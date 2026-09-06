@@ -30,13 +30,7 @@ def _load_matmul_tile(array, row, column, ROWS: ConstInt, COLUMNS: ConstInt, ACC
 
 @ct.function
 def _store_matmul_tile(array, row, column, tile, ACCESS_FORM: ConstInt):
-    if ACCESS_FORM == 2:
-        rows = row * tile.shape[0] + ct.arange(tile.shape[0], dtype=ct.int32)
-        columns = column * tile.shape[1] + ct.arange(tile.shape[1], dtype=ct.int32)
-        ct.scatter(array, (ct.expand_dims(rows, 1), ct.expand_dims(columns, 0)),
-                   tile, check_bounds=True)
-    else:
-        ct.store(array, index=(row, column), tile=tile, allow_tma=ACCESS_FORM == 1)
+    ct.store(array, index=(row, column), tile=tile, allow_tma=ACCESS_FORM != 3)
 
 
 def swizzle_2d_from_bid(M, N, tm, tn, GROUP_SIZE_M, bid):

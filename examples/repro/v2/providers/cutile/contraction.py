@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import cuda.tile as ct
 import torch
 
@@ -72,7 +74,7 @@ def dense_gemm(context: Context) -> PreparedComparison:
         )
     configs = contraction_configs(
         artifact, (a, b, generated.outputs()),
-        m_axis=(0, 0), n_axis=(1, 1), k_axis=(0, 1), fixed_options={"num_ctas": 1},
+        m_axis=(0, 0), n_axis=(1, 1), k_axis=(0, 1), fixed_options={},
     )
     source_module = official_source(
         context,
@@ -94,11 +96,17 @@ def tilegym_dense_gemm(context: Context) -> PreparedComparison:
     m, k, n = 8192, 4096, 11008
     a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     b = torch.randn((k, n), device="cuda", dtype=torch.bfloat16)
-    _, generated = compile_single(
-        context,
-        bf16_gemm,
-        (a, b),
+    with ct.compiler_timeout(15):
+        artifact, generated = compile_single(context, bf16_gemm, (a, b))
+    configurations = contraction_configs(
+        artifact, (a, b, generated.outputs()),
+        m_axis=(0, 0), n_axis=(1, 1), k_axis=(0, 1), fixed_options={},
     )
+    configs = tuple(SimpleNamespace(
+        TILE_SIZE_M=cfg.TILE_M, TILE_SIZE_N=cfg.TILE_N, TILE_SIZE_K=cfg.TILE_K,
+        GROUP_SIZE_M=cfg.GROUP_SIZE_M, num_ctas=cfg.num_ctas, occupancy=cfg.occupancy,
+        ACCESS_FORM=cfg.ACCESS_FORM, LOAD_LATENCY=-1,
+    ) for cfg in configurations)
     source_module = tilegym_source(
         context,
         "source/cutile/tilegym/gemm/dense/matmul.py",
@@ -111,6 +119,8 @@ def tilegym_dense_gemm(context: Context) -> PreparedComparison:
             trans_a=False,
             trans_b=False,
             static_persistent=True,
+            tuning_configs=configs,
+            compiler_timeout=15,
         )
     )
     return PreparedComparison(
@@ -130,7 +140,7 @@ def batched_gemm(context: Context) -> PreparedComparison:
     configs = contraction_configs(
         artifact, (a, b, generated.outputs()),
         m_axis=(0, 1), n_axis=(1, 2), k_axis=(0, 2), batch_axis=(0, 0),
-        fixed_options={"GROUP_SIZE_M": 8, "num_ctas": 1},
+        fixed_options={"GROUP_SIZE_M": 8},
     )
     source_module = tilegym_source(
         context,

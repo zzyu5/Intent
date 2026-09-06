@@ -25,6 +25,7 @@ namespace {
 constexpr llvm::StringLiteral legalizedAttr = "intent_cutile.legalized";
 constexpr llvm::StringLiteral accessFormParameter = "CUTILE_ACCESS_FORM";
 constexpr llvm::StringLiteral occupancyParameter = "CUTILE_OCCUPANCY";
+constexpr llvm::StringLiteral ctasParameter = "CUTILE_CTAS";
 constexpr int64_t nativeAccessForm = 1;
 constexpr int64_t gatherAccessForm = 2;
 constexpr int64_t nativeBlockedNoTMAForm = 3;
@@ -36,13 +37,18 @@ bool isLegalAccessForm(int64_t value) {
 
 bool isLegalOccupancy(int64_t value) { return value >= 1 && value <= 32; }
 
+bool isLegalCTAs(int64_t value) {
+  return value >= 1 && value <= 16 && llvm::isPowerOf2_64(value);
+}
+
 bool supportsE8M0ScaledMMA(gpu::CapabilitiesAttr capabilities) {
   return capabilities && capabilities.getComputeCapabilityMajor() >= 10;
 }
 
 bool isCuTileProviderRole(gpu::ParameterRole role) {
   return role == gpu::ParameterRole::ProviderAccessForm ||
-         role == gpu::ParameterRole::ProviderOccupancy;
+         role == gpu::ParameterRole::ProviderOccupancy ||
+         role == gpu::ParameterRole::ProviderCTAs;
 }
 
 std::optional<int64_t>
@@ -1393,6 +1399,43 @@ bool hasOccupancySensitiveTileCompute(func::FuncOp kernel) {
   return found;
 }
 
+bool hasMatrixTileCompute(func::FuncOp kernel) {
+  bool found = false;
+  kernel.walk([&](Operation *operation) {
+    found |= isa<gpu::ContractOp, gpu::ScaledContractOp, MMAOp, ScaledMMAOp>(operation);
+  });
+  return found;
+}
+
+LogicalResult declareProviderHint(func::FuncOp kernel,
+                                  const gpu::TuningProfiles &profiles,
+                                  StringRef family, StringRef name,
+                                  gpu::ParameterRole role,
+                                  bool (*isLegal)(int64_t)) {
+  auto rows = profiles.get("cutile", family, kernel.getLoc());
+  if (failed(rows))
+    return failure();
+  SmallVector<int64_t> candidates;
+  for (const auto &row : *rows)
+    if (isLegal(row[0]))
+      candidates.push_back(row[0]);
+  if (candidates.empty())
+    return kernel.emitError("cuTile tuning profile has no legal hints for ") << name;
+  bool nameCollision = false;
+  kernel.walk([&](gpu::ParameterOp parameter) {
+    nameCollision |= parameter.getParameter().getName().getValue() == name;
+  });
+  if (nameCollision)
+    return kernel.emitError("cuTile hint parameter name is already owned: ") << name;
+  OpBuilder entry(&kernel.getBody().front(), kernel.getBody().front().begin());
+  auto schema = gpu::ParameterAttr::get(
+      kernel.getContext(), entry.getStringAttr(name), static_cast<uint32_t>(role),
+      static_cast<uint32_t>(gpu::ParameterCategory::Provider),
+      /*elementBitWidth=*/0, DenseI64ArrayAttr::get(kernel.getContext(), candidates));
+  entry.create<gpu::ParameterOp>(kernel.getLoc(), entry.getIndexType(), schema);
+  return success();
+}
+
 bool hasResidentWorkerTraversal(func::FuncOp kernel) {
   bool found = false;
   kernel.walk([&](gpu::ParameterOp parameter) {
@@ -1469,34 +1512,15 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
   if (!scaledContracts.empty() && !supportsE8M0ScaledMMA(capabilities))
     return scaledContracts.front().emitOpError(
         "cuTile E8M0 scaled MMA requires compute capability 10.0 or newer");
-  if (hasOccupancySensitiveTileCompute(kernel)) {
-    auto rows = profiles.get("cutile", occupancyFamily(kernel, capabilities),
-                             kernel.getLoc());
-    if (failed(rows))
-      return failure();
-    SmallVector<int64_t> occupancyCandidates;
-    for (const auto &row : *rows)
-      if (isLegalOccupancy(row[0]))
-        occupancyCandidates.push_back(row[0]);
-    if (occupancyCandidates.empty())
-      return kernel.emitError("cuTile tuning profile has no legal occupancy hints (1..32)");
-    bool nameCollision = false;
-    kernel.walk([&](gpu::ParameterOp parameter) {
-      nameCollision |= parameter.getParameter().getName().getValue() ==
-                       occupancyParameter;
-    });
-    if (nameCollision)
-      return kernel.emitError(
-          "cuTile occupancy parameter name is already owned");
-    OpBuilder entry(&kernel.getBody().front(), kernel.getBody().front().begin());
-    auto schema = gpu::ParameterAttr::get(
-        kernel.getContext(), entry.getStringAttr(occupancyParameter),
-        static_cast<uint32_t>(gpu::ParameterRole::ProviderOccupancy),
-        static_cast<uint32_t>(gpu::ParameterCategory::Provider),
-        /*elementBitWidth=*/0,
-        DenseI64ArrayAttr::get(kernel.getContext(), occupancyCandidates));
-    entry.create<gpu::ParameterOp>(kernel.getLoc(), entry.getIndexType(), schema);
-  }
+  if (hasOccupancySensitiveTileCompute(kernel) &&
+      failed(declareProviderHint(kernel, profiles, occupancyFamily(kernel, capabilities),
+                                 occupancyParameter, gpu::ParameterRole::ProviderOccupancy,
+                                 isLegalOccupancy)))
+    return failure();
+  if (hasMatrixTileCompute(kernel) &&
+      failed(declareProviderHint(kernel, profiles, "ctas", ctasParameter,
+                                 gpu::ParameterRole::ProviderCTAs, isLegalCTAs)))
+    return failure();
   gpu::PhysicalProgramAnalysis analysis(kernel);
   Value accessForm;
   Value preferTileLoads;
@@ -2280,6 +2304,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     return kernel.emitError("cuTile provider requires selected GPU capabilities");
   gpu::ParameterOp accessForm;
   gpu::ParameterOp occupancy;
+  gpu::ParameterOp ctas;
   LogicalResult parameterSchema = success();
   kernel.walk([&](gpu::ParameterOp parameter) {
     auto schema = parameter.getParameter();
@@ -2312,6 +2337,17 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
       accessForm = parameter;
       return;
     }
+    if (role == gpu::ParameterRole::ProviderCTAs) {
+      if (ctas || schema.getName().getValue() != ctasParameter ||
+          candidates.empty() || !llvm::all_of(candidates, isLegalCTAs) ||
+          !parameter.getResult().use_empty()) {
+        parameter.emitOpError("has an invalid or duplicate cuTile CTA hint schema");
+        parameterSchema = failure();
+        return;
+      }
+      ctas = parameter;
+      return;
+    }
     if (occupancy) {
       parameter.emitOpError("duplicates the cuTile occupancy parameter");
       parameterSchema = failure();
@@ -2335,6 +2371,8 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
   if (needsOccupancy != static_cast<bool>(occupancy))
     return kernel.emitError(
         "cuTile occupancy hint does not match occupancy-sensitive tile compute");
+  if (hasMatrixTileCompute(kernel) != static_cast<bool>(ctas))
+    return kernel.emitError("cuTile CTA hint does not match matrix tile compute");
   auto isTrue = [](Value value) {
     auto constant = value.getDefiningOp<arith::ConstantOp>();
     auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())

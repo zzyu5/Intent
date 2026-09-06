@@ -135,12 +135,17 @@ struct CoverageParameter {
 
 bool isCuTileProviderRole(gpu::ParameterRole role) {
   return role == gpu::ParameterRole::ProviderAccessForm ||
-         role == gpu::ParameterRole::ProviderOccupancy;
+         role == gpu::ParameterRole::ProviderOccupancy ||
+         role == gpu::ParameterRole::ProviderCTAs;
 }
 
-bool isOccupancyParameter(gpu::ParameterOp parameter) {
-  return parameter.getParameter().getRole() ==
-         static_cast<uint32_t>(gpu::ParameterRole::ProviderOccupancy);
+StringRef providerHint(gpu::ParameterOp parameter) {
+  auto role = static_cast<gpu::ParameterRole>(parameter.getParameter().getRole());
+  if (role == gpu::ParameterRole::ProviderOccupancy)
+    return "occupancy";
+  if (role == gpu::ParameterRole::ProviderCTAs)
+    return "num_ctas";
+  return {};
 }
 
 FailureOr<SmallVector<std::map<std::string, int64_t>>>
@@ -266,14 +271,13 @@ private:
       }
     }
     kernel.walk([&](gpu::ParameterOp parameter) {
-      if (isOccupancyParameter(parameter)) {
-        if (!occupancyParameterName.empty()) {
-          parameter.emitOpError("duplicates the cuTile occupancy hint");
+      if (StringRef hint = providerHint(parameter); !hint.empty()) {
+        if (!providerHintParameters.emplace(
+                hint.str(), parameter.getParameter().getName().getValue().str()).second) {
+          parameter.emitOpError("duplicates a cuTile compiler hint");
           failed = true;
           return;
         }
-        occupancyParameterName =
-            parameter.getParameter().getName().getValue().str();
         return;
       }
       auto dimension =
@@ -390,7 +394,7 @@ private:
     for (const MetadataABI &metadata : metadataArguments)
       argument(metadata.name + ": ConstInt");
     kernel.walk([&](gpu::ParameterOp parameter) {
-      if (isOccupancyParameter(parameter))
+      if (!providerHint(parameter).empty())
         return;
       std::string name = parameter.getParameter().getName().getValue().str();
       values[parameter.getResult()] = name;
@@ -559,18 +563,16 @@ private:
               ", ";
     grid += "1, 1)";
     std::string hints;
-    if (!occupancyParameterName.empty())
-      hints = ", lambda " + configName + ": {\"occupancy\": " +
-              configName + "." + occupancyParameterName + "}";
+    if (!providerHintParameters.empty())
+      hints = ", lambda " + configName + ": " + compilerHints(configName);
     line(searchResultName + " = exhaustive_search(_CONFIGS, " + streamName +
              ", " + grid + ", _intent_kernel, lambda " + configName +
              ": " + trialStateName + ".arguments((" + joinKernelArguments(configName) + "))" + hints +
              ", quiet=True)",
          2);
     std::string tunedKernel = "_intent_kernel";
-    if (!occupancyParameterName.empty())
-      tunedKernel += ".replace_hints(occupancy=" + searchResultName +
-                     ".best.config." + occupancyParameterName + ")";
+    if (!providerHintParameters.empty())
+      tunedKernel += ".replace_hints(**" + compilerHints(searchResultName + ".best.config") + ")";
     line("_TUNE_CACHE[" + tuneKeyName + "] = (" + searchResultName +
              ".best.config, " + tunedKernel + ")",
          2);
@@ -1251,6 +1253,13 @@ private:
     return shape + ")";
   }
 
+  std::string compilerHints(StringRef configName) {
+    std::string result = "{";
+    for (const auto &[hint, parameter] : providerHintParameters)
+      result += "\"" + hint + "\": " + configName.str() + "." + parameter + ", ";
+    return result + "}";
+  }
+
   std::string joinKernelArguments(StringRef configName) {
     std::string result = joinViewNames(views);
     for (const ScalarABI &scalar : scalars) {
@@ -1262,7 +1271,7 @@ private:
       result += ", " + metadata.name;
     SmallVector<std::string> parameters;
     kernel.walk([&](gpu::ParameterOp parameter) {
-      if (isOccupancyParameter(parameter))
+      if (!providerHint(parameter).empty())
         return;
       parameters.push_back(parameter.getParameter().getName().getValue().str());
     });
@@ -1340,7 +1349,7 @@ private:
   llvm::DenseMap<int64_t, MetadataABI> dimensionBindings;
   std::map<std::string, CoverageParameter> fullCoverageParameters;
   llvm::StringSet<> fullCoverageParameterNames;
-  std::string occupancyParameterName;
+  std::map<std::string, std::string> providerHintParameters;
   unsigned indent = 0;
   unsigned counter = 0;
   bool failed = false;

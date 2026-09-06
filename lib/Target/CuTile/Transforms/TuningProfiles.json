@@ -1,6 +1,11 @@
 {
   "columns": ["value"],
   "families": {
+    "ctas": [
+      [1],
+      [2],
+      [4]
+    ],
     "access_forms": [
       [1],
       [2],

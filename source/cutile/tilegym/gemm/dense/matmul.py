@@ -215,6 +215,24 @@ def _matmul_kernel(
     ct.store(C, index=(bidx, bidy), tile=accumulator)
 
 
+@ct.function
+def _load_persistent_tile(
+    array, row, column, ROWS: ConstInt, COLUMNS: ConstInt,
+    LOAD_LATENCY: ConstInt, ACCESS_FORM: ConstInt,
+):
+    if ACCESS_FORM == 2:
+        rows = row * ROWS + ct.arange(ROWS, dtype=ct.int32)
+        columns = column * COLUMNS + ct.arange(COLUMNS, dtype=ct.int32)
+        return ct.gather(array, (ct.expand_dims(rows, 1), ct.expand_dims(columns, 0)),
+                         padding_value=0, check_bounds=True)
+    if LOAD_LATENCY >= 1:
+        return ct.load(array, index=(row, column), shape=(ROWS, COLUMNS),
+                       padding_mode=ct.PaddingMode.ZERO, latency=LOAD_LATENCY,
+                       allow_tma=ACCESS_FORM == 1)
+    return ct.load(array, index=(row, column), shape=(ROWS, COLUMNS),
+                   padding_mode=ct.PaddingMode.ZERO, allow_tma=ACCESS_FORM == 1)
+
+
 @ct.kernel
 def _static_persistent_matmul_kernel(
     A,
@@ -230,6 +248,7 @@ def _static_persistent_matmul_kernel(
     TRANSPOSE_B: ct.Constant[bool],
     GROUP_SIZE_M: ct.Constant[int],
     LOAD_LATENCY: ct.Constant[int],
+    ACCESS_FORM: ct.Constant[int],
 ):
     """CuTile static persistent matmul kernel: C = A @ B with static scheduling"""
     start_bid = ct.bid(0)
@@ -239,7 +258,6 @@ def _static_persistent_matmul_kernel(
     num_bid_n = ct.cdiv(N, TILE_SIZE_N)
     k_tiles = ct.cdiv(K, TILE_SIZE_K)
     num_tiles = num_bid_m * num_bid_n
-    zero_pad = ct.PaddingMode.ZERO
     num_programs = ct.num_blocks(0)
 
     # Static persistent scheduling loop
@@ -260,56 +278,24 @@ def _static_persistent_matmul_kernel(
             # both A and B reaches 6.74 ms vs 7.27 ms for B-only, ~7-8% better)
             if TRANSPOSE_A:
                 # A is transposed: load from (K, M) layout
-                if LOAD_LATENCY >= 1:
-                    a = ct.load(
-                        A,
-                        index=(k_tile, bid_m),
-                        shape=(TILE_SIZE_K, TILE_SIZE_M),
-                        padding_mode=zero_pad,
-                        latency=LOAD_LATENCY,
-                    )
-                else:
-                    a = ct.load(A, index=(k_tile, bid_m), shape=(TILE_SIZE_K, TILE_SIZE_M), padding_mode=zero_pad)
+                a = _load_persistent_tile(A, k_tile, bid_m, TILE_SIZE_K, TILE_SIZE_M,
+                                          LOAD_LATENCY, ACCESS_FORM)
                 a = ct.transpose(a)  # Convert to (TILE_SIZE_M, TILE_SIZE_K)
             else:
                 # A is normal: load from (M, K) layout
-                if LOAD_LATENCY >= 1:
-                    a = ct.load(
-                        A,
-                        index=(bid_m, k_tile),
-                        shape=(TILE_SIZE_M, TILE_SIZE_K),
-                        padding_mode=zero_pad,
-                        latency=LOAD_LATENCY,
-                    )
-                else:
-                    a = ct.load(A, index=(bid_m, k_tile), shape=(TILE_SIZE_M, TILE_SIZE_K), padding_mode=zero_pad)
+                a = _load_persistent_tile(A, bid_m, k_tile, TILE_SIZE_M, TILE_SIZE_K,
+                                          LOAD_LATENCY, ACCESS_FORM)
 
             # Load B tile
             if TRANSPOSE_B:
                 # B is transposed: load from (N, K) layout
-                if LOAD_LATENCY >= 1:
-                    b = ct.load(
-                        B,
-                        index=(bid_n, k_tile),
-                        shape=(TILE_SIZE_N, TILE_SIZE_K),
-                        padding_mode=zero_pad,
-                        latency=LOAD_LATENCY,
-                    )
-                else:
-                    b = ct.load(B, index=(bid_n, k_tile), shape=(TILE_SIZE_N, TILE_SIZE_K), padding_mode=zero_pad)
+                b = _load_persistent_tile(B, bid_n, k_tile, TILE_SIZE_N, TILE_SIZE_K,
+                                          LOAD_LATENCY, ACCESS_FORM)
                 b = ct.transpose(b)  # Convert to (TILE_SIZE_K, TILE_SIZE_N)
             else:
                 # B is normal: load from (K, N) layout
-                if LOAD_LATENCY >= 1:
-                    b = ct.load(
-                        B,
-                        index=(k_tile, bid_n),
-                        shape=(TILE_SIZE_K, TILE_SIZE_N),
-                        padding_mode=zero_pad,
-                        latency=LOAD_LATENCY,
-                    )
-                else:
-                    b = ct.load(B, index=(k_tile, bid_n), shape=(TILE_SIZE_K, TILE_SIZE_N), padding_mode=zero_pad)
+                b = _load_persistent_tile(B, k_tile, bid_n, TILE_SIZE_K, TILE_SIZE_N,
+                                          LOAD_LATENCY, ACCESS_FORM)
 
             # Convert fp32 to tf32 to use tensorcore
             dtype = ct.tfloat32 if A.dtype == ct.float32 else A.dtype
@@ -321,7 +307,7 @@ def _static_persistent_matmul_kernel(
 
         # Convert to output dtype and store
         result = ct.astype(accumulator, C.dtype)
-        ct.store(C, index=(bid_m, bid_n), tile=result)
+        ct.store(C, index=(bid_m, bid_n), tile=result, allow_tma=ACCESS_FORM != 3)
 
 
 def _cutile_autotune_matmul(stream, a, b, c):
@@ -353,13 +339,25 @@ def _cutile_autotune_matmul(stream, a, b, c):
     return c
 
 
-def _cutile_autotune_static_persistent_matmul(stream, a, b, c, M, N, K, trans_a, trans_b):
+def _cutile_autotune_static_persistent_matmul(
+    stream, a, b, c, M, N, K, trans_a, trans_b, tuning_configs, compiler_timeout,
+):
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-    cache_key = (M, N, K, trans_a, trans_b, a.dtype, str(a.device))
+    configs = (tuple(SimpleNamespace(**vars(cfg), ACCESS_FORM=1)
+                     for cfg in _static_persistent_matmul_autotune_configs())
+               if tuning_configs is None else tuple(tuning_configs))
+    for cfg in configs:
+        if vars(cfg).keys() != {"TILE_SIZE_M", "TILE_SIZE_N", "TILE_SIZE_K", "GROUP_SIZE_M",
+                               "LOAD_LATENCY", "ACCESS_FORM", "num_ctas", "occupancy"}:
+            raise ValueError("persistent matmul requires complete candidates without unconsumed fields")
+    config_key = tuple(tuple(sorted(vars(cfg).items())) for cfg in configs)
+    cache_key = (M, N, K, trans_a, trans_b, a.dtype, b.dtype, str(a.device),
+                 tuple(a.stride()), tuple(b.stride()), a.storage_offset(), b.storage_offset(),
+                 config_key, compiler_timeout)
     if cache_key not in _static_persistent_matmul_tune_cache:
-        with ct.compiler_timeout(5):
+        with ct.compiler_timeout(compiler_timeout):
             result = exhaustive_search(
-                list(_static_persistent_matmul_autotune_configs()),
+                configs,
                 stream,
                 lambda cfg: (
                     min(NUM_SMS // cfg.num_ctas, ceil(M / cfg.TILE_SIZE_M) * ceil(N / cfg.TILE_SIZE_N)) * cfg.occupancy,
@@ -381,6 +379,7 @@ def _cutile_autotune_static_persistent_matmul(stream, a, b, c, M, N, K, trans_a,
                     trans_b,
                     cfg.GROUP_SIZE_M,
                     cfg.LOAD_LATENCY,
+                    cfg.ACCESS_FORM,
                 ),
                 lambda cfg: {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy},
             )
@@ -413,6 +412,7 @@ def _cutile_autotune_static_persistent_matmul(stream, a, b, c, M, N, K, trans_a,
             trans_b,
             best_cfg.GROUP_SIZE_M,
             best_cfg.LOAD_LATENCY,
+            best_cfg.ACCESS_FORM,
         ),
     )
     return c
@@ -426,6 +426,9 @@ def matmul(
     trans_b=False,
     static_persistent=None,
     use_tma=False,
+    *,
+    tuning_configs=None,
+    compiler_timeout=5,
     **kwargs,
 ):
     if static_persistent is None:
@@ -447,8 +450,12 @@ def matmul(
 
     stream = torch.cuda.current_stream()
     if static_persistent:
-        _cutile_autotune_static_persistent_matmul(stream, a, b, c, M, N, K, trans_a, trans_b)
+        _cutile_autotune_static_persistent_matmul(
+            stream, a, b, c, M, N, K, trans_a, trans_b, tuning_configs, compiler_timeout,
+        )
     else:
+        if tuning_configs is not None:
+            raise NotImplementedError("explicit tuning candidates require the persistent matmul entry")
         assert trans_a == False, "trans_a is not supported for cutile"
         assert trans_b == False, "trans_b is not supported for cutile"
         _cutile_autotune_matmul(stream, a, b, c)

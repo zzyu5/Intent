@@ -31,6 +31,8 @@ def contraction_configs(
                 field = "ACCESS_FORM"
             elif role == ParameterRole.PROVIDER_OCCUPANCY:
                 field = "occupancy"
+            elif role == ParameterRole.PROVIDER_CTAS:
+                field = "num_ctas"
             elif role == ParameterRole.TRAVERSAL_GROUP:
                 field = "GROUP_SIZE_M"
             elif role == ParameterRole.REDUCTION and axis == k_axis:

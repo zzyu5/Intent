@@ -200,17 +200,9 @@ def _static_persistent_bmm_kernel(
         # Convert to output dtype
         result = ct.astype(accumulator, C.dtype)
         # Reshape to 3D for store
-        if ACCESS_FORM == 2:
-            rows = bid_m * TILE_M + ct.arange(TILE_M, dtype=ct.int32)
-            columns = bid_n * TILE_N + ct.arange(TILE_N, dtype=ct.int32)
-            ct.scatter(
-                C, (bid_q, ct.expand_dims(rows, 1), ct.expand_dims(columns, 0)),
-                result, check_bounds=True,
-            )
-        else:
-            result_3d = ct.reshape(result, (1, TILE_M, TILE_N))
-            ct.store(C, index=(bid_q, bid_m, bid_n), tile=result_3d,
-                     order=(0, 1, 2), latency=3, allow_tma=ACCESS_FORM == 1)
+        result_3d = ct.reshape(result, (1, TILE_M, TILE_N))
+        ct.store(C, index=(bid_q, bid_m, bid_n), tile=result_3d,
+                 order=(0, 1, 2), latency=3, allow_tma=ACCESS_FORM != 3)
 
 
 def _persistent_bmm_autotune_base(

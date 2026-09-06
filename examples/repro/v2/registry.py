@@ -84,7 +84,7 @@ CUTILE = (
     Entry("splitk_attention_reduce", "B8-H32-S8192-splits16-D128", "splitk_attention_reduce_v2", ("streaming/splitk_reduce.py:splitk_attention_reduce",), "source/cutile/tilegym/attention/flash_decode/splitk_reduce_runtime.py"),
     Entry("mla_prefill", "B1-QH128-KVH1-S2048-D128-R64-fp16", "mla_prefill_v2", ("streaming/attention.py:mla_prefill",), "source/cutile/tilegym/attention/mla/mla_runtime.py"),
     Entry("batched_gemm", "B32-M512-N512-K1024-bf16", "batched_gemm_v2", ("contraction/batched_gemm.py:batched_gemm_nn",), "source/cutile/tilegym/gemm/batched/bmm_runtime.py"),
-    Entry("tilegym_dense_gemm", "M8192-N11008-K4096-bf16", "tilegym_dense_gemm", ("contraction/gemm.py:gemm",), "source/cutile/tilegym/gemm/dense/matmul_runtime.py"),
+    Entry("tilegym_dense_gemm", "M8192-N11008-K4096-bf16", "tilegym_dense_gemm", ("contraction/gemm.py:bf16_gemm",), "source/cutile/tilegym/gemm/dense/matmul_runtime.py"),
     Entry("grouped_gemm", "rows256-512-1024-2048-K4096-N4096-bf16", "grouped_gemm_cutile_v2", ("ragged/grouped_gemm.py:ragged_grouped_gemm_bf16",), "source/cutile/tilegym/gemm/grouped/group_gemm_runtime.py"),
     Entry("moe_alignment", "T4096-top2-E64", "moe_alignment_v2", ("routing/moe_align.py:moe_count_routes", "routing/moe_align.py:moe_prefix_routes", "routing/moe_align.py:moe_scatter_routes", "routing/moe_align.py:moe_mark_expert_blocks"), "source/cutile/tilegym/moe/alignment/moe_align_block_runtime.py"),
     Entry("mhc_gemm_rms_scale", "T2048-H4096-streams4-bf16", "mhc_gemm_rms_scale", ("routing/mhc.py:mhc_gemm_rms_partial", "routing/mhc.py:mhc_gemm_rms_finalize"), "source/cutile/tilegym/mhc/fused/mhc_gemm_rms_runtime.py"),
