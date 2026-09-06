@@ -21,10 +21,9 @@ def fused_qkv_projection(
     columns = I.domain(0, N)
     for projection in I.parallel(projections):
         output[projection, rows, columns] = I.cast(
-            I.contract(
+            I.matmul(
                 x[rows, reduction],
                 weights[projection, reduction, columns],
-                reduce=((1, 0),),
                 acc_dtype=I.f32,
             ),
             I.f16,

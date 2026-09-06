@@ -54,7 +54,7 @@ class FrontendCompiler:
             constexpr_values=self.signature.constexpr_values,
         )
         lowerer.lower()
-        return canonicalize_mlir(self.builder.emit_module())
+        return canonicalize_mlir(self.builder.emit_module(), self.builder)
 
     def lower_helper_inline(
         self,

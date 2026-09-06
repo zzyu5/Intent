@@ -20,10 +20,9 @@ def split_k_partial(
         begin = I.minimum(part * width, K)
         end = I.minimum((part + 1) * width, K)
         reduction = reduction_axis[begin:end]
-        partial[part, rows, columns] = I.contract(
+        partial[part, rows, columns] = I.matmul(
             a[rows, reduction],
             b[reduction, columns],
-            reduce=((1, 0),),
             acc_dtype=I.f32,
         )
 

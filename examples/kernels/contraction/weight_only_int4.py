@@ -40,10 +40,9 @@ def weight_only_int4_matmul(
     group_indices = k_indices // GROUP_SIZE
     group_scales = scales[group_indices, columns]
     dequantized = I.cast(unpacked, I.f16) * group_scales
-    result = I.contract(
+    result = I.matmul(
         activation[rows, reduction],
         dequantized,
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
     output[rows, columns] = I.cast(
@@ -84,10 +83,10 @@ def w4a8_packed_matmul(
         ),
         I.i8,
     )
-    output[columns, rows] = I.contract(
+    output[columns, rows] = I.matmul(
         signed,
         activation[rows, reduction],
-        reduce=((1, 1),),
+        transpose_rhs=True,
         acc_dtype=I.i32,
     )
 
@@ -117,10 +116,10 @@ def bitnet_int2_matmul(
         (packed >> shifts[None, :]) & I.cast(3, I.u8),
         I.i8,
     )
-    output[rows, columns] = I.contract(
+    output[rows, columns] = I.matmul(
         activation[rows, reduction],
         decoded,
-        reduce=((1, 1),),
+        transpose_rhs=True,
         acc_dtype=I.i32,
     )
 
@@ -167,10 +166,10 @@ def dequant_bf16_fp4_matmul(
         I.cast(I.bitcast(bits, I.bf16), I.f32) * (2.0**126),
         I.bf16,
     )
-    result = I.contract(
+    result = I.matmul(
         activation[rows, reduction],
         decoded,
-        reduce=((1, 1),),
+        transpose_rhs=True,
         acc_dtype=I.f32,
     )
     output[rows, columns] = I.cast(result, I.bf16)
@@ -187,10 +186,10 @@ def fp8_e4m3_matmul(
     reduction = I.domain(0, K)
     rows = I.domain(0, M)
     columns = I.domain(0, N)
-    result = I.contract(
+    result = I.matmul(
         lhs[rows, reduction],
         rhs_transposed[columns, reduction],
-        reduce=((1, 1),),
+        transpose_rhs=True,
         acc_dtype=I.f32,
     )
     output[rows, columns] = I.cast(result, I.f8e4m3fn)
@@ -207,10 +206,10 @@ def fp8_e5m2_matmul(
     reduction = I.domain(0, K)
     rows = I.domain(0, M)
     columns = I.domain(0, N)
-    result = I.contract(
+    result = I.matmul(
         lhs[rows, reduction],
         rhs_transposed[columns, reduction],
-        reduce=((1, 1),),
+        transpose_rhs=True,
         acc_dtype=I.f32,
     )
     output[rows, columns] = I.cast(result, I.f8e5m2)

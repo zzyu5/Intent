@@ -14,10 +14,10 @@ def summarize_attention_chunk(
 ):
     # key_chunk/value_chunk are slices chosen by region_fold. Their leading
     # extent is intentionally absent from the author program.
-    scores = I.contract(
+    scores = I.matmul(
         queries,
         key_chunk,
-        reduce=((1, 1),),
+        transpose_rhs=True,
         acc_dtype=I.f32,
     )
     scores = scores * (scale * I.LOG2E)
@@ -51,10 +51,9 @@ def summarize_attention_chunk(
         probabilities,
         axis=1,
     )
-    accumulator = I.contract(
+    accumulator = I.matmul(
         probabilities,
         value_chunk,
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
 

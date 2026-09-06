@@ -7,6 +7,7 @@ from ..diagnostics.locations import Location
 from ..semantics.effects import Effect
 from ..semantics.operations import OperationKind
 from ..semantics.operations import REGION_OPS
+from ..semantics.operations import ShapeRelation
 from ..semantics.operations import TERMINATORS
 from ..semantics.types import ValueType
 from .attributes import emit_dictionary
@@ -36,6 +37,7 @@ class MlirBuilder:
         self._next_operation_id = 0
         self._dimension_ids: dict[object, int] = {}
         self._next_dimension_id = 1
+        self._shape_relations: dict[int, ShapeRelation] = {}
 
     def _value(
         self,
@@ -187,6 +189,8 @@ class MlirBuilder:
         )
         result_types = tuple(value.type for value in results)
         operation_attributes = dict(attributes or {})
+        if "shape" in operation_attributes:
+            self._shape_relations[operation_id] = operation_attributes["shape"]
         operation_attributes["intent.node"] = operation_id
         operation_attributes["intent.result_nodes"] = [value.id for value in results]
         operation_attributes["intent.result_names"] = [
@@ -374,13 +378,15 @@ class MlirBuilder:
         return [prefix + line for line in text.splitlines()]
 
 
-def canonicalize_mlir(assembly: str) -> str:
+def canonicalize_mlir(assembly: str, builder: MlirBuilder) -> str:
     from mlir.dialects import func as _func
     from mlir.ir import Context
     from mlir.ir import Module
+    from .canonicalization import canonicalize_regions
 
     del _func
     with Context() as context:
         context.allow_unregistered_dialects = True
         module = Module.parse(assembly)
+        canonicalize_regions(module, builder)
         return str(module) + "\n"

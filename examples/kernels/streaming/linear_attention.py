@@ -57,10 +57,9 @@ def emit_linear_forward_slice(
         value_slice,
         acc_dtype=I.f32,
     )
-    inter = I.contract(
+    inter = I.matmul(
         query_slice,
         I.cast(incoming_state, I.f16),
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
     return intra + inter
@@ -73,10 +72,10 @@ def summarize_linear_backward_q_slice(
     gradient_slice,
     token_coordinates,
 ):
-    return I.contract(
+    return I.matmul(
         value_slice,
         key_slice,
-        reduce=((0, 0),),
+        transpose_lhs=True,
         acc_dtype=I.f32,
     )
 
@@ -89,10 +88,10 @@ def emit_linear_backward_q_slice(
     token_coordinates,
     incoming_state,
 ):
-    score_gradient = I.contract(
+    score_gradient = I.matmul(
         gradient_slice,
         value_slice,
-        reduce=((1, 1),),
+        transpose_rhs=True,
         acc_dtype=I.f32,
     )
     score_gradient = I.mask(
@@ -100,16 +99,14 @@ def emit_linear_backward_q_slice(
         valid=token_coordinates[:, None] >= token_coordinates[None, :],
         fill=0.0,
     )
-    local = I.contract(
+    local = I.matmul(
         I.cast(score_gradient, I.f16),
         key_slice,
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
-    carried = I.contract(
+    carried = I.matmul(
         gradient_slice,
         I.cast(incoming_state, I.f16),
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
     return local + carried
@@ -123,10 +120,10 @@ def summarize_linear_backward_kv_slice(
     gradient_slice,
     token_coordinates,
 ):
-    return I.contract(
+    return I.matmul(
         query_slice,
         gradient_slice,
-        reduce=((0, 0),),
+        transpose_lhs=True,
         acc_dtype=I.f32,
     )
 
@@ -141,43 +138,40 @@ def emit_linear_backward_kv_slice(
     incoming_state,
 ):
     future = token_coordinates[None, :] >= token_coordinates[:, None]
-    score_gradient = I.contract(
+    score_gradient = I.matmul(
         value_slice,
         gradient_slice,
-        reduce=((1, 1),),
+        transpose_rhs=True,
         acc_dtype=I.f32,
     )
     score_gradient = I.mask(score_gradient, valid=future, fill=0.0)
-    local_grad_key = I.contract(
+    local_grad_key = I.matmul(
         I.cast(score_gradient, I.f16),
         query_slice,
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
-    carried_grad_key = I.contract(
+    carried_grad_key = I.matmul(
         value_slice,
         I.cast(incoming_state, I.f16),
-        reduce=((1, 1),),
+        transpose_rhs=True,
         acc_dtype=I.f32,
     )
 
-    scores = I.contract(
+    scores = I.matmul(
         key_slice,
         query_slice,
-        reduce=((1, 1),),
+        transpose_rhs=True,
         acc_dtype=I.f32,
     )
     scores = I.mask(scores, valid=future, fill=0.0)
-    local_grad_value = I.contract(
+    local_grad_value = I.matmul(
         I.cast(scores, I.f16),
         gradient_slice,
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
-    carried_grad_value = I.contract(
+    carried_grad_value = I.matmul(
         key_slice,
         I.cast(incoming_state, I.f16),
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
     return I.record(

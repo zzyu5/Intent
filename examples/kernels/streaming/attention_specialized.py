@@ -54,10 +54,10 @@ def window_attention_values(
     inclusive_lower,
     soft_cap,
 ):
-    scores = I.contract(
+    scores = I.matmul(
         queries,
         key_chunk,
-        reduce=((1, 1),),
+        transpose_rhs=True,
         acc_dtype=I.f32,
     ) * scale
     if soft_cap > 0.0:
@@ -115,10 +115,9 @@ def summarize_window_attention_f16(
         valid=values.valid,
         maximum=values.maximum,
         denominator=values.denominator,
-        accumulator=I.contract(
+        accumulator=I.matmul(
             I.cast(values.probability, I.f16),
             value_chunk,
-            reduce=((1, 0),),
             acc_dtype=I.f32,
         ),
     )
@@ -150,10 +149,9 @@ def summarize_window_attention_bf16(
         valid=values.valid,
         maximum=values.maximum,
         denominator=values.denominator,
-        accumulator=I.contract(
+        accumulator=I.matmul(
             I.cast(values.probability, I.bf16),
             value_chunk,
-            reduce=((1, 0),),
             acc_dtype=I.f32,
         ),
     )
@@ -171,10 +169,10 @@ def summarize_block_causal_chunk(
     block,
     sequence_start,
 ):
-    scores = I.contract(
+    scores = I.matmul(
         queries,
         key_chunk,
-        reduce=((1, 1),),
+        transpose_rhs=True,
         acc_dtype=I.f32,
     ) * (scale * I.LOG2E)
     query_index = query_coordinates - sequence_start
@@ -214,10 +212,9 @@ def summarize_block_causal_chunk(
         valid=chunk_valid,
         maximum=maximum,
         denominator=I.reduce.sum(probability, axis=1),
-        accumulator=I.contract(
+        accumulator=I.matmul(
             I.cast(probability, I.f16),
             value_chunk,
-            reduce=((1, 0),),
             acc_dtype=I.f32,
         ),
     )

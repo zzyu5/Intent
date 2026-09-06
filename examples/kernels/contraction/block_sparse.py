@@ -44,10 +44,9 @@ def block_sparse_matmul(
                 reduction_region = reduction[reduction_begin:reduction_end]
                 enabled = block_mask[row_block, column_block, reduction_block] != 0
                 if enabled:
-                    partial = I.contract(
+                    partial = I.matmul(
                         lhs[row_region, reduction_region],
                         rhs[reduction_region, column_region],
-                        reduce=((1, 0),),
                         acc_dtype=I.f32,
                     )
                     accumulator = accumulator + partial

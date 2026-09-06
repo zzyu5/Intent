@@ -94,16 +94,16 @@ def summarize_mla_chunk(
     causal,
 ):
     scores = (
-        I.contract(
+        I.matmul(
             latent_query,
             latent_chunk,
-            reduce=((1, 1),),
+            transpose_rhs=True,
             acc_dtype=I.f32,
         )
-        + I.contract(
+        + I.matmul(
             rope_query,
             rope_chunk,
-            reduce=((1, 1),),
+            transpose_rhs=True,
             acc_dtype=I.f32,
         )
     ) * (scale * I.LOG2E)
@@ -126,10 +126,9 @@ def summarize_mla_chunk(
         valid=chunk_valid,
         maximum=maximum,
         denominator=I.reduce.sum(probability, axis=1),
-        accumulator=I.contract(
+        accumulator=I.matmul(
             I.cast(probability, I.f16),
             value_chunk,
-            reduce=((1, 0),),
             acc_dtype=I.f32,
         ),
     )
@@ -148,16 +147,16 @@ def summarize_masked_mla_chunk(
     scale,
 ):
     scores = (
-        I.contract(
+        I.matmul(
             latent_query,
             latent_chunk,
-            reduce=((1, 1),),
+            transpose_rhs=True,
             acc_dtype=I.f32,
         )
-        + I.contract(
+        + I.matmul(
             rope_query,
             rope_chunk,
-            reduce=((1, 1),),
+            transpose_rhs=True,
             acc_dtype=I.f32,
         )
     ) * (scale * I.LOG2E)
@@ -178,10 +177,9 @@ def summarize_masked_mla_chunk(
         valid=chunk_valid,
         maximum=maximum,
         denominator=I.reduce.sum(probability, axis=1),
-        accumulator=I.contract(
+        accumulator=I.matmul(
             I.cast(probability, I.f16),
             value_chunk,
-            reduce=((1, 0),),
             acc_dtype=I.f32,
         ),
     )
@@ -200,16 +198,16 @@ def summarize_masked_mla_chunk_natural(
     scale,
 ):
     scores = (
-        I.contract(
+        I.matmul(
             latent_query,
             latent_chunk,
-            reduce=((1, 1),),
+            transpose_rhs=True,
             acc_dtype=I.f32,
         )
-        + I.contract(
+        + I.matmul(
             rope_query,
             rope_chunk,
-            reduce=((1, 1),),
+            transpose_rhs=True,
             acc_dtype=I.f32,
         )
     ) * scale
@@ -230,10 +228,9 @@ def summarize_masked_mla_chunk_natural(
         valid=chunk_valid,
         maximum=maximum,
         denominator=I.reduce.sum(probability, axis=1),
-        accumulator=I.contract(
+        accumulator=I.matmul(
             I.cast(probability, I.f16),
             value_chunk,
-            reduce=((1, 0),),
             acc_dtype=I.f32,
         ),
     )
@@ -250,18 +247,16 @@ def sparse_mla_summary(
     scale,
 ):
     scores = (
-        I.contract(
+        I.matmul(
             latent_query,
             latent_keys,
-            reduce=((2, 2),),
-            batch=((0, 0),),
+            transpose_rhs=True,
             acc_dtype=I.f32,
         )
-        + I.contract(
+        + I.matmul(
             rope_query,
             rope_keys,
-            reduce=((2, 2),),
-            batch=((0, 0),),
+            transpose_rhs=True,
             acc_dtype=I.f32,
         )
     ) * (scale * I.LOG2E)
@@ -282,11 +277,9 @@ def sparse_mla_summary(
         valid=summary_valid,
         maximum=maximum,
         denominator=I.reduce.sum(probability, axis=2),
-        accumulator=I.contract(
+        accumulator=I.matmul(
             I.cast(probability, I.bf16),
             values,
-            reduce=((2, 1),),
-            batch=((0, 0),),
             acc_dtype=I.f32,
         ),
     )

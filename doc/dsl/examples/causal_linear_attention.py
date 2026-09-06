@@ -26,10 +26,10 @@ def summarize_linear_slice(
     # region_scan slices every source component at the same boundaries before
     # calling both helpers.  This summary does not use the coordinate or query
     # slices; emit consumes their corresponding slices directly.
-    matrix = I.contract(
+    matrix = I.matmul(
         key_slice,
         value_slice,
-        reduce=((0, 0),),
+        transpose_lhs=True,
         acc_dtype=I.f32,
     )
     key = I.reduce.sum(
@@ -59,23 +59,21 @@ def emit_linear_slice(
     # are not ordinals local to the compiler-selected slice.  query_slice was
     # cut at the same source boundaries and needs no gather reconstruction.
 
-    inter_numerator = I.contract(
+    inter_numerator = I.matmul(
         query_slice,
         incoming_state.matrix,
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
-    inter_denominator = I.contract(
+    inter_denominator = I.matvec(
         query_slice,
         incoming_state.key,
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
 
-    local_scores = I.contract(
+    local_scores = I.matmul(
         query_slice,
         key_slice,
-        reduce=((1, 1),),
+        transpose_rhs=True,
         acc_dtype=I.f32,
     )
     causal = (
@@ -83,10 +81,9 @@ def emit_linear_slice(
         >= token_coordinates[None, :]
     )
     local_scores = I.select(causal, local_scores, 0.0)
-    intra_numerator = I.contract(
+    intra_numerator = I.matmul(
         local_scores,
         value_slice,
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
     intra_denominator = I.reduce.sum(

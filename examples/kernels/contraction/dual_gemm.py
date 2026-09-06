@@ -19,16 +19,14 @@ def gated_dual_gemm(
     m_axis = I.domain(0, M)
     n_axis = I.domain(0, N)
     k_axis = I.domain(0, K)
-    gate = I.contract(
+    gate = I.matmul(
         x[m_axis, k_axis],
         gate_weight[k_axis, n_axis],
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
-    value = I.contract(
+    value = I.matmul(
         x[m_axis, k_axis],
         value_weight[k_axis, n_axis],
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
     y[m_axis, n_axis] = I.cast(I.maximum(gate, 0.0) * value, I.f16)

@@ -30,12 +30,9 @@ def unique_consecutive_rows(
             )
             > 0
         )
-        groups = I.scan(
+        groups = I.cumsum(
             I.cast(run_starts, I.i32),
             axis=0,
-            identity=0,
-            combine=I.add,
-            inclusive=True,
         )
         for column in columns:
             group = groups[column] - 1

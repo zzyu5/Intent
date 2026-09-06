@@ -1656,8 +1656,54 @@ private:
     if (failed(transposeLhs) || failed(transposeRhs))
       return failure();
     OpBuilder builder(contract);
-    builder.create<GemmOp>(contract.getLoc(), *lhs, *rhs, *accumulator,
-                           *transposeLhs, *transposeRhs);
+    if (lhsType.getElementType().isF32() &&
+        rhsType.getElementType().isF32()) {
+      // TileLang's default f32 GEMM selects TF32 operands. Keep full-f32
+      // products on CUDA cores, with independent output elements in parallel.
+      FailureOr<ParallelOp> parallel =
+          createParallel(contract, accumulatorType, accumulatorShape);
+      if (failed(parallel))
+        return failure();
+      Block &body = parallel->getBody().front();
+      OpBuilder outputBuilder(&body, body.begin());
+      Location location = contract.getLoc();
+      Value zero = outputBuilder.create<arith::ConstantIndexOp>(location, 0);
+      Value one = outputBuilder.create<arith::ConstantIndexOp>(location, 1);
+      Value end = outputBuilder.create<gpu::PhysicalExprOp>(
+          location, outputBuilder.getIndexType(),
+          cast<gpu::PhysicalExprAttr>(lhsShape[1]));
+      auto loop = outputBuilder.create<scf::ForOp>(location, zero, end, one);
+      OpBuilder productBuilder = OpBuilder::atBlockBegin(loop.getBody());
+      Value m = body.getArgument(0);
+      Value n = body.getArgument(1);
+      Value k = loop.getInductionVar();
+      Type dtype = accumulatorType.getElementType();
+      Type productType = dtype.isF64() ? dtype : lhsType.getElementType();
+      Value left = productBuilder.create<BufferLoadOp>(
+          location, lhsType.getElementType(), *lhs,
+          *transposeLhs ? ValueRange{k, m} : ValueRange{m, k});
+      Value right = productBuilder.create<BufferLoadOp>(
+          location, rhsType.getElementType(), *rhs,
+          *transposeRhs ? ValueRange{n, k} : ValueRange{k, n});
+      if (left.getType() != productType) {
+        left = productBuilder.create<gpu::CastOp>(location, productType, left);
+        right = productBuilder.create<gpu::CastOp>(location, productType, right);
+      }
+      Value previous = productBuilder.create<BufferLoadOp>(
+          location, dtype, *accumulator, ValueRange{m, n});
+      Value product = productBuilder.create<gpu::BinaryOp>(
+          location, productType, left, right, BinaryOperator::Multiply);
+      if (productType != dtype)
+        product = productBuilder.create<gpu::CastOp>(location, dtype, product);
+      Value sum = productBuilder.create<gpu::BinaryOp>(
+          location, dtype, previous, product, BinaryOperator::Add);
+      productBuilder.create<BufferStoreOp>(location, *accumulator,
+                                           ValueRange{m, n}, sum);
+      outputBuilder.create<YieldOp>(location);
+    } else {
+      builder.create<GemmOp>(contract.getLoc(), *lhs, *rhs, *accumulator,
+                             *transposeLhs, *transposeRhs);
+    }
     fragmentBuffers[contract.getResult()] = *accumulator;
     lowered.insert(contract);
     return success();

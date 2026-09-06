@@ -24,10 +24,10 @@ def fp8_mqa_logits(
     reduction_axis = I.domain(0, D)
     key_axis = I.domain(0, K)
     for query in I.parallel(I.domain(0, Q)):
-        head_logits = I.contract(
+        head_logits = I.matmul(
             q[query, head_axis, reduction_axis],
             kv[key_axis, reduction_axis],
-            reduce=((1, 1),),
+            transpose_rhs=True,
             acc_dtype=I.f32,
         )
         weighted = I.maximum(head_logits, 0.0) * head_weight[

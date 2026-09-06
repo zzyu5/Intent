@@ -40,10 +40,10 @@ def batched_gemm_tn(
     n_axis = I.domain(0, N)
     k_axis = I.domain(0, K)
     for batch in I.parallel(I.domain(0, Q)):
-        accumulator = I.contract(
+        accumulator = I.matmul(
             a[batch, k_axis, m_axis],
             b[batch, k_axis, n_axis],
-            reduce=((0, 0),),
+            transpose_lhs=True,
             acc_dtype=I.f32,
         )
         c[batch, m_axis, n_axis] = I.cast(accumulator, I.bf16)
@@ -61,10 +61,10 @@ def batched_gemm_nt(
     n_axis = I.domain(0, N)
     k_axis = I.domain(0, K)
     for batch in I.parallel(I.domain(0, Q)):
-        accumulator = I.contract(
+        accumulator = I.matmul(
             a[batch, m_axis, k_axis],
             b[batch, n_axis, k_axis],
-            reduce=((1, 1),),
+            transpose_rhs=True,
             acc_dtype=I.f32,
         )
         c[batch, m_axis, n_axis] = I.cast(accumulator, I.bf16)
@@ -82,10 +82,11 @@ def batched_gemm_tt(
     n_axis = I.domain(0, N)
     k_axis = I.domain(0, K)
     for batch in I.parallel(I.domain(0, Q)):
-        accumulator = I.contract(
+        accumulator = I.matmul(
             a[batch, k_axis, m_axis],
             b[batch, n_axis, k_axis],
-            reduce=((0, 1),),
+            transpose_lhs=True,
+            transpose_rhs=True,
             acc_dtype=I.f32,
         )
         c[batch, m_axis, n_axis] = I.cast(accumulator, I.bf16)

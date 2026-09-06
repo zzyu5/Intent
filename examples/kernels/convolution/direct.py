@@ -314,10 +314,9 @@ def conv2d_nhwc(
                         input_channels,
                         output_channels,
                     ]
-                    accumulator = accumulator + I.contract(
+                    accumulator = accumulator + I.matmul(
                         patch,
                         filter_values,
-                        reduce=((1, 0),),
                         acc_dtype=I.f32,
                     )
             output[
