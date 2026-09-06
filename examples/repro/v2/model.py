@@ -39,6 +39,7 @@ class Context:
     project_root: Path
     target: object
     provider: str
+    compiler_timeout_seconds: int = 15
 
 
 @dataclass(frozen=True)

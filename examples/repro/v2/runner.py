@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import csv
 import json
 import os
@@ -78,7 +79,7 @@ def _write_stage(path: Path, stage: str) -> None:
     temporary.replace(path)
 
 
-def _run_entry(provider: str, compiler: str, entry) -> ResultRow:
+def _run_entry(provider: str, compiler: str, entry, compiler_timeout: int) -> ResultRow:
     report_stage("device_setup")
     torch.cuda.set_device(0)
     torch.manual_seed(0)
@@ -88,6 +89,7 @@ def _run_entry(provider: str, compiler: str, entry) -> ResultRow:
         project_root=project_root,
         target=_target(provider),
         provider=provider,
+        compiler_timeout_seconds=compiler_timeout,
     )
     report_stage("adapter_loading")
     try:
@@ -180,10 +182,14 @@ def main() -> None:
     parser.add_argument("--kernel", action="append")
     parser.add_argument("--worker-timeout", type=int, default=WORKER_TIMEOUT_SECONDS,
                         help="wall-clock limit in seconds for each complete entry")
+    parser.add_argument("--cutile-compiler-timeout", type=int, default=15,
+                        help="default external cuTile compiler limit per candidate, in seconds")
     parser.add_argument("--worker-entry", type=int, help=argparse.SUPPRESS)
     arguments = parser.parse_args()
     if arguments.worker_timeout <= 0:
         parser.error("--worker-timeout must be positive")
+    if arguments.cutile_compiler_timeout <= 0:
+        parser.error("--cutile-compiler-timeout must be positive")
 
     provider = arguments.provider
     selected = set(arguments.kernel or ())
@@ -200,7 +206,15 @@ def main() -> None:
         entry = BY_PROVIDER[provider][arguments.worker_entry]
         phase_path = arguments.output.with_suffix(".phase.json")
         with observe_stages(lambda stage: _write_stage(phase_path, stage)):
-            _write(arguments.output, [_run_entry(provider, arguments.compiler, entry)])
+            compile_budget = nullcontext()
+            if provider == "cutile":
+                report_stage("provider_compiler_setup")
+                import cuda.tile as ct
+                compile_budget = ct.compiler_timeout(arguments.cutile_compiler_timeout)
+            with compile_budget:
+                _write(arguments.output, [_run_entry(
+                    provider, arguments.compiler, entry, arguments.cutile_compiler_timeout,
+                )])
         return
 
     rows: list[ResultRow] = []
@@ -227,6 +241,8 @@ def main() -> None:
                     str(worker_output),
                     "--worker-entry",
                     str(index),
+                    "--cutile-compiler-timeout",
+                    str(arguments.cutile_compiler_timeout),
                 ),
                 start_new_session=True,
             )

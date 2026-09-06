@@ -68,16 +68,15 @@ LogicalResult realizeGroupedContractionMapping(
   Value columnCount = mapping.getExtents()[*columnAxis];
   Value row = mapping.getCoordinates()[*rowAxis];
   Value column = mapping.getCoordinates()[*columnAxis];
-  Value linear = binary(binary(row, columnCount, BinaryOperator::Multiply),
-                        column, BinaryOperator::Add);
-  Value programsPerGroup =
-      binary(groupSize, columnCount, BinaryOperator::Multiply);
-  Value group = binary(linear, programsPerGroup, BinaryOperator::FloorDivide);
+  Value group = binary(row, groupSize, BinaryOperator::FloorDivide);
   Value firstRow = binary(group, groupSize, BinaryOperator::Multiply);
   Value liveRows = binary(rowCount, firstRow, BinaryOperator::Subtract);
   Value activeGroupSize =
       binary(liveRows, groupSize, BinaryOperator::MinimumNum);
-  Value groupOffset = binary(linear, programsPerGroup, BinaryOperator::Remainder);
+  Value rowInGroup = binary(row, groupSize, BinaryOperator::Remainder);
+  Value groupOffset = binary(
+      binary(rowInGroup, columnCount, BinaryOperator::Multiply), column,
+      BinaryOperator::Add);
   Value groupedRow =
       binary(firstRow,
              binary(groupOffset, activeGroupSize, BinaryOperator::Remainder),

@@ -65,7 +65,7 @@ def dense_gemm(context: Context) -> PreparedComparison:
     m, k, n = 4096, 4096, 14336
     a = torch.randn((m, k), device="cuda", dtype=torch.float16)
     b = torch.randn((k, n), device="cuda", dtype=torch.float16)
-    with ct.compiler_timeout(15):
+    with ct.compiler_timeout(context.compiler_timeout_seconds):
         artifact, generated = compile_single(
             context,
             gemm,
@@ -82,7 +82,9 @@ def dense_gemm(context: Context) -> PreparedComparison:
         "intent_v2_cutile_dense_gemm",
     )
     source = functional_launch(
-        lambda: source_module.cutile_matmul(a, b, tuning_configs=configs, compiler_timeout=15)
+        lambda: source_module.cutile_matmul(
+            a, b, tuning_configs=configs, compiler_timeout=context.compiler_timeout_seconds,
+        )
     )
     return PreparedComparison(
         generated,
@@ -96,7 +98,7 @@ def tilegym_dense_gemm(context: Context) -> PreparedComparison:
     m, k, n = 8192, 4096, 11008
     a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     b = torch.randn((k, n), device="cuda", dtype=torch.bfloat16)
-    with ct.compiler_timeout(15):
+    with ct.compiler_timeout(context.compiler_timeout_seconds):
         artifact, generated = compile_single(context, bf16_gemm, (a, b))
     configurations = contraction_configs(
         artifact, (a, b, generated.outputs()),
@@ -120,7 +122,7 @@ def tilegym_dense_gemm(context: Context) -> PreparedComparison:
             trans_b=False,
             static_persistent=True,
             tuning_configs=configs,
-            compiler_timeout=15,
+            compiler_timeout=context.compiler_timeout_seconds,
         )
     )
     return PreparedComparison(
@@ -135,12 +137,12 @@ def batched_gemm(context: Context) -> PreparedComparison:
     batch, m, k, n = 32, 512, 1024, 512
     a = torch.randn((batch, m, k), device="cuda", dtype=torch.bfloat16)
     b = torch.randn((batch, k, n), device="cuda", dtype=torch.bfloat16)
-    with ct.compiler_timeout(15):
+    with ct.compiler_timeout(context.compiler_timeout_seconds):
         artifact, generated = compile_single(context, batched_gemm_nn, (a, b))
     configs = contraction_configs(
         artifact, (a, b, generated.outputs()),
         m_axis=(0, 1), n_axis=(1, 2), k_axis=(0, 2), batch_axis=(0, 0),
-        fixed_options={"GROUP_SIZE_M": 8},
+        fixed_options={},
     )
     source_module = tilegym_source(
         context,
@@ -155,7 +157,7 @@ def batched_gemm(context: Context) -> PreparedComparison:
             transpose_b=False,
             static_persistent=True,
             tuning_configs=configs,
-            compiler_timeout=15,
+            compiler_timeout=context.compiler_timeout_seconds,
         )
     )
     return PreparedComparison(

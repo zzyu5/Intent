@@ -358,6 +358,36 @@ bool derivesFromAccessCoordinate(Value value, Value coordinate) {
          sameScalarExpression(valueRange.getStep(), coordinateRange.getStep());
 }
 
+bool valueKnownPositive(Value value, unsigned depth);
+bool valueKnownNonNegative(Value value, unsigned depth);
+
+bool valueBelowDelinearizeExtent(Value value, Value extent, unsigned depth) {
+  if (!value || depth >= 32)
+    return false;
+  if (auto result = dyn_cast<OpResult>(value))
+    if (auto mapping = dyn_cast<DelinearizeOp>(result.getOwner()))
+      return mapping.getExtents()[result.getResultNumber()] == extent &&
+             valueKnownNonNegative(mapping.getLinear(), depth + 1) &&
+             llvm::all_of(mapping.getExtents(), [&](Value bound) {
+               return valueKnownNonNegative(bound, depth + 1);
+             });
+  auto multiply = value.getDefiningOp<BinaryOp>();
+  if (!multiply || multiply.getOperatorKind() != BinaryOperator::Multiply)
+    return false;
+  // For x >= 0 and s > 0, floor(x / s) * s <= x.
+  for (auto [quotient, step] :
+       {std::pair{multiply.getLhs(), multiply.getRhs()},
+        std::pair{multiply.getRhs(), multiply.getLhs()}}) {
+    auto divide = quotient.getDefiningOp<BinaryOp>();
+    if (divide && divide.getOperatorKind() == BinaryOperator::FloorDivide &&
+        divide.getRhs() == step && valueKnownPositive(step, depth + 1) &&
+        valueKnownNonNegative(divide.getLhs(), depth + 1) &&
+        valueBelowDelinearizeExtent(divide.getLhs(), extent, depth + 1))
+      return true;
+  }
+  return false;
+}
+
 bool valueKnownPositive(Value value, unsigned depth = 0) {
   if (!value || depth >= 32)
     return false;
@@ -376,8 +406,12 @@ bool valueKnownPositive(Value value, unsigned depth = 0) {
   auto binary = value.getDefiningOp<BinaryOp>();
   if (!binary)
     return false;
+  if (binary.getOperatorKind() == BinaryOperator::Subtract)
+    return valueBelowDelinearizeExtent(binary.getRhs(), binary.getLhs(), depth + 1);
   if (binary.getOperatorKind() == BinaryOperator::Multiply ||
-      binary.getOperatorKind() == BinaryOperator::Add)
+      binary.getOperatorKind() == BinaryOperator::Add ||
+      binary.getOperatorKind() == BinaryOperator::Minimum ||
+      binary.getOperatorKind() == BinaryOperator::MinimumNum)
     return valueKnownPositive(binary.getLhs(), depth + 1) &&
            valueKnownPositive(binary.getRhs(), depth + 1);
   return false;
@@ -450,6 +484,8 @@ bool valueKnownNonNegative(Value value, unsigned depth = 0) {
   case BinaryOperator::MaximumNum:
     return lhs || rhs;
   case BinaryOperator::Subtract: {
+    if (valueBelowDelinearizeExtent(binary.getRhs(), binary.getLhs(), depth + 1))
+      return true;
     std::optional<int64_t> subtrahend = integerConstant(binary.getRhs());
     if (!subtrahend)
       return false;
@@ -466,6 +502,8 @@ bool valueKnownNonNegative(Value value, unsigned depth = 0) {
   case BinaryOperator::FloorDivide: {
     return lhs && valueKnownPositive(binary.getRhs(), depth + 1);
   }
+  case BinaryOperator::Remainder:
+    return lhs && valueKnownPositive(binary.getRhs(), depth + 1);
   default:
     return false;
   }

@@ -4396,6 +4396,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     pointwiseOwnershipAxes.push_back(axis);
   }
 
+  llvm::DenseMap<Attribute, CoordinateRole> contractionCoordinateRoles;
   for (auto [ownershipIndex, axis] :
        llvm::enumerate(pointwiseOwnershipAxes)) {
     ParameterOp parameter = parameters.lookup(axis);
@@ -4409,7 +4410,14 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       batchedContraction |= facts.batchedContraction;
     }
     ParameterRole ownershipRole = ParameterRole::OwnershipN;
-    if (!scalarGridAxis && contractSides == ContractFreeAxisLhs)
+    auto declaredRole =
+        static_cast<ParameterRole>(parameter.getParameter().getRole());
+    if (parameter.getParameter().getCategory() ==
+            static_cast<uint32_t>(ParameterCategory::Contraction) &&
+        (declaredRole == ParameterRole::OwnershipM ||
+         declaredRole == ParameterRole::OwnershipN))
+      ownershipRole = declaredRole;
+    else if (!scalarGridAxis && contractSides == ContractFreeAxisLhs)
       ownershipRole = ParameterRole::OwnershipM;
     else if (!scalarGridAxis &&
              ownershipIndex + 2 == pointwiseOwnershipAxes.size())
@@ -4437,7 +4445,19 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         category,
         pointwiseElementBitWidth, candidates);
     parameter->setAttr("parameter", schema);
+    if (category == static_cast<uint32_t>(ParameterCategory::Contraction))
+      contractionCoordinateRoles[axis] =
+          ownershipRole == ParameterRole::OwnershipM
+              ? CoordinateRole::ContractionM
+              : CoordinateRole::ContractionN;
   }
+  if (llvm::count_if(contractionCoordinateRoles, [](const auto &entry) {
+        return entry.second == CoordinateRole::ContractionM;
+      }) != 1 ||
+      llvm::count_if(contractionCoordinateRoles, [](const auto &entry) {
+        return entry.second == CoordinateRole::ContractionN;
+      }) != 1)
+    contractionCoordinateRoles.clear();
 
   if (ownershipOnly) {
     llvm::MapVector<Attribute, SmallVector<MakeRangeOp>> selectedAxes;
@@ -4660,6 +4680,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       if (existing.size() == mapping.getNumResults())
         llvm::copy(existing.asArrayRef(), coordinateRoles.begin());
     auto ownershipRole = [&](Attribute axis) {
+      auto contraction = contractionCoordinateRoles.find(axis);
+      if (contraction != contractionCoordinateRoles.end())
+        return contraction->second;
       return llvm::any_of(axes.lookup(axis), [](MakeRangeOp range) {
                return range->hasAttr(worksetCoordinateRangeAttr);
              })
