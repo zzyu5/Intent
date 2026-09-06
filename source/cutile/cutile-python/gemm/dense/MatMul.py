@@ -6,9 +6,37 @@ import argparse
 import cuda.tile as ct
 import torch
 from math import ceil  # Required for host-side grid calculation
+from cuda.tile.tune import exhaustive_search
 
 
 ConstInt = ct.Constant[int]
+_tune_cache = {}
+
+
+@ct.function
+def _load_matmul_tile(array, row, column, ROWS: ConstInt, COLUMNS: ConstInt, ACCESS_FORM: ConstInt):
+    if ACCESS_FORM == 2:
+        rows = row * ROWS + ct.arange(ROWS, dtype=ct.int32)
+        columns = column * COLUMNS + ct.arange(COLUMNS, dtype=ct.int32)
+        return ct.gather(
+            array, (ct.expand_dims(rows, 1), ct.expand_dims(columns, 0)),
+            padding_value=0, check_bounds=True,
+        )
+    return ct.load(
+        array, index=(row, column), shape=(ROWS, COLUMNS),
+        padding_mode=ct.PaddingMode.ZERO, allow_tma=ACCESS_FORM == 1,
+    )
+
+
+@ct.function
+def _store_matmul_tile(array, row, column, tile, ACCESS_FORM: ConstInt):
+    if ACCESS_FORM == 2:
+        rows = row * tile.shape[0] + ct.arange(tile.shape[0], dtype=ct.int32)
+        columns = column * tile.shape[1] + ct.arange(tile.shape[1], dtype=ct.int32)
+        ct.scatter(array, (ct.expand_dims(rows, 1), ct.expand_dims(columns, 0)),
+                   tile, check_bounds=True)
+    else:
+        ct.store(array, index=(row, column), tile=tile, allow_tma=ACCESS_FORM == 1)
 
 
 def swizzle_2d_from_bid(M, N, tm, tn, GROUP_SIZE_M, bid):
@@ -34,7 +62,8 @@ def swizzle_2d(M, N, tm, tn, GROUP_SIZE_M):
 def matmul_kernel(A, B, C,
                   tm: ConstInt,         # Tile size along M dimension (rows of C)
                   tn: ConstInt,         # Tile size along N dimension (columns of C)
-                  tk: ConstInt):        # Tile size along K dimension (inner product dimension)
+                  tk: ConstInt,         # Tile size along K dimension (inner product dimension)
+                  GROUP_SIZE_M: ConstInt, ACCESS_FORM: ConstInt):
     """
     cuTile kernel for performing matrix multiplication C = A @ B.
 
@@ -53,7 +82,6 @@ def matmul_kernel(A, B, C,
         tk (ConstInt): The depth of the inner loop (K-dimension) tile size.
                        Corresponds to columns of A and rows of B.
     """
-    GROUP_SIZE_M = 8
     M = A.shape[0]
     N = B.shape[1]
     bidx, bidy = swizzle_2d(M, N, tm, tn, GROUP_SIZE_M)
@@ -69,7 +97,6 @@ def matmul_kernel(A, B, C,
     # It's common practice to use `float32` for accumulation even with `float16` inputs
     # to maintain higher precision during the sum-reduction of the matrix multiplication.
     accumulator = ct.full((tm, tn), 0, dtype=ct.float32)
-    zero_pad = ct.PaddingMode.ZERO
 
     # Convert fp32 to tf32 to use tensorcore
     dtype = ct.tfloat32 if A.dtype == ct.float32 else A.dtype
@@ -81,12 +108,12 @@ def matmul_kernel(A, B, C,
         # Load tile from matrix A.
         # The `index=(bidx, k_tile_idx)` specifies which (M-tile, K-tile) to load
         # from global memory A. `shape=(tm, tk)` defines the size of this tile.
-        a = ct.load(A, index=(bidx, k), shape=(tm, tk), padding_mode=zero_pad).astype(dtype)
+        a = _load_matmul_tile(A, bidx, k, tm, tk, ACCESS_FORM).astype(dtype)
 
         # Load tile from matrix B.
         # The `index=(k_tile_idx, bidy)` specifies which (K-tile, N-tile) to load
         # from global memory B. `shape=(tk, tn)` defines the size of this tile.
-        b = ct.load(B, index=(k, bidy), shape=(tk, tn), padding_mode=zero_pad).astype(dtype)
+        b = _load_matmul_tile(B, k, bidy, tk, tn, ACCESS_FORM).astype(dtype)
 
         # Perform Matrix Multiplication for the current tiles.
         # `ct.mma` computes the product of the two loaded tiles and accumulates the result.
@@ -98,14 +125,15 @@ def matmul_kernel(A, B, C,
 
     # Store the computed tile to the global memory of the output matrix C.
     # The `(bidx, bidy)` directly corresponds to the tile's position in the 2D output matrix.
-    ct.store(C, index=(bidx, bidy), tile=accumulator)
+    _store_matmul_tile(C, bidx, bidy, accumulator, ACCESS_FORM)
 
 
 @ct.kernel
 def persistent_matmul_kernel(A, B, C,
                              tm: ConstInt,   # Tile size along M dimension (rows of C)
                              tn: ConstInt,   # Tile size along N dimension (columns of C)
-                             tk: ConstInt):  # Tile size along K dimension
+                             tk: ConstInt,   # Tile size along K dimension
+                             GROUP_SIZE_M: ConstInt, ACCESS_FORM: ConstInt):
     """
     cuTile persistent kernel for performing matrix multiplication C = A @ B.
 
@@ -123,8 +151,6 @@ def persistent_matmul_kernel(A, B, C,
         tk (ConstInt): The depth of the inner loop (K-dimension) tile size.
                        Corresponds to columns of A and rows of B.
     """
-    GROUP_SIZE_M = 8
-
     bid = ct.bid(0)
     M = A.shape[0]
     N = B.shape[1]
@@ -134,7 +160,6 @@ def persistent_matmul_kernel(A, B, C,
     # from matrix A's shape, assuming A's shape is conceptually (M_tiles, K_tiles),
     # and then implicitly performs ceiling division by `tk` to get the number of K-tiles.
     num_tiles_k = ct.num_tiles(A, axis=1, shape=(tm, tk))
-    zero_pad = ct.PaddingMode.ZERO
 
     # Convert fp32 to tf32 to use tensorcore
     dtype = ct.tfloat32 if A.dtype == ct.float32 else A.dtype
@@ -160,12 +185,12 @@ def persistent_matmul_kernel(A, B, C,
             # Load tile from matrix A.
             # The `index=(bidx, k_tile_idx)` specifies which (M-tile, K-tile) to load
             # from global memory A. `shape=(tm, tk)` defines the size of this tile.
-            a = ct.load(A, index=(bidx, k), shape=(tm, tk), padding_mode=zero_pad).astype(dtype)
+            a = _load_matmul_tile(A, bidx, k, tm, tk, ACCESS_FORM).astype(dtype)
 
             # Load tile from matrix B.
             # The `index=(k_tile_idx, bidy)` specifies which (K-tile, N-tile) to load
             # from global memory B. `shape=(tk, tn)` defines the size of this tile.
-            b = ct.load(B, index=(k, bidy), shape=(tk, tn), padding_mode=zero_pad).astype(dtype)
+            b = _load_matmul_tile(B, k, bidy, tk, tn, ACCESS_FORM).astype(dtype)
 
             # Perform Matrix Multiplication for the current tiles.
             # `ct.mma` computes the product of the two loaded tiles and accumulates the result.
@@ -173,10 +198,44 @@ def persistent_matmul_kernel(A, B, C,
 
         # Cast result back to C.dtype and store
         accumulator = ct.astype(accumulator, C.dtype)
-        ct.store(C, index=(bidx, bidy), tile=accumulator)
+        _store_matmul_tile(C, bidx, bidy, accumulator, ACCESS_FORM)
 
 
-def cutile_matmul(A: torch.Tensor, B: torch.Tensor, persistent: bool = False) -> torch.Tensor:
+def _autotune_matmul(a, b, c, kernel, persistent, configs, compiler_timeout):
+    configs = tuple(configs)
+    for cfg in configs:
+        if vars(cfg).keys() != {"TILE_M", "TILE_N", "TILE_K", "GROUP_SIZE_M",
+                               "ACCESS_FORM", "num_ctas", "occupancy"}:
+            raise ValueError("matmul requires complete candidates without unconsumed fields")
+    config_key = tuple(tuple(sorted(vars(cfg).items())) for cfg in configs)
+    key = (tuple(a.shape), tuple(b.shape), tuple(a.stride()), tuple(b.stride()),
+           a.storage_offset(), b.storage_offset(), a.dtype, b.dtype, str(a.device),
+           persistent, config_key, compiler_timeout)
+
+    def grid_fn(cfg):
+        blocks = ceil(a.shape[0] / cfg.TILE_M) * ceil(b.shape[1] / cfg.TILE_N)
+        if persistent:
+            blocks = min(torch.cuda.get_device_properties(a.device).multi_processor_count, blocks)
+        return (blocks, 1, 1)
+
+    def args_fn(cfg):
+        return (a, b, c, cfg.TILE_M, cfg.TILE_N, cfg.TILE_K, cfg.GROUP_SIZE_M, cfg.ACCESS_FORM)
+
+    stream = torch.cuda.current_stream(a.device)
+    if key not in _tune_cache:
+        with ct.compiler_timeout(compiler_timeout):
+            result = exhaustive_search(
+                configs, stream, grid_fn, kernel, args_fn,
+                lambda cfg: {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy},
+            )
+        cfg = result.best.config
+        _tune_cache[key] = (cfg, kernel.replace_hints(num_ctas=cfg.num_ctas, occupancy=cfg.occupancy))
+    cfg, tuned_kernel = _tune_cache[key]
+    ct.launch(stream, grid_fn(cfg), tuned_kernel, args_fn(cfg))
+
+
+def cutile_matmul(A: torch.Tensor, B: torch.Tensor, persistent: bool = False,
+                  *, tuning_configs=None, compiler_timeout=15) -> torch.Tensor:
     """
     Performs matrix multiplication C = A @ B using a cuTile kernel with a 2D grid.
 
@@ -246,7 +305,10 @@ def cutile_matmul(A: torch.Tensor, B: torch.Tensor, persistent: bool = False) ->
     # The `matmul_kernel` is launched with the calculated grid dimensions.
     # `tm`, `tn`, and `tk` are passed as Constant integers to the kernel.
     kernel = persistent_matmul_kernel if persistent else matmul_kernel
-    ct.launch(torch.cuda.current_stream(), grid, kernel, (A, B, C, tm, tn, tk))
+    if tuning_configs is None:
+        ct.launch(torch.cuda.current_stream(), grid, kernel, (A, B, C, tm, tn, tk, 8, 1))
+    else:
+        _autotune_matmul(A, B, C, kernel, persistent, tuning_configs, compiler_timeout)
 
     return C
 

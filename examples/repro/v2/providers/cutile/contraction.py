@@ -63,18 +63,25 @@ def dense_gemm(context: Context) -> PreparedComparison:
     m, k, n = 4096, 4096, 14336
     a = torch.randn((m, k), device="cuda", dtype=torch.float16)
     b = torch.randn((k, n), device="cuda", dtype=torch.float16)
-    _, generated = compile_single(
-        context,
-        gemm,
-        (a, b),
-        constexprs={"ACTIVATION": Activation.NONE},
+    with ct.compiler_timeout(15):
+        artifact, generated = compile_single(
+            context,
+            gemm,
+            (a, b),
+            constexprs={"ACTIVATION": Activation.NONE},
+        )
+    configs = contraction_configs(
+        artifact, (a, b, generated.outputs()),
+        m_axis=(0, 0), n_axis=(1, 1), k_axis=(0, 1), fixed_options={"num_ctas": 1},
     )
     source_module = official_source(
         context,
         "source/cutile/cutile-python/gemm/dense/MatMul_runtime.py",
         "intent_v2_cutile_dense_gemm",
     )
-    source = functional_launch(lambda: source_module.cutile_matmul(a, b))
+    source = functional_launch(
+        lambda: source_module.cutile_matmul(a, b, tuning_configs=configs, compiler_timeout=15)
+    )
     return PreparedComparison(
         generated,
         source,
@@ -123,6 +130,7 @@ def batched_gemm(context: Context) -> PreparedComparison:
     configs = contraction_configs(
         artifact, (a, b, generated.outputs()),
         m_axis=(0, 1), n_axis=(1, 2), k_axis=(0, 2), batch_axis=(0, 0),
+        fixed_options={"GROUP_SIZE_M": 8, "num_ctas": 1},
     )
     source_module = tilegym_source(
         context,

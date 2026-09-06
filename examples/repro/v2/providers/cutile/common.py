@@ -11,7 +11,9 @@ from ...measurement import report_stage
 from ...model import Context
 
 
-def contraction_configs(artifact, arguments, *, m_axis, n_axis, k_axis, batch_axis=None):
+def contraction_configs(
+    artifact, arguments, *, m_axis, n_axis, k_axis, fixed_options, batch_axis=None,
+):
     report_stage("generated_tuning_metadata")
     try:
         configurations = artifact.tuning_configurations(*arguments)
@@ -29,6 +31,8 @@ def contraction_configs(artifact, arguments, *, m_axis, n_axis, k_axis, batch_ax
                 field = "ACCESS_FORM"
             elif role == ParameterRole.PROVIDER_OCCUPANCY:
                 field = "occupancy"
+            elif role == ParameterRole.TRAVERSAL_GROUP:
+                field = "GROUP_SIZE_M"
             elif role == ParameterRole.REDUCTION and axis == k_axis:
                 field = "TILE_K"
             elif role in (ParameterRole.OWNERSHIP_M, ParameterRole.OWNERSHIP_N):
@@ -51,11 +55,15 @@ def contraction_configs(artifact, arguments, *, m_axis, n_axis, k_axis, batch_ax
             if field in values:
                 raise ValueError(f"multiple physical parameters bind source field {field}")
             values[field] = value
-        if values.keys() != {"TILE_M", "TILE_N", "TILE_K", "ACCESS_FORM", "occupancy"}:
+        if values.keys() & fixed_options.keys():
+            raise PipelineStageError("source_candidate_binding", "fixed options overlap tuned parameters")
+        values.update(fixed_options)
+        if values.keys() != {"TILE_M", "TILE_N", "TILE_K", "ACCESS_FORM", "occupancy",
+                             "GROUP_SIZE_M", "num_ctas"}:
             raise PipelineStageError(
                 "source_candidate_binding", "source requires a complete contraction candidate",
             )
-        result.append(SimpleNamespace(**values, GROUP_SIZE_M=8, num_ctas=1))
+        result.append(SimpleNamespace(**values))
     report_stage("adapter_preparation")
     return tuple(result)
 
