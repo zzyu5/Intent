@@ -911,6 +911,12 @@ LogicalResult verifyHelperRegion(Operation *owner, Region &region,
     return failure();
   }
   WalkResult effects = region.walk([&](Operation *nested) {
+    for (Value operand : nested->getOperands())
+      if (!region.isAncestor(operand.getParentRegion())) {
+        nested->emitOpError(
+            "physical helper captures must use explicit region arguments");
+        return WalkResult::interrupt();
+      }
     if (isa<YieldOp>(nested))
       return WalkResult::advance();
     if (!isMemoryEffectFree(nested)) {
@@ -1085,6 +1091,13 @@ LogicalResult ReduceOp::verify() {
 }
 
 LogicalResult ScanOp::verify() {
+  if (getSourceCount() > getInputs().size() ||
+      getSourceCount() != getNumResults())
+    return emitOpError("physical scan requires one result per source component");
+  for (auto [source, result] :
+       llvm::zip(getInputs().take_front(getSourceCount()), getResults()))
+    if (source.getType() != result.getType())
+      return emitOpError("physical scan result must preserve its source type");
   for (Value source : getInputs().take_front(getSourceCount()))
     if (!typeCarriesAxis(source.getType(), getAxis()))
       return emitOpError("physical scan axis is outside a source schema");

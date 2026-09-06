@@ -14,6 +14,7 @@ from kernels.routing.moe_align import moe_prefix_routes
 from kernels.routing.moe_align import moe_scatter_routes
 
 from ...measurement import compile_single
+from ...measurement import initial_launch
 from ...model import Context
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
@@ -66,8 +67,9 @@ def expert_projection(context: Context) -> PreparedComparison:
         (tokens, topk), 1.0 / topk, device="cuda", dtype=torch.bfloat16
     )
     runtime = _runtime(context)
-    sorted_ids, expert_ids, padded_tokens, _, _ = runtime.align.moe_align_block_size(
-        topk_ids, BLOCK_SIZE, experts
+    sorted_ids, expert_ids, padded_tokens, _, _ = initial_launch(
+        lambda: runtime.align.moe_align_block_size(topk_ids, BLOCK_SIZE, experts),
+        side="source",
     )
     flat_experts = topk_ids.flatten()
     member_routes = torch.argsort(flat_experts, stable=True).to(torch.int32)
@@ -120,7 +122,7 @@ def expert_projection(context: Context) -> PreparedComparison:
             False,
         )
 
-    source_launch()
+    initial_launch(source_launch, side="source")
     source = PreparedLaunch(source_launch, lambda: source_output)
     return PreparedComparison(
         generated,
@@ -133,15 +135,14 @@ def expert_projection(context: Context) -> PreparedComparison:
 def alignment(context: Context) -> PreparedComparison:
     tokens, topk = 4096, 2
     source_ids = (
-        torch.arange(tokens * topk, device="cuda", dtype=torch.long)
+        torch.arange(tokens * topk, device="cuda", dtype=torch.int32)
         .remainder(EXPERTS)
         .reshape(tokens, topk)
         .contiguous()
     )
-    generated_ids = source_ids.to(torch.int32)
     expert_counts = torch.zeros((EXPERTS,), device="cuda", dtype=torch.int32)
     _, count = compile_single(
-        context, moe_count_routes, (generated_ids, expert_counts)
+        context, moe_count_routes, (source_ids, expert_counts)
     )
     _, prefix = compile_single(context, moe_prefix_routes, (expert_counts,))
     expert_offsets, total_padded = prefix.outputs()
@@ -152,7 +153,7 @@ def alignment(context: Context) -> PreparedComparison:
     _, scatter = compile_single(
         context,
         moe_scatter_routes,
-        (generated_ids, expert_offsets, expert_cursors, sorted_routes),
+        (source_ids, expert_offsets, expert_cursors, sorted_routes),
     )
     _, mark = compile_single(context, moe_mark_expert_blocks, (expert_offsets,))
     expert_blocks = mark.outputs()
@@ -172,7 +173,7 @@ def alignment(context: Context) -> PreparedComparison:
         return _canonical_alignment(sorted_routes, expert_blocks, total_padded)
 
     generated_prepare()
-    generated_launch()
+    initial_launch(generated_launch, side="generated")
     generated = PreparedLaunch(
         generated_launch,
         generated_outputs,
@@ -190,13 +191,14 @@ def alignment(context: Context) -> PreparedComparison:
         sorted_ids, expert_ids, total, _, _ = source_state["outputs"]
         return _canonical_alignment(sorted_ids, expert_ids, total)
 
-    source_launch()
+    initial_launch(source_launch, side="source")
     source = PreparedLaunch(source_launch, source_outputs)
     return PreparedComparison(
         generated,
         source,
         (Tolerance(atol=0.0), Tolerance(atol=0.0), Tolerance(atol=0.0)),
         cuda_graph=False,
+        status="source_algorithm_and_timing_contract_gap",
     )
 
 

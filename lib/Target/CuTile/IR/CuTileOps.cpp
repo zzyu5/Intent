@@ -246,8 +246,8 @@ LogicalResult ExtractScalarOp::verify() {
     return emitOpError(
         "requires one scalar element coordinate per source tile axis");
   for (Value coordinate : getCoordinates())
-    if (!coordinate.getType().isIntOrIndex())
-      return emitOpError("requires integer scalar coordinates");
+    if (!coordinate.getType().isInteger(32))
+      return emitOpError("requires i32 scalar tile coordinates");
   if (static_cast<bool>(getValid()) != static_cast<bool>(getFill()) ||
       (getValid() && (!getValid().getType().isInteger(1) ||
                       getFill().getType() != getResult().getType())))

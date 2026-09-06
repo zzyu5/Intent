@@ -225,6 +225,9 @@ MakeRangeOp sourceRange(Value value) {
     return {};
   PhysicalProgramAnalysis analysis(kernel);
   PhysicalRangeFact fact = analysis.sourceRanges(value);
+  // Read-dependent coordinates use indirect-row replay, not direct range blocking.
+  if (!fact.accesses.empty())
+    return {};
   FailureOr<MakeRangeOp> range = queryExactLogicalRange(fact);
   return succeeded(range) ? *range : MakeRangeOp();
 }

@@ -977,6 +977,34 @@ FailureOr<Value> materializeReplayedValue(
   if (!replay.isReplayable())
     return failure();
 
+  SmallVector<PhysicalSourceAxis> replaySources{source};
+  for (MakeRangeOp range : options.traversalRanges) {
+    PhysicalSourceAxis occurrence = sourceAxisIdentity(range);
+    if (!llvm::is_contained(replaySources, occurrence))
+      replaySources.push_back(occurrence);
+    if (!analysis.replayability(value, occurrence, options.scope,
+                               options.allowAccesses).isReplayable())
+      return failure();
+  }
+  bool projectionFailed = false;
+  auto replayProjection = [&](Type type) {
+    PhysicalAxisProjection result;
+    for (PhysicalSourceAxis occurrence : replaySources) {
+      PhysicalAxisProjection current = queryFragmentAxis(type, occurrence);
+      if (current.state == PhysicalFactState::Ambiguous ||
+          (result.isExact() && current.isExact() &&
+           (result.fragmentAxis != current.fragmentAxis ||
+            result.dimensionId != current.dimensionId))) {
+        result.state = PhysicalFactState::Ambiguous;
+        projectionFailed = true;
+        return result;
+      }
+      if (!current.isExact())
+        continue;
+      result = current;
+    }
+    return result;
+  };
   auto replaceReplayAxis = [&](FragmentType type, unsigned axis) {
     SmallVector<Attribute> shape(type.getShape().begin(), type.getShape().end());
     SmallVector<Attribute> axes(type.getAxisMaps().begin(),
@@ -996,7 +1024,7 @@ FailureOr<Value> materializeReplayedValue(
   };
   std::function<Type(Type)> replaceReplayType = [&](Type type) -> Type {
     if (auto fragment = dyn_cast<FragmentType>(type)) {
-      PhysicalAxisProjection projection = queryFragmentAxis(fragment, source);
+      PhysicalAxisProjection projection = replayProjection(fragment);
       return projection.isExact()
                  ? Type(replaceReplayAxis(fragment, projection.fragmentAxis))
                  : type;
@@ -1025,7 +1053,7 @@ FailureOr<Value> materializeReplayedValue(
       -> std::optional<unsigned> {
     auto fragment = dyn_cast<FragmentType>(current.getType());
     PhysicalAxisProjection projection =
-        fragment ? queryFragmentAxis(fragment, source)
+        fragment ? replayProjection(fragment)
                  : PhysicalAxisProjection{};
     if (!fragment || !projection.isExact())
       return std::nullopt;
@@ -1306,7 +1334,8 @@ FailureOr<Value> materializeReplayedValue(
     return clonedValue;
   };
 
-  return materialize(value);
+  FailureOr<Value> result = materialize(value);
+  return projectionFailed ? FailureOr<Value>(failure()) : result;
 }
 
 FailureOr<Value> projectPredicateToFragment(OpBuilder &builder,
@@ -2495,7 +2524,7 @@ static void retargetExtent(Value root, AxisSelector selects,
     }
     Operation *definition = value.getDefiningOp();
     if (isa_and_nonnull<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp,
-                        BitcastOp, ReshapeOp>(definition)) {
+                        BitcastOp, ReshapeOp, LoadOp>(definition)) {
       worklist.append(definition->getOperands().begin(),
                       definition->getOperands().end());
     } else if (auto broadcast = dyn_cast_or_null<BroadcastOp>(definition)) {

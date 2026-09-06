@@ -13,6 +13,7 @@
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Support/MathExtras.h"
 
 #include <optional>
 
@@ -1217,6 +1218,8 @@ bool hasNativeMMAAxes(gpu::ContractOp contract) {
 Attribute scalarConstant(Value value) {
   while (true) {
     if (auto cast = value.getDefiningOp<gpu::CastOp>()) {
+      if (cast.getValue().getType() != cast.getResult().getType())
+        return {};
       value = cast.getValue();
       continue;
     }
@@ -1407,6 +1410,37 @@ StringRef occupancyFamily(func::FuncOp kernel,
     return "occupancy_loop";
   return capabilities.getComputeCapabilityMajor() < 9
              ? "occupancy_legacy" : "occupancy_modern";
+}
+
+LogicalResult verifyScan(gpu::ScanOp scan) {
+  if (scan.getSourceCount() == 0 ||
+      scan.getSourceCount() != scan.getIdentityCount() ||
+      scan.getSourceCount() != scan.getNumResults() ||
+      scan.getCaptureCount() != 0 || !scan.getInclusive())
+    return scan.emitOpError(
+        "cuTile scan lowering requires matching source/identity/result schemas, no captures, and an inclusive prefix");
+  auto source = dyn_cast<gpu::FragmentType>(scan.getInputs().front().getType());
+  if (!source)
+    return scan.emitOpError("cuTile scan source must be a tile");
+  for (auto [input, identity] : llvm::zip(
+           scan.getInputs().take_front(scan.getSourceCount()),
+           scan.getInputs().slice(scan.getSourceCount(), scan.getIdentityCount()))) {
+    auto fragment = dyn_cast<gpu::FragmentType>(input.getType());
+    if (!fragment || fragment.getShape() != source.getShape())
+      return scan.emitOpError(
+          "cuTile scan lowering requires source components with the same physical shape");
+    auto constant = dyn_cast_or_null<TypedAttr>(scalarConstant(identity));
+    if (!constant || constant.getType() != fragment.getElementType())
+      return scan.emitOpError(
+          "cuTile scan identity must be an explicit scalar constant of the source dtype");
+  }
+  for (Operation &operation : scan.getCombine().front())
+    if (!isa<arith::ConstantOp, gpu::UnaryOp, gpu::BinaryOp, gpu::CompareOp,
+             gpu::SelectOp, gpu::CastOp, gpu::BitcastOp, gpu::MakeRecordOp,
+             gpu::ExtractOp, gpu::YieldOp>(operation))
+      return scan.emitOpError(
+          "cuTile scan callback lowering requires scalar elementwise operations");
+  return success();
 }
 
 LogicalResult formNativeTiles(func::FuncOp kernel,
@@ -1727,6 +1761,12 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
     if (llvm::any_of(coordinates, [](Value coordinate) { return !coordinate; }))
       return gather.emitOpError("cuTile tile extraction source axes are incomplete");
     OpBuilder builder(gather);
+    // In-bounds coordinates fit i32 under cuTile's tile-size limit.
+    // This does not narrow external view dimensions or address arithmetic.
+    for (Value &coordinate : coordinates)
+      if (!coordinate.getType().isInteger(32))
+        coordinate = builder.create<gpu::CastOp>(
+            gather.getLoc(), builder.getI32Type(), coordinate);
     auto replacement = builder.create<ExtractScalarOp>(
         gather.getLoc(), gather.getResult().getType(), gather.getSource(),
         coordinates, gather.getValid(), gather.getFill());
@@ -1833,20 +1873,18 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
   }
 
   for (gpu::ScanOp scan : scans) {
+    if (failed(verifyScan(scan)))
+      return failure();
     std::optional<BinaryOperator> kind = nativeCombineKind(scan.getCombine());
-    if (scan.getSourceCount() != 1 || scan.getIdentityCount() != 1 ||
-        scan.getCaptureCount() != 0 || scan.getNumResults() != 1 || !kind ||
-        *kind != BinaryOperator::Add || !scan.getInclusive() ||
-        scan.getReverse())
-      return scan.emitOpError(
-          "cuTile native scan requires one source/identity, inclusive forward additive combine");
-    auto source = dyn_cast<gpu::FragmentType>(scan.getInputs().front().getType());
-    if (!source)
-      return scan.emitOpError("cuTile native scan source must be a tile");
+    if (scan.getSourceCount() != 1 || !kind || *kind != BinaryOperator::Add ||
+        !isNativeReductionIdentity(*kind, scan.getInputs()[1]))
+      continue;
     OpBuilder builder(scan);
     auto replacement = builder.create<ScanOp>(
         scan.getLoc(), cast<gpu::FragmentType>(scan.getResultTypes().front()),
-        scan.getInputs().front(), scan.getAxis(), *kind, false);
+        scan.getInputs().front(), scan.getAxis(), *kind, scan.getReverse());
+    if (Attribute origin = scan->getAttr(gpu::originAttr))
+      replacement->setAttr(gpu::originAttr, origin);
     scan.getResults().front().replaceAllUsesWith(replacement.getResult());
     scan.erase();
   }
@@ -2346,6 +2384,14 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
         return WalkResult::interrupt();
       }
     }
+    if (auto scan = dyn_cast<gpu::ScanOp>(operation))
+      if (failed(verifyScan(scan)))
+        return WalkResult::interrupt();
+    if (auto loop = dyn_cast<scf::ForOp>(operation))
+      if (!loop.getInductionVar().getType().isSignlessInteger(32)) {
+        loop.emitOpError("cuTile native for requires an i32 induction variable");
+        return WalkResult::interrupt();
+      }
     for (Type type : operation->getResultTypes()) {
       if (auto fragment = dyn_cast<gpu::FragmentType>(type)) {
         if (!isCuTileScalarType(fragment.getElementType())) {
@@ -2360,7 +2406,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     }
     if (isa<TileLoadOp, TileStoreOp, ScalarLoadOp, ScalarStoreOp, GatherLoadOp,
             ScatterStoreOp, AtomicRMWOp, ExtractScalarOp, MMAOp, ScaledMMAOp,
-            ReduceOp, ScanOp, gpu::ReduceOp, gpu::ParameterOp,
+            ReduceOp, ScanOp, gpu::ReduceOp, gpu::ScanOp, gpu::ParameterOp,
             gpu::PhysicalExprOp, gpu::ProgramIdOp, gpu::WorksetCoordinateOp,
             gpu::DelinearizeOp,
             gpu::DimOp, gpu::RangeOp, gpu::RangeBoundOp, gpu::MakeRangeOp,
@@ -2377,6 +2423,67 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
   return result.wasInterrupted() ? failure() : success();
 }
 
+bool fitsNativeLoopBound(Value value, unsigned depth = 0) {
+  if (depth >= 32)
+    return false;
+  auto integer = dyn_cast<IntegerType>(value.getType());
+  if (integer && (integer.getWidth() < 32 ||
+                  (integer.getWidth() == 32 && !integer.isUnsigned())))
+    return true;
+  if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
+    auto attribute = dyn_cast<IntegerAttr>(constant.getValue());
+    if (!attribute)
+      return false;
+    return integer && integer.isUnsigned()
+               ? attribute.getValue().getActiveBits() < 32
+               : attribute.getValue().isSignedIntN(32);
+  }
+  if (auto parameter = value.getDefiningOp<gpu::ParameterOp>())
+    return llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
+                        [](int64_t candidate) { return llvm::isInt<32>(candidate); });
+  if (auto bound = value.getDefiningOp<gpu::RangeBoundOp>())
+    if (auto range = bound.getRange().getDefiningOp<gpu::RangeOp>())
+      return fitsNativeLoopBound(bound.getBound() == 0 ? range.getStart()
+                                 : bound.getBound() == 1 ? range.getStop()
+                                                        : range.getStep(),
+                                 depth + 1);
+  if (auto cast = value.getDefiningOp<gpu::CastOp>())
+    if (value.getType().isIndex() ||
+        (integer && integer.getWidth() == 64 && !integer.isUnsigned()))
+      return fitsNativeLoopBound(cast.getValue(), depth + 1);
+  return false;
+}
+
+bool isSpecializedLoopBound(Value value, unsigned depth = 0) {
+  if (depth >= 32)
+    return false;
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    auto kernel = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
+    if (!kernel)
+      return false;
+    auto kind = kernel.getArgAttrOfType<StringAttr>(argument.getArgNumber(),
+                                                   gpu::abiKindAttr);
+    return kind && (kind.getValue() == "dimension" ||
+                    kind.getValue() == "stride" ||
+                    kind.getValue() == "constexpr");
+  }
+  Operation *producer = value.getDefiningOp();
+  if (isa_and_nonnull<arith::ConstantOp, gpu::ParameterOp, gpu::DimOp>(producer))
+    return true;
+  if (auto bound = dyn_cast_or_null<gpu::RangeBoundOp>(producer)) {
+    auto range = bound.getRange().getDefiningOp<gpu::RangeOp>();
+    return range && isSpecializedLoopBound(
+                        bound.getBound() == 0 ? range.getStart()
+                        : bound.getBound() == 1 ? range.getStop()
+                                               : range.getStep(),
+                        depth + 1);
+  }
+  return isa_and_nonnull<gpu::CastOp, gpu::BinaryOp>(producer) &&
+         llvm::all_of(producer->getOperands(), [&](Value operand) {
+           return isSpecializedLoopBound(operand, depth + 1);
+         });
+}
+
 void realizeWideLoops(func::FuncOp kernel) {
   SmallVector<scf::ForOp> loops;
   kernel.walk<WalkOrder::PostOrder>([&](scf::ForOp loop) {
@@ -2385,37 +2492,115 @@ void realizeWideLoops(func::FuncOp kernel) {
       loops.push_back(loop);
   });
   for (scf::ForOp loop : loops) {
-    // cuTile range has an i32 induction variable even with i64 bounds.
-    // Preserve the actual wide induction value as ordinary while-loop state.
     OpBuilder builder(loop);
     Location location = loop.getLoc();
-    SmallVector<Value> initial{loop.getLowerBound()};
-    llvm::append_range(initial, loop.getInitArgs());
-    SmallVector<Type> types;
-    for (Value value : initial)
-      types.push_back(value.getType());
-    SmallVector<Location> locations(types.size(), location);
-    auto replacement = builder.create<scf::WhileOp>(location, types, initial);
-    if (Attribute origin = loop->getAttr(gpu::originAttr))
-      replacement->setAttr(gpu::originAttr, origin);
-    Block *before = builder.createBlock(&replacement.getBefore(), {}, types, locations);
-    Value condition = builder.create<gpu::CompareOp>(
-        location, builder.getI1Type(), before->getArgument(0),
-        loop.getUpperBound(), ComparePredicate::Lt);
-    builder.create<scf::ConditionOp>(location, condition, before->getArguments());
-    Block *after = builder.createBlock(&replacement.getAfter(), {}, types, locations);
-    IRMapping mapping;
-    mapping.map(loop.getInductionVar(), after->getArgument(0));
-    mapping.map(loop.getRegionIterArgs(), after->getArguments().drop_front());
-    for (Operation &operation : loop.getBody()->without_terminator())
-      builder.clone(operation, mapping);
-    Value next = builder.create<gpu::BinaryOp>(
-        location, types.front(), after->getArgument(0), loop.getStep(),
-        BinaryOperator::Add);
-    SmallVector<Value> yielded{next};
-    for (Value value : cast<scf::YieldOp>(loop.getBody()->getTerminator()).getOperands())
-      yielded.push_back(mapping.lookupOrDefault(value));
-    builder.create<scf::YieldOp>(location, yielded);
+    auto step = loop.getStep().getDefiningOp<arith::ConstantOp>();
+    auto stepValue = step ? dyn_cast<IntegerAttr>(step.getValue()) : IntegerAttr();
+    auto nativeLoop = [&](OpBuilder &nested) {
+      Value lower = nested.create<gpu::CastOp>(
+          location, nested.getI32Type(), loop.getLowerBound());
+      Value upper = nested.create<gpu::CastOp>(
+          location, nested.getI32Type(), loop.getUpperBound());
+      Value unit = nested.create<arith::ConstantIntOp>(location, 1, 32);
+      auto replacement = nested.create<scf::ForOp>(
+          location, lower, upper, unit, loop.getInitArgs(),
+          [&](OpBuilder &body, Location bodyLoc, Value induction,
+              ValueRange carried) {
+            IRMapping mapping;
+            Value wide = body.create<gpu::CastOp>(
+                bodyLoc, loop.getInductionVar().getType(), induction);
+            mapping.map(loop.getInductionVar(), wide);
+            mapping.map(loop.getRegionIterArgs(), carried);
+            for (Operation &operation : loop.getBody()->without_terminator())
+              body.clone(operation, mapping);
+            SmallVector<Value> yielded;
+            for (Value value :
+                 cast<scf::YieldOp>(loop.getBody()->getTerminator()).getOperands())
+              yielded.push_back(mapping.lookupOrDefault(value));
+            body.create<scf::YieldOp>(bodyLoc, yielded);
+          });
+      replacement->setAttrs(loop->getAttrs());
+      return replacement;
+    };
+    auto wideLoop = [&](OpBuilder &nested) {
+      OpBuilder::InsertionGuard guard(nested);
+      SmallVector<Value> initial{loop.getLowerBound()};
+      llvm::append_range(initial, loop.getInitArgs());
+      SmallVector<Type> types;
+      for (Value value : initial)
+        types.push_back(value.getType());
+      SmallVector<Location> locations(types.size(), location);
+      auto replacement = nested.create<scf::WhileOp>(location, types, initial);
+      if (Attribute origin = loop->getAttr(gpu::originAttr))
+        replacement->setAttr(gpu::originAttr, origin);
+      Block *before = nested.createBlock(&replacement.getBefore(), {}, types, locations);
+      Value condition = nested.create<gpu::CompareOp>(
+          location, nested.getI1Type(), before->getArgument(0),
+          loop.getUpperBound(), ComparePredicate::Lt);
+      nested.create<scf::ConditionOp>(location, condition, before->getArguments());
+      Block *after = nested.createBlock(&replacement.getAfter(), {}, types, locations);
+      IRMapping mapping;
+      mapping.map(loop.getInductionVar(), after->getArgument(0));
+      mapping.map(loop.getRegionIterArgs(), after->getArguments().drop_front());
+      for (Operation &operation : loop.getBody()->without_terminator())
+        nested.clone(operation, mapping);
+      Value next = nested.create<gpu::BinaryOp>(
+          location, types.front(), after->getArgument(0), loop.getStep(),
+          BinaryOperator::Add);
+      SmallVector<Value> yielded{next};
+      for (Value value : cast<scf::YieldOp>(loop.getBody()->getTerminator()).getOperands())
+        yielded.push_back(mapping.lookupOrDefault(value));
+      nested.create<scf::YieldOp>(location, yielded);
+      return replacement;
+    };
+    // Unit steps keep the terminating increment in range as well as the body IV.
+    bool unitStep = stepValue && stepValue.getValue().isOne();
+    if (unitStep && fitsNativeLoopBound(loop.getLowerBound()) &&
+        fitsNativeLoopBound(loop.getUpperBound())) {
+      auto replacement = nativeLoop(builder);
+      loop.replaceAllUsesWith(replacement.getResults());
+      loop.erase();
+      continue;
+    }
+    auto integer = dyn_cast<IntegerType>(loop.getInductionVar().getType());
+    if (unitStep && (!integer || !integer.isUnsigned()) &&
+        isSpecializedLoopBound(loop.getLowerBound()) &&
+        isSpecializedLoopBound(loop.getUpperBound())) {
+      Value minimum = builder.create<arith::ConstantOp>(
+          location, loop.getInductionVar().getType(),
+          builder.getIntegerAttr(loop.getInductionVar().getType(), INT32_MIN));
+      Value maximum = builder.create<arith::ConstantOp>(
+          location, loop.getInductionVar().getType(),
+          builder.getIntegerAttr(loop.getInductionVar().getType(), INT32_MAX));
+      Value condition;
+      for (Value bound : {loop.getLowerBound(), loop.getUpperBound()}) {
+        Value lower = builder.create<gpu::CompareOp>(
+            location, builder.getI1Type(), bound, minimum, ComparePredicate::Ge);
+        Value upper = builder.create<gpu::CompareOp>(
+            location, builder.getI1Type(), bound, maximum, ComparePredicate::Le);
+        Value fits = builder.create<gpu::BinaryOp>(
+            location, builder.getI1Type(), lower, upper, BinaryOperator::LogicalAnd);
+        condition = condition ? Value(builder.create<gpu::BinaryOp>(
+                                    location, builder.getI1Type(), condition, fits,
+                                    BinaryOperator::LogicalAnd))
+                              : fits;
+      }
+      auto replacement = builder.create<scf::IfOp>(
+          location, condition,
+          [&](OpBuilder &nested, Location nestedLocation) {
+            auto native = nativeLoop(nested);
+            nested.create<scf::YieldOp>(nestedLocation, native.getResults());
+          },
+          [&](OpBuilder &nested, Location nestedLocation) {
+            auto wide = wideLoop(nested);
+            nested.create<scf::YieldOp>(nestedLocation, wide.getResults().drop_front());
+          });
+      loop.replaceAllUsesWith(replacement.getResults());
+      loop.erase();
+      continue;
+    }
+    // cuTile range always has an i32 IV. Unproven bounds retain explicit wide state.
+    auto replacement = wideLoop(builder);
     loop.replaceAllUsesWith(replacement.getResults().drop_front());
     loop.erase();
   }

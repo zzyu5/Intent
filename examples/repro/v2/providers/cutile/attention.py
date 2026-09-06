@@ -24,6 +24,7 @@ from kernels.streaming.splitk_reduce import splitk_attention_reduce
 from kernels.streaming.splitk_reduce import splitk_attention_reduce_f16
 
 from ...measurement import compile_single
+from ...measurement import initial_launch
 from ...measurement import functional_launch
 from ...model import Context
 from ...model import PreparedComparison
@@ -143,7 +144,7 @@ def splitk_reduce(context: Context) -> PreparedComparison:
             8192,
         )
 
-    source_launch()
+    initial_launch(source_launch, side="source")
     source = PreparedLaunch(source_launch, lambda: source_output)
     return PreparedComparison(
         generated,
@@ -297,7 +298,7 @@ def gemma_prefill(context: Context) -> PreparedComparison:
             window_size=1024,
             soft_cap=50.0,
             is_causal=True,
-            use_autotune=False,
+            use_autotune=True,
         )
     )
     return PreparedComparison(
@@ -305,6 +306,7 @@ def gemma_prefill(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=5e-2, rtol=2e-2),
         cuda_graph=True,
+        status="source_precision_contract_gap",
     )
 
 
@@ -591,7 +593,7 @@ def splitk_mla_decode(context: Context) -> PreparedComparison:
             sequence,
         )
 
-    source_launch()
+    initial_launch(source_launch, side="source")
     source = PreparedLaunch(
         source_launch,
         lambda: source_output,
@@ -827,6 +829,7 @@ def gemma_decode(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=1e-1, rtol=5e-2),
         cuda_graph=False,
+        status="source_precision_contract_gap",
     )
 
 

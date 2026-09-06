@@ -9,6 +9,7 @@ from kernels.routing.mhc import mhc_gemm_rms_partial
 from kernels.routing.mhc import mhc_sinkhorn
 
 from ...measurement import compile_single
+from ...measurement import initial_launch
 from ...measurement import functional_launch
 from ...model import Context
 from ...model import PreparedComparison
@@ -133,7 +134,7 @@ def gemm_rms_scale(context: Context) -> PreparedComparison:
             ),
         )
 
-    source_launch()
+    initial_launch(source_launch, side="source")
     source = PreparedLaunch(
         source_launch,
         lambda: (source_mixed, source_rms),
@@ -222,7 +223,7 @@ def sinkhorn(context: Context) -> PreparedComparison:
         source_module.mhc_sinkhorn(packed, streams)
 
     prepare()
-    launch()
+    initial_launch(launch, side="source")
     source = PreparedLaunch(
         launch=launch,
         outputs=lambda: packed[:, 2 * streams :].view(tokens, streams, streams),

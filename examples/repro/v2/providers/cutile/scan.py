@@ -129,6 +129,7 @@ def chunk_gated_delta(context: Context) -> PreparedComparison:
         source,
         (tolerance, tolerance),
         cuda_graph=False,
+        status="source_precision_contract_gap",
     )
 
 

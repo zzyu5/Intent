@@ -1398,6 +1398,23 @@ public:
     return SmallVector<Value>{};
   }
 
+  FailureOr<SmallVector<Value>> lowerWorksetBlock(Block &source) {
+    SmallVector<Operation *> ancestors;
+    for (Operation *parent = source.getParentOp();
+         parent && !isa<func::FuncOp>(parent); parent = parent->getParentOp())
+      ancestors.push_back(parent);
+    // Workset extraction must retain the lexical constraints used by its accesses.
+    for (Operation *ancestor : llvm::reverse(ancestors))
+      for (Operation &operation : *ancestor->getBlock()) {
+        if (&operation == ancestor)
+          break;
+        if (isa<intent::AssumeInBoundsOp>(operation) &&
+            failed(lower(&operation)))
+          return failure();
+      }
+    return lowerBlock(source);
+  }
+
   llvm::DenseMap<Value, Value> &mapping() { return values; }
   FailureOr<Value> lowerValue(Value source) { return get(source); }
 
@@ -5277,7 +5294,7 @@ LogicalResult constructGPUProgram(ModuleOp module,
       ScalarRegionLowering lowering(builder, std::move(childValues),
                                     sourceArguments, dimensionValues,
                                     parameterValues, canonicalAnalysis);
-      if (failed(lowering.lowerBlock(sourceBlock)))
+      if (failed(lowering.lowerWorksetBlock(sourceBlock)))
         return failure();
       runtimeOffset = segmentEnd;
       launchOffset = binaryExpression(context, PhysicalExprKind::Add,
@@ -5333,7 +5350,7 @@ LogicalResult constructGPUProgram(ModuleOp module,
           ScalarRegionLowering lowering(nested, std::move(childValues),
                                         sourceArguments, dimensionValues,
                                         parameterValues, canonicalAnalysis);
-          if (failed(lowering.lowerBlock(sourceBlock)))
+          if (failed(lowering.lowerWorksetBlock(sourceBlock)))
             dispatchLoweringFailed = true;
         });
     dispatch->setAttr(gpu::executionGroupAttr,

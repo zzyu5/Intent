@@ -348,6 +348,11 @@ public:
       llvm::ArrayRef<std::pair<MakeRangeOp, mlir::Value>> ranges) const;
 
 private:
+  using ReplayContext = std::pair<std::optional<PhysicalSourceAxis>,
+                                  std::optional<int64_t>>;
+  using ReplayVisits = llvm::DenseMap<mlir::Operation *,
+                                      llvm::SmallVector<ReplayContext, 2>>;
+
   void collectRanges(mlir::Value value,
                      std::optional<PhysicalSourceAxis> source,
                      PhysicalRangeFact &result,
@@ -362,7 +367,7 @@ private:
                      std::optional<int64_t> sourceDimension,
                      mlir::DominanceInfo *dominance,
                      PhysicalReplayFact &result,
-                     llvm::SmallPtrSetImpl<mlir::Operation *> &visited);
+                     ReplayVisits &visited);
   llvm::SmallVector<mlir::Value, 2>
   structuredSourcesForArgument(mlir::BlockArgument argument) const;
   bool carriesSource(mlir::Type type, PhysicalSourceAxis source) const;

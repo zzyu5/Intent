@@ -5,6 +5,7 @@ import torch
 from kernels.position.rope import rotary_qk_bf16_inplace
 
 from ...measurement import compile_single
+from ...measurement import initial_launch
 from ...model import Context
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
@@ -60,7 +61,7 @@ def rope_qk(context: Context) -> PreparedComparison:
         source_module.apply_rope_base(source_query, source_key, cosine, sine)
 
     source_prepare()
-    source_launch()
+    initial_launch(source_launch, side="source")
     source_prepare()
     source = PreparedLaunch(
         source_launch,

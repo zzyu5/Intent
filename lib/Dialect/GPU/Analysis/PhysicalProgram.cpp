@@ -1245,8 +1245,13 @@ void PhysicalProgramAnalysis::collectRanges(
     result.state = PhysicalFactState::Unknown;
     return;
   }
-  for (Value operand : operation->getOperands())
+  auto load = dyn_cast<LoadOp>(operation);
+  for (Value operand : operation->getOperands()) {
+    // Resource identity stays in the access fact, not in fragment range provenance.
+    if (load && operand == load.getResource())
+      continue;
     collectRanges(operand, source, result, visited);
+  }
 }
 
 PhysicalRangeFact PhysicalProgramAnalysis::sourceRanges(
@@ -2195,7 +2200,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
     Operation *insertionAnchor, std::optional<int64_t> sourceDimension,
     DominanceInfo *dominance,
     PhysicalReplayFact &result,
-    SmallPtrSetImpl<Operation *> &visited) {
+    ReplayVisits &visited) {
   if (!value)
     return;
   bool carriesRequestedTraversal = false;
@@ -2258,8 +2263,13 @@ void PhysicalProgramAnalysis::analyzeReplay(
     return;
   }
   Operation *operation = value.getDefiningOp();
-  if (!operation || !visited.insert(operation).second)
+  if (!operation)
     return;
+  auto &contexts = visited[operation];
+  ReplayContext context{source, sourceDimension};
+  if (llvm::is_contained(contexts, context))
+    return;
+  contexts.push_back(context);
   if (isa<ContractOp, ScaledContractOp, SparseContractOp>(operation))
     appendUnique(result.contractions, operation);
   if (auto range = dyn_cast<MakeRangeOp>(operation)) {
@@ -2385,6 +2395,31 @@ void PhysicalProgramAnalysis::analyzeReplay(
     result.state = PhysicalFactState::Unknown;
     return;
   }
+  if (auto broadcast = dyn_cast<BroadcastOp>(operation); broadcast && source) {
+    auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
+    auto output = dyn_cast<FragmentType>(value.getType());
+    PhysicalAxisProjection requested = queryFragmentAxis(output, *source);
+    if (input && requested.isExact()) {
+      BroadcastProjection projection = queryAxisProjection(input, output);
+      if (projection.isExact() &&
+          requested.fragmentAxis < projection.targetToSource.size())
+        if (auto axis = projection.targetToSource[requested.fragmentAxis]) {
+          auto mapping = cast<AxisMapAttr>(input.getAxisMaps()[*axis]);
+          if (sourceDimension && mapping.getDimensionId() <= 0) {
+            appendUnique(result.blockers, operation);
+            result.state = PhysicalFactState::Unknown;
+            return;
+          }
+          std::optional<int64_t> inputDimension =
+              sourceDimension ? std::optional<int64_t>(mapping.getDimensionId())
+                              : std::nullopt;
+          analyzeReplay(broadcast.getValue(), sourceAxisIdentity(mapping), scope,
+                        allowAccesses, insertionAnchor, inputDimension,
+                        dominance, result, visited);
+          return;
+        }
+    }
+  }
   for (Value operand : operation->getOperands())
     analyzeReplay(operand, source, scope, allowAccesses, insertionAnchor,
                   sourceDimension, dominance, result, visited);
@@ -2397,7 +2432,7 @@ PhysicalReplayFact PhysicalProgramAnalysis::replayability(
     std::optional<int64_t> sourceDimension) {
   PhysicalReplayFact result;
   result.state = PhysicalFactState::Exact;
-  SmallPtrSet<Operation *, 32> visited;
+  ReplayVisits visited;
   std::optional<DominanceInfo> dominance;
   if (insertionAnchor)
     dominance.emplace(kernel);

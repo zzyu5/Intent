@@ -202,7 +202,7 @@ public:
   LogicalResult emit() {
     bindArguments();
     emitPreamble();
-    emitReductionHelpers();
+    emitCollectiveHelpers();
     emitKernel();
     emitLaunch();
     emitRun();
@@ -305,6 +305,8 @@ private:
   Attribute scalarConstant(Value value) {
     while (true) {
       if (auto cast = value.getDefiningOp<gpu::CastOp>()) {
+        if (cast.getValue().getType() != cast.getResult().getType())
+          return {};
         value = cast.getValue();
         continue;
       }
@@ -329,15 +331,18 @@ private:
     return constant ? constant.getValue() : Attribute();
   }
 
-  void emitReductionHelpers() {
-    SmallVector<gpu::ReduceOp> reductions;
-    kernel.walk([&](gpu::ReduceOp reduce) { reductions.push_back(reduce); });
-    for (gpu::ReduceOp reduce : reductions) {
-      std::string helper = "_intent_reduce_" +
-                           std::to_string(reductionHelpers.size());
-      reductionHelpers[reduce.getOperation()] = helper;
+  void emitCollectiveHelpers() {
+    SmallVector<Operation *> collectives;
+    kernel.walk([&](Operation *operation) {
+      if (isa<gpu::ReduceOp, gpu::ScanOp>(operation))
+        collectives.push_back(operation);
+    });
+    for (Operation *collective : collectives) {
+      std::string helper = "_intent_combine_" +
+                           std::to_string(collectiveHelpers.size());
+      collectiveHelpers[collective] = helper;
       output << "@ct.function\ndef " << helper << "(";
-      Block &block = reduce.getCombine().front();
+      Block &block = collective->getRegion(0).front();
       for (auto [index, argument] : llvm::enumerate(block.getArguments())) {
         if (index)
           output << ", ";
@@ -785,10 +790,12 @@ private:
                  "), ct.bitcast(" + valueString(mma.getRhsScale()) +
                  ", ct.float8_e8m0fnu), " +
                  valueString(mma.getAccumulator()) + ")");
-    } else if (auto reduce = dyn_cast<gpu::ReduceOp>(operation)) {
-      unsigned count = reduce.getSourceCount();
-      ValueRange sources = reduce.getInputs().take_front(count);
-      ValueRange identities = reduce.getInputs().slice(count, count);
+    } else if (isa<gpu::ReduceOp, gpu::ScanOp>(operation)) {
+      auto reduce = dyn_cast<gpu::ReduceOp>(operation);
+      auto scan = dyn_cast<gpu::ScanOp>(operation);
+      unsigned count = reduce ? reduce.getSourceCount() : scan.getSourceCount();
+      ValueRange sources = operation.getOperands().take_front(count);
+      ValueRange identities = operation.getOperands().slice(count, count);
       std::string source = count == 1 ? valueString(sources.front())
                                       : tuple(sources);
       std::string identity;
@@ -803,16 +810,21 @@ private:
         }
         identity += ")";
       }
-      std::string call = "ct.reduce(" + source + ", axis=" +
-                         std::to_string(reduce.getAxes().front()) +
+      std::string call = std::string(reduce ? "ct.reduce(" : "ct.scan(") +
+                         source + ", axis=" +
+                         std::to_string(reduce ? reduce.getAxes().front()
+                                               : scan.getAxis()) +
                          ", func=" +
-                         reductionHelpers.lookup(reduce.getOperation()) +
-                         ", identity=" + identity + ")";
+                         collectiveHelpers.lookup(&operation) +
+                         ", identity=" + identity;
+      if (scan)
+        call += std::string(", reverse=") + (scan.getReverse() ? "True" : "False");
+      call += ")";
       if (count == 1) {
-        assign(reduce.getResult(0), call);
+        assign(operation.getResult(0), call);
       } else {
         std::string resultNames;
-        for (auto [index, result] : llvm::enumerate(reduce.getResults())) {
+        for (auto [index, result] : llvm::enumerate(operation.getResults())) {
           if (index)
             resultNames += ", ";
           std::string name = newName();
@@ -1253,7 +1265,7 @@ private:
   func::FuncOp kernel;
   raw_ostream &output;
   llvm::DenseMap<Value, std::string> values;
-  llvm::DenseMap<Operation *, std::string> reductionHelpers;
+  llvm::DenseMap<Operation *, std::string> collectiveHelpers;
   SmallVector<ViewABI> views;
   SmallVector<ScalarABI> scalars;
   SmallVector<MetadataABI> metadataArguments;

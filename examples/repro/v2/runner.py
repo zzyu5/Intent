@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 from pathlib import Path
 import signal
@@ -14,6 +15,8 @@ import torch
 import intent
 
 from .measurement import evaluate
+from .measurement import observe_stages
+from .measurement import report_stage
 from .measurement import NumericalComparisonError
 from .measurement import PipelineStageError
 from .model import Context
@@ -69,7 +72,14 @@ def _write(path: Path, rows: list[ResultRow]) -> None:
     temporary.replace(path)
 
 
+def _write_stage(path: Path, stage: str) -> None:
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"stage": stage}))
+    temporary.replace(path)
+
+
 def _run_entry(provider: str, compiler: str, entry) -> ResultRow:
+    report_stage("device_setup")
     torch.cuda.set_device(0)
     torch.manual_seed(0)
     project_root = Path(__file__).resolve().parents[3]
@@ -79,6 +89,7 @@ def _run_entry(provider: str, compiler: str, entry) -> ResultRow:
         target=_target(provider),
         provider=provider,
     )
+    report_stage("adapter_loading")
     try:
         cases = load_cases(provider)
     except Exception as error:
@@ -91,6 +102,7 @@ def _run_entry(provider: str, compiler: str, entry) -> ResultRow:
         status = "adapter_missing"
         print(f"{provider}:{entry.kernel}: {status}")
         return ResultRow(entry.kernel, entry.case, None, None, None, status)
+    report_stage("adapter_preparation")
     try:
         comparison = factory(context)
     except ComparisonUnavailable as error:
@@ -118,6 +130,12 @@ def _run_entry(provider: str, compiler: str, entry) -> ResultRow:
         print(f"{provider}:{entry.kernel}: {status}: {error}")
         return ResultRow(entry.kernel, entry.case, None, None, None, status)
 
+    if comparison.status != "pass":
+        print(
+            f"{provider}:{entry.kernel}: {comparison.status}: "
+            "numerical comparison completed; timing contract is not comparable"
+        )
+        return ResultRow(entry.kernel, entry.case, None, None, None, comparison.status)
     ratio = generated_p50 / source_p50
     print(
         f"{provider}:{entry.kernel}: {comparison.status} "
@@ -176,7 +194,9 @@ def main() -> None:
 
     if arguments.worker_entry is not None:
         entry = BY_PROVIDER[provider][arguments.worker_entry]
-        _write(arguments.output, [_run_entry(provider, arguments.compiler, entry)])
+        phase_path = arguments.output.with_suffix(".phase.json")
+        with observe_stages(lambda stage: _write_stage(phase_path, stage)):
+            _write(arguments.output, [_run_entry(provider, arguments.compiler, entry)])
         return
 
     rows: list[ResultRow] = []
@@ -189,6 +209,8 @@ def main() -> None:
         entry = BY_PROVIDER[provider][index]
         with tempfile.TemporaryDirectory(prefix="intentdsl-baseline-v2-") as directory:
             worker_output = Path(directory) / "result.csv"
+            phase_path = worker_output.with_suffix(".phase.json")
+            _write_stage(phase_path, "worker_startup")
             worker = subprocess.Popen(
                 (
                     sys.executable,
@@ -213,7 +235,8 @@ def main() -> None:
                 except subprocess.TimeoutExpired:
                     os.killpg(worker.pid, signal.SIGKILL)
                     worker.wait()
-                status = "worker_timeout"
+                stage = json.loads(phase_path.read_text())["stage"]
+                status = f"{stage}_timeout"
                 print(
                     f"{provider}:{entry.kernel}: {status}: "
                     f"exceeded {WORKER_TIMEOUT_SECONDS} seconds"
@@ -221,7 +244,8 @@ def main() -> None:
                 row = ResultRow(entry.kernel, entry.case, None, None, None, status)
             else:
                 if returncode != 0 or not worker_output.exists():
-                    status = "worker_process_failed"
+                    stage = json.loads(phase_path.read_text())["stage"]
+                    status = f"{stage}_process_failed"
                     print(
                         f"{provider}:{entry.kernel}: {status}: "
                         f"worker exited with code {returncode}"

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from contextlib import contextmanager
+from contextvars import ContextVar
 import statistics
 
 import torch
@@ -29,6 +31,38 @@ class NumericalComparisonError(RuntimeError):
 MEASUREMENT_REPETITIONS = 200
 
 
+_stage_observer: ContextVar[Callable[[str], None] | None] = ContextVar(
+    "repro_stage_observer", default=None
+)
+
+
+@contextmanager
+def observe_stages(observer: Callable[[str], None]):
+    token = _stage_observer.set(observer)
+    try:
+        yield
+    finally:
+        _stage_observer.reset(token)
+
+
+def report_stage(stage: str) -> None:
+    observer = _stage_observer.get()
+    if observer is not None:
+        observer(stage)
+
+
+def initial_launch(function, *, side: str):
+    stage = f"{side}_provider_jit_or_initial_launch"
+    report_stage(stage)
+    try:
+        result = function()
+        torch.cuda.synchronize()
+    except Exception as error:
+        raise PipelineStageError(stage, str(error)) from error
+    report_stage("adapter_preparation")
+    return result
+
+
 def compile_single(
     context: Context,
     definition,
@@ -36,6 +70,7 @@ def compile_single(
     *,
     constexprs: dict[str, object] | None = None,
 ) -> tuple[object, PreparedLaunch]:
+    report_stage("generated_compilation")
     try:
         artifact = intent.compile(
             definition,
@@ -44,18 +79,15 @@ def compile_single(
             constexprs=constexprs,
         )
     except intent.CompilationStageError as error:
-        raise PipelineStageError(error.stage, str(error)) from error
-    try:
-        result = artifact.run(*arguments)
-    except Exception as error:
-        raise PipelineStageError(
-            "provider_jit_or_initial_launch", str(error)
-        ) from error
+        raise PipelineStageError(f"generated_{error.stage}", str(error)) from error
+    result = initial_launch(lambda: artifact.run(*arguments), side="generated")
+    report_stage("generated_launcher_preparation")
     try:
         launch_outputs = () if result is None else result
         launch = prepare_kernel_call(artifact, arguments, launch_outputs)
     except Exception as error:
-        raise PipelineStageError("launcher_preparation", str(error)) from error
+        raise PipelineStageError("generated_launcher_preparation", str(error)) from error
+    report_stage("adapter_preparation")
     return artifact, PreparedLaunch(launch=launch, outputs=lambda: result)
 
 
@@ -66,12 +98,7 @@ def functional_launch(function) -> PreparedLaunch:
         state["output"] = function()
         return state["output"]
 
-    try:
-        launch()
-    except Exception as error:
-        raise PipelineStageError(
-            "source_provider_jit_or_initial_launch", str(error)
-        ) from error
+    initial_launch(launch, side="source")
     return PreparedLaunch(launch=launch, outputs=lambda: state["output"])
 
 
@@ -200,7 +227,8 @@ def compare_outputs(
     return tuple(errors)
 
 
-def evaluate(comparison: PreparedComparison) -> tuple[float, float]:
+def evaluate(comparison: PreparedComparison) -> tuple[float | None, float | None]:
+    report_stage("generated_launch")
     try:
         if comparison.generated.prepare is not None:
             comparison.generated.prepare()
@@ -208,6 +236,7 @@ def evaluate(comparison: PreparedComparison) -> tuple[float, float]:
         torch.cuda.synchronize()
     except Exception as error:
         raise PipelineStageError("generated_launch", str(error)) from error
+    report_stage("source_launch")
     try:
         if comparison.source.prepare is not None:
             comparison.source.prepare()
@@ -215,11 +244,15 @@ def evaluate(comparison: PreparedComparison) -> tuple[float, float]:
         torch.cuda.synchronize()
     except Exception as error:
         raise PipelineStageError("source_launch", str(error)) from error
+    report_stage("numerical_comparison")
     compare_outputs(
         comparison.generated.outputs(),
         comparison.source.outputs(),
         comparison.tolerance,
     )
+    if comparison.status != "pass":
+        return None, None
+    report_stage("generated_benchmark")
     try:
         generated_first, _ = benchmark(
             comparison.generated.launch,
@@ -230,6 +263,7 @@ def evaluate(comparison: PreparedComparison) -> tuple[float, float]:
         )
     except Exception as error:
         raise PipelineStageError("generated_benchmark", str(error)) from error
+    report_stage("source_benchmark")
     try:
         source_first, _ = benchmark(
             comparison.source.launch,
@@ -240,6 +274,7 @@ def evaluate(comparison: PreparedComparison) -> tuple[float, float]:
         )
     except Exception as error:
         raise PipelineStageError("source_benchmark", str(error)) from error
+    report_stage("source_reverse_benchmark")
     try:
         source_second, _ = benchmark(
             comparison.source.launch,
@@ -250,6 +285,7 @@ def evaluate(comparison: PreparedComparison) -> tuple[float, float]:
         )
     except Exception as error:
         raise PipelineStageError("source_reverse_benchmark", str(error)) from error
+    report_stage("generated_reverse_benchmark")
     try:
         generated_second, _ = benchmark(
             comparison.generated.launch,

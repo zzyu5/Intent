@@ -416,6 +416,9 @@ def gemma_gqa_decode_partials(
     for batch in I.parallel(I.domain(0, B)):
         for key_head in I.parallel(I.domain(0, HK)):
             query_heads = key_head * HEAD_GROUP + I.indices(local_heads)
+            I.assume_in_bounds(query_heads, q, axis=1)
+            I.assume_in_bounds(query_heads, partial_lse, axis=1)
+            I.assume_in_bounds(query_heads, partial_output, axis=1)
             query = I.gather(q, index=(batch, query_heads, 0, slice(None)))
             for part in I.parallel(parts):
                 begin = I.minimum(part * width, K)
