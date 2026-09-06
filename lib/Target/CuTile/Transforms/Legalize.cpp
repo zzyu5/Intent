@@ -2484,6 +2484,24 @@ bool isSpecializedLoopBound(Value value, unsigned depth = 0) {
          });
 }
 
+std::optional<int64_t> maximumNativeLoopStep(Value value) {
+  if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
+    auto attribute = dyn_cast<IntegerAttr>(constant.getValue());
+    if (attribute && attribute.getValue().isSignedIntN(32) &&
+        attribute.getInt() > 0)
+      return attribute.getInt();
+  }
+  if (auto parameter = value.getDefiningOp<gpu::ParameterOp>()) {
+    ArrayRef<int64_t> candidates =
+        parameter.getParameter().getCandidates().asArrayRef();
+    if (!candidates.empty() && llvm::all_of(candidates, [](int64_t candidate) {
+          return candidate > 0 && llvm::isInt<32>(candidate);
+        }))
+      return *llvm::max_element(candidates);
+  }
+  return std::nullopt;
+}
+
 void realizeWideLoops(func::FuncOp kernel) {
   SmallVector<scf::ForOp> loops;
   kernel.walk<WalkOrder::PostOrder>([&](scf::ForOp loop) {
@@ -2494,16 +2512,16 @@ void realizeWideLoops(func::FuncOp kernel) {
   for (scf::ForOp loop : loops) {
     OpBuilder builder(loop);
     Location location = loop.getLoc();
-    auto step = loop.getStep().getDefiningOp<arith::ConstantOp>();
-    auto stepValue = step ? dyn_cast<IntegerAttr>(step.getValue()) : IntegerAttr();
+    std::optional<int64_t> maximumStep = maximumNativeLoopStep(loop.getStep());
     auto nativeLoop = [&](OpBuilder &nested) {
       Value lower = nested.create<gpu::CastOp>(
           location, nested.getI32Type(), loop.getLowerBound());
       Value upper = nested.create<gpu::CastOp>(
           location, nested.getI32Type(), loop.getUpperBound());
-      Value unit = nested.create<arith::ConstantIntOp>(location, 1, 32);
+      Value step = nested.create<gpu::CastOp>(
+          location, nested.getI32Type(), loop.getStep());
       auto replacement = nested.create<scf::ForOp>(
-          location, lower, upper, unit, loop.getInitArgs(),
+          location, lower, upper, step, loop.getInitArgs(),
           [&](OpBuilder &body, Location bodyLoc, Value induction,
               ValueRange carried) {
             IRMapping mapping;
@@ -2554,7 +2572,7 @@ void realizeWideLoops(func::FuncOp kernel) {
       return replacement;
     };
     // Unit steps keep the terminating increment in range as well as the body IV.
-    bool unitStep = stepValue && stepValue.getValue().isOne();
+    bool unitStep = maximumStep && *maximumStep == 1;
     if (unitStep && fitsNativeLoopBound(loop.getLowerBound()) &&
         fitsNativeLoopBound(loop.getUpperBound())) {
       auto replacement = nativeLoop(builder);
@@ -2563,7 +2581,7 @@ void realizeWideLoops(func::FuncOp kernel) {
       continue;
     }
     auto integer = dyn_cast<IntegerType>(loop.getInductionVar().getType());
-    if (unitStep && (!integer || !integer.isUnsigned()) &&
+    if (maximumStep && (!integer || !integer.isUnsigned()) &&
         isSpecializedLoopBound(loop.getLowerBound()) &&
         isSpecializedLoopBound(loop.getUpperBound())) {
       Value minimum = builder.create<arith::ConstantOp>(
@@ -2572,12 +2590,19 @@ void realizeWideLoops(func::FuncOp kernel) {
       Value maximum = builder.create<arith::ConstantOp>(
           location, loop.getInductionVar().getType(),
           builder.getIntegerAttr(loop.getInductionVar().getType(), INT32_MAX));
+      // The last body IV is at most upper - 1; its increment must also fit.
+      Value maximumUpper = builder.create<arith::ConstantOp>(
+          location, loop.getInductionVar().getType(),
+          builder.getIntegerAttr(loop.getInductionVar().getType(),
+                                 int64_t{INT32_MAX} - *maximumStep + 1));
       Value condition;
       for (Value bound : {loop.getLowerBound(), loop.getUpperBound()}) {
         Value lower = builder.create<gpu::CompareOp>(
             location, builder.getI1Type(), bound, minimum, ComparePredicate::Ge);
         Value upper = builder.create<gpu::CompareOp>(
-            location, builder.getI1Type(), bound, maximum, ComparePredicate::Le);
+            location, builder.getI1Type(), bound,
+            bound == loop.getUpperBound() ? maximumUpper : maximum,
+            ComparePredicate::Le);
         Value fits = builder.create<gpu::BinaryOp>(
             location, builder.getI1Type(), lower, upper, BinaryOperator::LogicalAnd);
         condition = condition ? Value(builder.create<gpu::BinaryOp>(
