@@ -1,5 +1,6 @@
 #include "Intent/Target/CuTile/Serialization/Serializer.h"
 
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -11,6 +12,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <cmath>
@@ -298,6 +300,7 @@ private:
               "import torch\n"
               "import cuda.tile as ct\n"
               "from cuda.tile.tune import exhaustive_search\n"
+              "from intent.runtime.artifact import ParameterRole, TuningConfiguration, TuningParameter\n"
               "from intent.runtime.tuning import TuningState\n\n"
               "ConstInt = ct.Constant[int]\n\n";
   }
@@ -399,28 +402,7 @@ private:
     output << "\n";
   }
 
-  void emitLaunch() {
-    FailureOr<SmallVector<std::map<std::string, int64_t>>> configs =
-        parameterConfigs(kernel);
-    if (mlir::failed(configs)) {
-      failed = true;
-      return;
-    }
-    output << "_CONFIGS = (\n";
-    for (const auto &config : *configs) {
-      output << "    SimpleNamespace(";
-      for (auto [index, item] : llvm::enumerate(config)) {
-        if (index)
-          output << ", ";
-        output << item.first << "=" << item.second;
-      }
-      output << "),\n";
-    }
-    output << ")\n_TUNE_CACHE = {}\n\ndef launch(" << joinViewNames(views);
-    for (const ScalarABI &scalar : scalars)
-      output << (views.empty() && &scalar == &scalars.front() ? "" : ", ")
-             << scalar.name;
-    output << "):\n";
+  void emitArgumentBindings() {
     for (const MetadataABI &metadata : metadataArguments) {
       const ViewABI &source = viewByABI(metadata.sourceABI);
       line(metadata.name + " = " + source.name +
@@ -442,6 +424,92 @@ private:
                "\")",
            2);
     }
+  }
+
+  std::string launchArguments() {
+    std::string result = joinViewNames(views);
+    for (const ScalarABI &scalar : scalars) {
+      if (!result.empty())
+        result += ", ";
+      result += scalar.name;
+    }
+    return result;
+  }
+
+  void emitTuningConfigurations() {
+    output << "_TUNING_PARAMETERS = (\n";
+    std::string bindings = "(";
+    kernel.walk([&](gpu::ParameterOp parameter) {
+      auto schema = parameter.getParameter();
+      gpu::PhysicalParameterBinding binding = gpu::queryParameterBinding(parameter);
+      if (binding.state == gpu::PhysicalFactState::Ambiguous) {
+        parameter.emitOpError("has contradictory physical parameter bindings");
+        failed = true;
+        return;
+      }
+      output << "    TuningParameter(";
+      llvm::json::OStream(output).value(schema.getName().getValue());
+      output << ", ParameterRole(" << schema.getRole() << "), "
+             << schema.getCategory() << ", (";
+      for (int64_t candidate : schema.getCandidates().asArrayRef())
+        output << candidate << ", ";
+      output << "), ";
+      if (binding.dimension)
+        output << *binding.dimension;
+      else
+        output << "None";
+      output << ", ";
+      if (binding.source)
+        output << "(" << binding.source->sourceId << ", "
+               << binding.source->sourceAxis << ", "
+               << (binding.source->derived ? "True" : "False") << ")";
+      else
+        output << "None";
+      output << ", ";
+      auto metadata = binding.dimension ? dimensionBindings.find(*binding.dimension)
+                                        : dimensionBindings.end();
+      if (metadata == dimensionBindings.end()) {
+        output << "None";
+      } else {
+        for (auto [index, view] : llvm::enumerate(views))
+          if (view.argument == metadata->second.sourceABI)
+            output << "(" << index << ", " << metadata->second.sourceAxis << ")";
+      }
+      output << "),\n";
+      std::string name = schema.getName().getValue().str();
+      bindings += fullCoverageParameterNames.contains(name)
+                      ? name + ", "
+                      : "_intent_config." + name + ", ";
+    });
+    output << ")\n\ndef tuning_configurations(" << launchArguments() << "):\n";
+    emitArgumentBindings();
+    line("return tuple(TuningConfiguration(_TUNING_PARAMETERS, " + bindings +
+             ")) for _intent_config in _CONFIGS)",
+         1);
+    output << "\n";
+  }
+
+  void emitLaunch() {
+    FailureOr<SmallVector<std::map<std::string, int64_t>>> configs =
+        parameterConfigs(kernel);
+    if (mlir::failed(configs)) {
+      failed = true;
+      return;
+    }
+    output << "_CONFIGS = (\n";
+    for (const auto &config : *configs) {
+      output << "    SimpleNamespace(";
+      for (auto [index, item] : llvm::enumerate(config)) {
+        if (index)
+          output << ", ";
+        output << item.first << "=" << item.second;
+      }
+      output << "),\n";
+    }
+    output << ")\n_TUNE_CACHE = {}\n\n";
+    emitTuningConfigurations();
+    output << "def launch(" << launchArguments() << "):\n";
+    emitArgumentBindings();
 
     llvm::StringSet<> occupiedNames;
     for (const ViewABI &view : views)

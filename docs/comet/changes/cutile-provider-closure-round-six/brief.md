@@ -13,6 +13,7 @@
 - 对每个实际修改点，先区分缺少 shared executable facts、已有 facts 缺少 provider realization、以及 external compiler 的机器 lowering。Provider pass 使用公共 GPU/scf operations 做等价展开不构成 shared 架构越界；不得为了避免修改公共文件而在 leaf 重建事实，也不得把纯 leaf 缺口上移为 shared 语义限制。
 - 允许随可达 lowering 问题做有界、渐进的职责重构，删除被新 authority 替代的重复推导和旧 executable path；不按文件行数整理目录，不另开一轮无具体反例的共享架构重建。
 - 性能修改前先核对双方完整 callable closure、输入精度、显式舍入、中间 dtype、kernel/额外 tensor 工作、candidate contract 与计时范围。先完成数值与终端归因，再解释 ratio；不把容差通过当作契约等价。
+- 对齐比较所需的 source runtime 候选入口，使双方暴露语义角色一致的完整候选集合并分别调优；保持 source 算法、数值语义、ABI 与计时范围，不按单个 winner 或旧 timing 筛选。
 
 # Non-goals
 
@@ -48,6 +49,7 @@
 - 先用 fresh、逐 entry 的生产路径事实选择修改点；明显差距优先修 Physical Program、typed candidate/config 或可复用 provider form，禁止 entry-local 特例。
 - 用户在恢复审查后明确同意上述有界 Shape 细化并要求继续 Build。A1-A4、双机完整 registry 和稳定可比项 `1.05` 目标保持不变；不创建新的 change 或恢复暂停 stash。
 - 暂存的 `StatefulPointwise` 与 metadata `ConstInt -> int` 只是未证明试验。新候选数据遵守当前 JSON profile 边界；是否改变 metadata specialization 需证明实际成本与 ABI 宽度，不能无证据使用普通 i32 参数或把普通循环等同于静态展开。
+- 用户已明确授权本轮修改 source runtime 的候选入口，在保持算法、数值语义、ABI 和计时范围不变的前提下对齐双方搜索集合；该授权不降低 A1-A4，也不允许通过把真实性能差距全部标成不可比来完成验收。
 
 # Open questions
 

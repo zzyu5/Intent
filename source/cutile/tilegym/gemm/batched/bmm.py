@@ -29,6 +29,7 @@ def _bmm_autotune_configs():
                             GROUP_SIZE_M=8,
                             occupancy=occupancy,
                             num_ctas=1,
+                            ACCESS_FORM=1,
                         )
     elif torch.cuda.get_device_capability()[0] < 9:
         # SM80 (A100): avoid 256×256 tiles and num_ctas=2 (not supported).
@@ -37,7 +38,7 @@ def _bmm_autotune_configs():
                 for TILE_K in [32, 64, 128]:
                     for occupancy in [1, 2]:
                         yield SimpleNamespace(
-                            TILE_M=TILE_M, TILE_N=TILE_N, TILE_K=TILE_K, GROUP_SIZE_M=8, occupancy=occupancy, num_ctas=1
+                            TILE_M=TILE_M, TILE_N=TILE_N, TILE_K=TILE_K, GROUP_SIZE_M=8, occupancy=occupancy, num_ctas=1, ACCESS_FORM=1
                         )
     elif torch.cuda.get_device_capability() == (9, 0):
         # H100 (sm_90): Medium tiles with occupancy tuning
@@ -46,7 +47,7 @@ def _bmm_autotune_configs():
                 for TILE_K in [64]:
                     for occupancy in [1, 2]:
                         yield SimpleNamespace(
-                            TILE_M=TILE_M, TILE_N=TILE_N, TILE_K=TILE_K, GROUP_SIZE_M=8, occupancy=occupancy, num_ctas=2
+                            TILE_M=TILE_M, TILE_N=TILE_N, TILE_K=TILE_K, GROUP_SIZE_M=8, occupancy=occupancy, num_ctas=2, ACCESS_FORM=1
                         )
     else:
         # Other GPUs (e.g., GB100): Larger tiles with num_ctas=2
@@ -54,7 +55,7 @@ def _bmm_autotune_configs():
             for TILE_N in [256]:
                 for TILE_K in [64]:
                     yield SimpleNamespace(
-                        TILE_M=TILE_M, TILE_N=TILE_N, TILE_K=TILE_K, GROUP_SIZE_M=8, occupancy=1, num_ctas=2
+                        TILE_M=TILE_M, TILE_N=TILE_N, TILE_K=TILE_K, GROUP_SIZE_M=8, occupancy=1, num_ctas=2, ACCESS_FORM=1
                     )
 
 
@@ -95,6 +96,26 @@ def _bmm_kernel(A, B, C, TM: ct.Constant[int], TN: ct.Constant[int], TK: ct.Cons
     ct.store(C, index=(bidz, bidx, bidy), tile=result_3d)
 
 
+@ct.function
+def _load_bmm_tile(
+    array, batch, row, column,
+    ROWS: ct.Constant[int], COLUMNS: ct.Constant[int], ACCESS_FORM: ct.Constant[int],
+):
+    if ACCESS_FORM == 2:
+        rows = row * ROWS + ct.arange(ROWS, dtype=ct.int32)
+        columns = column * COLUMNS + ct.arange(COLUMNS, dtype=ct.int32)
+        tile = ct.gather(
+            array, (batch, ct.expand_dims(rows, 1), ct.expand_dims(columns, 0)),
+            padding_value=0, check_bounds=True,
+        )
+        return ct.reshape(tile, (1, ROWS, COLUMNS))
+    return ct.load(
+        array, index=(batch, row, column), shape=(1, ROWS, COLUMNS),
+        order=(0, 1, 2), padding_mode=ct.PaddingMode.ZERO, latency=3,
+        allow_tma=ACCESS_FORM == 1,
+    )
+
+
 @ct.kernel
 def _static_persistent_bmm_kernel(
     A,
@@ -110,6 +131,7 @@ def _static_persistent_bmm_kernel(
     GROUP_SIZE_M: ct.Constant[int],
     TRANSPOSE_A: ct.Constant[bool],
     TRANSPOSE_B: ct.Constant[bool],
+    ACCESS_FORM: ct.Constant[int],
 ):
     """CuTile static persistent GEMM kernel: C = A @ B with static scheduling
 
@@ -144,8 +166,6 @@ def _static_persistent_bmm_kernel(
         # Initialize 2D accumulator (avoid 3D reshape overhead)
         accumulator = ct.full((TILE_M, TILE_N), 0.0, dtype=ct.float32)
 
-        zero_pad = ct.PaddingMode.ZERO
-
         # K-dimension loop
         num_k_tiles = ct.cdiv(K, TILE_K)
         for k_tile in range(num_k_tiles):
@@ -153,52 +173,24 @@ def _static_persistent_bmm_kernel(
             if TRANSPOSE_A:
                 # A is transposed: physical layout (Q, K, M), load as (TILE_M, TILE_K)
                 # Use order=(0, 2, 1) to read transposed
-                a_tile_3d = ct.load(
-                    A,
-                    index=(bid_q, k_tile, bid_m),
-                    shape=(1, TILE_K, TILE_M),
-                    order=(0, 1, 2),
-                    padding_mode=zero_pad,
-                    latency=3,
-                )
+                a_tile_3d = _load_bmm_tile(A, bid_q, k_tile, bid_m, TILE_K, TILE_M, ACCESS_FORM)
                 # Transpose to get (1, TILE_M, TILE_K)
                 a_tile_3d = ct.permute(a_tile_3d, (0, 2, 1))
             else:
                 # A is normal: physical layout (Q, M, K)
-                a_tile_3d = ct.load(
-                    A,
-                    index=(bid_q, bid_m, k_tile),
-                    shape=(1, TILE_M, TILE_K),
-                    order=(0, 1, 2),
-                    padding_mode=zero_pad,
-                    latency=3,
-                )
+                a_tile_3d = _load_bmm_tile(A, bid_q, bid_m, k_tile, TILE_M, TILE_K, ACCESS_FORM)
             # Reshape to 2D for MMA
             a_tile = ct.reshape(a_tile_3d, (TILE_M, TILE_K))
 
             # Load B tile
             if TRANSPOSE_B:
                 # B is transposed: physical layout (Q, N, K), load and transpose
-                b_tile_3d = ct.load(
-                    B,
-                    index=(bid_q, bid_n, k_tile),
-                    shape=(1, TILE_N, TILE_K),
-                    order=(0, 1, 2),
-                    padding_mode=zero_pad,
-                    latency=3,
-                )
+                b_tile_3d = _load_bmm_tile(B, bid_q, bid_n, k_tile, TILE_N, TILE_K, ACCESS_FORM)
                 # Transpose to get (1, TILE_K, TILE_N)
                 b_tile_3d = ct.permute(b_tile_3d, (0, 2, 1))
             else:
                 # B is normal: physical layout (Q, K, N)
-                b_tile_3d = ct.load(
-                    B,
-                    index=(bid_q, k_tile, bid_n),
-                    shape=(1, TILE_K, TILE_N),
-                    order=(0, 1, 2),
-                    padding_mode=zero_pad,
-                    latency=3,
-                )
+                b_tile_3d = _load_bmm_tile(B, bid_q, k_tile, bid_n, TILE_K, TILE_N, ACCESS_FORM)
             # Reshape to 2D for MMA
             b_tile = ct.reshape(b_tile_3d, (TILE_K, TILE_N))
 
@@ -208,11 +200,23 @@ def _static_persistent_bmm_kernel(
         # Convert to output dtype
         result = ct.astype(accumulator, C.dtype)
         # Reshape to 3D for store
-        result_3d = ct.reshape(result, (1, TILE_M, TILE_N))
-        ct.store(C, index=(bid_q, bid_m, bid_n), tile=result_3d, order=(0, 1, 2), latency=3)
+        if ACCESS_FORM == 2:
+            rows = bid_m * TILE_M + ct.arange(TILE_M, dtype=ct.int32)
+            columns = bid_n * TILE_N + ct.arange(TILE_N, dtype=ct.int32)
+            ct.scatter(
+                C, (bid_q, ct.expand_dims(rows, 1), ct.expand_dims(columns, 0)),
+                result, check_bounds=True,
+            )
+        else:
+            result_3d = ct.reshape(result, (1, TILE_M, TILE_N))
+            ct.store(C, index=(bid_q, bid_m, bid_n), tile=result_3d,
+                     order=(0, 1, 2), latency=3, allow_tma=ACCESS_FORM == 1)
 
 
-def _persistent_bmm_autotune_base(stream, a, b, output, batch_size, M, N, K, transpose_a, transpose_b):
+def _persistent_bmm_autotune_base(
+    stream, a, b, output, batch_size, M, N, K, transpose_a, transpose_b,
+    tuning_configs, compiler_timeout,
+):
     """
     Autotuned static persistent BMM kernel
 
@@ -248,6 +252,7 @@ def _persistent_bmm_autotune_base(stream, a, b, output, batch_size, M, N, K, tra
             cfg.GROUP_SIZE_M,
             transpose_a,
             transpose_b,
+            cfg.ACCESS_FORM,
         )
 
     # grid_fn: computes grid size based on config
@@ -257,19 +262,27 @@ def _persistent_bmm_autotune_base(stream, a, b, output, batch_size, M, N, K, tra
         num_tiles_n = (N + cfg.TILE_N - 1) // cfg.TILE_N
         total_tiles = num_tiles_m * num_tiles_n * batch_size
 
-        occupancy = getattr(cfg, "occupancy", 1)
-        num_ctas = getattr(cfg, "num_ctas", 1)
+        occupancy = cfg.occupancy
+        num_ctas = cfg.num_ctas
 
         base_programs = NUM_SMS // num_ctas
         grid_size = min(base_programs, total_tiles) * occupancy
         return (grid_size,)
 
     # Call autotuner to find the best config and execute the kernel
-    cache_key = (batch_size, M, N, K, transpose_a, transpose_b, a.dtype, str(a.device))
+    configs = tuple(_bmm_autotune_configs()) if tuning_configs is None else tuple(tuning_configs)
+    for cfg in configs:
+        if vars(cfg).keys() != {"TILE_M", "TILE_N", "TILE_K", "GROUP_SIZE_M",
+                               "occupancy", "num_ctas", "ACCESS_FORM"}:
+            raise ValueError("BMM requires complete candidates without unconsumed fields")
+    config_key = tuple(tuple(sorted(vars(cfg).items())) for cfg in configs)
+    cache_key = (batch_size, M, N, K, transpose_a, transpose_b, a.dtype, str(a.device),
+                 tuple(a.stride()), tuple(b.stride()), a.storage_offset(), b.storage_offset(),
+                 config_key, compiler_timeout)
     if cache_key not in _bmm_tune_cache:
-        with ct.compiler_timeout(15):
+        with ct.compiler_timeout(compiler_timeout):
             result = exhaustive_search(
-                list(_bmm_autotune_configs()),
+                configs,
                 stream,
                 grid_fn,
                 _static_persistent_bmm_kernel,
@@ -288,7 +301,8 @@ def _persistent_bmm_autotune_base(stream, a, b, output, batch_size, M, N, K, tra
 
 
 @register_impl("bmm", backend="cutile")
-def bmm(a, b, transpose_a=False, transpose_b=False, static_persistent=True, **kwargs):
+def bmm(a, b, transpose_a=False, transpose_b=False, static_persistent=True,
+        *, tuning_configs=None, compiler_timeout=15, **kwargs):
     """
     Batch Matrix Multiplication using CuTile
 
@@ -320,9 +334,12 @@ def bmm(a, b, transpose_a=False, transpose_b=False, static_persistent=True, **kw
 
     if static_persistent:
         _persistent_bmm_autotune_base(
-            torch.cuda.current_stream(), a, b, output, Q_A, M, N, K_A, transpose_a, transpose_b
+            torch.cuda.current_stream(), a, b, output, Q_A, M, N, K_A, transpose_a, transpose_b,
+            tuning_configs, compiler_timeout,
         )
     else:
+        if tuning_configs is not None:
+            raise NotImplementedError("explicit tuning candidates require the persistent BMM entry")
         assert not transpose_a, "Transpose A is not supported for BMM"
         assert not transpose_b, "Transpose B is not supported for BMM"
         # Defaults for non-persistent schedule (lighter tiles)

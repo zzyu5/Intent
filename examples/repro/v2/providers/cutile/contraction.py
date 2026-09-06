@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import cuda.tile as ct
 import torch
 
 from kernels.contraction.batched_gemm import batched_gemm_nn
@@ -15,6 +16,7 @@ from ...model import Context
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
 from ...model import Tolerance
+from .common import contraction_configs
 from .common import official_source
 from .common import tilegym_source
 
@@ -116,7 +118,12 @@ def batched_gemm(context: Context) -> PreparedComparison:
     batch, m, k, n = 32, 512, 1024, 512
     a = torch.randn((batch, m, k), device="cuda", dtype=torch.bfloat16)
     b = torch.randn((batch, k, n), device="cuda", dtype=torch.bfloat16)
-    _, generated = compile_single(context, batched_gemm_nn, (a, b))
+    with ct.compiler_timeout(15):
+        artifact, generated = compile_single(context, batched_gemm_nn, (a, b))
+    configs = contraction_configs(
+        artifact, (a, b, generated.outputs()),
+        m_axis=(0, 1), n_axis=(1, 2), k_axis=(0, 2), batch_axis=(0, 0),
+    )
     source_module = tilegym_source(
         context,
         "source/cutile/tilegym/gemm/batched/bmm.py",
@@ -129,6 +136,8 @@ def batched_gemm(context: Context) -> PreparedComparison:
             transpose_a=False,
             transpose_b=False,
             static_persistent=True,
+            tuning_configs=configs,
+            compiler_timeout=15,
         )
     )
     return PreparedComparison(

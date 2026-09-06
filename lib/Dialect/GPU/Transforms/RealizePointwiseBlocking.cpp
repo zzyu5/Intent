@@ -2986,6 +2986,7 @@ enum ContractFreeAxisSide : unsigned {
 struct ContractFreeAxisFacts {
   unsigned sides = ContractFreeAxisNone;
   bool regionContraction = false;
+  bool batchedContraction = false;
 };
 
 ContractFreeAxisFacts contractFreeAxisFacts(func::FuncOp kernel,
@@ -3007,6 +3008,14 @@ ContractFreeAxisFacts contractFreeAxisFacts(func::FuncOp kernel,
       if (axis.operand == contract.getRhs())
         facts.sides |= ContractFreeAxisRhs;
       auto fold = contract->getParentOfType<RegionFoldOp>();
+      if (!fold && !contract.getLhsBatchAxes().empty() &&
+          llvm::count_if(freeAxes.axes, [&](const auto &free) {
+            return free.operand == contract.getLhs();
+          }) == 1 &&
+          llvm::count_if(freeAxes.axes, [&](const auto &free) {
+            return free.operand == contract.getRhs();
+          }) == 1)
+        facts.batchedContraction = true;
       if (fold &&
           fold.getSegment().getCategory() ==
               static_cast<uint32_t>(ParameterCategory::RegionContraction))
@@ -4393,8 +4402,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     const bool scalarGridAxis =
         ownershipIndex + 2 < pointwiseOwnershipAxes.size();
     unsigned contractSides = ContractFreeAxisNone;
-    for (MakeRangeOp range : axes.lookup(axis))
-      contractSides |= contractFreeAxisSides(kernel, range);
+    bool batchedContraction = false;
+    for (MakeRangeOp range : axes.lookup(axis)) {
+      ContractFreeAxisFacts facts = contractFreeAxisFacts(kernel, range);
+      contractSides |= facts.sides;
+      batchedContraction |= facts.batchedContraction;
+    }
     ParameterRole ownershipRole = ParameterRole::OwnershipN;
     if (!scalarGridAxis && contractSides == ContractFreeAxisLhs)
       ownershipRole = ParameterRole::OwnershipM;
@@ -4412,10 +4425,16 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           module.getContext(),
           {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
            8192, 16384, 32768, 65536});
+    uint32_t category = parameter.getParameter().getCategory();
+    if (!scalarGridAxis && batchedContraction &&
+        (contractSides == ContractFreeAxisLhs ||
+         contractSides == ContractFreeAxisRhs) &&
+        category == static_cast<uint32_t>(ParameterCategory::Pointwise))
+      category = static_cast<uint32_t>(ParameterCategory::Contraction);
     auto schema = ParameterAttr::get(
         module.getContext(), parameter.getParameter().getName(),
         static_cast<uint32_t>(ownershipRole),
-        parameter.getParameter().getCategory(),
+        category,
         pointwiseElementBitWidth, candidates);
     parameter->setAttr("parameter", schema);
   }

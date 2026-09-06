@@ -178,8 +178,12 @@ def main() -> None:
     parser.add_argument("--compiler", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--kernel", action="append")
+    parser.add_argument("--worker-timeout", type=int, default=WORKER_TIMEOUT_SECONDS,
+                        help="wall-clock limit in seconds for each complete entry")
     parser.add_argument("--worker-entry", type=int, help=argparse.SUPPRESS)
     arguments = parser.parse_args()
+    if arguments.worker_timeout <= 0:
+        parser.error("--worker-timeout must be positive")
 
     provider = arguments.provider
     selected = set(arguments.kernel or ())
@@ -227,7 +231,7 @@ def main() -> None:
                 start_new_session=True,
             )
             try:
-                returncode = worker.wait(timeout=WORKER_TIMEOUT_SECONDS)
+                returncode = worker.wait(timeout=arguments.worker_timeout)
             except subprocess.TimeoutExpired:
                 os.killpg(worker.pid, signal.SIGTERM)
                 try:
@@ -239,7 +243,7 @@ def main() -> None:
                 status = f"{stage}_timeout"
                 print(
                     f"{provider}:{entry.kernel}: {status}: "
-                    f"exceeded {WORKER_TIMEOUT_SECONDS} seconds"
+                    f"exceeded {arguments.worker_timeout} seconds"
                 )
                 row = ResultRow(entry.kernel, entry.case, None, None, None, status)
             else:

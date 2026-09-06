@@ -46,6 +46,7 @@ Intent 的 shared GPU Program 是 cuTile lowering 的唯一完整 executable aut
 - 两台机器使用同一 compiler提交和一致的 cuTile运行环境。两张 CSV是该状态的当前观察，不定义 DSL、compiler policy或长期 capability。
 - 只有 generated/source都数值通过，并且算法、数值契约、dtype、ABI、shape、调用次数、candidate contract和计时范围一致的稳定 entry才计算 ratio。
 - 数值容差通过不证明比较契约相同。比较显式覆盖 full-f32/TF32 等输入精度、cast/中间 dtype、所有 kernel 和额外 tensor 变换，以及实际启用的候选搜索；不一致时先对齐同一既定语义或记录具体不可比原因，不能据此改变 shared semantics 或归因性能。
+- Source runtime 可接入比较所需的完整候选集合，并由同一 provider tuner 独立选择 winner；对齐只改变候选入口，不改变 source 算法、数值语义、ABI 或计时范围，不按 generated winner、entry 名称或旧 timing 隐式筛选候选。
 - 稳定可比 entry的 `generated_p50_ms / source_p50_ms` 不超过 `1.05`。明显高 ratio优先从 current Physical Program的 mapping/blocking/ownership/traversal/materialization、typed config/candidate或 provider form修复；不可通过 entry-local特例、source模仿、测量挑选或语义缩窄闭合。
 - 若 fresh same-code复核证明结果不稳定或不可比，CSV记录具体原因并不保留无解释的高 ratio `pass`；`1.05` 不成为 lowering legality或 target capability规则。
 
