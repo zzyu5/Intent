@@ -5,9 +5,13 @@
 import math
 
 import cuda.tile as ct
+from cuda.tile.tune import exhaustive_search
 import torch
 
 from tilegym.backend import register_impl
+
+
+_dropout_tune_cache = {}
 
 
 @ct.kernel
@@ -18,6 +22,7 @@ def _dropout_kernel(
     SEED: ct.Constant[int],
     TILE_SIZE: ct.Constant[int],
     TRAINING: ct.Constant[bool],
+    ACCESS_FORM: ct.Constant[int],
 ):
     """
     cuTile kernel for dropout operation.
@@ -35,7 +40,12 @@ def _dropout_kernel(
     offsets = ct.arange(TILE_SIZE, dtype=ct.int32) + tile_start
     # For 1D arrays, indices are passed directly (not as tuple)
     # Use padding_value=0 (int) to avoid dtype mismatch with float16
-    x_tile = ct.gather(x, offsets, padding_value=0)
+    # Form 0 preserves the untuned entry's gather/scatter access.
+    if ACCESS_FORM == 0 or ACCESS_FORM == 2:
+        x_tile = ct.gather(x, offsets, padding_value=0)
+    else:
+        x_tile = ct.load(x, index=(bid,), shape=(TILE_SIZE,),
+                         padding_mode=ct.PaddingMode.ZERO, allow_tma=ACCESS_FORM != 3)
 
     # Initialize output tile
     output_tile = ct.zeros((TILE_SIZE,), dtype=x_tile.dtype)
@@ -71,7 +81,35 @@ def _dropout_kernel(
     else:
         # In inference mode, just copy input to output
         output_tile = x_tile
-    ct.scatter(output, offsets, output_tile)
+    if ACCESS_FORM == 0:
+        ct.scatter(output, offsets, output_tile)
+    else:
+        ct.store(output, index=(bid,), tile=output_tile, allow_tma=ACCESS_FORM != 3)
+
+
+def _autotune_dropout(stream, x, output, probability, seed, tuning_configs, compiler_timeout):
+    configs = tuple(tuning_configs)
+    for cfg in configs:
+        if vars(cfg).keys() != {"TILE_SIZE", "ACCESS_FORM"}:
+            raise ValueError("dropout requires complete candidates without unconsumed fields")
+        if cfg.ACCESS_FORM not in (1, 2, 3):
+            raise ValueError("dropout candidate has an unknown access form")
+    config_key = tuple(tuple(sorted(vars(cfg).items())) for cfg in configs)
+    cache_key = (tuple(x.shape), tuple(x.stride()), x.dtype, str(x.device),
+                 x.storage_offset(), probability, seed, config_key, compiler_timeout)
+
+    def grid_fn(cfg):
+        return (ct.cdiv(x.numel(), cfg.TILE_SIZE), 1, 1)
+
+    def args_fn(cfg):
+        return (x, output, probability, seed, cfg.TILE_SIZE, True, cfg.ACCESS_FORM)
+
+    if cache_key not in _dropout_tune_cache:
+        with ct.compiler_timeout(compiler_timeout):
+            result = exhaustive_search(configs, stream, grid_fn, _dropout_kernel, args_fn)
+        _dropout_tune_cache[cache_key] = result.best.config
+    best = _dropout_tune_cache[cache_key]
+    ct.launch(stream, grid_fn(best), _dropout_kernel, args_fn(best))
 
 
 def _mix_seed(seed: int) -> int:
@@ -99,7 +137,8 @@ def _mix_seed(seed: int) -> int:
 
 class _DropoutCuTileFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, seed, p=0.5, training=True, inplace=False):
+    def forward(ctx, x, seed, p=0.5, training=True, inplace=False,
+                tuning_configs=None, compiler_timeout=15):
         """
         Forward pass for dropout.
 
@@ -113,6 +152,8 @@ class _DropoutCuTileFunction(torch.autograd.Function):
         Returns:
             Output tensor with dropout applied
         """
+        if tuning_configs is not None and (not training or inplace):
+            raise NotImplementedError("explicit dropout candidates require out-of-place training")
         if not training:
             ctx.mark_dirty(x)
             return x
@@ -135,19 +176,14 @@ class _DropoutCuTileFunction(torch.autograd.Function):
         # large bit-level perturbations before the kernel's XOR-shift hash.
         seed_int32 = _mix_seed(seed)
 
-        ct.launch(
-            torch.cuda.current_stream(),
-            grid,
-            _dropout_kernel,
-            (
-                x_flat,
-                output_flat,
-                p,
-                seed_int32,
-                TILE_SIZE,
-                training,
-            ),
-        )
+        if tuning_configs is None:
+            ct.launch(
+                torch.cuda.current_stream(), grid, _dropout_kernel,
+                (x_flat, output_flat, p, seed_int32, TILE_SIZE, training, 0),
+            )
+        else:
+            _autotune_dropout(torch.cuda.current_stream(), x_flat, output_flat,
+                               p, seed_int32, tuning_configs, compiler_timeout)
 
         ctx.p = p
         ctx.seed = seed
@@ -159,7 +195,8 @@ class _DropoutCuTileFunction(torch.autograd.Function):
 
 
 @register_impl("dropout", backend="cutile")
-def dropout(x, seed, p=0.5, training=True, inplace=False, **kwargs):
+def dropout(x, seed, p=0.5, training=True, inplace=False,
+            *, tuning_configs=None, compiler_timeout=15, **kwargs):
     """
     cuTile implementation of dropout.
 
@@ -176,4 +213,6 @@ def dropout(x, seed, p=0.5, training=True, inplace=False, **kwargs):
     Returns:
         Tensor with dropout applied
     """
-    return _DropoutCuTileFunction.apply(x, seed, p, training, inplace)
+    return _DropoutCuTileFunction.apply(
+        x, seed, p, training, inplace, tuning_configs, compiler_timeout,
+    )

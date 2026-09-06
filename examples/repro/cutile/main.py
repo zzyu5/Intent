@@ -101,6 +101,8 @@ def _load_extended_upstream(kernel: str, source_path: Path):
                     tn,
                     tk,
                     scaling_block_size,
+                    8,
+                    1,
                 ),
             )
             return state["output"]

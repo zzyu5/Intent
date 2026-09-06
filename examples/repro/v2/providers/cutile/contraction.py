@@ -38,19 +38,22 @@ def block_scaled_gemm(context: Context) -> PreparedComparison:
     )
     rhs = rhs_rows.T
     rhs_scale = rhs_scale_rows.T
-    _, generated = compile_single(
-        context,
-        block_scaled_matmul,
-        (
-            lhs.view(m, k // block, block),
-            lhs_scale.view(torch.uint8),
-            rhs.view(k // block, block, n),
-            rhs_scale.view(torch.uint8),
-        ),
+    arguments = (
+        lhs.view(m, k // block, block),
+        lhs_scale.view(torch.uint8),
+        rhs.view(k // block, block, n),
+        rhs_scale.view(torch.uint8),
+    )
+    artifact, generated = compile_single(context, block_scaled_matmul, arguments)
+    configs = contraction_configs(
+        artifact, (*arguments, generated.outputs()),
+        m_axis=(0, 0), n_axis=(2, 2), k_axis=(0, 1), fixed_options={},
+        k_elements_per_unit=block,
     )
     source = functional_launch(
         lambda: source_module.cutile_block_scaled_matmul(
-            lhs, lhs_scale, rhs, rhs_scale
+            lhs, lhs_scale, rhs, rhs_scale, tuning_configs=configs,
+            compiler_timeout=context.compiler_timeout_seconds,
         )
     )
     return PreparedComparison(

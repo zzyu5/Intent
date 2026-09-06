@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import cuda.tile as ct
 import torch
 
+from intent.runtime.artifact import ParameterRole
 from kernels.backward.attention import attention_backward_delta
 from kernels.backward.attention import attention_backward_dkdv
 from kernels.backward.attention import attention_backward_dq
@@ -26,6 +28,8 @@ from kernels.streaming.splitk_reduce import splitk_attention_reduce_f16
 from ...measurement import compile_single
 from ...measurement import initial_launch
 from ...measurement import functional_launch
+from ...measurement import PipelineStageError
+from ...measurement import report_stage
 from ...model import Context
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
@@ -75,6 +79,7 @@ def official_fmha(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=5e-2, rtol=2e-2),
         cuda_graph=True,
+        status="source_exp2_ftz_and_approx_division_contract_gap",
     )
 
 
@@ -111,6 +116,7 @@ def dense_attention_forward(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=5e-2, rtol=2e-2),
         cuda_graph=True,
+        status="source_exp2_ftz_and_approx_division_contract_gap",
     )
 
 
@@ -124,9 +130,43 @@ def splitk_reduce(context: Context) -> PreparedComparison:
     partial_lse = torch.randn(
         (batch, heads, splits), device="cuda", dtype=torch.float32
     )
-    _, generated = compile_single(
+    artifact, generated = compile_single(
         context, splitk_attention_reduce, (partial, partial_lse)
     )
+    report_stage("generated_tuning_metadata")
+    try:
+        configurations = artifact.tuning_configurations(
+            partial, partial_lse, generated.outputs(),
+        )
+    except NotImplementedError as error:
+        raise PipelineStageError("generated_tuning_metadata", str(error)) from error
+    report_stage("source_candidate_binding")
+    configs = []
+    for configuration in configurations:
+        values = {}
+        for parameter, value in zip(configuration.parameters, configuration.values, strict=True):
+            role, axis = parameter.role, parameter.view_axis
+            if role == ParameterRole.PROVIDER_ACCESS_FORM:
+                field = "ACCESS_FORM"
+            elif role == ParameterRole.PROVIDER_OCCUPANCY:
+                field = "occupancy"
+            elif role == ParameterRole.PROVIDER_CTAS:
+                field = "num_ctas"
+            elif role == ParameterRole.FULL_COVERAGE and axis == (0, 2):
+                field = "NUM_KV_SPLITS_POW2"
+            elif role in (ParameterRole.OWNERSHIP_M, ParameterRole.OWNERSHIP_N) and axis == (0, 3):
+                field = "TILE_D"
+            else:
+                raise PipelineStageError("source_candidate_binding",
+                                         f"source cannot bind split-K reduction parameter {parameter}")
+            if field in values:
+                raise PipelineStageError("source_candidate_binding", f"duplicate split-K reduction field {field}")
+            values[field] = value
+        if values.keys() != {"ACCESS_FORM", "occupancy", "num_ctas", "NUM_KV_SPLITS_POW2", "TILE_D"}:
+            raise PipelineStageError("source_candidate_binding", "incomplete split-K reduction candidate")
+        configs.append(SimpleNamespace(**values))
+    configs = tuple(configs)
+    report_stage("adapter_preparation")
     source_module = tilegym_source(
         context,
         "source/cutile/tilegym/attention/flash_decode/splitk_reduce.py",
@@ -142,6 +182,8 @@ def splitk_reduce(context: Context) -> PreparedComparison:
             partial_lse,
             source_output,
             8192,
+            tuning_configs=configs,
+            compiler_timeout=context.compiler_timeout_seconds,
         )
 
     initial_launch(source_launch, side="source")
@@ -199,6 +241,7 @@ def mla_prefill_case(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=5e-2, rtol=2e-2),
         cuda_graph=True,
+        status="source_exp2_ftz_and_approx_division_contract_gap",
     )
 
 
@@ -339,6 +382,8 @@ def absorbed_mla(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=5e-2, rtol=2e-2),
         cuda_graph=True,
+        # Source additionally stores LSE and requests approximate normalization.
+        status="source_approx_division_and_auxiliary_lse_contract_gap",
     )
 
 
@@ -511,6 +556,7 @@ def sparse_mla_prefill(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=1e-1, rtol=5e-2),
         cuda_graph=False,
+        status="source_exp2_ftz_and_approx_division_contract_gap",
     )
 
 
@@ -609,6 +655,7 @@ def splitk_mla_decode(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=1e-1, rtol=5e-2),
         cuda_graph=False,
+        status="source_ftz_approx_division_contract_gap",
     )
 
 
@@ -680,6 +727,7 @@ def grouped_flash_decode(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=1e-1, rtol=5e-2),
         cuda_graph=False,
+        status="source_ftz_approx_division_contract_gap",
     )
 
 
@@ -761,6 +809,8 @@ def attention_sink_decode(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=1e-1, rtol=5e-2),
         cuda_graph=False,
+        # Source rounds LSE to the bf16 output dtype before storing in its f32 buffer.
+        status="source_bf16_lse_and_approx_division_contract_gap",
     )
 
 

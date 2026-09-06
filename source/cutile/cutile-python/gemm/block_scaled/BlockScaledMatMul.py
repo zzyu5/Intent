@@ -4,6 +4,7 @@
 
 import argparse
 import cuda.tile as ct
+from cuda.tile.tune import exhaustive_search
 import torch
 import sys
 from cuda.tile._cext import get_compute_capability
@@ -86,6 +87,19 @@ def swizzle_32_4_4(scale):
 
 
 ConstInt = ct.Constant[int]
+_block_scaled_tune_cache = {}
+
+
+@ct.function
+def _load_block_scaled_tile(array, row, column, ROWS: ConstInt, COLUMNS: ConstInt,
+                            ACCESS_FORM: ConstInt):
+    if ACCESS_FORM == 2:
+        rows = row * ROWS + ct.arange(ROWS, dtype=ct.int32)
+        columns = column * COLUMNS + ct.arange(COLUMNS, dtype=ct.int32)
+        return ct.gather(array, (rows[:, None], columns[None, :]),
+                         check_bounds=True, padding_value=0)
+    return ct.load(array, index=(row, column), shape=(ROWS, COLUMNS),
+                   padding_mode=ct.PaddingMode.ZERO, allow_tma=ACCESS_FORM != 3)
 
 
 def swizzle_2d_from_bid(M, N, tm, tn, GROUP_SIZE_M, bid):
@@ -127,7 +141,8 @@ def block_scaled_matmul_kernel(
                     tm: ConstInt,         # Tile size along M dimension (rows of C)
                     tn: ConstInt,         # Tile size along N dimension (columns of C)
                     tk: ConstInt,        # Tile size along K dimension (inner product dimension)
-                    scaling_block_size: ConstInt):
+                    scaling_block_size: ConstInt,
+                    GROUP_SIZE_M: ConstInt, ACCESS_FORM: ConstInt):
 
     """
     cuTile kernel for block-scaled matrix multiplication.
@@ -157,7 +172,6 @@ def block_scaled_matmul_kernel(
                         Corresponds to columns of A and rows of B.
         scaling_block_size (ConstInt): the scaling block size.
     """
-    GROUP_SIZE_M = 8
     M = A.shape[0]
     N = B.shape[1]
     bidx, bidy = swizzle_2d(M, N, tm, tn, GROUP_SIZE_M)
@@ -184,11 +198,11 @@ def block_scaled_matmul_kernel(
         # Load tile from matrix A.
         # The `index=(bidx, k_tile_idx)` specifies which (M-tile, K-tile) to load
         # from global memory A. `shape=(tm, tk)` defines the size of this tile.
-        a = ct.load(A, index=(bidx, k), shape=(tm, tk), padding_mode=zero_pad)
+        a = _load_block_scaled_tile(A, bidx, k, tm, tk, ACCESS_FORM)
 
         if len(A_scale.shape) == 2:
             # 2D scale path. A_scale is already stored in logical shape (M, K_s).
-            a_scale = ct.load(A_scale, index=(bidx, k), shape=(tm, tks), padding_mode=zero_pad)
+            a_scale = _load_block_scaled_tile(A_scale, bidx, k, tm, tks, ACCESS_FORM)
         else:
             # Load the packed scale tile, unswizzle it, and reshape to
             # the logical ct.mma_scaled shape (tm, tks).
@@ -202,10 +216,10 @@ def block_scaled_matmul_kernel(
         # Load tile from matrix B.
         # The `index=(k_tile_idx, bidy)` specifies which (K-tile, N-tile) to load
         # from global memory B. `shape=(tk, tn)` defines the size of this tile.
-        b = ct.load(B, index=(k, bidy), shape=(tk, tn), padding_mode=zero_pad)
+        b = _load_block_scaled_tile(B, k, bidy, tk, tn, ACCESS_FORM)
 
         if len(B_scale.shape) == 2:
-            b_scale = ct.load(B_scale, index=(k, bidy), shape=(tks, tn), padding_mode=zero_pad)
+            b_scale = _load_block_scaled_tile(B_scale, k, bidy, tks, tn, ACCESS_FORM)
         else:
             # B scales are stored N-major. Unswizzle it, reshape it to
             # (tn, tks), then transpose it to the logical ct.mma_scaled shape (tks, tn).
@@ -223,11 +237,12 @@ def block_scaled_matmul_kernel(
 
     # Store the computed tile to the global memory of the output matrix C.
     # The `(bidx, bidy)` directly corresponds to the tile's position in the 2D output matrix.
-    ct.store(C, index=(bidx, bidy), tile=accumulator)
+    ct.store(C, index=(bidx, bidy), tile=accumulator, allow_tma=ACCESS_FORM != 3)
 
 
 def cutile_block_scaled_matmul(A: torch.Tensor, A_scale: torch.Tensor,
-                               B: torch.Tensor, B_scale: torch.Tensor) -> torch.Tensor:
+                               B: torch.Tensor, B_scale: torch.Tensor,
+                               *, tuning_configs=None, compiler_timeout=15) -> torch.Tensor:
 
     """
     Performs block-scaled matrix multiplication using a cuTile kernel.
@@ -287,12 +302,51 @@ def cutile_block_scaled_matmul(A: torch.Tensor, A_scale: torch.Tensor,
     # on the same device, and with the same data type as the input matrices.
     C = torch.empty((m, n), device=A.device, dtype=torch.float32)
 
+    if tuning_configs is not None:
+        if A_scale.ndim != 2 or B_scale.ndim != 2:
+            raise NotImplementedError("explicit candidates require logical 2D scale views")
+        configs = tuple(tuning_configs)
+        for cfg in configs:
+            if vars(cfg).keys() != {"TILE_M", "TILE_N", "TILE_K", "GROUP_SIZE_M",
+                                   "ACCESS_FORM", "occupancy", "num_ctas"}:
+                raise ValueError("scaled GEMM requires complete candidates without unconsumed fields")
+            if cfg.TILE_K <= 0 or cfg.TILE_K % scaling_block_size != 0:
+                raise ValueError("scaled GEMM K tile must contain complete scaling groups")
+        arrays = (A, A_scale, B, B_scale)
+        layouts = tuple((tuple(value.shape), tuple(value.stride()), value.dtype,
+                         str(value.device), value.storage_offset()) for value in arrays)
+        config_key = tuple(tuple(sorted(vars(cfg).items())) for cfg in configs)
+        cache_key = (layouts, config_key, compiler_timeout)
+        stream = torch.cuda.current_stream()
+
+        def grid_fn(cfg):
+            return (ct.cdiv(m, cfg.TILE_M) * ct.cdiv(n, cfg.TILE_N), 1, 1)
+
+        def args_fn(cfg):
+            return (A, A_scale, B, B_scale, C, cfg.TILE_M, cfg.TILE_N, cfg.TILE_K,
+                    scaling_block_size, cfg.GROUP_SIZE_M, cfg.ACCESS_FORM)
+
+        if cache_key not in _block_scaled_tune_cache:
+            with ct.compiler_timeout(compiler_timeout):
+                result = exhaustive_search(
+                    configs, stream, grid_fn, block_scaled_matmul_kernel, args_fn,
+                    lambda cfg: {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy},
+                )
+            best = result.best.config
+            _block_scaled_tune_cache[cache_key] = (
+                best, block_scaled_matmul_kernel.replace_hints(
+                    num_ctas=best.num_ctas, occupancy=best.occupancy),
+            )
+        best, kernel = _block_scaled_tune_cache[cache_key]
+        ct.launch(stream, grid_fn(best), kernel, args_fn(best))
+        return C
+
     # --- Launch the cuTile Kernel ---
     # The `block_scaled_matmul_kernel` is launched with the calculated grid dimensions.
     # `tm`, `tn`, and `tk` are passed as Constant integers to the kernel.
     kernel = block_scaled_matmul_kernel
     ct.launch(torch.cuda.current_stream(), grid, kernel, (
-        A, A_scale, B, B_scale, C, tm, tn, tk, scaling_block_size))
+        A, A_scale, B, B_scale, C, tm, tn, tk, scaling_block_size, 8, 1))
 
     return C
 

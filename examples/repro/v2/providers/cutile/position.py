@@ -73,6 +73,8 @@ def rope_qk(context: Context) -> PreparedComparison:
         source,
         (Tolerance(atol=2e-2, rtol=1e-2), Tolerance(atol=2e-2, rtol=1e-2)),
         cuda_graph=False,
+        # Source multiplies/adds bf16 tiles; Intent promotes both products to f32.
+        status="source_bf16_intermediates_contract_gap",
     )
 
 

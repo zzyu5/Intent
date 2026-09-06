@@ -13,6 +13,7 @@ from ...model import Context
 
 def contraction_configs(
     artifact, arguments, *, m_axis, n_axis, k_axis, fixed_options, batch_axis=None,
+    k_elements_per_unit=1,
 ):
     report_stage("generated_tuning_metadata")
     try:
@@ -37,6 +38,7 @@ def contraction_configs(
                 field = "GROUP_SIZE_M"
             elif role == ParameterRole.REDUCTION and axis == k_axis:
                 field = "TILE_K"
+                value *= k_elements_per_unit
             elif role in (ParameterRole.OWNERSHIP_M, ParameterRole.OWNERSHIP_N):
                 if axis == m_axis:
                     field = "TILE_M"
