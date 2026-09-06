@@ -34,17 +34,15 @@ def moe_expert_ffn(
         token = I.gather(route_token, index=routes)
         weight = I.gather(route_weights, index=routes)
         values = I.gather(x, index=(token, slice(None)))
-        hidden = I.contract(
+        hidden = I.matmul(
             values,
             w1[expert, :, :],
-            reduce=((1, 0),),
             acc_dtype=I.f32,
         )
         hidden = I.cast(I.maximum(hidden, 0.0), I.f16)
-        route_output = I.contract(
+        route_output = I.matmul(
             hidden,
             w2[expert, :, :],
-            reduce=((1, 0),),
             acc_dtype=I.f32,
         )
         I.scatter_reduce(

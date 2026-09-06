@@ -186,10 +186,10 @@ def summarize_attention_chunk_bf16(
     scale,
     causal,
 ):
-    scores = I.contract(
+    scores = I.matmul(
         queries,
         key_chunk,
-        reduce=((1, 1),),
+        transpose_rhs=True,
         acc_dtype=I.f32,
     ) * (scale * I.LOG2E)
     valid = I.full(scores.shape, fill=True, dtype=I.bool)
@@ -208,10 +208,9 @@ def summarize_attention_chunk_bf16(
         valid=chunk_valid,
         maximum=maximum,
         denominator=I.reduce.sum(probability, axis=1),
-        accumulator=I.contract(
+        accumulator=I.matmul(
             I.cast(probability, I.bf16),
             value_chunk,
-            reduce=((1, 0),),
             acc_dtype=I.f32,
         ),
     )
@@ -227,10 +226,10 @@ def summarize_masked_attention_chunk(
     query_coordinates,
     scale,
 ):
-    scores = I.contract(
+    scores = I.matmul(
         queries,
         key_chunk,
-        reduce=((1, 1),),
+        transpose_rhs=True,
         acc_dtype=I.f32,
     ) * (scale * I.LOG2E)
     valid = I.full(scores.shape, fill=True, dtype=I.bool) & active[None, :]
@@ -247,10 +246,9 @@ def summarize_masked_attention_chunk(
         valid=chunk_valid,
         maximum=maximum,
         denominator=I.reduce.sum(probability, axis=1),
-        accumulator=I.contract(
+        accumulator=I.matmul(
             I.cast(probability, I.f16),
             value_chunk,
-            reduce=((1, 0),),
             acc_dtype=I.f32,
         ),
     )
@@ -306,10 +304,10 @@ def summarize_biased_attention_chunk(
     scale,
 ):
     scores = (
-        I.contract(
+        I.matmul(
             queries,
             key_chunk,
-            reduce=((1, 1),),
+            transpose_rhs=True,
             acc_dtype=I.f32,
         )
         * scale
@@ -328,10 +326,9 @@ def summarize_biased_attention_chunk(
         valid=chunk_valid,
         maximum=maximum,
         denominator=I.reduce.sum(probability, axis=1),
-        accumulator=I.contract(
+        accumulator=I.matmul(
             I.cast(probability, I.f16),
             value_chunk,
-            reduce=((1, 0),),
             acc_dtype=I.f32,
         ),
     )
@@ -349,11 +346,11 @@ def summarize_mla_chunk(
     scale,
 ):
     scores = (
-        I.contract(queries, key_chunk, reduce=((1, 1),), acc_dtype=I.f32)
-        + I.contract(
+        I.matmul(queries, key_chunk, transpose_rhs=True, acc_dtype=I.f32)
+        + I.matmul(
             query_positions,
             key_position_chunk,
-            reduce=((1, 1),),
+            transpose_rhs=True,
             acc_dtype=I.f32,
         )
     ) * (scale * I.LOG2E)
@@ -374,10 +371,9 @@ def summarize_mla_chunk(
         valid=chunk_valid,
         maximum=maximum,
         denominator=I.reduce.sum(probability, axis=1),
-        accumulator=I.contract(
+        accumulator=I.matmul(
             I.cast(probability, I.f16),
             value_chunk,
-            reduce=((1, 0),),
             acc_dtype=I.f32,
         ),
     )

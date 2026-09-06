@@ -22,10 +22,9 @@ def ragged_grouped_gemm(
     for group in I.parallel(groups.outer):
         rows = I.members(groups[group])
         values = I.gather(x, index=(rows, reduction))
-        result = I.contract(
+        result = I.matmul(
             values,
             weight[group, reduction, columns],
-            reduce=((1, 0),),
             acc_dtype=I.f32,
         )
         I.scatter_unique(

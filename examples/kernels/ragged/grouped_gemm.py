@@ -27,10 +27,9 @@ def ragged_grouped_gemm(
     for group in I.parallel(groups.outer):
         rows = I.members(groups[group])
         values = I.gather(x, index=(rows, reduction))
-        result = I.contract(
+        result = I.matmul(
             values,
             weight[group, reduction, columns],
-            reduce=((1, 0),),
             acc_dtype=I.f32,
         )
         I.scatter_unique(
@@ -59,10 +58,9 @@ def ragged_grouped_gemm_bf16(
     for group in I.parallel(groups.outer):
         rows = I.members(groups[group])
         values = I.gather(x, index=(rows, reduction))
-        result = I.contract(
+        result = I.matmul(
             values,
             weight[group, reduction, columns],
-            reduce=((1, 0),),
             acc_dtype=I.f32,
         )
         I.scatter_unique(
@@ -91,10 +89,10 @@ def ragged_grouped_gemm_backward_weight(
     n_axis = I.domain(0, N)
     for group in I.parallel(groups.outer):
         members = groups[group]
-        result = I.contract(
+        result = I.matmul(
             left[members, k_axis],
             right[members, n_axis],
-            reduce=((0, 0),),
+            transpose_lhs=True,
             acc_dtype=I.f32,
         )
         grad_weight[group, k_axis, n_axis] = I.cast(result, I.f16)
@@ -127,10 +125,10 @@ def routed_expert_projection_bf16(
         slot = routes % TOP_K
         I.assume_in_bounds(token, x, axis=0)
         values = I.gather(x, index=(token, reduction))
-        result = I.contract(
+        result = I.matmul(
             values,
             weight[expert, columns, reduction],
-            reduce=((1, 1),),
+            transpose_rhs=True,
             acc_dtype=I.f32,
         )
         I.scatter_unique(

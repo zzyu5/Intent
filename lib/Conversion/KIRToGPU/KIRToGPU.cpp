@@ -305,10 +305,27 @@ LogicalResult alignElementwiseOperands(OpBuilder &builder, Location location,
       sameDimensions &= cast<gpu::AxisMapAttr>(leftMapping).getDimensionId() ==
                         cast<gpu::AxisMapAttr>(rightMapping).getDimensionId();
     if (sameDimensions) {
-      FailureOr<Value> aligned = retargetBroadcast(builder, location, rhs, left);
-      if (failed(aligned))
+      SmallVector<Attribute> mappings;
+      for (auto [leftAttribute, rightAttribute] :
+           llvm::zip(left.getAxisMaps(), right.getAxisMaps())) {
+        auto leftMapping = cast<gpu::AxisMapAttr>(leftAttribute);
+        auto rightMapping = cast<gpu::AxisMapAttr>(rightAttribute);
+        // A broadcast-derived identity must not replace a source coordinate.
+        mappings.push_back(leftMapping.getDerived() && !rightMapping.getDerived()
+                               ? rightAttribute
+                               : leftAttribute);
+      }
+      auto target = gpu::FragmentType::get(
+          lhs.getContext(), left.getElementType(), left.getShape(),
+          builder.getArrayAttr(mappings), left.getValidity(), left.getOwner());
+      FailureOr<Value> alignedLeft =
+          retargetBroadcast(builder, location, lhs, target);
+      FailureOr<Value> alignedRight =
+          retargetBroadcast(builder, location, rhs, target);
+      if (failed(alignedLeft) || failed(alignedRight))
         return failure();
-      rhs = *aligned;
+      lhs = *alignedLeft;
+      rhs = *alignedRight;
       return success();
     }
   }

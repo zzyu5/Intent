@@ -39,12 +39,9 @@ def moe_prefix_routes(
     for singleton in I.parallel(I.domain(0, total_padded.shape[0])):
         counts = expert_counts[experts]
         padded = ((counts + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
-        prefix = I.scan(
+        prefix = I.cumsum(
             padded,
             axis=0,
-            identity=0,
-            combine=I.add,
-            inclusive=True,
         )
         expert_offsets[singleton] = 0
         for expert in experts:

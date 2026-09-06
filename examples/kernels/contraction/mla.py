@@ -16,10 +16,10 @@ def mla_head_projection(
     reduction_axis = I.domain(0, I_DIMENSION)
     for batch in I.parallel(I.domain(0, B)):
         for head in I.parallel(I.domain(0, H)):
-            projected = I.contract(
+            projected = I.matmul(
                 source[batch, query_axis, head, reduction_axis],
                 weight[head, output_axis, reduction_axis],
-                reduce=((1, 1),),
+                transpose_rhs=True,
                 acc_dtype=I.f32,
             )
             output[batch, query_axis, head, output_axis] = I.cast(

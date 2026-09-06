@@ -1188,9 +1188,13 @@ void PhysicalProgramAnalysis::collectRanges(
   if (source && !carriesSource(value.getType(), *source))
     return;
   if (auto argument = dyn_cast<BlockArgument>(value)) {
+    // Scalar ABI/control coordinates do not introduce a fragment range.
+    if (isa<IntegerType, FloatType, IndexType>(argument.getType()))
+      return;
     SmallVector<Value, 2> outer = structuredSourcesForArgument(argument);
     if (outer.empty()) {
       result.state = PhysicalFactState::Unknown;
+      appendUnique(result.blockers, argument.getOwner()->getParentOp());
       return;
     }
     for (Value related : outer)

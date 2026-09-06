@@ -1603,20 +1603,19 @@ FailureOr<Value> projectPredicateForScalarAxis(
     PhysicalProgramAnalysis &analysis) {
   if (!value)
     return Value();
-  FailureOr<int64_t> sourceDimension = queryRangeDimension(root);
-  PhysicalReductionDependencyFact dependency = analysis.reductionDependency(
-      value, sourceAxisIdentity(root),
-      succeeded(sourceDimension)
-          ? std::optional<int64_t>(*sourceDimension)
-          : std::nullopt);
-  if (!dependency.isExact()) {
+  if (FailureOr<Value> scalar = scalarSource(value); succeeded(scalar))
+    return Value(builder.create<SplatOp>(location, target, *scalar));
+  PhysicalRangeFact ranges =
+      analysis.sourceRanges(value, sourceAxisIdentity(root));
+  if (!ranges.blockers.empty() ||
+      (!ranges.roots.empty() && ranges.state != PhysicalFactState::Exact)) {
     InFlightDiagnostic diagnostic = root.emitOpError(
         "validity predicate has no exact source-range dependency");
-    for (Operation *blocker : dependency.blockers)
+    for (Operation *blocker : ranges.blockers)
       diagnostic << "; blocker=" << blocker->getName();
     return failure();
   }
-  if (!dependency.depends) {
+  if (ranges.roots.empty()) {
     if (value.getType() == target)
       return value;
     return projectBroadcast(builder, location, value, target);
@@ -1644,16 +1643,17 @@ FailureOr<Value> projectPredicateForScalarAxis(
   }
   if (auto comparison = value.getDefiningOp<CompareOp>()) {
     Value lhs = strippedBroadcast(comparison.getLhs());
-    Value rhs = strippedBroadcast(comparison.getRhs());
+    FailureOr<Value> rhs =
+        scalarSource(strippedBroadcast(comparison.getRhs()));
     if (comparison.getPredicate() == ComparePredicate::Lt &&
-        lhs == root.getResult()) {
+        lhs == root.getResult() && succeeded(rhs)) {
       Value scalar = builder.create<CompareOp>(
-          location, builder.getI1Type(), coordinate, rhs,
+          location, builder.getI1Type(), coordinate, *rhs,
           comparison.getPredicate());
       return Value(builder.create<SplatOp>(location, target, scalar));
     }
   }
-  return projectBroadcast(builder, location, value, target);
+  return failure();
 }
 
 LogicalResult decomposeMultiReductionContract(ContractOp contract) {

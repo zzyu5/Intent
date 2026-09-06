@@ -76,10 +76,10 @@ def mamba_chunk_state_fwd(
                     * I.cast(scale[:, None], I.f16),
                     I.f16,
                 )
-                result = I.contract(
+                result = I.matmul(
                     lhs,
                     rhs,
-                    reduce=((0, 0),),
+                    transpose_lhs=True,
                     acc_dtype=I.f32,
                 )
                 states[batch, chunk, head, dimensions, state_axis] = (
@@ -147,10 +147,10 @@ def mamba_chunk_state_bf16_fwd(
                     head,
                     dimensions,
                     state_axis,
-                ] = I.contract(
+                ] = I.matmul(
                     lhs,
                     rhs,
-                    reduce=((0, 0),),
+                    transpose_lhs=True,
                     acc_dtype=I.f32,
                 )
 
@@ -300,10 +300,9 @@ def mamba3_siso_step(
                 I.join(rotated_query_first, rotated_query_second),
                 (qk_dimensions,),
             )
-            projected = I.contract(
+            projected = I.matmul(
                 I.cast(state, I.bf16),
                 I.reshape(rotated_query, (qk_dimensions, 1)),
-                reduce=((1, 0),),
                 acc_dtype=I.f32,
             )
             projected = I.reshape(projected, (value_region,))
@@ -448,7 +447,7 @@ def mamba3_siso_forward(
                     (chunk_positions, qk_dimensions),
                 ) * I.cast(transition_scale[:, None], I.bf16)
                 qk_dot = I.reshape(
-                    I.contract(
+                    I.matmul(
                         I.cast(
                             query_first * key_first
                             + query_second * key_second,
@@ -459,7 +458,6 @@ def mamba3_siso_forward(
                             1.0,
                             dtype=I.bf16,
                         ),
-                        reduce=((1, 0),),
                         acc_dtype=I.f32,
                     ),
                     (chunk_positions,),
@@ -506,27 +504,24 @@ def mamba3_siso_forward(
                     value_dimension_indices[None, :],
                 ]
                 decay_input = adt[batch, head, source_positions] * I.LOG2E
-                decay = I.scan(
+                decay = I.cumsum(
                     decay_input,
                     axis=0,
-                    identity=0.0,
-                    combine=I.add,
-                    inclusive=True,
                 )
                 decay_sum = I.reduce.sum(
                     decay_input,
                     axis=0,
                 )
-                carried = I.contract(
+                carried = I.matmul(
                     query_block,
                     I.cast(state, I.bf16),
-                    reduce=((1, 1),),
+                    transpose_rhs=True,
                     acc_dtype=I.f32,
                 ) * I.exp2(decay)[:, None]
-                scores = I.contract(
+                scores = I.matmul(
                     query_block,
                     key_block,
-                    reduce=((1, 1),),
+                    transpose_rhs=True,
                     acc_dtype=I.f32,
                 )
                 scores = I.mask(
@@ -537,10 +532,9 @@ def mamba3_siso_forward(
                     valid=strict_lower,
                     fill=0.0,
                 )
-                current = I.contract(
+                current = I.matmul(
                     I.cast(scores, I.bf16),
                     value_block,
-                    reduce=((1, 0),),
                     acc_dtype=I.f32,
                 )
                 skip = (
@@ -567,10 +561,10 @@ def mamba3_siso_forward(
                 weighted_value = I.cast(value_block, I.f32) * I.exp2(
                     reverse_decay
                 )[:, None]
-                update = I.contract(
+                update = I.matmul(
                     I.cast(weighted_value, I.bf16),
                     key_block,
-                    reduce=((0, 0),),
+                    transpose_lhs=True,
                     acc_dtype=I.f32,
                 )
                 state = state * I.exp2(decay_sum) + update

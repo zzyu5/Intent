@@ -66,14 +66,14 @@ def mamba_chunk_scan_fwd(
                 row_index = I.indices(rows)
                 column_index = I.indices(columns)
                 global_row = chunk_begin + row_index
-                state_term = I.contract(
+                state_term = I.matmul(
                     state_matrix[
                         batch, global_row, group, state_axis
                     ],
                     previous_states[
                         batch, chunk, head, column_index, state_axis
                     ],
-                    reduce=((1, 1),),
+                    transpose_rhs=True,
                     acc_dtype=I.f32,
                 )
                 state_term = state_term * I.exp2(
@@ -113,7 +113,7 @@ def mamba_chunk_scan_fwd(
                     valid=global_row[:, None] >= global_scan[None, :],
                     fill=0.0,
                 )
-                partial = I.contract(
+                partial = I.matmul(
                     I.cast(coefficient, I.f16),
                     x[
                         batch,
@@ -121,7 +121,6 @@ def mamba_chunk_scan_fwd(
                         head,
                         column_index[None, :],
                     ],
-                    reduce=((1, 0),),
                     acc_dtype=I.f32,
                 )
                 scan_term = state_term + partial
@@ -183,7 +182,7 @@ def mamba_chunk_scan_bf16_fwd(
                 row_index = I.indices(rows)
                 column_index = I.indices(columns)
                 global_row = chunk_begin + row_index
-                state_term = I.contract(
+                state_term = I.matmul(
                     state_matrix[
                         batch, global_row, group, state_axis
                     ],
@@ -193,7 +192,7 @@ def mamba_chunk_scan_bf16_fwd(
                         ],
                         I.bf16,
                     ),
-                    reduce=((1, 1),),
+                    transpose_rhs=True,
                     acc_dtype=I.f32,
                 )
                 state_term = state_term * I.exp2(
@@ -222,7 +221,7 @@ def mamba_chunk_scan_bf16_fwd(
                     valid=global_row[:, None] >= global_scan[None, :],
                     fill=0.0,
                 )
-                partial = I.contract(
+                partial = I.matmul(
                     I.cast(coefficient, I.bf16),
                     x[
                         batch,
@@ -230,7 +229,6 @@ def mamba_chunk_scan_bf16_fwd(
                         head,
                         column_index[None, :],
                     ],
-                    reduce=((1, 0),),
                     acc_dtype=I.f32,
                 )
                 scan_term = state_term + partial

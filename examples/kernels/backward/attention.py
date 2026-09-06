@@ -65,10 +65,10 @@ def attention_backward_dkdv(
                 grad_output_block = grad_output[
                     batch, query_head, query_axis, :
                 ]
-                scores = I.contract(
+                scores = I.matmul(
                     key_block,
                     query_block,
-                    reduce=((1, 1),),
+                    transpose_rhs=True,
                     acc_dtype=I.f32,
                 )
                 probability = I.exp2(
@@ -81,26 +81,24 @@ def attention_backward_dkdv(
                         valid=k_index[:, None] <= q_index[None, :],
                         fill=0.0,
                     )
-                grad_v_value = grad_v_value + I.contract(
+                grad_v_value = grad_v_value + I.matmul(
                     I.cast(probability, I.f16),
                     grad_output_block,
-                    reduce=((1, 0),),
                     acc_dtype=I.f32,
                 )
-                grad_probability = I.contract(
+                grad_probability = I.matmul(
                     value_block,
                     grad_output_block,
-                    reduce=((1, 1),),
+                    transpose_rhs=True,
                     acc_dtype=I.f32,
                 )
                 grad_scores = probability * (
                     grad_probability
                     - delta[batch, query_head, query_axis][None, :]
                 )
-                grad_k_value = grad_k_value + I.contract(
+                grad_k_value = grad_k_value + I.matmul(
                     I.cast(grad_scores, I.f16),
                     query_block,
-                    reduce=((1, 0),),
                     acc_dtype=I.f32,
                 )
             grad_k[batch, key_head, key_axis, :] = I.cast(
@@ -139,10 +137,10 @@ def attention_backward_dq(
             query_delta = delta[batch, query_head, query_axis][:, None]
             key_block = k[batch, key_head, key_axis, :]
             value_block = v[batch, key_head, key_axis, :]
-            scores = I.contract(
+            scores = I.matmul(
                 query_block,
                 key_block,
-                reduce=((1, 1),),
+                transpose_rhs=True,
                 acc_dtype=I.f32,
             )
             probability = I.exp2(
@@ -156,17 +154,16 @@ def attention_backward_dq(
                     valid=q_index[:, None] >= k_index[None, :],
                     fill=0.0,
                 )
-            grad_probability = I.contract(
+            grad_probability = I.matmul(
                 grad_output_block,
                 value_block,
-                reduce=((1, 1),),
+                transpose_rhs=True,
                 acc_dtype=I.f32,
             )
             grad_scores = probability * (grad_probability - query_delta)
-            grad_q_value = I.contract(
+            grad_q_value = I.matmul(
                 I.cast(grad_scores, I.f16),
                 key_block,
-                reduce=((1, 0),),
                 acc_dtype=I.f32,
             )
             grad_q[batch, query_head, query_axis, :] = I.cast(

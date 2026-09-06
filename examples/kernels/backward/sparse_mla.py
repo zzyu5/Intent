@@ -92,10 +92,10 @@ def sparse_mla_backward_main(
                 key_value_tail = selected_key_value[:, DV + I.indices(tail_features)]
                 query_main = query_block[:, value_features]
                 query_tail = query_block[:, DV + I.indices(tail_features)]
-                probability = I.contract(
+                probability = I.matmul(
                     query_block,
                     selected_key_value,
-                    reduce=((1, 1),),
+                    transpose_rhs=True,
                     acc_dtype=I.f32,
                 )
                 probability = I.exp2(
@@ -106,10 +106,10 @@ def sparse_mla_backward_main(
                     valid=valid_index[None, :],
                     fill=0.0,
                 )
-                grad_probability = I.contract(
+                grad_probability = I.matmul(
                     grad_output_block,
                     key_value_main,
-                    reduce=((1, 1),),
+                    transpose_rhs=True,
                     acc_dtype=I.f32,
                 )
                 grad_score = (
@@ -117,27 +117,26 @@ def sparse_mla_backward_main(
                     * (grad_probability - delta_block[:, None])
                     * scale
                 )
-                grad_query_value = I.contract(
+                grad_query_value = I.matmul(
                     I.cast(grad_score, I.bf16),
                     selected_key_value,
-                    reduce=((1, 0),),
                     acc_dtype=I.f32,
                 )
-                grad_key_value_main = I.contract(
+                grad_key_value_main = I.matmul(
                     I.cast(grad_score, I.bf16),
                     query_main,
-                    reduce=((0, 0),),
+                    transpose_lhs=True,
                     acc_dtype=I.f32,
-                ) + I.contract(
+                ) + I.matmul(
                     I.cast(probability, I.bf16),
                     grad_output_block,
-                    reduce=((0, 0),),
+                    transpose_lhs=True,
                     acc_dtype=I.f32,
                 )
-                grad_key_value_tail = I.contract(
+                grad_key_value_tail = I.matmul(
                     I.cast(grad_score, I.bf16),
                     query_tail,
-                    reduce=((0, 0),),
+                    transpose_lhs=True,
                     acc_dtype=I.f32,
                 )
                 I.atomic.add(

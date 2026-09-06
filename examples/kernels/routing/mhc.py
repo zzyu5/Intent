@@ -29,10 +29,9 @@ def summarize_mhc_gemm_rms_chunk(x_chunk, weight_chunk, coordinates, stop):
     )
     float_values = I.cast(values, I.f32)
     return I.record(
-        linear=I.contract(
+        linear=I.matmul(
             values,
             weight_chunk,
-            reduce=((1, 0),),
             acc_dtype=I.f32,
         ),
         square_sum=I.reduce.sum(
@@ -202,10 +201,10 @@ def mhc_pre_gemm_sqrsum(
         values * values,
         axis=1,
     )
-    mixes[tokens, components] = I.contract(
+    mixes[tokens, components] = I.matmul(
         residual_flat[tokens, reduction],
         I.cast(weight[components, reduction], I.bf16),
-        reduce=((1, 1),),
+        transpose_rhs=True,
         acc_dtype=I.f32,
     )
 

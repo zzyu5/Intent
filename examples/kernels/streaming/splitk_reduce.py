@@ -30,12 +30,11 @@ def splitk_attention_reduce(
                 axis=0,
             )
             numerator = I.reshape(
-                I.contract(
+                I.matmul(
                     I.reshape(weights, (1, S)),
                     I.cast(
                         partial[batch, head, splits, dimensions], I.f32
                     ),
-                    reduce=((1, 0),),
                     acc_dtype=I.f32,
                 ),
                 (D,),
@@ -68,12 +67,11 @@ def splitk_attention_reduce_f16(
                 axis=0,
             )
             numerator = I.reshape(
-                I.contract(
+                I.matmul(
                     I.reshape(weights, (1, S)),
                     I.cast(
                         partial[batch, head, splits, dimensions], I.f32
                     ),
-                    reduce=((1, 0),),
                     acc_dtype=I.f32,
                 ),
                 (D,),

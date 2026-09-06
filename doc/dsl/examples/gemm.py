@@ -20,10 +20,9 @@ def gemm(
     n = I.domain(0, N)
     k = I.domain(0, K)
 
-    accumulator = I.contract(
+    accumulator = I.matmul(
         a[m, k],
         b[k, n],
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
     if ACTIVATION == Activation.RELU:

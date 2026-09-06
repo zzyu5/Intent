@@ -19,10 +19,10 @@ def linear_logits_chunk(
     rows = I.domain(0, M)
     vocabulary = I.domain(0, V)
     reduction = I.domain(0, K)
-    value = I.contract(
+    value = I.matmul(
         hidden[rows, reduction],
         weight[vocabulary, reduction],
-        reduce=((1, 1),),
+        transpose_rhs=True,
         acc_dtype=I.f32,
     )
     logits[rows, vocabulary] = I.cast(value, I.bf16)

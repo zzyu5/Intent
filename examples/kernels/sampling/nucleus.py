@@ -17,12 +17,9 @@ def sorted_nucleus_cutoff(
     M, N = probabilities.shape
     candidates = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
-        prefix = I.scan(
+        prefix = I.cumsum(
             probabilities[row, candidates],
             axis=0,
-            identity=0.0,
-            combine=I.add,
-            inclusive=True,
         )
         cumulative[row, candidates] = prefix
         negative_positions = -I.cast(I.indices(candidates), I.f32)

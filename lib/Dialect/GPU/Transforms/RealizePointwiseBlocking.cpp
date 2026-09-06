@@ -875,6 +875,7 @@ LogicalResult addTailValidity(func::FuncOp kernel,
       continue;
     OpBuilder builder(store);
     Value payload = store.getValue();
+    Value existingValidity = store.getValid();
     auto valueType = dyn_cast<FragmentType>(payload.getType());
     if (valueType) {
       SmallVector<MakeRangeOp> blockedRanges;
@@ -926,6 +927,17 @@ LogicalResult addTailValidity(func::FuncOp kernel,
                  << (succeeded(dimension) ? *dimension : -1)
                  << ", payload=" << payload.getType()
                  << ", coordinate=" << range.getResult().getType();
+        if (existingValidity) {
+          FailureOr<Value> replayedValidity = replayPointwiseValue(
+              builder, existingValidity, sourceAxisIdentity(range),
+              traversalDimensions, blockedExtent, range.getResult(),
+              rangePredicates.lookup(range.getResult()), store.getOperation(),
+              mapping);
+          if (failed(replayedValidity))
+            return store.emitOpError(
+                "pointwise store validity cannot be replayed with its payload");
+          existingValidity = *replayedValidity;
+        }
         payload = *replayed;
         valueType = dyn_cast<FragmentType>(payload.getType());
         if (!valueType)
@@ -981,7 +993,7 @@ LogicalResult addTailValidity(func::FuncOp kernel,
     }
     FailureOr<Value> valid = accessValidity(
         builder, store.getLoc(), store.getCoordinates(), rangePredicates,
-        valueType, store.getValid());
+        valueType, existingValidity);
     if (failed(valid))
       return store.emitOpError("could not form pointwise store validity");
     auto replacement = builder.create<StoreOp>(

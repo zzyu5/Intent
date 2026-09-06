@@ -18,12 +18,9 @@ def compact_nonzero_rows(
         for column in columns:
             indices[row, column] = -1
         flags = I.cast(values[row, columns] != 0.0, I.i32)
-        inclusive = I.scan(
+        inclusive = I.cumsum(
             flags,
             axis=0,
-            identity=0,
-            combine=I.add,
-            inclusive=True,
         )
         for column in columns:
             if flags[column] != 0:
