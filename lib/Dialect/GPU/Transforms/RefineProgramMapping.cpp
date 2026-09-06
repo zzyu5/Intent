@@ -2,6 +2,7 @@
 
 #include "Intent/Dialect/GPU/IR/Program.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -15,6 +16,52 @@ PhysicalExprAttr parameterExpression(MLIRContext *context, StringRef name) {
   return PhysicalExprAttr::get(
       context, static_cast<uint32_t>(PhysicalExprKind::Parameter), 0,
       StringAttr::get(context, name), ArrayAttr::get(context, {}));
+}
+
+void preserveBoundedTileOrigins(func::FuncOp kernel, DelinearizeOp mapping) {
+  kernel.walk([&](MakeRangeOp range) {
+    if (range->hasAttr(sourceSubregionAttr) || !isUnitStepRange(range))
+      return;
+    auto start = range.getLogicalStart().getDefiningOp<arith::ConstantOp>();
+    auto startValue =
+        start ? dyn_cast<IntegerAttr>(start.getValue()) : IntegerAttr();
+    auto block = range.getExtent().getDefiningOp<ParameterOp>();
+    FailureOr<int64_t> dimension = queryRangeDimension(range);
+    if (!startValue || startValue.getInt() != 0 || !block || failed(dimension) ||
+        llvm::any_of(block.getParameter().getCandidates().asArrayRef(),
+                     [](int64_t value) { return value <= 0; }))
+      return;
+    for (auto [axis, coordinate] : llvm::enumerate(mapping.getCoordinates())) {
+      Attribute launchExtent = mapping.getLaunchExtents()[axis];
+      FailureOr<uint64_t> mappedDimension = blockedDimension(launchExtent);
+      auto extent = dyn_cast<PhysicalExprAttr>(launchExtent);
+      if (failed(mappedDimension) ||
+          *mappedDimension != static_cast<uint64_t>(*dimension) ||
+          !extent || extent.getOperands().size() != 2)
+        continue;
+      auto divisor = dyn_cast<PhysicalExprAttr>(extent.getOperands()[1]);
+      if (!divisor || divisor.getKind() !=
+                          static_cast<uint32_t>(PhysicalExprKind::Parameter) ||
+          divisor.getSymbol() != block.getParameter().getName())
+        continue;
+      for (Operation *user : coordinate.getUsers()) {
+        auto product = dyn_cast<BinaryOp>(user);
+        if (!product || product.getOperatorKind() != BinaryOperator::Multiply)
+          continue;
+        bool scaledCoordinate =
+            (product.getLhs() == coordinate &&
+             product.getRhs() == range.getExtent()) ||
+            (product.getRhs() == coordinate &&
+             product.getLhs() == range.getExtent());
+        if (scaledCoordinate &&
+            samePhysicalScalarExpression(range.getStart(), product.getResult())) {
+          range->setAttr(programBoundedOriginAttr,
+                         UnitAttr::get(kernel.getContext()));
+          break;
+        }
+      }
+    }
+  });
 }
 
 LogicalResult realizeGroupedContractionMapping(
@@ -42,6 +89,10 @@ LogicalResult realizeGroupedContractionMapping(
   }
   if (!rowAxis || !columnAxis)
     return success();
+
+  // The permutation preserves the rectangular tile domain, including its last
+  // partial tile. Keep exact origin bounds before replacing coordinate uses.
+  preserveBoundedTileOrigins(kernel, mapping);
 
   OpBuilder parameterBuilder(&kernel.getBody().front(),
                              kernel.getBody().front().begin());
