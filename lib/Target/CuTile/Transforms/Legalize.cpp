@@ -1252,6 +1252,11 @@ Attribute scalarConstant(Value value) {
 }
 
 bool isZeroFill(Value value) {
+  Value scalar = uniformScalarFill(value);
+  if (auto cast = scalar ? scalar.getDefiningOp<gpu::CastOp>() : gpu::CastOp())
+    if (cast.getValue().getType().isIntOrIndex() &&
+        cast.getResult().getType().isIntOrIndex())
+      return isZeroFill(cast.getValue());
   Attribute constant = scalarConstant(value);
   if (!constant)
     return false;
