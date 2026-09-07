@@ -7,7 +7,7 @@ layer_norm,8192x4096-bf16,0.122488,2.894040,0.042324,pass,同算法；source 额
 silu_and_mul,4096x28672-to14336-bf16,0.260672,0.228024,1.143178,pass,同算法；source 使用 FTZ 与近似除法
 attention_backward,B2-QH8-KVH2-S1024-D64-fp16-causal,0.625384,0.199104,3.140992,pass,同算法；中间精度和舍入不同
 dense_attention_forward,B2-QH32-KVH8-S4096-D128-bf16-causal,17.663232,5.391896,3.275885,pass,同算法；source 使用 FTZ 与近似除法
-grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,0.235800,0.192712,1.223588,pass,同算法；source 使用 FTZ 与近似除法
+grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,0.214744,0.192024,1.118319,pass,同算法；source 使用 FTZ 与近似除法
 swiglu,8192x14336-bf16,0.465352,0.412576,1.127918,pass,同算法；source 使用 FTZ 与近似除法
 splitk_attention_reduce,B8-H32-S8192-splits16-D128,0.011264,0.011120,1.012950,pass,
 mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,1.099760,0.799104,1.376242,pass,同算法；source 使用 FTZ 与近似除法
@@ -22,14 +22,14 @@ gelu,8192x4096-fp16-tanh,0.102240,0.107968,0.946947,pass,同算法；source 保�
 geglu,4096x28672-fp16-tanh,0.255816,0.446792,0.572562,pass,同算法；source 保留 f16 中间舍入
 relu,8192x4096-fp16,0.088552,0.088456,1.001085,pass,同算法；NaN 传播方式不同
 dropout,8192x4096-fp16-p0.1,0.098424,0.098216,1.002118,pass,
-attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,0.891280,0.983088,0.906613,pass,同算法；source 的布局转换与辅助工作计入其调用时间
+attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,0.869360,0.981592,0.885663,pass,同算法；source 的布局转换与辅助工作计入其调用时间
 attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,3.812256,4.337016,0.879004,pass,同算法；source 使用 bf16 LSE 与近似除法
 mhc_apply_residual,T2048-H4096-streams4-bf16,0.174048,0.103424,1.682859,pass,同算法；source 保留 bf16 中间累加
 gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,1.330600,0.759288,1.752431,pass,同算法；中间精度和舍入不同
 gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,0.272456,0.663224,0.410805,pass,同算法；中间精度和舍入不同
 mhc_sinkhorn,T8192-streams4-fp32,0.081016,0.081136,0.998521,pass,同算法；source 用 exp2(x * log2(e)) 实现 exp
 absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,1.555832,0.655184,2.374649,pass,同算法；source 使用近似除法并额外输出 LSE
-splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,0.625832,0.222976,2.806723,pass,同算法；source 使用 FTZ 与近似除法
+splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,0.503528,0.223728,2.250626,pass,同算法；source 使用 FTZ 与近似除法
 sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,4.998200,308.888641,0.016181,pass,同算法；source 使用 FTZ 与近似除法
 sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,4.569648,1.232136,3.708721,pass,同算法；source 的布局转换与辅助工作计入其调用时间
 rms_norm,8192x4096-bf16,0.050616,0.050896,0.994499,pass,同算法；source 额外写 Rstd
