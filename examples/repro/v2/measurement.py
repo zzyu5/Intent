@@ -29,6 +29,7 @@ class NumericalComparisonError(RuntimeError):
 
 
 MEASUREMENT_REPETITIONS = 200
+COMPARISON_CHUNK_ELEMENTS = 1 << 20
 
 
 _stage_observer: ContextVar[Callable[[str], None] | None] = ContextVar(
@@ -177,55 +178,70 @@ def compare_outputs(
                 )
             errors.append(0.0)
             continue
-        generated_compare = generated_value.float()
-        source_compare = source_value.float()
-        generated_finite = torch.isfinite(generated_compare)
-        source_finite = torch.isfinite(source_compare)
-        if not torch.equal(generated_finite, source_finite):
-            raise NumericalComparisonError(
-                f"generated/source result {leaf_index} finite-value masks differ"
+        generated_flat = generated_value.reshape(-1)
+        source_flat = source_value.reshape(-1)
+        maximum = 0.0
+        for begin in range(0, generated_flat.numel(), COMPARISON_CHUNK_ELEMENTS):
+            end = begin + COMPARISON_CHUNK_ELEMENTS
+            maximum = max(
+                maximum,
+                _compare_float_chunk(
+                    generated_flat[begin:end], source_flat[begin:end],
+                    leaf_tolerance, leaf_index,
+                ),
             )
-        finite = generated_finite & source_finite
-        nonfinite = ~finite
-        if nonfinite.any():
-            generated_nonfinite = generated_compare[nonfinite]
-            source_nonfinite = source_compare[nonfinite]
-            if not (
-                torch.equal(
-                    torch.isnan(generated_nonfinite),
-                    torch.isnan(source_nonfinite),
-                )
-                and torch.equal(
-                    torch.isposinf(generated_nonfinite),
-                    torch.isposinf(source_nonfinite),
-                )
-                and torch.equal(
-                    torch.isneginf(generated_nonfinite),
-                    torch.isneginf(source_nonfinite),
-                )
-            ):
-                raise NumericalComparisonError(
-                    f"generated/source result {leaf_index} non-finite values differ"
-                )
-        if finite.any():
-            difference = (
-                generated_compare[finite] - source_compare[finite]
-            ).abs()
-            limit = (
-                leaf_tolerance.atol
-                + leaf_tolerance.rtol * source_compare[finite].abs()
-            )
-            maximum = difference.max().item()
-            if torch.any(difference > limit):
-                raise NumericalComparisonError(
-                    f"generated/source floating result {leaf_index} differs: "
-                    f"max_abs={maximum}, atol={leaf_tolerance.atol}, "
-                    f"rtol={leaf_tolerance.rtol}"
-                )
-            errors.append(maximum)
-        else:
-            errors.append(0.0)
+        errors.append(maximum)
     return tuple(errors)
+
+
+def _compare_float_chunk(
+    generated: torch.Tensor,
+    source: torch.Tensor,
+    tolerance: Tolerance,
+    leaf_index: int,
+) -> float:
+    generated_compare = generated.float()
+    source_compare = source.float()
+    generated_finite = torch.isfinite(generated_compare)
+    source_finite = torch.isfinite(source_compare)
+    if not torch.equal(generated_finite, source_finite):
+        raise NumericalComparisonError(
+            f"generated/source result {leaf_index} finite-value masks differ"
+        )
+    finite = generated_finite & source_finite
+    nonfinite = ~finite
+    if nonfinite.any():
+        generated_nonfinite = generated_compare[nonfinite]
+        source_nonfinite = source_compare[nonfinite]
+        if not (
+            torch.equal(
+                torch.isnan(generated_nonfinite),
+                torch.isnan(source_nonfinite),
+            )
+            and torch.equal(
+                torch.isposinf(generated_nonfinite),
+                torch.isposinf(source_nonfinite),
+            )
+            and torch.equal(
+                torch.isneginf(generated_nonfinite),
+                torch.isneginf(source_nonfinite),
+            )
+        ):
+            raise NumericalComparisonError(
+                f"generated/source result {leaf_index} non-finite values differ"
+            )
+    if finite.any():
+        difference = (generated_compare[finite] - source_compare[finite]).abs()
+        limit = tolerance.atol + tolerance.rtol * source_compare[finite].abs()
+        maximum = difference.max().item()
+        if torch.any(difference > limit):
+            raise NumericalComparisonError(
+                f"generated/source floating result {leaf_index} differs: "
+                f"max_abs={maximum}, atol={tolerance.atol}, "
+                f"rtol={tolerance.rtol}"
+            )
+        return maximum
+    return 0.0
 
 
 def evaluate(

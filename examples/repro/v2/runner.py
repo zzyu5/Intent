@@ -124,7 +124,10 @@ def _run_entry(
     except PipelineStageError as error:
         status = f"{error.stage}_failed"
         print(f"{provider}:{entry.kernel}: {status}: {error}")
-        return ResultRow(entry.kernel, entry.case, None, None, None, status)
+        return ResultRow(
+            entry.kernel, entry.case, None, None, None, status,
+            "; ".join(str(error).splitlines()[:2]),
+        )
     except Exception as error:
         status = "adapter_preparation_failed"
         print(f"{provider}:{entry.kernel}: {status}: {error}")
@@ -142,7 +145,10 @@ def _run_entry(
     except PipelineStageError as error:
         status = f"{error.stage}_failed"
         print(f"{provider}:{entry.kernel}: {status}: {error}")
-        return ResultRow(entry.kernel, entry.case, None, None, None, status)
+        return ResultRow(
+            entry.kernel, entry.case, None, None, None, status,
+            "; ".join(str(error).splitlines()[:2]),
+        )
 
     if comparison.status != "pass":
         print(

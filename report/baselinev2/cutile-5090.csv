@@ -1,38 +1,38 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
-official_fmha,B4-QH32-KVH8-S4096-D128-fp16-causal,,,,timing_not_measured,同算法：causal GQA online softmax；FTZ 与近似除法差异；旧门禁跳过计时
+official_fmha,B4-QH32-KVH8-S4096-D128-fp16-causal,4.448160,36.421282,0.122131,pass,同算法；source 使用 FTZ 与近似除法
 block_scaled_gemm,M4096-N14336-K4096-fp8-block32,1.062088,1.072520,0.990273,pass,
 dense_gemm,M4096-N14336-K4096-fp16,2.082512,2.114040,0.985086,pass,
-moe_expert_projection,T4096-E8-top2-4096x14336-bf16,,,,timing_not_measured,同算法：路由 expert GEMM；CSR 与预计算 block ownership 表示不同；Triton 共用作者函数不改；旧门禁跳过计时
-layer_norm,8192x4096-bf16,,,,timing_not_measured,同算法：均值与方差归一化；rsqrt 舍入及 source 额外 Mean/Rstd 输出；旧门禁跳过计时
+moe_expert_projection,T4096-E8-top2-4096x14336-bf16,4.264960,6.198288,0.688087,pass,同算法；source 使用预计算 block ownership
+layer_norm,8192x4096-bf16,0.087776,0.265920,0.330084,pass,同算法；source 额外写 Mean/Rstd
 silu_and_mul,4096x28672-to14336-bf16,0.227072,0.245424,0.925223,pass,同算法；source 使用 FTZ 与近似除法
-attention_backward,B2-QH8-KVH2-S1024-D64-fp16-causal,,,,timing_not_measured,同算法：delta/dK-dV/dQ；Triton 共用作者算法；精度细节不同；旧门禁跳过计时
-dense_attention_forward,B2-QH32-KVH8-S4096-D128-bf16-causal,,,,timing_not_measured,同算法：causal GQA online softmax；FTZ 与近似除法差异；旧门禁跳过计时
-grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,,,,timing_not_measured,同算法：split-K attention 与 LSE 加权合并；精度及 workspace 表示差异；旧门禁跳过计时
-swiglu,8192x14336-bf16,,,,timing_not_measured,同算法：SiLU(gate) 乘 up；Triton 共用作者函数；中间舍入与近似数学差异；旧门禁跳过计时
+attention_backward,B2-QH8-KVH2-S1024-D64-fp16-causal,0.187184,0.178928,1.046141,pass,同算法；中间精度和舍入不同
+dense_attention_forward,B2-QH32-KVH8-S4096-D128-bf16-causal,2.229968,1.283736,1.737092,pass,同算法；source 使用 FTZ 与近似除法
+grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,0.425840,0.188464,2.259530,pass,同算法；source 使用 FTZ 与近似除法
+swiglu,8192x14336-bf16,0.449824,0.464616,0.968163,pass,同算法；source 使用 FTZ 与近似除法
 splitk_attention_reduce,B8-H32-S8192-splits16-D128,0.005904,0.005888,1.002717,pass,
-mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,,,,timing_not_measured,同算法：latent 与 RoPE attention；FTZ 与近似除法差异；旧门禁跳过计时
+mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,1.523848,0.946840,1.609404,pass,同算法；source 使用 FTZ 与近似除法
 batched_gemm,B32-M512-N512-K1024-bf16,0.091904,0.091936,0.999652,pass,
 tilegym_dense_gemm,M8192-N11008-K4096-bf16,3.121920,3.171448,0.984383,pass,
-grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,,,,timing_not_measured,同算法：grouped GEMM；device offsets 与 host group shapes 表示不同；计时范围需注明；旧门禁跳过计时
-moe_alignment,T4096-top2-E64,,,,timing_not_measured,同算法：计数/前缀和/散射；不是排序对计数算法；辅助输出与初始化计时需注明；旧门禁跳过计时
-mhc_gemm_rms_scale,T2048-H4096-streams4-bf16,,,,timing_not_measured,同算法：split-K GEMM 与 RMS/scale；除法与乘倒数差异；旧门禁跳过计时
+grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.699008,0.642576,1.087822,pass,同算法；source 使用 host group shapes
+moe_alignment,T4096-top2-E64,0.018432,0.036864,0.500000,pass,同算法计数/前缀和/散射；初始化与辅助输出计入调用
+mhc_gemm_rms_scale,T2048-H4096-streams4-bf16,0.071680,0.077824,0.921053,pass,同算法；source 用乘倒数实现归一化
 chunked_softmax,8192x32768-bf16,2.101456,0.849960,2.472417,pass,
-rope_qk,B2-S4096-QH32-KVH8-D128-bf16,,,,timing_not_measured,同算法：RoPE half rotation；中间精度不同；保留 Triton 同族算法；旧门禁跳过计时
-gelu,8192x4096-fp16-tanh,,,,timing_not_measured,同算法：tanh GELU；f16 中间舍入不同；旧门禁跳过计时
-geglu,4096x28672-fp16-tanh,,,,timing_not_measured,同算法：tanh GELU 乘 up；f16 中间舍入不同；旧门禁跳过计时
+rope_qk,B2-S4096-QH32-KVH8-D128-bf16,0.116704,0.120800,0.966093,pass,同算法；source 保留 bf16 中间舍入
+gelu,8192x4096-fp16-tanh,0.087856,0.087872,0.999818,pass,同算法；source 保留 f16 中间舍入
+geglu,4096x28672-fp16-tanh,0.227008,0.225912,1.004851,pass,同算法；source 保留 f16 中间舍入
 relu,8192x4096-fp16,0.087696,0.087824,0.998543,pass,同算法；NaN 传播方式不同
 dropout,8192x4096-fp16-p0.1,0.087840,0.087856,0.999818,pass,
-attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,,,,timing_not_measured,同算法：causal GQA 与 attention sink；精度及 source 布局拷贝差异；计时范围需注明；旧门禁跳过计时
-attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,,,,timing_not_measured,同算法：split-K GQA 与 attention sink；bf16 LSE 及 source K/V 布局拷贝差异；计时范围需注明；旧门禁跳过计时
-mhc_apply_residual,T2048-H4096-streams4-bf16,,,,timing_not_measured,同算法：residual mixing；bf16 中间累加舍入差异；旧门禁跳过计时
-gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,,,,timing_not_measured,同算法：windowed GQA 与 softcap；近似数学和舍入差异；旧门禁跳过计时
-gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,,,,timing_not_measured,同算法：split-K windowed GQA 与 softcap；近似数学和舍入差异；旧门禁跳过计时
-mhc_sinkhorn,T8192-streams4-fp32,,,,timing_not_measured,同算法：指数初始化后反复行列归一化；exp2(x·log2(e)) 与 exp(x) 数学等价；旧门禁跳过计时
+attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,1.216552,0.789056,1.541782,pass,同算法；source 的布局转换与辅助工作计入其调用时间
+attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,0.752104,2.081640,0.361304,pass,同算法；source 使用 bf16 LSE 与近似除法
+mhc_apply_residual,T2048-H4096-streams4-bf16,0.099336,0.108320,0.917061,pass,同算法；source 保留 bf16 中间累加
+gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,1.554520,0.591664,2.627370,pass,同算法；中间精度和舍入不同
+gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,1.774616,0.696216,2.548945,pass,同算法；中间精度和舍入不同
+mhc_sinkhorn,T8192-streams4-fp32,0.019168,0.018512,1.035436,pass,同算法；source 用 exp2(x * log2(e)) 实现 exp
 absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,1.254616,2.061088,0.608715,pass,同算法；source 使用近似除法并额外输出 LSE
-splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,,,,physical_program_verification_failed,同算法：split-K MLA 与分片合并；workspace 表示不同；本轮未运行到此项；保留此前记录
-sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,,,,physical_program_verification_failed,同算法：选择 token 的 latent 与 RoPE attention；本轮未运行到此项；保留此前记录
-sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,,,,worker_timeout,同算法：causal window GQA；source 含 KV 扩展与布局转换；本轮未运行到此项；保留此前记录
+splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,0.442304,0.328184,1.347732,pass,同算法；source 使用 FTZ 与近似除法
+sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,0.998648,33.752392,0.029587,pass,同算法；source 使用 FTZ 与近似除法
+sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,1.195072,0.833264,1.434206,pass,同算法；source 的布局转换与辅助工作计入其调用时间
 rms_norm,8192x4096-bf16,0.087688,0.085776,1.022291,pass,同算法：mean-square 与 rsqrt/weight；source 额外 Rstd 输出；本轮未运行到此项；保留此前记录
 recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,0.787256,0.936160,0.840942,pass,已完成的单项运行结果
-chunk_gated_delta,B2-S2048-H8-K128-V128-C64-bf16,,,,physical_program_verification_failed,同算法：guarded Neumann/serial chunk correction 与状态递推；TF32 精度差异；本轮未运行到此项；保留此前记录
+chunk_gated_delta,B2-S2048-H8-K128-V128-C64-bf16,,,,generated_physical_program_verification_failed,
 nvfp4_quantize,8192x4096-block16-bf16,1.124128,0.057072,19.696663,pass,同算法、group16；双方计时均为一次 kernel launch，不含输出分配
