@@ -1,5 +1,7 @@
 # cuTile Provider 闭合
 
+本文件属于已停止、被替代的 change，仅作为历史提案保留，未作为已验收 capability 安装。归档结论见 [brief](../../brief.md)；后续工作不继承本文件的旧性能门槛或验收要求。
+
 ## 目标状态
 
 Intent 的 shared GPU Program 是 cuTile lowering 的唯一完整 executable authority。cuTile provider 从 current typed program确定 block identity、tile/index form、access spelling、native structured operation、physical/provider parameters与 launch artifact；provider rewrite 后的 current program在 serialization 前已闭合，terminal serializer不回读 KIR、kernel identity 或逻辑 shape重建执行决策。持续修复当前 registry 可达的 lowering 与运行缺口，同算法的 generated/source 开展性能比较，已完成的双机结果增量发布；ratio 不超过 1.05 是改进目标，不是要求全表同时达标或全量重跑才继续推进的门槛。

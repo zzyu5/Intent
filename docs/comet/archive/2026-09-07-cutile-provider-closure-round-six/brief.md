@@ -1,6 +1,8 @@
 # Outcome
 
-本 change 已按用户要求停止推进，剩余问题由 [cutile-execution-closure](../cutile-execution-closure/brief.md) 承接。以下正文保留历史范围，不再作为新 change 的执行要求；本 change 未经最终验收，不宣称已完成。
+本 change 于 2026-09-07 按用户明确要求停止归档，移出 active change 目录，不再恢复执行。原执行收尾由已完成的 [cutile-execution-closure](../2026-09-07-cutile-execution-closure/brief.md) 承接；后续横向优化和性能攻坚属于新的 change。
+
+这是被替代任务的历史归档，不是验收通过归档。原生 Archive 入口因本轮未到 archive-ready、确认后的验收文字已变更且没有 verification.md 而拒绝归档；用户要求直接归档后，仅移动正式文件并保留历史。`comet-state.yaml` 原样保存停止前的 Runtime 快照，其中 Build、active、pending 与 archived=false 不代表本轮仍可执行，也不构成验收结果。旧 Spec 不安装到当前 capability，以下正文仅为历史范围。
 
 在不改变 DSL 与 canonical KIR 语义的前提下，推进 shared GPU Program 到 cuTile provider/runtime 的唯一 executable path，修复实际可达的 lowering 与运行缺口。Generated/source 算法相同即可开展性能比较，细微数值实现差异和额外包装工作如实注明，不统一阻断计时；已完成的 RTX 5090D 与 H100 结果及时写入项目 CSV。`generated_p50_ms / source_p50_ms <= 1.05` 保留为性能改进目标，不以双机全量重跑或所有条目同时达标作为继续推进、更新表格的前提。每项改动的 shared 或 provider-local 归属由真实输入程序、语义缺口和 reference 决定，不预设必须只改 leaf，也不重新制造 shared/core 或 Serializer 权威。
 
