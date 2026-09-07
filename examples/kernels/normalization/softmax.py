@@ -1,9 +1,6 @@
 import intent
 import intent.language as I
 
-from kernels.streaming.online_softmax import online_softmax_summary
-
-
 ROWS = 8192
 COLUMNS = 8192
 ROW_MAJOR_NOALIAS = I.constraints(
@@ -51,11 +48,7 @@ def chunked_softmax_bf16(
     columns = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
         values = I.cast(x[row, columns], I.f32)
-        summary = online_softmax_summary(values)
-        safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
-        normalized = I.select(
-            summary.valid,
-            I.exp(values - summary.maximum) / safe_denominator,
-            0.0,
-        )
-        y[row, columns] = I.cast(normalized, I.bf16)
+        maximum = I.reduce.max(values, axis=0)
+        numerator = I.exp(values - maximum)
+        denominator = I.reduce.sum(numerator, axis=0)
+        y[row, columns] = I.cast(numerator / denominator, I.bf16)

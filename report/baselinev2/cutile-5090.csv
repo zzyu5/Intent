@@ -16,7 +16,7 @@ tilegym_dense_gemm,M8192-N11008-K4096-bf16,3.121920,3.171448,0.984383,pass,
 grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,,,,timing_not_measured,同算法：grouped GEMM；device offsets 与 host group shapes 表示不同；计时范围需注明；旧门禁跳过计时
 moe_alignment,T4096-top2-E64,,,,timing_not_measured,同算法：计数/前缀和/散射；不是排序对计数算法；辅助输出与初始化计时需注明；旧门禁跳过计时
 mhc_gemm_rms_scale,T2048-H4096-streams4-bf16,,,,timing_not_measured,同算法：split-K GEMM 与 RMS/scale；除法与乘倒数差异；旧门禁跳过计时
-chunked_softmax,8192x32768-bf16,,,,algorithm_mismatch,算法组织不同：Intent online summary；source 三遍扫描；未发现 Triton 使用此专用函数；可局部对齐 baseline；尚未计时
+chunked_softmax,8192x32768-bf16,2.101456,0.849960,2.472417,pass,
 rope_qk,B2-S4096-QH32-KVH8-D128-bf16,,,,timing_not_measured,同算法：RoPE half rotation；中间精度不同；保留 Triton 同族算法；旧门禁跳过计时
 gelu,8192x4096-fp16-tanh,,,,timing_not_measured,同算法：tanh GELU；f16 中间舍入不同；旧门禁跳过计时
 geglu,4096x28672-fp16-tanh,,,,timing_not_measured,同算法：tanh GELU 乘 up；f16 中间舍入不同；旧门禁跳过计时
@@ -28,11 +28,11 @@ mhc_apply_residual,T2048-H4096-streams4-bf16,,,,timing_not_measured,同算法：
 gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,,,,timing_not_measured,同算法：windowed GQA 与 softcap；近似数学和舍入差异；旧门禁跳过计时
 gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,,,,timing_not_measured,同算法：split-K windowed GQA 与 softcap；近似数学和舍入差异；旧门禁跳过计时
 mhc_sinkhorn,T8192-streams4-fp32,,,,timing_not_measured,同算法：指数初始化后反复行列归一化；exp2(x·log2(e)) 与 exp(x) 数学等价；旧门禁跳过计时
-absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,,,,numerical_failed,同算法；generated/source 有限值掩码不一致；generated 部分 head 为 NaN；真实实现缺口尚未修复
+absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,1.254616,2.061088,0.608715,pass,同算法；source 使用近似除法并额外输出 LSE
 splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,,,,physical_program_verification_failed,同算法：split-K MLA 与分片合并；workspace 表示不同；本轮未运行到此项；保留此前记录
 sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,,,,physical_program_verification_failed,同算法：选择 token 的 latent 与 RoPE attention；本轮未运行到此项；保留此前记录
 sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,,,,worker_timeout,同算法：causal window GQA；source 含 KV 扩展与布局转换；本轮未运行到此项；保留此前记录
 rms_norm,8192x4096-bf16,0.087688,0.085776,1.022291,pass,同算法：mean-square 与 rsqrt/weight；source 额外 Rstd 输出；本轮未运行到此项；保留此前记录
 recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,0.787256,0.936160,0.840942,pass,已完成的单项运行结果
 chunk_gated_delta,B2-S2048-H8-K128-V128-C64-bf16,,,,physical_program_verification_failed,同算法：guarded Neumann/serial chunk correction 与状态递推；TF32 精度差异；本轮未运行到此项；保留此前记录
-nvfp4_quantize,8192x4096-block32-bf16,,,,intent_implementation_gap,Intent 算法尚未实现；本轮未运行到此项；保留此前记录
+nvfp4_quantize,8192x4096-block16-bf16,1.124128,0.057072,19.696663,pass,同算法、group16；双方计时均为一次 kernel launch，不含输出分配

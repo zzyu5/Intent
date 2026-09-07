@@ -59,8 +59,6 @@ def chunked_softmax(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=2e-2, rtol=1e-2),
         cuda_graph=True,
-        # Source is a max/denominator/output three-pass algorithm, not online merge.
-        note="source 使用三遍 softmax",
     )
 
 

@@ -18,6 +18,7 @@ build_root=${INTENT_BUILD_ROOT:-/tmp/intentdsl-build}
 cmake_generator=${INTENT_CMAKE_GENERATOR:-Ninja}
 mlir_dir=${INTENT_MLIR_DIR:-/usr/lib/llvm-20/lib/cmake/mlir}
 llvm_dir=${INTENT_LLVM_DIR:-/usr/lib/llvm-20/lib/cmake/llvm}
+tuning_config=${INTENT_TUNING_CONFIG:-}
 
 case "${provider}" in
   triton)
@@ -25,6 +26,7 @@ case "${provider}" in
     ;;
   cutile)
     default_python=/home/kingdom/.venvs/intentdsl-cutile/bin/python
+    tuning_config=${INTENT_TUNING_CONFIG:-${project_root}/examples/repro/v2/providers/cutile/tuning.json}
     ;;
   tilelang)
     default_python=/home/kingdom/.venvs/intentdsl-tilelang/bin/python
@@ -51,8 +53,11 @@ arguments=(
   --worker-timeout "${INTENT_WORKER_TIMEOUT:-300}"
   --cutile-compiler-timeout "${INTENT_CUTILE_COMPILER_TIMEOUT:-15}"
 )
-if [[ -n "${INTENT_TUNING_CONFIG:-}" ]]; then
-  arguments+=(--tuning-config "${INTENT_TUNING_CONFIG}")
+if [[ -n "${tuning_config}" ]]; then
+  if [[ "${tuning_config}" != /* ]]; then
+    tuning_config="${PWD}/${tuning_config}"
+  fi
+  arguments+=(--tuning-config "${tuning_config}")
 fi
 for kernel in "$@"; do
   arguments+=(--kernel "${kernel}")
