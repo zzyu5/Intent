@@ -103,6 +103,8 @@ Autotune winner cache另外以runtime tuning key索引候选timings。Compiled a
 
 ## 8. Baseline 对照边界
 
-比较generated与手写provider source时，双方必须暴露语义角色相同的candidate集合并各自由同一provider tuner选择winner。固定同一个winner没有意义；不同候选预算也不能归因于compiler program quality。
+比较generated与手写provider source的算子性能时，以算法、输入shape、外部dtype与明确的调用和计时范围为基础。双方可各自调优，不要求先对齐完整candidate集合或穷举全部候选才允许测量。舍入位置、近似数学和中间精度的细微差异应注明，不一概阻断同算法的性能比较；这不放松compiler对Intent语义的保持要求。
+
+若进一步把性能差距归因于compiler program quality，则需要控制双方相关parameter roles、候选预算和计时范围，或明确说明这些因素的影响。相同调优winner不是比较目标，候选调优耗时也不是算子执行时间；ABI表示、辅助输出或布局转换的差异应明确计入或排除相应测量范围，不隐藏额外工作。
 
 Tuning只选择参数和已声明local forms，不能掩盖缺失的program mapping、access graph或structured realization。若generated依赖更大的search space才弥补结构缺口，该问题仍属于compiler IR/passes。

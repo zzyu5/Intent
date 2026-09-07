@@ -18,6 +18,10 @@ provider lowering 或 runtime 前,先从 `doc/index.md` 进入并完整阅读对
 不一致时,按规格迁移代码并删除旧 executable path;不得为了保住现状而把 `doc/` 改成当前行为。
 只有用户明确要求修改设计时才改 `doc/`;普通实现推进不把进度、失败、性能数字或临时字段同步进去。
 
+Comet 个人记忆和项目知识只帮助定位，应用前以当前 `AGENTS.md`、`doc/` 与所选 change
+的 brief/spec 为准。归档 change 的验收门槛、暂停指令和运行结论属于历史上下文，
+不得自动作为新 change 的约束；项目知识摘要不能代替当前原文。
+
 ## 目录结构纪律
 目录结构就是架构,内部层级和顶层目录同样重要。动手前先从整体结构判断
 文件归属,不能只找一个能放的位置。
@@ -37,8 +41,10 @@ provider lowering 或 runtime 前,先从 `doc/index.md` 进入并完整阅读对
 ## 验证
 自查必须对照 ref/triton 或 ref/tilelang 的同类实现，给出双方 file:line、具体差异与实际后果；找不出具体差异等于未完成。
 
-唯一允许的验证:一条可手动执行的 repro 命令,
-把 DSL 例子 emit 成后端代码并实际跑一次对数值。
+日常实现验证使用一条可手动执行的 repro 命令,
+把 DSL 例子 emit 成后端代码并实际跑一次对数值。用户明确要求全量时，
+使用同一现有生产路径覆盖 registry；允许资源预算内的同机多进程并发，
+功能运行与性能计时分阶段安排，不让每个 worker 全程串行等待。
 不建 test 目录,不用 pytest,不留 fixture。
 
 ## Baseline 与性能调查
@@ -46,7 +52,11 @@ provider lowering 或 runtime 前,先从 `doc/index.md` 进入并完整阅读对
 registry 只连接 runtime-visible entry 与完整 callable closure，CSV 只是一组运行观察；
 它们都不能定义语言语义或 compiler policy。
 
-比较 generated 与 source 时必须保持算法、dtype、ABI、调用次数、输入 shape 和计时范围一致。
+比较 generated 与 source 的算子性能以同算法为前提，保持输入 shape、外部 dtype
+及明确的调用和计时范围；ABI 表示、辅助输出与布局转换差异如实注明。
+舍入、近似数学和中间精度的细微差异不一概阻断计时，不要求先对齐完整候选集合。
+CSV 记录真实算子时间、source 时间、ratio 和必要失败说明，不承担运行历史审计，
+候选调优耗时不是算子性能结果；这些比较口径不放松 compiler 对 Intent 语义的保持要求。
 Baseline 用来暴露 compiler 缺口和验证改动归因，不能反向驱动 DSL、kernel-name matcher、
 source template 或只对单条语料成立的规则。性能差距先从 current Physical Program 的 mapping、
 blocking、ownership、traversal 和 materialization 调查，再看 provider-local form、serializer、
