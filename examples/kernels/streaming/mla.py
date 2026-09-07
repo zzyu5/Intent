@@ -594,22 +594,28 @@ def splitk_mla_decode_partials(
     B, H, C = q_latent.shape
     K = latent_cache.shape[1]
     heads = I.domain(0, H)
-    key_axis = I.domain(0, K)
+    split_slots = I.domain(0, SPLIT_SIZE)
     for batch in I.parallel(I.domain(0, B)):
         for split in I.parallel(I.domain(0, SPLITS)):
-            begin = I.minimum(split * SPLIT_SIZE, K)
-            end = I.minimum(begin + SPLIT_SIZE, K)
-            keys = key_axis[begin:end]
-            latent_values = latent_cache[batch, keys, :]
+            key_coordinates = split * SPLIT_SIZE + I.indices(split_slots)
+            active = (key_coordinates >= 0) & (key_coordinates < K)
+            latent_values = I.gather(
+                latent_cache, index=(batch, key_coordinates, slice(None)),
+                valid=active[:, None], fill=0.0,
+            )
             summary = I.region_fold(
                 source=(
                     latent_values,
-                    rope_cache[batch, keys, :],
+                    I.gather(
+                        rope_cache, index=(batch, key_coordinates, slice(None)),
+                        valid=active[:, None], fill=0.0,
+                    ),
                     latent_values,
-                    I.indices(keys),
+                    key_coordinates,
+                    active,
                 ),
                 axis=0,
-                summarize=summarize_mla_chunk,
+                summarize=summarize_masked_mla_chunk,
                 combine=merge_attention_summaries,
                 identity=empty_attention_summary(H, C),
                 operands=(
@@ -617,7 +623,6 @@ def splitk_mla_decode_partials(
                     q_rope[batch, heads, :],
                     I.full((H,), fill=0, dtype=I.index),
                     scale,
-                    False,
                 ),
             )
             safe_denominator = I.select(summary.valid, summary.denominator, 1.0)

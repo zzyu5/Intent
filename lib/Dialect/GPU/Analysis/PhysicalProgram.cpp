@@ -950,6 +950,12 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
     bool nonNegative = false;
     PhysicalExprAttr upper;
   };
+  auto constantUpper = [](Bounds bounds) -> std::optional<int64_t> {
+    if (bounds.nonNegative && bounds.upper &&
+        bounds.upper.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant))
+      return bounds.upper.getValue();
+    return std::nullopt;
+  };
   std::function<Bounds(Value, unsigned)> bound =
       [&](Value current, unsigned depth) -> Bounds {
     if (!current || depth >= 32 || !current.getType().isIndex())
@@ -987,9 +993,28 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
     };
     if (auto dim = current.getDefiningOp<DimOp>())
       return {true, resourceExtentExpression(dim.getView(), dim.getAxis())};
-    if (auto argument = dyn_cast<BlockArgument>(current))
+    if (auto argument = dyn_cast<BlockArgument>(current)) {
       if (PhysicalExprAttr dimension = dimensionExpression(argument))
         return {true, dimension};
+      auto loop = dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
+      if (loop && argument == loop.getInductionVar()) {
+        Bounds lower = bound(loop.getLowerBound(), depth + 1);
+        std::optional<int64_t> upper =
+            constantUpper(bound(loop.getUpperBound(), depth + 1));
+        std::optional<int64_t> step = integerConstant(loop.getStep());
+        if (auto parameter = loop.getStep().getDefiningOp<ParameterOp>()) {
+          auto candidates = parameter.getParameter().getCandidates().asArrayRef();
+          if (!candidates.empty() && llvm::all_of(candidates, [](int64_t value) {
+                return value > 0;
+              }))
+            step = *llvm::max_element(candidates);
+        }
+        if (lower.nonNegative && upper && step && *step > 0 &&
+            *upper <= std::numeric_limits<int64_t>::max() - *step + 1)
+          return {true, expression(PhysicalExprKind::Constant,
+                                   std::max<int64_t>(*upper - 1, 0))};
+      }
+    }
     if (auto parameter = current.getDefiningOp<ParameterOp>()) {
       auto schema = parameter.getParameter();
       if (llvm::all_of(schema.getCandidates().asArrayRef(),
@@ -1035,6 +1060,19 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
       return {};
     Bounds lhs = bound(binary.getLhs(), depth + 1);
     Bounds rhs = bound(binary.getRhs(), depth + 1);
+    std::optional<int64_t> lhsConstant = constantUpper(lhs);
+    std::optional<int64_t> rhsConstant = constantUpper(rhs);
+    if (lhsConstant && rhsConstant) {
+      constexpr int64_t maximum = std::numeric_limits<int64_t>::max();
+      if (binary.getOperatorKind() == BinaryOperator::Add &&
+          *lhsConstant <= maximum - *rhsConstant)
+        return {true, expression(PhysicalExprKind::Constant,
+                                 *lhsConstant + *rhsConstant)};
+      if (binary.getOperatorKind() == BinaryOperator::Multiply &&
+          (*rhsConstant == 0 || *lhsConstant <= maximum / *rhsConstant))
+        return {true, expression(PhysicalExprKind::Constant,
+                                 *lhsConstant * *rhsConstant)};
+    }
     if (binary.getOperatorKind() == BinaryOperator::Minimum) {
       PhysicalExprAttr upper = lhs.upper && rhs.upper
           ? expression(PhysicalExprKind::Minimum, 0, {lhs.upper, rhs.upper})
@@ -1066,7 +1104,7 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
     }
     if (binary.getOperatorKind() == BinaryOperator::Multiply) {
       // Aligning a non-negative index down cannot overflow or exceed that index.
-      // Ordinary add/multiply do wrap and therefore are not monotonic bounds.
+      // Other products require the explicit no-overflow proof above.
       for (auto [quotient, factor] :
            {std::pair{binary.getLhs(), binary.getRhs()},
             std::pair{binary.getRhs(), binary.getLhs()}}) {

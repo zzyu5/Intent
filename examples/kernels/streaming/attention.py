@@ -200,6 +200,7 @@ def summarize_attention_chunk_bf16(
     query_coordinates,
     scale,
     causal,
+    active,
 ):
     scores = I.matmul(
         queries,
@@ -207,9 +208,9 @@ def summarize_attention_chunk_bf16(
         transpose_rhs=True,
         acc_dtype=I.f32,
     ) * (scale * I.LOG2E)
-    valid = I.full(scores.shape, fill=True, dtype=I.bool)
+    valid = I.full(scores.shape, fill=True, dtype=I.bool) & active
     if causal:
-        valid = query_coordinates[:, None] >= key_coordinates[None, :]
+        valid = valid & (query_coordinates[:, None] >= key_coordinates[None, :])
     masked_scores = I.select(valid, scores, -I.inf)
     chunk_valid = I.reduce.any(valid, axis=1)
     raw_maximum = reduce_score_maximum(masked_scores, axis=1)
@@ -228,6 +229,17 @@ def summarize_attention_chunk_bf16(
             value_chunk,
             acc_dtype=I.f32,
         ),
+    )
+
+
+@intent.fn
+def summarize_masked_attention_chunk_bf16(
+    key_chunk, value_chunk, key_coordinates, active,
+    queries, query_coordinates, scale,
+):
+    return summarize_attention_chunk_bf16(
+        key_chunk, value_chunk, key_coordinates,
+        queries, query_coordinates, scale, False, active,
     )
 
 
@@ -524,6 +536,7 @@ def flash_attention_bf16_fwd(
                     q_coordinates,
                     scale,
                     CAUSAL,
+                    True,
                 ),
             )
             output[batch, query_head, q_axis, :] = I.cast(
@@ -548,7 +561,7 @@ def grouped_flash_decode_partials(
     HK = k.shape[1]
     K = k.shape[2]
     DV = v.shape[3]
-    key_axis = I.domain(0, K)
+    split_slots = I.domain(0, SPLIT_SIZE)
     parts = I.domain(0, P)
     local_query_heads = I.domain(0, HEAD_GROUP)
     for batch in I.parallel(I.domain(0, B)):
@@ -556,24 +569,29 @@ def grouped_flash_decode_partials(
             query_heads = key_head * HEAD_GROUP + I.indices(local_query_heads)
             query = I.gather(q, index=(batch, query_heads, 0, slice(None)))
             for part in I.parallel(parts):
-                begin = I.minimum(part * SPLIT_SIZE, K)
-                end = I.minimum(begin + SPLIT_SIZE, K)
-                part_keys = key_axis[begin:end]
+                key_coordinates = part * SPLIT_SIZE + I.indices(split_slots)
+                active = (key_coordinates >= 0) & (key_coordinates < K)
                 summary = I.region_fold(
                     source=(
-                        k[batch, key_head, part_keys, :],
-                        v[batch, key_head, part_keys, :],
-                        I.indices(part_keys),
+                        I.gather(
+                            k, index=(batch, key_head, key_coordinates, slice(None)),
+                            valid=active[:, None], fill=0.0,
+                        ),
+                        I.gather(
+                            v, index=(batch, key_head, key_coordinates, slice(None)),
+                            valid=active[:, None], fill=0.0,
+                        ),
+                        key_coordinates,
+                        active,
                     ),
                     axis=0,
-                    summarize=summarize_attention_chunk_bf16,
+                    summarize=summarize_masked_attention_chunk_bf16,
                     combine=merge_attention_summaries,
                     identity=empty_attention_summary(local_query_heads, DV),
                     operands=(
                         query,
                         I.full((HEAD_GROUP,), fill=0, dtype=I.index),
                         scale,
-                        False,
                     ),
                 )
                 safe_denominator = I.select(

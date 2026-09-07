@@ -277,6 +277,7 @@ def attention_sink_prefill(
                     I.indices(query_axis),
                     scale,
                     True,
+                    True,
                 ),
             )
             summary = add_sink_to_summary(
