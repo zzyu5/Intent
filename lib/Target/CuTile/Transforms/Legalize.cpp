@@ -248,11 +248,18 @@ coordinateTargetAxes(gpu::FragmentType source, gpu::FragmentType target) {
   if (source.getOwner() != target.getOwner() ||
       source.getShape().size() > target.getShape().size())
     return failure();
-  SmallVector<unsigned> result;
+  SmallVector<unsigned> result(source.getShape().size());
+  SmallVector<unsigned> unitAxes;
   SmallVector<bool> usedTargetAxes(target.getShape().size(), false);
-  result.reserve(source.getShape().size());
   for (auto [sourceIndex, sourceAttribute] :
        llvm::enumerate(source.getAxisMaps())) {
+    auto extent = cast<gpu::PhysicalExprAttr>(source.getShape()[sourceIndex]);
+    if (extent.getKind() ==
+            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+        extent.getValue() == 1) {
+      unitAxes.push_back(sourceIndex);
+      continue;
+    }
     auto sourceMap = cast<gpu::AxisMapAttr>(sourceAttribute);
     std::optional<unsigned> targetIndex;
     for (auto [index, targetAttribute] :
@@ -272,15 +279,21 @@ coordinateTargetAxes(gpu::FragmentType source, gpu::FragmentType target) {
       return failure();
     Attribute sourceExtent = source.getShape()[sourceIndex];
     Attribute targetExtent = target.getShape()[*targetIndex];
-    auto constant = dyn_cast<gpu::PhysicalExprAttr>(sourceExtent);
-    bool unit = constant &&
-                constant.getKind() == static_cast<uint32_t>(
-                                          gpu::PhysicalExprKind::Constant) &&
-                constant.getValue() == 1;
-    if (!unit && sourceExtent != targetExtent)
+    if (sourceExtent != targetExtent)
       return failure();
     usedTargetAxes[*targetIndex] = true;
-    result.push_back(*targetIndex);
+    result[sourceIndex] = *targetIndex;
+  }
+  // Singleton axes carry no coordinate variation.  Match the varying axes
+  // first, then embed singleton axes into the remaining broadcast dimensions.
+  // A newaxis introduced by author indexing need not share the access axis's
+  // provenance identity.
+  unsigned nextTargetAxis = 0;
+  for (unsigned sourceAxis : unitAxes) {
+    while (usedTargetAxes[nextTargetAxis])
+      ++nextTargetAxis;
+    result[sourceAxis] = nextTargetAxis;
+    usedTargetAxes[nextTargetAxis] = true;
   }
   return result;
 }
@@ -1736,39 +1749,78 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
 
   for (gpu::GatherOp gather : gathers) {
     auto source = dyn_cast<gpu::FragmentType>(gather.getSource().getType());
-    if (!source || isa<gpu::FragmentType>(gather.getResult().getType()) ||
-        llvm::any_of(gather.getCoordinates(), [](Value coordinate) {
-          return isa<gpu::FragmentType>(coordinate.getType());
-        }))
-      return gather.emitOpError(
-          "cuTile tile extraction requires scalar coordinates and result");
+    auto result = dyn_cast<gpu::FragmentType>(gather.getResult().getType());
+    if (!source)
+      return gather.emitOpError("cuTile tile extraction requires a source fragment");
     if (gather.getCoordinates().size() != gather.getSourceAxes().size())
       return gather.emitOpError("cuTile tile extraction source axes are incomplete");
     SmallVector<Value> coordinates(source.getShape().size());
+    OpBuilder builder(gather);
     for (auto [coordinate, sourceAxis] :
          llvm::zip(gather.getCoordinates(), gather.getSourceAxes())) {
       if (sourceAxis < 0 ||
           sourceAxis >= static_cast<int64_t>(coordinates.size()) ||
           coordinates[sourceAxis])
         return gather.emitOpError(
-            "cuTile tile extraction source axes are not a permutation");
+            "cuTile tile extraction source axes are not a unique subset");
+      if (result) {
+        auto integer = dyn_cast_or_null<IntegerAttr>(scalarConstant(coordinate));
+        auto extent = constantPhysicalExpression(
+            cast<gpu::PhysicalExprAttr>(source.getShape()[sourceAxis]), kernel);
+        if (!integer || !extent || integer.getInt() < 0 || integer.getInt() >= *extent)
+          return gather.emitOpError(
+              "cuTile rectangular tile extraction requires in-bounds constant selected coordinates");
+        coordinate = builder.create<arith::ConstantIntOp>(
+            gather.getLoc(), integer.getInt(), 32);
+      } else {
+        if (isa<gpu::FragmentType>(coordinate.getType()))
+          return gather.emitOpError("cuTile scalar extraction requires scalar coordinates");
+        if (gather.getValid()) {
+          Value zero = builder.create<arith::ConstantOp>(
+              gather.getLoc(), coordinate.getType(),
+              builder.getIntegerAttr(coordinate.getType(), 0));
+          coordinate = builder.create<gpu::SelectOp>(
+              gather.getLoc(), coordinate.getType(), gather.getValid(), coordinate, zero);
+        }
+      }
       coordinates[sourceAxis] = coordinate;
     }
-    if (llvm::any_of(coordinates, [](Value coordinate) { return !coordinate; }))
-      return gather.emitOpError("cuTile tile extraction source axes are incomplete");
-    OpBuilder builder(gather);
+    auto unit = gpu::PhysicalExprAttr::get(
+        kernel.getContext(), static_cast<uint32_t>(gpu::PhysicalExprKind::Constant),
+        1, builder.getStringAttr(""), builder.getArrayAttr({}));
+    SmallVector<Attribute> extractionShape(source.getShape().size(), unit);
+    SmallVector<int64_t> retainedAxes;
+    for (unsigned axis = 0; axis < coordinates.size(); ++axis) {
+      if (coordinates[axis])
+        continue;
+      if (!result)
+        return gather.emitOpError("cuTile scalar extraction must select every source axis");
+      retainedAxes.push_back(axis);
+      extractionShape[axis] = source.getShape()[axis];
+      coordinates[axis] = builder.create<arith::ConstantIntOp>(gather.getLoc(), 0, 32);
+    }
     // In-bounds coordinates fit i32 under cuTile's tile-size limit.
     // This does not narrow external view dimensions or address arithmetic.
     for (Value &coordinate : coordinates)
       if (!coordinate.getType().isInteger(32))
         coordinate = builder.create<gpu::CastOp>(
             gather.getLoc(), builder.getI32Type(), coordinate);
-    auto replacement = builder.create<ExtractScalarOp>(
+    auto replacement = builder.create<ExtractOp>(
         gather.getLoc(), gather.getResult().getType(), gather.getSource(),
-        coordinates, gather.getValid(), gather.getFill());
+        coordinates, builder.getArrayAttr(extractionShape),
+        builder.getDenseI64ArrayAttr(retainedAxes));
     if (Attribute origin = gather->getAttr(gpu::originAttr))
       replacement->setAttr(gpu::originAttr, origin);
-    gather.getResult().replaceAllUsesWith(replacement.getResult());
+    Value value = replacement.getResult();
+    if (gather.getValid()) {
+      auto selected = builder.create<gpu::SelectOp>(
+          gather.getLoc(), gather.getResult().getType(), gather.getValid(),
+          value, gather.getFill());
+      if (Attribute origin = gather->getAttr(gpu::originAttr))
+        selected->setAttr(gpu::originAttr, origin);
+      value = selected.getResult();
+    }
+    gather.getResult().replaceAllUsesWith(value);
     gather.erase();
   }
 
@@ -2597,7 +2649,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
       }
     }
     if (isa<ArrayViewOp, TileLoadOp, TileStoreOp, ScalarLoadOp, ScalarStoreOp, GatherLoadOp,
-            ScatterStoreOp, AtomicRMWOp, ExtractScalarOp, MMAOp, ScaledMMAOp,
+            ScatterStoreOp, AtomicRMWOp, ExtractOp, MMAOp, ScaledMMAOp,
             ReduceOp, ScanOp, gpu::ReduceOp, gpu::ScanOp, gpu::ParameterOp,
             gpu::PhysicalExprOp, gpu::ProgramIdOp, gpu::WorksetCoordinateOp,
             gpu::DelinearizeOp,

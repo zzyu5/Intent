@@ -7,7 +7,7 @@ layer_norm,8192x4096-bf16,0.122488,2.894040,0.042324,pass,同算法；source 额
 silu_and_mul,4096x28672-to14336-bf16,0.260672,0.228024,1.143178,pass,同算法；source 使用 FTZ 与近似除法
 attention_backward,B2-QH8-KVH2-S1024-D64-fp16-causal,0.625384,0.199104,3.140992,pass,同算法；中间精度和舍入不同
 dense_attention_forward,B2-QH32-KVH8-S4096-D128-bf16-causal,17.663232,5.391896,3.275885,pass,同算法；source 使用 FTZ 与近似除法
-grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,3.946936,0.192288,20.526170,pass,同算法；source 使用 FTZ 与近似除法
+grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,1.583432,0.191960,8.248760,pass,同算法；source 使用 FTZ 与近似除法
 swiglu,8192x14336-bf16,0.465352,0.412576,1.127918,pass,同算法；source 使用 FTZ 与近似除法
 splitk_attention_reduce,B8-H32-S8192-splits16-D128,0.011264,0.011120,1.012950,pass,
 mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,11.134376,0.804592,13.838536,pass,同算法；source 使用 FTZ 与近似除法
@@ -26,10 +26,10 @@ attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,9.417656,0.994728,9.467569,p
 attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,6.420880,9.956544,0.644890,pass,同算法；source 使用 bf16 LSE 与近似除法
 mhc_apply_residual,T2048-H4096-streams4-bf16,0.174048,0.103424,1.682859,pass,同算法；source 保留 bf16 中间累加
 gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,5.794536,0.758928,7.635159,pass,同算法；中间精度和舍入不同
-gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,17.861472,0.665744,26.829340,pass,同算法；中间精度和舍入不同
+gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,7.792912,0.664136,11.733910,pass,同算法；中间精度和舍入不同
 mhc_sinkhorn,T8192-streams4-fp32,0.081016,0.081136,0.998521,pass,同算法；source 用 exp2(x * log2(e)) 实现 exp
-absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,1.872464,0.655816,2.855167,pass,同算法；source 使用近似除法并额外输出 LSE
-splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,3.290104,0.224536,14.652901,pass,同算法；source 使用 FTZ 与近似除法
+absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,1.555832,0.655184,2.374649,pass,同算法；source 使用近似除法并额外输出 LSE
+splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,0.626248,0.224880,2.784810,pass,同算法；source 使用 FTZ 与近似除法
 sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,4.998200,308.888641,0.016181,pass,同算法；source 使用 FTZ 与近似除法
 sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,4.569648,1.232136,3.708721,pass,同算法；source 的布局转换与辅助工作计入其调用时间
 rms_norm,8192x4096-bf16,0.050616,0.050896,0.994499,pass,同算法；source 额外写 Rstd

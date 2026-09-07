@@ -555,32 +555,29 @@ def absorbed_mla_decode(
     B, H, C = q_latent.shape
     K = latent_cache.shape[1]
     key_axis = I.domain(0, K)
+    heads = I.domain(0, H)
     for batch in I.parallel(I.domain(0, B)):
-        for head in I.parallel(I.domain(0, H)):
-            latent_values = latent_cache[batch, key_axis, :]
-            summary = I.region_fold(
-                source=(
-                    latent_values,
-                    rope_cache[batch, key_axis, :],
-                    latent_values,
-                    I.indices(key_axis),
-                ),
-                axis=0,
-                summarize=summarize_mla_chunk,
-                combine=merge_attention_summaries,
-                identity=empty_attention_summary(1, C),
-                operands=(
-                    I.reshape(q_latent[batch, head, :], (1, C)),
-                    I.reshape(q_rope[batch, head, :], (1, q_rope.shape[2])),
-                    I.full((1,), fill=0, dtype=I.index),
-                    scale,
-                    False,
-                ),
-            )
-            output[batch, head, :] = I.reshape(
-                I.cast(normalize_attention_summary(summary), I.f16),
-                (C,),
-            )
+        latent_values = latent_cache[batch, key_axis, :]
+        summary = I.region_fold(
+            source=(
+                latent_values,
+                rope_cache[batch, key_axis, :],
+                latent_values,
+                I.indices(key_axis),
+            ),
+            axis=0,
+            summarize=summarize_mla_chunk,
+            combine=merge_attention_summaries,
+            identity=empty_attention_summary(H, C),
+            operands=(
+                q_latent[batch, heads, :],
+                q_rope[batch, heads, :],
+                I.full((H,), fill=0, dtype=I.index),
+                scale,
+                False,
+            ),
+        )
+        output[batch, heads, :] = I.cast(normalize_attention_summary(summary), I.f16)
 
 
 @intent.kernel
@@ -597,46 +594,41 @@ def splitk_mla_decode_partials(
 ):
     B, H, C = q_latent.shape
     K = latent_cache.shape[1]
+    heads = I.domain(0, H)
     split_keys = I.ragged(
         outer=I.domain(0, SPLITS),
         members=I.domain(0, K),
         offsets=split_offsets,
     )
     for batch in I.parallel(I.domain(0, B)):
-        for head in I.parallel(I.domain(0, H)):
-            for split in I.parallel(split_keys.outer):
-                keys = split_keys[split]
-                latent_values = latent_cache[batch, keys, :]
-                summary = I.region_fold(
-                    source=(
-                        latent_values,
-                        rope_cache[batch, keys, :],
-                        latent_values,
-                        I.indices(keys),
-                    ),
-                    axis=0,
-                    summarize=summarize_mla_chunk,
-                    combine=merge_attention_summaries,
-                    identity=empty_attention_summary(1, C),
-                    operands=(
-                        I.reshape(q_latent[batch, head, :], (1, C)),
-                        I.reshape(q_rope[batch, head, :], (1, q_rope.shape[2])),
-                        I.full((1,), fill=0, dtype=I.index),
-                        scale,
-                        False,
-                    ),
-                )
-                safe_denominator = I.select(
-                    summary.valid,
-                    summary.denominator,
-                    1.0,
-                )
-                partial_lse[batch, head, split] = I.select(
-                    summary.valid[0],
-                    summary.maximum[0] + I.log(safe_denominator[0]) * I.LOG2E,
-                    -I.inf,
-                )
-                partial_output[batch, head, split, :] = I.reshape(
-                    I.cast(normalize_attention_summary(summary), I.f16),
-                    (C,),
-                )
+        for split in I.parallel(split_keys.outer):
+            keys = split_keys[split]
+            latent_values = latent_cache[batch, keys, :]
+            summary = I.region_fold(
+                source=(
+                    latent_values,
+                    rope_cache[batch, keys, :],
+                    latent_values,
+                    I.indices(keys),
+                ),
+                axis=0,
+                summarize=summarize_mla_chunk,
+                combine=merge_attention_summaries,
+                identity=empty_attention_summary(H, C),
+                operands=(
+                    q_latent[batch, heads, :],
+                    q_rope[batch, heads, :],
+                    I.full((H,), fill=0, dtype=I.index),
+                    scale,
+                    False,
+                ),
+            )
+            safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
+            partial_lse[batch, heads, split] = I.select(
+                summary.valid,
+                summary.maximum + I.log(safe_denominator) * I.LOG2E,
+                -I.inf,
+            )
+            partial_output[batch, heads, split, :] = I.cast(
+                normalize_attention_summary(summary), I.f16
+            )

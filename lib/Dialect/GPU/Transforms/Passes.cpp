@@ -7,6 +7,16 @@ namespace {
 
 // Each group owns its relation repairs. Analyses are recreated by its rewrites;
 // the executable-program verifier runs only after the complete group.
+LogicalResult closeReductionValueRelations(func::FuncOp kernel) {
+  if (failed(alignReductionResultRelations(kernel)) ||
+      failed(alignReductionIdentityRelations(kernel)) ||
+      failed(alignPointwiseValueRelations(kernel)) ||
+      failed(alignReductionYieldRelations(kernel)) ||
+      failed(alignAggregateValueRelations(kernel)))
+    return failure();
+  return success();
+}
+
 LogicalResult normalizeStructuredSources(ModuleOp module, func::FuncOp kernel) {
   if (failed(realizeVectorContractions(module)) ||
       failed(decomposeMultiAxisReductions(module)) ||
@@ -19,10 +29,9 @@ LogicalResult formPointwiseOwnership(ModuleOp module, func::FuncOp kernel) {
   if (failed(realizePointwiseOwnership(module)) ||
       failed(refreshReshapeRelations(kernel)) ||
       failed(alignPointwiseValueRelations(kernel)) ||
-      failed(alignContractValueRelations(kernel)) ||
-      failed(alignAggregateValueRelations(kernel)))
+      failed(alignContractValueRelations(kernel)))
     return failure();
-  return success();
+  return closeReductionValueRelations(kernel);
 }
 
 LogicalResult formPointwiseBlocking(ModuleOp module, func::FuncOp kernel) {
@@ -37,7 +46,7 @@ LogicalResult formPointwiseBlocking(ModuleOp module, func::FuncOp kernel) {
       failed(refreshReshapeRelations(kernel)) ||
       failed(alignContractValueRelations(kernel)))
     return failure();
-  return success();
+  return closeReductionValueRelations(kernel);
 }
 
 LogicalResult coRealizeOnlineReductions(ModuleOp module, func::FuncOp kernel) {

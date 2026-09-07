@@ -346,19 +346,49 @@ void AtomicRMWOp::getEffects(
   effects.emplace_back(MemoryEffects::Write::get());
 }
 
-LogicalResult ExtractScalarOp::verify() {
+LogicalResult ExtractOp::verify() {
   auto source = getSource().getType();
-  if (getCoordinates().size() != source.getShape().size() ||
-      getResult().getType() != source.getElementType())
+  unsigned rank = source.getShape().size();
+  if (getCoordinates().size() != rank || getExtractionShape().size() != rank ||
+      elementType(getResult().getType()) != source.getElementType())
     return emitOpError(
-        "requires one scalar element coordinate per source tile axis");
-  for (Value coordinate : getCoordinates())
+        "requires source-ranked tile coordinates/shape and matching element type");
+  llvm::SmallBitVector retained(rank);
+  int64_t previous = -1;
+  for (int64_t axis : getRetainedAxes()) {
+    if (axis <= previous || axis >= static_cast<int64_t>(rank))
+      return emitOpError("retained axes must be an ordered subset of source axes");
+    retained.set(axis);
+    previous = axis;
+  }
+  for (unsigned axis = 0; axis < rank; ++axis) {
+    Value coordinate = getCoordinates()[axis];
     if (!coordinate.getType().isInteger(32))
       return emitOpError("requires i32 scalar tile coordinates");
-  if (static_cast<bool>(getValid()) != static_cast<bool>(getFill()) ||
-      (getValid() && (!getValid().getType().isInteger(1) ||
-                      getFill().getType() != getResult().getType())))
-    return emitOpError("validity/fill do not match the extracted scalar");
+    auto extent = dyn_cast<gpu::PhysicalExprAttr>(getExtractionShape()[axis]);
+    if (!extent)
+      return emitOpError("extraction shape must contain physical expressions");
+    if (retained.test(axis)) {
+      if (extent != source.getShape()[axis] || !matchPattern(coordinate, m_Zero()))
+        return emitOpError("retained axes require full source extents and zero tile indices");
+    } else if (extent.getKind() !=
+                   static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+               extent.getValue() != 1) {
+      return emitOpError("selected axes require unit extraction extents");
+    }
+  }
+  auto result = dyn_cast<gpu::FragmentType>(getResult().getType());
+  if (!result)
+    return getRetainedAxes().empty()
+               ? success()
+               : emitOpError("scalar extraction cannot retain source axes");
+  if (result.getShape().size() != getRetainedAxes().size() ||
+      result.getOwner() != source.getOwner())
+    return emitOpError("extracted fragment must preserve retained rank and owner");
+  for (auto [resultAxis, sourceAxis] : llvm::enumerate(getRetainedAxes()))
+    if (result.getShape()[resultAxis] != source.getShape()[sourceAxis] ||
+        !sameLogicalAxis(source, sourceAxis, result, resultAxis))
+      return emitOpError("extracted fragment must preserve retained axis relations");
   return success();
 }
 

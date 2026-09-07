@@ -16,6 +16,30 @@ def encode_e2m1(value):
     return code | (sign << I.cast(3, I.u8))
 
 
+@intent.fn
+def quantize_nvfp4_groups(values, encoding_scale):
+    absolute = I.maximum(values, -values)
+    maximum = I.reduce.max(absolute, axis=1)
+    scale = I.cast(
+        I.maximum((maximum / 6.0) * encoding_scale, 1.5258789e-05),
+        I.f8e4m3fn,
+    )
+    multiplier = encoding_scale / I.cast(scale, I.f32)
+    return encode_e2m1(values * multiplier[:, None]), I.bitcast(scale, I.u8)
+
+
+@intent.fn
+def quantize_nvfp4_group(x, packed, scales, encoding_scale, row, group):
+    members = I.indices(I.domain(0, 16))
+    pairs = I.indices(I.domain(0, 8))
+    values = I.reshape(I.cast(x[row, group * 16 + members], I.f32), (1, 16))
+    encoded, scale = quantize_nvfp4_groups(values, encoding_scale)
+    scales[row // 128, group // 4, row % 32, (row % 128) // 32, group % 4] = scale[0]
+    paired = I.reshape(encoded, (8, 2))
+    packed[row, group * 8 + pairs] = paired[:, 0] | (paired[:, 1] << I.cast(4, I.u8))
+    return
+
+
 @intent.kernel
 def nvfp4_quantize(
     x: I.In[I.bf16, ("M", "N")],
@@ -24,21 +48,33 @@ def nvfp4_quantize(
     scales: I.InOut[I.u8, ("MT", "NT", 32, 4, 4)],
 ):
     M, N = x.shape
-    pairs = I.indices(I.domain(0, 8))
+    groups = N // 16
     encoding_scale = global_scale[0]
-    for row in I.parallel(I.domain(0, M)):
-        for group in I.parallel(I.domain(0, N // 16)):
-            columns = group * 16 + pairs * 2
-            even = I.cast(x[row, columns], I.f32)
-            odd = I.cast(x[row, columns + 1], I.f32)
-            absolute = I.maximum(I.maximum(even, -even), I.maximum(odd, -odd))
-            maximum = I.reduce.max(absolute, axis=0)
-            scale = I.cast(
-                I.maximum((maximum / 6.0) * encoding_scale, 1.5258789e-05),
-                I.f8e4m3fn,
-            )
-            scales[row // 128, group // 4, row % 32, (row % 128) // 32, group % 4] = I.bitcast(scale, I.u8)
-            multiplier = encoding_scale / I.cast(scale, I.f32)
-            low = encode_e2m1(even * multiplier)
-            high = encode_e2m1(odd * multiplier)
-            packed[row, group * 8 + pairs] = low | (high << I.cast(4, I.u8))
+
+    # The scale ABI stores 128 rows and four group16 scales in one swizzled block.
+    local_rows = I.indices(I.domain(0, 128))
+    local_columns = I.indices(I.domain(0, 64))
+    packed_columns = I.indices(I.domain(0, 32))
+    for row_block in I.parallel(I.domain(0, (M + 127) // 128)):
+        for group_block in I.parallel(I.domain(0, (groups + 3) // 4)):
+            row_start = row_block * 128
+            group_start = group_block * 4
+            if (row_start + 128 <= M) and (group_start + 4 <= groups):
+                rows = row_start + local_rows
+                columns = group_start * 16 + local_columns
+                values = I.reshape(
+                    I.cast(x[rows[:, None], columns[None, :]], I.f32), (512, 16)
+                )
+                encoded, scale = quantize_nvfp4_groups(values, encoding_scale)
+                scales[row_block, group_block, :, :, :] = I.transpose(
+                    I.reshape(scale, (4, 32, 4)), (1, 0, 2)
+                )
+                paired = I.reshape(encoded, (128, 32, 2))
+                packed[rows[:, None], (group_start * 8 + packed_columns)[None, :]] = (
+                    paired[:, :, 0] | (paired[:, :, 1] << I.cast(4, I.u8))
+                )
+            else:
+                # Only valid groups are written; InOut padding is unchanged.
+                for row in I.domain(row_start, I.minimum(row_start + 128, M)):
+                    for group in I.domain(group_start, I.minimum(group_start + 4, groups)):
+                        quantize_nvfp4_group(x, packed, scales, encoding_scale, row, group)

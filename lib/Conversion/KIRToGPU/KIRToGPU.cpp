@@ -5350,8 +5350,11 @@ LogicalResult constructGPUProgram(ModuleOp module,
           ScalarRegionLowering lowering(nested, std::move(childValues),
                                         sourceArguments, dimensionValues,
                                         parameterValues, canonicalAnalysis);
-          if (failed(lowering.lowerWorksetBlock(sourceBlock)))
+          if (failed(lowering.lowerWorksetBlock(sourceBlock))) {
             dispatchLoweringFailed = true;
+            return;
+          }
+          nested.create<scf::YieldOp>(location);
         });
     dispatch->setAttr(gpu::executionGroupAttr,
                       builder.getI64IntegerAttr(groupIndex));

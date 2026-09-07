@@ -103,14 +103,12 @@ def IntentCuTile_AtomicRMWOp : IntentCuTile_Op<"atomic_rmw", [
   let hasVerifier = 1;
 }
 
-def IntentCuTile_ExtractScalarOp : IntentCuTile_Op<"extract_scalar", [
-    Pure, AttrSizedOperandSegments
-  ]> {
+def IntentCuTile_ExtractOp : IntentCuTile_Op<"extract", [Pure]> {
   let arguments = (ins IntentGPU_FragmentValue:$source,
                        Variadic<IntentGPU_ScalarValue>:$coordinates,
-                       Optional<IntentGPU_ScalarValue>:$valid,
-                       Optional<IntentGPU_ScalarValue>:$fill);
-  let results = (outs IntentGPU_ScalarValue:$result);
+                       ArrayAttr:$extraction_shape,
+                       DenseI64ArrayAttr:$retained_axes);
+  let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
 }
 

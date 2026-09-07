@@ -516,21 +516,6 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
                schema.getCandidates().size() == 1 &&
                parameter->hasAttr(pointwiseLocalAttr);
       });
-  bool hasJointPointwiseReduction =
-      hasTwoAxisPointwiseOwnership &&
-      llvm::any_of(parameters, [&](ParameterOp parameter) {
-        ParameterAttr schema = parameter.getParameter();
-        return schema.getCategory() ==
-                   static_cast<uint32_t>(ParameterCategory::Pointwise) &&
-               schema.getRole() ==
-                   static_cast<uint32_t>(ParameterRole::OwnershipM) &&
-               tuningClass(kernel, parameter) ==
-                   TuningClass::PointwiseReduction;
-      });
-  bool hasOnlineMomentOwnership = llvm::any_of(
-      parameters, [&](ParameterOp parameter) {
-        return tuningClass(kernel, parameter) == TuningClass::OnlineMoment;
-      });
   bool pointwiseOnlyProgram = true;
   kernel.walk([&](Operation *operation) {
     pointwiseOnlyProgram &=
@@ -572,21 +557,7 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
   }
   if (profileCount == 0)
     profileCount = 1;
-  // A free axis that survives a blocked reduction and a second pointwise
-  // ownership axis form one live two-dimensional state.  Ordinary reductions
-  // use one balanced binding.  An online moment keeps its output-free axis in
-  // the loop carry, so retain the small correlated family that changes the
-  // actual number of program instances owning that state.
-  unsigned profileBegin = hasJointPointwiseReduction &&
-                                  !hasOnlineMomentOwnership
-                              ? 1
-                              : 0;
-  unsigned profileEnd = hasJointPointwiseReduction
-                            ? (hasOnlineMomentOwnership
-                                   ? std::min<unsigned>(3, profileCount)
-                                   : 2)
-                            : profileCount;
-  for (unsigned profileIndex = profileBegin; profileIndex < profileEnd;
+  for (unsigned profileIndex = 0; profileIndex < profileCount;
        ++profileIndex) {
     SmallVector<NamedAttribute> bindings;
     for (ParameterOp parameter : parameters) {

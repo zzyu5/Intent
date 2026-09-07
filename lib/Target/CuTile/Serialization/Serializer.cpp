@@ -1066,30 +1066,18 @@ private:
                  atomicOrder(atomic.getOrdering()).str() +
                  ", memory_scope=ct.MemoryScope." +
                  atomicScope(atomic.getSharing()).str() + ")");
-    } else if (auto extract = dyn_cast<ExtractScalarOp>(operation)) {
+    } else if (auto extract = dyn_cast<ExtractOp>(operation)) {
       std::string shape = "(";
-      for (unsigned axis = 0;
-           axis < extract.getSource().getType().getShape().size(); ++axis)
-        shape += "1, ";
+      for (Attribute extent : extract.getExtractionShape())
+        shape += expressionString(mlir::cast<gpu::PhysicalExprAttr>(extent), false) + ", ";
       shape += ")";
-      std::string indices = "(";
-      for (auto [index, coordinate] : llvm::enumerate(extract.getCoordinates())) {
-        if (index)
-          indices += ", ";
-        indices += extract.getValid()
-                       ? "ct.where(" + valueString(extract.getValid()) + ", " +
-                             valueString(coordinate) + ", 0)"
-                       : valueString(coordinate);
-      }
-      if (extract.getCoordinates().size() == 1)
-        indices += ",";
-      indices += ")";
       std::string result = "ct.extract(" + valueString(extract.getSource()) +
-                           ", index=" + indices + ", shape=" + shape +
-                           ").item()";
-      if (extract.getValid())
-        result = "ct.where(" + valueString(extract.getValid()) + ", " + result +
-                 ", " + valueString(extract.getFill()) + ")";
+                           ", index=" + tuple(extract.getCoordinates()) +
+                           ", shape=" + shape + ")";
+      if (auto fragment = dyn_cast<gpu::FragmentType>(extract.getResult().getType()))
+        result += ".reshape(" + fragmentShape(fragment) + ")";
+      else
+        result += ".item()";
       assign(extract.getResult(), result);
     } else if (auto store = dyn_cast<TileStoreOp>(operation)) {
       line("ct.store(" + valueString(store.getResource()) + ", index=" +

@@ -34,5 +34,5 @@ sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,0.998648,33.752392,0.
 sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,1.195072,0.833264,1.434206,pass,同算法；source 的布局转换与辅助工作计入其调用时间
 rms_norm,8192x4096-bf16,0.087688,0.085776,1.022291,pass,同算法；source 额外写 Rstd
 recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,0.787256,0.936160,0.840942,pass,
-chunk_gated_delta,B2-S2048-H8-K128-V128-C64-bf16,10.012704,1.553088,6.446965,pass,同算法；中间精度和舍入不同
-nvfp4_quantize,8192x4096-block16-bf16,1.124128,0.057072,19.696663,pass,同算法、group16；双方计时均为一次 kernel launch，不含输出分配
+chunk_gated_delta,B2-S2048-H8-K128-V128-C64-bf16,0.666624,1.556976,0.428153,pass,同算法；generated 使用 BF16 矩阵输入、FP32 累加与状态，source 使用 TF32 矩阵输入
+nvfp4_quantize,8192x4096-block16-bf16,0.059152,0.057072,1.036445,pass,同算法、group16；双方计时均为一次 kernel launch，不含输出分配

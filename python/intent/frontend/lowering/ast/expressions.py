@@ -383,7 +383,7 @@ def _lower_call(lowerer: object, node: ast.Call) -> Expression:
                     lowerer.materialize(expression, argument),
                 )
             else:
-                lowered_arguments[argument] = lowerer.read_value(expression, argument)
+                lowered_arguments[argument] = lowerer.materialize(expression, argument)
         results = lowerer.compiler.lower_helper_inline(
             lowerer,
             callee,
