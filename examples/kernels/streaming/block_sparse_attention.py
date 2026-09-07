@@ -96,6 +96,7 @@ def block_sparse_gqa_decode_partials(
                     summary.denominator,
                     1.0,
                 )
+                inverse_denominator = 1.0 / safe_denominator
                 I.scatter_unique(
                     partial_lse,
                     index=(batch, query_head_indices, split),
@@ -115,7 +116,7 @@ def block_sparse_gqa_decode_partials(
                     ),
                     value=I.select(
                         summary.valid[:, None],
-                        summary.accumulator / safe_denominator[:, None],
+                        summary.accumulator * inverse_denominator[:, None],
                         0.0,
                     ),
                 )
@@ -160,5 +161,5 @@ def block_sparse_gqa_decode_combine(
                 (D,),
             )
             output[batch, query_head, dimensions] = I.cast(
-                numerator / safe_denominator, I.f16
+                numerator * (1.0 / safe_denominator), I.f16
             )

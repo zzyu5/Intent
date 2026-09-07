@@ -684,6 +684,10 @@ std::optional<bool> booleanConstant(
     return finish(booleanConstant(broadcast.getValue(), falsePredicate, visiting));
   if (auto splat = dyn_cast<SplatOp>(definition))
     return finish(booleanConstant(splat.getValue(), falsePredicate, visiting));
+  if (auto reshape = dyn_cast<ReshapeOp>(definition))
+    return finish(booleanConstant(reshape.getValue(), falsePredicate, visiting));
+  if (auto transpose = dyn_cast<TransposeOp>(definition))
+    return finish(booleanConstant(transpose.getValue(), falsePredicate, visiting));
   if (auto cast = dyn_cast<CastOp>(definition))
     return finish(booleanConstant(cast.getValue(), falsePredicate, visiting));
   if (auto extract = dyn_cast<ExtractOp>(definition)) {
@@ -784,6 +788,10 @@ bool isZeroConstant(Value value, Value falsePredicate,
     return finish(isZeroConstant(broadcast.getValue(), falsePredicate, visiting));
   if (auto splat = dyn_cast<SplatOp>(definition))
     return finish(isZeroConstant(splat.getValue(), falsePredicate, visiting));
+  if (auto reshape = dyn_cast<ReshapeOp>(definition))
+    return finish(isZeroConstant(reshape.getValue(), falsePredicate, visiting));
+  if (auto transpose = dyn_cast<TransposeOp>(definition))
+    return finish(isZeroConstant(transpose.getValue(), falsePredicate, visiting));
   if (auto cast = dyn_cast<CastOp>(definition))
     return finish(isZeroConstant(cast.getValue(), falsePredicate, visiting));
   if (auto extract = dyn_cast<ExtractOp>(definition)) {
@@ -1878,7 +1886,19 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
                             upperBoundCount == 1 && !hasLowerBound};
 }
 
+void foldKnownRecordProjections(Operation *structured) {
+  for (Region &region : structured->getRegions())
+    region.walk([&](ExtractOp extract) {
+      if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>()) {
+        extract.getResult().replaceAllUsesWith(
+            record.getFields()[extract.getField()]);
+        extract.erase();
+      }
+    });
+}
+
 LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
+  foldKnownRecordProjections(fold);
   ParameterOp segment = findParameter(kernel, fold.getSegment());
   if (!segment)
     return fold.emitOpError("region-fold segment parameter is not declared");
@@ -2320,6 +2340,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
 }
 
 LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
+  foldKnownRecordProjections(scan);
   ParameterOp segment = findParameter(kernel, scan.getSegment());
   if (!segment)
     return scan.emitOpError("region-scan segment parameter is not declared");

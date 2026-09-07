@@ -21,6 +21,14 @@ Value scalarValue(Value value) {
       value = broadcast.getValue();
       continue;
     }
+    if (auto reshape = value.getDefiningOp<ReshapeOp>()) {
+      value = reshape.getValue();
+      continue;
+    }
+    if (auto transpose = value.getDefiningOp<TransposeOp>()) {
+      value = transpose.getValue();
+      continue;
+    }
     return value;
   }
   return {};

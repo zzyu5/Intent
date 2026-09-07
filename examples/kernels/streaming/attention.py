@@ -382,9 +382,10 @@ def summarize_mla_chunk(
 @intent.fn
 def normalize_attention_summary(summary):
     safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
+    inverse_denominator = 1.0 / safe_denominator
     return I.select(
         summary.valid[:, None],
-        summary.accumulator / safe_denominator[:, None],
+        summary.accumulator * inverse_denominator[:, None],
         0.0,
     )
 
@@ -689,11 +690,12 @@ def varlen_gqa_decode_with_sink_logits(
                 sink_denominator,
                 1.0,
             )
+            inverse_denominator = 1.0 / safe_denominator
             output[sequence, query_head, :] = I.reshape(
                 I.cast(
                     I.select(
                         summary.valid[:, None],
-                        summary.accumulator / safe_denominator[:, None],
+                        summary.accumulator * inverse_denominator[:, None],
                         0.0,
                     ),
                     I.f16,
@@ -705,7 +707,7 @@ def varlen_gqa_decode_with_sink_logits(
                 probability = I.exp2(block_maximum - summary.maximum[0])
                 block_logits[sequence, query_head, block] = I.select(
                     block < block_count,
-                    probability / safe_denominator[0],
+                    probability * inverse_denominator[0],
                     0.0,
                 )
 

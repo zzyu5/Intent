@@ -29,18 +29,12 @@ def splitk_attention_reduce(
                 weights,
                 axis=0,
             )
-            numerator = I.reshape(
-                I.matmul(
-                    I.reshape(weights, (1, S)),
-                    I.cast(
-                        partial[batch, head, splits, dimensions], I.f32
-                    ),
-                    acc_dtype=I.f32,
-                ),
-                (D,),
-            )
+            weighted = I.cast(
+                partial[batch, head, splits, dimensions], I.f32
+            ) * I.reshape(weights, (S, 1))
+            numerator = I.reduce.sum(weighted, axis=0)
             output[batch, head, dimensions] = I.cast(
-                numerator / denominator,
+                numerator * (1.0 / denominator),
                 I.bf16,
             )
 
@@ -66,18 +60,12 @@ def splitk_attention_reduce_f16(
                 weights,
                 axis=0,
             )
-            numerator = I.reshape(
-                I.matmul(
-                    I.reshape(weights, (1, S)),
-                    I.cast(
-                        partial[batch, head, splits, dimensions], I.f32
-                    ),
-                    acc_dtype=I.f32,
-                ),
-                (D,),
-            )
+            weighted = I.cast(
+                partial[batch, head, splits, dimensions], I.f32
+            ) * I.reshape(weights, (S, 1))
+            numerator = I.reduce.sum(weighted, axis=0)
             output[batch, head, dimensions] = I.cast(
-                numerator / denominator,
+                numerator * (1.0 / denominator),
                 I.f16,
             )
 
@@ -111,7 +99,7 @@ def splitk_attention_weighted_sum_reduce(
                 axis=0,
             )
             output[batch, head, dimensions] = I.cast(
-                numerator / denominator,
+                numerator * (1.0 / denominator),
                 I.bf16,
             )
 
@@ -145,7 +133,7 @@ def splitk_attention_bf16_to_f16_reduce(
                 axis=0,
             )
             output[batch, head, dimensions] = I.cast(
-                numerator / denominator,
+                numerator * (1.0 / denominator),
                 I.f16,
             )
 
@@ -179,6 +167,6 @@ def splitk_attention_f32_to_f16_reduce(
                 axis=0,
             )
             output[batch, head, dimensions] = I.cast(
-                numerator / denominator,
+                numerator * (1.0 / denominator),
                 I.f16,
             )

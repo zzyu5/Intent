@@ -144,6 +144,7 @@ def paged_gqa_decode_partials(
                 summary.denominator,
                 1.0,
             )
+            inverse_denominator = 1.0 / safe_denominator
             I.scatter_unique(
                 partial_lse,
                 index=(batch, query_heads, split),
@@ -158,7 +159,7 @@ def paged_gqa_decode_partials(
                 index=(batch, query_heads, split, slice(None)),
                 value=I.select(
                     summary.valid[:, None],
-                    summary.accumulator / safe_denominator[:, None],
+                    summary.accumulator * inverse_denominator[:, None],
                     0.0,
                 ),
             )

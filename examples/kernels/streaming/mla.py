@@ -355,10 +355,11 @@ def token_sparse_mla_prefill(
         scale,
     )
     safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
+    inverse_denominator = 1.0 / safe_denominator
     output[queries, :, :] = I.cast(
         I.select(
             summary.valid[:, :, None],
-            summary.accumulator / safe_denominator[:, :, None],
+            summary.accumulator * inverse_denominator[:, :, None],
             0.0,
         ),
         I.bf16,
@@ -400,10 +401,11 @@ def token_sparse_mla_value_prefill(
         scale,
     )
     safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
+    inverse_denominator = 1.0 / safe_denominator
     output[queries, :, :] = I.cast(
         I.select(
             summary.valid[:, :, None],
-            summary.accumulator / safe_denominator[:, :, None],
+            summary.accumulator * inverse_denominator[:, :, None],
             0.0,
         ),
         I.bf16,
@@ -535,11 +537,7 @@ def paged_mla_decode_partials(
                 I.scatter_unique(
                     partial_output,
                     index=(batch, query_heads, split, slice(None)),
-                    value=I.select(
-                        summary.valid[:, None],
-                        summary.accumulator / safe_denominator[:, None],
-                        0.0,
-                    ),
+                    value=normalize_attention_summary(summary),
                 )
 
 
@@ -586,23 +584,21 @@ def splitk_mla_decode_partials(
     q_rope: I.In[I.f16, ("B", "H", "DR")],
     latent_cache: I.In[I.f16, ("B", "K", "C")],
     rope_cache: I.In[I.f16, ("B", "K", "DR")],
-    split_offsets: I.In[I.i32, ("SP_PLUS_1",)],
     partial_lse: I.Out[I.f32, ("B", "H", "SPLITS")],
     partial_output: I.Out[I.f16, ("B", "H", "SPLITS", "C")],
     scale: I.f32,
     SPLITS: I.Constexpr[int],
+    SPLIT_SIZE: I.Constexpr[int],
 ):
     B, H, C = q_latent.shape
     K = latent_cache.shape[1]
     heads = I.domain(0, H)
-    split_keys = I.ragged(
-        outer=I.domain(0, SPLITS),
-        members=I.domain(0, K),
-        offsets=split_offsets,
-    )
+    key_axis = I.domain(0, K)
     for batch in I.parallel(I.domain(0, B)):
-        for split in I.parallel(split_keys.outer):
-            keys = split_keys[split]
+        for split in I.parallel(I.domain(0, SPLITS)):
+            begin = I.minimum(split * SPLIT_SIZE, K)
+            end = I.minimum(begin + SPLIT_SIZE, K)
+            keys = key_axis[begin:end]
             latent_values = latent_cache[batch, keys, :]
             summary = I.region_fold(
                 source=(

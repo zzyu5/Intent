@@ -62,9 +62,10 @@ def streamed_online_softmax(
         values = x[row, columns]
         summary = online_softmax_summary(values)
         safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
+        inverse_denominator = 1.0 / safe_denominator
         y[row, columns] = I.select(
             summary.valid,
-            I.exp(values - summary.maximum) / safe_denominator,
+            I.exp(values - summary.maximum) * inverse_denominator,
             0.0,
         )
 
@@ -80,9 +81,10 @@ def streamed_online_softmax_f16(
         values = I.cast(x[row, columns], I.f32)
         summary = online_softmax_summary(values)
         safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
+        inverse_denominator = 1.0 / safe_denominator
         normalized = I.select(
             summary.valid,
-            I.exp(values - summary.maximum) / safe_denominator,
+            I.exp(values - summary.maximum) * inverse_denominator,
             0.0,
         )
         y[row, columns] = I.cast(normalized, I.f16)

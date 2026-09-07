@@ -49,7 +49,7 @@ SHARED_COMPILE_BINDINGS: dict[str, dict[str, object]] = {
     "kernels.streaming.mamba:mamba3_siso_forward": {"HEAD_GROUP": 8},
     "kernels.streaming.mla:paged_mla_decode": {"PAGE_SIZE": 64, "HEAD_GROUP": 8},
     "kernels.streaming.mla:paged_mla_decode_partials": {"PAGE_SIZE": 64, "HEAD_GROUP": 8, "SPLITS": 4},
-    "kernels.streaming.mla:splitk_mla_decode_partials": {"SPLITS": 4},
+    "kernels.streaming.mla:splitk_mla_decode_partials": {"SPLITS": 4, "SPLIT_SIZE": 128},
     "kernels.streaming.paged_attention:paged_gqa_decode_attention": {"PAGE_SIZE": 64, "HEAD_GROUP": 8},
     "kernels.streaming.paged_attention:paged_gqa_decode_partials": {"PAGE_SIZE": 64, "HEAD_GROUP": 8, "SPLITS": 4},
     "kernels.streaming.paged_attention:splitk_paged_gqa_decode_partials": {"PAGE_SIZE": 64, "HEAD_GROUP": 8, "SPLITS": 4},

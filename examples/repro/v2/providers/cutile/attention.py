@@ -575,15 +575,12 @@ def splitk_mla_decode(context: Context) -> PreparedComparison:
     cache_rope = torch.randn(
         (batch, sequence, rope), device="cuda", dtype=torch.float16
     )
-    split_offsets = torch.arange(
-        0, sequence + 1, split_size, device="cuda", dtype=torch.int32
-    )
     scale = 1.0 / math.sqrt(latent + rope)
     _, partials = compile_single(
         context,
         splitk_mla_decode_partials,
-        (query, query_rope, cache, cache_rope, split_offsets, scale),
-        constexprs={"SPLITS": splits},
+        (query, query_rope, cache, cache_rope, scale),
+        constexprs={"SPLITS": splits, "SPLIT_SIZE": split_size},
     )
     partial_lse, partial_output = partials.outputs()
     _, reduction = compile_single(
