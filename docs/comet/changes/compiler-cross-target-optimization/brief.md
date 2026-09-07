@@ -39,6 +39,7 @@
 - 旧 cutile-provider-closure-round-six 已按用户明确要求停止归档；其未验收快照不构成新的执行要求。cutile-execution-closure 已完成，本 change 不重开它。
 - 使用当前 main 目录创建一个普通 Native change。四类问题共同涉及作者表达、shared 参数化程序和 target 消费者，性能归因与修复需共同演进，暂不拆 Supervisor 或按 kernel/target 建立独立子任务。
 - 用户已明确确认完整 Shape 并要求进入 Build；三个结果型验收项与锁定的八个设备条目保持不变。
+- 用户要求本 change 完成后，下一轮单独收束 cuTile 全部性能条目至 G/S <= 1.05；本轮仍按固定八项 <= 1.1 验收，不提前扩大范围或宣称完成。
 
 # Open questions
 

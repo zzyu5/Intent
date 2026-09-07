@@ -47,6 +47,8 @@ Provider JIT 与实测 autotuning 保留：对未命中适用 winner 缓存的�
 
 其余 kernel 是横向实现的适用范围，不自动新增全表 <= 1.1 门槛。同一作者程序已有可运行的 Triton/cuTile 比较可辅助归因，但不要求先扩展完整双 target registry，也不能仅凭两个后端都慢或只有一个后端慢判定归属。
 
+本 change 完成后的下一轮按用户要求单独处理 cuTile 全部性能条目至 G/S <= 1.05；该后续目标不替换或扩大本轮的固定验收集合。
+
 ## 运行、交付与恢复
 
 复用项目现有 production runner。仅围绕受影响的性能条目及上述硬目标执行 emit、JIT、launch 和计时，在同次 benchmark 的既有输入上进行一次原容差检查；不另开正确性测试轮、不扩展输入矩阵、不新增 pytest、fixture、临时测试脚本或长期验证基础设施。
