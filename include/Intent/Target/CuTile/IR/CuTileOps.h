@@ -10,4 +10,8 @@
 #define GET_OP_CLASSES
 #include "Intent/Target/CuTile/IR/CuTileOps.h.inc"
 
+namespace intent::cutile {
+mlir::FailureOr<TileLoadOp> unfoldedArrayLoad(TileLoadOp load);
+}
+
 #endif

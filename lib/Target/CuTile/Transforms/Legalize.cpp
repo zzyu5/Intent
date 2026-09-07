@@ -2467,6 +2467,13 @@ ArrayAttr arrayIndexTileBounds(func::FuncOp kernel) {
     Value resource;
     gpu::FragmentType tile;
     if (auto load = dyn_cast<TileLoadOp>(operation)) {
+      if (load.getResource().getDefiningOp<ArrayViewOp>()) {
+        auto original = unfoldedArrayLoad(load);
+        if (failed(original) || failed(load.verify()))
+          return WalkResult::interrupt();
+        // The full inner-axis padding also bounds its contiguous alias.
+        load = *original;
+      }
       resource = load.getResource();
       tile = load.getResult().getType();
     } else if (auto store = dyn_cast<TileStoreOp>(operation)) {
@@ -2668,7 +2675,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
         return WalkResult::interrupt();
       }
     }
-    if (isa<TileLoadOp, TileStoreOp, ScalarLoadOp, ScalarStoreOp, GatherLoadOp,
+    if (isa<ArrayViewOp, TileLoadOp, TileStoreOp, ScalarLoadOp, ScalarStoreOp, GatherLoadOp,
             ScatterStoreOp, AtomicRMWOp, ExtractScalarOp, MMAOp, ScaledMMAOp,
             ReduceOp, ScanOp, gpu::ReduceOp, gpu::ScanOp, gpu::ParameterOp,
             gpu::PhysicalExprOp, gpu::ProgramIdOp, gpu::WorksetCoordinateOp,
@@ -3025,6 +3032,8 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
     return failure();
   realizeWideLoops(*kernel);
   preserveNativeIndexValues(*kernel);
+  if (failed(collapseArrayViews(module)))
+    return failure();
   if (ArrayAttr bounds = arrayIndexTileBounds(*kernel))
     (*kernel)->setAttr(arrayIndexTileBoundsAttr, bounds);
   if (failed(verifyCuTileProgram(module)))

@@ -2,6 +2,9 @@
 
 #include "Intent/Dialect/GPU/IR/Program.h"
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SmallBitVector.h"
 
@@ -67,10 +70,9 @@ LogicalResult verifySourceAxes(Operation *owner, ArrayRef<int64_t> sourceAxes,
   return success();
 }
 
-LogicalResult verifyResourceOrderedTile(Operation *owner, gpu::ViewType view,
+LogicalResult verifyResourceOrderedTile(Operation *owner, unsigned rank,
                                         gpu::FragmentType tile,
                                         ValueRange tileIndices) {
-  const unsigned rank = view.getRank();
   if (tileIndices.size() != rank || tile.getShape().size() != rank)
     return owner->emitOpError(
         "requires one resource-ordered tile axis and index per view axis");
@@ -97,16 +99,114 @@ LogicalResult verifySerializedCoordinateOrder(
 
 } // namespace
 
+LogicalResult ArrayViewOp::verify() {
+  auto base = dyn_cast<BlockArgument>(getBase());
+  auto kernel = (*this)->getParentOfType<func::FuncOp>();
+  auto view = getBase().getType();
+  if (!base || !kernel || base.getOwner() != &kernel.getBody().front() ||
+      (*this)->getBlock() != base.getOwner() || view.getAccess() != 0 ||
+      getResult().getType() != view)
+    return emitOpError(
+        "requires a read-only kernel view and preserves its logical ABI");
+  auto ends = getGroupEnds();
+  if (ends.size() < 2 || ends.size() >= view.getRank() ||
+      ends.back() != view.getRank())
+    return emitOpError("requires an ordered partition that reduces the array rank");
+  unsigned begin = 0;
+  for (int64_t end : ends) {
+    if (end <= begin || end > view.getRank())
+      return emitOpError("array collapse groups must partition every source axis");
+    for (unsigned axis = begin + 1; axis < static_cast<unsigned>(end); ++axis) {
+      auto extent =
+          dyn_cast<gpu::PhysicalExprAttr>(view.getLayout().getExtents()[axis]);
+      if (!extent ||
+          extent.getKind() !=
+              static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+          extent.getValue() <= 1)
+        return emitOpError(
+            "collapsed inner axes require positive non-unit static extents");
+    }
+    begin = end;
+  }
+  for (Operation *user : getResult().getUsers())
+    if (!isa<TileLoadOp>(user))
+      return emitOpError(
+          "conditional array aliases are only consumed by native tile loads");
+  return success();
+}
+
+FailureOr<TileLoadOp> unfoldedArrayLoad(TileLoadOp load) {
+  auto array = load.getResource().getDefiningOp<ArrayViewOp>();
+  auto choice = load->getParentOfType<scf::IfOp>();
+  if (!array || !choice || choice.getCondition() != array.getEligible() ||
+      load->getBlock() != choice.thenBlock() ||
+      choice.thenBlock()->getOperations().size() != 3 ||
+      choice.getElseRegion().empty() ||
+      choice.elseBlock()->getOperations().size() != 2)
+    return failure();
+  auto original = dyn_cast<TileLoadOp>(&choice.elseBlock()->front());
+  auto restore = dyn_cast<gpu::ReshapeOp>(load->getNextNode());
+  auto thenYield = dyn_cast<scf::YieldOp>(choice.thenBlock()->getTerminator());
+  auto elseYield = dyn_cast<scf::YieldOp>(choice.elseBlock()->getTerminator());
+  if (!original || !restore || !thenYield || !elseYield ||
+      thenYield.getNumOperands() != 1 || elseYield.getNumOperands() != 1 ||
+      original.getResource() != array.getBase() ||
+      original.getAllowTma() != load.getAllowTma() ||
+      restore.getValue() != load.getResult() ||
+      restore.getResult().getType() != original.getResult().getType() ||
+      thenYield.getOperand(0) != restore.getResult() ||
+      elseYield.getOperand(0) != original.getResult())
+    return failure();
+  return original;
+}
+
 LogicalResult TileLoadOp::verify() {
   auto view = getResource().getType();
   auto result = getResult().getType();
   if (!getAllowTma().getType().isInteger(1))
     return emitOpError("allow_tma must be a compile-time i1 access decision");
-  if (failed(verifyResourceOrderedTile(*this, view, result,
+  auto array = getResource().getDefiningOp<ArrayViewOp>();
+  unsigned rank = array ? array.getGroupEnds().size() : view.getRank();
+  if (failed(verifyResourceOrderedTile(*this, rank, result,
                                        getTileIndices())))
     return failure();
   if (view.getElementType() != result.getElementType())
     return emitOpError("view and tile element types disagree");
+  if (!array)
+    return success();
+  if (failed(array.verify()))
+    return failure();
+  auto original = unfoldedArrayLoad(*this);
+  if (failed(original))
+    return emitOpError(
+        "collapsed load must have a guarded reshape and unchanged alternative");
+  auto source = original->getResult().getType();
+  if (source.getShape().size() != view.getRank() ||
+      original->getTileIndices().size() != view.getRank() ||
+      source.getOwner() != result.getOwner() ||
+      source.getValidity() != result.getValidity())
+    return emitOpError("collapsed load must preserve the original physical domain");
+  unsigned begin = 0;
+  for (auto [group, end] : llvm::enumerate(array.getGroupEnds())) {
+    Attribute extent = source.getShape()[begin];
+    if (getTileIndices()[group] != original->getTileIndices()[begin])
+      return emitOpError(
+          "collapsed tile origin must be the original outer tile origin");
+    for (unsigned axis = begin + 1; axis < static_cast<unsigned>(end); ++axis) {
+      if (source.getShape()[axis] != view.getLayout().getExtents()[axis] ||
+          !matchPattern(original->getTileIndices()[axis], m_Zero()))
+        return emitOpError(
+            "collapsed inner tile axes must cover the full source axis from zero");
+      extent = gpu::PhysicalExprAttr::get(
+          getContext(), static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
+          StringAttr::get(getContext()),
+          ArrayAttr::get(getContext(), {extent, source.getShape()[axis]}));
+    }
+    if (result.getShape()[group] != extent)
+      return emitOpError(
+          "collapsed tile extent must equal the original contiguous product");
+    begin = end;
+  }
   return success();
 }
 
@@ -119,7 +219,9 @@ LogicalResult TileStoreOp::verify() {
   auto view = getResource().getType();
   if (!getAllowTma().getType().isInteger(1))
     return emitOpError("allow_tma must be a compile-time i1 access decision");
-  if (failed(verifyResourceOrderedTile(*this, view, getValue().getType(),
+  if (getResource().getDefiningOp<ArrayViewOp>())
+    return emitOpError("conditional array aliases are read-only");
+  if (failed(verifyResourceOrderedTile(*this, view.getRank(), getValue().getType(),
                                        getTileIndices())))
     return failure();
   return view.getElementType() == getValue().getType().getElementType()

@@ -237,6 +237,14 @@ private:
     std::string kind;
     Type type;
   };
+  struct ArrayViewABI {
+    ArrayViewOp operation;
+    unsigned sourceView;
+    std::string name;
+    std::string eligible;
+    std::string trialName;
+    std::string trialEligible;
+  };
 
   void bindArguments() {
     auto indexBounds = kernel->getAttrOfType<ArrayAttr>(arrayIndexTileBoundsAttr);
@@ -300,6 +308,34 @@ private:
           SmallVector<int64_t>(schema.getCandidates().asArrayRef())};
       fullCoverageParameterNames.insert(schema.getName().getValue());
     });
+    llvm::StringSet<> occupied;
+    for (const auto &entry : values)
+      occupied.insert(entry.second);
+    kernel.walk([&](gpu::ParameterOp parameter) {
+      occupied.insert(parameter.getParameter().getName().getValue());
+    });
+    auto fresh = [&](StringRef stem) {
+      unsigned suffix = 0;
+      std::string name;
+      do {
+        name = (Twine(stem) + Twine(suffix++)).str();
+      } while (!occupied.insert(name).second);
+      return name;
+    };
+    kernel.walk([&](ArrayViewOp array) {
+      unsigned argument = cast<BlockArgument>(array.getBase()).getArgNumber();
+      for (auto [index, view] : llvm::enumerate(views)) {
+        if (view.argument != argument)
+          continue;
+        ArrayViewABI binding{
+            array, static_cast<unsigned>(index), fresh("_intent_array_view_"),
+            fresh("_intent_array_valid_"), fresh("_intent_trial_array_view_"),
+            fresh("_intent_trial_array_valid_")};
+        values[array.getResult()] = binding.name;
+        values[array.getEligible()] = binding.eligible;
+        arrayViews.push_back(std::move(binding));
+      }
+    });
   }
 
   void emitPreamble() {
@@ -308,7 +344,7 @@ private:
               "import cuda.tile as ct\n"
               "from cuda.tile.tune import exhaustive_search\n"
               "from intent.runtime.artifact import ParameterRole, TuningConfiguration, TuningParameter\n"
-              "from intent.runtime.cutile import array_index_kernels, can_use_i32_array_indices\n"
+              "from intent.runtime.cutile import array_index_kernels, bind_array_view, can_use_i32_array_indices\n"
               "from intent.runtime.tuning import TuningState\n\n"
               "ConstInt = ct.Constant[int]\n\n";
   }
@@ -391,6 +427,10 @@ private:
     };
     for (const ViewABI &view : views)
       argument(view.name + ": ct.IndexedWithInt64");
+    for (const ArrayViewABI &view : arrayViews) {
+      argument(view.name + ": ct.IndexedWithInt64");
+      argument(view.eligible + ": ct.Constant[bool]");
+    }
     for (const ScalarABI &scalar : scalars) {
       auto integer = dyn_cast<IntegerType>(scalar.type);
       bool wide = scalar.type.isIndex() ||
@@ -413,6 +453,10 @@ private:
     if (kernel->hasAttr(arrayIndexTileBoundsAttr)) {
       output << "_intent_i32_kernel, _intent_kernel = array_index_kernels(_intent_kernel, (";
       for (const ViewABI &view : views) {
+        llvm::json::OStream(output).value(view.name);
+        output << ", ";
+      }
+      for (const ArrayViewABI &view : arrayViews) {
         llvm::json::OStream(output).value(view.name);
         output << ", ";
       }
@@ -441,6 +485,21 @@ private:
       line("raise ValueError(\"no legal full-coverage extent for " + parameter +
                "\")",
            2);
+    }
+  }
+
+  void emitArrayBindings(StringRef trialState, unsigned level) {
+    for (ArrayViewABI &view : arrayViews) {
+      bool trial = !trialState.empty();
+      std::string source = trial
+          ? trialState.str() + ".views[" + std::to_string(view.sourceView) + "]"
+          : views[view.sourceView].name;
+      std::string groups = "(";
+      for (int64_t end : view.operation.getGroupEnds())
+        groups += std::to_string(end) + ", ";
+      line((trial ? view.trialName : view.name) + ", " +
+               (trial ? view.trialEligible : view.eligible) +
+               " = bind_array_view(" + source + ", " + groups + "))", level);
     }
   }
 
@@ -528,6 +587,7 @@ private:
     emitTuningConfigurations();
     output << "def launch(" << launchArguments() << "):\n";
     emitArgumentBindings();
+    emitArrayBindings("", 1);
 
     llvm::StringSet<> occupiedNames;
     for (const ViewABI &view : views)
@@ -536,6 +596,12 @@ private:
       occupiedNames.insert(scalar.name);
     for (const MetadataABI &metadata : metadataArguments)
       occupiedNames.insert(metadata.name);
+    for (const ArrayViewABI &view : arrayViews) {
+      occupiedNames.insert(view.name);
+      occupiedNames.insert(view.eligible);
+      occupiedNames.insert(view.trialName);
+      occupiedNames.insert(view.trialEligible);
+    }
     kernel.walk([&](gpu::ParameterOp parameter) {
       occupiedNames.insert(parameter.getParameter().getName().getValue());
     });
@@ -585,6 +651,7 @@ private:
     for (const ViewABI &view : views)
       trialState += view.type.getAccess() != 0 ? "True, " : "False, ";
     line(trialState + "))", 2);
+    emitArrayBindings(trialStateName, 2);
     auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
     std::string grid = "lambda " + configName + ": (";
     for (Attribute extent : space)
@@ -597,7 +664,7 @@ private:
       hints = ", lambda " + configName + ": " + compilerHints(configName);
     line(searchResultName + " = exhaustive_search(_CONFIGS, " + streamName +
              ", " + grid + ", " + selectedKernelName + ", lambda " + configName +
-             ": " + trialStateName + ".arguments((" + joinKernelArguments(configName) + "))" + hints +
+             ": " + trialStateName + ".arguments((" + joinKernelArguments(configName, true) + "))" + hints +
              ", quiet=True)",
          2);
     std::string tunedKernel = selectedKernelName;
@@ -710,7 +777,9 @@ private:
   }
 
   void emitOperation(Operation &operation) {
-    if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
+    if (isa<ArrayViewOp>(operation)) {
+      return;
+    } else if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
       values[constant.getResult()] = literal(constant.getValue());
     } else if (auto parameter = dyn_cast<gpu::ParameterOp>(operation)) {
       values[parameter.getResult()] =
@@ -1290,8 +1359,11 @@ private:
     return result + "}";
   }
 
-  std::string joinKernelArguments(StringRef configName) {
+  std::string joinKernelArguments(StringRef configName, bool trial = false) {
     std::string result = joinViewNames(views);
+    for (const ArrayViewABI &view : arrayViews)
+      result += ", " + (trial ? view.trialName : view.name) + ", " +
+                (trial ? view.trialEligible : view.eligible);
     for (const ScalarABI &scalar : scalars) {
       if (!result.empty())
         result += ", ";
@@ -1374,6 +1446,7 @@ private:
   llvm::DenseMap<Value, std::string> values;
   llvm::DenseMap<Operation *, std::string> collectiveHelpers;
   SmallVector<ViewABI> views;
+  SmallVector<ArrayViewABI> arrayViews;
   SmallVector<ScalarABI> scalars;
   SmallVector<MetadataABI> metadataArguments;
   llvm::DenseMap<int64_t, MetadataABI> dimensionBindings;

@@ -10,6 +10,7 @@ namespace intent::cutile {
 mlir::LogicalResult legalizeGPUProgram(mlir::ModuleOp module,
                                      const gpu::TuningProfiles &profiles);
 mlir::LogicalResult verifyCuTileProgram(mlir::ModuleOp module);
+mlir::LogicalResult collapseArrayViews(mlir::ModuleOp module);
 
 } // namespace intent::cutile
 

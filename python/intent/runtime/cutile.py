@@ -2,6 +2,24 @@ from .artifact import CompiledArtifact
 from .source import materialize_python_source
 
 
+def bind_array_view(view, group_ends: tuple[int, ...]):
+    shape, strides = [], []
+    begin = 0
+    for end in group_ends:
+        extent = 1
+        for axis in range(begin, end):
+            if view.shape[axis] <= 0:
+                return view, False
+            if axis > begin and (view.stride(axis) <= 0 or
+                                 view.stride(axis - 1) != view.shape[axis] * view.stride(axis)):
+                return view, False
+            extent *= view.shape[axis]
+        shape.append(extent)
+        strides.append(view.stride(end - 1))
+        begin = end
+    return view.as_strided(shape, strides), True
+
+
 def array_index_kernels(function, view_names: tuple[str, ...]):
     from types import FunctionType
     import cuda.tile as ct

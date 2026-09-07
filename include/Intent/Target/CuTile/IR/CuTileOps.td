@@ -10,6 +10,15 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 class IntentCuTile_Op<string mnemonic, list<Trait> traits = []> :
     Op<IntentCuTile_Dialect, mnemonic, traits>;
 
+def IntentCuTile_ArrayViewOp : IntentCuTile_Op<"array_view", [Pure]> {
+  let summary = "Conditional host alias collapsing contiguous full inner axes";
+  let arguments = (ins IntentGPU_ViewValue:$base,
+                       DenseI64ArrayAttr:$group_ends);
+  // Preserve logical resource identity; group_ends declares the provider rank.
+  let results = (outs IntentGPU_ViewValue:$result, I1:$eligible);
+  let hasVerifier = 1;
+}
+
 def IntentCuTile_TileLoadOp : IntentCuTile_Op<"tile_load", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
   ]> {
