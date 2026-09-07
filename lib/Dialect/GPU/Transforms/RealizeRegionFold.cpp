@@ -12,6 +12,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 
 #include <functional>
@@ -916,6 +917,8 @@ bool isRecordField(Value value, BlockArgument record, unsigned field) {
 }
 
 bool isMembershipReduction(Value value, Value membershipPredicate) {
+  while (auto broadcast = value.getDefiningOp<BroadcastOp>())
+    value = broadcast.getValue();
   auto reduce = value.getDefiningOp<ReduceOp>();
   auto result = dyn_cast<OpResult>(value);
   if (!reduce || !result || reduce.getSourceCount() != 1 ||
@@ -1642,10 +1645,11 @@ LogicalResult cloneScanOutputConsumers(
 }
 
 struct PredicatePartition {
+  Value allTrueStart;
   Value allTrueStop;
   Value effectiveStart;
   Value effectiveStop;
-  Value predicate;
+  SmallVector<Value> allTruePredicates;
   bool firstMemberIsActive = false;
   bool prefixSpecializable = false;
 };
@@ -1678,6 +1682,12 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
       return std::nullopt;
     unsigned captureIndex = capture.getArgNumber() - sourceCount;
     if (captureIndex >= captures.size())
+      return std::nullopt;
+    Value sourceCoordinate =
+        stripHelperForwarding(plans[source.getArgNumber()].source);
+    Value captureCoordinate = stripHelperForwarding(captures[captureIndex]);
+    if (!sourceCoordinate.getDefiningOp<MakeRangeOp>() ||
+        !captureCoordinate.getDefiningOp<MakeRangeOp>())
       return std::nullopt;
     MakeRangeOp captureRange = uniqueRange(captures[captureIndex]);
     MakeRangeOp comparedSource =
@@ -1729,8 +1739,9 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
   Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
   Value effectiveStart = zero;
   Value effectiveStop = masterExtent;
-  Value allTrueStop = zero;
-  Value prefixPredicate;
+  Value allTrueStart = zero;
+  Value allTrueStop = masterExtent;
+  SmallVector<Value> allTruePredicates;
   bool firstMemberIsActive = false;
   bool hasLowerBound = false;
   unsigned upperBoundCount = 0;
@@ -1789,7 +1800,7 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
       effectiveStop = builder.create<BinaryOp>(
           location, builder.getIndexType(), effectiveStop, candidateStop,
           BinaryOperator::Minimum);
-      if (upperBoundCount++ == 0) {
+      {
         Value relativeStart = builder.create<BinaryOp>(
             location, builder.getIndexType(), captureRange.getStart(),
             master.getStart(), BinaryOperator::Subtract);
@@ -1802,17 +1813,22 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
         Value wholeSegments = builder.create<BinaryOp>(
             location, builder.getIndexType(), boundedStart, segment,
             BinaryOperator::FloorDivide);
-        allTrueStop = builder.create<BinaryOp>(
+        Value candidateAllTrueStop = builder.create<BinaryOp>(
             location, builder.getIndexType(), wholeSegments, segment,
             BinaryOperator::Multiply);
-        prefixPredicate = compare.getResult();
-        firstMemberIsActive =
-            samePhysicalScalarExpression(master.getStart(),
-                                         master.getLogicalStart()) &&
-            samePhysicalScalarExpression(captureRange.getLogicalStart(),
-                                         master.getStart()) &&
-            samePhysicalScalarExpression(comparedSource.getStart(),
-                                         master.getStart());
+        allTrueStop = builder.create<BinaryOp>(
+            location, builder.getIndexType(), allTrueStop, candidateAllTrueStop,
+            BinaryOperator::Minimum);
+        allTruePredicates.push_back(compare.getResult());
+        if (upperBoundCount++ == 0) {
+          firstMemberIsActive =
+              samePhysicalScalarExpression(master.getStart(),
+                                           master.getLogicalStart()) &&
+              samePhysicalScalarExpression(captureRange.getLogicalStart(),
+                                           master.getStart()) &&
+              samePhysicalScalarExpression(comparedSource.getStart(),
+                                           master.getStart());
+        }
       }
       foundBound = true;
     }
@@ -1876,13 +1892,46 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
     effectiveStart = builder.create<BinaryOp>(
         location, builder.getIndexType(), effectiveStart, alignedLower,
         BinaryOperator::Maximum);
+    Value captureSpan = builder.create<BinaryOp>(
+        location, builder.getIndexType(), captureRange.getExtent(),
+        captureRange.getStep(), BinaryOperator::Multiply);
+    Value lastCaptureOffset = builder.create<BinaryOp>(
+        location, builder.getIndexType(), captureSpan, captureRange.getStep(),
+        BinaryOperator::Subtract);
+    Value lastLower = builder.create<BinaryOp>(
+        location, builder.getIndexType(), relativeLower, lastCaptureOffset,
+        BinaryOperator::Add);
+    Value nonNegativeLastLower = builder.create<BinaryOp>(
+        location, builder.getIndexType(), lastLower, zero,
+        BinaryOperator::Maximum);
+    Value boundedLastLower = builder.create<BinaryOp>(
+        location, builder.getIndexType(), masterExtent, nonNegativeLastLower,
+        BinaryOperator::Minimum);
+    Value one = builder.create<arith::ConstantIndexOp>(location, 1);
+    Value adjustment = builder.create<BinaryOp>(
+        location, builder.getIndexType(), segment, one,
+        BinaryOperator::Subtract);
+    Value roundedLastLower = builder.create<BinaryOp>(
+        location, builder.getIndexType(), boundedLastLower, adjustment,
+        BinaryOperator::Add);
+    Value firstWholeSegment = builder.create<BinaryOp>(
+        location, builder.getIndexType(), roundedLastLower, segment,
+        BinaryOperator::FloorDivide);
+    Value candidateAllTrueStart = builder.create<BinaryOp>(
+        location, builder.getIndexType(), firstWholeSegment, segment,
+        BinaryOperator::Multiply);
+    allTrueStart = builder.create<BinaryOp>(
+        location, builder.getIndexType(), allTrueStart, candidateAllTrueStart,
+        BinaryOperator::Maximum);
+    allTruePredicates.push_back(compare.getResult());
     hasLowerBound = true;
     foundBound = true;
   }
   if (!foundBound)
     return failure();
-  return PredicatePartition{allTrueStop, effectiveStart, effectiveStop,
-                            prefixPredicate, firstMemberIsActive,
+  return PredicatePartition{allTrueStart, allTrueStop, effectiveStart,
+                            effectiveStop,
+                            std::move(allTruePredicates), firstMemberIsActive,
                             upperBoundCount == 1 && !hasLowerBound};
 }
 
@@ -1938,14 +1987,13 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     sliceTypes.push_back(fragment);
   }
 
-  struct SourceAssumption {
-    AssumeInBoundsOp operation;
-    PhysicalSourceAxis source;
-    unsigned planIndex;
-  };
-  SmallVector<SourceAssumption> sourceAssumptions;
+  SmallVector<AssumeInBoundsOp> sourceAssumptions;
+  DominanceInfo dominance(kernel);
   kernel.walk([&](AssumeInBoundsOp assumption) {
-    for (auto [planIndex, plan] : llvm::enumerate(plans)) {
+    if (!dominance.properlyDominates(assumption.getOperation(),
+                                    fold.getOperation()))
+      return;
+    for (const SourcePlan &plan : plans) {
       PhysicalRangeFact fact = physicalAnalysis.sourceRanges(
           assumption.getIndex(), plan.sourceIdentity);
       FailureOr<MakeRangeOp> range = queryExactLogicalRange(fact);
@@ -1956,8 +2004,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
             });
           }))
         continue;
-      sourceAssumptions.push_back(
-          {assumption, plan.sourceIdentity, static_cast<unsigned>(planIndex)});
+      sourceAssumptions.push_back(assumption);
       break;
     }
   });
@@ -2016,47 +2063,38 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
                                  segmentTail, sliceMapping, sourceMappings,
                                  failureReason)))
       return failure();
-    for (SourceAssumption &sourceAssumption : sourceAssumptions) {
-      if (sourceAssumption.planIndex >= sourceMappings.size()) {
-        failureReason =
-            "region-fold source assertion has no matching slice mapping";
-        return failure();
+    for (AssumeInBoundsOp assumption : sourceAssumptions) {
+      SmallVector<Value> assertedIndices;
+      for (const std::shared_ptr<IRMapping> &sourceMapping : sourceMappings) {
+        Value index = sourceMapping->lookupOrNull(assumption.getIndex());
+        if (!index || llvm::is_contained(assertedIndices, index))
+          continue;
+        assertedIndices.push_back(index);
+        OpBuilder::InsertionGuard guard(nested);
+        nested.setInsertionPointAfter(index.getDefiningOp());
+        auto replacement = nested.create<AssumeInBoundsOp>(
+            nestedLocation, index, assumption.getResource(),
+            assumption.getAxis());
+        if (Attribute origin = assumption->getAttr(originAttr))
+          replacement->setAttr(originAttr, origin);
       }
-      ReplayMaterializationOptions replayOptions;
-      replayOptions.scope = PhysicalReplayScope::Coordinate;
-      replayOptions.segmentTail = segmentTail;
-      replayOptions.materializeZeroFill = true;
-      FailureOr<Value> index = materializeReplayedValue(
-          nested, nestedLocation, sourceAssumption.operation.getIndex(),
-          sourceAssumption.source, sliceExtent,
-          *sourceMappings[sourceAssumption.planIndex], replayOptions);
-      if (failed(index)) {
-        failureReason =
-            "region-fold source assertion could not be replayed for a physical slice";
-        return failure();
-      }
-      auto replacement = nested.create<AssumeInBoundsOp>(
-          nestedLocation, *index, sourceAssumption.operation.getResource(),
-          sourceAssumption.operation.getAxis());
-      if (Attribute origin =
-              sourceAssumption.operation->getAttr(originAttr))
-        replacement->setAttr(originAttr, origin);
     }
     SmallVector<Value> summarizeArguments(slices);
     summarizeArguments.append(captures.begin(), captures.end());
-    Value substituteSource;
-    Value substituteTarget;
+    IRMapping localSummaryMapping;
+    IRMapping &mapping = summaryMapping ? *summaryMapping : localSummaryMapping;
     if (predicateIsTrue) {
-      auto predicateType = dyn_cast<FragmentType>(partition->predicate.getType());
-      if (!predicateType) {
-        failureReason = "range predicate is not a physical fragment";
-        return failure();
+      for (Value predicate : partition->allTruePredicates) {
+        auto predicateType = dyn_cast<FragmentType>(predicate.getType());
+        if (!predicateType) {
+          failureReason = "range predicate is not a physical fragment";
+          return failure();
+        }
+        Value truth = nested.create<arith::ConstantOp>(
+            nestedLocation, nested.getI1Type(), nested.getBoolAttr(true));
+        mapping.map(predicate,
+                    nested.create<SplatOp>(nestedLocation, predicateType, truth));
       }
-      Value truth = nested.create<arith::ConstantOp>(
-          nestedLocation, nested.getI1Type(), nested.getBoolAttr(true));
-      substituteSource = partition->predicate;
-      substituteTarget =
-          nested.create<SplatOp>(nestedLocation, predicateType, truth);
     }
     Value nonemptySource;
     Value nonemptyTarget;
@@ -2069,10 +2107,10 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
       nonemptyTarget = allTrueValue(nested, nestedLocation, validityType);
     }
     return inlinePureRegion(nested, fold.getSummarize(), summarizeArguments,
-                            failureReason, substituteSource, substituteTarget,
+                            failureReason, {}, {},
                             fullSegment ? Value() : memberPredicate,
                             fullSegment ? Value() : segmentTail,
-                            nonemptySource, nonemptyTarget, summaryMapping);
+                            nonemptySource, nonemptyTarget, &mapping);
   };
   auto emitLoop = [&](Value lower, Value upper, ValueRange initial,
                       bool fullSegment, bool predicateIsTrue) {
@@ -2112,9 +2150,8 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   };
 
   auto finish = [&]() -> LogicalResult {
-    for (SourceAssumption &sourceAssumption : sourceAssumptions)
-      if (sourceAssumption.operation->getBlock())
-        sourceAssumption.operation.erase();
+    for (AssumeInBoundsOp assumption : sourceAssumptions)
+      assumption.erase();
     simplifyKnownRecordValues(kernel);
     eraseDeadPhysicalValues(kernel);
     return success();
@@ -2318,6 +2355,35 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   Value fullMixedStop = builder.create<BinaryOp>(
       location, builder.getIndexType(), fullMixedSegments, segment.getResult(),
       BinaryOperator::Multiply);
+  scf::ForOp leadingMixedLoop;
+  if (!specializePredicatePrefix && succeeded(partition)) {
+    Value boundedStart = builder.create<BinaryOp>(
+        location, builder.getIndexType(), mixedStart, partition->allTrueStart,
+        BinaryOperator::Maximum);
+    Value interiorStart = builder.create<BinaryOp>(
+        location, builder.getIndexType(), fullMixedStop, boundedStart,
+        BinaryOperator::Minimum);
+    Value boundedStop = builder.create<BinaryOp>(
+        location, builder.getIndexType(), interiorStart, partition->allTrueStop,
+        BinaryOperator::Maximum);
+    Value interiorStop = builder.create<BinaryOp>(
+        location, builder.getIndexType(), fullMixedStop, boundedStop,
+        BinaryOperator::Minimum);
+    leadingMixedLoop = emitLoop(mixedStart, interiorStart, current,
+                                /*fullSegment=*/true,
+                                /*predicateIsTrue=*/false);
+    if (!bodyFailed) {
+      current.assign(leadingMixedLoop.getResults().begin(),
+                     leadingMixedLoop.getResults().end());
+      allTrueLoop = emitLoop(interiorStart, interiorStop, current,
+                             /*fullSegment=*/true,
+                             /*predicateIsTrue=*/true);
+    }
+    if (!bodyFailed)
+      current.assign(allTrueLoop.getResults().begin(),
+                     allTrueLoop.getResults().end());
+    mixedStart = interiorStop;
+  }
   scf::ForOp fullMixedLoop;
   if (!bodyFailed)
     fullMixedLoop = emitLoop(mixedStart, fullMixedStop, current,
@@ -2332,6 +2398,8 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
                         /*fullSegment=*/false,
                         /*predicateIsTrue=*/false);
   if (bodyFailed) {
+    if (leadingMixedLoop && leadingMixedLoop->getBlock())
+      leadingMixedLoop.erase();
     if (allTrueLoop && allTrueLoop->getBlock())
       allTrueLoop.erase();
     if (fullMixedLoop && fullMixedLoop->getBlock())

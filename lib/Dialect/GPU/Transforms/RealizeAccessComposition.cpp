@@ -494,6 +494,58 @@ bool deduplicateImmutableLoads(func::FuncOp kernel) {
   return changed;
 }
 
+void sinkImmutableLoadChains(func::FuncOp kernel) {
+  llvm::SmallPtrSet<Operation *, 32> selected;
+  SmallVector<Operation *> pending;
+  kernel.walk([&](LoadOp load) {
+    auto view = dyn_cast<ViewType>(load.getResource().getType());
+    if (view && view.getAccess() == 0 && selected.insert(load).second)
+      pending.push_back(load);
+  });
+  while (!pending.empty()) {
+    Operation *producer = pending.pop_back_val();
+    for (Operation *user : producer->getUsers()) {
+      if (user->getBlock() != producer->getBlock() ||
+          !isa<CastOp, BitcastOp, ReshapeOp, TransposeOp, BroadcastOp,
+               SelectOp, BinaryOp, UnaryOp>(user) ||
+          !isMemoryEffectFree(user) || !selected.insert(user).second)
+        continue;
+      pending.push_back(user);
+    }
+  }
+  SmallVector<Operation *> ordered;
+  kernel.walk<WalkOrder::PreOrder>([&](Operation *operation) {
+    if (selected.contains(operation))
+      ordered.push_back(operation);
+  });
+  for (Operation *operation : llvm::reverse(ordered)) {
+    Operation *firstUse = nullptr;
+    for (Operation *user : operation->getUsers()) {
+      Operation *ancestor = operation->getBlock()->findAncestorOpInBlock(*user);
+      if (!ancestor) {
+        firstUse = nullptr;
+        break;
+      }
+      if (!firstUse || ancestor->isBeforeInBlock(firstUse))
+        firstUse = ancestor;
+    }
+    if (!firstUse || operation->getNextNode() == firstUse)
+      continue;
+    bool crossesEffect = false;
+    for (Operation *next = operation->getNextNode(); next != firstUse;
+         next = next->getNextNode()) {
+      // ABI views can alias. Do not cross writes, atomics, synchronization,
+      // or an unknown effect while shortening an immutable load's live range.
+      if (!isMemoryEffectFree(next) && !isa<LoadOp, GatherOp>(next)) {
+        crossesEffect = true;
+        break;
+      }
+    }
+    if (!crossesEffect)
+      operation->moveBefore(firstUse);
+  }
+}
+
 } // namespace
 
 LogicalResult realizeAccessComposition(ModuleOp module) {
@@ -540,6 +592,7 @@ LogicalResult realizeAccessComposition(ModuleOp module) {
     changed |= deduplicateImmutableLoads(*physicalKernel);
     eraseDeadPhysicalValues(*physicalKernel);
   } while (changed);
+  sinkImmutableLoadChains(*physicalKernel);
   return success();
 }
 
