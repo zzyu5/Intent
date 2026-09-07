@@ -5,50 +5,10 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "llvm/ADT/DenseSet.h"
 
 using namespace mlir;
 
 namespace intent::cutile {
-namespace {
-
-SmallVector<TileLoadOp> matrixLoads(Value root, scf::ForOp loop) {
-  SmallVector<TileLoadOp> loads;
-  SmallVector<Value> pending{root};
-  llvm::SmallDenseSet<Value, 16> visited;
-  while (!pending.empty()) {
-    Value value = pending.pop_back_val();
-    if (!visited.insert(value).second)
-      continue;
-    Operation *producer = value.getDefiningOp();
-    if (!producer)
-      continue;
-    if (auto load = dyn_cast<TileLoadOp>(producer)) {
-      if (load->getParentOfType<scf::ForOp>() == loop)
-        loads.push_back(load);
-    } else if (auto reshape = dyn_cast<gpu::ReshapeOp>(producer)) {
-      pending.push_back(reshape.getValue());
-    } else if (auto transpose = dyn_cast<gpu::TransposeOp>(producer)) {
-      pending.push_back(transpose.getValue());
-    } else if (auto cast = dyn_cast<gpu::CastOp>(producer)) {
-      pending.push_back(cast.getValue());
-    } else if (auto broadcast = dyn_cast<gpu::BroadcastOp>(producer)) {
-      pending.push_back(broadcast.getValue());
-    } else if (auto select = dyn_cast<gpu::SelectOp>(producer)) {
-      pending.push_back(select.getTrueValue());
-      pending.push_back(select.getFalseValue());
-    } else if (auto choice = dyn_cast<scf::IfOp>(producer)) {
-      unsigned index = mlir::cast<OpResult>(value).getResultNumber();
-      for (Region &region : choice->getRegions()) {
-        auto yield = mlir::cast<scf::YieldOp>(region.front().getTerminator());
-        pending.push_back(yield.getOperand(index));
-      }
-    }
-  }
-  return loads;
-}
-
-} // namespace
 
 LogicalResult refineMMALoops(ModuleOp module) {
   auto physicalKernel = gpu::getPhysicalKernel(module);
@@ -58,15 +18,6 @@ LogicalResult refineMMALoops(ModuleOp module) {
   physicalKernel->walk<WalkOrder::PostOrder>(
       [&](scf::ForOp loop) { loops.push_back(loop); });
   for (scf::ForOp loop : loops) {
-    loop.walk([&](MMAOp mma) {
-      if (mma->getParentOfType<scf::ForOp>() != loop)
-        return;
-      for (Value operand : {mma.getLhs(), mma.getRhs()})
-        for (TileLoadOp load : matrixLoads(operand, loop))
-          if (!load.getLatency())
-            load.setLatencyAttr(IntegerAttr::get(
-                IntegerType::get(module.getContext(), 64), 3));
-    });
     auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
     for (auto [index, argument] : llvm::enumerate(loop.getRegionIterArgs())) {
       auto original = dyn_cast<gpu::FragmentType>(argument.getType());
