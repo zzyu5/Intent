@@ -1671,7 +1671,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
     auto emitNativeLoad = [&](OpBuilder &nested) {
       auto tile = nested.create<TileLoadOp>(
           load.getLoc(), plan->resourceType, load.getResource(), *allowTMA,
-          indices->values);
+          indices->values, IntegerAttr());
       Value value = tile.getResult();
       createdOperations.push_back(tile);
       if (plan->resourceToPacked) {
@@ -3027,6 +3027,8 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
     return failure();
   materializeUnitOwnershipExtents(*kernel);
   if (failed(formNativeTiles(*kernel, profiles)))
+    return failure();
+  if (failed(refineMMALoops(module)))
     return failure();
   if (failed(materializeClosedConfigs(*kernel)))
     return failure();

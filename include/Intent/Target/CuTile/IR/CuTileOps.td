@@ -24,7 +24,8 @@ def IntentCuTile_TileLoadOp : IntentCuTile_Op<"tile_load", [
   ]> {
   let arguments = (ins IntentGPU_ViewValue:$resource,
                        IntentGPU_ScalarValue:$allow_tma,
-                       Variadic<AnyTypeOf<[Index, I32]>>:$tile_indices);
+                       Variadic<AnyTypeOf<[Index, I32]>>:$tile_indices,
+                       OptionalAttr<I64Attr>:$latency);
   let results = (outs IntentGPU_FragmentValue:$result);
   let hasVerifier = 1;
 }

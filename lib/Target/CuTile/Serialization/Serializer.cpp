@@ -901,7 +901,10 @@ private:
                          ", index=" + tuple(load.getTileIndices()) +
                          ", shape=" + fragmentShape(load.getResult().getType()) +
                          ", padding_mode=ct.PaddingMode.ZERO, allow_tma=" +
-                         valueString(load.getAllowTma()) + ")";
+                         valueString(load.getAllowTma());
+      if (auto latency = load.getLatency())
+        call += ", latency=" + std::to_string(*latency);
+      call += ")";
       assign(load.getResult(), call);
     } else if (auto load = dyn_cast<ScalarLoadOp>(operation)) {
       std::string call = "ct.gather(" + valueString(load.getResource()) + ", " +
