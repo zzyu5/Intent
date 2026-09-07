@@ -7,10 +7,10 @@ layer_norm,8192x4096-bf16,0.122488,2.894040,0.042324,pass,同算法；source 额
 silu_and_mul,4096x28672-to14336-bf16,0.260672,0.228024,1.143178,pass,同算法；source 使用 FTZ 与近似除法
 attention_backward,B2-QH8-KVH2-S1024-D64-fp16-causal,0.625384,0.199104,3.140992,pass,同算法；中间精度和舍入不同
 dense_attention_forward,B2-QH32-KVH8-S4096-D128-bf16-causal,17.663232,5.391896,3.275885,pass,同算法；source 使用 FTZ 与近似除法
-grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,0.244168,0.191792,1.273088,pass,同算法；source 使用 FTZ 与近似除法
+grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,0.243536,0.191944,1.268787,pass,同算法；source 使用 FTZ 与近似除法
 swiglu,8192x14336-bf16,0.465352,0.412576,1.127918,pass,同算法；source 使用 FTZ 与近似除法
 splitk_attention_reduce,B8-H32-S8192-splits16-D128,0.011264,0.011120,1.012950,pass,
-mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,2.276104,0.798432,2.850717,pass,同算法；source 使用 FTZ 与近似除法
+mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,1.173032,0.798800,1.468493,pass,同算法；source 使用 FTZ 与近似除法
 batched_gemm,B32-M512-N512-K1024-bf16,0.078960,0.079424,0.994158,pass,
 tilegym_dense_gemm,M8192-N11008-K4096-bf16,2.463600,3.951752,0.623420,pass,
 grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.828880,0.821912,1.008478,pass,同算法；source 使用 host group shapes
@@ -22,14 +22,14 @@ gelu,8192x4096-fp16-tanh,0.102240,0.107968,0.946947,pass,同算法；source 保�
 geglu,4096x28672-fp16-tanh,0.255816,0.446792,0.572562,pass,同算法；source 保留 f16 中间舍入
 relu,8192x4096-fp16,0.088552,0.088456,1.001085,pass,同算法；NaN 传播方式不同
 dropout,8192x4096-fp16-p0.1,0.098424,0.098216,1.002118,pass,
-attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,1.562096,0.983256,1.588697,pass,同算法；source 的布局转换与辅助工作计入其调用时间
+attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,1.482992,0.983872,1.507302,pass,同算法；source 的布局转换与辅助工作计入其调用时间
 attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,3.812256,4.337016,0.879004,pass,同算法；source 使用 bf16 LSE 与近似除法
 mhc_apply_residual,T2048-H4096-streams4-bf16,0.174048,0.103424,1.682859,pass,同算法；source 保留 bf16 中间累加
-gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,3.517928,0.759456,4.632168,pass,同算法；中间精度和舍入不同
-gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,0.344640,0.662136,0.520497,pass,同算法；中间精度和舍入不同
+gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,2.936288,0.759944,3.863822,pass,同算法；中间精度和舍入不同
+gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,0.283608,0.664584,0.426745,pass,同算法；中间精度和舍入不同
 mhc_sinkhorn,T8192-streams4-fp32,0.081016,0.081136,0.998521,pass,同算法；source 用 exp2(x * log2(e)) 实现 exp
 absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,1.555832,0.655184,2.374649,pass,同算法；source 使用近似除法并额外输出 LSE
-splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,0.775248,0.225024,3.445179,pass,同算法；source 使用 FTZ 与近似除法
+splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,0.748912,0.222816,3.361123,pass,同算法；source 使用 FTZ 与近似除法
 sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,4.998200,308.888641,0.016181,pass,同算法；source 使用 FTZ 与近似除法
 sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,4.569648,1.232136,3.708721,pass,同算法；source 的布局转换与辅助工作计入其调用时间
 rms_norm,8192x4096-bf16,0.050616,0.050896,0.994499,pass,同算法；source 额外写 Rstd

@@ -945,6 +945,78 @@ bool samePhysicalScalarExpression(Value lhs, Value rhs) {
   return sameScalarExpression(lhs, rhs);
 }
 
+PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
+  std::function<PhysicalExprAttr(Value, unsigned)> bound =
+      [&](Value current, unsigned depth) -> PhysicalExprAttr {
+    if (!current || depth >= 32 || !current.getType().isIndex())
+      return {};
+    current = stripScalarIdentity(current);
+    auto expression = [&](PhysicalExprKind kind, int64_t constant,
+                          ArrayRef<Attribute> operands = {}) {
+      MLIRContext *context = current.getContext();
+      return PhysicalExprAttr::get(
+          context, static_cast<uint32_t>(kind), constant,
+          StringAttr::get(context, ""), ArrayAttr::get(context, operands));
+    };
+    if (auto coordinate = current.getDefiningOp<WorksetCoordinateOp>())
+      return bound(coordinate.getCoordinate(), depth + 1);
+    if (auto result = dyn_cast<OpResult>(current))
+      if (auto mapping = dyn_cast<DelinearizeOp>(result.getOwner())) {
+        if (!valueKnownNonNegative(mapping.getLinear()) ||
+            !llvm::all_of(mapping.getExtents(), [](Value extent) {
+              return valueKnownNonNegative(extent);
+            }))
+          return {};
+        Value extent = stripScalarIdentity(
+            mapping.getExtents()[result.getResultNumber()]);
+        if (auto physical = extent.getDefiningOp<PhysicalExprOp>())
+          return physical.getExpression();
+        if (auto dim = extent.getDefiningOp<DimOp>())
+          return resourceExtentExpression(dim.getView(), dim.getAxis());
+        if (auto argument = dyn_cast<BlockArgument>(extent)) {
+          auto kernel = dyn_cast<func::FuncOp>(
+              argument.getOwner()->getParentOp());
+          DictionaryAttr attributes =
+              kernel ? kernel.getArgAttrDict(argument.getArgNumber())
+                     : DictionaryAttr();
+          auto kind = attributes ? attributes.getAs<StringAttr>(abiKindAttr)
+                                 : StringAttr();
+          auto dimension = attributes
+                               ? attributes.getAs<IntegerAttr>(dimensionAttr)
+                               : IntegerAttr();
+          if (kind && kind.getValue() == "dimension" && dimension)
+            return PhysicalExprAttr::get(
+                current.getContext(),
+                static_cast<uint32_t>(PhysicalExprKind::Dimension),
+                dimension.getInt(),
+                StringAttr::get(current.getContext(),
+                                "D" + std::to_string(dimension.getInt())),
+                ArrayAttr::get(current.getContext(), {}));
+        }
+        if (std::optional<int64_t> constant = integerConstant(extent))
+          return expression(PhysicalExprKind::Constant, *constant);
+        return {};
+      }
+    if (std::optional<int64_t> constant = integerConstant(current)) {
+      if (*constant >= 0 && *constant < std::numeric_limits<int64_t>::max())
+        return expression(PhysicalExprKind::Constant, *constant + 1);
+      return {};
+    }
+    auto divide = current.getDefiningOp<BinaryOp>();
+    if (!divide || divide.getOperatorKind() != BinaryOperator::FloorDivide)
+      return {};
+    std::optional<int64_t> divisor = integerConstant(divide.getRhs());
+    if (!divisor || *divisor <= 0)
+      return {};
+    PhysicalExprAttr upper = bound(divide.getLhs(), depth + 1);
+    if (!upper)
+      return {};
+    return expression(PhysicalExprKind::CeilDiv, 0,
+                      {upper, expression(PhysicalExprKind::Constant, *divisor)});
+  };
+  return bound(value, 0);
+}
+
 bool sameLogicalRange(MakeRangeOp lhs, MakeRangeOp rhs) {
   if (!lhs || !rhs || lhs.getSourceId() != rhs.getSourceId() ||
       lhs.getSourceAxis() != rhs.getSourceAxis() ||

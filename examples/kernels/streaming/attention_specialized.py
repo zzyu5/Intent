@@ -1,7 +1,6 @@
 import intent
 import intent.language as I
 
-from kernels.activation.pointwise import tanh_value
 from kernels.streaming.attention import empty_attention_summary
 from kernels.streaming.attention import merge_attention_summaries
 from kernels.streaming.attention import normalize_attention_summary
@@ -61,7 +60,9 @@ def window_attention_values(
         acc_dtype=I.f32,
     ) * scale
     if soft_cap > 0.0:
-        scores = soft_cap * tanh_value(scores / soft_cap)
+        normalized_scores = scores * (1.0 / soft_cap)
+        exponential = I.exp2((-2.0 * I.LOG2E) * normalized_scores)
+        scores = soft_cap * (2.0 / (1.0 + exponential) - 1.0)
     valid = key_coordinates[None, :] <= query_coordinates[:, None]
     if window > 0:
         if inclusive_lower:

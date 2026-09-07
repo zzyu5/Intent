@@ -567,6 +567,9 @@ bool isKnownNonNegative(Value value, unsigned depth = 0) {
   value = stripIndexIdentities(value);
   if (std::optional<int64_t> constant = constantValue(value))
     return *constant >= 0;
+  if (auto parameter = value.getDefiningOp<gpu::ParameterOp>())
+    return llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
+                        [](int64_t candidate) { return candidate >= 0; });
   if (isa_and_nonnull<gpu::ProgramIdOp, gpu::WorksetCoordinateOp>(
           value.getDefiningOp()))
     return true;
@@ -1120,6 +1123,19 @@ FailureOr<Value> materializeTileOriginGuard(
     Value axisCondition = builder.create<gpu::BinaryOp>(
         owner->getLoc(), builder.getI1Type(), nonNegative, belowExtent,
         BinaryOperator::LogicalAnd);
+    if (gpu::PhysicalExprAttr upper =
+            gpu::queryNonNegativeIndexUpperBound(origin)) {
+      Value bound = builder.create<gpu::PhysicalExprOp>(
+          owner->getLoc(), builder.getIndexType(), upper);
+      Value allOriginsInBounds = builder.create<gpu::CompareOp>(
+          owner->getLoc(), builder.getI1Type(), bound, extent,
+          ComparePredicate::Le);
+      // Specialization can discharge the whole mapped domain. Otherwise the
+      // original per-origin predicate still determines exactly the same access.
+      axisCondition = builder.create<gpu::BinaryOp>(
+          owner->getLoc(), builder.getI1Type(), allOriginsInBounds, axisCondition,
+          BinaryOperator::LogicalOr);
+    }
     condition = condition
                     ? Value(builder.create<gpu::BinaryOp>(
                           owner->getLoc(), builder.getI1Type(), condition,
@@ -2805,10 +2821,12 @@ void realizeWideLoops(func::FuncOp kernel) {
              gpu::samePhysicalScalarExpression(binary.getRhs(), loop.getStep());
     };
     bool useTileCounter = maximumStep && *maximumStep > 1 &&
-                          isProvably(loop.getLowerBound(), 0) &&
+                          isKnownNonNegative(loop.getLowerBound()) &&
+                          valueIsMultipleOf(loop.getLowerBound(), loop.getStep()) &&
                           llvm::any_of(loop.getBody()->without_terminator(),
                                        isInductionQuotient);
     auto nativeLoop = [&](OpBuilder &nested) {
+      Value lowerBound = loop.getLowerBound();
       Value upperBound = loop.getUpperBound();
       if (useTileCounter) {
         Type wideType = loop.getInductionVar().getType();
@@ -2825,9 +2843,11 @@ void realizeWideLoops(func::FuncOp kernel) {
             location, wideType, distance, adjustment, BinaryOperator::Add);
         upperBound = nested.create<gpu::BinaryOp>(
             location, wideType, rounded, loop.getStep(), BinaryOperator::FloorDivide);
+        lowerBound = nested.create<gpu::BinaryOp>(
+            location, wideType, lowerBound, loop.getStep(), BinaryOperator::FloorDivide);
       }
       Value lower = nested.create<gpu::CastOp>(
-          location, nested.getI32Type(), loop.getLowerBound());
+          location, nested.getI32Type(), lowerBound);
       Value upper = nested.create<gpu::CastOp>(
           location, nested.getI32Type(), upperBound);
       Value step = nested.create<gpu::CastOp>(
