@@ -2,6 +2,7 @@
 
 #include "Intent/Dialect/GPU/IR/Program.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
 #include "llvm/ADT/DenseSet.h"
@@ -381,7 +382,8 @@ correlatedReductionContractionParameters(
 FailureOr<SmallVector<TuningProfile, 5>>
 profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
             bool twoAxisPointwise, bool fixedPointwiseLocal,
-            bool pointwiseOnlyProgram, const TuningProfiles &tables) {
+            bool pointwiseOnlyProgram, bool smallRegionRows,
+            const TuningProfiles &tables) {
   auto capabilities =
       kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   bool matrix = capabilities && capabilities.getMatrixUnits();
@@ -394,7 +396,10 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
   case TuningClass::Contraction:
     family = matrix && narrow ? "contraction_narrow" : "contraction";
     break;
-  case TuningClass::RegionContraction: family = "region_contraction"; break;
+  case TuningClass::RegionContraction:
+    family = smallRegionRows ? "region_contraction_small_rows"
+                             : "region_contraction";
+    break;
   case TuningClass::RegionReduction: family = "region_reduction"; break;
   case TuningClass::Scan: family = "scan"; break;
   case TuningClass::MultiAxisReduction: family = "multi_axis_reduction"; break;
@@ -465,6 +470,33 @@ int64_t selectCandidate(ArrayRef<int64_t> candidates, int64_t requested) {
       selected = candidate;
   }
   return selected;
+}
+
+bool hasSmallRegionRows(func::FuncOp kernel, ArrayRef<ParameterOp> parameters) {
+  bool found = false;
+  for (ParameterOp parameter : parameters) {
+    ParameterAttr schema = parameter.getParameter();
+    if (schema.getCategory() !=
+            static_cast<uint32_t>(ParameterCategory::RegionContraction) ||
+        schema.getRole() != static_cast<uint32_t>(ParameterRole::OwnershipM))
+      continue;
+    bool small = false;
+    kernel.walk([&](MakeRangeOp range) {
+      auto fragment = cast<FragmentType>(range.getResult().getType());
+      if (fragment.getShape().size() != 1 ||
+          !axisReferencesParameter(fragment, 0, schema.getName()))
+        return;
+      auto start = range.getLogicalStart().getDefiningOp<arith::ConstantIndexOp>();
+      auto stop = range.getLogicalStop().getDefiningOp<arith::ConstantIndexOp>();
+      if (start && stop && start.value() == 0 &&
+          stop.value() > 0 && stop.value() <= 8)
+        small = true;
+    });
+    if (!small)
+      return false;
+    found = true;
+  }
+  return found;
 }
 
 } // namespace
@@ -544,12 +576,14 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
       indirectRowGroups.push_back(group);
     }
   unsigned profileCount = 0;
+  bool smallRegionRows = hasSmallRegionRows(kernel, parameters);
   llvm::DenseMap<Operation *, SmallVector<TuningProfile, 5>> parameterProfiles;
   for (ParameterOp parameter : parameters) {
     ParameterAttr schema = parameter.getParameter();
     auto profiles = profilesFor(
         kernel, tuningClass(kernel, parameter), schema.getElementBitWidth(),
-        hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal, pointwiseOnlyProgram, tables);
+        hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal,
+        pointwiseOnlyProgram, smallRegionRows, tables);
     if (failed(profiles))
       return failure();
     profileCount = std::max<unsigned>(profileCount, profiles->size());
