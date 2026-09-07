@@ -219,7 +219,8 @@ matchOnlineSummaryStructure(MakeRecordOp record) {
     }
     if (auto select = field.getDefiningOp<SelectOp>()) {
       auto reduce = select.getTrueValue().getDefiningOp<ReduceOp>();
-      if (isSingleBinaryReduction(reduce, BinaryOperator::Maximum))
+      if (isSingleBinaryReduction(reduce, BinaryOperator::Maximum) ||
+          isSingleBinaryReduction(reduce, BinaryOperator::MaximumNum))
         maximumCandidates.emplace_back(index, select);
       continue;
     }
@@ -366,8 +367,10 @@ matchOnlineSummaryMerge(Region &region,
     return failure();
   auto maximumOfBoth =
       stripProjection(finalMaximum.getTrueValue()).getDefiningOp<BinaryOp>();
+  ReduceOp summaryMaximum = summary.maximum;
   if (!maximumOfBoth ||
-      maximumOfBoth.getOperatorKind() != BinaryOperator::Maximum ||
+      maximumOfBoth.getOperatorKind() !=
+          queryBinaryCombineKind(summaryMaximum.getCombine()) ||
       !((isProjectedFrom(maximumOfBoth.getLhs(), initialMaximum.getResult()) &&
          isRecordField(maximumOfBoth.getRhs(), right,
                        summary.maximumField)) ||

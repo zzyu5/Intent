@@ -6,6 +6,7 @@ import intent.language as I
 from kernels.streaming.attention import empty_attention_summary
 from kernels.streaming.attention import merge_attention_summaries
 from kernels.streaming.attention import normalize_attention_summary
+from kernels.streaming.attention import reduce_score_maximum
 
 
 ABSORBED_MLA_BATCH = 1
@@ -52,7 +53,7 @@ def merge_natural_attention_summaries(lhs, rhs):
     maximum = I.select(lhs.valid, lhs.maximum, rhs.maximum)
     maximum = I.select(
         rhs.valid,
-        I.maximum(maximum, rhs.maximum),
+        I.maximum_num(maximum, rhs.maximum),
         maximum,
     )
     lhs_maximum = I.select(lhs.valid, lhs.maximum, maximum)
@@ -114,7 +115,7 @@ def summarize_mla_chunk(
     chunk_valid = I.reduce.any(valid, axis=1)
     maximum = I.select(
         chunk_valid,
-        I.reduce.max(scores, axis=1),
+        reduce_score_maximum(scores, axis=1),
         0.0,
     )
     probability = I.select(
@@ -165,7 +166,7 @@ def summarize_masked_mla_chunk(
     chunk_valid = I.reduce.any(valid, axis=1)
     maximum = I.select(
         chunk_valid,
-        I.reduce.max(scores, axis=1),
+        reduce_score_maximum(scores, axis=1),
         0.0,
     )
     probability = I.select(
@@ -216,7 +217,7 @@ def summarize_masked_mla_chunk_natural(
     chunk_valid = I.reduce.any(valid, axis=1)
     maximum = I.select(
         chunk_valid,
-        I.reduce.max(scores, axis=1),
+        reduce_score_maximum(scores, axis=1),
         0.0,
     )
     probability = I.select(
@@ -265,7 +266,7 @@ def sparse_mla_summary(
     summary_valid = I.reduce.any(valid, axis=2)
     maximum = I.select(
         summary_valid,
-        I.reduce.max(scores, axis=2),
+        reduce_score_maximum(scores, axis=2),
         0.0,
     )
     probability = I.select(

@@ -4,6 +4,7 @@ import intent.language as I
 from kernels.streaming.attention import empty_attention_summary
 from kernels.streaming.attention import merge_attention_summaries
 from kernels.streaming.attention import normalize_attention_summary
+from kernels.streaming.attention import reduce_score_maximum
 from kernels.streaming.attention import summarize_attention_chunk_bf16
 from kernels.streaming.attention import summarize_masked_attention_chunk
 
@@ -62,7 +63,8 @@ def window_attention_values(
     if soft_cap > 0.0:
         normalized_scores = scores * (1.0 / soft_cap)
         exponential = I.exp2((-2.0 * I.LOG2E) * normalized_scores)
-        scores = soft_cap * (2.0 / (1.0 + exponential) - 1.0)
+        inverse_root = I.rsqrt(1.0 + exponential)
+        scores = soft_cap * (2.0 * inverse_root * inverse_root - 1.0)
     valid = key_coordinates[None, :] <= query_coordinates[:, None]
     if window > 0:
         if inclusive_lower:
@@ -74,7 +76,7 @@ def window_attention_values(
     chunk_valid = I.reduce.any(valid, axis=1)
     maximum = I.select(
         chunk_valid,
-        I.reduce.max(scores, axis=1),
+        reduce_score_maximum(scores, axis=1),
         0.0,
     )
     probability = I.select(
@@ -201,7 +203,7 @@ def summarize_block_causal_chunk(
     chunk_valid = I.reduce.any(valid, axis=1)
     maximum = I.select(
         chunk_valid,
-        I.reduce.max(scores, axis=1),
+        reduce_score_maximum(scores, axis=1),
         0.0,
     )
     probability = I.select(
@@ -225,7 +227,7 @@ def summarize_block_causal_chunk(
 def add_sink_to_summary(summary, sink_log2):
     maximum = I.select(
         summary.valid,
-        I.maximum(summary.maximum, sink_log2),
+        I.maximum_num(summary.maximum, sink_log2),
         sink_log2,
     )
     data_scale = I.select(

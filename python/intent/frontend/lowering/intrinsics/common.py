@@ -120,9 +120,9 @@ def require_static_int(lowerer: FunctionLowerer, node: ast.AST) -> int:
 
 def require_axes(lowerer: FunctionLowerer, node: ast.AST) -> tuple[int, ...]:
     expression = lowerer.lower_expression(node)
-    if isinstance(expression, Literal):
-        if isinstance(expression.value, int) and not isinstance(expression.value, bool):
-            return (expression.value,)
+    known, value = compile_time_value(expression)
+    if known and isinstance(value, int) and not isinstance(value, bool):
+        return (value,)
     if isinstance(expression, StaticTuple):
         axes: list[int] = []
         for element in expression.elements:

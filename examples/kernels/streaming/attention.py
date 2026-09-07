@@ -45,6 +45,21 @@ MLA_PREFILL_SCALE = 1.0 / math.sqrt(
 
 
 @intent.fn
+def maximum_score(lhs, rhs):
+    return I.maximum_num(lhs, rhs)
+
+
+@intent.fn
+def reduce_score_maximum(scores, axis):
+    return I.reduce(
+        scores,
+        axis=axis,
+        identity=-I.inf,
+        combine=maximum_score,
+    )
+
+
+@intent.fn
 def empty_attention_summary(query_count, value_width):
     return I.record(
         valid=I.full((query_count,), fill=False, dtype=I.bool),
@@ -70,7 +85,7 @@ def merge_attention_summaries(lhs, rhs):
     maximum = I.select(lhs.valid, lhs.maximum, rhs.maximum)
     maximum = I.select(
         rhs.valid,
-        I.maximum(maximum, rhs.maximum),
+        I.maximum_num(maximum, rhs.maximum),
         maximum,
     )
     lhs_maximum = I.select(lhs.valid, lhs.maximum, maximum)
@@ -105,7 +120,7 @@ def merge_scalar_attention_summaries(lhs, rhs):
     maximum = I.select(lhs.valid, lhs.maximum, rhs.maximum)
     maximum = I.select(
         rhs.valid,
-        I.maximum(maximum, rhs.maximum),
+        I.maximum_num(maximum, rhs.maximum),
         maximum,
     )
     lhs_maximum = I.select(lhs.valid, lhs.maximum, maximum)
@@ -155,7 +170,7 @@ def summarize_attention_chunk_f16(
         valid = query_coordinates[:, None] >= key_coordinates[None, :]
     masked_scores = I.select(valid, scores, -I.inf)
     chunk_valid = I.reduce.any(valid, axis=1)
-    raw_maximum = I.reduce.max(masked_scores, axis=1)
+    raw_maximum = reduce_score_maximum(masked_scores, axis=1)
     maximum = I.select(chunk_valid, raw_maximum, 0.0)
     probability = I.select(
         valid,
@@ -197,7 +212,7 @@ def summarize_attention_chunk_bf16(
         valid = query_coordinates[:, None] >= key_coordinates[None, :]
     masked_scores = I.select(valid, scores, -I.inf)
     chunk_valid = I.reduce.any(valid, axis=1)
-    raw_maximum = I.reduce.max(masked_scores, axis=1)
+    raw_maximum = reduce_score_maximum(masked_scores, axis=1)
     maximum = I.select(chunk_valid, raw_maximum, 0.0)
     probability = I.select(
         valid,
@@ -235,7 +250,7 @@ def summarize_masked_attention_chunk(
     valid = I.full(scores.shape, fill=True, dtype=I.bool) & active[None, :]
     masked_scores = I.select(valid, scores, -I.inf)
     chunk_valid = I.reduce.any(valid, axis=1)
-    raw_maximum = I.reduce.max(masked_scores, axis=1)
+    raw_maximum = reduce_score_maximum(masked_scores, axis=1)
     maximum = I.select(chunk_valid, raw_maximum, 0.0)
     probability = I.select(
         valid,
@@ -271,7 +286,7 @@ def summarize_masked_scalar_query_chunk(
     chunk_valid = I.reduce.any(valid, axis=0)
     maximum = I.select(
         chunk_valid,
-        I.reduce.max(scores, axis=0),
+        reduce_score_maximum(scores, axis=0),
         0.0,
     )
     probability = I.select(
@@ -315,7 +330,7 @@ def summarize_biased_attention_chunk(
     ) * I.LOG2E
     valid = I.full(scores.shape, fill=True, dtype=I.bool)
     chunk_valid = I.reduce.any(valid, axis=1)
-    raw_maximum = I.reduce.max(scores, axis=1)
+    raw_maximum = reduce_score_maximum(scores, axis=1)
     maximum = I.select(chunk_valid, raw_maximum, 0.0)
     probability = I.select(
         valid,
@@ -359,7 +374,7 @@ def summarize_mla_chunk(
     chunk_valid = I.reduce.any(valid, axis=1)
     maximum = I.select(
         chunk_valid,
-        I.reduce.max(scores, axis=1),
+        reduce_score_maximum(scores, axis=1),
         0.0,
     )
     probability = I.select(

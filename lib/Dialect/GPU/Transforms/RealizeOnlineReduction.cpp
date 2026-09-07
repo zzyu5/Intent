@@ -268,7 +268,7 @@ LogicalResult realizeOnlineSummary(OnlineSummaryPattern pattern,
             chunkValidity.getResult(0), BinaryOperator::LogicalOr);
         Value maximumOfBoth = nested.create<BinaryOp>(
             nestedLocation, carries[1].getType(), carries[1], currentMaximum,
-            BinaryOperator::Maximum);
+            *queryBinaryCombineKind(pattern.maximum.getCombine()));
         Value maximumWithRight = nested.create<SelectOp>(
             nestedLocation, carries[1].getType(), chunkValidity.getResult(0),
             maximumOfBoth, carries[1]);
