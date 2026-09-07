@@ -2298,6 +2298,46 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
     configurations = std::move(expanded);
   }
 
+  gpu::ParameterOp resident;
+  gpu::ParameterOp ctas;
+  gpu::ParameterOp occupancy;
+  for (Domain &domain : domains) {
+    auto role = static_cast<gpu::ParameterRole>(domain.parameter.getParameter().getRole());
+    if (role == gpu::ParameterRole::ResidentWorkers)
+      resident = domain.parameter;
+    if (role == gpu::ParameterRole::ProviderCTAs)
+      ctas = domain.parameter;
+    if (role == gpu::ParameterRole::ProviderOccupancy)
+      occupancy = domain.parameter;
+  }
+  bool bindResidentCapacity = resident && ctas && occupancy;
+  if (bindResidentCapacity) {
+    auto capabilities = kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+    if (!capabilities || capabilities.getComputeUnits() <= 0)
+      return kernel.emitError("cuTile resident binding requires a positive compute-unit count");
+    SmallVector<int64_t> counts;
+    auto definition = resident.getParameter();
+    for (auto &configuration : configurations) {
+      NamedAttrList bindings(configuration);
+      int64_t cluster = cast<IntegerAttr>(bindings.get(ctas.getParameter().getName())).getInt();
+      int64_t capacity = cast<IntegerAttr>(bindings.get(occupancy.getParameter().getName())).getInt();
+      if (!isLegalCTAs(cluster) || !isLegalOccupancy(capacity))
+        return kernel.emitError("cuTile resident binding requires legal CTA and occupancy options");
+      int64_t count;
+      if (llvm::MulOverflow(capabilities.getComputeUnits() / cluster, capacity, count) || count <= 0)
+        return kernel.emitError("cuTile resident capacity is not a positive representable count");
+      bindings.set(definition.getName(), builder.getI64IntegerAttr(count));
+      configuration.assign(bindings.begin(), bindings.end());
+      if (!llvm::is_contained(counts, count))
+        counts.push_back(count);
+    }
+    llvm::sort(counts);
+    resident.setParameterAttr(gpu::ParameterAttr::get(
+        kernel.getContext(), definition.getName(), definition.getRole(),
+        definition.getCategory(), definition.getElementBitWidth(),
+        DenseI64ArrayAttr::get(kernel.getContext(), counts)));
+  }
+
   SmallVector<Attribute> encoded;
   for (const auto &bindings : configurations) {
     DictionaryAttr candidate = builder.getDictionaryAttr(bindings);
@@ -2307,6 +2347,22 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
   if (encoded.empty())
     return kernel.emitError("cuTile legalization produced no provider config");
   kernel->setAttr(gpu::cuTileConfigsAttr, builder.getArrayAttr(encoded));
+  if (bindResidentCapacity) {
+    SmallVector<Attribute> projected;
+    for (Attribute attribute : encoded) {
+      auto candidate = cast<DictionaryAttr>(attribute);
+      SmallVector<NamedAttribute> bindings;
+      for (Domain &domain : domains)
+        if (!domain.provider && !domain.coverage) {
+          auto name = domain.parameter.getParameter().getName();
+          bindings.push_back(builder.getNamedAttr(name, candidate.get(name)));
+        }
+      auto tuple = builder.getDictionaryAttr(bindings);
+      if (!llvm::is_contained(projected, Attribute(tuple)))
+        projected.push_back(tuple);
+    }
+    kernel->setAttr(gpu::sharedConfigTuplesAttr, builder.getArrayAttr(projected));
+  }
   return success();
 }
 
@@ -2634,6 +2690,8 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
 bool fitsNativeLoopBound(Value value, unsigned depth = 0) {
   if (depth >= 32)
     return false;
+  if (value.getDefiningOp<gpu::ProgramIdOp>())
+    return true;
   auto integer = dyn_cast<IntegerType>(value.getType());
   if (integer && (integer.getWidth() < 32 ||
                   (integer.getWidth() == 32 && !integer.isUnsigned())))
@@ -2676,6 +2734,34 @@ bool isSpecializedLoopBound(Value value, unsigned depth = 0) {
                     kind.getValue() == "constexpr");
   }
   Operation *producer = value.getDefiningOp();
+  if (auto physical = dyn_cast_or_null<gpu::PhysicalExprOp>(producer)) {
+    auto kernel = physical->getParentOfType<func::FuncOp>();
+    auto specialized = [&](auto &&self, gpu::PhysicalExprAttr expression) -> bool {
+      auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
+      if (kind == gpu::PhysicalExprKind::Constant)
+        return true;
+      if (kind == gpu::PhysicalExprKind::Parameter) {
+        auto parameter = gpu::queryParameterBySymbol(kernel, expression.getSymbol());
+        if (failed(parameter))
+          return false;
+        auto role = static_cast<gpu::ParameterRole>(parameter->getParameter().getRole());
+        return role != gpu::ParameterRole::ProviderCTAs &&
+               role != gpu::ParameterRole::ProviderOccupancy;
+      }
+      if (kind == gpu::PhysicalExprKind::Dimension ||
+          kind == gpu::PhysicalExprKind::ScalarABI) {
+        for (BlockArgument argument : kernel.getArguments())
+          if (kernel.getArgAttrOfType<StringAttr>(argument.getArgNumber(), gpu::abiNameAttr) ==
+              expression.getSymbol())
+            return isSpecializedLoopBound(argument, depth + 1);
+        return false;
+      }
+      return llvm::all_of(expression.getOperands(), [&](Attribute operand) {
+        return self(self, cast<gpu::PhysicalExprAttr>(operand));
+      });
+    };
+    return specialized(specialized, physical.getExpression());
+  }
   if (isa_and_nonnull<arith::ConstantOp, gpu::ParameterOp, gpu::DimOp>(producer))
     return true;
   if (auto bound = dyn_cast_or_null<gpu::RangeBoundOp>(producer)) {
@@ -2865,7 +2951,8 @@ void realizeWideLoops(func::FuncOp kernel) {
     }
     auto integer = dyn_cast<IntegerType>(loop.getInductionVar().getType());
     if (maximumStep && (!integer || !integer.isUnsigned()) &&
-        isSpecializedLoopBound(loop.getLowerBound()) &&
+        (fitsNativeLoopBound(loop.getLowerBound()) ||
+         isSpecializedLoopBound(loop.getLowerBound())) &&
         isSpecializedLoopBound(loop.getUpperBound())) {
       Value minimum = builder.create<arith::ConstantOp>(
           location, loop.getInductionVar().getType(),
@@ -2880,6 +2967,8 @@ void realizeWideLoops(func::FuncOp kernel) {
                                  int64_t{INT32_MAX} - *maximumStep + 1));
       Value condition;
       for (Value bound : {loop.getLowerBound(), loop.getUpperBound()}) {
+        if (bound != loop.getUpperBound() && fitsNativeLoopBound(bound))
+          continue;
         Value lower = builder.create<gpu::CompareOp>(
             location, builder.getI1Type(), bound, minimum, ComparePredicate::Ge);
         Value upper = builder.create<gpu::CompareOp>(
@@ -2932,10 +3021,10 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   materializeUnitOwnershipExtents(*kernel);
   if (failed(formNativeTiles(*kernel, profiles)))
     return failure();
-  realizeWideLoops(*kernel);
-  preserveNativeIndexValues(*kernel);
   if (failed(materializeClosedConfigs(*kernel)))
     return failure();
+  realizeWideLoops(*kernel);
+  preserveNativeIndexValues(*kernel);
   if (ArrayAttr bounds = arrayIndexTileBounds(*kernel))
     (*kernel)->setAttr(arrayIndexTileBoundsAttr, bounds);
   if (failed(verifyCuTileProgram(module)))

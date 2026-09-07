@@ -254,6 +254,9 @@ def _persistent_bmm_autotune_base(
         num_tiles_n = (N + cfg.TILE_N - 1) // cfg.TILE_N
         total_tiles = num_tiles_m * num_tiles_n * batch_size
 
+        if "RESIDENT_WORKERS" in vars(cfg):
+            return (min(cfg.RESIDENT_WORKERS, total_tiles),)
+
         occupancy = cfg.occupancy
         num_ctas = cfg.num_ctas
 
@@ -264,8 +267,13 @@ def _persistent_bmm_autotune_base(
     # Call autotuner to find the best config and execute the kernel
     configs = tuple(_bmm_autotune_configs()) if tuning_configs is None else tuple(tuning_configs)
     for cfg in configs:
-        if vars(cfg).keys() != {"TILE_M", "TILE_N", "TILE_K", "GROUP_SIZE_M",
-                               "occupancy", "num_ctas", "ACCESS_FORM"}:
+        fields = {"TILE_M", "TILE_N", "TILE_K", "GROUP_SIZE_M",
+                  "occupancy", "num_ctas", "ACCESS_FORM"}
+        if "RESIDENT_WORKERS" in vars(cfg):
+            fields.add("RESIDENT_WORKERS")
+            if cfg.RESIDENT_WORKERS <= 0:
+                raise ValueError("BMM resident worker count must be positive")
+        if vars(cfg).keys() != fields:
             raise ValueError("BMM requires complete candidates without unconsumed fields")
     config_key = tuple(tuple(sorted(vars(cfg).items())) for cfg in configs)
     cache_key = (batch_size, M, N, K, transpose_a, transpose_b, a.dtype, str(a.device),

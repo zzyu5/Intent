@@ -36,6 +36,8 @@ def contraction_configs(
                 field = "num_ctas"
             elif role == ParameterRole.TRAVERSAL_GROUP:
                 field = "GROUP_SIZE_M"
+            elif role == ParameterRole.RESIDENT_WORKERS:
+                field = "RESIDENT_WORKERS"
             elif role == ParameterRole.REDUCTION and axis == k_axis:
                 field = "TILE_K"
                 value *= k_elements_per_unit
@@ -62,8 +64,11 @@ def contraction_configs(
         if values.keys() & fixed_options.keys():
             raise PipelineStageError("source_candidate_binding", "fixed options overlap tuned parameters")
         values.update(fixed_options)
-        if values.keys() != {"TILE_M", "TILE_N", "TILE_K", "ACCESS_FORM", "occupancy",
-                             "GROUP_SIZE_M", "num_ctas"}:
+        required = {"TILE_M", "TILE_N", "TILE_K", "ACCESS_FORM", "occupancy",
+                    "GROUP_SIZE_M", "num_ctas"}
+        if "RESIDENT_WORKERS" in values:
+            required.add("RESIDENT_WORKERS")
+        if values.keys() != required:
             raise PipelineStageError(
                 "source_candidate_binding", "source requires a complete contraction candidate",
             )

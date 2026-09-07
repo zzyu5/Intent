@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
 using namespace mlir;
@@ -171,12 +172,14 @@ LogicalResult refineProgramMapping(ModuleOp module) {
   const int64_t traversalWorker =
       static_cast<int64_t>(CoordinateRole::TraversalWorker);
   const int64_t workset = static_cast<int64_t>(CoordinateRole::Workset);
+  const int64_t ownership =
+      static_cast<int64_t>(CoordinateRole::PointwiseOwnership);
   const int64_t contractionM =
       static_cast<int64_t>(CoordinateRole::ContractionM);
   const int64_t contractionN =
       static_cast<int64_t>(CoordinateRole::ContractionN);
   SmallVector<unsigned> traversalAxes;
-  unsigned worksetAxes = 0;
+  unsigned outerAxes = 0;
   unsigned contractionMAxes = 0;
   unsigned contractionNAxes = 0;
   bool onlyBatchedContractionRoles = true;
@@ -184,14 +187,15 @@ LogicalResult refineProgramMapping(ModuleOp module) {
     if (role == traversalWorker) {
       traversalAxes.push_back(axis);
     } else {
-      worksetAxes += role == workset;
+      outerAxes += role == workset || role == ownership;
       contractionMAxes += role == contractionM;
       contractionNAxes += role == contractionN;
       onlyBatchedContractionRoles &=
-          role == workset || role == contractionM || role == contractionN;
+          role == workset || role == ownership ||
+          role == contractionM || role == contractionN;
     }
   bool batchedContraction = traversalAxes.empty() &&
-                            onlyBatchedContractionRoles && worksetAxes > 0 &&
+                            onlyBatchedContractionRoles && outerAxes > 0 &&
                             contractionMAxes == 1 && contractionNAxes == 1;
   if (traversalAxes.empty() && !batchedContraction)
     return success();
@@ -200,6 +204,14 @@ LogicalResult refineProgramMapping(ModuleOp module) {
   if (!program || program.getAxis() != 0)
     return mapping.emitOpError(
         "persistent traversal requires one linear program coordinate");
+  if (!program.getResult().hasOneUse())
+    return success();
+  for (Operation &operation : kernel.getBody().front()) {
+    if (&operation == mapping.getOperation())
+      break;
+    if (!isMemoryEffectFree(&operation))
+      return success();
+  }
   auto programSpace = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
   auto segmentOffset =
       mapping->getAttrOfType<PhysicalExprAttr>(segmentOffsetAttr);

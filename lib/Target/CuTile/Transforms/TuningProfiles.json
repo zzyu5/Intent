@@ -17,7 +17,9 @@
       [4]
     ],
     "occupancy_persistent": [
-      [1]
+      [1],
+      [2],
+      [4]
     ],
     "occupancy_legacy": [
       [2]
