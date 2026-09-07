@@ -1,28 +1,51 @@
 schema: comet.native.v4
 name: compiler-cross-target-optimization
 language: zh-CN
-phase: shape
+phase: build
 status: active
-state_version: 1
+state_version: 2
 brief: brief.md
-spec_changes: []
+spec_changes:
+  - capability: compiler-cross-target-optimization
+    operation: create
+    source: specs/compiler-cross-target-optimization/spec.md
 workspace:
   isolation: current
   change_branch: main
   target_branch: main
   finish: null
 loop:
-  stage: shape
+  stage: building
   goal_cycle: 1
-  iteration: 0
+  iteration: 1
   attempt: 0
   retry_epoch: 0
   failed_iteration_count: 0
   no_progress_count: 0
   execution_failure_count: 0
   previous_unresolved_ids: []
-  next_action: confirm-shape
-acceptance: []
+  next_action: submit-builder-candidate
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1：四类横向问题在现有实现中按共同语义和执行结构得到处理；每项实际修复覆盖所有适用位置及已有 target 消费者，共同事实由唯一
+      authority 提供，target-local form 留在对应边界。作者层问题在作者层改进，不以单 kernel 特例或局部性能收益冒充
+      compiler 通用能力。
+    result: pending
+    reason: null
+  - id: A2
+    source: brief.md
+    text: A2：受影响程序的可调 shared/provider 参数形成有限、合法且有意义的完整候选，真实改变相应计算或 provider 选项，由保留的
+      provider JIT/autotuner 编译并按实测耗时选择和复用
+      winner；固定维度或合法性只允许单候选时保持真实限制，无依据的硬收缩、无效组合或重复工作不能成为默认调优策略。
+    result: pending
+    reason: null
+  - id: A3
+    source: brief.md
+    text: A3：Spec 锁定的八个设备条目全部使用现有性能入口完成同算法、同 case 的 generated/source 比较，在原容差内通过且每项
+      G/S <= 1.1；结果随完成写入对应项目 CSV。任何超标或失败均保持该目标未完成，不用平均值、删除条目、放宽容差、更换输入或比较口径代替达标。
+    result: pending
+    reason: null
 builder_handoff: null
 blockers: []
 verification: null

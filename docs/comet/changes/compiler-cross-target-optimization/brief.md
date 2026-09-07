@@ -38,10 +38,11 @@
 - 用户确认允许减少 tuning 数量，但必须保留实际有效的 shared/provider 参数搜索、provider JIT 和实测选优，参考 Triton/TileLang 的真实机制。
 - 旧 cutile-provider-closure-round-six 已按用户明确要求停止归档；其未验收快照不构成新的执行要求。cutile-execution-closure 已完成，本 change 不重开它。
 - 使用当前 main 目录创建一个普通 Native change。四类问题共同涉及作者表达、shared 参数化程序和 target 消费者，性能归因与修复需共同演进，暂不拆 Supervisor 或按 kernel/target 建立独立子任务。
+- 用户已明确确认完整 Shape 并要求进入 Build；三个结果型验收项与锁定的八个设备条目保持不变。
 
 # Open questions
 
-- [blocking] CONFIRM: 确认以本 brief 和完整目标 Spec 进入 Build：四类横向改进、有限真实 tuning/JIT、锁定的八个设备条目逐项 G/S <= 1.1；保持现有容差与精简性能验证，不扩为全 registry 达标或新增测试体系。
+无。
 
 # Verification expectations
 
