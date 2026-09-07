@@ -619,6 +619,9 @@ private:
     std::string tunedKernelName = freshName("_intent_tuned_kernel");
     std::string trialStateName = freshName("_intent_trial_state");
     std::string selectedKernelName = freshName("_intent_selected_kernel");
+    std::string boundGridName = freshName("_intent_bound_grid");
+    std::string boundArgumentsName = freshName("_intent_bound_arguments");
+    std::string boundLaunchName = freshName("_intent_bound_launch");
 
     std::string key = tuneKeyName + " = (";
     for (const ViewABI &view : views)
@@ -682,9 +685,13 @@ private:
                                      &fullCoverageParameterNames, configName) +
                     ", ";
     launchGrid += "1, 1)";
-    line("return ct.launch(" + streamName + ", " + launchGrid + ", " +
-             tunedKernelName + ", (" + joinKernelArguments(configName) + "))",
-         1);
+    line(boundGridName + " = " + launchGrid, 1);
+    line(boundArgumentsName + " = (" + joinKernelArguments(configName) + ")", 1);
+    line("def " + boundLaunchName + "():", 1);
+    line("return ct.launch(torch.cuda.current_stream(), " + boundGridName +
+             ", " + tunedKernelName + ", " + boundArgumentsName + ")", 2);
+    line(boundLaunchName + "()", 1);
+    line("return " + boundLaunchName, 1);
     output << "\n";
   }
 
