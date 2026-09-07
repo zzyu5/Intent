@@ -1515,6 +1515,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
   kernel.walk([&](gpu::AssumeInBoundsOp op) { assumptions.push_back(op); });
   auto capabilities =
       kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+  bool matrixCompute = hasMatrixTileCompute(kernel);
   if (!scaledContracts.empty() && !supportsE8M0ScaledMMA(capabilities))
     return scaledContracts.front().emitOpError(
         "cuTile E8M0 scaled MMA requires compute capability 10.0 or newer");
@@ -1523,7 +1524,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
                                  occupancyParameter, gpu::ParameterRole::ProviderOccupancy,
                                  isLegalOccupancy)))
     return failure();
-  if (hasMatrixTileCompute(kernel) &&
+  if (matrixCompute &&
       failed(declareProviderHint(kernel, profiles, "ctas", ctasParameter,
                                  gpu::ParameterRole::ProviderCTAs, isLegalCTAs)))
     return failure();
@@ -1642,6 +1643,8 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
       continue;
     }
     auto result = cast<gpu::FragmentType>(load.getResult().getType());
+    // Vector inputs stay register loads, not cluster TMA payloads.
+    bool vectorInput = matrixCompute && result.getShape().size() == 1;
     gpu::PhysicalAccessBoundaryFact boundary =
         analysis.boundaryValidity(load);
     FailureOr<NativeTileAccessPlan> plan = analyzeNativeTileAccess(
@@ -1649,7 +1652,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
         load.getSourceAxes(), result);
     FailureOr<MaterializedTileIndices> indices = failure();
     FailureOr<Value> originGuard = failure();
-    if (succeeded(plan) && boundary.isExact() &&
+    if (!vectorInput && succeeded(plan) && boundary.isExact() &&
         (!load.getFill() || isZeroFill(load.getFill())))
       indices = materializeTileIndices(builder, load, *plan,
                                        /*allowDynamicAlignment=*/true);
