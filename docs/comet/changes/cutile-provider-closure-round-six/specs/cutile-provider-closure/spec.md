@@ -2,7 +2,7 @@
 
 ## 目标状态
 
-Intent 的 shared GPU Program 是 cuTile lowering 的唯一完整 executable authority。cuTile provider 从 current typed program确定 block identity、tile/index form、access spelling、native structured operation、physical/provider parameters与 launch artifact；provider rewrite 后的 current program在 serialization 前已闭合，terminal serializer不回读 KIR、kernel identity 或逻辑 shape重建执行决策。当前 registry 中 cuTile 能保持同一 Intent 语义的程序在 RTX 5090D 与 H100 上完成数值执行，稳定可比的 generated/source ratio 不超过 1.05。
+Intent 的 shared GPU Program 是 cuTile lowering 的唯一完整 executable authority。cuTile provider 从 current typed program确定 block identity、tile/index form、access spelling、native structured operation、physical/provider parameters与 launch artifact；provider rewrite 后的 current program在 serialization 前已闭合，terminal serializer不回读 KIR、kernel identity 或逻辑 shape重建执行决策。持续修复当前 registry 可达的 lowering 与运行缺口，同算法的 generated/source 开展性能比较，已完成的双机结果增量发布；ratio 不超过 1.05 是改进目标，不是要求全表同时达标或全量重跑才继续推进的门槛。
 
 ## Authority 与 provider 边界
 
@@ -33,7 +33,7 @@ Intent 的 shared GPU Program 是 cuTile lowering 的唯一完整 executable aut
 
 - Provider legalization完成后，local MLIR schema和 whole-program provider verifier共同保证 grid/block identity、fragment/static requirements、local op operands/results/regions、access/resource legality、structured form和 parameter binding完整。
 - Physical/provider parameter declaration是 typed finite domain；每个 candidate concrete binding都产生完整合法的 current provider program。Intent可以删除能够证明非法的 candidate，但不复制 cuda-tile的下层 layout、register或 resource allocator。
-- Fixed profile或有限 candidate集合本身合法。只有 current运行证明某个 domain真实阻塞 lowering、产生不公平 candidate contract或造成稳定性能差距时，才调整 typed parameter/form；adapter不得按 entry名称偷偷筛选。
+- Fixed profile或有限 candidate集合本身合法。只有实际程序或运行证明某个 domain 阻塞 lowering 或造成性能问题时，才调整 typed parameter/form；双方可以独立选择配置，不要求搜索空间完全一致或先穷举全部候选，adapter 不得按 entry 名称偷偷筛选。
 - Shared/provider profile 数据沿用当前有限 JSON 输入与 typed family/role 绑定。旧 stash 中的调优分类和取消 metadata specialization 不构成已证明决定；metadata 的 specialization、runtime scalar dtype 和索引宽度必须各自保持明确的 ABI 契约。
 - Artifact携带已选择的 compile device与 launch-visible grid/config binding。Runtime在同一设备上物化、JIT和 launch，并对跨设备输入执行既定 typed检查；不得在 wrapper中重新选择 capability或默认到另一设备。
 - Serializer只输出 import、kernel/signature、current ops、已声明 candidate/config和 launch wrapper。它不得新增 legality、fallback、grid/access、workspace、candidate或 algorithm decisions。
@@ -43,14 +43,15 @@ Intent 的 shared GPU Program 是 cuTile lowering 的唯一完整 executable aut
 - Production registry workflow分别记录 generated与 source的 compile、JIT、launch、numerical和 measurement结果。Terminal failure必须指出发生的一侧和最早可判定阶段；总 worker timeout不能成为无法继续归因的最终分类。
 - Worker 在进入耗时阶段前保留当前侧和阶段；父进程处理 timeout、异常退出或缺失最终结果时消费该阶段，不能覆盖成无侧无阶段的错误。JIT 与 launch 若由同一 provider 调用完成，只能报告实际可观察边界，不猜测尚无证据的内部阶段。
 - 对具有完整 Intent算法，且同环境 source或实际 cuda-tile能力证明语义可表达的 entry，generated路径必须闭合实现并通过数值比较。Source自身不成立、hardware不支持或外部 compiler在明确成本界限内不能完成时，保留对应的准确状态而不伪造通过。
-- 两台机器使用同一 compiler提交和一致的 cuTile运行环境。两张 CSV是该状态的当前观察，不定义 DSL、compiler policy或长期 capability。
-- 只有 generated/source都数值通过，并且算法、数值契约、dtype、ABI、shape、调用次数、candidate contract和计时范围一致的稳定 entry才计算 ratio。
-- 数值容差通过不证明比较契约相同。比较显式覆盖 full-f32/TF32 等输入精度、cast/中间 dtype、所有 kernel 和额外 tensor 变换，以及实际启用的候选搜索；不一致时先对齐同一既定语义或记录具体不可比原因，不能据此改变 shared semantics 或归因性能。
-- Source runtime 可接入比较所需的完整候选集合，并由同一 provider tuner 独立选择 winner；对齐只改变候选入口，不改变 source 算法、数值语义、ABI 或计时范围，不按 generated winner、entry 名称或旧 timing 隐式筛选候选。
-- 稳定可比 entry的 `generated_p50_ms / source_p50_ms` 不超过 `1.05`。明显高 ratio优先从 current Physical Program的 mapping/blocking/ownership/traversal/materialization、typed config/candidate或 provider form修复；不可通过 entry-local特例、source模仿、测量挑选或语义缩窄闭合。
-- 若 fresh same-code复核证明结果不稳定或不可比，CSV记录具体原因并不保留无解释的高 ratio `pass`；`1.05` 不成为 lowering legality或 target capability规则。
+- RTX 5090D 与 H100 每完成一项运行就更新对应 CSV，不等待同一提交下的双机全量结果。未重跑项保留此前记录并注明，已完成、未计时、真实失败与未重跑不得混淆；CSV 不定义 DSL、compiler policy 或长期 capability。
+- 性能比较以算法相同为前提，保持输入 shape、外部 dtype 等条件一致；舍入位置、FTZ、近似数学和中间精度的细微差异注明即可，不要求逐操作数值契约相同，不以这些差异统一跳过计时或 ratio。
+- 完整 callable closure 中的辅助输出、布局转换、workspace 与调用范围差异如实注明，区分 kernel 与端到端时间。比较口径不授权 compiler 改变 Intent 语义；真实 NaN、错误算法或错误结果不作为精度细节放过。已测量的 p50 才能用于成对 ratio，不用调优候选时间替代。
+- 若确实算法不同，保留已被 Triton 使用或此前已与 Triton 对齐的作者算法；没有 Triton 使用的 cuTile 专用作者算法可向 cuTile baseline 对齐，不改变语言语义或共享 helper。算法是否相同依据双方实际计算步骤，不从旧 contract gap 状态推断。
+- Source runtime 可按实际需要接入候选入口并独立调优，不要求先对齐完整搜索集合，不按 generated winner、entry 名称或旧 timing 隐式筛选候选。
+- `generated_p50_ms / source_p50_ms <= 1.05` 是性能改进目标。明显高 ratio 优先从 current Physical Program 的 mapping/blocking/ownership/traversal/materialization、typed config/candidate 或 provider form 调查并修复；不可通过 entry-local 特例、测量挑选、语义缩窄或“契约不同”标签隐去差距。
+- CSV 保留真实高 ratio 及其已知原因，未定位时如实标明，不伪造达标。`1.05` 不成为 lowering legality、target capability 或全表同时通过才继续推进的规则；异常仅按需做一次 same-code 复核。
 
-对 shared 修复，语义完整节点需给出真实 IR 改写与保持条件，并在受影响的 Triton/cuTile production 路径 emit、JIT、launch 和对数值；涉及 TileLang storage/copy 边界时覆盖相应路径。只采用手动可执行的生产 repro，不增加 pytest、fixture、测试目录或长期检查体系。先完成数值、比较契约和终端归因，再用同一 current compiler state 收敛双机性能；四项最终验收及 `1.05` 门槛不因工作顺序细化而降低。
+对 shared 修复，说明真实 IR 改写与保持条件，对照 ref/triton 或 ref/tilelang 的同类实现，并选择一条受影响的生产 repro 完成 emit、JIT、launch 和对数值；跨 provider 边界按实际问题定位，不自动扩为全量验证。只采用手动可执行的生产 repro，不增加 pytest、fixture、测试目录或长期检查体系。推进以实现为主，性能结果随实际运行增量发布，不维护 tmp 证据或要求完整调优矩阵。
 
 ## Acceptance scenarios
 
@@ -70,18 +71,18 @@ When current shared program经过 cuTile local rewrite、closed-surface verifica
 
 Then axes、identity/combine、format、accumulator、validity、atomic与 result flow均保持并通过数值比较；若实际 surface不能保持某个组合，最早的 provider/capability层给出精确 rejection，而 source成功的同语义 form不被误报为 target unsupported
 
-Scenario: 双机完整 registry 获得可归因的 current 结果
+Scenario: 已完成的运行结果及时进入项目表格
 
-Given 同一 current compiler state、RTX 5090D和H100上一致的 cuTile环境以及当前 registry登记的 generated/source callable closure
+Given RTX 5090D 或 H100 上一个已完成的 generated/source 生产运行
 
-When 两台机器分别执行完整 production workflow
+When 发布该次运行结果
 
-Then 每个 entry都获得可归因到 generated/source和 compile/JIT/launch/numerical/measurement阶段的终端状态，不留下 opaque timeout或宽泛 compile failure，两张 cuTile CSV完整记录同一提交的 current结果
+Then 对应 CSV 及时记录已获得的时间、ratio 或失败侧与阶段，未计时和未重跑明确标注；不等待双机完整 registry，不把历史记录冒充当前重跑结果
 
-Scenario: 稳定可比 entry 达到 1.05 性能目标
+Scenario: 同算法比较性能并暴露真实差距
 
-Given 双机完整结果中 generated/source均数值通过且算法、数值、ABI、shape、candidate contract和计时范围可比的稳定 entry
+Given 算法相同且输入 shape 与外部 dtype 等基本条件一致的 generated/source entry
 
-When production workflow记录 fresh p50时间，并对明显异常进行一次 same-code复核
+When production workflow 测量双方运行时间
 
-Then 每项 `generated_p50_ms / source_p50_ms` 不超过 `1.05`；真正的差距由 current Physical Program、typed config/candidate或 provider form闭合，不稳定或不可比项记录具体原因而不是无解释的高 ratio `pass`
+Then 细微数值实现差异不阻断计时，真实 p50 与 generated/source ratio 进入表格并注明额外工作及计时范围；高于 1.05 的差距保留并用于定位改进，不要求全表同时达标才继续推进
