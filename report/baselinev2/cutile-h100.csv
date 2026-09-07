@@ -10,27 +10,27 @@ dense_attention_forward,B2-QH32-KVH8-S4096-D128-bf16-causal,17.663232,5.391896,3
 grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,3.946936,0.192288,20.526170,pass,同算法；source 使用 FTZ 与近似除法
 swiglu,8192x14336-bf16,0.465352,0.412576,1.127918,pass,同算法；source 使用 FTZ 与近似除法
 splitk_attention_reduce,B8-H32-S8192-splits16-D128,0.011264,0.011120,1.012950,pass,
-mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,,,,timing_not_measured,同算法：latent 与 RoPE attention；FTZ 与近似除法差异；旧门禁跳过计时
+mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,11.134376,0.804592,13.838536,pass,同算法；source 使用 FTZ 与近似除法
 batched_gemm,B32-M512-N512-K1024-bf16,0.078960,0.079424,0.994158,pass,
 tilegym_dense_gemm,M8192-N11008-K4096-bf16,2.463600,3.951752,0.623420,pass,
-grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,,,,timing_not_measured,同算法：grouped GEMM；device offsets 与 host group shapes 表示不同；计时范围需注明；旧门禁跳过计时
-moe_alignment,T4096-top2-E64,,,,timing_not_measured,同算法：计数/前缀和/散射；不是排序对计数算法；辅助输出与初始化计时需注明；旧门禁跳过计时
-mhc_gemm_rms_scale,T2048-H4096-streams4-bf16,,,,timing_not_measured,同算法：split-K GEMM 与 RMS/scale；除法与乘倒数差异；旧门禁跳过计时
-chunked_softmax,8192x32768-bf16,,,,numerical_comparison_process_failed,大输出的全量 f32 比较临时张量导致显存不足；正在改为分块检查
-rope_qk,B2-S4096-QH32-KVH8-D128-bf16,,,,timing_not_measured,同算法：RoPE half rotation；中间精度不同；保留 Triton 同族算法；旧门禁跳过计时
+grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.828880,0.821912,1.008478,pass,同算法；source 使用 host group shapes
+moe_alignment,T4096-top2-E64,0.051280,0.089608,0.572270,pass,同算法计数/前缀和/散射；初始化与辅助输出计入调用
+mhc_gemm_rms_scale,T2048-H4096-streams4-bf16,0.142152,0.175896,0.808159,pass,同算法；source 用乘倒数实现归一化
+chunked_softmax,8192x32768-bf16,8.066632,4.299944,1.875985,pass,
+rope_qk,B2-S4096-QH32-KVH8-D128-bf16,0.127776,0.116016,1.101365,pass,同算法；source 保留 bf16 中间舍入
 gelu,8192x4096-fp16-tanh,0.102240,0.107968,0.946947,pass,同算法；source 保留 f16 中间舍入
 geglu,4096x28672-fp16-tanh,0.255816,0.446792,0.572562,pass,同算法；source 保留 f16 中间舍入
 relu,8192x4096-fp16,0.088552,0.088456,1.001085,pass,同算法；NaN 传播方式不同
 dropout,8192x4096-fp16-p0.1,0.098424,0.098216,1.002118,pass,
-attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,,,,timing_not_measured,同算法：causal GQA 与 attention sink；精度及 source 布局拷贝差异；计时范围需注明；旧门禁跳过计时
-attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,,,,timing_not_measured,同算法：split-K GQA 与 attention sink；bf16 LSE 及 source K/V 布局拷贝差异；计时范围需注明；旧门禁跳过计时
-mhc_apply_residual,T2048-H4096-streams4-bf16,,,,timing_not_measured,同算法：residual mixing；bf16 中间累加舍入差异；旧门禁跳过计时
-gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,,,,timing_not_measured,同算法：windowed GQA 与 softcap；近似数学和舍入差异；旧门禁跳过计时
-gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,,,,timing_not_measured,同算法：split-K windowed GQA 与 softcap；近似数学和舍入差异；旧门禁跳过计时
-mhc_sinkhorn,T8192-streams4-fp32,,,,timing_not_measured,同算法：指数初始化后反复行列归一化；exp2(x·log2(e)) 与 exp(x) 数学等价；旧门禁跳过计时
+attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,9.417656,0.994728,9.467569,pass,同算法；source 的布局转换与辅助工作计入其调用时间
+attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,6.420880,9.956544,0.644890,pass,同算法；source 使用 bf16 LSE 与近似除法
+mhc_apply_residual,T2048-H4096-streams4-bf16,0.174048,0.103424,1.682859,pass,同算法；source 保留 bf16 中间累加
+gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,5.794536,0.758928,7.635159,pass,同算法；中间精度和舍入不同
+gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,17.861472,0.665744,26.829340,pass,同算法；中间精度和舍入不同
+mhc_sinkhorn,T8192-streams4-fp32,0.081016,0.081136,0.998521,pass,同算法；source 用 exp2(x * log2(e)) 实现 exp
 absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,1.872464,0.655816,2.855167,pass,同算法；source 使用近似除法并额外输出 LSE
-splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,,,,physical_program_verification_failed,同算法：split-K MLA 与分片合并；workspace 表示不同；本轮未运行到此项；保留此前记录
-sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,,,,physical_program_verification_failed,同算法：选择 token 的 latent 与 RoPE attention；本轮未运行到此项；保留此前记录
+splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,3.290104,0.224536,14.652901,pass,同算法；source 使用 FTZ 与近似除法
+sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,4.998200,308.888641,0.016181,pass,同算法；source 使用 FTZ 与近似除法
 sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,,,,worker_timeout,同算法：causal window GQA；source 含 KV 扩展与布局转换；本轮未运行到此项；保留此前记录
 rms_norm,8192x4096-bf16,0.050616,0.050896,0.994499,pass,同算法：mean-square 与 rsqrt/weight；source 额外 Rstd 输出；本轮未运行到此项；保留此前记录
 recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,2.859456,3.024832,0.945327,pass,已完成的单项运行结果

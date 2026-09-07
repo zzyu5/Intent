@@ -32,7 +32,7 @@ absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,1.254616,2.061088,0.608715,pass,�
 splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,0.442304,0.328184,1.347732,pass,同算法；source 使用 FTZ 与近似除法
 sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,0.998648,33.752392,0.029587,pass,同算法；source 使用 FTZ 与近似除法
 sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,1.195072,0.833264,1.434206,pass,同算法；source 的布局转换与辅助工作计入其调用时间
-rms_norm,8192x4096-bf16,0.087688,0.085776,1.022291,pass,同算法：mean-square 与 rsqrt/weight；source 额外 Rstd 输出；本轮未运行到此项；保留此前记录
-recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,0.787256,0.936160,0.840942,pass,已完成的单项运行结果
-chunk_gated_delta,B2-S2048-H8-K128-V128-C64-bf16,,,,generated_physical_program_verification_failed,
+rms_norm,8192x4096-bf16,0.087688,0.085776,1.022291,pass,同算法；source 额外写 Rstd
+recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,0.787256,0.936160,0.840942,pass,
+chunk_gated_delta,B2-S2048-H8-K128-V128-C64-bf16,10.012704,1.553088,6.446965,pass,同算法；中间精度和舍入不同
 nvfp4_quantize,8192x4096-block16-bf16,1.124128,0.057072,19.696663,pass,同算法、group16；双方计时均为一次 kernel launch，不含输出分配

@@ -213,6 +213,18 @@ bool isOnlineMomentOwnership(func::FuncOp kernel, ParameterOp parameter) {
   return found;
 }
 
+bool isContractionOwnership(func::FuncOp kernel, ParameterOp parameter) {
+  auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());
+  if (role != ParameterRole::OwnershipM && role != ParameterRole::OwnershipN)
+    return false;
+  StringAttr name = parameter.getParameter().getName();
+  bool found = false;
+  kernel.walk([&](ContractOp contract) {
+    found |= fragmentReferencesParameter(contract.getResult().getType(), name);
+  });
+  return found;
+}
+
 bool isStatefulReduction(func::FuncOp kernel, ParameterOp parameter) {
   auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());
   if (role != ParameterRole::Reduction)
@@ -262,6 +274,8 @@ TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
   case ParameterCategory::Pointwise:
     if (isOnlineMomentOwnership(kernel, parameter))
       return TuningClass::OnlineMoment;
+    if (isContractionOwnership(kernel, parameter))
+      return TuningClass::Contraction;
     return isBlockedReductionFreeAxis(kernel, parameter)
                ? TuningClass::PointwiseReduction
                : TuningClass::Pointwise;
