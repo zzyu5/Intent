@@ -1,5 +1,7 @@
 # Outcome
 
+本 change 已按用户要求停止推进，剩余问题由 [cutile-execution-closure](../cutile-execution-closure/brief.md) 承接。以下正文保留历史范围，不再作为新 change 的执行要求；本 change 未经最终验收，不宣称已完成。
+
 在不改变 DSL 与 canonical KIR 语义的前提下，推进 shared GPU Program 到 cuTile provider/runtime 的唯一 executable path，修复实际可达的 lowering 与运行缺口。Generated/source 算法相同即可开展性能比较，细微数值实现差异和额外包装工作如实注明，不统一阻断计时；已完成的 RTX 5090D 与 H100 结果及时写入项目 CSV。`generated_p50_ms / source_p50_ms <= 1.05` 保留为性能改进目标，不以双机全量重跑或所有条目同时达标作为继续推进、更新表格的前提。每项改动的 shared 或 provider-local 归属由真实输入程序、语义缺口和 reference 决定，不预设必须只改 leaf，也不重新制造 shared/core 或 Serializer 权威。
 
 # Scope
