@@ -32,6 +32,11 @@ SmallVector<TileLoadOp> matrixLoads(Value root, scf::ForOp loop) {
       pending.push_back(transpose.getValue());
     } else if (auto cast = dyn_cast<gpu::CastOp>(producer)) {
       pending.push_back(cast.getValue());
+    } else if (auto broadcast = dyn_cast<gpu::BroadcastOp>(producer)) {
+      pending.push_back(broadcast.getValue());
+    } else if (auto select = dyn_cast<gpu::SelectOp>(producer)) {
+      pending.push_back(select.getTrueValue());
+      pending.push_back(select.getFalseValue());
     } else if (auto choice = dyn_cast<scf::IfOp>(producer)) {
       unsigned index = mlir::cast<OpResult>(value).getResultNumber();
       for (Region &region : choice->getRegions()) {
@@ -53,6 +58,15 @@ LogicalResult refineMMALoops(ModuleOp module) {
   physicalKernel->walk<WalkOrder::PostOrder>(
       [&](scf::ForOp loop) { loops.push_back(loop); });
   for (scf::ForOp loop : loops) {
+    loop.walk([&](MMAOp mma) {
+      if (mma->getParentOfType<scf::ForOp>() != loop)
+        return;
+      for (Value operand : {mma.getLhs(), mma.getRhs()})
+        for (TileLoadOp load : matrixLoads(operand, loop))
+          if (!load.getLatency())
+            load.setLatencyAttr(IntegerAttr::get(
+                IntegerType::get(module.getContext(), 64), 3));
+    });
     auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
     for (auto [index, argument] : llvm::enumerate(loop.getRegionIterArgs())) {
       auto original = dyn_cast<gpu::FragmentType>(argument.getType());
@@ -78,16 +92,6 @@ LogicalResult refineMMALoops(ModuleOp module) {
           matrix.getShape().getValue() !=
               original.getShape().getValue().drop_front())
         continue;
-      auto loads = matrixLoads(mma.getLhs(), loop);
-      auto rightLoads = matrixLoads(mma.getRhs(), loop);
-      if (loads.empty() || rightLoads.empty())
-        continue;
-      loads.append(rightLoads);
-      if (llvm::any_of(loads, [](TileLoadOp load) {
-            return load.getLatency() && *load.getLatency() != 3;
-          }))
-        continue;
-
       // Project only at the loop boundaries; the native MMA carries a matrix.
       OpBuilder before(loop);
       auto init = before.create<gpu::ReshapeOp>(
@@ -107,8 +111,6 @@ LogicalResult refineMMALoops(ModuleOp module) {
       auto restored = after.create<gpu::ReshapeOp>(
           loop.getLoc(), original, result, restoreRelation);
       result.replaceAllUsesExcept(restored.getResult(), restored.getOperation());
-      for (TileLoadOp load : loads)
-        load.setLatencyAttr(before.getI64IntegerAttr(3));
     }
   }
   return success();

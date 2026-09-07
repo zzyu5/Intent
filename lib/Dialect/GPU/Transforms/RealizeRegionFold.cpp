@@ -1104,14 +1104,6 @@ FailureOr<Value> coRealizeOnlineRegion(
       location, probabilityCast.getType(), directProbability.getResult());
   if (Attribute origin = plan.summary.probabilityCast->getAttr(originAttr))
     directProbabilityCast->setAttr(originAttr, origin);
-  auto directMoment = builder.create<ContractOp>(
-      location, mappedMoment.getResult().getType(), directProbabilityCast,
-      mappedMoment.getRhs(), mappedMoment.getAccumulator(),
-      mappedMoment.getLhsReductionAxes(), mappedMoment.getRhsReductionAxes(),
-      mappedMoment.getLhsBatchAxes(), mappedMoment.getRhsBatchAxes());
-  if (Attribute origin = mappedMoment->getAttr(originAttr))
-    directMoment->setAttr(originAttr, origin);
-
   auto mappedRecord = mergedRecord.getDefiningOp<MakeRecordOp>();
   if (!mappedRecord)
     return failure();
@@ -1123,17 +1115,25 @@ FailureOr<Value> coRealizeOnlineRegion(
   FailureOr<Value> projectedMass = projectPhysicalValueToSchema(
       builder, location, directMass.getResult(0), massType);
   FailureOr<Value> projectedLeftMoment = projectPhysicalValueToSchema(
-      builder, location, leftMomentTerm, momentType);
+      builder, location, leftMomentTerm, mappedMoment.getResult().getType());
+  if (failed(projectedLeftMass) || failed(projectedMass) ||
+      failed(projectedLeftMoment))
+    return failure();
+  // The matched moment has a zero accumulator. Keep the ordered left carry
+  // inside the contraction instead of materializing a second matrix and add.
+  auto directMoment = builder.create<ContractOp>(
+      location, mappedMoment.getResult().getType(), directProbabilityCast,
+      mappedMoment.getRhs(), *projectedLeftMoment,
+      mappedMoment.getLhsReductionAxes(), mappedMoment.getRhsReductionAxes(),
+      mappedMoment.getLhsBatchAxes(), mappedMoment.getRhsBatchAxes());
+  if (Attribute origin = mappedMoment->getAttr(originAttr))
+    directMoment->setAttr(originAttr, origin);
   FailureOr<Value> projectedMoment = projectPhysicalValueToSchema(
       builder, location, directMoment.getResult(), momentType);
-  if (failed(projectedLeftMass) || failed(projectedMass) ||
-      failed(projectedLeftMoment) || failed(projectedMoment))
+  if (failed(projectedMoment))
     return failure();
   Value combinedMass = builder.create<BinaryOp>(
       location, massType, *projectedLeftMass, *projectedMass,
-      BinaryOperator::Add);
-  Value combinedMoment = builder.create<BinaryOp>(
-      location, momentType, *projectedLeftMoment, *projectedMoment,
       BinaryOperator::Add);
 
   SmallVector<Value> fields;
@@ -1145,7 +1145,7 @@ FailureOr<Value> coRealizeOnlineRegion(
       continue;
     }
     if (field == plan.summary.momentField) {
-      fields.push_back(combinedMoment);
+      fields.push_back(*projectedMoment);
       continue;
     }
     Value mapped = mergeValue(original);
@@ -2080,20 +2080,29 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
       location, lower, upper, segment.getResult(), initial,
       [&](OpBuilder &nested, Location nestedLocation, Value offset,
           ValueRange carries) {
+        IRMapping summaryMapping;
         FailureOr<SmallVector<Value>> summary = emitSummary(
             nested, nestedLocation, offset, fullSegment, predicateIsTrue,
-            /*summaryIsNonempty=*/false, /*summaryMapping=*/nullptr);
+            /*summaryIsNonempty=*/false, online ? &summaryMapping : nullptr);
         if (failed(summary)) {
           bodyFailed = true;
           return;
         }
         SmallVector<Value> combineArguments(carries.begin(), carries.end());
         combineArguments.append(summary->begin(), summary->end());
+        IRMapping mergeMapping;
         FailureOr<SmallVector<Value>> combined = inlinePureRegion(
-            nested, fold.getCombine(), combineArguments, failureReason);
+            nested, fold.getCombine(), combineArguments, failureReason,
+            {}, {}, {}, {}, {}, {}, online ? &mergeMapping : nullptr);
         if (failed(combined)) {
           bodyFailed = true;
           return;
+        }
+        if (online) {
+          FailureOr<Value> direct = coRealizeOnlineRegion(
+              nested, nestedLocation, *online, summaryMapping, mergeMapping);
+          if (succeeded(direct))
+            combined->front() = *direct;
         }
         nested.create<scf::YieldOp>(nestedLocation, *combined);
       });

@@ -837,6 +837,77 @@ LogicalResult markNativeCoverage(func::FuncOp kernel,
   return success();
 }
 
+bool isZeroScalar(Value value);
+
+Value stripCoverageProjection(Value value) {
+  while (Operation *producer = value.getDefiningOp()) {
+    if (auto broadcast = dyn_cast<BroadcastOp>(producer))
+      value = broadcast.getValue();
+    else if (auto reshape = dyn_cast<ReshapeOp>(producer))
+      value = reshape.getValue();
+    else if (auto transpose = dyn_cast<TransposeOp>(producer))
+      value = transpose.getValue();
+    else if (auto splat = dyn_cast<SplatOp>(producer))
+      value = splat.getValue();
+    else
+      break;
+  }
+  return value;
+}
+
+bool impliesLogicalUpperBound(Value predicate, MakeRangeOp range,
+                               llvm::SmallDenseSet<Value> &visited) {
+  if (!predicate || !visited.insert(predicate).second)
+    return false;
+  predicate = stripCoverageProjection(predicate);
+  if (isZeroScalar(predicate))
+    return true;
+  if (auto binary = predicate.getDefiningOp<BinaryOp>())
+    if (binary.getOperatorKind() == BinaryOperator::LogicalAnd ||
+        binary.getOperatorKind() == BinaryOperator::BitwiseAnd)
+      return impliesLogicalUpperBound(binary.getLhs(), range, visited) ||
+             impliesLogicalUpperBound(binary.getRhs(), range, visited);
+  auto compare = predicate.getDefiningOp<CompareOp>();
+  if (!compare || compare.getPredicate() != ComparePredicate::Lt)
+    return false;
+  Value coordinate = stripCoverageProjection(compare.getLhs());
+  Value bound = stripCoverageProjection(compare.getRhs());
+  auto coordinateRange = coordinate.getDefiningOp<MakeRangeOp>();
+  return coordinateRange && sameLogicalRange(coordinateRange, range) &&
+         samePhysicalScalarExpression(coordinateRange.getStart(), range.getStart()) &&
+         samePhysicalScalarExpression(coordinateRange.getExtent(), range.getExtent()) &&
+         samePhysicalScalarExpression(bound, range.getLogicalStop());
+}
+
+bool isZeroPastLogicalEnd(Value value, MakeRangeOp range) {
+  while (true) {
+    value = stripCoverageProjection(value);
+    if (auto cast = value.getDefiningOp<CastOp>()) {
+      value = cast.getValue();
+      continue;
+    }
+    break;
+  }
+  if (isZeroScalar(value))
+    return true;
+  Value valid;
+  Value fill;
+  if (auto load = value.getDefiningOp<LoadOp>()) {
+    valid = load.getValid();
+    fill = load.getFill();
+  } else if (auto gather = value.getDefiningOp<GatherOp>()) {
+    valid = gather.getValid();
+    fill = gather.getFill();
+  } else if (auto select = value.getDefiningOp<SelectOp>()) {
+    valid = select.getCondition();
+    fill = select.getFalseValue();
+  }
+  if (!fill || !isZeroScalar(fill))
+    return false;
+  llvm::SmallDenseSet<Value> visited;
+  return impliesLogicalUpperBound(valid, range, visited);
+}
+
 LogicalResult neutralizeFullCoverageOperand(ContractOp contract,
                                             OpOperand &operand,
                                             ArrayRef<int64_t> axes,
@@ -856,6 +927,11 @@ LogicalResult neutralizeFullCoverageOperand(ContractOp contract,
     if (failed(stop))
       return contract.emitOpError(
           "full-coverage contraction tail has no logical bound");
+    // Preserve a proven zero extension instead of materializing a second mask.
+    // Derived operations such as exp do not preserve it and still need the
+    // explicit contraction identity below.
+    if (isZeroPastLogicalEnd(source, *range))
+      continue;
     OpBuilder builder(contract);
     Location location = contract.getLoc();
     auto coordinateType = range->getResult().getType();
