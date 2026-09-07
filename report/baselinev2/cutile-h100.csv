@@ -34,5 +34,5 @@ sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,4.998200,308.888641,0
 sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,4.569648,1.232136,3.708721,pass,同算法；source 的布局转换与辅助工作计入其调用时间
 rms_norm,8192x4096-bf16,0.050616,0.050896,0.994499,pass,同算法；source 额外写 Rstd
 recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,2.859456,3.024832,0.945327,pass,
-chunk_gated_delta,B2-S2048-H8-K128-V128-C64-bf16,52.664827,1.549592,33.986254,pass,同算法；中间精度和舍入不同
+chunk_gated_delta,B2-S2048-H8-K128-V128-C64-bf16,0.663368,4.617560,0.143662,pass,同算法；generated 使用 BF16 矩阵输入、FP32 累加与状态，source 使用 TF32 矩阵输入
 nvfp4_quantize,8192x4096-block16-bf16,,,,source_hardware_unsupported,generated 已编译运行；cuTile source 的 float4_e2m1fn/pack_to_bytes 不支持 SM90

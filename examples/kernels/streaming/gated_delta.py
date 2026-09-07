@@ -107,10 +107,8 @@ def chunk_gated_delta_prepare(
                 lower = local[:, None] >= local[None, :]
                 strict_lower = local[:, None] > local[None, :]
                 identity = I.cast(local[:, None] == local[None, :], I.f32)
-                key_values = I.cast(
-                    key[batch, source_positions, head, key_dimensions],
-                    I.f32,
-                )
+                key_input = key[batch, source_positions, head, key_dimensions]
+                key_values = I.cast(key_input, I.f32)
                 beta_values = I.cast(beta[batch, source_positions, head], I.f32)
                 gate_values = I.cast(gate[batch, source_positions, head], I.f32)
                 gate_prefix = I.cumsum(
@@ -124,8 +122,8 @@ def chunk_gated_delta_prepare(
                 )
                 weighted_keys = key_values * beta_values[:, None]
                 base = I.matmul(
-                    weighted_keys,
-                    key_values,
+                    I.cast(weighted_keys, I.bf16),
+                    key_input,
                     transpose_rhs=True,
                     acc_dtype=I.f32,
                 )
@@ -144,14 +142,15 @@ def chunk_gated_delta_prepare(
                     inverse = identity + triangular
                     power = triangular
                     for _ in range(1, 6):
+                        power_input = I.cast(power, I.bf16)
                         power = I.matmul(
-                            power,
-                            power,
+                            power_input,
+                            power_input,
                             acc_dtype=I.f32,
                         )
                         inverse = I.matmul(
-                            inverse,
-                            identity + power,
+                            I.cast(inverse, I.bf16),
+                            I.cast(identity + power, I.bf16),
                             acc_dtype=I.f32,
                         )
                 else:
@@ -180,14 +179,15 @@ def chunk_gated_delta_prepare(
                     value[batch, source_positions, head, value_dimensions],
                     I.f32,
                 )
+                inverse_input = I.cast(inverse, I.bf16)
                 corrected = I.matmul(
-                    inverse,
-                    value_values * beta_values[:, None],
+                    inverse_input,
+                    I.cast(value_values * beta_values[:, None], I.bf16),
                     acc_dtype=I.f32,
                 )
                 cumulative_key = I.matmul(
-                    inverse,
-                    weighted_keys * I.exp(gate_prefix)[:, None],
+                    inverse_input,
+                    I.cast(weighted_keys * I.exp(gate_prefix)[:, None], I.bf16),
                     acc_dtype=I.f32,
                 )
                 query_values = I.cast(
@@ -201,9 +201,7 @@ def chunk_gated_delta_prepare(
                 query_chunks[batch, head, source_positions, key_dimensions] = (
                     query_values
                 )
-                key_chunks[batch, head, source_positions, key_dimensions] = I.cast(
-                    key_values, I.bf16
-                )
+                key_chunks[batch, head, source_positions, key_dimensions] = key_input
                 corrected_values[
                     batch,
                     head,
@@ -245,24 +243,18 @@ def chunk_gated_delta_recurrence(
                 source_positions = I.indices(chunk_positions)
                 local = source_positions - chunk_begin
                 causal = local[:, None] >= local[None, :]
-                query = I.cast(
-                    query_chunks[
-                        batch,
-                        head,
-                        source_positions,
-                        key_dimensions,
-                    ],
-                    I.f32,
-                )
-                key = I.cast(
-                    key_chunks[
-                        batch,
-                        head,
-                        source_positions,
-                        key_dimensions,
-                    ],
-                    I.f32,
-                )
+                query = query_chunks[
+                    batch,
+                    head,
+                    source_positions,
+                    key_dimensions,
+                ]
+                key = key_chunks[
+                    batch,
+                    head,
+                    source_positions,
+                    key_dimensions,
+                ]
                 corrected = I.cast(
                     corrected_values[
                         batch,
@@ -272,25 +264,26 @@ def chunk_gated_delta_recurrence(
                     ],
                     I.f32,
                 )
-                cumulative_key = I.cast(
-                    cumulative_keys[
-                        batch,
-                        head,
-                        source_positions,
-                        key_dimensions,
-                    ],
-                    I.f32,
-                )
+                cumulative_key = cumulative_keys[
+                    batch,
+                    head,
+                    source_positions,
+                    key_dimensions,
+                ]
                 gate_prefix = cumulative_gate[batch, head, source_positions]
+                # Keep the recurrent state in f32; round only the matmul inputs.
+                state_input = I.cast(state, I.bf16)
                 projected_state = I.matmul(
                     cumulative_key,
-                    state,
+                    state_input,
                     acc_dtype=I.f32,
                 )
                 corrected = corrected - projected_state
+                corrected_input = I.cast(corrected, I.bf16)
+                weighted_query = I.cast(query, I.f32) * I.exp(gate_prefix)[:, None]
                 inter = I.matmul(
-                    query * I.exp(gate_prefix)[:, None],
-                    state,
+                    I.cast(weighted_query, I.bf16),
+                    state_input,
                     acc_dtype=I.f32,
                 )
                 scores = I.matmul(
@@ -305,8 +298,8 @@ def chunk_gated_delta_recurrence(
                     fill=0.0,
                 )
                 intra = I.matmul(
-                    scores * decay,
-                    corrected,
+                    I.cast(scores * decay, I.bf16),
+                    corrected_input,
                     acc_dtype=I.f32,
                 )
                 output[
@@ -318,10 +311,10 @@ def chunk_gated_delta_recurrence(
                 last_position = chunk_end - 1
                 I.assume_in_bounds(last_position, cumulative_gate, axis=2)
                 last_gate = cumulative_gate[batch, head, last_position]
-                weighted_key = key * I.exp(last_gate - gate_prefix)[:, None]
+                weighted_key = I.cast(key, I.f32) * I.exp(last_gate - gate_prefix)[:, None]
                 update = I.matmul(
-                    weighted_key,
-                    corrected,
+                    I.cast(weighted_key, I.bf16),
+                    corrected_input,
                     transpose_lhs=True,
                     acc_dtype=I.f32,
                 )

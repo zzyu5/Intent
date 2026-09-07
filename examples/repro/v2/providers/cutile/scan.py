@@ -167,7 +167,7 @@ def chunk_gated_delta(context: Context) -> PreparedComparison:
         source,
         (tolerance, tolerance),
         cuda_graph=False,
-        note="同算法；中间精度和舍入不同",
+        note="同算法；generated 使用 BF16 矩阵输入、FP32 累加与状态，source 使用 TF32 矩阵输入",
     )
 
 
