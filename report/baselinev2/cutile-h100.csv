@@ -1,6 +1,6 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
 official_fmha,B4-QH32-KVH8-S4096-D128-fp16-causal,20.435888,4.355680,4.691779,pass,同算法；source 使用 FTZ 与近似除法
-block_scaled_gemm,M4096-N14336-K4096-fp8-block32,,,,generated_provider_program_verification_failed,H100 为 SM90；E8M0 scaled MMA 要求 compute capability 10.0 及以上
+block_scaled_gemm,M4096-N14336-K4096-fp8-block32,,,,hardware_unsupported,H100 为 SM90；E8M0 scaled MMA 要求 compute capability 10.0 及以上
 dense_gemm,M4096-N14336-K4096-fp16,1.758128,1.805016,0.974024,pass,
 moe_expert_projection,T4096-E8-top2-4096x14336-bf16,22.317479,8.643376,2.582033,pass,同算法；source 使用预计算 block ownership
 layer_norm,8192x4096-bf16,0.122488,2.894040,0.042324,pass,同算法；source 额外写 Mean/Rstd
@@ -31,8 +31,8 @@ mhc_sinkhorn,T8192-streams4-fp32,0.081016,0.081136,0.998521,pass,同算法；sou
 absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,1.872464,0.655816,2.855167,pass,同算法；source 使用近似除法并额外输出 LSE
 splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,3.290104,0.224536,14.652901,pass,同算法；source 使用 FTZ 与近似除法
 sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,4.998200,308.888641,0.016181,pass,同算法；source 使用 FTZ 与近似除法
-sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,,,,worker_timeout,同算法：causal window GQA；source 含 KV 扩展与布局转换；本轮未运行到此项；保留此前记录
-rms_norm,8192x4096-bf16,0.050616,0.050896,0.994499,pass,同算法：mean-square 与 rsqrt/weight；source 额外 Rstd 输出；本轮未运行到此项；保留此前记录
-recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,2.859456,3.024832,0.945327,pass,已完成的单项运行结果
-chunk_gated_delta,B2-S2048-H8-K128-V128-C64-bf16,,,,physical_program_verification_failed,同算法：guarded Neumann/serial chunk correction 与状态递推；TF32 精度差异；本轮未运行到此项；保留此前记录
+sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,4.569648,1.232136,3.708721,pass,同算法；source 的布局转换与辅助工作计入其调用时间
+rms_norm,8192x4096-bf16,0.050616,0.050896,0.994499,pass,同算法；source 额外写 Rstd
+recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,2.859456,3.024832,0.945327,pass,
+chunk_gated_delta,B2-S2048-H8-K128-V128-C64-bf16,52.664827,1.549592,33.986254,pass,同算法；中间精度和舍入不同
 nvfp4_quantize,8192x4096-block16-bf16,,,,source_hardware_unsupported,generated 已编译运行；cuTile source 的 float4_e2m1fn/pack_to_bytes 不支持 SM90
