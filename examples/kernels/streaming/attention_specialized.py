@@ -317,6 +317,10 @@ def attention_sink_decode_partials(
             for part in I.parallel(parts):
                 begin = I.minimum(part * width, K)
                 end = I.minimum((part + 1) * width, K)
+                end = I.maximum(0, I.minimum(end, query_coordinate + 1))
+                if WINDOW > 0:
+                    begin = I.maximum(begin, query_coordinate - WINDOW + 1)
+                begin = I.minimum(begin, end)
                 keys = key_axis[begin:end]
                 summary = summarize_window_attention_bf16(
                     k[batch, keys, key_head, :],
@@ -423,6 +427,8 @@ def gemma_gqa_decode_partials(
             for part in I.parallel(parts):
                 begin = I.minimum(part * width, K)
                 end = I.minimum((part + 1) * width, K)
+                if WINDOW > 0:
+                    begin = I.minimum(end, I.maximum(begin, K - 1 - WINDOW))
                 keys = key_axis[begin:end]
                 summary = I.region_fold(
                     source=(

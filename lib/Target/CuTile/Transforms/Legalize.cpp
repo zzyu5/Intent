@@ -31,6 +31,12 @@ constexpr int64_t nativeAccessForm = 1;
 constexpr int64_t gatherAccessForm = 2;
 constexpr int64_t nativeBlockedNoTMAForm = 3;
 
+enum ProviderProfileColumn : unsigned {
+  CTAsColumn,
+  AccessFormColumn,
+  OccupancyColumn,
+};
+
 bool isLegalAccessForm(int64_t value) {
   return value == nativeAccessForm || value == gatherAccessForm ||
          value == nativeBlockedNoTMAForm;
@@ -1390,17 +1396,14 @@ bool hasMatrixTileCompute(func::FuncOp kernel) {
 }
 
 LogicalResult declareProviderHint(func::FuncOp kernel,
-                                  const gpu::TuningProfiles &profiles,
-                                  StringRef family, StringRef name,
+                                  ArrayRef<gpu::TuningProfiles::Row> profiles,
+                                  ProviderProfileColumn column, StringRef name,
                                   gpu::ParameterRole role,
                                   bool (*isLegal)(int64_t)) {
-  auto rows = profiles.get("cutile", family, kernel.getLoc());
-  if (failed(rows))
-    return failure();
   SmallVector<int64_t> candidates;
-  for (const auto &row : *rows)
-    if (isLegal(row[0]))
-      candidates.push_back(row[0]);
+  for (const auto &row : profiles)
+    if (isLegal(row[column]) && !llvm::is_contained(candidates, row[column]))
+      candidates.push_back(row[column]);
   if (candidates.empty())
     return kernel.emitError("cuTile tuning profile has no legal hints for ") << name;
   bool nameCollision = false;
@@ -1427,14 +1430,14 @@ bool hasResidentWorkerTraversal(func::FuncOp kernel) {
   return found;
 }
 
-StringRef occupancyFamily(func::FuncOp kernel,
-                          gpu::CapabilitiesAttr capabilities) {
+StringRef providerProfileFamily(func::FuncOp kernel,
+                                gpu::CapabilitiesAttr capabilities) {
   if (hasResidentWorkerTraversal(kernel))
-    return "occupancy_persistent";
+    return "persistent";
   if (hasLoopCarriedFragment(kernel))
-    return "occupancy_loop";
+    return "loop";
   return capabilities.getComputeCapabilityMajor() < 9
-             ? "occupancy_legacy" : "occupancy_modern";
+             ? "legacy" : "modern";
 }
 
 LogicalResult verifyScan(gpu::ScanOp scan) {
@@ -1469,7 +1472,7 @@ LogicalResult verifyScan(gpu::ScanOp scan) {
 }
 
 LogicalResult formNativeTiles(func::FuncOp kernel,
-                              const gpu::TuningProfiles &profiles) {
+                              ArrayRef<gpu::TuningProfiles::Row> profiles) {
   SmallVector<gpu::LoadOp> loads;
   SmallVector<gpu::GatherOp> gathers;
   SmallVector<gpu::ContractOp> contracts;
@@ -1496,12 +1499,12 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
     return scaledContracts.front().emitOpError(
         "cuTile E8M0 scaled MMA requires compute capability 10.0 or newer");
   if (hasOccupancySensitiveTileCompute(kernel) &&
-      failed(declareProviderHint(kernel, profiles, occupancyFamily(kernel, capabilities),
+      failed(declareProviderHint(kernel, profiles, OccupancyColumn,
                                  occupancyParameter, gpu::ParameterRole::ProviderOccupancy,
                                  isLegalOccupancy)))
     return failure();
   if (matrixCompute &&
-      failed(declareProviderHint(kernel, profiles, "ctas", ctasParameter,
+      failed(declareProviderHint(kernel, profiles, CTAsColumn, ctasParameter,
                                  gpu::ParameterRole::ProviderCTAs, isLegalCTAs)))
     return failure();
   gpu::PhysicalProgramAnalysis analysis(kernel);
@@ -1512,13 +1515,11 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
   auto accessFormValue = [&]() -> FailureOr<Value> {
     if (accessForm)
       return accessForm;
-    auto rows = profiles.get("cutile", "access_forms", kernel.getLoc());
-    if (failed(rows))
-      return failure();
     SmallVector<int64_t> candidates;
-    for (const auto &row : *rows)
-      if (isLegalAccessForm(row[0]))
-        candidates.push_back(row[0]);
+    for (const auto &row : profiles)
+      if (isLegalAccessForm(row[AccessFormColumn]) &&
+          !llvm::is_contained(candidates, row[AccessFormColumn]))
+        candidates.push_back(row[AccessFormColumn]);
     if (candidates.empty())
       return kernel.emitError("cuTile tuning profile has no legal access forms (1, 2, 3)");
     bool nameCollision = false;
@@ -2185,7 +2186,8 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
   return success();
 }
 
-LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
+LogicalResult materializeClosedConfigs(
+    func::FuncOp kernel, ArrayRef<gpu::TuningProfiles::Row> profiles) {
   struct Domain {
     gpu::ParameterOp parameter;
     bool provider;
@@ -2256,20 +2258,37 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
     configurations.push_back(std::move(bindings));
   }
 
-  for (Domain &domain : domains) {
-    if (!domain.provider)
-      continue;
-    SmallVector<SmallVector<NamedAttribute>> expanded;
-    gpu::ParameterAttr definition = domain.parameter.getParameter();
-    for (const auto &base : configurations)
-      for (int64_t candidate : definition.getCandidates().asArrayRef()) {
-        SmallVector<NamedAttribute> bindings(base);
+  SmallVector<SmallVector<NamedAttribute>> expanded;
+  for (const auto &base : configurations)
+    for (const auto &profile : profiles) {
+      SmallVector<NamedAttribute> bindings(base);
+      for (Domain &domain : domains) {
+        if (!domain.provider)
+          continue;
+        gpu::ParameterAttr definition = domain.parameter.getParameter();
+        ProviderProfileColumn column;
+        switch (static_cast<gpu::ParameterRole>(definition.getRole())) {
+        case gpu::ParameterRole::ProviderCTAs:
+          column = CTAsColumn;
+          break;
+        case gpu::ParameterRole::ProviderAccessForm:
+          column = AccessFormColumn;
+          break;
+        case gpu::ParameterRole::ProviderOccupancy:
+          column = OccupancyColumn;
+          break;
+        default:
+          return kernel.emitError("cuTile profile has no column for a provider role");
+        }
+        int64_t candidate = profile[column];
+        if (!llvm::is_contained(definition.getCandidates().asArrayRef(), candidate))
+          return kernel.emitError("cuTile profile is outside its declared parameter domain");
         bindings.push_back(builder.getNamedAttr(
             definition.getName(), builder.getI64IntegerAttr(candidate)));
-        expanded.push_back(std::move(bindings));
       }
-    configurations = std::move(expanded);
-  }
+      expanded.push_back(std::move(bindings));
+    }
+  configurations = std::move(expanded);
 
   gpu::ParameterOp resident;
   gpu::ParameterOp ctas;
@@ -2697,65 +2716,25 @@ bool fitsNativeLoopBound(Value value, unsigned depth = 0) {
     if (value.getType().isIndex() ||
         (integer && integer.getWidth() == 64 && !integer.isUnsigned()))
       return fitsNativeLoopBound(cast.getValue(), depth + 1);
-  return false;
-}
-
-bool isSpecializedLoopBound(Value value, unsigned depth = 0) {
-  if (depth >= 32)
-    return false;
-  if (auto argument = dyn_cast<BlockArgument>(value)) {
-    auto kernel = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
-    if (!kernel)
+  if (auto clamp = value.getDefiningOp<gpu::BinaryOp>()) {
+    auto kind = clamp.getOperatorKind();
+    if (kind != BinaryOperator::Minimum && kind != BinaryOperator::Maximum)
       return false;
-    auto kind = kernel.getArgAttrOfType<StringAttr>(argument.getArgNumber(),
-                                                   gpu::abiKindAttr);
-    return kind && (kind.getValue() == "dimension" ||
-                    kind.getValue() == "stride" ||
-                    kind.getValue() == "constexpr");
-  }
-  Operation *producer = value.getDefiningOp();
-  if (auto physical = dyn_cast_or_null<gpu::PhysicalExprOp>(producer)) {
-    auto kernel = physical->getParentOfType<func::FuncOp>();
-    auto specialized = [&](auto &&self, gpu::PhysicalExprAttr expression) -> bool {
-      auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
-      if (kind == gpu::PhysicalExprKind::Constant)
+    BinaryOperator opposite = kind == BinaryOperator::Minimum
+                                  ? BinaryOperator::Maximum
+                                  : BinaryOperator::Minimum;
+    for (auto [limit, nestedValue] :
+         {std::pair{clamp.getLhs(), clamp.getRhs()},
+          std::pair{clamp.getRhs(), clamp.getLhs()}}) {
+      auto nested = nestedValue.getDefiningOp<gpu::BinaryOp>();
+      if (fitsNativeLoopBound(limit, depth + 1) && nested &&
+          nested.getOperatorKind() == opposite &&
+          (fitsNativeLoopBound(nested.getLhs(), depth + 1) ||
+           fitsNativeLoopBound(nested.getRhs(), depth + 1)))
         return true;
-      if (kind == gpu::PhysicalExprKind::Parameter) {
-        auto parameter = gpu::queryParameterBySymbol(kernel, expression.getSymbol());
-        if (failed(parameter))
-          return false;
-        auto role = static_cast<gpu::ParameterRole>(parameter->getParameter().getRole());
-        return role != gpu::ParameterRole::ProviderCTAs &&
-               role != gpu::ParameterRole::ProviderOccupancy;
-      }
-      if (kind == gpu::PhysicalExprKind::Dimension ||
-          kind == gpu::PhysicalExprKind::ScalarABI) {
-        for (BlockArgument argument : kernel.getArguments())
-          if (kernel.getArgAttrOfType<StringAttr>(argument.getArgNumber(), gpu::abiNameAttr) ==
-              expression.getSymbol())
-            return isSpecializedLoopBound(argument, depth + 1);
-        return false;
-      }
-      return llvm::all_of(expression.getOperands(), [&](Attribute operand) {
-        return self(self, cast<gpu::PhysicalExprAttr>(operand));
-      });
-    };
-    return specialized(specialized, physical.getExpression());
+    }
   }
-  if (isa_and_nonnull<arith::ConstantOp, gpu::ParameterOp, gpu::DimOp>(producer))
-    return true;
-  if (auto bound = dyn_cast_or_null<gpu::RangeBoundOp>(producer)) {
-    auto range = bound.getRange().getDefiningOp<gpu::RangeOp>();
-    return range && isSpecializedLoopBound(
-                        bound.getBound() == 0 ? range.getStart()
-                        : bound.getBound() == 1 ? range.getStop()
-                                               : range.getStep(),
-                        depth + 1);
-  }
-  return isa_and_nonnull<gpu::CastOp, gpu::BinaryOp>(producer) &&
-         llvm::all_of(producer->getOperands(), [&](Value operand) {
-           return isSpecializedLoopBound(operand, depth + 1);
-         });
+  return false;
 }
 
 std::optional<int64_t> maximumNativeLoopStep(Value value) {
@@ -2930,10 +2909,10 @@ void realizeWideLoops(func::FuncOp kernel) {
       continue;
     }
     auto integer = dyn_cast<IntegerType>(loop.getInductionVar().getType());
-    if (maximumStep && (!integer || !integer.isUnsigned()) &&
-        (fitsNativeLoopBound(loop.getLowerBound()) ||
-         isSpecializedLoopBound(loop.getLowerBound())) &&
-        isSpecializedLoopBound(loop.getUpperBound())) {
+    // Runtime scalar bounds can use the same checked native loop as specialized
+    // bounds.  The predicate proves the i32 range before narrowing; genuinely
+    // wide domains retain the original explicit i64 induction state.
+    if (maximumStep && (!integer || !integer.isUnsigned())) {
       Value minimum = builder.create<arith::ConstantOp>(
           location, loop.getInductionVar().getType(),
           builder.getIntegerAttr(loop.getInductionVar().getType(), INT32_MIN));
@@ -2999,11 +2978,24 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   if (failed(kernel))
     return failure();
   materializeUnitOwnershipExtents(*kernel);
-  if (failed(formNativeTiles(*kernel, profiles)))
+  auto capabilities = (*kernel)->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+  auto rows = profiles.get("cutile", providerProfileFamily(*kernel, capabilities),
+                           kernel->getLoc());
+  if (failed(rows))
+    return failure();
+  gpu::TuningProfiles::Table providerProfiles;
+  for (const auto &row : *rows)
+    if (isLegalCTAs(row[CTAsColumn]) &&
+        isLegalAccessForm(row[AccessFormColumn]) &&
+        isLegalOccupancy(row[OccupancyColumn]))
+      providerProfiles.push_back(row);
+  if (providerProfiles.empty())
+    return kernel->emitError("cuTile tuning profile has no legal complete configuration");
+  if (failed(formNativeTiles(*kernel, providerProfiles)))
     return failure();
   if (failed(refineMMALoops(module)))
     return failure();
-  if (failed(materializeClosedConfigs(*kernel)))
+  if (failed(materializeClosedConfigs(*kernel, providerProfiles)))
     return failure();
   realizeWideLoops(*kernel);
   preserveNativeIndexValues(*kernel);

@@ -75,6 +75,11 @@ def nvfp4_quantize(
                 )
             else:
                 # Only valid groups are written; InOut padding is unchanged.
-                for row in I.domain(row_start, I.minimum(row_start + 128, M)):
-                    for group in I.domain(group_start, I.minimum(group_start + 4, groups)):
-                        quantize_nvfp4_group(x, packed, scales, encoding_scale, row, group)
+                row_count = I.maximum(0, I.minimum(128, M - row_start))
+                group_count = I.maximum(0, I.minimum(4, groups - group_start))
+                for row_offset in I.domain(0, row_count):
+                    for group_offset in I.domain(0, group_count):
+                        quantize_nvfp4_group(
+                            x, packed, scales, encoding_scale,
+                            row_start + row_offset, group_start + group_offset,
+                        )

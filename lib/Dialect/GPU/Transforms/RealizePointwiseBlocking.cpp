@@ -4161,15 +4161,17 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           candidates.assign({1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024,
                              2048, 4096});
         } else {
+          // A fixed logical free axis can still use a padded contraction tile.
+          // Keep its physical candidates; ownership tail validity masks the
+          // extra lanes, and the correlated profiles choose the actual shape.
           for (int64_t candidate : {8, 16, 32, 64, 128, 256, 512, 1024,
                                     2048, 4096})
-            if (candidate <= logicalExtent.value())
+            if (category == ParameterCategory::RegionContraction ||
+                candidate <= logicalExtent.value())
               candidates.push_back(candidate);
-          if (candidates.empty() || candidates.back() != logicalExtent.value())
+          if (!llvm::is_contained(candidates, logicalExtent.value()))
             candidates.push_back(logicalExtent.value());
-          if (category == ParameterCategory::RegionContraction &&
-              candidates.back() < 8)
-            candidates.push_back(8);
+          llvm::sort(candidates);
         }
         OpBuilder builder(&kernel.getBody().front(),
                           kernel.getBody().front().begin());

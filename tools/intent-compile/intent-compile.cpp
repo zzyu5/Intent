@@ -119,11 +119,12 @@ int main(int argc, char **argv) {
       "ownership_m", "ownership_n", "reduction", "reduction_outer", "scan",
       "traversal_workers", "traversal_group"};
   const llvm::StringRef tritonColumns[] = {"warps", "stages", "ctas"};
+  const llvm::StringRef cutileColumns[] = {"ctas", "access_form", "occupancy"};
   const llvm::StringRef valueColumn[] = {"value"};
   const intent::gpu::TuningProfileSource profileSources[] = {
       {"shared", profilePath("shared.json"), sharedColumns},
       {"triton", profilePath("triton.json"), tritonColumns},
-      {"cutile", profilePath("cutile.json"), valueColumn},
+      {"cutile", profilePath("cutile.json"), cutileColumns},
       {"tilelang", profilePath("tilelang.json"), valueColumn}};
   auto profiles = intent::gpu::TuningProfiles::read(
       module->getLoc(), profileSources, tuningConfigFilename);
