@@ -79,7 +79,7 @@ def official_fmha(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=5e-2, rtol=2e-2),
         cuda_graph=True,
-        status="source_exp2_ftz_and_approx_division_contract_gap",
+        note="同算法；source 使用 FTZ 与近似除法",
     )
 
 
@@ -116,7 +116,7 @@ def dense_attention_forward(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=5e-2, rtol=2e-2),
         cuda_graph=True,
-        status="source_exp2_ftz_and_approx_division_contract_gap",
+        note="同算法；source 使用 FTZ 与近似除法",
     )
 
 
@@ -241,7 +241,7 @@ def mla_prefill_case(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=5e-2, rtol=2e-2),
         cuda_graph=True,
-        status="source_exp2_ftz_and_approx_division_contract_gap",
+        note="同算法；source 使用 FTZ 与近似除法",
     )
 
 
@@ -302,7 +302,7 @@ def attention_sink(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=5e-2, rtol=2e-2),
         cuda_graph=False,
-        status="source_precision_and_timing_contract_gap",
+        note="同算法；source 的布局转换与辅助工作计入其调用时间",
     )
 
 
@@ -351,7 +351,7 @@ def gemma_prefill(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=5e-2, rtol=2e-2),
         cuda_graph=True,
-        status="source_precision_contract_gap",
+        note="同算法；中间精度和舍入不同",
     )
 
 
@@ -383,7 +383,7 @@ def absorbed_mla(context: Context) -> PreparedComparison:
         Tolerance(atol=5e-2, rtol=2e-2),
         cuda_graph=True,
         # Source additionally stores LSE and requests approximate normalization.
-        status="source_approx_division_and_auxiliary_lse_contract_gap",
+        note="同算法；source 使用近似除法并额外输出 LSE",
     )
 
 
@@ -423,7 +423,7 @@ def sliding_window(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=5e-2, rtol=2e-2),
         cuda_graph=False,
-        status="source_precision_and_timing_contract_gap",
+        note="同算法；source 的布局转换与辅助工作计入其调用时间",
     )
 
 
@@ -492,7 +492,7 @@ def attention_backward(context: Context) -> PreparedComparison:
         ),
         cuda_graph=False,
         # Both paths launch three kernels; only the source requests exp2 FTZ.
-        status="source_precision_contract_gap",
+        note="同算法；中间精度和舍入不同",
     )
 
 
@@ -556,7 +556,7 @@ def sparse_mla_prefill(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=1e-1, rtol=5e-2),
         cuda_graph=False,
-        status="source_exp2_ftz_and_approx_division_contract_gap",
+        note="同算法；source 使用 FTZ 与近似除法",
     )
 
 
@@ -655,7 +655,7 @@ def splitk_mla_decode(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=1e-1, rtol=5e-2),
         cuda_graph=False,
-        status="source_ftz_approx_division_contract_gap",
+        note="同算法；source 使用 FTZ 与近似除法",
     )
 
 
@@ -727,7 +727,7 @@ def grouped_flash_decode(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=1e-1, rtol=5e-2),
         cuda_graph=False,
-        status="source_ftz_approx_division_contract_gap",
+        note="同算法；source 使用 FTZ 与近似除法",
     )
 
 
@@ -810,7 +810,7 @@ def attention_sink_decode(context: Context) -> PreparedComparison:
         Tolerance(atol=1e-1, rtol=5e-2),
         cuda_graph=False,
         # Source rounds LSE to the bf16 output dtype before storing in its f32 buffer.
-        status="source_bf16_lse_and_approx_division_contract_gap",
+        note="同算法；source 使用 bf16 LSE 与近似除法",
     )
 
 
@@ -885,7 +885,7 @@ def gemma_decode(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=1e-1, rtol=5e-2),
         cuda_graph=False,
-        status="source_precision_contract_gap",
+        note="同算法；中间精度和舍入不同",
     )
 
 

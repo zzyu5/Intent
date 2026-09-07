@@ -220,7 +220,7 @@ def grouped_gemm(context: Context) -> PreparedComparison:
         Tolerance(atol=5e-2, rtol=2e-2),
         cuda_graph=False,
         # Source receives per-group array shapes, not device-resident ragged offsets.
-        status="source_host_visible_group_shapes_contract_gap",
+        note="同算法；source 使用 host group shapes",
     )
 
 

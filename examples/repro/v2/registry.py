@@ -107,7 +107,7 @@ CUTILE = (
     Entry("rms_norm", "8192x4096-bf16", "rms_norm_bf16", ("normalization/rms_norm.py:rms_norm_bf16",), "source/cutile/tilegym/normalization/rms_norm/rms_norm_runtime.py"),
     Entry("recurrent_gated_delta", "B2-S2048-H8-K128-V128-bf16", "recurrent_gated_delta", ("streaming/gated_delta.py:recurrent_gated_delta_fwd",), "source/cutile/tilegym/scan/gated_delta_recurrent/recurrent_gated_delta_rule_runtime.py"),
     Entry("chunk_gated_delta", "B2-S2048-H8-K128-V128-C64-bf16", "chunk_gated_delta", ("streaming/gated_delta.py:chunk_gated_delta_prepare", "streaming/gated_delta.py:chunk_gated_delta_recurrence"), "source/cutile/tilegym/scan/gated_delta_chunk/chunk_gated_delta_rule_runtime.py"),
-    Entry("nvfp4_quantize", "8192x4096-block32-bf16", "nvfp4_quantize", (), "source/cutile/tilegym/quantization/nvfp4/nvfp4_quantize_runtime.py"),
+    Entry("nvfp4_quantize", "8192x4096-block16-bf16", "nvfp4_quantize", ("quantization/nvfp4.py:nvfp4_quantize", "quantization/nvfp4.py:encode_e2m1"), "source/cutile/tilegym/quantization/nvfp4/nvfp4_quantize_runtime.py"),
 )
 
 

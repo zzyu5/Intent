@@ -1338,6 +1338,14 @@ FailureOr<Value> materializeReplayedValue(
   return projectionFailed ? FailureOr<Value>(failure()) : result;
 }
 
+FailureOr<Value> projectPredicateToFragmentAxis(OpBuilder &builder,
+                                                Location location,
+                                                Value predicate,
+                                                FragmentType target,
+                                                unsigned fragmentAxis) {
+  return projectPredicate(builder, location, predicate, target, fragmentAxis);
+}
+
 FailureOr<Value> projectPredicateToFragment(OpBuilder &builder,
                                             Location location, Value predicate,
                                             FragmentType target,

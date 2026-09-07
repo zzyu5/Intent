@@ -1335,43 +1335,6 @@ bool fragmentUsesRole(gpu::FragmentType fragment, func::FuncOp kernel,
   });
 }
 
-Value regionContractionTransposeCondition(gpu::ContractOp contract,
-                                          func::FuncOp kernel) {
-  auto result = dyn_cast<gpu::FragmentType>(contract.getResult().getType());
-  if (!result || result.getShape().size() != 2)
-    return {};
-  auto ownershipExtent =
-      dyn_cast<gpu::PhysicalExprAttr>(result.getShape()[0]);
-  if (!ownershipExtent ||
-      ownershipExtent.getKind() !=
-          static_cast<uint32_t>(gpu::PhysicalExprKind::Parameter))
-    return {};
-  FailureOr<gpu::ParameterOp> ownership = gpu::queryParameterBySymbol(
-      kernel, ownershipExtent.getSymbol());
-  if (failed(ownership) ||
-      (*ownership).getParameter().getRole() !=
-          static_cast<uint32_t>(gpu::ParameterRole::OwnershipM) ||
-      (*ownership).getParameter().getCategory() !=
-          static_cast<uint32_t>(gpu::ParameterCategory::RegionContraction))
-    return {};
-  auto loop = contract->getParentOfType<scf::ForOp>();
-  auto segment = loop ? loop.getStep().getDefiningOp<gpu::ParameterOp>()
-                      : gpu::ParameterOp();
-  if (!segment ||
-      segment.getParameter().getRole() !=
-          static_cast<uint32_t>(gpu::ParameterRole::ScanChunk) ||
-      segment.getParameter().getCategory() !=
-          static_cast<uint32_t>(gpu::ParameterCategory::RegionContraction))
-    return {};
-  OpBuilder builder(contract);
-  auto condition = builder.create<gpu::CompareOp>(
-      contract.getLoc(), builder.getI1Type(), (*ownership).getResult(),
-      segment.getResult(), ComparePredicate::Lt);
-  if (Attribute origin = contract->getAttr(gpu::originAttr))
-    condition->setAttr(gpu::originAttr, origin);
-  return condition;
-}
-
 bool containsFragment(Type type) {
   if (isa<gpu::FragmentType>(type))
     return true;
@@ -1987,56 +1950,11 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
       contract.erase();
       continue;
     }
-    auto emitMMA = [&](OpBuilder &nested) -> Value {
-      auto replacement = nested.create<MMAOp>(
-          contract.getLoc(), contract.getResult().getType(), contract.getLhs(),
-          contract.getRhs(), contract.getAccumulator());
-      inheritOrigin(replacement);
-      return replacement.getResult();
-    };
-    auto emitTransposedMMA = [&](OpBuilder &nested) -> Value {
-      auto lhsType = cast<gpu::FragmentType>(contract.getLhs().getType());
-      auto rhsType = cast<gpu::FragmentType>(contract.getRhs().getType());
-      auto accumulatorType =
-          cast<gpu::FragmentType>(contract.getAccumulator().getType());
-      auto lhs = nested.create<gpu::TransposeOp>(
-          contract.getLoc(), transposeRankTwo(lhsType), contract.getLhs(),
-          ArrayRef<int64_t>{1, 0});
-      auto rhs = nested.create<gpu::TransposeOp>(
-          contract.getLoc(), transposeRankTwo(rhsType), contract.getRhs(),
-          ArrayRef<int64_t>{1, 0});
-      auto accumulator = nested.create<gpu::TransposeOp>(
-          contract.getLoc(), transposeRankTwo(accumulatorType),
-          contract.getAccumulator(), ArrayRef<int64_t>{1, 0});
-      auto mma = nested.create<MMAOp>(
-          contract.getLoc(), accumulator.getResult().getType(), rhs, lhs,
-          accumulator);
-      auto result = nested.create<gpu::TransposeOp>(
-          contract.getLoc(), contract.getResult().getType(), mma,
-          ArrayRef<int64_t>{1, 0});
-      for (Operation *operation :
-           {lhs.getOperation(), rhs.getOperation(), accumulator.getOperation(),
-            mma.getOperation(), result.getOperation()})
-        inheritOrigin(operation);
-      return result;
-    };
-    Value transpose = regionContractionTransposeCondition(contract, kernel);
-    Value result;
-    if (transpose) {
-      auto conditional = builder.create<scf::IfOp>(
-          contract.getLoc(), TypeRange{contract.getResult().getType()}, transpose,
-          /*withElseRegion=*/true);
-      inheritOrigin(conditional);
-      OpBuilder transposed = prepareBranch(conditional.getThenRegion());
-      transposed.create<scf::YieldOp>(contract.getLoc(),
-                                      emitTransposedMMA(transposed));
-      OpBuilder direct = prepareBranch(conditional.getElseRegion());
-      direct.create<scf::YieldOp>(contract.getLoc(), emitMMA(direct));
-      result = conditional.getResult(0);
-    } else {
-      result = emitMMA(builder);
-    }
-    contract.getResult().replaceAllUsesWith(result);
+    auto replacement = builder.create<MMAOp>(
+        contract.getLoc(), contract.getResult().getType(), contract.getLhs(),
+        contract.getRhs(), contract.getAccumulator());
+    inheritOrigin(replacement);
+    contract.getResult().replaceAllUsesWith(replacement.getResult());
     contract.erase();
   }
 

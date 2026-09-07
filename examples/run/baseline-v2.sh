@@ -18,6 +18,7 @@ build_root=${INTENT_BUILD_ROOT:-/tmp/intentdsl-build}
 cmake_generator=${INTENT_CMAKE_GENERATOR:-Ninja}
 mlir_dir=${INTENT_MLIR_DIR:-/usr/lib/llvm-20/lib/cmake/mlir}
 llvm_dir=${INTENT_LLVM_DIR:-/usr/lib/llvm-20/lib/cmake/llvm}
+tuning_config=${INTENT_TUNING_CONFIG:-}
 
 case "${provider}" in
   triton)
@@ -25,6 +26,7 @@ case "${provider}" in
     ;;
   cutile)
     default_python=/home/kingdom/.venvs/intentdsl-cutile/bin/python
+    tuning_config=${INTENT_TUNING_CONFIG:-${project_root}/examples/repro/v2/providers/cutile/tuning.json}
     ;;
   tilelang)
     default_python=/home/kingdom/.venvs/intentdsl-tilelang/bin/python
@@ -41,13 +43,22 @@ cmake \
   -G "${cmake_generator}" \
   -DMLIR_DIR="${mlir_dir}" \
   -DLLVM_DIR="${llvm_dir}"
-cmake --build "${build_root}" --target intent-compile
+cmake --build "${build_root}" --target intent-compile --parallel "${INTENT_BUILD_JOBS:-24}"
 
 arguments=(
   "${provider}"
   --compiler "${build_root}/tools/intent-compile/intent-compile"
   --output "${output}"
+  --jobs "${INTENT_BENCHMARK_JOBS:-4}"
+  --worker-timeout "${INTENT_WORKER_TIMEOUT:-300}"
+  --cutile-compiler-timeout "${INTENT_CUTILE_COMPILER_TIMEOUT:-15}"
 )
+if [[ -n "${tuning_config}" ]]; then
+  if [[ "${tuning_config}" != /* ]]; then
+    tuning_config="${PWD}/${tuning_config}"
+  fi
+  arguments+=(--tuning-config "${tuning_config}")
+fi
 for kernel in "$@"; do
   arguments+=(--kernel "${kernel}")
 done

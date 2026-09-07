@@ -82,6 +82,10 @@ mlir::FailureOr<mlir::Value> materializeReplayedValue(
     mlir::IRMapping &mapping,
     ReplayMaterializationOptions options = {});
 mlir::FailureOr<mlir::Value>
+projectPredicateToFragmentAxis(mlir::OpBuilder &builder, mlir::Location location,
+                               mlir::Value predicate, FragmentType target,
+                               unsigned fragmentAxis);
+mlir::FailureOr<mlir::Value>
 projectPredicateToFragment(mlir::OpBuilder &builder, mlir::Location location,
                            mlir::Value predicate, FragmentType target,
                            PhysicalSourceAxis source);

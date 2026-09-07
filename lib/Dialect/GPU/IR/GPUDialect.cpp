@@ -83,22 +83,18 @@ BroadcastProjection queryAxisProjection(FragmentType source,
   // that explicit occurrence relation before source-identity matching: one
   // logical source axis may legitimately occur more than once in a Cartesian
   // result, and identity-first matching would let the wrong occurrence consume
-  // the positional target.  A non-singleton positional pair must still carry
-  // either the same immutable source or the same logical dimension.
+  // the positional target.  A positional pair must still carry either the same
+  // immutable source or the same logical dimension: a physically singleton
+  // ownership axis is not an anonymous broadcast axis.
   for (auto [sourceIndex, mapping] : llvm::enumerate(source.getAxisMaps())) {
     unsigned targetIndex = offset + sourceIndex;
     auto sourceAxis = cast<AxisMapAttr>(mapping);
     auto targetAxis = cast<AxisMapAttr>(target.getAxisMaps()[targetIndex]);
-    auto sourceExtent = cast<PhysicalExprAttr>(source.getShape()[sourceIndex]);
-    bool singleton =
-        sourceExtent.getKind() ==
-            static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-        sourceExtent.getValue() == 1;
     bool sameSource =
         sourceAxis.getSourceId() == targetAxis.getSourceId() &&
         sourceAxis.getSourceAxis() == targetAxis.getSourceAxis() &&
         sourceAxis.getDerived() == targetAxis.getDerived();
-    if (!singleton && !sameSource &&
+    if (!sameSource &&
         sourceAxis.getDimensionId() != targetAxis.getDimensionId())
       continue;
     result.targetToSource[targetIndex] = sourceIndex;

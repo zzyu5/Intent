@@ -1,0 +1,8 @@
+{
+  "cutile": {
+    "ctas": [[1]],
+    "access_forms": [[1], [2]],
+    "occupancy_loop": [[2]],
+    "occupancy_persistent": [[2]]
+  }
+}

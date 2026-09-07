@@ -868,8 +868,8 @@ LogicalResult neutralizeFullCoverageOperand(ContractOp contract,
     Value tail = builder.create<CompareOp>(
         location, predicateType, range->getResult(), stopFragment,
         ComparePredicate::Lt);
-    FailureOr<Value> valid = projectPredicateToFragment(
-        builder, location, tail, type, sourceAxisIdentity(*range));
+    FailureOr<Value> valid = projectPredicateToFragmentAxis(
+        builder, location, tail, type, static_cast<unsigned>(axis));
     FailureOr<Value> zero = materializeZeroFragment(builder, location, type);
     if (failed(valid) || failed(zero))
       return contract.emitOpError(
