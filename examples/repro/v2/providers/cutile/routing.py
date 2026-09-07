@@ -148,7 +148,7 @@ def gemm_rms_scale(context: Context) -> PreparedComparison:
         ),
         cuda_graph=False,
         # Source normalizes through reciprocal(rsqrt) and division, not multiplication.
-        status="source_reciprocal_normalization_contract_gap",
+        note="同算法；source 用乘倒数实现归一化",
     )
 
 
@@ -195,7 +195,7 @@ def apply_residual(context: Context) -> PreparedComparison:
         Tolerance(atol=1e-1, rtol=5e-2),
         cuda_graph=True,
         # The packed source mix selects bf16 arithmetic; Intent accumulates in f32.
-        status="source_bf16_accumulation_contract_gap",
+        note="同算法；source 保留 bf16 中间累加",
     )
 
 
@@ -238,7 +238,7 @@ def sinkhorn(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=2e-4, rtol=1e-4),
         cuda_graph=False,
-        status="source_exp2_vs_exp_contract_gap",
+        note="同算法；source 用 exp2(x * log2(e)) 实现 exp",
     )
 
 

@@ -31,7 +31,7 @@ def silu_and_mul(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=2e-2, rtol=1e-2),
         cuda_graph=True,
-        status="source_ftz_approx_division_contract_gap",
+        note="同算法；source 使用 FTZ 与近似除法",
     )
 
 
@@ -52,7 +52,7 @@ def swiglu(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=2e-2, rtol=1e-2),
         cuda_graph=True,
-        status="source_ftz_approx_division_contract_gap",
+        note="同算法；source 使用 FTZ 与近似除法",
     )
 
 
@@ -71,7 +71,7 @@ def gelu(context: Context) -> PreparedComparison:
         Tolerance(atol=1e-2, rtol=1e-2),
         cuda_graph=True,
         # Source helper constants and intermediate arithmetic remain f16.
-        status="source_f16_intermediates_contract_gap",
+        note="同算法；source 保留 f16 中间舍入",
     )
 
 
@@ -94,7 +94,7 @@ def geglu(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=2e-2, rtol=1e-2),
         cuda_graph=True,
-        status="source_f16_intermediates_contract_gap",
+        note="同算法；source 保留 f16 中间舍入",
     )
 
 
@@ -113,7 +113,7 @@ def relu(context: Context) -> PreparedComparison:
         Tolerance(atol=0.0),
         cuda_graph=True,
         # cuda-tile maximum does not propagate NaNs; Intent maximum does.
-        status="source_nonpropagating_maximum_contract_gap",
+        note="同算法；NaN 传播方式不同",
     )
 
 

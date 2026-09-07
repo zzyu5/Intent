@@ -40,6 +40,7 @@
 # Decisions
 
 - 用户停止旧 change，并要求以一个新 change 统一收束编译/config/JIT、运行方案、真实数值问题和项目知识，最终完成 cuTile 全量性能运行。
+- 用户已确认以上完整范围并要求开始 Build；按同次 benchmark 容差检查与性能测量推进，不另开测试轮。
 - 最新数值要求是“容差内即可”，不是完全不检查，也不是独立正确性测试阶段。此前“只性能、不做任何数值检查”的解释已修正。
 - 使用单个普通 Native change，不拆 Supervisor：编译入口、runner、计时与修复共享同一生产链路，拆分会增加交接而不能独立完成最终结果。
 - 原拟沿用 main，但 Runtime 拒绝在已有未完成 change 的目录中再创建 current change；因此使用 `comet/cutile-execution-closure` 独立 worktree，目标分支 main。worktree 是 change 隔离，不是算子并发的前提。
@@ -50,7 +51,7 @@
 
 # Open questions
 
-- [blocking] CONFIRM: 按以上范围进入 Build：对齐实际编译入口，改善同机并发与重复 JIT/调优，修复真实实现问题，完成双机全 registry 性能及同次运行容差检查；不新增独立测试或临时测试矩阵。
+无。
 
 # Verification expectations
 

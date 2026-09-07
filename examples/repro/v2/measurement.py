@@ -77,6 +77,7 @@ def compile_single(
             target=context.target,
             compiler=context.compiler,
             constexprs=constexprs,
+            tuning_config=context.tuning_config,
         )
     except intent.CompilationStageError as error:
         raise PipelineStageError(f"generated_{error.stage}", str(error)) from error
@@ -227,7 +228,11 @@ def compare_outputs(
     return tuple(errors)
 
 
-def evaluate(comparison: PreparedComparison) -> tuple[float | None, float | None]:
+def evaluate(
+    comparison: PreparedComparison,
+    *,
+    before_benchmark: Callable[[], None] | None = None,
+) -> tuple[float | None, float | None]:
     report_stage("generated_launch")
     try:
         if comparison.generated.prepare is not None:
@@ -252,6 +257,8 @@ def evaluate(comparison: PreparedComparison) -> tuple[float | None, float | None
     )
     if comparison.status != "pass":
         return None, None
+    if before_benchmark is not None:
+        before_benchmark()
     report_stage("generated_benchmark")
     try:
         generated_first, _ = benchmark(

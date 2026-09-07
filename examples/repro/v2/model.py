@@ -31,6 +31,7 @@ class PreparedComparison:
     tolerance: Tolerance | tuple[Tolerance, ...]
     cuda_graph: bool
     status: str = "pass"
+    note: str = ""
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,7 @@ class Context:
     target: object
     provider: str
     compiler_timeout_seconds: int = 15
+    tuning_config: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,7 @@ class ResultRow:
     source_p50_ms: float | None
     ratio: float | None
     status: str
+    note: str = ""
 
 
 CaseFactory: TypeAlias = Callable[[Context], PreparedComparison]

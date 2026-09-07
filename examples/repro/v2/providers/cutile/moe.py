@@ -130,7 +130,7 @@ def expert_projection(context: Context) -> PreparedComparison:
         Tolerance(atol=5e-2, rtol=2e-2),
         cuda_graph=False,
         # Source receives precomputed block ownership; Intent receives CSR routing.
-        status="source_precomputed_block_ownership_contract_gap",
+        note="同算法；source 使用预计算 block ownership",
     )
 
 
@@ -200,7 +200,7 @@ def alignment(context: Context) -> PreparedComparison:
         source,
         (Tolerance(atol=0.0), Tolerance(atol=0.0), Tolerance(atol=0.0)),
         cuda_graph=False,
-        status="source_algorithm_and_timing_contract_gap",
+        note="同算法计数/前缀和/散射；初始化与辅助输出计入调用",
     )
 
 

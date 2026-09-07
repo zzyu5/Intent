@@ -4,7 +4,7 @@ block_scaled_gemm,M4096-N14336-K4096-fp8-block32,1.062088,1.072520,0.990273,pass
 dense_gemm,M4096-N14336-K4096-fp16,2.082512,2.114040,0.985086,pass,
 moe_expert_projection,T4096-E8-top2-4096x14336-bf16,,,,timing_not_measured,同算法：路由 expert GEMM；CSR 与预计算 block ownership 表示不同；Triton 共用作者函数不改；旧门禁跳过计时
 layer_norm,8192x4096-bf16,,,,timing_not_measured,同算法：均值与方差归一化；rsqrt 舍入及 source 额外 Mean/Rstd 输出；旧门禁跳过计时
-silu_and_mul,4096x28672-to14336-bf16,,,,timing_not_measured,同算法：SiLU(gate) 乘 up；FTZ 与近似除法差异；旧门禁跳过计时
+silu_and_mul,4096x28672-to14336-bf16,0.227072,0.245424,0.925223,pass,同算法；source 使用 FTZ 与近似除法
 attention_backward,B2-QH8-KVH2-S1024-D64-fp16-causal,,,,timing_not_measured,同算法：delta/dK-dV/dQ；Triton 共用作者算法；精度细节不同；旧门禁跳过计时
 dense_attention_forward,B2-QH32-KVH8-S4096-D128-bf16-causal,,,,timing_not_measured,同算法：causal GQA online softmax；FTZ 与近似除法差异；旧门禁跳过计时
 grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,,,,timing_not_measured,同算法：split-K attention 与 LSE 加权合并；精度及 workspace 表示差异；旧门禁跳过计时
@@ -20,7 +20,7 @@ chunked_softmax,8192x32768-bf16,,,,algorithm_mismatch,算法组织不同：Inten
 rope_qk,B2-S4096-QH32-KVH8-D128-bf16,,,,timing_not_measured,同算法：RoPE half rotation；中间精度不同；保留 Triton 同族算法；旧门禁跳过计时
 gelu,8192x4096-fp16-tanh,,,,timing_not_measured,同算法：tanh GELU；f16 中间舍入不同；旧门禁跳过计时
 geglu,4096x28672-fp16-tanh,,,,timing_not_measured,同算法：tanh GELU 乘 up；f16 中间舍入不同；旧门禁跳过计时
-relu,8192x4096-fp16,,,,timing_not_measured,同算法：ReLU；NaN 传播差异不阻止正常输入性能比较；旧门禁跳过计时
+relu,8192x4096-fp16,0.087696,0.087824,0.998543,pass,同算法；NaN 传播方式不同
 dropout,8192x4096-fp16-p0.1,0.087840,0.087856,0.999818,pass,
 attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,,,,timing_not_measured,同算法：causal GQA 与 attention sink；精度及 source 布局拷贝差异；计时范围需注明；旧门禁跳过计时
 attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,,,,timing_not_measured,同算法：split-K GQA 与 attention sink；bf16 LSE 及 source K/V 布局拷贝差异；计时范围需注明；旧门禁跳过计时
