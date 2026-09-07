@@ -86,8 +86,8 @@ mlir::FailureOr<AxisMapAttr> queryAxisMap(mlir::Type type,
 mlir::FailureOr<int64_t> queryRangeDimension(MakeRangeOp range);
 bool samePhysicalScalarExpression(mlir::Value lhs, mlir::Value rhs);
 
-/// A compile-time exclusive upper bound for a proven non-negative scalar
-/// index, derived from the current launch mapping. Null means unknown.
+/// A compile-time inclusive upper bound for a proven non-negative scalar
+/// index, derived from current mapping, dimensions and clamps. Null means unknown.
 PhysicalExprAttr queryNonNegativeIndexUpperBound(mlir::Value value);
 
 /// Returns the single typed binary operation implemented by a two-argument

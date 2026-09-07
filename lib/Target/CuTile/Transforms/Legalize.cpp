@@ -1129,7 +1129,7 @@ FailureOr<Value> materializeTileOriginGuard(
           owner->getLoc(), builder.getIndexType(), upper);
       Value allOriginsInBounds = builder.create<gpu::CompareOp>(
           owner->getLoc(), builder.getI1Type(), bound, extent,
-          ComparePredicate::Le);
+          ComparePredicate::Lt);
       // Specialization can discharge the whole mapped domain. Otherwise the
       // original per-origin predicate still determines exactly the same access.
       axisCondition = builder.create<gpu::BinaryOp>(
@@ -2948,14 +2948,22 @@ void realizeWideLoops(func::FuncOp kernel) {
       for (Value bound : {loop.getLowerBound(), loop.getUpperBound()}) {
         if (bound != loop.getUpperBound() && fitsNativeLoopBound(bound))
           continue;
-        Value lower = builder.create<gpu::CompareOp>(
-            location, builder.getI1Type(), bound, minimum, ComparePredicate::Ge);
-        Value upper = builder.create<gpu::CompareOp>(
-            location, builder.getI1Type(), bound,
-            bound == loop.getUpperBound() ? maximumUpper : maximum,
-            ComparePredicate::Le);
-        Value fits = builder.create<gpu::BinaryOp>(
-            location, builder.getI1Type(), lower, upper, BinaryOperator::LogicalAnd);
+        Value limit = bound == loop.getUpperBound() ? maximumUpper : maximum;
+        Value fits;
+        if (gpu::PhysicalExprAttr upperBound =
+                gpu::queryNonNegativeIndexUpperBound(bound)) {
+          Value symbolic = builder.create<gpu::PhysicalExprOp>(
+              location, builder.getIndexType(), upperBound);
+          fits = builder.create<gpu::CompareOp>(
+              location, builder.getI1Type(), symbolic, limit, ComparePredicate::Le);
+        } else {
+          Value lower = builder.create<gpu::CompareOp>(
+              location, builder.getI1Type(), bound, minimum, ComparePredicate::Ge);
+          Value upper = builder.create<gpu::CompareOp>(
+              location, builder.getI1Type(), bound, limit, ComparePredicate::Le);
+          fits = builder.create<gpu::BinaryOp>(
+              location, builder.getI1Type(), lower, upper, BinaryOperator::LogicalAnd);
+        }
         condition = condition ? Value(builder.create<gpu::BinaryOp>(
                                     location, builder.getI1Type(), condition, fits,
                                     BinaryOperator::LogicalAnd))

@@ -946,8 +946,12 @@ bool samePhysicalScalarExpression(Value lhs, Value rhs) {
 }
 
 PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
-  std::function<PhysicalExprAttr(Value, unsigned)> bound =
-      [&](Value current, unsigned depth) -> PhysicalExprAttr {
+  struct Bounds {
+    bool nonNegative = false;
+    PhysicalExprAttr upper;
+  };
+  std::function<Bounds(Value, unsigned)> bound =
+      [&](Value current, unsigned depth) -> Bounds {
     if (!current || depth >= 32 || !current.getType().isIndex())
       return {};
     current = stripScalarIdentity(current);
@@ -960,6 +964,41 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
     };
     if (auto coordinate = current.getDefiningOp<WorksetCoordinateOp>())
       return bound(coordinate.getCoordinate(), depth + 1);
+    if (current.getDefiningOp<ProgramIdOp>())
+      return {true, {}};
+    auto dimensionExpression = [&](BlockArgument argument) -> PhysicalExprAttr {
+      auto kernel = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
+      DictionaryAttr attributes =
+          kernel ? kernel.getArgAttrDict(argument.getArgNumber())
+                 : DictionaryAttr();
+      auto kind = attributes ? attributes.getAs<StringAttr>(abiKindAttr)
+                             : StringAttr();
+      auto dimension = attributes
+                           ? attributes.getAs<IntegerAttr>(dimensionAttr)
+                           : IntegerAttr();
+      if (!kind || kind.getValue() != "dimension" || !dimension)
+        return {};
+      return PhysicalExprAttr::get(
+          current.getContext(), static_cast<uint32_t>(PhysicalExprKind::Dimension),
+          dimension.getInt(),
+          StringAttr::get(current.getContext(),
+                          "D" + std::to_string(dimension.getInt())),
+          ArrayAttr::get(current.getContext(), {}));
+    };
+    if (auto dim = current.getDefiningOp<DimOp>())
+      return {true, resourceExtentExpression(dim.getView(), dim.getAxis())};
+    if (auto argument = dyn_cast<BlockArgument>(current))
+      if (PhysicalExprAttr dimension = dimensionExpression(argument))
+        return {true, dimension};
+    if (auto parameter = current.getDefiningOp<ParameterOp>()) {
+      auto schema = parameter.getParameter();
+      if (llvm::all_of(schema.getCandidates().asArrayRef(),
+                       [](int64_t candidate) { return candidate >= 0; }))
+        return {true, PhysicalExprAttr::get(
+            current.getContext(), static_cast<uint32_t>(PhysicalExprKind::Parameter),
+            0, schema.getName(), ArrayAttr::get(current.getContext(), {}))};
+      return {};
+    }
     if (auto result = dyn_cast<OpResult>(current))
       if (auto mapping = dyn_cast<DelinearizeOp>(result.getOwner())) {
         if (!valueKnownNonNegative(mapping.getLinear()) ||
@@ -969,52 +1008,81 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
           return {};
         Value extent = stripScalarIdentity(
             mapping.getExtents()[result.getResultNumber()]);
-        if (auto physical = extent.getDefiningOp<PhysicalExprOp>())
-          return physical.getExpression();
-        if (auto dim = extent.getDefiningOp<DimOp>())
-          return resourceExtentExpression(dim.getView(), dim.getAxis());
-        if (auto argument = dyn_cast<BlockArgument>(extent)) {
-          auto kernel = dyn_cast<func::FuncOp>(
-              argument.getOwner()->getParentOp());
-          DictionaryAttr attributes =
-              kernel ? kernel.getArgAttrDict(argument.getArgNumber())
-                     : DictionaryAttr();
-          auto kind = attributes ? attributes.getAs<StringAttr>(abiKindAttr)
-                                 : StringAttr();
-          auto dimension = attributes
-                               ? attributes.getAs<IntegerAttr>(dimensionAttr)
-                               : IntegerAttr();
-          if (kind && kind.getValue() == "dimension" && dimension)
-            return PhysicalExprAttr::get(
-                current.getContext(),
-                static_cast<uint32_t>(PhysicalExprKind::Dimension),
-                dimension.getInt(),
-                StringAttr::get(current.getContext(),
-                                "D" + std::to_string(dimension.getInt())),
-                ArrayAttr::get(current.getContext(), {}));
-        }
         if (std::optional<int64_t> constant = integerConstant(extent))
-          return expression(PhysicalExprKind::Constant, *constant);
-        return {};
+          return {true, expression(PhysicalExprKind::Constant,
+                                   std::max<int64_t>(*constant - 1, 0))};
+        PhysicalExprAttr upper;
+        if (auto physical = extent.getDefiningOp<PhysicalExprOp>())
+          upper = physical.getExpression();
+        else if (auto dim = extent.getDefiningOp<DimOp>())
+          upper = resourceExtentExpression(dim.getView(), dim.getAxis());
+        else if (auto argument = dyn_cast<BlockArgument>(extent))
+          upper = dimensionExpression(argument);
+        if (!upper)
+          return {};
+        return {true, expression(PhysicalExprKind::Maximum, 0,
+            {expression(PhysicalExprKind::Subtract, 0,
+                        {upper, expression(PhysicalExprKind::Constant, 1)}),
+             expression(PhysicalExprKind::Constant, 0)})};
       }
     if (std::optional<int64_t> constant = integerConstant(current)) {
-      if (*constant >= 0 && *constant < std::numeric_limits<int64_t>::max())
-        return expression(PhysicalExprKind::Constant, *constant + 1);
+      if (*constant >= 0)
+        return {true, expression(PhysicalExprKind::Constant, *constant)};
       return {};
     }
-    auto divide = current.getDefiningOp<BinaryOp>();
-    if (!divide || divide.getOperatorKind() != BinaryOperator::FloorDivide)
+    auto binary = current.getDefiningOp<BinaryOp>();
+    if (!binary)
       return {};
-    std::optional<int64_t> divisor = integerConstant(divide.getRhs());
-    if (!divisor || *divisor <= 0)
+    Bounds lhs = bound(binary.getLhs(), depth + 1);
+    Bounds rhs = bound(binary.getRhs(), depth + 1);
+    if (binary.getOperatorKind() == BinaryOperator::Minimum) {
+      PhysicalExprAttr upper = lhs.upper && rhs.upper
+          ? expression(PhysicalExprKind::Minimum, 0, {lhs.upper, rhs.upper})
+          : lhs.upper ? lhs.upper : rhs.upper;
+      return {lhs.nonNegative && rhs.nonNegative, upper};
+    }
+    if (binary.getOperatorKind() == BinaryOperator::Maximum)
+      return {lhs.nonNegative || rhs.nonNegative,
+              lhs.upper && rhs.upper
+                  ? expression(PhysicalExprKind::Maximum, 0, {lhs.upper, rhs.upper})
+                  : PhysicalExprAttr()};
+    auto positiveDivisor = [&](Value divisor) -> PhysicalExprAttr {
+      if (auto constant = integerConstant(divisor))
+        return *constant > 0
+                   ? expression(PhysicalExprKind::Constant, *constant)
+                   : PhysicalExprAttr();
+      if (auto parameter = divisor.getDefiningOp<ParameterOp>())
+        if (llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
+                         [](int64_t candidate) { return candidate > 0; }))
+          return bound(divisor, depth + 1).upper;
       return {};
-    PhysicalExprAttr upper = bound(divide.getLhs(), depth + 1);
-    if (!upper)
-      return {};
-    return expression(PhysicalExprKind::CeilDiv, 0,
-                      {upper, expression(PhysicalExprKind::Constant, *divisor)});
+    };
+    if (binary.getOperatorKind() == BinaryOperator::FloorDivide) {
+      PhysicalExprAttr divisor = positiveDivisor(binary.getRhs());
+      return {lhs.nonNegative && bool(divisor),
+              lhs.upper && divisor
+                  ? expression(PhysicalExprKind::FloorDiv, 0, {lhs.upper, divisor})
+                  : PhysicalExprAttr()};
+    }
+    if (binary.getOperatorKind() == BinaryOperator::Multiply) {
+      // Aligning a non-negative index down cannot overflow or exceed that index.
+      // Ordinary add/multiply do wrap and therefore are not monotonic bounds.
+      for (auto [quotient, factor] :
+           {std::pair{binary.getLhs(), binary.getRhs()},
+            std::pair{binary.getRhs(), binary.getLhs()}}) {
+        auto divide = quotient.getDefiningOp<BinaryOp>();
+        if (divide && divide.getOperatorKind() == BinaryOperator::FloorDivide &&
+            sameScalarExpression(divide.getRhs(), factor) && positiveDivisor(factor)) {
+          Bounds dividend = bound(divide.getLhs(), depth + 1);
+          if (dividend.nonNegative)
+            return dividend;
+        }
+      }
+    }
+    return {};
   };
-  return bound(value, 0);
+  Bounds result = bound(value, 0);
+  return result.nonNegative ? result.upper : PhysicalExprAttr();
 }
 
 bool sameLogicalRange(MakeRangeOp lhs, MakeRangeOp rhs) {
