@@ -1935,7 +1935,8 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   });
   for (gpu::AssumeInBoundsOp assumption : boundsAssumptions)
     assumption.erase();
-  if (failed(verifyTritonProgram(module)))
+  if (failed(gpu::eliminateCommonValues(module)) ||
+      failed(verifyTritonProgram(module)))
     return failure();
   kernel->setAttr(legalizedAttr, UnitAttr::get(module.getContext()));
   return success();

@@ -130,6 +130,10 @@ LogicalResult refineMapping(ModuleOp module, func::FuncOp) {
   return refineProgramMapping(module);
 }
 
+LogicalResult simplifyValues(ModuleOp module, func::FuncOp) {
+  return eliminateCommonValues(module);
+}
+
 LogicalResult closeSharedConfigurations(func::FuncOp kernel,
                                         const TuningProfiles &profiles) {
   eraseUnusedPhysicalParameters(kernel);
@@ -170,6 +174,7 @@ LogicalResult runSharedGPUPasses(ModuleOp module, const TuningProfiles &profiles
       {"realize-contractions", realizeContractionGroup},
       {"compose-realized-accesses", composeRealizedAccesses},
       {"refine-program-mapping", refineMapping},
+      {"eliminate-common-values", simplifyValues},
   };
   for (const TransformationGroup &group : groups) {
     if (failed(group.run(module, *kernel)))

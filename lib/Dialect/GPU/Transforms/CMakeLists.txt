@@ -7,6 +7,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   RealizeRegionFold.cpp
   RealizeReductionBlocking.cpp
   RefineProgramMapping.cpp
+  EliminateCommonValues.cpp
   MaterializeConfigTuples.cpp
   TuningProfiles.cpp
   OnlineSummary.cpp
@@ -19,6 +20,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   MLIRFuncDialect
   MLIRIR
   MLIRSCFDialect
+  MLIRSideEffectInterfaces
   MLIRIntentGPUAnalysis
   MLIRIntentGPUDialect
 )

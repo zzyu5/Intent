@@ -3099,6 +3099,8 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   preserveNativeIndexValues(*kernel);
   if (failed(collapseArrayViews(module)))
     return failure();
+  if (failed(gpu::eliminateCommonValues(module)))
+    return failure();
   if (ArrayAttr bounds = arrayIndexTileBounds(*kernel))
     (*kernel)->setAttr(arrayIndexTileBoundsAttr, bounds);
   if (failed(verifyCuTileProgram(module)))

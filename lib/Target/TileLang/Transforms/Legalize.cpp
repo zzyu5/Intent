@@ -571,7 +571,8 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
     return failure();
   (*kernel)->setAttr(lowerPredicatedLoadStoreAttr,
                      BoolAttr::get(module.getContext(), true));
-  if (failed(verifyTileLangProgram(module)))
+  if (failed(gpu::eliminateCommonValues(module)) ||
+      failed(verifyTileLangProgram(module)))
     return failure();
   (*kernel)->setAttr(legalizedAttr, UnitAttr::get(module.getContext()));
   return success();

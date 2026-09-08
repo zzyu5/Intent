@@ -2095,8 +2095,12 @@ FailureOr<bool> realizeSegmentNativeReduction(ContractOp contract,
   return true;
 }
 
-FailureOr<bool> realizeStructuredNativeReduction(ContractOp contract,
-                                                 func::FuncOp kernel) {
+LogicalResult realizeReductionTraversal(ContractOp contract, func::FuncOp kernel,
+                                        SmallVectorImpl<ContractOp> &replayed);
+
+FailureOr<bool> realizeStructuredNativeReduction(
+    ContractOp contract, func::FuncOp kernel,
+    SmallVectorImpl<ContractOp> &replayed) {
   if (contract.getLhsReductionAxes().size() != 1 ||
       contract.getRhsReductionAxes().size() != 1)
     return false;
@@ -2193,8 +2197,59 @@ FailureOr<bool> realizeStructuredNativeReduction(ContractOp contract,
   if (reductionUsesOwnershipExtent(
           contract, segmented,
           lhsInvariant ? contract.getRhsReductionAxes()
-                       : contract.getLhsReductionAxes()))
-    return false;
+                       : contract.getLhsReductionAxes())) {
+    unsigned lhsAxis = contract.getLhsReductionAxes().front();
+    unsigned rhsAxis = contract.getRhsReductionAxes().front();
+    if (contract.getLhs().getType().getShape()[lhsAxis] !=
+        contract.getRhs().getType().getShape()[rhsAxis])
+      return false;
+    SmallVector<MakeRangeOp> ranges;
+    for (auto [operand, axis] :
+         {std::pair<Value, unsigned>{contract.getLhs(), lhsAxis},
+          std::pair<Value, unsigned>{contract.getRhs(), rhsAxis}}) {
+      FailureOr<MakeRangeOp> range =
+          queryExactLogicalRange(analysis.axisRanges(operand, axis));
+      if (failed(range) || !isUnitStepRange(*range) ||
+          !isZeroPastLogicalEnd(operand, *range))
+        return false;
+      ranges.push_back(*range);
+    }
+    OpBuilder builder(contract);
+    Location location = contract.getLoc();
+    Value complete;
+    for (MakeRangeOp range : ranges) {
+      Value span = binary(builder, location, builder.getIndexType(),
+                          range.getLogicalStop(), range.getLogicalStart(),
+                          BinaryOperator::Subtract);
+      Value beginsAtStart = compare(
+          builder, location, builder.getI1Type(), range.getStart(),
+          range.getLogicalStart(), ComparePredicate::Eq);
+      Value coversExtent = compare(builder, location, builder.getI1Type(),
+                                    range.getExtent(), span,
+                                    ComparePredicate::Ge);
+      Value covered = binary(builder, location, builder.getI1Type(),
+                              beginsAtStart, coversExtent,
+                              BinaryOperator::LogicalAnd);
+      complete = complete
+                     ? binary(builder, location, builder.getI1Type(), complete,
+                              covered, BinaryOperator::LogicalAnd)
+                     : covered;
+    }
+    auto choice = builder.create<scf::IfOp>(
+        location, TypeRange{contract.getResult().getType()}, complete,
+        /*withElseRegion=*/true);
+    OpBuilder native = choice.getThenBodyBuilder();
+    auto product = cast<ContractOp>(native.clone(*contract));
+    native.create<scf::YieldOp>(location, product.getResult());
+    OpBuilder blocked = choice.getElseBodyBuilder();
+    auto reduction = cast<ContractOp>(blocked.clone(*contract));
+    blocked.create<scf::YieldOp>(location, reduction.getResult());
+    if (failed(realizeReductionTraversal(reduction, kernel, replayed)))
+      return failure();
+    contract.getResult().replaceAllUsesWith(choice.getResult(0));
+    contract.erase();
+    return true;
+  }
 
   Value invariant = lhsInvariant ? contract.getLhs() : contract.getRhs();
   unsigned reductionAxis = static_cast<unsigned>(
@@ -4493,7 +4548,7 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
       if (*nativeSegment)
         continue;
       FailureOr<bool> nativeStructured =
-          realizeStructuredNativeReduction(contract, kernel);
+          realizeStructuredNativeReduction(contract, kernel, contracts);
       if (failed(nativeStructured))
         return failure();
       if (*nativeStructured)

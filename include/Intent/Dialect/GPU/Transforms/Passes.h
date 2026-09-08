@@ -123,6 +123,7 @@ mlir::LogicalResult realizeReductionBlocking(mlir::ModuleOp module);
 mlir::LogicalResult realizePointwiseOwnership(mlir::ModuleOp module);
 mlir::LogicalResult realizePointwiseBlocking(mlir::ModuleOp module);
 mlir::LogicalResult refineProgramMapping(mlir::ModuleOp module);
+mlir::LogicalResult eliminateCommonValues(mlir::ModuleOp module);
 mlir::LogicalResult materializeSharedConfigTuples(mlir::func::FuncOp kernel,
                                                  const TuningProfiles &profiles);
 mlir::LogicalResult verifySharedConfigTuples(mlir::func::FuncOp kernel);
