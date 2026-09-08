@@ -55,7 +55,7 @@ def nvfp4_quantize(context: Context) -> PreparedComparison:
         functional_launch(launch_source),
         Tolerance(atol=0.0),
         cuda_graph=True,
-        note="同算法、group16；双方计时均为一次 kernel launch，不含输出分配",
+        note="同算法、group16；CUDA Graph 重放下的算子 GPU 执行延迟，不含编译、调优与输出分配",
     )
 
 

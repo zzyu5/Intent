@@ -35,4 +35,4 @@ sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,1.195072,0.8332
 rms_norm,8192x4096-bf16,0.087688,0.085776,1.022291,pass,同算法；source 额外写 Rstd
 recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,0.787256,0.936160,0.840942,pass,
 chunk_gated_delta,B2-S2048-H8-K128-V128-C64-bf16,0.227376,1.550952,0.146604,pass,同算法；generated 使用 BF16 矩阵输入、FP32 累加与状态，source 使用 TF32 矩阵输入
-nvfp4_quantize,8192x4096-block16-bf16,0.059392,0.057136,1.039485,pass,同算法、group16；双方计时均为一次 kernel launch，不含输出分配
+nvfp4_quantize,8192x4096-block16-bf16,0.059392,0.057136,1.039485,pass,同算法、group16；CUDA Graph 重放下的算子 GPU 执行延迟，不含编译、调优与输出分配

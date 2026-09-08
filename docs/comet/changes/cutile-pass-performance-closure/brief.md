@@ -40,11 +40,11 @@
 - 用户要求以新 change 继续解决 cuTile 性能，并确认沿用此前提出的全表 <= 1.05 目标与 pass 化优化方向。
 - 原计划沿用 `main`，但 Runtime 禁止在已有 active change 的同一目录创建第二个 change；用户随后明确同意独立 worktree。分支为 `comet/cutile-pass-performance-closure`，目标分支为 `main`。
 - 采用一个普通 Native change，不拆 Supervisor：各问题共同影响 shared/provider 编译链与同一性能集合，无法把结果型验收清楚拆成互不重叠的独立交付。主代理负责调查和实现，不把频繁子代理派发作为推进前提。
-- 当前阶段仅建立 Shape；旧 change 的未完成验收不因新 change 创建而变成通过。新 change 的完整范围、两个硬件限制和三个验收结果仍待最终 Shape 确认。
+- 用户已明确确认完整 Shape 并要求开始 Build：72 个可比较设备条目全部 <= 1.05、两个既定 H100 硬件限制、通用 pass 化改进与 A1—A3 保持不变。旧 change 的未完成验收不因本次确认而变成通过。
 
 # Open questions
 
-- [blocking] CONFIRM: 确认按一个普通 change 推进：现有 37 个 cuTile entry 的双机范围中，72 个可比较设备条目全部 G/S <= 1.05，保留两个已确认 H100 硬件限制；通过通用 analyses/passes 与必要作者改进收束性能，保留有效 tuning/JIT 和原容差，只使用现有性能入口。确认后进入 Build。
+无。
 
 # Verification expectations
 

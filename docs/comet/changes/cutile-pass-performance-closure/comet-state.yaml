@@ -1,28 +1,52 @@
 schema: comet.native.v4
 name: cutile-pass-performance-closure
 language: zh-CN
-phase: shape
+phase: build
 status: active
-state_version: 1
+state_version: 2
 brief: brief.md
-spec_changes: []
+spec_changes:
+  - capability: cutile-pass-performance-closure
+    operation: create
+    source: specs/cutile-pass-performance-closure/spec.md
 workspace:
   isolation: worktree
   change_branch: comet/cutile-pass-performance-closure
   target_branch: main
   finish: null
 loop:
-  stage: shape
+  stage: building
   goal_cycle: 1
-  iteration: 0
+  iteration: 1
   attempt: 0
   retry_epoch: 0
   failed_iteration_count: 0
   no_progress_count: 0
   execution_failure_count: 0
   previous_unresolved_ids: []
-  next_action: confirm-shape
-acceptance: []
+  next_action: submit-builder-candidate
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1：性能修复落实为符合 `doc/` 的作者表达或通用 IR analysis/transformation；适用位置及已有 target
+      消费者一致处理，共同事实保持唯一 authority。每项 compiler 修复能指出实际 IR 改写、适用条件以及
+      Triton/TileLang 同类机制的具体对照，不存在按算子名、source 模板或 serializer 分流替代优化。
+    result: pending
+    reason: null
+  - id: A2
+    source: brief.md
+    text: A2：受影响的 shared/provider 参数形成有限、合法、有实际编译作用的完整候选，由保留的 provider JIT 和 tuner
+      实测选择并复用；参数通过相应 compiler passes 或 provider 编译选项落实为具体程序，不以固定
+      winner、无依据收缩、无效组合或不断增加候选掩盖结构缺口。
+    result: pending
+    reason: null
+  - id: A3
+    source: brief.md
+    text: A3：Spec 固定的 72 个可比较设备条目均完成原容差检查和同算法、同 case 的 GPU 性能比较，每项 G/S <=
+      1.05，结果位于对应项目 CSV；两个既定 H100 硬件限制仍明确可见。计时不混淆 CPU launch 与 GPU
+      执行，完成一项即更新该项；任何其余失败、空值或超标均使本目标保持未完成。
+    result: pending
+    reason: null
 builder_handoff: null
 blockers: []
 verification: null
