@@ -28,6 +28,7 @@ constexpr llvm::StringLiteral accessFormParameter = "CUTILE_ACCESS_FORM";
 constexpr llvm::StringLiteral occupancyParameter = "CUTILE_OCCUPANCY";
 constexpr llvm::StringLiteral loadPolicyParameter = "CUTILE_LOAD_POLICY";
 constexpr llvm::StringLiteral ctasParameter = "CUTILE_CTAS";
+constexpr llvm::StringLiteral workerWarpsParameter = "CUTILE_WORKER_WARPS";
 constexpr int64_t nativeAccessForm = 1;
 constexpr int64_t gatherAccessForm = 2;
 constexpr int64_t nativeNoTMAForm = 3;
@@ -38,6 +39,8 @@ bool isLegalAccessForm(int64_t value) {
 }
 
 bool isLegalOccupancy(int64_t value) { return value >= 1 && value <= 32; }
+
+bool isLegalWorkerWarps(int64_t value) { return value == 4 || value == 8; }
 
 bool isLegalCTAs(int64_t value) {
   return value >= 1 && value <= 16 && llvm::isPowerOf2_64(value);
@@ -51,6 +54,7 @@ bool isCuTileProviderRole(gpu::ParameterRole role) {
   return role == gpu::ParameterRole::ProviderAccessForm ||
          role == gpu::ParameterRole::ProviderOccupancy ||
          role == gpu::ParameterRole::ProviderLoadPolicy ||
+         role == gpu::ParameterRole::ProviderWarps ||
          role == gpu::ParameterRole::ProviderCTAs;
 }
 
@@ -1626,6 +1630,11 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
           kernel, profiles, "ctas", ctasParameter,
           gpu::ParameterRole::ProviderCTAs, isLegalCTAs)))
     return failure();
+  if (matrixCompute &&
+      failed(declareProviderParameter(
+          kernel, profiles, "worker_warps", workerWarpsParameter,
+          gpu::ParameterRole::ProviderWarps, isLegalWorkerWarps)))
+    return failure();
   gpu::PhysicalProgramAnalysis analysis(kernel);
   Value accessForm;
   Value loadPolicy;
@@ -1746,29 +1755,22 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
     }
     Value replacementResult;
     SmallVector<Operation *> createdOperations;
-    Value nativeLatency;
-    if (native && matrixCompute && load->getParentOfType<scf::ForOp>()) {
-      auto form = accessFormValue();
-      if (failed(form))
-        return failure();
-      auto definition = (*form).getDefiningOp<gpu::ParameterOp>().getParameter();
-      if (llvm::any_of(definition.getCandidates().asArrayRef(),
-                       [](int64_t candidate) { return candidate != gatherAccessForm; })) {
-        if (!loadPolicy) {
-          auto parameter = declareProviderParameter(
-              kernel, profiles, "load_policy_loop", loadPolicyParameter,
-              gpu::ParameterRole::ProviderLoadPolicy, isLegalLoadPolicy);
-          if (failed(parameter))
-            return failure();
-          loadPolicy = parameter->getResult();
-        }
-        nativeLatency = loadPolicy;
+    Value loopLatency;
+    if (matrixCompute && load->getParentOfType<scf::ForOp>()) {
+      if (!loadPolicy) {
+        auto parameter = declareProviderParameter(
+            kernel, profiles, "load_policy_loop", loadPolicyParameter,
+            gpu::ParameterRole::ProviderLoadPolicy, isLegalLoadPolicy);
+        if (failed(parameter))
+          return failure();
+        loadPolicy = parameter->getResult();
       }
+      loopLatency = loadPolicy;
     }
     auto emitNativeLoad = [&](OpBuilder &nested) {
       auto tile = nested.create<TileLoadOp>(
           load.getLoc(), plan->resourceType, load.getResource(), *allowTMA,
-          indices->values, nativeLatency);
+          indices->values, loopLatency);
       Value value = tile.getResult();
       createdOperations.push_back(tile);
       if (plan->resourceToPacked) {
@@ -1798,7 +1800,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
         return failure();
       auto replacement = nested.create<GatherLoadOp>(
           load.getLoc(), result, load.getResource(), *materialized,
-          load.getValid(), *fill, identityAxes(view.getRank()));
+          load.getValid(), *fill, loopLatency, identityAxes(view.getRank()));
       createdOperations.push_back(replacement);
       return replacement.getResult();
     };
@@ -2447,10 +2449,21 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
       continue;
     auto definition = option.getParameter();
     auto forms = definition.getCandidates().asArrayRef();
-    // Explore joint CTA/occupancy settings, then sample each independent
-    // latency/access alternative at the endpoints of the existing settings.
-    SmallVector<SmallVector<NamedAttribute>> anchors{
-        providerConfigurations.front(), providerConfigurations.back()};
+    // Memory scheduling and occupancy interact through the register/shared
+    // memory budget. Preserve each occupancy setting at both core anchors.
+    auto matchesCore = [&](ArrayRef<NamedAttribute> candidate,
+                           ArrayRef<NamedAttribute> anchor) {
+      NamedAttrList bindings(anchor);
+      return llvm::all_of(candidate, [&](NamedAttribute attribute) {
+        return attribute.getName().getValue() == occupancyParameter ||
+               bindings.get(attribute.getName()) == attribute.getValue();
+      });
+    };
+    SmallVector<SmallVector<NamedAttribute>> anchors;
+    for (const auto &configuration : providerConfigurations)
+      if (matchesCore(configuration, providerConfigurations.front()) ||
+          matchesCore(configuration, providerConfigurations.back()))
+        anchors.push_back(configuration);
     for (auto &configuration : providerConfigurations)
       configuration.push_back(builder.getNamedAttr(
           definition.getName(), builder.getI64IntegerAttr(forms.front())));
@@ -2462,18 +2475,6 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
         if (!llvm::is_contained(providerConfigurations, configuration))
           providerConfigurations.push_back(std::move(configuration));
       }
-  }
-  if (accessForm && loadPolicy) {
-    auto accessName = accessForm.getParameter().getName();
-    auto latency = loadPolicy.getParameter();
-    for (auto &configuration : providerConfigurations) {
-      NamedAttrList bindings(configuration);
-      if (cast<IntegerAttr>(bindings.get(accessName)).getInt() != gatherAccessForm)
-        continue;
-      bindings.set(latency.getName(), builder.getI64IntegerAttr(
-                                         latency.getCandidates().asArrayRef().front()));
-      configuration.assign(bindings.begin(), bindings.end());
-    }
   }
   SmallVector<SmallVector<NamedAttribute>> expanded;
   for (const auto &base : configurations)
@@ -2724,6 +2725,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
   gpu::ParameterOp accessForm;
   gpu::ParameterOp occupancy;
   gpu::ParameterOp ctas;
+  gpu::ParameterOp workerWarps;
   gpu::ParameterOp loadPolicy;
   LogicalResult parameterSchema = success();
   kernel.walk([&](gpu::ParameterOp parameter) {
@@ -2768,6 +2770,18 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
       ctas = parameter;
       return;
     }
+    if (role == gpu::ParameterRole::ProviderWarps) {
+      if (workerWarps || schema.getName().getValue() != workerWarpsParameter ||
+          candidates.empty() || !llvm::all_of(candidates, isLegalWorkerWarps) ||
+          !parameter.getResult().use_empty()) {
+        parameter.emitOpError(
+            "has an invalid or duplicate cuTile worker-warp hint schema");
+        parameterSchema = failure();
+        return;
+      }
+      workerWarps = parameter;
+      return;
+    }
     if (role == gpu::ParameterRole::ProviderLoadPolicy) {
       if (loadPolicy || schema.getName().getValue() != loadPolicyParameter ||
           candidates.empty() || !llvm::all_of(candidates, isLegalLoadPolicy) ||
@@ -2778,9 +2792,11 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
       }
       for (OpOperand &use : parameter.getResult().getUses()) {
         auto load = dyn_cast<TileLoadOp>(use.getOwner());
-        if (!load || load.getLatencyPolicy() != parameter.getResult()) {
+        auto gather = dyn_cast<GatherLoadOp>(use.getOwner());
+        if ((!load || load.getLatencyPolicy() != parameter.getResult()) &&
+            (!gather || gather.getLatencyPolicy() != parameter.getResult())) {
           parameter.emitOpError(
-              "cuTile load latency must bind native load decisions");
+              "cuTile load latency must bind a tile or gather load");
           parameterSchema = failure();
           return;
         }

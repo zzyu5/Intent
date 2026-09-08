@@ -1021,6 +1021,142 @@ struct OnlineRegionPlan {
   OnlineSummaryMerge merge;
 };
 
+struct AdditiveRegionContract {
+  ContractOp summary;
+  BinaryOp merge;
+};
+
+Value stripAdditiveProjection(Value value, bool singleUse = false) {
+  auto elementType = [](Type type) {
+    auto fragment = dyn_cast<FragmentType>(type);
+    return fragment ? fragment.getElementType() : type;
+  };
+  while (value) {
+    if (singleUse && !value.hasOneUse())
+      return {};
+    Operation *operation = value.getDefiningOp();
+    if (!operation)
+      break;
+    if (auto cast = dyn_cast<CastOp>(operation)) {
+      if (elementType(cast.getValue().getType()) !=
+          elementType(cast.getResult().getType()))
+        break;
+    } else if (!isa<BroadcastOp, ReshapeOp, TransposeOp>(operation)) {
+      break;
+    }
+    value = operation->getOperand(0);
+  }
+  return value;
+}
+
+bool isLiteralZeroProjection(Value value) {
+  while (Operation *operation = value.getDefiningOp()) {
+    if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
+      if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
+        return integer.getValue().isZero();
+      if (auto floating = dyn_cast<FloatAttr>(constant.getValue()))
+        return floating.getValue().isZero();
+      return false;
+    }
+    if (!isa<SplatOp, BroadcastOp, ReshapeOp, TransposeOp, CastOp>(operation))
+      return false;
+    value = operation->getOperand(0);
+  }
+  return false;
+}
+
+SmallVector<AdditiveRegionContract>
+additiveRegionContracts(RegionFoldOp fold, ValueRange identities) {
+  SmallVector<AdditiveRegionContract> result;
+  if (identities.size() != 1)
+    return result;
+  auto identity = identities.front().getDefiningOp<MakeRecordOp>();
+  auto summaryYield = cast<YieldOp>(fold.getSummarize().front().getTerminator());
+  auto mergeYield = cast<YieldOp>(fold.getCombine().front().getTerminator());
+  auto summary = summaryYield.getValues().front().getDefiningOp<MakeRecordOp>();
+  auto merged = mergeYield.getValues().front().getDefiningOp<MakeRecordOp>();
+  if (!identity || !summary || !merged)
+    return result;
+  Block &combine = fold.getCombine().front();
+  for (auto [field, value] : llvm::enumerate(summary.getFields())) {
+    Value contracted = stripAdditiveProjection(value, /*singleUse=*/true);
+    Value mergedField = stripAdditiveProjection(merged.getFields()[field]);
+    auto contract = contracted ? contracted.getDefiningOp<ContractOp>()
+                               : ContractOp();
+    auto add = mergedField ? mergedField.getDefiningOp<BinaryOp>() : BinaryOp();
+    if (!contract || !contract->hasOneUse() || !add ||
+        add.getOperatorKind() != BinaryOperator::Add ||
+        !isRecordField(stripAdditiveProjection(add.getLhs()),
+                       combine.getArgument(0), field) ||
+        !isRecordField(stripAdditiveProjection(add.getRhs()),
+                       combine.getArgument(1), field) ||
+        cast<FragmentType>(value.getType()).getElementType() !=
+            contract.getResult().getType().getElementType() ||
+        !isLiteralZeroProjection(contract.getAccumulator()))
+      continue;
+    if (isLiteralZeroProjection(identity.getFields()[field]))
+      result.push_back({contract, add});
+  }
+  return result;
+}
+
+void coRealizeAdditiveRegion(OpBuilder &builder, Location location,
+                            ArrayRef<AdditiveRegionContract> contracts,
+                            IRMapping &summaryMapping,
+                            IRMapping &mergeMapping) {
+  for (AdditiveRegionContract plan : contracts) {
+    Value summary = summaryMapping.lookup(plan.summary.getResult());
+    Value merged = mergeMapping.lookup(plan.merge.getResult());
+    auto contract = summary.getDefiningOp<ContractOp>();
+    auto add = merged.getDefiningOp<BinaryOp>();
+    DominanceInfo dominance(contract->getParentOfType<func::FuncOp>());
+    OpBuilder::InsertionGuard insertion(builder);
+    builder.setInsertionPoint(contract);
+    IRMapping carryMapping;
+    std::function<FailureOr<Value>(Value)> projectCarry =
+        [&](Value value) -> FailureOr<Value> {
+      if (dominance.dominates(value, contract))
+        return value;
+      if (Value mapped = carryMapping.lookupOrNull(value))
+        return mapped;
+      Operation *definition = value.getDefiningOp();
+      if (!definition ||
+          !isa<ExtractOp, MakeRecordOp, BroadcastOp, ReshapeOp, TransposeOp,
+               SplatOp, CastOp, arith::ConstantOp>(definition))
+        return failure();
+      for (Value operand : definition->getOperands()) {
+        FailureOr<Value> mapped = projectCarry(operand);
+        if (failed(mapped))
+          return failure();
+        carryMapping.map(operand, *mapped);
+      }
+      builder.clone(*definition, carryMapping);
+      return carryMapping.lookup(value);
+    };
+    FailureOr<Value> leftCarry = projectCarry(add.getLhs());
+    if (failed(leftCarry))
+      continue;
+    FailureOr<Value> carry = projectPhysicalValueToSchema(
+        builder, location, *leftCarry, contract.getResult().getType());
+    if (failed(carry))
+      continue;
+    // The fold's ordered homomorphism permits carrying the preceding sum
+    // through the next slice's contraction. Ordinary adjacent float adds
+    // outside this declared reduction boundary are not rewritten here.
+    auto direct = builder.create<ContractOp>(
+        location, contract.getResult().getType(), contract.getLhs(),
+        contract.getRhs(), *carry, contract.getLhsReductionAxes(),
+        contract.getRhsReductionAxes(), contract.getLhsBatchAxes(),
+        contract.getRhsBatchAxes());
+    if (Attribute origin = contract->getAttr(originAttr))
+      direct->setAttr(originAttr, origin);
+    FailureOr<Value> projected = projectPhysicalValueToSchema(
+        builder, location, direct.getResult(), add.getResult().getType());
+    if (succeeded(projected))
+      add.getResult().replaceAllUsesWith(*projected);
+  }
+}
+
 std::optional<OnlineRegionPlan>
 onlineRegionPlan(RegionFoldOp fold,
                  const std::optional<SummaryEmptinessPlan> &emptiness) {
@@ -2043,6 +2179,9 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   std::optional<SummaryEmptinessPlan> emptiness =
       summaryEmptinessPlan(fold, identities, memberPredicate);
   std::optional<OnlineRegionPlan> online = onlineRegionPlan(fold, emptiness);
+  SmallVector<AdditiveRegionContract> additive =
+      additiveRegionContracts(fold, identities);
+  bool needsSummaryMapping = online || !additive.empty();
 
   bool bodyFailed = false;
   std::string failureReason;
@@ -2122,7 +2261,8 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
         IRMapping summaryMapping;
         FailureOr<SmallVector<Value>> summary = emitSummary(
             nested, nestedLocation, offset, fullSegment, predicateIsTrue,
-            /*summaryIsNonempty=*/false, online ? &summaryMapping : nullptr);
+            /*summaryIsNonempty=*/false,
+            needsSummaryMapping ? &summaryMapping : nullptr);
         if (failed(summary)) {
           bodyFailed = true;
           return;
@@ -2132,7 +2272,8 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
         IRMapping mergeMapping;
         FailureOr<SmallVector<Value>> combined = inlinePureRegion(
             nested, fold.getCombine(), combineArguments, failureReason,
-            {}, {}, {}, {}, {}, {}, online ? &mergeMapping : nullptr);
+            {}, {}, {}, {}, {}, {},
+            needsSummaryMapping ? &mergeMapping : nullptr);
         if (failed(combined)) {
           bodyFailed = true;
           return;
@@ -2143,6 +2284,8 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
           if (succeeded(direct))
             combined->front() = *direct;
         }
+        coRealizeAdditiveRegion(nested, nestedLocation, additive,
+                               summaryMapping, mergeMapping);
         nested.create<scf::YieldOp>(nestedLocation, *combined);
       });
     if (Attribute origin = fold->getAttr(originAttr))
@@ -2232,8 +2375,8 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
             IRMapping summaryMapping;
             FailureOr<SmallVector<Value>> summary = emitSummary(
                 nested, nestedLocation, offset, fullSegment, predicateIsTrue,
-                summaryIsNonempty,
-                online ? &summaryMapping : nullptr);
+                summaryIsNonempty, needsSummaryMapping ? &summaryMapping
+                                                      : nullptr);
             if (failed(summary) || summary->size() != 1 ||
                 carries.size() != 1) {
               if (succeeded(summary))
@@ -2248,7 +2391,8 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
             FailureOr<SmallVector<Value>> combined = inlinePureRegion(
                 nested, fold.getCombine(),
                 ValueRange{fullCarry, summary->front()}, failureReason,
-                {}, {}, {}, {}, {}, {}, online ? &mergeMapping : nullptr);
+                {}, {}, {}, {}, {}, {},
+                needsSummaryMapping ? &mergeMapping : nullptr);
             if (failed(combined) || combined->size() != 1) {
               if (succeeded(combined))
                 failureReason =
@@ -2264,6 +2408,8 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
               if (succeeded(direct))
                 combinedValue = *direct;
             }
+            coRealizeAdditiveRegion(nested, nestedLocation, additive,
+                                   summaryMapping, mergeMapping);
             FailureOr<Value> next = stripOptionalRecord(
                 nested, nestedLocation, combinedValue, *emptiness);
             if (failed(next)) {

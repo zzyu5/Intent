@@ -137,6 +137,7 @@ bool isCuTileProviderRole(gpu::ParameterRole role) {
   return role == gpu::ParameterRole::ProviderAccessForm ||
          role == gpu::ParameterRole::ProviderOccupancy ||
          role == gpu::ParameterRole::ProviderLoadPolicy ||
+         role == gpu::ParameterRole::ProviderWarps ||
          role == gpu::ParameterRole::ProviderCTAs;
 }
 
@@ -146,6 +147,8 @@ StringRef providerHint(gpu::ParameterOp parameter) {
     return "occupancy";
   if (role == gpu::ParameterRole::ProviderCTAs)
     return "num_ctas";
+  if (role == gpu::ParameterRole::ProviderWarps)
+    return "num_worker_warps";
   return {};
 }
 
@@ -942,6 +945,10 @@ private:
         call += ", mask=" + valueString(gather.getValid());
       if (gather.getFill())
         call += ", padding_value=" + valueString(gather.getFill());
+      if (auto latency = gather.getLatencyPolicy())
+        call += ", latency=(None if " + valueString(latency) + " == " +
+                std::to_string(inferredLoadPolicy) + " else " +
+                valueString(latency) + ")";
       call += ", check_bounds=True)";
       assign(gather.getResult(), call);
     } else if (auto mma = dyn_cast<MMAOp>(operation)) {

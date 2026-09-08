@@ -2299,13 +2299,14 @@ LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
                                         : FailureOr<Type>(failure());
   };
   WalkResult branches = kernel.walk([&](scf::IfOp branch) {
+    if (branch.getNumResults() == 0)
+      return WalkResult::advance();
     auto thenYield = dyn_cast<scf::YieldOp>(branch.thenBlock()->getTerminator());
     auto elseYield = dyn_cast<scf::YieldOp>(branch.elseBlock()->getTerminator());
     if (!thenYield || !elseYield ||
         thenYield.getResults().size() != branch.getNumResults() ||
         elseYield.getResults().size() != branch.getNumResults())
-      return branch.getNumResults() == 0 ? WalkResult::advance()
-                                         : WalkResult::interrupt();
+      return WalkResult::interrupt();
     for (unsigned index = 0; index < branch.getNumResults(); ++index) {
       FailureOr<Type> target = joinTypes(
           branch.getResult(index).getType(),

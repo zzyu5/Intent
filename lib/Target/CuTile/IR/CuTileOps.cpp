@@ -97,6 +97,20 @@ LogicalResult verifySerializedCoordinateOrder(
   return success();
 }
 
+LogicalResult verifyLoadLatency(Operation *operation, Value latency) {
+  if (!latency)
+    return success();
+  auto parameter = latency.getDefiningOp<gpu::ParameterOp>();
+  if (!parameter || parameter.getParameter().getRole() !=
+                        static_cast<uint32_t>(
+                            gpu::ParameterRole::ProviderLoadPolicy) ||
+      !llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
+                    isLegalLoadPolicy))
+    return operation->emitOpError(
+        "load policy requires an inferred or explicit latency domain");
+  return success();
+}
+
 } // namespace
 
 LogicalResult ArrayViewOp::verify() {
@@ -166,16 +180,8 @@ LogicalResult TileLoadOp::verify() {
   auto result = getResult().getType();
   if (!getAllowTma().getType().isInteger(1))
     return emitOpError("allow_tma must be a compile-time i1 access decision");
-  if (Value latency = getLatencyPolicy()) {
-    auto parameter = latency.getDefiningOp<gpu::ParameterOp>();
-    if (!parameter || parameter.getParameter().getRole() !=
-                          static_cast<uint32_t>(
-                              gpu::ParameterRole::ProviderLoadPolicy) ||
-        !llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
-                      isLegalLoadPolicy))
-      return emitOpError(
-          "native load policy requires an inferred or explicit latency domain");
-  }
+  if (failed(verifyLoadLatency(*this, getLatencyPolicy())))
+    return failure();
   auto array = getResource().getDefiningOp<ArrayViewOp>();
   unsigned rank = array ? array.getGroupEnds().size() : view.getRank();
   if (failed(verifyResourceOrderedTile(*this, rank, result,
@@ -280,6 +286,8 @@ void ScalarStoreOp::getEffects(
 }
 
 LogicalResult GatherLoadOp::verify() {
+  if (failed(verifyLoadLatency(*this, getLatencyPolicy())))
+    return failure();
   auto view = getResource().getType();
   if (getCoordinates().size() != view.getRank() ||
       view.getElementType() != getResult().getType().getElementType())

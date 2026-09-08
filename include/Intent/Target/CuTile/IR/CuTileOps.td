@@ -75,6 +75,7 @@ def IntentCuTile_GatherLoadOp : IntentCuTile_Op<"gather_load", [
                        Variadic<IntentGPU_DataValue>:$coordinates,
                        Optional<IntentGPU_DataValue>:$valid,
                        Optional<IntentGPU_ScalarValue>:$fill,
+                       Optional<Index>:$latency_policy,
                        DenseI64ArrayAttr:$source_axes);
   let results = (outs IntentGPU_FragmentValue:$result);
   let hasVerifier = 1;

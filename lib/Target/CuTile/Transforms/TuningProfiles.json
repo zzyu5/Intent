@@ -2,6 +2,7 @@
   "columns": ["value"],
   "families": {
     "ctas": [[1], [2], [4]],
+    "worker_warps": [[4], [8]],
     "access_form": [[1], [2], [3]],
     "load_policy_loop": [[11], [2], [3]],
     "occupancy_loop": [[1], [2]],

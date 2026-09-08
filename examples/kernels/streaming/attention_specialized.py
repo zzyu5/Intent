@@ -61,7 +61,10 @@ def window_attention_values(
         acc_dtype=I.f32,
     )
     if soft_cap > 0.0:
-        scores = I.tanh(scores * (scale / soft_cap), approximate=True) * (
+        scaled_scores = I.fdiv(
+            scores * scale, soft_cap, approximate=True, flush_to_zero=True
+        )
+        scores = I.tanh(scaled_scores, approximate=True) * (
             soft_cap * I.LOG2E
         )
     else:
