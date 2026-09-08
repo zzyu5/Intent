@@ -28,7 +28,10 @@ def contraction_configs(
             configuration.parameters, configuration.values, strict=True,
         ):
             role, axis = parameter.role, parameter.view_axis
-            if role == ParameterRole.PROVIDER_ACCESS_FORM:
+            if role == ParameterRole.PROVIDER_LOAD_POLICY:
+                # Source kernels retain their own load scheduling policy.
+                continue
+            elif role == ParameterRole.PROVIDER_ACCESS_FORM:
                 field = "ACCESS_FORM"
             elif role == ParameterRole.PROVIDER_OCCUPANCY:
                 field = "occupancy"
@@ -72,7 +75,9 @@ def contraction_configs(
             raise PipelineStageError(
                 "source_candidate_binding", "source requires a complete contraction candidate",
             )
-        result.append(SimpleNamespace(**values))
+        candidate = SimpleNamespace(**values)
+        if candidate not in result:
+            result.append(candidate)
     report_stage("adapter_preparation")
     return tuple(result)
 

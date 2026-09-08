@@ -203,7 +203,8 @@ private:
       if (role == gpu::ParameterRole::ProviderWarps ||
           role == gpu::ParameterRole::ProviderCTAs ||
           role == gpu::ParameterRole::ProviderAccessForm ||
-          role == gpu::ParameterRole::ProviderOccupancy) {
+          role == gpu::ParameterRole::ProviderOccupancy ||
+          role == gpu::ParameterRole::ProviderLoadPolicy) {
         parameter.emitOpError(
             "TileLang source cannot bind a foreign provider parameter role");
         failed = true;

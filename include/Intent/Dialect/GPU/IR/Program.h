@@ -93,6 +93,7 @@ enum class ParameterRole : uint32_t {
   ReductionInner = 13,
   ProviderAccessForm = 14,
   ProviderOccupancy = 15,
+  ProviderLoadPolicy = 16,
 };
 
 enum class ParameterCategory : uint32_t {

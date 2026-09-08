@@ -111,7 +111,7 @@ LogicalResult collapseArrayViews(ModuleOp module) {
     }
     auto native = folded.create<TileLoadOp>(
         load.getLoc(), tile, array.getResult(), load.getAllowTma(), indices,
-        load.getLatencyAttr());
+        load.getLatencyPolicy());
     auto restored = folded.create<gpu::ReshapeOp>(
         load.getLoc(), load.getResult().getType(), native.getResult(),
         *reassociation);

@@ -11,6 +11,10 @@
 #include "Intent/Target/CuTile/IR/CuTileOps.h.inc"
 
 namespace intent::cutile {
+inline constexpr int64_t inferredLoadPolicy = 11;
+inline bool isLegalLoadPolicy(int64_t value) {
+  return value >= 1 && value <= inferredLoadPolicy;
+}
 mlir::FailureOr<TileLoadOp> unfoldedArrayLoad(TileLoadOp load);
 }
 

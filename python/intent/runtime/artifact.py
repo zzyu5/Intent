@@ -27,6 +27,7 @@ class ParameterRole(IntEnum):
     REDUCTION_INNER = 13
     PROVIDER_ACCESS_FORM = 14
     PROVIDER_OCCUPANCY = 15
+    PROVIDER_LOAD_POLICY = 16
 
 
 @dataclass(frozen=True, slots=True)

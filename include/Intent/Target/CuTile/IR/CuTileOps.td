@@ -20,12 +20,14 @@ def IntentCuTile_ArrayViewOp : IntentCuTile_Op<"array_view", [Pure]> {
 }
 
 def IntentCuTile_TileLoadOp : IntentCuTile_Op<"tile_load", [
+    AttrSizedOperandSegments,
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
   ]> {
   let arguments = (ins IntentGPU_ViewValue:$resource,
                        IntentGPU_ScalarValue:$allow_tma,
                        Variadic<AnyTypeOf<[Index, I32]>>:$tile_indices,
-                       OptionalAttr<I64Attr>:$latency);
+                       // 1..10 select an explicit latency; 11 retains inference.
+                       Optional<Index>:$latency_policy);
   let results = (outs IntentGPU_FragmentValue:$result);
   let hasVerifier = 1;
 }

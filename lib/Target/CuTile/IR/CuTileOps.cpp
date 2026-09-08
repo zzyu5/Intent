@@ -152,7 +152,7 @@ FailureOr<TileLoadOp> unfoldedArrayLoad(TileLoadOp load) {
       thenYield.getNumOperands() != 1 || elseYield.getNumOperands() != 1 ||
       original.getResource() != array.getBase() ||
       original.getAllowTma() != load.getAllowTma() ||
-      original.getLatencyAttr() != load.getLatencyAttr() ||
+      original.getLatencyPolicy() != load.getLatencyPolicy() ||
       restore.getValue() != load.getResult() ||
       restore.getResult().getType() != original.getResult().getType() ||
       thenYield.getOperand(0) != restore.getResult() ||
@@ -166,9 +166,16 @@ LogicalResult TileLoadOp::verify() {
   auto result = getResult().getType();
   if (!getAllowTma().getType().isInteger(1))
     return emitOpError("allow_tma must be a compile-time i1 access decision");
-  if (auto latency = getLatency())
-    if (*latency < 1 || *latency > 10)
-      return emitOpError("native load latency must be between 1 and 10");
+  if (Value latency = getLatencyPolicy()) {
+    auto parameter = latency.getDefiningOp<gpu::ParameterOp>();
+    if (!parameter || parameter.getParameter().getRole() !=
+                          static_cast<uint32_t>(
+                              gpu::ParameterRole::ProviderLoadPolicy) ||
+        !llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
+                      isLegalLoadPolicy))
+      return emitOpError(
+          "native load policy requires an inferred or explicit latency domain");
+  }
   auto array = getResource().getDefiningOp<ArrayViewOp>();
   unsigned rank = array ? array.getGroupEnds().size() : view.getRank();
   if (failed(verifyResourceOrderedTile(*this, rank, result,

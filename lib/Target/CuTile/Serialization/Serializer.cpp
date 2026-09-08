@@ -136,6 +136,7 @@ struct CoverageParameter {
 bool isCuTileProviderRole(gpu::ParameterRole role) {
   return role == gpu::ParameterRole::ProviderAccessForm ||
          role == gpu::ParameterRole::ProviderOccupancy ||
+         role == gpu::ParameterRole::ProviderLoadPolicy ||
          role == gpu::ParameterRole::ProviderCTAs;
 }
 
@@ -909,8 +910,10 @@ private:
                          ", shape=" + fragmentShape(load.getResult().getType()) +
                          ", padding_mode=ct.PaddingMode.ZERO, allow_tma=" +
                          valueString(load.getAllowTma());
-      if (auto latency = load.getLatency())
-        call += ", latency=" + std::to_string(*latency);
+      if (auto latency = load.getLatencyPolicy())
+        call += ", latency=(None if " + valueString(latency) + " == " +
+                std::to_string(inferredLoadPolicy) + " else " +
+                valueString(latency) + ")";
       call += ")";
       assign(load.getResult(), call);
     } else if (auto load = dyn_cast<ScalarLoadOp>(operation)) {
