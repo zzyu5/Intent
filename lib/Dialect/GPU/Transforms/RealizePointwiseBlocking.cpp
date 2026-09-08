@@ -3016,6 +3016,7 @@ struct ContractFreeAxisFacts {
   unsigned sides = ContractFreeAxisNone;
   bool regionContraction = false;
   bool batchedContraction = false;
+  unsigned operandElementBitWidth = 0;
 };
 
 ContractFreeAxisFacts contractFreeAxisFacts(func::FuncOp kernel,
@@ -3036,6 +3037,10 @@ ContractFreeAxisFacts contractFreeAxisFacts(func::FuncOp kernel,
         facts.sides |= ContractFreeAxisLhs;
       if (axis.operand == contract.getRhs())
         facts.sides |= ContractFreeAxisRhs;
+      facts.operandElementBitWidth = std::max(
+          facts.operandElementBitWidth,
+          std::max(physicalElementBitWidth(contract.getLhs().getType()),
+                   physicalElementBitWidth(contract.getRhs().getType())));
       auto fold = contract->getParentOfType<RegionFoldOp>();
       if (!fold && !contract.getLhsBatchAxes().empty() &&
           llvm::count_if(freeAxes.axes, [&](const auto &free) {
@@ -4428,6 +4433,32 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     pointwiseOwnershipAxes.push_back(axis);
   }
 
+  bool orderedByStore = false;
+  kernel.walk([&](StoreOp store) {
+    if (orderedByStore)
+      return;
+    llvm::DenseMap<Attribute, int64_t> outputAxes;
+    llvm::SmallDenseSet<int64_t> usedOutputAxes;
+    for (Attribute axis : pointwiseOwnershipAxes) {
+      std::optional<int64_t> outputAxis;
+      for (MakeRangeOp range : axes.lookup(axis)) {
+        std::optional<int64_t> projection = storeAxisForRange(store, range);
+        if (!projection)
+          continue;
+        if (outputAxis && outputAxis != projection)
+          return;
+        outputAxis = projection;
+      }
+      if (!outputAxis || !usedOutputAxes.insert(*outputAxis).second)
+        return;
+      outputAxes[axis] = *outputAxis;
+    }
+    llvm::stable_sort(pointwiseOwnershipAxes, [&](Attribute lhs, Attribute rhs) {
+      return outputAxes.lookup(lhs) < outputAxes.lookup(rhs);
+    });
+    orderedByStore = true;
+  });
+
   llvm::DenseMap<Attribute, CoordinateRole> contractionCoordinateRoles;
   for (auto [ownershipIndex, axis] :
        llvm::enumerate(pointwiseOwnershipAxes)) {
@@ -4436,10 +4467,13 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         ownershipIndex + 2 < pointwiseOwnershipAxes.size();
     unsigned contractSides = ContractFreeAxisNone;
     bool batchedContraction = false;
+    unsigned contractElementBitWidth = 0;
     for (MakeRangeOp range : axes.lookup(axis)) {
       ContractFreeAxisFacts facts = contractFreeAxisFacts(kernel, range);
       contractSides |= facts.sides;
       batchedContraction |= facts.batchedContraction;
+      contractElementBitWidth =
+          std::max(contractElementBitWidth, facts.operandElementBitWidth);
     }
     ParameterRole ownershipRole = ParameterRole::OwnershipN;
     auto declaredRole =
@@ -4473,9 +4507,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       category = static_cast<uint32_t>(ParameterCategory::Contraction);
     auto schema = ParameterAttr::get(
         module.getContext(), parameter.getParameter().getName(),
-        static_cast<uint32_t>(ownershipRole),
-        category,
-        pointwiseElementBitWidth, candidates);
+        static_cast<uint32_t>(ownershipRole), category,
+        category == static_cast<uint32_t>(ParameterCategory::Contraction) &&
+                contractElementBitWidth != 0
+            ? contractElementBitWidth
+            : pointwiseElementBitWidth,
+        candidates);
     parameter->setAttr("parameter", schema);
     if (category == static_cast<uint32_t>(ParameterCategory::Contraction))
       contractionCoordinateRoles[axis] =

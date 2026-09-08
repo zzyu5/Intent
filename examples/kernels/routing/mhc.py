@@ -151,20 +151,22 @@ def mhc_apply_residual(
     output: I.Out[I.bf16, ("T", "S", "D")],
 ):
     T, S, D = residual.shape
+    output_streams = I.domain(0, S)
     dimensions = I.domain(0, D)
     for token in I.parallel(I.domain(0, T)):
-        for output_stream in I.parallel(I.domain(0, S)):
-            mixed_residual = I.zeros((D,), dtype=I.f32)
-            for source_stream in range(STREAMS):
-                mixed_residual = mixed_residual + I.cast(
-                    residual[token, source_stream, dimensions], I.f32
-                ) * residual_mix[token, output_stream, source_stream]
-            output[token, output_stream, dimensions] = I.cast(
-                mixed_residual
-                + post_mix[token, output_stream]
-                * I.cast(layer_output[token, dimensions], I.f32),
-                I.bf16,
+        mixed_residual = I.zeros((S, D), dtype=I.f32)
+        for source_stream in range(STREAMS):
+            source_values = I.cast(
+                residual[token, source_stream, dimensions], I.f32
             )
+            mix = residual_mix[token, output_streams, source_stream]
+            mixed_residual = mixed_residual + source_values[None, :] * mix[:, None]
+        output[token, output_streams, dimensions] = I.cast(
+            mixed_residual
+            + post_mix[token, output_streams][:, None]
+            * I.cast(layer_output[token, dimensions], I.f32)[None, :],
+            I.bf16,
+        )
 
 
 @intent.kernel
