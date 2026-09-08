@@ -4,13 +4,10 @@ from types import SimpleNamespace
 
 import torch
 
-from intent.runtime.artifact import ParameterRole
 from kernels.regularization.dropout import xor_shift_dropout
 
-from ...measurement import PipelineStageError
 from ...measurement import compile_single
 from ...measurement import functional_launch
-from ...measurement import report_stage
 from ...model import Context
 from ...model import PreparedComparison
 from ...model import Tolerance
@@ -28,7 +25,7 @@ def dropout(context: Context) -> PreparedComparison:
     probability = 0.1
     mixed_seed = source_module._mix_seed(seed)
     inverse_keep = 1.0 / (1.0 - probability)
-    artifact, generated = compile_single(
+    _, generated = compile_single(
         context,
         xor_shift_dropout,
         (
@@ -38,37 +35,13 @@ def dropout(context: Context) -> PreparedComparison:
             inverse_keep,
         ),
     )
-    report_stage("generated_tuning_metadata")
-    try:
-        configurations = artifact.tuning_configurations(
-            x, generated.outputs(), mixed_seed, probability, inverse_keep,
-        )
-    except NotImplementedError as error:
-        raise PipelineStageError("generated_tuning_metadata", str(error)) from error
-    report_stage("source_candidate_binding")
-    configs = []
-    for configuration in configurations:
-        values = {}
-        for parameter, value in zip(configuration.parameters, configuration.values, strict=True):
-            if parameter.role == ParameterRole.PROVIDER_ACCESS_FORM:
-                field = "ACCESS_FORM"
-            elif (parameter.role in (ParameterRole.OWNERSHIP_M, ParameterRole.OWNERSHIP_N)
-                  and parameter.view_axis == (0, 1)):
-                field = "TILE_SIZE"
-            else:
-                raise PipelineStageError("source_candidate_binding",
-                                         f"source cannot bind dropout parameter {parameter}")
-            if field in values:
-                raise PipelineStageError("source_candidate_binding", f"duplicate dropout field {field}")
-            values[field] = value
-        if values.keys() != {"TILE_SIZE", "ACCESS_FORM"}:
-            raise PipelineStageError("source_candidate_binding", "incomplete dropout candidate")
-        if x.shape[1] % values["TILE_SIZE"] != 0:
-            raise PipelineStageError("source_candidate_binding",
-                                     "source flat tiles must preserve generated row ownership")
-        configs.append(SimpleNamespace(**values))
-    configs = tuple(configs)
-    report_stage("adapter_preparation")
+    # The source counter is the absolute flattened element offset, independent
+    # of both source tile boundaries and generated row ownership.
+    configs = tuple(
+        SimpleNamespace(TILE_SIZE=1 << exponent, ACCESS_FORM=form)
+        for exponent in range(5, 15)
+        for form in (1, 2, 3)
+    )
     source = functional_launch(
         lambda: source_module.dropout(
             x,

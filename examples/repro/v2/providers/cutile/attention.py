@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import cuda.tile as ct
 import torch
 
-from intent.runtime.artifact import ParameterRole
 from kernels.backward.attention import attention_backward_delta
 from kernels.backward.attention import attention_backward_dkdv
 from kernels.backward.attention import attention_backward_dq
@@ -28,8 +27,6 @@ from kernels.streaming.splitk_reduce import splitk_attention_reduce_f16
 from ...measurement import compile_single
 from ...measurement import initial_launch
 from ...measurement import functional_launch
-from ...measurement import PipelineStageError
-from ...measurement import report_stage
 from ...model import Context
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
@@ -130,43 +127,24 @@ def splitk_reduce(context: Context) -> PreparedComparison:
     partial_lse = torch.randn(
         (batch, heads, splits), device="cuda", dtype=torch.float32
     )
-    artifact, generated = compile_single(
+    _, generated = compile_single(
         context, splitk_attention_reduce, (partial, partial_lse)
     )
-    report_stage("generated_tuning_metadata")
-    try:
-        configurations = artifact.tuning_configurations(
-            partial, partial_lse, generated.outputs(),
+    # Source owns its candidate schema; generated reductions need not expose
+    # the same occupancy, CTA or tiling parameters.
+    configs = tuple(
+        SimpleNamespace(
+            NUM_KV_SPLITS_POW2=1 << (splits - 1).bit_length(),
+            TILE_D=tile,
+            ACCESS_FORM=form,
+            occupancy=occupancy,
+            num_ctas=ctas,
         )
-    except NotImplementedError as error:
-        raise PipelineStageError("generated_tuning_metadata", str(error)) from error
-    report_stage("source_candidate_binding")
-    configs = []
-    for configuration in configurations:
-        values = {}
-        for parameter, value in zip(configuration.parameters, configuration.values, strict=True):
-            role, axis = parameter.role, parameter.view_axis
-            if role == ParameterRole.PROVIDER_ACCESS_FORM:
-                field = "ACCESS_FORM"
-            elif role == ParameterRole.PROVIDER_OCCUPANCY:
-                field = "occupancy"
-            elif role == ParameterRole.PROVIDER_CTAS:
-                field = "num_ctas"
-            elif role == ParameterRole.FULL_COVERAGE and axis == (0, 2):
-                field = "NUM_KV_SPLITS_POW2"
-            elif role in (ParameterRole.OWNERSHIP_M, ParameterRole.OWNERSHIP_N) and axis == (0, 3):
-                field = "TILE_D"
-            else:
-                raise PipelineStageError("source_candidate_binding",
-                                         f"source cannot bind split-K reduction parameter {parameter}")
-            if field in values:
-                raise PipelineStageError("source_candidate_binding", f"duplicate split-K reduction field {field}")
-            values[field] = value
-        if values.keys() != {"ACCESS_FORM", "occupancy", "num_ctas", "NUM_KV_SPLITS_POW2", "TILE_D"}:
-            raise PipelineStageError("source_candidate_binding", "incomplete split-K reduction candidate")
-        configs.append(SimpleNamespace(**values))
-    configs = tuple(configs)
-    report_stage("adapter_preparation")
+        for tile in (32, 64, 128, 256)
+        for form in (1, 2, 3)
+        for occupancy in (1, 2)
+        for ctas in (1, 2)
+    )
     source_module = tilegym_source(
         context,
         "source/cutile/tilegym/attention/flash_decode/splitk_reduce.py",
