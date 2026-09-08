@@ -1275,6 +1275,12 @@ private:
     case BinaryOperator::Subtract: return infix("-");
     case BinaryOperator::Multiply: return infix("*");
     case BinaryOperator::TrueDivide: {
+      if (binary.getApproximate())
+        return "tl.inline_asm_elementwise(\"div.approx" +
+               std::string(binary.getFlushToZero() ? ".ftz" : "") +
+               ".f32 $0, $1, $2;\", constraints=\"=f,f,f\", args=[" +
+               valueString(binary.getLhs()) + ", " + valueString(binary.getRhs()) +
+               "], dtype=tl.float32, is_pure=True, pack=1)";
       Type element = elementType(binary.getResult().getType());
       auto floating = cast<FloatType>(element);
       std::string computation = floating.getWidth() < 32
@@ -1340,6 +1346,11 @@ private:
     case UnaryOperator::Exp:
       return libraryCall("libdevice.exp");
     case UnaryOperator::Exp2:
+      if (unary.getApproximate())
+        return "tl.inline_asm_elementwise(\"ex2.approx" +
+               std::string(unary.getFlushToZero() ? ".ftz" : "") +
+               ".f32 $0, $1;\", constraints=\"=f,f\", args=[" + input +
+               "], dtype=tl.float32, is_pure=True, pack=1)";
       return libraryCall("libdevice.exp2");
     case UnaryOperator::Log:
       return libraryCall("libdevice.log");
@@ -1356,6 +1367,10 @@ private:
     case UnaryOperator::Sigmoid:
       return "tl.sigmoid(" + input + ")";
     case UnaryOperator::Tanh:
+      if (unary.getApproximate())
+        return "tl.inline_asm_elementwise(\"tanh.approx.f32 $0, $1;\", "
+               "constraints=\"=f,f\", args=[" + input +
+               "], dtype=tl.float32, is_pure=True, pack=1)";
       return libraryCall("libdevice.tanh");
     case UnaryOperator::Abs:
       return "tl.abs(" + input + ")";

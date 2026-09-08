@@ -36,6 +36,8 @@ Passes查询features而不是匹配设备名称。SM90、SM100、SM120或gfx fam
 
 否则使用thin legalization或直接serialization。
 
+显式近似数学与 FTZ 属于已有 unary/binary operation 的共同数值语义，不为 provider API 名称另建 dialect。Provider legality 检查 dtype 与硬件能力；serialization 机械发出满足该数值属性的原语或原语包装，不开启影响整份 kernel 的 fast-math 编译选项。Cloning、bufferization 和 scalarization 必须保留这两个属性；普通运算的既有 lowering 不因相邻操作 opt-in 而改变。
+
 ## 4. Triton
 
 共同GPU program可以机械映射：

@@ -61,10 +61,8 @@ def window_attention_values(
         acc_dtype=I.f32,
     )
     if soft_cap > 0.0:
-        exponential = I.exp2(scores * (scale * (-2.0 * I.LOG2E / soft_cap)))
-        inverse_root = I.rsqrt(1.0 + exponential)
-        scores = (soft_cap * I.LOG2E) * (
-            2.0 * inverse_root * inverse_root - 1.0
+        scores = I.tanh(scores * (scale / soft_cap), approximate=True) * (
+            soft_cap * I.LOG2E
         )
     else:
         scores = scores * (scale * I.LOG2E)
@@ -84,7 +82,7 @@ def window_attention_values(
     )
     probability = I.select(
         valid,
-        I.exp2(scores - maximum[:, None]),
+        I.exp2(scores - maximum[:, None], approximate=True, flush_to_zero=True),
         0.0,
     )
     return I.record(
@@ -211,7 +209,7 @@ def summarize_block_causal_chunk(
     )
     probability = I.select(
         valid,
-        I.exp2(scores - maximum[:, None]),
+        I.exp2(scores - maximum[:, None], approximate=True, flush_to_zero=True),
         0.0,
     )
     return I.record(
@@ -235,10 +233,10 @@ def add_sink_to_summary(summary, sink_log2):
     )
     data_scale = I.select(
         summary.valid,
-        I.exp2(summary.maximum - maximum),
+        I.exp2(summary.maximum - maximum, approximate=True, flush_to_zero=True),
         0.0,
     )
-    sink_scale = I.exp2(sink_log2 - maximum)
+    sink_scale = I.exp2(sink_log2 - maximum, approximate=True, flush_to_zero=True)
     return I.record(
         valid=I.full(summary.valid.shape, fill=True, dtype=I.bool),
         maximum=maximum,

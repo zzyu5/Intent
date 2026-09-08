@@ -138,6 +138,8 @@ Atomic operation另外显式保存memory order、logical sharing domain、RMW ki
 - immutable value reuse与rematerialization；
 - typed pure helper/combiner regions。
 
+Unary/binary operations 保留 KIR 的逐操作 `approximate` 与 `flush_to_zero` 数值属性，默认均为 false；合法 operator/dtype 组合与精度范围由 DSL 数值规格定义。属性不改变 fragment shape、ownership 或 ABI，不是 provider 参数；相同 operands/operator kind 但数值属性不同的操作不是同一纯值。
+
 Broadcast、reshape、transpose、slice、tuple/record extraction与pure helper call同时组合value def-use与coordinate provenance。Physical pass若选择重算pure producer，必须真实改变def-use并保持等价coordinate map；若选择materialize，必须产生buffer/value及对应uses。不能只写`replay=true`、provenance ID或value ID列表。
 
 ## 8. Structured compute

@@ -12,15 +12,19 @@ from intent.frontend.semantics import TensorType
 from intent.frontend.semantics import UnaryOperator
 from intent.frontend.mlir import MlirValue
 from intent.frontend.semantics import broadcast_shape
+from intent.language import DType
 from intent.language import DTypeCategory
 from intent.language import bool as intent_bool
+from intent.language import f32 as intent_f32
 
 from ..ast.model import Literal
 from .common import bind_call
+from .common import bind_declared_call
 from .common import lower_shape
 from .common import normalize_axes
 from .common import require_axes
 from .common import require_dtype
+from .common import require_static_bool
 
 if TYPE_CHECKING:
     from ..ast.context import FunctionLowerer
@@ -59,6 +63,7 @@ def lower_tensor_intrinsic(
         "maximum_num": lambda context, call: _binary(context, call, BinaryOperator.MAXIMUM_NUM),
         "minimum_num": lambda context, call: _binary(context, call, BinaryOperator.MINIMUM_NUM),
         "add": lambda context, call: _binary(context, call, BinaryOperator.ADD),
+        "fdiv": lambda context, call: _binary(context, call, BinaryOperator.TRUE_DIVIDE),
     }
     handler = handlers.get(name)
     if handler is None:
@@ -310,19 +315,46 @@ def _select(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     ).results[0]
 
 
+def _math_attributes(
+    lowerer: FunctionLowerer,
+    node: ast.Call,
+    bound: dict[str, ast.AST],
+    dtype: DType,
+) -> dict[str, bool]:
+    attributes = {
+        name: require_static_bool(lowerer, bound[name])
+        for name in ("approximate", "flush_to_zero")
+        if name in bound
+    }
+    if attributes.get("flush_to_zero", False) and not attributes["approximate"]:
+        lowerer.error(node, "flush_to_zero requires approximate=True")
+    if attributes.get("approximate", False) and dtype != intent_f32:
+        lowerer.error(node, "explicit approximate math requires f32 operands")
+    return {name: value for name, value in attributes.items() if value}
+
+
 def _unary(
     lowerer: FunctionLowerer,
     node: ast.Call,
     operator: UnaryOperator,
 ) -> MlirValue:
-    bound = bind_call(lowerer, node, ("value",), required=("value",))
+    if operator in (UnaryOperator.EXP2, UnaryOperator.TANH):
+        bound = bind_declared_call(
+            lowerer, node, "exp2" if operator == UnaryOperator.EXP2 else "tanh"
+        )
+    else:
+        bound = bind_call(lowerer, node, ("value",), required=("value",))
     source = lowerer.read_value(lowerer.lower_expression(bound["value"]), bound["value"])
+    dtype, _ = lowerer.dtype_and_shape(source.type, node)
     operation = lowerer.emit(
         OperationKind.UNARY,
         lowerer.location(node),
         operands=(source,),
         result_types=(source.type,),
-        attributes={"operator_kind": operator},
+        attributes={
+            "operator_kind": operator,
+            **_math_attributes(lowerer, node, bound, dtype),
+        },
     )
     return operation.results[0]
 
@@ -332,12 +364,16 @@ def _binary(
     node: ast.Call,
     operator: BinaryOperator,
 ) -> MlirValue:
-    bound = bind_call(lowerer, node, ("lhs", "rhs"), required=("lhs", "rhs"))
+    bound = (
+        bind_declared_call(lowerer, node, "fdiv")
+        if operator == BinaryOperator.TRUE_DIVIDE
+        else bind_call(lowerer, node, ("lhs", "rhs"), required=("lhs", "rhs"))
+    )
     lhs_expression = lowerer.lower_expression(bound["lhs"])
     rhs_expression = lowerer.lower_expression(bound["rhs"])
     lhs, rhs = lowerer.coerce_pair(lhs_expression, rhs_expression, node)
     result_type = lowerer.broadcast_result_type(lhs.type, rhs.type, node)
-    _, result_shape = lowerer.dtype_and_shape(result_type, node)
+    dtype, result_shape = lowerer.dtype_and_shape(result_type, node)
     lhs = lowerer.broadcast_value(lhs, result_shape, node)
     rhs = lowerer.broadcast_value(rhs, result_shape, node)
     operation = lowerer.emit(
@@ -345,6 +381,9 @@ def _binary(
         lowerer.location(node),
         operands=(lhs, rhs),
         result_types=(result_type,),
-        attributes={"operator_kind": operator},
+        attributes={
+            "operator_kind": operator,
+            **_math_attributes(lowerer, node, bound, dtype),
+        },
     )
     return operation.results[0]

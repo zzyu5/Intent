@@ -238,7 +238,8 @@ LogicalResult realizeOnlineSummary(OnlineSummaryPattern pattern,
             broadcastMaximum, BinaryOperator::Subtract);
         Value unmaskedProbability = nested.create<UnaryOp>(
             nestedLocation, blockedScoreType, shiftedScore,
-            pattern.exponential.getOperatorKind());
+            pattern.exponential.getOperatorKind(),
+            pattern.exponential.getApproximate(), pattern.exponential.getFlushToZero());
         Value probabilityZero = nested.create<SplatOp>(
             nestedLocation, blockedScoreType,
             scalarValue(pattern.probability.getFalseValue()));
@@ -282,7 +283,8 @@ LogicalResult realizeOnlineSummary(OnlineSummaryPattern pattern,
               combinedMaximum, BinaryOperator::Subtract);
           Value exponential = nested.create<UnaryOp>(
               nestedLocation, carries[1].getType(), delta,
-              pattern.exponential.getOperatorKind());
+              pattern.exponential.getOperatorKind(),
+              pattern.exponential.getApproximate(), pattern.exponential.getFlushToZero());
           return Value(nested.create<SelectOp>(
               nestedLocation, carries[1].getType(), present, exponential,
               massIdentity));

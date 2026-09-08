@@ -272,6 +272,36 @@ private:
   void emitPreamble() {
     output << "import torch\nimport tilelang\nimport tilelang.language as T\n"
               "from intent.runtime.tilelang import tune_kernel\n\n";
+    std::map<std::string, std::pair<std::string, bool>> primitives;
+    auto add = [&](StringRef mnemonic, bool flush, bool binary) {
+      std::string suffix = flush ? "_ftz" : "";
+      primitives["_intent_approx_" + mnemonic.str() + suffix] = {
+          mnemonic.str() + ".approx" + (flush ? ".ftz" : "") + ".f32", binary};
+    };
+    kernel.walk([&](gpu::UnaryOp unary) {
+      if (unary.getApproximate())
+        add(unary.getOperatorKind() == UnaryOperator::Exp2 ? "ex2" : "tanh",
+            unary.getFlushToZero(), false);
+    });
+    kernel.walk([&](gpu::BinaryOp binary) {
+      if (binary.getApproximate())
+        add("div", binary.getFlushToZero(), true);
+    });
+    hasApproximateMath = !primitives.empty();
+    if (hasApproximateMath) {
+      output << "_INTENT_MATH_SOURCE = r\"\"\"\n";
+      for (const auto &[name, primitive] : primitives) {
+        const auto &[instruction, binary] = primitive;
+        output << "static __device__ __forceinline__ float " << name
+               << "(float x" << (binary ? ", float y" : "") << ") {\n"
+               << "  float result;\n  asm(\"" << instruction
+               << " %0, %1" << (binary ? ", %2" : "")
+               << ";\" : \"=f\"(result) : \"f\"(x)"
+               << (binary ? ", \"f\"(y)" : "")
+               << ");\n  return result;\n}\n";
+      }
+      output << "\"\"\"\n\n";
+    }
   }
 
   void emitBuilder() {
@@ -345,6 +375,8 @@ private:
              ", threads=" + valueString(launch.getThreads()) + ") as pid0:",
          2);
     indent = 3;
+    if (hasApproximateMath)
+      line("T.import_source(_INTENT_MATH_SOURCE)");
     emitBlock(kernel.getBody().front());
     line("return main", 1);
     output << "\n";
@@ -701,7 +733,12 @@ private:
     case BinaryOperator::Add: return infix("+");
     case BinaryOperator::Subtract: return infix("-");
     case BinaryOperator::Multiply: return infix("*");
-    case BinaryOperator::TrueDivide: return infix("/");
+    case BinaryOperator::TrueDivide:
+      if (binary.getApproximate())
+        return "T.call_pure_extern(\"float32\", \"_intent_approx_div" +
+               std::string(binary.getFlushToZero() ? "_ftz" : "") + "\", " +
+               valueString(binary.getLhs()) + ", " + valueString(binary.getRhs()) + ")";
+      return infix("/");
     case BinaryOperator::FloorDivide: return infix("//");
     case BinaryOperator::Remainder: return infix("%");
     case BinaryOperator::Power: return infix("**");
@@ -713,6 +750,11 @@ private:
              valueString(binary.getRhs()) + ")";
     case BinaryOperator::Maximum:
     case BinaryOperator::Minimum:
+      if (isa<IntegerType, IndexType>(binary.getResult().getType()))
+        return std::string(binary.getOperatorKind() == BinaryOperator::Maximum
+                               ? "T.max(" : "T.min(") +
+               valueString(binary.getLhs()) + ", " +
+               valueString(binary.getRhs()) + ")";
       binary.emitOpError(
           "TileLang has no spelling that preserves Intent NaN-propagating min/max");
       failed = true;
@@ -737,7 +779,11 @@ private:
     case UnaryOperator::Negate: return "(-" + input + ")";
     case UnaryOperator::Not: return "(~" + input + ")";
     case UnaryOperator::Exp: return call("T.exp");
-    case UnaryOperator::Exp2: return call("T.exp2");
+    case UnaryOperator::Exp2:
+      if (unary.getApproximate())
+        return "T.call_pure_extern(\"float32\", \"_intent_approx_ex2" +
+               std::string(unary.getFlushToZero() ? "_ftz" : "") + "\", " + input + ")";
+      return call("T.exp2");
     case UnaryOperator::Log: return call("T.log");
     case UnaryOperator::Sin: return call("T.sin");
     case UnaryOperator::Cos: return call("T.cos");
@@ -745,7 +791,10 @@ private:
     case UnaryOperator::Erf: return call("T.erf");
     case UnaryOperator::Rsqrt: return call("T.rsqrt");
     case UnaryOperator::Sigmoid: return call("T.sigmoid");
-    case UnaryOperator::Tanh: return call("T.tanh");
+    case UnaryOperator::Tanh:
+      return unary.getApproximate()
+                 ? "T.call_pure_extern(\"float32\", \"_intent_approx_tanh\", " + input + ")"
+                 : call("T.tanh");
     case UnaryOperator::Abs: return call("T.abs");
     case UnaryOperator::Sqrt: return call("T.sqrt");
     }
@@ -891,6 +940,7 @@ private:
   unsigned indent = 0;
   unsigned counter = 0;
   bool failed = false;
+  bool hasApproximateMath = false;
 };
 
 } // namespace

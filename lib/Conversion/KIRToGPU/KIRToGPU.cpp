@@ -3558,7 +3558,7 @@ private:
       if (failed(result))
         return unary.emitOpError("unary value has no physical data type");
       auto target = builder.create<gpu::UnaryOp>(location, *result, *input,
-                                                 unary.getOperatorKind());
+          unary.getOperatorKind(), unary.getApproximate(), unary.getFlushToZero());
       mapResults(operation, target);
       return success();
     }
@@ -3578,7 +3578,7 @@ private:
       if (failed(result))
         return binary.emitOpError("binary result has no physical data schema");
       auto target = builder.create<gpu::BinaryOp>(location, *result, *lhs, *rhs,
-                                                   binary.getOperatorKind());
+          binary.getOperatorKind(), binary.getApproximate(), binary.getFlushToZero());
       mapResults(operation, target);
       return success();
     }

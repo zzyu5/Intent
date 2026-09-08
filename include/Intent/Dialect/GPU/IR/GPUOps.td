@@ -92,14 +92,18 @@ def IntentGPU_BroadcastOp : IntentGPU_Op<"broadcast", [Pure]> {
 
 def IntentGPU_UnaryOp : IntentGPU_Op<"unary", [Pure]> {
   let arguments = (ins IntentGPU_DataValue:$input,
-                       Intent_UnaryOperatorAttr:$operator_kind);
+                       Intent_UnaryOperatorAttr:$operator_kind,
+                       DefaultValuedAttr<BoolAttr, "false">:$approximate,
+                       DefaultValuedAttr<BoolAttr, "false">:$flush_to_zero);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
 }
 
 def IntentGPU_BinaryOp : IntentGPU_Op<"binary", [Pure]> {
   let arguments = (ins IntentGPU_DataValue:$lhs, IntentGPU_DataValue:$rhs,
-                       Intent_BinaryOperatorAttr:$operator_kind);
+                       Intent_BinaryOperatorAttr:$operator_kind,
+                       DefaultValuedAttr<BoolAttr, "false">:$approximate,
+                       DefaultValuedAttr<BoolAttr, "false">:$flush_to_zero);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
 }

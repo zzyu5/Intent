@@ -12,6 +12,30 @@
 using namespace mlir;
 
 namespace intent {
+
+LogicalResult verifyPointwiseMathMode(Operation *operation, Type elementType) {
+  auto approximate = operation->getAttrOfType<BoolAttr>("approximate");
+  auto flush = operation->getAttrOfType<BoolAttr>("flush_to_zero");
+  bool isApproximate = approximate && approximate.getValue();
+  bool isFlush = flush && flush.getValue();
+  if (!isApproximate && !isFlush)
+    return success();
+  if (!isApproximate || !elementType.isF32())
+    return operation->emitOpError(
+        "non-default math requires approximate=true and f32 operands/results");
+  if (auto unary = operation->getAttrOfType<UnaryOperatorAttr>("operator_kind")) {
+    if (unary.getValue() == UnaryOperator::Exp2 ||
+        (unary.getValue() == UnaryOperator::Tanh && !isFlush))
+      return success();
+  } else if (auto binary =
+                 operation->getAttrOfType<BinaryOperatorAttr>("operator_kind")) {
+    if (binary.getValue() == BinaryOperator::TrueDivide)
+      return success();
+  }
+  return operation->emitOpError(
+      "math mode is defined only for exp2/division and non-FTZ tanh");
+}
+
 namespace {
 
 bool isIntegerLike(Type type) {
@@ -701,6 +725,8 @@ LogicalResult verifyDataOperation(Operation *operation) {
     auto kind = operation->getAttrOfType<UnaryOperatorAttr>("operator_kind");
     if (!kind || !sameDataSchema(input, result))
       return operation->emitOpError("unary operator/schema is invalid");
+    if (failed(verifyPointwiseMathMode(operation, getElementType(input))))
+      return failure();
     if (kind.getValue() == UnaryOperator::Not)
       return isBooleanData(input)
                  ? success()
@@ -724,6 +750,8 @@ LogicalResult verifyDataOperation(Operation *operation) {
         !sameDataSchema(lhs, result, false))
       return operation->emitOpError("binary operator/schema is invalid");
     BinaryOperator value = kind.getValue();
+    if (failed(verifyPointwiseMathMode(operation, getElementType(lhs))))
+      return failure();
     if (value == BinaryOperator::LogicalAnd ||
         value == BinaryOperator::LogicalOr)
       return isBooleanData(lhs) && isBooleanData(rhs) && isBooleanData(result)

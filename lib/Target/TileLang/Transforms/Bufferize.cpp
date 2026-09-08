@@ -1079,7 +1079,7 @@ private:
         return failure();
       result = builder.create<gpu::UnaryOp>(owner->getLoc(),
                                             source.getElementType(), *input,
-                                            unary.getOperatorKind());
+          unary.getOperatorKind(), unary.getApproximate(), unary.getFlushToZero());
     } else if (auto binary = dyn_cast<gpu::BinaryOp>(producer)) {
       FailureOr<Value> lhs = recurse(binary.getLhs());
       FailureOr<Value> rhs = recurse(binary.getRhs());
@@ -1087,7 +1087,7 @@ private:
         return failure();
       result = builder.create<gpu::BinaryOp>(
           owner->getLoc(), source.getElementType(), *lhs, *rhs,
-          binary.getOperatorKind());
+          binary.getOperatorKind(), binary.getApproximate(), binary.getFlushToZero());
     } else if (auto compare = dyn_cast<gpu::CompareOp>(producer)) {
       FailureOr<Value> lhs = recurse(compare.getLhs());
       FailureOr<Value> rhs = recurse(compare.getRhs());

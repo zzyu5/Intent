@@ -139,11 +139,15 @@ def Intent_ExtractOp : Intent_Op<"extract", [Pure]> {
 
 def Intent_UnaryOp : Intent_UnaryDataOp<"unary"> {
   let arguments = (ins Intent_DataValue:$input,
-                       Intent_UnaryOperatorAttr:$operator_kind);
+                       Intent_UnaryOperatorAttr:$operator_kind,
+                       DefaultValuedAttr<BoolAttr, "false">:$approximate,
+                       DefaultValuedAttr<BoolAttr, "false">:$flush_to_zero);
 }
 def Intent_BinaryOp : Intent_BinaryDataOp<"binary"> {
   let arguments = (ins Intent_DataValue:$lhs, Intent_DataValue:$rhs,
-                       Intent_BinaryOperatorAttr:$operator_kind);
+                       Intent_BinaryOperatorAttr:$operator_kind,
+                       DefaultValuedAttr<BoolAttr, "false">:$approximate,
+                       DefaultValuedAttr<BoolAttr, "false">:$flush_to_zero);
 }
 def Intent_CompareOp : Intent_Op<"compare", [Pure]> {
   let arguments = (ins Intent_DataValue:$lhs, Intent_DataValue:$rhs,

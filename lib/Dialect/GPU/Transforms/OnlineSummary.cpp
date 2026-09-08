@@ -136,14 +136,17 @@ bool isCommutativeRecordFieldBinary(Value value, BinaryOperator kind,
 FailureOr<Value> matchScale(Value value, BlockArgument record,
                             unsigned validityField, unsigned maximumField,
                             Value combinedMaximum,
-                            UnaryOperator exponentialKind) {
+                            UnaryOp summaryExponential) {
   auto scale = stripProjection(value).getDefiningOp<SelectOp>();
   if (!scale ||
       !isRecordField(scale.getCondition(), record, validityField) ||
       !isZero(scale.getFalseValue()))
     return failure();
   auto exponential = scale.getTrueValue().getDefiningOp<UnaryOp>();
-  if (!exponential || exponential.getOperatorKind() != exponentialKind)
+  if (!exponential ||
+      exponential.getOperatorKind() != summaryExponential.getOperatorKind() ||
+      exponential.getApproximate() != summaryExponential.getApproximate() ||
+      exponential.getFlushToZero() != summaryExponential.getFlushToZero())
     return failure();
   auto delta = exponential.getInput().getDefiningOp<BinaryOp>();
   if (!delta || delta.getOperatorKind() != BinaryOperator::Subtract ||
@@ -336,7 +339,6 @@ matchOnlineSummaryMerge(Region &region,
   BlockArgument left = region.front().getArgument(0);
   BlockArgument right = region.front().getArgument(1);
   UnaryOp summaryExponential = summary.exponential;
-  UnaryOperator exponentialKind = summaryExponential.getOperatorKind();
 
   bool mergedValidity =
       isCommutativeRecordFieldBinary(
@@ -398,11 +400,11 @@ matchOnlineSummaryMerge(Region &region,
     if (failed(leftScale))
       leftScale = matchScale(candidate, left, summary.validityField,
                              summary.maximumField, combinedMaximum,
-                             exponentialKind);
+                             summaryExponential);
     if (failed(rightScale))
       rightScale = matchScale(candidate, right, summary.validityField,
                               summary.maximumField, combinedMaximum,
-                              exponentialKind);
+                              summaryExponential);
   }
   if (failed(leftScale) || failed(rightScale))
     return failure();

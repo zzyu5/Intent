@@ -120,7 +120,7 @@ def summarize_mla_chunk(
     )
     probability = I.select(
         valid,
-        I.exp2(scores - maximum[:, None]),
+        I.exp2(scores - maximum[:, None], approximate=True, flush_to_zero=True),
         0.0,
     )
     return I.record(
@@ -171,7 +171,7 @@ def summarize_masked_mla_chunk(
     )
     probability = I.select(
         valid,
-        I.exp2(scores - maximum[:, None]),
+        I.exp2(scores - maximum[:, None], approximate=True, flush_to_zero=True),
         0.0,
     )
     return I.record(
@@ -271,7 +271,7 @@ def sparse_mla_summary(
     )
     probability = I.select(
         valid,
-        I.exp2(scores - maximum[:, :, None]),
+        I.exp2(scores - maximum[:, :, None], approximate=True, flush_to_zero=True),
         0.0,
     )
     return I.record(
@@ -356,7 +356,7 @@ def token_sparse_mla_prefill(
         scale,
     )
     safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
-    inverse_denominator = 1.0 / safe_denominator
+    inverse_denominator = I.fdiv(1.0, safe_denominator, approximate=True, flush_to_zero=True)
     output[queries, :, :] = I.cast(
         I.select(
             summary.valid[:, :, None],
@@ -402,7 +402,7 @@ def token_sparse_mla_value_prefill(
         scale,
     )
     safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
-    inverse_denominator = 1.0 / safe_denominator
+    inverse_denominator = I.fdiv(1.0, safe_denominator, approximate=True, flush_to_zero=True)
     output[queries, :, :] = I.cast(
         I.select(
             summary.valid[:, :, None],

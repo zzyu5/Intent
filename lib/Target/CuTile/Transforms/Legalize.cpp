@@ -2720,6 +2720,15 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
            constantValue(compare.getRhs()) == nativeNoTMAForm;
   };
   WalkResult result = kernel.walk([&](Operation *operation) {
+    if (auto unary = dyn_cast<gpu::UnaryOp>(operation);
+        unary && unary.getApproximate() &&
+        unary.getOperatorKind() == UnaryOperator::Tanh &&
+        10 * capabilities.getComputeCapabilityMajor() +
+                capabilities.getComputeCapabilityMinor() < 75) {
+      unary.emitOpError(
+          "native approximate tanh requires compute capability 7.5 or newer");
+      return WalkResult::interrupt();
+    }
     if (isa<gpu::LoadOp, gpu::StoreOp, gpu::ContractOp>(operation)) {
       operation->emitOpError(
           "was not converted to an explicit cuTile tile/MMA form");

@@ -1,5 +1,6 @@
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/Intent/IR/IntentOps.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -568,10 +569,12 @@ LogicalResult UnaryOp::verify() {
   if (!sameShape(getInput().getType(), getResult().getType()) ||
       elementType(getInput().getType()) != elementType(getResult().getType()))
     return emitOpError("unary physical schema is invalid");
-  return success();
+  return verifyPointwiseMathMode(getOperation(), elementType(getInput().getType()));
 }
 
 LogicalResult BinaryOp::verify() {
+  if (failed(verifyPointwiseMathMode(getOperation(), elementType(getLhs().getType()))))
+    return failure();
   return verifyDataSchemas(getOperation(), {getLhs().getType(), getRhs().getType()},
                            getResult().getType());
 }

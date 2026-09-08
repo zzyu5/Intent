@@ -1675,7 +1675,7 @@ FailureOr<Value> projectBroadcast(OpBuilder &builder, Location location,
     if (failed(lhs) || failed(rhs))
       return failure();
     return Value(builder.create<BinaryOp>(location, target, *lhs, *rhs,
-                                          binary.getOperatorKind()));
+        binary.getOperatorKind(), binary.getApproximate(), binary.getFlushToZero()));
   }
   if (auto compare = value.getDefiningOp<CompareOp>()) {
     FailureOr<FragmentType> lhsType = retarget(compare.getLhs());

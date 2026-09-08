@@ -20,6 +20,13 @@ def _signature(
 
 
 INTRINSIC_SIGNATURES = {
+    "fdiv": _signature(
+        ("lhs", "rhs"), defaults=(("approximate", False), ("flush_to_zero", False))
+    ),
+    "exp2": _signature(
+        ("value",), defaults=(("approximate", False), ("flush_to_zero", False))
+    ),
+    "tanh": _signature(("value",), defaults=(("approximate", False),)),
     "dot": _signature(("lhs", "rhs"), required=("acc_dtype",)),
     "matvec": _signature(
         ("matrix", "vector"), required=("acc_dtype",), defaults=(("transpose", False),)

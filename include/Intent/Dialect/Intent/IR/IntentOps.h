@@ -13,4 +13,9 @@
 #define GET_OP_CLASSES
 #include "Intent/Dialect/Intent/IR/IntentOps.h.inc"
 
+namespace intent {
+mlir::LogicalResult verifyPointwiseMathMode(mlir::Operation *operation,
+                                           mlir::Type elementType);
+}
+
 #endif

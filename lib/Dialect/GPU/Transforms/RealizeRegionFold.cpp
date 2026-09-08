@@ -1091,7 +1091,8 @@ FailureOr<Value> coRealizeOnlineRegion(
       BinaryOperator::Subtract);
   auto directExponential = builder.create<UnaryOp>(
       location, probability.getType(), shifted,
-      plan.summary.exponential.getOperatorKind());
+      plan.summary.exponential.getOperatorKind(),
+      plan.summary.exponential.getApproximate(), plan.summary.exponential.getFlushToZero());
   auto directProbability = builder.create<SelectOp>(
       location, probability.getType(), memberValidity, directExponential,
       *projectedZero);

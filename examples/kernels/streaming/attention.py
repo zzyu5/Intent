@@ -92,12 +92,12 @@ def merge_attention_summaries(lhs, rhs):
     rhs_maximum = I.select(rhs.valid, rhs.maximum, maximum)
     lhs_scale = I.select(
         lhs.valid,
-        I.exp2(lhs_maximum - maximum),
+        I.exp2(lhs_maximum - maximum, approximate=True, flush_to_zero=True),
         0.0,
     )
     rhs_scale = I.select(
         rhs.valid,
-        I.exp2(rhs_maximum - maximum),
+        I.exp2(rhs_maximum - maximum, approximate=True, flush_to_zero=True),
         0.0,
     )
     return I.record(
@@ -127,12 +127,12 @@ def merge_scalar_attention_summaries(lhs, rhs):
     rhs_maximum = I.select(rhs.valid, rhs.maximum, maximum)
     lhs_scale = I.select(
         lhs.valid,
-        I.exp2(lhs_maximum - maximum),
+        I.exp2(lhs_maximum - maximum, approximate=True, flush_to_zero=True),
         0.0,
     )
     rhs_scale = I.select(
         rhs.valid,
-        I.exp2(rhs_maximum - maximum),
+        I.exp2(rhs_maximum - maximum, approximate=True, flush_to_zero=True),
         0.0,
     )
     return I.record(
@@ -174,7 +174,7 @@ def summarize_attention_chunk_f16(
     maximum = I.select(chunk_valid, raw_maximum, 0.0)
     probability = I.select(
         valid,
-        I.exp2(masked_scores - maximum[:, None]),
+        I.exp2(masked_scores - maximum[:, None], approximate=True, flush_to_zero=True),
         0.0,
     )
     denominator = I.reduce.sum(probability, axis=1)
@@ -217,7 +217,7 @@ def summarize_attention_chunk_bf16(
     maximum = I.select(chunk_valid, raw_maximum, 0.0)
     probability = I.select(
         valid,
-        I.exp2(masked_scores - maximum[:, None]),
+        I.exp2(masked_scores - maximum[:, None], approximate=True, flush_to_zero=True),
         0.0,
     )
     return I.record(
@@ -266,7 +266,7 @@ def summarize_masked_attention_chunk(
     maximum = I.select(chunk_valid, raw_maximum, 0.0)
     probability = I.select(
         valid,
-        I.exp2(masked_scores - maximum[:, None]),
+        I.exp2(masked_scores - maximum[:, None], approximate=True, flush_to_zero=True),
         0.0,
     )
     return I.record(
@@ -303,7 +303,7 @@ def summarize_masked_scalar_query_chunk(
     )
     probability = I.select(
         valid,
-        I.exp2(scores - maximum),
+        I.exp2(scores - maximum, approximate=True, flush_to_zero=True),
         0.0,
     )
     return I.record(
@@ -346,7 +346,7 @@ def summarize_biased_attention_chunk(
     maximum = I.select(chunk_valid, raw_maximum, 0.0)
     probability = I.select(
         valid,
-        I.exp2(scores - maximum[:, None]),
+        I.exp2(scores - maximum[:, None], approximate=True, flush_to_zero=True),
         0.0,
     )
     return I.record(
@@ -391,7 +391,7 @@ def summarize_mla_chunk(
     )
     probability = I.select(
         valid,
-        I.exp2(scores - maximum[:, None]),
+        I.exp2(scores - maximum[:, None], approximate=True, flush_to_zero=True),
         0.0,
     )
     return I.record(
@@ -409,7 +409,7 @@ def summarize_mla_chunk(
 @intent.fn
 def normalize_attention_summary(summary):
     safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
-    inverse_denominator = 1.0 / safe_denominator
+    inverse_denominator = I.fdiv(1.0, safe_denominator, approximate=True, flush_to_zero=True)
     return I.select(
         summary.valid[:, None],
         summary.accumulator * inverse_denominator[:, None],
@@ -723,7 +723,7 @@ def varlen_gqa_decode_with_sink_logits(
                 sink_denominator,
                 1.0,
             )
-            inverse_denominator = 1.0 / safe_denominator
+            inverse_denominator = I.fdiv(1.0, safe_denominator, approximate=True, flush_to_zero=True)
             output[sequence, query_head, :] = I.reshape(
                 I.cast(
                     I.select(
@@ -737,7 +737,7 @@ def varlen_gqa_decode_with_sink_logits(
             )
             for block in blocks:
                 block_maximum = I.mutable_load(block_maxima, block)
-                probability = I.exp2(block_maximum - summary.maximum[0])
+                probability = I.exp2(block_maximum - summary.maximum[0], approximate=True, flush_to_zero=True)
                 block_logits[sequence, query_head, block] = I.select(
                     block < block_count,
                     probability * inverse_denominator[0],

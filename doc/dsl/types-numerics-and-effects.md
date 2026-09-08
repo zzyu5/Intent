@@ -74,6 +74,22 @@ fixed-width integers使用二进制补码与modulo arithmetic：
 
 普通floating operations遵循对应格式的IEEE-754值与round-to-nearest-even。除非作者使用structured operation或显式approximate math，compiler保持source expression的数据依赖与求值关系，不启用会改变结果集合的隐式fast-math。
 
+### 5.1 显式近似数学
+
+`fdiv`、`exp2` 和 `tanh` 的 `approximate` 是操作本身的语义，不是优化 hint；默认 `False` 保持普通运算。`fdiv/exp2` 另外接受 `flush_to_zero`，仅允许在 `approximate=True` 时启用。两个参数必须是 constexpr bool，非默认模式的 operands/result 都是 `f32`，不做隐式 dtype 转换。这是一个闭合的逐操作能力，不授权普通 add/mul/FMA 重结合或改变 contraction/reduction 的语义。
+
+近似模式采用以下跨 target 的数值契约，不承诺 correctly-rounded 或不同 target bitwise 相同：
+
+- `exp2`：相对正确舍入结果的最大误差为 2 ULP；`-inf`、`+inf`、NaN 分别产生 `+0`、`+inf`、NaN，任一符号的零产生 1。
+- `tanh`：有限非零结果的最大相对误差为 `2^-11`；保留 signed zero，正/负无穷产生正/负 1，NaN 产生 NaN，subnormal 输入保持其近零值。
+- `fdiv`：使用近似倒数与乘法的除法语义。对 `2^-126 <= abs(rhs) <= 2^126`，最大误差为 2 ULP；对 `2^126 < abs(rhs) < 2^128`，有限 lhs 产生按商符号的零，无穷 lhs 产生 NaN。其余特殊值遵循对应除法分类，不把 NaN 当成有限近似结果。
+
+`flush_to_zero=True` 在选中操作的输入和输出边界把 subnormal 转为保留符号的零；不修改相邻操作或 memory 中的数据。不支持非默认模式的 provider/hardware 必须明确拒绝。Canonical KIR 与 shared GPU unary/binary operations 保存这两个 typed bool attributes；CSE、克隆、重算和所有 lowering 必须保留其区别，不以 plain operator kind 代替完整数值语义。
+
+以上近似界限采用公开 [PTX 浮点指令语义](https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions) 的闭合精度范围作为语言契约；其它硬件实现也必须满足它，不能用各 provider 的默认行为重新定义。
+
+### 5.2 Cast 与 bitcast
+
 `I.cast`定义：
 
 - integer→integer先把source解释为数学整数，再对`2^destination_width`取模，最后按destination signedness解释该bit pattern；同signedness widening因此分别等价于sign/zero extension，narrowing等价于保留低bits；

@@ -60,7 +60,9 @@ Compiler 可以作出合法性与收益选择，但必须落实为当前 IR 中�
 
 ## 作者表达与数值边界
 
-作者 kernel 可以用现有 DSL 显式改善不合理表达和中间精度，不冻结已有作者写法，也不让 serializer 隐式改变精度、dtype、NaN 或累加语义。保持 `doc/` 定义的语言语义和外部 ABI；本 change 不新增语言语义，若实际实现需要此类变化，先单独澄清，不以修改设计文档迎合现状。
+作者 kernel 可以显式改善不合理表达和中间精度，不冻结已有作者写法，也不让 serializer 隐式改变精度、dtype、NaN 或累加语义。本 change 增加已获用户确认的逐操作近似数学与 FTZ：`I.fdiv`、`I.exp2` 与 `I.tanh` 的显式近似选择，以及近似除法/exp2 的 FTZ 选择；支持范围与闭合数值契约由 `doc/dsl/` 定义。默认语义、外部 ABI、原容差和性能门槛不变，除此之外的语言变化仍需单独澄清。
+
+近似与 FTZ 必须成为 canonical unary/binary operation 的 typed attributes，并随 construction、cloning、blocking、summary 改写、bufferization 和 provider lowering 保留；它们不进入 shape、kernel ABI、候选配置或 kernel-name policy。不同数值属性的运算不能被当作同一纯值合并；近似选择不授权改变相邻普通运算、累加 dtype、数据依赖或 source order。Provider 对不支持的 dtype/primitive 组合明确拒绝，不能静默改回另一种数值语义。
 
 Generated/source 使用相同算法、固定 case 和外部 dtype。舍入位置、近似数学、FTZ 和中间精度的细微差异允许注明后比较，不要求逐操作或 bitwise 一致；原有 entry 容差不放宽，真实 NaN/Inf 或容差外错误必须修复。若确有算法变化，保留已有 Triton 使用或已对齐的算法；没有 Triton 使用的 cuTile 专用算法可向 baseline 对齐，但不得偷换完整 callable 的功能或计时范围。
 

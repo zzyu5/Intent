@@ -40,7 +40,8 @@ def summarize_key_value_gradients(
 ):
     scores = I.matmul(keys, queries, transpose_rhs=True, acc_dtype=I.f32)
     probability = I.exp2(
-        scores * (scale * I.LOG2E) - lse[None, :] * I.LOG2E
+        scores * (scale * I.LOG2E) - lse[None, :] * I.LOG2E,
+        approximate=True, flush_to_zero=True,
     )
     if causal:
         probability = I.mask(
@@ -158,7 +159,8 @@ def attention_backward_dq(
                 acc_dtype=I.f32,
             )
             probability = I.exp2(
-                scores * (scale * I.LOG2E) - query_lse * I.LOG2E
+                scores * (scale * I.LOG2E) - query_lse * I.LOG2E,
+                approximate=True, flush_to_zero=True,
             )
             if CAUSAL:
                 q_index = I.indices(query_axis)

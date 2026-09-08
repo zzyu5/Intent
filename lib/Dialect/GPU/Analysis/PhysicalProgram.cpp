@@ -206,6 +206,8 @@ bool sameScalarExpression(Value lhs, Value rhs, unsigned depth = 0) {
   if (leftBinary || rightBinary)
     return leftBinary && rightBinary &&
            leftBinary.getOperatorKind() == rightBinary.getOperatorKind() &&
+           leftBinary.getApproximate() == rightBinary.getApproximate() &&
+           leftBinary.getFlushToZero() == rightBinary.getFlushToZero() &&
            sameScalarExpression(leftBinary.getLhs(), rightBinary.getLhs(),
                                 depth + 1) &&
            sameScalarExpression(leftBinary.getRhs(), rightBinary.getRhs(),

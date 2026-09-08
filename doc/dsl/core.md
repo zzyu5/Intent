@@ -57,6 +57,8 @@ window = columns[begin:end]
 
 pointwise surface允许scalar与size-one broadcast；frontend必须将其归一成显式broadcast relation。dynamic extents保留identity/equality conditions，不以“都是dynamic”判为兼容。
 
+Floating division可使用具名入口 `I.fdiv(lhs, rhs, *, approximate=False, flush_to_zero=False)`，默认与普通 `/` 相同。`I.exp2(value, *, approximate=False, flush_to_zero=False)` 与 `I.tanh(value, *, approximate=False)` 允许作者逐操作显式选择近似数学。选项是硬件无关的 constexpr bool；非默认模式只接受 `f32`，FTZ 必须与 `approximate=True` 一起选择。它们归一到同一 canonical binary/unary operation 的数值属性，不产生另一套算法、全局 fast-math 环境或 target query；具体精度与特殊值规则见数值章节。
+
 `reshape` 保持logical row-major element order与元素总数；`transpose/permute` 显式给出axis permutation。
 
 Ranked tensor与external view暴露`.shape`，返回保留dynamic-extent identity的logical extent tuple。Scalar、tuple、record与domain/subregion本身没有统一`.shape`。`.shape`可用于shape arithmetic、domain、shape transform和tensor construction，不表示physical fragment或block shape。

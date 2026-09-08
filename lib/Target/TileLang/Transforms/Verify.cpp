@@ -57,6 +57,19 @@ LogicalResult verifyTileLangKernel(func::FuncOp kernel) {
     return kernel.emitError(
         "TileLang provider program contains a nested launch configuration");
   WalkResult result = kernel.walk([&](Operation *operation) {
+    if (auto unary = dyn_cast<gpu::UnaryOp>(operation);
+        unary && unary.getApproximate() &&
+        unary.getOperatorKind() == UnaryOperator::Tanh) {
+      auto capabilities =
+          kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+      if (!capabilities ||
+          10 * capabilities.getComputeCapabilityMajor() +
+                  capabilities.getComputeCapabilityMinor() < 75) {
+        unary.emitOpError(
+            "native approximate tanh requires compute capability 7.5 or newer");
+        return WalkResult::interrupt();
+      }
+    }
     for (Type type : operation->getOperandTypes())
       if (isa<gpu::FragmentType>(type)) {
         operation->emitOpError(

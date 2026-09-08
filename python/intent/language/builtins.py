@@ -87,6 +87,7 @@ minimum = Intrinsic("minimum")
 maximum_num = Intrinsic("maximum_num")
 minimum_num = Intrinsic("minimum_num")
 add = Intrinsic("add")
+fdiv = Intrinsic("fdiv")
 
 reduce = IntrinsicNamespace("reduce", ("max", "sum", "any", "all"))
 arg_reduce = IntrinsicNamespace("arg_reduce", ("max",))
@@ -179,6 +180,7 @@ INTRINSICS = {
         maximum_num,
         minimum_num,
         add,
+        fdiv,
         reduce,
         reduce.max,
         reduce.sum,

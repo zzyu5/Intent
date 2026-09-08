@@ -42,6 +42,7 @@ from .builtins import domain
 from .builtins import end
 from .builtins import exp
 from .builtins import exp2
+from .builtins import fdiv
 from .builtins import floor
 from .builtins import full
 from .builtins import gather
@@ -148,6 +149,7 @@ __all__ = [
     "end",
     "exp",
     "exp2",
+    "fdiv",
     "f8e4m3fn",
     "f8e5m2",
     "f16",

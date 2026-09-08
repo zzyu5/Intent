@@ -1218,7 +1218,13 @@ private:
     case BinaryOperator::Add: return infix("+");
     case BinaryOperator::Subtract: return infix("-");
     case BinaryOperator::Multiply: return infix("*");
-    case BinaryOperator::TrueDivide: return infix("/");
+    case BinaryOperator::TrueDivide:
+      if (binary.getApproximate())
+        return "ct.truediv(" + valueString(binary.getLhs()) + ", " +
+               valueString(binary.getRhs()) +
+               ", rounding_mode=ct.RoundingMode.APPROX, flush_to_zero=" +
+               (binary.getFlushToZero() ? "True" : "False") + ")";
+      return infix("/");
     case BinaryOperator::FloorDivide: return infix("//");
     case BinaryOperator::Remainder: return infix("%");
     case BinaryOperator::Power: return infix("**");
@@ -1252,7 +1258,11 @@ private:
     case UnaryOperator::Negate: return "(-" + input + ")";
     case UnaryOperator::Not: return "(~" + input + ")";
     case UnaryOperator::Exp: return call("ct.exp");
-    case UnaryOperator::Exp2: return call("ct.exp2");
+    case UnaryOperator::Exp2:
+      if (unary.getApproximate())
+        return "ct.exp2(" + input + ", flush_to_zero=" +
+               (unary.getFlushToZero() ? "True" : "False") + ")";
+      return call("ct.exp2");
     case UnaryOperator::Log: return call("ct.log");
     case UnaryOperator::Sin: return call("ct.sin");
     case UnaryOperator::Cos: return call("ct.cos");
@@ -1260,7 +1270,10 @@ private:
     case UnaryOperator::Erf: return call("ct.erf");
     case UnaryOperator::Rsqrt: return call("ct.rsqrt");
     case UnaryOperator::Sigmoid: return call("ct.sigmoid");
-    case UnaryOperator::Tanh: return call("ct.tanh");
+    case UnaryOperator::Tanh:
+      return unary.getApproximate()
+                 ? "ct.tanh(" + input + ", rounding_mode=ct.RoundingMode.APPROX)"
+                 : call("ct.tanh");
     case UnaryOperator::Abs: return call("ct.abs");
     case UnaryOperator::Sqrt: return call("ct.sqrt");
     }
