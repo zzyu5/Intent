@@ -264,6 +264,9 @@ struct PhysicalAccessFootprint {
 struct PhysicalAccessBoundaryFact {
   PhysicalFactState state = PhysicalFactState::Unknown;
   llvm::SmallVector<int64_t, 4> boundaryAxes;
+  /// Requested conditional bounds: each entire unit-step range must lie below
+  /// its exclusive upper bound before replacing the original member predicate.
+  llvm::SmallVector<std::pair<MakeRangeOp, mlir::Value>, 2> rangeBounds;
   llvm::SmallVector<mlir::Operation *, 4> blockers;
 
   bool isExact() const { return state == PhysicalFactState::Exact; }
@@ -340,7 +343,10 @@ public:
       std::optional<int64_t> sourceDimension = std::nullopt);
   PhysicalContractFreeAxisFact contractFreeAxes(mlir::Operation *contract);
   PhysicalAccessFootprint footprint(mlir::Operation *access);
-  PhysicalAccessBoundaryFact boundaryValidity(mlir::Operation *access);
+  /// Conditional range bounds are opt-in: the caller must materialize their
+  /// guards before using the boundary form, retaining the original access otherwise.
+  PhysicalAccessBoundaryFact boundaryValidity(mlir::Operation *access,
+                                             bool allowRangeGuards = false);
   PhysicalAccessBoundsFact accessBounds(mlir::Operation *access);
   PhysicalBufferDataflowFact bufferDataflow(BufferOp buffer);
 

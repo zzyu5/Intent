@@ -13,7 +13,7 @@ splitk_attention_reduce,B8-H32-S8192-splits16-D128,0.005904,0.005888,1.002717,pa
 mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,1.523848,0.946840,1.609404,pass,同算法；source 使用 FTZ 与近似除法
 batched_gemm,B32-M512-N512-K1024-bf16,0.091904,0.091936,0.999652,pass,
 tilegym_dense_gemm,M8192-N11008-K4096-bf16,3.121920,3.171448,0.984383,pass,
-grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.699008,0.642576,1.087822,pass,同算法；source 使用 host group shapes
+grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.650184,0.643184,1.010883,pass,同算法；source 使用 host group shapes
 moe_alignment,T4096-top2-E64,0.018432,0.036864,0.500000,pass,同算法计数/前缀和/散射；初始化与辅助输出计入调用
 mhc_gemm_rms_scale,T2048-H4096-streams4-bf16,0.071680,0.077824,0.921053,pass,同算法；source 用乘倒数实现归一化
 chunked_softmax,8192x32768-bf16,0.802576,0.845864,0.948824,pass,

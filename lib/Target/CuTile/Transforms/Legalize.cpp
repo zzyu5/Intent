@@ -1153,6 +1153,39 @@ struct MaterializedTileIndices {
   Value alignment;
 };
 
+Value materializeFullRangeGuard(
+    OpBuilder &builder, Location location,
+    const gpu::PhysicalAccessBoundaryFact &boundary) {
+  Value guard;
+  for (auto [range, upper] : boundary.rangeBounds) {
+    Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+    Value origin = range.getStart();
+    Value nonnegativeOrigin = builder.create<gpu::CompareOp>(
+        location, builder.getI1Type(), origin, zero, ComparePredicate::Ge);
+    Value nonnegativeUpper = builder.create<gpu::CompareOp>(
+        location, builder.getI1Type(), upper, zero, ComparePredicate::Ge);
+    Value nonnegative = builder.create<gpu::BinaryOp>(
+        location, builder.getI1Type(), nonnegativeOrigin, nonnegativeUpper,
+        BinaryOperator::LogicalAnd);
+    // With nonnegative endpoints, subtraction cannot overflow. A failed guard
+    // keeps the original predicated gather, including a partial logical tile.
+    Value remaining = builder.create<gpu::BinaryOp>(
+        location, builder.getIndexType(), upper, origin,
+        BinaryOperator::Subtract);
+    Value fullRange = builder.create<gpu::CompareOp>(
+        location, builder.getI1Type(), remaining, range.getExtent(),
+        ComparePredicate::Ge);
+    Value condition = builder.create<gpu::BinaryOp>(
+        location, builder.getI1Type(), nonnegative, fullRange,
+        BinaryOperator::LogicalAnd);
+    guard = guard ? Value(builder.create<gpu::BinaryOp>(
+                        location, builder.getI1Type(), guard, condition,
+                        BinaryOperator::LogicalAnd))
+                  : condition;
+  }
+  return guard;
+}
+
 FailureOr<MaterializedTileIndices>
 materializeTileIndices(OpBuilder &builder, Operation *owner,
                        const NativeTileAccessPlan &plan,
@@ -1618,7 +1651,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
     // Vector inputs stay register loads, not cluster TMA payloads.
     bool vectorInput = matrixCompute && result.getShape().size() == 1;
     gpu::PhysicalAccessBoundaryFact boundary =
-        analysis.boundaryValidity(load);
+        analysis.boundaryValidity(load, /*allowRangeGuards=*/true);
     FailureOr<NativeTileAccessPlan> plan = analyzeNativeTileAccess(
         load, kernel, analysis, view, load.getCoordinates(),
         load.getSourceAxes(), result);
@@ -1631,10 +1664,18 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
     if (succeeded(indices))
       originGuard = materializeTileOriginGuard(
           builder, load, load.getResource(), *plan, boundary);
+    Value rangeGuard = succeeded(indices)
+                           ? materializeFullRangeGuard(builder, load.getLoc(),
+                                                       boundary)
+                           : Value();
     bool guardedNative = succeeded(originGuard) && *originGuard;
     bool native = succeeded(indices) && succeeded(originGuard) &&
                   (!guardedNative ||
                    (load.getFill() && load.getFill().getType() == result));
+    if (rangeGuard && guardedNative)
+      rangeGuard = builder.create<gpu::BinaryOp>(
+          load.getLoc(), builder.getI1Type(), rangeGuard, *originGuard,
+          BinaryOperator::LogicalAnd);
     FailureOr<Value> allowTMA = failure();
     if (native) {
       allowTMA = tmaCondition(plan->resourceType);
@@ -1713,15 +1754,22 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
       outOfBounds.create<scf::YieldOp>(load.getLoc(), load.getFill());
       return conditional.getResult(0);
     };
-    auto emitAlignedNative = [&](OpBuilder &nested) -> FailureOr<Value> {
-      if (!indices->alignment)
+    auto emitGuardedNative = [&](OpBuilder &nested) -> FailureOr<Value> {
+      Value condition = indices->alignment;
+      if (rangeGuard)
+        condition = condition ? Value(nested.create<gpu::BinaryOp>(
+                                    load.getLoc(), nested.getI1Type(), condition,
+                                    rangeGuard, BinaryOperator::LogicalAnd))
+                              : rangeGuard;
+      if (!condition)
         return emitNativeOrFill(nested);
       auto conditional = nested.create<scf::IfOp>(
-          load.getLoc(), TypeRange{result}, indices->alignment,
+          load.getLoc(), TypeRange{result}, condition,
           /*withElseRegion=*/true);
       createdOperations.push_back(conditional);
       OpBuilder aligned = prepareBranch(conditional.getThenRegion());
-      Value value = emitNativeOrFill(aligned);
+      Value value = rangeGuard ? emitNativeLoad(aligned)
+                              : emitNativeOrFill(aligned);
       aligned.create<scf::YieldOp>(load.getLoc(), value);
       OpBuilder unaligned = prepareBranch(conditional.getElseRegion());
       FailureOr<Value> gathered = emitGatherLoad(unaligned);
@@ -1739,7 +1787,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
           /*withElseRegion=*/true);
       createdOperations.push_back(conditional);
       OpBuilder tiled = prepareBranch(conditional.getThenRegion());
-      FailureOr<Value> tiledValue = emitAlignedNative(tiled);
+      FailureOr<Value> tiledValue = emitGuardedNative(tiled);
       if (failed(tiledValue))
         return failure();
       tiled.create<scf::YieldOp>(load.getLoc(), *tiledValue);
@@ -2118,7 +2166,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
       continue;
     }
     gpu::PhysicalAccessBoundaryFact boundary =
-        analysis.boundaryValidity(store);
+        analysis.boundaryValidity(store, /*allowRangeGuards=*/true);
     auto computationType =
         cast<gpu::FragmentType>(store.getValue().getType());
     FailureOr<NativeTileAccessPlan> plan = analyzeNativeTileAccess(
@@ -2128,12 +2176,25 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
     FailureOr<Value> originGuard = failure();
     if (succeeded(plan) && boundary.isExact())
       indices = materializeTileIndices(builder, store, *plan,
-                                       /*allowDynamicAlignment=*/false);
+                                       /*allowDynamicAlignment=*/true);
     if (succeeded(indices))
       originGuard = materializeTileOriginGuard(
           builder, store, store.getResource(), *plan, boundary);
     bool native = succeeded(indices) && succeeded(originGuard);
     bool guardedNative = native && *originGuard;
+    Value nativeCondition;
+    if (native) {
+      nativeCondition = indices->alignment;
+      Value rangeGuard = materializeFullRangeGuard(builder, store.getLoc(),
+                                                  boundary);
+      if (rangeGuard)
+        nativeCondition = nativeCondition
+                              ? Value(builder.create<gpu::BinaryOp>(
+                                    store.getLoc(), builder.getI1Type(),
+                                    nativeCondition, rangeGuard,
+                                    BinaryOperator::LogicalAnd))
+                              : rangeGuard;
+    }
     FailureOr<Value> allowTMA = failure();
     if (native) {
       allowTMA = tmaCondition(plan->resourceType);
@@ -2162,8 +2223,12 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
           nativeValue);
       createdOperations.push_back(tile);
     };
-    if (guardedNative) {
-      auto conditional = builder.create<scf::IfOp>(
+    auto emitBoundedNativeStore = [&](OpBuilder &nested) {
+      if (!guardedNative) {
+        emitNativeStore(nested);
+        return;
+      }
+      auto conditional = nested.create<scf::IfOp>(
           store.getLoc(), TypeRange{}, *originGuard,
           /*withElseRegion=*/true);
       createdOperations.push_back(conditional);
@@ -2172,22 +2237,39 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
       inBounds.create<scf::YieldOp>(store.getLoc());
       OpBuilder outOfBounds = prepareBranch(conditional.getElseRegion());
       outOfBounds.create<scf::YieldOp>(store.getLoc());
-    } else if (native) {
-      emitNativeStore(builder);
-    } else {
+    };
+    auto emitScatterStore = [&](OpBuilder &nested) -> LogicalResult {
       FailureOr<SmallVector<Value>> coordinates = orderedCoordinates(
           store, store.getResource(), store.getCoordinates(), store.getSourceAxes());
       if (failed(coordinates))
         return failure();
       auto target = cast<gpu::FragmentType>(store.getValue().getType());
       FailureOr<SmallVector<Value>> materialized =
-          materializeCoordinateDomains(builder, store, *coordinates, target);
+          materializeCoordinateDomains(nested, store, *coordinates, target);
       if (failed(materialized))
         return failure();
-      auto replacement = builder.create<ScatterStoreOp>(
+      auto replacement = nested.create<ScatterStoreOp>(
           store.getLoc(), store.getResource(), *materialized, store.getValue(),
           store.getValid(), identityAxes(view.getRank()));
       createdOperations.push_back(replacement);
+      return success();
+    };
+    if (native && nativeCondition) {
+      auto conditional = builder.create<scf::IfOp>(
+          store.getLoc(), TypeRange{}, nativeCondition,
+          /*withElseRegion=*/true);
+      createdOperations.push_back(conditional);
+      OpBuilder tiled = prepareBranch(conditional.getThenRegion());
+      emitBoundedNativeStore(tiled);
+      tiled.create<scf::YieldOp>(store.getLoc());
+      OpBuilder scattered = prepareBranch(conditional.getElseRegion());
+      if (failed(emitScatterStore(scattered)))
+        return failure();
+      scattered.create<scf::YieldOp>(store.getLoc());
+    } else if (native) {
+      emitBoundedNativeStore(builder);
+    } else if (failed(emitScatterStore(builder))) {
+      return failure();
     }
     for (Operation *operation : createdOperations)
       if (Attribute origin = store->getAttr(gpu::originAttr))

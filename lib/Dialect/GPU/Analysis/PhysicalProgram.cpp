@@ -2908,7 +2908,8 @@ PhysicalProgramAnalysis::footprint(Operation *access) {
 }
 
 PhysicalAccessBoundaryFact
-PhysicalProgramAnalysis::boundaryValidity(Operation *access) {
+PhysicalProgramAnalysis::boundaryValidity(Operation *access,
+                                          bool allowRangeGuards) {
   PhysicalAccessBoundaryFact result;
   PhysicalAccessFootprint accessFact = footprint(access);
   result.blockers = accessFact.blockers;
@@ -3013,13 +3014,29 @@ PhysicalProgramAnalysis::boundaryValidity(Operation *access) {
       bool exactRange =
           upperComparison && hasExactPhysicalRangeCoverage(
                                  coordinate, comparison.getRhs());
-      if (!viewBoundary && !exactRange)
+      MakeRangeOp guardedRange;
+      Value rangeBound;
+      if (allowRangeGuards && upperComparison && !viewBoundary && !exactRange) {
+        auto range = stripIntegerIndexCasts(coordinate)
+                         .getDefiningOp<MakeRangeOp>();
+        Value bound = stripScalarIdentity(comparison.getRhs());
+        if (range && isUnitStepRange(range) && bound.getType().isIndex() &&
+            sameScalarExpression(bound, range.getLogicalStop())) {
+          guardedRange = range;
+          rangeBound = bound;
+        }
+      }
+      if (!viewBoundary && !exactRange && !guardedRange)
         continue;
       if (matchedAxis) {
         appendUnique(result.blockers, comparison);
         return PhysicalFactState::Ambiguous;
       }
       matchedAxis = sourceAxis;
+      if (guardedRange &&
+          !llvm::is_contained(result.rangeBounds,
+                             std::make_pair(guardedRange, rangeBound)))
+        result.rangeBounds.emplace_back(guardedRange, rangeBound);
       requiresBoundary =
           viewBoundary && !coordinateRangeWithinResource(
                               coordinate, accessFact.resource, sourceAxis);
