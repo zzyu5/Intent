@@ -92,10 +92,9 @@ bool collectInvariantGuard(Value value, scf::ForOp loop,
 
 void unswitchNativeAccessGuard(scf::ForOp loop) {
   scf::IfOp selected;
-  unsigned selectedBenefit = 0;
   SmallVector<Operation *> guardOperations;
   loop.walk([&](scf::IfOp conditional) {
-    if (conditional->getParentOfType<scf::ForOp>() != loop ||
+    if (selected || conditional->getParentOfType<scf::ForOp>() != loop ||
         conditional.getNumResults() == 0 ||
         isSpecializationExpression(conditional.getCondition()))
       return;
@@ -103,20 +102,7 @@ void unswitchNativeAccessGuard(scf::ForOp loop) {
     bool gatherLoad = false;
     conditional.getThenRegion().walk([&](TileLoadOp) { tileLoad = true; });
     conditional.getElseRegion().walk([&](GatherLoadOp) { gatherLoad = true; });
-    bool fillOnly = false;
-    if (!conditional.getElseRegion().empty()) {
-      Block &block = conditional.getElseRegion().front();
-      auto yield = cast<scf::YieldOp>(block.getTerminator());
-      fillOnly = block.getOperations().size() == 1 &&
-                 llvm::all_of(yield.getResults(), [](Value value) {
-                   return value.getDefiningOp<gpu::SplatOp>();
-                 });
-    }
-    // Origin guards can choose a native load or an existing padding fragment.
-    // Prefer native/gather decisions when both are present, retaining the
-    // single-decision bound on loop versioning.
-    unsigned benefit = gatherLoad ? 2 : fillOnly ? 1 : 0;
-    if (!tileLoad || benefit <= selectedBenefit)
+    if (!tileLoad || !gatherLoad)
       return;
     llvm::SmallPtrSet<Operation *, 16> visited;
     SmallVector<Operation *> operations;
@@ -124,7 +110,6 @@ void unswitchNativeAccessGuard(scf::ForOp loop) {
                                operations))
       return;
     selected = conditional;
-    selectedBenefit = benefit;
     guardOperations = std::move(operations);
   });
   if (!selected)
