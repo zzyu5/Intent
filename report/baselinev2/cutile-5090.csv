@@ -2,15 +2,15 @@ kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
 official_fmha,B4-QH32-KVH8-S4096-D128-fp16-causal,4.448160,36.421282,0.122131,pass,同算法；source 使用 FTZ 与近似除法
 block_scaled_gemm,M4096-N14336-K4096-fp8-block32,1.062088,1.072520,0.990273,pass,
 dense_gemm,M4096-N14336-K4096-fp16,2.074160,2.097128,0.989048,pass,
-moe_expert_projection,T4096-E8-top2-4096x14336-bf16,4.208104,6.167992,0.682249,pass,同算法；source 使用预计算 block ownership
+moe_expert_projection,T4096-E8-top2-4096x14336-bf16,4.208944,6.160432,0.683222,pass,同算法；source 使用预计算 block ownership
 layer_norm,8192x4096-bf16,0.086488,0.264288,0.327249,pass,同算法；source 额外写 Mean/Rstd
-silu_and_mul,4096x28672-to14336-bf16,0.227104,0.243760,0.931671,pass,同算法；source 使用 FTZ 与近似除法
+silu_and_mul,4096x28672-to14336-bf16,0.227120,0.244640,0.928385,pass,同算法；source 使用 FTZ 与近似除法
 attention_backward,B2-QH8-KVH2-S1024-D64-fp16-causal,0.158616,0.177848,0.891863,pass,同算法；中间精度和舍入不同
 dense_attention_forward,B2-QH32-KVH8-S4096-D128-bf16-causal,1.334816,1.285352,1.038483,pass,同算法；source 使用 FTZ 与近似除法
 grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,0.188848,0.188448,1.002123,pass,同算法；source 使用 FTZ 与近似除法
-swiglu,8192x14336-bf16,0.450256,0.464672,0.968976,pass,同算法；source 使用 FTZ 与近似除法
-splitk_attention_reduce,B8-H32-S8192-splits16-D128,0.005792,0.006176,0.937824,pass,
-mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,0.941384,0.941760,0.999601,pass,同算法；source 使用 FTZ 与近似除法
+swiglu,8192x14336-bf16,0.450352,0.464688,0.969149,pass,同算法；source 使用 FTZ 与近似除法
+splitk_attention_reduce,B8-H32-S8192-splits16-D128,0.005904,0.005904,1.000000,pass,
+mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,0.914720,0.942384,0.970645,pass,同算法；source 使用 FTZ 与近似除法
 batched_gemm,B32-M512-N512-K1024-bf16,0.091904,0.091936,0.999652,pass,
 tilegym_dense_gemm,M8192-N11008-K4096-bf16,3.121920,3.171448,0.984383,pass,
 grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.650184,0.643184,1.010883,pass,同算法；source 使用 host group shapes

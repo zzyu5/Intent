@@ -17,7 +17,8 @@ def swiglu_forward(
     for row in I.parallel(I.domain(0, M)):
         gate_values = I.cast(gate[row, columns], I.f32)
         up_values = up[row, columns]
-        sigmoid = 1.0 / (1.0 + I.exp(-gate_values))
+        inverse_root = I.rsqrt(1.0 + I.exp(-gate_values))
+        sigmoid = inverse_root * inverse_root
         silu = I.cast(gate_values * sigmoid, I.bf16)
         output[row, columns] = silu * up_values
 
@@ -35,7 +36,8 @@ def silu_and_mul_packed(
             packed[row, I.indices(columns) + FEATURES],
             I.f32,
         )
-        sigmoid = 1.0 / (1.0 + I.exp(-gate_values))
+        inverse_root = I.rsqrt(1.0 + I.exp(-gate_values))
+        sigmoid = inverse_root * inverse_root
         output[row, columns] = I.cast(
             gate_values * sigmoid * up_values,
             I.bf16,

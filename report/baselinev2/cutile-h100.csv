@@ -2,15 +2,15 @@ kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
 official_fmha,B4-QH32-KVH8-S4096-D128-fp16-causal,3.019576,4.350520,0.694072,pass,同算法；source 使用 FTZ 与近似除法
 block_scaled_gemm,M4096-N14336-K4096-fp8-block32,,,,hardware_unsupported,H100 为 SM90；E8M0 scaled MMA 要求 compute capability 10.0 及以上
 dense_gemm,M4096-N14336-K4096-fp16,1.758128,1.805016,0.974024,pass,
-moe_expert_projection,T4096-E8-top2-4096x14336-bf16,4.517648,3.587448,1.259293,pass,同算法；source 使用预计算 block ownership
+moe_expert_projection,T4096-E8-top2-4096x14336-bf16,4.517680,3.634632,1.242954,pass,同算法；source 使用预计算 block ownership
 layer_norm,8192x4096-bf16,0.122488,2.894040,0.042324,pass,同算法；source 额外写 Mean/Rstd
 silu_and_mul,4096x28672-to14336-bf16,0.212568,0.229056,0.928018,pass,同算法；source 使用 FTZ 与近似除法
-attention_backward,B2-QH8-KVH2-S1024-D64-fp16-causal,0.248104,0.197976,1.253202,pass,同算法；中间精度和舍入不同
+attention_backward,B2-QH8-KVH2-S1024-D64-fp16-causal,0.248808,0.196752,1.264577,pass,同算法；中间精度和舍入不同
 dense_attention_forward,B2-QH32-KVH8-S4096-D128-bf16-causal,1.566112,2.314680,0.676600,pass,同算法；source 使用 FTZ 与近似除法
 grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,0.199608,0.192168,1.038716,pass,同算法；source 使用 FTZ 与近似除法
 swiglu,8192x14336-bf16,0.401312,0.412960,0.971794,pass,同算法；source 使用 FTZ 与近似除法
-splitk_attention_reduce,B8-H32-S8192-splits16-D128,0.012496,0.010768,1.160475,pass,
-mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,1.013184,0.798744,1.268472,pass,同算法；source 使用 FTZ 与近似除法
+splitk_attention_reduce,B8-H32-S8192-splits16-D128,0.012544,0.010768,1.164933,pass,
+mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,1.012960,0.798312,1.268877,pass,同算法；source 使用 FTZ 与近似除法
 batched_gemm,B32-M512-N512-K1024-bf16,0.078960,0.079424,0.994158,pass,
 tilegym_dense_gemm,M8192-N11008-K4096-bf16,2.463600,3.951752,0.623420,pass,
 grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.828880,0.821912,1.008478,pass,同算法；source 使用 host group shapes
@@ -25,7 +25,7 @@ dropout,8192x4096-fp16-p0.1,0.095680,0.096736,0.989084,pass,
 attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,0.869360,0.981592,0.885663,pass,同算法；source 的布局转换与辅助工作计入其调用时间
 attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,3.812256,4.337016,0.879004,pass,同算法；source 使用 bf16 LSE 与近似除法
 mhc_apply_residual,T2048-H4096-streams4-bf16,0.098504,0.103088,0.955533,pass,同算法；source 保留 bf16 中间累加
-gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,1.687232,0.759336,2.221984,pass,同算法；中间精度和舍入不同
+gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,1.817880,0.759120,2.394720,pass,同算法；中间精度和舍入不同
 gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,0.272456,0.663224,0.410805,pass,同算法；中间精度和舍入不同
 mhc_sinkhorn,T8192-streams4-fp32,0.081016,0.081136,0.998521,pass,同算法；source 用 exp2(x * log2(e)) 实现 exp
 absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,0.630320,0.653632,0.964335,pass,同算法；source 使用近似除法并额外输出 LSE
