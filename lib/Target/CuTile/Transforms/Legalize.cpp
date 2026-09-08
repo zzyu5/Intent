@@ -650,6 +650,82 @@ bool valueIsMultipleOf(Value value, Value divisor, unsigned depth) {
   }
 }
 
+// Return uniform factors whose divisibility is sufficient for the complete
+// index. The caller restricts the divisor to powers of two, so index-width
+// wraparound does not invalidate multiplication/addition divisibility.
+FailureOr<SmallVector<Value>> uniformAlignmentFactors(
+    Value value, Value divisor, unsigned depth = 0) {
+  if (!value || depth >= 32)
+    return failure();
+  value = stripIndexIdentities(value);
+  divisor = stripIndexIdentities(divisor);
+  if (gpu::samePhysicalScalarExpression(value, divisor))
+    return SmallVector<Value>{};
+  if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
+    auto integer = dyn_cast<IntegerAttr>(constant.getValue());
+    if (!integer)
+      return failure();
+    return integer.getValue().isZero() ? SmallVector<Value>{}
+                                       : SmallVector<Value>{value};
+  }
+  if (value.getDefiningOp<gpu::ParameterOp>() ||
+      value.getDefiningOp<gpu::DimOp>() ||
+      value.getDefiningOp<gpu::PhysicalExprOp>())
+    return SmallVector<Value>{value};
+  auto combine = [&](Value lhs, Value rhs) -> FailureOr<SmallVector<Value>> {
+    auto left = uniformAlignmentFactors(lhs, divisor, depth + 1);
+    auto right = uniformAlignmentFactors(rhs, divisor, depth + 1);
+    if (failed(left) || failed(right))
+      return failure();
+    for (Value factor : *right)
+      if (!llvm::is_contained(*left, factor))
+        left->push_back(factor);
+    return std::move(*left);
+  };
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    if (dimensionIdentity(argument))
+      return SmallVector<Value>{value};
+    auto loop = dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
+    if (loop && argument == loop.getInductionVar() &&
+        isKnownPositive(loop.getStep()))
+      return combine(loop.getLowerBound(), loop.getStep());
+    return failure();
+  }
+  auto binary = value.getDefiningOp<gpu::BinaryOp>();
+  if (!binary)
+    return failure();
+  switch (binary.getOperatorKind()) {
+  case BinaryOperator::Add:
+  case BinaryOperator::Subtract:
+  case BinaryOperator::Minimum:
+  case BinaryOperator::Maximum:
+    return combine(binary.getLhs(), binary.getRhs());
+  case BinaryOperator::Multiply: {
+    auto lhs = uniformAlignmentFactors(binary.getLhs(), divisor, depth + 1);
+    auto rhs = uniformAlignmentFactors(binary.getRhs(), divisor, depth + 1);
+    if (succeeded(lhs) && (failed(rhs) || lhs->size() <= rhs->size()))
+      return std::move(*lhs);
+    return rhs;
+  }
+  default:
+    return failure();
+  }
+}
+
+bool hasPowerOfTwoDomain(Value value) {
+  value = stripIndexIdentities(value);
+  if (auto parameter = value.getDefiningOp<gpu::ParameterOp>())
+    return llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
+                        [](int64_t candidate) {
+                          return candidate > 0 && llvm::isPowerOf2_64(candidate);
+                        });
+  auto constant = value.getDefiningOp<arith::ConstantOp>();
+  auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
+                          : IntegerAttr();
+  return integer && integer.getInt() > 0 &&
+         llvm::isPowerOf2_64(integer.getInt());
+}
+
 bool valueUpperBoundedBy(Value value, Value bound, unsigned depth = 0) {
   if (!value || !bound || depth >= 32)
     return false;
@@ -1221,6 +1297,31 @@ materializeTileIndices(OpBuilder &builder, Operation *owner,
     Value aligned = builder.create<gpu::CompareOp>(
         owner->getLoc(), builder.getI1Type(), remainder, zero,
         ComparePredicate::Eq);
+    if (hasPowerOfTwoDomain(range.getExtent())) {
+      auto factors = uniformAlignmentFactors(start, range.getExtent());
+      if (succeeded(factors)) {
+        if (factors->empty())
+          continue;
+        Value uniform;
+        for (Value factor : *factors) {
+          Value modulus = builder.create<gpu::BinaryOp>(
+              owner->getLoc(), builder.getIndexType(), factor,
+              range.getExtent(), BinaryOperator::Remainder);
+          Value condition = builder.create<gpu::CompareOp>(
+              owner->getLoc(), builder.getI1Type(), modulus, zero,
+              ComparePredicate::Eq);
+          uniform = uniform ? Value(builder.create<gpu::BinaryOp>(
+                                  owner->getLoc(), builder.getI1Type(), uniform,
+                                  condition, BinaryOperator::LogicalAnd))
+                            : condition;
+        }
+        // Specialization can discard the gather branch for the entire loop.
+        // Otherwise retain the original per-origin alignment predicate.
+        aligned = builder.create<gpu::BinaryOp>(
+            owner->getLoc(), builder.getI1Type(), uniform, aligned,
+            BinaryOperator::LogicalOr);
+      }
+    }
     result.alignment =
         result.alignment
             ? Value(builder.create<gpu::BinaryOp>(
