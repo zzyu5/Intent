@@ -34,7 +34,7 @@ bool isAllowed(Operation *operation) {
              gpu::RangeBoundOp, gpu::UnaryOp, gpu::BinaryOp, gpu::CompareOp,
              gpu::SelectOp, gpu::CastOp, gpu::BitcastOp, gpu::MakeRecordOp,
              gpu::ExtractOp, arith::ConstantOp,
-             scf::ForOp, scf::YieldOp, func::FuncOp, func::ReturnOp>(operation);
+             scf::ForOp, scf::IfOp, scf::YieldOp, func::FuncOp, func::ReturnOp>(operation);
 }
 
 } // namespace
@@ -92,6 +92,11 @@ LogicalResult verifyTileLangKernel(func::FuncOp kernel) {
     if (auto loop = dyn_cast<scf::ForOp>(operation))
       if (loop.getNumResults() != 0) {
         loop.emitOpError("still carries an unbufferized SSA value");
+        return WalkResult::interrupt();
+      }
+    if (auto choice = dyn_cast<scf::IfOp>(operation))
+      if (choice.getNumResults() != 0) {
+        choice.emitOpError("still returns an unbufferized SSA value");
         return WalkResult::interrupt();
       }
     if (isAllowed(operation))

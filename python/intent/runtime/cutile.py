@@ -22,6 +22,7 @@ def bind_array_view(view, group_ends: tuple[int, ...]):
 
 def array_index_kernels(function, view_names: tuple[str, ...]):
     from types import FunctionType
+    from typing import Annotated, get_args
     import cuda.tile as ct
 
     narrow = FunctionType(function.__code__, function.__globals__, function.__name__,
@@ -29,7 +30,10 @@ def array_index_kernels(function, view_names: tuple[str, ...]):
     narrow.__qualname__ = function.__qualname__
     narrow.__annotations__ = dict(function.__annotations__)
     for name in view_names:
-        narrow.__annotations__[name] = ct.Array
+        array = get_args(function.__annotations__[name])[1]
+        narrow.__annotations__[name] = Annotated[
+            ct.Array, ct.ArrayAnnotation(static_shape_dims=array.static_shape_dims)
+        ]
     return ct.kernel(narrow), ct.kernel(function)
 
 

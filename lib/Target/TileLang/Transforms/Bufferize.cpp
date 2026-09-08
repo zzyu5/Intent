@@ -272,7 +272,7 @@ public:
   explicit Bufferizer(func::FuncOp kernel) : kernel(kernel) {}
 
   LogicalResult run() {
-    if (failed(flattenRecordLoopCarries()))
+    if (failed(flattenRecordLoopCarries()) || failed(flattenRecordIfResults()))
       return failure();
     SmallVector<gpu::LoadOp> loads;
     SmallVector<Operation *> structuredComputations;
@@ -359,7 +359,8 @@ public:
                         : BufferSpace::Fragment)))
         return failure();
     }
-    if (failed(prepareFragmentLoopCarries()))
+    if (failed(prepareFragmentIfResults()) ||
+        failed(prepareFragmentLoopCarries()))
       return failure();
     // Preserve physical SSA/program order across native computations.  A
     // second contraction may consume a reduction produced after an earlier
@@ -384,7 +385,8 @@ public:
           return failure();
       }
     }
-    if (failed(bufferizeFragmentLoopCarries()))
+    if (failed(bufferizeFragmentLoopCarries()) ||
+        failed(bufferizeFragmentIfResults()))
       return failure();
     for (gpu::StoreOp store : stores)
       if (failed(lowerStore(store)))
@@ -401,6 +403,8 @@ public:
       return failure();
     eraseLoweredOperations();
     eraseDeadPureValues();
+    if (failed(dropFragmentIfResults()))
+      return failure();
     eraseLoweredOperations();
     eraseDeadPureValues();
     return success();
@@ -458,6 +462,135 @@ private:
                                     cast<TypeAttr>(attribute).getValue(), leaves,
                                     next));
     return builder.create<gpu::MakeRecordOp>(location, record, fields);
+  }
+
+  LogicalResult flattenRecordIfResults() {
+    SmallVector<scf::IfOp> choices;
+    kernel.walk<WalkOrder::PostOrder>([&](scf::IfOp choice) {
+      if (llvm::any_of(choice.getResultTypes(), [](Type type) {
+            return isa<gpu::RecordType>(type);
+          }))
+        choices.push_back(choice);
+    });
+    for (scf::IfOp choice : choices) {
+      SmallVector<Type> types;
+      std::function<void(Type)> flattenType = [&](Type type) {
+        if (auto record = dyn_cast<gpu::RecordType>(type)) {
+          for (Attribute field : record.getFieldTypes())
+            flattenType(cast<TypeAttr>(field).getValue());
+        } else {
+          types.push_back(type);
+        }
+      };
+      for (Type type : choice.getResultTypes())
+        flattenType(type);
+      OpBuilder before(choice);
+      auto replacement = before.create<scf::IfOp>(
+          choice.getLoc(), types, choice.getCondition(), true);
+      replacement->setAttrs(choice->getAttrs());
+      replacement.getThenRegion().takeBody(choice.getThenRegion());
+      replacement.getElseRegion().takeBody(choice.getElseRegion());
+      for (Region &region : replacement->getRegions()) {
+        auto yield = cast<scf::YieldOp>(region.front().getTerminator());
+        OpBuilder builder(yield);
+        SmallVector<Value> leaves;
+        for (Value value : yield.getOperands())
+          flattenValue(builder, value, leaves);
+        yield->setOperands(leaves);
+      }
+      OpBuilder after(replacement);
+      after.setInsertionPointAfter(replacement);
+      unsigned next = 0;
+      for (Value result : choice.getResults())
+        result.replaceAllUsesWith(rebuildValue(
+            after, choice.getLoc(), result.getType(), replacement.getResults(), next));
+      choice.erase();
+    }
+    return success();
+  }
+
+  LogicalResult prepareFragmentIfResults() {
+    WalkResult result = kernel.walk([&](scf::IfOp choice) {
+      for (Value value : choice.getResults()) {
+        auto fragment = dyn_cast<gpu::FragmentType>(value.getType());
+        if (!fragment)
+          continue;
+        auto shape = physicalShapeFor(value, choice);
+        if (failed(shape))
+          return WalkResult::interrupt();
+        auto buffer = allocateFor(value, BufferSpace::Fragment, choice, *shape);
+        if (failed(buffer))
+          return WalkResult::interrupt();
+        fragmentBuffers[value] = *buffer;
+      }
+      return WalkResult::advance();
+    });
+    return failure(result.wasInterrupted());
+  }
+
+  LogicalResult bufferizeFragmentIfResults() {
+    WalkResult result = kernel.walk<WalkOrder::PostOrder>([&](scf::IfOp choice) {
+      for (auto [index, value] : llvm::enumerate(choice.getResults())) {
+        auto fragment = dyn_cast<gpu::FragmentType>(value.getType());
+        if (!fragment)
+          continue;
+        Value buffer = fragmentBuffers.lookup(value);
+        for (Region &region : choice->getRegions()) {
+          auto yield = cast<scf::YieldOp>(region.front().getTerminator());
+          if (failed(storeFragment(yield.getOperand(index), buffer, yield)))
+            return WalkResult::interrupt();
+          // The branch result now flows through the buffer. Break its old SSA
+          // edge before dropping bufferized nested loop results and this result.
+          OpBuilder builder(yield);
+          Value zero = builder.create<arith::ConstantOp>(
+              choice.getLoc(), fragment.getElementType(),
+              builder.getZeroAttr(fragment.getElementType()));
+          yield.setOperand(index, builder.create<gpu::SplatOp>(
+                                      choice.getLoc(), fragment, zero));
+        }
+      }
+      return WalkResult::advance();
+    });
+    return failure(result.wasInterrupted());
+  }
+
+  LogicalResult dropFragmentIfResults() {
+    SmallVector<scf::IfOp> choices;
+    kernel.walk<WalkOrder::PostOrder>([&](scf::IfOp choice) {
+      if (llvm::any_of(choice.getResultTypes(), [](Type type) {
+            return isa<gpu::FragmentType>(type);
+          }))
+        choices.push_back(choice);
+    });
+    for (scf::IfOp choice : choices) {
+      SmallVector<Type> retained;
+      for (Value value : choice.getResults()) {
+        if (!isa<gpu::FragmentType>(value.getType()))
+          retained.push_back(value.getType());
+        else if (!value.use_empty())
+          return choice.emitOpError("bufferized TileLang branch result has a live SSA use");
+      }
+      OpBuilder builder(choice);
+      auto replacement = builder.create<scf::IfOp>(
+          choice.getLoc(), retained, choice.getCondition(), true);
+      replacement->setAttrs(choice->getAttrs());
+      replacement.getThenRegion().takeBody(choice.getThenRegion());
+      replacement.getElseRegion().takeBody(choice.getElseRegion());
+      for (Region &region : replacement->getRegions()) {
+        auto yield = cast<scf::YieldOp>(region.front().getTerminator());
+        SmallVector<Value> operands;
+        for (Value value : yield.getOperands())
+          if (!isa<gpu::FragmentType>(value.getType()))
+            operands.push_back(value);
+        yield->setOperands(operands);
+      }
+      unsigned next = 0;
+      for (Value value : choice.getResults())
+        if (!isa<gpu::FragmentType>(value.getType()))
+          value.replaceAllUsesWith(replacement.getResult(next++));
+      choice.erase();
+    }
+    return success();
   }
 
   LogicalResult flattenRecordLoopCarries() {
@@ -888,14 +1021,32 @@ private:
       FailureOr<Value> input;
       auto sourceType = dyn_cast<gpu::FragmentType>(broadcast.getValue().getType());
       auto resultType = dyn_cast<gpu::FragmentType>(broadcast.getResult().getType());
-      if (sourceType && resultType &&
-          sourceType.getShape() == resultType.getShape()) {
-        // An equal-rank broadcast is the explicit physical projection from one
-        // coordinate schema to another.  Its axes are positionally identical
-        // even when the structured helper's local provenance differs from the
-        // producer's result provenance.
-        input = scalarize(broadcast.getValue(), sourceType, targetIndices,
-                          builder, owner, memo, preferSourceGraph);
+      if (sourceType && resultType) {
+        auto projection = gpu::queryBroadcastProjection(sourceType, resultType);
+        if (!projection.isExact())
+          return owner->emitOpError("TileLang broadcast lost its shared axis projection");
+        auto resultIndices = indicesFor(builder, resultType, target,
+                                        targetIndices, owner);
+        if (failed(resultIndices))
+          return failure();
+        SmallVector<Value> sourceIndices(sourceType.getShape().size());
+        for (auto [resultAxis, sourceAxis] :
+             llvm::enumerate(projection.targetToSource))
+          if (sourceAxis)
+            sourceIndices[*sourceAxis] = (*resultIndices)[resultAxis];
+        for (auto [axis, attribute] : llvm::enumerate(sourceType.getShape())) {
+          auto extent = cast<gpu::PhysicalExprAttr>(attribute);
+          if (extent.getKind() ==
+                  static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+              extent.getValue() == 1)
+            sourceIndices[axis] = builder.create<arith::ConstantIndexOp>(
+                owner->getLoc(), 0);
+          if (!sourceIndices[axis])
+            return owner->emitOpError("TileLang broadcast has an unmapped source axis");
+        }
+        DenseMap<Value, Value> projectedMemo;
+        input = scalarize(broadcast.getValue(), sourceType, sourceIndices,
+                          builder, owner, projectedMemo, preferSourceGraph);
       } else {
         input = recurse(broadcast.getValue());
       }

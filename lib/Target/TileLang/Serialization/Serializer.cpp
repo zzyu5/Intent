@@ -437,11 +437,14 @@ private:
   }
 
   void emitBlock(Block &block) {
+    uint64_t begin = output.tell();
     for (Operation &operation : block) {
       if (isa<scf::YieldOp, YieldOp, func::ReturnOp>(operation))
         continue;
       emitOperation(operation);
     }
+    if (output.tell() == begin)
+      line("pass");
   }
 
   void emitOperation(Operation &operation) {
@@ -652,6 +655,22 @@ private:
            tile + " * " + valueString(loop.getStep()));
       emitBlock(*loop.getBody());
       --indent;
+    } else if (auto choice = dyn_cast<scf::IfOp>(operation)) {
+      if (choice.getNumResults() != 0) {
+        choice.emitOpError("TileLang-local branch still returns an unbufferized SSA value");
+        failed = true;
+        return;
+      }
+      line("if " + valueString(choice.getCondition()) + ":");
+      ++indent;
+      emitBlock(choice.getThenRegion().front());
+      --indent;
+      if (!choice.getElseRegion().empty()) {
+        line("else:");
+        ++indent;
+        emitBlock(choice.getElseRegion().front());
+        --indent;
+      }
     } else if (auto loop = dyn_cast<scf::ForOp>(operation)) {
       if (loop.getNumResults() != 0) {
         loop.emitOpError("TileLang-local loop still carries an unbufferized SSA value");

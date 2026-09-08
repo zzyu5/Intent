@@ -341,6 +341,7 @@ private:
 
   void emitPreamble() {
     output << "from types import SimpleNamespace\n"
+              "from typing import Annotated\n"
               "import torch\n"
               "import cuda.tile as ct\n"
               "from cuda.tile.tune import exhaustive_search\n"
@@ -426,10 +427,19 @@ private:
       first = false;
       output << text;
     };
+    auto arrayArgument = [&](StringRef name, unsigned rank) {
+      // Shapes already specialize the metadata ABI and launch cache. Preserve
+      // the same facts in the provider array type used for access lowering.
+      std::string annotation = name.str() +
+          ": Annotated[ct.Array, ct.ArrayAnnotation(index_dtype=ct.int64, static_shape_dims=(";
+      for (unsigned axis = 0; axis < rank; ++axis)
+        annotation += std::to_string(axis) + ", ";
+      argument(annotation + "))]");
+    };
     for (const ViewABI &view : views)
-      argument(view.name + ": ct.IndexedWithInt64");
-    for (const ArrayViewABI &view : arrayViews) {
-      argument(view.name + ": ct.IndexedWithInt64");
+      arrayArgument(view.name, view.type.getLayout().getExtents().size());
+    for (ArrayViewABI view : arrayViews) {
+      arrayArgument(view.name, view.operation.getGroupEnds().size());
       argument(view.eligible + ": ct.Constant[bool]");
     }
     for (const ScalarABI &scalar : scalars) {

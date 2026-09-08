@@ -4431,14 +4431,16 @@ LogicalResult orientLoopContractions(ModuleOp module) {
         loop.getBody()->getTerminator()->getOperands(), dependsOnMatrixContract);
     if (!carriesContract || !supportsMatrixLoopTranspose(loop))
       continue;
-    // Orient a connected product chain. A join of independent products needs
-    // a joint residency/layout decision, not this single-chain orientation.
+    // Orient the complete connected product graph, including joins. Every
+    // matrix value is transposed together, so shared producers remain shared
+    // and pointwise joins retain their original arithmetic order.
     llvm::DenseSet<Operation *> chain;
-    ContractOp consumer = carriedContract;
-    bool hasProducer = false, joinedProducts = false;
-    while (consumer && !joinedProducts) {
-      chain.insert(consumer.getOperation());
-      ContractOp predecessor;
+    SmallVector<ContractOp> pending{carriedContract};
+    bool hasProducer = false;
+    while (!pending.empty()) {
+      ContractOp consumer = pending.pop_back_val();
+      if (!chain.insert(consumer.getOperation()).second)
+        continue;
       visited.clear();
       std::function<void(Value)> traceProducer = [&](Value value) {
         if (!visited.insert(value).second)
@@ -4447,9 +4449,8 @@ LogicalResult orientLoopContractions(ModuleOp module) {
         if (!producer || !loop->isProperAncestor(producer))
           return;
         if (auto contract = dyn_cast<ContractOp>(producer)) {
-          if (predecessor && predecessor != contract)
-            joinedProducts = true;
-          predecessor = contract;
+          hasProducer |= contract != carriedContract;
+          pending.push_back(contract);
           return;
         }
         for (Value operand : producer->getOperands())
@@ -4457,14 +4458,13 @@ LogicalResult orientLoopContractions(ModuleOp module) {
       };
       traceProducer(consumer.getLhs());
       traceProducer(consumer.getRhs());
-      hasProducer |= static_cast<bool>(predecessor);
-      consumer = predecessor;
+      traceProducer(consumer.getAccumulator());
     }
     bool disconnectedProducts = false;
     loop.walk([&](ContractOp contract) {
       disconnectedProducts |= !chain.contains(contract.getOperation());
     });
-    if (!hasProducer || joinedProducts || disconnectedProducts)
+    if (!hasProducer || disconnectedProducts)
       continue;
 
     // Keep a strongly rectangular matrix's short axis in the column position.
