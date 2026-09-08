@@ -59,12 +59,15 @@ def window_attention_values(
         key_chunk,
         transpose_rhs=True,
         acc_dtype=I.f32,
-    ) * scale
+    )
     if soft_cap > 0.0:
-        normalized_scores = scores * (1.0 / soft_cap)
-        exponential = I.exp2((-2.0 * I.LOG2E) * normalized_scores)
+        exponential = I.exp2(scores * (scale * (-2.0 * I.LOG2E / soft_cap)))
         inverse_root = I.rsqrt(1.0 + exponential)
-        scores = soft_cap * (2.0 * inverse_root * inverse_root - 1.0)
+        scores = (soft_cap * I.LOG2E) * (
+            2.0 * inverse_root * inverse_root - 1.0
+        )
+    else:
+        scores = scores * (scale * I.LOG2E)
     valid = key_coordinates[None, :] <= query_coordinates[:, None]
     if window > 0:
         if inclusive_lower:
@@ -72,7 +75,7 @@ def window_attention_values(
         else:
             lower = key_coordinates[None, :] > query_coordinates[:, None] - window
         valid = valid & lower
-    scores = I.select(valid, scores * I.LOG2E, -I.inf)
+    scores = I.select(valid, scores, -I.inf)
     chunk_valid = I.reduce.any(valid, axis=1)
     maximum = I.select(
         chunk_valid,

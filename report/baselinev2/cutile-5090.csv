@@ -23,15 +23,15 @@ geglu,4096x28672-fp16-tanh,0.227008,0.225912,1.004851,pass,同算法；source �
 relu,8192x4096-fp16,0.087696,0.087824,0.998543,pass,同算法；NaN 传播方式不同
 dropout,8192x4096-fp16-p0.1,0.087840,0.087856,0.999818,pass,
 attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,0.728304,0.796688,0.914165,pass,同算法；source 的布局转换与辅助工作计入其调用时间
-attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,0.752104,2.081640,0.361304,pass,同算法；source 使用 bf16 LSE 与近似除法
+attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,0.838592,2.086176,0.401976,pass,同算法；source 使用 bf16 LSE 与近似除法
 mhc_apply_residual,T2048-H4096-streams4-bf16,0.099336,0.108320,0.917061,pass,同算法；source 保留 bf16 中间累加
-gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,0.696336,0.592688,1.174878,pass,同算法；中间精度和舍入不同
-gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,0.118768,0.696312,0.170567,pass,同算法；中间精度和舍入不同
+gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,0.694560,0.592176,1.172894,pass,同算法；中间精度和舍入不同
+gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,0.119216,0.696376,0.171195,pass,同算法；中间精度和舍入不同
 mhc_sinkhorn,T8192-streams4-fp32,0.019168,0.018512,1.035436,pass,同算法；source 用 exp2(x * log2(e)) 实现 exp
 absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,1.254616,2.061088,0.608715,pass,同算法；source 使用近似除法并额外输出 LSE
 splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,0.284144,0.331776,0.856433,pass,同算法；source 使用 FTZ 与近似除法
 sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,0.998648,33.752392,0.029587,pass,同算法；source 使用 FTZ 与近似除法
-sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,1.195072,0.833264,1.434206,pass,同算法；source 的布局转换与辅助工作计入其调用时间
+sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,0.621600,0.834072,0.745259,pass,同算法；source 的布局转换与辅助工作计入其调用时间
 rms_norm,8192x4096-bf16,0.087688,0.085776,1.022291,pass,同算法；source 额外写 Rstd
 recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,0.787256,0.936160,0.840942,pass,
 chunk_gated_delta,B2-S2048-H8-K128-V128-C64-bf16,0.227376,1.550952,0.146604,pass,同算法；generated 使用 BF16 矩阵输入、FP32 累加与状态，source 使用 TF32 矩阵输入
