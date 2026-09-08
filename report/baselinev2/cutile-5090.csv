@@ -26,10 +26,10 @@ attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,1.216552,0.789056,1.541782,p
 attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,0.752104,2.081640,0.361304,pass,同算法；source 使用 bf16 LSE 与近似除法
 mhc_apply_residual,T2048-H4096-streams4-bf16,0.099336,0.108320,0.917061,pass,同算法；source 保留 bf16 中间累加
 gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,1.554520,0.591664,2.627370,pass,同算法；中间精度和舍入不同
-gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,1.774616,0.696216,2.548945,pass,同算法；中间精度和舍入不同
+gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,0.118768,0.696312,0.170567,pass,同算法；中间精度和舍入不同
 mhc_sinkhorn,T8192-streams4-fp32,0.019168,0.018512,1.035436,pass,同算法；source 用 exp2(x * log2(e)) 实现 exp
 absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,1.254616,2.061088,0.608715,pass,同算法；source 使用近似除法并额外输出 LSE
-splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,0.442304,0.328184,1.347732,pass,同算法；source 使用 FTZ 与近似除法
+splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,,,,generated_provider_jit_or_initial_launch_timeout,exceeded 600 seconds
 sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,0.998648,33.752392,0.029587,pass,同算法；source 使用 FTZ 与近似除法
 sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,1.195072,0.833264,1.434206,pass,同算法；source 的布局转换与辅助工作计入其调用时间
 rms_norm,8192x4096-bf16,0.087688,0.085776,1.022291,pass,同算法；source 额外写 Rstd
