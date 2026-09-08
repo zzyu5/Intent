@@ -16,7 +16,7 @@ tilegym_dense_gemm,M8192-N11008-K4096-bf16,3.121920,3.171448,0.984383,pass,
 grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.699008,0.642576,1.087822,pass,同算法；source 使用 host group shapes
 moe_alignment,T4096-top2-E64,0.018432,0.036864,0.500000,pass,同算法计数/前缀和/散射；初始化与辅助输出计入调用
 mhc_gemm_rms_scale,T2048-H4096-streams4-bf16,0.071680,0.077824,0.921053,pass,同算法；source 用乘倒数实现归一化
-chunked_softmax,8192x32768-bf16,2.101456,0.849960,2.472417,pass,
+chunked_softmax,8192x32768-bf16,0.939768,0.845584,1.111383,pass,
 rope_qk,B2-S4096-QH32-KVH8-D128-bf16,0.116704,0.120800,0.966093,pass,同算法；source 保留 bf16 中间舍入
 gelu,8192x4096-fp16-tanh,0.087856,0.087872,0.999818,pass,同算法；source 保留 f16 中间舍入
 geglu,4096x28672-fp16-tanh,0.227008,0.225912,1.004851,pass,同算法；source 保留 f16 中间舍入

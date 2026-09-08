@@ -1487,6 +1487,31 @@ bool reachesReduction(Value value, PhysicalSourceAxis source,
   return false;
 }
 
+bool isExpensiveReplayProducer(Value value) {
+  auto unary = value.getDefiningOp<UnaryOp>();
+  if (!unary)
+    return false;
+  switch (unary.getOperatorKind()) {
+  case UnaryOperator::Exp:
+  case UnaryOperator::Exp2:
+  case UnaryOperator::Log:
+  case UnaryOperator::Sin:
+  case UnaryOperator::Cos:
+  case UnaryOperator::Erf:
+  case UnaryOperator::Rsqrt:
+  case UnaryOperator::Sigmoid:
+  case UnaryOperator::Tanh:
+  case UnaryOperator::Sqrt:
+    return true;
+  case UnaryOperator::Negate:
+  case UnaryOperator::Not:
+  case UnaryOperator::Floor:
+  case UnaryOperator::Abs:
+    return false;
+  }
+  llvm_unreachable("unknown unary replay cost");
+}
+
 bool hasMaterializedReductionStoreFork(
     Value value, StoreOp current, PhysicalSourceAxis source, int64_t dimension,
     llvm::SmallPtrSetImpl<Operation *> &visited) {
@@ -1496,7 +1521,10 @@ bool hasMaterializedReductionStoreFork(
     if (projection.isExact() && projection.dimensionId == dimension) {
       llvm::SmallPtrSet<Operation *, 16> storeVisited;
       llvm::SmallPtrSet<Operation *, 16> reductionVisited;
-      if (reachesDifferentStore(value, current, source, dimension,
+      // The reduction already consumes the full-axis producer. Preserve its
+      // SSA reuse even for this store when tiling would duplicate costly math.
+      StoreOp excluded = isExpensiveReplayProducer(value) ? StoreOp() : current;
+      if (reachesDifferentStore(value, excluded, source, dimension,
                                 storeVisited) &&
           reachesReduction(value, source, dimension, reductionVisited))
         return true;
@@ -3732,11 +3760,11 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     });
   if (!ownershipOnly) {
     SmallVector<MakeRangeOp> realized;
-    SmallVector<MakeRangeOp> nonReplayable;
+    SmallVector<MakeRangeOp> retainedFragments;
     for (MakeRangeOp range : dynamicRanges) {
       if (!reuseTraversalRanges.contains(range.getOperation()))
         continue;
-      bool replayable = true;
+      bool useReplayTraversal = true;
       SmallVector<StoreOp> currentStores;
       FailureOr<Attribute> effectKey = effectLocalKey(range);
       auto effectLocal = succeeded(effectKey)
@@ -3771,7 +3799,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       FailureOr<SmallVector<int64_t>> traversalDimensions =
           traversalDimensionsForStores(currentStores, range);
       if (failed(traversalDimensions)) {
-        nonReplayable.push_back(range);
+        retainedFragments.push_back(range);
         continue;
       }
       for (StoreOp store : currentStores) {
@@ -3792,18 +3820,17 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
               replay.crossesAccess && hasMaterializedReductionStoreFork(
                                           store.getValue(), store, source,
                                           dimension, materializationVisited);
-          replayable &= replay.isReplayable() && !materializedFork &&
-                        (effectLocal == effectLocalOrigins.end() ||
-                         !replay.crossesStructuredProgram);
+          useReplayTraversal &=
+              replay.isReplayable() && !materializedFork &&
+              (effectLocal == effectLocalOrigins.end() ||
+               !replay.crossesStructuredProgram);
         }
       }
-      // A value graph containing loop-carried or otherwise non-replayable
-      // structure must remain one full fragment.  Tiling the writeback axis
-      // would require cloning author control flow, which is not a pointwise
-      // realization.  The ordinary internal-range path below binds an exact
-      // full-coverage extent instead.
-      if (!replayable) {
-        nonReplayable.push_back(range);
+      // Keep non-replayable control and shared reduction producers intact.
+      // The internal-range path below binds their full-coverage extent,
+      // avoiding control cloning and duplicate costly fragment computation.
+      if (!useReplayTraversal) {
+        retainedFragments.push_back(range);
         continue;
       }
       if (failed(realizeReusePointwiseTraversal(
@@ -3812,7 +3839,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         return failure();
       realized.push_back(range);
     }
-    for (MakeRangeOp range : nonReplayable) {
+    for (MakeRangeOp range : retainedFragments) {
       reuseTraversalRanges.erase(range.getOperation());
       internalTraversalRanges.insert(range.getOperation());
     }
