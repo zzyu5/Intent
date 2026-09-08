@@ -1274,7 +1274,19 @@ private:
     case BinaryOperator::Add: return infix("+");
     case BinaryOperator::Subtract: return infix("-");
     case BinaryOperator::Multiply: return infix("*");
-    case BinaryOperator::TrueDivide: return infix("/");
+    case BinaryOperator::TrueDivide: {
+      Type element = elementType(binary.getResult().getType());
+      auto floating = cast<FloatType>(element);
+      std::string computation = floating.getWidth() < 32
+                                    ? "tl.float32" : pythonType(element);
+      std::string result =
+          "tl.fdiv(tl.cast(" + valueString(binary.getLhs()) + ", " +
+          computation + "), tl.cast(" + valueString(binary.getRhs()) + ", " +
+          computation + "), ieee_rounding=True)";
+      return floating.getWidth() < 32
+                 ? "tl.cast(" + result + ", " + pythonType(element) + ")"
+                 : result;
+    }
     case BinaryOperator::FloorDivide:
     case BinaryOperator::Remainder: {
       Type element = elementType(binary.getResult().getType());
@@ -1309,35 +1321,46 @@ private:
 
   std::string unaryExpression(gpu::UnaryOp unary) {
     std::string input = valueString(unary.getInput());
+    auto libraryCall = [&](StringRef function) {
+      Type element = elementType(unary.getResult().getType());
+      auto floating = cast<FloatType>(element);
+      std::string computation = floating.getWidth() < 32
+                                    ? "tl.float32" : pythonType(element);
+      std::string result = function.str() + "(tl.cast(" + input + ", " +
+                           computation + "))";
+      return floating.getWidth() < 32
+                 ? "tl.cast(" + result + ", " + pythonType(element) + ")"
+                 : result;
+    };
     switch (unary.getOperatorKind()) {
     case UnaryOperator::Negate:
       return "(-" + input + ")";
     case UnaryOperator::Not:
       return "(~" + input + ")";
     case UnaryOperator::Exp:
-      return "tl.exp(" + input + ")";
+      return libraryCall("libdevice.exp");
     case UnaryOperator::Exp2:
-      return "tl.exp2(" + input + ")";
+      return libraryCall("libdevice.exp2");
     case UnaryOperator::Log:
-      return "tl.log(" + input + ")";
+      return libraryCall("libdevice.log");
     case UnaryOperator::Sin:
-      return "tl.sin(" + input + ")";
+      return libraryCall("libdevice.sin");
     case UnaryOperator::Cos:
-      return "tl.cos(" + input + ")";
+      return libraryCall("libdevice.cos");
     case UnaryOperator::Floor:
       return "tl.floor(" + input + ")";
     case UnaryOperator::Erf:
-      return "tl.erf(" + input + ")";
+      return libraryCall("libdevice.erf");
     case UnaryOperator::Rsqrt:
-      return "tl.rsqrt(" + input + ")";
+      return libraryCall("libdevice.rsqrt");
     case UnaryOperator::Sigmoid:
       return "tl.sigmoid(" + input + ")";
     case UnaryOperator::Tanh:
-      return "tl.libdevice.tanh(" + input + ")";
+      return libraryCall("libdevice.tanh");
     case UnaryOperator::Abs:
       return "tl.abs(" + input + ")";
     case UnaryOperator::Sqrt:
-      return "tl.sqrt(" + input + ")";
+      return libraryCall("libdevice.sqrt");
     default:
       failed = true;
       return "<unsupported-unary>";
