@@ -69,12 +69,26 @@ def lower_matrix_intrinsic(lowerer, name: str, node: ast.Call):
         lowerer.error(node, f"I.{name} batch shapes: {error}")
     lhs = lowerer.broadcast_value(lhs, batch_shape + lhs.type.shape[-lhs_core:], node)
     rhs = lowerer.broadcast_value(rhs, batch_shape + rhs.type.shape[-rhs_core:], node)
-    return emit_contract(
+    if name == "vecmat":
+        lhs = _reshape_axes(
+            lowerer, lhs, (*range(len(batch_shape)), None, len(batch_shape)), node
+        )
+    elif name == "matvec":
+        rhs = _reshape_axes(lowerer, rhs, (*range(rhs.type.rank), None), node)
+    result = emit_contract(
         lowerer, lhs, rhs,
-        ((lhs.type.rank - 1, rhs.type.rank - rhs_core),),
+        ((lhs.type.rank - 1, rhs.type.rank - 2),),
         tuple((axis, axis) for axis in range(len(batch_shape))),
         require_dtype(lowerer, bound["acc_dtype"]), node,
     )
+    if name in ("matvec", "vecmat"):
+        unit_axis = len(batch_shape) + (name == "matvec")
+        return _reshape_axes(
+            lowerer, result,
+            tuple(axis for axis in range(result.type.rank) if axis != unit_axis),
+            node,
+        )
+    return result
 
 
 def _tensor(lowerer, node):
@@ -90,6 +104,29 @@ def _transpose_matrix(lowerer, value, node):
         OperationKind.TRANSPOSE, lowerer.location(node), operands=(value,),
         result_types=(TensorType(value.type.dtype, tuple(value.type.shape[axis] for axis in permutation)),),
         attributes={"permutation": permutation},
+    ).results[0]
+
+
+def _reshape_axes(lowerer, value, axes, node):
+    shape = tuple(
+        StaticDim(1) if axis is None else value.type.shape[axis]
+        for axis in axes
+    )
+    operands = [value]
+    relation = []
+    for dimension, source_axis in zip(shape, axes):
+        dimension_id = lowerer.compiler.builder.dimension_id(dimension)
+        if isinstance(dimension, StaticDim):
+            relation.append(ShapeExpr(ShapeExprKind.STATIC, dimension_id, dimension.value))
+        else:
+            relation.append(ShapeExpr(ShapeExprKind.SSA_EXTENT, dimension_id, len(operands)))
+            operands.append(lowerer.materialize_dimension(
+                ShapeDimension(dimension, value, source_axis), node
+            ))
+    return lowerer.emit(
+        OperationKind.RESHAPE, lowerer.location(node), operands=tuple(operands),
+        result_types=(TensorType(value.type.dtype, shape),),
+        attributes={"shape": ShapeRelation(tuple(relation))},
     ).results[0]
 
 
