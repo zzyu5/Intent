@@ -30,11 +30,11 @@ constexpr llvm::StringLiteral loadPolicyParameter = "CUTILE_LOAD_POLICY";
 constexpr llvm::StringLiteral ctasParameter = "CUTILE_CTAS";
 constexpr int64_t nativeAccessForm = 1;
 constexpr int64_t gatherAccessForm = 2;
-constexpr int64_t nativeBlockedNoTMAForm = 3;
+constexpr int64_t nativeNoTMAForm = 3;
 
 bool isLegalAccessForm(int64_t value) {
   return value == nativeAccessForm || value == gatherAccessForm ||
-         value == nativeBlockedNoTMAForm;
+         value == nativeNoTMAForm;
 }
 
 bool isLegalOccupancy(int64_t value) { return value >= 1 && value <= 32; }
@@ -1370,35 +1370,6 @@ Type withElementType(Type type, Type elementType) {
       fragment.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
 }
 
-bool physicalExpressionUsesRole(gpu::PhysicalExprAttr expression,
-                                func::FuncOp kernel,
-                                gpu::ParameterRole role,
-                                unsigned depth = 0) {
-  if (!expression || depth >= 32)
-    return false;
-  if (expression.getKind() ==
-      static_cast<uint32_t>(gpu::PhysicalExprKind::Parameter)) {
-    FailureOr<gpu::ParameterOp> parameter =
-        gpu::queryParameterBySymbol(kernel, expression.getSymbol());
-    return succeeded(parameter) &&
-           (*parameter).getParameter().getRole() ==
-               static_cast<uint32_t>(role);
-  }
-  return llvm::any_of(expression.getOperands(), [&](Attribute operand) {
-    auto nested = dyn_cast<gpu::PhysicalExprAttr>(operand);
-    return nested && physicalExpressionUsesRole(nested, kernel, role,
-                                                depth + 1);
-  });
-}
-
-bool fragmentUsesRole(gpu::FragmentType fragment, func::FuncOp kernel,
-                      gpu::ParameterRole role) {
-  return llvm::any_of(fragment.getShape(), [&](Attribute extent) {
-    auto expression = dyn_cast<gpu::PhysicalExprAttr>(extent);
-    return expression && physicalExpressionUsesRole(expression, kernel, role);
-  });
-}
-
 bool containsFragment(Type type) {
   if (isa<gpu::FragmentType>(type))
     return true;
@@ -1558,8 +1529,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
   Value accessForm;
   Value loadPolicy;
   Value preferTileLoads;
-  Value allowBlockedTMA;
-  Value allowDefaultTMA;
+  Value allowNativeTMA;
   auto accessFormValue = [&]() -> FailureOr<Value> {
     if (accessForm)
       return accessForm;
@@ -1586,29 +1556,20 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
         ComparePredicate::Ne);
     return preferTileLoads;
   };
-  auto tmaCondition = [&](gpu::FragmentType tile) -> FailureOr<Value> {
-    if (fragmentUsesRole(tile, kernel, gpu::ParameterRole::FullCoverage)) {
-      if (!allowDefaultTMA) {
-        OpBuilder entry(&kernel.getBody().front(),
-                        kernel.getBody().front().begin());
-        allowDefaultTMA = entry.create<arith::ConstantIntOp>(
-            kernel.getLoc(), /*value=*/1, /*width=*/1);
-      }
-      return allowDefaultTMA;
-    }
-    if (allowBlockedTMA)
-      return allowBlockedTMA;
+  auto tmaCondition = [&]() -> FailureOr<Value> {
+    if (allowNativeTMA)
+      return allowNativeTMA;
     FailureOr<Value> form = accessFormValue();
     if (failed(form))
       return failure();
     OpBuilder entry(kernel.getContext());
     entry.setInsertionPointAfter((*form).getDefiningOp());
     Value disabled = entry.create<arith::ConstantIndexOp>(
-        kernel.getLoc(), nativeBlockedNoTMAForm);
-    allowBlockedTMA = entry.create<gpu::CompareOp>(
+        kernel.getLoc(), nativeNoTMAForm);
+    allowNativeTMA = entry.create<gpu::CompareOp>(
         kernel.getLoc(), entry.getI1Type(), *form, disabled,
         ComparePredicate::Ne);
-    return allowBlockedTMA;
+    return allowNativeTMA;
   };
 
   for (gpu::LoadOp load : loads) {
@@ -1678,7 +1639,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
           BinaryOperator::LogicalAnd);
     FailureOr<Value> allowTMA = failure();
     if (native) {
-      allowTMA = tmaCondition(plan->resourceType);
+      allowTMA = tmaCondition();
       if (failed(allowTMA))
         return failure();
     }
@@ -2197,7 +2158,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
     }
     FailureOr<Value> allowTMA = failure();
     if (native) {
-      allowTMA = tmaCondition(plan->resourceType);
+      allowTMA = tmaCondition();
       if (failed(allowTMA))
         return failure();
     }
@@ -2278,24 +2239,6 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
   }
   for (gpu::AssumeInBoundsOp assumption : assumptions)
     assumption.erase();
-  // Forms 1 and 3 differ only in the blocked-TMA condition.  Do not tune
-  // both when the realized access graph never consumes that distinction.
-  if (accessForm && !allowBlockedTMA) {
-    auto parameter = accessForm.getDefiningOp<gpu::ParameterOp>();
-    auto schema = parameter.getParameter();
-    auto candidates = schema.getCandidates().asArrayRef();
-    if (llvm::is_contained(candidates, nativeAccessForm) &&
-        llvm::is_contained(candidates, nativeBlockedNoTMAForm)) {
-      SmallVector<int64_t> distinct;
-      llvm::copy_if(candidates, std::back_inserter(distinct), [](int64_t value) {
-        return value != nativeBlockedNoTMAForm;
-      });
-      parameter.setParameterAttr(gpu::ParameterAttr::get(
-          kernel.getContext(), schema.getName(), schema.getRole(),
-          schema.getCategory(), schema.getElementBitWidth(),
-          DenseI64ArrayAttr::get(kernel.getContext(), distinct)));
-    }
-  }
   gpu::eraseDeadPhysicalValues(kernel);
   return success();
 }
@@ -2769,19 +2712,12 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
         "cuTile occupancy hint does not match occupancy-sensitive tile compute");
   if (hasMatrixTileCompute(kernel) != static_cast<bool>(ctas))
     return kernel.emitError("cuTile CTA hint does not match matrix tile compute");
-  auto isTrue = [](Value value) {
-    auto constant = value.getDefiningOp<arith::ConstantOp>();
-    auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
-                            : IntegerAttr();
-    return integer && integer.getType().isInteger(1) &&
-           integer.getValue().isOne();
-  };
-  auto isBlockedTMACondition = [&](Value value) {
+  auto isNativeTMACondition = [&](Value value) {
     auto compare = value.getDefiningOp<gpu::CompareOp>();
     return accessForm && compare &&
            compare.getPredicate() == ComparePredicate::Ne &&
            compare.getLhs() == accessForm.getResult() &&
-           constantValue(compare.getRhs()) == nativeBlockedNoTMAForm;
+           constantValue(compare.getRhs()) == nativeNoTMAForm;
   };
   WalkResult result = kernel.walk([&](Operation *operation) {
     if (isa<gpu::LoadOp, gpu::StoreOp, gpu::ContractOp>(operation)) {
@@ -2790,22 +2726,14 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
       return WalkResult::interrupt();
     }
     if (auto load = dyn_cast<TileLoadOp>(operation)) {
-      bool fullCoverage = fragmentUsesRole(
-          load.getResult().getType(), kernel,
-          gpu::ParameterRole::FullCoverage);
-      if ((fullCoverage && !isTrue(load.getAllowTma())) ||
-          (!fullCoverage && !isBlockedTMACondition(load.getAllowTma()))) {
+      if (!isNativeTMACondition(load.getAllowTma())) {
         load.emitOpError(
             "allow_tma is not the typed cuTile access-form decision");
         return WalkResult::interrupt();
       }
     }
     if (auto store = dyn_cast<TileStoreOp>(operation)) {
-      bool fullCoverage = fragmentUsesRole(
-          store.getValue().getType(), kernel,
-          gpu::ParameterRole::FullCoverage);
-      if ((fullCoverage && !isTrue(store.getAllowTma())) ||
-          (!fullCoverage && !isBlockedTMACondition(store.getAllowTma()))) {
+      if (!isNativeTMACondition(store.getAllowTma())) {
         store.emitOpError(
             "allow_tma is not the typed cuTile access-form decision");
         return WalkResult::interrupt();
