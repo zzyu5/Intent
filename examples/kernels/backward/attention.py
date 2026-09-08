@@ -33,6 +33,39 @@ def attention_backward_delta(
             )
 
 
+@intent.fn
+def summarize_key_value_gradients(
+    queries, grad_outputs, lse, delta, query_coordinates,
+    keys, values, key_coordinates, scale, causal,
+):
+    scores = I.matmul(keys, queries, transpose_rhs=True, acc_dtype=I.f32)
+    probability = I.exp2(
+        scores * (scale * I.LOG2E) - lse[None, :] * I.LOG2E
+    )
+    if causal:
+        probability = I.mask(
+            probability,
+            valid=key_coordinates[:, None] <= query_coordinates[None, :],
+            fill=0.0,
+        )
+    grad_values = I.matmul(
+        I.cast(probability, I.f16), grad_outputs, acc_dtype=I.f32
+    )
+    grad_probability = I.matmul(
+        values, grad_outputs, transpose_rhs=True, acc_dtype=I.f32
+    )
+    grad_scores = probability * (grad_probability - delta[None, :])
+    grad_keys = I.matmul(
+        I.cast(grad_scores, I.f16), queries, acc_dtype=I.f32
+    )
+    return I.record(grad_k=grad_keys, grad_v=grad_values)
+
+
+@intent.fn
+def merge_key_value_gradients(lhs, rhs):
+    return I.record(grad_k=lhs.grad_k + rhs.grad_k, grad_v=lhs.grad_v + rhs.grad_v)
+
+
 @intent.kernel
 def attention_backward_dkdv(
     q: I.In[I.f16, ("B", "HQ", "Q", "D")],
@@ -65,42 +98,23 @@ def attention_backward_dkdv(
                 grad_output_block = grad_output[
                     batch, query_head, query_axis, :
                 ]
-                scores = I.matmul(
-                    key_block,
-                    query_block,
-                    transpose_rhs=True,
-                    acc_dtype=I.f32,
+                summary = I.region_fold(
+                    source=(
+                        query_block, grad_output_block,
+                        lse[batch, query_head, query_axis],
+                        delta[batch, query_head, query_axis], q_index,
+                    ),
+                    axis=0,
+                    summarize=summarize_key_value_gradients,
+                    combine=merge_key_value_gradients,
+                    identity=I.record(
+                        grad_k=I.zeros((K, D), dtype=I.f32),
+                        grad_v=I.zeros((K, D), dtype=I.f32),
+                    ),
+                    operands=(key_block, value_block, k_index, scale, CAUSAL),
                 )
-                probability = I.exp2(
-                    scores * (scale * I.LOG2E)
-                    - lse[batch, query_head, query_axis][None, :] * I.LOG2E
-                )
-                if CAUSAL:
-                    probability = I.mask(
-                        probability,
-                        valid=k_index[:, None] <= q_index[None, :],
-                        fill=0.0,
-                    )
-                grad_v_value = grad_v_value + I.matmul(
-                    I.cast(probability, I.f16),
-                    grad_output_block,
-                    acc_dtype=I.f32,
-                )
-                grad_probability = I.matmul(
-                    value_block,
-                    grad_output_block,
-                    transpose_rhs=True,
-                    acc_dtype=I.f32,
-                )
-                grad_scores = probability * (
-                    grad_probability
-                    - delta[batch, query_head, query_axis][None, :]
-                )
-                grad_k_value = grad_k_value + I.matmul(
-                    I.cast(grad_scores, I.f16),
-                    query_block,
-                    acc_dtype=I.f32,
-                )
+                grad_k_value = grad_k_value + summary.grad_k
+                grad_v_value = grad_v_value + summary.grad_v
             grad_k[batch, key_head, key_axis, :] = I.cast(
                 grad_k_value * scale, I.f16
             )

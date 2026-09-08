@@ -1373,10 +1373,11 @@ public:
                        ArrayRef<Value> views,
                        llvm::DenseMap<int64_t, Value> dimensions,
                        llvm::DenseMap<StringAttr, Value> parameters,
-                       CanonicalKernelAnalysis &canonicalAnalysis)
+                       CanonicalKernelAnalysis &canonicalAnalysis,
+                       func::FuncOp physicalKernel)
       : builder(builder), values(std::move(values)), views(views),
         dimensions(std::move(dimensions)), parameters(std::move(parameters)),
-        canonicalAnalysis(canonicalAnalysis) {}
+        canonicalAnalysis(canonicalAnalysis), physicalKernel(physicalKernel) {}
 
   FailureOr<SmallVector<Value>> lowerBlock(Block &source) {
     for (Operation &operation : source) {
@@ -1491,13 +1492,7 @@ private:
         builder.getDenseI64ArrayAttr(
             {16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384,
              32768, 65536}));
-    Operation *parent = builder.getInsertionBlock()->getParentOp();
-    func::FuncOp physical = dyn_cast<func::FuncOp>(parent);
-    if (!physical)
-      physical = parent->getParentOfType<func::FuncOp>();
-    if (!physical)
-      return operation->emitOpError(
-          "region segment decision has no physical kernel scope");
+    func::FuncOp physical = physicalKernel;
 
     gpu::ParameterOp declaration;
     bool ambiguous = false;
@@ -1553,7 +1548,8 @@ private:
       childValues[from] = to;
     builder.setInsertionPointToStart(block);
     ScalarRegionLowering child(builder, std::move(childValues), views,
-                               dimensions, parameters, canonicalAnalysis);
+                               dimensions, parameters, canonicalAnalysis,
+                               physicalKernel);
     FailureOr<SmallVector<Value>> yielded = child.lowerBlock(source.front());
     if (failed(yielded))
       return failure();
@@ -1624,14 +1620,7 @@ private:
       return found == parameters.end() ? FailureOr<Value>(failure())
                                        : FailureOr<Value>(found->second);
     }
-    Operation *parent = builder.getInsertionBlock()->getParentOp();
-    if (!parent)
-      return failure();
-    func::FuncOp function = dyn_cast<func::FuncOp>(parent);
-    if (!function)
-      function = parent->getParentOfType<func::FuncOp>();
-    if (!function)
-      return failure();
+    func::FuncOp function = physicalKernel;
     if (kind == PhysicalExprKind::ScalarABI) {
       for (BlockArgument argument : function.getArguments()) {
         auto name = function.getArgAttrOfType<StringAttr>(
@@ -4731,7 +4720,7 @@ private:
           targetBlock.back().erase();
         OpBuilder nested(&targetBlock, targetBlock.begin());
         ScalarRegionLowering child(nested, values, views, dimensions, parameters,
-                                   canonicalAnalysis);
+                                   canonicalAnalysis, physicalKernel);
         FailureOr<SmallVector<Value>> yielded =
             child.lowerBlock(sourceRegion.front());
         if (failed(yielded) || yielded->size() != resultTypes.size())
@@ -4836,7 +4825,8 @@ private:
                    source.getArguments().drop_front(axes.size()), carries))
             childValues[argument] = carry;
           ScalarRegionLowering child(nested, std::move(childValues), views,
-                                     dimensions, parameters, canonicalAnalysis);
+                                     dimensions, parameters, canonicalAnalysis,
+                                     physicalKernel);
           FailureOr<SmallVector<Value>> yielded = child.lowerBlock(source);
           if (failed(yielded)) {
             nestedFailed = true;
@@ -4926,7 +4916,8 @@ private:
           childValues[source] = targetArgument;
         builder.setInsertionPointToStart(before);
         ScalarRegionLowering child(builder, std::move(childValues), views,
-                                   dimensions, parameters, canonicalAnalysis);
+                                   dimensions, parameters, canonicalAnalysis,
+                                   physicalKernel);
         Block &source = whileOperation.getBefore().front();
         for (Operation &nested : source.without_terminator())
           if (failed(child.lower(&nested)))
@@ -4956,7 +4947,8 @@ private:
           childValues[source] = targetArgument;
         builder.setInsertionPointToStart(after);
         ScalarRegionLowering child(builder, std::move(childValues), views,
-                                   dimensions, parameters, canonicalAnalysis);
+                                   dimensions, parameters, canonicalAnalysis,
+                                   physicalKernel);
         FailureOr<SmallVector<Value>> yielded =
             child.lowerBlock(whileOperation.getAfter().front());
         if (failed(yielded))
@@ -4997,6 +4989,7 @@ private:
   llvm::DenseMap<int64_t, Value> dimensions;
   llvm::DenseMap<StringAttr, Value> parameters;
   CanonicalKernelAnalysis &canonicalAnalysis;
+  func::FuncOp physicalKernel;
 };
 
 struct ParallelWorkset {
@@ -5194,7 +5187,7 @@ LogicalResult constructGPUProgram(ModuleOp module,
       expression(context, PhysicalExprKind::Constant, 0);
   ScalarRegionLowering rootLowering(builder, values, sourceArguments,
                                     dimensionValues, parameterValues,
-                                    canonicalAnalysis);
+                                    canonicalAnalysis, physical);
   auto formWorksetCoordinate = [&](OpBuilder &nested, Location location,
                                    intent::DomainOp domain, Value coordinate,
                                    Value step,
@@ -5293,7 +5286,7 @@ LogicalResult constructGPUProgram(ModuleOp module,
       }
       ScalarRegionLowering lowering(builder, std::move(childValues),
                                     sourceArguments, dimensionValues,
-                                    parameterValues, canonicalAnalysis);
+                                    parameterValues, canonicalAnalysis, physical);
       if (failed(lowering.lowerWorksetBlock(sourceBlock)))
         return failure();
       runtimeOffset = segmentEnd;
@@ -5349,7 +5342,8 @@ LogicalResult constructGPUProgram(ModuleOp module,
           }
           ScalarRegionLowering lowering(nested, std::move(childValues),
                                         sourceArguments, dimensionValues,
-                                        parameterValues, canonicalAnalysis);
+                                        parameterValues, canonicalAnalysis,
+                                        physical);
           if (failed(lowering.lowerWorksetBlock(sourceBlock))) {
             dispatchLoweringFailed = true;
             return;

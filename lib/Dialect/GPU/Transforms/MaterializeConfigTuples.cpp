@@ -380,10 +380,37 @@ correlatedReductionContractionParameters(
   return correlated;
 }
 
+unsigned carriedMatrixCount(Type type) {
+  if (auto fragment = dyn_cast<FragmentType>(type))
+    return fragment.getShape().size() >= 2 &&
+           isa<FloatType>(fragment.getElementType());
+  unsigned count = 0;
+  if (auto record = dyn_cast<RecordType>(type))
+    for (Attribute field : record.getFieldTypes())
+      count += carriedMatrixCount(cast<TypeAttr>(field).getValue());
+  return count;
+}
+
+bool hasMultipleRegionMatrixAccumulators(func::FuncOp kernel) {
+  bool found = false;
+  kernel.walk([&](scf::ForOp loop) {
+    auto segment = loop.getStep().getDefiningOp<ParameterOp>();
+    if (!segment || segment.getParameter().getCategory() !=
+                        static_cast<uint32_t>(ParameterCategory::RegionContraction))
+      return;
+    unsigned matrices = 0;
+    for (Value carry : loop.getInitArgs())
+      matrices += carriedMatrixCount(carry.getType());
+    found |= matrices > 1;
+  });
+  return found;
+}
+
 FailureOr<SmallVector<TuningProfile, 5>>
 profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
             bool twoAxisPointwise, bool fixedPointwiseLocal,
             bool pointwiseOnlyProgram, bool smallRegionRows,
+            bool multipleRegionMatrixAccumulators,
             const TuningProfiles &tables) {
   auto capabilities =
       kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
@@ -421,6 +448,9 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
       family = narrow ? "pointwise_narrow" : "pointwise";
     break;
   }
+  if (multipleRegionMatrixAccumulators &&
+      (kind == TuningClass::Contraction || kind == TuningClass::RegionContraction))
+    family = "region_contraction_multi_accumulator";
   auto rows = tables.get("shared", family, kernel.getLoc());
   if (failed(rows))
     return failure();
@@ -579,13 +609,16 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
     }
   unsigned profileCount = 0;
   bool smallRegionRows = hasSmallRegionRows(kernel, parameters);
+  bool multipleRegionMatrixAccumulators =
+      hasMultipleRegionMatrixAccumulators(kernel);
   llvm::DenseMap<Operation *, SmallVector<TuningProfile, 5>> parameterProfiles;
   for (ParameterOp parameter : parameters) {
     ParameterAttr schema = parameter.getParameter();
     auto profiles = profilesFor(
         kernel, tuningClass(kernel, parameter), schema.getElementBitWidth(),
         hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal,
-        pointwiseOnlyProgram, smallRegionRows, tables);
+        pointwiseOnlyProgram, smallRegionRows,
+        multipleRegionMatrixAccumulators, tables);
     if (failed(profiles))
       return failure();
     profileCount = std::max<unsigned>(profileCount, profiles->size());

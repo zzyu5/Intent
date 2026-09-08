@@ -1553,7 +1553,8 @@ bool reductionAxesNeedTraversal(ContractOp contract, func::FuncOp kernel) {
         return false;
       PhysicalAxisRealizationFact fact =
           analysis.axisRealization(operand, static_cast<unsigned>(axis));
-      return fact.constructionScalarSeed ||
+      return isOwnershipExtent(contract, fragment.getShape()[axis]) ||
+             fact.constructionScalarSeed ||
              (fact.isExact() && !fact.physicalized);
     });
   };
@@ -2187,6 +2188,13 @@ FailureOr<bool> realizeStructuredNativeReduction(ContractOp contract,
                  "typed segment ownership disagrees with lexical load invariance"),
              failure();
   }
+
+  Value segmented = lhsInvariant ? contract.getRhs() : contract.getLhs();
+  if (reductionUsesOwnershipExtent(
+          contract, segmented,
+          lhsInvariant ? contract.getRhsReductionAxes()
+                       : contract.getLhsReductionAxes()))
+    return false;
 
   Value invariant = lhsInvariant ? contract.getLhs() : contract.getRhs();
   unsigned reductionAxis = static_cast<unsigned>(

@@ -751,13 +751,34 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
   } else if (auto splat = value.getDefiningOp<SplatOp>()) {
     projection = builder.create<SplatOp>(location, target, splat.getValue());
   } else if (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
-    auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
-    if (!input || queryBroadcastProjection(input, target).isExact())
-      projection = builder.create<BroadcastOp>(location, target,
-                                               broadcast.getValue());
+    FailureOr<Value> projected =
+        projectFragmentValue(builder, location, broadcast.getValue(), target);
+    if (succeeded(projected))
+      return *projected;
   }
   if (!projection && queryBroadcastProjection(source, target).isExact())
     projection = builder.create<BroadcastOp>(location, target, value);
+  Operation *definition = value.getDefiningOp();
+  if (!projection &&
+      isa_and_nonnull<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp>(
+          definition)) {
+    IRMapping mapping;
+    for (Value operand : definition->getOperands()) {
+      Type element = operand.getType();
+      if (auto fragment = dyn_cast<FragmentType>(element))
+        element = fragment.getElementType();
+      auto operandTarget = FragmentType::get(
+          target.getContext(), element, target.getShape(), target.getAxisMaps(),
+          target.getValidity(), target.getOwner());
+      FailureOr<Value> projected =
+          projectFragmentValue(builder, location, operand, operandTarget);
+      if (failed(projected))
+        return failure();
+      mapping.map(operand, *projected);
+    }
+    projection = builder.clone(*definition, mapping);
+    projection->getResult(0).setType(target);
+  }
   if (!projection)
     return failure();
   if (Operation *definition = value.getDefiningOp())
@@ -1770,6 +1791,18 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
   };
 
   WalkResult result = kernel.walk([&](Operation *operation) {
+    if (auto transpose = dyn_cast<TransposeOp>(operation)) {
+      auto source = cast<FragmentType>(transpose.getValue().getType());
+      auto target = cast<FragmentType>(transpose.getResult().getType());
+      SmallVector<Attribute> shape;
+      for (int64_t input : transpose.getPermutation())
+        shape.push_back(source.getShape()[input]);
+      transpose.getResult().setType(FragmentType::get(
+          kernel.getContext(), target.getElementType(),
+          ArrayAttr::get(kernel.getContext(), shape), target.getAxisMaps(),
+          target.getValidity(), target.getOwner()));
+      return WalkResult::advance();
+    }
     if (auto broadcast = dyn_cast<BroadcastOp>(operation)) {
       auto target = dyn_cast<FragmentType>(broadcast.getResult().getType());
       auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
