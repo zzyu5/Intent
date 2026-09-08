@@ -114,6 +114,13 @@ void unswitchNativeAccessGuard(scf::ForOp loop) {
   });
   if (!selected)
     return;
+  SmallVector<scf::IfOp> equivalentChoices;
+  loop.walk<WalkOrder::PostOrder>([&](scf::IfOp conditional) {
+    if (conditional->getParentOfType<scf::ForOp>() == loop &&
+        gpu::samePhysicalScalarExpression(conditional.getCondition(),
+                                          selected.getCondition()))
+      equivalentChoices.push_back(conditional);
+  });
 
   // One program-uniform access decision, hence at most two loop versions.
   // Specialization-only choices stay for the provider compiler to fold.
@@ -134,16 +141,23 @@ void unswitchNativeAccessGuard(scf::ForOp loop) {
     OpBuilder nested(&block, block.end());
     IRMapping mapping;
     auto copied = cast<scf::ForOp>(nested.clone(*loop.getOperation(), mapping));
-    auto choice =
-        mapping.lookup(selected.getResult(0)).getDefiningOp<scf::IfOp>();
-    Block &chosen =
-        (takeThen ? choice.getThenRegion() : choice.getElseRegion()).front();
-    auto yield = cast<scf::YieldOp>(chosen.getTerminator());
-    for (Operation &operation :
-         llvm::make_early_inc_range(chosen.without_terminator()))
-      operation.moveBefore(choice);
-    choice.getResults().replaceAllUsesWith(yield.getResults());
-    choice.erase();
+    // K/V or other cooperating accesses can carry separate, equivalent guard
+    // expressions. Refine every occurrence, including nested ones, so a native
+    // loop version does not retain another copy of the same runtime branch.
+    for (scf::IfOp originalChoice : equivalentChoices) {
+      auto choice = cast<scf::IfOp>(
+          mapping.lookup(&originalChoice.getThenRegion().front())->getParentOp());
+      Region &chosen = takeThen ? choice.getThenRegion() : choice.getElseRegion();
+      if (!chosen.empty()) {
+        Block &body = chosen.front();
+        auto yield = cast<scf::YieldOp>(body.getTerminator());
+        for (Operation &operation :
+             llvm::make_early_inc_range(body.without_terminator()))
+          operation.moveBefore(choice);
+        choice.getResults().replaceAllUsesWith(yield.getResults());
+      }
+      choice.erase();
+    }
     nested.create<scf::YieldOp>(loop.getLoc(), copied.getResults());
   }
   loop.getResults().replaceAllUsesWith(version.getResults());

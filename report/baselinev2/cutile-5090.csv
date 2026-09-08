@@ -7,10 +7,10 @@ layer_norm,8192x4096-bf16,0.087776,0.265920,0.330084,pass,同算法；source 额
 silu_and_mul,4096x28672-to14336-bf16,0.227072,0.245424,0.925223,pass,同算法；source 使用 FTZ 与近似除法
 attention_backward,B2-QH8-KVH2-S1024-D64-fp16-causal,0.187184,0.178928,1.046141,pass,同算法；中间精度和舍入不同
 dense_attention_forward,B2-QH32-KVH8-S4096-D128-bf16-causal,1.334816,1.285352,1.038483,pass,同算法；source 使用 FTZ 与近似除法
-grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,0.190200,0.188440,1.009340,pass,同算法；source 使用 FTZ 与近似除法
+grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,0.188848,0.188448,1.002123,pass,同算法；source 使用 FTZ 与近似除法
 swiglu,8192x14336-bf16,0.449824,0.464616,0.968163,pass,同算法；source 使用 FTZ 与近似除法
 splitk_attention_reduce,B8-H32-S8192-splits16-D128,0.005904,0.005888,1.002717,pass,
-mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,1.523848,0.946840,1.609404,pass,同算法；source 使用 FTZ 与近似除法
+mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,0.941384,0.941760,0.999601,pass,同算法；source 使用 FTZ 与近似除法
 batched_gemm,B32-M512-N512-K1024-bf16,0.091904,0.091936,0.999652,pass,
 tilegym_dense_gemm,M8192-N11008-K4096-bf16,3.121920,3.171448,0.984383,pass,
 grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.650184,0.643184,1.010883,pass,同算法；source 使用 host group shapes

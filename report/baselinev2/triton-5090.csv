@@ -1,5 +1,5 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
-fused_softmax,8192x8192-fp16,0.174208,0.187520,0.929010,pass,
+fused_softmax,8192x8192-fp16,0.174352,0.188112,0.926852,pass,
 dense_gemm,M4096-N14336-K4096-fp16,2.055952,2.083600,0.986731,pass,
 grouped_gemm,E8-M1024-K4096-N14336-fp16,4.235672,4.592976,0.922206,pass,
 flash_attention_forward,B4-H32-S4096-D128-fp16-causal,2.763520,2.777256,0.995054,source_abi_gap,

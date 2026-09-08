@@ -185,6 +185,8 @@ void appendUnique(SmallVectorImpl<Operation *> &destination,
     destination.push_back(operation);
 }
 
+PhysicalExprAttr resourceExtentExpression(Value resource, unsigned axis);
+
 bool sameScalarExpression(Value lhs, Value rhs, unsigned depth = 0) {
   if (lhs == rhs)
     return true;
@@ -208,13 +210,27 @@ bool sameScalarExpression(Value lhs, Value rhs, unsigned depth = 0) {
                                 depth + 1) &&
            sameScalarExpression(leftBinary.getRhs(), rightBinary.getRhs(),
                                 depth + 1);
+  auto leftCompare = lhs.getDefiningOp<CompareOp>();
+  auto rightCompare = rhs.getDefiningOp<CompareOp>();
+  if (leftCompare || rightCompare)
+    return leftCompare && rightCompare &&
+           leftCompare.getPredicate() == rightCompare.getPredicate() &&
+           sameScalarExpression(leftCompare.getLhs(), rightCompare.getLhs(),
+                                depth + 1) &&
+           sameScalarExpression(leftCompare.getRhs(), rightCompare.getRhs(),
+                                depth + 1);
   auto leftDim = lhs.getDefiningOp<DimOp>();
   auto rightDim = rhs.getDefiningOp<DimOp>();
   if (leftDim || rightDim) {
-    if (!leftDim || !rightDim)
+    if (!leftDim || !rightDim ||
+        leftDim->getParentOfType<func::FuncOp>() !=
+            rightDim->getParentOfType<func::FuncOp>())
       return false;
-    return leftDim.getView() == rightDim.getView() &&
-           leftDim.getAxis() == rightDim.getAxis();
+    PhysicalExprAttr leftExtent =
+        resourceExtentExpression(leftDim.getView(), leftDim.getAxis());
+    PhysicalExprAttr rightExtent =
+        resourceExtentExpression(rightDim.getView(), rightDim.getAxis());
+    return leftExtent && rightExtent && leftExtent == rightExtent;
   }
   auto leftCast = lhs.getDefiningOp<CastOp>();
   auto rightCast = rhs.getDefiningOp<CastOp>();
