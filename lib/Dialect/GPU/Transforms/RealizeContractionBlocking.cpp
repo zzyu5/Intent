@@ -4169,7 +4169,277 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
   return success();
 }
 
+Type transposeLoopSchema(Type type) {
+  if (auto fragment = dyn_cast<FragmentType>(type))
+    return fragment.getShape().size() == 2 ? transposeLastTwo(fragment) : type;
+  if (auto record = dyn_cast<RecordType>(type)) {
+    SmallVector<Attribute> fields;
+    for (Attribute field : record.getFieldTypes())
+      fields.push_back(TypeAttr::get(
+          transposeLoopSchema(cast<TypeAttr>(field).getValue())));
+    return RecordType::get(type.getContext(), record.getFieldNames(),
+                           ArrayAttr::get(type.getContext(), fields),
+                           record.getOwner());
+  }
+  return type;
+}
+
+void matrixFields(Type type, SmallVectorImpl<FragmentType> &fields) {
+  if (auto fragment = dyn_cast<FragmentType>(type)) {
+    if (fragment.getShape().size() == 2)
+      fields.push_back(fragment);
+  } else if (auto record = dyn_cast<RecordType>(type)) {
+    for (Attribute field : record.getFieldTypes())
+      matrixFields(cast<TypeAttr>(field).getValue(), fields);
+  }
+}
+
+Value transposeLoopValue(OpBuilder &builder, Location location, Value value) {
+  if (auto fragment = dyn_cast<FragmentType>(value.getType())) {
+    if (fragment.getShape().size() != 2)
+      return value;
+    auto target = transposeLastTwo(fragment);
+    if (auto splat = value.getDefiningOp<SplatOp>())
+      return builder.create<SplatOp>(location, target, splat.getValue());
+    return builder.create<TransposeOp>(location, target, value,
+                                       ArrayRef<int64_t>{1, 0});
+  }
+  if (auto record = dyn_cast<RecordType>(value.getType())) {
+    SmallVector<Value> fields;
+    for (auto [index, type] : llvm::enumerate(record.getFieldTypes())) {
+      Value field = builder.create<ExtractOp>(
+          location, cast<TypeAttr>(type).getValue(), value, index);
+      fields.push_back(transposeLoopValue(builder, location, field));
+    }
+    return builder.create<MakeRecordOp>(
+        location, cast<RecordType>(transposeLoopSchema(record)), fields);
+  }
+  return value;
+}
+
+bool supportsMatrixLoopTranspose(scf::ForOp loop) {
+  auto supportedType = [&](Type type) {
+    std::function<bool(Type)> supported = [&](Type current) {
+      if (auto fragment = dyn_cast<FragmentType>(current))
+        return fragment.getShape().size() <= 2;
+      if (auto record = dyn_cast<RecordType>(current))
+        return llvm::all_of(record.getFieldTypes(), [&](Attribute field) {
+          return supported(cast<TypeAttr>(field).getValue());
+        });
+      return true;
+    };
+    return supported(type);
+  };
+  return !loop.walk([&](Operation *operation) {
+    if (!llvm::all_of(operation->getOperandTypes(), supportedType) ||
+        !llvm::all_of(operation->getResultTypes(), supportedType))
+      return WalkResult::interrupt();
+    if (auto load = dyn_cast<LoadOp>(operation))
+      return isa<ViewType>(load.getResource().getType())
+                 ? WalkResult::advance() : WalkResult::interrupt();
+    if (auto contract = dyn_cast<ContractOp>(operation)) {
+      if (contract.getLhs().getType().getShape().size() != 2 ||
+          contract.getRhs().getType().getShape().size() != 2 ||
+          !contract.getLhsBatchAxes().empty() ||
+          !contract.getRhsBatchAxes().empty() ||
+          contract.getLhsReductionAxes().size() != 1 ||
+          contract.getRhsReductionAxes().size() != 1)
+        return WalkResult::interrupt();
+      return WalkResult::advance();
+    }
+    if (auto reshape = dyn_cast<ReshapeOp>(operation)) {
+      auto source = dyn_cast<FragmentType>(reshape.getValue().getType());
+      auto target = dyn_cast<FragmentType>(reshape.getResult().getType());
+      if (!source || !target)
+        return WalkResult::interrupt();
+      auto nonUnit = [](FragmentType type) {
+        return llvm::count_if(type.getShape(), [](Attribute extent) {
+          auto expression = cast<PhysicalExprAttr>(extent);
+          return expression.getKind() !=
+                     static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+                 expression.getValue() != 1;
+        });
+      };
+      if (source.getShape() != target.getShape() &&
+          (nonUnit(source) > 1 || nonUnit(target) > 1))
+        return WalkResult::interrupt();
+      return succeeded(inferReshapeReassociation(
+                 cast<FragmentType>(transposeLoopSchema(source)),
+                 cast<FragmentType>(transposeLoopSchema(target))))
+                 ? WalkResult::advance() : WalkResult::interrupt();
+    }
+    if (auto reduce = dyn_cast<ReduceOp>(operation))
+      return reduce.getAxes().size() == 1 ? WalkResult::advance()
+                                          : WalkResult::interrupt();
+    return isa<arith::ConstantOp, scf::ForOp, scf::IfOp, scf::YieldOp,
+               UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp,
+               SplatOp, BroadcastOp, TransposeOp, MakeRecordOp, ExtractOp,
+               MakeRangeOp, RangeBoundOp, DimOp, AssumeInBoundsOp, YieldOp>(operation)
+               ? WalkResult::advance() : WalkResult::interrupt();
+  }).wasInterrupted();
+}
+
+void transposeClonedLoop(scf::ForOp loop) {
+  loop.walk([&](Operation *operation) {
+    for (Value result : operation->getResults())
+      result.setType(transposeLoopSchema(result.getType()));
+    for (Region &region : operation->getRegions())
+      for (Block &block : region)
+        for (BlockArgument argument : block.getArguments())
+          argument.setType(transposeLoopSchema(argument.getType()));
+  });
+  loop.walk([&](Operation *operation) {
+    if (auto contract = dyn_cast<ContractOp>(operation)) {
+      Value lhs = contract.getLhs(), rhs = contract.getRhs();
+      auto lhsAxes = remapAxes(contract.getRhsReductionAxes(), {1, 0});
+      auto rhsAxes = remapAxes(contract.getLhsReductionAxes(), {1, 0});
+      contract->setOperand(0, rhs);
+      contract->setOperand(1, lhs);
+      contract.setLhsReductionAxesAttr(
+          DenseI64ArrayAttr::get(loop.getContext(), lhsAxes));
+      contract.setRhsReductionAxesAttr(
+          DenseI64ArrayAttr::get(loop.getContext(), rhsAxes));
+    } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
+      auto source = dyn_cast<FragmentType>(reduce.getInputs().front().getType());
+      if (source && source.getShape().size() == 2)
+        reduce.setAxesAttr(DenseI64ArrayAttr::get(
+            loop.getContext(), remapAxes(reduce.getAxes(), {1, 0})));
+    } else if (auto reshape = dyn_cast<ReshapeOp>(operation)) {
+      auto relation = inferReshapeReassociation(
+          cast<FragmentType>(reshape.getValue().getType()),
+          cast<FragmentType>(reshape.getResult().getType()));
+      assert(succeeded(relation) && "loop transpose preflight checked reshapes");
+      reshape.setReassociationAttr(*relation);
+    }
+  });
+}
+
 } // namespace
+
+LogicalResult orientLoopContractions(ModuleOp module) {
+  auto kernel = getPhysicalKernel(module);
+  if (failed(kernel))
+    return failure();
+  SmallVector<scf::ForOp> loops;
+  kernel->walk([&](scf::ForOp loop) {
+    if (!loop->getParentOfType<scf::ForOp>())
+      loops.push_back(loop);
+  });
+  for (scf::ForOp loop : loops) {
+    SmallVector<FragmentType> fields;
+    for (Value value : loop.getInitArgs())
+      matrixFields(value.getType(), fields);
+    if (fields.empty())
+      continue;
+    FragmentType matrix = fields.front();
+    if (!isa<FloatType>(matrix.getElementType()) ||
+        !llvm::all_of(fields, [&](FragmentType field) {
+          return field == matrix;
+        }))
+      continue;
+    auto row = parameterForExtent(
+        *kernel, cast<PhysicalExprAttr>(matrix.getShape()[0]));
+    auto column = parameterForExtent(
+        *kernel, cast<PhysicalExprAttr>(matrix.getShape()[1]));
+    if (failed(row) || failed(column) ||
+        row->getParameter().getCategory() !=
+            static_cast<uint32_t>(ParameterCategory::RegionContraction) ||
+        column->getParameter().getRole() !=
+            static_cast<uint32_t>(ParameterRole::FullCoverage))
+      continue;
+    llvm::DenseSet<Value> visited;
+    ContractOp carriedContract;
+    std::function<bool(Value)> dependsOnMatrixContract = [&](Value value) {
+      if (!visited.insert(value).second)
+        return false;
+      Operation *producer = value.getDefiningOp();
+      if (!producer || !loop->isProperAncestor(producer))
+        return false;
+      if (auto contract = dyn_cast<ContractOp>(producer))
+        if (contract.getResult().getType().getShape() == matrix.getShape() &&
+            contract.getResult().getType().getElementType() ==
+                matrix.getElementType()) {
+          carriedContract = contract;
+          return true;
+        }
+      return llvm::any_of(producer->getOperands(), dependsOnMatrixContract);
+    };
+    bool carriesContract = llvm::any_of(
+        loop.getBody()->getTerminator()->getOperands(), dependsOnMatrixContract);
+    unsigned contractionCount = 0;
+    loop.walk([&](ContractOp) { ++contractionCount; });
+    // This orientation policy covers one producer contraction feeding the
+    // carried contraction. Extra products need a joint residency/layout cost
+    // decision; transposing their entire live graph can increase traffic.
+    if (!carriesContract || contractionCount != 2 ||
+        !supportsMatrixLoopTranspose(loop))
+      continue;
+    visited.clear();
+    std::function<bool(Value)> hasProducerContract = [&](Value value) {
+      if (!visited.insert(value).second)
+        return false;
+      Operation *producer = value.getDefiningOp();
+      if (!producer || !loop->isProperAncestor(producer))
+        return false;
+      if (auto contract = dyn_cast<ContractOp>(producer))
+        return contract != carriedContract;
+      return llvm::any_of(producer->getOperands(), hasProducerContract);
+    };
+    if (!hasProducerContract(carriedContract.getLhs()) &&
+        !hasProducerContract(carriedContract.getRhs()))
+      continue;
+
+    // Keep a strongly rectangular matrix's short axis in the column position.
+    // The predicate uses existing tile parameters, not a new structural tuner.
+    OpBuilder builder(loop);
+    Location location = loop.getLoc();
+    Value four = builder.create<arith::ConstantIndexOp>(location, 4);
+    Value quarter = binary(builder, location, builder.getIndexType(),
+                           column->getResult(), four,
+                           BinaryOperator::FloorDivide);
+    Value rectangular = builder.create<CompareOp>(
+        location, builder.getI1Type(), row->getResult(), quarter,
+        ComparePredicate::Le);
+    auto choice = builder.create<scf::IfOp>(
+        location, loop.getResultTypes(), rectangular, true);
+    auto branchBuilder = [](Region &region) {
+      Block &block = region.front();
+      if (!block.empty() && isa<scf::YieldOp>(block.back()))
+        block.back().erase();
+      return OpBuilder(&block, block.end());
+    };
+    OpBuilder transposed = branchBuilder(choice.getThenRegion());
+    IRMapping mapping;
+    llvm::DenseSet<Value> captured;
+    loop.walk([&](Operation *operation) {
+      for (Value operand : operation->getOperands()) {
+        Operation *owner = operand.getParentRegion()->getParentOp();
+        if (owner == loop || loop->isProperAncestor(owner) ||
+            !captured.insert(operand).second)
+          continue;
+        SmallVector<FragmentType> matrices;
+        matrixFields(operand.getType(), matrices);
+        if (!matrices.empty())
+          mapping.map(operand,
+                      transposeLoopValue(transposed, location, operand));
+      }
+    });
+    auto replacement = cast<scf::ForOp>(transposed.clone(*loop, mapping));
+    transposeClonedLoop(replacement);
+    SmallVector<Value> results;
+    for (Value result : replacement.getResults())
+      results.push_back(transposeLoopValue(transposed, location, result));
+    transposed.create<scf::YieldOp>(location, results);
+    OpBuilder original = branchBuilder(choice.getElseRegion());
+    IRMapping originalMapping;
+    auto unchanged = cast<scf::ForOp>(original.clone(*loop, originalMapping));
+    original.create<scf::YieldOp>(location, unchanged.getResults());
+    loop.replaceAllUsesWith(choice.getResults());
+    loop.erase();
+  }
+  eraseDeadPhysicalValues(*kernel);
+  return success();
+}
 
 LogicalResult realizeContractionBlocking(ModuleOp module) {
   FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);

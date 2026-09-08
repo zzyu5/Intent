@@ -119,7 +119,9 @@ LogicalResult realizeContractionGroup(ModuleOp module, func::FuncOp kernel) {
 }
 
 LogicalResult composeRealizedAccesses(ModuleOp module, func::FuncOp kernel) {
-  if (failed(realizeAccessComposition(module)))
+  if (failed(realizeAccessComposition(module)) ||
+      failed(orientLoopContractions(module)) ||
+      failed(alignAggregateValueRelations(kernel)))
     return failure();
   return closeValueAccessRelations(kernel);
 }
