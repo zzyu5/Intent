@@ -9,6 +9,7 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Support/MathExtras.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
@@ -4188,13 +4189,15 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           candidates.assign({1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024,
                              2048, 4096});
         } else {
-          // A fixed logical free axis can still use a padded contraction tile.
-          // Keep its physical candidates; ownership tail validity masks the
-          // extra lanes, and the correlated profiles choose the actual shape.
+          // Ownership tail validity also permits a padded pointwise tile.
+          // Keep the enclosing power-of-two extent available to the profiles;
+          // a logical row width must not cap an otherwise legal physical tile.
+          uint64_t paddedExtent = llvm::PowerOf2Ceil(
+              static_cast<uint64_t>(std::max<int64_t>(logicalExtent.value(), 1)));
           for (int64_t candidate : {8, 16, 32, 64, 128, 256, 512, 1024,
-                                    2048, 4096})
+                                    2048, 4096, 8192, 16384})
             if (category == ParameterCategory::RegionContraction ||
-                candidate <= logicalExtent.value())
+                static_cast<uint64_t>(candidate) <= paddedExtent)
               candidates.push_back(candidate);
           if (!llvm::is_contained(candidates, logicalExtent.value()))
             candidates.push_back(logicalExtent.value());
