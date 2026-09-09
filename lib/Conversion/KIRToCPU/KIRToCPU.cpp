@@ -40,12 +40,25 @@ public:
         auto tensor = cast<RankedTensorType>(view.getTensor());
         if (!tensor.getElementType().isF32() || view.getAccess() == 2)
           return source.emitError("CPU construction supports f32 In/Out views; InOut is not implemented");
-        if (view.getConstraints().getHasStrides())
-          return source.emitError("CPU construction does not yet implement declared view stride constraints");
+        auto memory = MemRefType::get(tensor.getShape(), tensor.getElementType());
+        if (view.getConstraints().getHasStrides()) {
+          if (view.getConstraints().getStrides().size() != static_cast<size_t>(tensor.getRank()))
+            return source.emitError("CPU declared stride constraints must cover the view rank");
+          SmallVector<int64_t> strides;
+          int64_t offset;
+          if (failed(memory.getStridesAndOffset(strides, offset)))
+            return source.emitError("CPU contiguous view has no derived strides");
+          for (auto [constraint, stride] : llvm::zip(view.getConstraints().getStrides(), strides)) {
+            if (isa<UnitAttr>(constraint)) continue;
+            auto fixed = dyn_cast<IntegerAttr>(constraint);
+            if (!fixed || ShapedType::isDynamic(stride) || fixed.getInt() != stride)
+              return source.emitError("CPU contiguous ABI cannot discharge this declared stride constraint");
+          }
+        }
         auto shape = dyn_cast_or_null<TensorShapeAttr>(tensor.getEncoding());
         if (!shape)
           return source.emitError("CPU view is missing canonical dimension identities");
-        types.push_back(MemRefType::get(tensor.getShape(), tensor.getElementType()));
+        types.push_back(memory);
         interface.push_back(cpu::ViewArgumentAttr::get(builder.getContext(),
             parameter.getName(), tensor.getElementType(),
             builder.getDenseI64ArrayAttr(tensor.getShape()), shape.getDimensions(),
@@ -199,6 +212,9 @@ private:
       case BinaryOperator::TrueDivide:
         if (fp) return Value(builder.create<arith::DivFOp>(loc, a, b));
         break;
+      case BinaryOperator::MaximumNum:
+        if (fp) return Value(builder.create<arith::MaxNumFOp>(loc, a, b));
+        break;
       default: break;
       }
     } else if (auto unary = dyn_cast<UnaryOp>(operation)) {
@@ -207,6 +223,7 @@ private:
       switch (unary.getOperatorKind()) {
       case UnaryOperator::Rsqrt: return Value(builder.create<math::RsqrtOp>(loc, arguments[0]));
       case UnaryOperator::Sqrt: return Value(builder.create<math::SqrtOp>(loc, arguments[0]));
+      case UnaryOperator::Exp: return Value(builder.create<math::ExpOp>(loc, arguments[0]));
       case UnaryOperator::Negate: return Value(builder.create<arith::NegFOp>(loc, arguments[0]));
       default: break;
       }
@@ -272,9 +289,10 @@ private:
         if (failed(lowerOperation(&nested))) return failure();
       Value result = values.lookup(combine.getTerminator()->getOperand(0));
       builder.create<cpu::YieldOp>(loc, result);
-      auto add = result.getDefiningOp<arith::AddFOp>();
-      if (add && body->getArgument(0).hasOneUse() &&
-          (add.getLhs() == body->getArgument(0) || add.getRhs() == body->getArgument(0)))
+      auto *combineOp = result.getDefiningOp();
+      if (combineOp && isa<arith::AddFOp, arith::MaxNumFOp>(combineOp) &&
+          body->getArgument(0).hasOneUse() &&
+          llvm::is_contained(combineOp->getOperands(), body->getArgument(0)))
         reduction.setOrderAttr(cpu::ReductionOrderAttr::get(builder.getContext(), true));
     }
     values.map(operation.getResults()[0], reduction.getResult());

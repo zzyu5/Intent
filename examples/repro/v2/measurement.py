@@ -283,12 +283,17 @@ def evaluate(
         _synchronize(comparison)
     except Exception as error:
         raise PipelineStageError("source_launch", str(error)) from error
-    report_stage("numerical_comparison")
-    compare_outputs(
-        comparison.generated.outputs(),
-        comparison.source.outputs(),
-        comparison.tolerance,
-    )
+
+    def validate_outputs() -> None:
+        report_stage("numerical_comparison")
+        compare_outputs(
+            comparison.generated.outputs(),
+            comparison.source.outputs(),
+            comparison.tolerance,
+        )
+
+    if comparison.device_type != "cpu" or comparison.status != "pass":
+        validate_outputs()
     if comparison.status != "pass":
         return None, None
     if comparison.device_type != "cpu" and before_benchmark is not None:
@@ -313,6 +318,9 @@ def evaluate(
         generated_second = _benchmark_launch(comparison.generated, comparison, 0)
     except Exception as error:
         raise PipelineStageError("generated_reverse_benchmark", str(error)) from error
+    if comparison.device_type == "cpu":
+        # Torch's comparison workers must not spin alongside native CPU timing.
+        validate_outputs()
     return (
         statistics.median((generated_first, generated_second)),
         statistics.median((source_first, source_second)),

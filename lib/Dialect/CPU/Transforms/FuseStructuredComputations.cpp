@@ -1,8 +1,11 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 using namespace mlir;
 
@@ -15,10 +18,15 @@ linalg::GenericOp pointwiseProducer(Value buffer, Operation *consumer,
   linalg::GenericOp producer;
   for (Operation *user : buffer.getUsers()) {
     if (auto generic = dyn_cast<linalg::GenericOp>(user)) {
-      if (!llvm::is_contained(generic.getOutputs(), buffer)) continue;
+      if (!llvm::is_contained(generic.getOutputs(), buffer)) {
+        if (user != consumer) return {};
+        continue;
+      }
       if (producer) return {};
       producer = generic;
-    } else if (!isa<memref::DimOp, memref::DeallocOp, ReduceOp>(user)) return {};
+    } else if (isa<ReduceOp>(user)) {
+      if (user != consumer) return {};
+    } else if (!isa<memref::DimOp, memref::DeallocOp>(user)) return {};
   }
   if (!producer || producer == consumer || producer->getBlock() != consumer->getBlock() ||
       !producer->isBeforeInBlock(consumer) || producer.getOutputs().size() != 1 ||
@@ -143,6 +151,85 @@ bool fuseOne(Operation *consumer, unsigned inputNumber,
   return true;
 }
 
+bool reuseOutput(linalg::GenericOp consumer, Value buffer,
+                 PhysicalProgramAnalysis &analysis) {
+  auto allocation = buffer.getDefiningOp<memref::AllocOp>();
+  if (!allocation || allocation->getBlock() != consumer->getBlock() ||
+      consumer.getNumReductionLoops() || consumer.getOutputs().size() != 1 ||
+      !consumer.getRegion().front().getArguments().back().use_empty()) return false;
+  auto maps = consumer.getIndexingMapsArray();
+  if (!maps.back().isIdentity()) return false;
+  for (auto [input, map] : llvm::zip(consumer.getInputs(), maps))
+    if (input == buffer && !map.isIdentity()) return false;
+  Value output = consumer.getOutputs()[0];
+  auto external = analysis.externalView(output);
+  auto view = output.getDefiningOp<memref::SubViewOp>();
+  if (!external || external.getAccess() != 1 || !view ||
+      view.getType().getRank() != allocation.getType().getRank() ||
+      view.getType().getElementType() != allocation.getType().getElementType()) return false;
+  SmallVector<OpFoldResult> extents;
+  auto dropped = view.getDroppedDims();
+  for (auto [axis, size] : llvm::enumerate(view.getMixedSizes()))
+    if (!dropped.test(axis)) extents.push_back(size);
+  unsigned dynamic = 0;
+  for (auto [axis, extent] : llvm::enumerate(extents)) {
+    if (allocation.getType().isDynamicDim(axis)) {
+      Value size = allocation.getDynamicSizes()[dynamic++];
+      if (extent == OpFoldResult(size)) continue;
+      auto left = getConstantIntValue(extent), right = getConstantIntValue(size);
+      if (!left || !right || *left != *right) return false;
+    } else if (getConstantIntValue(extent) != allocation.getType().getDimSize(axis)) return false;
+  }
+  Value root = analysis.storageRoot(output);
+  SmallVector<Value> aliases{root};
+  for (unsigned i = 0; i < aliases.size(); ++i)
+    for (Operation *user : aliases[i].getUsers()) {
+      if (user == consumer || isa<memref::DimOp>(user)) continue;
+      if (auto alias = dyn_cast<memref::SubViewOp>(user)) aliases.push_back(alias.getResult());
+      else if (auto alias = dyn_cast<memref::CastOp>(user)) aliases.push_back(alias.getResult());
+      else return false;
+    }
+  linalg::GenericOp producer;
+  llvm::SmallPtrSet<Operation *, 4> readers;
+  SmallVector<memref::DeallocOp> deallocations;
+  for (Operation *user : buffer.getUsers()) {
+    if (auto dealloc = dyn_cast<memref::DeallocOp>(user)) {
+      deallocations.push_back(dealloc);
+      continue;
+    }
+    if (isa<memref::DimOp>(user)) continue;
+    auto generic = dyn_cast<linalg::GenericOp>(user);
+    if (generic && llvm::is_contained(generic.getOutputs(), buffer)) {
+      if (producer || generic.getOutputs().size() != 1 || generic.getNumReductionLoops() ||
+          !generic.getIndexingMapsArray().back().isIdentity() ||
+          !generic.getRegion().front().getArguments().back().use_empty() ||
+          llvm::is_contained(generic.getInputs(), buffer)) return false;
+      producer = generic;
+    } else if (generic || isa<ReduceOp>(user)) readers.insert(user);
+    else return false;
+    if (user->getBlock() != consumer->getBlock() ||
+        (user != consumer && !user->isBeforeInBlock(consumer))) return false;
+  }
+  if (!producer || readers.size() < 2) return false;
+  for (Operation *reader : readers)
+    if (!producer->isBeforeInBlock(reader)) return false;
+  for (auto operation : {producer, consumer})
+    for (Operation &nested : operation.getRegion().front().without_terminator())
+      if (nested.getNumRegions() || !isMemoryEffectFree(&nested)) return false;
+  DominanceInfo dominance(consumer->getParentOfType<func::FuncOp>());
+  if (!dominance.dominates(output, allocation)) {
+    if (view->getBlock() != allocation->getBlock() ||
+        llvm::any_of(view->getOperands(), [&](Value value) {
+          return !dominance.dominates(value, allocation);
+        })) return false;
+    view->moveBefore(allocation);
+  }
+  for (memref::DeallocOp dealloc : deallocations) dealloc.erase();
+  allocation.getResult().replaceAllUsesWith(output);
+  allocation.erase();
+  return true;
+}
+
 }
 
 LogicalResult fuseStructuredComputations(func::FuncOp function) {
@@ -171,6 +258,15 @@ LogicalResult fuseStructuredComputations(func::FuncOp function) {
       if (changed) break;
     }
   } while (changed);
+  SmallVector<linalg::GenericOp> outputs;
+  function.walk([&](linalg::GenericOp operation) { outputs.push_back(operation); });
+  for (auto operation : llvm::reverse(outputs)) {
+    SmallVector<Value> inputs(operation.getInputs());
+    for (Value input : inputs) {
+      PhysicalProgramAnalysis analysis(function);
+      if (reuseOutput(operation, input, analysis)) break;
+    }
+  }
   return success();
 }
 

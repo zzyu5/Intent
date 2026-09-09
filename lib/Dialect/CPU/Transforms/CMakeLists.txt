@@ -3,6 +3,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   MaterializeStructuredComputations.cpp
   MaterializeRegisterContractions.cpp
   FuseIntermediateBuffers.cpp
+  FuseReductionTraversals.cpp
   BlockContractions.cpp
   VectorizeLoops.cpp
   PartitionTasks.cpp

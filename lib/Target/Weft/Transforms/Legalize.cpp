@@ -309,6 +309,7 @@ private:
     else if (isa<arith::MulFOp, arith::MulIOp>(operation)) kind = "mul";
     else if (isa<arith::DivFOp, arith::DivSIOp>(operation)) kind = "div";
     else if (isa<arith::RemSIOp>(operation)) kind = "mod";
+    else if (isa<arith::MaxNumFOp>(operation)) kind = "max";
     if (!kind.empty()) return binary(loc, operands[0], operands[1], kind);
     if (isa<arith::MinSIOp, arith::MaxSIOp>(operation))
       return binary(loc, operands[0], operands[1], isa<arith::MinSIOp>(operation) ? "min" : "max");
@@ -322,6 +323,7 @@ private:
     if (isa<arith::IndexCastOp>(operation))
       return Value(b.create<wk::CastOp>(loc, operation->getResult(0).getType(), operands[0]));
     if (isa<math::RsqrtOp>(operation)) kind = "rsqrt";
+    else if (isa<math::ExpOp>(operation)) kind = "exp";
     else if (isa<arith::NegFOp>(operation)) kind = "neg";
     if (!kind.empty()) return Value(b.create<wk::UnaryOp>(loc, operands[0].getType(), operands[0], kind));
     operation->emitError("CPU operation has no Weft numerical representation");
@@ -386,11 +388,18 @@ private:
 
   LogicalResult reduction(cpu::ReduceOp operation) {
     Block &body = operation.getCombine().front();
-    auto add = body.getTerminator()->getOperand(0).getDefiningOp<arith::AddFOp>();
+    Operation *combine = body.getTerminator()->getOperand(0).getDefiningOp();
     auto initial = operation.getInitial().getDefiningOp<arith::ConstantOp>();
     auto identity = initial ? dyn_cast<FloatAttr>(initial.getValue()) : FloatAttr();
-    if (!operation.getOrder().getAdjacentReassociation() || !add || !identity || !identity.getValue().isZero())
-      return operation.emitError("Weft reduction requires the closed additive identity/combine schema");
+    bool additive = combine && isa<arith::AddFOp>(combine);
+    bool maximum = combine && isa<arith::MaxNumFOp>(combine);
+    Value accumulator = body.getArgument(0);
+    if (!operation.getOrder().getAdjacentReassociation() || (!additive && !maximum) ||
+        !identity || !accumulator.hasOneUse() ||
+        !llvm::is_contained(combine->getOperands(), accumulator) ||
+        (additive && !identity.getValue().isZero()) ||
+        (maximum && !(identity.getValue().isInfinity() && identity.getValue().isNegative())))
+      return operation.emitError("Weft reduction requires a closed additive/maximumNumber identity and accumulator combine");
     IRMapping mapping;
     for (auto [number, input] : llvm::enumerate(operation.getInputs())) {
       auto value = mappedInput(input, cast<AffineMapAttr>(operation.getIndexingMaps()[number]).getValue());
@@ -398,15 +407,22 @@ private:
       mapping.map(body.getArgument(number + 1), *value);
     }
     for (Operation &nested : body.without_terminator()) {
-      if (&nested == add.getOperation()) continue;
+      if (&nested == combine) continue;
       auto value = expression(&nested, mapping);
       if (failed(value)) return failure();
       mapping.map(nested.getResult(0), *value);
     }
-    Value contribution = mapping.lookup(add.getLhs() == body.getArgument(0) ? add.getRhs() : add.getLhs());
+    Value contribution = mapping.lookup(combine->getOperand(0) == accumulator
+        ? combine->getOperand(1) : combine->getOperand(0));
     if (shape(contribution.getType()).size() != 1)
       return operation.emitError("Weft reduction requires one retained logical input axis");
-    Value result = b.create<wk::ReduceOp>(operation.getLoc(), operation.getResult().getType(), contribution, "add", 0);
+    Value result = b.create<wk::ReduceOp>(operation.getLoc(), operation.getResult().getType(), contribution,
+        additive ? "add" : "max", 0);
+    if (maximum) {
+      auto seeded = binary(operation.getLoc(), values.lookup(operation.getInitial()), result, "max");
+      if (failed(seeded)) return failure();
+      result = *seeded;
+    }
     values.map(operation.getResult(), result);
     return success();
   }

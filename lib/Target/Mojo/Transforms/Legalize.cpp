@@ -31,7 +31,7 @@ LogicalResult checkSurface(ModuleOp module) {
         arith::SubFOp, arith::SubIOp, arith::MulFOp, arith::MulIOp,
         arith::DivFOp, arith::DivSIOp, arith::FloorDivSIOp, arith::RemSIOp,
         arith::MinSIOp, arith::MaxSIOp, arith::CeilDivSIOp, arith::NegFOp,
-        arith::IndexCastOp, math::FmaOp, math::SqrtOp, memref::DimOp,
+        arith::IndexCastOp, arith::MaxNumFOp, math::FmaOp, math::SqrtOp, math::ExpOp, memref::DimOp,
         memref::SubViewOp, memref::CastOp, memref::LoadOp, memref::StoreOp,
         memref::AllocaOp, memref::AllocOp, memref::DeallocOp, memref::PrefetchOp,
         vector::LoadOp, vector::StoreOp, vector::BroadcastOp, vector::ShuffleOp,

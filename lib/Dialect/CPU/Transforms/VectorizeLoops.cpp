@@ -111,20 +111,33 @@ private:
   llvm::DenseMap<Value, Value> vectors;
 };
 
-void vectorize(scf::ForOp original, int64_t width) {
-  if (!matchPattern(original.getStep(), m_One()) || original.getNumResults() > 1) return;
-  Value reductionInput;
-  if (original.getNumResults() == 1) {
+bool dependsOnCarry(Value value, scf::ForOp loop) {
+  if (llvm::is_contained(loop.getRegionIterArgs(), value)) return true;
+  Operation *operation = value.getDefiningOp();
+  if (!operation || !loop->isAncestor(operation)) return false;
+  return llvm::any_of(operation->getOperands(), [&](Value input) {
+    return dependsOnCarry(input, loop);
+  });
+}
+
+void vectorize(scf::ForOp original, int64_t width, int64_t replicas) {
+  if (!matchPattern(original.getStep(), m_One())) return;
+  SmallVector<Value> reductionInputs;
+  SmallVector<Operation *> combines;
+  if (original.getNumResults()) {
     auto order = original->getAttrOfType<ReductionOrderAttr>("intent_cpu.reduction_order");
-    if (!order || !order.getAdjacentReassociation() ||
-        !original.getResult(0).getType().isF32()) return;
-    auto combine = original.getBody()->getTerminator()->getOperand(0).getDefiningOp<arith::AddFOp>();
-    if (!combine) return;
-    Value carry = original.getRegionIterArgs()[0];
-    if (combine.getLhs() == carry) reductionInput = combine.getRhs();
-    else if (combine.getRhs() == carry) reductionInput = combine.getLhs();
-    else return;
-    if (!carry.hasOneUse()) return;
+    if (!order || !order.getAdjacentReassociation()) return;
+    for (auto [carry, yielded] : llvm::zip(original.getRegionIterArgs(),
+             original.getBody()->getTerminator()->getOperands())) {
+      if (!carry.getType().isF32() || !carry.hasOneUse()) return;
+      Operation *combine = yielded.getDefiningOp();
+      if (!combine || !isa<arith::AddFOp, arith::MaxNumFOp>(combine)) return;
+      if (combine->getOperand(0) == carry) reductionInputs.push_back(combine->getOperand(1));
+      else if (combine->getOperand(1) == carry) reductionInputs.push_back(combine->getOperand(0));
+      else return;
+      if (dependsOnCarry(reductionInputs.back(), original)) return;
+      combines.push_back(combine);
+    }
   }
   SmallVector<memref::StoreOp> stores;
   for (Operation &operation : original.getBody()->without_terminator()) {
@@ -132,20 +145,21 @@ void vectorize(scf::ForOp original, int64_t width) {
     if (auto load = dyn_cast<memref::LoadOp>(&operation)) {
       if (!contiguous(load.getMemref(), load.getIndices(), original, true)) return;
     } else if (auto store = dyn_cast<memref::StoreOp>(&operation)) {
-      if (reductionInput || !contiguous(store.getMemref(), store.getIndices(), original, false)) return;
+      if (dependsOnCarry(store.getValue(), original) ||
+          !contiguous(store.getMemref(), store.getIndices(), original, false)) return;
       stores.push_back(store);
     } else if (!isMemoryEffectFree(&operation) ||
                llvm::any_of(operation.getResultTypes(), [](Type type) {
                  return !type.isF32() && !type.isIndex() && !type.isInteger(64);
                })) return;
   }
-  if (!reductionInput && stores.empty()) return;
+  if (reductionInputs.empty() && stores.empty()) return;
   OpBuilder b(original);
   Location loc = original.getLoc();
   // One local tree spans adjacent register replicas. Keeping the leaves in
   // coordinate order permits reassociation without striped accumulators, and
-  // amortizes the narrow horizontal stages across four hardware vectors.
-  int64_t logicalWidth = reductionInput ? 4 * width : width;
+  // amortizes the narrow horizontal stages across the bound register replicas.
+  int64_t logicalWidth = replicas * width;
   Value step = index(b, loc, logicalWidth);
   Value length = b.create<arith::SubIOp>(loc, original.getUpperBound(), original.getLowerBound());
   Value full = add(b, loc, original.getLowerBound(),
@@ -155,37 +169,51 @@ void vectorize(scf::ForOp original, int64_t width) {
     OpBuilder::InsertionGuard guard(b);
     b.setInsertionPointToStart(vectorLoop.getBody());
     VectorBody body(original, b, vectorLoop.getInductionVar(), logicalWidth);
-    if (reductionInput) {
-      Value value = body.vector(reductionInput);
-      for (int64_t count = logicalWidth; count > 1; count /= 2) {
-        SmallVector<int64_t> even, odd;
-        for (int64_t lane = 0; lane < count; lane += 2) {
-          even.push_back(lane);
-          odd.push_back(lane + 1);
+    for (memref::StoreOp store : stores)
+      b.create<vector::StoreOp>(loc, body.vector(store.getValue()), store.getMemref(), body.indices(store.getIndices()));
+    if (!reductionInputs.empty()) {
+      SmallVector<Value> results;
+      for (auto [number, reductionInput] : llvm::enumerate(reductionInputs)) {
+        Operation *combine = combines[number];
+        auto merge = [&](Value lhs, Value rhs) {
+          IRMapping mapping;
+          mapping.map(combine->getOperand(0), lhs);
+          mapping.map(combine->getOperand(1), rhs);
+          Operation *result = b.clone(*combine, mapping);
+          result->getResult(0).setType(lhs.getType());
+          return result->getResult(0);
+        };
+        Value value = body.vector(reductionInput);
+        for (int64_t count = logicalWidth; count > 1; count /= 2) {
+          SmallVector<int64_t> even, odd;
+          for (int64_t lane = 0; lane < count; lane += 2) {
+            even.push_back(lane);
+            odd.push_back(lane + 1);
+          }
+          Value lhs = b.create<vector::ShuffleOp>(loc, value, value, even);
+          Value rhs = b.create<vector::ShuffleOp>(loc, value, value, odd);
+          value = merge(lhs, rhs);
         }
-        Value lhs = b.create<vector::ShuffleOp>(loc, value, value, even);
-        Value rhs = b.create<vector::ShuffleOp>(loc, value, value, odd);
-        value = b.create<arith::AddFOp>(loc, lhs, rhs);
+        Value sum = b.create<vector::ExtractElementOp>(loc, value, index(b, loc, 0));
+        results.push_back(merge(vectorLoop.getRegionIterArgs()[number], sum));
       }
-      Value sum = b.create<vector::ExtractElementOp>(loc, value, index(b, loc, 0));
-      Value result = b.create<arith::AddFOp>(loc, vectorLoop.getRegionIterArgs()[0], sum);
-      b.create<scf::YieldOp>(loc, result);
-    } else {
-      for (memref::StoreOp store : stores)
-        b.create<vector::StoreOp>(loc, body.vector(store.getValue()), store.getMemref(), body.indices(store.getIndices()));
+      b.create<scf::YieldOp>(loc, results);
     }
   }
   original.setLowerBound(full);
-  if (reductionInput) original.getInitArgsMutable().assign(vectorLoop.getResults());
+  if (!reductionInputs.empty()) original.getInitArgsMutable().assign(vectorLoop.getResults());
+  if (replicas > 1) vectorize(original, width, 1);
   original->removeAttr("intent_cpu.reduction_order");
 }
 
 }
 
-LogicalResult vectorizeLoops(func::FuncOp function, int64_t width) {
+LogicalResult vectorizeLoops(func::FuncOp function, int64_t width, int64_t replicas,
+                            int64_t reductionReplicas) {
   SmallVector<scf::ForOp> loops;
   function.walk<WalkOrder::PostOrder>([&](scf::ForOp op) { loops.push_back(op); });
-  for (scf::ForOp loop : loops) vectorize(loop, width);
+  for (scf::ForOp loop : loops)
+    vectorize(loop, width, loop.getNumResults() ? reductionReplicas : replicas);
   return success();
 }
 

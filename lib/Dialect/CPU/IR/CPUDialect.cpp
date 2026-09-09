@@ -70,10 +70,16 @@ LogicalResult CapabilitiesAttr::verify(
 
 LogicalResult ConfigurationAttr::verify(
     llvm::function_ref<InFlightDiagnostic()> error, int64_t width,
-    int64_t grain, int64_t m, int64_t n, int64_t k, int64_t mr, int64_t nr) {
+    int64_t grain, int64_t m, int64_t n, int64_t k, int64_t mr, int64_t nr,
+    int64_t replicas, int64_t reductionReplicas) {
   if (width <= 0 || (width & (width - 1)) || grain <= 0 || m <= 0 || n <= 0 ||
       k <= 0 || mr <= 0 || nr <= 0)
     return error() << "CPU binding requires positive extents and power-of-two issue width";
+  if (replicas <= 0 || replicas > 16 || (replicas & (replicas - 1)))
+    return error() << "CPU vector realization supports power-of-two register replicas up to sixteen";
+  if (reductionReplicas <= 0 || reductionReplicas > 16 ||
+      (reductionReplicas & (reductionReplicas - 1)))
+    return error() << "CPU reduction realization supports power-of-two register replicas up to sixteen";
   return success();
 }
 

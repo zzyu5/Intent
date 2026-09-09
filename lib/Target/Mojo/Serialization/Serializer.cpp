@@ -24,6 +24,14 @@ std::string join(ArrayRef<std::string> values, llvm::StringRef separator = ", ")
   return llvm::join(values, separator);
 }
 
+std::string floatingLiteral(const llvm::APFloat &value) {
+  if (!value.isFinite())
+    return std::string("(Float32(") + (value.isNaN() ? "0" : value.isNegative() ? "-1" : "1") + ") / Float32(0))";
+  llvm::SmallString<32> literal;
+  value.toString(literal);
+  return "Float32(" + literal.str().str() + ")";
+}
+
 llvm::json::Array json(DenseI64ArrayAttr attribute) {
   llvm::json::Array result;
   for (int64_t value : attribute.asArrayRef()) result.push_back(value);
@@ -250,15 +258,11 @@ private:
         else
           assign(op.getResult(), std::string(op.getResult().getType().isIndex() ? "Int(" : "Int64(") + std::to_string(integer.getInt()) + ")", true);
       } else if (auto floating = dyn_cast<FloatAttr>(op.getValue())) {
-        llvm::SmallString<32> literal;
-        floating.getValue().toString(literal);
-        assign(op.getResult(), "Float32(" + literal.str().str() + ")", true);
+        assign(op.getResult(), floatingLiteral(floating.getValue()), true);
       } else if (auto dense = dyn_cast<DenseFPElementsAttr>(op.getValue())) {
         SmallVector<std::string> elements;
         for (llvm::APFloat value : dense.getValues<llvm::APFloat>()) {
-          llvm::SmallString<32> literal;
-          value.toString(literal);
-          elements.push_back("Float32(" + literal.str().str() + ")");
+          elements.push_back(floatingLiteral(value));
           if (dense.isSplat()) break;
         }
         assign(op.getResult(), "SIMD[DType.float32, " +
@@ -327,6 +331,13 @@ private:
       assign(op.getResult(), "fma(" + name(op.getA()) + ", " + name(op.getB()) + ", " + name(op.getC()) + ")");
     } else if (auto op = dyn_cast<math::SqrtOp>(operation)) {
       assign(op.getResult(), "sqrt(" + name(op.getOperand()) + ")");
+    } else if (auto op = dyn_cast<math::ExpOp>(operation)) {
+      assign(op.getResult(), "exp(" + name(op.getOperand()) + ")");
+    } else if (auto op = dyn_cast<arith::MaxNumFOp>(operation)) {
+      auto vector = dyn_cast<VectorType>(op.getResult().getType());
+      std::string type = vector ? "SIMD[DType.float32, " + std::to_string(vector.getNumElements()) + "]" : "Float32";
+      assign(op.getResult(), "llvm_intrinsic[\"llvm.maximumnum\", " + type + "](" +
+          name(op.getLhs()) + ", " + name(op.getRhs()) + ")");
     } else if (auto op = dyn_cast<arith::NegFOp>(operation)) {
       assign(op.getResult(), "-" + name(op.getOperand()));
     } else if (isa<arith::IndexCastOp>(operation)) {
@@ -366,9 +377,9 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string
   llvm::raw_string_ostream output(source);
   output << "from std.ffi import external_call\n"
             "from std.memory import Layout, alloc, dealloc, unsafe_stack_allocation\n"
-            "from std.sys import prefetch\n"
+            "from std.sys import prefetch, llvm_intrinsic\n"
             "from std.sys.intrinsics import PrefetchOptions\n"
-            "from std.math import fma, sqrt, min, max\n"
+            "from std.math import fma, sqrt, exp, min, max\n"
             "from std.runtime import initialize_runtime\n"
             "from max.algorithm import parallelize\n\n";
   Serializer serializer(output);
@@ -391,7 +402,8 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string
         {"entry", function.getName().str()},
         {"values", llvm::json::Array{configuration.getVectorWidth(), configuration.getTaskGrain(),
             configuration.getTileM(), configuration.getTileN(), configuration.getTileK(),
-            configuration.getMicroM(), configuration.getMicroN()}}});
+            configuration.getMicroM(), configuration.getMicroN(),
+            configuration.getRegisterReplicas(), configuration.getReductionReplicas()}}});
   }
   interface["candidates"] = std::move(candidates);
   llvm::raw_string_ostream metadataOutput(metadata);

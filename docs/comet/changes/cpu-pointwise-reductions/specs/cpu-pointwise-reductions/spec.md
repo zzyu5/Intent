@@ -63,7 +63,7 @@ LayerNorm wrapper 可以提供输入、贡献和输出的高层 closure，但任
 
 本轮仅新增表中两条固定性能项到现有 Mojo registry，使用 examples/repro/v2 的生产 runner，不扩大输入矩阵。Softmax 同次容差为 atol=1e-6、rtol=1e-5；LayerNorm 为 atol=5e-5、rtol=1e-5。失败据实修复，不放大容差。
 
-拟定完成门槛为两项分别 generated/source≤1.05，不用平均数或自比改善代替。该门槛需本次 Shape 明确确认。实际时间、ratio 与必要 source/失败说明写入 report/baselinev2/mojo-x86.csv，不记录候选耗时和历史审计；旧三项未受影响不重跑，受影响只复用对应性能入口。
+完成门槛为两项分别 generated/source≤1.05，不用平均数或自比改善代替。该门槛已由用户在本次 Shape 明确确认。实际时间、ratio 与必要 source/失败说明写入 report/baselinev2/mojo-x86.csv，不记录候选耗时和历史审计；旧三项未受影响不重跑，受影响只复用对应性能入口。
 
 ## 7. 非目标与完成边界
 

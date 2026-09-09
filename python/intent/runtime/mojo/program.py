@@ -81,12 +81,15 @@ class NativeProgram:
     def _view(self, parameter, tensor, dimensions: dict[int, int]) -> None:
         if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu" or tensor.dtype != torch.float32:
             raise ValueError(f"{parameter['name']} must be a CPU f32 tensor")
-        if not tensor.is_contiguous():
-            raise NotImplementedError("Mojo CPU non-contiguous views are not implemented")
         if tensor.numel() == 0:
             raise NotImplementedError("Mojo CPU empty-storage pointer ABI is not implemented")
         if tensor.ndim != len(parameter["shape"]):
             raise ValueError(f"{parameter['name']} has an incompatible rank")
+        expected_stride = 1
+        for extent, stride in zip(reversed(tensor.shape), reversed(tensor.stride())):
+            if stride != expected_stride:
+                raise NotImplementedError("Mojo CPU views require canonical contiguous strides")
+            expected_stride *= extent
         for axis, (static, identity) in enumerate(zip(parameter["shape"], parameter["dimensions"])):
             extent = tensor.shape[axis]
             if static >= 0 and static != extent:

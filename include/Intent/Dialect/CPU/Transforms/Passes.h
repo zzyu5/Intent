@@ -17,6 +17,8 @@ struct Configuration {
   int64_t tileK;
   int64_t microM;
   int64_t microN;
+  int64_t registerReplicas;
+  int64_t reductionReplicas;
 };
 
 mlir::LogicalResult fuseStructuredComputations(mlir::func::FuncOp function);
@@ -25,9 +27,11 @@ mlir::LogicalResult materializeStructuredComputations(mlir::func::FuncOp functio
 mlir::LogicalResult materializeRegisterContractions(mlir::func::FuncOp function);
 mlir::LogicalResult materializeCPUProgram(mlir::ModuleOp module);
 mlir::LogicalResult fuseIntermediateBuffers(mlir::func::FuncOp function);
+mlir::LogicalResult fuseReductionTraversals(mlir::func::FuncOp function);
 mlir::LogicalResult blockContractions(mlir::func::FuncOp function,
                                     const Configuration &configuration);
-mlir::LogicalResult vectorizeLoops(mlir::func::FuncOp function, int64_t width);
+mlir::LogicalResult vectorizeLoops(mlir::func::FuncOp function, int64_t width,
+                                   int64_t replicas, int64_t reductionReplicas);
 mlir::LogicalResult partitionTasks(mlir::func::FuncOp function, int64_t grain);
 mlir::LogicalResult isolateTasks(mlir::func::FuncOp function);
 mlir::LogicalResult materializeTaskLoops(mlir::func::FuncOp function);

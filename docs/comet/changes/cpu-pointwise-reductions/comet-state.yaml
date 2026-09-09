@@ -1,28 +1,59 @@
 schema: comet.native.v4
 name: cpu-pointwise-reductions
 language: zh-CN
-phase: shape
+phase: build
 status: active
-state_version: 1
+state_version: 2
 brief: brief.md
-spec_changes: []
+spec_changes:
+  - capability: cpu-pointwise-reductions
+    operation: create
+    source: specs/cpu-pointwise-reductions/spec.md
 workspace:
   isolation: current
   change_branch: main
   target_branch: main
   finish: null
 loop:
-  stage: shape
+  stage: building
   goal_cycle: 1
-  iteration: 0
+  iteration: 1
   attempt: 0
   retry_epoch: 0
   failed_iteration_count: 0
   no_progress_count: 0
   execution_failure_count: 0
   previous_unresolved_ids: []
-  next_action: confirm-shape
-acceptance: []
+  next_action: submit-builder-candidate
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1：现有 f32 stable_softmax 与 weighted_layer_norm 不改作者算法即可通过共同 CPU
+      construction/transformations；前者的 stride/noalias
+      约束被保留并兑现，exp、maximum_num、additive/maximumNumber reduce 及其
+      producer/consumer 形成可验证的当前程序，而不是 emitter 中新增整算子逻辑。
+    result: pending
+    reason: null
+  - id: A2
+    source: brief.md
+    text: A2：两条程序均得到正式 Mojo native callable artifact，以及从同一结构化 CPU 程序生成的合法 Canonical
+      Weft IR/任务接口；后者明确不可调用、不声称设备运行，未支持的语义不静默近似或 fallback。
+    result: pending
+    reason: null
+  - id: A3
+    source: brief.md
+    text: A3：两条固定 CPU benchmark 都取得 native 算子执行时间、真实同算法 MAX 库级 source 时间与
+      G/S，并在同次运行通过预定容差；两项分别 G/S≤1.05，结果进入既有 CSV。LayerNorm 基线明确是同矩统计的 MAX rowwise
+      路径，不用 Welford 数字冒充。
+    result: pending
+    reason: null
+  - id: A4
+    source: brief.md
+    text: A4：两条程序实际消费共同 CPU 的任务/向量、归约实现、融合和中间值生命周期机制；有限 tuning
+      只实例化合法物理参数并实测选优，产物/winner 继续复用。完整 lowering 不依赖 kernel 名、固定 case shape
+      或未实现的参数，相关新旧 executable path 不并存。
+    result: pending
+    reason: null
 builder_handoff: null
 blockers: []
 verification: null

@@ -43,7 +43,7 @@ FailureOr<llvm::json::Object> readProfiles(Location loc, llvm::StringRef path) {
     SmallVector<SmallVector<int64_t>> seen;
     for (const llvm::json::Value &entry : *rows) {
       auto row = entry.getAsArray();
-      if (!row || row->size() != (item.first == "vector" ? 2u : 7u)) {
+      if (!row || row->size() != (item.first == "vector" ? 4u : 7u)) {
         emitError(loc, "CPU tuning row has the wrong column count");
         return failure();
       }
@@ -98,7 +98,7 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
   SmallVector<SmallVector<int64_t>> seen;
   for (const llvm::json::Value &value : *rows) {
     auto row = value.getAsArray();
-    if (!row || row->size() != (contraction ? 7u : 2u))
+    if (!row || row->size() != (contraction ? 7u : 4u))
       return module.emitError("CPU candidate has an invalid column count");
     SmallVector<int64_t> columns;
     for (const llvm::json::Value &item : *row) {
@@ -111,7 +111,7 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
     if ((columns[0] & (columns[0] - 1)) != 0)
       return module.emitError("CPU vector width must be a power of two");
     if (columns[0] > vectorBits / 32) continue;
-    Configuration config{columns[0], columns[1], 1, 1, 1, 1, 1};
+    Configuration config{columns[0], columns[1], 1, 1, 1, 1, 1, 1, 1};
     if (contraction) {
       config.tileM = columns[2]; config.tileN = columns[3];
       config.tileK = columns[4]; config.microM = columns[5];
@@ -121,6 +121,12 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
           config.microM * config.microN > 24 ||
           config.tileK > capabilities.getPrivateBytes() / 4 / config.vectorWidth / config.microN)
         return module.emitError("CPU tile candidate violates vector, microtile or stack-size constraints");
+    } else {
+      config.registerReplicas = columns[2];
+      config.reductionReplicas = columns[3];
+      for (int64_t replicas : {config.registerReplicas, config.reductionReplicas})
+        if (replicas > 16 || (replicas & (replicas - 1)))
+          return module.emitError("CPU vector candidate requires power-of-two register replicas up to sixteen");
     }
     configurations.push_back(config);
   }
@@ -136,7 +142,8 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
     Builder b(module.getContext());
     function->setAttr("intent_cpu.configuration", ConfigurationAttr::get(module.getContext(),
         config.vectorWidth, config.taskGrain, config.tileM, config.tileN,
-        config.tileK, config.microM, config.microN));
+        config.tileK, config.microM, config.microN, config.registerReplicas,
+        config.reductionReplicas));
     functions.push_back(function);
   }
   original.erase();
@@ -157,8 +164,15 @@ LogicalResult materializeCPUProgram(ModuleOp module) {
     if (!configuration) return function.emitError("CPU materialization requires a complete binding");
     if (failed(materializeRegisterContractions(function)) ||
         failed(materializeStructuredComputations(function)) ||
-        failed(fuseIntermediateBuffers(function)) ||
-        failed(vectorizeLoops(function, configuration.getVectorWidth()))) return failure();
+        failed(fuseIntermediateBuffers(function))) return failure();
+  }
+  if (failed(normalize(module))) return failure();
+  for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+    auto configuration = function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration");
+    if (failed(fuseReductionTraversals(function)) ||
+        failed(vectorizeLoops(function, configuration.getVectorWidth(),
+                              configuration.getRegisterReplicas(),
+                              configuration.getReductionReplicas()))) return failure();
   }
   if (failed(normalize(module))) return failure();
   return verifyCPUProgram(module, true);

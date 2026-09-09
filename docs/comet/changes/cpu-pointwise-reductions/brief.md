@@ -26,7 +26,7 @@
 
 - A1：现有 f32 stable_softmax 与 weighted_layer_norm 不改作者算法即可通过共同 CPU construction/transformations；前者的 stride/noalias 约束被保留并兑现，exp、maximum_num、additive/maximumNumber reduce 及其 producer/consumer 形成可验证的当前程序，而不是 emitter 中新增整算子逻辑。
 - A2：两条程序均得到正式 Mojo native callable artifact，以及从同一结构化 CPU 程序生成的合法 Canonical Weft IR/任务接口；后者明确不可调用、不声称设备运行，未支持的语义不静默近似或 fallback。
-- A3：两条固定 CPU benchmark 都取得 native 算子执行时间、真实同算法 MAX 库级 source 时间与 G/S，并在同次运行通过预定容差；本轮拟定两项分别 G/S≤1.05，结果进入既有 CSV。LayerNorm 基线明确是同矩统计的 MAX rowwise 路径，不用 Welford 数字冒充。
+- A3：两条固定 CPU benchmark 都取得 native 算子执行时间、真实同算法 MAX 库级 source 时间与 G/S，并在同次运行通过预定容差；两项分别 G/S≤1.05，结果进入既有 CSV。LayerNorm 基线明确是同矩统计的 MAX rowwise 路径，不用 Welford 数字冒充。
 - A4：两条程序实际消费共同 CPU 的任务/向量、归约实现、融合和中间值生命周期机制；有限 tuning 只实例化合法物理参数并实测选优，产物/winner 继续复用。完整 lowering 不依赖 kernel 名、固定 case shape 或未实现的参数，相关新旧 executable path 不并存。
 
 # 约束与不变量
@@ -41,6 +41,7 @@
 # 决策
 
 - 已接受并归档 cpu-mojo-execution；本轮选择继续丰满 CPU 普通数学与归约能力，使用单个 Native change、main/current。
+- 用户已确认本 Shape 的目标、两项固定性能输入与门槛、同算法 MAX 基线、Mojo native/Weft generation-only 边界及非目标，授权进入 Build。
 - 不拆 Supervisor：共同 reduction/current-program analysis、Mojo/Weft lowering 与两项性能反复涉及同一核心；按算子或 provider 拆分没有独立交付价值。
 - 先做 CPU 的依据：KIRToCPU.cpp:185–215 尚无 exp/maximum_num；:43 对 stride annotation 一概拒绝。stable_softmax.py:25–26 正好携带兼容的行主序约束。Weft Legalize.cpp:387–410 只接受 add，但外部 Weft functions-and-operations.md:81、109 已定义匹配的 maximumNumber/max reduce；缺口在 Intent lowering，不需扩展 Weft。
 - 参考差异：Triton ReduceOpToLLVM.cpp:230–317 消费 combine 与当前 layout 形成局部树，并更新 layout；Intent 应同样从 typed combine/axes 建立实际 IR，但保持自己的 logical-order 语义，不复制 GPU register/warp ownership。
@@ -49,7 +50,7 @@
 
 # 待解决问题
 
-- [blocking] CONFIRM: 本轮按上述 CPU 普通数学/归约范围推进；保留两条作者算法，Mojo native + Weft generation-only，MAX Softmax/同矩统计 MAX rowwise 基线；两条固定八核 f32 benchmark 分别达到 G/S≤1.05，并采用 Spec 中预定容差；不改外部 Weft、不做 Ascend/其他 dtype/layout/scan，也不额外测试。
+- [blocking] 为继续收束 A3，是否允许调整“保留作者代码”的范围：将共享 stable_softmax 作者末尾显式写成 numerator * (1.0 / denominator)，与 MAX 的倒数后乘法表达一致？保持 stable Softmax 算法、原容差和 G/S≤1.05，不放松 compiler 的普通浮点语义。该共享作者表达会影响各 target 的同源生成，不创建 CPU 特供版本；用户确认前保持当前作者代码与 Spec 不变。
 
 # 验证预期
 

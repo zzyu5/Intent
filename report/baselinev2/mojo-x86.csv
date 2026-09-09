@@ -1,4 +1,6 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
-batched_row_affine,17x257x4093-f32-8cores,2.186536,2.766295,0.790421,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU elementwise。
-weighted_rms_norm,8192x4096-f32-8cores,7.853616,8.864000,0.886013,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX RMSNorm；双方归约括号与中间数学实现可能不同。
-dense_gemm_f32,M1024-N1024-K1024-f32-8cores,2.248740,2.151451,1.045221,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU matmul，未缓存输入 packing。
+batched_row_affine,17x257x4093-f32-8cores,1.539003,1.495355,1.029189,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU elementwise。
+weighted_rms_norm,8192x4096-f32-8cores,4.755950,4.274722,1.112575,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX RMSNorm；双方归约括号与中间数学实现可能不同。
+dense_gemm_f32,M1024-N1024-K1024-f32-8cores,2.188533,2.137148,1.024044,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU matmul，未缓存输入 packing。
+stable_softmax,8192x8192-f32-8cores,9.784723,7.932341,1.233523,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU Softmax；双方 max/exp/sum 后归一化，中间归约和除法实现可能不同。
+weighted_layer_norm,8192x4096-f32-8cores,3.893471,3.728957,1.044118,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 使用 Modular/MAX rowwise 同矩统计算法 E[x²]-E[x]²；不是现成 Welford layer_norm。

@@ -108,6 +108,13 @@ bool fuse(memref::AllocOp allocation) {
     } else return false;
   }
   if (!store || loads.empty()) return false;
+  llvm::SmallPtrSet<Operation *, 4> consumers;
+  for (memref::LoadOp load : loads) {
+    Operation *stage = allocation->getBlock()->findAncestorOpInBlock(*load);
+    if (!stage) return false;
+    consumers.insert(stage);
+  }
+  if (consumers.size() != 1) return false;
   SmallVector<scf::ForOp> loops;
   Operation *root = store;
   while (auto parent = dyn_cast<scf::ForOp>(root->getParentOp())) {

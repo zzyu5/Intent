@@ -55,11 +55,11 @@ LogicalResult ReduceOp::verify() {
     if (operation.getNumRegions() || !isMemoryEffectFree(&operation))
       return emitOpError("combine must be a closed pure scalar expression");
   if (getOrder().getAdjacentReassociation()) {
-    auto add = yield.getValue().getDefiningOp<arith::AddFOp>();
+    Operation *combine = yield.getValue().getDefiningOp();
     Value accumulator = block.getArgument(0);
-    if (!add || !accumulator.hasOneUse() ||
-        (add.getLhs() != accumulator && add.getRhs() != accumulator))
-      return emitOpError("adjacent reassociation requires one floating-add accumulator consumer");
+    if (!combine || !isa<arith::AddFOp, arith::MaxNumFOp>(combine) || !accumulator.hasOneUse() ||
+        !llvm::is_contained(combine->getOperands(), accumulator))
+      return emitOpError("adjacent reassociation requires one floating-add/maximumNumber accumulator consumer");
   }
   return success();
 }
