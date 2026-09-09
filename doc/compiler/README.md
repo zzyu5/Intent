@@ -12,11 +12,12 @@ canonical Intent KIR
     │    ├─ Triton legalization / serialization
     │    ├─ cuTile legalization / serialization
     │    └─ 被真实差异逼出的 provider-local extensions
-    ├─ CPU executable program
-    └─ RVV executable program
+    └─ CPU executable program
+         ├─ Mojo legalization / serialization
+         └─ Weft legalization / Canonical Weft IR
 ```
 
-GPU、CPU 与 RVV 复用 KIR semantics 及 shape、index、effect、dependence、reuse 等分析方法，不共享一套改名后的 GPU physical topology。
+GPU 与 CPU 复用 KIR semantics 及 shape、index、effect、dependence、reuse 等分析方法，不共享一套改名后的 GPU physical topology。Mojo 与 Weft 消费共同 CPU 程序；RVV 是 CPU 硬件能力，不是另一套 Intent execution family。
 
 ## 2. GPU 编译边界
 
@@ -48,7 +49,7 @@ Intent KIR
 
 ## 4. 术语
 
-- **execution family**：GPU、CPU、RVV 等具有不同执行模型、因而从 KIR 分叉建立不同 physical program 的大类；
+- **execution family**：GPU、CPU 等具有不同执行模型、因而从 KIR 分叉建立不同 physical program 的大类；同一 CPU family 可以由不同 provider 实现 scalar、vector 与可选 matrix 计算；
 - **physical program structure**：program-space mapping、loop nesting、control、value/access graph、structured-operation skeleton 与 resource ownership 的总和；
 - **execution group**：同一个 physical kernel body 内共同拥有一组 connected computations/effects 的内部 dispatch region；它不是第二个 kernel、artifact 或 launch；
 - **logical ownership extent**：一个 physical program instance 负责的 logical instances 集合或连续范围；
@@ -60,15 +61,17 @@ Intent KIR
 
 Triton、cuTile、TileLang是source providers；NVIDIA/AMD及SM/gfx版本是hardware targets。两者是正交维度。
 
+CPU 同样区分 Mojo/Weft provider 与 x86/RISC-V hardware。具体向量宽度、AMX/IME 等矩阵能力参与合法化，不成为作者引擎分工；共同 CPU 程序与下层机器表示的边界见 CPU 规格。
+
 Provider surface若只是API spelling不同，直接从共同GPU IR确定性序列化。只有共同IR无法无损表达、且需要多个passes或独立legality的真实target-local structure，才增加extension operations。Extension扩展同一当前program，不复制一份完整leaf program。
 
 SM90、SM100、SM120或不同gfx版本不建立独立IR。Physical module携带target capability；passes、verifiers与lowering patterns按feature predicates形成不同program。作者KIR不包含device/provider分支。
 
 ## 6. 唯一 executable authority
 
-KIR在physical construction期间保持immutable。Conversion产生独立GPU program后，后续passes只改当前GPU IR；provider lowering和serializer不得回到KIR、shape metadata或role名称重建ownership、range、access、validity、workspace或control。
+KIR在physical construction期间保持immutable。Conversion产生所选family的独立physical program后，后续passes只改当前IR；provider lowering和serializer不得回到KIR、shape metadata或role名称重建ownership、range、access、validity、workspace或control。
 
-KIR origin只用于语义保持验证、诊断和追踪。GPU program本身必须能够独立verify与serialize；执行不依赖旁边的KIR clone或decision records。
+KIR origin只用于语义保持验证、诊断和追踪。Physical program本身必须能够独立verify与serialize；执行不依赖旁边的KIR clone或decision records。
 
 ## 7. 规格组成
 
@@ -77,4 +80,4 @@ KIR origin只用于语义保持验证、诊断和追踪。GPU program本身必�
 - [`passes-and-analyses.md`](passes-and-analyses.md)：analysis、transformation、verification与semantic-preservation；
 - [`physical-parameters.md`](physical-parameters.md)：compile-time physical parameters、candidate legality与下层tuning；
 - [`target-lowering.md`](target-lowering.md)：provider extensions、architecture features、serialization与外部compiler边界。
-- [`cpu-program-ir.md`](cpu-program-ir.md)：CPU executable program、memory/vector/task transformations 与 Mojo native provider 边界。
+- [`cpu-program-ir.md`](cpu-program-ir.md)：共同 CPU executable program、scalar/vector/matrix 表示、typed analyses/passes 与 Mojo/Weft provider 边界。
