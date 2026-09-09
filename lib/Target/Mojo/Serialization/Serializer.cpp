@@ -207,7 +207,7 @@ private:
       } else return op.emitError("Mojo runtime call has no declared C ABI spelling");
     } else if (auto op = dyn_cast<arith::ConstantOp>(operation)) {
       if (auto integer = dyn_cast<IntegerAttr>(op.getValue())) {
-        assign(op.getResult(), "Int(" + std::to_string(integer.getInt()) + ")");
+        assign(op.getResult(), std::string(op.getResult().getType().isIndex() ? "Int(" : "Int64(") + std::to_string(integer.getInt()) + ")");
       } else if (auto floating = dyn_cast<FloatAttr>(op.getValue())) {
         llvm::SmallString<32> literal;
         floating.getValue().toString(literal);
@@ -281,7 +281,7 @@ private:
     } else if (auto op = dyn_cast<arith::NegFOp>(operation)) {
       assign(op.getResult(), "-" + name(op.getOperand()));
     } else if (isa<arith::IndexCastOp>(operation)) {
-      assign(operation->getResult(0), "Int(" + name(operation->getOperand(0)) + ")");
+      assign(operation->getResult(0), std::string(operation->getResult(0).getType().isIndex() ? "Int(" : "Int64(") + name(operation->getOperand(0)) + ")");
     } else {
       std::string token;
       if (isa<arith::AddFOp, arith::AddIOp>(operation)) token = "+";

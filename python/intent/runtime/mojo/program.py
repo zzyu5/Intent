@@ -133,10 +133,13 @@ class NativeProgram:
                     raise ValueError("CPU invocation violates an author allocation-alias constraint")
         native: list[object] = []
         key: list[object] = []
+        allocation_groups: dict[int, int] = {}
         for parameter, value in zip(self.parameters, all_arguments):
             if parameter["kind"] == "view":
                 native.extend([value.data_ptr(), *value.shape, *value.stride()])
-                key.append((tuple(value.shape), tuple(value.stride()), value.storage_offset(), value.dtype))
+                allocation = value.untyped_storage().data_ptr()
+                group = allocation_groups.setdefault(allocation, len(allocation_groups))
+                key.append((tuple(value.shape), tuple(value.stride()), value.storage_offset(), value.dtype, group))
             else:
                 native.append(value)
                 key.append(parameter["dtype"])

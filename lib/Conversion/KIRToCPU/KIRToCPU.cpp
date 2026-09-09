@@ -380,6 +380,8 @@ private:
       values.map(op.getBody().front().getArgument(0), parallel.getInductionVars()[0]);
       return lowerBlock(op.getBody().front());
     } else if (auto op = dyn_cast<ViewLoadOp>(operation)) {
+      if (cast<ViewType>(op.getInputs()[0].getType()).getAccess() != 0)
+        return op.emitError("CPU construction does not implement reads from writable external views");
       if (op.getValidOperandIndex() || op.getFillOperandIndex())
         return op.emitError("CPU predicated source loads are not implemented");
       auto value = indexed(operation);

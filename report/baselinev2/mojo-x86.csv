@@ -1,4 +1,4 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
-batched_row_affine,17x257x4093-f32-8cores,1.868713,1.837744,1.016852,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。
-weighted_rms_norm,8192x4096-f32-8cores,5.408725,3.795511,1.425032,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 使用 SIMD lane-striped sum，generated 保留 source-order-preserving reduction。
-dense_gemm_f32,M1024-N1024-K1024-f32-8cores,5.258041,4.341999,1.210972,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。
+batched_row_affine,17x257x4093-f32-8cores,2.411815,1.882051,1.281483,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。
+weighted_rms_norm,8192x4096-f32-8cores,5.367275,3.346709,1.603747,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 使用 SIMD lane-striped sum，generated 保留 source-order-preserving reduction。
+dense_gemm_f32,M1024-N1024-K1024-f32-8cores,5.441901,4.330263,1.256714,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。
