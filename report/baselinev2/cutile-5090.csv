@@ -5,7 +5,7 @@ dense_gemm,M4096-N14336-K4096-fp16,2.074160,2.097128,0.989048,pass,
 moe_expert_projection,T4096-E8-top2-4096x14336-bf16,4.468736,6.147072,0.726970,pass,同算法；source 使用预计算 block ownership
 layer_norm,8192x4096-bf16,0.086488,0.264288,0.327249,pass,同算法；source 额外写 Mean/Rstd
 silu_and_mul,4096x28672-to14336-bf16,0.227024,0.245008,0.926598,pass,同算法；source 使用 FTZ 与近似除法
-attention_backward,B2-QH8-KVH2-S1024-D64-fp16-causal,0.123144,0.178792,0.688756,pass,同算法；中间精度和舍入不同
+attention_backward,B2-QH8-KVH2-S1024-D64-fp16-causal,0.184096,0.175896,1.046618,pass,同算法；中间精度和舍入不同
 dense_attention_forward,B2-QH32-KVH8-S4096-D128-bf16-causal,1.334816,1.285352,1.038483,pass,同算法；source 使用 FTZ 与近似除法
 grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,0.185856,0.187912,0.989059,pass,同算法；source 使用 FTZ 与近似除法
 swiglu,8192x14336-bf16,0.451352,0.464688,0.971301,pass,同算法；source 使用 FTZ 与近似除法

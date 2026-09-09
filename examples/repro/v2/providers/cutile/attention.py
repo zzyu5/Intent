@@ -468,8 +468,8 @@ def attention_backward(context: Context) -> PreparedComparison:
             Tolerance(atol=2.5e-1),
             Tolerance(atol=1.25e-1),
         ),
-        cuda_graph=False,
-        # Both paths launch three kernels; only the source requests exp2 FTZ.
+        # Capture all three dependent kernels on both sides; exclude host gaps.
+        cuda_graph=True,
         note="同算法；中间精度和舍入不同",
     )
 
