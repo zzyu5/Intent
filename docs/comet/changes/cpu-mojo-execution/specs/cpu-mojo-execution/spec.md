@@ -90,7 +90,7 @@ Native ABI 保留 pointer、extents、strides、offset、scalars、access/alias 
 
 只生成入口返回 CPU/Weft 编译产物与明确接口，不返回伪造的可调用 native artifact。生成过程中的 verifier 属于生产编译；不调用 RISC-V native discovery、JIT、SSH、设备执行或性能 runner。Weft canonical numeric/effect schema 无法保持的组合明确诊断，不通过更换算法或绕过 Weft 发 intrinsic C 解决。
 
-Weft compiler 是外部依赖，接收其正式 Canonical Kernel IR；`TianchenRV` 仓库保持只读。它的 layout、RVV/IME selection、physical packing、schedule/resource 和 intrinsic emission 不迁入 Intent。生成成功不等于下层编译、运行、数值或性能已通过。
+Weft compiler 是外部依赖，接收其正式 Canonical Kernel IR。用户仅授权在 `TianchenRV` 补齐 `rsqrt` 的正式数值定义、frontend/canonical verifier 及对应既有 lowering；其余内容保持只读，保护其他人的并行工作与未提交修改。该扩展在 Weft 仓库单独提交，commit 说明具体范围与实际验证边界。它的 layout、RVV/IME selection、physical packing、schedule/resource 和 intrinsic emission 不迁入 Intent。生成成功不等于下层编译、运行、数值或性能已通过。
 
 ## 7. Specialization、缓存与有效 tuning
 
@@ -132,7 +132,7 @@ GEMM、weighted RMSNorm 使用成熟 Modular/MAX CPU 库实现作为主要 sourc
 
 对照先定位当前 CPU 程序的 partition、blocking、ownership、访问/遍历、reuse/materialization，再判断 provider form、serializer、外部 compiler 和 measurement。对照必须给出 Intent 与 Triton/TileLang 的实际 file:line、差异及后果，并结合 Modular CPU 实现与 Weft 的 typed fragment/转换机制。不得仅凭 IR/dialect/pass 名称断言成熟或越界。
 
-迁移后同一 CPU 编译请求只有一条 executable path；旧的任意属性协议、过早 scalarization 或 serializer 重建路径在对应新能力替换时删除，不留双主干和兼容开关。不改无关 GPU 算法、用户文件或 Weft 实现。
+迁移后同一 CPU 编译请求只有一条 executable path；旧的任意属性协议、过早 scalarization 或 serializer 重建路径在对应新能力替换时删除，不留双主干和兼容开关。不改无关 GPU 算法、用户文件或授权 `rsqrt` 范围以外的 Weft 实现。
 
 本 change 使用 `main/current`。此前合并只保留实现起点，不自动通过新验收。正式执行标准为 brief 的 A1–A5；模型设计、provider 生成、native 执行、容差通过和成熟库性能达标分别报告，不互相代替。
 

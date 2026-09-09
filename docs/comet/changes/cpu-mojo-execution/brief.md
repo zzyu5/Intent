@@ -17,7 +17,7 @@ CPU 不是仅含 AVX SIMD 的专用路径。共同模型须保持 scalar、shape
 
 ## 参考范围
 
-`../TianchenRV`、`../ref/modular`、`../ref/triton`、`../ref/tilelang` 及官方 TileLang Ascend 源码是只读的实现/架构参考，不是要求移植全部语言、算子或硬件能力的需求来源。Weft 的既有未提交内容不在本 change 修改范围内。
+`../TianchenRV`、`../ref/modular`、`../ref/triton`、`../ref/tilelang` 及官方 TileLang Ascend 源码是实现/架构参考，不是要求移植全部语言、算子或硬件能力的需求来源。除用户明确授权在 TianchenRV 补齐 `rsqrt` 的正式数值定义、frontend/canonical verifier 及对应既有 lowering 外，参考仓库保持只读。Weft 的并行工作和既有未提交内容不在本 change 修改范围内；该原语扩展在 Weft 仓库单独提交，并在 commit 中说明范围与实际验证边界。
 
 # 非目标
 
@@ -49,16 +49,17 @@ CPU 不是仅含 AVX SIMD 的专用路径。共同模型须保持 scalar、shape
 
 - 用户确认将已有 CPU 分支合入 `main` 并清除 worktree，并明确允许仅修正当前 change 的 workspace 绑定为 `main/current`。本次合并不代表验收或归档。
 - 用户确认统一 CPU 模型、Mojo/Weft provider 分层、vector 与可选 matrix 的物理表达；不引入 Ascend 式作者引擎分工。原先独立 RVV family、仅 AVX 的公共模型、以手写 SIMD 为主要性能标尺的设定由本 Shape 替代。
-- Weft 本轮最多到生成端；不改 Weft 仓库、不接 RISC-V 调用环境、不用 f32 三例声称 AMX/IME 已支持。
+- Weft 本轮最多到生成端；仅允许在其仓库补齐 `rsqrt` 原语，不接 RISC-V 调用环境、不用 f32 三例声称 AMX/IME 已支持。
 - 采用单个普通 Native change：公共 CPU IR、两种 provider 输入边界与 Mojo 性能共同约束同一核心，拆成独立 emitter/算子子 change 没有独立验收价值。
 - 当前 `lib/Transforms/CPU/Passes.cpp:78` 的 verifier 和 `:113` 的 AVX 限制，缺少 GPU `include/Intent/Dialect/GPU/IR/GPUAttrs.td:119`、`include/Intent/Dialect/GPU/Analysis/PhysicalProgram.h:302` 对应的 typed/current-program 边界；本 change 修的是该职责缺口，不以 pass 名称或文件数量判断成熟度。
 - `../ref/triton/lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp:684` 使用 type conversion、legality 和真实 patterns；`../TianchenRV/lib/Target/RISCVCompiler.cpp:45` 以实际 passes 形成 layout、memory、schedule、leaf 和资源。这些机制用于约束本轮 CPU 分层，不复制其 ISA 实现。
 - `../ref/modular/max/kernels/src/linalg/utils.mojo:493` 与 `:583` 展示 cache 与多列 microkernel 结构；`../TianchenRV/lib/Target/IME/FragmentMaterialization.cpp:97` 展示 typed pack/MMA/unpack。优化和表示转换在 IR 中形成，serializer 不首次创造它们。
 - 用户已确认三项 generated/MAX 执行时间比均不超过 1.05，并要求按完整新 Shape 继续 Build；共同 CPU dialect/analyses/passes、Mojo native 与成熟库基线、Weft 仅生成的边界保持不变。
+- 用户允许补齐 Weft 缺失的 `rsqrt`，要求保护该仓库其他人的并行工作并单独提交、清楚说明。此有限授权解除外部修改阻塞，不改变 A1–A5 或性能门槛，也不授权新增设备 runtime。
 
 # 待解决问题
 
-- [blocking] Q1：A3 要求三类任务内计算均能生成合法 Canonical Weft IR，但当前外部 Weft 不支持 RMSNorm 所需的 `rsqrt`：`../TianchenRV/lib/Dialect/Kernel/IR/KernelDialect.cpp:1305` 的 unary verifier 只接受 `neg/abs/exp`，`:844` 的标准 operation 白名单也不接受 `math.rsqrt`。是否允许对 TianchenRV 做最小的 `rsqrt` primitive 扩展（canonical 数值 schema/verifier 及对应现有 lowering），其余内容保持只读，仍不接 RISC-V 设备 runtime？这是新增的外部修改授权问题；确认前保留 A3 与三项 G/S ≤ 1.05 门槛，不将 unsupported 诊断算作 A3 通过，也不替换 RMSNorm 算法。
+无。Weft `rsqrt` 所需的有限外部修改及独立提交已获得用户授权。
 
 # 验证预期
 
