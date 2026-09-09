@@ -100,6 +100,42 @@ bool reductionUsesOwnershipExtent(Operation *origin, Value operand,
   });
 }
 
+void fuseContractionAdds(func::FuncOp kernel) {
+  SmallVector<BinaryOp> additions;
+  kernel.walk([&](BinaryOp binary) {
+    if (binary.getOperatorKind() == BinaryOperator::Add)
+      additions.push_back(binary);
+  });
+  for (BinaryOp add : additions) {
+    for (unsigned operand : {1u, 0u}) {
+      Value value =
+          stripAdditiveProjection(add->getOperand(operand), /*singleUse=*/true);
+      auto contract = value ? value.getDefiningOp<ContractOp>() : ContractOp();
+      if (!contract || contract->getBlock() != add->getBlock() ||
+          !isLiteralZeroProjection(contract.getAccumulator()))
+        continue;
+      OpBuilder builder(add);
+      FailureOr<Value> carry = projectPhysicalValueToSchema(
+          builder, add.getLoc(), add->getOperand(1 - operand),
+          contract.getResult().getType());
+      if (failed(carry))
+        continue;
+      // Clone only the pure contraction at its consumer. Inputs already
+      // dominate this point; memory reads and other effects are not moved.
+      auto fused = cast<ContractOp>(builder.clone(*contract));
+      fused.getAccumulatorMutable().assign(*carry);
+      FailureOr<Value> result = projectPhysicalValueToSchema(
+          builder, add.getLoc(), fused.getResult(), add.getResult().getType());
+      if (failed(result))
+        continue;
+      add.getResult().replaceAllUsesWith(*result);
+      add.erase();
+      break;
+    }
+  }
+  eraseDeadPhysicalValues(kernel);
+}
+
 bool hasFragmentSchema(ContractOp contract) {
   return isa<FragmentType>(contract.getLhs().getType()) &&
          isa<FragmentType>(contract.getRhs().getType()) &&
@@ -4524,6 +4560,7 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
   if (failed(physicalKernel))
     return failure();
   func::FuncOp kernel = *physicalKernel;
+  fuseContractionAdds(kernel);
   SmallVector<ContractOp> contracts;
   kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
   for (ContractOp contract : contracts)

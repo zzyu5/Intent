@@ -60,7 +60,9 @@ Compiler 可以作出合法性与收益选择，但必须落实为当前 IR 中�
 
 ## 作者表达与数值边界
 
-作者 kernel 可以显式改善不合理表达和中间精度，不冻结已有作者写法，也不让 serializer 隐式改变精度、dtype、NaN 或累加语义。本 change 增加已获用户确认的逐操作近似数学与 FTZ：`I.fdiv`、`I.exp2` 与 `I.tanh` 的显式近似选择，以及近似除法/exp2 的 FTZ 选择；支持范围与闭合数值契约由 `doc/dsl/` 定义。默认语义、外部 ABI、原容差和性能门槛不变，除此之外的语言变化仍需单独澄清。
+作者 kernel 可以显式改善不合理表达和中间精度，不冻结已有作者写法，也不让 serializer 隐式改变精度、dtype、NaN 或累加语义。本 change 增加已获用户确认的逐操作近似数学与 FTZ：`I.fdiv`、`I.exp2` 与 `I.tanh` 的显式近似选择，以及近似除法/exp2 的 FTZ 选择；支持范围与闭合数值契约由 `doc/dsl/` 定义。外部 ABI、原容差和性能门槛不变，除以下已确认的局部融合外，其它语言变化仍需单独澄清。
+
+普通零初值 contraction 的结果只有一个同 dtype 加法 consumer 时，允许将另一 operand `C`接入contraction accumulator，实现 `contract(A, B) + C` 或 `C + contract(A, B)` 的局部融合。融合后的舍入、特殊值与空 reduction 规则由 DSL 数值规格定义；shared pass从current def-use、零初值、结果坐标关系与dominance判定并直接改写IR，所有provider消费同一结果。不得跨数值cast或多个consumer，不把该许可扩展为非零初值的重复重结合、全局fast-math、输入精度下降、FTZ或kernel-name/tuning策略。
 
 近似与 FTZ 必须成为 canonical unary/binary operation 的 typed attributes，并随 construction、cloning、blocking、summary 改写、bufferization 和 provider lowering 保留；它们不进入 shape、kernel ABI、候选配置或 kernel-name policy。不同数值属性的运算不能被当作同一纯值合并；近似选择不授权改变相邻普通运算、累加 dtype、数据依赖或 source order。Provider 对不支持的 dtype/primitive 组合明确拒绝，不能静默改回另一种数值语义。
 

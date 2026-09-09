@@ -102,6 +102,7 @@ Blocking pass不得修改KIR logical subregions或作者可观察的page/window/
 - bufferization产生真实allocation/lifetime/read/write；
 - access realization产生coordinate/validity/fill/effect operands；
 - contract/reduce/scan/region-fold/region-scan realization产生真实fragments、loops、carry与accumulator graph；region summarizer中的contract保持显式，不能依赖attention-shaped algebraic recognition恢复；
+- ordinary contraction与其唯一同dtype加法consumer可按DSL的局部融合语义合流：从当前def-use、零初值、结果坐标对应关系与dominance证明合法性，把另一add operand直接接入physical accumulator；不能跨数值cast或在serializer中隐式补做；
 - boundary neutralization删除或简化实际validity/fill，不只删除padding record。
 
 ### 3.5 Predicate range narrowing 与 summary emptiness
@@ -141,6 +142,7 @@ Physical IR可以与KIR op graph不同，但变化必须属于KIR semantics允�
 - 合并pure producer与consumer；
 - rematerialize pure value；
 - 对reduce/scan/contract采用operation允许的reassociation；
+- 按DSL局部contraction-add规则合并零初值contraction与唯一同dtype加法consumer；
 - flatten/permutation paired contract axes；
 - 创建blocking loops与fragment accumulators；
 - 从coordinate predicate证明all-true/all-false/mixed ranges，删除identity-only physical traversal或冗余summary validity；

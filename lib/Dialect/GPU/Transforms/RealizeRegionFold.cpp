@@ -1026,45 +1026,6 @@ struct AdditiveRegionContract {
   BinaryOp merge;
 };
 
-Value stripAdditiveProjection(Value value, bool singleUse = false) {
-  auto elementType = [](Type type) {
-    auto fragment = dyn_cast<FragmentType>(type);
-    return fragment ? fragment.getElementType() : type;
-  };
-  while (value) {
-    if (singleUse && !value.hasOneUse())
-      return {};
-    Operation *operation = value.getDefiningOp();
-    if (!operation)
-      break;
-    if (auto cast = dyn_cast<CastOp>(operation)) {
-      if (elementType(cast.getValue().getType()) !=
-          elementType(cast.getResult().getType()))
-        break;
-    } else if (!isa<BroadcastOp, ReshapeOp, TransposeOp>(operation)) {
-      break;
-    }
-    value = operation->getOperand(0);
-  }
-  return value;
-}
-
-bool isLiteralZeroProjection(Value value) {
-  while (Operation *operation = value.getDefiningOp()) {
-    if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
-      if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
-        return integer.getValue().isZero();
-      if (auto floating = dyn_cast<FloatAttr>(constant.getValue()))
-        return floating.getValue().isZero();
-      return false;
-    }
-    if (!isa<SplatOp, BroadcastOp, ReshapeOp, TransposeOp, CastOp>(operation))
-      return false;
-    value = operation->getOperand(0);
-  }
-  return false;
-}
-
 SmallVector<AdditiveRegionContract>
 additiveRegionContracts(RegionFoldOp fold, ValueRange identities) {
   SmallVector<AdditiveRegionContract> result;

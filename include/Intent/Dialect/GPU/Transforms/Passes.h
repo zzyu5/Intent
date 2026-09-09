@@ -76,6 +76,8 @@ materializeBroadcastToFragment(mlir::OpBuilder &builder,
 mlir::FailureOr<mlir::Value>
 materializeZeroFragment(mlir::OpBuilder &builder, mlir::Location location,
                         FragmentType target);
+mlir::Value stripAdditiveProjection(mlir::Value value, bool singleUse = false);
+bool isLiteralZeroProjection(mlir::Value value);
 mlir::FailureOr<mlir::Value> materializeReplayedValue(
     mlir::OpBuilder &builder, mlir::Location location, mlir::Value value,
     PhysicalSourceAxis source, PhysicalExprAttr blockedExtent,

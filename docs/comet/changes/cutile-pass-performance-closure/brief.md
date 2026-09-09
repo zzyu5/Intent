@@ -10,11 +10,12 @@
 - Shared GPU passes、provider-local legalization 和下层 compiler 各自承担已有规格定义的职责；不把线程布局、机器流水与寄存器分配全部搬进 shared，也不把 shared 执行事实交给 serializer 补猜。
 - 保留参数化 IR、有限合法候选、provider JIT、实测选优与缓存复用。Tuning 参数可以驱动已有 passes 改变具体布局、分块和流水，但候选数量不能替代缺失的 transformation。
 - 允许改善作者中间精度和低效表达，并增加作者逐操作显式选择的近似数学与 FTZ；语义进入 canonical KIR 和 shared GPU IR，Triton/cuTile/TileLang 一致兑现。默认数学语义、外部 ABI、既定算法比较边界和原容差不变。
+- 允许零初值、单消费者、同 dtype 的普通 `contract + C` 局部融合；由 shared pass 改写累加器 def-use，不启用全局 fast-math，不跨数值 cast，不放宽原容差。
 - 复用现有 production runner 和两张项目 CSV，修正将 NVFP4 GPU 执行时间写成“一次 kernel launch”的模糊注释。计时是算子 GPU 执行延迟；CUDA Graph 是执行组织方式，CUDA event 是设备计时工具，不把 CPU 提交耗时、JIT 或候选搜索耗时冒充算子性能。
 
 # Non-goals
 
-- 不新增后端、硬件或输入矩阵；除已确认的逐操作近似数学/FTZ 外，不新增语言语义。不复制另一套机器 compiler，不构建任意 IR 图结构的笛卡尔积搜索。
+- 不新增后端、硬件或输入矩阵；除已确认的逐操作近似数学/FTZ 和局部 contraction-add 融合外，不新增语言语义。不复制另一套机器 compiler，不构建任意 IR 图结构的笛卡尔积搜索。
 - 不要求 Triton/TileLang 全表达到 1.05，不新建完整双 target 对照矩阵作为当前实现前置条件；受共同改动影响的已有消费者仍需保持正确 lowering。
 - 不为 H100 增加其缺失的 E8M0 scaled MMA 或原生 FP4 source 能力；两个既定限制保持可见，不将其他失败新增为豁免。
 - 不通过删除条目、减小输入、放宽容差、弱化 source、变更测量范围或平均比值达标。原容差之外的真实错误必须修复。
@@ -42,6 +43,7 @@
 - 采用一个普通 Native change，不拆 Supervisor：各问题共同影响 shared/provider 编译链与同一性能集合，无法把结果型验收清楚拆成互不重叠的独立交付。主代理负责调查和实现，不把频繁子代理派发作为推进前提。
 - 用户已明确确认完整 Shape 并要求开始 Build：72 个可比较设备条目全部 <= 1.05、两个既定 H100 硬件限制、通用 pass 化改进与 A1—A3 保持不变。旧 change 的未完成验收不因本次确认而变成通过。
 - 用户在显式近似数学与 FTZ 的范围确认问题后要求继续：允许补齐该能力，默认语义、原容差和全表 1.05 目标不变。该选择不授权普通浮点表达式跨操作重结合，也不把数值策略作为 kernel-name 路由或 tuning 参数。
+- 用户随后明确同意零初值、单消费者、同 dtype 的普通 `contract + C` 融合范围，参照 Triton 的通用 contraction/add 合并机制推进。该许可限于局部矩阵累加语义，不开启全局 fast-math、不放宽容差，也不预设仅靠该融合就能使全部条目达标；A1—A3 保持不变。
 
 # Open questions
 

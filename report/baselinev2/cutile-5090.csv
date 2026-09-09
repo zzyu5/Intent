@@ -10,7 +10,7 @@ dense_attention_forward,B2-QH32-KVH8-S4096-D128-bf16-causal,1.334816,1.285352,1.
 grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,0.185856,0.187912,0.989059,pass,同算法；source 使用 FTZ 与近似除法
 swiglu,8192x14336-bf16,0.451352,0.464688,0.971301,pass,同算法；source 使用 FTZ 与近似除法
 splitk_attention_reduce,B8-H32-S8192-splits16-D128,0.004280,0.005936,0.721024,pass,
-mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,0.958240,0.944704,1.014328,pass,同算法；source 使用 FTZ 与近似除法
+mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,0.931136,0.943384,0.987017,pass,同算法；source 使用 FTZ 与近似除法
 batched_gemm,B32-M512-N512-K1024-bf16,0.091904,0.091936,0.999652,pass,
 tilegym_dense_gemm,M8192-N11008-K4096-bf16,3.121920,3.171448,0.984383,pass,
 grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.650184,0.643184,1.010883,pass,同算法；source 使用 host group shapes

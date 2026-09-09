@@ -72,7 +72,7 @@ fixed-width integers使用二进制补码与modulo arithmetic：
 
 ## 5. Floating point、cast 与 bitcast
 
-普通floating operations遵循对应格式的IEEE-754值与round-to-nearest-even。除非作者使用structured operation或显式approximate math，compiler保持source expression的数据依赖与求值关系，不启用会改变结果集合的隐式fast-math。
+普通floating operations遵循对应格式的IEEE-754值与round-to-nearest-even。除本节规定的局部contraction-add融合、作者使用structured operation或显式approximate math外，compiler保持source expression的数据依赖与求值关系，不启用会改变结果集合的隐式fast-math。
 
 ### 5.1 显式近似数学
 
@@ -106,6 +106,12 @@ fixed-width integers使用二进制补码与modulo arithmetic：
 
 - `f8e4m3fn`：1 sign bit、4 exponent bits、3 fraction bits、bias 7、支持subnormal、无infinity；`S.1111.111`是NaN，其余编码按finite E4M3FN解释，最大finite magnitude为448。普通cast使用round-to-nearest-even，有限输入超出可表示范围是非法输入；需要clamp时使用显式saturating conversion；
 - `f8e5m2`：1 sign bit、5 exponent bits、2 fraction bits、bias 15、支持subnormal；exponent全1且fraction为0表示infinity，fraction非零表示NaN。普通cast使用round-to-nearest-even，finite overflow产生对应infinity。
+
+### 5.3 局部 contraction-add 融合
+
+普通`contract`的零初值结果只有一个加法consumer，且另一operand `C`与contraction accumulator/result具有相同dtype和逐元素对应的结果关系时，`contract(A, B) + C`或`C + contract(A, B)`允许实现为以`C`为初值的contraction累加。该局部组合采用融合累加的舍入与特殊值语义，不承诺先独立舍入完整contraction再做add；空reduction的融合结果为`C`。Compiler必须保持lhs/rhs输入精度、paired axes、accumulator dtype与所有外部effects，不引入TF32、FTZ或其它近似选择。
+
+该许可不依赖target或kernel identity，不需要新的作者hint或tuning参数。它不覆盖跨数值cast、多个consumer、非零初值contraction的再次重结合，也不授权普通add/mul/FMA的全局fast-math。纯shape projection只有在逐元素对应关系保持不变时才能随融合改写。
 
 ## 6. Reduce 与 scan 数值语义
 
