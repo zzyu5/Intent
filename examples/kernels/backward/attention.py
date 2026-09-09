@@ -83,44 +83,40 @@ def attention_backward_dkdv(
 ):
     B, HQ, Q, D = q.shape
     _, HK, K, _ = k.shape
-    query_axis = I.domain(0, Q)
     key_axis = I.domain(0, K)
+    group_query_count = HEAD_GROUP * Q
+    group_queries = I.domain(0, group_query_count)
     for batch in I.parallel(I.domain(0, B)):
         for key_head in I.parallel(I.domain(0, HK)):
             key_block = k[batch, key_head, key_axis, :]
             value_block = v[batch, key_head, key_axis, :]
-            q_index = I.indices(query_axis)
+            members = I.indices(group_queries)
+            query_heads = key_head * HEAD_GROUP + members // Q
+            q_index = members % Q
+            query_block = q[batch, query_heads, q_index, :]
+            grad_output_block = grad_output[batch, query_heads, q_index, :]
+            query_lse = lse[batch, query_heads, q_index]
+            query_delta = delta[batch, query_heads, q_index]
             k_index = I.indices(key_axis)
-            grad_k_value = I.zeros((K, D), dtype=I.f32)
-            grad_v_value = I.zeros((K, D), dtype=I.f32)
-            for query_head_offset in range(HEAD_GROUP):
-                query_head = key_head * HEAD_GROUP + query_head_offset
-                query_block = q[batch, query_head, query_axis, :]
-                grad_output_block = grad_output[
-                    batch, query_head, query_axis, :
-                ]
-                summary = I.region_fold(
-                    source=(
-                        query_block, grad_output_block,
-                        lse[batch, query_head, query_axis],
-                        delta[batch, query_head, query_axis], q_index,
-                    ),
-                    axis=0,
-                    summarize=summarize_key_value_gradients,
-                    combine=merge_key_value_gradients,
-                    identity=I.record(
-                        grad_k=I.zeros((K, D), dtype=I.f32),
-                        grad_v=I.zeros((K, D), dtype=I.f32),
-                    ),
-                    operands=(key_block, value_block, k_index, scale, CAUSAL),
-                )
-                grad_k_value = grad_k_value + summary.grad_k
-                grad_v_value = grad_v_value + summary.grad_v
+            summary = I.region_fold(
+                source=(
+                    query_block, grad_output_block,
+                    query_lse, query_delta, q_index,
+                ),
+                axis=0,
+                summarize=summarize_key_value_gradients,
+                combine=merge_key_value_gradients,
+                identity=I.record(
+                    grad_k=I.zeros((K, D), dtype=I.f32),
+                    grad_v=I.zeros((K, D), dtype=I.f32),
+                ),
+                operands=(key_block, value_block, k_index, scale, CAUSAL),
+            )
             grad_k[batch, key_head, key_axis, :] = I.cast(
-                grad_k_value * scale, I.f16
+                summary.grad_k * scale, I.f16
             )
             grad_v[batch, key_head, key_axis, :] = I.cast(
-                grad_v_value, I.f16
+                summary.grad_v, I.f16
             )
 
 

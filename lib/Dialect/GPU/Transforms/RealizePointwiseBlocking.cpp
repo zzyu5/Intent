@@ -2493,8 +2493,15 @@ bool supportsStructuredFreeAxisValueGraph(WorksetCoordinateOp coordinate) {
   bool sawContract = sawNestedContract;
   bool sawOwnedStore = false;
   for (Operation *operation : operations) {
-    if (isa<RegionFoldOp>(operation))
+    if (auto fold = dyn_cast<RegionFoldOp>(operation)) {
+      // Another producer path may reach this fold after its first visit. Check
+      // the completed dependence set before committing any ownership rewrite.
+      SmallVector<bool> resultDependencies;
+      if (!analyzeStructuredRegionFold(fold, depends, resultDependencies,
+                                       sawContract))
+        return false;
       continue;
+    }
     if (auto contract = dyn_cast<ContractOp>(operation)) {
       bool lhs = depends(contract.getLhs());
       bool rhs = depends(contract.getRhs());
@@ -2663,8 +2670,10 @@ LogicalResult rankLiftPointwiseValueGraph(
       ValueRange inputs = fold.getInputs();
       if (inputs.size() != sourceCount + identityCount + captureCount ||
           llvm::any_of(inputs.take_front(sourceCount + identityCount),
-                       dependsOnLiftedAxis))
+                       dependsOnLiftedAxis)) {
+        fold.emitOpError("rank lifting requires independent sources and identities");
         return WalkResult::interrupt();
+      }
 
       Block &summarize = fold.getSummarize().front();
       bool dependentCapture = false;
@@ -2730,8 +2739,12 @@ LogicalResult rankLiftPointwiseValueGraph(
     if (auto contract = dyn_cast<ContractOp>(operation)) {
       bool lhs = dependsOnLiftedAxis(contract.getLhs());
       bool rhs = dependsOnLiftedAxis(contract.getRhs());
-      if (lhs == rhs || dependsOnLiftedAxis(contract.getAccumulator()))
+      if (lhs == rhs || dependsOnLiftedAxis(contract.getAccumulator())) {
+        contract.emitOpError("cannot rank-lift contraction operand relation")
+            << "; lhs=" << lhs << "; rhs=" << rhs
+            << "; accumulator=" << dependsOnLiftedAxis(contract.getAccumulator());
         return WalkResult::interrupt();
+      }
       OpBuilder builder(contract);
       if (lhs) {
         contract->setAttr(
@@ -2836,8 +2849,10 @@ LogicalResult rankLiftPointwiseValueGraph(
           "permutation",
           DenseI64ArrayAttr::get(kernel.getContext(), permutation));
     }
-    if (!isStructuredFreeAxisValueOp(operation))
+    if (!isStructuredFreeAxisValueOp(operation)) {
+      operation->emitOpError("has no rank-lifting rule for a structured free axis");
       return WalkResult::interrupt();
+    }
     if (auto splat = dyn_cast<SplatOp>(operation);
         splat && isa<FragmentType>(splat.getValue().getType()))
       rememberRankLiftedSplat(splat);

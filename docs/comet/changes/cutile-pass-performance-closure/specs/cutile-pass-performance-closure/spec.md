@@ -64,6 +64,8 @@ Compiler 可以作出合法性与收益选择，但必须落实为当前 IR 中�
 
 普通零初值 contraction 的结果只有一个同 dtype 加法 consumer 时，允许将另一 operand `C`接入contraction accumulator，实现 `contract(A, B) + C` 或 `C + contract(A, B)` 的局部融合。融合后的舍入、特殊值与空 reduction 规则由 DSL 数值规格定义；shared pass从current def-use、零初值、结果坐标关系与dominance判定并直接改写IR，所有provider消费同一结果。不得跨数值cast或多个consumer，不把该许可扩展为非零初值的重复重结合、全局fast-math、输入精度下降、FTZ或kernel-name/tuning策略。
 
+Attention backward 的作者归约可以把同组 query heads 的成员按 head-major/query-major 顺序纳入同一个声明式 reduction/region fold，不再强制逐 head 独立归约后做普通加法。该表达显式接受已有 structured reduction 允许的重结合，保留每个成员的 query coordinate、因果谓词、梯度公式与完整三-kernel callable；ABI、dtype、原容差和性能门槛不变。Compiler 只消费这个声明及 current physical facts，不能据 kernel identity 或该例子的授权改写其他普通 ordered loops。
+
 近似与 FTZ 必须成为 canonical unary/binary operation 的 typed attributes，并随 construction、cloning、blocking、summary 改写、bufferization 和 provider lowering 保留；它们不进入 shape、kernel ABI、候选配置或 kernel-name policy。不同数值属性的运算不能被当作同一纯值合并；近似选择不授权改变相邻普通运算、累加 dtype、数据依赖或 source order。Provider 对不支持的 dtype/primitive 组合明确拒绝，不能静默改回另一种数值语义。
 
 Generated/source 使用相同算法、固定 case 和外部 dtype。舍入位置、近似数学、FTZ 和中间精度的细微差异允许注明后比较，不要求逐操作或 bitwise 一致；原有 entry 容差不放宽，真实 NaN/Inf 或容差外错误必须修复。若确有算法变化，保留已有 Triton 使用或已对齐的算法；没有 Triton 使用的 cuTile 专用算法可向 baseline 对齐，但不得偷换完整 callable 的功能或计时范围。

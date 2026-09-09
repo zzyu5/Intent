@@ -11,6 +11,7 @@
 - 保留参数化 IR、有限合法候选、provider JIT、实测选优与缓存复用。Tuning 参数可以驱动已有 passes 改变具体布局、分块和流水，但候选数量不能替代缺失的 transformation。
 - 允许改善作者中间精度和低效表达，并增加作者逐操作显式选择的近似数学与 FTZ；语义进入 canonical KIR 和 shared GPU IR，Triton/cuTile/TileLang 一致兑现。默认数学语义、外部 ABI、既定算法比较边界和原容差不变。
 - 允许零初值、单消费者、同 dtype 的普通 `contract + C` 局部融合；由 shared pass 改写累加器 def-use，不启用全局 fast-math，不跨数值 cast，不放宽原容差。
+- 允许将 attention backward 作者表达改成跨同组 query heads 的声明式归约，保持 head-major/query-major 成员顺序，仅解除逐 head 独立归约的分组限制；不改变算法、ABI、dtype、kernel 数量或原容差，不扩展普通浮点运算的全局重结合权限。
 - 复用现有 production runner 和两张项目 CSV，修正将 NVFP4 GPU 执行时间写成“一次 kernel launch”的模糊注释。计时是算子 GPU 执行延迟；CUDA Graph 是执行组织方式，CUDA event 是设备计时工具，不把 CPU 提交耗时、JIT 或候选搜索耗时冒充算子性能。
 
 # Non-goals
@@ -44,6 +45,7 @@
 - 用户已明确确认完整 Shape 并要求开始 Build：72 个可比较设备条目全部 <= 1.05、两个既定 H100 硬件限制、通用 pass 化改进与 A1—A3 保持不变。旧 change 的未完成验收不因本次确认而变成通过。
 - 用户在显式近似数学与 FTZ 的范围确认问题后要求继续：允许补齐该能力，默认语义、原容差和全表 1.05 目标不变。该选择不授权普通浮点表达式跨操作重结合，也不把数值策略作为 kernel-name 路由或 tuning 参数。
 - 用户随后明确同意零初值、单消费者、同 dtype 的普通 `contract + C` 融合范围，参照 Triton 的通用 contraction/add 合并机制推进。该许可限于局部矩阵累加语义，不开启全局 fast-math、不放宽容差，也不预设仅靠该融合就能使全部条目达标；A1—A3 保持不变。
+- 用户明确同意修改 backward 作者的跨 head 归约表达：使用已有声明式归约语义允许连续累加，避免作者强制保留每个 head 的独立矩阵和；保持逻辑成员顺序、完整三-kernel callable、外部 dtype 与原容差。该授权不允许 compiler 擅自重结合其他普通 ordered loops；A1—A3 保持不变。
 
 # Open questions
 
