@@ -142,7 +142,11 @@ void vectorize(scf::ForOp original, int64_t width) {
   if (!reductionInput && stores.empty()) return;
   OpBuilder b(original);
   Location loc = original.getLoc();
-  Value step = index(b, loc, width);
+  // One local tree spans adjacent register replicas. Keeping the leaves in
+  // coordinate order permits reassociation without striped accumulators, and
+  // amortizes the narrow horizontal stages across four hardware vectors.
+  int64_t logicalWidth = reductionInput ? 4 * width : width;
+  Value step = index(b, loc, logicalWidth);
   Value length = b.create<arith::SubIOp>(loc, original.getUpperBound(), original.getLowerBound());
   Value full = add(b, loc, original.getLowerBound(),
       multiply(b, loc, b.create<arith::DivSIOp>(loc, length, step), step));
@@ -150,10 +154,10 @@ void vectorize(scf::ForOp original, int64_t width) {
   {
     OpBuilder::InsertionGuard guard(b);
     b.setInsertionPointToStart(vectorLoop.getBody());
-    VectorBody body(original, b, vectorLoop.getInductionVar(), width);
+    VectorBody body(original, b, vectorLoop.getInductionVar(), logicalWidth);
     if (reductionInput) {
       Value value = body.vector(reductionInput);
-      for (int64_t count = width; count > 1; count /= 2) {
+      for (int64_t count = logicalWidth; count > 1; count /= 2) {
         SmallVector<int64_t> even, odd;
         for (int64_t lane = 0; lane < count; lane += 2) {
           even.push_back(lane);

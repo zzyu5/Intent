@@ -5,8 +5,9 @@ from pathlib import Path
 from intent.api import KernelDefinition
 from intent.frontend import lower_to_mlir
 from intent.runtime import CompiledArtifact
-from intent.targets.base import Target
+from intent.targets.base import Target, SourceTarget, ResolvedSourceTarget, ResolvedTarget
 
+from .artifact import GeneratedProgram
 from .toolchain import CompilationStageError
 from .toolchain import run_compiler
 from .toolchain import run_shared_compiler
@@ -20,6 +21,29 @@ def compile(
     constexprs: dict[str, object] | None = None,
     tuning_config: str | Path | None = None,
 ) -> CompiledArtifact:
+    kernel_mlir, resolved = _inputs(definition, target, constexprs)
+    if not isinstance(resolved, ResolvedTarget):
+        raise NotImplementedError("This target only generates source; use intent.generate, not intent.compile")
+    program = _generate_source(kernel_mlir, resolved, compiler, tuning_config)
+    try:
+        return resolved.materialize(program.source, program.ir, definition.__name__, program.metadata)
+    except Exception as error:
+        raise CompilationStageError("generated_source_materialization", str(error)) from error
+
+
+def generate(
+    definition: KernelDefinition[object, object],
+    *,
+    target: SourceTarget,
+    compiler: str | Path,
+    constexprs: dict[str, object] | None = None,
+    tuning_config: str | Path | None = None,
+) -> GeneratedProgram:
+    kernel_mlir, resolved = _inputs(definition, target, constexprs)
+    return _generate_source(kernel_mlir, resolved, compiler, tuning_config)
+
+
+def _inputs(definition, target, constexprs) -> tuple[str, ResolvedSourceTarget]:
     try:
         kernel_mlir = lower_to_mlir(definition, constexprs=constexprs)
     except Exception as error:
@@ -28,6 +52,10 @@ def compile(
         resolved = target.resolve()
     except Exception as error:
         raise CompilationStageError("target_resolution", str(error)) from error
+    return kernel_mlir, resolved
+
+
+def _generate_source(kernel_mlir, resolved, compiler, tuning_config) -> GeneratedProgram:
     source, realized_mlir, metadata = run_compiler(
         compiler,
         kernel_mlir,
@@ -37,12 +65,7 @@ def compile(
         ),
         resolved.compiler_role,
     )
-    try:
-        return resolved.materialize(source, realized_mlir, definition.__name__, metadata)
-    except Exception as error:
-        raise CompilationStageError(
-            "generated_source_materialization", str(error)
-        ) from error
+    return GeneratedProgram(source, realized_mlir, metadata)
 
 
 def compile_shared_gpu(

@@ -41,4 +41,9 @@ target_link_libraries(intent-compile PRIVATE
   MLIRSupport
 )
 
+if(TARGET MLIRIntentWeftTransforms)
+  target_link_libraries(intent-compile PRIVATE MLIRIntentWeftTransforms MLIRIntentWeftSerialization)
+  target_compile_definitions(intent-compile PRIVATE INTENT_HAS_WEFT_CANONICAL=1)
+endif()
+
 mlir_check_all_link_libraries(intent-compile)

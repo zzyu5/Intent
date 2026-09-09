@@ -17,6 +17,13 @@ struct AllocationFacts {
   bool stack;
 };
 
+struct MemoryAccess {
+  mlir::Operation *operation;
+  mlir::Value memory;
+  bool read;
+  bool write;
+};
+
 // A query object belongs to the current IR snapshot; recreate after a rewrite.
 class PhysicalProgramAnalysis {
 public:
@@ -27,6 +34,7 @@ public:
   bool mayReadAt(mlir::Value memory, mlir::Operation *from,
                  mlir::Operation *to);
   llvm::SmallVector<AllocationFacts> allocations();
+  llvm::SmallVector<MemoryAccess> accesses(mlir::Operation *scope);
   mlir::LogicalResult verify(bool realized);
 
 private:

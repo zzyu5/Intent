@@ -2,6 +2,7 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -26,7 +27,7 @@ bool isMatrixContraction(linalg::GenericOp operation) {
           utils::IteratorType::reduction}) return false;
   Block &body = operation.getRegion().front();
   auto fma = body.getTerminator()->getOperand(0).getDefiningOp<math::FmaOp>();
-  return fma && fma.getA() == body.getArgument(0) &&
+  return fma && llvm::hasSingleElement(body.without_terminator()) && fma.getA() == body.getArgument(0) &&
       fma.getB() == body.getArgument(1) && fma.getC() == body.getArgument(2);
 }
 
@@ -34,6 +35,11 @@ Value PhysicalProgramAnalysis::storageRoot(Value memory) {
   while (true) {
     if (auto view = memory.getDefiningOp<memref::SubViewOp>()) memory = view.getSource();
     else if (auto cast = memory.getDefiningOp<memref::CastOp>()) memory = cast.getSource();
+    else if (auto argument = dyn_cast<BlockArgument>(memory)) {
+      auto tasks = dyn_cast<TasksOp>(argument.getOwner()->getParentOp());
+      if (!tasks || argument.getArgNumber() == 0) return memory;
+      memory = tasks.getCaptures()[argument.getArgNumber() - 1];
+    }
     else return memory;
   }
 }
@@ -70,6 +76,30 @@ bool PhysicalProgramAnalysis::mayReadAt(Value memory, Operation *from, Operation
     }
   }
   return true;
+}
+
+SmallVector<MemoryAccess> PhysicalProgramAnalysis::accesses(Operation *scope) {
+  SmallVector<MemoryAccess> result;
+  scope->walk([&](Operation *operation) {
+    auto add = [&](Value memory, bool read, bool write) {
+      if (isa<MemRefType>(memory.getType()))
+        result.push_back({operation, memory, read, write});
+    };
+    if (auto generic = dyn_cast<linalg::LinalgOp>(operation)) {
+      for (OpOperand *input : generic.getDpsInputOperands())
+        if (generic.payloadUsesValueFromOperand(input)) add(input->get(), true, false);
+      for (OpOperand &output : generic.getDpsInitsMutable())
+        add(output.get(), generic.payloadUsesValueFromOperand(&output), true);
+    } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
+      for (Value input : reduce.getInputs()) add(input, true, false);
+    } else if (auto copy = dyn_cast<memref::CopyOp>(operation)) {
+      add(copy.getSource(), true, false); add(copy.getTarget(), false, true);
+    } else if (auto load = dyn_cast<memref::LoadOp>(operation)) add(load.getMemref(), true, false);
+    else if (auto load = dyn_cast<vector::LoadOp>(operation)) add(load.getBase(), true, false);
+    else if (auto store = dyn_cast<memref::StoreOp>(operation)) add(store.getMemref(), false, true);
+    else if (auto store = dyn_cast<vector::StoreOp>(operation)) add(store.getBase(), false, true);
+  });
+  return result;
 }
 
 SmallVector<AllocationFacts> PhysicalProgramAnalysis::allocations() {
@@ -144,17 +174,17 @@ LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
     }
   }
   bool invalid = false;
+  for (MemoryAccess access : accesses(function)) {
+    auto view = externalView(access.memory);
+    if (access.write && view && view.getAccess() != 1) {
+      access.operation->emitError("CPU write contradicts its input-only ABI");
+      invalid = true;
+    }
+  }
   function.walk([&](Operation *operation) {
     if (realized && (isa<ReduceOp>(operation) || operation->getName().getDialectNamespace() == "linalg")) {
       operation->emitError("CPU structured operation has not been materialized for the provider");
       invalid = true;
-    }
-    if (auto store = dyn_cast<memref::StoreOp>(operation)) {
-      auto view = externalView(store.getMemref());
-      if (view && view.getAccess() != 1) {
-        store.emitError("CPU store contradicts its input-only ABI");
-        invalid = true;
-      }
     }
   });
   return failure(invalid);

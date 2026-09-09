@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ctypes
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -11,6 +12,7 @@ import tempfile
 class NativeLibrary:
     directory: tempfile.TemporaryDirectory
     library: ctypes.CDLL
+    identity: tuple[object, ...]
 
 
 _libraries: dict[tuple[object, ...], NativeLibrary] = {}
@@ -55,7 +57,8 @@ def benchmark_exports(metadata: dict[str, object]) -> str:
 def compile_library(source: str, metadata: dict[str, object], target) -> NativeLibrary:
     complete_source = source + benchmark_exports(metadata)
     fp_source = Path(__file__).with_name("fp_environment.c")
-    key = (complete_source, target.executable, target.native_options, fp_source.read_text(encoding="utf-8"))
+    key = (complete_source, json.dumps(metadata, sort_keys=True), target.executable,
+           target.native_options, fp_source.read_text(encoding="utf-8"))
     if key in _libraries:
         return _libraries[key]
     directory = tempfile.TemporaryDirectory(prefix="intentdsl-mojo-artifact-")
@@ -75,6 +78,6 @@ def compile_library(source: str, metadata: dict[str, object], target) -> NativeL
     )
     if completed.returncode:
         raise RuntimeError(f"Mojo native compilation failed:\n{completed.stderr}{completed.stdout}")
-    result = NativeLibrary(directory, ctypes.CDLL(str(library_path)))
+    result = NativeLibrary(directory, ctypes.CDLL(str(library_path)), key)
     _libraries[key] = result
     return result

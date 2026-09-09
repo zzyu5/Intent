@@ -2,6 +2,8 @@
 #include "Utilities.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Transforms/RegionUtils.h"
+#include "llvm/ADT/SetVector.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 using namespace mlir;
@@ -85,6 +87,58 @@ LogicalResult partitionTasks(func::FuncOp function, int64_t grain) {
   });
   for (scf::ParallelOp root : roots)
     if (failed(partition(root, grain))) return failure();
+  return success();
+}
+
+LogicalResult isolateTasks(func::FuncOp function) {
+  SmallVector<scf::ParallelOp> operations;
+  function.walk([&](scf::ParallelOp operation) { operations.push_back(operation); });
+  for (auto parallel : operations) {
+    if (parallel.getNumLoops() != 1 || parallel.getNumResults() ||
+        !matchPattern(parallel.getLowerBound()[0], m_Zero()) ||
+        !matchPattern(parallel.getStep()[0], m_One()))
+      return parallel.emitError("task isolation requires the partitioned one-dimensional workset");
+    llvm::SetVector<Value> used;
+    getUsedValuesDefinedAbove(parallel.getRegion(), used);
+    SmallVector<Value> captures;
+    for (Value value : used)
+      if (!value.getDefiningOp<arith::ConstantOp>()) captures.push_back(value);
+    OpBuilder b(parallel);
+    auto tasks = b.create<TasksOp>(parallel.getLoc(), parallel.getUpperBound()[0], captures);
+    Block *body = new Block;
+    tasks.getBody().push_back(body);
+    body->addArgument(b.getIndexType(), parallel.getLoc());
+    IRMapping mapping;
+    mapping.map(parallel.getInductionVars()[0], body->getArgument(0));
+    for (Value capture : captures)
+      mapping.map(capture, body->addArgument(capture.getType(), capture.getLoc()));
+    b.setInsertionPointToStart(body);
+    for (Value value : used)
+      if (auto constant = value.getDefiningOp<arith::ConstantOp>()) b.clone(*constant, mapping);
+    for (Operation &operation : parallel.getBody()->without_terminator()) b.clone(operation, mapping);
+    b.create<TaskYieldOp>(parallel.getLoc());
+    parallel.erase();
+  }
+  return success();
+}
+
+LogicalResult materializeTaskLoops(func::FuncOp function) {
+  SmallVector<TasksOp> operations;
+  function.walk([&](TasksOp tasks) { operations.push_back(tasks); });
+  for (auto tasks : operations) {
+    OpBuilder b(tasks);
+    Location loc = tasks.getLoc();
+    Value zero = index(b, loc, 0), one = index(b, loc, 1);
+    auto parallel = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{tasks.getCount()}, ValueRange{one});
+    b.setInsertionPointToStart(parallel.getBody());
+    Block &body = tasks.getBody().front();
+    IRMapping mapping;
+    mapping.map(body.getArgument(0), parallel.getInductionVars()[0]);
+    for (auto [argument, capture] : llvm::zip(body.getArguments().drop_front(), tasks.getCaptures()))
+      mapping.map(argument, capture);
+    for (Operation &operation : body.without_terminator()) b.clone(operation, mapping);
+    tasks.erase();
+  }
   return success();
 }
 

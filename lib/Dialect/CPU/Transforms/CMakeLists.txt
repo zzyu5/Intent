@@ -17,6 +17,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   MLIRMathDialect
   MLIRMemRefDialect
   MLIRSCFDialect
+  MLIRSCFUtils
   MLIRVectorDialect
   MLIRIR
   MLIRPass

@@ -9,6 +9,10 @@ import torch
 from .compilation import compile_library
 
 
+_winners: dict[tuple[object, ...], dict[tuple[object, ...], int]] = {}
+_candidate_timings: dict[tuple[object, ...], dict[tuple[object, ...], tuple[float, ...]]] = {}
+
+
 def _timing_samples(measure, arguments: tuple[object, ...], *, samples: int) -> float:
     first = measure(*arguments, 1)
     if first <= 0:
@@ -71,8 +75,8 @@ class NativeProgram:
             measure.argtypes = [*argument_types, ctypes.c_int64]
             measure.restype = ctypes.c_double
             self.measurements.append(measure)
-        self.winners: dict[tuple[object, ...], int] = {}
-        self.timings: dict[tuple[object, ...], tuple[float, ...]] = {}
+        self.winners = _winners.setdefault(self.compilation.identity, {})
+        self.timings = _candidate_timings.setdefault(self.compilation.identity, {})
 
     def _view(self, parameter, tensor, dimensions: dict[int, int]) -> None:
         if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu" or tensor.dtype != torch.float32:

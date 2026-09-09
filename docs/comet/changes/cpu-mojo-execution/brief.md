@@ -17,7 +17,7 @@ CPU 不是仅含 AVX SIMD 的专用路径。共同模型须保持 scalar、shape
 
 ## 参考范围
 
-`../TianchenRV`、`../ref/modular`、`../ref/triton`、`../ref/tilelang` 及官方 TileLang Ascend 源码是实现/架构参考，不是要求移植全部语言、算子或硬件能力的需求来源。除用户明确授权在 TianchenRV 补齐 `rsqrt` 的正式数值定义、frontend/canonical verifier 及对应既有 lowering 外，参考仓库保持只读。Weft 的并行工作和既有未提交内容不在本 change 修改范围内；该原语扩展在 Weft 仓库单独提交，并在 commit 中说明范围与实际验证边界。
+`../TianchenRV`、`../ref/modular`、`../ref/triton`、`../ref/tilelang` 及官方 TileLang Ascend 源码是实现/架构参考，不是要求移植全部语言、算子或硬件能力的需求来源。用户明确授权在 TianchenRV 补齐 `rsqrt`，以及保持 logical axes 和访问语义的动态矩形 View 接口、frontend/canonical verifier 与对应正式 lowering；其余参考内容保持只读。Weft 的并行工作和既有未提交内容不在本 change 修改范围内；扩展在 Weft 仓库单独提交，并在 commit 中说明范围与实际验证边界。
 
 # 非目标
 
@@ -49,17 +49,18 @@ CPU 不是仅含 AVX SIMD 的专用路径。共同模型须保持 scalar、shape
 
 - 用户确认将已有 CPU 分支合入 `main` 并清除 worktree，并明确允许仅修正当前 change 的 workspace 绑定为 `main/current`。本次合并不代表验收或归档。
 - 用户确认统一 CPU 模型、Mojo/Weft provider 分层、vector 与可选 matrix 的物理表达；不引入 Ascend 式作者引擎分工。原先独立 RVV family、仅 AVX 的公共模型、以手写 SIMD 为主要性能标尺的设定由本 Shape 替代。
-- Weft 本轮最多到生成端；仅允许在其仓库补齐 `rsqrt` 原语，不接 RISC-V 调用环境、不用 f32 三例声称 AMX/IME 已支持。
+- Weft 本轮最多到生成端；允许在其仓库补齐 `rsqrt` 原语和动态矩形 View 接口及对应 lowering，不接 RISC-V 调用环境、不用 f32 三例声称 AMX/IME 已支持。
 - 采用单个普通 Native change：公共 CPU IR、两种 provider 输入边界与 Mojo 性能共同约束同一核心，拆成独立 emitter/算子子 change 没有独立验收价值。
 - 当前 `lib/Transforms/CPU/Passes.cpp:78` 的 verifier 和 `:113` 的 AVX 限制，缺少 GPU `include/Intent/Dialect/GPU/IR/GPUAttrs.td:119`、`include/Intent/Dialect/GPU/Analysis/PhysicalProgram.h:302` 对应的 typed/current-program 边界；本 change 修的是该职责缺口，不以 pass 名称或文件数量判断成熟度。
 - `../ref/triton/lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp:684` 使用 type conversion、legality 和真实 patterns；`../TianchenRV/lib/Target/RISCVCompiler.cpp:45` 以实际 passes 形成 layout、memory、schedule、leaf 和资源。这些机制用于约束本轮 CPU 分层，不复制其 ISA 实现。
 - `../ref/modular/max/kernels/src/linalg/utils.mojo:493` 与 `:583` 展示 cache 与多列 microkernel 结构；`../TianchenRV/lib/Target/IME/FragmentMaterialization.cpp:97` 展示 typed pack/MMA/unpack。优化和表示转换在 IR 中形成，serializer 不首次创造它们。
 - 用户已确认三项 generated/MAX 执行时间比均不超过 1.05，并要求按完整新 Shape 继续 Build；共同 CPU dialect/analyses/passes、Mojo native 与成熟库基线、Weft 仅生成的边界保持不变。
 - 用户允许补齐 Weft 缺失的 `rsqrt`，要求保护该仓库其他人的并行工作并单独提交、清楚说明。此有限授权解除外部修改阻塞，不改变 A1–A5 或性能门槛，也不授权新增设备 runtime。
+- 用户进一步确认补齐 Weft 动态矩形 View：SSA offset/extent 保留 axes、读写方向及 alias，由 canonical/physical schema 和 passes 承载，不引入 task/hart 根对象。保护并行工作、独立提交及 generation-only 边界不变。当前 change 完成后再调查下一轮 CPU 能力或 DSA/TileLang Ascend；本次不预先指定或启动另一条实现主线。
 
 # 待解决问题
 
-- [blocking] 是否将 Weft 的有限修改授权扩展到保持 logical axes 的动态矩形 View 接口及其正式 lowering？当前 CPU blocking 的输入/输出区域具有来自 task/K-loop 的 SSA offset、extent；Weft `KernelOps.td:237` 仅提供静态 `subview`，`KernelDialect.cpp:1170` 进一步限制其结果只能用于 commit。`slice` 的 scalar index 删除对应 axis，domain selector 则要求 Weft Level 产生的 Point，不能直接绑定外部 CPU task 坐标。原 `rsqrt` 授权没有覆盖该接口；不以全量 admit 后 gather、拆成多个叶函数或回到 KIR 重建遍历替代 A3。Weft 中其他并行工作继续保持只读，A1–A5 与性能门槛不变。
+无。动态矩形 View 的有限外部修改已获授权，A1–A5 与性能门槛不变。
 
 # 验证预期
 

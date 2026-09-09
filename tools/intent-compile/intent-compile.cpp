@@ -3,6 +3,10 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Target/Mojo/Serialization/Serializer.h"
 #include "Intent/Target/Mojo/Transforms/Passes.h"
+#ifdef INTENT_HAS_WEFT_CANONICAL
+#include "Intent/Target/Weft/Transforms/Passes.h"
+#include "Intent/Target/Weft/Serialization/Serializer.h"
+#endif
 #include "Intent/Dialect/GPU/IR/GPUDialect.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
@@ -35,7 +39,7 @@
 
 namespace {
 
-enum class TargetKind { Triton, CuTile, TileLang, Mojo };
+enum class TargetKind { Triton, CuTile, TileLang, Mojo, Weft };
 
 enum class ExitCode : int {
   Success = 0,
@@ -64,7 +68,8 @@ int main(int argc, char **argv) {
           clEnumValN(TargetKind::Triton, "triton", "Triton DSL"),
           clEnumValN(TargetKind::CuTile, "cutile", "cuTile DSL"),
           clEnumValN(TargetKind::TileLang, "tilelang", "TileLang DSL"),
-          clEnumValN(TargetKind::Mojo, "mojo", "Mojo CPU SIMD")));
+          clEnumValN(TargetKind::Mojo, "mojo", "Mojo CPU native"),
+          clEnumValN(TargetKind::Weft, "weft", "Canonical Weft generation only")));
 
   // Compile-call inputs are parsed but not interpreted before the shared
   // executable GPU Program exists.
@@ -96,7 +101,7 @@ int main(int argc, char **argv) {
   llvm::cl::opt<int64_t> cpuWorkers("cpu-workers", llvm::cl::init(0));
   llvm::cl::opt<bool> stopAfterShared(
       "stop-after-shared",
-      llvm::cl::desc("stop after the full shared GPU verifier"),
+      llvm::cl::desc("stop after the selected execution family's shared verifier"),
       llvm::cl::init(false));
   llvm::cl::ParseCommandLineOptions(argc, argv,
                                     "Intent canonical KIR compiler boundary\n");
@@ -131,11 +136,22 @@ int main(int argc, char **argv) {
   };
   std::string source;
   std::string metadata = "{}";
-  if (target == TargetKind::Mojo) {
-    if (stopAfterShared) {
-      llvm::errs() << "--stop-after-shared selects the GPU family, not CPU\n";
-      return exitCode(ExitCode::Invocation);
+  auto emitShared = [&]() {
+    if (irOutputFilename.empty()) {
+      llvm::errs() << "--ir-output is required with --stop-after-shared\n";
+      return exitCode(ExitCode::CompilerOutput);
     }
+    std::error_code error;
+    llvm::raw_fd_ostream irOutput(irOutputFilename, error, llvm::sys::fs::OF_Text);
+    if (error) {
+      llvm::errs() << "cannot open physical IR output: " << error.message() << "\n";
+      return exitCode(ExitCode::CompilerOutput);
+    }
+    module->print(irOutput);
+    irOutput << "\n";
+    return exitCode(ExitCode::Success);
+  };
+  if (target == TargetKind::Mojo || target == TargetKind::Weft) {
     context.loadDialect<mlir::linalg::LinalgDialect, mlir::math::MathDialect,
                         mlir::memref::MemRefDialect, mlir::vector::VectorDialect>();
     if (mlir::failed(intent::lowerCanonicalKIRToCPU(*module)))
@@ -143,11 +159,24 @@ int main(int argc, char **argv) {
     if (mlir::failed(intent::cpu::runCPUPasses(*module, cpuVectorBits, cpuWorkers,
                                               profilePath("cpu.json"), tuningConfigFilename)))
       return exitCode(ExitCode::PhysicalProgramVerification);
+    if (stopAfterShared) return emitShared();
     metadata.clear();
-    if (mlir::failed(intent::mojo::legalizeProgram(*module)))
-      return exitCode(ExitCode::ProviderProgramVerification);
-    if (mlir::failed(intent::mojo::serializeProgram(*module, source, metadata)))
-      return exitCode(ExitCode::TerminalTranslation);
+    if (target == TargetKind::Mojo) {
+      if (mlir::failed(intent::mojo::legalizeProgram(*module)))
+        return exitCode(ExitCode::ProviderProgramVerification);
+      if (mlir::failed(intent::mojo::serializeProgram(*module, source, metadata)))
+        return exitCode(ExitCode::TerminalTranslation);
+    } else {
+#ifdef INTENT_HAS_WEFT_CANONICAL
+      auto program = intent::weft_provider::legalizeProgram(*module, metadata);
+      if (mlir::failed(program)) return exitCode(ExitCode::ProviderProgramVerification);
+      if (mlir::failed(intent::weft_provider::serializeProgram(**program, source)))
+        return exitCode(ExitCode::TerminalTranslation);
+#else
+      llvm::errs() << "Weft generation requires the external canonical IR library at compiler build time\n";
+      return exitCode(ExitCode::ProviderProgram);
+#endif
+    }
   } else {
   const llvm::StringRef sharedColumns[] = {
       "ownership_m", "ownership_n", "reduction", "reduction_outer", "scan",
@@ -179,23 +208,7 @@ int main(int argc, char **argv) {
   }
   if (mlir::failed(intent::gpu::runSharedGPUPasses(*module, *profiles)))
     return exitCode(ExitCode::PhysicalProgramVerification);
-  if (stopAfterShared) {
-    if (irOutputFilename.empty()) {
-      llvm::errs() << "--ir-output is required with --stop-after-shared\n";
-      return exitCode(ExitCode::CompilerOutput);
-    }
-    std::error_code error;
-    llvm::raw_fd_ostream irOutput(irOutputFilename, error,
-                                 llvm::sys::fs::OF_Text);
-    if (error) {
-      llvm::errs() << "cannot open physical IR output: " << error.message()
-                   << "\n";
-      return exitCode(ExitCode::CompilerOutput);
-    }
-    module->print(irOutput);
-    irOutput << "\n";
-    return exitCode(ExitCode::Success);
-  }
+  if (stopAfterShared) return emitShared();
   mlir::LogicalResult provider = mlir::failure();
   mlir::LogicalResult serialized = mlir::failure();
   switch (target) {
@@ -215,6 +228,7 @@ int main(int argc, char **argv) {
       serialized = intent::tilelang::serializeProgram(*module, source);
     break;
   case TargetKind::Mojo:
+  case TargetKind::Weft:
     llvm_unreachable("CPU construction is selected before GPU construction");
   }
   if (mlir::failed(provider))

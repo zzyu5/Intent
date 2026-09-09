@@ -29,6 +29,8 @@ mlir::LogicalResult blockContractions(mlir::func::FuncOp function,
                                     const Configuration &configuration);
 mlir::LogicalResult vectorizeLoops(mlir::func::FuncOp function, int64_t width);
 mlir::LogicalResult partitionTasks(mlir::func::FuncOp function, int64_t grain);
+mlir::LogicalResult isolateTasks(mlir::func::FuncOp function);
+mlir::LogicalResult materializeTaskLoops(mlir::func::FuncOp function);
 mlir::LogicalResult runCPUPasses(mlir::ModuleOp module, int64_t vectorBits,
                                int64_t workers, llvm::StringRef defaults,
                                llvm::StringRef overrides);

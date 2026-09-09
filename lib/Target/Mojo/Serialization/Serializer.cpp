@@ -185,6 +185,26 @@ private:
     return success();
   }
 
+  LogicalResult conditional(scf::IfOp operation) {
+    if (operation.getNumResults()) return operation.emitError("Mojo conditional SSA results are not implemented");
+    auto saved = scope.size();
+    line("if " + name(operation.getCondition()) + ":");
+    ++indent;
+    if (failed(block(*operation.thenBlock()))) return failure();
+    if (operation.thenBlock()->getOperations().size() == 1) line("pass");
+    --indent;
+    scope.resize(saved);
+    if (!operation.getElseRegion().empty()) {
+      line("else:");
+      ++indent;
+      if (failed(block(*operation.elseBlock()))) return failure();
+      if (operation.elseBlock()->getOperations().size() == 1) line("pass");
+      --indent;
+      scope.resize(saved);
+    }
+    return success();
+  }
+
   LogicalResult allocation(Operation *operation, Value memory, ValueRange dynamicSizes, bool stack) {
     auto type = cast<MemRefType>(memory.getType());
     if (!type.getElementType().isF32() || (stack && !type.hasStaticShape()))
@@ -202,12 +222,16 @@ private:
       descriptor.strides[axis] = stride;
       stride = "(" + stride + ") * (" + descriptor.sizes[axis] + ")";
     }
-    if (stack)
-      line("var " + storage + " = Array[Float32, " + std::to_string(type.getNumElements()) + "](uninitialized=True)");
-    else
+    if (stack) {
+      int64_t alignment = cast<memref::AllocaOp>(operation).getAlignment().value_or(4);
+      line("var " + value + " = unsafe_stack_allocation[" +
+          std::to_string(type.getNumElements()) + ", Float32, alignment=" +
+          std::to_string(alignment) + "]()");
+    } else {
       line("var " + storage + " = alloc(Layout[Float32](count=" + stride + "))");
-    line("var " + value + " = " + storage + ".unsafe_ptr()");
-    allocations[memory] = storage;
+      line("var " + value + " = " + storage + ".unsafe_ptr()");
+      allocations[memory] = storage;
+    }
     memories[memory] = std::move(descriptor);
     return success();
   }
@@ -221,7 +245,10 @@ private:
       } else return op.emitError("Mojo runtime call has no declared C ABI spelling");
     } else if (auto op = dyn_cast<arith::ConstantOp>(operation)) {
       if (auto integer = dyn_cast<IntegerAttr>(op.getValue())) {
-        assign(op.getResult(), std::string(op.getResult().getType().isIndex() ? "Int(" : "Int64(") + std::to_string(integer.getInt()) + ")", true);
+        if (op.getResult().getType().isInteger(1))
+          assign(op.getResult(), integer.getValue().isZero() ? "False" : "True", true);
+        else
+          assign(op.getResult(), std::string(op.getResult().getType().isIndex() ? "Int(" : "Int64(") + std::to_string(integer.getInt()) + ")", true);
       } else if (auto floating = dyn_cast<FloatAttr>(op.getValue())) {
         llvm::SmallString<32> literal;
         floating.getValue().toString(literal);
@@ -268,6 +295,9 @@ private:
       assign(op.getResult(), pointer(op.getBase(), op.getIndices()) + ".unsafe_load[width=" + std::to_string(op.getVectorType().getNumElements()) + "]()");
     } else if (auto op = dyn_cast<vector::StoreOp>(operation)) {
       line(pointer(op.getBase(), op.getIndices()) + ".unsafe_store(" + name(op.getValueToStore()) + ")");
+    } else if (auto op = dyn_cast<memref::PrefetchOp>(operation)) {
+      line("prefetch[PrefetchOptions().for_read().high_locality().to_data_cache()](" +
+          pointer(op.getMemref(), op.getIndices()) + ")");
     } else if (auto op = dyn_cast<vector::BroadcastOp>(operation)) {
       assign(op.getResult(), "SIMD[DType.float32, " + std::to_string(cast<VectorType>(op.getResult().getType()).getNumElements()) + "](" + name(op.getSource()) + ")");
     } else if (auto op = dyn_cast<vector::ShuffleOp>(operation)) {
@@ -288,6 +318,11 @@ private:
       return forLoop(op);
     } else if (auto op = dyn_cast<scf::ParallelOp>(operation)) {
       return parallel(op);
+    } else if (auto op = dyn_cast<scf::IfOp>(operation)) {
+      return conditional(op);
+    } else if (auto op = dyn_cast<arith::CmpIOp>(operation)) {
+      if (op.getPredicate() != arith::CmpIPredicate::eq) return op.emitError("unsupported Mojo integer comparison");
+      assign(op.getResult(), name(op.getLhs()) + " == " + name(op.getRhs()));
     } else if (auto op = dyn_cast<math::FmaOp>(operation)) {
       assign(op.getResult(), "fma(" + name(op.getA()) + ", " + name(op.getB()) + ", " + name(op.getC()) + ")");
     } else if (auto op = dyn_cast<math::SqrtOp>(operation)) {
@@ -329,9 +364,10 @@ private:
 LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string &metadata) {
   if (failed(cpu::verifyCPUProgram(module, true))) return failure();
   llvm::raw_string_ostream output(source);
-  output << "from std.collections import Array\n"
-            "from std.ffi import external_call\n"
-            "from std.memory import Layout, alloc, dealloc\n"
+  output << "from std.ffi import external_call\n"
+            "from std.memory import Layout, alloc, dealloc, unsafe_stack_allocation\n"
+            "from std.sys import prefetch\n"
+            "from std.sys.intrinsics import PrefetchOptions\n"
             "from std.math import fma, sqrt, min, max\n"
             "from std.runtime import initialize_runtime\n"
             "from max.algorithm import parallelize\n\n";

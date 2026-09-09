@@ -7,6 +7,7 @@ from .api import kernel
 from .compiler import CompilationStageError
 from .compiler import compile
 from .compiler import compile_shared_gpu
+from .compiler import generate, GeneratedProgram
 from .diagnostics import DefinitionError
 from .diagnostics import IntentError
 from .diagnostics import LanguageUseError
@@ -17,6 +18,7 @@ from .targets import CuTileTarget
 from .targets import TileLangTarget
 from .targets import TritonTarget
 from .targets import MojoTarget
+from .targets import WeftTarget
 
 
 __all__ = [
@@ -32,11 +34,14 @@ __all__ = [
     "kernel",
     "compile",
     "compile_shared_gpu",
+    "generate",
+    "GeneratedProgram",
     "CompiledArtifact",
     "CuTileTarget",
     "TileLangTarget",
     "TritonTarget",
     "MojoTarget",
+    "WeftTarget",
     "FrontendError",
     "lower_to_mlir",
 ]

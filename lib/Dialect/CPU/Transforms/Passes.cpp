@@ -116,10 +116,10 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
       config.tileM = columns[2]; config.tileN = columns[3];
       config.tileK = columns[4]; config.microM = columns[5];
       config.microN = columns[6];
-      if (config.tileN % config.vectorWidth || config.tileM % config.microM ||
+      if (config.tileN % config.vectorWidth ||
           config.microM > 8 || config.microN > 4 ||
           config.microM * config.microN > 24 ||
-          config.tileK > capabilities.getPrivateBytes() / 4 / config.tileN)
+          config.tileK > capabilities.getPrivateBytes() / 4 / config.vectorWidth / config.microN)
         return module.emitError("CPU tile candidate violates vector, microtile or stack-size constraints");
     }
     configurations.push_back(config);
@@ -145,6 +145,8 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
         failed(partitionTasks(function, config.taskGrain))) return failure();
   }
   if (failed(normalize(module))) return failure();
+  for (func::FuncOp function : functions)
+    if (failed(isolateTasks(function))) return failure();
   return verifyCPUProgram(module, false);
 }
 

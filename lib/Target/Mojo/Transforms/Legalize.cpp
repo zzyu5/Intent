@@ -20,7 +20,7 @@ bool supportedType(Type type) {
         width > 0 && (width & (width - 1)) == 0;
   }
   if (auto memory = dyn_cast<MemRefType>(type)) return memory.getElementType().isF32();
-  return type.isIndex() || type.isF32() || type.isInteger(64);
+  return type.isIndex() || type.isF32() || type.isInteger(64) || type.isInteger(1);
 }
 
 LogicalResult checkSurface(ModuleOp module) {
@@ -33,9 +33,9 @@ LogicalResult checkSurface(ModuleOp module) {
         arith::MinSIOp, arith::MaxSIOp, arith::CeilDivSIOp, arith::NegFOp,
         arith::IndexCastOp, math::FmaOp, math::SqrtOp, memref::DimOp,
         memref::SubViewOp, memref::CastOp, memref::LoadOp, memref::StoreOp,
-        memref::AllocaOp, memref::AllocOp, memref::DeallocOp,
+        memref::AllocaOp, memref::AllocOp, memref::DeallocOp, memref::PrefetchOp,
         vector::LoadOp, vector::StoreOp, vector::BroadcastOp, vector::ShuffleOp,
-        vector::ExtractElementOp, scf::ForOp, scf::ParallelOp>(operation);
+        vector::ExtractElementOp, arith::CmpIOp, scf::IfOp, scf::ForOp, scf::ParallelOp>(operation);
     supported &= llvm::all_of(operation->getOperandTypes(), supportedType);
     supported &= llvm::all_of(operation->getResultTypes(), supportedType);
     if (auto constant = dyn_cast<arith::ConstantOp>(operation))
@@ -44,6 +44,12 @@ LogicalResult checkSurface(ModuleOp module) {
       supported &= dimension.getConstantIndex().has_value();
     if (auto stack = dyn_cast<memref::AllocaOp>(operation))
       supported &= stack.getType().hasStaticShape();
+    if (auto prefetch = dyn_cast<memref::PrefetchOp>(operation))
+      supported &= !prefetch.getIsWrite() && prefetch.getLocalityHint() == 3 && prefetch.getIsDataCache();
+    if (auto compare = dyn_cast<arith::CmpIOp>(operation))
+      supported &= compare.getPredicate() == arith::CmpIPredicate::eq;
+    if (auto conditional = dyn_cast<scf::IfOp>(operation))
+      supported &= conditional.getNumResults() == 0;
     if (auto parallel = dyn_cast<scf::ParallelOp>(operation))
       supported &= parallel.getNumResults() == 0 && parallel.getNumLoops() == 1 &&
           matchPattern(parallel.getLowerBound()[0], m_Zero()) &&
@@ -62,6 +68,8 @@ LogicalResult legalizeProgram(ModuleOp module) {
   auto capabilities = module->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities");
   if (!capabilities || (capabilities.getVectorBits() != 256 && capabilities.getVectorBits() != 512))
     return module.emitError("Mojo native currently requires an AVX2 or AVX512 CPU capability");
+  for (func::FuncOp function : module.getOps<func::FuncOp>())
+    if (failed(cpu::materializeTaskLoops(function))) return failure();
   if (failed(cpu::materializeCPUProgram(module))) return failure();
   SmallVector<math::RsqrtOp> roots;
   module.walk([&](math::RsqrtOp operation) { roots.push_back(operation); });

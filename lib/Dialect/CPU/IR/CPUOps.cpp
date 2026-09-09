@@ -1,12 +1,30 @@
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/Matchers.h"
 
 using namespace mlir;
 using namespace intent::cpu;
 
 #define GET_OP_CLASSES
 #include "Intent/Dialect/CPU/IR/CPUOps.cpp.inc"
+
+LogicalResult TasksOp::verify() {
+  Block &body = getBody().front();
+  if (body.empty() || body.getNumArguments() != getCaptures().size() + 1 ||
+      !body.getArgument(0).getType().isIndex() ||
+      !isa<TaskYieldOp>(body.getTerminator()))
+    return emitOpError("tasks require an index coordinate, explicit captures and task_yield");
+  for (auto [argument, capture] : llvm::zip(body.getArguments().drop_front(), getCaptures()))
+    if (argument.getType() != capture.getType())
+      return emitOpError("task capture and body argument types must agree");
+  llvm::APInt count;
+  if (matchPattern(getCount(), m_ConstantInt(&count)) && count.isNegative())
+    return emitOpError("task count cannot be negative");
+  if (getOperation()->getParentOfType<TasksOp>())
+    return emitOpError("nested task scheduling has not been realized by CPU partitioning");
+  return success();
+}
 
 LogicalResult ReduceOp::verify() {
   if (getInitial().getType() != getResult().getType() || getInputs().empty() ||
