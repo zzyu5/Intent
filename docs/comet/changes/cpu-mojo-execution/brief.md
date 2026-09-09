@@ -30,7 +30,7 @@ CPU 不是仅含 AVX SIMD 的专用路径。共同模型须保持 scalar、shape
 # 验收示例
 
 - A1：同一份作者算法形成独立、typed、可验证的 CPU 程序；三类计算的轴、任务、访问、累加器、blocking/reuse 与生命周期由当前 IR 和真实 passes 承载。CPU 公共层不硬编码 AVX2/AVX512 或回读 KIR 补结构，provider serializer 只消费已形成的程序。
-- A2：三条既定 f32 CPU benchmark 经正式 Mojo native artifact 执行，分别对照成熟 Modular/MAX 基线得到算子时间、G/S 与同次容差内数值结果；每项满足完整规格第 8 节的用户确认性能门槛。C ABI、CPU views、输出/scratch 生命周期和同步调用明确，双方线程预算与计时范围一致。
+- A2：三条既定 f32 CPU benchmark 经正式 Mojo native artifact 执行，分别对照成熟 Modular/MAX 基线得到算子时间、G/S 与同次容差内数值结果；每项 generated/MAX 执行时间比均不超过 1.05。C ABI、CPU views、输出/scratch 生命周期和同步调用明确，双方线程预算与计时范围一致。
 - A3：同一 CPU 程序的三类任务内计算可生成带合法 typed axes、数值 operations、访问和生命周期的 Canonical Weft IR；生成接口保留所需任务边界，不重读 KIR、按 kernel 名选 std 模板或绕过 Weft 直发 RVV/IME。生成产物明确不等于 native 调用、RISC-V 运行或性能通过。
 - A4：有限候选绑定真实 CPU/provider 参数，至少一条正式 benchmark 实际编译、计时并选择两个以上合法候选；除向量宽度外，本轮已有 task/cache/register 分块参数也有真实 IR consumer。产物与 winner 分别复用，候选先满足数值、访问和资源合法性，不恒取首行或搜索算法。
 - A5：CPU dialect、analysis、passes、provider 与外部 compiler 的职责可由源码和生成程序核对；scalar/vector/matrix 表示边界、转换、资源与不支持能力明确，未复制外部机器 compiler 或引入 emitter 优化路径。对照当前 Intent 与 Triton/TileLang、Modular/Weft 的具体实现说明差异及后果，稳定规格与该边界一致。
@@ -54,11 +54,11 @@ CPU 不是仅含 AVX SIMD 的专用路径。共同模型须保持 scalar、shape
 - 当前 `lib/Transforms/CPU/Passes.cpp:78` 的 verifier 和 `:113` 的 AVX 限制，缺少 GPU `include/Intent/Dialect/GPU/IR/GPUAttrs.td:119`、`include/Intent/Dialect/GPU/Analysis/PhysicalProgram.h:302` 对应的 typed/current-program 边界；本 change 修的是该职责缺口，不以 pass 名称或文件数量判断成熟度。
 - `../ref/triton/lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp:684` 使用 type conversion、legality 和真实 patterns；`../TianchenRV/lib/Target/RISCVCompiler.cpp:45` 以实际 passes 形成 layout、memory、schedule、leaf 和资源。这些机制用于约束本轮 CPU 分层，不复制其 ISA 实现。
 - `../ref/modular/max/kernels/src/linalg/utils.mojo:493` 与 `:583` 展示 cache 与多列 microkernel 结构；`../TianchenRV/lib/Target/IME/FragmentMaterialization.cpp:97` 展示 typed pack/MMA/unpack。优化和表示转换在 IR 中形成，serializer 不首次创造它们。
-- 用户本轮授权修订 Shape，不授权直接继续旧 Build；性能门槛和最终完整 Shape 确认完成前，不进入实现。
+- 用户已确认三项 generated/MAX 执行时间比均不超过 1.05，并要求按完整新 Shape 继续 Build；共同 CPU dialect/analyses/passes、Mojo native 与成熟库基线、Weft 仅生成的边界保持不变。
 
 # 待解决问题
 
-- [blocking] Q1：三条 f32 benchmark 相对成熟 Modular/MAX 基线的逐项 G/S 上限定为多少？建议以 1.05 为最终目标；1.10 可作为较宽的首轮门槛。该数值尚未获得用户选择，不沿用旧 cuTile 门槛，也不把“仅报出数字”视作性能完成。
+- [blocking] Q1：A3 要求三类任务内计算均能生成合法 Canonical Weft IR，但当前外部 Weft 不支持 RMSNorm 所需的 `rsqrt`：`../TianchenRV/lib/Dialect/Kernel/IR/KernelDialect.cpp:1305` 的 unary verifier 只接受 `neg/abs/exp`，`:844` 的标准 operation 白名单也不接受 `math.rsqrt`。是否允许对 TianchenRV 做最小的 `rsqrt` primitive 扩展（canonical 数值 schema/verifier 及对应现有 lowering），其余内容保持只读，仍不接 RISC-V 设备 runtime？这是新增的外部修改授权问题；确认前保留 A3 与三项 G/S ≤ 1.05 门槛，不将 unsupported 诊断算作 A3 通过，也不替换 RMSNorm 算法。
 
 # 验证预期
 
