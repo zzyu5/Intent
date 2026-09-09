@@ -111,6 +111,56 @@ LogicalResult verifyLoadLatency(Operation *operation, Value latency) {
   return success();
 }
 
+LogicalResult verifyFullTileCondition(TileLoadOp load) {
+  if (!load.getFullTiles())
+    return success();
+  auto view = load.getResource().getType();
+  auto shape = load.getResult().getType().getShape();
+  llvm::SmallBitVector covered(view.getRank());
+  for (auto [axis, attribute] : llvm::enumerate(shape)) {
+    auto width = cast<gpu::PhysicalExprAttr>(attribute);
+    auto size = cast<gpu::PhysicalExprAttr>(view.getLayout().getExtents()[axis]);
+    auto constant = static_cast<uint32_t>(gpu::PhysicalExprKind::Constant);
+    covered[axis] = width.getKind() == constant && width.getValue() > 0 &&
+                    (width.getValue() == 1 ||
+                     (size.getKind() == constant &&
+                      size.getValue() % width.getValue() == 0));
+  }
+  SmallVector<Value> pending{load.getFullTiles()};
+  while (!pending.empty()) {
+    Value predicate = pending.pop_back_val();
+    if (matchPattern(predicate, m_Zero()))
+      return success();
+    if (matchPattern(predicate, m_One()))
+      continue;
+    if (auto conjunction = predicate.getDefiningOp<gpu::BinaryOp>();
+        conjunction &&
+        conjunction.getOperatorKind() == BinaryOperator::LogicalAnd) {
+      pending.push_back(conjunction.getLhs());
+      pending.push_back(conjunction.getRhs());
+      continue;
+    }
+    auto equal = predicate.getDefiningOp<gpu::CompareOp>();
+    if (!equal || equal.getPredicate() != ComparePredicate::Eq ||
+        !matchPattern(equal.getRhs(), m_Zero()))
+      return load.emitOpError("full tiles require a view-size divisibility proof");
+    auto remainder = equal.getLhs().getDefiningOp<gpu::BinaryOp>();
+    auto size = remainder ? remainder.getLhs().getDefiningOp<gpu::DimOp>()
+                          : gpu::DimOp();
+    auto width = remainder ? remainder.getRhs().getDefiningOp<gpu::PhysicalExprOp>()
+                           : gpu::PhysicalExprOp();
+    if (!remainder || remainder.getOperatorKind() != BinaryOperator::Remainder ||
+        !size || !width || size.getView() != load.getResource() ||
+        size.getAxis() >= view.getRank() ||
+        width.getExpression() != shape[size.getAxis()])
+      return load.emitOpError("full-tile proof must describe this native load");
+    covered[size.getAxis()] = true;
+  }
+  return covered.all()
+             ? success()
+             : load.emitOpError("full-tile proof does not cover every view axis");
+}
+
 } // namespace
 
 LogicalResult ArrayViewOp::verify() {
@@ -167,6 +217,7 @@ FailureOr<TileLoadOp> unfoldedArrayLoad(TileLoadOp load) {
       original.getResource() != array.getBase() ||
       original.getAllowTma() != load.getAllowTma() ||
       original.getLatencyPolicy() != load.getLatencyPolicy() ||
+      original.getFullTiles() != load.getFullTiles() ||
       restore.getValue() != load.getResult() ||
       restore.getResult().getType() != original.getResult().getType() ||
       thenYield.getOperand(0) != restore.getResult() ||
@@ -190,7 +241,7 @@ LogicalResult TileLoadOp::verify() {
   if (view.getElementType() != result.getElementType())
     return emitOpError("view and tile element types disagree");
   if (!array)
-    return success();
+    return verifyFullTileCondition(*this);
   if (failed(array.verify()))
     return failure();
   auto original = unfoldedArrayLoad(*this);

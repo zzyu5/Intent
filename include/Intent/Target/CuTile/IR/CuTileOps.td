@@ -27,7 +27,9 @@ def IntentCuTile_TileLoadOp : IntentCuTile_Op<"tile_load", [
                        IntentGPU_ScalarValue:$allow_tma,
                        Variadic<AnyTypeOf<[Index, I32]>>:$tile_indices,
                        // 1..10 select an explicit latency; 11 retains inference.
-                       Optional<Index>:$latency_policy);
+                       Optional<Index>:$latency_policy,
+                       // True only when every view axis divides into full tiles.
+                       Optional<I1>:$full_tiles);
   let results = (outs IntentGPU_FragmentValue:$result);
   let hasVerifier = 1;
 }

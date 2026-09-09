@@ -11,6 +11,8 @@
 #include "Intent/Target/CuTile/IR/CuTileOps.h.inc"
 
 namespace intent::cutile {
+// The provider-default policy leaves the worker count to the lower compiler.
+inline constexpr int64_t inferredWorkerWarps = 1;
 inline constexpr int64_t inferredLoadPolicy = 11;
 inline bool isLegalLoadPolicy(int64_t value) {
   return value >= 1 && value <= inferredLoadPolicy;

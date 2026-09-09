@@ -40,7 +40,9 @@ bool isLegalAccessForm(int64_t value) {
 
 bool isLegalOccupancy(int64_t value) { return value >= 1 && value <= 32; }
 
-bool isLegalWorkerWarps(int64_t value) { return value == 4 || value == 8; }
+bool isLegalWorkerWarps(int64_t value) {
+  return value == inferredWorkerWarps || value == 4 || value == 8;
+}
 
 bool isLegalCTAs(int64_t value) {
   return value >= 1 && value <= 16 && llvm::isPowerOf2_64(value);
@@ -1769,9 +1771,31 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
       loopLatency = loadPolicy;
     }
     auto emitNativeLoad = [&](OpBuilder &nested) {
+      Value fullTiles = nested.create<arith::ConstantIntOp>(load.getLoc(), 1, 1);
+      Value zero = nested.create<arith::ConstantIndexOp>(load.getLoc(), 0);
+      for (auto [axis, attribute] : llvm::enumerate(plan->resourceType.getShape())) {
+        auto extent = cast<gpu::PhysicalExprAttr>(attribute);
+        if (extent.getKind() ==
+                static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+            extent.getValue() == 1)
+          continue;
+        Value size = nested.create<gpu::DimOp>(
+            load.getLoc(), nested.getIndexType(), load.getResource(), axis);
+        Value width = nested.create<gpu::PhysicalExprOp>(
+            load.getLoc(), nested.getIndexType(), extent);
+        Value remainder = nested.create<gpu::BinaryOp>(
+            load.getLoc(), nested.getIndexType(), size, width,
+            BinaryOperator::Remainder);
+        Value divisible = nested.create<gpu::CompareOp>(
+            load.getLoc(), nested.getI1Type(), remainder, zero,
+            ComparePredicate::Eq);
+        fullTiles = nested.create<gpu::BinaryOp>(
+            load.getLoc(), nested.getI1Type(), fullTiles, divisible,
+            BinaryOperator::LogicalAnd);
+      }
       auto tile = nested.create<TileLoadOp>(
           load.getLoc(), plan->resourceType, load.getResource(), *allowTMA,
-          indices->values, loopLatency);
+          indices->values, loopLatency, fullTiles);
       Value value = tile.getResult();
       createdOperations.push_back(tile);
       if (plan->resourceToPacked) {
@@ -2424,6 +2448,7 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
   SmallVector<SmallVector<NamedAttribute>> providerConfigurations(1);
   gpu::ParameterOp accessForm;
   gpu::ParameterOp loadPolicy;
+  gpu::ParameterOp inferredWarps;
   for (Domain &domain : domains) {
     if (!domain.provider)
       continue;
@@ -2438,9 +2463,19 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
       loadPolicy = domain.parameter;
       continue;
     }
+    bool addInferredDefault =
+        definition.getRole() ==
+            static_cast<uint32_t>(gpu::ParameterRole::ProviderWarps) &&
+        llvm::is_contained(definition.getCandidates().asArrayRef(),
+                           inferredWorkerWarps) &&
+        definition.getCandidates().size() > 1;
+    if (addInferredDefault)
+      inferredWarps = domain.parameter;
     SmallVector<SmallVector<NamedAttribute>> expanded;
     for (const auto &base : providerConfigurations)
       for (int64_t candidate : definition.getCandidates().asArrayRef()) {
+        if (addInferredDefault && candidate == inferredWorkerWarps)
+          continue;
         SmallVector<NamedAttribute> bindings(base);
         bindings.push_back(builder.getNamedAttr(
             definition.getName(), builder.getI64IntegerAttr(candidate)));
@@ -2448,6 +2483,7 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
       }
     providerConfigurations = std::move(expanded);
   }
+  auto coreConfigurations = providerConfigurations;
   for (gpu::ParameterOp option : {loadPolicy, accessForm}) {
     if (!option)
       continue;
@@ -2479,6 +2515,24 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
         if (!llvm::is_contained(providerConfigurations, configuration))
           providerConfigurations.push_back(std::move(configuration));
       }
+  }
+  if (inferredWarps) {
+    // Add the lower compiler's default at each core setting without moving
+    // the existing explicit-count anchors or multiplying every local form.
+    for (auto configuration : coreConfigurations) {
+      for (NamedAttribute &binding : configuration)
+        if (binding.getName() == inferredWarps.getParameter().getName())
+          binding = builder.getNamedAttr(
+              binding.getName(), builder.getI64IntegerAttr(inferredWorkerWarps));
+      for (gpu::ParameterOp option : {loadPolicy, accessForm})
+        if (option)
+          configuration.push_back(builder.getNamedAttr(
+              option.getParameter().getName(),
+              builder.getI64IntegerAttr(
+                  option.getParameter().getCandidates().asArrayRef().front())));
+      if (!llvm::is_contained(providerConfigurations, configuration))
+        providerConfigurations.push_back(std::move(configuration));
+    }
   }
   SmallVector<SmallVector<NamedAttribute>> expanded;
   for (const auto &base : configurations)

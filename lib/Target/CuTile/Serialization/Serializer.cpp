@@ -918,10 +918,14 @@ private:
                                       ", " + valueString(select.getTrueValue()) +
                                       ", " + valueString(select.getFalseValue()) + ")");
     } else if (auto load = dyn_cast<TileLoadOp>(operation)) {
+      std::string padding = "ct.PaddingMode.ZERO";
+      if (Value fullTiles = load.getFullTiles())
+        padding = "(ct.PaddingMode.UNDETERMINED if " + valueString(fullTiles) +
+                  " else ct.PaddingMode.ZERO)";
       std::string call = "ct.load(" + valueString(load.getResource()) +
                          ", index=" + tuple(load.getTileIndices()) +
                          ", shape=" + fragmentShape(load.getResult().getType()) +
-                         ", padding_mode=ct.PaddingMode.ZERO, allow_tma=" +
+                         ", padding_mode=" + padding + ", allow_tma=" +
                          valueString(load.getAllowTma());
       if (auto latency = load.getLatencyPolicy())
         call += ", latency=(None if " + valueString(latency) + " == " +
@@ -1387,8 +1391,13 @@ private:
 
   std::string compilerHints(StringRef configName) {
     std::string result = "{";
-    for (const auto &[hint, parameter] : providerHintParameters)
-      result += "\"" + hint + "\": " + configName.str() + "." + parameter + ", ";
+    for (const auto &[hint, parameter] : providerHintParameters) {
+      std::string value = configName.str() + "." + parameter;
+      if (hint == "num_worker_warps")
+        value = "(None if " + value + " == " +
+                std::to_string(inferredWorkerWarps) + " else " + value + ")";
+      result += "\"" + hint + "\": " + value + ", ";
+    }
     return result + "}";
   }
 
