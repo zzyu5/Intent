@@ -1,5 +1,5 @@
 #include "Intent/Target/Mojo/Serialization/Serializer.h"
-#include "Intent/Transforms/CPU/Passes.h"
+#include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -24,22 +24,27 @@ std::string join(ArrayRef<std::string> values, llvm::StringRef separator = ", ")
   return llvm::join(values, separator);
 }
 
-llvm::json::Value json(Attribute attribute) {
-  if (auto string = dyn_cast<StringAttr>(attribute)) return string.getValue().str();
-  if (auto integer = dyn_cast<IntegerAttr>(attribute)) return integer.getInt();
-  if (auto array = dyn_cast<DenseI64ArrayAttr>(attribute)) {
-    llvm::json::Array result;
-    for (int64_t value : array.asArrayRef()) result.push_back(value);
-    return result;
+llvm::json::Array json(DenseI64ArrayAttr attribute) {
+  llvm::json::Array result;
+  for (int64_t value : attribute.asArrayRef()) result.push_back(value);
+  return result;
+}
+
+llvm::json::Array parameters(cpu::InterfaceAttr interface) {
+  llvm::json::Array result;
+  for (Attribute argument : interface.getArguments()) {
+    if (auto view = dyn_cast<cpu::ViewArgumentAttr>(argument)) {
+      result.push_back(llvm::json::Object{
+          {"name", view.getName().getValue().str()}, {"kind", "view"},
+          {"access", static_cast<int64_t>(view.getAccess())}, {"shape", json(view.getShape())},
+          {"dimensions", json(view.getDimensions())}, {"alias", view.getAlias().getValue().str()},
+          {"noalias", view.getNoalias()}});
+    } else {
+      auto scalar = cast<cpu::ScalarArgumentAttr>(argument);
+      result.push_back(llvm::json::Object{{"name", scalar.getName().getValue().str()},
+          {"kind", "scalar"}, {"dtype", scalar.getType().isF32() ? "f32" : "i64"}});
+    }
   }
-  if (auto array = dyn_cast<ArrayAttr>(attribute)) {
-    llvm::json::Array result;
-    for (Attribute value : array) result.push_back(json(value));
-    return result;
-  }
-  auto dictionary = cast<DictionaryAttr>(attribute);
-  llvm::json::Object result;
-  for (NamedAttribute field : dictionary) result[field.getName().strref()] = json(field.getValue());
   return result;
 }
 
@@ -49,7 +54,8 @@ public:
 
   LogicalResult function(func::FuncOp function) {
     names.clear(); memories.clear(); allocations.clear(); scope.clear(); next = 0;
-    workers = function->getAttrOfType<IntegerAttr>("cpu.workers").getInt();
+    workers = function->getParentOfType<ModuleOp>()->getAttrOfType<cpu::CapabilitiesAttr>(
+        "intent_cpu.capabilities").getWorkers();
     SmallVector<std::string> signature;
     for (auto [number, argument] : llvm::enumerate(function.getArguments())) {
       std::string name = "a" + std::to_string(number);
@@ -57,17 +63,23 @@ public:
       if (auto type = dyn_cast<MemRefType>(argument.getType())) {
         signature.push_back(name + ": Pointer[Float32, MutUntrackedOrigin]");
         Memory memory{name, {}, {}};
+        SmallVector<int64_t> staticStrides;
+        int64_t staticOffset;
+        if (failed(type.getStridesAndOffset(staticStrides, staticOffset)))
+          return function.emitError("Mojo entry requires a strided memory descriptor");
         for (int64_t axis = 0; axis < type.getRank(); ++axis) {
           std::string dimension = name + "_d" + std::to_string(axis);
           signature.push_back(dimension + ": Int64");
           scope.push_back(dimension);
-          memory.sizes.push_back("Int(" + dimension + ")");
+          memory.sizes.push_back(type.isDynamicDim(axis) ? "Int(" + dimension + ")"
+                                                        : std::to_string(type.getDimSize(axis)));
         }
         for (int64_t axis = 0; axis < type.getRank(); ++axis) {
           std::string stride = name + "_s" + std::to_string(axis);
           signature.push_back(stride + ": Int64");
           scope.push_back(stride);
-          memory.strides.push_back("Int(" + stride + ")");
+          memory.strides.push_back(ShapedType::isDynamic(staticStrides[axis])
+                                       ? "Int(" + stride + ")" : std::to_string(staticStrides[axis]));
         }
         memories[argument] = std::move(memory);
       } else {
@@ -102,8 +114,10 @@ private:
     return result;
   }
 
-  void assign(Value value, const std::string &expression) {
-    line("var " + fresh(value) + " = " + expression);
+  void assign(Value value, const std::string &expression, bool constant = false) {
+    std::string identifier = fresh(value);
+    if (constant) scope.pop_back();
+    line(std::string(constant ? "comptime " : "var ") + identifier + " = " + expression);
   }
 
   std::string fold(OpFoldResult value) {
@@ -207,11 +221,11 @@ private:
       } else return op.emitError("Mojo runtime call has no declared C ABI spelling");
     } else if (auto op = dyn_cast<arith::ConstantOp>(operation)) {
       if (auto integer = dyn_cast<IntegerAttr>(op.getValue())) {
-        assign(op.getResult(), std::string(op.getResult().getType().isIndex() ? "Int(" : "Int64(") + std::to_string(integer.getInt()) + ")");
+        assign(op.getResult(), std::string(op.getResult().getType().isIndex() ? "Int(" : "Int64(") + std::to_string(integer.getInt()) + ")", true);
       } else if (auto floating = dyn_cast<FloatAttr>(op.getValue())) {
         llvm::SmallString<32> literal;
         floating.getValue().toString(literal);
-        assign(op.getResult(), "Float32(" + literal.str().str() + ")");
+        assign(op.getResult(), "Float32(" + literal.str().str() + ")", true);
       } else if (auto dense = dyn_cast<DenseFPElementsAttr>(op.getValue())) {
         SmallVector<std::string> elements;
         for (llvm::APFloat value : dense.getValues<llvm::APFloat>()) {
@@ -221,7 +235,7 @@ private:
           if (dense.isSplat()) break;
         }
         assign(op.getResult(), "SIMD[DType.float32, " +
-            std::to_string(cast<VectorType>(op.getResult().getType()).getNumElements()) + "](" + join(elements) + ")");
+            std::to_string(cast<VectorType>(op.getResult().getType()).getNumElements()) + "](" + join(elements) + ")", true);
       } else return op.emitError("unsupported Mojo constant");
     } else if (auto op = dyn_cast<memref::DimOp>(operation)) {
       auto axis = op.getConstantIndex();
@@ -329,15 +343,19 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string
     if (function.isExternal()) continue;
     if (failed(serializer.function(function))) return failure();
     if (first) {
-      interface["parameters"] = json(function->getAttr("cpu.interface"));
-      interface["workers"] = function->getAttrOfType<IntegerAttr>("cpu.workers").getInt();
-      interface["contiguous_views"] = function->hasAttr("cpu.contiguous_views");
-      interface["disjoint_outputs"] = function->hasAttr("cpu.disjoint_outputs");
+      auto abi = function->getAttrOfType<cpu::InterfaceAttr>("intent_cpu.interface");
+      interface["parameters"] = parameters(abi);
+      interface["workers"] = module->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities").getWorkers();
+      interface["contiguous_views"] = abi.getContiguousViews();
+      interface["disjoint_outputs"] = abi.getDisjointOutputs();
       first = false;
     }
+    auto configuration = function->getAttrOfType<cpu::ConfigurationAttr>("intent_cpu.configuration");
     candidates.push_back(llvm::json::Object{
         {"entry", function.getName().str()},
-        {"values", json(function->getAttr("cpu.configuration"))}});
+        {"values", llvm::json::Array{configuration.getVectorWidth(), configuration.getTaskGrain(),
+            configuration.getTileM(), configuration.getTileN(), configuration.getTileK(),
+            configuration.getMicroM(), configuration.getMicroN()}}});
   }
   interface["candidates"] = std::move(candidates);
   llvm::raw_string_ostream metadataOutput(metadata);

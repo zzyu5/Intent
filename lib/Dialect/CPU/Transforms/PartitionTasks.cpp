@@ -1,4 +1,4 @@
-#include "Intent/Transforms/CPU/Passes.h"
+#include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Utilities.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/Matchers.h"

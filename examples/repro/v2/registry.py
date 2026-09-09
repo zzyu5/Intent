@@ -153,9 +153,9 @@ TILELANG = (
 
 
 MOJO = (
-    Entry("batched_row_affine", "17x257x4093-f32-8cores", "batched_row_affine", ("pointwise/batched_affine.py:batched_row_affine",), "source/mojo/intentdsl/pointwise/batched_affine/batched_affine_runtime.py"),
-    Entry("weighted_rms_norm", "8192x4096-f32-8cores", "weighted_rms_norm", ("normalization/rms_norm.py:weighted_rms_norm",), "source/mojo/intentdsl/normalization/rms_norm/rms_norm_runtime.py"),
-    Entry("dense_gemm_f32", "M1024-N1024-K1024-f32-8cores", "gemm_f32", ("contraction/gemm.py:gemm_f32",), "source/mojo/intentdsl/contraction/gemm/gemm_runtime.py"),
+    Entry("batched_row_affine", "17x257x4093-f32-8cores", "batched_row_affine", ("pointwise/batched_affine.py:batched_row_affine",), "source/mojo/modular/pointwise/batched_affine/batched_affine_runtime.py"),
+    Entry("weighted_rms_norm", "8192x4096-f32-8cores", "weighted_rms_norm", ("normalization/rms_norm.py:weighted_rms_norm",), "source/mojo/modular/normalization/rms_norm/rms_norm_runtime.py"),
+    Entry("dense_gemm_f32", "M1024-N1024-K1024-f32-8cores", "gemm_f32", ("contraction/gemm.py:gemm_f32",), "source/mojo/modular/contraction/gemm/gemm_runtime.py"),
 )
 
 

@@ -1,4 +1,4 @@
-#include "Intent/Transforms/CPU/Passes.h"
+#include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Utilities.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -68,10 +68,9 @@ bool stableRead(memref::LoadOp load, Operation *producer, func::FuncOp function)
   }
   if (auto argument = dyn_cast<BlockArgument>(base)) {
     if (argument.getOwner() != &function.front()) return false;
-    auto abi = function->getAttrOfType<ArrayAttr>("cpu.interface");
-    auto field = cast<DictionaryAttr>(abi[argument.getArgNumber()]);
-    auto access = field.getAs<IntegerAttr>("access");
-    return access && access.getInt() == 0;
+    auto abi = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+    auto field = dyn_cast<ViewArgumentAttr>(abi.getArguments()[argument.getArgNumber()]);
+    return field && field.getAccess() == 0;
   }
   auto allocation = base.getDefiningOp<memref::AllocOp>();
   if (!allocation) return false;
@@ -161,7 +160,8 @@ bool fuse(memref::AllocOp allocation) {
 }
 
 LogicalResult fuseIntermediateBuffers(func::FuncOp function) {
-  if (!function->hasAttr("cpu.disjoint_outputs"))
+  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  if (!interface || !interface.getDisjointOutputs())
     return function.emitError("CPU buffer fusion requires established external alias legality");
   forwardDestinations(function);
   SmallVector<memref::CopyOp> copies;
@@ -196,5 +196,7 @@ LogicalResult fuseIntermediateBuffers(func::FuncOp function) {
   } while (changed);
   return success();
 }
+
+void forwardCPUOutputs(func::FuncOp function) { forwardDestinations(function); }
 
 }

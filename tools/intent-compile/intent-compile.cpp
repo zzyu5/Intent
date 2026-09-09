@@ -1,6 +1,6 @@
 #include "Intent/Conversion/KIRToGPU/KIRToGPU.h"
 #include "Intent/Conversion/KIRToCPU/KIRToCPU.h"
-#include "Intent/Transforms/CPU/Passes.h"
+#include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Target/Mojo/Serialization/Serializer.h"
 #include "Intent/Target/Mojo/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/IR/GPUDialect.h"
@@ -104,11 +104,13 @@ int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
   registry.insert<intent::IntentDialect, intent::gpu::IntentGPUDialect,
+                  intent::cpu::IntentCPUDialect,
                   intent::cutile::IntentCuTileDialect,
                   intent::tilelang::IntentTileLangDialect,
                   intent::triton::IntentTritonDialect>();
   mlir::MLIRContext context(registry);
   context.loadDialect<intent::IntentDialect, intent::gpu::IntentGPUDialect,
+                      intent::cpu::IntentCPUDialect,
                       intent::cutile::IntentCuTileDialect,
                       intent::tilelang::IntentTileLangDialect,
                       intent::triton::IntentTritonDialect,

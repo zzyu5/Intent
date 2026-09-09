@@ -1,15 +1,12 @@
-add_mlir_library(MLIRIntentKIRToCPU
-  KIRToCPU.cpp
-
+add_mlir_library(MLIRIntentCPUAnalysis
+  PhysicalProgram.cpp
   LINK_LIBS PUBLIC
-  MLIRIntentAnalysis
-  MLIRIntentDialect
   MLIRIntentCPUDialect
-  MLIRArithDialect
   MLIRFuncDialect
   MLIRLinalgDialect
   MLIRMathDialect
   MLIRMemRefDialect
   MLIRSCFDialect
   MLIRIR
+  MLIRSideEffectInterfaces
 )

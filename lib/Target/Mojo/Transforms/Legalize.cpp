@@ -1,5 +1,5 @@
 #include "Intent/Target/Mojo/Transforms/Passes.h"
-#include "Intent/Transforms/CPU/Passes.h"
+#include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -59,6 +59,25 @@ LogicalResult checkSurface(ModuleOp module) {
 }
 
 LogicalResult legalizeProgram(ModuleOp module) {
+  auto capabilities = module->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities");
+  if (!capabilities || (capabilities.getVectorBits() != 256 && capabilities.getVectorBits() != 512))
+    return module.emitError("Mojo native currently requires an AVX2 or AVX512 CPU capability");
+  if (failed(cpu::materializeCPUProgram(module))) return failure();
+  SmallVector<math::RsqrtOp> roots;
+  module.walk([&](math::RsqrtOp operation) { roots.push_back(operation); });
+  for (auto operation : roots) {
+    OpBuilder b(operation);
+    Type type = operation.getType();
+    TypedAttr one;
+    if (auto vector = dyn_cast<VectorType>(type))
+      one = DenseElementsAttr::get(vector, b.getF32FloatAttr(1.0));
+    else one = b.getFloatAttr(type, 1.0);
+    Value root = b.create<math::SqrtOp>(operation.getLoc(), operation.getOperand());
+    Value unit = b.create<arith::ConstantOp>(operation.getLoc(), type, one);
+    Value result = b.create<arith::DivFOp>(operation.getLoc(), unit, root);
+    operation.getResult().replaceAllUsesWith(result);
+    operation.erase();
+  }
   if (failed(cpu::verifyCPUProgram(module, true)) || failed(checkSurface(module))) return failure();
   OpBuilder builder(module.getContext());
   builder.setInsertionPointToStart(module.getBody());

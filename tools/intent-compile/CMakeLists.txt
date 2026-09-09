@@ -6,7 +6,7 @@ add_llvm_executable(intent-compile
 
 llvm_update_compile_flags(intent-compile)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/profiles")
-configure_file("${PROJECT_SOURCE_DIR}/lib/Transforms/CPU/TuningProfiles.json"
+configure_file("${PROJECT_SOURCE_DIR}/lib/Dialect/CPU/Transforms/TuningProfiles.json"
                "${CMAKE_CURRENT_BINARY_DIR}/profiles/cpu.json" COPYONLY)
 configure_file("${PROJECT_SOURCE_DIR}/lib/Dialect/GPU/Transforms/TuningProfiles.json"
                "${CMAKE_CURRENT_BINARY_DIR}/profiles/shared.json" COPYONLY)
@@ -21,6 +21,7 @@ target_link_libraries(intent-compile PRIVATE
   MLIRIntentKIRToGPU
   MLIRIntentKIRToCPU
   MLIRIntentCPUTransforms
+  MLIRIntentCPUDialect
   MLIRIntentMojoSerialization
   MLIRIntentMojoTransforms
   MLIRIntentCuTileDialect

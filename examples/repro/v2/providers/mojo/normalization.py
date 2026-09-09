@@ -8,8 +8,8 @@ def rms_norm(context):
     x = torch.randn((8192, 4096), dtype=torch.float32)
     weight = torch.randn((4096,), dtype=torch.float32)
     return prepare_comparison(context, weighted_rms_norm, (x, weight, 1.0 / 4096, 1e-6),
-        "source/mojo/intentdsl/normalization/rms_norm/rms_norm_runtime.py", Tolerance(5e-5),
-        "Source 使用 SIMD lane-striped sum，generated 保留 source-order-preserving reduction。")
+        "source/mojo/modular/normalization/rms_norm/rms_norm_runtime.py", Tolerance(5e-5),
+        "Source 调用安装的 Modular/MAX RMSNorm；双方归约括号与中间数学实现可能不同。")
 
 
 CASES = {"weighted_rms_norm": rms_norm}

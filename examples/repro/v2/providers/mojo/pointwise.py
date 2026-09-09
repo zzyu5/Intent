@@ -10,7 +10,8 @@ def affine(context):
     scale = torch.randn(shape[:2], dtype=torch.float32)
     bias = torch.randn(shape[:2], dtype=torch.float32)
     return prepare_comparison(context, batched_row_affine, (x, scale, bias),
-        "source/mojo/intentdsl/pointwise/batched_affine/batched_affine_runtime.py", Tolerance(2e-6))
+        "source/mojo/modular/pointwise/batched_affine/batched_affine_runtime.py", Tolerance(2e-6),
+        "Source 调用安装的 Modular/MAX CPU elementwise。")
 
 
 CASES = {"batched_row_affine": affine}

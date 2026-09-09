@@ -1,5 +1,6 @@
 #include "Intent/Conversion/KIRToCPU/KIRToCPU.h"
 #include "Intent/Analysis/CanonicalKernel.h"
+#include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "Intent/Dialect/Intent/IR/IntentDialect.h"
 #include "Intent/Dialect/Intent/IR/IntentOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -35,8 +36,6 @@ public:
     SmallVector<Attribute> interface;
     for (auto [i, argument] : llvm::enumerate(source.getArguments())) {
       auto parameter = cast<ParameterAttr>(parameters[i]);
-      NamedAttrList item;
-      item.set("name", parameter.getName());
       if (auto view = dyn_cast<ViewType>(argument.getType())) {
         auto tensor = cast<RankedTensorType>(view.getTensor());
         if (!tensor.getElementType().isF32() || view.getAccess() == 2)
@@ -47,28 +46,25 @@ public:
         if (!shape)
           return source.emitError("CPU view is missing canonical dimension identities");
         types.push_back(MemRefType::get(tensor.getShape(), tensor.getElementType()));
-        item.set("kind", builder.getStringAttr("view"));
-        item.set("access", builder.getI64IntegerAttr(view.getAccess()));
-        item.set("shape", builder.getDenseI64ArrayAttr(tensor.getShape()));
-        item.set("dimensions", shape.getDimensions());
-        item.set("alias", view.getConstraints().getAlias());
-        item.set("noalias", builder.getBoolAttr(view.getConstraints().getNoalias()));
+        interface.push_back(cpu::ViewArgumentAttr::get(builder.getContext(),
+            parameter.getName(), tensor.getElementType(),
+            builder.getDenseI64ArrayAttr(tensor.getShape()), shape.getDimensions(),
+            view.getAccess(), view.getConstraints().getAlias(),
+            view.getConstraints().getNoalias()));
       } else if (argument.getType().isF32() || argument.getType().isIndex() ||
                  argument.getType().isInteger(64)) {
         types.push_back(argument.getType());
-        item.set("kind", builder.getStringAttr("scalar"));
-        item.set("dtype", builder.getStringAttr(argument.getType().isF32() ? "f32" : "i64"));
+        interface.push_back(cpu::ScalarArgumentAttr::get(builder.getContext(),
+            parameter.getName(), argument.getType()));
       } else {
         return source.emitError("CPU construction does not implement this parameter type");
       }
-      interface.push_back(builder.getDictionaryAttr(item));
     }
     builder.setInsertionPointToEnd(module.getBody());
     function = builder.create<func::FuncOp>(source.getLoc(), source.getName(),
                                            builder.getFunctionType(types, {}));
-    function->setAttr("cpu.interface", builder.getArrayAttr(interface));
-    function->setAttr("cpu.contiguous_views", builder.getUnitAttr());
-    function->setAttr("cpu.disjoint_outputs", builder.getUnitAttr());
+    function->setAttr("intent_cpu.interface", cpu::InterfaceAttr::get(
+        builder.getContext(), builder.getArrayAttr(interface), true, true));
     function.addEntryBlock();
     builder.setInsertionPointToStart(&function.front());
     for (auto [oldValue, newValue] : llvm::zip(source.getArguments(), function.getArguments())) {
@@ -123,33 +119,19 @@ private:
     return allocation;
   }
 
-  void elements(Location loc, ArrayRef<Value> sizes,
-                llvm::function_ref<void(ValueRange)> body) {
-    SmallVector<Value> indices;
-    std::function<void(unsigned)> visit = [&](unsigned axis) {
-      if (axis == sizes.size()) {
-        body(indices);
-        return;
-      }
-      auto loop = builder.create<scf::ForOp>(loc, constant(loc, 0), sizes[axis], constant(loc, 1));
-      OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToStart(loop.getBody());
-      indices.push_back(loop.getInductionVar());
-      visit(axis + 1);
-      indices.pop_back();
-    };
-    visit(0);
-  }
-
-  Value element(Value value, ValueRange coordinates, Location loc) {
-    auto memory = dyn_cast<MemRefType>(value.getType());
-    if (!memory)
-      return value;
-    SmallVector<Value> indices;
-    unsigned start = coordinates.size() - memory.getRank();
-    for (int64_t axis = 0; axis < memory.getRank(); ++axis)
-      indices.push_back(memory.getDimSize(axis) == 1 ? constant(loc, 0) : coordinates[start + axis]);
-    return builder.create<memref::LoadOp>(loc, value, indices);
+  SmallVector<AffineMap> pointwiseMaps(ValueRange inputs, int64_t rank) {
+    SmallVector<AffineMap> maps;
+    for (Value input : inputs) {
+      SmallVector<AffineExpr> axes;
+      if (auto memory = dyn_cast<MemRefType>(input.getType()))
+        for (int64_t axis = 0; axis < memory.getRank(); ++axis)
+          axes.push_back(memory.getDimSize(axis) == 1
+              ? builder.getAffineConstantExpr(0)
+              : builder.getAffineDimExpr(rank - memory.getRank() + axis));
+      maps.push_back(AffineMap::get(rank, 0, axes, builder.getContext()));
+    }
+    maps.push_back(builder.getMultiDimIdentityMap(rank));
+    return maps;
   }
 
   FailureOr<Value> indexed(Operation *operation) {
@@ -200,7 +182,7 @@ private:
                                                  source, offsets, sizes, strides));
   }
 
-  FailureOr<Value> arithmetic(Operation *operation, ValueRange arguments) {
+  FailureOr<Value> arithmetic(Operation *operation, ValueRange arguments, OpBuilder &builder) {
     Location loc = operation->getLoc();
     if (auto binary = dyn_cast<BinaryOp>(operation)) {
       if (binary.getApproximate() || binary.getFlushToZero())
@@ -223,11 +205,7 @@ private:
       if (unary.getApproximate() || unary.getFlushToZero())
         return unary.emitError("CPU approximate arithmetic is not implemented"), failure();
       switch (unary.getOperatorKind()) {
-      case UnaryOperator::Rsqrt: {
-        Value root = builder.create<math::SqrtOp>(loc, arguments[0]);
-        Value one = builder.create<arith::ConstantOp>(loc, builder.getF32FloatAttr(1.0));
-        return Value(builder.create<arith::DivFOp>(loc, one, root));
-      }
+      case UnaryOperator::Rsqrt: return Value(builder.create<math::RsqrtOp>(loc, arguments[0]));
       case UnaryOperator::Sqrt: return Value(builder.create<math::SqrtOp>(loc, arguments[0]));
       case UnaryOperator::Negate: return Value(builder.create<arith::NegFOp>(loc, arguments[0]));
       default: break;
@@ -244,7 +222,7 @@ private:
     for (Value input : operation->getOperands())
       arguments.push_back(values.lookup(input));
     if (!tensor || tensor.getRank() == 0) {
-      auto result = arithmetic(operation, arguments);
+      auto result = arithmetic(operation, arguments, builder);
       if (failed(result)) return failure();
       values.map(operation->getResult(0), *result);
       return success();
@@ -253,14 +231,14 @@ private:
     if (failed(sizes)) return failure();
     Value output = allocate(tensor, *sizes, operation->getLoc());
     LogicalResult status = success();
-    elements(operation->getLoc(), *sizes, [&](ValueRange indices) {
-      SmallVector<Value> scalars;
-      for (Value input : arguments)
-        scalars.push_back(element(input, indices, operation->getLoc()));
-      auto result = arithmetic(operation, scalars);
-      if (failed(result)) { status = failure(); return; }
-      builder.create<memref::StoreOp>(operation->getLoc(), *result, output, indices);
-    });
+    builder.create<linalg::GenericOp>(operation->getLoc(), arguments,
+        ValueRange{output}, pointwiseMaps(arguments, tensor.getRank()),
+        SmallVector<utils::IteratorType>(tensor.getRank(), utils::IteratorType::parallel),
+        [&](OpBuilder &nested, Location loc, ValueRange scalars) {
+          auto result = arithmetic(operation, scalars.take_front(arguments.size()), nested);
+          if (failed(result)) { status = failure(); return; }
+          nested.create<linalg::YieldOp>(loc, *result);
+        });
     values.map(operation->getResult(0), output);
     return status;
   }
@@ -276,22 +254,30 @@ private:
       return operation.emitError("CPU reduction currently requires a rank-one source");
     Value initial = values.lookup(operation.getInputs()[1]);
     Location loc = operation.getLoc();
-    auto loop = builder.create<scf::ForOp>(loc, constant(loc, 0),
-        builder.create<memref::DimOp>(loc, input, 0), constant(loc, 1), ValueRange{initial});
-    loop->setAttr("cpu.ordered_reassociation", builder.getUnitAttr());
+    Value extent = builder.create<memref::DimOp>(loc, input, 0);
+    auto reduction = builder.create<cpu::ReduceOp>(loc, initial.getType(),
+        extent, initial, ValueRange{input},
+        builder.getArrayAttr({AffineMapAttr::get(builder.getMultiDimIdentityMap(1))}),
+        cpu::ReductionOrderAttr::get(builder.getContext(), false));
+    Block *body = &reduction.getCombine().emplaceBlock();
+    body->addArgument(initial.getType(), loc);
+    body->addArgument(type.getElementType(), loc);
     {
       OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToStart(loop.getBody());
-      Value current = builder.create<memref::LoadOp>(loc, input, ValueRange{loop.getInductionVar()});
+      builder.setInsertionPointToStart(body);
       Block &combine = operation.getCombine().front();
-      values.map(combine.getArgument(0), loop.getRegionIterArgs()[0]);
-      values.map(combine.getArgument(1), current);
+      values.map(combine.getArgument(0), body->getArgument(0));
+      values.map(combine.getArgument(1), body->getArgument(1));
       for (Operation &nested : combine.without_terminator())
         if (failed(lowerOperation(&nested))) return failure();
       Value result = values.lookup(combine.getTerminator()->getOperand(0));
-      builder.create<scf::YieldOp>(loc, result);
+      builder.create<cpu::YieldOp>(loc, result);
+      auto add = result.getDefiningOp<arith::AddFOp>();
+      if (add && body->getArgument(0).hasOneUse() &&
+          (add.getLhs() == body->getArgument(0) || add.getRhs() == body->getArgument(0)))
+        reduction.setOrderAttr(cpu::ReductionOrderAttr::get(builder.getContext(), true));
     }
-    values.map(operation.getResults()[0], loop.getResult(0));
+    values.map(operation.getResults()[0], reduction.getResult());
     return success();
   }
 
@@ -403,9 +389,12 @@ private:
       if (failed(sizes)) return failure();
       Value input = values.lookup(op.getInputs()[0]);
       Value output = allocate(tensor, *sizes, loc);
-      elements(loc, *sizes, [&](ValueRange indices) {
-        builder.create<memref::StoreOp>(loc, element(input, indices, loc), output, indices);
-      });
+      builder.create<linalg::GenericOp>(loc, ValueRange{input}, ValueRange{output},
+          pointwiseMaps(ValueRange{input}, tensor.getRank()),
+          SmallVector<utils::IteratorType>(tensor.getRank(), utils::IteratorType::parallel),
+          [](OpBuilder &nested, Location loc, ValueRange scalars) {
+            nested.create<linalg::YieldOp>(loc, scalars[0]);
+          });
       values.map(op.getResult(), output);
     } else if (auto op = dyn_cast<ReduceOp>(operation)) {
       return reduce(op);
@@ -435,7 +424,6 @@ LogicalResult lowerCanonicalKIRToCPU(ModuleOp module) {
   CanonicalKernelAnalysis analysis(module);
   if (failed(analysis.verify())) return failure();
   auto physical = OwningOpRef<ModuleOp>(ModuleOp::create(module.getLoc()));
-  (*physical)->setAttr("cpu.execution_family", StringAttr::get(module.getContext(), "cpu"));
   Construction construction(module, *physical);
   unsigned count = 0;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {

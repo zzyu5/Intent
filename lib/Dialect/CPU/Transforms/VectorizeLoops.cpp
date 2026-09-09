@@ -1,4 +1,4 @@
-#include "Intent/Transforms/CPU/Passes.h"
+#include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Utilities.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -115,7 +115,8 @@ void vectorize(scf::ForOp original, int64_t width) {
   if (!matchPattern(original.getStep(), m_One()) || original.getNumResults() > 1) return;
   Value reductionInput;
   if (original.getNumResults() == 1) {
-    if (!original->hasAttr("cpu.ordered_reassociation") ||
+    auto order = original->getAttrOfType<ReductionOrderAttr>("intent_cpu.reduction_order");
+    if (!order || !order.getAdjacentReassociation() ||
         !original.getResult(0).getType().isF32()) return;
     auto combine = original.getBody()->getTerminator()->getOperand(0).getDefiningOp<arith::AddFOp>();
     if (!combine) return;
@@ -172,7 +173,7 @@ void vectorize(scf::ForOp original, int64_t width) {
   }
   original.setLowerBound(full);
   if (reductionInput) original.getInitArgsMutable().assign(vectorLoop.getResults());
-  original->removeAttr("cpu.ordered_reassociation");
+  original->removeAttr("intent_cpu.reduction_order");
 }
 
 }

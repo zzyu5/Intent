@@ -59,7 +59,7 @@ CPU 不是仅含 AVX SIMD 的专用路径。共同模型须保持 scalar、shape
 
 # 待解决问题
 
-无。Weft `rsqrt` 所需的有限外部修改及独立提交已获得用户授权。
+- [blocking] 是否将 Weft 的有限修改授权扩展到保持 logical axes 的动态矩形 View 接口及其正式 lowering？当前 CPU blocking 的输入/输出区域具有来自 task/K-loop 的 SSA offset、extent；Weft `KernelOps.td:237` 仅提供静态 `subview`，`KernelDialect.cpp:1170` 进一步限制其结果只能用于 commit。`slice` 的 scalar index 删除对应 axis，domain selector 则要求 Weft Level 产生的 Point，不能直接绑定外部 CPU task 坐标。原 `rsqrt` 授权没有覆盖该接口；不以全量 admit 后 gather、拆成多个叶函数或回到 KIR 重建遍历替代 A3。Weft 中其他并行工作继续保持只读，A1–A5 与性能门槛不变。
 
 # 验证预期
 
