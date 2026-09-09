@@ -22,6 +22,7 @@ class PreparedLaunch:
     launch: Callable[[], object]
     outputs: Callable[[], TensorTree]
     prepare: Callable[[], object] | None = None
+    native_benchmark: Callable[[], float] | None = None
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class PreparedComparison:
     cuda_graph: bool
     status: str = "pass"
     note: str = ""
+    device_type: str = "cuda"
 
 
 @dataclass(frozen=True)

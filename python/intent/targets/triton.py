@@ -27,6 +27,7 @@ class ResolvedTritonTarget:
         source: str,
         module_text: str,
         entry_name: str,
+        metadata: dict[str, object],
     ) -> CompiledArtifact:
         return materialize_triton_artifact(
             source, module_text, entry_name, self.capabilities.device

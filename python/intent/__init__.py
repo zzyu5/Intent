@@ -16,6 +16,7 @@ from .runtime import CompiledArtifact
 from .targets import CuTileTarget
 from .targets import TileLangTarget
 from .targets import TritonTarget
+from .targets import MojoTarget
 
 
 __all__ = [
@@ -35,6 +36,7 @@ __all__ = [
     "CuTileTarget",
     "TileLangTarget",
     "TritonTarget",
+    "MojoTarget",
     "FrontendError",
     "lower_to_mlir",
 ]

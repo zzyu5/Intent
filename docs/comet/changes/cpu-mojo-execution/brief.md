@@ -44,11 +44,11 @@
 - 工具使用用户级隔离环境、官方编辑器扩展和需要的官方 skills/docs MCP，不修改系统 Python 或原 GPU 环境。安装结果不等于 CPU backend 已完成。
 - 当前 `tools/intent-compile/intent-compile.cpp:132–183` 无条件先进入 GPU construction，最后才分 provider；`ref/triton/python/triton/compiler/compiler.py:289–327` 由所选 backend 提供实际 stages。具体后果是 Intent 的 CPU 分叉必须前移，不能只给末端 switch 增加 Mojo serializer。
 - `ref/modular/Mojo/stdlib/std/algorithm/backend/vectorize.mojo:115–155` 显式处理 SIMD 遍历与尾部；`ref/modular/max/mojo/max/algorithm/backend/cpu/elementwise.mojo:77–99` 组合任务分区与向量化；`ref/modular/max/kernels/src/linalg/matmul/cpu/impl.mojo:328–495` 显式形成 packing、分块与 microkernel 调用。这些是实现参考，不是让 emitter 自动补全结构的授权，也不是需求来源覆盖清单。
-- 首批范围、native ABI、有限 tuning、三条 benchmark 及本轮不设历史性能 ratio 门槛，随下面的完整 Shape 摘要统一确认；尚未授权越过最终确认进入 Build。
+- 用户已确认完整 Shape 并授权进入 Build：首批 f32 三类程序、独立 CPU physical program、native C ABI、有限 tuning、三条正式 benchmark 及本轮不设历史性能 ratio 门槛全部保持本规格范围。
 
 # 待解决问题
 
-- [blocking] CONFIRM: 确认以独立 CPU physical program → Mojo SIMD → native C ABI 为本轮完整范围，同时实现 f32 逐点融合、行归约和 dense GEMM、真实有限 tuning 与三条正式性能 benchmark；不纳入 AMX/全 GPU registry/历史 1.05 门槛，不把优化放入 emitter。确认后进入 Build。
+无。完整 Shape 已获用户确认。
 
 # 验证预期
 

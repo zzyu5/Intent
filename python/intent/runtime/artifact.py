@@ -57,6 +57,7 @@ class CompiledArtifact:
     _runner: Callable[..., object] = field(repr=False)
     _backend_ir_collector: BackendIRCollector | None = field(repr=False)
     _namespace: dict[str, object] = field(repr=False)
+    device_type: str = field(default="cuda", kw_only=True)
     backend_ir: dict[str, str] = field(default_factory=dict, init=False)
 
     @property
@@ -92,12 +93,16 @@ class CompiledArtifact:
     ) -> object:
         import torch
 
-        expected = torch.device("cuda", self.device)
+        expected = torch.device(self.device_type, self.device) if self.device_type == "cuda" else torch.device(self.device_type)
         for index, argument in enumerate(arguments):
             if isinstance(argument, torch.Tensor) and argument.device != expected:
                 raise ValueError(
                     f"compiled artifact is bound to {expected}, but tensor argument "
                     f"{index} is on {argument.device}"
                 )
-        with torch.cuda.device(expected):
+        if expected.type == "cuda":
+            with torch.cuda.device(expected):
+                return function(*arguments)
+        if expected.type == "cpu":
             return function(*arguments)
+        raise NotImplementedError(f"artifact invocation for {expected.type}")

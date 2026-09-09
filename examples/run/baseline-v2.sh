@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
-  echo "usage: $0 <triton|cutile|tilelang> <output.csv> [kernel ...]" >&2
+  echo "usage: $0 <triton|cutile|tilelang|mojo> <output.csv> [kernel ...]" >&2
   exit 2
 fi
 
@@ -21,6 +21,10 @@ llvm_dir=${INTENT_LLVM_DIR:-/usr/lib/llvm-20/lib/cmake/llvm}
 tuning_config=${INTENT_TUNING_CONFIG:-}
 
 case "${provider}" in
+  mojo)
+    default_python="${HOME}/.venvs/intentdsl-mlir20/bin/python"
+    export INTENT_MOJO="${INTENT_MOJO:-${HOME}/.venvs/intentdsl-mojo/bin/mojo}"
+    ;;
   triton)
     default_python=/home/kingdom/.venvs/intentdsl-mlir20/bin/python
     ;;

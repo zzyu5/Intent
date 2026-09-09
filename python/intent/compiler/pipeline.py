@@ -28,7 +28,7 @@ def compile(
         resolved = target.resolve()
     except Exception as error:
         raise CompilationStageError("target_resolution", str(error)) from error
-    source, realized_mlir = run_compiler(
+    source, realized_mlir, metadata = run_compiler(
         compiler,
         kernel_mlir,
         resolved.compiler_options + (
@@ -38,7 +38,7 @@ def compile(
         resolved.compiler_role,
     )
     try:
-        return resolved.materialize(source, realized_mlir, definition.__name__)
+        return resolved.materialize(source, realized_mlir, definition.__name__, metadata)
     except Exception as error:
         raise CompilationStageError(
             "generated_source_materialization", str(error)

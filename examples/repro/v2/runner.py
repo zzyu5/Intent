@@ -43,6 +43,8 @@ WORKER_TIMEOUT_SECONDS = 300
 
 
 def _target(provider: str):
+    if provider == "mojo":
+        return intent.MojoTarget(workers=8)
     if provider == "triton":
         return intent.TritonTarget(device=0)
     if provider == "cutile":
@@ -88,7 +90,11 @@ def _run_entry(
     tuning_config: Path | None, before_benchmark,
 ) -> ResultRow:
     report_stage("device_setup")
-    torch.cuda.set_device(0)
+    if provider == "mojo":
+        from .providers.mojo.common import configure_cpu_budget
+        configure_cpu_budget(8)
+    else:
+        torch.cuda.set_device(0)
     torch.manual_seed(0)
     project_root = Path(__file__).resolve().parents[3]
     context = Context(

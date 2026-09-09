@@ -13,6 +13,20 @@ class Activation(I.Enum):
 
 
 @intent.kernel
+def gemm_f32(
+    a: I.In[I.f32, ("M", "K")],
+    b: I.In[I.f32, ("K", "N")],
+    c: I.Out[I.f32, ("M", "N")],
+):
+    M, K = a.shape
+    _, N = b.shape
+    m = I.domain(0, M)
+    n = I.domain(0, N)
+    k = I.domain(0, K)
+    c[m, n] = I.matmul(a[m, k], b[k, n], acc_dtype=I.f32)
+
+
+@intent.kernel
 def gemm(
     a: I.In[I.f16, ("M", "K")],
     b: I.In[I.f16, ("K", "N")],

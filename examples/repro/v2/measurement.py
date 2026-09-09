@@ -244,17 +244,35 @@ def _compare_float_chunk(
     return 0.0
 
 
+def _synchronize(comparison: PreparedComparison) -> None:
+    if comparison.device_type == "cuda":
+        torch.cuda.synchronize()
+    elif comparison.device_type != "cpu":
+        raise NotImplementedError(f"benchmark completion for {comparison.device_type}")
+
+
+def _benchmark_launch(launch: PreparedLaunch, comparison: PreparedComparison, warmup: int) -> float:
+    if launch.native_benchmark is not None:
+        return launch.native_benchmark()
+    if comparison.device_type != "cuda":
+        raise NotImplementedError("CPU benchmark requires a native repeat/timing entry")
+    return benchmark(launch.launch, warmup=warmup, repetitions=MEASUREMENT_REPETITIONS,
+                     cuda_graph=comparison.cuda_graph, prepare=launch.prepare)[0]
+
+
 def evaluate(
     comparison: PreparedComparison,
     *,
     before_benchmark: Callable[[], None] | None = None,
 ) -> tuple[float | None, float | None]:
+    if comparison.device_type == "cpu" and before_benchmark is not None:
+        before_benchmark()
     report_stage("generated_launch")
     try:
         if comparison.generated.prepare is not None:
             comparison.generated.prepare()
         comparison.generated.launch()
-        torch.cuda.synchronize()
+        _synchronize(comparison)
     except Exception as error:
         raise PipelineStageError("generated_launch", str(error)) from error
     report_stage("source_launch")
@@ -262,7 +280,7 @@ def evaluate(
         if comparison.source.prepare is not None:
             comparison.source.prepare()
         comparison.source.launch()
-        torch.cuda.synchronize()
+        _synchronize(comparison)
     except Exception as error:
         raise PipelineStageError("source_launch", str(error)) from error
     report_stage("numerical_comparison")
@@ -273,50 +291,26 @@ def evaluate(
     )
     if comparison.status != "pass":
         return None, None
-    if before_benchmark is not None:
+    if comparison.device_type != "cpu" and before_benchmark is not None:
         before_benchmark()
     report_stage("generated_benchmark")
     try:
-        generated_first, _ = benchmark(
-            comparison.generated.launch,
-            warmup=25,
-            repetitions=MEASUREMENT_REPETITIONS,
-            cuda_graph=comparison.cuda_graph,
-            prepare=comparison.generated.prepare,
-        )
+        generated_first = _benchmark_launch(comparison.generated, comparison, 25)
     except Exception as error:
         raise PipelineStageError("generated_benchmark", str(error)) from error
     report_stage("source_benchmark")
     try:
-        source_first, _ = benchmark(
-            comparison.source.launch,
-            warmup=25,
-            repetitions=MEASUREMENT_REPETITIONS,
-            cuda_graph=comparison.cuda_graph,
-            prepare=comparison.source.prepare,
-        )
+        source_first = _benchmark_launch(comparison.source, comparison, 25)
     except Exception as error:
         raise PipelineStageError("source_benchmark", str(error)) from error
     report_stage("source_reverse_benchmark")
     try:
-        source_second, _ = benchmark(
-            comparison.source.launch,
-            warmup=0,
-            repetitions=MEASUREMENT_REPETITIONS,
-            cuda_graph=comparison.cuda_graph,
-            prepare=comparison.source.prepare,
-        )
+        source_second = _benchmark_launch(comparison.source, comparison, 0)
     except Exception as error:
         raise PipelineStageError("source_reverse_benchmark", str(error)) from error
     report_stage("generated_reverse_benchmark")
     try:
-        generated_second, _ = benchmark(
-            comparison.generated.launch,
-            warmup=0,
-            repetitions=MEASUREMENT_REPETITIONS,
-            cuda_graph=comparison.cuda_graph,
-            prepare=comparison.generated.prepare,
-        )
+        generated_second = _benchmark_launch(comparison.generated, comparison, 0)
     except Exception as error:
         raise PipelineStageError("generated_reverse_benchmark", str(error)) from error
     return (

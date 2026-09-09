@@ -77,3 +77,4 @@ KIR origin只用于语义保持验证、诊断和追踪。GPU program本身必�
 - [`passes-and-analyses.md`](passes-and-analyses.md)：analysis、transformation、verification与semantic-preservation；
 - [`physical-parameters.md`](physical-parameters.md)：compile-time physical parameters、candidate legality与下层tuning；
 - [`target-lowering.md`](target-lowering.md)：provider extensions、architecture features、serialization与外部compiler边界。
+- [`cpu-program-ir.md`](cpu-program-ir.md)：CPU executable program、memory/vector/task transformations 与 Mojo native provider 边界。

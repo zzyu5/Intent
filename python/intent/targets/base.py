@@ -17,6 +17,7 @@ class ResolvedTarget(Protocol):
         source: str,
         module_text: str,
         entry_name: str,
+        metadata: dict[str, object],
     ) -> CompiledArtifact: ...
 
 

@@ -1,4 +1,8 @@
 #include "Intent/Conversion/KIRToGPU/KIRToGPU.h"
+#include "Intent/Conversion/KIRToCPU/KIRToCPU.h"
+#include "Intent/Transforms/CPU/Passes.h"
+#include "Intent/Target/Mojo/Serialization/Serializer.h"
+#include "Intent/Target/Mojo/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/IR/GPUDialect.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
@@ -16,6 +20,10 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/InitAllDialects.h"
 #include "mlir/Parser/Parser.h"
@@ -27,7 +35,7 @@
 
 namespace {
 
-enum class TargetKind { Triton, CuTile, TileLang };
+enum class TargetKind { Triton, CuTile, TileLang, Mojo };
 
 enum class ExitCode : int {
   Success = 0,
@@ -55,7 +63,8 @@ int main(int argc, char **argv) {
       llvm::cl::values(
           clEnumValN(TargetKind::Triton, "triton", "Triton DSL"),
           clEnumValN(TargetKind::CuTile, "cutile", "cuTile DSL"),
-          clEnumValN(TargetKind::TileLang, "tilelang", "TileLang DSL")));
+          clEnumValN(TargetKind::TileLang, "tilelang", "TileLang DSL"),
+          clEnumValN(TargetKind::Mojo, "mojo", "Mojo CPU SIMD")));
 
   // Compile-call inputs are parsed but not interpreted before the shared
   // executable GPU Program exists.
@@ -82,6 +91,9 @@ int main(int argc, char **argv) {
       llvm::cl::init(""));
   llvm::cl::opt<std::string> sourceOutputFilename("source-output",
                                                   llvm::cl::init(""));
+  llvm::cl::opt<std::string> metadataOutputFilename("metadata-output", llvm::cl::init(""));
+  llvm::cl::opt<int64_t> cpuVectorBits("cpu-vector-bits", llvm::cl::init(0));
+  llvm::cl::opt<int64_t> cpuWorkers("cpu-workers", llvm::cl::init(0));
   llvm::cl::opt<bool> stopAfterShared(
       "stop-after-shared",
       llvm::cl::desc("stop after the full shared GPU verifier"),
@@ -115,6 +127,26 @@ int main(int argc, char **argv) {
     llvm::sys::path::append(path, name);
     return path.str().str();
   };
+  std::string source;
+  std::string metadata = "{}";
+  if (target == TargetKind::Mojo) {
+    if (stopAfterShared) {
+      llvm::errs() << "--stop-after-shared selects the GPU family, not CPU\n";
+      return exitCode(ExitCode::Invocation);
+    }
+    context.loadDialect<mlir::linalg::LinalgDialect, mlir::math::MathDialect,
+                        mlir::memref::MemRefDialect, mlir::vector::VectorDialect>();
+    if (mlir::failed(intent::lowerCanonicalKIRToCPU(*module)))
+      return exitCode(ExitCode::PhysicalProgram);
+    if (mlir::failed(intent::cpu::runCPUPasses(*module, cpuVectorBits, cpuWorkers,
+                                              profilePath("cpu.json"), tuningConfigFilename)))
+      return exitCode(ExitCode::PhysicalProgramVerification);
+    metadata.clear();
+    if (mlir::failed(intent::mojo::legalizeProgram(*module)))
+      return exitCode(ExitCode::ProviderProgramVerification);
+    if (mlir::failed(intent::mojo::serializeProgram(*module, source, metadata)))
+      return exitCode(ExitCode::TerminalTranslation);
+  } else {
   const llvm::StringRef sharedColumns[] = {
       "ownership_m", "ownership_n", "reduction", "reduction_outer", "scan",
       "traversal_workers", "traversal_group"};
@@ -162,7 +194,6 @@ int main(int argc, char **argv) {
     irOutput << "\n";
     return exitCode(ExitCode::Success);
   }
-  std::string source;
   mlir::LogicalResult provider = mlir::failure();
   mlir::LogicalResult serialized = mlir::failure();
   switch (target) {
@@ -181,11 +212,14 @@ int main(int argc, char **argv) {
     if (mlir::succeeded(provider))
       serialized = intent::tilelang::serializeProgram(*module, source);
     break;
+  case TargetKind::Mojo:
+    llvm_unreachable("CPU construction is selected before GPU construction");
   }
   if (mlir::failed(provider))
     return exitCode(ExitCode::ProviderProgramVerification);
   if (mlir::failed(serialized))
     return exitCode(ExitCode::TerminalTranslation);
+  }
   if (irOutputFilename.empty() || sourceOutputFilename.empty()) {
     llvm::errs() << "both --ir-output and --source-output are required\n";
     return exitCode(ExitCode::CompilerOutput);
@@ -209,5 +243,13 @@ int main(int argc, char **argv) {
   }
   sourceOutput << source;
   sourceOutput.close();
+  if (!metadataOutputFilename.empty()) {
+    llvm::raw_fd_ostream metadataOutput(metadataOutputFilename, error, llvm::sys::fs::OF_Text);
+    if (error) {
+      llvm::errs() << "cannot open artifact metadata output: " << error.message() << "\n";
+      return exitCode(ExitCode::CompilerOutput);
+    }
+    metadataOutput << metadata << "\n";
+  }
   return exitCode(ExitCode::Success);
 }

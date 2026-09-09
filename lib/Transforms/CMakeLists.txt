@@ -8,3 +8,5 @@ add_mlir_library(MLIRIntentTransforms
   MLIRPass
   MLIRSupport
 )
+
+add_subdirectory(CPU)

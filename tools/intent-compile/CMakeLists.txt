@@ -6,6 +6,8 @@ add_llvm_executable(intent-compile
 
 llvm_update_compile_flags(intent-compile)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/profiles")
+configure_file("${PROJECT_SOURCE_DIR}/lib/Transforms/CPU/TuningProfiles.json"
+               "${CMAKE_CURRENT_BINARY_DIR}/profiles/cpu.json" COPYONLY)
 configure_file("${PROJECT_SOURCE_DIR}/lib/Dialect/GPU/Transforms/TuningProfiles.json"
                "${CMAKE_CURRENT_BINARY_DIR}/profiles/shared.json" COPYONLY)
 foreach(provider Triton CuTile TileLang)
@@ -17,6 +19,10 @@ target_link_libraries(intent-compile PRIVATE
   ${dialect_libs}
   MLIRIntentDialect
   MLIRIntentKIRToGPU
+  MLIRIntentKIRToCPU
+  MLIRIntentCPUTransforms
+  MLIRIntentMojoSerialization
+  MLIRIntentMojoTransforms
   MLIRIntentCuTileDialect
   MLIRIntentCuTileTransforms
   MLIRIntentCuTileSerialization

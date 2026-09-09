@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import tempfile
+import json
 from pathlib import Path
 
 
@@ -28,7 +29,7 @@ def run_compiler(
     module_text: str,
     options: tuple[str, ...],
     role: str,
-) -> tuple[str, str]:
+) -> tuple[str, str, dict[str, object]]:
     executable = Path(executable_path)
     if not executable.is_file():
         raise CompilationStageError(
@@ -36,8 +37,9 @@ def run_compiler(
         )
     with tempfile.TemporaryDirectory(prefix="intentdsl-compile-") as directory:
         output_directory = Path(directory)
-        source_path = output_directory / "kernel.py"
+        source_path = output_directory / "kernel.source"
         mlir_path = output_directory / "kernel.mlir"
+        metadata_path = output_directory / "artifact.json"
         try:
             completed = subprocess.run(
                 [
@@ -45,6 +47,7 @@ def run_compiler(
                     *options,
                     f"--source-output={source_path}",
                     f"--ir-output={mlir_path}",
+                    f"--metadata-output={metadata_path}",
                     "-",
                 ],
                 input=module_text,
@@ -73,7 +76,8 @@ def run_compiler(
             raise CompilationStageError(
                 "compiler_output", f"{role} produced an empty compiler output"
             )
-        return source, realized_mlir
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        return source, realized_mlir, metadata
 
 
 def run_shared_compiler(
