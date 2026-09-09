@@ -1010,6 +1010,13 @@ Value stripAdditiveProjection(Value value, bool singleUse) {
 
 bool isLiteralZeroProjection(Value value) {
   while (Operation *operation = value.getDefiningOp()) {
+    if (auto extract = dyn_cast<ExtractOp>(operation)) {
+      auto record = extract.getRecord().getDefiningOp<MakeRecordOp>();
+      if (!record)
+        return false;
+      value = record.getFields()[extract.getField()];
+      continue;
+    }
     if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
       if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
         return integer.getValue().isZero();

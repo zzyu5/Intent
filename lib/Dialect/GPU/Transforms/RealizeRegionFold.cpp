@@ -1143,7 +1143,8 @@ onlineRegionPlan(RegionFoldOp fold,
 
 FailureOr<Value> coRealizeOnlineRegion(
     OpBuilder &builder, Location location, OnlineRegionPlan &plan,
-    IRMapping &summaryMapping, IRMapping &mergeMapping) {
+    IRMapping &summaryMapping, IRMapping &mergeMapping,
+    Value encodedCarry = {}) {
   auto summaryValue = [&](Value value) {
     return summaryMapping.lookupOrNull(value);
   };
@@ -1173,6 +1174,51 @@ FailureOr<Value> coRealizeOnlineRegion(
   auto mappedMoment = moment.getDefiningOp<ContractOp>();
   if (!mappedMass || !mappedMoment)
     return failure();
+  if (encodedCarry) {
+    auto carry = encodedCarry.getDefiningOp<MakeRecordOp>();
+    Value rawMaximum = summaryValue(plan.summary.maximum.getResult(0));
+    if (!carry || !rawMaximum)
+      return failure();
+    Value oldMaximum = carry.getFields()[plan.summary.maximumField];
+    Value oldMass = carry.getFields()[plan.summary.massField];
+    Value oldMoment = carry.getFields()[plan.summary.momentField];
+    FailureOr<Value> rightMaximum = projectPhysicalValueToSchema(
+        builder, location, rawMaximum, oldMaximum.getType());
+    if (failed(rightMaximum))
+      return failure();
+    // maxnum with the -inf reduction identity never returns NaN. Encoding an
+    // absent maximum as -inf therefore lets both empty and nonempty summaries
+    // use the same maximum operation. Keep the scale's validity select: it
+    // protects the empty/empty case without changing Inf/NaN multiplication.
+    combinedMaximum = builder.create<BinaryOp>(
+        location, oldMaximum.getType(), oldMaximum, *rightMaximum,
+        BinaryOperator::MaximumNum);
+    Value delta = builder.create<BinaryOp>(
+        location, oldMaximum.getType(), oldMaximum, combinedMaximum,
+        BinaryOperator::Subtract);
+    Value exponential = builder.create<UnaryOp>(
+        location, oldMaximum.getType(), delta,
+        plan.summary.exponential.getOperatorKind(),
+        plan.summary.exponential.getApproximate(),
+        plan.summary.exponential.getFlushToZero());
+    Value scalarZero = builder.create<arith::ConstantOp>(
+        location, builder.getF32FloatAttr(0));
+    Value zero = builder.create<SplatOp>(location, oldMaximum.getType(), scalarZero);
+    Value scale = builder.create<SelectOp>(
+        location, oldMaximum.getType(),
+        carry.getFields()[plan.summary.validityField], exponential, zero);
+    FailureOr<Value> massScale = projectPhysicalValueToSchema(
+        builder, location, scale, oldMass.getType());
+    FailureOr<Value> momentScale = projectPhysicalValueToSchema(
+        builder, location, scale, oldMoment.getType());
+    if (failed(massScale) || failed(momentScale))
+      return failure();
+    leftMassTerm = builder.create<BinaryOp>(
+        location, oldMass.getType(), *massScale, oldMass, BinaryOperator::Multiply);
+    leftMomentTerm = builder.create<BinaryOp>(
+        location, oldMoment.getType(), *momentScale, oldMoment,
+        BinaryOperator::Multiply);
+  }
   FailureOr<Value> projectedMaximum = projectPhysicalValueToSchema(
       builder, location, combinedMaximum, maskedScore.getType());
   FailureOr<Value> projectedZero = projectPhysicalValueToSchema(
@@ -1190,19 +1236,20 @@ FailureOr<Value> coRealizeOnlineRegion(
       location, probability.getType(), shifted,
       plan.summary.exponential.getOperatorKind(),
       plan.summary.exponential.getApproximate(), plan.summary.exponential.getFlushToZero());
-  auto directProbability = builder.create<SelectOp>(
+  auto directProbabilityOp = builder.create<SelectOp>(
       location, probability.getType(), memberValidity, directExponential,
       *projectedZero);
   if (Attribute origin = plan.summary.exponential->getAttr(originAttr)) {
     shifted->setAttr(originAttr, origin);
     directExponential->setAttr(originAttr, origin);
-    directProbability->setAttr(originAttr, origin);
+    directProbabilityOp->setAttr(originAttr, origin);
   }
+  Value directProbability = directProbabilityOp.getResult();
 
   ReduceOp directMass = cloneReductionWithSource(
-      builder, location, mappedMass, directProbability.getResult());
+      builder, location, mappedMass, directProbability);
   auto directProbabilityCast = builder.create<CastOp>(
-      location, probabilityCast.getType(), directProbability.getResult());
+      location, probabilityCast.getType(), directProbability);
   if (Attribute origin = plan.summary.probabilityCast->getAttr(originAttr))
     directProbabilityCast->setAttr(originAttr, origin);
   auto mappedRecord = mergedRecord.getDefiningOp<MakeRecordOp>();
@@ -1247,6 +1294,10 @@ FailureOr<Value> coRealizeOnlineRegion(
     }
     if (field == plan.summary.momentField) {
       fields.push_back(*projectedMoment);
+      continue;
+    }
+    if (encodedCarry && field == plan.summary.maximumField) {
+      fields.push_back(combinedMaximum);
       continue;
     }
     Value mapped = mergeValue(original);
@@ -1304,6 +1355,43 @@ Value restoreOptionalRecord(OpBuilder &builder, Location location, Value payload
                                                payloadField++));
   }
   return builder.create<MakeRecordOp>(location, plan.fullType, fields);
+}
+
+FailureOr<Value> restoreOnlineRecord(OpBuilder &builder, Location location,
+                                     Value payload,
+                                     const SummaryEmptinessPlan &plan,
+                                     unsigned massField,
+                                     std::optional<unsigned> encodedMaximum = {}) {
+  unsigned payloadField = massField - (plan.optionalField < massField);
+  auto massType = cast<FragmentType>(
+      cast<TypeAttr>(plan.payloadType.getFieldTypes()[payloadField]).getValue());
+  Value mass = builder.create<ExtractOp>(location, massType, payload,
+                                         payloadField);
+  Value scalarZero = builder.create<arith::ConstantOp>(
+      location, massType.getElementType(),
+      builder.getZeroAttr(massType.getElementType()));
+  Value zero = builder.create<SplatOp>(location, massType, scalarZero);
+  Value nonempty = builder.create<CompareOp>(
+      location, predicateType(massType), mass, zero, ComparePredicate::Ne);
+  Type validityType = cast<TypeAttr>(
+      plan.fullType.getFieldTypes()[plan.optionalField]).getValue();
+  FailureOr<Value> validity = projectPhysicalValueToSchema(
+      builder, location, nonempty, validityType);
+  if (failed(validity))
+    return failure();
+  Value restored = restoreOptionalRecord(builder, location, payload, plan, *validity);
+  if (encodedMaximum) {
+    auto record = restored.getDefiningOp<MakeRecordOp>();
+    OpBuilder::InsertionGuard insertion(builder);
+    builder.setInsertionPoint(record);
+    Value maximum = record.getFields()[*encodedMaximum];
+    Value canonicalZero = builder.create<SplatOp>(
+        location, maximum.getType(), scalarZero);
+    Value canonicalMaximum = builder.create<SelectOp>(
+        location, maximum.getType(), *validity, maximum, canonicalZero);
+    record->setOperand(*encodedMaximum, canonicalMaximum);
+  }
+  return restored;
 }
 
 void simplifyKnownRecordValues(func::FuncOp kernel) {
@@ -1920,6 +2008,7 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
         allTruePredicates.push_back(compare.getResult());
         if (upperBoundCount++ == 0) {
           firstMemberIsActive =
+              !strictUpper &&
               samePhysicalScalarExpression(master.getStart(),
                                            master.getLogicalStart()) &&
               samePhysicalScalarExpression(captureRange.getLogicalStart(),
@@ -2140,6 +2229,30 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   std::optional<SummaryEmptinessPlan> emptiness =
       summaryEmptinessPlan(fold, identities, memberPredicate);
   std::optional<OnlineRegionPlan> online = onlineRegionPlan(fold, emptiness);
+  // A nonempty normalized-exponential summary contains exp(0), hence its
+  // accumulated mass cannot be zero. Nonfinite scores produce NaN mass, for
+  // which != 0 remains true. Only the empty identity has zero mass. Rebuild
+  // validity at its uses instead of carrying it or peeling the first slice.
+  // This proof concerns the accumulated mass, not a rescaled incoming slice,
+  // whose contribution may legitimately underflow to zero.
+  bool massRepresentsValidity = false;
+  bool encodeEmptyMaximum = false;
+  if (online) {
+    auto identity = identities.front().getDefiningOp<MakeRecordOp>();
+    massRepresentsValidity =
+        identity &&
+        isLiteralZeroProjection(
+            identity.getFields()[online->summary.massField]) &&
+        isLiteralZeroProjection(online->summary.mass.getInputs()[1]);
+    encodeEmptyMaximum = massRepresentsValidity &&
+        queryBinaryCombineKind(online->summary.maximum.getCombine()) ==
+            BinaryOperator::MaximumNum &&
+        isLiteralZeroProjection(identity.getFields()[online->summary.maximumField]);
+    for (unsigned field : {online->summary.maximumField, online->summary.massField,
+                           online->summary.momentField})
+      encodeEmptyMaximum &= cast<FragmentType>(identity.getFields()[field].getType())
+                                .getElementType().isF32();
+  }
   SmallVector<AdditiveRegionContract> additive =
       additiveRegionContracts(fold, identities);
   bool needsSummaryMapping = online || !additive.empty();
@@ -2229,6 +2342,17 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
           return;
         }
         SmallVector<Value> combineArguments(carries.begin(), carries.end());
+        if (massRepresentsValidity) {
+          FailureOr<Value> restored = restoreOnlineRecord(
+              nested, nestedLocation, carries.front(), *emptiness,
+              online->summary.massField);
+          if (failed(restored)) {
+            failureReason = "online mass has no exact validity projection";
+            bodyFailed = true;
+            return;
+          }
+          combineArguments.front() = *restored;
+        }
         combineArguments.append(summary->begin(), summary->end());
         IRMapping mergeMapping;
         FailureOr<SmallVector<Value>> combined = inlinePureRegion(
@@ -2241,12 +2365,27 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
         }
         if (online) {
           FailureOr<Value> direct = coRealizeOnlineRegion(
-              nested, nestedLocation, *online, summaryMapping, mergeMapping);
+              nested, nestedLocation, *online, summaryMapping, mergeMapping,
+              encodeEmptyMaximum ? combineArguments.front() : Value());
+          if (failed(direct) && encodeEmptyMaximum) {
+            failureReason = "encoded online maximum could not close its merge graph";
+            bodyFailed = true;
+            return;
+          }
           if (succeeded(direct))
             combined->front() = *direct;
         }
         coRealizeAdditiveRegion(nested, nestedLocation, additive,
                                summaryMapping, mergeMapping);
+        if (massRepresentsValidity) {
+          FailureOr<Value> payload = stripOptionalRecord(
+              nested, nestedLocation, combined->front(), *emptiness);
+          if (failed(payload)) {
+            bodyFailed = true;
+            return;
+          }
+          combined->front() = *payload;
+        }
         nested.create<scf::YieldOp>(nestedLocation, *combined);
       });
     if (Attribute origin = fold->getAttr(originAttr))
@@ -2260,6 +2399,23 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     simplifyKnownRecordValues(kernel);
     eraseDeadPhysicalValues(kernel);
     return success();
+  };
+  auto finishResults = [&](ValueRange physicalResults) -> LogicalResult {
+    SmallVector<Value> results(physicalResults.begin(), physicalResults.end());
+    if (massRepresentsValidity) {
+      FailureOr<Value> restored = restoreOnlineRecord(
+          builder, location, results.front(), *emptiness,
+          online->summary.massField,
+          encodeEmptyMaximum ? std::optional<unsigned>(online->summary.maximumField)
+                             : std::nullopt);
+      if (failed(restored))
+        return fold.emitOpError("online result has no validity projection");
+      results.front() = *restored;
+    }
+    for (auto [oldResult, newResult] : llvm::zip(fold.getResults(), results))
+      oldResult.replaceAllUsesWith(newResult);
+    fold.erase();
+    return finish();
   };
 
   if (segment->hasAttr(coverageDimensionAttr)) {
@@ -2278,7 +2434,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     return finish();
   }
 
-  if (emptiness && specializePredicatePrefix &&
+  if (emptiness && !massRepresentsValidity && specializePredicatePrefix &&
       partition->firstMemberIsActive) {
     stop = partition->effectiveStop;
     Value nonempty = builder.create<CompareOp>(
@@ -2443,6 +2599,26 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   }
 
   SmallVector<Value> current(identities.begin(), identities.end());
+  if (massRepresentsValidity) {
+    FailureOr<Value> payload = stripOptionalRecord(
+        builder, location, current.front(), *emptiness);
+    if (failed(payload))
+      return fold.emitOpError("online identity has no payload projection");
+    current.front() = *payload;
+    if (encodeEmptyMaximum) {
+      unsigned field = online->summary.maximumField -
+                       (emptiness->optionalField < online->summary.maximumField);
+      auto record = current.front().getDefiningOp<MakeRecordOp>();
+      OpBuilder::InsertionGuard insertion(builder);
+      builder.setInsertionPoint(record);
+      Type type = record.getFields()[field].getType();
+      Value negativeInfinity = builder.create<arith::ConstantOp>(
+          location, FloatAttr::get(builder.getF32Type(),
+                                   APFloat::getInf(APFloat::IEEEsingle(), true)));
+      Value encoded = builder.create<SplatOp>(location, type, negativeInfinity);
+      record->setOperand(field, encoded);
+    }
+  }
   scf::ForOp allTrueLoop;
   if (specializePredicatePrefix) {
     allTrueLoop = emitLoop(zero, partition->allTrueStop, current,
@@ -2517,11 +2693,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     return fold.emitOpError("region-fold physicalization failed: ")
            << failureReason;
   }
-  for (auto [oldResult, newResult] :
-       llvm::zip(fold.getResults(), tailLoop.getResults()))
-    oldResult.replaceAllUsesWith(newResult);
-  fold.erase();
-  return finish();
+  return finishResults(tailLoop.getResults());
 }
 
 LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
