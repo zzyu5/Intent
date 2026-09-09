@@ -949,7 +949,8 @@ private:
         call += ", latency=(None if " + valueString(latency) + " == " +
                 std::to_string(inferredLoadPolicy) + " else " +
                 valueString(latency) + ")";
-      call += ", check_bounds=True)";
+      call += gather.getInBounds() ? ", check_bounds=False)"
+                                   : ", check_bounds=True)";
       assign(gather.getResult(), call);
     } else if (auto mma = dyn_cast<MMAOp>(operation)) {
       assign(mma.getResult(), "ct.mma(" + valueString(mma.getLhs()) + ", " +
@@ -1126,7 +1127,8 @@ private:
                          valueString(scatter.getValue());
       if (scatter.getValid())
         call += ", mask=" + valueString(scatter.getValid());
-      line(call + ", check_bounds=True)");
+      line(call + (scatter.getInBounds() ? ", check_bounds=False)"
+                                         : ", check_bounds=True)"));
     } else if (auto loop = dyn_cast<scf::ForOp>(operation)) {
       SmallVector<std::string> results;
       for (auto [result, initial] : llvm::zip(loop.getResults(), loop.getInitArgs())) {

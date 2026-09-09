@@ -1719,6 +1719,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
       continue;
     }
     auto result = cast<gpu::FragmentType>(load.getResult().getType());
+    bool activeInBounds = analysis.accessBounds(load).isExact();
     // Vector inputs stay register loads, not cluster TMA payloads.
     bool vectorInput = matrixCompute && result.getShape().size() == 1;
     gpu::PhysicalAccessBoundaryFact boundary =
@@ -1800,7 +1801,8 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
         return failure();
       auto replacement = nested.create<GatherLoadOp>(
           load.getLoc(), result, load.getResource(), *materialized,
-          load.getValid(), *fill, loopLatency, identityAxes(view.getRank()));
+          load.getValid(), *fill, loopLatency, identityAxes(view.getRank()),
+          activeInBounds ? nested.getUnitAttr() : UnitAttr());
       createdOperations.push_back(replacement);
       return replacement.getResult();
     };
@@ -2231,6 +2233,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
     }
     gpu::PhysicalAccessBoundaryFact boundary =
         analysis.boundaryValidity(store, /*allowRangeGuards=*/true);
+    bool activeInBounds = analysis.accessBounds(store).isExact();
     auto computationType =
         cast<gpu::FragmentType>(store.getValue().getType());
     FailureOr<NativeTileAccessPlan> plan = analyzeNativeTileAccess(
@@ -2314,7 +2317,8 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
         return failure();
       auto replacement = nested.create<ScatterStoreOp>(
           store.getLoc(), store.getResource(), *materialized, store.getValue(),
-          store.getValid(), identityAxes(view.getRank()));
+          store.getValid(), identityAxes(view.getRank()),
+          activeInBounds ? nested.getUnitAttr() : UnitAttr());
       createdOperations.push_back(replacement);
       return success();
     };

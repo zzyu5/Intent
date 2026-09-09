@@ -76,7 +76,9 @@ def IntentCuTile_GatherLoadOp : IntentCuTile_Op<"gather_load", [
                        Optional<IntentGPU_DataValue>:$valid,
                        Optional<IntentGPU_ScalarValue>:$fill,
                        Optional<Index>:$latency_policy,
-                       DenseI64ArrayAttr:$source_axes);
+                       DenseI64ArrayAttr:$source_axes,
+                       // Proven for active coordinates; does not replace valid.
+                       OptionalAttr<UnitAttr>:$in_bounds);
   let results = (outs IntentGPU_FragmentValue:$result);
   let hasVerifier = 1;
 }
@@ -89,7 +91,9 @@ def IntentCuTile_ScatterStoreOp : IntentCuTile_Op<"scatter_store", [
                        Variadic<IntentGPU_DataValue>:$coordinates,
                        IntentGPU_FragmentValue:$value,
                        Optional<IntentGPU_DataValue>:$valid,
-                       DenseI64ArrayAttr:$source_axes);
+                       DenseI64ArrayAttr:$source_axes,
+                       // Proven for active coordinates; does not replace valid.
+                       OptionalAttr<UnitAttr>:$in_bounds);
   let hasVerifier = 1;
 }
 
