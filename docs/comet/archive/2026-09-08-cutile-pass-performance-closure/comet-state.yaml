@@ -3,7 +3,7 @@ name: cutile-pass-performance-closure
 language: zh-CN
 phase: build
 status: active
-state_version: 2
+state_version: 3
 brief: brief.md
 spec_changes:
   - capability: cutile-pass-performance-closure
@@ -13,7 +13,7 @@ workspace:
   isolation: worktree
   change_branch: comet/cutile-pass-performance-closure
   target_branch: main
-  finish: null
+  finish: merge
 loop:
   stage: building
   goal_cycle: 1

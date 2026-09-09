@@ -1,5 +1,11 @@
 # Outcome
 
+本 change 于 2026-09-09 按用户明确要求停止归档。已有实现和性能表已合入 `main`；本任务移出 active change 集合，后续分析与行动另行确定范围，不自动恢复本轮。
+
+这是未完成任务的搁置归档，不是验收通过归档。Native Archive 因未到 archive-ready 且缺少 verification.md 而不能执行；按用户要求，仅归档正式文件并保留原始待验状态。`comet-state.yaml` 是停止前 Runtime 快照，其中 Build、active、pending、archived=false 及工作区绑定不代表本任务仍在执行或已经通过验收。本 Spec 不安装为当前 capability，以下正文仅保留历史目标。
+
+停止时仍有 H100 MLA/Gemma prefill 的 1.05 性能尾项，以及 RTX 5090D Gemma prefill 的 provider JIT/准备超时；完整新程序验收尚未完成。实际结果保留在 `report/baselinev2/cutile-5090.csv` 与 `report/baselinev2/cutile-h100.csv`，不因本次归档改成通过。
+
 通过通用 analyses/passes、合理的作者表达和真实有效的有限调优，收束当前 cuTile 算子的性能缺口。现有 RTX 5090D 与 H100 可比较的全部 72 个设备条目，在原有数值容差和既定算法、case、计时范围下逐项达到 generated/source GPU 执行延迟比值 G/S <= 1.05；编译成功、局部提速或增加参数本身不代表完成。
 
 # Scope

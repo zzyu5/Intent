@@ -1,5 +1,7 @@
 # Compiler 横向优化与性能攻坚
 
+本 change 已于 2026-09-09 按用户要求停止归档。本文保留未验收的历史目标，不作为当前 capability 或新的执行任务；停止决定及原始待验状态见 [brief](../../brief.md)。
+
 ## 目标与边界
 
 本能力在现有 IntentDSL、canonical KIR、shared physical program 和已有 target lowering 上，统一改进真实作者表达、共同执行结构与参数搜索，使现有编译路径获得可复用的优化能力，并满足下面锁定的性能硬目标。它不修改 `doc/` 定义的语言语义，不以一个作者 kernel 的加速代表 compiler 通用能力，也不承诺覆盖尚无实际需求的新后端或语言构造。

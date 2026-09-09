@@ -1,5 +1,9 @@
 # Outcome
 
+本 change 于 2026-09-09 按用户明确要求停止归档。已提交的横向优化及后续 cuTile 性能改进保留在 `main`；本任务移出 active change 集合，后续分析与行动另行确定范围，不自动恢复本轮。
+
+这是未完成任务的搁置归档，不是验收通过归档。Native Archive 因未到 archive-ready 且缺少 verification.md 而不能执行；按用户要求，仅归档正式文件。`comet-state.yaml` 原样保留停止前 Runtime 的 Build/active 快照和 A1—A3 待验结论，不代表本任务仍在执行，也不把后续 CSV 的改善追溯为本轮正式验收。本 Spec 不安装为当前 capability，以下正文仅保留历史目标。
+
 横向修复现有 Intent compiler 与作者 kernel 的共同性能问题，让相同语义和执行结构在各实际使用点及已有 target 中得到一致处理；保留能真实选择有效参数的有限 autotuning 与 provider JIT。同时，将用户确认时两张 cuTile CSV 中 G/S >= 5 的全部八个设备条目逐项收束到 G/S <= 1.1，数值保持现有容差。局部作者优化、结构重构和候选数量减少都不能单独替代这些结果。
 
 # Scope

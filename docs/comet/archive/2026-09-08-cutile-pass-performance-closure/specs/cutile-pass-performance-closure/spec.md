@@ -1,5 +1,7 @@
 # cuTile Pass-Based Performance Closure
 
+本 change 已于 2026-09-09 按用户要求停止归档。本文保留未验收的历史目标，不作为当前 capability 或新的执行任务；停止原因、未完成项及 Runtime 快照含义见 [brief](../../brief.md)。
+
 ## 目标与范围
 
 本能力通过现有 Intent compiler、作者 kernel 和 cuTile provider 的通用实现，解决当前 cuTile 性能缺口。它要求有效的 IR 优化与逐项性能结果同时成立，而不是只完成调参、改名或可执行路径闭合。下表固定当前 37 个 entry 的 case；名称只标识运行范围，不参与 compiler policy。
