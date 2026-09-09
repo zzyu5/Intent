@@ -18,7 +18,7 @@ def softmax(context):
     x = torch.randn((8192, 8192), dtype=torch.float32)
     return prepare_comparison(context, stable_softmax, (x,),
         "source/mojo/modular/normalization/softmax/softmax_runtime.py", Tolerance(1e-6, 1e-5),
-        "Source 调用安装的 Modular/MAX CPU Softmax；双方 max/exp/sum 后归一化，中间归约和除法实现可能不同。")
+        "Source 调用安装的 Modular/MAX CPU Softmax；双方 max/exp/sum 后显式以倒数乘法归一化，归约树仍可能不同。")
 
 
 def layer_norm(context):

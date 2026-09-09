@@ -12,7 +12,7 @@
 
 | 入口 | 作者表达 | 固定性能输入 |
 | --- | --- | --- |
-| examples/kernels/normalization/softmax.py:stable_softmax | maximumNumber reduce → exp(x−max) → sum → divide | f32，M=N=8192 |
+| examples/kernels/normalization/softmax.py:stable_softmax | maximumNumber reduce → exp(x−max) → sum → scalar reciprocal → multiply | f32，M=N=8192 |
 | examples/kernels/normalization/layer_norm.py:weighted_layer_norm | mean、second moment → variance → rsqrt → scale+bias | f32，M=8192、N=4096，inverse_features=1/4096、epsilon=1e-6 |
 
 这些入口用来约束通用 lowering 能力，不是 compiler matcher 的输入。Dynamic shape 仍由既有 CPU ABI 传递；不能只接受表内数值或以 case shape 替代 legality。
@@ -28,6 +28,8 @@ maximum_num 忽略单侧 NaN，双方 NaN 仍产生 NaN；它与传播 NaN 的 m
 本轮支持现有单 f32 accumulator、单逻辑轴、无 canonical capture 的 additive 与 maximumNumber reduction，及其可合法融合的逐点贡献表达。共享层保持 typed combine、identity、axes、result consumers；本轮不承诺任意 tuple/multi-axis/Welford reduce。
 
 Softmax 保持现有三阶段依赖；LayerNorm 保持 E[x²]−E[x]²，不把 ordinary arithmetic 改为 Welford 或另一方差方法。合法归约可重结合但不可任意 permutation；普通乘加不获得全局 FMA/fast-math 许可。
+
+共享 f32 stable_softmax 作者显式写出 inverse_denominator = 1.0 / denominator 与 numerator * inverse_denominator，以普通 f32 运算表达与 MAX 相同的归一化形式。这项已确认的作者表达改变对各 target 的同源生成生效；不改变 f16/bf16 入口，不授权 compiler 把其它普通逐元素除法隐式改为倒数乘法。算法、输入规模、外部 dtype、原容差和性能门槛保持不变。
 
 ## 4. 当前程序与优化职责
 

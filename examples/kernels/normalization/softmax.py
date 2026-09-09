@@ -32,7 +32,8 @@ def stable_softmax(
         maximum = softmax_maximum(values)
         numerator = I.exp(values - maximum)
         denominator = I.reduce.sum(numerator, axis=0)
-        y[row, columns] = numerator / denominator
+        inverse_denominator = 1.0 / denominator
+        y[row, columns] = numerator * inverse_denominator
 
 
 @intent.kernel

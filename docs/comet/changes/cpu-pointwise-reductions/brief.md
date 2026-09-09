@@ -5,7 +5,7 @@
 # 范围
 
 - 沿用已归档 cpu-mojo-execution 的 CPU family、typed ABI、Tasks、AxisRelations、Reduce 与 provider 边界；不另起 KIR→Weft 或按 kernel 名选择实现。
-- 保留作者代码和数值方法，接通普通 f32 exp、maximum_num、单逻辑轴上的 additive/maximumNumber combine，以及这些 reduce 与逐点 producer/consumer 的组合。
+- 保留 stable Softmax 与矩统计算法，接通普通 f32 exp、maximum_num、单逻辑轴上的 additive/maximumNumber combine，以及这些 reduce 与逐点 producer/consumer 的组合。允许共享 f32 stable_softmax 作者显式采用 numerator * (1.0 / denominator) 归一化；其它作者表达不变。
 - 接受可与当前 contiguous CPU ABI 共同兑现的作者 stride constraints，至少覆盖 stable_softmax 的 strides=(None,1)、noalias；保留并兑现约束，不删除 annotation，也不暗中复制不支持的 view。
 - 让任务内多次归约、共享输入/中间值、尾部、局部存储及后续归一化由当前 CPU IR、analysis 和 passes 承载。Mojo serializer 只拼写；Weft 只消费已经形成的结构。
 - 本轮两条 native 性能项：stable_softmax，f32，8192×8192；weighted_layer_norm，f32，8192×4096，inverse_features=1/4096、epsilon=1e-6。均用单 NUMA 8 个物理核。
@@ -42,6 +42,7 @@
 
 - 已接受并归档 cpu-mojo-execution；本轮选择继续丰满 CPU 普通数学与归约能力，使用单个 Native change、main/current。
 - 用户已确认本 Shape 的目标、两项固定性能输入与门槛、同算法 MAX 基线、Mojo native/Weft generation-only 边界及非目标，授权进入 Build。
+- 用户已确认共享 f32 stable_softmax 的归一化表达调整：先以普通 f32 除法求一次倒数，再逐元素相乘，参考 MAX softmax.mojo:168–179、628–636。这是共享作者表达的显式改变，各 target 消费同一份新 KIR；不创建 CPU 特供版本，不隐式放宽 compiler 浮点语义，原算法、容差和性能门槛不变。f16/bf16 入口与 GPU compiler 不在此次表达调整范围内。
 - 不拆 Supervisor：共同 reduction/current-program analysis、Mojo/Weft lowering 与两项性能反复涉及同一核心；按算子或 provider 拆分没有独立交付价值。
 - 先做 CPU 的依据：KIRToCPU.cpp:185–215 尚无 exp/maximum_num；:43 对 stride annotation 一概拒绝。stable_softmax.py:25–26 正好携带兼容的行主序约束。Weft Legalize.cpp:387–410 只接受 add，但外部 Weft functions-and-operations.md:81、109 已定义匹配的 maximumNumber/max reduce；缺口在 Intent lowering，不需扩展 Weft。
 - 参考差异：Triton ReduceOpToLLVM.cpp:230–317 消费 combine 与当前 layout 形成局部树，并更新 layout；Intent 应同样从 typed combine/axes 建立实际 IR，但保持自己的 logical-order 语义，不复制 GPU register/warp ownership。
@@ -50,7 +51,7 @@
 
 # 待解决问题
 
-- [blocking] 为继续收束 A3，是否允许调整“保留作者代码”的范围：将共享 stable_softmax 作者末尾显式写成 numerator * (1.0 / denominator)，与 MAX 的倒数后乘法表达一致？保持 stable Softmax 算法、原容差和 G/S≤1.05，不放松 compiler 的普通浮点语义。该共享作者表达会影响各 target 的同源生成，不创建 CPU 特供版本；用户确认前保持当前作者代码与 Spec 不变。
+无。共享 f32 Softmax 作者表达调整已获用户确认。
 
 # 验证预期
 
