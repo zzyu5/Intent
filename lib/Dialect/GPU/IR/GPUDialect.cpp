@@ -27,8 +27,6 @@ using namespace intent::gpu;
 
 namespace intent::gpu {
 
-namespace {
-
 bool isCompileTimePhysicalExpr(PhysicalExprAttr expression) {
   auto kind = static_cast<PhysicalExprKind>(expression.getKind());
   if (kind == PhysicalExprKind::Constant || kind == PhysicalExprKind::Parameter)
@@ -40,8 +38,6 @@ bool isCompileTimePhysicalExpr(PhysicalExprAttr expression) {
     return isCompileTimePhysicalExpr(cast<PhysicalExprAttr>(operand));
   });
 }
-
-} // namespace
 
 BroadcastProjection queryAxisProjection(FragmentType source,
                                         FragmentType target) {

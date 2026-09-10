@@ -963,6 +963,107 @@ bool samePhysicalScalarExpression(Value lhs, Value rhs) {
   return sameScalarExpression(lhs, rhs);
 }
 
+PhysicalExprAttr queryLaunchExpression(Value value) {
+  std::function<PhysicalExprAttr(Value, unsigned)> query =
+      [&](Value current, unsigned depth) -> PhysicalExprAttr {
+    if (!current || depth >= 32 ||
+        !isa<IndexType, IntegerType>(current.getType()))
+      return {};
+    MLIRContext *context = current.getContext();
+    auto expression = [&](PhysicalExprKind kind, int64_t constant = 0,
+                          StringRef symbol = {},
+                          ArrayRef<Attribute> operands = {}) {
+      return PhysicalExprAttr::get(
+          context, static_cast<uint32_t>(kind), constant,
+          StringAttr::get(context, symbol), ArrayAttr::get(context, operands));
+    };
+    if (auto constant = current.getDefiningOp<arith::ConstantOp>()) {
+      auto integer = dyn_cast<IntegerAttr>(constant.getValue());
+      if (!integer || integer.getValue().getBitWidth() > 64)
+        return {};
+      auto type = dyn_cast<IntegerType>(current.getType());
+      if (type && (type.isUnsigned() || type.getWidth() == 1)) {
+        if (integer.getValue().getActiveBits() > 63)
+          return {};
+        return expression(PhysicalExprKind::Constant,
+                          integer.getValue().getZExtValue());
+      }
+      return expression(PhysicalExprKind::Constant, integer.getInt());
+    }
+    if (auto argument = dyn_cast<BlockArgument>(current)) {
+      auto kernel = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
+      if (!kernel)
+        return {};
+      DictionaryAttr attributes = kernel.getArgAttrDict(argument.getArgNumber());
+      auto kind = attributes.getAs<StringAttr>(abiKindAttr);
+      auto name = attributes.getAs<StringAttr>(abiNameAttr);
+      if (!kind || !name)
+        return {};
+      if (kind.getValue() == "dimension") {
+        auto dimension = attributes.getAs<IntegerAttr>(dimensionAttr);
+        return dimension ? expression(PhysicalExprKind::Dimension,
+                                      dimension.getInt(), name.getValue())
+                         : PhysicalExprAttr();
+      }
+      if (kind.getValue() == "scalar" || kind.getValue() == "constexpr" ||
+          kind.getValue() == "value" || kind.getValue() == "stride")
+        return expression(PhysicalExprKind::ScalarABI, 0, name.getValue());
+      return {};
+    }
+    if (auto dim = current.getDefiningOp<DimOp>())
+      return resourceExtentExpression(dim.getView(), dim.getAxis());
+    if (auto physical = current.getDefiningOp<PhysicalExprOp>())
+      return physical.getExpression();
+    if (auto parameter = current.getDefiningOp<ParameterOp>())
+      return expression(PhysicalExprKind::Parameter, 0,
+                        parameter.getParameter().getName().getValue());
+    if (auto cast = current.getDefiningOp<arith::IndexCastOp>()) {
+      auto integer = dyn_cast<IntegerType>(cast.getIn().getType());
+      return integer && !integer.isUnsigned() && integer.getWidth() > 1 &&
+                     integer.getWidth() <= 64 && current.getType().isIndex()
+                 ? query(cast.getIn(), depth + 1)
+                 : PhysicalExprAttr();
+    }
+    if (auto cast = current.getDefiningOp<CastOp>()) {
+      Type source = cast.getValue().getType();
+      auto integer = dyn_cast<IntegerType>(source);
+      bool preservesInteger = current.getType().isIndex() && integer &&
+          (integer.getWidth() < 64 ||
+           (integer.getWidth() == 64 && !integer.isUnsigned()));
+      return source == current.getType() || preservesInteger
+                 ? query(cast.getValue(), depth + 1)
+                 : PhysicalExprAttr();
+    }
+    if (auto bound = current.getDefiningOp<RangeBoundOp>()) {
+      auto range = bound.getRange().getDefiningOp<RangeOp>();
+      if (!range)
+        return {};
+      return query(bound.getBound() == 0 ? range.getStart()
+                   : bound.getBound() == 1 ? range.getStop() : range.getStep(),
+                   depth + 1);
+    }
+    auto binary = current.getDefiningOp<BinaryOp>();
+    if (!binary || !current.getType().isIndex())
+      return {};
+    PhysicalExprAttr lhs = query(binary.getLhs(), depth + 1);
+    PhysicalExprAttr rhs = query(binary.getRhs(), depth + 1);
+    if (!lhs || !rhs)
+      return {};
+    PhysicalExprKind kind;
+    switch (binary.getOperatorKind()) {
+    case BinaryOperator::Add: kind = PhysicalExprKind::Add; break;
+    case BinaryOperator::Subtract: kind = PhysicalExprKind::Subtract; break;
+    case BinaryOperator::Multiply: kind = PhysicalExprKind::Multiply; break;
+    case BinaryOperator::FloorDivide: kind = PhysicalExprKind::FloorDiv; break;
+    case BinaryOperator::Minimum: kind = PhysicalExprKind::Minimum; break;
+    case BinaryOperator::Maximum: kind = PhysicalExprKind::Maximum; break;
+    default: return {};
+    }
+    return expression(kind, 0, {}, {lhs, rhs});
+  };
+  return query(value, 0);
+}
+
 PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
   struct Bounds {
     bool nonNegative = false;

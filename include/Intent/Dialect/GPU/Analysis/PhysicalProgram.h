@@ -86,6 +86,10 @@ mlir::FailureOr<AxisMapAttr> queryAxisMap(mlir::Type type,
 mlir::FailureOr<int64_t> queryRangeDimension(MakeRangeOp range);
 bool samePhysicalScalarExpression(mlir::Value lhs, mlir::Value rhs);
 
+/// Exact launch-visible integer expression from current scalar SSA. Device
+/// accesses, program coordinates and ordered carries are not launch leaves.
+PhysicalExprAttr queryLaunchExpression(mlir::Value value);
+
 /// A compile-time inclusive upper bound for a proven non-negative scalar
 /// index, derived from current mapping, dimensions and clamps. Null means unknown.
 PhysicalExprAttr queryNonNegativeIndexUpperBound(mlir::Value value);

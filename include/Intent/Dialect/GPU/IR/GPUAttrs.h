@@ -9,4 +9,8 @@
 #define GET_ATTRDEF_CLASSES
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h.inc"
 
+namespace intent::gpu {
+bool isCompileTimePhysicalExpr(PhysicalExprAttr expression);
+}
+
 #endif

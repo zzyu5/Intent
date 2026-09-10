@@ -126,6 +126,24 @@ PhysicalExprAttr binaryExpression(MLIRContext *context, PhysicalExprKind kind,
       ArrayAttr::get(context, {lhs, rhs}));
 }
 
+PhysicalExprAttr launchRangeExtent(MakeRangeOp range) {
+  PhysicalExprAttr start = queryLaunchExpression(range.getLogicalStart());
+  PhysicalExprAttr stop = queryLaunchExpression(range.getLogicalStop());
+  PhysicalExprAttr step = queryLaunchExpression(range.getStep());
+  if (!start || !stop || !step)
+    return {};
+  if (step.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+      step.getValue() <= 0)
+    return {};
+  MLIRContext *context = range.getContext();
+  PhysicalExprAttr distance = binaryExpression(
+      context, PhysicalExprKind::Subtract, stop, start);
+  distance = binaryExpression(
+      context, PhysicalExprKind::Maximum, distance,
+      expression(context, PhysicalExprKind::Constant, 0));
+  return binaryExpression(context, PhysicalExprKind::CeilDiv, distance, step);
+}
+
 bool hasCompileTimeExtent(Value value) {
   return value.getDefiningOp<arith::ConstantOp>() ||
          value.getDefiningOp<ParameterOp>() ||
@@ -4228,6 +4246,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       const bool launchVisibleDimension =
           succeeded(sourceDimension) &&
           succeeded(dimensionArgument(kernel, *sourceDimension));
+      PhysicalExprAttr derivedExtent = launchRangeExtent(range);
+      const bool launchVisibleExtent = launchVisibleDimension ||
+          (derivedExtent && !isCompileTimePhysicalExpr(derivedExtent));
       ParameterCategory category = ParameterCategory::Pointwise;
       if (succeeded(sourceDimension)) {
         auto structured = structuredOwnershipCategories.find(*sourceDimension);
@@ -4238,13 +4259,13 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           contractFreeAxisFacts(kernel, range).regionContraction)
         category = ParameterCategory::RegionContraction;
       if (dynamicSubregion ||
-          launchVisibleDimension ||
+          launchVisibleExtent ||
           (logicalExtent && physicalExtent.getKind() ==
                                 static_cast<uint32_t>(PhysicalExprKind::Constant))) {
         SmallVector<int64_t> candidates;
         if (dynamicSubregion) {
           candidates.assign({1, 2, 4, 8, 16, 32, 64, 128, 256});
-        } else if (launchVisibleDimension) {
+        } else if (launchVisibleExtent) {
           candidates.assign({1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024,
                              2048, 4096});
         } else {
@@ -4691,6 +4712,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     }
     ParameterOp parameter = parameters.lookup(axisKey);
     Value dimension;
+    PhysicalExprAttr derivedLogicalExtent;
     std::optional<int64_t> staticExtent;
     FailureOr<uint64_t> sourceDimension = ownershipDimension(kernel, range);
     if (worksetPosition) {
@@ -4728,6 +4750,15 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     }
     if (!ownershipAxes.contains(axisKey))
       continue;
+    if (!dimension && llvm::all_of(ranges, [&](MakeRangeOp other) {
+          return sharesLogicalTraversal(range, other);
+        })) {
+      derivedLogicalExtent = launchRangeExtent(range);
+      if (derivedLogicalExtent)
+        dimension = mappingBuilder.create<PhysicalExprOp>(
+            mapping.getLoc(), mappingBuilder.getIndexType(),
+            derivedLogicalExtent);
+    }
     if (!dimension) {
       InFlightDiagnostic diagnostic = range.emitOpError(
           "dynamic ownership range has no launch-visible logical dimension");
@@ -4752,6 +4783,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     if (worksetPosition) {
       logical = cast<PhysicalExprAttr>(
           mapping.getLaunchExtents()[*worksetPosition]);
+    } else if (derivedLogicalExtent) {
+      logical = derivedLogicalExtent;
     } else if (isSourceAxisKey(axisKey) && staticExtent) {
       logical = expression(module.getContext(), PhysicalExprKind::Constant,
                            *staticExtent);
