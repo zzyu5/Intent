@@ -1,0 +1,9 @@
+def build(context):
+    compiled = context.load_source('abs.py')
+
+    def wrapper(input, *, out=None):
+        if out is None:
+            return compiled.run(input)
+        compiled(input, out)
+        return out
+    return wrapper

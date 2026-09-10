@@ -1,0 +1,3232 @@
+[
+  {
+    "task": "fused_bmm_rmsnorm_gelu_dropout_sub",
+    "entry": "fused_bmm_rmsnorm_gelu_dropout_sub",
+    "prompt_index": 0,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_bmm_rmsnorm_gelu_dropout_sub.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_bmm_rmsnorm_gelu_dropout_sub_perf.py",
+    "disposition": "out_of_scope",
+    "reason": "Training-time RNG contract is not closed; do not silently disable dropout."
+  },
+  {
+    "task": "div",
+    "entry": "div",
+    "prompt_index": 1,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/div.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/div_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "sigmoid_conv2d",
+    "entry": "sigmoid_conv2d",
+    "prompt_index": 2,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/sigmoid_conv2d.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/sigmoid_conv2d_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "solve_multiple_lu",
+    "entry": "solve_multiple_lu",
+    "prompt_index": 3,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/solve_multiple_lu.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/solve_multiple_lu_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "tanh",
+    "entry": "tanh",
+    "prompt_index": 4,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/tanh.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/tanh_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "tanh",
+    "family": "pointwise",
+    "input_index": 8,
+    "tolerance": "fp32",
+    "invocation": {
+      "input_tensor": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "out_tensor": null
+    }
+  },
+  {
+    "task": "relu_sqrt",
+    "entry": "relu_sqrt",
+    "prompt_index": 5,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/relu_sqrt.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/relu_sqrt_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "sqrt",
+    "entry": "sqrt",
+    "prompt_index": 6,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/sqrt.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/sqrt_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "sqrt",
+    "family": "pointwise",
+    "input_index": 8,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "out": null
+    }
+  },
+  {
+    "task": "sigmoid_argmax",
+    "entry": "sigmoid_argmax",
+    "prompt_index": 7,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/sigmoid_argmax.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/sigmoid_argmax_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "sub",
+    "entry": "sub",
+    "prompt_index": 8,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/sub.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/sub_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "grid_sample",
+    "entry": "grid_sample",
+    "prompt_index": 9,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/grid_sample.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/grid_sample_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "grid_sample",
+    "family": "indexing_layout",
+    "input_index": 0,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          16,
+          3,
+          256,
+          256
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          196608,
+          65536,
+          256,
+          1
+        ],
+        "device": "cuda"
+      },
+      "grid": {
+        "shape": [
+          16,
+          128,
+          128,
+          2
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          32768,
+          256,
+          2,
+          1
+        ],
+        "device": "cuda"
+      },
+      "mode": "bilinear",
+      "padding_mode": "zeros",
+      "align_corners": false
+    }
+  },
+  {
+    "task": "svd",
+    "entry": "svd",
+    "prompt_index": 10,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/svd.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/svd_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "i0",
+    "entry": "i0",
+    "prompt_index": 11,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/i0.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/i0_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "rsqrt",
+    "entry": "rsqrt",
+    "prompt_index": 12,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/rsqrt.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/rsqrt_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "rsqrt",
+    "family": "pointwise",
+    "input_index": 8,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "out": null
+    }
+  },
+  {
+    "task": "dropout_relu_batch_norm_conv2d",
+    "entry": "dropout_relu_batch_norm_conv2d",
+    "prompt_index": 13,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/dropout_relu_batch_norm_conv2d.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/dropout_relu_batch_norm_conv2d_perf.py",
+    "disposition": "out_of_scope",
+    "reason": "Training-time RNG contract is not closed; do not silently disable dropout."
+  },
+  {
+    "task": "fused_mv_logsoftmax_dropout",
+    "entry": "fused_mv_logsoftmax_dropout",
+    "prompt_index": 14,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_mv_logsoftmax_dropout.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_mv_logsoftmax_dropout_perf.py",
+    "disposition": "out_of_scope",
+    "reason": "Training-time RNG contract is not closed; do not silently disable dropout."
+  },
+  {
+    "task": "add",
+    "entry": "add",
+    "prompt_index": 15,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/add.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/add_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "fused_silu_layer_norm_conv2d",
+    "entry": "fused_silu_layer_norm_conv2d",
+    "prompt_index": 16,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_silu_layer_norm_conv2d.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_silu_layer_norm_conv2d_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "fused_index_select_eq",
+    "entry": "fused_index_select_eq",
+    "prompt_index": 17,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_index_select_eq.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_index_select_eq_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "fused_index_select_eq",
+    "family": "indexing_layout",
+    "input_index": 1,
+    "tolerance": "exact",
+    "invocation": {
+      "input": {
+        "shape": [
+          8192,
+          128
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          128,
+          1
+        ],
+        "device": "cuda"
+      },
+      "dim": 0,
+      "index": {
+        "shape": [
+          1024
+        ],
+        "dtype": "torch.int64",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "other": 0.0,
+      "out": null
+    }
+  },
+  {
+    "task": "argmax",
+    "entry": "argmax",
+    "prompt_index": 18,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/argmax.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/argmax_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "argmax",
+    "family": "reduction",
+    "input_index": 8,
+    "tolerance": "exact",
+    "invocation": {
+      "input_tensor": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float16",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "dim": 0,
+      "keepdim": false
+    }
+  },
+  {
+    "task": "fused_lu_solve",
+    "entry": "fused_lu_solve",
+    "prompt_index": 19,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_lu_solve.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_lu_solve_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "normalize_pairwise_distance",
+    "entry": "normalize_pairwise_distance",
+    "prompt_index": 20,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/normalize_pairwise_distance.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/normalize_pairwise_distance_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "max",
+    "entry": "max",
+    "prompt_index": 21,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/max.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/max_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "max",
+    "family": "reduction",
+    "input_index": 8,
+    "tolerance": "exact",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "dim": 0,
+      "keepdim": false
+    }
+  },
+  {
+    "task": "log_softmax_linear",
+    "entry": "log_softmax_linear",
+    "prompt_index": 22,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/log_softmax_linear.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/log_softmax_linear_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "relu",
+    "entry": "relu",
+    "prompt_index": 23,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/relu.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/relu_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "relu",
+    "family": "pointwise",
+    "input_index": 8,
+    "tolerance": "exact",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "inplace": false
+    }
+  },
+  {
+    "task": "least_squares_qr",
+    "entry": "least_squares_qr",
+    "prompt_index": 24,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/least_squares_qr.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/least_squares_qr_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "determinant_via_qr",
+    "entry": "determinant_via_qr",
+    "prompt_index": 25,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/determinant_via_qr.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/determinant_via_qr_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "fused_tile_exp",
+    "entry": "fused_tile_exp",
+    "prompt_index": 26,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_tile_exp.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_tile_exp_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "sqrt_tanh",
+    "entry": "sqrt_tanh",
+    "prompt_index": 27,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/sqrt_tanh.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/sqrt_tanh_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "silu_batch_norm",
+    "entry": "silu_batch_norm",
+    "prompt_index": 28,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/silu_batch_norm.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/silu_batch_norm_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "index_fill_",
+    "entry": "index_fill_",
+    "prompt_index": 29,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/index_fill_.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/index_fill__perf.py",
+    "disposition": "contract_pending",
+    "reason": "Input mutation requires an explicit replay reset contract."
+  },
+  {
+    "task": "fused_cross_entropy_softmax_layernorm",
+    "entry": "fused_cross_entropy_softmax_layernorm",
+    "prompt_index": 30,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_cross_entropy_softmax_layernorm.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_cross_entropy_softmax_layernorm_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "mean",
+    "entry": "mean",
+    "prompt_index": 31,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/mean.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/mean_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "mean",
+    "family": "reduction",
+    "input_index": 8,
+    "tolerance": "fp32",
+    "invocation": {
+      "input_tensor": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "dim": 0,
+      "keepdim": false,
+      "dtype": null,
+      "out": null
+    }
+  },
+  {
+    "task": "eig",
+    "entry": "eig",
+    "prompt_index": 32,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/eig.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/eig_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "logsumexp",
+    "entry": "logsumexp",
+    "prompt_index": 33,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/logsumexp.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/logsumexp_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "logsumexp",
+    "family": "reduction",
+    "input_index": 8,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "dim": 0,
+      "keepdim": false,
+      "out": null
+    }
+  },
+  {
+    "task": "fused_embedding_add_tanh",
+    "entry": "fused_embedding_add_tanh",
+    "prompt_index": 34,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_embedding_add_tanh.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_embedding_add_tanh_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "fused_mv_sigmoid_sub",
+    "entry": "fused_mv_sigmoid_sub",
+    "prompt_index": 35,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_mv_sigmoid_sub.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_mv_sigmoid_sub_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "fused_mv_sigmoid_sub",
+    "family": "contraction",
+    "input_index": 4,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1024,
+          1
+        ],
+        "device": "cuda"
+      },
+      "vec": {
+        "shape": [
+          1024
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "other": 0.5,
+      "alpha": 1,
+      "out": null
+    }
+  },
+  {
+    "task": "add_gelu",
+    "entry": "add_gelu",
+    "prompt_index": 36,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/add_gelu.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/add_gelu_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "add_gelu",
+    "family": "fusion",
+    "input_index": 8,
+    "tolerance": "fp16",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float16",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "other": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float16",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "alpha": 1,
+      "approximate": "none",
+      "out": null
+    }
+  },
+  {
+    "task": "fused_cosine_embedding_loss_with_normalization",
+    "entry": "fused_cosine_embedding_loss_with_normalization",
+    "prompt_index": 37,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_cosine_embedding_loss_with_normalization.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_cosine_embedding_loss_with_normalization_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "fused_transformer_block",
+    "entry": "fused_transformer_block",
+    "prompt_index": 38,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_transformer_block.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_transformer_block_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "log1p",
+    "entry": "log1p",
+    "prompt_index": 39,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/log1p.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/log1p_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "log1p",
+    "family": "pointwise",
+    "input_index": 8,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "out": null
+    }
+  },
+  {
+    "task": "sigmoid_batch_norm",
+    "entry": "sigmoid_batch_norm",
+    "prompt_index": 40,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/sigmoid_batch_norm.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/sigmoid_batch_norm_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "fused_hardsigmoid_batch_norm",
+    "entry": "fused_hardsigmoid_batch_norm",
+    "prompt_index": 41,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_hardsigmoid_batch_norm.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_hardsigmoid_batch_norm_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "zeta",
+    "entry": "zeta",
+    "prompt_index": 42,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/zeta.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/zeta_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "symmetric_matrix_vector_norm",
+    "entry": "symmetric_matrix_vector_norm",
+    "prompt_index": 43,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/symmetric_matrix_vector_norm.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/symmetric_matrix_vector_norm_perf.py",
+    "disposition": "contract_pending",
+    "reason": "Reference has no initial y and scales its new product by (1+beta), unlike the described update."
+  },
+  {
+    "task": "softplus_linear",
+    "entry": "softplus_linear",
+    "prompt_index": 44,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/softplus_linear.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/softplus_linear_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "softplus_linear",
+    "family": "fusion",
+    "input_index": 6,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          1,
+          1024
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1024,
+          1
+        ],
+        "device": "cuda"
+      },
+      "weight": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1024,
+          1
+        ],
+        "device": "cuda"
+      },
+      "bias": {
+        "shape": [
+          1024
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "beta": 1,
+      "threshold": 20
+    }
+  },
+  {
+    "task": "fused_svd_reconstruct",
+    "entry": "fused_svd_reconstruct",
+    "prompt_index": 45,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_svd_reconstruct.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_svd_reconstruct_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "fused_mul_add_logsoftmax_dropout_bmm",
+    "entry": "fused_mul_add_logsoftmax_dropout_bmm",
+    "prompt_index": 46,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_mul_add_logsoftmax_dropout_bmm.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_mul_add_logsoftmax_dropout_bmm_perf.py",
+    "disposition": "out_of_scope",
+    "reason": "Training-time RNG contract is not closed; do not silently disable dropout."
+  },
+  {
+    "task": "selu",
+    "entry": "selu",
+    "prompt_index": 47,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/selu.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/selu_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "scaled_add_norm",
+    "entry": "scaled_add_norm",
+    "prompt_index": 48,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/scaled_add_norm.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/scaled_add_norm_perf.py",
+    "disposition": "contract_pending",
+    "reason": "Input mutation requires an explicit replay reset contract."
+  },
+  {
+    "task": "leaky_relu_conv2d",
+    "entry": "leaky_relu_conv2d",
+    "prompt_index": 49,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/leaky_relu_conv2d.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/leaky_relu_conv2d_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "sqrt_exp",
+    "entry": "sqrt_exp",
+    "prompt_index": 50,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/sqrt_exp.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/sqrt_exp_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "cos_avg_pool1d",
+    "entry": "cos_avg_pool1d",
+    "prompt_index": 51,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/cos_avg_pool1d.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/cos_avg_pool1d_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "sum_std",
+    "entry": "sum_std",
+    "prompt_index": 52,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/sum_std.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/sum_std_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "mul_relu",
+    "entry": "mul_relu",
+    "prompt_index": 53,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/mul_relu.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/mul_relu_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "mul_relu",
+    "family": "fusion",
+    "input_index": 8,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "other": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "inplace": false,
+      "out": null
+    }
+  },
+  {
+    "task": "gelu_conv2d",
+    "entry": "gelu_conv2d",
+    "prompt_index": 54,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/gelu_conv2d.py",
+    "reference_line": 7,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/gelu_conv2d_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "gelu_conv2d",
+    "family": "fusion",
+    "input_index": 4,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          16,
+          16,
+          64,
+          64
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          65536,
+          4096,
+          64,
+          1
+        ],
+        "device": "cuda"
+      },
+      "weight": {
+        "shape": [
+          32,
+          16,
+          3,
+          3
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          144,
+          9,
+          3,
+          1
+        ],
+        "device": "cuda"
+      },
+      "bias": null,
+      "stride": 1,
+      "padding": 1,
+      "dilation": 1,
+      "groups": 1,
+      "approximate": "none",
+      "out": null
+    }
+  },
+  {
+    "task": "fused_instance_norm_selu_conv2d",
+    "entry": "fused_instance_norm_selu_conv2d",
+    "prompt_index": 55,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_instance_norm_selu_conv2d.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_instance_norm_selu_conv2d_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "fused_fractional_max_pool2d_with_relu",
+    "entry": "fused_fractional_max_pool2d_with_relu",
+    "prompt_index": 56,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_fractional_max_pool2d_with_relu.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_fractional_max_pool2d_with_relu_perf.py",
+    "disposition": "out_of_scope",
+    "reason": "Random pooling samples are not explicit common inputs."
+  },
+  {
+    "task": "chebyshev_polynomial_t",
+    "entry": "chebyshev_polynomial_t",
+    "prompt_index": 57,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/chebyshev_polynomial_t.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/chebyshev_polynomial_t_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "logit",
+    "entry": "logit",
+    "prompt_index": 58,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/logit.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/logit_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "solve_symmetric_ldl",
+    "entry": "solve_symmetric_ldl",
+    "prompt_index": 59,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/solve_symmetric_ldl.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/solve_symmetric_ldl_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "exp_sqrt",
+    "entry": "exp_sqrt",
+    "prompt_index": 60,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/exp_sqrt.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/exp_sqrt_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "combined_activation",
+    "entry": "combined_activation",
+    "prompt_index": 61,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/combined_activation.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/combined_activation_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed 2D upstream profile; not the broader rank range described by the prompt.",
+    "id": "combined_activation",
+    "family": "fusion",
+    "input_index": 6,
+    "tolerance": "fp32",
+    "note": "Fixed 2D upstream profile; not the broader rank range described by the prompt.",
+    "invocation": {
+      "input": {
+        "shape": [
+          512,
+          512
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          512,
+          1
+        ],
+        "device": "cuda"
+      },
+      "weight1": {
+        "shape": [
+          512,
+          512
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          512,
+          1
+        ],
+        "device": "cuda"
+      },
+      "weight2": {
+        "shape": [
+          512
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "bias": {
+        "shape": [
+          512
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "out": null
+    }
+  },
+  {
+    "task": "scaled_add_dot",
+    "entry": "scaled_add_dot",
+    "prompt_index": 62,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/scaled_add_dot.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/scaled_add_dot_perf.py",
+    "disposition": "contract_pending",
+    "reason": "Input mutation requires an explicit replay reset contract."
+  },
+  {
+    "task": "tensordot",
+    "entry": "tensordot",
+    "prompt_index": 63,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/tensordot.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/tensordot_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "tensordot",
+    "family": "contraction",
+    "input_index": 4,
+    "tolerance": "fp16",
+    "invocation": {
+      "a": {
+        "shape": [
+          1024,
+          8,
+          8
+        ],
+        "dtype": "torch.float16",
+        "stride": [
+          64,
+          8,
+          1
+        ],
+        "device": "cuda"
+      },
+      "b": {
+        "shape": [
+          8,
+          8,
+          1024
+        ],
+        "dtype": "torch.float16",
+        "stride": [
+          8192,
+          1024,
+          1
+        ],
+        "device": "cuda"
+      },
+      "dims": 2
+    }
+  },
+  {
+    "task": "qr",
+    "entry": "qr",
+    "prompt_index": 64,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/qr.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/qr_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "asin",
+    "entry": "asin",
+    "prompt_index": 65,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/asin.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/asin_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "asin",
+    "family": "pointwise",
+    "input_index": 8,
+    "tolerance": "fp16",
+    "invocation": {
+      "input_tensor": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float16",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      }
+    }
+  },
+  {
+    "task": "fused_masked_select_add_gelu",
+    "entry": "fused_masked_select_add_gelu",
+    "prompt_index": 66,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_masked_select_add_gelu.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_masked_select_add_gelu_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "fused_pairwise_distance_adaptive_avg_pool2d",
+    "entry": "fused_pairwise_distance_adaptive_avg_pool2d",
+    "prompt_index": 67,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_pairwise_distance_adaptive_avg_pool2d.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_pairwise_distance_adaptive_avg_pool2d_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "add_mean",
+    "entry": "add_mean",
+    "prompt_index": 68,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/add_mean.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/add_mean_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "add_mean",
+    "family": "reduction",
+    "input_index": 8,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "other": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "dim": null,
+      "alpha": 1,
+      "keepdim": false,
+      "dtype": null,
+      "out": null
+    }
+  },
+  {
+    "task": "fused_layer_norm_relu_linear",
+    "entry": "fused_layer_norm_relu_linear",
+    "prompt_index": 69,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_layer_norm_relu_linear.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_layer_norm_relu_linear_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "fused_layer_norm_relu_linear",
+    "family": "fusion",
+    "input_index": 4,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          32,
+          4096
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          4096,
+          1
+        ],
+        "device": "cuda"
+      },
+      "weight": {
+        "shape": [
+          2048,
+          4096
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          4096,
+          1
+        ],
+        "device": "cuda"
+      },
+      "bias": {
+        "shape": [
+          2048
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "normalized_shape": [
+        2048
+      ],
+      "eps": 1e-05,
+      "elementwise_affine": true
+    }
+  },
+  {
+    "task": "fused_add_mul_groupnorm",
+    "entry": "fused_add_mul_groupnorm",
+    "prompt_index": 70,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_add_mul_groupnorm.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_add_mul_groupnorm_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "SGD",
+    "entry": "SGD",
+    "prompt_index": 71,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/SGD.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/SGD_perf.py",
+    "disposition": "out_of_scope",
+    "reason": "Model, loss, backward and optimizer update."
+  },
+  {
+    "task": "relu_batch_norm_conv2d",
+    "entry": "relu_batch_norm_conv2d",
+    "prompt_index": 72,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/relu_batch_norm_conv2d.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/relu_batch_norm_conv2d_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "conv2d",
+    "entry": "conv2d",
+    "prompt_index": 73,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/conv2d.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/conv2d_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "conv2d",
+    "family": "contraction",
+    "input_index": 2,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          8,
+          64,
+          16,
+          16
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          16384,
+          256,
+          16,
+          1
+        ],
+        "device": "cuda"
+      },
+      "weight": {
+        "shape": [
+          128,
+          64,
+          3,
+          3
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          576,
+          9,
+          3,
+          1
+        ],
+        "device": "cuda"
+      },
+      "bias": {
+        "shape": [
+          128
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "stride": 1,
+      "padding": 0,
+      "dilation": 1,
+      "groups": 1
+    }
+  },
+  {
+    "task": "normalized_cosine_similarity",
+    "entry": "normalized_cosine_similarity",
+    "prompt_index": 74,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/normalized_cosine_similarity.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/normalized_cosine_similarity_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "fused_cholesky_solve",
+    "entry": "fused_cholesky_solve",
+    "prompt_index": 75,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_cholesky_solve.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_cholesky_solve_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "fused_cholesky_solve",
+    "family": "linear_algebra",
+    "input_index": 6,
+    "tolerance": "linear_algebra",
+    "invocation": {
+      "A": {
+        "shape": [
+          256,
+          256
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          256,
+          1
+        ],
+        "device": "cuda"
+      },
+      "b": {
+        "shape": [
+          256,
+          1
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1,
+          1
+        ],
+        "device": "cuda"
+      }
+    }
+  },
+  {
+    "task": "matmul",
+    "entry": "matmul",
+    "prompt_index": 76,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/matmul.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/matmul_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "matmul",
+    "family": "contraction",
+    "input_index": 6,
+    "tolerance": "fp16",
+    "invocation": {
+      "tensor1": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float16",
+        "stride": [
+          1024,
+          1
+        ],
+        "device": "cuda"
+      },
+      "tensor2": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float16",
+        "stride": [
+          1024,
+          1
+        ],
+        "device": "cuda"
+      }
+    }
+  },
+  {
+    "task": "fused_gather_masked_fill",
+    "entry": "fused_gather_masked_fill",
+    "prompt_index": 77,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_gather_masked_fill.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_gather_masked_fill_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "fused_gather_masked_fill",
+    "family": "indexing_layout",
+    "input_index": 5,
+    "tolerance": "exact",
+    "invocation": {
+      "input": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1024,
+          1
+        ],
+        "device": "cuda"
+      },
+      "dim": 0,
+      "index": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.int64",
+        "stride": [
+          1024,
+          1
+        ],
+        "device": "cuda"
+      },
+      "mask": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.bool",
+        "stride": [
+          1024,
+          1
+        ],
+        "device": "cuda"
+      },
+      "value": 0.5,
+      "sparse_grad": false,
+      "out": null
+    }
+  },
+  {
+    "task": "fused_cross_entropy_log_softmax",
+    "entry": "fused_cross_entropy_log_softmax",
+    "prompt_index": 78,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_cross_entropy_log_softmax.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_cross_entropy_log_softmax_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "addmm",
+    "entry": "addmm",
+    "prompt_index": 79,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/addmm.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/addmm_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "addmm",
+    "family": "contraction",
+    "input_index": 6,
+    "tolerance": "fp16",
+    "invocation": {
+      "input": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float16",
+        "stride": [
+          1024,
+          1
+        ],
+        "device": "cuda"
+      },
+      "mat1": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float16",
+        "stride": [
+          1024,
+          1
+        ],
+        "device": "cuda"
+      },
+      "mat2": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float16",
+        "stride": [
+          1024,
+          1
+        ],
+        "device": "cuda"
+      },
+      "beta": 1,
+      "alpha": 1,
+      "out": null
+    }
+  },
+  {
+    "task": "fused_qr_solve",
+    "entry": "fused_qr_solve",
+    "prompt_index": 80,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_qr_solve.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_qr_solve_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "fused_qr_solve",
+    "family": "linear_algebra",
+    "input_index": 4,
+    "tolerance": "linear_algebra",
+    "invocation": {
+      "A": {
+        "shape": [
+          512,
+          256
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          256,
+          1
+        ],
+        "device": "cuda"
+      },
+      "b": {
+        "shape": [
+          512,
+          10
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          10,
+          1
+        ],
+        "device": "cuda"
+      }
+    }
+  },
+  {
+    "task": "sigmoid_adaptive_avg_pool2d",
+    "entry": "sigmoid_adaptive_avg_pool2d",
+    "prompt_index": 81,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/sigmoid_adaptive_avg_pool2d.py",
+    "reference_line": 6,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/sigmoid_adaptive_avg_pool2d_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "cos",
+    "entry": "cos",
+    "prompt_index": 82,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/cos.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/cos_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "cos",
+    "family": "pointwise",
+    "input_index": 8,
+    "tolerance": "fp32",
+    "invocation": {
+      "input_tensor": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      }
+    }
+  },
+  {
+    "task": "fused_bmm_dropout_gelu",
+    "entry": "fused_bmm_dropout_gelu",
+    "prompt_index": 83,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_bmm_dropout_gelu.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_bmm_dropout_gelu_perf.py",
+    "disposition": "out_of_scope",
+    "reason": "Training-time RNG contract is not closed; do not silently disable dropout."
+  },
+  {
+    "task": "trunc",
+    "entry": "trunc",
+    "prompt_index": 84,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/trunc.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/trunc_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "matrix_power_eig",
+    "entry": "matrix_power_eig",
+    "prompt_index": 85,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/matrix_power_eig.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/matrix_power_eig_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "log_tanh",
+    "entry": "log_tanh",
+    "prompt_index": 86,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/log_tanh.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/log_tanh_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "exp",
+    "entry": "exp",
+    "prompt_index": 87,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/exp.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/exp_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "exp",
+    "family": "pointwise",
+    "input_index": 8,
+    "tolerance": "fp32",
+    "invocation": {
+      "input_tensor": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "out": null
+    }
+  },
+  {
+    "task": "matrix_multiply_symmetric",
+    "entry": "matrix_multiply_symmetric",
+    "prompt_index": 88,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/matrix_multiply_symmetric.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/matrix_multiply_symmetric_perf.py",
+    "disposition": "contract_pending",
+    "reason": "Repeated positive fp16 products can overflow in the original profiles."
+  },
+  {
+    "task": "fused_avg_pool2d_cosine_similarity",
+    "entry": "fused_avg_pool2d_cosine_similarity",
+    "prompt_index": 89,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_avg_pool2d_cosine_similarity.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_avg_pool2d_cosine_similarity_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "fused_hardshrink_dropout",
+    "entry": "fused_hardshrink_dropout",
+    "prompt_index": 90,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_hardshrink_dropout.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_hardshrink_dropout_perf.py",
+    "disposition": "out_of_scope",
+    "reason": "Training-time RNG contract is not closed; do not silently disable dropout."
+  },
+  {
+    "task": "erfc_sqrt",
+    "entry": "erfc_sqrt",
+    "prompt_index": 91,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/erfc_sqrt.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/erfc_sqrt_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "tensordot_rsqrt",
+    "entry": "tensordot_rsqrt",
+    "prompt_index": 92,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/tensordot_rsqrt.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/tensordot_rsqrt_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "tensordot_rsqrt",
+    "family": "contraction",
+    "input_index": 5,
+    "tolerance": "fp32",
+    "invocation": {
+      "a": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1024,
+          1
+        ],
+        "device": "cuda"
+      },
+      "b": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1024,
+          1
+        ],
+        "device": "cuda"
+      },
+      "dims": 1
+    }
+  },
+  {
+    "task": "softmax_log",
+    "entry": "softmax_log",
+    "prompt_index": 93,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/softmax_log.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/softmax_log_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "dropout_sigmoid_linear",
+    "entry": "dropout_sigmoid_linear",
+    "prompt_index": 94,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/dropout_sigmoid_linear.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/dropout_sigmoid_linear_perf.py",
+    "disposition": "out_of_scope",
+    "reason": "Training-time RNG contract is not closed; do not silently disable dropout."
+  },
+  {
+    "task": "batch_norm",
+    "entry": "batch_norm",
+    "prompt_index": 95,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/batch_norm.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/batch_norm_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "gammaln",
+    "entry": "gammaln",
+    "prompt_index": 96,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/gammaln.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/gammaln_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "bitwise_and",
+    "entry": "bitwise_and",
+    "prompt_index": 97,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/bitwise_and.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/bitwise_and_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "sub_gelu",
+    "entry": "sub_gelu",
+    "prompt_index": 98,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/sub_gelu.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/sub_gelu_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "sub_gelu",
+    "family": "fusion",
+    "input_index": 8,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "other": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "alpha": 1,
+      "approximate": "none",
+      "out": null
+    }
+  },
+  {
+    "task": "gelu_std",
+    "entry": "gelu_std",
+    "prompt_index": 99,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/gelu_std.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/gelu_std_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "permute_copy",
+    "entry": "permute_copy",
+    "prompt_index": 100,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/permute_copy.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/permute_copy_perf.py",
+    "disposition": "selected",
+    "reason": "Return a fresh allocation; a permuted alias is not the requested copy.",
+    "id": "permute_copy",
+    "family": "indexing_layout",
+    "input_index": 2,
+    "tolerance": "exact",
+    "note": "Return a fresh allocation; a permuted alias is not the requested copy.",
+    "invocation": {
+      "input": {
+        "shape": [
+          32,
+          32,
+          32,
+          32
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          32768,
+          1024,
+          32,
+          1
+        ],
+        "device": "cuda"
+      },
+      "dims": [
+        3,
+        2,
+        1,
+        0
+      ]
+    }
+  },
+  {
+    "task": "digamma",
+    "entry": "digamma",
+    "prompt_index": 101,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/digamma.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/digamma_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "softmax_mul",
+    "entry": "softmax_mul",
+    "prompt_index": 102,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/softmax_mul.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/softmax_mul_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "bitwise_and_binomial",
+    "entry": "bitwise_and_binomial",
+    "prompt_index": 103,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/bitwise_and_binomial.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/bitwise_and_binomial_perf.py",
+    "disposition": "out_of_scope",
+    "reason": "Binomial sampling; the reference also discards its bitwise result."
+  },
+  {
+    "task": "rad2deg_sqrt",
+    "entry": "rad2deg_sqrt",
+    "prompt_index": 104,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/rad2deg_sqrt.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/rad2deg_sqrt_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "bessel_j1",
+    "entry": "bessel_j1",
+    "prompt_index": 105,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/bessel_j1.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/bessel_j1_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "lu",
+    "entry": "lu",
+    "prompt_index": 106,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/lu.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/lu_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "gelu_min",
+    "entry": "gelu_min",
+    "prompt_index": 107,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/gelu_min.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/gelu_min_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "grid_sample_with_affine",
+    "entry": "grid_sample_with_affine",
+    "prompt_index": 108,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/grid_sample_with_affine.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/grid_sample_with_affine_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "pseudoinverse_svd",
+    "entry": "pseudoinverse_svd",
+    "prompt_index": 109,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/pseudoinverse_svd.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/pseudoinverse_svd_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "exp_mean",
+    "entry": "exp_mean",
+    "prompt_index": 110,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/exp_mean.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/exp_mean_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "exp_mean",
+    "family": "reduction",
+    "input_index": 8,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "dim": null,
+      "keepdim": false,
+      "dtype": null,
+      "out": null
+    }
+  },
+  {
+    "task": "low_rank_svd_approximation",
+    "entry": "low_rank_svd_approximation",
+    "prompt_index": 111,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/low_rank_svd_approximation.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/low_rank_svd_approximation_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "min",
+    "entry": "min",
+    "prompt_index": 112,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/min.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/min_perf.py",
+    "disposition": "selected",
+    "reason": "Compare the full values/indices return, not only values retained by the upstream performance wrapper.",
+    "id": "min",
+    "family": "reduction",
+    "input_index": 4,
+    "tolerance": "exact",
+    "note": "Compare the full values/indices return, not only values retained by the upstream performance wrapper.",
+    "invocation": {
+      "input_tensor": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1024,
+          1
+        ],
+        "device": "cuda"
+      },
+      "dim": 0,
+      "keepdim": false
+    }
+  },
+  {
+    "task": "symmetric_mm_and_abs_sum",
+    "entry": "symmetric_mm_and_abs_sum",
+    "prompt_index": 113,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/symmetric_mm_and_abs_sum.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/symmetric_mm_and_abs_sum_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "symmetric_mm_and_abs_sum",
+    "family": "contraction",
+    "input_index": 6,
+    "tolerance": "fp32",
+    "invocation": {
+      "A": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1024,
+          1
+        ],
+        "device": "cuda"
+      },
+      "C": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1024,
+          1
+        ],
+        "device": "cuda"
+      },
+      "alpha": 1.0,
+      "beta": 0.5
+    }
+  },
+  {
+    "task": "determinant_lu",
+    "entry": "determinant_lu",
+    "prompt_index": 114,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/determinant_lu.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/determinant_lu_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "tanh_linear",
+    "entry": "tanh_linear",
+    "prompt_index": 115,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/tanh_linear.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/tanh_linear_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "sum",
+    "entry": "sum",
+    "prompt_index": 116,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/sum.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/sum_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "sum",
+    "family": "reduction",
+    "input_index": 8,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "dim": 0,
+      "keepdim": false,
+      "dtype": null
+    }
+  },
+  {
+    "task": "logspace",
+    "entry": "logspace",
+    "prompt_index": 117,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/logspace.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/logspace_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "solve_and_add_scaled_vector",
+    "entry": "solve_and_add_scaled_vector",
+    "prompt_index": 118,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/solve_and_add_scaled_vector.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/solve_and_add_scaled_vector_perf.py",
+    "disposition": "contract_pending",
+    "reason": "Upstream performance op_name includes a trailing period."
+  },
+  {
+    "task": "pixel_shuffle_conv2d",
+    "entry": "pixel_shuffle_conv2d",
+    "prompt_index": 119,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/pixel_shuffle_conv2d.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/pixel_shuffle_conv2d_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "matrix_vector_dot",
+    "entry": "matrix_vector_dot",
+    "prompt_index": 120,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/matrix_vector_dot.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/matrix_vector_dot_perf.py",
+    "disposition": "contract_pending",
+    "reason": "Description permits rectangular A, but dot(y,x) requires matching vector lengths."
+  },
+  {
+    "task": "min_gelu",
+    "entry": "min_gelu",
+    "prompt_index": 121,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/min_gelu.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/min_gelu_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "pow",
+    "entry": "pow",
+    "prompt_index": 122,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/pow.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/pow_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "relu_max_pool2d_conv2d",
+    "entry": "relu_max_pool2d_conv2d",
+    "prompt_index": 123,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/relu_max_pool2d_conv2d.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/relu_max_pool2d_conv2d_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "erf",
+    "entry": "erf",
+    "prompt_index": 124,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/erf.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/erf_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "sigmoid",
+    "entry": "sigmoid",
+    "prompt_index": 125,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/sigmoid.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/sigmoid_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "sigmoid",
+    "family": "pointwise",
+    "input_index": 8,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "out": null
+    }
+  },
+  {
+    "task": "gelu",
+    "entry": "gelu",
+    "prompt_index": 126,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/gelu.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/gelu_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "gelu",
+    "family": "pointwise",
+    "input_index": 8,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "approximate": "none"
+    }
+  },
+  {
+    "task": "det",
+    "entry": "det",
+    "prompt_index": 127,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/det.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/det_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "fused_bmm_rmsnorm_gelu_dropout",
+    "entry": "fused_bmm_rmsnorm_gelu_dropout",
+    "prompt_index": 128,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_bmm_rmsnorm_gelu_dropout.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_bmm_rmsnorm_gelu_dropout_perf.py",
+    "disposition": "out_of_scope",
+    "reason": "Training-time RNG contract is not closed; do not silently disable dropout."
+  },
+  {
+    "task": "floor",
+    "entry": "floor",
+    "prompt_index": 129,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/floor.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/floor_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "floor",
+    "family": "pointwise",
+    "input_index": 8,
+    "tolerance": "exact",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "out": null
+    }
+  },
+  {
+    "task": "rand",
+    "entry": "rand",
+    "prompt_index": 130,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/rand.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/rand_perf.py",
+    "disposition": "out_of_scope",
+    "reason": "Output RNG stream contract is not closed in this deterministic experiment."
+  },
+  {
+    "task": "cholesky_solve",
+    "entry": "cholesky_solve",
+    "prompt_index": 131,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/cholesky_solve.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/cholesky_solve_perf.py",
+    "disposition": "contract_pending",
+    "reason": "Original random triangular factors are not conditioned; use the SPD fused_cholesky_solve task in the initial set without altering either algorithm."
+  },
+  {
+    "task": "mul_sub",
+    "entry": "mul_sub",
+    "prompt_index": 132,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/mul_sub.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/mul_sub_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "mul_sub",
+    "family": "fusion",
+    "input_index": 8,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "other_mul": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "other_sub": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "alpha": 1,
+      "out": null
+    }
+  },
+  {
+    "task": "ldl_factor",
+    "entry": "ldl_factor",
+    "prompt_index": 133,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/ldl_factor.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/ldl_factor_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "abs",
+    "entry": "abs",
+    "prompt_index": 134,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/abs.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/abs_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "abs",
+    "family": "pointwise",
+    "input_index": 8,
+    "tolerance": "exact",
+    "invocation": {
+      "input_tensor": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "out": null
+    }
+  },
+  {
+    "task": "mul",
+    "entry": "mul",
+    "prompt_index": 135,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/mul.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/mul_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "mul",
+    "family": "pointwise",
+    "input_index": 8,
+    "tolerance": "fp16",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float16",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "other": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float16",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "out": null
+    }
+  },
+  {
+    "task": "softmax",
+    "entry": "softmax",
+    "prompt_index": 136,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/softmax.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/softmax_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "softmax",
+    "family": "reduction",
+    "input_index": 6,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1024,
+          1
+        ],
+        "device": "cuda"
+      },
+      "dim": 1,
+      "dtype": "torch.float32"
+    }
+  },
+  {
+    "task": "leaky_relu",
+    "entry": "leaky_relu",
+    "prompt_index": 137,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/leaky_relu.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/leaky_relu_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "leaky_relu",
+    "family": "pointwise",
+    "input_index": 8,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "negative_slope": 0.01,
+      "inplace": false
+    }
+  },
+  {
+    "task": "invert_matrix_lu",
+    "entry": "invert_matrix_lu",
+    "prompt_index": 138,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/invert_matrix_lu.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/invert_matrix_lu_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "std",
+    "entry": "std",
+    "prompt_index": 139,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/std.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/std_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "std",
+    "family": "reduction",
+    "input_index": 8,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "dim": null,
+      "correction": 1,
+      "keepdim": false,
+      "out": null
+    }
+  },
+  {
+    "task": "tril_mm_and_scale",
+    "entry": "tril_mm_and_scale",
+    "prompt_index": 140,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/tril_mm_and_scale.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/tril_mm_and_scale_perf.py",
+    "disposition": "contract_pending",
+    "reason": "Original performance input generator refers to undefined p."
+  },
+  {
+    "task": "solve",
+    "entry": "solve",
+    "prompt_index": 141,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/solve.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/solve_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "solve",
+    "family": "linear_algebra",
+    "input_index": 4,
+    "tolerance": "linear_algebra",
+    "invocation": {
+      "A": {
+        "shape": [
+          256,
+          256
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          256,
+          1
+        ],
+        "device": "cuda"
+      },
+      "B": {
+        "shape": [
+          256,
+          1
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1,
+          1
+        ],
+        "device": "cuda"
+      }
+    }
+  },
+  {
+    "task": "airy_ai",
+    "entry": "airy_ai",
+    "prompt_index": 142,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/airy_ai.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/airy_ai_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "signbit",
+    "entry": "signbit",
+    "prompt_index": 143,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/signbit.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/signbit_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "matrix_multiply_and_row_dot",
+    "entry": "matrix_multiply_and_row_dot",
+    "prompt_index": 144,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/matrix_multiply_and_row_dot.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/matrix_multiply_and_row_dot_perf.py",
+    "disposition": "contract_pending",
+    "reason": "Positive fp16 matmul followed by a row dot can overflow in the original profiles; do not treat matching infinities as accuracy evidence."
+  },
+  {
+    "task": "polygamma",
+    "entry": "polygamma",
+    "prompt_index": 145,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/polygamma.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/polygamma_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "elu_linear",
+    "entry": "elu_linear",
+    "prompt_index": 146,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/elu_linear.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/elu_linear_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "fused_pairwise_distance_normalize",
+    "entry": "fused_pairwise_distance_normalize",
+    "prompt_index": 147,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_pairwise_distance_normalize.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_pairwise_distance_normalize_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "Adam",
+    "entry": "Adam",
+    "prompt_index": 148,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/Adam.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/Adam_perf.py",
+    "disposition": "out_of_scope",
+    "reason": "Optimizer state transformation, not a forward tensor kernel."
+  },
+  {
+    "task": "fused_hstack_div",
+    "entry": "fused_hstack_div",
+    "prompt_index": 149,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_hstack_div.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_hstack_div_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "broadcast_tensors",
+    "entry": "broadcast_tensors",
+    "prompt_index": 150,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/broadcast_tensors.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/broadcast_tensors_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "relu_conv2d",
+    "entry": "relu_conv2d",
+    "prompt_index": 151,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/relu_conv2d.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/relu_conv2d_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "relu_conv2d",
+    "family": "fusion",
+    "input_index": 3,
+    "tolerance": "fp32",
+    "invocation": {
+      "input": {
+        "shape": [
+          1,
+          3,
+          256,
+          256
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          196608,
+          65536,
+          256,
+          1
+        ],
+        "device": "cuda"
+      },
+      "weight": {
+        "shape": [
+          64,
+          3,
+          3,
+          3
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          27,
+          9,
+          3,
+          1
+        ],
+        "device": "cuda"
+      },
+      "bias": null,
+      "stride": 1,
+      "padding": 1,
+      "dilation": 1,
+      "groups": 1,
+      "inplace": false
+    }
+  },
+  {
+    "task": "log",
+    "entry": "log",
+    "prompt_index": 152,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/log.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/log_perf.py",
+    "disposition": "selected",
+    "reason": "Upstream performance call supplies out; its returned buffer identity remains observable.",
+    "id": "log",
+    "family": "pointwise",
+    "input_index": 8,
+    "tolerance": "fp32",
+    "note": "Upstream performance call supplies out; its returned buffer identity remains observable.",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "out": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      }
+    }
+  },
+  {
+    "task": "adaptive_avg_pool2d",
+    "entry": "adaptive_avg_pool2d",
+    "prompt_index": 153,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/adaptive_avg_pool2d.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/adaptive_avg_pool2d_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "quantize_dynamic",
+    "entry": "dynamic_custom",
+    "prompt_index": 154,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/quantize_dynamic.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/quantize_dynamic_perf.py",
+    "disposition": "out_of_scope",
+    "reason": "nn.Module transformation, not a tensor kernel."
+  },
+  {
+    "task": "conv2d_add",
+    "entry": "conv2d_add",
+    "prompt_index": 155,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/conv2d_add.py",
+    "reference_line": 5,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/conv2d_add_perf.py",
+    "disposition": "selected",
+    "reason": "Original smallest spatial profile; no additional input matrix.",
+    "id": "conv2d_add",
+    "family": "fusion",
+    "input_index": 0,
+    "tolerance": "fp32",
+    "note": "Original smallest spatial profile; no additional input matrix.",
+    "invocation": {
+      "input": {
+        "shape": [
+          16,
+          32,
+          32,
+          32
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          32768,
+          1024,
+          32,
+          1
+        ],
+        "device": "cuda"
+      },
+      "weight": {
+        "shape": [
+          32,
+          32,
+          3,
+          3
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          288,
+          9,
+          3,
+          1
+        ],
+        "device": "cuda"
+      },
+      "bias": null,
+      "other": {
+        "shape": [
+          16,
+          32,
+          32,
+          32
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          32768,
+          1024,
+          32,
+          1
+        ],
+        "device": "cuda"
+      },
+      "stride": 1,
+      "padding": 1,
+      "dilation": 1,
+      "groups": 1,
+      "alpha": 1,
+      "out": null
+    }
+  },
+  {
+    "task": "ifftshift",
+    "entry": "ifftshift",
+    "prompt_index": 156,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/ifftshift.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/ifftshift_perf.py",
+    "disposition": "selected",
+    "reason": "Fixed deterministic forward performance profile.",
+    "id": "ifftshift",
+    "family": "indexing_layout",
+    "input_index": 8,
+    "tolerance": "exact",
+    "invocation": {
+      "input": {
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32",
+        "stride": [
+          1
+        ],
+        "device": "cuda"
+      },
+      "dim": null
+    }
+  },
+  {
+    "task": "signbit_bitwise_and",
+    "entry": "signbit_bitwise_and",
+    "prompt_index": 157,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/signbit_bitwise_and.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/signbit_bitwise_and_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "fused_repeat_interleave_log_softmax",
+    "entry": "fused_repeat_interleave_log_softmax",
+    "prompt_index": 158,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fused_repeat_interleave_log_softmax.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fused_repeat_interleave_log_softmax_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "cholesky",
+    "entry": "cholesky",
+    "prompt_index": 159,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/cholesky.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/cholesky_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "ones_like",
+    "entry": "ones_like",
+    "prompt_index": 160,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/ones_like.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/ones_like_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "autocast",
+    "entry": "autocast",
+    "prompt_index": 161,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/autocast.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/autocast_perf.py",
+    "disposition": "out_of_scope",
+    "reason": "Execution context manager, not a tensor result."
+  },
+  {
+    "task": "reciprocal",
+    "entry": "reciprocal",
+    "prompt_index": 162,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/reciprocal.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/reciprocal_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "cos_signbit",
+    "entry": "cos_signbit",
+    "prompt_index": 163,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/cos_signbit.py",
+    "reference_line": 4,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/cos_signbit_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "spectral_norm_eig",
+    "entry": "spectral_norm_eig",
+    "prompt_index": 164,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/spectral_norm_eig.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/spectral_norm_eig_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  },
+  {
+    "task": "fftn",
+    "entry": "fftn",
+    "prompt_index": 165,
+    "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+    "reference_file": "data/TritonBench_T_v1/fftn.py",
+    "reference_line": 3,
+    "profile_file": "performance_metrics/perf_T/golden_metrics/fftn_perf.py",
+    "disposition": "not_selected",
+    "reason": "Outside the fixed first 50; not a compiler-support judgment."
+  }
+]

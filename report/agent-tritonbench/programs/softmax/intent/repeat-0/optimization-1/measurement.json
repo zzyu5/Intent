@@ -1,0 +1,21 @@
+{
+  "status": "pass",
+  "candidate_ms": 0.007840000092983246,
+  "reference_ms": 0.007840000092983246,
+  "ratio": 1.0,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0001,
+    "rtol": 1e-05
+  },
+  "tuning": [
+    {
+      "kernel": "_softmax_kernel",
+      "declared": 4,
+      "measured": 4,
+      "seconds": 1.4683594703674316,
+      "winner": "num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+    }
+  ],
+  "preparation_and_benchmark_seconds": 2.0196698068175465
+}

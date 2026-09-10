@@ -1,0 +1,27 @@
+{
+  "model": "gpt-5.6-luna",
+  "reasoning_effort": "max",
+  "seconds": 94.29944017692469,
+  "usage": [
+    {
+      "input_tokens": 125577,
+      "cached_input_tokens": 101888,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 4274,
+      "reasoning_output_tokens": 3017
+    }
+  ],
+  "threads": [
+    "01a08c30-e342-7770-9b82-de8a3d97c3f8"
+  ],
+  "exit_code": 0,
+  "action": "submit",
+  "reason": "Set the existing 1024-element full/tail Triton abs kernels to launch with one warp, preserving the unmasked fast path and masked remainder path.",
+  "language_materials": [
+    "triton-3.6.0/language/core.py",
+    "triton-3.6.0/language/standard.py",
+    "triton-3.6.0/language/math.py",
+    "triton-3.6.0/language/extra/cuda/libdevice.py",
+    "ref/triton/docs/python-api/triton-semantics.rst"
+  ]
+}

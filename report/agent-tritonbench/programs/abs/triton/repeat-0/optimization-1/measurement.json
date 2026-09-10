@@ -1,0 +1,13 @@
+{
+  "status": "pass",
+  "candidate_ms": 0.006128000095486641,
+  "reference_ms": 0.007823999971151352,
+  "ratio": 0.7832310989368353,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0,
+    "rtol": 0.0
+  },
+  "tuning": [],
+  "preparation_and_benchmark_seconds": 1.210750480182469
+}

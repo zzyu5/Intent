@@ -1,0 +1,16 @@
+{
+  "status": "agent_program_error",
+  "candidate_ms": null,
+  "reference_ms": null,
+  "ratio": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0,
+    "rtol": 0.0
+  },
+  "failure_stage": "candidate_load",
+  "error": "module 'intent.language' has no attribute 'Tensor'",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/benchmark.py\", line 86, in run\n    module = load_program(arguments.program)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/program.py\", line 123, in load_program\n    spec.loader.exec_module(module)\n  File \"<frozen importlib._bootstrap_external>\", line 883, in exec_module\n  File \"<frozen importlib._bootstrap>\", line 241, in _call_with_frames_removed\n  File \"/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/programs/abs/intent/repeat-0/generation-5/candidate.py\", line 7, in <module>\n    def abs_kernel(x: tl.Tensor, n_elements: tl.int32, out: tl.Tensor):\nAttributeError: module 'intent.language' has no attribute 'Tensor'\n",
+  "tuning": [],
+  "preparation_and_benchmark_seconds": 0.021113881841301918
+}

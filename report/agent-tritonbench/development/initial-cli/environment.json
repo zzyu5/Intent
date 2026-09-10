@@ -1,0 +1,388 @@
+{
+  "compiler_commit": "13f40d789dd282cf7f861eca10ea8c2eec0784cd",
+  "reference_commit": "603e28a5050e8c268f6883a69709d477a272d49a",
+  "triton_ref_commit": "ef08c7fc412737f1663dbfc38a8bed3e9fbf82da",
+  "torch": "2.10.0+cu130",
+  "triton": "3.6.0",
+  "codex": "codex-cli 0.154.0",
+  "gpu": "NVIDIA GeForce RTX 5090 D",
+  "suite": {
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "max",
+    "repetitions": 3,
+    "generation_candidates": 5,
+    "optimization_candidates": 5,
+    "phase_seconds": 1800,
+    "candidate_seconds": 300,
+    "max_tuning_configurations": 16,
+    "input_seed": 0,
+    "prompt_entry_overrides": {
+      "31": {
+        "entry": "mean",
+        "reason": "The mean description omits its function name and starts with input (Tensor)."
+      },
+      "141": {
+        "entry": "solve",
+        "reason": "The linear solve description gives argument names but omits its function name."
+      },
+      "154": {
+        "entry": "dynamic_custom",
+        "reason": "The quantize_dynamic source wrapper is actually named dynamic_custom."
+      }
+    },
+    "dtype": "float32",
+    "timing": "cuda_graph",
+    "generation_stop": "first_correct_or_budget",
+    "optimization_stop": "agent_stop_or_budget",
+    "selection": "Fixed deterministic forward tensor tasks, chosen before measurements by computation family and usable upstream performance input contract, not compiler support. One original input profile per task. Other tasks remain in the 166-task catalog.",
+    "tolerances": {
+      "exact": {
+        "atol": 0.0,
+        "rtol": 0.0
+      },
+      "fp32": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "fp16": {
+        "atol": 0.01,
+        "rtol": 0.01
+      },
+      "linear_algebra": {
+        "atol": 0.0001,
+        "rtol": 0.0001
+      }
+    },
+    "tasks": [
+      {
+        "id": "abs",
+        "family": "pointwise",
+        "input_index": 8,
+        "tolerance": "exact"
+      },
+      {
+        "id": "asin",
+        "family": "pointwise",
+        "input_index": 8,
+        "tolerance": "fp16"
+      },
+      {
+        "id": "cos",
+        "family": "pointwise",
+        "input_index": 8,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "exp",
+        "family": "pointwise",
+        "input_index": 8,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "floor",
+        "family": "pointwise",
+        "input_index": 8,
+        "tolerance": "exact"
+      },
+      {
+        "id": "gelu",
+        "family": "pointwise",
+        "input_index": 8,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "leaky_relu",
+        "family": "pointwise",
+        "input_index": 8,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "log",
+        "family": "pointwise",
+        "input_index": 8,
+        "tolerance": "fp32",
+        "note": "Upstream performance call supplies out; its returned buffer identity remains observable."
+      },
+      {
+        "id": "log1p",
+        "family": "pointwise",
+        "input_index": 8,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "mul",
+        "family": "pointwise",
+        "input_index": 8,
+        "tolerance": "fp16"
+      },
+      {
+        "id": "relu",
+        "family": "pointwise",
+        "input_index": 8,
+        "tolerance": "exact"
+      },
+      {
+        "id": "rsqrt",
+        "family": "pointwise",
+        "input_index": 8,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "sigmoid",
+        "family": "pointwise",
+        "input_index": 8,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "sqrt",
+        "family": "pointwise",
+        "input_index": 8,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "tanh",
+        "family": "pointwise",
+        "input_index": 8,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "argmax",
+        "family": "reduction",
+        "input_index": 8,
+        "tolerance": "exact"
+      },
+      {
+        "id": "max",
+        "family": "reduction",
+        "input_index": 8,
+        "tolerance": "exact"
+      },
+      {
+        "id": "mean",
+        "family": "reduction",
+        "input_index": 8,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "min",
+        "family": "reduction",
+        "input_index": 4,
+        "tolerance": "exact",
+        "note": "Compare the full values/indices return, not only values retained by the upstream performance wrapper."
+      },
+      {
+        "id": "sum",
+        "family": "reduction",
+        "input_index": 8,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "std",
+        "family": "reduction",
+        "input_index": 8,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "softmax",
+        "family": "reduction",
+        "input_index": 6,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "logsumexp",
+        "family": "reduction",
+        "input_index": 8,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "add_mean",
+        "family": "reduction",
+        "input_index": 8,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "exp_mean",
+        "family": "reduction",
+        "input_index": 8,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "matmul",
+        "family": "contraction",
+        "input_index": 6,
+        "tolerance": "fp16"
+      },
+      {
+        "id": "addmm",
+        "family": "contraction",
+        "input_index": 6,
+        "tolerance": "fp16"
+      },
+      {
+        "id": "tensordot",
+        "family": "contraction",
+        "input_index": 4,
+        "tolerance": "fp16"
+      },
+      {
+        "id": "tensordot_rsqrt",
+        "family": "contraction",
+        "input_index": 5,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "conv2d",
+        "family": "contraction",
+        "input_index": 2,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "symmetric_mm_and_abs_sum",
+        "family": "contraction",
+        "input_index": 6,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "fused_mv_sigmoid_sub",
+        "family": "contraction",
+        "input_index": 4,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "solve",
+        "family": "linear_algebra",
+        "input_index": 4,
+        "tolerance": "linear_algebra"
+      },
+      {
+        "id": "fused_cholesky_solve",
+        "family": "linear_algebra",
+        "input_index": 6,
+        "tolerance": "linear_algebra"
+      },
+      {
+        "id": "fused_qr_solve",
+        "family": "linear_algebra",
+        "input_index": 4,
+        "tolerance": "linear_algebra"
+      },
+      {
+        "id": "add_gelu",
+        "family": "fusion",
+        "input_index": 8,
+        "tolerance": "fp16"
+      },
+      {
+        "id": "mul_relu",
+        "family": "fusion",
+        "input_index": 8,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "mul_sub",
+        "family": "fusion",
+        "input_index": 8,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "sub_gelu",
+        "family": "fusion",
+        "input_index": 8,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "relu_conv2d",
+        "family": "fusion",
+        "input_index": 3,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "gelu_conv2d",
+        "family": "fusion",
+        "input_index": 4,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "conv2d_add",
+        "family": "fusion",
+        "input_index": 0,
+        "tolerance": "fp32",
+        "note": "Original smallest spatial profile; no additional input matrix."
+      },
+      {
+        "id": "combined_activation",
+        "family": "fusion",
+        "input_index": 6,
+        "tolerance": "fp32",
+        "note": "Fixed 2D upstream profile; not the broader rank range described by the prompt."
+      },
+      {
+        "id": "fused_layer_norm_relu_linear",
+        "family": "fusion",
+        "input_index": 4,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "softplus_linear",
+        "family": "fusion",
+        "input_index": 6,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "permute_copy",
+        "family": "indexing_layout",
+        "input_index": 2,
+        "tolerance": "exact",
+        "note": "Return a fresh allocation; a permuted alias is not the requested copy."
+      },
+      {
+        "id": "ifftshift",
+        "family": "indexing_layout",
+        "input_index": 8,
+        "tolerance": "exact"
+      },
+      {
+        "id": "grid_sample",
+        "family": "indexing_layout",
+        "input_index": 0,
+        "tolerance": "fp32"
+      },
+      {
+        "id": "fused_gather_masked_fill",
+        "family": "indexing_layout",
+        "input_index": 5,
+        "tolerance": "exact"
+      },
+      {
+        "id": "fused_index_select_eq",
+        "family": "indexing_layout",
+        "input_index": 1,
+        "tolerance": "exact"
+      }
+    ],
+    "outside_scope": {
+      "Adam": "Optimizer state transformation, not a forward tensor kernel.",
+      "SGD": "Model, loss, backward and optimizer update.",
+      "quantize_dynamic": "nn.Module transformation, not a tensor kernel.",
+      "autocast": "Execution context manager, not a tensor result.",
+      "rand": "Output RNG stream contract is not closed in this deterministic experiment.",
+      "bitwise_and_binomial": "Binomial sampling; the reference also discards its bitwise result.",
+      "fused_fractional_max_pool2d_with_relu": "Random pooling samples are not explicit common inputs."
+    },
+    "deferred_contracts": {
+      "cholesky_solve": "Original random triangular factors are not conditioned; use the SPD fused_cholesky_solve task in the initial set without altering either algorithm.",
+      "matrix_multiply_and_row_dot": "Positive fp16 matmul followed by a row dot can overflow in the original profiles; do not treat matching infinities as accuracy evidence.",
+      "matrix_multiply_symmetric": "Repeated positive fp16 products can overflow in the original profiles.",
+      "matrix_vector_dot": "Description permits rectangular A, but dot(y,x) requires matching vector lengths.",
+      "symmetric_matrix_vector_norm": "Reference has no initial y and scales its new product by (1+beta), unlike the described update.",
+      "solve_and_add_scaled_vector": "Upstream performance op_name includes a trailing period.",
+      "tril_mm_and_scale": "Original performance input generator refers to undefined p.",
+      "scaled_add_dot": "Input mutation requires an explicit replay reset contract.",
+      "scaled_add_norm": "Input mutation requires an explicit replay reset contract.",
+      "index_fill_": "Input mutation requires an explicit replay reset contract."
+    }
+  },
+  "session_policy": "fresh ephemeral Codex call per submission; prior programs and feedback replayed only within a stage/repetition",
+  "isolation": "workspace-only filesystem permissions, network off, user config/rules/skills/plugins/hooks/memory/multi-agent disabled",
+  "tuning_policy": "first 16 configurations after existing legality pruning; median CUDA Graph, 5 warmups / 30 samples"
+}
