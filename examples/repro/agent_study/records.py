@@ -67,7 +67,6 @@ class Records:
                                   "Triton launch did not return a compiled kernel artifact")))
             if warmup_failure:
                 recheck = recheck.with_name("evaluation-recheck.json")
-                row.update(original_status=row["status"], status="evaluation_error")
             if (source_failure or warmup_failure) and recheck.exists():
                 measured = json.loads(recheck.read_text())
                 measured["evaluation_recheck_seconds"] = measured.pop("preparation_and_benchmark_seconds", 0)
