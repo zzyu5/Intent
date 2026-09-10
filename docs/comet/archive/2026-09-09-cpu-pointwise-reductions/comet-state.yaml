@@ -1,9 +1,9 @@
 schema: comet.native.v4
 name: cpu-pointwise-reductions
 language: zh-CN
-phase: verify
-status: await-user
-state_version: 5
+phase: archive
+status: done
+state_version: 7
 brief: brief.md
 spec_changes:
   - capability: cpu-pointwise-reductions
@@ -15,7 +15,7 @@ workspace:
   target_branch: main
   finish: null
 loop:
-  stage: await-user
+  stage: done
   goal_cycle: 1
   iteration: 1
   attempt: 1
@@ -24,7 +24,7 @@ loop:
   no_progress_count: 0
   execution_failure_count: 0
   previous_unresolved_ids: []
-  next_action: confirm-skill-coordinated-pass
+  next_action: null
 acceptance:
   - id: A1
     source: brief.md
@@ -129,14 +129,7 @@ builder_handoff:
       truncated: false
     reviewer_execution_ref: /root/cpu_pointwise_candidate_review
   submitted_at: 2026-09-09T21:16:33.529Z
-blockers:
-  - owner: user
-    reason:
-      text: The generic Skill bridge cannot prove an independent Verifier execution;
-        user confirmation is required before Archive.
-      truncated: false
-    acceptance_ids: []
-    resolution_action: await-user
+blockers: []
 verification:
   candidate_id: e510fee0-3a44-4b7d-9761-744eb2c34860
   identity_provider: skill-coordinated
@@ -176,5 +169,5 @@ history_overflow:
     recovery: 0
 verification_result: pass
 verification_report: verification.md
-archived: false
+archived: true
 created_at: 2026-09-09T18:04:54.871Z
