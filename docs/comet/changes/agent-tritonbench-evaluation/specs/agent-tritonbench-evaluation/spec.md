@@ -6,7 +6,7 @@
 
 任务来源为 `https://github.com/thunlp/TritonBench` 的 TritonBench-T。外部参考仓库已位于 `/home/kingdom/phdworks/ref/tritonbench`，路径作为环境事实而不是硬编码实验语义。复杂版任务 JSON 为共同任务描述基础，简单版不是另一批任务；发布数据各含 166 条。训练语料、LLM_generated 和原论文的模型结果不自动成为 agent 可访问资料。
 
-为全部任务保存稳定的来源和范围对应，并在获取比较结果前确定主实验集合。首轮 20 项横向集合或全部 166 项的选择待 brief Q1；不能以 Intent 已编译成功或某组性能好为纳入条件。语义范围外、参考实现/适配存在问题、compiler 尚不支持与 agent 写错分别记录，不通过静默删除失败改变分母。
+为全部 166 个任务保存稳定的来源和范围对应，并在获取比较结果前确定首轮 50 个不同任务的主实验集合。横向覆盖 pointwise、reduction、contraction、融合与索引等计算结构，不以同一任务的多个 shape 替代任务数量；不能以 Intent 已编译成功或某组性能好为纳入条件。语义范围外、参考实现/适配存在问题、compiler 尚不支持与 agent 写错分别记录，不通过静默删除失败改变分母。
 
 每项明确 callable signature、输入 shape/dtype、标量/constexpr、输出结构及必要的 out/in-place/alias 等可观察效果。Forward tensor kernel、随机状态、autograd 或模型对象变换不可混为同一种任务；不默默关闭 dropout、改变 p、丢弃 backward 或将框架模型操作替换成一个算子后仍宣称原任务完成。必要 specialization 必须对两组一致、明确命名并披露与原任务的差异。
 
@@ -90,6 +90,6 @@ Agent 可以读取允许的资料、编辑自己的程序、调用正式编译�
 
 ## 8. 当前边界
 
-当前只建立 change 和 Shape，未授权在未确定规模时开始大规模实验。brief Q1–Q3 解决后，汇总实际运行 profile、范围、预算、A1–A6 与非目标请用户最终确认，再进入 Build。
+当前处于 Shape，首轮 50 个不同任务的规模已确定，尚未授权启动实验。brief Q2/Q3 解决后，汇总实际运行 profile、范围、预算、A1–A6 与非目标请用户最终确认，再进入 Build。
 
 本 change 使用 main/current，不新建 worktree，不推送或创建 PR，不使用 ARS，不修改个人 Codex 设置。默认不扩展其它模型、推理档位、GPU 设备、CPU/DSA 后端或完整论文复现实验。
