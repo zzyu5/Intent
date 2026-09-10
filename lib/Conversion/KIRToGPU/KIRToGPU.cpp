@@ -2064,9 +2064,65 @@ private:
         PhysicalExprAttr extent = *physicalExtent;
         uint64_t sourceId = rangeType.getSourceId();
         uint32_t logicalSourceAxis = rangeType.getSourceAxis();
+        bool derived = rangeType.getDerived();
+        auto fragment = dyn_cast<gpu::FragmentType>((*resource).getType());
+        auto logical =
+            dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
+        const bool fragmentIndex = static_cast<bool>(fragment);
+        unsigned logicalAxis = sourceAxis;
+        unsigned fragmentAxis = *physicalSourceAxis;
+        if (!fragment && valuePrototype) {
+          auto valueIndex =
+              operation->getAttrOfType<IntegerAttr>("value_operand_index");
+          auto valueType = valueIndex ? dyn_cast<RankedTensorType>(
+                                           operation->getOperand(valueIndex.getInt()).getType())
+                                     : RankedTensorType();
+          if (valueType &&
+              valueType.getRank() == relation.getResultDimensions().size()) {
+            fragment = valuePrototype;
+            logical = valueType;
+            logicalAxis = resultAxis;
+            fragmentAxis =
+                fragment.getShape().size() - valueType.getRank() + resultAxis;
+          }
+        }
+        if (fragment && logical && integerConstant(start) == 0 &&
+            integerConstant(step) == 1) {
+          DenseI64ArrayAttr identities = dimensionIds(logical);
+          auto mapping = cast<gpu::AxisMapAttr>(
+              fragment.getAxisMaps()[fragmentAxis]);
+          bool coversSource = false;
+          if (logical.isDynamicDim(logicalAxis)) {
+            if (identities) {
+              auto binding = dimensions.find(identities[logicalAxis]);
+              coversSource =
+                  binding != dimensions.end() && stop == binding->second;
+            }
+          } else {
+            coversSource = integerConstant(stop) == logical.getDimSize(logicalAxis);
+          }
+          if (coversSource && identities &&
+              mapping.getDimensionId() == identities[logicalAxis] &&
+              rangeType.getDimensionId() == identities[logicalAxis]) {
+            // Full logical indexing preserves the value's axis relation. Reads
+            // use local fragment coordinates; writes retain logical bounds so
+            // ownership advances their coordinates with the producing tile.
+            sourceId = mapping.getSourceId();
+            logicalSourceAxis = mapping.getSourceAxis();
+            derived = mapping.getDerived();
+            extent = cast<PhysicalExprAttr>(fragment.getShape()[fragmentAxis]);
+            if (fragmentIndex) {
+              FailureOr<Value> fragmentStop =
+                  physicalExtentValue(operation->getLoc(), extent);
+              if (failed(fragmentStop))
+                return failure();
+              stop = *fragmentStop;
+            }
+          }
+        }
         FailureOr<Value> coordinate = makeRange(
             logicalSourceAxis, start, stop, step, sourceId,
-            rangeType.getDimensionId(), rangeType.getDerived(), extent);
+            rangeType.getDimensionId(), derived, extent);
         if (failed(coordinate))
           return failure();
         for (StringRef name : {gpu::sourceSubregionAttr,
