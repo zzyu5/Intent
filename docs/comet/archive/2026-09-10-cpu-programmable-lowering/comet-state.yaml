@@ -1,9 +1,9 @@
 schema: comet.native.v4
 name: cpu-programmable-lowering
 language: zh-CN
-phase: verify
-status: await-user
-state_version: 5
+phase: archive
+status: done
+state_version: 7
 brief: brief.md
 spec_changes:
   - capability: cpu-programmable-lowering
@@ -15,7 +15,7 @@ workspace:
   target_branch: main
   finish: null
 loop:
-  stage: await-user
+  stage: done
   goal_cycle: 1
   iteration: 1
   attempt: 1
@@ -24,7 +24,7 @@ loop:
   no_progress_count: 0
   execution_failure_count: 0
   previous_unresolved_ids: []
-  next_action: confirm-skill-coordinated-pass
+  next_action: null
 acceptance:
   - id: A1
     source: brief.md
@@ -172,14 +172,7 @@ builder_handoff:
       truncated: false
     reviewer_execution_ref: /root/cpu_implementation_review:followup-final;/root/weft_field_store_review:followup-final
   submitted_at: 2026-09-10T13:44:54.036Z
-blockers:
-  - owner: user
-    reason:
-      text: The generic Skill bridge cannot prove an independent Verifier execution;
-        user confirmation is required before Archive.
-      truncated: false
-    acceptance_ids: []
-    resolution_action: await-user
+blockers: []
 verification:
   candidate_id: 127ef35d-1ea2-4424-a16a-e6b801cdfd99
   identity_provider: skill-coordinated
@@ -225,5 +218,5 @@ history_overflow:
     recovery: 0
 verification_result: pass
 verification_report: verification.md
-archived: false
+archived: true
 created_at: 2026-09-10T05:47:09.345Z
