@@ -4047,6 +4047,45 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             (!scanSegmentDimensions.contains(*dimension) &&
              !partiallyCarriedStructuredDimensions.contains(*dimension)));
   };
+  // A read-only operand may reach a write through broadcast/pointwise values
+  // while retaining a different source identity from the write coordinates.
+  // Share ownership only through that value path and an exact logical range.
+  for (MakeRangeOp range : dynamicRanges) {
+    if (range->getParentOfType<RegionFoldOp>() ||
+        range->getParentOfType<RegionScanOp>() ||
+        reductionTraversalRanges.contains(range.getOperation()))
+      continue;
+    FailureOr<uint64_t> dimension = rangeDimension(range);
+    if (failed(dimension))
+      continue;
+    SmallVector<Value> worklist{range.getResult()};
+    llvm::SmallDenseSet<Value> visited;
+    bool reachesWrite = false;
+    while (!worklist.empty() && !reachesWrite) {
+      Value value = worklist.pop_back_val();
+      if (!visited.insert(value).second)
+        continue;
+      reachesWrite = llvm::any_of(writeEffects, [&](const WriteEffectFacts &effect) {
+        return llvm::is_contained(effect.payloads, value) &&
+               llvm::any_of(allRanges, [&](MakeRangeOp owned) {
+                 FailureOr<uint64_t> ownedDimension = rangeDimension(owned);
+                 return succeeded(ownedDimension) && *ownedDimension == *dimension &&
+                        sharesLogicalTraversal(range, owned) &&
+                        coordinatesUseRange(effect.coordinates, owned);
+               });
+      });
+      for (Operation *user : value.getUsers()) {
+        if (!isa<LoadOp, UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp,
+                 BitcastOp, BroadcastOp, TransposeOp>(user))
+          continue;
+        for (Value result : user->getResults())
+          if (queryFragmentDimensions(result.getType(), *dimension).size() == 1)
+            worklist.push_back(result);
+      }
+    }
+    if (reachesWrite)
+      ownershipSources.insert(sourceAxisIdentity(range));
+  }
   auto dependsOnSource = [&](ValueRange values, PhysicalSourceAxis source) {
     for (Value value : values) {
       if (!queryFragmentAxis(value.getType(), source).isExact())

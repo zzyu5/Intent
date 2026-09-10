@@ -21,6 +21,7 @@ from intent.frontend.semantics.types import dims_compatible
 from intent.language import DTypeCategory
 from intent.language import bool as intent_bool
 from intent.language import i32
+from intent.language import i64
 from intent.language import index as intent_index
 from intent.language import u32
 from intent.language.builtins import Intrinsic
@@ -219,8 +220,8 @@ def _arg_reduce_max(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
     bound = bind_call(
         lowerer,
         node,
-        ("value", "axis", "identity", "acc_dtype"),
-        required=("value", "axis", "identity"),
+        ("value", "axis", "acc_dtype"),
+        required=("value", "axis"),
     )
     source = lowerer.read_value(
         lowerer.lower_expression(bound["value"]), bound["value"]
@@ -247,11 +248,7 @@ def _arg_reduce_max(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
             operands=(source,),
             result_types=(TensorType(acc_dtype, source.type.shape),),
         ).results[0]
-    identity = lowerer.materialize(
-        lowerer.lower_expression(bound["identity"]),
-        bound["identity"],
-        ScalarType(acc_dtype),
-    )
+    identity = _builtin_identity(lowerer, acc_dtype, BinaryOperator.MAXIMUM, node)
     indices = lowerer.emit(
         OperationKind.INDICES,
         lowerer.location(node),
@@ -263,9 +260,9 @@ def _arg_reduce_max(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
         OperationKind.CAST,
         lowerer.location(node),
         operands=(indices,),
-        result_types=(TensorType(i32, source.type.shape),),
+        result_types=(TensorType(i64, source.type.shape),),
     ).results[0]
-    index_identity = lowerer.emit_literal(2147483647, node, ScalarType(i32))
+    index_identity = lowerer.emit_literal((1 << 63) - 1, node, ScalarType(i64))
     combine = _argmax_combine_region(lowerer, ScalarType(acc_dtype), node)
     result_shape = tuple(
         dimension
@@ -278,7 +275,7 @@ def _arg_reduce_max(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
         operands=(source, indices, identity, index_identity),
         result_types=(
             lowerer.value_result_type(acc_dtype, result_shape),
-            lowerer.value_result_type(i32, result_shape),
+            lowerer.value_result_type(i64, result_shape),
         ),
         attributes={
             "axes": axes,
@@ -1123,7 +1120,7 @@ def _argmax_combine_region(
     value_type: ValueType,
     node: ast.AST,
 ):
-    types = (value_type, ScalarType(i32))
+    types = (value_type, ScalarType(i64))
     region = lowerer.make_region(lowerer.location(node), types + types)
     saved = lowerer.current_block
     lowerer.current_block = region.blocks[0]
@@ -1163,6 +1160,29 @@ def _argmax_combine_region(
         result_types=(ScalarType(intent_bool),),
         attributes={"operator_kind": BinaryOperator.LOGICAL_OR},
     ).results[0]
+    if value_type.dtype.category in (DTypeCategory.FLOAT, DTypeCategory.BFLOAT):
+        lhs_nan, rhs_nan = (
+            lowerer.emit(
+                OperationKind.COMPARE,
+                lowerer.location(node),
+                operands=(value, value),
+                result_types=(ScalarType(intent_bool),),
+                attributes={"predicate": ComparePredicate.NE},
+            ).results[0]
+            for value in (lhs_value, rhs_value)
+        )
+        nan_choice = lowerer.emit(
+            OperationKind.SELECT,
+            lowerer.location(node),
+            operands=(rhs_nan, lower, lowerer.emit_literal(True, node)),
+            result_types=(ScalarType(intent_bool),),
+        ).results[0]
+        choose = lowerer.emit(
+            OperationKind.SELECT,
+            lowerer.location(node),
+            operands=(lhs_nan, nan_choice, choose),
+            result_types=(ScalarType(intent_bool),),
+        ).results[0]
     selected = tuple(
         lowerer.emit(
             OperationKind.SELECT,

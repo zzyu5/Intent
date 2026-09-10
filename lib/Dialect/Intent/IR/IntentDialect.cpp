@@ -215,7 +215,7 @@ LogicalResult IndexRelationAttr::verify(
   for (int64_t identity : resultDimensions.asArrayRef())
     if (identity < 0)
       return emitError() << "index relation dimension identity must be non-negative";
-  if (!terms || terms.empty())
+  if (!terms || (terms.empty() && (sourceRank || resultRank)))
     return emitError() << "index relation requires typed terms";
   unsigned consumed = 0;
   for (Attribute term : terms) {

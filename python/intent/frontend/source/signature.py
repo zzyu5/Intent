@@ -65,11 +65,6 @@ def lower_kernel_signature(
         if annotation is inspect.Signature.empty:
             raise FrontendError(f"kernel parameter {name!r} requires an Intent annotation", location)
         if isinstance(annotation, ViewSpec):
-            if not annotation.shape:
-                raise FrontendError(
-                    "rank-zero values use runtime scalar parameters, not tensor views",
-                    location,
-                )
             if parameter.default is not inspect.Signature.empty:
                 raise FrontendError("view parameters cannot have Python defaults", location)
             parameters.append(

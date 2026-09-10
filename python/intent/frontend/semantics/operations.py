@@ -316,8 +316,8 @@ class IndexRelation:
                 "index relation requires one positive dimension identity per result axis"
             )
         object.__setattr__(self, "terms", tuple(self.terms))
-        if not self.terms:
-            raise ValueError("index relation requires at least one term")
+        if not self.terms and (self.source_rank or self.result_rank):
+            raise ValueError("non-scalar index relation requires at least one term")
         if any(not isinstance(term, IndexTerm) for term in self.terms):
             raise TypeError("index relation terms must be IndexTerm values")
         consuming = sum(term.kind is not IndexTermKind.NEW_AXIS for term in self.terms)

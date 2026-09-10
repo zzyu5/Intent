@@ -374,7 +374,7 @@ LogicalResult ViewType::verify(function_ref<InFlightDiagnostic()> emitError,
                                uint64_t sourceId,
                                ViewLayoutAttr layout) {
   (void)abiIndex;
-  if (!elementType || rank == 0 || access > 2 || sourceId == 0 || !layout)
+  if (!elementType || access > 2 || sourceId == 0 || !layout)
     return emitError() << "physical view schema is incomplete";
   if (layout.getDimensionIds().size() != rank)
     return emitError() << "physical view dimensions must match its rank";

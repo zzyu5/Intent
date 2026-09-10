@@ -156,7 +156,7 @@ def _lower_unary(lowerer: object, node: ast.UnaryOp) -> Expression:
         if isinstance(node.op, ast.Not):
             return Literal(not value)
         lowerer.error(node, "unsupported compile-time unary operator")
-    operand_value = lowerer.materialize(operand, node.operand)
+    operand_value = lowerer.read_value(operand, node.operand)
     if isinstance(node.op, ast.USub):
         operator_value = UnaryOperator.NEGATE
         result_type = operand_value.type

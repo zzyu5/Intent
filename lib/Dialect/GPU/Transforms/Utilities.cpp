@@ -340,6 +340,11 @@ bool preservesIntroducedUnitAxis(Value value, AxisSelector selects) {
               extent.getValue() == 1;
   if (!unit)
     return false;
+  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
+  if (kernel && PhysicalProgramAnalysis(kernel)
+                    .axisRealization(value, *axis)
+                    .constructionScalarSeed)
+    return false;
   if (!reshape) {
     bool expanded = false;
     for (Operation *user : value.getUsers()) {
@@ -3260,7 +3265,9 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
             builder, load.getLoc(), existing, predicate);
         if (failed(projected))
           return load.emitOpError(
-              "full-coverage validity has no exact physical projection");
+              "full-coverage validity has no exact physical projection")
+                 << "; existing=" << existing.getType()
+                 << "; required=" << predicate;
         existing = *projected;
       }
       valid = builder.create<BinaryOp>(load.getLoc(), predicate, existing, valid,

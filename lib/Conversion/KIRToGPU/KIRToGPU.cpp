@@ -3061,6 +3061,35 @@ private:
               "tensor index axis extent is not materialized");
         Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
         Value one = builder.create<arith::ConstantIndexOp>(location, 1);
+        Value start = zero, logicalStart = zero, step = one, logicalStop;
+        gpu::MakeRangeOp sourceRange;
+        gpu::PhysicalRangeFact sourceRanges =
+            gpu::PhysicalProgramAnalysis(physicalKernel).axisRanges(*source, axis);
+        if (!sourceRanges.roots.empty()) {
+          FailureOr<gpu::MakeRangeOp> range =
+              gpu::queryExactLogicalRange(sourceRanges);
+          if (failed(range))
+            return indices.emitOpError(
+                "tensor index axis has ambiguous logical ranges");
+          sourceRange = *range;
+          start = range->getStart();
+          logicalStart = range->getLogicalStart();
+          logicalStop = range->getLogicalStop();
+          step = range->getStep();
+        } else {
+          auto logical = cast<RankedTensorType>(indices.getSource().getType());
+          auto identities = dimensionIds(logical);
+          PhysicalExprAttr logicalExtent =
+              logical.isDynamicDim(axis)
+                  ? dimensionExpression(operation->getContext(), identities[axis])
+                  : expression(operation->getContext(), PhysicalExprKind::Constant,
+                               logical.getDimSize(axis));
+          FailureOr<Value> stop = physicalExtentValue(location, logicalExtent);
+          if (failed(stop))
+            return indices.emitOpError(
+                "tensor index axis has no logical extent authority");
+          logicalStop = *stop;
+        }
         auto coordinateType = gpu::FragmentType::get(
             operation->getContext(), builder.getIndexType(),
             builder.getArrayAttr({extent}),
@@ -3069,11 +3098,26 @@ private:
                 mapping.getSourceAxis(), mapping.getDimensionId(), 0,
                 mapping.getDerived())}),
             fragment.getValidity(), fragment.getOwner());
-        Value coordinate = builder.create<gpu::MakeRangeOp>(
-            location, coordinateType, zero, *physicalExtent, one, zero,
-            *physicalExtent,
+        auto coordinateRange = builder.create<gpu::MakeRangeOp>(
+            location, coordinateType, start, *physicalExtent, step, logicalStart,
+            logicalStop,
             mapping.getSourceId(), mapping.getSourceAxis(),
             mapping.getDerived());
+        if (sourceRange)
+          for (StringRef name : {gpu::sourceSubregionAttr,
+                                 gpu::sourceSubregionBoundAttr})
+            if (Attribute attribute = sourceRange->getAttr(name))
+              coordinateRange->setAttr(name, attribute);
+        Value coordinate = coordinateRange.getResult();
+        Value origin = builder.create<gpu::BroadcastOp>(
+            location, coordinateType, logicalStart);
+        Value stride = builder.create<gpu::BroadcastOp>(
+            location, coordinateType, step);
+        coordinate = builder.create<gpu::BinaryOp>(
+            location, coordinateType, coordinate, origin, BinaryOperator::Subtract);
+        coordinate = builder.create<gpu::BinaryOp>(
+            location, coordinateType, coordinate, stride,
+            BinaryOperator::FloorDivide);
         auto resultType = gpu::FragmentType::get(
             operation->getContext(), builder.getIndexType(), fragment.getShape(),
             fragment.getAxisMaps(), fragment.getValidity(), fragment.getOwner());

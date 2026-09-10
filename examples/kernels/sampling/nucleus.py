@@ -31,6 +31,5 @@ def sorted_nucleus_cutoff(
         _, first_index = I.arg_reduce.max(
             first_reached,
             axis=0,
-            identity=-I.inf,
         )
-        cutoff[row] = first_index + 1
+        cutoff[row] = I.cast(first_index + 1, I.i32)

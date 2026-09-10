@@ -566,14 +566,14 @@ class FunctionLowerer:
         if rhs_known and not lhs_known:
             rhs = Literal(rhs_static)
         if isinstance(lhs, Literal) and not isinstance(rhs, Literal):
-            rhs_value = self.materialize(rhs, node)
+            rhs_value = self.read_value(rhs, node)
             dtype, _ = self.dtype_and_shape(rhs_value.type, node)
             return self.materialize(lhs, node, ScalarType(dtype)), rhs_value
         if isinstance(rhs, Literal) and not isinstance(lhs, Literal):
-            lhs_value = self.materialize(lhs, node)
+            lhs_value = self.read_value(lhs, node)
             dtype, _ = self.dtype_and_shape(lhs_value.type, node)
             return lhs_value, self.materialize(rhs, node, ScalarType(dtype))
-        return self.materialize(lhs, node), self.materialize(rhs, node)
+        return self.read_value(lhs, node), self.read_value(rhs, node)
 
     def types_compatible_for_literal(self, actual: ValueType, expected: ValueType) -> bool:
         from intent.frontend.semantics.types import types_compatible

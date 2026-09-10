@@ -50,7 +50,6 @@ def max_pool2d_with_indices(
             maximum, winner = I.arg_reduce.max(
                 patch,
                 axis=2,
-                identity=-I.inf,
             )
             winner_index = I.cast(winner, I.index)
             winner_row = winner_index // KERNEL_WIDTH

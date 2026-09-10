@@ -1408,7 +1408,8 @@ private:
   std::string broadcastValue(Value value, gpu::FragmentType target) {
     auto source = dyn_cast<gpu::FragmentType>(value.getType());
     if (!source)
-      return valueString(value);
+      return "tl.full(" + fragmentShape(target) + ", " + valueString(value) +
+             ", " + pythonType(elementType(value.getType())) + ")";
     if (source == target)
       return valueString(value);
     gpu::BroadcastProjection projection =
@@ -1418,14 +1419,9 @@ private:
       failed = true;
       return {};
     }
-    if (source.getShape().size() == target.getShape().size()) {
-      std::string shape = "(";
-      for (Attribute extent : target.getShape())
-        shape += expressionString(cast<gpu::PhysicalExprAttr>(extent), false) +
-                 ", ";
-      shape += ")";
-      return "tl.broadcast_to(" + valueString(value) + ", " + shape + ")";
-    }
+    if (source.getShape().size() == target.getShape().size())
+      return "tl.broadcast_to(" + valueString(value) + ", " +
+             fragmentShape(target) + ")";
     SmallVector<std::string> selectors;
     for (std::optional<unsigned> sourceIndex : projection.targetToSource)
       selectors.push_back(sourceIndex ? ":" : "None");
@@ -1435,7 +1431,7 @@ private:
         result += ", ";
       result += selector;
     }
-    return result + "]";
+    return "tl.broadcast_to(" + result + "], " + fragmentShape(target) + ")";
   }
 
   std::string axisTuple(ArrayRef<int64_t> axes) const {
