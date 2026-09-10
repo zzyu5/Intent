@@ -1,0 +1,22 @@
+{
+  "status": "pass",
+  "candidate_ms": 0.003904000041075051,
+  "reference_ms": 0.005936000030487776,
+  "ratio": 0.6576819442425524,
+  "reference_timing_note": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0,
+    "rtol": 0.0
+  },
+  "tuning": [
+    {
+      "kernel": "_fused_contiguous_kernel",
+      "declared": 16,
+      "measured": 16,
+      "seconds": 1.937434434890747,
+      "winner": "BLOCK_ROWS: 1, BLOCK_COLS: 128, num_warps: 1, num_ctas: 1, num_stages: 1, maxnreg: None"
+    }
+  ],
+  "preparation_and_benchmark_seconds": 2.380777264945209
+}

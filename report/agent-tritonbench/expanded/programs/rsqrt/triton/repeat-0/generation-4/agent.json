@@ -1,0 +1,90 @@
+{
+  "model": "gpt-5.6-luna",
+  "reasoning_effort": "max",
+  "seconds": 85.02709309500642,
+  "usage": [
+    {
+      "input_tokens": 134241,
+      "cached_input_tokens": 116480,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 4133,
+      "reasoning_output_tokens": 2685
+    }
+  ],
+  "threads": [
+    "01a08cb8-068f-7e22-b8c8-8c231e3635fc"
+  ],
+  "exit_code": 0,
+  "tool_activity": [
+    {
+      "command": "/bin/bash -c pwd",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c 'rg --files materials'",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c \"sed -n '1,240p' TASK.md\"",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c \"rg --files -g 'candidate.py' -g '*.py' .\"",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c \"sed -n '1,260p' materials/math.py\"",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c \"sed -n '1,300p' materials/triton-semantics.rst\"",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c \"sed -n '1,320p' materials/core.py\"",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c \"sed -n '1,160p' materials/vector_add.py\"",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c \"sed -n '1,220p' candidate.py\"",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c \"sed -n '1,320p' materials/standard.py\"",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c \"sed -n '1,180p' candidate.py\"",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c 'python -m py_compile candidate.py'",
+      "exit_code": 0,
+      "status": "completed"
+    }
+  ],
+  "action": "submit",
+  "reason": "Pre-warm the Triton rsqrt specialization during build and launch the fixed 1024x1024-element grid, preserving the rsqrt(input, *, out=None) wrapper.",
+  "language_materials": [
+    "triton-3.6.0/language/core.py",
+    "triton-3.6.0/language/standard.py",
+    "triton-3.6.0/language/math.py",
+    "triton-3.6.0/language/extra/cuda/libdevice.py",
+    "ref/triton/docs/python-api/triton-semantics.rst",
+    "examples/repro/agent_study/materials/triton/vector_add.py"
+  ]
+}

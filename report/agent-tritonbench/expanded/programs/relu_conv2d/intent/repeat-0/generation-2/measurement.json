@@ -1,0 +1,22 @@
+{
+  "status": "pass",
+  "candidate_ms": 1.9339519739151,
+  "reference_ms": 0.03441599942743778,
+  "ratio": 56.19339859627258,
+  "reference_timing_note": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0001,
+    "rtol": 1e-05
+  },
+  "tuning": [
+    {
+      "kernel": "_intent_kernel",
+      "declared": 8,
+      "measured": 8,
+      "seconds": 2.4014644622802734,
+      "winner": "num_warps: 2, num_ctas: 1, num_stages: 2, maxnreg: None"
+    }
+  ],
+  "preparation_and_benchmark_seconds": 4.004644957836717
+}

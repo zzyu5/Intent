@@ -63,6 +63,8 @@ def trial(arguments, row, repeat, arm, records, runtime) -> None:
         return
     suite = arguments.suite
     task = next(task for task in suite["tasks"] if task["id"] == row["task"])
+    if any(item["task"] == row["task"] and item["status"] == "awaiting_oracle_decision" for item in records.reference_issues):
+        return
     identity = f"{row['task']}/{arm}/repeat-{repeat}"
     output_root = arguments.output / "programs" / identity
     if output_root.exists() and not arguments.resume:
@@ -149,7 +151,7 @@ def trial(arguments, row, repeat, arm, records, runtime) -> None:
                             "ratio": None, "error": "No candidate.py was submitted"}
             else:
                 remaining = suite["phase_seconds"] - spent - (time.monotonic() - started)
-                measured = run_benchmark(arguments, row["task"], program, language, destination / "measurement.json", runtime / "gpu.lock", remaining)
+                measured = run_benchmark(arguments, row["task"], program, language, destination / "measurement.json", arguments.gpu_lock or runtime / "gpu.lock", remaining)
             agent_record = {**agent_result, "language_materials": materials}
             (destination / "agent.json").write_text(json.dumps(agent_record, indent=2) + "\n")
             observation = {"task": row["task"], "case": f"upstream-profile-{task['input_index']}",
@@ -188,6 +190,7 @@ def main() -> None:
     parser.add_argument("--tasks", nargs="+")
     parser.add_argument("--repeat", type=int, choices=(0, 1, 2), action="append")
     parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--gpu-lock", type=Path, help="Shared timing lock when scheduling independent study processes on one GPU")
     parser.add_argument("--stage", choices=("generation", "optimization"), help="Schedule one phase across the suite before the other")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--output", type=Path, help="Independent report directory for a newly frozen experiment configuration")

@@ -1,0 +1,22 @@
+{
+  "status": "pass",
+  "candidate_ms": 66.76637649536133,
+  "reference_ms": null,
+  "ratio": null,
+  "reference_timing_note": "The unchanged PyTorch reference branches on torch.any(input < 0); CUDA Graph cannot capture its Python data-dependent control. It remains the numerical oracle; candidate operator timing is still CUDA Graph.",
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0001,
+    "rtol": 1e-05
+  },
+  "tuning": [
+    {
+      "kernel": "_intent_kernel",
+      "declared": 8,
+      "measured": 8,
+      "seconds": 19.205766201019287,
+      "winner": "num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+    }
+  ],
+  "preparation_and_benchmark_seconds": 47.36248091515154
+}

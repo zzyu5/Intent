@@ -1,0 +1,75 @@
+{
+  "model": "gpt-5.6-luna",
+  "reasoning_effort": "max",
+  "seconds": 24.59744759113528,
+  "usage": [],
+  "threads": [
+    "01a08cca-60c8-76d0-a9e3-a6df44b1e286"
+  ],
+  "exit_code": -15,
+  "tool_activity": [
+    {
+      "command": "/bin/bash -c 'rg --files .'",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c 'rg --files materials'",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c \"sed -n '1,240p' TASK.md\"",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c \"sed -n '1,260p' materials/dsl/README.md\"",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c \"sed -n '1,260p' materials/dsl/core.md\"",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c \"sed -n '1,260p' materials/programming-model/README.md\"",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c \"sed -n '1,260p' materials/dsl/types-numerics-and-effects.md\"",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c \"sed -n '1,260p' materials/programming-model/kernel-and-host.md\"",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c \"sed -n '1,260p' materials/programming-model/logical-program.md\"",
+      "exit_code": 0,
+      "status": "completed"
+    },
+    {
+      "command": "/bin/bash -c \"sed -n '1,260p' materials/vector_add.py\"",
+      "exit_code": 0,
+      "status": "completed"
+    }
+  ],
+  "action": "unavailable",
+  "status": "agent_environment_failure",
+  "errors": [],
+  "error": "Agent execution stopped before a submission",
+  "language_materials": [
+    "doc/dsl/README.md",
+    "doc/dsl/core.md",
+    "doc/dsl/types-numerics-and-effects.md",
+    "doc/programming-model/README.md",
+    "doc/programming-model/logical-program.md",
+    "doc/programming-model/kernel-and-host.md",
+    "examples/repro/agent_study/materials/intent/vector_add.py"
+  ]
+}

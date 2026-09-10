@@ -1,0 +1,42 @@
+{
+  "ratio": "candidate_ms / PyTorch_reference_ms; smaller is better",
+  "arms": {
+    "triton": {
+      "denominator": 150,
+      "attempted": 50,
+      "first_correct": 42,
+      "budget_correct": 49,
+      "correct_and_no_slower_than_reference": 33,
+      "not_run": 100,
+      "first_correct_rate": 0.28,
+      "budget_correct_rate": 0.32666666666666666,
+      "correct_and_no_slower_than_reference_rate": 0.22
+    },
+    "intent": {
+      "denominator": 150,
+      "attempted": 50,
+      "first_correct": 21,
+      "budget_correct": 40,
+      "correct_and_no_slower_than_reference": 23,
+      "not_run": 100,
+      "first_correct_rate": 0.14,
+      "budget_correct_rate": 0.26666666666666666,
+      "correct_and_no_slower_than_reference_rate": 0.15333333333333332
+    }
+  },
+  "common_success_pairs": 40,
+  "paired_performance": {
+    "seed": {
+      "measured_pairs": 40,
+      "intent_faster_pairs": 18,
+      "geomean_intent_over_direct": 1.8353129434512288,
+      "population": "pairs where both arms have a correct measured program; not a full-suite success rate"
+    },
+    "optimized": {
+      "measured_pairs": 4,
+      "intent_faster_pairs": 1,
+      "geomean_intent_over_direct": 1.0106655474085506,
+      "population": "pairs where both arms have a correct measured program; not a full-suite success rate"
+    }
+  }
+}

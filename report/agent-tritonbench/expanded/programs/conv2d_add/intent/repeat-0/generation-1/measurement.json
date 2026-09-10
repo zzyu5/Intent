@@ -1,0 +1,25 @@
+{
+  "status": "execution_failure",
+  "candidate_ms": null,
+  "reference_ms": null,
+  "ratio": null,
+  "reference_timing_note": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0001,
+    "rtol": 1e-05
+  },
+  "failure_stage": "generated_launch",
+  "error": "'int' object has no attribute 'stride'",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/v2/measurement.py\", line 281, in evaluate\n    comparison.generated.launch()\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/benchmark.py\", line 48, in launch\n    result = call.call(function)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/tasks.py\", line 126, in call\n    return function(*self.args, **self.kwargs)\n  File \"/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/expanded/programs/conv2d_add/intent/repeat-0/generation-1/candidate.py\", line 38, in wrapper\n    compiled(input, weight, other, alpha, result)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/runtime/artifact.py\", line 85, in __call__\n    compiled_kernel = self._invoke(self._launcher, arguments)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/runtime/artifact.py\", line 107, in _invoke\n    return function(*arguments)\n  File \"<intent.generated.triton.conv2d_add_kernel.0>\", line 192, in launch\n    S4_0 = output.stride(0)\nAttributeError: 'int' object has no attribute 'stride'\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/benchmark.py\", line 114, in run\n    measured, anchor = evaluate(PreparedComparison(candidate, source, tolerance(task, suite), cuda_graph=True),\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/v2/measurement.py\", line 284, in evaluate\n    raise PipelineStageError(\"generated_launch\", str(error)) from error\nrepro.v2.measurement.PipelineStageError: 'int' object has no attribute 'stride'\n",
+  "tuning": [
+    {
+      "kernel": "_intent_kernel",
+      "declared": 8,
+      "measured": 0,
+      "seconds": 0.0,
+      "winner": null
+    }
+  ],
+  "preparation_and_benchmark_seconds": 0.15544498804956675
+}

@@ -1,0 +1,2 @@
+kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
+flaggems_max_pool2d_with_indices,B8-C32-H128-W128-K3-S2-P1-fp16,0.014128,0.020272,0.696922,pass,

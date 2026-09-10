@@ -1,0 +1,23 @@
+{
+  "status": "pass",
+  "candidate_ms": 28.98428726196289,
+  "reference_ms": null,
+  "ratio": null,
+  "reference_timing_note": "The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.",
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0001,
+    "rtol": 0.0001
+  },
+  "reference_timing_error": "CUDA error: operation not permitted when stream is capturing\nSearch for `cudaErrorStreamCaptureUnsupported' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n",
+  "tuning": [
+    {
+      "kernel": "_intent_kernel",
+      "declared": 8,
+      "measured": 8,
+      "seconds": 10.881048917770386,
+      "winner": "num_warps: 1, num_ctas: 1, num_stages: 3, maxnreg: None"
+    }
+  ],
+  "preparation_and_benchmark_seconds": 17.80978847714141
+}

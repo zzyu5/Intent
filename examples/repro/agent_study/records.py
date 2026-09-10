@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+from contextlib import contextmanager
+import fcntl
 import json
 import math
 from pathlib import Path
@@ -25,11 +27,36 @@ class Records:
     def __init__(self, directory: Path, suite: dict):
         self.directory = directory
         self.suite = suite
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.directory.mkdir(parents=True, exist_ok=True)
         self.path = directory / "observations.jsonl"
-        self.rows = [json.loads(line) for line in self.path.read_text().splitlines()] if self.path.exists() else []
+        issues_path = directory / "reference-issues.json"
+        self.reference_issues = json.loads(issues_path.read_text()) if issues_path.exists() else []
+        with self._locked() as source:
+            self._reload(source)
+
+    @contextmanager
+    def _locked(self):
+        with self.lock, self.path.open("a+") as source:
+            fcntl.flock(source, fcntl.LOCK_EX)
+            yield source
+
+    @contextmanager
+    def _publication(self, name):
+        destination = self.directory / name
+        pending = destination.with_name(f".{name}.pending")
+        with pending.open("w", newline="") as output:
+            yield output
+        pending.replace(destination)
+
+    def _reload(self, source):
+        source.seek(0)
+        self.rows = [json.loads(line) for line in source]
+        unresolved = {item["task"]: item for item in self.reference_issues if item["status"] == "awaiting_oracle_decision"}
         for row in self.rows:
+            if row["task"] in unresolved and row["status"] in {"pass", "numerical_failure"}:
+                row.update(original_status=row["status"], status="reference_contract_failure",
+                           failure_stage="reference_contract", error=unresolved[row["task"]]["issue"])
             recheck = Path(__file__).resolve().parents[3] / Path(row["program"]).parent / "reference-recheck.json"
             if row.get("failure_stage", "").startswith("source_") and recheck.exists():
                 measured = json.loads(recheck.read_text())
@@ -41,23 +68,27 @@ class Records:
                     row.pop("traceback", None)
 
     def add(self, row: dict) -> None:
-        with self.lock:
-            with self.path.open("a") as output:
-                output.write(json.dumps(row) + "\n")
-            self.rows.append(row)
-            self.publish()
+        with self._locked() as source:
+            source.write(json.dumps(row) + "\n")
+            source.flush()
+            self._publish(source)
         print(json.dumps({key: row[key] for key in ("task", "arm", "repeat", "stage", "candidate", "status", "candidate_ms", "reference_ms", "ratio")}), flush=True)
 
     def stop(self, path: Path, result: dict) -> None:
-        with self.lock:
+        with self._locked() as source:
             pending = path.with_name(f".{path.name}.pending")
             pending.write_text(json.dumps(result, indent=2) + "\n")
             pending.replace(path)
-            self.publish()
+            self._publish(source)
 
     def publish(self) -> None:
+        with self._locked() as source:
+            self._publish(source)
+
+    def _publish(self, source) -> None:
+        self._reload(source)
         fields = ("task", "case", "arm", "repeat", "stage", "candidate", "status", "candidate_ms", "reference_ms", "ratio", "failure_stage", "error", "reference_timing_note", "original_status", "evaluation_repaired")
-        with (self.directory / "candidates.csv").open("w", newline="") as output:
+        with self._publication("candidates.csv") as output:
             writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(self.rows)
@@ -70,6 +101,7 @@ class Records:
                     generation_events = [row for row in relevant if row["stage"] == "generation"]
                     generated = [row for row in generation_events if row["status"] != "agent_environment_failure"]
                     correct = [row for row in generated if row["status"] == "pass"]
+                    reference_conflict = any(row["status"] == "reference_contract_failure" for row in generated)
                     optimization_rows = [row for row in relevant if row["stage"] == "optimization"]
                     stop_path = self.directory / "programs" / task["id"] / arm / f"repeat-{repeat}" / "optimization-stop.json"
                     stop = json.loads(stop_path.read_text()) if stop_path.exists() else {}
@@ -117,7 +149,7 @@ class Records:
                                       "first_correct": bool(generated and generated[0]["status"] == "pass"),
                                       "budget_correct": bool(correct),
                                       "generation_evaluation_repaired": any(row.get("evaluation_repaired", False) for row in generated),
-                                      "generation_status": "pass" if correct else generated[-1]["status"] if generated else "interrupted" if generation_events else "not_run",
+                                      "generation_status": "pass" if correct else "reference_contract_failure" if reference_conflict else generated[-1]["status"] if generated else "interrupted" if generation_events else "not_run",
                                       "seed_ms": seed["candidate_ms"] if seed else None,
                                       "static_intent_ms": seed["candidate_ms"] if seed and arm == "intent" else None,
                                       "optimization_status": stop_reason or ("in_progress" if optimization_rows else "not_run"),
@@ -130,12 +162,12 @@ class Records:
                                       "optimization_first_reference_checkpoint": first_target["optimization"],
                                       **{f"generation_{key}": value for key, value in _budget(generation_events).items()},
                                       **{f"optimization_{key}": value for key, value in _budget(optimization_rows, stop.get("agent")).items()}})
-        with (self.directory / "summary.csv").open("w", newline="") as output:
+        with self._publication("summary.csv") as output:
             writer = csv.DictWriter(output, fieldnames=list(summaries[0]))
             writer.writeheader()
             writer.writerows(summaries)
         if checkpoints:
-            with (self.directory / "budget.csv").open("w", newline="") as output:
+            with self._publication("budget.csv") as output:
                 writer = csv.DictWriter(output, fieldnames=list(checkpoints[0]))
                 writer.writeheader()
                 writer.writerows(checkpoints)
@@ -148,6 +180,7 @@ class Records:
                 "budget_correct": sum(row["budget_correct"] for row in rows),
                 "correct_and_no_slower_than_reference": sum(row["seed_ratio"] is not None and row["seed_ratio"] <= 1 for row in rows)}
             counts = metrics["arms"][arm]
+            counts["not_run"] = counts["denominator"] - counts["attempted"]
             for name in ("first_correct", "budget_correct", "correct_and_no_slower_than_reference"):
                 counts[f"{name}_rate"] = counts[name] / counts["denominator"]
         metrics["common_success_pairs"] = sum(
@@ -169,7 +202,7 @@ class Records:
                                "intent_over_direct_optimized": intent["optimized_ms"] / direct["optimized_ms"] if optimized else None,
                                "direct_optimization_speedup": direct["seed_ms"] / direct["optimized_ms"] if direct["optimized_ms"] is not None else None,
                                "intent_optimization_speedup": intent["seed_ms"] / intent["optimized_ms"] if intent["optimized_ms"] is not None else None})
-        with (self.directory / "paired.csv").open("w", newline="") as output:
+        with self._publication("paired.csv") as output:
             writer = csv.DictWriter(output, fieldnames=list(paired[0]))
             writer.writeheader()
             writer.writerows(paired)
@@ -180,8 +213,15 @@ class Records:
                 "measured_pairs": len(ratios), "intent_faster_pairs": sum(ratio < 1 for ratio in ratios),
                 "geomean_intent_over_direct": math.exp(statistics.mean(math.log(ratio) for ratio in ratios)) if ratios else None,
                 "population": "pairs where both arms have a correct measured program; not a full-suite success rate"}
-        (self.directory / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+        with self._publication("metrics.json") as output:
+            output.write(json.dumps(metrics, indent=2) + "\n")
+        coverage = "; ".join(
+            f"{arm}: {counts['attempted']}/{counts['denominator']} generation trials attempted, "
+            f"{counts['first_correct']} first-correct, {counts['budget_correct']} budget-correct, {counts['not_run']} not run"
+            for arm, counts in metrics["arms"].items()
+        )
         lines = ["# TritonBench-T Agent Results", "", "Codex / gpt-5.6-luna / max. Fixed denominator: 50 tasks x 3 independent repetitions per arm.",
+                 f"Current coverage: {coverage}. Not-run repetitions are pending, not observed failures. Fixed-denominator rates are incomplete until coverage is complete.",
                  "Times are median CUDA Graph operator milliseconds among correct repetitions; `-` means no correct measured program.",
                  "The PyTorch task implementation is a performance anchor, not an optimized Triton upper bound. Failures remain in the denominator.", "",
                  "Uncapturable references remain unchanged numerical oracles; candidate CUDA Graph times remain usable without a reference ratio. Reference-only evaluation repairs preserve raw observations and original agent programs. Canceled calls without a submission retain their cost but do not consume a submission slot.", "",
@@ -199,6 +239,10 @@ class Records:
             counts = [sum(row["budget_correct"] for row in arms[arm]) for arm in ("triton", "intent")]
             lines.append(f"| {task['id']} | {counts[0]} | {counts[1]} | {median('triton', 'seed_ms')} | {median('intent', 'seed_ms')} | {median('triton', 'optimized_ms')} | {median('intent', 'optimized_ms')} |")
         recheck_index = self.directory / "compiler-rechecks/index.json"
+        if self.reference_issues:
+            lines += ["", "## Reference Issues", ""]
+            for item in self.reference_issues:
+                lines.append(f"- {item['task']} ({item['status']}): {item['issue']} {item['action']}")
         if recheck_index.exists():
             lines += ["", "## Compiler Rechecks", "",
                       "Human compiler development, reusing the original agent DSL. These measurements do not change agent first-submission correctness, budgets or optimization seeds above.", "",
@@ -211,7 +255,8 @@ class Records:
                     return f"{value:.6f}" if value is not None else "-"
                 lines.append(f"| {item['task']} | {item['before']} | {number('candidate_ms')} | {number('reference_ms')} | {number('ratio')} | {measured['status']} |")
             lines += ["", "Compiler commits, original programs and ref comparisons are recorded in compiler-rechecks/index.json."]
-        (self.directory / "results.md").write_text("\n".join(lines) + "\n")
+        with self._publication("results.md") as output:
+            output.write("\n".join(lines) + "\n")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,16 @@
+{
+  "status": "compilation_failure",
+  "candidate_ms": null,
+  "reference_ms": null,
+  "ratio": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0001,
+    "rtol": 1e-05
+  },
+  "failure_stage": "frontend_kir",
+  "error": "/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/expanded/programs/mean/intent/repeat-0/generation-1/candidate.py:8:5: error: rank-zero values use runtime scalar parameters, not tensor views",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/compiler/pipeline.py\", line 48, in _inputs\n    kernel_mlir = lower_to_mlir(definition, constexprs=constexprs)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/frontend/compilation/compiler.py\", line 97, in lower_to_mlir\n    return FrontendCompiler(definition, dict(constexprs or {})).lower()\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/frontend/compilation/compiler.py\", line 37, in __init__\n    self.signature = lower_kernel_signature(definition, self.source, constexprs)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/frontend/source/signature.py\", line 69, in lower_kernel_signature\n    raise FrontendError(\nintent.frontend.diagnostics.errors.FrontendError: /home/kingdom/phdworks/intentdsl/report/agent-tritonbench/expanded/programs/mean/intent/repeat-0/generation-1/candidate.py:8:5: error: rank-zero values use runtime scalar parameters, not tensor views\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/benchmark.py\", line 91, in run\n    function = module.build(context)\n  File \"/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/expanded/programs/mean/intent/repeat-0/generation-1/candidate.py\", line 16, in build\n    compiled = context.compile(\"mean\", mean_kernel)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/program.py\", line 30, in compile\n    program = intent.generate(definition, target=TritonTarget(), compiler=self.compiler,\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/compiler/pipeline.py\", line 42, in generate\n    kernel_mlir, resolved = _inputs(definition, target, constexprs)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/compiler/pipeline.py\", line 50, in _inputs\n    raise CompilationStageError(\"frontend_kir\", str(error)) from error\nintent.compiler.toolchain.CompilationStageError: /home/kingdom/phdworks/intentdsl/report/agent-tritonbench/expanded/programs/mean/intent/repeat-0/generation-1/candidate.py:8:5: error: rank-zero values use runtime scalar parameters, not tensor views\n",
+  "tuning": [],
+  "preparation_and_benchmark_seconds": 0.02412844216451049
+}

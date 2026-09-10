@@ -1,0 +1,25 @@
+{
+  "status": "execution_failure",
+  "candidate_ms": null,
+  "reference_ms": null,
+  "ratio": null,
+  "reference_timing_note": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0,
+    "rtol": 0.0
+  },
+  "failure_stage": "generated_launch",
+  "error": "no legal full-coverage extent for FULL_D1",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/v2/measurement.py\", line 281, in evaluate\n    comparison.generated.launch()\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/benchmark.py\", line 48, in launch\n    result = call.call(function)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/tasks.py\", line 126, in call\n    return function(*self.args, **self.kwargs)\n  File \"/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/expanded/programs/argmax/intent/repeat-0/generation-4/candidate.py\", line 18, in wrapper\n    return compiled.run(input).view(())\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/runtime/artifact.py\", line 72, in run\n    return self._invoke(self._runner, arguments)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/runtime/artifact.py\", line 107, in _invoke\n    return function(*arguments)\n  File \"<intent.generated.triton.argmax_kernel.0>\", line 83, in run\n    launch(input, output)\n  File \"<intent.generated.triton.argmax_kernel.0>\", line 79, in launch\n    return _intent_kernel[grid](input, output, D1, D2, S0_0, S1_0)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/jit.py\", line 370, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/autotuner.py\", line 240, in run\n    benchmark()\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/autotuner.py\", line 229, in benchmark\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/autotuner.py\", line 229, in <dictcomp>\n    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/autotuner.py\", line 164, in _bench\n    return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/program.py\", line 100, in _measure\n    return [benchmark(candidate_call, warmup=5, repetitions=30, cuda_graph=True)[0]]\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/common/support.py\", line 33, in benchmark\n    function()\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/program.py\", line 99, in candidate_call\n    return function()\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/autotuner.py\", line 150, in kernel_call\n    self.fn.run(\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/autotuner.py\", line 458, in run\n    kwargs[v] = heur({**dict(zip(self.arg_names, args)), **kwargs})\n  File \"<intent.generated.triton.argmax_kernel.0>\", line 24, in _intent_cover_FULL_D1\n    raise ValueError(\"no legal full-coverage extent for FULL_D1\")\nValueError: no legal full-coverage extent for FULL_D1\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/benchmark.py\", line 103, in run\n    measured, anchor = evaluate(PreparedComparison(candidate, source, tolerance(task, suite), cuda_graph=True),\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/v2/measurement.py\", line 284, in evaluate\n    raise PipelineStageError(\"generated_launch\", str(error)) from error\nrepro.v2.measurement.PipelineStageError: no legal full-coverage extent for FULL_D1\n",
+  "tuning": [
+    {
+      "kernel": "_intent_kernel",
+      "declared": 8,
+      "measured": 0,
+      "seconds": 0.0,
+      "winner": null
+    }
+  ],
+  "preparation_and_benchmark_seconds": 0.1972868328448385
+}

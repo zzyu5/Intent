@@ -1,0 +1,25 @@
+{
+  "status": "execution_failure",
+  "candidate_ms": null,
+  "reference_ms": null,
+  "ratio": null,
+  "reference_timing_note": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0001,
+    "rtol": 1e-05
+  },
+  "failure_stage": "generated_launch",
+  "error": "build.<locals>.wrapper() missing 1 required positional argument: 'keepdim'",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/v2/measurement.py\", line 281, in evaluate\n    comparison.generated.launch()\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/benchmark.py\", line 48, in launch\n    result = call.call(function)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/tasks.py\", line 126, in call\n    return function(*self.args, **self.kwargs)\nTypeError: build.<locals>.wrapper() missing 1 required positional argument: 'keepdim'\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/benchmark.py\", line 103, in run\n    measured, anchor = evaluate(PreparedComparison(candidate, source, tolerance(task, suite), cuda_graph=True),\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/v2/measurement.py\", line 284, in evaluate\n    raise PipelineStageError(\"generated_launch\", str(error)) from error\nrepro.v2.measurement.PipelineStageError: build.<locals>.wrapper() missing 1 required positional argument: 'keepdim'\n",
+  "tuning": [
+    {
+      "kernel": "_intent_kernel",
+      "declared": 8,
+      "measured": 0,
+      "seconds": 0.0,
+      "winner": null
+    }
+  ],
+  "preparation_and_benchmark_seconds": 0.11115881707519293
+}

@@ -1,0 +1,96 @@
+[
+  {
+    "task": "grid_sample",
+    "compiler_commit": "c60cd537",
+    "program": "programs/grid_sample/intent/repeat-0/generation-2/candidate.py",
+    "before": "0.358032 ms; one scalar program per output element",
+    "before_measurement": "compiler-rechecks/grid_sample/before-measurement.json",
+    "measurement": "compiler-rechecks/grid_sample/after-measurement.json",
+    "cause": "Scalar conditional regions blocked Cartesian pointwise ownership formation. Predicate safe scalar computation and ordinary reads with explicit validity, then let existing ownership/blocking passes form vector fragments. Physical parameters are scalar provenance leaves, not unknown coordinate producers.",
+    "implementation": ["lib/Dialect/GPU/Transforms/PredicateScalarControl.cpp:16", "lib/Dialect/GPU/Transforms/Passes.cpp:172", "lib/Dialect/GPU/Analysis/PhysicalProgram.cpp:1458"],
+    "reference": ["/home/kingdom/phdworks/ref/triton/lib/Dialect/TritonGPU/Transforms/CombineTensorSelectAndIf.cpp:92", "/home/kingdom/phdworks/ref/triton/python/tutorials/01-vector-add.py:48"],
+    "reference_difference": "Triton distinguishes cheap scalar predication from tensor control and uses explicit masked vector loads. The original Intent program retained nested scalar branches and had no tl.arange. The shared pass now exposes vectorizable selects and masked loads; it does not speculate stores, integer division, shifts or unsafe casts, and does not alter provider serialization.",
+    "reviewer": "/root/agent_benchmark_interfaces"
+  },
+  {
+    "task": "mean",
+    "compiler_commit": "c60cd537",
+    "program": "programs/mean/intent/repeat-0/generation-3/candidate.py",
+    "before": "no legal full-coverage extent for FULL_D1 at 1048576 elements",
+    "measurement": "compiler-rechecks/mean/measurement.json",
+    "cause": "The construction scalar reduction axis was forced into one full-coverage fragment capped at 65536. Route it through the existing explicit bounded chunk loop and offer generic 1024/8192 reduction candidates. Floating-point chunks combine in logical order rather than accumulating interleaved lanes across chunks.",
+    "implementation": ["lib/Dialect/GPU/Transforms/RealizeReductionBlocking.cpp:2569", "lib/Dialect/GPU/Transforms/TuningProfiles.json:70"],
+    "reference": ["/home/kingdom/phdworks/ref/tilelang/examples/online_softmax/online_softmax.py:17", "/home/kingdom/phdworks/ref/tilelang/examples/online_softmax/online_softmax.py:25"],
+    "reference_difference": "TileLang's example uses bounded fragments and an explicit loop over logical source blocks, carrying the partial summary. Intent now forms that physical traversal in a shared pass instead of requiring an arbitrarily large fragment. This repairs coverage but does not create hidden cross-kernel partial reductions; the one-program global reduction remains slower than the PyTorch anchor.",
+    "reviewer": "/root/agent_benchmark_interfaces"
+  },
+  {
+    "task": "logsumexp",
+    "compiler_commit": "c60cd537",
+    "program": "programs/logsumexp/intent/repeat-0/generation-3/candidate.py",
+    "before": "no legal full-coverage extent for FULL_D1",
+    "measurement": "compiler-rechecks/logsumexp/measurement.json",
+    "cause": "The same bounded reduction lowering applies to the original maximum plus shifted exponential sum graph without changing the author algorithm.",
+    "implementation": ["lib/Dialect/GPU/Transforms/RealizeReductionBlocking.cpp:2569", "lib/Dialect/GPU/Transforms/TuningProfiles.json:70"],
+    "reference": ["/home/kingdom/phdworks/ref/tilelang/examples/online_softmax/online_softmax.py:25"],
+    "reference_difference": "Both use bounded source traversal and explicit summary flow. The reference writes an online algorithm, whereas this Intent source retains its original two reductions. The compiler does not substitute the reference's algorithm; the remaining performance gap is recorded.",
+    "reviewer": "/root/agent_benchmark_interfaces"
+  },
+  {
+    "task": "fused_index_select_eq",
+    "compiler_commit": "bf9c3039",
+    "program": "programs/fused_index_select_eq/intent/repeat-0/generation-1/candidate.py",
+    "before": "Triton rejected int1 values for an int8 block pointer store",
+    "measurement": "compiler-rechecks/fused_index_select_eq/measurement.json",
+    "cause": "Logical predicates use i1, but Triton boolean memory uses byte storage. Block-pointer loads now convert bytes to predicates and stores convert predicates to bytes at the serialization boundary.",
+    "implementation": ["lib/Target/Triton/Serialization/Serializer.cpp:953", "lib/Target/Triton/Serialization/Serializer.cpp:1162"],
+    "reference": ["/home/kingdom/phdworks/ref/triton/python/triton/language/semantic.py:1214"],
+    "reference_difference": "Triton's scalar/tensor-pointer store converts bool pointers and values to int8. Our block-pointer form instead explicitly cast the value to int1, which the external compiler rejects. The change is mechanical type representation, not a new algorithm or physical program structure."
+  },
+  {
+    "task": "max",
+    "compiler_commit": "ad621ac4",
+    "program": "programs/max/intent/repeat-0/generation-1/candidate.py",
+    "before": "rank-zero output rejected; builtin arg_reduce incorrectly required author identity",
+    "measurement": "compiler-rechecks/max/measurement.json",
+    "cause": "Accept rank-zero external views without turning them into by-value scalars; canonical empty indexing and GPU view verification now agree. Arg-reduce uses its specified fixed identity, i64 logical indices and NaN/tie combine. Tensor indices retain their logical range rather than the unit construction fragment extent.",
+    "implementation": ["python/intent/frontend/source/signature.py:67", "lib/Dialect/GPU/IR/GPUDialect.cpp:371", "python/intent/frontend/lowering/intrinsics/structured.py:219", "lib/Conversion/KIRToGPU/KIRToGPU.cpp:3064", "lib/Dialect/GPU/Transforms/Utilities.cpp:343"],
+    "reference": ["/home/kingdom/phdworks/ref/triton/python/triton/language/core.py:2348", "/home/kingdom/phdworks/ref/triton/python/triton/language/standard.py:147", "/home/kingdom/phdworks/ref/triton/python/tutorials/01-vector-add.py:45"],
+    "reference_difference": "Triton supports scalar pointer accesses and paired value/index reduction with explicit tie selection. Intent previously rejected the scalar output ABI and used i32 indices plus a user-supplied identity. The repaired canonical combine follows Intent's stronger documented i64/NaN contract rather than copying Triton's NaN behavior. Exact existing benchmark comparison passes; the single-program global traversal remains much slower than the reference.",
+    "related_benchmark": "compiler-rechecks/max_pool.csv"
+  },
+  {
+    "task": "min",
+    "compiler_commit": "ad621ac4",
+    "program": "programs/min/intent/repeat-0/generation-1/candidate.py",
+    "before": "builtin arg_reduce required identity; negated whole view was not loaded",
+    "measurement": "compiler-rechecks/min/measurement.json",
+    "cause": "Whole-view unary arithmetic now creates an explicit view load. Fixed arg-reduce identity, i64 index results and logical range propagation let the original negative-max implementation lower without author changes.",
+    "implementation": ["python/intent/frontend/lowering/ast/expressions.py:159", "python/intent/frontend/lowering/intrinsics/structured.py:219", "lib/Conversion/KIRToGPU/KIRToGPU.cpp:3064"],
+    "reference": ["/home/kingdom/phdworks/ref/triton/python/triton/language/core.py:2344", "/home/kingdom/phdworks/ref/triton/python/triton/language/standard.py:147"],
+    "reference_difference": "Triton reduction consumes loaded SSA values with paired logical indices; the old Intent unary operation incorrectly consumed an external view. Explicit loading and correct value/index reduction now preserve the original author's negative-max algorithm, with exact existing output comparison. This is a frontend/shared lowering repair, not a min-specific template."
+  },
+  {
+    "task": "sum",
+    "compiler_commit": "ad621ac4",
+    "program": "programs/sum/intent/repeat-0/generation-1/candidate.py",
+    "before": "rank-zero output rejected",
+    "measurement": "compiler-rechecks/sum/measurement.json",
+    "cause": "Rank-zero views retain scalar memory output semantics through the canonical and physical type boundaries. The bounded global reduction path from c60cd537 handles the original full logical source.",
+    "implementation": ["python/intent/frontend/source/signature.py:67", "lib/Dialect/GPU/IR/GPUDialect.cpp:371", "lib/Dialect/GPU/Transforms/RealizeReductionBlocking.cpp:2569"],
+    "reference": ["/home/kingdom/phdworks/ref/triton/python/triton/language/core.py:2348", "/home/kingdom/phdworks/ref/tilelang/examples/online_softmax/online_softmax.py:25"],
+    "reference_difference": "Scalar pointer accesses and bounded source loops are already explicit in the references. Intent's obsolete frontend restriction blocked the scalar output; removing it does not introduce a hidden second kernel or parallel cross-program reduction. The numerical tolerance passes, but the one-program traversal remains slow."
+  },
+  {
+    "task": "softplus_linear",
+    "compiler_commit": "ad621ac4",
+    "program": "programs/softplus_linear/intent/repeat-0/generation-2/candidate.py",
+    "before": "broadcast consumed an unloaded view; bias ownership and physical broadcast shape were inconsistent",
+    "measurement": "compiler-rechecks/softplus_linear/measurement.json",
+    "cause": "Binary arithmetic explicitly loads view operands. A read-only bias can share write ownership only through supported pointwise def-use paths and an exact logical traversal match. Serialization materializes the already-explicit broadcast shape and preserves coordinate dtype.",
+    "implementation": ["python/intent/frontend/lowering/ast/context.py:566", "lib/Dialect/GPU/Transforms/RealizePointwiseBlocking.cpp:4050", "lib/Target/Triton/Serialization/Serializer.cpp:1408"],
+    "reference": ["/home/kingdom/phdworks/ref/triton/python/tutorials/03-matrix-multiplication.py:297", "/home/kingdom/phdworks/ref/triton/python/tutorials/03-matrix-multiplication.py:316", "/home/kingdom/phdworks/ref/triton/python/triton/language/core.py:1914", "/home/kingdom/phdworks/ref/triton/python/tutorials/01-vector-add.py:45"],
+    "reference_difference": "The Triton matmul example keeps accumulator and epilogue store on the same bounded M/N tile, and broadcast_to supplies the full target shape. Intent instead left a bias source in independent full coverage and emitted only singleton-axis expansion for a larger promised fragment. Shared ownership propagation and mechanical broadcast spelling close those gaps without placing epilogue optimization in the serializer. Integer pointer coordinates remain integer regardless of payload dtype.",
+    "limits": "The original wrapper compiles both bias branches; this fixed task profile executes only the bias branch. The measured implementation remains about 2.92 times the PyTorch reference."
+  }
+]
