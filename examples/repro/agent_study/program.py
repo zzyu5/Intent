@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import intent
+from intent.runtime.source import materialize_python_source
 from intent.runtime.triton import materialize_triton_artifact, TuningHooks
 from intent.targets import TritonTarget
 import triton
@@ -53,7 +54,11 @@ class ProgramContext:
         if path.parent != self.directory or path.suffix != ".py":
             raise ValueError("load_source() accepts an adjacent generated Python file")
         validate_program(path, language="triton", generated_source=True)
-        return materialize_triton_artifact(path.read_text(), "", path.stem, 0)
+        # Agent-edited Triton may launch multiple kernels without returning
+        # compiler debug metadata. Only its operator outputs are evaluated.
+        return materialize_python_source(
+            target_name="triton", source=path.read_text(), module_text="",
+            entry_name=path.stem, device=0, backend_ir_collector=None)
 
 
 class TuningBudget:

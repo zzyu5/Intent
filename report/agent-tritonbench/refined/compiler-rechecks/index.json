@@ -25,29 +25,31 @@
   },
   {
     "task": "conv2d",
-    "compiler_commit": "31f6aadc",
+    "compiler_commit": "95bdc2cb",
     "program": "../expanded/programs/conv2d/intent/repeat-0/generation-1-resume-1/candidate.py",
     "before": "0.967440 ms; ordered scalar accumulation and one output per program instance",
     "before_measurement": "compiler-rechecks/conv2d/measurement.json",
-    "measurement": "compiler-rechecks/conv2d/after-measurement.json",
-    "cause": "Extend shared pointwise rank lifting through scf.for init, iter_arg, yield and result. Only one independent output axis is promoted; loop bounds and steps must remain lane-independent and loop bodies cannot contain writes or other effects. SSA dependence propagation reaches a fixed point across nested carries.",
-    "implementation": ["lib/Dialect/GPU/Transforms/RealizePointwiseBlocking.cpp:2427", "lib/Dialect/GPU/Transforms/RealizePointwiseBlocking.cpp:2711", "lib/Dialect/GPU/Transforms/Utilities.cpp:2461"],
+    "intermediate_measurement": "compiler-rechecks/conv2d/after-measurement.json",
+    "measurement": "compiler-rechecks/conv2d/cartesian-measurement.json",
+    "cause": "Extend shared pointwise rank lifting through scf.for init, iter_arg, yield and result. Prove one or two independent output axes; loop bounds and steps must remain lane-independent and loop bodies cannot contain writes or other effects. SSA dependence propagation reaches a fixed point across nested carries.",
+    "implementation": ["lib/Dialect/GPU/Transforms/RealizePointwiseBlocking.cpp:2427", "lib/Dialect/GPU/Transforms/RealizePointwiseBlocking.cpp:2711", "lib/Dialect/GPU/Transforms/RealizePointwiseBlocking.cpp:3234", "lib/Dialect/GPU/Transforms/Utilities.cpp:2461"],
     "reference": ["/home/kingdom/phdworks/ref/triton/python/tutorials/gluon/13-conv-im2col.py:984", "/home/kingdom/phdworks/ref/tilelang/examples/convolution/example_convolution.py:20"],
     "reference_difference": "Both references use independent blocked output axes and an ordered inner traversal. Their GEMM convolution algorithm is not copied: Intent retains the author's scalar multiply/add order for each output, while carrying a vector of independent outputs through the same loops. No hidden kernel or serializer optimization is added.",
-    "limits": "The original task still measures 2.627 times its PyTorch anchor; no claim of optimal convolution blocking or algorithm substitution."
+    "limits": "The original task measures 1.119 times its PyTorch anchor after two-axis tiling; the one-axis intermediate was 2.627 times. No claim of optimal convolution blocking or algorithm substitution."
   },
   {
     "task": "conv2d_add",
-    "compiler_commit": "31f6aadc",
+    "compiler_commit": "95bdc2cb",
     "program": "programs/conv2d_add/intent/repeat-0/generation-1/candidate.py",
     "before": "1.702560 ms; ordered scalar accumulation",
     "before_measurement": "programs/conv2d_add/intent/repeat-0/generation-1/evaluation-recheck.json",
-    "measurement": "compiler-rechecks/conv2d_add/measurement.json",
+    "intermediate_measurement": "compiler-rechecks/conv2d_add/measurement.json",
+    "measurement": "compiler-rechecks/conv2d_add/cartesian-measurement.json",
     "cause": "The same independent-output rank-lifting pass applies to the original fused convolution-plus-add program, including its explicit output wrapper.",
-    "implementation": ["lib/Dialect/GPU/Transforms/RealizePointwiseBlocking.cpp:2427", "lib/Dialect/GPU/Transforms/RealizePointwiseBlocking.cpp:2711"],
+    "implementation": ["lib/Dialect/GPU/Transforms/RealizePointwiseBlocking.cpp:2427", "lib/Dialect/GPU/Transforms/RealizePointwiseBlocking.cpp:2711", "lib/Dialect/GPU/Transforms/RealizePointwiseBlocking.cpp:3234"],
     "reference": ["/home/kingdom/phdworks/ref/triton/python/tutorials/gluon/13-conv-im2col.py:984"],
     "reference_difference": "Blocked outputs share the ordered inner traversal. The original fused addition remains in the same program; the compiler does not replace the author algorithm with reference im2col/matmul.",
-    "limits": "The measured 0.096048 ms remains 2.714 times the PyTorch anchor."
+    "limits": "The measured 0.065184 ms remains 1.693 times the PyTorch anchor."
   },
   {
     "task": "softmax",
