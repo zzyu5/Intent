@@ -950,6 +950,8 @@ private:
         call += ", boundary_check=" + axisTuple(load.getBoundaryAxes()) +
                 ", padding_option=\"" + load.getPadding().str() + "\"";
       call += ")";
+      if (fragment.getElementType().isInteger(1))
+        call = "tl.cast(" + call + ", tl.int1)";
       assign(load.getResult(), call);
       return;
     }
@@ -1157,12 +1159,15 @@ private:
     }
     if (auto store = dyn_cast<BlockStoreOp>(operation)) {
       auto fragment = cast<gpu::FragmentType>(store.getValue().getType());
+      std::string storageType = fragment.getElementType().isInteger(1)
+                                    ? "tl.int8"
+                                    : pythonType(fragment.getElementType());
       std::string call =
           "tl.store(" +
           blockPointer(store.getView(), store.getOffsets(),
                        store.getBlockAxes(), store.getOrder(), fragment) +
           ", tl.cast(" + valueString(store.getValue()) + ", " +
-          pythonType(fragment.getElementType()) + ")";
+          storageType + ")";
       if (!store.getBoundaryAxes().empty())
         call += ", boundary_check=" + axisTuple(store.getBoundaryAxes());
       line(call + ")");
