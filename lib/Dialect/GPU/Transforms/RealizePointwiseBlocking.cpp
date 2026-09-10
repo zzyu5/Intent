@@ -13,6 +13,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include <algorithm>
 #include <functional>
@@ -2425,17 +2426,47 @@ bool analyzeStructuredRegionFold(
 }
 
 bool supportsCartesianPointwiseValueGraph(
-    ArrayRef<WorksetCoordinateOp> coordinates) {
+    ArrayRef<WorksetCoordinateOp> coordinates, bool allowOrderedLoops = false) {
   llvm::SmallDenseSet<Value> dependent;
   SmallVector<Value> worklist;
+  auto enqueue = [&](Value value) {
+    if (dependent.insert(value).second)
+      worklist.push_back(value);
+  };
   for (WorksetCoordinateOp coordinate : coordinates) {
-    dependent.insert(coordinate.getResult());
-    worklist.push_back(coordinate.getResult());
+    enqueue(coordinate.getResult());
   }
   llvm::SmallPtrSet<Operation *, 32> visited;
+  llvm::SmallPtrSet<Operation *, 8> loops;
   while (!worklist.empty()) {
     Value value = worklist.pop_back_val();
     for (Operation *user : value.getUsers()) {
+      if (allowOrderedLoops) {
+        if (auto yield = dyn_cast<scf::YieldOp>(user)) {
+          auto loop = dyn_cast<scf::ForOp>(yield->getParentOp());
+          if (!loop)
+            return false;
+          loops.insert(loop);
+          for (auto [index, operand] : llvm::enumerate(yield.getResults()))
+            if (operand == value) {
+              enqueue(loop.getRegionIterArgs()[index]);
+              enqueue(loop.getResult(index));
+            }
+          continue;
+        }
+        if (auto loop = dyn_cast<scf::ForOp>(user)) {
+          if (value == loop.getLowerBound() || value == loop.getUpperBound() ||
+              value == loop.getStep())
+            return false;
+          loops.insert(loop);
+          for (auto [index, operand] : llvm::enumerate(loop.getInitArgs()))
+            if (operand == value) {
+              enqueue(loop.getRegionIterArgs()[index]);
+              enqueue(loop.getResult(index));
+            }
+          continue;
+        }
+      }
       if (!visited.insert(user).second)
         continue;
       if (user->getNumResults() == 0) {
@@ -2453,10 +2484,25 @@ bool supportsCartesianPointwiseValueGraph(
         Type type = result.getType();
         if (!isa<IntegerType, FloatType, IndexType, FragmentType>(type))
           return false;
-        if (dependent.insert(result).second)
-          worklist.push_back(result);
+        enqueue(result);
       }
     }
+  }
+  if (allowOrderedLoops && loops.empty())
+    return false;
+  for (Operation *loop : loops) {
+    WalkResult effects = loop->walk([&](Operation *operation) {
+      if (isa<scf::ForOp>(operation))
+        return WalkResult::advance();
+      if (operation->getNumRegions() != 0)
+        return WalkResult::interrupt();
+      return isa<scf::YieldOp, LoadOp>(operation) ||
+                     isMemoryEffectFree(operation)
+                 ? WalkResult::advance()
+                 : WalkResult::interrupt();
+    });
+    if (effects.wasInterrupted())
+      return false;
   }
   return true;
 }
@@ -2665,6 +2711,25 @@ LogicalResult rankLiftPointwiseValueGraph(
     return shifted;
   };
   llvm::SmallPtrSet<Operation *, 32> liftedOperations;
+  auto liftLoopCarry = [&](scf::ForOp loop, unsigned index,
+                           Type target) -> LogicalResult {
+    OpBuilder initBuilder(loop);
+    FailureOr<Value> init = projectPhysicalValueToSchema(
+        initBuilder, loop.getLoc(), loop.getInitArgs()[index], target);
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    OpBuilder yieldBuilder(yield);
+    FailureOr<Value> yielded = projectPhysicalValueToSchema(
+        yieldBuilder, loop.getLoc(), yield.getResults()[index], target);
+    if (failed(init) || failed(yielded))
+      return loop.emitOpError("ordered carry cannot adopt the lifted output axis");
+    loop.getInitArgsMutable()[index].assign(*init);
+    yield->setOperand(index, *yielded);
+    loop.getRegionIterArgs()[index].setType(target);
+    loop.getResult(index).setType(target);
+    liftedValues.insert(loop.getRegionIterArgs()[index]);
+    liftedValues.insert(loop.getResult(index));
+    return success();
+  };
   std::function<WalkResult(Operation *)> liftOperation;
   liftOperation = [&](Operation *operation) {
     if (isa<MakeRangeOp>(operation))
@@ -2675,6 +2740,27 @@ LogicalResult rankLiftPointwiseValueGraph(
         });
     if (!dependsOnLiftedRange)
       return WalkResult::advance();
+    if (auto yield = dyn_cast<scf::YieldOp>(operation)) {
+      auto loop = dyn_cast<scf::ForOp>(yield->getParentOp());
+      if (!loop)
+        return WalkResult::interrupt();
+      for (auto [index, value] : llvm::enumerate(yield.getResults()))
+        if (dependsOnLiftedAxis(value) &&
+            failed(liftLoopCarry(loop, index, value.getType())))
+          return WalkResult::interrupt();
+      return WalkResult::advance();
+    }
+    if (auto loop = dyn_cast<scf::ForOp>(operation)) {
+      if (dependsOnLiftedAxis(loop.getLowerBound()) ||
+          dependsOnLiftedAxis(loop.getUpperBound()) ||
+          dependsOnLiftedAxis(loop.getStep()))
+        return WalkResult::interrupt();
+      for (auto [index, value] : llvm::enumerate(loop.getInitArgs()))
+        if (dependsOnLiftedAxis(value) &&
+            failed(liftLoopCarry(loop, index, value.getType())))
+          return WalkResult::interrupt();
+      return WalkResult::advance();
+    }
     if (!liftedOperations.insert(operation).second)
       return WalkResult::advance();
     if (operation->getNumResults() == 0)
@@ -2886,10 +2972,16 @@ LogicalResult rankLiftPointwiseValueGraph(
     }
     return WalkResult::advance();
   };
-  WalkResult result =
-      kernel.walk([&](Operation *operation) { return liftOperation(operation); });
-  if (result.wasInterrupted())
-    return failure();
+  // A carry can make earlier body operations lane-dependent. Reach a fixed
+  // point through SSA uses without changing ordered loop control or traversal.
+  size_t previousLiftedCount;
+  do {
+    previousLiftedCount = liftedValues.size() + liftedOperations.size();
+    WalkResult result = kernel.walk(
+        [&](Operation *operation) { return liftOperation(operation); });
+    if (result.wasInterrupted())
+      return failure();
+  } while (previousLiftedCount != liftedValues.size() + liftedOperations.size());
 
   // Rank lifting can turn the scalar producer of an existing splat into a
   // fragment.  Preserve that newly explicit value relation as a fragment
@@ -3142,6 +3234,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     if (existingRanges.empty()) {
       if (supportsCartesianPointwiseValueGraph(pointwiseCoordinates))
         lifted.append(pointwiseCoordinates.begin(), pointwiseCoordinates.end());
+      else
+        for (WorksetCoordinateOp coordinate : llvm::reverse(pointwiseCoordinates))
+          if (supportsCartesianPointwiseValueGraph({coordinate}, true)) {
+            lifted.push_back(coordinate);
+            break;
+          }
     } else {
       SmallVector<std::pair<int64_t, WorksetCoordinateOp>> uncovered;
       for (WorksetCoordinateOp coordinate : pointwiseCoordinates) {
@@ -3172,7 +3270,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       }
       if (lifted.empty())
         for (auto [_, coordinate] : llvm::reverse(uncovered))
-          if (supportsStructuredFreeAxisValueGraph(coordinate)) {
+          if (supportsStructuredFreeAxisValueGraph(coordinate) ||
+              supportsCartesianPointwiseValueGraph({coordinate}, true)) {
             lifted.push_back(coordinate);
             break;
           }
