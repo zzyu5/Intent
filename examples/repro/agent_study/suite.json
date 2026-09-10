@@ -8,6 +8,9 @@
   "candidate_seconds": 300,
   "max_tuning_configurations": 16,
   "input_seed": 0,
+  "reference_corrections": {
+    "sub_gelu": "sub_gelu_standard_gelu"
+  },
   "prompt_entry_overrides": {
     "31": {"entry": "mean", "reason": "The mean description omits its function name and starts with input (Tensor)."},
     "141": {"entry": "solve", "reason": "The linear solve description gives argument names but omits its function name."},

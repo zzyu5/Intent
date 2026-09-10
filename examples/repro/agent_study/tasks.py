@@ -14,6 +14,8 @@ import torch
 
 from repro.v2.model import Tolerance
 
+from .reference_corrections import CORRECTIONS
+
 
 SUITE_PATH = Path(__file__).with_name("suite.json")
 
@@ -56,6 +58,8 @@ def catalog(root: Path, suite: dict) -> list[dict]:
                      "prompt_file": str(data_path), "reference_file": str(source_dir / f"{task_id}.py"),
                      "reference_line": line, "profile_file": f"performance_metrics/perf_T/golden_metrics/{task_id}_perf.py",
                      "disposition": disposition, "reason": reason})
+        if task_id in suite.get("reference_corrections", {}):
+            rows[-1]["reference_correction"] = suite["reference_corrections"][task_id]
     if len(rows) != 166 or len({row["task"] for row in rows}) != 166:
         raise ValueError("TritonBench-T task correspondence is not the agreed 166 unique tasks")
     if len(selected) != 50 or set(selected) - {row["task"] for row in rows}:
@@ -72,6 +76,8 @@ def description(root: Path, row: dict) -> str:
 
 
 def reference(root: Path, row: dict):
+    if "reference_correction" in row:
+        return CORRECTIONS[row["reference_correction"]]
     path = root / row["reference_file"]
     tree = ast.parse(path.read_text(), filename=str(path))
     tree.body = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))

@@ -73,6 +73,8 @@ def run(arguments) -> dict:
     result = {"status": "pending", "candidate_ms": None, "reference_ms": None, "ratio": None,
               "reference_timing_note": None,
               "timing": "cuda_graph", "tolerance": suite["tolerances"][task["tolerance"]]}
+    if "reference_correction" in row:
+        result["reference_correction"] = row["reference_correction"]
 
     def source_timing_error(error: Exception) -> bool:
         cause = error

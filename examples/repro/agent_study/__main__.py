@@ -67,7 +67,7 @@ def trial(arguments, row, repeat, arm, records, runtime) -> None:
         return
     identity = f"{row['task']}/{arm}/repeat-{repeat}"
     output_root = arguments.output / "programs" / identity
-    if output_root.exists() and not arguments.resume:
+    if output_root.exists() and not arguments.resume and not (arm == "triton" and arguments.reuse_triton_from):
         raise ValueError(f"trial already has records: {identity}; do not silently replace an independent repetition")
     output_root.mkdir(parents=True, exist_ok=True)
     prior_rows = [item for item in records.rows if item["task"] == row["task"] and item["arm"] == arm and item["repeat"] == repeat]
@@ -188,15 +188,19 @@ def main() -> None:
     parser.add_argument("--compiler-revision", help="Caller-declared build revision of an immutable compiler snapshot; verifies only that the live Python frontend matches")
     parser.add_argument("--codex", type=Path, required=True, help="Native Codex executable, not a shell/Node launcher")
     parser.add_argument("--tasks", nargs="+")
+    parser.add_argument("--arms", nargs="+", choices=("triton", "intent"), default=("triton", "intent"))
     parser.add_argument("--repeat", type=int, choices=(0, 1, 2), action="append")
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--gpu-lock", type=Path, help="Shared timing lock when scheduling independent study processes on one GPU")
     parser.add_argument("--stage", choices=("generation", "optimization"), help="Schedule one phase across the suite before the other")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--output", type=Path, help="Independent report directory for a newly frozen experiment configuration")
+    parser.add_argument("--reuse-triton-from", type=Path, help="Initialize a new compiler batch with unchanged direct Triton trials and original budgets")
     arguments = parser.parse_args()
     arguments.project = Path(__file__).resolve().parents[3]
     arguments.output = (arguments.output or arguments.project / "report/agent-tritonbench").resolve()
+    if arguments.reuse_triton_from:
+        arguments.reuse_triton_from = arguments.reuse_triton_from.resolve(strict=True)
     arguments.reference = arguments.reference.resolve()
     arguments.triton_ref = arguments.triton_ref.resolve()
     arguments.compiler = arguments.compiler.resolve(strict=True)
@@ -239,11 +243,15 @@ def main() -> None:
                    "instructions": Path(__file__).with_name("instructions.md").read_text(),
                    "isolation": "agent editing: workspace-only filesystem, network off, user config/rules/skills/plugins/hooks/memory/multi-agent disabled; benchmark candidate API validation is not a hostile-Python sandbox",
                    "tuning_policy": "up to 16 evenly spaced configurations including endpoints after legality pruning; median CUDA Graph, 5 warmups / 30 samples"}
+    if arguments.reuse_triton_from:
+        environment["reuse_triton_from"] = str(arguments.reuse_triton_from.relative_to(arguments.project))
     environment_path = arguments.output / "environment.json"
     if environment_path.exists() and json.loads(environment_path.read_text()) != environment:
         raise ValueError("recorded experiment environment changed; affected comparisons require explicit reconciliation")
     environment_path.write_text(json.dumps(environment, indent=2) + "\n")
     records = Records(arguments.output, arguments.suite)
+    if arguments.reuse_triton_from and not records.rows:
+        records.reuse_triton(arguments.reuse_triton_from, environment, rows)
     records.publish()
     runtime = Path(tempfile.mkdtemp(prefix="intent-agent-study-")).resolve()
     print(f"Selected {len(selected)} of 50 tasks; project results: {arguments.output}", flush=True)
@@ -253,7 +261,7 @@ def main() -> None:
             if row["task"] not in selected:
                 continue
             for repeat in arguments.repeat if arguments.repeat else range(arguments.suite["repetitions"]):
-                for arm in ("triton", "intent"):
+                for arm in arguments.arms:
                     futures.append(executor.submit(trial, arguments, row, repeat, arm, records, runtime))
         for future in as_completed(futures):
             try:

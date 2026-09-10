@@ -7,6 +7,7 @@ import json
 import math
 from pathlib import Path
 import statistics
+import shutil
 import threading
 
 
@@ -52,7 +53,8 @@ class Records:
     def _reload(self, source):
         source.seek(0)
         self.rows = [json.loads(line) for line in source]
-        unresolved = {item["task"]: item for item in self.reference_issues if item["status"] == "awaiting_oracle_decision"}
+        unresolved = {item["task"]: item for item in self.reference_issues
+                      if item["status"] in {"awaiting_oracle_decision", "superseded_by_corrected_reference"}}
         for row in self.rows:
             if row["task"] in unresolved and row["status"] in {"pass", "numerical_failure"}:
                 row.update(original_status=row["status"], status="reference_contract_failure",
@@ -74,6 +76,41 @@ class Records:
             self._publish(source)
         print(json.dumps({key: row[key] for key in ("task", "arm", "repeat", "stage", "candidate", "status", "candidate_ms", "reference_ms", "ratio")}), flush=True)
 
+    def reuse_triton(self, directory: Path, environment: dict, catalog: list[dict]) -> None:
+        source_environment = json.loads((directory / "environment.json").read_text())
+        for name, value in environment.items():
+            if name in {"compiler_commit", "reuse_triton_from"}:
+                continue
+            previous = source_environment[name]
+            if name == "suite":
+                value = {key: item for key, item in value.items() if key != "reference_corrections"}
+                previous = {key: item for key, item in previous.items() if key != "reference_corrections"}
+            if previous != value:
+                raise ValueError(f"cannot reuse direct Triton with changed {name}")
+        old_catalog = {row["task"]: row for row in json.loads((directory / "tasks.json").read_text())}
+        reusable = {row["task"] for row in catalog if row["disposition"] == "selected"
+                    and old_catalog[row["task"]] == row}
+        source = Records(directory, source_environment["suite"])
+        origin = str(directory.relative_to(Path(__file__).resolve().parents[3]))
+        rows = [{**row, "reused_from": origin} for row in source.rows
+                if row["arm"] == "triton" and row["task"] in reusable]
+        with self._locked() as output:
+            self._reload(output)
+            if self.rows:
+                raise ValueError("reference reuse initializes an empty experiment batch only")
+            for task, repeat in {(row["task"], row["repeat"]) for row in rows}:
+                relative = Path("programs") / task / "triton" / f"repeat-{repeat}"
+                destination = self.directory / relative
+                destination.mkdir(parents=True, exist_ok=True)
+                for stage in ("generation", "optimization"):
+                    stop = directory / relative / f"{stage}-stop.json"
+                    if stop.exists():
+                        shutil.copyfile(stop, destination / stop.name)
+            for row in rows:
+                output.write(json.dumps(row) + "\n")
+            output.flush()
+            self._publish(output)
+
     def stop(self, path: Path, result: dict) -> None:
         with self._locked() as source:
             pending = path.with_name(f".{path.name}.pending")
@@ -87,7 +124,7 @@ class Records:
 
     def _publish(self, source) -> None:
         self._reload(source)
-        fields = ("task", "case", "arm", "repeat", "stage", "candidate", "status", "candidate_ms", "reference_ms", "ratio", "failure_stage", "error", "reference_timing_note", "original_status", "evaluation_repaired")
+        fields = ("task", "case", "arm", "repeat", "stage", "candidate", "status", "candidate_ms", "reference_ms", "ratio", "failure_stage", "error", "reference_timing_note", "reference_correction", "original_status", "evaluation_repaired", "reused_from")
         with self._publication("candidates.csv") as output:
             writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
@@ -239,6 +276,12 @@ class Records:
             counts = [sum(row["budget_correct"] for row in arms[arm]) for arm in ("triton", "intent")]
             lines.append(f"| {task['id']} | {counts[0]} | {counts[1]} | {median('triton', 'seed_ms')} | {median('intent', 'seed_ms')} | {median('triton', 'optimized_ms')} | {median('intent', 'optimized_ms')} |")
         recheck_index = self.directory / "compiler-rechecks/index.json"
+        reused = sorted({row["reused_from"] for row in self.rows if "reused_from" in row})
+        if reused:
+            lines += ["", "Unchanged direct Triton programs, measurements and their actual budgets were reused from: " + ", ".join(reused) + ". Tasks with changed reference contracts were not imported."]
+        corrections = self.suite.get("reference_corrections", {})
+        if corrections:
+            lines += ["", "Project-local reference corrections: " + ", ".join(f"{task}: {correction}" for task, correction in corrections.items()) + ". Upstream files are unchanged; sub_gelu restores the missing 1 + in the exact GELU formula."]
         if self.reference_issues:
             lines += ["", "## Reference Issues", ""]
             for item in self.reference_issues:
@@ -266,4 +309,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Publish existing agent-study benchmark observations")
     parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parents[3] / "report/agent-tritonbench")
     arguments = parser.parse_args()
-    Records(arguments.output, read_suite()).publish()
+    environment = arguments.output / "environment.json"
+    suite = json.loads(environment.read_text())["suite"] if environment.exists() else read_suite()
+    Records(arguments.output, suite).publish()
