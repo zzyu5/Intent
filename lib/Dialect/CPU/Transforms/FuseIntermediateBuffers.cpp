@@ -23,26 +23,61 @@ void forwardDestinations(func::FuncOp function) {
     if (!allocation || allocation->getBlock() != copy->getBlock()) continue;
     Value target = copy.getTarget();
     if (allocation.getType().getRank() != copy.getTarget().getType().getRank()) continue;
+    PhysicalProgramAnalysis analysis(function);
+    Value targetRoot = analysis.storageRoot(target);
+    auto external = analysis.externalView(target);
+    if (!targetRoot.getDefiningOp<memref::AllocOp>() &&
+        (!external || external.getAccess() != 1)) continue;
+    if (targetRoot == allocation.getResult()) continue;
     auto targetOp = target.getDefiningOp();
     DominanceInfo dominance(function);
     if (targetOp && !dominance.dominates(targetOp, allocation)) {
-      if (!isMemoryEffectFree(targetOp) ||
+      if (targetOp->getBlock() != allocation->getBlock() ||
+          (!isMemoryEffectFree(targetOp) && !isa<memref::AllocOp>(targetOp)) ||
           llvm::any_of(targetOp->getOperands(), [&](Value value) {
             return !dominance.dominates(value, allocation);
           })) continue;
-      targetOp->moveBefore(allocation);
     }
     bool legal = true;
     SmallVector<memref::DeallocOp> deallocations;
-    for (Operation *user : allocation->getUsers()) {
-      if (auto dealloc = dyn_cast<memref::DeallocOp>(user)) {
-        deallocations.push_back(dealloc);
-        continue;
+    SmallVector<Value> aliases{allocation.getResult()};
+    for (unsigned i = 0; i < aliases.size(); ++i) {
+      for (Operation *user : aliases[i].getUsers()) {
+        if (auto dealloc = dyn_cast<memref::DeallocOp>(user)) {
+          if (aliases[i] != allocation.getResult()) legal = false;
+          else deallocations.push_back(dealloc);
+          continue;
+        }
+        if (auto view = dyn_cast<memref::SubViewOp>(user)) aliases.push_back(view.getResult());
+        else if (auto cast = dyn_cast<memref::CastOp>(user)) aliases.push_back(cast.getResult());
+        else if (!isa<memref::CopyOp, memref::DimOp, memref::LoadOp, memref::StoreOp,
+                      linalg::LinalgOp, ReduceOp>(user)) legal = false;
+        Operation *ancestor = copy->getBlock()->findAncestorOpInBlock(*user);
+        if (!ancestor || (ancestor != copy && !ancestor->isBeforeInBlock(copy))) legal = false;
       }
-      Operation *ancestor = copy->getBlock()->findAncestorOpInBlock(*user);
-      if (!ancestor || (ancestor != copy && !ancestor->isBeforeInBlock(copy))) legal = false;
+    }
+    // Forwarding moves the destination writes earlier. Its previous contents
+    // must not be observed or changed anywhere in that interval.
+    for (Operation *between = allocation->getNextNode(); legal && between != copy;
+         between = between->getNextNode()) {
+      between->walk([&](Operation *operation) {
+        if (isMemoryEffectFree(operation)) return;
+        auto effects = dyn_cast<MemoryEffectOpInterface>(operation);
+        if (!effects) {
+          if (!operation->hasTrait<OpTrait::HasRecursiveMemoryEffects>()) legal = false;
+          return;
+        }
+        SmallVector<MemoryEffects::EffectInstance> instances;
+        effects.getEffects(instances);
+        for (auto &effect : instances) {
+          if (isa<MemoryEffects::Allocate>(effect.getEffect())) continue;
+          if (!effect.getValue() || analysis.storageRoot(effect.getValue()) == targetRoot)
+            legal = false;
+        }
+      });
     }
     if (!legal) continue;
+    if (targetOp && !dominance.dominates(targetOp, allocation)) targetOp->moveBefore(allocation);
     for (memref::DeallocOp dealloc : deallocations) dealloc.erase();
     allocation.getResult().replaceAllUsesExcept(target, copy);
     copy.erase();

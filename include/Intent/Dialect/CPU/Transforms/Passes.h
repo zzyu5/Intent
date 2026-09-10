@@ -32,11 +32,14 @@ mlir::LogicalResult fuseReductionTraversals(mlir::func::FuncOp function);
 mlir::LogicalResult blockContractions(mlir::func::FuncOp function,
                                     const Configuration &configuration,
                                     const ImplementationRegistry &implementations);
+mlir::LogicalResult blockStructuredComputations(mlir::func::FuncOp function,
+                                    const ImplementationRegistry &implementations);
 mlir::LogicalResult vectorizeLoops(mlir::func::FuncOp function, int64_t width,
                                    int64_t replicas, int64_t reductionReplicas);
 mlir::LogicalResult partitionTasks(mlir::func::FuncOp function, int64_t grain);
 mlir::LogicalResult isolateTasks(mlir::func::FuncOp function);
-mlir::LogicalResult realizeRegions(mlir::func::FuncOp function, int64_t segmentSize);
+mlir::LogicalResult realizeRegions(mlir::func::FuncOp function, const Configuration &configuration,
+                                  const ImplementationRegistry &implementations);
 mlir::LogicalResult materializeTaskLoops(mlir::func::FuncOp function);
 mlir::LogicalResult runCPUPasses(mlir::ModuleOp module, int64_t vectorBits,
                                int64_t workers, llvm::StringRef defaults,

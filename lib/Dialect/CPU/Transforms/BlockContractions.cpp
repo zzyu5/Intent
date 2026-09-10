@@ -40,6 +40,8 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
     return operation.emitError("CPU contraction accumulator initialization is missing");
   PhysicalProgramAnalysis analysis(operation->getParentOfType<func::FuncOp>());
   Value root = analysis.storageRoot(output);
+  bool keepInitialization = (*implementation)->contraction.completePrivateInitialization &&
+      isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(root.getDefiningOp());
   for (Operation *between = initialization->getNextNode(); between != operation;
        between = between->getNextNode())
     for (auto access : analysis.accesses(between))
@@ -66,22 +68,37 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
     Value nCount = b.create<arith::MinSIOp>(loc, b.create<arith::SubIOp>(loc, nSize, nBegin), bn);
     Value outputTile = subview(b, loc, output, {mBegin, nBegin}, {mCount, nCount});
     Value empty = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, kSize, zero);
-    auto initializeEmpty = b.create<scf::IfOp>(loc, empty, false);
-    {
+    if (!keepInitialization) {
+      auto initializeEmpty = b.create<scf::IfOp>(loc, empty, false);
       OpBuilder::InsertionGuard guard(b);
       b.setInsertionPointToStart(initializeEmpty.thenBlock());
       b.create<linalg::FillOp>(loc, ValueRange{initial}, ValueRange{outputTile});
     }
-    auto kBlock = [&](Value kBegin, bool first) {
-      Value depth = b.create<arith::MinSIOp>(loc,
-          b.create<arith::SubIOp>(loc, kSize, kBegin), bk);
+    auto kBlock = [&](Value kBegin, Value depth, bool first) {
       if (failed((*implementation)->formTile(b, operation,
               {lhs, rhs, output, initial, mBegin, mCount, nBegin, nCount, kBegin, depth, first},
               shared, binding))) status = failure();
     };
-    Value firstEnd = b.create<arith::MinSIOp>(loc, kSize, bk);
-    loop(b, loc, zero, firstEnd, config.tileK, [&](Value k) { kBlock(k, true); });
-    loop(b, loc, firstEnd, kSize, config.tileK, [&](Value k) { kBlock(k, false); });
+    if ((*implementation)->contraction.staticReductionExtent) {
+      Value fullEnd = b.create<arith::SubIOp>(loc, kSize, b.create<arith::RemSIOp>(loc, kSize, bk));
+      Value firstEnd = b.create<arith::MinSIOp>(loc, fullEnd, bk);
+      loop(b, loc, zero, firstEnd, config.tileK, [&](Value k) { kBlock(k, bk, true); });
+      loop(b, loc, bk, fullEnd, config.tileK, [&](Value k) { kBlock(k, bk, false); });
+      Value noFullTile = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, fullEnd, zero);
+      Value firstTailEnd = b.create<arith::SelectOp>(loc, noFullTile,
+          b.create<arith::MinSIOp>(loc, kSize, one), zero);
+      loop(b, loc, zero, firstTailEnd, 1, [&](Value k) { kBlock(k, one, true); });
+      Value tailBegin = b.create<arith::MaxSIOp>(loc, fullEnd, one);
+      loop(b, loc, tailBegin, kSize, 1, [&](Value k) { kBlock(k, one, false); });
+    } else {
+      Value firstEnd = b.create<arith::MinSIOp>(loc, kSize, bk);
+      auto dynamicBlock = [&](Value k, bool first) {
+        Value depth = b.create<arith::MinSIOp>(loc, b.create<arith::SubIOp>(loc, kSize, k), bk);
+        kBlock(k, depth, first);
+      };
+      loop(b, loc, zero, firstEnd, config.tileK, [&](Value k) { dynamicBlock(k, true); });
+      loop(b, loc, firstEnd, kSize, config.tileK, [&](Value k) { dynamicBlock(k, false); });
+    }
   };
   if (operation->getParentOfType<scf::ForOp>() || operation->getParentOfType<scf::ParallelOp>()) {
     loop(b, loc, zero, mTasks, 1, [&](Value m) {
@@ -95,7 +112,7 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
     tile(parallel.getInductionVars()[0], parallel.getInductionVars()[1]);
   }
   if (failed(status)) return failure();
-  initialization.erase();
+  if (!keepInitialization) initialization.erase();
   operation.erase();
   return success();
 }

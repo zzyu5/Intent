@@ -164,6 +164,8 @@ MOJO = (
 
 
 WEFT = (
+    Entry("causal_attention_f32", "B8-S128-D32-f32-1core", "causal_attention_f32", ("streaming/attention_f32.py:causal_attention_f32",), "source/weft/intentdsl/attention/attention_runtime.py"),
+    Entry("causal_linear_attention_f32", "B8-S128-D32-f32-1core", "causal_linear_attention_f32", ("streaming/attention_f32.py:causal_linear_attention_f32",), "source/weft/intentdsl/attention/attention_runtime.py"),
     Entry("q4_k_projection", "N4096-K4096-Q4_K-f32-1core", "quantized_projection",
           ("quantization/quantized_projection.py:quantized_projection",),
           "source/weft/tianchenrv/contraction/q4_k_projection/q4_k_projection_runtime.py"),

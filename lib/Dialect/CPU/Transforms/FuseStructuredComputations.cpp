@@ -12,6 +12,42 @@ using namespace mlir;
 namespace intent::cpu {
 namespace {
 
+void eraseDeadBuffers(func::FuncOp function) {
+  SmallVector<memref::AllocOp> allocations;
+  function.walk([&](memref::AllocOp allocation) { allocations.push_back(allocation); });
+  for (auto allocation : llvm::reverse(allocations)) {
+    SmallVector<Operation *> users;
+    llvm::SmallPtrSet<Operation *, 8> seen;
+    for (Operation *user : allocation.getResult().getUsers())
+      if (seen.insert(user).second) users.push_back(user);
+    bool unused = llvm::all_of(users, [&](Operation *user) {
+      if (auto generic = dyn_cast<linalg::LinalgOp>(user)) {
+        if (generic.getNumDpsInits() != 1 || generic->getNumResults() ||
+            generic.getDpsInits()[0] != allocation.getResult()) return false;
+        return llvm::all_of(generic->getRegion(0).front().without_terminator(), [](Operation &nested) {
+          return !nested.getNumRegions() && isMemoryEffectFree(&nested);
+        });
+      }
+      if (auto copy = dyn_cast<memref::CopyOp>(user)) return copy.getTarget() == allocation.getResult();
+      if (auto dimension = dyn_cast<memref::DimOp>(user)) return dimension.getConstantIndex().has_value();
+      return isa<memref::DeallocOp>(user);
+    });
+    if (!unused) continue;
+    for (Operation *user : users) {
+      if (auto dimension = dyn_cast<memref::DimOp>(user)) {
+        OpBuilder b(dimension);
+        int64_t axis = *dimension.getConstantIndex();
+        Value extent = allocation.getType().isDynamicDim(axis)
+            ? allocation.getDynamicSizes()[allocation.getType().getDynamicDimIndex(axis)]
+            : Value(b.create<arith::ConstantIndexOp>(dimension.getLoc(), allocation.getType().getDimSize(axis)));
+        dimension.getResult().replaceAllUsesWith(extent);
+      }
+      user->erase();
+    }
+    allocation.erase();
+  }
+}
+
 linalg::GenericOp pointwiseProducer(Value buffer, Operation *consumer,
                                     PhysicalProgramAnalysis &analysis) {
   if (!buffer.getDefiningOp<memref::AllocOp>()) return {};
@@ -84,6 +120,10 @@ bool fuseOne(Operation *consumer, unsigned inputNumber,
           return cast<AffineMapAttr>(a).getValue();
         }));
   auto producerMaps = producer.getIndexingMapsArray();
+  if (reduce && !producer.getRegion().front().getOps<linalg::IndexOp>().empty()) return false;
+  for (auto index : producer.getRegion().front().getOps<linalg::IndexOp>())
+    if (!isa<AffineDimExpr, AffineConstantExpr>(oldMaps[inputNumber].getResult(index.getDim())))
+      return false;
   SmallVector<Value> inputs;
   SmallVector<AffineMap> maps;
   for (auto [i, input] : llvm::enumerate(oldInputs)) {
@@ -110,7 +150,16 @@ bool fuseOne(Operation *consumer, unsigned inputNumber,
       Block &body = producer.getRegion().front();
       for (unsigned j = 0; j < producer.getInputs().size(); ++j)
         producerMapping.map(body.getArgument(j), target.getArgument(current++));
-      for (Operation &operation : body.without_terminator()) b.clone(operation, producerMapping);
+      for (Operation &operation : body.without_terminator()) {
+        if (auto index = dyn_cast<linalg::IndexOp>(operation)) {
+          AffineExpr coordinate = oldMaps[inputNumber].getResult(index.getDim());
+          Value value;
+          if (auto dimension = dyn_cast<AffineDimExpr>(coordinate))
+            value = b.create<linalg::IndexOp>(index.getLoc(), dimension.getPosition());
+          else value = b.create<arith::ConstantIndexOp>(index.getLoc(), cast<AffineConstantExpr>(coordinate).getValue());
+          producerMapping.map(index.getResult(), value);
+        } else b.clone(operation, producerMapping);
+      }
       mapping.map(oldBody.getArgument(prefix + i),
           producerMapping.lookupOrDefault(body.getTerminator()->getOperand(0)));
     }
@@ -122,12 +171,13 @@ bool fuseOne(Operation *consumer, unsigned inputNumber,
   OpBuilder builder(consumer);
   if (generic) {
     maps.push_back(oldMaps.back());
-    builder.create<linalg::GenericOp>(generic.getLoc(), inputs,
+    auto replacement = builder.create<linalg::GenericOp>(generic.getLoc(), inputs,
         generic.getOutputs(), maps, generic.getIteratorTypesArray(),
         [&](OpBuilder &b, Location loc, ValueRange) {
           Value value = populate(b, *b.getInsertionBlock(), generic.getRegion().front(), 0);
           b.create<linalg::YieldOp>(loc, value);
         });
+    replacement->setDiscardableAttrs(llvm::to_vector(generic->getDiscardableAttrs()));
     generic.erase();
   } else {
     SmallVector<Attribute> attributes;
@@ -267,6 +317,7 @@ LogicalResult fuseStructuredComputations(func::FuncOp function) {
       if (reuseOutput(operation, input, analysis)) break;
     }
   }
+  eraseDeadBuffers(function);
   return success();
 }
 

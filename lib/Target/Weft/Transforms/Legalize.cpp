@@ -96,6 +96,14 @@ public:
                const cpu::ImplementationRegistry &implementations)
       : analysis(function), relations(function), output(output), b(output.getContext()),
         formats(formats), implementations(implementations) {
+    auto interface = function->getAttrOfType<cpu::InterfaceAttr>("intent_cpu.interface");
+    for (auto [argument, schema] : llvm::zip(function.getArguments(), interface.getArguments())) {
+      auto view = dyn_cast<cpu::ViewArgumentAttr>(schema);
+      if (!view) continue;
+      auto memory = cast<MemRefType>(argument.getType());
+      for (unsigned axis = 0; axis < memory.getRank(); ++axis)
+        if (memory.isDynamicDim(axis)) extentIds.try_emplace(view.getDimensions()[axis], extentIds.size() + 1);
+    }
     auto join = [&](Value lhs, Value rhs) {
       int64_t a = physicalAxis(relations.axes(lhs).back());
       int64_t c = physicalAxis(relations.axes(rhs).back());
@@ -112,14 +120,15 @@ public:
   }
 
   SmallVector<Value> shapeArguments(func::FuncOp function, OpBuilder &builder) {
-    SmallVector<Value> result(relations.dynamicAxisCount());
-    for (Value argument : function.getArguments()) {
+    SmallVector<Value> result(extentIds.size());
+    auto interface = function->getAttrOfType<cpu::InterfaceAttr>("intent_cpu.interface");
+    for (BlockArgument argument : function.getArguments()) {
       auto memory = dyn_cast<MemRefType>(argument.getType());
       if (!memory) continue;
-      auto ids = memoryAxes(argument);
+      auto ids = cast<cpu::ViewArgumentAttr>(interface.getArguments()[argument.getArgNumber()]).getDimensions();
       for (auto [axis, extent] : llvm::enumerate(memory.getShape()))
         if (ShapedType::isDynamic(extent))
-          result[ids[axis] - 1] = builder.create<memref::DimOp>(function.getLoc(), argument, axis);
+          result[extentIds.at(ids[axis]) - 1] = builder.create<memref::DimOp>(function.getLoc(), argument, axis);
     }
     return result;
   }
@@ -141,8 +150,13 @@ public:
         if (unique.size() != ids.size())
           return tasks.emitError("Weft view requires independent logical axes; this reuse needs an explicit axis projection");
         SmallVector<int64_t> dimensions;
-        for (auto [axis, extent] : llvm::enumerate(memory.getShape()))
-          dimensions.push_back(ShapedType::isDynamic(extent) ? -ids[axis] : extent);
+        for (auto [axis, extent] : llvm::enumerate(memory.getShape())) {
+          if (ShapedType::isDynamic(extent)) {
+            auto symbol = dimensionSymbol(capture, axis);
+            if (!symbol) return tasks.emitError("captured view extent has no external shape binding");
+            dimensions.push_back(-*symbol);
+          } else dimensions.push_back(extent);
+        }
         auto format = formats.find(analysis.storageRoot(capture));
         if (format != formats.end()) {
           int64_t bytes = format->second == intent::QuantFormat::Q4K ? 144 : 292;
@@ -166,8 +180,8 @@ public:
         aliases.push_back(0);
       }
     }
-    for (unsigned axis = 1; axis <= relations.dynamicAxisCount(); ++axis)
-      symbols.push_back(b.getStringAttr("axis_" + std::to_string(axis)));
+    for (unsigned symbol = 1; symbol <= extentIds.size(); ++symbol)
+      symbols.push_back(b.getStringAttr("shape_" + std::to_string(symbol)));
     b.setInsertionPointToEnd(output.getBody());
     auto kernel = b.create<wk::KernelOp>(loc, name, b.getArrayAttr(names),
         b.getArrayAttr(accesses), array(aliases), b.getArrayAttr(symbols), "Intent CPU task");
@@ -233,17 +247,30 @@ private:
     return wk::ViewType::get(b.getContext(), dense(type), array({1}), array({nextAxis++}));
   }
   Type valueType(Type element, ArrayRef<int64_t> dimensions, ArrayRef<int64_t> ids) {
+    element = scalarType(element);
     if (dimensions.empty()) return element;
     return wk::ValueType::get(b.getContext(), element, array(dimensions), array(ids));
   }
+  Type scalarType(Type type) {
+    if (auto integer = dyn_cast<IntegerType>(type); integer && integer.isSignless() && integer.getWidth() != 1)
+      return IntegerType::get(b.getContext(), integer.getWidth(), IntegerType::Signed);
+    return type;
+  }
   Value index(Location loc, int64_t value) { return b.create<arith::ConstantIndexOp>(loc, value); }
-  Type resultType(Value memory, Type scalar = {}) {
+  FailureOr<Type> resultType(Value memory, Type scalar = {}) {
     auto type = cast<MemRefType>(memory.getType());
     auto ids = memoryAxes(memory);
     SmallVector<int64_t> dimensions;
-    for (auto [axis, extent] : llvm::enumerate(type.getShape()))
-      dimensions.push_back(ShapedType::isDynamic(extent) ? -ids[axis] : extent);
-    return valueType(scalar ? scalar : type.getElementType(), dimensions, ids);
+    for (auto [axis, extent] : llvm::enumerate(type.getShape())) {
+      if (ShapedType::isDynamic(extent)) {
+        auto symbol = dimensionSymbol(memory, axis);
+        if (!symbol) return emitError(memory.getLoc(), "private value extent has no explicit shape binding"), failure();
+        dimensions.push_back(-*symbol);
+      } else dimensions.push_back(extent);
+    }
+    Type element = scalar ? scalar : type.getElementType();
+    if (element.isIndex()) element = IntegerType::get(b.getContext(), 64, IntegerType::Signed);
+    return valueType(element, dimensions, ids);
   }
   bool sameBound(OpFoldResult lhs, OpFoldResult rhs) {
     if (lhs == rhs) return true;
@@ -267,11 +294,59 @@ private:
     return isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(localRoot(memory).getDefiningOp());
   }
 
+  std::optional<int64_t> extentSymbol(Value extent) {
+    if (auto cast = extent.getDefiningOp<arith::IndexCastOp>(); cast &&
+        (cast.getIn().getType().isInteger(64) || cast.getOut().getType().isInteger(64)))
+      return extentSymbol(cast.getIn());
+    if (auto maximum = extent.getDefiningOp<arith::MaxSIOp>()) {
+      // A memref extent is nonnegative; max(extent, 0) is the same bound.
+      if (matchPattern(maximum.getLhs(), m_Zero())) return extentSymbol(maximum.getRhs());
+      if (matchPattern(maximum.getRhs(), m_Zero())) return extentSymbol(maximum.getLhs());
+    }
+    if (auto argument = dyn_cast<BlockArgument>(extent)) {
+      auto tasks = dyn_cast<cpu::TasksOp>(argument.getOwner()->getParentOp());
+      if (tasks && argument.getArgNumber())
+        return extentSymbol(tasks.getCaptures()[argument.getArgNumber() - 1]);
+      return std::nullopt;
+    }
+    auto dimension = extent.getDefiningOp<memref::DimOp>();
+    if (!dimension || !dimension.getConstantIndex()) return std::nullopt;
+    return dimensionSymbol(dimension.getSource(), *dimension.getConstantIndex());
+  }
+
+  std::optional<int64_t> dimensionSymbol(Value memory, unsigned axis) {
+    if (auto cast = memory.getDefiningOp<memref::CastOp>()) return dimensionSymbol(cast.getSource(), axis);
+    if (auto argument = dyn_cast<BlockArgument>(memory)) {
+      if (auto tasks = dyn_cast<cpu::TasksOp>(argument.getOwner()->getParentOp()))
+        return dimensionSymbol(tasks.getCaptures()[argument.getArgNumber() - 1], axis);
+      if (isa<func::FuncOp>(argument.getOwner()->getParentOp()) &&
+          cast<MemRefType>(memory.getType()).isDynamicDim(axis)) {
+        auto interface = argument.getOwner()->getParentOp()->getAttrOfType<cpu::InterfaceAttr>("intent_cpu.interface");
+        auto dimension = cast<cpu::ViewArgumentAttr>(interface.getArguments()[argument.getArgNumber()]).getDimensions()[axis];
+        return extentIds.at(dimension);
+      }
+    }
+    if (auto subview = memory.getDefiningOp<memref::SubViewOp>()) {
+      unsigned projected = 0;
+      for (unsigned original = 0; original < subview.getSourceType().getRank(); ++original)
+        if (!subview.getDroppedDims().test(original) && projected++ == axis) {
+          auto size = dyn_cast<Value>(subview.getMixedSizes()[original]);
+          return size ? extentSymbol(size) : std::nullopt;
+        }
+    }
+    if (isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(memory.getDefiningOp())) {
+      auto type = cast<MemRefType>(memory.getType());
+      if (type.isDynamicDim(axis))
+        return extentSymbol(memory.getDefiningOp()->getOperand(type.getDynamicDimIndex(axis)));
+    }
+    return std::nullopt;
+  }
+
   FailureOr<Value> view(Value memory) {
     if (values.contains(memory)) return values.lookup(memory);
     if (auto cast = memory.getDefiningOp<memref::CastOp>()) return view(cast.getSource());
     auto operation = memory.getDefiningOp<memref::SubViewOp>();
-    if (!operation) return failure();
+    if (!operation) return emitError(memory.getLoc(), "CPU memory has no explicit Weft view relation: ") << memory, failure();
     auto base = view(operation.getSource());
     if (failed(base)) return failure();
     SmallVector<int64_t> offsets, extents, dimensions;
@@ -288,6 +363,35 @@ private:
     };
     for (OpFoldResult stride : operation.getMixedStrides())
       if (!sameBound(stride, b.getIndexAttr(1))) return operation.emitError("Weft subview requires unit coordinate steps"), failure();
+    bool projectionOnly = true;
+    auto dropped = operation.getDroppedDims();
+    auto baseShape = shape((*base).getType());
+    for (unsigned axis = 0; axis < baseShape.size(); ++axis) {
+      if (dropped.test(axis)) continue;
+      auto size = operation.getMixedSizes()[axis];
+      bool full = baseShape[axis] >= 0 ? sameBound(size, b.getIndexAttr(baseShape[axis]))
+          : isa<Value>(size) && extentSymbol(cast<Value>(size)) == -baseShape[axis];
+      projectionOnly &= sameBound(operation.getMixedOffsets()[axis], b.getIndexAttr(0)) && full;
+    }
+    if (projectionOnly) {
+      SmallVector<Attribute> selectors;
+      SmallVector<Value> indices;
+      SmallVector<int64_t> keptShape, keptAxes;
+      auto baseAxes = axes((*base).getType());
+      for (unsigned axis = 0; axis < baseShape.size(); ++axis) {
+        selectors.push_back(b.getStringAttr(dropped.test(axis) ? "index" : "all"));
+        if (dropped.test(axis)) {
+          auto offset = operation.getMixedOffsets()[axis];
+          indices.push_back(isa<Attribute>(offset) ? index(operation.getLoc(), cast<IntegerAttr>(cast<Attribute>(offset)).getInt())
+                                                   : values.lookup(cast<Value>(offset)));
+        } else { keptShape.push_back(baseShape[axis]); keptAxes.push_back(baseAxes[axis]); }
+      }
+      Value selected = b.create<wk::SliceOp>(operation.getLoc(),
+          wk::SliceType::get(b.getContext(), encoding(memory), array(keptShape), array(keptAxes)),
+          *base, indices, b.getArrayAttr(selectors));
+      values.map(memory, selected);
+      return selected;
+    }
     append(operation.getMixedOffsets(), offsets);
     append(operation.getMixedSizes(), extents);
     auto format = formats.find(analysis.storageRoot(memory));
@@ -298,11 +402,18 @@ private:
       extents.back() = 256;
     }
     auto ids = axes((*base).getType());
-    for (auto [extent, axis] : llvm::zip(extents, ids)) dimensions.push_back(extent < 0 ? -axis : extent);
+    for (auto [axis, extent] : llvm::enumerate(extents)) {
+      if (extent >= 0) dimensions.push_back(extent);
+      else {
+        auto size = dyn_cast<Value>(operation.getMixedSizes()[axis]);
+        auto symbol = size ? extentSymbol(size) : std::nullopt;
+        if (!symbol) return operation.emitError("dynamic Weft subview extent has no shape binding"), failure();
+        dimensions.push_back(-*symbol);
+      }
+    }
     Value selected = b.create<wk::SubviewOp>(operation.getLoc(),
         wk::SliceType::get(b.getContext(), encoding(memory), array(dimensions), array(ids)),
         *base, dynamic, array(offsets), array(extents));
-    auto dropped = operation.getDroppedDims();
     if (dropped.any()) {
       SmallVector<Attribute> selectors;
       SmallVector<Value> indices;
@@ -331,8 +442,10 @@ private:
       if (previous != operandReads.end()) return previous->second;
       auto region = view(memory);
       if (failed(region)) return failure();
+      Type element = cast<MemRefType>(memory.getType()).getElementType();
+      if (element.isIndex()) element = IntegerType::get(b.getContext(), 64, IntegerType::Signed);
       Value loaded = b.create<wk::AdmitOp>(memory.getLoc(),
-          valueType(cast<MemRefType>(memory.getType()).getElementType(), shape((*region).getType()), axes((*region).getType())), *region);
+          valueType(element, shape((*region).getType()), axes((*region).getType())), *region);
       operandReads[memory] = loaded;
       return loaded;
     }
@@ -355,31 +468,145 @@ private:
       return found->second.value;
     }
     if (auto cast = memory.getDefiningOp<memref::CastOp>()) return read(cast.getSource());
-    auto projection = memory.getDefiningOp<memref::SubViewOp>();
-    if (!projection || projection.getSource() != root || projection.getDroppedDims().any()) {
-      emitError(memory.getLoc(), "Weft local-value projection requires one explicit rank-preserving subview");
-      return failure();
+    auto projection = localProjection(memory, found->second);
+    if (failed(projection)) return failure();
+    return Value(b.create<wk::ExtractOp>(memory.getLoc(), projection->type, found->second.value,
+                                        projection->indices, b.getArrayAttr(projection->selectors)));
+  }
+
+  struct LocalProjection {
+    Type type;
+    SmallVector<Value> indices;
+    SmallVector<Attribute> selectors;
+  };
+
+  FailureOr<LocalProjection> localProjection(Value memory, const LocalValue &state) {
+    Value root = localRoot(memory);
+    auto rootType = cast<MemRefType>(root.getType());
+    SmallVector<Value> origins(rootType.getRank());
+    SmallVector<bool> zeroOrigins(rootType.getRank(), true);
+    for (Value &origin : origins) origin = index(memory.getLoc(), 0);
+    SmallVector<OpFoldResult> sizes(state.sizes);
+    SmallVector<unsigned> kept;
+    for (unsigned axis = 0; axis < rootType.getRank(); ++axis) kept.push_back(axis);
+    SmallVector<memref::SubViewOp> chain;
+    for (Value current = memory; current != root;) {
+      if (auto cast = current.getDefiningOp<memref::CastOp>()) current = cast.getSource();
+      else if (auto view = current.getDefiningOp<memref::SubViewOp>()) { chain.push_back(view); current = view.getSource(); }
+      else return emitError(memory.getLoc(), "local window has no composed subview relation"), failure();
     }
-    auto offsets = projection.getMixedOffsets(), sizes = projection.getMixedSizes();
-    for (auto [axis, offset, size, stride] : llvm::zip(llvm::seq<unsigned>(0, sizes.size()),
-             offsets, sizes, projection.getMixedStrides())) {
-      if (!sameBound(stride, b.getIndexAttr(1)) || !sameBound(offset, b.getIndexAttr(0)) ||
-          !sameBound(size, found->second.sizes[axis]))
-        return projection.emitError("Weft private value must consume its explicit complete active panel; other local windows are not implemented"), failure();
+    for (auto view : llvm::reverse(chain)) {
+      SmallVector<unsigned> next;
+      for (unsigned axis = 0; axis < kept.size(); ++axis) {
+        unsigned original = kept[axis];
+        if (!sameBound(view.getMixedStrides()[axis], b.getIndexAttr(1)))
+          return view.emitError("private windows require unit coordinate steps"), failure();
+        OpFoldResult offset = view.getMixedOffsets()[axis];
+        zeroOrigins[original] = zeroOrigins[original] && sameBound(offset, b.getIndexAttr(0));
+        Value value = isa<Attribute>(offset) ? index(memory.getLoc(), cast<IntegerAttr>(cast<Attribute>(offset)).getInt())
+                                            : values.lookup(cast<Value>(offset));
+        origins[original] = b.create<wk::BinaryOp>(memory.getLoc(), b.getIndexType(), origins[original], value, "add");
+        sizes[original] = view.getMixedSizes()[axis];
+        if (!view.getDroppedDims().test(axis)) next.push_back(original);
+      }
+      kept = std::move(next);
     }
-    return found->second.value;
+    LocalProjection result;
+    SmallVector<int64_t> dimensions, ids;
+    auto rootAxes = memoryAxes(root);
+    auto sourceAxes = axes(state.value.getType());
+    auto sourceShape = shape(state.value.getType());
+    for (auto [position, axis] : llvm::enumerate(sourceAxes)) {
+      auto found = llvm::find(rootAxes, axis);
+      if (found == rootAxes.end()) return emitError(memory.getLoc(), "private state axis lost its destination relation"), failure();
+      unsigned original = found - rootAxes.begin();
+      if (!llvm::is_contained(kept, original)) {
+        result.selectors.push_back(b.getStringAttr("index")); result.indices.push_back(origins[original]);
+        continue;
+      }
+      if (sameBound(sizes[original], state.sizes[original]) && zeroOrigins[original]) {
+        result.selectors.push_back(b.getStringAttr("all"));
+        dimensions.push_back(sourceShape[position]); ids.push_back(axis);
+        continue;
+      }
+      std::optional<int64_t> size;
+      if (auto attribute = dyn_cast<Attribute>(sizes[original])) size = cast<IntegerAttr>(attribute).getInt();
+      else { llvm::APInt constant; if (matchPattern(cast<Value>(sizes[original]), m_ConstantInt(&constant))) size = constant.getSExtValue(); }
+      if (!size || *size <= 0)
+        return emitError(memory.getLoc(), "private window extent must be statically bounded by the selected implementation"), failure();
+      Type unsignedIndex = IntegerType::get(b.getContext(), 64, IntegerType::Unsigned);
+      auto laneType = cast<wk::ValueType>(valueType(unsignedIndex, {*size}, {axis}));
+      Value lane = b.create<wk::IotaOp>(memory.getLoc(), laneType, 0, *size);
+      Value base = b.create<wk::CastOp>(memory.getLoc(), unsignedIndex, origins[original]);
+      Value coordinate = b.create<wk::BinaryOp>(memory.getLoc(), laneType, lane, base, "add");
+      result.selectors.push_back(b.getStringAttr("gather")); result.indices.push_back(coordinate);
+      dimensions.push_back(*size); ids.push_back(axis);
+    }
+    result.type = valueType(element(state.value.getType()), dimensions, ids);
+    return result;
+  }
+
+  FailureOr<Value> alignValue(Value value, Type target, Location loc) {
+    if (element(value.getType()).isIndex() && element(target).isSignedInteger(64))
+      value = b.create<wk::CastOp>(loc, valueType(element(target), shape(value.getType()), axes(value.getType())), value);
+    if (value.getType() == target) return value;
+    auto result = dyn_cast<wk::ValueType>(target);
+    if (result && value.getType() == result.getElementType())
+      return Value(b.create<wk::NewOp>(loc, target, value, true));
+    auto input = dyn_cast<wk::ValueType>(value.getType());
+    if (input && result && input.getElementType() == result.getElementType() &&
+        llvm::all_of(input.getShape().asArrayRef(), [](int64_t extent) { return extent > 0; }) &&
+        llvm::all_of(result.getShape().asArrayRef(), [](int64_t extent) { return extent > 0; })) {
+      auto preserves = [](wk::ValueType from, wk::ValueType to) {
+        for (auto [axis, extent] : llvm::zip(from.getAxisIds().asArrayRef(), from.getShape().asArrayRef())) {
+          auto position = llvm::find(to.getAxisIds().asArrayRef(), axis);
+          if (extent != 1 && (position == to.getAxisIds().asArrayRef().end() ||
+              to.getShape()[position - to.getAxisIds().asArrayRef().begin()] != extent)) return false;
+        }
+        return true;
+      };
+      if (preserves(input, result) && preserves(result, input)) {
+        SmallVector<int64_t> order;
+        for (int64_t axis : result.getAxisIds().asArrayRef())
+          if (llvm::is_contained(input.getAxisIds().asArrayRef(), axis)) order.push_back(axis);
+        for (int64_t axis : input.getAxisIds().asArrayRef())
+          if (!llvm::is_contained(order, axis)) order.push_back(axis);
+        SmallVector<int64_t> inputDomain, resultDomain;
+        for (auto [axis, extent] : llvm::zip(input.getAxisIds().asArrayRef(), input.getShape().asArrayRef()))
+          if (extent != 1) inputDomain.push_back(axis);
+        for (auto [axis, extent] : llvm::zip(result.getAxisIds().asArrayRef(), result.getShape().asArrayRef()))
+          if (extent != 1) resultDomain.push_back(axis);
+        if (inputDomain == resultDomain) order = llvm::to_vector(input.getAxisIds().asArrayRef());
+        return Value(b.create<wk::ReshapeOp>(loc, result, value, array(order)));
+      }
+    }
+    emitError(loc) << "Weft value does not preserve destination axes/extents: " << value.getType() << " -> " << target;
+    return failure();
   }
 
   LogicalResult write(Value memory, Value value, SmallVector<OpFoldResult> sizes = {}) {
     if (!isLocal(memory)) {
       auto region = view(memory);
       if (failed(region)) return failure();
-      b.create<wk::CommitOp>(memory.getLoc(), value, *region);
+      auto aligned = alignValue(value, valueType(element(value.getType()), shape((*region).getType()), axes((*region).getType())), memory.getLoc());
+      if (failed(aligned)) return failure();
+      b.create<wk::CommitOp>(memory.getLoc(), *aligned, *region);
       return success();
     }
     Value root = localRoot(memory);
     if (memory != root) {
+      if (auto cast = memory.getDefiningOp<memref::CastOp>()) return write(cast.getSource(), value, sizes);
       auto projection = memory.getDefiningOp<memref::SubViewOp>();
+      auto found = locals.find(root);
+      if (found != locals.end()) {
+        auto projected = localProjection(memory, found->second);
+        if (failed(projected)) return failure();
+        auto aligned = alignValue(value, projected->type, memory.getLoc());
+        if (failed(aligned)) return failure();
+        found->second.value = b.create<wk::UpdateOp>(memory.getLoc(), found->second.value.getType(),
+            found->second.value, *aligned, projected->indices, b.getArrayAttr(projected->selectors));
+        return success();
+      }
       if (!projection || projection.getSource() != root || projection.getDroppedDims().any() ||
           llvm::any_of(projection.getMixedOffsets(), [&](OpFoldResult offset) { return !sameBound(offset, b.getIndexAttr(0)); }))
         return emitError(memory.getLoc(), "Weft private supply must define one zero-based complete active region");
@@ -394,7 +621,11 @@ private:
         else sizes.push_back(b.getIndexAttr(extent));
       }
     }
-    locals[root] = {value, sizes};
+    auto type = resultType(memory);
+    if (failed(type)) return failure();
+    auto aligned = alignValue(value, *type, memory.getLoc());
+    if (failed(aligned)) return failure();
+    locals[root] = {*aligned, sizes};
     return success();
   }
 
@@ -422,15 +653,56 @@ private:
 
   FailureOr<Value> expression(Operation *operation, IRMapping &mapping) {
     Location loc = operation->getLoc();
-    if (auto constant = dyn_cast<arith::ConstantOp>(operation))
-      return b.clone(*constant, mapping)->getResult(0);
+    if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
+      Type type = scalarType(constant.getType());
+      if (type == constant.getType()) return b.clone(*constant, mapping)->getResult(0);
+      Attribute value = constant.getValue();
+      if (auto integer = dyn_cast<IntegerAttr>(value)) value = b.getIntegerAttr(type, integer.getValue());
+      return Value(b.create<wk::ConstantOp>(loc, type, value));
+    }
     SmallVector<Value> operands;
     for (Value operand : operation->getOperands()) operands.push_back(mapping.lookup(operand));
     StringRef kind;
     if (auto compare = dyn_cast<arith::CmpIOp>(operation)) {
-      if (compare.getPredicate() != arith::CmpIPredicate::eq)
-        return compare.emitError("this CPU integer comparison has no implemented Weft mapping"), failure();
-      return Value(b.create<wk::CompareOp>(loc, b.getI1Type(), operands[0], operands[1], "eq"));
+      switch (compare.getPredicate()) {
+      case arith::CmpIPredicate::eq: kind = "eq"; break;
+      case arith::CmpIPredicate::ne: kind = "ne"; break;
+      case arith::CmpIPredicate::slt: kind = "lt"; break;
+      case arith::CmpIPredicate::sle: kind = "le"; break;
+      case arith::CmpIPredicate::sgt: kind = "gt"; break;
+      case arith::CmpIPredicate::sge: kind = "ge"; break;
+      default: return compare.emitError("unsigned comparison requires unsigned Weft operands"), failure();
+      }
+    } else if (auto compare = dyn_cast<arith::CmpFOp>(operation)) {
+      switch (compare.getPredicate()) {
+      case arith::CmpFPredicate::OEQ: kind = "eq"; break;
+      case arith::CmpFPredicate::UNE: kind = "ne"; break;
+      case arith::CmpFPredicate::OLT: kind = "lt"; break;
+      case arith::CmpFPredicate::OLE: kind = "le"; break;
+      case arith::CmpFPredicate::OGT: kind = "gt"; break;
+      case arith::CmpFPredicate::OGE: kind = "ge"; break;
+      default: return compare.emitError("floating comparison has no exact Weft predicate mapping"), failure();
+      }
+    }
+    if (!kind.empty()) {
+      auto domain = pointwiseType(operands[0], operands[1]);
+      if (failed(domain)) return operation->emitError("comparison domains disagree"), failure();
+      return Value(b.create<wk::CompareOp>(loc,
+          valueType(b.getI1Type(), shape(*domain), axes(*domain)), operands[0], operands[1], kind));
+    }
+    if (isa<arith::SelectOp>(operation)) {
+      auto domain = pointwiseType(operands[1], operands[2]);
+      if (failed(domain)) return operation->emitError("select branch domains disagree"), failure();
+      auto dimensions = shape(*domain), ids = axes(*domain);
+      for (auto [axis, extent] : llvm::zip(axes(operands[0].getType()), shape(operands[0].getType()))) {
+        auto found = llvm::find(ids, axis);
+        if (found == ids.end()) { ids.push_back(axis); dimensions.push_back(extent); }
+        else if (dimensions[found - ids.begin()] == 1) dimensions[found - ids.begin()] = extent;
+        else if (extent != 1 && extent != dimensions[found - ids.begin()])
+          return operation->emitError("select predicate domain disagrees with branches"), failure();
+      }
+      return Value(b.create<wk::SelectOp>(loc, valueType(element(*domain), dimensions, ids),
+          operands[0], operands[1], operands[2]));
     }
     if (isa<arith::AddFOp, arith::AddIOp>(operation)) kind = "add";
     else if (isa<arith::SubFOp, arith::SubIOp>(operation)) kind = "sub";
@@ -438,6 +710,12 @@ private:
     else if (isa<arith::DivFOp, arith::DivSIOp>(operation)) kind = "div";
     else if (isa<arith::RemSIOp>(operation)) kind = "mod";
     else if (isa<arith::MaxNumFOp>(operation)) kind = "max";
+    else if (isa<arith::MinNumFOp>(operation)) kind = "min";
+    else if (isa<arith::MaximumFOp>(operation)) kind = "maximum";
+    else if (isa<arith::MinimumFOp>(operation)) kind = "minimum";
+    else if (isa<arith::AndIOp>(operation)) kind = "and";
+    else if (isa<arith::OrIOp>(operation)) kind = "or";
+    else if (isa<arith::XOrIOp>(operation)) kind = "xor";
     if (!kind.empty()) return binary(loc, operands[0], operands[1], kind);
     if (isa<arith::MinSIOp, arith::MaxSIOp>(operation))
       return binary(loc, operands[0], operands[1], isa<arith::MinSIOp>(operation) ? "min" : "max");
@@ -448,8 +726,9 @@ private:
       if (failed(sum)) return failure();
       return binary(loc, *sum, operands[1], "div");
     }
-    if (isa<arith::IndexCastOp>(operation))
-      return Value(b.create<wk::CastOp>(loc, operation->getResult(0).getType(), operands[0]));
+    if (isa<arith::IndexCastOp, arith::SIToFPOp, arith::FPToSIOp, arith::ExtFOp, arith::TruncFOp>(operation))
+      return Value(b.create<wk::CastOp>(loc, valueType(operation->getResult(0).getType(),
+          shape(operands[0].getType()), axes(operands[0].getType())), operands[0]));
     if (isa<math::RsqrtOp>(operation)) kind = "rsqrt";
     else if (isa<math::ExpOp>(operation)) kind = "exp";
     else if (isa<arith::NegFOp>(operation)) kind = "neg";
@@ -458,53 +737,143 @@ private:
     return failure();
   }
 
-  FailureOr<Value> mappedInput(Value input, AffineMap map) {
+  FailureOr<Value> mappedInput(Value input, AffineMap map, ArrayRef<int64_t> loopAxes) {
     auto loaded = read(input);
     if (failed(loaded)) return failure();
     if (!isa<MemRefType>(input.getType())) return *loaded;
     auto dimensions = shape((*loaded).getType()), ids = axes((*loaded).getType());
-    SmallVector<int64_t> keptShape, keptAxes;
+    SmallVector<int64_t> keptShape, keptAxes, mappedAxes;
     SmallVector<Attribute> selectors;
     SmallVector<Value> indices;
-    for (auto [axis, expression] : llvm::enumerate(map.getResults())) {
+    auto memoryIds = memoryAxes(input);
+    for (auto [axis, id] : llvm::enumerate(ids)) {
+      auto position = llvm::find(memoryIds, id);
+      if (position == memoryIds.end()) return emitError(input.getLoc(), "Weft input lost its CPU coordinate relation"), failure();
+      AffineExpr expression = map.getResult(position - memoryIds.begin());
       if (auto constant = dyn_cast<AffineConstantExpr>(expression)) {
-        if (constant.getValue() != 0 || dimensions[axis] != 1) return failure();
+        if (constant.getValue() != 0 || dimensions[axis] != 1)
+          return emitError(input.getLoc(), "constant pointwise projection requires a singleton input axis"), failure();
         selectors.push_back(b.getStringAttr("index")); indices.push_back(index(input.getLoc(), 0));
       } else {
+        auto dim = dyn_cast<AffineDimExpr>(expression);
+        if (!dim) return emitError(input.getLoc(), "Weft computation requires an explicit dimension or singleton indexing map"), failure();
         selectors.push_back(b.getStringAttr("all")); keptShape.push_back(dimensions[axis]); keptAxes.push_back(ids[axis]);
+        mappedAxes.push_back(loopAxes[dim.getPosition()]);
       }
     }
-    if (indices.empty()) return *loaded;
-    return Value(b.create<wk::ExtractOp>(input.getLoc(), valueType(b.getF32Type(), keptShape, keptAxes),
-        *loaded, indices, b.getArrayAttr(selectors)));
+    Value result = *loaded;
+    if (!indices.empty()) result = b.create<wk::ExtractOp>(input.getLoc(), valueType(element(result.getType()), keptShape, keptAxes),
+        result, indices, b.getArrayAttr(selectors));
+    if (mappedAxes != keptAxes) result = b.create<wk::ReshapeOp>(input.getLoc(),
+        valueType(element(result.getType()), keptShape, mappedAxes), result, array(keptAxes));
+    return result;
+  }
+
+  FailureOr<Value> reduceValue(Location loc, Value input, unsigned axis, StringRef kind) {
+    auto dimensions = shape(input.getType()), ids = axes(input.getType());
+    SmallVector<int64_t> outputShape(dimensions), outputAxes(ids);
+    outputShape.erase(outputShape.begin() + axis); outputAxes.erase(outputAxes.begin() + axis);
+    auto countTrue = [&](Value predicate) -> FailureOr<Value> {
+      if (dimensions[axis] <= 0 || dimensions[axis] > int64_t(UINT32_MAX))
+        return emitError(loc, "boolean reduction requires a statically bounded u32 contribution count"), failure();
+      Type count = IntegerType::get(b.getContext(), 32, IntegerType::Unsigned);
+      Value zero = b.create<wk::ConstantOp>(loc, count, b.getIntegerAttr(count, 0));
+      Value one = b.create<wk::ConstantOp>(loc, count, b.getIntegerAttr(count, 1));
+      Value bits = b.create<wk::SelectOp>(loc, valueType(count, dimensions, ids), predicate, one, zero);
+      Value total = b.create<wk::ReduceOp>(loc, valueType(count, outputShape, outputAxes), bits, "add", axis);
+      Value bound = kind == "and" ? Value(b.create<wk::ConstantOp>(loc, count, b.getIntegerAttr(count, dimensions[axis]))) : zero;
+      return Value(b.create<wk::CompareOp>(loc, valueType(b.getI1Type(), outputShape, outputAxes),
+                                         total, bound, kind == "and" ? "eq" : "ne"));
+    };
+    if (kind == "or" || kind == "and") return countTrue(input);
+    bool propagating = kind == "maximum" || kind == "minimum";
+    Value result = b.create<wk::ReduceOp>(loc, valueType(element(input.getType()), outputShape, outputAxes),
+        input, kind == "maximum" ? "max" : kind == "minimum" ? "min" : kind, axis);
+    if (propagating) {
+      Value isNaN = b.create<wk::CompareOp>(loc, valueType(b.getI1Type(), dimensions, ids), input, input, "ne");
+      auto anyNaN = countTrue(isNaN);
+      if (failed(anyNaN)) return failure();
+      auto floating = cast<FloatType>(element(input.getType()));
+      Value nan = b.create<wk::ConstantOp>(loc, floating,
+          FloatAttr::get(floating, llvm::APFloat::getQNaN(floating.getFloatSemantics())));
+      result = b.create<wk::SelectOp>(loc, result.getType(), *anyNaN, nan, result);
+    }
+    return result;
   }
 
   LogicalResult generic(linalg::GenericOp operation) {
     if (operation.getOutputs().size() != 1 || operation.getNumResults())
       return operation.emitError("Weft CPU legalization requires one buffer-semantics result");
     Value destination = operation.getOutputs()[0];
+    SmallVector<int64_t> loopAxes(operation.getNumLoops(), 0);
+    auto maps = operation.getIndexingMapsArray();
+    auto outputAxes = memoryAxes(destination);
+    for (auto [axis, expression] : llvm::enumerate(maps.back().getResults())) {
+      auto dim = dyn_cast<AffineDimExpr>(expression);
+      if (!dim) return operation.emitError("Weft output traversal requires dimension projections");
+      loopAxes[dim.getPosition()] = outputAxes[axis];
+    }
+    for (int64_t &axis : loopAxes) if (!axis) axis = nextAxis++;
     if (cpu::isMatrixContraction(operation)) {
-      auto lhs = read(operation.getInputs()[0]), rhs = read(operation.getInputs()[1]), initial = read(destination);
+      auto lhs = mappedInput(operation.getInputs()[0], maps[0], loopAxes);
+      auto rhs = mappedInput(operation.getInputs()[1], maps[1], loopAxes);
+      auto initial = read(destination);
       if (failed(lhs) || failed(rhs) || failed(initial)) return failure();
       auto definition = (*initial).getDefiningOp<wk::NewOp>();
       if (!definition || !matchPattern(definition->getOperand(0), m_PosZeroFloat()))
         return operation.emitError("Weft contraction requires an explicit zero-initialized partial; nonzero fused accumulation has no equivalent canonical operation");
-      int64_t reduction = axes((*lhs).getType())[1];
+      int64_t reduction = loopAxes[2];
       Value term = b.create<wk::OuterContractOp>(operation.getLoc(), (*initial).getType(),
           *lhs, *rhs, array({reduction}), TypeAttr::get(b.getF32Type()));
       return write(destination, term);
     }
-    if (llvm::any_of(operation.getIteratorTypesArray(), [](utils::IteratorType type) {
-          return type != utils::IteratorType::parallel;
-        }) || !operation.getIndexingMapsArray().back().isIdentity())
-      return operation.emitError("Weft pointwise legalization requires an identity output traversal");
-    IRMapping mapping;
+    auto iterators = operation.getIteratorTypesArray();
+    SmallVector<unsigned> reductions;
+    for (auto [axis, type] : llvm::enumerate(iterators))
+      if (type == utils::IteratorType::reduction) reductions.push_back(axis);
+    if (reductions.size() > 1)
+      return operation.emitError("Weft structured reduction requires one explicit reduction axis");
+    IRMapping mapping = values;
     Block &body = operation.getRegion().front();
     for (auto [number, input] : llvm::enumerate(operation.getInputs())) {
-      auto value = mappedInput(input, operation.getIndexingMapsArray()[number]);
+      auto value = mappedInput(input, maps[number], loopAxes);
       if (failed(value)) return failure();
       mapping.map(body.getArgument(number), *value);
     }
+    if (!reductions.empty()) {
+      Value accumulator = body.getArguments().back();
+      auto combine = body.getTerminator()->getOperand(0).getDefiningOp();
+      if (!combine || !accumulator.hasOneUse() || combine->getNumOperands() != 2 ||
+          !llvm::is_contained(combine->getOperands(), accumulator))
+        return operation.emitError("Weft structured reduction requires a closed accumulator combine");
+      StringRef kind;
+      if (isa<arith::AddFOp, arith::AddIOp>(combine)) kind = "add";
+      else if (isa<arith::MaximumFOp>(combine)) kind = "maximum";
+      else if (isa<arith::MinimumFOp>(combine)) kind = "minimum";
+      else if (isa<arith::MaxNumFOp>(combine)) kind = "max";
+      else if (isa<arith::MinNumFOp>(combine)) kind = "min";
+      else if (isa<arith::OrIOp>(combine) && accumulator.getType().isInteger(1)) kind = "or";
+      else if (isa<arith::AndIOp>(combine) && accumulator.getType().isInteger(1)) kind = "and";
+      else return operation.emitError("Weft reduction combine is not implemented");
+      for (Operation &nested : body.without_terminator()) {
+        if (&nested == combine) continue;
+        auto value = expression(&nested, mapping);
+        if (failed(value)) return failure();
+        mapping.map(nested.getResult(0), *value);
+      }
+      Value contribution = mapping.lookup(combine->getOperand(combine->getOperand(0) == accumulator ? 1 : 0));
+      auto ids = axes(contribution.getType());
+      auto position = llvm::find(ids, loopAxes[reductions[0]]);
+      if (position == ids.end()) return operation.emitError("Weft reduction lost its current logical axis relation");
+      auto reduced = reduceValue(operation.getLoc(), contribution, position - ids.begin(), kind);
+      auto initial = read(destination);
+      if (failed(reduced) || failed(initial)) return failure();
+      auto result = binary(operation.getLoc(), *initial, *reduced, kind);
+      if (failed(result)) return failure();
+      return write(destination, *result);
+    }
+    if (!operation.getIndexingMapsArray().back().isIdentity())
+      return operation.emitError("Weft pointwise legalization requires an identity output traversal");
     if (!body.getArguments().back().use_empty()) return operation.emitError("Weft pointwise output is not a pure definition");
     for (Operation &nested : body.without_terminator()) {
       auto value = expression(&nested, mapping);
@@ -529,8 +898,10 @@ private:
         (maximum && !(identity.getValue().isInfinity() && identity.getValue().isNegative())))
       return operation.emitError("Weft reduction requires a closed additive/maximumNumber identity and accumulator combine");
     IRMapping mapping;
+    SmallVector<int64_t> loopAxes(cast<AffineMapAttr>(operation.getIndexingMaps()[0]).getValue().getNumDims());
+    for (int64_t &axis : loopAxes) axis = nextAxis++;
     for (auto [number, input] : llvm::enumerate(operation.getInputs())) {
-      auto value = mappedInput(input, cast<AffineMapAttr>(operation.getIndexingMaps()[number]).getValue());
+      auto value = mappedInput(input, cast<AffineMapAttr>(operation.getIndexingMaps()[number]).getValue(), loopAxes);
       if (failed(value)) return failure();
       mapping.map(body.getArgument(number + 1), *value);
     }
@@ -561,14 +932,63 @@ private:
     return success();
   }
 
+  SmallVector<Value> writtenEnclosingLocals(Operation *scope) {
+    SmallVector<Value> result;
+    for (auto access : analysis.accesses(scope)) {
+      Value root = localRoot(access.memory);
+      if (access.write && isLocal(root) &&
+          !scope->isProperAncestor(root.getDefiningOp()) &&
+          !llvm::is_contained(result, root))
+        result.push_back(root);
+    }
+    return result;
+  }
+
+  LogicalResult checkCarry(Value root, const LocalValue &before, Operation *scope) {
+    auto found = locals.find(root);
+    if (found == locals.end() || found->second.value.getType() != before.value.getType() ||
+        found->second.sizes.size() != before.sizes.size() ||
+        !llvm::all_of(llvm::zip(found->second.sizes, before.sizes), [&](auto bounds) {
+          return sameBound(std::get<0>(bounds), std::get<1>(bounds));
+        }))
+      return scope->emitError("Weft control carry must preserve its complete initialized region and type");
+    return success();
+  }
+
   LogicalResult lower(Operation *operation) {
     operandReads.clear();
     Location loc = operation->getLoc();
-    if (isa<memref::AllocOp, memref::AllocaOp, memref::SubViewOp, memref::CastOp>(operation)) return success();
+    if (isa<memref::AllocOp, memref::AllocaOp>(operation)) return success();
+    if (isa<memref::SubViewOp, memref::CastOp>(operation)) {
+      Value result = operation->getResult(0);
+      if (!isLocal(result) && failed(view(result))) return failure();
+      return success();
+    }
     if (auto dealloc = dyn_cast<memref::DeallocOp>(operation)) { locals.erase(localRoot(dealloc.getMemref())); return success(); }
     if (auto dimension = dyn_cast<memref::DimOp>(operation)) {
       auto axis = dimension.getConstantIndex();
-      if (!axis || isLocal(dimension.getSource())) return dimension.emitError("Weft dimension requires an explicit external View axis");
+      if (!axis) return dimension.emitError("Weft dimension requires a static axis position");
+      if (isLocal(dimension.getSource())) {
+        Value memory = dimension.getSource();
+        while (auto cast = memory.getDefiningOp<memref::CastOp>()) memory = cast.getSource();
+        OpFoldResult extent;
+        if (auto subview = memory.getDefiningOp<memref::SubViewOp>()) {
+          unsigned projected = 0;
+          for (unsigned original = 0; original < subview.getSourceType().getRank(); ++original)
+            if (!subview.getDroppedDims().test(original) && projected++ == *axis)
+              extent = subview.getMixedSizes()[original];
+        } else {
+          auto type = cast<MemRefType>(memory.getType());
+          extent = type.isDynamicDim(*axis)
+              ? OpFoldResult(memory.getDefiningOp()->getOperand(type.getDynamicDimIndex(*axis)))
+              : OpFoldResult(b.getIndexAttr(type.getDimSize(*axis)));
+        }
+        if (!extent) return dimension.emitError("local dimension has no explicit allocation or subview extent");
+        values.map(dimension.getResult(), isa<Attribute>(extent)
+            ? index(loc, cast<IntegerAttr>(cast<Attribute>(extent)).getInt())
+            : values.lookup(cast<Value>(extent)));
+        return success();
+      }
       auto region = view(dimension.getSource());
       if (failed(region)) return failure();
       values.map(dimension.getResult(), b.create<wk::ExtentOp>(loc, b.getIndexType(), *region, *axis));
@@ -577,12 +997,20 @@ private:
     if (auto copy = dyn_cast<memref::CopyOp>(operation)) {
       auto value = read(copy.getSource());
       if (failed(value)) return failure();
+      auto target = resultType(copy.getTarget());
+      if (failed(target)) return failure();
+      if (shape((*value).getType()) != shape(*target) || element((*value).getType()) != element(*target))
+        return copy.emitError("positional copy requires the same ordered extents and element type");
+      if (axes((*value).getType()) != axes(*target))
+        *value = b.create<wk::ReshapeOp>(loc, *target, *value, array(axes((*value).getType())));
       if (isLocal(copy.getTarget())) {
         Value root = localRoot(copy.getTarget());
-        auto scope = copy->getParentOfType<scf::ForOp>();
-        for (Operation *user : root.getUsers())
-          if (!isa<memref::DeallocOp>(user) && scope && !scope->isProperAncestor(user))
-            return copy.emitError("Weft private packing supply escapes its overwrite scope");
+        auto current = locals.find(root);
+        if (root == copy.getTarget() && current != locals.end() && isa<wk::ValueType>(*target)) {
+          current->second.value = b.create<wk::UpdateOp>(loc, *target, current->second.value,
+              *value, ValueRange{}, b.getArrayAttr(SmallVector<Attribute>(shape(*target).size(), b.getStringAttr("all"))));
+          return success();
+        }
         *value = b.create<wk::MaterializeOp>(loc, (*value).getType(), *value);
       }
       return write(copy.getTarget(), *value);
@@ -591,9 +1019,11 @@ private:
       Value destination = fill.getOutputs()[0];
       Value initial = values.lookup(fill.getInputs()[0]);
       if (isLocal(destination)) {
-        if (!cast<MemRefType>(destination.getType()).hasStaticShape())
-          return fill.emitError("Weft private fill requires explicit runtime shape storage, which is not implemented");
-        Value result = b.create<wk::NewOp>(loc, resultType(destination), initial, true);
+        auto type = resultType(destination);
+        if (failed(type)) return failure();
+        if (initial.getType().isIndex() && element(*type).isSignedInteger(64))
+          initial = b.create<wk::CastOp>(loc, element(*type), initial);
+        Value result = b.create<wk::NewOp>(loc, *type, initial, true);
         return write(destination, result);
       }
       auto region = view(destination);
@@ -638,6 +1068,8 @@ private:
       return success();
     }
     if (auto store = dyn_cast<memref::StoreOp>(operation)) {
+      if (isLocal(store.getMemref()) && store.getIndices().empty())
+        return write(store.getMemref(), values.lookup(store.getValue()));
       auto region = view(store.getMemref());
       if (failed(region)) return failure();
       SmallVector<Value> indices;
@@ -651,46 +1083,83 @@ private:
     if (auto genericOp = dyn_cast<linalg::GenericOp>(operation)) return generic(genericOp);
     if (auto reduce = dyn_cast<cpu::ReduceOp>(operation)) return reduction(reduce);
     if (auto conditional = dyn_cast<scf::IfOp>(operation)) {
-      if (conditional.getNumResults()) return conditional.emitError("Weft conditional SSA results are not implemented");
-      for (auto access : analysis.accesses(conditional))
-        if (access.write && isLocal(access.memory) &&
-            !conditional->isProperAncestor(localRoot(access.memory).getDefiningOp()))
-          return conditional.emitError("Weft conditional mutation of an enclosing private value is not implemented");
-      auto target = b.create<scf::IfOp>(loc, values.lookup(conditional.getCondition()),
-          !conditional.getElseRegion().empty());
+      auto roots = writtenEnclosingLocals(conditional);
       auto savedLocals = locals;
-      OpBuilder::InsertionGuard guard(b);
-      b.setInsertionPointToStart(target.thenBlock());
-      if (failed(block(*conditional.thenBlock()))) return failure();
-      locals = savedLocals;
-      if (!conditional.getElseRegion().empty()) {
-        b.setInsertionPointToStart(target.elseBlock());
-        if (failed(block(*conditional.elseBlock()))) return failure();
-        locals = savedLocals;
+      SmallVector<Type> types;
+      for (Type type : conditional.getResultTypes()) types.push_back(scalarType(type));
+      for (Value root : roots) {
+        auto found = savedLocals.find(root);
+        if (found == savedLocals.end()) {
+          auto type = resultType(root);
+          if (failed(type)) return failure();
+          types.push_back(*type);
+        } else types.push_back(found->second.value.getType());
       }
+      auto target = b.create<scf::IfOp>(loc, types, values.lookup(conditional.getCondition()),
+          !types.empty() || !conditional.getElseRegion().empty());
+      for (bool then : {true, false}) {
+        Block *destination = then ? target.thenBlock() : target.getElseRegion().empty() ? nullptr : target.elseBlock();
+        if (!destination) continue;
+        locals = savedLocals;
+        OpBuilder::InsertionGuard guard(b);
+        b.setInsertionPointToStart(destination);
+        Block *source = then ? conditional.thenBlock() : conditional.getElseRegion().empty() ? nullptr : conditional.elseBlock();
+        if (source && failed(block(*source))) return failure();
+        SmallVector<Value> results;
+        if (source)
+          for (Value value : source->getTerminator()->getOperands()) results.push_back(values.lookup(value));
+        for (Value root : roots) {
+          if (!locals.count(root)) return conditional.emitError("conditional local result is not initialized on every branch");
+          if (savedLocals.count(root) && failed(checkCarry(root, savedLocals.lookup(root), conditional))) return failure();
+          results.push_back(locals.lookup(root).value);
+        }
+        if (!types.empty()) b.create<scf::YieldOp>(loc, results);
+      }
+      locals = savedLocals;
+      for (auto [source, destination] : llvm::zip(conditional.getResults(), target.getResults().take_front(conditional.getNumResults()))) values.map(source, destination);
+      for (auto [root, value] : llvm::zip(roots, target.getResults().drop_front(conditional.getNumResults())))
+        if (locals.count(root)) locals[root].value = value;
+        else if (failed(write(root, value))) return failure();
       return success();
     }
     if (auto loop = dyn_cast<scf::ForOp>(operation)) {
       SmallVector<Value> initial;
       for (Value value : loop.getInitArgs()) initial.push_back(values.lookup(value));
+      auto savedLocals = locals;
+      SmallVector<Value> roots;
+      for (Value root : writtenEnclosingLocals(loop))
+        if (locals.count(root)) { roots.push_back(root); initial.push_back(locals.lookup(root).value); }
       auto target = b.create<scf::ForOp>(loc, values.lookup(loop.getLowerBound()),
           values.lookup(loop.getUpperBound()), values.lookup(loop.getStep()), initial);
-      auto savedLocals = locals;
       {
         OpBuilder::InsertionGuard guard(b);
         b.setInsertionPointToStart(target.getBody());
         values.map(loop.getInductionVar(), target.getInductionVar());
-        for (auto [source, destination] : llvm::zip(loop.getRegionIterArgs(), target.getRegionIterArgs())) values.map(source, destination);
+        for (auto [source, destination] : llvm::zip(loop.getRegionIterArgs(), target.getRegionIterArgs().take_front(loop.getNumRegionIterArgs()))) values.map(source, destination);
+        for (auto [root, value] : llvm::zip(roots, target.getRegionIterArgs().drop_front(loop.getNumRegionIterArgs())))
+          locals[root].value = value;
         if (failed(block(*loop.getBody()))) return failure();
         SmallVector<Value> results;
         for (Value value : loop.getBody()->getTerminator()->getOperands()) results.push_back(values.lookup(value));
+        for (Value root : roots) {
+          if (failed(checkCarry(root, savedLocals.lookup(root), loop))) return failure();
+          results.push_back(locals.lookup(root).value);
+        }
         if (!initial.empty()) b.create<scf::YieldOp>(loc, results);
       }
       locals = std::move(savedLocals);
-      for (auto [source, destination] : llvm::zip(loop.getResults(), target.getResults())) values.map(source, destination);
+      for (auto [source, destination] : llvm::zip(loop.getResults(), target.getResults().take_front(loop.getNumResults()))) values.map(source, destination);
+      for (auto [root, value] : llvm::zip(roots, target.getResults().drop_front(loop.getNumResults())))
+        locals[root].value = value;
       return success();
     }
     if (auto load = dyn_cast<memref::LoadOp>(operation)) {
+      if (isLocal(load.getMemref()) && load.getIndices().empty()) {
+        auto value = read(load.getMemref());
+        if (failed(value)) return failure();
+        values.map(load.getResult(), *value);
+        return success();
+      }
       auto region = view(load.getMemref());
       if (failed(region)) return failure();
       SmallVector<Value> indices;
@@ -717,6 +1186,7 @@ private:
   llvm::DenseMap<Value, Value> operandReads;
   const llvm::DenseMap<Value, intent::QuantFormat> &formats;
   const cpu::ImplementationRegistry &implementations;
+  llvm::DenseMap<int64_t, int64_t> extentIds;
   llvm::DenseMap<int64_t, int64_t> axisProjection;
   int64_t nextAxis;
 };

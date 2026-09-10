@@ -78,10 +78,11 @@
 - 参考依据：TileLang `tilelang/tileop/gemm/__init__.py:121–139` 分开 infer_layout/lower，`src/transform/lower_tile_op.cc:1134–1151` 实际连接 layout、buffer、workspace 与 alignment；Triton `python/tutorials/06-fused-attention.py:55–110` 由作者显式组织 causal stages。本轮复用的是约束与程序连接方法，不宣称下层能自动推导 Intent 的区域语义。
 - 用户已明确确认完整 change 与 Build 范围，授权按本 Shape 和 A1–A4 持续实现；普通实现选择由执行者依据 doc/ 与 ref 决定，不再就已确认范围重复询问。
 - 用户在收到 Weft 外部修改请求后明确同意继续：允许在 TianchenRV 补齐逐元素 select、区分浮点 maximum 语义及相应 lowering，以同一正式 CPU 区域 benchmark 验证，完成后独立提交；不以浮点乘加替代 select，不引入 Intent 专用路径。
+- 用户进一步确认动态私有状态的有界窗口读写及对应 physical IR/pass 扩展。该实现属于通用 Weft 编译能力，复用现有 descriptor、layout、访存选择与资源/lifetime 机制；保留完整状态与未写窗口的值，不以整算子模板或全量标量化替代。必要的 extent 绑定和 local-state selection 修正一并完成，外部修改仍独立提交并保留并发修改。
 
 # 待解决问题
 
-- [blocking] 是否将 TianchenRV 的授权范围从 select/传播 NaN 的 extrema 扩至动态私有状态的有界窗口读写及对应 physical IR/pass？已核对其 canonical Extract/Update 合法性不等于 native 支持：`lib/Target/Emission/Encoding.cpp:299` 的 shaped local read 仅接纳一个 gather 且其它轴为 all，`:721` 的 update 仅接纳全标量索引与标量值；`lib/Target/RISCVCompiler.cpp:59` 在 memory planning 前再次选择 operation，而当前 selector 不接纳 local-carrier Update。CPU 完整 state 与 1xBK 窗口需要正式衔接，不能用 emitter 算法或全量标量化绕过。扩大范围仍要求通用 Weft 能力、独立提交及保留并发修改，未确认前不实施该扩展。
+无未解决的需求或授权问题。
 
 # 验证预期
 

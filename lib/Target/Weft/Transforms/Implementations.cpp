@@ -81,11 +81,15 @@ cpu::ImplementationRegistry implementations() {
   result.add({"weft.contract_f32", [](Operation *op) {
       auto generic = dyn_cast<linalg::GenericOp>(op);
       return generic && isMatrixContraction(generic);
-    }, legal, noParameters, formTile, {}});
+    }, legal, noParameters, formTile, {}, {true, true, true}});
   result.add({"weft.structured_f32", [](Operation *op) {
       if (auto generic = dyn_cast<linalg::GenericOp>(op)) return !isMatrixContraction(generic);
       return isa<cpu::ReduceOp>(op);
-    }, legal, noParameters, {}, {}});
+    }, legal, [](Builder &b, const Configuration &config) {
+      return b.getDictionaryAttr({b.getNamedAttr("panel", b.getI64IntegerAttr(std::min<int64_t>(4, config.tileN)))});
+    }, {}, {}, {}, [](ImplementationAttr binding) {
+      return implementationParameter(binding, "panel");
+    }});
   return result;
 }
 

@@ -52,36 +52,10 @@ AxisRelations::AxisRelations(func::FuncOp function) {
     } else if (auto tasks = dyn_cast<TasksOp>(operation)) {
       for (auto [argument, capture] : llvm::zip(tasks.getBody().front().getArguments().drop_front(), tasks.getCaptures()))
         equate(argument, capture);
-    } else if (auto copy = dyn_cast<memref::CopyOp>(operation)) {
-      equate(copy.getSource(), copy.getTarget());
     } else if (auto quantize = dyn_cast<QuantizeOp>(operation)) {
       unite(positions.at(quantize.getInput())[0], positions.at(quantize.getOutput())[0]);
     } else if (auto dot = dyn_cast<QuantizedDotOp>(operation)) {
       unite(positions.at(dot.getLhs())[0], positions.at(dot.getRhs())[0]);
-    } else if (auto generic = dyn_cast<linalg::GenericOp>(operation)) {
-      llvm::DenseMap<unsigned, unsigned> dimensions;
-      for (auto [input, map] : llvm::zip(generic->getOperands(), generic.getIndexingMapsArray())) {
-        if (!isa<MemRefType>(input.getType())) continue;
-        for (auto [position, expression] : llvm::enumerate(map.getResults())) {
-          auto dim = dyn_cast<AffineDimExpr>(expression);
-          if (!dim) continue;
-          unsigned axis = positions.at(input)[position];
-          auto [it, inserted] = dimensions.try_emplace(dim.getPosition(), axis);
-          if (!inserted) unite(it->second, axis);
-        }
-      }
-    } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
-      std::optional<unsigned> reduction;
-      for (auto [input, attribute] : llvm::zip(reduce.getInputs(), reduce.getIndexingMaps())) {
-        if (!isa<MemRefType>(input.getType())) continue;
-        auto map = mlir::cast<AffineMapAttr>(attribute).getValue();
-        for (auto [position, expression] : llvm::enumerate(map.getResults())) {
-          if (!isa<AffineDimExpr>(expression)) continue;
-          unsigned axis = positions.at(input)[position];
-          if (reduction) unite(*reduction, axis);
-          else reduction = axis;
-        }
-      }
     }
   });
   auto identify = [&](unsigned position) {

@@ -1,8 +1,8 @@
 {
   "cpu": {
     "weft.region_contract_f32": [
-      {"shared": [1, 32, 32, 64, 64], "local": {}},
-      {"shared": [1, 32, 32, 128, 128], "local": {}}
+      {"shared": [1, 16, 16, 16, 16], "local": {}},
+      {"shared": [1, 16, 16, 32, 32], "local": {}}
     ],
     "weft.region_structured": [
       {"shared": [1, 1, 1, 1, 64], "local": {}},

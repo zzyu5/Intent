@@ -12,6 +12,12 @@ struct ContractionTile {
   bool first;
 };
 
+struct ContractionRequirements {
+  bool completePrivateInitialization = false;
+  bool staticReductionExtent = false;
+  bool staticParallelExtent = false;
+};
+
 struct Implementation {
   llvm::StringRef name;
   std::function<bool(mlir::Operation *)> applicable;
@@ -21,6 +27,8 @@ struct Implementation {
       const ContractionTile &, ConfigurationAttr, ImplementationAttr)> formTile;
   std::function<mlir::FailureOr<llvm::SmallVector<mlir::Value>>(
       mlir::OpBuilder &, mlir::Operation *, mlir::ValueRange, int64_t &)> expand;
+  ContractionRequirements contraction;
+  std::function<int64_t(ImplementationAttr)> parallelWindow;
 };
 
 class ImplementationRegistry {
