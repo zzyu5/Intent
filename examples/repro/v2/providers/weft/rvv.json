@@ -8,6 +8,8 @@
   "cflags": [
     "--gcc-toolchain=/opt/tcrv-toolchains/gcc-15.2.0",
     "-B/opt/tcrv-toolchains/binutils-2.46.1/bin",
-    "-fno-integrated-as"
+    "-fno-integrated-as",
+    "-L/opt/tcrv-toolchains/gcc-15.2.0/lib",
+    "-Wl,-rpath,/opt/tcrv-toolchains/gcc-15.2.0/lib"
   ]
 }

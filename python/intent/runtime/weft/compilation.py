@@ -32,6 +32,11 @@ def lower_artifact(source: str, *, compiler: str, profile: TargetProfile) -> dic
         [compiler, "--emit=artifact", f"--march={profile.march}", f"--abi={profile.abi}",
          f"--vlen-bits={profile.vlen_bits}"], source,
     ))
+    _validate_target(artifact, profile)
+    return artifact
+
+
+def _validate_target(artifact: dict, profile: TargetProfile) -> None:
     if artifact["kind"] != "weft-riscv-artifact":
         raise ValueError("Weft compiler did not produce a native artifact")
     for kernel in artifact["kernels"]:
@@ -39,18 +44,32 @@ def lower_artifact(source: str, *, compiler: str, profile: TargetProfile) -> dic
             profile.march, profile.abi, profile.vlen_bits,
         ) or kernel["matrix_extensions"]:
             raise NotImplementedError("Weft artifact does not match the selected standard RVV profile")
-    return artifact
+
+
+def validate_artifact(manifest: dict) -> None:
+    artifact = manifest["weft"]
+    _validate_target(artifact, TargetProfile(**manifest["profile"]))
+    kernels = {kernel["symbol"]: kernel for kernel in artifact["kernels"]}
+    expected = {task["abi"]["symbol"]: task["abi"] for task in manifest["program"]["tasks"]}
+    if (len(kernels) != len(artifact["kernels"]) or
+            len(expected) != len(manifest["program"]["tasks"]) or kernels.keys() != expected.keys()):
+        raise ValueError("Weft artifact kernel symbols disagree with the CPU task calls")
+    for symbol, abi in expected.items():
+        for field in ("arguments", "shape_parameters"):
+            if kernels[symbol][field] != abi[field]:
+                raise ValueError(f"Weft artifact {symbol} {field} disagree with the CPU task ABI")
 
 
 def export_artifact(program, directory: Path, *, compiler: str, profile: TargetProfile) -> None:
     """AOT lowering; system compilation and native loading remain separate."""
     artifact = lower_artifact(program.source, compiler=compiler, profile=profile)
+    manifest = {"profile": asdict(profile), "program": program.metadata, "weft": artifact}
+    validate_artifact(manifest)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "canonical.mlir").write_text(program.source, encoding="utf-8")
     (directory / "cpu.mlir").write_text(program.ir, encoding="utf-8")
     (directory / "kernels.c").write_text(artifact["intrinsic_c"], encoding="utf-8")
     (directory / "host.c").write_text(program.metadata["host_source"], encoding="utf-8")
-    manifest = {"profile": asdict(profile), "program": program.metadata, "weft": artifact}
     (directory / "artifact.json").write_text(json.dumps(manifest), encoding="utf-8")
 
 
@@ -99,6 +118,7 @@ def native_exports(metadata: dict) -> str:
 
 def compile_artifact(directory: Path, *, cc: tuple[str, ...], cflags: tuple[str, ...] = ()) -> Path:
     manifest = json.loads((directory / "artifact.json").read_text())
+    validate_artifact(manifest)
     profile = TargetProfile(**manifest["profile"])
     metadata = manifest["program"]
     exports = directory / "exports.c"

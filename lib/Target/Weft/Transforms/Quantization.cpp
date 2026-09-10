@@ -42,6 +42,11 @@ struct Microprogram {
     return element;
   }
   Value convert(Value value, Type element) {
+    Type inputElement = value.getType();
+    if (auto shaped = dyn_cast<wk::ValueType>(inputElement)) inputElement = shaped.getElementType();
+    auto from = dyn_cast<IntegerType>(inputElement), to = dyn_cast<IntegerType>(element);
+    if (from && to && to.getWidth() > from.getWidth())
+      return b.create<wk::WidenOp>(loc, converted(value.getType(), element), value);
     return b.create<wk::CastOp>(loc, converted(value.getType(), element), value);
   }
   Value binary(Value lhs, Value rhs, StringRef kind) {

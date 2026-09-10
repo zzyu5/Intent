@@ -45,6 +45,7 @@ def _source_artifact(context, directory: Path, profile: TargetProfile, compiler:
         "  free(quantized);\n}\n"
     )
     source_metadata = {**metadata, "host_source": host,
+                       "tasks": [{"abi": {key: kernel[key] for key in ("symbol", "arguments", "shape_parameters")}}],
                        "candidates": [{"entry": "source_projection", "values": [], "implementations": []}]}
     directory.mkdir()
     (directory / "canonical.mlir").write_text(canonical)
@@ -77,7 +78,7 @@ def projection(context):
     host = deployment["host"]
     remote = subprocess.run(["ssh", host, "mktemp -d /tmp/intentdsl-weft-benchmark.XXXXXX"],
                             check=True, text=True, capture_output=True).stdout.strip()
-    subprocess.run(["scp", "-qr", str(root) + "/.", f"{host}:{remote}/"], check=True)
+    subprocess.run(["scp", "-qr", *(str(path) for path in sorted(root.iterdir())), f"{host}:{remote}/"], check=True)
     command = shlex.join(["env", f"PYTHONPATH={remote}/python", "python3", f"{remote}/runtime.py", remote])
     process = subprocess.Popen(["ssh", host, command], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     ready = process.stdout.readline()

@@ -26,13 +26,13 @@ def inputs(n: int, k: int) -> tuple[Buffer, Buffer]:
 
 def serve(directory: Path) -> None:
     configuration = json.loads((directory / "deployment.json").read_text())
-    os.sched_setaffinity(0, configuration["cpus"])
     with ThreadPoolExecutor(max_workers=2) as executor:
         builds = [executor.submit(compile_artifact, directory / side,
                   cc=tuple(configuration["cc"]), cflags=tuple(configuration["cflags"]))
                   for side in ("generated", "source")]
         for build in builds:
             build.result()
+    os.sched_setaffinity(0, configuration["cpus"])
     generated = NativeProgram(directory / "generated")
     source = NativeProgram(directory / "source")
     try:

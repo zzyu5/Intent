@@ -30,7 +30,7 @@ Mojo：现有 f32 register contraction/vector 程序作为明确的实现迁入�
 
 Weft：消费 structured CPU task，而非先经过 Mojo 的 SIMD materialization。简单操作可直接生成 Canonical Weft IR；专业实现通过结构化 adapter 绑定宿主 views/scalars、axes/symbols、domain、输出和资源，不能直接拼接 standalone kernel body。Canonical IR 继续经过外部 Weft physical compiler、system compiler 和 §7 的 native artifact/runtime；不在 Intent 重写 RVV/IME leaf selector。
 
-Weft 现有 helper/front-end 及 Canonical dialect 可复用；Intent 不复制整个 Weft parser/语言或 RVV/IME 指令选择器。外部 repository 默认只读，需要修改其接口时另行取得明确授权。
+Weft 现有 helper/front-end 及 Canonical dialect 可复用；Intent 不复制整个 Weft parser/语言或 RVV/IME 指令选择器。外部 repository 默认只读；用户已授权本轮字段子区域写回的最小 physical lowering/packing 修复，需独立提交并保留其它人的修改。其它外部改动仍需另行授权。
 
 ## 5. 专业计算组合：Q8_K 量化准备与 Q4_K×Q8_K 点积
 

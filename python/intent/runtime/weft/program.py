@@ -10,7 +10,7 @@ import statistics
 import sys
 
 from .buffer import Buffer
-from .compilation import TargetProfile
+from .compilation import TargetProfile, validate_artifact
 
 
 def _isa_extensions(isa: str) -> set[str]:
@@ -107,6 +107,7 @@ class NativeProgram:
         self.directory = Path(directory)
         manifest_text = (self.directory / "artifact.json").read_text()
         manifest = json.loads(manifest_text)
+        validate_artifact(manifest)
         self.profile = TargetProfile(**manifest["profile"])
         self.metadata = manifest["program"]
         self.parameters = self.metadata["parameters"]

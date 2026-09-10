@@ -92,6 +92,8 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
   auto rows = profiles->getArray(family);
   if (!rows || rows->empty()) return module.emitError("CPU candidate family is empty or missing");
   SmallVector<Configuration> configurations;
+  bool hasContraction = false;
+  original.walk([&](linalg::GenericOp operation) { hasContraction |= isMatrixContraction(operation); });
   for (const llvm::json::Value &value : *rows) {
     auto candidate = value.getAsObject();
     auto row = candidate->getArray("shared");
@@ -101,6 +103,8 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
       local.push_back(builder.getNamedAttr(parameter.first, builder.getI64IntegerAttr(*parameter.second.getAsInteger())));
     Configuration config{*(*row)[0].getAsInteger(), *(*row)[1].getAsInteger(),
         *(*row)[2].getAsInteger(), *(*row)[3].getAsInteger(), builder.getDictionaryAttr(local)};
+    if (!hasContraction && (config.tileM != 1 || config.tileN != 1 || config.tileK != 1))
+      return original.emitError("M/N/K block parameters require a matrix contraction consumer; otherwise they must be 1");
     if (implementations.legal(*module.getOps<func::FuncOp>().begin(), capabilities, config))
       configurations.push_back(config);
   }

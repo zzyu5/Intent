@@ -80,9 +80,10 @@
 
 # 待解决问题
 
-- [blocking] EXTERNAL-FIELD-STORE：2026-09-10 的正式 Weft 性能入口中，generated 和完整 source closure 均在外部 compiler 的 Q8_K 字段切片写回失败，尚未进入 native 执行。Source 定位为 `source/weft/tianchenrv/contraction/q4_k_projection/q4_k_projection.py:45`，错误为 `encoded field commit has no selected packing plan`。
-- TianchenRV `lib/Target/PlanRISCVMemory.cpp:2881` 只对直接 FieldOp destination 调用 packing planner；`PlanRISCVFieldStores.cpp:11` 只承接完整字段，`Emission/Memory.cpp:1643` / `Emission/FieldStorage.cpp:71` 对投影后的 Field binding 仍要求该 plan。需要在外部 physical memory lowering/plan 中闭合字段子区域写回，而不是在 emitter 临时拼 packing。
-- 外部仓库有其它未提交工作，仍保持只读。等待用户授权最小外部修复与独立提交；不覆盖现有修改，不更换算法或扩大容差。Comet 保持 Build，未提交验收候选；Mojo 五项同次 benchmark 已通过原容差并更新 `report/baselinev2/mojo-x86.csv`，Weft native 调用、数值与性能均尚未验收。
+- EXTERNAL-FIELD-STORE 已按用户“可以”的授权修复并独立提交为 TianchenRV `ea4026b21`：memory pass 将完整、自然布局的整字节字段显式物化为 `field_view`，接续普通 slice/subview/store；完整字段 packing 保留原路径，terminal 不新建算法。record owner 本身的 subview 偏移尚不支持，明确诊断；其它外部改动不在授权范围。
+- 参考差异已收束：TileLang `src/transform/lower_tile_op.cc:967–985` 在 lowering 重写 buffer/index 后再发射 store；Weft 原 planner 只识别直接 FieldOp，投影后直到 emitter 才发现缺 packing plan。新 typed descriptor 在 memory pass 闭合字段地址与 origin，final verifier 拒绝残留字段投影写回。
+- 初次只读复核指出 native helper ABI 未对照外部 artifact、非 contraction 的 M/N/K override 无消费者；现已在导出、编译、加载前逐项核对 typed ABI，并要求无 contraction 时 M/N/K 保持中性值 1。量化实际搜索 chunk=32/64，点积内部 32 元素分组来自既定计算关系，不是假设可调的 shared tile。
+- 2026-09-10 正式 Weft benchmark：generated 6.074266 ms、source 5.798605 ms、G/S 1.047539；同次原容差通过，winner 为 chunk=64，已更新 `report/baselinev2/weft-rvv.csv`。Mojo 五项已通过原容差并记录于既有 CSV；未受影响能力不重跑。等待修补复核和 Comet 独立验收，不将 benchmark 通过直接当作 A1–A5 全部验收。
 
 # 验证预期
 
