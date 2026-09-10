@@ -4,7 +4,6 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Matchers.h"
-#include "mlir/IR/Dominance.h"
 
 using namespace mlir;
 
@@ -29,21 +28,23 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
       "intent_cpu.configuration");
   Value lhs = operation.getInputs()[0], rhs = operation.getInputs()[1];
   Value output = operation.getOutputs()[0];
-  DominanceInfo dominance(operation->getParentOfType<func::FuncOp>());
   linalg::FillOp initialization;
   for (Operation *user : output.getUsers()) {
     if (auto fill = dyn_cast<linalg::FillOp>(user)) {
-      if (initialization || fill->getBlock() != operation->getBlock() ||
-          !fill->isBeforeInBlock(operation))
-        return operation.emitError("CPU contraction requires one dominating initialization");
-      initialization = fill;
-    } else if (user != operation && !isa<memref::DeallocOp, memref::DimOp>(user)) {
-      if (!dominance.properlyDominates(operation.getOperation(), user))
-        return operation.emitError("CPU contraction output has an intervening or escaping use");
+      if (fill->getBlock() == operation->getBlock() && fill->isBeforeInBlock(operation) &&
+          (!initialization || initialization->isBeforeInBlock(fill)))
+        initialization = fill;
     }
   }
   if (!initialization)
     return operation.emitError("CPU contraction accumulator initialization is missing");
+  PhysicalProgramAnalysis analysis(operation->getParentOfType<func::FuncOp>());
+  Value root = analysis.storageRoot(output);
+  for (Operation *between = initialization->getNextNode(); between != operation;
+       between = between->getNextNode())
+    for (auto access : analysis.accesses(between))
+      if (analysis.storageRoot(access.memory) == root)
+        return operation.emitError("CPU contraction initialization has an intervening memory access");
   Value initial = initialization.getInputs()[0];
   if (!matchPattern(initial, m_PosZeroFloat()))
     return operation.emitError("CPU contraction blocking requires the closed zero-initialized contraction; splitting a nonzero fused accumulator is not implemented");

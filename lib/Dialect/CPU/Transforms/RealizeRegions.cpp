@@ -44,14 +44,14 @@ LogicalResult instantiate(OpBuilder &b, Region &helper, ValueRange arguments) {
 }
 
 SmallVector<Value> slices(OpBuilder &b, Location loc, ValueRange sources,
-                          unsigned axis, Value begin, Value extent) {
+                          unsigned axis, Value begin, OpFoldResult extent) {
   SmallVector<Value> result;
   for (Value source : sources) {
     auto type = cast<MemRefType>(source.getType());
     SmallVector<OpFoldResult> offsets, sizes, steps;
     for (unsigned index = 0; index < type.getRank(); ++index) {
       offsets.push_back(index == axis ? OpFoldResult(begin) : b.getIndexAttr(0));
-      sizes.push_back(index == axis ? OpFoldResult(extent) :
+      sizes.push_back(index == axis ? extent :
           type.isDynamicDim(index) ? OpFoldResult(b.create<memref::DimOp>(loc, source, index).getResult()) : b.getIndexAttr(type.getDimSize(index)));
       steps.push_back(b.getIndexAttr(1));
     }
@@ -73,13 +73,14 @@ LogicalResult realize(Operation *operation, int64_t segmentSize) {
   for (auto [input, output] : llvm::zip(initial, state)) copy(b, loc, input, output);
   auto summary = scratch(b, loc, program.identities());
   auto next = scratch(b, loc, state);
-  auto loop = b.create<scf::ForOp>(loc, zero, count, step);
-  loop->setAttr("intent_cpu.region_axis", b.getI64IntegerAttr(program.count("axis")));
-  {
+  Value fullEnd = b.create<arith::SubIOp>(loc, count, b.create<arith::RemSIOp>(loc, count, step));
+  auto visit = [&](Value lower, Value upper, int64_t width) -> LogicalResult {
+    auto loop = b.create<scf::ForOp>(loc, lower, upper, b.create<arith::ConstantIndexOp>(loc, width));
+    loop->setAttr("intent_cpu.region_axis", b.getI64IntegerAttr(program.count("axis")));
     OpBuilder::InsertionGuard guard(b);
     b.setInsertionPointToStart(loop.getBody());
     Value begin = loop.getInductionVar();
-    Value extent = b.create<arith::MinSIOp>(loc, step, b.create<arith::SubIOp>(loc, count, begin));
+    OpFoldResult extent = b.getIndexAttr(width);
     auto inputs = slices(b, loc, program.sources(), program.count("axis"), begin, extent);
     SmallVector<Value> arguments(inputs);
     llvm::append_range(arguments, program.captures()); llvm::append_range(arguments, summary);
@@ -97,7 +98,9 @@ LogicalResult realize(Operation *operation, int64_t segmentSize) {
       if (failed(instantiate(b, program.combine(), arguments))) return failure();
     }
     for (auto [source, target] : llvm::zip(next, state)) copy(b, loc, source, target);
-  }
+    return success();
+  };
+  if (failed(visit(zero, fullEnd, segmentSize)) || failed(visit(fullEnd, count, 1))) return failure();
   for (Value value : summary) b.create<memref::DeallocOp>(loc, value);
   for (Value value : next) b.create<memref::DeallocOp>(loc, value);
   operation->erase();

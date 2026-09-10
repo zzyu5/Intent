@@ -141,10 +141,14 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
   original.erase();
   for (auto function : functions) {
     auto binding = function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration");
+    if (failed(realizeRegions(function, binding.getRegionSize()))) return failure();
+  }
+  if (failed(normalize(module))) return failure();
+  for (auto function : functions) {
+    auto binding = function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration");
     Configuration config{binding.getTaskGrain(), binding.getTileM(), binding.getTileN(),
         binding.getTileK(), binding.getRegionSize(), {}};
-    if (failed(realizeRegions(function, config.regionSize)) ||
-        failed(blockContractions(function, config, implementations)) || failed(verifyCPUProgram(module, false)) ||
+    if (failed(blockContractions(function, config, implementations)) || failed(verifyCPUProgram(module, false)) ||
         failed(partitionTasks(function, config.taskGrain))) return failure();
   }
   if (failed(normalize(module))) return failure();

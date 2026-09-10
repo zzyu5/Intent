@@ -60,7 +60,7 @@ Mojo 与 Weft 在共同 CPU region/task 程序边界分流。Mojo 可进一步�
 
 专业实现展开必须成为 current IR，继续参与合法化、分析和验证。Serializer 只拼写已经形成的程序；runtime 只绑定 typed ABI 和已声明资源，执行完整 native entry，并在返回前完成任务与依赖。内部函数/任务不变成额外作者可见 kernel launches，不执行 Python/Torch 算法替代生成物。
 
-原有 FP environment、typed buffer、alias/alignment、target capability、artifact 与 winner 分离等合同保持。外部 compiler 未支持的形式必须按其实际边界诊断；不能通过整算子 reference 调用、source template 或异常 fallback 假装完成。必要外部仓库修改另行取得用户授权并独立提交。
+原有 FP environment、typed buffer、alias/alignment、target capability、artifact 与 winner 分离等合同保持。外部 compiler 未支持的形式必须按其实际边界诊断；不能通过整算子 reference 调用、source template 或异常 fallback 假装完成。用户已授权在 TianchenRV 补齐本轮所需逐元素 select、区分浮点 maximum 语义及其 lowering，独立提交并保留并发修改；其它外部仓库改动仍须另行取得授权。
 
 ## 6. 性能与交付结果
 
