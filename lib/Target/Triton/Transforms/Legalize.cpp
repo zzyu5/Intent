@@ -1708,6 +1708,13 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
             "requires provider legalization to [...,M,K] x [...,K,N] tl.dot form");
         return WalkResult::interrupt();
       }
+      auto form = contract->getAttrOfType<StringAttr>(contractFormAttr);
+      if ((!form || form.getValue() != "multiply_sum") &&
+          isa<BFloat16Type>(contract.getResult().getType().getElementType())) {
+        contract.emitOpError(
+            "Triton tl.dot does not support a bfloat16 accumulator; requires precision-preserving provider legalization");
+        return WalkResult::interrupt();
+      }
     } else if (auto range = dyn_cast<gpu::MakeRangeOp>(operation)) {
       auto fragment = dyn_cast<gpu::FragmentType>(range.getResult().getType());
       auto physicalExtent =

@@ -997,7 +997,10 @@ private:
       assign(contract.getResult(), "tl.dot(" + valueString(contract.getLhs()) +
                                       ", " + valueString(contract.getRhs()) +
                                       ", " + valueString(contract.getAccumulator()) +
-                                      ", input_precision=\"ieee\")");
+                                      ", input_precision=\"ieee\", out_dtype=" +
+                                      pythonType(contract.getResult()
+                                                     .getType()
+                                                     .getElementType()) + ")");
       return;
     }
     if (auto contract = dyn_cast<gpu::ScaledContractOp>(operation)) {

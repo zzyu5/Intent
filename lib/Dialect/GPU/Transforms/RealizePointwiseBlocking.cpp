@@ -2509,6 +2509,7 @@ bool supportsStructuredFreeAxisValueGraph(WorksetCoordinateOp coordinate) {
 
   auto depends = [&](Value value) { return dependent.contains(value); };
   bool sawContract = sawNestedContract;
+  bool sawReduction = false;
   bool sawOwnedStore = false;
   for (Operation *operation : operations) {
     if (auto fold = dyn_cast<RegionFoldOp>(operation)) {
@@ -2535,6 +2536,7 @@ bool supportsStructuredFreeAxisValueGraph(WorksetCoordinateOp coordinate) {
           reduce.getInputs().drop_front(reduce.getSourceCount());
       if (!llvm::any_of(sources, depends) || llvm::any_of(boundaries, depends))
         return false;
+      sawReduction = true;
       continue;
     }
     if (auto gather = dyn_cast<GatherOp>(operation)) {
@@ -2556,7 +2558,7 @@ bool supportsStructuredFreeAxisValueGraph(WorksetCoordinateOp coordinate) {
       sawOwnedStore = true;
     }
   }
-  return sawContract && sawOwnedStore;
+  return (sawContract || sawReduction) && sawOwnedStore;
 }
 
 LogicalResult rankLiftPointwiseValueGraph(

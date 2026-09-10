@@ -1962,8 +1962,8 @@ LogicalResult decomposeMultiReductionContract(ContractOp contract) {
       failureReason = "a reduction pair has no scalar physical step";
       return failure();
     }
-    if (*lhsStep != *rhsStep) {
-      failureReason = "a reduction pair uses independently materialized steps";
+    if (!samePhysicalScalarExpression(*lhsStep, *rhsStep)) {
+      failureReason = "a reduction pair does not have equivalent physical steps";
       return failure();
     }
     PhysicalLockstepTraversalFact lockstep =
