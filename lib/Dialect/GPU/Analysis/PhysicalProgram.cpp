@@ -1455,7 +1455,7 @@ void PhysicalProgramAnalysis::collectRanges(
   // These operations are typed coordinate leaves.  They do not contribute a
   // fragment range root, but reaching one is an exact end of provenance rather
   // than an unknown operation in the producer graph.
-  if (isa<arith::ConstantOp, PhysicalExprOp, ProgramIdOp, DelinearizeOp,
+  if (isa<arith::ConstantOp, PhysicalExprOp, ParameterOp, ProgramIdOp, DelinearizeOp,
           WorksetCoordinateOp, DimOp, RangeOp, RangeBoundOp>(operation))
     return;
   if (auto scan = dyn_cast<ScanOp>(operation)) {

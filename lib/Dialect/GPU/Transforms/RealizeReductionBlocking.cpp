@@ -109,36 +109,6 @@ ArrayAttr reductionSources(ReduceOp reduce) {
 
 bool hasNonUnitFreeAxis(ReduceOp reduce);
 
-LogicalResult realizeConstructionScalarReductionAxes(ReduceOp reduce,
-                                                      func::FuncOp kernel) {
-  if (hasNonUnitFreeAxis(reduce))
-    return success();
-  SmallVector<std::pair<Value, unsigned>> pending;
-  PhysicalProgramAnalysis analysis(kernel);
-  for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
-    auto fragment = dyn_cast<FragmentType>(source.getType());
-    if (!fragment)
-      continue;
-    for (int64_t rawAxis : reduce.getAxes()) {
-      if (rawAxis < 0 ||
-          rawAxis >= static_cast<int64_t>(fragment.getShape().size()))
-        continue;
-      unsigned axis = static_cast<unsigned>(rawAxis);
-      PhysicalAxisRealizationFact fact = analysis.axisRealization(source, axis);
-      if (fact.constructionScalarSeed &&
-          llvm::none_of(fact.roots, [](MakeRangeOp range) {
-            return range->hasAttr(sourceSubregionAttr);
-          }))
-        pending.emplace_back(source, axis);
-    }
-  }
-  for (auto [source, axis] : pending)
-    if (failed(realizeFullCoverageDimension(kernel, source, axis)))
-      return reduce.emitOpError(
-          "construction scalar reduction axis has no exact full-coverage realization");
-  return success();
-}
-
 MakeRangeOp sourceRange(Value value) {
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel)
@@ -2263,6 +2233,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
 
   const bool vectorAccumulation =
       isSingleComponentAddReduce(reduce) &&
+      isa<IntegerType>(firstSource.getElementType()) &&
       succeeded(scalarSource(reduce.getInputs()[reduce.getSourceCount()]));
   SmallVector<FragmentType> blockedSourceTypes;
   for (const SourcePlan &plan : sourcePlans) {
@@ -2599,8 +2570,6 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
 LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
   if (failed(bindReductionFreeAxes(reduce, kernel)))
     return failure();
-  if (failed(realizeConstructionScalarReductionAxes(reduce, kernel)))
-    return failure();
   const bool required = requiresPhysicalRealization(reduce);
   auto unhandled = [&](const Twine &reason) -> LogicalResult {
     return required ? reduce.emitOpError()
@@ -2642,11 +2611,16 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
   PhysicalExprAttr sourceExtent;
   bool hasDerivedSource = false;
   bool hasRuntimeSourceRange = false;
+  bool hasConstructionScalarSource = false;
   for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
     auto fragment = dyn_cast<FragmentType>(source.getType());
     if (!fragment || reductionAxis < 0 ||
         reductionAxis >= static_cast<int64_t>(fragment.getShape().size()))
       return unhandled("source has no physical reduction axis");
+    hasConstructionScalarSource |=
+        PhysicalProgramAnalysis(kernel)
+            .axisRealization(source, static_cast<unsigned>(reductionAxis))
+            .constructionScalarSeed;
     FailureOr<SourcePlan> plan = analyzeSource(source, reductionAxis);
     if (failed(plan)) {
       FailureOr<AxisMapAttr> mapping = queryAxisMap(fragment, reductionAxis);
@@ -2722,7 +2696,7 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
   if (!sourceExtent)
     return unhandled("reduction has no physical source extent");
   if (!isCompileTimeExtent(sourceExtent) || hasDerivedSource ||
-      hasRuntimeSourceRange)
+      hasRuntimeSourceRange || hasConstructionScalarSource)
     return realizeRuntimeReduce(reduce, sourcePlans, kernel);
 
   PhysicalExprAttr blockExtent = nextPowerOfTwo(sourceExtent);

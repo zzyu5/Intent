@@ -34,6 +34,10 @@ LogicalResult formPointwiseOwnership(ModuleOp module, func::FuncOp kernel) {
   return closeReductionValueRelations(kernel);
 }
 
+LogicalResult predicateScalarControlGroup(ModuleOp module, func::FuncOp) {
+  return predicateScalarControl(module);
+}
+
 LogicalResult formPointwiseBlocking(ModuleOp module, func::FuncOp kernel) {
   if (failed(realizePointwiseBlocking(module)) ||
       failed(alignAccessResultRelations(kernel)) ||
@@ -165,6 +169,7 @@ LogicalResult runSharedGPUPasses(ModuleOp module, const TuningProfiles &profiles
     return failure();
   const TransformationGroup groups[] = {
       {"normalize-structured-sources", normalizeStructuredSources},
+      {"predicate-scalar-control", predicateScalarControlGroup},
       {"form-pointwise-ownership", formPointwiseOwnership},
       {"form-pointwise-blocking", formPointwiseBlocking},
       {"co-realize-online-reductions", coRealizeOnlineReductions},

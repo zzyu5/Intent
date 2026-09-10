@@ -114,6 +114,7 @@ mlir::LogicalResult replacePhysicalParameter(mlir::func::FuncOp kernel,
                                              ParameterOp previous,
                                              ParameterOp replacement);
 mlir::LogicalResult realizeAccessComposition(mlir::ModuleOp module);
+mlir::LogicalResult predicateScalarControl(mlir::ModuleOp module);
 mlir::LogicalResult realizeRegionFolds(mlir::ModuleOp module);
 mlir::LogicalResult realizeRegionScans(mlir::ModuleOp module);
 mlir::LogicalResult realizeContractionBlocking(mlir::ModuleOp module);
