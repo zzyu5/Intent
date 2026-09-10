@@ -70,7 +70,7 @@ budget.csv records best-so-far absolute time and cumulative stage/full-workflow 
 
 ## Reference Issues
 
-- sub_gelu (awaiting_oracle_decision): The default branch computes 0.5*x*erf(x/sqrt(2)), omitting the 1 + required by GELU. Both arms implement standard GELU and repeatedly differ from this reference by max_abs=0.49934613704681396. These numerical failures cannot be attributed to agent or compiler arithmetic without resolving the reference/task conflict. Keep the upstream source, task and raw observations unchanged. A project-local oracle correction has been proposed to the user; no correction has been applied.
+- sub_gelu (superseded_by_corrected_reference): The default branch computes 0.5*x*erf(x/sqrt(2)), omitting the 1 + required by GELU. Both arms implement standard GELU and repeatedly differ from this reference by max_abs=0.49934613704681396. These numerical failures cannot be attributed to agent or compiler arithmetic without resolving the reference/task conflict. The user authorized continued implementation after the proposed correction. The project evaluator restores the missing 1 + in a new batch; this batch retains its original reference-contract failure and raw observations. The upstream source is unchanged.
 
 ## Compiler Rechecks
 

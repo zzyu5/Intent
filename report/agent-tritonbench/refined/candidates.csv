@@ -1,0 +1,388 @@
+task,case,arm,repeat,stage,candidate,status,candidate_ms,reference_ms,ratio,failure_stage,error,reference_timing_note,reference_correction,original_status,evaluation_repaired,reused_from
+rsqrt,upstream-profile-8,triton,0,generation,1,pass,0.005888000130653381,,,,,The unchanged PyTorch reference branches on torch.any(input < 0); CUDA Graph cannot capture its Python data-dependent control. It remains the numerical oracle; candidate operator timing is still CUDA Graph.,,execution_failure,True,report/agent-tritonbench/expanded
+tanh,upstream-profile-8,triton,0,generation,1,execution_failure,,,,generated_launch,"at 5:35:
+def tanh_kernel(input_ptr, output_ptr, n_elements, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n_elements
+    values = tl.load(input_ptr + offsets, mask=mask)
+    tl.store(output_ptr + offsets, tl.tanh(values), mask=mask)
+                                   ^
+AttributeError(""module 'triton.language' has no attribute 'tanh'"")",,,,,report/agent-tritonbench/expanded
+sqrt,upstream-profile-8,triton,0,generation,1,pass,0.005839999997988343,0.007840000092983246,0.7448979500925146,,,,,,,report/agent-tritonbench/expanded
+tanh,upstream-profile-8,triton,0,generation,2,pass,0.006704000057652593,0.007823999971151352,0.8568507262744859,,,,,,,report/agent-tritonbench/expanded
+rsqrt,upstream-profile-8,triton,0,generation,2,execution_failure,,,,source_benchmark,"CUDA error: operation failed due to a previous error during capture
+Search for `cudaErrorStreamCaptureInvalidated' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+",,,,,report/agent-tritonbench/expanded
+fused_index_select_eq,upstream-profile-1,triton,0,generation,1,pass,0.0038720000302419066,0.005888000130653381,0.6576086861961801,,,,,,,report/agent-tritonbench/expanded
+grid_sample,upstream-profile-0,triton,0,generation,1,pass,0.028320000506937504,0.028744000010192394,0.985249112750329,,,,,,,report/agent-tritonbench/expanded
+rsqrt,upstream-profile-8,triton,0,generation,3,execution_failure,,,,source_benchmark,"CUDA error: operation failed due to a previous error during capture
+Search for `cudaErrorStreamCaptureInvalidated' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+",,,,,report/agent-tritonbench/expanded
+argmax,upstream-profile-8,triton,0,generation,1,execution_failure,,,,generated_launch,"at 13:17:
+    input_ptr,
+    partial_values_ptr,
+    partial_indices_ptr,
+    n_elements,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    valid = offsets < n_elements
+
+    values = tl.load(input_ptr + offsets, mask=valid, other=-float(""inf""))
+    nan_values = tl.isnan(values)
+                 ^
+AttributeError(""module 'triton.language' has no attribute 'isnan'"")",,,,,report/agent-tritonbench/expanded
+max,upstream-profile-8,triton,0,generation,1,pass,0.009320000186562538,0.012640000320971012,0.73734176818807,,,,,,,report/agent-tritonbench/expanded
+rsqrt,upstream-profile-8,triton,0,generation,4,agent_program_error,,,,candidate_build,KernelInterface.warmup() missing 1 required keyword-only argument: 'grid',,,,,report/agent-tritonbench/expanded
+relu,upstream-profile-8,triton,0,generation,1,pass,0.0059200001414865255,0.0072480000089854,0.816777060450808,,,,,,,report/agent-tritonbench/expanded
+argmax,upstream-profile-8,triton,0,generation,2,pass,0.007967999903485179,0.010479999706149101,0.7603053556203808,,,,,,,report/agent-tritonbench/expanded
+rsqrt,upstream-profile-8,triton,0,generation,5,execution_failure,,,,source_benchmark,"CUDA error: operation failed due to a previous error during capture
+Search for `cudaErrorStreamCaptureInvalidated' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+",,,,,report/agent-tritonbench/expanded
+mean,upstream-profile-8,triton,0,generation,1,execution_failure,,,,generated_launch,build.<locals>.wrapper() missing 1 required positional argument: 'keepdim',,,,,report/agent-tritonbench/expanded
+logsumexp,upstream-profile-8,triton,0,generation,1,pass,0.008848000317811966,0.028672000393271446,0.308593756851662,,,,,,,report/agent-tritonbench/expanded
+mean,upstream-profile-8,triton,0,generation,2,numerical_failure,,,,comparison,"generated/source floating result 0 differs: max_abs=0.2502914071083069, atol=0.0001, rtol=1e-05",,,,,report/agent-tritonbench/expanded
+fused_mv_sigmoid_sub,upstream-profile-4,triton,0,generation,1,pass,0.007840000092983246,0.011920000426471233,0.6577181050742781,,,,,,,report/agent-tritonbench/expanded
+mean,upstream-profile-8,triton,0,generation,3,pass,0.007840000092983246,0.010607999749481678,0.7390648829310464,,,,,,,report/agent-tritonbench/expanded
+add_gelu,upstream-profile-8,triton,0,generation,1,pass,0.007815999910235405,0.01193600008264184,0.654825725211076,,,,,,,report/agent-tritonbench/expanded
+log1p,upstream-profile-8,triton,0,generation,1,pass,0.006864000111818314,0.007151999976485968,0.9597315624140762,,,,,,,report/agent-tritonbench/expanded
+softplus_linear,upstream-profile-6,triton,0,generation,1,pass,0.007840000092983246,0.018080000765621662,0.43362830536438174,,,,,,,report/agent-tritonbench/expanded
+mul_relu,upstream-profile-8,triton,0,generation,1,pass,0.009999999776482582,0.012008000165224075,0.8327781178287464,,,,,,,report/agent-tritonbench/expanded
+gelu_conv2d,upstream-profile-4,triton,0,generation,1,pass,0.06328000128269196,0.034592000767588615,1.8293246958407476,,,,,,,report/agent-tritonbench/expanded
+tensordot,upstream-profile-4,triton,0,generation,1,pass,0.0060640000738203526,0.005887999897822738,1.0298913347574439,,,,,,,report/agent-tritonbench/expanded
+combined_activation,upstream-profile-6,triton,0,generation,1,pass,0.044703999534249306,0.024224000051617622,1.845442513168426,,,,,,,report/agent-tritonbench/expanded
+asin,upstream-profile-8,triton,0,generation,1,execution_failure,,,,generated_launch,"at 5:13:
+def asin_kernel(input_ptr, output_ptr, n_elements, input_stride, output_stride, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n_elements
+    values = tl.load(input_ptr + offsets * input_stride, mask=mask, other=0.0)
+    values = tl.math.asin(values.to(tl.float32))
+             ^
+AttributeError(""module 'triton.language.math' has no attribute 'asin'"")",,,,,report/agent-tritonbench/expanded
+add_mean,upstream-profile-8,triton,0,generation,1,pass,0.011320000048726797,0.018432000651955605,0.614149286476168,,,,,,,report/agent-tritonbench/expanded
+asin,upstream-profile-8,triton,0,generation,2,pass,0.0059200001414865255,0.005919999908655882,1.0000000393295012,,,,,,,report/agent-tritonbench/expanded
+fused_layer_norm_relu_linear,upstream-profile-4,triton,0,generation,1,pass,0.17387200146913528,0.06773600354790688,2.566906701930869,,,,,,,report/agent-tritonbench/expanded
+fused_cholesky_solve,upstream-profile-6,triton,0,generation,1,pass,7.501408100128174,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,reference_failure,True,report/agent-tritonbench/expanded
+conv2d,upstream-profile-2,triton,0,generation,1,agent_environment_failure,,,,,Agent execution stopped before a submission,,,,,report/agent-tritonbench/expanded
+matmul,upstream-profile-6,triton,0,generation,1,agent_environment_failure,,,,,Agent execution stopped before a submission,,,,,report/agent-tritonbench/expanded
+matmul,upstream-profile-6,triton,0,generation,1,pass,0.028672000393271446,0.01812800019979477,1.581641663573903,,,,,,,report/agent-tritonbench/expanded
+fused_gather_masked_fill,upstream-profile-5,triton,0,generation,1,pass,0.028384000062942505,0.02635199949145317,1.0771099199568663,,,,,,,report/agent-tritonbench/expanded
+conv2d,upstream-profile-2,triton,0,generation,1,execution_failure,,,,generated_launch,"at 76:15:
+
+        input_channel = k_offsets // (KERNEL_H * KERNEL_W)
+        kernel_offset = k_offsets % (KERNEL_H * KERNEL_W)
+        kernel_row = kernel_offset // KERNEL_W
+        kernel_col = kernel_offset % KERNEL_W
+
+        input_row = output_row[:, None] * STRIDE_H - PAD_H + kernel_row[None, :] * DILATION_H
+        input_col = output_col[:, None] * STRIDE_W - PAD_W + kernel_col[None, :] * DILATION_W
+
+        input_offsets = (
+            batch[:, None] * input_stride_n
+            + (input_channel_base[None, :] + input_channel[None, :]) * input_stride_c
+               ^
+ValueError('Cannot make_shape_compatible: incompatible dimensions at index 1: 64 and 32')",,,,,report/agent-tritonbench/expanded
+addmm,upstream-profile-6,triton,0,generation,1,pass,0.03254400007426739,0.022007999941706657,1.4787350127439018,,,,,,,report/agent-tritonbench/expanded
+conv2d,upstream-profile-2,triton,0,generation,2,execution_failure,,,,generated_launch,"at 75:12:
+        k_mask = k_offsets < K_TOTAL
+
+        input_channel = k_offsets // (KERNEL_H * KERNEL_W)
+        kernel_offset = k_offsets % (KERNEL_H * KERNEL_W)
+        kernel_row = kernel_offset // KERNEL_W
+        kernel_col = kernel_offset % KERNEL_W
+
+        input_row = output_row[:, None] * STRIDE_H - PAD_H + kernel_row[None, :] * DILATION_H
+        input_col = output_col[:, None] * STRIDE_W - PAD_W + kernel_col[None, :] * DILATION_W
+
+        input_offsets = (
+            batch[:, None] * input_stride_n
+            ^
+ValueError('Cannot make_shape_compatible: incompatible dimensions at index 0: 32 and 64')",,,,,report/agent-tritonbench/expanded
+conv2d,upstream-profile-2,triton,0,generation,3,pass,0.09080799669027328,0.034592000767588615,2.625115479742846,,,,,,,report/agent-tritonbench/expanded
+cos,upstream-profile-8,triton,0,generation,1,pass,0.007935999892652035,0.007967999903485179,0.9959839343347447,,,,,,,report/agent-tritonbench/expanded
+exp,upstream-profile-8,triton,0,generation,1,pass,0.005936000030487776,0.00711200013756752,0.834645657433583,,,,,,,report/agent-tritonbench/expanded
+fused_qr_solve,upstream-profile-4,triton,0,generation,1,pass,16.26518440246582,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,report/agent-tritonbench/expanded
+tensordot_rsqrt,upstream-profile-5,triton,0,generation,1,pass,0.04676800034940243,0.04678400047123432,0.999658000135287,,,,,,,report/agent-tritonbench/expanded
+exp_mean,upstream-profile-8,triton,0,generation,1,pass,0.007840000092983246,0.014352000318467617,0.546265323231287,,,,,,,report/agent-tritonbench/expanded
+permute_copy,upstream-profile-2,triton,0,generation,1,pass,0.005927999969571829,0.005904000019654632,1.0040650321540143,,,,,,,report/agent-tritonbench/expanded
+min,upstream-profile-4,triton,0,generation,1,execution_failure,,,,generated_launch,"at 20:23:
+    INDEX_STRIDE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    columns = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    input_offsets = columns * STRIDE1
+
+    min_value = tl.load(input_ptr + input_offsets)
+    min_index = tl.zeros((BLOCK_N,), dtype=tl.int64)
+
+    for row in tl.range(1, n_rows, num_stages=4):
+        value = tl.load(input_ptr + row * STRIDE0 + input_offsets)
+        value_is_nan = tl.isnan(value)
+                       ^
+AttributeError(""module 'triton.language' has no attribute 'isnan'"")",,,,,report/agent-tritonbench/expanded
+symmetric_mm_and_abs_sum,upstream-profile-6,triton,0,generation,1,numerical_failure,,,,comparison,"generated/source floating result 0 differs: max_abs=176368.0, atol=0.0001, rtol=1e-05",,,,,report/agent-tritonbench/expanded
+min,upstream-profile-4,triton,0,generation,2,pass,0.14243200421333313,0.01473599998280406,9.665581187536773,,,,,,,report/agent-tritonbench/expanded
+symmetric_mm_and_abs_sum,upstream-profile-6,triton,0,generation,2,pass,0.14135199785232544,0.07737600058317184,1.826819644165835,,,,,,,report/agent-tritonbench/expanded
+sum,upstream-profile-8,triton,0,generation,1,pass,0.007952000014483929,0.010479999706149101,0.758778648611805,,,,,,,report/agent-tritonbench/expanded
+sigmoid,upstream-profile-8,triton,0,generation,1,pass,0.007823999971151352,0.007823999971151352,1.0,,,,,,,report/agent-tritonbench/expanded
+gelu,upstream-profile-8,triton,0,generation,1,pass,0.007808000082150102,0.007823999971151352,0.9979550244043655,,,,,,,report/agent-tritonbench/expanded
+floor,upstream-profile-8,triton,0,generation,1,pass,0.007791999960318208,0.007823999971151352,0.9959100190502128,,,,,,,report/agent-tritonbench/expanded
+mul_sub,upstream-profile-8,triton,0,generation,1,pass,0.012064000125974417,0.018207999877631664,0.6625659164681187,,,,,,,report/agent-tritonbench/expanded
+abs,upstream-profile-8,triton,0,generation,1,pass,0.007280000019818544,0.007408000063151121,0.9827213765872823,,,,,,,report/agent-tritonbench/expanded
+mul,upstream-profile-8,triton,0,generation,1,pass,0.007599999895319343,0.007791999960318208,0.9753593344485818,,,,,,,report/agent-tritonbench/expanded
+softmax,upstream-profile-6,triton,0,generation,1,pass,0.007960000075399876,0.007967999903485179,0.9989960054992214,,,,,,,report/agent-tritonbench/expanded
+leaky_relu,upstream-profile-8,triton,0,generation,1,pass,0.007376000285148621,0.007911999942734838,0.9322548456185978,,,,,,,report/agent-tritonbench/expanded
+log,upstream-profile-8,triton,0,generation,1,pass,0.007791999960318208,0.007832000032067299,0.9948927385616299,,,,,,,report/agent-tritonbench/expanded
+std,upstream-profile-8,triton,0,generation,1,pass,0.008200000040233135,0.013383999932557344,0.6126718530748171,,,,,,,report/agent-tritonbench/expanded
+ifftshift,upstream-profile-8,triton,0,generation,1,pass,0.006152000045403838,0.009416000451892614,0.6533559632707204,,,,,,,report/agent-tritonbench/expanded
+relu_conv2d,upstream-profile-3,triton,0,generation,1,pass,0.012048000004142523,0.03457600064575672,0.34844978537507904,,,,,,,report/agent-tritonbench/expanded
+solve,upstream-profile-4,triton,0,generation,1,pass,6.626768112182617,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,report/agent-tritonbench/expanded
+conv2d_add,upstream-profile-0,triton,0,generation,1,pass,0.031487999483942986,0.03561600111424923,0.8840969928919191,,,,,,,report/agent-tritonbench/expanded
+fused_index_select_eq,upstream-profile-1,triton,0,optimization,1,pass,0.0045999998692423105,0.005792000098153949,0.79419885899319,,,,,,,report/agent-tritonbench/expanded
+grid_sample,upstream-profile-0,triton,0,optimization,1,pass,0.03033600002527237,0.028792000375688076,1.0536259943539055,,,,,,,report/agent-tritonbench/expanded
+fused_index_select_eq,upstream-profile-1,triton,0,optimization,2,pass,0.004680000012740493,0.005792000098153949,0.8080110382304936,,,,,,,report/agent-tritonbench/expanded
+grid_sample,upstream-profile-0,triton,0,optimization,2,pass,0.028320000506937504,0.028735999949276447,0.985523404681471,,,,,,,report/agent-tritonbench/expanded
+fused_index_select_eq,upstream-profile-1,triton,0,optimization,3,pass,0.005119999870657921,0.005792000098153949,0.8839778632410226,,,,,,,report/agent-tritonbench/expanded
+fused_index_select_eq,upstream-profile-1,triton,0,optimization,4,pass,0.004735999973490834,0.005792000098153949,0.81767953957741,,,,,,,report/agent-tritonbench/expanded
+grid_sample,upstream-profile-0,triton,0,optimization,3,pass,0.029343999922275543,0.029328000731766224,1.00054552612214,,,,,,,report/agent-tritonbench/expanded
+fused_index_select_eq,upstream-profile-1,triton,0,optimization,5,pass,0.004735999973490834,0.005839999997988343,0.8109588998496927,,,,,,,report/agent-tritonbench/expanded
+grid_sample,upstream-profile-0,triton,0,optimization,4,pass,0.03038400039076805,0.02830400038510561,1.0734878454409928,,,,,,,report/agent-tritonbench/expanded
+grid_sample,upstream-profile-0,triton,0,optimization,5,execution_failure,,,,generated_launch,dynamic_func() missing 1 required positional argument: 'BLOCK',,,,,report/agent-tritonbench/expanded
+matmul,upstream-profile-6,triton,0,optimization,1,pass,0.018207999877631664,0.018160000443458557,1.0026431405837546,,,,,,,report/agent-tritonbench/expanded
+softmax,upstream-profile-6,triton,0,optimization,1,pass,0.007823999971151352,0.007832000032067299,0.9989785417667018,,,,,,,report/agent-tritonbench/expanded
+softmax,upstream-profile-6,triton,0,optimization,2,pass,0.007823999971151352,0.007840000092983246,0.9979591681578915,,,,,,,report/agent-tritonbench/expanded
+softmax,upstream-profile-6,triton,0,optimization,3,pass,0.007840000092983246,0.007840000092983246,1.0,,,,,,,report/agent-tritonbench/expanded
+matmul,upstream-profile-6,triton,0,optimization,2,pass,0.016119999811053276,0.01812800019979477,0.8892321068727578,,,,,,,report/agent-tritonbench/expanded
+softmax,upstream-profile-6,triton,0,optimization,4,pass,0.007823999971151352,0.007823999971151352,1.0,,,,,,,report/agent-tritonbench/expanded
+softmax,upstream-profile-6,triton,0,optimization,5,pass,0.007823999971151352,0.007840000092983246,0.9979591681578915,,,,,,,report/agent-tritonbench/expanded
+matmul,upstream-profile-6,triton,0,optimization,3,pass,0.016143999993801117,0.017360000871121883,0.9299538700286838,,,,,,,report/agent-tritonbench/expanded
+matmul,upstream-profile-6,triton,0,optimization,4,pass,0.01601599995046854,0.018064000643789768,0.8866252978115725,,,,,,,report/agent-tritonbench/expanded
+matmul,upstream-profile-6,triton,0,optimization,5,pass,0.01607999950647354,0.018160000443458557,0.8854625062669392,,,,,,,report/agent-tritonbench/expanded
+tanh,upstream-profile-8,intent,0,generation,1,pass,0.007967999903485179,0.006231999956071377,1.2785622528322622,,,,,,,
+argmax,upstream-profile-8,intent,0,generation,1,compilation_failure,,,,frontend_kir,"/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/argmax/intent/repeat-0/generation-1/candidate.py:11:5: error: expected scalar/tensor value, got tuple<f16,i64>",,,,,
+relu,upstream-profile-8,intent,0,generation,1,pass,0.006128000095486641,0.007935999892652035,0.7721774418319454,,,,,,,
+fused_index_select_eq,upstream-profile-1,intent,0,generation,1,pass,0.0038720000302419066,0.005904000019654632,0.6558265612045863,,,,,,,
+sqrt,upstream-profile-8,intent,0,generation,1,pass,0.006128000095486641,0.007960000075399876,0.7698492509346864,,,,,,,
+rsqrt,upstream-profile-8,intent,0,generation,1,pass,0.0074880002066493034,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+argmax,upstream-profile-8,intent,0,generation,2,pass,0.1390720009803772,0.010464000049978495,13.290519907887711,,,,,,,
+max,upstream-profile-8,intent,0,generation,1,pass,0.22836799919605255,0.012640000320971012,18.06708808520894,,,,,,,
+mean,upstream-profile-8,intent,0,generation,1,execution_failure,,,,generated_launch,build.<locals>.wrapper() missing 1 required positional argument: 'keepdim',,,,,
+fused_mv_sigmoid_sub,upstream-profile-4,intent,0,generation,1,pass,0.018207999877631664,0.012032000347971916,1.5132978184047974,,,,,,,
+grid_sample,upstream-profile-0,intent,0,generation,1,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/grid_sample/intent/repeat-0/generation-1/candidate.py:72:5: error: cannot broadcast dimensions N and C,,,,,
+add_gelu,upstream-profile-8,intent,0,generation,1,pass,0.006856000050902367,0.01208000024780631,0.5675496614453625,,,,,,,
+log1p,upstream-profile-8,intent,0,generation,1,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/log1p/intent/repeat-0/generation-1/candidate.py:11:24: error: compile-time object has no attribute 'log1p',,,,,
+logsumexp,upstream-profile-8,intent,0,generation,1,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/logsumexp/intent/repeat-0/generation-1/candidate.py:20:28: error: only Intent intrinsics and @intent.fn values are callable in DSL code,,,,,
+mean,upstream-profile-8,intent,0,generation,2,pass,0.11036799848079681,0.010207999963313341,10.811912115737632,,,,,,,
+mul_relu,upstream-profile-8,intent,0,generation,1,pass,0.01003200002014637,0.01208000024780631,0.8304635607907499,,,,,,,
+logsumexp,upstream-profile-8,intent,0,generation,2,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/logsumexp/intent/repeat-0/generation-2/candidate.py:33:12: error: mixed dtypes require an explicit I.cast,,,,,
+tensordot,upstream-profile-4,intent,0,generation,1,compilation_failure,,,,physical_program_verification,"Intent Triton compiler failed with exit code 4:
+loc(""<stdin>"":11:10): error: 'intent_gpu.contract' op multi-pair contraction could not be decomposed into provider-native contractions: a reduction pair uses independently materialized steps
+loc(""<stdin>"":1:1): error: shared GPU transformation failed: realize-contractions
+",,,,,
+grid_sample,upstream-profile-0,intent,0,generation,2,execution_failure,,,,generated_launch,'function' object has no attribute 'numel',,,,,
+combined_activation,upstream-profile-6,intent,0,generation,1,pass,0.01411199988797307,0.024335999973118305,0.5798816528419326,,,,,,,
+asin,upstream-profile-8,intent,0,generation,1,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/asin/intent/repeat-0/generation-1/candidate.py:11:24: error: compile-time object has no attribute 'asin',,,,,
+gelu_conv2d,upstream-profile-4,intent,0,generation,1,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/gelu_conv2d/intent/repeat-0/generation-1/candidate.py:69:46: error: mixed dtypes require an explicit I.cast,,,,,
+softplus_linear,upstream-profile-6,intent,0,generation,1,pass,0.05302399955689907,0.01740800030529499,3.0459558034802403,,,,,,,
+tensordot,upstream-profile-4,intent,0,generation,2,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/tensordot/intent/repeat-0/generation-2/candidate.py:15:14: error: contract paired reduction extents are incompatible,,,,,
+logsumexp,upstream-profile-8,intent,0,generation,3,pass,0.2014480009675026,0.028447999618947506,7.081271219974643,,,,,,,
+add_mean,upstream-profile-8,intent,0,generation,1,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/add_mean/intent/repeat-0/generation-1/candidate.py:13:39: error: axis must be an integer or non-empty integer tuple,,,,,
+tensordot,upstream-profile-4,intent,0,generation,3,compilation_failure,,,,provider_program_verification,"Intent Triton compiler failed with exit code 6:
+loc(""<stdin>"":18:11): error: 'intent_gpu.gather' op requires safe-index legalization before Triton tl.gather: source='!intent_gpu.fragment<f32, [#intent_gpu.expr<0, 1024, """", []>, #intent_gpu.expr<0, 1024, """", []>], [#intent_gpu.axis_map<1, 0, 1, 0, false>, #intent_gpu.axis_map<2, 2, 8, 1, false>], 1, 1>', coordinate='!intent_gpu.fragment<index, [#intent_gpu.expr<1, 0, ""FRAGMENT_S9_A0"", []>], [#intent_gpu.axis_map<9, 0, 11, 0, false>], 1, 1>', valid='!intent_gpu.fragment<i1, [#intent_gpu.expr<1, 0, ""FRAGMENT_S9_A0"", []>, #intent_gpu.expr<1, 0, ""FRAGMENT_S12_A0"", []>], [#intent_gpu.axis_map<9, 0, 11, 0, false>, #intent_gpu.axis_map<12, 0, 12, 1, false>], 1, 1>', fill='!intent_gpu.fragment<f32, [#intent_gpu.expr<1, 0, ""FRAGMENT_S9_A0"", []>, #intent_gpu.expr<1, 0, ""FRAGMENT_S12_A0"", []>], [#intent_gpu.axis_map<9, 0, 11, 0, false>, #intent_gpu.axis_map<12, 0, 12, 1, false>], 1, 1>', result='!intent_gpu.fragment<f32, [#intent_gpu.expr<1, 0, ""FRAGMENT_S9_A0"", []>, #intent_gpu.expr<1, 0, ""FRAGMENT_S12_A0"", []>], [#intent_gpu.axis_map<9, 0, 11, 0, false>, #intent_gpu.axis_map<12, 0, 12, 1, false>], 1, 1>'
+",,,,,
+log1p,upstream-profile-8,intent,0,generation,2,pass,0.007984000025317073,0.0062240001279860735,1.282776327303915,,,,,,,
+gelu_conv2d,upstream-profile-4,intent,0,generation,2,compilation_failure,,,,kernel_ir_parse,"Intent Triton compiler failed with exit code 2:
+loc(""<stdin>"":59:31): error: 'intent.binary' op binary operator/schema is invalid
+",,,,,
+grid_sample,upstream-profile-0,intent,0,generation,3,pass,0.030479999259114265,0.028711999766528606,1.0615770237866444,,,,,,,
+fused_layer_norm_relu_linear,upstream-profile-4,intent,0,generation,1,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/fused_layer_norm_relu_linear/intent/repeat-0/generation-1/candidate.py:34:16: error: cannot broadcast dimensions N and M,,,,,
+asin,upstream-profile-8,intent,0,generation,2,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/asin/intent/repeat-0/generation-2/candidate.py:14:9: error: return inside structured control flow is unsupported; return after the region,,,,,
+add_mean,upstream-profile-8,intent,0,generation,2,pass,0.1778400018811226,0.01844000071287155,9.644251356074303,,,,,,,
+gelu_conv2d,upstream-profile-4,intent,0,generation,3,compilation_failure,,,,kernel_ir_parse,"Intent Triton compiler failed with exit code 2:
+loc(""<stdin>"":59:32): error: 'intent.binary' op binary operator/schema is invalid
+",,,,,
+fused_gather_masked_fill,upstream-profile-5,intent,0,generation,1,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/fused_gather_masked_fill/intent/repeat-0/generation-1/candidate.py:16:29: error: cannot broadcast dimensions M and N,,,,,
+fused_cholesky_solve,upstream-profile-6,intent,0,generation,1,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/fused_cholesky_solve/intent/repeat-0/generation-1/candidate.py:39:54: error: Out-only view cannot be read,,,,,
+conv2d,upstream-profile-2,intent,0,generation,1,compilation_failure,,,,provider_program_verification,"Intent Triton compiler failed with exit code 6:
+loc(""<stdin>"":27:17): error: 'intent_gpu.gather' op requires safe-index legalization before Triton tl.gather: source='!intent_gpu.fragment<f32, [#intent_gpu.expr<0, 1, """", []>, #intent_gpu.expr<0, 1, """", []>, #intent_gpu.expr<0, 1, """", []>], [#intent_gpu.axis_map<10, 0, 3, 0, true>, #intent_gpu.axis_map<1, 0, 1, 1, false>, #intent_gpu.axis_map<2, 2, 4, 2, false>], 1, 1>', coordinate='index', valid='!intent_gpu.fragment<i1, [#intent_gpu.expr<1, 0, ""FRAGMENT_D4"", []>, #intent_gpu.expr<1, 0, ""FRAGMENT_D1"", []>], [#intent_gpu.axis_map<21, 0, 4, 0, false>, #intent_gpu.axis_map<17, 0, 1, 1, false>], 1, 1>', fill='!intent_gpu.fragment<f32, [#intent_gpu.expr<1, 0, ""FRAGMENT_D4"", []>, #intent_gpu.expr<1, 0, ""FRAGMENT_D1"", []>], [#intent_gpu.axis_map<21, 0, 4, 0, false>, #intent_gpu.axis_map<17, 0, 1, 1, false>], 1, 1>', result='!intent_gpu.fragment<f32, [#intent_gpu.expr<1, 0, ""FRAGMENT_D4"", []>, #intent_gpu.expr<1, 0, ""FRAGMENT_D1"", []>], [#intent_gpu.axis_map<21, 0, 4, 0, false>, #intent_gpu.axis_map<17, 0, 1, 1, false>], 1, 1>'
+",,,,,
+gelu_conv2d,upstream-profile-4,intent,0,generation,4,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/gelu_conv2d/intent/repeat-0/generation-4/candidate.py:27:37: error: mixed dtypes require an explicit I.cast,,,,,
+tensordot,upstream-profile-4,intent,0,generation,4,benchmark_timeout,,,,,candidate preparation/queue/execution exceeded the remaining 300.000-second budget,,,,,
+conv2d,upstream-profile-2,intent,0,generation,2,compilation_failure,,,,provider_program_verification,"Intent Triton compiler failed with exit code 6:
+loc(""<stdin>"":27:17): error: 'intent_gpu.gather' op requires safe-index legalization before Triton tl.gather: source='!intent_gpu.fragment<f32, [#intent_gpu.expr<0, 1, """", []>, #intent_gpu.expr<0, 1, """", []>, #intent_gpu.expr<0, 1, """", []>], [#intent_gpu.axis_map<10, 0, 3, 0, true>, #intent_gpu.axis_map<1, 0, 1, 1, false>, #intent_gpu.axis_map<2, 2, 4, 2, false>], 1, 1>', coordinate='index', valid='!intent_gpu.fragment<i1, [#intent_gpu.expr<1, 0, ""FRAGMENT_D4"", []>, #intent_gpu.expr<1, 0, ""FRAGMENT_D1"", []>], [#intent_gpu.axis_map<21, 0, 4, 0, false>, #intent_gpu.axis_map<17, 0, 1, 1, false>], 1, 1>', fill='!intent_gpu.fragment<f32, [#intent_gpu.expr<1, 0, ""FRAGMENT_D4"", []>, #intent_gpu.expr<1, 0, ""FRAGMENT_D1"", []>], [#intent_gpu.axis_map<21, 0, 4, 0, false>, #intent_gpu.axis_map<17, 0, 1, 1, false>], 1, 1>', result='!intent_gpu.fragment<f32, [#intent_gpu.expr<1, 0, ""FRAGMENT_D4"", []>, #intent_gpu.expr<1, 0, ""FRAGMENT_D1"", []>], [#intent_gpu.axis_map<21, 0, 4, 0, false>, #intent_gpu.axis_map<17, 0, 1, 1, false>], 1, 1>'
+",,,,,
+asin,upstream-profile-8,intent,0,generation,3,pass,0.006784000201150775,0.005936000030487776,1.1428571708739221,,,,,,,
+fused_layer_norm_relu_linear,upstream-profile-4,intent,0,generation,2,execution_failure,,,,generated_launch,"CUDA error: an illegal memory access was encountered
+Search for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+",,,,,
+matmul,upstream-profile-6,intent,0,generation,1,execution_failure,,,,generated_launch,"at 63:14:
+        v50 = (v47 & v49)
+        v51 = tl.broadcast_to(v41[:, None], (BLOCK_M_1_0_0_1_1_0_2_0_0_2_1_0_3_0, BLOCK_K_1_0_0_1_1_0_2_0_0_2_1_0_3_0))
+        v52 = tl.broadcast_to(v50[None, :], (BLOCK_M_1_0_0_1_1_0_2_0_0_2_1_0_3_0, BLOCK_K_1_0_0_1_1_0_2_0_0_2_1_0_3_0))
+        v53 = (v51 & v52)
+        v54 = tl.broadcast_to(v50[:, None], (BLOCK_K_1_0_0_1_1_0_2_0_0_2_1_0_3_0, BLOCK_N_1_0_0_1_1_0_2_0_0_2_1_0_3_0))
+        v55 = tl.broadcast_to(v35[None, :], (BLOCK_K_1_0_0_1_1_0_2_0_0_2_1_0_3_0, BLOCK_N_1_0_0_1_1_0_2_0_0_2_1_0_3_0))
+        v56 = (v54 & v55)
+        v57 = tl.full((BLOCK_M_1_0_0_1_1_0_2_0_0_2_1_0_3_0, BLOCK_K_1_0_0_1_1_0_2_0_0_2_1_0_3_0), 0.0, tl.float16)
+        v58 = tl.full((BLOCK_K_1_0_0_1_1_0_2_0_0_2_1_0_3_0, BLOCK_N_1_0_0_1_1_0_2_0_0_2_1_0_3_0), 0.0, tl.float16)
+        v59 = tl.load((other + (tl.broadcast_to(v45[:, None], (BLOCK_K_1_0_0_1_1_0_2_0_0_2_1_0_3_0, BLOCK_N_1_0_0_1_1_0_2_0_0_2_1_0_3_0))) * S1_0 + (tl.broadcast_to(v30[None, :], (BLOCK_K_1_0_0_1_1_0_2_0_0_2_1_0_3_0, BLOCK_N_1_0_0_1_1_0_2_0_0_2_1_0_3_0))) * S1_1), mask=v56, other=v58)
+        v60 = tl.load(tl.make_block_ptr(base=(input + tl.cast(v26, tl.int64) * S0_0 + tl.cast(iv44, tl.int64) * S0_1), shape=((D1 - tl.cast(v26, tl.int64)), (D2 - tl.cast(iv44, tl.int64))), strides=(S0_0, S0_1), offsets=(0, 0), block_shape=(BLOCK_M_1_0_0_1_1_0_2_0_0_2_1_0_3_0, BLOCK_K_1_0_0_1_1_0_2_0_0_2_1_0_3_0), order=(1, 0)), boundary_check=(0, 1), padding_option=""zero"")
+        v61 = tl.dot(v60, v59, v43, input_precision=""ieee"")
+              ^",,,,,
+fused_gather_masked_fill,upstream-profile-5,intent,0,generation,2,pass,0.01809599995613098,0.026271999813616276,0.6887941566881471,,,,,,,
+fused_cholesky_solve,upstream-profile-6,intent,0,generation,2,numerical_failure,,,,comparison,"generated/source floating result 0 differs: max_abs=0.0052381763234734535, atol=0.0001, rtol=0.0001",,,,,
+matmul,upstream-profile-6,intent,0,generation,2,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/matmul/intent/repeat-0/generation-2/candidate.py:13:5: error: stored/scattered value dtype does not match destination,,,,,
+addmm,upstream-profile-6,intent,0,generation,1,pass,0.018223999999463558,0.02223999984562397,0.819424466095461,,,,,,,
+tensordot,upstream-profile-4,intent,0,generation,5,compilation_failure,,,,physical_program,"Intent Triton compiler failed with exit code 3:
+loc(""<stdin>"":46:15): error: 'intent_gpu.make_range' op physical subregion requires one launch-visible parent dimension
+Intent KIR-to-GPU construction failed
+",,,,,
+gelu_conv2d,upstream-profile-4,intent,0,generation,5,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/gelu_conv2d/intent/repeat-0/generation-5/candidate.py:33:32: error: mixed dtypes require an explicit I.cast,,,,,
+matmul,upstream-profile-6,intent,0,generation,3,pass,0.018207999877631664,0.018136000260710716,1.0039699832314695,,,,,,,
+fused_layer_norm_relu_linear,upstream-profile-4,intent,0,generation,3,compilation_failure,,,,physical_program_verification,"Intent Triton compiler failed with exit code 4:
+loc(""<stdin>"":12:10): error: 'intent_gpu.contract' op pointwise ownership found two non-equivalent contract extents
+loc(""<stdin>"":1:1): error: shared GPU transformation failed: form-pointwise-blocking
+",,,,,
+fused_cholesky_solve,upstream-profile-6,intent,0,generation,3,pass,42.76387023925781,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,evaluation_error,True,
+cos,upstream-profile-8,intent,0,generation,1,pass,0.006407999899238348,0.007967999903485179,0.804216864565411,,,,,evaluation_error,True,
+exp,upstream-profile-8,intent,0,generation,1,pass,0.00595200015231967,0.006896000122651458,0.8631090554608594,,,,,,,
+fused_qr_solve,upstream-profile-4,intent,0,generation,1,compilation_failure,,,,physical_program_verification,"Intent Triton compiler failed with exit code 4:
+loc(""<stdin>"":18:11): error: 'intent_gpu.contract' op cannot form a complete physical contraction: row and column ownership share one mapping coordinate that cannot be refined independently; lhs='!intent_gpu.fragment<f32, [#intent_gpu.expr<1, 0, ""FRAGMENT_D1"", []>, #intent_gpu.expr<0, 1, """", []>], [#intent_gpu.axis_map<1, 1, 1, 0, false>, #intent_gpu.axis_map<1, 0, 3, 1, false>], 1, 1>'; rhs='!intent_gpu.fragment<f32, [#intent_gpu.expr<0, 1, """", []>, #intent_gpu.expr<1, 0, ""FRAGMENT_D1"", []>], [#intent_gpu.axis_map<1, 0, 3, 0, false>, #intent_gpu.axis_map<1, 1, 1, 1, false>], 1, 1>'; result='!intent_gpu.fragment<f32, [#intent_gpu.expr<1, 0, ""FRAGMENT_D1"", []>, #intent_gpu.expr<1, 0, ""FRAGMENT_D1"", []>], [#intent_gpu.axis_map<1, 1, 1, 0, false>, #intent_gpu.axis_map<1, 1, 1, 1, false>], 1, 1>'; lhs_reduction=1; rhs_reduction=0; lhs_batch=; rhs_batch=; free_axes_need_realization=0; selected_free_axes=1
+loc(""<stdin>"":1:1): error: shared GPU transformation failed: realize-contractions
+",,,,,
+tensordot_rsqrt,upstream-profile-5,intent,0,generation,1,pass,0.04483200050890446,0.04708800092339516,0.952089696520333,,,,,,,
+conv2d,upstream-profile-2,intent,0,generation,3,compilation_failure,,,,physical_program_verification,"Intent Triton compiler failed with exit code 4:
+loc(""<stdin>"":19:5): error: 'intent_gpu.store' op access payload and coordinate extents disagree; payload_axis=0; payload_extent=#intent_gpu.expr<1, 0, ""FRAGMENT_D3"", []>; coordinate_extent=#intent_gpu.expr<0, 1, """", []>
+loc(""<stdin>"":1:1): error: shared GPU postcondition failed: form-pointwise-ownership
+",,,,,
+sub_gelu,upstream-profile-8,triton,0,generation,1,pass,0.010015999898314476,0.02638399973511696,0.379624014511463,,,,sub_gelu_standard_gelu,,,
+fused_layer_norm_relu_linear,upstream-profile-4,intent,0,generation,4,compilation_failure,,,,physical_program_verification,"Intent Triton compiler failed with exit code 4:
+loc(""<stdin>"":29:11): error: 'intent_gpu.broadcast' op broadcast has conflicting non-singleton physical extents; input='!intent_gpu.fragment<f32, [#intent_gpu.expr<1, 0, ""FULL_D1"", []>, #intent_gpu.expr<0, 1, """", []>], [#intent_gpu.axis_map<26, 0, 1, 0, true>, #intent_gpu.axis_map<26, 1, 5, 1, true>], 1, 1>'; result='!intent_gpu.fragment<f32, [#intent_gpu.expr<1, 0, ""FRAGMENT_D1"", []>, #intent_gpu.expr<1, 0, ""FRAGMENT_D2"", []>], [#intent_gpu.axis_map<1, 0, 1, 0, false>, #intent_gpu.axis_map<1, 1, 2, 1, false>], 1, 1>'
+loc(""<stdin>"":1:1): error: shared GPU transformation failed: form-pointwise-blocking
+",,,,,
+permute_copy,upstream-profile-2,intent,0,generation,1,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/permute_copy/intent/repeat-0/generation-1/candidate.py:14:5: error: cannot broadcast dimensions D3 and D0,,,,,
+fused_cholesky_solve,upstream-profile-6,intent,0,generation,4,pass,44.947471618652344,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+cos,upstream-profile-8,intent,0,generation,2,pass,0.007943999953567982,0.007960000075399876,0.9979899344622695,,,,,,,
+sub_gelu,upstream-profile-8,intent,0,generation,1,pass,0.01003200002014637,0.026415999978780746,0.37976983753046645,,,,sub_gelu_standard_gelu,,,
+exp_mean,upstream-profile-8,intent,0,generation,1,pass,0.12010400369763374,0.0139679997228086,8.598511317373077,,,,,,,
+permute_copy,upstream-profile-2,intent,0,generation,2,numerical_failure,,,,comparison,"generated/source floating result 0 differs: max_abs=0.9999989867210388, atol=0.0, rtol=0.0",,,,,
+fused_qr_solve,upstream-profile-4,intent,0,generation,2,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/fused_qr_solve/intent/repeat-0/generation-2/candidate.py:13:5: error: cannot broadcast dimensions N and M,,,,,
+sum,upstream-profile-8,intent,0,generation,1,pass,0.11038399860262871,0.010207999963313341,10.81347952579733,,,,,,,
+symmetric_mm_and_abs_sum,upstream-profile-6,intent,0,generation,1,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/symmetric_mm_and_abs_sum/intent/repeat-0/generation-1/candidate.py:15:16: error: only Intent intrinsics and @intent.fn values are callable in DSL code,,,,,
+sigmoid,upstream-profile-8,intent,0,generation,1,pass,0.007839999860152602,0.007840000092983246,0.9999999703022142,,,,,,,
+permute_copy,upstream-profile-2,intent,0,generation,3,compilation_failure,,,,frontend_kir,"/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/permute_copy/intent/repeat-0/generation-3/candidate.py:13:12: error: expected scalar/tensor value, got domain<3,1,10>",,,,,
+fused_layer_norm_relu_linear,upstream-profile-4,intent,0,generation,5,pass,0.2024959996342659,0.06684799864888191,3.029200630191983,,,,,,,
+symmetric_mm_and_abs_sum,upstream-profile-6,intent,0,generation,2,compilation_failure,,,,physical_program_verification,"Intent Triton compiler failed with exit code 4:
+loc(""<stdin>"":11:10): error: 'intent_gpu.load' op reduction source provenance is absent from load coordinates; reduction_range='!intent_gpu.fragment<index, [#intent_gpu.expr<0, 1, """", []>], [#intent_gpu.axis_map<2, 0, 1, 0, false>], 1, 1>', fragment_axis=0, matching_occurrences=2, coordinate='!intent_gpu.fragment<index, [#intent_gpu.expr<0, 1, """", []>], [#intent_gpu.axis_map<2, 0, 1, 0, false>], 1, 1>', coordinate='!intent_gpu.fragment<index, [#intent_gpu.expr<0, 1, """", []>], [#intent_gpu.axis_map<2, 1, 1, 0, false>], 1, 1>'
+loc(""<stdin>"":20:11): error: 'intent_gpu.reduce' op multi-axis reduction outer axis is neither load-rooted nor a replayable pure source; source type='!intent_gpu.fragment<f32, [#intent_gpu.expr<0, 1, """", []>, #intent_gpu.expr<0, 1, """", []>], [#intent_gpu.axis_map<1, 0, 1, 0, false>, #intent_gpu.axis_map<1, 0, 1, 1, false>], 1, 1>', producer=intent_gpu.binary
+loc(""<stdin>"":1:1): error: shared GPU transformation failed: normalize-structured-sources
+",,,,,
+fused_qr_solve,upstream-profile-4,intent,0,generation,3,compilation_failure,,,,physical_program_verification,"Intent Triton compiler failed with exit code 4:
+loc(""<stdin>"":16:11): error: 'intent_gpu.load' op access payload and coordinate extents disagree; payload_axis=1; payload_extent=#intent_gpu.expr<1, 0, ""FRAGMENT_D1"", []>; coordinate_extent=#intent_gpu.expr<0, 1, """", []>
+loc(""<stdin>"":1:1): error: shared GPU postcondition failed: form-pointwise-ownership
+",,,,,
+conv2d,upstream-profile-2,intent,0,generation,4,compilation_failure,,,,provider_program_verification,"Intent Triton compiler failed with exit code 6:
+loc(""<stdin>"":2:3): error: all Triton parameter candidates violate typed fragment legality
+",,,,,
+gelu,upstream-profile-8,intent,0,generation,1,pass,0.006800000090152025,0.0062160000670701265,1.0939510966506736,,,,,,,
+floor,upstream-profile-8,intent,0,generation,1,pass,0.006192000117152929,0.006240000016987324,0.9923077083808136,,,,,,,
+mul_sub,upstream-profile-8,intent,0,generation,1,pass,0.01208000024780631,0.018207999877631664,0.6634446577872875,,,,,,,
+min,upstream-profile-4,intent,0,generation,1,compilation_failure,,,,kernel_ir_parse,"Intent Triton compiler failed with exit code 2:
+loc(""<stdin>"":24:11): error: 'intent.make_tuple' op tuple component operand has the wrong type
+",,,,,
+permute_copy,upstream-profile-2,intent,0,generation,4,pass,0.016143999993801117,0.005904000019654632,2.7344173340205202,,,,,,,
+symmetric_mm_and_abs_sum,upstream-profile-6,intent,0,generation,3,compilation_failure,,,,physical_program_verification,"Intent Triton compiler failed with exit code 4:
+loc(""<stdin>"":5:10): error: 'intent_gpu.contract' op pointwise ownership found two non-equivalent contract extents
+loc(""<stdin>"":1:1): error: shared GPU transformation failed: form-pointwise-blocking
+",,,,,
+mul,upstream-profile-8,intent,0,generation,1,pass,0.006880000000819564,0.006144000217318535,1.1197916271920716,,,,,,,
+abs,upstream-profile-8,intent,0,generation,1,pass,0.006200000178068876,0.007791999960318208,0.795687911915195,,,,,,,
+leaky_relu,upstream-profile-8,intent,0,generation,1,pass,0.006880000000819564,0.007808000082150102,0.8811475318177773,,,,,,,
+min,upstream-profile-4,intent,0,generation,2,compilation_failure,,,,kernel_ir_parse,"Intent Triton compiler failed with exit code 2:
+loc(""<stdin>"":24:11): error: 'intent.make_tuple' op tuple component operand has the wrong type
+",,,,,
+softmax,upstream-profile-6,intent,0,generation,1,pass,0.007823999971151352,0.007808000082150102,1.0020491660902806,,,,,,,
+symmetric_mm_and_abs_sum,upstream-profile-6,intent,0,generation,4,compilation_failure,,,,physical_program_verification,"Intent Triton compiler failed with exit code 4:
+loc(""<stdin>"":6:10): error: 'intent_gpu.contract' op pointwise ownership found two non-equivalent contract extents
+loc(""<stdin>"":1:1): error: shared GPU transformation failed: form-pointwise-blocking
+",,,,,
+conv2d,upstream-profile-2,intent,0,generation,5,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/conv2d/intent/repeat-0/generation-5/candidate.py:22:21: error: cannot broadcast dimensions ?subregion_extent_1 and 14,,,,,
+fused_qr_solve,upstream-profile-4,intent,0,generation,4,compilation_failure,,,,physical_program_verification,"Intent Triton compiler failed with exit code 4:
+loc(""<stdin>"":2:3): error: dynamic pointwise blocking requires one explicit execution workset
+loc(""<stdin>"":1:1): error: shared GPU transformation failed: form-pointwise-ownership
+",,,,,
+log,upstream-profile-8,intent,0,generation,1,pass,0.006144000217318535,0.007967999903485179,0.7710843739633039,,,,,evaluation_error,True,
+std,upstream-profile-8,intent,0,generation,1,pass,0.19228800386190414,0.01252800039947033,15.348658822682818,,,,,,,
+symmetric_mm_and_abs_sum,upstream-profile-6,intent,0,generation,5,compilation_failure,,,,physical_program_verification,"Intent Triton compiler failed with exit code 4:
+loc(""<stdin>"":5:10): error: 'intent_gpu.contract' op cannot form a complete physical contraction: row and column ownership share one mapping coordinate that cannot be refined independently; lhs='!intent_gpu.fragment<f32, [#intent_gpu.expr<1, 0, ""FRAGMENT_D1"", []>, #intent_gpu.expr<0, 1, """", []>], [#intent_gpu.axis_map<1, 0, 1, 0, false>, #intent_gpu.axis_map<1, 1, 2, 1, false>], 1, 1>'; rhs='!intent_gpu.fragment<f32, [#intent_gpu.expr<0, 1, """", []>, #intent_gpu.expr<1, 0, ""FRAGMENT_D1"", []>], [#intent_gpu.axis_map<2, 0, 2, 0, false>, #intent_gpu.axis_map<2, 1, 1, 1, false>], 1, 1>'; result='!intent_gpu.fragment<f32, [#intent_gpu.expr<1, 0, ""FRAGMENT_D1"", []>, #intent_gpu.expr<1, 0, ""FRAGMENT_D1"", []>], [#intent_gpu.axis_map<1, 0, 1, 0, false>, #intent_gpu.axis_map<2, 1, 1, 1, false>], 1, 1>'; lhs_reduction=1; rhs_reduction=0; lhs_batch=; rhs_batch=; free_axes_need_realization=0; selected_free_axes=1
+loc(""<stdin>"":1:1): error: shared GPU transformation failed: realize-contractions
+",,,,,
+relu_conv2d,upstream-profile-3,intent,0,generation,1,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/relu_conv2d/intent/repeat-0/generation-1/candidate.py:29:43: error: mixed dtypes require an explicit I.cast,,,,,
+min,upstream-profile-4,intent,0,generation,3,compilation_failure,,,,kernel_ir_parse,"Intent Triton compiler failed with exit code 2:
+loc(""<stdin>"":44:11): error: 'intent.full' op full fill/result element schema is invalid
+",,,,,
+conv2d_add,upstream-profile-0,intent,0,generation,1,pass,1.702560007572174,0.036480000242590904,46.67105252878841,,,,,evaluation_error,True,
+ifftshift,upstream-profile-8,intent,0,generation,1,compilation_failure,,,,frontend_kir,"/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/ifftshift/intent/repeat-0/generation-1/candidate.py:11:15: error: expected scalar/tensor value, got domain<3,1,4>",,,,,
+relu_conv2d,upstream-profile-3,intent,0,generation,2,pass,1.902351975440979,0.03456000052392483,55.044905862314415,,,,,,,
+solve,upstream-profile-4,intent,0,generation,1,compilation_failure,,,,physical_program,"Intent Triton compiler failed with exit code 3:
+loc(""<stdin>"":68:7): error: 'intent.parallel' op has no scalar shared-GPU construction; tensor/structured families require physical co-realization
+Intent KIR-to-GPU construction failed
+",,,,,
+log,upstream-profile-8,intent,0,generation,2,evaluation_error,,,,candidate_precompile,Triton launch did not return a compiled kernel artifact,,,agent_program_error,,
+ifftshift,upstream-profile-8,intent,0,generation,2,pass,0.006440000142902136,0.008967999834567308,0.7181088605821607,,,,,,,
+min,upstream-profile-4,intent,0,generation,4,pass,0.007967999903485179,0.014560000039637089,0.5472527391341808,,,,,,,
+conv2d_add,upstream-profile-0,intent,0,generation,2,pass,1.7047359943389893,0.03653600066900253,46.659074970548225,,,,,,,
+solve,upstream-profile-4,intent,0,generation,2,compilation_failure,,,,physical_program_verification,"Intent Triton compiler failed with exit code 4:
+loc(""<stdin>"":40:17): error: 'intent_gpu.load' op full-coverage rewrite requires one exact physical access footprint
+loc(""<stdin>"":2:3): error: full-coverage decision could not preserve access validity
+loc(""<stdin>"":58:13): error: 'intent_gpu.make_range' op internal pointwise traversal has no exact full-coverage realization; source_id=7, fragment='!intent_gpu.fragment<index, [#intent_gpu.expr<1, 0, ""FULL_D1"", []>], [#intent_gpu.axis_map<7, 0, 1, 0, false>], 1, 1>'
+loc(""<stdin>"":1:1): error: shared GPU transformation failed: form-pointwise-blocking
+",,,,,
+fused_qr_solve,upstream-profile-4,intent,0,generation,5,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/fused_qr_solve/intent/repeat-0/generation-5/candidate.py:33:20: error: Out-only view cannot be read,,,,,
+log,upstream-profile-8,intent,0,generation,3,pass,0.005919999908655882,0.007952000014483929,0.7444667879619062,,,,,,,
+solve,upstream-profile-4,intent,0,generation,3,compilation_failure,,,,frontend_kir,/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/solve/intent/repeat-0/generation-3/candidate.py:30:23: error: Out-only view cannot be read,,,,,
+solve,upstream-profile-4,intent,0,generation,4,agent_program_error,,,,candidate_build,"expected an indented block after 'else' statement on line 146 (<intent.generated.triton._solve_system.0>, line 147)",,,,,
+solve,upstream-profile-4,intent,0,generation,5,pass,241.67466735839844,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+tanh,upstream-profile-8,triton,0,optimization,1,agent_program_error,,,,candidate_precompile,"at 5:13:
+def tanh_kernel(input_ptr, output_ptr, n_elements, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n_elements
+    values = tl.load(input_ptr + offsets, mask=mask)
+    result = tl.tanh(values)
+             ^
+AttributeError(""module 'triton.language' has no attribute 'tanh'"")",,,,,
+sqrt,upstream-profile-8,triton,0,optimization,1,pass,0.0059200001414865255,0.007920000003650784,0.7474747649946536,,,,,,,
+sqrt,upstream-profile-8,intent,0,optimization,1,pass,0.006136000156402588,0.007967999903485179,0.7700803502418117,,,,,,,
+tanh,upstream-profile-8,triton,0,optimization,2,pass,0.007967999903485179,0.007671999745070934,1.0385818780304858,,,,,,,
+rsqrt,upstream-profile-8,triton,0,optimization,1,pass,0.0060800001956522465,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+rsqrt,upstream-profile-8,intent,0,optimization,1,pass,0.0064479997381567955,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+grid_sample,upstream-profile-0,intent,0,optimization,1,evaluation_error,,,,candidate_precompile,Triton launch did not return a compiled kernel artifact,,,agent_program_error,,
+sqrt,upstream-profile-8,triton,0,optimization,2,pass,0.005936000030487776,0.007920000003650784,0.7494949529989308,,,,,,,
+tanh,upstream-profile-8,intent,0,optimization,1,pass,0.006160000106319785,0.006912000011652708,0.8912037175831667,,,,,,,
+rsqrt,upstream-profile-8,triton,0,optimization,2,pass,0.005535999778658152,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+sqrt,upstream-profile-8,intent,0,optimization,2,pass,0.0077599999494850636,0.007840000092983246,0.989795900185029,,,,,,,
+tanh,upstream-profile-8,triton,0,optimization,3,pass,0.006744000129401684,0.007840000092983246,0.8602040879358566,,,,,,,
+rsqrt,upstream-profile-8,intent,0,optimization,2,pass,0.006144000217318535,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+sqrt,upstream-profile-8,triton,0,optimization,3,pass,0.0059200001414865255,0.007239999948069453,0.8176795834183803,,,,,,,
+tanh,upstream-profile-8,intent,0,optimization,2,pass,0.007823999971151352,0.007840000092983246,0.9979591681578915,,,,,,,
+fused_index_select_eq,upstream-profile-1,intent,0,optimization,1,pass,0.0038880000356584787,0.0059200001414865255,0.6567567470838258,,,,,,,
+rsqrt,upstream-profile-8,triton,0,optimization,3,pass,0.005696000065654516,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+grid_sample,upstream-profile-0,intent,0,optimization,2,agent_program_error,,,,candidate_precompile,'CompiledArtifact' object has no attribute 'launch',,,,,
+tanh,upstream-profile-8,triton,0,optimization,4,pass,0.0059200001414865255,0.007167999865487218,0.8258928923799771,,,,,,,
+rsqrt,upstream-profile-8,intent,0,optimization,3,pass,0.007360000163316727,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+rsqrt,upstream-profile-8,triton,0,optimization,4,pass,0.005696000065654516,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+sqrt,upstream-profile-8,intent,0,optimization,3,pass,0.005904000019654632,0.007920000003650784,0.7454545475925679,,,,,,,
+sqrt,upstream-profile-8,triton,0,optimization,4,pass,0.0059200001414865255,0.007952000014483929,0.7444668172414136,,,,,,,

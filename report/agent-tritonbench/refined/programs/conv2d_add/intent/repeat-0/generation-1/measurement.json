@@ -1,0 +1,25 @@
+{
+  "status": "agent_program_error",
+  "candidate_ms": null,
+  "reference_ms": null,
+  "ratio": null,
+  "reference_timing_note": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0001,
+    "rtol": 1e-05
+  },
+  "failure_stage": "candidate_precompile",
+  "error": "Triton launch did not return a compiled kernel artifact",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/benchmark.py\", line 118, in run\n    candidate_call.call(function)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/tasks.py\", line 132, in call\n    return function(*self.args, **self.kwargs)\n  File \"/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/conv2d_add/intent/repeat-0/generation-1/candidate.py\", line 52, in wrapper\n    compiled(input, weight, other, result)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/runtime/artifact.py\", line 87, in __call__\n    self.backend_ir = self._backend_ir_collector(compiled_kernel)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/runtime/triton.py\", line 24, in _collect_triton_ir\n    raise RuntimeError(\"Triton launch did not return a compiled kernel artifact\")\nRuntimeError: Triton launch did not return a compiled kernel artifact\n",
+  "tuning": [
+    {
+      "kernel": "_intent_kernel",
+      "declared": 8,
+      "measured": 0,
+      "seconds": 0.0,
+      "winner": null
+    }
+  ],
+  "preparation_and_benchmark_seconds": 1.4304335149936378
+}

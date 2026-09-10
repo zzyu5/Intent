@@ -1,0 +1,25 @@
+{
+  "status": "compilation_failure",
+  "candidate_ms": null,
+  "reference_ms": null,
+  "ratio": null,
+  "reference_timing_note": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0001,
+    "rtol": 0.0001
+  },
+  "failure_stage": "physical_program",
+  "error": "Intent Triton compiler failed with exit code 3:\nloc(\"<stdin>\":68:7): error: 'intent.parallel' op has no scalar shared-GPU construction; tensor/structured families require physical co-realization\nIntent KIR-to-GPU construction failed\n",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/benchmark.py\", line 108, in run\n    function = module.build(context)\n  File \"/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/solve/intent/repeat-0/generation-1/candidate.py\", line 63, in build\n    gauss_jordan = context.compile(\"solve_gauss_jordan\", _gauss_jordan, constexprs={})\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/program.py\", line 35, in compile\n    program = intent.generate(definition, target=TritonTarget(), compiler=self.compiler,\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/compiler/pipeline.py\", line 43, in generate\n    return _generate_source(kernel_mlir, resolved, compiler, tuning_config)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/compiler/pipeline.py\", line 59, in _generate_source\n    source, realized_mlir, metadata = run_compiler(\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/compiler/toolchain.py\", line 64, in run_compiler\n    raise CompilationStageError(\nintent.compiler.toolchain.CompilationStageError: Intent Triton compiler failed with exit code 3:\nloc(\"<stdin>\":68:7): error: 'intent.parallel' op has no scalar shared-GPU construction; tensor/structured families require physical co-realization\nIntent KIR-to-GPU construction failed\n\n",
+  "tuning": [
+    {
+      "kernel": "_intent_kernel",
+      "declared": 8,
+      "measured": 0,
+      "seconds": 0.0,
+      "winner": null
+    }
+  ],
+  "preparation_and_benchmark_seconds": 0.17931626201607287
+}

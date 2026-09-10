@@ -1,0 +1,28 @@
+{
+  "status": "numerical_failure",
+  "candidate_ms": null,
+  "reference_ms": null,
+  "ratio": null,
+  "reference_timing_note": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0,
+    "rtol": 0.0
+  },
+  "precompile_seconds": 6.35213071689941,
+  "precompile_failures": [],
+  "preparation_policy": "compile_only_before_gpu_timing_lock",
+  "failure_stage": "comparison",
+  "error": "generated/source floating result 0 differs: max_abs=0.9999989867210388, atol=0.0, rtol=0.0",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/benchmark.py\", line 127, in run\n    measured, anchor = evaluate(PreparedComparison(candidate, source, tolerance(task, suite), cuda_graph=True),\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/v2/measurement.py\", line 303, in evaluate\n    validate_outputs()\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/v2/measurement.py\", line 296, in validate_outputs\n    compare_outputs(\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/v2/measurement.py\", line 188, in compare_outputs\n    _compare_float_chunk(\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/v2/measurement.py\", line 238, in _compare_float_chunk\n    raise NumericalComparisonError(\nrepro.v2.measurement.NumericalComparisonError: generated/source floating result 0 differs: max_abs=0.9999989867210388, atol=0.0, rtol=0.0\n",
+  "tuning": [
+    {
+      "kernel": "_intent_kernel",
+      "declared": 8,
+      "measured": 8,
+      "seconds": 0.1401960849761963,
+      "winner": "FRAGMENT_D1: 16, num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None"
+    }
+  ],
+  "preparation_and_benchmark_seconds": 7.4183625399600714
+}

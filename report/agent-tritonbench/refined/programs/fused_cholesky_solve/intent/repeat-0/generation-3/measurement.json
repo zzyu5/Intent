@@ -1,0 +1,39 @@
+{
+  "status": "agent_program_error",
+  "candidate_ms": null,
+  "reference_ms": null,
+  "ratio": null,
+  "reference_timing_note": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0001,
+    "rtol": 0.0001
+  },
+  "failure_stage": "candidate_precompile",
+  "error": "repro.agent_study.program.TuningBudget.compilation_only.<locals>.compile_kernel() got multiple values for keyword argument 'warmup'",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/benchmark.py\", line 118, in run\n    candidate_call.call(function)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/tasks.py\", line 132, in call\n    return function(*self.args, **self.kwargs)\n  File \"/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/fused_cholesky_solve/intent/repeat-0/generation-3/candidate.py\", line 63, in wrapper\n    factor_kernel.run(A, factor)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/runtime/artifact.py\", line 72, in run\n    return self._invoke(self._runner, arguments)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/runtime/artifact.py\", line 107, in _invoke\n    return function(*arguments)\n  File \"<intent.generated.triton.cholesky_factor.0>\", line 107, in run\n    launch(matrix, factor)\n  File \"<intent.generated.triton.cholesky_factor.0>\", line 104, in launch\n    return _intent_kernel[grid](matrix, factor, D1, S0_0, S0_1, S1_0, S1_1)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/jit.py\", line 370, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/program.py\", line 90, in compile_tuner\n    return tuner.warmup(*args, **kwargs)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/autotuner.py\", line 291, in warmup\n    ret.append(self.fn.warmup(\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/jit.py\", line 359, in warmup\n    return self.run(grid=grid, warmup=True, *map(MockTensor.wrap_dtype, args), **kwargs)\nTypeError: repro.agent_study.program.TuningBudget.compilation_only.<locals>.compile_kernel() got multiple values for keyword argument 'warmup'\n",
+  "tuning": [
+    {
+      "kernel": "_intent_kernel",
+      "declared": 8,
+      "measured": 0,
+      "seconds": 0.0,
+      "winner": null
+    },
+    {
+      "kernel": "_intent_kernel",
+      "declared": 8,
+      "measured": 0,
+      "seconds": 0.0,
+      "winner": null
+    },
+    {
+      "kernel": "_intent_kernel",
+      "declared": 8,
+      "measured": 0,
+      "seconds": 0.0,
+      "winner": null
+    }
+  ],
+  "preparation_and_benchmark_seconds": 0.21223495015874505
+}

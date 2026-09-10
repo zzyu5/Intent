@@ -1,0 +1,25 @@
+import intent
+import intent.language as I
+
+
+@intent.kernel
+def tensordot_kernel(
+    a: I.In[I.f16, ("M", "K0", "K1")],
+    b: I.In[I.f16, ("K0", "K1", "N")],
+    output: I.Out[I.f16, ("M", "N")],
+):
+    lhs = I.reshape(a, (a.shape[0], a.shape[1] * a.shape[2]))
+    rhs = I.reshape(b, (b.shape[0] * b.shape[1], b.shape[2]))
+    rows = I.domain(0, a.shape[0])
+    columns = I.domain(0, b.shape[2])
+    result = I.matmul(lhs, rhs, acc_dtype=I.f32)
+    output[rows, columns] = I.cast(result[rows, columns], I.f16)
+
+
+def build(context):
+    compiled = context.compile("tensordot", tensordot_kernel)
+
+    def wrapper(a, b, dims):
+        return compiled.run(a, b)
+
+    return wrapper

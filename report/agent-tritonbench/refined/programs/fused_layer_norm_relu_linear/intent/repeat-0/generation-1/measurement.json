@@ -1,0 +1,25 @@
+{
+  "status": "compilation_failure",
+  "candidate_ms": null,
+  "reference_ms": null,
+  "ratio": null,
+  "reference_timing_note": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0001,
+    "rtol": 1e-05
+  },
+  "failure_stage": "frontend_kir",
+  "error": "/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/fused_layer_norm_relu_linear/intent/repeat-0/generation-1/candidate.py:34:16: error: cannot broadcast dimensions N and M",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/frontend/lowering/ast/context.py\", line 482, in broadcast_result_type\n    shape = broadcast_shape(lhs_shape, rhs_shape)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/frontend/semantics/types.py\", line 420, in broadcast_shape\n    raise ValueError(f\"cannot broadcast dimensions {left} and {right}\")\nValueError: cannot broadcast dimensions N and M\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/compiler/pipeline.py\", line 48, in _inputs\n    kernel_mlir = lower_to_mlir(definition, constexprs=constexprs)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/frontend/compilation/compiler.py\", line 97, in lower_to_mlir\n    return FrontendCompiler(definition, dict(constexprs or {})).lower()\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/frontend/compilation/compiler.py\", line 56, in lower\n    lowerer.lower()\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/frontend/lowering/ast/context.py\", line 109, in lower\n    self.lower_statements(self.source.function.body)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/frontend/lowering/ast/context.py\", line 157, in lower_statements\n    lower_statement(self, statement)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/frontend/lowering/ast/statements.py\", line 39, in lower_statement\n    _lower_assign(lowerer, node)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/frontend/lowering/ast/statements.py\", line 100, in _lower_assign\n    expression = lowerer.lower_expression(node.value)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/frontend/lowering/ast/context.py\", line 164, in lower_expression\n    return lower_expression(self, node)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/frontend/lowering/ast/expressions.py\", line 91, in lower_expression\n    return _lower_binary(lowerer, node)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/frontend/lowering/ast/expressions.py\", line 209, in _lower_binary\n    result_type = lowerer.broadcast_result_type(lhs_value.type, rhs_value.type, node)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/frontend/lowering/ast/context.py\", line 484, in broadcast_result_type\n    self.error(node, str(error))\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/frontend/lowering/ast/context.py\", line 592, in error\n    raise FrontendError(message, self.location(node))\nintent.frontend.diagnostics.errors.FrontendError: /home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/fused_layer_norm_relu_linear/intent/repeat-0/generation-1/candidate.py:34:16: error: cannot broadcast dimensions N and M\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/benchmark.py\", line 108, in run\n    function = module.build(context)\n  File \"/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/fused_layer_norm_relu_linear/intent/repeat-0/generation-1/candidate.py\", line 42, in build\n    norm_compiled = context.compile(\"fused_layer_norm\", layer_norm)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/program.py\", line 30, in compile\n    program = intent.generate(definition, target=TritonTarget(), compiler=self.compiler,\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/compiler/pipeline.py\", line 42, in generate\n    kernel_mlir, resolved = _inputs(definition, target, constexprs)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/compiler/pipeline.py\", line 50, in _inputs\n    raise CompilationStageError(\"frontend_kir\", str(error)) from error\nintent.compiler.toolchain.CompilationStageError: /home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/fused_layer_norm_relu_linear/intent/repeat-0/generation-1/candidate.py:34:16: error: cannot broadcast dimensions N and M\n",
+  "tuning": [
+    {
+      "kernel": "_intent_kernel",
+      "declared": 9,
+      "measured": 0,
+      "seconds": 0.0,
+      "winner": null
+    }
+  ],
+  "preparation_and_benchmark_seconds": 0.2182918400503695
+}

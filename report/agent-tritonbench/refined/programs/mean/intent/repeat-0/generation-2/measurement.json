@@ -1,0 +1,22 @@
+{
+  "status": "pass",
+  "candidate_ms": 0.11036799848079681,
+  "reference_ms": 0.010207999963313341,
+  "ratio": 10.811912115737632,
+  "reference_timing_note": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0001,
+    "rtol": 1e-05
+  },
+  "tuning": [
+    {
+      "kernel": "_intent_kernel",
+      "declared": 15,
+      "measured": 15,
+      "seconds": 2.7189266681671143,
+      "winner": "REDUCE_CHUNK_1_A0: 8192, num_warps: 16, num_ctas: 1, num_stages: 2, maxnreg: None"
+    }
+  ],
+  "preparation_and_benchmark_seconds": 3.2770452999975532
+}
