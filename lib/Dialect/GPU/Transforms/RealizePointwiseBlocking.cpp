@@ -3234,12 +3234,21 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     if (existingRanges.empty()) {
       if (supportsCartesianPointwiseValueGraph(pointwiseCoordinates))
         lifted.append(pointwiseCoordinates.begin(), pointwiseCoordinates.end());
-      else
-        for (WorksetCoordinateOp coordinate : llvm::reverse(pointwiseCoordinates))
-          if (supportsCartesianPointwiseValueGraph({coordinate}, true)) {
-            lifted.push_back(coordinate);
-            break;
-          }
+      else {
+        if (pointwiseCoordinates.size() >= 2) {
+          SmallVector<WorksetCoordinateOp> candidates{
+              pointwiseCoordinates[pointwiseCoordinates.size() - 2],
+              pointwiseCoordinates.back()};
+          if (supportsCartesianPointwiseValueGraph(candidates, true))
+            lifted = std::move(candidates);
+        }
+        if (lifted.empty())
+          for (WorksetCoordinateOp coordinate : llvm::reverse(pointwiseCoordinates))
+            if (supportsCartesianPointwiseValueGraph({coordinate}, true)) {
+              lifted.push_back(coordinate);
+              break;
+            }
+      }
     } else {
       SmallVector<std::pair<int64_t, WorksetCoordinateOp>> uncovered;
       for (WorksetCoordinateOp coordinate : pointwiseCoordinates) {
