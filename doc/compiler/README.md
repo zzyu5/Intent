@@ -61,7 +61,7 @@ Intent KIR
 
 Triton、cuTile、TileLang是source providers；NVIDIA/AMD及SM/gfx版本是hardware targets。两者是正交维度。
 
-CPU 同样区分 Mojo/Weft provider 与 x86/RISC-V hardware。具体向量宽度、AMX/IME 等矩阵能力参与合法化，不成为作者引擎分工；共同 CPU 程序与下层机器表示的边界见 CPU 规格。
+CPU 同样区分 Mojo/Weft provider 与 x86/RISC-V hardware。共同 CPU IR 保留 task/block 与 structured compute；target lowering 可查询实现需求、选择并实例化专家编写的微程序，而非仅做 API 映射或调用整算子库旁路。具体向量宽度、AMX/IME 等能力参与实现合法性，职责与参数边界由 [CPU 规格](cpu-program-ir.md)统一定义。
 
 Provider surface若只是API spelling不同，直接从共同GPU IR确定性序列化。只有共同IR无法无损表达、且需要多个passes或独立legality的真实target-local structure，才增加extension operations。Extension扩展同一当前program，不复制一份完整leaf program。
 
@@ -80,4 +80,4 @@ KIR origin只用于语义保持验证、诊断和追踪。Physical program本身
 - [`passes-and-analyses.md`](passes-and-analyses.md)：analysis、transformation、verification与semantic-preservation；
 - [`physical-parameters.md`](physical-parameters.md)：compile-time physical parameters、candidate legality与下层tuning；
 - [`target-lowering.md`](target-lowering.md)：provider extensions、architecture features、serialization与外部compiler边界。
-- [`cpu-program-ir.md`](cpu-program-ir.md)：共同 CPU executable program、scalar/vector/matrix 表示、typed analyses/passes 与 Mojo/Weft provider 边界。
+- [`cpu-program-ir.md`](cpu-program-ir.md)：CPU task/block 编程模型、共同 passes、可编程目标实现与 Mojo/Weft compiler 边界。
