@@ -105,7 +105,8 @@ def trial(arguments, row, repeat, arm, records, runtime) -> None:
             prefix += "The existing files are your actual seed; optimize its full operator time. "
             prefix += "Measured seed: " + json.dumps({key: seed_result[key] for key in ("candidate_ms", "reference_ms", "ratio")})
         submissions = [item for item in previous if item["status"] != "agent_environment_failure"]
-        history = [{"candidate": item["candidate"], "feedback": {key: item[key] for key in ("status", "candidate_ms", "reference_ms", "ratio")},
+        feedback_keys = {"status", "candidate_ms", "reference_ms", "ratio", "failure_stage", "error", "reference_timing_note", "tuning"}
+        history = [{"candidate": item["candidate"], "feedback": {key: value for key, value in item.items() if key in feedback_keys},
                     "programs": {path.name: path.read_text() for path in (arguments.project / item["program"]).parent.glob("*.py")}}
                    for item in submissions]
         if submissions:
