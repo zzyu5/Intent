@@ -44,8 +44,8 @@ FailureOr<llvm::json::Object> readProfiles(Location loc, llvm::StringRef path) {
         return failure();
       }
       auto row = candidate->getArray("shared");
-      if (!row || row->size() != 4) {
-        emitError(loc, "CPU shared binding requires task grain and M/N/K outer blocks");
+      if (!row || row->size() != 5) {
+        emitError(loc, "CPU shared binding requires task grain, M/N/K outer blocks and region size");
         return failure();
       }
       for (const llvm::json::Value &column : *row) {
@@ -92,8 +92,9 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
   auto rows = profiles->getArray(family);
   if (!rows || rows->empty()) return module.emitError("CPU candidate family is empty or missing");
   SmallVector<Configuration> configurations;
-  bool hasContraction = false;
+  bool hasContraction = false, hasRegion = false;
   original.walk([&](linalg::GenericOp operation) { hasContraction |= isMatrixContraction(operation); });
+  original.walk([&](Operation *op) { hasRegion |= isa<RegionFoldOp, RegionScanOp>(op); });
   for (const llvm::json::Value &value : *rows) {
     auto candidate = value.getAsObject();
     auto row = candidate->getArray("shared");
@@ -102,9 +103,11 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
     for (auto &parameter : *candidate->getObject("local"))
       local.push_back(builder.getNamedAttr(parameter.first, builder.getI64IntegerAttr(*parameter.second.getAsInteger())));
     Configuration config{*(*row)[0].getAsInteger(), *(*row)[1].getAsInteger(),
-        *(*row)[2].getAsInteger(), *(*row)[3].getAsInteger(), builder.getDictionaryAttr(local)};
+        *(*row)[2].getAsInteger(), *(*row)[3].getAsInteger(), *(*row)[4].getAsInteger(), builder.getDictionaryAttr(local)};
     if (!hasContraction && (config.tileM != 1 || config.tileN != 1 || config.tileK != 1))
       return original.emitError("M/N/K block parameters require a matrix contraction consumer; otherwise they must be 1");
+    if (!hasRegion && config.regionSize != 1)
+      return original.emitError("region size requires a region consumer; otherwise it must be 1");
     if (implementations.legal(*module.getOps<func::FuncOp>().begin(), capabilities, config))
       configurations.push_back(config);
   }
@@ -118,7 +121,7 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
     module.push_back(function);
     Builder b(module.getContext());
     function->setAttr("intent_cpu.configuration", ConfigurationAttr::get(module.getContext(),
-        config.taskGrain, config.tileM, config.tileN, config.tileK));
+        config.taskGrain, config.tileM, config.tileN, config.tileK, config.regionSize));
     if (failed(implementations.bind(function, capabilities, config))) return failure();
     SmallVector<Attribute> bindings;
     function.walk([&](Operation *operation) {
@@ -139,8 +142,9 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
   for (auto function : functions) {
     auto binding = function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration");
     Configuration config{binding.getTaskGrain(), binding.getTileM(), binding.getTileN(),
-        binding.getTileK(), {}};
-    if (failed(blockContractions(function, config, implementations)) || failed(verifyCPUProgram(module, false)) ||
+        binding.getTileK(), binding.getRegionSize(), {}};
+    if (failed(realizeRegions(function, config.regionSize)) ||
+        failed(blockContractions(function, config, implementations)) || failed(verifyCPUProgram(module, false)) ||
         failed(partitionTasks(function, config.taskGrain))) return failure();
   }
   if (failed(normalize(module))) return failure();

@@ -4,6 +4,7 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/Dominance.h"
 
 using namespace mlir;
 
@@ -28,6 +29,7 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
       "intent_cpu.configuration");
   Value lhs = operation.getInputs()[0], rhs = operation.getInputs()[1];
   Value output = operation.getOutputs()[0];
+  DominanceInfo dominance(operation->getParentOfType<func::FuncOp>());
   linalg::FillOp initialization;
   for (Operation *user : output.getUsers()) {
     if (auto fill = dyn_cast<linalg::FillOp>(user)) {
@@ -36,7 +38,8 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
         return operation.emitError("CPU contraction requires one dominating initialization");
       initialization = fill;
     } else if (user != operation && !isa<memref::DeallocOp, memref::DimOp>(user)) {
-      return operation.emitError("CPU contraction output has an intervening or escaping use");
+      if (!dominance.properlyDominates(operation.getOperation(), user))
+        return operation.emitError("CPU contraction output has an intervening or escaping use");
     }
   }
   if (!initialization)
@@ -54,13 +57,10 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
   Value bk = index(b, loc, config.tileK);
   Value mTasks = b.create<arith::CeilDivSIOp>(loc, mSize, bm);
   Value nTasks = b.create<arith::CeilDivSIOp>(loc, nSize, bn);
-  auto parallel = b.create<scf::ParallelOp>(loc, ValueRange{zero, zero},
-      ValueRange{mTasks, nTasks}, ValueRange{one, one});
-  {
-    OpBuilder::InsertionGuard guard(b);
-    b.setInsertionPointToStart(parallel.getBody());
-    Value mBegin = multiply(b, loc, parallel.getInductionVars()[0], bm);
-    Value nBegin = multiply(b, loc, parallel.getInductionVars()[1], bn);
+  LogicalResult status = success();
+  auto tile = [&](Value m, Value n) {
+    Value mBegin = multiply(b, loc, m, bm);
+    Value nBegin = multiply(b, loc, n, bn);
     Value mCount = b.create<arith::MinSIOp>(loc, b.create<arith::SubIOp>(loc, mSize, mBegin), bm);
     Value nCount = b.create<arith::MinSIOp>(loc, b.create<arith::SubIOp>(loc, nSize, nBegin), bn);
     Value outputTile = subview(b, loc, output, {mBegin, nBegin}, {mCount, nCount});
@@ -71,7 +71,6 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
       b.setInsertionPointToStart(initializeEmpty.thenBlock());
       b.create<linalg::FillOp>(loc, ValueRange{initial}, ValueRange{outputTile});
     }
-    LogicalResult status = success();
     auto kBlock = [&](Value kBegin, bool first) {
       Value depth = b.create<arith::MinSIOp>(loc,
           b.create<arith::SubIOp>(loc, kSize, kBegin), bk);
@@ -82,8 +81,19 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
     Value firstEnd = b.create<arith::MinSIOp>(loc, kSize, bk);
     loop(b, loc, zero, firstEnd, config.tileK, [&](Value k) { kBlock(k, true); });
     loop(b, loc, firstEnd, kSize, config.tileK, [&](Value k) { kBlock(k, false); });
-    if (failed(status)) return failure();
+  };
+  if (operation->getParentOfType<scf::ForOp>() || operation->getParentOfType<scf::ParallelOp>()) {
+    loop(b, loc, zero, mTasks, 1, [&](Value m) {
+      loop(b, loc, zero, nTasks, 1, [&](Value n) { tile(m, n); });
+    });
+  } else {
+    auto parallel = b.create<scf::ParallelOp>(loc, ValueRange{zero, zero},
+        ValueRange{mTasks, nTasks}, ValueRange{one, one});
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(parallel.getBody());
+    tile(parallel.getInductionVars()[0], parallel.getInductionVars()[1]);
   }
+  if (failed(status)) return failure();
   initialization.erase();
   operation.erase();
   return success();

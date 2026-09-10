@@ -4,6 +4,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   FuseIntermediateBuffers.cpp
   FuseReductionTraversals.cpp
   BlockContractions.cpp
+  RealizeRegions.cpp
   VectorizeLoops.cpp
   PartitionTasks.cpp
   Implementation.cpp

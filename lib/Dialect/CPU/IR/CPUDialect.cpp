@@ -71,8 +71,8 @@ LogicalResult CapabilitiesAttr::verify(
 
 LogicalResult ConfigurationAttr::verify(
     llvm::function_ref<InFlightDiagnostic()> error,
-    int64_t grain, int64_t m, int64_t n, int64_t k) {
-  if (grain <= 0 || m <= 0 || n <= 0 || k <= 0)
+    int64_t grain, int64_t m, int64_t n, int64_t k, int64_t regionSize) {
+  if (grain <= 0 || m <= 0 || n <= 0 || k <= 0 || regionSize <= 0)
     return error() << "CPU task/cache blocking requires positive extents";
   return success();
 }

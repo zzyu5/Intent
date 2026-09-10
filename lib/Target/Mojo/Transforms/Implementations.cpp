@@ -119,8 +119,10 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
 cpu::ImplementationRegistry implementations() {
   ImplementationRegistry result;
   result.profile = [](func::FuncOp function) -> StringRef {
-    bool contraction = false;
+    bool contraction = false, region = false;
     function.walk([&](linalg::GenericOp op) { contraction |= isMatrixContraction(op); });
+    function.walk([&](Operation *op) { region |= isa<cpu::RegionFoldOp, cpu::RegionScanOp>(op); });
+    if (region) return contraction ? "mojo.region_contract_f32" : "mojo.region_vector_f32";
     return contraction ? "mojo.register_f32" : "mojo.vector_f32";
   };
   result.add({"mojo.register_f32", [](Operation *op) {

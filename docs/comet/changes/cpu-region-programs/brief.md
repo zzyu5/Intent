@@ -76,11 +76,11 @@
 - 采用单个普通 Native change。区域 carrier、关联分块、规则适配和 implementation 需求都会修改同一当前程序的接口及依赖，拆成独立交付的集成成本较高；不创建 Supervisor 或额外子 worktree。
 - 当前 CPU 仅有受限 reduce 和普通 f32 contraction，RegionFold/RegionScan 与 predicated source load 没有正式 lowering；`formTile` 已有真实展开，`legal` 已有尺寸约束，但不等于完整供应/资源协调。GPU 区域推导仍依赖 GPU 类型；部分位于 CPU 目录的变换实际只被 Mojo 调用。这些是起点，不是允许保留的最终缺口。
 - 参考依据：TileLang `tilelang/tileop/gemm/__init__.py:121–139` 分开 infer_layout/lower，`src/transform/lower_tile_op.cc:1134–1151` 实际连接 layout、buffer、workspace 与 alignment；Triton `python/tutorials/06-fused-attention.py:55–110` 由作者显式组织 causal stages。本轮复用的是约束与程序连接方法，不宣称下层能自动推导 Intent 的区域语义。
-- 用户已授权创建并推进；本次把具体支持范围、四项结果型验收和性能交付写成完整 Shape。依 Comet Native 要求，最终确认后进入 Build。
+- 用户已明确确认完整 change 与 Build 范围，授权按本 Shape 和 A1–A4 持续实现；普通实现选择由执行者依据 doc/ 与 ref 决定，不再就已确认范围重复询问。
 
 # 待解决问题
 
-- [blocking] CONFIRM: 确认本轮按以上范围补 CPU f32 区域 fold/scan 与 typed state，实际复用 GPU/CPU 的语义规则及条件，补有消费者的实现需求与外围复用，贯通 Mojo/Weft native 和少量同算法性能结果；不扩 DSA、全 dtype/微核库、论文图稿或 TritonBench 实验。
+- [blocking] Weft 外部实现授权待确认：当前 TianchenRV 的 `include/Weft/Dialect/Kernel/IR/KernelOps.td:195–365` 没有逐元素 select；`lib/Dialect/Kernel/IR/KernelDialect.cpp:1309–1324` 的 max/min 也未区分 Intent 的 propagating maximum 与 maximumNumber。带 predicate 的区域计算需要精确保留选择和数值语义，不能用浮点乘加替代 select。已请求仅补这组必要基础操作及 lowering、避开其它并发改动并独立提交的授权；取得授权前不写外部仓库，A1/A4 的 Weft 路径保持待实现，完整 A1–A4 不提前验收。
 
 # 验证预期
 

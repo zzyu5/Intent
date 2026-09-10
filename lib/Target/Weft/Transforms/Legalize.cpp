@@ -771,7 +771,7 @@ FailureOr<OwningOpRef<ModuleOp>> legalizeProgram(ModuleOp cpuProgram, std::strin
       implementations.push_back(llvm::json::Object{{"name", binding.getName().getValue().str()}, {"parameters", std::move(values)}});
     }
     candidates.push_back(llvm::json::Object{{"entry", function.getName().str()},
-        {"values", llvm::json::Array{config.getTaskGrain(), config.getTileM(), config.getTileN(), config.getTileK()}},
+        {"values", llvm::json::Array{config.getTaskGrain(), config.getTileM(), config.getTileN(), config.getTileK(), config.getRegionSize()}},
         {"implementations", std::move(implementations)}});
     cpu::PhysicalProgramAnalysis analysis(function);
     llvm::DenseMap<Value, intent::QuantFormat> formats;

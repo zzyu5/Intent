@@ -1,28 +1,61 @@
 schema: comet.native.v4
 name: cpu-region-programs
 language: zh-CN
-phase: shape
+phase: build
 status: active
-state_version: 1
+state_version: 2
 brief: brief.md
-spec_changes: []
+spec_changes:
+  - capability: cpu-region-programs
+    operation: create
+    source: specs/cpu-region-programs/spec.md
 workspace:
   isolation: worktree
   change_branch: comet/cpu-region-programs
   target_branch: main
   finish: null
 loop:
-  stage: shape
+  stage: building
   goal_cycle: 1
-  iteration: 0
+  iteration: 1
   attempt: 0
   retry_epoch: 0
   failed_iteration_count: 0
   no_progress_count: 0
   execution_failure_count: 0
   previous_unresolved_ids: []
-  next_action: confirm-shape
-acceptance: []
+  next_action: submit-builder-candidate
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1：真实作者区域程序沿 canonical KIR→CPU→Mojo/Weft 形成可执行程序，支持 region fold 的 typed
+      summary/identity/combine 以及 region scan 的 transition、initial
+      state、apply/emit、final state；区域坐标、captures、相连 MatMul/统计、访问、尾部和任务完成语义不丢失，不由
+      serializer/runtime 补算法。
+    result: pending
+    reason: null
+  - id: A2
+    source: brief.md
+    text: A2：GPU 与 CPU 在各自当前执行范围上实际调用同一组区域/identity/状态分析规则，证明成立时产生有效遍历、谓词或 carry
+      的实际简化；不成立时保留原语义。浮点零值传播不会在缺乏证明时抹去 NaN/Inf 或 signed-zero 行为，不能以复制 GPU pass
+      或关闭整个优化冒充复用。
+    result: pending
+    reason: null
+  - id: A3
+    source: brief.md
+    text: A3：相连计算的分块、访问、状态与所选 implementation 需求使用同一候选 binding；外围供应、共享准备、资源 owner 与
+      lifetime 在 current program 中形成，并被实际 Mojo/Weft 消费。实现内部的微块与 packing
+      保持可编程，既有局部实现继续复用，无 kernel-name/source-template 选择器或两套并行执行路径。
+    result: pending
+    reason: null
+  - id: A4
+    source: brief.md
+    text: A4：通过现有生产 benchmark 入口获得代表性 CPU region-fold 与 region-scan 程序的真实
+      generated/source ms、G/S 和同次既定容差结果；Mojo/Weft 的 native
+      调用均有实际区域程序运行证据。相同案例使用同算法、shape、dtype、资源预算及完整调用范围，数据进入项目 CSV；受影响 GPU 和既有
+      CPU 项只复用必要性能运行，未受影响结果保留，不以生成成功代替执行或性能结果。
+    result: pending
+    reason: null
 builder_handoff: null
 blockers: []
 verification: null

@@ -1,4 +1,5 @@
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/IR/RegionProgram.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -92,6 +93,13 @@ SmallVector<MemoryAccess> PhysicalProgramAnalysis::accesses(Operation *scope) {
         add(output.get(), generic.payloadUsesValueFromOperand(&output), true);
     } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
       for (Value input : reduce.getInputs()) add(input, true, false);
+    } else if (isa<RegionFoldOp, RegionScanOp>(operation)) {
+      RegionProgram program(operation);
+      for (Value input : program.sources()) add(input, true, false);
+      for (Value input : program.identities()) add(input, true, false);
+      for (Value input : program.initialState()) add(input, true, false);
+      for (Value input : program.captures()) add(input, true, false);
+      for (Value output : program.outputs()) add(output, false, true);
     } else if (auto quantize = dyn_cast<QuantizeOp>(operation)) {
       add(quantize.getInput(), true, false);
       add(quantize.getOutput(), false, true);
@@ -115,7 +123,7 @@ SmallVector<AllocationFacts> PhysicalProgramAnalysis::allocations() {
     Value value = operation->getResult(0);
     auto type = cast<MemRefType>(value.getType());
     std::optional<int64_t> bytes;
-    int64_t elementBytes = (type.getElementTypeBitWidth() + 7) / 8;
+    int64_t elementBytes = type.getElementType().isIndex() ? 8 : (type.getElementTypeBitWidth() + 7) / 8;
     if (type.hasStaticShape() && type.getNumElements() <= std::numeric_limits<int64_t>::max() / elementBytes)
       bytes = type.getNumElements() * elementBytes;
     Operation *writer = nullptr;
@@ -186,7 +194,7 @@ LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
     }
   }
   function.walk([&](Operation *operation) {
-    if (realized && (isa<ReduceOp, QuantizeOp, QuantizedDotOp>(operation) || operation->getName().getDialectNamespace() == "linalg")) {
+    if (realized && (isa<RegionFoldOp, RegionScanOp, ReduceOp, QuantizeOp, QuantizedDotOp>(operation) || operation->getName().getDialectNamespace() == "linalg")) {
       operation->emitError("CPU structured operation has not been materialized for the provider");
       invalid = true;
     }

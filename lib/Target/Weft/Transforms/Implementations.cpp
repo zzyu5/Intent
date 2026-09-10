@@ -50,9 +50,11 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
 cpu::ImplementationRegistry implementations() {
   ImplementationRegistry result;
   result.profile = [](func::FuncOp function) -> StringRef {
-    bool quantize = false, contraction = false;
+    bool quantize = false, contraction = false, region = false;
     function.walk([&](cpu::QuantizeOp) { quantize = true; });
     function.walk([&](linalg::GenericOp op) { contraction |= isMatrixContraction(op); });
+    function.walk([&](Operation *op) { region |= isa<cpu::RegionFoldOp, cpu::RegionScanOp>(op); });
+    if (region) return contraction ? "weft.region_contract_f32" : "weft.region_structured";
     return quantize ? "weft.q8_k" : contraction ? "weft.contract_f32" : "weft.structured";
   };
   auto noParameters = [](Builder &b, const Configuration &) { return b.getDictionaryAttr({}); };

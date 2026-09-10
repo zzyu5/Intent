@@ -16,6 +16,7 @@ struct Configuration {
   int64_t tileM;
   int64_t tileN;
   int64_t tileK;
+  int64_t regionSize;
   mlir::DictionaryAttr local;
 
   int64_t parameter(llvm::StringRef name) const {
@@ -35,6 +36,7 @@ mlir::LogicalResult vectorizeLoops(mlir::func::FuncOp function, int64_t width,
                                    int64_t replicas, int64_t reductionReplicas);
 mlir::LogicalResult partitionTasks(mlir::func::FuncOp function, int64_t grain);
 mlir::LogicalResult isolateTasks(mlir::func::FuncOp function);
+mlir::LogicalResult realizeRegions(mlir::func::FuncOp function, int64_t segmentSize);
 mlir::LogicalResult materializeTaskLoops(mlir::func::FuncOp function);
 mlir::LogicalResult runCPUPasses(mlir::ModuleOp module, int64_t vectorBits,
                                int64_t workers, llvm::StringRef defaults,
