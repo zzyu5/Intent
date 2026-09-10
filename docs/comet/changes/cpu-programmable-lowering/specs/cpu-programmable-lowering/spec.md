@@ -4,7 +4,7 @@
 
 本能力实现 `doc/compiler/cpu-program-ir.md` 定义的 structured CPU program 与可编程目标 realization。CPU 仍从 canonical KIR 独立构造，形成非 SIMT 的 task/block 程序；不改为整算子库选择器，不复制 GPU execution topology，也不另起 planning IR。
 
-Q1 已确认采用预量化 Q4_K×Q8_K 局部点积并仅生成 Canonical Weft IR。本 Spec 固定完整目标，等待最终 Shape 确认；本次 Q1 确认不授权进入 Build，也不代表现有语言已支持这些格式。确认后先将 §5 的最小语言扩展写入 `doc/dsl/`，其它设计继续按现有 `doc/` 实现。
+用户最新授权将本轮扩为调用内 Q8_K 量化准备、Q4_K×Q8_K 点积组合与 Weft runtime 接入。原 generation-only 裁剪已被替代；完整范围见 §5–7，等待最终 Shape 确认。确认后先将最小语言扩展写入 `doc/dsl/`，其它设计继续按现有 `doc/` 实现。
 
 ## 2. 共同程序与分层
 
@@ -28,13 +28,13 @@ Q1 已确认采用预量化 Q4_K×Q8_K 局部点积并仅生成 Canonical Weft I
 
 Mojo：现有 f32 register contraction/vector 程序作为明确的实现迁入新机制，保留 native ABI、FP environment、任务 join、数值义务与已有可达算法；具体 vector/unroll/prefetch 策略及参数由实际实现消费，不成为整个 CPU family 的固定定义。
 
-Weft：消费 structured CPU task，而非先经过 Mojo 的 SIMD materialization。简单操作可直接生成 Canonical Weft IR；专业实现通过结构化 adapter 绑定宿主 views/scalars、axes/symbols、domain、输出和资源，不能直接拼接 standalone kernel body。
+Weft：消费 structured CPU task，而非先经过 Mojo 的 SIMD materialization。简单操作可直接生成 Canonical Weft IR；专业实现通过结构化 adapter 绑定宿主 views/scalars、axes/symbols、domain、输出和资源，不能直接拼接 standalone kernel body。Canonical IR 继续经过外部 Weft physical compiler、system compiler 和 §7 的 native artifact/runtime；不在 Intent 重写 RVV/IME leaf selector。
 
 Weft 现有 helper/front-end 及 Canonical dialect 可复用；Intent 不复制整个 Weft parser/语言或 RVV/IME 指令选择器。外部 repository 默认只读，需要修改其接口时另行取得明确授权。
 
-## 5. 首个专业计算块：Q4_K×Q8_K 局部点积
+## 5. 专业计算组合：Q8_K 量化准备与 Q4_K×Q8_K 点积
 
-用户已确认采用预量化 Q4_K weights 与 Q8_K activation 的局部点积。边界只承接已有量化输入的计算并生成 Canonical Weft IR，不包含 f32 activation 的量化准备、跨调用 weight interleave、persistent repack 或设备运行。
+保留预量化 Q4_K weights 与 Q8_K activation 的局部点积，并增加 f32 activation→Q8_K 的调用内准备。量化与点积各自拥有完整数值合同，可由专业微程序实现，结果在同一 CPU invocation 内形成真实 producer/consumer 和复用关系。跨调用 weight quantization、interleave/persistent repack 不在本轮范围。
 
 ### 5.1 最小作者入口与 canonical relation
 
@@ -102,32 +102,77 @@ result = f32 add-reduction of v_b in increasing record order
 
 ### 5.4 CPU carrier、实现及程序集成
 
-CPU construction/typed ABI 必须真实保存 u8 carrier、f32 result、record extent identity、原访问/快照/effects 与 format relation；拆除共享层对所有输入均为 f32 的无条件假设，不因此宣称其它 dtype/operations 全部支持。CPU structured operation 保存完整计算，不提前展开 nibble/decode 或强制走 f32 matrix matcher。
+CPU construction/typed ABI 必须真实保存 f32 量化输入、u8 carrier、f32 点积结果、record extent identity、原访问/快照/effects 与 format relation；拆除共享层对所有输入均为 f32 的无条件假设，不因此宣称其它 dtype/operations 全部支持。CPU structured operations 保存完整计算，不提前展开 nibble/decode 或强制走 f32 matrix matcher。
 
 专业实现通过 §3 的同一查询/绑定/展开接口接收该 operation。首个 Weft realization 可用结构化 IRBuilder 编写，产生真实 Encoding declarations、字段读取、integer dot/reduce、转换、校正、循环/carry 与结果 SSA；不要求外部仓库新增通用 callable-module importer，也不能只把原 f32 builder 改名。若使用目标 source helper，则必须经其 frontend 形成 IR，再显式绑定进入宿主，不做字符串替换。
 
 Adapter 将已知 byte-carrier relation 映射到相应 encoded views/values，明确区分 record axis、256-element logical axis 和 byte axis，保持外部 bytes，不隐含 copy/repack。Canonical Weft 输出中的捕获、shape/axis symbols、domain 父子关系、返回值的宿主 consumer、store、alias/effects 和资源 lifetime 必须完整；共享宿主唯一 root/终止结构，不能直接拼接 standalone kernel body。合法空域不产生 encoded-record 读取。
 
-首个基于现行 Weft formats 的 realization 消费可追溯到连续外部 records 的读取，要求 record 起址分别满足 2-byte/4-byte alignment；任意计算产生的 u8 tensor 不在首个 realization 的覆盖范围。连续性和对齐是实现/生成 artifact 的显式 ABI 适用条件，不从普通 u8 dtype 假定。输入 pointer/offset/stride 与 provider View 的映射和这些条件随生成物保留，generation-only 不声称已经对实际调用 buffers 验证。未满足条件或 target 无对应实现时明确诊断，不静默换格式或 host 算法。外部 Weft 规范示例的 alignment=1 不作为当前 helper 的 2/4-byte pin 合同证据。
+首个基于现行 Weft formats 的 realization 同时消费连续外部 records 和本次 invocation 内量化 producer 生成的 records。Q4_K/Q8_K record 起址分别满足 2-byte/4-byte alignment，输入 pointer/offset/stride 与 provider View 的映射必须完整。外部 view 的适用条件由 native admission 兑现；内部物化的大小、对齐和 lifetime 由 compiler 显式形成，不能仅因 dtype 是 u8 就假定条件成立。其它没有对应 realization 的 carrier producers 明确诊断，不静默换格式或 host 算法。外部 Weft 规范示例的 alignment=1 不作为当前 helper 的 2/4-byte pin 合同证据。
 
-完整路径为真实 Intent 作者 kernel→canonical KIR→structured CPU→implementation expansion→Canonical Weft IR；通过已有 `intent.generate(..., target=WeftTarget(...))` 交付。示例只是该通用 lowering 的一个 consumer，不根据示例名称选择程序。不新增设备 runtime、虚假的可运行 registry 条目或第二套生成入口；Mojo/GPU 对这项新格式尚无实现时明确拒绝，不影响其已有合法能力。
+完整路径为真实 Intent 作者 kernel→canonical KIR→structured CPU→implementation expansion→Canonical Weft IR→Weft compiler→native artifact。`intent.generate` 保留生成能力，native materialization/load/run 消费同一编译结果，不从 runtime 重建量化或点积程序。示例只是通用 lowering 的 consumer，不根据示例名称选择程序；Mojo/GPU 对这项新格式尚无实现时明确拒绝，不影响其已有合法能力。
 
-### 5.5 本轮支持边界
+### 5.5 调用内 Q8_K 量化操作
 
-只补上述局部点积与最小专业实现机制，不扩成完整量化 GEMM/GEMV、activation quantization、跨调用 Q4K_I interleave、设备 RVV/IME 执行或所有 layout/tail 组合。外部 TianchenRV 保持只读。最终 Shape 确认前不修改 DSL 数值规格、不新增算子实现、不执行生成。
+新增闭合入口 `I.quantize(values, format=I.quant.q8_k)`：输入 f32 tensor `[G,256]`，输出 u8 tensor `[G,292]`，保存同一 record axis identity；没有外部写入、隐藏 launch 或 caller-visible workspace。外部存储通过普通 view store 表达。该入口归一到独立 canonical quantize operation，使用明确 format/numerics，而非识别任意 min/max/cast 树；本轮不宣称其它 formats 已有量化实现。
+
+每个 256-element block 独立计算，采用现行 Weft Q8_K helper 的数值方案：
+
+1. 取得 block 的最大值 `maximum` 与最小值 `minimum`，选择绝对值较大的 signed extreme；绝对值相等时选 `minimum`。
+2. 全零 block 生成 `ds=+0`、所有 `q=0` 和 `bsum=0`；非零 block 计算 `inverse=R32(-127.0/extreme)`，再计算 `ds=R32(1.0/inverse)`。
+3. `q[i]` 为 `R32(values[i]*inverse)` 按 nearest-even 取整、饱和到 `[-128,127]` 的 i8；不是普通 float→integer 的向零截断 cast。
+4. `bsum[j]` 是对应 16 个已经量化的 q 的精确整数和，保存为 i16；按 §5.2 的 Q8_K mapping 写出完整 records。
+
+输入域要求有限 f32；非零 block 的 inverse、ds 及转换前 scaled values 必须具有上述操作可表示的有限结果。域外数据是量化操作的非法输入，不默默把 NaN/overflow 变成零或改变算法。编译器不插入全数据扫描作为运行前置条件；该限制不授权放大 benchmark 容差。`G=0` 产生 empty records，不读取输入。
+
+### 5.6 生产者、复用与 native 组合
+
+正式作者示例采用 Q4_K weights `[N,G,144]`、f32 activation `[G,256]` 和 f32 output `[N]`：先由 `I.quantize` 定义一个 Q8_K 中间值，再以普通 parallel/output control 调用局部 `I.quantized_dot`，让 N 个输出消费同一组量化结果。它是普通构造组成的量化投影，不新增 whole-kernel GEMV/matmul operation 或 kernel-name template；K 等于 `256*G`。
+
+共同 CPU passes 保存 producer、消费者集合、跨 task 依赖和唯一写入；确定共享物化范围、分块供应和释放点。量化/点积 implementation 各自展开内部组织。单消费者可按合法性融合，多消费者场景保留量化结果复用；不能在每个输出点积里重新量化完整 activation。它不要求把所有输入一次物化为大 tensor，也不允许由 emitter 临时决定准备阶段。
+
+量化结果可以保持内部 SSA/logical buffer，并由编译器形成 invocation-local storage；不强迫 Intent 作者把它变成外部参数。若下层 Weft callable 需要一个编码 View 参数，该 View 对应的内部 storage owner、大小、对齐、初始化、跨 task 使用与 lifetime 仍显式保存在当前编译程序。外部 source 示例的显式 Xq workspace 不是本项目 public ABI 的设计权威。
+
+一个 Intent kernel 最终仍为一次 host-visible native invocation。内部 CPU tasks/本地函数不是额外独立 kernel launches；任务调用、传参、同步与资源组织必须由当前程序形成，runtime 只调用已编译入口，不在 Python 逐输出循环中实施算法。
 
 ## 6. 参数、artifact 与性能
 
 共同参数约束 task grain、外层 block 和跨块组织；implementation 参数约束真实局部微块/vector/replica/unroll 等；外部 compiler 参数由其消费者拥有。跨边界参数只有一个 binding owner 与显式约束，不各自选择两个值。
 
-保留有限配置覆盖、适用性过滤、完整候选实例化；Mojo native 继续实测选优并缓存 winner。Weft 本轮只生成，不伪造设备测量或 winner；单个合法专业实现不需要虚构第二份候选。格式/算法不作为可互换的 tuning 参数，也不对所有格式/算法建立笛卡尔积。Artifact 与 winner cache 分开，其身份包含实际依赖的 specialization、view facts、target、implementation 定义及 bindings。
+保留有限配置覆盖、适用性过滤、完整候选实例化；Mojo native 继续实测选优并缓存 winner。Weft 只枚举已有真实 consumer 的少量合法参数，使用目标机的完整 invocation 时间选优，不在 x86 或 Python/SSH 耗时上决定 winner；单个合法专业实现不需要虚构第二份候选。格式/算法不作为可互换的 tuning 参数，不对所有格式/算法建立笛卡尔积。Artifact 与 winner cache 分开，其身份包含实际依赖的 specialization、view facts、target、implementation 定义及 bindings。
 
 既有 Mojo registry 的 f32 affine、RMSNorm、dense GEMM、Softmax、LayerNorm 保持可达；不改变它们的作者算法、同算法 source 及既定数值容差。受影响项复用现有生产 benchmark，在同次运行做一次容差检查，记录 generated/source native 时间、G/S 和必要说明到 `report/baselinev2/mojo-x86.csv`。未受影响结果直接复用，不要求重跑全表。
 
-不以候选搜索、JIT 或 Python 调度耗时冒充算子时间；同机准备允许预算内并发，计时避免互相干扰。Weft 仅生成的项不填写虚构设备性能，不把 compilation verifier 当作数值运行。
+不以候选搜索、JIT、Python 调度、SSH 或部署耗时冒充算子时间；同机准备允许预算内并发，计时避免互相干扰。Weft 运行与比较按 §7，仅生成的其它项不填写设备性能，不把 compilation verifier 当作数值运行。
 
-## 7. 验收与非目标
+## 7. Weft runtime 与首个性能交付
 
-验收仅使用 brief 的 A1–A4：共同 CPU 边界、真实可编程实现、选定专业计算块、有效参数/native 性能。技术定位与参考材料不拆成独立测试门禁；数值与域边界属于实现义务，不据此另建输入矩阵、单元测试或临时测试脚本。本轮不新增统一 G/S 硬门槛。
+### 7.1 Native artifact 与调用接口
 
-不扩展无关 GPU/DSA，不接全量量化库，不引入隐藏 host invocations 或跨调用 workspace，不启用全局 fast-math/FTZ，不放大容差，不增加性能 benchmark 之外的测试。本 change 使用 main/current；Shape 完整确认后才进入 Build。
+复用正式 `weft-compile --emit=artifact`：直接输入 Intent lowering 的 Canonical Weft IR，取得同次编译的 RISC-V Physical IR、intrinsic C 和 typed ABI，再由明确的 RISC-V system toolchain 形成可加载 native artifact。不能通过 source example/KernelDefinition 替换 Intent 生成的程序，也不需要为此复制 Weft frontend。
+
+Intent 的 Weft materialization/runtime adapter 保留生成入口，并提供 native artifact 的加载、typed buffer 参数绑定、launch/run 与释放能力。它消费真实 compiler ABI 中的 symbol、encoding、shape、record span、alignment、access/alias、scalar/shape 参数与 target binding，不解析 C 文本补 ABI。CPU 调用不强制依赖 Torch；连续 Python buffer storage 与显式 shape/dtype 可用于 RVV native invocation，现有 Mojo/Torch CPU 与 GPU 的调用行为保持不变。
+
+CPU task coordinates、scalar captures 和多 task 依赖不能被丢弃，也不能把 scalar 冒充 shape symbol。Provider ABI 不直接接收的形式通过正式 lowering 变成明确的内部传参/调用程序。下层 CLI 可包含多个 native helper symbols，但对外仍是 §5.6 的完整单次 CPU invocation；不把 Weft Python loader 的单 kernel 限制变成新 kernel ABI 的任意裁剪。
+
+编译 profile 明确保存 march/ABI/VLEN 和实际使用的 extensions；加载/执行核对目标能力、vector state、执行 CPU 集合及 buffer 合同，不由设备名称推断能力。RNE/FP environment 与普通运算保持 Intent 语义，必要状态在调用后恢复；system compiler 不沿用会改变 §5 数值边界的默认 `-ffp-contract=fast`，采用 `-ffp-contract=off`，显式且合法的 FMA/点积 primitives 不因此被改写。外部 Weft compiler 已有的程序优化仍须保持输入合同。
+
+本轮包含显式 profile 的 AOT materialization、部署后 native load/run。具备本机 compiler/toolchain 时可复用同一适配链立即编译；不把在板卡上安装完整 Intent/Weft/LLVM frontend 或接通自动发现的原生 JIT 作为本轮验收前置条件。主机编译/板卡 system compile 与调用是显式部署方式，不是本机执行失败后的 fallback；SSH 仅在生产部署/benchmark 层使用，不属于核心 runtime 调用语义。
+
+### 7.2 固定运行范围与性能口径
+
+本轮首先在现有 `rvv`/SG2044 的标准 RVV 环境验收，使用对应显式 profile、VLEN128 与现有 Clang18 工具链；固定单核且双方 worker budget 为 1，运行前从当前设备事实核对。K1 已可连接，但不把双设备全量或 IME 使用变成本轮门槛；硬件 identity 不进入 compiler policy。
+
+只新增一个正式量化组合性能 case：`N=4096, K=4096`、一个 f32 activation vector，外部 Q4_K weights；对应现有 Weft `production_mul_mat_q4_k` 的 decode `M=1`。Source baseline 使用该 Weft 作者程序及完整 Q8_K helper closure，generated 与 source 使用同算法、输入、toolchain、target 和 FP flags；必要的 source/runtime 按项目 `source/` 语言/来源/职责边界接入，registry 只连接入口，不参与编译选择。现有 GGML 数据准备/数值参考可复用，不用旧 GGML 或 Weft GOP/s 折算本次 source 时间。
+
+复用现有生产 benchmark 机制并补 Weft provider 的必要接线，远端调用正式 native entry；不得另建临时测试 runner 绕过它。一次既有 warmup、相同 cold-cache 方式和 10 次计时，报告 median ms、source ms、G/S；每次 invocation 包含 activation quantization、必要 packing/materialization、内部任务执行与同步。编译、tuning、部署、加载、外部输入/输出分配、warmup 和 eviction 不计时；workspace 存储准备的边界双方一致并注明，不把每次量化工作移到计时外。
+
+同一次 benchmark 只做一次最终 f32 输出数值检查，使用现有量化组合容差 `abs(actual-expected) <= 1e-4 + 2e-3*abs(expected)`，沿用该 case 的有限输出要求；不增加 standalone quantize 的 byte-exact 检查或独立数值测试。语义错误或超差直接修复，只重跑这个受影响 benchmark，不放大容差。
+
+成对实际时间进入项目现有 `report/baselinev2/` 下的 Weft provider CSV（`weft-rvv.csv`），不以外部仓库表格或 `/tmp` 报告作为交付。表格不承担候选耗时/逐轮历史审计；没有实测不得宣称 runtime、数值或性能已达标。本轮不新增统一 G/S 硬门槛。
+
+## 8. 验收与非目标
+
+验收仅使用 brief 的 A1–A5：共同 CPU 边界、真实可编程实现、量化 producer/consumer、Weft native 完整调用与性能、有效参数及既有 Mojo 能力。技术定位与参考材料不拆成独立测试门禁；数值与域边界属于实现义务，不据此另建输入矩阵、单元测试或临时测试脚本。
+
+不扩展无关 GPU/DSA，不接全量量化库、不增加 whole-kernel matmul DSL，不做跨调用权重量化/repack，不引入隐藏 host invocations 或未建模 workspace/cache，不启用全局 fast-math/FTZ，不放大容差，不增加性能 benchmark 之外的测试。外部 TianchenRV 先保持只读；若发现必需的外部接口/语义缺口，拿出具体证据并就最小改动取得授权，独立提交且不覆盖他人工作。本 change 使用 main/current；完整 Shape 确认后才进入 Build。
