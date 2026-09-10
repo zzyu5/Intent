@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
 from pathlib import Path
 
 import intent
 from intent.runtime.triton import materialize_triton_artifact, TuningHooks
 from intent.targets import TritonTarget
 import triton
+from triton.compiler.errors import CompileTimeAssertionFailure
+from triton.runtime.autotuner import Autotuner
+from triton.runtime.errors import OutOfResources, PTXASError
+from triton.runtime.jit import JITFunction
 from torch.utils._python_dispatch import _disable_current_modes
 
 from repro.common.support import benchmark
@@ -58,6 +63,42 @@ class TuningBudget:
         self.limit = limit
         self.policy = policy
         self.tuners = []
+        self.precompile_failures = []
+
+    @contextmanager
+    def compilation_only(self):
+        original_jit = JITFunction.run
+        original_autotuner = Autotuner.run
+        autotuning = 0
+
+        def compile_kernel(kernel, *args, **kwargs):
+            kwargs["warmup"] = True
+            try:
+                return original_jit(kernel, *args, **kwargs)
+            except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as error:
+                if not autotuning:
+                    raise
+                # Match Triton's candidate-failure policy. Normal autotuning
+                # still evaluates the same bounded set and rejects these forms.
+                self.precompile_failures.append({"kernel": kernel.__name__, "error": str(error)})
+                return None
+
+        def compile_tuner(tuner, *args, **kwargs):
+            nonlocal autotuning
+            kwargs.pop("warmup", None)
+            autotuning += 1
+            try:
+                return tuner.warmup(*args, **kwargs)
+            finally:
+                autotuning -= 1
+
+        JITFunction.run = compile_kernel
+        Autotuner.run = compile_tuner
+        try:
+            yield
+        finally:
+            JITFunction.run = original_jit
+            Autotuner.run = original_autotuner
 
     def _decorate(self, *args, **kwargs):
         kwargs["do_bench"] = self._measure

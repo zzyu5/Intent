@@ -106,11 +106,22 @@ def run(arguments) -> dict:
                 module = load_program(arguments.program, language=arguments.language)
                 stage = "candidate_build"
                 function = module.build(context)
-            stage = "comparison"
+            stage = "candidate_input_preparation"
             with arguments.gpu_lock.open("w") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 candidate_call = candidate_call.to_device("cuda")
                 reference_call = reference_call.to_device("cuda")
+                torch.cuda.synchronize()
+            stage = "candidate_precompile"
+            compile_started = time.monotonic()
+            with budget.compilation_only(), CandidateTorchPolicy():
+                candidate_call.call(function)
+            result["precompile_seconds"] = time.monotonic() - compile_started
+            result["precompile_failures"] = budget.precompile_failures
+            result["preparation_policy"] = "compile_only_before_gpu_timing_lock"
+            stage = "comparison"
+            with arguments.gpu_lock.open("w") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
                 candidate = _observe(candidate_call, function, task=arguments.task, enforce=True)
                 source = _observe(reference_call, reference_function, task=arguments.task, enforce=False)
                 measured, anchor = evaluate(PreparedComparison(candidate, source, tolerance(task, suite), cuda_graph=True),

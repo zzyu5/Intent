@@ -60,7 +60,12 @@ class Records:
                 row.update(original_status=row["status"], status="reference_contract_failure",
                            failure_stage="reference_contract", error=unresolved[row["task"]]["issue"])
             recheck = Path(__file__).resolve().parents[3] / Path(row["program"]).parent / "reference-recheck.json"
-            if row.get("failure_stage", "").startswith("source_") and recheck.exists():
+            source_failure = row.get("failure_stage", "").startswith("source_")
+            warmup_failure = (row.get("failure_stage") == "candidate_precompile"
+                              and "compile_kernel() got multiple values for keyword argument 'warmup'" in row.get("error", ""))
+            if warmup_failure:
+                recheck = recheck.with_name("evaluation-recheck.json")
+            if (source_failure or warmup_failure) and recheck.exists():
                 measured = json.loads(recheck.read_text())
                 measured["evaluation_recheck_seconds"] = measured.pop("preparation_and_benchmark_seconds", 0)
                 row.update(original_status=row["status"], evaluation_repaired=True, **measured)
@@ -262,7 +267,7 @@ class Records:
                  "Times are median CUDA Graph operator milliseconds among correct repetitions; `-` means no correct measured program.",
                  "The PyTorch task implementation is a performance anchor, not an optimized Triton upper bound. Failures remain in the denominator.", "",
                  "Uncapturable references remain unchanged numerical oracles; candidate CUDA Graph times remain usable without a reference ratio. Reference-only evaluation repairs preserve raw observations and original agent programs. Canceled calls without a submission retain their cost but do not consume a submission slot.", "",
-                 "Budgets include the work actually incurred, including retries after erroneous reference-only feedback. Repaired trials are flagged in summary.csv; their observed costs are not an estimate of an error-free workflow. The candidate time limit includes preparation and GPU queue time, not only device execution.", "",
+                 "Budgets include the work actually incurred, including retries after erroneous evaluator feedback. Repaired trials are flagged in summary.csv; their observed costs are not an estimate of an error-free workflow. The candidate time limit includes preparation and GPU queue time, not only device execution.", "",
                  "Optimization columns show the best correct program after optimization starts, including the unchanged seed when it remains best; they are not a claim of improvement. Stage and stopping status are in summary.csv.", "",
                  "paired.csv compares Intent/direct absolute operator times without requiring a PyTorch timing anchor. Paired performance is conditional on both arms succeeding; all failures remain in the separate fixed-denominator correctness results.", "",
                  "budget.csv records best-so-far absolute time and cumulative stage/full-workflow costs. Its common performance target is the median PyTorch seed-reference time of the two paired arms; no paired target is reported when either seed is missing. Cached input tokens are a subset of input tokens. Missing provider usage is disclosed, not estimated.", "",
