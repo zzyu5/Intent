@@ -398,12 +398,19 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string
       first = false;
     }
     auto configuration = function->getAttrOfType<cpu::ConfigurationAttr>("intent_cpu.configuration");
+    llvm::json::Array implementations;
+    for (Attribute entry : function->getAttrOfType<ArrayAttr>("intent_cpu.implementations")) {
+      auto binding = cast<cpu::ImplementationAttr>(entry);
+      llvm::json::Object values;
+      for (NamedAttribute parameter : binding.getParameters())
+        values[parameter.getName().getValue()] = cast<IntegerAttr>(parameter.getValue()).getInt();
+      implementations.push_back(llvm::json::Object{{"name", binding.getName().getValue().str()}, {"parameters", std::move(values)}});
+    }
     candidates.push_back(llvm::json::Object{
         {"entry", function.getName().str()},
-        {"values", llvm::json::Array{configuration.getVectorWidth(), configuration.getTaskGrain(),
-            configuration.getTileM(), configuration.getTileN(), configuration.getTileK(),
-            configuration.getMicroM(), configuration.getMicroN(),
-            configuration.getRegisterReplicas(), configuration.getReductionReplicas()}}});
+        {"values", llvm::json::Array{configuration.getTaskGrain(),
+            configuration.getTileM(), configuration.getTileN(), configuration.getTileK()}},
+        {"implementations", std::move(implementations)}});
   }
   interface["candidates"] = std::move(candidates);
   llvm::raw_string_ostream metadataOutput(metadata);

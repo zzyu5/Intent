@@ -156,8 +156,13 @@ int main(int argc, char **argv) {
                         mlir::memref::MemRefDialect, mlir::vector::VectorDialect>();
     if (mlir::failed(intent::lowerCanonicalKIRToCPU(*module)))
       return exitCode(ExitCode::PhysicalProgram);
+    intent::cpu::ImplementationRegistry implementations;
+    if (target == TargetKind::Mojo) implementations = intent::mojo::implementations();
+#ifdef INTENT_HAS_WEFT_CANONICAL
+    else implementations = intent::weft_provider::implementations();
+#endif
     if (mlir::failed(intent::cpu::runCPUPasses(*module, cpuVectorBits, cpuWorkers,
-                                              profilePath("cpu.json"), tuningConfigFilename)))
+            profilePath(target == TargetKind::Mojo ? "mojo.json" : "weft.json"), tuningConfigFilename, implementations)))
       return exitCode(ExitCode::PhysicalProgramVerification);
     if (stopAfterShared) return emitShared();
     metadata.clear();

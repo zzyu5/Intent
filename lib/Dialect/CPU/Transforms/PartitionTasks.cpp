@@ -91,6 +91,17 @@ LogicalResult partitionTasks(func::FuncOp function, int64_t grain) {
 }
 
 LogicalResult isolateTasks(func::FuncOp function) {
+  SmallVector<QuantizeOp> preparations;
+  function.walk([&](QuantizeOp operation) {
+    if (!operation->getParentOfType<scf::ParallelOp>()) preparations.push_back(operation);
+  });
+  for (auto preparation : preparations) {
+    OpBuilder b(preparation);
+    auto loc = preparation.getLoc();
+    auto task = b.create<scf::ParallelOp>(loc, ValueRange{index(b, loc, 0)},
+        ValueRange{index(b, loc, 1)}, ValueRange{index(b, loc, 1)});
+    preparation->moveBefore(task.getBody()->getTerminator());
+  }
   SmallVector<scf::ParallelOp> operations;
   function.walk([&](scf::ParallelOp operation) { operations.push_back(operation); });
   for (auto parallel : operations) {

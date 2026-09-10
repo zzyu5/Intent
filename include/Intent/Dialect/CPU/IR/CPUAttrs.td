@@ -37,12 +37,16 @@ def IntentCPU_CapabilitiesAttr : IntentCPU_Attr<"Capabilities", "capabilities"> 
 }
 
 def IntentCPU_ConfigurationAttr : IntentCPU_Attr<"Configuration", "configuration"> {
-  let parameters = (ins "int64_t":$vectorWidth, "int64_t":$taskGrain,
-    "int64_t":$tileM, "int64_t":$tileN, "int64_t":$tileK,
-    "int64_t":$microM, "int64_t":$microN, "int64_t":$registerReplicas,
-    "int64_t":$reductionReplicas);
+  let parameters = (ins "int64_t":$taskGrain,
+    "int64_t":$tileM, "int64_t":$tileN, "int64_t":$tileK);
   let assemblyFormat =
-    "`<` $vectorWidth `,` $taskGrain `,` $tileM `,` $tileN `,` $tileK `,` $microM `,` $microN `,` $registerReplicas `,` $reductionReplicas `>`";
+    "`<` $taskGrain `,` $tileM `,` $tileN `,` $tileK `>`";
+}
+
+def IntentCPU_ImplementationAttr : IntentCPU_Attr<"Implementation", "implementation"> {
+  let parameters = (ins "::mlir::StringAttr":$name,
+                        "::mlir::DictionaryAttr":$parameters);
+  let assemblyFormat = "`<` $name `,` $parameters `>`";
 }
 
 def IntentCPU_ReductionOrderAttr : IntentCPU_Attr<"ReductionOrder", "reduction_order"> {

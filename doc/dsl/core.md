@@ -357,6 +357,14 @@ scaled contract是first-class local tensor operation。它使用一个closed pos
 
 普通packed INT4/INT2不是scaled contract。作者使用carrier tensor、bit/index arithmetic、sign extension、zero-point与scale表达其logical values，再调用ordinary contract。
 
+### 11.1 闭合量化计算
+
+`I.quantize(values, format=I.quant.q8_k)` 与 `I.quantized_dot(lhs, rhs,
+lhs_format=I.quant.q4_k, rhs_format=I.quant.q8_k, acc_dtype=I.f32)` 是独立的
+pure structured operations，不归一为 scaled contract。它们的完整 shape、record
+mapping、量化及点积数值合同见[量化计算](quantized-operations.md)。格式不选择 target
+implementation；量化准备的中间结果可在普通作者 control 中共享。
+
 ## 12. Sparse contract
 
 矩阵形式的具名入口为：
@@ -487,7 +495,7 @@ part identity、boundary formula、empty/tail与partial tensor interface由普�
 | definitions/interface | kernel、helper、`In/Out/InOut`、runtime/constexpr | Python decorators与type spelling | target selection、hidden launch、provider dispatch |
 | domain/control | domain、source subregion、`if/for/while`、unordered parallel、loop carry | slices、`indices`、`break/continue` | `auto`、partition、state_stream、ordered、program/lane id |
 | tensor values | arithmetic、compare/select、broadcast、reshape、transpose、join、tuple、record、full、cast/bitcast | zeros、activation helpers、value mask | physical tile/layout/padding |
-| structured ops | generic reduce、scan、region fold/scan、contract、scaled contract、sparse contract、histogram | dot/matvec/vecmat/matmul、scaled/sparse matmul、builtin reduces/prefixes、arg-reduce、format-specific sparse spelling | whole-operator softmax/attention/MoE |
+| structured ops | generic reduce、scan、region fold/scan、contract、scaled contract、sparse contract、quantize、quantized dot、histogram | dot/matvec/vecmat/matmul、scaled/sparse matmul、builtin reduces/prefixes、arg-reduce、format-specific sparse spelling | whole-operator softmax/attention/MoE |
 | relations | source subregion、index relation、sparse format schema | ragged/members/index helpers | target metadata layout、MMA hint |
 | memory/effects | external/buffer read-write、unique/reduction scatter、atomic ops、Philox bits | ordinary indexing/assignment、atomic convenience names | physical scope、storage、copy instruction、barrier/pipeline |
 

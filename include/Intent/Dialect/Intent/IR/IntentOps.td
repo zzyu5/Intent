@@ -222,6 +222,16 @@ def Intent_ContractOp : Intent_Op<"contract", [Pure]> {
                        ArrayAttr:$reduce, ArrayAttr:$batch);
   let results = (outs AnyRankedTensor:$result);
 }
+def Intent_QuantizeOp : Intent_Op<"quantize", [Pure]> {
+  let arguments = (ins AnyRankedTensor:$input, Intent_QuantFormatAttr:$format);
+  let results = (outs AnyRankedTensor:$result);
+}
+def Intent_QuantizedDotOp : Intent_Op<"quantized_dot", [Pure]> {
+  let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs,
+                       Intent_QuantFormatAttr:$lhs_format,
+                       Intent_QuantFormatAttr:$rhs_format);
+  let results = (outs AnyRankedTensor:$result);
+}
 def Intent_ScaledContractOp : Intent_Op<"scaled_contract", [Pure]> {
   let arguments = (ins AnyRankedTensor:$lhs,
                        AnyRankedTensor:$lhs_scale,

@@ -25,9 +25,10 @@ LogicalResult ViewArgumentAttr::verify(
     llvm::function_ref<InFlightDiagnostic()> error, StringAttr name,
     Type element, DenseI64ArrayAttr shape, DenseI64ArrayAttr dimensions,
     uint32_t access, StringAttr alias, bool) {
-  if (!name || name.getValue().empty() || !element.isF32() || !shape || !dimensions ||
+  if (!name || name.getValue().empty() ||
+      (!element.isF32() && !element.isUnsignedInteger(8)) || !shape || !dimensions ||
       shape.size() != dimensions.size() || access > 1 || !alias)
-    return error() << "CPU view argument requires a named f32 In/Out view and complete shape identities";
+    return error() << "CPU view argument requires a named f32/u8 In/Out view and complete shape identities";
   for (auto [size, dimension] : llvm::zip(shape.asArrayRef(), dimensions.asArrayRef()))
     if ((size < 0 && !ShapedType::isDynamic(size)) || dimension < 0 ||
         (ShapedType::isDynamic(size) && dimension == 0))
@@ -64,22 +65,28 @@ LogicalResult CapabilitiesAttr::verify(
     llvm::function_ref<InFlightDiagnostic()> error, int64_t vectorBits,
     int64_t workers, int64_t privateBytes) {
   if (vectorBits < 32 || vectorBits % 32 || workers <= 0 || privateBytes <= 0)
-    return error() << "CPU capabilities require a positive f32 vector capacity, worker and private-storage budget";
+    return error() << "CPU capabilities require positive byte-addressable vector, worker and private-storage budgets";
   return success();
 }
 
 LogicalResult ConfigurationAttr::verify(
-    llvm::function_ref<InFlightDiagnostic()> error, int64_t width,
-    int64_t grain, int64_t m, int64_t n, int64_t k, int64_t mr, int64_t nr,
-    int64_t replicas, int64_t reductionReplicas) {
-  if (width <= 0 || (width & (width - 1)) || grain <= 0 || m <= 0 || n <= 0 ||
-      k <= 0 || mr <= 0 || nr <= 0)
-    return error() << "CPU binding requires positive extents and power-of-two issue width";
-  if (replicas <= 0 || replicas > 16 || (replicas & (replicas - 1)))
-    return error() << "CPU vector realization supports power-of-two register replicas up to sixteen";
-  if (reductionReplicas <= 0 || reductionReplicas > 16 ||
-      (reductionReplicas & (reductionReplicas - 1)))
-    return error() << "CPU reduction realization supports power-of-two register replicas up to sixteen";
+    llvm::function_ref<InFlightDiagnostic()> error,
+    int64_t grain, int64_t m, int64_t n, int64_t k) {
+  if (grain <= 0 || m <= 0 || n <= 0 || k <= 0)
+    return error() << "CPU task/cache blocking requires positive extents";
+  return success();
+}
+
+LogicalResult ImplementationAttr::verify(
+    llvm::function_ref<InFlightDiagnostic()> error, StringAttr name,
+    DictionaryAttr parameters) {
+  if (!name || name.empty() || !parameters)
+    return error() << "CPU implementation requires a registered identity and explicit bindings";
+  for (NamedAttribute parameter : parameters) {
+    auto integer = mlir::dyn_cast<IntegerAttr>(parameter.getValue());
+    if (!integer || integer.getInt() <= 0)
+      return error() << "CPU implementation parameter must be a positive integer";
+  }
   return success();
 }
 

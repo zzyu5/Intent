@@ -47,6 +47,8 @@ class OperationKind(Enum):
     REGION_FOLD = "region_fold"
     REGION_SCAN = "region_scan"
     CONTRACT = "contract"
+    QUANTIZE = "quantize"
+    QUANTIZED_DOT = "quantized_dot"
     SCALED_CONTRACT = "scaled_contract"
     SPARSE_CONTRACT = "sparse_contract"
     HISTOGRAM = "histogram"
@@ -91,6 +93,8 @@ STRUCTURED_OPS = {
     OperationKind.REGION_FOLD,
     OperationKind.REGION_SCAN,
     OperationKind.CONTRACT,
+    OperationKind.QUANTIZE,
+    OperationKind.QUANTIZED_DOT,
     OperationKind.SCALED_CONTRACT,
     OperationKind.SPARSE_CONTRACT,
     OperationKind.PARALLEL,
@@ -179,6 +183,11 @@ class ScaledFormatKind(IntEnum):
     E2M1 = 0
     E4M3 = 1
     E8M0 = 2
+
+
+class QuantFormatKind(IntEnum):
+    Q4_K = 0
+    Q8_K = 1
 
 
 class IndexTermKind(IntEnum):

@@ -1,4 +1,6 @@
 #include "Intent/Target/Weft/Transforms/Passes.h"
+#include "Quantization.h"
+#include "Intent/Target/Weft/Serialization/Serializer.h"
 #include "Intent/Dialect/CPU/Analysis/AxisRelations.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
@@ -45,32 +47,65 @@ struct LocalValue {
 
 class TaskLowering {
 public:
-  TaskLowering(func::FuncOp function, ModuleOp output)
-      : analysis(function), relations(function), output(output), b(output.getContext()) {}
+  TaskLowering(func::FuncOp function, ModuleOp output,
+               const llvm::DenseMap<Value, intent::QuantFormat> &formats,
+               const cpu::ImplementationRegistry &implementations)
+      : analysis(function), relations(function), output(output), b(output.getContext()),
+        formats(formats), implementations(implementations) {
+    auto join = [&](Value lhs, Value rhs) {
+      int64_t a = physicalAxis(relations.axes(lhs).back());
+      int64_t c = physicalAxis(relations.axes(rhs).back());
+      if (a != c) axisProjection[std::max(a, c)] = std::min(a, c);
+    };
+    function.walk([&](cpu::QuantizeOp op) { join(op.getInput(), op.getOutput()); });
+    function.walk([&](cpu::QuantizedDotOp op) { join(op.getLhs(), op.getRhs()); });
+    nextAxis = 1;
+    function.walk([&](Operation *operation) {
+      for (Value value : operation->getOperands())
+        if (isa<MemRefType>(value.getType()))
+          for (int64_t axis : relations.axes(value)) nextAxis = std::max(nextAxis, axis + 1);
+    });
+  }
 
-  LogicalResult lower(cpu::TasksOp tasks, StringRef name) {
+  SmallVector<Value> shapeArguments(func::FuncOp function, OpBuilder &builder) {
+    SmallVector<Value> result(relations.dynamicAxisCount());
+    for (Value argument : function.getArguments()) {
+      auto memory = dyn_cast<MemRefType>(argument.getType());
+      if (!memory) continue;
+      auto ids = memoryAxes(argument);
+      for (auto [axis, extent] : llvm::enumerate(memory.getShape()))
+        if (ShapedType::isDynamic(extent))
+          result[ids[axis] - 1] = builder.create<memref::DimOp>(function.getLoc(), argument, axis);
+    }
+    return result;
+  }
+
+  LogicalResult lower(cpu::TasksOp tasks, StringRef name, ArrayRef<unsigned> argumentPositions) {
     values.clear(); locals.clear();
     Location loc = tasks.getLoc();
     SmallVector<Attribute> names, accesses, symbols;
     SmallVector<int64_t> aliases;
-    SmallVector<Type> types{b.getIndexType()};
+    SmallVector<Type> types;
     auto memoryAccesses = analysis.accesses(tasks);
-    names.push_back(b.getStringAttr("coordinate"));
-    accesses.push_back(b.getStringAttr("none"));
-    aliases.push_back(-1);
-    for (auto [number, capture] : llvm::enumerate(tasks.getCaptures())) {
-      names.push_back(b.getStringAttr("capture_" + std::to_string(number)));
+    for (unsigned position : argumentPositions) {
+      Value capture = position == 0 ? tasks.getBody().front().getArgument(0) : tasks.getCaptures()[position - 1];
+      names.push_back(b.getStringAttr(position == 0 ? "coordinate" : "capture_" + std::to_string(position - 1)));
       if (auto memory = dyn_cast<MemRefType>(capture.getType())) {
-        auto ids = relations.axes(capture);
+        auto ids = memoryAxes(capture);
         llvm::SmallSet<int64_t, 8> unique(ids.begin(), ids.end());
         if (unique.size() != ids.size())
           return tasks.emitError("Weft view requires independent logical axes; this reuse needs an explicit axis projection");
-        auto abi = analysis.externalView(capture);
-        if (!abi) return tasks.emitError("Weft task capture requires an external CPU view; captured scratch is not implemented");
         SmallVector<int64_t> dimensions;
         for (auto [axis, extent] : llvm::enumerate(memory.getShape()))
           dimensions.push_back(ShapedType::isDynamic(extent) ? -ids[axis] : extent);
-        types.push_back(wk::ViewType::get(b.getContext(), encoding(), array(dimensions), array(ids)));
+        auto format = formats.find(analysis.storageRoot(capture));
+        if (format != formats.end()) {
+          int64_t bytes = format->second == intent::QuantFormat::Q4K ? 144 : 292;
+          if (memory.getShape().back() != bytes)
+            return tasks.emitError("encoded capture requires a statically complete contiguous record byte span");
+          dimensions.back() = 256;
+        }
+        types.push_back(wk::ViewType::get(b.getContext(), encoding(capture), array(dimensions), array(ids)));
         Value storage = analysis.storageRoot(capture);
         bool reads = false, writes = false;
         for (auto access : memoryAccesses)
@@ -79,12 +114,11 @@ public:
           }
         accesses.push_back(b.getStringAttr(reads ? (writes ? "readwrite" : "read")
                                                : (writes ? "write" : "none")));
-        auto root = cast<BlockArgument>(analysis.storageRoot(capture));
-        aliases.push_back(abi.getAccess() == 0 && !abi.getNoalias() ? 0 : root.getArgNumber() + 1);
+        aliases.push_back(0);
       } else {
-        types.push_back(capture.getType());
-        accesses.push_back(b.getStringAttr("none"));
-        aliases.push_back(-1);
+        types.push_back(scalarView(capture.getType()));
+        accesses.push_back(b.getStringAttr("read"));
+        aliases.push_back(0);
       }
     }
     for (unsigned axis = 1; axis <= relations.dynamicAxisCount(); ++axis)
@@ -95,22 +129,60 @@ public:
     Block *body = new Block;
     kernel.getBody().push_back(body);
     for (Type type : types) body->addArgument(type, loc);
-    for (auto [source, target] : llvm::zip(tasks.getBody().front().getArguments(), body->getArguments()))
-      values.map(source, target);
     b.setInsertionPointToStart(body);
-    b.create<wk::RootDomainOp>(loc,
-        wk::DomainType::get(b.getContext(), "root", 0, -1, 0, "root", "exact"));
     for (Attribute symbol : symbols)
       b.create<wk::SymbolOp>(loc, b.getIndexType(), cast<StringAttr>(symbol),
           b.getStringAttr("shape"), array({}));
+    b.create<wk::RootDomainOp>(loc,
+        wk::DomainType::get(b.getContext(), "root", 0, -1, 0, "root", "exact"));
+    for (auto [position, target] : llvm::zip(argumentPositions, body->getArguments())) {
+      Value source = tasks.getBody().front().getArgument(position);
+      if (isa<MemRefType>(source.getType())) values.map(source, target);
+      else {
+        auto type = cast<wk::ViewType>(target.getType());
+        Value scalar = b.create<wk::SliceOp>(loc,
+            wk::SliceType::get(b.getContext(), type.getEncoding(), array({}), array({})),
+            target, ValueRange{index(loc, 0)}, b.getArrayAttr({b.getStringAttr("index")}));
+        Type storage = source.getType().isIndex()
+            ? Type(IntegerType::get(b.getContext(), 64, IntegerType::Signed)) : source.getType();
+        Value loaded = b.create<wk::AdmitOp>(loc, storage, scalar);
+        if (source.getType().isIndex()) loaded = b.create<wk::CastOp>(loc, b.getIndexType(), loaded);
+        values.map(source, loaded);
+      }
+    }
     if (failed(block(tasks.getBody().front()))) return failure();
     b.create<wk::ReturnOp>(loc, ValueRange{});
     return verify(kernel);
   }
 
 private:
+  int64_t physicalAxis(int64_t axis) {
+    while (axisProjection.count(axis)) axis = axisProjection.lookup(axis);
+    return axis;
+  }
+  SmallVector<int64_t> memoryAxes(Value memory) {
+    auto result = relations.axes(memory);
+    for (int64_t &axis : result) axis = physicalAxis(axis);
+    return result;
+  }
   DenseI64ArrayAttr array(ArrayRef<int64_t> entries) { return b.getDenseI64ArrayAttr(entries); }
-  wk::EncodingType encoding() { return wk::EncodingType::get(b.getContext(), "f32", "dense", "dense.f32", array({})); }
+  wk::EncodingType dense(Type type) {
+    std::string name;
+    if (type.isIndex()) name = "i64";
+    else if (auto integer = dyn_cast<IntegerType>(type))
+      name = (integer.isUnsigned() ? "u" : "i") + std::to_string(integer.getWidth());
+    else { llvm::raw_string_ostream stream(name); type.print(stream); }
+    return wk::EncodingType::get(b.getContext(), name, "dense", "dense." + name, array({}));
+  }
+  wk::EncodingType encoding(Value memory = {}) {
+    if (!memory) return dense(b.getF32Type());
+    auto format = formats.find(analysis.storageRoot(memory));
+    return format == formats.end() ? dense(cast<MemRefType>(memory.getType()).getElementType())
+                                  : quantEncoding(b, format->second);
+  }
+  wk::ViewType scalarView(Type type) {
+    return wk::ViewType::get(b.getContext(), dense(type), array({1}), array({nextAxis++}));
+  }
   Type valueType(Type element, ArrayRef<int64_t> dimensions, ArrayRef<int64_t> ids) {
     if (dimensions.empty()) return element;
     return wk::ValueType::get(b.getContext(), element, array(dimensions), array(ids));
@@ -118,7 +190,7 @@ private:
   Value index(Location loc, int64_t value) { return b.create<arith::ConstantIndexOp>(loc, value); }
   Type resultType(Value memory, Type scalar = {}) {
     auto type = cast<MemRefType>(memory.getType());
-    auto ids = relations.axes(memory);
+    auto ids = memoryAxes(memory);
     SmallVector<int64_t> dimensions;
     for (auto [axis, extent] : llvm::enumerate(type.getShape()))
       dimensions.push_back(ShapedType::isDynamic(extent) ? -ids[axis] : extent);
@@ -169,10 +241,17 @@ private:
       if (!sameBound(stride, b.getIndexAttr(1))) return operation.emitError("Weft subview requires unit coordinate steps"), failure();
     append(operation.getMixedOffsets(), offsets);
     append(operation.getMixedSizes(), extents);
+    auto format = formats.find(analysis.storageRoot(memory));
+    if (format != formats.end()) {
+      int64_t bytes = format->second == intent::QuantFormat::Q4K ? 144 : 292;
+      if (offsets.back() != 0 || extents.back() != bytes)
+        return operation.emitError("encoded view projection must retain its complete record bytes"), failure();
+      extents.back() = 256;
+    }
     auto ids = axes((*base).getType());
     for (auto [extent, axis] : llvm::zip(extents, ids)) dimensions.push_back(extent < 0 ? -axis : extent);
     Value selected = b.create<wk::SubviewOp>(operation.getLoc(),
-        wk::SliceType::get(b.getContext(), encoding(), array(dimensions), array(ids)),
+        wk::SliceType::get(b.getContext(), encoding(memory), array(dimensions), array(ids)),
         *base, dynamic, array(offsets), array(extents));
     auto dropped = operation.getDroppedDims();
     if (dropped.any()) {
@@ -189,7 +268,7 @@ private:
         }
       }
       selected = b.create<wk::SliceOp>(operation.getLoc(),
-          wk::SliceType::get(b.getContext(), encoding(), array(keptShape), array(keptAxes)),
+          wk::SliceType::get(b.getContext(), encoding(memory), array(keptShape), array(keptAxes)),
           selected, indices, b.getArrayAttr(selectors));
     }
     values.map(memory, selected);
@@ -204,7 +283,7 @@ private:
       auto region = view(memory);
       if (failed(region)) return failure();
       Value loaded = b.create<wk::AdmitOp>(memory.getLoc(),
-          valueType(b.getF32Type(), shape((*region).getType()), axes((*region).getType())), *region);
+          valueType(cast<MemRefType>(memory.getType()).getElementType(), shape((*region).getType()), axes((*region).getType())), *region);
       operandReads[memory] = loaded;
       return loaded;
     }
@@ -492,6 +571,34 @@ private:
       fillAxis(0);
       return success();
     }
+    if (isa<cpu::QuantizeOp, cpu::QuantizedDotOp>(operation)) {
+      auto implementation = implementations.lookup(operation);
+      if (failed(implementation)) return failure();
+      if (!(*implementation)->expand) return operation->emitError("selected Weft implementation has no expansion");
+      SmallVector<Value> arguments;
+      for (Value operand : operation->getOperands()) {
+        auto supplied = view(operand);
+        if (failed(supplied)) return operation->emitError("implementation requires supplied operand views");
+        arguments.push_back(*supplied);
+      }
+      auto results = (*implementation)->expand(b, operation, arguments, nextAxis);
+      if (failed(results)) return failure();
+      if (results->size() != operation->getNumResults())
+        return operation->emitError("implementation results disagree with the structured operation");
+      values.map(operation->getResults(), *results);
+      return success();
+    }
+    if (auto store = dyn_cast<memref::StoreOp>(operation)) {
+      auto region = view(store.getMemref());
+      if (failed(region)) return failure();
+      SmallVector<Value> indices;
+      for (Value value : store.getIndices()) indices.push_back(values.lookup(value));
+      Value selected = b.create<wk::SliceOp>(loc,
+          wk::SliceType::get(b.getContext(), encoding(store.getMemref()), array({}), array({})),
+          *region, indices, b.getArrayAttr(SmallVector<Attribute>(indices.size(), b.getStringAttr("index"))));
+      b.create<wk::CommitOp>(loc, values.lookup(store.getValue()), selected);
+      return success();
+    }
     if (auto genericOp = dyn_cast<linalg::GenericOp>(operation)) return generic(genericOp);
     if (auto reduce = dyn_cast<cpu::ReduceOp>(operation)) return reduction(reduce);
     if (auto conditional = dyn_cast<scf::IfOp>(operation)) {
@@ -559,6 +666,10 @@ private:
   IRMapping values;
   llvm::DenseMap<Value, LocalValue> locals;
   llvm::DenseMap<Value, Value> operandReads;
+  const llvm::DenseMap<Value, intent::QuantFormat> &formats;
+  const cpu::ImplementationRegistry &implementations;
+  llvm::DenseMap<int64_t, int64_t> axisProjection;
+  int64_t nextAxis;
 };
 
 }
@@ -567,24 +678,125 @@ FailureOr<OwningOpRef<ModuleOp>> legalizeProgram(ModuleOp cpuProgram, std::strin
   if (failed(cpu::verifyCPUProgram(cpuProgram, false))) return failure();
   cpuProgram.getContext()->loadDialect<wk::WEFTKernelDialect>();
   OwningOpRef<ModuleOp> output = ModuleOp::create(cpuProgram.getLoc());
+  bool quantized = false;
+  cpuProgram.walk([&](cpu::QuantizedDotOp) { quantized = true; });
+  cpuProgram.walk([&](cpu::QuantizeOp) { quantized = true; });
+  if (quantized) declareQuantEncodings(*output);
   llvm::json::Array interfaces;
-  for (func::FuncOp function : cpuProgram.getOps<func::FuncOp>()) {
-    TaskLowering lowering(function, *output);
+  auto registry = implementations();
+  llvm::json::Array parameters, candidates;
+  SmallVector<func::FuncOp> functions(cpuProgram.getOps<func::FuncOp>());
+  auto interface = functions.front()->getAttrOfType<cpu::InterfaceAttr>("intent_cpu.interface");
+  cpu::PhysicalProgramAnalysis rootAnalysis(functions.front());
+  llvm::DenseMap<Value, int64_t> alignments;
+  functions.front().walk([&](cpu::QuantizedDotOp op) {
+    alignments[rootAnalysis.storageRoot(op.getLhs())] = 2;
+    alignments[rootAnalysis.storageRoot(op.getRhs())] = 4;
+  });
+  auto integers = [](DenseI64ArrayAttr entries) {
+    llvm::json::Array result;
+    for (int64_t entry : entries.asArrayRef()) result.push_back(entry);
+    return result;
+  };
+  for (auto [index, parameter] : llvm::enumerate(interface.getArguments())) {
+    if (auto view = dyn_cast<cpu::ViewArgumentAttr>(parameter))
+      parameters.push_back(llvm::json::Object{{"name", view.getName().getValue().str()},
+          {"kind", "view"}, {"dtype", view.getElementType().isF32() ? "f32" : "u8"},
+          {"shape", integers(view.getShape())}, {"dimensions", integers(view.getDimensions())},
+          {"alignment", std::max(int64_t(view.getElementType().isF32() ? 4 : 1), alignments.lookup(functions.front().getArgument(index)))},
+          {"access", view.getAccess()}, {"alias", view.getAlias().getValue().str()}, {"noalias", view.getNoalias()}});
+    else {
+      auto scalar = cast<cpu::ScalarArgumentAttr>(parameter);
+      parameters.push_back(llvm::json::Object{{"name", scalar.getName().getValue().str()},
+          {"kind", "scalar"}, {"dtype", scalar.getType().isF32() ? "f32" : "i64"}});
+    }
+  }
+  for (func::FuncOp function : functions) {
+    auto config = function->getAttrOfType<cpu::ConfigurationAttr>("intent_cpu.configuration");
+    llvm::json::Array implementations;
+    for (Attribute entry : function->getAttrOfType<ArrayAttr>("intent_cpu.implementations")) {
+      auto binding = cast<cpu::ImplementationAttr>(entry);
+      llvm::json::Object values;
+      for (NamedAttribute parameter : binding.getParameters())
+        values[parameter.getName().getValue()] = cast<IntegerAttr>(parameter.getValue()).getInt();
+      implementations.push_back(llvm::json::Object{{"name", binding.getName().getValue().str()}, {"parameters", std::move(values)}});
+    }
+    candidates.push_back(llvm::json::Object{{"entry", function.getName().str()},
+        {"values", llvm::json::Array{config.getTaskGrain(), config.getTileM(), config.getTileN(), config.getTileK()}},
+        {"implementations", std::move(implementations)}});
+    cpu::PhysicalProgramAnalysis analysis(function);
+    llvm::DenseMap<Value, intent::QuantFormat> formats;
+    bool conflict = false;
+    auto requireFormat = [&](Value memory, intent::QuantFormat format) {
+      auto [it, inserted] = formats.try_emplace(analysis.storageRoot(memory), format);
+      if (!inserted && it->second != format) conflict = true;
+    };
+    function.walk([&](cpu::QuantizeOp op) { requireFormat(op.getOutput(), op.getFormat()); });
+    function.walk([&](cpu::QuantizedDotOp op) {
+      requireFormat(op.getLhs(), op.getLhsFormat()); requireFormat(op.getRhs(), op.getRhsFormat());
+    });
+    if (conflict) return function.emitError("one CPU storage has incompatible quantized record interpretations"), failure();
+    TaskLowering lowering(function, *output, formats, registry);
+    OpBuilder host(function.getContext());
+    host.setInsertionPointToStart(&function.front());
+    auto shapeArguments = lowering.shapeArguments(function, host);
     SmallVector<cpu::TasksOp> tasks;
     function.walk([&](cpu::TasksOp operation) { tasks.push_back(operation); });
     if (tasks.empty()) return function.emitError("Weft generation requires an explicit CPU task interface"), failure();
     for (auto [ordinal, task] : llvm::enumerate(tasks)) {
       std::string name = function.getName().str() + "_task_" + std::to_string(ordinal);
-      if (failed(lowering.lower(task, name))) return failure();
+      SmallVector<unsigned> argumentPositions;
+      for (BlockArgument argument : task.getBody().front().getArguments())
+        if (!argument.use_empty()) argumentPositions.push_back(argument.getArgNumber());
+      if (failed(lowering.lower(task, name, argumentPositions))) return failure();
+      host.setInsertionPoint(task);
+      auto loc = task.getLoc();
+      auto zero = host.create<arith::ConstantIndexOp>(loc, 0);
+      auto one = host.create<arith::ConstantIndexOp>(loc, 1);
+      auto loop = host.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{task.getCount()}, ValueRange{one});
+      host.setInsertionPointToStart(loop.getBody());
+      SmallVector<Value> arguments;
+      SmallVector<Value> original{loop.getInductionVars()[0]};
+      llvm::append_range(original, task.getCaptures());
+      for (unsigned position : argumentPositions) {
+        Value capture = original[position];
+        if (isa<MemRefType>(capture.getType())) arguments.push_back(capture);
+        else {
+          Type type = capture.getType().isIndex() ? Type(host.getI64Type()) : capture.getType();
+          Value box = host.create<memref::AllocaOp>(loc, MemRefType::get({1}, type));
+          Value scalar = capture;
+          if (capture.getType().isIndex()) scalar = host.create<arith::IndexCastOp>(loc, type, capture);
+          host.create<memref::StoreOp>(loc, scalar, box, ValueRange{zero});
+          arguments.push_back(box);
+        }
+      }
+      llvm::append_range(arguments, shapeArguments);
+      {
+        OpBuilder::InsertionGuard guard(host);
+        host.setInsertionPointToStart(cpuProgram.getBody());
+        auto declaration = host.create<func::FuncOp>(loc, name,
+            host.getFunctionType(TypeRange(arguments), {}));
+        declaration.setPrivate();
+        declaration->setAttr("cpu.external_runtime", host.getUnitAttr());
+      }
+      host.create<func::CallOp>(loc, name, TypeRange{}, arguments);
       interfaces.push_back(llvm::json::Object{{"cpu_entry", function.getName().str()},
           {"task_ordinal", static_cast<int64_t>(ordinal)}, {"weft_entry", name},
-          {"coordinate_argument", 0}, {"capture_count", static_cast<int64_t>(task.getCaptures().size())}});
+          {"coordinate_argument", llvm::is_contained(argumentPositions, 0u) ? 0 : -1},
+          {"argument_count", static_cast<int64_t>(argumentPositions.size())}});
+      task.erase();
     }
+    if (failed(cpu::materializeStructuredComputations(function))) return failure();
   }
   if (failed(verify(*output))) return failure();
+  std::string hostSource;
+  if (failed(serializeHostProgram(cpuProgram, hostSource))) return failure();
   llvm::raw_string_ostream stream(metadata);
   stream << llvm::json::Value(llvm::json::Object{{"kind", "weft-generation"},
-      {"native", false}, {"tasks", std::move(interfaces)}});
+      {"native", false}, {"host_source", hostSource}, {"tasks", std::move(interfaces)},
+      {"parameters", std::move(parameters)}, {"candidates", std::move(candidates)},
+      {"contiguous_views", interface.getContiguousViews()}, {"disjoint_outputs", interface.getDisjointOutputs()},
+      {"workers", cpuProgram->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities").getWorkers()}});
   return std::move(output);
 }
 

@@ -1189,6 +1189,29 @@ LogicalResult verifyRegionScan(Operation *operation) {
   return success();
 }
 
+LogicalResult verifyQuantization(Operation *operation) {
+  auto input = cast<RankedTensorType>(operation->getOperand(0).getType());
+  auto result = cast<RankedTensorType>(operation->getResult(0).getType());
+  auto record = [](RankedTensorType type, int64_t bytes) {
+    return type.getRank() == 2 && type.getDimSize(1) == bytes &&
+           type.getElementType().isUnsignedInteger(8);
+  };
+  if (auto quantize = dyn_cast<QuantizeOp>(operation)) {
+    if (quantize.getFormat() != QuantFormat::Q8K || input.getRank() != 2 ||
+        input.getDimSize(1) != 256 || !input.getElementType().isF32() ||
+        !record(result, 292) || !sameDimension(input, 0, result, 0))
+      return operation->emitOpError("Q8_K quantize requires f32[G,256] -> u8[G,292]");
+    return success();
+  }
+  auto dot = cast<QuantizedDotOp>(operation);
+  auto rhs = cast<RankedTensorType>(dot.getRhs().getType());
+  if (dot.getLhsFormat() != QuantFormat::Q4K || dot.getRhsFormat() != QuantFormat::Q8K ||
+      !record(input, 144) || !record(rhs, 292) || !sameDimension(input, 0, rhs, 0) ||
+      result.getRank() != 0 || !result.getElementType().isF32())
+    return operation->emitOpError("quantized dot requires Q4_K u8[G,144] x Q8_K u8[G,292] -> f32[]");
+  return success();
+}
+
 LogicalResult verifyContract(Operation *operation) {
   StringRef name = operation->getName().getStringRef();
   auto lhs = dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
@@ -1557,6 +1580,8 @@ LogicalResult verifyCanonicalOperation(Operation *operation) {
     return verifyRegionFold(operation);
   if (name == "intent.region_scan")
     return verifyRegionScan(operation);
+  if (name == "intent.quantize" || name == "intent.quantized_dot")
+    return verifyQuantization(operation);
   if (name == "intent.contract" || name == "intent.scaled_contract" ||
       name == "intent.sparse_contract")
     return verifyContract(operation);
@@ -1852,6 +1877,8 @@ INTENT_DEFINE_VERIFY(CompareOp)
 INTENT_DEFINE_VERIFY(ConditionOp)
 INTENT_DEFINE_VERIFY(ConstantOp)
 INTENT_DEFINE_VERIFY(ContractOp)
+INTENT_DEFINE_VERIFY(QuantizeOp)
+INTENT_DEFINE_VERIFY(QuantizedDotOp)
 INTENT_DEFINE_VERIFY(DimOp)
 INTENT_DEFINE_VERIFY(DomainOp)
 INTENT_DEFINE_VERIFY(DomainProductOp)

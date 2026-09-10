@@ -1,28 +1,68 @@
 schema: comet.native.v4
 name: cpu-programmable-lowering
 language: zh-CN
-phase: shape
+phase: build
 status: active
-state_version: 1
+state_version: 2
 brief: brief.md
-spec_changes: []
+spec_changes:
+  - capability: cpu-programmable-lowering
+    operation: create
+    source: specs/cpu-programmable-lowering/spec.md
 workspace:
   isolation: current
   change_branch: main
   target_branch: main
   finish: null
 loop:
-  stage: shape
+  stage: building
   goal_cycle: 1
-  iteration: 0
+  iteration: 1
   attempt: 0
   retry_epoch: 0
   failed_iteration_count: 0
   no_progress_count: 0
   execution_failure_count: 0
   previous_unresolved_ids: []
-  next_action: confirm-shape
-acceptance: []
+  next_action: submit-builder-candidate
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1：现有 CPU 程序保留完整 task/block、访问、依赖与 structured compute；共同
+      blocking/参数不再无条件绑定特定 f32 向量微核的内部组织，Mojo/Weft 从同一共同程序边界继续 lowering。
+    result: pending
+    reason: null
+  - id: A2
+    source: brief.md
+    text: A2：实际计算块通过明确的实现适用性、需求协调、参数绑定与微程序展开形成可验证 IR；现有 f32 Mojo native
+      路径在新机制中真实可调用，布局/供应与展开使用同一选择，无新旧旁路并存。
+    result: pending
+    reason: null
+  - id: A3
+    source: brief.md
+    text: A3：真实 Intent 作者 kernel 从 f32 activation 产生 Q8_K 中间值并让多个 Q4_K×Q8_K 点积消费；沿唯一
+      KIR→CPU→Weft 链形成量化/点积专业程序的真实展开。§5 的格式、i32 统计、f32 校正和 reduction
+      合同完整保留；producer/captures/轴/域、消费者、effects、共享 storage 与 lifetime
+      显式连接。量化不在每个点积里重复，不残留 emitter/runtime recipe，不调用完整 source kernel。
+    result: pending
+    reason: null
+  - id: A4
+    source: brief.md
+    text: A4：Weft native artifact 可通过 typed buffer ABI 加载并执行完整单次 CPU
+      invocation，任务、scalar、内部资源和 join 均闭合；SG2044 的固定量化投影 case 获得真实
+      generated/source ms 和 G/S，包含 activation quantization，并在同次 benchmark 通过
+      `1e-4 + 2e-3*abs(expected)` 容差，结果进入 `report/baselinev2/weft-rvv.csv`。不是仅生成
+      C、手动运行 reference 或把 SSH/编译耗时当算子时间。
+    result: pending
+    reason: null
+  - id: A5
+    source: brief.md
+    text: A5：shared/implementation/provider 参数都有实际消费者，有限合法候选以相应目标上的完整 invocation
+      时间选优并复用 artifact/winner。既有 Mojo f32 affine、RMSNorm、dense
+      GEMM、Softmax、LayerNorm 保持可达；受影响项使用原生产 benchmark、原算法/source/容差，实际
+      generated/source 时间和 G/S 更新到既有 CSV。
+    result: pending
+    reason: null
 builder_handoff: null
 blockers: []
 verification: null

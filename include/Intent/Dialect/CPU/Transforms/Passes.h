@@ -9,27 +9,28 @@
 
 namespace intent::cpu {
 
+class ImplementationRegistry;
+
 struct Configuration {
-  int64_t vectorWidth;
   int64_t taskGrain;
   int64_t tileM;
   int64_t tileN;
   int64_t tileK;
-  int64_t microM;
-  int64_t microN;
-  int64_t registerReplicas;
-  int64_t reductionReplicas;
+  mlir::DictionaryAttr local;
+
+  int64_t parameter(llvm::StringRef name) const {
+    return mlir::cast<mlir::IntegerAttr>(local.get(name)).getInt();
+  }
 };
 
 mlir::LogicalResult fuseStructuredComputations(mlir::func::FuncOp function);
 void forwardCPUOutputs(mlir::func::FuncOp function);
 mlir::LogicalResult materializeStructuredComputations(mlir::func::FuncOp function);
-mlir::LogicalResult materializeRegisterContractions(mlir::func::FuncOp function);
-mlir::LogicalResult materializeCPUProgram(mlir::ModuleOp module);
 mlir::LogicalResult fuseIntermediateBuffers(mlir::func::FuncOp function);
 mlir::LogicalResult fuseReductionTraversals(mlir::func::FuncOp function);
 mlir::LogicalResult blockContractions(mlir::func::FuncOp function,
-                                    const Configuration &configuration);
+                                    const Configuration &configuration,
+                                    const ImplementationRegistry &implementations);
 mlir::LogicalResult vectorizeLoops(mlir::func::FuncOp function, int64_t width,
                                    int64_t replicas, int64_t reductionReplicas);
 mlir::LogicalResult partitionTasks(mlir::func::FuncOp function, int64_t grain);
@@ -37,7 +38,8 @@ mlir::LogicalResult isolateTasks(mlir::func::FuncOp function);
 mlir::LogicalResult materializeTaskLoops(mlir::func::FuncOp function);
 mlir::LogicalResult runCPUPasses(mlir::ModuleOp module, int64_t vectorBits,
                                int64_t workers, llvm::StringRef defaults,
-                               llvm::StringRef overrides);
+                               llvm::StringRef overrides,
+                               const ImplementationRegistry &implementations);
 
 }
 

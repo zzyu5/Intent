@@ -1,0 +1,2 @@
+kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
+q4_k_projection,N4096-K4096-Q4_K-f32-1core,,,,source_weft_compilation_failed,Q8_K 字段切片写回缺少 packing plan；generated 与 source 均受阻，未进入 native 执行。

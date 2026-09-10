@@ -20,6 +20,9 @@ Tuple和record是immutable structural product types，不是ranked tensor或memo
 
 `i4/u4/fp4`不作为普通可寻址tensor element type。普通packed data使用`u8/u16/u32` carrier，加显式index、shift、mask、sign extension与scale arithmetic。FP4等microscaling formats由scaled-contract schema定义。
 
+闭合的 Q4_K/Q8_K [量化计算](quantized-operations.md)同样使用普通 u8 carrier，
+其 record 格式与数值由独立 quantize/quantized-dot schema 定义，不是新 scalar dtype。
+
 ## 2. Logical index 与 shape values
 
 logical `index`使用signed 64-bit arithmetic。physical address width由compiler根据shape、stride与bounds证明后选择，不能改变logical index结果。

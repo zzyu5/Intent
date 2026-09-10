@@ -7,6 +7,8 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/Passes.h"
 
 using namespace mlir;
 
@@ -70,7 +72,33 @@ LogicalResult legalizeProgram(ModuleOp module) {
     return module.emitError("Mojo native currently requires an AVX2 or AVX512 CPU capability");
   for (func::FuncOp function : module.getOps<func::FuncOp>())
     if (failed(cpu::materializeTaskLoops(function))) return failure();
-  if (failed(cpu::materializeCPUProgram(module))) return failure();
+  for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+    if (failed(materializeRegisterContractions(function)) ||
+        failed(cpu::materializeStructuredComputations(function)) ||
+        failed(cpu::fuseIntermediateBuffers(function))) return failure();
+  }
+  auto normalize = [&]() {
+    PassManager manager(module.getContext());
+    manager.addPass(createCanonicalizerPass());
+    manager.addPass(createCSEPass());
+    return manager.run(module);
+  };
+  if (failed(normalize())) return failure();
+  for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+    auto bindings = function->getAttrOfType<ArrayAttr>("intent_cpu.implementations");
+    if (!bindings || bindings.empty()) return function.emitError("Mojo lowering requires selected implementations");
+    auto binding = cast<cpu::ImplementationAttr>(bindings[0]);
+    for (Attribute value : bindings)
+      for (StringRef name : {"vector_width", "register_replicas", "reduction_replicas"})
+        if (cpu::implementationParameter(cast<cpu::ImplementationAttr>(value), name) != cpu::implementationParameter(binding, name))
+          return function.emitError("Mojo loop materialization requires coordinated vector bindings");
+    if (failed(cpu::fuseReductionTraversals(function)) ||
+        failed(cpu::vectorizeLoops(function,
+            cpu::implementationParameter(binding, "vector_width"),
+            cpu::implementationParameter(binding, "register_replicas"),
+            cpu::implementationParameter(binding, "reduction_replicas")))) return failure();
+  }
+  if (failed(normalize())) return failure();
   SmallVector<math::RsqrtOp> roots;
   module.walk([&](math::RsqrtOp operation) { roots.push_back(operation); });
   for (auto operation : roots) {

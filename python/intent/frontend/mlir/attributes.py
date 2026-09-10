@@ -15,6 +15,7 @@ from ..semantics.operations import AtomicRMWKind
 from ..semantics.operations import BinaryOperator
 from ..semantics.operations import ComparePredicate
 from ..semantics.operations import ScaledFormatKind
+from ..semantics.operations import QuantFormatKind
 from ..semantics.operations import ShapeExpr
 from ..semantics.operations import ShapeRelation
 from ..semantics.operations import UnaryOperator
@@ -71,6 +72,8 @@ def emit_attribute(value: object) -> str:
         return f"#intent.atomic_rmw_kind<{spelling}>"
     if isinstance(value, ScaledFormatKind):
         return f"#intent.scaled_format<{value.name.lower()}>"
+    if isinstance(value, QuantFormatKind):
+        return f"#intent.quant_format<{value.name.lower()}>"
     if isinstance(value, IntEnum):
         return f"{int(value)} : i64"
     if isinstance(value, int):

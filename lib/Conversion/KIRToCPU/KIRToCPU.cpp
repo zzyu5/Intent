@@ -38,8 +38,9 @@ public:
       auto parameter = cast<ParameterAttr>(parameters[i]);
       if (auto view = dyn_cast<ViewType>(argument.getType())) {
         auto tensor = cast<RankedTensorType>(view.getTensor());
-        if (!tensor.getElementType().isF32() || view.getAccess() == 2)
-          return source.emitError("CPU construction supports f32 In/Out views; InOut is not implemented");
+        if ((!tensor.getElementType().isF32() && !tensor.getElementType().isUnsignedInteger(8)) ||
+            view.getAccess() == 2)
+          return source.emitError("CPU construction supports f32/u8 In/Out views; InOut is not implemented");
         auto memory = MemRefType::get(tensor.getShape(), tensor.getElementType());
         if (view.getConstraints().getHasStrides()) {
           if (view.getConstraints().getStrides().size() != static_cast<size_t>(tensor.getRank()))
@@ -169,8 +170,14 @@ private:
           return failure();
         }
         offsets.push_back(builder.getIndexAttr(0));
-        sizes.push_back(domain.end);
-        resultShape.push_back(ShapedType::kDynamic);
+        llvm::APInt extent;
+        if (matchPattern(domain.end, m_ConstantInt(&extent))) {
+          sizes.push_back(builder.getIndexAttr(extent.getSExtValue()));
+          resultShape.push_back(extent.getSExtValue());
+        } else {
+          sizes.push_back(domain.end);
+          resultShape.push_back(ShapedType::kDynamic);
+        }
       } else {
         operation->emitError("CPU construction does not implement this index relation");
         return failure();
@@ -416,6 +423,23 @@ private:
       values.map(op.getResult(), output);
     } else if (auto op = dyn_cast<ReduceOp>(operation)) {
       return reduce(op);
+    } else if (auto op = dyn_cast<QuantizeOp>(operation)) {
+      auto tensor = cast<RankedTensorType>(op.getResult().getType());
+      auto sizes = extents(tensor, loc);
+      if (failed(sizes)) return failure();
+      Value output = allocate(tensor, *sizes, loc);
+      output.getDefiningOp<memref::AllocOp>().setAlignment(4);
+      if (tensor.getShape()[0] != 0)
+        builder.create<cpu::QuantizeOp>(loc, values.lookup(op.getInput()), output, op.getFormatAttr());
+      values.map(op.getResult(), output);
+    } else if (auto op = dyn_cast<QuantizedDotOp>(operation)) {
+      if (cast<RankedTensorType>(op.getLhs().getType()).getShape()[0] == 0) {
+        values.map(op.getResult(), builder.create<arith::ConstantOp>(loc, builder.getF32FloatAttr(0.0)));
+        return success();
+      }
+      values.map(op.getResult(), builder.create<cpu::QuantizedDotOp>(loc,
+          builder.getF32Type(), values.lookup(op.getLhs()), values.lookup(op.getRhs()),
+          op.getLhsFormatAttr(), op.getRhsFormatAttr()));
     } else if (auto op = dyn_cast<ContractOp>(operation)) {
       return contract(op);
     } else if (operation->getName().getDialectNamespace() == "arith") {

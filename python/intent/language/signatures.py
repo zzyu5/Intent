@@ -20,6 +20,10 @@ def _signature(
 
 
 INTRINSIC_SIGNATURES = {
+    "quantize": _signature(("values",), required=("format",)),
+    "quantized_dot": _signature(
+        ("lhs", "rhs"), required=("lhs_format", "rhs_format", "acc_dtype")
+    ),
     "fdiv": _signature(
         ("lhs", "rhs"), defaults=(("approximate", False), ("flush_to_zero", False))
     ),

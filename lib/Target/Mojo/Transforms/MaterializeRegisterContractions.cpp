@@ -1,5 +1,6 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
-#include "Utilities.h"
+#include "Intent/Target/Mojo/Transforms/Passes.h"
+#include "../../../Dialect/CPU/Transforms/Utilities.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
@@ -8,7 +9,8 @@
 
 using namespace mlir;
 
-namespace intent::cpu {
+namespace intent::mojo {
+using namespace intent::cpu;
 namespace {
 
 struct LocalEpilogue {

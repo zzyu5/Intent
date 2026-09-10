@@ -91,6 +91,8 @@ class CompiledArtifact:
         function: Callable[..., object],
         arguments: tuple[Any, ...],
     ) -> object:
+        if self.device_type == "cpu":
+            return function(*arguments)
         import torch
 
         expected = torch.device(self.device_type, self.device) if self.device_type == "cuda" else torch.device(self.device_type)
@@ -103,6 +105,4 @@ class CompiledArtifact:
         if expected.type == "cuda":
             with torch.cuda.device(expected):
                 return function(*arguments)
-        if expected.type == "cpu":
-            return function(*arguments)
         raise NotImplementedError(f"artifact invocation for {expected.type}")

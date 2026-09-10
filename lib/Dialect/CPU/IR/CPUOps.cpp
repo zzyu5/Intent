@@ -63,3 +63,35 @@ LogicalResult ReduceOp::verify() {
   }
   return success();
 }
+
+namespace {
+bool recordType(Type type, int64_t bytes) {
+  auto memory = dyn_cast<MemRefType>(type);
+  return memory && memory.getRank() == 2 &&
+      (memory.isDynamicDim(1) || memory.getDimSize(1) == bytes) &&
+      memory.getElementType().isUnsignedInteger(8);
+}
+}
+
+LogicalResult QuantizeOp::verify() {
+  auto input = cast<MemRefType>(getInput().getType());
+  auto output = cast<MemRefType>(getOutput().getType());
+  if (getFormat() != intent::QuantFormat::Q8K || input.getRank() != 2 ||
+      (!input.isDynamicDim(1) && input.getDimSize(1) != 256) ||
+      !input.getElementType().isF32() || !recordType(output, 292) ||
+      (!input.isDynamicDim(0) && !output.isDynamicDim(0) &&
+       input.getDimSize(0) != output.getDimSize(0)))
+    return emitOpError("Q8_K preparation requires f32[G,256] and u8[G,292] storage");
+  return success();
+}
+
+LogicalResult QuantizedDotOp::verify() {
+  if (getLhsFormat() != intent::QuantFormat::Q4K || getRhsFormat() != intent::QuantFormat::Q8K ||
+      !recordType(getLhs().getType(), 144) || !recordType(getRhs().getType(), 292))
+    return emitOpError("quantized dot requires Q4_K and Q8_K record storage");
+  auto lhs = cast<MemRefType>(getLhs().getType());
+  auto rhs = cast<MemRefType>(getRhs().getType());
+  if (!lhs.isDynamicDim(0) && !rhs.isDynamicDim(0) && lhs.getDimSize(0) != rhs.getDimSize(0))
+    return emitOpError("quantized dot record extents must agree");
+  return success();
+}

@@ -6,5 +6,6 @@
 
 namespace intent::weft_provider {
 mlir::LogicalResult serializeProgram(mlir::ModuleOp program, std::string &source);
+mlir::LogicalResult serializeHostProgram(mlir::ModuleOp program, std::string &source);
 }
 #endif

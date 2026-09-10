@@ -1,0 +1,13 @@
+{
+  "host": "rvv",
+  "march": "rv64gcv_zfh_zvfh",
+  "abi": "lp64d",
+  "vlen_bits": 128,
+  "cpus": [48],
+  "cc": ["/opt/tcrv-toolchains/llvm-18.1.8/bin/clang"],
+  "cflags": [
+    "--gcc-toolchain=/opt/tcrv-toolchains/gcc-15.2.0",
+    "-B/opt/tcrv-toolchains/binutils-2.46.1/bin",
+    "-fno-integrated-as"
+  ]
+}

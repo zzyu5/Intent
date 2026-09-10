@@ -1,0 +1,10 @@
+{
+  "cpu": {
+    "weft.q8_k": [
+      {"shared": [8, 1, 1, 1], "local": {"chunk": 32}},
+      {"shared": [8, 1, 1, 1], "local": {"chunk": 64}}
+    ],
+    "weft.contract_f32": [{"shared": [1, 32, 32, 128], "local": {}}],
+    "weft.structured": [{"shared": [8, 1, 1, 1], "local": {}}]
+  }
+}

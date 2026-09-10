@@ -1,12 +1,12 @@
 add_mlir_library(MLIRIntentCPUTransforms
   FuseStructuredComputations.cpp
   MaterializeStructuredComputations.cpp
-  MaterializeRegisterContractions.cpp
   FuseIntermediateBuffers.cpp
   FuseReductionTraversals.cpp
   BlockContractions.cpp
   VectorizeLoops.cpp
   PartitionTasks.cpp
+  Implementation.cpp
   Passes.cpp
 
   LINK_LIBS PUBLIC

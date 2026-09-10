@@ -105,6 +105,14 @@ def Intent_ScaledFormat : Intent_I32Enum<"ScaledFormat",
 def Intent_ScaledFormatAttr :
     Intent_I32EnumAttr<"scaled_format", Intent_ScaledFormat>;
 
+def Intent_QuantFormat : Intent_I32Enum<"QuantFormat",
+    "Canonical quantized record format", [
+      I32EnumAttrCase<"Q4K", 0, "q4_k">,
+      I32EnumAttrCase<"Q8K", 1, "q8_k">
+    ]>;
+def Intent_QuantFormatAttr :
+    Intent_I32EnumAttr<"quant_format", Intent_QuantFormat>;
+
 def Intent_TensorShapeAttr : AttrDef<Intent_Dialect, "TensorShape"> {
   let mnemonic = "tensor_shape";
   let summary = "Stable identities for logical tensor dimensions";

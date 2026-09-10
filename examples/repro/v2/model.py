@@ -27,13 +27,22 @@ class PreparedLaunch:
 
 @dataclass(frozen=True)
 class PreparedComparison:
-    generated: PreparedLaunch
-    source: PreparedLaunch
+    generated: PreparedLaunch | None
+    source: PreparedLaunch | None
     tolerance: Tolerance | tuple[Tolerance, ...]
     cuda_graph: bool
     status: str = "pass"
     note: str = ""
     device_type: str = "cuda"
+    native_comparison: Callable[[], NativeComparisonResult] | None = None
+
+
+@dataclass(frozen=True)
+class NativeComparisonResult:
+    generated_ms: float
+    source_ms: float
+    generated: TensorTree
+    source: TensorTree
 
 
 @dataclass(frozen=True)

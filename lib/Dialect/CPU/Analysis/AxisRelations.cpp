@@ -54,6 +54,10 @@ AxisRelations::AxisRelations(func::FuncOp function) {
         equate(argument, capture);
     } else if (auto copy = dyn_cast<memref::CopyOp>(operation)) {
       equate(copy.getSource(), copy.getTarget());
+    } else if (auto quantize = dyn_cast<QuantizeOp>(operation)) {
+      unite(positions.at(quantize.getInput())[0], positions.at(quantize.getOutput())[0]);
+    } else if (auto dot = dyn_cast<QuantizedDotOp>(operation)) {
+      unite(positions.at(dot.getLhs())[0], positions.at(dot.getRhs())[0]);
     } else if (auto generic = dyn_cast<linalg::GenericOp>(operation)) {
       llvm::DenseMap<unsigned, unsigned> dimensions;
       for (auto [input, map] : llvm::zip(generic->getOperands(), generic.getIndexingMapsArray())) {

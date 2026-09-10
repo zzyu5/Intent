@@ -20,6 +20,9 @@ from .builtins import buffer
 from .builtins import bitcast
 from .builtins import cast
 from .builtins import contract
+from .builtins import quant
+from .builtins import quantize
+from .builtins import quantized_dot
 from .builtins import cummax
 from .builtins import cumsum
 from .builtins import dot
@@ -100,6 +103,9 @@ from .dtypes import u64
 
 
 __all__ = [
+    "quant",
+    "quantize",
+    "quantized_dot",
     "Constexpr",
     "ConstexprSpec",
     "DType",

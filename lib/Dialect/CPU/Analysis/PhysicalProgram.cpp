@@ -92,6 +92,12 @@ SmallVector<MemoryAccess> PhysicalProgramAnalysis::accesses(Operation *scope) {
         add(output.get(), generic.payloadUsesValueFromOperand(&output), true);
     } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
       for (Value input : reduce.getInputs()) add(input, true, false);
+    } else if (auto quantize = dyn_cast<QuantizeOp>(operation)) {
+      add(quantize.getInput(), true, false);
+      add(quantize.getOutput(), false, true);
+    } else if (auto dot = dyn_cast<QuantizedDotOp>(operation)) {
+      add(dot.getLhs(), true, false);
+      add(dot.getRhs(), true, false);
     } else if (auto copy = dyn_cast<memref::CopyOp>(operation)) {
       add(copy.getSource(), true, false); add(copy.getTarget(), false, true);
     } else if (auto load = dyn_cast<memref::LoadOp>(operation)) add(load.getMemref(), true, false);
@@ -109,8 +115,9 @@ SmallVector<AllocationFacts> PhysicalProgramAnalysis::allocations() {
     Value value = operation->getResult(0);
     auto type = cast<MemRefType>(value.getType());
     std::optional<int64_t> bytes;
-    if (type.hasStaticShape() && type.getNumElements() <= std::numeric_limits<int64_t>::max() / 4)
-      bytes = type.getNumElements() * 4;
+    int64_t elementBytes = (type.getElementTypeBitWidth() + 7) / 8;
+    if (type.hasStaticShape() && type.getNumElements() <= std::numeric_limits<int64_t>::max() / elementBytes)
+      bytes = type.getNumElements() * elementBytes;
     Operation *writer = nullptr;
     bool multiple = false;
     for (Operation *user : value.getUsers()) {
@@ -119,7 +126,8 @@ SmallVector<AllocationFacts> PhysicalProgramAnalysis::allocations() {
         writes = llvm::is_contained(generic.getDpsInits(), value);
       else if (auto store = dyn_cast<memref::StoreOp>(user)) writes = store.getMemref() == value;
       else if (auto copy = dyn_cast<memref::CopyOp>(user)) writes = copy.getTarget() == value;
-      else if (!isa<memref::LoadOp, memref::DimOp, memref::DeallocOp, ReduceOp>(user))
+      else if (auto quantize = dyn_cast<QuantizeOp>(user)) writes = quantize.getOutput() == value;
+      else if (!isa<memref::LoadOp, memref::DimOp, memref::DeallocOp, ReduceOp, QuantizedDotOp>(user))
         multiple = true;
       if (writes) {
         if (writer) multiple = true;
@@ -150,10 +158,6 @@ LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
   }
   auto capabilities = function->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>(
       "intent_cpu.capabilities");
-  auto configuration = function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration");
-  if (configuration && (!capabilities ||
-      configuration.getVectorWidth() > capabilities.getVectorBits() / 32))
-    return function.emitError("CPU issue width exceeds the selected capability");
   for (auto facts : allocations()) {
     if (facts.stack && capabilities && (!facts.bytes || *facts.bytes > capabilities.getPrivateBytes()))
       return facts.value.getDefiningOp()->emitError("CPU stack allocation exceeds its declared budget");
@@ -182,7 +186,7 @@ LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
     }
   }
   function.walk([&](Operation *operation) {
-    if (realized && (isa<ReduceOp>(operation) || operation->getName().getDialectNamespace() == "linalg")) {
+    if (realized && (isa<ReduceOp, QuantizeOp, QuantizedDotOp>(operation) || operation->getName().getDialectNamespace() == "linalg")) {
       operation->emitError("CPU structured operation has not been materialized for the provider");
       invalid = true;
     }

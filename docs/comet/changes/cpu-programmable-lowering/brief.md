@@ -15,7 +15,7 @@
 
 ## Source coverage
 
-当前 CPU doc 与已提交报告已完整读取。下表覆盖相应文档全部章节；`covered` 表示已映射到本草案，不表示 Shape 已获最终确认。参考链接仅作为实现证据，不把其全部上游能力扩成需求。
+当前 CPU doc 与已提交报告已完整读取。下表覆盖相应文档全部章节；完整 Shape 已获用户确认。参考链接仅作为实现证据，不把其全部上游能力扩成需求。
 
 | 来源单元 | 读取 | 归类与保留内容 | Spec 对应 | 验收 | 覆盖状态 |
 |---|---|---|---|---|---|
@@ -56,7 +56,7 @@
 
 # 约束与不变量
 
-- `doc/` 为设计权威；CPU 分层、内部资源和调用边界按既有规范收束。新增语言设计仅为待最终确认的 §5 闭合量化准备、点积及格式/数值合同，确认后先补对应 DSL 规范；不为了保留旧实现改写其它语义。报告提供已读证据与范围线索，旧归档的非目标、失败状态和性能门槛不自动变成本轮约束。
+- `doc/` 为设计权威；CPU 分层、内部资源和调用边界按既有规范收束。新增语言设计仅为已确认的 §5 闭合量化准备、点积及格式/数值合同，先补对应 DSL 规范；不为了保留旧实现改写其它语义。报告提供已读证据与范围线索，旧归档的非目标、失败状态和性能门槛不自动变成本轮约束。
 - 专家 implementation 可编程，展开必须成为 current IR；serializer 只拼写。合法直接映射与专业实现按适用条件共存，不以失败后 fallback 决定程序。
 - 格式/算法选择、实现选择、参数选择分别归属。Q4_K×Q8_K 尚无对应 DSL/KIR 数值合同，先明确该最小合同，不以一个 format 字符串冒充完成。
 - 外围共享量化准备、数据供应与资源可见；微程序不能每个 output tile 重复 activation quantization，不能隐藏 persistent repack/缓存。内部物化不强迫上移到作者 public ABI；下层 View 参数与本次 invocation 的 storage owner/lifetime 显式对应。
@@ -67,6 +67,7 @@
 - 用户已确认将 CPU 模型和可编程 lowering 边界固定到 `doc/`，文档与报告已提交为 `b164302`。
 - 用户已明确接受 `cpu-pointwise-reductions` 的 4/4 验收并授权归档；归档提交为 `44c422c`。本轮不再恢复该任务。
 - 用户授权创建新 change，沿用 main/current；此授权不是本 Shape 的最终 Build 确认。
+- 用户明确回复“可以，进入实现吧”，确认更新后的完整 Shape、A1–A5、Weft native/SG2044 性能范围和非目标，授权进入 Build。
 - 用户最新授权替代原 Q1 的范围裁剪：纳入调用内 Q8_K 量化准备与 Q4_K×Q8_K 点积组合，并接入 Weft runtime；不再把量化准备或设备执行一概排除。量化准备可以专业微程序化，其生产结果、共享范围与 lifetime 仍属于 current CPU/provider program。
 - 最终 Shape 的接口提议：普通 u8 carrier 保持现有 ABI；closed format schema 定义固定 record mapping、`bsum` 一致性及量化点积数值语义。Q4_K/Q8_K 不是新 scalar dtype，也不借 `scaled_contract` 或 arbitrary `assume` 承载。具体专业程序可以用结构化 IRBuilder 定义，无需为本轮新建通用 Weft Python module importer；其展开须进入当前宿主程序。
 - 采用单个普通 Native change：共享阶段、实现接口、bindings 与 Mojo/Weft 集成会共同修改同一组核心边界，不按 provider 拆分 Supervisor。
@@ -79,7 +80,9 @@
 
 # 待解决问题
 
-- [blocking] CONFIRM: 是否确认更新后的完整 Shape：保留 structured CPU task/block，重构实现选择/需求协调/IR 展开并保持 Mojo 五项与有效 tuning；新增调用内 Q8_K 量化准备、Q4_K×Q8_K 点积及中间值复用；贯通 Weft AOT native artifact、typed buffer load/run，在 SG2044 固定一个含量化准备的投影 case 测真实性能和原容差；不强制双设备全量、IME、板卡完整 JIT 安装或跨调用 repack，外部 TianchenRV 先只读，沿用 main/current？确认后进入 Build。
+- [blocking] EXTERNAL-FIELD-STORE：2026-09-10 的正式 Weft 性能入口中，generated 和完整 source closure 均在外部 compiler 的 Q8_K 字段切片写回失败，尚未进入 native 执行。Source 定位为 `source/weft/tianchenrv/contraction/q4_k_projection/q4_k_projection.py:45`，错误为 `encoded field commit has no selected packing plan`。
+- TianchenRV `lib/Target/PlanRISCVMemory.cpp:2881` 只对直接 FieldOp destination 调用 packing planner；`PlanRISCVFieldStores.cpp:11` 只承接完整字段，`Emission/Memory.cpp:1643` / `Emission/FieldStorage.cpp:71` 对投影后的 Field binding 仍要求该 plan。需要在外部 physical memory lowering/plan 中闭合字段子区域写回，而不是在 emitter 临时拼 packing。
+- 外部仓库有其它未提交工作，仍保持只读。等待用户授权最小外部修复与独立提交；不覆盖现有修改，不更换算法或扩大容差。Comet 保持 Build，未提交验收候选；Mojo 五项同次 benchmark 已通过原容差并更新 `report/baselinev2/mojo-x86.csv`，Weft native 调用、数值与性能均尚未验收。
 
 # 验证预期
 

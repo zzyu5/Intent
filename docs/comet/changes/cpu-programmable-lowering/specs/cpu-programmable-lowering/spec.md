@@ -4,7 +4,7 @@
 
 本能力实现 `doc/compiler/cpu-program-ir.md` 定义的 structured CPU program 与可编程目标 realization。CPU 仍从 canonical KIR 独立构造，形成非 SIMT 的 task/block 程序；不改为整算子库选择器，不复制 GPU execution topology，也不另起 planning IR。
 
-用户最新授权将本轮扩为调用内 Q8_K 量化准备、Q4_K×Q8_K 点积组合与 Weft runtime 接入。原 generation-only 裁剪已被替代；完整范围见 §5–7，等待最终 Shape 确认。确认后先将最小语言扩展写入 `doc/dsl/`，其它设计继续按现有 `doc/` 实现。
+用户已确认完整 Shape 并授权进入实现，范围为调用内 Q8_K 量化准备、Q4_K×Q8_K 点积组合与 Weft runtime 接入。原 generation-only 裁剪已被替代；完整范围见 §5–7。先将最小语言扩展写入 `doc/dsl/`，其它设计继续按现有 `doc/` 实现。
 
 ## 2. 共同程序与分层
 

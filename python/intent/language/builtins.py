@@ -53,6 +53,22 @@ class ScaledFormat:
         return f"I.{self.name}"
 
 
+@dataclass(frozen=True, slots=True)
+class QuantFormat:
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class QuantFormats:
+    q4_k: QuantFormat = QuantFormat("q4_k")
+    q8_k: QuantFormat = QuantFormat("q8_k")
+
+
+quant = QuantFormats()
+quantize = Intrinsic("quantize")
+quantized_dot = Intrinsic("quantized_dot")
+
+
 domain = Intrinsic("domain")
 parallel = Intrinsic("parallel")
 indices = Intrinsic("indices")
@@ -192,6 +208,8 @@ INTRINSICS = {
         region_fold,
         region_scan,
         contract,
+        quantize,
+        quantized_dot,
         dot,
         matvec,
         vecmat,

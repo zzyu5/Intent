@@ -69,6 +69,10 @@ def lower_structured_intrinsic(
         return _region_scan(lowerer, node)
     if name == "contract":
         return _contract(lowerer, node)
+    if name in ("quantize", "quantized_dot"):
+        from .quantization import lower_quantization
+
+        return lower_quantization(lowerer, name, node)
     if name == "scaled_contract":
         return _scaled_contract(lowerer, node)
     if name in ("sparse.one_of_two", "sparse.two_of_four"):

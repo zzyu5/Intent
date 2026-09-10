@@ -267,6 +267,12 @@ def evaluate(
 ) -> tuple[float | None, float | None]:
     if comparison.device_type == "cpu" and before_benchmark is not None:
         before_benchmark()
+    if comparison.native_comparison is not None:
+        report_stage("native_benchmark")
+        measured = comparison.native_comparison()
+        report_stage("numerical_comparison")
+        compare_outputs(measured.generated, measured.source, comparison.tolerance)
+        return measured.generated_ms, measured.source_ms
     report_stage("generated_launch")
     try:
         if comparison.generated.prepare is not None:

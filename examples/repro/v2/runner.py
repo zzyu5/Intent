@@ -45,6 +45,8 @@ WORKER_TIMEOUT_SECONDS = 300
 def _target(provider: str):
     if provider == "mojo":
         return intent.MojoTarget(workers=8)
+    if provider == "weft":
+        return intent.WeftTarget(vector_bits=128, workers=1)
     if provider == "triton":
         return intent.TritonTarget(device=0)
     if provider == "cutile":
@@ -93,7 +95,7 @@ def _run_entry(
     if provider == "mojo":
         from .providers.mojo.common import configure_cpu_budget
         configure_cpu_budget(8)
-    else:
+    elif provider != "weft":
         torch.cuda.set_device(0)
     torch.manual_seed(0)
     project_root = Path(__file__).resolve().parents[3]
