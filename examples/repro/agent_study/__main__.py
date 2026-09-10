@@ -79,6 +79,8 @@ def trial(arguments, row, repeat, arm, records, runtime) -> None:
             if arm == "intent":
                 seed = seed / "triton_seed"
             continue
+        if arguments.stage is not None and stage != arguments.stage:
+            continue
         if stage == "optimization" and seed is None:
             break
         if stop_path.exists():
@@ -102,16 +104,17 @@ def trial(arguments, row, repeat, arm, records, runtime) -> None:
         if stage == "optimization":
             prefix += "The existing files are your actual seed; optimize its full operator time. "
             prefix += "Measured seed: " + json.dumps({key: seed_result[key] for key in ("candidate_ms", "reference_ms", "ratio")})
+        submissions = [item for item in previous if item["status"] != "agent_environment_failure"]
         history = [{"candidate": item["candidate"], "feedback": {key: item[key] for key in ("status", "candidate_ms", "reference_ms", "ratio")},
                     "programs": {path.name: path.read_text() for path in (arguments.project / item["program"]).parent.glob("*.py")}}
-                   for item in previous]
-        if previous:
-            previous_directory = (arguments.project / previous[-1]["program"]).parent
+                   for item in submissions]
+        if submissions:
+            previous_directory = (arguments.project / submissions[-1]["program"]).parent
             for path in previous_directory.glob("*.py"):
                 shutil.copyfile(path, directory / path.name)
         started = time.monotonic()
         spent = sum(item["agent"]["seconds"] + item.get("preparation_and_benchmark_seconds", 0) for item in previous)
-        for candidate in range(len(previous) + 1, suite[f"{stage}_candidates"] + 1):
+        for candidate in range(len(submissions) + 1, suite[f"{stage}_candidates"] + 1):
             if arguments.stop.is_set():
                 return
             remaining = suite["phase_seconds"] - spent - (time.monotonic() - started)
@@ -125,6 +128,10 @@ def trial(arguments, row, repeat, arm, records, runtime) -> None:
             agent_result = execute(directory, suite, prompt, remaining_seconds=remaining,
                                    executable=arguments.codex, stop=arguments.stop)
             destination = output_root / f"{stage}-{candidate}"
+            resumed = 0
+            while destination.exists():
+                resumed += 1
+                destination = output_root / f"{stage}-{candidate}-resume-{resumed}"
             destination.mkdir()
             if agent_result["action"] == "stop" and stage == "optimization":
                 (destination / "agent.json").write_text(json.dumps(agent_result, indent=2) + "\n")
@@ -147,6 +154,7 @@ def trial(arguments, row, repeat, arm, records, runtime) -> None:
             observation = {"task": row["task"], "case": f"upstream-profile-{task['input_index']}",
                            "arm": arm, "repeat": repeat, "stage": stage, "candidate": candidate,
                            "compiler_commit": arguments.compiler_commit,
+                           "compiler_executable": str(arguments.compiler),
                            "program": str(program.relative_to(arguments.project)),
                            "agent": agent_record, **measured}
             records.add(observation)
@@ -174,10 +182,12 @@ def main() -> None:
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--triton-ref", type=Path, required=True)
     parser.add_argument("--compiler", type=Path, required=True)
+    parser.add_argument("--compiler-revision", help="Caller-declared build revision of an immutable compiler snapshot; verifies only that the live Python frontend matches")
     parser.add_argument("--codex", type=Path, required=True, help="Native Codex executable, not a shell/Node launcher")
     parser.add_argument("--tasks", nargs="+")
     parser.add_argument("--repeat", type=int, choices=(0, 1, 2), action="append")
     parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--stage", choices=("generation", "optimization"), help="Schedule one phase across the suite before the other")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--output", type=Path, help="Independent report directory for a newly frozen experiment configuration")
     arguments = parser.parse_args()
@@ -188,13 +198,19 @@ def main() -> None:
     arguments.compiler = arguments.compiler.resolve(strict=True)
     arguments.codex = arguments.codex.resolve(strict=True)
     arguments.stop = threading.Event()
-    arguments.compiler_commit = compiler_revision(arguments.project)
+    arguments.compiler_commit = arguments.compiler_revision or compiler_revision(arguments.project)
+    compiler_paths = ["python/intent"] if arguments.compiler_revision else ["CMakeLists.txt", "include", "lib", "python/intent", "tools"]
     if subprocess.check_output(["git", "-C", str(arguments.project), "status", "--porcelain", "--",
-                                "CMakeLists.txt", "include", "lib", "python/intent", "tools"], text=True).strip():
+                                *compiler_paths], text=True).strip() and arguments.stage != "optimization":
         parser.error("commit compiler changes before agent trials; use the existing benchmark entry for compiler development")
+    if arguments.compiler_revision:
+        arguments.compiler_commit = subprocess.check_output(
+            ["git", "-C", str(arguments.project), "rev-parse", "--verify", f"{arguments.compiler_revision}^{{commit}}"], text=True).strip()
+        if arguments.stage != "optimization" and subprocess.check_output(["git", "-C", str(arguments.project), "diff", arguments.compiler_commit, "--", "python/intent"], text=True).strip():
+            parser.error("the live Python frontend differs from the specified compiler snapshot")
     arguments.suite = read_suite()
-    if not 1 <= arguments.workers <= 4:
-        parser.error("use between one and four concurrent preparation/agent workers")
+    if not 1 <= arguments.workers <= 8:
+        parser.error("use between one and eight concurrent preparation/agent workers")
     torch.set_num_threads(1)
     rows = catalog(arguments.reference, arguments.suite)
     by_id = {task["id"]: task for task in arguments.suite["tasks"]}

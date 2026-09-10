@@ -264,6 +264,7 @@ def evaluate(
     comparison: PreparedComparison,
     *,
     before_benchmark: Callable[[], None] | None = None,
+    source_timing_error: Callable[[Exception], bool] | None = None,
 ) -> tuple[float | None, float | None]:
     if comparison.device_type == "cpu" and before_benchmark is not None:
         before_benchmark()
@@ -309,16 +310,20 @@ def evaluate(
         generated_first = _benchmark_launch(comparison.generated, comparison, 25)
     except Exception as error:
         raise PipelineStageError("generated_benchmark", str(error)) from error
-    report_stage("source_benchmark")
-    try:
-        source_first = _benchmark_launch(comparison.source, comparison, 25)
-    except Exception as error:
-        raise PipelineStageError("source_benchmark", str(error)) from error
-    report_stage("source_reverse_benchmark")
-    try:
-        source_second = _benchmark_launch(comparison.source, comparison, 0)
-    except Exception as error:
-        raise PipelineStageError("source_reverse_benchmark", str(error)) from error
+    for stage, warmup in (("source_benchmark", 25), ("source_reverse_benchmark", 0)):
+        report_stage(stage)
+        try:
+            source_ms = _benchmark_launch(comparison.source, comparison, warmup)
+        except Exception as error:
+            if source_timing_error is not None and source_timing_error(error):
+                # The candidate window and numerical comparison already finished.
+                # Do not reuse a stream after an unsupported reference capture.
+                return generated_first, None
+            raise PipelineStageError(stage, str(error)) from error
+        if warmup:
+            source_first = source_ms
+        else:
+            source_second = source_ms
     report_stage("generated_reverse_benchmark")
     try:
         generated_second = _benchmark_launch(comparison.generated, comparison, 0)

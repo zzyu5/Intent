@@ -71,7 +71,22 @@ def run(arguments) -> dict:
     task = next(task for task in suite["tasks"] if task["id"] == arguments.task)
     row = next(row for row in catalog(arguments.reference, suite) if row["task"] == arguments.task)
     result = {"status": "pending", "candidate_ms": None, "reference_ms": None, "ratio": None,
+              "reference_timing_note": None,
               "timing": "cuda_graph", "tolerance": suite["tolerances"][task["tolerance"]]}
+
+    def source_timing_error(error: Exception) -> bool:
+        cause = error
+        while cause is not None:
+            if isinstance(cause, torch.AcceleratorError) and "operation not permitted when stream is capturing" in str(cause):
+                result["reference_timing_note"] = (
+                    "The unchanged PyTorch reference cannot be captured by CUDA Graph. "
+                    "Its eager output remains the numerical oracle. Candidate time is "
+                    "the completed CUDA Graph window before reference capture; no reference ratio is available."
+                )
+                result["reference_timing_error"] = str(cause)
+                return True
+            cause = cause.__cause__ or cause.__context__
+        return False
     started = time.monotonic()
     stage = "reference_preparation"
     budget = TuningBudget(suite["max_tuning_configurations"], CandidateTorchPolicy)
@@ -96,8 +111,10 @@ def run(arguments) -> dict:
                 reference_call = reference_call.to_device("cuda")
                 candidate = _observe(candidate_call, function, task=arguments.task, enforce=True)
                 source = _observe(reference_call, reference_function, task=arguments.task, enforce=False)
-                measured, anchor = evaluate(PreparedComparison(candidate, source, tolerance(task, suite), cuda_graph=True))
-            result.update(status="pass", candidate_ms=measured, reference_ms=anchor, ratio=measured / anchor)
+                measured, anchor = evaluate(PreparedComparison(candidate, source, tolerance(task, suite), cuda_graph=True),
+                                            source_timing_error=source_timing_error)
+            result.update(status="pass", candidate_ms=measured, reference_ms=anchor,
+                          ratio=measured / anchor if anchor is not None else None)
             if arguments.language == "intent":
                 stage = "source_export"
                 export_seed(arguments.program, context, artifact_directory / "triton_seed")
@@ -113,8 +130,8 @@ def run(arguments) -> dict:
         elif isinstance(error, NumericalComparisonError):
             status = "numerical_failure"
         elif isinstance(error, PipelineStageError):
-            status = "execution_failure"
             stage = error.stage
+            status = "reference_failure" if stage.startswith("source_") else "execution_failure"
         elif hasattr(error, "stage"):
             status = "compilation_failure"
             stage = error.stage
