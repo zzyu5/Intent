@@ -88,7 +88,13 @@ class TuningBudget:
             kwargs.pop("warmup", None)
             autotuning += 1
             try:
-                return tuner.warmup(*args, **kwargs)
+                compiled = tuner.warmup(*args, **kwargs)
+                # Autotuner.run returns one compiled kernel. Preserve that
+                # interface for explicit-output artifact calls during warmup.
+                for kernel in compiled:
+                    if kernel is not None:
+                        return kernel
+                raise RuntimeError("no bounded autotune configuration compiled successfully")
             finally:
                 autotuning -= 1
 
