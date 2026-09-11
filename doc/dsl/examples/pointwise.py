@@ -18,3 +18,8 @@ def fused_bias_gelu(
         1.0 + I.erf(shifted * 0.7071067811865476)
     )
     output[rows, columns] = I.cast(activated, I.bf16)
+
+
+def compile_bias_gelu(*, compiler, target):
+    artifact = intent.compile(fused_bias_gelu, compiler=compiler, target=target)
+    return artifact.run

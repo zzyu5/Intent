@@ -6,12 +6,15 @@ from pathlib import Path
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 
 import tomli
 import triton
 import triton.language
+
+from intent.tools.manual import snapshot
 
 
 def _toml(value) -> str:
@@ -23,61 +26,61 @@ def _toml(value) -> str:
 
 
 def materialize_language(project: Path, triton_ref: Path, directory: Path, language: str) -> list[str]:
-    directory.mkdir(parents=True, exist_ok=True)
-    sources = []
+    directory.mkdir(parents=True)
     if language == "intent":
-        paths = [project / "doc/dsl" / name for name in ("README.md", "core.md", "types-numerics-and-effects.md")]
-        paths += [project / "doc/programming-model" / name for name in ("README.md", "logical-program.md", "kernel-and-host.md")]
-        for path in paths:
-            relative = path.relative_to(project / "doc")
-            output = directory / relative
-            output.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(path, output)
-            sources.append(str(path.relative_to(project)))
-    else:
-        # Installed APIs match the executing Triton, not a potentially newer ref.
-        language_path = Path(triton.language.__file__).parent
-        for name in ("core.py", "standard.py", "math.py", "extra/cuda/libdevice.py"):
-            path = language_path / name
-            destination = directory / name
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(path, destination)
-            sources.append(f"triton-{triton.__version__}/language/{name}")
-        path = triton_ref / "docs/python-api/triton-semantics.rst"
-        shutil.copyfile(path, directory / path.name)
-        sources.append("ref/triton/docs/python-api/triton-semantics.rst")
-    example = Path(__file__).with_name("materials") / language / "vector_add.py"
+        corpus = snapshot(project)
+        (directory / "manual.json").write_text(json.dumps(corpus, ensure_ascii=False))
+        return sorted(key for key in corpus["documents"] if "#L" not in key)
+    language_path = Path(triton.language.__file__).parent
+    sources = []
+    for name in ("core.py", "standard.py", "math.py", "extra/cuda/libdevice.py"):
+        destination = directory / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(language_path / name, destination)
+        sources.append(f"triton-{triton.__version__}/language/{name}")
+    path = triton_ref / "docs/python-api/triton-semantics.rst"
+    shutil.copyfile(path, directory / path.name)
+    sources.append("ref/triton/docs/python-api/triton-semantics.rst")
+    example = Path(__file__).with_name("materials") / "triton/vector_add.py"
     shutil.copyfile(example, directory / "vector_add.py")
-    sources.append(str(example.relative_to(project)))
-    return sources
+    return sources + [str(example.relative_to(project))]
 
 
-def command(directory: Path, suite: dict, response: Path, schema: Path, executable: Path) -> list[str]:
-    codex_dir = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
-    config = tomli.loads((codex_dir / "config.toml").read_text())
-    provider = config.get("model_provider", "openai")
+def command(directory: Path, suite: dict, response: Path, schema: Path, executable: Path,
+            state_root: Path, language: str) -> list[str]:
+    config = tomli.loads((state_root / "config.toml").read_text())
+    if (config["model"], config["model_reasoning_effort"]) != (suite["model"], suite["reasoning_effort"]):
+        raise ValueError("dedicated configuration must retain the agreed model and reasoning effort")
+    provider = config["model_provider"]
+    if config["model_providers"][provider]["env_key"] != "INTENT_STUDY_API_KEY":
+        raise ValueError("dedicated provider must use INTENT_STUDY_API_KEY")
     values = {
         "model_reasoning_effort": suite["reasoning_effort"],
         "model_provider": provider,
+        f"model_providers.{provider}": config["model_providers"][provider],
         "approval_policy": "never",
         "default_permissions": "study",
         "permissions.study.filesystem": {":root": "deny", ":minimal": "read",
                                          ":workspace_roots": {".": "write", "materials": "read", "TASK.md": "read"},
-                                         str(executable): "read", str(codex_dir / "tmp/arg0"): "read"},
+                                         str(executable): "read", str(state_root / "codex/tmp/arg0"): "read"},
         "permissions.study.network.enabled": False,
         "project_doc_max_bytes": 0,
         "developer_instructions": Path(__file__).with_name("instructions.md").read_text(),
-        "memories.generate_memories": False,
-        "memories.use_memories": False,
-        "agents.enabled": False,
-        "web_search": "disabled",
+        "memories.generate_memories": False, "memories.use_memories": False,
+        "agents.enabled": False, "web_search": "disabled",
         "shell_environment_policy.inherit": "none",
         "shell_environment_policy.set": {"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONNOUSERSITE": "1"},
-        "allow_login_shell": False,
-        "features.skip_host_skill_discovery": True,
+        "allow_login_shell": False, "features.skip_host_skill_discovery": True,
     }
-    if provider in config.get("model_providers", {}):
-        values[f"model_providers.{provider}"] = config["model_providers"][provider]
+    if language == "intent":
+        project = Path(__file__).resolve().parents[3]
+        values["mcp_servers.intent_manual"] = {
+            "command": "/usr/bin/env",
+            "args": ["-i", "PATH=/usr/local/bin:/usr/bin:/bin", f"PYTHONPATH={project / 'python'}",
+                     sys.executable, "-B", "-m", "intent.tools.manual", "--corpus", str(directory / "materials/manual.json")],
+            "required": True, "enabled_tools": ["search", "api", "read"],
+            "default_tools_approval_mode": "approve",
+        }
     result = [str(executable), "exec", "--ignore-user-config", "--ignore-rules", "--strict-config",
               "--ephemeral", "--skip-git-repo-check", "--json", "--color", "never",
               "--model", suite["model"], "--cd", str(directory),
@@ -91,46 +94,45 @@ def command(directory: Path, suite: dict, response: Path, schema: Path, executab
     return result + ["-"]
 
 
-def execute(directory: Path, suite: dict, prompt: str, *, remaining_seconds: float,
-            executable: Path, stop: threading.Event) -> dict:
-    response = directory / "response.json"
-    schema = directory / "response-schema.json"
+def execute(directory: Path, suite: dict, prompt: str, *, executable: Path,
+            state_root: Path, language: str, stop: threading.Event) -> dict:
+    response, schema = directory / "response.json", directory / "response-schema.json"
     schema.write_text(json.dumps({"type": "object", "additionalProperties": False,
-                                  "properties": {"action": {"type": "string", "enum": ["submit", "stop"]},
+                                  "properties": {"action": {"type": "string", "enum": ["submit"]},
                                                  "reason": {"type": "string"}},
                                   "required": ["action", "reason"]}))
-    if response.exists():
-        response.unlink()
+    secret_path = state_root / "provider.key"
+    if secret_path.stat().st_mode & 0o077:
+        raise PermissionError("dedicated provider.key must only be accessible to its owner")
+    key = secret_path.read_text().strip()
+    if not key:
+        raise ValueError("dedicated provider.key is empty")
+    environment = {name: os.environ[name] for name in ("PATH", "HOME", "USER", "LANG", "TMPDIR") if name in os.environ}
+    environment.update(CODEX_HOME=str(state_root / "codex"), INTENT_STUDY_API_KEY=key)
     started = time.monotonic()
-    process = subprocess.Popen(command(directory, suite, response, schema, executable), stdin=subprocess.PIPE,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                               cwd=directory, start_new_session=True)
-    stdout_lines, stderr_lines, tool_activity, environment_errors = [], [], [], []
+    process = subprocess.Popen(command(directory, suite, response, schema, executable, state_root, language),
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                               cwd=directory, env=environment, start_new_session=True)
+    threads, errors, mcp_calls, stderr = [], [], [], []
 
     def collect_stdout():
         for line in process.stdout:
-            stdout_lines.append(line)
-            if line.startswith("{"):
-                event = json.loads(line)
-                if event["type"] in {"thread.started", "turn.completed", "turn.failed", "error"}:
-                    print(json.dumps({"agent_directory": str(directory), **event}), flush=True)
-                elif event["type"] == "item.completed":
-                    item = event["item"]
-                    if item["type"] == "command_execution":
-                        tool_activity.append({key: item[key] for key in ("command", "exit_code", "status") if key in item})
-                        if item.get("exit_code", 0):
-                            output = item.get("aggregated_output", "")
-                            print(json.dumps({"agent_directory": str(directory), "tool_failure": tool_activity[-1],
-                                              "error_excerpt": output[:1000]}), flush=True)
-                            if "bwrap:" in output:
-                                environment_errors.append(output)
-                                stop.set()
+            if not line.startswith("{"):
+                continue
+            event = json.loads(line.replace(key, "<redacted>"))
+            if event["type"] == "thread.started":
+                threads.append(event["thread_id"])
+            elif event["type"] in {"error", "turn.failed"}:
+                errors.append(event)
+            elif event["type"] == "item.completed" and event["item"]["type"] == "mcp_tool_call":
+                item = event["item"]
+                call = {k: item[k] for k in ("server", "tool", "arguments", "status", "error") if k in item}
+                mcp_calls.append(call)
+                print(json.dumps({"task_directory": str(directory), "manual_call": call}), flush=True)
 
     def collect_stderr():
         for line in process.stderr:
-            stderr_lines.append(line)
-            if "ERROR" in line:
-                print(f"Agent tool error ({directory.parent.parent.name}/{directory.parent.parent.parent.name}): {line.strip()}", flush=True)
+            stderr.append(line.replace(key, "<redacted>"))
 
     readers = [threading.Thread(target=collect_stdout), threading.Thread(target=collect_stderr)]
     for reader in readers:
@@ -139,7 +141,7 @@ def execute(directory: Path, suite: dict, prompt: str, *, remaining_seconds: flo
     process.stdin.close()
     timed_out = False
     while process.poll() is None:
-        timed_out = time.monotonic() - started >= remaining_seconds
+        timed_out = time.monotonic() - started >= suite["agent_seconds"]
         if timed_out or stop.is_set():
             os.killpg(process.pid, signal.SIGTERM)
             try:
@@ -151,24 +153,11 @@ def execute(directory: Path, suite: dict, prompt: str, *, remaining_seconds: flo
         stop.wait(1)
     for reader in readers:
         reader.join()
-    stdout, stderr = "".join(stdout_lines), "".join(stderr_lines)
-    usage, threads, errors = [], [], []
-    for line in stdout.splitlines():
-        if not line.startswith("{"):
-            continue
-        event = json.loads(line)
-        if event["type"] == "thread.started":
-            threads.append(event["thread_id"])
-        elif event["type"] == "turn.completed":
-            usage.append(event["usage"])
-        elif event["type"] in {"error", "turn.failed"}:
-            errors.append(event)
     result = {"model": suite["model"], "reasoning_effort": suite["reasoning_effort"],
-              "seconds": time.monotonic() - started, "usage": usage, "threads": threads,
-              "exit_code": process.returncode, "tool_activity": tool_activity}
+              "threads": threads, "exit_code": process.returncode, "manual_calls": mcp_calls}
     if timed_out or stop.is_set() or process.returncode or not response.exists():
         result.update(action="unavailable", status="agent_timeout" if timed_out else "agent_environment_failure",
-                      errors=errors, error="\n".join(environment_errors) or stderr[-6000:] or "Agent execution stopped before a submission")
+                      errors=errors, error="".join(stderr)[-6000:] or "Agent stopped without a submission")
     else:
         result.update(json.loads(response.read_text()))
     return result

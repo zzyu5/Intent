@@ -19,6 +19,11 @@ def row_max(
     output[rows] = I.reduce(
         x[rows, columns],
         axis=1,
-        identity=-I.inf,
+        identity=I.full((M,), -I.inf, dtype=I.f32),
         combine=maximum_pair,
     )
+
+
+def compile_row_max(*, compiler, target):
+    artifact = intent.compile(row_max, compiler=compiler, target=target)
+    return artifact.run

@@ -3,7 +3,10 @@ given task correctly and efficiently for the supplied, fixed invocation profile.
 This is forward execution, not autograd. Do not change the task, dtype, output
 structure, numerical tolerance, or observable out/alias behavior.
 
-Read TASK.md and the provided language materials. Write candidate.py containing
+Read TASK.md and the provided language materials. For Intent, query the
+intent_manual MCP: search concepts, api for signatures/return schemas, read for
+complete examples. Consult the manual before writing code; it does not execute
+programs or provide task answers. Write candidate.py containing
 build(context), which returns a callable with the task's original wrapper
 signature. The evaluator calls build once outside timing, then calls that wrapper
 with the documented inputs. Multiple kernels and explicit host composition are
@@ -24,14 +27,9 @@ call intent.compile/generate or invoke a different compiler yourself. Choose the
 kernel algorithm, not hardware block sizes or provider-specific emission.
 
 For direct Triton generation, define @triton.jit kernels and an ordinary wrapper;
-context need not be used. For Triton optimization, candidate.py is the existing
-wrapper. context.load_source("name.py") loads an adjacent, editable generated
-Triton module with launch()/run(). Edit the real Triton and wrapper; do not call
-the Intent frontend/compiler in this stage. The untouched seed remains a static
-control outside your workspace.
+context need not be used.
 
-Each submission is the complete candidate.py and any adjacent Triton .py modules
-used through context.load_source. Use only torch, triton, intent, math, functools,
+The submission is the complete candidate.py. Use only torch, triton, intent, math, functools,
 typing, collections, dataclasses and __future__ imports. File/network access,
 dynamic code loading and evaluator introspection are not part of the task.
 
@@ -39,23 +37,16 @@ Submitting triggers the production paired benchmark: one numerical comparison
 and full CUDA Graph timing, including all of your kernels and internal data
 handling. Allocations outside captured execution, compilation, JIT and tuning do
 not count as operator milliseconds. Do not run independent tests, input sweeps
-or benchmarks. The next invocation supplies the actual benchmark feedback and
-your prior submissions, so you can revise your code. No reference implementation
-or reference output values are available to you. Do not seek other task answers,
+or benchmarks. You submit once; there is no benchmark-feedback repair round.
+No reference implementation or reference output values are available to you. Do not seek other task answers,
 personal memory, external websites or subagents.
 
-The generation stage ends at the first correct program or after five submissions.
-The optimization stage allows up to five further submissions. It may stop sooner
-when you have no justified improvement. All stages have a 30-minute wall limit;
-each candidate benchmark has a 5-minute limit. Both arms use the same policy.
 Triton's autotuner considers at most 16 legal configurations per kernel. When
 there are more, it samples uniformly spaced list positions, including both ends,
 after existing legality pruning. Both arms use the same median-only CUDA Graph
-measurement policy. This internal search is recorded
-separately from your program-submission budget.
+measurement policy. Tuning is evaluator-side execution preparation, not another
+agent submission.
 
 When candidate.py is ready, finish with the specified JSON response:
 {"action": "submit", "reason": "brief implementation or change description"}.
-During optimization only, you may instead return
-{"action": "stop", "reason": "why no further candidate is justified"}.
 Do not claim correctness or speed that has not been measured by the evaluator.

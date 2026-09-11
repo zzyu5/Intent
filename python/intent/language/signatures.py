@@ -6,11 +6,14 @@ from inspect import Parameter, Signature
 def _signature(
     positional: tuple[str, ...],
     *,
+    optional_positional: tuple[tuple[str, object], ...] = (),
     required: tuple[str, ...] = (),
     defaults: tuple[tuple[str, object], ...] = (),
 ) -> Signature:
     return Signature(
         [Parameter(name, Parameter.POSITIONAL_OR_KEYWORD) for name in positional]
+        + [Parameter(name, Parameter.POSITIONAL_OR_KEYWORD, default=value)
+           for name, value in optional_positional]
         + [Parameter(name, Parameter.KEYWORD_ONLY) for name in required]
         + [
             Parameter(name, Parameter.KEYWORD_ONLY, default=value)
@@ -20,6 +23,38 @@ def _signature(
 
 
 INTRINSIC_SIGNATURES = {
+    "domain": _signature(("start", "stop"), optional_positional=(("step", 1),)),
+    "parallel": _signature(("source",)),
+    "indices": _signature(("region",)),
+    "end": _signature(("region",)),
+    "assume_in_bounds": _signature(("index", "view", "axis")),
+    "reshape": _signature(("value", "shape")),
+    "join": _signature(("lhs", "rhs")),
+    "transpose": _signature(("value",), optional_positional=(("permutation", None),)),
+    "full": _signature(("shape", "fill", "dtype")),
+    "zeros": _signature(("shape", "dtype")),
+    "record": Signature([Parameter("fields", Parameter.VAR_KEYWORD)]),
+    "cast": _signature(("value", "dtype")),
+    "bitcast": _signature(("value", "dtype")),
+    "mask": _signature(("value", "valid", "fill")),
+    "select": _signature(("condition", "true_value", "false_value")),
+    **{name: _signature(("value",)) for name in
+       ("exp", "log", "sin", "cos", "floor", "erf", "rsqrt", "sqrt", "sigmoid", "abs")},
+    **{name: _signature(("lhs", "rhs")) for name in
+       ("add", "maximum", "minimum", "maximum_num", "minimum_num")},
+    "reduce": _signature(("value", "axis", "identity", "combine"),
+                         optional_positional=(("combine_operands", ()), ("acc_dtype", None))),
+    "arg_reduce.max": _signature(("value", "axis"), optional_positional=(("acc_dtype", None),)),
+    "contract": _signature(("lhs", "rhs", "reduce", "acc_dtype"), optional_positional=(("batch", ()),)),
+    "region_fold": _signature(("source", "axis", "summarize", "combine", "identity"),
+                              optional_positional=(("operands", ()),)),
+    "region_scan": _signature(("source", "axis", "summarize", "combine", "identity", "initial_state", "apply", "emit"),
+                              optional_positional=(("operands", ()),)),
+    "histogram": _signature(("values", "bins", "valid", "count_dtype")),
+    "store": _signature(("target", "index", "value")),
+    "mutable_load": _signature(("target", "index")),
+    "random.bits": _signature(("seed", "logical_counter")),
+    "random.uniform": _signature(("seed", "logical_counter", "dtype")),
     "quantize": _signature(("values",), required=("format",)),
     "quantized_dot": _signature(
         ("lhs", "rhs"), required=("lhs_format", "rhs_format", "acc_dtype")

@@ -1,11 +1,8 @@
 {
   "model": "gpt-5.6-luna",
   "reasoning_effort": "max",
-  "repetitions": 3,
-  "generation_candidates": 5,
-  "optimization_candidates": 5,
-  "phase_seconds": 1800,
-  "candidate_seconds": 300,
+  "agent_seconds": 900,
+  "benchmark_seconds": 300,
   "max_tuning_configurations": 16,
   "input_seed": 0,
   "reference_corrections": {
@@ -18,8 +15,6 @@
   },
   "dtype": "float32",
   "timing": "cuda_graph",
-  "generation_stop": "first_correct_or_budget",
-  "optimization_stop": "agent_stop_or_budget",
   "selection": "Fixed deterministic forward tensor tasks, chosen before measurements by computation family and usable upstream performance input contract, not compiler support. One original input profile per task. Other tasks remain in the 166-task catalog.",
   "tolerances": {
     "exact": {"atol": 0.0, "rtol": 0.0},

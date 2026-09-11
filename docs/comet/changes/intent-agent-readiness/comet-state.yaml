@@ -1,28 +1,55 @@
 schema: comet.native.v4
 name: intent-agent-readiness
 language: zh-CN
-phase: shape
+phase: build
 status: active
-state_version: 1
+state_version: 2
 brief: brief.md
-spec_changes: []
+spec_changes:
+  - capability: intent-agent-readiness
+    operation: create
+    source: specs/intent-agent-readiness/spec.md
 workspace:
   isolation: current
   change_branch: main
   target_branch: main
   finish: null
 loop:
-  stage: shape
+  stage: building
   goal_cycle: 1
-  iteration: 0
+  iteration: 1
   attempt: 0
   retry_epoch: 0
   failed_iteration_count: 0
   no_progress_count: 0
   execution_failure_count: 0
   previous_unresolved_ids: []
-  next_action: confirm-shape
-acceptance: []
+  next_action: submit-builder-candidate
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1：旧任务不再出现在 active
+      列表，实验目录只保留可解释结果所需内容；重复报表、无用过程日志和旧多轮调度不再作为活动入口，原始失败和必要复现未被选择性抹除。
+    result: pending
+    reason: null
+  - id: A2
+    source: brief.md
+    text: A2：独立 agent 能通过只读 MCP 查到真实 API 签名/返回类型、语义规则及完整多 kernel 通用示例；未知 API
+      明确返回不存在或未确认，工具不执行代码、不读取 oracle、不生成题解。
+    result: pending
+    reason: null
+  - id: A3
+    source: brief.md
+    text: A3：专用 provider 的 luna/max 经真实调用确认；独立 agent 使用 MCP 交付一个既有任务程序，正式 benchmark
+      得到容差检查和完整算子毫秒数，配置与模型不继承主会话，凭据不进入仓库。
+    result: pending
+    reason: null
+  - id: A4
+    source: brief.md
+    text: A4：首批重复轴 ownership 和 scalar/rank-0/tuple 问题被准确归因，确认合法的原始表达不再因这些 compiler
+      缺陷阻塞 lowering；修复有 ref 对照和受影响既有 benchmark 结果，错误作者程序保持准确诊断，未证实问题不冒充已修复。
+    result: pending
+    reason: null
 builder_handoff: null
 blockers: []
 verification: null

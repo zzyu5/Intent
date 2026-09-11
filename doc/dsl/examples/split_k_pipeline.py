@@ -1,5 +1,6 @@
 import intent
 import intent.language as I
+import torch
 
 
 @intent.kernel
@@ -42,10 +43,16 @@ def split_k_combine(
     )
 
 
-def run_split_k(a, b, parts):
-    """Host pseudocode: allocation and launch order are author-visible."""
-    partial = allocate_tensor((parts, a.shape[0], b.shape[1]), dtype="float32")
-    output = allocate_tensor((a.shape[0], b.shape[1]), dtype="float16")
-    launch(split_k_partial, a, b, partial)
-    launch(split_k_combine, partial, output)
-    return output
+def compile_split_k(*, compiler, target):
+    """Compile both kernels before invoking or timing the returned operator."""
+    partial_kernel = intent.compile(split_k_partial, compiler=compiler, target=target)
+    combine_kernel = intent.compile(split_k_combine, compiler=compiler, target=target)
+
+    def run(a, b, parts):
+        partial = torch.empty((parts, a.shape[0], b.shape[1]), device=a.device, dtype=torch.float32)
+        output = torch.empty((a.shape[0], b.shape[1]), device=a.device, dtype=torch.float16)
+        partial_kernel(a, b, partial)
+        combine_kernel(partial, output)
+        return output
+
+    return run

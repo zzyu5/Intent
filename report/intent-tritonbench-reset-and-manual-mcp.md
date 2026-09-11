@@ -12,7 +12,7 @@
 - 暂停第二项“生成 Triton 作为后续优化起点”的实验。其研究问题保留，不继续消耗当前工程预算。
 - 当前 change `agent-tritonbench-evaluation` 的旧范围已被用户停止。未完成的验收不变成通过，旧 Spec 不发布为新有效要求。
 
-本轮只形成报告并处理旧 change 的封存；不运行模型/GPU、不部署 MCP、不安装第二套 Codex、不清空原始实验数据。
+本文最初形成于旧 change 封存阶段；用户现已确认 `intent-agent-readiness` 进入 Build，授权精简旧数据、部署专用环境/手册 MCP 和首批 compiler 修复。
 
 ## 2. TritonBench 原本做什么，我们额外加了什么
 
@@ -30,7 +30,7 @@
 
 `refined/environment.json` 的 compiler 为 `e28e8e72`。该首轮 50 题中，直接 Triton 首次正确 43、预算内正确 50；Intent 首次正确 29、预算内正确 45。后续 compiler 修复和人工复测没有回填为 agent 自主成功。重复轮次未补齐，优化阶段已停止。
 
-共同成功的 45 题，静态 Intent/direct 耗时比几何均值约 2.20，但中位数约 1.047，11 题超过 10 倍。15 个逐元素任务整体接近，严重差距集中在部分归约、融合和求解结构。不能据此说“Intent 全面很慢”，也不能只报局部胜例宣称目标成立。数据见 [已有结果](agent-tritonbench/refined/results.md) 与 [成对记录](agent-tritonbench/refined/paired.csv)。
+共同成功的 45 题，静态 Intent/direct 耗时比几何均值约 2.20，但中位数约 1.047，11 题超过 10 倍。15 个逐元素任务整体接近，严重差距集中在部分归约、融合和求解结构。不能据此说“Intent 全面很慢”，也不能只报局部胜例宣称目标成立。旧批次观察统一保存在 [observations.csv](agent-tritonbench/observations.csv)，`batch/stage/candidate` 保留原始含义，不能把第五次提交当成首次生成。
 
 ### 3.2 多 kernel 已有实际证据，不是未来设想
 
@@ -146,7 +146,7 @@ provider 的 Responses/流式/工具交互以及该服务的 luna/max 映射尚�
 
 ## 8. 旧 change 的处置与当前未完成项
 
-用户要求停止旧 `agent-tritonbench-evaluation` 并准备重新设计，旧三次重复、生成与优化各至多五次提交的范围不再执行。实际后台实验已停止；工作区仍保留此前产生的结果改动。本轮没有完成数据清理、compiler 新修复、手册/MCP 部署或新模型调用。
+用户要求停止旧 `agent-tritonbench-evaluation` 并准备重新设计，旧三次重复、生成与优化各至多五次提交的范围不再执行。实际后台实验已停止。
 
 封存前 Native 归档预检返回 `ready=false`：处于 Build，0/6 验收通过且缺少 `verification.md`。公开 CLI 和文档只提供验收完成式 Archive，没有未完成 change 的 cancel/abandon 入口。不能补造 verification 或把旧 Spec 发布到主规格以满足工具。
 
@@ -154,6 +154,6 @@ provider 的 Responses/流式/工具交互以及该服务的 luna/max 映射尚�
 
 主工作区封存后，Comet 曾从 `.worktrees/cpu-region-programs` 发现继承的同名旧副本，显示 `bindingState=mismatch`。用户随后明确允许清理旧任务残留；确认副本无自身修改后，删除了该副本的三个文档，单独提交 `e628976c`，CPU 实现和 worktree 均保留。原文可由 Git 历史和主目录归档恢复。再次查询 Native 的旧 active 列表为 0。
 
-按用户要求，新建 [intent-agent-readiness](../docs/comet/changes/intent-agent-readiness/brief.md)，绑定 main/current，停留在 Shape。其第一批为旧产物收口、手册 MCP、专用 Luna 环境及 ownership/schema 修复；只用一个既有任务接通链路，不把 50 题正式实验、第二阶段优化或全部 compiler backlog 塞入本轮验收。其它根因仍保留在本文，未宣称解决。
+按用户要求，新建 [intent-agent-readiness](../docs/comet/changes/intent-agent-readiness/brief.md)，绑定 main/current，用户已确认进入 Build。其第一批为旧产物收口、手册 MCP、专用 Luna 环境及 ownership/schema 修复；只用一个既有任务接通链路，不把 50 题正式实验、第二阶段优化或全部 compiler backlog 塞入本轮验收。其它根因仍保留在本文，未宣称解决。
 
-目前尚未完成实验数据清理、MCP/环境部署或新 compiler 修复；没有启动模型/GPU 运行，没有回滚有效 compiler 改动。新 Shape 待最终确认后进入 Build。
+旧数据已收口为一份 811 行观察 CSV，保留 refined 生成程序及其原测量、早期多 kernel 实例和必要 compiler 复测；删除 2,839 个重复表格、逐轮活动/停止日志、优化副本和 Python 缓存。已知 evaluator 修复仅对原来对应的失败行应用，`original_status` 保留；未重跑或补造任何数值。CSV 的 `original_program` 是原始位置，`retained_program` 非空才表示当前仍保留的源码；其它已提交材料由 Git 历史保存，不另建归档包。专用环境/MCP 与 compiler 首批修复仍在实现中。

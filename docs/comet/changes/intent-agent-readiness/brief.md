@@ -37,7 +37,7 @@
 
 # 决策
 
-- 用户先要求报告、废止旧 change，随后要求先建 Shape 留档；本轮停在 Shape，未经最终确认不实现 MCP、配置 provider 或启动 benchmark。
+- 用户已确认本 Shape 并明确要求进入 Build、清理无用实验数据；授权按本范围实现 MCP、配置专用 provider 和执行必要的既有 benchmark。用户提供的认证信息不进入 Comet 产物或记忆。
 - 旧 change 主目录已封存；经用户允许，CPU worktree 中继承的三个旧文档也已清除并单独提交，CPU 实现不变。新 change 使用 `main/current`。
 - 环境隔离指被评测 Codex 的配置/会话/文件权限隔离，不是创建第二个开发 worktree，也不代表只换 CODEX_HOME 即完成隔离。
 - 手册优先保证内容准确和可查询，以本地 STDIO MCP 提供小接口；不另建与 compiler 并行维护的语言定义。
@@ -46,7 +46,7 @@
 
 # 待解决问题
 
-- [blocking] CONFIRM: 确认本轮仅完成旧产物收口、手册 MCP、独立 luna/max 环境及首批 ownership/schema 修复；一个既有任务用于接通链路，50 题正式评估和其它 compiler 根因留后续，不进入旧多轮实验。
+无待确认的用户决定；provider 实际能力在 Build 中核实，真实不兼容时再报告。
 
 # 验证预期
 
