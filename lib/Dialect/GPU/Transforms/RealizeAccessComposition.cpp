@@ -181,13 +181,16 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
   auto sourceType = dyn_cast<FragmentType>(gather.getSource().getType());
   auto sourceLoad = gather.getSource().getDefiningOp<LoadOp>();
   if (!sourceType || !sourceLoad ||
-      !isa<ViewType>(sourceLoad.getResource().getType()))
+      !isa<ViewType>(sourceLoad.getResource().getType()) ||
+      !canReplayReadAt(sourceLoad, gather))
     return false;
   if (gather.getCoordinates().size() != gather.getSourceAxes().size()) {
     gather.emitOpError("gather coordinate/source-axis schema is incomplete");
     return failure();
   }
 
+  OpBuilder builder(gather);
+  auto resultType = dyn_cast<FragmentType>(gather.getResult().getType());
   SmallVector<Value> coordinates(sourceLoad.getCoordinates());
   IRMapping replay;
   PhysicalProgramAnalysis analysis(gather->getParentOfType<func::FuncOp>());
@@ -211,6 +214,20 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
           "loaded source coordinate cannot be composed with gather indexing");
       return failure();
     }
+    if (resultType) {
+      Type element = coordinate.getType();
+      if (auto fragment = dyn_cast<FragmentType>(element))
+        element = fragment.getElementType();
+      auto coordinateType = FragmentType::get(
+          resultType.getContext(), element, resultType.getShape(),
+          resultType.getAxisMaps(), resultType.getValidity(), resultType.getOwner());
+      FailureOr<Value> projected = projectPhysicalValueToSchema(
+          builder, gather.getLoc(), coordinate, coordinateType);
+      if (failed(projected))
+        return gather.emitOpError(
+            "composed gather index cannot adopt its result coordinate relation");
+      coordinate = *projected;
+    }
     Value original = sourceLoad.getCoordinates()[target.fragmentAxis];
     replay.map(original, coordinate);
     PhysicalRangeFact roots = analysis.sourceRanges(original);
@@ -219,8 +236,6 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
     coordinates[target.fragmentAxis] = coordinate;
   }
 
-  OpBuilder builder(gather);
-  auto resultType = dyn_cast<FragmentType>(gather.getResult().getType());
   if (!resultType) {
     FailureOr<Value> sourceValid = replayScalarValue(
         builder, sourceLoad.getValid(), replay, analysis);

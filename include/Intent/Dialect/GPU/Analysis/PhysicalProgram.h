@@ -47,6 +47,10 @@ bool isPhysicalReplayNode(mlir::Operation *operation,
                           PhysicalReplayScope scope,
                           bool allowAccesses);
 
+/// Includes writes in structured iterations entered between the read and use.
+/// ABI aliases are conservatively treated as potentially overlapping.
+bool canReplayReadAt(LoadOp load, mlir::Operation *insertionAnchor);
+
 struct PhysicalAxisProjection {
   PhysicalFactState state = PhysicalFactState::Unknown;
   PhysicalSourceAxis source;
@@ -370,7 +374,8 @@ private:
   void collectRanges(mlir::Value value,
                      std::optional<PhysicalSourceAxis> source,
                      PhysicalRangeFact &result,
-                     llvm::SmallPtrSetImpl<mlir::Operation *> &visited);
+                     llvm::SmallPtrSetImpl<mlir::Operation *> &visited,
+                     bool followScalarDependencies = true);
   void collectAxisRanges(mlir::Value value, unsigned fragmentAxis,
                          PhysicalRangeFact &result,
                          llvm::SmallPtrSetImpl<mlir::Operation *> &visited);

@@ -2869,6 +2869,29 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
   const int64_t dimension = mapping.getDimensionId();
   auto currentExtent =
       cast<PhysicalExprAttr>(fragment.getShape()[fragmentAxis]);
+  PhysicalProgramAnalysis analysis(kernel);
+  PhysicalRangeFact ranges = analysis.axisRanges(source, fragmentAxis);
+  int64_t coverageDimension = dimension;
+  bool subregion = llvm::any_of(ranges.roots, [](MakeRangeOp range) {
+    return range->hasAttr(sourceSubregionAttr);
+  });
+  if (subregion) {
+    if (failed(queryExactLogicalRange(ranges)))
+      return kernel.emitError(
+          "subregion full coverage has no exact logical range authority");
+    std::optional<int64_t> parent;
+    for (MakeRangeOp range : ranges.roots) {
+      auto bound = range->getAttrOfType<IntegerAttr>(sourceSubregionAttr);
+      if (!bound || bound.getInt() <= 0 ||
+          (parent && *parent != bound.getInt()) ||
+          !queryNonNegativeIndexUpperBound(range.getLogicalStart()) ||
+          !isUnitStepRange(range))
+        return range.emitOpError(
+            "subregion full coverage has no proven nonnegative parent-bounded traversal");
+      parent = bound.getInt();
+    }
+    coverageDimension = *parent;
+  }
 
   Value runtimeDimension;
   for (BlockArgument argument : kernel.getArguments()) {
@@ -2876,7 +2899,7 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
     auto kind = attributes.getAs<StringAttr>(abiKindAttr);
     auto identity = attributes.getAs<IntegerAttr>(dimensionAttr);
     if (kind && kind.getValue() == "dimension" && identity &&
-        identity.getInt() == dimension) {
+        identity.getInt() == coverageDimension) {
       if (runtimeDimension && runtimeDimension != argument)
         return kernel.emitError(
             "logical dimension has multiple runtime ABI authorities");
@@ -2891,7 +2914,7 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
       continue;
     for (auto [axis, identity] :
          llvm::enumerate(view.getLayout().getDimensionIds().asArrayRef())) {
-      if (identity != dimension)
+      if (identity != coverageDimension)
         continue;
       auto extent = cast<PhysicalExprAttr>(
           view.getLayout().getExtents()[axis]);
@@ -2912,6 +2935,11 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
   if (!runtimeDimension)
     return kernel.emitError(
         "full-coverage physicalization has no runtime or static dimension authority");
+  if (subregion)
+    for (MakeRangeOp range : ranges.roots)
+      if (!samePhysicalScalarExpression(range.getLogicalStop(), runtimeDimension))
+        return range.emitOpError(
+            "subregion full coverage does not end at its parent extent");
 
   ParameterOp parameter;
   if (currentExtent.getKind() ==
@@ -2921,7 +2949,7 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
     if (succeeded(declaration)) {
       auto covered = (*declaration)->getAttrOfType<IntegerAttr>(
           coverageDimensionAttr);
-      if (covered && covered.getInt() == dimension &&
+      if (covered && covered.getInt() == coverageDimension &&
           (*declaration).getParameter().getRole() ==
               static_cast<uint32_t>(ParameterRole::FullCoverage))
         parameter = *declaration;
@@ -2931,7 +2959,7 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
     kernel.walk([&](ParameterOp candidate) {
       auto covered = candidate->getAttrOfType<IntegerAttr>(
           coverageDimensionAttr);
-      if (!covered || covered.getInt() != dimension ||
+      if (!covered || covered.getInt() != coverageDimension ||
           candidate.getParameter().getRole() !=
               static_cast<uint32_t>(ParameterRole::FullCoverage))
         return;
@@ -2950,7 +2978,7 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
           static_cast<uint32_t>(ParameterRole::FullCoverage)) {
     PhysicalParameterBinding binding = queryParameterBinding(parameter);
     if (!binding.isExact() || !binding.dimension ||
-        *binding.dimension != dimension)
+        *binding.dimension != coverageDimension)
       return parameter.emitOpError(
           "full-coverage parameter lost its typed dimension authority");
     if (failed(bindFullCoverageDimension(kernel, dimension,
@@ -2963,7 +2991,7 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
       1,    2,    4,     8,     16,    32,    64,    128,   256,
       512,  1024, 2048,  4096,  8192,  16384, 32768, 65536};
   if (!parameter) {
-    std::string name = ("FULL_D" + Twine(dimension)).str();
+    std::string name = ("FULL_D" + Twine(coverageDimension)).str();
     bool nameCollision = false;
     kernel.walk([&](ParameterOp candidate) {
       nameCollision |=
@@ -3005,18 +3033,16 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
   }
   parameter->setAttr(
       dimensionAttr,
-      IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), dimension));
+      IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), coverageDimension));
   parameter->setAttr(
       coverageDimensionAttr,
-      IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), dimension));
+      IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), coverageDimension));
 
   auto covered = PhysicalExprAttr::get(
       kernel.getContext(),
       static_cast<uint32_t>(PhysicalExprKind::Parameter), 0,
       parameter.getParameter().getName(),
       ArrayAttr::get(kernel.getContext(), {}));
-  PhysicalProgramAnalysis analysis(kernel);
-  PhysicalRangeFact ranges = analysis.axisRanges(source, fragmentAxis);
   if (!ranges.roots.empty() && failed(queryExactLogicalRange(ranges)))
     return kernel.emitError(
         "full-coverage source has ambiguous physical range authority");
@@ -3036,8 +3062,7 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
   }
   for (MakeRangeOp range : ranges.roots) {
     FailureOr<int64_t> rangeDimension = queryRangeDimension(range);
-    if (failed(rangeDimension) || *rangeDimension != dimension ||
-        range->hasAttr(sourceSubregionAttr))
+    if (failed(rangeDimension) || *rangeDimension != dimension)
       return range.emitOpError(
           "full-coverage range does not cover the selected logical dimension");
     retargetDimensionExtent(range.getResult(), dimension, covered);
@@ -3067,7 +3092,7 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
     auto fragment = dyn_cast<FragmentType>(range.getResult().getType());
     if (failed(sourceDimension) ||
         *sourceDimension != static_cast<int64_t>(dimension) ||
-        range->hasAttr(sourceSubregionAttr) || !fragment ||
+        !fragment ||
         fragment.getShape().size() != 1)
       return;
     auto extent = cast<PhysicalExprAttr>(fragment.getShape()[0]);
@@ -3262,7 +3287,9 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
         materializeTail(builder, load.getLoc(), type, sources);
     if (failed(tail))
       return load.emitOpError(
-          "cannot project full-coverage dimension to load validity");
+          "cannot project full-coverage dimension to load validity")
+             << "; dimension=" << dimension << "; result=" << type
+             << "; range_count=" << sources.size();
     Value valid = *tail;
     auto predicate = cast<FragmentType>(valid.getType());
     if (load.getValid()) {

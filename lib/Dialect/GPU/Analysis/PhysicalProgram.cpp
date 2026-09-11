@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -536,10 +537,62 @@ bool coordinateRangeWithinResource(Value coordinate, Value resource,
   coordinate = stripIntegerIndexCasts(coordinate);
   if (std::optional<int64_t> constant = integerConstant(coordinate)) {
     PhysicalExprAttr extent = resourceExtentExpression(resource, axis);
+    if (extent && *constant >= 0 && extent.getKind() ==
+            static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
+      auto kernel = resource.getParentRegion()->getParentOfType<func::FuncOp>();
+      FailureOr<ParameterOp> parameter = queryParameterBySymbol(kernel, extent.getSymbol());
+      if (succeeded(parameter)) {
+        auto candidates = (*parameter).getParameter().getCandidates().asArrayRef();
+        return !candidates.empty() && llvm::all_of(candidates, [&](int64_t size) {
+          return *constant < size;
+        });
+      }
+    }
     return extent &&
            extent.getKind() ==
                static_cast<uint32_t>(PhysicalExprKind::Constant) &&
            *constant >= 0 && *constant < extent.getValue();
+  }
+  if (auto select = coordinate.getDefiningOp<SelectOp>()) {
+    if (!coordinateRangeWithinResource(select.getFalseValue(), resource, axis))
+      return false;
+    if (coordinateRangeWithinResource(select.getTrueValue(), resource, axis))
+      return true;
+    bool lower = false;
+    bool upper = false;
+    std::function<void(Value)> inspectPredicate = [&](Value predicate) {
+      predicate = stripBroadcast(predicate);
+      if (integerConstant(predicate) == 0) {
+        lower = upper = true;
+        return;
+      }
+      if (auto conjunction = predicate.getDefiningOp<BinaryOp>()) {
+        if (conjunction.getOperatorKind() == BinaryOperator::LogicalAnd ||
+            conjunction.getOperatorKind() == BinaryOperator::BitwiseAnd) {
+          inspectPredicate(conjunction.getLhs());
+          inspectPredicate(conjunction.getRhs());
+        }
+        return;
+      }
+      auto compare = predicate.getDefiningOp<CompareOp>();
+      if (!compare)
+        return;
+      Value selected = select.getTrueValue();
+      bool lhsIndex = derivesFromAccessCoordinate(compare.getLhs(), selected);
+      bool rhsIndex = derivesFromAccessCoordinate(compare.getRhs(), selected);
+      if ((compare.getPredicate() == ComparePredicate::Ge && lhsIndex &&
+           integerConstant(compare.getRhs()) == 0) ||
+          (compare.getPredicate() == ComparePredicate::Le && rhsIndex &&
+           integerConstant(compare.getLhs()) == 0))
+        lower = true;
+      if ((compare.getPredicate() == ComparePredicate::Lt && lhsIndex &&
+           upperBoundWithinResource(compare.getRhs(), resource, axis)) ||
+          (compare.getPredicate() == ComparePredicate::Gt && rhsIndex &&
+           upperBoundWithinResource(compare.getLhs(), resource, axis)))
+        upper = true;
+    };
+    inspectPredicate(select.getCondition());
+    return lower && upper;
   }
   auto range = coordinate.getDefiningOp<MakeRangeOp>();
   if (!range || !isUnitStepValue(range.getStep()) ||
@@ -1068,6 +1121,7 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
   struct Bounds {
     bool nonNegative = false;
     PhysicalExprAttr upper;
+    int64_t lower = 0;
   };
   auto constantUpper = [](Bounds bounds) -> std::optional<int64_t> {
     if (bounds.nonNegative && bounds.upper &&
@@ -1118,8 +1172,9 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
       auto loop = dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
       if (loop && argument == loop.getInductionVar()) {
         Bounds lower = bound(loop.getLowerBound(), depth + 1);
+        Bounds upperBound = bound(loop.getUpperBound(), depth + 1);
         std::optional<int64_t> upper =
-            constantUpper(bound(loop.getUpperBound(), depth + 1));
+            constantUpper(upperBound);
         std::optional<int64_t> step = integerConstant(loop.getStep());
         if (auto parameter = loop.getStep().getDefiningOp<ParameterOp>()) {
           auto candidates = parameter.getParameter().getCandidates().asArrayRef();
@@ -1132,6 +1187,13 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
             *upper <= std::numeric_limits<int64_t>::max() - *step + 1)
           return {true, expression(PhysicalExprKind::Constant,
                                    std::max<int64_t>(*upper - 1, 0))};
+        if (lower.nonNegative && upperBound.nonNegative && upperBound.upper &&
+            step && *step == 1)
+          return {true, expression(PhysicalExprKind::Maximum, 0,
+              {expression(PhysicalExprKind::Subtract, 0,
+                          {upperBound.upper,
+                           expression(PhysicalExprKind::Constant, 1)}),
+               expression(PhysicalExprKind::Constant, 0)})};
       }
     }
     if (auto parameter = current.getDefiningOp<ParameterOp>()) {
@@ -1181,6 +1243,71 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
     Bounds rhs = bound(binary.getRhs(), depth + 1);
     std::optional<int64_t> lhsConstant = constantUpper(lhs);
     std::optional<int64_t> rhsConstant = constantUpper(rhs);
+    if (binary.getOperatorKind() == BinaryOperator::Subtract) {
+      auto ordinal = dyn_cast<BlockArgument>(stripScalarIdentity(binary.getRhs()));
+      auto loop = ordinal
+                      ? dyn_cast<scf::ForOp>(ordinal.getOwner()->getParentOp())
+                      : scf::ForOp();
+      // Within 0 <= iv < end, end - iv lies in [1, end].  This
+      // also proves reversed ordinals without assuming a static extent.
+      if (loop && ordinal == loop.getInductionVar() &&
+          integerConstant(loop.getStep()) == 1 &&
+          bound(loop.getLowerBound(), depth + 1).nonNegative &&
+          bound(loop.getUpperBound(), depth + 1).nonNegative) {
+        if (sameScalarExpression(binary.getLhs(), loop.getUpperBound()) &&
+            lhs.upper)
+          return {true, lhs.upper, 1};
+        auto last = binary.getLhs().getDefiningOp<BinaryOp>();
+        Bounds end = bound(loop.getUpperBound(), depth + 1);
+        if (last && last.getOperatorKind() == BinaryOperator::Subtract &&
+            integerConstant(last.getRhs()) == 1 && end.upper &&
+            sameScalarExpression(last.getLhs(), loop.getUpperBound()))
+          return {true, expression(PhysicalExprKind::Subtract, 0,
+                                   {end.upper,
+                                    expression(PhysicalExprKind::Constant, 1)})};
+      }
+      std::optional<int64_t> amount = integerConstant(binary.getRhs());
+      if (amount && *amount >= 0 && lhs.nonNegative && lhs.upper &&
+          lhs.lower >= *amount)
+        return {true, expression(PhysicalExprKind::Subtract, 0,
+                                 {lhs.upper, expression(PhysicalExprKind::Constant,
+                                                        *amount)}),
+                lhs.lower - *amount};
+    }
+    if (binary.getOperatorKind() == BinaryOperator::Add) {
+      for (auto [difference, increment] :
+           {std::pair{binary.getLhs(), binary.getRhs()},
+            std::pair{binary.getRhs(), binary.getLhs()}}) {
+        auto subtract = difference.getDefiningOp<BinaryOp>();
+        std::optional<int64_t> amount = integerConstant(increment);
+        Bounds preceding = bound(difference, depth + 1);
+        if (amount && *amount >= 0 && preceding.nonNegative && preceding.upper &&
+            preceding.upper.getKind() ==
+                static_cast<uint32_t>(PhysicalExprKind::Subtract) &&
+            preceding.upper.getOperands().size() == 2) {
+          auto headroom = cast<PhysicalExprAttr>(preceding.upper.getOperands()[1]);
+          if (headroom.getKind() ==
+                  static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+              headroom.getValue() >= *amount &&
+              preceding.lower <= std::numeric_limits<int64_t>::max() - *amount) {
+            auto base = cast<PhysicalExprAttr>(preceding.upper.getOperands()[0]);
+            int64_t remaining = headroom.getValue() - *amount;
+            return {true, remaining == 0 ? base :
+                expression(PhysicalExprKind::Subtract, 0,
+                           {base, expression(PhysicalExprKind::Constant, remaining)}),
+                    preceding.lower + *amount};
+          }
+        }
+        if (subtract && subtract.getOperatorKind() == BinaryOperator::Subtract &&
+            amount && *amount >= 0 &&
+            integerConstant(subtract.getRhs()) == amount &&
+            preceding.nonNegative) {
+          Bounds original = bound(subtract.getLhs(), depth + 1);
+          if (original.nonNegative)
+            return original;
+        }
+      }
+    }
     if (lhsConstant && rhsConstant) {
       constexpr int64_t maximum = std::numeric_limits<int64_t>::max();
       if (binary.getOperatorKind() == BinaryOperator::Add &&
@@ -1250,6 +1377,37 @@ bool sameLogicalRange(MakeRangeOp lhs, MakeRangeOp rhs) {
   return sameScalarExpression(lhs.getLogicalStart(), rhs.getLogicalStart()) &&
          sameScalarExpression(lhs.getLogicalStop(), rhs.getLogicalStop()) &&
          sameScalarExpression(lhs.getStep(), rhs.getStep());
+}
+
+bool canReplayReadAt(LoadOp load, Operation *insertionAnchor) {
+  if (!load || !insertionAnchor)
+    return false;
+  auto readOnly = [](Operation *operation) {
+    return !operation->walk([](Operation *nested) {
+      if (isa<LoadOp, GatherOp, scf::ForOp, scf::IfOp, scf::WhileOp>(nested) ||
+          isMemoryEffectFree(nested))
+        return WalkResult::advance();
+      return WalkResult::interrupt();
+    }).wasInterrupted();
+  };
+  Operation *ancestor = insertionAnchor;
+  while (ancestor && ancestor->getBlock() != load->getBlock()) {
+    if (!readOnly(ancestor))
+      return false;
+    ancestor = ancestor->getParentOp();
+  }
+  if (!ancestor || ancestor == load ||
+      !load->isBeforeInBlock(ancestor))
+    return false;
+  // Entering a loop can repeat this read after writes from an earlier
+  // iteration, even when the first insertion point precedes those writes.
+  if (ancestor != insertionAnchor && !readOnly(ancestor))
+    return false;
+  for (Operation *next = load->getNextNode(); next != ancestor;
+       next = next->getNextNode())
+    if (!readOnly(next))
+      return false;
+  return true;
 }
 
 bool isUnitStepRange(MakeRangeOp range) {
@@ -1505,9 +1663,15 @@ SmallVector<Value, 2> PhysicalProgramAnalysis::structuredSourcesForArgument(
 void PhysicalProgramAnalysis::collectRanges(
     Value value, std::optional<PhysicalSourceAxis> source,
     PhysicalRangeFact &result,
-    SmallPtrSetImpl<Operation *> &visited) {
+    SmallPtrSetImpl<Operation *> &visited, bool followScalarDependencies) {
   if (!value)
     return;
+  if (!followScalarDependencies) {
+    auto fragment = dyn_cast<FragmentType>(value.getType());
+    if (isa<IntegerType, FloatType, IndexType>(value.getType()) ||
+        (fragment && fragment.getShape().empty()))
+      return;
+  }
   if (auto extract = value.getDefiningOp<ExtractOp>()) {
     if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>()) {
       uint64_t field = extract.getField();
@@ -1516,7 +1680,8 @@ void PhysicalProgramAnalysis::collectRanges(
         appendUnique(result.blockers, extract);
         return;
       }
-      collectRanges(record.getFields()[field], source, result, visited);
+      collectRanges(record.getFields()[field], source, result, visited,
+                    followScalarDependencies);
       return;
     }
   }
@@ -1533,7 +1698,7 @@ void PhysicalProgramAnalysis::collectRanges(
       return;
     }
     for (Value related : outer)
-      collectRanges(related, source, result, visited);
+      collectRanges(related, source, result, visited, followScalarDependencies);
     return;
   }
   Operation *operation = value.getDefiningOp();
@@ -1550,7 +1715,8 @@ void PhysicalProgramAnalysis::collectRanges(
   // producer.  Any genuinely incompatible roots remain ambiguous in
   // sourceRanges(), where all collected ranges are compared.
   if (auto reshape = dyn_cast<ReshapeOp>(operation)) {
-    collectRanges(reshape.getValue(), source, result, visited);
+    collectRanges(reshape.getValue(), source, result, visited,
+                  followScalarDependencies);
     return;
   }
   // These operations are typed coordinate leaves.  They do not contribute a
@@ -1565,7 +1731,7 @@ void PhysicalProgramAnalysis::collectRanges(
       if (source && !carriesSource(scanSource.getType(), *source))
         continue;
       followed = true;
-      collectRanges(scanSource, source, result, visited);
+      collectRanges(scanSource, source, result, visited, followScalarDependencies);
     }
     if (!followed) {
       appendUnique(result.blockers, operation);
@@ -1585,7 +1751,7 @@ void PhysicalProgramAnalysis::collectRanges(
     // Resource identity stays in the access fact, not in fragment range provenance.
     if (load && operand == load.getResource())
       continue;
-    collectRanges(operand, source, result, visited);
+    collectRanges(operand, source, result, visited, followScalarDependencies);
   }
 }
 
@@ -2059,7 +2225,10 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     return;
   }
   if (auto select = dyn_cast<SelectOp>(operation)) {
-    for (Value selected : {select.getTrueValue(), select.getFalseValue()}) {
+    // Even uniform alternatives vary by lane when the condition does.  Its
+    // coordinate range must be replayed with the selected result axis.
+    for (Value selected : {select.getCondition(), select.getTrueValue(),
+                           select.getFalseValue()}) {
       auto selectedType = dyn_cast<FragmentType>(selected.getType());
       if (!selectedType ||
           selectedType.getShape().size() != fragment.getShape().size() ||
@@ -2988,7 +3157,14 @@ PhysicalProgramAnalysis::footprint(Operation *access) {
                        : PhysicalFactState::Unknown;
     result.rangeState = PhysicalFactState::Exact;
     for (Value coordinate : coordinates) {
-      PhysicalRangeFact ranges = sourceRanges(coordinate);
+      PhysicalRangeFact ranges;
+      ranges.state = PhysicalFactState::Exact;
+      SmallPtrSet<Operation *, 32> visited;
+      // A scalar coordinate may depend on a completed reduction, but that
+      // reduction's input lanes are not lanes of this memory access.  Keep the
+      // coordinate SSA dependency without applying its ancestors' tail masks.
+      collectRanges(coordinate, std::nullopt, ranges, visited,
+                    /*followScalarDependencies=*/false);
       // A footprint records the complete set of ranges, not a request for one
       // unique range.  Multiple roots are therefore exact here.  A coordinate
       // with no range roots is also exact when it is a scalar/broadcast-only

@@ -555,10 +555,17 @@ FailureOr<Value> replaySourceValueImpl(OpBuilder &builder, Location location,
       FailureOr<Value> projected = projectPhysicalValueToSchema(
           builder, location, current, operandTarget);
       if (failed(projected)) {
-        producer->emitOpError(
+        InFlightDiagnostic diagnostic = producer->emitOpError(
             "replayed pointwise operand cannot adopt the selected range relation")
             << "; operand=" << current.getType()
             << "; target=" << operandTarget;
+        if (Operation *definition = current.getDefiningOp())
+          diagnostic << "; operand_producer=" << definition->getName()
+                     << "; operand_location=" << definition->getLoc();
+        auto selectedOperand =
+            PhysicalProgramAnalysis(kernel).rangeAxes(operand, roots);
+        diagnostic << "; selected_operand_axes="
+                   << selectedOperand.fragmentAxes.size();
         return failure();
       }
       cloneMapping.map(operand, *projected);
@@ -581,7 +588,8 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
                                    PhysicalExprAttr blockedExtent,
                                    ArrayRef<MakeRangeOp> roots,
                                    Value replacement,
-                                   IRMapping &mapping) {
+                                   IRMapping &mapping,
+                                   Operation *insertionAnchor) {
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel || roots.empty())
     return failure();
@@ -607,6 +615,84 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
     for (Operation *blocker : replay.blockers)
       diagnostic << "; blocker=" << blocker->getName();
     return failure();
+  }
+  bool preserveRead = llvm::any_of(replay.accesses, [&](Operation *access) {
+    auto load = dyn_cast<LoadOp>(access);
+    return load && !canReplayReadAt(load, insertionAnchor);
+  });
+  if (preserveRead) {
+    PhysicalProgramAnalysis analysis(kernel);
+    PhysicalRangeAxisFact selected = analysis.rangeAxes(value, roots);
+    auto original = dyn_cast<FragmentType>(value.getType());
+    DominanceInfo dominance(kernel);
+    if (!original || !selected.isExact() || selected.fragmentAxes.size() != 1 ||
+        !dominance.dominates(value, insertionAnchor))
+      return (value.getDefiningOp() ? value.getDefiningOp() : kernel.getOperation())
+          ->emitError("contraction replay cannot preserve the original read value");
+    unsigned axis = selected.fragmentAxes.front();
+    if (!analysis.axisRealization(value, axis).physicalized) {
+      if (failed(realizeFullCoverageDimension(kernel, value, axis)))
+        return value.getDefiningOp()->emitOpError(
+            "retained contraction read could not be fully materialized");
+      original = cast<FragmentType>(value.getType());
+      analysis = PhysicalProgramAnalysis(kernel);
+    }
+    PhysicalRangeFact sourceRanges = analysis.axisRanges(value, axis);
+    FailureOr<MakeRangeOp> authority = queryExactLogicalRange(sourceRanges);
+    if (failed(authority) || !isUnitStepRange(*authority) ||
+        !analysis.lockstepRanges(sourceRanges.roots).isExact() ||
+        !analysis.axisRealization(value, axis).physicalized)
+      return value.getDefiningOp()->emitOpError(
+          "retained contraction value has no realized slice coordinate relation");
+    SmallVector<Attribute> shape(original.getShape().begin(),
+                                  original.getShape().end());
+    shape[axis] = blockedExtent;
+    auto target = FragmentType::get(
+        original.getContext(), original.getElementType(),
+        builder.getArrayAttr(shape), original.getAxisMaps(),
+        original.getValidity(), original.getOwner());
+    auto coordinate = cast<FragmentType>(replacement.getType());
+    Value start = builder.create<SplatOp>(location, coordinate,
+                                          (*authority).getStart());
+    Value ordinal = builder.create<BinaryOp>(
+        location, coordinate, replacement, start, BinaryOperator::Subtract);
+    auto indexType = FragmentType::get(
+        target.getContext(), builder.getIndexType(), target.getShape(),
+        target.getAxisMaps(), target.getValidity(), target.getOwner());
+    FailureOr<Value> indices = projectPhysicalValueToSchema(
+        builder, location, ordinal, indexType);
+    if (failed(indices))
+      return value.getDefiningOp()->emitOpError(
+          "retained contraction slice has no index projection");
+    auto predicate = FragmentType::get(
+        target.getContext(), builder.getI1Type(), target.getShape(),
+        target.getAxisMaps(), target.getValidity(), target.getOwner());
+    Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+    Value lower = builder.create<SplatOp>(location, indexType, zero);
+    Value extent = builder.create<SplatOp>(location, indexType,
+                                           (*authority).getExtent());
+    Value nonNegative = builder.create<CompareOp>(
+        location, predicate, *indices, lower, ComparePredicate::Ge);
+    Value inExtent = builder.create<CompareOp>(
+        location, predicate, *indices, extent, ComparePredicate::Lt);
+    Value valid = builder.create<BinaryOp>(
+        location, predicate, nonNegative, inExtent, BinaryOperator::LogicalAnd);
+    Value activeLength = builder.create<BinaryOp>(
+        location, builder.getIndexType(), (*authority).getLogicalStop(),
+        (*authority).getStart(), BinaryOperator::Subtract);
+    Value activeExtent = builder.create<SplatOp>(location, indexType, activeLength);
+    Value active = builder.create<CompareOp>(
+        location, predicate, *indices, activeExtent, ComparePredicate::Lt);
+    valid = builder.create<BinaryOp>(
+        location, predicate, valid, active, BinaryOperator::LogicalAnd);
+    FailureOr<Value> fill = materializeZeroFragment(builder, location, target);
+    if (failed(fill))
+      return failure();
+    Value sliced = builder.create<GatherOp>(
+        location, target, value, ValueRange{*indices}, valid, *fill,
+        ArrayRef<int64_t>{static_cast<int64_t>(axis)});
+    mapping.map(value, sliced);
+    return sliced;
   }
   FailureOr<Value> result = replaySourceValueImpl(
       builder, location, kernel, value, blockedExtent, roots, replacement,
@@ -775,8 +861,17 @@ LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
       return failure();
     auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
     FailureOr<ParameterOp> parameter = parameterForExtent(kernel, extent);
-    if (failed(parameter))
+    if (failed(parameter)) {
+      PhysicalAxisRealizationFact coverage =
+          PhysicalProgramAnalysis(kernel).axisRealization(source, axis);
+      if (!coverage.isExact() || !coverage.physicalized ||
+          coverage.constructionScalarSeed)
+        return kernel.emitError(
+            "native contraction axis has no exact physical coverage")
+               << "; axis=" << axis << "; source=" << source.getType()
+               << "; construction_seed=" << coverage.constructionScalarSeed;
       continue;
+    }
     uint32_t role = parameter->getParameter().getRole();
     if (role == static_cast<uint32_t>(ParameterRole::ScanChunk) ||
         role == static_cast<uint32_t>(ParameterRole::Reduction))
@@ -1610,6 +1705,7 @@ bool reductionAxesNeedTraversal(ContractOp contract, func::FuncOp kernel) {
       PhysicalAxisRealizationFact fact =
           analysis.axisRealization(operand, static_cast<unsigned>(axis));
       return isOwnershipExtent(contract, fragment.getShape()[axis]) ||
+             isFullCoverageExtent(contract, fragment.getShape()[axis]) ||
              fact.constructionScalarSeed ||
              (fact.isExact() && !fact.physicalized);
     });
@@ -2479,10 +2575,10 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
           rhsReplay.map(range.getResult(), rhsK);
         FailureOr<Value> lhs = replaySourceValue(
             nested, nestedLocation, contract.getLhs(), unitK, lhsRanges, lhsK,
-            lhsReplay);
+            lhsReplay, contract.getOperation());
         FailureOr<Value> rhs = replaySourceValue(
             nested, nestedLocation, contract.getRhs(), unitK, rhsRanges, rhsK,
-            rhsReplay);
+            rhsReplay, contract.getOperation());
         if (failed(lhs) || failed(rhs)) {
           bodyFailed = true;
           return;
@@ -2752,15 +2848,16 @@ LogicalResult realizeSparseReductionTraversal(SparseContractOp contract,
           metadataReplay.map(range.getResult(), metadataK);
         FailureOr<Value> compressed = replaySourceValue(
             nested, nestedLocation, contract.getCompressed(), unitCompressedK,
-            compressedRanges, compressedK, compressedReplay);
+            compressedRanges, compressedK, compressedReplay,
+            contract.getOperation());
         FailureOr<Value> rhs = replaySourceValue(
             nested, nestedLocation, contract.getRhs(), unitDenseK, denseRanges,
-            denseK, denseReplay);
+            denseK, denseReplay, contract.getOperation());
         SmallVector<Value> replayedMetadata;
         for (Value component : metadataComponents) {
           FailureOr<Value> replayed = replaySourceValue(
               nested, nestedLocation, component, unitMetadataK, metadataRanges,
-              metadataK, metadataReplay);
+              metadataK, metadataReplay, contract.getOperation());
           if (failed(replayed)) {
             bodyFailed = true;
             return;
