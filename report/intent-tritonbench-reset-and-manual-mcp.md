@@ -148,6 +148,10 @@ provider 的 Responses/流式/工具交互以及该服务的 luna/max 映射尚�
 
 用户要求停止旧 `agent-tritonbench-evaluation` 并准备重新设计，旧三次重复、生成与优化各至多五次提交的范围不再执行。实际后台实验已停止；工作区仍保留此前产生的结果改动。本轮没有完成数据清理、compiler 新修复、手册/MCP 部署或新模型调用。
 
-Native 归档预检返回 `ready=false`：当前处于 Build，0/6 验收通过且缺少 `verification.md`。公开 CLI 和文档只提供验收完成式 Archive，没有未完成 change 的 cancel/abandon 入口。不能补造 verification 或把旧 Spec 发布到主规格以满足工具。
+封存前 Native 归档预检返回 `ready=false`：处于 Build，0/6 验收通过且缺少 `verification.md`。公开 CLI 和文档只提供验收完成式 Archive，没有未完成 change 的 cancel/abandon 入口。不能补造 verification 或把旧 Spec 发布到主规格以满足工具。
 
-已向用户请求按“废止方案”手动历史封存的确认：保留原始未验收状态、停止旧范围，不发布旧 Spec。最终采用方式与实际结果在此处更新；新 change 尚未建立。报告中的 MCP/隔离/精简评估是下一轮讨论依据，不自动成为已经验收的实现。
+用户随后明确回复“是的，允许”，授权按“废止方案”手动封存。三个正式文件已从 active 目录移至 [docs/comet/archive/2026-09-11-agent-tritonbench-evaluation](../docs/comet/archive/2026-09-11-agent-tritonbench-evaluation/brief.md)。这不是 Native 的验收完成事务：`comet-state.yaml` 原样保留 Build、pending、archived=false 的历史快照，brief/Spec 明确标记废止；未生成验收报告，未发布旧 Spec，未修改 Runtime 机器文件。
+
+主工作区的原 active 目录已不存在。封存后 `comet native status` 仍从 `.worktrees/cpu-region-programs` 发现继承的同名旧副本，显示 `bindingState=mismatch`（声明 main，实际为 `comet/cpu-region-programs`）。该副本在 CPU worktree 中没有自身未提交修改，但属于另一工作区；本次未修改或删除它。因而“主工作区手动封存完成”不等于“Comet 跨 worktree 列表已清空”，该旧副本也不授权继续执行已废止范围。
+
+本次只封存这个 change、更新本报告；没有删除实验数据、回滚 compiler、处理其它 change/worktree 或创建新 change。报告中的 MCP/隔离/精简评估是下一轮讨论依据，不自动成为已经验收的实现。

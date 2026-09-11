@@ -1,6 +1,6 @@
 # 目标
 
-> 2026-09-11：用户已停止本方案，要求归档后重新思考。下文保留为历史需求，不再授权继续三次重复、生成/优化各五次提交或第二阶段实验；没有通过旧验收，也不发布旧 Spec。当前处置及替代方向见[复盘报告](../../../../report/intent-tritonbench-reset-and-manual-mcp.md)。
+> 2026-09-11：经用户明确授权，本方案已按“废止”手动移入历史归档，不属于 Native 验收完成式 Archive。下文不再授权继续三次重复、生成/优化各五次提交或第二阶段实验；旧 Spec 未发布。`comet-state.yaml` 原样保留封存前 Build/未验收状态，仅是历史快照，不表示仍应推进。实际处置及替代方向见[复盘报告](../../../../report/intent-tritonbench-reset-and-manual-mcp.md)。
 
 以 TritonBench-T 为共同任务来源，评价同一个 Codex/Luna agent 使用 Intent DSL 与直接编写 Triton 时，获得数值正确且高性能 GPU 程序的能力；进一步评价 Intent 生成的 Triton 作为 agent 后续优化起点的价值。实验接入与 compiler 攻坚共同推进，不把当前实现缺口当作不可修改的边界，也不预设实验必须得到正面结论。
 
