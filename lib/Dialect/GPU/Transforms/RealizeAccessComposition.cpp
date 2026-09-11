@@ -738,7 +738,7 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
   if (!reshape)
     return false;
   auto input = dyn_cast<FragmentType>(reshape.getValue().getType());
-  if (!input || input.getShape().size() >= outputRank)
+  if (!input || input.getShape().size() > outputRank)
     return false;
   unsigned logicalSourceRank = 0;
   unsigned logicalResultRank = 0;

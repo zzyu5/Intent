@@ -2678,6 +2678,24 @@ private:
           << " vs " << target;
       return failure();
     }
+    if (source.getShape() == target.getShape() &&
+        !gpu::queryAxisProjection(source, target).isExact()) {
+      // Canonical assignment has already aligned logical tensor axes by
+      // position.  Rebinding those axes to destination coordinates preserves
+      // lane order; matching old domain identities would imply a transpose.
+      SmallVector<Attribute> groups;
+      for (unsigned axis = 0; axis < source.getShape().size(); ++axis) {
+        auto axes = builder.getDenseI64ArrayAttr({static_cast<int64_t>(axis)});
+        groups.push_back(gpu::ReshapeGroupAttr::get(
+            operation->getContext(), axes, axes));
+      }
+      auto projected = builder.create<gpu::ReshapeOp>(
+          operation->getLoc(), target, *value, builder.getArrayAttr(groups));
+      if (Operation *definition = (*value).getDefiningOp())
+        if (Attribute origin = definition->getAttr(gpu::originAttr))
+          projected->setAttr(gpu::originAttr, origin);
+      return projected.getResult();
+    }
     return retargetBroadcast(builder, operation->getLoc(), *value, target);
   }
 
