@@ -1,5 +1,7 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
+#include "Intent/Analysis/RegionSemantics.h"
 
 #include "OnlineSummary.h"
 
@@ -69,6 +71,7 @@ struct SourcePlan {
   unsigned sourceAxis;
   bool hasLoads;
   SmallVector<MakeRangeOp> ranges;
+  Attribute tailConstant;
 };
 
 struct SliceRelation {
@@ -84,21 +87,31 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned sourceAxis,
   FailureOr<AxisMapAttr> mapping = queryAxisMap(fragment, sourceAxis);
   if (failed(mapping))
     return failure();
-  SourcePlan plan{source, sourceAxisIdentity(*mapping), sourceAxis, false, {}};
+  SourcePlan plan{source, sourceAxisIdentity(*mapping), sourceAxis, false, {}, {}};
   PhysicalRangeFact fact = analysis.axisRanges(source, sourceAxis);
   if (failed(queryExactLogicalRange(fact)))
     return failure();
   plan.ranges.assign(fact.roots.begin(), fact.roots.end());
+  UniformValueAnalysis values(describeUniformValue);
+  UniformBindings tailValues;
   for (Operation *access : fact.accesses) {
+    auto sliced = [&](Value value) {
+      auto resultType = dyn_cast<FragmentType>(value.getType());
+      return resultType && queryFragmentAxis(resultType, plan.sourceIdentity).isExact();
+    };
     if (auto load = dyn_cast<LoadOp>(access)) {
       if (!isa<ViewType>(load.getResource().getType()))
         return load.emitOpError(
             "region-fold source replay requires an immutable external-view load");
       plan.hasLoads = true;
+      if (sliced(load.getResult())) tailValues[load.getResult()] = load.getFill()
+          ? values.evaluate(load.getFill()) : uniformZero(uniformElementType(load.getResult().getType()));
       continue;
     }
-    if (isa<GatherOp>(access)) {
+    if (auto gather = dyn_cast<GatherOp>(access)) {
       plan.hasLoads = true;
+      if (sliced(gather.getResult())) tailValues[gather.getResult()] = gather.getFill()
+          ? values.evaluate(gather.getFill()) : uniformZero(uniformElementType(gather.getResult().getType()));
       continue;
     }
     return access->emitOpError(
@@ -110,6 +123,7 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned sourceAxis,
         "region-fold source traversal requires a unit-step physical range");
   if (plan.ranges.empty())
     return failure();
+  plan.tailConstant = values.evaluate(source, tailValues);
   return plan;
 }
 
@@ -660,225 +674,37 @@ helperCoordinateExpression(Value value) {
   return failure();
 }
 
-bool isZeroConstant(Value value, Value falsePredicate,
-                    llvm::SmallPtrSetImpl<Operation *> &visiting);
-
 std::optional<bool> booleanConstant(
     Value value, Value falsePredicate,
-    llvm::SmallPtrSetImpl<Operation *> &visiting) {
-  if (value == falsePredicate)
-    return false;
-  if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
-    if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
-      if (integer.getType().isInteger(1))
-        return integer.getInt() != 0;
-    return std::nullopt;
-  }
-  Operation *definition = value.getDefiningOp();
-  if (!definition || !visiting.insert(definition).second)
-    return std::nullopt;
-  auto finish = [&](std::optional<bool> result) {
-    visiting.erase(definition);
-    return result;
-  };
-  if (auto broadcast = dyn_cast<BroadcastOp>(definition))
-    return finish(booleanConstant(broadcast.getValue(), falsePredicate, visiting));
-  if (auto splat = dyn_cast<SplatOp>(definition))
-    return finish(booleanConstant(splat.getValue(), falsePredicate, visiting));
-  if (auto reshape = dyn_cast<ReshapeOp>(definition))
-    return finish(booleanConstant(reshape.getValue(), falsePredicate, visiting));
-  if (auto transpose = dyn_cast<TransposeOp>(definition))
-    return finish(booleanConstant(transpose.getValue(), falsePredicate, visiting));
-  if (auto cast = dyn_cast<CastOp>(definition))
-    return finish(booleanConstant(cast.getValue(), falsePredicate, visiting));
-  if (auto extract = dyn_cast<ExtractOp>(definition)) {
-    auto record = extract.getRecord().getDefiningOp<MakeRecordOp>();
-    if (!record || extract.getField() >= record.getFields().size())
-      return finish(std::nullopt);
-    return finish(booleanConstant(record.getFields()[extract.getField()],
-                                  falsePredicate, visiting));
-  }
-  if (auto select = dyn_cast<SelectOp>(definition)) {
-    std::optional<bool> condition =
-        booleanConstant(select.getCondition(), falsePredicate, visiting);
-    if (!condition)
-      return finish(std::nullopt);
-    return finish(booleanConstant(*condition ? select.getTrueValue()
-                                             : select.getFalseValue(),
-                                  falsePredicate, visiting));
-  }
-  if (auto compare = dyn_cast<CompareOp>(definition)) {
-    llvm::SmallPtrSet<Operation *, 16> zeroVisiting;
-    bool lhsZero =
-        isZeroConstant(compare.getLhs(), falsePredicate, zeroVisiting);
-    zeroVisiting.clear();
-    bool rhsZero =
-        isZeroConstant(compare.getRhs(), falsePredicate, zeroVisiting);
-    if (!lhsZero || !rhsZero)
-      return finish(std::nullopt);
-    switch (compare.getPredicate()) {
-    case ComparePredicate::Eq:
-    case ComparePredicate::Le:
-    case ComparePredicate::Ge:
-      return finish(true);
-    case ComparePredicate::Ne:
-    case ComparePredicate::Lt:
-    case ComparePredicate::Gt:
-      return finish(false);
-    default:
-      return finish(std::nullopt);
-    }
-  }
-  if (auto binary = dyn_cast<BinaryOp>(definition)) {
-    std::optional<bool> lhs =
-        booleanConstant(binary.getLhs(), falsePredicate, visiting);
-    std::optional<bool> rhs =
-        booleanConstant(binary.getRhs(), falsePredicate, visiting);
-    BinaryOperator kind = binary.getOperatorKind();
-    if (kind == BinaryOperator::LogicalAnd ||
-        kind == BinaryOperator::BitwiseAnd) {
-      if ((lhs && !*lhs) || (rhs && !*rhs))
-        return finish(false);
-      if (lhs && rhs)
-        return finish(*lhs && *rhs);
-    }
-    if (kind == BinaryOperator::LogicalOr ||
-        kind == BinaryOperator::BitwiseOr) {
-      if ((lhs && *lhs) || (rhs && *rhs))
-        return finish(true);
-      if (lhs && rhs)
-        return finish(*lhs || *rhs);
-    }
-    return finish(std::nullopt);
-  }
-  if (auto reduce = dyn_cast<ReduceOp>(definition)) {
-    auto result = cast<OpResult>(value).getResultNumber();
-    if (result >= reduce.getSourceCount() ||
-        result >= reduce.getIdentityCount())
-      return finish(std::nullopt);
-    std::optional<bool> source = booleanConstant(
-        reduce.getInputs()[result], falsePredicate, visiting);
-    std::optional<bool> identity = booleanConstant(
-        reduce.getInputs()[reduce.getSourceCount() + result], falsePredicate,
-        visiting);
-    if (source && identity && *source == *identity)
-      return finish(source);
-  }
-  return finish(std::nullopt);
-}
-
-bool isZeroConstant(Value value, Value falsePredicate,
-                    llvm::SmallPtrSetImpl<Operation *> &visiting) {
-  if (value == falsePredicate)
-    return true;
-  if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
-    if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
-      return integer.getInt() == 0;
-    if (auto floating = dyn_cast<FloatAttr>(constant.getValue()))
-      return floating.getValue().isZero();
-    return false;
-  }
-  Operation *definition = value.getDefiningOp();
-  if (!definition || !visiting.insert(definition).second)
-    return false;
-  auto finish = [&](bool result) {
-    visiting.erase(definition);
-    return result;
-  };
-  if (auto broadcast = dyn_cast<BroadcastOp>(definition))
-    return finish(isZeroConstant(broadcast.getValue(), falsePredicate, visiting));
-  if (auto splat = dyn_cast<SplatOp>(definition))
-    return finish(isZeroConstant(splat.getValue(), falsePredicate, visiting));
-  if (auto reshape = dyn_cast<ReshapeOp>(definition))
-    return finish(isZeroConstant(reshape.getValue(), falsePredicate, visiting));
-  if (auto transpose = dyn_cast<TransposeOp>(definition))
-    return finish(isZeroConstant(transpose.getValue(), falsePredicate, visiting));
-  if (auto cast = dyn_cast<CastOp>(definition))
-    return finish(isZeroConstant(cast.getValue(), falsePredicate, visiting));
-  if (auto extract = dyn_cast<ExtractOp>(definition)) {
-    auto record = extract.getRecord().getDefiningOp<MakeRecordOp>();
-    if (!record || extract.getField() >= record.getFields().size())
-      return finish(false);
-    return finish(isZeroConstant(record.getFields()[extract.getField()],
-                                 falsePredicate, visiting));
-  }
-  if (auto binary = dyn_cast<BinaryOp>(definition)) {
-    bool lhs = isZeroConstant(binary.getLhs(), falsePredicate, visiting);
-    bool rhs = isZeroConstant(binary.getRhs(), falsePredicate, visiting);
-    switch (binary.getOperatorKind()) {
-    case BinaryOperator::Add:
-    case BinaryOperator::Subtract:
-      return finish(lhs && rhs);
-    case BinaryOperator::Multiply:
-      return finish(lhs || rhs);
-    default:
-      return finish(false);
-    }
-  }
-  if (auto select = dyn_cast<SelectOp>(definition)) {
-    std::optional<bool> condition =
-        booleanConstant(select.getCondition(), falsePredicate, visiting);
-    if (!condition)
-      return finish(false);
-    return finish(isZeroConstant(*condition ? select.getTrueValue()
-                                            : select.getFalseValue(),
-                                 falsePredicate, visiting));
-  }
-  if (auto reduce = dyn_cast<ReduceOp>(definition)) {
-    auto result = cast<OpResult>(value).getResultNumber();
-    if (result >= reduce.getSourceCount() ||
-        result >= reduce.getIdentityCount())
-      return finish(false);
-    return finish(isZeroConstant(reduce.getInputs()[result], falsePredicate,
-                                 visiting) &&
-                  isZeroConstant(
-                      reduce.getInputs()[reduce.getSourceCount() + result],
-                      falsePredicate, visiting));
-  }
-  if (auto contract = dyn_cast<ContractOp>(definition))
-    return finish(isZeroConstant(contract.getAccumulator(), falsePredicate,
-                                 visiting) &&
-                  (isZeroConstant(contract.getLhs(), falsePredicate, visiting) ||
-                   isZeroConstant(contract.getRhs(), falsePredicate, visiting)));
-  return finish(false);
+    llvm::SmallPtrSetImpl<Operation *> &) {
+  UniformBindings bindings;
+  if (falsePredicate)
+    bindings[falsePredicate] = uniformZero(uniformElementType(falsePredicate.getType()));
+  UniformValueAnalysis facts(describeUniformValue);
+  return uniformBoolean(facts.evaluate(value, bindings));
 }
 
 bool equalWhenPredicateIsFalse(Value summary, Value identity,
                                Value falsePredicate) {
-  auto summaryRecord = summary.getDefiningOp<MakeRecordOp>();
-  auto identityRecord = identity.getDefiningOp<MakeRecordOp>();
-  if (summaryRecord || identityRecord) {
-    if (!summaryRecord || !identityRecord ||
-        summaryRecord.getFields().size() != identityRecord.getFields().size())
-      return false;
-    for (auto [summaryField, identityField] :
-         llvm::zip(summaryRecord.getFields(), identityRecord.getFields()))
-      if (!equalWhenPredicateIsFalse(summaryField, identityField,
-                                     falsePredicate))
-        return false;
-    return true;
-  }
-  llvm::SmallPtrSet<Operation *, 16> booleanVisiting;
-  std::optional<bool> summaryBoolean =
-      booleanConstant(summary, falsePredicate, booleanVisiting);
-  booleanVisiting.clear();
-  std::optional<bool> identityBoolean =
-      booleanConstant(identity, falsePredicate, booleanVisiting);
-  if (summaryBoolean && identityBoolean)
-    return *summaryBoolean == *identityBoolean;
-  llvm::SmallPtrSet<Operation *, 16> zeroVisiting;
-  if (!isZeroConstant(summary, falsePredicate, zeroVisiting))
-    return false;
-  zeroVisiting.clear();
-  return isZeroConstant(identity, falsePredicate, zeroVisiting);
+  UniformBindings bindings;
+  bindings[falsePredicate] = uniformZero(uniformElementType(falsePredicate.getType()));
+  UniformValueAnalysis facts(describeUniformValue);
+  return equalUniformConstants(facts.evaluate(summary, bindings),
+                               facts.evaluate(identity, bindings));
 }
 
-Value summaryMembershipPredicate(RegionFoldOp fold, ValueRange identities,
-                                 ParameterAttr segment) {
+// Only synthetic padding receives source fill facts. Logical traversal pruning
+// separately calls equalWhenPredicateIsFalse without these assumptions.
+Value physicalTailMembershipPredicate(RegionFoldOp fold, ValueRange identities,
+                                 ParameterAttr segment, ArrayRef<SourcePlan> plans) {
   auto yield = dyn_cast<YieldOp>(fold.getSummarize().front().getTerminator());
   if (!yield || yield.getValues().size() != identities.size())
     return {};
   Value candidate;
+  UniformValueAnalysis facts(describeUniformValue);
+  UniformBindings tailValues;
+  for (auto [argument, plan] : llvm::zip(fold.getSummarize().front().getArguments().take_front(fold.getSourceCount()), plans))
+    if (plan.tailConstant) tailValues[argument] = plan.tailConstant;
   for (Operation &operation : fold.getSummarize().front().without_terminator()) {
     for (Value result : operation.getResults()) {
       auto fragment = dyn_cast<FragmentType>(result.getType());
@@ -894,9 +720,10 @@ Value summaryMembershipPredicate(RegionFoldOp fold, ValueRange identities,
           !carriesSegment)
         continue;
       bool identityOnly = true;
+      UniformBindings assumptions = tailValues;
+      assumptions[result] = uniformZero(uniformElementType(result.getType()));
       for (auto [summary, identity] : llvm::zip(yield.getValues(), identities))
-        identityOnly &=
-            equalWhenPredicateIsFalse(summary, identity, result);
+        identityOnly &= equalUniformConstants(facts.evaluate(summary, assumptions), facts.evaluate(identity));
       if (identityOnly)
         candidate = result;
     }
@@ -932,19 +759,12 @@ bool isMembershipReduction(Value value, Value membershipPredicate) {
   std::optional<bool> identity =
       booleanConstant(reduce.getInputs().back(), Value(), visiting);
   auto yield = dyn_cast<YieldOp>(reduce.getCombine().front().getTerminator());
-  auto merged = yield && yield.getValues().size() == 1
-                    ? yield.getValues().front().getDefiningOp<BinaryOp>()
-                    : BinaryOp();
-  if (!identity || *identity || !merged ||
-      (merged.getOperatorKind() != BinaryOperator::LogicalOr &&
-       merged.getOperatorKind() != BinaryOperator::BitwiseOr) ||
+  if (!identity || *identity || !yield || yield.getValues().size() != 1 ||
       reduce.getCombine().front().getNumArguments() != 2)
     return false;
   Block &combine = reduce.getCombine().front();
-  return (merged.getLhs() == combine.getArgument(0) &&
-          merged.getRhs() == combine.getArgument(1)) ||
-         (merged.getRhs() == combine.getArgument(0) &&
-          merged.getLhs() == combine.getArgument(1));
+  return isBooleanUnion(UniformValueAnalysis(describeUniformValue), yield.getValues()[0],
+                        combine.getArgument(0), combine.getArgument(1));
 }
 
 std::optional<SummaryEmptinessPlan>
@@ -995,6 +815,10 @@ summaryEmptinessPlan(RegionFoldOp fold, ValueRange identities,
         (isRecordField(merged.getRhs(), lhs, field) &&
          isRecordField(merged.getLhs(), rhs, field));
     if (!fieldsMatch || selected)
+      return std::nullopt;
+    UniformValueAnalysis values(describeUniformValue);
+    if (!isBooleanUnion(values, merged.getResult(), merged.getLhs(), merged.getRhs()) ||
+        !hasTrueStateInvariant(values, merged.getResult(), merged.getLhs()))
       return std::nullopt;
     selected = field;
   }
@@ -1472,98 +1296,22 @@ void simplifyKnownRecordValues(func::FuncOp kernel) {
   } while (changed);
 }
 
-bool isZeroWithSources(Value value, const llvm::SmallDenseSet<Value> &sources,
-                       llvm::SmallPtrSetImpl<Operation *> &visiting) {
-  if (sources.contains(value))
-    return true;
-  if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
-    if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
-      return integer.getInt() == 0;
-    if (auto floating = dyn_cast<FloatAttr>(constant.getValue()))
-      return floating.getValue().isZero();
-    return false;
-  }
-  Operation *definition = value.getDefiningOp();
-  if (!definition || !visiting.insert(definition).second)
-    return false;
-  auto finish = [&](bool result) {
-    visiting.erase(definition);
-    return result;
-  };
-  if (auto broadcast = dyn_cast<BroadcastOp>(definition))
-    return finish(isZeroWithSources(broadcast.getValue(), sources, visiting));
-  if (auto splat = dyn_cast<SplatOp>(definition))
-    return finish(isZeroWithSources(splat.getValue(), sources, visiting));
-  if (auto cast = dyn_cast<CastOp>(definition))
-    return finish(isZeroWithSources(cast.getValue(), sources, visiting));
-  if (auto extract = dyn_cast<ExtractOp>(definition)) {
-    auto record = extract.getRecord().getDefiningOp<MakeRecordOp>();
-    if (!record || extract.getField() >= record.getFields().size())
-      return finish(false);
-    return finish(isZeroWithSources(record.getFields()[extract.getField()],
-                                    sources, visiting));
-  }
-  if (auto unary = dyn_cast<UnaryOp>(definition))
-    return finish(unary.getOperatorKind() == UnaryOperator::Negate &&
-                  isZeroWithSources(unary.getInput(), sources, visiting));
-  if (auto binary = dyn_cast<BinaryOp>(definition)) {
-    bool lhs = isZeroWithSources(binary.getLhs(), sources, visiting);
-    bool rhs = isZeroWithSources(binary.getRhs(), sources, visiting);
-    switch (binary.getOperatorKind()) {
-    case BinaryOperator::Add:
-    case BinaryOperator::Subtract:
-      return finish(lhs && rhs);
-    case BinaryOperator::Multiply:
-      return finish(lhs || rhs);
-    default:
-      return finish(false);
-    }
-  }
-  if (auto reduce = dyn_cast<ReduceOp>(definition)) {
-    auto result = cast<OpResult>(value).getResultNumber();
-    if (result >= reduce.getSourceCount() ||
-        result >= reduce.getIdentityCount())
-      return finish(false);
-    return finish(isZeroWithSources(reduce.getInputs()[result], sources,
-                                    visiting) &&
-                  isZeroWithSources(
-                      reduce.getInputs()[reduce.getSourceCount() + result],
-                      sources, visiting));
-  }
-  if (auto contract = dyn_cast<ContractOp>(definition))
-    return finish(isZeroWithSources(contract.getAccumulator(), sources,
-                                    visiting) &&
-                  (isZeroWithSources(contract.getLhs(), sources, visiting) ||
-                   isZeroWithSources(contract.getRhs(), sources, visiting)));
-  if (auto record = dyn_cast<MakeRecordOp>(definition)) {
-    for (Value field : record.getFields())
-      if (!isZeroWithSources(field, sources, visiting))
-        return finish(false);
-    return finish(true);
-  }
-  return finish(false);
-}
-
 bool scanTailIsIdentity(RegionScanOp scan, ArrayRef<SourcePlan> plans,
                         ValueRange identities) {
   auto yield = dyn_cast<YieldOp>(scan.getSummarize().front().getTerminator());
   if (!yield || yield.getValues().size() != identities.size())
     return false;
-  llvm::SmallDenseSet<Value> zeroSources;
+  UniformBindings bindings;
   for (auto [index, argument] : llvm::enumerate(
            scan.getSummarize().front().getArguments().take_front(
-               scan.getSourceCount())))
-    if (plans[index].hasLoads)
-      zeroSources.insert(argument);
-  llvm::SmallDenseSet<Value> noSources;
-  for (auto [summary, identity] : llvm::zip(yield.getValues(), identities)) {
-    llvm::SmallPtrSet<Operation *, 16> visiting;
-    if (!isZeroWithSources(summary, zeroSources, visiting))
-      return false;
-    visiting.clear();
-    if (!isZeroWithSources(identity, noSources, visiting))
-      return false;
+               scan.getSourceCount()))) {
+    if (plans[index].tailConstant) bindings[argument] = plans[index].tailConstant;
   }
+  UniformValueAnalysis facts(describeUniformValue);
+  for (auto [summary, identity] : llvm::zip(yield.getValues(), identities))
+    if (!equalUniformConstants(facts.evaluate(summary, bindings),
+                               facts.evaluate(identity)))
+      return false;
   return true;
 }
 
@@ -1923,6 +1671,23 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
 
   Location location = fold.getLoc();
   Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+  Value one = builder.create<arith::ConstantIndexOp>(location, 1);
+  auto expression = [&](UniformKind kind, Value lhs, Value rhs) -> Value {
+    BinaryOperator operation;
+    switch (kind) {
+    case UniformKind::Add: operation = BinaryOperator::Add; break;
+    case UniformKind::Subtract: operation = BinaryOperator::Subtract; break;
+    case UniformKind::Minimum: operation = BinaryOperator::Minimum; break;
+    case UniformKind::Maximum: operation = BinaryOperator::Maximum; break;
+    default: llvm_unreachable("unexpected coordinate expression");
+    }
+    return builder.create<BinaryOp>(location, builder.getIndexType(), lhs, rhs, operation);
+  };
+  auto intervals = [&](UniformPredicate predicate, MakeRangeOp source, Value captureBegin, Value captureEnd) {
+    Value sourceEnd = expression(UniformKind::Add, source.getStart(), masterExtent);
+    return *partitionCoordinatePredicate(predicate, {source.getStart(), sourceEnd},
+        {captureBegin, captureEnd}, zero, one, expression);
+  };
   Value effectiveStart = zero;
   Value effectiveStop = masterExtent;
   Value allTrueStart = zero;
@@ -1939,9 +1704,6 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
     for (auto [summary, identity] : llvm::zip(yield.getValues(), identities))
       identityOnly &=
           equalWhenPredicateIsFalse(summary, identity, compare.getResult());
-    if (!identityOnly)
-      continue;
-
     BlockArgument upperSource;
     BlockArgument upperCapture;
     bool strictUpper = false;
@@ -1964,40 +1726,14 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
     if (auto ranges = boundRanges(upperSource, upperCapture)) {
       MakeRangeOp captureRange = ranges->first;
       MakeRangeOp comparedSource = ranges->second;
-      Value captureWidth = builder.create<BinaryOp>(
-          location, builder.getIndexType(), captureRange.getExtent(),
-          captureRange.getStep(), BinaryOperator::Multiply);
-      Value captureUpper = builder.create<BinaryOp>(
-          location, builder.getIndexType(), captureRange.getStart(),
-          captureWidth, BinaryOperator::Add);
-      if (strictUpper)
-        captureUpper = builder.create<BinaryOp>(
-            location, builder.getIndexType(), captureUpper,
-            captureRange.getStep(), BinaryOperator::Subtract);
-      Value relativeUpper = builder.create<BinaryOp>(
-          location, builder.getIndexType(), captureUpper, master.getStart(),
-          BinaryOperator::Subtract);
-      Value nonNegative = builder.create<BinaryOp>(
-          location, builder.getIndexType(), relativeUpper, zero,
-          BinaryOperator::Maximum);
-      Value candidateStop = builder.create<BinaryOp>(
-          location, builder.getIndexType(), masterExtent, nonNegative,
-          BinaryOperator::Minimum);
-      effectiveStop = builder.create<BinaryOp>(
-          location, builder.getIndexType(), effectiveStop, candidateStop,
-          BinaryOperator::Minimum);
+      Value captureEnd = expression(UniformKind::Add, captureRange.getStart(), captureRange.getExtent());
+      auto bounds = intervals(strictUpper ? UniformPredicate::Less : UniformPredicate::LessEqual,
+          comparedSource, captureRange.getStart(), captureEnd);
+      if (identityOnly)
+        effectiveStop = expression(UniformKind::Minimum, effectiveStop, bounds.possibleEnd);
       {
-        Value relativeStart = builder.create<BinaryOp>(
-            location, builder.getIndexType(), captureRange.getStart(),
-            master.getStart(), BinaryOperator::Subtract);
-        Value nonNegativeStart = builder.create<BinaryOp>(
-            location, builder.getIndexType(), relativeStart, zero,
-            BinaryOperator::Maximum);
-        Value boundedStart = builder.create<BinaryOp>(
-            location, builder.getIndexType(), masterExtent, nonNegativeStart,
-            BinaryOperator::Minimum);
         Value wholeSegments = builder.create<BinaryOp>(
-            location, builder.getIndexType(), boundedStart, segment,
+            location, builder.getIndexType(), bounds.allTrueEnd, segment,
             BinaryOperator::FloorDivide);
         Value candidateAllTrueStop = builder.create<BinaryOp>(
             location, builder.getIndexType(), wholeSegments, segment,
@@ -2057,49 +1793,22 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
           lowerCapture->subtractScalar ? BinaryOperator::Subtract
                                        : BinaryOperator::Add);
     }
-    if (strictLower)
-      lower = builder.create<BinaryOp>(
-          location, builder.getIndexType(), lower, comparedSource.getStep(),
-          BinaryOperator::Add);
-    Value relativeLower = builder.create<BinaryOp>(
-        location, builder.getIndexType(), lower, master.getStart(),
-        BinaryOperator::Subtract);
-    Value nonNegativeLower = builder.create<BinaryOp>(
-        location, builder.getIndexType(), relativeLower, zero,
-        BinaryOperator::Maximum);
-    Value boundedLower = builder.create<BinaryOp>(
-        location, builder.getIndexType(), masterExtent, nonNegativeLower,
-        BinaryOperator::Minimum);
+    Value captureEnd = expression(UniformKind::Add, lower, captureRange.getExtent());
+    auto bounds = intervals(strictLower ? UniformPredicate::Greater : UniformPredicate::GreaterEqual,
+        comparedSource, lower, captureEnd);
     Value wholeSegments = builder.create<BinaryOp>(
-        location, builder.getIndexType(), boundedLower, segment,
+        location, builder.getIndexType(), bounds.possibleBegin, segment,
         BinaryOperator::FloorDivide);
     Value alignedLower = builder.create<BinaryOp>(
         location, builder.getIndexType(), wholeSegments, segment,
         BinaryOperator::Multiply);
-    effectiveStart = builder.create<BinaryOp>(
-        location, builder.getIndexType(), effectiveStart, alignedLower,
-        BinaryOperator::Maximum);
-    Value captureSpan = builder.create<BinaryOp>(
-        location, builder.getIndexType(), captureRange.getExtent(),
-        captureRange.getStep(), BinaryOperator::Multiply);
-    Value lastCaptureOffset = builder.create<BinaryOp>(
-        location, builder.getIndexType(), captureSpan, captureRange.getStep(),
-        BinaryOperator::Subtract);
-    Value lastLower = builder.create<BinaryOp>(
-        location, builder.getIndexType(), relativeLower, lastCaptureOffset,
-        BinaryOperator::Add);
-    Value nonNegativeLastLower = builder.create<BinaryOp>(
-        location, builder.getIndexType(), lastLower, zero,
-        BinaryOperator::Maximum);
-    Value boundedLastLower = builder.create<BinaryOp>(
-        location, builder.getIndexType(), masterExtent, nonNegativeLastLower,
-        BinaryOperator::Minimum);
-    Value one = builder.create<arith::ConstantIndexOp>(location, 1);
+    if (identityOnly)
+      effectiveStart = expression(UniformKind::Maximum, effectiveStart, alignedLower);
     Value adjustment = builder.create<BinaryOp>(
         location, builder.getIndexType(), segment, one,
         BinaryOperator::Subtract);
     Value roundedLastLower = builder.create<BinaryOp>(
-        location, builder.getIndexType(), boundedLastLower, adjustment,
+        location, builder.getIndexType(), bounds.allTrueBegin, adjustment,
         BinaryOperator::Add);
     Value firstWholeSegment = builder.create<BinaryOp>(
         location, builder.getIndexType(), roundedLastLower, segment,
@@ -2222,7 +1931,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   bool specializePredicatePrefix =
       succeeded(partition) && partition->prefixSpecializable;
   Value memberPredicate =
-      summaryMembershipPredicate(fold, identities, fold.getSegment());
+      physicalTailMembershipPredicate(fold, identities, fold.getSegment(), plans);
   if (!memberPredicate)
     return fold.emitOpError(
         "region-fold summarizer has no typed membership predicate that makes a physical tail equal to identity");
@@ -2460,9 +2169,13 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
       bodyFailed = true;
     }
     FailureOr<Value> payload = failure();
-    if (succeeded(first) && !bodyFailed)
-      payload = stripOptionalRecord(nonemptyBuilder, location, first->front(),
-                                    *emptiness);
+    if (succeeded(first) && !bodyFailed) {
+      SmallVector<Value> arguments(identities);
+      llvm::append_range(arguments, *first);
+      auto combined = inlinePureRegion(nonemptyBuilder, fold.getCombine(), arguments, failureReason);
+      if (succeeded(combined) && combined->size() == 1)
+        payload = stripOptionalRecord(nonemptyBuilder, location, combined->front(), *emptiness);
+    }
     if (failed(first) || failed(payload))
       bodyFailed = true;
 

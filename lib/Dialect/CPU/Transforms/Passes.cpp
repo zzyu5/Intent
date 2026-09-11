@@ -112,7 +112,7 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
       configurations.push_back(config);
   }
   if (configurations.empty()) return module.emitError("no legal CPU candidates remain");
-  if (failed(fuseStructuredComputations(original)) || failed(normalize(module)) ||
+  if (failed(foldUniformComputations(original)) || failed(fuseStructuredComputations(original)) || failed(normalize(module)) ||
       failed(verifyCPUProgram(module, false))) return failure();
   SmallVector<func::FuncOp> functions;
   for (auto [number, config] : llvm::enumerate(configurations)) {
@@ -147,9 +147,10 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
   }
   if (failed(normalize(module))) return failure();
   for (auto function : functions)
-    if (failed(fuseStructuredComputations(function))) return failure();
+    if (failed(foldUniformComputations(function)) || failed(fuseStructuredComputations(function))) return failure();
   if (failed(normalize(module))) return failure();
   for (auto function : functions) {
+    if (failed(reusePreparedInputs(function))) return failure();
     auto binding = function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration");
     Configuration config{binding.getTaskGrain(), binding.getTileM(), binding.getTileN(),
         binding.getTileK(), binding.getRegionSize(), {}};

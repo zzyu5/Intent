@@ -25,6 +25,8 @@ struct Configuration {
 };
 
 mlir::LogicalResult fuseStructuredComputations(mlir::func::FuncOp function);
+mlir::LogicalResult foldUniformComputations(mlir::func::FuncOp function);
+mlir::LogicalResult reusePreparedInputs(mlir::func::FuncOp function);
 void forwardCPUOutputs(mlir::func::FuncOp function);
 mlir::LogicalResult materializeStructuredComputations(mlir::func::FuncOp function);
 mlir::LogicalResult fuseIntermediateBuffers(mlir::func::FuncOp function);

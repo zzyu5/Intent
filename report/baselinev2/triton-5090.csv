@@ -2,7 +2,7 @@ kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
 fused_softmax,8192x8192-fp16,0.173872,0.188120,0.924261,pass,
 dense_gemm,M4096-N14336-K4096-fp16,2.055952,2.083600,0.986731,pass,
 grouped_gemm,E8-M1024-K4096-N14336-fp16,4.235672,4.592976,0.922206,pass,
-flash_attention_forward,B4-H32-S4096-D128-fp16-causal,2.763520,2.777256,0.995054,source_abi_gap,
+flash_attention_forward,B4-H32-S4096-D128-fp16-causal,6.602016,2.767912,2.385197,pass,同算法；CUDA graph 设备执行计时；source 额外写 f32 M 辅助结果。
 layer_norm,8192x4096-fp16,0.085776,0.089840,0.954764,pass,
 flash_cross_entropy,8192x32768-bf16,0.342304,0.345088,0.991932,pass,
 flash_layer_norm,8192x4096-bf16,0.087072,0.086216,1.009929,pass,
@@ -24,7 +24,7 @@ rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.229600,0.438880,0.523150,pass,
 causal_conv1d,B4-C4096-S4096-W4-bf16-silu,0.176944,0.192816,0.917683,pass,
 varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.057344,0.057600,0.995556,pass,
 causal_conv1d_update,B32-D4096-W4-bf16,0.005640,0.006112,0.922775,pass,
-modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,,,,generated_provider_jit_or_initial_launch_timeout,exceeded 300 seconds
+modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,,,,source_device_resource_gap,
 mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.008688,0.008208,1.058480,source_semantics_gap,
 flash_attention_backward,B2-H16-S2048-D128-fp16-causal,,,,source_device_resource_gap,
 moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.433064,2.392576,1.016922,pass,
