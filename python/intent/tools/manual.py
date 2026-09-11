@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from dataclasses import fields
 import inspect
 import json
 from pathlib import Path
@@ -46,8 +47,8 @@ def snapshot(project: Path) -> dict:
             exports.update({f"{name}.{member}": method for member, method in vars(value).items()
                             if inspect.isfunction(method) and (not member.startswith("_") or member == "__call__")})
         elif isinstance(value, QuantFormats):
-            exports.update({f"{name}.{member}": format for member, format in vars(value).items()
-                            if not member.startswith("_")})
+            exports.update({f"{name}.{field.name}": getattr(value, field.name)
+                            for field in fields(value) if not field.name.startswith("_")})
     for path in sorted((project / "python/intent/frontend/lowering").rglob("*.py")):
         for node in ast.walk(ast.parse(path.read_text())):
             if not isinstance(node, ast.Call) or not node.args:
