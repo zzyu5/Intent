@@ -2,13 +2,6 @@
 
 本文件只保留当前工作边界和 compiler 问题定位，不保存旧候选、旧正确率、性能数字或迭代结论。设计规格以 [doc/index.md](../doc/index.md) 为准。
 
-## 当前接续：先调查
-
-- 用户本轮要求先核对现状与职责，不直接按下面的 compiler 条目开始实现。已完成规格、当前代码、实验入口与外部 `/home/kingdom/phdworks/ref/triton`、`tilelang` 源码的静态核查；未运行生成、编译或 benchmark，原固定 50 题目标尚未继续执行。
-- 作者决定算法、kernel 数量、partial tensor 与 host 编排；Intent 形成每个 kernel 的 physical program，外部 compiler 继续完成目标布局、指令与 pipeline 等 lowering。Triton LayerNorm backward 和 TileLang attention backward 的多阶段是作者显式组织的；不能从单 program reduce 的性能局限推出 Intent 应新增隐藏 kernels。
-- 下面的条目是定位线索，不是必须先全部完成的改动清单。Out 定义后仍无条件拒读、ordered control 内 parallel 缺少 GPU construction 分支，是当前可定位的实现缺口；多个 mapping 跳过 refinement 本身只是未优化，仍有 dynamic ranges 时 pointwise blocking 才另有单 workset 限制。一般融合与 indexed access 已有实现，组合覆盖和对 50 题的实际影响尚未通过本轮运行确认。
-- 现有 suite 为 50 个唯一任务、每题一个 profile，默认两个语言组各交付一次；手册 MCP 已包含 `split_k_pipeline.py` 的完整双 kernel 示例。计时覆盖 callable 内的全部 GPU 工作，采用 CUDA Graph，排除 host/分配、编译与 tuning 开销。数值通过但 reference 无法 capture 时可以没有性能比值；后续须分别说明正确率和性能对照覆盖，不能以部分成功代替固定任务集结果。
-
 ## 单次生成口径
 
 - 独立 Luna max 使用任务说明和对应语言资料，每题分别交付一份 Intent 程序和一份直接 Triton 程序。允许查手册、提交前编辑和显式多 kernel host 编排。
