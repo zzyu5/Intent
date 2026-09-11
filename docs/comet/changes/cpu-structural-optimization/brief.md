@@ -22,6 +22,7 @@
 | 用户接受当前核数预算不是语言模型约束 | complete | Mojo 8-worker、Weft 1-worker 仅沿用为现有性能比较条件，不做核数扩展实验 | §1、§5 | A4 |
 | 用户同意暂缓 Intel AMX，IME 留给后续步骤 | complete | 矩阵扩展接入、格式扩张及外部微程序库不并入本轮 | §6 | 非目标 |
 | 用户确认基于上一轮 CPU 分支创建 worktree | complete | 独立分支/目录，保留主目录与旧分支 | §6 | 工作区决定 |
+| 用户在明确外部修改与独立提交授权问题后回复“继续啊” | complete | 补齐 TianchenRV 中静态有界子视图/私有窗口的通用 stream lowering，独立提交 | §4、§6 | A3、A4 |
 | compiler-figure-design 报告 §10 | background | 采用跨执行模型的优化方法，不要求统一 physical IR 或整套 pass | §1 | 背景 |
 | cpu-region-programs 的共享代码验收及历史运行结论 | superseded | 只作实现起点；不得作为本轮强制共享代码或已性能达标的依据 | §1、§5 | A1–A4 |
 
@@ -32,7 +33,7 @@
 - 不替换作者算法或 summary/scan 定义，不新增有限输入假设、全局 fast-math 或改变 NaN/Inf、signed zero、近似与累加合同来换取裁剪。
 - 不按 kernel 名、source 模板或整算子库调用选择执行路径；serializer/runtime 不新建算法、循环、共享缓存或 scratch。
 - 不新增测试框架、独立数值/回归/边界/压力测试、逐 pass 全排列消融或全量重跑；不恢复 ARS，不建立额外计划/进度文档。
-- 主目录的其它 change、实验产物以及外部 TianchenRV、ref、intent-paper 保持只读；若实现确实需要新的外部编译能力，先说明缺口并取得单独授权。
+- 主目录的其它 change、实验产物以及 ref、intent-paper 保持只读。TianchenRV 仅允许本轮已单独授权的静态有界子视图/私有窗口到 RVV stream contraction 的通用 lowering 补齐，独立提交并保留他人改动；其它外部能力仍需单独授权。
 
 # 验收示例
 
@@ -60,10 +61,12 @@
 - Reference 对照：Triton `python/tutorials/06-fused-attention.py:54–80` 在 source 中明确限定阶段范围，而 CPU 尚未完整形成相应合法范围；TileLang `tilelang/tileop/gemm/__init__.py:121–139` 与 `src/transform/lower_tile_op.cc:1134–1151` 将选定局部实现、布局和资源连到 lowering。借鉴职责及 IR 连接，不复制数值约定或 GPU 布局。
 - 性能起点来自现有表：Weft linear attention 3.423664/1.904748 ms，G/S 1.797437；Mojo 的两条区域程序为 0.278042/0.295968 与 0.200169/0.291698 ms。历史数字用于定位，不以跨时段 ratio 漂移证明优化收益。
 - 本轮不默认继承 cuTile 的 1.05/1.1 门槛，也不承诺全部 CPU 条目已经接近 source；实际收益、最终 G/S 和剩余差距分别交付。
+- 用户已在完整 Shape、A1–A4 和非目标说明后回复“可以，继续”，确认进入 Build；不重复询问已确定范围，新增外部能力或语义变更仍需单独授权。
+- 用户在明确询问 TianchenRV 通用 lowering 补齐、保留他人改动并独立提交后回复“继续啊”，授权上述窄范围外部修改；不扩大到 IME/AMX、算法、数值语义或新测试。
 
 # 待解决问题
 
-- [blocking] CONFIRM: 确认上述单轮目标、A1–A4 和非目标后进入 Build；重点是合法范围/状态/供应改写与 Weft 块级组织的真实性能改善，不扩大到 IME/AMX、全类型覆盖或强制 CPU/GPU 共享 pass。
+无未解决的需求或授权问题。
 
 # 验证预期
 
@@ -73,4 +76,16 @@ Shape 只读调查并维护本 brief/Spec，不编译、不运行 benchmark。Bu
 
 IR 差异从正常编译和性能运行已有产物取证，结合 ref file:line 解释变换及后果，不另造运行检查。最终只读复核与 Comet Verifier 分别核对 A1–A4；局部结构收益或单项 benchmark 通过不自动等于整轮验收通过。
 
-Shape 的 `native new/status/doctor` 已确认工作区绑定及状态正常；单独的 `native check` 返回 `Unsupported Native change schema comet.native.v4 for runtime protocol 3`。这是该检查入口与当前状态协议的不一致，不改写 Runtime 状态来规避，也不据此宣称正式产物或实现已经验收；Build 仍等待最终 Shape 确认。
+Shape 的 `native new/status/doctor` 已确认工作区绑定及状态正常；单独的 `native check` 返回 `Unsupported Native change schema comet.native.v4 for runtime protocol 3`。这是该检查入口与当前状态协议的不一致，不改写 Runtime 状态来规避，也不据此宣称正式产物或实现已经验收；按正常 `next` continuation 推进 Build。
+
+## Build 事实与当前缺口
+
+- CPU 已实现 typed uniform summary/identity 证明及 possible 区间消费；证明未知时保留原计算。完整逐元素 writer→copy 可直接写入私有目标，Weft 同作用域只读供应可跨消费者复用；整块 private write 与窗口 write 均保留显式 owner/update。生产编译入口 `--stop-after-shared` 显示 linear attention 两个既有候选的 `memref.copy` 从 12 个减到 4 个，删除完整块/尾块内的 next→state 整状态复制，保留外围输出/snapshot 复制。
+- Reference：`ref/triton/python/tutorials/06-fused-attention.py:54–80` 用显式阶段上下界避免无贡献遍历；本轮 `RealizeRegions.cpp:274–301` 则仅在完整 identity/effects 证明后改变边界，不从浮点零掩码推断无贡献。`ref/tilelang/src/transform/storage_rewrite.cc:301–325,951–985` 依据逐元素依赖、生命周期及存储条件复用目标；本轮 `FuseStructuredComputations.cpp:283–352` 同样保留旧状态最后读取及 snapshot，不无条件原地更新。这里的 ref 位于 `/home/kingdom/phdworks/ref`，不是当前 worktree 子目录。
+- 同条件 Mojo linear attention：改动前 generated/source 为 0.098131/0.162892 ms，改动后为 0.079454/0.158565 ms，generated 耗时约下降 19.0%。改动后的 attention 为 0.270391/0.286279 ms，GEMM 为 2.183901/2.144156 ms；均通过各自同次原容差检查，已写入 `report/baselinev2/mojo-x86.csv`。没有用更早表中 0.200169 ms 的跨时段差值宣称收益。
+- Weft linear attention 的本轮改动前实测为 3.437264/1.901288 ms，最终实现为 1.260196/1.906588 ms，G/S 0.660969；generated 耗时下降约 63.3%（2.73×），source 基本不变。Causal attention 当前为 3.341075/109.407813 ms，G/S 0.030538。均由原生产 benchmark 获得且同次原容差通过，已更新 `report/baselinev2/weft-rvv.csv`；Q4_K 原记录未改动。
+- Weft implementation 已从无条件 1×1 改为 binding 中的有界微块，当前 panel 不超过 4；K=1 的真实尾部继续使用局部标量收缩，保持原数值路径。CPU blocking 实际消费 staticParallelExtent。直接 16×16 会形成 256 个累加器组，4×4 主体使用 16 个累加器组和各 4 个输入组，实际进入 RVV stream-load/step/finalize。
+- 外部缺口已在 TianchenRV 通用 physical passes 闭合：`hasCompleteStreamAxis` 从 subview 的静态 extent 或 memory/local view 的常量有效范围证明完整 replica 轴，同时供 `MaterializeRISCVPrograms` 与 `RVVStreamLoadOp` verifier 使用；domain 分块的名义 shape 不作为尾部有效范围，原动态 point 路径保持。`PropagateRISCVLayouts` 修正 update 输入/result 的 local carrier 传播；`PlanRISCVMemory` 消费旧 implementation，保留已选 local-update leaf。Slice 省略的尾部 selector 按 canonical 规则视为 all；Reaxis 保持位置，仅改轴名。独立提交为 `59c1a50ad`、`f3402637d`，无新增 Canonical Level、Intent 专用路径或 emitter 算法。
+- 共享改动的普通 Mojo 条目已通过同次原容差：row affine 1.444316/2.082646 ms、softmax 8.081696/7.888340 ms、LayerNorm 3.797713/3.678546 ms。新 forwarding 限于 private owner；向 caller 输出扩张后出现的 softmax/LayerNorm 慢项已收回，私有状态复制收益保持。保持 private owner 有利于保留后端可见的存储关系，但尚无完整 LLVM 证据将耗时变化唯一归因于 alias analysis。
+- RMSNorm 最新实测 5.019436/3.447934 ms、G/S 1.455781，原容差通过，真实慢项保留在 CSV。原生产生成入口得到的新旧 Mojo 源码无差异，不能据此认定本轮 current-program 改写造成该差距；其运行、调优或外部编译层原因尚未定位，不宣称全部 CPU 性能已经收敛，也不继续重复采样掩盖它。
+- 最终独立只读代码复核 `/root/cpu_structural_final_review` 已通过，覆盖 CPU proof/transform、Weft implementation/legalization 与授权外部 lowering；复核发现的隐式 trailing selector 问题已修正。未运行额外测试；正式 Comet 验收仍由新的独立 Verifier 判断。

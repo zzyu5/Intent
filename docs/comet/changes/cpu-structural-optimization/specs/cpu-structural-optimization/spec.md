@@ -58,6 +58,6 @@ Mojo 按自身需求形成 SIMD、register microtile 和 native ABI，不要求�
 
 本 change 基于 `comet/cpu-region-programs` 创建 `comet/cpu-structural-optimization` 独立 worktree，当前集成目标仍为前者。主目录、旧分支和其它 change 保持原样；最终合并、推送、PR 或 worktree 清理由 Archive 阶段按授权处理。
 
-不接入 IME/AMX、DSA/Ascend、全量 dtype/量化格式或一般索引/InOut，不修改外部 TianchenRV、ref 与论文仓库，不重写作者算法或稳定 `doc/` 语义来迁就实现。需要额外外部能力或语义修改时先取得单独授权，不把前轮授权自动扩大到本轮。
+不接入 IME/AMX、DSA/Ascend、全量 dtype/量化格式或一般索引/InOut，不修改 ref 与论文仓库，不重写作者算法或稳定 `doc/` 语义来迁就实现。TianchenRV 仅允许本轮已单独授权的静态有界子视图/私有窗口到 RVV stream contraction 的通用 physical lowering 补齐；不增加 Intent 专用路径，保留他人改动并独立提交。其它外部能力或语义修改仍需单独授权，不把前轮授权自动扩大到本轮。
 
 本轮不定义所有 CPU 算子的统一 1.05/1.1 性能门槛，不以这一点免除真实收益和慢项归因的交付要求。单个普通 Native change 完成上述相关变换与验收，不建立 Supervisor、统一跨 family planning IR 或额外测试框架。

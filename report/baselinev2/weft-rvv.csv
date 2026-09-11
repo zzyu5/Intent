@@ -1,4 +1,4 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
-causal_attention_f32,B8-S128-D32-f32-1core,7.223379,109.298485,0.066089,pass,单核 RVV；独立 Weft 同算法 source；完整 native invocation 含内部 workspace、状态与任务完成；不含外部输出分配。
-causal_linear_attention_f32,B8-S128-D32-f32-1core,3.423664,1.904748,1.797437,pass,单核 RVV；独立 Weft 同算法 source；完整 native invocation 含内部 workspace、状态与任务完成；不含外部输出分配。
+causal_attention_f32,B8-S128-D32-f32-1core,3.341075,109.407813,0.030538,pass,单核 RVV；独立 Weft 同算法 source；完整 native invocation 含内部 workspace、状态与任务完成；不含外部输出分配。
+causal_linear_attention_f32,B8-S128-D32-f32-1core,1.260196,1.906588,0.660969,pass,单核 RVV；独立 Weft 同算法 source；完整 native invocation 含内部 workspace、状态与任务完成；不含外部输出分配。
 q4_k_projection,N4096-K4096-Q4_K-f32-1core,6.583957,5.725744,1.149887,pass,单核 RVV；完整 native invocation 含 Q8_K 量化及内部 workspace 分配/释放；同算法、相同 cold-cache，10 次中位数。

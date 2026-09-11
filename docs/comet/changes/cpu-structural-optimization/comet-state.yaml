@@ -1,28 +1,62 @@
 schema: comet.native.v4
 name: cpu-structural-optimization
 language: zh-CN
-phase: shape
+phase: build
 status: active
-state_version: 1
+state_version: 2
 brief: brief.md
-spec_changes: []
+spec_changes:
+  - capability: cpu-structural-optimization
+    operation: create
+    source: specs/cpu-structural-optimization/spec.md
 workspace:
   isolation: worktree
   change_branch: comet/cpu-structural-optimization
   target_branch: comet/cpu-region-programs
   finish: null
 loop:
-  stage: shape
+  stage: building
   goal_cycle: 1
-  iteration: 0
+  iteration: 1
   attempt: 0
   retry_epoch: 0
   failed_iteration_count: 0
   no_progress_count: 0
   execution_failure_count: 0
   previous_unresolved_ids: []
-  next_action: confirm-shape
-acceptance: []
+  next_action: submit-builder-candidate
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1：CPU region transformation 根据当前坐标范围和完整的 typed summary/identity、数值及
+      effects 证据形成有效遍历与谓词/状态特化；可证明无贡献的区间真实改变循环边界及其专属访问，而非只记录
+      possibleBegin/End。无法证明的区间保留原计算；空 source、首次 combine、绝对坐标、tail、scan
+      输出和最终状态不被省略。不得将 mask-false 或一个浮点零操作数单独当作删除整段的依据。
+    result: pending
+    reason: null
+  - id: A2
+    source: brief.md
+    text: A2：当前 region-scan 的重复准备/状态物化得到实际改写：在同一 slice
+      的来源稳定、访问一致且生命周期合法时复用输入供应，在旧状态不再被读取时消除不必要的 next→state 全量复制或重复初始化。生成的
+      CPU/provider IR 能指出减少的具体工作及 owner/lifetime，所有 summarize/emit/apply 依赖和完整
+      final state 保持；不以全局字符串缓存代替 IR 复用。
+    result: pending
+    reason: null
+  - id: A3
+    source: brief.md
+    text: A3：所选 Weft f32 实现能承接合法的有界二维计算块，CPU/provider transformation 不再无条件为每个输出元素建立
+      1×1 allocation/fill/contraction。块、输入供应、累加与尾部由同一 binding 和当前 IR 连接，展开结果进入正式
+      Weft lowering；Mojo 仍按自身需求形成局部微块，不强迫两个 provider 使用相同表示，也不引入整算子模板。
+    result: pending
+    reason: null
+  - id: A4
+    source: brief.md
+    text: A4：通过既有性能入口获得受影响 CPU 算子的 generated/source ms、G/S 和同次原容差结果，及时写回项目 CSV；对
+      Weft linear attention 给出明确结构归因和优化前后 generated 时间，实际改善不能由 source
+      时间漂移替代。保持同算法、shape、dtype、线程预算和完整 native
+      调用范围；没有真实性能收益不能把结构改写宣传成性能收敛，未运行项不宣称通过。
+    result: pending
+    reason: null
 builder_handoff: null
 blockers: []
 verification: null

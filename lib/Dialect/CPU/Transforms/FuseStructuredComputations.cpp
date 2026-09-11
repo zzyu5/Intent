@@ -280,6 +280,77 @@ bool reuseOutput(linalg::GenericOp consumer, Value buffer,
   return true;
 }
 
+void forwardPointwiseCopies(func::FuncOp function) {
+  SmallVector<memref::AllocOp> allocations;
+  function.walk([&](memref::AllocOp allocation) { allocations.push_back(allocation); });
+  for (auto allocation : allocations) {
+    Value buffer = allocation.getResult();
+    llvm::DenseMap<Block *, linalg::GenericOp> writers;
+    llvm::DenseMap<Block *, memref::CopyOp> readers;
+    bool closed = true;
+    for (Operation *user : buffer.getUsers()) {
+      if (isa<memref::DimOp, memref::DeallocOp>(user)) continue;
+      if (auto copy = dyn_cast<memref::CopyOp>(user)) {
+        if (copy.getSource() != buffer || copy.getTarget() == buffer ||
+            !readers.try_emplace(copy->getBlock(), copy).second) closed = false;
+        continue;
+      }
+      auto writer = dyn_cast<linalg::GenericOp>(user);
+      if (!writer || writer.getNumResults() || writer.getNumReductionLoops() ||
+          writer.getOutputs().size() != 1 || writer.getOutputs()[0] != buffer ||
+          llvm::is_contained(writer.getInputs(), buffer) ||
+          !writer.getIndexingMapsArray().back().isIdentity() ||
+          !writer.getRegion().front().getArguments().back().use_empty() ||
+          llvm::any_of(writer.getRegion().front().without_terminator(), [](Operation &operation) {
+            return operation.getNumRegions() || !isMemoryEffectFree(&operation);
+          }) || !writers.try_emplace(writer->getBlock(), writer).second) closed = false;
+    }
+    if (!closed || readers.empty() || readers.size() != writers.size()) continue;
+    // Every read has its own complete same-block definition, including distinct
+    // full/tail loop bodies. No other user may observe this scratch afterwards.
+    if (llvm::any_of(readers, [&](auto &entry) {
+          auto writer = writers.lookup(entry.first);
+          return !writer || !writer->isBeforeInBlock(entry.second);
+        })) continue;
+    for (auto &entry : readers) {
+      auto copy = entry.second;
+      auto writer = writers.lookup(entry.first);
+      Value target = copy.getTarget();
+      PhysicalProgramAnalysis physical(function);
+      Value targetRoot = physical.storageRoot(target);
+      // Retain a private owner. Forwarding into caller storage also needs the
+      // provider's native ABI to preserve the disjointness used for load reuse.
+      if (!isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(targetRoot.getDefiningOp())) continue;
+      DominanceInfo dominance(function);
+      if (!dominance.dominates(target, writer)) continue;
+      bool legal = true;
+      auto strip = [](Value value) {
+        while (auto cast = value.getDefiningOp<memref::CastOp>()) value = cast.getSource();
+        return value;
+      };
+      auto maps = writer.getIndexingMapsArray();
+      for (auto [number, input] : llvm::enumerate(writer.getInputs())) {
+        if (!isa<MemRefType>(input.getType()) || physical.storageRoot(input) != targetRoot) continue;
+        if (strip(input) != strip(target) || maps[number] != maps.back()) legal = false;
+      }
+      // Only dst[i] = f(dst[i], ...) is safe in-place. Other observations of the
+      // old destination between the definition and its copy keep the snapshot.
+      for (Operation *between = writer->getNextNode(); legal && between != copy;
+           between = between->getNextNode()) {
+        auto effects = getEffectsRecursively(between);
+        if (!effects) { legal = false; break; }
+        for (auto &effect : *effects) {
+          if (isa<MemoryEffects::Allocate>(effect.getEffect())) continue;
+          if (!effect.getValue() || physical.storageRoot(effect.getValue()) == targetRoot) legal = false;
+        }
+      }
+      if (!legal) continue;
+      writer.getDpsInitsMutable()[0].set(target);
+      copy.erase();
+    }
+  }
+}
+
 }
 
 LogicalResult fuseStructuredComputations(func::FuncOp function) {
@@ -317,6 +388,7 @@ LogicalResult fuseStructuredComputations(func::FuncOp function) {
       if (reuseOutput(operation, input, analysis)) break;
     }
   }
+  forwardPointwiseCopies(function);
   eraseDeadBuffers(function);
   return success();
 }

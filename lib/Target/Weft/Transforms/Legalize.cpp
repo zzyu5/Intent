@@ -135,7 +135,7 @@ public:
 
   LogicalResult lower(cpu::TasksOp tasks, StringRef name, ArrayRef<unsigned> argumentPositions,
                       llvm::json::Object &abi) {
-    values.clear(); locals.clear();
+    values.clear(); locals.clear(); readOnlySupplies.clear();
     Location loc = tasks.getLoc();
     SmallVector<Attribute> names, accesses, symbols;
     SmallVector<int64_t> aliases;
@@ -438,6 +438,8 @@ private:
   FailureOr<Value> read(Value memory) {
     if (!isa<MemRefType>(memory.getType())) return values.lookup(memory);
     if (!isLocal(memory)) {
+      auto supply = readOnlySupplies.find(memory);
+      if (supply != readOnlySupplies.end()) return supply->second;
       auto previous = operandReads.find(memory);
       if (previous != operandReads.end()) return previous->second;
       auto region = view(memory);
@@ -447,6 +449,7 @@ private:
       Value loaded = b.create<wk::AdmitOp>(memory.getLoc(),
           valueType(element, shape((*region).getType()), axes((*region).getType())), *region);
       operandReads[memory] = loaded;
+      if (analysis.isReadOnly(memory)) readOnlySupplies[memory] = loaded;
       return loaded;
     }
     Value root = localRoot(memory);
@@ -625,6 +628,18 @@ private:
     if (failed(type)) return failure();
     auto aligned = alignValue(value, *type, memory.getLoc());
     if (failed(aligned)) return failure();
+    auto current = locals.find(root);
+    if (current != locals.end() && isa<wk::ValueType>(*type)) {
+      if (current->second.value.getType() != *type || current->second.sizes.size() != sizes.size() ||
+          !llvm::all_of(llvm::zip(current->second.sizes, sizes), [&](auto bounds) {
+            return sameBound(std::get<0>(bounds), std::get<1>(bounds));
+          }))
+        return emitError(memory.getLoc(), "complete private write must preserve its initialized owner and extents");
+      current->second.value = b.create<wk::UpdateOp>(memory.getLoc(), *type,
+          current->second.value, *aligned, ValueRange{},
+          b.getArrayAttr(SmallVector<Attribute>(shape(*type).size(), b.getStringAttr("all"))));
+      return success();
+    }
     locals[root] = {*aligned, sizes};
     return success();
   }
@@ -927,8 +942,15 @@ private:
   }
 
   LogicalResult block(Block &source) {
+    auto enclosingSupplies = readOnlySupplies;
     for (Operation &operation : source.without_terminator())
-      if (failed(lower(&operation))) return failure();
+      if (failed(lower(&operation))) {
+        readOnlySupplies = std::move(enclosingSupplies);
+        return failure();
+      }
+    // A supplied immutable input may serve later consumers in this block, but
+    // a branch/loop-local SSA value cannot escape into its enclosing scope.
+    readOnlySupplies = std::move(enclosingSupplies);
     return success();
   }
 
@@ -1184,6 +1206,7 @@ private:
   IRMapping values;
   llvm::DenseMap<Value, LocalValue> locals;
   llvm::DenseMap<Value, Value> operandReads;
+  llvm::DenseMap<Value, Value> readOnlySupplies;
   const llvm::DenseMap<Value, intent::QuantFormat> &formats;
   const cpu::ImplementationRegistry &implementations;
   llvm::DenseMap<int64_t, int64_t> extentIds;
