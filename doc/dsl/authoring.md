@@ -24,9 +24,9 @@ Domain 索引按资源索引顺序形成读取结果的 tensor axes，赋值仍�
 
 ## Reduce、tuple 与 helpers
 
-`I.reduce.sum/max/any/all` 返回归约后的 values，没有 `keepdim`；非空 axis tuple 可同时归约多轴。补 size-one 轴时，tensor value 使用 `I.reshape`；scalar 不能 reshape，可用 `I.full` 构造 tensor，或按赋值的广播规则直接写出。
+`I.reduce.sum/max/any/all` 返回归约后的 values，没有 `keepdim`；非空 axis tuple 可同时归约多轴。若所有轴都被归约，结果是 scalar，而非零维 tensor。补 size-one 轴时，tensor value 使用 `I.reshape`；scalar 不能 reshape，可用 `I.full` 构造 tensor，或按赋值的广播规则直接写出。
 
-`I.arg_reduce.max(value, axis=...)` 返回 `(values, indices)`，不能把整对结果当 indices。分别核对两个 component 的 dtype；写入不同 dtype 的输出前必须显式 `I.cast`，包括 `I.i64` 与 `I.index` 之间，不能因它们都使用 64 bits 就视为同一类型。
+`I.arg_reduce.max(value, axis=...)` 返回 `(values, indices)`，不能把整对结果当 indices。完整归约时两项均为 scalar；保留轴时两项均为保留这些轴的 tensor。分别核对两个 component 的 dtype；写入不同 dtype 的输出前必须显式 `I.cast`，包括 `I.i64` 与 `I.index` 之间，不能因它们都使用 64 bits 就视为同一类型。
 
 Generic `I.reduce(value, axis=..., identity=..., combine=helper)` 的 identity、两组 combine 参数和返回值必须具有删除归约轴后的同一 schema。例如 `[M,N]` 沿 `1` 归约得到 `[M]`，identity 可写成 `I.full((M,), 0.0, dtype=I.f32)`。完整例子见 [reduction.py](examples/reduction.py)。
 
