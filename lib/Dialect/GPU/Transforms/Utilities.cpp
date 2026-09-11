@@ -3349,6 +3349,22 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
     if (!store->getBlock() || !type || sources.empty())
       continue;
     OpBuilder builder(store);
+    SmallVector<Attribute> shape(type.getShape().begin(), type.getShape().end());
+    for (MakeRangeOp range : sources) {
+      auto coordinate = cast<FragmentType>(range.getResult().getType());
+      for (PhysicalAxisProjection projection : queryRangeProjections(type, range))
+        shape[projection.fragmentAxis] = coordinate.getShape()[0];
+    }
+    type = FragmentType::get(kernel.getContext(), type.getElementType(),
+                             builder.getArrayAttr(shape), type.getAxisMaps(),
+                             type.getValidity(), type.getOwner());
+    // The access coordinates own the physical extent.  Project a uniform
+    // payload to that schema without retargeting its independent value graph.
+    FailureOr<Value> value = projectPhysicalValueToSchema(
+        builder, store.getLoc(), store.getValue(), type);
+    if (failed(value))
+      return store.emitOpError(
+          "full-coverage stored value has no exact physical projection");
     FailureOr<Value> tail =
         materializeTail(builder, store.getLoc(), type, sources);
     if (failed(tail))
@@ -3363,7 +3379,9 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
             builder, store.getLoc(), existing, predicate);
         if (failed(projected))
           return store.emitOpError(
-              "full-coverage validity has no exact physical projection");
+              "full-coverage validity has no exact physical projection")
+                 << "; existing=" << existing.getType()
+                 << "; required=" << predicate;
         existing = *projected;
       }
       valid = builder.create<BinaryOp>(store.getLoc(), predicate, existing,
@@ -3371,7 +3389,7 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
     }
     auto replacement = builder.create<StoreOp>(
         store.getLoc(), store.getResource(), store.getCoordinates(),
-        store.getValue(), valid, store.getSourceAxes());
+        *value, valid, store.getSourceAxes());
     if (Attribute origin = store->getAttr(originAttr))
       replacement->setAttr(originAttr, origin);
     store.erase();
