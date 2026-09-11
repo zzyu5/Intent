@@ -221,10 +221,21 @@ private:
   };
 
   void bindArguments() {
+    llvm::StringSet<> argumentNames;
+    for (unsigned index = 0; index < kernel.getNumArguments(); ++index)
+      argumentNames.insert(kernel.getArgAttrDict(index)
+                               .getAs<StringAttr>(gpu::abiNameAttr).getValue());
     for (auto [index, argument] : llvm::enumerate(kernel.getArguments())) {
       DictionaryAttr attrs = kernel.getArgAttrDict(index);
       std::string kind = attrs.getAs<StringAttr>(gpu::abiKindAttr).getValue().str();
       std::string name = attrs.getAs<StringAttr>(gpu::abiNameAttr).getValue().str();
+      // Triton's launch kwargs also enter autotune hook argument maps.  Keep
+      // view names out of that namespace (for example, an input named grid).
+      if (kind == "view") {
+        name = "_intent_view_" + std::to_string(index);
+        while (!argumentNames.insert(name).second)
+          name += "_";
+      }
       values[argument] = name;
       if (kind == "view") {
         views.push_back(
@@ -619,7 +630,8 @@ private:
            1);
     }
     auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
-    std::string grid = "grid = lambda META: (";
+    std::string gridName = newName();
+    std::string grid = gridName + " = lambda META: (";
     for (auto [index, extent] : llvm::enumerate(space)) {
       if (index)
         grid += ", ";
@@ -628,7 +640,7 @@ private:
     if (space.size() == 1)
       grid += ",";
     line(grid + ")", 1);
-    std::string call = "return _intent_kernel[grid](";
+    std::string call = "return _intent_kernel[" + gridName + "](";
     bool first = true;
     for (const ViewABI &view : views) {
       if (!first)
@@ -1677,7 +1689,15 @@ private:
     line(statement + " = " + expression);
   }
 
-  std::string newName() { return "v" + std::to_string(counter++); }
+  std::string newName() {
+    std::string name;
+    do {
+      name = "v" + std::to_string(counter++);
+    } while (llvm::any_of(values, [&](const auto &entry) {
+      return entry.second == name;
+    }));
+    return name;
+  }
 
   void line(const std::string &text, unsigned explicitIndent = ~0U) {
     unsigned level = explicitIndent == ~0U ? indent : explicitIndent;
