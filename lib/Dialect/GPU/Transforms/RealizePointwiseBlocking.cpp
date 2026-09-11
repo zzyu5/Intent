@@ -429,11 +429,6 @@ LogicalResult bindStructurallyRequiredStaticFragments(func::FuncOp kernel) {
   return success();
 }
 
-LogicalResult requireFullDimensionCoverage(func::FuncOp kernel, Value source,
-                                           uint64_t axis) {
-  return realizeFullCoverageDimension(kernel, source, axis);
-}
-
 bool hasExactStaticFullCoverage(func::FuncOp kernel, Value source,
                                 uint64_t axis) {
   auto fragment = dyn_cast<FragmentType>(source.getType());
@@ -462,6 +457,13 @@ bool hasExactStaticFullCoverage(func::FuncOp kernel, Value source,
            static_cast<__int128>(extent.getValue()) * step.value() >=
                static_cast<__int128>(stop.value() - start.value());
   });
+}
+
+LogicalResult requireFullDimensionCoverage(func::FuncOp kernel, Value source,
+                                           uint64_t axis) {
+  if (hasExactStaticFullCoverage(kernel, source, axis))
+    return success();
+  return realizeFullCoverageDimension(kernel, source, axis);
 }
 
 bool isZeroScanIdentity(Value value) {
