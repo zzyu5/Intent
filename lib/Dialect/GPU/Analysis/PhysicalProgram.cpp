@@ -380,6 +380,45 @@ bool derivesFromAccessCoordinate(Value value, Value coordinate) {
 bool valueKnownPositive(Value value, unsigned depth);
 bool valueKnownNonNegative(Value value, unsigned depth);
 
+enum class IndexSign { Unknown, NonNegative, Positive };
+
+IndexSign physicalIndexSign(PhysicalExprAttr expression, func::FuncOp kernel) {
+  auto kind = static_cast<PhysicalExprKind>(expression.getKind());
+  if (kind == PhysicalExprKind::Constant)
+    return expression.getValue() > 0 ? IndexSign::Positive
+         : expression.getValue() == 0 ? IndexSign::NonNegative : IndexSign::Unknown;
+  if (kind == PhysicalExprKind::Dimension)
+    return IndexSign::NonNegative;
+  if (kind == PhysicalExprKind::Parameter) {
+    FailureOr<ParameterOp> parameter = queryParameterBySymbol(kernel, expression.getSymbol());
+    if (failed(parameter))
+      return IndexSign::Unknown;
+    auto candidates = (*parameter).getParameter().getCandidates().asArrayRef();
+    if (candidates.empty())
+      return IndexSign::Unknown;
+    if (llvm::all_of(candidates, [](int64_t value) { return value > 0; }))
+      return IndexSign::Positive;
+    return llvm::all_of(candidates, [](int64_t value) { return value >= 0; })
+               ? IndexSign::NonNegative : IndexSign::Unknown;
+  }
+  if (expression.getOperands().size() != 2)
+    return IndexSign::Unknown;
+  IndexSign lhs = physicalIndexSign(
+      cast<PhysicalExprAttr>(expression.getOperands()[0]), kernel);
+  IndexSign rhs = physicalIndexSign(
+      cast<PhysicalExprAttr>(expression.getOperands()[1]), kernel);
+  if (kind == PhysicalExprKind::Maximum)
+    return std::max(lhs, rhs);
+  if (kind == PhysicalExprKind::Minimum)
+    return std::min(lhs, rhs);
+  if ((kind == PhysicalExprKind::CeilDiv || kind == PhysicalExprKind::FloorDiv) &&
+      lhs != IndexSign::Unknown && rhs == IndexSign::Positive)
+    return kind == PhysicalExprKind::CeilDiv ? lhs : IndexSign::NonNegative;
+  // Unknown arithmetic remains unknown; in particular this does not assume
+  // that a product or sum of dynamic index values cannot overflow.
+  return IndexSign::Unknown;
+}
+
 bool valueBelowDelinearizeExtent(Value value, Value extent, unsigned depth) {
   if (!value || depth >= 32)
     return false;
@@ -411,6 +450,10 @@ bool valueKnownPositive(Value value, unsigned depth = 0) {
   if (!value || depth >= 32)
     return false;
   value = stripIntegerIndexCasts(value);
+  if (auto physical = value.getDefiningOp<PhysicalExprOp>())
+    return physicalIndexSign(physical.getExpression(),
+                             physical->getParentOfType<func::FuncOp>()) ==
+           IndexSign::Positive;
   if (std::optional<int64_t> constant = integerConstant(value))
     return *constant > 0;
   if (auto parameter = value.getDefiningOp<ParameterOp>())
@@ -427,6 +470,10 @@ bool valueKnownPositive(Value value, unsigned depth = 0) {
     return false;
   if (binary.getOperatorKind() == BinaryOperator::Subtract)
     return valueBelowDelinearizeExtent(binary.getRhs(), binary.getLhs(), depth + 1);
+  if (binary.getOperatorKind() == BinaryOperator::Maximum &&
+      value.getType().isIndex())
+    return valueKnownPositive(binary.getLhs(), depth + 1) ||
+           valueKnownPositive(binary.getRhs(), depth + 1);
   if (binary.getOperatorKind() == BinaryOperator::Multiply ||
       binary.getOperatorKind() == BinaryOperator::Add ||
       binary.getOperatorKind() == BinaryOperator::Minimum ||
@@ -440,6 +487,10 @@ bool valueKnownNonNegative(Value value, unsigned depth = 0) {
   if (!value || depth >= 32)
     return false;
   value = stripIntegerIndexCasts(value);
+  if (auto physical = value.getDefiningOp<PhysicalExprOp>())
+    return physicalIndexSign(physical.getExpression(),
+                             physical->getParentOfType<func::FuncOp>()) !=
+           IndexSign::Unknown;
   if (std::optional<int64_t> constant = integerConstant(value))
     return *constant >= 0;
   if (value.getDefiningOp<ProgramIdOp>())
@@ -2519,6 +2570,23 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
   }
 
   result.state = PhysicalFactState::Exact;
+  if (ranges.roots.empty() && value.getDefiningOp() &&
+      isCoordinateReplayNode(value.getDefiningOp()) &&
+      extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
+    FailureOr<ParameterOp> parameter = queryParameterBySymbol(kernel, extent.getSymbol());
+    if (succeeded(parameter)) {
+      PhysicalParameterBinding binding = queryParameterBinding(*parameter);
+      bool hasBinding = binding.dimension || binding.source;
+      if (binding.isExact() && hasBinding &&
+          (!binding.dimension || *binding.dimension == result.dimensionId) &&
+          (!binding.source || *binding.source == result.source))
+        // A uniform axis has no coordinate range, but its explicitly bound
+        // physical extent still governs pointwise broadcasting.  This does
+        // not prove that any logical traversal has been materialized.
+        result.extentAuthority =
+            PhysicalAxisRealizationFact::ExtentAuthority::Structural;
+    }
+  }
   if (result.physicalized)
     result.extentAuthority =
         PhysicalAxisRealizationFact::ExtentAuthority::Range;
