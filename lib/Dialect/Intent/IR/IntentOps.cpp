@@ -1,7 +1,9 @@
 #include "Intent/Dialect/Intent/IR/IntentOps.h"
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -1393,6 +1395,56 @@ LogicalResult verifyContract(Operation *operation) {
   return success();
 }
 
+bool hasDominatingViewDefinition(Operation *read, RankedTensorType tensor) {
+  Value resource = read->getOperand(0);
+  auto function = read->getParentOfType<func::FuncOp>();
+  if (!function)
+    return false;
+  DominanceInfo dominance(function);
+  for (Operation *user : resource.getUsers()) {
+    auto store = dyn_cast<ViewStoreOp>(user);
+    if (!store || store->getOperand(0) != resource ||
+        !dominance.dominates(user, read) ||
+        store->hasAttr("valid_operand_index"))
+      continue;
+    auto relation = store->getAttrOfType<IndexRelationAttr>("index");
+    if (!relation || relation.getSourceRank() != tensor.getRank() ||
+        relation.getTerms().size() != static_cast<size_t>(tensor.getRank()))
+      continue;
+    bool complete = true;
+    for (auto [axis, attribute] : llvm::enumerate(relation.getTerms())) {
+      auto term = dyn_cast<IndexTermAttr>(attribute);
+      if (!term) {
+        complete = false;
+        break;
+      }
+      if (term.getKind() == 0)
+        continue;
+      if (term.getKind() != 4 || term.getOperandPositions().size() != 1) {
+        complete = false;
+        break;
+      }
+      int64_t position = term.getOperandPositions()[0];
+      if (position <= 0 || position >= store->getNumOperands()) {
+        complete = false;
+        break;
+      }
+      auto domain = store->getOperand(position).getDefiningOp<DomainOp>();
+      if (!domain || domain.getBounds().size() < 2 ||
+          getConstantInteger(domain.getBounds()[0]) != 0 ||
+          !extentValueMatchesAxis(domain.getBounds()[1], tensor, axis) ||
+          (domain.getBounds().size() == 3 &&
+           getConstantInteger(domain.getBounds()[2]) != 1)) {
+        complete = false;
+        break;
+      }
+    }
+    if (complete)
+      return true;
+  }
+  return false;
+}
+
 LogicalResult verifyAccess(Operation *operation) {
   FailureOr<IndexRelationInfo> relation = verifyIndexRelation(operation);
   if (failed(relation))
@@ -1420,8 +1472,10 @@ LogicalResult verifyAccess(Operation *operation) {
         "logical-buffer access requires a logical buffer source");
   if (name == "intent.gather" && !isa<RankedTensorType>(sourceType))
     return operation->emitOpError("pure gather requires an immutable tensor source");
-  if (view && load && view.getAccess() == 1)
-    return operation->emitOpError("Out-only external view cannot be read");
+  if (view && load && view.getAccess() == 1 &&
+      !hasDominatingViewDefinition(operation, source))
+    return operation->emitOpError(
+        "Out view read has no proven preceding definition");
   if (view && !load && view.getAccess() == 0)
     return operation->emitOpError("In-only external view cannot be written");
 

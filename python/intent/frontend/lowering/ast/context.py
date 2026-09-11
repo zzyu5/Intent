@@ -446,8 +446,8 @@ class FunctionLowerer:
 
     def require_readable_view(self, value: MlirValue, node: ast.AST) -> None:
         kind = self.view_kinds.get(value)
-        if kind not in (ViewKind.IN, ViewKind.INOUT):
-            self.error(node, "Out-only view cannot be read")
+        if kind not in (ViewKind.IN, ViewKind.INOUT, ViewKind.OUT):
+            self.error(node, "view read requires an external-view ABI")
 
     def require_writable_view(self, value: MlirValue, node: ast.AST) -> None:
         kind = self.view_kinds.get(value)

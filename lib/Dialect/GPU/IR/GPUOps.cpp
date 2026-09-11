@@ -150,13 +150,6 @@ Type resourceElementType(Type type) {
   return {};
 }
 
-LogicalResult verifyReadableResource(Operation *owner, Type resource) {
-  auto view = dyn_cast<ViewType>(resource);
-  return !view || view.getAccess() != 1
-             ? success()
-             : owner->emitOpError("Out-only external view cannot be read");
-}
-
 LogicalResult verifyWritableResource(Operation *owner, Type resource) {
   auto view = dyn_cast<ViewType>(resource);
   return !view || view.getAccess() != 0
@@ -795,8 +788,8 @@ LogicalResult LoadOp::verify() {
                              : cast<BufferType>(getResource().getType()).getElementType();
   if (resourceElement != elementType(getResult().getType()))
     return emitOpError("load resource/result element types disagree");
-  if (failed(verifyReadableResource(getOperation(), getResource().getType())))
-    return failure();
+  // Out denotes the external ABI's initial state.  Canonical KIR verifies
+  // prior definitions before lowering the ordered reads and writes here.
   return verifyAccessAxisExtents(getOperation(), getResult().getType(),
                                  getCoordinates());
 }
