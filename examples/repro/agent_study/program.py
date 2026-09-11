@@ -182,6 +182,7 @@ def validate_program(path: Path, *, language: str, generated_source: bool = Fals
         allowed.remove("triton")
     intent_names = set()
     torch_names = set()
+    torch_result_types = {"max", "min"}
     torch_api = {"Tensor", "dtype", "device", "empty", "empty_like", "empty_strided", "finfo", "iinfo", "is_tensor", "numel",
                  "bool", "int", "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "long", "short",
                  "float", "float16", "float32", "float64", "bfloat16", "half", "double", "complex64", "complex128",
@@ -206,7 +207,9 @@ def validate_program(path: Path, *, language: str, generated_source: bool = Fals
             if node.module is not None and node.module.startswith("intent.") and node.module != "intent.language" and not runtime_hooks:
                 raise ValueError("candidate author code may import only the public Intent language API")
             if node.module is not None and node.module.split(".")[0] == "torch":
-                if node.module != "torch" or any(item.name not in torch_api for item in node.names):
+                result_types = node.module == "torch.return_types" and all(
+                    item.name in torch_result_types for item in node.names)
+                if not result_types and (node.module != "torch" or any(item.name not in torch_api for item in node.names)):
                     raise ValueError("Torch imports are limited to allocation, tensor metadata and dtype APIs")
             if node.module == "intent" and any(item.name in {"compile", "generate", "compile_shared_gpu"} for item in node.names):
                 raise ValueError("compiler calls belong to context.compile(), not the candidate host")
@@ -216,7 +219,11 @@ def validate_program(path: Path, *, language: str, generated_source: bool = Fals
             raise ValueError(f"candidate import outside the language/host API allowlist: {names}")
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in torch_names:
             parent = parents.get(node)
-            if not isinstance(parent, ast.Attribute) or parent.value is not node or parent.attr not in torch_api:
+            container = parents.get(parent)
+            result_type = (isinstance(parent, ast.Attribute) and parent.attr == "return_types"
+                           and isinstance(container, ast.Attribute) and container.value is parent
+                           and container.attr in torch_result_types)
+            if not result_type and (not isinstance(parent, ast.Attribute) or parent.value is not node or parent.attr not in torch_api):
                 raise ValueError("Torch is available only through allocation, tensor metadata and dtype APIs")
         if isinstance(node, ast.Attribute) and (node.attr.startswith("__") or node.attr in {
             "open", "from_file", "fromfile", "tofile", "read_text", "read_bytes", "write_text", "write_bytes",
