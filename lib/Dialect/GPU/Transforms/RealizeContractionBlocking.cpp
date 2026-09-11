@@ -540,7 +540,7 @@ FailureOr<Value> replaySourceValueImpl(OpBuilder &builder, Location location,
       cloneMapping.map(accumulator, *projected);
     }
   }
-  if (isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp>(producer)) {
+  if (isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp, LoadOp>(producer)) {
     for (Value operand : producer->getOperands()) {
       Value current = cloneMapping.lookupOrDefault(operand);
       auto fragment = dyn_cast<FragmentType>(current.getType());
@@ -556,7 +556,7 @@ FailureOr<Value> replaySourceValueImpl(OpBuilder &builder, Location location,
           builder, location, current, operandTarget);
       if (failed(projected)) {
         InFlightDiagnostic diagnostic = producer->emitOpError(
-            "replayed pointwise operand cannot adopt the selected range relation")
+            "replayed operand cannot adopt the selected range relation")
             << "; operand=" << current.getType()
             << "; target=" << operandTarget;
         if (Operation *definition = current.getDefiningOp())
@@ -1146,12 +1146,17 @@ LogicalResult normalizeMatrixContractForms(func::FuncOp kernel) {
             result.push_back(axis);
         return result;
       };
-      auto unitAxis = [](Attribute attribute) {
-        auto extent = dyn_cast<PhysicalExprAttr>(attribute);
-        return extent &&
-               extent.getKind() ==
-                   static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-               extent.getValue() == 1;
+      PhysicalProgramAnalysis analysis(kernel);
+      auto unitAxis = [&](Value value, unsigned axis) {
+        auto type = cast<FragmentType>(value.getType());
+        auto extent = dyn_cast<PhysicalExprAttr>(type.getShape()[axis]);
+        if (!extent || extent.getKind() !=
+                           static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+            extent.getValue() != 1)
+          return false;
+        auto realization = analysis.axisRealization(value, axis);
+        return realization.hasExtentAuthority() &&
+               !realization.constructionScalarSeed;
       };
       auto lhs = contract.getLhs().getType();
       auto rhs = contract.getRhs().getType();
@@ -1163,11 +1168,11 @@ LogicalResult normalizeMatrixContractForms(func::FuncOp kernel) {
       SmallVector<unsigned> rhsErased;
       if (lhsFree.size() > 1)
         for (unsigned axis : lhsFree)
-          if (unitAxis(lhs.getShape()[axis]))
+          if (unitAxis(contract.getLhs(), axis))
             lhsErased.push_back(axis);
       if (rhsFree.size() > 1)
         for (unsigned axis : rhsFree)
-          if (unitAxis(rhs.getShape()[axis]))
+          if (unitAxis(contract.getRhs(), axis))
             rhsErased.push_back(axis);
       const size_t lhsRemaining = lhsFree.size() - lhsErased.size();
       const size_t rhsRemaining = rhsFree.size() - rhsErased.size();
@@ -1205,14 +1210,24 @@ LogicalResult normalizeMatrixContractForms(func::FuncOp kernel) {
           return result;
         };
         SmallVector<unsigned> resultErased;
-        for (auto [position, axis] : llvm::enumerate(lhsFree))
-          if (llvm::is_contained(lhsErased, axis))
-            resultErased.push_back(position);
-        for (auto [position, axis] : llvm::enumerate(rhsFree))
-          if (llvm::is_contained(rhsErased, axis))
-            resultErased.push_back(lhsFree.size() + position);
-
         FragmentType originalResult = contract.getResult().getType();
+        auto appendResultAxes = [&](FragmentType operand,
+                                    ArrayRef<unsigned> erased) {
+          for (unsigned axis : erased) {
+            auto mapping = cast<AxisMapAttr>(operand.getAxisMaps()[axis]);
+            auto projection = queryFragmentDimension(
+                originalResult, mapping.getDimensionId());
+            if (!projection.isExact() ||
+                llvm::is_contained(resultErased, projection.fragmentAxis))
+              return failure();
+            resultErased.push_back(projection.fragmentAxis);
+          }
+          return success();
+        };
+        if (failed(appendResultAxes(lhs, lhsErased)) ||
+            failed(appendResultAxes(rhs, rhsErased)))
+          return contract.emitOpError(
+              "singleton matrix axes have no exact result projection");
         FragmentType squeezedLhs = eraseAxes(lhs, lhsErased);
         FragmentType squeezedRhs = eraseAxes(rhs, rhsErased);
         FragmentType squeezedResult = eraseAxes(originalResult, resultErased);

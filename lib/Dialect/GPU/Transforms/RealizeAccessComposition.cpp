@@ -464,10 +464,211 @@ FailureOr<bool> projectFragmentGather(GatherOp gather) {
   return true;
 }
 
+FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
+  auto load = reshape.getValue().getDefiningOp<LoadOp>();
+  auto result = dyn_cast<FragmentType>(reshape.getResult().getType());
+  if (!load || !result || !isa<ViewType>(load.getResource().getType()) ||
+      !canReplayReadAt(load, reshape))
+    return false;
+  auto source = cast<FragmentType>(load.getResult().getType());
+  if (source.getShape().size() <= result.getShape().size())
+    return false;
+  unsigned sourceRank = 0;
+  unsigned resultRank = 0;
+  for (Attribute attribute : reshape.getReassociation()) {
+    auto group = cast<ReshapeGroupAttr>(attribute);
+    if (group.getSourceAxes().empty() || group.getResultAxes().size() != 1)
+      return false;
+    for (int64_t axis : group.getSourceAxes().asArrayRef())
+      sourceRank = std::max(sourceRank, static_cast<unsigned>(axis + 1));
+    resultRank = std::max(resultRank,
+                         static_cast<unsigned>(group.getResultAxes()[0] + 1));
+  }
+  if (sourceRank != source.getShape().size() || resultRank != result.getShape().size())
+    return false;
+  auto kernel = reshape->getParentOfType<func::FuncOp>();
+  PhysicalProgramAnalysis analysis(kernel);
+  SmallVector<MakeRangeOp> sourceRanges;
+  SmallVector<unsigned> coordinateSlots;
+  SmallVector<Attribute> sourceExtents;
+  for (unsigned axis = 0; axis < sourceRank; ++axis) {
+    auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[axis]);
+    auto position = queryCoordinateIndex(load.getCoordinates(), sourceAxisIdentity(mapping));
+    if (!position.isExact())
+      return false;
+    auto range = load.getCoordinates()[position.fragmentAxis].getDefiningOp<MakeRangeOp>();
+    if (!range || !isZero(range.getStart()) || !isZero(range.getLogicalStart()) ||
+        !isUnitStepRange(range))
+      return false;
+    auto realization = analysis.axisRealization(load.getResult(), axis);
+    if (!realization.constructionScalarSeed &&
+        !samePhysicalScalarExpression(range.getExtent(), range.getLogicalStop()))
+      return false;
+    PhysicalExprAttr extent = queryLaunchExpression(range.getLogicalStop());
+    if (!extent)
+      return false;
+    sourceRanges.push_back(range);
+    coordinateSlots.push_back(position.fragmentAxis);
+    sourceExtents.push_back(extent);
+  }
+  SmallVector<Value> resultStops(resultRank);
+  SmallVector<PhysicalExprAttr> resultExtents(resultRank);
+  // Consume only the launch-visible extent of this typed dimension.  The
+  // witness's physical traversal and ownership are not reused.
+  for (unsigned axis = 0; axis < resultRank; ++axis) {
+    auto mapping = cast<AxisMapAttr>(result.getAxisMaps()[axis]);
+    bool conflicting = false;
+    kernel.walk([&](MakeRangeOp range) {
+      FailureOr<int64_t> dimension = queryRangeDimension(range);
+      if (failed(dimension) || *dimension != mapping.getDimensionId() ||
+          !isZero(range.getLogicalStart()) || !isUnitStepRange(range))
+        return;
+      PhysicalExprAttr extent = queryLaunchExpression(range.getLogicalStop());
+      if (!extent)
+        return;
+      if (resultExtents[axis] && resultExtents[axis] != extent)
+        conflicting = true;
+      else {
+        resultExtents[axis] = extent;
+        resultStops[axis] = range.getLogicalStop();
+      }
+    });
+    if (!resultStops[axis] || conflicting)
+      return false;
+  }
+  for (Attribute attribute : reshape.getReassociation()) {
+    auto group = cast<ReshapeGroupAttr>(attribute);
+    SmallVector<Attribute> extents;
+    for (int64_t axis : group.getSourceAxes().asArrayRef())
+      extents.push_back(sourceExtents[axis]);
+    if (failed(inferReshapeReassociation(
+            reshape.getContext(), extents,
+            ArrayRef<Attribute>{resultExtents[group.getResultAxes()[0]]})))
+      return false;
+  }
+
+  OpBuilder builder(reshape);
+  DominanceInfo dominance(kernel);
+  Value zero = builder.create<arith::ConstantIndexOp>(reshape.getLoc(), 0);
+  Value one = builder.create<arith::ConstantIndexOp>(reshape.getLoc(), 1);
+  SmallVector<Value> flatCoordinates;
+  auto indexType = FragmentType::get(
+      result.getContext(), builder.getIndexType(), result.getShape(),
+      result.getAxisMaps(), result.getValidity(), result.getOwner());
+  for (unsigned axis = 0; axis < resultRank; ++axis) {
+    auto mapping = cast<AxisMapAttr>(result.getAxisMaps()[axis]);
+    Value stop = resultStops[axis];
+    if (!dominance.dominates(stop, reshape))
+      stop = builder.create<PhysicalExprOp>(reshape.getLoc(), builder.getIndexType(),
+                                            resultExtents[axis]);
+    Value extent = builder.create<PhysicalExprOp>(
+        reshape.getLoc(), builder.getIndexType(),
+        cast<PhysicalExprAttr>(result.getShape()[axis]));
+    auto rangeType = FragmentType::get(
+        result.getContext(), builder.getIndexType(),
+        builder.getArrayAttr({result.getShape()[axis]}),
+        builder.getArrayAttr({AxisMapAttr::get(
+            result.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+            mapping.getDimensionId(), 0, mapping.getDerived())}),
+        result.getValidity(), result.getOwner());
+    Value range = builder.create<MakeRangeOp>(
+        reshape.getLoc(), rangeType, zero, extent, one, zero, stop,
+        mapping.getSourceId(), mapping.getSourceAxis(), mapping.getDerived());
+    FailureOr<Value> projected = projectPhysicalValueToSchema(
+        builder, reshape.getLoc(), range, indexType);
+    if (failed(projected))
+      return reshape.emitOpError("collapsed load has no flat coordinate projection");
+    flatCoordinates.push_back(*projected);
+  }
+  SmallVector<Value> coordinates(load.getCoordinates());
+  IRMapping mapping;
+  for (Attribute attribute : reshape.getReassociation()) {
+    auto group = cast<ReshapeGroupAttr>(attribute);
+    Value ordinal = flatCoordinates[group.getResultAxes()[0]];
+    auto axes = group.getSourceAxes().asArrayRef();
+    for (unsigned position = axes.size(); position-- > 0;) {
+      unsigned axis = axes[position];
+      MakeRangeOp range = sourceRanges[axis];
+      Value coordinate = ordinal;
+      if (position != 0) {
+        Value divisor = builder.create<BinaryOp>(
+            reshape.getLoc(), builder.getIndexType(), range.getLogicalStop(), one,
+            BinaryOperator::Maximum);
+        Value extent = builder.create<SplatOp>(reshape.getLoc(), indexType, divisor);
+        coordinate = builder.create<BinaryOp>(
+            reshape.getLoc(), indexType, ordinal, extent, BinaryOperator::Remainder);
+        ordinal = builder.create<BinaryOp>(
+            reshape.getLoc(), indexType, ordinal, extent, BinaryOperator::FloorDivide);
+      }
+      coordinates[coordinateSlots[axis]] = coordinate;
+      mapping.map(range.getResult(), coordinate);
+    }
+  }
+  FailureOr<Value> valid = replayFragmentValue(
+      builder, load.getValid(), result, mapping, analysis);
+  FailureOr<Value> fill = replayFragmentValue(
+      builder, load.getFill(), result, mapping, analysis);
+  if (failed(valid) || failed(fill))
+    return reshape.emitOpError("collapsed load could not preserve validity and fill");
+  auto predicate = FragmentType::get(
+      result.getContext(), builder.getI1Type(), result.getShape(), result.getAxisMaps(),
+      result.getValidity(), result.getOwner());
+  Value lower = builder.create<SplatOp>(reshape.getLoc(), indexType, zero);
+  Value active = *valid;
+  for (unsigned axis = 0; axis < sourceRank; ++axis) {
+    Value coordinate = coordinates[coordinateSlots[axis]];
+    Value end = builder.create<SplatOp>(
+        reshape.getLoc(), indexType, sourceRanges[axis].getLogicalStop());
+    Value nonNegative = builder.create<CompareOp>(
+        reshape.getLoc(), predicate, coordinate, lower, ComparePredicate::Ge);
+    Value belowEnd = builder.create<CompareOp>(
+        reshape.getLoc(), predicate, coordinate, end, ComparePredicate::Lt);
+    Value within = builder.create<BinaryOp>(
+        reshape.getLoc(), predicate, nonNegative, belowEnd, BinaryOperator::LogicalAnd);
+    active = active ? Value(builder.create<BinaryOp>(
+        reshape.getLoc(), predicate, active, within, BinaryOperator::LogicalAnd)) : within;
+  }
+  if (!*fill) {
+    fill = materializeZeroFragment(builder, reshape.getLoc(), result);
+    if (failed(fill))
+      return failure();
+  }
+  auto replacement = builder.create<LoadOp>(
+      reshape.getLoc(), result, load.getResource(), coordinates, active, *fill,
+      load.getSourceAxes());
+  if (Attribute origin = load->getAttr(originAttr))
+    replacement->setAttr(originAttr, origin);
+  reshape.getResult().replaceAllUsesWith(replacement.getResult());
+  reshape.erase();
+  if (load.getResult().use_empty())
+    load.erase();
+  return true;
+}
+
 FailureOr<bool> composeReshapedStore(StoreOp store) {
+  auto stripIdentityBroadcast = [](Value value) {
+    while (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
+      auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
+      auto result = dyn_cast<FragmentType>(value.getType());
+      if (!source || !result || source.getShape() != result.getShape() ||
+          source.getElementType() != result.getElementType() ||
+          source.getOwner() != result.getOwner() || source.getValidity() != result.getValidity())
+        break;
+      bool sameDimensions = true;
+      for (auto [lhs, rhs] : llvm::zip(source.getAxisMaps(), result.getAxisMaps()))
+        sameDimensions &= cast<AxisMapAttr>(lhs).getDimensionId() ==
+                          cast<AxisMapAttr>(rhs).getDimensionId();
+      if (!sameDimensions)
+        break;
+      value = broadcast.getValue();
+    }
+    return value;
+  };
   auto output = dyn_cast<FragmentType>(store.getValue().getType());
   if (!output || output.getShape().empty())
     return false;
+  auto kernel = store->getParentOfType<func::FuncOp>();
+  PhysicalProgramAnalysis analysis(kernel);
   unsigned outputRank = output.getShape().size();
   SmallVector<MakeRangeOp> outputRanges(outputRank);
   SmallVector<unsigned> coordinateSlots(outputRank);
@@ -480,6 +681,10 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
     if (!range || failed(dimension) || !isZero(range.getStart()) ||
         !isZero(range.getLogicalStart()) || !isUnitStepRange(range))
       return false;
+    auto realization = analysis.axisRealization(range.getResult(), 0);
+    if (!realization.constructionScalarSeed &&
+        !samePhysicalScalarExpression(range.getExtent(), range.getLogicalStop()))
+      return false;
     auto projection = queryFragmentDimension(output, *dimension);
     if (!projection.isExact() || outputRanges[projection.fragmentAxis])
       return false;
@@ -489,7 +694,7 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
   if (llvm::any_of(outputRanges, [](MakeRangeOp range) { return !range; }))
     return false;
 
-  Value value = store.getValue();
+  Value value = stripIdentityBroadcast(store.getValue());
   SmallVector<unsigned> outerAxes;
   for (unsigned axis = 0; axis < outputRank; ++axis)
     outerAxes.push_back(axis);
@@ -500,9 +705,36 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
     for (auto [axis, sourceAxis] : llvm::enumerate(transpose.getPermutation()))
       inputAxes[sourceAxis] = outerAxes[axis];
     outerAxes = std::move(inputAxes);
-    value = transpose.getValue();
+    value = stripIdentityBroadcast(transpose.getValue());
   }
   auto reshape = value.getDefiningOp<ReshapeOp>();
+  BinaryOp pointwise;
+  LoadOp companion;
+  bool reshapedLhs = false;
+  if (!reshape) {
+    pointwise = value.getDefiningOp<BinaryOp>();
+    if (!pointwise)
+      return false;
+    reshape = stripIdentityBroadcast(pointwise.getLhs()).getDefiningOp<ReshapeOp>();
+    if (reshape) {
+      reshapedLhs = true;
+      companion = stripIdentityBroadcast(pointwise.getRhs()).getDefiningOp<LoadOp>();
+    }
+    else {
+      reshape = stripIdentityBroadcast(pointwise.getRhs()).getDefiningOp<ReshapeOp>();
+      companion = stripIdentityBroadcast(pointwise.getLhs()).getDefiningOp<LoadOp>();
+    }
+    if (!reshape || !companion || !canReplayReadAt(companion, store))
+      return false;
+    auto companionType = dyn_cast<FragmentType>(companion.getResult().getType());
+    auto reshaped = cast<FragmentType>(reshape.getResult().getType());
+    if (!companionType || companionType.getShape() != reshaped.getShape() ||
+        companionType.getElementType() != reshaped.getElementType())
+      return false;
+    for (auto [lhs, rhs] : llvm::zip(companionType.getAxisMaps(), reshaped.getAxisMaps()))
+      if (cast<AxisMapAttr>(lhs).getDimensionId() != cast<AxisMapAttr>(rhs).getDimensionId())
+        return false;
+  }
   if (!reshape)
     return false;
   auto input = dyn_cast<FragmentType>(reshape.getValue().getType());
@@ -519,8 +751,6 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
   }
   if (logicalSourceRank != input.getShape().size() || logicalResultRank != outputRank)
     return false;
-  auto kernel = store->getParentOfType<func::FuncOp>();
-  PhysicalProgramAnalysis analysis(kernel);
   SmallVector<MakeRangeOp> inputRanges;
   SmallVector<Attribute> inputExtents;
   for (unsigned axis = 0; axis < input.getShape().size(); ++axis) {
@@ -601,9 +831,9 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
       kernel.walk([&](MakeRangeOp occurrence) {
         FailureOr<int64_t> occurrenceDimension = queryRangeDimension(occurrence);
         FailureOr<int64_t> rangeDimension = queryRangeDimension(range);
-        if (sameLogicalRange(occurrence, range) &&
-            succeeded(occurrenceDimension) && succeeded(rangeDimension) &&
-            *occurrenceDimension == *rangeDimension)
+        if (succeeded(occurrenceDimension) && succeeded(rangeDimension) &&
+            *occurrenceDimension == *rangeDimension &&
+            analysis.lockstepRanges({occurrence, range}).isExact())
           mapping.map(occurrence.getResult(), coordinate);
       });
     }
@@ -631,8 +861,49 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
     active = active ? Value(builder.create<BinaryOp>(
         store.getLoc(), predicate, active, within, BinaryOperator::LogicalAnd)) : within;
   }
+  Value payload = reshape.getValue();
+  if (pointwise) {
+    SmallVector<Value> companionCoordinates;
+    for (Value coordinate : companion.getCoordinates()) {
+      if (!isa<FragmentType>(coordinate.getType())) {
+        companionCoordinates.push_back(coordinate);
+        continue;
+      }
+      FailureOr<Value> projected = replayFragmentValue(
+          builder, coordinate, indexType, mapping, analysis);
+      if (failed(projected))
+        return store.emitOpError(
+            "reshaped store companion has no exact coordinate mapping")
+               << "; coordinate=" << coordinate;
+      companionCoordinates.push_back(*projected);
+    }
+    FailureOr<Value> companionValid = replayFragmentValue(
+        builder, companion.getValid(), input, mapping, analysis);
+    FailureOr<Value> companionFill = replayFragmentValue(
+        builder, companion.getFill(), input, mapping, analysis);
+    if (failed(companionValid) || failed(companionFill))
+      return store.emitOpError(
+          "reshaped store companion could not preserve validity and fill");
+    companionValid = combinePredicates(
+        builder, store.getLoc(), input, *companionValid, active);
+    if (!*companionFill)
+      companionFill = materializeZeroFragment(builder, store.getLoc(), input);
+    if (failed(companionValid) || failed(companionFill))
+      return failure();
+    auto loaded = builder.create<LoadOp>(
+        companion.getLoc(), input, companion.getResource(), companionCoordinates,
+        *companionValid, *companionFill, companion.getSourceAxes());
+    if (Attribute origin = companion->getAttr(originAttr))
+      loaded->setAttr(originAttr, origin);
+    IRMapping operands;
+    operands.map(reshapedLhs ? pointwise.getLhs() : pointwise.getRhs(), payload);
+    operands.map(reshapedLhs ? pointwise.getRhs() : pointwise.getLhs(), loaded.getResult());
+    Operation *combined = builder.clone(*pointwise, operands);
+    combined->getResult(0).setType(input);
+    payload = combined->getResult(0);
+  }
   auto replacement = builder.create<StoreOp>(
-      store.getLoc(), store.getResource(), coordinates, reshape.getValue(),
+      store.getLoc(), store.getResource(), coordinates, payload,
       active, store.getSourceAxes());
   if (Attribute origin = store->getAttr(originAttr))
     replacement->setAttr(originAttr, origin);
@@ -779,6 +1050,14 @@ LogicalResult realizeAccessComposition(ModuleOp module) {
       if (failed(load))
         return failure();
       changed |= *load;
+    }
+    SmallVector<ReshapeOp> reshapes;
+    physicalKernel->walk([&](ReshapeOp reshape) { reshapes.push_back(reshape); });
+    for (ReshapeOp reshape : reshapes) {
+      FailureOr<bool> composed = composeReshapedLoad(reshape);
+      if (failed(composed))
+        return failure();
+      changed |= *composed;
     }
     SmallVector<StoreOp> stores;
     physicalKernel->walk([&](StoreOp store) { stores.push_back(store); });

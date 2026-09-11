@@ -2388,6 +2388,7 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
           if (input.hasExtentAuthority()) {
             result.state = PhysicalFactState::Exact;
             result.physicalized = input.physicalized;
+            result.constructionScalarSeed = input.constructionScalarSeed;
             result.extentAuthority =
                 PhysicalAxisRealizationFact::ExtentAuthority::Structural;
             return result;
@@ -2460,6 +2461,7 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
               source.getShape()[sourceAxis] == extent) {
             result.state = PhysicalFactState::Exact;
             result.physicalized = input.physicalized;
+            result.constructionScalarSeed = input.constructionScalarSeed;
             result.extentAuthority =
                 PhysicalAxisRealizationFact::ExtentAuthority::Structural;
             return result;
@@ -2498,6 +2500,7 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
             source.getShape()[sourceAxis] == extent) {
           result.state = PhysicalFactState::Exact;
           result.physicalized = input.physicalized;
+          result.constructionScalarSeed = input.constructionScalarSeed;
           result.extentAuthority =
               PhysicalAxisRealizationFact::ExtentAuthority::Structural;
           return result;
