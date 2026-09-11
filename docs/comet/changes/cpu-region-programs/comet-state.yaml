@@ -3,7 +3,7 @@ name: cpu-region-programs
 language: zh-CN
 phase: archive
 status: active
-state_version: 6
+state_version: 7
 brief: brief.md
 spec_changes:
   - capability: cpu-region-programs
@@ -13,7 +13,7 @@ workspace:
   isolation: worktree
   change_branch: comet/cpu-region-programs
   target_branch: main
-  finish: null
+  finish: keep
 loop:
   stage: archive-ready
   goal_cycle: 1
