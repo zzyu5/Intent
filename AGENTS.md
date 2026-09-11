@@ -1,104 +1,42 @@
-# 协作规则
+# IntentDSL 协作原则
 
-## 唯一目标
-推进骨架。判据:本轮改动是否让某个语言构造/IR 节点
-更接近"能 lowering 出后端代码"?不是,就不要做。
+## 目标与责任
 
-## 规格权威
-`doc/` 是最终设计规格,实现必须向它收敛。动 DSL、canonical KIR、compiler IR/pass、
-provider lowering 或 runtime 前,先从 `doc/index.md` 进入并完整阅读对应章节。
+- 推进可运行的 lowering 骨架与真实算子性能；问答、调查、清理按用户指定范围完成，不用测试、报告或管理流程冒充进展。
+- Intent 是可编程算子 DSL，不默认采用“高层算子图交给 compiler 决定全部算法”的模型。作者负责算法与显式程序组织，包括多个 kernels 和 host 编排；compiler 在既有语义下形成物理程序并优化。
+- 合法的类型、shape、数值与 effect 表达 lowering 失败，是 compiler 问题；不要求作者换算法或反复拆 kernel 迁就实现缺陷。
+- 明确语义与适用条件下，允许 lowering 到高性能 micro-kernel/目标构造，不必由通用 IR 重建全部底层细节；也不能让 leaf 猜测缺失语义或接管整个算子。
 
-- `doc/programming-model/` 定义作者、kernel、host 与 compiler 的语义边界。
-- `doc/dsl/` 定义 public surface 与唯一 canonical semantics。
-- `doc/compiler/` 定义 KIR 之后的 executable physical programs、passes、target
-  extensions 与外部 provider compiler 边界。
-- `report/` 只记录讨论、现状和验证事实,不是规格权威。
+## 规格与参考
 
-当前实现、旧 IR、examples、历史报告或任一 target API 都不能反向定义规格。代码与 `doc/`
-不一致时,按规格迁移代码并删除旧 executable path;不得为了保住现状而把 `doc/` 改成当前行为。
-只有用户明确要求修改设计时才改 `doc/`;普通实现推进不把进度、失败、性能数字或临时字段同步进去。
+- `doc/` 是最终设计规格。动 DSL、KIR、compiler IR/pass、provider 或 runtime 前，从 `doc/index.md` 进入并完整阅读相关章节；实现向规格收敛，不为保住现状反改规格。
+- 只有用户确认设计变化才改规格；进度、实验失败、临时字段和性能数字不写入 `doc/`。Memory、短期记录和 report 只能帮助定位，不能替代当前原文。
+- 架构、pass 与性能决策先对照 `ref/triton`、`ref/tilelang` 或相应成熟目标实现：确认同类职责由哪层承担，关键结论给出双方 file:line、具体差异与后果。参考边界与机制，不照搬 surface，不凭框架名称作判断。
+- `source/` 是 provider source/runtime corpus，`examples/kernels/` 是作者算法，registry 连接完整 callable，CSV 是运行观察；它们不定义语言语义或 compiler policy。
 
-Comet 个人记忆和项目知识只帮助定位，应用前以当前 `AGENTS.md`、`doc/` 与所选 change
-的 brief/spec 为准。归档 change 的验收门槛、暂停指令和运行结论属于历史上下文，
-不得自动作为新 change 的约束；项目知识摘要不能代替当前原文。
+## IR、pass 与目录
 
-## 目录结构纪律
-目录结构就是架构,内部层级和顶层目录同样重要。动手前先从整体结构判断
-文件归属,不能只找一个能放的位置。
+- 分块、布局、ownership、遍历、复用、materialization 等执行决定必须存在于相应 IR 与 passes；shared 和 target-local 各守职责，serializer 只拼写已决定的结构。
+- Policy 根据 current typed semantics、def-use、coordinate relations、effects、lifetime 与目标能力决策，不靠算子名、字符串标签或单条样本。正式 typed 参数、shape 与 capability 可以参与合法性判断。
+- 复用已有 carrier；只有真正缺少执行事实才增加 IR 表达。目标 API 的拼写差异不自动要求修改 shared IR。
+- 只保留一条有效执行路径。迁移后删除旧路径，不保留兼容开关、默认值或异常回退掩盖未实现。
+- 目录表达稳定职责与 lowering 边界；同层同抽象，强耦合文件相邻，source 与 runtime 相邻。不随手造层级、平铺模块或放入缓存和环境。
+- 可查清的信息自行调查；只有现有规格无法决定的语言语义、作者可观察行为或核心架构分叉才暂停问用户，不能用另造产物填补不确定性。
 
-- 同一层保持一致的抽象,用稳定的职责和模块边界组织文件。
-- 模块应拆到职责清楚,但不为单次任务随手造层级;不要把独立模块平铺堆在一起。
-- 强耦合、共同演进的文件应相邻;共享内容放在职责明确的共同边界。
-- `source/` 按语言、上游来源和算子职责形成可读层级,源码与对应 runtime 相邻。
-- 正式编译器也依靠目录表达阶段、模块、依赖和 lowering 边界。
-- 落点或边界不明确时停下来问我;缓存、环境和临时产物不得进入项目。
+## Benchmark 与实验
 
-## 卡住时
-遇到设计歧义、信息缺失、方案分叉 —— 停下来问我。
-禁止用"造一个可交付物"来填补不确定性。
-宁可一轮只给出一个问题,也不要给我一堆自洽但没用的产物。
+- 运行只复用必要的生产算子 benchmark，同次做一次既定容差检查；容差内即可，不追求 bitwise 一致，不为通过放宽容差。
+- 不额外设计独立数值、边界、回归、兼容、压力或组合测试；不建 test 目录，不用 pytest，不留 fixture。临时脚本、内联命令和跑完即删也不是例外。
+- 全量指现有 registry 的性能运行，不扩矩阵。准备、编译与必要运行可按资源预算并发，同机性能计时避免干扰，不让所有工作全程串行。
+- 同算法、相同输入规模与外部 dtype 下比较；ABI、辅助输出、布局转换与精度细节注明，不一概阻断计时。Compiler 仍必须保持 Intent 语义。
+- 报真实完整算子时间、reference 时间及清楚的比值；编译/JIT/tuning 不是算子耗时，CSV 不承担历史审计。差距先查物理结构，再查 provider/外部 compiler/measurement，不无证据归因给下层。
+- Agent 实验每题每语言组只交付一次完整程序，提交后不反馈错误或性能继续生成。Bench 自带 reference 保留；开发端修 compiler 不改写首次交付成绩。
 
-## 验证
-自查必须对照 ref/triton 或 ref/tilelang 的同类实现，给出双方 file:line、具体差异与实际后果；找不出具体差异等于未完成。
+## 禁止与交付
 
-唯一需要的运行检查是获得算子性能的 benchmark，复用现有生产入口，
-只执行得到所需性能结果的编译、运行、预热与计时，并在同一次 benchmark 中
-做一次现有约定容差的数值检查；容差内即可，不追求逐操作或 bitwise 一致。
-不额外设计独立数值测试、边界、回归、兼容、压力或组合测试，
-不把这些额外检查作为性能测量的前置门槛，不为通过而放大容差。
-这个限制针对测试行为本身，与文件是否保留、放在项目内还是 `/tmp` 无关；
-临时脚本、内联命令、跑完即删同样不得用来绕过限制。
-全量指现有 registry 的性能 benchmark，不是扩展测试矩阵。
-准备、编译与必要运行允许资源预算内的同机多进程并发，性能计时避免相互干扰，
-不让每个 worker 全程串行等待。
-超出容差或已知实现错误如实记录并修复，只复用受影响的性能运行确认，
-不围绕它们新增测试；未经验证不宣称数值正确。
-不建 test 目录,不用 pytest,不留 fixture。
-
-## Baseline 与性能调查
-`source/` 是 provider source/runtime 参考 corpus，`examples/kernels/` 是 Intent 作者算法，
-registry 只连接 runtime-visible entry 与完整 callable closure，CSV 只是一组运行观察；
-它们都不能定义语言语义或 compiler policy。
-
-比较 generated 与 source 的算子性能以同算法为前提，保持输入 shape、外部 dtype
-及明确的调用和计时范围；ABI 表示、辅助输出与布局转换差异如实注明。
-舍入、近似数学和中间精度的细微差异不一概阻断计时，不要求先对齐完整候选集合。
-CSV 记录真实算子时间、source 时间、ratio 和必要失败说明，不承担运行历史审计，
-候选调优耗时不是算子性能结果；这些比较口径不放松 compiler 对 Intent 语义的保持要求。
-Baseline 用来暴露 compiler 缺口和验证改动归因，不能反向驱动 DSL、kernel-name matcher、
-source template 或只对单条语料成立的规则。性能差距先从 current Physical Program 的 mapping、
-blocking、ownership、traversal 和 materialization 调查，再看 provider-local form、serializer、
-外部 compiler 与 measurement；没有证据时不能把差距归因给下层。
-
-## 禁止
-- 任何 hash / SHA / checksum 校验来源或产物
-- 性能 benchmark 之外的测试，以及为这些测试创建的临时或永久脚手架
-- 版本号、CHANGELOG、迁移指南、deprecation 标记 —— 有 git 就够了
-- 未经要求的重构、目录整理、注释批量补写、README 更新
-- 兜底代码:try/except 吞异常、默认值兜底、"防御性"分支
-  未实现就直接 raise NotImplementedError,不要假装能跑
-
-## 交付形式
-- 只改必要文件,不新建计划文档/进度文档
-- 回复结构:改了什么(一句) → 关键设计取舍 → 卡住的地方
-- 不要总结你干了什么,不要罗列"下一步建议"
-
-<comet-ambient-resume>
-<!-- Managed by Comet. Edits inside this block may be replaced by comet init/update. -->
-<!-- Contract: comet.resume_probe.v2 -->
-
-## Comet Ambient Resume
-
-在这个仓库中，开始处理需要改动或调查的任务前，如果可能存在活跃 Comet workflow，把当前用户请求传入只读探针：`comet resume-probe . --stdin --json`。
-
-- 如果用户通过宿主明确调用任意 Comet Skill（例如 `@comet`、`/comet`、`@comet-native` 或 `/comet-hotfix`），显式调用优先于本恢复协议；不要运行 resume probe，直接进入被调用的 Skill。
-- 如果用户通过宿主明确调用的是非 Comet 的 Skill 或斜杠命令，任务意图已由该调用明确：不要运行 resume probe，直接执行该 Skill。
-- 如果你正在 Comet 流程内（包括正在等待用户回复你在流程中提出的问题），不要运行 resume probe；把这类回复（例如方案/选项选择）当作当前 change 的继续，直接按用户的选择推进。
-- 只信任返回的 `workflow`、`skill` 和 `entrySource`；它们只由项目配置或无配置兼容回退决定。不得扫描或切换另一套 workflow。
-- 如果 probe 返回 `auto_resume`，简短说明选中的 active change，并进入 `nextCommand` 指向的永久入口。不要把状态命令当作恢复入口直接推进。
-- 如果 probe 返回 `ask_user`，只问一个简短问题并等待用户回复。
-- 如果当前请求未明确调用 Comet Skill，且 probe 返回 `out_of_scope` 或 `none`，不要进入 Comet workflow。
-- `out_of_scope` 或 `none` 只表示不要因为这个新请求进入 Comet workflow；它绝不表示要暂停或退出一个已在进行的 Comet 流程。
-- 如果配置或状态无效且没有 `nextCommand`，停止并报告原因；不要猜测另一个 workflow。
-- 不能只因为存在 active change 就把无关任务挂到该 change。Native 的未提交改动由 Native 入口检查，不由探针自动归因。
-</comet-ambient-resume>
+- 禁止任何 hash / SHA / checksum 校验来源或产物。
+- 不增加版本号、CHANGELOG、迁移指南、deprecation 标记；用 Git 记录修改。
+- 不做未经要求的重构、目录整理、注释批量补写或 README 更新。
+- 不吞异常、不加默认值兜底或“防御性”假支持；未实现明确报 unsupported / NotImplementedError。
+- 只改必要文件，除用户指定或 todoskill 的单份短期记录外，不新建计划/进度文档。完成一个连贯改动后提交自己的文件，保留他人修改，不自动 push。
+- 简明报告实际结果、关键取舍和未完成项；未经运行不宣称数值正确或性能达标。

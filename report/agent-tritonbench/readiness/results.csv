@@ -1,2 +1,0 @@
-task,profile,language,status,candidate_ms,reference_ms,ratio,failure_stage,error,program
-softmax,6,intent,pass,0.007975999964401126,0.007984000025317073,0.9989979883654084,,,softmax/intent/candidate.py

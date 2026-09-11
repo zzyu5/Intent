@@ -1,9 +1,0 @@
-[
-  {
-    "task": "sub_gelu",
-    "status": "superseded_by_corrected_reference",
-    "source": "/home/kingdom/phdworks/ref/tritonbench/data/TritonBench_T_v1/sub_gelu.py:24",
-    "issue": "The default branch computes 0.5*x*erf(x/sqrt(2)), omitting the 1 + required by GELU. Both arms implement standard GELU and repeatedly differ from this reference by max_abs=0.49934613704681396. These numerical failures cannot be attributed to agent or compiler arithmetic without resolving the reference/task conflict.",
-    "action": "The user authorized continued implementation after the proposed correction. The project evaluator restores the missing 1 + in a new batch; this batch retains its original reference-contract failure and raw observations. The upstream source is unchanged."
-  }
-]

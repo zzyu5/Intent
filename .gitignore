@@ -8,5 +8,4 @@ dist/
 /.codegraph/
 /.agents/
 /.codex/
-/.comet/
 /autotuner.log
