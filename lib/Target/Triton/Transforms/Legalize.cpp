@@ -584,7 +584,8 @@ FailureOr<SmallVector<Value>> materializeDescriptorOffsets(
 }
 
 FailureOr<TensorDescriptorChoiceOp>
-materializeTensorDescriptorForms(func::FuncOp kernel) {
+materializeTensorDescriptorForms(
+    func::FuncOp kernel, ArrayRef<TritonLocalOptions> localOptions) {
   auto capabilities =
       kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
   if (!capabilities || capabilities.getComputeCapabilityMajor() < 9)
@@ -656,6 +657,16 @@ materializeTensorDescriptorForms(func::FuncOp kernel) {
         descriptorElementBytes(view.getElementType());
     if (!elementBytes || 16 % *elementBytes != 0)
       return failure();
+    int64_t maximumBlockElements = maxTritonTensorElements;
+    if (llvm::all_of(localOptions, [](const TritonLocalOptions &options) {
+          return options.ctas == 1;
+        })) {
+      // Single-CTA TMA materializes the entire descriptor block in shared
+      // memory. Other buffers and barriers remain the provider's responsibility.
+      maximumBlockElements = std::min(
+          maximumBlockElements,
+          capabilities.getMaxDynamicSharedMemoryPerBlock() / *elementBytes);
+    }
     SmallVector<int64_t> flattenedContiguousAxes;
     for (unsigned axis = 0; axis + 2 < view.getRank(); ++axis)
       flattenedContiguousAxes.push_back(axis);
@@ -671,7 +682,7 @@ materializeTensorDescriptorForms(func::FuncOp kernel) {
         /*requirePowerOfTwoBlockShape=*/true, /*alignment=*/16,
         /*minimumContiguousBytes=*/16,
         /*maximumShapeExtent=*/std::numeric_limits<int32_t>::max(),
-        /*maximumBlockElements=*/maxTritonTensorElements);
+        maximumBlockElements);
     descriptors.push_back(
         {viewValue, fragment,
          SmallVector<int64_t>(blockAxes.begin(), blockAxes.end()), descriptor});
@@ -2058,7 +2069,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       failed(materializeBlockPointerForms(kernel)))
     return failure();
   FailureOr<TensorDescriptorChoiceOp> tensorDescriptorForms =
-      materializeTensorDescriptorForms(kernel);
+      materializeTensorDescriptorForms(kernel, localOptions);
   if (failed(tensorDescriptorForms) ||
       failed(materializeLegalConfigs(kernel, *tensorDescriptorForms, localOptions)))
     return failure();

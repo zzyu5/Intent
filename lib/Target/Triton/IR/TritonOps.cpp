@@ -379,7 +379,8 @@ LogicalResult TensorDescriptorOp::verify() {
       !getRequirePositiveShape() || !getRequirePositiveStrides() ||
       !getRequirePowerOfTwoBlockShape() ||
       getMaximumShapeExtent() != std::numeric_limits<int32_t>::max() ||
-      getMaximumBlockElements() != (1 << 20))
+      getMaximumBlockElements() <= 0 ||
+      getMaximumBlockElements() > (1 << 20))
     return emitOpError(
         "host tensor descriptor requires the complete Triton 3.6 flattened-row-major runtime contract");
   SmallVector<int64_t> expectedContiguousAxes;
