@@ -763,6 +763,47 @@ FailureOr<PhysicalExprAttr> launchExpression(Value value,
   return failure();
 }
 
+FailureOr<PhysicalExprAttr> logicalDimensionExpression(func::FuncOp function,
+                                                      int64_t dimension) {
+  PhysicalExprAttr identity =
+      dimensionExpression(function.getContext(), dimension);
+  PhysicalExprAttr resolved;
+  bool conflict = false;
+  auto observe = [&](Value value) {
+    FailureOr<PhysicalExprAttr> candidate = launchExpression(value, function);
+    if (failed(candidate) || *candidate == identity)
+      return;
+    if (resolved && resolved != *candidate)
+      conflict = true;
+    else
+      resolved = *candidate;
+  };
+  function.walk([&](Operation *operation) {
+    if (auto dim = dyn_cast<intent::DimOp>(operation)) {
+      if (dim.getDimension() == dimension)
+        observe(dim.getResult());
+      return;
+    }
+    ArrayAttr relations;
+    if (auto reshape = dyn_cast<intent::ReshapeOp>(operation))
+      relations = reshape.getShape().getAxes();
+    else if (auto broadcast = dyn_cast<intent::BroadcastOp>(operation))
+      relations = broadcast.getShape().getAxes();
+    else if (auto full = dyn_cast<intent::FullOp>(operation))
+      relations = full.getShape().getAxes();
+    if (!relations)
+      return;
+    for (Attribute attribute : relations) {
+      auto relation = cast<intent::ShapeExprAttr>(attribute);
+      if (relation.getKind() == 1 && relation.getDimension() == dimension)
+        observe(operation->getOperand(relation.getPayload()));
+    }
+  });
+  if (conflict)
+    return failure();
+  return resolved ? resolved : identity;
+}
+
 std::optional<int64_t> sourceExtentDimension(Value source) {
   while (auto subregion = source.getDefiningOp<intent::SubregionOp>())
     source = subregion.getInputs().front();
@@ -3346,8 +3387,12 @@ private:
                               PhysicalExprKind::Constant,
                               logicalSource.getDimSize(axis));
         } else if (logicalSourceDimensions[axis] > 0) {
-          extent = dimensionExpression(operation->getContext(),
-                                       logicalSourceDimensions[axis]);
+          FailureOr<PhysicalExprAttr> resolved = logicalDimensionExpression(
+              function, logicalSourceDimensions[axis]);
+          if (failed(resolved))
+            return reshape.emitOpError(
+                "reshape source dimension has conflicting logical extent relations");
+          extent = *resolved;
         } else {
           return reshape.emitOpError(
               "reshape source axis has no logical extent identity");
@@ -3375,20 +3420,15 @@ private:
               operand >= static_cast<int64_t>(operation->getNumOperands()))
             return reshape.emitOpError(
                 "reshape shape relation references an invalid extent operand");
-          FailureOr<PhysicalExprAttr> launched = launchExpression(
-              operation->getOperand(operand), function);
-          if (succeeded(launched)) {
-            physical = *launched;
-          } else if (extent.getDimension() > 0) {
-            // Region-local extents are not launch expressions, but their
-            // canonical dimension identity is still an exact logical reshape
-            // relation.  This attribute never enters a fragment shape.
-            physical = dimensionExpression(operation->getContext(),
-                                           extent.getDimension());
-          } else {
+          if (extent.getDimension() <= 0)
             return reshape.emitOpError(
                 "reshape result extent has no typed logical expression");
-          }
+          FailureOr<PhysicalExprAttr> resolved = logicalDimensionExpression(
+              function, extent.getDimension());
+          if (failed(resolved))
+            return reshape.emitOpError(
+                "reshape result dimension has conflicting logical extent relations");
+          physical = *resolved;
         } else if (extent.getKind() == 2) {
           if (inferredAxis)
             return reshape.emitOpError(

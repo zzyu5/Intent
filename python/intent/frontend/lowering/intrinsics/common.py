@@ -213,8 +213,13 @@ def lower_shape(
                     ),
                 )
         elif isinstance(element, MlirValue) and is_integer(element.type):
+            # Shape operands are nonnegative.  Under that contract, the extent
+            # of an existing unit-step domain(0, element) is exactly element.
             dimension = lowerer.dimension_values.get(
-                element, DynamicDim(f"value_{element.id}")
+                element,
+                lowerer.zero_based_domain_extents.get(
+                    element, DynamicDim(f"value_{element.id}")
+                ),
             )
             lowerer.dimension_values[element] = dimension
             append_extent(

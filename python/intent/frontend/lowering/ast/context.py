@@ -86,10 +86,12 @@ class FunctionLowerer:
         self.ragged_mappings: dict[MlirValue, MlirValue] = {}
         self.iteration_shapes: dict[MlirValue, tuple[object, ...]] = {}
         self.dimension_values: dict[MlirValue, object] = {}
+        self.zero_based_domain_extents: dict[MlirValue, object] = {}
         self.dimension_origins: dict[object, list[ShapeDimension]] = {}
         self.value_blocks: dict[MlirValue, BlockState] = {}
         self.operation_blocks: dict[int, BlockState] = {}
         self.region_parent_blocks: dict[RegionState, BlockState] = {}
+        self._integer_operations: dict[tuple[object, ...], EmittedOperation] = {}
         self._dynamic_dimension_counter = 0
         self._initialize_parameters(constexpr_values)
 
@@ -175,6 +177,27 @@ class FunctionLowerer:
         effects: tuple[Effect, ...] = (),
         result_names: tuple[str | None, ...] = (),
     ) -> EmittedOperation:
+        key = None
+        if (
+            opcode in (OperationKind.CONSTANT, OperationKind.DIM, OperationKind.BINARY)
+            and len(result_types) == 1
+            and isinstance(result_types[0], ScalarType)
+            and result_types[0].dtype.category in (
+                DTypeCategory.INDEX,
+                DTypeCategory.SIGNED_INTEGER,
+                DTypeCategory.UNSIGNED_INTEGER,
+            )
+            and not effects
+            and not regions
+            and not self.is_terminated(self.current_block)
+        ):
+            # Share exact integer expressions within their defining block.
+            # This preserves shape SSA identity without algebraic reassociation
+            # or commoning memory reads and ordered effects.
+            key = (self.current_block, opcode, operands, result_types,
+                   tuple(sorted((attributes or {}).items())))
+            if key in self._integer_operations:
+                return self._integer_operations[key]
         operation = self.compiler.builder.emit(
             self.current_block,
             opcode,
@@ -186,6 +209,8 @@ class FunctionLowerer:
             effects=effects,
             result_names=result_names,
         )
+        if key is not None:
+            self._integer_operations[key] = operation
         self.operation_blocks[operation.id] = self.current_block
         for result in operation.results:
             self.value_blocks[result] = self.current_block

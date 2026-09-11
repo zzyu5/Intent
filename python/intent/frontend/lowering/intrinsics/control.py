@@ -88,6 +88,12 @@ def _domain(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         extent = StaticDim(max(0, stop_value - start_value))
     elif start_known and start_value == 0 and isinstance(expressions[1], ShapeDimension):
         extent = expressions[1].dimension
+    elif start_known and start_value == 0 and isinstance(expressions[1], MlirValue):
+        stop = operands[1]
+        extent = lowerer.zero_based_domain_extents.get(stop)
+        if extent is None:
+            extent = lowerer.fresh_dynamic_dimension("domain_extent")
+            lowerer.zero_based_domain_extents[stop] = extent
     else:
         extent = lowerer.fresh_dynamic_dimension("domain_extent")
     operation = lowerer.emit(
