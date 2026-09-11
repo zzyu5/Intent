@@ -6,6 +6,8 @@
 
 在 kernel 中使用 `import intent.language as I`。`I.In/I.Out/I.InOut` 描述外部 views，`I.f32` 等描述 scalar dtype；Python literal 可按上下文实例化，但两个不同 dtype 的 runtime values 必须显式 `I.cast`。例如先把 bf16 输入 cast 到 f32，再和 f32 累加器计算，最后 cast 回输出 dtype。
 
+`I.select` 的 bool 条件不提供数值分支的 expected dtype。两个分支都写成 literal 时，不要从生成条件的 tensor 推断结果 dtype；例如需要 f32 符号值时写 `I.cast(I.select(mask, -1.0, 1.0), I.f32)`。已经产生的 runtime value 不会因后续与 f32 相乘而重新实例化。
+
 Tensor 和 view 有 `.shape`；scalar、tuple、record、domain 没有统一 `.shape`。`I.full(shape, fill, dtype)` 产生 tensor value，不分配跨 kernel workspace。`I.dot` 只接受两个 rank-1 tensor，返回 rank-0 tensor `[]`，不是 rank-1 `[1]` 或一个 Python number。Scalar 和 rank-0 tensor 是不同类型；pointwise scalar broadcast 由 frontend 显式表达。
 
 ## Domain、index 与 broadcast
@@ -35,6 +37,8 @@ Python tuple 与 `I.record(field=value, ...)` 是结构化 products，不要求�
 一个 kernel 不自动拆成多个 launches。需要多个 kernels 时，host 分别编译，分配中间 tensor，显式依次调用。[split_k_pipeline.py](examples/split_k_pipeline.py) 包含完整 partial/combine kernels 和真实 host 编排；`parts` 是作者可见的算法分解，不是物理 tile 参数。
 
 Public 调用为 `intent.compile(kernel, compiler=..., target=..., constexprs=...)`，返回 artifact；`artifact(*inputs, *outputs)` 显式传输出，`artifact.run(*inputs)` 分配并返回输出。编译与 launch 分开。`intent.generate` 只生成 source/IR；target 在 host 选择，例如 `intent.targets.TritonTarget()`，不能在 kernel 查询设备或选择 warp/tile。
+
+`constexprs` 绑定 kernel 签名中声明的 `I.Constexpr[...]` 参数。View shape 中的 `"M"`、`"K"` 是 logical extent 名字；`M, K = input.shape` 读取这些 extents，不会声明同名 constexpr 参数。只有动态 shape 的 kernel 无需把本次输入尺寸传入 `constexprs`。
 
 评测中的 `build(context)` 只是上述调用的薄适配：在 build 内分别 `context.compile("name", kernel)`，返回一个 host callable，在 callable 中分配中间 tensors 并调用 artifacts。它不改变 DSL，也不要求整个任务只能写一个 kernel。
 
