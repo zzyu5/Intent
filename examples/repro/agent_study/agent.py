@@ -113,7 +113,7 @@ def execute(directory: Path, suite: dict, prompt: str, *, executable: Path,
     process = subprocess.Popen(command(directory, suite, response, schema, executable, state_root, language),
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                cwd=directory, env=environment, start_new_session=True)
-    threads, errors, mcp_calls, stderr = [], [], [], []
+    threads, errors, mcp_calls, stderr, completed_turns = [], [], [], [], []
 
     def collect_stdout():
         for line in process.stdout:
@@ -124,6 +124,8 @@ def execute(directory: Path, suite: dict, prompt: str, *, executable: Path,
                 threads.append(event["thread_id"])
             elif event["type"] in {"error", "turn.failed"}:
                 errors.append(event)
+            elif event["type"] == "turn.completed":
+                completed_turns.append(event)
             elif event["type"] == "item.completed" and event["item"]["type"] == "mcp_tool_call":
                 item = event["item"]
                 call = {k: item[k] for k in ("server", "tool", "arguments", "status", "error") if k in item}
@@ -154,7 +156,9 @@ def execute(directory: Path, suite: dict, prompt: str, *, executable: Path,
     for reader in readers:
         reader.join()
     result = {"model": suite["model"], "reasoning_effort": suite["reasoning_effort"],
-              "threads": threads, "exit_code": process.returncode, "manual_calls": mcp_calls}
+              "threads": threads, "exit_code": process.returncode, "manual_calls": mcp_calls,
+              "generation_seconds": time.monotonic() - started,
+              "completed_turns": completed_turns}
     if timed_out or stop.is_set() or process.returncode or not response.exists():
         result.update(action="unavailable", status="agent_timeout" if timed_out else "agent_environment_failure",
                       errors=errors, error="".join(stderr)[-6000:] or "Agent stopped without a submission")

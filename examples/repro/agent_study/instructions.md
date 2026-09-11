@@ -34,9 +34,10 @@ typing, collections, dataclasses and __future__ imports. File/network access,
 dynamic code loading and evaluator introspection are not part of the task.
 
 Submitting triggers the production paired benchmark: one numerical comparison
-and full CUDA Graph timing, including all of your kernels and internal data
-handling. Allocations outside captured execution, compilation, JIT and tuning do
-not count as operator milliseconds. Do not run independent tests, input sweeps
+and complete-operator timing using the CUDA Graph or CUDA event path declared in
+TASK.md, including all of your kernels and internal data handling. Compilation,
+JIT, tuning and allocations outside timed execution do not count as operator
+milliseconds. Do not run independent tests, input sweeps
 or benchmarks. You submit once; there is no benchmark-feedback repair round.
 No reference implementation or reference output values are available to you. Do not seek other task answers,
 personal memory, external websites or subagents.

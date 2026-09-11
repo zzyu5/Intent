@@ -48,6 +48,7 @@ def trial(arguments, row, language) -> dict:
     task_text = description(arguments.reference, row)
     task_text += "\n\nFixed invocation (tensor values are not disclosed):\n" + json.dumps(row["invocation"], indent=2)
     task_text += "\n\nTolerance: " + json.dumps(arguments.suite["tolerances"][row["tolerance"]])
+    task_text += "\n\nTiming: " + row["timing"]
     task_text += "\n\nProfile note: " + row["reason"]
     (directory / "TASK.md").write_text(task_text)
     agent = execute(directory, arguments.suite, f"Implement TASK.md using {language}. Submit one complete candidate.py.\n",
@@ -101,6 +102,7 @@ def main() -> None:
     rows = [row for row in catalog(arguments.reference, arguments.suite) if row["task"] in selected]
     for row in rows:
         row.update(by_id[row["task"]])
+        row["timing"] = by_id[row["task"]].get("timing", arguments.suite["timing"])
         row["invocation"] = invocation(arguments.reference, row, by_id[row["task"]], arguments.suite, device="cpu").metadata()
     arguments.output = arguments.output.resolve()
     arguments.output.mkdir(parents=True, exist_ok=False)
@@ -112,11 +114,11 @@ def main() -> None:
                    "torch": torch.__version__, "triton": triton.__version__, "gpu": torch.cuda.get_device_name(0),
                    "model": arguments.suite["model"], "reasoning_effort": arguments.suite["reasoning_effort"],
                    "tasks": rows, "submission_policy": "one complete program; documentation tools; no benchmark feedback",
-                   "timing": "complete CUDA Graph operator; compilation/tuning/allocations outside timing",
+                   "timing": "complete operator; per-task paired CUDA Graph or CUDA event timing; compilation/tuning excluded",
                    "isolation": "dedicated Codex state/provider; workspace-only shell, no network; read-only public manual MCP; no reference/history/agents",
                    "instructions": Path(__file__).with_name("instructions.md").read_text()}
     (arguments.output / "environment.json").write_text(json.dumps(environment, indent=2) + "\n")
-    fields = ("task", "profile", "language", "status", "candidate_ms", "reference_ms", "ratio", "failure_stage", "error", "program")
+    fields = ("task", "profile", "language", "status", "candidate_ms", "reference_ms", "ratio", "timing", "failure_stage", "error", "program")
     with (arguments.output / "results.csv").open("w", newline="") as output, ThreadPoolExecutor(max_workers=arguments.workers) as executor:
         writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()

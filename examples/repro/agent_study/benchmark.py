@@ -71,10 +71,11 @@ def run(arguments) -> dict:
     suite = read_suite()
     task = next(task for task in suite["tasks"] if task["id"] == arguments.task)
     row = next(row for row in catalog(arguments.reference, suite) if row["task"] == arguments.task)
-    cuda_graph = arguments.timing == "cuda_graph"
+    timing = arguments.timing or task.get("timing", suite["timing"])
+    cuda_graph = timing == "cuda_graph"
     result = {"status": "pending", "candidate_ms": None, "reference_ms": None, "ratio": None,
               "reference_timing_note": None,
-              "timing": arguments.timing, "tolerance": suite["tolerances"][task["tolerance"]]}
+              "timing": timing, "tolerance": suite["tolerances"][task["tolerance"]]}
     if "reference_correction" in row:
         result["reference_correction"] = row["reference_correction"]
 
@@ -169,8 +170,8 @@ def main() -> None:
     parser.add_argument("--result", type=Path, required=True)
     parser.add_argument("--gpu-lock", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, help="Separate compiler recheck artifacts from an existing submission")
-    parser.add_argument("--timing", choices=("cuda_graph", "cuda_event"), default="cuda_graph",
-                        help="Use the same timing path for the candidate and unchanged reference")
+    parser.add_argument("--timing", choices=("cuda_graph", "cuda_event"),
+                        help="Override the task's paired candidate/reference timing path")
     arguments = parser.parse_args()
     with redirect_stdout(sys.stderr):
         result = run(arguments)
