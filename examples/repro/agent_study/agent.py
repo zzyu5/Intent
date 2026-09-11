@@ -41,7 +41,7 @@ def materialize_language(project: Path, triton_ref: Path, directory: Path, langu
     path = triton_ref / "docs/python-api/triton-semantics.rst"
     shutil.copyfile(path, directory / path.name)
     sources.append("ref/triton/docs/python-api/triton-semantics.rst")
-    example = Path(__file__).with_name("materials") / "triton/vector_add.py"
+    example = Path(__file__).resolve().with_name("materials") / "triton/vector_add.py"
     shutil.copyfile(example, directory / "vector_add.py")
     return sources + [str(example.relative_to(project))]
 

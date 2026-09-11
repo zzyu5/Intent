@@ -12,6 +12,7 @@ import subprocess
 
 def snapshot(project: Path) -> dict:
     """Freeze only public author material, never benchmarks or provider sources."""
+    project = project.resolve()
     import intent
     import intent.language as language
     from intent.language.builtins import INTRINSICS, Intrinsic, IntrinsicNamespace, QuantFormats
@@ -74,7 +75,7 @@ def snapshot(project: Path) -> dict:
             source = "python/intent/language/signatures.py" if signature else "python/intent/language/builtins.py"
         elif inspect.isfunction(value) or inspect.isclass(value):
             signature = inspect.signature(value) if inspect.isfunction(value) or inspect.isfunction(vars(value).get("__init__")) else None
-            source = str(Path(inspect.getfile(value)).relative_to(project))
+            source = str(Path(inspect.getfile(value)).resolve().relative_to(project))
         else:
             signature, source = None, "python/intent/language/__init__.py"
         pattern = re.compile(r"(?<![\w.])(?:I\.)?" + re.escape(name) + r"(?![\w.])")
