@@ -228,7 +228,7 @@ def lower_index(
             terms.append(IndexTerm(IndexTermKind.STATIC_INDEX, static_values=(static,)))
             source_axis += 1
             continue
-        value = lowerer.materialize(lowerer.lower_expression(raw_term), raw_term)
+        value = lowerer.read_value(lowerer.lower_expression(raw_term), raw_term)
         position = first_operand_position + len(operands)
         operands.append(value)
         if isinstance(value.type, (DomainType, RegionType)):
