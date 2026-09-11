@@ -18,6 +18,8 @@ Pointwise 按尾部对齐，允许 scalar/size-one broadcast。`[M]` 与 `[M,N]`
 
 `I.transpose(value, permutation)` 显式重排；`I.reshape` 保持 row-major element order，不是任意 data permutation。Domain/subregion 与 integer coordinate tensor 不可互换；索引关系、有效范围和 fill 必须来自作者实际表达。
 
+多个 tensor indices 按 broadcast 规则形成共同的索引 shape；domain index 则引入独立的 logical axis。例如二维逐元素按第 0 轴 gather，使用 `index=(indices[rows, columns], I.reshape(I.indices(columns), (1, N)))`。这里第二项是可广播的列坐标 tensor，直接传 `columns` domain 会额外引入一个轴。
+
 ## Reduce、tuple 与 helpers
 
 `I.reduce.sum/max/any/all` 返回归约后的 values，没有 `keepdim`；非空 axis tuple 可同时归约多轴。补 size-one 轴时，tensor value 使用 `I.reshape`；scalar 不能 reshape，可用 `I.full` 构造 tensor，或按赋值的广播规则直接写出。
@@ -35,6 +37,8 @@ Python tuple 与 `I.record(field=value, ...)` 是结构化 products，不要求�
 普通 `for/while` 保持顺序与 loop carry；`I.parallel(domain)` 表达独立无序点，不允许 carry。Tensor predicate 使用 `I.select`，不控制 statement `if`。`Out` 进入 kernel 时未定义，读取前必须先定义；不能用 InOut 掩盖未定义读取。
 
 一个 kernel 不自动拆成多个 launches。需要多个 kernels 时，host 分别编译，分配中间 tensor，显式依次调用。[split_k_pipeline.py](examples/split_k_pipeline.py) 包含完整 partial/combine kernels 和真实 host 编排；`parts` 是作者可见的算法分解，不是物理 tile 参数。
+
+输出很少的大归约可以采用分段生成 partials、再合并的算法，以增加独立工作的数量。分段与合并仍须保持操作的顺序、identity、NaN 和数值契约；每个 kernel 内的物理分块、布局与 target 配置仍由 compiler 负责。
 
 Public 调用为 `intent.compile(kernel, compiler=..., target=..., constexprs=...)`，返回 artifact；`artifact(*inputs, *outputs)` 显式传输出，`artifact.run(*inputs)` 分配并返回输出。编译与 launch 分开。`intent.generate` 只生成 source/IR；target 在 host 选择，例如 `intent.targets.TritonTarget()`，不能在 kernel 查询设备或选择 warp/tile。
 
