@@ -124,6 +124,12 @@ FailureOr<Value> scalarSource(Value value) {
     return failure();
   if (!isa<FragmentType>(value.getType()))
     return value;
+  while (auto extract = value.getDefiningOp<ExtractOp>()) {
+    auto record = extract.getRecord().getDefiningOp<MakeRecordOp>();
+    if (!record || extract.getField() >= record.getFields().size())
+      return failure();
+    value = record.getFields()[extract.getField()];
+  }
   if (auto broadcast = value.getDefiningOp<BroadcastOp>())
     if (!isa<FragmentType>(broadcast.getValue().getType()))
       return broadcast.getValue();
@@ -2684,9 +2690,11 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
       if (succeeded(authority))
         plan->ranges.push_back(*authority);
     }
-    if (plan->roots.empty() && plan->ranges.empty())
+    if (plan->roots.empty() && plan->ranges.empty() &&
+        failed(scalarSource(source)))
       return reduce.emitOpError(
-          "pure reduction source has no exact physical range authority");
+                 "pure reduction source has no exact physical range authority")
+             << "; source=" << source;
     for (LoadOp root : plan->roots) {
       FailureOr<std::optional<RootAccess>> rootAccess =
           analyzeRoot(root, plan->ranges, plan->reductionAxis);
@@ -2724,6 +2732,26 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
   }
   if (!sourceExtent)
     return unhandled("reduction has no physical source extent");
+  auto needsPairedTraversal = [](const SourcePlan &plan) {
+    return plan.roots.empty() && plan.ranges.empty();
+  };
+  if (llvm::any_of(sourcePlans, needsPairedTraversal)) {
+    SmallVector<MakeRangeOp> pairedRanges;
+    for (const SourcePlan &plan : sourcePlans)
+      for (MakeRangeOp range : plan.ranges)
+        if (!llvm::is_contained(pairedRanges, range))
+          pairedRanges.push_back(range);
+    PhysicalLockstepTraversalFact traversal =
+        PhysicalProgramAnalysis(kernel).lockstepRanges(pairedRanges);
+    if (!traversal.isExact())
+      return reduce.emitOpError(
+          "uniform reduction components require an exact paired traversal");
+    // Reduce pairs these component axes. Uniform scalar broadcasts can use
+    // that traversal for replay and padding while retaining their own identity.
+    for (SourcePlan &plan : sourcePlans)
+      if (needsPairedTraversal(plan))
+        plan.ranges.push_back(traversal.authority);
+  }
   if (!isCompileTimeExtent(sourceExtent) || hasDerivedSource ||
       hasRuntimeSourceRange || hasConstructionScalarSource)
     return realizeRuntimeReduce(reduce, sourcePlans, kernel);
