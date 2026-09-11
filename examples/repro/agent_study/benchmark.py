@@ -71,9 +71,10 @@ def run(arguments) -> dict:
     suite = read_suite()
     task = next(task for task in suite["tasks"] if task["id"] == arguments.task)
     row = next(row for row in catalog(arguments.reference, suite) if row["task"] == arguments.task)
+    cuda_graph = arguments.timing == "cuda_graph"
     result = {"status": "pending", "candidate_ms": None, "reference_ms": None, "ratio": None,
               "reference_timing_note": None,
-              "timing": "cuda_graph", "tolerance": suite["tolerances"][task["tolerance"]]}
+              "timing": arguments.timing, "tolerance": suite["tolerances"][task["tolerance"]]}
     if "reference_correction" in row:
         result["reference_correction"] = row["reference_correction"]
 
@@ -127,7 +128,7 @@ def run(arguments) -> dict:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 candidate = _observe(candidate_call, function, task=arguments.task, enforce=True)
                 source = _observe(reference_call, reference_function, task=arguments.task, enforce=False)
-                measured, anchor = evaluate(PreparedComparison(candidate, source, tolerance(task, suite), cuda_graph=True),
+                measured, anchor = evaluate(PreparedComparison(candidate, source, tolerance(task, suite), cuda_graph=cuda_graph),
                                             source_timing_error=source_timing_error)
             result.update(status="pass", candidate_ms=measured, reference_ms=anchor,
                           ratio=measured / anchor if anchor is not None else None)
@@ -168,6 +169,8 @@ def main() -> None:
     parser.add_argument("--result", type=Path, required=True)
     parser.add_argument("--gpu-lock", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, help="Separate compiler recheck artifacts from an existing submission")
+    parser.add_argument("--timing", choices=("cuda_graph", "cuda_event"), default="cuda_graph",
+                        help="Use the same timing path for the candidate and unchanged reference")
     arguments = parser.parse_args()
     with redirect_stdout(sys.stderr):
         result = run(arguments)
