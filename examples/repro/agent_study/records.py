@@ -151,9 +151,9 @@ class Records:
                     stop = json.loads(stop_path.read_text()) if stop_path.exists() else {}
                     stop_reason = stop.get("reason")
                     optimization_started = bool(optimization_rows or stop_reason)
-                    optimized = correct + [row for row in optimization_rows if row["status"] == "pass"]
-                    best = min(optimized, key=lambda row: row["candidate_ms"]) if optimized else None
                     seed = min(correct, key=lambda row: row["candidate"]) if correct else None
+                    optimized = ([seed] if seed else []) + [row for row in optimization_rows if row["status"] == "pass"]
+                    best = min(optimized, key=lambda row: row["candidate_ms"]) if optimized else None
                     anchors = []
                     for paired_arm in ("triton", "intent"):
                         paired_seeds = [row for row in self.rows if row["task"] == task["id"] and row["repeat"] == repeat
