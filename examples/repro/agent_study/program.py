@@ -93,7 +93,15 @@ class TuningBudget:
             kwargs.pop("warmup", None)
             autotuning += 1
             try:
-                compiled = tuner.warmup(*args, **kwargs)
+                tuner.nargs = dict(zip(tuner.arg_names, args))
+                compiled = []
+                for configuration in tuner.prune_configs(kwargs):
+                    meta = configuration.all_kwargs()
+                    # Descriptor block shapes are part of the compiled argument
+                    # type. Triton's warmup skips this normal run-time hook.
+                    if configuration.pre_hook is not None:
+                        configuration.pre_hook({**tuner.nargs, **kwargs, **meta})
+                    compiled.append(tuner.fn.warmup(*args, **kwargs, **meta))
                 # Autotuner.run returns one compiled kernel. Preserve that
                 # interface for explicit-output artifact calls during warmup.
                 for kernel in compiled:
