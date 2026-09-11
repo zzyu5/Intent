@@ -4,11 +4,100 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/IR/IRMapping.h"
 
 using namespace mlir;
 namespace intent::weft_provider {
 using namespace intent::cpu;
 namespace {
+
+LogicalResult formIntegerTile(OpBuilder &b, linalg::GenericOp operation,
+    const ContractionTile &tile, ConfigurationAttr, ImplementationAttr binding) {
+  Location loc = operation.getLoc();
+  auto rows = getConstantIntValue(tile.mCount), columns = getConstantIntValue(tile.nCount);
+  auto depth = getConstantIntValue(tile.depth);
+  if (!rows || !columns || !depth)
+    return operation.emitError("matrix implementation requires bounded M/N/K tiles");
+  auto view = [&](Value source, Value row, Value column, int64_t m, int64_t n) -> Value {
+    return b.create<memref::SubViewOp>(loc, source,
+        ArrayRef<OpFoldResult>{row, column}, ArrayRef<OpFoldResult>{b.getIndexAttr(m), b.getIndexAttr(n)},
+        ArrayRef<OpFoldResult>{b.getIndexAttr(1), b.getIndexAttr(1)});
+  };
+  auto pointwise = [&](Value lhs, Value rhs, Value output) {
+    SmallVector<Value> inputs{lhs};
+    if (rhs) inputs.push_back(rhs);
+    b.create<linalg::GenericOp>(loc, inputs, ValueRange{output},
+        SmallVector<AffineMap>(inputs.size() + 1, b.getMultiDimIdentityMap(2)),
+        SmallVector<utils::IteratorType>(2, utils::IteratorType::parallel),
+        [&](OpBuilder &nested, Location loc, ValueRange args) {
+          Value result = rhs ? Value(nested.create<arith::AddIOp>(loc, args[0], args[1])) : args[0];
+          nested.create<linalg::YieldOp>(loc, result);
+        });
+  };
+  auto micro = [&](Value m, Value n, int64_t rows, int64_t columns) {
+    auto type = MemRefType::get({rows, columns}, b.getI32Type());
+    Value accumulator = b.create<memref::AllocaOp>(loc, type);
+    b.create<linalg::FillOp>(loc, ValueRange{tile.initial}, ValueRange{accumulator});
+    auto issue = [&](Value k, int64_t count) {
+      Value lhs = view(tile.lhs, m, k, rows, count);
+      Value rhs = view(tile.rhs, k, n, count, columns);
+      Value partial = b.create<memref::AllocaOp>(loc, type);
+      if (count == 1) {
+        AffineExpr row, column;
+        bindDims(b.getContext(), row, column);
+        b.create<linalg::GenericOp>(loc, ValueRange{lhs, rhs}, ValueRange{partial},
+            ArrayRef<AffineMap>{AffineMap::get(2, 0, {row, b.getAffineConstantExpr(0)}, b.getContext()),
+                AffineMap::get(2, 0, {b.getAffineConstantExpr(0), column}, b.getContext()),
+                b.getMultiDimIdentityMap(2)},
+            SmallVector<utils::IteratorType>(2, utils::IteratorType::parallel),
+            [&](OpBuilder &nested, Location loc, ValueRange args) {
+              Value left = nested.create<arith::ExtSIOp>(loc, b.getI32Type(), args[0]);
+              Value right = nested.create<arith::ExtSIOp>(loc, b.getI32Type(), args[1]);
+              nested.create<linalg::YieldOp>(loc, nested.create<arith::MulIOp>(loc, left, right).getResult());
+            });
+        pointwise(accumulator, partial, accumulator);
+        return;
+      }
+      b.create<linalg::FillOp>(loc, ValueRange{tile.initial}, ValueRange{partial});
+      auto term = b.create<linalg::GenericOp>(loc, ValueRange{lhs, rhs}, ValueRange{partial},
+          operation.getIndexingMapsArray(), operation.getIteratorTypesArray(),
+          [&](OpBuilder &nested, Location loc, ValueRange args) {
+            IRMapping mapping;
+            Block &body = operation.getRegion().front();
+            mapping.map(body.getArguments(), args);
+            for (Operation &value : body.without_terminator()) nested.clone(value, mapping);
+            nested.create<linalg::YieldOp>(loc, mapping.lookup(body.getTerminator()->getOperand(0)));
+          });
+      term->setAttr("intent_cpu.implementation", binding);
+      pointwise(accumulator, partial, accumulator);
+    };
+    int64_t step = implementationParameter(binding, "micro_k");
+    int64_t full = *depth / step * step;
+    if (full)
+      loop(b, loc, index(b, loc, 0), index(b, loc, full), step,
+          [&](Value k) { issue(add(b, loc, tile.kBegin, k), step); });
+    for (int64_t k = full; k < *depth; ++k)
+      issue(add(b, loc, tile.kBegin, index(b, loc, k)), 1);
+    Value out = view(tile.output, m, n, rows, columns);
+    pointwise(accumulator, tile.first ? Value() : out, out);
+  };
+  auto panels = [&](Value begin, int64_t extent, int64_t panel,
+                    const std::function<void(Value, int64_t)> &body) {
+    int64_t full = extent / panel * panel;
+    if (full)
+      loop(b, loc, begin, add(b, loc, begin, index(b, loc, full)), panel,
+          [&](Value offset) { body(offset, panel); });
+    for (int64_t offset = full; offset < extent; ++offset)
+      body(add(b, loc, begin, index(b, loc, offset)), 1);
+  };
+  int64_t microM = *depth == 1 ? 1 : implementationParameter(binding, "micro_m");
+  int64_t microN = *depth == 1 ? 1 : implementationParameter(binding, "micro_n");
+  panels(tile.mBegin, *rows, microM, [&](Value m, int64_t rows) {
+    panels(tile.nBegin, *columns, microN,
+        [&](Value n, int64_t columns) { micro(m, n, rows, columns); });
+  });
+  return success();
+}
 
 LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
     const ContractionTile &tile, ConfigurationAttr, ImplementationAttr binding) {
@@ -73,10 +162,15 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
 cpu::ImplementationRegistry implementations() {
   ImplementationRegistry result;
   result.profile = [](func::FuncOp function) -> StringRef {
-    bool quantize = false, contraction = false, region = false;
+    bool quantize = false, contraction = false, integer = false, region = false;
     function.walk([&](cpu::QuantizeOp) { quantize = true; });
-    function.walk([&](linalg::GenericOp op) { contraction |= isMatrixContraction(op); });
+    function.walk([&](linalg::GenericOp op) {
+      if (!isMatrixContraction(op)) return;
+      contraction = true;
+      integer |= cast<MemRefType>(op.getInputs()[0].getType()).getElementType().isSignlessInteger(8);
+    });
     function.walk([&](Operation *op) { region |= isa<cpu::RegionFoldOp, cpu::RegionScanOp>(op); });
+    if (integer) return "weft.contract_i8_i32";
     if (region) return contraction ? "weft.region_contract_f32" : "weft.region_structured";
     return quantize ? "weft.q8_k" : contraction ? "weft.contract_f32" : "weft.structured";
   };
@@ -101,16 +195,30 @@ cpu::ImplementationRegistry implementations() {
         if (failed(value)) return failure();
         return SmallVector<Value>{*value};
       }});
+  result.add({"weft.matrix_i8_i32", [](Operation *op) {
+      auto generic = dyn_cast<linalg::GenericOp>(op);
+      return generic && isMatrixContraction(generic) &&
+          cast<MemRefType>(generic.getInputs()[0].getType()).getElementType().isSignlessInteger(8);
+    }, [](CapabilitiesAttr capabilities, const Configuration &config) {
+      if (!capabilities.getMatrixI8I32() || capabilities.getVectorBits() != 256 ||
+          config.local.size() != 3 || !config.local.get("micro_m") ||
+          !config.local.get("micro_n") || !config.local.get("micro_k")) return false;
+      int64_t m = config.parameter("micro_m"), n = config.parameter("micro_n");
+      return (m == 1 || m == 4) && (n == 4 || n == 16) && config.parameter("micro_k") == 8 &&
+          config.tileM % m == 0 && config.tileN % n == 0 && config.tileK % 8 == 0;
+    }, [](Builder &, const Configuration &config) { return config.local; },
+    formIntegerTile, {}, {true, true, true}});
   result.add({"weft.contract_f32", [](Operation *op) {
       auto generic = dyn_cast<linalg::GenericOp>(op);
-      return generic && isMatrixContraction(generic);
+      return generic && isMatrixContraction(generic) &&
+          cast<MemRefType>(generic.getInputs()[0].getType()).getElementType().isF32();
     }, legal, [](Builder &b, const Configuration &config) {
       // A 4x4 reduction-lane stream needs 16 accumulator groups plus its
       // stationary input panel and one streamed input, within RVV's 32 groups.
       return b.getDictionaryAttr({b.getNamedAttr("panel", b.getI64IntegerAttr(
           std::min<int64_t>({4, config.tileM, config.tileN})))});
     }, formTile, {}, {true, true, true}});
-  result.add({"weft.structured_f32", [](Operation *op) {
+  result.add({"weft.structured", [](Operation *op) {
       if (auto generic = dyn_cast<linalg::GenericOp>(op)) return !isMatrixContraction(generic);
       return isa<cpu::ReduceOp>(op);
     }, legal, [](Builder &b, const Configuration &config) {

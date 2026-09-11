@@ -99,6 +99,7 @@ int main(int argc, char **argv) {
   llvm::cl::opt<std::string> metadataOutputFilename("metadata-output", llvm::cl::init(""));
   llvm::cl::opt<int64_t> cpuVectorBits("cpu-vector-bits", llvm::cl::init(0));
   llvm::cl::opt<int64_t> cpuWorkers("cpu-workers", llvm::cl::init(0));
+  llvm::cl::opt<bool> cpuMatrixI8I32("cpu-matrix-i8-i32", llvm::cl::init(false));
   llvm::cl::opt<bool> stopAfterShared(
       "stop-after-shared",
       llvm::cl::desc("stop after the selected execution family's shared verifier"),
@@ -161,7 +162,7 @@ int main(int argc, char **argv) {
 #ifdef INTENT_HAS_WEFT_CANONICAL
     else implementations = intent::weft_provider::implementations();
 #endif
-    if (mlir::failed(intent::cpu::runCPUPasses(*module, cpuVectorBits, cpuWorkers,
+    if (mlir::failed(intent::cpu::runCPUPasses(*module, cpuVectorBits, cpuWorkers, cpuMatrixI8I32,
             profilePath(target == TargetKind::Mojo ? "mojo.json" : "weft.json"), tuningConfigFilename, implementations)))
       return exitCode(ExitCode::PhysicalProgramVerification);
     if (stopAfterShared) return emitShared();

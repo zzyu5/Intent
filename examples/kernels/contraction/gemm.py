@@ -27,6 +27,19 @@ def gemm_f32(
 
 
 @intent.kernel
+def gemm_i8(
+    a: I.In[I.i8, ("M", "K")],
+    b: I.In[I.i8, ("K", "N")],
+    bias: I.In[I.i32, ("N",)],
+    c: I.Out[I.i32, ("M", "N")],
+):
+    m = I.domain(0, a.shape[0])
+    k = I.domain(0, a.shape[1])
+    n = I.domain(0, b.shape[1])
+    c[m, n] = I.matmul(a[m, k], b[k, n], acc_dtype=I.i32) + bias[n]
+
+
+@intent.kernel
 def gemm(
     a: I.In[I.f16, ("M", "K")],
     b: I.In[I.f16, ("K", "N")],

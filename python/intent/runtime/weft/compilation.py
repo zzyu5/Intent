@@ -1,23 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 import json
 from pathlib import Path
 import subprocess
 
 
-@dataclass(frozen=True)
-class TargetProfile:
-    march: str
-    abi: str
-    vlen_bits: int
-    cpus: tuple[int, ...]
-
-    def __post_init__(self) -> None:
-        if not self.march.startswith("rv64") or self.abi != "lp64d":
-            raise NotImplementedError("native Weft currently requires RV64/lp64d")
-        if self.vlen_bits <= 0 or not self.cpus or any(cpu < 0 for cpu in self.cpus):
-            raise ValueError("native Weft requires an explicit VLEN and CPU execution set")
+from .target import TargetProfile
 
 
 def invoke_compiler(command: list[str], source: str | None = None) -> str:
@@ -27,10 +16,13 @@ def invoke_compiler(command: list[str], source: str | None = None) -> str:
     return result.stdout
 
 
-def lower_artifact(source: str, *, compiler: str, profile: TargetProfile) -> dict:
+def lower_artifact(source: str, *, compiler: str, profile: TargetProfile,
+                   source_bindings: tuple[tuple[str, int], ...] = ()) -> dict:
     artifact = json.loads(invoke_compiler(
         [compiler, "--emit=artifact", f"--march={profile.march}", f"--abi={profile.abi}",
-         f"--vlen-bits={profile.vlen_bits}"], source,
+         f"--vlen-bits={profile.vlen_bits}",
+         *([f"--matrix-extension={profile.matrix_extension}"] if profile.matrix_extension else []),
+         *(f"--meta={name}={value}" for name, value in source_bindings)], source,
     ))
     _validate_target(artifact, profile)
     return artifact
@@ -42,8 +34,16 @@ def _validate_target(artifact: dict, profile: TargetProfile) -> None:
     for kernel in artifact["kernels"]:
         if (kernel["march"], kernel["abi"], kernel["vlen_bits"]) != (
             profile.march, profile.abi, profile.vlen_bits,
-        ) or kernel["matrix_extensions"]:
-            raise NotImplementedError("Weft artifact does not match the selected standard RVV profile")
+        ) or set(kernel["matrix_extensions"]) != ({profile.matrix_extension} if profile.matrix_extension else set()):
+            raise ValueError("Weft artifact does not match the selected target profile")
+        if not set(kernel["required_extensions"]).issubset(kernel["used_extensions"]) or not set(
+                kernel["used_extensions"]).issubset(kernel["matrix_extensions"]):
+            raise ValueError("Weft artifact extension requirements disagree with its selected instructions")
+    # An Intent invocation can also contain RVV-only preparation and copy tasks.
+    # Its extension requirement applies to the complete executable candidate.
+    used = {extension for kernel in artifact["kernels"] for extension in kernel["used_extensions"]}
+    if not set(profile.required_extensions).issubset(used):
+        raise ValueError("Weft program does not use the required matrix extension")
 
 
 def validate_artifact(manifest: dict) -> None:
@@ -58,10 +58,19 @@ def validate_artifact(manifest: dict) -> None:
         for field in ("arguments", "shape_parameters"):
             if kernels[symbol][field] != abi[field]:
                 raise ValueError(f"Weft artifact {symbol} {field} disagree with the CPU task ABI")
+    profile = TargetProfile(**manifest["profile"])
+    for candidate in manifest["program"]["candidates"]:
+        used = {extension for task in manifest["program"]["tasks"]
+                if task["cpu_entry"] == candidate["entry"]
+                for extension in kernels[task["abi"]["symbol"]]["used_extensions"]}
+        if not set(profile.required_extensions).issubset(used):
+            raise ValueError("Weft candidate does not use the required matrix extension")
 
 
 def export_artifact(program, directory: Path, *, compiler: str, profile: TargetProfile) -> None:
     """AOT lowering; system compilation and native loading remain separate."""
+    if program.metadata["matrix_i8_i32"] and not profile.matrix_extension:
+        raise ValueError("CPU program matrix capability disagrees with native materialization")
     artifact = lower_artifact(program.source, compiler=compiler, profile=profile)
     manifest = {"profile": asdict(profile), "program": program.metadata, "weft": artifact}
     validate_artifact(manifest)

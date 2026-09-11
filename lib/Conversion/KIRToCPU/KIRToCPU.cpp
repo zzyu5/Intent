@@ -40,9 +40,10 @@ public:
       auto parameter = cast<ParameterAttr>(parameters[i]);
       if (auto view = dyn_cast<ViewType>(argument.getType())) {
         auto tensor = cast<RankedTensorType>(view.getTensor());
-        if ((!tensor.getElementType().isF32() && !tensor.getElementType().isUnsignedInteger(8)) ||
+        if ((!tensor.getElementType().isF32() && !tensor.getElementType().isUnsignedInteger(8) &&
+             !tensor.getElementType().isSignlessInteger(8) && !tensor.getElementType().isSignlessInteger(32)) ||
             view.getAccess() == 2)
-          return source.emitError("CPU construction supports f32/u8 In/Out views; InOut is not implemented");
+          return source.emitError("CPU construction supports f32/u8/i8/i32 In/Out views; InOut is not implemented");
         auto memory = MemRefType::get(tensor.getShape(), tensor.getElementType());
         if (view.getConstraints().getHasStrides()) {
           if (view.getConstraints().getStrides().size() != static_cast<size_t>(tensor.getRank()))
@@ -674,18 +675,21 @@ private:
     auto rhsType = cast<RankedTensorType>(operation.getRhs().getType());
     auto resultType = cast<RankedTensorType>(operation.getResult().getType());
     auto pairs = operation.getReduce();
+    bool floating = lhsType.getElementType().isF32() && rhsType.getElementType().isF32() &&
+        resultType.getElementType().isF32();
+    bool integer = lhsType.getElementType().isSignlessInteger(8) && rhsType.getElementType().isSignlessInteger(8) &&
+        resultType.getElementType().isSignlessInteger(32);
     if (lhsType.getRank() != 2 || rhsType.getRank() != 2 || pairs.size() != 1 ||
         !operation.getBatch().empty() ||
         cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[0]).getInt() != 1 ||
         cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[1]).getInt() != 0 ||
-        !lhsType.getElementType().isF32() || !rhsType.getElementType().isF32() ||
-        !resultType.getElementType().isF32())
-      return operation.emitError("CPU construction supports ordinary rank-two f32 contraction");
+        (!floating && !integer))
+      return operation.emitError("CPU construction supports ordinary rank-two f32 or i8 to i32 contraction");
     Location loc = operation.getLoc();
     auto sizes = extents(resultType, loc);
     if (failed(sizes)) return failure();
     Value output = allocate(resultType, *sizes, loc);
-    Value zero = builder.create<arith::ConstantOp>(loc, builder.getF32FloatAttr(0.0));
+    Value zero = builder.create<arith::ConstantOp>(loc, builder.getZeroAttr(resultType.getElementType()));
     builder.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{output});
     AffineExpr m, n, k;
     bindDims(builder.getContext(), m, n, k);
@@ -700,7 +704,14 @@ private:
         ValueRange{values.lookup(operation.getLhs()), values.lookup(operation.getRhs())},
         ValueRange{output}, maps, iterators,
         [](OpBuilder &b, Location loc, ValueRange arguments) {
-          Value value = b.create<math::FmaOp>(loc, arguments[0], arguments[1], arguments[2]);
+          Value value;
+          if (arguments[2].getType().isF32())
+            value = b.create<math::FmaOp>(loc, arguments[0], arguments[1], arguments[2]);
+          else {
+            Value lhs = b.create<arith::ExtSIOp>(loc, arguments[2].getType(), arguments[0]);
+            Value rhs = b.create<arith::ExtSIOp>(loc, arguments[2].getType(), arguments[1]);
+            value = b.create<arith::AddIOp>(loc, b.create<arith::MulIOp>(loc, lhs, rhs), arguments[2]);
+          }
           b.create<linalg::YieldOp>(loc, value);
         });
     values.map(operation.getResult(), output);

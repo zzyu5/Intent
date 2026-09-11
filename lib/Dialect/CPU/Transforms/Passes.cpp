@@ -73,10 +73,10 @@ LogicalResult normalize(ModuleOp module) {
 }
 
 LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
-                          llvm::StringRef defaults, llvm::StringRef overrides,
+                          bool matrixI8I32, llvm::StringRef defaults, llvm::StringRef overrides,
                           const ImplementationRegistry &implementations) {
   auto capabilities = CapabilitiesAttr::getChecked([&]() { return module.emitError(); },
-      module.getContext(), vectorBits, workers, int64_t{262144});
+      module.getContext(), vectorBits, workers, int64_t{262144}, matrixI8I32);
   if (!capabilities) return failure();
   module->setAttr("intent_cpu.capabilities", capabilities);
   if (failed(verifyCPUProgram(module, false)) || failed(normalize(module))) return failure();

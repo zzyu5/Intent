@@ -10,6 +10,7 @@ class Entry:
     generated: str
     examples: tuple[str, ...]
     source_runtime: str
+    deployment: str | None = None
 
 
 TRITON = (
@@ -164,6 +165,8 @@ MOJO = (
 
 
 WEFT = (
+    Entry("i8_gemv_bias", "M1-N4096-K4096-i8-i32-IME1-1core", "gemm_i8", ("contraction/gemm.py:gemm_i8",), "source/weft/intentdsl/contraction/i8/i8_runtime.py", "weft/ime.json"),
+    Entry("i8_gemm_bias", "M128-N4096-K4096-i8-i32-IME1-1core", "gemm_i8", ("contraction/gemm.py:gemm_i8",), "source/weft/intentdsl/contraction/i8/i8_runtime.py", "weft/ime.json"),
     Entry("causal_attention_f32", "B8-S128-D32-f32-1core", "causal_attention_f32", ("streaming/attention_f32.py:causal_attention_f32",), "source/weft/intentdsl/attention/attention_runtime.py"),
     Entry("causal_linear_attention_f32", "B8-S128-D32-f32-1core", "causal_linear_attention_f32", ("streaming/attention_f32.py:causal_linear_attention_f32",), "source/weft/intentdsl/attention/attention_runtime.py"),
     Entry("q4_k_projection", "N4096-K4096-Q4_K-f32-1core", "quantized_projection",

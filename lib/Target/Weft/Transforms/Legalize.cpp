@@ -56,6 +56,7 @@ FailureOr<llvm::json::Object> taskABI(wk::KernelOp kernel) {
     std::string scalar;
     if (encoding.getKind() == "dense") {
       if (encoding.getFamily() == "f32") { scalar = "float"; bytes = 4; }
+      else if (encoding.getFamily() == "i32") { scalar = "int32_t"; bytes = 4; }
       else if (encoding.getFamily() == "i64") { scalar = "int64_t"; bytes = 8; }
       else if (encoding.getFamily() == "u8" || encoding.getFamily() == "i8") {
         scalar = encoding.getFamily() == "u8" ? "uint8_t" : "int8_t"; bytes = 1;
@@ -741,7 +742,7 @@ private:
       if (failed(sum)) return failure();
       return binary(loc, *sum, operands[1], "div");
     }
-    if (isa<arith::IndexCastOp, arith::SIToFPOp, arith::FPToSIOp, arith::ExtFOp, arith::TruncFOp>(operation))
+    if (isa<arith::IndexCastOp, arith::SIToFPOp, arith::FPToSIOp, arith::ExtFOp, arith::TruncFOp, arith::ExtSIOp>(operation))
       return Value(b.create<wk::CastOp>(loc, valueType(operation->getResult(0).getType(),
           shape(operands[0].getType()), axes(operands[0].getType())), operands[0]));
     if (isa<math::RsqrtOp>(operation)) kind = "rsqrt";
@@ -835,11 +836,15 @@ private:
       auto initial = read(destination);
       if (failed(lhs) || failed(rhs) || failed(initial)) return failure();
       auto definition = (*initial).getDefiningOp<wk::NewOp>();
-      if (!definition || !matchPattern(definition->getOperand(0), m_PosZeroFloat()))
+      bool zero = definition && matchPattern(definition->getOperand(0), m_PosZeroFloat());
+      if (definition && isa<IntegerType>(element((*initial).getType())))
+        if (auto constant = definition->getOperand(0).getDefiningOp<wk::ConstantOp>())
+          if (auto value = dyn_cast<IntegerAttr>(constant.getValue())) zero = value.getValue().isZero();
+      if (!zero)
         return operation.emitError("Weft contraction requires an explicit zero-initialized partial; nonzero fused accumulation has no equivalent canonical operation");
       int64_t reduction = loopAxes[2];
       Value term = b.create<wk::OuterContractOp>(operation.getLoc(), (*initial).getType(),
-          *lhs, *rhs, array({reduction}), TypeAttr::get(b.getF32Type()));
+          *lhs, *rhs, array({reduction}), TypeAttr::get(element((*initial).getType())));
       return write(destination, term);
     }
     auto iterators = operation.getIteratorTypesArray();
@@ -1241,13 +1246,19 @@ FailureOr<OwningOpRef<ModuleOp>> legalizeProgram(ModuleOp cpuProgram, std::strin
     return result;
   };
   for (auto [index, parameter] : llvm::enumerate(interface.getArguments())) {
-    if (auto view = dyn_cast<cpu::ViewArgumentAttr>(parameter))
+    if (auto view = dyn_cast<cpu::ViewArgumentAttr>(parameter)) {
+      Type element = view.getElementType();
+      std::string dtype;
+      if (element.isF32()) dtype = "f32";
+      else if (auto integer = dyn_cast<IntegerType>(element))
+        dtype = (integer.isUnsigned() ? "u" : "i") + std::to_string(integer.getWidth());
+      else return cpuProgram.emitError("CPU view has no Weft native dtype"), failure();
       parameters.push_back(llvm::json::Object{{"name", view.getName().getValue().str()},
-          {"kind", "view"}, {"dtype", view.getElementType().isF32() ? "f32" : "u8"},
+          {"kind", "view"}, {"dtype", dtype},
           {"shape", integers(view.getShape())}, {"dimensions", integers(view.getDimensions())},
-          {"alignment", std::max(int64_t(view.getElementType().isF32() ? 4 : 1), alignments.lookup(functions.front().getArgument(index)))},
+          {"alignment", std::max(int64_t(element.getIntOrFloatBitWidth() / 8), alignments.lookup(functions.front().getArgument(index)))},
           {"access", view.getAccess()}, {"alias", view.getAlias().getValue().str()}, {"noalias", view.getNoalias()}});
-    else {
+    } else {
       auto scalar = cast<cpu::ScalarArgumentAttr>(parameter);
       parameters.push_back(llvm::json::Object{{"name", scalar.getName().getValue().str()},
           {"kind", "scalar"}, {"dtype", scalar.getType().isF32() ? "f32" : "i64"}});
@@ -1340,6 +1351,7 @@ FailureOr<OwningOpRef<ModuleOp>> legalizeProgram(ModuleOp cpuProgram, std::strin
       {"native", false}, {"host_source", hostSource}, {"tasks", std::move(interfaces)},
       {"parameters", std::move(parameters)}, {"candidates", std::move(candidates)},
       {"contiguous_views", interface.getContiguousViews()}, {"disjoint_outputs", interface.getDisjointOutputs()},
+      {"matrix_i8_i32", cpuProgram->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities").getMatrixI8I32()},
       {"workers", cpuProgram->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities").getWorkers()}});
   return std::move(output);
 }

@@ -32,8 +32,8 @@ def IntentCPU_InterfaceAttr : IntentCPU_Attr<"Interface", "interface"> {
 
 def IntentCPU_CapabilitiesAttr : IntentCPU_Attr<"Capabilities", "capabilities"> {
   let parameters = (ins "int64_t":$vectorBits, "int64_t":$workers,
-    "int64_t":$privateBytes);
-  let assemblyFormat = "`<` $vectorBits `,` $workers `,` $privateBytes `>`";
+    "int64_t":$privateBytes, "bool":$matrixI8I32);
+  let assemblyFormat = "`<` $vectorBits `,` $workers `,` $privateBytes `,` $matrixI8I32 `>`";
 }
 
 def IntentCPU_ConfigurationAttr : IntentCPU_Attr<"Configuration", "configuration"> {

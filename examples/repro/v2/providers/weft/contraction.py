@@ -45,7 +45,7 @@ def _source_artifact(context, directory: Path, profile: TargetProfile, compiler:
         "  free(quantized);\n}\n"
     )
     source_metadata = {**metadata, "host_source": host,
-                       "tasks": [{"abi": {key: kernel[key] for key in ("symbol", "arguments", "shape_parameters")}}],
+                       "tasks": [{"cpu_entry": "source_projection", "abi": {key: kernel[key] for key in ("symbol", "arguments", "shape_parameters")}}],
                        "candidates": [{"entry": "source_projection", "values": [], "implementations": []}]}
     directory.mkdir()
     (directory / "canonical.mlir").write_text(canonical)
@@ -59,7 +59,7 @@ def _source_artifact(context, directory: Path, profile: TargetProfile, compiler:
 def projection(context):
     deployment_path = Path(os.environ.get("INTENT_WEFT_PROFILE", Path(__file__).with_name("rvv.json")))
     deployment = json.loads(deployment_path.read_text())
-    profile = TargetProfile(deployment["march"], deployment["abi"], deployment["vlen_bits"], tuple(deployment["cpus"]))
+    profile = TargetProfile.from_deployment(deployment)
     compiler = os.environ["INTENT_WEFT_COMPILER"]
     directory = tempfile.TemporaryDirectory(prefix="intentdsl-weft-benchmark-")
     root = Path(directory.name)
