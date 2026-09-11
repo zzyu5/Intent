@@ -31,16 +31,22 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
   linalg::FillOp initialization;
   for (Operation *user : output.getUsers()) {
     if (auto fill = dyn_cast<linalg::FillOp>(user)) {
-      if (initialization || fill->getBlock() != operation->getBlock() ||
-          !fill->isBeforeInBlock(operation))
-        return operation.emitError("CPU contraction requires one dominating initialization");
-      initialization = fill;
-    } else if (user != operation && !isa<memref::DeallocOp, memref::DimOp>(user)) {
-      return operation.emitError("CPU contraction output has an intervening or escaping use");
+      if (fill->getBlock() == operation->getBlock() && fill->isBeforeInBlock(operation) &&
+          (!initialization || initialization->isBeforeInBlock(fill)))
+        initialization = fill;
     }
   }
   if (!initialization)
     return operation.emitError("CPU contraction accumulator initialization is missing");
+  PhysicalProgramAnalysis analysis(operation->getParentOfType<func::FuncOp>());
+  Value root = analysis.storageRoot(output);
+  bool keepInitialization = (*implementation)->contraction.completePrivateInitialization &&
+      isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(root.getDefiningOp());
+  for (Operation *between = initialization->getNextNode(); between != operation;
+       between = between->getNextNode())
+    for (auto access : analysis.accesses(between))
+      if (analysis.storageRoot(access.memory) == root)
+        return operation.emitError("CPU contraction initialization has an intervening memory access");
   Value initial = initialization.getInputs()[0];
   if (!matchPattern(initial, m_PosZeroFloat()))
     return operation.emitError("CPU contraction blocking requires the closed zero-initialized contraction; splitting a nonzero fused accumulator is not implemented");
@@ -54,37 +60,86 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
   Value bk = index(b, loc, config.tileK);
   Value mTasks = b.create<arith::CeilDivSIOp>(loc, mSize, bm);
   Value nTasks = b.create<arith::CeilDivSIOp>(loc, nSize, bn);
-  auto parallel = b.create<scf::ParallelOp>(loc, ValueRange{zero, zero},
-      ValueRange{mTasks, nTasks}, ValueRange{one, one});
-  {
-    OpBuilder::InsertionGuard guard(b);
-    b.setInsertionPointToStart(parallel.getBody());
-    Value mBegin = multiply(b, loc, parallel.getInductionVars()[0], bm);
-    Value nBegin = multiply(b, loc, parallel.getInductionVars()[1], bn);
-    Value mCount = b.create<arith::MinSIOp>(loc, b.create<arith::SubIOp>(loc, mSize, mBegin), bm);
-    Value nCount = b.create<arith::MinSIOp>(loc, b.create<arith::SubIOp>(loc, nSize, nBegin), bn);
+  bool staticParallel = (*implementation)->contraction.staticParallelExtent;
+  Value fullM, fullN;
+  if (staticParallel) {
+    fullM = b.create<arith::DivSIOp>(loc, mSize, bm);
+    fullN = b.create<arith::DivSIOp>(loc, nSize, bn);
+    mTasks = add(b, loc, fullM, b.create<arith::RemSIOp>(loc, mSize, bm));
+    nTasks = add(b, loc, fullN, b.create<arith::RemSIOp>(loc, nSize, bn));
+  }
+  LogicalResult status = success();
+  auto tile = [&](Value mBegin, Value nBegin, Value mCount, Value nCount) {
     Value outputTile = subview(b, loc, output, {mBegin, nBegin}, {mCount, nCount});
     Value empty = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, kSize, zero);
-    auto initializeEmpty = b.create<scf::IfOp>(loc, empty, false);
-    {
+    if (!keepInitialization) {
+      auto initializeEmpty = b.create<scf::IfOp>(loc, empty, false);
       OpBuilder::InsertionGuard guard(b);
       b.setInsertionPointToStart(initializeEmpty.thenBlock());
       b.create<linalg::FillOp>(loc, ValueRange{initial}, ValueRange{outputTile});
     }
-    LogicalResult status = success();
-    auto kBlock = [&](Value kBegin, bool first) {
-      Value depth = b.create<arith::MinSIOp>(loc,
-          b.create<arith::SubIOp>(loc, kSize, kBegin), bk);
+    auto kBlock = [&](Value kBegin, Value depth, bool first) {
       if (failed((*implementation)->formTile(b, operation,
               {lhs, rhs, output, initial, mBegin, mCount, nBegin, nCount, kBegin, depth, first},
               shared, binding))) status = failure();
     };
-    Value firstEnd = b.create<arith::MinSIOp>(loc, kSize, bk);
-    loop(b, loc, zero, firstEnd, config.tileK, [&](Value k) { kBlock(k, true); });
-    loop(b, loc, firstEnd, kSize, config.tileK, [&](Value k) { kBlock(k, false); });
-    if (failed(status)) return failure();
+    if ((*implementation)->contraction.staticReductionExtent) {
+      Value fullEnd = b.create<arith::SubIOp>(loc, kSize, b.create<arith::RemSIOp>(loc, kSize, bk));
+      Value firstEnd = b.create<arith::MinSIOp>(loc, fullEnd, bk);
+      loop(b, loc, zero, firstEnd, config.tileK, [&](Value k) { kBlock(k, bk, true); });
+      loop(b, loc, bk, fullEnd, config.tileK, [&](Value k) { kBlock(k, bk, false); });
+      Value noFullTile = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, fullEnd, zero);
+      Value firstTailEnd = b.create<arith::SelectOp>(loc, noFullTile,
+          b.create<arith::MinSIOp>(loc, kSize, one), zero);
+      loop(b, loc, zero, firstTailEnd, 1, [&](Value k) { kBlock(k, one, true); });
+      Value tailBegin = b.create<arith::MaxSIOp>(loc, fullEnd, one);
+      loop(b, loc, tailBegin, kSize, 1, [&](Value k) { kBlock(k, one, false); });
+    } else {
+      Value firstEnd = b.create<arith::MinSIOp>(loc, kSize, bk);
+      auto dynamicBlock = [&](Value k, bool first) {
+        Value depth = b.create<arith::MinSIOp>(loc, b.create<arith::SubIOp>(loc, kSize, k), bk);
+        kBlock(k, depth, first);
+      };
+      loop(b, loc, zero, firstEnd, config.tileK, [&](Value k) { dynamicBlock(k, true); });
+      loop(b, loc, firstEnd, kSize, config.tileK, [&](Value k) { dynamicBlock(k, false); });
+    }
+  };
+  auto emitTile = [&](Value m, Value n) {
+    if (!staticParallel) {
+      Value mBegin = multiply(b, loc, m, bm), nBegin = multiply(b, loc, n, bn);
+      Value mCount = b.create<arith::MinSIOp>(loc, b.create<arith::SubIOp>(loc, mSize, mBegin), bm);
+      Value nCount = b.create<arith::MinSIOp>(loc, b.create<arith::SubIOp>(loc, nSize, nBegin), bn);
+      tile(mBegin, nBegin, mCount, nCount);
+      return;
+    }
+    auto bounded = [&](Value ordinal, Value full, Value block,
+                       const std::function<void(Value, Value)> &body) {
+      Value complete = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, ordinal, full);
+      auto branch = b.create<scf::IfOp>(loc, complete, true);
+      OpBuilder::InsertionGuard guard(b);
+      b.setInsertionPointToStart(branch.thenBlock());
+      body(multiply(b, loc, ordinal, block), block);
+      b.setInsertionPointToStart(branch.elseBlock());
+      Value begin = add(b, loc, multiply(b, loc, full, block), b.create<arith::SubIOp>(loc, ordinal, full));
+      body(begin, one);
+    };
+    bounded(m, fullM, bm, [&](Value mBegin, Value mCount) {
+      bounded(n, fullN, bn, [&](Value nBegin, Value nCount) { tile(mBegin, nBegin, mCount, nCount); });
+    });
+  };
+  if (operation->getParentOfType<scf::ForOp>() || operation->getParentOfType<scf::ParallelOp>()) {
+    loop(b, loc, zero, mTasks, 1, [&](Value m) {
+      loop(b, loc, zero, nTasks, 1, [&](Value n) { emitTile(m, n); });
+    });
+  } else {
+    auto parallel = b.create<scf::ParallelOp>(loc, ValueRange{zero, zero},
+        ValueRange{mTasks, nTasks}, ValueRange{one, one});
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(parallel.getBody());
+    emitTile(parallel.getInductionVars()[0], parallel.getInductionVars()[1]);
   }
-  initialization.erase();
+  if (failed(status)) return failure();
+  if (!keepInitialization) initialization.erase();
   operation.erase();
   return success();
 }

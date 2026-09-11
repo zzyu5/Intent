@@ -38,9 +38,9 @@ def IntentCPU_CapabilitiesAttr : IntentCPU_Attr<"Capabilities", "capabilities"> 
 
 def IntentCPU_ConfigurationAttr : IntentCPU_Attr<"Configuration", "configuration"> {
   let parameters = (ins "int64_t":$taskGrain,
-    "int64_t":$tileM, "int64_t":$tileN, "int64_t":$tileK);
+    "int64_t":$tileM, "int64_t":$tileN, "int64_t":$tileK, "int64_t":$regionSize);
   let assemblyFormat =
-    "`<` $taskGrain `,` $tileM `,` $tileN `,` $tileK `>`";
+    "`<` $taskGrain `,` $tileM `,` $tileN `,` $tileK `,` $regionSize `>`";
 }
 
 def IntentCPU_ImplementationAttr : IntentCPU_Attr<"Implementation", "implementation"> {

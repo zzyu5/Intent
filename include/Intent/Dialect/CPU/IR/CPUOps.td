@@ -52,4 +52,27 @@ def IntentCPU_QuantizedDotOp : IntentCPU_Op<"quantized_dot"> {
   let hasVerifier = 1;
 }
 
+class IntentCPU_RegionOp<string name> : IntentCPU_Op<name,
+    [RecursiveMemoryEffects]> {
+  let arguments = (ins Variadic<AnyType>:$inputs, I64Attr:$axis,
+      I64Attr:$source_count, I64Attr:$identity_count, I64Attr:$capture_count,
+      I64Attr:$state_count, I64Attr:$output_count,
+      ArrayAttr:$summary_fields, ArrayAttr:$state_fields, DenseI64ArrayAttr:$output_axes,
+      OptionalAttr<I64Attr>:$segment_size);
+  let hasVerifier = 1;
+}
+
+def IntentCPU_RegionFoldOp : IntentCPU_RegionOp<"region_fold"> {
+  let summary = "Ordered source slices and destination-passing summary helpers";
+  let regions = (region SizedRegion<1>:$summarize, SizedRegion<1>:$combine);
+}
+
+def IntentCPU_RegionScanOp : IntentCPU_RegionOp<"region_scan"> {
+  let summary = "Region transitions, incoming state, slice outputs and final state";
+  let regions = (region SizedRegion<1>:$summarize, SizedRegion<1>:$combine,
+      SizedRegion<1>:$apply, SizedRegion<1>:$emit);
+}
+
+def IntentCPU_RegionYieldOp : IntentCPU_Op<"region_yield", [Pure, Terminator]>;
+
 #endif

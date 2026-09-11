@@ -24,6 +24,13 @@ std::string join(ArrayRef<std::string> values, llvm::StringRef separator = ", ")
   return llvm::join(values, separator);
 }
 
+std::string memoryElement(Type type) {
+  if (type.isF32()) return "Float32";
+  if (type.isInteger(1)) return "SIMD[DType.bool, 1]";
+  assert(type.isIndex() || type.isInteger(64));
+  return "Int64";
+}
+
 std::string floatingLiteral(const llvm::APFloat &value) {
   if (!value.isFinite())
     return std::string("(Float32(") + (value.isNaN() ? "0" : value.isNegative() ? "-1" : "1") + ") / Float32(0))";
@@ -215,8 +222,9 @@ private:
 
   LogicalResult allocation(Operation *operation, Value memory, ValueRange dynamicSizes, bool stack) {
     auto type = cast<MemRefType>(memory.getType());
-    if (!type.getElementType().isF32() || (stack && !type.hasStaticShape()))
-      return operation->emitError("Mojo allocation requires f32 and static stack extents");
+    if (stack && !type.hasStaticShape())
+      return operation->emitError("Mojo stack allocation requires static extents");
+    std::string element = memoryElement(type.getElementType());
     std::string value = fresh(memory);
     std::string storage = "storage_" + value;
     Memory descriptor{value, {}, {}};
@@ -233,11 +241,11 @@ private:
     if (stack) {
       int64_t alignment = cast<memref::AllocaOp>(operation).getAlignment().value_or(4);
       line("var " + value + " = unsafe_stack_allocation[" +
-          std::to_string(type.getNumElements()) + ", Float32, alignment=" +
+          std::to_string(type.getNumElements()) + ", " + element + ", alignment=" +
           std::to_string(alignment) + "]()");
     } else {
-      line("var " + storage + " = alloc(Layout[Float32](count=" + stride + "))");
-      line("var " + value + " = " + storage + ".unsafe_ptr()");
+      line("var " + storage + " = alloc(Layout[" + element + "](count=" + stride + "))");
+      line("var " + value + " = " + storage + ".unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()");
       allocations[memory] = storage;
     }
     memories[memory] = std::move(descriptor);
@@ -292,9 +300,15 @@ private:
       memories[op.getResult()] = memories.at(op.getSource());
       names[op.getResult()] = name(op.getSource());
     } else if (auto op = dyn_cast<memref::LoadOp>(operation)) {
-      assign(op.getResult(), pointer(op.getMemref(), op.getIndices()) + ".unsafe_load()");
+      std::string expression = pointer(op.getMemref(), op.getIndices()) + ".unsafe_load()";
+      if (op.getType().isIndex()) expression = "Int(" + expression + ")";
+      if (op.getType().isInteger(1)) expression = "Bool(" + expression + ")";
+      assign(op.getResult(), expression);
     } else if (auto op = dyn_cast<memref::StoreOp>(operation)) {
-      line(pointer(op.getMemref(), op.getIndices()) + ".unsafe_store(" + name(op.getValue()) + ")");
+      std::string value = name(op.getValue());
+      if (op.getValue().getType().isIndex()) value = "Int64(" + value + ")";
+      if (op.getValue().getType().isInteger(1)) value = "SIMD[DType.bool, 1](" + value + ")";
+      line(pointer(op.getMemref(), op.getIndices()) + ".unsafe_store(" + value + ")");
     } else if (auto op = dyn_cast<vector::LoadOp>(operation)) {
       assign(op.getResult(), pointer(op.getBase(), op.getIndices()) + ".unsafe_load[width=" + std::to_string(op.getVectorType().getNumElements()) + "]()");
     } else if (auto op = dyn_cast<vector::StoreOp>(operation)) {
@@ -320,24 +334,66 @@ private:
       line("dealloc(" + allocations.at(op.getMemref()) + "^)");
     } else if (auto op = dyn_cast<scf::ForOp>(operation)) {
       return forLoop(op);
+    } else if (auto op = dyn_cast<scf::WhileOp>(operation)) {
+      if (op.getNumResults() || op.getNumOperands()) return op.emitError("Mojo while requires realized destination-passing state");
+      auto saved = scope.size();
+      line("while True:");
+      ++indent;
+      if (failed(block(op.getBefore().front()))) return failure();
+      line("if not " + name(cast<scf::ConditionOp>(op.getBefore().front().getTerminator()).getCondition()) + ":");
+      ++indent; line("break"); --indent;
+      if (failed(block(op.getAfter().front()))) return failure();
+      --indent;
+      scope.resize(saved);
     } else if (auto op = dyn_cast<scf::ParallelOp>(operation)) {
       return parallel(op);
     } else if (auto op = dyn_cast<scf::IfOp>(operation)) {
       return conditional(op);
     } else if (auto op = dyn_cast<arith::CmpIOp>(operation)) {
-      if (op.getPredicate() != arith::CmpIPredicate::eq) return op.emitError("unsupported Mojo integer comparison");
-      assign(op.getResult(), name(op.getLhs()) + " == " + name(op.getRhs()));
+      StringRef token;
+      switch (op.getPredicate()) {
+      case arith::CmpIPredicate::eq: token = " == "; break;
+      case arith::CmpIPredicate::ne: token = " != "; break;
+      case arith::CmpIPredicate::slt: token = " < "; break;
+      case arith::CmpIPredicate::sle: token = " <= "; break;
+      case arith::CmpIPredicate::sgt: token = " > "; break;
+      case arith::CmpIPredicate::sge: token = " >= "; break;
+      default: return op.emitError("unsupported Mojo unsigned comparison");
+      }
+      assign(op.getResult(), name(op.getLhs()) + token.str() + name(op.getRhs()));
+    } else if (auto op = dyn_cast<arith::CmpFOp>(operation)) {
+      StringRef token;
+      switch (op.getPredicate()) {
+      case arith::CmpFPredicate::OEQ: token = " == "; break;
+      case arith::CmpFPredicate::UNE: token = " != "; break;
+      case arith::CmpFPredicate::OLT: token = " < "; break;
+      case arith::CmpFPredicate::OLE: token = " <= "; break;
+      case arith::CmpFPredicate::OGT: token = " > "; break;
+      case arith::CmpFPredicate::OGE: token = " >= "; break;
+      default: return op.emitError("unsupported Mojo floating comparison");
+      }
+      assign(op.getResult(), name(op.getLhs()) + token.str() + name(op.getRhs()));
+    } else if (auto op = dyn_cast<arith::SelectOp>(operation)) {
+      assign(op.getResult(), isa<VectorType>(op.getCondition().getType())
+          ? name(op.getCondition()) + ".select(" + name(op.getTrueValue()) + ", " + name(op.getFalseValue()) + ")"
+          : name(op.getTrueValue()) + " if " + name(op.getCondition()) + " else " + name(op.getFalseValue()));
     } else if (auto op = dyn_cast<math::FmaOp>(operation)) {
       assign(op.getResult(), "fma(" + name(op.getA()) + ", " + name(op.getB()) + ", " + name(op.getC()) + ")");
     } else if (auto op = dyn_cast<math::SqrtOp>(operation)) {
       assign(op.getResult(), "sqrt(" + name(op.getOperand()) + ")");
     } else if (auto op = dyn_cast<math::ExpOp>(operation)) {
       assign(op.getResult(), "exp(" + name(op.getOperand()) + ")");
-    } else if (auto op = dyn_cast<arith::MaxNumFOp>(operation)) {
-      auto vector = dyn_cast<VectorType>(op.getResult().getType());
+    } else if (auto op = dyn_cast<math::Exp2Op>(operation)) {
+      assign(op.getResult(), "exp2(" + name(op.getOperand()) + ")");
+    } else if (isa<arith::MaxNumFOp, arith::MaximumFOp, arith::MinimumFOp>(operation)) {
+      auto vector = dyn_cast<VectorType>(operation->getResult(0).getType());
       std::string type = vector ? "SIMD[DType.float32, " + std::to_string(vector.getNumElements()) + "]" : "Float32";
-      assign(op.getResult(), "llvm_intrinsic[\"llvm.maximumnum\", " + type + "](" +
-          name(op.getLhs()) + ", " + name(op.getRhs()) + ")");
+      StringRef intrinsic = isa<arith::MaxNumFOp>(operation) ? "llvm.maximumnum" :
+          isa<arith::MaximumFOp>(operation) ? "llvm.maximum" : "llvm.minimum";
+      assign(operation->getResult(0), "llvm_intrinsic[\"" + intrinsic.str() + "\", " + type + "](" +
+          name(operation->getOperand(0)) + ", " + name(operation->getOperand(1)) + ")");
+    } else if (auto op = dyn_cast<arith::SIToFPOp>(operation)) {
+      assign(op.getResult(), "Float32(" + name(op.getIn()) + ")");
     } else if (auto op = dyn_cast<arith::NegFOp>(operation)) {
       assign(op.getResult(), "-" + name(op.getOperand()));
     } else if (isa<arith::IndexCastOp>(operation)) {
@@ -350,6 +406,9 @@ private:
       else if (isa<arith::DivFOp>(operation)) token = "/";
       else if (isa<arith::DivSIOp, arith::FloorDivSIOp>(operation)) token = "//";
       else if (isa<arith::RemSIOp>(operation)) token = "%";
+      else if (isa<arith::AndIOp>(operation)) token = "&";
+      else if (isa<arith::OrIOp>(operation)) token = "|";
+      else if (isa<arith::XOrIOp>(operation)) token = "^";
       if (!token.empty()) {
         assign(operation->getResult(0), "(" + name(operation->getOperand(0)) + ") " + token + " (" + name(operation->getOperand(1)) + ")");
       } else if (isa<arith::MinSIOp, arith::MaxSIOp>(operation)) {
@@ -379,7 +438,7 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string
             "from std.memory import Layout, alloc, dealloc, unsafe_stack_allocation\n"
             "from std.sys import prefetch, llvm_intrinsic\n"
             "from std.sys.intrinsics import PrefetchOptions\n"
-            "from std.math import fma, sqrt, exp, min, max\n"
+            "from std.math import fma, sqrt, exp, exp2, min, max\n"
             "from std.runtime import initialize_runtime\n"
             "from max.algorithm import parallelize\n\n";
   Serializer serializer(output);
@@ -409,7 +468,7 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string
     candidates.push_back(llvm::json::Object{
         {"entry", function.getName().str()},
         {"values", llvm::json::Array{configuration.getTaskGrain(),
-            configuration.getTileM(), configuration.getTileN(), configuration.getTileK()}},
+            configuration.getTileM(), configuration.getTileN(), configuration.getTileK(), configuration.getRegionSize()}},
         {"implementations", std::move(implementations)}});
   }
   interface["candidates"] = std::move(candidates);

@@ -21,23 +21,25 @@ bool supportedType(Type type) {
     return vector.getRank() == 1 && vector.getElementType().isF32() &&
         width > 0 && (width & (width - 1)) == 0;
   }
-  if (auto memory = dyn_cast<MemRefType>(type)) return memory.getElementType().isF32();
+  if (auto memory = dyn_cast<MemRefType>(type)) return supportedType(memory.getElementType());
   return type.isIndex() || type.isF32() || type.isInteger(64) || type.isInteger(1);
 }
 
 LogicalResult checkSurface(ModuleOp module) {
   bool invalid = false;
   module.walk([&](Operation *operation) {
-    if (isa<ModuleOp, func::FuncOp, func::ReturnOp, scf::YieldOp, scf::ReduceOp>(operation)) return;
+    if (isa<ModuleOp, func::FuncOp, func::ReturnOp, scf::YieldOp, scf::ConditionOp, scf::ReduceOp>(operation)) return;
     bool supported = isa<arith::ConstantOp, arith::AddFOp, arith::AddIOp,
         arith::SubFOp, arith::SubIOp, arith::MulFOp, arith::MulIOp,
         arith::DivFOp, arith::DivSIOp, arith::FloorDivSIOp, arith::RemSIOp,
         arith::MinSIOp, arith::MaxSIOp, arith::CeilDivSIOp, arith::NegFOp,
-        arith::IndexCastOp, arith::MaxNumFOp, math::FmaOp, math::SqrtOp, math::ExpOp, memref::DimOp,
+        arith::IndexCastOp, arith::SIToFPOp, arith::MaxNumFOp, arith::MaximumFOp, arith::MinimumFOp,
+        arith::CmpFOp, arith::SelectOp, arith::AndIOp, arith::OrIOp, arith::XOrIOp,
+        math::FmaOp, math::SqrtOp, math::ExpOp, math::Exp2Op, memref::DimOp,
         memref::SubViewOp, memref::CastOp, memref::LoadOp, memref::StoreOp,
         memref::AllocaOp, memref::AllocOp, memref::DeallocOp, memref::PrefetchOp,
         vector::LoadOp, vector::StoreOp, vector::BroadcastOp, vector::ShuffleOp,
-        vector::ExtractElementOp, arith::CmpIOp, scf::IfOp, scf::ForOp, scf::ParallelOp>(operation);
+        vector::ExtractElementOp, arith::CmpIOp, scf::IfOp, scf::ForOp, scf::WhileOp, scf::ParallelOp>(operation);
     supported &= llvm::all_of(operation->getOperandTypes(), supportedType);
     supported &= llvm::all_of(operation->getResultTypes(), supportedType);
     if (auto constant = dyn_cast<arith::ConstantOp>(operation))
@@ -48,10 +50,10 @@ LogicalResult checkSurface(ModuleOp module) {
       supported &= stack.getType().hasStaticShape();
     if (auto prefetch = dyn_cast<memref::PrefetchOp>(operation))
       supported &= !prefetch.getIsWrite() && prefetch.getLocalityHint() == 3 && prefetch.getIsDataCache();
-    if (auto compare = dyn_cast<arith::CmpIOp>(operation))
-      supported &= compare.getPredicate() == arith::CmpIPredicate::eq;
     if (auto conditional = dyn_cast<scf::IfOp>(operation))
       supported &= conditional.getNumResults() == 0;
+    if (auto loop = dyn_cast<scf::WhileOp>(operation))
+      supported &= loop.getNumResults() == 0 && loop.getNumOperands() == 0;
     if (auto parallel = dyn_cast<scf::ParallelOp>(operation))
       supported &= parallel.getNumResults() == 0 && parallel.getNumLoops() == 1 &&
           matchPattern(parallel.getLowerBound()[0], m_Zero()) &&

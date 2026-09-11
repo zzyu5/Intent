@@ -7,8 +7,9 @@
 
 namespace intent::cpu {
 
-// Coordinate equivalence in the current shaped program, not extent equality.
-// Construct again after a rewrite. Positional maps remain the IR authority.
+// Storage-axis identities through aliasing views and task captures. Computation
+// correspondences remain per-use indexing maps, not global equivalence classes.
+// Construct again after a rewrite; extent equality is a separate ABI fact.
 class AxisRelations {
 public:
   explicit AxisRelations(mlir::func::FuncOp function);

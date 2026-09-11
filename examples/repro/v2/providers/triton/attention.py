@@ -71,7 +71,7 @@ def flash_attention_forward(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=2e-2, rtol=2e-2),
         cuda_graph=True,
-        status="source_abi_gap",
+        note="同算法；CUDA graph 设备执行计时；source 额外写 f32 M 辅助结果。",
     )
 
 

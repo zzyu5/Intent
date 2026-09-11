@@ -1,9 +1,13 @@
 add_mlir_library(MLIRIntentCPUTransforms
   FuseStructuredComputations.cpp
+  FoldUniformComputations.cpp
+  ReusePreparedInputs.cpp
   MaterializeStructuredComputations.cpp
   FuseIntermediateBuffers.cpp
   FuseReductionTraversals.cpp
   BlockContractions.cpp
+  BlockStructuredComputations.cpp
+  RealizeRegions.cpp
   VectorizeLoops.cpp
   PartitionTasks.cpp
   Implementation.cpp
@@ -11,6 +15,7 @@ add_mlir_library(MLIRIntentCPUTransforms
 
   LINK_LIBS PUBLIC
   MLIRIntentCPUAnalysis
+  MLIRIntentAnalysis
   MLIRIntentCPUDialect
   MLIRArithDialect
   MLIRFuncDialect

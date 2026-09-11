@@ -153,6 +153,8 @@ TILELANG = (
 
 
 MOJO = (
+    Entry("causal_attention_f32", "B8-S128-D32-f32-8cores", "causal_attention_f32", ("streaming/attention_f32.py:causal_attention_f32",), "source/mojo/intentdsl/attention/causal/causal_runtime.py"),
+    Entry("causal_linear_attention_f32", "B8-S128-D32-f32-8cores", "causal_linear_attention_f32", ("streaming/attention_f32.py:causal_linear_attention_f32",), "source/mojo/intentdsl/attention/linear/linear_runtime.py"),
     Entry("batched_row_affine", "17x257x4093-f32-8cores", "batched_row_affine", ("pointwise/batched_affine.py:batched_row_affine",), "source/mojo/modular/pointwise/batched_affine/batched_affine_runtime.py"),
     Entry("weighted_rms_norm", "8192x4096-f32-8cores", "weighted_rms_norm", ("normalization/rms_norm.py:weighted_rms_norm",), "source/mojo/modular/normalization/rms_norm/rms_norm_runtime.py"),
     Entry("dense_gemm_f32", "M1024-N1024-K1024-f32-8cores", "gemm_f32", ("contraction/gemm.py:gemm_f32",), "source/mojo/modular/contraction/gemm/gemm_runtime.py"),
@@ -162,6 +164,8 @@ MOJO = (
 
 
 WEFT = (
+    Entry("causal_attention_f32", "B8-S128-D32-f32-1core", "causal_attention_f32", ("streaming/attention_f32.py:causal_attention_f32",), "source/weft/intentdsl/attention/attention_runtime.py"),
+    Entry("causal_linear_attention_f32", "B8-S128-D32-f32-1core", "causal_linear_attention_f32", ("streaming/attention_f32.py:causal_linear_attention_f32",), "source/weft/intentdsl/attention/attention_runtime.py"),
     Entry("q4_k_projection", "N4096-K4096-Q4_K-f32-1core", "quantized_projection",
           ("quantization/quantized_projection.py:quantized_projection",),
           "source/weft/tianchenrv/contraction/q4_k_projection/q4_k_projection_runtime.py"),

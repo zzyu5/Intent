@@ -3,6 +3,7 @@
 #include "../../../Dialect/CPU/Transforms/Utilities.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 
 using namespace mlir;
 namespace intent::weft_provider {
@@ -12,36 +13,58 @@ namespace {
 LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
     const ContractionTile &tile, ConfigurationAttr, ImplementationAttr binding) {
   Location loc = operation.getLoc();
+  auto rows = getConstantIntValue(tile.mCount), columns = getConstantIntValue(tile.nCount);
+  if (!rows || !columns)
+    return operation.emitError("selected Weft contraction requires statically bounded parallel tile extents");
   auto view = [&](Value source, Value m, Value n, OpFoldResult rows, OpFoldResult columns) -> Value {
     return b.create<memref::SubViewOp>(loc, source,
         ArrayRef<OpFoldResult>{m, n}, ArrayRef<OpFoldResult>{rows, columns},
         ArrayRef<OpFoldResult>{b.getIndexAttr(1), b.getIndexAttr(1)});
   };
-  loop(b, loc, tile.mBegin, add(b, loc, tile.mBegin, tile.mCount), 1, [&](Value m) {
-    loop(b, loc, tile.nBegin, add(b, loc, tile.nBegin, tile.nCount), 1, [&](Value n) {
-      Value lhs = view(tile.lhs, m, tile.kBegin, b.getIndexAttr(1), tile.depth);
-      Value rhs = view(tile.rhs, tile.kBegin, n, tile.depth, b.getIndexAttr(1));
-      Value out = view(tile.output, m, n, b.getIndexAttr(1), b.getIndexAttr(1));
-      auto partial = b.create<memref::AllocaOp>(loc, MemRefType::get({1, 1}, b.getF32Type()));
-      b.create<linalg::FillOp>(loc, ValueRange{tile.initial}, ValueRange{partial});
-      auto term = b.create<linalg::GenericOp>(loc, ValueRange{lhs, rhs}, ValueRange{partial},
-          operation.getIndexingMapsArray(), operation.getIteratorTypesArray(),
-          [](OpBuilder &nested, Location loc, ValueRange args) {
-            nested.create<linalg::YieldOp>(loc, nested.create<math::FmaOp>(loc, args[0], args[1], args[2]).getResult());
-          });
-      term->setAttr("intent_cpu.implementation", binding);
-      SmallVector<Value> inputs{partial};
-      if (!tile.first) inputs.insert(inputs.begin(), out);
-      b.create<linalg::GenericOp>(loc, inputs, ValueRange{out},
-          SmallVector<AffineMap>(inputs.size() + 1, b.getMultiDimIdentityMap(2)),
-          SmallVector<utils::IteratorType>(2, utils::IteratorType::parallel),
-          [&](OpBuilder &nested, Location loc, ValueRange args) {
-            Value result = args[0];
-            if (!tile.first) result = nested.create<arith::AddFOp>(loc, result, args[1]);
-            nested.create<linalg::YieldOp>(loc, result);
-          });
+  auto form = [&](Value m, Value n, int64_t rows, int64_t columns) {
+    Value lhs = view(tile.lhs, m, tile.kBegin, b.getIndexAttr(rows), tile.depth);
+    Value rhs = view(tile.rhs, tile.kBegin, n, tile.depth, b.getIndexAttr(columns));
+    Value out = view(tile.output, m, n, b.getIndexAttr(rows), b.getIndexAttr(columns));
+    auto partial = b.create<memref::AllocaOp>(loc, MemRefType::get({rows, columns}, b.getF32Type()));
+    b.create<linalg::FillOp>(loc, ValueRange{tile.initial}, ValueRange{partial});
+    auto term = b.create<linalg::GenericOp>(loc, ValueRange{lhs, rhs}, ValueRange{partial},
+        operation.getIndexingMapsArray(), operation.getIteratorTypesArray(),
+        [](OpBuilder &nested, Location loc, ValueRange args) {
+          nested.create<linalg::YieldOp>(loc, nested.create<math::FmaOp>(loc, args[0], args[1], args[2]).getResult());
+        });
+    term->setAttr("intent_cpu.implementation", binding);
+    SmallVector<Value> inputs{partial};
+    if (!tile.first) inputs.insert(inputs.begin(), out);
+    b.create<linalg::GenericOp>(loc, inputs, ValueRange{out},
+        SmallVector<AffineMap>(inputs.size() + 1, b.getMultiDimIdentityMap(2)),
+        SmallVector<utils::IteratorType>(2, utils::IteratorType::parallel),
+        [&](OpBuilder &nested, Location loc, ValueRange args) {
+          Value result = args[0];
+          if (!tile.first) result = nested.create<arith::AddFOp>(loc, result, args[1]);
+          nested.create<linalg::YieldOp>(loc, result);
+        });
+  };
+  // The current Weft RVV stream form requires a non-singleton reduction
+  // carrier. Keep the scalar reduction tail local; full K blocks remain 2D.
+  if (getConstantIntValue(tile.depth) == 1) {
+    loop(b, loc, tile.mBegin, add(b, loc, tile.mBegin, tile.mCount), 1, [&](Value m) {
+      loop(b, loc, tile.nBegin, add(b, loc, tile.nBegin, tile.nCount), 1,
+          [&](Value n) { form(m, n, 1, 1); });
     });
-  });
+  } else {
+    int64_t panel = implementationParameter(binding, "panel");
+    auto panels = [&](Value begin, int64_t extent,
+                      const std::function<void(Value, int64_t)> &body) {
+      int64_t full = extent / panel * panel;
+      if (full)
+        loop(b, loc, begin, add(b, loc, begin, index(b, loc, full)), panel,
+            [&](Value offset) { body(offset, panel); });
+      if (extent != full) body(add(b, loc, begin, index(b, loc, full)), extent - full);
+    };
+    panels(tile.mBegin, *rows, [&](Value m, int64_t rows) {
+      panels(tile.nBegin, *columns, [&](Value n, int64_t columns) { form(m, n, rows, columns); });
+    });
+  }
   return success();
 }
 
@@ -50,9 +73,11 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
 cpu::ImplementationRegistry implementations() {
   ImplementationRegistry result;
   result.profile = [](func::FuncOp function) -> StringRef {
-    bool quantize = false, contraction = false;
+    bool quantize = false, contraction = false, region = false;
     function.walk([&](cpu::QuantizeOp) { quantize = true; });
     function.walk([&](linalg::GenericOp op) { contraction |= isMatrixContraction(op); });
+    function.walk([&](Operation *op) { region |= isa<cpu::RegionFoldOp, cpu::RegionScanOp>(op); });
+    if (region) return contraction ? "weft.region_contract_f32" : "weft.region_structured";
     return quantize ? "weft.q8_k" : contraction ? "weft.contract_f32" : "weft.structured";
   };
   auto noParameters = [](Builder &b, const Configuration &) { return b.getDictionaryAttr({}); };
@@ -79,11 +104,20 @@ cpu::ImplementationRegistry implementations() {
   result.add({"weft.contract_f32", [](Operation *op) {
       auto generic = dyn_cast<linalg::GenericOp>(op);
       return generic && isMatrixContraction(generic);
-    }, legal, noParameters, formTile, {}});
+    }, legal, [](Builder &b, const Configuration &config) {
+      // A 4x4 reduction-lane stream needs 16 accumulator groups plus its
+      // stationary input panel and one streamed input, within RVV's 32 groups.
+      return b.getDictionaryAttr({b.getNamedAttr("panel", b.getI64IntegerAttr(
+          std::min<int64_t>({4, config.tileM, config.tileN})))});
+    }, formTile, {}, {true, true, true}});
   result.add({"weft.structured_f32", [](Operation *op) {
       if (auto generic = dyn_cast<linalg::GenericOp>(op)) return !isMatrixContraction(generic);
       return isa<cpu::ReduceOp>(op);
-    }, legal, noParameters, {}, {}});
+    }, legal, [](Builder &b, const Configuration &config) {
+      return b.getDictionaryAttr({b.getNamedAttr("panel", b.getI64IntegerAttr(std::min<int64_t>(4, config.tileN)))});
+    }, {}, {}, {}, [](ImplementationAttr binding) {
+      return implementationParameter(binding, "panel");
+    }});
   return result;
 }
 

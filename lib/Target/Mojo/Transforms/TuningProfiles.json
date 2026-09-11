@@ -1,19 +1,27 @@
 {
   "cpu": {
+    "mojo.region_contract_f32": [
+      {"shared": [1, 64, 64, 64, 64], "local": {"vector_width": 8, "micro_m": 4, "micro_n": 2, "register_replicas": 1, "reduction_replicas": 1}},
+      {"shared": [1, 64, 128, 128, 128], "local": {"vector_width": 16, "micro_m": 4, "micro_n": 2, "register_replicas": 1, "reduction_replicas": 1}}
+    ],
+    "mojo.region_vector_f32": [
+      {"shared": [1, 1, 1, 1, 64], "local": {"vector_width": 8, "register_replicas": 1, "reduction_replicas": 4}},
+      {"shared": [1, 1, 1, 1, 128], "local": {"vector_width": 16, "register_replicas": 1, "reduction_replicas": 4}}
+    ],
     "mojo.vector_f32": [
-      {"shared": [8, 1, 1, 1], "local": {"vector_width": 8, "register_replicas": 1, "reduction_replicas": 4}},
-      {"shared": [8, 1, 1, 1], "local": {"vector_width": 16, "register_replicas": 1, "reduction_replicas": 4}},
-      {"shared": [8, 1, 1, 1], "local": {"vector_width": 8, "register_replicas": 4, "reduction_replicas": 4}},
-      {"shared": [8, 1, 1, 1], "local": {"vector_width": 16, "register_replicas": 4, "reduction_replicas": 4}},
-      {"shared": [8, 1, 1, 1], "local": {"vector_width": 16, "register_replicas": 8, "reduction_replicas": 8}},
-      {"shared": [8, 1, 1, 1], "local": {"vector_width": 16, "register_replicas": 16, "reduction_replicas": 16}}
+      {"shared": [8, 1, 1, 1, 1], "local": {"vector_width": 8, "register_replicas": 1, "reduction_replicas": 4}},
+      {"shared": [8, 1, 1, 1, 1], "local": {"vector_width": 16, "register_replicas": 1, "reduction_replicas": 4}},
+      {"shared": [8, 1, 1, 1, 1], "local": {"vector_width": 8, "register_replicas": 4, "reduction_replicas": 4}},
+      {"shared": [8, 1, 1, 1, 1], "local": {"vector_width": 16, "register_replicas": 4, "reduction_replicas": 4}},
+      {"shared": [8, 1, 1, 1, 1], "local": {"vector_width": 16, "register_replicas": 8, "reduction_replicas": 8}},
+      {"shared": [8, 1, 1, 1, 1], "local": {"vector_width": 16, "register_replicas": 16, "reduction_replicas": 16}}
     ],
     "mojo.register_f32": [
-      {"shared": [1, 256, 192, 128], "local": {"vector_width": 16, "micro_m": 8, "micro_n": 3, "register_replicas": 1, "reduction_replicas": 1}},
-      {"shared": [1, 128, 256, 1024], "local": {"vector_width": 16, "micro_m": 8, "micro_n": 3, "register_replicas": 1, "reduction_replicas": 1}},
-      {"shared": [1, 512, 256, 1024], "local": {"vector_width": 16, "micro_m": 6, "micro_n": 4, "register_replicas": 1, "reduction_replicas": 1}},
-      {"shared": [1, 256, 256, 1024], "local": {"vector_width": 16, "micro_m": 6, "micro_n": 4, "register_replicas": 1, "reduction_replicas": 1}},
-      {"shared": [1, 128, 128, 128], "local": {"vector_width": 8, "micro_m": 4, "micro_n": 2, "register_replicas": 1, "reduction_replicas": 1}}
+      {"shared": [1, 256, 192, 128, 1], "local": {"vector_width": 16, "micro_m": 8, "micro_n": 3, "register_replicas": 1, "reduction_replicas": 1}},
+      {"shared": [1, 128, 256, 1024, 1], "local": {"vector_width": 16, "micro_m": 8, "micro_n": 3, "register_replicas": 1, "reduction_replicas": 1}},
+      {"shared": [1, 512, 256, 1024, 1], "local": {"vector_width": 16, "micro_m": 6, "micro_n": 4, "register_replicas": 1, "reduction_replicas": 1}},
+      {"shared": [1, 256, 256, 1024, 1], "local": {"vector_width": 16, "micro_m": 6, "micro_n": 4, "register_replicas": 1, "reduction_replicas": 1}},
+      {"shared": [1, 128, 128, 128, 1], "local": {"vector_width": 8, "micro_m": 4, "micro_n": 2, "register_replicas": 1, "reduction_replicas": 1}}
     ]
   }
 }

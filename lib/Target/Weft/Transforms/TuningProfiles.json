@@ -1,10 +1,18 @@
 {
   "cpu": {
-    "weft.q8_k": [
-      {"shared": [8, 1, 1, 1], "local": {"chunk": 32}},
-      {"shared": [8, 1, 1, 1], "local": {"chunk": 64}}
+    "weft.region_contract_f32": [
+      {"shared": [1, 16, 16, 16, 16], "local": {}},
+      {"shared": [1, 16, 16, 32, 32], "local": {}}
     ],
-    "weft.contract_f32": [{"shared": [1, 32, 32, 128], "local": {}}],
-    "weft.structured": [{"shared": [8, 1, 1, 1], "local": {}}]
+    "weft.region_structured": [
+      {"shared": [1, 1, 1, 1, 64], "local": {}},
+      {"shared": [1, 1, 1, 1, 128], "local": {}}
+    ],
+    "weft.q8_k": [
+      {"shared": [8, 1, 1, 1, 1], "local": {"chunk": 32}},
+      {"shared": [8, 1, 1, 1, 1], "local": {"chunk": 64}}
+    ],
+    "weft.contract_f32": [{"shared": [1, 32, 32, 128, 1], "local": {}}],
+    "weft.structured": [{"shared": [8, 1, 1, 1, 1], "local": {}}]
   }
 }
