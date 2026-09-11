@@ -131,6 +131,13 @@ class In(_ViewAnnotation):
 
 
 class Out(_ViewAnnotation):
+    """Output view with no defined incoming elements.
+
+    Define an element before reading it in a subsequent ordered operation.
+    For example, a full-domain copy may initialize an output before an ordered
+    factorization loop reads and updates it.
+    """
+
     kind = ViewKind.OUT
 
 
