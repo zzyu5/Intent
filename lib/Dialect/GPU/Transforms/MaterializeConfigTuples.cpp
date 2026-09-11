@@ -276,11 +276,13 @@ TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
   case ParameterCategory::Pointwise:
     if (isOnlineMomentOwnership(kernel, parameter))
       return TuningClass::OnlineMoment;
+    // A reduction retains this free-axis footprint across its chunks even
+    // when a contraction produces its input. Keep the smaller row candidates.
+    if (isBlockedReductionFreeAxis(kernel, parameter))
+      return TuningClass::PointwiseReduction;
     if (isContractionOwnership(kernel, parameter))
       return TuningClass::Contraction;
-    return isBlockedReductionFreeAxis(kernel, parameter)
-               ? TuningClass::PointwiseReduction
-               : TuningClass::Pointwise;
+    return TuningClass::Pointwise;
   case ParameterCategory::Coverage:
   case ParameterCategory::Provider:
     return TuningClass::Pointwise;
