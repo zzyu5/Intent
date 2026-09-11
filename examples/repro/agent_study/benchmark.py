@@ -10,13 +10,14 @@ import time
 import traceback
 
 import torch
+from triton.compiler.errors import CompilationError
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_flatten
 
 from repro.v2.measurement import evaluate, NumericalComparisonError, PipelineStageError
 from repro.v2.model import PreparedComparison, PreparedLaunch
 
-from .program import load_program, ProgramContext, TuningBudget, export_seed
+from .program import load_program, ProgramContext, TuningBudget
 from .tasks import catalog, invocation, read_suite, reference, tolerance
 
 
@@ -106,6 +107,8 @@ def run(arguments) -> dict:
                 module = load_program(arguments.program, language=arguments.language)
                 stage = "candidate_build"
                 function = module.build(context)
+                if arguments.language == "intent" and not context.generated:
+                    raise ValueError("Intent submission did not compile any Intent kernels")
             stage = "candidate_input_preparation"
             with arguments.gpu_lock.open("w") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
@@ -128,9 +131,6 @@ def run(arguments) -> dict:
                                             source_timing_error=source_timing_error)
             result.update(status="pass", candidate_ms=measured, reference_ms=anchor,
                           ratio=measured / anchor if anchor is not None else None)
-            if arguments.language == "intent":
-                stage = "source_export"
-                export_seed(arguments.program, context, artifact_directory / "triton_seed")
     except Exception as error:
         # A failed program is a result in the fixed denominator, never a fallback.
         causes = []
@@ -148,6 +148,8 @@ def run(arguments) -> dict:
         elif hasattr(error, "stage"):
             status = "compilation_failure"
             stage = error.stage
+        elif arguments.language == "intent" and any(isinstance(cause, CompilationError) for cause in causes):
+            status, stage = "compilation_failure", "provider_compilation"
         else:
             status = "reference_failure" if stage == "reference_preparation" else "agent_program_error"
         result.update(status=status, failure_stage=stage, error=str(error), traceback=traceback.format_exc())

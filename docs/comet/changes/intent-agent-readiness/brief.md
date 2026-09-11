@@ -46,7 +46,7 @@
 
 # 待解决问题
 
-无待确认的用户决定；provider 实际能力在 Build 中核实，真实不兼容时再报告。
+- [blocking] 首批实现已发现进一步的 shared ownership 设计问题：普通 Cartesian pointwise 的重复 dimension 仍被 value/access schema repair 按维度整体覆盖；同一 kernel 中两个 contraction 会产生多组 M/N 坐标，而当前 mapping refinement 只接受一组。是否扩充当前 Shape，明确统一按轴出现位置维护 value/coordinate/parameter relations，并收束多个 contraction 的执行域与唯一写入覆盖？这不是改算法或放宽 verifier。用户确认前不继续这两项跨模块重构，A4 保持未完成，不提交完成候选。
 
 # 验证预期
 

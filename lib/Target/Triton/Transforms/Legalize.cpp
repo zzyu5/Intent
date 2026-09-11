@@ -11,6 +11,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/IR/IRMapping.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringSet.h"
 
@@ -1551,6 +1552,90 @@ LogicalResult verifyAccess(Operation *operation, Value resource,
   return success();
 }
 
+Type scalarCallbackType(Type type) {
+  if (auto fragment = dyn_cast<gpu::FragmentType>(type))
+    return fragment.getElementType();
+  if (auto record = dyn_cast<gpu::RecordType>(type)) {
+    SmallVector<Attribute> fields;
+    for (Attribute field : record.getFieldTypes())
+      fields.push_back(TypeAttr::get(scalarCallbackType(cast<TypeAttr>(field).getValue())));
+    return gpu::RecordType::get(type.getContext(), record.getFieldNames(),
+                                ArrayAttr::get(type.getContext(), fields), record.getOwner());
+  }
+  return type;
+}
+
+LogicalResult legalizeCollectiveCallbacks(func::FuncOp kernel) {
+  SmallVector<Operation *> collectives;
+  kernel.walk([&](Operation *operation) {
+    if (auto reduce = dyn_cast<gpu::ReduceOp>(operation)) {
+      if (!reduce->hasAttr(reduceFormAttr)) collectives.push_back(operation);
+    } else if (isa<gpu::ScanOp>(operation)) {
+      collectives.push_back(operation);
+    }
+  });
+  for (Operation *operation : collectives) {
+    auto reduce = dyn_cast<gpu::ReduceOp>(operation);
+    auto scan = dyn_cast<gpu::ScanOp>(operation);
+    unsigned count = reduce ? reduce.getSourceCount() : scan.getSourceCount();
+    if ((reduce && (reduce.getAxes().size() != 1 || reduce.getCaptureCount())) ||
+        (scan && (!scan.getInclusive() || scan.getCaptureCount())))
+      return operation->emitOpError("native collective requires one axis and an inclusive, capture-free callback");
+    Region &region = reduce ? reduce.getCombine() : scan.getCombine();
+    Block &body = region.front();
+    for (Operation &nested : body) {
+      for (Value operand : nested.getOperands())
+        if (operand.getParentBlock() != &body)
+          return nested.emitOpError("native collective callback cannot capture enclosing values");
+      if (!isa<arith::ConstantOp, gpu::SplatOp, gpu::BroadcastOp,
+               gpu::UnaryOp, gpu::BinaryOp, gpu::CompareOp, gpu::SelectOp,
+               gpu::CastOp, gpu::BitcastOp, gpu::MakeRecordOp, gpu::ExtractOp,
+               gpu::YieldOp>(nested))
+        return nested.emitOpError("Triton native collective requires an elementwise scalarizable combine");
+      if (auto broadcast = dyn_cast<gpu::BroadcastOp>(nested)) {
+        auto source = dyn_cast<gpu::FragmentType>(broadcast.getValue().getType());
+        if (source) {
+          auto target = broadcast.getResult().getType();
+          auto projection = gpu::queryAxisProjection(source, target);
+          if (source.getShape() != target.getShape() || !projection.isExact() ||
+              llvm::any_of(llvm::enumerate(projection.targetToSource), [](auto pair) {
+                return !pair.value() || *pair.value() != pair.index();
+              }))
+            return broadcast.emitOpError("non-identity fragment broadcast in a collective requires prior lane-wise legalization");
+        }
+      }
+    }
+    OpBuilder builder(operation);
+    OperationState state(operation->getLoc(), reduce ? ReduceOp::getOperationName() : ScanOp::getOperationName());
+    state.addOperands(operation->getOperands());
+    state.addTypes(operation->getResultTypes());
+    state.addAttribute("source_count", builder.getI64IntegerAttr(count));
+    state.addAttribute("axis", builder.getI64IntegerAttr(reduce ? reduce.getAxes().front() : scan.getAxis()));
+    state.addAttribute("reverse", builder.getBoolAttr(scan && scan.getReverse()));
+    if (Attribute origin = operation->getAttr(gpu::originAttr)) state.addAttribute(gpu::originAttr, origin);
+    state.addRegion();
+    Operation *native = builder.create(state);
+    Block *scalarBody = new Block();
+    native->getRegion(0).push_back(scalarBody);
+    IRMapping mapping;
+    for (BlockArgument argument : body.getArguments())
+      mapping.map(argument, scalarBody->addArgument(scalarCallbackType(argument.getType()), argument.getLoc()));
+    builder.setInsertionPointToEnd(scalarBody);
+    for (Operation &nested : body) {
+      if (isa<gpu::SplatOp, gpu::BroadcastOp>(nested)) {
+        mapping.map(nested.getResult(0), mapping.lookup(nested.getOperand(0)));
+        continue;
+      }
+      Operation *cloned = builder.clone(nested, mapping);
+      for (Value result : cloned->getResults())
+        result.setType(scalarCallbackType(result.getType()));
+    }
+    operation->replaceAllUsesWith(native->getResults());
+    operation->erase();
+  }
+  return success();
+}
+
 LogicalResult verifyKernel(func::FuncOp kernel) {
   auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
   if (!space || space.empty() || space.size() > 3)
@@ -1780,17 +1865,15 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
         return WalkResult::interrupt();
       }
     } else if (auto reduce = dyn_cast<gpu::ReduceOp>(operation)) {
-      if (reduce.getAxes().size() != 1 || reduce.getCaptureCount() != 0) {
+      if (reduce.getAxes().size() != 1 || reduce.getCaptureCount() != 0 ||
+          !reduce->hasAttr(reduceFormAttr)) {
         reduce.emitOpError(
-            "Triton reduce requires one physical axis and capture-free helper");
+            "Triton reduce requires a native form or an explicitly scalarized callback");
         return WalkResult::interrupt();
       }
     } else if (auto scan = dyn_cast<gpu::ScanOp>(operation)) {
-      if (!scan.getInclusive() || scan.getCaptureCount() != 0) {
-        scan.emitOpError(
-            "Triton associative_scan requires inclusive capture-free physical form");
-        return WalkResult::interrupt();
-      }
+      scan.emitOpError("Triton associative_scan requires an explicitly scalarized callback");
+      return WalkResult::interrupt();
     } else if (auto contract = dyn_cast<gpu::ScaledContractOp>(operation)) {
       unsigned lhsRank = contract.getLhs().getType().getShape().size();
       unsigned rhsRank = contract.getRhs().getType().getShape().size();
@@ -1825,7 +1908,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
 
     if (isa<TensorDescriptorChoiceOp, TensorDescriptorAllocatorOp,
             TensorDescriptorOp, BlockLoadOp, BlockStoreOp, DescriptorLoadOp,
-            DescriptorStoreOp, SplitOp, gpu::ParameterOp,
+            DescriptorStoreOp, SplitOp, ReduceOp, ScanOp, gpu::ParameterOp,
             gpu::PhysicalExprOp,
             gpu::ProgramIdOp,
             gpu::WorksetCoordinateOp, gpu::DelinearizeOp,
@@ -1956,6 +2039,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   for (gpu::AssumeInBoundsOp assumption : boundsAssumptions)
     assumption.erase();
   if (failed(gpu::eliminateCommonValues(module)) ||
+      failed(legalizeCollectiveCallbacks(kernel)) ||
       failed(verifyTritonProgram(module)))
     return failure();
   kernel->setAttr(legalizedAttr, UnitAttr::get(module.getContext()));

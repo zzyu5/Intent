@@ -4159,8 +4159,27 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       structuredOwnershipCategories.try_emplace(
           dimension, ParameterCategory::Histogram);
   });
+  llvm::SmallDenseSet<uint64_t> nonUniqueContractionDimensions;
+  kernel.walk([&](Operation *operation) {
+    if (!isa<ContractOp, ScaledContractOp, SparseContractOp>(operation))
+      return;
+    llvm::SmallDenseSet<uint64_t> seen;
+    for (const auto &axis : PhysicalProgramAnalysis(kernel).contractFreeAxes(operation).axes) {
+      FailureOr<AxisMapAttr> mapping = queryAxisMap(axis.operand.getType(), axis.operandAxis);
+      if (failed(mapping) || mapping->getDimensionId() <= 0)
+        continue;
+      uint64_t dimension = mapping->getDimensionId();
+      if (!seen.insert(dimension).second)
+        nonUniqueContractionDimensions.insert(dimension);
+    }
+  });
   auto hasPointwiseOwnership = [&](MakeRangeOp range) {
     FailureOr<uint64_t> dimension = ownershipDimension(kernel, range);
+    // Dimension equality proves an extent, not a Cartesian coordinate. Leave
+    // non-unique free-axis occurrences to contraction blocking, which binds
+    // each operand/result position to its own mapping, ranges and validity.
+    if (succeeded(dimension) && nonUniqueContractionDimensions.contains(*dimension))
+      return false;
     PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
                               range.getDerived()};
     bool effectOwned = ownershipSources.contains(source) ||

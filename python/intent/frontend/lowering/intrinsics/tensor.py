@@ -187,7 +187,7 @@ def _record(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         if keyword.arg is None:
             lowerer.error(keyword, "record does not support **field expansion")
         names.append(keyword.arg)
-        values.append(lowerer.materialize(lowerer.lower_expression(keyword.value), keyword.value))
+        values.append(lowerer.read_value(lowerer.lower_expression(keyword.value), keyword.value))
     result_type = RecordType(tuple((name, value.type) for name, value in zip(names, values)))
     operation = lowerer.emit(
         OperationKind.MAKE_RECORD,
@@ -213,7 +213,7 @@ def _cast(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         OperationKind.CAST,
         lowerer.location(node),
         operands=(source,),
-        result_types=(lowerer.value_result_type(dtype, shape),),
+        result_types=(lowerer.value_result_type(dtype, shape, ranked=isinstance(source.type, TensorType)),),
         attributes=attributes,
     )
     return operation.results[0]
@@ -234,7 +234,7 @@ def _bitcast(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         OperationKind.BITCAST,
         lowerer.location(node),
         operands=(source,),
-        result_types=(lowerer.value_result_type(dtype, shape),),
+        result_types=(lowerer.value_result_type(dtype, shape, ranked=isinstance(source.type, TensorType)),),
     )
     return operation.results[0]
 
@@ -267,10 +267,11 @@ def _mask(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         result_shape = broadcast_shape(broadcast_shape(value_shape, fill_shape), predicate_shape)
     except ValueError as error:
         lowerer.error(node, str(error))
-    result_type = lowerer.value_result_type(dtype, result_shape)
-    value = lowerer.broadcast_value(value, result_shape, node)
-    predicate = lowerer.broadcast_value(predicate, result_shape, node)
-    fill = lowerer.broadcast_value(fill, result_shape, node)
+    ranked = any(isinstance(operand.type, TensorType) for operand in (value, predicate, fill))
+    result_type = lowerer.value_result_type(dtype, result_shape, ranked=ranked)
+    value = lowerer.broadcast_value(value, result_shape, node, ranked=ranked)
+    predicate = lowerer.broadcast_value(predicate, result_shape, node, ranked=ranked)
+    fill = lowerer.broadcast_value(fill, result_shape, node, ranked=ranked)
     operation = lowerer.emit(
         OperationKind.MASK,
         lowerer.location(node),
@@ -304,14 +305,15 @@ def _select(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         result_shape = broadcast_shape(condition_shape, value_shape)
     except ValueError as error:
         lowerer.error(node, str(error))
-    condition = lowerer.broadcast_value(condition, result_shape, node)
-    lhs = lowerer.broadcast_value(lhs, result_shape, node)
-    rhs = lowerer.broadcast_value(rhs, result_shape, node)
+    ranked = isinstance(result_type, TensorType) or isinstance(condition.type, TensorType)
+    condition = lowerer.broadcast_value(condition, result_shape, node, ranked=ranked)
+    lhs = lowerer.broadcast_value(lhs, result_shape, node, ranked=ranked)
+    rhs = lowerer.broadcast_value(rhs, result_shape, node, ranked=ranked)
     return lowerer.emit(
         OperationKind.SELECT,
         lowerer.location(node),
         operands=(condition, lhs, rhs),
-        result_types=(lowerer.value_result_type(dtype, result_shape),),
+        result_types=(lowerer.value_result_type(dtype, result_shape, ranked=ranked),),
     ).results[0]
 
 
@@ -374,8 +376,8 @@ def _binary(
     lhs, rhs = lowerer.coerce_pair(lhs_expression, rhs_expression, node)
     result_type = lowerer.broadcast_result_type(lhs.type, rhs.type, node)
     dtype, result_shape = lowerer.dtype_and_shape(result_type, node)
-    lhs = lowerer.broadcast_value(lhs, result_shape, node)
-    rhs = lowerer.broadcast_value(rhs, result_shape, node)
+    lhs = lowerer.broadcast_value(lhs, result_shape, node, ranked=isinstance(result_type, TensorType))
+    rhs = lowerer.broadcast_value(rhs, result_shape, node, ranked=isinstance(result_type, TensorType))
     operation = lowerer.emit(
         OperationKind.BINARY,
         lowerer.location(node),

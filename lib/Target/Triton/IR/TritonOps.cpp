@@ -1,6 +1,7 @@
 #include "Intent/Target/Triton/IR/TritonOps.h"
 
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/TypeUtilities.h"
@@ -15,6 +16,59 @@ using namespace mlir;
 
 namespace intent::triton {
 namespace {
+
+LogicalResult verifyElementwiseCollective(Operation *owner, ValueRange inputs,
+                                         ResultRange results, Region &combine,
+                                         unsigned count, int64_t axis,
+                                         bool scan) {
+  if (!count || inputs.size() != 2 * count || results.size() != count ||
+      !llvm::hasSingleElement(combine))
+    return owner->emitOpError("requires paired sources/identities and one scalar combine block");
+  auto first = dyn_cast<gpu::FragmentType>(inputs.front().getType());
+  if (!first || axis < 0 || axis >= static_cast<int64_t>(first.getShape().size()))
+    return owner->emitOpError("collective axis is outside its source fragment");
+  Block &block = combine.front();
+  auto yield = dyn_cast<gpu::YieldOp>(block.getTerminator());
+  if (block.getNumArguments() != 2 * count || !yield || yield.getValues().size() != count)
+    return owner->emitOpError("scalar combine arity disagrees with sources");
+  for (unsigned i = 0; i < count; ++i) {
+    auto source = dyn_cast<gpu::FragmentType>(inputs[i].getType());
+    if (!source || source.getShape() != first.getShape() ||
+        inputs[count + i].getType() != results[i].getType())
+      return owner->emitOpError("native collective requires equal source shapes and exact identity/result types");
+    Type element = source.getElementType();
+    if (block.getArgument(i).getType() != element ||
+        block.getArgument(count + i).getType() != element ||
+        yield.getValues()[i].getType() != element)
+      return owner->emitOpError("callback arguments and yields must be source element types");
+    SmallVector<Attribute> shape, mappings;
+    for (auto [position, extent] : llvm::enumerate(source.getShape())) {
+      if (!scan && position == static_cast<unsigned>(axis))
+        continue;
+      shape.push_back(extent);
+      auto mapping = cast<gpu::AxisMapAttr>(source.getAxisMaps()[position]);
+      mappings.push_back(gpu::AxisMapAttr::get(owner->getContext(),
+          mapping.getSourceId(), mapping.getSourceAxis(), mapping.getDimensionId(),
+          mappings.size(), mapping.getDerived()));
+    }
+    Type expected = shape.empty() ? element : Type(gpu::FragmentType::get(
+        owner->getContext(), element, ArrayAttr::get(owner->getContext(), shape),
+        ArrayAttr::get(owner->getContext(), mappings), source.getValidity(), source.getOwner()));
+    if (results[i].getType() != expected)
+      return owner->emitOpError("collective result must preserve its source free-axis relation");
+  }
+  for (Operation &operation : block) {
+    if (operation.getNumRegions())
+      return owner->emitOpError("native callback must be a closed elementwise block");
+    for (Value operand : operation.getOperands())
+      if (operand.getParentBlock() != &block)
+        return owner->emitOpError("native callback cannot capture enclosing values");
+    for (Value result : operation.getResults())
+      if (isa<gpu::FragmentType>(result.getType()))
+        return owner->emitOpError("native callback still contains a fragment value");
+  }
+  return success();
+}
 
 LogicalResult verifyBlockAccess(Operation *owner, Value viewValue,
                                 gpu::FragmentType fragment,
@@ -198,6 +252,18 @@ bool hasFlattenableDescriptorLayout(func::FuncOp kernel, gpu::ViewType view) {
 }
 
 } // namespace
+
+LogicalResult ReduceOp::verify() {
+  if (getReverse())
+    return emitOpError("native reduction does not reverse logical order");
+  return verifyElementwiseCollective(getOperation(), getInputs(), getResults(),
+                                    getCombine(), getSourceCount(), getAxis(), false);
+}
+
+LogicalResult ScanOp::verify() {
+  return verifyElementwiseCollective(getOperation(), getInputs(), getResults(),
+                                    getCombine(), getSourceCount(), getAxis(), true);
+}
 
 LogicalResult TensorDescriptorChoiceOp::verify() {
   auto kernel = (*this)->getParentOfType<func::FuncOp>();

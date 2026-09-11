@@ -1292,6 +1292,26 @@ Value broadcast(OpBuilder &builder, Location location, FragmentType result,
   return builder.create<BroadcastOp>(location, result, value);
 }
 
+Value broadcastAxis(OpBuilder &builder, Location location, FragmentType result,
+                    Value value, unsigned targetAxis) {
+  auto source = cast<FragmentType>(value.getType());
+  assert(source.getShape().size() == 1 && targetAxis < result.getShape().size());
+  SmallVector<Attribute> shape, groups;
+  for (unsigned axis = 0; axis < result.getShape().size(); ++axis) {
+    shape.push_back(axis == targetAxis ? source.getShape()[0] :
+                    expression(builder.getContext(), PhysicalExprKind::Constant, 1));
+    SmallVector<int64_t> sourceAxes;
+    if (axis == targetAxis) sourceAxes.push_back(0);
+    groups.push_back(ReshapeGroupAttr::get(builder.getContext(),
+        builder.getDenseI64ArrayAttr(sourceAxes),
+        builder.getDenseI64ArrayAttr({static_cast<int64_t>(axis)})));
+  }
+  auto expanded = FragmentType::get(builder.getContext(), source.getElementType(),
+      builder.getArrayAttr(shape), result.getAxisMaps(), source.getValidity(), source.getOwner());
+  Value reshaped = builder.create<ReshapeOp>(location, expanded, value, builder.getArrayAttr(groups));
+  return builder.create<BroadcastOp>(location, result, reshaped);
+}
+
 Value rangeBoundsValidity(OpBuilder &builder, Location location,
                           FragmentType indexType,
                           FragmentType predicateType, Value coordinate,
@@ -3346,16 +3366,16 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
               nested, nestedLocation, reductionIndexType,
               reductionPredicateType, reductions, reductionStop);
           Value lhsRows =
-              broadcast(nested, nestedLocation, lhsPredicateType, rowValid);
-          Value lhsReductions = broadcast(nested, nestedLocation,
-                                          lhsPredicateType, reductionValid);
+              broadcastAxis(nested, nestedLocation, lhsPredicateType, rowValid, 0);
+          Value lhsReductions = broadcastAxis(nested, nestedLocation,
+                                          lhsPredicateType, reductionValid, 1);
           Value lhsValid = binary(nested, nestedLocation, lhsPredicateType,
                                   lhsRows, lhsReductions,
                                   BinaryOperator::LogicalAnd);
-          Value rhsReductions = broadcast(nested, nestedLocation,
-                                          rhsPredicateType, reductionValid);
+          Value rhsReductions = broadcastAxis(nested, nestedLocation,
+                                          rhsPredicateType, reductionValid, 0);
           Value rhsColumns =
-              broadcast(nested, nestedLocation, rhsPredicateType, columnValid);
+              broadcastAxis(nested, nestedLocation, rhsPredicateType, columnValid, 1);
           Value rhsValid = binary(nested, nestedLocation, rhsPredicateType,
                                   rhsReductions, rhsColumns,
                                   BinaryOperator::LogicalAnd);
@@ -3426,9 +3446,9 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
     }
 
     Value outputRows =
-        broadcast(rowBuilder, location, outputPredicateType, rowValid);
+        broadcastAxis(rowBuilder, location, outputPredicateType, rowValid, 0);
     Value outputColumns =
-        broadcast(rowBuilder, location, outputPredicateType, columnValid);
+        broadcastAxis(rowBuilder, location, outputPredicateType, columnValid, 1);
     Value outputValid = binary(rowBuilder, location, outputPredicateType,
                                outputRows, outputColumns,
                                BinaryOperator::LogicalAnd);
@@ -3459,11 +3479,28 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
           storeRow = directRankOneAccessPosition(
               path.store.getCoordinates(), path.store.getValue().getType(), 0);
       }
-      if ((!indirectRow && failed(storeRow)) || failed(storeColumn))
+      if (failed(storeColumn))
         return path.store.emitOpError(
             "blocked contract output lost its logical source coordinates");
-      if (!indirectRow)
+      SmallVector<std::pair<MakeRangeOp, Value>> storeTailRanges(outputTailRanges);
+      if (!indirectRow) {
+        if (failed(storeRow))
+          return path.store.emitOpError(
+              "blocked contract output lost its logical source coordinates");
+        for (auto [position, authority, end] : {
+                 std::tuple<unsigned, MakeRangeOp, Value>{*storeRow, rowRange, rowStop},
+                 std::tuple<unsigned, MakeRangeOp, Value>{*storeColumn, columnRange, columnStop}}) {
+          MakeRangeOp stored = sourceRange(path.store.getCoordinates()[position]);
+          if (!stored)
+            continue;
+          FailureOr<Value> storedEnd = resolveLogicalRangeEnd(kernel, stored);
+          if (succeeded(storedEnd) && samePhysicalScalarExpression(*storedEnd, end) &&
+              samePhysicalScalarExpression(stored.getLogicalStart(), authority.getLogicalStart()) &&
+              samePhysicalScalarExpression(stored.getStep(), authority.getStep()))
+            storeTailRanges.emplace_back(stored, *storedEnd);
+        }
         coordinates[*storeRow] = rows;
+      }
       coordinates[*storeColumn] = columns;
       FailureOr<Value> valid = failure();
       if (indirectRow) {
@@ -3486,6 +3523,12 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
         }
       } else {
         Value originalValidity = path.store.getValid();
+        // A proven bounds-only mask is replaced by the newly constructed
+        // row/column mask. Replaying it by source identity would conflate two
+        // occurrences of that source in a Cartesian result (for example A.T A).
+        if (originalValidity &&
+            PhysicalProgramAnalysis(kernel).isTailPredicate(originalValidity, storeTailRanges))
+          originalValidity = Value();
         if (originalValidity) {
           IRMapping replay;
           replay.map(rowRange.getResult(), rows);
@@ -4084,31 +4127,31 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
         Value blockValid = rangeBoundsValidity(
             nested, nestedLocation, blockIndexType, blockPredicateType, blocks,
             blockStop);
-        Value lhsRows = broadcast(nested, nestedLocation, lhsPredicateType,
-                                  rowValid);
-        Value lhsBlocks = broadcast(nested, nestedLocation, lhsPredicateType,
-                                    blockValid);
+        Value lhsRows = broadcastAxis(nested, nestedLocation, lhsPredicateType,
+                                  rowValid, 0);
+        Value lhsBlocks = broadcastAxis(nested, nestedLocation, lhsPredicateType,
+                                    blockValid, 1);
         Value lhsValid = binary(nested, nestedLocation, lhsPredicateType,
                                 lhsRows, lhsBlocks,
                                 BinaryOperator::LogicalAnd);
-        Value lhsScaleRows = broadcast(
-            nested, nestedLocation, lhsScalePredicateType, rowValid);
-        Value lhsScaleBlocks = broadcast(
-            nested, nestedLocation, lhsScalePredicateType, blockValid);
+        Value lhsScaleRows = broadcastAxis(
+            nested, nestedLocation, lhsScalePredicateType, rowValid, 0);
+        Value lhsScaleBlocks = broadcastAxis(
+            nested, nestedLocation, lhsScalePredicateType, blockValid, 1);
         Value lhsScaleValid = binary(
             nested, nestedLocation, lhsScalePredicateType, lhsScaleRows,
             lhsScaleBlocks, BinaryOperator::LogicalAnd);
-        Value rhsBlocks = broadcast(nested, nestedLocation, rhsPredicateType,
-                                    blockValid);
-        Value rhsColumns = broadcast(nested, nestedLocation, rhsPredicateType,
-                                     columnValid);
+        Value rhsBlocks = broadcastAxis(nested, nestedLocation, rhsPredicateType,
+                                    blockValid, 0);
+        Value rhsColumns = broadcastAxis(nested, nestedLocation, rhsPredicateType,
+                                     columnValid, 2);
         Value rhsValid = binary(nested, nestedLocation, rhsPredicateType,
                                 rhsBlocks, rhsColumns,
                                 BinaryOperator::LogicalAnd);
-        Value rhsScaleBlocks = broadcast(
-            nested, nestedLocation, rhsScalePredicateType, blockValid);
-        Value rhsScaleColumns = broadcast(
-            nested, nestedLocation, rhsScalePredicateType, columnValid);
+        Value rhsScaleBlocks = broadcastAxis(
+            nested, nestedLocation, rhsScalePredicateType, blockValid, 1);
+        Value rhsScaleColumns = broadcastAxis(
+            nested, nestedLocation, rhsScalePredicateType, columnValid, 0);
         Value rhsScaleValid = binary(
             nested, nestedLocation, rhsScalePredicateType, rhsScaleBlocks,
             rhsScaleColumns, BinaryOperator::LogicalAnd);
@@ -4204,9 +4247,9 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
     return reject("blocked loop body could not be materialized");
   }
 
-  Value outputRows = broadcast(builder, location, outputPredicateType, rowValid);
+  Value outputRows = broadcastAxis(builder, location, outputPredicateType, rowValid, 0);
   Value outputColumns =
-      broadcast(builder, location, outputPredicateType, columnValid);
+      broadcastAxis(builder, location, outputPredicateType, columnValid, 1);
   Value outputValid = binary(builder, location, outputPredicateType, outputRows,
                              outputColumns, BinaryOperator::LogicalAnd);
   for (StorePath &path : paths) {

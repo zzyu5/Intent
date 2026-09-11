@@ -2174,9 +2174,14 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
   if (failed(firstEnd))
     return reduce.emitOpError(
         "runtime reduction source range has no exact logical end");
+  // Components are paired by the reduce axes, not by allocation provenance.
+  // Keep each source identity while proving their actual traversals coincide.
+  if (!PhysicalProgramAnalysis(kernel).lockstepRanges(traversalRanges).isExact())
+    return reduce.emitOpError(
+        "runtime reduction components require one lockstep logical range");
   for (MakeRangeOp range : traversalRanges) {
     FailureOr<Value> end = resolveLogicalRangeEnd(kernel, range);
-    if (!sameLogicalRange(firstRange, range) || failed(end) ||
+    if (failed(end) ||
         !samePhysicalScalarExpression(*firstEnd, *end))
       return reduce.emitOpError(
           "runtime reduction components require one lockstep logical range");

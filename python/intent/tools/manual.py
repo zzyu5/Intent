@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import inspect
 import json
 from pathlib import Path
@@ -12,7 +13,7 @@ def snapshot(project: Path) -> dict:
     """Freeze only public author material, never benchmarks or provider sources."""
     import intent
     import intent.language as language
-    from intent.language.builtins import INTRINSICS, Intrinsic, IntrinsicNamespace
+    from intent.language.builtins import INTRINSICS, Intrinsic, IntrinsicNamespace, QuantFormats
     from intent.language.signatures import INTRINSIC_SIGNATURES
 
     documents = {}
@@ -40,6 +41,31 @@ def snapshot(project: Path) -> dict:
     exports = {name: getattr(language, name) for name in language.__all__}
     exports.update(INTRINSICS)
     exports.update({f"intent.{name}": getattr(intent, name) for name in intent.__all__})
+    for name, value in list(exports.items()):
+        if inspect.isclass(value):
+            exports.update({f"{name}.{member}": method for member, method in vars(value).items()
+                            if inspect.isfunction(method) and (not member.startswith("_") or member == "__call__")})
+        elif isinstance(value, QuantFormats):
+            exports.update({f"{name}.{member}": format for member, format in vars(value).items()
+                            if not member.startswith("_")})
+    for path in sorted((project / "python/intent/frontend/lowering").rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            is_diagnostic = isinstance(node.func, ast.Attribute) and node.func.attr == "error"
+            is_unsupported = isinstance(node.func, ast.Name) and node.func.id == "NotImplementedError"
+            if not (is_diagnostic or is_unsupported):
+                continue
+            message = node.args[-1]
+            if not isinstance(message, ast.Constant) or not isinstance(message.value, str):
+                continue
+            source = str(path.relative_to(project))
+            identifier = f"diagnostic:{source}:L{node.lineno}"
+            documents[identifier] = {
+                "id": identifier, "title": message.value, "kind": "diagnostic",
+                "source": source, "line": node.lineno,
+                "text": "Current implementation diagnostic, not a language restriction or proof that its guard applies:\n" + message.value,
+            }
     symbols = {}
     for name, value in exports.items():
         if isinstance(value, (Intrinsic, IntrinsicNamespace)):
@@ -52,7 +78,7 @@ def snapshot(project: Path) -> dict:
             signature, source = None, "python/intent/language/__init__.py"
         pattern = re.compile(r"(?<![\w.])(?:I\.)?" + re.escape(name) + r"(?![\w.])")
         references = [d["id"] for d in documents.values()
-                      if ("#L" in d["id"] or d["kind"] == "example") and pattern.search(d["text"])]
+                      if ("#L" in d["id"] or d["kind"] != "concept") and pattern.search(d["text"])]
         symbols[name] = {
             "name": name, "signature": str(signature) if signature else None,
             "declaration": source, "sections": references,
@@ -84,9 +110,9 @@ class Manual:
                     results.append((100 * score, {"id": name, "kind": "api", "title": name,
                                                   "signature": entry["signature"]}))
         for entry in self.corpus["documents"].values():
-            if kind not in {"all", "diagnostic", entry["kind"]}:
+            if kind not in {"all", entry["kind"]}:
                 continue
-            if "#L" not in entry["id"] and entry["kind"] != "example":
+            if "#L" not in entry["id"] and entry["kind"] == "concept":
                 continue
             body, title = entry["text"].lower(), entry["title"].lower()
             score = sum(5 * (term in title) + (term in body) for term in terms)
@@ -105,7 +131,9 @@ class Manual:
         return {"status": "declared", "revision": self.corpus["revision"], **entry,
                 "signature_note": None if entry["signature"] else "No inspectable signature is declared; consult the linked rules, not a guessed signature.",
                 "rules": [self.corpus["documents"][key] for key in entry["sections"]
-                          if self.corpus["documents"][key]["kind"] != "example"],
+                          if self.corpus["documents"][key]["kind"] == "concept"],
+                "implementation_diagnostics": [self.corpus["documents"][key] for key in entry["sections"]
+                                               if self.corpus["documents"][key]["kind"] == "diagnostic"],
                 "examples": [key for key in entry["sections"] if self.corpus["documents"][key]["kind"] == "example"],
                 "verification": "not evaluated by this read-only service; diagnostics do not redefine doc semantics"}
 

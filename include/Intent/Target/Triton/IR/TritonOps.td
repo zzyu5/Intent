@@ -108,4 +108,19 @@ def IntentTriton_SplitOp : IntentTriton_Op<"split", [Pure]> {
   let hasVerifier = 1;
 }
 
+class IntentTriton_ElementwiseCollective<string mnemonic> :
+    IntentTriton_Op<mnemonic, [Pure]> {
+  let arguments = (ins Variadic<AnyType>:$inputs,
+                       I64Attr:$source_count,
+                       I64Attr:$axis,
+                       BoolAttr:$reverse);
+  let results = (outs Variadic<AnyType>:$outputs);
+  let regions = (region AnyRegion:$combine);
+  let hasVerifier = 1;
+}
+
+// Triton's native callbacks are scalar, unlike a shared fragment combiner.
+def IntentTriton_ReduceOp : IntentTriton_ElementwiseCollective<"reduce">;
+def IntentTriton_ScanOp : IntentTriton_ElementwiseCollective<"scan">;
+
 #endif

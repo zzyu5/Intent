@@ -441,11 +441,9 @@ private:
 
   void emitHelpers() {
     kernel.walk([&](Operation *operation) {
-      if (auto reduce = dyn_cast<gpu::ReduceOp>(operation)) {
-        if (!reduce->hasAttr(reduceFormAttr))
-          emitHelper(operation, reduce.getCombine(), "reduce");
-      }
-      else if (auto scan = dyn_cast<gpu::ScanOp>(operation))
+      if (auto reduce = dyn_cast<ReduceOp>(operation))
+        emitHelper(operation, reduce.getCombine(), "reduce");
+      else if (auto scan = dyn_cast<ScanOp>(operation))
         emitHelper(operation, scan.getCombine(), "scan");
     });
   }
@@ -1022,6 +1020,25 @@ private:
                  valueString(contract.getAccumulator()) + ")");
       return;
     }
+    if (isa<ReduceOp, ScanOp>(operation)) {
+      auto reduce = dyn_cast<ReduceOp>(operation);
+      auto scan = dyn_cast<ScanOp>(operation);
+      unsigned count = reduce ? reduce.getSourceCount() : scan.getSourceCount();
+      int64_t axis = reduce ? reduce.getAxis() : scan.getAxis();
+      std::string sources = count == 1 ? valueString(operation.getOperand(0)) : "(";
+      if (count != 1) {
+        for (unsigned i = 0; i < count; ++i) {
+          if (i) sources += ", ";
+          sources += valueString(operation.getOperand(i));
+        }
+        sources += ")";
+      }
+      std::string call = (reduce ? "tl.reduce(" : "tl.associative_scan(") + sources +
+          ", axis=" + std::to_string(axis) + ", combine_fn=" + helperNames.lookup(&operation).front();
+      if (scan) call += std::string(", reverse=") + (scan.getReverse() ? "True" : "False");
+      assignResults(operation.getResults(), call + ")");
+      return;
+    }
     if (auto reduce = dyn_cast<gpu::ReduceOp>(operation)) {
       std::string sources;
       ValueRange sourceValues =
@@ -1054,33 +1071,11 @@ private:
         call = primitive.str() + "(" + sources + ", axis=" +
                std::to_string(reduce.getAxes().front()) + ")";
       } else {
-        call = "tl.reduce(" + sources + ", axis=" +
-               std::to_string(reduce.getAxes().front()) +
-               ", combine_fn=" + helperNames.lookup(&operation).front() + ")";
+        reduce.emitOpError("custom reduction callback was not legalized");
+        failed = true;
+        return;
       }
       assignResults(reduce.getResults(), call);
-      return;
-    }
-    if (auto scan = dyn_cast<gpu::ScanOp>(operation)) {
-      std::string sources;
-      ValueRange sourceValues = scan.getInputs().take_front(scan.getSourceCount());
-      if (sourceValues.size() == 1) {
-        sources = valueString(sourceValues.front());
-      } else {
-        sources = "(";
-        for (auto [index, source] : llvm::enumerate(sourceValues)) {
-          if (index)
-            sources += ", ";
-          sources += valueString(source);
-        }
-        sources += ")";
-      }
-      std::string call =
-          "tl.associative_scan(" + sources + ", axis=" +
-          std::to_string(scan.getAxis()) + ", combine_fn=" +
-          helperNames.lookup(&operation).front() +
-          ", reverse=" + (scan.getReverse() ? "True" : "False") + ")";
-      assignResults(scan.getResults(), call);
       return;
     }
     if (auto histogram = dyn_cast<gpu::HistogramOp>(operation)) {

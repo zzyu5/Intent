@@ -30,7 +30,7 @@ def materialize_language(project: Path, triton_ref: Path, directory: Path, langu
     if language == "intent":
         corpus = snapshot(project)
         (directory / "manual.json").write_text(json.dumps(corpus, ensure_ascii=False))
-        return sorted(key for key in corpus["documents"] if "#L" not in key)
+        return sorted({entry["source"] for entry in corpus["documents"].values()})
     language_path = Path(triton.language.__file__).parent
     sources = []
     for name in ("core.py", "standard.py", "math.py", "extra/cuda/libdevice.py"):
@@ -159,5 +159,5 @@ def execute(directory: Path, suite: dict, prompt: str, *, executable: Path,
         result.update(action="unavailable", status="agent_timeout" if timed_out else "agent_environment_failure",
                       errors=errors, error="".join(stderr)[-6000:] or "Agent stopped without a submission")
     else:
-        result.update(json.loads(response.read_text()))
+        result.update(json.loads(response.read_text().replace(key, "<redacted>")))
     return result

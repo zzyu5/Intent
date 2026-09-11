@@ -46,10 +46,9 @@
 
 | 归类 | 数量 | 任务及直接原因 |
 |---|---:|---|
-| 确定实现 bug | 3 | `tensordot` 等价 step 误拒绝；`matmul` 累加 dtype 未正确传递；`fused_qr_solve` 的 Gram 独立轴合并 |
+| 确定实现 bug | 4 | `tensordot` 等价 step 误拒绝；`matmul` 累加 dtype 未正确传递；`fused_qr_solve` 的 Gram 独立轴合并；`min` 的 tuple component 未先读取 view |
 | 合法构造支持缺口/规格不一致 | 3 | `conv2d` safe-gather lowering；`solve` 有序控制中的 parallel construction；`fused_cholesky_solve` 已定义的 Out 内容仍被禁止读取 |
 | 作者接口/表达不符合当前公开规则 | 14 | `argmax` tuple 当 index；`mean` wrapper 缺省参数；`log1p`、`asin` 不存在的 API；`logsumexp` Python math 调用；`add_mean` domain 当 axis；`symmetric_mm_and_abs_sum` Python abs 调用；`ifftshift` domain 算术；`gelu_conv2d`、`relu_conv2d` dtype；`grid_sample`、`fused_layer_norm_relu_linear`、`fused_gather_masked_fill`、`permute_copy` shape/index/broadcast 表达 |
-| 未定因 | 1 | `min` tuple component 的 KIR 类型不一致 |
 
 证据位置统一为 `report/agent-tritonbench/refined/programs/<task>/intent/repeat-0/generation-1/{candidate.py,measurement.json}`。这 14 项也包含手册可发现性和 API 易用性问题，不能简单推给模型。涉及 indexed relation 的判断只限当前失败表达，不能反向把某种实现限制提升为新语言规则。
 
@@ -77,7 +76,7 @@ Out 需要特别纠正：`doc/dsl/core.md:34` 规定进入 kernel 时不可读�
 
 ### 5.1 内容先行，MCP 提供可靠入口
 
-当前 `examples/repro/agent_study/agent.py:28` 只提供六份 DSL/编程模型文档和单 kernel vector-add；未提供 `doc/dsl/examples/`。`split_k_pipeline.py:45` 的 host 部分又是伪代码。提示虽在 `instructions.md:9` 允许多 kernel，但没有等价的可运行教学入口。
+重整前的入口只提供六份 DSL/编程模型文档和单 kernel vector-add，没有提供 `doc/dsl/examples/`，split-K 的 host 还是伪代码。Build 已改为发布作者手册快照，并补齐真实 compile/host 编排；公开示例本身未单独跑 benchmark，不宣称每个示例的执行或性能已验证。
 
 手册需要覆盖四类问题：
 
@@ -90,7 +89,7 @@ Out 需要特别纠正：`doc/dsl/core.md:34` 规定进入 kernel 时不可读�
 
 ### 5.2 最小但完整的查询接口
 
-建议三个只读工具；名称是方案，不表示已注册：
+已实现三个本地 STDIO 只读工具，位于 `python/intent/tools/manual.py`；使用当前声明、公开章节/示例和 frontend 诊断消息，不执行候选：
 
 | 工具 | 职责 | 返回的关键内容 |
 |---|---|---|
@@ -120,7 +119,7 @@ MCP 属于作者工具，不进入 `lib/` 的 IR/pass、runtime 的执行语义�
 - **工具权限：** 可查手册、编辑候选；不能跑 benchmark 获取试错反馈、修改 compiler/reference 或派生子代理。模型连接与只读 MCP 的网络/进程权限单独管理，不能把 shell 禁网误称为所有通道均被隔离。
 - **提交边界：** 一次完整程序交付，可以含多个 kernels。Codex 内部读文档/编辑可能有多个模型回合，不等于多份评测候选，也不应冒称裸模型只调用一次。
 
-provider 的 Responses/流式/工具交互以及该服务的 luna/max 映射尚未实测。连接配置完成不等于运行行为已验证，不因为 URL 以 `/v1` 结尾就假定兼容，不静默换模型或加代理转换层。参考 [Codex 配置](https://learn.chatgpt.com/docs/config-file/config-advanced) 与 [状态目录说明](https://learn.chatgpt.com/docs/config-file/environment-variables)。
+专用状态位于 `/home/kingdom/.local/share/intentdsl/agent-evaluation`，配置/认证文件仅 owner 可读写。真实 Codex 请求使用指定 provider、`gpt-5.6-luna`、`max` 和 Responses；流式交互、三个 MCP 工具及最终程序交付已接通，没有修改主开发配置或加协议转换层。这证明请求配置被服务接受，不证明服务内部对模型别名的实现。参考 [Codex 配置](https://learn.chatgpt.com/docs/config-file/config-advanced) 与 [状态目录说明](https://learn.chatgpt.com/docs/config-file/environment-variables)。
 
 ## 7. 精简评估与数据清理
 
@@ -156,4 +155,25 @@ provider 的 Responses/流式/工具交互以及该服务的 luna/max 映射尚�
 
 按用户要求，新建 [intent-agent-readiness](../docs/comet/changes/intent-agent-readiness/brief.md)，绑定 main/current，用户已确认进入 Build。其第一批为旧产物收口、手册 MCP、专用 Luna 环境及 ownership/schema 修复；只用一个既有任务接通链路，不把 50 题正式实验、第二阶段优化或全部 compiler backlog 塞入本轮验收。其它根因仍保留在本文，未宣称解决。
 
-旧数据已收口为一份 811 行观察 CSV，保留 refined 生成程序及其原测量、早期多 kernel 实例和必要 compiler 复测；删除 2,839 个重复表格、逐轮活动/停止日志、优化副本和 Python 缓存。已知 evaluator 修复仅对原来对应的失败行应用，`original_status` 保留；未重跑或补造任何数值。CSV 的 `original_program` 是原始位置，`retained_program` 非空才表示当前仍保留的源码；其它已提交材料由 Git 历史保存，不另建归档包。专用环境/MCP 与 compiler 首批修复仍在实现中。
+旧数据已收口为一份 811 行观察 CSV，保留 refined 生成程序及其原测量、早期多 kernel 实例和必要 compiler 复测；净删除 2,835 个旧重复表格、逐轮活动/停止日志、优化副本和 Python 缓存，复测索引引用的四份早期源码仍保留。已知 evaluator 修复仅对原来对应的失败行应用，`original_status` 保留；数据清理没有重跑或补造数值。CSV 的 `original_program` 是原始位置，`retained_program` 表示收口时保留的源码；其它已提交材料由 Git 历史保存，不另建归档包。旧三轮/五次生成/五次优化调度、恢复和预算发布逻辑已删除，benchmark 不再自动生成后续优化 seed 副本。
+
+## 9. Build 的已验证结果与剩余边界
+
+独立 agent 只接收 softmax 的既有任务/profile、语言资料和自己的候选目录，实际使用 `search/api/read` 后交付一次程序，没有获得 benchmark 反馈再修错。完整 CUDA Graph 算子时间为 **0.007976 ms**，参考 **0.007984 ms**，原容差检查通过；[程序、MCP 调用证据和测量](agent-tritonbench/readiness/softmax/intent/measurement.json)随项目保留。这只是接通运行，不是 50 题正式评估，也不证明两个实验假设。
+
+`min` 原始 generation-1 已通过原来的 values/indices 零容差检查；[当前测量](agent-tritonbench/refined/compiler-rechecks/min/measurement.json)保存真实 ms。三个确定原因及 ref 对照：
+
+- `context.py:245` / `tensor.py:190` 的 tuple/record 构造原来直接装入 view，而 component type 声明为 tensor；现在先产生正式 view load。Triton 的 `ref/triton/python/triton/language/semantic.py:1040` 显式 load 得到 value、`:1690` 对这些值归约；Intent 的 whole-view shorthand 必须在形成 product 前完成同样的 value/read 边界。
+- `RealizeReductionBlocking.cpp:2177` 原先要求多个 components 的 source identity 相同，现在复用 `PhysicalProgramAnalysis::lockstepRanges` 证明实际 start/extent/step 与 logical bounds 对齐，保留各 source provenance。对照 `ref/triton/python/triton/language/semantic.py:1688` 要求相同归约 shape，而非相同指针来源。
+- Triton 回调实际接收元素类型（`ref/triton/python/triton/language/core.py:2931`，scan 为 `:3039`）。原 serializer 直接发出 fragment combine，导致回调引用未绑定的 `FRAGMENT_D2`。`Legalize.cpp:1568` 现在把可证明逐元素、无 capture 的 combine 形成显式 `intent_triton.reduce/scan` 标量 region，由各自 verifier 检查；serializer 不再接收未完成的自定义 GPU 回调。当前性能运行实际覆盖 tuple reduce，未另外扩展 scan 测试。
+
+Scalar/rank-0 修复在 `context.py:471`、`expressions.py`、`tensor.py` 保留 tensor 类别，对混合 pointwise 显式 broadcast，cast/bitcast 不再把 rank-0 tensor 变成 scalar。对照 `ref/triton/python/triton/language/semantic.py:716` 的 scalar/block splat；Intent 不照搬 Triton `:1671` 的 0D→scalar 规则，因为自己的 DSL 明确定义 dot 返回 rank-0 tensor。原 gelu generation-2 现在得到[准确 frontend 诊断](agent-tritonbench/refined/compiler-rechecks/gelu_conv2d/measurement.json)：它把 f32 scalar carry 在分支内改成了 rank-0 tensor。Triton 同样要求 control-flow carry 类型一致（`ref/triton/python/triton/compiler/code_generator.py:1169`）。未改原候选、未取得其数值或性能结果。
+
+Ownership **仍未收束，A4 未完成**。已保留的局部修复不允许 dimension-only pointwise 改写合并 contraction 的独立 free axes；contraction pass 按 operand/result 位置显式形成 `[M,1]` / `[1,N]` mask，并只删除有相等边界证明的旧 bounds-only mask。对照 `ref/triton/python/tutorials/03-matrix-multiplication.py:256`、`:292`、`:313` 的独立 offsets、二维 load 和 output mask，不把这些结构放进 emitter，也没有放宽独立性 verifier。
+
+- `symmetric_mm_and_abs_sum` 的第一个 matmul 已形成[完整 provider IR/source](agent-tritonbench/refined/compiler-rechecks/symmetric_mm_and_abs_sum/symmetric_mm_product.mlir)，但第二个普通 Cartesian pointwise kernel 仍失败：`Utilities.cpp:2133`、`:2159` 按 dimension 整体更新多个独立轴，value/coordinate schema 无法对齐。整算子没有性能/数值结果。
+- 同源 `A.T @ A` 已越过原先行列共用 coordinate 的阻塞，但同一个作者 kernel 还包含第二个 contraction；`RefineProgramMapping.cpp:68` 只接受一组 M/N 坐标，现报多 M coordinate。不能简单略过这个检查，否则还需证明多个 outputs 的执行域与唯一写入覆盖。原 QR 候选也采用 normal equations，算法/稳定性仍未验收。
+
+拟补充的 Shape 决定是：统一按当前 SSA 的轴出现位置维护 value/access/parameter relations，并处理同 kernel 多个 contraction 的 execution-group/coverage 关系。未获得用户确认前不继续跨模块重构；未收束的 pointwise alias 试改已撤掉，不以又一次 benchmark 或局部 source 生成冒充 change 完成。
+
+只读复核执行 `readiness_partial_review` 返回 partial，不是整轮验收。已补齐 agent 最终回复落盘前的凭据脱敏；另外两项疑点经原文核对不成立：`manual.py:42` 已合入包含 `reduce.sum` 等成员的 `INTRINSICS`；`structured.py:130`、`:331` 在 reduce/scan 前显式转换 accumulator dtype，`IntentOps.cpp:968` 也要求 source/identity 元素类型一致，不能仅由 KIR→GPU 的局部代码推断合法 f16 source/f32 identity 会直达新回调。没有为这些静态核对增加运行测试。

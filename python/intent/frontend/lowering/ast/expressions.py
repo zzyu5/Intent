@@ -11,6 +11,7 @@ from intent.frontend.semantics import ComparePredicate
 from intent.frontend.semantics import OperationKind
 from intent.frontend.semantics import RecordType
 from intent.frontend.semantics import ScalarType
+from intent.frontend.semantics import TensorType
 from intent.frontend.semantics import UnaryOperator
 from intent.frontend.semantics import broadcast_shape
 from intent.frontend.mlir import MlirValue
@@ -165,7 +166,7 @@ def _lower_unary(lowerer: object, node: ast.UnaryOp) -> Expression:
         operand_dtype, operand_shape = lowerer.dtype_and_shape(operand_value.type, node.operand)
         if operand_dtype != intent_bool:
             lowerer.error(node.operand, "runtime not requires a bool operand")
-        result_type = lowerer.value_result_type(intent_bool, operand_shape)
+        result_type = operand_value.type
     else:
         lowerer.error(node, f"unsupported runtime unary operator {type(node.op).__name__}")
     operation = lowerer.emit(
@@ -215,8 +216,8 @@ def _lower_binary(lowerer: object, node: ast.BinOp) -> Expression:
         DTypeCategory.INDEX,
     ):
         lowerer.error(node, "runtime bitwise operations require integer operands")
-    lhs_value = lowerer.broadcast_value(lhs_value, result_shape, node)
-    rhs_value = lowerer.broadcast_value(rhs_value, result_shape, node)
+    lhs_value = lowerer.broadcast_value(lhs_value, result_shape, node, ranked=isinstance(result_type, TensorType))
+    rhs_value = lowerer.broadcast_value(rhs_value, result_shape, node, ranked=isinstance(result_type, TensorType))
     operation = lowerer.emit(
         OperationKind.BINARY,
         lowerer.location(node),
@@ -240,8 +241,8 @@ def _lower_bool(lowerer: object, node: ast.BoolOp) -> Expression:
         lhs, rhs = lowerer.coerce_pair(result, next_value, node)
         result_type = lowerer.broadcast_result_type(lhs.type, rhs.type, node)
         _, result_shape = lowerer.dtype_and_shape(result_type, node)
-        lhs = lowerer.broadcast_value(lhs, result_shape, node)
-        rhs = lowerer.broadcast_value(rhs, result_shape, node)
+        lhs = lowerer.broadcast_value(lhs, result_shape, node, ranked=isinstance(result_type, TensorType))
+        rhs = lowerer.broadcast_value(rhs, result_shape, node, ranked=isinstance(result_type, TensorType))
         operation = lowerer.emit(
             OperationKind.BINARY,
             lowerer.location(node),
@@ -274,9 +275,10 @@ def _lower_compare(lowerer: object, node: ast.Compare) -> Expression:
             lhs, rhs = lowerer.coerce_pair(left, right, node)
             value_type = lowerer.broadcast_result_type(lhs.type, rhs.type, node)
             _, shape = lowerer.dtype_and_shape(value_type, node)
-            lhs = lowerer.broadcast_value(lhs, shape, node)
-            rhs = lowerer.broadcast_value(rhs, shape, node)
-            result_type = lowerer.value_result_type(intent_bool, shape)
+            ranked = isinstance(value_type, TensorType)
+            lhs = lowerer.broadcast_value(lhs, shape, node, ranked=ranked)
+            rhs = lowerer.broadcast_value(rhs, shape, node, ranked=ranked)
+            result_type = lowerer.value_result_type(intent_bool, shape, ranked=ranked)
             operation = lowerer.emit(
                 OperationKind.COMPARE,
                 lowerer.location(node),
@@ -295,8 +297,8 @@ def _lower_compare(lowerer: object, node: ast.Compare) -> Expression:
         lhs, rhs = lowerer.coerce_pair(result, comparison, node)
         result_type = lowerer.broadcast_result_type(lhs.type, rhs.type, node)
         _, result_shape = lowerer.dtype_and_shape(result_type, node)
-        lhs = lowerer.broadcast_value(lhs, result_shape, node)
-        rhs = lowerer.broadcast_value(rhs, result_shape, node)
+        lhs = lowerer.broadcast_value(lhs, result_shape, node, ranked=isinstance(result_type, TensorType))
+        rhs = lowerer.broadcast_value(rhs, result_shape, node, ranked=isinstance(result_type, TensorType))
         operation = lowerer.emit(
             OperationKind.BINARY,
             lowerer.location(node),
@@ -329,10 +331,11 @@ def _lower_if_expression(lowerer: object, node: ast.IfExp) -> Expression:
         result_shape = broadcast_shape(condition_shape, branch_shape)
     except ValueError as error:
         lowerer.error(node, str(error))
-    result_type = lowerer.value_result_type(result_dtype, result_shape)
-    condition_value = lowerer.broadcast_value(condition_value, result_shape, node)
-    lhs = lowerer.broadcast_value(lhs, result_shape, node)
-    rhs = lowerer.broadcast_value(rhs, result_shape, node)
+    ranked = isinstance(branch_type, TensorType) or isinstance(condition_value.type, TensorType)
+    result_type = lowerer.value_result_type(result_dtype, result_shape, ranked=ranked)
+    condition_value = lowerer.broadcast_value(condition_value, result_shape, node, ranked=ranked)
+    lhs = lowerer.broadcast_value(lhs, result_shape, node, ranked=ranked)
+    rhs = lowerer.broadcast_value(rhs, result_shape, node, ranked=ranked)
     operation = lowerer.emit(
         OperationKind.SELECT,
         lowerer.location(node),

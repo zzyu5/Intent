@@ -1,0 +1,48 @@
+{
+  "project_revision": "9ccdf014e651c7accd9b621a4aa70a1ea29697de",
+  "reference_revision": "603e28a5050e8c268f6883a69709d477a272d49a",
+  "triton_ref_revision": "ef08c7fc412737f1663dbfc38a8bed3e9fbf82da",
+  "compiler": "/mnt/hdd/tmp/intentdsl-agent-build.tFX1vN/tools/intent-compile/intent-compile",
+  "torch": "2.10.0+cu130",
+  "triton": "3.6.0",
+  "gpu": "NVIDIA GeForce RTX 5090 D",
+  "model": "gpt-5.6-luna",
+  "reasoning_effort": "max",
+  "tasks": [
+    {
+      "task": "softmax",
+      "entry": "softmax",
+      "prompt_index": 136,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/softmax.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/softmax_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "softmax",
+      "family": "reduction",
+      "input_index": 6,
+      "tolerance": "fp32",
+      "invocation": {
+        "input": {
+          "shape": [
+            1024,
+            1024
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": 1,
+        "dtype": "torch.float32"
+      }
+    }
+  ],
+  "submission_policy": "one complete program; documentation tools; no benchmark feedback",
+  "timing": "complete CUDA Graph operator; compilation/tuning/allocations outside timing",
+  "isolation": "dedicated Codex state/provider; workspace-only shell, no network; read-only public manual MCP; no reference/history/agents",
+  "instructions": "You are the single programming agent in a GPU kernel experiment. Implement the\ngiven task correctly and efficiently for the supplied, fixed invocation profile.\nThis is forward execution, not autograd. Do not change the task, dtype, output\nstructure, numerical tolerance, or observable out/alias behavior.\n\nRead TASK.md and the provided language materials. For Intent, query the\nintent_manual MCP: search concepts, api for signatures/return schemas, read for\ncomplete examples. Consult the manual before writing code; it does not execute\nprograms or provide task answers. Write candidate.py containing\nbuild(context), which returns a callable with the task's original wrapper\nsignature. The evaluator calls build once outside timing, then calls that wrapper\nwith the documented inputs. Multiple kernels and explicit host composition are\nallowed. Torch may allocate empty tensors and perform metadata-only views; GPU\narithmetic, reductions, copies, conversions and library kernels must use the\nassigned language. Do not replace computation with PyTorch, CUDA extensions or\nanother language. Do not infer outputs from the particular input distribution.\nThe editing directory is not a Git repository. Do not run Git commands or try to\ninstall/import the execution environment here; submission invokes that environment.\n\nFor Intent generation, define ordinary @intent.kernel / @intent.fn programs using\nintent.language. Inside build, use context.compile(\"unique_literal_name\", kernel,\nconstexprs={...}) for each kernel. This invokes the unmodified public\nintent.generate path and materializes its generated Triton. The returned artifact\nsupports run(*inputs) and explicit-output launch via artifact(*inputs, *outputs).\nAll compile calls must execute during build, not inside the timed wrapper. Do not\ncall intent.compile/generate or invoke a different compiler yourself. Choose the\nkernel algorithm, not hardware block sizes or provider-specific emission.\n\nFor direct Triton generation, define @triton.jit kernels and an ordinary wrapper;\ncontext need not be used.\n\nThe submission is the complete candidate.py. Use only torch, triton, intent, math, functools,\ntyping, collections, dataclasses and __future__ imports. File/network access,\ndynamic code loading and evaluator introspection are not part of the task.\n\nSubmitting triggers the production paired benchmark: one numerical comparison\nand full CUDA Graph timing, including all of your kernels and internal data\nhandling. Allocations outside captured execution, compilation, JIT and tuning do\nnot count as operator milliseconds. Do not run independent tests, input sweeps\nor benchmarks. You submit once; there is no benchmark-feedback repair round.\nNo reference implementation or reference output values are available to you. Do not seek other task answers,\npersonal memory, external websites or subagents.\n\nTriton's autotuner considers at most 16 legal configurations per kernel. When\nthere are more, it samples uniformly spaced list positions, including both ends,\nafter existing legality pruning. Both arms use the same median-only CUDA Graph\nmeasurement policy. Tuning is evaluator-side execution preparation, not another\nagent submission.\n\nWhen candidate.py is ready, finish with the specified JSON response:\n{\"action\": \"submit\", \"reason\": \"brief implementation or change description\"}.\nDo not claim correctness or speed that has not been measured by the evaluator.\n"
+}

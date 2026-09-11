@@ -243,10 +243,12 @@ class FunctionLowerer:
                     self.error(node, "tuple value/expected type arity mismatch")
                 expected_components = expected_type.components
             components = tuple(
-                self.materialize(
-                    element,
+                self.read_value(
+                    self.materialize(
+                        element, node,
+                        expected_components[index] if expected_components is not None else None,
+                    ),
                     node,
-                    expected_components[index] if expected_components is not None else None,
                 )
                 for index, element in enumerate(expression.elements)
             )
@@ -470,8 +472,10 @@ class FunctionLowerer:
         self,
         dtype: DType,
         shape: tuple[object, ...],
+        *,
+        ranked: bool = False,
     ) -> ValueType:
-        return TensorType(dtype, shape) if shape else ScalarType(dtype)
+        return TensorType(dtype, shape) if shape or ranked else ScalarType(dtype)
 
     def broadcast_result_type(self, lhs: ValueType, rhs: ValueType, node: ast.AST) -> ValueType:
         lhs_dtype, lhs_shape = self.dtype_and_shape(lhs, node)
@@ -482,23 +486,27 @@ class FunctionLowerer:
             shape = broadcast_shape(lhs_shape, rhs_shape)
         except ValueError as error:
             self.error(node, str(error))
-        return self.value_result_type(lhs_dtype, shape)
+        return self.value_result_type(
+            lhs_dtype, shape, ranked=isinstance(lhs, TensorType) or isinstance(rhs, TensorType)
+        )
 
     def broadcast_value(
         self,
         value: MlirValue,
         result_shape: tuple[object, ...],
         node: ast.AST,
+        *,
+        ranked: bool = False,
     ) -> MlirValue:
         dtype, source_shape = self.dtype_and_shape(value.type, node)
         target_shape = tuple(result_shape)
-        if len(source_shape) == len(target_shape) and all(
+        if (not ranked or isinstance(value.type, TensorType)) and len(source_shape) == len(target_shape) and all(
             self.compiler.builder.dimension_id(source)
             == self.compiler.builder.dimension_id(target)
             for source, target in zip(source_shape, target_shape)
         ):
             return value
-        if not target_shape:
+        if not target_shape and not ranked:
             self.error(node, "tensor value cannot broadcast to a scalar")
         try:
             broadcasted = tuple(broadcast_shape(source_shape, target_shape))
