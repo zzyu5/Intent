@@ -3,6 +3,7 @@ add_mlir_library(MLIRIntentCPUAnalysis
   AxisRelations.cpp
   RegionPartition.cpp
   RegionPredicates.cpp
+  UniformValues.cpp
   LINK_LIBS PUBLIC
   MLIRIntentCPUDialect
   MLIRIntentAnalysis

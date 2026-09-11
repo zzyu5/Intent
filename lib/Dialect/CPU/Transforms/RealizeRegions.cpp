@@ -160,7 +160,6 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
   ValueRange state = program.isScan() ? program.outputs().take_back(program.count("state_count")) : program.outputs();
   ValueRange initial = program.isScan() ? program.initialState() : program.identities();
   for (auto [input, output] : llvm::zip(initial, state)) copy(b, loc, input, output);
-  Value fullEnd = b.create<arith::SubIOp>(loc, count, b.create<arith::RemSIOp>(loc, count, step));
   auto partition = analyzeRegionPartition(program, configuration.tileM, configuration.tileN);
   auto predicate = partition ? analyzeRegionPredicate(program) : std::nullopt;
   if (predicate && (!partition->axes.count(program.captures()[predicate->capture]) ||
@@ -273,7 +272,15 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
     return visitOne(loop.getInductionVar(), width, predicateIsTrue, predicateIsTrue, omitValidity);
   };
   auto remainder = [&](Value start, bool omitValidity) -> LogicalResult {
-    Value lower = b.create<arith::MinSIOp>(loc, start, fullEnd);
+    Value end = count;
+    if (intervals && predicate->identityWhenFalse) {
+      Value begin = b.create<arith::SubIOp>(loc, intervals->possibleBegin,
+          b.create<arith::RemSIOp>(loc, intervals->possibleBegin, step));
+      start = b.create<arith::MaxSIOp>(loc, start, begin);
+      end = intervals->possibleEnd;
+    }
+    Value completeEnd = b.create<arith::SubIOp>(loc, end, b.create<arith::RemSIOp>(loc, end, step));
+    Value lower = b.create<arith::MinSIOp>(loc, start, completeEnd);
     if (intervals) {
       Value raw = intervals->allTrueBegin;
       Value residue = b.create<arith::RemSIOp>(loc, raw, step);
@@ -281,17 +288,17 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
           b.create<arith::SubIOp>(loc, step, residue));
       Value aligned = b.create<arith::SelectOp>(loc, b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, residue, zero),
           raw, b.create<arith::AddIOp>(loc, raw, adjustment));
-      Value trueBegin = b.create<arith::MinSIOp>(loc, fullEnd, b.create<arith::MaxSIOp>(loc, lower, aligned));
+      Value trueBegin = b.create<arith::MinSIOp>(loc, completeEnd, b.create<arith::MaxSIOp>(loc, lower, aligned));
       Value trueEnd = b.create<arith::SubIOp>(loc, intervals->allTrueEnd,
           b.create<arith::RemSIOp>(loc, intervals->allTrueEnd, step));
-      trueEnd = b.create<arith::MaxSIOp>(loc, trueBegin, trueEnd);
+      trueEnd = b.create<arith::MaxSIOp>(loc, trueBegin, b.create<arith::MinSIOp>(loc, completeEnd, trueEnd));
       if (failed(visit(lower, trueBegin, segmentSize, false, omitValidity)) ||
           failed(visit(trueBegin, trueEnd, segmentSize, true, omitValidity))) return failure();
       lower = trueEnd;
     }
-    Value tail = b.create<arith::MaxSIOp>(loc, start, fullEnd);
-    return success(succeeded(visit(lower, fullEnd, segmentSize, false, omitValidity)) &&
-                   succeeded(visit(tail, count, 1, false, omitValidity)));
+    Value tail = b.create<arith::MaxSIOp>(loc, start, completeEnd);
+    return success(succeeded(visit(lower, completeEnd, segmentSize, false, omitValidity)) &&
+                   succeeded(visit(tail, end, 1, false, omitValidity)));
   };
   if (specializeState) {
     Value nonempty = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, count, zero);

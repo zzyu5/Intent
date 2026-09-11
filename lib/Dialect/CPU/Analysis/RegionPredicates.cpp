@@ -1,4 +1,6 @@
 #include "Intent/Dialect/CPU/Analysis/RegionPredicates.h"
+#include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/Analysis/UniformValues.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -103,6 +105,102 @@ std::optional<unsigned> validityField(RegionProgram program, linalg::GenericOp m
     if (lhs && rhs && isBooleanUnion(values, result, lhs, rhs) && hasTrueStateInvariant(values, result, lhs)) return field;
   }
   return std::nullopt;
+}
+
+class ConstantMemory {
+public:
+  explicit ConstantMemory(PhysicalProgramAnalysis &physical) : physical(physical), values(describeScalarValue) {}
+
+  Attribute read(Value value, const UniformBindings &scalars = UniformBindings()) {
+    if (!isa<MemRefType>(value.getType())) return values.evaluate(value, scalars);
+    value = stripCast(value);
+    auto found = facts.find(value);
+    return found != facts.end() ? found->second : facts.lookup(physical.storageRoot(value));
+  }
+  void write(Value value, Attribute constant) {
+    Value root = physical.storageRoot(value);
+    SmallVector<Value> invalidated;
+    for (auto &fact : facts)
+      if (physical.storageRoot(fact.first) == root) invalidated.push_back(fact.first);
+    for (Value alias : invalidated) facts.erase(alias);
+    if (constant) facts[stripCast(value)] = constant;
+  }
+  void visit(Operation *operation, const UniformBindings &scalars = UniformBindings()) {
+    if (auto fill = dyn_cast<linalg::FillOp>(operation)) {
+      write(fill.getOutputs()[0], read(fill.getInputs()[0], scalars));
+    } else if (auto copy = dyn_cast<memref::CopyOp>(operation)) {
+      write(copy.getTarget(), read(copy.getSource(), scalars));
+    } else if (auto generic = dyn_cast<linalg::GenericOp>(operation)) {
+      if (generic.getOutputs().size() != 1) { facts.clear(); return; }
+      UniformBindings operands;
+      Value output = generic.getOutputs()[0];
+      auto maps = generic.getIndexingMapsArray();
+      bool unsafeAlias = false;
+      for (auto [number, input] : llvm::enumerate(generic.getInputs())) {
+        operands[input] = read(input, scalars);
+        if (isa<MemRefType>(input.getType()) && physical.storageRoot(input) == physical.storageRoot(output))
+          unsafeAlias |= input != output || generic.getNumReductionLoops() ||
+              maps[number] != maps.back() || !maps.back().isPermutation();
+      }
+      operands[output] = read(output, scalars);
+      write(output, unsafeAlias ? Attribute() : foldUniformComputation(generic, operands, scalars));
+    } else if (auto store = dyn_cast<memref::StoreOp>(operation)) {
+      write(store.getMemref(), store.getIndices().empty() ? read(store.getValue(), scalars) : Attribute());
+    } else {
+      auto effects = getEffectsRecursively(operation);
+      if (!effects) { facts.clear(); return; }
+      for (auto &effect : *effects) {
+        if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect())) continue;
+        if (effect.getValue()) write(effect.getValue(), {});
+        else facts.clear();
+      }
+    }
+  }
+
+private:
+  PhysicalProgramAnalysis &physical;
+  UniformValueAnalysis values;
+  UniformBindings facts;
+};
+
+bool summaryIsIdentityWhenFalse(RegionProgram program, Value predicate) {
+  PhysicalProgramAnalysis physical(program.getOperation()->getParentOfType<func::FuncOp>());
+  for (Region &region : program.getOperation()->getRegions()) {
+    unsigned firstDestination = region.front().getNumArguments() - program.count("identity_count");
+    for (Operation &operation : region.front().without_terminator()) {
+      auto effects = getEffectsRecursively(&operation);
+      if (!effects) return false;
+      for (auto &effect : *effects) {
+        if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect())) continue;
+        if (!effect.getValue()) return false;
+        Value root = physical.storageRoot(effect.getValue());
+        if (auto argument = dyn_cast<BlockArgument>(root)) {
+          if (argument.getOwner() != &region.front() || argument.getArgNumber() < firstDestination ||
+              !isa<MemoryEffects::Write>(effect.getEffect())) return false;
+        } else {
+          auto allocation = root.getDefiningOp();
+          if (!isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(allocation) ||
+              !region.isAncestor(allocation->getParentRegion())) return false;
+        }
+      }
+    }
+  }
+  ConstantMemory outer(physical), summary(physical);
+  for (Operation &operation : *program.getOperation()->getBlock()) {
+    if (&operation == program.getOperation()) break;
+    outer.visit(&operation);
+  }
+  Block &helper = program.summarize().front();
+  SmallVector<Value> inputs(program.sources());
+  llvm::append_range(inputs, program.captures());
+  for (auto [argument, input] : llvm::zip(helper.getArguments().take_front(inputs.size()), inputs))
+    summary.write(argument, outer.read(input));
+  UniformBindings scalars;
+  scalars[predicate] = IntegerAttr::get(IntegerType::get(predicate.getContext(), 1), 0);
+  for (Operation &operation : helper.without_terminator()) summary.visit(&operation, scalars);
+  for (auto [result, identity] : llvm::zip(helper.getArguments().take_back(program.count("identity_count")), program.identities()))
+    if (!equalUniformConstants(summary.read(result), outer.read(identity))) return false;
+  return true;
 }
 
 }
@@ -225,7 +323,8 @@ std::optional<RegionPredicatePlan> analyzeRegionPredicate(RegionProgram program)
     auto validity = validityField(program, generic, memberAxis);
     auto reduction = validity ? producer(helper.getArguments().take_back(program.count("identity_count"))[*validity])
                               : linalg::GenericOp();
-    return RegionPredicatePlan{compare, source.first.getArgNumber(), capture.first.getArgNumber() - sourceCount, predicate, validity, reduction};
+    return RegionPredicatePlan{compare, source.first.getArgNumber(), capture.first.getArgNumber() - sourceCount,
+        predicate, validity, reduction, summaryIsIdentityWhenFalse(program, compare)};
   }
   return std::nullopt;
 }

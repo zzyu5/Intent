@@ -18,6 +18,7 @@ struct RegionPredicatePlan {
   UniformPredicate comparison;
   std::optional<unsigned> validityField;
   mlir::Operation *validityReduction;
+  bool identityWhenFalse;
 };
 
 std::optional<CoordinateSequence> coordinateSequence(mlir::Value memory, mlir::Operation *at);

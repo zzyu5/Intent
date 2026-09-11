@@ -1,4 +1,4 @@
-#include "Intent/Analysis/UniformValues.h"
+#include "Intent/Dialect/CPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -60,44 +60,7 @@ public:
         }
         if (unsafeAlias) { forget(output); continue; }
         inputs[output] = read(output);
-        Attribute constant;
-        if (contraction) {
-          UniformExpression expression;
-          expression.kind = UniformKind::Contract;
-          expression.type = cast<MemRefType>(output.getType()).getElementType();
-          expression.operands.assign(generic.getInputs().begin(), generic.getInputs().end());
-          expression.operands.push_back(output);
-          constant = values.fold(expression, inputs);
-        } else if (!generic.getNumReductionLoops() && maps.back().isPermutation()) {
-          UniformBindings arguments;
-          for (auto [argument, operand] : llvm::zip(generic.getRegion().front().getArguments(), generic->getOperands()))
-            arguments[argument] = inputs.lookup(operand);
-          constant = values.evaluate(generic.getRegion().front().getTerminator()->getOperand(0), arguments);
-        } else if (generic.getNumReductionLoops()) {
-          UniformExpression expression;
-          expression.kind = UniformKind::Fold;
-          expression.stateCount = 1;
-          expression.type = cast<MemRefType>(output.getType()).getElementType();
-          expression.operands.push_back(output);
-          llvm::append_range(expression.operands, generic.getInputs());
-          auto arguments = generic.getRegion().front().getArguments();
-          expression.parameters.push_back(arguments.back());
-          llvm::append_range(expression.parameters, arguments.drop_back());
-          expression.yields.push_back(generic.getRegion().front().getTerminator()->getOperand(0));
-          auto iterators = generic.getIteratorTypesArray();
-          SmallVector<bool> positive(iterators.size(), false);
-          for (auto [operand, map] : llvm::zip(generic->getOperands(), generic.getIndexingMapsArray())) {
-            auto type = dyn_cast<MemRefType>(operand.getType());
-            if (!type) continue;
-            for (auto [axis, coordinate] : llvm::enumerate(map.getResults()))
-              if (auto dimension = dyn_cast<AffineDimExpr>(coordinate))
-                positive[dimension.getPosition()] = positive[dimension.getPosition()] || type.getDimSize(axis) > 0;
-          }
-          expression.nonempty = llvm::all_of(llvm::enumerate(iterators), [&](auto iterator) {
-            return iterator.value() != utils::IteratorType::reduction || positive[iterator.index()];
-          });
-          constant = values.fold(expression, inputs);
-        }
+        Attribute constant = foldUniformComputation(generic, inputs);
         if (!contraction && !constant) {
           OpBuilder builder = OpBuilder::atBlockBegin(&generic.getRegion().front());
           for (auto [argument, input] : llvm::zip(generic.getRegion().front().getArguments(), generic.getInputs())) {
