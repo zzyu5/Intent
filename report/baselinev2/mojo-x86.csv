@@ -1,6 +1,6 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
-causal_attention_f32,B8-S128-D32-f32-8cores,0.270391,0.286279,0.944502,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。独立 Mojo online attention source；沿用 CPU f32 contraction 容差；分段与归约括号可不同。
-causal_linear_attention_f32,B8-S128-D32-f32-8cores,0.079454,0.158565,0.501085,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。独立 Mojo chunked linear attention source；输出包含最终状态；沿用 CPU f32 contraction 容差。
+causal_attention_f32,B8-S128-D32-f32-8cores,0.278868,0.279233,0.998690,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。独立 Mojo online attention source；沿用 CPU f32 contraction 容差；分段与归约括号可不同。
+causal_linear_attention_f32,B8-S128-D32-f32-8cores,0.083348,0.154081,0.540938,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。独立 Mojo chunked linear attention source；输出包含最终状态；沿用 CPU f32 contraction 容差。
 batched_row_affine,17x257x4093-f32-8cores,1.444316,2.082646,0.693500,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU elementwise。
 weighted_rms_norm,8192x4096-f32-8cores,5.019436,3.447934,1.455781,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX RMSNorm；双方归约括号与中间数学实现可能不同。
 dense_gemm_f32,M1024-N1024-K1024-f32-8cores,2.183901,2.144156,1.018536,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU matmul，未缓存输入 packing。
