@@ -3327,13 +3327,10 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
             "full-coverage fill has no exact physical projection");
       fill = *projected;
     }
-    auto replacement = builder.create<LoadOp>(
-        load.getLoc(), type, load.getResource(), load.getCoordinates(), valid,
-        fill, load.getSourceAxes());
-    if (Attribute origin = load->getAttr(originAttr))
-      replacement->setAttr(originAttr, origin);
-    load.getResult().replaceAllUsesWith(replacement.getResult());
-    load.erase();
+    // Callers may be realizing coverage for this exact SSA result.  Updating
+    // its access operands keeps that value live across physicalization.
+    load.getValidMutable().assign(ValueRange{valid});
+    load.getFillMutable().assign(ValueRange{fill});
   }
 
   for (GatherOp gather : gathers) {
@@ -3361,13 +3358,8 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
             "full-coverage fill has no exact physical projection");
       fill = *projected;
     }
-    auto replacement = builder.create<GatherOp>(
-        gather.getLoc(), type, gather.getSource(), gather.getCoordinates(),
-        *valid, fill, gather.getSourceAxes());
-    if (Attribute origin = gather->getAttr(originAttr))
-      replacement->setAttr(originAttr, origin);
-    gather.getResult().replaceAllUsesWith(replacement.getResult());
-    gather.erase();
+    gather.getValidMutable().assign(ValueRange{*valid});
+    gather.getFillMutable().assign(ValueRange{fill});
   }
 
   for (StoreOp store : stores) {

@@ -32,6 +32,17 @@ FailureOr<Value> replayFragmentValue(OpBuilder &builder, Value value,
   auto fragment = dyn_cast<FragmentType>(value.getType());
   if (!fragment)
     return value;
+  if (auto extract = value.getDefiningOp<ExtractOp>()) {
+    auto record = extract.getRecord().getDefiningOp<MakeRecordOp>();
+    if (!record)
+      return failure();
+    FailureOr<Value> field = replayFragmentValue(
+        builder, record.getFields()[extract.getField()], target, mapping, analysis);
+    if (failed(field))
+      return failure();
+    mapping.map(value, *field);
+    return *field;
+  }
   PhysicalReplayFact replay = analysis.replayability(
       value, std::nullopt, PhysicalReplayScope::Coordinate,
       /*allowAccesses=*/false);
@@ -45,6 +56,20 @@ FailureOr<Value> replayFragmentValue(OpBuilder &builder, Value value,
       return failure();
     if (*replacement != operand && !mapping.lookupOrNull(operand))
       mapping.map(operand, *replacement);
+  }
+  if (isa<BroadcastOp, ReshapeOp, TransposeOp>(producer)) {
+    auto resultType = FragmentType::get(
+        target.getContext(), fragment.getElementType(), target.getShape(),
+        target.getAxisMaps(), target.getValidity(), target.getOwner());
+    // Replayed coordinates already use the destination axes.  The old shape
+    // relation must not introduce its singleton axes a second time.
+    FailureOr<Value> projected = projectPhysicalValueToSchema(
+        builder, producer->getLoc(),
+        mapping.lookupOrDefault(producer->getOperand(0)), resultType);
+    if (failed(projected))
+      return failure();
+    mapping.map(value, *projected);
+    return *projected;
   }
   Operation *clone = builder.clone(*producer, mapping);
   for (Value result : clone->getResults()) {
@@ -234,6 +259,59 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
     if (roots.isUnique() && !replay.lookupOrNull(roots.roots.front().getResult()))
       replay.map(roots.roots.front().getResult(), coordinate);
     coordinates[target.fragmentAxis] = coordinate;
+  }
+
+  if (resultType) {
+    for (auto [slot, original] : llvm::enumerate(sourceLoad.getCoordinates())) {
+      if (replay.lookupOrNull(original) || !isa<FragmentType>(original.getType()))
+        continue;
+      auto coordinateType = cast<FragmentType>(original.getType());
+      auto indexType = FragmentType::get(
+          resultType.getContext(), coordinateType.getElementType(),
+          resultType.getShape(), resultType.getAxisMaps(),
+          resultType.getValidity(), resultType.getOwner());
+      FailureOr<Value> projected = projectPhysicalValueToSchema(
+          builder, gather.getLoc(), original, indexType);
+      if (failed(projected))
+        return gather.emitOpError(
+            "retained load coordinate cannot adopt the gather result relation");
+      coordinates[slot] = *projected;
+      replay.map(original, *projected);
+    }
+    for (Value predicateOrFill : {sourceLoad.getValid(), sourceLoad.getFill()}) {
+      if (!predicateOrFill)
+        continue;
+      PhysicalRangeFact roots = analysis.sourceRanges(predicateOrFill);
+      // Bounds may use the raw range while the address uses a guarded index.
+      // Preserve each untouched range's values, not the address expression.
+      for (MakeRangeOp range : roots.roots) {
+        if (replay.lookupOrNull(range.getResult()))
+          continue;
+        auto sourceAxis = queryFragmentAxis(sourceType, sourceAxisIdentity(range));
+        if (!sourceAxis.isExact() ||
+            llvm::is_contained(gather.getSourceAxes(),
+                               static_cast<int64_t>(sourceAxis.fragmentAxis)))
+          continue;
+        auto axis = queryFragmentAxis(resultType, sourceAxisIdentity(range));
+        FailureOr<int64_t> dimension = queryRangeDimension(range);
+        auto rangeType = range.getResult().getType();
+        if (!axis.isExact() || failed(dimension) ||
+            sourceAxis.dimensionId != *dimension ||
+            axis.dimensionId != *dimension ||
+            resultType.getShape()[axis.fragmentAxis] != rangeType.getShape()[0])
+          continue;
+        auto rangeTarget = FragmentType::get(
+            resultType.getContext(), rangeType.getElementType(),
+            resultType.getShape(), resultType.getAxisMaps(),
+            resultType.getValidity(), resultType.getOwner());
+        FailureOr<Value> projectedRange = projectPhysicalValueToSchema(
+            builder, gather.getLoc(), range.getResult(), rangeTarget);
+        if (failed(projectedRange))
+          return gather.emitOpError(
+              "retained coordinate range cannot adopt the gather result relation");
+        replay.map(range.getResult(), *projectedRange);
+      }
+    }
   }
 
   if (!resultType) {

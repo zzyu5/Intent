@@ -384,7 +384,7 @@ def IntentGPU_RandomBitsOp : IntentGPU_Op<"random_bits", [Pure]> {
   let hasVerifier = 1;
 }
 
-def IntentGPU_YieldOp : IntentGPU_Op<"yield", [Terminator]> {
+def IntentGPU_YieldOp : IntentGPU_Op<"yield", [Pure, Terminator]> {
   let arguments = (ins Variadic<IntentGPU_DataValue>:$values);
 }
 
