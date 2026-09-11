@@ -1,0 +1,25 @@
+{
+  "status": "agent_program_error",
+  "candidate_ms": null,
+  "reference_ms": null,
+  "ratio": null,
+  "reference_timing_note": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0001,
+    "rtol": 1e-05
+  },
+  "failure_stage": "candidate_precompile",
+  "error": "at 20:41:\n    pid = tl.program_id(0)\n    base = pid * (BLOCK * CHUNKS)\n    running_max = -float(\"inf\")\n    running_sum = 0.0\n\n    for chunk in range(CHUNKS):\n        offsets = base + chunk * BLOCK + tl.arange(0, BLOCK)\n        mask = offsets < n_elements\n        values = tl.load(input_ptr + offsets, mask=mask, other=-float(\"inf\"))\n        chunk_max = tl.reduce(values, axis=0, combine_fn=_max_combine)\n\n        shifted = (values - chunk_max) * LOG2E\n                                         ^\nNameError(\"Cannot access global variable LOG2E from within @jit'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever.\")",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/benchmark.py\", line 118, in run\n    candidate_call.call(function)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/tasks.py\", line 132, in call\n    return function(*self.args, **self.kwargs)\n  File \"/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/logsumexp/intent/repeat-0/optimization-1/candidate.py\", line 9, in wrapper\n    return compiled.run(input)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/runtime/artifact.py\", line 72, in run\n    return self._invoke(self._runner, arguments)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/runtime/artifact.py\", line 107, in _invoke\n    return function(*arguments)\n  File \"<intent.generated.triton.logsumexp.0>\", line 120, in run\n    launch(input, output)\n  File \"<intent.generated.triton.logsumexp.0>\", line 114, in launch\n    _partial_logsumexp[grid](input, partial_max, partial_sum, n_elements)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/jit.py\", line 370, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/program.py\", line 91, in compile_tuner\n    compiled = tuner.warmup(*args, **kwargs)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/autotuner.py\", line 291, in warmup\n    ret.append(self.fn.warmup(\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/jit.py\", line 359, in warmup\n    return self.run(grid=grid, warmup=True, *map(MockTensor.wrap_dtype, args), **kwargs)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/program.py\", line 77, in compile_kernel\n    return original_jit(kernel, *args, **kwargs)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/jit.py\", line 720, in run\n    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 304, in compile\n    module = src.make_ir(target, options, codegen_fns, module_map, context)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 80, in make_ir\n    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,\ntriton.compiler.errors.CompilationError: at 20:41:\n    pid = tl.program_id(0)\n    base = pid * (BLOCK * CHUNKS)\n    running_max = -float(\"inf\")\n    running_sum = 0.0\n\n    for chunk in range(CHUNKS):\n        offsets = base + chunk * BLOCK + tl.arange(0, BLOCK)\n        mask = offsets < n_elements\n        values = tl.load(input_ptr + offsets, mask=mask, other=-float(\"inf\"))\n        chunk_max = tl.reduce(values, axis=0, combine_fn=_max_combine)\n\n        shifted = (values - chunk_max) * LOG2E\n                                         ^\nNameError(\"Cannot access global variable LOG2E from within @jit'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever.\")\n",
+  "tuning": [
+    {
+      "kernel": "_partial_logsumexp",
+      "declared": 12,
+      "measured": 0,
+      "seconds": 0.0,
+      "winner": null
+    }
+  ],
+  "preparation_and_benchmark_seconds": 0.618504781043157
+}

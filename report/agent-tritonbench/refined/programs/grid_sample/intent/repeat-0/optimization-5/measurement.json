@@ -1,0 +1,25 @@
+{
+  "status": "pass",
+  "candidate_ms": 0.028336000628769398,
+  "reference_ms": 0.030128000304102898,
+  "ratio": 0.9405204574732609,
+  "reference_timing_note": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0001,
+    "rtol": 1e-05
+  },
+  "precompile_seconds": 0.6835598789621145,
+  "precompile_failures": [],
+  "preparation_policy": "compile_only_before_gpu_timing_lock",
+  "tuning": [
+    {
+      "kernel": "grid_sample_kernel",
+      "declared": 10,
+      "measured": 10,
+      "seconds": 0.15672516822814941,
+      "winner": "BLOCK_H: 1, BLOCK_W: 128, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+    }
+  ],
+  "preparation_and_benchmark_seconds": 1.5009583130013198
+}

@@ -369,7 +369,7 @@ sqrt,upstream-profile-8,intent,0,optimization,1,pass,0.006136000156402588,0.0079
 tanh,upstream-profile-8,triton,0,optimization,2,pass,0.007967999903485179,0.007671999745070934,1.0385818780304858,,,,,,,
 rsqrt,upstream-profile-8,triton,0,optimization,1,pass,0.0060800001956522465,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
 rsqrt,upstream-profile-8,intent,0,optimization,1,pass,0.0064479997381567955,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
-grid_sample,upstream-profile-0,intent,0,optimization,1,evaluation_error,,,,candidate_precompile,Triton launch did not return a compiled kernel artifact,,,agent_program_error,,
+grid_sample,upstream-profile-0,intent,0,optimization,1,pass,0.04122399911284447,0.02868800051510334,1.4369770765704397,,,,,evaluation_error,True,
 sqrt,upstream-profile-8,triton,0,optimization,2,pass,0.005936000030487776,0.007920000003650784,0.7494949529989308,,,,,,,
 tanh,upstream-profile-8,intent,0,optimization,1,pass,0.006160000106319785,0.006912000011652708,0.8912037175831667,,,,,,,
 rsqrt,upstream-profile-8,triton,0,optimization,2,pass,0.005535999778658152,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
@@ -386,3 +386,332 @@ rsqrt,upstream-profile-8,intent,0,optimization,3,pass,0.007360000163316727,,,,,T
 rsqrt,upstream-profile-8,triton,0,optimization,4,pass,0.005696000065654516,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
 sqrt,upstream-profile-8,intent,0,optimization,3,pass,0.005904000019654632,0.007920000003650784,0.7454545475925679,,,,,,,
 sqrt,upstream-profile-8,triton,0,optimization,4,pass,0.0059200001414865255,0.007952000014483929,0.7444668172414136,,,,,,,
+tanh,upstream-profile-8,intent,0,optimization,3,pass,0.0077599999494850636,0.007823999971151352,0.9918200381004257,,,,,,,
+fused_index_select_eq,upstream-profile-1,intent,0,optimization,2,pass,0.0038880000356584787,0.005936000030487776,0.6549865255541436,,,,,,,
+rsqrt,upstream-profile-8,triton,0,optimization,5,pass,0.005696000065654516,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+sqrt,upstream-profile-8,intent,0,optimization,4,pass,0.005927999969571829,0.007935999892652035,0.7469758127215427,,,,,,,
+tanh,upstream-profile-8,triton,0,optimization,5,pass,0.007943999953567982,0.007887999759986997,1.0070994162379485,,,,,,,
+rsqrt,upstream-profile-8,intent,0,optimization,4,pass,0.005696000065654516,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+grid_sample,upstream-profile-0,intent,0,optimization,3,pass,0.04273599945008755,0.028432000428438187,1.5030950621167778,,,,,,,
+sqrt,upstream-profile-8,triton,0,optimization,5,pass,0.0059200001414865255,0.007927999831736088,0.7467205180540668,,,,,,,
+argmax,upstream-profile-8,triton,0,optimization,1,pass,0.007967999903485179,0.010479999706149101,0.7603053556203808,,,,,,,
+rsqrt,upstream-profile-8,intent,0,optimization,5,pass,0.007552000228315592,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+fused_index_select_eq,upstream-profile-1,intent,0,optimization,3,pass,0.003904000041075051,0.0059200001414865255,0.659459450636896,,,,,,,
+tanh,upstream-profile-8,intent,0,optimization,4,pass,0.0059200001414865255,0.007143999915570021,0.8286674428122761,,,,,,,
+sqrt,upstream-profile-8,intent,0,optimization,5,pass,0.006720000179484487,0.007823999971151352,0.8588957316286384,,,,,,,
+argmax,upstream-profile-8,triton,0,optimization,2,pass,0.007967999903485179,0.010464000049978495,0.7614678770477983,,,,,,,
+grid_sample,upstream-profile-0,intent,0,optimization,4,pass,0.02844800055027008,0.0294560007750988,0.9657794609483833,,,,,,,
+max,upstream-profile-8,triton,0,optimization,1,pass,0.007967999903485179,0.010544000193476677,0.755690417040659,,,,,,,
+relu,upstream-profile-8,triton,0,optimization,1,pass,0.0059200001414865255,0.007175999926403165,0.8249721574974729,,,,,,,
+max,upstream-profile-8,intent,0,optimization,1,pass,0.007967999903485179,0.010792000219225883,0.7383246610104988,,,,,,,
+fused_index_select_eq,upstream-profile-1,intent,0,optimization,4,pass,0.0038720000302419066,0.0059200001414865255,0.6540540435307555,,,,,,,
+relu,upstream-profile-8,triton,0,optimization,2,pass,0.005888000130653381,0.007887999759986997,0.7464503435358989,,,,,,,
+argmax,upstream-profile-8,intent,0,optimization,1,pass,0.007967999903485179,0.010464000049978495,0.7614678770477983,,,,,,,
+argmax,upstream-profile-8,triton,0,optimization,3,pass,0.007967999903485179,0.010464000049978495,0.7614678770477983,,,,,,,
+grid_sample,upstream-profile-0,intent,0,optimization,5,pass,0.028336000628769398,0.030128000304102898,0.9405204574732609,,,,,,,
+tanh,upstream-profile-8,intent,0,optimization,5,pass,0.0059200001414865255,0.007224000059068203,0.819490599817371,,,,,,,
+relu,upstream-profile-8,triton,0,optimization,3,pass,0.007823999971151352,0.007840000092983246,0.9979591681578915,,,,,,,
+mean,upstream-profile-8,triton,0,optimization,1,pass,0.007967999903485179,0.010464000049978495,0.7614678770477983,,,,,,,
+argmax,upstream-profile-8,intent,0,optimization,2,pass,0.007967999903485179,0.010464000049978495,0.7614678770477983,,,,,,,
+max,upstream-profile-8,triton,0,optimization,2,agent_program_error,,,,candidate_precompile,"at 18:32:
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    valid = offsets < n_elements
+    values = tl.load(input_ptr + offsets, mask=valid, other=-float(""inf""))
+    best = tl.argmax(values, axis=0, tie_break_left=True)
+    best_offset = pid * BLOCK + best
+    best_value = tl.load(input_ptr + best_offset)
+    tl.store(partial_values_ptr + pid, best_value)
+    tl.store(partial_indices_ptr + pid, best_offset)
+
+    tail_offsets = tl.arange(0, _MAX_PARTIALS)
+                                ^
+NameError(""Cannot access global variable _MAX_PARTIALS from within @jit'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever."")",,,,,
+relu,upstream-profile-8,triton,0,optimization,4,pass,0.0059200001414865255,0.006904000183567405,0.8574739258520079,,,,,,,
+fused_index_select_eq,upstream-profile-1,intent,0,optimization,5,pass,0.004080000100657344,0.0059200001414865255,0.6891891897206689,,,,,,,
+max,upstream-profile-8,intent,0,optimization,2,pass,0.007984000025317073,0.010864000301808119,0.7349042529010495,,,,,,,
+mean,upstream-profile-8,triton,0,optimization,2,pass,0.007855999981984496,0.010607999749481678,0.7405731681289257,,,,,,,
+argmax,upstream-profile-8,triton,0,optimization,4,pass,0.007840000092983246,0.010607999749481678,0.7390648829310464,,,,,,,
+relu,upstream-profile-8,triton,0,optimization,5,pass,0.007744000293314457,0.007823999971151352,0.9897750922633091,,,,,,,
+relu,upstream-profile-8,intent,0,optimization,1,pass,0.006128000095486641,0.00791999977082014,0.7737374081832918,,,,,,,
+mean,upstream-profile-8,intent,0,optimization,1,pass,0.007935999892652035,0.010495999827980995,0.7560975631397852,,,,,,,
+argmax,upstream-profile-8,intent,0,optimization,3,pass,0.007967999903485179,0.010464000049978495,0.7614678770477983,,,,,,,
+mean,upstream-profile-8,triton,0,optimization,3,pass,0.007855999981984496,0.010607999749481678,0.7405731681289257,,,,,,,
+max,upstream-profile-8,intent,0,optimization,3,pass,0.007967999903485179,0.010815999936312437,0.7366863859470173,,,,,,,
+relu,upstream-profile-8,intent,0,optimization,2,pass,0.006136000156402588,0.007823999971151352,0.7842536016139116,,,,,,,
+max,upstream-profile-8,triton,0,optimization,3,pass,0.010015999898314476,0.010848000179976225,0.923303810116311,,,,,,,
+mean,upstream-profile-8,intent,0,optimization,2,pass,0.19419199973344803,0.010607999749481678,18.306184419257413,,,,,,,
+mean,upstream-profile-8,triton,0,optimization,4,pass,0.00788799999281764,0.010607999749481678,0.7435897604732749,,,,,,,
+argmax,upstream-profile-8,intent,0,optimization,4,pass,0.007840000092983246,0.010607999749481678,0.7390648829310464,,,,,,,
+logsumexp,upstream-profile-8,triton,0,optimization,1,pass,0.00787200010381639,0.028760000132024288,0.2737134933129194,,,,,,,
+argmax,upstream-profile-8,triton,0,optimization,5,pass,0.007855999981984496,0.010592000093311071,0.7416918346654491,,,,,,,
+relu,upstream-profile-8,intent,0,optimization,3,pass,0.006144000217318535,0.007823999971151352,0.7852761042909878,,,,,,,
+mean,upstream-profile-8,intent,0,optimization,3,agent_program_error,,,,candidate_precompile,"at 5:29:
+def _mean_final(partial, output, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    values = tl.load(partial + offsets)
+    total = tl.sum(values, axis=0)
+    tl.store(output, total * _INV_N_ELEMENTS)
+                             ^
+NameError(""Cannot access global variable _INV_N_ELEMENTS from within @jit'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever."")",,,,,
+max,upstream-profile-8,intent,0,optimization,4,pass,0.007975999964401126,0.01080000028014183,0.7385184960658521,,,,,,,
+max,upstream-profile-8,triton,0,optimization,4,pass,0.007967999903485179,0.010584000032395124,0.7528344556969967,,,,,,,
+logsumexp,upstream-profile-8,triton,0,optimization,2,pass,0.009903999976813793,0.028768000192940235,0.3442714095658366,,,,,,,
+mean,upstream-profile-8,triton,0,optimization,5,pass,0.00788799999281764,0.01054399972781539,0.7481032052769176,,,,,,,
+mean,upstream-profile-8,intent,0,optimization,4,pass,0.00788799999281764,0.01054399972781539,0.7481032052769176,,,,,,,
+relu,upstream-profile-8,intent,0,optimization,4,pass,0.00583200016990304,0.007823999971151352,0.7453987974701927,,,,,,,
+logsumexp,upstream-profile-8,intent,0,optimization,1,agent_program_error,,,,candidate_precompile,"at 20:41:
+    pid = tl.program_id(0)
+    base = pid * (BLOCK * CHUNKS)
+    running_max = -float(""inf"")
+    running_sum = 0.0
+
+    for chunk in range(CHUNKS):
+        offsets = base + chunk * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < n_elements
+        values = tl.load(input_ptr + offsets, mask=mask, other=-float(""inf""))
+        chunk_max = tl.reduce(values, axis=0, combine_fn=_max_combine)
+
+        shifted = (values - chunk_max) * LOG2E
+                                         ^
+NameError(""Cannot access global variable LOG2E from within @jit'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever."")",,,,,
+fused_mv_sigmoid_sub,upstream-profile-4,triton,0,optimization,1,pass,0.007823999971151352,0.01190400030463934,0.6572580452725718,,,,,,,
+logsumexp,upstream-profile-8,triton,0,optimization,3,pass,0.008832000195980072,0.028504000045359135,0.30985125532997077,,,,,,,
+argmax,upstream-profile-8,intent,0,optimization,5,pass,0.007832000032067299,0.010607999749481678,0.7383107293578115,,,,,,,
+max,upstream-profile-8,triton,0,optimization,5,pass,0.007967999903485179,0.010847999714314938,0.7345132847828773,,,,,,,
+relu,upstream-profile-8,intent,0,optimization,5,pass,0.006144000217318535,0.007823999971151352,0.7852761042909878,,,,,,,
+max,upstream-profile-8,intent,0,optimization,5,pass,0.00787200010381639,0.012640000320971012,0.6227848025253577,,,,,,,
+logsumexp,upstream-profile-8,triton,0,optimization,4,pass,0.00787200010381639,0.02875200007110834,0.27378965234932046,,,,,,,
+logsumexp,upstream-profile-8,intent,0,optimization,2,numerical_failure,,,,comparison,"generated/source floating result 0 differs: max_abs=4.113162994384766, atol=0.0001, rtol=1e-05",,,,,
+mean,upstream-profile-8,intent,0,optimization,5,pass,0.007855999981984496,0.010607999749481678,0.7405731681289257,,,,,,,
+add_gelu,upstream-profile-8,triton,0,optimization,1,agent_program_error,,,,candidate_precompile,"at 23:34:
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+    x = tl.load(input_ptr + offsets).to(tl.float32)
+    other = tl.load(other_ptr + offsets).to(tl.float32)
+    if ALPHA_IS_ONE:
+        x = x + other
+    else:
+        x = x + alpha * other
+
+    if APPROXIMATE_TANH or USE_TANH:
+        x3 = x * x * x
+        result = 0.5 * x * (1.0 + tl.tanh(0.7978845608028654 * (x + 0.044715 * x3)))
+                                  ^
+AttributeError(""module 'triton.language' has no attribute 'tanh'"")",,,,,
+fused_mv_sigmoid_sub,upstream-profile-4,triton,0,optimization,2,pass,0.00788799999281764,0.011968000326305628,0.6590908905207699,,,,,,,
+log1p,upstream-profile-8,triton,0,optimization,1,pass,0.005944000091403723,0.0071680000983178616,0.8292410728061542,,,,,,,
+fused_mv_sigmoid_sub,upstream-profile-4,intent,0,optimization,1,pass,0.01616000011563301,0.010815999936312437,1.4940828597251763,,,,,,,
+add_gelu,upstream-profile-8,intent,0,optimization,1,pass,0.007984000025317073,0.01208000024780631,0.6609271408555593,,,,,,,
+logsumexp,upstream-profile-8,triton,0,optimization,5,pass,0.007920000003650784,0.028464000672101974,0.2782461992917708,,,,,,,
+log1p,upstream-profile-8,triton,0,optimization,2,pass,0.006912000011652708,0.007855999981984496,0.87983707071072,,,,,,,
+log1p,upstream-profile-8,intent,0,optimization,1,pass,0.006152000278234482,0.007920000003650784,0.7767677115402362,,,,,,,
+add_gelu,upstream-profile-8,triton,0,optimization,2,pass,0.005951999919489026,0.012064000125974417,0.49336868843975407,,,,,,,
+logsumexp,upstream-profile-8,intent,0,optimization,3,pass,0.008960000239312649,0.02838400099426508,0.31567079782455604,,,,,,,
+add_gelu,upstream-profile-8,intent,0,optimization,2,pass,0.007952000014483929,0.01104000024497509,0.720289840401346,,,,,,,
+softplus_linear,upstream-profile-6,triton,0,optimization,1,pass,0.03136000037193298,0.018080000765621662,1.734513221457527,,,,,,,
+fused_mv_sigmoid_sub,upstream-profile-4,triton,0,optimization,3,pass,0.007823999971151352,0.01190400030463934,0.6572580452725718,,,,,,,
+fused_mv_sigmoid_sub,upstream-profile-4,intent,0,optimization,2,pass,0.01003200002014637,0.011344000231474638,0.8843441304163551,,,,,,,
+add_gelu,upstream-profile-8,intent,0,optimization,3,pass,0.006144000217318535,0.012064000125974417,0.5092838323244199,,,,,,,
+log1p,upstream-profile-8,intent,0,optimization,2,pass,0.005888000130653381,0.007871999870985746,0.7479675085304689,,,,,,,
+add_gelu,upstream-profile-8,triton,0,optimization,3,agent_program_error,,,,candidate_precompile,"at 19:30:
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    x = tl.load(input_ptr + offsets)
+    other_value = tl.load(other_ptr + offsets)
+
+    if ALPHA_IS_ONE:
+        x = x + other_value
+    else:
+        x = x + alpha * other_value
+
+    result = x * (0.5 + 0.5 * tl.erf(x * 0.7071067811865476))
+                              ^
+Expected dtype ['fp32', 'fp64'] but got fp16",,,,,
+log1p,upstream-profile-8,triton,0,optimization,3,pass,0.005927999969571829,0.007896000053733587,0.7507598694567893,,,,,,,
+logsumexp,upstream-profile-8,intent,0,optimization,4,pass,0.007967999903485179,0.028479999862611294,0.2797752788596609,,,,,,,
+softplus_linear,upstream-profile-6,triton,0,optimization,2,agent_program_error,,,,candidate_precompile,"at 42:19:
+        accumulator = tl.dot(
+            input_values[None, :],
+            tl.trans(weight_values),
+            acc=accumulator,
+            input_precision=""ieee"",
+        )
+
+    if HAS_BIAS:
+        bias_values = tl.load(bias_ptr + n_offsets, mask=n_mask, other=0.0)
+        accumulator += bias_values[None, :]
+
+    linear_value = accumulator[0, :]
+                   ^
+unsupported tensor index: constexpr[0]",,,,,
+log1p,upstream-profile-8,intent,0,optimization,3,pass,0.006152000278234482,0.007879999931901693,0.7807107019542587,,,,,,,
+fused_mv_sigmoid_sub,upstream-profile-4,triton,0,optimization,4,pass,0.007840000092983246,0.011920000426471233,0.6577181050742781,,,,,,,
+log1p,upstream-profile-8,triton,0,optimization,4,pass,0.007791999960318208,0.007823999971151352,0.9959100190502128,,,,,,,
+logsumexp,upstream-profile-8,intent,0,optimization,5,pass,0.009848000016063452,0.02875200007110834,0.34251530299484406,,,,,,,
+add_gelu,upstream-profile-8,triton,0,optimization,4,pass,0.006160000106319785,0.012064000125974417,0.5106100830566958,,,,,,,
+fused_mv_sigmoid_sub,upstream-profile-4,intent,0,optimization,3,pass,0.01003200002014637,0.010359999723732471,0.9683397961068738,,,,,,,
+add_gelu,upstream-profile-8,intent,0,optimization,4,pass,0.007839999860152602,0.01208000024780631,0.6490065976262145,,,,,,,
+log1p,upstream-profile-8,intent,0,optimization,4,pass,0.006320000160485506,0.00788799999281764,0.8012170596146216,,,,,,,
+log1p,upstream-profile-8,triton,0,optimization,5,pass,0.007735999999567866,0.007840000092983246,0.9867346821196521,,,,,,,
+fused_mv_sigmoid_sub,upstream-profile-4,triton,0,optimization,5,pass,0.00787200010381639,0.011336000170558691,0.6944248399238001,,,,,,,
+mul_relu,upstream-profile-8,triton,0,optimization,1,pass,0.009871999733150005,0.01193600008264184,0.827077719906064,,,,,,,
+add_gelu,upstream-profile-8,intent,0,optimization,5,pass,0.007808000082150102,0.01193600008264184,0.6541554983318941,,,,,,,
+softplus_linear,upstream-profile-6,triton,0,optimization,3,pass,0.044703999534249306,0.018080000765621662,2.4725662412167604,,,,,,,
+add_gelu,upstream-profile-8,triton,0,optimization,5,pass,0.005936000030487776,0.012064000125974417,0.4920424377074782,,,,,,,
+log1p,upstream-profile-8,intent,0,optimization,5,pass,0.007631999906152487,0.007823999971151352,0.9754601143012771,,,,,,,
+mul_relu,upstream-profile-8,triton,0,optimization,2,pass,0.0098879998549819,0.01193600008264184,0.8284182126776051,,,,,,,
+softplus_linear,upstream-profile-6,intent,0,optimization,1,agent_program_error,,,,candidate_precompile,"at 46:13:
+            + k_offsets[None, :] * stride_weight_k,
+            mask=n_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        accumulator = tl.dot(
+            input_values[None, :],
+            tl.permute(weight_values, (1, 0)),
+            accumulator,
+            input_precision=""ieee"",
+        )
+
+    linear = accumulator[0, :]
+             ^
+unsupported tensor index: constexpr[0]",,,,,
+mul_relu,upstream-profile-8,triton,0,optimization,3,pass,0.01003200002014637,0.012064000125974417,0.83156497972401,,,,,,,
+combined_activation,upstream-profile-6,intent,0,optimization,1,pass,0.014119999948889017,0.024368000216782093,0.5794484497404371,,,,,,,
+combined_activation,upstream-profile-6,triton,0,optimization,1,pass,0.016176000237464905,0.0243520000949502,0.6642575630089322,,,,,,,
+mul_relu,upstream-profile-8,intent,0,optimization,1,pass,0.0098879998549819,0.011952000204473734,0.8273092106608848,,,,,,,
+softplus_linear,upstream-profile-6,triton,0,optimization,4,pass,0.01003200002014637,0.018424000591039658,0.5445071481937175,,,,,,,
+mul_relu,upstream-profile-8,triton,0,optimization,4,pass,0.010015999898314476,0.012048000004142523,0.8313412927349457,,,,,,,
+gelu_conv2d,upstream-profile-4,triton,0,optimization,1,pass,0.044735999777913094,0.03447999991476536,1.2974477925899244,,,,,,,
+fused_mv_sigmoid_sub,upstream-profile-4,intent,0,optimization,4,pass,0.007879999931901693,0.011920000426471233,0.6610737961386524,,,,,,,
+mul_relu,upstream-profile-8,intent,0,optimization,2,pass,0.0098879998549819,0.01193600008264184,0.8284182126776051,,,,,,,
+combined_activation,upstream-profile-6,triton,0,optimization,2,pass,0.01616000011563301,0.0243520000949502,0.6636005277851514,,,,,,,
+combined_activation,upstream-profile-6,intent,0,optimization,2,pass,0.012368000112473965,0.024368000216782093,0.5075508865087829,,,,,,,
+mul_relu,upstream-profile-8,triton,0,optimization,5,pass,0.009920000098645687,0.012032000347971916,0.8244680694609337,,,,,,,
+softplus_linear,upstream-profile-6,triton,0,optimization,5,agent_program_error,,,,candidate_precompile,"at 33:4:
+        k_offsets = k_start + tl.arange(0, BLOCK_K)
+        input_values = tl.load(input_row + k_offsets)
+        weight_values = tl.load(weight_row + k_offsets)
+        accumulator += tl.sum(input_values * weight_values, axis=0)
+
+    if HAS_BIAS:
+        accumulator += tl.load(bias_ptr + col)
+
+    scaled_value = accumulator * BETA
+    softplus_value = tl.log(1.0 + tl.exp(scaled_value)) / BETA
+    result = tl.where(scaled_value > THRESHOLD, accumulator, softplus_value)
+    tl.store(output_ptr + row * 1024 + col, result)
+    ^
+Value argument cannot be block type if pointer argument is not a block",,,,,
+combined_activation,upstream-profile-6,intent,0,optimization,3,pass,0.013791999779641628,0.024335999973118305,0.566732404457444,,,,,,,
+softplus_linear,upstream-profile-6,intent,0,optimization,2,pass,0.025679999962449074,0.018223999999463558,1.4091308144866654,,,,,,,
+tensordot,upstream-profile-4,triton,0,optimization,1,pass,0.0066720000468194485,0.005760000087320805,1.1583333239015365,,,,,,,
+mul_relu,upstream-profile-8,intent,0,optimization,3,pass,0.0098879998549819,0.011920000426471233,0.8295301594975796,,,,,,,
+fused_mv_sigmoid_sub,upstream-profile-4,intent,0,optimization,5,pass,0.008191999979317188,0.011920000426471233,0.6872482958242919,,,,,,,
+combined_activation,upstream-profile-6,triton,0,optimization,3,pass,0.018207999877631664,0.024335999973118305,0.7481919747593825,,,,,,,
+combined_activation,upstream-profile-6,intent,0,optimization,4,pass,0.013952000066637993,0.024224000051617622,0.5759577293968141,,,,,,,
+gelu_conv2d,upstream-profile-4,triton,0,optimization,2,pass,0.059088001027703285,0.034463999792933464,1.714484719786319,,,,,,,
+tensordot,upstream-profile-4,triton,0,optimization,2,pass,0.0057760002091526985,0.005792000098153949,0.9972375882717354,,,,,,,
+asin,upstream-profile-8,triton,0,optimization,1,pass,0.005792000098153949,0.005792000098153949,1.0,,,,,,,
+mul_relu,upstream-profile-8,intent,0,optimization,4,pass,0.0098879998549819,0.01193600008264184,0.8284182126776051,,,,,,,
+combined_activation,upstream-profile-6,triton,0,optimization,4,pass,0.016176000237464905,0.0243520000949502,0.6642575630089322,,,,,,,
+softplus_linear,upstream-profile-6,intent,0,optimization,3,pass,0.018207999877631664,0.018192000687122345,1.0008794629455267,,,,,,,
+asin,upstream-profile-8,intent,0,optimization,1,pass,0.005904000019654632,0.005912000080570579,0.9986468097417254,,,,,,,
+combined_activation,upstream-profile-6,intent,0,optimization,5,pass,0.012360000051558018,0.024368000216782093,0.5072225846028088,,,,,,,
+gelu_conv2d,upstream-profile-4,triton,0,optimization,3,pass,0.04483200050890446,0.034592000767588615,1.29602218761831,,,,,,,
+mul_relu,upstream-profile-8,intent,0,optimization,5,pass,0.010015999898314476,0.012048000004142523,0.8313412927349457,,,,,,,
+tensordot,upstream-profile-4,triton,0,optimization,3,pass,0.0057840002700686455,0.005760000087320805,1.0041666983305557,,,,,,,
+asin,upstream-profile-8,triton,0,optimization,2,pass,0.005792000098153949,0.005792000098153949,1.0,,,,,,,
+combined_activation,upstream-profile-6,triton,0,optimization,5,pass,0.01616000011563301,0.024335999973118305,0.6640368233679917,,,,,,,
+asin,upstream-profile-8,intent,0,optimization,2,pass,0.005792000098153949,0.005792000098153949,1.0,,,,,,,
+add_mean,upstream-profile-8,intent,0,optimization,1,pass,0.09179200232028961,0.0184480007737875,4.9757154417900695,,,,,,,
+softplus_linear,upstream-profile-6,intent,0,optimization,4,pass,0.016176000237464905,0.018223999999463558,0.8876207329862303,,,,,,,
+tensordot,upstream-profile-4,triton,0,optimization,4,pass,0.005775999976322055,0.005760000087320805,1.002777758465051,,,,,,,
+asin,upstream-profile-8,triton,0,optimization,3,pass,0.005792000098153949,0.005792000098153949,1.0,,,,,,,
+add_mean,upstream-profile-8,triton,0,optimization,1,pass,0.011920000426471233,0.018463999964296818,0.6455806136005479,,,,,,,
+add_mean,upstream-profile-8,intent,0,optimization,2,pass,0.01089600007981062,0.01845599990338087,0.5903771205489999,,,,,,,
+asin,upstream-profile-8,intent,0,optimization,3,pass,0.0057840002700686455,0.005792000098153949,0.9986188142351978,,,,,,,
+asin,upstream-profile-8,triton,0,optimization,4,pass,0.005792000098153949,0.005792000098153949,1.0,,,,,,,
+add_mean,upstream-profile-8,intent,0,optimization,3,pass,0.011920000426471233,0.018463999964296818,0.6455806136005479,,,,,,,
+tensordot,upstream-profile-4,triton,0,optimization,5,pass,0.005760000087320805,0.005760000087320805,1.0,,,,,,,
+fused_layer_norm_relu_linear,upstream-profile-4,triton,0,optimization,1,pass,0.15543999522924423,0.06679200008511543,2.327224742950675,,,,,,,
+gelu_conv2d,upstream-profile-4,triton,0,optimization,4,pass,0.040735999122262,0.034592000767588615,1.177613269494087,,,,,,,
+asin,upstream-profile-8,intent,0,optimization,4,pass,0.0059200001414865255,0.0059200001414865255,1.0,,,,,,,
+softplus_linear,upstream-profile-6,intent,0,optimization,5,pass,0.016176000237464905,0.018223999999463558,0.8876207329862303,,,,,,,
+add_mean,upstream-profile-8,triton,0,optimization,2,pass,0.011920000426471233,0.018432000651955605,0.6467013891520529,,,,,,,
+asin,upstream-profile-8,intent,0,optimization,5,pass,0.005872000008821487,0.0059200001414865255,0.9918918696760394,,,,,,,
+asin,upstream-profile-8,triton,0,optimization,5,pass,0.005792000098153949,0.005792000098153949,1.0,,,,,,,
+add_mean,upstream-profile-8,intent,0,optimization,4,numerical_failure,,,,comparison,"generated/source floating result 0 differs: max_abs=0.007759392261505127, atol=0.0001, rtol=1e-05",,,,,
+add_mean,upstream-profile-8,triton,0,optimization,3,pass,0.011920000426471233,0.0184480007737875,0.6461404990511597,,,,,,,
+fused_layer_norm_relu_linear,upstream-profile-4,triton,0,optimization,2,pass,0.14336799830198288,0.0663359984755516,2.161239773225419,,,,,,,
+add_mean,upstream-profile-8,intent,0,optimization,5,pass,0.011392000131309032,0.01845599990338087,0.6172518525654188,,,,,,,
+gelu_conv2d,upstream-profile-4,triton,0,optimization,5,pass,0.036584001034498215,0.03460800088942051,1.0570966277824432,,,,,,,
+fused_layer_norm_relu_linear,upstream-profile-4,triton,0,optimization,3,pass,0.14316799491643906,0.06696800142526627,2.137856765461473,,,,,,,
+fused_layer_norm_relu_linear,upstream-profile-4,intent,0,optimization,1,pass,0.2131040021777153,0.06654400005936623,3.202452542492152,,,,,,,
+conv2d,upstream-profile-2,triton,0,optimization,1,pass,0.02948799915611744,0.034592000767588615,0.8524513905465269,,,,,,,
+fused_gather_masked_fill,upstream-profile-5,triton,0,optimization,1,pass,0.017463999800384045,0.02638399973511696,0.6619163119964543,,,,,,,
+add_mean,upstream-profile-8,triton,0,optimization,4,pass,0.011920000426471233,0.018432000651955605,0.6467013891520529,,,,,,,
+fused_gather_masked_fill,upstream-profile-5,triton,0,optimization,2,pass,0.017088000662624836,0.026399999856948853,0.6472727558794676,,,,,,,
+fused_cholesky_solve,upstream-profile-6,triton,0,optimization,1,pass,1.5364160537719727,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+conv2d,upstream-profile-2,triton,0,optimization,2,pass,0.0284639997407794,0.03460800088942051,0.8224687647150605,,,,,,,
+fused_layer_norm_relu_linear,upstream-profile-4,intent,0,optimization,2,agent_program_error,,,,candidate_build,generated triton source must define launch() and run(),,,,,
+fused_cholesky_solve,upstream-profile-6,intent,0,optimization,1,pass,0.5529599785804749,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+add_mean,upstream-profile-8,triton,0,optimization,5,pass,0.09195199981331825,0.018432000651955605,4.988715091194525,,,,,,,
+matmul,upstream-profile-6,intent,0,optimization,1,pass,0.01616000011563301,0.017656000331044197,0.9152695861258681,,,,,,,
+fused_cholesky_solve,upstream-profile-6,triton,0,optimization,2,pass,11.059807777404785,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+fused_gather_masked_fill,upstream-profile-5,triton,0,optimization,3,pass,0.018144000321626663,0.026399999856948853,0.6872727431796143,,,,,,,
+conv2d,upstream-profile-2,triton,0,optimization,3,pass,0.08376000076532364,0.034592000767588615,2.421369071077368,,,,,,,
+fused_layer_norm_relu_linear,upstream-profile-4,triton,0,optimization,4,pass,0.14313600212335587,0.06753599643707275,2.119403128326152,,,,,,,
+fused_gather_masked_fill,upstream-profile-5,intent,0,optimization,1,pass,0.0323840007185936,0.026271999813616276,1.232643154245517,,,,,,,
+matmul,upstream-profile-6,intent,0,optimization,2,pass,0.016080000437796116,0.018064000643789768,0.8901682830333748,,,,,,,
+conv2d,upstream-profile-2,triton,0,optimization,4,pass,0.029160000383853912,0.034463999792933464,0.8461002947728926,,,,,,,
+fused_layer_norm_relu_linear,upstream-profile-4,intent,0,optimization,3,execution_failure,,,,generated_launch,"out of resource: shared memory, Required: 524800, Hardware limit: 101376. Reducing block sizes or `num_stages` may help.",,,,,
+fused_gather_masked_fill,upstream-profile-5,triton,0,optimization,4,pass,0.018207999877631664,0.0264079999178648,0.6894880314398252,,,,,,,
+conv2d,upstream-profile-2,triton,0,optimization,5,pass,0.029680000618100166,0.034463999792933464,0.8611885096455283,,,,,,,
+fused_cholesky_solve,upstream-profile-6,intent,0,optimization,2,pass,1.4421119689941406,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+fused_gather_masked_fill,upstream-profile-5,intent,0,optimization,2,pass,0.026415999978780746,0.026399999856948853,1.000606065224189,,,,,,,
+fused_gather_masked_fill,upstream-profile-5,triton,0,optimization,5,pass,0.018087999895215034,0.026399999856948853,0.6851515148949524,,,,,,,
+fused_cholesky_solve,upstream-profile-6,triton,0,optimization,3,pass,1.5396159887313843,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+matmul,upstream-profile-6,intent,0,optimization,3,pass,0.016176000237464905,0.017215999774634838,0.9395911041598517,,,,,,,
+fused_gather_masked_fill,upstream-profile-5,intent,0,optimization,3,pass,0.024208000861108303,0.02628799993544817,0.9208764805444525,,,,,,,
+fused_layer_norm_relu_linear,upstream-profile-4,triton,0,optimization,5,numerical_failure,,,,comparison,"generated/source floating result 0 differs: max_abs=6.947726726531982, atol=0.0001, rtol=1e-05",,,,,
+addmm,upstream-profile-6,triton,0,optimization,1,pass,0.054927999153733253,0.022168000228703022,2.477805782526686,,,,,,,
+fused_cholesky_solve,upstream-profile-6,intent,0,optimization,3,numerical_failure,,,,comparison,"generated/source floating result 0 differs: max_abs=0.00015375507064163685, atol=0.0001, rtol=0.0001",,,,,
+matmul,upstream-profile-6,intent,0,optimization,4,pass,0.01616000011563301,0.017967999912798405,0.8993766804352233,,,,,,,
+fused_cholesky_solve,upstream-profile-6,triton,0,optimization,4,pass,1.5140479803085327,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+fused_layer_norm_relu_linear,upstream-profile-4,intent,0,optimization,4,pass,0.21315199881792068,0.06678400188684464,3.1916625658203954,,,,,,,
+fused_gather_masked_fill,upstream-profile-5,intent,0,optimization,4,pass,0.022304000332951546,0.02638399973511696,0.8453608458487454,,,,,,,
+fused_cholesky_solve,upstream-profile-6,intent,0,optimization,4,pass,0.5396479964256287,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+matmul,upstream-profile-6,intent,0,optimization,5,pass,0.01640000008046627,0.01795199979096651,0.9135472521963146,,,,,,,
+fused_qr_solve,upstream-profile-4,triton,0,optimization,1,pass,2.326047897338867,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+addmm,upstream-profile-6,intent,0,optimization,1,pass,0.02024799957871437,0.022288000211119652,0.9084708985516112,,,,,,,
+addmm,upstream-profile-6,triton,0,optimization,2,pass,0.018207999877631664,0.022272000089287758,0.8175287268604686,,,,,,,
+fused_gather_masked_fill,upstream-profile-5,intent,0,optimization,5,pass,0.022160000167787075,0.026255999691784382,0.8439975787599143,,,,,,,
+fused_cholesky_solve,upstream-profile-6,triton,0,optimization,5,pass,1.4982719421386719,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+addmm,upstream-profile-6,intent,0,optimization,2,pass,0.020255999639630318,0.02223999984562397,0.9107913570249403,,,,,,,
+fused_qr_solve,upstream-profile-4,triton,0,optimization,2,pass,4.156944274902344,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+cos,upstream-profile-8,triton,0,optimization,1,pass,0.007823999971151352,0.007823999971151352,1.0,,,,,,,
+exp,upstream-profile-8,triton,0,optimization,1,pass,0.0077119998168200254,0.007823999971151352,0.985685051796486,,,,,,,
+fused_layer_norm_relu_linear,upstream-profile-4,intent,0,optimization,5,agent_timeout,,,,,Agent execution stopped before a submission,,,,,
+addmm,upstream-profile-6,triton,0,optimization,3,pass,0.018080000765621662,0.02217600028961897,0.815295839172823,,,,,,,
+cos,upstream-profile-8,intent,0,optimization,1,pass,0.007823999971151352,0.007840000092983246,0.9979591681578915,,,,,,,
+cos,upstream-profile-8,triton,0,optimization,2,pass,0.007823999971151352,0.007840000092983246,0.9979591681578915,,,,,,,
+fused_qr_solve,upstream-profile-4,triton,0,optimization,3,pass,2.3270719051361084,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+addmm,upstream-profile-6,triton,0,optimization,4,pass,0.018080000765621662,0.022160000167787075,0.8158845049064435,,,,,,,
+fused_cholesky_solve,upstream-profile-6,intent,0,optimization,5,agent_timeout,,,,,Agent execution stopped before a submission,,,,,
+addmm,upstream-profile-6,intent,0,optimization,3,pass,0.020255999639630318,0.022288000211119652,0.9088298388262059,,,,,,,
+cos,upstream-profile-8,triton,0,optimization,3,pass,0.007808000082150102,0.00787200010381639,0.9918699160540838,,,,,,,
+cos,upstream-profile-8,intent,0,optimization,2,pass,0.007823999971151352,0.007823999971151352,1.0,,,,,,,
+exp,upstream-profile-8,triton,0,optimization,2,pass,0.006792000029236078,0.007823999971151352,0.8680981664467711,,,,,,,
+fused_qr_solve,upstream-profile-4,triton,0,optimization,4,pass,2.347504138946533,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+tensordot_rsqrt,upstream-profile-5,triton,0,optimization,1,pass,0.046880001202225685,0.046880001202225685,1.0,,,,,,,
+cos,upstream-profile-8,triton,0,optimization,4,pass,0.007832000032067299,0.007840000092983246,0.9989795840789457,,,,,,,
+addmm,upstream-profile-6,triton,0,optimization,5,pass,0.018080000765621662,0.022160000167787075,0.8158845049064435,,,,,,,
+exp,upstream-profile-8,intent,0,optimization,1,pass,0.006696000229567289,0.007840000092983246,0.8540816518051026,,,,,,,
+cos,upstream-profile-8,intent,0,optimization,3,pass,0.0077599999494850636,0.007832000032067299,0.9908069353565578,,,,,,,
+fused_qr_solve,upstream-profile-4,triton,0,optimization,5,pass,2.325023889541626,,,,,The unchanged PyTorch reference cannot be captured by CUDA Graph. Its eager output remains the numerical oracle. Candidate time is the completed CUDA Graph window before reference capture; no reference ratio is available.,,,,
+exp,upstream-profile-8,triton,0,optimization,3,pass,0.005904000019654632,0.0071680000983178616,0.8236607057301998,,,,,,,
+cos,upstream-profile-8,triton,0,optimization,5,pass,0.006991999922320247,0.00791999977082014,0.882828298566504,,,,,,,
+addmm,upstream-profile-6,intent,0,optimization,4,pass,0.02022399939596653,0.022255999967455864,0.9086987520461604,,,,,,,

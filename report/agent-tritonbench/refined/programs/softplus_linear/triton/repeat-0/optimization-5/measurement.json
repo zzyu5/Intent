@@ -1,0 +1,25 @@
+{
+  "status": "agent_program_error",
+  "candidate_ms": null,
+  "reference_ms": null,
+  "ratio": null,
+  "reference_timing_note": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0001,
+    "rtol": 1e-05
+  },
+  "failure_stage": "candidate_precompile",
+  "error": "at 33:4:\n        k_offsets = k_start + tl.arange(0, BLOCK_K)\n        input_values = tl.load(input_row + k_offsets)\n        weight_values = tl.load(weight_row + k_offsets)\n        accumulator += tl.sum(input_values * weight_values, axis=0)\n\n    if HAS_BIAS:\n        accumulator += tl.load(bias_ptr + col)\n\n    scaled_value = accumulator * BETA\n    softplus_value = tl.log(1.0 + tl.exp(scaled_value)) / BETA\n    result = tl.where(scaled_value > THRESHOLD, accumulator, softplus_value)\n    tl.store(output_ptr + row * 1024 + col, result)\n    ^\nValue argument cannot be block type if pointer argument is not a block",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/language/core.py\", line 43, in wrapper\n    return fn(*args, **kwargs)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/language/core.py\", line 2233, in store\n    return _semantic.store(pointer, value, mask, boundary_check, cache_modifier, eviction_policy)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/language/semantic.py\", line 1301, in store\n    return self._store_legacy(ptr, val, mask, boundary_check, cache, eviction)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/language/semantic.py\", line 1253, in _store_legacy\n    raise ValueError(\"Value argument cannot be block type if pointer argument is not a block\")\nValueError: Value argument cannot be block type if pointer argument is not a block\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/benchmark.py\", line 118, in run\n    candidate_call.call(function)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/tasks.py\", line 132, in call\n    return function(*self.args, **self.kwargs)\n  File \"/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/softplus_linear/triton/repeat-0/optimization-5/candidate.py\", line 70, in wrapper\n    softplus_linear_kernel[(m_size * 1024,)](\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/jit.py\", line 370, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/program.py\", line 96, in compile_tuner\n    compiled = tuner.warmup(*args, **kwargs)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/autotuner.py\", line 291, in warmup\n    ret.append(self.fn.warmup(\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/jit.py\", line 359, in warmup\n    return self.run(grid=grid, warmup=True, *map(MockTensor.wrap_dtype, args), **kwargs)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/program.py\", line 82, in compile_kernel\n    return original_jit(kernel, *args, **kwargs)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/jit.py\", line 720, in run\n    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 304, in compile\n    module = src.make_ir(target, options, codegen_fns, module_map, context)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 80, in make_ir\n    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,\ntriton.compiler.errors.CompilationError: at 33:4:\n        k_offsets = k_start + tl.arange(0, BLOCK_K)\n        input_values = tl.load(input_row + k_offsets)\n        weight_values = tl.load(weight_row + k_offsets)\n        accumulator += tl.sum(input_values * weight_values, axis=0)\n\n    if HAS_BIAS:\n        accumulator += tl.load(bias_ptr + col)\n\n    scaled_value = accumulator * BETA\n    softplus_value = tl.log(1.0 + tl.exp(scaled_value)) / BETA\n    result = tl.where(scaled_value > THRESHOLD, accumulator, softplus_value)\n    tl.store(output_ptr + row * 1024 + col, result)\n    ^\nValue argument cannot be block type if pointer argument is not a block\n",
+  "tuning": [
+    {
+      "kernel": "softplus_linear_kernel",
+      "declared": 16,
+      "measured": 0,
+      "seconds": 0.0,
+      "winner": null
+    }
+  ],
+  "preparation_and_benchmark_seconds": 0.5966159589588642
+}

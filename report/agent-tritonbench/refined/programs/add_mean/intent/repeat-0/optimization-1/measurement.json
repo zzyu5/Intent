@@ -1,0 +1,17 @@
+{
+  "status": "pass",
+  "candidate_ms": 0.09179200232028961,
+  "reference_ms": 0.0184480007737875,
+  "ratio": 4.9757154417900695,
+  "reference_timing_note": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0001,
+    "rtol": 1e-05
+  },
+  "precompile_seconds": 1.355270372936502,
+  "precompile_failures": [],
+  "preparation_policy": "compile_only_before_gpu_timing_lock",
+  "tuning": [],
+  "preparation_and_benchmark_seconds": 1.9900726131163538
+}

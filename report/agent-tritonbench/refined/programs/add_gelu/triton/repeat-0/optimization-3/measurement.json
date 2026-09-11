@@ -1,0 +1,25 @@
+{
+  "status": "agent_program_error",
+  "candidate_ms": null,
+  "reference_ms": null,
+  "ratio": null,
+  "reference_timing_note": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.01,
+    "rtol": 0.01
+  },
+  "failure_stage": "candidate_precompile",
+  "error": "at 19:30:\n    BLOCK_SIZE: tl.constexpr,\n):\n    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)\n    x = tl.load(input_ptr + offsets)\n    other_value = tl.load(other_ptr + offsets)\n\n    if ALPHA_IS_ONE:\n        x = x + other_value\n    else:\n        x = x + alpha * other_value\n\n    result = x * (0.5 + 0.5 * tl.erf(x * 0.7071067811865476))\n                              ^\nExpected dtype ['fp32', 'fp64'] but got fp16",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/language/core.py\", line 43, in wrapper\n    return fn(*args, **kwargs)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/language/math.py\", line 25, in check\n    raise ValueError(f\"Expected dtype {dtypes} but got {arg.type.scalar.name}\")\nValueError: Expected dtype ['fp32', 'fp64'] but got fp16\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/benchmark.py\", line 118, in run\n    candidate_call.call(function)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/tasks.py\", line 132, in call\n    return function(*self.args, **self.kwargs)\n  File \"/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/add_gelu/triton/repeat-0/optimization-3/candidate.py\", line 122, in wrapper\n    _add_gelu_tensor_full[full_grid](\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/jit.py\", line 370, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/program.py\", line 91, in compile_tuner\n    compiled = tuner.warmup(*args, **kwargs)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/autotuner.py\", line 291, in warmup\n    ret.append(self.fn.warmup(\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/jit.py\", line 359, in warmup\n    return self.run(grid=grid, warmup=True, *map(MockTensor.wrap_dtype, args), **kwargs)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/program.py\", line 77, in compile_kernel\n    return original_jit(kernel, *args, **kwargs)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/jit.py\", line 720, in run\n    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 304, in compile\n    module = src.make_ir(target, options, codegen_fns, module_map, context)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 80, in make_ir\n    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,\ntriton.compiler.errors.CompilationError: at 19:30:\n    BLOCK_SIZE: tl.constexpr,\n):\n    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)\n    x = tl.load(input_ptr + offsets)\n    other_value = tl.load(other_ptr + offsets)\n\n    if ALPHA_IS_ONE:\n        x = x + other_value\n    else:\n        x = x + alpha * other_value\n\n    result = x * (0.5 + 0.5 * tl.erf(x * 0.7071067811865476))\n                              ^\nExpected dtype ['fp32', 'fp64'] but got fp16\n",
+  "tuning": [
+    {
+      "kernel": "_add_gelu_tensor_full",
+      "declared": 6,
+      "measured": 0,
+      "seconds": 0.0,
+      "winner": null
+    }
+  ],
+  "preparation_and_benchmark_seconds": 0.3989422610029578
+}

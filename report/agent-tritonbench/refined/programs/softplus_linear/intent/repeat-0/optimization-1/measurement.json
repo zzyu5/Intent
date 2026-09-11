@@ -1,0 +1,25 @@
+{
+  "status": "agent_program_error",
+  "candidate_ms": null,
+  "reference_ms": null,
+  "ratio": null,
+  "reference_timing_note": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.0001,
+    "rtol": 1e-05
+  },
+  "failure_stage": "candidate_precompile",
+  "error": "at 46:13:\n            + k_offsets[None, :] * stride_weight_k,\n            mask=n_mask[:, None] & k_mask[None, :],\n            other=0.0,\n        )\n        accumulator = tl.dot(\n            input_values[None, :],\n            tl.permute(weight_values, (1, 0)),\n            accumulator,\n            input_precision=\"ieee\",\n        )\n\n    linear = accumulator[0, :]\n             ^\nunsupported tensor index: constexpr[0]",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/language/core.py\", line 43, in wrapper\n    return fn(*args, **kwargs)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/language/core.py\", line 1101, in __getitem__\n    raise ValueError(f\"unsupported tensor index: {sl}\")\nValueError: unsupported tensor index: constexpr[0]\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/benchmark.py\", line 118, in run\n    candidate_call.call(function)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/tasks.py\", line 132, in call\n    return function(*self.args, **self.kwargs)\n  File \"/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/softplus_linear/intent/repeat-0/optimization-1/candidate.py\", line 5, in wrapper\n    return fused.run(input, weight, bias, beta, threshold)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/runtime/artifact.py\", line 72, in run\n    return self._invoke(self._runner, arguments)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/runtime/artifact.py\", line 107, in _invoke\n    return function(*arguments)\n  File \"<intent.generated.triton.softplus_linear_fused.0>\", line 124, in run\n    launch(input, weight, bias, output, beta, threshold)\n  File \"<intent.generated.triton.softplus_linear_fused.0>\", line 100, in launch\n    return _fused_matvec[grid](\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/jit.py\", line 370, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/program.py\", line 96, in compile_tuner\n    compiled = tuner.warmup(*args, **kwargs)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/autotuner.py\", line 291, in warmup\n    ret.append(self.fn.warmup(\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/jit.py\", line 359, in warmup\n    return self.run(grid=grid, warmup=True, *map(MockTensor.wrap_dtype, args), **kwargs)\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/program.py\", line 82, in compile_kernel\n    return original_jit(kernel, *args, **kwargs)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/jit.py\", line 720, in run\n    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/runtime/jit.py\", line 849, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 304, in compile\n    module = src.make_ir(target, options, codegen_fns, module_map, context)\n  File \"/home/kingdom/.local/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 80, in make_ir\n    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,\ntriton.compiler.errors.CompilationError: at 46:13:\n            + k_offsets[None, :] * stride_weight_k,\n            mask=n_mask[:, None] & k_mask[None, :],\n            other=0.0,\n        )\n        accumulator = tl.dot(\n            input_values[None, :],\n            tl.permute(weight_values, (1, 0)),\n            accumulator,\n            input_precision=\"ieee\",\n        )\n\n    linear = accumulator[0, :]\n             ^\nunsupported tensor index: constexpr[0]\n",
+  "tuning": [
+    {
+      "kernel": "_fused_matvec",
+      "declared": 16,
+      "measured": 0,
+      "seconds": 0.0,
+      "winner": null
+    }
+  ],
+  "preparation_and_benchmark_seconds": 0.5841405859682709
+}

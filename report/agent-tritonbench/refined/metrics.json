@@ -33,9 +33,9 @@
       "population": "pairs where both arms have a correct measured program; not a full-suite success rate"
     },
     "optimized": {
-      "measured_pairs": 5,
-      "intent_faster_pairs": 0,
-      "geomean_intent_over_direct": 1.0467280727481854,
+      "measured_pairs": 25,
+      "intent_faster_pairs": 9,
+      "geomean_intent_over_direct": 0.9920472046181057,
       "population": "pairs where both arms have a correct measured program; not a full-suite success rate"
     }
   }

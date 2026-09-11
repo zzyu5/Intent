@@ -1,0 +1,25 @@
+{
+  "status": "pass",
+  "candidate_ms": 0.0057840002700686455,
+  "reference_ms": 0.005760000087320805,
+  "ratio": 1.0041666983305557,
+  "reference_timing_note": null,
+  "timing": "cuda_graph",
+  "tolerance": {
+    "atol": 0.01,
+    "rtol": 0.01
+  },
+  "precompile_seconds": 2.1137295740190893,
+  "precompile_failures": [],
+  "preparation_policy": "compile_only_before_gpu_timing_lock",
+  "tuning": [
+    {
+      "kernel": "_tensordot_kernel",
+      "declared": 6,
+      "measured": 6,
+      "seconds": 0.11642575263977051,
+      "winner": "BLOCK_M: 64, BLOCK_N: 128, BLOCK_K: 64, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+    }
+  ],
+  "preparation_and_benchmark_seconds": 3.1201985001098365
+}
