@@ -24,7 +24,7 @@ from .tasks import catalog, invocation, read_suite, reference, tolerance
 class CandidateTorchPolicy(TorchDispatchMode):
     def __torch_dispatch__(self, function, types, args=(), kwargs=None):
         tensors = [value for value in tree_flatten((args, kwargs))[0] if isinstance(value, torch.Tensor)]
-        allowed = {"aten.empty", "aten.empty_strided", "aten.empty_like", "aten.view", "aten._unsafe_view",
+        allowed = {"aten.empty", "aten.empty_strided", "aten.empty_like", "aten.new_empty", "aten.view", "aten._unsafe_view",
                    "aten.as_strided", "aten.detach", "aten.alias", "aten.permute", "aten.transpose",
                    "aten.squeeze", "aten.unsqueeze", "aten.slice", "aten.select", "aten.expand"}
         name = str(function).rsplit(".", 1)[0]
