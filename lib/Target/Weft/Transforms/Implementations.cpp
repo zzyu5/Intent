@@ -41,8 +41,8 @@ LogicalResult formIntegerTile(OpBuilder &b, linalg::GenericOp operation,
     auto issue = [&](Value k, int64_t count) {
       Value lhs = view(tile.lhs, m, k, rows, count);
       Value rhs = view(tile.rhs, k, n, count, columns);
-      Value partial = b.create<memref::AllocaOp>(loc, type);
       if (count == 1) {
+        Value partial = b.create<memref::AllocaOp>(loc, type);
         AffineExpr row, column;
         bindDims(b.getContext(), row, column);
         b.create<linalg::GenericOp>(loc, ValueRange{lhs, rhs}, ValueRange{partial},
@@ -58,8 +58,7 @@ LogicalResult formIntegerTile(OpBuilder &b, linalg::GenericOp operation,
         pointwise(accumulator, partial, accumulator);
         return;
       }
-      b.create<linalg::FillOp>(loc, ValueRange{tile.initial}, ValueRange{partial});
-      auto term = b.create<linalg::GenericOp>(loc, ValueRange{lhs, rhs}, ValueRange{partial},
+      auto term = b.create<linalg::GenericOp>(loc, ValueRange{lhs, rhs}, ValueRange{accumulator},
           operation.getIndexingMapsArray(), operation.getIteratorTypesArray(),
           [&](OpBuilder &nested, Location loc, ValueRange args) {
             IRMapping mapping;
@@ -69,7 +68,6 @@ LogicalResult formIntegerTile(OpBuilder &b, linalg::GenericOp operation,
             nested.create<linalg::YieldOp>(loc, mapping.lookup(body.getTerminator()->getOperand(0)));
           });
       term->setAttr("intent_cpu.implementation", binding);
-      pointwise(accumulator, partial, accumulator);
     };
     int64_t step = implementationParameter(binding, "micro_k");
     int64_t full = *depth / step * step;
@@ -188,13 +186,25 @@ cpu::ImplementationRegistry implementations() {
           return failure();
         return SmallVector<Value>{};
       }});
-  result.add({"weft.q4_k_q8_k", [](Operation *op) { return isa<cpu::QuantizedDotOp>(op); },
-      legal, noParameters, {}, [](OpBuilder &b, Operation *operation, ValueRange args, int64_t &nextAxis)
+  auto quantizedDot = [](OpBuilder &b, Operation *operation, ValueRange args, int64_t &nextAxis)
           -> FailureOr<SmallVector<Value>> {
         auto value = expandQuantizedDot(b, cast<cpu::QuantizedDotOp>(operation), args[0], args[1], nextAxis);
         if (failed(value)) return failure();
         return SmallVector<Value>{*value};
+      };
+  result.add({"weft.q4_k_q8_k_matrix", [](Operation *op) {
+        if (!isa<cpu::QuantizedDotOp>(op)) return false;
+        auto capabilities = op->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities");
+        return capabilities && capabilities.getMatrixI8I32();
+      }, [](CapabilitiesAttr capabilities, const Configuration &) {
+        return capabilities.getMatrixI8I32() && capabilities.getVectorBits() == 256;
+      }, [](Builder &b, const Configuration &) {
+        return b.getDictionaryAttr({b.getNamedAttr("columns", b.getI64IntegerAttr(4))});
+      }, {}, quantizedDot, {}, [](ImplementationAttr binding) {
+        return implementationParameter(binding, "columns");
       }});
+  result.add({"weft.q4_k_q8_k", [](Operation *op) { return isa<cpu::QuantizedDotOp>(op); },
+      legal, noParameters, {}, quantizedDot});
   result.add({"weft.matrix_i8_i32", [](Operation *op) {
       auto generic = dyn_cast<linalg::GenericOp>(op);
       return generic && isMatrixContraction(generic) &&

@@ -980,9 +980,10 @@ private:
         values.map(op.getResult(), builder.create<arith::ConstantOp>(loc, builder.getF32FloatAttr(0.0)));
         return success();
       }
-      values.map(op.getResult(), builder.create<cpu::QuantizedDotOp>(loc,
-          builder.getF32Type(), values.lookup(op.getLhs()), values.lookup(op.getRhs()),
-          op.getLhsFormatAttr(), op.getRhsFormatAttr()));
+      Value output = allocate(cast<RankedTensorType>(op.getResult().getType()), {}, loc);
+      builder.create<cpu::QuantizedDotOp>(loc, values.lookup(op.getLhs()), values.lookup(op.getRhs()),
+          output, op.getLhsFormatAttr(), op.getRhsFormatAttr());
+      values.map(op.getResult(), output);
     } else if (auto op = dyn_cast<ContractOp>(operation)) {
       return contract(op);
     } else if (operation->getName().getDialectNamespace() == "arith") {

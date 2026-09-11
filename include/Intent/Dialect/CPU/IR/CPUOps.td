@@ -44,11 +44,11 @@ def IntentCPU_QuantizeOp : IntentCPU_Op<"quantize"> {
 }
 
 def IntentCPU_QuantizedDotOp : IntentCPU_Op<"quantized_dot"> {
-  let summary = "Closed quantized record dot with explicit numerical formats";
+  let summary = "Independent closed record dots with explicit output ownership";
   let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$lhs,
       Arg<AnyMemRef, "", [MemRead]>:$rhs,
+      Arg<AnyMemRef, "", [MemWrite]>:$output,
       Intent_QuantFormatAttr:$lhs_format, Intent_QuantFormatAttr:$rhs_format);
-  let results = (outs F32:$result);
   let hasVerifier = 1;
 }
 

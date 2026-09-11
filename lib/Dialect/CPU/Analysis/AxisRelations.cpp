@@ -55,7 +55,9 @@ AxisRelations::AxisRelations(func::FuncOp function) {
     } else if (auto quantize = dyn_cast<QuantizeOp>(operation)) {
       unite(positions.at(quantize.getInput())[0], positions.at(quantize.getOutput())[0]);
     } else if (auto dot = dyn_cast<QuantizedDotOp>(operation)) {
-      unite(positions.at(dot.getLhs())[0], positions.at(dot.getRhs())[0]);
+      auto &lhs = positions.at(dot.getLhs());
+      unite(lhs[lhs.size() - 2], positions.at(dot.getRhs())[0]);
+      if (lhs.size() == 3) unite(lhs[0], positions.at(dot.getOutput())[0]);
     }
   });
   auto identify = [&](unsigned position) {

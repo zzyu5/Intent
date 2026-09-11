@@ -172,6 +172,9 @@ WEFT = (
     Entry("q4_k_projection", "N4096-K4096-Q4_K-f32-1core", "quantized_projection",
           ("quantization/quantized_projection.py:quantized_projection",),
           "source/weft/tianchenrv/contraction/q4_k_projection/q4_k_projection_runtime.py"),
+    Entry("q4_k_projection_ime", "N4096-K4096-Q4_K-f32-IME1-1core", "quantized_projection",
+          ("quantization/quantized_projection.py:quantized_projection",),
+          "source/weft/tianchenrv/contraction/q4_k_projection/q4_k_projection_runtime.py", "weft/ime.json"),
 )
 
 

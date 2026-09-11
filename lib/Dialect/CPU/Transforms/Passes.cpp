@@ -150,7 +150,8 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
     if (failed(foldUniformComputations(function)) || failed(fuseStructuredComputations(function))) return failure();
   if (failed(normalize(module))) return failure();
   for (auto function : functions) {
-    if (failed(reusePreparedInputs(function))) return failure();
+    if (failed(reusePreparedInputs(function)) ||
+        failed(groupQuantizedDots(function, implementations))) return failure();
     auto binding = function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration");
     Configuration config{binding.getTaskGrain(), binding.getTileM(), binding.getTileN(),
         binding.getTileK(), binding.getRegionSize(), {}};

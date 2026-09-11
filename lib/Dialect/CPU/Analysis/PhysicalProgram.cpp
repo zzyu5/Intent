@@ -117,6 +117,7 @@ SmallVector<MemoryAccess> PhysicalProgramAnalysis::accesses(Operation *scope) {
     } else if (auto dot = dyn_cast<QuantizedDotOp>(operation)) {
       add(dot.getLhs(), true, false);
       add(dot.getRhs(), true, false);
+      add(dot.getOutput(), false, true);
     } else if (auto copy = dyn_cast<memref::CopyOp>(operation)) {
       add(copy.getSource(), true, false); add(copy.getTarget(), false, true);
     } else if (auto load = dyn_cast<memref::LoadOp>(operation)) add(load.getMemref(), true, false);
@@ -146,6 +147,7 @@ SmallVector<AllocationFacts> PhysicalProgramAnalysis::allocations() {
       else if (auto store = dyn_cast<memref::StoreOp>(user)) writes = store.getMemref() == value;
       else if (auto copy = dyn_cast<memref::CopyOp>(user)) writes = copy.getTarget() == value;
       else if (auto quantize = dyn_cast<QuantizeOp>(user)) writes = quantize.getOutput() == value;
+      else if (auto dot = dyn_cast<QuantizedDotOp>(user)) writes = dot.getOutput() == value;
       else if (!isa<memref::LoadOp, memref::DimOp, memref::DeallocOp, ReduceOp, QuantizedDotOp>(user))
         multiple = true;
       if (writes) {

@@ -840,11 +840,17 @@ private:
       if (definition && isa<IntegerType>(element((*initial).getType())))
         if (auto constant = definition->getOperand(0).getDefiningOp<wk::ConstantOp>())
           if (auto value = dyn_cast<IntegerAttr>(constant.getValue())) zero = value.getValue().isZero();
-      if (!zero)
+      bool integer = isa<IntegerType>(element((*initial).getType()));
+      if (!zero && !integer)
         return operation.emitError("Weft contraction requires an explicit zero-initialized partial; nonzero fused accumulation has no equivalent canonical operation");
       int64_t reduction = loopAxes[2];
       Value term = b.create<wk::OuterContractOp>(operation.getLoc(), (*initial).getType(),
           *lhs, *rhs, array({reduction}), TypeAttr::get(element((*initial).getType())));
+      if (!zero) {
+        auto accumulated = binary(operation.getLoc(), *initial, term, "add");
+        if (failed(accumulated)) return failure();
+        term = *accumulated;
+      }
       return write(destination, term);
     }
     auto iterators = operation.getIteratorTypesArray();
@@ -1082,13 +1088,19 @@ private:
       if (failed(implementation)) return failure();
       if (!(*implementation)->expand) return operation->emitError("selected Weft implementation has no expansion");
       SmallVector<Value> arguments;
-      for (Value operand : operation->getOperands()) {
+      auto operands = operation->getOperands();
+      if (isa<cpu::QuantizedDotOp>(operation)) operands = operands.take_front(2);
+      for (Value operand : operands) {
         auto supplied = view(operand);
         if (failed(supplied)) return operation->emitError("implementation requires supplied operand views");
         arguments.push_back(*supplied);
       }
       auto results = (*implementation)->expand(b, operation, arguments, nextAxis);
       if (failed(results)) return failure();
+      if (auto dot = dyn_cast<cpu::QuantizedDotOp>(operation)) {
+        if (results->size() != 1) return dot.emitError("quantized implementation must supply its complete output value");
+        return write(dot.getOutput(), results->front());
+      }
       if (results->size() != operation->getNumResults())
         return operation->emitError("implementation results disagree with the structured operation");
       values.map(operation->getResults(), *results);
