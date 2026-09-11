@@ -1020,6 +1020,37 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
     return kernel.emitError(
         "all Triton parameter candidates violate typed fragment legality");
   kernel->setAttr(gpu::tritonConfigsAttr, builder.getArrayAttr(encoded));
+  SmallVector<NamedAttribute> reductionBounds;
+  kernel.walk([&](gpu::ParameterOp parameter) {
+    if (parameter.getParameter().getRole() !=
+            static_cast<uint32_t>(gpu::ParameterRole::Reduction) ||
+        parameter->hasAttr(gpu::coverageDimensionAttr))
+      return;
+    auto dimension = parameter->getAttrOfType<IntegerAttr>(gpu::dimensionAttr);
+    if (!dimension)
+      return;
+    for (BlockArgument argument : kernel.getArguments()) {
+      DictionaryAttr attrs = kernel.getArgAttrDict(argument.getArgNumber());
+      auto kind = attrs.getAs<StringAttr>(gpu::abiKindAttr);
+      if (!kind || kind.getValue() != "dimension" ||
+          attrs.getAs<IntegerAttr>(gpu::dimensionAttr) != dimension)
+        continue;
+      auto logicalExtent = gpu::PhysicalExprAttr::get(
+          kernel.getContext(),
+          static_cast<uint32_t>(gpu::PhysicalExprKind::Dimension),
+          dimension.getInt(), attrs.getAs<StringAttr>(gpu::abiNameAttr),
+          builder.getArrayAttr({}));
+      auto bound = gpu::PhysicalExprAttr::get(
+          kernel.getContext(),
+          static_cast<uint32_t>(gpu::PhysicalExprKind::NextPowerOfTwo), 0,
+          builder.getStringAttr(""), builder.getArrayAttr({logicalExtent}));
+      reductionBounds.push_back(builder.getNamedAttr(
+          parameter.getParameter().getName().getValue(), bound));
+      break;
+    }
+  });
+  kernel->setAttr(gpu::tritonReductionBoundsAttr,
+                  builder.getDictionaryAttr(reductionBounds));
   return success();
 }
 

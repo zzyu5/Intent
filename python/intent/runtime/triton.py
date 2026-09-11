@@ -17,6 +17,13 @@ class TuningHooks:
         self.state.restore()
         del self.state
 
+    def prune(self, configurations, bounds: dict[str, int]):
+        scores = [sum(max(1, (config.kwargs[name] + max(1, bound) - 1) // max(1, bound))
+                      for name, bound in bounds.items())
+                  for config in configurations]
+        minimum = min(scores)
+        return [config for config, score in zip(configurations, scores) if score == minimum]
+
 
 def _collect_triton_ir(compiled_kernel: object) -> dict[str, str]:
     asm = getattr(compiled_kernel, "asm", None)

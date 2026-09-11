@@ -465,6 +465,32 @@ private:
       failed = true;
       return;
     }
+    auto reductionBounds =
+        kernel->getAttrOfType<DictionaryAttr>(gpu::tritonReductionBoundsAttr);
+    if (!reductionBounds) {
+      kernel.emitError("Triton legalization did not bind reduction search bounds");
+      failed = true;
+      return;
+    }
+    if (!reductionBounds.empty()) {
+      output << "def _intent_prune_configs(configs, named_args, **kwargs):\n";
+      if (descriptorChoice)
+        line("configs = _intent_prune_tensor_descriptor_configs(configs, named_args, **kwargs)", 1);
+      for (const MetadataABI &metadata : metadataArguments)
+        line(metadata.name + " = named_args[\"" + metadata.name + "\"]", 1);
+      output << "    bounds = {\n";
+      for (NamedAttribute bound : reductionBounds) {
+        auto expression = dyn_cast<gpu::PhysicalExprAttr>(bound.getValue());
+        if (!expression) {
+          kernel.emitError("Triton reduction search bound is not a physical expression");
+          failed = true;
+          return;
+        }
+        output << "        \"" << bound.getName().strref() << "\": "
+               << expressionString(expression, false) << ",\n";
+      }
+      output << "    }\n    return _intent_tuning_hooks.prune(configs, bounds)\n\n";
+    }
     for (const auto &[parameter, coverage] : fullCoverageParameters) {
       output << "def _intent_cover_" << parameter << "(args):\n"
              << "    bound = int(args[\"" << coverage.dimension << "\"])\n"
@@ -518,7 +544,9 @@ private:
     output << "],\n";
     output << "    pre_hook=_intent_tuning_hooks.before,\n"
               "    post_hook=_intent_tuning_hooks.after,\n";
-    if (descriptorChoice)
+    if (!reductionBounds.empty())
+      output << "    prune_configs_by={\"early_config_prune\": _intent_prune_configs},\n";
+    else if (descriptorChoice)
       output << "    prune_configs_by={\"early_config_prune\": "
                 "_intent_prune_tensor_descriptor_configs},\n";
     output << ")\n";
