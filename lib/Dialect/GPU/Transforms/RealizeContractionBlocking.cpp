@@ -2954,11 +2954,6 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
     return unhandled("lhs invalid fill is not the contraction zero");
   if (rhsLoad.getFill() && !isZeroScalar(rhsLoad.getFill()))
     return unhandled("rhs invalid fill is not the contraction zero");
-  FailureOr<Value> initialAccumulator = scalarSource(contract.getAccumulator());
-  if (failed(initialAccumulator) ||
-      (*initialAccumulator).getType() !=
-          contract.getResult().getType().getElementType())
-    return unhandled("accumulator is not an explicit scalarizable value");
 
   SmallVector<AssumeInBoundsOp> rowAssumptions;
   if (indirectRow)
@@ -3346,13 +3341,27 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
         replayedStoreValidities.push_back(validity);
       }
     }
-    Value accumulator = rowBuilder.create<SplatOp>(
-        location, blockedResultType, *initialAccumulator);
+    Value initialAccumulator = contract.getAccumulator();
+    if (runtimeRowTraversal && failed(scalarSource(initialAccumulator))) {
+      FailureOr<Value> replayed = replaySourceValue(
+          rowBuilder, location, kernel, initialAccumulator,
+          sourceAxisIdentity(*rowMap), unitM, rowRange, rows, rowReplay,
+          contract.getOperation());
+      if (failed(replayed))
+        return contract.emitOpError(
+            "blocked contraction could not replay its row-dependent accumulator");
+      initialAccumulator = *replayed;
+    }
+    FailureOr<Value> accumulator = projectPhysicalValueToSchema(
+        rowBuilder, location, initialAccumulator, blockedResultType);
+    if (failed(accumulator))
+      return contract.emitOpError(
+          "blocked contraction accumulator has no exact result projection");
 
     std::string loopBodyFailure;
     auto loop = rowBuilder.create<scf::ForOp>(
         location, lhsReductionRange.getStart(), reductionStop,
-        blockK.getResult(), ValueRange{accumulator},
+        blockK.getResult(), ValueRange{*accumulator},
         [&](OpBuilder &nested, Location nestedLocation, Value kStart,
             ValueRange carries) {
           Value reductions = nested.create<MakeRangeOp>(
