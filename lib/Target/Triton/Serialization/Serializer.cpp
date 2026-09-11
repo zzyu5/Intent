@@ -575,21 +575,7 @@ private:
   }
 
   void emitLaunch() {
-    output << "def launch(";
-    bool firstArgument = true;
-    for (auto [index, view] : llvm::enumerate(views)) {
-      if (!firstArgument)
-        output << ", ";
-      firstArgument = false;
-      output << view.name;
-    }
-    for (const ScalarABI &scalar : scalars) {
-      if (!firstArgument)
-        output << ", ";
-      firstArgument = false;
-      output << scalar.name;
-    }
-    output << "):\n";
+    output << "def launch(" << joinLaunchArguments() << "):\n";
     if (descriptorAllocator)
       line("triton.set_allocator(_intent_tensor_descriptor_allocator)", 1);
     for (const MetadataABI &metadata : metadataArguments) {
@@ -680,18 +666,7 @@ private:
       if (view.type.getAccess() == 1)
         outputs.push_back(view);
     }
-    output << "def run(";
-    for (auto [index, view] : llvm::enumerate(inputs)) {
-      if (index)
-        output << ", ";
-      output << view.name;
-    }
-    for (const ScalarABI &scalar : scalars) {
-      if (!inputs.empty() || &scalar != &scalars.front())
-        output << ", ";
-      output << scalar.name;
-    }
-    output << "):\n";
+    output << "def run(" << joinLaunchArguments(/*includeOutputs=*/false) << "):\n";
     if (outputs.empty()) {
       line("launch(" + joinLaunchArguments() + ")", 1);
       line("return None", 1);
@@ -1727,12 +1702,18 @@ private:
     return result;
   }
 
-  std::string joinLaunchArguments() const {
-    std::string result = joinViewNames(views);
-    for (const ScalarABI &scalar : scalars) {
+  std::string joinLaunchArguments(bool includeOutputs = true) const {
+    std::map<unsigned, std::string> arguments;
+    for (const ViewABI &view : views)
+      if (includeOutputs || view.type.getAccess() != 1)
+        arguments.emplace(view.argument, view.name);
+    for (const ScalarABI &scalar : scalars)
+      arguments.emplace(scalar.argument, scalar.name);
+    std::string result;
+    for (const auto &[index, name] : arguments) {
       if (!result.empty())
         result += ", ";
-      result += scalar.name;
+      result += name;
     }
     return result;
   }

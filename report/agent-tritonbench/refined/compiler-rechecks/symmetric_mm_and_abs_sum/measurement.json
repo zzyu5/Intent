@@ -1,25 +1,39 @@
 {
-  "status": "compilation_failure",
-  "candidate_ms": null,
-  "reference_ms": null,
-  "ratio": null,
+  "status": "pass",
+  "candidate_ms": 0.2126080021262169,
+  "reference_ms": 0.07714399695396423,
+  "ratio": 2.7559889365479853,
   "reference_timing_note": null,
   "timing": "cuda_graph",
   "tolerance": {
     "atol": 0.0001,
     "rtol": 1e-05
   },
-  "failure_stage": "physical_program_verification",
-  "error": "Intent Triton compiler failed with exit code 4:\nloc(\"<stdin>\":22:5): error: 'intent_gpu.store' op cannot align store value with its coordinate schema\nloc(\"<stdin>\":1:1): error: shared GPU transformation failed: form-pointwise-blocking\n",
-  "traceback": "Traceback (most recent call last):\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/benchmark.py\", line 109, in run\n    function = module.build(context)\n  File \"/home/kingdom/phdworks/intentdsl/report/agent-tritonbench/refined/programs/symmetric_mm_and_abs_sum/intent/repeat-0/generation-5/candidate.py\", line 44, in build\n    absolute_kernel = context.compile(\n  File \"/home/kingdom/phdworks/intentdsl/examples/repro/agent_study/program.py\", line 36, in compile\n    program = intent.generate(definition, target=TritonTarget(), compiler=self.compiler,\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/compiler/pipeline.py\", line 43, in generate\n    return _generate_source(kernel_mlir, resolved, compiler, tuning_config)\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/compiler/pipeline.py\", line 59, in _generate_source\n    source, realized_mlir, metadata = run_compiler(\n  File \"/home/kingdom/phdworks/intentdsl/python/intent/compiler/toolchain.py\", line 64, in run_compiler\n    raise CompilationStageError(\nintent.compiler.toolchain.CompilationStageError: Intent Triton compiler failed with exit code 4:\nloc(\"<stdin>\":22:5): error: 'intent_gpu.store' op cannot align store value with its coordinate schema\nloc(\"<stdin>\":1:1): error: shared GPU transformation failed: form-pointwise-blocking\n\n",
+  "precompile_seconds": 4.530691819963977,
+  "precompile_failures": [],
+  "preparation_policy": "compile_only_before_gpu_timing_lock",
   "tuning": [
     {
       "kernel": "_intent_kernel",
       "declared": 9,
-      "measured": 0,
-      "seconds": 0.0,
-      "winner": null
+      "measured": 9,
+      "seconds": 0.22141194343566895,
+      "winner": "BLOCK_K_1_0_0_1_1_0_2_0_0_2_1_0_3_0: 32, BLOCK_M_1_0_0_1_1_0_2_0_0_2_1_0_3_0: 64, BLOCK_N_1_0_0_1_1_0_2_0_0_2_1_0_3_0: 64, GROUP_SIZE_M: 8, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+    },
+    {
+      "kernel": "_intent_kernel",
+      "declared": 28,
+      "measured": 16,
+      "seconds": 0.21460628509521484,
+      "winner": "FRAGMENT_S1_A0: 64, FRAGMENT_S1_A1: 64, num_warps: 2, num_ctas: 1, num_stages: 5, maxnreg: None"
+    },
+    {
+      "kernel": "_intent_kernel",
+      "declared": 9,
+      "measured": 9,
+      "seconds": 0.15946459770202637,
+      "winner": "REDUCE_CHUNK_1_A0: 64, REDUCE_CHUNK_1_A1: 256, num_warps: 16, num_ctas: 1, num_stages: 2, maxnreg: None"
     }
   ],
-  "preparation_and_benchmark_seconds": 0.18217555503360927
+  "preparation_and_benchmark_seconds": 6.2317418057937175
 }

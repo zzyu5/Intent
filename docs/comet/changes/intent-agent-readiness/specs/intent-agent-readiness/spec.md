@@ -34,6 +34,8 @@ provider 的接口、流式/工具交互和指定模型/effort 必须通过真�
 
 相同 extent identity 不得合并独立 operand/result 坐标；同一 source 在 contraction 两侧也须保留各自角色。修复必须使 current physical program 的 mapping、fragment、access、validity 和 contraction relations 一致，不能只更换参数名或放宽 verifier。
 
+Axis occurrence 通过当前 value/access/structured-operation 的位置关系保持；相等 logical extent 不要求相同 physical blocking。多个 outputs 的 execution groups 遵循既有 KIR→GPU 规格：按 def-use、effects 与 dependence 形成 ownership，独立 groups 使用同一 kernel 内互斥的 program-space segments，共享或有序依赖不能被切断。不得用忽略重复 M/N 角色的方式替代覆盖证明。
+
 Scalar、rank-0 tensor 和 structural products 保持各自类型语义，必要转换/广播在正式 lowering 中明确形成。合法作者表达不得因 compiler 产生错误 KIR 而被拒绝；确为作者错误则给准确诊断，不能靠统一强转或默认 dtype 掩盖。未定因的 `min` 等记录须先归因，不能承诺任何原候选修后必然正确。
 
 已有等价 step、dot out_dtype 与输出分块修复保留。Out 已定义内容读取、safe indexed access、ordered control 中 parallel、其它数值和性能异常仍作为后续根因保存在复盘报告，不因本 change 完成而标为解决。第一批如果涉及新增 public semantics 或核心架构分叉，必须回到设计确认。

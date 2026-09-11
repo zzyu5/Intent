@@ -75,7 +75,25 @@ BroadcastProjection queryAxisProjection(FragmentType source,
     return true;
   };
 
-  // Broadcast semantics align source axes with the trailing target axes.  Use
+  // Rank-expanding physical broadcasts also embed coordinate vectors. Respect
+  // a unique source-axis occurrence already present in the result relation;
+  // a row coordinate must not become a column merely because both extents are N.
+  if (source.getShape().size() < target.getShape().size())
+    for (auto [sourceIndex, attribute] : llvm::enumerate(source.getAxisMaps())) {
+      auto axis = cast<AxisMapAttr>(attribute);
+      auto sameSource = [&](Attribute candidate) {
+        auto other = cast<AxisMapAttr>(candidate);
+        return axis.getSourceId() == other.getSourceId() &&
+               axis.getSourceAxis() == other.getSourceAxis() &&
+               axis.getDerived() == other.getDerived();
+      };
+      if (llvm::count_if(source.getAxisMaps(), sameSource) == 1 &&
+          llvm::count_if(target.getAxisMaps(), sameSource) == 1)
+        if (!bindUnique(sourceIndex, [&](AxisMapAttr other) { return sameSource(other); }))
+          return result;
+    }
+
+  // Same-rank broadcasts preserve the explicit positional relation. Use
   // that explicit occurrence relation before source-identity matching: one
   // logical source axis may legitimately occur more than once in a Cartesian
   // result, and identity-first matching would let the wrong occurrence consume
@@ -84,6 +102,8 @@ BroadcastProjection queryAxisProjection(FragmentType source,
   // ownership axis is not an anonymous broadcast axis.
   for (auto [sourceIndex, mapping] : llvm::enumerate(source.getAxisMaps())) {
     unsigned targetIndex = offset + sourceIndex;
+    if (sourceUsed[sourceIndex] || result.targetToSource[targetIndex])
+      continue;
     auto sourceAxis = cast<AxisMapAttr>(mapping);
     auto targetAxis = cast<AxisMapAttr>(target.getAxisMaps()[targetIndex]);
     bool sameSource =

@@ -2137,14 +2137,21 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
         continue;
       auto mapping = cast<AxisMapAttr>(currentType.getAxisMaps()[axis]);
       auto extent = cast<PhysicalExprAttr>(currentType.getShape()[axis]);
-      retargetDimensionExtent(store.getValue(), mapping.getDimensionId(), extent);
-      for (Value coordinate : store.getCoordinates())
-        retargetDimensionExtent(coordinate, mapping.getDimensionId(), extent);
+      for (Value coordinate : store.getCoordinates()) {
+        auto coordinateType = dyn_cast<FragmentType>(coordinate.getType());
+        if (!coordinateType)
+          continue;
+        PhysicalAxisProjection projection =
+            queryFragmentAxis(coordinateType, sourceAxisIdentity(mapping));
+        if (!projection.isExact())
+          continue;
+        retargetSourceExtent(coordinate, projection.source, extent);
+      }
     }
     currentType = cast<FragmentType>(store.getValue().getType());
     OpBuilder builder(store);
     FailureOr<FragmentType> valueType =
-        refinePhysicalSchema(kernel, currentType, store.getCoordinates());
+        refineAccessResultSchema(kernel, currentType, store.getCoordinates());
     if (failed(valueType))
       return store.emitOpError(
           "store value has no unique physical coordinate projection");
@@ -2156,15 +2163,21 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
       if (dimension <= 0)
         return store.emitOpError(
             "store coordinate refinement has no logical dimension authority");
-      retargetDimensionExtent(
-          store.getValue(), dimension,
+      retargetSourceExtent(
+          store.getValue(), sourceAxisIdentity(cast<AxisMapAttr>(mapping)),
           cast<PhysicalExprAttr>((*valueType).getShape()[axis]));
     }
     FailureOr<Value> value = project(builder, store.getLoc(), store.getValue(),
                                      *valueType);
-    if (failed(value))
-      return store.emitOpError(
+    if (failed(value)) {
+      InFlightDiagnostic diagnostic = store.emitOpError(
           "cannot align store value with its coordinate schema");
+      diagnostic << "; value=" << store.getValue().getType()
+                 << "; coordinate_schema=" << *valueType;
+      for (Value coordinate : store.getCoordinates())
+        diagnostic << "; coordinate=" << coordinate.getType();
+      return failure();
+    }
     FailureOr<Value> valid = project(
         builder, store.getLoc(), store.getValid(), predicateType(*valueType));
     if (failed(valid)) {

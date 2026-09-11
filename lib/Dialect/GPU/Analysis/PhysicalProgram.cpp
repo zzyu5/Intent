@@ -1954,6 +1954,7 @@ void PhysicalProgramAnalysis::collectAxisRanges(
       appendUnique(result.blockers, operation);
       return;
     }
+    SmallVector<MakeRangeOp> accessRoots;
     for (const CoordinateOccurrence &occurrence : occurrences) {
       PhysicalRangeFact nested = axisRanges(occurrence.first, occurrence.second);
       if (nested.state == PhysicalFactState::Unknown ||
@@ -1963,14 +1964,18 @@ void PhysicalProgramAnalysis::collectAxisRanges(
           appendUnique(result.blockers, blocker);
         continue;
       }
-      for (MakeRangeOp range : nested.roots)
+      for (MakeRangeOp range : nested.roots) {
         appendUnique(result.roots, range);
+        appendUnique(accessRoots, range);
+      }
       for (Operation *access : nested.accesses)
         appendUnique(result.accesses, access);
     }
-    if (result.state != PhysicalFactState::Unknown && !result.roots.empty()) {
-      MakeRangeOp authority = result.roots.front();
-      if (!llvm::all_of(result.roots, [&](MakeRangeOp range) {
+    // Resolve this load's coordinate occurrence, not ranges accumulated from
+    // sibling operands of a pointwise expression over different resources.
+    if (result.state != PhysicalFactState::Unknown && !accessRoots.empty()) {
+      MakeRangeOp authority = accessRoots.front();
+      if (!llvm::all_of(accessRoots, [&](MakeRangeOp range) {
             return sameLogicalRange(authority, range);
           })) {
         result.state = PhysicalFactState::Ambiguous;

@@ -517,16 +517,6 @@ private:
     }
   }
 
-  std::string launchArguments() {
-    std::string result = joinViewNames(views);
-    for (const ScalarABI &scalar : scalars) {
-      if (!result.empty())
-        result += ", ";
-      result += scalar.name;
-    }
-    return result;
-  }
-
   void emitTuningConfigurations() {
     output << "_TUNING_PARAMETERS = (\n";
     std::string bindings = "(";
@@ -563,8 +553,12 @@ private:
         output << "None";
       } else {
         for (auto [index, view] : llvm::enumerate(views))
-          if (view.argument == metadata->second.sourceABI)
-            output << "(" << index << ", " << metadata->second.sourceAxis << ")";
+          if (view.argument == metadata->second.sourceABI) {
+            unsigned runtimeIndex = index + llvm::count_if(scalars, [&](const ScalarABI &scalar) {
+              return scalar.argument < view.argument;
+            });
+            output << "(" << runtimeIndex << ", " << metadata->second.sourceAxis << ")";
+          }
       }
       output << "),\n";
       std::string name = schema.getName().getValue().str();
@@ -572,7 +566,7 @@ private:
                       ? name + ", "
                       : "_intent_config." + name + ", ";
     });
-    output << ")\n\ndef tuning_configurations(" << launchArguments() << "):\n";
+    output << ")\n\ndef tuning_configurations(" << joinLaunchArguments() << "):\n";
     emitArgumentBindings();
     line("return tuple(TuningConfiguration(_TUNING_PARAMETERS, " + bindings +
              ")) for _intent_config in _CONFIGS)",
@@ -599,7 +593,7 @@ private:
     }
     output << ")\n_TUNE_CACHE = {}\n\n";
     emitTuningConfigurations();
-    output << "def launch(" << launchArguments() << "):\n";
+    output << "def launch(" << joinLaunchArguments() << "):\n";
     emitArgumentBindings();
     emitArrayBindings("", 1);
 
@@ -718,11 +712,7 @@ private:
       if (view.type.getAccess() == 1)
         outputs.push_back(view);
     }
-    output << "def run(" << joinViewNames(inputs);
-    for (const ScalarABI &scalar : scalars)
-      output << (inputs.empty() && &scalar == &scalars.front() ? "" : ", ")
-             << scalar.name;
-    output << "):\n";
+    output << "def run(" << joinLaunchArguments(/*includeOutputs=*/false) << "):\n";
     std::string device = inputs.empty() ? "'cuda'" : inputs.front().name + ".device";
     for (const ViewABI &view : outputs) {
       std::string shape = outputShape(view);
@@ -1473,12 +1463,18 @@ private:
     return result;
   }
 
-  std::string joinLaunchArguments() const {
-    std::string result = joinViewNames(views);
-    for (const ScalarABI &scalar : scalars) {
+  std::string joinLaunchArguments(bool includeOutputs = true) const {
+    std::map<unsigned, std::string> arguments;
+    for (const ViewABI &view : views)
+      if (includeOutputs || view.type.getAccess() != 1)
+        arguments.emplace(view.argument, view.name);
+    for (const ScalarABI &scalar : scalars)
+      arguments.emplace(scalar.argument, scalar.name);
+    std::string result;
+    for (const auto &[index, name] : arguments) {
       if (!result.empty())
         result += ", ";
-      result += scalar.name;
+      result += name;
     }
     return result;
   }

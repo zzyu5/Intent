@@ -4194,6 +4194,85 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             (!scanSegmentDimensions.contains(*dimension) &&
              !partiallyCarriedStructuredDimensions.contains(*dimension)));
   };
+
+  llvm::DenseMap<Operation *, MakeRangeOp> occurrenceRoots;
+  llvm::DenseMap<Operation *, ParameterOp> occurrenceParameters;
+  WalkResult occurrences = kernel.walk([&](StoreOp store) {
+    auto valueType = dyn_cast<FragmentType>(store.getValue().getType());
+    if (!valueType || valueType.getShape().size() != store.getCoordinates().size() ||
+        llvm::any_of(store.getCoordinates(), [](Value coordinate) {
+          auto type = dyn_cast<FragmentType>(coordinate.getType());
+          return !type || type.getShape().size() != 1;
+        }))
+      return WalkResult::advance();
+    PhysicalProgramAnalysis analysis(kernel);
+    llvm::DenseMap<Operation *, unsigned> resultAxes;
+    for (auto [axis, attribute] : llvm::enumerate(valueType.getAxisMaps())) {
+      auto mapping = cast<AxisMapAttr>(attribute);
+      int64_t dimension = mapping.getDimensionId();
+      if (dimension <= 0 || nonUniqueContractionDimensions.contains(dimension) ||
+          llvm::count_if(valueType.getAxisMaps(), [&](Attribute other) {
+            return cast<AxisMapAttr>(other).getDimensionId() == dimension;
+          }) < 2)
+        continue;
+      // Rank-one Cartesian coordinates concatenate into the result axes.
+      // Equal dimension values do not equate those independent occurrences.
+      PhysicalRangeFact address = analysis.axisRanges(store.getCoordinates()[axis], 0);
+      PhysicalRangeFact payload = analysis.axisRanges(store.getValue(), axis);
+      if (address.state == PhysicalFactState::Unknown ||
+          payload.state == PhysicalFactState::Unknown ||
+          !address.blockers.empty() || !payload.blockers.empty() ||
+          address.roots.empty() || payload.roots.empty())
+        continue;
+      SmallVector<MakeRangeOp> ranges(address.roots.begin(), address.roots.end());
+      for (MakeRangeOp range : payload.roots)
+        if (!llvm::is_contained(ranges, range))
+          ranges.push_back(range);
+      MakeRangeOp root = ranges.front();
+      auto sameBound = [](Value lhs, Value rhs) {
+        if (samePhysicalScalarExpression(lhs, rhs))
+          return true;
+        PhysicalExprAttr left = queryLaunchExpression(lhs);
+        PhysicalExprAttr right = queryLaunchExpression(rhs);
+        return left && right && left == right;
+      };
+      if (!llvm::all_of(ranges, [&](MakeRangeOp range) {
+            return sameBound(root.getLogicalStart(), range.getLogicalStart()) &&
+                   sameBound(root.getLogicalStop(), range.getLogicalStop()) &&
+                   sameBound(root.getStep(), range.getStep());
+          }))
+        continue;
+      for (MakeRangeOp range : ranges) {
+        auto [found, inserted] = resultAxes.try_emplace(range.getOperation(), axis);
+        if (!inserted && found->second != axis) {
+          store.emitOpError("Cartesian pointwise axes require independent producer ranges");
+          return WalkResult::interrupt();
+        }
+      }
+      for (MakeRangeOp range : ranges) {
+        auto previous = occurrenceRoots.find(range.getOperation());
+        if (previous == occurrenceRoots.end())
+          continue;
+        MakeRangeOp old = previous->second;
+        for (auto &entry : occurrenceRoots)
+          if (entry.second == old)
+            entry.second = root;
+      }
+      for (MakeRangeOp range : ranges) {
+        occurrenceRoots[range.getOperation()] = root;
+        ownershipSources.insert(sourceAxisIdentity(range));
+      }
+    }
+    return WalkResult::advance();
+  });
+  if (occurrences.wasInterrupted())
+    return failure();
+  if (ownershipOnly)
+    for (auto &entry : occurrenceRoots) {
+      auto range = cast<MakeRangeOp>(entry.first);
+      if (!llvm::is_contained(dynamicRanges, range))
+        dynamicRanges.push_back(range);
+    }
   // A read-only operand may reach a write through broadcast/pointwise values
   // while retaining a different source identity from the write coordinates.
   // Share ownership only through that value path and an exact logical range.
@@ -4234,13 +4313,19 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       ownershipSources.insert(sourceAxisIdentity(range));
   }
   auto dependsOnSource = [&](ValueRange values, PhysicalSourceAxis source) {
+    PhysicalProgramAnalysis analysis(kernel);
     for (Value value : values) {
-      if (!queryFragmentAxis(value.getType(), source).isExact())
+      auto fragment = dyn_cast<FragmentType>(value.getType());
+      if (!fragment)
         continue;
-      llvm::SmallPtrSet<Operation *, 8> ranges;
-      collectProducerRanges(value, source, ranges);
-      if (!ranges.empty())
-        return true;
+      for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
+        PhysicalRangeFact ranges = analysis.axisRanges(value, axis);
+        if (ranges.state != PhysicalFactState::Unknown && ranges.blockers.empty() &&
+            llvm::any_of(ranges.roots, [&](MakeRangeOp range) {
+              return sourceAxisIdentity(range) == source;
+            }))
+          return true;
+      }
     }
     return false;
   };
@@ -4358,6 +4443,17 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       continue;
     FailureOr<ParameterOp> parameter =
         queryOwnershipBlockingParameter(kernel, range);
+    MakeRangeOp occurrenceRoot = occurrenceRoots.lookup(range.getOperation());
+    if (occurrenceRoot) {
+      ParameterOp selected = occurrenceParameters.lookup(occurrenceRoot.getOperation());
+      if (!selected && succeeded(parameter)) {
+        PhysicalParameterBinding binding = queryParameterBinding(*parameter);
+        if (binding.source && *binding.source == sourceAxisIdentity(occurrenceRoot))
+          selected = *parameter;
+      }
+      parameter = selected ? FailureOr<ParameterOp>(selected)
+                           : FailureOr<ParameterOp>(failure());
+    }
     bool requiresBlockingParameter =
         (ownershipOnly && hasPointwiseOwnership(range) &&
          !internalTraversalRanges.contains(range.getOperation())) ||
@@ -4416,9 +4512,11 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                           kernel.getBody().front().begin());
         PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
                               range.getDerived()};
+        if (occurrenceRoot)
+          source = sourceAxisIdentity(occurrenceRoot);
         auto schema = ParameterAttr::get(
             module.getContext(),
-            builder.getStringAttr(launchVisibleDimension
+            builder.getStringAttr(launchVisibleDimension && !occurrenceRoot
                                       ? ("FRAGMENT_D" +
                                          Twine(*sourceDimension))
                                             .str()
@@ -4434,7 +4532,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         if (succeeded(sourceDimension))
           (*parameter)->setAttr(dimensionAttr,
                                 builder.getI64IntegerAttr(*sourceDimension));
-        if (!launchVisibleDimension)
+        if (!launchVisibleDimension || occurrenceRoot)
           (*parameter)->setAttr(
               parameterSourceAttr,
               PhysicalSourceAttr::get(module.getContext(), source.sourceId,
@@ -4454,12 +4552,15 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                    << parameter->getParameter().getName().getValue();
       return failure();
     }
-    // Pointwise ownership is shared by every value carrying the same
-    // canonical logical dimension, even when an elementwise result has a new
-    // provenance identity.  Propagate through that typed relation first; the
-    // source identity remains the fallback for range-local/derived axes that
-    // have no canonical dimension.
-    if (FailureOr<uint64_t> dimension = rangeDimension(range);
+    if (occurrenceRoot)
+      occurrenceParameters[occurrenceRoot.getOperation()] = *parameter;
+    // Repeated Cartesian axes use their proven occurrence classes. A unique
+    // logical dimension can still bind connected pointwise values, while a
+    // range-local source retains its own traversal relation.
+    if (occurrenceRoot)
+      retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
+                           fragmentExtent(*parameter));
+    else if (FailureOr<uint64_t> dimension = rangeDimension(range);
         succeeded(dimension))
       retargetDimensionExtent(range.getResult(), *dimension,
                               fragmentExtent(*parameter));
@@ -4764,6 +4865,18 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::DenseMap<Attribute, unsigned> mappedAxes;
   llvm::DenseMap<unsigned, Attribute> coordinateAxes;
   auto mappingAxis = [&](Attribute attribute) -> FailureOr<Attribute> {
+    auto expression = dyn_cast<PhysicalExprAttr>(attribute);
+    if (expression && expression.getKind() ==
+                          static_cast<uint32_t>(PhysicalExprKind::CeilDiv) &&
+        expression.getOperands().size() == 2) {
+      auto divisor = dyn_cast<PhysicalExprAttr>(expression.getOperands()[1]);
+      if (divisor && divisor.getKind() ==
+                         static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
+        FailureOr<ParameterOp> parameter = queryParameterBySymbol(kernel, divisor.getSymbol());
+        if (succeeded(parameter))
+          return parameterAxis(*parameter);
+      }
+    }
     FailureOr<uint64_t> blocked = blockedDimension(attribute);
     if (succeeded(blocked))
       return dimensionAxisKey(module.getContext(), *blocked);

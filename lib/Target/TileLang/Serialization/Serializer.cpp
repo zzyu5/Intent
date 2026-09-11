@@ -383,11 +383,7 @@ private:
   }
 
   void emitLaunch() {
-    output << "_KERNEL_CACHE = {}\n\ndef launch(" << joinViewNames(views);
-    for (const ScalarABI &scalar : scalars)
-      if (scalar.kind != "constexpr")
-        output << (views.empty() ? "" : ", ") << scalar.name;
-    output << "):\n";
+    output << "_KERNEL_CACHE = {}\n\ndef launch(" << joinLaunchArguments() << "):\n";
     for (const MetadataABI &metadata : metadataArguments) {
       const ViewABI &source = viewByABI(metadata.sourceABI);
       line(metadata.name + " = " + source.name +
@@ -448,11 +444,7 @@ private:
       if (view.type.getAccess() == 1)
         outputs.push_back(view);
     }
-    output << "def run(" << joinViewNames(inputs);
-    for (const ScalarABI &scalar : scalars)
-      if (scalar.kind != "constexpr")
-        output << (inputs.empty() ? "" : ", ") << scalar.name;
-    output << "):\n";
+    output << "def run(" << joinLaunchArguments(/*includeOutputs=*/false) << "):\n";
     std::string device = inputs.empty() ? "'cuda'" : inputs.front().name + ".device";
     for (const ViewABI &view : outputs)
       line(view.name + " = torch.empty(" + outputShape(view) + ", device=" +
@@ -885,8 +877,21 @@ private:
     return result;
   }
 
-  std::string joinLaunchArguments() const {
-    return joinKernelRuntimeArguments();
+  std::string joinLaunchArguments(bool includeOutputs = true) const {
+    std::map<unsigned, std::string> arguments;
+    for (const ViewABI &view : views)
+      if (includeOutputs || view.type.getAccess() != 1)
+        arguments.emplace(view.argument, view.name);
+    for (const ScalarABI &scalar : scalars)
+      if (scalar.kind != "constexpr")
+        arguments.emplace(scalar.argument, scalar.name);
+    std::string result;
+    for (const auto &[index, name] : arguments) {
+      if (!result.empty())
+        result += ", ";
+      result += name;
+    }
+    return result;
   }
 
   std::string valueString(Value value) {

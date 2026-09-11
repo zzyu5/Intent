@@ -523,6 +523,7 @@ analyzeRoot(LoadOp load, ArrayRef<MakeRangeOp> reductionRanges,
   unsigned reductionAxis = resultAxes.front().axis;
   MakeRangeOp resultAuthority = resultAxes.front().authority;
   SmallVector<std::pair<unsigned, unsigned>, 2> occurrences;
+  SmallVector<std::pair<unsigned, unsigned>, 2> directOccurrences;
   for (auto [index, value] : llvm::enumerate(load.getCoordinates())) {
     auto type = dyn_cast<FragmentType>(value.getType());
     if (!type)
@@ -531,12 +532,17 @@ analyzeRoot(LoadOp load, ArrayRef<MakeRangeOp> reductionRanges,
       PhysicalRangeFact fact = analysis.axisRanges(value, axis);
       if (fact.roots.empty())
         continue;
+      if (llvm::is_contained(fact.roots, resultAuthority))
+        directOccurrences.emplace_back(index, axis);
       SmallVector<MakeRangeOp> combined(fact.roots.begin(), fact.roots.end());
       combined.push_back(resultAuthority);
       if (analysis.lockstepRanges(combined).isExact())
         occurrences.emplace_back(index, axis);
     }
   }
+  // Equal bounds do not identify one of two independent Cartesian axes.
+  if (!directOccurrences.empty())
+    occurrences = std::move(directOccurrences);
   SmallVector<std::pair<unsigned, unsigned>, 2> alignedOccurrences;
   llvm::copy_if(occurrences, std::back_inserter(alignedOccurrences),
                 [&](const auto &occurrence) {
@@ -585,8 +591,18 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned reductionAxis) {
   // map those coordinates from the same lockstep authority instead of meeting
   // an unmapped make_range inside the chunk loop.
   PhysicalRangeFact graphRanges = analysis.sourceRanges(source);
+  llvm::SmallPtrSet<Operation *, 8> otherAxisRanges;
+  for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
+    if (axis == reductionAxis)
+      continue;
+    PhysicalRangeFact other = analysis.axisRanges(source, axis);
+    for (MakeRangeOp range : other.roots)
+      if (!llvm::is_contained(plan.ranges, range))
+        otherAxisRanges.insert(range.getOperation());
+  }
   for (MakeRangeOp range : graphRanges.roots) {
-    if (llvm::is_contained(plan.ranges, range))
+    if (llvm::is_contained(plan.ranges, range) ||
+        otherAxisRanges.contains(range.getOperation()))
       continue;
     SmallVector<MakeRangeOp> combined(plan.ranges.begin(), plan.ranges.end());
     combined.push_back(range);
@@ -1781,7 +1797,10 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
   auto loop = builder.create<scf::ForOp>(
       location, master->range.getLogicalStart(),
       master->range.getLogicalStop(), outerLoopStep, identities,
-      [&](OpBuilder &nested, Location nestedLocation, Value coordinate,
+      [](OpBuilder &, Location, Value, ValueRange) {});
+  // Replay analyses require the new values to belong to the current kernel.
+  // A ForOp build callback runs before the loop is attached to that kernel.
+  auto buildBody = [&](OpBuilder &nested, Location nestedLocation, Value coordinate,
           ValueRange carries) {
         SmallVector<Value> innerSources;
         for (auto [component, plan] : llvm::enumerate(plans)) {
@@ -2097,7 +2116,9 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
           return;
         }
         nested.create<scf::YieldOp>(nestedLocation, *combined);
-      });
+      };
+  OpBuilder bodyBuilder = OpBuilder::atBlockEnd(loop.getBody());
+  buildBody(bodyBuilder, location, loop.getInductionVar(), loop.getRegionIterArgs());
   if (bodyFailed) {
     loop.erase();
     return reduce.emitOpError(
@@ -2278,7 +2299,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
   std::string bodyFailure = "unknown producer replay failure";
   auto loop = builder.create<scf::ForOp>(
       location, firstRange.getStart(), stop, chunk.getResult(), loopInitials,
-      [&](OpBuilder &nested, Location nestedLocation, Value chunkStart,
+      [](OpBuilder &, Location, Value, ValueRange) {});
+  auto buildBody = [&](OpBuilder &nested, Location nestedLocation, Value chunkStart,
           ValueRange carries) {
         auto masterType = cast<FragmentType>(firstRange.getResult().getType());
         SmallVector<Attribute> masterShape(masterType.getShape().begin(),
@@ -2532,7 +2554,9 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
           return;
         }
         nested.create<scf::YieldOp>(nestedLocation, *combined);
-      });
+      };
+  OpBuilder bodyBuilder = OpBuilder::atBlockEnd(loop.getBody());
+  buildBody(bodyBuilder, location, loop.getInductionVar(), loop.getRegionIterArgs());
   if (Attribute origin = reduce->getAttr(originAttr))
     loop->setAttr(originAttr, origin);
   if (bodyFailed) {

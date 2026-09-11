@@ -43,10 +43,11 @@
 - 手册优先保证内容准确和可查询，以本地 STDIO MCP 提供小接口；不另建与 compiler 并行维护的语言定义。
 - 暂不拆 Supervisor：本轮交付是一条本地作者入口链，手册、agent 配置、薄适配和首批 compiler 复现共同演进；完整实验与其余 compiler 攻坚不塞入本轮。
 - provider 接口能力尚未实测是 Build 工作，不假定 `/v1` 即兼容；若实际不支持指定模型/协议，应报告缺口，不静默换模型或搭转换平台。
+- 用户已同意继续收束暴露的问题。复核 `doc/compiler/gpu-program-ir.md` 与 `kir-to-gpu.md` 后，轴出现位置、独立 output relation 和同 kernel execution groups 已有规格依据；剩余两项按 A4 修正实现，不另造编程模型，也不提前启动 50 题评估。遇到现有规格不能决定的真实分叉再确认。
 
 # 待解决问题
 
-- [blocking] 首批实现已发现进一步的 shared ownership 设计问题：普通 Cartesian pointwise 的重复 dimension 仍被 value/access schema repair 按维度整体覆盖；同一 kernel 中两个 contraction 会产生多组 M/N 坐标，而当前 mapping refinement 只接受一组。是否扩充当前 Shape，明确统一按轴出现位置维护 value/coordinate/parameter relations，并收束多个 contraction 的执行域与唯一写入覆盖？这不是改算法或放宽 verifier。用户确认前不继续这两项跨模块重构，A4 保持未完成，不提交完成候选。
+- [blocking] 多输出分组还缺少 alias/依赖证明。`doc/dsl/types-numerics-and-effects.md` 规定不同 view 参数默认可以 alias，不能仅因 `gram` 和 `rhs` 参数不同就并行拆组；GPU launcher 当前没有相应运行条件载体。是否在本 change 加入 Physical IR 显式声明、runtime 检查的 buffer 非重叠条件，为满足条件的调用提供独立分组，未满足时明确报未支持？确认前不引入这一 IR/runtime 契约；A4 与整轮验收保持未完成。
 
 # 验证预期
 
