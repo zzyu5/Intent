@@ -4,7 +4,7 @@ from .program import NativeProgram
 
 
 def view(name: str, dimensions: tuple[int, ...], *, output: bool = False) -> dict[str, object]:
-    return {"name": name, "kind": "view", "access": 1 if output else 0,
+    return {"name": name, "kind": "view", "dtype": "f32", "access": 1 if output else 0,
             "shape": [-1] * len(dimensions), "dimensions": list(dimensions),
             "alias": "", "noalias": False}
 

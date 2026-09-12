@@ -4,11 +4,11 @@
       {"shared": [1, 64, 64, 64, 64], "local": {"vector_width": 8, "micro_m": 4, "micro_n": 2, "register_replicas": 1, "reduction_replicas": 1}},
       {"shared": [1, 64, 128, 128, 128], "local": {"vector_width": 16, "micro_m": 4, "micro_n": 2, "register_replicas": 1, "reduction_replicas": 1}}
     ],
-    "mojo.region_vector_f32": [
+    "mojo.region_vector": [
       {"shared": [1, 1, 1, 1, 64], "local": {"vector_width": 8, "register_replicas": 1, "reduction_replicas": 4}},
       {"shared": [1, 1, 1, 1, 128], "local": {"vector_width": 16, "register_replicas": 1, "reduction_replicas": 4}}
     ],
-    "mojo.vector_f32": [
+    "mojo.vector": [
       {"shared": [8, 1, 1, 1, 1], "local": {"vector_width": 8, "register_replicas": 1, "reduction_replicas": 4}},
       {"shared": [8, 1, 1, 1, 1], "local": {"vector_width": 16, "register_replicas": 1, "reduction_replicas": 4}},
       {"shared": [8, 1, 1, 1, 1], "local": {"vector_width": 8, "register_replicas": 4, "reduction_replicas": 4}},

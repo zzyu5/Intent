@@ -6,11 +6,16 @@ import statistics
 
 import torch
 
-from .compilation import compile_library
+from .compilation import SCALAR_CTYPES, compile_library
 
 
 _winners: dict[tuple[object, ...], dict[tuple[object, ...], int]] = {}
 _candidate_timings: dict[tuple[object, ...], dict[tuple[object, ...], tuple[float, ...]]] = {}
+
+_DTYPES = {
+    "f16": torch.float16, "bf16": torch.bfloat16, "f32": torch.float32, "f64": torch.float64,
+    "i1": torch.bool, "i8": torch.int8, "i16": torch.int16, "i32": torch.int32, "i64": torch.int64,
+}
 
 
 def _timing_samples(measure, arguments: tuple[object, ...], *, samples: int) -> float:
@@ -63,7 +68,7 @@ class NativeProgram:
             if parameter["kind"] == "view":
                 argument_types.extend([ctypes.c_void_p, *([ctypes.c_int64] * (2 * len(parameter["shape"])))])
             else:
-                argument_types.append(ctypes.c_float if parameter["dtype"] == "f32" else ctypes.c_int64)
+                argument_types.append(SCALAR_CTYPES[parameter["dtype"]])
         self.functions = []
         self.measurements = []
         for candidate in self.candidates:
@@ -79,8 +84,8 @@ class NativeProgram:
         self.timings = _candidate_timings.setdefault(self.compilation.identity, {})
 
     def _view(self, parameter, tensor, dimensions: dict[int, int]) -> None:
-        if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu" or tensor.dtype != torch.float32:
-            raise ValueError(f"{parameter['name']} must be a CPU f32 tensor")
+        if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu" or tensor.dtype != _DTYPES[parameter["dtype"]]:
+            raise ValueError(f"{parameter['name']} must be a CPU {parameter['dtype']} tensor")
         if tensor.numel() == 0:
             raise NotImplementedError("Mojo CPU empty-storage pointer ABI is not implemented")
         if tensor.ndim != len(parameter["shape"]):
@@ -122,7 +127,7 @@ class NativeProgram:
             if not explicit_outputs:
                 shape = tuple(static if static >= 0 else dimensions[identity]
                               for static, identity in zip(parameter["shape"], parameter["dimensions"]))
-                all_arguments[index] = torch.empty(shape, dtype=torch.float32, device="cpu")
+                all_arguments[index] = torch.empty(shape, dtype=_DTYPES[parameter["dtype"]], device="cpu")
                 self._view(parameter, all_arguments[index], dimensions)
             outputs.append(all_arguments[index])
         views = [(parameter, value) for parameter, value in zip(self.parameters, all_arguments)

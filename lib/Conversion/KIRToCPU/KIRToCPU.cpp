@@ -40,10 +40,13 @@ public:
       auto parameter = cast<ParameterAttr>(parameters[i]);
       if (auto view = dyn_cast<ViewType>(argument.getType())) {
         auto tensor = cast<RankedTensorType>(view.getTensor());
-        if ((!tensor.getElementType().isF32() && !tensor.getElementType().isUnsignedInteger(8) &&
-             !tensor.getElementType().isSignlessInteger(8) && !tensor.getElementType().isSignlessInteger(32)) ||
+        Type element = tensor.getElementType();
+        if ((!element.isF16() && !element.isBF16() && !element.isF32() && !element.isF64() &&
+             !element.isUnsignedInteger(8) && !element.isSignlessInteger(8) &&
+             !element.isSignlessInteger(16) && !element.isSignlessInteger(32) &&
+             !element.isSignlessInteger(64) && !element.isInteger(1)) ||
             view.getAccess() == 2)
-          return source.emitError("CPU construction supports f32/u8/i8/i32 In/Out views; InOut is not implemented");
+          return source.emitError("CPU construction requires supported numeric In/Out views; InOut is not implemented");
         auto memory = MemRefType::get(tensor.getShape(), tensor.getElementType());
         if (view.getConstraints().getHasStrides()) {
           if (view.getConstraints().getStrides().size() != static_cast<size_t>(tensor.getRank()))
@@ -68,8 +71,10 @@ public:
             builder.getDenseI64ArrayAttr(tensor.getShape()), shape.getDimensions(),
             view.getAccess(), view.getConstraints().getAlias(),
             view.getConstraints().getNoalias()));
-      } else if (argument.getType().isF32() || argument.getType().isIndex() ||
-                 argument.getType().isInteger(64)) {
+      } else if (argument.getType().isF32() || argument.getType().isF64() || argument.getType().isIndex() ||
+                 argument.getType().isSignlessInteger(8) || argument.getType().isSignlessInteger(16) ||
+                 argument.getType().isSignlessInteger(32) || argument.getType().isSignlessInteger(64) ||
+                 argument.getType().isInteger(1)) {
         types.push_back(argument.getType());
         interface.push_back(cpu::ScalarArgumentAttr::get(builder.getContext(),
             parameter.getName(), argument.getType()));
@@ -389,30 +394,22 @@ private:
       return failure();
     Value source = values.lookup(fact->source);
     auto type = dyn_cast<MemRefType>(source.getType());
-    if (llvm::any_of(fact->terms, [](const IndexTermFact &term) { return term.kind == 1; })) {
-      auto tensor = dyn_cast<RankedTensorType>(operation->getResult(0).getType());
-      if (!tensor || llvm::any_of(fact->terms, [](const IndexTermFact &term) { return term.kind != 0 && term.kind != 1; }))
-        return operation->emitError("CPU inserted index axes require a full tensor projection"), failure();
-      auto shape = extents(tensor, operation->getLoc());
-      if (failed(shape)) return failure();
-      Value output = allocate(tensor, *shape, operation->getLoc());
-      SmallVector<AffineExpr> coordinates;
-      for (auto [axis, term] : llvm::enumerate(fact->terms))
-        if (term.kind == 0) coordinates.push_back(builder.getAffineDimExpr(axis));
-      builder.create<linalg::GenericOp>(operation->getLoc(), ValueRange{source}, ValueRange{output},
-          SmallVector<AffineMap>{AffineMap::get(tensor.getRank(), 0, coordinates, builder.getContext()), builder.getMultiDimIdentityMap(tensor.getRank())},
-          SmallVector<utils::IteratorType>(tensor.getRank(), utils::IteratorType::parallel),
-          [](OpBuilder &nested, Location loc, ValueRange scalars) { nested.create<linalg::YieldOp>(loc, scalars[0]); });
-      return output;
-    }
     SmallVector<OpFoldResult> offsets, sizes, strides;
     SmallVector<int64_t> resultShape;
+    SmallVector<AffineExpr> projection;
+    unsigned outputAxis = 0;
+    bool inserted = false;
     for (const IndexTermFact &term : fact->terms) {
-      if (term.kind == 0) {
+      if (term.kind == 1) {
+        inserted = true;
+        ++outputAxis;
+        continue;
+      } else if (term.kind == 0) {
         unsigned axis = *term.sourceAxis;
         offsets.push_back(builder.getIndexAttr(0));
         sizes.push_back(type.isDynamicDim(axis) ? OpFoldResult(builder.create<memref::DimOp>(operation->getLoc(), source, axis).getResult()) : builder.getIndexAttr(type.getDimSize(axis)));
         resultShape.push_back(type.getDimSize(axis));
+        projection.push_back(builder.getAffineDimExpr(outputAxis++));
       } else if (term.kind == 3 && term.operands.size() == 1) {
         auto coordinate = indexValue(values.lookup(term.operands[0]), operation->getLoc());
         if (failed(coordinate)) return failure();
@@ -428,6 +425,7 @@ private:
           return failure();
         }
         offsets.push_back(builder.getIndexAttr(0));
+        projection.push_back(builder.getAffineDimExpr(outputAxis++));
         llvm::APInt extent;
         if (matchPattern(domain.end, m_ConstantInt(&extent))) {
           sizes.push_back(builder.getIndexAttr(extent.getSExtValue()));
@@ -446,7 +444,7 @@ private:
       operation->emitError("CPU indexed access must resolve every source axis");
       return failure();
     }
-    if (resultShape.empty()) {
+    if (resultShape.empty() && !inserted) {
       SmallVector<Value> indices;
       for (OpFoldResult offset : offsets)
         indices.push_back(isa<Value>(offset) ? cast<Value>(offset)
@@ -456,8 +454,20 @@ private:
     }
     auto resultType = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
         resultShape, type, offsets, sizes, strides));
-    return Value(builder.create<memref::SubViewOp>(operation->getLoc(), resultType,
-                                                 source, offsets, sizes, strides));
+    Value selected = builder.create<memref::SubViewOp>(operation->getLoc(), resultType,
+                                                      source, offsets, sizes, strides);
+    if (!inserted) return selected;
+    if (operation->getNumResults() != 1 || !isa<RankedTensorType>(operation->getResult(0).getType()))
+      return operation->emitError("CPU inserted write axes are not implemented"), failure();
+    auto tensor = cast<RankedTensorType>(operation->getResult(0).getType());
+    auto shape = extents(tensor, operation->getLoc());
+    if (failed(shape)) return failure();
+    Value output = allocate(tensor, *shape, operation->getLoc());
+    builder.create<linalg::GenericOp>(operation->getLoc(), ValueRange{selected}, ValueRange{output},
+        SmallVector<AffineMap>{AffineMap::get(tensor.getRank(), 0, projection, builder.getContext()), builder.getMultiDimIdentityMap(tensor.getRank())},
+        SmallVector<utils::IteratorType>(tensor.getRank(), utils::IteratorType::parallel),
+        [](OpBuilder &nested, Location loc, ValueRange scalars) { nested.create<linalg::YieldOp>(loc, scalars[0]); });
+    return output;
   }
 
   FailureOr<Value> arithmetic(Operation *operation, ValueRange arguments, OpBuilder &builder) {
@@ -480,6 +490,12 @@ private:
       case BinaryOperator::MaximumNum:
         if (fp) return Value(builder.create<arith::MaxNumFOp>(loc, a, b));
         break;
+      case BinaryOperator::MinimumNum:
+        if (fp) return Value(builder.create<arith::MinNumFOp>(loc, a, b));
+        break;
+      case BinaryOperator::Power:
+        if (fp) return Value(builder.create<math::PowFOp>(loc, a, b));
+        break;
       case BinaryOperator::Maximum:
         return fp ? Value(builder.create<arith::MaximumFOp>(loc, a, b)) : Value(builder.create<arith::MaxSIOp>(loc, a, b));
       case BinaryOperator::Minimum:
@@ -499,7 +515,25 @@ private:
       case UnaryOperator::Sqrt: return Value(builder.create<math::SqrtOp>(loc, arguments[0]));
       case UnaryOperator::Exp: return Value(builder.create<math::ExpOp>(loc, arguments[0]));
       case UnaryOperator::Exp2: return Value(builder.create<math::Exp2Op>(loc, arguments[0]));
-      case UnaryOperator::Negate: return Value(builder.create<arith::NegFOp>(loc, arguments[0]));
+      case UnaryOperator::Log: return Value(builder.create<math::LogOp>(loc, arguments[0]));
+      case UnaryOperator::Sin: return Value(builder.create<math::SinOp>(loc, arguments[0]));
+      case UnaryOperator::Cos: return Value(builder.create<math::CosOp>(loc, arguments[0]));
+      case UnaryOperator::Floor: return Value(builder.create<math::FloorOp>(loc, arguments[0]));
+      case UnaryOperator::Erf: return Value(builder.create<math::ErfOp>(loc, arguments[0]));
+      case UnaryOperator::Tanh: return Value(builder.create<math::TanhOp>(loc, arguments[0]));
+      case UnaryOperator::Abs:
+        if (isa<FloatType>(arguments[0].getType())) return Value(builder.create<math::AbsFOp>(loc, arguments[0]));
+        return Value(builder.create<math::AbsIOp>(loc, arguments[0]));
+      case UnaryOperator::Sigmoid: {
+        Value one = builder.create<arith::ConstantOp>(loc, builder.getFloatAttr(arguments[0].getType(), 1.0));
+        Value negative = builder.create<arith::NegFOp>(loc, arguments[0]);
+        Value denominator = builder.create<arith::AddFOp>(loc, one, builder.create<math::ExpOp>(loc, negative));
+        return Value(builder.create<arith::DivFOp>(loc, one, denominator));
+      }
+      case UnaryOperator::Negate:
+        if (isa<FloatType>(arguments[0].getType())) return Value(builder.create<arith::NegFOp>(loc, arguments[0]));
+        return Value(builder.create<arith::SubIOp>(loc,
+            builder.create<arith::ConstantOp>(loc, builder.getIntegerAttr(arguments[0].getType(), 0)), arguments[0]));
       case UnaryOperator::Not: return Value(builder.create<arith::XOrIOp>(loc, arguments[0],
           builder.create<arith::ConstantOp>(loc, builder.getBoolAttr(true))));
       default: break;
@@ -521,12 +555,31 @@ private:
       Type type = getElementTypeOrSelf(cast.getType());
       Type input = arguments[0].getType();
       if (input == type) return arguments[0];
-      if (cast.getRounding()) return cast.emitError("CPU explicit-rounding cast is not implemented"), failure();
-      if (input.isIndex() && type.isInteger(64)) return Value(builder.create<arith::IndexCastOp>(loc, type, arguments[0]));
-      if (input.isInteger(64) && type.isIndex()) return Value(builder.create<arith::IndexCastOp>(loc, type, arguments[0]));
-      if ((input.isIndex() || input.isInteger(64)) && type.isF32()) {
+      if (cast.getRounding() && *cast.getRounding() != 0)
+        return cast.emitError("CPU non-default-rounding cast is not implemented"), failure();
+      if (type.isInteger(1)) return cast.emitError("CPU numeric-to-bool cast is not implemented"), failure();
+      if (input.isIndex() && type.isSignlessInteger()) return Value(builder.create<arith::IndexCastOp>(loc, type, arguments[0]));
+      if (input.isSignlessInteger() && type.isIndex()) return Value(builder.create<arith::IndexCastOp>(loc, type, arguments[0]));
+      if ((input.isIndex() || input.isSignlessInteger()) && isa<FloatType>(type)) {
         Value value = input.isIndex() ? Value(builder.create<arith::IndexCastOp>(loc, builder.getI64Type(), arguments[0])) : arguments[0];
+        if (input.isInteger(1)) return Value(builder.create<arith::UIToFPOp>(loc, type, value));
         return Value(builder.create<arith::SIToFPOp>(loc, type, value));
+      }
+      if (isa<FloatType>(input) && isa<FloatType>(type)) {
+        if (input.getIntOrFloatBitWidth() < type.getIntOrFloatBitWidth())
+          return Value(builder.create<arith::ExtFOp>(loc, type, arguments[0]));
+        if (input.getIntOrFloatBitWidth() > type.getIntOrFloatBitWidth())
+          return Value(builder.create<arith::TruncFOp>(loc, type, arguments[0]));
+        Value widened = builder.create<arith::ExtFOp>(loc, builder.getF32Type(), arguments[0]);
+        return Value(builder.create<arith::TruncFOp>(loc, type, widened));
+      }
+      if (isa<FloatType>(input) && type.isSignlessInteger() && !type.isInteger(1))
+        return Value(builder.create<arith::FPToSIOp>(loc, type, arguments[0]));
+      if (input.isSignlessInteger() && type.isSignlessInteger()) {
+        if (input.getIntOrFloatBitWidth() > type.getIntOrFloatBitWidth())
+          return Value(builder.create<arith::TruncIOp>(loc, type, arguments[0]));
+        if (input.isInteger(1)) return Value(builder.create<arith::ExtUIOp>(loc, type, arguments[0]));
+        return Value(builder.create<arith::ExtSIOp>(loc, type, arguments[0]));
       }
     }
     operation->emitError("CPU construction does not implement this arithmetic operation");

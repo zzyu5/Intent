@@ -17,6 +17,16 @@ class NativeLibrary:
 
 _libraries: dict[tuple[object, ...], NativeLibrary] = {}
 
+ELEMENT_TYPES = {
+    "f16": "Float16", "bf16": "BFloat16", "f32": "Float32", "f64": "Float64",
+    "i1": "SIMD[DType.bool, 1]", "i8": "Int8", "i16": "Int16", "i32": "Int32", "i64": "Int64",
+}
+
+SCALAR_CTYPES = {
+    "f32": ctypes.c_float, "f64": ctypes.c_double, "i1": ctypes.c_bool,
+    "i8": ctypes.c_int8, "i16": ctypes.c_int16, "i32": ctypes.c_int32, "i64": ctypes.c_int64,
+}
+
 
 def flattened_signature(parameters: list[dict[str, object]]) -> tuple[list[str], list[str]]:
     signature: list[str] = []
@@ -24,7 +34,7 @@ def flattened_signature(parameters: list[dict[str, object]]) -> tuple[list[str],
     for index, parameter in enumerate(parameters):
         name = f"a{index}"
         if parameter["kind"] == "view":
-            signature.append(f"{name}: Pointer[Float32, MutUntrackedOrigin]")
+            signature.append(f"{name}: Pointer[{ELEMENT_TYPES[parameter['dtype']]}, MutUntrackedOrigin]")
             arguments.append(name)
             rank = len(parameter["shape"])
             for role in ("d", "s"):
@@ -33,7 +43,7 @@ def flattened_signature(parameters: list[dict[str, object]]) -> tuple[list[str],
                     signature.append(f"{field}: Int64")
                     arguments.append(field)
         else:
-            signature.append(f"{name}: {'Float32' if parameter['dtype'] == 'f32' else 'Int64'}")
+            signature.append(f"{name}: {'Bool' if parameter['dtype'] == 'i1' else ELEMENT_TYPES[parameter['dtype']]}")
             arguments.append(name)
     return signature, arguments
 

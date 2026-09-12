@@ -154,6 +154,18 @@ TILELANG = (
 
 
 MOJO = (
+    Entry("fused_softmax", "8192x8192-fp16-8cores-host", "stable_softmax_f16", ("normalization/softmax.py:stable_softmax_f16",), "source/pytorch/cpu_runtime.py"),
+    Entry("chunked_softmax", "8192x32768-bf16-8cores-host", "chunked_softmax_bf16", ("normalization/softmax.py:chunked_softmax_bf16",), "source/pytorch/cpu_runtime.py"),
+    Entry("layer_norm_f16", "8192x4096-fp16-8cores-host", "layer_norm_f16", ("normalization/layer_norm.py:layer_norm_f16",), "source/pytorch/cpu_runtime.py"),
+    Entry("layer_norm_bf16", "8192x4096-bf16-8cores-host", "layer_norm_bf16", ("normalization/layer_norm.py:layer_norm_bf16",), "source/pytorch/cpu_runtime.py"),
+    Entry("rms_norm_f32", "8192x4096-f32-8cores-host", "rms_norm_f32", ("normalization/rms_norm.py:rms_norm_f32",), "source/pytorch/cpu_runtime.py"),
+    Entry("rms_norm_bf16", "8192x4096-bf16-8cores-host", "rms_norm_bf16", ("normalization/rms_norm.py:rms_norm_bf16",), "source/pytorch/cpu_runtime.py"),
+    Entry("flaggems_softmax_backward", "4096x4097-fp32-8cores-host", "softmax_backward", ("backward/softmax.py:softmax_backward",), "source/pytorch/cpu_runtime.py"),
+    Entry("flaggems_transpose_copy", "4093x8191-fp16-8cores-host", "matrix_transpose", ("layout/transpose.py:matrix_transpose",), "source/pytorch/cpu_runtime.py"),
+    Entry("gelu", "8192x4096-fp16-tanh-8cores-host", "gelu_tanh", ("activation/pointwise.py:gelu_tanh",), "source/pytorch/cpu_runtime.py"),
+    Entry("relu", "8192x4096-fp16-8cores-host", "relu_forward", ("activation/pointwise.py:relu_forward",), "source/pytorch/cpu_runtime.py"),
+    Entry("flaggems_addcmul", "B64-C128-L4096-bf16-8cores-host", "addcmul_broadcast_bf16", ("activation/pointwise.py:addcmul_broadcast_bf16",), "source/pytorch/cpu_runtime.py"),
+    Entry("flaggems_logsumexp", "8192x8192-fp32-8cores-host", "row_logsumexp", ("normalization/logsumexp.py:row_logsumexp",), "source/pytorch/cpu_runtime.py"),
     Entry("causal_attention_f32", "B8-S128-D32-f32-8cores", "causal_attention_f32", ("streaming/attention_f32.py:causal_attention_f32",), "source/mojo/intentdsl/attention/causal/causal_runtime.py"),
     Entry("causal_linear_attention_f32", "B8-S128-D32-f32-8cores", "causal_linear_attention_f32", ("streaming/attention_f32.py:causal_linear_attention_f32",), "source/mojo/intentdsl/attention/linear/linear_runtime.py"),
     Entry("batched_row_affine", "17x257x4093-f32-8cores", "batched_row_affine", ("pointwise/batched_affine.py:batched_row_affine",), "source/mojo/modular/pointwise/batched_affine/batched_affine_runtime.py"),

@@ -1,8 +1,20 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
-causal_attention_f32,B8-S128-D32-f32-8cores,0.279693,0.283169,0.987724,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。独立 Mojo online attention source；沿用 CPU f32 contraction 容差；分段与归约括号可不同。
-causal_linear_attention_f32,B8-S128-D32-f32-8cores,0.074779,0.151338,0.494115,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。独立 Mojo chunked linear attention source；输出包含最终状态；沿用 CPU f32 contraction 容差。
-batched_row_affine,17x257x4093-f32-8cores,1.444316,2.082646,0.693500,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU elementwise。
-weighted_rms_norm,8192x4096-f32-8cores,5.019436,3.447934,1.455781,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX RMSNorm；双方归约括号与中间数学实现可能不同。
-dense_gemm_f32,M1024-N1024-K1024-f32-8cores,2.175399,2.189766,0.993439,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU matmul，未缓存输入 packing。
-stable_softmax,8192x8192-f32-8cores,8.081696,7.888340,1.024512,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU Softmax；双方 max/exp/sum 后显式以倒数乘法归一化，归约树仍可能不同。
-weighted_layer_norm,8192x4096-f32-8cores,3.797713,3.678546,1.032395,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 使用 Modular/MAX rowwise 同矩统计算法 E[x²]-E[x]²；不是现成 Welford layer_norm。
+fused_softmax,8192x8192-fp16-8cores-host,25.688447,160.472313,0.160080,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+chunked_softmax,8192x32768-bf16-8cores-host,101.572544,603.484248,0.168310,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+layer_norm_f16,8192x4096-fp16-8cores-host,11.091587,128.427770,0.086364,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+layer_norm_bf16,8192x4096-bf16-8cores-host,8.839343,119.342051,0.074067,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+rms_norm_f32,8192x4096-f32-8cores-host,20.804469,39.640834,0.524824,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+rms_norm_bf16,8192x4096-bf16-8cores-host,9.831196,81.682288,0.120359,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+flaggems_softmax_backward,4096x4097-fp32-8cores-host,9.866295,26.847422,0.367495,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+flaggems_transpose_copy,4093x8191-fp16-8cores-host,176.101310,50.775816,3.468212,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+gelu,8192x4096-fp16-tanh-8cores-host,11.966874,21.635796,0.553105,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+relu,8192x4096-fp16-8cores-host,9.773445,11.399792,0.857335,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+flaggems_addcmul,B64-C128-L4096-bf16-8cores-host,10.484505,22.202588,0.472220,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+flaggems_logsumexp,8192x8192-fp32-8cores-host,22.470132,50.243201,0.447227,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+causal_attention_f32,B8-S128-D32-f32-8cores,0.255846,0.213484,1.198435,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。独立 Mojo online attention source；沿用 CPU f32 contraction 容差；分段与归约括号可不同。
+causal_linear_attention_f32,B8-S128-D32-f32-8cores,0.063946,0.150292,0.425477,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。独立 Mojo chunked linear attention source；输出包含最终状态；沿用 CPU f32 contraction 容差。
+batched_row_affine,17x257x4093-f32-8cores,1.902721,1.936592,0.982510,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU elementwise。
+weighted_rms_norm,8192x4096-f32-8cores,3.474215,3.398490,1.022282,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX RMSNorm；双方归约括号与中间数学实现可能不同。
+dense_gemm_f32,M1024-N1024-K1024-f32-8cores,3.178589,2.181360,1.457159,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU matmul，未缓存输入 packing。
+stable_softmax,8192x8192-f32-8cores,8.081428,8.147241,0.991922,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU Softmax；双方 max/exp/sum 后显式以倒数乘法归一化，归约树仍可能不同。
+weighted_layer_norm,8192x4096-f32-8cores,3.685852,3.796412,0.970878,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 使用 Modular/MAX rowwise 同矩统计算法 E[x²]-E[x]²；不是现成 Welford layer_norm。

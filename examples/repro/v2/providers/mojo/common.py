@@ -55,3 +55,25 @@ def prepare_comparison(context, definition, arguments, runtime_path, tolerance, 
         tolerance, cuda_graph=False, device_type="cpu",
         note="同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。" + note,
     )
+
+
+def prepare_host_comparison(context, definition, arguments, reference, tolerance):
+    report_stage("generated_compilation")
+    artifact = intent.compile(definition, target=context.target, compiler=context.compiler,
+                              tuning_config=context.tuning_config)
+    runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_reference")
+
+    def side(function):
+        state = {}
+
+        def launch():
+            state["output"] = function(*arguments)
+
+        return PreparedLaunch(launch, lambda: state["output"])
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(
+        side(artifact.run), side(getattr(runtime, reference)), tolerance,
+        cuda_graph=False, device_type="cpu", cpu_host_timing=True,
+        note="既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。",
+    )

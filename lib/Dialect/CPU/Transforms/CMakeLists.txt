@@ -19,6 +19,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   MLIRIntentCPUAnalysis
   MLIRIntentAnalysis
   MLIRIntentCPUDialect
+  MLIRAnalysis
   MLIRArithDialect
   MLIRFuncDialect
   MLIRLinalgDialect

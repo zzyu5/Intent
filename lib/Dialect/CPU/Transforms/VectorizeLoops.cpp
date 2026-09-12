@@ -1,5 +1,6 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Utilities.h"
+#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
@@ -11,6 +12,12 @@ using namespace mlir;
 
 namespace intent::cpu {
 namespace {
+
+bool vectorElement(Type type) {
+  return type.isF16() || type.isBF16() || type.isF32() || type.isF64() ||
+      type.isIndex() || type.isSignlessInteger(1) || type.isSignlessInteger(8) ||
+      type.isSignlessInteger(16) || type.isSignlessInteger(32) || type.isSignlessInteger(64);
+}
 
 std::optional<int64_t> coefficient(Value value, scf::ForOp loop) {
   if (value == loop.getInductionVar()) return 1;
@@ -38,7 +45,7 @@ std::optional<int64_t> coefficient(Value value, scf::ForOp loop) {
 
 bool contiguous(Value memory, ValueRange indices, scf::ForOp loop, bool allowInvariant) {
   auto type = cast<MemRefType>(memory.getType());
-  if (!type.getElementType().isF32()) return false;
+  if (!vectorElement(type.getElementType()) || type.getElementType().isInteger(1)) return false;
   if (auto owner = memory.getDefiningOp(); owner && loop->isAncestor(owner)) return false;
   SmallVector<int64_t> strides;
   int64_t offset;
@@ -58,7 +65,7 @@ bool contiguous(Value memory, ValueRange indices, scf::ForOp loop, bool allowInv
 class VectorBody {
 public:
   VectorBody(scf::ForOp original, OpBuilder &builder, Value iv, int64_t width)
-      : original(original), b(builder), type(VectorType::get({width}, b.getF32Type())) {
+      : original(original), b(builder), width(width) {
     mapping.map(original.getInductionVar(), iv);
   }
 
@@ -81,8 +88,13 @@ public:
     if (vectors.count(value)) return vectors.lookup(value);
     Location loc = original.getLoc();
     Operation *op = value.getDefiningOp();
+    auto type = VectorType::get({width}, value.getType());
     Value result;
-    if (!op || !original->isAncestor(op) || isa<arith::ConstantOp>(op)) {
+    if (value == original.getInductionVar()) {
+      Value start = b.create<vector::BroadcastOp>(loc, type, scalar(value));
+      Value lanes = b.create<vector::StepOp>(loc, type);
+      result = b.create<arith::AddIOp>(loc, start, lanes);
+    } else if (!op || !original->isAncestor(op) || coefficient(value, original) == 0) {
       result = b.create<vector::BroadcastOp>(loc, type, scalar(value));
     } else if (auto load = dyn_cast<memref::LoadOp>(op)) {
       bool invariant = llvm::all_of(load.getIndices(), [&](Value input) {
@@ -94,7 +106,7 @@ public:
     } else {
       IRMapping operationMapping;
       for (Value input : op->getOperands())
-        operationMapping.map(input, input.getType().isF32() ? vector(input) : scalar(input));
+        operationMapping.map(input, vector(input));
       Operation *cloned = b.clone(*op, operationMapping);
       cloned->getResult(0).setType(type);
       result = cloned->getResult(0);
@@ -106,7 +118,7 @@ public:
 private:
   scf::ForOp original;
   OpBuilder &b;
-  VectorType type;
+  int64_t width;
   IRMapping mapping;
   llvm::DenseMap<Value, Value> vectors;
 };
@@ -140,20 +152,39 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas) {
     }
   }
   SmallVector<memref::StoreOp> stores;
+  SmallVector<memref::LoadOp> loads;
   for (Operation &operation : original.getBody()->without_terminator()) {
     if (operation.getNumRegions()) return;
     if (auto load = dyn_cast<memref::LoadOp>(&operation)) {
       if (!contiguous(load.getMemref(), load.getIndices(), original, true)) return;
+      loads.push_back(load);
     } else if (auto store = dyn_cast<memref::StoreOp>(&operation)) {
       if (dependsOnCarry(store.getValue(), original) ||
           !contiguous(store.getMemref(), store.getIndices(), original, false)) return;
       stores.push_back(store);
-    } else if (!isMemoryEffectFree(&operation) ||
-               llvm::any_of(operation.getResultTypes(), [](Type type) {
-                 return !type.isF32() && !type.isIndex() && !type.isInteger(64);
-               })) return;
+    } else if (!isMemoryEffectFree(&operation) || operation.getNumResults() != 1 ||
+               !vectorElement(operation.getResult(0).getType()) ||
+               (!operation.hasTrait<OpTrait::Elementwise>() &&
+                coefficient(operation.getResult(0), original) != 0)) return;
   }
   if (reductionInputs.empty() && stores.empty()) return;
+  auto function = original->getParentOfType<func::FuncOp>();
+  PhysicalProgramAnalysis physical(function);
+  AliasAnalysis aliases(function);
+  auto independent = [&](Value lhs, ValueRange lhsIndices, Value rhs, ValueRange rhsIndices) {
+    if (lhs == rhs && lhsIndices == rhsIndices) return true;
+    if (aliases.alias(lhs, rhs).isNo()) return true;
+    auto left = physical.externalView(lhs), right = physical.externalView(rhs);
+    auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+    return left && right && physical.storageRoot(lhs) != physical.storageRoot(rhs) &&
+        interface.getDisjointOutputs() && (left.getAccess() != 0 || right.getAccess() != 0);
+  };
+  for (auto [number, store] : llvm::enumerate(stores)) {
+    for (auto load : loads)
+      if (!independent(load.getMemref(), load.getIndices(), store.getMemref(), store.getIndices())) return;
+    for (auto other : ArrayRef(stores).drop_front(number + 1))
+      if (!independent(other.getMemref(), other.getIndices(), store.getMemref(), store.getIndices())) return;
+  }
   OpBuilder b(original);
   Location loc = original.getLoc();
   // One local tree spans adjacent register replicas. Keeping the leaves in
@@ -162,27 +193,43 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas) {
   int64_t logicalWidth = replicas * width;
   Value step = index(b, loc, logicalWidth);
   Value length = b.create<arith::SubIOp>(loc, original.getUpperBound(), original.getLowerBound());
+  // Shorten the scalar carry chains with contiguous sums, then combine their
+  // results in coordinate order. Splitting requires the closed +0 identity.
+  int64_t partitions = stores.empty() && !combines.empty() &&
+      llvm::all_of(combines, [](Operation *op) { return isa<arith::AddFOp>(op); }) &&
+      llvm::all_of(original.getInitArgs(), [](Value value) { return matchPattern(value, m_PosZeroFloat()); })
+      ? std::min<int64_t>(replicas, 4) : 1;
+  Value groupStep = index(b, loc, logicalWidth * partitions);
   Value full = add(b, loc, original.getLowerBound(),
-      multiply(b, loc, b.create<arith::DivSIOp>(loc, length, step), step));
-  auto vectorLoop = b.create<scf::ForOp>(loc, original.getLowerBound(), full, step, original.getInitArgs());
+      multiply(b, loc, b.create<arith::DivSIOp>(loc, length, groupStep), groupStep));
+  Value span = b.create<arith::DivSIOp>(loc,
+      b.create<arith::SubIOp>(loc, full, original.getLowerBound()), index(b, loc, partitions));
+  SmallVector<Value> initial;
+  for (int64_t part = 0; part < partitions; ++part) llvm::append_range(initial, original.getInitArgs());
+  auto vectorLoop = b.create<scf::ForOp>(loc, original.getLowerBound(),
+      add(b, loc, original.getLowerBound(), span), step, initial);
+  auto merge = [&](Operation *combine, Value lhs, Value rhs) {
+    IRMapping mapping;
+    mapping.map(combine->getOperand(0), lhs);
+    mapping.map(combine->getOperand(1), rhs);
+    Operation *result = b.clone(*combine, mapping);
+    result->getResult(0).setType(lhs.getType());
+    return result->getResult(0);
+  };
   {
     OpBuilder::InsertionGuard guard(b);
     b.setInsertionPointToStart(vectorLoop.getBody());
-    VectorBody body(original, b, vectorLoop.getInductionVar(), logicalWidth);
-    for (memref::StoreOp store : stores)
-      b.create<vector::StoreOp>(loc, body.vector(store.getValue()), store.getMemref(), body.indices(store.getIndices()));
-    if (!reductionInputs.empty()) {
-      SmallVector<Value> results;
+    SmallVector<Value> results;
+    for (int64_t part = 0; part < partitions; ++part) {
+      Value coordinate = add(b, loc, vectorLoop.getInductionVar(), multiply(b, loc, span, index(b, loc, part)));
+      VectorBody body(original, b, coordinate, logicalWidth);
+      for (Operation &operation : original.getBody()->without_terminator()) {
+        if (auto load = dyn_cast<memref::LoadOp>(&operation)) body.vector(load.getResult());
+        else if (auto store = dyn_cast<memref::StoreOp>(&operation))
+          b.create<vector::StoreOp>(loc, body.vector(store.getValue()), store.getMemref(), body.indices(store.getIndices()));
+      }
       for (auto [number, reductionInput] : llvm::enumerate(reductionInputs)) {
         Operation *combine = combines[number];
-        auto merge = [&](Value lhs, Value rhs) {
-          IRMapping mapping;
-          mapping.map(combine->getOperand(0), lhs);
-          mapping.map(combine->getOperand(1), rhs);
-          Operation *result = b.clone(*combine, mapping);
-          result->getResult(0).setType(lhs.getType());
-          return result->getResult(0);
-        };
         Value value = body.vector(reductionInput);
         for (int64_t count = logicalWidth; count > 1; count /= 2) {
           SmallVector<int64_t> even, odd;
@@ -192,17 +239,32 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas) {
           }
           Value lhs = b.create<vector::ShuffleOp>(loc, value, value, even);
           Value rhs = b.create<vector::ShuffleOp>(loc, value, value, odd);
-          value = merge(lhs, rhs);
+          value = merge(combine, lhs, rhs);
         }
         Value sum = b.create<vector::ExtractElementOp>(loc, value, index(b, loc, 0));
-        results.push_back(merge(vectorLoop.getRegionIterArgs()[number], sum));
+        results.push_back(merge(combine,
+            vectorLoop.getRegionIterArgs()[part * reductionInputs.size() + number], sum));
       }
-      b.create<scf::YieldOp>(loc, results);
     }
+    if (!results.empty()) b.create<scf::YieldOp>(loc, results);
+  }
+  SmallVector<Value> combined;
+  for (auto [number, combine] : llvm::enumerate(combines)) {
+    SmallVector<Value> leaves;
+    for (int64_t part = 0; part < partitions; ++part)
+      leaves.push_back(vectorLoop.getResult(part * combines.size() + number));
+    while (leaves.size() > 1) {
+      SmallVector<Value> level;
+      for (unsigned part = 0; part < leaves.size(); part += 2)
+        level.push_back(merge(combine, leaves[part], leaves[part + 1]));
+      leaves = std::move(level);
+    }
+    combined.push_back(leaves.front());
   }
   original.setLowerBound(full);
-  if (!reductionInputs.empty()) original.getInitArgsMutable().assign(vectorLoop.getResults());
-  if (replicas > 1) vectorize(original, width, 1);
+  if (!reductionInputs.empty()) original.getInitArgsMutable().assign(combined);
+  if (partitions > 1) vectorize(original, width, replicas);
+  else if (replicas > 1) vectorize(original, width, 1);
   original->removeAttr("intent_cpu.reduction_order");
 }
 

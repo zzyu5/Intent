@@ -35,6 +35,7 @@ class PreparedComparison:
     note: str = ""
     device_type: str = "cuda"
     native_comparison: Callable[[], NativeComparisonResult] | None = None
+    cpu_host_timing: bool = False
 
 
 @dataclass(frozen=True)

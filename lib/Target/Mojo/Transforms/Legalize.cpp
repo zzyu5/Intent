@@ -18,11 +18,13 @@ namespace {
 bool supportedType(Type type) {
   if (auto vector = dyn_cast<VectorType>(type)) {
     int64_t width = vector.getNumElements();
-    return vector.getRank() == 1 && vector.getElementType().isF32() &&
+    return vector.getRank() == 1 && supportedType(vector.getElementType()) &&
         width > 0 && (width & (width - 1)) == 0;
   }
   if (auto memory = dyn_cast<MemRefType>(type)) return supportedType(memory.getElementType());
-  return type.isIndex() || type.isF32() || type.isInteger(64) || type.isInteger(1);
+  return type.isIndex() || type.isF16() || type.isBF16() || type.isF32() || type.isF64() ||
+      type.isSignlessInteger(8) || type.isSignlessInteger(16) || type.isSignlessInteger(32) ||
+      type.isSignlessInteger(64) || type.isInteger(1);
 }
 
 LogicalResult checkSurface(ModuleOp module) {
@@ -33,17 +35,20 @@ LogicalResult checkSurface(ModuleOp module) {
         arith::SubFOp, arith::SubIOp, arith::MulFOp, arith::MulIOp,
         arith::DivFOp, arith::DivSIOp, arith::FloorDivSIOp, arith::RemSIOp,
         arith::MinSIOp, arith::MaxSIOp, arith::CeilDivSIOp, arith::NegFOp,
-        arith::IndexCastOp, arith::SIToFPOp, arith::MaxNumFOp, arith::MaximumFOp, arith::MinimumFOp,
+        arith::IndexCastOp, arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp,
+        arith::ExtFOp, arith::TruncFOp, arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp,
+        arith::MaxNumFOp, arith::MinNumFOp, arith::MaximumFOp, arith::MinimumFOp,
         arith::CmpFOp, arith::SelectOp, arith::AndIOp, arith::OrIOp, arith::XOrIOp,
-        math::FmaOp, math::SqrtOp, math::ExpOp, math::Exp2Op, memref::DimOp,
+        math::FmaOp, math::SqrtOp, math::ExpOp, math::Exp2Op, math::LogOp, math::TanhOp,
+        math::SinOp, math::CosOp, math::FloorOp, math::ErfOp, math::AbsFOp, math::AbsIOp, math::PowFOp, memref::DimOp,
         memref::SubViewOp, memref::CastOp, memref::LoadOp, memref::StoreOp,
         memref::AllocaOp, memref::AllocOp, memref::DeallocOp, memref::PrefetchOp,
-        vector::LoadOp, vector::StoreOp, vector::BroadcastOp, vector::ShuffleOp,
+        vector::LoadOp, vector::StoreOp, vector::BroadcastOp, vector::ShuffleOp, vector::StepOp,
         vector::ExtractElementOp, arith::CmpIOp, scf::IfOp, scf::ForOp, scf::WhileOp, scf::ParallelOp>(operation);
     supported &= llvm::all_of(operation->getOperandTypes(), supportedType);
     supported &= llvm::all_of(operation->getResultTypes(), supportedType);
     if (auto constant = dyn_cast<arith::ConstantOp>(operation))
-      supported &= isa<IntegerAttr, FloatAttr, DenseFPElementsAttr>(constant.getValue());
+      supported &= isa<IntegerAttr, FloatAttr, DenseElementsAttr>(constant.getValue());
     if (auto dimension = dyn_cast<memref::DimOp>(operation))
       supported &= dimension.getConstantIndex().has_value();
     if (auto stack = dyn_cast<memref::AllocaOp>(operation))
@@ -108,7 +113,7 @@ LogicalResult legalizeProgram(ModuleOp module) {
     Type type = operation.getType();
     TypedAttr one;
     if (auto vector = dyn_cast<VectorType>(type))
-      one = DenseElementsAttr::get(vector, b.getF32FloatAttr(1.0));
+      one = DenseElementsAttr::get(vector, b.getFloatAttr(vector.getElementType(), 1.0));
     else one = b.getFloatAttr(type, 1.0);
     Value root = b.create<math::SqrtOp>(operation.getLoc(), operation.getOperand());
     Value unit = b.create<arith::ConstantOp>(operation.getLoc(), type, one);

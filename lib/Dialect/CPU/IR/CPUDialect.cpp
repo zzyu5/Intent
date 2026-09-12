@@ -26,10 +26,12 @@ LogicalResult ViewArgumentAttr::verify(
     Type element, DenseI64ArrayAttr shape, DenseI64ArrayAttr dimensions,
     uint32_t access, StringAttr alias, bool) {
   if (!name || name.getValue().empty() ||
-      (!element.isF32() && !element.isUnsignedInteger(8) &&
-       !element.isSignlessInteger(8) && !element.isSignlessInteger(32)) || !shape || !dimensions ||
+      (!element.isF16() && !element.isBF16() && !element.isF32() && !element.isF64() &&
+       !element.isUnsignedInteger(8) && !element.isSignlessInteger(8) &&
+       !element.isSignlessInteger(16) && !element.isSignlessInteger(32) &&
+       !element.isSignlessInteger(64) && !element.isInteger(1)) || !shape || !dimensions ||
       shape.size() != dimensions.size() || access > 1 || !alias)
-    return error() << "CPU view argument requires a named f32/u8/i8/i32 In/Out view and complete shape identities";
+    return error() << "CPU view argument requires a named numeric In/Out view and complete shape identities";
   for (auto [size, dimension] : llvm::zip(shape.asArrayRef(), dimensions.asArrayRef()))
     if ((size < 0 && !ShapedType::isDynamic(size)) || dimension < 0 ||
         (ShapedType::isDynamic(size) && dimension == 0))
@@ -40,8 +42,9 @@ LogicalResult ViewArgumentAttr::verify(
 LogicalResult ScalarArgumentAttr::verify(
     llvm::function_ref<InFlightDiagnostic()> error, StringAttr name, Type type) {
   if (!name || name.getValue().empty() ||
-      (!type.isF32() && !type.isIndex() && !type.isInteger(64)))
-    return error() << "CPU scalar argument requires a name and f32/index/i64 type";
+      (!type.isF32() && !type.isF64() && !type.isIndex() && !type.isSignlessInteger(8) &&
+       !type.isSignlessInteger(16) && !type.isSignlessInteger(32) && !type.isSignlessInteger(64) && !type.isInteger(1)))
+    return error() << "CPU scalar argument requires a name and a supported C ABI numeric type";
   return success();
 }
 

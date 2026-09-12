@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from contextvars import ContextVar
 import statistics
+import time
 
 import torch
 
@@ -187,7 +188,7 @@ def compare_outputs(
                 maximum,
                 _compare_float_chunk(
                     generated_flat[begin:end], source_flat[begin:end],
-                    leaf_tolerance, leaf_index,
+                    leaf_tolerance, leaf_index, begin,
                 ),
             )
         errors.append(maximum)
@@ -199,9 +200,11 @@ def _compare_float_chunk(
     source: torch.Tensor,
     tolerance: Tolerance,
     leaf_index: int,
+    begin: int,
 ) -> float:
-    generated_compare = generated.float()
-    source_compare = source.float()
+    comparison_dtype = torch.float64 if source.dtype == torch.float64 else torch.float32
+    generated_compare = generated.to(comparison_dtype)
+    source_compare = source.to(comparison_dtype)
     generated_finite = torch.isfinite(generated_compare)
     source_finite = torch.isfinite(source_compare)
     if not torch.equal(generated_finite, source_finite):
@@ -235,10 +238,13 @@ def _compare_float_chunk(
         limit = tolerance.atol + tolerance.rtol * source_compare[finite].abs()
         maximum = difference.max().item()
         if torch.any(difference > limit):
+            failed = torch.nonzero(difference > limit)[0, 0]
+            position = torch.nonzero(finite)[failed, 0].item()
             raise NumericalComparisonError(
                 f"generated/source floating result {leaf_index} differs: "
                 f"max_abs={maximum}, atol={tolerance.atol}, "
-                f"rtol={tolerance.rtol}"
+                f"rtol={tolerance.rtol}; first_failure={begin + position}, "
+                f"generated={generated_compare[position].item()}, source={source_compare[position].item()}"
             )
         return maximum
     return 0.0
@@ -252,6 +258,21 @@ def _synchronize(comparison: PreparedComparison) -> None:
 
 
 def _benchmark_launch(launch: PreparedLaunch, comparison: PreparedComparison, warmup: int) -> float:
+    if comparison.device_type == "cpu" and comparison.cpu_host_timing:
+        def invoke() -> float:
+            if launch.prepare is not None:
+                launch.prepare()
+            begin = time.perf_counter_ns()
+            launch.launch()
+            return (time.perf_counter_ns() - begin) * 1e-6
+
+        for _ in range(warmup):
+            invoke()
+        first = invoke()
+        repetitions = min(50, max(1, int(10.0 / first)))
+        return statistics.median(
+            sum(invoke() for _ in range(repetitions)) / repetitions for _ in range(7)
+        )
     if launch.native_benchmark is not None:
         return launch.native_benchmark()
     if comparison.device_type != "cuda":
