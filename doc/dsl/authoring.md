@@ -40,7 +40,11 @@ Python tuple 与 `I.record(field=value, ...)` 是结构化 products，不要求�
 
 一个 kernel 不自动拆成多个 launches。需要多个 kernels 时，host 分别编译，分配中间 tensor，显式依次调用。[split_k_pipeline.py](examples/split_k_pipeline.py) 包含完整 partial/combine kernels 和真实 host 编排；`parts` 是作者可见的算法分解，不是物理 tile 参数。
 
+### Matmul 后的逐行归约与 normalization
+
 选择 kernel 边界时，要权衡中间 tensor 的读写成本、值复用和各阶段可用的并行度。`I.matmul` 等生产阶段之后若要归约某个输出轴，可以先保存生产结果，再在后续 kernel 中归约，使两个阶段分别形成适合的并行划分；显式分块与在线 summary 则可用于避免完整中间 tensor。算法及 kernel 编排由作者表达，各 kernel 内的物理分块、布局和 target 配置由 compiler 形成。
+
+例如 `Y = ReLU(X @ W + bias)` 后沿输出列做 LayerNorm 或 softmax：行数较少时，单个 kernel 中完整行的归约依赖可能限制 matmul 的列方向并行度。作者可先用一个 kernel 生成 `Y`，再用另一个 kernel 逐行归约，使 matmul 的行、列两个结果轴都能独立分块。比较完整算子耗时，计入中间 tensor 的读写和全部 launches，并保持各阶段的 dtype 与数值契约。
 
 ### Large/global reduction 与 partial/combine
 
