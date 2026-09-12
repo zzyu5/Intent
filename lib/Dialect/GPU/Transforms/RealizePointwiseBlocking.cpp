@@ -4779,6 +4779,65 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       return outputAxes.lookup(lhs) < outputAxes.lookup(rhs);
     });
     orderedByStore = true;
+    if (pointwiseOwnershipAxes.size() <= 2)
+      return;
+    Value copied = store.getValue();
+    while (true) {
+      if (auto transpose = copied.getDefiningOp<TransposeOp>()) {
+        copied = transpose.getValue();
+        continue;
+      }
+      if (auto broadcast = copied.getDefiningOp<BroadcastOp>()) {
+        auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
+        auto target = cast<FragmentType>(broadcast.getResult().getType());
+        if (source && source.getShape() == target.getShape() &&
+            source.getAxisMaps() == target.getAxisMaps()) {
+          copied = broadcast.getValue();
+          continue;
+        }
+      }
+      break;
+    }
+    auto load = copied.getDefiningOp<LoadOp>();
+    auto input = load ? dyn_cast<ViewType>(load.getResource().getType()) : ViewType();
+    if (!input)
+      return;
+    Attribute inputAxis;
+    for (auto [position, coordinate] : llvm::enumerate(load.getCoordinates())) {
+      if (load.getSourceAxes()[position] + 1 != input.getRank())
+        continue;
+      auto range = coordinate.getDefiningOp<MakeRangeOp>();
+      if (!range || !isUnitStepRange(range))
+        return;
+      for (Attribute axis : pointwiseOwnershipAxes)
+        if (llvm::is_contained(axes.lookup(axis), range)) {
+          if (inputAxis && inputAxis != axis)
+            return;
+          inputAxis = axis;
+        }
+    }
+    if (!inputAxis || inputAxis == pointwiseOwnershipAxes.back())
+      return;
+    ParameterOp inputParameter = parameters.lookup(inputAxis);
+    if (!inputParameter || llvm::all_of(
+            inputParameter.getParameter().getCandidates().asArrayRef(),
+            [](int64_t extent) { return extent == 1; }))
+      return;
+    bool commonOutputDirection = true;
+    kernel.walk([&](StoreOp other) {
+      auto output = dyn_cast<ViewType>(other.getResource().getType());
+      commonOutputDirection &= output && other.getValue() == store.getValue() &&
+          llvm::any_of(axes.lookup(pointwiseOwnershipAxes.back()),
+                       [&](MakeRangeOp range) {
+                         return storeAxisForRange(other, range) == output.getRank() - 1;
+                       });
+    });
+    if (!commonOutputDirection)
+      return;
+    // Tile both ends of a permutation for row-major source/destination
+    // locality. The access graph still carries the actual view strides.
+    pointwiseOwnershipAxes.erase(llvm::find(pointwiseOwnershipAxes, inputAxis));
+    pointwiseOwnershipAxes.insert(pointwiseOwnershipAxes.end() - 1, inputAxis);
   });
 
   llvm::DenseMap<Attribute, CoordinateRole> contractionCoordinateRoles;
