@@ -10,7 +10,8 @@ import statistics
 import sys
 
 from .buffer import Buffer
-from .compilation import TargetProfile, validate_artifact
+from .compilation import validate_artifact
+from .target import TargetProfile, matrix_capability
 
 
 def _isa_extensions(isa: str) -> set[str]:
@@ -24,7 +25,7 @@ def _isa_extensions(isa: str) -> set[str]:
     return result
 
 
-def _check_execution(profile: TargetProfile, library=None) -> None:
+def _check_execution(profile: TargetProfile, used_extensions: frozenset[str], library=None) -> None:
     if sys.platform != "linux" or platform.machine() != "riscv64" or sys.byteorder != "little":
         raise NotImplementedError("Weft native loading requires little-endian RISC-V Linux")
     if ctypes.sizeof(ctypes.c_void_p) != 8:
@@ -38,11 +39,18 @@ def _check_execution(profile: TargetProfile, library=None) -> None:
         fields = dict(line.split(":", 1) for line in paragraph.splitlines() if ":" in line)
         fields = {key.strip(): value.strip() for key, value in fields.items()}
         if "processor" in fields:
-            facts[int(fields["processor"])] = _isa_extensions(fields["isa"])
+            facts[int(fields["processor"])] = fields
     for cpu in cpus:
-        missing = required - facts[cpu]
+        extensions = _isa_extensions(facts[cpu]["isa"])
+        missing = required - extensions
         if missing:
             raise ValueError(f"CPU {cpu} lacks requested ISA extensions: {sorted(missing)}")
+        for extension in used_extensions:
+            capability = matrix_capability(extension, profile.vlen_bits)
+            if (capability.isa_feature not in extensions or
+                    int(facts[cpu]["mvendorid"], 0) != capability.vendor_id or
+                    int(facts[cpu]["marchid"], 0) != capability.architecture_id):
+                raise ValueError(f"CPU {cpu} does not support the artifact's {extension} instructions")
     libc = ctypes.CDLL(None, use_errno=True)
     control = libc.prctl(ctypes.c_int(70), *(ctypes.c_ulong(0) for _ in range(4)))
     if control < 0:
@@ -70,6 +78,9 @@ class NativeCall:
 
     def choose(self, prepare=None) -> int:
         if self.winner is not None:
+            return self.winner
+        if len(self.program.measurements) == 1:
+            self.winner = 0
             return self.winner
         if self.key not in _winners:
             timings = []
@@ -112,7 +123,9 @@ class NativeProgram:
         self.metadata = manifest["program"]
         self.parameters = self.metadata["parameters"]
         self.candidates = self.metadata["candidates"]
-        _check_execution(self.profile)
+        self.used_extensions = frozenset(extension for kernel in manifest["weft"]["kernels"]
+                                         for extension in kernel["used_extensions"])
+        _check_execution(self.profile, self.used_extensions)
         self.library = ctypes.CDLL(str(self.directory / "kernel.so"))
         self.check_execution()
         self.identity = (manifest_text, (self.directory / "kernel.so").stat().st_mtime_ns)
@@ -134,7 +147,7 @@ class NativeProgram:
     def check_execution(self) -> None:
         if self.library is None:
             raise RuntimeError("native artifact is closed")
-        _check_execution(self.profile, self.library)
+        _check_execution(self.profile, self.used_extensions, self.library)
 
     def _view(self, parameter, value, dimensions: dict[int, int]) -> None:
         if not isinstance(value, Buffer) or value.dtype != parameter["dtype"]:

@@ -26,9 +26,10 @@ LogicalResult ViewArgumentAttr::verify(
     Type element, DenseI64ArrayAttr shape, DenseI64ArrayAttr dimensions,
     uint32_t access, StringAttr alias, bool) {
   if (!name || name.getValue().empty() ||
-      (!element.isF32() && !element.isUnsignedInteger(8)) || !shape || !dimensions ||
+      (!element.isF32() && !element.isUnsignedInteger(8) &&
+       !element.isSignlessInteger(8) && !element.isSignlessInteger(32)) || !shape || !dimensions ||
       shape.size() != dimensions.size() || access > 1 || !alias)
-    return error() << "CPU view argument requires a named f32/u8 In/Out view and complete shape identities";
+    return error() << "CPU view argument requires a named f32/u8/i8/i32 In/Out view and complete shape identities";
   for (auto [size, dimension] : llvm::zip(shape.asArrayRef(), dimensions.asArrayRef()))
     if ((size < 0 && !ShapedType::isDynamic(size)) || dimension < 0 ||
         (ShapedType::isDynamic(size) && dimension == 0))
@@ -63,7 +64,7 @@ LogicalResult InterfaceAttr::verify(
 
 LogicalResult CapabilitiesAttr::verify(
     llvm::function_ref<InFlightDiagnostic()> error, int64_t vectorBits,
-    int64_t workers, int64_t privateBytes) {
+    int64_t workers, int64_t privateBytes, bool) {
   if (vectorBits < 32 || vectorBits % 32 || workers <= 0 || privateBytes <= 0)
     return error() << "CPU capabilities require positive byte-addressable vector, worker and private-storage budgets";
   return success();

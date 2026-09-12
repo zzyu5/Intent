@@ -2,6 +2,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   FuseStructuredComputations.cpp
   FoldUniformComputations.cpp
   ReusePreparedInputs.cpp
+  GroupQuantizedDots.cpp
   MaterializeStructuredComputations.cpp
   FuseIntermediateBuffers.cpp
   FuseReductionTraversals.cpp

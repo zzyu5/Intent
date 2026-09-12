@@ -4,6 +4,8 @@
   "abi": "lp64d",
   "vlen_bits": 128,
   "cpus": [48],
+  "matrix_extension": null,
+  "required_extensions": [],
   "cc": ["/opt/tcrv-toolchains/llvm-18.1.8/bin/clang"],
   "cflags": [
     "--gcc-toolchain=/opt/tcrv-toolchains/gcc-15.2.0",

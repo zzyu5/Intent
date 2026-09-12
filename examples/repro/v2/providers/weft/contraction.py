@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
 import shlex
 import shutil
 import subprocess
-import tempfile
 
 import torch
 import intent
@@ -45,9 +44,9 @@ def _source_artifact(context, directory: Path, profile: TargetProfile, compiler:
         "  free(quantized);\n}\n"
     )
     source_metadata = {**metadata, "host_source": host,
-                       "tasks": [{"abi": {key: kernel[key] for key in ("symbol", "arguments", "shape_parameters")}}],
+                       "tasks": [{"cpu_entry": "source_projection", "abi": {key: kernel[key] for key in ("symbol", "arguments", "shape_parameters")}}],
                        "candidates": [{"entry": "source_projection", "values": [], "implementations": []}]}
-    directory.mkdir()
+    directory.mkdir(exist_ok=True)
     (directory / "canonical.mlir").write_text(canonical)
     (directory / "host.c").write_text(host)
     (directory / "kernels.c").write_text(artifact["intrinsic_c"])
@@ -56,21 +55,23 @@ def _source_artifact(context, directory: Path, profile: TargetProfile, compiler:
     }))
 
 
-def projection(context):
-    deployment_path = Path(os.environ.get("INTENT_WEFT_PROFILE", Path(__file__).with_name("rvv.json")))
+def projection(context, deployment_name="rvv.json"):
+    deployment_path = Path(os.environ.get("INTENT_WEFT_PROFILE", Path(__file__).with_name(deployment_name)))
     deployment = json.loads(deployment_path.read_text())
-    profile = TargetProfile(deployment["march"], deployment["abi"], deployment["vlen_bits"], tuple(deployment["cpus"]))
+    profile = TargetProfile.from_deployment(deployment)
     compiler = os.environ["INTENT_WEFT_COMPILER"]
-    directory = tempfile.TemporaryDirectory(prefix="intentdsl-weft-benchmark-")
-    root = Path(directory.name)
+    root = Path.home() / ".cache/intentdsl/benchmarks" / context.project_root.name / f"q4_k_{profile.matrix_extension or 'rvv'}"
+    root.mkdir(parents=True, exist_ok=True)
     report_stage("generated_compilation")
     program = intent.generate(quantized_projection, target=context.target, compiler=context.compiler,
                               tuning_config=context.tuning_config)
+    (root / "input.mlir").write_text(program.source)
+    (root / "cpu.mlir").write_text(program.ir)
     report_stage("source_compilation")
-    _source_artifact(context, root / "source", profile, compiler, program.metadata)
+    _source_artifact(context, root / "source", replace(profile, required_extensions=()), compiler, program.metadata)
     report_stage("generated_weft_compilation")
     export_artifact(program, root / "generated", compiler=compiler, profile=profile)
-    shutil.copytree(context.project_root / "python/intent", root / "python/intent",
+    shutil.copytree(context.project_root / "python/intent", root / "python/intent", dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     shutil.copyfile(context.project_root / SOURCE / "q4_k_projection_runtime.py", root / "runtime.py")
     (root / "deployment.json").write_text(json.dumps(deployment))
@@ -106,13 +107,12 @@ def projection(context):
         finally:
             process.stdin.close()
             process.stdout.close()
-            directory.cleanup()
 
     return PreparedComparison(
         generated=None, source=None, tolerance=Tolerance(1e-4, 2e-3), cuda_graph=False,
         device_type="cpu", native_comparison=measure,
-        note="单核 RVV；完整 native invocation 含 Q8_K 量化及内部 workspace 分配/释放；同算法、相同 cold-cache，10 次中位数。",
+        note=f"单核；generated {'IME1+RVV' if profile.matrix_extension else 'RVV'} / source RVV；完整 native invocation 含 Q8_K 量化及内部 workspace 分配/释放；同算法、相同 cold-cache，10 次中位数。",
     )
 
 
-CASES = {"q4_k_projection": projection}
+CASES = {"q4_k_projection": projection, "q4_k_projection_ime": lambda context: projection(context, "ime.json")}

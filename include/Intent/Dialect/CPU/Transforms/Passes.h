@@ -27,6 +27,8 @@ struct Configuration {
 mlir::LogicalResult fuseStructuredComputations(mlir::func::FuncOp function);
 mlir::LogicalResult foldUniformComputations(mlir::func::FuncOp function);
 mlir::LogicalResult reusePreparedInputs(mlir::func::FuncOp function);
+mlir::LogicalResult groupQuantizedDots(mlir::func::FuncOp function,
+                                     const ImplementationRegistry &implementations);
 void forwardCPUOutputs(mlir::func::FuncOp function);
 mlir::LogicalResult materializeStructuredComputations(mlir::func::FuncOp function);
 mlir::LogicalResult fuseIntermediateBuffers(mlir::func::FuncOp function);
@@ -44,7 +46,7 @@ mlir::LogicalResult realizeRegions(mlir::func::FuncOp function, const Configurat
                                   const ImplementationRegistry &implementations);
 mlir::LogicalResult materializeTaskLoops(mlir::func::FuncOp function);
 mlir::LogicalResult runCPUPasses(mlir::ModuleOp module, int64_t vectorBits,
-                               int64_t workers, llvm::StringRef defaults,
+                               int64_t workers, bool matrixI8I32, llvm::StringRef defaults,
                                llvm::StringRef overrides,
                                const ImplementationRegistry &implementations);
 

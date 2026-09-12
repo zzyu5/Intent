@@ -28,8 +28,19 @@ bool isMatrixContraction(linalg::GenericOp operation) {
           utils::IteratorType::reduction}) return false;
   Block &body = operation.getRegion().front();
   auto fma = body.getTerminator()->getOperand(0).getDefiningOp<math::FmaOp>();
-  return fma && llvm::hasSingleElement(body.without_terminator()) && fma.getA() == body.getArgument(0) &&
-      fma.getB() == body.getArgument(1) && fma.getC() == body.getArgument(2);
+  if (fma)
+    return llvm::hasSingleElement(body.without_terminator()) && fma.getA() == body.getArgument(0) &&
+        fma.getB() == body.getArgument(1) && fma.getC() == body.getArgument(2);
+  auto add = body.getTerminator()->getOperand(0).getDefiningOp<arith::AddIOp>();
+  if (!add || !body.getArgument(0).getType().isSignlessInteger(8) ||
+      !body.getArgument(1).getType().isSignlessInteger(8) ||
+      !body.getArgument(2).getType().isSignlessInteger(32) ||
+      std::distance(body.begin(), body.end()) != 5 || add.getRhs() != body.getArgument(2)) return false;
+  auto product = add.getLhs().getDefiningOp<arith::MulIOp>();
+  if (!product) return false;
+  auto lhs = product.getLhs().getDefiningOp<arith::ExtSIOp>();
+  auto rhs = product.getRhs().getDefiningOp<arith::ExtSIOp>();
+  return lhs && rhs && lhs.getIn() == body.getArgument(0) && rhs.getIn() == body.getArgument(1);
 }
 
 Value PhysicalProgramAnalysis::storageRoot(Value memory) {
@@ -106,6 +117,7 @@ SmallVector<MemoryAccess> PhysicalProgramAnalysis::accesses(Operation *scope) {
     } else if (auto dot = dyn_cast<QuantizedDotOp>(operation)) {
       add(dot.getLhs(), true, false);
       add(dot.getRhs(), true, false);
+      add(dot.getOutput(), false, true);
     } else if (auto copy = dyn_cast<memref::CopyOp>(operation)) {
       add(copy.getSource(), true, false); add(copy.getTarget(), false, true);
     } else if (auto load = dyn_cast<memref::LoadOp>(operation)) add(load.getMemref(), true, false);
@@ -135,6 +147,7 @@ SmallVector<AllocationFacts> PhysicalProgramAnalysis::allocations() {
       else if (auto store = dyn_cast<memref::StoreOp>(user)) writes = store.getMemref() == value;
       else if (auto copy = dyn_cast<memref::CopyOp>(user)) writes = copy.getTarget() == value;
       else if (auto quantize = dyn_cast<QuantizeOp>(user)) writes = quantize.getOutput() == value;
+      else if (auto dot = dyn_cast<QuantizedDotOp>(user)) writes = dot.getOutput() == value;
       else if (!isa<memref::LoadOp, memref::DimOp, memref::DeallocOp, ReduceOp, QuantizedDotOp>(user))
         multiple = true;
       if (writes) {

@@ -42,11 +42,15 @@ FIELDS = (
 WORKER_TIMEOUT_SECONDS = 300
 
 
-def _target(provider: str):
+def _target(provider: str, entry):
     if provider == "mojo":
         return intent.MojoTarget(workers=8)
     if provider == "weft":
-        return intent.WeftTarget(vector_bits=128, workers=1)
+        from intent.runtime.weft import TargetProfile
+        path = Path(os.environ.get("INTENT_WEFT_PROFILE", Path(__file__).parent / "providers" / (entry.deployment or "weft/rvv.json")))
+        profile = TargetProfile.from_deployment(json.loads(path.read_text()))
+        return intent.WeftTarget(vector_bits=profile.vlen_bits, workers=len(profile.cpus),
+                                 matrix_extension=profile.matrix_extension)
     if provider == "triton":
         return intent.TritonTarget(device=0)
     if provider == "cutile":
@@ -102,7 +106,7 @@ def _run_entry(
     context = Context(
         compiler=compiler,
         project_root=project_root,
-        target=_target(provider),
+        target=_target(provider, entry),
         provider=provider,
         compiler_timeout_seconds=compiler_timeout,
         tuning_config=tuning_config,

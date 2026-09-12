@@ -1,0 +1,11 @@
+{
+  "host": "k1",
+  "march": "rv64gcv_zfh_zvfh",
+  "abi": "lp64d",
+  "vlen_bits": 256,
+  "cpus": [3],
+  "matrix_extension": "spacemit-ime1",
+  "required_extensions": ["spacemit-ime1"],
+  "cc": ["/usr/bin/clang-18"],
+  "cflags": ["-fno-integrated-as"]
+}

@@ -49,7 +49,7 @@ def source_artifact(directory, profile, metadata, linear, canonical, artifact):
         f"  {kernel['symbol']}({', '.join([*pointers, *shape_arguments])});\n}}\n"
     )
     source_metadata = {**metadata, "host_source": host,
-        "tasks": [{"abi": {key: kernel[key] for key in ("symbol", "arguments", "shape_parameters")}}],
+        "tasks": [{"cpu_entry": "source_attention", "abi": {key: kernel[key] for key in ("symbol", "arguments", "shape_parameters")}}],
         "candidates": [{"entry": "source_attention", "values": [], "implementations": []}]}
     directory.mkdir()
     (directory / "canonical.mlir").write_text(canonical)
@@ -64,7 +64,7 @@ def prepare(context, linear):
     deployment_path = Path(os.environ.get("INTENT_WEFT_PROFILE", Path(__file__).with_name("rvv.json")))
     deployment = json.loads(deployment_path.read_text())
     deployment["kernel"] = "causal_linear_attention_f32" if linear else "causal_attention_f32"
-    profile = TargetProfile(deployment["march"], deployment["abi"], deployment["vlen_bits"], tuple(deployment["cpus"]))
+    profile = TargetProfile.from_deployment(deployment)
     compiler = os.environ["INTENT_WEFT_COMPILER"]
     directory = tempfile.TemporaryDirectory(prefix="intentdsl-weft-attention-")
     root = Path(directory.name)

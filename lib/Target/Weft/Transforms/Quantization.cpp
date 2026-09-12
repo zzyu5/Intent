@@ -60,21 +60,28 @@ struct Microprogram {
         ? cast<wk::ViewType>(view.getType()).getAxisIds() : cast<wk::SliceType>(view.getType()).getAxisIds();
     auto encoding = isa<wk::ViewType>(view.getType())
         ? cast<wk::ViewType>(view.getType()).getEncoding() : cast<wk::SliceType>(view.getType()).getEncoding();
+    SmallVector<int64_t> selectedShape(shape.asArrayRef()), selectedAxes(axes.asArrayRef());
+    unsigned recordAxis = shape.size() - 2;
+    selectedShape.erase(selectedShape.begin() + recordAxis);
+    selectedAxes.erase(selectedAxes.begin() + recordAxis);
+    SmallVector<Attribute> selectors(shape.size(), b.getStringAttr("all"));
+    selectors[recordAxis] = b.getStringAttr("index");
     return b.create<wk::SliceOp>(loc,
-        wk::SliceType::get(b.getContext(), encoding, array({shape[1]}), array({axes[1]})),
-        view, ValueRange{number}, b.getArrayAttr({b.getStringAttr("index"), b.getStringAttr("all")}));
+        wk::SliceType::get(b.getContext(), encoding, array(selectedShape), array(selectedAxes)),
+        view, ValueRange{number}, b.getArrayAttr(selectors));
   }
   Value load(Value region, Type element) {
     auto type = cast<wk::SliceType>(region.getType());
     return b.create<wk::AdmitOp>(loc, valueType(element, type.getShape(), type.getAxisIds()), region);
   }
   Value field(Value owner, StringRef name, Type element, int64_t count) {
-    SmallVector<int64_t> shape, axes;
+    auto ownerShape = isa<wk::ValueType>(owner.getType())
+        ? cast<wk::ValueType>(owner.getType()).getShape() : cast<wk::SliceType>(owner.getType()).getShape();
+    auto ids = isa<wk::ValueType>(owner.getType())
+        ? cast<wk::ValueType>(owner.getType()).getAxisIds() : cast<wk::SliceType>(owner.getType()).getAxisIds();
+    SmallVector<int64_t> shape(ownerShape.asArrayRef().drop_back()), axes(ids.asArrayRef().drop_back());
     if (count) {
       shape.push_back(count);
-      auto ids = isa<wk::ValueType>(owner.getType())
-          ? cast<wk::ValueType>(owner.getType()).getAxisIds()
-          : cast<wk::SliceType>(owner.getType()).getAxisIds();
       axes.push_back(ids.asArrayRef().back());
     }
     Type type = isa<wk::ValueType>(owner.getType()) ? valueType(element, shape, axes)
@@ -85,9 +92,13 @@ struct Microprogram {
     bool memory = isa<wk::SliceType>(value.getType());
     auto ids = memory ? cast<wk::SliceType>(value.getType()).getAxisIds()
                       : cast<wk::ValueType>(value.getType()).getAxisIds();
-    SmallVector<int64_t> shape, axes;
-    if (extent) { shape.push_back(extent); axes.push_back(ids[0]); }
-    auto selectors = b.getArrayAttr({b.getStringAttr(selector)});
+    auto sourceShape = memory ? cast<wk::SliceType>(value.getType()).getShape()
+                             : cast<wk::ValueType>(value.getType()).getShape();
+    SmallVector<int64_t> shape(sourceShape.asArrayRef().drop_back()), axes(ids.asArrayRef().drop_back());
+    if (extent) { shape.push_back(extent); axes.push_back(ids.asArrayRef().back()); }
+    SmallVector<Attribute> entries(ids.size(), b.getStringAttr("all"));
+    entries.back() = b.getStringAttr(selector);
+    auto selectors = b.getArrayAttr(entries);
     if (memory) return b.create<wk::SliceOp>(loc,
         wk::SliceType::get(b.getContext(), cast<wk::SliceType>(value.getType()).getEncoding(), array(shape), array(axes)),
         value, ValueRange{point}, selectors);
@@ -96,8 +107,14 @@ struct Microprogram {
   }
   Value gather(Value value, Value indices) {
     auto indexType = cast<wk::ValueType>(indices.getType());
-    return b.create<wk::ExtractOp>(loc, valueType(cast<wk::ValueType>(value.getType()).getElementType(),
-        indexType.getShape(), indexType.getAxisIds()), value, ValueRange{indices}, b.getArrayAttr({b.getStringAttr("gather")}));
+    auto source = cast<wk::ValueType>(value.getType());
+    SmallVector<int64_t> shape(source.getShape().asArrayRef().drop_back()), axes(source.getAxisIds().asArrayRef().drop_back());
+    llvm::append_range(shape, indexType.getShape().asArrayRef());
+    llvm::append_range(axes, indexType.getAxisIds().asArrayRef());
+    SmallVector<Attribute> selectors(source.getShape().size(), b.getStringAttr("all"));
+    selectors.back() = b.getStringAttr("gather");
+    return b.create<wk::ExtractOp>(loc, valueType(source.getElementType(), shape, axes),
+        value, ValueRange{indices}, b.getArrayAttr(selectors));
   }
   Value rootDomain() {
     Operation *owner = b.getInsertionBlock()->getParentOp();
@@ -251,20 +268,55 @@ LogicalResult expandQuantize(OpBuilder &b, cpu::QuantizeOp operation,
 FailureOr<Value> expandQuantizedDot(OpBuilder &b, cpu::QuantizedDotOp operation,
     Value lhs, Value rhs, int64_t &nextAxis) {
   Microprogram p{b, operation.getLoc(), nextAxis};
-  Value groups = b.create<wk::ExtentOp>(p.loc, b.getIndexType(), lhs, 0);
-  auto records = b.create<scf::ForOp>(p.loc, p.index(0), groups, p.index(1), ValueRange{p.fp(0)});
+  auto output = cast<MemRefType>(operation.getOutput().getType());
+  bool grouped = output.getRank() != 0;
+  int64_t columns = grouped ? output.getDimSize(0) : 1;
+  auto lhsAxes = isa<wk::ViewType>(lhs.getType()) ? cast<wk::ViewType>(lhs.getType()).getAxisIds()
+                                               : cast<wk::SliceType>(lhs.getType()).getAxisIds();
+  int64_t rowAxis = grouped ? lhsAxes[0] : 0;
+  if (grouped) {
+    auto binding = operation->getAttrOfType<cpu::ImplementationAttr>("intent_cpu.implementation");
+    if (columns != 4 || !binding || !binding.getParameters().get("columns") ||
+        cpu::implementationParameter(binding, "columns") != columns)
+      return operation.emitError("grouped quantized dots require the selected four-column matrix implementation"), failure();
+  }
+  auto state = [&](Type element, Value initial) -> Value {
+    return grouped ? Value(b.create<wk::NewOp>(p.loc, p.valueType(element, {columns}, {rowAxis}), initial, true)) : initial;
+  };
+  Value groups = b.create<wk::ExtentOp>(p.loc, b.getIndexType(), lhs, grouped ? 1 : 0);
+  auto records = b.create<scf::ForOp>(p.loc, p.index(0), groups, p.index(1),
+      ValueRange{state(b.getF32Type(), p.fp(0))});
   {
     OpBuilder::InsertionGuard guard(b);
     b.setInsertionPointToStart(records.getBody());
     Value w = p.load(p.record(lhs, records.getInductionVar()), quantEncoding(b, intent::QuantFormat::Q4K));
     Value x = p.load(p.record(rhs, records.getInductionVar()), quantEncoding(b, intent::QuantFormat::Q8K));
-    int64_t axis = cast<wk::ValueType>(w.getType()).getAxisIds()[0];
-    auto partials = p.level(p.rootDomain(), axis, 256, 32, ValueRange{p.integerConstant(32, true, 0)},
-        [&](Value, Value point, ValueRange carried) {
+    int64_t axis = cast<wk::ValueType>(w.getType()).getAxisIds().asArrayRef().back();
+    Type i32 = integer(b, 32, true);
+    auto partials = p.level(p.rootDomain(), axis, 256, 32,
+        ValueRange{state(i32, p.integerConstant(32, true, 0))},
+        [&](Value domain, Value point, ValueRange carried) {
       Value wq = p.project(p.field(w, "q", integer(b, 4, false), 256), point, 32, "domain");
       Value xq = p.project(p.field(x, "q", integer(b, 8, true), 256), point, 32, "domain");
-      Value partial = b.create<wk::ContractOp>(p.loc, integer(b, 32, true),
-          wq, xq, p.array({axis}), TypeAttr::get(integer(b, 32, true)));
+      Value partial;
+      if (grouped) {
+        int64_t mAxis = nextAxis++;
+        Type matrix = p.valueType(i32, {1, columns}, {mAxis, rowAxis});
+        Value zero = b.create<wk::NewOp>(p.loc, matrix, p.integerConstant(32, true, 0), true);
+        auto product = p.level(domain, axis, 32, 8, ValueRange{zero},
+            [&](Value, Value inner, ValueRange accumulator) {
+          Value a = p.project(xq, inner, 8, "domain");
+          Value weights = p.convert(p.project(wq, inner, 8, "domain"), integer(b, 8, true));
+          Value left = b.create<wk::ReshapeOp>(p.loc,
+              p.valueType(integer(b, 8, true), {1, 8}, {mAxis, axis}), a, p.array({axis}));
+          Value term = b.create<wk::OuterContractOp>(p.loc, matrix, left, weights, p.array({axis}), TypeAttr::get(i32));
+          return SmallVector<Value>{p.binary(accumulator[0], term, "add")};
+        });
+        partial = b.create<wk::ReshapeOp>(p.loc, p.valueType(i32, {columns}, {rowAxis}),
+            product[0], p.array({mAxis, rowAxis}));
+      } else {
+        partial = b.create<wk::ContractOp>(p.loc, i32, wq, xq, p.array({axis}), TypeAttr::get(i32));
+      }
       Value sc = p.convert(p.project(p.field(w, "sc", integer(b, 6, false), 8), point, 0, "group_index"), integer(b, 32, true));
       return SmallVector<Value>{p.binary(carried[0], p.binary(partial, sc, "mul"), "add")};
     });
@@ -277,7 +329,7 @@ FailureOr<Value> expandQuantizedDot(OpBuilder &b, cpu::QuantizedDotOp operation,
     Value odd = p.binary(even, p.integerConstant(32, false, 1), "add");
     Value sums = p.binary(p.convert(p.gather(bsum, even), integer(b, 32, true)),
         p.convert(p.gather(bsum, odd), integer(b, 32, true)), "add");
-    Value correction = p.reduce(p.binary(m, sums, "mul"), "add", 0);
+    Value correction = p.reduce(p.binary(m, sums, "mul"), "add", grouped ? 1 : 0);
     Value positive = p.binary(p.convert(p.field(w, "d", b.getF16Type(), 0), b.getF32Type()),
         p.convert(scaled, b.getF32Type()), "mul");
     Value negative = p.binary(p.convert(p.field(w, "dmin", b.getF16Type(), 0), b.getF32Type()),
