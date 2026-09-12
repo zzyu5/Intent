@@ -78,11 +78,9 @@ bool PhysicalProgramAnalysis::mayReadAt(Value memory, Operation *from, Operation
   for (Operation *operation = from->getNextNode(); operation != to;
        operation = operation->getNextNode()) {
     if (isMemoryEffectFree(operation)) continue;
-    auto effects = dyn_cast<MemoryEffectOpInterface>(operation);
+    auto effects = getEffectsRecursively(operation);
     if (!effects) return false;
-    SmallVector<MemoryEffects::EffectInstance> instances;
-    effects.getEffects(instances);
-    for (auto &effect : instances) {
+    for (auto &effect : *effects) {
       if (isa<MemoryEffects::Read>(effect.getEffect())) continue;
       if (!effect.getValue() || storageRoot(effect.getValue()) == root) return false;
     }

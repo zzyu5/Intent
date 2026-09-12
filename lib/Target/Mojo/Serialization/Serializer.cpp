@@ -222,6 +222,8 @@ private:
 
   LogicalResult allocation(Operation *operation, Value memory, ValueRange dynamicSizes, bool stack) {
     auto type = cast<MemRefType>(memory.getType());
+    if (!type.getLayout().isIdentity())
+      return operation->emitError("Mojo allocation requires an explicit dense storage layout");
     if (stack && !type.hasStaticShape())
       return operation->emitError("Mojo stack allocation requires static extents");
     std::string element = memoryElement(type.getElementType());
@@ -239,12 +241,16 @@ private:
       stride = "(" + stride + ") * (" + descriptor.sizes[axis] + ")";
     }
     if (stack) {
-      int64_t alignment = cast<memref::AllocaOp>(operation).getAlignment().value_or(4);
+      int64_t elementBytes = type.getElementType().isIndex() ? 8 : (type.getElementTypeBitWidth() + 7) / 8;
+      int64_t alignment = cast<memref::AllocaOp>(operation).getAlignment().value_or(elementBytes);
       line("var " + value + " = unsafe_stack_allocation[" +
           std::to_string(type.getNumElements()) + ", " + element + ", alignment=" +
           std::to_string(alignment) + "]()");
     } else {
-      line("var " + storage + " = alloc(Layout[" + element + "](count=" + stride + "))");
+      auto alignment = cast<memref::AllocOp>(operation).getAlignment();
+      std::string layout = "Layout[" + element + "]";
+      if (alignment) layout += ".aligned[" + std::to_string(*alignment) + "]";
+      line("var " + storage + " = alloc(" + layout + "(count=" + stride + "))");
       line("var " + value + " = " + storage + ".unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()");
       allocations[memory] = storage;
     }

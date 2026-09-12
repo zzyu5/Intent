@@ -34,11 +34,17 @@ Value subview(OpBuilder &b, Location loc, Value source,
 }
 
 LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
-    const ContractionTile &tile, ConfigurationAttr shared, ImplementationAttr binding) {
+    const ContractionTile &tile, ConfigurationAttr, ImplementationAttr binding) {
   Location loc = operation.getLoc();
   int64_t microM = implementationParameter(binding, "micro_m");
   int64_t microN = implementationParameter(binding, "micro_n");
   int64_t vectorWidth = implementationParameter(binding, "vector_width");
+  const InputSupply *supply = nullptr;
+  for (const auto &input : tile.inputs) {
+    if (input.operand != 1 || input.panelAxis != 1 || input.panelSize != vectorWidth * microN)
+      return operation.emitError("Mojo contraction received an incompatible input representation");
+    supply = &input;
+  }
   Value zero = index(b, loc, 0);
   Value mEnd = add(b, loc, tile.mBegin, tile.mCount);
   auto micro = [&](Value packed, Value m, Value n, int64_t rows, int64_t columns, int64_t width) {
@@ -84,19 +90,27 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
     rowBegin = end;
   }
   auto rows = [&](Value n, int64_t columns, int64_t width) {
-    auto packed = b.create<memref::AllocaOp>(loc,
-        MemRefType::get({shared.getTileK(), columns}, b.getF32Type()));
-    packed.setAlignment(width * 4);
-    Value source = subview(b, loc, tile.rhs, {tile.kBegin, add(b, loc, tile.nBegin, n)},
-        {tile.depth, b.getIndexAttr(columns)});
-    Value destination = subview(b, loc, packed, {b.getIndexAttr(0), b.getIndexAttr(0)},
-        {tile.depth, b.getIndexAttr(columns)});
-    b.create<memref::CopyOp>(loc, source, destination);
+    Value column = add(b, loc, tile.nBegin, n);
+    Value packed;
+    if (supply) {
+      Value panel = index(b, loc, supply->panelSize);
+      Value relativeColumn = b.create<arith::SubIOp>(loc, column, supply->begins[1]);
+      Value relativeK = b.create<arith::SubIOp>(loc, tile.kBegin, supply->begins[0]);
+      SmallVector<OpFoldResult> offsets{b.create<arith::DivSIOp>(loc, relativeColumn, panel).getResult(), relativeK,
+          b.create<arith::RemSIOp>(loc, relativeColumn, panel).getResult()};
+      SmallVector<OpFoldResult> sizes{b.getIndexAttr(1), tile.depth, b.getIndexAttr(columns)};
+      SmallVector<OpFoldResult> strides(3, b.getIndexAttr(1));
+      auto type = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
+          {ShapedType::kDynamic, columns}, cast<MemRefType>(supply->storage.getType()), offsets, sizes, strides));
+      packed = b.create<memref::SubViewOp>(loc, type, supply->storage, offsets, sizes, strides);
+    } else {
+      packed = subview(b, loc, tile.rhs, {tile.kBegin, column}, {tile.depth, b.getIndexAttr(columns)});
+    }
     for (auto region : rowRegions)
       loop(b, loc, region.begin, region.end, region.rows,
           [&](Value m) { micro(packed, m, n, region.rows, columns, width); });
   };
-  // This implementation shares its packed B panel across the outer M block.
+  // The selected input representation is shared by all M microtiles.
   Value columnBegin = zero;
   int64_t previousVectors = microN + 1;
   for (int64_t vectors : {microN, int64_t{2}, int64_t{1}}) {
@@ -125,7 +139,7 @@ cpu::ImplementationRegistry implementations() {
     if (region) return contraction ? "mojo.region_contract_f32" : "mojo.region_vector_f32";
     return contraction ? "mojo.register_f32" : "mojo.vector_f32";
   };
-  result.add({"mojo.register_f32", [](Operation *op) {
+  Implementation contraction{"mojo.register_f32", [](Operation *op) {
       auto generic = dyn_cast<linalg::GenericOp>(op);
       return generic && isMatrixContraction(generic) &&
           cast<MemRefType>(generic.getInputs()[0].getType()).getElementType().isF32();
@@ -133,8 +147,32 @@ cpu::ImplementationRegistry implementations() {
       if (!vectorLegal(operation, capabilities, config) || !config.local.get("micro_m") || !config.local.get("micro_n")) return false;
       int64_t width = config.parameter("vector_width"), m = config.parameter("micro_m"), n = config.parameter("micro_n");
       return config.tileN % width == 0 && m <= 8 && n <= 4 && m * n <= 24 &&
-          config.tileK <= capabilities.getPrivateBytes() / 4 / width / n;
-    }, [](Builder &, const Configuration &config) { return config.local; }, formTile, {}});
+          m * n * width <= capabilities.getPrivateBytes() / 4;
+    }, [](Builder &, const Configuration &config) { return config.local; }, formTile, {}};
+  auto inputRequirements = [](InputReuse reuse) {
+    return [reuse](linalg::GenericOp, ConfigurationAttr, ImplementationAttr binding) {
+      int64_t width = implementationParameter(binding, "vector_width");
+      return SmallVector<InputRequirement>{{1, 1, width * implementationParameter(binding, "micro_n"), width * 4, reuse}};
+    };
+  };
+  auto directLegal = contraction.legal;
+  contraction.inputs = inputRequirements(InputReuse::Group);
+  contraction.legal = [directLegal](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
+    return directLegal(op, capabilities, config) && config.tileK <= capabilities.getPrivateBytes() / 4 /
+        config.parameter("vector_width") / config.parameter("micro_n");
+  };
+  result.add(contraction);
+  contraction.name = "mojo.register_f32_shared";
+  contraction.inputs = inputRequirements(InputReuse::Consumers);
+  contraction.legal = [directLegal](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
+    return directLegal(op, capabilities, config) &&
+        config.tileN % (config.parameter("vector_width") * config.parameter("micro_n")) == 0;
+  };
+  result.add(contraction);
+  contraction.name = "mojo.register_f32_direct";
+  contraction.legal = directLegal;
+  contraction.inputs = {};
+  result.add(std::move(contraction));
   result.add({"mojo.vector_f32", [](Operation *op) {
       if (auto generic = dyn_cast<linalg::GenericOp>(op)) return !isMatrixContraction(generic);
       return isa<cpu::ReduceOp>(op);

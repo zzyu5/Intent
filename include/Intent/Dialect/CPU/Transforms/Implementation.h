@@ -6,10 +6,31 @@
 
 namespace intent::cpu {
 
+enum class InputReuse { Group, Consumers };
+
+// Storage order is [panel, unsplit source axes..., lane within panel]. A group
+// supply covers one compute group; consumer reuse preserves a source snapshot.
+struct InputRequirement {
+  unsigned operand;
+  unsigned panelAxis;
+  int64_t panelSize;
+  int64_t alignment;
+  InputReuse reuse;
+};
+
+struct InputSupply {
+  unsigned operand;
+  unsigned panelAxis;
+  int64_t panelSize;
+  mlir::Value storage;
+  llvm::SmallVector<mlir::Value> begins; // Logical source coordinates of the supplied window.
+};
+
 struct ContractionTile {
   mlir::Value lhs, rhs, output, initial;
   mlir::Value mBegin, mCount, nBegin, nCount, kBegin, depth;
   bool first;
+  llvm::ArrayRef<InputSupply> inputs;
 };
 
 struct ContractionRequirements {
@@ -30,6 +51,8 @@ struct Implementation {
   ContractionRequirements contraction;
   std::function<int64_t(ImplementationAttr)> parallelWindow;
   bool requiresMatrixI8I32 = false;
+  std::function<llvm::SmallVector<InputRequirement>(mlir::linalg::GenericOp,
+      ConfigurationAttr, ImplementationAttr)> inputs;
 };
 
 class ImplementationRegistry {

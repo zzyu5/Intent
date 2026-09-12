@@ -1,5 +1,6 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Dialect/CPU/Transforms/Implementation.h"
+#include "ImplementationInputs.h"
 #include "Utilities.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -18,7 +19,7 @@ Value subview(OpBuilder &b, Location loc, Value source,
 }
 
 LogicalResult block(linalg::GenericOp operation, const Configuration &config,
-                    const ImplementationRegistry &implementations) {
+                    const ImplementationRegistry &implementations, ImplementationInputs &inputs) {
   auto implementation = implementations.lookup(operation);
   if (failed(implementation)) return failure();
   auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
@@ -50,6 +51,20 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
   Value initial = initialization.getInputs()[0];
   if (!(initial.getType().isF32() ? matchPattern(initial, m_PosZeroFloat()) : matchPattern(initial, m_Zero())))
     return operation.emitError("CPU contraction blocking requires the closed zero-initialized contraction; splitting a nonzero fused accumulator is not implemented");
+  auto requirements = (*implementation)->inputs ? (*implementation)->inputs(operation, shared, binding)
+      : SmallVector<InputRequirement>{};
+  auto supplies = inputs.prepare(operation, requirements);
+  if (failed(supplies)) return failure();
+  int64_t groupM = 0, groupN = 0;
+  for (auto requirement : requirements) {
+    if (requirement.reuse != InputReuse::Group) continue;
+    auto map = operation.getIndexingMapsArray()[requirement.operand];
+    auto axis = dyn_cast<AffineDimExpr>(map.getResult(requirement.panelAxis));
+    if (!axis || axis.getPosition() > 1)
+      return operation.emitError("input supply grouping requires a free contraction axis");
+    auto &group = axis.getPosition() == 0 ? groupM : groupN;
+    group = group ? std::min(group, requirement.panelSize) : requirement.panelSize;
+  }
   OpBuilder b(operation);
   Location loc = operation.getLoc();
   Value zero = index(b, loc, 0), one = index(b, loc, 1);
@@ -79,9 +94,28 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
       b.create<linalg::FillOp>(loc, ValueRange{initial}, ValueRange{outputTile});
     }
     auto kBlock = [&](Value kBegin, Value depth, bool first) {
-      if (failed((*implementation)->formTile(b, operation,
-              {lhs, rhs, output, initial, mBegin, mCount, nBegin, nCount, kBegin, depth, first},
-              shared, binding))) status = failure();
+      auto group = [&](Value begin, Value extent, int64_t size,
+                       const std::function<void(Value, Value)> &body) {
+        if (!size) { body(begin, extent); return; }
+        Value step = index(b, loc, size);
+        Value full = multiply(b, loc, b.create<arith::DivSIOp>(loc, extent, step), step);
+        loop(b, loc, zero, full, size, [&](Value offset) { body(add(b, loc, begin, offset), step); });
+        Value tail = b.create<arith::SubIOp>(loc, extent, full);
+        auto branch = b.create<scf::IfOp>(loc, b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, tail, zero), false);
+        OpBuilder::InsertionGuard guard(b);
+        b.setInsertionPointToStart(branch.thenBlock());
+        body(add(b, loc, begin, full), tail);
+      };
+      group(mBegin, mCount, groupM, [&](Value m, Value rows) {
+        group(nBegin, nCount, groupN, [&](Value n, Value columns) {
+          ContractionTile tile{lhs, rhs, output, initial, m, rows, n, columns, kBegin, depth, first, {}};
+          auto local = inputs.prepareGroup(b, operation, tile, shared, requirements);
+          if (failed(local)) { status = failure(); return; }
+          llvm::append_range(*local, *supplies);
+          tile.inputs = *local;
+          if (failed((*implementation)->formTile(b, operation, tile, shared, binding))) status = failure();
+        });
+      });
     };
     if ((*implementation)->contraction.staticReductionExtent) {
       Value fullEnd = b.create<arith::SubIOp>(loc, kSize, b.create<arith::RemSIOp>(loc, kSize, bk));
@@ -149,12 +183,13 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
 LogicalResult blockContractions(func::FuncOp function, const Configuration &configuration,
                                 const ImplementationRegistry &implementations) {
   SmallVector<linalg::GenericOp> contractions;
+  ImplementationInputs inputs(function);
   function.walk([&](linalg::GenericOp operation) {
     if (isMatrixContraction(operation) && !operation->hasAttr("intent_cpu.microtile"))
       contractions.push_back(operation);
   });
   for (linalg::GenericOp operation : contractions)
-    if (failed(block(operation, configuration, implementations))) return failure();
+    if (failed(block(operation, configuration, implementations, inputs))) return failure();
   return success();
 }
 

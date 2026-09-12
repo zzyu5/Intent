@@ -12,6 +12,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   VectorizeLoops.cpp
   PartitionTasks.cpp
   Implementation.cpp
+  ImplementationInputs.cpp
   Passes.cpp
 
   LINK_LIBS PUBLIC
