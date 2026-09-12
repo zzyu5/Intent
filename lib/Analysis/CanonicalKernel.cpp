@@ -495,11 +495,23 @@ CanonicalKernelAnalysis::indexRelation(Operation *operation) {
 FailureOr<SmallVector<LogicalWorksetFact, 4>>
 CanonicalKernelAnalysis::logicalWorksets(func::FuncOp function) const {
   SmallVector<LogicalWorksetFact, 4> worksets;
-  for (Operation &operation : function.getBody().front())
-    if (auto parallel = dyn_cast<ParallelOp>(operation))
+  bool requiresWholeBody = false;
+  for (Operation &operation : function.getBody().front().without_terminator()) {
+    if (auto parallel = dyn_cast<ParallelOp>(operation)) {
       if (failed(collectLogicalWorkset(parallel, {}, {}, worksets)))
         return failure();
-  if (worksets.empty()) {
+    } else {
+      auto effects = getEffectsRecursively(&operation);
+      requiresWholeBody |= !effects ||
+          llvm::any_of(*effects, [](const auto &effect) {
+            return !isa<MemoryEffects::Read>(effect.getEffect());
+          });
+    }
+  }
+  // Effects outside the parallel regions still belong to this invocation.
+  // Keep their order and shared state until independence has been proven.
+  if (worksets.empty() || requiresWholeBody) {
+    worksets.clear();
     LogicalWorksetFact singleton;
     singleton.state = CanonicalFactState::Exact;
     singleton.body = &function.getBody().front();

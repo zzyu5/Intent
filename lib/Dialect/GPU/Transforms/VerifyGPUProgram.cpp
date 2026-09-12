@@ -413,9 +413,21 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
           "physical execution group identities must be dense from zero");
   if (!hasProgramId || programAxes.size() != static_cast<size_t>(gridRank) ||
       executionGroups.empty() ||
-      actualEffectOrigins != expectedEffectOrigins)
-    return kernel.emitError(
+      actualEffectOrigins != expectedEffectOrigins) {
+    InFlightDiagnostic diagnostic = kernel.emitError(
         "physical kernel program mapping/effect coverage is incomplete");
+    diagnostic << "; has_program_id=" << hasProgramId
+               << "; program_axes=" << programAxes.size()
+               << "; grid_rank=" << gridRank
+               << "; execution_groups=" << executionGroups.size()
+               << "; expected_effect_origins=";
+    for (int64_t origin : expectedEffectOrigins)
+      diagnostic << origin << ",";
+    diagnostic << "; actual_effect_origins=";
+    for (int64_t origin : actualEffectOrigins)
+      diagnostic << origin << ",";
+    return failure();
+  }
   return verifyBufferDataflow(kernel, physicalAnalysis);
 }
 
