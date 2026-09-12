@@ -2,6 +2,7 @@
 
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 
 #include "llvm/ADT/SmallPtrSet.h"
@@ -199,6 +200,18 @@ LogicalResult legalizeProgramGrid(ModuleOp module) {
     for (unsigned axis = 0; axis < rank; ++axis)
       if (!llvm::is_contained(programOrder, axis))
         programOrder.push_back(axis);
+  }
+
+  // The linear shared grid avoids the stricter CUDA Y/Z launch limits. Only
+  // expand it when every secondary coordinate has a proven finite bound.
+  for (unsigned coordinateAxis : llvm::drop_begin(programOrder)) {
+    gpu::PhysicalExprAttr bound = gpu::queryNonNegativeIndexUpperBound(
+        mapping.getExtents()[coordinateAxis]);
+    if (!bound ||
+        bound.getKind() !=
+            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+        bound.getValue() > 65535)
+      return success();
   }
 
   // Specialized traversal forms retain their typed shared ordering.  For an
