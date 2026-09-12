@@ -72,6 +72,32 @@ def conv1d_same(x, weight):
     return (patches * weight.float()).sum(dim=-1).to(x.dtype)
 
 
+def triangular_solve(lower, solution):
+    for row in range(solution.shape[-1]):
+        residual = solution[:, row].clone()
+        for column in range(row):
+            residual = residual - lower[:, row, column] * solution[:, column]
+        solution[:, row].copy_(residual / lower[:, row, row])
+    return solution
+
+
+def bitonic_sort(values):
+    result = values.clone()
+    indices = torch.arange(values.shape[1], device=values.device)
+    sequence = 2
+    while sequence <= values.shape[1]:
+        stride = sequence // 2
+        while stride > 0:
+            partner = indices ^ stride
+            other = result[:, partner]
+            take_minimum = ((indices & sequence) == 0) == (indices < partner)
+            swap = torch.where(take_minimum, result > other, result < other)
+            result = torch.where(swap, other, result)
+            stride //= 2
+        sequence *= 2
+    return result
+
+
 def adamw(gradient, parameter, first_moment, second_moment, learning_rate,
           beta1, beta2, bias_correction1, bias_correction2, epsilon, weight_decay):
     first = beta1 * first_moment + (1.0 - beta1) * gradient

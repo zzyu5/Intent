@@ -1,6 +1,7 @@
 #include "Intent/Target/Mojo/Transforms/Passes.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -9,6 +10,7 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 using namespace mlir;
 
@@ -33,8 +35,8 @@ LogicalResult checkSurface(ModuleOp module) {
     if (isa<ModuleOp, func::FuncOp, func::ReturnOp, scf::YieldOp, scf::ConditionOp, scf::ReduceOp>(operation)) return;
     bool supported = isa<arith::ConstantOp, arith::AddFOp, arith::AddIOp,
         arith::SubFOp, arith::SubIOp, arith::MulFOp, arith::MulIOp,
-        arith::DivFOp, arith::DivSIOp, arith::FloorDivSIOp, arith::RemSIOp,
-        arith::MinSIOp, arith::MaxSIOp, arith::CeilDivSIOp, arith::NegFOp,
+        arith::DivFOp, arith::DivSIOp, arith::RemSIOp,
+        arith::MinSIOp, arith::MaxSIOp, arith::NegFOp,
         arith::IndexCastOp, arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp,
         arith::ExtFOp, arith::TruncFOp, arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp,
         arith::MaxNumFOp, arith::MinNumFOp, arith::MaximumFOp, arith::MinimumFOp,
@@ -121,6 +123,9 @@ LogicalResult legalizeProgram(ModuleOp module) {
     operation.getResult().replaceAllUsesWith(result);
     operation.erase();
   }
+  RewritePatternSet integerDivision(module.getContext());
+  arith::populateCeilFloorDivExpandOpsPatterns(integerDivision);
+  if (failed(applyPatternsGreedily(module, std::move(integerDivision)))) return failure();
   if (failed(cpu::verifyCPUProgram(module, true)) || failed(checkSurface(module))) return failure();
   OpBuilder builder(module.getContext());
   builder.setInsertionPointToStart(module.getBody());

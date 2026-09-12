@@ -457,7 +457,7 @@ private:
     if (failed(fact))
       return failure();
     Value source = values.lookup(fact->source);
-    if (isa<ViewLoadOp, GatherOp>(operation) && llvm::any_of(fact->terms, [&](const auto &term) {
+    if (isa<ViewLoadOp, BufferLoadOp, GatherOp>(operation) && llvm::any_of(fact->terms, [&](const auto &term) {
           return term.kind == 3 && term.operands.size() == 1 &&
               isa<MemRefType>(values.lookup(term.operands[0]).getType());
         }))
@@ -522,7 +522,7 @@ private:
       for (OpFoldResult offset : offsets)
         indices.push_back(isa<Value>(offset) ? cast<Value>(offset)
                            : constant(operation->getLoc(), cast<IntegerAttr>(cast<Attribute>(offset)).getInt()));
-      if (isa<ViewLoadOp, GatherOp>(operation))
+      if (isa<ViewLoadOp, BufferLoadOp, GatherOp>(operation))
         return Value(builder.create<memref::LoadOp>(operation->getLoc(), source, indices));
     }
     auto resultType = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
@@ -531,7 +531,7 @@ private:
                                                       source, offsets, sizes, strides);
     if (!inserted) {
       auto view = dyn_cast<ViewType>(fact->source.getType());
-      if (isa<ViewLoadOp>(operation) && view && view.getAccess() != 0) {
+      if (isa<BufferLoadOp>(operation) || (isa<ViewLoadOp>(operation) && view && view.getAccess() != 0)) {
         auto tensor = cast<RankedTensorType>(operation->getResult(0).getType());
         SmallVector<Value> shape;
         for (int64_t axis = 0; axis < resultType.getRank(); ++axis)
@@ -594,6 +594,16 @@ private:
         return fp ? Value(builder.create<arith::MulFOp>(loc, a, b)) : Value(builder.create<arith::MulIOp>(loc, a, b));
       case BinaryOperator::TrueDivide:
         if (fp) return Value(builder.create<arith::DivFOp>(loc, a, b));
+        break;
+      case BinaryOperator::FloorDivide:
+        if (!fp) return Value(builder.create<arith::FloorDivSIOp>(loc, a, b));
+        break;
+      case BinaryOperator::Remainder:
+        if (!fp) {
+          Value quotient = builder.create<arith::FloorDivSIOp>(loc, a, b);
+          Value product = builder.create<arith::MulIOp>(loc, quotient, b);
+          return Value(builder.create<arith::SubIOp>(loc, a, product));
+        }
         break;
       case BinaryOperator::MaximumNum:
         if (fp) return Value(builder.create<arith::MaxNumFOp>(loc, a, b));
@@ -1062,20 +1072,33 @@ private:
       return lowerBlock(op.getBody().front());
     } else if (isa<IfOp, ForOp, WhileOp>(operation)) {
       return orderedControl(operation);
+    } else if (auto op = dyn_cast<BufferOp>(operation)) {
+      if (!analysis.logicalBuffer(op).isExact())
+        return op.emitError("CPU logical buffer requires an exact lexical allocation fact");
+      auto tensor = cast<RankedTensorType>(cast<BufferType>(op.getResult().getType()).getTensor());
+      auto sizes = extents(tensor, loc);
+      if (failed(sizes)) return failure();
+      Value storage = allocate(tensor, *sizes, loc);
+      if (op.getInitialOperand())
+        copyToSlot(values.lookup(op.getInputs()[*op.getInitialOperand()]), storage, loc);
+      values.map(op.getResult(), storage);
+      bindDimensions(tensor, storage, loc);
     } else if (isa<AssumeInBoundsOp>(operation)) {
       return success();
-    } else if (auto op = dyn_cast<ViewLoadOp>(operation)) {
+    } else if (isa<ViewLoadOp, BufferLoadOp>(operation)) {
       if (!alwaysValid(operation))
-        return op.emitError("CPU predicated source loads are not implemented");
+        return operation->emitError("CPU predicated source loads are not implemented");
       auto value = indexed(operation);
       if (failed(value)) return failure();
-      values.map(op.getResult(), *value);
-    } else if (auto op = dyn_cast<ViewStoreOp>(operation)) {
+      values.map(operation->getResult(0), *value);
+    } else if (isa<ViewStoreOp, BufferStoreOp>(operation)) {
       if (!alwaysValid(operation))
-        return op.emitError("CPU predicated destination stores are not implemented");
+        return operation->emitError("CPU predicated destination stores are not implemented");
       auto destination = indexed(operation);
       if (failed(destination)) return failure();
-      Value input = values.lookup(op.getInputs()[op.getValueOperandIndex()]);
+      unsigned position = isa<ViewStoreOp>(operation) ? cast<ViewStoreOp>(operation).getValueOperandIndex()
+                                                     : cast<BufferStoreOp>(operation).getValueOperandIndex();
+      Value input = values.lookup(operation->getOperand(position));
       if (isa<MemRefType>(input.getType()))
         builder.create<memref::CopyOp>(loc, input, *destination);
       else

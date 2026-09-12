@@ -154,6 +154,8 @@ TILELANG = (
 
 
 MOJO = (
+    Entry("bitonic_sort", "4096x256-fp32-8cores-host", "bitonic_sort_rows", ("sorting/bitonic.py:bitonic_sort_rows",), "source/pytorch/cpu_runtime.py"),
+    Entry("flaggems_triangular_solve", "B4096-N16-fp32-lower-8cores-host", "batched_lower_triangular_solve", ("factorization/triangular_solve.py:batched_lower_triangular_solve",), "source/pytorch/cpu_runtime.py"),
     Entry("flaggems_conv1d", "B64-L16384-K5-fp16-same-8cores-host", "conv1d_same", ("convolution/direct.py:conv1d_same",), "source/pytorch/cpu_runtime.py"),
     Entry("swiglu", "8192x14336-bf16-8cores-host", "swiglu_forward", ("activation/swiglu.py:swiglu_forward",), "source/pytorch/cpu_runtime.py"),
     Entry("embedding_lookup", "tokens16384-vocab32768-hidden4096-bf16-8cores-host", "embedding_forward_lookup_bf16", ("backward/embedding.py:embedding_forward_lookup_bf16",), "source/pytorch/cpu_runtime.py"),

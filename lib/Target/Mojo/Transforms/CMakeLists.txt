@@ -5,6 +5,7 @@ add_mlir_library(MLIRIntentMojoTransforms
   LINK_LIBS PUBLIC
   MLIRIntentCPUTransforms
   MLIRArithDialect
+  MLIRArithTransforms
   MLIRFuncDialect
   MLIRMathDialect
   MLIRMemRefDialect

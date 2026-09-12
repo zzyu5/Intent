@@ -446,6 +446,9 @@ private:
       assign(result, expression + ".cast[DType." + dtype(result.getType()) + "]()");
     } else if (auto op = dyn_cast<arith::NegFOp>(operation)) {
       assign(op.getResult(), "-" + name(op.getOperand()));
+    } else if (auto op = dyn_cast<arith::RemSIOp>(operation)) {
+      std::string lhs = name(op.getLhs()), rhs = name(op.getRhs());
+      assign(op.getResult(), "(" + lhs + ") - ((" + lhs + ") / (" + rhs + ")) * (" + rhs + ")");
     } else if (isa<arith::IndexCastOp>(operation)) {
       Value result = operation->getResult(0);
       if (isa<VectorType>(result.getType()))
@@ -458,8 +461,7 @@ private:
       else if (isa<arith::MulFOp, arith::MulIOp>(operation)) token = "*";
       else if (isa<arith::DivFOp>(operation)) token = "/";
       else if (isa<math::PowFOp>(operation)) token = "**";
-      else if (isa<arith::DivSIOp, arith::FloorDivSIOp>(operation)) token = "//";
-      else if (isa<arith::RemSIOp>(operation)) token = "%";
+      else if (isa<arith::DivSIOp>(operation)) token = "/";
       else if (isa<arith::AndIOp>(operation)) token = "&";
       else if (isa<arith::OrIOp>(operation)) token = "|";
       else if (isa<arith::XOrIOp>(operation)) token = "^";
@@ -467,8 +469,6 @@ private:
         assign(operation->getResult(0), "(" + name(operation->getOperand(0)) + ") " + token + " (" + name(operation->getOperand(1)) + ")");
       } else if (isa<arith::MinSIOp, arith::MaxSIOp>(operation)) {
         assign(operation->getResult(0), std::string(isa<arith::MinSIOp>(operation) ? "min(" : "max(") + name(operation->getOperand(0)) + ", " + name(operation->getOperand(1)) + ")");
-      } else if (auto op = dyn_cast<arith::CeilDivSIOp>(operation)) {
-        assign(op.getResult(), "(" + name(op.getLhs()) + " + " + name(op.getRhs()) + " - 1) // " + name(op.getRhs()));
       } else return operation->emitError("Mojo serialization has no spelling for this realized CPU operation");
     }
     return success();
