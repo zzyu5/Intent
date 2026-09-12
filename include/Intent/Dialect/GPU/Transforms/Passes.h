@@ -12,6 +12,8 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Support/LogicalResult.h"
 
+#include <utility>
+
 namespace intent::gpu {
 
 struct ReplayMaterializationOptions {
@@ -25,6 +27,8 @@ struct ReplayMaterializationOptions {
 
 mlir::FailureOr<mlir::func::FuncOp>
 getPhysicalKernel(mlir::ModuleOp module);
+std::pair<uint64_t, int64_t>
+nextPhysicalAxisIdentities(mlir::func::FuncOp kernel);
 ParameterOp getOrCreatePhysicalParameter(
     mlir::func::FuncOp kernel, llvm::StringRef name, ParameterRole role,
     ParameterCategory category, uint32_t elementBitWidth,

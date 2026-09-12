@@ -9,7 +9,6 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/IR/IRMapping.h"
@@ -1522,43 +1521,9 @@ void selectNativeReduceForms(func::FuncOp kernel) {
 }
 
 LogicalResult legalizeContractShapes(func::FuncOp kernel) {
-  uint64_t nextSource = 1;
-  int64_t nextDimension = 1;
-  AttrTypeWalker identities;
-  identities.addWalk([&](gpu::AxisMapAttr axis) {
-    nextSource = std::max(nextSource, axis.getSourceId() + 1);
-    nextDimension = std::max(nextDimension, axis.getDimensionId() + 1);
-  });
-  identities.addWalk([&](gpu::PhysicalSourceAttr source) {
-    nextSource = std::max(nextSource, source.getSourceId() + 1);
-  });
-  identities.addWalk([&](gpu::ViewType view) {
-    nextSource = std::max(nextSource, view.getSourceId() + 1);
-  });
-  identities.addWalk([&](gpu::ViewLayoutAttr layout) {
-    for (int64_t dimension : layout.getDimensionIds().asArrayRef())
-      nextDimension = std::max(nextDimension, dimension + 1);
-  });
-  identities.addWalk([&](gpu::PhysicalExprAttr expression) {
-    if (expression.getKind() ==
-        static_cast<uint32_t>(gpu::PhysicalExprKind::Dimension))
-      nextDimension = std::max(nextDimension, expression.getValue() + 1);
-  });
+  auto [nextSource, nextDimension] = gpu::nextPhysicalAxisIdentities(kernel);
   SmallVector<gpu::ContractOp> contracts;
-  kernel.walk([&](Operation *operation) {
-    identities.walk(operation->getAttrDictionary());
-    for (Type type : operation->getOperandTypes()) identities.walk(type);
-    for (Type type : operation->getResultTypes()) identities.walk(type);
-    for (Region &region : operation->getRegions())
-      for (Block &block : region)
-        for (BlockArgument argument : block.getArguments())
-          identities.walk(argument.getType());
-    for (StringRef name : {gpu::dimensionAttr, gpu::coverageDimensionAttr})
-      if (auto dimension = operation->getAttrOfType<IntegerAttr>(name))
-        nextDimension = std::max(nextDimension, dimension.getInt() + 1);
-    if (auto contract = dyn_cast<gpu::ContractOp>(operation))
-      contracts.push_back(contract);
-  });
+  kernel.walk([&](gpu::ContractOp contract) { contracts.push_back(contract); });
   for (gpu::ContractOp contract : contracts) {
     auto lhs = contract.getLhs().getType();
     auto rhs = contract.getRhs().getType();

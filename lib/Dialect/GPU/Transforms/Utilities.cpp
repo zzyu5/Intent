@@ -12,6 +12,7 @@
 #include "llvm/ADT/StringSet.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include <algorithm>
@@ -21,6 +22,43 @@
 using namespace mlir;
 
 namespace intent::gpu {
+
+std::pair<uint64_t, int64_t> nextPhysicalAxisIdentities(func::FuncOp kernel) {
+  uint64_t nextSource = 1;
+  int64_t nextDimension = 1;
+  AttrTypeWalker identities;
+  identities.addWalk([&](AxisMapAttr axis) {
+    nextSource = std::max(nextSource, axis.getSourceId() + 1);
+    nextDimension = std::max(nextDimension, axis.getDimensionId() + 1);
+  });
+  identities.addWalk([&](PhysicalSourceAttr source) {
+    nextSource = std::max(nextSource, source.getSourceId() + 1);
+  });
+  identities.addWalk([&](ViewType view) {
+    nextSource = std::max(nextSource, view.getSourceId() + 1);
+  });
+  identities.addWalk([&](ViewLayoutAttr layout) {
+    for (int64_t dimension : layout.getDimensionIds().asArrayRef())
+      nextDimension = std::max(nextDimension, dimension + 1);
+  });
+  identities.addWalk([&](PhysicalExprAttr expression) {
+    if (expression.getKind() == static_cast<uint32_t>(PhysicalExprKind::Dimension))
+      nextDimension = std::max(nextDimension, expression.getValue() + 1);
+  });
+  kernel.walk([&](Operation *operation) {
+    identities.walk(operation->getAttrDictionary());
+    for (Type type : operation->getOperandTypes()) identities.walk(type);
+    for (Type type : operation->getResultTypes()) identities.walk(type);
+    for (Region &region : operation->getRegions())
+      for (Block &block : region)
+        for (BlockArgument argument : block.getArguments())
+          identities.walk(argument.getType());
+    for (StringRef name : {dimensionAttr, coverageDimensionAttr})
+      if (auto dimension = operation->getAttrOfType<IntegerAttr>(name))
+        nextDimension = std::max(nextDimension, dimension.getInt() + 1);
+  });
+  return {nextSource, nextDimension};
+}
 
 ParameterOp getOrCreatePhysicalParameter(
     func::FuncOp kernel, StringRef name, ParameterRole role,

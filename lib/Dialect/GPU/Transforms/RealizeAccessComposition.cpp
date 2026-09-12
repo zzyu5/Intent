@@ -607,11 +607,46 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
     return false;
   auto kernel = reshape->getParentOfType<func::FuncOp>();
   PhysicalProgramAnalysis analysis(kernel);
-  SmallVector<MakeRangeOp> sourceRanges;
-  SmallVector<SmallVector<MakeRangeOp>> sourceRoots;
-  SmallVector<Attribute> sourceExtents;
+  SmallVector<bool> preservedSource(sourceRank, false);
+  SmallVector<bool> preservedResult(resultRank, false);
+  for (Attribute attribute : reshape.getReassociation()) {
+    auto group = cast<ReshapeGroupAttr>(attribute);
+    if (group.getSourceAxes().size() != 1)
+      continue;
+    unsigned sourceAxis = group.getSourceAxes()[0];
+    unsigned resultAxis = group.getResultAxes()[0];
+    auto original = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
+    auto target = cast<AxisMapAttr>(result.getAxisMaps()[resultAxis]);
+    if (sourceAxisIdentity(original) == sourceAxisIdentity(target) &&
+        original.getDimensionId() == target.getDimensionId() &&
+        source.getShape()[sourceAxis] == result.getShape()[resultAxis]) {
+      preservedSource[sourceAxis] = true;
+      preservedResult[resultAxis] = true;
+    }
+  }
+  SmallVector<MakeRangeOp> sourceRanges(sourceRank);
+  SmallVector<SmallVector<MakeRangeOp>> sourceRoots(sourceRank);
+  SmallVector<Attribute> sourceExtents(sourceRank);
+  llvm::DenseMap<Operation *, unsigned> rootAxes;
   for (unsigned axis = 0; axis < sourceRank; ++axis) {
     PhysicalRangeFact fact = analysis.axisRanges(sourceValue, axis);
+    for (MakeRangeOp root : fact.roots) {
+      auto [found, inserted] = rootAxes.try_emplace(root.getOperation(), axis);
+      if (!inserted && found->second != axis)
+        return false;
+    }
+    sourceRoots[axis].append(fact.roots.begin(), fact.roots.end());
+    if (preservedSource[axis]) {
+      auto realization = analysis.axisRealization(sourceValue, axis);
+      bool introducedUnit = fact.roots.empty() && realization.isExact() &&
+                            !realization.constructionScalarSeed &&
+                            cast<PhysicalExprAttr>(source.getShape()[axis]).getKind() ==
+                                static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                            cast<PhysicalExprAttr>(source.getShape()[axis]).getValue() == 1;
+      if (fact.state != PhysicalFactState::Exact && !introducedUnit)
+        return false;
+      continue;
+    }
     FailureOr<MakeRangeOp> authority = queryExactLogicalRange(fact);
     if (failed(authority))
       return false;
@@ -628,9 +663,17 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
     PhysicalExprAttr extent = queryLaunchExpression(range.getLogicalStop());
     if (!extent)
       return false;
-    sourceRanges.push_back(range);
-    sourceRoots.emplace_back(fact.roots.begin(), fact.roots.end());
-    sourceExtents.push_back(extent);
+    if (!queryNonNegativeIndexUpperBound(range.getLogicalStop())) {
+      auto zero = PhysicalExprAttr::get(
+          reshape.getContext(), static_cast<uint32_t>(PhysicalExprKind::Constant),
+          0, StringAttr::get(reshape.getContext(), ""), ArrayAttr::get(reshape.getContext(), {}));
+      extent = PhysicalExprAttr::get(
+          reshape.getContext(), static_cast<uint32_t>(PhysicalExprKind::Maximum),
+          0, StringAttr::get(reshape.getContext(), ""),
+          ArrayAttr::get(reshape.getContext(), {extent, zero}));
+    }
+    sourceRanges[axis] = range;
+    sourceExtents[axis] = extent;
   }
   OpBuilder builder(reshape);
   SmallVector<Value> resultStops(resultRank);
@@ -638,24 +681,28 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
   // extent is their product, including when no author domain names that axis.
   for (Attribute attribute : reshape.getReassociation()) {
     auto group = cast<ReshapeGroupAttr>(attribute);
+    unsigned resultAxis = group.getResultAxes()[0];
+    if (preservedResult[resultAxis])
+      continue;
     auto axes = group.getSourceAxes().asArrayRef();
     auto extent = cast<PhysicalExprAttr>(sourceExtents[axes.front()]);
     for (int64_t axis : axes.drop_front())
       extent = PhysicalExprAttr::get(reshape.getContext(),
           static_cast<uint32_t>(PhysicalExprKind::Multiply), 0,
           builder.getStringAttr(""), builder.getArrayAttr({extent, sourceExtents[axis]}));
-    unsigned resultAxis = group.getResultAxes()[0];
     resultStops[resultAxis] = builder.create<PhysicalExprOp>(
         reshape.getLoc(), builder.getIndexType(), extent);
   }
 
   Value zero = builder.create<arith::ConstantIndexOp>(reshape.getLoc(), 0);
   Value one = builder.create<arith::ConstantIndexOp>(reshape.getLoc(), 1);
-  SmallVector<Value> flatCoordinates;
+  SmallVector<Value> flatCoordinates(resultRank);
   auto indexType = FragmentType::get(
       result.getContext(), builder.getIndexType(), result.getShape(),
       result.getAxisMaps(), result.getValidity(), result.getOwner());
   for (unsigned axis = 0; axis < resultRank; ++axis) {
+    if (preservedResult[axis])
+      continue;
     auto mapping = cast<AxisMapAttr>(result.getAxisMaps()[axis]);
     Value stop = resultStops[axis];
     Value extent = builder.create<PhysicalExprOp>(
@@ -675,12 +722,24 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
         builder, reshape.getLoc(), range, indexType);
     if (failed(projected))
       return reshape.emitOpError("collapsed load has no flat coordinate projection");
-    flatCoordinates.push_back(*projected);
+    flatCoordinates[axis] = *projected;
   }
   SmallVector<Value> sourceCoordinates(sourceRank);
   IRMapping mapping;
   for (Attribute attribute : reshape.getReassociation()) {
     auto group = cast<ReshapeGroupAttr>(attribute);
+    if (preservedResult[group.getResultAxes()[0]]) {
+      // Unmerged axes retain their current tile and coordinates, including
+      // program-local batch coordinates and already blocked free dimensions.
+      for (MakeRangeOp root : sourceRoots[group.getSourceAxes()[0]]) {
+        FailureOr<Value> projected = projectPhysicalValueToSchema(
+            builder, reshape.getLoc(), root.getResult(), indexType);
+        if (failed(projected))
+          return reshape.emitOpError("collapsed load lost an unmerged axis projection");
+        mapping.map(root.getResult(), *projected);
+      }
+      continue;
+    }
     Value ordinal = flatCoordinates[group.getResultAxes()[0]];
     auto axes = group.getSourceAxes().asArrayRef();
     for (unsigned position = axes.size(); position-- > 0;) {
@@ -722,6 +781,8 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
   Value lower = builder.create<SplatOp>(reshape.getLoc(), indexType, zero);
   Value active = *valid;
   for (unsigned axis = 0; axis < sourceRank; ++axis) {
+    if (preservedSource[axis])
+      continue;
     Value coordinate = sourceCoordinates[axis];
     Value end = builder.create<SplatOp>(
         reshape.getLoc(), indexType, sourceRanges[axis].getLogicalStop());

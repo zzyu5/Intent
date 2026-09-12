@@ -1773,6 +1773,127 @@ SmallVector<int64_t> eraseAxis(ArrayRef<int64_t> axes, unsigned erasedAxis) {
   return result;
 }
 
+bool collapseMultiReductionContract(ContractOp contract) {
+  ArrayRef<int64_t> lhsAxes = contract.getLhsReductionAxes();
+  ArrayRef<int64_t> rhsAxes = contract.getRhsReductionAxes();
+  if (lhsAxes.size() <= 1 || lhsAxes.size() != rhsAxes.size() ||
+      !contract.getLhsBatchAxes().empty() || !contract.getRhsBatchAxes().empty())
+    return false;
+  auto contiguous = [](ArrayRef<int64_t> axes) {
+    for (auto [position, axis] : llvm::enumerate(axes))
+      if (axis != axes.front() + static_cast<int64_t>(position))
+        return false;
+    return true;
+  };
+  if (!contiguous(lhsAxes) || !contiguous(rhsAxes) ||
+      !contract.getLhs().getDefiningOp<LoadOp>() ||
+      !contract.getRhs().getDefiningOp<LoadOp>())
+    return false;
+  func::FuncOp kernel = contract->getParentOfType<func::FuncOp>();
+  PhysicalProgramAnalysis analysis(kernel);
+  auto unit = expression(kernel.getContext(), PhysicalExprKind::Constant, 1);
+  for (Value operand : {contract.getLhs(), contract.getRhs()}) {
+    auto load = operand.getDefiningOp<LoadOp>();
+    if (!isa<ViewType>(load.getResource().getType()))
+      return false;
+    auto type = cast<FragmentType>(operand.getType());
+    llvm::DenseMap<Operation *, unsigned> rootAxes;
+    for (unsigned axis = 0; axis < type.getShape().size(); ++axis) {
+      PhysicalRangeFact ranges = analysis.axisRanges(operand, axis);
+      auto realization = analysis.axisRealization(operand, axis);
+      bool introducedUnit = ranges.roots.empty() && realization.isExact() &&
+                            !realization.constructionScalarSeed &&
+                            type.getShape()[axis] == unit;
+      if (ranges.state != PhysicalFactState::Exact && !introducedUnit)
+        return false;
+      for (MakeRangeOp root : ranges.roots) {
+        auto [found, inserted] = rootAxes.try_emplace(root.getOperation(), axis);
+        if (!inserted && found->second != axis)
+          return false;
+      }
+    }
+  }
+  for (auto [lhsAxis, rhsAxis] : llvm::zip(lhsAxes, rhsAxes)) {
+    SmallVector<MakeRangeOp> paired;
+    for (auto [operand, axis] :
+         {std::pair<Value, int64_t>{contract.getLhs(), lhsAxis},
+          std::pair<Value, int64_t>{contract.getRhs(), rhsAxis}}) {
+      auto load = operand.getDefiningOp<LoadOp>();
+      if (!canReplayReadAt(load, contract))
+        return false;
+      PhysicalRangeFact ranges = analysis.axisRanges(operand, axis);
+      if (failed(queryExactLogicalRange(ranges)))
+        return false;
+      for (MakeRangeOp range : ranges.roots) {
+        auto realization = analysis.axisRealization(range.getResult(), 0);
+        if (!isZeroScalar(range.getStart()) ||
+            !isZeroScalar(range.getLogicalStart()) || !isUnitStepRange(range) ||
+            !queryLaunchExpression(range.getLogicalStop()) ||
+            (!realization.constructionScalarSeed &&
+             !samePhysicalScalarExpression(range.getExtent(), range.getLogicalStop())))
+          return false;
+        paired.push_back(range);
+      }
+    }
+    if (!analysis.lockstepRanges(paired).isExact())
+      return false;
+  }
+
+  auto [sourceId, dimensionId] = nextPhysicalAxisIdentities(kernel);
+  OpBuilder builder(contract);
+  auto collapse = [&](Value value, ArrayRef<int64_t> reductions) -> Value {
+    auto source = cast<FragmentType>(value.getType());
+    SmallVector<Attribute> shape, mappings, groups;
+    for (unsigned axis = 0; axis < source.getShape().size();) {
+      unsigned resultAxis = shape.size();
+      SmallVector<int64_t> sourceAxes;
+      auto extent = cast<PhysicalExprAttr>(source.getShape()[axis]);
+      AxisMapAttr mapping;
+      if (axis == static_cast<unsigned>(reductions.front())) {
+        sourceAxes.append(reductions.begin(), reductions.end());
+        for (int64_t reduced : reductions.drop_front()) {
+          auto factor = cast<PhysicalExprAttr>(source.getShape()[reduced]);
+          if (extent == unit)
+            extent = factor;
+          else if (factor != unit)
+            extent = binaryExpression(kernel.getContext(), PhysicalExprKind::Multiply,
+                                      extent, factor);
+        }
+        mapping = AxisMapAttr::get(kernel.getContext(), sourceId, 0,
+                                   dimensionId, resultAxis, true);
+        axis += reductions.size();
+      } else {
+        sourceAxes.push_back(axis);
+        auto original = cast<AxisMapAttr>(source.getAxisMaps()[axis++]);
+        mapping = AxisMapAttr::get(
+            kernel.getContext(), original.getSourceId(), original.getSourceAxis(),
+            original.getDimensionId(), resultAxis, original.getDerived());
+      }
+      shape.push_back(extent);
+      mappings.push_back(mapping);
+      groups.push_back(ReshapeGroupAttr::get(
+          kernel.getContext(), builder.getDenseI64ArrayAttr(sourceAxes),
+          builder.getDenseI64ArrayAttr({static_cast<int64_t>(resultAxis)})));
+    }
+    auto target = FragmentType::get(
+        kernel.getContext(), source.getElementType(), builder.getArrayAttr(shape),
+        builder.getArrayAttr(mappings), source.getValidity(), source.getOwner());
+    return builder.create<ReshapeOp>(contract.getLoc(), target, value,
+                                     builder.getArrayAttr(groups));
+  };
+  Value lhs = collapse(contract.getLhs(), lhsAxes);
+  Value rhs = collapse(contract.getRhs(), rhsAxes);
+  auto replacement = builder.create<ContractOp>(
+      contract.getLoc(), contract.getResult().getType(), lhs, rhs,
+      contract.getAccumulator(), ArrayRef<int64_t>{lhsAxes.front()},
+      ArrayRef<int64_t>{rhsAxes.front()}, ArrayRef<int64_t>{}, ArrayRef<int64_t>{});
+  if (Attribute origin = contract->getAttr(originAttr))
+    replacement->setAttr(originAttr, origin);
+  contract.getResult().replaceAllUsesWith(replacement.getResult());
+  contract.erase();
+  return true;
+}
+
 LogicalResult decomposeMultiReductionContract(ContractOp contract) {
   if (!contract->getBlock() || contract.getLhsReductionAxes().size() <= 1)
     return success();
@@ -4446,6 +4567,13 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
   func::FuncOp kernel = *physicalKernel;
   fuseContractionAdds(kernel);
   SmallVector<ContractOp> contracts;
+  kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
+  bool collapsed = false;
+  for (ContractOp contract : contracts)
+    collapsed |= collapseMultiReductionContract(contract);
+  if (collapsed && failed(realizeAccessComposition(module)))
+    return failure();
+  contracts.clear();
   kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
   for (ContractOp contract : contracts)
     if (contract.getLhsReductionAxes().size() > 1 &&
