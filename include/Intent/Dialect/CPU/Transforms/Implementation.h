@@ -12,6 +12,7 @@ enum class InputReuse { Group, Consumers };
 // supply covers one compute group; consumer reuse preserves a source snapshot.
 struct InputRequirement {
   unsigned operand;
+  mlir::Type elementType;
   unsigned panelAxis;
   int64_t panelSize;
   int64_t alignment;

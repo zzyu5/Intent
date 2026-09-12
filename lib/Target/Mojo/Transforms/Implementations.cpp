@@ -34,21 +34,38 @@ Value subview(OpBuilder &b, Location loc, Value source,
 }
 
 LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
-    const ContractionTile &tile, ConfigurationAttr, ImplementationAttr binding) {
+    const ContractionTile &tile, ConfigurationAttr configuration, ImplementationAttr binding) {
   Location loc = operation.getLoc();
   int64_t microM = implementationParameter(binding, "micro_m");
   int64_t microN = implementationParameter(binding, "micro_n");
   int64_t vectorWidth = implementationParameter(binding, "vector_width");
-  const InputSupply *supply = nullptr;
+  const InputSupply *supplies[2] = {};
   for (const auto &input : tile.inputs) {
-    if (input.operand != 1 || input.panelAxis != 1 || input.panelSize != vectorWidth * microN)
+    if (input.operand > 1 || input.panelAxis != 1 ||
+        input.panelSize != (input.operand == 0 ? configuration.getTileK() : vectorWidth * microN))
       return operation.emitError("Mojo contraction received an incompatible input representation");
-    supply = &input;
+    supplies[input.operand] = &input;
   }
+  auto window = [&](unsigned operand, Value source, Value row, Value column,
+                    ArrayRef<OpFoldResult> sizes, ArrayRef<int64_t> shape) -> Value {
+    const InputSupply *supply = supplies[operand];
+    if (!supply) return subview(b, loc, source, {row, column}, sizes);
+    Value panel = index(b, loc, supply->panelSize);
+    Value relativeRow = b.create<arith::SubIOp>(loc, row, supply->begins[0]);
+    Value relativeColumn = b.create<arith::SubIOp>(loc, column, supply->begins[1]);
+    SmallVector<OpFoldResult> offsets{b.create<arith::DivSIOp>(loc, relativeColumn, panel).getResult(), relativeRow,
+        b.create<arith::RemSIOp>(loc, relativeColumn, panel).getResult()};
+    SmallVector<OpFoldResult> packedSizes{b.getIndexAttr(1), sizes[0], sizes[1]};
+    SmallVector<OpFoldResult> strides(3, b.getIndexAttr(1));
+    auto type = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
+        shape, cast<MemRefType>(supply->storage.getType()), offsets, packedSizes, strides));
+    return b.create<memref::SubViewOp>(loc, type, supply->storage, offsets, packedSizes, strides);
+  };
   Value zero = index(b, loc, 0);
   Value mEnd = add(b, loc, tile.mBegin, tile.mCount);
   auto micro = [&](Value packed, Value m, Value n, int64_t rows, int64_t columns, int64_t width) {
-    Value left = subview(b, loc, tile.lhs, {m, tile.kBegin}, {b.getIndexAttr(rows), tile.depth});
+    Value left = window(0, tile.lhs, m, tile.kBegin,
+        {b.getIndexAttr(rows), tile.depth}, {rows, ShapedType::kDynamic});
     Value right = subview(b, loc, packed, {b.getIndexAttr(0), b.getIndexAttr(0)},
         {tile.depth, b.getIndexAttr(columns)});
     Value out = subview(b, loc, tile.output, {m, add(b, loc, tile.nBegin, n)},
@@ -63,7 +80,12 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
           IRMapping mapping;
           Block &body = operation.getRegion().front();
           mapping.map(body.getArguments(), arguments);
-          for (Operation &op : body.without_terminator()) nested.clone(op, mapping);
+          for (Operation &op : body.without_terminator()) {
+            if (auto widen = dyn_cast<arith::ExtFOp>(op);
+                widen && mapping.lookup(widen.getIn()).getType() == widen.getType())
+              mapping.map(widen.getResult(), mapping.lookup(widen.getIn()));
+            else nested.clone(op, mapping);
+          }
           nested.create<linalg::YieldOp>(loc, mapping.lookup(body.getTerminator()->getOperand(0)));
         });
     contract->setAttr("intent_cpu.implementation", binding);
@@ -95,21 +117,8 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
   }
   auto rows = [&](Value n, int64_t columns, int64_t width) {
     Value column = add(b, loc, tile.nBegin, n);
-    Value packed;
-    if (supply) {
-      Value panel = index(b, loc, supply->panelSize);
-      Value relativeColumn = b.create<arith::SubIOp>(loc, column, supply->begins[1]);
-      Value relativeK = b.create<arith::SubIOp>(loc, tile.kBegin, supply->begins[0]);
-      SmallVector<OpFoldResult> offsets{b.create<arith::DivSIOp>(loc, relativeColumn, panel).getResult(), relativeK,
-          b.create<arith::RemSIOp>(loc, relativeColumn, panel).getResult()};
-      SmallVector<OpFoldResult> sizes{b.getIndexAttr(1), tile.depth, b.getIndexAttr(columns)};
-      SmallVector<OpFoldResult> strides(3, b.getIndexAttr(1));
-      auto type = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
-          {ShapedType::kDynamic, columns}, cast<MemRefType>(supply->storage.getType()), offsets, sizes, strides));
-      packed = b.create<memref::SubViewOp>(loc, type, supply->storage, offsets, sizes, strides);
-    } else {
-      packed = subview(b, loc, tile.rhs, {tile.kBegin, column}, {tile.depth, b.getIndexAttr(columns)});
-    }
+    Value packed = window(1, tile.rhs, tile.kBegin, column,
+        {tile.depth, b.getIndexAttr(columns)}, {ShapedType::kDynamic, columns});
     for (auto region : rowRegions)
       loop(b, loc, region.begin, region.end, region.rows,
           [&](Value m) { micro(packed, m, n, region.rows, columns, width); });
@@ -158,8 +167,9 @@ cpu::ImplementationRegistry implementations() {
   auto inputRequirements = [](InputReuse reuse) {
     return [reuse](linalg::GenericOp operation, ConfigurationAttr, ImplementationAttr binding) {
       int64_t width = implementationParameter(binding, "vector_width");
-      int64_t bytes = cast<MemRefType>(operation.getInputs()[1].getType()).getElementTypeBitWidth() / 8;
-      return SmallVector<InputRequirement>{{1, 1, width * implementationParameter(binding, "micro_n"), width * bytes, reuse}};
+      Type element = cast<MemRefType>(operation.getInputs()[1].getType()).getElementType();
+      int64_t bytes = element.getIntOrFloatBitWidth() / 8;
+      return SmallVector<InputRequirement>{{1, element, 1, width * implementationParameter(binding, "micro_n"), width * bytes, reuse}};
     };
   };
   auto directLegal = contraction.legal;
@@ -180,6 +190,25 @@ cpu::ImplementationRegistry implementations() {
   contraction.name = "mojo.register_float_direct";
   contraction.legal = directLegal;
   contraction.inputs = {};
+  result.add(contraction);
+  contraction.name = "mojo.register_float_widened";
+  contraction.legal = [directLegal](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
+    if (!directLegal(op, capabilities, config) ||
+        config.tileN % (config.parameter("vector_width") * config.parameter("micro_n")) != 0) return false;
+    auto operation = cast<linalg::GenericOp>(op);
+    Type accumulator = cast<MemRefType>(operation.getOutputs()[0].getType()).getElementType();
+    return llvm::any_of(operation.getInputs(), [&](Value input) {
+      return cast<MemRefType>(input.getType()).getElementType() != accumulator;
+    });
+  };
+  contraction.inputs = [](linalg::GenericOp operation, ConfigurationAttr config, ImplementationAttr binding) {
+    int64_t width = implementationParameter(binding, "vector_width");
+    Type element = cast<MemRefType>(operation.getOutputs()[0].getType()).getElementType();
+    int64_t alignment = width * element.getIntOrFloatBitWidth() / 8;
+    return SmallVector<InputRequirement>{
+        {0, element, 1, config.getTileK(), alignment, InputReuse::Consumers},
+        {1, element, 1, width * implementationParameter(binding, "micro_n"), alignment, InputReuse::Consumers}};
+  };
   result.add(std::move(contraction));
   result.add({"mojo.vector", [](Operation *op) {
       if (auto generic = dyn_cast<linalg::GenericOp>(op)) return !isMatrixContraction(generic);

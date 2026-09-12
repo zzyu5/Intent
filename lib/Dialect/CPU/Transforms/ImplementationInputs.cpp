@@ -19,13 +19,24 @@ FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepare(linalg::Generi
     operands.push_back(requirement.operand);
     Value source = operation.getInputs()[requirement.operand];
     auto type = cast<MemRefType>(source.getType());
-    int64_t bits = type.getElementType().isIndex() ? 64 : type.getElementType().getIntOrFloatBitWidth();
+    if (!requirement.elementType || !requirement.elementType.isIntOrIndexOrFloat())
+      return operation.emitError("implementation input requires an explicit scalar representation type"), failure();
+    if (requirement.elementType != type.getElementType()) {
+      Value argument = operation.getRegion().front().getArgument(requirement.operand);
+      if (argument.use_empty() || !llvm::all_of(argument.getUsers(), [&](Operation *user) {
+            auto widen = dyn_cast<arith::ExtFOp>(user);
+            return widen && widen.getType() == requirement.elementType;
+          }))
+        return operation.emitError("input representation must preserve the consumer's explicit floating extension"), failure();
+    }
+    int64_t bits = requirement.elementType.isIndex() ? 64 : requirement.elementType.getIntOrFloatBitWidth();
     if (requirement.panelAxis >= static_cast<unsigned>(type.getRank()) || requirement.alignment < (bits + 7) / 8)
       return operation.emitError("implementation input panel does not match its typed source"), failure();
     if (requirement.reuse == InputReuse::Group) continue;
     memref::AllocOp storage;
     for (auto &previous : prepared) {
       if (previous.source != source || previous.requirement.panelAxis != requirement.panelAxis ||
+          previous.requirement.elementType != requirement.elementType ||
           previous.requirement.panelSize != requirement.panelSize ||
           previous.requirement.alignment < requirement.alignment ||
           previous.allocation->getBlock() != operation->getBlock() ||
@@ -59,7 +70,7 @@ FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepare(linalg::Generi
       SmallVector<Value> dynamic;
       for (auto [axis, size] : llvm::enumerate(sizes))
         if (ShapedType::isDynamic(shape[axis])) dynamic.push_back(size);
-      storage = b.create<memref::AllocOp>(loc, MemRefType::get(shape, type.getElementType()), dynamic);
+      storage = b.create<memref::AllocOp>(loc, MemRefType::get(shape, requirement.elementType), dynamic);
       storage.setAlignment(requirement.alignment);
 
       auto copyPanel = [&](Value ordinal, Value width) {
@@ -71,6 +82,8 @@ FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepare(linalg::Generi
               logical[requirement.panelAxis] = add(b, loc, begin, lane);
               physical.push_back(lane);
               Value value = b.create<memref::LoadOp>(loc, source, logical);
+              if (value.getType() != requirement.elementType)
+                value = b.create<arith::ExtFOp>(loc, requirement.elementType, value);
               b.create<memref::StoreOp>(loc, value, storage, physical);
               physical.pop_back();
             });
@@ -141,7 +154,7 @@ FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepareGroup(OpBuilder
     }
     auto other = cast<AffineDimExpr>(map.getResult(otherAxis)).getPosition();
     auto storage = b.create<memref::AllocaOp>(loc,
-        MemRefType::get({1, capacities[other], requirement.panelSize}, sourceType.getElementType()));
+        MemRefType::get({1, capacities[other], requirement.panelSize}, requirement.elementType));
     storage.setAlignment(requirement.alignment);
     SmallVector<OpFoldResult> strides(2, b.getIndexAttr(1));
     Value window = b.create<memref::SubViewOp>(loc, source, offsets, sizes, strides);
@@ -151,14 +164,18 @@ FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepareGroup(OpBuilder
     auto resultType = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
         {ShapedType::kDynamic, ShapedType::kDynamic}, storage.getType(), packedOffsets, packedSizes, packedStrides));
     Value destination = b.create<memref::SubViewOp>(loc, resultType, storage, packedOffsets, packedSizes, packedStrides);
-    if (requirement.panelAxis == 1) {
+    if (requirement.panelAxis == 1 && sourceType.getElementType() == requirement.elementType) {
       b.create<memref::CopyOp>(loc, window, destination);
     } else {
       auto zero = index(b, loc, 0);
       loop(b, loc, zero, cast<Value>(sizes[0]), 1, [&](Value row) {
         loop(b, loc, zero, cast<Value>(sizes[1]), 1, [&](Value column) {
           Value value = b.create<memref::LoadOp>(loc, window, ValueRange{row, column});
-          b.create<memref::StoreOp>(loc, value, destination, ValueRange{column, row});
+          if (value.getType() != requirement.elementType)
+            value = b.create<arith::ExtFOp>(loc, requirement.elementType, value);
+          SmallVector<Value> coordinates = requirement.panelAxis == 1 ? SmallVector<Value>{row, column}
+                                                                     : SmallVector<Value>{column, row};
+          b.create<memref::StoreOp>(loc, value, destination, coordinates);
         });
       });
     }
