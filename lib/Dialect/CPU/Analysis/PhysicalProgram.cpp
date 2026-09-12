@@ -118,6 +118,14 @@ SmallVector<MemoryAccess> PhysicalProgramAnalysis::accesses(Operation *scope) {
     } else if (auto histogram = dyn_cast<HistogramOp>(operation)) {
       add(histogram.getValues(), true, false); add(histogram.getValid(), true, false);
       add(histogram.getOutput(), false, true);
+    } else if (auto atomic = dyn_cast<AtomicLoadOp>(operation)) {
+      add(atomic.getTarget(), true, false);
+    } else if (auto atomic = dyn_cast<AtomicStoreOp>(operation)) {
+      add(atomic.getTarget(), false, true);
+    } else if (auto atomic = dyn_cast<AtomicRMWOp>(operation)) {
+      add(atomic.getTarget(), true, true);
+    } else if (auto atomic = dyn_cast<AtomicCompareExchangeOp>(operation)) {
+      add(atomic.getTarget(), true, true);
     } else if (isa<RegionFoldOp, RegionScanOp>(operation)) {
       RegionProgram program(operation);
       for (Value input : program.sources()) add(input, true, false);

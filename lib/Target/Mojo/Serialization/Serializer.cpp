@@ -47,6 +47,16 @@ std::string valueType(Type type) {
   return memoryElement(type);
 }
 
+std::string ordering(AtomicOrdering order) {
+  switch (order) {
+  case AtomicOrdering::Relaxed: return "Ordering.RELAXED";
+  case AtomicOrdering::Acquire: return "Ordering.ACQUIRE";
+  case AtomicOrdering::Release: return "Ordering.RELEASE";
+  case AtomicOrdering::AcquireRelease: return "Ordering.ACQUIRE_RELEASE";
+  }
+  llvm_unreachable("unknown atomic ordering");
+}
+
 std::string abiDType(Type type) {
   if (type.isIndex()) return "i64";
   std::string result;
@@ -227,6 +237,37 @@ private:
     return success();
   }
 
+  LogicalResult whileLoop(scf::WhileOp loop) {
+    Block &before = loop.getBefore().front(), &after = loop.getAfter().front();
+    for (auto [argument, initial] : llvm::zip(before.getArguments(), loop.getInits()))
+      assign(argument, name(initial));
+    for (BlockArgument argument : after.getArguments())
+      line("var " + fresh(argument) + ": " + valueType(argument.getType()));
+    auto saved = scope.size();
+    auto transfer = [&](ValueRange from, ValueRange to) {
+      SmallVector<std::string> nextValues;
+      for (Value value : from) {
+        std::string temporary = "next_" + std::to_string(next++);
+        line("var " + temporary + " = " + name(value));
+        nextValues.push_back(temporary);
+      }
+      for (auto [value, temporary] : llvm::zip(to, nextValues)) line(name(value) + " = " + temporary);
+    };
+    line("while True:");
+    ++indent;
+    if (failed(block(before))) return failure();
+    auto condition = cast<scf::ConditionOp>(before.getTerminator());
+    transfer(condition.getArgs(), after.getArguments());
+    line("if not " + name(condition.getCondition()) + ":");
+    ++indent; line("break"); --indent;
+    if (failed(block(after))) return failure();
+    transfer(after.getTerminator()->getOperands(), before.getArguments());
+    --indent;
+    scope.resize(saved);
+    for (auto [result, argument] : llvm::zip(loop.getResults(), after.getArguments())) names[result] = name(argument);
+    return success();
+  }
+
   LogicalResult conditional(scf::IfOp operation) {
     SmallVector<std::string> results;
     for (Value result : operation.getResults()) {
@@ -357,6 +398,23 @@ private:
       if (op.getValue().getType().isIndex()) value = "Int64(" + value + ")";
       if (op.getValue().getType().isInteger(1)) value = "SIMD[DType.bool, 1](" + value + ")";
       line(pointer(op.getMemref(), op.getIndices()) + ".unsafe_store(" + value + ")");
+    } else if (auto op = dyn_cast<cpu::AtomicLoadOp>(operation)) {
+      assign(op.getValue(), "Atomic[DType." + dtype(op.getValue().getType()) + "].load[ordering=" +
+          ordering(op.getOrdering()) + "](" + pointer(op.getTarget(), op.getIndices()) + ")");
+    } else if (auto op = dyn_cast<cpu::AtomicStoreOp>(operation)) {
+      line("Atomic[DType." + dtype(op.getValue().getType()) + "].store[ordering=" + ordering(op.getOrdering()) +
+          "](" + pointer(op.getTarget(), op.getIndices()) + ", " + name(op.getValue()) + ")");
+    } else if (auto op = dyn_cast<cpu::AtomicRMWOp>(operation)) {
+      if (op.getKind() != AtomicRMWKind::Add) return op.emitError("Mojo atomic RMW was not expanded before serialization");
+      assign(op.getOldValue(), "Atomic[DType." + dtype(op.getValue().getType()) + "].fetch_add[ordering=" +
+          ordering(op.getOrdering()) + "](" + pointer(op.getTarget(), op.getIndices()) + ", " + name(op.getValue()) + ")");
+    } else if (auto op = dyn_cast<cpu::AtomicCompareExchangeOp>(operation)) {
+      assign(op.getOldValue(), name(op.getExpected()));
+      auto failureOrder = op.getOrdering() == AtomicOrdering::Acquire || op.getOrdering() == AtomicOrdering::AcquireRelease
+          ? AtomicOrdering::Acquire : AtomicOrdering::Relaxed;
+      assign(op.getSuccess(), "Atomic[DType." + dtype(op.getExpected().getType()) + "].compare_exchange[success_ordering=" +
+          ordering(op.getOrdering()) + ", failure_ordering=" + ordering(failureOrder) + ", weak=False](" +
+          pointer(op.getTarget(), op.getIndices()) + ", " + name(op.getOldValue()) + ", " + name(op.getDesired()) + ")");
     } else if (auto op = dyn_cast<vector::LoadOp>(operation)) {
       assign(op.getResult(), pointer(op.getBase(), op.getIndices()) + ".unsafe_load[width=" + std::to_string(op.getVectorType().getNumElements()) + "]()");
     } else if (auto op = dyn_cast<vector::StoreOp>(operation)) {
@@ -387,16 +445,7 @@ private:
     } else if (auto op = dyn_cast<scf::ForOp>(operation)) {
       return forLoop(op);
     } else if (auto op = dyn_cast<scf::WhileOp>(operation)) {
-      if (op.getNumResults() || op.getNumOperands()) return op.emitError("Mojo while requires realized destination-passing state");
-      auto saved = scope.size();
-      line("while True:");
-      ++indent;
-      if (failed(block(op.getBefore().front()))) return failure();
-      line("if not " + name(cast<scf::ConditionOp>(op.getBefore().front().getTerminator()).getCondition()) + ":");
-      ++indent; line("break"); --indent;
-      if (failed(block(op.getAfter().front()))) return failure();
-      --indent;
-      scope.resize(saved);
+      return whileLoop(op);
     } else if (auto op = dyn_cast<scf::ParallelOp>(operation)) {
       return parallel(op);
     } else if (auto op = dyn_cast<scf::IfOp>(operation)) {
@@ -500,6 +549,7 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string
   if (failed(cpu::verifyCPUProgram(module, true))) return failure();
   llvm::raw_string_ostream output(source);
   output << "from std.ffi import external_call\n"
+            "from std.atomic import Atomic, Ordering\n"
             "from std.memory import Layout, alloc, dealloc, unsafe_stack_allocation\n"
             "from std.sys import prefetch, llvm_intrinsic\n"
             "from std.sys.intrinsics import PrefetchOptions\n"

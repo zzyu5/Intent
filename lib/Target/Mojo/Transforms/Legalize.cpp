@@ -47,7 +47,8 @@ LogicalResult checkSurface(ModuleOp module) {
         memref::SubViewOp, memref::CastOp, memref::LoadOp, memref::StoreOp,
         memref::AllocaOp, memref::AllocOp, memref::DeallocOp, memref::PrefetchOp,
         vector::LoadOp, vector::StoreOp, vector::BroadcastOp, vector::ShuffleOp, vector::StepOp,
-        vector::ExtractElementOp, arith::CmpIOp, scf::IfOp, scf::ForOp, scf::WhileOp, scf::ParallelOp>(operation);
+        vector::ExtractElementOp, arith::CmpIOp, scf::IfOp, scf::ForOp, scf::WhileOp, scf::ParallelOp,
+        cpu::AtomicLoadOp, cpu::AtomicStoreOp, cpu::AtomicRMWOp, cpu::AtomicCompareExchangeOp>(operation);
     supported &= llvm::all_of(operation->getOperandTypes(), supportedType);
     supported &= llvm::all_of(operation->getResultTypes(), supportedType);
     if (auto constant = dyn_cast<arith::ConstantOp>(operation))
@@ -61,7 +62,12 @@ LogicalResult checkSurface(ModuleOp module) {
     if (auto conditional = dyn_cast<scf::IfOp>(operation))
       supported &= llvm::none_of(conditional.getResultTypes(), [](Type type) { return isa<MemRefType>(type); });
     if (auto loop = dyn_cast<scf::WhileOp>(operation))
-      supported &= loop.getNumResults() == 0 && loop.getNumOperands() == 0;
+      supported &= llvm::none_of(loop.getResultTypes(), [](Type type) { return isa<MemRefType>(type); });
+    if (isa<cpu::AtomicLoadOp, cpu::AtomicStoreOp, cpu::AtomicRMWOp, cpu::AtomicCompareExchangeOp>(operation)) {
+      Type element = cast<MemRefType>(operation->getOperand(0).getType()).getElementType();
+      supported &= element.isF32() || element.isF64() || element.isSignlessInteger(32) || element.isSignlessInteger(64);
+      if (auto rmw = dyn_cast<cpu::AtomicRMWOp>(operation)) supported &= rmw.getKind() == AtomicRMWKind::Add;
+    }
     if (auto parallel = dyn_cast<scf::ParallelOp>(operation))
       supported &= parallel.getNumResults() == 0 && parallel.getNumLoops() == 1 &&
           matchPattern(parallel.getLowerBound()[0], m_Zero()) &&
@@ -72,6 +78,45 @@ LogicalResult checkSurface(ModuleOp module) {
     }
   });
   return failure(invalid);
+}
+
+void expandAtomicUpdates(ModuleOp module) {
+  SmallVector<cpu::AtomicRMWOp> updates;
+  module.walk([&](cpu::AtomicRMWOp operation) {
+    if (operation.getKind() != AtomicRMWKind::Add) updates.push_back(operation);
+  });
+  for (auto operation : updates) {
+    OpBuilder builder(operation);
+    Location loc = operation.getLoc();
+    Type type = operation.getValue().getType();
+    Value initial = builder.create<cpu::AtomicLoadOp>(loc, type, operation.getTarget(), operation.getIndices(), AtomicOrdering::Relaxed);
+    Value pending = builder.create<arith::ConstantIntOp>(loc, 0, 1);
+    auto retry = builder.create<scf::WhileOp>(loc, TypeRange{type, builder.getI1Type()}, ValueRange{initial, pending});
+    auto *before = builder.createBlock(&retry.getBefore(), {}, {type, builder.getI1Type()}, {loc, loc});
+    Value no = builder.create<arith::ConstantIntOp>(loc, 0, 1);
+    Value again = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, before->getArgument(1), no);
+    builder.create<scf::ConditionOp>(loc, again, before->getArguments());
+    auto *after = builder.createBlock(&retry.getAfter(), {}, {type, builder.getI1Type()}, {loc, loc});
+    Value old = after->getArgument(0), value = operation.getValue(), desired;
+    switch (operation.getKind()) {
+    case AtomicRMWKind::Exchange: desired = value; break;
+    case AtomicRMWKind::Maximum:
+      desired = isa<FloatType>(type) ? Value(builder.create<arith::MaximumFOp>(loc, old, value))
+          : Value(builder.create<arith::MaxSIOp>(loc, old, value)); break;
+    case AtomicRMWKind::Minimum:
+      desired = isa<FloatType>(type) ? Value(builder.create<arith::MinimumFOp>(loc, old, value))
+          : Value(builder.create<arith::MinSIOp>(loc, old, value)); break;
+    case AtomicRMWKind::BitwiseAnd: desired = builder.create<arith::AndIOp>(loc, old, value); break;
+    case AtomicRMWKind::BitwiseOr: desired = builder.create<arith::OrIOp>(loc, old, value); break;
+    case AtomicRMWKind::BitwiseXor: desired = builder.create<arith::XOrIOp>(loc, old, value); break;
+    case AtomicRMWKind::Add: llvm_unreachable("atomic add has a direct Mojo implementation");
+    }
+    auto exchange = builder.create<cpu::AtomicCompareExchangeOp>(loc, type, builder.getI1Type(),
+        operation.getTarget(), old, desired, operation.getIndices(), operation.getOrdering());
+    builder.create<scf::YieldOp>(loc, exchange.getResults());
+    operation.getOldValue().replaceAllUsesWith(retry.getResult(0));
+    operation.erase();
+  }
 }
 
 }
@@ -129,6 +174,7 @@ LogicalResult legalizeProgram(ModuleOp module) {
   RewritePatternSet integerDivision(module.getContext());
   arith::populateCeilFloorDivExpandOpsPatterns(integerDivision);
   if (failed(applyPatternsGreedily(module, std::move(integerDivision)))) return failure();
+  expandAtomicUpdates(module);
   if (failed(cpu::verifyCPUProgram(module, true)) || failed(checkSurface(module))) return failure();
   OpBuilder builder(module.getContext());
   builder.setInsertionPointToStart(module.getBody());

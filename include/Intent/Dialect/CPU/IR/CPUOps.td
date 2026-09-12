@@ -59,6 +59,36 @@ def IntentCPU_HistogramOp : IntentCPU_Op<"histogram"> {
   let hasVerifier = 1;
 }
 
+// Synchronization orders surrounding memory effects, not only the target cell.
+class IntentCPU_AtomicOp<string name> : IntentCPU_Op<name,
+    [MemoryEffects<[MemRead, MemWrite]>]> {
+  let hasVerifier = 1;
+}
+
+def IntentCPU_AtomicLoadOp : IntentCPU_AtomicOp<"atomic_load"> {
+  let arguments = (ins AnyMemRef:$target, Variadic<Index>:$indices,
+      Intent_AtomicOrderingAttr:$ordering);
+  let results = (outs AnyType:$value);
+}
+
+def IntentCPU_AtomicStoreOp : IntentCPU_AtomicOp<"atomic_store"> {
+  let arguments = (ins AnyMemRef:$target, AnyType:$value,
+      Variadic<Index>:$indices, Intent_AtomicOrderingAttr:$ordering);
+}
+
+def IntentCPU_AtomicRMWOp : IntentCPU_AtomicOp<"atomic_rmw"> {
+  let arguments = (ins AnyMemRef:$target, AnyType:$value,
+      Variadic<Index>:$indices, Intent_AtomicOrderingAttr:$ordering,
+      Intent_AtomicRMWKindAttr:$kind);
+  let results = (outs AnyType:$old_value);
+}
+
+def IntentCPU_AtomicCompareExchangeOp : IntentCPU_AtomicOp<"atomic_compare_exchange"> {
+  let arguments = (ins AnyMemRef:$target, AnyType:$expected, AnyType:$desired,
+      Variadic<Index>:$indices, Intent_AtomicOrderingAttr:$ordering);
+  let results = (outs AnyType:$old_value, I1:$success);
+}
+
 def IntentCPU_QuantizeOp : IntentCPU_Op<"quantize"> {
   let summary = "Quantize complete records into invocation-owned storage";
   let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$input,

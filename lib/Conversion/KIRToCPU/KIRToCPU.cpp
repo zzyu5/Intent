@@ -532,6 +532,67 @@ private:
     return output;
   }
 
+  LogicalResult atomicAccess(Operation *operation) {
+    auto fact = analysis.indexRelation(operation);
+    if (failed(fact)) return failure();
+    auto rank = advancedIndexRank(operation, *fact);
+    if (failed(rank)) return failure();
+    Location loc = operation->getLoc();
+    Value target = values.lookup(fact->source);
+    Type element = cast<MemRefType>(target.getType()).getElementType();
+    auto ordering = operation->getAttrOfType<AtomicOrderingAttr>("ordering");
+    SmallVector<Type> resultTypes;
+    for (Type type : operation->getResultTypes()) flattenTypes(type, resultTypes);
+    Type accessType = resultTypes.empty()
+        ? operation->getOperand(cast<AtomicStoreOp>(operation).getValueOperand()).getType()
+        : resultTypes.front();
+    auto tensor = dyn_cast<RankedTensorType>(accessType);
+    SmallVector<Value> sizes, members, outputs;
+    bool used = llvm::any_of(operation->getResults(), [](Value value) { return !value.use_empty(); });
+    if (tensor) {
+      auto extentsOr = extents(tensor, loc);
+      if (failed(extentsOr)) return failure();
+      sizes = *extentsOr;
+      if (used) outputs = makeSlots(operation->getResultTypes(), loc);
+    }
+    auto operand = [&](StringRef attribute) {
+      auto position = operation->getAttrOfType<IntegerAttr>(attribute).getInt();
+      return elementAt(values.lookup(operation->getOperand(position)), members, builder, loc);
+    };
+    std::function<void(unsigned)> traverse = [&](unsigned axis) {
+      if (axis < sizes.size()) {
+        auto loop = builder.create<scf::ForOp>(loc, constant(loc, 0), sizes[axis], constant(loc, 1));
+        OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(loop.getBody());
+        members.push_back(loop.getInductionVar());
+        traverse(axis + 1);
+        members.pop_back();
+        return;
+      }
+      auto coordinates = indexedCoordinates(*fact, *rank, target, members, builder, loc);
+      SmallVector<Value> results;
+      if (isa<AtomicLoadOp>(operation)) {
+        results.push_back(builder.create<cpu::AtomicLoadOp>(loc, element, target, coordinates, ordering));
+      } else if (isa<AtomicStoreOp>(operation)) {
+        builder.create<cpu::AtomicStoreOp>(loc, target, operand("value_operand"), coordinates, ordering);
+      } else if (isa<AtomicRMWOp>(operation)) {
+        results.push_back(builder.create<cpu::AtomicRMWOp>(loc, element, target, operand("value_operand"),
+            coordinates, ordering, operation->getAttrOfType<AtomicRMWKindAttr>("kind")));
+      } else {
+        auto exchange = builder.create<cpu::AtomicCompareExchangeOp>(loc, element, builder.getI1Type(),
+            target, operand("expected_operand"), operand("desired_operand"), coordinates, ordering);
+        llvm::append_range(results, exchange.getResults());
+      }
+      if (!used) return;
+      if (!tensor) bindScalars(operation->getResults(), results);
+      else for (auto [value, output] : llvm::zip(results, outputs))
+        builder.create<memref::StoreOp>(loc, value, output, members);
+    };
+    traverse(0);
+    if (used && tensor) bindSlots(operation->getResults(), outputs, loc);
+    return success();
+  }
+
   FailureOr<Value> indexed(Operation *operation) {
     auto fact = analysis.indexRelation(operation);
     if (failed(fact))
@@ -1277,6 +1338,8 @@ private:
       bindDimensions(tensor, storage, loc);
     } else if (isa<AssumeInBoundsOp>(operation)) {
       return success();
+    } else if (isa<AtomicLoadOp, AtomicStoreOp, AtomicRMWOp, AtomicCompareExchangeOp>(operation)) {
+      return atomicAccess(operation);
     } else if (isa<ViewLoadOp, BufferLoadOp>(operation)) {
       auto value = indexed(operation);
       if (failed(value)) return failure();

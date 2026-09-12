@@ -109,6 +109,44 @@ LogicalResult HistogramOp::verify() {
 }
 
 namespace {
+LogicalResult verifyAtomicAddress(Operation *operation, Value target, ValueRange indices,
+                                  TypeRange operands, Type result = {}) {
+  auto memory = cast<MemRefType>(target.getType());
+  Type element = memory.getElementType();
+  if (indices.size() != static_cast<size_t>(memory.getRank()) ||
+      !isa<IntegerType, FloatType>(element) || element.isInteger(1) ||
+      llvm::any_of(operands, [&](Type type) { return type != element; }) ||
+      (result && result != element))
+    return operation->emitOpError("atomic operation requires complete coordinates and matching numeric scalar types");
+  return success();
+}
+}
+
+LogicalResult AtomicLoadOp::verify() {
+  if (getOrdering() != intent::AtomicOrdering::Relaxed && getOrdering() != intent::AtomicOrdering::Acquire)
+    return emitOpError("atomic load requires relaxed or acquire ordering");
+  return verifyAtomicAddress(*this, getTarget(), getIndices(), {}, getValue().getType());
+}
+
+LogicalResult AtomicStoreOp::verify() {
+  if (getOrdering() != intent::AtomicOrdering::Relaxed && getOrdering() != intent::AtomicOrdering::Release)
+    return emitOpError("atomic store requires relaxed or release ordering");
+  return verifyAtomicAddress(*this, getTarget(), getIndices(), TypeRange{getValue().getType()});
+}
+
+LogicalResult AtomicRMWOp::verify() {
+  if (getKind() == intent::AtomicRMWKind::BitwiseAnd || getKind() == intent::AtomicRMWKind::BitwiseOr ||
+      getKind() == intent::AtomicRMWKind::BitwiseXor)
+    if (!isa<IntegerType>(getValue().getType())) return emitOpError("bitwise atomic RMW requires an integer");
+  return verifyAtomicAddress(*this, getTarget(), getIndices(), TypeRange{getValue().getType()}, getOldValue().getType());
+}
+
+LogicalResult AtomicCompareExchangeOp::verify() {
+  return verifyAtomicAddress(*this, getTarget(), getIndices(),
+      TypeRange{getExpected().getType(), getDesired().getType()}, getOldValue().getType());
+}
+
+namespace {
 bool recordType(Type type, int64_t bytes) {
   auto memory = dyn_cast<MemRefType>(type);
   return memory && memory.getRank() == 2 &&
