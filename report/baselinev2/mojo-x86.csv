@@ -1,4 +1,6 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
+flaggems_conv1d,B64-L16384-K5-fp16-same-8cores-host,4.397394,1.746781,2.517426,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+swiglu,8192x14336-bf16-8cores-host,44.579537,659.456547,0.067600,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
 embedding_lookup,tokens16384-vocab32768-hidden4096-bf16-8cores-host,21.112265,19.317571,1.092905,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
 index_select,source65536-selected32768-hidden4096-fp16-8cores-host,39.220644,42.000270,0.933819,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
 flaggems_fused_adamw,N8388608-fp32-8cores-host,21.964079,82.639246,0.265783,pass,既有 AdamW N8388608 f32；PyTorch eager CPU reference，单 NUMA 8 核；每次调用前恢复相同的 parameter/moments，恢复不计时；双方计完整 host 调用。

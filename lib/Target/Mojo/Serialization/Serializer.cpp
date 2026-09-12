@@ -59,6 +59,7 @@ std::string floatingLiteral(Type element, const llvm::APFloat &value) {
   std::string type = valueType(element);
   if (!value.isFinite())
     return "(" + type + "(" + (value.isNaN() ? "0" : value.isNegative() ? "-1" : "1") + ") / " + type + "(0))";
+  if (value.isZero() && value.isNegative()) return type + "(-0.0)";
   llvm::SmallString<32> literal;
   value.toString(literal);
   return type + "(" + literal.str().str() + ")";

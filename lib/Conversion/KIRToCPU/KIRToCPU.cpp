@@ -558,9 +558,32 @@ private:
   FailureOr<Value> arithmetic(Operation *operation, ValueRange arguments, OpBuilder &builder) {
     Location loc = operation->getLoc();
     if (auto binary = dyn_cast<BinaryOp>(operation)) {
-      if (binary.getApproximate() || binary.getFlushToZero())
-        return binary.emitError("CPU approximate arithmetic is not implemented"), failure();
       Value a = arguments[0], b = arguments[1];
+      if (binary.getApproximate() || binary.getFlushToZero()) {
+        if (binary.getOperatorKind() != BinaryOperator::TrueDivide || !binary.getApproximate() ||
+            !a.getType().isF32() || !b.getType().isF32())
+          return binary.emitError("CPU non-default arithmetic requires the closed f32 approximate division contract"), failure();
+        auto literal = [&](float value) -> Value {
+          return builder.create<arith::ConstantOp>(loc, builder.getF32FloatAttr(value));
+        };
+        Value zero = literal(0.0f), negativeZero = literal(-0.0f);
+        Value normal = literal(0x1.0p-126f);
+        auto flush = [&](Value value) -> Value {
+          Value magnitude = builder.create<math::AbsFOp>(loc, value);
+          Value subnormal = builder.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OLT, magnitude, normal);
+          Value signedZero = builder.create<arith::MulFOp>(loc, value, zero);
+          return builder.create<arith::SelectOp>(loc, subnormal, signedZero, value);
+        };
+        if (binary.getFlushToZero()) { a = flush(a); b = flush(b); }
+        Value quotient = builder.create<arith::DivFOp>(loc, a, b);
+        Value large = builder.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OGT,
+            builder.create<math::AbsFOp>(loc, b), literal(0x1.0p126f));
+        Value negative = builder.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OLT, b, zero);
+        Value denominatorSign = builder.create<arith::SelectOp>(loc, negative, negativeZero, zero);
+        Value limit = builder.create<arith::MulFOp>(loc, a, denominatorSign);
+        Value result = builder.create<arith::SelectOp>(loc, large, limit, quotient);
+        return binary.getFlushToZero() ? flush(result) : result;
+      }
       bool fp = isa<FloatType>(a.getType());
       switch (binary.getOperatorKind()) {
       case BinaryOperator::Add:

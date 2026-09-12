@@ -1,6 +1,7 @@
 import torch
 
 from kernels.activation.pointwise import addcmul_broadcast_bf16, gelu_tanh, relu_forward
+from kernels.activation.swiglu import swiglu_forward
 
 from ...model import Tolerance
 from .common import configure_cpu_budget, prepare_host_comparison
@@ -28,4 +29,11 @@ def addcmul(context):
                                    "addcmul", Tolerance(atol=2e-2, rtol=1e-2))
 
 
-CASES = {"gelu": gelu, "relu": relu, "flaggems_addcmul": addcmul}
+def swiglu(context):
+    gate = torch.randn((8192, 14336), dtype=torch.bfloat16)
+    up = torch.randn_like(gate)
+    return prepare_host_comparison(context, swiglu_forward, (gate, up), "swiglu",
+                                   Tolerance(atol=2e-2, rtol=1e-2))
+
+
+CASES = {"gelu": gelu, "relu": relu, "flaggems_addcmul": addcmul, "swiglu": swiglu}

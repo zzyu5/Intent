@@ -10,6 +10,13 @@ def relu(x):
     return torch.maximum(x, x.new_zeros(()))
 
 
+def swiglu(gate, up):
+    values = gate.float()
+    sigmoid = 1.0 / (1.0 + torch.exp(-values))
+    sigmoid = torch.where(sigmoid < torch.finfo(torch.float32).tiny, sigmoid * 0.0, sigmoid)
+    return (values * sigmoid).to(gate.dtype) * up
+
+
 def addcmul(x, scale, bias):
     return bias.unsqueeze(-1) + x * scale.unsqueeze(-1)
 
@@ -57,6 +64,12 @@ def index_select(source, indices):
 
 def matmul(a, b):
     return torch.matmul(a.float(), b.float()).to(a.dtype)
+
+
+def conv1d_same(x, weight):
+    width = weight.numel()
+    patches = F.pad(x.float(), (width // 2, width // 2)).unfold(-1, width, 1)
+    return (patches * weight.float()).sum(dim=-1).to(x.dtype)
 
 
 def adamw(gradient, parameter, first_moment, second_moment, learning_rate,
