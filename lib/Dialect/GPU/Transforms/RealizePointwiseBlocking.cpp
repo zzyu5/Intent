@@ -4233,6 +4233,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
 
   llvm::DenseMap<Operation *, MakeRangeOp> occurrenceRoots;
   llvm::DenseMap<Operation *, ParameterOp> occurrenceParameters;
+  llvm::SmallPtrSet<Operation *, 8> positionalOccurrences;
   WalkResult occurrences = kernel.walk([&](StoreOp store) {
     auto valueType = dyn_cast<FragmentType>(store.getValue().getType());
     if (!valueType || valueType.getShape().size() != store.getCoordinates().size() ||
@@ -4246,11 +4247,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     for (auto [axis, attribute] : llvm::enumerate(valueType.getAxisMaps())) {
       auto mapping = cast<AxisMapAttr>(attribute);
       int64_t dimension = mapping.getDimensionId();
-      if (dimension <= 0 || nonUniqueContractionDimensions.contains(dimension) ||
+      if (dimension <= 0 || nonUniqueContractionDimensions.contains(dimension))
+        continue;
+      bool repeatedDimension =
           llvm::count_if(valueType.getAxisMaps(), [&](Attribute other) {
             return cast<AxisMapAttr>(other).getDimensionId() == dimension;
-          }) < 2)
-        continue;
+          }) >= 2;
       // Rank-one Cartesian coordinates concatenate into the result axes.
       // Equal dimension values do not equate those independent occurrences.
       PhysicalRangeFact address = analysis.axisRanges(store.getCoordinates()[axis], 0);
@@ -4260,11 +4262,40 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           !address.blockers.empty() || !payload.blockers.empty() ||
           address.roots.empty() || payload.roots.empty())
         continue;
+      bool positionalRemap = llvm::any_of(payload.roots, [&](MakeRangeOp range) {
+        FailureOr<int64_t> sourceDimension = queryRangeDimension(range);
+        return succeeded(sourceDimension) && *sourceDimension != dimension;
+      });
+      if (!repeatedDimension && !positionalRemap)
+        continue;
+      if (positionalRemap && (!address.isExact() || !payload.isExact()))
+        continue;
       SmallVector<MakeRangeOp> ranges(address.roots.begin(), address.roots.end());
       for (MakeRangeOp range : payload.roots)
         if (!llvm::is_contained(ranges, range))
           ranges.push_back(range);
+      if (positionalRemap && !repeatedDimension) {
+        // Separate access sites can materialize the same logical range. Keep
+        // their positional ownership connected instead of multiplying grids.
+        SmallVector<MakeRangeOp> related;
+        for (auto &entry : occurrenceRoots) {
+          auto previous = cast<MakeRangeOp>(entry.first);
+          if (positionalOccurrences.contains(entry.first) &&
+              llvm::any_of(ranges, [&](MakeRangeOp range) {
+                return sameLogicalRange(range, previous);
+              }))
+            related.push_back(previous);
+        }
+        for (MakeRangeOp range : related)
+          if (!llvm::is_contained(ranges, range))
+            ranges.push_back(range);
+      }
       MakeRangeOp root = ranges.front();
+      FailureOr<int64_t> addressExtent = exactStaticTraversalExtent(address);
+      FailureOr<int64_t> payloadExtent = exactStaticTraversalExtent(payload);
+      bool sameStaticCardinality = succeeded(addressExtent) &&
+                                   succeeded(payloadExtent) &&
+                                   *addressExtent == *payloadExtent;
       auto sameBound = [](Value lhs, Value rhs) {
         if (samePhysicalScalarExpression(lhs, rhs))
           return true;
@@ -4273,6 +4304,15 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         return left && right && left == right;
       };
       if (!llvm::all_of(ranges, [&](MakeRangeOp range) {
+            if (positionalRemap) {
+              // The store pairs these tensor axes by ordinal, even when the
+              // address domains have different starts. Share their tile width,
+              // retaining each domain's own coordinates and source identity.
+              PhysicalExprAttr length = launchRangeExtent(root);
+              return isUnitStepRange(root) && isUnitStepRange(range) &&
+                     (sameStaticCardinality ||
+                      (length && length == launchRangeExtent(range)));
+            }
             return sameBound(root.getLogicalStart(), range.getLogicalStart()) &&
                    sameBound(root.getLogicalStop(), range.getLogicalStop()) &&
                    sameBound(root.getStep(), range.getStep());
@@ -4296,6 +4336,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       }
       for (MakeRangeOp range : ranges) {
         occurrenceRoots[range.getOperation()] = root;
+        if (positionalRemap && !repeatedDimension)
+          positionalOccurrences.insert(range.getOperation());
         ownershipSources.insert(sourceAxisIdentity(range));
       }
     }
