@@ -50,17 +50,45 @@ def flattened_signature(parameters: list[dict[str, object]]) -> tuple[list[str],
 
 def benchmark_exports(metadata: dict[str, object]) -> str:
     signature, arguments = flattened_signature(metadata["parameters"])
-    sections = ["\nfrom std.time import monotonic\n"]
+    sections = ["\nfrom std.time import monotonic\nfrom std.sys import size_of\n"]
+    mutable = [(index, parameter) for index, parameter in enumerate(metadata["parameters"])
+               if parameter["kind"] == "view" and parameter["access"] == 2]
     for candidate in metadata["candidates"]:
         entry = candidate["entry"]
         sections.append(
             f'\n@export("{entry}_benchmark")\n'
             f"def {entry}_benchmark({', '.join(signature)}, repetitions: Int64) abi(\"C\") -> Float64:\n"
-            "    var begin = monotonic()\n"
-            "    for iteration in range(Int(repetitions)):\n"
-            f"        {entry}({', '.join(arguments)})\n"
-            "    return Float64(monotonic() - begin) * 1.0e-6 / Float64(repetitions)\n"
         )
+        if not mutable:
+            sections.append(
+                "    var begin = monotonic()\n"
+                "    for iteration in range(Int(repetitions)):\n"
+                f"        {entry}({', '.join(arguments)})\n"
+                "    return Float64(monotonic() - begin) * 1.0e-6 / Float64(repetitions)\n"
+            )
+            continue
+        for index, parameter in mutable:
+            dimensions = " * ".join(f"Int(a{index}_d{axis})" for axis in range(len(parameter["shape"]))) or "1"
+            element = ELEMENT_TYPES[parameter["dtype"]]
+            sections.append(
+                f"    var bytes_a{index} = ({dimensions}) * size_of[{element}]()\n"
+                f"    var saved_a{index} = alloc(Layout[UInt8](count=bytes_a{index}))\n"
+                f'    external_call["memcpy", NoneType](saved_a{index}.unsafe_ptr(), a{index}, UInt(bytes_a{index}))\n'
+            )
+        sections.append("    var elapsed = Float64(0)\n    for iteration in range(Int(repetitions)):\n")
+        for index, _ in mutable:
+            sections.append(f'        external_call["memcpy", NoneType](a{index}, saved_a{index}.unsafe_ptr(), UInt(bytes_a{index}))\n')
+        sections.append(
+            "        var begin = monotonic()\n"
+            f"        {entry}({', '.join(arguments)})\n"
+            "        elapsed += Float64(monotonic() - begin)\n"
+        )
+        for index, _ in mutable:
+            sections.append(
+                f'    external_call["memcpy", NoneType](a{index}, saved_a{index}.unsafe_ptr(), UInt(bytes_a{index}))\n'
+                f"    dealloc(saved_a{index}^)\n"
+            )
+        sections.append("    return elapsed * 1.0e-6 / Float64(repetitions)\n")
     return "".join(sections)
 
 

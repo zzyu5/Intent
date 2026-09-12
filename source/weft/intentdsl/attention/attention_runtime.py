@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from array import array
 from concurrent.futures import ThreadPoolExecutor
+import faulthandler
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ from intent.runtime.weft import Buffer, NativeProgram, compile_artifact
 
 
 def serve(directory: Path) -> None:
+    faulthandler.enable()
     configuration = json.loads((directory / "deployment.json").read_text())
     with ThreadPoolExecutor(max_workers=2) as executor:
         builds = [executor.submit(compile_artifact, directory / side,

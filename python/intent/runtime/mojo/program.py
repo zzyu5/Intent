@@ -138,9 +138,9 @@ class NativeProgram:
             all_arguments.append(value)
         outputs = []
         for index, parameter in enumerate(self.parameters):
-            if parameter["kind"] != "view" or parameter["access"] != 1:
+            if parameter["kind"] != "view" or parameter["access"] == 0:
                 continue
-            if not explicit_outputs:
+            if parameter["access"] == 1 and not explicit_outputs:
                 shape = tuple(static if static >= 0 else dimensions[identity]
                               for static, identity in zip(parameter["shape"], parameter["dimensions"]))
                 all_arguments[index] = torch.empty(shape, dtype=_DTYPES[parameter["dtype"]], device="cpu")
@@ -153,7 +153,7 @@ class NativeProgram:
             for other_parameter, other in views[index + 1:]:
                 same_allocation = value.untyped_storage().data_ptr() == other.untyped_storage().data_ptr()
                 overlap = begin < other.data_ptr() + other.numel() * other.element_size() and other.data_ptr() < end
-                if overlap and (parameter["access"] == 1 or other_parameter["access"] == 1):
+                if overlap and (parameter["access"] != 0 or other_parameter["access"] != 0):
                     raise NotImplementedError("Mojo CPU overlapping writable views are not implemented")
                 if same_allocation and (parameter["noalias"] or other_parameter["noalias"]):
                     raise ValueError("CPU invocation violates an author noalias constraint")

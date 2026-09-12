@@ -4,6 +4,13 @@ using namespace mlir;
 namespace intent::cpu {
 
 bool needsImplementation(Operation *operation) {
+  if (auto function = dyn_cast<func::FuncOp>(operation)) {
+    bool computation = false;
+    function.walk([&](Operation *nested) {
+      computation |= isa<linalg::GenericOp, ReduceOp, QuantizeOp, QuantizedDotOp>(nested);
+    });
+    return !function.isExternal() && !computation;
+  }
   return isa<linalg::GenericOp, ReduceOp, QuantizeOp, QuantizedDotOp>(operation);
 }
 

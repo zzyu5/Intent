@@ -174,6 +174,8 @@ cpu::ImplementationRegistry implementations() {
   };
   auto noParameters = [](Builder &b, const Configuration &) { return b.getDictionaryAttr({}); };
   auto legal = [](Operation *, CapabilitiesAttr, const Configuration &) { return true; };
+  result.add({"weft.scalar_program", [](Operation *op) { return isa<func::FuncOp>(op); },
+      legal, noParameters, {}, {}});
   result.add({"weft.q8_k", [](Operation *op) { return isa<cpu::QuantizeOp>(op); },
       [](Operation *, CapabilitiesAttr, const Configuration &config) {
         return config.local.size() == 1 && config.local.get("chunk") &&

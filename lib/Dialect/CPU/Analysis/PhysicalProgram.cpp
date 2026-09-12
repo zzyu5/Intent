@@ -209,7 +209,7 @@ LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
   bool invalid = false;
   for (MemoryAccess access : accesses(function)) {
     auto view = externalView(access.memory);
-    if (access.write && view && view.getAccess() != 1) {
+    if (access.write && view && view.getAccess() == 0) {
       access.operation->emitError("CPU write contradicts its input-only ABI");
       invalid = true;
     }

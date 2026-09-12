@@ -51,5 +51,21 @@ def transpose(x):
     return x.T.contiguous()
 
 
+def index_select(source, indices):
+    return torch.index_select(source, 0, indices)
+
+
 def matmul(a, b):
     return torch.matmul(a.float(), b.float()).to(a.dtype)
+
+
+def adamw(gradient, parameter, first_moment, second_moment, learning_rate,
+          beta1, beta2, bias_correction1, bias_correction2, epsilon, weight_decay):
+    first = beta1 * first_moment + (1.0 - beta1) * gradient
+    second = beta2 * second_moment + (1.0 - beta2) * gradient * gradient
+    denominator = torch.sqrt(second / bias_correction2) + epsilon
+    update = (first / bias_correction1) / denominator + weight_decay * parameter
+    parameter.copy_(parameter - learning_rate * update)
+    first_moment.copy_(first)
+    second_moment.copy_(second)
+    return parameter, first_moment, second_moment

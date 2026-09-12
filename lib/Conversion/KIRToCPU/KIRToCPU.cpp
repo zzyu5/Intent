@@ -51,9 +51,8 @@ public:
         if ((!element.isF16() && !element.isBF16() && !element.isF32() && !element.isF64() &&
              !element.isUnsignedInteger(8) && !element.isSignlessInteger(8) &&
              !element.isSignlessInteger(16) && !element.isSignlessInteger(32) &&
-             !element.isSignlessInteger(64) && !element.isInteger(1)) ||
-            view.getAccess() == 2)
-          return source.emitError("CPU construction requires supported numeric In/Out views; InOut is not implemented");
+             !element.isSignlessInteger(64) && !element.isInteger(1)))
+          return source.emitError("CPU construction requires supported numeric views");
         auto memory = MemRefType::get(tensor.getShape(), tensor.getElementType());
         if (view.getConstraints().getHasStrides()) {
           if (view.getConstraints().getStrides().size() != static_cast<size_t>(tensor.getRank()))
@@ -395,11 +394,74 @@ private:
     return maps;
   }
 
+  FailureOr<Value> indexedTensorRead(Operation *operation, const IndexRelationFact &fact, Value source) {
+    auto tensor = dyn_cast<RankedTensorType>(operation->getResult(0).getType());
+    if (!tensor) return operation->emitError("CPU tensor-indexed read requires a ranked result"), failure();
+    unsigned advancedRank = 0;
+    for (const auto &term : fact.terms) {
+      if (term.kind == 3 && term.operands.size() == 1) {
+        if (auto type = dyn_cast<MemRefType>(values.lookup(term.operands[0]).getType()))
+          advancedRank = std::max<unsigned>(advancedRank, type.getRank());
+      } else if (term.kind == 4) {
+        if (term.operands.size() != 1 || !domains.count(term.operands[0]))
+          return operation->emitError("CPU tensor-indexed read requires a realized domain"), failure();
+      } else if (term.kind != 0 && term.kind != 1 && term.kind != 2) {
+        return operation->emitError("CPU tensor-indexed read does not implement this coordinate term"), failure();
+      }
+    }
+    auto shape = extents(tensor, operation->getLoc());
+    if (failed(shape)) return failure();
+    Value output = allocate(tensor, *shape, operation->getLoc());
+    builder.create<linalg::GenericOp>(operation->getLoc(), ValueRange{}, ValueRange{output},
+        SmallVector<AffineMap>{builder.getMultiDimIdentityMap(tensor.getRank())},
+        SmallVector<utils::IteratorType>(tensor.getRank(), utils::IteratorType::parallel),
+        [&](OpBuilder &nested, Location loc, ValueRange) {
+          SmallVector<Value> coordinates;
+          unsigned axis = 0;
+          std::optional<unsigned> advancedBegin;
+          for (const auto &term : fact.terms) {
+            if (term.kind == 1) { ++axis; continue; }
+            Value coordinate;
+            if (term.kind == 0 || term.kind == 4) {
+              coordinate = nested.create<linalg::IndexOp>(loc, axis++);
+            } else if (term.kind == 2) {
+              int64_t literal = *term.staticValues[0];
+              coordinate = nested.create<arith::ConstantIndexOp>(loc, literal);
+              if (literal < 0) coordinate = nested.create<arith::AddIOp>(loc,
+                  nested.create<memref::DimOp>(loc, source, *term.sourceAxis), coordinate);
+            } else {
+              coordinate = values.lookup(term.operands[0]);
+              if (auto type = dyn_cast<MemRefType>(coordinate.getType())) {
+                if (!advancedBegin) { advancedBegin = axis; axis += advancedRank; }
+                SmallVector<Value> indices;
+                for (unsigned dimension = 0; dimension < type.getRank(); ++dimension)
+                  indices.push_back(type.getDimSize(dimension) == 1
+                      ? Value(nested.create<arith::ConstantIndexOp>(loc, 0))
+                      : Value(nested.create<linalg::IndexOp>(loc,
+                          *advancedBegin + advancedRank - type.getRank() + dimension)));
+                coordinate = nested.create<memref::LoadOp>(loc, coordinate, indices);
+              }
+              if (!coordinate.getType().isIndex())
+                coordinate = nested.create<arith::IndexCastOp>(loc, nested.getIndexType(), coordinate);
+            }
+            coordinates.push_back(coordinate);
+          }
+          Value value = nested.create<memref::LoadOp>(loc, source, coordinates);
+          nested.create<linalg::YieldOp>(loc, value);
+        });
+    return output;
+  }
+
   FailureOr<Value> indexed(Operation *operation) {
     auto fact = analysis.indexRelation(operation);
     if (failed(fact))
       return failure();
     Value source = values.lookup(fact->source);
+    if (isa<ViewLoadOp, GatherOp>(operation) && llvm::any_of(fact->terms, [&](const auto &term) {
+          return term.kind == 3 && term.operands.size() == 1 &&
+              isa<MemRefType>(values.lookup(term.operands[0]).getType());
+        }))
+      return indexedTensorRead(operation, *fact, source);
     auto type = dyn_cast<MemRefType>(source.getType());
     SmallVector<OpFoldResult> offsets, sizes, strides;
     SmallVector<int64_t> resultShape;
@@ -423,7 +485,11 @@ private:
         offsets.push_back(*coordinate);
         sizes.push_back(builder.getIndexAttr(1));
       } else if (term.kind == 2 && !term.staticValues.empty() && term.staticValues[0]) {
-        offsets.push_back(builder.getIndexAttr(*term.staticValues[0]));
+        int64_t literal = *term.staticValues[0];
+        if (literal < 0) offsets.push_back(builder.create<arith::AddIOp>(operation->getLoc(),
+            builder.create<memref::DimOp>(operation->getLoc(), source, *term.sourceAxis),
+            constant(operation->getLoc(), literal)).getResult());
+        else offsets.push_back(builder.getIndexAttr(literal));
         sizes.push_back(builder.getIndexAttr(1));
       } else if (term.kind == 4 && term.operands.size() == 1 && domains.count(term.operands[0])) {
         Domain domain = domains.lookup(term.operands[0]);
@@ -463,7 +529,19 @@ private:
         resultShape, type, offsets, sizes, strides));
     Value selected = builder.create<memref::SubViewOp>(operation->getLoc(), resultType,
                                                       source, offsets, sizes, strides);
-    if (!inserted) return selected;
+    if (!inserted) {
+      auto view = dyn_cast<ViewType>(fact->source.getType());
+      if (isa<ViewLoadOp>(operation) && view && view.getAccess() != 0) {
+        auto tensor = cast<RankedTensorType>(operation->getResult(0).getType());
+        SmallVector<Value> shape;
+        for (int64_t axis = 0; axis < resultType.getRank(); ++axis)
+          shape.push_back(builder.create<memref::DimOp>(operation->getLoc(), selected, axis));
+        Value snapshot = allocate(tensor, shape, operation->getLoc());
+        builder.create<memref::CopyOp>(operation->getLoc(), selected, snapshot);
+        return snapshot;
+      }
+      return selected;
+    }
     if (operation->getNumResults() != 1 || !isa<RankedTensorType>(operation->getResult(0).getType()))
       return operation->emitError("CPU inserted write axes are not implemented"), failure();
     auto tensor = cast<RankedTensorType>(operation->getResult(0).getType());
@@ -961,15 +1039,17 @@ private:
       return lowerBlock(op.getBody().front());
     } else if (isa<IfOp, ForOp, WhileOp>(operation)) {
       return orderedControl(operation);
+    } else if (isa<AssumeInBoundsOp>(operation)) {
+      return success();
     } else if (auto op = dyn_cast<ViewLoadOp>(operation)) {
-      if (cast<ViewType>(op.getInputs()[0].getType()).getAccess() != 0)
-      return op.emitError("CPU construction does not implement reads from writable external views");
       if (!alwaysValid(operation))
         return op.emitError("CPU predicated source loads are not implemented");
       auto value = indexed(operation);
       if (failed(value)) return failure();
       values.map(op.getResult(), *value);
     } else if (auto op = dyn_cast<ViewStoreOp>(operation)) {
+      if (!alwaysValid(operation))
+        return op.emitError("CPU predicated destination stores are not implemented");
       auto destination = indexed(operation);
       if (failed(destination)) return failure();
       Value input = values.lookup(op.getInputs()[op.getValueOperandIndex()]);

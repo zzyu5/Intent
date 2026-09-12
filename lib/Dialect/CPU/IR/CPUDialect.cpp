@@ -30,8 +30,8 @@ LogicalResult ViewArgumentAttr::verify(
        !element.isUnsignedInteger(8) && !element.isSignlessInteger(8) &&
        !element.isSignlessInteger(16) && !element.isSignlessInteger(32) &&
        !element.isSignlessInteger(64) && !element.isInteger(1)) || !shape || !dimensions ||
-      shape.size() != dimensions.size() || access > 1 || !alias)
-    return error() << "CPU view argument requires a named numeric In/Out view and complete shape identities";
+      shape.size() != dimensions.size() || access > 2 || !alias)
+    return error() << "CPU view argument requires a named numeric view and complete shape identities";
   for (auto [size, dimension] : llvm::zip(shape.asArrayRef(), dimensions.asArrayRef()))
     if ((size < 0 && !ShapedType::isDynamic(size)) || dimension < 0 ||
         (ShapedType::isDynamic(size) && dimension == 0))

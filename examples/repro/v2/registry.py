@@ -154,6 +154,9 @@ TILELANG = (
 
 
 MOJO = (
+    Entry("embedding_lookup", "tokens16384-vocab32768-hidden4096-bf16-8cores-host", "embedding_forward_lookup_bf16", ("backward/embedding.py:embedding_forward_lookup_bf16",), "source/pytorch/cpu_runtime.py"),
+    Entry("index_select", "source65536-selected32768-hidden4096-fp16-8cores-host", "index_select_rows", ("indexing/relations.py:index_select_rows",), "source/pytorch/cpu_runtime.py"),
+    Entry("flaggems_fused_adamw", "N8388608-fp32-8cores-host", "adamw_update", ("optimization/adamw.py:adamw_update",), "source/pytorch/cpu_runtime.py"),
     Entry("dense_gemm", "M4096-N14336-K4096-fp16-8cores-host", "gemm", ("contraction/gemm.py:gemm",), "source/pytorch/cpu_runtime.py"),
     Entry("tilegym_dense_gemm", "M8192-N11008-K4096-bf16-8cores-host", "bf16_gemm", ("contraction/gemm.py:bf16_gemm",), "source/pytorch/cpu_runtime.py"),
     Entry("batched_gemm", "B32-M512-N512-K1024-bf16-8cores-host", "batched_gemm_nn", ("contraction/batched_gemm.py:batched_gemm_nn",), "source/pytorch/cpu_runtime.py"),
