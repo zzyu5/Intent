@@ -1,7 +1,7 @@
 import intent
 import torch
 
-from kernels.convolution.direct import conv1d_same
+from kernels.convolution.direct import conv1d_same, causal_depthwise_conv1d_update
 from kernels.convolution.varlen import varlen_aligned_causal_depthwise_conv1d, varlen_causal_conv1d_final_state
 from ...loading import load_module
 from ...measurement import report_stage
@@ -49,4 +49,34 @@ def varlen_conv1d(context):
     )
 
 
-CASES = {"flaggems_conv1d": conv1d, "varlen_causal_conv1d": varlen_conv1d}
+def causal_conv_update(context):
+    x = torch.randn((64, 4096), dtype=torch.float16) * 0.1
+    initial = torch.randn((64, 4096, 4), dtype=torch.float16) * 0.1
+    weight = torch.randn((4096, 4), dtype=torch.float16) * 0.1
+    bias = torch.randn((4096,), dtype=torch.float16) * 0.1
+    report_stage("generated_compilation")
+    artifact = intent.compile(causal_depthwise_conv1d_update, target=context.target,
+                              compiler=context.compiler, tuning_config=context.tuning_config,
+                              constexprs={"SILU": True})
+    runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_reference")
+
+    def side(function):
+        state = initial.clone()
+        result = {}
+
+        def launch():
+            result["output"] = function(x, state, weight, bias)
+
+        return PreparedLaunch(launch, lambda: result["output"], prepare=lambda: state.copy_(initial))
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(
+        side(artifact.run), side(runtime.causal_conv_update),
+        (Tolerance(atol=0.0), Tolerance(atol=2e-3)),
+        cuda_graph=False, device_type="cpu", cpu_host_timing=True,
+        note="既有B64-D4096-W4 f16缓存卷积更新及SiLU；单NUMA8核，PyTorch eager同算法，完整host调用；每次恢复同一state且恢复不计时。",
+    )
+
+
+CASES = {"flaggems_conv1d": conv1d, "varlen_causal_conv1d": varlen_conv1d,
+         "causal_conv_update": causal_conv_update}

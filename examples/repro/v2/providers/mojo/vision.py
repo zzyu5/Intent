@@ -1,5 +1,7 @@
 import torch
+import torch.nn.functional as F
 
+from kernels.vision.max_pool import max_pool2d
 from kernels.vision.roi_align import roi_align_center_sample
 
 from ...model import Tolerance
@@ -23,4 +25,10 @@ def roi_align(context):
         (feature, rois), "roi_align_center_sample", Tolerance(atol=1.0e-4))
 
 
-CASES = {"roi_align_center_sample": roi_align}
+def max_pool(context):
+    x = torch.randn((8, 32, 128, 128), dtype=torch.float16)
+    return prepare_host_comparison(context, max_pool2d, (x,), "max_pool2d",
+        Tolerance(atol=0.0))
+
+
+CASES = {"roi_align_center_sample": roi_align, "max_pool2d": max_pool}

@@ -84,8 +84,7 @@ LogicalResult legalizeProgram(ModuleOp module) {
     if (failed(cpu::materializeTaskLoops(function))) return failure();
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
     if (failed(materializeRegisterContractions(function)) ||
-        failed(cpu::materializeStructuredComputations(function)) ||
-        failed(cpu::fuseIntermediateBuffers(function))) return failure();
+        failed(cpu::materializeStructuredComputations(function))) return failure();
   }
   auto normalize = [&]() {
     PassManager manager(module.getContext());
@@ -93,6 +92,9 @@ LogicalResult legalizeProgram(ModuleOp module) {
     manager.addPass(createCSEPass());
     return manager.run(module);
   };
+  if (failed(normalize())) return failure();
+  for (func::FuncOp function : module.getOps<func::FuncOp>())
+    if (failed(cpu::fuseIntermediateBuffers(function))) return failure();
   if (failed(normalize())) return failure();
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
     auto bindings = function->getAttrOfType<ArrayAttr>("intent_cpu.implementations");

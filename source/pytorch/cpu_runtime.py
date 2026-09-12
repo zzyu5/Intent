@@ -62,6 +62,47 @@ def scalar_table_lookup(labels, table):
     return table[labels.long()]
 
 
+def embedding_forward_lookup(embedding_table, indices):
+    return embedding_table[indices.long()]
+
+
+def max_pool2d(x):
+    return F.max_pool2d(x, kernel_size=3, stride=2, padding=1)
+
+
+def integer_log2_floor(values):
+    value = values.clone()
+    result = torch.zeros_like(values)
+    while bool((value > 1).any()):
+        active = value > 1
+        value = torch.where(active, torch.div(value, 2, rounding_mode="floor"), value)
+        result = result + active.to(result.dtype)
+    return result
+
+
+def cumsum(x):
+    return torch.cumsum(x, dim=1)
+
+
+def nucleus(probabilities, threshold):
+    cumulative = probabilities.cumsum(dim=1)
+    cutoff = (cumulative < threshold).sum(dim=1, dtype=torch.int32) + 1
+    return cumulative, cutoff
+
+
+def ordered_prefix(x):
+    return torch.cumsum(x.flatten(1), dim=1).reshape_as(x)
+
+
+def compact_nonzero(values):
+    flags = values != 0.0
+    prefix = flags.to(torch.int32).cumsum(dim=1, dtype=torch.int32)
+    output = torch.full_like(prefix, -1)
+    rows, columns = torch.nonzero(flags, as_tuple=True)
+    output[rows, prefix[rows, columns].long() - 1] = columns.to(torch.int32)
+    return output, flags.sum(dim=1, dtype=torch.int32)
+
+
 def csr_spmv(row_offsets, column_indices, values, vector):
     return (
         values.reshape(32768, 32)
@@ -144,6 +185,27 @@ def triangular_solve(lower, solution):
             residual = residual - lower[:, row, column] * solution[:, column]
         solution[:, row].copy_(residual / lower[:, row, row])
     return solution
+
+
+def cholesky(matrices):
+    matrices.copy_(torch.linalg.cholesky(matrices))
+    return matrices
+
+
+def householder_qr(matrices):
+    factor, tau = torch.geqrf(matrices)
+    matrices.copy_(factor)
+    return matrices, tau
+
+
+def causal_conv_update(x, state, weight, bias):
+    updated = torch.cat((state[:, :, 1:], x[:, :, None]), dim=2)
+    state.copy_(updated)
+    accumulator = bias.float()[None, :].expand(x.shape[0], -1).clone()
+    for tap in range(weight.shape[1]):
+        accumulator = accumulator + state[:, :, tap].float() * weight[:, tap].float()
+    output = (accumulator * torch.sigmoid(accumulator)).to(x.dtype)
+    return state, output
 
 
 def bitonic_sort(values):

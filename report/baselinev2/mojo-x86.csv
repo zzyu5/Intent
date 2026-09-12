@@ -1,37 +1,47 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
-varlen_causal_conv1d,U5120-D4096-W4-bf16-8cores-host,57.424201,105.660516,0.543478,pass,既有变长卷积及final-state两kernel完整调用；原长度2048/1536/1024/512、D4096、bf16、chunk64；同算法PyTorch eager CPU reference，单NUMA8核；含ABI、输出分配与同步。
-radix2_fft,B1024-N1024-fp32-complex-8cores-host,6.788357,8.708498,0.779510,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-viterbi,B64-T256-S64-fp32-8cores-host,14.427981,29.253954,0.493198,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-smith_waterman,B128-Q128-R128-i32-8cores-host,1.450775,470.877796,0.003081,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-bitonic_sort,4096x256-fp32-8cores-host,21.322966,61.245835,0.348154,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-flaggems_triangular_solve,B4096-N16-fp32-lower-8cores-host,1.784075,5.238593,0.340564,pass,既有 B4096-N16 f32 lower-triangular solve；PyTorch eager CPU reference 保持逐列有序减法；单 NUMA 8 核；双方完整 host 调用，每次恢复相同 RHS，恢复不计时。
-flaggems_conv1d,B64-L16384-K5-fp16-same-8cores-host,4.397394,1.746781,2.517426,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-swiglu,8192x14336-bf16-8cores-host,44.579537,659.456547,0.067600,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-embedding_lookup,tokens16384-vocab32768-hidden4096-bf16-8cores-host,21.112265,19.317571,1.092905,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-index_select,source65536-selected32768-hidden4096-fp16-8cores-host,39.220644,42.000270,0.933819,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-flaggems_fused_adamw,N8388608-fp32-8cores-host,21.964079,82.639246,0.265783,pass,既有 AdamW N8388608 f32；PyTorch eager CPU reference，单 NUMA 8 核；每次调用前恢复相同的 parameter/moments，恢复不计时；双方计完整 host 调用。
-dense_gemm,M4096-N14336-K4096-fp16-8cores-host,614.226229,407.328467,1.507938,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-tilegym_dense_gemm,M8192-N11008-K4096-bf16-8cores-host,874.914373,629.876627,1.389025,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-batched_gemm,B32-M512-N512-K1024-bf16-8cores-host,23.594457,33.998987,0.693975,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-fused_softmax,8192x8192-fp16-8cores-host,25.688447,160.472313,0.160080,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-chunked_softmax,8192x32768-bf16-8cores-host,101.572544,603.484248,0.168310,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-layer_norm_f16,8192x4096-fp16-8cores-host,11.091587,128.427770,0.086364,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-layer_norm_bf16,8192x4096-bf16-8cores-host,8.839343,119.342051,0.074067,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-rms_norm_f32,8192x4096-f32-8cores-host,20.804469,39.640834,0.524824,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-rms_norm_bf16,8192x4096-bf16-8cores-host,9.831196,81.682288,0.120359,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-flaggems_softmax_backward,4096x4097-fp32-8cores-host,9.866295,26.847422,0.367495,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-flaggems_transpose_copy,4093x8191-fp16-8cores-host,40.267004,51.061554,0.788597,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-gelu,8192x4096-fp16-tanh-8cores-host,11.966874,21.635796,0.553105,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-relu,8192x4096-fp16-8cores-host,9.773445,11.399792,0.857335,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-flaggems_addcmul,B64-C128-L4096-bf16-8cores-host,10.484505,22.202588,0.472220,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-flaggems_logsumexp,8192x8192-fp32-8cores-host,22.470132,50.243201,0.447227,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-scalar_table_lookup,C65536-D128-M65536-i32-f32-8cores-host,4.136016,4.869315,0.849404,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-csr_spmv,32768x32768-nnz32-fp32-8cores-host,0.409692,0.703707,0.582191,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-roi_align_center_sample,B8-C64-H128-W128-R2048-7x7-fp32-8cores-host,7.184394,45.242677,0.158797,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
-causal_attention_f32,B8-S128-D32-f32-8cores,0.250459,0.307772,0.813779,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。独立 Mojo online attention source；沿用 CPU f32 contraction 容差；分段与归约括号可不同。
-causal_linear_attention_f32,B8-S128-D32-f32-8cores,0.210153,0.237460,0.885004,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。独立 Mojo chunked linear attention source；输出包含最终状态；沿用 CPU f32 contraction 容差。
-batched_row_affine,17x257x4093-f32-8cores,1.902721,1.936592,0.982510,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU elementwise。
-weighted_rms_norm,8192x4096-f32-8cores,3.474215,3.398490,1.022282,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX RMSNorm；双方归约括号与中间数学实现可能不同。
-dense_gemm_f32,M1024-N1024-K1024-f32-8cores,3.489633,2.149286,1.623624,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU matmul，未缓存输入 packing。
-stable_softmax,8192x8192-f32-8cores,8.081428,8.147241,0.991922,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU Softmax；双方 max/exp/sum 后显式以倒数乘法归一化，归约树仍可能不同。
-weighted_layer_norm,8192x4096-f32-8cores,3.685852,3.796412,0.970878,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 使用 Modular/MAX rowwise 同矩统计算法 E[x²]-E[x]²；不是现成 Welford layer_norm。
+cholesky,B256-N16-fp32-8cores-host,1.515526,0.323950,4.678265,pass,既有batched factorization相同算法/输入规模/f32；单NUMA8核，PyTorch CPU reference写回相同InOut ABI；双方完整host调用，含内部临时量与输出分配，每次恢复输入矩阵且恢复不计时。
+householder_qr,B128-R32-C16-fp32-8cores-host,1.510343,0.668634,2.258850,pass,既有batched factorization相同算法/输入规模/f32；单NUMA8核，PyTorch CPU reference写回相同InOut ABI；双方完整host调用，含内部临时量与输出分配，每次恢复输入矩阵且恢复不计时。
+causal_conv_update,B64-D4096-W4-fp16-8cores-host,3.188378,1.177213,2.708413,pass,既有B64-D4096-W4 f16缓存卷积更新及SiLU；单NUMA8核，PyTorch eager同算法，完整host调用；每次恢复同一state且恢复不计时。
+sorted_nucleus_cutoff,1024x4093-fp32-8cores-host,5.036986,3.274653,1.538174,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+flaggems_cumsum,8192x8192-fp32-8cores-host,48.140482,40.464407,1.189699,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+ordered_prefix,512x17x31-fp32-8cores-host,0.142082,0.043126,3.294594,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+compact_nonzero,64x4096-fp32-8cores-host,0.405629,0.593674,0.683252,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+varlen_causal_conv1d,U5120-D4096-W4-bf16-8cores-host,46.812920,100.383833,0.466339,pass,既有变长卷积及final-state两kernel完整调用；原长度2048/1536/1024/512、D4096、bf16、chunk64；同算法PyTorch eager CPU reference，单NUMA8核；含ABI、输出分配与同步。
+radix2_fft,B1024-N1024-fp32-complex-8cores-host,5.387976,8.060420,0.668449,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+viterbi,B64-T256-S64-fp32-8cores-host,11.662080,20.223132,0.576670,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+smith_waterman,B128-Q128-R128-i32-8cores-host,1.431976,472.833710,0.003028,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+bitonic_sort,4096x256-fp32-8cores-host,20.266094,51.013309,0.397271,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+flaggems_triangular_solve,B4096-N16-fp32-lower-8cores-host,1.534428,3.854682,0.398069,pass,既有 B4096-N16 f32 lower-triangular solve；PyTorch eager CPU reference 保持逐列有序减法；单 NUMA 8 核；双方完整 host 调用，每次恢复相同 RHS，恢复不计时。
+flaggems_conv1d,B64-L16384-K5-fp16-same-8cores-host,1.833017,1.701385,1.077368,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+swiglu,8192x14336-bf16-8cores-host,46.566501,648.828123,0.071770,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+embedding_lookup,tokens16384-vocab32768-hidden4096-bf16-8cores-host,19.138074,18.652518,1.026032,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+embedding_lookup_f32,tokens8192-vocab8192-hidden1021-f32-8cores-host,0.841938,0.759561,1.108453,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+index_select,source65536-selected32768-hidden4096-fp16-8cores-host,36.002680,37.971482,0.948150,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+flaggems_fused_adamw,N8388608-fp32-8cores-host,11.146653,81.731486,0.136381,pass,既有 AdamW N8388608 f32；PyTorch eager CPU reference，单 NUMA 8 核；每次调用前恢复相同的 parameter/moments，恢复不计时；双方计完整 host 调用。
+dense_gemm,M4096-N14336-K4096-fp16-8cores-host,547.434761,396.954454,1.379087,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+tilegym_dense_gemm,M8192-N11008-K4096-bf16-8cores-host,789.504150,598.654484,1.318798,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+batched_gemm,B32-M512-N512-K1024-bf16-8cores-host,19.900564,34.943453,0.569508,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+fused_softmax,8192x8192-fp16-8cores-host,28.915842,157.133480,0.184021,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+chunked_softmax,8192x32768-bf16-8cores-host,78.508053,509.353788,0.154133,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+layer_norm_f16,8192x4096-fp16-8cores-host,8.843963,113.324044,0.078041,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+layer_norm_bf16,8192x4096-bf16-8cores-host,10.241055,118.806796,0.086199,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+rms_norm_f32,8192x4096-f32-8cores-host,20.666567,35.753882,0.578023,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+rms_norm_bf16,8192x4096-bf16-8cores-host,9.350093,82.032725,0.113980,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+flaggems_softmax_backward,4096x4097-fp32-8cores-host,9.565548,28.314395,0.337833,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+flaggems_transpose_copy,4093x8191-fp16-8cores-host,32.698797,47.019532,0.695430,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+gelu,8192x4096-fp16-tanh-8cores-host,11.048214,14.670446,0.753093,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+relu,8192x4096-fp16-8cores-host,8.346379,8.509220,0.980863,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+flaggems_addcmul,B64-C128-L4096-bf16-8cores-host,9.464557,19.941358,0.474620,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+flaggems_logsumexp,8192x8192-fp32-8cores-host,21.105875,49.905282,0.422919,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+scalar_table_lookup,C65536-D128-M65536-i32-f32-8cores-host,4.308828,5.016710,0.858895,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+csr_spmv,32768x32768-nnz32-fp32-8cores-host,0.409970,0.458365,0.894419,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+roi_align_center_sample,B8-C64-H128-W128-R2048-7x7-fp32-8cores-host,6.282305,38.129382,0.164763,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+max_pool2d,B8-C32-H128-W128-K3-S2-P1-fp16-8cores-host,3.187032,7.750041,0.411228,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+integer_log2_floor,N262144-i32-8cores-host,1.042333,9.984346,0.104397,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+causal_attention_f32,B8-S128-D32-f32-8cores,0.285093,0.215392,1.323604,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。独立 Mojo online attention source；沿用 CPU f32 contraction 容差；分段与归约括号可不同。
+causal_linear_attention_f32,B8-S128-D32-f32-8cores,0.086397,0.156303,0.552756,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。独立 Mojo chunked linear attention source；输出包含最终状态；沿用 CPU f32 contraction 容差。
+batched_row_affine,17x257x4093-f32-8cores,1.737575,1.369744,1.268540,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU elementwise。
+weighted_rms_norm,8192x4096-f32-8cores,3.248179,3.313623,0.980250,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX RMSNorm；双方归约括号与中间数学实现可能不同。
+dense_gemm_f32,M1024-N1024-K1024-f32-8cores,2.226767,2.156559,1.032555,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU matmul，未缓存输入 packing。
+stable_softmax,8192x8192-f32-8cores,8.126843,8.076187,1.006272,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU Softmax；双方 max/exp/sum 后显式以倒数乘法归一化，归约树仍可能不同。
+weighted_layer_norm,8192x4096-f32-8cores,3.675753,3.815182,0.963454,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 使用 Modular/MAX rowwise 同矩统计算法 E[x²]-E[x]²；不是现成 Welford layer_norm。

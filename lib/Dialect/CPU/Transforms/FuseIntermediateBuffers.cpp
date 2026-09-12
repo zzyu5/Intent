@@ -51,7 +51,7 @@ void forwardDestinations(func::FuncOp function) {
         if (auto view = dyn_cast<memref::SubViewOp>(user)) aliases.push_back(view.getResult());
         else if (auto cast = dyn_cast<memref::CastOp>(user)) aliases.push_back(cast.getResult());
         else if (!isa<memref::CopyOp, memref::DimOp, memref::LoadOp, memref::StoreOp,
-                      linalg::LinalgOp, ReduceOp, QuantizedDotOp>(user)) legal = false;
+                      linalg::LinalgOp, ReduceOp, ScanOp, QuantizedDotOp>(user)) legal = false;
         Operation *ancestor = copy->getBlock()->findAncestorOpInBlock(*user);
         if (!ancestor || (ancestor != copy && !ancestor->isBeforeInBlock(copy))) legal = false;
       }
@@ -149,11 +149,11 @@ bool fuse(memref::AllocOp allocation) {
     if (!stage) return false;
     consumers.insert(stage);
   }
-  if (consumers.size() != 1) return false;
   SmallVector<scf::ForOp> loops;
   Operation *root = store;
-  while (auto parent = dyn_cast<scf::ForOp>(root->getParentOp())) {
-    if (parent.getNumResults() || !matchPattern(parent.getLowerBound(), m_Zero()) ||
+  while (root->getBlock() != allocation->getBlock()) {
+    auto parent = dyn_cast<scf::ForOp>(root->getParentOp());
+    if (!parent || parent.getNumResults() || !matchPattern(parent.getLowerBound(), m_Zero()) ||
         !matchPattern(parent.getStep(), m_One())) return false;
     loops.push_back(parent);
     root = parent;
@@ -179,6 +179,12 @@ bool fuse(memref::AllocOp allocation) {
   if (otherEffect) return false;
   llvm::SmallPtrSet<Operation *, 16> seen;
   if (!canReplay(store.getValue(), root, seen)) return false;
+  if (consumers.size() != 1) {
+    auto integer = [](Type type) { return isa<IndexType, IntegerType>(type); };
+    if (!integer(store.getValue().getType()) || llvm::any_of(seen, [&](Operation *operation) {
+          return !isMemoryEffectFree(operation) || !llvm::all_of(operation->getResultTypes(), integer);
+        })) return false;
+  }
   auto function = allocation->getParentOfType<func::FuncOp>();
   for (Operation *operation : seen)
     if (auto read = dyn_cast<memref::LoadOp>(operation); read && !stableRead(read, root, function)) return false;

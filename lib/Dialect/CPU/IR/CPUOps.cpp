@@ -64,6 +64,38 @@ LogicalResult ReduceOp::verify() {
   return success();
 }
 
+LogicalResult ScanOp::verify() {
+  unsigned count = getSources().size();
+  if (!count || getInitials().size() != count || getOutputs().size() != count ||
+      !llvm::hasSingleElement(getCombine()))
+    return emitOpError("scan requires matching sources, scalar identities and destinations");
+  auto first = cast<MemRefType>(getSources()[0].getType());
+  if (getAxis() >= static_cast<uint64_t>(first.getRank()))
+    return emitOpError("scan axis is outside its source rank");
+  SmallVector<Type> elements;
+  for (auto [source, initial, output] : llvm::zip(getSources(), getInitials(), getOutputs())) {
+    auto inputType = cast<MemRefType>(source.getType()), outputType = cast<MemRefType>(output.getType());
+    if (inputType.getShape() != first.getShape() || outputType.getShape() != inputType.getShape() ||
+        inputType.getElementType() != initial.getType() || outputType.getElementType() != initial.getType())
+      return emitOpError("scan components must preserve a common shape and their scalar accumulator dtypes");
+    elements.push_back(initial.getType());
+  }
+  SmallVector<Type> arguments(elements);
+  llvm::append_range(arguments, elements);
+  llvm::append_range(arguments, getCaptures().getTypes());
+  Block &body = getCombine().front();
+  auto yield = body.empty() ? ScanYieldOp() : dyn_cast<ScanYieldOp>(body.getTerminator());
+  if (!yield || !llvm::equal(body.getArgumentTypes(), arguments) || !llvm::equal(yield.getOperandTypes(), elements))
+    return emitOpError("scan combine must accept two accumulator tuples and captures, then yield one tuple");
+  for (Value capture : getCaptures())
+    if (!isa<IntegerType, IndexType, FloatType>(capture.getType()))
+      return emitOpError("scalar scan captures must be numeric scalars");
+  for (Operation &operation : body.without_terminator())
+    if (operation.getNumRegions() || !isMemoryEffectFree(&operation))
+      return emitOpError("scalar scan combine must be a closed pure expression");
+  return success();
+}
+
 namespace {
 bool recordType(Type type, int64_t bytes) {
   auto memory = dyn_cast<MemRefType>(type);

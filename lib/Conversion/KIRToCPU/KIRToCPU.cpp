@@ -812,6 +812,48 @@ private:
     return status;
   }
 
+  LogicalResult scan(ScanOp operation) {
+    int64_t count = operation.getSourceCount();
+    auto inputs = operation.getInputs();
+    auto first = cast<RankedTensorType>(inputs[0].getType());
+    SmallVector<Value> sources, initials, captures, outputs;
+    for (int64_t component = 0; component < count; ++component) {
+      auto type = cast<RankedTensorType>(inputs[component].getType());
+      if (type.getShape() != first.getShape() || type.getEncoding() != first.getEncoding() ||
+          inputs[count + component].getType() != type.getElementType())
+        return operation.emitError("CPU scalar scan requires matching logical source axes and scalar identities; slice-valued combines are not implemented");
+      sources.push_back(values.lookup(inputs[component]));
+      initials.push_back(values.lookup(inputs[count + component]));
+      auto sizes = extents(type, operation.getLoc());
+      if (failed(sizes)) return failure();
+      outputs.push_back(allocate(type, *sizes, operation.getLoc()));
+    }
+    for (Value input : inputs.drop_front(count * 2)) {
+      Value capture = values.lookup(input);
+      if (!isa<IntegerType, IndexType, FloatType>(capture.getType()))
+        return operation.emitError("CPU scalar scan requires scalar captures");
+      captures.push_back(capture);
+    }
+    auto target = builder.create<cpu::ScanOp>(operation.getLoc(), sources, initials, captures, outputs,
+        operation.getAxis(), operation.getInclusive(), operation.getReverse());
+    Block &source = operation.getCombine().front();
+    Block *body = &target.getCombine().emplaceBlock();
+    for (BlockArgument argument : source.getArguments()) {
+      auto mapped = body->addArgument(argument.getType(), operation.getLoc());
+      values.map(argument, mapped);
+    }
+    {
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(body);
+      if (failed(lowerBlock(source))) return failure();
+      SmallVector<Value> yielded;
+      for (Value value : source.getTerminator()->getOperands()) yielded.push_back(values.lookup(value));
+      builder.create<cpu::ScanYieldOp>(operation.getLoc(), yielded);
+    }
+    for (auto [result, output] : llvm::zip(operation.getResults(), outputs)) values.map(result, output);
+    return success();
+  }
+
   LogicalResult reduce(ReduceOp operation) {
     auto first = dyn_cast<MemRefType>(flattened(operation.getInputs()[0]).front().getType());
     if (operation.getSourceCount() != 1 || operation.getIdentityCount() != 1 ||
@@ -1224,18 +1266,27 @@ private:
       builder.create<linalg::FillOp>(loc, ValueRange{values.lookup(op.getInputs()[0])}, ValueRange{output});
       values.map(op.getResult(), output);
     } else if (auto op = dyn_cast<IndicesOp>(operation)) {
-      if (!domains.count(op.getSource()) || op.getTensorAxis())
-        return op.emitError("CPU indices requires an explicit one-dimensional domain");
-      Domain domain = domains.lookup(op.getSource());
       auto type = cast<RankedTensorType>(op.getResult().getType());
-      Value output = allocate(type, {domain.extent}, loc);
+      auto sizes = extents(type, loc);
+      if (failed(sizes)) return failure();
+      Value begin = constant(loc, 0), step = constant(loc, 1);
+      int64_t axis = 0;
+      if (op.getTensorAxis()) {
+        axis = *op.getTensorAxis();
+      } else {
+        if (!domains.count(op.getSource()))
+          return op.emitError("CPU indices requires a realized source domain or a tensor axis");
+        Domain domain = domains.lookup(op.getSource());
+        begin = domain.begin; step = domain.step;
+      }
+      Value output = allocate(type, *sizes, loc);
       builder.create<linalg::GenericOp>(loc, ValueRange{}, ValueRange{output},
-          SmallVector<AffineMap>{builder.getMultiDimIdentityMap(1)},
-          SmallVector<utils::IteratorType>{utils::IteratorType::parallel},
+          SmallVector<AffineMap>{builder.getMultiDimIdentityMap(type.getRank())},
+          SmallVector<utils::IteratorType>(type.getRank(), utils::IteratorType::parallel),
           [&](OpBuilder &nested, Location location, ValueRange) {
-            Value coordinate = nested.create<linalg::IndexOp>(location, 0);
-            coordinate = nested.createOrFold<arith::AddIOp>(location, domain.begin,
-                nested.createOrFold<arith::MulIOp>(location, coordinate, domain.step));
+            Value coordinate = nested.create<linalg::IndexOp>(location, axis);
+            coordinate = nested.createOrFold<arith::AddIOp>(location, begin,
+                nested.createOrFold<arith::MulIOp>(location, coordinate, step));
             if (!type.getElementType().isIndex()) coordinate = nested.create<arith::IndexCastOp>(location, type.getElementType(), coordinate);
             nested.create<linalg::YieldOp>(location, coordinate);
           });
@@ -1296,6 +1347,8 @@ private:
       bindProduct(op.getResult(), ValueRange(products.at(op.getProduct())).slice(offset, leaves.size()));
     } else if (isa<RegionFoldOp, RegionScanOp>(operation)) {
       return region(operation);
+    } else if (auto op = dyn_cast<ScanOp>(operation)) {
+      return scan(op);
     } else if (auto op = dyn_cast<ReduceOp>(operation)) {
       return reduce(op);
     } else if (auto op = dyn_cast<QuantizeOp>(operation)) {

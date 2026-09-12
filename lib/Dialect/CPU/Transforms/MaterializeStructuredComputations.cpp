@@ -102,12 +102,57 @@ LogicalResult materialize(ReduceOp operation) {
   return success();
 }
 
+LogicalResult materialize(ScanOp operation) {
+  OpBuilder b(operation);
+  Location loc = operation.getLoc();
+  auto type = cast<MemRefType>(operation.getSources()[0].getType());
+  int64_t scanAxis = operation.getAxis();
+  SmallVector<Value> sizes, position(type.getRank());
+  for (int64_t axis = 0; axis < type.getRank(); ++axis)
+    sizes.push_back(b.create<memref::DimOp>(loc, operation.getSources()[0], axis));
+  std::function<void(int64_t)> traverse = [&](int64_t axis) {
+    if (axis != type.getRank()) {
+      if (axis == scanAxis) { traverse(axis + 1); return; }
+      loop(b, loc, index(b, loc, 0), sizes[axis], 1, [&](Value coordinate) {
+        position[axis] = coordinate;
+        traverse(axis + 1);
+      });
+      return;
+    }
+    Value extent = sizes[operation.getAxis()];
+    auto scan = b.create<scf::ForOp>(loc, index(b, loc, 0), extent, index(b, loc, 1), operation.getInitials());
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(scan.getBody());
+    Value coordinate = scan.getInductionVar();
+    if (operation.getReverse()) coordinate = b.create<arith::SubIOp>(loc,
+        b.create<arith::SubIOp>(loc, extent, index(b, loc, 1)), coordinate);
+    position[operation.getAxis()] = coordinate;
+    Block &combine = operation.getCombine().front();
+    IRMapping mapping;
+    unsigned component = 0;
+    for (Value carry : scan.getRegionIterArgs()) mapping.map(combine.getArgument(component++), carry);
+    for (Value source : operation.getSources())
+      mapping.map(combine.getArgument(component++), b.create<memref::LoadOp>(loc, source, position));
+    for (Value capture : operation.getCaptures()) mapping.map(combine.getArgument(component++), capture);
+    for (Operation &instruction : combine.without_terminator()) b.clone(instruction, mapping);
+    SmallVector<Value> next;
+    for (Value value : combine.getTerminator()->getOperands()) next.push_back(mapping.lookupOrDefault(value));
+    ValueRange output = operation.getInclusive() ? ValueRange(next) : ValueRange(scan.getRegionIterArgs());
+    for (auto [value, destination] : llvm::zip(output, operation.getOutputs()))
+      b.create<memref::StoreOp>(loc, value, destination, position);
+    b.create<scf::YieldOp>(loc, next);
+  };
+  traverse(0);
+  operation.erase();
+  return success();
+}
+
 }
 
 LogicalResult materializeStructuredComputations(func::FuncOp function) {
   SmallVector<Operation *> operations;
   function.walk([&](Operation *operation) {
-    if (isa<linalg::GenericOp, linalg::FillOp, ReduceOp>(operation)) operations.push_back(operation);
+    if (isa<linalg::GenericOp, linalg::FillOp, ReduceOp, ScanOp>(operation)) operations.push_back(operation);
   });
   for (Operation *operation : operations) {
     if (auto fill = dyn_cast<linalg::FillOp>(operation)) {
@@ -125,6 +170,8 @@ LogicalResult materializeStructuredComputations(func::FuncOp function) {
       if (failed(materialize(generic))) return failure();
     } else if (auto generic = dyn_cast<linalg::GenericOp>(operation)) {
       if (failed(materialize(generic))) return failure();
+    } else if (auto scan = dyn_cast<ScanOp>(operation)) {
+      if (failed(materialize(scan))) return failure();
     } else if (failed(materialize(cast<ReduceOp>(operation)))) return failure();
   }
   return success();

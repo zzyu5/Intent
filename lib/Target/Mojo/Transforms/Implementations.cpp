@@ -183,7 +183,7 @@ cpu::ImplementationRegistry implementations() {
   result.add(std::move(contraction));
   result.add({"mojo.vector", [](Operation *op) {
       if (auto generic = dyn_cast<linalg::GenericOp>(op)) return !isMatrixContraction(generic);
-      return isa<cpu::ReduceOp, func::FuncOp>(op);
+      return isa<cpu::ReduceOp, cpu::ScanOp, func::FuncOp>(op);
     }, vectorLegal, parameters, {}, {}});
   return result;
 }

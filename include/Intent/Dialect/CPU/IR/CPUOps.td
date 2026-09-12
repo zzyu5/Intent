@@ -36,6 +36,21 @@ def IntentCPU_YieldOp : IntentCPU_Op<"yield", [Pure, Terminator,
   let arguments = (ins AnyFloat:$value);
 }
 
+def IntentCPU_ScanOp : IntentCPU_Op<"scan", [SingleBlock, AttrSizedOperandSegments]> {
+  let summary = "Ordered prefixes over a source axis with a typed scalar combine";
+  let arguments = (ins Arg<Variadic<AnyMemRef>, "", [MemRead]>:$sources,
+      Variadic<AnyType>:$initials, Variadic<AnyType>:$captures,
+      Arg<Variadic<AnyMemRef>, "", [MemWrite]>:$outputs,
+      I64Attr:$axis, BoolAttr:$inclusive, BoolAttr:$reverse);
+  let regions = (region AnyRegion:$combine);
+  let hasVerifier = 1;
+}
+
+def IntentCPU_ScanYieldOp : IntentCPU_Op<"scan_yield", [Pure, Terminator,
+    HasParent<"ScanOp">]> {
+  let arguments = (ins Variadic<AnyType>:$values);
+}
+
 def IntentCPU_QuantizeOp : IntentCPU_Op<"quantize"> {
   let summary = "Quantize complete records into invocation-owned storage";
   let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$input,

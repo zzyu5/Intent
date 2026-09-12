@@ -112,6 +112,9 @@ SmallVector<MemoryAccess> PhysicalProgramAnalysis::accesses(Operation *scope) {
         add(output.get(), generic.payloadUsesValueFromOperand(&output), true);
     } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
       for (Value input : reduce.getInputs()) add(input, true, false);
+    } else if (auto scan = dyn_cast<ScanOp>(operation)) {
+      for (Value input : scan.getSources()) add(input, true, false);
+      for (Value output : scan.getOutputs()) add(output, false, true);
     } else if (isa<RegionFoldOp, RegionScanOp>(operation)) {
       RegionProgram program(operation);
       for (Value input : program.sources()) add(input, true, false);
@@ -156,6 +159,7 @@ SmallVector<AllocationFacts> PhysicalProgramAnalysis::allocations() {
       else if (auto copy = dyn_cast<memref::CopyOp>(user)) writes = copy.getTarget() == value;
       else if (auto quantize = dyn_cast<QuantizeOp>(user)) writes = quantize.getOutput() == value;
       else if (auto dot = dyn_cast<QuantizedDotOp>(user)) writes = dot.getOutput() == value;
+      else if (auto scan = dyn_cast<ScanOp>(user)) writes = llvm::is_contained(scan.getOutputs(), value);
       else if (!isa<memref::LoadOp, memref::DimOp, memref::DeallocOp, ReduceOp, QuantizedDotOp>(user))
         multiple = true;
       if (writes) {
@@ -215,7 +219,7 @@ LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
     }
   }
   function.walk([&](Operation *operation) {
-    if (realized && (isa<RegionFoldOp, RegionScanOp, ReduceOp, QuantizeOp, QuantizedDotOp>(operation) || operation->getName().getDialectNamespace() == "linalg")) {
+    if (realized && (isa<RegionFoldOp, RegionScanOp, ReduceOp, ScanOp, QuantizeOp, QuantizedDotOp>(operation) || operation->getName().getDialectNamespace() == "linalg")) {
       operation->emitError("CPU structured operation has not been materialized for the provider");
       invalid = true;
     }
