@@ -1336,7 +1336,7 @@ FailureOr<Type> convertReductionResultType(Type logical, Operation *origin,
       ArrayAttr::get(logical.getContext(), shape),
       ArrayAttr::get(logical.getContext(), mappings), sourceType.getValidity(),
       sourceType.getOwner());
-  return convertDataType(logical, origin, Type(prototype), 1, resultIndex);
+  return Type(prototype);
 }
 
 FailureOr<Type> convertContractResultType(
