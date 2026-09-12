@@ -22,6 +22,8 @@ using namespace mlir;
 namespace intent::gpu {
 namespace {
 
+constexpr int64_t contractionReductionCandidates[] = {32, 64, 128};
+
 PhysicalExprAttr expression(MLIRContext *context, PhysicalExprKind kind,
                             int64_t value = 0, StringRef symbol = {},
                             ArrayRef<Attribute> operands = {}) {
@@ -195,6 +197,8 @@ bool hasUnrealizedPhysicalAxis(Value value) {
   return false;
 }
 
+bool fullStaticReductionNeedsTraversal(ContractOp contract);
+
 bool requiresPhysicalRealization(ContractOp contract) {
   for (FragmentType type : {contract.getLhs().getType(),
                             contract.getRhs().getType(),
@@ -209,7 +213,8 @@ bool requiresPhysicalRealization(ContractOp contract) {
       reductionUsesOwnershipExtent(contract, contract.getRhs(),
                                    contract.getRhsReductionAxes()))
     return true;
-  return hasUnrealizedPhysicalAxis(contract.getLhs()) ||
+  return fullStaticReductionNeedsTraversal(contract) ||
+         hasUnrealizedPhysicalAxis(contract.getLhs()) ||
          hasUnrealizedPhysicalAxis(contract.getRhs());
 }
 
@@ -1736,7 +1741,8 @@ bool reductionAxesNeedTraversal(ContractOp contract, func::FuncOp kernel) {
   return operandNeedsTraversal(contract.getLhs(),
                                contract.getLhsReductionAxes()) ||
          operandNeedsTraversal(contract.getRhs(),
-                               contract.getRhsReductionAxes());
+                               contract.getRhsReductionAxes()) ||
+         fullStaticReductionNeedsTraversal(contract);
 }
 
 bool hasCompleteStorePath(ContractOp contract) {
@@ -2369,7 +2375,8 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
   ParameterOp blockK = getOrCreatePhysicalParameter(
       kernel, "BLOCK_K" + suffix, ParameterRole::Reduction,
       ParameterCategory::Contraction,
-      lhsType.getElementType().getIntOrFloatBitWidth(), {32, 64, 128});
+      lhsType.getElementType().getIntOrFloatBitWidth(),
+      contractionReductionCandidates);
   if (!blockK)
     return failure();
   FailureOr<int64_t> lhsDimension = queryRangeDimension(lhsRange);
@@ -2504,6 +2511,57 @@ bool canReplayContractionReads(ContractOp contract) {
     llvm::append_range(pending, producer->getOperands());
   }
   return true;
+}
+
+bool fullStaticReductionNeedsTraversal(ContractOp contract) {
+  if (contract.getLhsReductionAxes().size() != 1 ||
+      contract.getRhsReductionAxes().size() != 1)
+    return false;
+  auto integer = [](Value value) -> std::optional<int64_t> {
+    FailureOr<Value> scalar = scalarSource(value);
+    if (failed(scalar))
+      return std::nullopt;
+    if (auto constant = scalar->getDefiningOp<arith::ConstantOp>())
+      if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
+        return integer.getInt();
+    if (auto physical = scalar->getDefiningOp<PhysicalExprOp>();
+        physical && physical.getExpression().getKind() ==
+                        static_cast<uint32_t>(PhysicalExprKind::Constant))
+      return physical.getExpression().getValue();
+    return std::nullopt;
+  };
+  auto kernel = contract->getParentOfType<func::FuncOp>();
+  PhysicalProgramAnalysis analysis(kernel);
+  int64_t largestTile = *std::max_element(
+      std::begin(contractionReductionCandidates),
+      std::end(contractionReductionCandidates));
+  for (auto [operand, axis] :
+       {std::pair<Value, int64_t>{contract.getLhs(),
+                                  contract.getLhsReductionAxes().front()},
+        std::pair<Value, int64_t>{contract.getRhs(),
+                                  contract.getRhsReductionAxes().front()}}) {
+    auto type = cast<FragmentType>(operand.getType());
+    auto extent = cast<PhysicalExprAttr>(type.getShape()[axis]);
+    if (extent.getKind() !=
+            static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+        extent.getValue() <= largestTile)
+      return false;
+    PhysicalRangeFact ranges = analysis.axisRanges(operand, axis);
+    if (!ranges.unitStep || failed(queryExactLogicalRange(ranges)))
+      return false;
+    for (MakeRangeOp range : ranges.roots) {
+      auto begin = integer(range.getLogicalStart());
+      auto end = integer(range.getLogicalStop());
+      if (!begin || !end || integer(range.getExtent()) != extent.getValue() ||
+          !samePhysicalScalarExpression(range.getStart(),
+                                        range.getLogicalStart()) ||
+          static_cast<__int128>(*end) - *begin != extent.getValue())
+        return false;
+    }
+  }
+  // A static logical extent does not select a hardware reduction tile.
+  // Only retile a complete range here; an existing segment retains its bounds.
+  return canReplayContractionReads(contract);
 }
 
 FailureOr<bool> realizeFullResultTraversal(
@@ -3224,7 +3282,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       contractionCategory,
       std::max(lhsType.getElementType().getIntOrFloatBitWidth(),
                rhsType.getElementType().getIntOrFloatBitWidth()),
-      {32, 64, 128});
+      contractionReductionCandidates);
   if (!blockM || !blockN || !blockK)
     return failure();
   FailureOr<unsigned> existingRowAxis =
