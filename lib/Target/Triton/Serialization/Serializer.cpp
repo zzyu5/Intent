@@ -799,6 +799,7 @@ private:
 
   void emitBlock(Block &block, bool isLoop,
                  ArrayRef<std::string> loopResults) {
+    auto begin = output.tell();
     for (Operation &operation : block) {
       if (auto yield = dyn_cast<scf::YieldOp>(operation)) {
         if (isLoop || !loopResults.empty())
@@ -810,6 +811,8 @@ private:
         continue;
       emitOperation(operation);
     }
+    if (output.tell() == begin)
+      line("pass");
   }
 
   void emitOperation(Operation &operation) {
