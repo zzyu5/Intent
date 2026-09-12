@@ -36,8 +36,15 @@ public:
       return source.emitError("CPU construction requires canonical parameter metadata");
     SmallVector<Type> types;
     SmallVector<Attribute> interface;
+    SmallVector<Value> runtimeArguments;
     for (auto [i, argument] : llvm::enumerate(source.getArguments())) {
       auto parameter = cast<ParameterAttr>(parameters[i]);
+      if (parameter.getKind() == 2) {
+        if (!isa<ConstexprType>(argument.getType()) || !argument.use_empty())
+          return source.emitError("CPU physical ABI requires fully specialized constexpr parameters");
+        continue;
+      }
+      runtimeArguments.push_back(argument);
       if (auto view = dyn_cast<ViewType>(argument.getType())) {
         auto tensor = cast<RankedTensorType>(view.getTensor());
         Type element = tensor.getElementType();
@@ -89,7 +96,7 @@ public:
         builder.getContext(), builder.getArrayAttr(interface), true, true));
     function.addEntryBlock();
     builder.setInsertionPointToStart(&function.front());
-    for (auto [oldValue, newValue] : llvm::zip(source.getArguments(), function.getArguments())) {
+    for (auto [oldValue, newValue] : llvm::zip(runtimeArguments, function.getArguments())) {
       values.map(oldValue, newValue);
       if (auto view = dyn_cast<ViewType>(oldValue.getType())) {
         auto type = cast<RankedTensorType>(view.getTensor());
@@ -728,22 +735,29 @@ private:
     auto rhsType = cast<RankedTensorType>(operation.getRhs().getType());
     auto resultType = cast<RankedTensorType>(operation.getResult().getType());
     auto pairs = operation.getReduce();
-    bool floating = lhsType.getElementType().isF32() && rhsType.getElementType().isF32() &&
-        resultType.getElementType().isF32();
+    Type inputElement = lhsType.getElementType(), accumulator = resultType.getElementType();
+    bool floating = isa<FloatType>(inputElement) && inputElement == rhsType.getElementType() &&
+        (accumulator.isF32() || accumulator.isF64()) &&
+        inputElement.getIntOrFloatBitWidth() <= accumulator.getIntOrFloatBitWidth();
     bool integer = lhsType.getElementType().isSignlessInteger(8) && rhsType.getElementType().isSignlessInteger(8) &&
         resultType.getElementType().isSignlessInteger(32);
-    if (lhsType.getRank() != 2 || rhsType.getRank() != 2 || pairs.size() != 1 ||
-        !operation.getBatch().empty() ||
-        cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[0]).getInt() != 1 ||
-        cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[1]).getInt() != 0 ||
+    int64_t batchRank = operation.getBatch().size();
+    if (lhsType.getRank() != batchRank + 2 || rhsType.getRank() != batchRank + 2 || pairs.size() != 1 ||
+        cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[0]).getInt() != batchRank + 1 ||
+        cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[1]).getInt() != batchRank ||
         (!floating && !integer))
-      return operation.emitError("CPU construction supports ordinary rank-two f32 or i8 to i32 contraction");
+      return operation.emitError("CPU construction requires a matrix contraction with lossless floating widening or i8 to i32 accumulation");
+    for (auto [axis, pair] : llvm::enumerate(operation.getBatch())) {
+      auto relation = cast<ArrayAttr>(pair);
+      if (cast<IntegerAttr>(relation[0]).getInt() != static_cast<int64_t>(axis) ||
+          cast<IntegerAttr>(relation[1]).getInt() != static_cast<int64_t>(axis))
+        return operation.emitError("CPU contraction batch axes must form a shared leading domain");
+    }
     Location loc = operation.getLoc();
     auto sizes = extents(resultType, loc);
     if (failed(sizes)) return failure();
     Value output = allocate(resultType, *sizes, loc);
     Value zero = builder.create<arith::ConstantOp>(loc, builder.getZeroAttr(resultType.getElementType()));
-    builder.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{output});
     AffineExpr m, n, k;
     bindDims(builder.getContext(), m, n, k);
     SmallVector<AffineMap> maps = {
@@ -753,20 +767,52 @@ private:
     SmallVector<utils::IteratorType> iterators = {
         utils::IteratorType::parallel, utils::IteratorType::parallel,
         utils::IteratorType::reduction};
-    builder.create<linalg::GenericOp>(loc,
-        ValueRange{values.lookup(operation.getLhs()), values.lookup(operation.getRhs())},
-        ValueRange{output}, maps, iterators,
+    auto matrix = [&](Value lhs, Value rhs, Value destination) {
+      builder.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{destination});
+      builder.create<linalg::GenericOp>(loc, ValueRange{lhs, rhs}, ValueRange{destination}, maps, iterators,
         [](OpBuilder &b, Location loc, ValueRange arguments) {
           Value value;
-          if (arguments[2].getType().isF32())
-            value = b.create<math::FmaOp>(loc, arguments[0], arguments[1], arguments[2]);
-          else {
+          if (isa<FloatType>(arguments[2].getType())) {
+            Value lhs = arguments[0], rhs = arguments[1];
+            if (lhs.getType() != arguments[2].getType()) lhs = b.create<arith::ExtFOp>(loc, arguments[2].getType(), lhs);
+            if (rhs.getType() != arguments[2].getType()) rhs = b.create<arith::ExtFOp>(loc, arguments[2].getType(), rhs);
+            value = b.create<math::FmaOp>(loc, lhs, rhs, arguments[2]);
+          } else {
             Value lhs = b.create<arith::ExtSIOp>(loc, arguments[2].getType(), arguments[0]);
             Value rhs = b.create<arith::ExtSIOp>(loc, arguments[2].getType(), arguments[1]);
             value = b.create<arith::AddIOp>(loc, b.create<arith::MulIOp>(loc, lhs, rhs), arguments[2]);
           }
           b.create<linalg::YieldOp>(loc, value);
         });
+    };
+    Value lhs = values.lookup(operation.getLhs()), rhs = values.lookup(operation.getRhs());
+    if (!batchRank) matrix(lhs, rhs, output);
+    else {
+      SmallVector<Value> begins(batchRank, constant(loc, 0)), steps(batchRank, constant(loc, 1)), ends;
+      for (int64_t axis = 0; axis < batchRank; ++axis)
+        ends.push_back(builder.create<memref::DimOp>(loc, lhs, axis));
+      auto batches = builder.create<scf::ParallelOp>(loc, begins, ends, steps);
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(batches.getBody());
+      auto slice = [&](Value source) -> Value {
+        auto type = cast<MemRefType>(source.getType());
+        SmallVector<OpFoldResult> offsets, extents, strides(type.getRank(), builder.getIndexAttr(1));
+        for (Value coordinate : batches.getInductionVars()) {
+          offsets.push_back(coordinate);
+          extents.push_back(builder.getIndexAttr(1));
+        }
+        for (int64_t axis = batchRank; axis < type.getRank(); ++axis) {
+          offsets.push_back(builder.getIndexAttr(0));
+          extents.push_back(type.isDynamicDim(axis)
+              ? OpFoldResult(builder.create<memref::DimOp>(loc, source, axis).getResult())
+              : builder.getIndexAttr(type.getDimSize(axis)));
+        }
+        auto result = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
+            type.getShape().take_back(2), type, offsets, extents, strides));
+        return builder.create<memref::SubViewOp>(loc, result, source, offsets, extents, strides);
+      };
+      matrix(slice(lhs), slice(rhs), slice(output));
+    }
     values.map(operation.getResult(), output);
     return success();
   }

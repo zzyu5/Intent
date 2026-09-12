@@ -49,3 +49,7 @@ def softmax_backward(probabilities, upstream):
 
 def transpose(x):
     return x.T.contiguous()
+
+
+def matmul(a, b):
+    return torch.matmul(a.float(), b.float()).to(a.dtype)

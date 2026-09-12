@@ -154,6 +154,9 @@ TILELANG = (
 
 
 MOJO = (
+    Entry("dense_gemm", "M4096-N14336-K4096-fp16-8cores-host", "gemm", ("contraction/gemm.py:gemm",), "source/pytorch/cpu_runtime.py"),
+    Entry("tilegym_dense_gemm", "M8192-N11008-K4096-bf16-8cores-host", "bf16_gemm", ("contraction/gemm.py:bf16_gemm",), "source/pytorch/cpu_runtime.py"),
+    Entry("batched_gemm", "B32-M512-N512-K1024-bf16-8cores-host", "batched_gemm_nn", ("contraction/batched_gemm.py:batched_gemm_nn",), "source/pytorch/cpu_runtime.py"),
     Entry("fused_softmax", "8192x8192-fp16-8cores-host", "stable_softmax_f16", ("normalization/softmax.py:stable_softmax_f16",), "source/pytorch/cpu_runtime.py"),
     Entry("chunked_softmax", "8192x32768-bf16-8cores-host", "chunked_softmax_bf16", ("normalization/softmax.py:chunked_softmax_bf16",), "source/pytorch/cpu_runtime.py"),
     Entry("layer_norm_f16", "8192x4096-fp16-8cores-host", "layer_norm_f16", ("normalization/layer_norm.py:layer_norm_f16",), "source/pytorch/cpu_runtime.py"),

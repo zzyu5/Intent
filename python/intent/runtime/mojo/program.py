@@ -26,6 +26,23 @@ def _timing_samples(measure, arguments: tuple[object, ...], *, samples: int) -> 
     return statistics.median(measure(*arguments, repetitions) for _ in range(samples))
 
 
+def _measure_candidates(measurements, arguments: tuple[object, ...]) -> tuple[float, ...]:
+    probes = [measure(*arguments, 1) for measure in measurements]
+    if any(elapsed <= 0 for elapsed in probes):
+        raise RuntimeError("native monotonic timing returned a non-positive duration")
+    repetitions = [min(50, max(1, int(10.0 / elapsed))) for elapsed in probes]
+    samples = [[] for _ in measurements]
+    for round_index in range(3):
+        order = list(range(len(measurements)))
+        if round_index == 1:
+            order.reverse()
+        elif round_index == 2:
+            order = order[1:] + order[:1]
+        for candidate in order:
+            samples[candidate].append(measurements[candidate](*arguments, repetitions[candidate]))
+    return tuple(statistics.median(values) for values in samples)
+
+
 @dataclass
 class NativeCall:
     program: NativeProgram
@@ -39,8 +56,7 @@ class NativeCall:
         if self.winner is not None:
             return self.winner
         if self.key not in self.program.winners:
-            timings = tuple(_timing_samples(measure, self.native_arguments, samples=3)
-                            for measure in self.program.measurements)
+            timings = _measure_candidates(self.program.measurements, self.native_arguments)
             self.program.winners[self.key] = min(range(len(timings)), key=timings.__getitem__)
             self.program.timings[self.key] = timings
         self.winner = self.program.winners[self.key]

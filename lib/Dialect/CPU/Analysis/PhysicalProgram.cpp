@@ -28,9 +28,19 @@ bool isMatrixContraction(linalg::GenericOp operation) {
           utils::IteratorType::reduction}) return false;
   Block &body = operation.getRegion().front();
   auto fma = body.getTerminator()->getOperand(0).getDefiningOp<math::FmaOp>();
-  if (fma)
-    return llvm::hasSingleElement(body.without_terminator()) && fma.getA() == body.getArgument(0) &&
-        fma.getB() == body.getArgument(1) && fma.getC() == body.getArgument(2);
+  if (fma) {
+    if (fma.getC() != body.getArgument(2)) return false;
+    llvm::SmallPtrSet<Operation *, 4> computation{fma};
+    auto input = [&](Value value, Value argument) {
+      if (value == argument) return true;
+      auto widen = value.getDefiningOp<arith::ExtFOp>();
+      if (!widen || widen.getIn() != argument || widen.getType() != fma.getType()) return false;
+      computation.insert(widen);
+      return true;
+    };
+    return input(fma.getA(), body.getArgument(0)) && input(fma.getB(), body.getArgument(1)) &&
+        computation.size() == static_cast<size_t>(std::distance(body.begin(), body.end()) - 1);
+  }
   auto add = body.getTerminator()->getOperand(0).getDefiningOp<arith::AddIOp>();
   if (!add || !body.getArgument(0).getType().isSignlessInteger(8) ||
       !body.getArgument(1).getType().isSignlessInteger(8) ||

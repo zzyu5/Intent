@@ -53,14 +53,18 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
         {tile.depth, b.getIndexAttr(columns)});
     Value out = subview(b, loc, tile.output, {m, add(b, loc, tile.nBegin, n)},
         {b.getIndexAttr(rows), b.getIndexAttr(columns)});
-    auto partial = b.create<memref::AllocaOp>(loc, MemRefType::get({rows, columns}, b.getF32Type()));
-    partial.setAlignment(width * 4);
+    Type accumulator = cast<MemRefType>(tile.output.getType()).getElementType();
+    auto partial = b.create<memref::AllocaOp>(loc, MemRefType::get({rows, columns}, accumulator));
+    partial.setAlignment(width * accumulator.getIntOrFloatBitWidth() / 8);
     b.create<linalg::FillOp>(loc, ValueRange{tile.initial}, ValueRange{partial});
     auto contract = b.create<linalg::GenericOp>(loc, ValueRange{left, right}, ValueRange{partial},
         operation.getIndexingMapsArray(), operation.getIteratorTypesArray(),
-        [](OpBuilder &nested, Location loc, ValueRange arguments) {
-          Value value = nested.create<math::FmaOp>(loc, arguments[0], arguments[1], arguments[2]);
-          nested.create<linalg::YieldOp>(loc, value);
+        [&](OpBuilder &nested, Location loc, ValueRange arguments) {
+          IRMapping mapping;
+          Block &body = operation.getRegion().front();
+          mapping.map(body.getArguments(), arguments);
+          for (Operation &op : body.without_terminator()) nested.clone(op, mapping);
+          nested.create<linalg::YieldOp>(loc, mapping.lookup(body.getTerminator()->getOperand(0)));
         });
     contract->setAttr("intent_cpu.implementation", binding);
     contract->setAttr("intent_cpu.microtile", MicrotileAttr::get(b.getContext(), rows, columns, width));
@@ -136,40 +140,44 @@ cpu::ImplementationRegistry implementations() {
     bool contraction = false, region = false;
     function.walk([&](linalg::GenericOp op) { contraction |= isMatrixContraction(op); });
     function.walk([&](Operation *op) { region |= isa<cpu::RegionFoldOp, cpu::RegionScanOp>(op); });
-    if (region) return contraction ? "mojo.region_contract_f32" : "mojo.region_vector";
-    return contraction ? "mojo.register_f32" : "mojo.vector";
+    if (region) return contraction ? "mojo.region_contract_float" : "mojo.region_vector";
+    return contraction ? "mojo.register_float" : "mojo.vector";
   };
-  Implementation contraction{"mojo.register_f32", [](Operation *op) {
+  Implementation contraction{"mojo.register_float", [](Operation *op) {
       auto generic = dyn_cast<linalg::GenericOp>(op);
       return generic && isMatrixContraction(generic) &&
-          cast<MemRefType>(generic.getInputs()[0].getType()).getElementType().isF32();
+          isa<FloatType>(cast<MemRefType>(generic.getOutputs()[0].getType()).getElementType());
     }, [](Operation *operation, CapabilitiesAttr capabilities, const Configuration &config) {
       if (!vectorLegal(operation, capabilities, config) || !config.local.get("micro_m") || !config.local.get("micro_n")) return false;
       int64_t width = config.parameter("vector_width"), m = config.parameter("micro_m"), n = config.parameter("micro_n");
+      int64_t bytes = cast<MemRefType>(cast<linalg::GenericOp>(operation).getOutputs()[0].getType()).getElementTypeBitWidth() / 8;
       return config.tileN % width == 0 && m <= 8 && n <= 4 && m * n <= 24 &&
-          m * n * width <= capabilities.getPrivateBytes() / 4;
+          width * bytes * 8 <= capabilities.getVectorBits() &&
+          m * n * width <= capabilities.getPrivateBytes() / bytes;
     }, [](Builder &, const Configuration &config) { return config.local; }, formTile, {}};
   auto inputRequirements = [](InputReuse reuse) {
-    return [reuse](linalg::GenericOp, ConfigurationAttr, ImplementationAttr binding) {
+    return [reuse](linalg::GenericOp operation, ConfigurationAttr, ImplementationAttr binding) {
       int64_t width = implementationParameter(binding, "vector_width");
-      return SmallVector<InputRequirement>{{1, 1, width * implementationParameter(binding, "micro_n"), width * 4, reuse}};
+      int64_t bytes = cast<MemRefType>(operation.getInputs()[1].getType()).getElementTypeBitWidth() / 8;
+      return SmallVector<InputRequirement>{{1, 1, width * implementationParameter(binding, "micro_n"), width * bytes, reuse}};
     };
   };
   auto directLegal = contraction.legal;
   contraction.inputs = inputRequirements(InputReuse::Group);
   contraction.legal = [directLegal](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
-    return directLegal(op, capabilities, config) && config.tileK <= capabilities.getPrivateBytes() / 4 /
+    int64_t bytes = cast<MemRefType>(cast<linalg::GenericOp>(op).getInputs()[1].getType()).getElementTypeBitWidth() / 8;
+    return directLegal(op, capabilities, config) && config.tileK <= capabilities.getPrivateBytes() / bytes /
         config.parameter("vector_width") / config.parameter("micro_n");
   };
   result.add(contraction);
-  contraction.name = "mojo.register_f32_shared";
+  contraction.name = "mojo.register_float_shared";
   contraction.inputs = inputRequirements(InputReuse::Consumers);
   contraction.legal = [directLegal](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
     return directLegal(op, capabilities, config) &&
         config.tileN % (config.parameter("vector_width") * config.parameter("micro_n")) == 0;
   };
   result.add(contraction);
-  contraction.name = "mojo.register_f32_direct";
+  contraction.name = "mojo.register_float_direct";
   contraction.legal = directLegal;
   contraction.inputs = {};
   result.add(std::move(contraction));

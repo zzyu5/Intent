@@ -34,17 +34,18 @@ std::optional<LocalEpilogue> localEpilogue(linalg::GenericOp contraction) {
   for (Operation *user : partial.getUsers())
     if (user != initialization && user != contraction && user != consumer) return std::nullopt;
   auto shape = cast<MemRefType>(partial.getType()).getShape();
+  Type element = cast<MemRefType>(partial.getType()).getElementType();
   PhysicalProgramAnalysis analysis(contraction->getParentOfType<func::FuncOp>());
   Value destination = consumer.getOutputs()[0];
   for (Value memory : consumer->getOperands()) {
     auto type = dyn_cast<MemRefType>(memory.getType());
-    if (!type || type.getShape() != shape || !type.getElementType().isF32()) return std::nullopt;
+    if (!type || type.getShape() != shape || type.getElementType() != element) return std::nullopt;
     if (memory != destination && analysis.storageRoot(memory) == analysis.storageRoot(destination))
       return std::nullopt;
   }
   for (Operation &operation : consumer.getRegion().front().without_terminator())
     if (operation.getNumRegions() || operation.getNumResults() != 1 ||
-        !operation.getResult(0).getType().isF32() || !isMemoryEffectFree(&operation)) return std::nullopt;
+        operation.getResult(0).getType() != element || !isMemoryEffectFree(&operation)) return std::nullopt;
   return LocalEpilogue{allocation, initialization, consumer};
 }
 
@@ -68,13 +69,19 @@ LogicalResult materializeRegisterContractions(func::FuncOp function) {
     OpBuilder b(operation);
     Location loc = operation.getLoc();
     int64_t width = tile.getVectorWidth(), columns = tile.getColumns() / width;
-    auto vectorType = VectorType::get({width}, b.getF32Type());
+    Type accumulator = outputType.getElementType();
+    auto vectorType = VectorType::get({width}, accumulator);
     SmallVector<Value> rows, offsets, accumulators;
     for (int64_t row = 0; row < tile.getRows(); ++row) rows.push_back(index(b, loc, row));
     for (int64_t column = 0; column < columns; ++column) offsets.push_back(index(b, loc, column * width));
     auto load = [&](Value source, Value row, Value column) -> Value {
-      if (width == 1) return b.create<memref::LoadOp>(loc, source, ValueRange{row, column});
-      return b.create<vector::LoadOp>(loc, vectorType, source, ValueRange{row, column});
+      Type element = cast<MemRefType>(source.getType()).getElementType();
+      Value value = width == 1
+          ? Value(b.create<memref::LoadOp>(loc, source, ValueRange{row, column}))
+          : Value(b.create<vector::LoadOp>(loc, VectorType::get({width}, element), source, ValueRange{row, column}));
+      if (element != accumulator)
+        value = b.create<arith::ExtFOp>(loc, width == 1 ? accumulator : vectorType, value);
+      return value;
     };
     for (Value row : rows)
       for (Value offset : offsets) {
@@ -103,6 +110,7 @@ LogicalResult materializeRegisterContractions(func::FuncOp function) {
       SmallVector<Value> next;
       for (auto [number, row] : llvm::enumerate(rows)) {
         Value left = b.create<memref::LoadOp>(loc, lhs, ValueRange{row, k});
+        if (left.getType() != accumulator) left = b.create<arith::ExtFOp>(loc, accumulator, left);
         if (width != 1) left = b.create<vector::BroadcastOp>(loc, vectorType, left);
         for (int64_t column = 0; column < columns; ++column)
           next.push_back(b.create<math::FmaOp>(loc, left, right[column],

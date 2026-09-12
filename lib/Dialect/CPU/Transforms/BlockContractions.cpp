@@ -49,7 +49,7 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
       if (analysis.storageRoot(access.memory) == root)
         return operation.emitError("CPU contraction initialization has an intervening memory access");
   Value initial = initialization.getInputs()[0];
-  if (!(initial.getType().isF32() ? matchPattern(initial, m_PosZeroFloat()) : matchPattern(initial, m_Zero())))
+  if (!(isa<FloatType>(initial.getType()) ? matchPattern(initial, m_PosZeroFloat()) : matchPattern(initial, m_Zero())))
     return operation.emitError("CPU contraction blocking requires the closed zero-initialized contraction; splitting a nonzero fused accumulator is not implemented");
   auto requirements = (*implementation)->inputs ? (*implementation)->inputs(operation, shared, binding)
       : SmallVector<InputRequirement>{};

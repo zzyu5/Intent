@@ -57,10 +57,10 @@ def prepare_comparison(context, definition, arguments, runtime_path, tolerance, 
     )
 
 
-def prepare_host_comparison(context, definition, arguments, reference, tolerance):
+def prepare_host_comparison(context, definition, arguments, reference, tolerance, *, constexprs=None):
     report_stage("generated_compilation")
     artifact = intent.compile(definition, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config)
+                              tuning_config=context.tuning_config, constexprs=constexprs)
     runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
     def side(function):
