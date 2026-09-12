@@ -10,6 +10,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
@@ -2470,6 +2471,241 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
   return success();
 }
 
+bool canReplayContractionReads(ContractOp contract) {
+  auto onlyReads = [](Operation *operation) {
+    auto effects = getEffectsRecursively(operation);
+    return effects && llvm::all_of(*effects, [](const auto &effect) {
+      return isa<MemoryEffects::Read>(effect.getEffect());
+    });
+  };
+  SmallVector<Value> pending(contract->getOperands());
+  llvm::DenseSet<Value> seen;
+  while (!pending.empty()) {
+    Value value = pending.pop_back_val();
+    if (!seen.insert(value).second)
+      continue;
+    Operation *producer = value.getDefiningOp();
+    if (!producer)
+      continue;
+    if (auto load = dyn_cast<LoadOp>(producer)) {
+      Operation *anchor = contract;
+      while (anchor->getBlock() != load->getBlock()) {
+        anchor = anchor->getParentOp();
+        if (!anchor || !onlyReads(anchor))
+          return false;
+      }
+      if (!load->isBeforeInBlock(anchor))
+        return false;
+      for (Operation *between = load->getNextNode(); between != anchor;
+           between = between->getNextNode())
+        if (!onlyReads(between))
+          return false;
+    }
+    llvm::append_range(pending, producer->getOperands());
+  }
+  return true;
+}
+
+FailureOr<bool> realizeFullResultTraversal(
+    ContractOp contract, func::FuncOp kernel,
+    SmallVectorImpl<ContractOp> &pending) {
+  if (!contract.getLhsBatchAxes().empty() ||
+      !contract.getRhsBatchAxes().empty())
+    return false;
+  FragmentType resultType = contract.getResult().getType();
+  if (llvm::none_of(resultType.getShape(), [&](Attribute extent) {
+        return isFullCoverageExtent(contract, cast<PhysicalExprAttr>(extent));
+      }))
+    return false;
+  SmallVector<std::pair<Value, unsigned>> freeAxes(resultType.getShape().size());
+  unsigned freeAxisCount = 0;
+  for (auto [operand, reductions] :
+       {std::pair<Value, ArrayRef<int64_t>>{contract.getLhs(),
+                                          contract.getLhsReductionAxes()},
+        std::pair<Value, ArrayRef<int64_t>>{contract.getRhs(),
+                                          contract.getRhsReductionAxes()}}) {
+    auto type = cast<FragmentType>(operand.getType());
+    for (unsigned axis = 0; axis < type.getShape().size(); ++axis) {
+      if (llvm::is_contained(reductions, static_cast<int64_t>(axis)))
+        continue;
+      auto mapping = cast<AxisMapAttr>(type.getAxisMaps()[axis]);
+      auto source = queryFragmentAxis(resultType, sourceAxisIdentity(mapping));
+      auto dimension =
+          queryFragmentDimension(resultType, mapping.getDimensionId());
+      if (source.isExact() && dimension.isExact() &&
+          source.fragmentAxis != dimension.fragmentAxis)
+        return false;
+      if (!source.isExact() && !dimension.isExact())
+        return false;
+      int64_t resultAxis =
+          source.isExact() ? source.fragmentAxis : dimension.fragmentAxis;
+      if (freeAxes[resultAxis].first ||
+          resultType.getShape()[resultAxis] != type.getShape()[axis])
+        return false;
+      freeAxes[resultAxis] = {operand, axis};
+      ++freeAxisCount;
+    }
+  }
+  if (freeAxisCount != resultType.getShape().size())
+    return contract.emitOpError(
+        "full-result traversal lost its free-axis relation");
+  // Slicing may replay loads at the contraction.  External views can alias,
+  // so retain their original snapshots across every intervening write.
+  if (!canReplayContractionReads(contract))
+    return false;
+
+  for (auto [resultAxis, selected] : llvm::enumerate(freeAxes)) {
+    auto fullExtent = cast<PhysicalExprAttr>(resultType.getShape()[resultAxis]);
+    if (!isFullCoverageExtent(contract, fullExtent))
+      continue;
+    PhysicalProgramAnalysis analysis(kernel);
+    PhysicalRangeFact fact = analysis.axisRanges(selected.first, selected.second);
+    FailureOr<MakeRangeOp> authority = queryExactLogicalRange(fact);
+    FailureOr<ParameterOp> fullParameter = parameterForExtent(kernel, fullExtent);
+    FailureOr<AxisMapAttr> axisMap =
+        queryAxisMap(selected.first.getType(), selected.second);
+    if (failed(authority) || failed(fullParameter) || failed(axisMap) ||
+        !fact.unitStep ||
+        !samePhysicalScalarExpression((*authority).getStart(),
+                                      (*authority).getLogicalStart()))
+      continue;
+    SmallVector<MakeRangeOp> roots(fact.roots.begin(), fact.roots.end());
+    bool lhsAxis = selected.first == contract.getLhs();
+    std::string name =
+        ((lhsAxis ? "BLOCK_M_CACHE_" : "BLOCK_N_CACHE_") +
+         Twine(axisMap->getSourceId()) + "_" + Twine(axisMap->getSourceAxis()) +
+         "_" + Twine(axisMap->getDerived() ? 1 : 0) + "_D" +
+         Twine(axisMap->getDimensionId()))
+            .str();
+    ParameterOp block = getOrCreatePhysicalParameter(
+        kernel, name,
+        lhsAxis ? ParameterRole::OwnershipM : ParameterRole::OwnershipN,
+        ParameterCategory::Contraction,
+        resultType.getElementType().getIntOrFloatBitWidth(), {32, 64, 128});
+    if (!block)
+      return failure();
+    if (FailureOr<int64_t> dimension = queryRangeDimension(*authority);
+        succeeded(dimension))
+      block->setAttr(dimensionAttr,
+                     IntegerAttr::get(IntegerType::get(kernel.getContext(), 64),
+                                      *dimension));
+    auto tileExtent = parameterExpression(kernel.getContext(), name);
+    SmallVector<Attribute> tileShape(resultType.getShape().begin(),
+                                     resultType.getShape().end());
+    tileShape[resultAxis] = tileExtent;
+    auto tileResultType = FragmentType::get(
+        kernel.getContext(), resultType.getElementType(),
+        ArrayAttr::get(kernel.getContext(), tileShape), resultType.getAxisMaps(),
+        resultType.getValidity(), resultType.getOwner());
+    auto rangeType = cast<FragmentType>((*authority).getResult().getType());
+    auto fullRangeType = FragmentType::get(
+        kernel.getContext(), rangeType.getElementType(),
+        ArrayAttr::get(kernel.getContext(), {fullExtent}), rangeType.getAxisMaps(),
+        rangeType.getValidity(), rangeType.getOwner());
+    auto tileRangeType = FragmentType::get(
+        kernel.getContext(), rangeType.getElementType(),
+        ArrayAttr::get(kernel.getContext(), {tileExtent}), rangeType.getAxisMaps(),
+        rangeType.getValidity(), rangeType.getOwner());
+    auto indexType = FragmentType::get(
+        kernel.getContext(), IndexType::get(kernel.getContext()),
+        resultType.getShape(), resultType.getAxisMaps(), resultType.getValidity(),
+        resultType.getOwner());
+    auto predicateType = FragmentType::get(
+        kernel.getContext(), IntegerType::get(kernel.getContext(), 1),
+        resultType.getShape(), resultType.getAxisMaps(), resultType.getValidity(),
+        resultType.getOwner());
+    OpBuilder builder(contract);
+    Location location = contract.getLoc();
+    Value fullRange = builder.create<MakeRangeOp>(
+        location, fullRangeType, (*authority).getLogicalStart(),
+        (*fullParameter).getResult(), (*authority).getStep(),
+        (*authority).getLogicalStart(), (*authority).getLogicalStop(),
+        axisMap->getSourceId(), axisMap->getSourceAxis(), axisMap->getDerived());
+    inheritRangeAuthority(fullRange, *authority);
+    Value coordinates = broadcastAxis(builder, location, indexType, fullRange,
+                                      static_cast<unsigned>(resultAxis));
+    // Each iteration fills one disjoint slice of an immutable full result.
+    // The operand and dot fragments retain their independent, bounded tiles.
+    auto loop = builder.create<scf::ForOp>(
+        location, (*authority).getLogicalStart(), (*authority).getLogicalStop(),
+        block.getResult(), ValueRange{contract.getAccumulator()},
+        [](OpBuilder &body, Location location, Value, ValueRange carries) {
+          body.create<scf::YieldOp>(location, carries);
+        });
+    Operation *yield = loop.getBody()->getTerminator();
+    OpBuilder nested(yield);
+    Value tileRange = nested.create<MakeRangeOp>(
+        location, tileRangeType, loop.getInductionVar(), block.getResult(),
+        (*authority).getStep(), (*authority).getLogicalStart(),
+        (*authority).getLogicalStop(), axisMap->getSourceId(),
+        axisMap->getSourceAxis(), axisMap->getDerived());
+    inheritRangeAuthority(tileRange, *authority);
+    FailureOr<Value> tail =
+        buildRangeTailPredicate(nested, location, tileRange, *authority);
+    if (failed(tail))
+      return failure();
+    SmallVector<Value> operands;
+    for (Value value :
+         {Value(contract.getLhs()), Value(contract.getRhs()),
+          Value(contract.getAccumulator())}) {
+      IRMapping mapping;
+      for (MakeRangeOp root : roots)
+        mapping.map(root.getResult(), tileRange);
+      FailureOr<Value> sliced = replaySourceValue(
+          nested, location, value, tileExtent, roots, tileRange, mapping,
+          loop.getOperation());
+      if (failed(sliced))
+        return contract.emitOpError(
+            "full-result traversal could not form its operand slice");
+      if (!queryFragmentAxes(value.getType(), sourceAxisIdentity(*axisMap))
+               .empty() &&
+          failed(appendTailValidity(location, value, *tail, mapping)))
+        return failure();
+      operands.push_back(*sliced);
+    }
+    FailureOr<Value> accumulator = projectPhysicalValueToSchema(
+        nested, location, operands[2], tileResultType);
+    if (failed(accumulator))
+      return contract.emitOpError(
+          "full-result traversal could not project its accumulator slice");
+    auto tile = nested.create<ContractOp>(
+        location, tileResultType, operands[0], operands[1],
+        *accumulator, contract.getLhsReductionAxes(), contract.getRhsReductionAxes(),
+        contract.getLhsBatchAxes(), contract.getRhsBatchAxes());
+    if (Attribute origin = contract->getAttr(originAttr))
+      tile->setAttr(originAttr, origin);
+    Value start = nested.create<BroadcastOp>(location, indexType,
+                                            loop.getInductionVar());
+    Value local = binary(nested, location, indexType, coordinates, start,
+                         BinaryOperator::Subtract);
+    Value zero = nested.create<arith::ConstantIndexOp>(location, 0);
+    Value zeroes = nested.create<BroadcastOp>(location, indexType, zero);
+    Value width = nested.create<BroadcastOp>(location, indexType, block.getResult());
+    Value stop = nested.create<BroadcastOp>(location, indexType,
+                                           (*authority).getLogicalStop());
+    Value lower = compare(nested, location, predicateType, local, zeroes,
+                          ComparePredicate::Ge);
+    Value upper = compare(nested, location, predicateType, local, width,
+                          ComparePredicate::Lt);
+    Value active = compare(nested, location, predicateType, coordinates, stop,
+                           ComparePredicate::Lt);
+    Value valid = binary(nested, location, predicateType, lower, upper,
+                         BinaryOperator::LogicalAnd);
+    valid = binary(nested, location, predicateType, valid, active,
+                   BinaryOperator::LogicalAnd);
+    Value assembled = nested.create<GatherOp>(
+        location, resultType, tile.getResult(), ValueRange{local}, valid,
+        loop.getRegionIterArgs().front(),
+        ArrayRef<int64_t>{static_cast<int64_t>(resultAxis)});
+    yield->setOperands(ValueRange{assembled});
+    loop.walk([&](ContractOp product) { pending.push_back(product); });
+    contract.getResult().replaceAllUsesWith(loop.getResult(0));
+    contract.erase();
+    return true;
+  }
+  return false;
+}
+
 LogicalResult realizeSparseReductionTraversal(SparseContractOp contract,
                                               func::FuncOp kernel) {
   if (contract.getLhsReductionAxes() != ArrayRef<int64_t>{1} ||
@@ -4589,6 +4825,12 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
     if (!hasFragmentSchema(contract))
       return contract.emitOpError(
           "shared contraction blocking requires fragment operands and result");
+    FailureOr<bool> fullResult =
+        realizeFullResultTraversal(contract, kernel, contracts);
+    if (failed(fullResult))
+      return failure();
+    if (*fullResult)
+      continue;
     if (requiresPhysicalRealization(contract)) {
       FailureOr<bool> nativeSegment =
           realizeSegmentNativeReduction(contract, kernel);

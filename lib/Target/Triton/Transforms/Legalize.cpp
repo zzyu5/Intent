@@ -1487,6 +1487,172 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
   return success();
 }
 
+LogicalResult legalizeExpandingGathers(func::FuncOp kernel) {
+  auto [nextSource, nextDimension] = gpu::nextPhysicalAxisIdentities(kernel);
+  SmallVector<gpu::GatherOp> gathers;
+  kernel.walk([&](gpu::GatherOp gather) { gathers.push_back(gather); });
+  for (gpu::GatherOp gather : gathers) {
+    if (gather.getValid() || gather.getCoordinates().size() != 1 ||
+        gather.getSourceAxes().size() != 1)
+      continue;
+    auto source = dyn_cast<gpu::FragmentType>(gather.getSource().getType());
+    auto result = dyn_cast<gpu::FragmentType>(gather.getResult().getType());
+    auto indices = dyn_cast<gpu::FragmentType>(
+        gather.getCoordinates().front().getType());
+    if (!source || !result || !indices || source.getShape().size() < 2 ||
+        source.getShape().size() != result.getShape().size() ||
+        indices.getShape() != result.getShape() ||
+        indices.getAxisMaps() != result.getAxisMaps())
+      continue;
+    unsigned axis = gather.getSourceAxes().front();
+    bool compatible = true;
+    for (unsigned position = 0; position < source.getShape().size(); ++position)
+      compatible &= position == axis ||
+                    (source.getShape()[position] == result.getShape()[position] &&
+                     source.getAxisMaps()[position] == result.getAxisMaps()[position]);
+    auto sourceExtent = cast<gpu::PhysicalExprAttr>(source.getShape()[axis]);
+    auto resultExtent = cast<gpu::PhysicalExprAttr>(result.getShape()[axis]);
+    if (!compatible || sourceExtent == resultExtent ||
+        !isCompileTimeExpression(sourceExtent) ||
+        !isCompileTimeExpression(resultExtent))
+      continue;
+    auto constantExtent = [](gpu::PhysicalExprAttr extent) {
+      return extent.getKind() ==
+             static_cast<uint32_t>(gpu::PhysicalExprKind::Constant);
+    };
+    bool constantShape = constantExtent(sourceExtent) &&
+                         constantExtent(resultExtent);
+    if (constantShape && resultExtent.getValue() <= sourceExtent.getValue())
+      continue;
+
+    OpBuilder builder(gather);
+    Location location = gather.getLoc();
+    auto product = [&](ArrayRef<Attribute> shape) {
+      auto extent = gpu::PhysicalExprAttr::get(
+          kernel.getContext(),
+          static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), 1,
+          builder.getStringAttr(""), builder.getArrayAttr({}));
+      if (shape.empty())
+        return extent;
+      extent = cast<gpu::PhysicalExprAttr>(shape.front());
+      for (Attribute dimension : shape.drop_front())
+        extent = gpu::PhysicalExprAttr::get(
+            kernel.getContext(),
+            static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
+            builder.getStringAttr(""), builder.getArrayAttr({extent, dimension}));
+      return extent;
+    };
+    auto flatSourceAxis = gpu::AxisMapAttr::get(
+        kernel.getContext(), nextSource++, 0, nextDimension++, 0, true);
+    auto flatResultAxis = gpu::AxisMapAttr::get(
+        kernel.getContext(), nextSource++, 0, nextDimension++, 0, true);
+    auto sourceElements = product(source.getShape().getValue());
+    auto resultElements = product(result.getShape().getValue());
+    auto flatType = [&](gpu::FragmentType original, Type element,
+                        gpu::PhysicalExprAttr extent, gpu::AxisMapAttr mapping) {
+      return gpu::FragmentType::get(
+          kernel.getContext(), element, builder.getArrayAttr({extent}),
+          builder.getArrayAttr({mapping}), original.getValidity(),
+          original.getOwner());
+    };
+    auto flatSourceType = flatType(source, source.getElementType(),
+                                   sourceElements, flatSourceAxis);
+    auto flatResultType = flatType(result, result.getElementType(),
+                                   resultElements, flatResultAxis);
+    auto flatIndexType = flatType(indices, builder.getIndexType(),
+                                  resultElements, flatResultAxis);
+    auto linearize = [&](OpBuilder &nested) -> FailureOr<Value> {
+      auto reshape = [&](Value value,
+                         gpu::FragmentType target) -> FailureOr<Value> {
+        auto relation = gpu::inferReshapeReassociation(
+            cast<gpu::FragmentType>(value.getType()), target);
+        if (failed(relation))
+          return failure();
+        return Value(nested.create<gpu::ReshapeOp>(location, target, value,
+                                                  *relation));
+      };
+      auto flatOriginalIndexType = flatType(
+          indices, indices.getElementType(), resultElements, flatResultAxis);
+      FailureOr<Value> flatSource = reshape(gather.getSource(), flatSourceType);
+      FailureOr<Value> flatIndices =
+          reshape(gather.getCoordinates().front(), flatOriginalIndexType);
+      if (failed(flatSource) || failed(flatIndices))
+        return failure();
+      Value index = *flatIndices;
+      if (index.getType() != flatIndexType)
+        index = nested.create<gpu::CastOp>(location, flatIndexType, index);
+      auto extentValue = [&](gpu::PhysicalExprAttr extent) -> Value {
+        return nested.create<gpu::PhysicalExprOp>(
+            location, nested.getIndexType(), extent);
+      };
+      auto broadcastExtent = [&](gpu::PhysicalExprAttr extent) -> Value {
+        return nested.create<gpu::BroadcastOp>(location, flatIndexType,
+                                               extentValue(extent));
+      };
+      auto binary = [&](Value lhs, Value rhs, BinaryOperator kind) -> Value {
+        return nested.create<gpu::BinaryOp>(location, flatIndexType, lhs, rhs,
+                                            kind);
+      };
+      Value zero = nested.create<arith::ConstantIndexOp>(location, 0);
+      Value one = nested.create<arith::ConstantIndexOp>(location, 1);
+      Value count = extentValue(resultElements);
+      Value ordinal = nested.create<gpu::MakeRangeOp>(
+          location, flatIndexType, zero, count, one, zero, count,
+          flatResultAxis.getSourceId(), flatResultAxis.getSourceAxis(), true);
+      Value inner = broadcastExtent(
+          product(result.getShape().getValue().drop_front(axis + 1)));
+      Value sourceStride = binary(broadcastExtent(sourceExtent), inner,
+                                   BinaryOperator::Multiply);
+      Value resultStride = binary(broadcastExtent(resultExtent), inner,
+                                   BinaryOperator::Multiply);
+      Value outer = binary(ordinal, resultStride, BinaryOperator::FloorDivide);
+      Value tail = binary(ordinal, inner, BinaryOperator::Remainder);
+      Value offset = binary(outer, sourceStride, BinaryOperator::Multiply);
+      offset = binary(offset, binary(index, inner, BinaryOperator::Multiply),
+                      BinaryOperator::Add);
+      offset = binary(offset, tail, BinaryOperator::Add);
+      Value selected = nested.create<gpu::GatherOp>(
+          location, flatResultType, *flatSource, ValueRange{offset}, Value(),
+          Value(), ArrayRef<int64_t>{0});
+      return reshape(selected, result);
+    };
+
+    // Expanding gathers can require cross-warp exchange.  A linear gather
+    // retains that meaning without the rank-dependent warp-local rewrite.
+    Value replacement;
+    if (constantShape) {
+      FailureOr<Value> linear = linearize(builder);
+      if (failed(linear))
+        return gather.emitOpError("expanding gather has no exact linear reshape");
+      replacement = *linear;
+    } else {
+      Value sourceSize = builder.create<gpu::PhysicalExprOp>(
+          location, builder.getIndexType(), sourceExtent);
+      Value resultSize = builder.create<gpu::PhysicalExprOp>(
+          location, builder.getIndexType(), resultExtent);
+      Value expanding = builder.create<gpu::CompareOp>(
+          location, builder.getI1Type(), resultSize, sourceSize,
+          ComparePredicate::Gt);
+      auto conditional = builder.create<scf::IfOp>(
+          location, TypeRange{result}, expanding, /*withElseRegion=*/true);
+      OpBuilder linearBuilder = conditional.getThenBodyBuilder();
+      FailureOr<Value> linear = linearize(linearBuilder);
+      if (failed(linear))
+        return gather.emitOpError("expanding gather has no exact linear reshape");
+      linearBuilder.create<scf::YieldOp>(location, *linear);
+      OpBuilder originalBuilder = conditional.getElseBodyBuilder();
+      Operation *original = originalBuilder.clone(*gather.getOperation());
+      originalBuilder.create<scf::YieldOp>(location, original->getResults());
+      replacement = conditional.getResult(0);
+    }
+    if (Attribute origin = gather->getAttr(gpu::originAttr))
+      replacement.getDefiningOp()->setAttr(gpu::originAttr, origin);
+    gather.getResult().replaceAllUsesWith(replacement);
+    gather.erase();
+  }
+  return success();
+}
+
 bool isAddCombine(gpu::ScatterReduceOp scatter) {
   return gpu::queryBinaryCombineKind(scatter.getCombine()) ==
          BinaryOperator::Add;
@@ -2165,6 +2331,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       failed(gpu::verifyGPUProgram(module)))
     return failure();
   if (failed(legalizeMaskedGather(kernel)) ||
+      failed(legalizeExpandingGathers(kernel)) ||
       failed(legalizeScatterAdd(kernel)) ||
       failed(legalizeContractShapes(kernel)) ||
       failed(gpu::verifyGPUProgram(module)))

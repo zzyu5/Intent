@@ -1510,6 +1510,8 @@ bool reachesReduction(Value value, PhysicalSourceAxis source,
 }
 
 bool isExpensiveReplayProducer(Value value) {
+  if (value.getDefiningOp<ContractOp>())
+    return true;
   auto unary = value.getDefiningOp<UnaryOp>();
   if (!unary)
     return false;

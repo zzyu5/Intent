@@ -584,7 +584,160 @@ bool coordinateKnownNonNegative(Value coordinate) {
 }
 
 bool coordinateRangeWithinResource(Value coordinate, Value resource,
+                                   unsigned axis);
+bool valueMatchesExtent(Value value, PhysicalExprAttr extent);
+
+bool linearizedGatherWithinResource(Value coordinate, Value resource) {
+  auto sourceReshape = resource.getDefiningOp<ReshapeOp>();
+  auto source = sourceReshape
+                    ? dyn_cast<FragmentType>(sourceReshape.getValue().getType())
+                    : FragmentType();
+  auto flatSource = dyn_cast<FragmentType>(resource.getType());
+  if (!source || !flatSource || source.getShape().size() < 2 ||
+      flatSource.getShape().size() != 1)
+    return false;
+  auto binary = [](Value value, BinaryOperator kind) {
+    auto operation = stripBroadcast(value).getDefiningOp<BinaryOp>();
+    Type type = value.getType();
+    if (auto fragment = dyn_cast<FragmentType>(type))
+      type = fragment.getElementType();
+    return operation && operation.getOperatorKind() == kind && type.isIndex()
+               ? operation : BinaryOp();
+  };
+  auto offset = binary(coordinate, BinaryOperator::Add);
+  auto tail = offset ? binary(offset.getRhs(), BinaryOperator::Remainder)
+                     : BinaryOp();
+  auto prefix = offset ? binary(offset.getLhs(), BinaryOperator::Add)
+                       : BinaryOp();
+  auto outer = prefix ? binary(prefix.getLhs(), BinaryOperator::Multiply)
+                      : BinaryOp();
+  auto selected = prefix ? binary(prefix.getRhs(), BinaryOperator::Multiply)
+                         : BinaryOp();
+  auto quotient = outer ? binary(outer.getLhs(), BinaryOperator::FloorDivide)
+                        : BinaryOp();
+  auto sourceStride = outer ? binary(outer.getRhs(), BinaryOperator::Multiply)
+                            : BinaryOp();
+  auto resultStride = quotient
+                          ? binary(quotient.getRhs(), BinaryOperator::Multiply)
+                          : BinaryOp();
+  if (!tail || !selected || !sourceStride || !resultStride ||
+      !sameScalarExpression(quotient.getLhs(), tail.getLhs()) ||
+      !sameScalarExpression(selected.getRhs(), tail.getRhs()) ||
+      !sameScalarExpression(sourceStride.getRhs(), tail.getRhs()) ||
+      !sameScalarExpression(resultStride.getRhs(), tail.getRhs()))
+    return false;
+  auto ordinal = quotient.getLhs().getDefiningOp<MakeRangeOp>();
+  Value index = stripBroadcast(selected.getLhs());
+  uint64_t castLimit = std::numeric_limits<int64_t>::max();
+  auto elementType = [](Type type) {
+    if (auto fragment = dyn_cast<FragmentType>(type))
+      return fragment.getElementType();
+    return type;
+  };
+  while (auto cast = index.getDefiningOp<CastOp>()) {
+    Type sourceType = elementType(cast.getValue().getType());
+    Type resultType = elementType(cast.getResult().getType());
+    if (!isa<IndexType, IntegerType>(sourceType) ||
+        !isa<IndexType, IntegerType>(resultType))
+      return false;
+    if (auto integer = dyn_cast<IntegerType>(resultType);
+        integer && integer.getWidth() < 64) {
+      unsigned valueBits = integer.getWidth() - (integer.isUnsigned() ? 0 : 1);
+      castLimit = std::min(castLimit, (uint64_t{1} << valueBits) - 1);
+    }
+    index = stripBroadcast(cast.getValue());
+  }
+  auto indexReshape = index.getDefiningOp<ReshapeOp>();
+  auto indices = indexReshape
+                     ? dyn_cast<FragmentType>(indexReshape.getValue().getType())
+                     : FragmentType();
+  auto flatIndices = dyn_cast<FragmentType>(index.getType());
+  if (!ordinal || !indices || !flatIndices ||
+      indices.getShape().size() != source.getShape().size() ||
+      flatIndices.getShape().size() != 1 ||
+      integerConstant(ordinal.getStart()) != 0 ||
+      !isUnitStepValue(ordinal.getStep()) ||
+      !matchesResourceExtent(ordinal.getExtent(), index, 0))
+    return false;
+
+  auto kernel = sourceReshape->getParentOfType<func::FuncOp>();
+  std::function<std::optional<int64_t>(PhysicalExprAttr)> positiveExtentLimit =
+      [&](PhysicalExprAttr extent) -> std::optional<int64_t> {
+    auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+    if (kind == PhysicalExprKind::Constant)
+      return extent.getValue() > 0 ? std::optional<int64_t>(extent.getValue())
+                                   : std::nullopt;
+    if (kind == PhysicalExprKind::Parameter) {
+      FailureOr<ParameterOp> parameter =
+          queryParameterBySymbol(kernel, extent.getSymbol());
+      if (failed(parameter))
+        return std::nullopt;
+      auto candidates = parameter->getParameter().getCandidates().asArrayRef();
+      if (candidates.empty() ||
+          llvm::any_of(candidates, [](int64_t value) { return value <= 0; }))
+        return std::nullopt;
+      return *llvm::max_element(candidates);
+    }
+    if (kind != PhysicalExprKind::Multiply || extent.getOperands().size() != 2)
+      return std::nullopt;
+    auto lhs = positiveExtentLimit(cast<PhysicalExprAttr>(extent.getOperands()[0]));
+    auto rhs = positiveExtentLimit(cast<PhysicalExprAttr>(extent.getOperands()[1]));
+    if (!lhs || !rhs)
+      return std::nullopt;
+    __int128 product = static_cast<__int128>(*lhs) * *rhs;
+    return product <= std::numeric_limits<int64_t>::max()
+               ? std::optional<int64_t>(static_cast<int64_t>(product))
+               : std::nullopt;
+  };
+  if (!positiveExtentLimit(resourceExtentExpression(resource, 0)) ||
+      !positiveExtentLimit(resourceExtentExpression(index, 0)))
+    return false;
+
+  for (unsigned axis = 0; axis < source.getShape().size(); ++axis) {
+    if (!matchesResourceExtent(sourceStride.getLhs(), sourceReshape.getValue(), axis) ||
+        !matchesResourceExtent(resultStride.getLhs(), indexReshape.getValue(), axis))
+      continue;
+    bool sameOtherAxes = true;
+    for (unsigned other = 0; other < source.getShape().size(); ++other)
+      sameOtherAxes &= other == axis ||
+                       (source.getShape()[other] == indices.getShape()[other] &&
+                        source.getAxisMaps()[other] == indices.getAxisMaps()[other]);
+    if (!sameOtherAxes)
+      continue;
+    auto selectedLimit = positiveExtentLimit(
+        cast<PhysicalExprAttr>(source.getShape()[axis]));
+    if (!selectedLimit || static_cast<uint64_t>(*selectedLimit - 1) > castLimit)
+      continue;
+    MLIRContext *context = resource.getContext();
+    auto inner = PhysicalExprAttr::get(
+        context, static_cast<uint32_t>(PhysicalExprKind::Constant), 1,
+        StringAttr::get(context, ""), ArrayAttr::get(context, {}));
+    for (unsigned dimension = axis + 1; dimension < source.getShape().size(); ++dimension) {
+      auto extent = cast<PhysicalExprAttr>(source.getShape()[dimension]);
+      inner = dimension == axis + 1
+                  ? extent
+                  : PhysicalExprAttr::get(
+                        context, static_cast<uint32_t>(PhysicalExprKind::Multiply),
+                        0, StringAttr::get(context, ""),
+                        ArrayAttr::get(context, {inner, extent}));
+    }
+    if (!valueMatchesExtent(stripBroadcast(tail.getRhs()), inner) ||
+        !coordinateRangeWithinResource(indexReshape.getValue(),
+                                       sourceReshape.getValue(), axis))
+      continue;
+    // The exact reshapes preserve row-major element order.  For a bounded
+    // ordinal, q < outer and remainder < inner; the selected index is < B.
+    // Thus q*(B*inner) + index*inner + remainder is in [0, outer*B*inner).
+    // The positive finite shape limits above also exclude index overflow.
+    return true;
+  }
+  return false;
+}
+
+bool coordinateRangeWithinResource(Value coordinate, Value resource,
                                    unsigned axis) {
+  if (axis == 0 && linearizedGatherWithinResource(coordinate, resource))
+    return true;
   coordinate = stripIntegerIndexCasts(coordinate);
   if (std::optional<int64_t> constant = integerConstant(coordinate)) {
     PhysicalExprAttr extent = resourceExtentExpression(resource, axis);
