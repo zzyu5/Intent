@@ -8,7 +8,7 @@ namespace intent::mojo {
 using namespace intent::cpu;
 namespace {
 
-bool vectorLegal(CapabilitiesAttr capabilities, const Configuration &config) {
+bool vectorLegal(Operation *, CapabilitiesAttr capabilities, const Configuration &config) {
   auto power = [](int64_t value) { return value > 0 && !(value & (value - 1)); };
   if (!config.local.get("vector_width") || !config.local.get("register_replicas") ||
       !config.local.get("reduction_replicas")) return false;
@@ -129,8 +129,8 @@ cpu::ImplementationRegistry implementations() {
       auto generic = dyn_cast<linalg::GenericOp>(op);
       return generic && isMatrixContraction(generic) &&
           cast<MemRefType>(generic.getInputs()[0].getType()).getElementType().isF32();
-    }, [](CapabilitiesAttr capabilities, const Configuration &config) {
-      if (!vectorLegal(capabilities, config) || !config.local.get("micro_m") || !config.local.get("micro_n")) return false;
+    }, [](Operation *operation, CapabilitiesAttr capabilities, const Configuration &config) {
+      if (!vectorLegal(operation, capabilities, config) || !config.local.get("micro_m") || !config.local.get("micro_n")) return false;
       int64_t width = config.parameter("vector_width"), m = config.parameter("micro_m"), n = config.parameter("micro_n");
       return config.tileN % width == 0 && m <= 8 && n <= 4 && m * n <= 24 &&
           config.tileK <= capabilities.getPrivateBytes() / 4 / width / n;

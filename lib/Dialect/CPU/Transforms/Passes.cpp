@@ -88,10 +88,16 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
     for (auto &item : *replacement) (*profiles)[item.first] = std::move(item.second);
   }
   auto original = *module.getOps<func::FuncOp>().begin();
+  if (failed(foldUniformComputations(original)) || failed(fuseStructuredComputations(original)) || failed(normalize(module)) ||
+      failed(verifyCPUProgram(module, false))) return failure();
   llvm::StringRef family = implementations.profile(original);
   auto rows = profiles->getArray(family);
   if (!rows || rows->empty()) return module.emitError("CPU candidate family is empty or missing");
-  SmallVector<Configuration> configurations;
+  struct Candidate {
+    Configuration configuration;
+    SmallVector<ImplementationAttr> bindings;
+  };
+  SmallVector<Candidate> configurations;
   bool hasContraction = false, hasRegion = false;
   original.walk([&](linalg::GenericOp operation) { hasContraction |= isMatrixContraction(operation); });
   original.walk([&](Operation *op) { hasRegion |= isa<RegionFoldOp, RegionScanOp>(op); });
@@ -108,34 +114,33 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
       return original.emitError("M/N/K block parameters require a matrix contraction consumer; otherwise they must be 1");
     if (!hasRegion && config.regionSize != 1)
       return original.emitError("region size requires a region consumer; otherwise it must be 1");
-    if (implementations.legal(*module.getOps<func::FuncOp>().begin(), capabilities, config))
-      configurations.push_back(config);
+    for (auto bindings : implementations.candidates(original, capabilities, config)) {
+      if (llvm::any_of(configurations, [&](const Candidate &previous) {
+            const auto &other = previous.configuration;
+            return other.taskGrain == config.taskGrain && other.tileM == config.tileM &&
+                other.tileN == config.tileN && other.tileK == config.tileK &&
+                other.regionSize == config.regionSize && previous.bindings == bindings;
+          })) continue;
+      configurations.push_back({config, std::move(bindings)});
+    }
   }
   if (configurations.empty()) return module.emitError("no legal CPU candidates remain");
-  if (failed(foldUniformComputations(original)) || failed(fuseStructuredComputations(original)) || failed(normalize(module)) ||
-      failed(verifyCPUProgram(module, false))) return failure();
   SmallVector<func::FuncOp> functions;
-  for (auto [number, config] : llvm::enumerate(configurations)) {
+  for (auto [number, candidate] : llvm::enumerate(configurations)) {
+    const auto &config = candidate.configuration;
     auto function = cast<func::FuncOp>(original->clone());
     function.setName(original.getName().str() + "_config_" + std::to_string(number));
     module.push_back(function);
     Builder b(module.getContext());
     function->setAttr("intent_cpu.configuration", ConfigurationAttr::get(module.getContext(),
         config.taskGrain, config.tileM, config.tileN, config.tileK, config.regionSize));
-    if (failed(implementations.bind(function, capabilities, config))) return failure();
+    if (failed(implementations.bind(function, capabilities, config, candidate.bindings))) return failure();
     SmallVector<Attribute> bindings;
     function.walk([&](Operation *operation) {
       if (auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation"))
         if (!llvm::is_contained(bindings, binding)) bindings.push_back(binding);
     });
     function->setAttr("intent_cpu.implementations", b.getArrayAttr(bindings));
-    if (llvm::any_of(functions, [&](func::FuncOp previous) {
-          return previous->getAttr("intent_cpu.configuration") == function->getAttr("intent_cpu.configuration") &&
-              previous->getAttr("intent_cpu.implementations") == function->getAttr("intent_cpu.implementations");
-        })) {
-      function.erase();
-      continue;
-    }
     functions.push_back(function);
   }
   original.erase();

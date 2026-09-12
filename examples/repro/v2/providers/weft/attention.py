@@ -50,7 +50,8 @@ def source_artifact(directory, profile, metadata, linear, canonical, artifact):
     )
     source_metadata = {**metadata, "host_source": host,
         "tasks": [{"cpu_entry": "source_attention", "abi": {key: kernel[key] for key in ("symbol", "arguments", "shape_parameters")}}],
-        "candidates": [{"entry": "source_attention", "values": [], "implementations": []}]}
+        "candidates": [{"entry": "source_attention", "values": [], "implementations": [],
+                        "requires_matrix_i8_i32": False}]}
     directory.mkdir()
     (directory / "canonical.mlir").write_text(canonical)
     (directory / "host.c").write_text(host)

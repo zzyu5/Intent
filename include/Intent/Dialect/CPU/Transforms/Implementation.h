@@ -21,7 +21,7 @@ struct ContractionRequirements {
 struct Implementation {
   llvm::StringRef name;
   std::function<bool(mlir::Operation *)> applicable;
-  std::function<bool(CapabilitiesAttr, const Configuration &)> legal;
+  std::function<bool(mlir::Operation *, CapabilitiesAttr, const Configuration &)> legal;
   std::function<mlir::DictionaryAttr(mlir::Builder &, const Configuration &)> parameters;
   std::function<mlir::LogicalResult(mlir::OpBuilder &, mlir::linalg::GenericOp,
       const ContractionTile &, ConfigurationAttr, ImplementationAttr)> formTile;
@@ -29,18 +29,20 @@ struct Implementation {
       mlir::OpBuilder &, mlir::Operation *, mlir::ValueRange, int64_t &)> expand;
   ContractionRequirements contraction;
   std::function<int64_t(ImplementationAttr)> parallelWindow;
+  bool requiresMatrixI8I32 = false;
 };
 
 class ImplementationRegistry {
 public:
   std::function<llvm::StringRef(mlir::func::FuncOp)> profile;
   void add(Implementation implementation) { implementations.push_back(std::move(implementation)); }
-  mlir::FailureOr<const Implementation *> select(mlir::Operation *operation) const;
   mlir::FailureOr<const Implementation *> lookup(mlir::Operation *operation) const;
+  llvm::SmallVector<llvm::SmallVector<ImplementationAttr>> candidates(
+      mlir::func::FuncOp function, CapabilitiesAttr capabilities,
+      const Configuration &configuration) const;
   mlir::LogicalResult bind(mlir::func::FuncOp function, CapabilitiesAttr capabilities,
-                           const Configuration &configuration) const;
-  bool legal(mlir::func::FuncOp function, CapabilitiesAttr capabilities,
-             const Configuration &configuration) const;
+                           const Configuration &configuration,
+                           llvm::ArrayRef<ImplementationAttr> bindings) const;
 
 private:
   llvm::SmallVector<Implementation> implementations;

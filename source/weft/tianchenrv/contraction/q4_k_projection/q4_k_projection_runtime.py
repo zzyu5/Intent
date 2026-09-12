@@ -61,6 +61,7 @@ def serve(directory: Path) -> None:
             "generated": list(generated_call.result().storage.cast("f")),
             "source": list(source_call.result().storage.cast("f")),
             "winner": generated.candidates[generated_call.winner],
+            "used_extensions": sorted(generated.candidate_extensions[generated_call.winner]),
         }), flush=True)
     finally:
         generated.close()

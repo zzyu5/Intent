@@ -173,9 +173,9 @@ cpu::ImplementationRegistry implementations() {
     return quantize ? "weft.q8_k" : contraction ? "weft.contract_f32" : "weft.structured";
   };
   auto noParameters = [](Builder &b, const Configuration &) { return b.getDictionaryAttr({}); };
-  auto legal = [](CapabilitiesAttr, const Configuration &) { return true; };
+  auto legal = [](Operation *, CapabilitiesAttr, const Configuration &) { return true; };
   result.add({"weft.q8_k", [](Operation *op) { return isa<cpu::QuantizeOp>(op); },
-      [](CapabilitiesAttr, const Configuration &config) {
+      [](Operation *, CapabilitiesAttr, const Configuration &config) {
         return config.local.size() == 1 && config.local.get("chunk") &&
             (config.parameter("chunk") == 32 || config.parameter("chunk") == 64);
       }, [](Builder &b, const Configuration &config) {
@@ -196,20 +196,20 @@ cpu::ImplementationRegistry implementations() {
         if (!isa<cpu::QuantizedDotOp>(op)) return false;
         auto capabilities = op->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities");
         return capabilities && capabilities.getMatrixI8I32();
-      }, [](CapabilitiesAttr capabilities, const Configuration &) {
+      }, [](Operation *, CapabilitiesAttr capabilities, const Configuration &) {
         return capabilities.getMatrixI8I32() && capabilities.getVectorBits() == 256;
       }, [](Builder &b, const Configuration &) {
         return b.getDictionaryAttr({b.getNamedAttr("columns", b.getI64IntegerAttr(4))});
       }, {}, quantizedDot, {}, [](ImplementationAttr binding) {
         return implementationParameter(binding, "columns");
-      }});
+      }, true});
   result.add({"weft.q4_k_q8_k", [](Operation *op) { return isa<cpu::QuantizedDotOp>(op); },
       legal, noParameters, {}, quantizedDot});
   result.add({"weft.matrix_i8_i32", [](Operation *op) {
       auto generic = dyn_cast<linalg::GenericOp>(op);
       return generic && isMatrixContraction(generic) &&
           cast<MemRefType>(generic.getInputs()[0].getType()).getElementType().isSignlessInteger(8);
-    }, [](CapabilitiesAttr capabilities, const Configuration &config) {
+    }, [](Operation *, CapabilitiesAttr capabilities, const Configuration &config) {
       if (!capabilities.getMatrixI8I32() || capabilities.getVectorBits() != 256 ||
           config.local.size() != 3 || !config.local.get("micro_m") ||
           !config.local.get("micro_n") || !config.local.get("micro_k")) return false;
@@ -217,7 +217,7 @@ cpu::ImplementationRegistry implementations() {
       return (m == 1 || m == 4) && (n == 4 || n == 16) && config.parameter("micro_k") == 8 &&
           config.tileM % m == 0 && config.tileN % n == 0 && config.tileK % 8 == 0;
     }, [](Builder &, const Configuration &config) { return config.local; },
-    formIntegerTile, {}, {true, true, true}});
+    formIntegerTile, {}, {true, true, true}, {}, true});
   result.add({"weft.contract_f32", [](Operation *op) {
       auto generic = dyn_cast<linalg::GenericOp>(op);
       return generic && isMatrixContraction(generic) &&

@@ -45,7 +45,8 @@ def _source_artifact(context, directory: Path, profile: TargetProfile, compiler:
     )
     source_metadata = {**metadata, "host_source": host,
                        "tasks": [{"cpu_entry": "source_projection", "abi": {key: kernel[key] for key in ("symbol", "arguments", "shape_parameters")}}],
-                       "candidates": [{"entry": "source_projection", "values": [], "implementations": []}]}
+                       "candidates": [{"entry": "source_projection", "values": [], "implementations": [],
+                                       "requires_matrix_i8_i32": False}]}
     directory.mkdir(exist_ok=True)
     (directory / "canonical.mlir").write_text(canonical)
     (directory / "host.c").write_text(host)
@@ -102,7 +103,7 @@ def projection(context, deployment_name="rvv.json"):
             source = torch.tensor(result["source"], dtype=torch.float32)
             if not torch.isfinite(generated).all() or not torch.isfinite(source).all():
                 raise NumericalComparisonError("Q4_K projection requires finite output values")
-            print(f"weft: selected {result['winner']}", flush=True)
+            print(f"weft: selected {result['winner']}; extensions={result['used_extensions']}", flush=True)
             return NativeComparisonResult(result["generated_ms"], result["source_ms"], generated, source)
         finally:
             process.stdin.close()
@@ -111,7 +112,7 @@ def projection(context, deployment_name="rvv.json"):
     return PreparedComparison(
         generated=None, source=None, tolerance=Tolerance(1e-4, 2e-3), cuda_graph=False,
         device_type="cpu", native_comparison=measure,
-        note=f"单核；generated {'IME1+RVV' if profile.matrix_extension else 'RVV'} / source RVV；完整 native invocation 含 Q8_K 量化及内部 workspace 分配/释放；同算法、相同 cold-cache，10 次中位数。",
+        note=f"单核；generated {'RVV/IME1 合法实现选优' if profile.matrix_extension else 'RVV'} / source RVV；完整 native invocation 含 Q8_K 量化及内部 workspace 分配/释放；同算法、相同 cold-cache，10 次中位数。",
     )
 
 

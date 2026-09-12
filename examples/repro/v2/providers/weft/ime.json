@@ -5,7 +5,7 @@
   "vlen_bits": 256,
   "cpus": [3],
   "matrix_extension": "spacemit-ime1",
-  "required_extensions": ["spacemit-ime1"],
+  "required_extensions": [],
   "cc": ["/usr/bin/clang-18"],
   "cflags": ["-fno-integrated-as"]
 }
