@@ -1,7 +1,29 @@
 import intent
 import torch
 
-from kernels.convolution.direct import conv1d_same, causal_depthwise_conv1d_update
+from kernels.backward.causal_conv import (
+    BATCH as BWD_CAUSAL_CONV_BATCH,
+    CHANNELS as BWD_CAUSAL_CONV_CHANNELS,
+    LENGTH as BWD_CAUSAL_CONV_LENGTH,
+    WIDTH as BWD_CAUSAL_CONV_WIDTH,
+    causal_conv1d_backward_partials,
+    causal_conv1d_backward_reduce,
+)
+from kernels.convolution.direct import (
+    CAUSAL_CONV_BATCH,
+    CAUSAL_CONV_CHANNELS,
+    CAUSAL_CONV_LENGTH,
+    CAUSAL_CONV_WIDTH,
+    CONV2D_BATCH,
+    CONV2D_HEIGHT,
+    CONV2D_WIDTH,
+    CONV2D_FILTER_HEIGHT,
+    CONV2D_FILTER_WIDTH,
+    causal_depthwise_conv1d,
+    conv1d_same,
+    conv2d_same,
+    causal_depthwise_conv1d_update,
+)
 from kernels.convolution.varlen import varlen_aligned_causal_depthwise_conv1d, varlen_causal_conv1d_final_state
 from ...loading import load_module
 from ...measurement import report_stage
@@ -14,6 +36,99 @@ def conv1d(context):
     weight = torch.randn((5,), dtype=torch.float16)
     return prepare_host_comparison(context, conv1d_same, (x, weight), "conv1d_same",
                                    Tolerance(atol=2e-2, rtol=1e-2))
+
+
+def causal_conv1d(context):
+    x = torch.randn(
+        (CAUSAL_CONV_BATCH, CAUSAL_CONV_CHANNELS, CAUSAL_CONV_LENGTH),
+        dtype=torch.float16,
+    ) * 0.1
+    weight = torch.randn(
+        (CAUSAL_CONV_CHANNELS, CAUSAL_CONV_WIDTH), dtype=torch.float16
+    ) * 0.1
+    bias = torch.randn((CAUSAL_CONV_CHANNELS,), dtype=torch.float16) * 0.1
+    return prepare_host_comparison(
+        context,
+        causal_depthwise_conv1d,
+        (x, weight, bias),
+        "causal_conv1d",
+        Tolerance(atol=3e-3),
+        constexprs={"SILU": True},
+    )
+
+
+def conv2d(context):
+    x = torch.randn(
+        (CONV2D_BATCH, CONV2D_HEIGHT, CONV2D_WIDTH), dtype=torch.float16
+    ) * 0.1
+    weight = torch.randn(
+        (CONV2D_FILTER_HEIGHT, CONV2D_FILTER_WIDTH), dtype=torch.float16
+    ) * 0.1
+    return prepare_host_comparison(
+        context,
+        conv2d_same,
+        (x, weight),
+        "conv2d",
+        Tolerance(atol=3e-3),
+    )
+
+
+def causal_conv1d_backward(context):
+    shape = (
+        BWD_CAUSAL_CONV_BATCH,
+        BWD_CAUSAL_CONV_CHANNELS,
+        BWD_CAUSAL_CONV_LENGTH,
+    )
+    x = torch.randn(shape, dtype=torch.float16) * 0.5
+    weight = torch.randn(
+        (BWD_CAUSAL_CONV_CHANNELS, BWD_CAUSAL_CONV_WIDTH),
+        dtype=torch.float16,
+    ) * 0.1
+    grad_output = torch.randn_like(x) * 0.05
+    report_stage("generated_compilation")
+    partial = intent.compile(
+        causal_conv1d_backward_partials,
+        target=context.target,
+        compiler=context.compiler,
+        tuning_config=context.tuning_config,
+    )
+    reduce = intent.compile(
+        causal_conv1d_backward_reduce,
+        target=context.target,
+        compiler=context.compiler,
+        tuning_config=context.tuning_config,
+    )
+    runtime = load_module(
+        context.project_root / "source/pytorch/cpu_runtime.py",
+        "intent_cpu_reference_causal_conv1d_backward",
+    )
+    generated_state = {}
+    source_state = {}
+
+    def generated_launch():
+        grad_x, partial_weight, partial_bias = partial.run(x, weight, grad_output)
+        grad_weight, grad_bias = reduce.run(partial_weight, partial_bias)
+        generated_state["output"] = (grad_x, grad_weight, grad_bias)
+
+    def source_launch():
+        source_state["output"] = runtime.causal_conv1d_backward(
+            x, weight, grad_output
+        )
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(
+        PreparedLaunch(generated_launch, lambda: generated_state["output"]),
+        PreparedLaunch(source_launch, lambda: source_state["output"]),
+        (
+            Tolerance(atol=2.5e-3),
+            Tolerance(atol=0.25),
+            Tolerance(atol=0.25),
+        ),
+        cuda_graph=False,
+        device_type="cpu",
+        cpu_host_timing=True,
+        note="既有B8-D2048-L4096-W4 f16 causal conv backward；partial kernel后接reduce kernel，PyTorch CPU reference同算法，双方完整host调用。",
+    )
 
 
 def varlen_conv1d(context):
@@ -78,5 +193,11 @@ def causal_conv_update(context):
     )
 
 
-CASES = {"flaggems_conv1d": conv1d, "varlen_causal_conv1d": varlen_conv1d,
-         "causal_conv_update": causal_conv_update}
+CASES = {
+    "flaggems_conv1d": conv1d,
+    "causal_conv1d": causal_conv1d,
+    "conv2d": conv2d,
+    "causal_conv1d_backward": causal_conv1d_backward,
+    "varlen_causal_conv1d": varlen_conv1d,
+    "causal_conv_update": causal_conv_update,
+}

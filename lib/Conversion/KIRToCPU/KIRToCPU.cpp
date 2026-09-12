@@ -593,6 +593,44 @@ private:
     return success();
   }
 
+  LogicalResult scatterReduce(ScatterReduceOp operation) {
+    auto fact = analysis.indexRelation(operation);
+    if (failed(fact)) return failure();
+    auto rank = advancedIndexRank(operation, *fact);
+    if (failed(rank)) return failure();
+    Location loc = operation.getLoc();
+    Value target = values.lookup(fact->source);
+    Value input = values.lookup(operation->getOperand(operation.getValueOperandIndex()));
+    SmallVector<Value> sizes, members;
+    if (auto memory = dyn_cast<MemRefType>(input.getType()))
+      for (int64_t axis = 0; axis < memory.getRank(); ++axis)
+        sizes.push_back(builder.create<memref::DimOp>(loc, input, axis));
+    std::function<LogicalResult(unsigned)> traverse = [&](unsigned axis) -> LogicalResult {
+      if (axis < sizes.size()) {
+        auto loop = builder.create<scf::ForOp>(loc, constant(loc, 0), sizes[axis], constant(loc, 1));
+        OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(loop.getBody());
+        members.push_back(loop.getInductionVar());
+        auto status = traverse(axis + 1);
+        members.pop_back();
+        return status;
+      }
+      Value value = elementAt(input, members, builder, loc);
+      auto coordinates = indexedCoordinates(*fact, *rank, target, members, builder, loc);
+      auto update = builder.create<memref::GenericAtomicRMWOp>(loc, target, coordinates);
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(&update.getRegion().front());
+      Block &combine = operation.getCombine().front();
+      values.map(combine.getArgument(0), update.getCurrentValue());
+      values.map(combine.getArgument(1), value);
+      for (Operation &instruction : combine.without_terminator())
+        if (failed(lowerOperation(&instruction))) return failure();
+      builder.create<memref::AtomicYieldOp>(loc, values.lookup(combine.getTerminator()->getOperand(0)));
+      return success();
+    };
+    return traverse(0);
+  }
+
   FailureOr<Value> indexed(Operation *operation) {
     auto fact = analysis.indexRelation(operation);
     if (failed(fact))
@@ -1340,6 +1378,8 @@ private:
       return success();
     } else if (isa<AtomicLoadOp, AtomicStoreOp, AtomicRMWOp, AtomicCompareExchangeOp>(operation)) {
       return atomicAccess(operation);
+    } else if (auto op = dyn_cast<ScatterReduceOp>(operation)) {
+      return scatterReduce(op);
     } else if (isa<ViewLoadOp, BufferLoadOp>(operation)) {
       auto value = indexed(operation);
       if (failed(value)) return failure();

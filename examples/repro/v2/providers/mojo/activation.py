@@ -2,6 +2,7 @@ import torch
 
 from kernels.activation.pointwise import addcmul_broadcast_bf16, gelu_tanh, relu_forward
 from kernels.activation.swiglu import swiglu_forward
+from kernels.backward.swiglu import swiglu_backward
 
 from ...model import Tolerance
 from .common import configure_cpu_budget, prepare_host_comparison
@@ -36,4 +37,20 @@ def swiglu(context):
                                    Tolerance(atol=2e-2, rtol=1e-2))
 
 
-CASES = {"gelu": gelu, "relu": relu, "flaggems_addcmul": addcmul, "swiglu": swiglu}
+def swiglu_backward_case(context):
+    configure_cpu_budget()
+    shape = (4096, 4096)
+    dc = torch.randn(shape, dtype=torch.bfloat16) * 0.5
+    a = torch.randn(shape, dtype=torch.bfloat16) * 0.5
+    b = torch.randn(shape, dtype=torch.bfloat16) * 0.5
+    return prepare_host_comparison(
+        context,
+        swiglu_backward,
+        (dc, a, b),
+        "swiglu_backward",
+        (Tolerance(atol=5e-2), Tolerance(atol=5e-2)),
+    )
+
+
+CASES = {"gelu": gelu, "relu": relu, "flaggems_addcmul": addcmul, "swiglu": swiglu,
+         "swiglu_backward": swiglu_backward_case}

@@ -1,6 +1,8 @@
+import math
 import torch
 from kernels.contraction.gemm import Activation, gemm_f32, bf16_gemm, gemm as half_gemm_definition
 from kernels.contraction.batched_gemm import batched_gemm_nn
+from kernels.contraction.dual_gemm import gated_dual_gemm
 from ...model import Tolerance
 from .common import configure_cpu_budget, prepare_comparison, prepare_host_comparison
 
@@ -35,5 +37,20 @@ def batched_gemm(context):
     return prepare_host_comparison(context, batched_gemm_nn, (a, b), "matmul", Tolerance(5e-2, 2e-2))
 
 
+def dual_gemm(context):
+    configure_cpu_budget()
+    x = torch.randn((2048, 4096), dtype=torch.float16)
+    x /= math.sqrt(4096)
+    gate_weight = torch.randn((4096, 4096), dtype=torch.float16)
+    value_weight = torch.randn_like(gate_weight)
+    return prepare_host_comparison(
+        context,
+        gated_dual_gemm,
+        (x, gate_weight, value_weight),
+        "gated_dual_gemm",
+        Tolerance(atol=5e-2),
+    )
+
+
 CASES = {"dense_gemm_f32": gemm, "dense_gemm": half_gemm, "tilegym_dense_gemm": bfloat_gemm,
-         "batched_gemm": batched_gemm}
+         "batched_gemm": batched_gemm, "gated_dual_gemm": dual_gemm}

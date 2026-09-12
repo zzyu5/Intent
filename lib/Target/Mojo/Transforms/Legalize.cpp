@@ -80,7 +80,45 @@ LogicalResult checkSurface(ModuleOp module) {
   return failure(invalid);
 }
 
-void expandAtomicUpdates(ModuleOp module) {
+LogicalResult expandAtomicUpdates(ModuleOp module) {
+  SmallVector<memref::GenericAtomicRMWOp> genericUpdates;
+  module.walk([&](memref::GenericAtomicRMWOp operation) { genericUpdates.push_back(operation); });
+  for (auto operation : genericUpdates) {
+    if (!operation.getResult().use_empty())
+      return operation.emitError("Mojo generic atomic update currently requires a discarded scatter result");
+    OpBuilder builder(operation);
+    Location loc = operation.getLoc();
+    Block &body = operation.getRegion().front();
+    Value yielded = cast<memref::AtomicYieldOp>(body.getTerminator()).getResult();
+    auto *combine = yielded.getDefiningOp();
+    if (combine && isa<arith::AddFOp, arith::AddIOp>(combine) &&
+        std::distance(body.begin(), body.end()) == 2 &&
+        llvm::is_contained(combine->getOperands(), body.getArgument(0))) {
+      Value value = combine->getOperand(combine->getOperand(0) == body.getArgument(0) ? 1 : 0);
+      if (value != body.getArgument(0)) {
+        builder.create<cpu::AtomicRMWOp>(loc, value.getType(), operation.getMemref(), value,
+            operation.getIndices(), AtomicOrdering::Relaxed, AtomicRMWKind::Add);
+        operation.erase();
+        continue;
+      }
+    }
+    Type type = operation.getResult().getType();
+    Value initial = builder.create<cpu::AtomicLoadOp>(loc, type, operation.getMemref(), operation.getIndices(), AtomicOrdering::Relaxed);
+    Value pending = builder.create<arith::ConstantIntOp>(loc, 0, 1);
+    auto retry = builder.create<scf::WhileOp>(loc, TypeRange{type, builder.getI1Type()}, ValueRange{initial, pending});
+    auto *before = builder.createBlock(&retry.getBefore(), {}, {type, builder.getI1Type()}, {loc, loc});
+    Value no = builder.create<arith::ConstantIntOp>(loc, 0, 1);
+    Value again = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, before->getArgument(1), no);
+    builder.create<scf::ConditionOp>(loc, again, before->getArguments());
+    auto *after = builder.createBlock(&retry.getAfter(), {}, {type, builder.getI1Type()}, {loc, loc});
+    IRMapping mapping;
+    mapping.map(body.getArgument(0), after->getArgument(0));
+    for (Operation &instruction : body.without_terminator()) builder.clone(instruction, mapping);
+    auto exchange = builder.create<cpu::AtomicCompareExchangeOp>(loc, type, builder.getI1Type(), operation.getMemref(),
+        after->getArgument(0), mapping.lookupOrDefault(yielded), operation.getIndices(), AtomicOrdering::Relaxed);
+    builder.create<scf::YieldOp>(loc, exchange.getResults());
+    operation.erase();
+  }
   SmallVector<cpu::AtomicRMWOp> updates;
   module.walk([&](cpu::AtomicRMWOp operation) {
     if (operation.getKind() != AtomicRMWKind::Add) updates.push_back(operation);
@@ -117,6 +155,7 @@ void expandAtomicUpdates(ModuleOp module) {
     operation.getOldValue().replaceAllUsesWith(retry.getResult(0));
     operation.erase();
   }
+  return success();
 }
 
 }
@@ -174,7 +213,7 @@ LogicalResult legalizeProgram(ModuleOp module) {
   RewritePatternSet integerDivision(module.getContext());
   arith::populateCeilFloorDivExpandOpsPatterns(integerDivision);
   if (failed(applyPatternsGreedily(module, std::move(integerDivision)))) return failure();
-  expandAtomicUpdates(module);
+  if (failed(expandAtomicUpdates(module))) return failure();
   if (failed(cpu::verifyCPUProgram(module, true)) || failed(checkSurface(module))) return failure();
   OpBuilder builder(module.getContext());
   builder.setInsertionPointToStart(module.getBody());

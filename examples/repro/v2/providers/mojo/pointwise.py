@@ -1,5 +1,6 @@
 import torch
 from kernels.pointwise.batched_affine import batched_row_affine
+from kernels.pointwise.record import paired_sum_product
 from kernels.pointwise.while_loop import integer_log2_floor
 from ...model import Tolerance
 from .common import prepare_comparison, prepare_host_comparison
@@ -21,4 +22,17 @@ def integer_log2(context):
         "integer_log2_floor", Tolerance(atol=0.0))
 
 
-CASES = {"batched_row_affine": affine, "integer_log2_floor": integer_log2}
+def paired_sum_product_case(context):
+    x = torch.randn((1048576,), dtype=torch.float32)
+    y = torch.randn_like(x)
+    return prepare_host_comparison(
+        context,
+        paired_sum_product,
+        (x, y),
+        "paired_sum_product",
+        Tolerance(atol=2e-6),
+    )
+
+
+CASES = {"batched_row_affine": affine, "integer_log2_floor": integer_log2,
+         "paired_sum_product": paired_sum_product_case}

@@ -5,6 +5,7 @@ from kernels.normalization.softmax import stable_softmax, stable_softmax_f16, ch
 from kernels.normalization.layer_norm import weighted_layer_norm, layer_norm_f16, layer_norm_bf16
 from kernels.normalization.logsumexp import row_logsumexp
 from kernels.normalization.batch_norm import batch_norm_training
+from kernels.normalization.fused_add_rms_norm import fused_add_rms_norm
 from kernels.backward.softmax import softmax_backward as backward_definition
 from ...loading import load_module
 from ...measurement import report_stage
@@ -121,9 +122,25 @@ def batch_norm(context):
     )
 
 
+def fused_add_rms_norm_case(context):
+    configure_cpu_budget()
+    shape = (8192, 4096)
+    x = torch.randn(shape, dtype=torch.bfloat16) * 0.5
+    residual = torch.randn_like(x) * 0.5
+    weight = torch.randn((4096,), dtype=torch.bfloat16)
+    return prepare_host_comparison(
+        context,
+        fused_add_rms_norm,
+        (x, residual, weight, 1.0 / 4096, 1.0e-6, 1.0),
+        "fused_add_rms_norm",
+        (Tolerance(atol=5e-2), Tolerance(atol=5e-2)),
+    )
+
+
 CASES = {"weighted_rms_norm": rms_norm, "stable_softmax": softmax, "weighted_layer_norm": layer_norm,
          "flaggems_logsumexp": logsumexp, "fused_softmax": half_softmax, "chunked_softmax": bfloat_softmax,
          "layer_norm_f16": lambda context: mixed_layer_norm(context, layer_norm_f16, torch.float16, Tolerance(1e-2)),
          "layer_norm_bf16": lambda context: mixed_layer_norm(context, layer_norm_bf16, torch.bfloat16, Tolerance(2e-2, 1e-2)),
          "rms_norm_f32": plain_rms_norm, "rms_norm_bf16": bfloat_rms_norm,
-         "flaggems_softmax_backward": softmax_backward, "batch_norm_training": batch_norm}
+         "flaggems_softmax_backward": softmax_backward, "batch_norm_training": batch_norm,
+         "fused_add_rms_norm": fused_add_rms_norm_case}

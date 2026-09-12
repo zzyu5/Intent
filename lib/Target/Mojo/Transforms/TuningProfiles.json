@@ -15,7 +15,9 @@
       {"shared": [8, 1, 1, 1, 1], "local": {"vector_width": 8, "register_replicas": 4, "reduction_replicas": 4}},
       {"shared": [8, 1, 1, 1, 1], "local": {"vector_width": 16, "register_replicas": 4, "reduction_replicas": 4}},
       {"shared": [8, 1, 1, 1, 1], "local": {"vector_width": 16, "register_replicas": 8, "reduction_replicas": 8}},
-      {"shared": [8, 1, 1, 1, 1], "local": {"vector_width": 16, "register_replicas": 16, "reduction_replicas": 16}}
+      {"shared": [8, 1, 1, 1, 1], "local": {"vector_width": 16, "register_replicas": 16, "reduction_replicas": 16}},
+      {"shared": [256, 1, 1, 1, 1], "local": {"vector_width": 16, "register_replicas": 1, "reduction_replicas": 4}},
+      {"shared": [2048, 1, 1, 1, 1], "local": {"vector_width": 16, "register_replicas": 1, "reduction_replicas": 4}}
     ],
     "mojo.register_float": [
       {"shared": [1, 256, 192, 128, 1], "local": {"vector_width": 16, "micro_m": 8, "micro_n": 3, "register_replicas": 1, "reduction_replicas": 1}},

@@ -17,6 +17,17 @@ def swiglu(gate, up):
     return (values * sigmoid).to(gate.dtype) * up
 
 
+def swiglu_backward(dc, a, b):
+    dc_f32 = dc.float()
+    a_f32 = a.float()
+    b_f32 = b.float()
+    sigmoid = torch.sigmoid(a_f32)
+    silu = a_f32 * sigmoid
+    da = (dc_f32 * (silu * (1.0 - sigmoid) + sigmoid) * b_f32).to(torch.bfloat16)
+    db = (dc_f32 * silu).to(torch.bfloat16)
+    return da, db
+
+
 def addcmul(x, scale, bias):
     return bias.unsqueeze(-1) + x * scale.unsqueeze(-1)
 
@@ -49,9 +60,68 @@ def weighted_rms_norm(x, weight, inverse_features, epsilon):
     return (rms_norm(values, inverse_features, epsilon) * weight.float()).to(x.dtype)
 
 
+def fused_add_rms_norm(x, residual, weight, inverse_features, epsilon, weight_offset):
+    summed = (x.float() + residual.float()).to(x.dtype)
+    summed_f32 = summed.float()
+    inverse_rms = torch.rsqrt(
+        summed_f32.square().sum(dim=1, keepdim=True) * inverse_features + epsilon
+    )
+    normalized = (
+        summed_f32 * inverse_rms * (weight.float() + weight_offset)
+    ).to(x.dtype)
+    return normalized, summed
+
+
 def softmax_backward(probabilities, upstream):
     projection = (probabilities * upstream).sum(dim=-1, keepdim=True)
     return probabilities * (upstream - projection)
+
+
+def fused_cross_entropy(logits, labels):
+    loss = F.cross_entropy(logits, labels.long(), reduction="none", ignore_index=-100)
+    valid = labels != -100
+    prediction = torch.where(valid, logits.argmax(dim=1), -1).to(torch.int32)
+    gradient = torch.softmax(logits, dim=1)
+    safe_labels = torch.where(valid, labels, 0).long()
+    gradient[torch.arange(logits.shape[0]), safe_labels] -= valid.float()
+    gradient *= valid[:, None].float()
+    logits.copy_(gradient)
+    return logits, loss, prediction
+
+
+def group_norm_silu_backward(x, upstream, weight, bias, mean, rstd, dweight, dbias, inverse_group_elements):
+    values = x.float()
+    normalized = ((values.reshape(32, 32, 8, 1024) - mean[:, :, None, None])
+                  * rstd[:, :, None, None]).reshape_as(values)
+    affine = normalized * weight[None, :, None] + bias[None, :, None]
+    sigmoid = torch.sigmoid(affine)
+    gradient = upstream.float() * (sigmoid + affine * sigmoid * (1.0 - sigmoid))
+    dx, dw, db = torch.ops.aten.native_group_norm_backward(
+        gradient, values, mean, rstd, weight, 32, 256, 1024, 32, [True, True, True])
+    dweight.add_(dw)
+    dbias.add_(db)
+    return dx.to(x.dtype), dweight, dbias
+
+
+def causal_conv1d(x, weight, bias):
+    values = F.conv1d(F.pad(x.float(), (weight.shape[1] - 1, 0)),
+                      weight[:, None, :].float(), bias.float(), groups=x.shape[1])
+    return F.silu(values).to(x.dtype)
+
+
+def conv2d(x, weight):
+    return F.conv2d(x[:, None].float(), weight[None, None].float(), padding=1)[:, 0].to(x.dtype)
+
+
+def causal_conv1d_backward(x, weight, grad_output):
+    batch, channels, length = x.shape
+    width = weight.shape[1]
+    gradient = grad_output.float()
+    padded = F.pad(x.float(), (width - 1, 0))
+    dx = torch.nn.grad.conv1d_input(padded.shape, weight[:, None].float(), gradient, groups=channels)
+    dw = torch.nn.grad.conv1d_weight(padded, (channels, 1, width), gradient, groups=channels)
+    db = gradient.sum(dim=(0, 2))
+    return dx[:, :, width - 1:].to(x.dtype), dw[:, 0], db
 
 
 def transpose(x):
@@ -82,6 +152,10 @@ def integer_log2_floor(values):
         value = torch.where(active, torch.div(value, 2, rounding_mode="floor"), value)
         result = result + active.to(result.dtype)
     return result
+
+
+def paired_sum_product(x, y):
+    return (x + y) + (x * y)
 
 
 def rope_qk(query, key, cosine, sine):
@@ -119,6 +193,17 @@ def greedy_nms(boxes, threshold):
             overlap = intersection / (candidate_area + remaining_area - intersection)
             suppressed[candidate + 1 :] |= overlap > threshold
     return keep
+
+
+def embedding_backward_atomic(indices, grad_output, grad_weight):
+    grad_weight.index_add_(0, indices.long(), grad_output)
+    return grad_weight
+
+
+def claim_zero_slots(state):
+    previous = state.clone()
+    state.copy_(torch.where(state == 0, torch.ones_like(state), state))
+    return state, previous
 
 
 def cumsum(x):
@@ -216,6 +301,12 @@ def roi_align_center_sample(feature, rois):
 
 def index_select(source, indices):
     return torch.index_select(source, 0, indices)
+
+
+def gated_dual_gemm(x, gate_weight, value_weight):
+    gate = x.float() @ gate_weight.float()
+    value = x.float() @ value_weight.float()
+    return (torch.relu(gate) * value).to(x.dtype)
 
 
 def matmul(a, b):
@@ -363,6 +454,14 @@ def smith_waterman(query, reference):
             maximum = torch.maximum(maximum, cell)
         previous = current
     return maximum.to(torch.int32)
+
+
+def adafactor(gradient, parameter, row_state, column_state, row_mean, decay, learning_rate, epsilon):
+    row_state.mul_(decay).add_(gradient.square().mean(dim=1), alpha=1.0 - decay)
+    column_state.mul_(decay).add_(gradient.square().mean(dim=0), alpha=1.0 - decay)
+    row_mean.copy_(row_state.mean().reshape(1))
+    variance = row_state[:, None] * column_state[None, :] / row_mean
+    parameter.add_(gradient * torch.rsqrt(variance + epsilon), alpha=-learning_rate)
 
 
 def adamw(gradient, parameter, first_moment, second_moment, learning_rate,

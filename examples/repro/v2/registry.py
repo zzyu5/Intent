@@ -154,6 +154,11 @@ TILELANG = (
 
 
 MOJO = (
+    Entry("fused_cross_entropy", "4096x16384-f32-8cores-host", "fused_cross_entropy", ("loss/cross_entropy.py:fused_cross_entropy",), "source/pytorch/cpu_runtime.py"),
+    Entry("group_norm_silu_backward", "B32-C256-S1024-G32-bf16-8cores-host", "group_norm_silu_backward", ("backward/group_norm_silu.py:group_norm_silu_backward",), "source/pytorch/cpu_runtime.py"),
+    Entry("causal_conv1d", "B8-C2048-L4096-W4-f16-8cores-host", "causal_conv1d", ("convolution/direct.py:causal_depthwise_conv1d",), "source/pytorch/cpu_runtime.py"),
+    Entry("conv2d", "B16-H256-W256-K3-f16-8cores-host", "conv2d", ("convolution/direct.py:conv2d_same",), "source/pytorch/cpu_runtime.py"),
+    Entry("causal_conv1d_backward", "B8-C2048-L4096-W4-f16-8cores-host", "causal_conv1d_backward", ("backward/causal_conv.py:causal_conv1d_backward_partials", "backward/causal_conv.py:causal_conv1d_backward_reduce"), "source/pytorch/cpu_runtime.py"),
     Entry("batch_norm_training", "B32-C64-S4096-fp16-8cores-host", "batch_norm_training", ("normalization/batch_norm.py:batch_norm_training",), "source/pytorch/cpu_runtime.py"),
     Entry("insertion_top_k", "1024x4093-k8-fp32-8cores-host", "insertion_top_k", ("sampling/top_k.py:insertion_top_k",), "source/pytorch/cpu_runtime.py"),
     Entry("histogram", "N8388608-bins256-f32-to-i32-8cores-host", "histogram_256", ("statistics/histogram.py:histogram_256",), "source/pytorch/cpu_runtime.py"),
@@ -174,8 +179,11 @@ MOJO = (
     Entry("swiglu", "8192x14336-bf16-8cores-host", "swiglu_forward", ("activation/swiglu.py:swiglu_forward",), "source/pytorch/cpu_runtime.py"),
     Entry("embedding_lookup", "tokens16384-vocab32768-hidden4096-bf16-8cores-host", "embedding_forward_lookup_bf16", ("backward/embedding.py:embedding_forward_lookup_bf16",), "source/pytorch/cpu_runtime.py"),
     Entry("embedding_lookup_f32", "tokens8192-vocab8192-hidden1021-f32-8cores-host", "embedding_forward_lookup", ("backward/embedding.py:embedding_forward_lookup",), "source/pytorch/cpu_runtime.py"),
+    Entry("embedding_backward_atomic", "M32768-V8192-D1021-f32-8cores-host", "embedding_backward_atomic", ("backward/embedding.py:embedding_backward_atomic",), "source/pytorch/cpu_runtime.py"),
+    Entry("atomic_compare_exchange", "N65536-i32-8cores-host", "claim_zero_slots", ("synchronization/compare_exchange.py:claim_zero_slots",), "source/pytorch/cpu_runtime.py"),
     Entry("index_select", "source65536-selected32768-hidden4096-fp16-8cores-host", "index_select_rows", ("indexing/relations.py:index_select_rows",), "source/pytorch/cpu_runtime.py"),
     Entry("flaggems_fused_adamw", "N8388608-fp32-8cores-host", "adamw_update", ("optimization/adamw.py:adamw_update",), "source/pytorch/cpu_runtime.py"),
+    Entry("adafactor", "4096x4096-fp32-8cores-host", "adafactor", ("optimization/adafactor.py:adafactor_update_rows", "optimization/adafactor.py:adafactor_update_columns", "optimization/adafactor.py:adafactor_apply"), "source/pytorch/cpu_runtime.py"),
     Entry("dense_gemm", "M4096-N14336-K4096-fp16-8cores-host", "gemm", ("contraction/gemm.py:gemm",), "source/pytorch/cpu_runtime.py"),
     Entry("tilegym_dense_gemm", "M8192-N11008-K4096-bf16-8cores-host", "bf16_gemm", ("contraction/gemm.py:bf16_gemm",), "source/pytorch/cpu_runtime.py"),
     Entry("batched_gemm", "B32-M512-N512-K1024-bf16-8cores-host", "batched_gemm_nn", ("contraction/batched_gemm.py:batched_gemm_nn",), "source/pytorch/cpu_runtime.py"),
@@ -207,6 +215,10 @@ MOJO = (
     Entry("dense_gemm_f32", "M1024-N1024-K1024-f32-8cores", "gemm_f32", ("contraction/gemm.py:gemm_f32",), "source/mojo/modular/contraction/gemm/gemm_runtime.py"),
     Entry("stable_softmax", "8192x8192-f32-8cores", "stable_softmax", ("normalization/softmax.py:stable_softmax",), "source/mojo/modular/normalization/softmax/softmax_runtime.py"),
     Entry("weighted_layer_norm", "8192x4096-f32-8cores", "weighted_layer_norm", ("normalization/layer_norm.py:weighted_layer_norm",), "source/mojo/modular/normalization/layer_norm/layer_norm_runtime.py"),
+    Entry("swiglu_backward", "4096x4096-bf16-8cores-host", "swiglu_backward", ("backward/swiglu.py:swiglu_backward",), "source/pytorch/cpu_runtime.py"),
+    Entry("fused_add_rms_norm", "8192x4096-bf16-8cores-host", "fused_add_rms_norm", ("normalization/fused_add_rms_norm.py:fused_add_rms_norm",), "source/pytorch/cpu_runtime.py"),
+    Entry("paired_sum_product", "N1048576-f32-8cores-host", "paired_sum_product", ("pointwise/record.py:paired_sum_product",), "source/pytorch/cpu_runtime.py"),
+    Entry("gated_dual_gemm", "M2048-N4096-K4096-fp16-8cores-host", "gated_dual_gemm", ("contraction/dual_gemm.py:gated_dual_gemm",), "source/pytorch/cpu_runtime.py"),
 )
 
 

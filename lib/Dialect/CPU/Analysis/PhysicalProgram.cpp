@@ -126,6 +126,8 @@ SmallVector<MemoryAccess> PhysicalProgramAnalysis::accesses(Operation *scope) {
       add(atomic.getTarget(), true, true);
     } else if (auto atomic = dyn_cast<AtomicCompareExchangeOp>(operation)) {
       add(atomic.getTarget(), true, true);
+    } else if (auto update = dyn_cast<memref::GenericAtomicRMWOp>(operation)) {
+      add(update.getMemref(), true, true);
     } else if (isa<RegionFoldOp, RegionScanOp>(operation)) {
       RegionProgram program(operation);
       for (Value input : program.sources()) add(input, true, false);
