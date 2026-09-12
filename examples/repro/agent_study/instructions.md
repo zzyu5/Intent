@@ -21,7 +21,11 @@ For Intent generation, define ordinary @intent.kernel / @intent.fn programs usin
 intent.language. Inside build, use context.compile("unique_literal_name", kernel,
 constexprs={...}) for each kernel. This invokes the unmodified public
 intent.generate path and materializes its generated Triton. The returned artifact
-supports run(*inputs) and explicit-output launch via artifact(*inputs, *outputs).
+supports explicit-output launch with runtime arguments in kernel declaration
+order: artifact(*declared_runtime_arguments). Keep Out arguments in their declared
+positions, even when scalar inputs follow them. artifact.run(...) allocates and
+returns Out tensors; omit only Out arguments and preserve the order of all other
+runtime arguments. Constexpr arguments are bound at compilation and omitted here.
 All compile calls must execute during build, not inside the timed wrapper. Do not
 call intent.compile/generate or invoke a different compiler yourself. Choose the
 kernel algorithm, not hardware block sizes or provider-specific emission.

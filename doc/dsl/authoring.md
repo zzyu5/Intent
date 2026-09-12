@@ -50,7 +50,9 @@ Python tuple 与 `I.record(field=value, ...)` 是结构化 products，不要求�
 
 ### Host 编译与调用
 
-Public 调用为 `intent.compile(kernel, compiler=..., target=..., constexprs=...)`，返回 artifact；`artifact(*inputs, *outputs)` 显式传输出，`artifact.run(*inputs)` 分配并返回输出。编译与 launch 分开。`intent.generate` 只生成 source/IR；target 在 host 选择，例如 `intent.targets.TritonTarget()`，不能在 kernel 查询设备或选择 warp/tile。
+Public 调用为 `intent.compile(kernel, compiler=..., target=..., constexprs=...)`，返回 artifact。显式调用 `artifact(...)` 按 kernel 声明顺序传入全部 runtime 参数，`Out` 保留在声明位置；`artifact.run(...)` 只省略 `Out`，其余 views 与 scalars 保持原顺序，由 runtime 分配并返回输出。例如声明顺序为 `A: In, B: Out, scale: f32` 时，调用为 `artifact(A, B, scale)` 或 `artifact.run(A, scale)`。`Constexpr` 在编译时绑定，不传入这两种 runtime 调用。
+
+编译与 launch 分开。`intent.generate` 只生成 source/IR；target 在 host 选择，例如 `intent.targets.TritonTarget()`，不能在 kernel 查询设备或选择 warp/tile。
 
 `constexprs` 绑定 kernel 签名中声明的 `I.Constexpr[...]` 参数。View shape 中的 `"M"`、`"K"` 是 logical extent 名字；`M, K = input.shape` 读取这些 extents，不会声明同名 constexpr 参数。只有动态 shape 的 kernel 无需把本次输入尺寸传入 `constexprs`。
 
