@@ -189,6 +189,12 @@ private:
     return memories.at(memory).pointer + ".unsafe_offset(" + offset(memory, indices) + ")";
   }
 
+  std::string unsignedValue(Value value) {
+    Type type = getElementTypeOrSelf(value.getType());
+    std::string input = value.getType().isIndex() ? "Int64(" + name(value) + ")" : name(value);
+    return "bitcast[DType.uint" + std::to_string(type.isIndex() ? 64 : type.getIntOrFloatBitWidth()) + "](" + input + ")";
+  }
+
   LogicalResult block(Block &body) {
     for (Operation &operation : body.without_terminator())
       if (failed(emit(&operation))) return failure();
@@ -452,6 +458,7 @@ private:
       return conditional(op);
     } else if (auto op = dyn_cast<arith::CmpIOp>(operation)) {
       StringRef token, method;
+      bool isUnsigned = false;
       switch (op.getPredicate()) {
       case arith::CmpIPredicate::eq: token = " == "; method = "eq"; break;
       case arith::CmpIPredicate::ne: token = " != "; method = "ne"; break;
@@ -459,11 +466,15 @@ private:
       case arith::CmpIPredicate::sle: token = " <= "; method = "le"; break;
       case arith::CmpIPredicate::sgt: token = " > "; method = "gt"; break;
       case arith::CmpIPredicate::sge: token = " >= "; method = "ge"; break;
-      default: return op.emitError("unsupported Mojo unsigned comparison");
+      case arith::CmpIPredicate::ult: token = " < "; method = "lt"; isUnsigned = true; break;
+      case arith::CmpIPredicate::ule: token = " <= "; method = "le"; isUnsigned = true; break;
+      case arith::CmpIPredicate::ugt: token = " > "; method = "gt"; isUnsigned = true; break;
+      case arith::CmpIPredicate::uge: token = " >= "; method = "ge"; isUnsigned = true; break;
       }
+      std::string lhs = isUnsigned ? unsignedValue(op.getLhs()) : name(op.getLhs());
+      std::string rhs = isUnsigned ? unsignedValue(op.getRhs()) : name(op.getRhs());
       assign(op.getResult(), isa<VectorType>(op.getLhs().getType())
-          ? name(op.getLhs()) + "." + method.str() + "(" + name(op.getRhs()) + ")"
-          : name(op.getLhs()) + token.str() + name(op.getRhs()));
+          ? lhs + "." + method.str() + "(" + rhs + ")" : lhs + token.str() + rhs);
     } else if (auto op = dyn_cast<arith::CmpFOp>(operation)) {
       StringRef token, method;
       switch (op.getPredicate()) {
@@ -496,22 +507,40 @@ private:
           isa<arith::MaximumFOp>(operation) ? "llvm.maximum" : "llvm.minimum";
       assign(operation->getResult(0), "llvm_intrinsic[\"" + intrinsic.str() + "\", " + type + "](" +
           name(operation->getOperand(0)) + ", " + name(operation->getOperand(1)) + ")");
-    } else if (isa<arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::ExtFOp,
+    } else if (auto op = dyn_cast<arith::BitcastOp>(operation)) {
+      assign(op.getResult(), "bitcast[DType." + dtype(op.getType()) + "](" + name(op.getIn()) + ")");
+    } else if (isa<arith::DivUIOp, arith::RemUIOp, arith::ShRUIOp, arith::MinUIOp, arith::MaxUIOp>(operation)) {
+      std::string lhs = unsignedValue(operation->getOperand(0)), rhs = unsignedValue(operation->getOperand(1));
+      std::string expression;
+      if (isa<arith::MinUIOp, arith::MaxUIOp>(operation))
+        expression = std::string(isa<arith::MinUIOp>(operation) ? "min(" : "max(") + lhs + ", " + rhs + ")";
+      else expression = "(" + lhs + ") " + (isa<arith::DivUIOp>(operation) ? "/" : isa<arith::RemUIOp>(operation) ? "%" : ">>") + " (" + rhs + ")";
+      assign(operation->getResult(0), "bitcast[DType." + dtype(operation->getResult(0).getType()) + "](" + expression + ")");
+    } else if (isa<arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::FPToUIOp, arith::ExtFOp,
                    arith::TruncFOp, arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp>(operation)) {
       Value input = operation->getOperand(0), result = operation->getResult(0);
       std::string expression = name(input);
       if (input.getType().isInteger(1)) expression = "SIMD[DType.bool, 1](" + expression + ")";
-      assign(result, expression + ".cast[DType." + dtype(result.getType()) + "]()");
+      else if (!getElementTypeOrSelf(input.getType()).isInteger(1) && isa<arith::UIToFPOp, arith::ExtUIOp>(operation))
+        expression = unsignedValue(input);
+      if (isa<arith::FPToUIOp>(operation)) {
+        auto bits = getElementTypeOrSelf(result.getType()).getIntOrFloatBitWidth();
+        expression += ".cast[DType.uint" + std::to_string(bits) + "]()";
+        assign(result, "bitcast[DType." + dtype(result.getType()) + "](" + expression + ")");
+      } else assign(result, expression + ".cast[DType." + dtype(result.getType()) + "]()");
     } else if (auto op = dyn_cast<arith::NegFOp>(operation)) {
       assign(op.getResult(), "-" + name(op.getOperand()));
     } else if (auto op = dyn_cast<arith::RemSIOp>(operation)) {
       std::string lhs = name(op.getLhs()), rhs = name(op.getRhs());
       assign(op.getResult(), "(" + lhs + ") - ((" + lhs + ") / (" + rhs + ")) * (" + rhs + ")");
-    } else if (isa<arith::IndexCastOp>(operation)) {
+    } else if (isa<arith::IndexCastOp, arith::IndexCastUIOp>(operation)) {
       Value result = operation->getResult(0);
+      Value input = operation->getOperand(0);
+      bool unsignedSource = isa<arith::IndexCastUIOp>(operation) && !getElementTypeOrSelf(input.getType()).isIndex();
+      std::string expression = unsignedSource ? unsignedValue(input) : name(input);
       if (isa<VectorType>(result.getType()))
-        assign(result, name(operation->getOperand(0)) + ".cast[DType." + dtype(result.getType()) + "]()");
-      else assign(result, valueType(result.getType()) + "(" + name(operation->getOperand(0)) + ")");
+        assign(result, expression + ".cast[DType." + dtype(result.getType()) + "]()");
+      else assign(result, valueType(result.getType()) + "(" + expression + ")");
     } else {
       std::string token;
       if (isa<arith::AddFOp, arith::AddIOp>(operation)) token = "+";
@@ -550,7 +579,7 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string
   llvm::raw_string_ostream output(source);
   output << "from std.ffi import external_call\n"
             "from std.atomic import Atomic, Ordering\n"
-            "from std.memory import Layout, alloc, dealloc, unsafe_stack_allocation\n"
+            "from std.memory import Layout, alloc, dealloc, unsafe_stack_allocation, bitcast\n"
             "from std.sys import prefetch, llvm_intrinsic\n"
             "from std.sys.intrinsics import PrefetchOptions\n"
             "from std.math import fma, sqrt, exp, exp2, log, tanh, sin, cos, floor, erf, abs, min, max\n"

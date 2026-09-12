@@ -1,5 +1,56 @@
+import numpy as np
 import torch
 import torch.nn.functional as F
+
+
+def philox_uniform(seed, counters):
+    counter = np.asarray(counters, dtype=np.uint64)
+    block = counter >> np.uint64(2)
+    mask = np.uint64(0xFFFFFFFF)
+    c0, c1 = block & mask, block >> np.uint64(32)
+    c2, c3 = np.zeros_like(block), np.zeros_like(block)
+    k0, k1 = seed & 0xFFFFFFFF, seed >> 32
+    for _ in range(10):
+        p0 = c0 * np.uint64(0xD2511F53)
+        p1 = c2 * np.uint64(0xCD9E8D57)
+        c0, c1, c2, c3 = ((p1 >> np.uint64(32)) ^ c1 ^ np.uint64(k0), p1 & mask,
+                          (p0 >> np.uint64(32)) ^ c3 ^ np.uint64(k1), p0 & mask)
+        k0 = (k0 + 0x9E3779B9) & 0xFFFFFFFF
+        k1 = (k1 + 0xBB67AE85) & 0xFFFFFFFF
+    word = counter & np.uint64(3)
+    bits = c3.copy()
+    for index, values in enumerate((c0, c1, c2)):
+        np.copyto(bits, values, where=word == index)
+    return torch.from_numpy((bits >> np.uint64(8)).astype(np.float32) * np.float32(2.0**-24))
+
+
+def dropout_residual_rms_norm(x, residual, weight, dnormalized, dresidual_out,
+                              seed, keep_probability, inverse_keep_probability,
+                              inverse_features, epsilon, weight_offset):
+    counters = np.arange(x.numel(), dtype=np.uint64).reshape(x.shape)
+    keep = (philox_uniform(seed, counters) < keep_probability).float()
+    summed = (x.float() * keep / keep_probability + residual.float()).to(x.dtype)
+    values = summed.float()
+    inverse_rms = torch.rsqrt(values.square().sum(dim=1, keepdim=True) * inverse_features + epsilon)
+    normalized = (values * inverse_rms * (weight.float() + weight_offset)).to(x.dtype)
+    gradient = dnormalized.float() * (weight.float() + weight_offset)
+    projection = (gradient * values).sum(dim=1, keepdim=True) * inverse_features
+    summed_gradient = gradient * inverse_rms - values * inverse_rms.pow(3) * projection + dresidual_out.float()
+    dx = (summed_gradient * keep / keep_probability).to(x.dtype)
+    return normalized, summed, dx, summed_gradient.to(x.dtype)
+
+
+def barrier_option_paths(seed, initial_price, strike, barrier, drift, volatility):
+    counters = np.arange(262144 * 64, dtype=np.uint64).reshape(262144, 64)
+    uniform = philox_uniform(seed, counters)
+    price = torch.full((262144,), initial_price, dtype=torch.float32)
+    knocked_out = torch.zeros((262144,), dtype=torch.bool)
+    for step in range(64):
+        direction = torch.where(uniform[:, step] >= 0.5, volatility, -volatility)
+        next_price = price * torch.exp(torch.tensor(drift, dtype=torch.float32) + direction)
+        price = torch.where(knocked_out, price, next_price)
+        knocked_out |= price >= barrier
+    return torch.where(knocked_out, torch.zeros_like(price), torch.clamp_min(price - strike, 0.0))
 
 
 def gelu(x):

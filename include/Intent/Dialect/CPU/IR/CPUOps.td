@@ -55,7 +55,7 @@ def IntentCPU_HistogramOp : IntentCPU_Op<"histogram"> {
   let summary = "Typed active values contributing to logical integer bins";
   let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$values,
       Arg<AnyMemRef, "", [MemRead]>:$valid,
-      Arg<AnyMemRef, "", [MemWrite]>:$output);
+      Arg<AnyMemRef, "", [MemWrite]>:$output, BoolAttr:$unsigned_values);
   let hasVerifier = 1;
 }
 
@@ -79,7 +79,7 @@ def IntentCPU_AtomicStoreOp : IntentCPU_AtomicOp<"atomic_store"> {
 def IntentCPU_AtomicRMWOp : IntentCPU_AtomicOp<"atomic_rmw"> {
   let arguments = (ins AnyMemRef:$target, AnyType:$value,
       Variadic<Index>:$indices, Intent_AtomicOrderingAttr:$ordering,
-      Intent_AtomicRMWKindAttr:$kind);
+      Intent_AtomicRMWKindAttr:$kind, BoolAttr:$unsigned_integer);
   let results = (outs AnyType:$old_value);
 }
 

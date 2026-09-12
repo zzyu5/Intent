@@ -224,6 +224,8 @@ MOJO = (
     Entry("fused_add_rms_norm", "8192x4096-bf16-8cores-host", "fused_add_rms_norm", ("normalization/fused_add_rms_norm.py:fused_add_rms_norm",), "source/pytorch/cpu_runtime.py"),
     Entry("paired_sum_product", "N1048576-f32-8cores-host", "paired_sum_product", ("pointwise/record.py:paired_sum_product",), "source/pytorch/cpu_runtime.py"),
     Entry("gated_dual_gemm", "M2048-N4096-K4096-fp16-8cores-host", "gated_dual_gemm", ("contraction/dual_gemm.py:gated_dual_gemm",), "source/pytorch/cpu_runtime.py"),
+    Entry("dropout_residual_rms_norm", "4096x4096-bf16-seed17-p0.1-8cores-host", "dropout_residual_rms_norm", ("normalization/dropout_residual_rms_norm.py:dropout_residual_rms_norm_forward", "normalization/dropout_residual_rms_norm.py:dropout_residual_rms_norm_backward_data"), "source/pytorch/cpu_runtime.py"),
+    Entry("barrier_option_paths", "paths262144-steps64-f32-seed17-8cores-host", "barrier_option_paths", ("simulation/monte_carlo.py:barrier_option_paths",), "source/pytorch/cpu_runtime.py"),
 )
 
 

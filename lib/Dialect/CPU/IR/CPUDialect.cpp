@@ -27,9 +27,8 @@ LogicalResult ViewArgumentAttr::verify(
     uint32_t access, StringAttr alias, bool) {
   if (!name || name.getValue().empty() ||
       (!element.isF16() && !element.isBF16() && !element.isF32() && !element.isF64() &&
-       !element.isUnsignedInteger(8) && !element.isSignlessInteger(8) &&
-       !element.isSignlessInteger(16) && !element.isSignlessInteger(32) &&
-       !element.isSignlessInteger(64) && !element.isInteger(1)) || !shape || !dimensions ||
+       !element.isInteger(8) && !element.isInteger(16) && !element.isInteger(32) &&
+       !element.isInteger(64) && !element.isInteger(1)) || !shape || !dimensions ||
       shape.size() != dimensions.size() || access > 2 || !alias)
     return error() << "CPU view argument requires a named numeric view and complete shape identities";
   for (auto [size, dimension] : llvm::zip(shape.asArrayRef(), dimensions.asArrayRef()))
@@ -42,8 +41,8 @@ LogicalResult ViewArgumentAttr::verify(
 LogicalResult ScalarArgumentAttr::verify(
     llvm::function_ref<InFlightDiagnostic()> error, StringAttr name, Type type) {
   if (!name || name.getValue().empty() ||
-      (!type.isF32() && !type.isF64() && !type.isIndex() && !type.isSignlessInteger(8) &&
-       !type.isSignlessInteger(16) && !type.isSignlessInteger(32) && !type.isSignlessInteger(64) && !type.isInteger(1)))
+      (!type.isF32() && !type.isF64() && !type.isIndex() && !type.isInteger(8) &&
+       !type.isInteger(16) && !type.isInteger(32) && !type.isInteger(64) && !type.isInteger(1)))
     return error() << "CPU scalar argument requires a name and a supported C ABI numeric type";
   return success();
 }

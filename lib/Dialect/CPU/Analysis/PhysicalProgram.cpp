@@ -193,13 +193,17 @@ LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
       !interface.getContiguousViews() || !interface.getDisjointOutputs())
     return function.emitError("CPU function requires its complete typed native interface");
   for (auto [argument, field] : llvm::zip(function.getArguments(), interface.getArguments())) {
+    auto storageType = [&](Type logical) -> Type {
+      if (auto integer = dyn_cast<IntegerType>(logical)) return IntegerType::get(function.getContext(), integer.getWidth());
+      return logical;
+    };
     if (auto view = dyn_cast<ViewArgumentAttr>(field)) {
       auto type = dyn_cast<MemRefType>(argument.getType());
-      if (!type || type.getElementType() != view.getElementType() ||
+      if (!type || type.getElementType() != storageType(view.getElementType()) ||
           type.getShape() != view.getShape().asArrayRef() || !type.getLayout().isIdentity())
         return function.emitError("CPU view type disagrees with its physical ABI");
     } else if (auto scalar = dyn_cast<ScalarArgumentAttr>(field)) {
-      if (scalar.getType() != argument.getType())
+      if (storageType(scalar.getType()) != argument.getType())
         return function.emitError("CPU scalar type disagrees with its physical ABI");
     } else return function.emitError("CPU interface contains an unknown argument schema");
   }

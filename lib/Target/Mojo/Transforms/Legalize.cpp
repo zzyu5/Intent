@@ -35,13 +35,13 @@ LogicalResult checkSurface(ModuleOp module) {
     if (isa<ModuleOp, func::FuncOp, func::ReturnOp, scf::YieldOp, scf::ConditionOp, scf::ReduceOp>(operation)) return;
     bool supported = isa<arith::ConstantOp, arith::AddFOp, arith::AddIOp,
         arith::SubFOp, arith::SubIOp, arith::MulFOp, arith::MulIOp,
-        arith::DivFOp, arith::DivSIOp, arith::RemSIOp,
-        arith::MinSIOp, arith::MaxSIOp, arith::NegFOp,
-        arith::IndexCastOp, arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp,
+        arith::DivFOp, arith::DivSIOp, arith::RemSIOp, arith::DivUIOp, arith::RemUIOp,
+        arith::MinSIOp, arith::MaxSIOp, arith::MinUIOp, arith::MaxUIOp, arith::NegFOp,
+        arith::IndexCastOp, arith::IndexCastUIOp, arith::BitcastOp, arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::FPToUIOp,
         arith::ExtFOp, arith::TruncFOp, arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp,
         arith::MaxNumFOp, arith::MinNumFOp, arith::MaximumFOp, arith::MinimumFOp,
         arith::CmpFOp, arith::SelectOp, arith::AndIOp, arith::OrIOp, arith::XOrIOp,
-        arith::ShLIOp, arith::ShRSIOp,
+        arith::ShLIOp, arith::ShRSIOp, arith::ShRUIOp,
         math::FmaOp, math::SqrtOp, math::ExpOp, math::Exp2Op, math::LogOp, math::TanhOp,
         math::SinOp, math::CosOp, math::FloorOp, math::ErfOp, math::AbsFOp, math::AbsIOp, math::PowFOp, memref::DimOp,
         memref::SubViewOp, memref::CastOp, memref::LoadOp, memref::StoreOp,
@@ -97,7 +97,7 @@ LogicalResult expandAtomicUpdates(ModuleOp module) {
       Value value = combine->getOperand(combine->getOperand(0) == body.getArgument(0) ? 1 : 0);
       if (value != body.getArgument(0)) {
         builder.create<cpu::AtomicRMWOp>(loc, value.getType(), operation.getMemref(), value,
-            operation.getIndices(), AtomicOrdering::Relaxed, AtomicRMWKind::Add);
+            operation.getIndices(), AtomicOrdering::Relaxed, AtomicRMWKind::Add, false);
         operation.erase();
         continue;
       }
@@ -140,9 +140,11 @@ LogicalResult expandAtomicUpdates(ModuleOp module) {
     case AtomicRMWKind::Exchange: desired = value; break;
     case AtomicRMWKind::Maximum:
       desired = isa<FloatType>(type) ? Value(builder.create<arith::MaximumFOp>(loc, old, value))
+          : operation.getUnsignedInteger() ? Value(builder.create<arith::MaxUIOp>(loc, old, value))
           : Value(builder.create<arith::MaxSIOp>(loc, old, value)); break;
     case AtomicRMWKind::Minimum:
       desired = isa<FloatType>(type) ? Value(builder.create<arith::MinimumFOp>(loc, old, value))
+          : operation.getUnsignedInteger() ? Value(builder.create<arith::MinUIOp>(loc, old, value))
           : Value(builder.create<arith::MinSIOp>(loc, old, value)); break;
     case AtomicRMWKind::BitwiseAnd: desired = builder.create<arith::AndIOp>(loc, old, value); break;
     case AtomicRMWKind::BitwiseOr: desired = builder.create<arith::OrIOp>(loc, old, value); break;

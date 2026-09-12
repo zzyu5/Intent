@@ -25,6 +25,38 @@ struct Domain {
   Value begin, end, step, extent;
 };
 
+Type integerStorageType(Type type) {
+  if (auto integer = dyn_cast<IntegerType>(type))
+    return IntegerType::get(type.getContext(), integer.getWidth());
+  if (auto memory = dyn_cast<MemRefType>(type))
+    return MemRefType::get(memory.getShape(), integerStorageType(memory.getElementType()), memory.getLayout(), memory.getMemorySpace());
+  if (auto function = dyn_cast<FunctionType>(type)) {
+    SmallVector<Type> inputs, outputs;
+    for (Type input : function.getInputs()) inputs.push_back(integerStorageType(input));
+    for (Type output : function.getResults()) outputs.push_back(integerStorageType(output));
+    return FunctionType::get(type.getContext(), inputs, outputs);
+  }
+  if (auto vector = dyn_cast<VectorType>(type))
+    return VectorType::get(vector.getShape(), integerStorageType(vector.getElementType()), vector.getScalableDims());
+  return type;
+}
+
+void realizeIntegerStorage(ModuleOp module) {
+  module.walk([&](Operation *operation) {
+    for (Value result : operation->getResults()) result.setType(integerStorageType(result.getType()));
+    for (Region &region : operation->getRegions())
+      for (Block &block : region)
+        for (BlockArgument argument : block.getArguments()) argument.setType(integerStorageType(argument.getType()));
+    SmallVector<NamedAttribute> attributes(operation->getAttrs());
+    for (NamedAttribute attribute : attributes) {
+      if (auto type = dyn_cast<TypeAttr>(attribute.getValue()))
+        operation->setAttr(attribute.getName(), TypeAttr::get(integerStorageType(type.getValue())));
+      else if (auto integer = dyn_cast<IntegerAttr>(attribute.getValue()))
+        operation->setAttr(attribute.getName(), IntegerAttr::get(integerStorageType(integer.getType()), integer.getValue()));
+    }
+  });
+}
+
 class Construction {
 public:
   Construction(ModuleOp original, ModuleOp physical)
@@ -49,9 +81,8 @@ public:
         auto tensor = cast<RankedTensorType>(view.getTensor());
         Type element = tensor.getElementType();
         if ((!element.isF16() && !element.isBF16() && !element.isF32() && !element.isF64() &&
-             !element.isUnsignedInteger(8) && !element.isSignlessInteger(8) &&
-             !element.isSignlessInteger(16) && !element.isSignlessInteger(32) &&
-             !element.isSignlessInteger(64) && !element.isInteger(1)))
+             !element.isInteger(8) && !element.isInteger(16) && !element.isInteger(32) &&
+             !element.isInteger(64) && !element.isInteger(1)))
           return source.emitError("CPU construction requires supported numeric views");
         auto memory = MemRefType::get(tensor.getShape(), tensor.getElementType());
         if (view.getConstraints().getHasStrides()) {
@@ -78,8 +109,8 @@ public:
             view.getAccess(), view.getConstraints().getAlias(),
             view.getConstraints().getNoalias()));
       } else if (argument.getType().isF32() || argument.getType().isF64() || argument.getType().isIndex() ||
-                 argument.getType().isSignlessInteger(8) || argument.getType().isSignlessInteger(16) ||
-                 argument.getType().isSignlessInteger(32) || argument.getType().isSignlessInteger(64) ||
+                 argument.getType().isInteger(8) || argument.getType().isInteger(16) ||
+                 argument.getType().isInteger(32) || argument.getType().isInteger(64) ||
                  argument.getType().isInteger(1)) {
         types.push_back(argument.getType());
         interface.push_back(cpu::ScalarArgumentAttr::get(builder.getContext(),
@@ -119,14 +150,22 @@ private:
     return builder.create<arith::ConstantIndexOp>(loc, value);
   }
 
-  FailureOr<Value> indexValue(Value value, Location loc) {
+  FailureOr<Value> indexValue(Value value, Type logicalType, Location loc) {
     if (value.getType().isIndex()) return value;
-    if (value.getType().isSignlessInteger() && !value.getType().isInteger(1))
-      return Value(builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), value));
-    return emitError(loc, "CPU coordinates require index or signed integer values"), failure();
+    if (isa<IntegerType>(value.getType()) && !value.getType().isInteger(1)) {
+      auto integer = dyn_cast<IntegerType>(logicalType);
+      if (!integer && !logicalType.isIndex() && !isa<LogicalIndexType>(logicalType))
+        return emitError(loc, "CPU coordinate has no integer interpretation"), failure();
+      return integer && integer.isUnsigned()
+          ? Value(builder.create<arith::IndexCastUIOp>(loc, builder.getIndexType(), value))
+          : Value(builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), value));
+    }
+    return emitError(loc, "CPU coordinates require index or integer values"), failure();
   }
 
   Value domainExtent(Value begin, Value end, Value step, Location loc) {
+    if (matchPattern(begin, m_Zero()) && matchPattern(step, m_One()) && end.getDefiningOp<memref::DimOp>())
+      return end;
     Value distance = builder.createOrFold<arith::SubIOp>(loc, end, begin);
     Value nonnegative = builder.createOrFold<arith::MaxSIOp>(loc, distance, constant(loc, 0));
     return builder.createOrFold<arith::CeilDivSIOp>(loc, nonnegative, step);
@@ -453,8 +492,12 @@ private:
           if (!advancedBegin) { advancedBegin = axis; axis += advancedRank; }
           coordinate = elementAt(coordinate, members.slice(*advancedBegin, advancedRank), nested, loc);
         }
-        if (!coordinate.getType().isIndex())
-          coordinate = nested.create<arith::IndexCastOp>(loc, nested.getIndexType(), coordinate);
+        if (!coordinate.getType().isIndex()) {
+          auto logical = cast<IntegerType>(getElementTypeOrSelf(term.operands[0].getType()));
+          coordinate = logical.isUnsigned()
+              ? Value(nested.create<arith::IndexCastUIOp>(loc, nested.getIndexType(), coordinate))
+              : Value(nested.create<arith::IndexCastOp>(loc, nested.getIndexType(), coordinate));
+        }
       }
       coordinates.push_back(coordinate);
     }
@@ -577,7 +620,8 @@ private:
         builder.create<cpu::AtomicStoreOp>(loc, target, operand("value_operand"), coordinates, ordering);
       } else if (isa<AtomicRMWOp>(operation)) {
         results.push_back(builder.create<cpu::AtomicRMWOp>(loc, element, target, operand("value_operand"),
-            coordinates, ordering, operation->getAttrOfType<AtomicRMWKindAttr>("kind")));
+            coordinates, ordering, operation->getAttrOfType<AtomicRMWKindAttr>("kind"),
+            builder.getBoolAttr(isa<IntegerType>(element) && cast<IntegerType>(element).isUnsigned())));
       } else {
         auto exchange = builder.create<cpu::AtomicCompareExchangeOp>(loc, element, builder.getI1Type(),
             target, operand("expected_operand"), operand("desired_operand"), coordinates, ordering);
@@ -660,7 +704,7 @@ private:
         resultShape.push_back(type.getDimSize(axis));
         projection.push_back(builder.getAffineDimExpr(outputAxis++));
       } else if (term.kind == 3 && term.operands.size() == 1) {
-        auto coordinate = indexValue(values.lookup(term.operands[0]), operation->getLoc());
+        auto coordinate = indexValue(values.lookup(term.operands[0]), term.operands[0].getType(), operation->getLoc());
         if (failed(coordinate)) return failure();
         offsets.push_back(*coordinate);
         sizes.push_back(builder.getIndexAttr(1));
@@ -734,7 +778,44 @@ private:
 
   FailureOr<Value> arithmetic(Operation *operation, ValueRange arguments, OpBuilder &builder) {
     Location loc = operation->getLoc();
-    if (auto binary = dyn_cast<BinaryOp>(operation)) {
+    if (isa<RandomBitsOp>(operation)) {
+      Type u32 = IntegerType::get(builder.getContext(), 32, IntegerType::Unsigned);
+      Type u64 = IntegerType::get(builder.getContext(), 64, IntegerType::Unsigned);
+      auto literal = [&](Type type, uint64_t value) -> Value {
+        return builder.create<arith::ConstantOp>(loc, builder.getIntegerAttr(type, value));
+      };
+      auto low = [&](Value value) -> Value { return builder.create<arith::TruncIOp>(loc, u32, value); };
+      auto high = [&](Value value) -> Value {
+        return low(builder.create<arith::ShRUIOp>(loc, value, literal(u64, 32)));
+      };
+      Value counter = arguments[1];
+      if (counter.getType().isIndex()) counter = builder.create<arith::IndexCastUIOp>(loc, u64, counter);
+      Value block = builder.create<arith::ShRUIOp>(loc, counter, literal(u64, 2));
+      Value word = builder.create<arith::AndIOp>(loc, counter, literal(u64, 3));
+      Value key0 = low(arguments[0]), key1 = high(arguments[0]);
+      SmallVector<Value> words{low(block), high(block), literal(u32, 0), literal(u32, 0)};
+      auto product = [&](Value value, uint64_t multiplier) {
+        Value wide = builder.create<arith::ExtUIOp>(loc, u64, value);
+        Value result = builder.create<arith::MulIOp>(loc, wide, literal(u64, multiplier));
+        return std::make_pair(high(result), low(result));
+      };
+      auto mix = [&](Value a, Value b, Value key) -> Value {
+        return builder.create<arith::XOrIOp>(loc, builder.create<arith::XOrIOp>(loc, a, b), key);
+      };
+      for (unsigned round = 0; round < 10; ++round) {
+        auto [hi0, lo0] = product(words[0], 0xD2511F53);
+        auto [hi1, lo1] = product(words[2], 0xCD9E8D57);
+        words = {mix(hi1, words[1], key0), lo1, mix(hi0, words[3], key1), lo0};
+        key0 = builder.create<arith::AddIOp>(loc, key0, literal(u32, 0x9E3779B9));
+        key1 = builder.create<arith::AddIOp>(loc, key1, literal(u32, 0xBB67AE85));
+      }
+      Value result = words[3];
+      for (int i = 2; i >= 0; --i) {
+        Value selected = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, word, literal(u64, i));
+        result = builder.create<arith::SelectOp>(loc, selected, words[i], result);
+      }
+      return result;
+    } else if (auto binary = dyn_cast<BinaryOp>(operation)) {
       Value a = arguments[0], b = arguments[1];
       if (binary.getApproximate() || binary.getFlushToZero()) {
         if (binary.getOperatorKind() != BinaryOperator::TrueDivide || !binary.getApproximate() ||
@@ -762,6 +843,8 @@ private:
         return binary.getFlushToZero() ? flush(result) : result;
       }
       bool fp = isa<FloatType>(a.getType());
+      auto logical = dyn_cast<IntegerType>(getElementTypeOrSelf(binary.getOperand(0).getType()));
+      bool unsignedInteger = logical && logical.isUnsigned();
       switch (binary.getOperatorKind()) {
       case BinaryOperator::Add:
         return fp ? Value(builder.create<arith::AddFOp>(loc, a, b)) : Value(builder.create<arith::AddIOp>(loc, a, b));
@@ -773,10 +856,12 @@ private:
         if (fp) return Value(builder.create<arith::DivFOp>(loc, a, b));
         break;
       case BinaryOperator::FloorDivide:
-        if (!fp) return Value(builder.create<arith::FloorDivSIOp>(loc, a, b));
+        if (!fp) return unsignedInteger ? Value(builder.create<arith::DivUIOp>(loc, a, b))
+            : Value(builder.create<arith::FloorDivSIOp>(loc, a, b));
         break;
       case BinaryOperator::Remainder:
         if (!fp) {
+          if (unsignedInteger) return Value(builder.create<arith::RemUIOp>(loc, a, b));
           Value quotient = builder.create<arith::FloorDivSIOp>(loc, a, b);
           Value product = builder.create<arith::MulIOp>(loc, quotient, b);
           return Value(builder.create<arith::SubIOp>(loc, a, product));
@@ -792,16 +877,19 @@ private:
         if (fp) return Value(builder.create<math::PowFOp>(loc, a, b));
         break;
       case BinaryOperator::Maximum:
-        return fp ? Value(builder.create<arith::MaximumFOp>(loc, a, b)) : Value(builder.create<arith::MaxSIOp>(loc, a, b));
+        return fp ? Value(builder.create<arith::MaximumFOp>(loc, a, b)) : unsignedInteger
+            ? Value(builder.create<arith::MaxUIOp>(loc, a, b)) : Value(builder.create<arith::MaxSIOp>(loc, a, b));
       case BinaryOperator::Minimum:
-        return fp ? Value(builder.create<arith::MinimumFOp>(loc, a, b)) : Value(builder.create<arith::MinSIOp>(loc, a, b));
+        return fp ? Value(builder.create<arith::MinimumFOp>(loc, a, b)) : unsignedInteger
+            ? Value(builder.create<arith::MinUIOp>(loc, a, b)) : Value(builder.create<arith::MinSIOp>(loc, a, b));
       case BinaryOperator::LogicalAnd:
       case BinaryOperator::BitwiseAnd: return Value(builder.create<arith::AndIOp>(loc, a, b));
       case BinaryOperator::LogicalOr:
       case BinaryOperator::BitwiseOr: return Value(builder.create<arith::OrIOp>(loc, a, b));
       case BinaryOperator::BitwiseXor: return Value(builder.create<arith::XOrIOp>(loc, a, b));
       case BinaryOperator::LeftShift: return Value(builder.create<arith::ShLIOp>(loc, a, b));
-      case BinaryOperator::RightShift: return Value(builder.create<arith::ShRSIOp>(loc, a, b));
+      case BinaryOperator::RightShift: return unsignedInteger ? Value(builder.create<arith::ShRUIOp>(loc, a, b))
+          : Value(builder.create<arith::ShRSIOp>(loc, a, b));
       default: break;
       }
     } else if (auto unary = dyn_cast<UnaryOp>(operation)) {
@@ -820,6 +908,7 @@ private:
       case UnaryOperator::Tanh: return Value(builder.create<math::TanhOp>(loc, arguments[0]));
       case UnaryOperator::Abs:
         if (isa<FloatType>(arguments[0].getType())) return Value(builder.create<math::AbsFOp>(loc, arguments[0]));
+        if (auto type = dyn_cast<IntegerType>(getElementTypeOrSelf(unary.getOperand().getType())); type && type.isUnsigned()) return arguments[0];
         return Value(builder.create<math::AbsIOp>(loc, arguments[0]));
       case UnaryOperator::Sigmoid: {
         Value one = builder.create<arith::ConstantOp>(loc, builder.getFloatAttr(arguments[0].getType(), 1.0));
@@ -840,26 +929,37 @@ private:
           arith::CmpFPredicate::OLT, arith::CmpFPredicate::OLE, arith::CmpFPredicate::OGT, arith::CmpFPredicate::OGE};
       static const arith::CmpIPredicate integer[] = {arith::CmpIPredicate::eq, arith::CmpIPredicate::ne,
           arith::CmpIPredicate::slt, arith::CmpIPredicate::sle, arith::CmpIPredicate::sgt, arith::CmpIPredicate::sge};
+      static const arith::CmpIPredicate unsignedPredicates[] = {arith::CmpIPredicate::eq, arith::CmpIPredicate::ne,
+          arith::CmpIPredicate::ult, arith::CmpIPredicate::ule, arith::CmpIPredicate::ugt, arith::CmpIPredicate::uge};
+      auto type = dyn_cast<IntegerType>(getElementTypeOrSelf(compare.getOperand(0).getType()));
       unsigned predicate = static_cast<unsigned>(compare.getPredicate());
       return isa<FloatType>(arguments[0].getType())
           ? Value(builder.create<arith::CmpFOp>(loc, floating[predicate], arguments[0], arguments[1]))
-          : Value(builder.create<arith::CmpIOp>(loc, integer[predicate], arguments[0], arguments[1]));
+          : Value(builder.create<arith::CmpIOp>(loc, type && type.isUnsigned() ? unsignedPredicates[predicate] : integer[predicate], arguments[0], arguments[1]));
     } else if (isa<SelectOp>(operation)) {
       return Value(builder.create<arith::SelectOp>(loc, arguments[0], arguments[1], arguments[2]));
     } else if (isa<MaskOp>(operation)) {
       return Value(builder.create<arith::SelectOp>(loc, arguments[1], arguments[0], arguments[2]));
+    } else if (isa<BitcastOp>(operation)) {
+      return Value(builder.create<arith::BitcastOp>(loc, getElementTypeOrSelf(operation->getResult(0).getType()), arguments[0]));
     } else if (auto cast = dyn_cast<CastOp>(operation)) {
       Type type = getElementTypeOrSelf(cast.getType());
-      Type input = arguments[0].getType();
+      Type input = getElementTypeOrSelf(cast.getOperand().getType());
+      if (isa<LogicalIndexType>(input)) input = builder.getIndexType();
+      auto inputInteger = dyn_cast<IntegerType>(input), outputInteger = dyn_cast<IntegerType>(type);
+      bool unsignedInput = inputInteger && inputInteger.isUnsigned();
+      bool unsignedOutput = outputInteger && outputInteger.isUnsigned();
       if (input == type) return arguments[0];
       if (cast.getRounding() && *cast.getRounding() != 0)
         return cast.emitError("CPU non-default-rounding cast is not implemented"), failure();
       if (type.isInteger(1)) return cast.emitError("CPU numeric-to-bool cast is not implemented"), failure();
-      if (input.isIndex() && type.isSignlessInteger()) return Value(builder.create<arith::IndexCastOp>(loc, type, arguments[0]));
-      if (input.isSignlessInteger() && type.isIndex()) return Value(builder.create<arith::IndexCastOp>(loc, type, arguments[0]));
-      if ((input.isIndex() || input.isSignlessInteger()) && isa<FloatType>(type)) {
+      if (input.isIndex() && outputInteger) return unsignedOutput
+          ? Value(builder.create<arith::IndexCastUIOp>(loc, type, arguments[0])) : Value(builder.create<arith::IndexCastOp>(loc, type, arguments[0]));
+      if (inputInteger && type.isIndex()) return unsignedInput
+          ? Value(builder.create<arith::IndexCastUIOp>(loc, type, arguments[0])) : Value(builder.create<arith::IndexCastOp>(loc, type, arguments[0]));
+      if ((input.isIndex() || inputInteger) && isa<FloatType>(type)) {
         Value value = input.isIndex() ? Value(builder.create<arith::IndexCastOp>(loc, builder.getI64Type(), arguments[0])) : arguments[0];
-        if (input.isInteger(1)) return Value(builder.create<arith::UIToFPOp>(loc, type, value));
+        if (input.isInteger(1) || unsignedInput) return Value(builder.create<arith::UIToFPOp>(loc, type, value));
         return Value(builder.create<arith::SIToFPOp>(loc, type, value));
       }
       if (isa<FloatType>(input) && isa<FloatType>(type)) {
@@ -870,12 +970,14 @@ private:
         Value widened = builder.create<arith::ExtFOp>(loc, builder.getF32Type(), arguments[0]);
         return Value(builder.create<arith::TruncFOp>(loc, type, widened));
       }
-      if (isa<FloatType>(input) && type.isSignlessInteger() && !type.isInteger(1))
-        return Value(builder.create<arith::FPToSIOp>(loc, type, arguments[0]));
-      if (input.isSignlessInteger() && type.isSignlessInteger()) {
+      if (isa<FloatType>(input) && outputInteger && !type.isInteger(1))
+        return unsignedOutput ? Value(builder.create<arith::FPToUIOp>(loc, type, arguments[0]))
+            : Value(builder.create<arith::FPToSIOp>(loc, type, arguments[0]));
+      if (inputInteger && outputInteger) {
+        if (input.getIntOrFloatBitWidth() == type.getIntOrFloatBitWidth()) return arguments[0];
         if (input.getIntOrFloatBitWidth() > type.getIntOrFloatBitWidth())
           return Value(builder.create<arith::TruncIOp>(loc, type, arguments[0]));
-        if (input.isInteger(1)) return Value(builder.create<arith::ExtUIOp>(loc, type, arguments[0]));
+        if (input.isInteger(1) || unsignedInput) return Value(builder.create<arith::ExtUIOp>(loc, type, arguments[0]));
         return Value(builder.create<arith::ExtSIOp>(loc, type, arguments[0]));
       }
     }
@@ -1321,7 +1423,9 @@ private:
       Value begin = values.lookup(op.getBounds()[0]);
       Value end = values.lookup(op.getBounds()[1]);
       Value step = op.getBounds().size() == 3 ? values.lookup(op.getBounds()[2]) : constant(loc, 1);
-      auto physicalBegin = indexValue(begin, loc), physicalEnd = indexValue(end, loc), physicalStep = indexValue(step, loc);
+      auto physicalBegin = indexValue(begin, op.getBounds()[0].getType(), loc);
+      auto physicalEnd = indexValue(end, op.getBounds()[1].getType(), loc);
+      auto physicalStep = indexValue(step, op.getBounds().size() == 3 ? op.getBounds()[2].getType() : builder.getIndexType(), loc);
       if (failed(physicalBegin) || failed(physicalEnd) || failed(physicalStep)) return failure();
       Value extent = domainExtent(*physicalBegin, *physicalEnd, *physicalStep, loc);
       Domain domain{*physicalBegin, *physicalEnd, *physicalStep, extent};
@@ -1333,12 +1437,14 @@ private:
       Domain domain = source->second;
       unsigned position = 1;
       if (op.getHasStart()) {
-        auto start = indexValue(values.lookup(op.getInputs()[position++]), loc);
+        Value input = op.getInputs()[position++];
+        auto start = indexValue(values.lookup(input), input.getType(), loc);
         if (failed(start)) return failure();
         domain.begin = *start;
       }
       if (op.getHasStop()) {
-        auto stop = indexValue(values.lookup(op.getInputs()[position]), loc);
+        Value input = op.getInputs()[position];
+        auto stop = indexValue(values.lookup(input), input.getType(), loc);
         if (failed(stop)) return failure();
         domain.end = *stop;
       }
@@ -1406,7 +1512,7 @@ private:
       auto value = indexed(operation);
       if (failed(value)) return failure();
       values.map(op.getResult(), *value);
-    } else if (isa<BinaryOp, UnaryOp, CompareOp, SelectOp, CastOp, MaskOp>(operation)) {
+    } else if (isa<BinaryOp, UnaryOp, CompareOp, SelectOp, CastOp, BitcastOp, MaskOp, RandomBitsOp>(operation)) {
       return pointwise(operation);
     } else if (auto op = dyn_cast<FullOp>(operation)) {
       auto tensor = cast<RankedTensorType>(op.getResult().getType());
@@ -1501,7 +1607,9 @@ private:
       auto type = cast<RankedTensorType>(op.getResult().getType());
       Value bins = values.lookup(op.getBins());
       Value output = allocate(type, {bins}, loc);
-      builder.create<cpu::HistogramOp>(loc, values.lookup(op.getValues()), values.lookup(op.getValid()), output);
+      auto integer = dyn_cast<IntegerType>(getElementTypeOrSelf(op.getValues().getType()));
+      builder.create<cpu::HistogramOp>(loc, values.lookup(op.getValues()), values.lookup(op.getValid()), output,
+          integer && integer.isUnsigned());
       values.map(op.getResult(), output);
       bindDimensions(type, output, loc);
     } else if (auto op = dyn_cast<ScanOp>(operation)) {
@@ -1562,6 +1670,7 @@ LogicalResult lowerCanonicalKIRToCPU(ModuleOp module) {
     if (failed(construction.lower(function))) return failure();
   }
   if (count == 0) return module.emitError("CPU construction found no kernel");
+  realizeIntegerStorage(*physical);
   if (failed(mlir::verify(*physical))) return failure();
   module.getBodyRegion().takeBody(physical->getBodyRegion());
   module->setAttrs((*physical)->getAttrs());

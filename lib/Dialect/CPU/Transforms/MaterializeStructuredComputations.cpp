@@ -276,10 +276,8 @@ LogicalResult realizeHistograms(func::FuncOp function) {
         b.setInsertionPointToStart(conditional.thenBlock());
         Value value = b.create<memref::LoadOp>(loc, operation.getValues(), coordinates);
         if (!value.getType().isIndex()) {
-          if (value.getType().isUnsignedInteger()) {
-            Value bits = b.create<arith::BitcastOp>(loc, b.getIntegerType(value.getType().getIntOrFloatBitWidth()), value);
-            value = b.create<arith::IndexCastUIOp>(loc, b.getIndexType(), bits);
-          } else value = b.create<arith::IndexCastOp>(loc, b.getIndexType(), value);
+          if (operation.getUnsignedValues()) value = b.create<arith::IndexCastUIOp>(loc, b.getIndexType(), value);
+          else value = b.create<arith::IndexCastOp>(loc, b.getIndexType(), value);
         }
         SmallVector<Value> bin{group, value};
         Value previous = b.create<memref::LoadOp>(loc, partials, bin);

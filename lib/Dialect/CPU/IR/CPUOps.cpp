@@ -135,6 +135,8 @@ LogicalResult AtomicStoreOp::verify() {
 }
 
 LogicalResult AtomicRMWOp::verify() {
+  if (getUnsignedInteger() && !isa<IntegerType>(getValue().getType()))
+    return emitOpError("unsigned atomic interpretation requires integer storage");
   if (getKind() == intent::AtomicRMWKind::BitwiseAnd || getKind() == intent::AtomicRMWKind::BitwiseOr ||
       getKind() == intent::AtomicRMWKind::BitwiseXor)
     if (!isa<IntegerType>(getValue().getType())) return emitOpError("bitwise atomic RMW requires an integer");
@@ -151,7 +153,7 @@ bool recordType(Type type, int64_t bytes) {
   auto memory = dyn_cast<MemRefType>(type);
   return memory && memory.getRank() == 2 &&
       (memory.isDynamicDim(1) || memory.getDimSize(1) == bytes) &&
-      memory.getElementType().isUnsignedInteger(8);
+      memory.getElementType().isSignlessInteger(8);
 }
 }
 
@@ -173,7 +175,7 @@ LogicalResult QuantizedDotOp::verify() {
   auto output = cast<MemRefType>(getOutput().getType());
   if (getLhsFormat() != intent::QuantFormat::Q4K || getRhsFormat() != intent::QuantFormat::Q8K ||
       !recordType(rhs, 292) || (lhs.getRank() != 2 && lhs.getRank() != 3) ||
-      !lhs.getElementType().isUnsignedInteger(8) ||
+      !lhs.getElementType().isSignlessInteger(8) ||
       (!lhs.isDynamicDim(lhs.getRank() - 1) && lhs.getShape().back() != 144) ||
       output.getRank() != lhs.getRank() - 2 || !output.getElementType().isF32())
     return emitOpError("quantized dots require Q4_K [G,144] or [R,G,144], shared Q8_K [G,292], and f32 [] or [R] output");

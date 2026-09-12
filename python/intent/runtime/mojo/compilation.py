@@ -20,11 +20,13 @@ _libraries: dict[tuple[object, ...], NativeLibrary] = {}
 ELEMENT_TYPES = {
     "f16": "Float16", "bf16": "BFloat16", "f32": "Float32", "f64": "Float64",
     "i1": "SIMD[DType.bool, 1]", "i8": "Int8", "i16": "Int16", "i32": "Int32", "i64": "Int64",
+    "ui8": "UInt8", "ui16": "UInt16", "ui32": "UInt32", "ui64": "UInt64",
 }
 
 SCALAR_CTYPES = {
     "f32": ctypes.c_float, "f64": ctypes.c_double, "i1": ctypes.c_bool,
     "i8": ctypes.c_int8, "i16": ctypes.c_int16, "i32": ctypes.c_int32, "i64": ctypes.c_int64,
+    "ui8": ctypes.c_uint8, "ui16": ctypes.c_uint16, "ui32": ctypes.c_uint32, "ui64": ctypes.c_uint64,
 }
 
 
@@ -35,7 +37,8 @@ def flattened_signature(parameters: list[dict[str, object]]) -> tuple[list[str],
         name = f"a{index}"
         if parameter["kind"] == "view":
             signature.append(f"{name}: Pointer[{ELEMENT_TYPES[parameter['dtype']]}, MutUntrackedOrigin]")
-            arguments.append(name)
+            arguments.append(f"{name}.unsafe_bitcast[Int{parameter['dtype'][2:]}]()"
+                             if parameter["dtype"].startswith("ui") else name)
             rank = len(parameter["shape"])
             for role in ("d", "s"):
                 for axis in range(rank):
@@ -44,7 +47,8 @@ def flattened_signature(parameters: list[dict[str, object]]) -> tuple[list[str],
                     arguments.append(field)
         else:
             signature.append(f"{name}: {'Bool' if parameter['dtype'] == 'i1' else ELEMENT_TYPES[parameter['dtype']]}")
-            arguments.append(name)
+            arguments.append(f"bitcast[DType.int{parameter['dtype'][2:]}]({name})"
+                             if parameter["dtype"].startswith("ui") else name)
     return signature, arguments
 
 
