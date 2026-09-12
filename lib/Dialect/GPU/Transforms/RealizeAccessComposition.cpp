@@ -282,6 +282,31 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
       coordinate = *projected;
     }
     Value original = sourceLoad.getCoordinates()[target.fragmentAxis];
+    if (auto range = original.getDefiningOp<MakeRangeOp>();
+        range && (!isZero(range.getStart()) || !isUnitStepRange(range))) {
+      Type indexType = range.getResult().getType().getElementType();
+      if (auto fragment = dyn_cast<FragmentType>(coordinate.getType()))
+        indexType = FragmentType::get(
+            fragment.getContext(), indexType, fragment.getShape(),
+            fragment.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
+      if (coordinate.getType() != indexType)
+        coordinate = builder.create<CastOp>(gather.getLoc(), indexType, coordinate);
+      auto projectedBound = [&](Value bound) -> Value {
+        if (auto fragment = dyn_cast<FragmentType>(indexType))
+          return builder.create<BroadcastOp>(gather.getLoc(), fragment, bound);
+        return bound;
+      };
+      // Gather indexes positions in the loaded tensor. Its ordinal must be
+      // composed with the load range before becoming a resource coordinate.
+      if (!isUnitStepRange(range))
+        coordinate = builder.create<BinaryOp>(
+            gather.getLoc(), indexType, coordinate, projectedBound(range.getStep()),
+            BinaryOperator::Multiply);
+      if (!isZero(range.getStart()))
+        coordinate = builder.create<BinaryOp>(
+            gather.getLoc(), indexType, projectedBound(range.getStart()), coordinate,
+            BinaryOperator::Add);
+    }
     replay.map(original, coordinate);
     PhysicalRangeFact roots = analysis.sourceRanges(original);
     if (roots.isUnique() && !replay.lookupOrNull(roots.roots.front().getResult()))
