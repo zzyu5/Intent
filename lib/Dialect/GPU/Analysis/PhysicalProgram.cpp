@@ -1238,13 +1238,18 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
             *upper <= std::numeric_limits<int64_t>::max() - *step + 1)
           return {true, expression(PhysicalExprKind::Constant,
                                    std::max<int64_t>(*upper - 1, 0))};
-        if (lower.nonNegative && upperBound.nonNegative && upperBound.upper &&
-            step && *step == 1)
-          return {true, expression(PhysicalExprKind::Maximum, 0,
-              {expression(PhysicalExprKind::Subtract, 0,
-                          {upperBound.upper,
-                           expression(PhysicalExprKind::Constant, 1)}),
-               expression(PhysicalExprKind::Constant, 0)})};
+        if (lower.nonNegative && step && *step == 1) {
+          // The induction value exists only in an executing loop body. Its
+          // exclusive upper bound therefore exceeds the nonnegative lower
+          // bound, even when that upper expression can be negative elsewhere.
+          PhysicalExprAttr end = queryLaunchExpression(loop.getUpperBound());
+          if (!end && upperBound.nonNegative)
+            end = upperBound.upper;
+          if (end)
+            return {true, expression(PhysicalExprKind::Subtract, 0,
+                                    {end, expression(PhysicalExprKind::Constant, 1)}),
+                    lower.lower};
+        }
       }
     }
     if (auto parameter = current.getDefiningOp<ParameterOp>()) {

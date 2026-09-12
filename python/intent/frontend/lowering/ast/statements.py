@@ -11,6 +11,7 @@ from intent.frontend.semantics import Effect
 from intent.frontend.semantics import EffectKind
 from intent.frontend.semantics import LogicalIndexType
 from intent.frontend.semantics import OperationKind
+from intent.frontend.semantics import RecordType
 from intent.frontend.semantics import RegionType
 from intent.frontend.semantics import ResourceKind
 from intent.frontend.semantics import ScalarType
@@ -21,6 +22,7 @@ from intent.language import bool as intent_bool
 from intent.language import DType
 from intent.language import f64
 from intent.language import i64
+from intent.language import index as intent_index
 
 from .expressions import compile_time_value
 from .indexing import lower_index
@@ -222,6 +224,67 @@ def _lower_return(lowerer: object, node: ast.Return) -> None:
     lowerer.error(node, "only the kernel entry may return outside an inline @intent.fn")
 
 
+def _control_value_type(value_type: object) -> object:
+    if isinstance(value_type, LogicalIndexType):
+        return ScalarType(intent_index)
+    if isinstance(value_type, TupleType):
+        return TupleType(tuple(_control_value_type(item) for item in value_type.components))
+    if isinstance(value_type, RecordType):
+        return RecordType(tuple(
+            (name, _control_value_type(item)) for name, item in value_type.fields
+        ))
+    return value_type
+
+
+def _control_value(
+    lowerer: object,
+    expression: Expression,
+    node: ast.AST,
+    expected_type: object | None = None,
+) -> MlirValue:
+    if isinstance(expression, StaticTuple):
+        expected = (
+            expected_type.components
+            if isinstance(expected_type, TupleType)
+            and len(expected_type.components) == len(expression.elements)
+            else (None,) * len(expression.elements)
+        )
+        expression = StaticTuple(tuple(
+            _control_value(lowerer, item, node, schema)
+            for item, schema in zip(expression.elements, expected)
+        ))
+    if isinstance(expression, MlirValue):
+        result_type = _control_value_type(expression.type)
+        if isinstance(expression.type, LogicalIndexType):
+            # A merge/carry can select coordinates from different domains.
+            # Keep their SSA dependencies without claiming one source identity.
+            expression = lowerer.emit(
+                OperationKind.CAST, lowerer.location(node),
+                operands=(expression,), result_types=(result_type,),
+            ).results[0]
+        elif result_type != expression.type:
+            components = (
+                expression.type.components
+                if isinstance(expression.type, TupleType)
+                else tuple(item for _, item in expression.type.fields)
+            )
+            values = []
+            for index, component_type in enumerate(components):
+                component = lowerer.emit(
+                    OperationKind.EXTRACT, lowerer.location(node),
+                    operands=(expression,), result_types=(component_type,),
+                    attributes={"field": index},
+                ).results[0]
+                values.append(_control_value(lowerer, component, node))
+            expression = lowerer.emit(
+                OperationKind.MAKE_TUPLE if isinstance(result_type, TupleType)
+                else OperationKind.MAKE_RECORD,
+                lowerer.location(node), operands=tuple(values),
+                result_types=(result_type,),
+            ).results[0]
+    return lowerer.materialize(expression, node, expected_type)
+
+
 def _lower_if(lowerer: object, node: ast.If) -> None:
     condition_expression = lowerer.lower_expression(node.test)
     known, value = compile_time_value(condition_expression)
@@ -298,12 +361,12 @@ def _lower_if(lowerer: object, node: ast.If) -> None:
         merge_names.append(name)
         snapshot_type = _expression_type(snapshot[name]) if name in snapshot else None
         if snapshot_type is not None:
-            merge_types[name] = snapshot_type
+            merge_types[name] = _control_value_type(snapshot_type)
             continue
         for branch_value in branch_values:
             branch_type = _expression_type(branch_value)
             if branch_type is not None:
-                merge_types[name] = branch_type
+                merge_types[name] = _control_value_type(branch_type)
                 break
 
     branch_yields: list[tuple[MlirValue, ...] | None] = []
@@ -320,7 +383,7 @@ def _lower_if(lowerer: object, node: ast.If) -> None:
         for name in merge_names:
             expression = environment[name]
             expected = merge_types.get(name)
-            value_result = lowerer.materialize(expression, node, expected)
+            value_result = _control_value(lowerer, expression, node, expected)
             if expected is not None:
                 value_result = lowerer.project_value_schema(value_result, expected, node)
             values.append(value_result)
@@ -431,7 +494,7 @@ def _lower_for(lowerer: object, node: ast.For) -> None:
         )
     carried_names = tuple(sorted(assigned_existing)) if opcode is OperationKind.FOR else ()
     initial_values = tuple(
-        lowerer.materialize(snapshot[name], node) for name in carried_names
+        _control_value(lowerer, snapshot[name], node) for name in carried_names
     )
     iteration_types = _iteration_argument_types(lowerer, source)
     region = lowerer.make_region(
@@ -452,7 +515,7 @@ def _lower_for(lowerer: object, node: ast.For) -> None:
     if not lowerer.is_terminated(block):
         yielded = tuple(
             lowerer.project_value_schema(
-                lowerer.materialize(lowerer.environment[name], node, initial.type),
+                _control_value(lowerer, lowerer.environment[name], node, initial.type),
                 initial.type,
                 node,
             )
@@ -526,7 +589,7 @@ def _lower_while(lowerer: object, node: ast.While) -> None:
 
     snapshot = dict(lowerer.environment)
     carried_names = tuple(sorted(_assigned_names(body) & set(snapshot)))
-    initial_values = tuple(lowerer.materialize(snapshot[name], node) for name in carried_names)
+    initial_values = tuple(_control_value(lowerer, snapshot[name], node) for name in carried_names)
     state_types = tuple(value.type for value in initial_values)
     before = lowerer.make_region(lowerer.location(node), state_types)
     after = lowerer.make_region(lowerer.location(node), state_types)
@@ -551,7 +614,14 @@ def _lower_while(lowerer: object, node: ast.While) -> None:
     lowerer.loop_stack.append(LoopContext(OperationKind.WHILE, carried_names))
     lowerer.lower_statements(body)
     if not lowerer.is_terminated(after.blocks[0]):
-        yielded = tuple(lowerer.materialize(lowerer.environment[name], node) for name in carried_names)
+        yielded = tuple(
+            lowerer.project_value_schema(
+                _control_value(lowerer, lowerer.environment[name], node, initial.type),
+                initial.type,
+                node,
+            )
+            for name, initial in zip(carried_names, initial_values)
+        )
         lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=yielded)
     lowerer.loop_stack.pop()
 
