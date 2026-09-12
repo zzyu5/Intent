@@ -1193,7 +1193,8 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
         "pointwise replay has no exact producer result occurrence");
   if (auto range = dyn_cast<MakeRangeOp>(producer)) {
     FailureOr<int64_t> rangeDimension = queryRangeDimension(range);
-    if (sourceAxisIdentity(range) == source && succeeded(rangeDimension) &&
+    if (sourceAxisIdentity(range) == source &&
+        sourceAxisIdentity(blocked) == source && succeeded(rangeDimension) &&
         *rangeDimension == *blockedDimension) {
       mapping.map(value, blockedRange);
       return blockedRange;
@@ -1241,8 +1242,38 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
     }
   }
   for (Value operand : producer->getOperands()) {
+    PhysicalSourceAxis operandSource = source;
+    if (isa<BroadcastOp>(producer)) {
+      auto input = dyn_cast<FragmentType>(operand.getType());
+      auto output = dyn_cast<FragmentType>(value.getType());
+      PhysicalAxisProjection requested = queryFragmentAxis(output, source);
+      if (input && requested.isExact() &&
+          llvm::is_contained(traversalDimensions, requested.dimensionId)) {
+        BroadcastProjection projection = queryAxisProjection(input, output);
+        if (projection.isExact())
+          if (auto axis = projection.targetToSource[requested.fragmentAxis]) {
+            auto axisMap = cast<AxisMapAttr>(input.getAxisMaps()[*axis]);
+            PhysicalRangeFact ranges =
+                PhysicalProgramAnalysis(kernel).axisRanges(operand, *axis);
+            if (axisMap.getDimensionId() == *blockedDimension &&
+                ranges.state != PhysicalFactState::Unknown &&
+                ranges.blockers.empty() &&
+                PhysicalProgramAnalysis(kernel).lockstepRanges(ranges.roots).isExact() &&
+                llvm::all_of(ranges.roots, [&](MakeRangeOp range) {
+                  return samePhysicalScalarExpression(
+                             range.getLogicalStart(), blocked.getLogicalStart()) &&
+                         samePhysicalScalarExpression(
+                             range.getLogicalStop(), blocked.getLogicalStop()) &&
+                         samePhysicalScalarExpression(range.getStep(), blocked.getStep());
+                }))
+              // Match replay analysis: a positional broadcast may rename its
+              // operand's source while preserving the same logical traversal.
+              operandSource = sourceAxisIdentity(axisMap);
+          }
+      }
+    }
     FailureOr<Value> replacement = replayPointwiseValue(
-        builder, operand, source, traversalDimensions, blockedExtent, blockedRange,
+        builder, operand, operandSource, traversalDimensions, blockedExtent, blockedRange,
         blockedValidity, insertionAnchor, mapping);
     if (failed(replacement))
       return failure();
