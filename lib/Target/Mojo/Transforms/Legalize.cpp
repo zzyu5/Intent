@@ -41,6 +41,7 @@ LogicalResult checkSurface(ModuleOp module) {
         arith::ExtFOp, arith::TruncFOp, arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp,
         arith::MaxNumFOp, arith::MinNumFOp, arith::MaximumFOp, arith::MinimumFOp,
         arith::CmpFOp, arith::SelectOp, arith::AndIOp, arith::OrIOp, arith::XOrIOp,
+        arith::ShLIOp, arith::ShRSIOp,
         math::FmaOp, math::SqrtOp, math::ExpOp, math::Exp2Op, math::LogOp, math::TanhOp,
         math::SinOp, math::CosOp, math::FloorOp, math::ErfOp, math::AbsFOp, math::AbsIOp, math::PowFOp, memref::DimOp,
         memref::SubViewOp, memref::CastOp, memref::LoadOp, memref::StoreOp,

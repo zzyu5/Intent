@@ -154,6 +154,9 @@ TILELANG = (
 
 
 MOJO = (
+    Entry("radix2_fft", "B1024-N1024-fp32-complex-8cores-host", "radix2_fft", ("spectral/fft.py:radix2_fft",), "source/pytorch/cpu_runtime.py"),
+    Entry("viterbi", "B64-T256-S64-fp32-8cores-host", "viterbi_decode", ("dynamic_programming/viterbi.py:viterbi_decode",), "source/pytorch/cpu_runtime.py"),
+    Entry("smith_waterman", "B128-Q128-R128-i32-8cores-host", "smith_waterman_score", ("dynamic_programming/smith_waterman.py:smith_waterman_score",), "source/pytorch/cpu_runtime.py"),
     Entry("bitonic_sort", "4096x256-fp32-8cores-host", "bitonic_sort_rows", ("sorting/bitonic.py:bitonic_sort_rows",), "source/pytorch/cpu_runtime.py"),
     Entry("flaggems_triangular_solve", "B4096-N16-fp32-lower-8cores-host", "batched_lower_triangular_solve", ("factorization/triangular_solve.py:batched_lower_triangular_solve",), "source/pytorch/cpu_runtime.py"),
     Entry("flaggems_conv1d", "B64-L16384-K5-fp16-same-8cores-host", "conv1d_same", ("convolution/direct.py:conv1d_same",), "source/pytorch/cpu_runtime.py"),

@@ -465,6 +465,8 @@ private:
       else if (isa<arith::AndIOp>(operation)) token = "&";
       else if (isa<arith::OrIOp>(operation)) token = "|";
       else if (isa<arith::XOrIOp>(operation)) token = "^";
+      else if (isa<arith::ShLIOp>(operation)) token = "<<";
+      else if (isa<arith::ShRSIOp>(operation)) token = ">>";
       if (!token.empty()) {
         assign(operation->getResult(0), "(" + name(operation->getOperand(0)) + ") " + token + " (" + name(operation->getOperand(1)) + ")");
       } else if (isa<arith::MinSIOp, arith::MaxSIOp>(operation)) {

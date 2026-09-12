@@ -1,4 +1,7 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
+radix2_fft,B1024-N1024-fp32-complex-8cores-host,6.788357,8.708498,0.779510,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+viterbi,B64-T256-S64-fp32-8cores-host,14.427981,29.253954,0.493198,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+smith_waterman,B128-Q128-R128-i32-8cores-host,1.450775,470.877796,0.003081,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
 bitonic_sort,4096x256-fp32-8cores-host,21.322966,61.245835,0.348154,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
 flaggems_triangular_solve,B4096-N16-fp32-lower-8cores-host,1.784075,5.238593,0.340564,pass,既有 B4096-N16 f32 lower-triangular solve；PyTorch eager CPU reference 保持逐列有序减法；单 NUMA 8 核；双方完整 host 调用，每次恢复相同 RHS，恢复不计时。
 flaggems_conv1d,B64-L16384-K5-fp16-same-8cores-host,4.397394,1.746781,2.517426,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。

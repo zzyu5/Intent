@@ -98,6 +98,65 @@ def bitonic_sort(values):
     return result
 
 
+def radix2_fft(input_real, input_imag, twiddle_real, twiddle_imag):
+    size = input_real.shape[1]
+    source = torch.arange(size, device=input_real.device)
+    reversed_index = torch.zeros_like(source)
+    for _ in range(size.bit_length() - 1):
+        reversed_index = (reversed_index << 1) | (source & 1)
+        source = source >> 1
+    real = input_real[:, reversed_index]
+    imag = input_imag[:, reversed_index]
+    for stage in range(size.bit_length() - 1):
+        span = 1 << (stage + 1)
+        half = span // 2
+        real_blocks = real.reshape(real.shape[0], -1, span)
+        imag_blocks = imag.reshape(imag.shape[0], -1, span)
+        even_real, odd_real = real_blocks[..., :half], real_blocks[..., half:]
+        even_imag, odd_imag = imag_blocks[..., :half], imag_blocks[..., half:]
+        weight_real = twiddle_real[stage, :half]
+        weight_imag = twiddle_imag[stage, :half]
+        rotated_real = odd_real * weight_real - odd_imag * weight_imag
+        rotated_imag = odd_real * weight_imag + odd_imag * weight_real
+        real = torch.cat((even_real + rotated_real, even_real - rotated_real), dim=-1).reshape_as(real)
+        imag = torch.cat((even_imag + rotated_imag, even_imag - rotated_imag), dim=-1).reshape_as(imag)
+    return real, imag
+
+
+def viterbi(emissions, transitions):
+    batch, time_steps, states = emissions.shape
+    previous = emissions[:, 0]
+    predecessors = torch.empty((batch, time_steps, states), dtype=torch.int64, device=emissions.device)
+    for time in range(1, time_steps):
+        values, sources = (previous[:, :, None] + transitions[None, :, :]).max(dim=1)
+        predecessors[:, time] = sources
+        previous = values + emissions[:, time]
+    score, state = previous.max(dim=1)
+    path = torch.empty((batch, time_steps), dtype=torch.int32, device=emissions.device)
+    path[:, -1] = state.to(torch.int32)
+    batch_index = torch.arange(batch, device=emissions.device)
+    for time in range(time_steps - 1, 0, -1):
+        state = predecessors[batch_index, time, state]
+        path[:, time - 1] = state.to(torch.int32)
+    return path, score
+
+
+def smith_waterman(query, reference):
+    previous = torch.zeros((query.shape[0], reference.shape[1] + 1), dtype=torch.int32, device=query.device)
+    maximum = torch.zeros((query.shape[0],), dtype=torch.int32, device=query.device)
+    for row in range(1, query.shape[1] + 1):
+        current = torch.zeros_like(previous)
+        for column in range(1, reference.shape[1] + 1):
+            substitution = torch.where(query[:, row - 1] == reference[:, column - 1], 2, -1)
+            cell = torch.maximum(torch.zeros_like(maximum), torch.maximum(
+                previous[:, column - 1] + substitution,
+                torch.maximum(previous[:, column] - 1, current[:, column - 1] - 1)))
+            current[:, column] = cell
+            maximum = torch.maximum(maximum, cell)
+        previous = current
+    return maximum.to(torch.int32)
+
+
 def adamw(gradient, parameter, first_moment, second_moment, learning_rate,
           beta1, beta2, bias_correction1, bias_correction2, epsilon, weight_decay):
     first = beta1 * first_moment + (1.0 - beta1) * gradient

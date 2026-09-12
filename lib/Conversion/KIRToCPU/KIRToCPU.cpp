@@ -22,7 +22,7 @@ namespace intent {
 namespace {
 
 struct Domain {
-  Value begin, end, step;
+  Value begin, end, step, extent;
 };
 
 class Construction {
@@ -121,9 +121,9 @@ private:
 
   FailureOr<Value> indexValue(Value value, Location loc) {
     if (value.getType().isIndex()) return value;
-    if (value.getType().isSignlessInteger(64))
+    if (value.getType().isSignlessInteger() && !value.getType().isInteger(1))
       return Value(builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), value));
-    return emitError(loc, "CPU coordinates require index or signed 64-bit integer values"), failure();
+    return emitError(loc, "CPU coordinates require index or signed integer values"), failure();
   }
 
   FailureOr<SmallVector<Value>> extents(RankedTensorType tensor, Location loc) {
@@ -424,6 +424,11 @@ private:
             Value coordinate;
             if (term.kind == 0 || term.kind == 4) {
               coordinate = nested.create<linalg::IndexOp>(loc, axis++);
+              if (term.kind == 4) {
+                Domain domain = domains.lookup(term.operands[0]);
+                coordinate = nested.createOrFold<arith::AddIOp>(loc, domain.begin,
+                    nested.createOrFold<arith::MulIOp>(loc, coordinate, domain.step));
+              }
             } else if (term.kind == 2) {
               int64_t literal = *term.staticValues[0];
               coordinate = nested.create<arith::ConstantIndexOp>(loc, literal);
@@ -469,6 +474,7 @@ private:
     unsigned outputAxis = 0;
     bool inserted = false;
     for (const IndexTermFact &term : fact->terms) {
+      OpFoldResult stride = builder.getIndexAttr(1);
       if (term.kind == 1) {
         inserted = true;
         ++outputAxis;
@@ -493,25 +499,22 @@ private:
         sizes.push_back(builder.getIndexAttr(1));
       } else if (term.kind == 4 && term.operands.size() == 1 && domains.count(term.operands[0])) {
         Domain domain = domains.lookup(term.operands[0]);
-        if (!matchPattern(domain.begin, m_Zero()) || !matchPattern(domain.step, m_One())) {
-          operation->emitError("CPU indexed domain requires zero begin and unit stride");
-          return failure();
-        }
-        offsets.push_back(builder.getIndexAttr(0));
+        offsets.push_back(domain.begin);
+        stride = domain.step;
         projection.push_back(builder.getAffineDimExpr(outputAxis++));
         llvm::APInt extent;
-        if (matchPattern(domain.end, m_ConstantInt(&extent))) {
+        if (matchPattern(domain.extent, m_ConstantInt(&extent))) {
           sizes.push_back(builder.getIndexAttr(extent.getSExtValue()));
           resultShape.push_back(extent.getSExtValue());
         } else {
-          sizes.push_back(domain.end);
+          sizes.push_back(domain.extent);
           resultShape.push_back(ShapedType::kDynamic);
         }
       } else {
         operation->emitError("CPU construction does not implement this index relation");
         return failure();
       }
-      strides.push_back(builder.getIndexAttr(1));
+      strides.push_back(stride);
     }
     if (offsets.size() != static_cast<size_t>(type.getRank())) {
       operation->emitError("CPU indexed access must resolve every source axis");
@@ -623,6 +626,8 @@ private:
       case BinaryOperator::LogicalOr:
       case BinaryOperator::BitwiseOr: return Value(builder.create<arith::OrIOp>(loc, a, b));
       case BinaryOperator::BitwiseXor: return Value(builder.create<arith::XOrIOp>(loc, a, b));
+      case BinaryOperator::LeftShift: return Value(builder.create<arith::ShLIOp>(loc, a, b));
+      case BinaryOperator::RightShift: return Value(builder.create<arith::ShRSIOp>(loc, a, b));
       default: break;
       }
     } else if (auto unary = dyn_cast<UnaryOp>(operation)) {
@@ -1053,22 +1058,25 @@ private:
       Value begin = values.lookup(op.getBounds()[0]);
       Value end = values.lookup(op.getBounds()[1]);
       Value step = op.getBounds().size() == 3 ? values.lookup(op.getBounds()[2]) : constant(loc, 1);
-      if (!matchPattern(begin, m_Zero()) || !matchPattern(step, m_One()))
-        return op.emitError("CPU construction currently supports zero-based unit-step domains");
       auto physicalBegin = indexValue(begin, loc), physicalEnd = indexValue(end, loc), physicalStep = indexValue(step, loc);
       if (failed(physicalBegin) || failed(physicalEnd) || failed(physicalStep)) return failure();
-      Domain domain{constant(loc, 0), *physicalEnd, constant(loc, 1)};
+      Value distance = builder.createOrFold<arith::SubIOp>(loc, *physicalEnd, *physicalBegin);
+      Value nonnegative = builder.createOrFold<arith::MaxSIOp>(loc, distance, constant(loc, 0));
+      Value extent = builder.createOrFold<arith::CeilDivSIOp>(loc, nonnegative, *physicalStep);
+      Domain domain{*physicalBegin, *physicalEnd, *physicalStep, extent};
       domains[op.getResult()] = domain;
-      dimensions[cast<IntegerAttr>(op.getExtentDimensions()[0]).getInt()] = domain.end;
+      dimensions[cast<IntegerAttr>(op.getExtentDimensions()[0]).getInt()] = domain.extent;
     } else if (auto op = dyn_cast<ParallelOp>(operation)) {
       if (!domains.count(op.getSource()))
         return op.emitError("CPU parallel source is not a supported domain");
       Domain domain = domains.lookup(op.getSource());
-      auto parallel = builder.create<scf::ParallelOp>(loc, ValueRange{domain.begin},
-          ValueRange{domain.end}, ValueRange{domain.step});
+      auto parallel = builder.create<scf::ParallelOp>(loc, ValueRange{constant(loc, 0)},
+          ValueRange{domain.extent}, ValueRange{constant(loc, 1)});
       OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPointToStart(parallel.getBody());
-      values.map(op.getBody().front().getArgument(0), parallel.getInductionVars()[0]);
+      Value coordinate = builder.createOrFold<arith::AddIOp>(loc, domain.begin,
+          builder.createOrFold<arith::MulIOp>(loc, parallel.getInductionVars()[0], domain.step));
+      values.map(op.getBody().front().getArgument(0), coordinate);
       return lowerBlock(op.getBody().front());
     } else if (isa<IfOp, ForOp, WhileOp>(operation)) {
       return orderedControl(operation);
@@ -1123,12 +1131,14 @@ private:
         return op.emitError("CPU indices requires an explicit one-dimensional domain");
       Domain domain = domains.lookup(op.getSource());
       auto type = cast<RankedTensorType>(op.getResult().getType());
-      Value output = allocate(type, {domain.end}, loc);
+      Value output = allocate(type, {domain.extent}, loc);
       builder.create<linalg::GenericOp>(loc, ValueRange{}, ValueRange{output},
           SmallVector<AffineMap>{builder.getMultiDimIdentityMap(1)},
           SmallVector<utils::IteratorType>{utils::IteratorType::parallel},
           [&](OpBuilder &nested, Location location, ValueRange) {
             Value coordinate = nested.create<linalg::IndexOp>(location, 0);
+            coordinate = nested.createOrFold<arith::AddIOp>(location, domain.begin,
+                nested.createOrFold<arith::MulIOp>(location, coordinate, domain.step));
             if (!type.getElementType().isIndex()) coordinate = nested.create<arith::IndexCastOp>(location, type.getElementType(), coordinate);
             nested.create<linalg::YieldOp>(location, coordinate);
           });
