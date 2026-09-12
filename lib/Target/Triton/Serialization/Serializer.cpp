@@ -613,8 +613,55 @@ private:
     output << "\n";
   }
 
+  void emitViewChecks(ArrayRef<ViewABI> arguments) {
+    std::map<int64_t, std::pair<std::string, std::string>> dimensions;
+    for (const ViewABI &view : arguments) {
+      std::string name = kernel.getArgAttrDict(view.argument)
+                             .getAs<StringAttr>(gpu::abiNameAttr)
+                             .getValue().str();
+      std::string dtype = pythonType(view.type.getElementType(), true);
+      line("if not isinstance(" + view.name + ", torch.Tensor):", 1);
+      line("raise TypeError(\"" + name + " must be a torch.Tensor\")", 2);
+      line("if " + view.name + ".dtype != " + dtype + ":", 1);
+      line("raise TypeError(f\"" + name + " must have dtype " + dtype +
+               ", got {" + view.name + ".dtype}\")", 2);
+      std::string rank = std::to_string(view.type.getRank());
+      line("if " + view.name + ".ndim != " + rank + ":", 1);
+      line("raise ValueError(f\"" + name + " must have rank " + rank +
+               ", got {" + view.name + ".ndim}\")", 2);
+      auto layout = view.type.getLayout();
+      for (auto [axis, dimension] :
+           llvm::enumerate(layout.getDimensionIds().asArrayRef())) {
+        std::string suffix = ".shape[" + std::to_string(axis) + "]";
+        std::string actual = view.name + suffix;
+        std::string label = name + suffix;
+        auto extent = cast<gpu::PhysicalExprAttr>(layout.getExtents()[axis]);
+        if (extent.getKind() ==
+            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant)) {
+          std::string expected = std::to_string(extent.getValue());
+          line("if " + actual + " != " + expected + ":", 1);
+          line("raise ValueError(f\"" + label + " must equal " + expected +
+                   ", got {" + actual + "}\")", 2);
+        }
+        if (dimension <= 0)
+          continue;
+        auto [binding, inserted] = dimensions.try_emplace(
+            dimension, std::make_pair(actual, label));
+        if (inserted)
+          continue;
+        const auto &[expected, source] = binding->second;
+        line("if " + actual + " != " + expected + ":", 1);
+        line("raise ValueError(f\"" + label + " must equal " + source +
+                 ", got {" + actual + "} and {" + expected + "}\")", 2);
+      }
+    }
+  }
+
   void emitLaunch() {
     output << "def launch(" << joinLaunchArguments() << "):\n";
+    emitViewChecks(views);
+    line("return _intent_launch(" + joinLaunchArguments() + ")", 1);
+    output << "\ndef _intent_launch(" << joinLaunchArguments() << "):\n";
     if (descriptorAllocator)
       line("triton.set_allocator(_intent_tensor_descriptor_allocator)", 1);
     for (const MetadataABI &metadata : metadataArguments) {
@@ -712,6 +759,7 @@ private:
       line("return None", 1);
       return;
     }
+    emitViewChecks(inputs);
     std::string device = inputs.empty() ? "'cuda'" : inputs.front().name + ".device";
     for (const ViewABI &view : outputs) {
       std::string shape = "(";
@@ -742,7 +790,7 @@ private:
                ", dtype=" + pythonType(view.type.getElementType(), true) + ")",
            1);
     }
-    line("launch(" + joinLaunchArguments() + ")", 1);
+    line("_intent_launch(" + joinLaunchArguments() + ")", 1);
     if (outputs.size() == 1)
       line("return " + outputs.front().name, 1);
     else
