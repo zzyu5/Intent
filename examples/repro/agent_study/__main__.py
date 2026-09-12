@@ -17,7 +17,7 @@ import torch
 import triton
 
 from .agent import execute, materialize_language
-from .tasks import catalog, description, invocation, read_suite
+from .tasks import catalog, description, invocation, read_suite, reference, return_contract
 
 
 def revision(directory: Path) -> str:
@@ -55,6 +55,7 @@ def generate_trial(arguments, row, language) -> dict:
     materials = materialize_language(arguments.project, arguments.triton_ref, directory / "materials", language)
     task_text = description(arguments.reference, row)
     task_text += "\n\nFixed invocation (tensor values are not disclosed):\n" + json.dumps(row["invocation"], indent=2)
+    task_text += "\n\nExpected return structure, shape and dtype:\n" + json.dumps(row["return_contract"], indent=2)
     task_text += "\n\nTolerance: " + json.dumps(arguments.suite["tolerances"][row["tolerance"]])
     task_text += "\n\nTiming: " + row["timing"]
     task_text += "\n\nProfile note: " + row["reason"]
@@ -117,7 +118,10 @@ def main() -> None:
     for row in rows:
         row.update(by_id[row["task"]])
         row["timing"] = by_id[row["task"]].get("timing", arguments.suite["timing"])
-        row["invocation"] = invocation(arguments.reference, row, by_id[row["task"]], arguments.suite, device="cpu").metadata()
+        material_inputs = invocation(arguments.reference, row, by_id[row["task"]], arguments.suite, device="cpu")
+        row["invocation"] = material_inputs.metadata()
+        with torch.no_grad():
+            row["return_contract"] = return_contract(material_inputs.call(reference(arguments.reference, row)))
     arguments.output = arguments.output.resolve()
     arguments.output.mkdir(parents=True, exist_ok=False)
     (arguments.state_root / "candidates").mkdir(exist_ok=True, mode=0o700)

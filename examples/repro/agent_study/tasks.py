@@ -75,6 +75,17 @@ def description(root: Path, row: dict) -> str:
     return instruction[start:end].strip()
 
 
+def return_contract(value) -> dict:
+    if isinstance(value, torch.Tensor):
+        return {"type": "tensor", "shape": list(value.shape), "dtype": str(value.dtype)}
+    if isinstance(value, (tuple, list)):
+        return {"type": "tuple" if isinstance(value, tuple) else "list",
+                "items": [return_contract(item) for item in value]}
+    if value is None:
+        return {"type": "none"}
+    raise TypeError(f"reference return contract is unsupported for {type(value).__name__}")
+
+
 def reference(root: Path, row: dict):
     if "reference_correction" in row:
         return CORRECTIONS[row["reference_correction"]]

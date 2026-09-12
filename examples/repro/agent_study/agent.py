@@ -54,6 +54,8 @@ def command(directory: Path, suite: dict, response: Path, schema: Path, executab
     provider = config["model_provider"]
     if config["model_providers"][provider]["env_key"] != "INTENT_STUDY_API_KEY":
         raise ValueError("dedicated provider must use INTENT_STUDY_API_KEY")
+    # The outer generation deadline also bounds a silent reasoning stream.
+    config["model_providers"][provider]["stream_idle_timeout_ms"] = int(suite["generation_seconds"] * 1000)
     values = {
         "model_reasoning_effort": suite["reasoning_effort"],
         "model_provider": provider,
