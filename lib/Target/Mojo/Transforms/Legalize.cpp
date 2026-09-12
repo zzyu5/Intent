@@ -17,6 +17,10 @@ using namespace mlir;
 namespace intent::mojo {
 namespace {
 
+bool directAtomicAdd(Type element) {
+  return element.isF32() || element.isF64() || element.isSignlessInteger(32) || element.isSignlessInteger(64);
+}
+
 bool supportedType(Type type) {
   if (auto vector = dyn_cast<VectorType>(type)) {
     int64_t width = vector.getNumElements();
@@ -66,8 +70,9 @@ LogicalResult checkSurface(ModuleOp module) {
       supported &= llvm::none_of(loop.getResultTypes(), [](Type type) { return isa<MemRefType>(type); });
     if (isa<cpu::AtomicLoadOp, cpu::AtomicStoreOp, cpu::AtomicRMWOp, cpu::AtomicCompareExchangeOp>(operation)) {
       Type element = cast<MemRefType>(operation->getOperand(0).getType()).getElementType();
-      supported &= element.isF32() || element.isF64() || element.isSignlessInteger(32) || element.isSignlessInteger(64);
-      if (auto rmw = dyn_cast<cpu::AtomicRMWOp>(operation)) supported &= rmw.getKind() == AtomicRMWKind::Add;
+      supported &= directAtomicAdd(element) || element.isF16() || element.isBF16();
+      if (auto rmw = dyn_cast<cpu::AtomicRMWOp>(operation))
+        supported &= directAtomicAdd(element) && rmw.getKind() == AtomicRMWKind::Add;
     }
     if (auto parallel = dyn_cast<scf::ParallelOp>(operation))
       supported &= parallel.getNumResults() == 0 && parallel.getNumLoops() == 1 &&
@@ -92,7 +97,7 @@ LogicalResult expandAtomicUpdates(ModuleOp module) {
     Block &body = operation.getRegion().front();
     Value yielded = cast<memref::AtomicYieldOp>(body.getTerminator()).getResult();
     auto *combine = yielded.getDefiningOp();
-    if (combine && isa<arith::AddFOp, arith::AddIOp>(combine) &&
+    if (combine && isa<arith::AddFOp, arith::AddIOp>(combine) && directAtomicAdd(yielded.getType()) &&
         std::distance(body.begin(), body.end()) == 2 &&
         llvm::is_contained(combine->getOperands(), body.getArgument(0))) {
       Value value = combine->getOperand(combine->getOperand(0) == body.getArgument(0) ? 1 : 0);
@@ -122,7 +127,8 @@ LogicalResult expandAtomicUpdates(ModuleOp module) {
   }
   SmallVector<cpu::AtomicRMWOp> updates;
   module.walk([&](cpu::AtomicRMWOp operation) {
-    if (operation.getKind() != AtomicRMWKind::Add) updates.push_back(operation);
+    if (operation.getKind() != AtomicRMWKind::Add || !directAtomicAdd(operation.getValue().getType()))
+      updates.push_back(operation);
   });
   for (auto operation : updates) {
     OpBuilder builder(operation);
@@ -150,7 +156,9 @@ LogicalResult expandAtomicUpdates(ModuleOp module) {
     case AtomicRMWKind::BitwiseAnd: desired = builder.create<arith::AndIOp>(loc, old, value); break;
     case AtomicRMWKind::BitwiseOr: desired = builder.create<arith::OrIOp>(loc, old, value); break;
     case AtomicRMWKind::BitwiseXor: desired = builder.create<arith::XOrIOp>(loc, old, value); break;
-    case AtomicRMWKind::Add: llvm_unreachable("atomic add has a direct Mojo implementation");
+    case AtomicRMWKind::Add:
+      desired = isa<FloatType>(type) ? Value(builder.create<arith::AddFOp>(loc, old, value))
+                                    : Value(builder.create<arith::AddIOp>(loc, old, value)); break;
     }
     auto exchange = builder.create<cpu::AtomicCompareExchangeOp>(loc, type, builder.getI1Type(),
         operation.getTarget(), old, desired, operation.getIndices(), operation.getOrdering());
