@@ -4901,23 +4901,25 @@ private:
       mapResults(operation, target);
       return success();
     }
-    if (auto forOperation = dyn_cast<intent::ForOp>(operation)) {
-      if (forOperation.getInputs().empty())
-        return forOperation.emitOpError("ordered for lacks its logical domain");
+    if (isa<intent::ForOp, intent::ParallelOp>(operation)) {
+      // Parallel regions remaining inside an execution group may be serialized.
+      // Keep their enclosing ordered control and resource environment intact.
+      ValueRange inputs = operation->getOperands();
+      if (inputs.empty())
+        return operation->emitOpError("iteration lacks its logical domain");
       SmallVector<OrderedIterationAxis> axes;
-      if (failed(collectOrderedIterationAxes(forOperation.getInputs().front(),
-                                             axes)) ||
+      if (failed(collectOrderedIterationAxes(inputs.front(), axes)) ||
           axes.empty())
-        return forOperation.emitOpError(
-            "ordered for source has no exact domain/subregion iteration relation");
+        return operation->emitOpError(
+            "iteration source has no exact domain/subregion relation");
       SmallVector<Value> lowers, uppers, steps;
       for (OrderedIterationAxis axis : axes) {
         FailureOr<Value> lower = get(axis.start);
         FailureOr<Value> upper = get(axis.stop);
         FailureOr<Value> prototype = get(axis.coordinatePrototype);
         if (failed(lower) || failed(upper) || failed(prototype))
-          return forOperation.emitOpError(
-              "ordered physical loop bounds are unavailable");
+          return operation->emitOpError(
+              "physical loop bounds are unavailable");
         Type coordinateType = (*prototype).getType();
         auto alignBound = [&](Value value) -> FailureOr<Value> {
           if (value.getType() == coordinateType)
@@ -4931,18 +4933,18 @@ private:
         lower = alignBound(*lower);
         upper = alignBound(*upper);
         if (failed(lower) || failed(upper))
-          return forOperation.emitOpError(
-              "ordered physical subregion bounds cannot adopt their source coordinate type");
+          return operation->emitOpError(
+              "physical subregion bounds cannot adopt their source coordinate type");
         Value step;
         if (axis.step) {
           FailureOr<Value> lowered = get(axis.step);
           if (failed(lowered))
-            return forOperation.emitOpError(
-                "ordered physical loop step is unavailable");
+            return operation->emitOpError(
+                "physical loop step is unavailable");
           FailureOr<Value> aligned = alignBound(*lowered);
           if (failed(aligned))
-            return forOperation.emitOpError(
-                "ordered physical loop step cannot adopt its source coordinate type");
+            return operation->emitOpError(
+                "physical loop step cannot adopt its source coordinate type");
           step = *aligned;
         } else if ((*lower).getType().isIndex()) {
           step = builder.create<arith::ConstantIndexOp>(location, 1);
@@ -4952,14 +4954,14 @@ private:
         }
         if (!step || (*lower).getType() != (*upper).getType() ||
             (*lower).getType() != step.getType())
-          return forOperation.emitOpError(
-              "ordered physical loop bounds must share one scalar type");
+          return operation->emitOpError(
+              "physical loop bounds must share one scalar type");
         lowers.push_back(*lower);
         uppers.push_back(*upper);
         steps.push_back(step);
       }
       SmallVector<Value> initial;
-      for (Value input : forOperation.getInputs().drop_front()) {
+      for (Value input : inputs.drop_front()) {
         FailureOr<Value> lowered = get(input);
         if (failed(lowered))
           return failure();
@@ -4974,7 +4976,7 @@ private:
                       ValueRange carries) -> SmallVector<Value> {
         if (axis == axes.size()) {
           auto childValues = values;
-          Block &source = forOperation.getBody().front();
+          Block &source = operation->getRegion(0).front();
           for (auto [argument, coordinate] :
                llvm::zip(source.getArguments().take_front(axes.size()),
                          coordinates))
@@ -5047,7 +5049,7 @@ private:
       if (nestedFailed)
         return failure();
       for (auto [source, target] :
-           llvm::zip(forOperation.getResults(), resultValues))
+           llvm::zip(operation->getResults(), resultValues))
         values[source] = target;
       return success();
     }

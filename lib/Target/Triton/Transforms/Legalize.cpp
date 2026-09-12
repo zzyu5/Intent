@@ -1275,6 +1275,30 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
     };
     auto source = dyn_cast<gpu::FragmentType>(gather.getSource().getType());
     auto result = dyn_cast<gpu::FragmentType>(gather.getResult().getType());
+    if (source && !result && source.getShape().size() == 1 &&
+        gather.getCoordinates().size() == 1 &&
+        gather.getSourceAxes() == ArrayRef<int64_t>{0} &&
+        isa<IndexType, IntegerType>(gather.getCoordinates().front().getType()) &&
+        gather.getValid().getType().isInteger(1)) {
+      OpBuilder builder(gather);
+      Value coordinate = gather.getCoordinates().front();
+      FailureOr<Value> zero = zeroLike(builder, gather.getLoc(), coordinate.getType());
+      if (failed(zero))
+        return gather.emitOpError("scalar gather coordinate has no integral zero");
+      Value safeIndex = builder.create<gpu::SelectOp>(
+          gather.getLoc(), coordinate.getType(), gather.getValid(), coordinate, *zero);
+      auto loaded = builder.create<gpu::GatherOp>(
+          gather.getLoc(), gather.getResult().getType(), gather.getSource(),
+          ValueRange{safeIndex}, Value(), Value(), gather.getSourceAxes());
+      auto selected = builder.create<gpu::SelectOp>(
+          gather.getLoc(), gather.getResult().getType(), gather.getValid(),
+          loaded.getResult(), gather.getFill());
+      if (Attribute origin = gather->getAttr(gpu::originAttr))
+        selected->setAttr(gpu::originAttr, origin);
+      gather.getResult().replaceAllUsesWith(selected.getResult());
+      gather.erase();
+      continue;
+    }
     if (gather.getCoordinates().size() == 1 &&
         gather.getSourceAxes().size() == 1 && source && result &&
         source.getShape().size() < result.getShape().size()) {
@@ -2073,6 +2097,13 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
           gather.getSourceAxes().size() != 1) {
         gather.emitOpError(
             "requires provider legalization to one-axis tl.gather");
+        return WalkResult::interrupt();
+      }
+      if (!isa<gpu::FragmentType>(gather.getResult().getType()) &&
+          (cast<gpu::FragmentType>(gather.getSource().getType()).getShape().size() != 1 ||
+           gather.getSourceAxes().front() != 0 ||
+           !isa<IndexType, IntegerType>(gather.getCoordinates().front().getType()))) {
+        gather.emitOpError("Triton scalar gather requires one scalar index into a vector");
         return WalkResult::interrupt();
       }
     } else if (auto reduce = dyn_cast<gpu::ReduceOp>(operation)) {

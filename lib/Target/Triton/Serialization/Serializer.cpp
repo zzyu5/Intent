@@ -948,7 +948,14 @@ private:
       return;
     }
     if (auto reshape = dyn_cast<gpu::ReshapeOp>(operation)) {
+      auto source = cast<gpu::FragmentType>(reshape.getValue().getType());
       auto target = cast<gpu::FragmentType>(reshape.getResult().getType());
+      if (source.getShape().empty()) {
+        assign(reshape.getResult(), "tl.broadcast_to(" +
+                                         valueString(reshape.getValue()) + ", " +
+                                         fragmentShape(target) + ")");
+        return;
+      }
       assign(reshape.getResult(), "tl.reshape(" + valueString(reshape.getValue()) +
                                        ", " + fragmentShape(target) +
                                        ", can_reorder=False)");
@@ -1028,10 +1035,18 @@ private:
       return;
     }
     if (auto gather = dyn_cast<gpu::GatherOp>(operation)) {
+      Value coordinate = gather.getCoordinates().front();
+      std::string indices = valueString(coordinate);
+      bool scalar = !isa<gpu::FragmentType>(gather.getResult().getType());
+      if (scalar)
+        indices = "tl.full((1,), " + indices + ", " +
+                  pythonType(coordinate.getType()) + ")";
       std::string call = "tl.gather(" + valueString(gather.getSource()) + ", " +
-                         valueString(gather.getCoordinates().front()) +
+                         indices +
                          ", axis=" +
                          std::to_string(gather.getSourceAxes().front()) + ")";
+      if (scalar)
+        call = "tl.reshape(" + call + ", ())";
       assign(gather.getResult(), call);
       return;
     }
