@@ -27,6 +27,7 @@ LogicalResult ViewArgumentAttr::verify(
     uint32_t access, StringAttr alias, bool) {
   if (!name || name.getValue().empty() ||
       (!element.isF16() && !element.isBF16() && !element.isF32() && !element.isF64() &&
+       !llvm::isa<Float8E4M3FNType, Float8E5M2Type>(element) &&
        !element.isInteger(8) && !element.isInteger(16) && !element.isInteger(32) &&
        !element.isInteger(64) && !element.isInteger(1)) || !shape || !dimensions ||
       shape.size() != dimensions.size() || access > 2 || !alias)

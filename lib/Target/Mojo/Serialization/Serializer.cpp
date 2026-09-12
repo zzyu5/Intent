@@ -30,6 +30,8 @@ std::string dtype(Type type) {
   if (type.isBF16()) return "bfloat16";
   if (type.isF32()) return "float32";
   if (type.isF64()) return "float64";
+  if (isa<Float8E4M3FNType>(type)) return "float8_e4m3fn";
+  if (isa<Float8E5M2Type>(type)) return "float8_e5m2";
   if (type.isInteger(1)) return "bool";
   if (type.isIndex()) return "int64";
   return "int" + std::to_string(cast<IntegerType>(type).getWidth());
@@ -59,6 +61,8 @@ std::string ordering(AtomicOrdering order) {
 
 std::string abiDType(Type type) {
   if (type.isIndex()) return "i64";
+  if (isa<Float8E4M3FNType>(type)) return "f8e4m3fn";
+  if (isa<Float8E5M2Type>(type)) return "f8e5m2";
   std::string result;
   llvm::raw_string_ostream out(result);
   type.print(out);

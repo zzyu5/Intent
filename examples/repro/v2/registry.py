@@ -154,6 +154,8 @@ TILELANG = (
 
 
 MOJO = (
+    Entry("fp8_groupwise_quantize", "8192x4096-bf16-group128-f8e4m3fn-8cores-host", "fp8_groupwise_quantize", ("quantization/fp8.py:bf16_groupwise_fp8_quantize",), "source/pytorch/cpu_runtime.py"),
+    Entry("partitioned_two_pass_max", "M128-N257-P300-f32-8cores-host", "partitioned_two_pass_max", ("reduction/two_pass.py:partitioned_max_partial", "reduction/two_pass.py:partitioned_max_reduce"), "source/pytorch/cpu_runtime.py"),
     Entry("shifted_row_copy", "4096x1024-f32-8cores-host", "shifted_row_copy", ("indexing/relations.py:shifted_row_copy",), "source/pytorch/cpu_runtime.py"),
     Entry("roll_rows_forward", "8192x4096-f16-flat-8cores-host", "roll_rows_forward", ("indexing/relations.py:roll_rows_forward",), "source/pytorch/cpu_runtime.py"),
     Entry("grouped_query_head_add", "QH32-KH8-T4096-f16-8cores-host", "grouped_query_head_add", ("indexing/relations.py:grouped_query_head_add",), "source/pytorch/cpu_runtime.py"),

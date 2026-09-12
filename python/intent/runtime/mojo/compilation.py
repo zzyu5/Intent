@@ -21,6 +21,7 @@ ELEMENT_TYPES = {
     "f16": "Float16", "bf16": "BFloat16", "f32": "Float32", "f64": "Float64",
     "i1": "SIMD[DType.bool, 1]", "i8": "Int8", "i16": "Int16", "i32": "Int32", "i64": "Int64",
     "ui8": "UInt8", "ui16": "UInt16", "ui32": "UInt32", "ui64": "UInt64",
+    "f8e4m3fn": "SIMD[DType.float8_e4m3fn, 1]", "f8e5m2": "SIMD[DType.float8_e5m2, 1]",
 }
 
 SCALAR_CTYPES = {

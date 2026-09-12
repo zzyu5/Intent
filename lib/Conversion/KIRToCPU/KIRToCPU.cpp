@@ -81,6 +81,7 @@ public:
         auto tensor = cast<RankedTensorType>(view.getTensor());
         Type element = tensor.getElementType();
         if ((!element.isF16() && !element.isBF16() && !element.isF32() && !element.isF64() &&
+             !isa<Float8E4M3FNType, Float8E5M2Type>(element) &&
              !element.isInteger(8) && !element.isInteger(16) && !element.isInteger(32) &&
              !element.isInteger(64) && !element.isInteger(1)))
           return source.emitError("CPU construction requires supported numeric views");

@@ -1,4 +1,6 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
+fp8_groupwise_quantize,8192x4096-bf16-group128-f8e4m3fn-8cores-host,39.222245,88.899663,0.441197,pass,既有8192x4096 bf16、group128、E4M3FN量化；原输出及scale容差；独立scale存储，单NUMA8核，PyTorch CPU reference，完整host调用。
+partitioned_two_pass_max,M128-N257-P300-f32-8cores-host,2.867702,0.007296,393.072215,pass,既有M128-N257-P300两阶段max，包含空子区域；原负输入、exact输出；单NUMA8核，完整host含workspace分配/初始化及两kernel同步，PyTorch amax reference。
 shifted_row_copy,4096x1024-f32-8cores-host,0.468689,0.210287,2.228801,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
 roll_rows_forward,8192x4096-f16-flat-8cores-host,31.918330,168.251562,0.189706,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
 grouped_query_head_add,QH32-KH8-T4096-f16-8cores-host,0.185415,0.043694,4.243511,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。

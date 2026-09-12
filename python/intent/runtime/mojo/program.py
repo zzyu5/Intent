@@ -16,6 +16,7 @@ _DTYPES = {
     "f16": torch.float16, "bf16": torch.bfloat16, "f32": torch.float32, "f64": torch.float64,
     "i1": torch.bool, "i8": torch.int8, "i16": torch.int16, "i32": torch.int32, "i64": torch.int64,
     "ui8": torch.uint8, "ui16": torch.uint16, "ui32": torch.uint32, "ui64": torch.uint64,
+    "f8e4m3fn": torch.float8_e4m3fn, "f8e5m2": torch.float8_e5m2,
 }
 
 

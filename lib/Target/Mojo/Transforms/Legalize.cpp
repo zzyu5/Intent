@@ -25,6 +25,7 @@ bool supportedType(Type type) {
   }
   if (auto memory = dyn_cast<MemRefType>(type)) return supportedType(memory.getElementType());
   return type.isIndex() || type.isF16() || type.isBF16() || type.isF32() || type.isF64() ||
+      isa<Float8E4M3FNType, Float8E5M2Type>(type) ||
       type.isSignlessInteger(8) || type.isSignlessInteger(16) || type.isSignlessInteger(32) ||
       type.isSignlessInteger(64) || type.isInteger(1);
 }

@@ -57,6 +57,18 @@ def gelu(x):
     return F.gelu(x, approximate="tanh")
 
 
+def fp8_groupwise_quantize(x, scales):
+    values = x.float().reshape(x.shape[0], -1, 128)
+    scale = values.abs().amax(dim=-1).clamp_min(1e-12) / 448.0
+    quantized = (values / scale[:, :, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    scales.copy_(scale)
+    return quantized.reshape_as(x), scales
+
+
+def partitioned_max(x):
+    return torch.amax(x, dim=1)
+
+
 def relu(x):
     return torch.maximum(x, x.new_zeros(()))
 

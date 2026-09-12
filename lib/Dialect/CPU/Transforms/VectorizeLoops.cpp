@@ -15,6 +15,7 @@ namespace {
 
 bool vectorElement(Type type) {
   return type.isF16() || type.isBF16() || type.isF32() || type.isF64() ||
+      isa<Float8E4M3FNType, Float8E5M2Type>(type) ||
       type.isIndex() || type.isSignlessInteger(1) || type.isSignlessInteger(8) ||
       type.isSignlessInteger(16) || type.isSignlessInteger(32) || type.isSignlessInteger(64);
 }
