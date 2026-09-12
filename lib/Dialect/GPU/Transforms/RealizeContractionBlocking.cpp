@@ -22,7 +22,7 @@ using namespace mlir;
 namespace intent::gpu {
 namespace {
 
-constexpr int64_t contractionReductionCandidates[] = {32, 64, 128};
+constexpr int64_t contractionReductionCandidates[] = {16, 32, 64, 128};
 
 PhysicalExprAttr expression(MLIRContext *context, PhysicalExprKind kind,
                             int64_t value = 0, StringRef symbol = {},

@@ -1772,7 +1772,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
          Twine(master->range.getSourceAxis()) +
          (master->range.getDerived() ? "_DERIVED" : ""))
             .str();
-    SmallVector<int64_t> candidates{8, 16, 32, 64, 128,
+    SmallVector<int64_t> candidates{4, 8, 16, 32, 64, 128,
                                     256, 512, 1024, 2048, 4096};
     auto firstSource =
         cast<FragmentType>(reduce.getInputs().front().getType());
@@ -1819,6 +1819,12 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
               return failure();
             FragmentType blockedType =
                 replaceExtent(rangeType, 0, outerSliceExtent);
+            if (!blockOuterAxis) {
+              auto slice = nested.create<BroadcastOp>(
+                  nestedLocation, blockedType, coordinate);
+              mapping.map(range.getResult(), slice.getResult());
+              return slice.getResult();
+            }
             auto blocked = nested.create<MakeRangeOp>(
                 nestedLocation, blockedType, coordinate,
                 outerChunk.getResult(), range.getStep(),
@@ -1828,24 +1834,21 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
             mapping.map(range.getResult(), blocked.getResult());
             return blocked.getResult();
           };
-          if (blockOuterAxis)
-            for (MakeRangeOp range : plan.ranges)
-              if (failed(mapOuterRange(range))) {
-                bodyFailed = true;
-                failureReason =
-                    "outer reduction range could not be blocked";
-                return;
-              }
+          // Tensor users retain a one-coordinate fragment. Its scalar loop
+          // slice must not become a new range for later full-domain blocking.
+          for (MakeRangeOp range : plan.ranges)
+            if (failed(mapOuterRange(range))) {
+              bodyFailed = true;
+              failureReason =
+                  "outer reduction range could not be blocked";
+              return;
+            }
           for (RootAccess access : accesses[component]) {
-            if (blockOuterAxis) {
-              if (failed(mapOuterRange(access.range))) {
-                bodyFailed = true;
-                failureReason =
-                    "outer reduction load range could not be blocked";
-                return;
-              }
-            } else {
-              mapping.map(access.range.getResult(), coordinate);
+            if (failed(mapOuterRange(access.range))) {
+              bodyFailed = true;
+              failureReason =
+                  "outer reduction load range could not be blocked";
+              return;
             }
             LoadOp load = access.load;
             auto sourceType = cast<FragmentType>(load.getResult().getType());
@@ -1864,13 +1867,9 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
             }
             coordinates[access.coordinateIndex] = *reducedCoordinate;
             using ReplayAxis =
-                std::tuple<PhysicalSourceAxis, PhysicalExprAttr, Value, Value>;
-            SmallVector<ReplayAxis> replayAxes{{
-                plan.sourceIdentity, outerSliceExtent,
-                access.range.getResult(),
-                blockOuterAxis
-                    ? mapping.lookupOrNull(access.range.getResult())
-                    : coordinate}};
+                std::pair<PhysicalSourceAxis, PhysicalExprAttr>;
+            SmallVector<ReplayAxis> replayAxes{
+                {plan.sourceIdentity, outerSliceExtent}};
             for (auto [coordinateIndex, original] :
                  llvm::enumerate(load.getCoordinates())) {
               if (coordinateIndex == access.coordinateIndex)
@@ -1891,8 +1890,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
               auto rangeType = cast<FragmentType>(range.getResult().getType());
               replayAxes.emplace_back(
                   sourceAxisIdentity(range),
-                  cast<PhysicalExprAttr>(rangeType.getShape()[0]),
-                  range.getResult(), mapping.lookupOrNull(range.getResult()));
+                  cast<PhysicalExprAttr>(rangeType.getShape()[0]));
               FailureOr<Value> replayedCoordinate = materializeReplayedValue(
                   nested, nestedLocation, original, sourceAxisIdentity(range),
                   cast<PhysicalExprAttr>(rangeType.getShape()[0]), mapping);
@@ -1907,13 +1905,11 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
             Value valid;
             if (load.getValid()) {
               valid = load.getValid();
-              for (auto [source, extent, originalRange, replacementRange] :
-                   replayAxes) {
-                IRMapping axisMapping;
-                axisMapping.map(originalRange, replacementRange);
+              // Reuse the coordinate SSA in its bounds predicates and fill.
+              for (auto [source, extent] : replayAxes) {
                 FailureOr<Value> replayed = materializeReplayedValue(
                     nested, nestedLocation, valid, source, extent,
-                    axisMapping);
+                    mapping);
                 if (failed(replayed)) {
                   bodyFailed = true;
                   failureReason =
@@ -1926,13 +1922,10 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
             Value fill;
             if (load.getFill()) {
               fill = load.getFill();
-              for (auto [source, extent, originalRange, replacementRange] :
-                   replayAxes) {
-                IRMapping axisMapping;
-                axisMapping.map(originalRange, replacementRange);
+              for (auto [source, extent] : replayAxes) {
                 FailureOr<Value> replayed = materializeReplayedValue(
                     nested, nestedLocation, fill, source, extent,
-                    axisMapping);
+                    mapping);
                 if (failed(replayed)) {
                   bodyFailed = true;
                   failureReason =
@@ -2242,7 +2235,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
          "_A" + Twine(sourcePlans.front().sourceIdentity.sourceAxis) +
          (sourcePlans.front().sourceIdentity.derived ? "_DERIVED" : ""))
             .str();
-    SmallVector<int64_t> candidates{8,   16,   32,   64,   128,  256,
+    SmallVector<int64_t> candidates{4,   8,    16,   32,   64,   128, 256,
                                     512, 1024, 2048, 4096, 8192};
     chunk = getOrCreatePhysicalParameter(
         kernel, name, reductionRole, ParameterCategory::Reduction,
