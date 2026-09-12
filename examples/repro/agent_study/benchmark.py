@@ -18,7 +18,7 @@ from repro.v2.measurement import evaluate, NumericalComparisonError, PipelineSta
 from repro.v2.model import PreparedComparison, PreparedLaunch
 
 from .program import load_program, ProgramContext, TuningBudget
-from .tasks import catalog, invocation, read_suite, reference, tolerance
+from .tasks import SUITE_PATH, catalog, invocation, read_suite, reference, tolerance
 
 
 class CandidateTorchPolicy(TorchDispatchMode):
@@ -62,13 +62,13 @@ def _observe(call, function, *, task: str, enforce: bool) -> PreparedLaunch:
     return PreparedLaunch(launch, lambda: (latest[0], _tensors(call)))
 
 
-def run(arguments) -> dict:
+def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
     torch.set_num_threads(1)
     torch.cuda.set_device(0)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.benchmark = False
-    suite = read_suite()
+    suite = read_suite(suite_path)
     task = next(task for task in suite["tasks"] if task["id"] == arguments.task)
     row = next(row for row in catalog(arguments.reference, suite) if row["task"] == arguments.task)
     timing = arguments.timing or task.get("timing", suite["timing"])
@@ -170,11 +170,13 @@ def main() -> None:
     parser.add_argument("--result", type=Path, required=True)
     parser.add_argument("--gpu-lock", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, help="Separate compiler recheck artifacts from an existing submission")
+    parser.add_argument("--suite", type=Path, default=SUITE_PATH,
+                        help="Fixed task and numerical configuration used by generation")
     parser.add_argument("--timing", choices=("cuda_graph", "cuda_event"),
                         help="Override the task's paired candidate/reference timing path")
     arguments = parser.parse_args()
     with redirect_stdout(sys.stderr):
-        result = run(arguments)
+        result = run(arguments, suite_path=arguments.suite)
     arguments.result.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({key: value for key, value in result.items() if key != "traceback"}))
 

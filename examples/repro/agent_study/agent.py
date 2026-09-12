@@ -55,7 +55,7 @@ def command(directory: Path, suite: dict, response: Path, schema: Path, executab
     if config["model_providers"][provider]["env_key"] != "INTENT_STUDY_API_KEY":
         raise ValueError("dedicated provider must use INTENT_STUDY_API_KEY")
     # The outer generation deadline also bounds a silent reasoning stream.
-    config["model_providers"][provider]["stream_idle_timeout_ms"] = int(suite["generation_seconds"] * 1000)
+    config["model_providers"][provider]["stream_idle_timeout_ms"] = int(suite["agent_seconds"] * 1000)
     values = {
         "model_reasoning_effort": suite["reasoning_effort"],
         "model_provider": provider,
@@ -157,7 +157,7 @@ def execute(directory: Path, suite: dict, prompt: str, *, executable: Path,
         stop.wait(1)
     for reader in readers:
         reader.join()
-    result = {"model": suite["model"], "reasoning_effort": suite["reasoning_effort"],
+    result = {"task_directory": str(directory), "model": suite["model"], "reasoning_effort": suite["reasoning_effort"],
               "threads": threads, "exit_code": process.returncode, "manual_calls": mcp_calls,
               "generation_seconds": time.monotonic() - started,
               "completed_turns": completed_turns}

@@ -20,8 +20,8 @@ from .reference_corrections import CORRECTIONS
 SUITE_PATH = Path(__file__).with_name("suite.json")
 
 
-def read_suite() -> dict:
-    return json.loads(SUITE_PATH.read_text())
+def read_suite(path: Path = SUITE_PATH) -> dict:
+    return json.loads(path.read_text())
 
 
 def catalog(root: Path, suite: dict) -> list[dict]:
@@ -45,7 +45,7 @@ def catalog(root: Path, suite: dict) -> list[dict]:
         if str(index) in suite["prompt_entry_overrides"]:
             entry = suite["prompt_entry_overrides"][str(index)]["entry"]
         task_id, line = entries[entry]
-        disposition, reason = "not_selected", "Outside the fixed first 50; not a compiler-support judgment."
+        disposition, reason = "not_selected", "Outside the selected fixed suite; not a compiler-support judgment."
         if task_id in suite["outside_scope"]:
             disposition, reason = "out_of_scope", suite["outside_scope"][task_id]
         elif task_id in suite["deferred_contracts"]:
@@ -62,8 +62,8 @@ def catalog(root: Path, suite: dict) -> list[dict]:
             rows[-1]["reference_correction"] = suite["reference_corrections"][task_id]
     if len(rows) != 166 or len({row["task"] for row in rows}) != 166:
         raise ValueError("TritonBench-T task correspondence is not the agreed 166 unique tasks")
-    if len(selected) != 50 or set(selected) - {row["task"] for row in rows}:
-        raise ValueError("the first study must contain exactly 50 distinct mapped tasks")
+    if not selected or len(selected) != len(suite["tasks"]) or set(selected) - {row["task"] for row in rows}:
+        raise ValueError("the study must contain distinct mapped tasks")
     return rows
 
 
@@ -180,17 +180,20 @@ def invocation(root: Path, row: dict, task: dict, suite: dict, *, device="cuda")
                 and node.name in {"__init__", "get_input_tensors", "call_op"}]
     cls = _StreamInputs().visit(cls)
     module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
-    namespace = {"torch": torch, "_ProfileBase": _ProfileBase, row["entry"]: _capture}
+    function = reference(root, row)
+    namespace = {"torch": torch, "_ProfileBase": _ProfileBase, row["entry"]: function}
     exec(compile(module, str(path), "exec"), namespace)
     profile = namespace[cls.name](dtype=getattr(torch, suite["dtype"]))
     torch.manual_seed(suite["input_seed"])
     with redirect_stdout(io.StringIO()):
         inputs = next(islice(profile.get_input_tensors(), task["input_index"], None))
     inputs = _to_device(inputs, device)
+    # Upstream factories may invoke the reference to determine output metadata.
+    # Capture only the subsequent operator call, after those inputs exist.
+    namespace[row["entry"]] = _capture
     try:
         profile.call_op(inputs)
     except _InvocationCaptured as captured:
-        function = reference(root, row)
         bound = inspect.signature(function).bind(*captured.args_value, **captured.kwargs_value)
         bound.apply_defaults()
         return Invocation(captured.args_value, captured.kwargs_value, dict(bound.arguments))

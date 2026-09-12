@@ -17,7 +17,7 @@ import torch
 import triton
 
 from .agent import execute, materialize_language
-from .tasks import catalog, description, invocation, read_suite, reference, return_contract
+from .tasks import SUITE_PATH, catalog, description, invocation, read_suite, reference, return_contract
 
 
 def revision(directory: Path) -> str:
@@ -27,7 +27,8 @@ def revision(directory: Path) -> str:
 def run_benchmark(arguments, task, program, language, result_path) -> dict:
     command = [sys.executable, "-B", "-m", "repro.agent_study.benchmark", "--reference", str(arguments.reference),
                "--compiler", str(arguments.compiler), "--task", task, "--program", str(program),
-               "--language", language, "--result", str(result_path), "--gpu-lock", str(arguments.gpu_lock)]
+               "--language", language, "--result", str(result_path), "--gpu-lock", str(arguments.gpu_lock),
+               "--suite", str(arguments.suite_path)]
     with tempfile.TemporaryFile(mode="w+") as log:
         process = subprocess.Popen(command, stdout=log, stderr=log, start_new_session=True)
         try:
@@ -92,6 +93,8 @@ def main() -> None:
     parser.add_argument("--codex", type=Path, required=True, help="Native Codex executable")
     parser.add_argument("--state-root", type=Path, required=True, help="Dedicated external config.toml, provider.key and Codex state")
     parser.add_argument("--output", type=Path, required=True, help="New result directory; previous batches are never resumed")
+    parser.add_argument("--suite", dest="suite_path", type=Path, default=SUITE_PATH,
+                        help="Fixed task and generation configuration")
     parser.add_argument("--tasks", nargs="+")
     parser.add_argument("--arms", nargs="+", choices=("triton", "intent"), default=("triton", "intent"))
     parser.add_argument("--workers", type=int, default=8, help="Concurrent isolated code-generation workers")
@@ -100,7 +103,8 @@ def main() -> None:
     parser.add_argument("--gpu-lock", type=Path)
     arguments = parser.parse_args()
     arguments.project = Path(__file__).resolve().parents[3]
-    arguments.suite, arguments.stop = read_suite(), threading.Event()
+    arguments.suite_path = arguments.suite_path.resolve(strict=True)
+    arguments.suite, arguments.stop = read_suite(arguments.suite_path), threading.Event()
     for name in ("reference", "triton_ref", "compiler", "codex", "state_root"):
         setattr(arguments, name, getattr(arguments, name).resolve(strict=True))
     if arguments.state_root.is_relative_to(arguments.project):
@@ -112,7 +116,7 @@ def main() -> None:
     by_id = {task["id"]: task for task in arguments.suite["tasks"]}
     selected = arguments.tasks or list(by_id)
     if set(selected) - set(by_id):
-        parser.error("--tasks must be drawn from the fixed 50-task suite")
+        parser.error("--tasks must be drawn from the selected fixed suite")
     torch.set_num_threads(1)
     rows = [row for row in catalog(arguments.reference, arguments.suite) if row["task"] in selected]
     for row in rows:
@@ -131,6 +135,7 @@ def main() -> None:
                    "triton_ref_revision": revision(arguments.triton_ref), "compiler": str(arguments.compiler),
                    "torch": torch.__version__, "triton": triton.__version__, "gpu": torch.cuda.get_device_name(0),
                    "model": arguments.suite["model"], "reasoning_effort": arguments.suite["reasoning_effort"],
+                   "suite": str(arguments.suite_path),
                    "tasks": rows, "submission_policy": "one complete program; documentation tools; no benchmark feedback",
                    "timing": "complete operator; per-task paired CUDA Graph or CUDA event timing; compilation/tuning excluded",
                    "isolation": "dedicated Codex state/provider; workspace-only shell, no network; read-only public manual MCP; no reference/history/agents",
