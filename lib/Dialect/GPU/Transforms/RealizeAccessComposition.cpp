@@ -9,6 +9,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "llvm/ADT/DenseSet.h"
 
 using namespace mlir;
 
@@ -1304,6 +1305,47 @@ LogicalResult realizeAccessComposition(ModuleOp module) {
     eraseDeadPhysicalValues(*physicalKernel);
   } while (changed);
   sinkImmutableLoadChains(*physicalKernel);
+  return success();
+}
+
+LogicalResult simplifyMaskedAccessCoordinates(ModuleOp module) {
+  FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
+  if (failed(kernel))
+    return failure();
+  kernel->walk([&](LoadOp load) {
+    Value valid = load.getValid();
+    if (!valid)
+      return;
+    llvm::SmallDenseSet<Value, 16> conjuncts;
+    SmallVector<Value> pending{valid};
+    while (!pending.empty()) {
+      Value value = pending.pop_back_val();
+      if (value.getType() != valid.getType() ||
+          !conjuncts.insert(value).second)
+        continue;
+      auto binary = value.getDefiningOp<BinaryOp>();
+      if (!binary ||
+          (binary.getOperatorKind() != BinaryOperator::LogicalAnd &&
+           binary.getOperatorKind() != BinaryOperator::BitwiseAnd))
+        continue;
+      pending.push_back(binary.getLhs());
+      pending.push_back(binary.getRhs());
+    }
+    SmallVector<Value> coordinates(load.getCoordinates());
+    bool changed = false;
+    for (Value &coordinate : coordinates) {
+      auto select = coordinate.getDefiningOp<SelectOp>();
+      if (!select || !conjuncts.contains(select.getCondition()))
+        continue;
+      // Exact SSA predicates with the same schema describe the same lanes.
+      // Change only this masked read; other uses retain their selected value.
+      coordinate = select.getTrueValue();
+      changed = true;
+    }
+    if (changed)
+      load.getCoordinatesMutable().assign(coordinates);
+  });
+  eraseDeadPhysicalValues(*kernel);
   return success();
 }
 

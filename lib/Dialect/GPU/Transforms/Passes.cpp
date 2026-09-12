@@ -135,7 +135,9 @@ LogicalResult refineMapping(ModuleOp module, func::FuncOp) {
 }
 
 LogicalResult simplifyValues(ModuleOp module, func::FuncOp) {
-  return eliminateCommonValues(module);
+  if (failed(eliminateCommonValues(module)))
+    return failure();
+  return simplifyMaskedAccessCoordinates(module);
 }
 
 LogicalResult closeSharedConfigurations(func::FuncOp kernel,
