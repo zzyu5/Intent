@@ -54,6 +54,8 @@ Public 调用为 `intent.compile(kernel, compiler=..., target=..., constexprs=..
 
 编译与 launch 分开。`intent.generate` 只生成 source/IR；target 在 host 选择，例如 `intent.targets.TritonTarget()`，不能在 kernel 查询设备或选择 warp/tile。
 
+标量 constexpr 使用 Python 类型注解，例如 `STEP: I.Constexpr[int]`、`EPS: I.Constexpr[float]`、`ENABLED: I.Constexpr[bool]`。`I.f32` 等是 runtime scalar dtype 描述符。
+
 `constexprs` 绑定 kernel 签名中声明的 `I.Constexpr[...]` 参数。View shape 中的 `"M"`、`"K"` 是 logical extent 名字；`M, K = input.shape` 读取这些 extents，不会声明同名 constexpr 参数。只有动态 shape 的 kernel 无需把本次输入尺寸传入 `constexprs`。
 
 评测中的 `build(context)` 只是上述调用的薄适配：在 build 内分别 `context.compile("name", kernel)`，返回一个 host callable，在 callable 中分配中间 tensors 并调用 artifacts。它不改变 DSL，也不要求整个任务只能写一个 kernel。
