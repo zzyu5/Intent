@@ -313,6 +313,22 @@ def matmul(a, b):
     return torch.matmul(a.float(), b.float()).to(a.dtype)
 
 
+def batched_gemm_tn(a, b):
+    return torch.bmm(a.float().transpose(-1, -2), b.float()).to(torch.bfloat16)
+
+
+def batched_gemm_nt(a, b):
+    return torch.bmm(a.float(), b.float().transpose(-1, -2)).to(torch.bfloat16)
+
+
+def batched_gemm_tt(a, b):
+    return torch.bmm(a.float().transpose(-1, -2), b.float().transpose(-1, -2)).to(torch.bfloat16)
+
+
+def mla_head_projection(source, weight):
+    return torch.einsum("bqhi,hoi->bqho", source.float(), weight.float()).half()
+
+
 def conv1d_same(x, weight):
     width = weight.numel()
     patches = F.pad(x.float(), (width // 2, width // 2)).unfold(-1, width, 1)

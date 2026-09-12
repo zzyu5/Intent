@@ -32,6 +32,11 @@ adafactor,4096x4096-fp32-8cores-host,28.538980,65.967577,0.432621,pass,既有409
 dense_gemm,M4096-N14336-K4096-fp16-8cores-host,547.434761,396.954454,1.379087,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
 tilegym_dense_gemm,M8192-N11008-K4096-bf16-8cores-host,789.504150,598.654484,1.318798,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
 batched_gemm,B32-M512-N512-K1024-bf16-8cores-host,19.900564,34.943453,0.569508,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+batched_gemm_tn,B32-M512-N512-K1024-bf16-TN-8cores-host,21.032780,36.779088,0.571868,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+batched_gemm_nt,B32-M512-N512-K1024-bf16-NT-8cores-host,21.260617,34.402498,0.617996,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+batched_gemm_tt,B32-M512-N512-K1024-bf16-TT-8cores-host,24.593153,37.269738,0.659869,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+mla_head_query_projection,B1-Q512-H8-I128-O512-fp16-8cores-host,5.341982,0.506409,10.548748,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+mla_head_value_projection,B1-Q512-H8-I512-O128-fp16-8cores-host,5.257535,0.652233,8.060822,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
 fused_softmax,8192x8192-fp16-8cores-host,28.915842,157.133480,0.184021,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
 chunked_softmax,8192x32768-bf16-8cores-host,78.508053,509.353788,0.154133,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
 layer_norm_f16,8192x4096-fp16-8cores-host,8.843963,113.324044,0.078041,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
