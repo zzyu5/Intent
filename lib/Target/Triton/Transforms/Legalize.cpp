@@ -1822,21 +1822,61 @@ LogicalResult legalizeContractShapes(func::FuncOp kernel) {
 }
 
 void selectContractForms(func::FuncOp kernel) {
-  kernel.walk([&](gpu::ContractOp contract) {
+  SmallVector<gpu::ContractOp> contracts;
+  kernel.walk([&](gpu::ContractOp contract) { contracts.push_back(contract); });
+  for (gpu::ContractOp contract : contracts) {
     auto lhs = contract.getLhs().getType();
     if (lhs.getShape().empty())
-      return;
+      continue;
     auto reductionExtent =
         dyn_cast<gpu::PhysicalExprAttr>(
             lhs.getShape()[lhs.getShape().size() - 1]);
-    if (!reductionExtent ||
-        reductionExtent.getKind() !=
-            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
-        reductionExtent.getValue() >= 16)
-      return;
-    contract->setAttr(contractFormAttr,
-                      StringAttr::get(kernel.getContext(), "multiply_sum"));
-  });
+    if (reductionExtent &&
+        reductionExtent.getKind() ==
+            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+        reductionExtent.getValue() < 16) {
+      contract->setAttr(contractFormAttr,
+                        StringAttr::get(kernel.getContext(), "multiply_sum"));
+      continue;
+    }
+    if (lhs.getShape().size() != 2 || !lhs.getElementType().isF32() ||
+        !contract.getRhs().getType().getElementType().isF32() ||
+        !contract.getAccumulator().getType().getElementType().isF32())
+      continue;
+    auto rows = cast<gpu::PhysicalExprAttr>(lhs.getShape()[0]);
+    if (rows.getKind() == static_cast<uint32_t>(gpu::PhysicalExprKind::Constant)) {
+      if (rows.getValue() <= 4)
+        contract->setAttr(contractFormAttr,
+                          StringAttr::get(kernel.getContext(), "multiply_sum"));
+      continue;
+    }
+    if (rows.getKind() != static_cast<uint32_t>(gpu::PhysicalExprKind::Parameter))
+      continue;
+    FailureOr<gpu::ParameterOp> parameter =
+        gpu::queryParameterBySymbol(kernel, rows.getSymbol());
+    if (failed(parameter))
+      continue;
+    auto candidates = parameter->getParameter().getCandidates().asArrayRef();
+    if (llvm::none_of(candidates, [](int64_t extent) { return extent <= 4; }))
+      continue;
+    OpBuilder builder(contract);
+    Value limit = builder.create<arith::ConstantIndexOp>(contract.getLoc(), 4);
+    Value small = builder.create<gpu::CompareOp>(
+        contract.getLoc(), builder.getI1Type(), parameter->getResult(), limit,
+        ComparePredicate::Le);
+    auto choice = builder.create<scf::IfOp>(
+        contract.getLoc(), TypeRange{contract.getResult().getType()}, small, true);
+    builder.setInsertionPointToStart(&choice.getThenRegion().front());
+    auto vector = cast<gpu::ContractOp>(builder.clone(*contract));
+    vector->setAttr(contractFormAttr,
+                    StringAttr::get(kernel.getContext(), "multiply_sum"));
+    builder.create<scf::YieldOp>(contract.getLoc(), vector.getResult());
+    builder.setInsertionPointToStart(&choice.getElseRegion().front());
+    auto matrix = cast<gpu::ContractOp>(builder.clone(*contract));
+    builder.create<scf::YieldOp>(contract.getLoc(), matrix.getResult());
+    contract.getResult().replaceAllUsesWith(choice.getResult(0));
+    contract.erase();
+  }
 }
 
 LogicalResult legalizeScatterAdd(func::FuncOp kernel) {
