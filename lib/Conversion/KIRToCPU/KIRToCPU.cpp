@@ -1075,7 +1075,54 @@ private:
     return predicate;
   }
 
+  void bindScalars(ValueRange originals, ValueRange components) {
+    unsigned offset = 0;
+    for (Value original : originals) {
+      SmallVector<Type> leaves;
+      flattenTypes(original.getType(), leaves);
+      bindProduct(original, components.slice(offset, leaves.size()));
+      offset += leaves.size();
+    }
+  }
+
+  LogicalResult scalarControl(Operation *operation, TypeRange resultTypes) {
+    auto savedDimensions = dimensions;
+    Location loc = operation->getLoc();
+    auto body = [&](Block &source, Block *target) {
+      if (!target->empty() && target->back().hasTrait<OpTrait::IsTerminator>()) target->back().erase();
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToEnd(target);
+      if (failed(lowerBlock(source))) return failure();
+      builder.create<scf::YieldOp>(loc, flattened(source.getTerminator()->getOperands()));
+      dimensions = savedDimensions;
+      return success();
+    };
+    if (auto conditional = dyn_cast<IfOp>(operation)) {
+      auto target = builder.create<scf::IfOp>(loc, resultTypes, values.lookup(conditional.getCondition()), true);
+      if (failed(body(conditional.getThenRegion().front(), target.thenBlock())) ||
+          failed(body(conditional.getElseRegion().front(), target.elseBlock()))) return failure();
+      bindScalars(operation->getResults(), target.getResults());
+      return success();
+    }
+    auto loop = cast<ForOp>(operation);
+    if (!domains.count(loop.getInputs().front())) return operation->emitError("CPU ordered for requires a realized domain");
+    Domain domain = domains.lookup(loop.getInputs().front());
+    auto target = builder.create<scf::ForOp>(loc, domain.begin, domain.end, domain.step,
+                                            flattened(loop.getInputs().drop_front()));
+    Block &source = loop.getBody().front();
+    values.map(source.getArgument(0), target.getInductionVar());
+    bindScalars(source.getArguments().drop_front(), target.getRegionIterArgs());
+    if (failed(body(source, target.getBody()))) return failure();
+    bindScalars(operation->getResults(), target.getResults());
+    return success();
+  }
+
   LogicalResult orderedControl(Operation *operation) {
+    SmallVector<Type> leaves;
+    for (Type type : operation->getResultTypes()) flattenTypes(type, leaves);
+    if (isa<IfOp, ForOp>(operation) && llvm::all_of(leaves, [](Type type) {
+          return isa<IntegerType, IndexType, FloatType>(type);
+        })) return scalarControl(operation, leaves);
     Location loc = operation->getLoc();
     auto destinations = makeSlots(operation->getResultTypes(), loc);
     if (operation->getNumResults() && destinations.empty()) return failure();

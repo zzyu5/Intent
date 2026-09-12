@@ -198,19 +198,34 @@ private:
       line("for (int64_t " + iv + " = " + value(loop.getLowerBound()) + "; " + iv + " < " + value(loop.getUpperBound()) +
           "; " + iv + " += " + value(loop.getStep()) + ") {");
       ++indent; if (failed(block(*loop.getBody()))) return failure();
-      for (auto [argument, yielded] : llvm::zip(loop.getRegionIterArgs(), loop.getBody()->getTerminator()->getOperands()))
-        line(value(argument) + " = " + value(yielded) + ";");
+      SmallVector<std::string> next;
+      for (Value yielded : loop.getBody()->getTerminator()->getOperands()) {
+        next.push_back(fresh());
+        line(scalarType(yielded.getType()) + " " + next.back() + " = " + value(yielded) + ";");
+      }
+      for (auto [argument, yielded] : llvm::zip(loop.getRegionIterArgs(), next))
+        line(value(argument) + " = " + yielded + ";");
       --indent; line("}");
       for (auto [result, argument] : llvm::zip(loop.getResults(), loop.getRegionIterArgs())) values[result] = value(argument);
       return success();
     }
     if (auto condition = dyn_cast<scf::IfOp>(operation)) {
-      if (condition.getNumResults()) return condition.emitError("host conditional results require prior materialization");
+      for (Value result : condition.getResults()) {
+        std::string name = fresh();
+        line(scalarType(result.getType()) + " " + name + ";");
+        values[result] = name;
+      }
+      auto branch = [&](Block &body) {
+        if (failed(block(body))) return failure();
+        for (auto [result, yielded] : llvm::zip(condition.getResults(), body.getTerminator()->getOperands()))
+          line(value(result) + " = " + value(yielded) + ";");
+        return success();
+      };
       line("if (" + value(condition.getCondition()) + ") {");
-      ++indent; if (failed(block(*condition.thenBlock()))) return failure(); --indent;
+      ++indent; if (failed(branch(*condition.thenBlock()))) return failure(); --indent;
       if (!condition.getElseRegion().empty()) {
         line("} else {"); ++indent;
-        if (failed(block(*condition.elseBlock()))) return failure(); --indent;
+        if (failed(branch(*condition.elseBlock()))) return failure(); --indent;
       }
       line("}"); return success();
     }
