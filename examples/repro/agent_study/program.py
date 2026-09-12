@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -75,11 +76,25 @@ class TuningBudget:
         original_jit = JITFunction.run
         original_autotuner = Autotuner.run
         autotuning = 0
+        future_names = {}
+        policy = self.policy
+
+        class CompileExecutor(ThreadPoolExecutor):
+            def submit(self, function, /, *args, **kwargs):
+                def compile_with_policy():
+                    with policy():
+                        return function(*args, **kwargs)
+                return super().submit(compile_with_policy)
 
         def compile_kernel(kernel, *args, **kwargs):
             kwargs["warmup"] = True
             try:
-                return original_jit(kernel, *args, **kwargs)
+                compiled = original_jit(kernel, *args, **kwargs)
+                if isinstance(compiled, triton.FutureKernel):
+                    if not autotuning:
+                        return compiled.result()
+                    future_names[compiled] = kernel.__name__
+                return compiled
             except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as error:
                 if not autotuning:
                     raise
@@ -102,11 +117,19 @@ class TuningBudget:
                     if configuration.pre_hook is not None:
                         configuration.pre_hook({**tuner.nargs, **kwargs, **meta})
                     compiled.append(tuner.fn.warmup(*args, **kwargs, **meta))
-                # Autotuner.run returns one compiled kernel. Preserve that
-                # interface for explicit-output artifact calls during warmup.
+                resolved = []
                 for kernel in compiled:
-                    if kernel is not None:
-                        return kernel
+                    if isinstance(kernel, triton.FutureKernel):
+                        try:
+                            resolved.append(kernel.result())
+                        except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as error:
+                            self.precompile_failures.append({"kernel": future_names[kernel], "error": str(error)})
+                    elif kernel is not None:
+                        resolved.append(kernel)
+                # Return a resolved kernel, preserving the explicit-output
+                # artifact interface. All candidate failures were inspected.
+                if resolved:
+                    return resolved[0]
                 raise RuntimeError("no bounded autotune configuration compiled successfully")
             finally:
                 autotuning -= 1
@@ -114,7 +137,11 @@ class TuningBudget:
         JITFunction.run = compile_kernel
         Autotuner.run = compile_tuner
         try:
-            yield
+            # Expected per-configuration failures are handled above; unknown
+            # failures still propagate from result() before this context exits.
+            with CompileExecutor(max_workers=2) as executor:
+                with triton.AsyncCompileMode(executor, ignore_errors=True):
+                    yield
         finally:
             JITFunction.run = original_jit
             Autotuner.run = original_autotuner
