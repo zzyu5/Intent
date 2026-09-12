@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import csv
 import json
 import os
@@ -42,7 +42,15 @@ def run_benchmark(arguments, task, program, language, result_path) -> dict:
     return json.loads(result_path.read_text())
 
 
-def trial(arguments, row, language) -> dict:
+def finish_trial(arguments, result, measured) -> dict:
+    destination = arguments.output / result["task"] / result["language"]
+    (destination / "measurement.json").write_text(json.dumps(measured, indent=2) + "\n")
+    result.update(measured)
+    print(json.dumps({key: result.get(key) for key in ("task", "language", "status", "candidate_ms", "reference_ms", "ratio")}), flush=True)
+    return result
+
+
+def generate_trial(arguments, row, language) -> dict:
     directory = Path(tempfile.mkdtemp(prefix=f"{row['task']}-{language}-", dir=arguments.state_root / "candidates")).resolve()
     materials = materialize_language(arguments.project, arguments.triton_ref, directory / "materials", language)
     task_text = description(arguments.reference, row)
@@ -57,20 +65,22 @@ def trial(arguments, row, language) -> dict:
     destination.mkdir(parents=True)
     agent["language_materials"] = materials
     (destination / "agent.json").write_text(json.dumps(agent, indent=2) + "\n")
-    result_path = destination / "measurement.json"
     program = destination / "candidate.py"
+    result = {"task": row["task"], "profile": row["input_index"], "language": language, "program": ""}
     if agent["action"] != "submit":
         measured = {"status": agent["status"], "error": agent["error"]}
     elif not (directory / "candidate.py").exists():
         measured = {"status": "agent_program_error", "error": "No candidate.py was submitted"}
     else:
         shutil.copyfile(directory / "candidate.py", program)
-        measured = run_benchmark(arguments, row["task"], program, language, result_path)
-    result_path.write_text(json.dumps(measured, indent=2) + "\n")
-    result = {"task": row["task"], "profile": row["input_index"], "language": language,
-              "program": str(program.relative_to(arguments.output)) if program.exists() else "", **measured}
-    print(json.dumps({key: result.get(key) for key in ("task", "language", "status", "candidate_ms", "reference_ms", "ratio")}), flush=True)
-    return result
+        return {**result, "program": str(program.relative_to(arguments.output)), "status": "submitted"}
+    return finish_trial(arguments, result, measured)
+
+
+def evaluate_trial(arguments, result) -> dict:
+    program = arguments.output / result["program"]
+    measured = run_benchmark(arguments, result["task"], program, result["language"], program.parent / "measurement.json")
+    return finish_trial(arguments, result, measured)
 
 
 def main() -> None:
@@ -83,7 +93,9 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True, help="New result directory; previous batches are never resumed")
     parser.add_argument("--tasks", nargs="+")
     parser.add_argument("--arms", nargs="+", choices=("triton", "intent"), default=("triton", "intent"))
-    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--workers", type=int, default=8, help="Concurrent isolated code-generation workers")
+    parser.add_argument("--benchmark-workers", type=int, default=4,
+                        help="Concurrent compiler/JIT processes; GPU execution uses the shared lock")
     parser.add_argument("--gpu-lock", type=Path)
     arguments = parser.parse_args()
     arguments.project = Path(__file__).resolve().parents[3]
@@ -93,7 +105,9 @@ def main() -> None:
     if arguments.state_root.is_relative_to(arguments.project):
         parser.error("dedicated state/candidates must live outside the project")
     if not 1 <= arguments.workers <= 8:
-        parser.error("use one to eight concurrent preparation workers")
+        parser.error("use one to eight concurrent generation workers")
+    if not 1 <= arguments.benchmark_workers <= 8:
+        parser.error("use one to eight concurrent benchmark preparation workers")
     by_id = {task["id"]: task for task in arguments.suite["tasks"]}
     selected = arguments.tasks or list(by_id)
     if set(selected) - set(by_id):
@@ -119,19 +133,29 @@ def main() -> None:
                    "instructions": Path(__file__).with_name("instructions.md").read_text()}
     (arguments.output / "environment.json").write_text(json.dumps(environment, indent=2) + "\n")
     fields = ("task", "profile", "language", "status", "candidate_ms", "reference_ms", "ratio", "timing", "failure_stage", "error", "program")
-    with (arguments.output / "results.csv").open("w", newline="") as output, ThreadPoolExecutor(max_workers=arguments.workers) as executor:
+    with ((arguments.output / "results.csv").open("w", newline="") as output,
+          ThreadPoolExecutor(max_workers=arguments.workers) as generation,
+          ThreadPoolExecutor(max_workers=arguments.benchmark_workers) as evaluation):
         writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
-        futures = [executor.submit(trial, arguments, row, language) for row in rows for language in arguments.arms]
-        for future in as_completed(futures):
-            try:
-                writer.writerow(future.result())
-                output.flush()
-            except BaseException:
-                arguments.stop.set()
-                for pending in futures:
-                    pending.cancel()
-                raise
+        futures = {generation.submit(generate_trial, arguments, row, language): True
+                   for row in rows for language in arguments.arms}
+        try:
+            while futures:
+                completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    result = future.result()
+                    generated = futures.pop(future)
+                    if generated and result["status"] == "submitted":
+                        futures[evaluation.submit(evaluate_trial, arguments, result)] = False
+                    else:
+                        writer.writerow(result)
+                        output.flush()
+        except BaseException:
+            arguments.stop.set()
+            for pending in futures:
+                pending.cancel()
+            raise
 
 
 if __name__ == "__main__":
