@@ -779,6 +779,14 @@ private:
 
   FailureOr<Value> arithmetic(Operation *operation, ValueRange arguments, OpBuilder &builder) {
     Location loc = operation->getLoc();
+    auto flushF32 = [&](Value value) -> Value {
+      Value zero = builder.create<arith::ConstantOp>(loc, builder.getF32FloatAttr(0.0f));
+      Value normal = builder.create<arith::ConstantOp>(loc, builder.getF32FloatAttr(0x1.0p-126f));
+      Value magnitude = builder.create<math::AbsFOp>(loc, value);
+      Value subnormal = builder.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OLT, magnitude, normal);
+      Value signedZero = builder.create<arith::MulFOp>(loc, value, zero);
+      return builder.create<arith::SelectOp>(loc, subnormal, signedZero, value);
+    };
     if (isa<RandomBitsOp>(operation)) {
       Type u32 = IntegerType::get(builder.getContext(), 32, IntegerType::Unsigned);
       Type u64 = IntegerType::get(builder.getContext(), 64, IntegerType::Unsigned);
@@ -826,14 +834,7 @@ private:
           return builder.create<arith::ConstantOp>(loc, builder.getF32FloatAttr(value));
         };
         Value zero = literal(0.0f), negativeZero = literal(-0.0f);
-        Value normal = literal(0x1.0p-126f);
-        auto flush = [&](Value value) -> Value {
-          Value magnitude = builder.create<math::AbsFOp>(loc, value);
-          Value subnormal = builder.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OLT, magnitude, normal);
-          Value signedZero = builder.create<arith::MulFOp>(loc, value, zero);
-          return builder.create<arith::SelectOp>(loc, subnormal, signedZero, value);
-        };
-        if (binary.getFlushToZero()) { a = flush(a); b = flush(b); }
+        if (binary.getFlushToZero()) { a = flushF32(a); b = flushF32(b); }
         Value quotient = builder.create<arith::DivFOp>(loc, a, b);
         Value large = builder.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OGT,
             builder.create<math::AbsFOp>(loc, b), literal(0x1.0p126f));
@@ -841,7 +842,7 @@ private:
         Value denominatorSign = builder.create<arith::SelectOp>(loc, negative, negativeZero, zero);
         Value limit = builder.create<arith::MulFOp>(loc, a, denominatorSign);
         Value result = builder.create<arith::SelectOp>(loc, large, limit, quotient);
-        return binary.getFlushToZero() ? flush(result) : result;
+        return binary.getFlushToZero() ? flushF32(result) : result;
       }
       bool fp = isa<FloatType>(a.getType());
       auto logical = dyn_cast<IntegerType>(getElementTypeOrSelf(binary.getOperand(0).getType()));
@@ -894,8 +895,17 @@ private:
       default: break;
       }
     } else if (auto unary = dyn_cast<UnaryOp>(operation)) {
-      if (unary.getApproximate() || unary.getFlushToZero())
-        return unary.emitError("CPU approximate arithmetic is not implemented"), failure();
+      if (unary.getApproximate() || unary.getFlushToZero()) {
+        auto kind = unary.getOperatorKind();
+        if (!unary.getApproximate() || !arguments[0].getType().isF32() ||
+            (kind != UnaryOperator::Exp2 && kind != UnaryOperator::Tanh) ||
+            (unary.getFlushToZero() && kind != UnaryOperator::Exp2))
+          return unary.emitError("CPU non-default unary arithmetic requires the closed f32 exp2/tanh contract"), failure();
+        Value input = unary.getFlushToZero() ? flushF32(arguments[0]) : arguments[0];
+        Value result = kind == UnaryOperator::Exp2 ? Value(builder.create<math::Exp2Op>(loc, input))
+                                                  : Value(builder.create<math::TanhOp>(loc, input));
+        return unary.getFlushToZero() ? flushF32(result) : result;
+      }
       switch (unary.getOperatorKind()) {
       case UnaryOperator::Rsqrt: return Value(builder.create<math::RsqrtOp>(loc, arguments[0]));
       case UnaryOperator::Sqrt: return Value(builder.create<math::SqrtOp>(loc, arguments[0]));
