@@ -228,19 +228,28 @@ private:
   }
 
   LogicalResult conditional(scf::IfOp operation) {
-    if (operation.getNumResults()) return operation.emitError("Mojo conditional SSA results are not implemented");
+    SmallVector<std::string> results;
+    for (Value result : operation.getResults()) {
+      results.push_back(fresh(result));
+      line("var " + results.back() + ": " + valueType(result.getType()));
+    }
     auto saved = scope.size();
+    auto branch = [&](Block *body) {
+      if (failed(block(*body))) return failure();
+      for (auto [result, value] : llvm::zip(results, body->getTerminator()->getOperands()))
+        line(result + " = " + name(value));
+      if (body->getOperations().size() == 1 && results.empty()) line("pass");
+      return success();
+    };
     line("if " + name(operation.getCondition()) + ":");
     ++indent;
-    if (failed(block(*operation.thenBlock()))) return failure();
-    if (operation.thenBlock()->getOperations().size() == 1) line("pass");
+    if (failed(branch(operation.thenBlock()))) return failure();
     --indent;
     scope.resize(saved);
     if (!operation.getElseRegion().empty()) {
       line("else:");
       ++indent;
-      if (failed(block(*operation.elseBlock()))) return failure();
-      if (operation.elseBlock()->getOperations().size() == 1) line("pass");
+      if (failed(branch(operation.elseBlock()))) return failure();
       --indent;
       scope.resize(saved);
     }

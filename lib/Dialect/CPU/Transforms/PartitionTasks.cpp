@@ -98,27 +98,45 @@ void exposeStructuredWorksets(func::FuncOp function) {
 }
 
 LogicalResult partition(scf::ParallelOp root, int64_t grain) {
+  auto function = root->getParentOfType<func::FuncOp>();
+  DominanceInfo dominance(function);
+  PhysicalProgramAnalysis analysis(function);
+  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  auto rectangular = [&](scf::ParallelOp parallel) {
+    for (auto [begin, end, step] : llvm::zip(parallel.getLowerBound(), parallel.getUpperBound(), parallel.getStep()))
+      if (!matchPattern(begin, m_Zero()) || !matchPattern(step, m_One()) || !dominance.dominates(end, root))
+        return false;
+    return true;
+  };
+  auto duplicable = [&](Operation *operation) {
+    if (operation->getNumRegions()) return false;
+    if (isMemoryEffectFree(operation)) return true;
+    if (auto load = dyn_cast<memref::LoadOp>(operation)) {
+      auto view = analysis.externalView(load.getMemref());
+      return view && view.getAccess() == 0 && interface.getDisjointOutputs();
+    }
+    return false;
+  };
   SmallVector<scf::ParallelOp> nest;
   scf::ParallelOp current = root;
   while (current) {
     if (current.getNumResults()) return current.emitError("CPU task reduction is not implemented");
     nest.push_back(current);
     scf::ParallelOp child;
+    bool flatten = true;
     for (Operation &operation : current.getBody()->without_terminator()) {
       if (auto parallel = dyn_cast<scf::ParallelOp>(&operation)) {
-        if (child) return root.emitError("CPU task flattening requires one nested workset");
+        if (child) { flatten = false; break; }
         child = parallel;
       }
     }
     if (child) {
       for (Operation &operation : current.getBody()->without_terminator())
-        if (&operation != child && (!isMemoryEffectFree(&operation) || operation.getNumRegions()))
-          return root.emitError("CPU task flattening cannot duplicate effects around a nested workset");
+        if (&operation != child && !duplicable(&operation)) flatten = false;
     }
-    current = child;
+    current = child && flatten && rectangular(child) ? child : scf::ParallelOp();
   }
   SmallVector<Value> extents, coordinates;
-  DominanceInfo dominance(root->getParentOfType<func::FuncOp>());
   for (scf::ParallelOp parallel : nest) {
     for (auto [begin, end, step, iv] : llvm::zip(parallel.getLowerBound(), parallel.getUpperBound(),
                                                parallel.getStep(), parallel.getInductionVars())) {
@@ -153,12 +171,36 @@ LogicalResult partition(scf::ParallelOp root, int64_t grain) {
       }
       std::function<void(scf::ParallelOp)> cloneBody = [&](scf::ParallelOp parallel) {
         for (Operation &operation : parallel.getBody()->without_terminator()) {
-          if (auto child = dyn_cast<scf::ParallelOp>(&operation)) cloneBody(child);
+          if (auto child = dyn_cast<scf::ParallelOp>(&operation); child && llvm::is_contained(nest, child)) cloneBody(child);
           else b.clone(operation, mapping);
         }
       };
       cloneBody(root);
     });
+  }
+  SmallVector<scf::ParallelOp> nested;
+  tasks.walk<WalkOrder::PostOrder>([&](scf::ParallelOp parallel) {
+    if (parallel != tasks) nested.push_back(parallel);
+  });
+  for (scf::ParallelOp parallel : nested) {
+    if (parallel.getNumResults()) return parallel.emitError("CPU task reduction is not implemented");
+    OpBuilder nestedBuilder(parallel);
+    IRMapping mapping;
+    std::function<void(unsigned)> traverse = [&](unsigned axis) {
+      if (axis == parallel.getNumLoops()) {
+        for (Operation &operation : parallel.getBody()->without_terminator())
+          nestedBuilder.clone(operation, mapping);
+        return;
+      }
+      auto loop = nestedBuilder.create<scf::ForOp>(parallel.getLoc(), parallel.getLowerBound()[axis],
+          parallel.getUpperBound()[axis], parallel.getStep()[axis]);
+      OpBuilder::InsertionGuard guard(nestedBuilder);
+      nestedBuilder.setInsertionPointToStart(loop.getBody());
+      mapping.map(parallel.getInductionVars()[axis], loop.getInductionVar());
+      traverse(axis + 1);
+    };
+    traverse(0);
+    parallel.erase();
   }
   root.erase();
   return success();

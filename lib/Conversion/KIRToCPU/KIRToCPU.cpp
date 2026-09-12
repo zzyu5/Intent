@@ -126,6 +126,12 @@ private:
     return emitError(loc, "CPU coordinates require index or signed integer values"), failure();
   }
 
+  Value domainExtent(Value begin, Value end, Value step, Location loc) {
+    Value distance = builder.createOrFold<arith::SubIOp>(loc, end, begin);
+    Value nonnegative = builder.createOrFold<arith::MaxSIOp>(loc, distance, constant(loc, 0));
+    return builder.createOrFold<arith::CeilDivSIOp>(loc, nonnegative, step);
+  }
+
   FailureOr<SmallVector<Value>> extents(RankedTensorType tensor, Location loc) {
     SmallVector<Value> result;
     auto shape = dyn_cast_or_null<TensorShapeAttr>(tensor.getEncoding());
@@ -394,9 +400,18 @@ private:
     return maps;
   }
 
-  FailureOr<Value> indexedTensorRead(Operation *operation, const IndexRelationFact &fact, Value source) {
-    auto tensor = dyn_cast<RankedTensorType>(operation->getResult(0).getType());
-    if (!tensor) return operation->emitError("CPU tensor-indexed read requires a ranked result"), failure();
+  Value elementAt(Value input, ValueRange members, OpBuilder &nested, Location loc) {
+    auto type = dyn_cast<MemRefType>(input.getType());
+    if (!type) return input;
+    SmallVector<Value> indices;
+    for (int64_t axis = 0; axis < type.getRank(); ++axis)
+      indices.push_back(type.getDimSize(axis) == 1
+          ? Value(nested.create<arith::ConstantIndexOp>(loc, 0))
+          : members[members.size() - type.getRank() + axis]);
+    return nested.create<memref::LoadOp>(loc, input, indices);
+  }
+
+  FailureOr<unsigned> advancedIndexRank(Operation *operation, const IndexRelationFact &fact) {
     unsigned advancedRank = 0;
     for (const auto &term : fact.terms) {
       if (term.kind == 3 && term.operands.size() == 1) {
@@ -404,11 +419,104 @@ private:
           advancedRank = std::max<unsigned>(advancedRank, type.getRank());
       } else if (term.kind == 4) {
         if (term.operands.size() != 1 || !domains.count(term.operands[0]))
-          return operation->emitError("CPU tensor-indexed read requires a realized domain"), failure();
+          return operation->emitError("CPU indexed access requires a realized domain"), failure();
       } else if (term.kind != 0 && term.kind != 1 && term.kind != 2) {
-        return operation->emitError("CPU tensor-indexed read does not implement this coordinate term"), failure();
+        return operation->emitError("CPU indexed access does not implement this coordinate term"), failure();
       }
     }
+    return advancedRank;
+  }
+
+  SmallVector<Value> indexedCoordinates(const IndexRelationFact &fact, unsigned advancedRank,
+                                       Value source, ValueRange members, OpBuilder &nested, Location loc) {
+    SmallVector<Value> coordinates;
+    unsigned axis = 0;
+    std::optional<unsigned> advancedBegin;
+    for (const auto &term : fact.terms) {
+      if (term.kind == 1) { ++axis; continue; }
+      Value coordinate;
+      if (term.kind == 0 || term.kind == 4) {
+        coordinate = members[axis++];
+        if (term.kind == 4) {
+          Domain domain = domains.lookup(term.operands[0]);
+          coordinate = nested.createOrFold<arith::AddIOp>(loc, domain.begin,
+              nested.createOrFold<arith::MulIOp>(loc, coordinate, domain.step));
+        }
+      } else if (term.kind == 2) {
+        int64_t literal = *term.staticValues[0];
+        coordinate = nested.create<arith::ConstantIndexOp>(loc, literal);
+        if (literal < 0) coordinate = nested.create<arith::AddIOp>(loc,
+            nested.create<memref::DimOp>(loc, source, *term.sourceAxis), coordinate);
+      } else {
+        coordinate = values.lookup(term.operands[0]);
+        if (auto type = dyn_cast<MemRefType>(coordinate.getType())) {
+          if (!advancedBegin) { advancedBegin = axis; axis += advancedRank; }
+          coordinate = elementAt(coordinate, members.slice(*advancedBegin, advancedRank), nested, loc);
+        }
+        if (!coordinate.getType().isIndex())
+          coordinate = nested.create<arith::IndexCastOp>(loc, nested.getIndexType(), coordinate);
+      }
+      coordinates.push_back(coordinate);
+    }
+    return coordinates;
+  }
+
+  LogicalResult indexedWrite(Operation *operation) {
+    auto fact = analysis.indexRelation(operation);
+    if (failed(fact)) return failure();
+    auto rank = advancedIndexRank(operation, *fact);
+    if (failed(rank)) return failure();
+    unsigned position = operation->getAttrOfType<IntegerAttr>("value_operand_index").getInt();
+    Value input = values.lookup(operation->getOperand(position)), destination = values.lookup(fact->source);
+    Location loc = operation->getLoc();
+    SmallVector<Value> sizes, members;
+    if (auto type = dyn_cast<MemRefType>(input.getType()))
+      for (int64_t axis = 0; axis < type.getRank(); ++axis)
+        sizes.push_back(builder.create<memref::DimOp>(loc, input, axis));
+    std::function<void(unsigned)> traverse = [&](unsigned axis) {
+      if (axis == sizes.size()) {
+        auto coordinates = indexedCoordinates(*fact, *rank, destination, members, builder, loc);
+        Value value = elementAt(input, members, builder, loc);
+        builder.create<memref::StoreOp>(loc, value, destination, coordinates);
+        return;
+      }
+      auto loop = builder.create<scf::ForOp>(loc, constant(loc, 0), sizes[axis], constant(loc, 1));
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(loop.getBody());
+      members.push_back(loop.getInductionVar());
+      traverse(axis + 1);
+      members.pop_back();
+    };
+    traverse(0);
+    return success();
+  }
+
+  FailureOr<Value> indexedRead(Operation *operation, const IndexRelationFact &fact, Value source) {
+    Type resultType = operation->getResult(0).getType();
+    auto tensor = dyn_cast<RankedTensorType>(resultType);
+    auto rank = advancedIndexRank(operation, fact);
+    if (failed(rank)) return failure();
+    auto read = [&](OpBuilder &nested, Location loc, ValueRange members) -> Value {
+      auto load = [&]() -> Value {
+        auto coordinates = indexedCoordinates(fact, *rank, source, members, nested, loc);
+        return nested.create<memref::LoadOp>(loc, source, coordinates);
+      };
+      if (alwaysValid(operation)) return load();
+      unsigned validPosition = operation->getAttrOfType<IntegerAttr>("valid_operand_index").getInt();
+      unsigned fillPosition = operation->getAttrOfType<IntegerAttr>("fill_operand_index").getInt();
+      Value active = elementAt(values.lookup(operation->getOperand(validPosition)), members, nested, loc);
+      auto conditional = nested.create<scf::IfOp>(loc, TypeRange{getElementTypeOrSelf(resultType)}, active, true);
+      {
+        OpBuilder::InsertionGuard guard(nested);
+        nested.setInsertionPointToStart(conditional.thenBlock());
+        nested.create<scf::YieldOp>(loc, load());
+        nested.setInsertionPointToStart(conditional.elseBlock());
+        Value fill = elementAt(values.lookup(operation->getOperand(fillPosition)), members, nested, loc);
+        nested.create<scf::YieldOp>(loc, fill);
+      }
+      return conditional.getResult(0);
+    };
+    if (!tensor) return read(builder, operation->getLoc(), {});
     auto shape = extents(tensor, operation->getLoc());
     if (failed(shape)) return failure();
     Value output = allocate(tensor, *shape, operation->getLoc());
@@ -416,43 +524,10 @@ private:
         SmallVector<AffineMap>{builder.getMultiDimIdentityMap(tensor.getRank())},
         SmallVector<utils::IteratorType>(tensor.getRank(), utils::IteratorType::parallel),
         [&](OpBuilder &nested, Location loc, ValueRange) {
-          SmallVector<Value> coordinates;
-          unsigned axis = 0;
-          std::optional<unsigned> advancedBegin;
-          for (const auto &term : fact.terms) {
-            if (term.kind == 1) { ++axis; continue; }
-            Value coordinate;
-            if (term.kind == 0 || term.kind == 4) {
-              coordinate = nested.create<linalg::IndexOp>(loc, axis++);
-              if (term.kind == 4) {
-                Domain domain = domains.lookup(term.operands[0]);
-                coordinate = nested.createOrFold<arith::AddIOp>(loc, domain.begin,
-                    nested.createOrFold<arith::MulIOp>(loc, coordinate, domain.step));
-              }
-            } else if (term.kind == 2) {
-              int64_t literal = *term.staticValues[0];
-              coordinate = nested.create<arith::ConstantIndexOp>(loc, literal);
-              if (literal < 0) coordinate = nested.create<arith::AddIOp>(loc,
-                  nested.create<memref::DimOp>(loc, source, *term.sourceAxis), coordinate);
-            } else {
-              coordinate = values.lookup(term.operands[0]);
-              if (auto type = dyn_cast<MemRefType>(coordinate.getType())) {
-                if (!advancedBegin) { advancedBegin = axis; axis += advancedRank; }
-                SmallVector<Value> indices;
-                for (unsigned dimension = 0; dimension < type.getRank(); ++dimension)
-                  indices.push_back(type.getDimSize(dimension) == 1
-                      ? Value(nested.create<arith::ConstantIndexOp>(loc, 0))
-                      : Value(nested.create<linalg::IndexOp>(loc,
-                          *advancedBegin + advancedRank - type.getRank() + dimension)));
-                coordinate = nested.create<memref::LoadOp>(loc, coordinate, indices);
-              }
-              if (!coordinate.getType().isIndex())
-                coordinate = nested.create<arith::IndexCastOp>(loc, nested.getIndexType(), coordinate);
-            }
-            coordinates.push_back(coordinate);
-          }
-          Value value = nested.create<memref::LoadOp>(loc, source, coordinates);
-          nested.create<linalg::YieldOp>(loc, value);
+          SmallVector<Value> members;
+          for (int64_t axis = 0; axis < tensor.getRank(); ++axis)
+            members.push_back(nested.create<linalg::IndexOp>(loc, axis));
+          nested.create<linalg::YieldOp>(loc, read(nested, loc, members));
         });
     return output;
   }
@@ -462,11 +537,11 @@ private:
     if (failed(fact))
       return failure();
     Value source = values.lookup(fact->source);
-    if (isa<ViewLoadOp, BufferLoadOp, GatherOp>(operation) && llvm::any_of(fact->terms, [&](const auto &term) {
+    if (isa<ViewLoadOp, BufferLoadOp, GatherOp>(operation) && (!alwaysValid(operation) || llvm::any_of(fact->terms, [&](const auto &term) {
           return term.kind == 3 && term.operands.size() == 1 &&
               isa<MemRefType>(values.lookup(term.operands[0]).getType());
-        }))
-      return indexedTensorRead(operation, *fact, source);
+        })))
+      return indexedRead(operation, *fact, source);
     auto type = dyn_cast<MemRefType>(source.getType());
     SmallVector<OpFoldResult> offsets, sizes, strides;
     SmallVector<int64_t> resultShape;
@@ -1060,12 +1135,32 @@ private:
       Value step = op.getBounds().size() == 3 ? values.lookup(op.getBounds()[2]) : constant(loc, 1);
       auto physicalBegin = indexValue(begin, loc), physicalEnd = indexValue(end, loc), physicalStep = indexValue(step, loc);
       if (failed(physicalBegin) || failed(physicalEnd) || failed(physicalStep)) return failure();
-      Value distance = builder.createOrFold<arith::SubIOp>(loc, *physicalEnd, *physicalBegin);
-      Value nonnegative = builder.createOrFold<arith::MaxSIOp>(loc, distance, constant(loc, 0));
-      Value extent = builder.createOrFold<arith::CeilDivSIOp>(loc, nonnegative, *physicalStep);
+      Value extent = domainExtent(*physicalBegin, *physicalEnd, *physicalStep, loc);
       Domain domain{*physicalBegin, *physicalEnd, *physicalStep, extent};
       domains[op.getResult()] = domain;
       dimensions[cast<IntegerAttr>(op.getExtentDimensions()[0]).getInt()] = domain.extent;
+    } else if (auto op = dyn_cast<SubregionOp>(operation)) {
+      auto source = domains.find(op.getInputs()[0]);
+      if (source == domains.end()) return op.emitError("CPU subregion requires a realized source domain");
+      Domain domain = source->second;
+      unsigned position = 1;
+      if (op.getHasStart()) {
+        auto start = indexValue(values.lookup(op.getInputs()[position++]), loc);
+        if (failed(start)) return failure();
+        domain.begin = *start;
+      }
+      if (op.getHasStop()) {
+        auto stop = indexValue(values.lookup(op.getInputs()[position]), loc);
+        if (failed(stop)) return failure();
+        domain.end = *stop;
+      }
+      domain.extent = domainExtent(domain.begin, domain.end, domain.step, loc);
+      domains[op.getResult()] = domain;
+      dimensions[cast<IntegerAttr>(op.getExtentDimensions()[0]).getInt()] = domain.extent;
+    } else if (auto op = dyn_cast<RegionEndOp>(operation)) {
+      auto source = domains.find(op.getSource());
+      if (source == domains.end()) return op.emitError("CPU region end requires a realized source domain");
+      values.map(op.getResult(), source->second.end);
     } else if (auto op = dyn_cast<ParallelOp>(operation)) {
       if (!domains.count(op.getSource()))
         return op.emitError("CPU parallel source is not a supported domain");
@@ -1094,14 +1189,18 @@ private:
     } else if (isa<AssumeInBoundsOp>(operation)) {
       return success();
     } else if (isa<ViewLoadOp, BufferLoadOp>(operation)) {
-      if (!alwaysValid(operation))
-        return operation->emitError("CPU predicated source loads are not implemented");
       auto value = indexed(operation);
       if (failed(value)) return failure();
       values.map(operation->getResult(0), *value);
-    } else if (isa<ViewStoreOp, BufferStoreOp>(operation)) {
+    } else if (isa<ViewStoreOp, BufferStoreOp, ScatterUniqueOp>(operation)) {
       if (!alwaysValid(operation))
         return operation->emitError("CPU predicated destination stores are not implemented");
+      auto fact = analysis.indexRelation(operation);
+      if (failed(fact)) return failure();
+      if (isa<ScatterUniqueOp>(operation) || llvm::any_of(fact->terms, [&](const auto &term) {
+            return term.kind == 1 || (term.kind == 3 && term.operands.size() == 1 &&
+                                     isa<MemRefType>(values.lookup(term.operands[0]).getType()));
+          })) return indexedWrite(operation);
       auto destination = indexed(operation);
       if (failed(destination)) return failure();
       unsigned position = isa<ViewStoreOp>(operation) ? cast<ViewStoreOp>(operation).getValueOperandIndex()
@@ -1112,8 +1211,6 @@ private:
       else
         builder.create<memref::StoreOp>(loc, input, *destination, ValueRange{});
     } else if (auto op = dyn_cast<GatherOp>(operation)) {
-      if (!alwaysValid(operation))
-        return op.emitError("CPU predicated tensor gathers are not implemented");
       auto value = indexed(operation);
       if (failed(value)) return failure();
       values.map(op.getResult(), *value);

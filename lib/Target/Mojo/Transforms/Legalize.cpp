@@ -59,7 +59,7 @@ LogicalResult checkSurface(ModuleOp module) {
     if (auto prefetch = dyn_cast<memref::PrefetchOp>(operation))
       supported &= !prefetch.getIsWrite() && prefetch.getLocalityHint() == 3 && prefetch.getIsDataCache();
     if (auto conditional = dyn_cast<scf::IfOp>(operation))
-      supported &= conditional.getNumResults() == 0;
+      supported &= llvm::none_of(conditional.getResultTypes(), [](Type type) { return isa<MemRefType>(type); });
     if (auto loop = dyn_cast<scf::WhileOp>(operation))
       supported &= loop.getNumResults() == 0 && loop.getNumOperands() == 0;
     if (auto parallel = dyn_cast<scf::ParallelOp>(operation))
