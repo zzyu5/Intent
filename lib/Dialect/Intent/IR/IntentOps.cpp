@@ -1395,6 +1395,137 @@ LogicalResult verifyContract(Operation *operation) {
   return success();
 }
 
+Value indexTermOperand(Operation *operation, IndexTermAttr term) {
+  if (!term || term.getOperandPositions().size() != 1)
+    return {};
+  int64_t position = term.getOperandPositions()[0];
+  return position > 0 && position < operation->getNumOperands()
+             ? operation->getOperand(position)
+             : Value();
+}
+
+bool isIterationInvariantCoordinate(Value value, ForOp loop,
+                                    DominanceInfo &dominance) {
+  if (dominance.dominates(value, loop))
+    return true;
+  auto argument = dyn_cast<BlockArgument>(value);
+  auto parallel = argument
+                      ? dyn_cast<ParallelOp>(argument.getOwner()->getParentOp())
+                      : ParallelOp();
+  return parallel && loop->isProperAncestor(parallel) &&
+         dominance.dominates(parallel.getSource(), loop);
+}
+
+bool hasPreviousIterationViewDefinition(Operation *read, ViewStoreOp store,
+                                        DominanceInfo &dominance) {
+  auto readRelation = read->getAttrOfType<IndexRelationAttr>("index");
+  auto writeRelation = store->getAttrOfType<IndexRelationAttr>("index");
+  if (!readRelation || !writeRelation ||
+      readRelation.getSourceRank() != writeRelation.getSourceRank() ||
+      readRelation.getTerms().size() != readRelation.getSourceRank() ||
+      writeRelation.getTerms().size() != writeRelation.getSourceRank() ||
+      store->hasAttr("valid_operand_index"))
+    return false;
+  for (Operation *parent = read->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    auto loop = dyn_cast<ForOp>(parent);
+    if (!loop || loop.getInputs().empty() || !loop.getBody().hasOneBlock() ||
+        loop.getBody().front().getNumArguments() == 0 ||
+        !dominance.dominates(read->getOperand(0), loop))
+      continue;
+    auto domain = loop.getInputs().front().getDefiningOp<DomainOp>();
+    if (!domain || domain.getBounds().size() < 2 ||
+        (domain.getBounds().size() == 3 &&
+         getConstantInteger(domain.getBounds()[2]) != 1))
+      continue;
+    WalkResult effects = loop.getBody().walk([](Operation *operation) {
+      if (isa<YieldOp, ForOp, ParallelOp, IfOp, WhileOp>(operation))
+        return WalkResult::advance();
+      auto nestedEffects = getEffectsRecursively(operation);
+      if (!nestedEffects ||
+          llvm::any_of(*nestedEffects, [](const auto &effect) {
+            return !isa<MemoryEffects::Read, MemoryEffects::Write>(
+                effect.getEffect());
+          }))
+        return WalkResult::interrupt();
+      return WalkResult::advance();
+    });
+    if (effects.wasInterrupted())
+      continue;
+    // A shared parallel context makes an empty domain suppress the read too;
+    // its invariant source preserves the same point in previous iterations.
+    Operation *writerParent = store->getParentOp();
+    while (writerParent && writerParent != loop) {
+      auto parallel = dyn_cast<ParallelOp>(writerParent);
+      if (!parallel || !parallel->isProperAncestor(read) ||
+          !dominance.dominates(parallel.getSource(), loop))
+        break;
+      writerParent = writerParent->getParentOp();
+    }
+    if (writerParent != loop)
+      continue;
+    Value induction = loop.getBody().front().getArgument(0);
+    bool previousPrefix = false;
+    bool covered = true;
+    for (auto [readAttribute, writeAttribute] :
+         llvm::zip(readRelation.getTerms(), writeRelation.getTerms())) {
+      auto readTerm = dyn_cast<IndexTermAttr>(readAttribute);
+      auto writeTerm = dyn_cast<IndexTermAttr>(writeAttribute);
+      if (!readTerm || !writeTerm) {
+        covered = false;
+        break;
+      }
+      Value writtenIndex = indexTermOperand(store, writeTerm);
+      if (writeTerm.getKind() == 3 && writtenIndex == induction) {
+        Value readIndex = indexTermOperand(read, readTerm);
+        auto prefix = readIndex ? readIndex.getDefiningOp<SubregionOp>()
+                                : SubregionOp();
+        if (previousPrefix || readTerm.getKind() != 4 || !prefix ||
+            prefix.getInputs().empty() ||
+            prefix.getInputs().front() != domain.getResult() ||
+            !prefix.getHasStop() ||
+            prefix.getInputs().back() != induction ||
+            (prefix.getHasStart() &&
+             prefix.getInputs()[1] != domain.getBounds().front())) {
+          covered = false;
+          break;
+        }
+        previousPrefix = true;
+        continue;
+      }
+      if (readTerm.getKind() != writeTerm.getKind() ||
+          readTerm.getStaticValues() != writeTerm.getStaticValues() ||
+          readTerm.getOperandPositions().size() !=
+              writeTerm.getOperandPositions().size()) {
+        covered = false;
+        break;
+      }
+      for (auto [readPosition, writePosition] : llvm::zip(
+               readTerm.getOperandPositions().asArrayRef(),
+               writeTerm.getOperandPositions().asArrayRef())) {
+        if (readPosition == -1 && writePosition == -1)
+          continue;
+        if (readPosition <= 0 || writePosition <= 0 ||
+            readPosition >= read->getNumOperands() ||
+            writePosition >= store->getNumOperands() ||
+            read->getOperand(readPosition) != store->getOperand(writePosition) ||
+            !isIterationInvariantCoordinate(read->getOperand(readPosition),
+                                            loop, dominance)) {
+          covered = false;
+          break;
+        }
+      }
+      if (!covered)
+        break;
+    }
+    // The first prefix is empty. Each completed ordered iteration defines
+    // exactly the next coordinate, with the other coordinates unchanged.
+    if (previousPrefix && covered)
+      return true;
+  }
+  return false;
+}
+
 bool hasDominatingViewDefinition(Operation *read, RankedTensorType tensor) {
   Value resource = read->getOperand(0);
   auto function = read->getParentOfType<func::FuncOp>();
@@ -1404,8 +1535,11 @@ bool hasDominatingViewDefinition(Operation *read, RankedTensorType tensor) {
   for (Operation *user : resource.getUsers()) {
     auto store = dyn_cast<ViewStoreOp>(user);
     if (!store || store->getOperand(0) != resource ||
-        !dominance.dominates(user, read) ||
         store->hasAttr("valid_operand_index"))
+      continue;
+    if (hasPreviousIterationViewDefinition(read, store, dominance))
+      return true;
+    if (!dominance.dominates(user, read))
       continue;
     auto relation = store->getAttrOfType<IndexRelationAttr>("index");
     if (!relation || relation.getSourceRank() != tensor.getRank() ||
