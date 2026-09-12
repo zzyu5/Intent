@@ -4770,8 +4770,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   for (auto [ownershipIndex, axis] :
        llvm::enumerate(pointwiseOwnershipAxes)) {
     ParameterOp parameter = parameters.lookup(axis);
-    const bool scalarGridAxis =
-        ownershipIndex + 2 < pointwiseOwnershipAxes.size();
     unsigned contractSides = ContractFreeAxisNone;
     bool batchedContraction = false;
     unsigned contractElementBitWidth = 0;
@@ -4782,16 +4780,21 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       contractElementBitWidth =
           std::max(contractElementBitWidth, facts.operandElementBitWidth);
     }
+    const bool contractionAxis = contractSides != ContractFreeAxisNone;
+    const bool scalarGridAxis = !contractionAxis &&
+        ownershipIndex + 2 < pointwiseOwnershipAxes.size();
     ParameterRole ownershipRole = ParameterRole::OwnershipN;
     auto declaredRole =
         static_cast<ParameterRole>(parameter.getParameter().getRole());
-    if (parameter.getParameter().getCategory() ==
+    if (contractSides == ContractFreeAxisLhs)
+      ownershipRole = ParameterRole::OwnershipM;
+    else if (contractSides == ContractFreeAxisRhs)
+      ownershipRole = ParameterRole::OwnershipN;
+    else if (parameter.getParameter().getCategory() ==
             static_cast<uint32_t>(ParameterCategory::Contraction) &&
         (declaredRole == ParameterRole::OwnershipM ||
          declaredRole == ParameterRole::OwnershipN))
       ownershipRole = declaredRole;
-    else if (!scalarGridAxis && contractSides == ContractFreeAxisLhs)
-      ownershipRole = ParameterRole::OwnershipM;
     else if (!scalarGridAxis &&
              ownershipIndex + 2 == pointwiseOwnershipAxes.size())
       ownershipRole = ParameterRole::OwnershipM;

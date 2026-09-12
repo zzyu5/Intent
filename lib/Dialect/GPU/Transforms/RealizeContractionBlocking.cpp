@@ -816,12 +816,6 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
       dominance ? &*dominance : nullptr);
 }
 
-Value strippedBroadcast(Value value) {
-  while (auto broadcast = value.getDefiningOp<BroadcastOp>())
-    value = broadcast.getValue();
-  return value;
-}
-
 bool isIntegerConstant(Value value, int64_t expected) {
   auto constant = value.getDefiningOp<arith::ConstantOp>();
   auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
@@ -1755,47 +1749,6 @@ FragmentType eraseFragmentAxis(FragmentType source, unsigned erasedAxis) {
                            source.getValidity(), source.getOwner());
 }
 
-FragmentType retargetFragmentToCoordinateRanges(
-    FragmentType source, ArrayRef<Value> coordinates) {
-  SmallVector<Attribute> shape(source.getShape().begin(), source.getShape().end());
-  bool changed = false;
-  for (auto [axis, attribute] : llvm::enumerate(source.getAxisMaps())) {
-    auto mapping = cast<AxisMapAttr>(attribute);
-    FailureOr<unsigned> coordinate = queryCoordinatePosition(
-        coordinates,
-        sourceAxisIdentity(mapping));
-    if (failed(coordinate))
-      continue;
-    MakeRangeOp range = sourceRange(coordinates[*coordinate]);
-    if (!range) {
-      FailureOr<MakeRangeOp> root =
-          producerRange(coordinates[*coordinate],
-                        sourceAxisIdentity(mapping));
-      if (succeeded(root))
-        range = *root;
-    }
-    if (!range)
-      continue;
-    auto rangeType = dyn_cast<FragmentType>(range.getResult().getType());
-    if (!rangeType || rangeType.getShape().size() != 1)
-      continue;
-    shape[axis] = rangeType.getShape()[0];
-    changed = true;
-  }
-  if (!changed)
-    return source;
-  return FragmentType::get(source.getContext(), source.getElementType(),
-                           ArrayAttr::get(source.getContext(), shape),
-                           source.getAxisMaps(), source.getValidity(),
-                           source.getOwner());
-}
-
-FragmentType fragmentElementType(FragmentType source, Type element) {
-  return FragmentType::get(source.getContext(), element, source.getShape(),
-                           source.getAxisMaps(), source.getValidity(),
-                           source.getOwner());
-}
-
 SmallVector<int64_t> eraseAxis(ArrayRef<int64_t> axes, unsigned erasedAxis) {
   SmallVector<int64_t> result;
   result.reserve(axes.size());
@@ -1807,146 +1760,6 @@ SmallVector<int64_t> eraseAxis(ArrayRef<int64_t> axes, unsigned erasedAxis) {
   return result;
 }
 
-FailureOr<Value> projectBroadcast(OpBuilder &builder, Location location,
-                                  Value value, FragmentType target) {
-  if (!value)
-    return failure();
-  if (value.getType() == target)
-    return value;
-  if (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
-    Type element = broadcast.getValue().getType();
-    if (auto fragment = dyn_cast<FragmentType>(element))
-      element = fragment.getElementType();
-    if (element != target.getElementType())
-      return failure();
-    return Value(
-        builder.create<BroadcastOp>(location, target, broadcast.getValue()));
-  }
-  if (auto splat = value.getDefiningOp<SplatOp>())
-    return Value(builder.create<SplatOp>(location, target, splat.getValue()));
-  auto retarget = [&](Value operand) -> FailureOr<FragmentType> {
-    auto fragment = dyn_cast<FragmentType>(operand.getType());
-    if (!fragment)
-      return failure();
-    return fragmentElementType(target, fragment.getElementType());
-  };
-  if (auto binary = value.getDefiningOp<BinaryOp>()) {
-    FailureOr<FragmentType> lhsType = retarget(binary.getLhs());
-    FailureOr<FragmentType> rhsType = retarget(binary.getRhs());
-    if (failed(lhsType) || failed(rhsType))
-      return failure();
-    FailureOr<Value> lhs =
-        projectBroadcast(builder, location, binary.getLhs(), *lhsType);
-    FailureOr<Value> rhs =
-        projectBroadcast(builder, location, binary.getRhs(), *rhsType);
-    if (failed(lhs) || failed(rhs))
-      return failure();
-    return Value(builder.create<BinaryOp>(location, target, *lhs, *rhs,
-        binary.getOperatorKind(), binary.getApproximate(), binary.getFlushToZero()));
-  }
-  if (auto compare = value.getDefiningOp<CompareOp>()) {
-    FailureOr<FragmentType> lhsType = retarget(compare.getLhs());
-    FailureOr<FragmentType> rhsType = retarget(compare.getRhs());
-    if (failed(lhsType) || failed(rhsType))
-      return failure();
-    FailureOr<Value> lhs =
-        projectBroadcast(builder, location, compare.getLhs(), *lhsType);
-    FailureOr<Value> rhs =
-        projectBroadcast(builder, location, compare.getRhs(), *rhsType);
-    if (failed(lhs) || failed(rhs))
-      return failure();
-    return Value(builder.create<CompareOp>(location, target, *lhs, *rhs,
-                                           compare.getPredicate()));
-  }
-  if (auto select = value.getDefiningOp<SelectOp>()) {
-    FailureOr<FragmentType> conditionType = retarget(select.getCondition());
-    FailureOr<FragmentType> trueType = retarget(select.getTrueValue());
-    FailureOr<FragmentType> falseType = retarget(select.getFalseValue());
-    if (failed(conditionType) || failed(trueType) || failed(falseType))
-      return failure();
-    FailureOr<Value> condition = projectBroadcast(
-        builder, location, select.getCondition(), *conditionType);
-    FailureOr<Value> trueValue = projectBroadcast(
-        builder, location, select.getTrueValue(), *trueType);
-    FailureOr<Value> falseValue = projectBroadcast(
-        builder, location, select.getFalseValue(), *falseType);
-    if (failed(condition) || failed(trueValue) || failed(falseValue))
-      return failure();
-    return Value(builder.create<SelectOp>(location, target, *condition,
-                                          *trueValue, *falseValue));
-  }
-  if (auto cast = value.getDefiningOp<CastOp>()) {
-    FailureOr<FragmentType> sourceType = retarget(cast.getValue());
-    if (failed(sourceType))
-      return failure();
-    FailureOr<Value> source =
-        projectBroadcast(builder, location, cast.getValue(), *sourceType);
-    if (failed(source))
-      return failure();
-    return Value(builder.create<CastOp>(location, target, *source));
-  }
-  return failure();
-}
-
-FailureOr<Value> projectPredicateForScalarAxis(
-    OpBuilder &builder, Location location, Value value, MakeRangeOp root,
-    Value coordinate, FragmentType target,
-    PhysicalProgramAnalysis &analysis) {
-  if (!value)
-    return Value();
-  if (FailureOr<Value> scalar = scalarSource(value); succeeded(scalar))
-    return Value(builder.create<SplatOp>(location, target, *scalar));
-  PhysicalRangeFact ranges =
-      analysis.sourceRanges(value, sourceAxisIdentity(root));
-  if (!ranges.blockers.empty() ||
-      (!ranges.roots.empty() && ranges.state != PhysicalFactState::Exact)) {
-    InFlightDiagnostic diagnostic = root.emitOpError(
-        "validity predicate has no exact source-range dependency");
-    for (Operation *blocker : ranges.blockers)
-      diagnostic << "; blocker=" << blocker->getName();
-    return failure();
-  }
-  if (ranges.roots.empty()) {
-    if (value.getType() == target)
-      return value;
-    return projectBroadcast(builder, location, value, target);
-  }
-  if (auto broadcast = value.getDefiningOp<BroadcastOp>())
-    return projectPredicateForScalarAxis(builder, location,
-                                         broadcast.getValue(), root,
-                                         coordinate, target, analysis);
-  if (auto splat = value.getDefiningOp<SplatOp>())
-    return projectPredicateForScalarAxis(builder, location, splat.getValue(),
-                                         root, coordinate, target, analysis);
-  if (auto conjunction = value.getDefiningOp<BinaryOp>()) {
-    if (conjunction.getOperatorKind() != BinaryOperator::LogicalAnd)
-      return failure();
-    FailureOr<Value> lhs = projectPredicateForScalarAxis(
-        builder, location, conjunction.getLhs(), root, coordinate, target,
-        analysis);
-    FailureOr<Value> rhs = projectPredicateForScalarAxis(
-        builder, location, conjunction.getRhs(), root, coordinate, target,
-        analysis);
-    if (failed(lhs) || failed(rhs))
-      return failure();
-    return Value(builder.create<BinaryOp>(location, target, *lhs, *rhs,
-                                          BinaryOperator::LogicalAnd));
-  }
-  if (auto comparison = value.getDefiningOp<CompareOp>()) {
-    Value lhs = strippedBroadcast(comparison.getLhs());
-    FailureOr<Value> rhs =
-        scalarSource(strippedBroadcast(comparison.getRhs()));
-    if (comparison.getPredicate() == ComparePredicate::Lt &&
-        lhs == root.getResult() && succeeded(rhs)) {
-      Value scalar = builder.create<CompareOp>(
-          location, builder.getI1Type(), coordinate, *rhs,
-          comparison.getPredicate());
-      return Value(builder.create<SplatOp>(location, target, scalar));
-    }
-  }
-  return failure();
-}
-
 LogicalResult decomposeMultiReductionContract(ContractOp contract) {
   if (!contract->getBlock() || contract.getLhsReductionAxes().size() <= 1)
     return success();
@@ -1956,210 +1769,107 @@ LogicalResult decomposeMultiReductionContract(ContractOp contract) {
       !contract.getRhsBatchAxes().empty())
     return contract.emitOpError(
         "multi-pair contraction decomposition requires paired reductions and no batch axes");
-  auto lhsLoad = contract.getLhs().getDefiningOp<LoadOp>();
-  auto rhsLoad = contract.getRhs().getDefiningOp<LoadOp>();
-  if (!lhsLoad || !rhsLoad)
-    return contract.emitOpError(
-        "multi-pair contraction decomposition requires direct loads");
-  SmallVector<int64_t> lhsReductions(contract.getLhsReductionAxes());
-  SmallVector<int64_t> rhsReductions(contract.getRhsReductionAxes());
-  SmallVector<int64_t> lhsBatch(contract.getLhsBatchAxes());
-  SmallVector<int64_t> rhsBatch(contract.getRhsBatchAxes());
-  SmallVector<Value> lhsCoordinates(lhsLoad.getCoordinates());
-  SmallVector<Value> rhsCoordinates(rhsLoad.getCoordinates());
-  FragmentType lhsType = contract.getLhs().getType();
-  FragmentType rhsType = contract.getRhs().getType();
+  func::FuncOp kernel = contract->getParentOfType<func::FuncOp>();
   Location location = contract.getLoc();
-  bool failedBody = false;
   std::string failureReason;
-  PhysicalProgramAnalysis predicateAnalysis(
-      contract->getParentOfType<func::FuncOp>());
-
-  std::function<FailureOr<Value>(
-      OpBuilder &, FragmentType, FragmentType, SmallVector<Value>,
-      SmallVector<Value>, Value, Value, SmallVector<int64_t>,
-      SmallVector<int64_t>, SmallVector<int64_t>, SmallVector<int64_t>, Value)>
+  auto unit = expression(kernel.getContext(), PhysicalExprKind::Constant, 1);
+  std::function<FailureOr<Value>(OpBuilder &, Value, Value,
+                                SmallVector<int64_t>, SmallVector<int64_t>, Value)>
       build;
-  build = [&](OpBuilder &builder, FragmentType currentLhsType,
-              FragmentType currentRhsType,
-              SmallVector<Value> currentLhsCoordinates,
-              SmallVector<Value> currentRhsCoordinates,
-              Value currentLhsValid, Value currentRhsValid,
-              SmallVector<int64_t> currentLhsReductions,
-              SmallVector<int64_t> currentRhsReductions,
-              SmallVector<int64_t> currentLhsBatch,
-              SmallVector<int64_t> currentRhsBatch,
+  build = [&](OpBuilder &builder, Value lhs, Value rhs,
+              SmallVector<int64_t> lhsReductions,
+              SmallVector<int64_t> rhsReductions,
               Value accumulator) -> FailureOr<Value> {
-    currentLhsType = retargetFragmentToCoordinateRanges(
-        currentLhsType, currentLhsCoordinates);
-    currentRhsType = retargetFragmentToCoordinateRanges(
-        currentRhsType, currentRhsCoordinates);
-    if (currentLhsReductions.size() == 1) {
-      auto lhsPredicateType =
-          fragmentElementType(currentLhsType, builder.getI1Type());
-      auto rhsPredicateType =
-          fragmentElementType(currentRhsType, builder.getI1Type());
-      Value lhsValid;
-      Value rhsValid;
-      if (currentLhsValid) {
-        FailureOr<Value> projected = projectBroadcast(
-            builder, location, currentLhsValid, lhsPredicateType);
-        if (failed(projected)) {
-          failureReason =
-              "lhs validity cannot be projected after erasing a reduction axis";
-          return failure();
-        }
-        lhsValid = *projected;
-      }
-      if (currentRhsValid) {
-        FailureOr<Value> projected = projectBroadcast(
-            builder, location, currentRhsValid, rhsPredicateType);
-        if (failed(projected)) {
-          failureReason =
-              "rhs validity cannot be projected after erasing a reduction axis";
-          return failure();
-        }
-        rhsValid = *projected;
-      }
-      FailureOr<Value> lhsFill =
-          lhsValid ? retargetFill(builder, location, lhsLoad.getFill(),
-                                  currentLhsType)
-                   : FailureOr<Value>(Value());
-      FailureOr<Value> rhsFill =
-          rhsValid ? retargetFill(builder, location, rhsLoad.getFill(),
-                                  currentRhsType)
-                   : FailureOr<Value>(Value());
-      if (failed(lhsFill) || failed(rhsFill)) {
-        failureReason =
-            "invalid-value fill cannot be retargeted after erasing a reduction axis";
-        return failure();
-      }
-      auto lhs = builder.create<LoadOp>(
-          location, currentLhsType, lhsLoad.getResource(), currentLhsCoordinates,
-          lhsValid, *lhsFill, lhsLoad.getSourceAxes());
-      auto rhs = builder.create<LoadOp>(
-          location, currentRhsType, rhsLoad.getResource(), currentRhsCoordinates,
-          rhsValid, *rhsFill, rhsLoad.getSourceAxes());
+    if (lhsReductions.size() == 1) {
       auto product = builder.create<ContractOp>(
           location, contract.getResult().getType(), lhs, rhs, accumulator,
-          currentLhsReductions, currentRhsReductions, currentLhsBatch,
-          currentRhsBatch);
+          lhsReductions, rhsReductions, ArrayRef<int64_t>{}, ArrayRef<int64_t>{});
       if (Attribute origin = contract->getAttr(originAttr))
         product->setAttr(originAttr, origin);
       return product.getResult();
     }
 
-    unsigned lhsAxis = currentLhsReductions.front();
-    unsigned rhsAxis = currentRhsReductions.front();
-    FailureOr<AxisMapAttr> lhsMapping = queryAxisMap(currentLhsType, lhsAxis);
-    FailureOr<AxisMapAttr> rhsMapping = queryAxisMap(currentRhsType, rhsAxis);
-    if (failed(lhsMapping) || failed(rhsMapping)) {
-      failureReason = "a reduction pair has no unique physical axis mapping";
+    unsigned lhsAxis = lhsReductions.front();
+    unsigned rhsAxis = rhsReductions.front();
+    PhysicalProgramAnalysis analysis(kernel);
+    PhysicalRangeFact lhsFact = analysis.axisRanges(lhs, lhsAxis);
+    PhysicalRangeFact rhsFact = analysis.axisRanges(rhs, rhsAxis);
+    FailureOr<MakeRangeOp> lhsRange = queryExactLogicalRange(lhsFact);
+    FailureOr<MakeRangeOp> rhsRange = queryExactLogicalRange(rhsFact);
+    if (failed(lhsRange) || failed(rhsRange)) {
+      failureReason = "a reduction pair has no exact source-axis ranges";
       return failure();
     }
-    PhysicalSourceAxis lhsSource{lhsMapping->getSourceId(),
-                                 lhsMapping->getSourceAxis()};
-    PhysicalSourceAxis rhsSource{rhsMapping->getSourceId(),
-                                 rhsMapping->getSourceAxis()};
-    if (lhsMapping->getDimensionId() <= 0 ||
-        lhsMapping->getDimensionId() != rhsMapping->getDimensionId()) {
-      failureReason = "a reduction pair does not share physical source provenance";
-      return failure();
-    }
-    FailureOr<unsigned> lhsCoordinate =
-        queryCoordinatePosition(currentLhsCoordinates, lhsSource);
-    FailureOr<unsigned> rhsCoordinate =
-        queryCoordinatePosition(currentRhsCoordinates, rhsSource);
-    if (failed(lhsCoordinate) || failed(rhsCoordinate)) {
-      failureReason = "a reduction pair has no unique access coordinate";
-      return failure();
-    }
-    MakeRangeOp lhsRange = sourceRange(currentLhsCoordinates[*lhsCoordinate]);
-    MakeRangeOp rhsRange = sourceRange(currentRhsCoordinates[*rhsCoordinate]);
-    if (!lhsRange || !rhsRange) {
-      failureReason = "a reduction pair coordinate has no physical range root";
-      return failure();
-    }
-    FailureOr<int64_t> lhsDimension = queryRangeDimension(lhsRange);
-    FailureOr<int64_t> rhsDimension = queryRangeDimension(rhsRange);
-    if (failed(lhsDimension) || failed(rhsDimension) ||
-        *lhsDimension != *rhsDimension) {
-      failureReason = "a reduction pair range root provenance differs";
-      return failure();
-    }
-    FailureOr<Value> lhsStep = scalarSource(lhsRange.getStep());
-    FailureOr<Value> rhsStep = scalarSource(rhsRange.getStep());
-    if (failed(lhsStep) || failed(rhsStep)) {
-      failureReason = "a reduction pair has no scalar physical step";
-      return failure();
-    }
-    if (!samePhysicalScalarExpression(*lhsStep, *rhsStep)) {
-      failureReason = "a reduction pair does not have equivalent physical steps";
-      return failure();
-    }
-    PhysicalLockstepTraversalFact lockstep =
-        predicateAnalysis.lockstepRanges({lhsRange, rhsRange});
+    SmallVector<MakeRangeOp> pairedRanges(lhsFact.roots.begin(), lhsFact.roots.end());
+    llvm::append_range(pairedRanges, rhsFact.roots);
+    PhysicalLockstepTraversalFact lockstep = analysis.lockstepRanges(pairedRanges);
     if (!lockstep.isExact()) {
-      failureReason =
-          "a reduction pair does not have one lockstep physical traversal";
+      failureReason = "a reduction pair does not have one lockstep traversal";
       return failure();
     }
-    FailureOr<Value> logicalEnd = resolveLogicalRangeEnd(
-        contract->getParentOfType<func::FuncOp>(), lockstep.authority);
-    if (failed(logicalEnd)) {
-      failureReason = "a reduction pair has no exact logical end";
+    FailureOr<Value> logicalEnd = resolveLogicalRangeEnd(kernel, lockstep.authority);
+    FailureOr<Value> step = scalarSource(lockstep.authority.getStep());
+    if (failed(logicalEnd) || failed(step)) {
+      failureReason = "a reduction pair has no exact logical bounds and step";
       return failure();
     }
 
-    FragmentType nestedLhsType = eraseFragmentAxis(currentLhsType, lhsAxis);
-    FragmentType nestedRhsType = eraseFragmentAxis(currentRhsType, rhsAxis);
-    auto nestedLhsPredicateType =
-        fragmentElementType(nestedLhsType, builder.getI1Type());
-    auto nestedRhsPredicateType =
-        fragmentElementType(nestedRhsType, builder.getI1Type());
-    SmallVector<int64_t> nestedLhsReductions(
-        currentLhsReductions.begin() + 1, currentLhsReductions.end());
-    SmallVector<int64_t> nestedRhsReductions(
-        currentRhsReductions.begin() + 1, currentRhsReductions.end());
-    for (int64_t &axis : nestedLhsReductions)
-      if (axis > static_cast<int64_t>(lhsAxis))
-        --axis;
-    for (int64_t &axis : nestedRhsReductions)
-      if (axis > static_cast<int64_t>(rhsAxis))
-        --axis;
-    SmallVector<int64_t> nestedLhsBatch =
-        eraseAxis(currentLhsBatch, lhsAxis);
-    SmallVector<int64_t> nestedRhsBatch =
-        eraseAxis(currentRhsBatch, rhsAxis);
-
+    bool failedBody = false;
     auto loop = builder.create<scf::ForOp>(
-        location, lockstep.authority.getStart(), *logicalEnd, *lhsStep,
+        location, lockstep.authority.getLogicalStart(), *logicalEnd, *step,
         ValueRange{accumulator},
-        [&](OpBuilder &nested, Location nestedLocation, Value coordinate,
+        [](OpBuilder &, Location, Value, ValueRange) {});
+    auto buildBody = [&](OpBuilder &nested, Location nestedLocation, Value coordinate,
             ValueRange carries) {
-          SmallVector<Value> nestedLhsCoordinates(currentLhsCoordinates);
-          SmallVector<Value> nestedRhsCoordinates(currentRhsCoordinates);
-          nestedLhsCoordinates[*lhsCoordinate] = coordinate;
-          nestedRhsCoordinates[*rhsCoordinate] = coordinate;
-          FailureOr<Value> nestedLhsValid = projectPredicateForScalarAxis(
-              nested, nestedLocation, currentLhsValid, lhsRange, coordinate,
-              nestedLhsPredicateType, predicateAnalysis);
-          FailureOr<Value> nestedRhsValid = projectPredicateForScalarAxis(
-              nested, nestedLocation, currentRhsValid, rhsRange, coordinate,
-              nestedRhsPredicateType, predicateAnalysis);
-          if (failed(nestedLhsValid) || failed(nestedRhsValid)) {
-            failureReason = failed(nestedLhsValid)
-                                ? "lhs tail validity could not be projected while scalarizing a reduction pair"
-                                : "rhs tail validity could not be projected while scalarizing a reduction pair";
+          auto slice = [&](Value value, unsigned axis,
+                           const PhysicalRangeFact &fact) -> FailureOr<Value> {
+            MakeRangeOp root = fact.roots.front();
+            auto rangeType = cast<FragmentType>(root.getResult().getType());
+            auto indexType = FragmentType::get(
+                kernel.getContext(), nested.getIndexType(),
+                nested.getArrayAttr({unit}), rangeType.getAxisMaps(),
+                rangeType.getValidity(), rangeType.getOwner());
+            Value one = nested.create<arith::ConstantIndexOp>(nestedLocation, 1);
+            Value selected = nested.create<MakeRangeOp>(
+                nestedLocation, indexType, coordinate, one, root.getStep(),
+                root.getLogicalStart(), root.getLogicalStop(), root.getSourceId(),
+                root.getSourceAxis(), root.getDerived());
+            inheritRangeAuthority(selected, root);
+            IRMapping mapping;
+            for (MakeRangeOp range : fact.roots)
+              mapping.map(range.getResult(), selected);
+            FailureOr<Value> replayed = replaySourceValue(
+                nested, nestedLocation, value, unit, fact.roots, selected,
+                mapping, loop.getOperation());
+            if (failed(replayed))
+              return failure();
+            auto source = cast<FragmentType>((*replayed).getType());
+            auto target = eraseFragmentAxis(source, axis);
+            SmallVector<Attribute> groups;
+            unsigned resultAxis = 0;
+            for (unsigned sourceAxis = 0;
+                 sourceAxis < source.getShape().size(); ++sourceAxis) {
+              SmallVector<int64_t> resultAxes;
+              if (sourceAxis != axis)
+                resultAxes.push_back(resultAxis++);
+              groups.push_back(ReshapeGroupAttr::get(
+                  kernel.getContext(),
+                  nested.getDenseI64ArrayAttr({static_cast<int64_t>(sourceAxis)}),
+                  nested.getDenseI64ArrayAttr(resultAxes)));
+            }
+            return Value(nested.create<ReshapeOp>(
+                nestedLocation, target, *replayed, nested.getArrayAttr(groups)));
+          };
+          FailureOr<Value> lhsSlice = slice(lhs, lhsAxis, lhsFact);
+          FailureOr<Value> rhsSlice = slice(rhs, rhsAxis, rhsFact);
+          if (failed(lhsSlice) || failed(rhsSlice)) {
+            failureReason = "a reduction-pair slice could not preserve its value graph";
             failedBody = true;
             return;
           }
           FailureOr<Value> product = build(
-              nested, nestedLhsType, nestedRhsType,
-              std::move(nestedLhsCoordinates), std::move(nestedRhsCoordinates),
-              *nestedLhsValid, *nestedRhsValid, nestedLhsReductions,
-              nestedRhsReductions, nestedLhsBatch, nestedRhsBatch,
-              carries.front());
+              nested, *lhsSlice, *rhsSlice, eraseAxis(lhsReductions, lhsAxis),
+              eraseAxis(rhsReductions, rhsAxis), carries.front());
           if (failed(product)) {
             failedBody = true;
             if (failureReason.empty())
@@ -2167,7 +1877,9 @@ LogicalResult decomposeMultiReductionContract(ContractOp contract) {
             return;
           }
           nested.create<scf::YieldOp>(nestedLocation, *product);
-        });
+        };
+    OpBuilder bodyBuilder = OpBuilder::atBlockEnd(loop.getBody());
+    buildBody(bodyBuilder, location, loop.getInductionVar(), loop.getRegionIterArgs());
     if (failedBody) {
       loop.erase();
       return failure();
@@ -2177,20 +1889,15 @@ LogicalResult decomposeMultiReductionContract(ContractOp contract) {
 
   OpBuilder builder(contract);
   FailureOr<Value> replacement = build(
-      builder, lhsType, rhsType, std::move(lhsCoordinates),
-      std::move(rhsCoordinates), lhsLoad.getValid(), rhsLoad.getValid(),
-      std::move(lhsReductions), std::move(rhsReductions), std::move(lhsBatch),
-      std::move(rhsBatch), contract.getAccumulator());
+      builder, contract.getLhs(), contract.getRhs(),
+      SmallVector<int64_t>(contract.getLhsReductionAxes()),
+      SmallVector<int64_t>(contract.getRhsReductionAxes()), contract.getAccumulator());
   if (failed(replacement))
     return contract.emitOpError(
                "multi-pair contraction could not be decomposed into provider-native contractions: ")
            << failureReason;
   contract.getResult().replaceAllUsesWith(*replacement);
   contract.erase();
-  if (lhsLoad.getResult().use_empty())
-    lhsLoad.erase();
-  if (rhsLoad.getResult().use_empty())
-    rhsLoad.erase();
   return success();
 }
 

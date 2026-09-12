@@ -9,7 +9,9 @@
 #include "llvm/ADT/StringMap.h"
 
 #include <algorithm>
+#include <functional>
 #include <limits>
+#include <optional>
 using namespace mlir;
 
 namespace intent::gpu {
@@ -506,6 +508,116 @@ int64_t selectCandidate(ArrayRef<int64_t> candidates, int64_t requested) {
   return selected;
 }
 
+struct ContractionFreeExtent {
+  SmallVector<PhysicalExprAttr> extents;
+  SmallVector<ParameterOp> parameters;
+  ParameterRole role;
+};
+
+SmallVector<ContractionFreeExtent>
+contractionFreeExtents(func::FuncOp kernel, ArrayRef<ParameterOp> parameters) {
+  llvm::StringMap<ParameterOp> ownership;
+  for (ParameterOp parameter : parameters) {
+    auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());
+    if (role == ParameterRole::OwnershipM || role == ParameterRole::OwnershipN)
+      ownership[parameter.getParameter().getName().getValue()] = parameter;
+  }
+  SmallVector<ContractionFreeExtent> groups;
+  kernel.walk([&](ContractOp contract) {
+    auto collectSide = [&](Value value, ArrayRef<int64_t> reduction,
+                           ArrayRef<int64_t> batch, ParameterRole role) {
+      ContractionFreeExtent group;
+      group.role = role;
+      unsigned variableFactors = 0;
+      std::function<bool(PhysicalExprAttr)> collect = [&](PhysicalExprAttr extent) {
+        auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+        if (kind == PhysicalExprKind::Constant)
+          return extent.getValue() > 0;
+        if (kind == PhysicalExprKind::Parameter) {
+          auto found = ownership.find(extent.getSymbol().getValue());
+          if (found == ownership.end()) return false;
+          ++variableFactors;
+          if (!llvm::is_contained(group.parameters, found->second))
+            group.parameters.push_back(found->second);
+          return true;
+        }
+        return kind == PhysicalExprKind::Multiply &&
+               llvm::all_of(extent.getOperands(), [&](Attribute operand) {
+                 return collect(cast<PhysicalExprAttr>(operand));
+               });
+      };
+      auto fragment = cast<FragmentType>(value.getType());
+      for (auto [axis, attribute] : llvm::enumerate(fragment.getShape())) {
+        if (llvm::is_contained(reduction, static_cast<int64_t>(axis)) ||
+            llvm::is_contained(batch, static_cast<int64_t>(axis)))
+          continue;
+        auto extent = cast<PhysicalExprAttr>(attribute);
+        if (!collect(extent)) return;
+        group.extents.push_back(extent);
+      }
+      if (variableFactors > 1) groups.push_back(std::move(group));
+    };
+    collectSide(contract.getLhs(), contract.getLhsReductionAxes(),
+                contract.getLhsBatchAxes(), ParameterRole::OwnershipM);
+    collectSide(contract.getRhs(), contract.getRhsReductionAxes(),
+                contract.getRhsBatchAxes(), ParameterRole::OwnershipN);
+  });
+  return groups;
+}
+
+void bindContractionFreeExtents(
+    ArrayRef<ContractionFreeExtent> groups, NamedAttrList &bindings,
+    llvm::function_ref<const TuningProfile &(ParameterOp)> profileFor,
+    Builder &builder) {
+  for (const ContractionFreeExtent &group : groups) {
+    int64_t budget = std::numeric_limits<int64_t>::max();
+    for (ParameterOp parameter : group.parameters)
+      budget = std::min(budget, requestedValue(profileFor(parameter), group.role));
+    auto fits = [&](ParameterOp selected, int64_t candidate) {
+      std::function<std::optional<int64_t>(PhysicalExprAttr)> evaluate =
+          [&](PhysicalExprAttr extent) -> std::optional<int64_t> {
+        auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+        if (kind == PhysicalExprKind::Constant)
+          return extent.getValue() <= budget
+                     ? std::optional<int64_t>(extent.getValue()) : std::nullopt;
+        if (kind == PhysicalExprKind::Parameter) {
+          int64_t value = selected && extent.getSymbol() == selected.getParameter().getName()
+                              ? candidate
+                              : cast<IntegerAttr>(bindings.get(extent.getSymbol().getValue())).getInt();
+          return value <= budget ? std::optional<int64_t>(value) : std::nullopt;
+        }
+        int64_t product = 1;
+        for (Attribute operand : extent.getOperands()) {
+          auto factor = evaluate(cast<PhysicalExprAttr>(operand));
+          if (!factor || product > budget / *factor) return std::nullopt;
+          product *= *factor;
+        }
+        return product;
+      };
+      int64_t product = 1;
+      for (PhysicalExprAttr extent : group.extents) {
+        auto factor = evaluate(extent);
+        if (!factor || product > budget / *factor) return false;
+        product *= *factor;
+      }
+      return true;
+    };
+    // Keep the innermost coordinates wide; the profile targets their combined
+    // M/N extent, not each independently tiled factor of that extent.
+    for (ParameterOp parameter : group.parameters) {
+      if (fits({}, 0)) break;
+      auto schema = parameter.getParameter();
+      int64_t current = cast<IntegerAttr>(bindings.get(schema.getName().getValue())).getInt();
+      auto candidates = schema.getCandidates().asArrayRef();
+      int64_t selected = *std::min_element(candidates.begin(), candidates.end());
+      for (int64_t candidate : candidates)
+        if (candidate <= current && candidate > selected && fits(parameter, candidate))
+          selected = candidate;
+      bindings.set(schema.getName(), builder.getI64IntegerAttr(selected));
+    }
+  }
+}
+
 bool hasSmallRegionRows(func::FuncOp kernel, ArrayRef<ParameterOp> parameters) {
   bool found = false;
   for (ParameterOp parameter : parameters) {
@@ -628,41 +740,34 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
   }
   if (profileCount == 0)
     profileCount = 1;
+  auto freeExtents = contractionFreeExtents(kernel, parameters);
+  auto appendTuple = [&](llvm::function_ref<const TuningProfile &(ParameterOp)> profileFor) {
+    NamedAttrList bindings;
+    for (ParameterOp parameter : parameters) {
+      auto schema = parameter.getParameter();
+      auto role = static_cast<ParameterRole>(schema.getRole());
+      int64_t selected = selectCandidate(schema.getCandidates().asArrayRef(),
+                                         requestedValue(profileFor(parameter), role));
+      bindings.set(schema.getName(), builder.getI64IntegerAttr(selected));
+    }
+    bindContractionFreeExtents(freeExtents, bindings, profileFor, builder);
+    DictionaryAttr tuple = bindings.getDictionary(kernel.getContext());
+    if (!llvm::is_contained(tuples, Attribute(tuple))) tuples.push_back(tuple);
+  };
   for (unsigned profileIndex = 0; profileIndex < profileCount;
        ++profileIndex) {
-    SmallVector<NamedAttribute> bindings;
-    for (ParameterOp parameter : parameters) {
-      ParameterAttr schema = parameter.getParameter();
-      auto role = static_cast<ParameterRole>(schema.getRole());
+    appendTuple([&](ParameterOp parameter) -> const TuningProfile & {
       const auto &profiles = parameterProfiles.find(parameter)->second;
       unsigned selectedProfile = std::min<unsigned>(profileIndex,
                                                      profiles.size() - 1);
-      int64_t selected = selectCandidate(schema.getCandidates().asArrayRef(),
-                                         requestedValue(profiles[selectedProfile], role));
-      bindings.push_back(builder.getNamedAttr(
-          schema.getName(), builder.getI64IntegerAttr(selected)));
-    }
-    DictionaryAttr tuple = builder.getDictionaryAttr(bindings);
-    if (!llvm::is_contained(tuples, Attribute(tuple)))
-      tuples.push_back(tuple);
+      return profiles[selectedProfile];
+    });
   }
   for (const CorrelatedProfileParameters &correlated : correlatedProfiles) {
-    SmallVector<NamedAttribute> bindings;
-    for (ParameterOp parameter : parameters) {
-      ParameterAttr schema = parameter.getParameter();
-      auto role = static_cast<ParameterRole>(schema.getRole());
+    appendTuple([&](ParameterOp parameter) -> const TuningProfile & {
       const auto &profiles = parameterProfiles.find(parameter)->second;
-      const TuningProfile &profile =
-          parameter == correlated.reduction ? profiles.back()
-                                            : profiles.front();
-      int64_t selected = selectCandidate(schema.getCandidates().asArrayRef(),
-                                         requestedValue(profile, role));
-      bindings.push_back(builder.getNamedAttr(
-          schema.getName(), builder.getI64IntegerAttr(selected)));
-    }
-    DictionaryAttr tuple = builder.getDictionaryAttr(bindings);
-    if (!llvm::is_contained(tuples, Attribute(tuple)))
-      tuples.push_back(tuple);
+      return parameter == correlated.reduction ? profiles.back() : profiles.front();
+    });
   }
   if (!indirectRowGroups.empty()) {
     auto rows = tables.get("shared", "indirect_row", kernel.getLoc());
@@ -671,27 +776,16 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
     for (const TuningProfiles::Row &row : *rows) {
       const TuningProfile indirectRowProfile{
           row[0], row[1], row[2], row[3], row[4], row[5], row[6]};
-      SmallVector<NamedAttribute> bindings;
-      for (ParameterOp parameter : parameters) {
+      appendTuple([&](ParameterOp parameter) -> const TuningProfile & {
         ParameterAttr schema = parameter.getParameter();
-        auto role = static_cast<ParameterRole>(schema.getRole());
         const auto &profiles = parameterProfiles.find(parameter)->second;
         bool indirectContraction =
             schema.getCategory() ==
                 static_cast<uint32_t>(ParameterCategory::Contraction) &&
             llvm::is_contained(indirectRowGroups,
                                parameter->getAttr(parameterGroupAttr));
-        int64_t selected = selectCandidate(
-            schema.getCandidates().asArrayRef(),
-            requestedValue(indirectContraction ? indirectRowProfile
-                                               : profiles.front(),
-                           role));
-        bindings.push_back(builder.getNamedAttr(
-            schema.getName(), builder.getI64IntegerAttr(selected)));
-      }
-      DictionaryAttr tuple = builder.getDictionaryAttr(bindings);
-      if (!llvm::is_contained(tuples, Attribute(tuple)))
-        tuples.push_back(tuple);
+        return indirectContraction ? indirectRowProfile : profiles.front();
+      });
     }
   }
   if (tuples.empty())

@@ -9,6 +9,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/IR/IRMapping.h"
@@ -1496,6 +1497,174 @@ void selectNativeReduceForms(func::FuncOp kernel) {
   });
 }
 
+LogicalResult legalizeContractShapes(func::FuncOp kernel) {
+  uint64_t nextSource = 1;
+  int64_t nextDimension = 1;
+  AttrTypeWalker identities;
+  identities.addWalk([&](gpu::AxisMapAttr axis) {
+    nextSource = std::max(nextSource, axis.getSourceId() + 1);
+    nextDimension = std::max(nextDimension, axis.getDimensionId() + 1);
+  });
+  identities.addWalk([&](gpu::PhysicalSourceAttr source) {
+    nextSource = std::max(nextSource, source.getSourceId() + 1);
+  });
+  identities.addWalk([&](gpu::ViewType view) {
+    nextSource = std::max(nextSource, view.getSourceId() + 1);
+  });
+  identities.addWalk([&](gpu::ViewLayoutAttr layout) {
+    for (int64_t dimension : layout.getDimensionIds().asArrayRef())
+      nextDimension = std::max(nextDimension, dimension + 1);
+  });
+  identities.addWalk([&](gpu::PhysicalExprAttr expression) {
+    if (expression.getKind() ==
+        static_cast<uint32_t>(gpu::PhysicalExprKind::Dimension))
+      nextDimension = std::max(nextDimension, expression.getValue() + 1);
+  });
+  SmallVector<gpu::ContractOp> contracts;
+  kernel.walk([&](Operation *operation) {
+    identities.walk(operation->getAttrDictionary());
+    for (Type type : operation->getOperandTypes()) identities.walk(type);
+    for (Type type : operation->getResultTypes()) identities.walk(type);
+    for (Region &region : operation->getRegions())
+      for (Block &block : region)
+        for (BlockArgument argument : block.getArguments())
+          identities.walk(argument.getType());
+    for (StringRef name : {gpu::dimensionAttr, gpu::coverageDimensionAttr})
+      if (auto dimension = operation->getAttrOfType<IntegerAttr>(name))
+        nextDimension = std::max(nextDimension, dimension.getInt() + 1);
+    if (auto contract = dyn_cast<gpu::ContractOp>(operation))
+      contracts.push_back(contract);
+  });
+  for (gpu::ContractOp contract : contracts) {
+    auto lhs = contract.getLhs().getType();
+    auto rhs = contract.getRhs().getType();
+    if (contract.getLhsReductionAxes().size() != 1 ||
+        contract.getRhsReductionAxes().size() != 1 ||
+        !contract.getLhsBatchAxes().empty() ||
+        !contract.getRhsBatchAxes().empty() ||
+        (lhs.getShape().size() <= 2 && rhs.getShape().size() <= 2))
+      continue;
+    auto freeAxes = [](gpu::FragmentType type, int64_t reduction) {
+      SmallVector<int64_t> axes;
+      for (int64_t axis = 0; axis < static_cast<int64_t>(type.getShape().size()); ++axis)
+        if (axis != reduction) axes.push_back(axis);
+      return axes;
+    };
+    auto lhsFree = freeAxes(lhs, contract.getLhsReductionAxes().front());
+    auto rhsFree = freeAxes(rhs, contract.getRhsReductionAxes().front());
+    if (lhsFree.empty() || rhsFree.empty())
+      return contract.emitOpError("Triton matrix normalization requires free axes on both operands");
+    OpBuilder builder(contract);
+    Location location = contract.getLoc();
+    auto remap = [&](gpu::AxisMapAttr axis, unsigned position) {
+      return gpu::AxisMapAttr::get(kernel.getContext(), axis.getSourceId(),
+          axis.getSourceAxis(), axis.getDimensionId(), position, axis.getDerived());
+    };
+    auto collapsedAxis = [&](gpu::FragmentType type, ArrayRef<int64_t> axes,
+                             unsigned position) {
+      if (axes.size() == 1)
+        return remap(cast<gpu::AxisMapAttr>(type.getAxisMaps()[axes.front()]), position);
+      return gpu::AxisMapAttr::get(kernel.getContext(), nextSource++, 0,
+                                   nextDimension++, position, true);
+    };
+    auto product = [&](gpu::FragmentType type, ArrayRef<int64_t> axes) {
+      auto extent = cast<gpu::PhysicalExprAttr>(type.getShape()[axes.front()]);
+      for (int64_t axis : axes.drop_front())
+        extent = gpu::PhysicalExprAttr::get(kernel.getContext(),
+            static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
+            builder.getStringAttr(""),
+            builder.getArrayAttr({extent, type.getShape()[axis]}));
+      return extent;
+    };
+    auto makeType = [&](gpu::FragmentType source, ArrayRef<Attribute> shape,
+                        ArrayRef<Attribute> mappings) {
+      return gpu::FragmentType::get(kernel.getContext(), source.getElementType(),
+          builder.getArrayAttr(shape), builder.getArrayAttr(mappings),
+          source.getValidity(), source.getOwner());
+    };
+    auto transpose = [&](Value value, ArrayRef<int64_t> permutation) {
+      if (llvm::all_of(llvm::enumerate(permutation), [](auto entry) {
+            return static_cast<int64_t>(entry.index()) == entry.value();
+          }))
+        return value;
+      auto type = cast<gpu::FragmentType>(value.getType());
+      SmallVector<Attribute> shape, mappings;
+      for (auto [position, axis] : llvm::enumerate(permutation)) {
+        shape.push_back(type.getShape()[axis]);
+        mappings.push_back(remap(cast<gpu::AxisMapAttr>(type.getAxisMaps()[axis]), position));
+      }
+      return Value(builder.create<gpu::TransposeOp>(location,
+          makeType(type, shape, mappings), value, permutation));
+    };
+    auto reshape = [&](Value value, gpu::FragmentType target) -> FailureOr<Value> {
+      if (value.getType() == target) return value;
+      auto relation = gpu::inferReshapeReassociation(
+          cast<gpu::FragmentType>(value.getType()), target);
+      if (failed(relation)) return failure();
+      return Value(builder.create<gpu::ReshapeOp>(location, target, value, *relation));
+    };
+    auto originalResult = contract.getResult().getType();
+    SmallVector<int64_t> resultPermutation;
+    auto appendResultAxes = [&](gpu::FragmentType operand, ArrayRef<int64_t> axes) {
+      for (int64_t axis : axes) {
+        auto mapping = cast<gpu::AxisMapAttr>(operand.getAxisMaps()[axis]);
+        auto source = gpu::queryFragmentAxis(originalResult, gpu::sourceAxisIdentity(mapping));
+        auto dimension = gpu::queryFragmentDimension(originalResult, mapping.getDimensionId());
+        std::optional<int64_t> position;
+        if (source.isExact()) position = source.fragmentAxis;
+        else if (dimension.isExact()) position = dimension.fragmentAxis;
+        if (!position || llvm::is_contained(resultPermutation, *position))
+          return failure();
+        resultPermutation.push_back(*position);
+      }
+      return success();
+    };
+    if (failed(appendResultAxes(lhs, lhsFree)) ||
+        failed(appendResultAxes(rhs, rhsFree)) ||
+        resultPermutation.size() != originalResult.getShape().size())
+      return contract.emitOpError("Triton matrix free axes have no bijective result projection");
+    auto m = product(lhs, lhsFree);
+    auto n = product(rhs, rhsFree);
+    auto mAxis = collapsedAxis(lhs, lhsFree, 0);
+    auto nAxis = collapsedAxis(rhs, rhsFree, 1);
+    int64_t lhsK = contract.getLhsReductionAxes().front();
+    int64_t rhsK = contract.getRhsReductionAxes().front();
+    SmallVector<int64_t> lhsPermutation(lhsFree);
+    lhsPermutation.push_back(lhsK);
+    SmallVector<int64_t> rhsPermutation{rhsK};
+    llvm::append_range(rhsPermutation, rhsFree);
+    auto matrixResult = makeType(originalResult, {m, n}, {mAxis, nAxis});
+    FailureOr<Value> matrixLhs = reshape(transpose(contract.getLhs(), lhsPermutation),
+        makeType(lhs, {m, lhs.getShape()[lhsK]},
+            {mAxis, remap(cast<gpu::AxisMapAttr>(lhs.getAxisMaps()[lhsK]), 1)}));
+    FailureOr<Value> matrixRhs = reshape(transpose(contract.getRhs(), rhsPermutation),
+        makeType(rhs, {rhs.getShape()[rhsK], n},
+            {remap(cast<gpu::AxisMapAttr>(rhs.getAxisMaps()[rhsK]), 0), nAxis}));
+    Value orderedAccumulator = transpose(contract.getAccumulator(), resultPermutation);
+    auto orderedResult = cast<gpu::FragmentType>(orderedAccumulator.getType());
+    FailureOr<Value> matrixAccumulator = reshape(orderedAccumulator, matrixResult);
+    if (failed(matrixLhs) || failed(matrixRhs) || failed(matrixAccumulator))
+      return contract.emitOpError("Triton matrix form has no exact row-major reshape");
+    contract->setOperands(ValueRange{*matrixLhs, *matrixRhs, *matrixAccumulator});
+    contract->setAttr("lhs_reduction_axes", builder.getDenseI64ArrayAttr({1}));
+    contract->setAttr("rhs_reduction_axes", builder.getDenseI64ArrayAttr({0}));
+    contract.getResult().setType(matrixResult);
+    builder.setInsertionPointAfter(contract);
+    FailureOr<Value> restored = reshape(contract.getResult(), orderedResult);
+    if (failed(restored))
+      return contract.emitOpError("Triton matrix result has no inverse row-major reshape");
+    Operation *firstRestore = (*restored).getDefiningOp();
+    SmallVector<int64_t> inverse(resultPermutation.size());
+    for (auto [position, axis] : llvm::enumerate(resultPermutation))
+      inverse[axis] = position;
+    Value result = transpose(*restored, inverse);
+    contract.getResult().replaceUsesWithIf(result, [&](OpOperand &use) {
+      return use.getOwner() != firstRestore;
+    });
+  }
+  return success();
+}
+
 void selectContractForms(func::FuncOp kernel) {
   kernel.walk([&](gpu::ContractOp contract) {
     auto lhs = contract.getLhs().getType();
@@ -2000,6 +2169,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
     return failure();
   if (failed(legalizeMaskedGather(kernel)) ||
       failed(legalizeScatterAdd(kernel)) ||
+      failed(legalizeContractShapes(kernel)) ||
       failed(gpu::verifyGPUProgram(module)))
     return failure();
   selectNativeReduceForms(kernel);
