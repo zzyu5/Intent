@@ -125,18 +125,20 @@ class Manual:
                 "total": len(results)}
 
     def api(self, name: str) -> dict:
-        """Exact public API declaration plus authoritative rules, return schema and examples."""
+        """Call api(name=...) for an exact declaration and rule IDs; use read(id=...) for rule text."""
         name = name.removeprefix("intent.language.").removeprefix("I.")
         entry = self.corpus["symbols"].get(name)
         if entry is None:
             return {"status": "not-found", "name": name, "message": "Not a current public declaration; no replacement is inferred."}
-        return {"status": "declared", "revision": self.corpus["revision"], **entry,
+        return {"status": "declared", "revision": self.corpus["revision"],
+                **{key: value for key, value in entry.items() if key != "sections"},
                 "signature_note": None if entry["signature"] else "No inspectable signature is declared; consult the linked rules, not a guessed signature.",
-                "rules": [self.corpus["documents"][key] for key in entry["sections"]
+                "rules": [{field: self.corpus["documents"][key][field]
+                           for field in ("id", "title", "source", "line")}
+                          for key in entry["sections"]
                           if self.corpus["documents"][key]["kind"] == "concept"],
-                "implementation_diagnostics": [self.corpus["documents"][key] for key in entry["sections"]
-                                               if self.corpus["documents"][key]["kind"] == "diagnostic"],
                 "examples": [key for key in entry["sections"] if self.corpus["documents"][key]["kind"] == "example"],
+                "read_note": "Read the relevant rule IDs for return shapes, dtypes and semantics. Implementation diagnostics are available through search(kind='diagnostic').",
                 "verification": "not evaluated by this read-only service; diagnostics do not redefine doc semantics"}
 
     def read(self, id: str, section: str | None = None) -> dict:
@@ -162,7 +164,13 @@ def main() -> None:
     from mcp.types import ToolAnnotations
 
     manual = Manual(json.loads(arguments.corpus.read_text()))
-    server = FastMCP("intent_manual", instructions="Intent public manual. Query api for exact signatures and return rules; read complete examples. No execution or task answers.")
+    server = FastMCP("intent_manual", instructions=(
+        "Intent public manual. Call api(name='I.domain') for exact declarations and rule IDs; "
+        "read(id=...) for the relevant rule text or complete examples. "
+        "read(id=..., section=...) accepts an exact section title. "
+        "Use search(query=..., kind=...) to find names and IDs. "
+        "No execution or task answers."
+    ))
     annotations = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
     for method in (manual.search, manual.api, manual.read):
         server.add_tool(method, annotations=annotations)
