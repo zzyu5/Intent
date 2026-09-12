@@ -108,12 +108,21 @@ void fuseContractionAdds(func::FuncOp kernel) {
   });
   for (BinaryOp add : additions) {
     for (unsigned operand : {1u, 0u}) {
+      Value projected = add->getOperand(operand);
+      if (projected.getType() != add.getResult().getType())
+        continue;
       Value value =
-          stripAdditiveProjection(add->getOperand(operand), /*singleUse=*/true);
+          stripAdditiveProjection(projected, /*singleUse=*/true);
       auto contract = value ? value.getDefiningOp<ContractOp>() : ContractOp();
       if (!contract || contract->getBlock() != add->getBlock() ||
           !isLiteralZeroProjection(contract.getAccumulator()))
         continue;
+      SmallVector<Operation *> projections;
+      for (Value current = projected; current != value;) {
+        Operation *projection = current.getDefiningOp();
+        projections.push_back(projection);
+        current = projection->getOperand(0);
+      }
       OpBuilder builder(add);
       FailureOr<Value> carry = projectPhysicalValueToSchema(
           builder, add.getLoc(), add->getOperand(1 - operand),
@@ -124,11 +133,15 @@ void fuseContractionAdds(func::FuncOp kernel) {
       // dominate this point; memory reads and other effects are not moved.
       auto fused = cast<ContractOp>(builder.clone(*contract));
       fused.getAccumulatorMutable().assign(*carry);
-      FailureOr<Value> result = projectPhysicalValueToSchema(
-          builder, add.getLoc(), fused.getResult(), add.getResult().getType());
-      if (failed(result))
-        continue;
-      add.getResult().replaceAllUsesWith(*result);
+      IRMapping mapping;
+      mapping.map(value, fused.getResult());
+      Value result = fused.getResult();
+      for (Operation *projection : llvm::reverse(projections)) {
+        Operation *clone = builder.clone(*projection, mapping);
+        result = clone->getResult(0);
+        mapping.map(projection->getResult(0), result);
+      }
+      add.getResult().replaceAllUsesWith(result);
       add.erase();
       break;
     }

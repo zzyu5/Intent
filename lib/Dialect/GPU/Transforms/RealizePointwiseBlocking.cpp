@@ -3549,8 +3549,21 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   kernel.walk([&](ContractOp contract) {
     collectAllAxesInto(contract.getLhs(), contractionTraversalRanges);
     collectAllAxesInto(contract.getRhs(), contractionTraversalRanges);
-    llvm::SmallPtrSet<Operation *, 16> visited;
-    collectStoreRanges(contract.getResult(), internalTraversalRanges, visited);
+    PhysicalContractFreeAxisFact freeAxes =
+        PhysicalProgramAnalysis(kernel).contractFreeAxes(contract);
+    bool directFreeCoordinates = freeAxes.isExact() &&
+        llvm::all_of(freeAxes.axes, [&](const auto &axis) {
+          auto load = axis.operand.template getDefiningOp<LoadOp>();
+          FailureOr<AxisMapAttr> mapping =
+              queryAxisMap(axis.operand.getType(), axis.operandAxis);
+          return load && succeeded(mapping) &&
+                 succeeded(queryCoordinatePosition(
+                     load.getCoordinates(), sourceAxisIdentity(*mapping)));
+        });
+    if (directFreeCoordinates) {
+      llvm::SmallPtrSet<Operation *, 16> visited;
+      collectStoreRanges(contract.getResult(), internalTraversalRanges, visited);
+    }
   });
   kernel.walk([&](ScaledContractOp contract) {
     collectAllAxesInto(contract.getLhs(), contractionTraversalRanges);
