@@ -9,6 +9,7 @@ from intent.api import DefinitionKind
 from intent.frontend.mlir import BlockState
 from intent.frontend.semantics import ConstexprType
 from intent.frontend.semantics import BufferType
+from intent.frontend.semantics import BinaryOperator
 from intent.frontend.semantics import DynamicDim
 from intent.frontend.semantics import Effect
 from intent.frontend.mlir import FunctionState
@@ -92,6 +93,8 @@ class FunctionLowerer:
         self.operation_blocks: dict[int, BlockState] = {}
         self.region_parent_blocks: dict[RegionState, BlockState] = {}
         self._integer_operations: dict[tuple[object, ...], EmittedOperation] = {}
+        self._integer_shape_terms: dict[MlirValue, tuple[frozenset, int]] = {}
+        self._integer_shape_dimensions: dict[tuple, object] = {}
         self._dynamic_dimension_counter = 0
         self._initialize_parameters(constexpr_values)
 
@@ -211,6 +214,31 @@ class FunctionLowerer:
         )
         if key is not None:
             self._integer_operations[key] = operation
+            result = operation.results[0]
+            properties = attributes or {}
+            if opcode is OperationKind.CONSTANT:
+                self._integer_shape_terms[result] = (frozenset(), properties["value"])
+            elif opcode is OperationKind.DIM:
+                self._integer_shape_terms[result] = (
+                    frozenset({(("dimension", properties["dimension"]), 1)}), 0
+                )
+            elif properties.get("operator_kind") in (
+                BinaryOperator.ADD, BinaryOperator.SUBTRACT
+            ):
+                terms = {}
+                constant = 0
+                for index, operand in enumerate(operands):
+                    sign = -1 if index == 1 and properties["operator_kind"] is BinaryOperator.SUBTRACT else 1
+                    nested, value = (frozenset({(("value", operand), 1)}), 0)
+                    if operand.type == result.type:
+                        nested, value = self._integer_shape_terms.get(operand, (nested, value))
+                    constant += sign * value
+                    for atom, coefficient in nested:
+                        terms[atom] = terms.get(atom, 0) + sign * coefficient
+                self._integer_shape_terms[result] = (
+                    frozenset((atom, coefficient) for atom, coefficient in terms.items() if coefficient),
+                    constant,
+                )
         self.operation_blocks[operation.id] = self.current_block
         for result in operation.results:
             self.value_blocks[result] = self.current_block
@@ -424,6 +452,7 @@ class FunctionLowerer:
         )
         result = operation.results[0]
         self.dimension_values[result] = dimension.dimension
+        self._integer_shape_dimensions[(result.type, self._integer_shape_terms[result])] = dimension.dimension
         self._remember_dimension_origin(dimension)
         return result
 
@@ -442,6 +471,23 @@ class FunctionLowerer:
         if origin is None:
             self.error(node, f"dynamic shape extent {dimension} has no SSA source")
         return self.materialize_dimension(origin, node)
+
+    def integer_shape_dimension(self, value: MlirValue, preferred: object = None) -> object:
+        dimension = self.dimension_values.get(value)
+        if dimension is not None:
+            return dimension
+        terms = self._integer_shape_terms.get(
+            value, (frozenset({(("value", value), 1)}), 0)
+        )
+        key = (value.type, terms)
+        dimension = self._integer_shape_dimensions.get(key)
+        if dimension is None:
+            dimension = self.zero_based_domain_extents.get(value)
+        if dimension is None:
+            dimension = preferred if preferred is not None else DynamicDim(f"value_{value.id}")
+        self._integer_shape_dimensions[key] = dimension
+        self.dimension_values[value] = dimension
+        return dimension
 
     def read_value(self, expression: Expression, node: ast.AST) -> MlirValue:
         value = self.materialize(expression, node)

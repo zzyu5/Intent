@@ -1416,6 +1416,49 @@ bool isIterationInvariantCoordinate(Value value, ForOp loop,
          dominance.dominates(parallel.getSource(), loop);
 }
 
+bool sameInvariantExtent(Value lhs, Value rhs, ForOp loop,
+                         DominanceInfo &dominance) {
+  if (lhs == rhs)
+    return dominance.dominates(lhs, loop);
+  if (auto left = getConstantInteger(lhs))
+    return getConstantInteger(rhs) == left;
+  auto left = lhs.getDefiningOp<DimOp>();
+  auto right = rhs.getDefiningOp<DimOp>();
+  return left && right && left->getOperand(0) == right->getOperand(0) &&
+         left->getAttr("axis") == right->getAttr("axis") &&
+         dominance.dominates(left->getOperand(0), loop);
+}
+
+bool readsPreviousReverseSuffix(Value readIndex, Value writtenIndex,
+                                 DomainOp domain, ForOp loop,
+                                 DominanceInfo &dominance) {
+  auto suffix = readIndex ? readIndex.getDefiningOp<SubregionOp>() : SubregionOp();
+  if (!suffix || !suffix.getHasStart() || !suffix.getHasStop() ||
+      getConstantInteger(domain.getBounds().front()) != 0)
+    return false;
+  auto source = suffix.getInputs().front().getDefiningOp<DomainOp>();
+  if (!source || source.getBounds().size() < 2 ||
+      getConstantInteger(source.getBounds().front()) != 0 ||
+      (source.getBounds().size() == 3 &&
+       getConstantInteger(source.getBounds()[2]) != 1) ||
+      !sameInvariantExtent(source.getBounds()[1], domain.getBounds()[1], loop,
+                           dominance) ||
+      !sameInvariantExtent(suffix.getInputs().back(), domain.getBounds()[1],
+                           loop, dominance))
+    return false;
+  auto reverse = writtenIndex.getDefiningOp<BinaryOp>();
+  auto last = reverse ? reverse.getLhs().getDefiningOp<BinaryOp>() : BinaryOp();
+  auto start = suffix.getInputs()[1].getDefiningOp<BinaryOp>();
+  return reverse && reverse.getOperatorKind() == BinaryOperator::Subtract &&
+         reverse.getRhs() == loop.getBody().front().getArgument(0) &&
+         last && last.getOperatorKind() == BinaryOperator::Subtract &&
+         getConstantInteger(last.getRhs()) == 1 &&
+         sameInvariantExtent(last.getLhs(), domain.getBounds()[1], loop,
+                              dominance) &&
+         start && start.getOperatorKind() == BinaryOperator::Add &&
+         start.getLhs() == writtenIndex && getConstantInteger(start.getRhs()) == 1;
+}
+
 bool hasPreviousIterationViewDefinition(Operation *read, ViewStoreOp store,
                                         DominanceInfo &dominance) {
   auto readRelation = read->getAttrOfType<IndexRelationAttr>("index");
@@ -1465,7 +1508,7 @@ bool hasPreviousIterationViewDefinition(Operation *read, ViewStoreOp store,
     if (writerParent != loop)
       continue;
     Value induction = loop.getBody().front().getArgument(0);
-    bool previousPrefix = false;
+    bool previousRange = false;
     bool covered = true;
     for (auto [readAttribute, writeAttribute] :
          llvm::zip(readRelation.getTerms(), writeRelation.getTerms())) {
@@ -1476,11 +1519,21 @@ bool hasPreviousIterationViewDefinition(Operation *read, ViewStoreOp store,
         break;
       }
       Value writtenIndex = indexTermOperand(store, writeTerm);
+      if (writeTerm.getKind() == 3 && readTerm.getKind() == 4 && writtenIndex &&
+          readsPreviousReverseSuffix(indexTermOperand(read, readTerm),
+                                     writtenIndex, domain, loop, dominance)) {
+        if (previousRange) {
+          covered = false;
+          break;
+        }
+        previousRange = true;
+        continue;
+      }
       if (writeTerm.getKind() == 3 && writtenIndex == induction) {
         Value readIndex = indexTermOperand(read, readTerm);
         auto prefix = readIndex ? readIndex.getDefiningOp<SubregionOp>()
                                 : SubregionOp();
-        if (previousPrefix || readTerm.getKind() != 4 || !prefix ||
+        if (previousRange || readTerm.getKind() != 4 || !prefix ||
             prefix.getInputs().empty() ||
             prefix.getInputs().front() != domain.getResult() ||
             !prefix.getHasStop() ||
@@ -1490,7 +1543,7 @@ bool hasPreviousIterationViewDefinition(Operation *read, ViewStoreOp store,
           covered = false;
           break;
         }
-        previousPrefix = true;
+        previousRange = true;
         continue;
       }
       if (readTerm.getKind() != writeTerm.getKind() ||
@@ -1518,9 +1571,9 @@ bool hasPreviousIterationViewDefinition(Operation *read, ViewStoreOp store,
       if (!covered)
         break;
     }
-    // The first prefix is empty. Each completed ordered iteration defines
-    // exactly the next coordinate, with the other coordinates unchanged.
-    if (previousPrefix && covered)
+    // The first prefix/suffix is empty. Each completed ordered iteration
+    // defines the next coordinate, with the other coordinates unchanged.
+    if (previousRange && covered)
       return true;
   }
   return false;

@@ -3869,8 +3869,25 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       if (PhysicalProgramAnalysis(kernel)
               .axisRealization(range.getResult(), 0)
               .constructionScalarSeed) {
-        unresolved.push_back(range);
-        continue;
+        FailureOr<int64_t> staticExtent = exactStaticTraversalExtent(
+            PhysicalProgramAnalysis(kernel).axisRanges(range.getResult(), 0));
+        if (failed(staticExtent) ||
+            physicalExtent.getKind() !=
+                static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+            !samePhysicalScalarExpression(range.getStart(),
+                                          range.getLogicalStart())) {
+          unresolved.push_back(range);
+          continue;
+        }
+        uint64_t covered = llvm::PowerOf2Ceil(
+            static_cast<uint64_t>(std::max<int64_t>(*staticExtent, 1)));
+        if (covered > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+          return range.emitOpError("static traversal extent exceeds index range");
+        physicalExtent = expression(kernel.getContext(),
+                                    PhysicalExprKind::Constant, covered);
+        retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
+                             physicalExtent);
+        fragment = cast<FragmentType>(range.getResult().getType());
       }
       const bool fixedSubregion =
           range->hasAttr(sourceSubregionAttr) &&
@@ -4015,8 +4032,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       });
     });
     eraseDeadPhysicalValues(kernel);
-    llvm::erase_if(dynamicRanges, [](MakeRangeOp range) {
-      return !range->getBlock() || range.getResult().use_empty();
+    allRanges.clear();
+    kernel.walk([&](MakeRangeOp range) { allRanges.push_back(range); });
+    llvm::erase_if(dynamicRanges, [&](MakeRangeOp range) {
+      return !llvm::is_contained(allRanges, range) || range.getResult().use_empty();
     });
   }
   if (dynamicRanges.empty()) {

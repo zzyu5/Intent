@@ -286,6 +286,8 @@ def _subscript_region(
     source: MlirValue,
     node: ast.Subscript,
 ) -> MlirValue:
+    from .expressions import compile_time_value
+
     if source.type.rank != 1 or not isinstance(node.slice, ast.Slice):
         lowerer.error(node, "logical subregion requires a rank-one source slice")
     if node.slice.step is not None:
@@ -293,12 +295,18 @@ def _subscript_region(
         if step != 1:
             lowerer.error(node.slice.step, "logical subregion requires unit step")
     operands = [source]
+    boundary_expressions = []
     has_start = node.slice.lower is not None
     has_stop = node.slice.upper is not None
     for bound in (node.slice.lower, node.slice.upper):
         if bound is None:
             continue
-        value = lowerer.materialize(lowerer.lower_expression(bound), bound)
+        expression = lowerer.lower_expression(bound)
+        boundary_expressions.append(expression)
+        known, _ = compile_time_value(expression)
+        value = lowerer.materialize(
+            expression, bound, ScalarType(intent_index) if known else None
+        )
         if not is_integer(value.type):
             lowerer.error(bound, "subregion boundary must be logical index/integer")
         operands.append(value)
@@ -311,6 +319,22 @@ def _subscript_region(
         extent_shape = lowerer.dynamic_shape_for_region(source)
     else:
         extent_shape = (lowerer.fresh_dynamic_dimension("subregion_extent"),)
+        if has_start and has_stop:
+            stop, start = lowerer.coerce_pair(
+                boundary_expressions[1], boundary_expressions[0], node
+            )
+            if stop.type == start.type and isinstance(stop.type, ScalarType):
+                operands[1:] = [start, stop]
+                length = lowerer.emit(
+                    OperationKind.BINARY,
+                    lowerer.location(node),
+                    operands=(stop, start),
+                    result_types=(stop.type,),
+                    attributes={"operator_kind": BinaryOperator.SUBTRACT},
+                ).results[0]
+                # A valid unit-step subregion has length end - begin. Reuse
+                # that exact typed value when the author uses it as a shape.
+                extent_shape = (lowerer.integer_shape_dimension(length, extent_shape[0]),)
     operation = lowerer.emit(
         OperationKind.SUBREGION,
         lowerer.location(node),
