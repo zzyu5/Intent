@@ -861,70 +861,85 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
   if (llvm::any_of(outputRanges, [](MakeRangeOp range) { return !range; }))
     return false;
 
-  Value value = stripIdentityBroadcast(store.getValue());
   SmallVector<unsigned> outerAxes;
   for (unsigned axis = 0; axis < outputRank; ++axis)
     outerAxes.push_back(axis);
-  while (auto transpose = value.getDefiningOp<TransposeOp>()) {
-    if (transpose.getPermutation().size() != outerAxes.size())
+  auto isPointwise = [](Operation *operation) {
+    return operation && isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp,
+                            BitcastOp, SplatOp, BroadcastOp>(operation);
+  };
+  ReshapeOp reshape;
+  llvm::SmallPtrSet<Operation *, 8> transposes;
+  std::function<bool(Value, SmallVector<unsigned>)> findReshape =
+      [&](Value value, SmallVector<unsigned> axes) {
+        value = stripIdentityBroadcast(value);
+        if (auto transpose = value.getDefiningOp<TransposeOp>()) {
+          if (transpose.getPermutation().size() != axes.size())
+            return false;
+          auto source = cast<FragmentType>(transpose.getValue().getType());
+          auto result = cast<FragmentType>(transpose.getResult().getType());
+          SmallVector<unsigned> inputAxes(axes.size());
+          for (auto [axis, sourceAxis] : llvm::enumerate(transpose.getPermutation())) {
+            auto sourceMap = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
+            auto resultMap = cast<AxisMapAttr>(result.getAxisMaps()[axis]);
+            if (!(sourceAxisIdentity(sourceMap) == sourceAxisIdentity(resultMap)) ||
+                sourceMap.getDimensionId() != resultMap.getDimensionId())
+              return false;
+            inputAxes[sourceAxis] = axes[axis];
+          }
+          if (!findReshape(transpose.getValue(), std::move(inputAxes)))
+            return false;
+          transposes.insert(transpose);
+          return true;
+        }
+        if (auto candidate = value.getDefiningOp<ReshapeOp>()) {
+          reshape = candidate;
+          outerAxes = std::move(axes);
+          return true;
+        }
+        Operation *producer = value.getDefiningOp();
+        return isPointwise(producer) && !isa<BroadcastOp>(producer) &&
+               llvm::any_of(producer->getOperands(), [&](Value operand) {
+                 return findReshape(operand, axes);
+               });
+      };
+  if (!findReshape(store.getValue(), outerAxes))
+    return false;
+  SmallVector<LoadOp> companions;
+  llvm::SmallDenseSet<Value> checked;
+  std::function<bool(Value)> canReplayEpilogue = [&](Value value) {
+    if (value == reshape.getResult() || !isa<FragmentType>(value.getType()) ||
+        !checked.insert(value).second)
+      return true;
+    Operation *producer = value.getDefiningOp();
+    if (isa_and_nonnull<TransposeOp>(producer) && !transposes.contains(producer))
       return false;
-    SmallVector<unsigned> inputAxes(outerAxes.size());
-    for (auto [axis, sourceAxis] : llvm::enumerate(transpose.getPermutation()))
-      inputAxes[sourceAxis] = outerAxes[axis];
-    outerAxes = std::move(inputAxes);
-    value = stripIdentityBroadcast(transpose.getValue());
-  }
-  auto reshape = value.getDefiningOp<ReshapeOp>();
-  BinaryOp pointwise;
-  LoadOp companion;
-  bool reshapedLhs = false;
-  if (!reshape) {
-    pointwise = value.getDefiningOp<BinaryOp>();
-    if (!pointwise)
-      return false;
-    Value companionValue;
-    reshape = stripIdentityBroadcast(pointwise.getLhs()).getDefiningOp<ReshapeOp>();
-    if (reshape) {
-      reshapedLhs = true;
-      companionValue = pointwise.getRhs();
-    }
-    else {
-      reshape = stripIdentityBroadcast(pointwise.getRhs()).getDefiningOp<ReshapeOp>();
-      companionValue = pointwise.getLhs();
-    }
-    if (!reshape)
-      return false;
-    auto companionType = dyn_cast<FragmentType>(companionValue.getType());
-    auto reshaped = cast<FragmentType>(reshape.getResult().getType());
-    if (!companionType || companionType.getShape() != reshaped.getShape() ||
-        companionType.getElementType() != reshaped.getElementType())
-      return false;
-    for (auto [lhs, rhs] : llvm::zip(companionType.getAxisMaps(), reshaped.getAxisMaps()))
-      if (cast<AxisMapAttr>(lhs).getDimensionId() != cast<AxisMapAttr>(rhs).getDimensionId())
-        return false;
-    while (auto broadcast = companionValue.getDefiningOp<BroadcastOp>()) {
-      auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
-      auto target = cast<FragmentType>(broadcast.getResult().getType());
-      if (!source)
-        return false;
-      BroadcastProjection projection = queryBroadcastProjection(source, target);
-      if (!projection.isExact())
-        return false;
-      for (auto [targetAxis, sourceAxis] : llvm::enumerate(projection.targetToSource)) {
-        if (!sourceAxis)
-          continue;
-        auto sourceMap = cast<AxisMapAttr>(source.getAxisMaps()[*sourceAxis]);
-        auto targetMap = cast<AxisMapAttr>(target.getAxisMaps()[targetAxis]);
-        if (sourceMap.getDimensionId() != targetMap.getDimensionId())
+    if (auto broadcast = dyn_cast_or_null<BroadcastOp>(producer)) {
+      if (auto source = dyn_cast<FragmentType>(broadcast.getValue().getType())) {
+        auto target = cast<FragmentType>(broadcast.getResult().getType());
+        BroadcastProjection projection = queryBroadcastProjection(source, target);
+        if (!projection.isExact())
           return false;
+        for (auto [axis, sourceAxis] : llvm::enumerate(projection.targetToSource)) {
+          if (!sourceAxis)
+            continue;
+          auto sourceMap = cast<AxisMapAttr>(source.getAxisMaps()[*sourceAxis]);
+          auto targetMap = cast<AxisMapAttr>(target.getAxisMaps()[axis]);
+          if (sourceMap.getDimensionId() != targetMap.getDimensionId())
+            return false;
+        }
       }
-      companionValue = broadcast.getValue();
     }
-    companion = companionValue.getDefiningOp<LoadOp>();
-    if (!companion || !canReplayReadAt(companion, store))
-      return false;
-  }
-  if (!reshape)
+    if (auto load = dyn_cast_or_null<LoadOp>(producer)) {
+      if (!canReplayReadAt(load, store))
+        return false;
+      companions.push_back(load);
+      return true;
+    }
+    return (isPointwise(producer) || isa_and_nonnull<TransposeOp>(producer)) &&
+           llvm::all_of(producer->getOperands(), canReplayEpilogue);
+  };
+  if (!canReplayEpilogue(store.getValue()))
     return false;
   auto input = dyn_cast<FragmentType>(reshape.getValue().getType());
   if (!input || input.getShape().size() > outputRank)
@@ -1050,8 +1065,11 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
     active = active ? Value(builder.create<BinaryOp>(
         store.getLoc(), predicate, active, within, BinaryOperator::LogicalAnd)) : within;
   }
-  Value payload = reshape.getValue();
-  if (pointwise) {
+  mapping.map(reshape.getResult(), reshape.getValue());
+  for (LoadOp companion : companions) {
+    auto companionType = FragmentType::get(
+        input.getContext(), cast<FragmentType>(companion.getResult().getType()).getElementType(),
+        input.getShape(), input.getAxisMaps(), input.getValidity(), input.getOwner());
     SmallVector<Value> companionCoordinates;
     for (Value coordinate : companion.getCoordinates()) {
       if (!isa<FragmentType>(coordinate.getType())) {
@@ -1076,23 +1094,49 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
     companionValid = combinePredicates(
         builder, store.getLoc(), input, *companionValid, active);
     if (!*companionFill)
-      companionFill = materializeZeroFragment(builder, store.getLoc(), input);
+      companionFill = materializeZeroFragment(builder, store.getLoc(), companionType);
     if (failed(companionValid) || failed(companionFill))
       return failure();
     auto loaded = builder.create<LoadOp>(
-        companion.getLoc(), input, companion.getResource(), companionCoordinates,
+        companion.getLoc(), companionType, companion.getResource(), companionCoordinates,
         *companionValid, *companionFill, companion.getSourceAxes());
     if (Attribute origin = companion->getAttr(originAttr))
       loaded->setAttr(originAttr, origin);
-    IRMapping operands;
-    operands.map(reshapedLhs ? pointwise.getLhs() : pointwise.getRhs(), payload);
-    operands.map(reshapedLhs ? pointwise.getRhs() : pointwise.getLhs(), loaded.getResult());
-    Operation *combined = builder.clone(*pointwise, operands);
-    combined->getResult(0).setType(input);
-    payload = combined->getResult(0);
+    mapping.map(companion.getResult(), loaded.getResult());
   }
+  std::function<FailureOr<Value>(Value)> replayEpilogue = [&](Value value) -> FailureOr<Value> {
+    if (Value mapped = mapping.lookupOrNull(value))
+      return mapped;
+    auto fragment = dyn_cast<FragmentType>(value.getType());
+    if (!fragment)
+      return value;
+    Operation *producer = value.getDefiningOp();
+    for (Value operand : producer->getOperands()) {
+      FailureOr<Value> mapped = replayEpilogue(operand);
+      if (failed(mapped))
+        return failure();
+      mapping.map(operand, *mapped);
+    }
+    auto target = FragmentType::get(
+        input.getContext(), fragment.getElementType(), input.getShape(),
+        input.getAxisMaps(), input.getValidity(), input.getOwner());
+    if (isa<BroadcastOp, TransposeOp>(producer)) {
+      FailureOr<Value> projected = projectPhysicalValueToSchema(
+          builder, producer->getLoc(), mapping.lookup(producer->getOperand(0)), target);
+      if (succeeded(projected))
+        mapping.map(value, *projected);
+      return projected;
+    }
+    Operation *clone = builder.clone(*producer, mapping);
+    clone->getResult(0).setType(target);
+    mapping.map(value, clone->getResult(0));
+    return clone->getResult(0);
+  };
+  FailureOr<Value> payload = replayEpilogue(store.getValue());
+  if (failed(payload))
+    return store.emitOpError("flattened store could not preserve its pointwise epilogue");
   auto replacement = builder.create<StoreOp>(
-      store.getLoc(), store.getResource(), coordinates, payload,
+      store.getLoc(), store.getResource(), coordinates, *payload,
       active, store.getSourceAxes());
   if (Attribute origin = store->getAttr(originAttr))
     replacement->setAttr(originAttr, origin);
