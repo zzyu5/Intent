@@ -179,6 +179,37 @@ def transpose(x):
     return x.T.contiguous()
 
 
+def shifted_row_copy(x):
+    return torch.cat((x[1:], x[:1]), dim=0)
+
+
+def roll_rows_forward(x):
+    return x[(torch.arange(x.numel()) + 4096) % x.numel()]
+
+
+def grouped_query_head_add(query, key):
+    heads = torch.arange(query.shape[0]) // (query.shape[0] // key.shape[0])
+    return query + key[heads]
+
+
+def alternating_signed_indices(shape_source):
+    rows, columns = shape_source.shape
+    signs = torch.where(torch.arange(rows, dtype=torch.int32) % 2 == 0, 1, -1).to(torch.int32)
+    return signs[:, None] * torch.arange(columns, dtype=torch.int32)[None, :]
+
+
+def row_boolean_reduction(shape_source):
+    return torch.full((shape_source.shape[0],), 3, dtype=torch.int32)
+
+
+def kmeans_assign(points, centroids):
+    distances = (points.float().square().sum(dim=1, keepdim=True)
+                 + centroids.float().square().sum(dim=1)[None, :]
+                 - 2.0 * points.float() @ centroids.float().T)
+    minimum, assignment = distances.min(dim=1)
+    return assignment.to(torch.int32), minimum
+
+
 def scalar_table_lookup(labels, table):
     return table[labels.long()]
 

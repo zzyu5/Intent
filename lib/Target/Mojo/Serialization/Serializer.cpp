@@ -429,7 +429,8 @@ private:
       line("prefetch[PrefetchOptions().for_read().high_locality().to_data_cache()](" +
           pointer(op.getMemref(), op.getIndices()) + ")");
     } else if (auto op = dyn_cast<vector::BroadcastOp>(operation)) {
-      assign(op.getResult(), valueType(op.getType()) + "(" + name(op.getSource()) + ")");
+      assign(op.getResult(), valueType(op.getType()) + "(" +
+          (op.getType().getElementType().isInteger(1) ? "fill=" : "") + name(op.getSource()) + ")");
     } else if (auto op = dyn_cast<vector::StepOp>(operation)) {
       SmallVector<std::string> lanes;
       for (int64_t lane = 0; lane < op.getType().getNumElements(); ++lane) lanes.push_back(std::to_string(lane));
@@ -532,7 +533,11 @@ private:
       assign(op.getResult(), "-" + name(op.getOperand()));
     } else if (auto op = dyn_cast<arith::RemSIOp>(operation)) {
       std::string lhs = name(op.getLhs()), rhs = name(op.getRhs());
-      assign(op.getResult(), "(" + lhs + ") - ((" + lhs + ") / (" + rhs + ")) * (" + rhs + ")");
+      std::string quotient = op.getType().isIndex() ? "Int(Int64(" + lhs + ") / Int64(" + rhs + "))"
+          : "(" + lhs + ") / (" + rhs + ")";
+      assign(op.getResult(), "(" + lhs + ") - (" + quotient + ") * (" + rhs + ")");
+    } else if (auto op = dyn_cast<arith::DivSIOp>(operation); op && op.getType().isIndex()) {
+      assign(op.getResult(), "Int(Int64(" + name(op.getLhs()) + ") / Int64(" + name(op.getRhs()) + "))");
     } else if (isa<arith::IndexCastOp, arith::IndexCastUIOp>(operation)) {
       Value result = operation->getResult(0);
       Value input = operation->getOperand(0);

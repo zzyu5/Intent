@@ -154,6 +154,12 @@ TILELANG = (
 
 
 MOJO = (
+    Entry("shifted_row_copy", "4096x1024-f32-8cores-host", "shifted_row_copy", ("indexing/relations.py:shifted_row_copy",), "source/pytorch/cpu_runtime.py"),
+    Entry("roll_rows_forward", "8192x4096-f16-flat-8cores-host", "roll_rows_forward", ("indexing/relations.py:roll_rows_forward",), "source/pytorch/cpu_runtime.py"),
+    Entry("grouped_query_head_add", "QH32-KH8-T4096-f16-8cores-host", "grouped_query_head_add", ("indexing/relations.py:grouped_query_head_add",), "source/pytorch/cpu_runtime.py"),
+    Entry("alternating_signed_indices", "4093x8191-i32-8cores-host", "alternating_signed_indices", ("pointwise/select.py:alternating_signed_indices",), "source/pytorch/cpu_runtime.py"),
+    Entry("boolean_reduction", "8192x4093-i32-8cores-host", "row_boolean_reduction", ("reduction/boolean.py:row_boolean_reduction",), "source/pytorch/cpu_runtime.py"),
+    Entry("kmeans_assign", "points65536-clusters64-features64-f16-8cores-host", "kmeans_assign", ("clustering/kmeans.py:kmeans_assign",), "source/pytorch/cpu_runtime.py"),
     Entry("fused_cross_entropy", "4096x16384-f32-8cores-host", "fused_cross_entropy", ("loss/cross_entropy.py:fused_cross_entropy",), "source/pytorch/cpu_runtime.py"),
     Entry("group_norm_silu_backward", "B32-C256-S1024-G32-bf16-8cores-host", "group_norm_silu_backward", ("backward/group_norm_silu.py:group_norm_silu_backward",), "source/pytorch/cpu_runtime.py"),
     Entry("causal_conv1d", "B8-C2048-L4096-W4-f16-8cores-host", "causal_conv1d", ("convolution/direct.py:causal_depthwise_conv1d",), "source/pytorch/cpu_runtime.py"),
