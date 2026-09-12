@@ -50,7 +50,8 @@ struct TritonLocalOptions {
 
 StringRef localOptionsFamily(ArrayRef<gpu::ParameterCategory> categories,
                              bool twoAxisPointwise,
-                             bool blackwellRecurrentContraction) {
+                             bool blackwellRecurrentContraction,
+                             bool fp32Contractions) {
   if (llvm::is_contained(categories,
                          gpu::ParameterCategory::RegionReduction))
     return "region_reduction";
@@ -64,7 +65,7 @@ StringRef localOptionsFamily(ArrayRef<gpu::ParameterCategory> categories,
     return "persistent_contraction";
   }
   if (llvm::is_contained(categories, gpu::ParameterCategory::Contraction))
-    return "contraction";
+    return fp32Contractions ? "contraction_f32" : "contraction";
   if (llvm::is_contained(categories, gpu::ParameterCategory::Histogram))
     return "histogram";
   if (llvm::is_contained(categories, gpu::ParameterCategory::Reduction) ||
@@ -2184,8 +2185,17 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   auto capabilities = kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
   bool blackwell = capabilities.getComputeCapabilityMajor() == 10 ||
                    capabilities.getComputeCapabilityMajor() == 12;
+  bool hasContraction = false;
+  bool allFp32 = true;
+  kernel.walk([&](gpu::ContractOp contract) {
+    hasContraction = true;
+    allFp32 &= contract.getLhs().getType().getElementType().isF32() &&
+               contract.getRhs().getType().getElementType().isF32() &&
+               contract.getResult().getType().getElementType().isF32();
+  });
   auto rows = profiles.get("triton", localOptionsFamily(
-      categories, twoAxisPointwise, blackwell && hasRecurrentContraction(kernel)), kernel.getLoc());
+      categories, twoAxisPointwise, blackwell && hasRecurrentContraction(kernel),
+      hasContraction && allFp32), kernel.getLoc());
   if (failed(rows))
     return failure();
   SmallVector<TritonLocalOptions> localOptions;
