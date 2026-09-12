@@ -3260,18 +3260,6 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
     for (MakeRangeOp range : sources) {
       SmallVector<PhysicalAxisProjection, 2> projections =
           queryRangeProjections(target, range);
-      if (FailureOr<int64_t> dimension = queryRangeDimension(range);
-          succeeded(dimension))
-        for (PhysicalDimensionProjection occurrence :
-             queryFragmentDimensions(target, *dimension))
-          if (!llvm::any_of(projections,
-                            [&](const PhysicalAxisProjection &projection) {
-                              return projection.fragmentAxis ==
-                                     occurrence.fragmentAxis;
-                            }))
-            projections.push_back(PhysicalAxisProjection{
-                PhysicalFactState::Exact, sourceAxisIdentity(range), *dimension,
-                occurrence.fragmentAxis});
       if (projections.empty())
         return failure();
       for (PhysicalAxisProjection projection : projections) {
