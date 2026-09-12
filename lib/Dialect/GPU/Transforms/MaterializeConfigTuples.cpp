@@ -547,6 +547,15 @@ contractionFreeExtents(func::FuncOp kernel, ArrayRef<ParameterOp> parameters) {
                });
       };
       auto fragment = cast<FragmentType>(value.getType());
+      // Batch lanes resident in this fragment also multiply its accumulator
+      // footprint. Consume the row budget before shrinking the matrix M axis;
+      // a batch distributed one per program contributes only its unit extent.
+      if (role == ParameterRole::OwnershipM)
+        for (int64_t axis : batch) {
+          auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
+          if (!collect(extent)) return;
+          group.extents.push_back(extent);
+        }
       for (auto [axis, attribute] : llvm::enumerate(fragment.getShape())) {
         if (llvm::is_contained(reduction, static_cast<int64_t>(axis)) ||
             llvm::is_contained(batch, static_cast<int64_t>(axis)))

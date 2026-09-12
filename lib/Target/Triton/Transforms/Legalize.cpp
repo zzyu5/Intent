@@ -1696,18 +1696,34 @@ LogicalResult legalizeContractShapes(func::FuncOp kernel) {
     auto rhs = contract.getRhs().getType();
     if (contract.getLhsReductionAxes().size() != 1 ||
         contract.getRhsReductionAxes().size() != 1 ||
-        !contract.getLhsBatchAxes().empty() ||
-        !contract.getRhsBatchAxes().empty() ||
         (lhs.getShape().size() <= 2 && rhs.getShape().size() <= 2))
       continue;
-    auto freeAxes = [](gpu::FragmentType type, int64_t reduction) {
+    ArrayRef<int64_t> lhsBatch = contract.getLhsBatchAxes();
+    ArrayRef<int64_t> rhsBatch = contract.getRhsBatchAxes();
+    unsigned batchRank = lhsBatch.size();
+    if (batchRank > 1)
+      continue;
+    auto canonicalBatch = [&](ArrayRef<int64_t> axes) {
+      return llvm::all_of(llvm::enumerate(axes), [](auto entry) {
+        return static_cast<int64_t>(entry.index()) == entry.value();
+      });
+    };
+    if (batchRank && lhs.getShape().size() == batchRank + 2 &&
+        rhs.getShape().size() == batchRank + 2 &&
+        canonicalBatch(lhsBatch) && canonicalBatch(rhsBatch) &&
+        contract.getLhsReductionAxes().front() == batchRank + 1 &&
+        contract.getRhsReductionAxes().front() == batchRank)
+      continue;
+    auto freeAxes = [](gpu::FragmentType type, int64_t reduction,
+                       ArrayRef<int64_t> batch) {
       SmallVector<int64_t> axes;
       for (int64_t axis = 0; axis < static_cast<int64_t>(type.getShape().size()); ++axis)
-        if (axis != reduction) axes.push_back(axis);
+        if (axis != reduction && !llvm::is_contained(batch, axis))
+          axes.push_back(axis);
       return axes;
     };
-    auto lhsFree = freeAxes(lhs, contract.getLhsReductionAxes().front());
-    auto rhsFree = freeAxes(rhs, contract.getRhsReductionAxes().front());
+    auto lhsFree = freeAxes(lhs, contract.getLhsReductionAxes().front(), lhsBatch);
+    auto rhsFree = freeAxes(rhs, contract.getRhsReductionAxes().front(), rhsBatch);
     if (lhsFree.empty() || rhsFree.empty())
       return contract.emitOpError("Triton matrix normalization requires free axes on both operands");
     OpBuilder builder(contract);
@@ -1775,35 +1791,63 @@ LogicalResult legalizeContractShapes(func::FuncOp kernel) {
       }
       return success();
     };
-    if (failed(appendResultAxes(lhs, lhsFree)) ||
+    if (failed(appendResultAxes(lhs, lhsBatch)) ||
+        failed(appendResultAxes(lhs, lhsFree)) ||
         failed(appendResultAxes(rhs, rhsFree)) ||
         resultPermutation.size() != originalResult.getShape().size())
       return contract.emitOpError("Triton matrix free axes have no bijective result projection");
     auto m = product(lhs, lhsFree);
     auto n = product(rhs, rhsFree);
-    auto mAxis = collapsedAxis(lhs, lhsFree, 0);
-    auto nAxis = collapsedAxis(rhs, rhsFree, 1);
+    auto mAxis = collapsedAxis(lhs, lhsFree, batchRank);
+    auto nAxis = collapsedAxis(rhs, rhsFree, batchRank + 1);
     int64_t lhsK = contract.getLhsReductionAxes().front();
     int64_t rhsK = contract.getRhsReductionAxes().front();
-    SmallVector<int64_t> lhsPermutation(lhsFree);
+    SmallVector<int64_t> lhsPermutation(lhsBatch);
+    llvm::append_range(lhsPermutation, lhsFree);
     lhsPermutation.push_back(lhsK);
-    SmallVector<int64_t> rhsPermutation{rhsK};
+    SmallVector<int64_t> rhsPermutation(rhsBatch);
+    rhsPermutation.push_back(rhsK);
     llvm::append_range(rhsPermutation, rhsFree);
-    auto matrixResult = makeType(originalResult, {m, n}, {mAxis, nAxis});
+    SmallVector<Attribute> lhsShape, lhsMappings, rhsShape, rhsMappings;
+    SmallVector<Attribute> resultShape, resultMappings;
+    SmallVector<int64_t> matrixBatch;
+    for (auto [position, pair] : llvm::enumerate(llvm::zip(lhsBatch, rhsBatch))) {
+      auto [left, right] = pair;
+      lhsShape.push_back(lhs.getShape()[left]);
+      lhsMappings.push_back(remap(
+          cast<gpu::AxisMapAttr>(lhs.getAxisMaps()[left]), position));
+      rhsShape.push_back(rhs.getShape()[right]);
+      rhsMappings.push_back(remap(
+          cast<gpu::AxisMapAttr>(rhs.getAxisMaps()[right]), position));
+      int64_t resultAxis = resultPermutation[position];
+      resultShape.push_back(originalResult.getShape()[resultAxis]);
+      resultMappings.push_back(remap(
+          cast<gpu::AxisMapAttr>(originalResult.getAxisMaps()[resultAxis]), position));
+      matrixBatch.push_back(position);
+    }
+    llvm::append_range(lhsShape, ArrayRef<Attribute>{m, lhs.getShape()[lhsK]});
+    llvm::append_range(lhsMappings, ArrayRef<Attribute>{mAxis,
+        remap(cast<gpu::AxisMapAttr>(lhs.getAxisMaps()[lhsK]), batchRank + 1)});
+    llvm::append_range(rhsShape, ArrayRef<Attribute>{rhs.getShape()[rhsK], n});
+    llvm::append_range(rhsMappings, ArrayRef<Attribute>{
+        remap(cast<gpu::AxisMapAttr>(rhs.getAxisMaps()[rhsK]), batchRank), nAxis});
+    llvm::append_range(resultShape, ArrayRef<Attribute>{m, n});
+    llvm::append_range(resultMappings, ArrayRef<Attribute>{mAxis, nAxis});
+    auto matrixResult = makeType(originalResult, resultShape, resultMappings);
     FailureOr<Value> matrixLhs = reshape(transpose(contract.getLhs(), lhsPermutation),
-        makeType(lhs, {m, lhs.getShape()[lhsK]},
-            {mAxis, remap(cast<gpu::AxisMapAttr>(lhs.getAxisMaps()[lhsK]), 1)}));
+        makeType(lhs, lhsShape, lhsMappings));
     FailureOr<Value> matrixRhs = reshape(transpose(contract.getRhs(), rhsPermutation),
-        makeType(rhs, {rhs.getShape()[rhsK], n},
-            {remap(cast<gpu::AxisMapAttr>(rhs.getAxisMaps()[rhsK]), 0), nAxis}));
+        makeType(rhs, rhsShape, rhsMappings));
     Value orderedAccumulator = transpose(contract.getAccumulator(), resultPermutation);
     auto orderedResult = cast<gpu::FragmentType>(orderedAccumulator.getType());
     FailureOr<Value> matrixAccumulator = reshape(orderedAccumulator, matrixResult);
     if (failed(matrixLhs) || failed(matrixRhs) || failed(matrixAccumulator))
       return contract.emitOpError("Triton matrix form has no exact row-major reshape");
     contract->setOperands(ValueRange{*matrixLhs, *matrixRhs, *matrixAccumulator});
-    contract->setAttr("lhs_reduction_axes", builder.getDenseI64ArrayAttr({1}));
-    contract->setAttr("rhs_reduction_axes", builder.getDenseI64ArrayAttr({0}));
+    contract->setAttr("lhs_reduction_axes", builder.getDenseI64ArrayAttr({batchRank + 1}));
+    contract->setAttr("rhs_reduction_axes", builder.getDenseI64ArrayAttr({batchRank}));
+    contract->setAttr("lhs_batch_axes", builder.getDenseI64ArrayAttr(matrixBatch));
+    contract->setAttr("rhs_batch_axes", builder.getDenseI64ArrayAttr(matrixBatch));
     contract.getResult().setType(matrixResult);
     builder.setInsertionPointAfter(contract);
     FailureOr<Value> restored = reshape(contract.getResult(), orderedResult);
@@ -1815,7 +1859,8 @@ LogicalResult legalizeContractShapes(func::FuncOp kernel) {
       inverse[axis] = position;
     Value result = transpose(*restored, inverse);
     contract.getResult().replaceUsesWithIf(result, [&](OpOperand &use) {
-      return use.getOwner() != firstRestore;
+      return use.getOwner() != firstRestore &&
+             use.getOwner() != result.getDefiningOp();
     });
   }
   return success();
