@@ -1786,14 +1786,7 @@ bool collapseMultiReductionContract(ContractOp contract) {
   if (lhsAxes.size() <= 1 || lhsAxes.size() != rhsAxes.size() ||
       !contract.getLhsBatchAxes().empty() || !contract.getRhsBatchAxes().empty())
     return false;
-  auto contiguous = [](ArrayRef<int64_t> axes) {
-    for (auto [position, axis] : llvm::enumerate(axes))
-      if (axis != axes.front() + static_cast<int64_t>(position))
-        return false;
-    return true;
-  };
-  if (!contiguous(lhsAxes) || !contiguous(rhsAxes) ||
-      !contract.getLhs().getDefiningOp<LoadOp>() ||
+  if (!contract.getLhs().getDefiningOp<LoadOp>() ||
       !contract.getRhs().getDefiningOp<LoadOp>())
     return false;
   func::FuncOp kernel = contract->getParentOfType<func::FuncOp>();
@@ -1848,8 +1841,42 @@ bool collapseMultiReductionContract(ContractOp contract) {
 
   auto [sourceId, dimensionId] = nextPhysicalAxisIdentities(kernel);
   OpBuilder builder(contract);
-  auto collapse = [&](Value value, ArrayRef<int64_t> reductions) -> Value {
+  auto collapse = [&](Value value, ArrayRef<int64_t> reductionAxes)
+      -> std::pair<Value, int64_t> {
+    SmallVector<int64_t> reductions(reductionAxes);
     auto source = cast<FragmentType>(value.getType());
+    bool contiguous = llvm::all_of(
+        llvm::enumerate(reductions), [&](auto entry) {
+          return entry.value() == reductions.front() +
+                                      static_cast<int64_t>(entry.index());
+        });
+    if (!contiguous) {
+      // Preserve free-axis order and the order of paired reductions. The
+      // permutation makes their existing exact ranges one collapsible group.
+      SmallVector<int64_t> permutation;
+      for (unsigned axis = 0; axis < source.getShape().size(); ++axis)
+        if (!llvm::is_contained(reductions, static_cast<int64_t>(axis)))
+          permutation.push_back(axis);
+      int64_t firstReduction = permutation.size();
+      llvm::append_range(permutation, reductions);
+      SmallVector<Attribute> transposedShape, transposedMappings;
+      for (auto [resultAxis, sourceAxis] : llvm::enumerate(permutation)) {
+        transposedShape.push_back(source.getShape()[sourceAxis]);
+        auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
+        transposedMappings.push_back(AxisMapAttr::get(
+            kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+            mapping.getDimensionId(), resultAxis, mapping.getDerived()));
+      }
+      source = FragmentType::get(
+          kernel.getContext(), source.getElementType(),
+          builder.getArrayAttr(transposedShape),
+          builder.getArrayAttr(transposedMappings), source.getValidity(),
+          source.getOwner());
+      value = builder.create<TransposeOp>(contract.getLoc(), source, value,
+                                           permutation);
+      for (auto [position, axis] : llvm::enumerate(reductions))
+        axis = firstReduction + static_cast<int64_t>(position);
+    }
     SmallVector<Attribute> shape, mappings, groups;
     for (unsigned axis = 0; axis < source.getShape().size();) {
       unsigned resultAxis = shape.size();
@@ -1858,7 +1885,7 @@ bool collapseMultiReductionContract(ContractOp contract) {
       AxisMapAttr mapping;
       if (axis == static_cast<unsigned>(reductions.front())) {
         sourceAxes.append(reductions.begin(), reductions.end());
-        for (int64_t reduced : reductions.drop_front()) {
+        for (int64_t reduced : ArrayRef<int64_t>(reductions).drop_front()) {
           auto factor = cast<PhysicalExprAttr>(source.getShape()[reduced]);
           if (extent == unit)
             extent = factor;
@@ -1885,15 +1912,16 @@ bool collapseMultiReductionContract(ContractOp contract) {
     auto target = FragmentType::get(
         kernel.getContext(), source.getElementType(), builder.getArrayAttr(shape),
         builder.getArrayAttr(mappings), source.getValidity(), source.getOwner());
-    return builder.create<ReshapeOp>(contract.getLoc(), target, value,
-                                     builder.getArrayAttr(groups));
+    return {builder.create<ReshapeOp>(contract.getLoc(), target, value,
+                                      builder.getArrayAttr(groups)),
+            reductions.front()};
   };
-  Value lhs = collapse(contract.getLhs(), lhsAxes);
-  Value rhs = collapse(contract.getRhs(), rhsAxes);
+  auto [lhs, lhsAxis] = collapse(contract.getLhs(), lhsAxes);
+  auto [rhs, rhsAxis] = collapse(contract.getRhs(), rhsAxes);
   auto replacement = builder.create<ContractOp>(
       contract.getLoc(), contract.getResult().getType(), lhs, rhs,
-      contract.getAccumulator(), ArrayRef<int64_t>{lhsAxes.front()},
-      ArrayRef<int64_t>{rhsAxes.front()}, ArrayRef<int64_t>{}, ArrayRef<int64_t>{});
+      contract.getAccumulator(), ArrayRef<int64_t>{lhsAxis},
+      ArrayRef<int64_t>{rhsAxis}, ArrayRef<int64_t>{}, ArrayRef<int64_t>{});
   if (Attribute origin = contract->getAttr(originAttr))
     replacement->setAttr(originAttr, origin);
   contract.getResult().replaceAllUsesWith(replacement.getResult());
