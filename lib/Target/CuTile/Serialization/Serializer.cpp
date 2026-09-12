@@ -129,7 +129,7 @@ std::string literal(Attribute value) {
 }
 
 struct CoverageParameter {
-  std::string dimension;
+  gpu::PhysicalExprAttr bound;
   SmallVector<int64_t> candidates;
 };
 
@@ -299,16 +299,17 @@ private:
           parameter->getAttrOfType<IntegerAttr>(gpu::coverageDimensionAttr);
       if (!dimension)
         return;
-      auto binding = dimensionBindings.find(dimension.getInt());
-      if (binding == dimensionBindings.end()) {
+      auto bound = parameter->getAttrOfType<gpu::PhysicalExprAttr>(
+          gpu::coverageBoundAttr);
+      if (!bound) {
         parameter.emitOpError(
-            "full-coverage parameter references a non-ABI dimension");
+            "full-coverage parameter has no typed bound expression");
         failed = true;
         return;
       }
       auto schema = parameter.getParameter();
       fullCoverageParameters[schema.getName().getValue().str()] = {
-          binding->second.name,
+          bound,
           SmallVector<int64_t>(schema.getCandidates().asArrayRef())};
       fullCoverageParameterNames.insert(schema.getName().getValue());
     });
@@ -493,7 +494,7 @@ private:
         candidates += std::to_string(candidate) + ", ";
       candidates += ")";
       line(parameter + " = next((extent for extent in " + candidates +
-               " if extent >= " + coverage.dimension + "), None)",
+               " if extent >= " + expressionString(coverage.bound, false) + "), None)",
            1);
       line("if " + parameter + " is None:", 1);
       line("raise ValueError(\"no legal full-coverage extent for " + parameter +

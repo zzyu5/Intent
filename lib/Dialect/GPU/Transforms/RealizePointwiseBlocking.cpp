@@ -3509,7 +3509,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             PhysicalProgramAnalysis(kernel).axisRealization(source, axis);
         for (MakeRangeOp range : allRanges) {
           if (!llvm::any_of(fact.roots, [&](MakeRangeOp root) {
-                return sameLogicalRange(root, range);
+                return sameLogicalRange(root, range) &&
+                       PhysicalProgramAnalysis(kernel)
+                           .lockstepRanges({root, range})
+                           .isExact();
               }))
             continue;
           structuredTraversalRanges.insert(range.getOperation());
@@ -4965,6 +4968,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
              ownershipIndex + 2 == pointwiseOwnershipAxes.size())
       ownershipRole = ParameterRole::OwnershipM;
     parameter->removeAttr(coverageDimensionAttr);
+    parameter->removeAttr(coverageBoundAttr);
     DenseI64ArrayAttr candidates;
     if (scalarGridAxis)
       candidates = DenseI64ArrayAttr::get(module.getContext(), {1});

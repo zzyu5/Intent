@@ -276,6 +276,19 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
             << name;
         return WalkResult::interrupt();
       }
+      if (parameter->hasAttr(coverageBoundAttr)) {
+        auto bound =
+            parameter->getAttrOfType<PhysicalExprAttr>(coverageBoundAttr);
+        if (!parameter->hasAttr(coverageDimensionAttr) || !bound) {
+          parameter.emitOpError(
+              "coverage bound requires a typed coverage decision");
+          return WalkResult::interrupt();
+        }
+        const llvm::StringSet<> noParameters;
+        if (failed(verifyExpressionSymbols(operation, bound, noParameters,
+                                           launchABI, launchDimensions)))
+          return WalkResult::interrupt();
+      }
     }
     if (auto physical = dyn_cast<PhysicalExprOp>(operation))
       if (failed(verifyExpressionSymbols(operation, physical.getExpression(),

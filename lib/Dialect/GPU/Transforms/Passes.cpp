@@ -18,7 +18,8 @@ LogicalResult closeReductionValueRelations(func::FuncOp kernel) {
 }
 
 LogicalResult normalizeStructuredSources(ModuleOp module, func::FuncOp kernel) {
-  if (failed(realizeVectorContractions(module)) ||
+  if (failed(composeContractResultReshapes(module)) ||
+      failed(realizeVectorContractions(module)) ||
       failed(decomposeMultiAxisReductions(module)) ||
       failed(refreshReshapeRelations(kernel)))
     return failure();

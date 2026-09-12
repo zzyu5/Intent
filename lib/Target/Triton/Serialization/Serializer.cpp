@@ -116,7 +116,7 @@ struct Config {
 };
 
 struct CoverageParameter {
-  std::string dimension;
+  gpu::PhysicalExprAttr bound;
   SmallVector<int64_t> candidates;
 };
 
@@ -274,15 +274,16 @@ private:
           parameter->getAttrOfType<IntegerAttr>(gpu::coverageDimensionAttr);
       if (!dimension)
         return;
-      auto binding = dimensionBindings.find(dimension.getInt());
-      if (binding == dimensionBindings.end()) {
+      auto bound = parameter->getAttrOfType<gpu::PhysicalExprAttr>(
+          gpu::coverageBoundAttr);
+      if (!bound) {
         parameter.emitOpError(
-            "full-coverage parameter references a non-ABI dimension");
+            "full-coverage parameter has no typed bound expression");
         failed = true;
         return;
       }
       fullCoverageParameters[name] = {
-          binding->second.name,
+          bound,
           SmallVector<int64_t>(schema.getCandidates().asArrayRef())};
     });
     kernel.walk([&](TensorDescriptorChoiceOp choice) {
@@ -493,7 +494,8 @@ private:
     }
     for (const auto &[parameter, coverage] : fullCoverageParameters) {
       output << "def _intent_cover_" << parameter << "(args):\n"
-             << "    bound = int(args[\"" << coverage.dimension << "\"])\n"
+             << "    bound = int(" << descriptorArgumentExpression(coverage.bound)
+             << ")\n"
              << "    for extent in (";
       for (int64_t candidate : coverage.candidates)
         output << candidate << ", ";

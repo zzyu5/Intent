@@ -680,6 +680,27 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
       invalidParameter = true;
       return;
     }
+    if (coverage && !parameter->hasAttr(coverageBoundAttr)) {
+      PhysicalParameterBinding binding = queryParameterBinding(parameter);
+      PhysicalExprAttr bound;
+      if (binding.isExact() && binding.dimension)
+        for (BlockArgument argument : kernel.getArguments()) {
+          DictionaryAttr attributes =
+              kernel.getArgAttrDict(argument.getArgNumber());
+          auto kind = attributes.getAs<StringAttr>(abiKindAttr);
+          auto dimension = attributes.getAs<IntegerAttr>(dimensionAttr);
+          if (kind && kind.getValue() == "dimension" && dimension &&
+              dimension.getInt() == *binding.dimension)
+            bound = queryLaunchExpression(argument);
+        }
+      if (!bound) {
+        parameter.emitOpError(
+            "full-coverage parameter has no launch-visible bound expression");
+        invalidParameter = true;
+        return;
+      }
+      parameter->setAttr(coverageBoundAttr, bound);
+    }
     if (isSharedStaticParameter(parameter))
       parameters.push_back(parameter);
   });
@@ -809,11 +830,20 @@ LogicalResult verifySharedConfigTuples(func::FuncOp kernel) {
     return kernel.emitError(
         "shared physical program requires complete config tuples");
   llvm::StringMap<ParameterOp> parameters;
+  bool missingCoverageBound = false;
   kernel.walk([&](ParameterOp parameter) {
+    if (parameter->hasAttr(coverageDimensionAttr) &&
+        !parameter->getAttrOfType<PhysicalExprAttr>(coverageBoundAttr)) {
+      parameter.emitOpError(
+          "full-coverage parameter requires a typed bound expression");
+      missingCoverageBound = true;
+    }
     if (isSharedStaticParameter(parameter))
       parameters.try_emplace(parameter.getParameter().getName().getValue(),
                              parameter);
   });
+  if (missingCoverageBound)
+    return failure();
   llvm::SmallDenseSet<Attribute, 8> unique;
   for (Attribute attribute : tuples) {
     auto tuple = dyn_cast<DictionaryAttr>(attribute);

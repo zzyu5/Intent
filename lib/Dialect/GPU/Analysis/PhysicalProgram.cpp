@@ -360,7 +360,15 @@ Value stripIntegerIndexCasts(Value value) {
 }
 
 bool derivesFromAccessCoordinate(Value value, Value coordinate) {
-  if (value == coordinate)
+  // Coordinate replay can duplicate a pure expression before CSE. Its bounds
+  // still apply when the complete typed expression and SSA leaves are equal.
+  if (sameScalarExpression(value, coordinate))
+    return true;
+  auto valueType = dyn_cast<FragmentType>(value.getType());
+  auto coordinateType = dyn_cast<FragmentType>(coordinate.getType());
+  if (valueType && coordinateType &&
+      queryBroadcastProjection(valueType, coordinateType).isExact() &&
+      sameScalarExpression(stripBroadcast(value), stripBroadcast(coordinate)))
     return true;
   value = stripIntegerIndexCasts(value);
   coordinate = stripIntegerIndexCasts(coordinate);
@@ -676,6 +684,24 @@ bool linearizedGatherWithinResource(Value coordinate, Value resource) {
       if (candidates.empty() ||
           llvm::any_of(candidates, [](int64_t value) { return value <= 0; }))
         return std::nullopt;
+      if (auto tuples = kernel->getAttrOfType<ArrayAttr>(sharedConfigTuplesAttr);
+          tuples && !tuples.empty()) {
+        int64_t maximum = 0;
+        bool bound = true;
+        for (Attribute attribute : tuples) {
+          auto tuple = dyn_cast<DictionaryAttr>(attribute);
+          auto selected = tuple ? tuple.getAs<IntegerAttr>(extent.getSymbol())
+                                : IntegerAttr();
+          if (!selected || selected.getInt() <= 0 ||
+              !llvm::is_contained(candidates, selected.getInt())) {
+            bound = false;
+            break;
+          }
+          maximum = std::max(maximum, selected.getInt());
+        }
+        if (bound)
+          return maximum;
+      }
       return *llvm::max_element(candidates);
     }
     if (kind != PhysicalExprKind::Multiply || extent.getOperands().size() != 2)
@@ -2547,6 +2573,7 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
             result.state = PhysicalFactState::Exact;
             result.physicalized = input.physicalized;
             result.constructionScalarSeed = input.constructionScalarSeed;
+            result.roots = input.roots;
             result.extentAuthority =
                 PhysicalAxisRealizationFact::ExtentAuthority::Structural;
             return result;
@@ -2620,6 +2647,7 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
             result.state = PhysicalFactState::Exact;
             result.physicalized = input.physicalized;
             result.constructionScalarSeed = input.constructionScalarSeed;
+            result.roots = input.roots;
             result.extentAuthority =
                 PhysicalAxisRealizationFact::ExtentAuthority::Structural;
             return result;
@@ -2659,6 +2687,7 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
           result.state = PhysicalFactState::Exact;
           result.physicalized = input.physicalized;
           result.constructionScalarSeed = input.constructionScalarSeed;
+          result.roots = input.roots;
           result.extentAuthority =
               PhysicalAxisRealizationFact::ExtentAuthority::Structural;
           return result;

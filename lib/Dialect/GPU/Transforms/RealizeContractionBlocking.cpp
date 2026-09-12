@@ -339,7 +339,7 @@ LogicalResult refineOwnershipParameter(func::FuncOp kernel, MakeRangeOp range,
     return previous->emitOpError(
         "contraction can only refine a provisional pointwise ownership parameter");
   for (StringRef attribute : {dimensionAttr, parameterSourceAttr,
-                              coverageDimensionAttr}) {
+                              coverageDimensionAttr, coverageBoundAttr}) {
     Attribute inherited = (*previous)->getAttr(attribute);
     Attribute current = replacement->getAttr(attribute);
     if (inherited && current && inherited != current)
@@ -4882,6 +4882,129 @@ LogicalResult orientLoopContractions(ModuleOp module) {
   return success();
 }
 
+LogicalResult composeContractResultReshapes(ModuleOp module) {
+  FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
+  if (failed(kernel))
+    return failure();
+  SmallVector<ContractOp> contracts;
+  kernel->walk([&](ContractOp contract) { contracts.push_back(contract); });
+  bool changed = false;
+  for (ContractOp contract : contracts) {
+    if (!contract.getResult().hasOneUse() ||
+        contract.getLhs().getType().getShape().size() != 2 ||
+        contract.getRhs().getType().getShape().size() != 2 ||
+        contract.getLhsReductionAxes() != ArrayRef<int64_t>{1} ||
+        contract.getRhsReductionAxes() != ArrayRef<int64_t>{0} ||
+        !contract.getLhsBatchAxes().empty() ||
+        !contract.getRhsBatchAxes().empty())
+      continue;
+    auto input = contract.getLhs().getDefiningOp<ReshapeOp>();
+    auto output = dyn_cast<ReshapeOp>(*contract.getResult().getUsers().begin());
+    auto identity = contract.getAccumulator().getDefiningOp<SplatOp>();
+    if (!input || !output || !identity || input.getReassociation().size() != 2 ||
+        output.getReassociation().size() != 2)
+      continue;
+    auto source = cast<FragmentType>(input.getValue().getType());
+    auto target = cast<FragmentType>(output.getResult().getType());
+    auto inputFree = cast<ReshapeGroupAttr>(input.getReassociation()[0]);
+    auto inputReduction = cast<ReshapeGroupAttr>(input.getReassociation()[1]);
+    auto outputFree = cast<ReshapeGroupAttr>(output.getReassociation()[0]);
+    auto outputColumn = cast<ReshapeGroupAttr>(output.getReassociation()[1]);
+    unsigned freeRank = inputFree.getSourceAxes().size();
+    if (freeRank < 2 || target.getShape().size() != freeRank + 1 ||
+        inputFree.getResultAxes().asArrayRef() != ArrayRef<int64_t>{0} ||
+        inputReduction.getResultAxes().asArrayRef() != ArrayRef<int64_t>{1} ||
+        outputFree.getSourceAxes().asArrayRef() != ArrayRef<int64_t>{0} ||
+        outputColumn.getSourceAxes().asArrayRef() != ArrayRef<int64_t>{1} ||
+        outputColumn.getResultAxes().asArrayRef() !=
+            ArrayRef<int64_t>{static_cast<int64_t>(freeRank)} ||
+        inputFree.getSourceAxes().asArrayRef() !=
+            outputFree.getResultAxes().asArrayRef())
+      continue;
+    bool exactFreeAxes = true;
+    for (unsigned axis = 0; axis < freeRank; ++axis) {
+      auto original = cast<AxisMapAttr>(source.getAxisMaps()[axis]);
+      auto restored = cast<AxisMapAttr>(target.getAxisMaps()[axis]);
+      exactFreeAxes &= original.getDimensionId() > 0 &&
+                       original.getDimensionId() == restored.getDimensionId() &&
+                       source.getShape()[axis] == target.getShape()[axis];
+    }
+    if (!exactFreeAxes)
+      continue;
+
+    // Compose the explicit inverse free-axis reshape through the contraction.
+    // Keep its reduction group collapsed and retain the input's independent
+    // coordinate roots for downstream spatial reductions.
+    OpBuilder builder(contract);
+    SmallVector<Attribute> shape, mappings, groups;
+    for (unsigned axis = 0; axis < freeRank; ++axis) {
+      shape.push_back(source.getShape()[axis]);
+      mappings.push_back(source.getAxisMaps()[axis]);
+      groups.push_back(ReshapeGroupAttr::get(
+          module.getContext(), builder.getDenseI64ArrayAttr({axis}),
+          builder.getDenseI64ArrayAttr({axis})));
+    }
+    auto matrix = contract.getLhs().getType();
+    auto reduction = cast<AxisMapAttr>(matrix.getAxisMaps()[1]);
+    shape.push_back(matrix.getShape()[1]);
+    mappings.push_back(AxisMapAttr::get(
+        module.getContext(), reduction.getSourceId(), reduction.getSourceAxis(),
+        reduction.getDimensionId(), freeRank, reduction.getDerived()));
+    groups.push_back(ReshapeGroupAttr::get(
+        module.getContext(), inputReduction.getSourceAxes(),
+        builder.getDenseI64ArrayAttr({freeRank})));
+    auto operandType = FragmentType::get(
+        module.getContext(), matrix.getElementType(), builder.getArrayAttr(shape),
+        builder.getArrayAttr(mappings), matrix.getValidity(), matrix.getOwner());
+    Value sourceValue = input.getValue();
+    while (auto cast = sourceValue.getDefiningOp<CastOp>()) {
+      if (cast.getValue().getType() != sourceValue.getType())
+        break;
+      sourceValue = cast.getValue();
+    }
+    Value operand = builder.create<ReshapeOp>(
+        input.getLoc(), operandType, sourceValue, builder.getArrayAttr(groups));
+    SmallVector<Attribute> resultMappings(source.getAxisMaps().begin(),
+                                          source.getAxisMaps().begin() + freeRank);
+    auto column = cast<AxisMapAttr>(contract.getRhs().getType().getAxisMaps()[1]);
+    resultMappings.push_back(AxisMapAttr::get(
+        module.getContext(), column.getSourceId(), column.getSourceAxis(),
+        column.getDimensionId(), freeRank, column.getDerived()));
+    auto resultType = FragmentType::get(
+        module.getContext(), target.getElementType(), target.getShape(),
+        builder.getArrayAttr(resultMappings), target.getValidity(),
+        target.getOwner());
+    Value accumulator = builder.create<SplatOp>(output.getLoc(), resultType,
+                                               identity.getValue());
+    contract.getLhsMutable().assign(operand);
+    contract.getAccumulatorMutable().assign(accumulator);
+    contract->setAttr("lhs_reduction_axes",
+                      builder.getDenseI64ArrayAttr({freeRank}));
+    contract.getResult().setType(resultType);
+    builder.setInsertionPointAfter(contract);
+    Value projected = builder.create<BroadcastOp>(output.getLoc(), target,
+                                                 contract.getResult());
+    output.getResult().replaceAllUsesWith(projected);
+    output.erase();
+    changed = true;
+  }
+  if (changed) {
+    SmallVector<CastOp> identityCasts;
+    kernel->walk([&](CastOp cast) {
+      if (cast.getValue().getType() == cast.getResult().getType())
+        identityCasts.push_back(cast);
+    });
+    for (CastOp cast : identityCasts) {
+      cast.getResult().replaceAllUsesWith(cast.getValue());
+      cast.erase();
+    }
+    eraseDeadPhysicalValues(*kernel);
+    if (failed(realizeAccessComposition(module)))
+      return failure();
+  }
+  return success();
+}
+
 LogicalResult realizeContractionBlocking(ModuleOp module) {
   FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);
   if (failed(physicalKernel))
@@ -4904,6 +5027,36 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
   contracts.clear();
   kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
   if (failed(normalizeMatrixContractForms(kernel)))
+    return failure();
+  // Close retained read snapshots before creating any contraction slices.
+  // Materializing one operand later can otherwise retarget an existing slice
+  // that shares the same logical dimension with that snapshot.
+  WalkResult snapshots = kernel.walk([&](ContractOp contract) {
+    for (auto [value, axes] :
+         {std::pair{contract.getLhs(), contract.getLhsReductionAxes()},
+          std::pair{contract.getRhs(), contract.getRhsReductionAxes()}}) {
+      for (int64_t axis : axes) {
+        PhysicalProgramAnalysis analysis(kernel);
+        auto fragment = cast<FragmentType>(value.getType());
+        auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+        PhysicalReplayFact replay = analysis.replayability(
+            value, sourceAxisIdentity(mapping), PhysicalReplayScope::ValueGraph,
+            /*allowAccesses=*/true, /*insertionAnchor=*/nullptr,
+            mapping.getDimensionId());
+        if (!replay.isReplayable())
+          continue;
+        bool retain = llvm::any_of(replay.accesses, [&](Operation *access) {
+          auto load = dyn_cast<LoadOp>(access);
+          return load && !canReplayReadAt(load, contract);
+        });
+        if (retain && !analysis.axisRealization(value, axis).physicalized &&
+            failed(realizeFullCoverageDimension(kernel, value, axis)))
+          return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
+  });
+  if (snapshots.wasInterrupted())
     return failure();
   for (size_t contractIndex = 0; contractIndex < contracts.size();
        ++contractIndex) {

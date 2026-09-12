@@ -1335,6 +1335,34 @@ FailureOr<Value> materializeReplayedValue(
       return materializeZeroFragment(builder, location, target);
     };
 
+    if (auto broadcast = dyn_cast<BroadcastOp>(producer)) {
+      auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
+      BroadcastProjection relation =
+          input ? queryAxisProjection(input, fragment) : BroadcastProjection{};
+      if (relation.isExact() && axis < relation.targetToSource.size()) {
+        if (auto inputAxis = relation.targetToSource[axis]) {
+          auto inputMap = cast<AxisMapAttr>(input.getAxisMaps()[*inputAxis]);
+          auto resultMap = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+          if (!(sourceAxisIdentity(inputMap) == sourceAxisIdentity(resultMap)) &&
+              inputMap.getDimensionId() > 0 &&
+              inputMap.getDimensionId() == resultMap.getDimensionId() &&
+              input.getShape()[*inputAxis] == fragment.getShape()[axis]) {
+            // An extent-preserving projection can rename an occurrence. Replay
+            // its input with that input's identity, retaining the output map.
+            FailureOr<Value> replayed = materializeReplayedValue(
+                builder, location, broadcast.getValue(),
+                sourceAxisIdentity(inputMap), blockedExtent, mapping, options);
+            if (failed(replayed))
+              return failure();
+            Value projected = builder.create<BroadcastOp>(
+                location, replaceReplayAxis(fragment, axis), *replayed);
+            mapping.map(current, projected);
+            return projected;
+          }
+        }
+      }
+    }
+
     if (auto load = dyn_cast<LoadOp>(producer)) {
       SmallVector<Value> coordinates;
       for (Value coordinate : load.getCoordinates()) {
@@ -2970,9 +2998,25 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
           static_cast<uint32_t>(PhysicalExprKind::Constant) &&
       currentExtent.getValue() == *staticDimension)
     return success();
+  if (!runtimeDimension && !subregion) {
+    FailureOr<MakeRangeOp> authority = queryExactLogicalRange(ranges);
+    PhysicalExprAttr start = succeeded(authority)
+                                ? queryNonNegativeIndexUpperBound(
+                                      (*authority).getLogicalStart())
+                                : PhysicalExprAttr();
+    if (start &&
+        start.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+        start.getValue() == 0 &&
+        queryLaunchExpression((*authority).getLogicalStop()))
+      runtimeDimension = (*authority).getLogicalStop();
+  }
   if (!runtimeDimension)
     return kernel.emitError(
         "full-coverage physicalization has no runtime or static dimension authority");
+  PhysicalExprAttr coverageBound = queryLaunchExpression(runtimeDimension);
+  if (!coverageBound)
+    return kernel.emitError(
+        "full-coverage physicalization has no launch-visible extent expression");
   if (subregion)
     for (MakeRangeOp range : ranges.roots)
       if (!samePhysicalScalarExpression(range.getLogicalStop(), runtimeDimension))
@@ -3014,6 +3058,7 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
       currentExtent.getSymbol() == parameter.getParameter().getName() &&
       parameter.getParameter().getRole() ==
           static_cast<uint32_t>(ParameterRole::FullCoverage)) {
+    parameter->setAttr(coverageBoundAttr, coverageBound);
     PhysicalParameterBinding binding = queryParameterBinding(parameter);
     if (!binding.isExact() || !binding.dimension ||
         *binding.dimension != coverageDimension)
@@ -3075,6 +3120,7 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
   parameter->setAttr(
       coverageDimensionAttr,
       IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), coverageDimension));
+  parameter->setAttr(coverageBoundAttr, coverageBound);
 
   auto covered = PhysicalExprAttr::get(
       kernel.getContext(),

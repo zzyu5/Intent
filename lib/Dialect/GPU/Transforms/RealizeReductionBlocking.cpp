@@ -1855,6 +1855,22 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
             FragmentType slicedType = replaceExtent(
                 sourceType, access.fragmentAxis, outerSliceExtent);
             SmallVector<Value> coordinates(load.getCoordinates());
+            // Bind companion ranges before replaying any coordinate, so a
+            // compound coordinate and its bounds use the same range values.
+            for (Value original : load.getCoordinates()) {
+              MakeRangeOp range = sourceRange(original);
+              if (!range || mapping.lookupOrNull(range.getResult()))
+                continue;
+              auto rangeType = cast<FragmentType>(range.getResult().getType());
+              auto clone = nested.create<MakeRangeOp>(
+                  nestedLocation, rangeType, range.getStart(),
+                  range.getExtent(), range.getStep(), range.getLogicalStart(),
+                  range.getLogicalStop(), range.getSourceId(),
+                  range.getSourceAxis(), range.getDerived());
+              inheritRangeAuthority(clone, range);
+              mapping.map(range.getResult(), clone.getResult());
+              mapping.map(clone.getResult(), clone.getResult());
+            }
             FailureOr<Value> reducedCoordinate = materializeReplayedValue(
                 nested, nestedLocation,
                 load.getCoordinates()[access.coordinateIndex],
@@ -1874,25 +1890,26 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                  llvm::enumerate(load.getCoordinates())) {
               if (coordinateIndex == access.coordinateIndex)
                 continue;
+              FailureOr<Value> outerCoordinate = materializeReplayedValue(
+                  nested, nestedLocation, original, plan.sourceIdentity,
+                  outerSliceExtent, mapping);
+              if (failed(outerCoordinate)) {
+                bodyFailed = true;
+                failureReason =
+                    "source coordinate could not adopt the outer slice";
+                return;
+              }
+              coordinates[coordinateIndex] = *outerCoordinate;
               MakeRangeOp range = sourceRange(original);
               if (!range)
                 continue;
-              if (!mapping.lookupOrNull(range.getResult())) {
-                auto rangeType = cast<FragmentType>(range.getResult().getType());
-                auto clone = nested.create<MakeRangeOp>(
-                    nestedLocation, rangeType, range.getStart(),
-                    range.getExtent(), range.getStep(), range.getLogicalStart(),
-                    range.getLogicalStop(), range.getSourceId(),
-                    range.getSourceAxis(), range.getDerived());
-                inheritRangeAuthority(clone, range);
-                mapping.map(range.getResult(), clone.getResult());
-              }
               auto rangeType = cast<FragmentType>(range.getResult().getType());
               replayAxes.emplace_back(
                   sourceAxisIdentity(range),
                   cast<PhysicalExprAttr>(rangeType.getShape()[0]));
               FailureOr<Value> replayedCoordinate = materializeReplayedValue(
-                  nested, nestedLocation, original, sourceAxisIdentity(range),
+                  nested, nestedLocation, *outerCoordinate,
+                  sourceAxisIdentity(range),
                   cast<PhysicalExprAttr>(rangeType.getShape()[0]), mapping);
               if (failed(replayedCoordinate)) {
                 bodyFailed = true;
@@ -2476,16 +2493,34 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
               fill = *zero;
             }
             SmallVector<Value> coordinates(load.getCoordinates());
-            FailureOr<Value> reducedCoordinate = materializeReplayedValue(
-                nested, nestedLocation,
-                load.getCoordinates()[access.coordinateIndex],
-                plan.sourceIdentity, chunkExtent, mapping, replayOptions);
-            if (failed(reducedCoordinate)) {
-              bodyFailed = true;
-              bodyFailure = "could not replay reduced source coordinate";
-              return;
+            for (Value &coordinate : coordinates) {
+              FailureOr<Value> replayedCoordinate = materializeReplayedValue(
+                  nested, nestedLocation, coordinate, plan.sourceIdentity,
+                  chunkExtent, mapping, replayOptions);
+              if (failed(replayedCoordinate)) {
+                bodyFailed = true;
+                bodyFailure = "could not replay source coordinate";
+                return;
+              }
+              coordinate = *replayedCoordinate;
+              auto coordinateType =
+                  dyn_cast<FragmentType>(coordinate.getType());
+              PhysicalAxisProjection projection = queryFragmentAxis(
+                  coordinate.getType(), sourceAxisIdentity(range));
+              if (coordinateType && projection.isExact()) {
+                FailureOr<Value> projected = materializeBroadcastToFragment(
+                    nested, nestedLocation, coordinate,
+                    replaceExtent(coordinateType, projection.fragmentAxis,
+                                  chunkExtent));
+                if (failed(projected)) {
+                  bodyFailed = true;
+                  bodyFailure =
+                      "source coordinate cannot adopt the reduction chunk";
+                  return;
+                }
+                coordinate = *projected;
+              }
             }
-            coordinates[access.coordinateIndex] = *reducedCoordinate;
             Value blockedLoad = nested.create<LoadOp>(
                 nestedLocation, blockedRoot, load.getResource(), coordinates,
                 valid, fill, load.getSourceAxes());

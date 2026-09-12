@@ -37,6 +37,8 @@ inline constexpr llvm::StringLiteral segmentLengthAttr =
     "intent_gpu.segment_length";
 inline constexpr llvm::StringLiteral coverageDimensionAttr =
     "intent_gpu.coverage_dimension";
+inline constexpr llvm::StringLiteral coverageBoundAttr =
+    "intent_gpu.coverage_bound";
 inline constexpr llvm::StringLiteral reductionSourcesAttr =
     "intent_gpu.reduction_sources";
 inline constexpr llvm::StringLiteral parameterSourceAttr =
