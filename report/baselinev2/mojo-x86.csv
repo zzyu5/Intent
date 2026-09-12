@@ -1,4 +1,5 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
+varlen_causal_conv1d,U5120-D4096-W4-bf16-8cores-host,57.424201,105.660516,0.543478,pass,既有变长卷积及final-state两kernel完整调用；原长度2048/1536/1024/512、D4096、bf16、chunk64；同算法PyTorch eager CPU reference，单NUMA8核；含ABI、输出分配与同步。
 radix2_fft,B1024-N1024-fp32-complex-8cores-host,6.788357,8.708498,0.779510,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
 viterbi,B64-T256-S64-fp32-8cores-host,14.427981,29.253954,0.493198,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
 smith_waterman,B128-Q128-R128-i32-8cores-host,1.450775,470.877796,0.003081,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
@@ -24,6 +25,9 @@ gelu,8192x4096-fp16-tanh-8cores-host,11.966874,21.635796,0.553105,pass,既有 ex
 relu,8192x4096-fp16-8cores-host,9.773445,11.399792,0.857335,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
 flaggems_addcmul,B64-C128-L4096-bf16-8cores-host,10.484505,22.202588,0.472220,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
 flaggems_logsumexp,8192x8192-fp32-8cores-host,22.470132,50.243201,0.447227,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+scalar_table_lookup,C65536-D128-M65536-i32-f32-8cores-host,4.136016,4.869315,0.849404,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+csr_spmv,32768x32768-nnz32-fp32-8cores-host,0.409692,0.703707,0.582191,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
+roi_align_center_sample,B8-C64-H128-W128-R2048-7x7-fp32-8cores-host,7.184394,45.242677,0.158797,pass,既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。
 causal_attention_f32,B8-S128-D32-f32-8cores,0.250459,0.307772,0.813779,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。独立 Mojo online attention source；沿用 CPU f32 contraction 容差；分段与归约括号可不同。
 causal_linear_attention_f32,B8-S128-D32-f32-8cores,0.210153,0.237460,0.885004,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。独立 Mojo chunked linear attention source；输出包含最终状态；沿用 CPU f32 contraction 容差。
 batched_row_affine,17x257x4093-f32-8cores,1.902721,1.936592,0.982510,pass,同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。Source 调用安装的 Modular/MAX CPU elementwise。

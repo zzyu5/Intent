@@ -6,10 +6,12 @@ from .activation import CASES as ACTIVATION
 from .layout import CASES as LAYOUT
 from .optimization import CASES as OPTIMIZATION
 from .indexing import CASES as INDEXING
+from .sparse import CASES as SPARSE
+from .vision import CASES as VISION
 from .convolution import CASES as CONVOLUTION
 from .factorization import CASES as FACTORIZATION
 from .sorting import CASES as SORTING
 from .dynamic_programming import CASES as DYNAMIC_PROGRAMMING
 from .spectral import CASES as SPECTRAL
 
-CASES = {**POINTWISE, **NORMALIZATION, **CONTRACTION, **ATTENTION, **ACTIVATION, **LAYOUT, **OPTIMIZATION, **INDEXING, **CONVOLUTION, **FACTORIZATION, **SORTING, **DYNAMIC_PROGRAMMING, **SPECTRAL}
+CASES = {**POINTWISE, **NORMALIZATION, **CONTRACTION, **ATTENTION, **ACTIVATION, **LAYOUT, **OPTIMIZATION, **INDEXING, **SPARSE, **VISION, **CONVOLUTION, **FACTORIZATION, **SORTING, **DYNAMIC_PROGRAMMING, **SPECTRAL}

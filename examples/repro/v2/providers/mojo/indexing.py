@@ -2,6 +2,7 @@ import torch
 
 from kernels.backward.embedding import embedding_forward_lookup_bf16
 from kernels.indexing.relations import index_select_rows
+from kernels.indexing.relations import scalar_table_lookup
 from ...model import Tolerance
 from .common import prepare_host_comparison
 
@@ -20,4 +21,12 @@ def index_select(context):
         (source, indices), "index_select", Tolerance(atol=0.0))
 
 
-CASES = {"embedding_lookup": embedding, "index_select": index_select}
+def scalar_lookup(context):
+    labels = torch.randint(0, 65536, (65536,), dtype=torch.int32)
+    table = torch.randn((65536, 128), dtype=torch.float32)
+    return prepare_host_comparison(context, scalar_table_lookup,
+        (labels, table), "scalar_table_lookup", Tolerance(atol=0.0))
+
+
+CASES = {"embedding_lookup": embedding, "index_select": index_select,
+         "scalar_table_lookup": scalar_lookup}

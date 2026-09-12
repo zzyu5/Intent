@@ -154,6 +154,7 @@ TILELANG = (
 
 
 MOJO = (
+    Entry("varlen_causal_conv1d", "U5120-D4096-W4-bf16-8cores-host", "varlen_aligned_causal_depthwise_conv1d + varlen_causal_conv1d_final_state", ("convolution/varlen.py:varlen_aligned_causal_depthwise_conv1d", "convolution/varlen.py:varlen_causal_conv1d_final_state"), "source/pytorch/cpu_runtime.py"),
     Entry("radix2_fft", "B1024-N1024-fp32-complex-8cores-host", "radix2_fft", ("spectral/fft.py:radix2_fft",), "source/pytorch/cpu_runtime.py"),
     Entry("viterbi", "B64-T256-S64-fp32-8cores-host", "viterbi_decode", ("dynamic_programming/viterbi.py:viterbi_decode",), "source/pytorch/cpu_runtime.py"),
     Entry("smith_waterman", "B128-Q128-R128-i32-8cores-host", "smith_waterman_score", ("dynamic_programming/smith_waterman.py:smith_waterman_score",), "source/pytorch/cpu_runtime.py"),
@@ -179,6 +180,9 @@ MOJO = (
     Entry("relu", "8192x4096-fp16-8cores-host", "relu_forward", ("activation/pointwise.py:relu_forward",), "source/pytorch/cpu_runtime.py"),
     Entry("flaggems_addcmul", "B64-C128-L4096-bf16-8cores-host", "addcmul_broadcast_bf16", ("activation/pointwise.py:addcmul_broadcast_bf16",), "source/pytorch/cpu_runtime.py"),
     Entry("flaggems_logsumexp", "8192x8192-fp32-8cores-host", "row_logsumexp", ("normalization/logsumexp.py:row_logsumexp",), "source/pytorch/cpu_runtime.py"),
+    Entry("scalar_table_lookup", "C65536-D128-M65536-i32-f32-8cores-host", "scalar_table_lookup", ("indexing/relations.py:scalar_table_lookup",), "source/pytorch/cpu_runtime.py"),
+    Entry("csr_spmv", "32768x32768-nnz32-fp32-8cores-host", "csr_spmv", ("sparse/csr_spmv.py:csr_spmv",), "source/pytorch/cpu_runtime.py"),
+    Entry("roi_align_center_sample", "B8-C64-H128-W128-R2048-7x7-fp32-8cores-host", "roi_align_center_sample", ("vision/roi_align.py:roi_align_center_sample",), "source/pytorch/cpu_runtime.py"),
     Entry("causal_attention_f32", "B8-S128-D32-f32-8cores", "causal_attention_f32", ("streaming/attention_f32.py:causal_attention_f32",), "source/mojo/intentdsl/attention/causal/causal_runtime.py"),
     Entry("causal_linear_attention_f32", "B8-S128-D32-f32-8cores", "causal_linear_attention_f32", ("streaming/attention_f32.py:causal_linear_attention_f32",), "source/mojo/intentdsl/attention/linear/linear_runtime.py"),
     Entry("batched_row_affine", "17x257x4093-f32-8cores", "batched_row_affine", ("pointwise/batched_affine.py:batched_row_affine",), "source/mojo/modular/pointwise/batched_affine/batched_affine_runtime.py"),

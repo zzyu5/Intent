@@ -58,6 +58,57 @@ def transpose(x):
     return x.T.contiguous()
 
 
+def scalar_table_lookup(labels, table):
+    return table[labels.long()]
+
+
+def csr_spmv(row_offsets, column_indices, values, vector):
+    return (
+        values.reshape(32768, 32)
+        * vector[column_indices.long()].reshape(32768, 32)
+    ).sum(dim=1)
+
+
+def roi_align_center_sample(feature, rois):
+    batch = rois[:, 0].long()
+    start_x = rois[:, 1]
+    start_y = rois[:, 2]
+    end_x = rois[:, 3]
+    end_y = rois[:, 4]
+    bin_width = (end_x - start_x).clamp_min(1.0) / 7
+    bin_height = (end_y - start_y).clamp_min(1.0) / 7
+    output = torch.empty(
+        (2048, 64, 7, 7),
+        device=feature.device,
+        dtype=torch.float32,
+    )
+    for pooled_y in range(7):
+        sample_y = start_y + (pooled_y + 0.5) * bin_height
+        y_low = sample_y.to(torch.int32).clamp(0, 127).long()
+        y_high = (y_low + 1).clamp_max(127)
+        y_fraction = sample_y - y_low.float()
+        for pooled_x in range(7):
+            sample_x = start_x + (pooled_x + 0.5) * bin_width
+            x_low = sample_x.to(torch.int32).clamp(0, 127).long()
+            x_high = (x_low + 1).clamp_max(127)
+            x_fraction = sample_x - x_low.float()
+            top = (
+                feature[batch, :, y_low, x_low]
+                * (1.0 - x_fraction[:, None])
+                + feature[batch, :, y_low, x_high] * x_fraction[:, None]
+            )
+            bottom = (
+                feature[batch, :, y_high, x_low]
+                * (1.0 - x_fraction[:, None])
+                + feature[batch, :, y_high, x_high] * x_fraction[:, None]
+            )
+            output[:, :, pooled_y, pooled_x] = (
+                top * (1.0 - y_fraction[:, None])
+                + bottom * y_fraction[:, None]
+            )
+    return output
+
+
 def index_select(source, indices):
     return torch.index_select(source, 0, indices)
 
@@ -70,6 +121,20 @@ def conv1d_same(x, weight):
     width = weight.numel()
     patches = F.pad(x.float(), (width // 2, width // 2)).unfold(-1, width, 1)
     return (patches * weight.float()).sum(dim=-1).to(x.dtype)
+
+
+def varlen_causal_conv1d(x, offsets, weight, bias):
+    width = weight.shape[1]
+    outputs, states = [], []
+    boundaries = offsets.tolist()
+    for start, end in zip(boundaries, boundaries[1:]):
+        values = x[start:end]
+        padded = torch.nn.functional.pad(values.float(), (0, 0, width - 1, 0))
+        accumulation = (padded.unfold(0, width, 1) * weight).sum(dim=-1) + bias
+        outputs.append((accumulation * torch.sigmoid(accumulation)).to(x.dtype))
+        state = torch.nn.functional.pad(values, (0, 0, max(0, width - values.shape[0]), 0))
+        states.append(state[-width:])
+    return torch.cat(outputs, dim=0), torch.stack(states, dim=0)
 
 
 def triangular_solve(lower, solution):
