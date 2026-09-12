@@ -49,7 +49,15 @@ y[rows, columns] = value * scale
 window = columns[begin:end]
 ```
 
-`domain(begin,end,step=1)` 使用半开整数序列。`axis[begin:end]` 产生source-derived连续subregion，保留source axis、bounds、empty/tail与provenance，不隐式clamp。
+`domain(begin,end,step=1)` 使用半开整数序列，`step` 必须为正。需要逆序时，用正向计数器显式计算坐标：
+
+```python
+for ordinal in I.domain(0, n):
+    i = n - 1 - ordinal
+    ...
+```
+
+`axis[begin:end]` 产生source-derived连续subregion，保留source axis、bounds、empty/tail与provenance，不隐式clamp。
 
 遍历subregion得到source logical coordinate；`I.indices(subregion)`也返回source coordinates。`I.indices`产生的是logical `index` tensor，其数值是source coordinate，同时canonical relation保存source identity、source axis与member mapping；不能在helper、slice或shape transform后只留下普通`i32/i64`数值。非连续、重复或重排成员使用indexed relation。
 
