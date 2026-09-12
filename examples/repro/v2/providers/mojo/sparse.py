@@ -1,6 +1,7 @@
 import torch
 
 from kernels.sparse.csr_spmv import csr_spmv
+from kernels.sparse.csr_spmm import csr_spmm
 
 from ...model import Tolerance
 from .common import prepare_host_comparison
@@ -19,4 +20,18 @@ def csr(context):
         Tolerance(atol=2.0e-5))
 
 
-CASES = {"csr_spmv": csr}
+def spmm(context):
+    rows = columns = 8192
+    nonzeros_per_row = 32
+    features = 128
+    nonzeros = rows * nonzeros_per_row
+    row_offsets = torch.arange(rows + 1, dtype=torch.int32) * nonzeros_per_row
+    column_indices = torch.randint(0, columns, (nonzeros,), dtype=torch.int32)
+    values = torch.randn((nonzeros,), dtype=torch.float32) * 0.1
+    dense = torch.randn((columns, features), dtype=torch.float32)
+    return prepare_host_comparison(context, csr_spmm,
+        (row_offsets, column_indices, values, dense), "csr_spmm",
+        Tolerance(atol=3.0e-5))
+
+
+CASES = {"csr_spmv": csr, "csr_spmm": spmm}

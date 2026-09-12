@@ -70,6 +70,10 @@ def max_pool2d(x):
     return F.max_pool2d(x, kernel_size=3, stride=2, padding=1)
 
 
+def max_pool2d_with_indices(x):
+    return F.max_pool2d(x, kernel_size=3, stride=2, padding=1, return_indices=True)
+
+
 def integer_log2_floor(values):
     value = values.clone()
     result = torch.zeros_like(values)
@@ -121,6 +125,19 @@ def cumsum(x):
     return torch.cumsum(x, dim=1)
 
 
+def batch_norm_training(x, weight, bias, running_mean, running_variance, epsilon, momentum):
+    values = x.float()
+    variance, mean = torch.var_mean(values, dim=(0, 2), unbiased=False)
+    rstd = torch.rsqrt(variance + epsilon)
+    output = ((values - mean[None, :, None]) * rstd[None, :, None]
+              * weight[None, :, None] + bias[None, :, None]).to(x.dtype)
+    count = x.shape[0] * x.shape[2]
+    running_mean.copy_((1.0 - momentum) * running_mean + momentum * mean)
+    running_variance.copy_((1.0 - momentum) * running_variance
+                           + momentum * variance * count / (count - 1))
+    return running_mean, running_variance, output, mean, rstd
+
+
 def histogram(samples):
     return torch.bincount(samples.to(torch.int64), minlength=256).to(torch.int32)
 
@@ -149,6 +166,12 @@ def csr_spmv(row_offsets, column_indices, values, vector):
         values.reshape(32768, 32)
         * vector[column_indices.long()].reshape(32768, 32)
     ).sum(dim=1)
+
+
+def csr_spmm(row_offsets, column_indices, values, dense):
+    gathered = dense[column_indices.long()].reshape(8192, 32, 128)
+    coefficients = values.reshape(8192, 32, 1)
+    return (coefficients * gathered).sum(dim=1)
 
 
 def roi_align_center_sample(feature, rois):

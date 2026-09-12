@@ -154,6 +154,7 @@ TILELANG = (
 
 
 MOJO = (
+    Entry("batch_norm_training", "B32-C64-S4096-fp16-8cores-host", "batch_norm_training", ("normalization/batch_norm.py:batch_norm_training",), "source/pytorch/cpu_runtime.py"),
     Entry("insertion_top_k", "1024x4093-k8-fp32-8cores-host", "insertion_top_k", ("sampling/top_k.py:insertion_top_k",), "source/pytorch/cpu_runtime.py"),
     Entry("histogram", "N8388608-bins256-f32-to-i32-8cores-host", "histogram_256", ("statistics/histogram.py:histogram_256",), "source/pytorch/cpu_runtime.py"),
     Entry("cholesky", "B256-N16-fp32-8cores-host", "batched_cholesky_lower", ("factorization/cholesky.py:batched_cholesky_lower",), "source/pytorch/cpu_runtime.py"),
@@ -192,8 +193,10 @@ MOJO = (
     Entry("flaggems_logsumexp", "8192x8192-fp32-8cores-host", "row_logsumexp", ("normalization/logsumexp.py:row_logsumexp",), "source/pytorch/cpu_runtime.py"),
     Entry("scalar_table_lookup", "C65536-D128-M65536-i32-f32-8cores-host", "scalar_table_lookup", ("indexing/relations.py:scalar_table_lookup",), "source/pytorch/cpu_runtime.py"),
     Entry("csr_spmv", "32768x32768-nnz32-fp32-8cores-host", "csr_spmv", ("sparse/csr_spmv.py:csr_spmv",), "source/pytorch/cpu_runtime.py"),
+    Entry("csr_spmm", "8192x8192-nnz32-features128-fp32-8cores-host", "csr_spmm", ("sparse/csr_spmm.py:csr_spmm",), "source/pytorch/cpu_runtime.py"),
     Entry("roi_align_center_sample", "B8-C64-H128-W128-R2048-7x7-fp32-8cores-host", "roi_align_center_sample", ("vision/roi_align.py:roi_align_center_sample",), "source/pytorch/cpu_runtime.py"),
     Entry("max_pool2d", "B8-C32-H128-W128-K3-S2-P1-fp16-8cores-host", "max_pool2d", ("vision/max_pool.py:max_pool2d",), "source/pytorch/cpu_runtime.py"),
+    Entry("flaggems_max_pool2d_with_indices", "B8-C32-H128-W128-K3-S2-P1-fp16-8cores-host", "max_pool2d_with_indices", ("vision/max_pool_with_indices.py:max_pool2d_with_indices",), "source/pytorch/cpu_runtime.py"),
     Entry("integer_log2_floor", "N262144-i32-8cores-host", "integer_log2_floor", ("pointwise/while_loop.py:integer_log2_floor",), "source/pytorch/cpu_runtime.py"),
     Entry("rope_qk", "B4-S4096-QH32-KVH8-D128-fp16-8cores-host", "rotary_qk_inplace", ("position/rope.py:rotary_qk_inplace",), "source/pytorch/cpu_runtime.py"),
     Entry("greedy_nms", "B32-N1024-fp32-8cores-host", "greedy_nms", ("vision/nms.py:greedy_nms",), "source/pytorch/cpu_runtime.py"),

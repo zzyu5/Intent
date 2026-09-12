@@ -1,5 +1,6 @@
 import torch
 from kernels.vision.max_pool import max_pool2d
+from kernels.vision.max_pool_with_indices import max_pool2d_with_indices
 from kernels.vision.nms import greedy_nms
 from kernels.vision.roi_align import roi_align_center_sample
 
@@ -30,6 +31,17 @@ def max_pool(context):
         Tolerance(atol=0.0))
 
 
+def max_pool_with_indices(context):
+    x = torch.randn((8, 32, 128, 128), dtype=torch.float16)
+    return prepare_host_comparison(
+        context,
+        max_pool2d_with_indices,
+        (x,),
+        "max_pool2d_with_indices",
+        (Tolerance(atol=0.0), Tolerance(atol=0.0)),
+    )
+
+
 def nms(context):
     upper_left = torch.rand((32, 1024, 2), dtype=torch.float32) * 0.8
     size = torch.rand_like(upper_left) * 0.2 + 0.01
@@ -40,4 +52,5 @@ def nms(context):
 
 
 CASES = {"roi_align_center_sample": roi_align, "max_pool2d": max_pool,
+         "flaggems_max_pool2d_with_indices": max_pool_with_indices,
          "greedy_nms": nms}
