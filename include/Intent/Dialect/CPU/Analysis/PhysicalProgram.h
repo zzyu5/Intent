@@ -42,6 +42,7 @@ private:
 };
 
 bool isMatrixContraction(mlir::linalg::GenericOp operation);
+bool isElementwiseContiguousScan(ScanOp operation);
 mlir::LogicalResult verifyCPUProgram(mlir::ModuleOp module, bool realized);
 
 }

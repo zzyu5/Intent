@@ -80,8 +80,49 @@ def integer_log2_floor(values):
     return result
 
 
+def rope_qk(query, key, cosine, sine):
+    half = 64
+    query_first = query[..., :half].clone()
+    query_second = query[..., half:].clone()
+    key_first = key[..., :half].clone()
+    key_second = key[..., half:].clone()
+    cos = cosine[..., :half]
+    sin = sine[..., :half]
+    query[..., :half] = query_first * cos - query_second * sin
+    query[..., half:] = query_second * cos + query_first * sin
+    key[..., :half] = key_first * cos - key_second * sin
+    key[..., half:] = key_second * cos + key_first * sin
+    return query, key
+
+
+def greedy_nms(boxes, threshold):
+    keep = torch.zeros((32, 1024), dtype=torch.bool, device=boxes.device)
+    for batch in range(32):
+        suppressed = torch.zeros((1024,), dtype=torch.bool, device=boxes.device)
+        for candidate in range(1024):
+            if suppressed[candidate]:
+                continue
+            keep[batch, candidate] = True
+            candidate_box = boxes[batch, candidate]
+            remaining = boxes[batch, candidate + 1 :]
+            if remaining.numel() == 0:
+                continue
+            upper_left = torch.maximum(candidate_box[:2], remaining[:, :2])
+            lower_right = torch.minimum(candidate_box[2:], remaining[:, 2:])
+            intersection = (lower_right - upper_left).clamp_min(0.0).prod(dim=1)
+            candidate_area = (candidate_box[2:] - candidate_box[:2]).prod()
+            remaining_area = (remaining[:, 2:] - remaining[:, :2]).prod(dim=1)
+            overlap = intersection / (candidate_area + remaining_area - intersection)
+            suppressed[candidate + 1 :] |= overlap > threshold
+    return keep
+
+
 def cumsum(x):
     return torch.cumsum(x, dim=1)
+
+
+def histogram(samples):
+    return torch.bincount(samples.to(torch.int64), minlength=256).to(torch.int32)
 
 
 def nucleus(probabilities, threshold):
@@ -223,6 +264,23 @@ def bitonic_sort(values):
             stride //= 2
         sequence *= 2
     return result
+
+
+def insertion_top_k(logits):
+    values = torch.full((logits.shape[0], 8), -torch.inf, dtype=logits.dtype)
+    indices = torch.full((logits.shape[0], 8), -1, dtype=torch.int32)
+    for candidate in range(logits.shape[1]):
+        carry_value = logits[:, candidate]
+        carry_index = torch.full((logits.shape[0],), candidate, dtype=torch.int32)
+        for slot in range(8):
+            current_value = values[:, slot].clone()
+            current_index = indices[:, slot].clone()
+            swap = carry_value > current_value
+            values[:, slot] = torch.where(swap, carry_value, current_value)
+            indices[:, slot] = torch.where(swap, carry_index, current_index)
+            carry_value = torch.where(swap, current_value, carry_value)
+            carry_index = torch.where(swap, current_index, carry_index)
+    return values, indices
 
 
 def radix2_fft(input_real, input_imag, twiddle_real, twiddle_imag):

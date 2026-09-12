@@ -183,8 +183,21 @@ cpu::ImplementationRegistry implementations() {
   result.add(std::move(contraction));
   result.add({"mojo.vector", [](Operation *op) {
       if (auto generic = dyn_cast<linalg::GenericOp>(op)) return !isMatrixContraction(generic);
-      return isa<cpu::ReduceOp, cpu::ScanOp, func::FuncOp>(op);
+      return isa<cpu::ReduceOp, cpu::HistogramOp, func::FuncOp>(op);
     }, vectorLegal, parameters, {}, {}});
+  auto scanParameters = [](bool vectorized) {
+    return [vectorized](Builder &b, const Configuration &config) {
+      NamedAttrList fields(parameters(b, config));
+      fields.append("scan_width", b.getI64IntegerAttr(vectorized ? config.parameter("vector_width") : 1));
+      return fields.getDictionary(b.getContext());
+    };
+  };
+  result.add({"mojo.scan_scalar", [](Operation *op) { return isa<cpu::ScanOp>(op); },
+      vectorLegal, scanParameters(false), {}, {}});
+  result.add({"mojo.scan_vector", [](Operation *op) { return isa<cpu::ScanOp>(op); },
+      [](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
+        return vectorLegal(op, capabilities, config) && isElementwiseContiguousScan(cast<cpu::ScanOp>(op));
+      }, scanParameters(true), {}, {}});
   return result;
 }
 

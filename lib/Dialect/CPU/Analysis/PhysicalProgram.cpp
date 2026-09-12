@@ -115,6 +115,9 @@ SmallVector<MemoryAccess> PhysicalProgramAnalysis::accesses(Operation *scope) {
     } else if (auto scan = dyn_cast<ScanOp>(operation)) {
       for (Value input : scan.getSources()) add(input, true, false);
       for (Value output : scan.getOutputs()) add(output, false, true);
+    } else if (auto histogram = dyn_cast<HistogramOp>(operation)) {
+      add(histogram.getValues(), true, false); add(histogram.getValid(), true, false);
+      add(histogram.getOutput(), false, true);
     } else if (isa<RegionFoldOp, RegionScanOp>(operation)) {
       RegionProgram program(operation);
       for (Value input : program.sources()) add(input, true, false);
@@ -160,6 +163,7 @@ SmallVector<AllocationFacts> PhysicalProgramAnalysis::allocations() {
       else if (auto quantize = dyn_cast<QuantizeOp>(user)) writes = quantize.getOutput() == value;
       else if (auto dot = dyn_cast<QuantizedDotOp>(user)) writes = dot.getOutput() == value;
       else if (auto scan = dyn_cast<ScanOp>(user)) writes = llvm::is_contained(scan.getOutputs(), value);
+      else if (auto histogram = dyn_cast<HistogramOp>(user)) writes = histogram.getOutput() == value;
       else if (!isa<memref::LoadOp, memref::DimOp, memref::DeallocOp, ReduceOp, QuantizedDotOp>(user))
         multiple = true;
       if (writes) {
@@ -219,12 +223,28 @@ LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
     }
   }
   function.walk([&](Operation *operation) {
-    if (realized && (isa<RegionFoldOp, RegionScanOp, ReduceOp, ScanOp, QuantizeOp, QuantizedDotOp>(operation) || operation->getName().getDialectNamespace() == "linalg")) {
+    if (realized && (isa<RegionFoldOp, RegionScanOp, ReduceOp, ScanOp, HistogramOp, QuantizeOp, QuantizedDotOp>(operation) || operation->getName().getDialectNamespace() == "linalg")) {
       operation->emitError("CPU structured operation has not been materialized for the provider");
       invalid = true;
     }
   });
   return failure(invalid);
+}
+
+bool isElementwiseContiguousScan(ScanOp operation) {
+  auto type = cast<MemRefType>(operation.getSources()[0].getType());
+  if (operation.getAxis() + 1 != static_cast<uint64_t>(type.getRank())) return false;
+  auto contiguous = [](Value memory) {
+    auto type = cast<MemRefType>(memory.getType());
+    SmallVector<int64_t> strides;
+    int64_t offset;
+    return !type.getElementType().isInteger(1) && succeeded(type.getStridesAndOffset(strides, offset)) && strides.back() == 1;
+  };
+  return llvm::all_of(operation.getSources(), contiguous) && llvm::all_of(operation.getOutputs(), contiguous) &&
+      llvm::all_of(operation.getCombine().front().without_terminator(), [](Operation &instruction) {
+        return isa<arith::ConstantOp>(instruction) ||
+            (instruction.hasTrait<OpTrait::Elementwise>() && instruction.getNumResults() == 1);
+      });
 }
 
 LogicalResult verifyCPUProgram(ModuleOp module, bool realized) {

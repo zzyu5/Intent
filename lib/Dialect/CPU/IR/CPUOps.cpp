@@ -96,6 +96,18 @@ LogicalResult ScanOp::verify() {
   return success();
 }
 
+LogicalResult HistogramOp::verify() {
+  auto values = cast<MemRefType>(getValues().getType());
+  auto valid = cast<MemRefType>(getValid().getType());
+  auto output = cast<MemRefType>(getOutput().getType());
+  if (!isa<IntegerType, IndexType>(values.getElementType()) || values.getElementType().isInteger(1) ||
+      values.getShape() != valid.getShape() || !valid.getElementType().isInteger(1) ||
+      output.getRank() != 1 || !isa<IntegerType>(output.getElementType()) || output.getElementType().isInteger(1) ||
+      (!output.isDynamicDim(0) && output.getDimSize(0) <= 0))
+    return emitOpError("histogram requires integer values, a matching bool predicate and a nonempty integer-bin vector");
+  return success();
+}
+
 namespace {
 bool recordType(Type type, int64_t bytes) {
   auto memory = dyn_cast<MemRefType>(type);

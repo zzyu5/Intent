@@ -51,7 +51,7 @@ void forwardDestinations(func::FuncOp function) {
         if (auto view = dyn_cast<memref::SubViewOp>(user)) aliases.push_back(view.getResult());
         else if (auto cast = dyn_cast<memref::CastOp>(user)) aliases.push_back(cast.getResult());
         else if (!isa<memref::CopyOp, memref::DimOp, memref::LoadOp, memref::StoreOp,
-                      linalg::LinalgOp, ReduceOp, ScanOp, QuantizedDotOp>(user)) legal = false;
+                      linalg::LinalgOp, ReduceOp, ScanOp, HistogramOp, QuantizedDotOp>(user)) legal = false;
         Operation *ancestor = copy->getBlock()->findAncestorOpInBlock(*user);
         if (!ancestor || (ancestor != copy && !ancestor->isBeforeInBlock(copy))) legal = false;
       }

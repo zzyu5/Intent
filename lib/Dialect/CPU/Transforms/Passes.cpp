@@ -152,7 +152,8 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
   }
   if (failed(normalize(module))) return failure();
   for (auto function : functions)
-    if (failed(foldUniformComputations(function)) || failed(fuseStructuredComputations(function))) return failure();
+    if (failed(realizeHistograms(function)) || failed(foldUniformComputations(function)) ||
+        failed(fuseStructuredComputations(function))) return failure();
   if (failed(normalize(module))) return failure();
   for (auto function : functions) {
     if (failed(reusePreparedInputs(function)) ||

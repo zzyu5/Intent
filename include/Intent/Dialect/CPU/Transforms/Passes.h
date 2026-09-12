@@ -31,6 +31,7 @@ mlir::LogicalResult groupQuantizedDots(mlir::func::FuncOp function,
                                      const ImplementationRegistry &implementations);
 void forwardCPUOutputs(mlir::func::FuncOp function);
 mlir::LogicalResult materializeStructuredComputations(mlir::func::FuncOp function);
+mlir::LogicalResult realizeHistograms(mlir::func::FuncOp function);
 mlir::LogicalResult fuseIntermediateBuffers(mlir::func::FuncOp function);
 mlir::LogicalResult fuseReductionTraversals(mlir::func::FuncOp function);
 mlir::LogicalResult blockContractions(mlir::func::FuncOp function,

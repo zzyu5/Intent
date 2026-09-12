@@ -63,17 +63,23 @@ def prepare_host_comparison(context, definition, arguments, reference, tolerance
                               tuning_config=context.tuning_config, constexprs=constexprs)
     runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
-    def side(function):
+    def side(function, program=None):
         state = {}
 
         def launch():
             state["output"] = function(*arguments)
 
-        return PreparedLaunch(launch, lambda: state["output"])
+        def outputs():
+            if program is not None:
+                for key, winner in program.winners.items():
+                    print(f"mojo: selected {program.candidates[winner]}; candidate_ms={program.timings[key]}", flush=True)
+            return state["output"]
+
+        return PreparedLaunch(launch, outputs)
 
     report_stage("adapter_preparation")
     return PreparedComparison(
-        side(artifact.run), side(getattr(runtime, reference)), tolerance,
+        side(artifact.run, artifact._namespace["native_program"]), side(getattr(runtime, reference)), tolerance,
         cuda_graph=False, device_type="cpu", cpu_host_timing=True,
         note="既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。",
     )

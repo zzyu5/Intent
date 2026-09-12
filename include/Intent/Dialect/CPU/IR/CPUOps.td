@@ -51,6 +51,14 @@ def IntentCPU_ScanYieldOp : IntentCPU_Op<"scan_yield", [Pure, Terminator,
   let arguments = (ins Variadic<AnyType>:$values);
 }
 
+def IntentCPU_HistogramOp : IntentCPU_Op<"histogram"> {
+  let summary = "Typed active values contributing to logical integer bins";
+  let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$values,
+      Arg<AnyMemRef, "", [MemRead]>:$valid,
+      Arg<AnyMemRef, "", [MemWrite]>:$output);
+  let hasVerifier = 1;
+}
+
 def IntentCPU_QuantizeOp : IntentCPU_Op<"quantize"> {
   let summary = "Quantize complete records into invocation-owned storage";
   let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$input,

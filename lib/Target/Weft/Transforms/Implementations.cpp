@@ -232,7 +232,7 @@ cpu::ImplementationRegistry implementations() {
     }, formTile, {}, {true, true, true}});
   result.add({"weft.structured", [](Operation *op) {
       if (auto generic = dyn_cast<linalg::GenericOp>(op)) return !isMatrixContraction(generic);
-      return isa<cpu::ReduceOp, cpu::ScanOp>(op);
+      return isa<cpu::ReduceOp, cpu::ScanOp, cpu::HistogramOp>(op);
     }, legal, [](Builder &b, const Configuration &config) {
       return b.getDictionaryAttr({b.getNamedAttr("panel", b.getI64IntegerAttr(std::min<int64_t>(4, config.tileN)))});
     }, {}, {}, {}, [](ImplementationAttr binding) {

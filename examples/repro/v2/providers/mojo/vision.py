@@ -1,7 +1,6 @@
 import torch
-import torch.nn.functional as F
-
 from kernels.vision.max_pool import max_pool2d
+from kernels.vision.nms import greedy_nms
 from kernels.vision.roi_align import roi_align_center_sample
 
 from ...model import Tolerance
@@ -31,4 +30,14 @@ def max_pool(context):
         Tolerance(atol=0.0))
 
 
-CASES = {"roi_align_center_sample": roi_align, "max_pool2d": max_pool}
+def nms(context):
+    upper_left = torch.rand((32, 1024, 2), dtype=torch.float32) * 0.8
+    size = torch.rand_like(upper_left) * 0.2 + 0.01
+    boxes = torch.cat((upper_left, upper_left + size), dim=2)
+    threshold = 0.5
+    return prepare_host_comparison(context, greedy_nms, (boxes, threshold),
+        "greedy_nms", Tolerance(atol=0.0))
+
+
+CASES = {"roi_align_center_sample": roi_align, "max_pool2d": max_pool,
+         "greedy_nms": nms}

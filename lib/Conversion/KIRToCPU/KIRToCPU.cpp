@@ -1394,6 +1394,13 @@ private:
       bindProduct(op.getResult(), ValueRange(products.at(op.getProduct())).slice(offset, leaves.size()));
     } else if (isa<RegionFoldOp, RegionScanOp>(operation)) {
       return region(operation);
+    } else if (auto op = dyn_cast<HistogramOp>(operation)) {
+      auto type = cast<RankedTensorType>(op.getResult().getType());
+      Value bins = values.lookup(op.getBins());
+      Value output = allocate(type, {bins}, loc);
+      builder.create<cpu::HistogramOp>(loc, values.lookup(op.getValues()), values.lookup(op.getValid()), output);
+      values.map(op.getResult(), output);
+      bindDimensions(type, output, loc);
     } else if (auto op = dyn_cast<ScanOp>(operation)) {
       return scan(op);
     } else if (auto op = dyn_cast<ReduceOp>(operation)) {
