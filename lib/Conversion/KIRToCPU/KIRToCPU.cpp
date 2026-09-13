@@ -59,8 +59,8 @@ void realizeIntegerStorage(ModuleOp module) {
 
 class Construction {
 public:
-  Construction(ModuleOp original, ModuleOp physical)
-      : analysis(original), module(physical), builder(physical.getContext()) {}
+  Construction(ModuleOp original, ModuleOp physical, CPUEntryLayout entryLayout)
+      : analysis(original), module(physical), builder(physical.getContext()), entryLayout(entryLayout) {}
 
   LogicalResult lower(func::FuncOp source) {
     auto parameters = source->getAttrOfType<ArrayAttr>("intent.parameters");
@@ -86,17 +86,32 @@ public:
              !element.isInteger(64) && !element.isInteger(1)))
           return source.emitError("CPU construction requires supported numeric views");
         auto memory = MemRefType::get(tensor.getShape(), tensor.getElementType());
+        SmallVector<Attribute> constraints(tensor.getRank(), builder.getUnitAttr());
         if (view.getConstraints().getHasStrides()) {
           if (view.getConstraints().getStrides().size() != static_cast<size_t>(tensor.getRank()))
             return source.emitError("CPU declared stride constraints must cover the view rank");
+          constraints.assign(view.getConstraints().getStrides().begin(), view.getConstraints().getStrides().end());
+        }
+        for (Attribute constraint : constraints)
+          if (!isa<UnitAttr, IntegerAttr>(constraint))
+            return source.emitError("CPU symbolic stride constraints are not implemented");
+        if (entryLayout == CPUEntryLayout::StridedInputs && view.getAccess() == 0) {
+          SmallVector<int64_t> strides;
+          for (Attribute constraint : constraints) {
+            auto fixed = dyn_cast<IntegerAttr>(constraint);
+            strides.push_back(fixed ? fixed.getInt() : ShapedType::kDynamic);
+          }
+          memory = MemRefType::get(tensor.getShape(), tensor.getElementType(),
+              StridedLayoutAttr::get(builder.getContext(), 0, strides));
+        } else {
           SmallVector<int64_t> strides;
           int64_t offset;
           if (failed(memory.getStridesAndOffset(strides, offset)))
             return source.emitError("CPU contiguous view has no derived strides");
-          for (auto [constraint, stride] : llvm::zip(view.getConstraints().getStrides(), strides)) {
+          for (auto [constraint, stride] : llvm::zip(constraints, strides)) {
             if (isa<UnitAttr>(constraint)) continue;
             auto fixed = dyn_cast<IntegerAttr>(constraint);
-            if (!fixed || ShapedType::isDynamic(stride) || fixed.getInt() != stride)
+            if (!fixed || (!ShapedType::isDynamic(stride) && fixed.getInt() != stride))
               return source.emitError("CPU contiguous ABI cannot discharge this declared stride constraint");
           }
         }
@@ -107,7 +122,7 @@ public:
         interface.push_back(cpu::ViewArgumentAttr::get(builder.getContext(),
             parameter.getName(), tensor.getElementType(),
             builder.getDenseI64ArrayAttr(tensor.getShape()), shape.getDimensions(),
-            view.getAccess(), view.getConstraints().getAlias(),
+            builder.getArrayAttr(constraints), view.getAccess(), view.getConstraints().getAlias(),
             view.getConstraints().getNoalias()));
       } else if (argument.getType().isF32() || argument.getType().isF64() || argument.getType().isIndex() ||
                  argument.getType().isInteger(8) || argument.getType().isInteger(16) ||
@@ -124,7 +139,7 @@ public:
     function = builder.create<func::FuncOp>(source.getLoc(), source.getName(),
                                            builder.getFunctionType(types, {}));
     function->setAttr("intent_cpu.interface", cpu::InterfaceAttr::get(
-        builder.getContext(), builder.getArrayAttr(interface), true, true));
+        builder.getContext(), builder.getArrayAttr(interface), entryLayout == CPUEntryLayout::Contiguous, true));
     function.addEntryBlock();
     builder.setInsertionPointToStart(&function.front());
     for (auto [oldValue, newValue] : llvm::zip(runtimeArguments, function.getArguments())) {
@@ -1175,6 +1190,35 @@ private:
     return success();
   }
 
+  void matrix(Value lhs, Value rhs, Value destination, Location loc) {
+    Type accumulator = cast<MemRefType>(destination.getType()).getElementType();
+    Value zero = builder.create<arith::ConstantOp>(loc, builder.getZeroAttr(accumulator));
+    AffineExpr m, n, k;
+    bindDims(builder.getContext(), m, n, k);
+    SmallVector<AffineMap> maps = {
+        AffineMap::get(3, 0, {m, k}, builder.getContext()),
+        AffineMap::get(3, 0, {k, n}, builder.getContext()),
+        AffineMap::get(3, 0, {m, n}, builder.getContext())};
+    builder.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{destination});
+    builder.create<linalg::GenericOp>(loc, ValueRange{lhs, rhs}, ValueRange{destination}, maps,
+        SmallVector<utils::IteratorType>{utils::IteratorType::parallel, utils::IteratorType::parallel,
+                                        utils::IteratorType::reduction},
+        [](OpBuilder &b, Location loc, ValueRange arguments) {
+          Value value;
+          if (isa<FloatType>(arguments[2].getType())) {
+            Value lhs = arguments[0], rhs = arguments[1];
+            if (lhs.getType() != arguments[2].getType()) lhs = b.create<arith::ExtFOp>(loc, arguments[2].getType(), lhs);
+            if (rhs.getType() != arguments[2].getType()) rhs = b.create<arith::ExtFOp>(loc, arguments[2].getType(), rhs);
+            value = b.create<math::FmaOp>(loc, lhs, rhs, arguments[2]);
+          } else {
+            Value lhs = b.create<arith::ExtSIOp>(loc, arguments[2].getType(), arguments[0]);
+            Value rhs = b.create<arith::ExtSIOp>(loc, arguments[2].getType(), arguments[1]);
+            value = b.create<arith::AddIOp>(loc, b.create<arith::MulIOp>(loc, lhs, rhs), arguments[2]);
+          }
+          b.create<linalg::YieldOp>(loc, value);
+        });
+  }
+
   LogicalResult contract(ContractOp operation) {
     auto lhsType = cast<RankedTensorType>(operation.getLhs().getType());
     auto rhsType = cast<RankedTensorType>(operation.getRhs().getType());
@@ -1202,36 +1246,8 @@ private:
     auto sizes = extents(resultType, loc);
     if (failed(sizes)) return failure();
     Value output = allocate(resultType, *sizes, loc);
-    Value zero = builder.create<arith::ConstantOp>(loc, builder.getZeroAttr(resultType.getElementType()));
-    AffineExpr m, n, k;
-    bindDims(builder.getContext(), m, n, k);
-    SmallVector<AffineMap> maps = {
-        AffineMap::get(3, 0, {m, k}, builder.getContext()),
-        AffineMap::get(3, 0, {k, n}, builder.getContext()),
-        AffineMap::get(3, 0, {m, n}, builder.getContext())};
-    SmallVector<utils::IteratorType> iterators = {
-        utils::IteratorType::parallel, utils::IteratorType::parallel,
-        utils::IteratorType::reduction};
-    auto matrix = [&](Value lhs, Value rhs, Value destination) {
-      builder.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{destination});
-      builder.create<linalg::GenericOp>(loc, ValueRange{lhs, rhs}, ValueRange{destination}, maps, iterators,
-        [](OpBuilder &b, Location loc, ValueRange arguments) {
-          Value value;
-          if (isa<FloatType>(arguments[2].getType())) {
-            Value lhs = arguments[0], rhs = arguments[1];
-            if (lhs.getType() != arguments[2].getType()) lhs = b.create<arith::ExtFOp>(loc, arguments[2].getType(), lhs);
-            if (rhs.getType() != arguments[2].getType()) rhs = b.create<arith::ExtFOp>(loc, arguments[2].getType(), rhs);
-            value = b.create<math::FmaOp>(loc, lhs, rhs, arguments[2]);
-          } else {
-            Value lhs = b.create<arith::ExtSIOp>(loc, arguments[2].getType(), arguments[0]);
-            Value rhs = b.create<arith::ExtSIOp>(loc, arguments[2].getType(), arguments[1]);
-            value = b.create<arith::AddIOp>(loc, b.create<arith::MulIOp>(loc, lhs, rhs), arguments[2]);
-          }
-          b.create<linalg::YieldOp>(loc, value);
-        });
-    };
     Value lhs = values.lookup(operation.getLhs()), rhs = values.lookup(operation.getRhs());
-    if (!batchRank) matrix(lhs, rhs, output);
+    if (!batchRank) matrix(lhs, rhs, output, loc);
     else {
       SmallVector<Value> begins(batchRank, constant(loc, 0)), steps(batchRank, constant(loc, 1)), ends;
       for (int64_t axis = 0; axis < batchRank; ++axis)
@@ -1256,8 +1272,87 @@ private:
             type.getShape().take_back(2), type, offsets, extents, strides));
         return builder.create<memref::SubViewOp>(loc, result, source, offsets, extents, strides);
       };
-      matrix(slice(lhs), slice(rhs), slice(output));
+      matrix(slice(lhs), slice(rhs), slice(output), loc);
     }
+    values.map(operation.getResult(), output);
+    return success();
+  }
+
+  LogicalResult scaledContract(ScaledContractOp operation) {
+    auto outputType = cast<RankedTensorType>(operation.getResult().getType());
+    auto carrier = [](Value value, ScaledFormat format) {
+      Type element = cast<RankedTensorType>(value.getType()).getElementType();
+      return format == ScaledFormat::E4M3 ? isa<Float8E4M3FNType>(element)
+           : format == ScaledFormat::E2M1 && element.isInteger(8);
+    };
+    if (!outputType.getElementType().isF32() ||
+        !carrier(operation.getLhs(), operation.getLhsFormat()) ||
+        !carrier(operation.getRhs(), operation.getRhsFormat()) ||
+        !cast<RankedTensorType>(operation.getLhsScale().getType()).getElementType().isInteger(8) ||
+        !cast<RankedTensorType>(operation.getRhsScale().getType()).getElementType().isInteger(8))
+      return operation.emitError("CPU scaled contraction requires E4M3 or E2M1 carriers, byte E8M0 scales and f32 accumulation");
+    Location loc = operation.getLoc();
+    int64_t groupSize = operation.getLhsGroupSize();
+    Value lhs = values.lookup(operation.getLhs()), rhs = values.lookup(operation.getRhs());
+    Value groups = builder.create<memref::DimOp>(loc, lhs, 1);
+    Value depth = builder.create<arith::MulIOp>(loc, groups, constant(loc, groupSize));
+    auto sizes = extents(outputType, loc);
+    if (failed(sizes)) return failure();
+    auto decode = [&](Value source, Value scales, ScaledFormat format, bool left) {
+      SmallVector<Value> shape = left ? SmallVector<Value>{(*sizes)[0], depth}
+                                     : SmallVector<Value>{depth, (*sizes)[1]};
+      auto type = RankedTensorType::get({ShapedType::kDynamic, ShapedType::kDynamic}, builder.getF32Type());
+      Value decoded = allocate(type, shape, loc);
+      builder.create<linalg::GenericOp>(loc, ValueRange{}, ValueRange{decoded},
+          SmallVector<AffineMap>{builder.getMultiDimIdentityMap(2)},
+          SmallVector<utils::IteratorType>(2, utils::IteratorType::parallel),
+          [&](OpBuilder &b, Location loc, ValueRange) {
+            auto integer = [&](int64_t value) -> Value { return b.create<arith::ConstantIntOp>(loc, value, 32); };
+            auto index = [&](int64_t value) -> Value { return b.create<arith::ConstantIndexOp>(loc, value); };
+            Value row = b.create<linalg::IndexOp>(loc, 0), column = b.create<linalg::IndexOp>(loc, 1);
+            Value free = left ? row : column, reduction = left ? column : row;
+            Value group = b.create<arith::DivSIOp>(loc, reduction, index(groupSize));
+            Value inner = b.create<arith::RemSIOp>(loc, reduction, index(groupSize));
+            Value position = format == ScaledFormat::E2M1
+                ? Value(b.create<arith::DivSIOp>(loc, inner, index(2))) : inner;
+            SmallVector<Value> coordinates = left ? SmallVector<Value>{free, group, position}
+                                                  : SmallVector<Value>{group, position, free};
+            Value raw = b.create<memref::LoadOp>(loc, source, coordinates);
+            Value number;
+            if (format == ScaledFormat::E4M3) number = b.create<arith::ExtFOp>(loc, b.getF32Type(), raw);
+            else {
+              Value bits = b.create<arith::ExtUIOp>(loc, b.getI32Type(), raw);
+              Value lane = b.create<arith::IndexCastOp>(loc, b.getI32Type(), b.create<arith::RemSIOp>(loc, inner, index(2)));
+              Value shift = b.create<arith::MulIOp>(loc, lane, integer(4));
+              Value nibble = b.create<arith::ShRUIOp>(loc, bits, shift);
+              Value magnitude = b.create<arith::AndIOp>(loc, nibble, integer(7));
+              static constexpr float table[] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+              number = b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(table[0]));
+              for (int64_t code = 1; code < 8; ++code) {
+                Value matches = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, magnitude, integer(code));
+                number = b.create<arith::SelectOp>(loc, matches,
+                    b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(table[code])), number);
+              }
+              Value sign = b.create<arith::AndIOp>(loc, nibble, integer(8));
+              Value negative = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, sign, integer(0));
+              number = b.create<arith::SelectOp>(loc, negative, b.create<arith::NegFOp>(loc, number), number);
+            }
+            Value rawScale = b.create<memref::LoadOp>(loc, scales, ValueRange{free, group});
+            Value exponent = b.create<arith::ExtUIOp>(loc, b.getI32Type(), rawScale);
+            Value bits = b.create<arith::ShLIOp>(loc, exponent, integer(23));
+            Value subnormal = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, exponent, integer(0));
+            bits = b.create<arith::SelectOp>(loc, subnormal, integer(0x00400000), bits);
+            Value nan = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, exponent, integer(255));
+            bits = b.create<arith::SelectOp>(loc, nan, integer(0x7fc00000), bits);
+            Value scale = b.create<arith::BitcastOp>(loc, b.getF32Type(), bits);
+            b.create<linalg::YieldOp>(loc, ValueRange{b.create<arith::MulFOp>(loc, number, scale)});
+          });
+      return decoded;
+    };
+    Value left = decode(lhs, values.lookup(operation.getLhsScale()), operation.getLhsFormat(), true);
+    Value right = decode(rhs, values.lookup(operation.getRhsScale()), operation.getRhsFormat(), false);
+    Value output = allocate(outputType, *sizes, loc);
+    matrix(left, right, output, loc);
     values.map(operation.getResult(), output);
     return success();
   }
@@ -1647,6 +1742,8 @@ private:
       values.map(op.getResult(), output);
     } else if (auto op = dyn_cast<ContractOp>(operation)) {
       return contract(op);
+    } else if (auto op = dyn_cast<ScaledContractOp>(operation)) {
+      return scaledContract(op);
     } else if (operation->getName().getDialectNamespace() == "arith") {
       builder.clone(*operation, values);
     } else {
@@ -1658,6 +1755,7 @@ private:
   CanonicalKernelAnalysis analysis;
   ModuleOp module;
   OpBuilder builder;
+  CPUEntryLayout entryLayout;
   func::FuncOp function;
   IRMapping values;
   llvm::DenseMap<Value, SmallVector<Value>> products;
@@ -1669,11 +1767,11 @@ private:
 
 }
 
-LogicalResult lowerCanonicalKIRToCPU(ModuleOp module) {
+LogicalResult lowerCanonicalKIRToCPU(ModuleOp module, CPUEntryLayout entryLayout) {
   CanonicalKernelAnalysis analysis(module);
   if (failed(analysis.verify())) return failure();
   auto physical = OwningOpRef<ModuleOp>(ModuleOp::create(module.getLoc()));
-  Construction construction(module, *physical);
+  Construction construction(module, *physical, entryLayout);
   unsigned count = 0;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
     if (++count != 1)

@@ -18,6 +18,8 @@ struct Memory {
   std::string pointer;
   SmallVector<std::string> sizes;
   SmallVector<std::string> strides;
+  std::string base;
+  std::string offset;
 };
 
 std::string join(ArrayRef<std::string> values, llvm::StringRef separator = ", ") {
@@ -89,11 +91,17 @@ llvm::json::Array parameters(cpu::InterfaceAttr interface) {
   llvm::json::Array result;
   for (Attribute argument : interface.getArguments()) {
     if (auto view = dyn_cast<cpu::ViewArgumentAttr>(argument)) {
+      llvm::json::Array strides;
+      for (Attribute constraint : view.getStrides()) {
+        if (auto fixed = dyn_cast<IntegerAttr>(constraint)) strides.push_back(fixed.getInt());
+        else strides.push_back(nullptr);
+      }
       result.push_back(llvm::json::Object{
           {"name", view.getName().getValue().str()}, {"kind", "view"},
           {"dtype", abiDType(view.getElementType())},
           {"access", static_cast<int64_t>(view.getAccess())}, {"shape", json(view.getShape())},
-          {"dimensions", json(view.getDimensions())}, {"alias", view.getAlias().getValue().str()},
+          {"dimensions", json(view.getDimensions())}, {"strides", std::move(strides)},
+          {"alias", view.getAlias().getValue().str()},
           {"noalias", view.getNoalias()}});
     } else {
       auto scalar = cast<cpu::ScalarArgumentAttr>(argument);
@@ -118,7 +126,7 @@ public:
       bind(argument, name);
       if (auto type = dyn_cast<MemRefType>(argument.getType())) {
         signature.push_back(name + ": Pointer[" + memoryElement(type.getElementType()) + ", MutUntrackedOrigin]");
-        Memory memory{name, {}, {}};
+        Memory memory{name, {}, {}, name, "0"};
         SmallVector<int64_t> staticStrides;
         int64_t staticOffset;
         if (failed(type.getStridesAndOffset(staticStrides, staticOffset)))
@@ -316,7 +324,7 @@ private:
     std::string element = memoryElement(type.getElementType());
     std::string value = fresh(memory);
     std::string storage = "storage_" + value;
-    Memory descriptor{value, {}, {}};
+    Memory descriptor{value, {}, {}, value, "0"};
     unsigned dynamicAxis = 0;
     for (int64_t axis = 0; axis < type.getRank(); ++axis)
       descriptor.sizes.push_back(type.isDynamicDim(axis) ? name(dynamicSizes[dynamicAxis++])
@@ -379,6 +387,17 @@ private:
       auto axis = op.getConstantIndex();
       if (!axis) return op.emitError("Mojo memory descriptor dimension must be static");
       assign(op.getResult(), memories.at(op.getSource()).sizes[*axis]);
+    } else if (auto op = dyn_cast<memref::ExtractStridedMetadataOp>(operation)) {
+      const Memory memory = memories.at(op.getSource());
+      if (!op.getBaseBuffer().use_empty()) {
+        assign(op.getBaseBuffer(), memory.base);
+        memories[op.getBaseBuffer()] = {name(op.getBaseBuffer()), {}, {}, memory.base, "0"};
+      }
+      if (!op.getOffset().use_empty()) assign(op.getOffset(), memory.offset);
+      for (auto [value, size] : llvm::zip(op.getSizes(), memory.sizes))
+        if (!value.use_empty()) assign(value, size);
+      for (auto [value, stride] : llvm::zip(op.getStrides(), memory.strides))
+        if (!value.use_empty()) assign(value, stride);
     } else if (auto op = dyn_cast<memref::SubViewOp>(operation)) {
       const Memory source = memories.at(op.getSource());
       auto offsets = op.getMixedOffsets(), sizes = op.getMixedSizes(), strides = op.getMixedStrides();
@@ -393,6 +412,17 @@ private:
         }
       }
       assign(op.getResult(), source.pointer + ".unsafe_offset(" + join(terms, " + ") + ")");
+      result.pointer = name(op.getResult());
+      result.base = source.base;
+      result.offset = "(" + source.offset + ") + (" + join(terms, " + ") + ")";
+      memories[op.getResult()] = std::move(result);
+    } else if (auto op = dyn_cast<memref::ReinterpretCastOp>(operation)) {
+      Memory result;
+      result.base = memories.at(op.getSource()).base;
+      result.offset = fold(op.getMixedOffsets()[0]);
+      for (OpFoldResult size : op.getMixedSizes()) result.sizes.push_back(fold(size));
+      for (OpFoldResult stride : op.getMixedStrides()) result.strides.push_back(fold(stride));
+      assign(op.getResult(), result.base + ".unsafe_offset(" + result.offset + ")");
       result.pointer = name(op.getResult());
       memories[op.getResult()] = std::move(result);
     } else if (auto op = dyn_cast<memref::CastOp>(operation)) {

@@ -4,7 +4,10 @@
 #include "mlir/IR/BuiltinOps.h"
 
 namespace intent {
-mlir::LogicalResult lowerCanonicalKIRToCPU(mlir::ModuleOp module);
+enum class CPUEntryLayout { Contiguous, StridedInputs };
+
+mlir::LogicalResult lowerCanonicalKIRToCPU(mlir::ModuleOp module,
+                                         CPUEntryLayout entryLayout);
 }
 
 #endif

@@ -24,18 +24,21 @@ void IntentCPUDialect::initialize() {
 LogicalResult ViewArgumentAttr::verify(
     llvm::function_ref<InFlightDiagnostic()> error, StringAttr name,
     Type element, DenseI64ArrayAttr shape, DenseI64ArrayAttr dimensions,
-    uint32_t access, StringAttr alias, bool) {
+    ArrayAttr strides, uint32_t access, StringAttr alias, bool) {
   if (!name || name.getValue().empty() ||
       (!element.isF16() && !element.isBF16() && !element.isF32() && !element.isF64() &&
        !llvm::isa<Float8E4M3FNType, Float8E5M2Type>(element) &&
        !element.isInteger(8) && !element.isInteger(16) && !element.isInteger(32) &&
        !element.isInteger(64) && !element.isInteger(1)) || !shape || !dimensions ||
-      shape.size() != dimensions.size() || access > 2 || !alias)
+      shape.size() != dimensions.size() || !strides || strides.size() != static_cast<size_t>(shape.size()) || access > 2 || !alias)
     return error() << "CPU view argument requires a named numeric view and complete shape identities";
   for (auto [size, dimension] : llvm::zip(shape.asArrayRef(), dimensions.asArrayRef()))
     if ((size < 0 && !ShapedType::isDynamic(size)) || dimension < 0 ||
         (ShapedType::isDynamic(size) && dimension == 0))
       return error() << "CPU view extent or dynamic dimension identity is invalid";
+  for (Attribute stride : strides)
+    if (!mlir::isa<UnitAttr, IntegerAttr>(stride))
+      return error() << "CPU stride constraint must be an integer or unconstrained";
   return success();
 }
 
@@ -50,9 +53,9 @@ LogicalResult ScalarArgumentAttr::verify(
 
 LogicalResult InterfaceAttr::verify(
     llvm::function_ref<InFlightDiagnostic()> error, ArrayAttr arguments,
-    bool contiguousViews, bool disjointOutputs) {
-  if (!arguments || arguments.empty() || !contiguousViews || !disjointOutputs)
-    return error() << "CPU interface requires contiguous views and disjoint outputs";
+    bool, bool disjointOutputs) {
+  if (!arguments || arguments.empty() || !disjointOutputs)
+    return error() << "CPU interface requires typed arguments and disjoint outputs";
   llvm::DenseSet<StringAttr> names;
   for (Attribute argument : arguments) {
     StringAttr name;

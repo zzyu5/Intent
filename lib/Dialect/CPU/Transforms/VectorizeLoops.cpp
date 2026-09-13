@@ -44,7 +44,8 @@ std::optional<int64_t> coefficient(Value value, scf::ForOp loop) {
   return std::nullopt;
 }
 
-bool contiguous(Value memory, ValueRange indices, scf::ForOp loop, bool allowInvariant) {
+bool contiguous(Value memory, ValueRange indices, scf::ForOp loop, bool allowInvariant,
+                SmallVectorImpl<Value> &guardedMemories) {
   auto type = cast<MemRefType>(memory.getType());
   if (!vectorElement(type.getElementType()) || type.getElementType().isInteger(1)) return false;
   if (auto owner = memory.getDefiningOp(); owner && loop->isAncestor(owner)) return false;
@@ -57,7 +58,10 @@ bool contiguous(Value memory, ValueRange indices, scf::ForOp loop, bool allowInv
     if (!c) return false;
     if (*c != 0) {
       invariant = false;
-      if (*c != 1 || axis + 1 != indices.size() || strides[axis] != 1) return false;
+      if (*c != 1 || axis + 1 != indices.size()) return false;
+      if (ShapedType::isDynamic(strides[axis])) {
+        if (!llvm::is_contained(guardedMemories, memory)) guardedMemories.push_back(memory);
+      } else if (strides[axis] != 1) return false;
     }
   }
   return !invariant || allowInvariant;
@@ -154,14 +158,15 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas) {
   }
   SmallVector<memref::StoreOp> stores;
   SmallVector<memref::LoadOp> loads;
+  SmallVector<Value> guardedMemories;
   for (Operation &operation : original.getBody()->without_terminator()) {
     if (operation.getNumRegions()) return;
     if (auto load = dyn_cast<memref::LoadOp>(&operation)) {
-      if (!contiguous(load.getMemref(), load.getIndices(), original, true)) return;
+      if (!contiguous(load.getMemref(), load.getIndices(), original, true, guardedMemories)) return;
       loads.push_back(load);
     } else if (auto store = dyn_cast<memref::StoreOp>(&operation)) {
       if (dependsOnCarry(store.getValue(), original) ||
-          !contiguous(store.getMemref(), store.getIndices(), original, false)) return;
+          !contiguous(store.getMemref(), store.getIndices(), original, false, guardedMemories)) return;
       stores.push_back(store);
     } else if (!isMemoryEffectFree(&operation) || operation.getNumResults() != 1 ||
                !vectorElement(operation.getResult(0).getType()) ||
@@ -188,6 +193,54 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas) {
   }
   OpBuilder b(original);
   Location loc = original.getLoc();
+  if (!guardedMemories.empty()) {
+    Value one = index(b, loc, 1), condition;
+    SmallVector<memref::ExtractStridedMetadataOp> descriptors;
+    for (Value memory : guardedMemories) {
+      auto metadata = b.create<memref::ExtractStridedMetadataOp>(loc, memory);
+      descriptors.push_back(metadata);
+      Value unit = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, metadata.getStrides().back(), one);
+      condition = condition ? Value(b.create<arith::AndIOp>(loc, condition, unit)) : unit;
+    }
+    auto dispatch = b.create<scf::IfOp>(loc, original.getResultTypes(), condition, true);
+    original.replaceAllUsesWith(dispatch.getResults());
+    b.setInsertionPointToStart(&dispatch.getThenRegion().front());
+    IRMapping mapping;
+    for (auto [memory, metadata] : llvm::zip(guardedMemories, descriptors)) {
+      auto type = cast<MemRefType>(memory.getType());
+      SmallVector<int64_t> strides;
+      int64_t offset;
+      (void)type.getStridesAndOffset(strides, offset);
+      strides.back() = 1;
+      auto contiguousType = MemRefType::get(type.getShape(), type.getElementType(),
+          StridedLayoutAttr::get(b.getContext(), offset, strides), type.getMemorySpace());
+      SmallVector<OpFoldResult> sizes, physicalStrides;
+      for (int64_t axis = 0; axis < type.getRank(); ++axis) {
+        sizes.push_back(type.isDynamicDim(axis) ? OpFoldResult(metadata.getSizes()[axis])
+                                               : OpFoldResult(b.getIndexAttr(type.getDimSize(axis))));
+        physicalStrides.push_back(ShapedType::isDynamic(strides[axis]) ? OpFoldResult(metadata.getStrides()[axis])
+                                                                     : OpFoldResult(b.getIndexAttr(strides[axis])));
+      }
+      OpFoldResult physicalOffset = ShapedType::isDynamic(offset) ? OpFoldResult(metadata.getOffset())
+                                                                 : OpFoldResult(b.getIndexAttr(offset));
+      // A descriptor reconstruction retains the proved stride through vector
+      // canonicalization, which can strip memref.cast from vector loads.
+      mapping.map(memory, b.create<memref::ReinterpretCastOp>(loc, contiguousType,
+          metadata.getBaseBuffer(), physicalOffset, sizes, physicalStrides));
+    }
+    auto contiguousLoop = cast<scf::ForOp>(b.clone(*original, mapping));
+    vectorize(contiguousLoop, width, replicas);
+    if (original.getNumResults()) {
+      b.setInsertionPointToEnd(&dispatch.getThenRegion().front());
+      b.create<scf::YieldOp>(loc, contiguousLoop.getResults());
+    }
+    original->moveBefore(&dispatch.getElseRegion().front(), dispatch.getElseRegion().front().begin());
+    if (original.getNumResults()) {
+      b.setInsertionPointToEnd(&dispatch.getElseRegion().front());
+      b.create<scf::YieldOp>(loc, original.getResults());
+    }
+    return;
+  }
   // One local tree spans adjacent register replicas. Keeping the leaves in
   // coordinate order permits reassociation without striped accumulators, and
   // amortizes the narrow horizontal stages across the bound register replicas.

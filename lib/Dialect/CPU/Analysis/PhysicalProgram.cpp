@@ -57,6 +57,8 @@ Value PhysicalProgramAnalysis::storageRoot(Value memory) {
   while (true) {
     if (auto view = memory.getDefiningOp<memref::SubViewOp>()) memory = view.getSource();
     else if (auto cast = memory.getDefiningOp<memref::CastOp>()) memory = cast.getSource();
+    else if (auto cast = memory.getDefiningOp<memref::ReinterpretCastOp>()) memory = cast.getSource();
+    else if (auto metadata = memory.getDefiningOp<memref::ExtractStridedMetadataOp>()) memory = metadata.getSource();
     else if (auto argument = dyn_cast<BlockArgument>(memory)) {
       auto tasks = dyn_cast<TasksOp>(argument.getOwner()->getParentOp());
       if (!tasks || argument.getArgNumber() == 0) return memory;
@@ -190,7 +192,7 @@ SmallVector<AllocationFacts> PhysicalProgramAnalysis::allocations() {
 LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
   auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
   if (!interface || interface.getArguments().size() != function.getNumArguments() ||
-      !interface.getContiguousViews() || !interface.getDisjointOutputs())
+      !interface.getDisjointOutputs())
     return function.emitError("CPU function requires its complete typed native interface");
   for (auto [argument, field] : llvm::zip(function.getArguments(), interface.getArguments())) {
     auto storageType = [&](Type logical) -> Type {
@@ -200,8 +202,17 @@ LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
     if (auto view = dyn_cast<ViewArgumentAttr>(field)) {
       auto type = dyn_cast<MemRefType>(argument.getType());
       if (!type || type.getElementType() != storageType(view.getElementType()) ||
-          type.getShape() != view.getShape().asArrayRef() || !type.getLayout().isIdentity())
+          type.getShape() != view.getShape().asArrayRef())
         return function.emitError("CPU view type disagrees with its physical ABI");
+      SmallVector<int64_t> strides;
+      int64_t offset;
+      if (failed(type.getStridesAndOffset(strides, offset)) || offset != 0 ||
+          ((interface.getContiguousViews() || view.getAccess() != 0) && !type.getLayout().isIdentity()))
+        return function.emitError("CPU view layout disagrees with its physical ABI");
+      for (auto [constraint, stride] : llvm::zip(view.getStrides(), strides))
+        if (auto fixed = dyn_cast<IntegerAttr>(constraint);
+            fixed && !ShapedType::isDynamic(stride) && fixed.getInt() != stride)
+          return function.emitError("CPU view layout contradicts its declared stride constraint");
     } else if (auto scalar = dyn_cast<ScalarArgumentAttr>(field)) {
       if (storageType(scalar.getType()) != argument.getType())
         return function.emitError("CPU scalar type disagrees with its physical ABI");

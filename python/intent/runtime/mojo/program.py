@@ -78,8 +78,9 @@ class NativeProgram:
     def __init__(self, source: str, metadata: dict[str, object], target) -> None:
         self.parameters = metadata["parameters"]
         self.candidates = metadata["candidates"]
-        if not metadata["contiguous_views"] or not metadata["disjoint_outputs"]:
-            raise NotImplementedError("Mojo runtime requires declared contiguous/disjoint-output entry legality")
+        self.contiguous_views = metadata["contiguous_views"]
+        if not metadata["disjoint_outputs"]:
+            raise NotImplementedError("Mojo runtime requires declared disjoint-output entry legality")
         self.compilation = compile_library(source, metadata, target)
         argument_types = []
         for parameter in self.parameters:
@@ -108,11 +109,15 @@ class NativeProgram:
             raise NotImplementedError("Mojo CPU empty-storage pointer ABI is not implemented")
         if tensor.ndim != len(parameter["shape"]):
             raise ValueError(f"{parameter['name']} has an incompatible rank")
-        expected_stride = 1
-        for extent, stride in zip(reversed(tensor.shape), reversed(tensor.stride())):
-            if stride != expected_stride:
-                raise NotImplementedError("Mojo CPU views require canonical contiguous strides")
-            expected_stride *= extent
+        if self.contiguous_views or parameter["access"] != 0:
+            expected_stride = 1
+            for extent, stride in zip(reversed(tensor.shape), reversed(tensor.stride())):
+                if stride != expected_stride:
+                    raise NotImplementedError("Mojo CPU writable views require canonical contiguous strides")
+                expected_stride *= extent
+        for constraint, stride in zip(parameter["strides"], tensor.stride()):
+            if constraint is not None and constraint != stride:
+                raise ValueError(f"{parameter['name']} violates an author stride constraint")
         for axis, (static, identity) in enumerate(zip(parameter["shape"], parameter["dimensions"])):
             extent = tensor.shape[axis]
             if static >= 0 and static != extent:
@@ -150,11 +155,17 @@ class NativeProgram:
             outputs.append(all_arguments[index])
         views = [(parameter, value) for parameter, value in zip(self.parameters, all_arguments)
                  if parameter["kind"] == "view"]
+        def span(tensor):
+            offsets = [(extent - 1) * stride for extent, stride in zip(tensor.shape, tensor.stride())]
+            return (tensor.data_ptr() + sum(min(0, offset) for offset in offsets) * tensor.element_size(),
+                    tensor.data_ptr() + (sum(max(0, offset) for offset in offsets) + 1) * tensor.element_size())
+
         for index, (parameter, value) in enumerate(views):
-            begin, end = value.data_ptr(), value.data_ptr() + value.numel() * value.element_size()
+            begin, end = span(value)
             for other_parameter, other in views[index + 1:]:
                 same_allocation = value.untyped_storage().data_ptr() == other.untyped_storage().data_ptr()
-                overlap = begin < other.data_ptr() + other.numel() * other.element_size() and other.data_ptr() < end
+                other_begin, other_end = span(other)
+                overlap = begin < other_end and other_begin < end
                 if overlap and (parameter["access"] != 0 or other_parameter["access"] != 0):
                     raise NotImplementedError("Mojo CPU overlapping writable views are not implemented")
                 if same_allocation and (parameter["noalias"] or other_parameter["noalias"]):

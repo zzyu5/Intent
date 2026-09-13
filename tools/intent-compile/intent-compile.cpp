@@ -155,7 +155,8 @@ int main(int argc, char **argv) {
   if (target == TargetKind::Mojo || target == TargetKind::Weft) {
     context.loadDialect<mlir::linalg::LinalgDialect, mlir::math::MathDialect,
                         mlir::memref::MemRefDialect, mlir::vector::VectorDialect>();
-    if (mlir::failed(intent::lowerCanonicalKIRToCPU(*module)))
+    if (mlir::failed(intent::lowerCanonicalKIRToCPU(*module,
+            target == TargetKind::Mojo ? intent::CPUEntryLayout::StridedInputs : intent::CPUEntryLayout::Contiguous)))
       return exitCode(ExitCode::PhysicalProgram);
     intent::cpu::ImplementationRegistry implementations;
     if (target == TargetKind::Mojo) implementations = intent::mojo::implementations();
