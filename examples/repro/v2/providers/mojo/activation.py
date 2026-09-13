@@ -1,10 +1,20 @@
+import intent
 import torch
 
-from kernels.activation.pointwise import addcmul_broadcast_bf16, gelu_tanh, relu_forward
+from kernels.activation.pointwise import (
+    addcmul_broadcast_bf16,
+    geglu_tanh,
+    gelu_tanh,
+    relu_forward,
+)
+from kernels.activation.swiglu import FEATURES as SWIGLU_FEATURES
+from kernels.activation.swiglu import silu_and_mul_packed
 from kernels.activation.swiglu import swiglu_forward
 from kernels.backward.swiglu import swiglu_backward
 
-from ...model import Tolerance
+from ...loading import load_module
+from ...measurement import report_stage
+from ...model import PreparedComparison, PreparedLaunch, Tolerance
 from .common import configure_cpu_budget, prepare_host_comparison
 
 
@@ -52,5 +62,38 @@ def swiglu_backward_case(context):
     )
 
 
+def silu_and_mul(context):
+    packed = torch.randn(
+        (4096, 2 * SWIGLU_FEATURES), dtype=torch.bfloat16
+    )
+    return prepare_host_comparison(
+        context,
+        silu_and_mul_packed,
+        (packed,),
+        "silu_and_mul_packed",
+        Tolerance(atol=2e-2, rtol=1e-2),
+    )
+
+
+def geglu(context):
+    x = torch.randn((4096, 2 * 14336), dtype=torch.float16)
+    report_stage("generated_compilation")
+    artifact = intent.compile(geglu_tanh, target=context.target, compiler=context.compiler,
+                              tuning_config=context.tuning_config)
+    runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_reference")
+
+    def side(function):
+        output = torch.empty((4096, 14336), dtype=torch.float16)
+        return PreparedLaunch(lambda: function(x, output), lambda: output)
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(
+        side(artifact.run), side(runtime.geglu_tanh), Tolerance(atol=2e-2, rtol=1e-2),
+        cuda_graph=False, device_type="cpu", cpu_host_timing=True,
+        note="既有4096x28672 f16 GEGLU，独立InOut输出，完整host调用；单NUMA8核，PyTorch CPU reference。",
+    )
+
+
 CASES = {"gelu": gelu, "relu": relu, "flaggems_addcmul": addcmul, "swiglu": swiglu,
-         "swiglu_backward": swiglu_backward_case}
+         "swiglu_backward": swiglu_backward_case,
+         "silu_and_mul_packed": silu_and_mul, "geglu_tanh": geglu}

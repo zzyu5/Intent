@@ -73,6 +73,33 @@ def relu(x):
     return torch.maximum(x, x.new_zeros(()))
 
 
+def silu_and_mul_packed(packed):
+    half = packed.shape[1] // 2
+    return swiglu(packed[:, :half], packed[:, half:])
+
+
+def geglu_tanh(x, output):
+    half = output.shape[1]
+    output.copy_((x[:, :half].float() * F.gelu(x[:, half:].float(), approximate="tanh")).to(x.dtype))
+    return output
+
+
+def fp8_matmul(lhs, rhs_transposed):
+    return (lhs.float() @ rhs_transposed.float().T).to(lhs.dtype)
+
+
+def qkv_projection(x, weights):
+    values = x.float()
+    return torch.stack(tuple((values @ weight.float()).to(x.dtype) for weight in weights))
+
+
+def flash_attention_bf16_fwd(query, key, value, scale):
+    group = query.shape[1] // key.shape[1]
+    keys = key.repeat_interleave(group, dim=1).float()
+    values = value.repeat_interleave(group, dim=1).float()
+    return F.scaled_dot_product_attention(query.float(), keys, values, is_causal=True, scale=scale).to(query.dtype)
+
+
 def swiglu(gate, up):
     values = gate.float()
     sigmoid = 1.0 / (1.0 + torch.exp(-values))
@@ -264,6 +291,32 @@ def rope_qk(query, key, cosine, sine):
     query[..., half:] = query_second * cos + query_first * sin
     key[..., :half] = key_first * cos - key_second * sin
     key[..., half:] = key_second * cos + key_first * sin
+    return query, key
+
+
+def rope_qk_partial(query, key, cosine, sine):
+    half = 32
+    cos, sin = cosine[..., :half].float(), sine[..., :half].float()
+    for values in (query, key):
+        first = values[..., :half].float()
+        second = values[..., half:2 * half].float()
+        values[..., :half] = first * cos - second * sin
+        values[..., half:2 * half] = second * cos + first * sin
+    return query, key
+
+
+def rotary_embedding_bf16(values, cosine, sine):
+    first, second = values[..., :64].float(), values[..., 64:].float()
+    cos, sin = cosine[None, :, None, :], sine[None, :, None, :]
+    return torch.cat((first * cos - second * sin, second * cos + first * sin), dim=-1).to(values.dtype)
+
+
+def rope_qk_bf16(query, key, cosine, sine):
+    cos, sin = cosine[..., :64].float(), sine[..., :64].float()
+    for values in (query, key):
+        first, second = values[..., :64].float(), values[..., 64:].float()
+        values[..., :64] = first * cos - second * sin
+        values[..., 64:] = second * cos + first * sin
     return query, key
 
 
@@ -584,3 +637,171 @@ def adamw(gradient, parameter, first_moment, second_moment, learning_rate,
     first_moment.copy_(first)
     second_moment.copy_(second)
     return parameter, first_moment, second_moment
+
+
+def jagged_mean(values, offsets):
+    return torch.segment_reduce(values, "mean", offsets=offsets)
+
+
+def ragged_grouped_gemm(x, offsets, weight):
+    output = torch.empty((x.shape[0], weight.shape[2]), dtype=x.dtype)
+    for group in range(weight.shape[0]):
+        begin, end = int(offsets[group]), int(offsets[group + 1])
+        output[begin:end] = x[begin:end].float() @ weight[group].float()
+    return output
+
+
+def nested_jagged_mean_pool(document_offsets, sentence_offsets, values):
+    sentence_lengths = sentence_offsets[1:] - sentence_offsets[:-1]
+    document_lengths = document_offsets[1:] - document_offsets[:-1]
+    sentence_ids = torch.repeat_interleave(torch.arange(sentence_lengths.numel()), sentence_lengths.long())
+    sentence_sums = torch.zeros((sentence_lengths.numel(), values.shape[1]), dtype=values.dtype)
+    sentence_sums.index_add_(0, sentence_ids, values)
+    document_ids = torch.repeat_interleave(torch.arange(document_lengths.numel()), document_lengths.long())
+    document_sums = torch.zeros((document_lengths.numel(), values.shape[1]), dtype=values.dtype)
+    document_sums.index_add_(0, document_ids, sentence_sums)
+    document_tokens = torch.zeros(document_lengths.shape, dtype=torch.int32)
+    document_tokens.index_add_(0, document_ids, sentence_lengths)
+    return sentence_sums / sentence_lengths[:, None], document_sums / document_tokens[:, None]
+
+
+def selective_state_scan(x, decay, drive):
+    state = torch.zeros((x.shape[0],), dtype=x.dtype)
+    output = torch.empty_like(x)
+    for position in range(x.shape[1]):
+        state = decay[:, position] * state + drive[:, position] * x[:, position]
+        output[:, position] = state
+    return output
+
+
+def streamed_online_softmax_f16(x):
+    return torch.softmax(x.float(), dim=-1).to(x.dtype)
+
+
+def recurrent_gated_delta_fwd(query, key, value, gate, beta, scale):
+    batch, sequence, heads, dimension = query.shape
+    state = torch.zeros((batch, heads, dimension, value.shape[-1]), dtype=torch.float32)
+    output = torch.empty_like(value)
+    for position in range(sequence):
+        q = query[:, position].float() * scale
+        k = key[:, position].float()
+        v = value[:, position].float()
+        decayed = state * gate[:, position].float().exp()[..., None, None]
+        remembered = (decayed * k[..., None]).sum(dim=-2)
+        update = (v - remembered) * beta[:, position].float()[..., None]
+        state = decayed + k[..., None] * update[..., None, :]
+        output[:, position] = (state * q[..., None]).sum(dim=-2).to(value.dtype)
+    return output, state
+
+
+def mamba_chunk_scan_fwd(cb, x, dt, cumulative_decay, state_matrix, previous_states, residual_scale):
+    batch, chunks, groups, chunk, _ = cb.shape
+    heads, dimension = x.shape[2:]
+    group_index = torch.arange(heads) // (heads // groups)
+    chunk_x = x.reshape(batch, chunks, chunk, heads, dimension)
+    state_c = state_matrix.reshape(batch, chunks, chunk, groups, state_matrix.shape[-1])[:, :, :, group_index]
+    state = torch.einsum("bcshn,bchpn->bcshp", state_c.float(), previous_states.float())
+    decay_values = cumulative_decay.float()
+    state *= decay_values.exp().permute(0, 2, 3, 1)[..., None]
+    decay = (decay_values[..., :, None] - decay_values[..., None, :]).exp().permute(0, 2, 3, 4, 1)
+    coefficients = cb[:, :, group_index].permute(0, 1, 3, 4, 2).float()
+    coefficients *= decay
+    coefficients *= dt.float().permute(0, 2, 3, 1)[:, :, None]
+    causal = torch.ones((chunk, chunk), dtype=torch.bool).tril()
+    coefficients.masked_fill_(~causal[None, None, :, :, None], 0.0)
+    scan = torch.einsum("bcskh,bckhp->bcshp", coefficients, chunk_x.float())
+    result = state + scan + chunk_x.float() * residual_scale.float()[None, None, None, :, None]
+    return result.reshape_as(x).to(x.dtype)
+
+
+def layer_norm_backward(x, dy, weight, mean, rstd):
+    normalized = (x.float() - mean[:, None]) * rstd[:, None]
+    gradient = dy.float()
+    weighted = gradient * weight.float()
+    dx = (weighted - weighted.mean(dim=1, keepdim=True)
+          - normalized * (weighted * normalized).mean(dim=1, keepdim=True)) * rstd[:, None]
+    return dx.to(x.dtype), (gradient * normalized).sum(dim=0), gradient.sum(dim=0)
+
+
+def group_norm_backward(x, grad_y, weight, mean, rstd):
+    batch, channels, spatial = x.shape
+    groups = mean.shape[1]
+    grouped = x.float().reshape(batch, groups, channels // groups, spatial)
+    normalized = (grouped - mean.float()[..., None, None]) * rstd.float()[..., None, None]
+    gradient = grad_y.float().reshape_as(grouped)
+    weighted = gradient * weight.float().reshape(groups, channels // groups)[None, :, :, None]
+    inverse_elements = 1.0 / (channels // groups * spatial)
+    total = weighted.sum(dim=(2, 3), keepdim=True)
+    projection = (weighted * normalized).sum(dim=(2, 3), keepdim=True)
+    dx = rstd.float()[..., None, None] * (weighted - total * inverse_elements - normalized * projection * inverse_elements)
+    dw = (gradient * normalized).sum(dim=(0, 3)).reshape(-1)
+    db = gradient.sum(dim=(0, 3)).reshape(-1)
+    return dx.reshape_as(x).to(x.dtype), dw.to(weight.dtype), db.to(weight.dtype)
+
+
+def dropout(x, mixed_seed, drop_probability, inverse_keep_probability):
+    offsets = torch.arange(x.numel(), dtype=torch.int32).reshape(x.shape)
+    hashed = offsets * 1103515245 + mixed_seed
+    hashed = hashed ^ (hashed >> 16)
+    hashed = hashed ^ (hashed << 8)
+    hashed = hashed ^ (hashed >> 4)
+    random = (hashed & 0x7FFFFFFF).float() / 2147483647.0
+    scaled = x * torch.tensor(inverse_keep_probability, dtype=x.dtype)
+    return torch.where(random > drop_probability, scaled, 0.0)
+
+
+def unique_consecutive(values, run_lengths):
+    starts = torch.ones_like(values, dtype=torch.bool)
+    starts[:, 1:] = values[:, 1:] != values[:, :-1]
+    groups = starts.to(torch.int32).cumsum(dim=1, dtype=torch.int32) - 1
+    output = torch.zeros_like(values)
+    rows, columns = torch.nonzero(starts, as_tuple=True)
+    output[rows, groups[rows, columns].long()] = values[rows, columns]
+    run_lengths.scatter_add_(1, groups.long(), torch.ones_like(values))
+    counts = starts.sum(dim=1, dtype=torch.int32)
+    return output, groups, counts
+
+
+def prepare_attention_backward(query, key, value, grad_output, scale):
+    q, k, v = (tensor.float().requires_grad_(True) for tensor in (query, key, value))
+    group = query.shape[1] // key.shape[1]
+    scores = (q @ k.repeat_interleave(group, dim=1).transpose(-2, -1)) * scale
+    causal = torch.ones(scores.shape[-2:], dtype=torch.bool).tril()
+    scores = scores.masked_fill(~causal, -float("inf"))
+    output = torch.softmax(scores, dim=-1) @ v.repeat_interleave(group, dim=1)
+    lse = torch.logsumexp(scores.detach(), dim=-1) * np.log2(np.e)
+
+    def launch():
+        gradients = torch.autograd.grad(output, (q, k, v), grad_output.float(), retain_graph=True)
+        return tuple(gradient.to(tensor.dtype) for gradient, tensor in zip(gradients, (query, key, value)))
+
+    return output.detach().to(query.dtype), lse, launch
+
+
+def block_scaled_matmul(lhs, lhs_scale, rhs, rhs_scale):
+    def scales(raw):
+        decoded = torch.exp2(raw.float() - 127.0)
+        return torch.where(raw == 255, float("nan"), decoded)
+
+    left = lhs.float() * scales(lhs_scale)[..., None]
+    right = rhs.float() * scales(rhs_scale)[:, None, :]
+    return left.reshape(lhs.shape[0], -1) @ right.reshape(-1, rhs.shape[2])
+
+
+def block_sparse_matmul(lhs, rhs, block_mask):
+    rows, depth = lhs.shape
+    columns = rhs.shape[1]
+    block_m, block_n, block_k = (rows // block_mask.shape[0], columns // block_mask.shape[1],
+                                 depth // block_mask.shape[2])
+    left, right = lhs.float(), rhs.float()
+    output = torch.empty((rows, columns), dtype=lhs.dtype)
+    for row in range(block_mask.shape[0]):
+        row_slice = slice(row * block_m, (row + 1) * block_m)
+        for column in range(block_mask.shape[1]):
+            column_slice = slice(column * block_n, (column + 1) * block_n)
+            accumulator = torch.zeros((block_m, block_n), dtype=torch.float32)
+            for block in torch.nonzero(block_mask[row, column], as_tuple=True)[0].tolist():
+                reduction = slice(block * block_k, (block + 1) * block_k)
+                accumulator += left[row_slice, reduction] @ right[reduction, column_slice]
+            output[row_slice, column_slice] = accumulator.to(lhs.dtype)
+    return output

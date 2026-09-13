@@ -5,10 +5,17 @@ import torch
 from kernels.normalization.dropout_residual_rms_norm import (
     FEATURES,
     KEEP_PROBABILITY,
-    ROWS,
-    SEED,
+    ROWS as RMS_ROWS,
+    SEED as RMS_SEED,
     dropout_residual_rms_norm_backward_data,
     dropout_residual_rms_norm_forward,
+)
+from kernels.regularization.dropout import (
+    DROP_PROBABILITY,
+    FEATURES as DROPOUT_FEATURES,
+    ROWS as DROPOUT_ROWS,
+    SEED as DROPOUT_SEED,
+    xor_shift_dropout,
 )
 from kernels.simulation.monte_carlo import barrier_option_paths
 
@@ -24,7 +31,7 @@ def dropout_residual_rms_norm(context):
     inverse_keep_probability = 1.0 / KEEP_PROBABILITY
     epsilon = 1.0e-6
     weight_offset = 1.0
-    shape = (ROWS, FEATURES)
+    shape = (RMS_ROWS, FEATURES)
     x = torch.randn(shape, dtype=torch.bfloat16) * 0.5
     residual = torch.randn_like(x) * 0.5
     weight = torch.randn((FEATURES,), dtype=torch.bfloat16)
@@ -34,7 +41,7 @@ def dropout_residual_rms_norm(context):
         x,
         residual,
         weight,
-        SEED,
+        RMS_SEED,
         KEEP_PROBABILITY,
         inverse_keep_probability,
         inverse_features,
@@ -47,7 +54,7 @@ def dropout_residual_rms_norm(context):
         weight,
         dnormalized,
         dresidual,
-        SEED,
+        RMS_SEED,
         KEEP_PROBABILITY,
         inverse_keep_probability,
         inverse_features,
@@ -87,7 +94,7 @@ def dropout_residual_rms_norm(context):
             weight,
             dnormalized,
             dresidual,
-            SEED,
+            RMS_SEED,
             KEEP_PROBABILITY,
             inverse_keep_probability,
             inverse_features,
@@ -107,6 +114,28 @@ def dropout_residual_rms_norm(context):
     )
 
 
+def _mix_dropout_seed(seed: int) -> int:
+    mixed = (int(seed) * 2654435761) & 0xFFFFFFFF
+    if mixed >= 0x80000000:
+        mixed -= 0x100000000
+    return mixed
+
+
+def dropout(context):
+    configure_cpu_budget()
+    x = torch.randn((DROPOUT_ROWS, DROPOUT_FEATURES), dtype=torch.float16)
+    probability = DROP_PROBABILITY
+    mixed_seed = _mix_dropout_seed(DROPOUT_SEED)
+    inverse_keep = 1.0 / (1.0 - probability)
+    return prepare_host_comparison(
+        context,
+        xor_shift_dropout,
+        (x, mixed_seed, probability, inverse_keep),
+        "dropout",
+        Tolerance(atol=0.0),
+    )
+
+
 def barrier_option(context):
     configure_cpu_budget()
     comparison = prepare_host_comparison(
@@ -120,6 +149,7 @@ def barrier_option(context):
 
 
 CASES = {
+    "dropout": dropout,
     "dropout_residual_rms_norm": dropout_residual_rms_norm,
     "barrier_option_paths": barrier_option,
 }

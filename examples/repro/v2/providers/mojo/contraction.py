@@ -1,11 +1,16 @@
 import math
+import intent
 import torch
+from kernels.contraction.block_scaled import block_scaled_matmul
+from kernels.contraction.block_sparse import block_sparse_matmul
 from kernels.contraction.gemm import Activation, gemm_f32, bf16_gemm, gemm as half_gemm_definition
 from kernels.contraction.batched_gemm import batched_gemm_nn
 from kernels.contraction.batched_gemm import batched_gemm_nt as batched_gemm_nt_definition
 from kernels.contraction.batched_gemm import batched_gemm_tn as batched_gemm_tn_definition
 from kernels.contraction.batched_gemm import batched_gemm_tt as batched_gemm_tt_definition
 from kernels.contraction.dual_gemm import gated_dual_gemm
+from kernels.contraction.qkv import fused_qkv_projection
+from kernels.contraction.weight_only_int4 import fp8_e4m3_matmul
 from kernels.contraction.mla import mla_head_projection as mla_head_projection_definition
 from ...model import Tolerance
 from .common import configure_cpu_budget, prepare_comparison, prepare_host_comparison
@@ -113,6 +118,74 @@ def mla_head_value_projection(context):
     )
 
 
+def fp8_gemm(context):
+    lhs = torch.randn((4096, 4096), dtype=torch.float16).to(torch.float8_e4m3fn)
+    rhs = torch.randn((14336, 4096), dtype=torch.float16).to(torch.float8_e4m3fn)
+    return prepare_host_comparison(context, fp8_e4m3_matmul, (lhs, rhs), "fp8_matmul",
+                                   Tolerance(atol=0.5, rtol=5e-2))
+
+
+def _block_quantize_mxfp8(x, block_size):
+    dtype_max = torch.finfo(torch.float8_e4m3fn).max
+    x_block = x.reshape(*x.shape[:-1], x.shape[-1] // block_size, block_size)
+    scale = torch.max(x_block.abs(), dim=-1, keepdims=True)[0]
+    scale = torch.clamp(scale / dtype_max, min=1e-12)
+    scale = torch.pow(2.0, torch.ceil(torch.log2(scale)))
+    x_q = (x_block / scale).to(torch.float8_e4m3fn).reshape(x.shape)
+    scale = scale.to(torch.float8_e8m0fnu).squeeze(-1)
+    return x_q, scale
+
+
+def mxfp8_gemm(context):
+    configure_cpu_budget()
+    m, k, n, block = 4096, 4096, 14336, 32
+    lhs_rows, lhs_scale_rows = _block_quantize_mxfp8(
+        torch.randn((m, k), dtype=torch.float32), block
+    )
+    rhs_rows, rhs_scale_rows = _block_quantize_mxfp8(
+        torch.randn((n, k), dtype=torch.float32), block
+    )
+    lhs = lhs_rows.view(m, k // block, block)
+    lhs_scale = lhs_scale_rows.view(torch.uint8)
+    rhs = rhs_rows.T.view(k // block, block, n)
+    rhs_scale = rhs_scale_rows.T.view(torch.uint8)
+    return prepare_host_comparison(
+        context,
+        block_scaled_matmul,
+        (lhs, lhs_scale, rhs, rhs_scale),
+        "block_scaled_matmul",
+        Tolerance(atol=1.0, rtol=2e-2),
+    )
+
+
+def block_sparse_gemm(context):
+    configure_cpu_budget()
+    dimension = 4096
+    lhs = torch.randn((dimension, dimension), dtype=torch.float16)
+    rhs = torch.randn_like(lhs)
+    mask = (torch.rand((32, 32, 128)) > 0.5).to(torch.uint8)
+    return prepare_host_comparison(
+        context,
+        block_sparse_matmul,
+        (lhs, rhs, mask),
+        "block_sparse_matmul",
+        Tolerance(atol=5e-2, rtol=2e-2),
+    )
+
+
+def qkv_projection(context):
+    configure_cpu_budget()
+    tokens = hidden = projection = 4096
+    x = torch.randn((tokens, hidden), dtype=torch.float16)
+    weights = tuple(
+        torch.randn((hidden, projection), dtype=torch.float16) for _ in range(3)
+    )
+    packed_weights = torch.stack(weights)
+
+    return prepare_host_comparison(context, fused_qkv_projection, (x, packed_weights),
+                                   "qkv_projection", Tolerance(atol=2e-2, rtol=1e-2))
+
+
 def dual_gemm(context):
     configure_cpu_budget()
     x = torch.randn((2048, 4096), dtype=torch.float16)
@@ -133,4 +206,6 @@ CASES = {"dense_gemm_f32": gemm, "dense_gemm": half_gemm, "tilegym_dense_gemm": 
          "batched_gemm_nt": batched_gemm_nt, "batched_gemm_tt": batched_gemm_tt,
          "mla_head_query_projection": mla_head_query_projection,
          "mla_head_value_projection": mla_head_value_projection,
-         "gated_dual_gemm": dual_gemm}
+         "qkv_projection": qkv_projection,
+         "gated_dual_gemm": dual_gemm, "fp8_gemm": fp8_gemm,
+         "mxfp8_gemm": mxfp8_gemm, "block_sparse_gemm": block_sparse_gemm}
