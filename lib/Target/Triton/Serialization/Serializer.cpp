@@ -780,6 +780,10 @@ private:
     }
     if (descriptorChoice)
       call += ", " + descriptorChoice.getEligibilityArgument().str();
+    // Ordinary arithmetic preserves rounding and subnormals; dot is explicit.
+    if (!first)
+      call += ", ";
+    call += "enable_fp_fusion=False, enable_reflect_ftz=False";
     line("with _intent_tuning_hooks:", 1);
     line(call + ")", 2);
     output << "\n";
