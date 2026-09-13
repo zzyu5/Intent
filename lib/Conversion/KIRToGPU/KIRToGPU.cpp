@@ -5235,6 +5235,38 @@ LogicalResult finalizeParallelWorkset(ParallelWorkset &workset,
   return success();
 }
 
+bool capturesScanPrefixAxis(const LogicalWorksetFact &workset,
+                            CanonicalKernelAnalysis &analysis) {
+  if (workset.singleton || !workset.parallel || !workset.body)
+    return false;
+  SmallVector<CoordinateOrigin> worksetCoordinates;
+  for (BlockArgument coordinate : workset.coordinates) {
+    CoordinateProvenance provenance = analysis.coordinateProvenance(coordinate);
+    if (provenance.known)
+      worksetCoordinates.append(provenance.origins.begin(),
+                                provenance.origins.end());
+  }
+  WalkResult result = workset.body->walk([&](intent::GatherOp gather) {
+    auto scan = gather.getInputs().front().getDefiningOp<intent::ScanOp>();
+    if (!scan || workset.parallel->isProperAncestor(scan))
+      return WalkResult::advance();
+    FailureOr<IndexRelationFact> relation = analysis.indexRelation(gather);
+    if (failed(relation))
+      return WalkResult::advance();
+    for (const IndexTermFact &term : relation->terms) {
+      if (!term.sourceAxis || *term.sourceAxis != scan.getAxis() ||
+          !term.coordinate.known)
+        continue;
+      if (llvm::any_of(term.coordinate.origins, [&](const auto &origin) {
+            return llvm::is_contained(worksetCoordinates, origin);
+          }))
+        return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return result.wasInterrupted();
+}
+
 LogicalResult constructGPUProgram(ModuleOp module,
                                   const GPUCapabilities &capabilities,
                                   func::FuncOp function) {
@@ -5247,6 +5279,18 @@ LogicalResult constructGPUProgram(ModuleOp module,
       canonicalAnalysis.logicalWorksets(function);
   if (failed(logicalWorksets))
     return failure();
+  if (llvm::any_of(*logicalWorksets, [&](const auto &workset) {
+        return capturesScanPrefixAxis(workset, canonicalAnalysis);
+      })) {
+    // Keep a captured prefix and its consumers in one execution group.  The
+    // prefix axis is dependent even when the consuming iterations are unordered.
+    LogicalWorksetFact singleton;
+    singleton.state = CanonicalFactState::Exact;
+    singleton.body = &function.getBody().front();
+    singleton.singleton = true;
+    logicalWorksets->clear();
+    logicalWorksets->push_back(std::move(singleton));
+  }
   SmallVector<ParallelWorkset> worksets;
   for (const LogicalWorksetFact &fact : *logicalWorksets) {
     if (!fact.isExact() || !fact.body)

@@ -13,12 +13,20 @@ bool isScalar(Type type) {
   return isa<IntegerType, IndexType, FloatType>(type);
 }
 
-bool canPredicate(Block &block) {
+bool canPredicate(Block &block, bool allowStores = false) {
   for (Operation &operation : block.without_terminator()) {
+    if (auto store = dyn_cast<StoreOp>(operation)) {
+      if (!allowStores || !isScalar(store.getValue().getType()) ||
+          !llvm::all_of(store.getCoordinates(), [](Value coordinate) {
+            return isScalar(coordinate.getType());
+          }))
+        return false;
+      continue;
+    }
     if (operation.getNumRegions() || !operation.getNumResults() ||
         !llvm::all_of(operation.getResultTypes(), isScalar))
       return false;
-    if (isa<LoadOp>(operation))
+    if (isa<LoadOp, GatherOp>(operation))
       continue;
     if (auto binary = dyn_cast<BinaryOp>(operation)) {
       auto kind = binary.getOperatorKind();
@@ -46,28 +54,57 @@ SmallVector<Value> predicateBlock(OpBuilder &builder, Block &block,
                                   Value predicate) {
   IRMapping mapping;
   for (Operation &operation : block.without_terminator()) {
+    auto maskedValidity = [&](Value valid) -> Value {
+      if (!valid)
+        return predicate;
+      return builder.create<BinaryOp>(
+          operation.getLoc(), builder.getI1Type(), predicate,
+          mapping.lookupOrDefault(valid), BinaryOperator::LogicalAnd);
+    };
+    auto mappedCoordinates = [&](ValueRange coordinates) {
+      SmallVector<Value> result;
+      for (Value coordinate : coordinates)
+        result.push_back(mapping.lookupOrDefault(coordinate));
+      return result;
+    };
+    auto mappedFill = [&](Value fill, Type type) -> Value {
+      return fill ? mapping.lookupOrDefault(fill)
+                  : builder.create<arith::ConstantOp>(
+                        operation.getLoc(), builder.getZeroAttr(type));
+    };
+    if (auto store = dyn_cast<StoreOp>(operation)) {
+      auto replacement = builder.create<StoreOp>(
+          store.getLoc(), mapping.lookupOrDefault(store.getResource()),
+          mappedCoordinates(store.getCoordinates()),
+          mapping.lookupOrDefault(store.getValue()),
+          maskedValidity(store.getValid()), store.getSourceAxes());
+      if (Attribute origin = store->getAttr(originAttr))
+        replacement->setAttr(originAttr, origin);
+      continue;
+    }
+    if (auto gather = dyn_cast<GatherOp>(operation)) {
+      auto replacement = builder.create<GatherOp>(
+          gather.getLoc(), gather.getType(),
+          mapping.lookupOrDefault(gather.getSource()),
+          mappedCoordinates(gather.getCoordinates()),
+          maskedValidity(gather.getValid()),
+          mappedFill(gather.getFill(), gather.getType()), gather.getSourceAxes());
+      if (Attribute origin = gather->getAttr(originAttr))
+        replacement->setAttr(originAttr, origin);
+      mapping.map(gather.getResult(), replacement.getResult());
+      continue;
+    }
     auto load = dyn_cast<LoadOp>(operation);
     if (!load) {
       builder.clone(operation, mapping);
       continue;
     }
-    SmallVector<Value> coordinates;
-    for (Value coordinate : load.getCoordinates())
-      coordinates.push_back(mapping.lookupOrDefault(coordinate));
-    Value valid = predicate;
-    if (load.getValid())
-      valid = builder.create<BinaryOp>(
-          load.getLoc(), builder.getI1Type(), predicate,
-          mapping.lookupOrDefault(load.getValid()), BinaryOperator::LogicalAnd);
-    Value fill = load.getFill()
-                     ? mapping.lookupOrDefault(load.getFill())
-                     : builder.create<arith::ConstantOp>(
-                           load.getLoc(), builder.getZeroAttr(load.getType()));
     // Untaken branches must not issue memory accesses, even when the original
     // read relied on its enclosing condition to establish valid coordinates.
     auto replacement = builder.create<LoadOp>(
         load.getLoc(), load.getType(), mapping.lookupOrDefault(load.getResource()),
-        coordinates, valid, fill, load.getSourceAxes());
+        mappedCoordinates(load.getCoordinates()), maskedValidity(load.getValid()),
+        mappedFill(load.getFill(), load.getType()), load.getSourceAxes());
     if (Attribute origin = load->getAttr(originAttr))
       replacement->setAttr(originAttr, origin);
     mapping.map(load.getResult(), replacement.getResult());
@@ -88,7 +125,22 @@ LogicalResult predicateScalarControl(ModuleOp module) {
   kernel->walk<WalkOrder::PostOrder>(
       [&](scf::IfOp conditional) { conditionals.push_back(conditional); });
   for (scf::IfOp conditional : conditionals) {
-    if (!conditional.getNumResults() || conditional.getElseRegion().empty() ||
+    if (conditional->hasAttr(executionGroupAttr))
+      continue;
+    if (!conditional.getNumResults()) {
+      bool emptyElse = conditional.getElseRegion().empty() ||
+          conditional.getElseRegion().front().without_terminator().empty();
+      if (!emptyElse ||
+          !canPredicate(conditional.getThenRegion().front(),
+                        /*allowStores=*/true))
+        continue;
+      OpBuilder builder(conditional);
+      predicateBlock(builder, conditional.getThenRegion().front(),
+                     conditional.getCondition());
+      conditional.erase();
+      continue;
+    }
+    if (conditional.getElseRegion().empty() ||
         !llvm::all_of(conditional.getResultTypes(), isScalar) ||
         !canPredicate(conditional.getThenRegion().front()) ||
         !canPredicate(conditional.getElseRegion().front()))
