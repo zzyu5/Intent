@@ -1097,11 +1097,19 @@ FailureOr<Value> materializeReplayedValue(
       return failure();
   }
   bool projectionFailed = false;
-  auto replayProjection = [&](Type type) {
+  auto replayProjection = [&](Type type,
+                              std::optional<unsigned> axis = std::nullopt) {
     PhysicalAxisProjection result;
     for (PhysicalSourceAxis occurrence : replaySources) {
-      PhysicalAxisProjection current = queryFragmentAxis(type, occurrence);
-      if (current.state == PhysicalFactState::Ambiguous ||
+      auto projections = queryFragmentAxes(type, occurrence);
+      if (axis)
+        llvm::erase_if(projections, [&](PhysicalAxisProjection projection) {
+          return projection.fragmentAxis != *axis;
+        });
+      PhysicalAxisProjection current;
+      if (projections.size() == 1)
+        current = projections.front();
+      if (projections.size() > 1 ||
           (result.isExact() && current.isExact() &&
            (result.fragmentAxis != current.fragmentAxis ||
             result.dimensionId != current.dimensionId))) {
@@ -1159,11 +1167,12 @@ FailureOr<Value> materializeReplayedValue(
   auto carriesReplaySource = [&](Type type) {
     return replaceReplayType(type) != type;
   };
-  auto selectedReplayAxis = [&](Value current)
+  auto selectedReplayAxis = [&](Value current,
+                                std::optional<unsigned> axis = std::nullopt)
       -> std::optional<unsigned> {
     auto fragment = dyn_cast<FragmentType>(current.getType());
     PhysicalAxisProjection projection =
-        fragment ? replayProjection(fragment)
+        fragment ? replayProjection(fragment, axis)
                  : PhysicalAxisProjection{};
     if (!fragment || !projection.isExact())
       return std::nullopt;
@@ -1217,33 +1226,68 @@ FailureOr<Value> materializeReplayedValue(
     }
   };
 
-  std::function<FailureOr<Value>(Value)> materialize =
-      [&](Value current) -> FailureOr<Value> {
-    if (Value mapped = mapping.lookupOrNull(current))
+  llvm::DenseMap<std::pair<Value, unsigned>, Value> axisValues;
+  auto hasMultipleReplayAxes = [&](Type type) {
+    std::optional<unsigned> selected;
+    for (PhysicalSourceAxis occurrence : replaySources)
+      for (PhysicalAxisProjection projection :
+           queryFragmentAxes(type, occurrence)) {
+        if (selected && *selected != projection.fragmentAxis)
+          return true;
+        selected = projection.fragmentAxis;
+      }
+    return false;
+  };
+  auto remember = [&](Value original, Value replacement,
+                       std::optional<unsigned> axis) {
+    if (axis)
+      axisValues[{original, *axis}] = replacement;
+    if (!hasMultipleReplayAxes(original.getType()))
+      mapping.map(original, replacement);
+  };
+  std::function<FailureOr<Value>(Value, std::optional<unsigned>)> materialize =
+      [&](Value current,
+          std::optional<unsigned> requestedAxis) -> FailureOr<Value> {
+    auto fragment = dyn_cast<FragmentType>(current.getType());
+    std::optional<unsigned> projection =
+        selectedReplayAxis(current, requestedAxis);
+    if (projection) {
+      auto cached = axisValues.find({current, *projection});
+      if (cached != axisValues.end())
+        return cached->second;
+    }
+    if (Value mapped = mapping.lookupOrNull(current)) {
+      // A prebound load must identify its occurrence by the changed axis alone.
+      if (hasMultipleReplayAxes(current.getType()) &&
+          (!projection || fragment.getShape()[*projection] == blockedExtent ||
+           mapped.getType() != replaceReplayAxis(fragment, *projection)))
+        return failure();
       return mapped;
+    }
     if (auto extract = current.getDefiningOp<ExtractOp>()) {
       if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>()) {
         uint64_t field = extract.getField();
         if (field >= record.getFields().size())
           return failure();
-        FailureOr<Value> replayed = materialize(record.getFields()[field]);
-        if (succeeded(replayed) && !mapping.lookupOrNull(current))
-          mapping.map(current, *replayed);
+        FailureOr<Value> replayed =
+            materialize(record.getFields()[field], projection);
+        if (succeeded(replayed))
+          remember(current, *replayed, projection);
         return replayed;
       }
       if (carriesReplaySource(extract.getRecord().getType())) {
-        FailureOr<Value> replayedRecord = materialize(extract.getRecord());
+        FailureOr<Value> replayedRecord =
+            materialize(extract.getRecord(), std::nullopt);
         if (failed(replayedRecord))
           return failure();
         Type target = replaceReplayType(current.getType());
         Value replayed = builder.create<ExtractOp>(
             location, target, *replayedRecord, extract.getField());
-        mapping.map(current, replayed);
+        remember(current, replayed, projection);
         return replayed;
       }
     }
 
-    auto fragment = dyn_cast<FragmentType>(current.getType());
     if (!fragment && carriesReplaySource(current.getType())) {
       Operation *producer = current.getDefiningOp();
       if (!producer ||
@@ -1253,7 +1297,7 @@ FailureOr<Value> materializeReplayedValue(
       for (Value operand : producer->getOperands()) {
         if (!carriesReplaySource(operand.getType()))
           continue;
-        FailureOr<Value> replayed = materialize(operand);
+        FailureOr<Value> replayed = materialize(operand, std::nullopt);
         if (failed(replayed))
           return failure();
         if (!mapping.lookupOrNull(operand) && *replayed != operand)
@@ -1286,7 +1330,6 @@ FailureOr<Value> materializeReplayedValue(
       Value replayed = clone->getResult(result.getResultNumber());
       return replayed;
     }
-    std::optional<unsigned> projection = selectedReplayAxis(current);
     if (!fragment || !projection)
       return current;
     unsigned axis = *projection;
@@ -1295,8 +1338,55 @@ FailureOr<Value> materializeReplayedValue(
       return failure();
 
     auto replayOperand = [&](Value operand) -> FailureOr<Value> {
-      return selectedReplayAxis(operand) ? materialize(operand)
-                                         : FailureOr<Value>(operand);
+      std::optional<unsigned> operandAxis;
+      auto input = dyn_cast<FragmentType>(operand.getType());
+      if (input && (hasMultipleReplayAxes(input) ||
+                    hasMultipleReplayAxes(fragment))) {
+        auto reduction = dyn_cast<ReduceOp>(producer);
+        bool reductionSource = reduction && llvm::is_contained(
+            reduction.getInputs().take_front(reduction.getSourceCount()), operand);
+        if (isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp,
+                BroadcastOp, SplatOp>(producer) ||
+            (reduction && !reductionSource)) {
+          BroadcastProjection relation = queryAxisProjection(input, fragment);
+          if (!relation.isExact())
+            return failure();
+          operandAxis = relation.targetToSource[axis];
+          if (!operandAxis)
+            return operand;
+        } else if (auto transpose = dyn_cast<TransposeOp>(producer)) {
+          operandAxis = transpose.getPermutation()[axis];
+        } else if (auto reshape = dyn_cast<ReshapeOp>(producer)) {
+          for (Attribute attribute : reshape.getReassociation()) {
+            auto group = cast<ReshapeGroupAttr>(attribute);
+            if (group.getSourceAxes().empty() &&
+                llvm::is_contained(group.getResultAxes().asArrayRef(),
+                                   static_cast<int64_t>(axis)))
+              return operand;
+            if (group.getResultAxes().size() == 1 &&
+                group.getResultAxes()[0] == static_cast<int64_t>(axis) &&
+                group.getSourceAxes().size() == 1)
+              operandAxis = group.getSourceAxes()[0];
+          }
+        } else if (reduction) {
+          SmallVector<unsigned> freeAxes;
+          for (unsigned inputAxis = 0; inputAxis < input.getShape().size();
+               ++inputAxis)
+            if (!llvm::is_contained(reduction.getAxes(),
+                                   static_cast<int64_t>(inputAxis)))
+              freeAxes.push_back(inputAxis);
+          if (axis < freeAxes.size())
+            operandAxis = freeAxes[axis];
+        }
+        if (!operandAxis)
+          return failure();
+      }
+      if (Value mapped = mapping.lookupOrNull(operand);
+          mapped && !hasMultipleReplayAxes(operand.getType()))
+        return mapped;
+      return selectedReplayAxis(operand, operandAxis)
+                 ? materialize(operand, operandAxis)
+                 : FailureOr<Value>(operand);
     };
     auto combineTail = [&](FragmentType target,
                            Value valid) -> FailureOr<Value> {
@@ -1358,18 +1448,78 @@ FailureOr<Value> materializeReplayedValue(
               input.getShape()[*inputAxis] == fragment.getShape()[axis]) {
             // An extent-preserving projection can rename an occurrence. Replay
             // its input with that input's identity, retaining the output map.
+            ReplayMaterializationOptions inputOptions = options;
+            inputOptions.fragmentAxis = *inputAxis;
             FailureOr<Value> replayed = materializeReplayedValue(
                 builder, location, broadcast.getValue(),
-                sourceAxisIdentity(inputMap), blockedExtent, mapping, options);
+                sourceAxisIdentity(inputMap), blockedExtent, mapping,
+                inputOptions);
             if (failed(replayed))
               return failure();
             Value projected = builder.create<BroadcastOp>(
                 location, replaceReplayAxis(fragment, axis), *replayed);
-            mapping.map(current, projected);
+            remember(current, projected, projection);
             return projected;
           }
         }
       }
+    }
+
+    if (auto contract = dyn_cast<ContractOp>(producer);
+        contract && hasMultipleReplayAxes(fragment)) {
+      SmallVector<std::pair<unsigned, unsigned>> freeAxes;
+      auto lhsType = cast<FragmentType>(contract.getLhs().getType());
+      auto rhsType = cast<FragmentType>(contract.getRhs().getType());
+      for (unsigned inputAxis = 0; inputAxis < lhsType.getShape().size();
+           ++inputAxis)
+        if (!llvm::is_contained(contract.getLhsReductionAxes(),
+                               static_cast<int64_t>(inputAxis)))
+          freeAxes.emplace_back(0, inputAxis);
+      for (unsigned inputAxis = 0; inputAxis < rhsType.getShape().size();
+           ++inputAxis)
+        if (!llvm::is_contained(contract.getRhsReductionAxes(),
+                               static_cast<int64_t>(inputAxis)) &&
+            !llvm::is_contained(contract.getRhsBatchAxes(),
+                               static_cast<int64_t>(inputAxis)))
+          freeAxes.emplace_back(1, inputAxis);
+      if (axis >= freeAxes.size())
+        return failure();
+      // One SSA value can have different matrix roles at the two input uses.
+      SmallVector<Value> operands{contract.getLhs(), contract.getRhs(),
+                                   contract.getAccumulator()};
+      auto replayAxis = [&](unsigned operand,
+                            unsigned inputAxis) -> LogicalResult {
+        auto type = cast<FragmentType>(operands[operand].getType());
+        auto axisMap = cast<AxisMapAttr>(type.getAxisMaps()[inputAxis]);
+        FailureOr<Value> replayed = failure();
+        if (llvm::is_contained(replaySources, sourceAxisIdentity(axisMap))) {
+          replayed = materialize(operands[operand], inputAxis);
+        } else {
+          ReplayMaterializationOptions inputOptions = options;
+          inputOptions.fragmentAxis = inputAxis;
+          replayed = materializeReplayedValue(
+              builder, location, operands[operand], sourceAxisIdentity(axisMap),
+              blockedExtent, mapping, inputOptions);
+        }
+        if (failed(replayed))
+          return failure();
+        operands[operand] = *replayed;
+        return success();
+      };
+      auto [operand, inputAxis] = freeAxes[axis];
+      if (failed(replayAxis(operand, inputAxis)) || failed(replayAxis(2, axis)))
+        return failure();
+      if (operand == 0)
+        for (auto [batch, lhsAxis] : llvm::enumerate(contract.getLhsBatchAxes()))
+          if (lhsAxis == static_cast<int64_t>(inputAxis) &&
+              failed(replayAxis(1, contract.getRhsBatchAxes()[batch])))
+            return failure();
+      IRMapping cloneMapping(mapping);
+      Operation *clone = builder.clone(*producer, cloneMapping);
+      clone->setOperands(operands);
+      clone->getResult(0).setType(replaceReplayAxis(fragment, axis));
+      remember(current, clone->getResult(0), projection);
+      return clone->getResult(0);
     }
 
     if (auto load = dyn_cast<LoadOp>(producer)) {
@@ -1399,7 +1549,7 @@ FailureOr<Value> materializeReplayedValue(
           *fill, load.getSourceAxes());
       if (Attribute origin = load->getAttr(originAttr))
         clone->setAttr(originAttr, origin);
-      mapping.map(current, clone.getResult());
+      remember(current, clone.getResult(), projection);
       return clone.getResult();
     }
     if (auto gather = dyn_cast<GatherOp>(producer)) {
@@ -1432,26 +1582,26 @@ FailureOr<Value> materializeReplayedValue(
           gather.getSourceAxes());
       if (Attribute origin = gather->getAttr(originAttr))
         clone->setAttr(originAttr, origin);
-      mapping.map(current, clone.getResult());
+      remember(current, clone.getResult(), projection);
       return clone.getResult();
     }
     if (!isPhysicalReplayNode(producer, options.scope,
                               /*allowAccesses=*/false))
       return failure();
+    IRMapping cloneMapping(mapping);
     for (Value operand : producer->getOperands()) {
       FailureOr<Value> replayed = replayOperand(operand);
       if (failed(replayed))
         return failure();
-      if (!mapping.lookupOrNull(operand) && *replayed != operand)
-        mapping.map(operand, *replayed);
+      cloneMapping.map(operand, *replayed);
     }
-    Operation *clone = builder.clone(*producer, mapping);
+    Operation *clone = builder.clone(*producer, cloneMapping);
     bool structuredResults = isa<ReduceOp, ScanOp>(clone);
     for (auto [original, cloned] :
          llvm::zip(producer->getResults(), clone->getResults())) {
       if (structuredResults)
         cloned.setType(replaceReplayType(cloned.getType()));
-      if (!mapping.lookupOrNull(original))
+      if (!hasMultipleReplayAxes(original.getType()))
         mapping.map(original, cloned);
     }
     auto result = dyn_cast<OpResult>(current);
@@ -1474,14 +1624,21 @@ FailureOr<Value> materializeReplayedValue(
       auto input = dyn_cast<FragmentType>(reshape.getValue().getType());
       introducedUnitAxis =
           isUnitExtent(clonedType.getShape()[axis]) &&
-          (!input || !queryFragmentAxis(input, source).isExact());
+          (!input || !queryFragmentAxis(input, source).isExact() ||
+           llvm::any_of(reshape.getReassociation(), [&](Attribute attribute) {
+             auto group = cast<ReshapeGroupAttr>(attribute);
+             return group.getSourceAxes().empty() &&
+                    llvm::is_contained(group.getResultAxes().asArrayRef(),
+                                       static_cast<int64_t>(axis));
+           }));
     }
     if (!introducedUnitAxis)
       clonedValue.setType(replaceReplayAxis(clonedType, axis));
+    remember(current, clonedValue, projection);
     return clonedValue;
   };
 
-  FailureOr<Value> result = materialize(value);
+  FailureOr<Value> result = materialize(value, options.fragmentAxis);
   return projectionFailed ? FailureOr<Value>(failure()) : result;
 }
 

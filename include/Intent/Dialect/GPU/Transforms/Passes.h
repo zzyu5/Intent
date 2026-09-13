@@ -12,6 +12,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Support/LogicalResult.h"
 
+#include <optional>
 #include <utility>
 
 namespace intent::gpu {
@@ -20,6 +21,7 @@ struct ReplayMaterializationOptions {
   PhysicalReplayScope scope = PhysicalReplayScope::ValueGraph;
   bool allowAccesses = true;
   llvm::ArrayRef<MakeRangeOp> traversalRanges;
+  std::optional<unsigned> fragmentAxis;
   mlir::Value segmentTail;
   AxisMapAttr segmentMapping;
   bool materializeZeroFill = false;

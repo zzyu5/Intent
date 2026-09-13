@@ -1879,6 +1879,8 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                                     256, 512, 1024, 2048, 4096};
     auto firstSource =
         cast<FragmentType>(reduce.getInputs().front().getType());
+    if (queryFragmentAxes(firstSource, plans.front().sourceIdentity).size() > 1)
+      name += ("_F" + Twine(outerAxis)).str();
     outerChunk = getOrCreatePhysicalParameter(
         kernel, name, ParameterRole::ReductionOuter,
         ParameterCategory::Reduction,
@@ -2063,9 +2065,11 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                 valid, fill, load.getSourceAxes());
             mapping.map(load.getResult(), slicedLoad.getResult());
           }
+          ReplayMaterializationOptions replayOptions;
+          replayOptions.fragmentAxis = plan.reductionAxis;
           FailureOr<Value> replayed = materializeReplayedValue(
               nested, nestedLocation, plan.source, plan.sourceIdentity,
-              outerSliceExtent, mapping);
+              outerSliceExtent, mapping, replayOptions);
           if (failed(replayed)) {
             bodyFailed = true;
             failureReason = "outer-axis source graph could not be sliced";
@@ -2100,8 +2104,8 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
             Value active = nested.create<CompareOp>(
                 nestedLocation, predicateType, outerRange.getResult(),
                 logicalEnd, ComparePredicate::Lt);
-            FailureOr<Value> alignedActive = alignToExecutionSchema(
-                nested, nestedLocation, active, sliced);
+            FailureOr<Value> alignedActive = projectPredicateToFragmentAxis(
+                nested, nestedLocation, active, sliced, outerAxis);
             FailureOr<Value> alignedIdentity = alignToExecutionSchema(
                 nested, nestedLocation, identities[component], sliced);
             if (failed(alignedActive) || failed(alignedIdentity)) {
@@ -2358,6 +2362,9 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
          "_A" + Twine(sourcePlans.front().sourceIdentity.sourceAxis) +
          (sourcePlans.front().sourceIdentity.derived ? "_DERIVED" : ""))
             .str();
+    if (queryFragmentAxes(firstSource,
+                          sourcePlans.front().sourceIdentity).size() > 1)
+      name += ("_F" + Twine(sourcePlans.front().reductionAxis)).str();
     SmallVector<int64_t> candidates{4,   8,    16,   32,   64,   128, 256,
                                     512, 1024, 2048, 4096, 8192};
     chunk = getOrCreatePhysicalParameter(
@@ -2487,13 +2494,19 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
             Value valid = nested.create<CompareOp>(
                 nestedLocation, coordinatePredicate, coordinate.getResult(), end,
                 ComparePredicate::Lt);
-            Value projected = nested.create<BroadcastOp>(
-                nestedLocation, blockedPredicate, valid);
+            FailureOr<Value> projected = projectPredicateToFragmentAxis(
+                nested, nestedLocation, valid, blockedPredicate,
+                plan.reductionAxis);
+            if (failed(projected)) {
+              bodyFailed = true;
+              bodyFailure = "could not project the reduction traversal tail";
+              return;
+            }
             sourceTail = sourceTail
                              ? Value(nested.create<BinaryOp>(
                                    nestedLocation, blockedPredicate, sourceTail,
-                                   projected, BinaryOperator::LogicalAnd))
-                             : projected;
+                                   *projected, BinaryOperator::LogicalAnd))
+                             : *projected;
           }
           for (RootAccess access : accesses[component]) {
             LoadOp load = access.load;
@@ -2557,10 +2570,24 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
             Value valid = nested.create<BroadcastOp>(nestedLocation,
                                                      rootPredicate,
                                                      coordinateValid);
+            auto replayAccessValue = [&](Value value) -> FailureOr<Value> {
+              ReplayMaterializationOptions accessOptions = replayOptions;
+              if (auto type = dyn_cast<FragmentType>(value.getType())) {
+                BroadcastProjection relation =
+                    queryAxisProjection(type, rootType);
+                if (!relation.isExact())
+                  return failure();
+                accessOptions.fragmentAxis =
+                    relation.targetToSource[access.fragmentAxis];
+                if (!accessOptions.fragmentAxis)
+                  return mapping.lookupOrDefault(value);
+              }
+              return materializeReplayedValue(
+                  nested, nestedLocation, value, plan.sourceIdentity,
+                  chunkExtent, mapping, accessOptions);
+            };
             if (load.getValid()) {
-              FailureOr<Value> original = materializeReplayedValue(
-                  nested, nestedLocation, load.getValid(), plan.sourceIdentity,
-                  chunkExtent, mapping, replayOptions);
+              FailureOr<Value> original = replayAccessValue(load.getValid());
               if (failed(original)) {
                 bodyFailed = true;
                 bodyFailure = "could not replay source validity";
@@ -2576,9 +2603,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
             }
             Value fill;
             if (load.getFill()) {
-              FailureOr<Value> replayedFill = materializeReplayedValue(
-                  nested, nestedLocation, load.getFill(), plan.sourceIdentity,
-                  chunkExtent, mapping, replayOptions);
+              FailureOr<Value> replayedFill = replayAccessValue(load.getFill());
               if (failed(replayedFill)) {
                 bodyFailed = true;
                 bodyFailure = "could not replay source fill";
@@ -2635,6 +2660,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
               sourceTail = nested.create<BroadcastOp>(
                   nestedLocation, blockedPredicate, coordinateValid);
           }
+          replayOptions.fragmentAxis = plan.reductionAxis;
           FailureOr<Value> replayed = materializeReplayedValue(
               nested, nestedLocation, plan.source, plan.sourceIdentity,
               chunkExtent, mapping, replayOptions);
@@ -2648,6 +2674,21 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                 nestedLocation, blockedPredicate, sharedTail);
           }
           Value identity = identities[component];
+          if (auto fragment = dyn_cast<FragmentType>(identity.getType());
+              fragment && fragment != blockedSource) {
+            FragmentType expanded = replaceExtent(
+                blockedSource, plan.reductionAxis,
+                expression(reduce.getContext(), PhysicalExprKind::Constant, 1));
+            FailureOr<ArrayAttr> relation =
+                inferReshapeReassociation(fragment, expanded);
+            if (failed(relation)) {
+              bodyFailed = true;
+              bodyFailure = "reduction identity has no free-axis projection";
+              return;
+            }
+            identity = nested.create<ReshapeOp>(
+                nestedLocation, expanded, identity, *relation);
+          }
           if (identity.getType() != blockedSource)
             identity = nested.create<BroadcastOp>(nestedLocation, blockedSource,
                                                   identity);
