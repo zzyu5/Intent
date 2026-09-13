@@ -515,6 +515,10 @@ private:
     for (const ViewABI &view : views)
       if (!view.workspace)
         output << (view.type.getAccess() != 0 ? "True, " : "False, ");
+    output << "), (";
+    for (const ViewABI &view : views)
+      if (!view.workspace)
+        output << (view.type.getAccess() != 1 ? "True, " : "False, ");
     output << "))\n\n@triton.autotune(\n    configs=[\n";
     for (const Config &config : *configs) {
       output << "        triton.Config({";
@@ -776,7 +780,8 @@ private:
     }
     if (descriptorChoice)
       call += ", " + descriptorChoice.getEligibilityArgument().str();
-    line(call + ")", 1);
+    line("with _intent_tuning_hooks:", 1);
+    line(call + ")", 2);
     output << "\n";
   }
 

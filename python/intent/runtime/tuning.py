@@ -38,7 +38,7 @@ class TuningState:
                 groups.append(span)
 
         arguments = list(views)
-        self._copies: list[tuple[object, object]] = []
+        self._copies: list[tuple[object, object, tuple[int, ...]]] = []
         for group in groups:
             if not any(writable[index] for index, _, _, _ in group.entries):
                 continue
@@ -48,6 +48,7 @@ class TuningState:
             scratch = torch.empty(group.end - group.start + padding,
                                   dtype=torch.uint8, device=device)
             copied = set()
+            members = tuple(index for index, _, _, _ in group.entries)
             for index, view, start, end in group.entries:
                 storage = view.untyped_storage()
                 size = end - start
@@ -55,7 +56,7 @@ class TuningState:
                 if (start, size) not in copied:
                     original = torch.empty(0, dtype=torch.uint8, device=device).set_(
                         storage, start - storage.data_ptr(), (size,), (1,))
-                    self._copies.append((original, scratch[offset:offset + size]))
+                    self._copies.append((original, scratch[offset:offset + size], members))
                     copied.add((start, size))
                 byte_offset = view.data_ptr() - group.start + padding
                 arguments[index] = torch.empty(0, dtype=view.dtype, device=device).set_(
@@ -65,12 +66,13 @@ class TuningState:
         self.reset()
 
     def reset(self) -> None:
-        for original, scratch in self._copies:
+        for original, scratch, _ in self._copies:
             scratch.copy_(original)
 
-    def restore(self) -> None:
-        for original, scratch in self._copies:
-            original.copy_(scratch)
+    def restore(self, readable: tuple[bool, ...] | None = None) -> None:
+        for original, scratch, members in self._copies:
+            if readable is None or any(readable[index] for index in members):
+                original.copy_(scratch)
 
     def arguments(self, arguments: tuple) -> tuple:
         self.reset()

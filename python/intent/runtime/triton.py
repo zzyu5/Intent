@@ -4,18 +4,45 @@ from .tuning import TuningState
 
 
 class TuningHooks:
-    def __init__(self, names: tuple[str, ...], writable: tuple[bool, ...]):
+    def __init__(self, names: tuple[str, ...], writable: tuple[bool, ...],
+                 readable: tuple[bool, ...]):
         self.names = names
         self.writable = writable
+        self.readable = readable
+        self.state = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exception_type, exception, traceback):
+        self.finish()
+
+    def finish(self) -> None:
+        if self.state is None:
+            return
+        from torch.utils._python_dispatch import _disable_current_modes
+
+        # Cleanup must also run when measurement fails outside Triton's hooks.
+        try:
+            with _disable_current_modes():
+                self.state.restore()
+        finally:
+            self.state = None
 
     def before(self, arguments: dict, reset_only: bool = False) -> None:
-        if not reset_only:
+        if reset_only:
+            self.finish()
+            return
+        if self.state is None:
             self.state = TuningState(tuple(arguments[name] for name in self.names),
                                      self.writable)
+        self.state.restore(self.readable)
 
     def after(self, arguments: dict, exception: Exception | None) -> None:
-        self.state.restore()
-        del self.state
+        if exception is not None:
+            self.finish()
+        else:
+            self.state.restore(self.readable)
 
     def prune(self, configurations, bounds: dict[str, int]):
         scores = [sum(max(1, (config.kwargs[name] + max(1, bound) - 1) // max(1, bound))
