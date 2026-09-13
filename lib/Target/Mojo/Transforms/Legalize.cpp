@@ -11,6 +11,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/DenseSet.h"
 
 using namespace mlir;
 
@@ -32,6 +33,74 @@ bool supportedType(Type type) {
       isa<Float8E4M3FNType, Float8E5M2Type>(type) ||
       type.isSignlessInteger(8) || type.isSignlessInteger(16) || type.isSignlessInteger(32) ||
       type.isSignlessInteger(64) || type.isInteger(1);
+}
+
+void promotePrivateScratch(func::FuncOp function, int64_t budget) {
+  cpu::PhysicalProgramAnalysis physical(function);
+  auto allocations = physical.allocations();
+  auto alignmentOf = [](auto allocation) -> int64_t {
+    Type element = allocation.getType().getElementType();
+    int64_t bytes = element.isIndex() ? 8 : (element.getIntOrFloatBitWidth() + 7) / 8;
+    return allocation.getAlignment().value_or(bytes);
+  };
+  auto fits = [&](int64_t bytes, int64_t alignment) {
+    return bytes >= 0 && bytes <= budget && alignment > 0 && alignment - 1 <= budget - bytes;
+  };
+  // Count every static slot, including mutually exclusive lifetimes, to bound
+  // the worker frame without relying on the lower compiler's stack coloring.
+  for (auto facts : allocations) {
+    if (!facts.stack) continue;
+    auto allocation = facts.value.getDefiningOp<memref::AllocaOp>();
+    int64_t alignment = alignmentOf(allocation);
+    if (!facts.bytes || !fits(*facts.bytes, alignment)) return;
+    budget -= *facts.bytes + alignment - 1;
+  }
+  for (auto facts : allocations) {
+    auto allocation = facts.value.getDefiningOp<memref::AllocOp>();
+    if (!allocation || !facts.bytes || *facts.bytes <= 0 || *facts.bytes > 1024 ||
+        !allocation.getType().getLayout().isIdentity()) continue;
+    int64_t alignment = alignmentOf(allocation);
+    if (!fits(*facts.bytes, alignment)) continue;
+    SmallVector<Value> aliases{facts.value};
+    llvm::SmallDenseSet<Value> seen;
+    SmallVector<Operation *> users;
+    memref::DeallocOp end;
+    bool closed = true;
+    for (unsigned i = 0; i < aliases.size() && closed; ++i) {
+      Value value = aliases[i];
+      if (!seen.insert(value).second) continue;
+      for (Operation *user : value.getUsers()) {
+        if (auto deallocation = dyn_cast<memref::DeallocOp>(user)) {
+          if (value != facts.value || end || user->getBlock() != allocation->getBlock()) {
+            closed = false; break;
+          }
+          end = deallocation;
+          continue;
+        }
+        if (isa<memref::SubViewOp, memref::CastOp, memref::ReinterpretCastOp,
+                memref::ExtractStridedMetadataOp>(user)) {
+          for (Value result : user->getResults())
+            if (isa<MemRefType>(result.getType())) aliases.push_back(result);
+        } else if (!isa<memref::LoadOp, memref::StoreOp, memref::DimOp,
+                       vector::LoadOp, vector::StoreOp, memref::PrefetchOp>(user)) {
+          closed = false; break;
+        }
+        users.push_back(user);
+      }
+    }
+    if (!closed || !end || !allocation->isBeforeInBlock(end)) continue;
+    if (!llvm::all_of(users, [&](Operation *user) {
+          Operation *ancestor = allocation->getBlock()->findAncestorOpInBlock(*user);
+          return ancestor && allocation->isBeforeInBlock(ancestor) && ancestor->isBeforeInBlock(end);
+        })) continue;
+    OpBuilder builder(allocation);
+    auto stack = builder.create<memref::AllocaOp>(allocation.getLoc(), allocation.getType(),
+        ValueRange{}, allocation.getAlignmentAttr());
+    end.erase();
+    allocation.replaceAllUsesWith(stack.getResult());
+    allocation.erase();
+    budget -= *facts.bytes + alignment - 1;
+  }
 }
 
 LogicalResult checkSurface(ModuleOp module) {
@@ -226,6 +295,8 @@ LogicalResult legalizeProgram(ModuleOp module) {
   arith::populateCeilFloorDivExpandOpsPatterns(integerDivision);
   if (failed(applyPatternsGreedily(module, std::move(integerDivision)))) return failure();
   if (failed(expandAtomicUpdates(module))) return failure();
+  for (func::FuncOp function : module.getOps<func::FuncOp>())
+    promotePrivateScratch(function, capabilities.getPrivateBytes());
   if (failed(cpu::verifyCPUProgram(module, true)) || failed(checkSurface(module))) return failure();
   OpBuilder builder(module.getContext());
   builder.setInsertionPointToStart(module.getBody());
