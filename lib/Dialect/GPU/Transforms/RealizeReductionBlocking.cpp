@@ -2264,7 +2264,8 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
 
 LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                                    ArrayRef<SourcePlan> sourcePlans,
-                                   func::FuncOp kernel) {
+                                   func::FuncOp kernel,
+                                   bool tileProducerFreeAxis) {
   if (sourcePlans.empty())
     return reduce.emitOpError("runtime reduction has no physical sources");
   SmallVector<SmallVector<RootAccess>> accesses;
@@ -2337,11 +2338,13 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
   PhysicalExprAttr sourceExtent = cast<PhysicalExprAttr>(
       firstSource.getShape()[sourcePlans.front().reductionAxis]);
   FailureOr<ParameterOp> fullCoverage = failure();
-  if (!hasNonUnitFreeAxis(reduce))
+  if (!tileProducerFreeAxis && !hasNonUnitFreeAxis(reduce))
     fullCoverage = fullCoverageParameter(kernel, sourceExtent);
   FailureOr<ParameterOp> selectedChunk =
       parameterForExtent(kernel, sourceExtent);
-  ParameterRole reductionRole = ParameterRole::Reduction;
+  ParameterRole reductionRole = tileProducerFreeAxis
+                                    ? ParameterRole::ReductionOuter
+                                    : ParameterRole::Reduction;
   if (auto parent = reduce->getParentOfType<scf::ForOp>())
     if (auto outer = parent.getStep().getDefiningOp<ParameterOp>();
         outer && outer.getParameter().getRole() ==
@@ -2922,7 +2925,8 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
   }
   if (!isCompileTimeExtent(sourceExtent) || hasDerivedSource ||
       hasRuntimeSourceRange || hasConstructionScalarSource)
-    return realizeRuntimeReduce(reduce, sourcePlans, kernel);
+    return realizeRuntimeReduce(reduce, sourcePlans, kernel,
+                                /*tileProducerFreeAxis=*/false);
 
   PhysicalExprAttr blockExtent = nextPowerOfTwo(sourceExtent);
   OpBuilder builder(reduce);
@@ -3028,6 +3032,67 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
   return success();
 }
 
+FailureOr<SourcePlan> nestedScalarReductionSource(ReduceOp reduce,
+                                                func::FuncOp kernel) {
+  if (reduce.getAxes() != ArrayRef<int64_t>{0} ||
+      reduce.getSourceCount() != 1 || reduce.getNumResults() != 1 ||
+      isa<FragmentType, RecordType>(reduce.getResult(0).getType()))
+    return failure();
+  Value source = reduce.getInputs().front();
+  auto type = dyn_cast<FragmentType>(source.getType());
+  if (!type || type.getShape().size() != 1)
+    return failure();
+  FailureOr<ParameterOp> parameter = parameterForExtent(
+      kernel, cast<PhysicalExprAttr>(type.getShape()[0]));
+  PhysicalProgramAnalysis analysis(kernel);
+  if (succeeded(parameter)) {
+    if (!(*parameter)->hasAttr(coverageDimensionAttr))
+      return failure();
+  } else if (!analysis.axisRealization(source, 0).constructionScalarSeed) {
+    return failure();
+  }
+  FailureOr<SourcePlan> plan = analyzeSource(source, 0);
+  if (failed(plan) ||
+      !llvm::all_of(plan->ranges, [](MakeRangeOp range) {
+        return isUnitStepRange(range);
+      }))
+    return failure();
+  PhysicalReplayFact replay = analysis.replayability(
+      source, plan->sourceIdentity, PhysicalReplayScope::ValueGraph,
+      /*allowAccesses=*/true, reduce);
+  if (!replay.isReplayable() ||
+      llvm::any_of(replay.accesses, [&](Operation *access) {
+        auto load = dyn_cast<LoadOp>(access);
+        return !load || !canReplayReadAt(load, reduce);
+      }))
+    return failure();
+
+  SmallVector<Value> values{source};
+  llvm::SmallPtrSet<Operation *, 32> producers;
+  bool hasNestedReduction = false;
+  for (unsigned index = 0; index < values.size(); ++index) {
+    Value value = values[index];
+    if (!queryFragmentAxis(value.getType(), plan->sourceIdentity).isExact())
+      continue;
+    Operation *producer = value.getDefiningOp();
+    if (!producer || !producers.insert(producer).second)
+      continue;
+    if (isa<ScanOp>(producer))
+      return failure();
+    hasNestedReduction |= isa<ReduceOp>(producer);
+    values.append(producer->getOperands().begin(), producer->getOperands().end());
+  }
+  if (!hasNestedReduction)
+    return failure();
+  // A closed producer slice can live inside the outer reduction traversal.
+  // External consumers would still retain the full intermediate fragment.
+  for (Operation *producer : producers)
+    for (Operation *user : producer->getUsers())
+      if (user != reduce && !producers.contains(user))
+        return failure();
+  return plan;
+}
+
 } // namespace
 
 LogicalResult decomposeMultiAxisReductions(ModuleOp module) {
@@ -3068,6 +3133,26 @@ LogicalResult realizeReductionBlocking(ModuleOp module) {
   if (failed(physicalKernel))
     return failure();
   func::FuncOp kernel = *physicalKernel;
+  // Tile a scalar consumer before its row reductions become loop results.
+  // Their existing lowering then runs inside the selected outer traversal.
+  while (true) {
+    ReduceOp selected;
+    std::optional<SourcePlan> source;
+    kernel.walk([&](ReduceOp reduce) {
+      FailureOr<SourcePlan> candidate =
+          nestedScalarReductionSource(reduce, kernel);
+      if (failed(candidate))
+        return WalkResult::advance();
+      selected = reduce;
+      source = std::move(*candidate);
+      return WalkResult::interrupt();
+    });
+    if (!selected)
+      break;
+    if (failed(realizeRuntimeReduce(selected, ArrayRef<SourcePlan>{*source},
+                                    kernel, /*tileProducerFreeAxis=*/true)))
+      return failure();
+  }
   // Pad composed value graphs before their upstream reductions become loops.
   // Padding can erase dead producers, so rebuild the worklist after each change.
   while (true) {
