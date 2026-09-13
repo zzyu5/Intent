@@ -266,9 +266,11 @@ def _benchmark_launch(launch: PreparedLaunch, comparison: PreparedComparison, wa
             launch.launch()
             return (time.perf_counter_ns() - begin) * 1e-6
 
-        for _ in range(warmup):
-            invoke()
         first = invoke()
+        remaining_warmup_ms = warmup - first
+        while remaining_warmup_ms > 0:
+            first = invoke()
+            remaining_warmup_ms -= first
         repetitions = min(50, max(1, int(10.0 / first)))
         return statistics.median(
             sum(invoke() for _ in range(repetitions)) / repetitions for _ in range(7)
