@@ -41,7 +41,8 @@ mlir::LogicalResult blockStructuredComputations(mlir::func::FuncOp function,
                                     const ImplementationRegistry &implementations);
 mlir::LogicalResult vectorizeLoops(mlir::func::FuncOp function, int64_t width,
                                    int64_t replicas, int64_t reductionReplicas);
-mlir::LogicalResult partitionTasks(mlir::func::FuncOp function, int64_t grain);
+mlir::LogicalResult partitionTasks(mlir::func::FuncOp function, int64_t grain,
+                                 const ImplementationRegistry &implementations);
 mlir::LogicalResult isolateTasks(mlir::func::FuncOp function);
 mlir::LogicalResult realizeRegions(mlir::func::FuncOp function, const Configuration &configuration,
                                   const ImplementationRegistry &implementations);

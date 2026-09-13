@@ -1,10 +1,13 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Target/Mojo/Transforms/Passes.h"
+#include "../../../Dialect/CPU/Transforms/ImplementationInputs.h"
 #include "../../../Dialect/CPU/Transforms/Utilities.h"
+#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 using namespace mlir;
@@ -49,16 +52,220 @@ std::optional<LocalEpilogue> localEpilogue(linalg::GenericOp contraction) {
   return LocalEpilogue{allocation, initialization, consumer};
 }
 
+constexpr int64_t indexedRowWindow = 32;
+
+struct IndexedContraction {
+  Value lhs, output;
+  memref::LoadOp load;
+  arith::ExtFOp rightWiden;
+  math::FmaOp fma;
+};
+
+std::optional<IndexedContraction> indexedContraction(linalg::GenericOp operation) {
+  if (operation.getNumDpsInputs() != 1 || operation.getNumDpsInits() != 1 || operation.getNumResults())
+    return std::nullopt;
+  AffineExpr m, k, n;
+  bindDims(operation.getContext(), m, k, n);
+  if (operation.getIndexingMapsArray() != SmallVector<AffineMap>{
+          AffineMap::get(3, 0, {m, k}, operation.getContext()),
+          AffineMap::get(3, 0, {m, n}, operation.getContext())} ||
+      operation.getIteratorTypesArray() != SmallVector<utils::IteratorType>{
+          utils::IteratorType::parallel, utils::IteratorType::reduction, utils::IteratorType::parallel})
+    return std::nullopt;
+  Value lhs = operation.getInputs()[0], output = operation.getOutputs()[0];
+  auto lhsType = dyn_cast<MemRefType>(lhs.getType()), outputType = dyn_cast<MemRefType>(output.getType());
+  if (!lhsType || !outputType || !outputType.getElementType().isF32()) return std::nullopt;
+  SmallVector<int64_t> outputStrides;
+  int64_t outputOffset;
+  if (failed(outputType.getStridesAndOffset(outputStrides, outputOffset)) || outputStrides.back() != 1)
+    return std::nullopt;
+  Block &body = operation.getRegion().front();
+  auto fma = body.getTerminator()->getOperand(0).getDefiningOp<math::FmaOp>();
+  if (!fma || fma.getC() != body.getArgument(1) || !body.getArgument(1).hasOneUse()) return std::nullopt;
+  Value left = fma.getA(), right = fma.getB();
+  if (auto widen = left.getDefiningOp<arith::ExtFOp>()) left = widen.getIn();
+  if (left != body.getArgument(0)) return std::nullopt;
+  auto rightWiden = right.getDefiningOp<arith::ExtFOp>();
+  if (rightWiden) right = rightWiden.getIn();
+  auto load = right.getDefiningOp<memref::LoadOp>();
+  if (!load || load->getBlock() != &body || load.getIndices().size() != 2 || !right.hasOneUse() ||
+      (rightWiden && !rightWiden.getResult().hasOneUse())) return std::nullopt;
+  Value column = load.getIndices()[1];
+  auto columnIndex = column.getDefiningOp<linalg::IndexOp>();
+  if (!columnIndex || columnIndex.getDim() != 2 || !column.hasOneUse() || load.getIndices()[0] == column)
+    return std::nullopt;
+  Value rhs = load.getMemref();
+  if (rhs.getParentBlock() == &body) return std::nullopt;
+  auto function = operation->getParentOfType<func::FuncOp>();
+  PhysicalProgramAnalysis analysis(function);
+  AliasAnalysis aliases(function);
+  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  auto independent = [&](Value input) {
+    if (aliases.alias(input, output).isNo()) return true;
+    auto source = analysis.externalView(input), destination = analysis.externalView(output);
+    return source && destination && interface.getDisjointOutputs() &&
+        analysis.storageRoot(input) != analysis.storageRoot(output) && destination.getAccess() != 0;
+  };
+  if (!independent(lhs) || !analysis.isReadOnly(rhs)) return std::nullopt;
+  for (Operation &instruction : body.without_terminator()) {
+    if (auto coordinate = dyn_cast<linalg::IndexOp>(instruction);
+        coordinate && coordinate.getDim() == 2 && coordinate.getResult() != column) return std::nullopt;
+    if (auto read = dyn_cast<memref::LoadOp>(instruction)) {
+      if (!independent(read.getMemref())) return std::nullopt;
+    } else if (!isMemoryEffectFree(&instruction)) return std::nullopt;
+    if (instruction.getNumRegions() || instruction.getNumResults() != 1) return std::nullopt;
+    if (&instruction == load || &instruction == rightWiden || &instruction == fma) continue;
+    for (Value input : instruction.getOperands())
+      if (input == column || input == body.getArgument(1) || input == right ||
+          input == fma.getResult() || (rightWiden && input == rightWiden.getResult())) return std::nullopt;
+  }
+  return IndexedContraction{lhs, output, load, rightWiden, fma};
+}
+
+FailureOr<bool> materializeIndexedContraction(linalg::GenericOp operation, ImplementationInputs &inputs) {
+  auto contraction = indexedContraction(operation);
+  if (!contraction) return false;
+  auto [lhs, output, load, rightWiden, fma] = *contraction;
+  Value rhs = load.getMemref();
+  auto outputType = cast<MemRefType>(output.getType());
+  Block &body = operation.getRegion().front();
+  auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
+  if (!binding) return false;
+  int64_t width = implementationParameter(binding, "vector_width");
+  int64_t replicas = implementationParameter(binding, "register_replicas");
+  DominanceInfo dominance(operation->getParentOfType<func::FuncOp>());
+  Operation *scope = operation;
+  for (Operation *parent = operation->getParentOp(); isa<scf::ForOp, scf::ParallelOp>(parent);
+       parent = parent->getParentOp()) {
+    if (!dominance.dominates(rhs, parent)) break;
+    scope = parent;
+  }
+  int64_t panelSize = width * replicas;
+  InputRequirement requirement{1, outputType.getElementType(), 1, panelSize, width * 4, InputReuse::Consumers};
+  auto supplied = inputs.prepareCaptured(operation, load, requirement, scope);
+  if (failed(supplied)) return failure();
+  OpBuilder b(operation);
+  Location loc = operation.getLoc();
+  Value zero = index(b, loc, 0), one = index(b, loc, 1);
+  Value rows = b.create<memref::DimOp>(loc, lhs, 0);
+  Value depth = b.create<memref::DimOp>(loc, lhs, 1);
+  Value columns = b.create<memref::DimOp>(loc, output, 1);
+  Value rhsRows = b.create<memref::DimOp>(loc, rhs, 0);
+  Value panelWidth = index(b, loc, panelSize);
+  Value nonempty = b.create<arith::AndIOp>(loc,
+      b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, depth, zero),
+      b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, columns, zero));
+  auto active = b.create<scf::IfOp>(loc, nonempty, false);
+  b.setInsertionPointToStart(active.thenBlock());
+  constexpr int64_t rowWindow = indexedRowWindow, reductionWindow = 128;
+  loop(b, loc, zero, rows, rowWindow, [&](Value rowBegin) {
+    Value rowEnd = b.create<arith::MinSIOp>(loc, add(b, loc, rowBegin, index(b, loc, rowWindow)), rows);
+    Value rowCount = b.create<arith::SubIOp>(loc, rowEnd, rowBegin);
+    Value leftSupply = b.create<memref::AllocaOp>(loc,
+        MemRefType::get({rowWindow, reductionWindow}, outputType.getElementType()));
+    Value indexSupply = b.create<memref::AllocaOp>(loc,
+        MemRefType::get({rowWindow, reductionWindow}, b.getIndexType()));
+    auto panel = [&](Value begin, Value reductionCount, int64_t lanes, int64_t count) {
+      SmallVector<OpFoldResult> origins{
+          b.create<arith::DivSIOp>(loc, begin, panelWidth).getResult(), b.getIndexAttr(0), b.getIndexAttr(0)};
+      SmallVector<OpFoldResult> sizes{b.getIndexAttr(1), rhsRows, b.getIndexAttr(panelSize)};
+      SmallVector<OpFoldResult> strides(3, b.getIndexAttr(1));
+      auto viewType = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
+          {ShapedType::kDynamic, panelSize}, cast<MemRefType>(supplied->storage.getType()), origins, sizes, strides));
+      Value rightMemory = b.create<memref::SubViewOp>(loc, viewType, supplied->storage, origins, sizes, strides);
+      Value rightBegin = b.create<arith::RemSIOp>(loc, begin, panelWidth);
+      Type scalar = outputType.getElementType();
+      Type accumulator = lanes == 1 ? scalar : Type(VectorType::get({lanes}, scalar));
+      SmallVector<Value> offsets, rightOffsets;
+      for (int64_t replica = 0; replica < count; ++replica) {
+        offsets.push_back(add(b, loc, begin, index(b, loc, replica * lanes)));
+        rightOffsets.push_back(add(b, loc, rightBegin, index(b, loc, replica * lanes)));
+      }
+      loop(b, loc, zero, rowCount, 1, [&](Value rowOrdinal) {
+        Value row = add(b, loc, rowBegin, rowOrdinal);
+        SmallVector<Value> initials;
+        for (Value offset : offsets)
+          initials.push_back(lanes == 1
+              ? Value(b.create<memref::LoadOp>(loc, output, ValueRange{row, offset}))
+              : Value(b.create<vector::LoadOp>(loc, cast<VectorType>(accumulator), output, ValueRange{row, offset})));
+        auto reduction = b.create<scf::ForOp>(loc, zero, reductionCount, one, initials);
+        {
+          OpBuilder::InsertionGuard guard(b);
+          b.setInsertionPointToStart(reduction.getBody());
+          Value leftValue = b.create<memref::LoadOp>(loc, leftSupply, ValueRange{rowOrdinal, reduction.getInductionVar()});
+          if (lanes != 1) leftValue = b.create<vector::BroadcastOp>(loc, cast<VectorType>(accumulator), leftValue);
+          Value logicalK = b.create<memref::LoadOp>(loc, indexSupply, ValueRange{rowOrdinal, reduction.getInductionVar()});
+          SmallVector<Value> next;
+          for (auto [replica, offset] : llvm::enumerate(rightOffsets)) {
+            Value rightValue = lanes == 1
+                ? Value(b.create<memref::LoadOp>(loc, rightMemory, ValueRange{logicalK, offset}))
+                : Value(b.create<vector::LoadOp>(loc, cast<VectorType>(accumulator),
+                                                rightMemory, ValueRange{logicalK, offset}));
+            auto update = b.create<math::FmaOp>(loc, leftValue, rightValue, reduction.getRegionIterArgs()[replica]);
+            update->setAttrs(fma->getAttrs());
+            next.push_back(update);
+          }
+          b.create<scf::YieldOp>(loc, next);
+        }
+        for (auto [value, offset] : llvm::zip(reduction.getResults(), offsets)) {
+          if (lanes == 1) b.create<memref::StoreOp>(loc, value, output, ValueRange{row, offset});
+          else b.create<vector::StoreOp>(loc, value, output, ValueRange{row, offset});
+        }
+      });
+    };
+    Value full = b.create<arith::SubIOp>(loc, columns, b.create<arith::RemSIOp>(loc, columns, panelWidth));
+    // Continue each output's ascending FMA chain while sharing each RHS panel
+    // across the independent rows of the implementation window.
+    loop(b, loc, zero, depth, reductionWindow, [&](Value reductionBegin) {
+      Value reductionEnd = b.create<arith::MinSIOp>(loc,
+          add(b, loc, reductionBegin, index(b, loc, reductionWindow)), depth);
+      Value reductionCount = b.create<arith::SubIOp>(loc, reductionEnd, reductionBegin);
+      loop(b, loc, zero, rowCount, 1, [&](Value rowOrdinal) {
+        Value row = add(b, loc, rowBegin, rowOrdinal);
+        loop(b, loc, zero, reductionCount, 1, [&](Value ordinal) {
+          Value k = add(b, loc, reductionBegin, ordinal);
+          IRMapping mapping;
+          mapping.map(body.getArgument(0), b.create<memref::LoadOp>(loc, lhs, ValueRange{row, k}).getResult());
+          for (Operation &instruction : body.without_terminator()) {
+            if (&instruction == load || &instruction == rightWiden || &instruction == fma) continue;
+            if (auto coordinate = dyn_cast<linalg::IndexOp>(instruction)) {
+              if (coordinate.getDim() != 2)
+                mapping.map(coordinate.getResult(), coordinate.getDim() == 0 ? row : k);
+            } else b.clone(instruction, mapping);
+          }
+          b.create<memref::StoreOp>(loc, mapping.lookupOrDefault(fma.getA()), leftSupply, ValueRange{rowOrdinal, ordinal});
+          b.create<memref::StoreOp>(loc, mapping.lookupOrDefault(load.getIndices()[0]), indexSupply,
+                                    ValueRange{rowOrdinal, ordinal});
+        });
+      });
+      loop(b, loc, zero, full, panelSize, [&](Value begin) { panel(begin, reductionCount, width, replicas); });
+      loop(b, loc, full, columns, 1, [&](Value begin) { panel(begin, reductionCount, 1, 1); });
+    });
+  });
+  operation.erase();
+  return true;
+}
+
+}
+
+int64_t registerContractionRows(linalg::GenericOp operation) {
+  return indexedContraction(operation) ? indexedRowWindow : 1;
 }
 
 LogicalResult materializeRegisterContractions(func::FuncOp function) {
+  ImplementationInputs inputs(function);
   SmallVector<linalg::GenericOp> operations;
   SmallVector<scf::ForOp> reductions;
   function.walk([&](linalg::GenericOp operation) {
-    if (operation->hasAttr("intent_cpu.microtile")) operations.push_back(operation);
+    if (operation->hasAttr("intent_cpu.microtile") || operation.getNumReductionLoops())
+      operations.push_back(operation);
   });
   for (auto operation : operations) {
+    auto indexed = materializeIndexedContraction(operation, inputs);
+    if (failed(indexed)) return failure();
+    if (*indexed) continue;
     auto tile = operation->getAttrOfType<MicrotileAttr>("intent_cpu.microtile");
+    if (!tile) continue;
     auto outputType = cast<MemRefType>(operation.getOutputs()[0].getType());
     if (!isMatrixContraction(operation) || outputType.getShape() !=
         ArrayRef<int64_t>({tile.getRows(), tile.getColumns()}))

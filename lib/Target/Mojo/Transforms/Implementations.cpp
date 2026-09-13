@@ -216,10 +216,14 @@ cpu::ImplementationRegistry implementations() {
         {1, element, 1, width * implementationParameter(binding, "micro_n"), alignment, InputReuse::Consumers}};
   };
   result.add(std::move(contraction));
-  result.add({"mojo.vector", [](Operation *op) {
+  Implementation vector{"mojo.vector", [](Operation *op) {
       if (auto generic = dyn_cast<linalg::GenericOp>(op)) return !isMatrixContraction(generic);
       return isa<cpu::ReduceOp, cpu::HistogramOp, func::FuncOp>(op);
-    }, vectorLegal, parameters, {}, {}});
+    }, vectorLegal, parameters, {}, {}};
+  vector.worksetRows = [](linalg::GenericOp operation, ImplementationAttr) {
+    return registerContractionRows(operation);
+  };
+  result.add(std::move(vector));
   auto scanParameters = [](bool vectorized) {
     return [vectorized](Builder &b, const Configuration &config) {
       NamedAttrList fields(parameters(b, config));

@@ -1,4 +1,4 @@
-#include "Intent/Dialect/CPU/Transforms/Passes.h"
+#include "Intent/Dialect/CPU/Transforms/Implementation.h"
 #include "Utilities.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -13,7 +13,7 @@ using namespace mlir;
 namespace intent::cpu {
 namespace {
 
-void exposeStructuredWorksets(func::FuncOp function) {
+LogicalResult exposeStructuredWorksets(func::FuncOp function, const ImplementationRegistry &implementations) {
   AliasAnalysis aliases(function);
   PhysicalProgramAnalysis analysis(function);
   auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
@@ -58,13 +58,25 @@ void exposeStructuredWorksets(func::FuncOp function) {
         independent &= disjoint(load.getMemref(), output);
     }
     if (!independent) continue;
+    int64_t rows = 1;
+    if (auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation")) {
+      auto implementation = implementations.lookup(operation);
+      if (failed(implementation)) return failure();
+      if ((*implementation)->worksetRows) rows = (*implementation)->worksetRows(operation, binding);
+      if (rows <= 0) return operation.emitError("implementation requires a positive leading parallel workset");
+    }
     OpBuilder b(operation);
     Location loc = operation.getLoc();
     Value zero = index(b, loc, 0), one = index(b, loc, 1);
     Value extent = b.create<memref::DimOp>(loc, operation.getOutputs()[0], 0);
-    auto workset = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{extent}, ValueRange{one});
+    Value window = index(b, loc, rows);
+    Value count = rows == 1 ? extent : b.create<arith::CeilDivSIOp>(loc, extent, window);
+    auto workset = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{count}, ValueRange{one});
     b.setInsertionPointToStart(workset.getBody());
-    Value row = workset.getInductionVars()[0];
+    Value row = multiply(b, loc, workset.getInductionVars()[0], window);
+    OpFoldResult rowCount = b.getIndexAttr(1);
+    if (rows != 1)
+      rowCount = b.create<arith::MinSIOp>(loc, window, b.create<arith::SubIOp>(loc, extent, row)).getResult();
     SmallVector<Value> inputs, outputs;
     for (auto [number, operand] : llvm::enumerate(operation->getOperands())) {
       Value selected = operand;
@@ -74,7 +86,7 @@ void exposeStructuredWorksets(func::FuncOp function) {
           auto dimension = dyn_cast<AffineDimExpr>(expression);
           bool leading = dimension && dimension.getPosition() == 0;
           offsets.push_back(leading ? OpFoldResult(row) : OpFoldResult(b.getIndexAttr(0)));
-          sizes.push_back(leading ? OpFoldResult(b.getIndexAttr(1))
+          sizes.push_back(leading ? rowCount
               : type.isDynamicDim(axis) ? OpFoldResult(b.create<memref::DimOp>(loc, operand, axis).getResult())
                                         : OpFoldResult(b.getIndexAttr(type.getDimSize(axis))));
         }
@@ -88,9 +100,12 @@ void exposeStructuredWorksets(func::FuncOp function) {
           Block &body = operation.getRegion().front();
           mapping.map(body.getArguments(), arguments);
           for (Operation &instruction : body.without_terminator()) {
-            if (auto coordinate = dyn_cast<linalg::IndexOp>(instruction); coordinate && coordinate.getDim() == 0)
-              mapping.map(coordinate.getResult(), row);
-            else nested.clone(instruction, mapping);
+            if (auto coordinate = dyn_cast<linalg::IndexOp>(instruction); coordinate && coordinate.getDim() == 0) {
+              Value coordinateRow = row;
+              if (rows != 1)
+                coordinateRow = add(nested, location, row, nested.create<linalg::IndexOp>(location, 0));
+              mapping.map(coordinate.getResult(), coordinateRow);
+            } else nested.clone(instruction, mapping);
           }
           SmallVector<Value> results;
           for (Value value : body.getTerminator()->getOperands()) results.push_back(mapping.lookupOrDefault(value));
@@ -99,6 +114,7 @@ void exposeStructuredWorksets(func::FuncOp function) {
     tile->setAttrs(operation->getAttrs());
     operation.erase();
   }
+  return success();
 }
 
 LogicalResult partition(scf::ParallelOp root, int64_t grain) {
@@ -212,8 +228,8 @@ LogicalResult partition(scf::ParallelOp root, int64_t grain) {
 
 }
 
-LogicalResult partitionTasks(func::FuncOp function, int64_t grain) {
-  exposeStructuredWorksets(function);
+LogicalResult partitionTasks(func::FuncOp function, int64_t grain, const ImplementationRegistry &implementations) {
+  if (failed(exposeStructuredWorksets(function, implementations))) return failure();
   SmallVector<scf::ParallelOp> roots;
   function.walk([&](scf::ParallelOp operation) {
     if (!operation->getParentOfType<scf::ParallelOp>()) roots.push_back(operation);

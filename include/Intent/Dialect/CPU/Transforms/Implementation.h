@@ -54,6 +54,8 @@ struct Implementation {
   bool requiresMatrixI8I32 = false;
   std::function<llvm::SmallVector<InputRequirement>(mlir::linalg::GenericOp,
       ConfigurationAttr, ImplementationAttr)> inputs;
+  // Leading parallel rows retained together inside one independent work item.
+  std::function<int64_t(mlir::linalg::GenericOp, ImplementationAttr)> worksetRows;
 };
 
 class ImplementationRegistry {
@@ -69,7 +71,7 @@ public:
                            llvm::ArrayRef<ImplementationAttr> bindings) const;
 
 private:
-  llvm::SmallVector<Implementation> implementations;
+  llvm::SmallVector<Implementation, 0> implementations;
 };
 
 bool needsImplementation(mlir::Operation *operation);

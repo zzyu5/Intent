@@ -163,7 +163,7 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
         binding.getTileK(), binding.getRegionSize(), {}};
     if (failed(blockContractions(function, config, implementations)) ||
         failed(blockStructuredComputations(function, implementations)) || failed(verifyCPUProgram(module, false)) ||
-        failed(partitionTasks(function, config.taskGrain))) return failure();
+        failed(partitionTasks(function, config.taskGrain, implementations))) return failure();
   }
   if (failed(normalize(module))) return failure();
   for (func::FuncOp function : functions)
