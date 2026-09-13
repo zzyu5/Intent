@@ -55,7 +55,8 @@ def generate_trial(arguments, row, language) -> dict:
     directory = Path(tempfile.mkdtemp(prefix=f"{row['task']}-{language}-", dir=arguments.state_root / "candidates")).resolve()
     materials = materialize_language(arguments.project, arguments.triton_ref, directory / "materials", language)
     task_text = description(arguments.reference, row)
-    task_text += "\n\nFixed invocation (tensor values are not disclosed):\n" + json.dumps(row["invocation"], indent=2)
+    task_text += "\n\nFixed profile parameters (reference defaults included; tensor values are not disclosed):\n" + json.dumps(row["invocation"], indent=2)
+    task_text += "\nParameters at their defaults may be omitted by the caller. Preserve optional parameter defaults in the returned callable."
     task_text += "\n\nExpected return structure, shape and dtype:\n" + json.dumps(row["return_contract"], indent=2)
     task_text += "\n\nTolerance: " + json.dumps(arguments.suite["tolerances"][row["tolerance"]])
     task_text += "\n\nTiming: " + row["timing"]
