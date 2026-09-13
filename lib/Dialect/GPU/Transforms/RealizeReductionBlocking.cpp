@@ -996,11 +996,14 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
                                        sourceMap.getDerived()};
     PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
         reduce.getInputs()[component], reductionSource,
-        PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true);
-    if (!replay.isReplayable())
-      return reduce.emitOpError(
-                 "static reduction producer has no exact shared replay fact"),
-             failure();
+        PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true, reduce);
+    if (!replay.isReplayable()) {
+      InFlightDiagnostic diagnostic = reduce.emitOpError(
+          "static reduction producer has no exact shared replay fact");
+      for (Operation *blocker : replay.blockers)
+        diagnostic << "; blocker=" << blocker->getName();
+      return failure();
+    }
     IRMapping mapping;
     SmallVector<Value> tailPredicates;
     FailureOr<Value> source = clonePaddedProducer(
@@ -2740,13 +2743,6 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
     return unhandled("requires one reduction axis and at least one source");
   if (hasSelectedSegmentExtent(reduce, kernel))
     return success();
-  FailureOr<bool> staticPadding = realizeStaticPaddingReduce(reduce, kernel);
-  if (failed(staticPadding))
-    return failure();
-  if (*staticPadding) {
-    eraseDeadPhysicalValues(kernel);
-    return success();
-  }
   // A full-coverage fragment grows every component with the runtime axis.
   // Its padding still needs the reduction identity after physicalization.
   // Keep coupled record/tuple accumulators bounded by a real chunk loop.
@@ -3024,6 +3020,26 @@ LogicalResult realizeReductionBlocking(ModuleOp module) {
   if (failed(physicalKernel))
     return failure();
   func::FuncOp kernel = *physicalKernel;
+  // Pad composed value graphs before their upstream reductions become loops.
+  // Padding can erase dead producers, so rebuild the worklist after each change.
+  while (true) {
+    SmallVector<ReduceOp> candidates;
+    kernel.walk([&](ReduceOp reduce) { candidates.push_back(reduce); });
+    bool changed = false;
+    for (ReduceOp reduce : candidates) {
+      if (hasSelectedSegmentExtent(reduce, kernel))
+        continue;
+      FailureOr<bool> padded = realizeStaticPaddingReduce(reduce, kernel);
+      if (failed(padded))
+        return failure();
+      if (*padded) {
+        changed = true;
+        break;
+      }
+    }
+    if (!changed)
+      break;
+  }
   SmallVector<ReduceOp> reductions;
   kernel.walk([&](ReduceOp reduce) { reductions.push_back(reduce); });
   for (ReduceOp reduce : reductions) {
