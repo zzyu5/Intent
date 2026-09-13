@@ -977,18 +977,21 @@ bool unconditionalStoreCoversBuffer(Operation *operation, Value buffer,
   ValueRange coordinates;
   ArrayRef<int64_t> sourceAxes;
   Value valid;
+  Value payload;
   if (auto store = dyn_cast<StoreOp>(operation)) {
     if (store.getResource() != buffer)
       return false;
     coordinates = store.getCoordinates();
     sourceAxes = store.getSourceAxes();
     valid = store.getValid();
+    payload = store.getValue();
   } else if (auto atomic = dyn_cast<AtomicStoreOp>(operation)) {
     if (atomic.getResource() != buffer)
       return false;
     coordinates = atomic.getCoordinates();
     sourceAxes = atomic.getSourceAxes();
     valid = atomic.getValid();
+    payload = atomic.getValue();
   } else {
     return false;
   }
@@ -999,18 +1002,35 @@ bool unconditionalStoreCoversBuffer(Operation *operation, Value buffer,
   llvm::DenseSet<int64_t> coveredAxes;
   llvm::DenseSet<Value> coveredLoops;
   SmallVector<std::pair<MakeRangeOp, Value>> tails;
+  SmallVector<MakeRangeOp> vectorRanges;
+  bool hasWholeAxis = false;
   for (auto [coordinate, sourceAxis] : llvm::zip(coordinates, sourceAxes)) {
     if (sourceAxis < 0 ||
         sourceAxis >= static_cast<int64_t>(type.getShape().size()) ||
         !coveredAxes.insert(sourceAxis).second)
       return false;
     auto range = coordinate.getDefiningOp<MakeRangeOp>();
+    if (range)
+      vectorRanges.push_back(range);
     Value start = range ? range.getStart() : coordinate;
     auto loop = llvm::find_if(loops, [&](const LoopCoordinate &candidate) {
       return sameScalarExpression(start, candidate.induction);
     });
-    if (loop == loops.end() ||
-        !coveredLoops.insert(loop->induction).second ||
+    auto bufferExtent = cast<PhysicalExprAttr>(type.getShape()[sourceAxis]);
+    if (loop == loops.end()) {
+      if (!range || integerConstant(range.getStart()) != 0 ||
+          integerConstant(range.getLogicalStart()) != 0 ||
+          integerConstant(range.getStep()) != 1 ||
+          !valueMatchesExtent(range.getLogicalStop(), bufferExtent) ||
+          !upperBoundWithinResource(range.getLogicalStop(), range.getResult(), 0) ||
+          (!valueMatchesExtent(range.getExtent(), bufferExtent) &&
+           !hasUpperTailGuard(valid, coordinate, bufferExtent)))
+        return false;
+      tails.emplace_back(range, range.getLogicalStop());
+      hasWholeAxis = true;
+      continue;
+    }
+    if (!coveredLoops.insert(loop->induction).second ||
         integerConstant(loop->lower) != 0 ||
         !valueMatchesExtent(
             loop->upper,
@@ -1044,6 +1064,15 @@ bool unconditionalStoreCoversBuffer(Operation *operation, Value buffer,
                            cast<PhysicalExprAttr>(type.getShape()[sourceAxis])))
       return false;
     tails.emplace_back(range, loop->upper);
+  }
+  if (hasWholeAxis) {
+    llvm::DenseSet<unsigned> fragmentAxes;
+    for (MakeRangeOp range : vectorRanges) {
+      PhysicalAxisProjection axis =
+          queryFragmentAxis(payload.getType(), sourceAxisIdentity(range));
+      if (!axis.isExact() || !fragmentAxes.insert(axis.fragmentAxis).second)
+        return false;
+    }
   }
   return coveredAxes.size() == type.getShape().size() &&
          coveredLoops.size() == loops.size() &&
@@ -1573,6 +1602,10 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
     Bounds rhs = bound(binary.getRhs(), depth + 1);
     std::optional<int64_t> lhsConstant = constantUpper(lhs);
     std::optional<int64_t> rhsConstant = constantUpper(rhs);
+    if (binary.getOperatorKind() == BinaryOperator::Multiply &&
+        ((lhsConstant && *lhsConstant == 0) ||
+         (rhsConstant && *rhsConstant == 0)))
+      return {true, expression(PhysicalExprKind::Constant, 0)};
     if (binary.getOperatorKind() == BinaryOperator::Subtract) {
       auto ordinal = dyn_cast<BlockArgument>(stripScalarIdentity(binary.getRhs()));
       auto loop = ordinal
@@ -3041,7 +3074,15 @@ PhysicalProgramAnalysis::lockstepRanges(ArrayRef<MakeRangeOp> ranges) {
            samePhysicalScalarExpression(lhs.getStep(), rhs.getStep());
   };
   auto sameTraversal = [](MakeRangeOp lhs, MakeRangeOp rhs) {
-    return samePhysicalScalarExpression(lhs.getStart(), rhs.getStart()) &&
+    auto isZero = [](Value value) {
+      PhysicalExprAttr bound = queryNonNegativeIndexUpperBound(value);
+      return bound &&
+             bound.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+             bound.getValue() == 0;
+    };
+    bool sameStart = samePhysicalScalarExpression(lhs.getStart(), rhs.getStart()) ||
+                     (isZero(lhs.getStart()) && isZero(rhs.getStart()));
+    return sameStart &&
            samePhysicalScalarExpression(lhs.getExtent(), rhs.getExtent()) &&
            samePhysicalScalarExpression(lhs.getStep(), rhs.getStep());
   };

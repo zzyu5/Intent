@@ -130,6 +130,7 @@ void clonePredicatedScalarOperation(mlir::OpBuilder &builder,
                                    mlir::Value predicate,
                                    FragmentType shape = {});
 mlir::LogicalResult realizeScanConsumerTraversals(mlir::ModuleOp module);
+mlir::LogicalResult materializeRetainedValues(mlir::ModuleOp module);
 mlir::LogicalResult realizeRegionFolds(mlir::ModuleOp module);
 mlir::LogicalResult realizeRegionScans(mlir::ModuleOp module);
 mlir::LogicalResult realizeContractionBlocking(mlir::ModuleOp module);

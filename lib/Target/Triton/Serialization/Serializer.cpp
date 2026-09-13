@@ -200,6 +200,7 @@ private:
     unsigned argument;
     std::string name;
     gpu::ViewType type;
+    bool workspace;
   };
   struct MetadataABI {
     unsigned argument;
@@ -231,15 +232,16 @@ private:
       std::string name = attrs.getAs<StringAttr>(gpu::abiNameAttr).getValue().str();
       // Triton's launch kwargs also enter autotune hook argument maps.  Keep
       // view names out of that namespace (for example, an input named grid).
-      if (kind == "view") {
+      if (kind == "view" || kind == "workspace") {
         name = "_intent_view_" + std::to_string(index);
         while (!argumentNames.insert(name).second)
           name += "_";
       }
       values[argument] = name;
-      if (kind == "view") {
-        views.push_back(
-            {static_cast<unsigned>(index), name, cast<gpu::ViewType>(argument.getType())});
+      if (kind == "view" || kind == "workspace") {
+        views.push_back({static_cast<unsigned>(index), name,
+                         cast<gpu::ViewType>(argument.getType()),
+                         kind == "workspace"});
         continue;
       }
       if (kind == "scalar" || kind == "constexpr" || kind == "value") {
@@ -507,10 +509,12 @@ private:
     }
     output << "_intent_tuning_hooks = TuningHooks((";
     for (const ViewABI &view : views)
-      output << "\"" << view.name << "\", ";
+      if (!view.workspace)
+        output << "\"" << view.name << "\", ";
     output << "), (";
     for (const ViewABI &view : views)
-      output << (view.type.getAccess() != 0 ? "True, " : "False, ");
+      if (!view.workspace)
+        output << (view.type.getAccess() != 0 ? "True, " : "False, ");
     output << "))\n\n@triton.autotune(\n    configs=[\n";
     for (const Config &config : *configs) {
       output << "        triton.Config({";
@@ -618,6 +622,8 @@ private:
   void emitViewChecks(ArrayRef<ViewABI> arguments) {
     std::map<int64_t, std::pair<std::string, std::string>> dimensions;
     for (const ViewABI &view : arguments) {
+      if (view.workspace)
+        continue;
       std::string name = kernel.getArgAttrDict(view.argument)
                              .getAs<StringAttr>(gpu::abiNameAttr)
                              .getValue().str();
@@ -668,10 +674,38 @@ private:
       line("triton.set_allocator(_intent_tensor_descriptor_allocator)", 1);
     for (const MetadataABI &metadata : metadataArguments) {
       const ViewABI &source = viewByABI(metadata.sourceABI);
+      if (source.workspace)
+        continue;
       line(metadata.name + " = " + source.name +
            (metadata.kind == "dimension" ? ".shape[" : ".stride(") +
            std::to_string(metadata.sourceAxis) +
            (metadata.kind == "dimension" ? "]" : ")"), 1);
+    }
+    for (const ViewABI &view : views) {
+      if (!view.workspace)
+        continue;
+      auto deviceSource = llvm::find_if(views, [](const ViewABI &candidate) {
+        return !candidate.workspace;
+      });
+      if (deviceSource == views.end()) {
+        kernel.emitError("workspace allocation requires a public view device");
+        failed = true;
+        return;
+      }
+      std::string shape = "(";
+      for (Attribute extent : view.type.getLayout().getExtents())
+        shape +=
+            expressionString(cast<gpu::PhysicalExprAttr>(extent), false) + ", ";
+      shape += ")";
+      line(view.name + " = torch.empty(" + shape + ", device=" +
+               deviceSource->name + ".device, dtype=" +
+               pythonType(view.type.getElementType(), true) + ")", 1);
+    }
+    for (const MetadataABI &metadata : metadataArguments) {
+      const ViewABI &source = viewByABI(metadata.sourceABI);
+      if (source.workspace)
+        line(metadata.name + " = " + source.name + ".stride(" +
+                 std::to_string(metadata.sourceAxis) + ")", 1);
     }
     if (descriptorChoice) {
       std::string eligibility;
@@ -750,6 +784,8 @@ private:
     SmallVector<ViewABI> inputs;
     SmallVector<ViewABI> outputs;
     for (const ViewABI &view : views) {
+      if (view.workspace)
+        continue;
       if (view.type.getAccess() != 1)
         inputs.push_back(view);
       if (view.type.getAccess() == 1)
@@ -818,6 +854,10 @@ private:
   }
 
   void emitOperation(Operation &operation) {
+    if (isa<CtaBarrierOp>(operation)) {
+      line("tl.debug_barrier()");
+      return;
+    }
     if (isa<TensorDescriptorChoiceOp, TensorDescriptorAllocatorOp,
             TensorDescriptorOp>(operation))
       return;
@@ -1829,7 +1869,7 @@ private:
   std::string joinLaunchArguments(bool includeOutputs = true) const {
     std::map<unsigned, std::string> arguments;
     for (const ViewABI &view : views)
-      if (includeOutputs || view.type.getAccess() != 1)
+      if (!view.workspace && (includeOutputs || view.type.getAccess() != 1))
         arguments.emplace(view.argument, view.name);
     for (const ScalarABI &scalar : scalars)
       arguments.emplace(scalar.argument, scalar.name);

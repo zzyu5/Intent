@@ -1183,9 +1183,27 @@ FailureOr<Value> materializeReplayedValue(
     if (fact.roots.empty()) {
       Operation *producer = current.getDefiningOp();
       bool neutralSchemaCarrier = isa_and_nonnull<SplatOp>(producer);
-      if (auto broadcast = dyn_cast_or_null<BroadcastOp>(producer))
+      if (auto broadcast = dyn_cast_or_null<BroadcastOp>(producer)) {
+        auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
         neutralSchemaCarrier |=
             !isa<FragmentType, RecordType>(broadcast.getValue().getType());
+        if (input) {
+          BroadcastProjection relation = queryAxisProjection(input, fragment);
+          if (relation.isExact()) {
+            std::optional<unsigned> inputAxis =
+                relation.targetToSource[projection.fragmentAxis];
+            if (!inputAxis) {
+              neutralSchemaCarrier = true;
+            } else {
+              auto extent = cast<PhysicalExprAttr>(input.getShape()[*inputAxis]);
+              neutralSchemaCarrier |=
+                  extent.getKind() ==
+                      static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                  extent.getValue() == 1;
+            }
+          }
+        }
+      }
       return neutralSchemaCarrier
                  ? std::optional<unsigned>(projection.fragmentAxis)
                  : std::nullopt;

@@ -97,6 +97,12 @@ LogicalResult realizeScanConsumerGroup(ModuleOp module, func::FuncOp kernel) {
   return closeValueAccessRelations(kernel);
 }
 
+LogicalResult materializeRetainedValueGroup(ModuleOp module, func::FuncOp kernel) {
+  if (failed(materializeRetainedValues(module)))
+    return failure();
+  return closeValueAccessRelations(kernel);
+}
+
 LogicalResult realizeReductionGroup(ModuleOp module, func::FuncOp kernel) {
   if (failed(realizeReductionBlocking(module)) ||
       failed(alignAggregateValueRelations(kernel)) ||
@@ -182,6 +188,7 @@ LogicalResult runSharedGPUPasses(ModuleOp module, const TuningProfiles &profiles
       {"form-pointwise-ownership", formPointwiseOwnership},
       {"form-pointwise-blocking", formPointwiseBlocking},
       {"realize-scan-consumers", realizeScanConsumerGroup},
+      {"materialize-retained-values", materializeRetainedValueGroup},
       {"co-realize-online-reductions", coRealizeOnlineReductions},
       {"realize-region-folds", realizeRegionFoldGroup},
       {"realize-region-scans", realizeRegionScanGroup},

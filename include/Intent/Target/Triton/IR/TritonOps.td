@@ -9,6 +9,10 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 class IntentTriton_Op<string mnemonic, list<Trait> traits = []> :
     Op<IntentTriton_Dialect, mnemonic, traits>;
 
+def IntentTriton_CtaBarrierOp : IntentTriton_Op<"cta_barrier", [
+    MemoryEffects<[MemRead, MemWrite]>
+  ]>;
+
 def IntentTriton_TensorDescriptorChoiceOp :
     IntentTriton_Op<"tensor_descriptor_choice", [Pure]> {
   let arguments = (ins Variadic<IntentGPU_ViewValue>:$descriptors,

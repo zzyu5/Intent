@@ -3072,8 +3072,6 @@ FailureOr<SourcePlan> nestedScalarReductionSource(ReduceOp reduce,
   bool hasNestedReduction = false;
   for (unsigned index = 0; index < values.size(); ++index) {
     Value value = values[index];
-    if (!queryFragmentAxis(value.getType(), plan->sourceIdentity).isExact())
-      continue;
     Operation *producer = value.getDefiningOp();
     if (!producer || !producers.insert(producer).second)
       continue;
@@ -3084,12 +3082,43 @@ FailureOr<SourcePlan> nestedScalarReductionSource(ReduceOp reduce,
   }
   if (!hasNestedReduction)
     return failure();
-  // A closed producer slice can live inside the outer reduction traversal.
-  // External consumers would still retain the full intermediate fragment.
+  // Shared one-dimensional ancestors may remain outside the traversal. Nested
+  // reductions and their multidimensional producers must move as a closed slice.
+  SmallVector<Operation *> retained;
+  llvm::SmallPtrSet<Operation *, 32> visited;
   for (Operation *producer : producers)
     for (Operation *user : producer->getUsers())
-      if (user != reduce && !producers.contains(user))
+      if (user != reduce && !producers.contains(user) &&
+          visited.insert(producer).second)
+        retained.push_back(producer);
+  for (unsigned index = 0; index < retained.size(); ++index) {
+    Operation *producer = retained[index];
+    if (isa<ReduceOp, ScanOp, ContractOp, ScaledContractOp, SparseContractOp>(
+            producer))
+      return failure();
+    for (Value result : producer->getResults()) {
+      if (isa<RecordType>(result.getType()))
         return failure();
+      auto fragment = dyn_cast<FragmentType>(result.getType());
+      if (!fragment)
+        continue;
+      unsigned varyingAxes = 0;
+      for (auto [axis, attribute] : llvm::enumerate(fragment.getShape())) {
+        auto extent = cast<PhysicalExprAttr>(attribute);
+        if (extent.getKind() !=
+                static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+            extent.getValue() != 1 ||
+            analysis.axisRealization(result, axis).constructionScalarSeed)
+          ++varyingAxes;
+      }
+      if (varyingAxes > 1)
+        return failure();
+    }
+    for (Value operand : producer->getOperands())
+      if (Operation *ancestor = operand.getDefiningOp();
+          ancestor && visited.insert(ancestor).second)
+        retained.push_back(ancestor);
+  }
   return plan;
 }
 

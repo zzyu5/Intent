@@ -2365,7 +2365,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
       }
     }
 
-    if (isa<TensorDescriptorChoiceOp, TensorDescriptorAllocatorOp,
+    if (isa<CtaBarrierOp, TensorDescriptorChoiceOp, TensorDescriptorAllocatorOp,
             TensorDescriptorOp, BlockLoadOp, BlockStoreOp, DescriptorLoadOp,
             DescriptorStoreOp, SplitOp, ReduceOp, ScanOp, gpu::ParameterOp,
             gpu::PhysicalExprOp,
@@ -2422,6 +2422,9 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       failed(gpu::verifyGPUProgram(module)))
     return failure();
   selectNativeReduceForms(kernel);
+  bool hasWorkspace = llvm::any_of(kernel.getArgumentTypes(), [](Type type) {
+    return isa<gpu::BufferType>(type);
+  });
   SmallVector<gpu::ParameterCategory> categories;
   bool twoAxisPointwise = false;
   kernel.walk([&](gpu::ParameterOp parameter) {
@@ -2454,6 +2457,8 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   SmallVector<int64_t> warpDomain, stageDomain, ctaDomain;
   for (const auto &row : *rows) {
     int64_t warps = row[0], stages = row[1], ctas = row[2];
+    if (hasWorkspace && ctas != 1)
+      continue;
     if ((warps & (warps - 1)) != 0 ||
         warps > capabilities.getMaxThreadsPerBlock() / 32 ||
         stages > std::numeric_limits<int32_t>::max() ||
@@ -2493,6 +2498,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   declareProviderParameter("NUM_CTAS", gpu::ParameterRole::ProviderCTAs,
                            ctaDomain);
   if (failed(gpu::verifyGPUProgram(module)) ||
+      failed(lowerInvocationWorkspaces(module)) ||
       failed(legalizeSplitGatherPairs(kernel)) ||
       failed(materializeBlockPointerForms(kernel)))
     return failure();

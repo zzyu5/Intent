@@ -60,6 +60,10 @@ void collectTypeExpressions(Type type,
 }
 
 bool hasObservableEffect(Operation *operation) {
+  if (auto store = dyn_cast<StoreOp>(operation))
+    if (auto buffer = dyn_cast<BufferType>(store.getResource().getType());
+        buffer && buffer.getWorkspace() && !store->hasAttr(originAttr))
+      return false;
   return isa<StoreOp, ScatterReduceOp, AtomicStoreOp, AtomicRMWOp,
              AtomicCompareExchangeOp>(operation);
 }

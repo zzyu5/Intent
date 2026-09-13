@@ -7,6 +7,7 @@
 namespace intent::triton {
 
 mlir::LogicalResult legalizeProgramGrid(mlir::ModuleOp module);
+mlir::LogicalResult lowerInvocationWorkspaces(mlir::ModuleOp module);
 mlir::LogicalResult legalizeGPUProgram(mlir::ModuleOp module,
                                      const gpu::TuningProfiles &profiles);
 mlir::LogicalResult verifyTritonProgram(mlir::ModuleOp module);
