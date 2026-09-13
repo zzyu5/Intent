@@ -1,6 +1,6 @@
 # 作者速查
 
-本页是 [core.md](core.md) 与[数值规则](types-numerics-and-effects.md)的使用入口，不定义第二套语义。MCP 的 `search` 找概念/API/诊断/示例，`api` 查当前声明及返回规则，`read` 读完整章节和代码。公开声明不等于所有 target 已支持；没有性能测量不能宣称高效。
+本页是 [core.md](core.md) 与[数值规则](types-numerics-and-effects.md)的使用入口，不定义第二套语义。MCP 的 `search` 找概念/API/诊断，`api` 查当前声明及返回规则，`read` 读语言规则与接口说明。公开声明不等于所有 target 已支持；没有性能测量不能宣称高效。
 
 ## 类型、literal 与 shape
 
@@ -28,7 +28,7 @@ Domain 索引按资源索引顺序形成读取结果的 tensor axes，赋值仍�
 
 `I.arg_reduce.max(value, axis=...)` 返回 `(values, indices)`，不能把整对结果当 indices。完整归约时两项均为 scalar；保留轴时两项均为保留这些轴的 tensor。分别核对两个 component 的 dtype；写入不同 dtype 的输出前必须显式 `I.cast`，包括 `I.i64` 与 `I.index` 之间，不能因它们都使用 64 bits 就视为同一类型。
 
-Generic `I.reduce(value, axis=..., identity=..., combine=helper)` 的 identity、两组 combine 参数和返回值必须具有删除归约轴后的同一 schema。例如 `[M,N]` 沿 `1` 归约得到 `[M]`，identity 可写成 `I.full((M,), 0.0, dtype=I.f32)`。完整例子见 [reduction.py](examples/reduction.py)。
+Generic `I.reduce(value, axis=..., identity=..., combine=helper)` 的 identity、两组 combine 参数和返回值必须具有删除归约轴后的同一 schema。例如 `[M,N]` 沿 `1` 归约得到 `[M]`，identity 可写成 `I.full((M,), 0.0, dtype=I.f32)`。
 
 Python tuple 与 `I.record(field=value, ...)` 是结构化 products，不要求各 component 同 dtype/shape，但每个 component 必须与对应 identity/combine/result 一致。Tuple 静态解构，record 用 `.field`；都不直接成为 host-visible kernel return。
 
@@ -38,19 +38,7 @@ Python tuple 与 `I.record(field=value, ...)` 是结构化 products，不要求�
 
 普通 `for/while` 保持顺序与 loop carry；`I.parallel(domain)` 表达独立无序点，不允许 carry。Tensor predicate 使用 `I.select`，不控制 statement `if`。`Out` 进入 kernel 时未定义，读取前必须先定义；不能用 InOut 掩盖未定义读取。
 
-一个 kernel 不自动拆成多个 launches。需要多个 kernels 时，host 分别编译，分配中间 tensor，显式依次调用。[split_k_pipeline.py](examples/split_k_pipeline.py) 包含完整 partial/combine kernels 和真实 host 编排；`parts` 是作者可见的算法分解，不是物理 tile 参数。
-
-### Matmul 后的逐行归约与 normalization
-
-选择 kernel 边界时，要权衡中间 tensor 的读写成本、值复用和各阶段可用的并行度。`I.matmul` 等生产阶段之后若要归约某个输出轴，可以先保存生产结果，再在后续 kernel 中归约，使两个阶段分别形成适合的并行划分；显式分块与在线 summary 则可用于避免完整中间 tensor。算法及 kernel 编排由作者表达，各 kernel 内的物理分块、布局和 target 配置由 compiler 形成。
-
-例如 `Y = ReLU(X @ W + bias)` 后沿输出列做 LayerNorm 或 softmax：行数较少时，单个 kernel 中完整行的归约依赖可能限制 matmul 的列方向并行度。作者可先用一个 kernel 生成 `Y`，再用另一个 kernel 逐行归约，使 matmul 的行、列两个结果轴都能独立分块。比较完整算子耗时，计入中间 tensor 的读写和全部 launches，并保持各阶段的 dtype 与数值契约。
-
-### Large/global reduction 与 partial/combine
-
-`I.reduce.sum`、`I.arg_reduce.max` 等输出很少的大归约（large/global reduction），可以由作者显式分段生成 partials，再由后续 kernel 合并，以增加独立工作的数量。[逻辑 partition](../programming-model/logical-program.md) 使用 `I.domain`、`I.parallel` 和 source slice 表达；[split_k_pipeline.py](examples/split_k_pipeline.py) 展示 partial/combine kernels 及 host 的中间 tensor 分配与调用顺序。
-
-分段与合并仍须保持操作的顺序、identity、NaN 和数值契约；arg-reduce 的 partials 还须保留原始逻辑索引，不能把分段内索引当作全局结果。每个 kernel 内的物理分块、布局与 target 配置仍由 compiler 负责。
+一个 kernel 不自动拆成多个 launches。多个 kernels 由 host 分别编译、显式调用；跨 kernel tensors 的分配与生命周期由 host 管理。Kernel 数量与算法编排由作者定义，各 kernel 内的物理分块、布局与 target 配置由 compiler 形成。
 
 ### Host 编译与调用
 

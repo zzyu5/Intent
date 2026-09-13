@@ -11,7 +11,7 @@ import subprocess
 
 
 def snapshot(project: Path) -> dict:
-    """Freeze only public author material, never benchmarks or provider sources."""
+    """Freeze public language rules and declarations, without algorithm examples."""
     project = project.resolve()
     import intent
     import intent.language as language
@@ -20,15 +20,13 @@ def snapshot(project: Path) -> dict:
 
     documents = {}
     for directory in (project / "doc/dsl", project / "doc/programming-model"):
-        for path in sorted(directory.rglob("*")):
-            if path.suffix not in {".md", ".py"}:
-                continue
+        for path in sorted(directory.glob("*.md")):
             identifier = str(path.relative_to(project))
             text = path.read_text()
-            sections = list(re.finditer(r"^#{1,3} (.+)$", text, re.MULTILINE)) if path.suffix == ".md" else []
+            sections = list(re.finditer(r"^#{1,3} (.+)$", text, re.MULTILINE))
             documents[identifier] = {
                 "id": identifier, "title": sections[0][1] if sections else path.stem,
-                "kind": "example" if path.suffix == ".py" else "concept",
+                "kind": "concept",
                 "source": identifier, "line": 1, "text": text,
             }
             for index, section in enumerate(sections):
@@ -98,9 +96,9 @@ class Manual:
         self.corpus = corpus
 
     def search(self, query: str, kind: str = "all") -> dict:
-        """Find API names, concepts, diagnostics and examples. Read returned IDs for full context."""
-        if kind not in {"all", "api", "concept", "diagnostic", "example"}:
-            raise ValueError("kind must be all, api, concept, diagnostic or example")
+        """Find API names, language rules and diagnostics. Read returned IDs for full context."""
+        if kind not in {"all", "api", "concept", "diagnostic"}:
+            raise ValueError("kind must be all, api, concept or diagnostic")
         terms = re.findall(r"[\w.]+", query.lower())
         if not terms:
             raise ValueError("query must contain a name or search term")
@@ -137,12 +135,11 @@ class Manual:
                            for field in ("id", "title", "source", "line")}
                           for key in entry["sections"]
                           if self.corpus["documents"][key]["kind"] == "concept"],
-                "examples": [key for key in entry["sections"] if self.corpus["documents"][key]["kind"] == "example"],
                 "read_note": "Read the relevant rule IDs for return shapes, dtypes and semantics. Implementation diagnostics are available through search(kind='diagnostic').",
                 "verification": "not evaluated by this read-only service; diagnostics do not redefine doc semantics"}
 
     def read(self, id: str, section: str | None = None) -> dict:
-        """Read a published document/example ID, optionally an exact section title. No filesystem paths accepted."""
+        """Read a published rule ID, optionally an exact section title. No filesystem paths accepted."""
         if section is not None:
             entries = [d for d in self.corpus["documents"].values()
                        if d["source"] == id and d["title"] == section and "#L" in d["id"]]
@@ -166,7 +163,7 @@ def main() -> None:
     manual = Manual(json.loads(arguments.corpus.read_text()))
     server = FastMCP("intent_manual", instructions=(
         "Intent public manual. Call api(name='I.domain') for exact declarations and rule IDs; "
-        "read(id=...) for the relevant rule text or complete examples. "
+        "read(id=...) for syntax, types, semantics and callable interface rules. "
         "read(id=..., section=...) accepts an exact section title. "
         "Use search(query=..., kind=...) to find names and IDs. "
         "No execution or task answers."
