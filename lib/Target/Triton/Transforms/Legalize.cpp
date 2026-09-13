@@ -2230,7 +2230,8 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
         return kernel.emitError("Triton view element type is unsupported");
       continue;
     }
-    if (!isTritonScalarType(type))
+    if (!isTritonScalarType(type) ||
+        isa<Float8E4M3FNType, Float8E5M2Type>(type))
       return kernel.emitError("Triton physical ABI type is unsupported");
   }
 

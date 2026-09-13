@@ -588,6 +588,8 @@ private:
       output << scalar.name;
       if (scalar.kind == "constexpr")
         output << ": tl.constexpr";
+      else
+        output << ": " << pythonType(scalar.type);
     }
     for (const MetadataABI &metadata : metadataArguments) {
       if (!first)
