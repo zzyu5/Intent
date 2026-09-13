@@ -4,6 +4,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   RealizeAccessComposition.cpp
   PredicateScalarControl.cpp
   RealizePointwiseBlocking.cpp
+  RealizeScanConsumers.cpp
   RealizeOnlineReduction.cpp
   RealizeRegionFold.cpp
   RealizeReductionBlocking.cpp

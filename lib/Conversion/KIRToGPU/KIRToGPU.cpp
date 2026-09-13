@@ -5020,6 +5020,8 @@ private:
           loop.erase();
           return {};
         }
+        if (isa<intent::ParallelOp>(operation))
+          loop->setAttr(gpu::independentIterationAttr, nested.getUnitAttr());
         auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
         if (!yield) {
           nestedFailed = true;

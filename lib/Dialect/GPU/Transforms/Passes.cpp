@@ -91,6 +91,12 @@ LogicalResult realizeRegionScanGroup(ModuleOp module, func::FuncOp kernel) {
   return closeValueAccessRelations(kernel);
 }
 
+LogicalResult realizeScanConsumerGroup(ModuleOp module, func::FuncOp kernel) {
+  if (failed(realizeScanConsumerTraversals(module)))
+    return failure();
+  return closeValueAccessRelations(kernel);
+}
+
 LogicalResult realizeReductionGroup(ModuleOp module, func::FuncOp kernel) {
   if (failed(realizeReductionBlocking(module)) ||
       failed(alignAggregateValueRelations(kernel)) ||
@@ -175,6 +181,7 @@ LogicalResult runSharedGPUPasses(ModuleOp module, const TuningProfiles &profiles
       {"predicate-scalar-control", predicateScalarControlGroup},
       {"form-pointwise-ownership", formPointwiseOwnership},
       {"form-pointwise-blocking", formPointwiseBlocking},
+      {"realize-scan-consumers", realizeScanConsumerGroup},
       {"co-realize-online-reductions", coRealizeOnlineReductions},
       {"realize-region-folds", realizeRegionFoldGroup},
       {"realize-region-scans", realizeRegionScanGroup},

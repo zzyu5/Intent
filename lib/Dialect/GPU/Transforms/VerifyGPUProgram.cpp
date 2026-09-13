@@ -386,6 +386,15 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
       if (failed(verifyStructuredSegment(operation, kernel, scan.getSegment())))
         return WalkResult::interrupt();
     }
+    if (operation->hasAttr(independentIterationAttr)) {
+      auto loop = dyn_cast<scf::ForOp>(operation);
+      if (!loop || loop.getNumRegionIterArgs() ||
+          !isa<UnitAttr>(operation->getAttr(independentIterationAttr))) {
+        operation->emitOpError(
+            "independent iteration requires an explicit loop without carried state");
+        return WalkResult::interrupt();
+      }
+    }
     if (isPhysicalAccess(operation)) {
       PhysicalAccessFootprint footprint = physicalAnalysis.footprint(operation);
       if (footprint.state != PhysicalFactState::Exact) {

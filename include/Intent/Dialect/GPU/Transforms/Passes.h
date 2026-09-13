@@ -122,6 +122,14 @@ mlir::LogicalResult replacePhysicalParameter(mlir::func::FuncOp kernel,
 mlir::LogicalResult realizeAccessComposition(mlir::ModuleOp module);
 mlir::LogicalResult simplifyMaskedAccessCoordinates(mlir::ModuleOp module);
 mlir::LogicalResult predicateScalarControl(mlir::ModuleOp module);
+bool canPredicateScalarBlock(mlir::Block &block);
+bool canPredicateValueOperation(mlir::Operation *operation);
+void clonePredicatedScalarOperation(mlir::OpBuilder &builder,
+                                   mlir::Operation *operation,
+                                   mlir::IRMapping &mapping,
+                                   mlir::Value predicate,
+                                   FragmentType shape = {});
+mlir::LogicalResult realizeScanConsumerTraversals(mlir::ModuleOp module);
 mlir::LogicalResult realizeRegionFolds(mlir::ModuleOp module);
 mlir::LogicalResult realizeRegionScans(mlir::ModuleOp module);
 mlir::LogicalResult realizeContractionBlocking(mlir::ModuleOp module);

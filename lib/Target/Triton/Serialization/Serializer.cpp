@@ -1270,7 +1270,7 @@ private:
       for (auto [result, initial] : llvm::zip(loop.getResults(), loop.getInitArgs())) {
         std::string name = newName();
         values[result] = name;
-        line(name + " = " + valueString(initial));
+        line(name + " = " + loopInitialValue(initial));
         results.push_back(name);
       }
       std::string induction = "iv" + std::to_string(counter++);
@@ -1311,7 +1311,7 @@ private:
            llvm::zip(whileOperation.getResults(), whileOperation.getInits())) {
         std::string name = newName();
         values[result] = name;
-        line(name + " = " + valueString(initial));
+        line(name + " = " + loopInitialValue(initial));
         carries.push_back(name);
       }
       Block &before = whileOperation.getBefore().front();
@@ -1753,6 +1753,14 @@ private:
       result += " + (" + coordinateExpression + ") * " + stride;
     }
     return "(" + result + ")";
+  }
+
+  std::string loopInitialValue(Value value) {
+    std::string result = valueString(value);
+    if (value.getDefiningOp<arith::ConstantOp>() &&
+        isa<IntegerType, IndexType, FloatType>(value.getType()))
+      return "tl.full((), " + result + ", " + pythonType(value.getType()) + ")";
+    return result;
   }
 
   std::string valueString(Value value) {

@@ -49,6 +49,8 @@ inline constexpr llvm::StringLiteral pointwiseChunkAttr =
     "intent_gpu.pointwise_chunk";
 inline constexpr llvm::StringLiteral pointwiseLocalAttr =
     "intent_gpu.pointwise_local";
+inline constexpr llvm::StringLiteral independentIterationAttr =
+    "intent_gpu.independent_iteration";
 inline constexpr llvm::StringLiteral physicalTailAttr =
     "intent_gpu.physical_tail";
 inline constexpr llvm::StringLiteral programBoundedOriginAttr =
