@@ -1343,9 +1343,18 @@ FailureOr<Value> materializeReplayedValue(
         if (auto inputAxis = relation.targetToSource[axis]) {
           auto inputMap = cast<AxisMapAttr>(input.getAxisMaps()[*inputAxis]);
           auto resultMap = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+          auto inputExtent =
+              cast<PhysicalExprAttr>(input.getShape()[*inputAxis]);
+          bool sameLogicalAxis = inputMap.getDimensionId() > 0 &&
+                                 inputMap.getDimensionId() ==
+                                     resultMap.getDimensionId();
+          bool nonUnitStaticExtent =
+              inputExtent.getKind() ==
+                  static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+              inputExtent.getValue() > 1 &&
+              queryBroadcastProjection(input, fragment).isExact();
           if (!(sourceAxisIdentity(inputMap) == sourceAxisIdentity(resultMap)) &&
-              inputMap.getDimensionId() > 0 &&
-              inputMap.getDimensionId() == resultMap.getDimensionId() &&
+              (sameLogicalAxis || nonUnitStaticExtent) &&
               input.getShape()[*inputAxis] == fragment.getShape()[axis]) {
             // An extent-preserving projection can rename an occurrence. Replay
             // its input with that input's identity, retaining the output map.
@@ -2602,6 +2611,7 @@ static void retargetExtent(Value root, AxisSelector selects,
     connectedExtents.push_back(extent);
   SmallVector<Value> worklist{root};
   llvm::DenseMap<Value, Type> visitedTypes;
+  SmallVector<std::pair<Value, AxisMapAttr>> broadcastAliases;
   auto isSegmentSourceSlice = [&](Value value) {
     auto argument = dyn_cast<BlockArgument>(value);
     if (!argument)
@@ -2620,6 +2630,7 @@ static void retargetExtent(Value root, AxisSelector selects,
   };
   while (!worklist.empty()) {
     Value value = worklist.pop_back_val();
+    auto previousFragment = dyn_cast<FragmentType>(value.getType());
     auto [visited, inserted] = visitedTypes.try_emplace(value, value.getType());
     if (!inserted && visited->second == value.getType())
       continue;
@@ -2764,6 +2775,36 @@ static void retargetExtent(Value root, AxisSelector selects,
       }
     appendStructuredResultRelations(value, worklist);
     for (Operation *user : value.getUsers()) {
+      if (auto broadcast = dyn_cast<BroadcastOp>(user)) {
+        auto target = dyn_cast<FragmentType>(broadcast.getResult().getType());
+        if (previousFragment && target) {
+          BroadcastProjection projection =
+              queryBroadcastProjection(previousFragment, target);
+          if (projection.isExact())
+            for (auto [targetAxis, sourceAxis] :
+                 llvm::enumerate(projection.targetToSource)) {
+              if (!sourceAxis)
+                continue;
+              auto inputMap =
+                  cast<AxisMapAttr>(previousFragment.getAxisMaps()[*sourceAxis]);
+              auto targetMap = cast<AxisMapAttr>(target.getAxisMaps()[targetAxis]);
+              auto oldExtent =
+                  cast<PhysicalExprAttr>(previousFragment.getShape()[*sourceAxis]);
+              bool unit = oldExtent.getKind() ==
+                              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                          oldExtent.getValue() <= 1;
+              if (selects(inputMap) && !selects(targetMap) && !unit &&
+                  !isIntroducedReshapeUnitAxis(value, *sourceAxis) &&
+                  oldExtent == target.getShape()[targetAxis] &&
+                  target.getShape()[targetAxis] != extent) {
+                std::pair<Value, AxisMapAttr> alias{broadcast.getResult(),
+                                                    targetMap};
+                if (!llvm::is_contained(broadcastAliases, alias))
+                  broadcastAliases.push_back(alias);
+              }
+            }
+        }
+      }
       if (isa<RegionFoldOp, RegionScanOp>(user)) {
         appendStructuredChildRelations(user, value, worklist, selects);
         for (Value result : user->getResults())
@@ -2804,6 +2845,18 @@ static void retargetExtent(Value root, AxisSelector selects,
       for (Value result : user->getResults())
         worklist.push_back(result);
     }
+  }
+  for (auto [value, axis] : broadcastAliases) {
+    auto type = cast<FragmentType>(value.getType());
+    if (type.getShape()[axis.getFragmentAxis()] == extent)
+      continue;
+    retargetExtent(
+        value,
+        [=](AxisMapAttr mapping) {
+          return sourceAxisIdentity(mapping) == sourceAxisIdentity(axis) &&
+                 mapping.getDimensionId() == axis.getDimensionId();
+        },
+        extent, /*followLogicalDimension=*/false);
   }
 }
 

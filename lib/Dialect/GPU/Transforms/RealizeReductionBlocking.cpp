@@ -504,6 +504,7 @@ analyzeRoot(LoadOp load, ArrayRef<MakeRangeOp> reductionRanges,
     MakeRangeOp authority;
   };
   SmallVector<AxisRelation> resultAxes;
+  SmallVector<AxisRelation> directResultAxes;
   for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
     PhysicalRangeFact fact = analysis.axisRanges(load.getResult(), axis);
     if (fact.roots.empty())
@@ -511,9 +512,16 @@ analyzeRoot(LoadOp load, ArrayRef<MakeRangeOp> reductionRanges,
     SmallVector<MakeRangeOp> combined(fact.roots.begin(), fact.roots.end());
     combined.append(reductionRanges.begin(), reductionRanges.end());
     PhysicalLockstepTraversalFact relation = analysis.lockstepRanges(combined);
-    if (relation.isExact())
+    if (relation.isExact()) {
       resultAxes.push_back({axis, fact.roots.front()});
+      if (llvm::any_of(fact.roots, [&](MakeRangeOp range) {
+            return llvm::is_contained(reductionRanges, range);
+          }))
+        directResultAxes.push_back({axis, fact.roots.front()});
+    }
   }
+  if (!directResultAxes.empty())
+    resultAxes = std::move(directResultAxes);
   if (resultAxes.empty())
     return std::optional<RootAccess>();
   if (resultAxes.size() > 1) {
@@ -744,6 +752,61 @@ PhysicalExprAttr selectedParameterExtent(ParameterOp parameter) {
                       schema.getCandidates()[0]);
   return expression(parameter.getContext(), PhysicalExprKind::Parameter, 0,
                     schema.getName().getValue());
+}
+
+FailureOr<ParameterOp> parameterForOwnedRange(func::FuncOp kernel,
+                                             MakeRangeOp range) {
+  FailureOr<ParameterOp> parameter = queryBlockingParameter(kernel, range);
+  if (failed(parameter) || !isUnitStepRange(range) ||
+      (*parameter)->hasAttr(coverageDimensionAttr))
+    return failure();
+  PhysicalParameterBinding binding = queryParameterBinding(*parameter);
+  FailureOr<int64_t> dimension = queryRangeDimension(range);
+  auto schema = parameter->getParameter();
+  if (!binding.isExact() ||
+      (binding.source && !(*binding.source == sourceAxisIdentity(range))) ||
+      (binding.dimension &&
+       (failed(dimension) || *binding.dimension != *dimension)) ||
+      (schema.getRole() != static_cast<uint32_t>(ParameterRole::OwnershipM) &&
+       schema.getRole() != static_cast<uint32_t>(ParameterRole::OwnershipN)))
+    return failure();
+  auto fragment = cast<FragmentType>(range.getResult().getType());
+  if (fragment.getShape()[0] != selectedParameterExtent(*parameter))
+    return failure();
+
+  // Ownership materializes start = logical_start + coordinate * tile * step.
+  // A matching parameter declaration alone does not distinguish a scalar seed.
+  auto otherOperand = [](Value value, Value term,
+                         BinaryOperator kind) -> Value {
+    auto binary = value.getDefiningOp<BinaryOp>();
+    if (!binary || binary.getOperatorKind() != kind)
+      return {};
+    if (samePhysicalScalarExpression(binary.getLhs(), term))
+      return binary.getRhs();
+    if (samePhysicalScalarExpression(binary.getRhs(), term))
+      return binary.getLhs();
+    return {};
+  };
+  Value offset = otherOperand(range.getStart(), range.getLogicalStart(),
+                              BinaryOperator::Add);
+  Value tileOffset = offset ? otherOperand(offset, range.getStep(),
+                                          BinaryOperator::Multiply)
+                            : Value();
+  Value coordinate = tileOffset
+                         ? otherOperand(tileOffset, parameter->getResult(),
+                                        BinaryOperator::Multiply)
+                         : Value();
+  auto result = dyn_cast_or_null<OpResult>(coordinate);
+  auto mapping = result ? dyn_cast<DelinearizeOp>(result.getOwner())
+                        : DelinearizeOp();
+  auto roles = mapping
+                   ? mapping->getAttrOfType<DenseI64ArrayAttr>(coordinateRolesAttr)
+                   : DenseI64ArrayAttr();
+  if (!roles || result.getResultNumber() >= roles.size() ||
+      roles[result.getResultNumber()] !=
+          static_cast<int64_t>(CoordinateRole::PointwiseOwnership))
+    return failure();
+  return *parameter;
 }
 
 FailureOr<ParameterOp> fullCoverageParameterForDimension(func::FuncOp kernel,
@@ -1149,7 +1212,31 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
   }
 
   for (auto [source, sourceAxis, dimension] : pending) {
+    PhysicalProgramAnalysis analysis(kernel);
+    PhysicalRangeFact ranges = analysis.sourceRanges(source, sourceAxis);
     FailureOr<ParameterOp> parameter = parameterForDimension(kernel, dimension);
+    bool projectedOwnership = false;
+    PhysicalAxisProjection projection =
+        queryFragmentAxis(source.getType(), sourceAxis);
+    if (failed(parameter) && projection.isExact()) {
+      PhysicalRangeFact projected =
+          analysis.axisRanges(source, projection.fragmentAxis);
+      if (projected.isExact() && projected.unitStep &&
+          analysis.lockstepRanges(projected.roots).isExact()) {
+        FailureOr<ParameterOp> owner =
+            parameterForOwnedRange(kernel, projected.roots.front());
+        if (succeeded(owner) &&
+            llvm::all_of(projected.roots, [&](MakeRangeOp range) {
+              FailureOr<ParameterOp> current =
+                  parameterForOwnedRange(kernel, range);
+              return succeeded(current) && *current == *owner;
+            })) {
+          parameter = *owner;
+          ranges = std::move(projected);
+          projectedOwnership = true;
+        }
+      }
+    }
     bool fullCoverage = false;
     if (failed(parameter)) {
       parameter = fullCoverageParameterForDimension(kernel, dimension);
@@ -1161,8 +1248,6 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
              << "; dimension=" << dimension << "; source=" << source.getType()
              << "; source_id=" << sourceAxis.sourceId
              << "; source_axis=" << sourceAxis.sourceAxis;
-    PhysicalProgramAnalysis analysis(kernel);
-    PhysicalRangeFact ranges = analysis.sourceRanges(source, sourceAxis);
     if (ranges.roots.empty()) {
       // A free axis introduced by a typed broadcast has no coordinate range of
       // its own.  Its dimension identity is nevertheless exact, so project
@@ -1192,9 +1277,17 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
              << "; source_id=" << sourceAxis.sourceId
              << ", source_axis=" << sourceAxis.sourceAxis
              << ", dimension=" << dimension;
-    for (MakeRangeOp range : ranges.roots)
-      retargetDimensionExtent(range.getResult(), dimension,
-                              selectedParameterExtent(*parameter));
+    for (MakeRangeOp range : ranges.roots) {
+      if (projectedOwnership)
+        retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
+                             selectedParameterExtent(*parameter));
+      else
+        retargetDimensionExtent(range.getResult(), dimension,
+                                selectedParameterExtent(*parameter));
+    }
+    if (projectedOwnership)
+      retargetSourceExtent(source, sourceAxis,
+                           selectedParameterExtent(*parameter));
     if (fullCoverage &&
         failed(bindFullCoverageDimension(kernel, dimension,
                                          parameter->getResult())))
@@ -1852,6 +1945,9 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
             }
             LoadOp load = access.load;
             auto sourceType = cast<FragmentType>(load.getResult().getType());
+            auto accessAxis =
+                cast<AxisMapAttr>(sourceType.getAxisMaps()[access.fragmentAxis]);
+            PhysicalSourceAxis accessSource = sourceAxisIdentity(accessAxis);
             FragmentType slicedType = replaceExtent(
                 sourceType, access.fragmentAxis, outerSliceExtent);
             SmallVector<Value> coordinates(load.getCoordinates());
@@ -1874,7 +1970,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
             FailureOr<Value> reducedCoordinate = materializeReplayedValue(
                 nested, nestedLocation,
                 load.getCoordinates()[access.coordinateIndex],
-                plan.sourceIdentity, outerSliceExtent, mapping);
+                accessSource, outerSliceExtent, mapping);
             if (failed(reducedCoordinate)) {
               bodyFailed = true;
               failureReason =
@@ -1885,13 +1981,13 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
             using ReplayAxis =
                 std::pair<PhysicalSourceAxis, PhysicalExprAttr>;
             SmallVector<ReplayAxis> replayAxes{
-                {plan.sourceIdentity, outerSliceExtent}};
+                {accessSource, outerSliceExtent}};
             for (auto [coordinateIndex, original] :
                  llvm::enumerate(load.getCoordinates())) {
               if (coordinateIndex == access.coordinateIndex)
                 continue;
               FailureOr<Value> outerCoordinate = materializeReplayedValue(
-                  nested, nestedLocation, original, plan.sourceIdentity,
+                  nested, nestedLocation, original, accessSource,
                   outerSliceExtent, mapping);
               if (failed(outerCoordinate)) {
                 bodyFailed = true;

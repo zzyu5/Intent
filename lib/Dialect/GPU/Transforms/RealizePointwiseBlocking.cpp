@@ -1324,6 +1324,7 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
   }
   for (Value operand : producer->getOperands()) {
     PhysicalSourceAxis operandSource = source;
+    SmallVector<int64_t> operandDimensions(traversalDimensions);
     if (isa<BroadcastOp>(producer)) {
       auto input = dyn_cast<FragmentType>(operand.getType());
       auto output = dyn_cast<FragmentType>(value.getType());
@@ -1336,7 +1337,17 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
             auto axisMap = cast<AxisMapAttr>(input.getAxisMaps()[*axis]);
             PhysicalRangeFact ranges =
                 PhysicalProgramAnalysis(kernel).axisRanges(operand, *axis);
-            if (axisMap.getDimensionId() == *blockedDimension &&
+            bool renamedAxis =
+                input.getShape()[*axis] ==
+                    output.getShape()[requested.fragmentAxis] &&
+                llvm::all_of(ranges.roots, [&](MakeRangeOp range) {
+                  FailureOr<int64_t> dimension = queryRangeDimension(range);
+                  return sourceAxisIdentity(range) ==
+                             sourceAxisIdentity(blocked) &&
+                         succeeded(dimension) &&
+                         *dimension == *blockedDimension;
+                });
+            if ((axisMap.getDimensionId() == *blockedDimension || renamedAxis) &&
                 ranges.state != PhysicalFactState::Unknown &&
                 ranges.blockers.empty() &&
                 PhysicalProgramAnalysis(kernel).lockstepRanges(ranges.roots).isExact() &&
@@ -1346,16 +1357,19 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
                          samePhysicalScalarExpression(
                              range.getLogicalStop(), blocked.getLogicalStop()) &&
                          samePhysicalScalarExpression(range.getStep(), blocked.getStep());
-                }))
-              // Match replay analysis: a positional broadcast may rename its
-              // operand's source while preserving the same logical traversal.
+                })) {
+              // The broadcast can rename an exact coordinate traversal.
               operandSource = sourceAxisIdentity(axisMap);
+              for (int64_t &dimension : operandDimensions)
+                if (dimension == requested.dimensionId)
+                  dimension = axisMap.getDimensionId();
+            }
           }
       }
     }
     FailureOr<Value> replacement = replayPointwiseValue(
-        builder, operand, operandSource, traversalDimensions, blockedExtent, blockedRange,
-        blockedValidity, insertionAnchor, mapping);
+        builder, operand, operandSource, operandDimensions, blockedExtent,
+        blockedRange, blockedValidity, insertionAnchor, mapping);
     if (failed(replacement))
       return failure();
     if (*replacement != operand && !mapping.lookupOrNull(operand))
@@ -1726,8 +1740,17 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
     return range.emitOpError(
         "pointwise traversal has multiple parameters for one source axis");
   if (!chunk) {
-    static constexpr int64_t candidates[] = {1, 2, 4, 8, 16, 32, 64, 128,
-                                             256, 512, 1024, 2048, 4096};
+    SmallVector<int64_t> candidates{1,   2,   4,    8,    16,   32, 64,
+                                   128, 256, 512, 1024, 2048, 4096};
+    FailureOr<int64_t> staticExtent = exactStaticTraversalExtent(
+        PhysicalProgramAnalysis(kernel).axisRanges(range.getResult(), 0));
+    if (succeeded(staticExtent)) {
+      uint64_t paddedExtent = llvm::PowerOf2Ceil(
+          static_cast<uint64_t>(std::max<int64_t>(*staticExtent, 1)));
+      llvm::erase_if(candidates, [&](int64_t candidate) {
+        return static_cast<uint64_t>(candidate) > paddedExtent;
+      });
+    }
     uint32_t elementBitWidth = 0;
     for (StoreOp store : stores)
       elementBitWidth =
@@ -5514,6 +5537,15 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     }
     auto sourceType = cast<FragmentType>(range.getResult().getType());
     PhysicalExprAttr tileExtent = fragmentExtent(*parameter);
+    if (sourceType.getShape()[0] != tileExtent) {
+      if (FailureOr<uint64_t> dimension = rangeDimension(range);
+          succeeded(dimension))
+        retargetDimensionExtent(range.getResult(), *dimension, tileExtent);
+      else
+        retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
+                             tileExtent);
+      sourceType = cast<FragmentType>(range.getResult().getType());
+    }
     Value physicalExtent = parameter->getResult();
     if (tileExtent.getKind() ==
         static_cast<uint32_t>(PhysicalExprKind::Constant))

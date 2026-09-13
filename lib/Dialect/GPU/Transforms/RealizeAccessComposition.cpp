@@ -11,6 +11,8 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseSet.h"
 
+#include <limits>
+
 using namespace mlir;
 
 namespace intent::gpu {
@@ -595,6 +597,68 @@ FailureOr<bool> projectFragmentGather(GatherOp gather) {
   return true;
 }
 
+bool hasNonUnitAxisSplit(ReshapeOp reshape) {
+  auto source = cast<FragmentType>(reshape.getValue().getType());
+  auto result = cast<FragmentType>(reshape.getResult().getType());
+  if (source.getShape().size() >= result.getShape().size())
+    return false;
+  bool split = false;
+  for (Attribute attribute : reshape.getReassociation()) {
+    auto group = cast<ReshapeGroupAttr>(attribute);
+    if (group.getSourceAxes().empty() || group.getResultAxes().empty())
+      return false;
+    if (group.getSourceAxes().size() == 1 && group.getResultAxes().size() > 1) {
+      for (int64_t axis : group.getResultAxes().asArrayRef()) {
+        auto extent = cast<PhysicalExprAttr>(result.getShape()[axis]);
+        if (extent.getKind() !=
+                static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+            extent.getValue() <= 1)
+          return false;
+      }
+      split = true;
+    }
+  }
+  return split;
+}
+
+bool composeReshapedPointwise(ReshapeOp reshape) {
+  if (!hasNonUnitAxisSplit(reshape))
+    return false;
+  Operation *producer = reshape.getValue().getDefiningOp();
+  if (!producer ||
+      !isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp,
+           SplatOp, BroadcastOp>(producer))
+    return false;
+  auto source = cast<FragmentType>(reshape.getValue().getType());
+  auto result = cast<FragmentType>(reshape.getResult().getType());
+  for (Value operand : producer->getOperands()) {
+    auto fragment = dyn_cast<FragmentType>(operand.getType());
+    if (fragment &&
+        (fragment.getShape() != source.getShape() ||
+         fragment.getAxisMaps() != source.getAxisMaps() ||
+         fragment.getOwner() != source.getOwner()))
+      return false;
+  }
+  OpBuilder builder(reshape);
+  IRMapping mapping;
+  for (Value operand : producer->getOperands()) {
+    auto fragment = dyn_cast<FragmentType>(operand.getType());
+    if (!fragment || mapping.contains(operand))
+      continue;
+    auto target = FragmentType::get(
+        result.getContext(), fragment.getElementType(), result.getShape(),
+        result.getAxisMaps(), result.getValidity(), result.getOwner());
+    mapping.map(operand, builder.create<ReshapeOp>(
+                             reshape.getLoc(), target, operand,
+                             reshape.getReassociation()).getResult());
+  }
+  Operation *replacement = builder.clone(*producer, mapping);
+  replacement->getResult(0).setType(result);
+  reshape.getResult().replaceAllUsesWith(replacement->getResult(0));
+  reshape.erase();
+  return true;
+}
+
 FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
   Value sourceValue = reshape.getValue();
   Value loaded = sourceValue;
@@ -616,18 +680,21 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
       !canReplayReadAt(load, reshape))
     return false;
   auto source = cast<FragmentType>(sourceValue.getType());
-  if (source.getShape().size() <= result.getShape().size())
+  if (source.getShape().size() <= result.getShape().size() &&
+      !hasNonUnitAxisSplit(reshape))
     return false;
   unsigned sourceRank = 0;
   unsigned resultRank = 0;
   for (Attribute attribute : reshape.getReassociation()) {
     auto group = cast<ReshapeGroupAttr>(attribute);
-    if (group.getSourceAxes().empty() || group.getResultAxes().size() != 1)
+    if (group.getSourceAxes().empty() || group.getResultAxes().empty() ||
+        (group.getSourceAxes().size() != 1 &&
+         group.getResultAxes().size() != 1))
       return false;
     for (int64_t axis : group.getSourceAxes().asArrayRef())
       sourceRank = std::max(sourceRank, static_cast<unsigned>(axis + 1));
-    resultRank = std::max(resultRank,
-                         static_cast<unsigned>(group.getResultAxes()[0] + 1));
+    for (int64_t axis : group.getResultAxes().asArrayRef())
+      resultRank = std::max(resultRank, static_cast<unsigned>(axis + 1));
   }
   if (sourceRank != source.getShape().size() || resultRank != result.getShape().size())
     return false;
@@ -637,7 +704,8 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
   SmallVector<bool> preservedResult(resultRank, false);
   for (Attribute attribute : reshape.getReassociation()) {
     auto group = cast<ReshapeGroupAttr>(attribute);
-    if (group.getSourceAxes().size() != 1)
+    if (group.getSourceAxes().size() != 1 ||
+        group.getResultAxes().size() != 1)
       continue;
     unsigned sourceAxis = group.getSourceAxes()[0];
     unsigned resultAxis = group.getResultAxes()[0];
@@ -701,10 +769,7 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
     sourceRanges[axis] = range;
     sourceExtents[axis] = extent;
   }
-  OpBuilder builder(reshape);
-  SmallVector<Value> resultStops(resultRank);
-  // Each group merges complete zero-based source-value axes. Its logical
-  // extent is their product, including when no author domain names that axis.
+  SmallVector<PhysicalExprAttr> resultExtents(resultRank);
   for (Attribute attribute : reshape.getReassociation()) {
     auto group = cast<ReshapeGroupAttr>(attribute);
     unsigned resultAxis = group.getResultAxes()[0];
@@ -712,13 +777,49 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
       continue;
     auto axes = group.getSourceAxes().asArrayRef();
     auto extent = cast<PhysicalExprAttr>(sourceExtents[axes.front()]);
+    if (group.getResultAxes().size() > 1) {
+      // The declared row-major group may split a complete source axis.
+      // Static result extents give each constituent its own exact range;
+      // physical padding or a partial source tile cannot satisfy this proof.
+      int64_t product = 1;
+      for (int64_t axis : group.getResultAxes().asArrayRef()) {
+        auto part = cast<PhysicalExprAttr>(result.getShape()[axis]);
+        if (part.getKind() !=
+                static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+            part.getValue() <= 0 ||
+            product > std::numeric_limits<int64_t>::max() / part.getValue())
+          return false;
+        product *= part.getValue();
+        resultExtents[axis] = part;
+      }
+      if (extent.getKind() !=
+              static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+          extent.getValue() != product)
+        return false;
+      continue;
+    }
     for (int64_t axis : axes.drop_front())
       extent = PhysicalExprAttr::get(reshape.getContext(),
           static_cast<uint32_t>(PhysicalExprKind::Multiply), 0,
-          builder.getStringAttr(""), builder.getArrayAttr({extent, sourceExtents[axis]}));
-    resultStops[resultAxis] = builder.create<PhysicalExprOp>(
-        reshape.getLoc(), builder.getIndexType(), extent);
+          StringAttr::get(reshape.getContext(), ""),
+          ArrayAttr::get(reshape.getContext(), {extent, sourceExtents[axis]}));
+    resultExtents[resultAxis] = extent;
   }
+  if (llvm::all_of(preservedResult, [](bool preserved) { return preserved; }))
+    return false;
+  OpBuilder builder(reshape);
+  auto materializeExtent = [&](PhysicalExprAttr extent) -> Value {
+    if (extent.getKind() ==
+        static_cast<uint32_t>(PhysicalExprKind::Constant))
+      return builder.create<arith::ConstantIndexOp>(reshape.getLoc(),
+                                                    extent.getValue());
+    return builder.create<PhysicalExprOp>(reshape.getLoc(), builder.getIndexType(),
+                                         extent);
+  };
+  SmallVector<Value> resultStops(resultRank);
+  for (unsigned axis = 0; axis < resultRank; ++axis)
+    if (!preservedResult[axis])
+      resultStops[axis] = materializeExtent(resultExtents[axis]);
 
   Value zero = builder.create<arith::ConstantIndexOp>(reshape.getLoc(), 0);
   Value one = builder.create<arith::ConstantIndexOp>(reshape.getLoc(), 1);
@@ -731,8 +832,7 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
       continue;
     auto mapping = cast<AxisMapAttr>(result.getAxisMaps()[axis]);
     Value stop = resultStops[axis];
-    Value extent = builder.create<PhysicalExprOp>(
-        reshape.getLoc(), builder.getIndexType(),
+    Value extent = materializeExtent(
         cast<PhysicalExprAttr>(result.getShape()[axis]));
     auto rangeType = FragmentType::get(
         result.getContext(), builder.getIndexType(),
@@ -767,6 +867,15 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
       continue;
     }
     Value ordinal = flatCoordinates[group.getResultAxes()[0]];
+    for (int64_t axis : group.getResultAxes().asArrayRef().drop_front()) {
+      Value extent = builder.create<SplatOp>(reshape.getLoc(), indexType,
+                                            resultStops[axis]);
+      ordinal = builder.create<BinaryOp>(reshape.getLoc(), indexType, ordinal,
+                                        extent, BinaryOperator::Multiply);
+      ordinal = builder.create<BinaryOp>(reshape.getLoc(), indexType, ordinal,
+                                        flatCoordinates[axis],
+                                        BinaryOperator::Add);
+    }
     auto axes = group.getSourceAxes().asArrayRef();
     for (unsigned position = axes.size(); position-- > 0;) {
       unsigned axis = axes[position];
@@ -1313,6 +1422,10 @@ LogicalResult realizeAccessComposition(ModuleOp module) {
     SmallVector<ReshapeOp> reshapes;
     physicalKernel->walk([&](ReshapeOp reshape) { reshapes.push_back(reshape); });
     for (ReshapeOp reshape : reshapes) {
+      if (composeReshapedPointwise(reshape)) {
+        changed = true;
+        continue;
+      }
       FailureOr<bool> composed = composeReshapedLoad(reshape);
       if (failed(composed))
         return failure();
