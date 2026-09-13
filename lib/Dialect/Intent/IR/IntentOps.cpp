@@ -1579,6 +1579,68 @@ bool hasPreviousIterationViewDefinition(Operation *read, ViewStoreOp store,
   return false;
 }
 
+bool hasCompletedLoopViewDefinition(Operation *read, ViewStoreOp store,
+                                    RankedTensorType tensor,
+                                    DominanceInfo &dominance) {
+  auto loop = dyn_cast<ForOp>(store->getParentOp());
+  if (!loop || loop.getInputs().empty() || !loop.getBody().hasOneBlock() ||
+      loop.getBody().front().getNumArguments() == 0 ||
+      loop->isAncestor(read) || !dominance.dominates(loop, read) ||
+      !dominance.dominates(read->getOperand(0), loop))
+    return false;
+  auto domain = loop.getInputs().front().getDefiningOp<DomainOp>();
+  if (!domain || domain.getBounds().size() < 2 ||
+      getConstantInteger(domain.getBounds().front()) != 0 ||
+      (domain.getBounds().size() == 3 &&
+       getConstantInteger(domain.getBounds()[2]) != 1))
+    return false;
+  auto readRelation = read->getAttrOfType<IndexRelationAttr>("index");
+  auto writeRelation = store->getAttrOfType<IndexRelationAttr>("index");
+  if (!readRelation || !writeRelation ||
+      readRelation.getSourceRank() != tensor.getRank() ||
+      writeRelation.getSourceRank() != tensor.getRank() ||
+      readRelation.getTerms().size() != static_cast<size_t>(tensor.getRank()) ||
+      writeRelation.getTerms().size() != static_cast<size_t>(tensor.getRank()))
+    return false;
+  Value induction = loop.getBody().front().getArgument(0);
+  bool completeAxis = false;
+  for (auto [axis, pair] : llvm::enumerate(
+           llvm::zip(readRelation.getTerms(), writeRelation.getTerms()))) {
+    auto readTerm = dyn_cast<IndexTermAttr>(std::get<0>(pair));
+    auto writeTerm = dyn_cast<IndexTermAttr>(std::get<1>(pair));
+    if (!readTerm || !writeTerm)
+      return false;
+    if (writeTerm.getKind() == 3 &&
+        indexTermOperand(store, writeTerm) == induction) {
+      if (completeAxis ||
+          !extentValueMatchesAxis(domain.getBounds()[1], tensor, axis))
+        return false;
+      completeAxis = true;
+      continue;
+    }
+    if (readTerm.getKind() != writeTerm.getKind() ||
+        readTerm.getStaticValues() != writeTerm.getStaticValues() ||
+        readTerm.getOperandPositions().size() !=
+            writeTerm.getOperandPositions().size())
+      return false;
+    for (auto [readPosition, writePosition] : llvm::zip(
+             readTerm.getOperandPositions().asArrayRef(),
+             writeTerm.getOperandPositions().asArrayRef())) {
+      if (readPosition == -1 && writePosition == -1)
+        continue;
+      if (readPosition <= 0 || writePosition <= 0 ||
+          readPosition >= read->getNumOperands() ||
+          writePosition >= store->getNumOperands() ||
+          read->getOperand(readPosition) != store->getOperand(writePosition) ||
+          !dominance.dominates(read->getOperand(readPosition), loop))
+        return false;
+    }
+  }
+  // The unconditional store covers a full axis before the later read starts;
+  // every other coordinate names the same loop-invariant slice.
+  return completeAxis;
+}
+
 bool hasDominatingViewDefinition(Operation *read, RankedTensorType tensor) {
   Value resource = read->getOperand(0);
   auto function = read->getParentOfType<func::FuncOp>();
@@ -1590,7 +1652,8 @@ bool hasDominatingViewDefinition(Operation *read, RankedTensorType tensor) {
     if (!store || store->getOperand(0) != resource ||
         store->hasAttr("valid_operand_index"))
       continue;
-    if (hasPreviousIterationViewDefinition(read, store, dominance))
+    if (hasPreviousIterationViewDefinition(read, store, dominance) ||
+        hasCompletedLoopViewDefinition(read, store, tensor, dominance))
       return true;
     if (!dominance.dominates(user, read))
       continue;
