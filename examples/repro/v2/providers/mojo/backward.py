@@ -31,9 +31,14 @@ from kernels.backward.layer_norm import (
     layer_norm_backward_reduce,
     layer_norm_backward_rows,
 )
+from kernels.backward.sparse_mla import (
+    sparse_mla_backward_delta,
+    sparse_mla_backward_main,
+    sparse_mla_grad_kv_cast,
+)
 from ...loading import load_module
 from ...measurement import report_stage
-from ...model import PreparedComparison, PreparedLaunch, Tolerance
+from ...model import Context, PreparedComparison, PreparedLaunch, Tolerance
 
 
 def group_norm(context):
@@ -330,9 +335,115 @@ def attention_backward_case(context):
     )
 
 
+def sparse_mla_backward_case(context: Context) -> PreparedComparison:
+    batch, sequence, key_value_sequence = 1, 4096, 8192
+    heads, key_value_groups = 64, 1
+    query_dimension, value_dimension, topk = 576, 512, 2048
+    query = torch.randn(
+        (batch, sequence, heads, query_dimension), dtype=torch.bfloat16
+    )
+    key_value = torch.randn(
+        (batch, key_value_sequence, key_value_groups, query_dimension),
+        dtype=torch.bfloat16,
+    )
+    grad_output = torch.randn(
+        (batch, sequence, heads, value_dimension), dtype=torch.bfloat16
+    )
+    positions = torch.arange(sequence, dtype=torch.int32)
+    offsets = torch.arange(topk, dtype=torch.int32)
+    causal_indices = positions[:, None] - offsets[None, :] - 1
+    causal_indices = torch.where(
+        offsets[None, :] < positions[:, None],
+        causal_indices,
+        torch.full_like(causal_indices, key_value_sequence),
+    )
+    selected_indices = causal_indices.view(
+        batch, sequence, key_value_groups, topk
+    ).contiguous()
+    scale = query_dimension**-0.5
+
+    runtime = load_module(
+        context.project_root / "source/pytorch/cpu_runtime.py",
+        "intent_cpu_reference_sparse_mla_backward",
+    )
+    output, lse, source_backward = runtime.prepare_sparse_mla_backward(
+        query,
+        key_value,
+        grad_output,
+        selected_indices,
+        scale,
+    )
+
+    report_stage("generated_compilation")
+    delta_artifact = intent.compile(
+        sparse_mla_backward_delta,
+        target=context.target,
+        compiler=context.compiler,
+        tuning_config=context.tuning_config,
+    )
+    constexprs = {"HEAD_GROUP": heads // key_value_groups}
+    main_artifact = intent.compile(
+        sparse_mla_backward_main,
+        target=context.target,
+        compiler=context.compiler,
+        tuning_config=context.tuning_config,
+        constexprs=constexprs,
+    )
+    cast_artifact = intent.compile(
+        sparse_mla_grad_kv_cast,
+        target=context.target,
+        compiler=context.compiler,
+        tuning_config=context.tuning_config,
+    )
+    delta = torch.empty((batch, sequence, heads), dtype=torch.float32)
+    grad_key_value = torch.zeros_like(key_value, dtype=torch.float32)
+    grad_query = torch.empty_like(query)
+    grad_key_value_bf16 = torch.empty_like(key_value)
+    generated_state = {}
+    source_state = {}
+
+    def generated_launch() -> None:
+        grad_key_value.zero_()
+        delta_artifact(output, grad_output, delta)
+        main_artifact(
+            query,
+            key_value,
+            grad_output,
+            selected_indices,
+            lse,
+            delta,
+            grad_key_value,
+            grad_query,
+            scale,
+        )
+        cast_artifact(grad_key_value, grad_key_value_bf16)
+        generated_state["output"] = (grad_query, grad_key_value_bf16)
+
+    def source_launch() -> None:
+        source_state["output"] = source_backward()
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(
+        PreparedLaunch(
+            generated_launch,
+            lambda: generated_state["output"],
+        ),
+        PreparedLaunch(source_launch, lambda: source_state["output"]),
+        (
+            Tolerance(atol=2.5e-1, rtol=5.0e-2),
+            Tolerance(atol=2.5e-1, rtol=5.0e-2),
+        ),
+        cuda_graph=False,
+        device_type="cpu",
+        cpu_host_timing=True,
+        note="既有B1-S4096-SKV8192-H64-DQ576-DV512-topk2048 bf16 sparse MLA backward；计入 f32 gradKV workspace 清零及 delta/main/gradKV cast 三kernel；CPU reference 同样重算概率并保持 bf16 dScore/P 转换，前向 output/LSE 准备不计入反向时间。",
+    )
+
+
 CASES = {
     "group_norm_silu_backward": group_norm,
     "layer_norm_backward": layer_norm_backward,
     "group_norm_backward": group_norm_backward,
     "attention_backward": attention_backward_case,
+    "sparse_mla_backward": sparse_mla_backward_case,
 }

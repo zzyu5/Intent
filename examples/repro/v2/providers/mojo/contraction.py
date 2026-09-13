@@ -1,4 +1,5 @@
 import math
+from dataclasses import replace
 import intent
 import torch
 from kernels.contraction.block_scaled import block_scaled_matmul
@@ -10,9 +11,11 @@ from kernels.contraction.batched_gemm import batched_gemm_tn as batched_gemm_tn_
 from kernels.contraction.batched_gemm import batched_gemm_tt as batched_gemm_tt_definition
 from kernels.contraction.dual_gemm import gated_dual_gemm
 from kernels.contraction.qkv import fused_qkv_projection
+from kernels.contraction.sparse_2to4 import sparse_2to4_gemm
 from kernels.contraction.weight_only_int4 import fp8_e4m3_matmul
 from kernels.contraction.mla import mla_head_projection as mla_head_projection_definition
 from ...model import Tolerance
+from ...loading import load_module
 from .common import configure_cpu_budget, prepare_comparison, prepare_host_comparison
 
 
@@ -173,6 +176,23 @@ def block_sparse_gemm(context):
     )
 
 
+def sparse_2to4(context):
+    configure_cpu_budget()
+    m, n, k = 8192, 14336, 8192
+    runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_sparse_inputs")
+    compressed, metadata = runtime.make_sparse_2to4_inputs(m, k)
+    rhs = torch.randn((k, n), dtype=torch.float16)
+    comparison = prepare_host_comparison(
+        context,
+        sparse_2to4_gemm,
+        (compressed, metadata, rhs),
+        "sparse_2to4_gemm",
+        Tolerance(atol=5.0e-2, rtol=2.0e-2),
+    )
+    return replace(comparison, note=comparison.note +
+                   " CPU reference 计入逻辑稀疏输入的 dense 解码及 f32 GEMM；生成程序保留压缩非零遍历。")
+
+
 def qkv_projection(context):
     configure_cpu_budget()
     tokens = hidden = projection = 4096
@@ -208,4 +228,5 @@ CASES = {"dense_gemm_f32": gemm, "dense_gemm": half_gemm, "tilegym_dense_gemm": 
          "mla_head_value_projection": mla_head_value_projection,
          "qkv_projection": qkv_projection,
          "gated_dual_gemm": dual_gemm, "fp8_gemm": fp8_gemm,
-         "mxfp8_gemm": mxfp8_gemm, "block_sparse_gemm": block_sparse_gemm}
+         "mxfp8_gemm": mxfp8_gemm, "block_sparse_gemm": block_sparse_gemm,
+         "sparse_2to4_gemm": sparse_2to4}

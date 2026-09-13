@@ -805,3 +805,275 @@ def block_sparse_matmul(lhs, rhs, block_mask):
                 accumulator += left[row_slice, reduction] @ right[reduction, column_slice]
             output[row_slice, column_slice] = accumulator.to(lhs.dtype)
     return output
+
+
+def padded_rope_cache_update(packed_input, sequence_lengths, output_storage, theta, linear_scale):
+    batch, _, dimension = packed_input.shape
+    query_heads, kv_heads, padded_length = 32, 8, 8193
+    half = dimension // 2
+    positions = sequence_lengths.long() - 1
+    powers = torch.arange(half, dtype=torch.float32) * (-2.0 / dimension)
+    angles = positions.float()[:, None] * torch.pow(theta, powers)[None, :] / linear_scale
+    cosine, sine = angles.cos()[:, None, :], angles.sin()[:, None, :]
+    first = packed_input[:, :query_heads + kv_heads, :half].float()
+    second = packed_input[:, :query_heads + kv_heads, half:].float()
+    rotated = torch.cat((first * cosine - second * sine, second * cosine + first * sine), dim=-1)
+    query_rows = batch * query_heads
+    cache_rows = batch * padded_length * kv_heads
+    output_storage[:query_rows] = rotated[:, :query_heads].reshape(query_rows, dimension)
+    key_cache = output_storage[query_rows:query_rows + cache_rows].view(batch, padded_length, kv_heads, dimension)
+    value_cache = output_storage[query_rows + cache_rows:].view(batch, padded_length, kv_heads, dimension)
+    rows = torch.arange(batch)
+    key_cache[rows, positions] = rotated[:, query_heads:].to(packed_input.dtype)
+    value_cache[rows, positions] = packed_input[:, query_heads + kv_heads:]
+    return output_storage
+
+
+def moe_align_block_size(topk_ids, block_size, num_experts):
+    flat = topk_ids.flatten()
+    counts = torch.bincount(flat.long(), minlength=num_experts)
+    padded = (counts + block_size - 1) // block_size * block_size
+    offsets = torch.cat((torch.zeros(1, dtype=torch.int64), padded.cumsum(0)))
+    routes = torch.argsort(flat, stable=True).to(torch.int32)
+    capacity = flat.numel() + num_experts * (block_size - 1)
+    sorted_ids = torch.full((capacity,), flat.numel(), dtype=torch.int32)
+    expert_ids = torch.empty(((capacity + block_size - 1) // block_size,), dtype=torch.int32)
+    source_offset = 0
+    for expert in range(num_experts):
+        begin, end = int(offsets[expert]), int(offsets[expert + 1])
+        count = int(counts[expert])
+        sorted_ids[begin:begin + count] = routes[source_offset:source_offset + count]
+        expert_ids[begin // block_size:end // block_size] = expert
+        source_offset += count
+    return sorted_ids, expert_ids, offsets[-1:].to(torch.int32)
+
+
+def mhc_apply_residual(residual, layer_output, post_mix, residual_mix):
+    mixed = torch.bmm(residual_mix, residual.float())
+    return (mixed + layer_output.float()[:, None, :] * post_mix[:, :, None]).to(residual.dtype)
+
+
+def swiglu_float_intermediate(gate, up):
+    return (torch.nn.functional.silu(gate.float()) * up.float()).to(gate.dtype)
+
+
+def rotary_embedding_flat(values, cosine, sine):
+    rows, dimension = values.shape
+    half = dimension // 2
+    dimensions = torch.arange(dimension)
+    paired = (dimensions - half) % dimension
+    phase = dimensions % half
+    sign = torch.where(dimensions < half, -1.0, 1.0).to(values.dtype)
+    tokens = torch.arange(rows) // (rows // cosine.shape[0])
+    rotated = values * cosine[tokens][:, phase] + values[:, paired] * sine[tokens][:, phase] * sign
+    return rotated.reshape(rows, 2, half)
+
+
+def mamba_chunk_state_fwd(state_basis, x, dt, cumulative_decay):
+    batch, sequence, heads, dimension = x.shape
+    chunks, chunk = dt.shape[-2:]
+    basis = state_basis.repeat_interleave(heads // state_basis.shape[2], dim=2)
+    basis = basis.reshape(batch, chunks, chunk, heads, state_basis.shape[-1])
+    values = x.reshape(batch, chunks, chunk, heads, dimension)
+    decay = torch.exp(cumulative_decay[..., -1:] - cumulative_decay)
+    return torch.einsum("bclhn,bhcl,bhcl,bclhp->bchpn", basis, decay.to(x.dtype), dt, values)
+
+
+def linear_attention_forward(q, k, v, scale):
+    batch, sequence, heads, dimension = q.shape
+    chunk = 64
+    def chunks(tensor):
+        return tensor.float().reshape(batch, sequence // chunk, chunk, heads, tensor.shape[-1]).permute(0, 3, 1, 2, 4)
+
+    query, key, value = chunks(q) * scale, chunks(k), chunks(v)
+    prefix = (key.transpose(-1, -2) @ value).cumsum(2)
+    final = prefix[:, :, -1]
+    previous = torch.cat((torch.zeros_like(prefix[:, :, :1]), prefix[:, :, :-1]), dim=2)
+    future = torch.ones((chunk, chunk), dtype=torch.bool).triu(1)
+    intra = (query @ key.transpose(-1, -2)).masked_fill(future, 0.0) @ value
+    output = query @ previous + intra
+    return output.permute(0, 2, 3, 1, 4).reshape(batch, sequence, heads, value.shape[-1]), final
+
+
+def moe_expert_ffn(x, route_offsets, member_routes, route_token, route_weights, w1, w2, y):
+    for expert in range(w1.shape[0]):
+        routes = member_routes[route_offsets[expert]:route_offsets[expert + 1]].long()
+        tokens = route_token[routes].long()
+        hidden = torch.relu(x[tokens].float() @ w1[expert].float())
+        values = hidden @ w2[expert].float()
+        y.index_add_(0, tokens, route_weights[routes, None] * values)
+    return y
+
+
+def make_sparse_2to4_inputs(rows, depth):
+    # The original TileLang input generator zeros each group's two largest values.
+    dense = torch.randn((rows, depth), dtype=torch.float32).view(rows, -1, 4)
+    dense.scatter_(-1, dense.topk(2, dim=-1).indices, 0)
+    groups = dense.to(torch.float16)
+    m0, m1, _, m3 = (groups != 0).unbind(-1)
+    expr0, expr1, expr2 = m0 & m1, ~m0 & m1, ~m0 & ~m1
+    first = expr1.long() | (expr2.long() << 1)
+    second = (expr0 | expr2 | m3).long() | ((expr1 | ~m1).long() << 1)
+    compressed = torch.stack((groups.gather(-1, first[..., None]),
+                              groups.gather(-1, second[..., None])), dim=-1).view(rows, depth // 2)
+    nibbles = (first | (second << 2)).view(rows, depth // 16, 4).to(torch.int16)
+    metadata = nibbles[:, :, 0]
+    for lane in range(1, 4):
+        metadata = metadata | (nibbles[:, :, lane] << (4 * lane))
+    return compressed, metadata
+
+
+def sparse_2to4_gemm(compressed, metadata, rhs):
+    rows = compressed.shape[0]
+    depth = rhs.shape[0]
+    shifts = torch.arange(4, dtype=torch.int16) * 4
+    nibbles = ((metadata[..., None] >> shifts) & 15).reshape(rows, depth // 4)
+    positions = torch.stack((nibbles & 3, (nibbles >> 2) & 3), dim=-1).long()
+    dense = torch.zeros((rows, depth // 4, 4), dtype=torch.float32)
+    dense.scatter_(2, positions, compressed.float().reshape(rows, depth // 4, 2))
+    return dense.reshape(rows, depth) @ rhs.float()
+
+
+def reshape_and_cache(key, value, slots, key_cache, value_cache):
+    flat_shape = (-1, *key.shape[1:])
+    key_cache.view(flat_shape)[slots.long()] = key
+    value_cache.view(flat_shape)[slots.long()] = value
+    return key_cache, value_cache
+
+
+def nvfp4_quantize(x, global_scale, packed, scales):
+    rows, columns = x.shape
+    groups = x.float().reshape(rows, columns // 16, 16)
+    scale = ((groups.abs().amax(-1) / 6.0) * global_scale[0]).clamp_min(1.5258789e-5).to(torch.float8_e4m3fn)
+    values = groups * (global_scale[0] / scale.float())[..., None]
+    magnitude = values.abs()
+    encoded = (magnitude > 0.25).to(torch.uint8)
+    for code, threshold in enumerate((0.75, 1.25, 1.75, 2.5, 3.5, 5.0), start=2):
+        selected = magnitude >= threshold if code % 2 == 0 else magnitude > threshold
+        encoded = torch.where(selected, code, encoded)
+    encoded |= torch.signbit(values).to(torch.uint8) << 3
+    pairs = encoded.reshape(rows, columns // 2, 2)
+    packed.copy_(pairs[..., 0] | (pairs[..., 1] << 4))
+    scale_bytes = scale.view(torch.uint8).reshape(rows // 128, 4, 32, columns // 64, 4)
+    scales.copy_(scale_bytes.permute(0, 3, 2, 1, 4))
+    return packed, scales
+
+
+def fp8_mqa_logits(q, kv, kv_scale, head_weight, key_start, key_end):
+    logits = (q.float() @ kv.float().T).relu()
+    output = (logits * head_weight[..., None]).sum(dim=1) * kv_scale[None, :]
+    keys = torch.arange(kv.shape[0])[None, :]
+    return output.masked_fill((keys < key_start[:, None]) | (keys >= key_end[:, None]), -float("inf"))
+
+
+def _grouped_decode(query, key, value, scale, soft_cap=0.0):
+    heads, dimension = query.shape
+    groups = key.shape[1]
+    q = query.float().reshape(groups, heads // groups, dimension)
+    scores = (q @ key.float().permute(1, 2, 0)) * scale
+    if soft_cap > 0.0:
+        scores = soft_cap * torch.tanh(scores / soft_cap)
+    output = torch.softmax(scores, dim=-1) @ value.float().permute(1, 0, 2)
+    return output.reshape(heads, value.shape[-1]).to(query.dtype)
+
+
+def gemma_decode(q, k, v, scale, *, window_size, soft_cap, kv_len_per_split):
+    begin = max(0, k.shape[2] - 1 - window_size) if window_size > 0 else 0
+    return torch.stack([
+        _grouped_decode(q[batch, :, 0], k[batch, :, begin:].transpose(0, 1),
+                        v[batch, :, begin:].transpose(0, 1), scale, soft_cap)
+        for batch in range(q.shape[0])
+    ]).unsqueeze(2)
+
+
+def paged_gqa_decode(q, key_cache, value_cache, page_offsets, page_indices,
+                     lengths, split_offsets, scale, *, page_size):
+    outputs = []
+    for batch in range(q.shape[0]):
+        pages = page_indices[page_offsets[batch]:page_offsets[batch + 1]].long()
+        key = key_cache[pages].reshape(-1, *key_cache.shape[2:])[:lengths[batch]]
+        value = value_cache[pages].reshape(-1, *value_cache.shape[2:])[:lengths[batch]]
+        outputs.append(_grouped_decode(q[batch], key, value, scale))
+    return torch.stack(outputs)
+
+
+def block_sparse_gqa_decode(q, k, v, selected, lengths, split_offsets, scale, *, block_size):
+    outputs = []
+    group = q.shape[1] // k.shape[2]
+    for batch in range(q.shape[0]):
+        heads = []
+        for head in range(k.shape[2]):
+            positions = (selected[batch, head].long()[:, None] * block_size + torch.arange(block_size)).flatten()
+            positions = positions[(positions >= 0) & (positions < lengths[batch])]
+            heads.append(_grouped_decode(q[batch, head * group:(head + 1) * group],
+                                         k[batch, positions, head][:, None],
+                                         v[batch, positions, head][:, None], scale))
+        outputs.append(torch.cat(heads))
+    return torch.stack(outputs)
+
+
+def paged_mla_decode(q_latent, q_rope, latent_cache, rope_cache,
+                     page_offsets, page_indices, lengths, scale):
+    outputs = []
+    groups = latent_cache.shape[2]
+    heads_per_group = q_latent.shape[1] // groups
+    for batch in range(q_latent.shape[0]):
+        pages = page_indices[page_offsets[batch]:page_offsets[batch + 1]].long()
+        latent = latent_cache[pages].reshape(-1, groups, latent_cache.shape[-1])[:lengths[batch]].float()
+        rope = rope_cache[pages].reshape(-1, groups, rope_cache.shape[-1])[:lengths[batch]].float()
+        query = q_latent[batch].float().reshape(groups, heads_per_group, -1)
+        query_rope = q_rope[batch].float().reshape(groups, heads_per_group, -1)
+        scores = (query @ latent.permute(1, 2, 0) + query_rope @ rope.permute(1, 2, 0)) * scale
+        output = torch.softmax(scores, dim=-1) @ latent.permute(1, 0, 2)
+        outputs.append(output.reshape(q_latent.shape[1], latent.shape[-1]).to(q_latent.dtype))
+    return torch.stack(outputs)
+
+
+def prepare_sparse_mla_backward(query, key_value, grad_output, selected_indices, scale):
+    batch, sequence, heads, dimension = query.shape
+    groups = key_value.shape[2]
+    heads_per_group = heads // groups
+    value_dimension = grad_output.shape[-1]
+    output = torch.empty_like(grad_output)
+    lse = torch.empty((batch, sequence, heads), dtype=torch.float32)
+
+    def blocks():
+        for b in range(batch):
+            for group in range(groups):
+                head_slice = slice(group * heads_per_group, (group + 1) * heads_per_group)
+                for begin in range(0, sequence, 32):
+                    end = min(begin + 32, sequence)
+                    rows = slice(begin, end)
+                    raw = selected_indices[b, rows, group].long()
+                    positions = torch.arange(begin, end)[:, None]
+                    valid = (raw >= 0) & (raw <= positions) & (raw < key_value.shape[1])
+                    safe = torch.where(valid, raw, 0)
+                    selected = key_value[b, safe, group].float()
+                    q = query[b, rows, head_slice].float()
+                    yield b, group, rows, head_slice, raw, valid, selected, q
+
+    for b, group, rows, head_slice, raw, valid, selected, q in blocks():
+        scores = (q @ selected.transpose(-2, -1)) * scale
+        scores = scores.masked_fill(~valid[:, None, :], -float("inf"))
+        probability = torch.softmax(scores, dim=-1)
+        output[b, rows, head_slice] = (probability @ selected[..., :value_dimension]).to(output.dtype)
+        lse[b, rows, head_slice] = torch.logsumexp(scores, dim=-1) * np.log2(np.e)
+
+    def backward():
+        delta = (output.float() * grad_output.float()).sum(dim=-1)
+        grad_query = torch.empty_like(query)
+        grad_kv = torch.zeros_like(key_value, dtype=torch.float32)
+        for b, group, rows, head_slice, raw, valid, selected, q in blocks():
+            do = grad_output[b, rows, head_slice].float()
+            probability = torch.exp2((q @ selected.transpose(-2, -1)) * (scale * np.log2(np.e))
+                                     - lse[b, rows, head_slice, None])
+            probability = torch.where(valid[:, None, :], probability, 0.0)
+            dp = do @ selected[..., :value_dimension].transpose(-2, -1)
+            ds = (probability * (dp - delta[b, rows, head_slice, None]) * scale).to(query.dtype).float()
+            grad_query[b, rows, head_slice] = (ds @ selected).to(query.dtype)
+            update = ds.transpose(-2, -1) @ q
+            update[..., :value_dimension] += probability.to(query.dtype).float().transpose(-2, -1) @ do
+            grad_kv[b, :, group].index_add_(0, raw[valid], update[valid])
+        return grad_query, grad_kv.to(key_value.dtype)
+
+    return output, lse, backward

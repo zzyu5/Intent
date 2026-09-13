@@ -5,6 +5,8 @@ import math
 import torch
 
 from kernels.streaming.gated_delta import recurrent_gated_delta_fwd
+from kernels.streaming.linear_attention import fused_chunk_linear_attention_fwd
+from kernels.streaming.mamba import mamba_chunk_state_fwd
 from kernels.streaming.online_softmax import streamed_online_softmax_f16
 from kernels.streaming.selective_scan import (
     BATCH as SELECTIVE_SCAN_BATCH,
@@ -125,9 +127,59 @@ def mamba_chunk_scan(context: Context) -> PreparedComparison:
     )
 
 
+def mamba_chunk_state(context: Context) -> PreparedComparison:
+    configure_cpu_budget()
+    batch, sequence, heads, groups, dimension, state, chunk = (
+        1, 2048, 32, 8, 64, 128, 256
+    )
+    chunks = sequence // chunk
+    state_basis = torch.randn(
+        (batch, sequence, groups, state), dtype=torch.float16
+    )
+    x = torch.randn(
+        (batch, sequence, heads, dimension), dtype=torch.float16
+    )
+    dt = torch.randn(
+        (batch, heads, chunks, chunk), dtype=torch.float16
+    )
+    cumulative_decay = torch.cumsum(
+        -torch.rand_like(dt) * 0.1,
+        dim=-1,
+    )
+    return prepare_host_comparison(
+        context,
+        mamba_chunk_state_fwd,
+        (state_basis, x, dt, cumulative_decay),
+        "mamba_chunk_state_fwd",
+        Tolerance(atol=1.0e-1, rtol=5.0e-2),
+        constexprs={"HEAD_GROUP": heads // groups},
+    )
+
+
+def linear_attention(context: Context) -> PreparedComparison:
+    configure_cpu_budget()
+    batch, sequence, heads, dimension = 1, 2048, 16, 128
+    q = torch.randn((batch, sequence, heads, dimension), dtype=torch.float16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    scale = 1.0 / math.sqrt(dimension)
+    return prepare_host_comparison(
+        context,
+        fused_chunk_linear_attention_fwd,
+        (q, k, v, scale),
+        "linear_attention_forward",
+        (
+            Tolerance(atol=1.0e-1, rtol=5.0e-2),
+            Tolerance(atol=1.0e-1, rtol=5.0e-2),
+        ),
+    )
+
+
 CASES = {
     "selective_state_scan": selective_scan,
     "streamed_online_softmax_f16": online_softmax,
     "recurrent_gated_delta_fwd": recurrent_gated_delta,
     "mamba_chunk_scan": mamba_chunk_scan,
+    "mamba_chunk_state": mamba_chunk_state,
+    "linear_attention_forward": linear_attention,
 }
