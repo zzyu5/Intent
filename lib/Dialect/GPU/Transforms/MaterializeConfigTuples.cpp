@@ -655,6 +655,78 @@ void bindContractionFreeExtents(
   }
 }
 
+void appendFullResultContractionTuples(
+    func::FuncOp kernel, const NamedAttrList &bindings,
+    llvm::function_ref<const TuningProfile &(ParameterOp)> profileFor,
+    Builder &builder, SmallVectorImpl<Attribute> &tuples) {
+  kernel.walk([&](scf::ForOp loop) {
+    auto parameter = loop.getStep().getDefiningOp<ParameterOp>();
+    if (!parameter || loop.getNumResults() != 1)
+      return;
+    auto schema = parameter.getParameter();
+    auto role = static_cast<ParameterRole>(schema.getRole());
+    if (schema.getCategory() !=
+            static_cast<uint32_t>(ParameterCategory::Contraction) ||
+        (role != ParameterRole::OwnershipM && role != ParameterRole::OwnershipN))
+      return;
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    auto gather = yield.getOperand(0).getDefiningOp<GatherOp>();
+    if (!gather || gather.getFill() != loop.getRegionIterArgs().front() ||
+        gather.getSourceAxes().size() != 1)
+      return;
+    auto source = dyn_cast<FragmentType>(gather.getSource().getType());
+    auto result = dyn_cast<FragmentType>(gather.getType());
+    if (!source || !result || source.getShape().size() != 2 ||
+        result.getShape().size() != 2)
+      return;
+    unsigned axis = gather.getSourceAxes().front();
+    if (axis >= 2 ||
+        source.getShape()[1 - axis] != result.getShape()[1 - axis])
+      return;
+    auto sliced = cast<PhysicalExprAttr>(source.getShape()[axis]);
+    auto full = cast<PhysicalExprAttr>(result.getShape()[axis]);
+    if (sliced.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter) ||
+        sliced.getSymbol() != schema.getName() ||
+        full.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter))
+      return;
+    auto coverage = queryParameterBySymbol(kernel, full.getSymbol());
+    if (failed(coverage) || !(*coverage)->hasAttr(coverageDimensionAttr))
+      return;
+    auto other = cast<PhysicalExprAttr>(source.getShape()[1 - axis]);
+    int64_t otherExtent;
+    if (other.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant))
+      otherExtent = other.getValue();
+    else if (other.getKind() ==
+             static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
+      auto binding = dyn_cast_or_null<IntegerAttr>(
+          bindings.get(other.getSymbol().getValue()));
+      if (!binding)
+        return;
+      otherExtent = binding.getInt();
+    } else
+      return;
+    if (otherExtent <= 0)
+      return;
+    // The full result is already live. Widen its producer slice within the
+    // existing accumulator budget to reduce repeated gather assembly.
+    const TuningProfile &profile = profileFor(parameter);
+    __int128 budget = static_cast<__int128>(profile.ownershipM) *
+                      profile.ownershipN / otherExtent;
+    int64_t requested = static_cast<int64_t>(std::min<__int128>(
+        budget, std::numeric_limits<int64_t>::max()));
+    int64_t selected =
+        selectCandidate(schema.getCandidates().asArrayRef(), requested);
+    auto current = cast<IntegerAttr>(bindings.get(schema.getName().getValue()));
+    if (selected <= current.getInt())
+      return;
+    NamedAttrList widened(bindings);
+    widened.set(schema.getName(), builder.getI64IntegerAttr(selected));
+    DictionaryAttr tuple = widened.getDictionary(kernel.getContext());
+    if (!llvm::is_contained(tuples, Attribute(tuple)))
+      tuples.push_back(tuple);
+  });
+}
+
 bool hasSmallRegionRows(func::FuncOp kernel, ArrayRef<ParameterOp> parameters) {
   bool found = false;
   for (ParameterOp parameter : parameters) {
@@ -811,6 +883,8 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
     bindContractionFreeExtents(freeExtents, bindings, profileFor, builder);
     DictionaryAttr tuple = bindings.getDictionary(kernel.getContext());
     if (!llvm::is_contained(tuples, Attribute(tuple))) tuples.push_back(tuple);
+    appendFullResultContractionTuples(kernel, bindings, profileFor, builder,
+                                     tuples);
   };
   for (unsigned profileIndex = 0; profileIndex < profileCount;
        ++profileIndex) {
