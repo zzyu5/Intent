@@ -1922,6 +1922,48 @@ void selectContractForms(func::FuncOp kernel) {
     contract.getResult().replaceAllUsesWith(choice.getResult(0));
     contract.erase();
   }
+
+  contracts.clear();
+  kernel.walk([&](gpu::ContractOp contract) {
+    auto form = contract->getAttrOfType<StringAttr>(contractFormAttr);
+    if (form && form.getValue() == "multiply_sum" &&
+        contract.getAccumulator().getType().getElementType().isF32())
+      contracts.push_back(contract);
+  });
+  for (gpu::ContractOp contract : contracts) {
+    OpBuilder builder(contract);
+    auto shape = contract.getAccumulator().getType().getShape().getValue();
+    auto elements = cast<gpu::PhysicalExprAttr>(shape.front());
+    for (Attribute extent : shape.drop_front())
+      elements = gpu::PhysicalExprAttr::get(
+          kernel.getContext(),
+          static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
+          builder.getStringAttr(""), builder.getArrayAttr({elements, extent}));
+    auto fmaForm = builder.getStringAttr("fma");
+    // Serial K accumulation needs enough independent output elements.
+    if (auto count = evaluateCompileTimeExpression(elements, TritonConfig{})) {
+      if (*count >= 256)
+        contract->setAttr(contractFormAttr, fmaForm);
+      continue;
+    }
+    Value count = builder.create<gpu::PhysicalExprOp>(
+        contract.getLoc(), builder.getIndexType(), elements);
+    Value limit = builder.create<arith::ConstantIndexOp>(contract.getLoc(), 256);
+    Value wide = builder.create<gpu::CompareOp>(
+        contract.getLoc(), builder.getI1Type(), count, limit,
+        ComparePredicate::Ge);
+    auto choice = builder.create<scf::IfOp>(
+        contract.getLoc(), TypeRange{contract.getResult().getType()}, wide, true);
+    builder.setInsertionPointToStart(&choice.getThenRegion().front());
+    auto fma = cast<gpu::ContractOp>(builder.clone(*contract));
+    fma->setAttr(contractFormAttr, fmaForm);
+    builder.create<scf::YieldOp>(contract.getLoc(), fma.getResult());
+    builder.setInsertionPointToStart(&choice.getElseRegion().front());
+    auto reduction = cast<gpu::ContractOp>(builder.clone(*contract));
+    builder.create<scf::YieldOp>(contract.getLoc(), reduction.getResult());
+    contract.getResult().replaceAllUsesWith(choice.getResult(0));
+    contract.erase();
+  }
 }
 
 LogicalResult legalizeScatterAdd(func::FuncOp kernel) {
@@ -2373,6 +2415,17 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
         return WalkResult::interrupt();
       }
       auto form = contract->getAttrOfType<StringAttr>(contractFormAttr);
+      if (form && form.getValue() != "multiply_sum" &&
+          form.getValue() != "fma") {
+        contract.emitOpError("has an unknown Triton contraction form");
+        return WalkResult::interrupt();
+      }
+      if (form && form.getValue() == "fma" &&
+          !contract.getAccumulator().getType().getElementType().isF32()) {
+        contract.emitOpError(
+            "Triton explicit FMA contraction requires f32 accumulation");
+        return WalkResult::interrupt();
+      }
       if ((!form || form.getValue() != "multiply_sum") &&
           isa<BFloat16Type>(contract.getResult().getType().getElementType())) {
         contract.emitOpError(

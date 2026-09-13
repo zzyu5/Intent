@@ -312,7 +312,8 @@ private:
     output << "import torch\nimport triton\nimport triton.language as tl\n"
               "from triton.language.extra import libdevice\n"
               "from triton.tools.tensor_descriptor import TensorDescriptor\n"
-              "from intent.runtime.triton import TuningHooks\n\n";
+              "from intent.runtime.triton import TuningHooks\n"
+              "from intent.runtime.triton_math import contract_fma\n\n";
   }
 
   void emitDescriptorPruner() {
@@ -1109,6 +1110,13 @@ private:
     if (auto contract = dyn_cast<gpu::ContractOp>(operation)) {
       auto form = contract->getAttrOfType<StringAttr>(
           "intent_gpu.triton.contract_form");
+      if (form && form.getValue() == "fma") {
+        assign(contract.getResult(),
+               "contract_fma(" + valueString(contract.getLhs()) + ", " +
+                   valueString(contract.getRhs()) + ", " +
+                   valueString(contract.getAccumulator()) + ")");
+        return;
+      }
       if (form && form.getValue() == "multiply_sum") {
         unsigned rank = contract.getLhs().getType().getShape().size();
         std::string element = pythonType(elementType(contract.getResult().getType()));
