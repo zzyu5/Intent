@@ -511,32 +511,52 @@ int64_t selectCandidate(ArrayRef<int64_t> candidates, int64_t requested) {
 struct ContractionFreeExtent {
   SmallVector<PhysicalExprAttr> extents;
   SmallVector<ParameterOp> parameters;
+  SmallVector<ParameterOp> profileParameters;
   ParameterRole role;
 };
 
 SmallVector<ContractionFreeExtent>
 contractionFreeExtents(func::FuncOp kernel, ArrayRef<ParameterOp> parameters) {
-  llvm::StringMap<ParameterOp> ownership;
-  for (ParameterOp parameter : parameters) {
-    auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());
-    if (role == ParameterRole::OwnershipM || role == ParameterRole::OwnershipN)
-      ownership[parameter.getParameter().getName().getValue()] = parameter;
-  }
+  // An enclosing reduction's chunk can be a free axis of its inner contract.
+  llvm::StringMap<ParameterOp> freeAxisParameters;
+  for (ParameterOp parameter : parameters)
+    freeAxisParameters[parameter.getParameter().getName().getValue()] = parameter;
   SmallVector<ContractionFreeExtent> groups;
   kernel.walk([&](ContractOp contract) {
+    SmallVector<ContractionFreeExtent> contractGroups;
+    bool factorizedFreeAxes = false;
+    SmallVector<ParameterOp> contractProfiles;
+    for (ParameterOp parameter : parameters) {
+      auto category = static_cast<ParameterCategory>(
+          parameter.getParameter().getCategory());
+      if (category != ParameterCategory::Contraction &&
+          category != ParameterCategory::PersistentContraction &&
+          category != ParameterCategory::RegionContraction)
+        continue;
+      StringAttr name = parameter.getParameter().getName();
+      if (reducedAxesReferenceParameter(
+              cast<FragmentType>(contract.getLhs().getType()),
+              contract.getLhsReductionAxes(), name) &&
+          reducedAxesReferenceParameter(
+              cast<FragmentType>(contract.getRhs().getType()),
+              contract.getRhsReductionAxes(), name))
+        contractProfiles.push_back(parameter);
+    }
     auto collectSide = [&](Value value, ArrayRef<int64_t> reduction,
                            ArrayRef<int64_t> batch, ParameterRole role) {
       ContractionFreeExtent group;
       group.role = role;
-      unsigned variableFactors = 0;
+      unsigned factors = 0;
       std::function<bool(PhysicalExprAttr)> collect = [&](PhysicalExprAttr extent) {
         auto kind = static_cast<PhysicalExprKind>(extent.getKind());
-        if (kind == PhysicalExprKind::Constant)
+        if (kind == PhysicalExprKind::Constant) {
+          factors += extent.getValue() > 1;
           return extent.getValue() > 0;
+        }
         if (kind == PhysicalExprKind::Parameter) {
-          auto found = ownership.find(extent.getSymbol().getValue());
-          if (found == ownership.end()) return false;
-          ++variableFactors;
+          auto found = freeAxisParameters.find(extent.getSymbol().getValue());
+          if (found == freeAxisParameters.end()) return false;
+          ++factors;
           if (!llvm::is_contained(group.parameters, found->second))
             group.parameters.push_back(found->second);
           return true;
@@ -564,12 +584,20 @@ contractionFreeExtents(func::FuncOp kernel, ArrayRef<ParameterOp> parameters) {
         if (!collect(extent)) return;
         group.extents.push_back(extent);
       }
-      if (variableFactors > 1) groups.push_back(std::move(group));
+      group.profileParameters = contractProfiles.empty() ? group.parameters
+                                                        : contractProfiles;
+      if (!group.parameters.empty()) {
+        factorizedFreeAxes |= factors > 1;
+        contractGroups.push_back(std::move(group));
+      }
     };
     collectSide(contract.getLhs(), contract.getLhsReductionAxes(),
                 contract.getLhsBatchAxes(), ParameterRole::OwnershipM);
     collectSide(contract.getRhs(), contract.getRhsReductionAxes(),
                 contract.getRhsBatchAxes(), ParameterRole::OwnershipN);
+    if (factorizedFreeAxes)
+      for (auto &group : contractGroups)
+        groups.push_back(std::move(group));
   });
   return groups;
 }
@@ -580,7 +608,7 @@ void bindContractionFreeExtents(
     Builder &builder) {
   for (const ContractionFreeExtent &group : groups) {
     int64_t budget = std::numeric_limits<int64_t>::max();
-    for (ParameterOp parameter : group.parameters)
+    for (ParameterOp parameter : group.profileParameters)
       budget = std::min(budget, requestedValue(profileFor(parameter), group.role));
     auto fits = [&](ParameterOp selected, int64_t candidate) {
       std::function<std::optional<int64_t>(PhysicalExprAttr)> evaluate =

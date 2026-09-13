@@ -775,6 +775,87 @@ FailureOr<Value> accessValidity(OpBuilder &builder, Location location,
   return result ? FailureOr<Value>(result) : FailureOr<Value>(failure());
 }
 
+bool hasFullRangeReductionCapture(Value value, MakeRangeOp range,
+                                  Operation *anchor) {
+  auto kernel = anchor->getParentOfType<func::FuncOp>();
+  if (!samePhysicalScalarExpression(range.getStart(), range.getLogicalStart()))
+    return false;
+  PhysicalSourceAxis source = sourceAxisIdentity(range);
+  FailureOr<int64_t> dimension = queryRangeDimension(range);
+  if (!kernel || failed(dimension))
+    return false;
+  DominanceInfo dominance(kernel);
+  PhysicalProgramAnalysis analysis(kernel);
+  SmallVector<Value> pending{value};
+  llvm::DenseSet<Value> visited;
+  while (!pending.empty()) {
+    Value current = pending.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    Operation *producer = current.getDefiningOp();
+    if (!producer)
+      continue;
+    if (auto loop = dyn_cast<scf::ForOp>(producer)) {
+      auto resultType = dyn_cast<FragmentType>(current.getType());
+      auto sources = loop->getAttrOfType<ArrayAttr>(reductionSourcesAttr);
+      bool consumesSource = sources && llvm::any_of(sources, [&](Attribute attr) {
+        auto identity = dyn_cast<PhysicalSourceAttr>(attr);
+        return identity &&
+               PhysicalSourceAxis{identity.getSourceId(), identity.getSourceAxis(),
+                                  identity.getDerived()} == source;
+      });
+      if (!consumesSource || !resultType ||
+          !dominance.dominates(current, anchor) ||
+          llvm::any_of(resultType.getAxisMaps(), [&](Attribute attr) {
+            return cast<AxisMapAttr>(attr).getDimensionId() == *dimension;
+          }) ||
+          !samePhysicalScalarExpression(loop.getLowerBound(),
+                                         range.getLogicalStart()) ||
+          !samePhysicalScalarExpression(loop.getUpperBound(),
+                                         range.getLogicalStop()))
+        continue;
+      bool readsOnly = !loop->walk([](Operation *operation) {
+        return isa<LoadOp, GatherOp, scf::ForOp, scf::IfOp, scf::WhileOp>(operation) ||
+                       isMemoryEffectFree(operation)
+                   ? WalkResult::advance()
+                   : WalkResult::interrupt();
+      }).wasInterrupted();
+      if (!readsOnly)
+        continue;
+      llvm::DenseSet<Value> dependencies;
+      std::function<bool(Value)> usesOutputRange = [&](Value dependency) {
+        if (!dependencies.insert(dependency).second)
+          return false;
+        if (auto argument = dyn_cast<BlockArgument>(dependency)) {
+          Operation *owner = argument.getOwner()->getParentOp();
+          return owner != kernel && owner != loop && !loop->isAncestor(owner);
+        }
+        Operation *definition = dependency.getDefiningOp();
+        if (!definition)
+          return true;
+        if (auto candidate = dyn_cast<MakeRangeOp>(definition))
+          if (analysis.lockstepRanges({range, candidate}).isExact())
+            return true;
+        if (llvm::any_of(definition->getOperands(), usesOutputRange))
+          return true;
+        for (Region &region : definition->getRegions())
+          for (Block &block : region)
+            for (Operation &nested : block)
+              if (llvm::any_of(nested.getOperands(), usesOutputRange))
+                return true;
+        return false;
+      };
+      bool dependent = usesOutputRange(current);
+      if (!dependent)
+        return true;
+      continue;
+    }
+    if (producer->getNumRegions() == 0)
+      pending.append(producer->operand_begin(), producer->operand_end());
+  }
+  return false;
+}
+
 FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
                                       PhysicalSourceAxis source,
                                       ArrayRef<int64_t> traversalDimensions,
@@ -1645,8 +1726,8 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
     return range.emitOpError(
         "pointwise traversal has multiple parameters for one source axis");
   if (!chunk) {
-    static constexpr int64_t candidates[] = {16, 32, 64, 128, 256, 512,
-                                             1024, 2048, 4096};
+    static constexpr int64_t candidates[] = {1, 2, 4, 8, 16, 32, 64, 128,
+                                             256, 512, 1024, 2048, 4096};
     uint32_t elementBitWidth = 0;
     for (StoreOp store : stores)
       elementBitWidth =
@@ -3651,6 +3732,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   SmallVector<StoreOp> candidateStores;
   kernel.walk([&](StoreOp store) { candidateStores.push_back(store); });
   SmallVector<Attribute> postStructuredWritebackKeys;
+  llvm::SmallPtrSet<Operation *, 16> reductionCaptureWritebackRanges;
   for (StoreOp store : candidateStores) {
     for (MakeRangeOp range : allRanges) {
       if (!storeAxisForRange(store, range))
@@ -3679,23 +3761,26 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     }
   }
   SmallVector<SmallVector<Value, 4>> writeCoordinates;
-  auto rememberWriteCoordinates = [&](ValueRange coordinates) {
+  SmallVector<Operation *> writeOperations;
+  auto rememberWriteCoordinates = [&](Operation *operation,
+                                      ValueRange coordinates) {
+    writeOperations.push_back(operation);
     writeCoordinates.emplace_back(coordinates.begin(), coordinates.end());
   };
   kernel.walk([&](StoreOp store) {
-    rememberWriteCoordinates(store.getCoordinates());
+    rememberWriteCoordinates(store, store.getCoordinates());
   });
   kernel.walk([&](AtomicStoreOp store) {
-    rememberWriteCoordinates(store.getCoordinates());
+    rememberWriteCoordinates(store, store.getCoordinates());
   });
   kernel.walk([&](AtomicRMWOp store) {
-    rememberWriteCoordinates(store.getCoordinates());
+    rememberWriteCoordinates(store, store.getCoordinates());
   });
   kernel.walk([&](AtomicCompareExchangeOp store) {
-    rememberWriteCoordinates(store.getCoordinates());
+    rememberWriteCoordinates(store, store.getCoordinates());
   });
   kernel.walk([&](ScatterReduceOp scatter) {
-    rememberWriteCoordinates(scatter.getCoordinates());
+    rememberWriteCoordinates(scatter, scatter.getCoordinates());
   });
   auto coordinatesUseRange = [&](ValueRange coordinates, MakeRangeOp range) {
     return llvm::any_of(coordinates, [&](Value coordinate) {
@@ -3731,6 +3816,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   };
   for (StoreOp store : candidateStores) {
     SmallVector<std::pair<MakeRangeOp, int64_t>> candidates;
+    llvm::SmallPtrSet<Operation *, 4> capturedRanges;
     int64_t innermostSourceAxis = -1;
     for (MakeRangeOp range : allRanges) {
       bool structuredFreeAxis =
@@ -3740,6 +3826,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       if (!sourceAxis)
         continue;
       if (structuredFreeAxis) {
+        bool capturesReduction =
+            llvm::all_of(writeOperations, [&](Operation *operation) {
+              return operation == store.getOperation();
+            }) &&
+            hasFullRangeReductionCapture(store.getValue(), range,
+                                         store.getOperation());
         bool usedByEveryEffect = llvm::all_of(
             writeCoordinates, [&](ArrayRef<Value> coordinates) {
               return llvm::any_of(allRanges, [&](MakeRangeOp candidate) {
@@ -3766,12 +3858,16 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
               return contractionFreeAxisNeedsRange(contract, range);
             });
         auto effectOrigin = store->getAttrOfType<IntegerAttr>(originAttr);
-        if (usedByEveryEffect || failed(dimension) ||
+        if ((usedByEveryEffect && !capturesReduction) || failed(dimension) ||
             !valueProjection.isExact() ||
             valueProjection.dimensionId != static_cast<int64_t>(*dimension) ||
             !replay.isReplayable() || replay.crossesStructuredProgram ||
             !contractRequiresRange || !effectOrigin)
           continue;
+        if (capturesReduction) {
+          capturedRanges.insert(range.getOperation());
+          reductionCaptureWritebackRanges.insert(range.getOperation());
+        }
       } else if (hasAccessDependentSubregionBounds(kernel, range)) {
         if (failed(reuseTraversalDimension(kernel, ArrayRef<StoreOp>{store},
                                            range)))
@@ -3804,7 +3900,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     }
     for (auto [range, sourceAxis] : candidates) {
       internalTraversalRanges.insert(range.getOperation());
-      if (sourceAxis != innermostSourceAxis)
+      if (sourceAxis != innermostSourceAxis &&
+          !capturedRanges.contains(range.getOperation()))
         continue;
       if (structuredTraversalRanges.contains(range.getOperation()) &&
           !reductionTraversalRanges.contains(range.getOperation())) {
@@ -4491,6 +4588,18 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       internalTraversalRanges.insert(range.getOperation());
   }
   if (ownershipOnly) {
+    // Equivalent coordinate occurrences must preserve the selected local
+    // writeback traversal instead of restoring duplicate program ownership.
+    for (MakeRangeOp range : allRanges)
+      if (llvm::any_of(reductionCaptureWritebackRanges,
+                       [&](Operation *operation) {
+                         auto captured = cast<MakeRangeOp>(operation);
+                         return sameLogicalRange(range, captured) &&
+                                PhysicalProgramAnalysis(kernel)
+                                    .lockstepRanges({range, captured})
+                                    .isExact();
+                       }))
+        internalTraversalRanges.insert(range.getOperation());
     SmallVector<MakeRangeOp> ownershipSeeds;
     for (MakeRangeOp range : dynamicRanges)
       if (hasPointwiseOwnership(range) &&
