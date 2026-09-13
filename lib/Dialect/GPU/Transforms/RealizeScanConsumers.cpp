@@ -150,7 +150,7 @@ LogicalResult realizeScanConsumerMatch(func::FuncOp kernel,
   auto chunk = getOrCreatePhysicalParameter(
       kernel, name, ParameterRole::ScanChunk, ParameterCategory::Scan,
       element.isIndex() ? 64 : element.getIntOrFloatBitWidth(),
-      {32, 64, 128, 256, 512, 1024, 2048});
+      {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192});
   chunk->setAttr(parameterSourceAttr,
                  PhysicalSourceAttr::get(kernel.getContext(), source.sourceId,
                                          source.sourceAxis, source.derived));
