@@ -69,9 +69,17 @@ bool contiguous(Value memory, ValueRange indices, scf::ForOp loop, bool allowInv
 
 class VectorBody {
 public:
-  VectorBody(scf::ForOp original, OpBuilder &builder, Value iv, int64_t width)
-      : original(original), b(builder), width(width) {
+  VectorBody(scf::ForOp original, OpBuilder &builder, OpBuilder &invariants, Value iv, int64_t width)
+      : original(original), b(builder), invariants(invariants), width(width) {
     mapping.map(original.getInductionVar(), iv);
+  }
+
+  static bool invariant(Value value, scf::ForOp loop) {
+    if (value == loop.getInductionVar() || llvm::is_contained(loop.getRegionIterArgs(), value)) return false;
+    Operation *op = value.getDefiningOp();
+    return !op || !loop->isAncestor(op) || llvm::all_of(op->getOperands(), [&](Value input) {
+      return invariant(input, loop);
+    });
   }
 
   Value scalar(Value value) {
@@ -79,7 +87,7 @@ public:
     Operation *op = value.getDefiningOp();
     if (!op || !original->isAncestor(op)) return value;
     for (Value input : op->getOperands()) mapping.map(input, scalar(input));
-    b.clone(*op, mapping);
+    (invariant(value, original) ? invariants : b).clone(*op, mapping);
     return mapping.lookup(value);
   }
 
@@ -123,6 +131,7 @@ public:
 private:
   scf::ForOp original;
   OpBuilder &b;
+  OpBuilder &invariants;
   int64_t width;
   IRMapping mapping;
   llvm::DenseMap<Value, Value> vectors;
@@ -137,7 +146,7 @@ bool dependsOnCarry(Value value, scf::ForOp loop) {
   });
 }
 
-void vectorize(scf::ForOp original, int64_t width, int64_t replicas) {
+void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonempty = false) {
   if (!matchPattern(original.getStep(), m_One())) return;
   SmallVector<Value> reductionInputs;
   SmallVector<Operation *> combines;
@@ -193,7 +202,11 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas) {
   }
   OpBuilder b(original);
   Location loc = original.getLoc();
-  if (!guardedMemories.empty()) {
+  bool needsInvariantGuard = llvm::any_of(original.getBody()->without_terminator(), [&](Operation &op) {
+    return op.getNumResults() == 1 && !isSpeculatable(&op) &&
+        VectorBody::invariant(op.getResult(0), original);
+  });
+  if (!guardedMemories.empty() || (!nonempty && needsInvariantGuard)) {
     Value one = index(b, loc, 1), condition;
     SmallVector<memref::ExtractStridedMetadataOp> descriptors;
     for (Value memory : guardedMemories) {
@@ -201,6 +214,11 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas) {
       descriptors.push_back(metadata);
       Value unit = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, metadata.getStrides().back(), one);
       condition = condition ? Value(b.create<arith::AndIOp>(loc, condition, unit)) : unit;
+    }
+    if (!nonempty && needsInvariantGuard) {
+      Value active = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt,
+          original.getUpperBound(), original.getLowerBound());
+      condition = condition ? Value(b.create<arith::AndIOp>(loc, condition, active)) : active;
     }
     auto dispatch = b.create<scf::IfOp>(loc, original.getResultTypes(), condition, true);
     original.replaceAllUsesWith(dispatch.getResults());
@@ -229,7 +247,7 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas) {
           metadata.getBaseBuffer(), physicalOffset, sizes, physicalStrides));
     }
     auto contiguousLoop = cast<scf::ForOp>(b.clone(*original, mapping));
-    vectorize(contiguousLoop, width, replicas);
+    vectorize(contiguousLoop, width, replicas, nonempty || needsInvariantGuard);
     if (original.getNumResults()) {
       b.setInsertionPointToEnd(&dispatch.getThenRegion().front());
       b.create<scf::YieldOp>(loc, contiguousLoop.getResults());
@@ -262,6 +280,7 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas) {
   for (int64_t part = 0; part < partitions; ++part) llvm::append_range(initial, original.getInitArgs());
   auto vectorLoop = b.create<scf::ForOp>(loc, original.getLowerBound(),
       add(b, loc, original.getLowerBound(), span), step, initial);
+  OpBuilder invariantBuilder(vectorLoop);
   auto merge = [&](Operation *combine, Value lhs, Value rhs) {
     IRMapping mapping;
     mapping.map(combine->getOperand(0), lhs);
@@ -276,7 +295,7 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas) {
     SmallVector<Value> results;
     for (int64_t part = 0; part < partitions; ++part) {
       Value coordinate = add(b, loc, vectorLoop.getInductionVar(), multiply(b, loc, span, index(b, loc, part)));
-      VectorBody body(original, b, coordinate, logicalWidth);
+      VectorBody body(original, b, invariantBuilder, coordinate, logicalWidth);
       for (Operation &operation : original.getBody()->without_terminator()) {
         if (auto load = dyn_cast<memref::LoadOp>(&operation)) body.vector(load.getResult());
         else if (auto store = dyn_cast<memref::StoreOp>(&operation))
