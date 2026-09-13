@@ -626,11 +626,14 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string
             "from max.algorithm import parallelize\n\n";
   Serializer serializer(output);
   llvm::json::Object interface;
+  interface["source_prelude_end"] = static_cast<int64_t>(output.tell());
   llvm::json::Array candidates;
   bool first = true;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
     if (function.isExternal()) continue;
+    int64_t sourceBegin = output.tell();
     if (failed(serializer.function(function))) return failure();
+    int64_t sourceEnd = output.tell();
     if (first) {
       auto abi = function->getAttrOfType<cpu::InterfaceAttr>("intent_cpu.interface");
       interface["parameters"] = parameters(abi);
@@ -650,6 +653,7 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string
     }
     candidates.push_back(llvm::json::Object{
         {"entry", function.getName().str()},
+        {"source_range", llvm::json::Array{sourceBegin, sourceEnd}},
         {"values", llvm::json::Array{configuration.getTaskGrain(),
             configuration.getTileM(), configuration.getTileN(), configuration.getTileK(), configuration.getRegionSize()}},
         {"implementations", std::move(implementations)}});

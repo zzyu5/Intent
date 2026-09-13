@@ -90,12 +90,12 @@ class NativeProgram:
                 argument_types.append(SCALAR_CTYPES[parameter["dtype"]])
         self.functions = []
         self.measurements = []
-        for candidate in self.candidates:
-            function = getattr(self.compilation.library, candidate["entry"])
+        for candidate, compilation in zip(self.candidates, self.compilation.libraries):
+            function = getattr(compilation.library, candidate["entry"])
             function.argtypes = argument_types
             function.restype = None
             self.functions.append(function)
-            measure = getattr(self.compilation.library, candidate["entry"] + "_benchmark")
+            measure = getattr(compilation.library, candidate["entry"] + "_benchmark")
             measure.argtypes = [*argument_types, ctypes.c_int64]
             measure.restype = ctypes.c_double
             self.measurements.append(measure)

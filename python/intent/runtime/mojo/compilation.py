@@ -1,21 +1,30 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import ctypes
 import json
 from pathlib import Path
 import subprocess
 import tempfile
+from threading import Lock
 
 
 @dataclass
 class NativeLibrary:
     directory: tempfile.TemporaryDirectory
     library: ctypes.CDLL
+
+
+@dataclass
+class NativeCompilation:
+    libraries: tuple[NativeLibrary, ...]
     identity: tuple[object, ...]
 
 
-_libraries: dict[tuple[object, ...], NativeLibrary] = {}
+_compilations: dict[tuple[object, ...], Future[NativeCompilation]] = {}
+_compilation_lock = Lock()
+_compilers = ThreadPoolExecutor(max_workers=2)
 
 ELEMENT_TYPES = {
     "f16": "Float16", "bf16": "BFloat16", "f32": "Float32", "f64": "Float64",
@@ -97,13 +106,9 @@ def benchmark_exports(metadata: dict[str, object]) -> str:
     return "".join(sections)
 
 
-def compile_library(source: str, metadata: dict[str, object], target) -> NativeLibrary:
+def _compile_unit(source: str, metadata: dict[str, object], target) -> NativeLibrary:
     complete_source = source + benchmark_exports(metadata)
     fp_source = Path(__file__).with_name("fp_environment.c")
-    key = (complete_source, json.dumps(metadata, sort_keys=True), target.executable,
-           target.native_options, fp_source.read_text(encoding="utf-8"))
-    if key in _libraries:
-        return _libraries[key]
     directory = tempfile.TemporaryDirectory(prefix="intentdsl-mojo-artifact-")
     root = Path(directory.name)
     source_path = root / "kernel.mojo"
@@ -121,6 +126,42 @@ def compile_library(source: str, metadata: dict[str, object], target) -> NativeL
     )
     if completed.returncode:
         raise RuntimeError(f"Mojo native compilation failed:\n{completed.stderr}{completed.stdout}")
-    result = NativeLibrary(directory, ctypes.CDLL(str(library_path)), key)
-    _libraries[key] = result
+    return NativeLibrary(directory, ctypes.CDLL(str(library_path)))
+
+
+def compile_library(source: str, metadata: dict[str, object], target) -> NativeCompilation:
+    fp_source = Path(__file__).with_name("fp_environment.c")
+    key = (source, json.dumps(metadata, sort_keys=True), target.executable,
+           target.native_options, fp_source.read_text(encoding="utf-8"))
+    with _compilation_lock:
+        pending = _compilations.get(key)
+        owner = pending is None
+        if owner:
+            pending = Future()
+            _compilations[key] = pending
+    if not owner:
+        return pending.result()
+
+    futures = []
+    try:
+        encoded = source.encode("utf-8")
+        prelude = encoded[:metadata["source_prelude_end"]]
+        for candidate in metadata["candidates"]:
+            begin, end = candidate["source_range"]
+            unit = (prelude + encoded[begin:end]).decode("utf-8")
+            unit_metadata = {**metadata, "candidates": [candidate]}
+            futures.append(_compilers.submit(_compile_unit, unit, unit_metadata, target))
+        result = NativeCompilation(tuple(future.result() for future in futures), key)
+    except BaseException as error:
+        for future in futures:
+            future.cancel()
+        wait(futures)
+        for future in futures:
+            if not future.cancelled() and future.exception() is None:
+                future.result().directory.cleanup()
+        with _compilation_lock:
+            del _compilations[key]
+        pending.set_exception(error)
+        raise
+    pending.set_result(result)
     return result
