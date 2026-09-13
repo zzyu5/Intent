@@ -356,7 +356,7 @@ public:
   PhysicalAccessBoundaryFact boundaryValidity(mlir::Operation *access,
                                              bool allowRangeGuards = false);
   PhysicalAccessBoundsFact accessBounds(mlir::Operation *access);
-  PhysicalBufferDataflowFact bufferDataflow(BufferOp buffer);
+  PhysicalBufferDataflowFact bufferDataflow(mlir::Value buffer);
 
   /// Recognizes a predicate composed only from exact range-bound comparisons,
   /// predicate-preserving shape operations and boolean conjunction.  This is

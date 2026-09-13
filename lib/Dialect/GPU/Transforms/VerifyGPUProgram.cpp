@@ -120,7 +120,7 @@ LogicalResult verifyBufferDataflow(func::FuncOp kernel,
       result = failure();
       return WalkResult::interrupt();
     }
-    PhysicalBufferDataflowFact fact = analysis.bufferDataflow(buffer);
+    PhysicalBufferDataflowFact fact = analysis.bufferDataflow(buffer.getResult());
     if (!fact.isExact()) {
       InFlightDiagnostic diagnostic = buffer.emitOpError(
           "physical buffer dataflow is not exact in the current program");
@@ -131,6 +131,37 @@ LogicalResult verifyBufferDataflow(func::FuncOp kernel,
     }
     return WalkResult::advance();
   });
+  if (failed(result))
+    return failure();
+  for (BlockArgument argument : kernel.getArguments()) {
+    auto buffer = dyn_cast<BufferType>(argument.getType());
+    if (!buffer)
+      continue;
+    if (!buffer.getWorkspace() ||
+        buffer.getScope().getValue() != BufferScope::InvocationWorkspace ||
+        buffer.getLifetime().getValue() != BufferLifetime::Invocation ||
+        buffer.getInitialization().getValue() != BufferInitialization::FirstWrite ||
+        !instances.insert(buffer.getInstance()).second)
+      return kernel.emitError(
+          "workspace requires a unique invocation allocation and explicit first writes");
+    auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
+    if (!llvm::all_of(space, [](Attribute extent) {
+          auto expression = cast<PhysicalExprAttr>(extent);
+          return expression.getKind() ==
+                     static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                 expression.getValue() == 1;
+        }))
+      return kernel.emitError(
+          "workspace ownership across multiple program instances is not implemented");
+    PhysicalBufferDataflowFact fact = analysis.bufferDataflow(argument);
+    if (!fact.isExact()) {
+      InFlightDiagnostic diagnostic = kernel.emitError(
+          "workspace read lacks a dominating definition of its accessed elements");
+      for (Operation *blocker : fact.blockers)
+        diagnostic << "; blocker=" << blocker->getName();
+      return failure();
+    }
+  }
   return result;
 }
 

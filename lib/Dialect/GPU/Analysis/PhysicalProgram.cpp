@@ -932,6 +932,8 @@ bool writesResourceWithoutReading(Operation *operation) {
 }
 
 bool valueMatchesExtent(Value value, PhysicalExprAttr extent) {
+  if (queryLaunchExpression(value) == extent)
+    return true;
   if (auto physical = value.getDefiningOp<PhysicalExprOp>())
     return physical.getExpression() == extent;
   auto kind = static_cast<PhysicalExprKind>(extent.getKind());
@@ -954,19 +956,35 @@ struct LoopCoordinate {
   Value step;
 };
 
-bool unconditionalStoreCoversBuffer(Operation *operation, BufferOp buffer,
+bool hasUpperTailGuard(Value predicate, Value coordinate,
+                       PhysicalExprAttr extent) {
+  if (!predicate)
+    return false;
+  predicate = stripBroadcast(predicate);
+  if (auto conjunction = predicate.getDefiningOp<BinaryOp>();
+      conjunction &&
+      conjunction.getOperatorKind() == BinaryOperator::LogicalAnd)
+    return hasUpperTailGuard(conjunction.getLhs(), coordinate, extent) ||
+           hasUpperTailGuard(conjunction.getRhs(), coordinate, extent);
+  auto compare = predicate.getDefiningOp<CompareOp>();
+  return compare && compare.getPredicate() == ComparePredicate::Lt &&
+         stripBroadcast(compare.getLhs()) == coordinate &&
+         valueMatchesExtent(stripBroadcast(compare.getRhs()), extent);
+}
+
+bool unconditionalStoreCoversBuffer(Operation *operation, Value buffer,
                                     ArrayRef<LoopCoordinate> loops) {
   ValueRange coordinates;
   ArrayRef<int64_t> sourceAxes;
   Value valid;
   if (auto store = dyn_cast<StoreOp>(operation)) {
-    if (store.getResource() != buffer.getResult())
+    if (store.getResource() != buffer)
       return false;
     coordinates = store.getCoordinates();
     sourceAxes = store.getSourceAxes();
     valid = store.getValid();
   } else if (auto atomic = dyn_cast<AtomicStoreOp>(operation)) {
-    if (atomic.getResource() != buffer.getResult())
+    if (atomic.getResource() != buffer)
       return false;
     coordinates = atomic.getCoordinates();
     sourceAxes = atomic.getSourceAxes();
@@ -974,33 +992,69 @@ bool unconditionalStoreCoversBuffer(Operation *operation, BufferOp buffer,
   } else {
     return false;
   }
-  BufferType type = buffer.getResult().getType();
-  if (valid || coordinates.size() != type.getShape().size() ||
+  BufferType type = cast<BufferType>(buffer.getType());
+  if (coordinates.size() != type.getShape().size() ||
       sourceAxes.size() != coordinates.size())
     return false;
   llvm::DenseSet<int64_t> coveredAxes;
+  llvm::DenseSet<Value> coveredLoops;
+  SmallVector<std::pair<MakeRangeOp, Value>> tails;
   for (auto [coordinate, sourceAxis] : llvm::zip(coordinates, sourceAxes)) {
     if (sourceAxis < 0 ||
         sourceAxis >= static_cast<int64_t>(type.getShape().size()) ||
         !coveredAxes.insert(sourceAxis).second)
       return false;
+    auto range = coordinate.getDefiningOp<MakeRangeOp>();
+    Value start = range ? range.getStart() : coordinate;
     auto loop = llvm::find_if(loops, [&](const LoopCoordinate &candidate) {
-      return sameScalarExpression(coordinate, candidate.induction);
+      return sameScalarExpression(start, candidate.induction);
     });
-    if (loop == loops.end() || integerConstant(loop->lower) != 0 ||
-        integerConstant(loop->step) != 1 ||
+    if (loop == loops.end() ||
+        !coveredLoops.insert(loop->induction).second ||
+        integerConstant(loop->lower) != 0 ||
         !valueMatchesExtent(
             loop->upper,
             cast<PhysicalExprAttr>(type.getShape()[sourceAxis])))
       return false;
+    if (!range) {
+      if (integerConstant(loop->step) != 1)
+        return false;
+      continue;
+    }
+    bool positiveStep = integerConstant(loop->step).value_or(0) > 0;
+    if (auto parameter = loop->step.getDefiningOp<ParameterOp>())
+      positiveStep = llvm::all_of(
+          parameter.getParameter().getCandidates().asArrayRef(),
+          [](int64_t candidate) { return candidate > 0; });
+    if (!positiveStep || integerConstant(range.getStep()) != 1 ||
+        !sameScalarExpression(range.getExtent(), loop->step) ||
+        integerConstant(range.getLogicalStart()) != 0 ||
+        !sameScalarExpression(range.getLogicalStop(), loop->upper))
+      return false;
+    auto upper = integerConstant(loop->upper);
+    bool dividesExtent = false;
+    if (auto step = integerConstant(loop->step))
+      dividesExtent = upper && *upper % *step == 0;
+    else if (auto parameter = loop->step.getDefiningOp<ParameterOp>())
+      dividesExtent = upper && llvm::all_of(
+          parameter.getParameter().getCandidates().asArrayRef(),
+          [&](int64_t step) { return *upper % step == 0; });
+    if (!dividesExtent &&
+        !hasUpperTailGuard(valid, coordinate,
+                           cast<PhysicalExprAttr>(type.getShape()[sourceAxis])))
+      return false;
+    tails.emplace_back(range, loop->upper);
   }
-  return coveredAxes.size() == type.getShape().size();
+  return coveredAxes.size() == type.getShape().size() &&
+         coveredLoops.size() == loops.size() &&
+         PhysicalProgramAnalysis(operation->getParentOfType<func::FuncOp>())
+             .isTailPredicate(valid, tails);
 }
 
-bool regionInitializesBuffer(Region &region, BufferOp buffer,
+bool regionInitializesBuffer(Region &region, Value buffer,
                              SmallVectorImpl<LoopCoordinate> &loops);
 
-bool operationInitializesBuffer(Operation *operation, BufferOp buffer,
+bool operationInitializesBuffer(Operation *operation, Value buffer,
                                 SmallVectorImpl<LoopCoordinate> &loops) {
   if (unconditionalStoreCoversBuffer(operation, buffer, loops))
     return true;
@@ -1023,7 +1077,7 @@ bool operationInitializesBuffer(Operation *operation, BufferOp buffer,
   return false;
 }
 
-bool regionInitializesBuffer(Region &region, BufferOp buffer,
+bool regionInitializesBuffer(Region &region, Value buffer,
                              SmallVectorImpl<LoopCoordinate> &loops) {
   if (!llvm::hasSingleElement(region))
     return false;
@@ -1033,7 +1087,7 @@ bool regionInitializesBuffer(Region &region, BufferOp buffer,
   return false;
 }
 
-bool precedingRegionInitializesBuffer(Operation *read, BufferOp buffer,
+bool precedingRegionInitializesBuffer(Operation *read, Value buffer,
                                       ArrayRef<Operation *> writes,
                                       DominanceInfo &dominance) {
   llvm::SmallPtrSet<Operation *, 8> candidates;
@@ -1043,18 +1097,51 @@ bool precedingRegionInitializesBuffer(Operation *read, BufferOp buffer,
       if (!isa<scf::ForOp, scf::IfOp>(candidate))
         continue;
       candidates.insert(candidate);
-      if (candidate->getBlock() == buffer->getBlock())
+      if (candidate->getBlock() == buffer.getParentBlock())
         break;
     }
   }
   for (Operation *candidate : candidates) {
-    if (!dominance.properlyDominates(candidate, read))
+    // Dominance by an enclosing region does not mean its writes have completed.
+    if (candidate->isProperAncestor(read) ||
+        !dominance.properlyDominates(candidate, read))
       continue;
     SmallVector<LoopCoordinate> loops;
     if (operationInitializesBuffer(candidate, buffer, loops))
       return true;
   }
   return false;
+}
+
+bool predicateIncludes(Value predicate, Value required) {
+  if (!required || integerConstant(required) == 1)
+    return true;
+  if (!predicate)
+    return false;
+  if (sameScalarExpression(predicate, required))
+    return true;
+  auto conjunction = stripBroadcast(predicate).getDefiningOp<BinaryOp>();
+  return conjunction &&
+         conjunction.getOperatorKind() == BinaryOperator::LogicalAnd &&
+         (predicateIncludes(conjunction.getLhs(), required) ||
+          predicateIncludes(conjunction.getRhs(), required));
+}
+
+bool writeDefinesRead(const PhysicalAccessFootprint &write,
+                      const PhysicalAccessFootprint &read) {
+  if (write.state != PhysicalFactState::Exact ||
+      read.state != PhysicalFactState::Exact || write.resource != read.resource ||
+      write.coordinates.size() != read.coordinates.size() ||
+      !predicateIncludes(read.validity, write.validity))
+    return false;
+  for (auto [coordinate, axis] : llvm::zip(read.coordinates, read.sourceAxes)) {
+    auto position = llvm::find(write.sourceAxes, axis);
+    if (position == write.sourceAxes.end() ||
+        !sameScalarExpression(
+            coordinate, write.coordinates[position - write.sourceAxes.begin()]))
+      return false;
+  }
+  return true;
 }
 
 } // namespace
@@ -3771,18 +3858,23 @@ PhysicalProgramAnalysis::accessBounds(Operation *access) {
 }
 
 PhysicalBufferDataflowFact
-PhysicalProgramAnalysis::bufferDataflow(BufferOp buffer) {
+PhysicalProgramAnalysis::bufferDataflow(Value buffer) {
   PhysicalBufferDataflowFact result;
-  if (!buffer || buffer->getParentOfType<func::FuncOp>() != kernel)
+  auto type = buffer ? dyn_cast<BufferType>(buffer.getType()) : BufferType();
+  auto allocation = buffer ? buffer.getDefiningOp<BufferOp>() : BufferOp();
+  auto argument = dyn_cast_if_present<BlockArgument>(buffer);
+  if (!type ||
+      (!allocation && (!argument || argument.getOwner() != &kernel.front())) ||
+      (allocation && allocation->getParentOfType<func::FuncOp>() != kernel))
     return result;
   result.state = PhysicalFactState::Exact;
   SmallVector<Operation *> reads;
   SmallVector<Operation *> initializingWrites;
-  for (OpOperand &use : buffer.getResult().getUses()) {
+  for (OpOperand &use : buffer.getUses()) {
     Operation *user = use.getOwner();
-    if (isa<AssumeInBoundsOp>(user))
+    if (isa<AssumeInBoundsOp, DimOp>(user))
       continue;
-    if (accessResource(user) != buffer.getResult()) {
+    if (accessResource(user) != buffer) {
       result.state = PhysicalFactState::Unknown;
       appendUnique(result.blockers, user);
       continue;
@@ -3792,14 +3884,18 @@ PhysicalProgramAnalysis::bufferDataflow(BufferOp buffer) {
     if (writesResourceWithoutReading(user))
       initializingWrites.push_back(user);
   }
-  if (buffer.getResult().getType().getInitialization().getValue() ==
-      BufferInitialization::FullValue)
+  if (allocation &&
+      type.getInitialization().getValue() == BufferInitialization::FullValue)
     return result;
 
   DominanceInfo dominance(kernel);
   for (Operation *read : reads) {
+    PhysicalAccessFootprint readAccess = footprint(read);
+    if (integerConstant(readAccess.validity) == 0)
+      continue;
     bool initialized = llvm::any_of(initializingWrites, [&](Operation *write) {
-      return dominance.properlyDominates(write, read);
+      return dominance.properlyDominates(write, read) &&
+             writeDefinesRead(footprint(write), readAccess);
     });
     if (!initialized)
       initialized = precedingRegionInitializesBuffer(
