@@ -157,7 +157,9 @@ FailureOr<bool> materializeIndexedContraction(linalg::GenericOp operation, Imple
       b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, columns, zero));
   auto active = b.create<scf::IfOp>(loc, nonempty, false);
   b.setInsertionPointToStart(active.thenBlock());
-  constexpr int64_t rowWindow = indexedRowWindow, reductionWindow = 128;
+  constexpr int64_t rowWindow = indexedRowWindow;
+  // Bound gathered RHS payload per row to 16 KiB and preparation to 192 KiB.
+  int64_t reductionWindow = std::min<int64_t>(512, 4096 / panelSize);
   loop(b, loc, zero, rows, rowWindow, [&](Value rowBegin) {
     Value rowEnd = b.create<arith::MinSIOp>(loc, add(b, loc, rowBegin, index(b, loc, rowWindow)), rows);
     Value rowCount = b.create<arith::SubIOp>(loc, rowEnd, rowBegin);
