@@ -323,11 +323,11 @@ bool upperBoundWithinResource(Value value, Value resource, unsigned axis) {
     return true;
   std::optional<int64_t> bound = integerConstant(value);
   PhysicalExprAttr extent = resourceExtentExpression(resource, axis);
-  if (!bound || *bound < 0 || !extent)
+  if (!extent)
     return false;
   auto kind = static_cast<PhysicalExprKind>(extent.getKind());
   if (kind == PhysicalExprKind::Constant)
-    return *bound <= extent.getValue();
+    return bound && *bound >= 0 && *bound <= extent.getValue();
   if (kind != PhysicalExprKind::Parameter)
     return false;
   func::FuncOp kernel = resource.getParentRegion()
@@ -336,7 +336,15 @@ bool upperBoundWithinResource(Value value, Value resource, unsigned axis) {
   FailureOr<ParameterOp> parameter =
       kernel ? queryParameterBySymbol(kernel, extent.getSymbol())
              : FailureOr<ParameterOp>(failure());
-  return succeeded(parameter) &&
+  if (failed(parameter))
+    return false;
+  if (parameter->getParameter().getCategory() ==
+      static_cast<uint32_t>(ParameterCategory::Coverage))
+    if (auto covered = (*parameter)->getAttrOfType<PhysicalExprAttr>(
+            coverageBoundAttr);
+        covered && queryLaunchExpression(value) == covered)
+      return true;
+  return bound && *bound >= 0 &&
          llvm::all_of(parameter->getParameter().getCandidates().asArrayRef(),
                       [&](int64_t candidate) { return *bound <= candidate; });
 }

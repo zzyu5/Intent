@@ -1813,6 +1813,15 @@ private:
     } else if (auto fragment = dyn_cast<gpu::FragmentType>(resource.getType())) {
       if (axis >= fragment.getShape().size())
         return failure();
+      gpu::PhysicalProgramAnalysis analysis(physicalKernel);
+      if (analysis.axisRealization(resource, axis).constructionScalarSeed) {
+        FailureOr<gpu::MakeRangeOp> range =
+            gpu::queryExactLogicalRange(analysis.axisRanges(resource, axis));
+        if (failed(range))
+          return failure();
+        return rangeExtent(location, range->getLogicalStart(),
+                           range->getLogicalStop(), range->getStep());
+      }
       if (auto load = resource.getDefiningOp<gpu::LoadOp>()) {
         auto view = dyn_cast<gpu::ViewType>(load.getResource().getType());
         auto mapping = dyn_cast<gpu::AxisMapAttr>(fragment.getAxisMaps()[axis]);

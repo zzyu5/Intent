@@ -1376,6 +1376,33 @@ void sinkImmutableLoadChains(func::FuncOp kernel) {
   }
 }
 
+LogicalResult materializeIndexedFragments(func::FuncOp kernel) {
+  SmallVector<GatherOp> gathers;
+  kernel.walk([&](GatherOp gather) { gathers.push_back(gather); });
+  for (GatherOp gather : gathers) {
+    for (auto [coordinate, sourceAxis] :
+         llvm::zip(gather.getCoordinates(), gather.getSourceAxes())) {
+      PhysicalProgramAnalysis analysis(kernel);
+      if (!analysis.axisRealization(gather.getSource(), sourceAxis)
+               .constructionScalarSeed)
+        continue;
+      auto source = cast<FragmentType>(gather.getSource().getType());
+      auto extent = cast<PhysicalExprAttr>(source.getShape()[sourceAxis]);
+      PhysicalExprAttr bound = queryNonNegativeIndexUpperBound(coordinate);
+      if (bound &&
+          bound.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          bound.getValue() < extent.getValue())
+        continue;
+      if (failed(realizeFullCoverageDimension(kernel, gather.getSource(),
+                                               sourceAxis)))
+        return gather.emitOpError(
+            "indexed tensor source has no complete physical extent");
+    }
+  }
+  return success();
+}
+
 } // namespace
 
 LogicalResult realizeAccessComposition(ModuleOp module) {
@@ -1442,6 +1469,8 @@ LogicalResult realizeAccessComposition(ModuleOp module) {
     changed |= deduplicateImmutableLoads(*physicalKernel);
     eraseDeadPhysicalValues(*physicalKernel);
   } while (changed);
+  if (failed(materializeIndexedFragments(*physicalKernel)))
+    return failure();
   sinkImmutableLoadChains(*physicalKernel);
   return success();
 }
