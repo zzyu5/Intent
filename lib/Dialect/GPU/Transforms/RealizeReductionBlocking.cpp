@@ -1004,6 +1004,13 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
         diagnostic << "; blocker=" << blocker->getName();
       return failure();
     }
+    if (llvm::any_of(replay.accesses, [&](Operation *access) {
+          auto load = dyn_cast<LoadOp>(access);
+          return load && !canReplayReadAt(load, reduce);
+        }))
+      return reduce.emitOpError(
+                 "static reduction padding would change a read snapshot"),
+             failure();
     IRMapping mapping;
     SmallVector<Value> tailPredicates;
     FailureOr<Value> source = clonePaddedProducer(
