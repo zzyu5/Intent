@@ -26,16 +26,20 @@ void exposeStructuredWorksets(func::FuncOp function) {
   SmallVector<linalg::GenericOp> computations(function.front().getOps<linalg::GenericOp>());
   for (auto operation : computations) {
     if (!operation.getNumLoops() || operation.getNumResults() || operation.getOutputs().empty() ||
-        llvm::any_of(operation.getIteratorTypesArray(), [](utils::IteratorType type) {
-          return type != utils::IteratorType::parallel;
-        })) continue;
+        operation.getIteratorTypesArray()[0] != utils::IteratorType::parallel) continue;
     auto maps = operation.getIndexingMapsArray();
     if (llvm::any_of(maps, [](AffineMap map) {
           return map.getNumSymbols() || llvm::any_of(map.getResults(), [](AffineExpr expression) {
             return !isa<AffineDimExpr, AffineConstantExpr>(expression);
           });
         }) || llvm::any_of(ArrayRef<AffineMap>(maps).drop_front(operation.getNumDpsInputs()),
-                           [](AffineMap map) { return !map.isIdentity(); })) continue;
+                           [](AffineMap map) {
+                             if (!map.getNumResults() || map.getResult(0) != getAffineDimExpr(0, map.getContext())) return true;
+                             return llvm::any_of(map.getResults().drop_front(), [](AffineExpr expression) {
+                               auto dimension = dyn_cast<AffineDimExpr>(expression);
+                               return dimension && dimension.getPosition() == 0;
+                             });
+                           })) continue;
     bool independent = true;
     for (auto [number, destination] : llvm::enumerate(operation.getOutputs())) {
       for (Value other : operation.getOutputs().drop_front(number + 1))

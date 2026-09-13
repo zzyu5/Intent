@@ -1278,6 +1278,69 @@ private:
     return success();
   }
 
+  LogicalResult sparseContract(SparseContractOp operation) {
+    auto lhsType = cast<RankedTensorType>(operation.getCompressed().getType());
+    auto rhsType = cast<RankedTensorType>(operation.getRhs().getType());
+    auto resultType = cast<RankedTensorType>(operation.getResult().getType());
+    Type element = lhsType.getElementType(), accumulator = resultType.getElementType();
+    auto pairs = operation.getReduce();
+    if (lhsType.getRank() != 2 || rhsType.getRank() != 2 || !operation.getBatch().empty() ||
+        operation.getFormat().getCompressionAxis() != 1 || pairs.size() != 1 ||
+        cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[0]).getInt() != 1 ||
+        cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[1]).getInt() != 0 ||
+        !isa<FloatType>(element) || element != rhsType.getElementType() ||
+        (!accumulator.isF32() && !accumulator.isF64()) ||
+        element.getIntOrFloatBitWidth() > accumulator.getIntOrFloatBitWidth())
+      return operation.emitError("CPU sparse contraction requires rank-two compressed matrices and lossless floating widening");
+    Location loc = operation.getLoc();
+    auto sizes = extents(resultType, loc);
+    if (failed(sizes)) return failure();
+    Value output = allocate(resultType, *sizes, loc);
+    Value compressed = values.lookup(operation.getCompressed()), rhs = values.lookup(operation.getRhs());
+    SmallVector<Value> positions = flattened(ValueRange{operation.getMetadata()});
+    int64_t nonzeros = operation.getFormat().getKind() == 0 ? 1 : 2;
+    int64_t groupSize = nonzeros * 2;
+    Value zero = builder.create<arith::ConstantOp>(loc, builder.getZeroAttr(accumulator));
+    builder.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{output});
+    AffineExpr m, compressedK, n;
+    bindDims(builder.getContext(), m, compressedK, n);
+    SmallVector<AffineMap> maps{
+        AffineMap::get(3, 0, {m, compressedK}, builder.getContext()),
+        AffineMap::get(3, 0, {m, n}, builder.getContext())};
+    builder.create<linalg::GenericOp>(loc, ValueRange{compressed}, ValueRange{output}, maps,
+        SmallVector<utils::IteratorType>{utils::IteratorType::parallel, utils::IteratorType::reduction,
+                                        utils::IteratorType::parallel},
+        [&](OpBuilder &b, Location loc, ValueRange arguments) {
+          auto index = [&](int64_t value) -> Value { return b.create<arith::ConstantIndexOp>(loc, value); };
+          Value row = b.create<linalg::IndexOp>(loc, 0), column = b.create<linalg::IndexOp>(loc, 2);
+          Value ordinal = b.create<linalg::IndexOp>(loc, 1);
+          Value group = b.create<arith::DivSIOp>(loc, ordinal, index(nonzeros));
+          auto position = [&](Value memory) -> Value {
+            Value value = b.create<memref::LoadOp>(loc, memory, ValueRange{row, group});
+            if (value.getType().isIndex()) return value;
+            return cast<IntegerType>(value.getType()).isUnsigned()
+                ? Value(b.create<arith::IndexCastUIOp>(loc, b.getIndexType(), value))
+                : Value(b.create<arith::IndexCastOp>(loc, b.getIndexType(), value));
+          };
+          Value relative = position(positions[0]);
+          if (nonzeros == 2) {
+            Value first = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                b.create<arith::RemSIOp>(loc, ordinal, index(nonzeros)), index(0));
+            relative = b.create<arith::SelectOp>(loc, first, relative, position(positions[1]));
+          }
+          Value reduction = b.create<arith::AddIOp>(loc,
+              b.create<arith::MulIOp>(loc, group, index(groupSize)), relative);
+          Value left = arguments[0], right = b.create<memref::LoadOp>(loc, rhs, ValueRange{reduction, column});
+          if (element != accumulator) {
+            left = b.create<arith::ExtFOp>(loc, accumulator, left);
+            right = b.create<arith::ExtFOp>(loc, accumulator, right);
+          }
+          b.create<linalg::YieldOp>(loc, ValueRange{b.create<math::FmaOp>(loc, left, right, arguments[1])});
+        });
+    values.map(operation.getResult(), output);
+    return success();
+  }
+
   LogicalResult scaledContract(ScaledContractOp operation) {
     auto outputType = cast<RankedTensorType>(operation.getResult().getType());
     auto carrier = [](Value value, ScaledFormat format) {
@@ -1665,15 +1728,51 @@ private:
           coordinates[cast<IntegerAttr>(permuted).getInt()] = builder.getAffineDimExpr(axis);
       } else {
         unsigned next = 0;
+        bool unitAxesOnly = true;
+        auto sourceTensor = cast<RankedTensorType>(operation->getOperand(0).getType());
+        auto sourceShape = dyn_cast_or_null<TensorShapeAttr>(sourceTensor.getEncoding());
+        auto resultShape = dyn_cast_or_null<TensorShapeAttr>(tensor.getEncoding());
         for (int64_t axis = 0; axis < source.getRank(); ++axis) {
           if (source.getDimSize(axis) == 1) { coordinates[axis] = builder.getAffineConstantExpr(0); continue; }
           while (next < tensor.getRank() && tensor.getDimSize(next) == 1) ++next;
-          if (next == tensor.getRank() || source.getDimSize(axis) != tensor.getDimSize(next))
-            return operation->emitError("CPU non-unit-axis reshape requires explicit contiguous regrouping, which is not implemented");
+          if (next == tensor.getRank() || source.getDimSize(axis) != tensor.getDimSize(next)) {
+            unitAxesOnly = false;
+            break;
+          }
+          if (source.isDynamicDim(axis) && (!sourceShape || !resultShape ||
+              sourceShape.getDimensions()[axis] != resultShape.getDimensions()[next])) {
+            unitAxesOnly = false;
+            break;
+          }
           coordinates[axis] = builder.getAffineDimExpr(next++);
         }
         while (next < tensor.getRank() && tensor.getDimSize(next) == 1) ++next;
-        if (next != tensor.getRank()) return operation->emitError("CPU reshape cannot introduce non-unit axes");
+        unitAxesOnly &= next == tensor.getRank();
+        if (!unitAxesOnly) {
+          SmallVector<Value> sourceSizes;
+          for (int64_t axis = 0; axis < source.getRank(); ++axis)
+            sourceSizes.push_back(builder.create<memref::DimOp>(loc, input, axis));
+          Value output = allocate(tensor, *sizes, loc);
+          builder.create<linalg::GenericOp>(loc, ValueRange{}, ValueRange{output},
+              SmallVector<AffineMap>{builder.getMultiDimIdentityMap(tensor.getRank())},
+              SmallVector<utils::IteratorType>(tensor.getRank(), utils::IteratorType::parallel),
+              [&](OpBuilder &nested, Location location, ValueRange) {
+                Value linear = nested.create<arith::ConstantIndexOp>(location, 0);
+                for (auto [axis, size] : llvm::enumerate(*sizes))
+                  linear = nested.create<arith::AddIOp>(location,
+                      nested.create<arith::MulIOp>(location, linear, size), nested.create<linalg::IndexOp>(location, axis));
+                SmallVector<Value> indices(source.getRank());
+                for (int64_t axis = source.getRank() - 1; axis >= 0; --axis) {
+                  if (axis == 0) { indices[axis] = linear; break; }
+                  indices[axis] = nested.create<arith::RemSIOp>(location, linear, sourceSizes[axis]);
+                  linear = nested.create<arith::DivSIOp>(location, linear, sourceSizes[axis]);
+                }
+                Value value = nested.create<memref::LoadOp>(location, input, indices);
+                nested.create<linalg::YieldOp>(location, value);
+              });
+          values.map(operation->getResult(0), output);
+          return success();
+        }
       }
       Value output = allocate(tensor, *sizes, loc);
       builder.create<linalg::GenericOp>(loc, ValueRange{input}, ValueRange{output},
@@ -1744,6 +1843,8 @@ private:
       return contract(op);
     } else if (auto op = dyn_cast<ScaledContractOp>(operation)) {
       return scaledContract(op);
+    } else if (auto op = dyn_cast<SparseContractOp>(operation)) {
+      return sparseContract(op);
     } else if (operation->getName().getDialectNamespace() == "arith") {
       builder.clone(*operation, values);
     } else {
