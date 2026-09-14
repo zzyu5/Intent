@@ -68,6 +68,8 @@ def catalog(root: Path, suite: dict) -> list[dict]:
 
 
 def description(root: Path, row: dict) -> str:
+    if "description" in row:
+        return f"Functional Description: {row['description']}\nWrapper Entry Information: {row['entry']}"
     instruction = json.loads((root / row["prompt_file"]).read_text())[row["prompt_index"]]["instruction"]
     # The surrounding upstream role text is Triton-specific; the task body is shared.
     start = instruction.index("Functional Description:")

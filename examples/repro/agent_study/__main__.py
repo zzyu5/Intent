@@ -128,7 +128,7 @@ def main() -> None:
         material_inputs = invocation(arguments.reference, row, by_id[row["task"]], arguments.suite, device="cpu")
         row["invocation"] = material_inputs.metadata()
         source = reference(arguments.reference, row)
-        row["reference_signature"] = str(inspect.signature(source))
+        row["reference_signature"] = row["entry"] + str(inspect.signature(source))
         with torch.no_grad():
             row["return_contract"] = return_contract(material_inputs.call(source))
     arguments.output = arguments.output.resolve()
