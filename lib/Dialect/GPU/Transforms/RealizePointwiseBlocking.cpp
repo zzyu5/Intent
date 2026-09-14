@@ -720,12 +720,12 @@ FragmentType predicateType(FragmentType source) {
 }
 
 FailureOr<unsigned> tailPredicateAxis(FragmentType target, MakeRangeOp range) {
-  if (range->hasAttr(sourceSubregionAttr)) {
-    auto axis = queryFragmentAxis(target, sourceAxisIdentity(range));
-    return axis.isExact() ? FailureOr<unsigned>(axis.fragmentAxis)
-                          : FailureOr<unsigned>(failure());
-  }
   FailureOr<int64_t> dimension = queryRangeDimension(range);
+  auto source = queryFragmentAxis(target, sourceAxisIdentity(range));
+  if (source.isExact() && succeeded(dimension) && source.dimensionId == *dimension)
+    return source.fragmentAxis;
+  if (range->hasAttr(sourceSubregionAttr))
+    return failure();
   auto axis = succeeded(dimension) ? queryFragmentDimension(target, *dimension)
                                    : PhysicalDimensionProjection{};
   return axis.isExact() ? FailureOr<unsigned>(axis.fragmentAxis)
@@ -786,8 +786,9 @@ FailureOr<Value> accessValidity(OpBuilder &builder, Location location,
       auto found = rangePredicates.find(range.getResult());
       if (found == rangePredicates.end())
         continue;
-      FailureOr<unsigned> axis = positionalAxis ? FailureOr<unsigned>(*positionalAxis)
-                                                : tailPredicateAxis(target, range);
+      FailureOr<unsigned> axis = tailPredicateAxis(target, range);
+      if (failed(axis) && positionalAxis)
+        axis = *positionalAxis;
       if (failed(axis))
         continue;
       FailureOr<Value> broadcast = projectPredicateToFragmentAxis(
@@ -4686,6 +4687,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         if (positionalRemap && !repeatedDimension)
           positionalOccurrences.insert(range.getOperation());
         ownershipSources.insert(sourceAxisIdentity(range));
+        if (positionalRemap)
+          directOwnershipSources.insert(sourceAxisIdentity(range));
         if (retainsReducedAxis) {
           reductionTraversalRanges.insert(range.getOperation());
           internalTraversalRanges.insert(range.getOperation());

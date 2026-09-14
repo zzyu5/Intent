@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -63,7 +64,11 @@ LogicalResult buildStoreTraversal(OpBuilder &builder, Location location,
   SmallVector<Value> predicates;
   for (unsigned axis = 0; axis < ranges.size(); ++axis) {
     MakeRangeOp range = ranges[axis];
-    Value chunk = axis == 0 ? rowChunk : range.getExtent();
+    Value chunk = rowChunk;
+    if (axis != 0)
+      chunk = builder.create<PhysicalExprOp>(
+          location, builder.getIndexType(),
+          cast<PhysicalExprAttr>(payload.getShape()[axis]));
     Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
     Value one = builder.create<arith::ConstantIndexOp>(location, 1);
     Value stop = builder.create<PhysicalExprOp>(
@@ -234,11 +239,18 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
           return false;
       }
   DominanceInfo dominance(kernel);
+  SmallVector<std::pair<Value, TypedAttr>> constants;
+  UniformValueAnalysis uniform(describeUniformValue);
   for (Value dependency : dependencies) {
     if (dominance.dominates(dependency, clobber))
       continue;
-    if (!isa<FragmentType>(dependency.getType()))
-      return false;
+    if (!isa<FragmentType>(dependency.getType())) {
+      auto constant = dyn_cast_or_null<TypedAttr>(uniform.evaluate(dependency));
+      if (!constant || constant.getType() != dependency.getType())
+        return false;
+      constants.emplace_back(dependency, constant);
+      continue;
+    }
     PhysicalRangeAxisFact axes = analysis.rangeAxes(dependency, rowRoots);
     bool scalarBroadcast = dependency.getDefiningOp<SplatOp>() != nullptr;
     if (auto broadcast = dependency.getDefiningOp<BroadcastOp>())
@@ -255,6 +267,10 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
   }
 
   OpBuilder builder(clobber);
+  IRMapping constantValues;
+  for (auto [original, constant] : constants)
+    constantValues.map(original, builder.create<arith::ConstantOp>(
+        store.getLoc(), original.getType(), constant));
   Value workspace = createInvocationWorkspace(
       kernel, store.getLoc(), payload, builder.getArrayAttr(shape));
   uint64_t instance = cast<BufferType>(workspace.getType()).getInstance();
@@ -277,6 +293,8 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
       builder, store.getLoc(), ranges, roots, chunk, blocked,
       [&](OpBuilder &nested, IRMapping &mapping, ValueRange coordinates,
           Value valid) -> LogicalResult {
+        for (const auto &entry : constantValues.getValueMap())
+          mapping.map(entry.first, entry.second);
         FailureOr<Value> value = materializeReplayedValue(
             nested, store.getLoc(), store.getValue(), source,
             queryLaunchExpression(chunk), mapping, options);

@@ -795,6 +795,13 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
   if (!isa<IntegerType, FloatType, IndexType>(element) ||
       element != target.getElementType())
     return failure();
+  if (source)
+    if (auto constant = dyn_cast_or_null<TypedAttr>(
+            UniformValueAnalysis(describeUniformValue).evaluate(value));
+        constant && constant.getType() == element) {
+      Value scalar = builder.create<arith::ConstantOp>(location, element, constant);
+      return Value(builder.create<SplatOp>(location, target, scalar));
+    }
   Operation *projection = nullptr;
   if (!source) {
     projection = builder.create<SplatOp>(location, target, value);
@@ -3031,7 +3038,7 @@ static void retargetExtent(Value root, AxisSelector selects,
     connectedExtents.push_back(extent);
   SmallVector<Value> worklist{root};
   llvm::DenseMap<Value, Type> visitedTypes;
-  SmallVector<std::pair<Value, AxisMapAttr>> broadcastAliases;
+  SmallVector<std::pair<Value, AxisMapAttr>> valueAliases;
   auto isSegmentSourceSlice = [&](Value value) {
     auto argument = dyn_cast<BlockArgument>(value);
     if (!argument)
@@ -3178,10 +3185,41 @@ static void retargetExtent(Value root, AxisSelector selects,
                   target.getShape()[targetAxis] != extent) {
                 std::pair<Value, AxisMapAttr> alias{broadcast.getResult(),
                                                     targetMap};
-                if (!llvm::is_contained(broadcastAliases, alias))
-                  broadcastAliases.push_back(alias);
+                if (!llvm::is_contained(valueAliases, alias))
+                  valueAliases.push_back(alias);
               }
             }
+        }
+      }
+      if (auto reshape = dyn_cast<ReshapeOp>(user)) {
+        auto target = dyn_cast<FragmentType>(reshape.getResult().getType());
+        if (previousFragment && target) {
+          unsigned sourceRank = 0, resultRank = 0;
+          for (Attribute attribute : reshape.getReassociation()) {
+            auto group = cast<ReshapeGroupAttr>(attribute);
+            sourceRank += group.getSourceAxes().size();
+            resultRank += group.getResultAxes().size();
+          }
+          unsigned sourcePrefix = previousFragment.getShape().size() - sourceRank;
+          unsigned resultPrefix = target.getShape().size() - resultRank;
+          for (Attribute attribute : reshape.getReassociation()) {
+            auto group = cast<ReshapeGroupAttr>(attribute);
+            if (group.getSourceAxes().size() != 1 ||
+                group.getResultAxes().size() != 1)
+              continue;
+            unsigned sourceAxis = sourcePrefix + group.getSourceAxes()[0];
+            unsigned targetAxis = resultPrefix + group.getResultAxes()[0];
+            auto inputMap =
+                cast<AxisMapAttr>(previousFragment.getAxisMaps()[sourceAxis]);
+            auto targetMap = cast<AxisMapAttr>(target.getAxisMaps()[targetAxis]);
+            if (!selects(inputMap) || selects(targetMap) ||
+                previousFragment.getShape()[sourceAxis] != target.getShape()[targetAxis] ||
+                target.getShape()[targetAxis] == extent)
+              continue;
+            std::pair<Value, AxisMapAttr> alias{reshape.getResult(), targetMap};
+            if (!llvm::is_contained(valueAliases, alias))
+              valueAliases.push_back(alias);
+          }
         }
       }
       if (isa<RegionFoldOp, RegionScanOp>(user)) {
@@ -3224,7 +3262,7 @@ static void retargetExtent(Value root, AxisSelector selects,
         worklist.push_back(result);
     }
   }
-  for (auto [value, axis] : broadcastAliases) {
+  for (auto [value, axis] : valueAliases) {
     auto type = cast<FragmentType>(value.getType());
     if (type.getShape()[axis.getFragmentAxis()] == extent)
       continue;
