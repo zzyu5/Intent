@@ -280,6 +280,11 @@ LogicalResult materializeRegisterContractions(func::FuncOp function) {
     int64_t width = tile.getVectorWidth(), columns = tile.getColumns() / width;
     Type accumulator = outputType.getElementType();
     auto vectorType = VectorType::get({width}, accumulator);
+    auto widen = [&](Value value, Type type) -> Value {
+      if (value.getType() == type) return value;
+      if (isa<FloatType>(accumulator)) return b.create<arith::ExtFOp>(loc, type, value);
+      return b.create<arith::ExtSIOp>(loc, type, value);
+    };
     SmallVector<Value> rows, offsets, accumulators;
     for (int64_t row = 0; row < tile.getRows(); ++row) rows.push_back(index(b, loc, row));
     for (int64_t column = 0; column < columns; ++column) offsets.push_back(index(b, loc, column * width));
@@ -288,9 +293,7 @@ LogicalResult materializeRegisterContractions(func::FuncOp function) {
       Value value = width == 1
           ? Value(b.create<memref::LoadOp>(loc, source, ValueRange{row, column}))
           : Value(b.create<vector::LoadOp>(loc, VectorType::get({width}, element), source, ValueRange{row, column}));
-      if (element != accumulator)
-        value = b.create<arith::ExtFOp>(loc, width == 1 ? accumulator : vectorType, value);
-      return value;
+      return widen(value, width == 1 ? accumulator : vectorType);
     };
     for (Value row : rows)
       for (Value offset : offsets) {
@@ -319,11 +322,16 @@ LogicalResult materializeRegisterContractions(func::FuncOp function) {
       SmallVector<Value> next;
       for (auto [number, row] : llvm::enumerate(rows)) {
         Value left = b.create<memref::LoadOp>(loc, lhs, ValueRange{row, k});
-        if (left.getType() != accumulator) left = b.create<arith::ExtFOp>(loc, accumulator, left);
+        left = widen(left, accumulator);
         if (width != 1) left = b.create<vector::BroadcastOp>(loc, vectorType, left);
-        for (int64_t column = 0; column < columns; ++column)
-          next.push_back(b.create<math::FmaOp>(loc, left, right[column],
-              reduction.getRegionIterArgs()[number * columns + column]));
+        for (int64_t column = 0; column < columns; ++column) {
+          Value previous = reduction.getRegionIterArgs()[number * columns + column];
+          if (isa<FloatType>(accumulator))
+            next.push_back(b.create<math::FmaOp>(loc, left, right[column], previous));
+          else
+            next.push_back(b.create<arith::AddIOp>(loc,
+                b.create<arith::MulIOp>(loc, left, right[column]), previous));
+        }
       }
       b.create<scf::YieldOp>(loc, next);
     }
@@ -339,7 +347,7 @@ LogicalResult materializeRegisterContractions(func::FuncOp function) {
           for (Operation &nested : body.without_terminator()) {
             if (auto constant = dyn_cast<arith::ConstantOp>(&nested); constant && width != 1) {
               Value splat = b.create<arith::ConstantOp>(loc, vectorType,
-                  DenseElementsAttr::get(vectorType, cast<FloatAttr>(constant.getValue())));
+                  DenseElementsAttr::get(vectorType, ArrayRef<Attribute>{constant.getValue()}));
               mapping.map(constant.getResult(), splat);
             } else {
               Operation *cloned = b.clone(nested, mapping);

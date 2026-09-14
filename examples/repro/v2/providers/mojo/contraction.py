@@ -15,6 +15,7 @@ from kernels.contraction.qkv import fused_qkv_projection
 from kernels.contraction.sparse_2to4 import sparse_2to4_gemm
 from kernels.contraction.weight_only_int4 import fp8_e4m3_matmul
 from kernels.contraction.weight_only_int4 import fp8_e5m2_matmul, weight_only_int4_matmul
+from kernels.contraction.weight_only_int4 import w4a8_packed_matmul, bitnet_int2_matmul, dequant_bf16_fp4_matmul
 from kernels.contraction.mla import mla_head_projection as mla_head_projection_definition
 from kernels.contraction.vector import vector_dot as vector_dot_definition
 from kernels.contraction.vector import matrix_vector as matrix_vector_definition
@@ -194,6 +195,32 @@ def weight_only_int4(context):
                                    "weight_only_int4_matmul", Tolerance(atol=4e-2))
 
 
+def w4a8_gemm(context):
+    activation = torch.randint(-128, 128, (4096, 4096), dtype=torch.int8)
+    packed = torch.randint(0, 256, (14336, 2048), dtype=torch.uint8)
+    comparison = prepare_host_comparison(context, w4a8_packed_matmul, (activation, packed),
+                                         "w4a8_packed_matmul", Tolerance(atol=0.0))
+    return replace(comparison, note=comparison.note + " 原 W4A8 4096x4096x14336，输出[N,M]i32；reference 含 signed nibble 解码，以 f32 精确承载本输入域的整数乘加后转 i32，逐元素精确比较。")
+
+
+def bitnet_int2(context):
+    activation = torch.randint(-8, 8, (1, 4096), dtype=torch.int8)
+    logical = torch.randint(0, 2, (4096, 4096), dtype=torch.int8).reshape(4096, 256, 4, 4)
+    packed = torch.zeros((4096, 256, 4), dtype=torch.uint8)
+    for lane in range(4):
+        packed |= logical[:, :, lane, :].to(torch.uint8) << (lane * 2)
+    comparison = prepare_host_comparison(context, bitnet_int2_matmul, (activation, packed.flatten(1)),
+                                         "bitnet_int2_matmul", Tolerance(atol=0.0))
+    return replace(comparison, note=comparison.note + " 原 M1/N4096/K4096、逻辑 weight 0..1、int8 目标 interleaved INT2 packing；reference 含解码，f32 精确整数乘加后转 i32，逐元素精确比较。")
+
+
+def dequant_bf16_fp4(context):
+    activation = torch.randn((4096, 4096), dtype=torch.bfloat16) * 0.125
+    packed = torch.randint(0, 256, (4096, 2048), dtype=torch.uint8)
+    return prepare_host_comparison(context, dequant_bf16_fp4_matmul, (activation, packed),
+                                   "dequant_bf16_fp4_matmul", Tolerance(atol=1.0, rtol=2e-2))
+
+
 def _block_quantize_mxfp8(x, block_size):
     dtype_max = torch.finfo(torch.float8_e4m3fn).max
     x_block = x.reshape(*x.shape[:-1], x.shape[-1] // block_size, block_size)
@@ -296,6 +323,8 @@ CASES = {"dense_gemm_f32": gemm, "dense_gemm": half_gemm, "tilegym_dense_gemm": 
          "gated_dual_gemm": dual_gemm, "fp8_gemm": fp8_gemm,
          "fp8_e5m2_gemm": fp8_e5m2_gemm, "quantized_gemm": quantized_gemm,
          "weight_only_int4": weight_only_int4,
+         "w4a8_gemm": w4a8_gemm, "bitnet_int2_decode": bitnet_int2,
+         "dequant_bf16_fp4": dequant_bf16_fp4,
          "vector_dot": vector_dot, "matrix_vector": matrix_vector,
          "vector_matrix": vector_matrix, "vector_outer": vector_outer,
          "mxfp8_gemm": mxfp8_gemm, "block_sparse_gemm": block_sparse_gemm,

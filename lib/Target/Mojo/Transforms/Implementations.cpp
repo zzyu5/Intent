@@ -97,7 +97,9 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
         SmallVector<utils::IteratorType>(2, utils::IteratorType::parallel),
         [&](OpBuilder &nested, Location loc, ValueRange arguments) {
           Value value = arguments[0];
-          if (!tile.first) value = nested.create<arith::AddFOp>(loc, value, arguments[1]);
+          if (!tile.first) value = isa<FloatType>(accumulator)
+              ? Value(nested.create<arith::AddFOp>(loc, value, arguments[1]))
+              : Value(nested.create<arith::AddIOp>(loc, value, arguments[1]));
           nested.create<linalg::YieldOp>(loc, value);
         });
   };
@@ -149,8 +151,8 @@ cpu::ImplementationRegistry implementations() {
     bool contraction = false, region = false;
     function.walk([&](linalg::GenericOp op) { contraction |= isMatrixContraction(op); });
     function.walk([&](Operation *op) { region |= isa<cpu::RegionFoldOp, cpu::RegionScanOp>(op); });
-    if (region) return contraction ? "mojo.region_contract_float" : "mojo.region_vector";
-    return contraction ? "mojo.register_float" : "mojo.vector";
+    if (region) return contraction ? "mojo.region_contraction" : "mojo.region_vector";
+    return contraction ? "mojo.register_contraction" : "mojo.vector";
   };
   Implementation contraction{"mojo.register_float", [](Operation *op) {
       auto generic = dyn_cast<linalg::GenericOp>(op);
@@ -173,6 +175,16 @@ cpu::ImplementationRegistry implementations() {
     };
   };
   auto directLegal = contraction.legal;
+  auto addInteger = [&](StringRef name) {
+    Implementation integer = contraction;
+    integer.name = name;
+    integer.applicable = [](Operation *op) {
+      auto generic = dyn_cast<linalg::GenericOp>(op);
+      return generic && isMatrixContraction(generic) &&
+          cast<MemRefType>(generic.getOutputs()[0].getType()).getElementType().isSignlessInteger(32);
+    };
+    result.add(std::move(integer));
+  };
   contraction.inputs = inputRequirements(InputReuse::Group);
   contraction.legal = [directLegal](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
     int64_t bytes = cast<MemRefType>(cast<linalg::GenericOp>(op).getInputs()[1].getType()).getElementTypeBitWidth() / 8;
@@ -180,6 +192,7 @@ cpu::ImplementationRegistry implementations() {
         config.parameter("vector_width") / config.parameter("micro_n");
   };
   result.add(contraction);
+  addInteger("mojo.register_integer");
   contraction.name = "mojo.register_float_shared";
   contraction.inputs = inputRequirements(InputReuse::Consumers);
   contraction.legal = [directLegal](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
@@ -187,6 +200,7 @@ cpu::ImplementationRegistry implementations() {
         config.tileN % (config.parameter("vector_width") * config.parameter("micro_n")) == 0;
   };
   result.add(contraction);
+  addInteger("mojo.register_integer_shared");
   contraction.name = "mojo.register_float_direct";
   contraction.legal = [directLegal](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
     SmallVector<int64_t> strides;
@@ -197,6 +211,7 @@ cpu::ImplementationRegistry implementations() {
   };
   contraction.inputs = {};
   result.add(contraction);
+  addInteger("mojo.register_integer_direct");
   contraction.name = "mojo.register_float_widened";
   contraction.legal = [directLegal](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
     if (!directLegal(op, capabilities, config) ||

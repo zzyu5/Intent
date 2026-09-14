@@ -102,6 +102,28 @@ def weight_only_int4_matmul(activation, packed, scales):
     return (activation.float() @ dequantized).half()
 
 
+def w4a8_packed_matmul(activation, packed):
+    nibbles = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(1).int()
+    signed = nibbles - ((nibbles & 8) << 1)
+    return (signed.float() @ activation.float().T).to(torch.int32)
+
+
+def bitnet_int2_matmul(activation, packed):
+    groups = packed.reshape(packed.shape[0], -1, 4)
+    logical = torch.stack(tuple((groups >> (lane * 2)) & 3 for lane in range(4)), dim=2).flatten(1)
+    return (activation.float() @ logical.float().T).to(torch.int32)
+
+
+def dequant_bf16_fp4_matmul(activation, packed):
+    word = (packed[:, 0::2].int() << 8) | packed[:, 1::2].int()
+    bits = torch.stack((word & 0x81C0, (word << 3) & 0x81C0,
+                        (word << 6) & 0x81C0,
+                        ((word << 1) & 0x8000) | ((word >> 3) & 0x0180) | ((word >> 7) & 0x0040)),
+                       dim=-1).flatten(1).to(torch.int16)
+    decoded = (bits.view(torch.bfloat16).float() * (2.0 ** 126)).bfloat16()
+    return (activation.float() @ decoded.float().T).bfloat16()
+
+
 def f32_groupwise_fp8_quantize(x, scales):
     values = x.reshape(x.shape[0], -1, 128)
     scale = values.abs().amax(dim=-1).clamp_min(1e-4) / 448.0

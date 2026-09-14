@@ -297,6 +297,9 @@ MOJO = (
     Entry("fp8_e5m2_gemm", "M1024-N1024-K1024-f8e5m2-8cores-host", "fp8_e5m2_matmul", ("contraction/weight_only_int4.py:fp8_e5m2_matmul",), "source/pytorch/cpu_runtime.py"),
     Entry("weight_only_int4", "M512-K2048-N4096-signed-w4-group64-f16-8cores-host", "weight_only_int4_matmul", ("contraction/weight_only_int4.py:weight_only_int4_matmul",), "source/pytorch/cpu_runtime.py"),
     Entry("per_token_fp8", "8192x8192-f32-group128-e4m3-8cores-host", "f32_groupwise_fp8_quantize", ("quantization/fp8.py:f32_groupwise_fp8_quantize",), "source/pytorch/cpu_runtime.py"),
+    Entry("w4a8_gemm", "M4096-K4096-N14336-i8-packed-w4-i32-NM-8cores-host", "w4a8_packed_matmul", ("contraction/weight_only_int4.py:w4a8_packed_matmul",), "source/pytorch/cpu_runtime.py"),
+    Entry("bitnet_int2_decode", "M1-N4096-K4096-i8-interleaved-u2-i32-8cores-host", "bitnet_int2_matmul", ("contraction/weight_only_int4.py:bitnet_int2_matmul",), "source/pytorch/cpu_runtime.py"),
+    Entry("dequant_bf16_fp4", "M4096-N4096-K4096-bf16-packed-fp4-8cores-host", "dequant_bf16_fp4_matmul", ("contraction/weight_only_int4.py:dequant_bf16_fp4_matmul",), "source/pytorch/cpu_runtime.py"),
 )
 
 
