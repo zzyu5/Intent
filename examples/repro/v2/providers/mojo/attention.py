@@ -6,6 +6,7 @@ import torch
 from kernels.streaming.attention_specialized import gemma_gqa_decode_partials
 from kernels.streaming.attention_specialized import attention_sink_prefill, attention_sink_decode_partials
 from kernels.streaming.attention_specialized import gemma_gqa_prefill, sliding_window_gqa_prefill
+from kernels.streaming.attention_specialized import block_causal_attention_fwd, varlen_block_causal_attention_fwd, native_sparse_attention_fwd
 from kernels.streaming.attention_f32 import causal_attention_f32, causal_linear_attention_f32
 from kernels.streaming.attention import flash_attention_bf16_fwd
 from kernels.streaming.attention import flash_attention_fwd, flash_gqa_attention_fwd
@@ -449,6 +450,33 @@ def sliding_window_prefill(context):
         constexprs={"HEAD_GROUP": 4, "WINDOW": 1024}, note=F16_PRECISION_NOTE)
 
 
+def block_causal(context):
+    q = torch.randn((2, 4096, 16, 128), dtype=torch.float16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    return prepare_host_comparison(context, block_causal_attention_fwd, (q, k, v, 128**-0.5),
+        "block_causal_attention", Tolerance(atol=5e-2, rtol=2e-2), constexprs={"BLOCK": 64},
+        note="原BSHD f16 block-causal noisy/clean halves与block64，CPU reference沿source三部分mask数学，非普通causal。" + F16_PRECISION_NOTE)
+
+
+def varlen_block_causal(context):
+    offsets = torch.tensor((0, 4096, 7936, 11520, 14848), dtype=torch.int32)
+    q = torch.randn((14848, 16, 128), dtype=torch.float16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    return prepare_host_comparison(context, varlen_block_causal_attention_fwd, (q, k, v, offsets, 128**-0.5),
+        "varlen_block_causal_attention", Tolerance(atol=5e-2, rtol=2e-2), constexprs={"BLOCK": 64},
+        note="原lengths4096/3840/3584/3328、H16/D128、block64 f16输入，reference保留每sequence的noisy/clean坐标。" + F16_PRECISION_NOTE)
+
+
+def native_sparse_prefill(context):
+    q = torch.randn((2, 4096, 32, 128), dtype=torch.float16)
+    k = torch.randn((2, 4096, 4, 128), dtype=torch.float16)
+    v = torch.randn_like(k)
+    blocks = torch.arange(64, dtype=torch.int32).reshape(1, 1, 1, 64).expand(2, 4096, 4, 64).contiguous()
+    return prepare_host_comparison(context, native_sparse_attention_fwd, (q, k, v, blocks, 128**-0.5),
+        "native_sparse_attention", Tolerance(atol=5e-2, rtol=2e-2), constexprs={"HEAD_GROUP": 8, "BLOCK": 64},
+        note="原provider实际B2/Q=K4096/HQ32/HK4/D128/S64/block64（其旧registry写HK2），使用原0..63连续selected blocks；CPU参考按每query/group gather并保留causal mask。" + F16_PRECISION_NOTE)
+
+
 CASES = {
     "causal_attention_f32": causal_attention,
     "causal_linear_attention_f32": causal_linear_attention,
@@ -463,6 +491,9 @@ CASES = {
     "attention_sink_decode": sink_decode,
     "gemma_gqa_prefill": gemma_prefill,
     "sliding_window_gqa_prefill": sliding_window_prefill,
+    "block_causal_attention": block_causal,
+    "varlen_block_causal_attention": varlen_block_causal,
+    "native_sparse_attention": native_sparse_prefill,
     "gemma_decode": gemma_decode,
     "paged_gqa_decode": paged_gqa_decode,
     "block_sparse_gqa_decode": block_sparse_gqa_decode,

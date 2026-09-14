@@ -226,6 +226,51 @@ def sliding_window_gqa_prefill(query, key, value, scale):
     return _masked_attention_prefill(query, key, value, valid, scale)
 
 
+def block_causal_attention(query, key, value, scale):
+    half = query.shape[1] // 2
+    rows, columns = torch.arange(query.shape[1])[:, None], torch.arange(key.shape[1])[None, :]
+    query_clean, key_clean = rows >= half, columns >= half
+    query_block = torch.where(query_clean, rows - half, rows) // 64
+    key_block = torch.where(key_clean, columns - half, columns) // 64
+    valid = (((query_block == key_block) & ~query_clean & ~key_clean)
+             | ((query_block > key_block) & ~query_clean & key_clean)
+             | ((query_block >= key_block) & query_clean & key_clean))
+    return _masked_attention_prefill(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2),
+                                     valid, scale).transpose(1, 2)
+
+
+def varlen_block_causal_attention(query, key, value, offsets, scale):
+    output = torch.empty((*query.shape[:-1], value.shape[-1]), dtype=query.dtype)
+    for sequence in range(offsets.numel() - 1):
+        begin, end = int(offsets[sequence]), int(offsets[sequence + 1])
+        tensors = tuple(tensor[begin:end].unsqueeze(0) for tensor in (query, key, value))
+        output[begin:end] = block_causal_attention(*tensors, scale)[0]
+    return output
+
+
+def native_sparse_attention(query, key, value, selected_blocks, scale):
+    output = torch.empty((*query.shape[:-1], value.shape[-1]), dtype=query.dtype)
+    heads_per_group = query.shape[2] // key.shape[2]
+    for batch in range(query.shape[0]):
+        for group in range(key.shape[2]):
+            heads = slice(group * heads_per_group, (group + 1) * heads_per_group)
+            for begin in range(0, query.shape[1], 16):
+                end = min(begin + 16, query.shape[1])
+                blocks = selected_blocks[batch, begin:end, group].long()
+                positions = (blocks[..., None] * 64 + torch.arange(64)).flatten(1)
+                valid = ((positions >= 0) & (positions < key.shape[1])
+                         & (positions <= torch.arange(begin, end)[:, None]))
+                safe = positions.masked_fill(~valid, 0)
+                keys, values = key[batch, safe, group].float(), value[batch, safe, group].float()
+                scores = (query[batch, begin:end, heads].float() @ keys.transpose(-1, -2)) * scale
+                scores.masked_fill_(~valid[:, None, :], float('-inf'))
+                active = valid.any(-1)[:, None, None]
+                probability = torch.softmax(torch.where(active, scores, 0.0), dim=-1)
+                result = probability @ values
+                output[batch, begin:end, heads] = torch.where(active, result, 0.0).to(query.dtype)
+    return output
+
+
 def swiglu(gate, up):
     values = gate.float()
     sigmoid = 1.0 / (1.0 + torch.exp(-values))
