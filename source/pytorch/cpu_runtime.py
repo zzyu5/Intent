@@ -183,6 +183,49 @@ def flash_varlen_gqa_prefill(query, key, value, sequence_lengths, offsets, scale
     return output
 
 
+def _masked_attention_prefill(query, key, value, valid, scale, *, soft_cap=0.0, sinks=None):
+    output = torch.empty((*query.shape[:-1], value.shape[-1]), dtype=query.dtype)
+    group = query.shape[1] // key.shape[1]
+    for batch in range(query.shape[0]):
+        keys = key[batch].repeat_interleave(group, dim=0).float()
+        values = value[batch].repeat_interleave(group, dim=0).float()
+        for begin in range(0, query.shape[2], 128):
+            end = min(begin + 128, query.shape[2])
+            scores = (query[batch, :, begin:end].float() @ keys.transpose(-1, -2)) * scale
+            if soft_cap > 0.0:
+                scores = torch.tanh(scores / soft_cap) * soft_cap
+            scores.masked_fill_(~valid[begin:end], float('-inf'))
+            if sinks is not None:
+                sink = sinks.float()[:, None, None].expand(-1, end - begin, 1)
+                scores = torch.cat((scores, sink), dim=-1)
+            probability = torch.softmax(scores, dim=-1)[..., :key.shape[2]]
+            output[batch, :, begin:end] = (probability @ values).to(query.dtype)
+    return output
+
+
+def attention_sink_prefill(query, key, value, sinks, scale):
+    valid = torch.arange(key.shape[2])[None, :] <= torch.arange(query.shape[2])[:, None]
+    return _masked_attention_prefill(query, key, value, valid, scale, sinks=sinks)
+
+
+def attention_sink_decode(query, key, value, sinks, start, scale):
+    valid = torch.arange(key.shape[1])[None, :] <= start[0]
+    return _masked_attention_prefill(query.unsqueeze(2), key.transpose(1, 2), value.transpose(1, 2),
+                                     valid, scale, sinks=sinks).squeeze(2)
+
+
+def gemma_gqa_prefill(query, key, value, scale):
+    rows, columns = torch.arange(query.shape[2])[:, None], torch.arange(key.shape[2])[None, :]
+    valid = (columns <= rows) & (columns >= rows - 1024)
+    return _masked_attention_prefill(query, key, value, valid, scale, soft_cap=50.0)
+
+
+def sliding_window_gqa_prefill(query, key, value, scale):
+    rows, columns = torch.arange(query.shape[2])[:, None], torch.arange(key.shape[2])[None, :]
+    valid = (columns <= rows) & (columns > rows - 1024)
+    return _masked_attention_prefill(query, key, value, valid, scale)
+
+
 def swiglu(gate, up):
     values = gate.float()
     sigmoid = 1.0 / (1.0 + torch.exp(-values))

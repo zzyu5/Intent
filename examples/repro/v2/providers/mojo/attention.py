@@ -4,6 +4,8 @@ import intent
 import torch
 
 from kernels.streaming.attention_specialized import gemma_gqa_decode_partials
+from kernels.streaming.attention_specialized import attention_sink_prefill, attention_sink_decode_partials
+from kernels.streaming.attention_specialized import gemma_gqa_prefill, sliding_window_gqa_prefill
 from kernels.streaming.attention_f32 import causal_attention_f32, causal_linear_attention_f32
 from kernels.streaming.attention import flash_attention_bf16_fwd
 from kernels.streaming.attention import flash_attention_fwd, flash_gqa_attention_fwd
@@ -390,6 +392,63 @@ def block_sparse_gqa_decode(context: Context) -> PreparedComparison:
     )
 
 
+def sink_prefill(context):
+    q = torch.randn((1, 32, 4096, 128), dtype=torch.bfloat16)
+    k = torch.randn((1, 8, 4096, 128), dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    sinks = torch.randn((32,), dtype=torch.bfloat16)
+    return prepare_host_comparison(context, attention_sink_prefill, (q, k, v, sinks, 128**-0.5),
+        "attention_sink_prefill", Tolerance(atol=5e-2, rtol=2e-2), constexprs={"HEAD_GROUP": 4},
+        note="原BF16 causal sink prefill，sink只贡献softmax denominator；生成端保留BF16概率转换，CPU数学reference使用f32概率，最终均BF16，原容差。")
+
+
+def sink_decode(context):
+    q = torch.randn((32, 32, 128), dtype=torch.bfloat16)
+    k = torch.randn((32, 8192, 8, 128), dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    sinks = torch.randn((32,), dtype=torch.bfloat16)
+    start = torch.tensor([8191], dtype=torch.int32)
+    report_stage("generated_compilation")
+    partials = intent.compile(attention_sink_decode_partials, target=context.target, compiler=context.compiler,
+                              tuning_config=context.tuning_config, constexprs={"HEAD_GROUP": 4, "WINDOW": 0, "P": 32})
+    reduction = intent.compile(splitk_attention_reduce, target=context.target, compiler=context.compiler,
+                               tuning_config=context.tuning_config)
+    runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_reference")
+    generated, source = {}, {}
+
+    def launch():
+        lse, partial = partials.run(q, k, v, sinks, start, 128**-0.5)
+        generated["output"] = reduction.run(partial, lse).reshape(32, 1, 4096)
+
+    def reference():
+        source["output"] = runtime.attention_sink_decode(q, k, v, sinks, start, 128**-0.5).reshape(32, 1, 4096)
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(PreparedLaunch(launch, lambda: generated["output"]),
+        PreparedLaunch(reference, lambda: source["output"]), Tolerance(atol=1e-1, rtol=5e-2),
+        cuda_graph=False, device_type="cpu", cpu_host_timing=True,
+        note="原BF16 sink decode B32/S8192/HQ32/HK8/D128、start8191、split256/P32；完整partial+reduce含workspace分配，生成LSEf32/partial BF16；CPU数学reference f32 softmax，最终BF16，原容差。")
+
+
+def gemma_prefill(context):
+    q = torch.randn((2, 32, 4096, 128), dtype=torch.bfloat16)
+    k = torch.randn((2, 8, 4096, 128), dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    return prepare_host_comparison(context, gemma_gqa_prefill, (q, k, v, 128**-0.5),
+        "gemma_gqa_prefill", Tolerance(atol=5e-2, rtol=2e-2),
+        constexprs={"HEAD_GROUP": 4, "WINDOW": 1024, "SOFT_CAP": 50.0},
+        note="原BF16 Gemma causal/window1024 inclusive/softcap50；生成端保留近似tanh和BF16概率，CPU数学reference使用f32 tanh/概率，最终BF16，原容差。")
+
+
+def sliding_window_prefill(context):
+    q = torch.randn((2, 32, 4096, 128), dtype=torch.float16)
+    k = torch.randn((2, 8, 4096, 128), dtype=torch.float16)
+    v = torch.randn_like(k)
+    return prepare_host_comparison(context, sliding_window_gqa_prefill, (q, k, v, 128**-0.5),
+        "sliding_window_gqa_prefill", Tolerance(atol=5e-2, rtol=2e-2),
+        constexprs={"HEAD_GROUP": 4, "WINDOW": 1024}, note=F16_PRECISION_NOTE)
+
+
 CASES = {
     "causal_attention_f32": causal_attention,
     "causal_linear_attention_f32": causal_linear_attention,
@@ -400,6 +459,10 @@ CASES = {
     "flash_varlen_gqa_prefill": varlen_gqa_prefill,
     "flash_attention_bias": biased_attention,
     "flash_varlen_attention": varlen_attention,
+    "attention_sink_prefill": sink_prefill,
+    "attention_sink_decode": sink_decode,
+    "gemma_gqa_prefill": gemma_prefill,
+    "sliding_window_gqa_prefill": sliding_window_prefill,
     "gemma_decode": gemma_decode,
     "paged_gqa_decode": paged_gqa_decode,
     "block_sparse_gqa_decode": block_sparse_gqa_decode,
