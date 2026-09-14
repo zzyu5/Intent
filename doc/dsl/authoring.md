@@ -4,13 +4,13 @@
 
 ## 类型、literal 与 shape
 
-在 kernel 中使用 `import intent.language as I`。`I.In/I.Out/I.InOut` 描述外部 views，`I.f32` 等描述 scalar dtype；Python literal 可按上下文实例化，但两个不同 dtype 的 runtime values 必须显式 `I.cast`。例如先把 bf16 输入 cast 到 f32，再和 f32 累加器计算，最后 cast 回输出 dtype。
+在 kernel 中使用 `import intent.language as I`。`I.In/I.Out/I.InOut` 描述外部 views，必须同时给出 dtype 和 shape，例如 `I.In[I.f32, ("M", "N")]`；rank-0 view 的 shape 写 `()`。`I.f32` 等描述 scalar dtype；Python literal 可按上下文实例化，但两个不同 dtype 的 runtime values 必须显式 `I.cast`。例如先把 bf16 输入 cast 到 f32，再和 f32 累加器计算，最后 cast 回输出 dtype。
 
 Literal 首次形成 runtime value 时若没有 expected dtype，Python `bool/int/float` 分别采用 `bool/i64/f64`。需要 f32 的循环状态可用 `I.cast(1.0, I.f32)` 初始化；后续使用不会反向改变它的 dtype。
 
 `I.select` 的 bool 条件不提供数值分支的 expected dtype。两个分支都写成 literal 时，不要从生成条件的 tensor 推断结果 dtype；例如需要 f32 符号值时写 `I.cast(I.select(mask, -1.0, 1.0), I.f32)`。已经产生的 runtime value 不会因后续与 f32 相乘而重新实例化。
 
-Tensor 和 view 有 `.shape`；scalar、tuple、record、domain 没有统一 `.shape`。`I.full(shape, fill, dtype)` 产生 tensor value，不分配跨 kernel workspace。`I.dot` 只接受两个 rank-1 tensor，返回 rank-0 tensor `[]`，不是 rank-1 `[1]` 或一个 Python number。Scalar 和 rank-0 tensor 是不同类型；需要将 scalar 放入 rank-0 tensor 的分支或 carry schema 时，可用 `I.full((), value, dtype=...)` 显式构造。Pointwise scalar broadcast 由 frontend 显式表达。
+Tensor 和 view 有 `.shape`；scalar、tuple、record、domain 没有统一 `.shape`。`I.full(shape, fill, dtype)` 产生 tensor value，不分配跨 kernel workspace。`I.dot(lhs, rhs, acc_dtype=...)` 必须显式指定累加 dtype，只接受两个 rank-1 tensor，返回 rank-0 tensor `[]`，不是 rank-1 `[1]` 或一个 Python number。Scalar 和 rank-0 tensor 是不同类型；需要将 scalar 放入 rank-0 tensor 的分支或 carry schema 时，可用 `I.full((), value, dtype=...)` 显式构造。Pointwise scalar broadcast 由 frontend 显式表达。
 
 ## Domain、index 与 broadcast
 
@@ -22,7 +22,7 @@ Pointwise 按尾部对齐，允许 scalar/size-one broadcast。`[M]` 与 `[M,N]`
 
 Domain 索引按资源索引顺序形成读取结果的 tensor axes，赋值仍按 positional axes 对齐，不按 domain 变量名自动换轴。例如两个等长 domains 下，`output[rows, columns] = input[columns, rows]` 不表示矩阵转置；应显式转置读取的 tensor value，或构造具有所需对应关系的坐标 tensor。不同 subregions 的动态长度也不会因本次输入碰巧等长而成为同一 extent；需要使用已成立的 shape relation，或在共同输出 domain 上表达坐标映射。
 
-多个 tensor indices 按 broadcast 规则形成共同的索引 shape；domain index 则引入独立的 logical axis。例如二维逐元素按第 0 轴 gather，使用 `index=(indices[rows, columns], I.reshape(I.indices(columns), (1, N)))`。这里第二项是可广播的列坐标 tensor，直接传 `columns` domain 会额外引入一个轴。
+多个 tensor indices 按 broadcast 规则形成共同的索引 shape，坐标逐位置配对，不自动形成 Cartesian product；domain index 则引入独立的 logical axis。例如二维逐元素按第 0 轴 gather，使用 `index=(indices[rows, columns], I.reshape(I.indices(columns), (1, N)))`。这里第二项是可广播的列坐标 tensor，直接传 `columns` domain 会额外引入一个轴。
 
 ## Reduce、tuple 与 helpers
 
