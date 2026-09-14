@@ -1,5 +1,6 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
@@ -9,6 +10,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Dominance.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
@@ -1094,29 +1096,78 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
                  << ", tail_count=" << tailPredicates.size();
       return failure();
     }
-    auto sourceType = cast<FragmentType>(source->getType());
-    Value tail;
-    for (Value base : tailPredicates) {
-      FailureOr<Value> current = predicateForReductionSource(
-          builder, reduce.getLoc(), base, sourceType,
-          static_cast<unsigned>(reductionAxis));
-      if (failed(current))
-        return failure();
-      tail = tail ? Value(builder.create<BinaryOp>(
-                        reduce.getLoc(), current->getType(), tail, *current,
-                        BinaryOperator::LogicalAnd))
-                  : *current;
-    }
-    Value identity =
-        reduce.getInputs()[reduce.getSourceCount() + component];
-    if (identity.getType() != sourceType)
-      identity = builder.create<BroadcastOp>(reduce.getLoc(), sourceType, identity);
-    Value selected = builder.create<SelectOp>(reduce.getLoc(), sourceType, tail,
-                                              *source, identity);
-    reduce->setOperand(component, selected);
+    reduce->setOperand(component, *source);
   }
   eraseDeadPhysicalValues(kernel);
   return true;
+}
+
+LogicalResult neutralizeReductionTails(ReduceOp reduce, func::FuncOp kernel) {
+  if (reduce.getAxes().size() != 1)
+    return success();
+  unsigned axis = reduce.getAxes().front();
+  DominanceInfo dominance(kernel);
+  for (unsigned component = 0; component < reduce.getSourceCount(); ++component) {
+    Value source = reduce.getInputs()[component];
+    auto type = dyn_cast<FragmentType>(source.getType());
+    if (!type || axis >= type.getShape().size())
+      continue;
+    PhysicalProgramAnalysis analysis(kernel);
+    PhysicalRangeFact ranges = analysis.axisRanges(source, axis);
+    auto constant = [](Value value) -> std::optional<int64_t> {
+      auto expression = queryLaunchExpression(value);
+      return expression ? constantPhysicalExpression(expression) : std::nullopt;
+    };
+    bool needsTail = llvm::any_of(ranges.roots, [&](MakeRangeOp range) {
+      if (range.getResult().getType().getShape()[0] != type.getShape()[axis])
+        return false;
+      auto start = constant(range.getLogicalStart());
+      auto stop = constant(range.getLogicalStop());
+      auto extent = constant(range.getExtent());
+      return !isUnitStepRange(range) || !start || !stop || !extent ||
+             !samePhysicalScalarExpression(range.getStart(), range.getLogicalStart()) ||
+             static_cast<__int128>(*stop) - *start != *extent;
+    });
+    if (!needsTail)
+      continue;
+    if ((!ranges.isExact() && !analysis.lockstepRanges(ranges.roots).isExact()) ||
+        !ranges.blockers.empty())
+      return reduce.emitOpError(
+          "padded reduction has no exact logical member traversal");
+    OpBuilder builder(reduce);
+    Value tail;
+    for (MakeRangeOp range : ranges.roots) {
+      if (range.getResult().getType().getShape()[0] != type.getShape()[axis])
+        continue;
+      if (!isUnitStepRange(range) ||
+          !dominance.dominates(range.getOperation(), reduce.getOperation()))
+        return reduce.emitOpError(
+            "padded reduction has no dominating coordinate predicate");
+      auto coordinates = range.getResult().getType();
+      auto predicate = FragmentType::get(kernel.getContext(), builder.getI1Type(),
+          coordinates.getShape(), coordinates.getAxisMaps(),
+          coordinates.getValidity(), coordinates.getOwner());
+      Value end = builder.create<SplatOp>(reduce.getLoc(), coordinates,
+                                          range.getLogicalStop());
+      Value valid = builder.create<CompareOp>(reduce.getLoc(), predicate,
+          range.getResult(), end, ComparePredicate::Lt);
+      auto projected = predicateForReductionSource(builder, reduce.getLoc(), valid,
+                                                   type, axis);
+      if (failed(projected))
+        return reduce.emitOpError("reduction tail has no physical axis projection");
+      tail = tail ? Value(builder.create<BinaryOp>(reduce.getLoc(), projected->getType(),
+                     tail, *projected, BinaryOperator::LogicalAnd)) : *projected;
+    }
+    if (!tail)
+      continue;
+    Value identity = reduce.getInputs()[reduce.getSourceCount() + component];
+    auto projected = projectPhysicalValueToSchema(builder, reduce.getLoc(), identity, type);
+    if (failed(projected))
+      return reduce.emitOpError("reduction identity cannot neutralize physical padding");
+    reduce->setOperand(component, builder.create<SelectOp>(
+        reduce.getLoc(), type, tail, source, *projected).getResult());
+  }
+  return success();
 }
 
 FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
@@ -2671,9 +2722,15 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                 reduce.getContext(), nested.getI1Type(), blockedRoot.getShape(),
                 blockedRoot.getAxisMaps(), blockedRoot.getValidity(),
                 blockedRoot.getOwner());
-            Value valid = nested.create<BroadcastOp>(nestedLocation,
-                                                     rootPredicate,
-                                                     coordinateValid);
+            auto projectedValid = predicateForReductionSource(
+                nested, nestedLocation, coordinateValid, rootPredicate,
+                access.fragmentAxis);
+            if (failed(projectedValid)) {
+              bodyFailed = true;
+              bodyFailure = "source tail cannot adopt its reduction axis";
+              return;
+            }
+            Value valid = *projectedValid;
             auto replayAccessValue = [&](Value value) -> FailureOr<Value> {
               ReplayMaterializationOptions accessOptions = replayOptions;
               if (auto type = dyn_cast<FragmentType>(value.getType())) {
@@ -2728,10 +2785,35 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
               fill = *zero;
             }
             SmallVector<Value> coordinates(load.getCoordinates());
-            for (Value &coordinate : coordinates) {
-              FailureOr<Value> replayedCoordinate = materializeReplayedValue(
-                  nested, nestedLocation, coordinate, plan.sourceIdentity,
-                  chunkExtent, mapping, replayOptions);
+            bool cartesian = static_cast<size_t>(llvm::count_if(coordinates, [](Value coordinate) {
+              return isa<FragmentType>(coordinate.getType());
+            })) == rootType.getShape().size() &&
+                llvm::all_of(coordinates, [](Value coordinate) {
+                  auto type = dyn_cast<FragmentType>(coordinate.getType());
+                  return !type || type.getShape().size() == 1;
+                });
+            for (unsigned coordinateIndex = 0;
+                 coordinateIndex < coordinates.size(); ++coordinateIndex) {
+              Value &coordinate = coordinates[coordinateIndex];
+              auto originalType = dyn_cast<FragmentType>(coordinate.getType());
+              std::optional<unsigned> coordinateAxis;
+              if (originalType) {
+                if (cartesian) {
+                  if (coordinateIndex != access.coordinateIndex)
+                    continue;
+                  coordinateAxis = 0;
+                } else {
+                  auto relation = queryAxisProjection(originalType, rootType);
+                  if (relation.isExact())
+                    coordinateAxis = relation.targetToSource[access.fragmentAxis];
+                }
+              }
+              ReplayMaterializationOptions coordinateOptions = replayOptions;
+              coordinateOptions.fragmentAxis = coordinateAxis;
+              FailureOr<Value> replayedCoordinate = cartesian
+                  ? materializeReplayedValue(nested, nestedLocation, coordinate,
+                        plan.sourceIdentity, chunkExtent, mapping, coordinateOptions)
+                  : replayAccessValue(coordinate);
               if (failed(replayedCoordinate)) {
                 bodyFailed = true;
                 bodyFailure = "could not replay source coordinate";
@@ -2740,12 +2822,10 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
               coordinate = *replayedCoordinate;
               auto coordinateType =
                   dyn_cast<FragmentType>(coordinate.getType());
-              PhysicalAxisProjection projection = queryFragmentAxis(
-                  coordinate.getType(), sourceAxisIdentity(range));
-              if (coordinateType && projection.isExact()) {
+              if (coordinateType && coordinateAxis) {
                 FailureOr<Value> projected = materializeBroadcastToFragment(
                     nested, nestedLocation, coordinate,
-                    replaceExtent(coordinateType, projection.fragmentAxis,
+                    replaceExtent(coordinateType, *coordinateAxis,
                                   chunkExtent));
                 if (failed(projected)) {
                   bodyFailed = true;
@@ -2760,9 +2840,17 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                 nestedLocation, blockedRoot, load.getResource(), coordinates,
                 valid, fill, load.getSourceAxes());
             mapping.map(load.getResult(), blockedLoad);
-            if (!sourceTail)
-              sourceTail = nested.create<BroadcastOp>(
-                  nestedLocation, blockedPredicate, coordinateValid);
+            if (!sourceTail) {
+              auto tail = predicateForReductionSource(
+                  nested, nestedLocation, coordinateValid, blockedPredicate,
+                  plan.reductionAxis);
+              if (failed(tail)) {
+                bodyFailed = true;
+                bodyFailure = "source tail cannot adopt the producer reduction axis";
+                return;
+              }
+              sourceTail = *tail;
+            }
           }
           replayOptions.fragmentAxis = plan.reductionAxis;
           FailureOr<Value> replayed = materializeReplayedValue(
@@ -3332,8 +3420,11 @@ LogicalResult realizeReductionBlocking(ModuleOp module) {
     if (reduce.getAxes().size() > 1)
       return reduce.emitOpError(
           "reduction blocking requires prior multi-axis normalization");
-    if (reduce->getBlock() && failed(realizeReduce(reduce, kernel)))
-      return failure();
+    if (reduce->getBlock()) {
+      if (failed(neutralizeReductionTails(reduce, kernel)) ||
+          failed(realizeReduce(reduce, kernel)))
+        return failure();
+    }
   }
   return success();
 }

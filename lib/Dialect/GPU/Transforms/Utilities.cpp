@@ -2338,6 +2338,19 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
         bool sourceParameter =
             isParameterExtent(source.getShape()[*sourceAxis]);
         bool targetParameter = isParameterExtent(targetExtent);
+        if (!sourceParameter && !targetParameter) {
+          PhysicalProgramAnalysis analysis(kernel);
+          auto input = analysis.axisRealization(broadcast.getValue(), *sourceAxis);
+          auto output = analysis.axisRealization(broadcast.getResult(), targetAxis);
+          if (input.hasExtentAuthority() && !input.constructionScalarSeed &&
+              !output.hasExtentAuthority()) {
+            auto targetMap = cast<AxisMapAttr>(target.getAxisMaps()[targetAxis]);
+            retargetSourceExtent(broadcast.getResult(),
+                                 sourceAxisIdentity(targetMap), sourceExtent);
+            target = cast<FragmentType>(broadcast.getResult().getType());
+            continue;
+          }
+        }
         if (sourceParameter == targetParameter) {
           broadcast.emitOpError(
               "broadcast has conflicting non-singleton physical extents")

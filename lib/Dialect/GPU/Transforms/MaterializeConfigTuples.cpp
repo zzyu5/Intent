@@ -658,16 +658,22 @@ void bindContractionFreeExtents(
   }
 }
 
-LogicalResult bindPointwiseTraversalFootprints(
+LogicalResult bindTraversalFragmentFootprints(
     func::FuncOp kernel, ArrayRef<ParameterOp> parameters,
     NamedAttrList &bindings, Builder &builder) {
   auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   if (!capabilities || capabilities.getRegistersPerUnit() <= 0)
     return success();
   for (ParameterOp parameter : parameters) {
-    if (!parameter->hasAttr(pointwiseChunkAttr))
-      continue;
     auto schema = parameter.getParameter();
+    auto category = static_cast<ParameterCategory>(schema.getCategory());
+    auto role = static_cast<ParameterRole>(schema.getRole());
+    bool reduction = category == ParameterCategory::Reduction &&
+                     (role == ParameterRole::Reduction ||
+                      role == ParameterRole::ReductionInner ||
+                      role == ParameterRole::ReductionOuter);
+    if (!parameter->hasAttr(pointwiseChunkAttr) && !reduction)
+      continue;
     llvm::SmallDenseSet<FragmentType> fragments;
     kernel.walk([&](Operation *operation) {
       for (Value value : operation->getResults())
@@ -988,8 +994,8 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
       bindings.set(schema.getName(), builder.getI64IntegerAttr(selected));
     }
     bindContractionFreeExtents(freeExtents, bindings, profileFor, builder);
-    if (failed(bindPointwiseTraversalFootprints(kernel, parameters, bindings,
-                                                builder))) {
+    if (failed(bindTraversalFragmentFootprints(kernel, parameters, bindings,
+                                               builder))) {
       invalidFootprint = true;
       return;
     }
@@ -1042,7 +1048,7 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
   }
   if (invalidFootprint && tuples.empty())
     return kernel.emitOpError(
-        "pointwise traversal has no profile within the fragment register budget");
+        "physical traversal has no profile within the fragment register budget");
   if (tuples.empty())
     tuples.push_back(builder.getDictionaryAttr({}));
   kernel->setAttr(sharedConfigTuplesAttr, builder.getArrayAttr(tuples));

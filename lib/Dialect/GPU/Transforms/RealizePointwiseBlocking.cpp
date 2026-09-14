@@ -740,12 +740,17 @@ FragmentType predicateType(FragmentType source) {
                            source.getOwner());
 }
 
-bool tailPredicateProjectsTo(FragmentType target, MakeRangeOp range) {
-  if (range->hasAttr(sourceSubregionAttr))
-    return queryFragmentAxis(target, sourceAxisIdentity(range)).isExact();
+FailureOr<unsigned> tailPredicateAxis(FragmentType target, MakeRangeOp range) {
+  if (range->hasAttr(sourceSubregionAttr)) {
+    auto axis = queryFragmentAxis(target, sourceAxisIdentity(range));
+    return axis.isExact() ? FailureOr<unsigned>(axis.fragmentAxis)
+                          : FailureOr<unsigned>(failure());
+  }
   FailureOr<int64_t> dimension = queryRangeDimension(range);
-  return succeeded(dimension) &&
-         queryFragmentDimension(target, *dimension).isExact();
+  auto axis = succeeded(dimension) ? queryFragmentDimension(target, *dimension)
+                                   : PhysicalDimensionProjection{};
+  return axis.isExact() ? FailureOr<unsigned>(axis.fragmentAxis)
+                        : FailureOr<unsigned>(failure());
 }
 
 void collectCoordinateRanges(Value coordinate,
@@ -777,7 +782,22 @@ FailureOr<Value> accessValidity(OpBuilder &builder, Location location,
       return failure();
     result = *broadcast;
   }
+  SmallVector<Value> fragmentCoordinates;
+  for (Value coordinate : coordinates)
+    if (isa<FragmentType>(coordinate.getType()))
+      fragmentCoordinates.push_back(coordinate);
+  bool cartesian = fragmentCoordinates.size() == target.getShape().size() &&
+      llvm::all_of(fragmentCoordinates, [](Value coordinate) {
+        return cast<FragmentType>(coordinate.getType()).getShape().size() == 1;
+      });
+  unsigned fragmentAxis = 0;
   for (Value coordinate : coordinates) {
+    std::optional<unsigned> positionalAxis;
+    if (isa<FragmentType>(coordinate.getType())) {
+      if (cartesian)
+        positionalAxis = fragmentAxis;
+      ++fragmentAxis;
+    }
     llvm::SmallPtrSet<Operation *, 8> ranges;
     collectCoordinateRanges(coordinate, ranges);
     for (Operation *operation : ranges) {
@@ -785,11 +805,14 @@ FailureOr<Value> accessValidity(OpBuilder &builder, Location location,
       if (!range)
         continue;
       auto found = rangePredicates.find(range.getResult());
-      if (found == rangePredicates.end() ||
-          !tailPredicateProjectsTo(target, range))
+      if (found == rangePredicates.end())
         continue;
-      FailureOr<Value> broadcast =
-          materializeBroadcastToFragment(builder, location, found->second, target);
+      FailureOr<unsigned> axis = positionalAxis ? FailureOr<unsigned>(*positionalAxis)
+                                                : tailPredicateAxis(target, range);
+      if (failed(axis))
+        continue;
+      FailureOr<Value> broadcast = projectPredicateToFragmentAxis(
+          builder, location, found->second, target, *axis);
       if (failed(broadcast))
         return failure();
       result = result ? Value(builder.create<BinaryOp>(
@@ -3618,6 +3641,14 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       dynamicRanges.push_back(range);
       return;
     }
+    auto fragment = cast<FragmentType>(range.getResult().getType());
+    auto extent = cast<PhysicalExprAttr>(fragment.getShape()[0]);
+    auto fixedExtent = constantPhysicalExpression(extent);
+    if (!ownershipOnly && fixedExtent && *fixedExtent > 0 &&
+        !llvm::isPowerOf2_64(*fixedExtent) && isUnitStepRange(range)) {
+      dynamicRanges.push_back(range);
+      return;
+    }
     if (!ownershipOnly ||
         !range.getExtent().getDefiningOp<arith::ConstantIndexOp>())
       return;
@@ -3625,8 +3656,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       dynamicRanges.push_back(range);
       return;
     }
-    auto fragment = cast<FragmentType>(range.getResult().getType());
-    auto extent = cast<PhysicalExprAttr>(fragment.getShape()[0]);
     if (extent.getKind() ==
             static_cast<uint32_t>(PhysicalExprKind::Constant) &&
         extent.getValue() > 1)
@@ -4167,6 +4196,23 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                              physicalExtent);
         fragment = cast<FragmentType>(range.getResult().getType());
       }
+      auto fixedExtent = constantPhysicalExpression(physicalExtent);
+      if (fixedExtent && *fixedExtent > 0 &&
+          !llvm::isPowerOf2_64(*fixedExtent) &&
+          isUnitStepRange(range)) {
+        uint64_t padded = llvm::PowerOf2Ceil(
+            static_cast<uint64_t>(*fixedExtent));
+        if (padded > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+          return range.emitOpError("static fragment padding exceeds index range");
+        physicalExtent = expression(kernel.getContext(),
+                                    PhysicalExprKind::Constant, padded);
+        auto dimension = queryRangeDimension(range);
+        if (succeeded(dimension))
+          retargetDimensionExtent(range.getResult(), *dimension, physicalExtent);
+        else
+          retargetSourceExtent(range.getResult(), sourceAxisIdentity(range), physicalExtent);
+        fragment = cast<FragmentType>(range.getResult().getType());
+      }
       const bool fixedSubregion =
           range->hasAttr(sourceSubregionAttr) &&
           physicalExtent.getKind() ==
@@ -4639,7 +4685,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       for (MakeRangeOp range : ranges) {
         auto [found, inserted] = resultAxes.try_emplace(range.getOperation(), axis);
         if (!inserted && found->second != axis) {
-          store.emitOpError("Cartesian pointwise axes require independent producer ranges");
+          store.emitOpError("Cartesian pointwise axes require independent producer ranges")
+              << "; first_axis=" << found->second << "; second_axis=" << axis
+              << "; shared_range=" << range.getResult();
           return WalkResult::interrupt();
         }
       }
