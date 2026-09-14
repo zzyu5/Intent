@@ -1097,6 +1097,26 @@ def linear_attention_forward(q, k, v, scale):
     return output.permute(0, 2, 3, 1, 4).reshape(batch, sequence, heads, value.shape[-1]), final
 
 
+def mamba_chunk_state_bf16_fwd(state_basis, x, dt, cumulative_decay):
+    batch, sequence, heads, dimension = x.shape
+    chunks, chunk = dt.shape[-2:]
+    basis = state_basis.repeat_interleave(heads // state_basis.shape[2], dim=2)
+    basis = basis.reshape(batch, chunks, chunk, heads, state_basis.shape[-1])
+    scale = (cumulative_decay[..., -1:] - cumulative_decay).clamp_max(0.0).exp() * dt
+    scaled = (basis.float() * scale.permute(0, 2, 3, 1)[..., None]).to(x.dtype).float()
+    values = x.float().reshape(batch, chunks, chunk, heads, dimension)
+    return torch.einsum("bclhp,bclhn->bchpn", values, scaled)
+
+
+def mamba_state_passing_fwd(chunk_states, chunk_decay, initial_states):
+    state = initial_states.clone()
+    previous = torch.empty_like(chunk_states)
+    for chunk in range(chunk_states.shape[1]):
+        previous[:, chunk] = state
+        state = chunk_decay[:, :, chunk].exp()[..., None] * state + chunk_states[:, chunk]
+    return previous, state
+
+
 def moe_expert_ffn(x, route_offsets, member_routes, route_token, route_weights, w1, w2, y):
     for expert in range(w1.shape[0]):
         routes = member_routes[route_offsets[expert]:route_offsets[expert + 1]].long()

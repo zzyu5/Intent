@@ -7,17 +7,20 @@ import torch
 from kernels.streaming.gated_delta import recurrent_gated_delta_fwd
 from kernels.streaming.linear_attention import fused_chunk_linear_attention_fwd
 from kernels.streaming.mamba import mamba_chunk_state_fwd
+from kernels.streaming.mamba import mamba_chunk_state_bf16_fwd, mamba_state_passing_fwd
+from kernels.streaming.mamba import mamba3_siso_step, mamba3_siso_forward
 from kernels.streaming.online_softmax import streamed_online_softmax_f16
 from kernels.streaming.online_softmax import streamed_online_softmax
 from kernels.streaming.selective_scan import (
     BATCH as SELECTIVE_SCAN_BATCH,
     LENGTH as SELECTIVE_SCAN_LENGTH,
     mamba_chunk_scan_fwd,
+    mamba_chunk_scan_bf16_fwd,
     selective_state_scan,
 )
 
 from ...model import Context, PreparedComparison, Tolerance
-from .common import configure_cpu_budget, prepare_host_comparison
+from .common import configure_cpu_budget, prepare_host_comparison, prepare_host_run_only
 
 
 def selective_scan(context: Context) -> PreparedComparison:
@@ -181,6 +184,77 @@ def linear_attention(context: Context) -> PreparedComparison:
     )
 
 
+def mamba_chunk_state_bf16(context):
+    x = torch.randn((1, 2048, 32, 64), dtype=torch.bfloat16)
+    basis = torch.randn((1, 2048, 8, 128), dtype=torch.bfloat16)
+    dt = torch.rand((1, 32, 8, 256), dtype=torch.float32) * 0.01
+    decay = -torch.rand_like(dt).cumsum(-1) * 0.01
+    return prepare_host_comparison(context, mamba_chunk_state_bf16_fwd, (basis, x, dt, decay),
+        "mamba_chunk_state_bf16_fwd", Tolerance(atol=2e-2, rtol=2e-2), constexprs={"HEAD_GROUP": 4},
+        note="原BF16 chunk-state生产输入，dt/decay及输出f32；双方保留scaled basis的bf16转换，沿用原容差。")
+
+
+def mamba_state_passing(context):
+    states = torch.randn((1, 8, 32, 8192), dtype=torch.float32) * 0.01
+    decay = -torch.rand((1, 32, 8), dtype=torch.float32) * 0.1
+    initial = torch.zeros((1, 32, 8192), dtype=torch.float32)
+    return prepare_host_comparison(context, mamba_state_passing_fwd, (states, decay, initial),
+        "mamba_state_passing_fwd", (Tolerance(atol=1e-5, rtol=1e-5), Tolerance(atol=1e-5, rtol=1e-5)))
+
+
+def mamba_chunk_scan_bf16(context):
+    x = torch.randn((1, 2048, 32, 64), dtype=torch.bfloat16)
+    state_matrix = torch.randn((1, 2048, 8, 128), dtype=torch.bfloat16)
+    cb = torch.randn((1, 8, 8, 256, 256), dtype=torch.bfloat16) * 0.01
+    dt = torch.rand((1, 32, 8, 256), dtype=torch.float32) * 0.01
+    decay = -torch.rand_like(dt).cumsum(-1) * 0.01
+    previous = torch.randn((1, 8, 32, 64, 128), dtype=torch.float32) * 0.01
+    residual = torch.randn((32,), dtype=torch.float32) * 0.01
+    return prepare_host_comparison(context, mamba_chunk_scan_bf16_fwd,
+        (cb, x, dt, decay, state_matrix, previous, residual), "mamba_chunk_scan_fwd",
+        Tolerance(atol=1e-1, rtol=5e-2), constexprs={"HEADS_PER_GROUP": 4},
+        note="原BF16 chunk-scan生产输入与f32 dt/decay/previous；生成端保留previous与scan coefficient的bf16转换，CPU数学reference以f32计算，最终均bf16，沿用原容差。")
+
+
+def mamba3_step(context):
+    query = torch.randn((32, 4, 32), dtype=torch.bfloat16) * 0.1
+    key = torch.randn_like(query) * 0.1
+    value = torch.randn((32, 16, 64), dtype=torch.bfloat16) * 0.1
+    adt = -torch.rand((32, 16), dtype=torch.float32) * 0.1
+    dt, trap = torch.rand_like(adt) * 0.1, torch.rand_like(adt) * 0.1
+    query_bias = torch.randn((16, 32), dtype=torch.bfloat16) * 0.01
+    key_bias = torch.randn_like(query_bias) * 0.01
+    angles = torch.randn((32, 16, 16), dtype=torch.float32) * 0.01
+    residual = torch.randn((16,), dtype=torch.float32) * 0.01
+    gate = torch.randn_like(value) * 0.1
+    states = tuple(torch.zeros(shape, dtype=torch.float32) for shape in
+                   ((32, 16, 16), (32, 16, 64, 32), (32, 16, 32), (32, 16, 64)))
+    return prepare_host_run_only(context, mamba3_siso_step,
+        (query, key, value, adt, dt, trap, query_bias, key_bias, angles, residual, gate, *states),
+        constexprs={"HEAD_GROUP": 4},
+        note="原Mamba3 step B32/H16/QKH4/DQK32/DV64 BF16输入、四个零初始f32状态；原source标记semantics gap，无可比CPU reference，仅运行完整kernel和其四项输出，不作数值或相对性能结论。")
+
+
+def mamba3_forward(context):
+    query = torch.randn((1, 2048, 4, 32), dtype=torch.bfloat16) * 0.1
+    key = torch.randn_like(query) * 0.1
+    value = torch.randn((1, 2048, 16, 64), dtype=torch.bfloat16) * 0.1
+    adt = -torch.rand((1, 16, 2048), dtype=torch.float32) * 0.1
+    dt, trap = torch.rand_like(adt) * 0.1, torch.rand_like(adt) * 0.1
+    query_bias = torch.randn((16, 32), dtype=torch.bfloat16) * 0.01
+    key_bias = torch.randn_like(query_bias) * 0.01
+    angles = torch.randn((1, 2048, 16, 16), dtype=torch.float32) * 0.01
+    residual = torch.randn((16,), dtype=torch.float32) * 0.01
+    gate = torch.randn_like(value) * 0.1
+    stores = (torch.empty((1, 2048, 16, 32), dtype=torch.bfloat16),
+              torch.empty((1, 2048, 16, 32), dtype=torch.bfloat16),
+              *(torch.empty((1, 16, 2048), dtype=torch.float32) for _ in range(3)))
+    return prepare_host_run_only(context, mamba3_siso_forward,
+        (query, key, value, adt, dt, trap, query_bias, key_bias, angles, residual, gate, *stores),
+        constexprs={"HEAD_GROUP": 4},
+        note="原Mamba3 forward B1/S2048/H16/QKH4/DQK32/DV64 BF16输入；五个InOut stores在每次kernel内先完整写入再读取，host预分配；原source标记semantics gap，无可比CPU reference，仅运行，不作数值或相对性能结论。")
+
+
 CASES = {
     "selective_state_scan": selective_scan,
     "streamed_online_softmax_f16": online_softmax,
@@ -189,4 +263,9 @@ CASES = {
     "mamba_chunk_scan": mamba_chunk_scan,
     "mamba_chunk_state": mamba_chunk_state,
     "linear_attention_forward": linear_attention,
+    "mamba_chunk_state_bf16": mamba_chunk_state_bf16,
+    "mamba_state_passing": mamba_state_passing,
+    "mamba_chunk_scan_bf16": mamba_chunk_scan_bf16,
+    "mamba3_siso_step": mamba3_step,
+    "mamba3_siso_forward": mamba3_forward,
 }

@@ -323,6 +323,14 @@ MOJO = (
     Entry("moe_count_routes_product_domain", "T4096-top2-E64-i32-random-8cores-host", "moe_count_routes_product_domain", ("variants/decomposition.py:moe_count_routes_product_domain",), "source/pytorch/cpu_runtime.py"),
     Entry("nested_jagged_mean_pool_identity", "D256-S4096-T65536-F128-f32-indexed-8cores-host", "nested_jagged_mean_pool_identity", ("variants/decomposition.py:nested_jagged_mean_pool_identity",), "source/pytorch/cpu_runtime.py"),
     Entry("nested_jagged_mean_pool_split", "D256-S4096-T65536-F128-f32-2kernels-8cores-host", "nested_jagged_mean_pool_split", ("variants/decomposition.py:nested_sentence_pool", "variants/decomposition.py:nested_document_pool"), "source/pytorch/cpu_runtime.py"),
+    Entry("mamba_chunk_state_bf16", "B1-L2048-H32-G8-P64-N128-C8-S256-bf16-f32-8cores-host", "mamba_chunk_state_bf16", ("streaming/mamba.py:mamba_chunk_state_bf16_fwd",), "source/pytorch/cpu_runtime.py"),
+    Entry("mamba_state_passing", "B1-C8-H32-D8192-f32-8cores-host", "mamba_state_passing", ("streaming/mamba.py:mamba_state_passing_fwd",), "source/pytorch/cpu_runtime.py"),
+    Entry("mamba_chunk_scan_bf16", "B1-L2048-H32-G8-P64-N128-C8-S256-bf16-f32-8cores-host", "mamba_chunk_scan_bf16", ("streaming/selective_scan.py:mamba_chunk_scan_bf16_fwd",), "source/pytorch/cpu_runtime.py"),
+    Entry("mamba3_siso_step", "B32-H16-QKH4-DQK32-DV64-bf16-8cores-host", "mamba3_siso_step", ("streaming/mamba.py:mamba3_siso_step",), None),
+    Entry("mamba3_siso_forward", "B1-S2048-H16-QKH4-DQK32-DV64-bf16-8cores-host", "mamba3_siso_forward", ("streaming/mamba.py:mamba3_siso_forward",), None),
+    Entry("flash_attention_inline", "B4-H32-S4096-D128-f16-causal-8cores-host", "flash_attention_inline_fwd", ("variants/streaming.py:flash_attention_inline_fwd",), None),
+    Entry("flash_attention_select", "B4-H32-S4096-D128-f16-causal-8cores-host", "flash_attention_select_fwd", ("variants/streaming.py:flash_attention_select_fwd",), None),
+    Entry("flash_attention_full_causal_stream", "B4-H32-S4096-D128-f16-causal-8cores-host", "flash_attention_full_causal_stream_fwd", ("variants/streaming.py:flash_attention_full_causal_stream_fwd",), None),
 )
 
 

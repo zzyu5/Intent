@@ -1224,9 +1224,12 @@ private:
                              ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes) -> Value {
         auto type = cast<MemRefType>(source.getType());
         SmallVector<OpFoldResult> strides(2, builder.getIndexAttr(1));
+        SmallVector<OpFoldResult> sliceSizes(sizes);
+        if (!type.isDynamicDim(reductionAxis))
+          sliceSizes[reductionAxis] = builder.getIndexAttr(type.getDimSize(reductionAxis));
         auto sliced = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
-            ArrayRef<int64_t>{type.getDimSize(reductionAxis)}, type, offsets, sizes, strides));
-        return builder.create<memref::SubViewOp>(loc, sliced, source, offsets, sizes, strides);
+            ArrayRef<int64_t>{type.getDimSize(reductionAxis)}, type, offsets, sliceSizes, strides));
+        return builder.create<memref::SubViewOp>(loc, sliced, source, offsets, sliceSizes, strides);
       };
       Value right = vectorSlice(rhs, 0, {builder.getIndexAttr(0), builder.getIndexAttr(0)},
           {extent, builder.getIndexAttr(1)});
@@ -1832,6 +1835,27 @@ private:
                 nested.createOrFold<arith::MulIOp>(location, coordinate, step));
             if (!type.getElementType().isIndex()) coordinate = nested.create<arith::IndexCastOp>(location, type.getElementType(), coordinate);
             nested.create<linalg::YieldOp>(location, coordinate);
+          });
+      values.map(op.getResult(), output);
+    } else if (auto op = dyn_cast<JoinOp>(operation)) {
+      auto tensor = cast<RankedTensorType>(op.getResult().getType());
+      auto sizes = extents(tensor, loc);
+      if (failed(sizes)) return failure();
+      Value output = allocate(tensor, *sizes, loc);
+      SmallVector<AffineExpr> prefix;
+      for (int64_t axis = 0; axis + 1 < tensor.getRank(); ++axis)
+        prefix.push_back(builder.getAffineDimExpr(axis));
+      auto inputMap = AffineMap::get(tensor.getRank(), 0, prefix, builder.getContext());
+      builder.create<linalg::GenericOp>(loc,
+          ValueRange{values.lookup(op.getLhs()), values.lookup(op.getRhs())}, ValueRange{output},
+          SmallVector<AffineMap>{inputMap, inputMap, builder.getMultiDimIdentityMap(tensor.getRank())},
+          SmallVector<utils::IteratorType>(tensor.getRank(), utils::IteratorType::parallel),
+          [&](OpBuilder &nested, Location location, ValueRange inputs) {
+            Value component = nested.create<linalg::IndexOp>(location, tensor.getRank() - 1);
+            Value first = nested.create<arith::CmpIOp>(location, arith::CmpIPredicate::eq,
+                component, nested.create<arith::ConstantIndexOp>(location, 0));
+            Value selected = nested.create<arith::SelectOp>(location, first, inputs[0], inputs[1]);
+            nested.create<linalg::YieldOp>(location, selected);
           });
       values.map(op.getResult(), output);
     } else if (isa<TransposeOp, ReshapeOp>(operation)) {

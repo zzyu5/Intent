@@ -8,6 +8,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -33,6 +34,18 @@ bool supportedType(Type type) {
       isa<Float8E4M3FNType, Float8E5M2Type>(type) ||
       type.isSignlessInteger(8) || type.isSignlessInteger(16) || type.isSignlessInteger(32) ||
       type.isSignlessInteger(64) || type.isInteger(1);
+}
+
+bool needsFloatingPointEnvironment(Operation *scope) {
+  auto floating = [](Type type) { return isa<FloatType>(getElementTypeOrSelf(type)); };
+  return scope->walk([&](Operation *operation) {
+    // Calls may depend on the caller's FP state even with an integer-only ABI.
+    if (isa<func::CallOp>(operation) ||
+        llvm::any_of(operation->getOperandTypes(), floating) ||
+        llvm::any_of(operation->getResultTypes(), floating))
+      return WalkResult::interrupt();
+    return WalkResult::advance();
+  }).wasInterrupted();
 }
 
 void promotePrivateScratch(func::FuncOp function, int64_t budget) {
@@ -298,6 +311,15 @@ LogicalResult legalizeProgram(ModuleOp module) {
   for (func::FuncOp function : module.getOps<func::FuncOp>())
     promotePrivateScratch(function, capabilities.getPrivateBytes());
   if (failed(cpu::verifyCPUProgram(module, true)) || failed(checkSurface(module))) return failure();
+  SmallVector<Block *> scopes;
+  for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+    if (function.isExternal()) continue;
+    if (needsFloatingPointEnvironment(function)) scopes.push_back(&function.front());
+    function.walk([&](scf::ParallelOp parallel) {
+      if (needsFloatingPointEnvironment(parallel)) scopes.push_back(parallel.getBody());
+    });
+  }
+  if (scopes.empty()) return success();
   OpBuilder builder(module.getContext());
   builder.setInsertionPointToStart(module.getBody());
   auto enter = builder.create<func::FuncOp>(module.getLoc(), "intent_cpu_enter_ieee",
@@ -307,12 +329,6 @@ LogicalResult legalizeProgram(ModuleOp module) {
   enter.setPrivate(); leave.setPrivate();
   enter->setAttr("cpu.external_runtime", builder.getUnitAttr());
   leave->setAttr("cpu.external_runtime", builder.getUnitAttr());
-  SmallVector<Block *> scopes;
-  for (func::FuncOp function : module.getOps<func::FuncOp>()) {
-    if (function.isExternal()) continue;
-    scopes.push_back(&function.front());
-    function.walk([&](scf::ParallelOp parallel) { scopes.push_back(parallel.getBody()); });
-  }
   for (Block *scope : scopes) {
     builder.setInsertionPointToStart(scope);
     Value previous = builder.create<func::CallOp>(module.getLoc(), enter, ValueRange{}).getResult(0);

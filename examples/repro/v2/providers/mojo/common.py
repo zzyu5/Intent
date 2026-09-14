@@ -83,3 +83,17 @@ def prepare_host_comparison(context, definition, arguments, reference, tolerance
         cuda_graph=False, device_type="cpu", cpu_host_timing=True,
         note="既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。" + note,
     )
+
+
+def prepare_host_run_only(context, definition, arguments, *, constexprs=None, note):
+    report_stage("generated_compilation")
+    artifact = intent.compile(definition, target=context.target, compiler=context.compiler,
+                              tuning_config=context.tuning_config, constexprs=constexprs)
+    state = {}
+
+    def launch():
+        state["output"] = artifact.run(*arguments)
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(PreparedLaunch(launch, lambda: state["output"]), None, None,
+        cuda_graph=False, status="run_only", device_type="cpu", cpu_host_timing=True, note=note)

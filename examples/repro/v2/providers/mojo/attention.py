@@ -18,7 +18,7 @@ from kernels.streaming.splitk_reduce import splitk_attention_reduce
 from ...loading import load_module
 from ...measurement import report_stage
 from ...model import Context, PreparedComparison, PreparedLaunch, Tolerance
-from .common import configure_cpu_budget, prepare_comparison, prepare_host_comparison
+from .common import configure_cpu_budget, prepare_comparison, prepare_host_comparison, prepare_host_run_only
 
 
 F16_PRECISION_NOTE = "生成端保留作者的chunk概率f16转换后与V作f32累加；CPU数学reference使用f32概率，最终双方输出f16；沿用原production容差。"
@@ -94,26 +94,12 @@ def varlen_gqa_prefill(context):
                                    constexprs={"HEAD_GROUP": 4}, note=F16_PRECISION_NOTE)
 
 
-def _attention_run_only(context, definition, arguments, constexprs, note):
-    report_stage("generated_compilation")
-    artifact = intent.compile(definition, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config, constexprs=constexprs)
-    state = {}
-
-    def launch():
-        state["output"] = artifact.run(*arguments)
-
-    report_stage("adapter_preparation")
-    return PreparedComparison(PreparedLaunch(launch, lambda: state["output"]), None, None,
-        cuda_graph=False, status="run_only", device_type="cpu", cpu_host_timing=True, note=note)
-
-
 def biased_attention(context):
     q = torch.randn((4, 32, 4096, 128), dtype=torch.float16)
     k, v = torch.randn_like(q), torch.randn_like(q)
     bias = torch.randn((4, 32, 4096), dtype=torch.float32)
-    return _attention_run_only(context, flash_attention_bias_fwd, (q, k, v, bias, 128**-0.5), {},
-        "既有B4/H32/S4096/D128 f16 attention+bias f32 metadata；原provider没有可运行reference和容差，仅验证当前kernel完整host调用可运行，输出f16，非causal，不作数值或相对性能结论。")
+    return prepare_host_run_only(context, flash_attention_bias_fwd, (q, k, v, bias, 128**-0.5),
+        note="既有B4/H32/S4096/D128 f16 attention+bias f32 metadata；原provider没有可运行reference和容差，仅验证当前kernel完整host调用可运行，输出f16，非causal，不作数值或相对性能结论。")
 
 
 def varlen_attention(context):
@@ -122,9 +108,9 @@ def varlen_attention(context):
     offsets = torch.cat((torch.zeros(1, dtype=torch.int32), lengths.cumsum(0).int()))
     q = torch.randn((VARLEN_TOTAL_TOKENS, 128), dtype=torch.float16)
     k, v = torch.randn_like(q), torch.randn_like(q)
-    return _attention_run_only(context, flash_varlen_attention_fwd,
-        (q, k, v, lengths, offsets, 128**-0.5), {"CAUSAL": True},
-        "按作者B8/U29114常量构造平衡分段，f16/D128/causal；该entry无既有production runner、reference或容差，仅验证完整host调用可运行，不作数值或相对性能结论。")
+    return prepare_host_run_only(context, flash_varlen_attention_fwd,
+        (q, k, v, lengths, offsets, 128**-0.5), constexprs={"CAUSAL": True},
+        note="按作者B8/U29114常量构造平衡分段，f16/D128/causal；该entry无既有production runner、reference或容差，仅验证完整host调用可运行，不作数值或相对性能结论。")
 
 
 def gemma_decode(context: Context) -> PreparedComparison:

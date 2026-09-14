@@ -19,6 +19,7 @@ from kernels.variants.layout import matrix_transpose_scalar_domains
 from kernels.variants.normalization import stable_softmax_online
 from kernels.variants.normalization import weighted_layer_norm_second_moment
 from kernels.variants.streaming import streamed_online_softmax_inline
+from kernels.variants.streaming import flash_attention_inline_fwd, flash_attention_select_fwd, flash_attention_full_causal_stream_fwd
 from kernels.activation.swiglu import FEATURES as SWIGLU_FEATURES
 from kernels.activation.swiglu import TOKENS as SWIGLU_TOKENS
 from kernels.layout.transpose import COLUMNS as TRANSPOSE_COLUMNS
@@ -31,7 +32,7 @@ from kernels.streaming.online_softmax import ROWS as ONLINE_ROWS
 from ...loading import load_module
 from ...measurement import report_stage
 from ...model import PreparedComparison, PreparedLaunch, Tolerance
-from .common import configure_cpu_budget, prepare_host_comparison
+from .common import configure_cpu_budget, prepare_host_comparison, prepare_host_run_only
 
 
 def swiglu_helper(context):
@@ -188,6 +189,25 @@ def cholesky_right_looking(context):
     )
 
 
+def _flash_variant(context, definition):
+    q = torch.randn((4, 32, 4096, 128), dtype=torch.float16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    return prepare_host_run_only(context, definition, (q, k, v, 128**-0.5), constexprs={"CAUSAL": True},
+        note="该attention变体无独立原production runner/reference/容差，复用base flash已有B4/H32/S4096/D128 f16 causal输入规模；保留作者helper与概率cast，仅验证完整host调用可运行，不作数值或相对性能结论。")
+
+
+def flash_inline(context):
+    return _flash_variant(context, flash_attention_inline_fwd)
+
+
+def flash_select(context):
+    return _flash_variant(context, flash_attention_select_fwd)
+
+
+def flash_full_causal(context):
+    return _flash_variant(context, flash_attention_full_causal_stream_fwd)
+
+
 CASES = {
     "swiglu_forward_helper": swiglu_helper,
     "gemm_loop_interchange": gemm_loop,
@@ -200,4 +220,7 @@ CASES = {
     "stable_softmax_online": softmax_online,
     "streamed_online_softmax_inline": online_softmax_inline,
     "batched_cholesky_right_looking": cholesky_right_looking,
+    "flash_attention_inline": flash_inline,
+    "flash_attention_select": flash_select,
+    "flash_attention_full_causal_stream": flash_full_causal,
 }
