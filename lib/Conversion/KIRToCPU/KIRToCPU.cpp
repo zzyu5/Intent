@@ -1190,8 +1190,56 @@ private:
     return success();
   }
 
+  Value dotProduct(Value lhs, Value rhs, Value extent, Type accumulator,
+                   ArrayRef<AffineMap> maps, Location loc) {
+    Type element = cast<MemRefType>(lhs.getType()).getElementType();
+    Value initial = builder.create<arith::ConstantOp>(loc, builder.getZeroAttr(accumulator));
+    auto reduction = builder.create<cpu::ReduceOp>(loc, accumulator, extent, initial,
+        ValueRange{lhs, rhs}, builder.getAffineMapArrayAttr(maps),
+        cpu::ReductionOrderAttr::get(builder.getContext(), true));
+    Block *body = &reduction.getCombine().emplaceBlock();
+    body->addArguments(TypeRange{accumulator, element, element}, {loc, loc, loc});
+    {
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(body);
+      Value left = body->getArgument(1), right = body->getArgument(2);
+      if (element != accumulator) {
+        left = builder.create<arith::ExtFOp>(loc, accumulator, left);
+        right = builder.create<arith::ExtFOp>(loc, accumulator, right);
+      }
+      Value product = builder.create<arith::MulFOp>(loc, left, right);
+      Value sum = builder.create<arith::AddFOp>(loc, body->getArgument(0), product);
+      builder.create<cpu::YieldOp>(loc, sum);
+    }
+    return reduction.getResult();
+  }
+
   void matrix(Value lhs, Value rhs, Value destination, Location loc) {
     Type accumulator = cast<MemRefType>(destination.getType()).getElementType();
+    if (isa<FloatType>(accumulator) && cast<MemRefType>(rhs.getType()).getDimSize(1) == 1) {
+      Value rows = builder.create<memref::DimOp>(loc, lhs, 0);
+      Value extent = builder.create<memref::DimOp>(loc, lhs, 1);
+      Value zero = constant(loc, 0), one = constant(loc, 1);
+      auto vectorSlice = [&](Value source, int64_t reductionAxis,
+                             ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes) -> Value {
+        auto type = cast<MemRefType>(source.getType());
+        SmallVector<OpFoldResult> strides(2, builder.getIndexAttr(1));
+        auto sliced = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
+            ArrayRef<int64_t>{type.getDimSize(reductionAxis)}, type, offsets, sizes, strides));
+        return builder.create<memref::SubViewOp>(loc, sliced, source, offsets, sizes, strides);
+      };
+      Value right = vectorSlice(rhs, 0, {builder.getIndexAttr(0), builder.getIndexAttr(0)},
+          {extent, builder.getIndexAttr(1)});
+      auto parallel = builder.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{rows}, ValueRange{one});
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(parallel.getBody());
+      Value row = parallel.getInductionVars()[0];
+      Value source = vectorSlice(lhs, 1, {row, builder.getIndexAttr(0)}, {builder.getIndexAttr(1), extent});
+      auto map = builder.getMultiDimIdentityMap(1);
+      Value value = dotProduct(source, right, extent, accumulator, {map, map}, loc);
+      builder.create<memref::StoreOp>(loc, value, destination, ValueRange{row, zero});
+      return;
+    }
     Value zero = builder.create<arith::ConstantOp>(loc, builder.getZeroAttr(accumulator));
     AffineExpr m, n, k;
     bindDims(builder.getContext(), m, n, k);
@@ -1231,11 +1279,22 @@ private:
     bool integer = lhsType.getElementType().isSignlessInteger(8) && rhsType.getElementType().isSignlessInteger(8) &&
         resultType.getElementType().isSignlessInteger(32);
     int64_t batchRank = operation.getBatch().size();
+    if (floating && !batchRank && lhsType.getRank() == 1 && rhsType.getRank() == 1 &&
+        resultType.getRank() == 0 && pairs.size() == 1 &&
+        cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[0]).getInt() == 0 &&
+        cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[1]).getInt() == 0) {
+      Location loc = operation.getLoc();
+      Value lhs = values.lookup(operation.getLhs()), rhs = values.lookup(operation.getRhs());
+      Value extent = builder.create<memref::DimOp>(loc, lhs, 0);
+      auto map = builder.getMultiDimIdentityMap(1);
+      values.map(operation.getResult(), dotProduct(lhs, rhs, extent, accumulator, {map, map}, loc));
+      return success();
+    }
     if (lhsType.getRank() != batchRank + 2 || rhsType.getRank() != batchRank + 2 || pairs.size() != 1 ||
         cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[0]).getInt() != batchRank + 1 ||
         cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[1]).getInt() != batchRank ||
         (!floating && !integer))
-      return operation.emitError("CPU construction requires a matrix contraction with lossless floating widening or i8 to i32 accumulation");
+      return operation.emitError("CPU construction requires a floating vector dot or a matrix contraction with lossless floating widening or i8 to i32 accumulation");
     for (auto [axis, pair] : llvm::enumerate(operation.getBatch())) {
       auto relation = cast<ArrayAttr>(pair);
       if (cast<IntegerAttr>(relation[0]).getInt() != static_cast<int64_t>(axis) ||

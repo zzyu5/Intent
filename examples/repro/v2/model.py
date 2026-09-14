@@ -29,7 +29,7 @@ class PreparedLaunch:
 class PreparedComparison:
     generated: PreparedLaunch | None
     source: PreparedLaunch | None
-    tolerance: Tolerance | tuple[Tolerance, ...]
+    tolerance: Tolerance | tuple[Tolerance, ...] | None
     cuda_graph: bool
     status: str = "pass"
     note: str = ""

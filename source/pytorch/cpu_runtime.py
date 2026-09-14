@@ -179,6 +179,29 @@ def fused_cross_entropy(logits, labels):
     return logits, loss, prediction
 
 
+def fused_cross_entropy_bf16(logits, labels):
+    values = logits.float()
+    loss = F.cross_entropy(values, labels, reduction="none", ignore_index=-100)
+    valid = labels != -100
+    prediction = torch.where(valid, values.argmax(dim=1), -1)
+    gradient = torch.softmax(values, dim=1)
+    safe_labels = torch.where(valid, labels, 0)
+    gradient[torch.arange(logits.shape[0]), safe_labels] -= valid.float()
+    gradient *= valid[:, None].float()
+    logits.copy_(gradient)
+    return logits, loss, prediction
+
+
+def flash_cross_entropy_bf16(logits, labels):
+    values = logits.float()
+    valid = labels != -100
+    safe_labels = torch.where(valid, labels, 0)
+    lse = torch.logsumexp(values, dim=1)
+    regularizer = (1e-4 * lse) * lse
+    target = values[torch.arange(logits.shape[0]), safe_labels]
+    return torch.where(valid, lse - target + regularizer, 0.0), torch.where(valid, regularizer, 0.0)
+
+
 def group_norm_silu_backward(x, upstream, weight, bias, mean, rstd, dweight, dbias, inverse_group_elements):
     values = x.float()
     normalized = ((values.reshape(32, 32, 8, 1024) - mean[:, :, None, None])
@@ -458,6 +481,14 @@ def gated_dual_gemm(x, gate_weight, value_weight):
 
 def matmul(a, b):
     return torch.matmul(a.float(), b.float()).to(a.dtype)
+
+
+def vector_dot(lhs, rhs):
+    return torch.dot(lhs, rhs).reshape(1)
+
+
+def vector_outer(lhs, rhs):
+    return torch.outer(lhs, rhs)
 
 
 def batched_gemm_tn(a, b):

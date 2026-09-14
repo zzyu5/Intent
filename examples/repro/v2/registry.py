@@ -9,7 +9,7 @@ class Entry:
     case: str
     generated: str
     examples: tuple[str, ...]
-    source_runtime: str
+    source_runtime: str | None
     deployment: str | None = None
 
 
@@ -278,6 +278,15 @@ MOJO = (
     Entry("gated_dual_gemm", "M2048-N4096-K4096-fp16-8cores-host", "gated_dual_gemm", ("contraction/dual_gemm.py:gated_dual_gemm",), "source/pytorch/cpu_runtime.py"),
     Entry("dropout_residual_rms_norm", "4096x4096-bf16-seed17-p0.1-8cores-host", "dropout_residual_rms_norm", ("normalization/dropout_residual_rms_norm.py:dropout_residual_rms_norm_forward", "normalization/dropout_residual_rms_norm.py:dropout_residual_rms_norm_backward_data"), "source/pytorch/cpu_runtime.py"),
     Entry("barrier_option_paths", "paths262144-steps64-f32-seed17-8cores-host", "barrier_option_paths", ("simulation/monte_carlo.py:barrier_option_paths",), "source/pytorch/cpu_runtime.py"),
+    Entry("vector_dot", "K1048576-f32-8cores-host", "vector_dot", ("contraction/vector.py:vector_dot",), "source/pytorch/cpu_runtime.py"),
+    Entry("matrix_vector", "M1024-K1024-f32-8cores-host", "matrix_vector", ("contraction/vector.py:matrix_vector",), "source/pytorch/cpu_runtime.py"),
+    Entry("vector_matrix", "K1024-N1024-f32-8cores-host", "vector_matrix", ("contraction/vector.py:vector_matrix",), "source/pytorch/cpu_runtime.py"),
+    Entry("vector_outer", "M1024-N1024-f32-8cores-host", "vector_outer", ("contraction/vector.py:vector_outer",), "source/pytorch/cpu_runtime.py"),
+    Entry("fused_linear_cross_entropy", "tokens2048-hidden4096-vocab32768-chunk1024-bf16-f32-8cores-host", "fused_linear_cross_entropy", ("loss/fused_linear_cross_entropy.py:linear_logits_chunk", "loss/fused_linear_cross_entropy.py:cross_entropy_probability_chunk", "loss/fused_linear_cross_entropy.py:cross_entropy_mean"), None),
+    Entry("causal_conv1d_bf16", "B4-C4096-S4096-W4-bf16-silu-8cores-host", "causal_depthwise_conv1d_bf16", ("convolution/direct.py:causal_depthwise_conv1d_bf16",), "source/pytorch/cpu_runtime.py"),
+    Entry("causal_conv_update_bf16", "B32-D4096-W4-bf16-f32-silu-8cores-host", "causal_depthwise_conv1d_update_bf16", ("convolution/direct.py:causal_depthwise_conv1d_update_bf16",), "source/pytorch/cpu_runtime.py"),
+    Entry("fused_cross_entropy_bf16", "8192x32768-bf16-i64-8cores-host", "fused_cross_entropy_bf16", ("loss/cross_entropy.py:fused_cross_entropy_bf16",), "source/pytorch/cpu_runtime.py"),
+    Entry("flash_cross_entropy_bf16", "8192x32768-bf16-i64-zloss1e-4-8cores-host", "flash_cross_entropy_bf16", ("loss/cross_entropy.py:flash_cross_entropy_bf16",), "source/pytorch/cpu_runtime.py"),
 )
 
 

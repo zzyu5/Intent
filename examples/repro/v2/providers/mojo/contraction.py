@@ -14,6 +14,10 @@ from kernels.contraction.qkv import fused_qkv_projection
 from kernels.contraction.sparse_2to4 import sparse_2to4_gemm
 from kernels.contraction.weight_only_int4 import fp8_e4m3_matmul
 from kernels.contraction.mla import mla_head_projection as mla_head_projection_definition
+from kernels.contraction.vector import vector_dot as vector_dot_definition
+from kernels.contraction.vector import matrix_vector as matrix_vector_definition
+from kernels.contraction.vector import vector_matrix as vector_matrix_definition
+from kernels.contraction.vector import vector_outer as vector_outer_definition
 from ...model import Tolerance
 from ...loading import load_module
 from .common import configure_cpu_budget, prepare_comparison, prepare_host_comparison
@@ -25,6 +29,34 @@ def gemm(context):
     return prepare_comparison(context, gemm_f32, (a, b),
         "source/mojo/modular/contraction/gemm/gemm_runtime.py", Tolerance(2e-4, 1e-5),
         "Source 调用安装的 Modular/MAX CPU matmul，未缓存输入 packing。")
+
+
+def vector_dot(context):
+    lhs = torch.randn((1048576,), dtype=torch.float32)
+    rhs = torch.randn_like(lhs)
+    return prepare_host_comparison(context, vector_dot_definition, (lhs, rhs),
+                                   "vector_dot", Tolerance(atol=2e-3, rtol=1e-5))
+
+
+def matrix_vector(context):
+    matrix = torch.randn((1024, 1024), dtype=torch.float32)
+    vector = torch.randn((1024,), dtype=torch.float32)
+    return prepare_host_comparison(context, matrix_vector_definition, (matrix, vector),
+                                   "matmul", Tolerance(atol=2e-4, rtol=1e-5))
+
+
+def vector_matrix(context):
+    vector = torch.randn((1024,), dtype=torch.float32)
+    matrix = torch.randn((1024, 1024), dtype=torch.float32)
+    return prepare_host_comparison(context, vector_matrix_definition, (vector, matrix),
+                                   "matmul", Tolerance(atol=2e-4, rtol=1e-5))
+
+
+def vector_outer(context):
+    lhs = torch.randn((1024,), dtype=torch.float32)
+    rhs = torch.randn_like(lhs)
+    return prepare_host_comparison(context, vector_outer_definition, (lhs, rhs),
+                                   "vector_outer", Tolerance(atol=0.0))
 
 
 def half_gemm(context):
@@ -228,5 +260,7 @@ CASES = {"dense_gemm_f32": gemm, "dense_gemm": half_gemm, "tilegym_dense_gemm": 
          "mla_head_value_projection": mla_head_value_projection,
          "qkv_projection": qkv_projection,
          "gated_dual_gemm": dual_gemm, "fp8_gemm": fp8_gemm,
+         "vector_dot": vector_dot, "matrix_vector": matrix_vector,
+         "vector_matrix": vector_matrix, "vector_outer": vector_outer,
          "mxfp8_gemm": mxfp8_gemm, "block_sparse_gemm": block_sparse_gemm,
          "sparse_2to4_gemm": sparse_2to4}

@@ -20,9 +20,11 @@ from kernels.convolution.direct import (
     CONV2D_FILTER_HEIGHT,
     CONV2D_FILTER_WIDTH,
     causal_depthwise_conv1d,
+    causal_depthwise_conv1d_bf16,
     conv1d_same,
     conv2d_same,
     causal_depthwise_conv1d_update,
+    causal_depthwise_conv1d_update_bf16,
 )
 from kernels.convolution.varlen import varlen_aligned_causal_depthwise_conv1d, varlen_causal_conv1d_final_state
 from ...loading import load_module
@@ -70,6 +72,16 @@ def conv2d(context):
         (x, weight),
         "conv2d",
         Tolerance(atol=3e-3),
+    )
+
+
+def causal_conv1d_bf16(context):
+    x = torch.randn((4, 4096, 4096), dtype=torch.bfloat16).transpose(1, 2)
+    weight = torch.randn((4096, 4), dtype=torch.bfloat16)
+    bias = torch.randn((4096,), dtype=torch.bfloat16)
+    return prepare_host_comparison(
+        context, causal_depthwise_conv1d_bf16, (x, weight, bias), "causal_conv1d",
+        Tolerance(atol=5e-2, rtol=5e-2), constexprs={"SILU": True},
     )
 
 
@@ -193,11 +205,42 @@ def causal_conv_update(context):
     )
 
 
+def causal_conv_update_bf16(context):
+    x = torch.randn((32, 4096), dtype=torch.bfloat16)
+    initial = torch.randn((32, 4096, 4), dtype=torch.bfloat16)
+    weight = torch.randn((4096, 4), dtype=torch.float32)
+    bias = torch.randn((4096,), dtype=torch.float32)
+    report_stage("generated_compilation")
+    artifact = intent.compile(causal_depthwise_conv1d_update_bf16, target=context.target,
+                              compiler=context.compiler, tuning_config=context.tuning_config,
+                              constexprs={"SILU": True})
+    runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_reference")
+
+    def side(function):
+        state = initial.clone()
+        result = {}
+
+        def launch():
+            result["output"] = function(x, state, weight, bias)
+
+        return PreparedLaunch(launch, lambda: result["output"], prepare=lambda: state.copy_(initial))
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(
+        side(artifact.run), side(runtime.causal_conv_update),
+        (Tolerance(atol=0.0), Tolerance(atol=5e-2, rtol=5e-2)),
+        cuda_graph=False, device_type="cpu", cpu_host_timing=True,
+        note="既有 B32-D4096-W4 bf16 state/input、f32 weight/bias、SiLU；完整缓存更新及输出，PyTorch CPU reference，沿用原容差；单 NUMA 8 核，完整 host 调用，每次恢复 state 且恢复不计时。",
+    )
+
+
 CASES = {
     "flaggems_conv1d": conv1d,
     "causal_conv1d": causal_conv1d,
+    "causal_conv1d_bf16": causal_conv1d_bf16,
     "conv2d": conv2d,
     "causal_conv1d_backward": causal_conv1d_backward,
     "varlen_causal_conv1d": varlen_conv1d,
     "causal_conv_update": causal_conv_update,
+    "causal_conv_update_bf16": causal_conv_update_bf16,
 }

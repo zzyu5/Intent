@@ -289,6 +289,12 @@ def evaluate(
     before_benchmark: Callable[[], None] | None = None,
     source_timing_error: Callable[[Exception], bool] | None = None,
 ) -> tuple[float | None, float | None]:
+    run_only = comparison.status == "run_only"
+    if run_only:
+        if comparison.source is not None or comparison.tolerance is not None or comparison.native_comparison is not None:
+            raise PipelineStageError("adapter_preparation", "run_only requires a generated launch without reference or tolerance")
+    elif comparison.tolerance is None or (comparison.source is None and comparison.native_comparison is None):
+        raise PipelineStageError("adapter_preparation", "comparison requires an explicit reference and tolerance")
     if comparison.device_type == "cpu" and before_benchmark is not None:
         before_benchmark()
     if comparison.native_comparison is not None:
@@ -305,6 +311,21 @@ def evaluate(
         _synchronize(comparison)
     except Exception as error:
         raise PipelineStageError("generated_launch", str(error)) from error
+    if run_only:
+        if comparison.device_type != "cpu" and before_benchmark is not None:
+            before_benchmark()
+        report_stage("generated_benchmark")
+        try:
+            first = _benchmark_launch(comparison.generated, comparison, 25)
+            second = _benchmark_launch(comparison.generated, comparison, 0)
+        except Exception as error:
+            raise PipelineStageError("generated_benchmark", str(error)) from error
+        report_stage("generated_result_access")
+        try:
+            _result_structure(comparison.generated.outputs())
+        except Exception as error:
+            raise PipelineStageError("generated_result_access", str(error)) from error
+        return statistics.median((first, second)), None
     report_stage("source_launch")
     try:
         if comparison.source.prepare is not None:

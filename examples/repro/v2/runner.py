@@ -132,7 +132,7 @@ def _run_entry(
         return ResultRow(entry.kernel, entry.case, None, None, None, error.status)
     except NotImplementedError as error:
         print(f"{provider}:{entry.kernel}: unsupported: {error}")
-        return ResultRow(entry.kernel, entry.case, None, None, None, "unsupported")
+        return ResultRow(entry.kernel, entry.case, None, None, None, "unsupported", str(error))
     except PipelineStageError as error:
         status = f"{error.stage}_failed"
         print(f"{provider}:{entry.kernel}: {status}: {error}")
@@ -143,7 +143,8 @@ def _run_entry(
     except Exception as error:
         status = "adapter_preparation_failed"
         print(f"{provider}:{entry.kernel}: {status}: {error}")
-        return ResultRow(entry.kernel, entry.case, None, None, None, status)
+        return ResultRow(entry.kernel, entry.case, None, None, None, status,
+                         "; ".join(str(error).splitlines()[:2]))
 
     try:
         generated_p50, source_p50 = evaluate(
@@ -162,6 +163,9 @@ def _run_entry(
             "; ".join(str(error).splitlines()[:2]),
         )
 
+    if comparison.status == "run_only":
+        print(f"{provider}:{entry.kernel}: run_only generated={generated_p50:.6f} ms; no reference")
+        return ResultRow(entry.kernel, entry.case, generated_p50, None, None, "run_only", comparison.note)
     if comparison.status != "pass":
         print(
             f"{provider}:{entry.kernel}: {comparison.status}: "

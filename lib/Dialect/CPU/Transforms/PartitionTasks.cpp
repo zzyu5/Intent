@@ -13,6 +13,70 @@ using namespace mlir;
 namespace intent::cpu {
 namespace {
 
+void partitionScalarSums(func::FuncOp function, int64_t grain) {
+  auto capabilities = function->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities");
+  if (capabilities.getWorkers() <= 1) return;
+  int64_t limit = std::min(grain, capabilities.getPrivateBytes() / 4 / capabilities.getWorkers()) * capabilities.getWorkers();
+  if (!limit) return;
+  SmallVector<ReduceOp> reductions(function.front().getOps<ReduceOp>());
+  for (ReduceOp operation : reductions) {
+    if (!operation.getResult().getType().isF32() || !operation.getOrder().getAdjacentReassociation() ||
+        !matchPattern(operation.getInitial(), m_PosZeroFloat())) continue;
+    Block &body = operation.getCombine().front();
+    auto combine = body.getTerminator()->getOperand(0).getDefiningOp<arith::AddFOp>();
+    if (!combine || !body.getArgument(0).hasOneUse()) continue;
+    OpBuilder b(operation);
+    Location loc = operation.getLoc();
+    Value zero = index(b, loc, 0), one = index(b, loc, 1);
+    Value count = b.create<arith::CeilDivSIOp>(loc, operation.getExtent(), index(b, loc, 4096));
+    count = b.create<arith::MinSIOp>(loc, index(b, loc, limit),
+        b.create<arith::MaxSIOp>(loc, one, count));
+    Value width = b.create<arith::DivSIOp>(loc, operation.getExtent(), count);
+    Value remainder = b.create<arith::RemSIOp>(loc, operation.getExtent(), count);
+    Value partials = b.create<memref::AllocOp>(loc, MemRefType::get({limit}, b.getF32Type()));
+    auto tasks = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{count}, ValueRange{one});
+    {
+      OpBuilder::InsertionGuard guard(b);
+      b.setInsertionPointToStart(tasks.getBody());
+      Value group = tasks.getInductionVars()[0];
+      Value begin = add(b, loc, multiply(b, loc, group, width), b.create<arith::MinSIOp>(loc, group, remainder));
+      Value extra = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, group, remainder);
+      Value size = add(b, loc, width, b.create<arith::SelectOp>(loc, extra, one, zero));
+      SmallVector<Value> inputs;
+      for (auto [input, attr] : llvm::zip(operation.getInputs(), operation.getIndexingMaps())) {
+        auto type = dyn_cast<MemRefType>(input.getType());
+        if (!type) { inputs.push_back(input); continue; }
+        SmallVector<OpFoldResult> offsets, sizes, strides(type.getRank(), b.getIndexAttr(1));
+        for (AffineExpr expression : cast<AffineMapAttr>(attr).getValue().getResults()) {
+          bool varying = isa<AffineDimExpr>(expression);
+          offsets.push_back(varying ? OpFoldResult(begin) : OpFoldResult(b.getIndexAttr(0)));
+          sizes.push_back(varying ? OpFoldResult(size) : OpFoldResult(b.getIndexAttr(1)));
+        }
+        inputs.push_back(b.create<memref::SubViewOp>(loc, input, offsets, sizes, strides));
+      }
+      auto partial = b.create<ReduceOp>(loc, operation.getResult().getType(), size,
+          operation.getInitial(), inputs, operation.getIndexingMaps(), operation.getOrder());
+      partial->setAttr("intent_cpu.implementation", operation->getAttr("intent_cpu.implementation"));
+      IRMapping mapping;
+      operation.getCombine().cloneInto(&partial.getCombine(), mapping);
+      b.create<memref::StoreOp>(loc, partial.getResult(), partials, ValueRange{group});
+    }
+    auto result = b.create<ReduceOp>(loc, b.getF32Type(), count, operation.getInitial(), ValueRange{partials},
+        b.getArrayAttr({AffineMapAttr::get(b.getMultiDimIdentityMap(1))}), operation.getOrder());
+    result->setAttr("intent_cpu.implementation", operation->getAttr("intent_cpu.implementation"));
+    {
+      OpBuilder::InsertionGuard guard(b);
+      Block *merge = &result.getCombine().emplaceBlock();
+      merge->addArguments(TypeRange{b.getF32Type(), b.getF32Type()}, {loc, loc});
+      b.setInsertionPointToStart(merge);
+      b.create<YieldOp>(loc, b.create<arith::AddFOp>(loc, merge->getArgument(0), merge->getArgument(1)).getResult());
+    }
+    b.create<memref::DeallocOp>(loc, partials);
+    operation.replaceAllUsesWith(result.getResult());
+    operation.erase();
+  }
+}
+
 LogicalResult exposeStructuredWorksets(func::FuncOp function, const ImplementationRegistry &implementations) {
   AliasAnalysis aliases(function);
   PhysicalProgramAnalysis analysis(function);
@@ -229,6 +293,7 @@ LogicalResult partition(scf::ParallelOp root, int64_t grain) {
 }
 
 LogicalResult partitionTasks(func::FuncOp function, int64_t grain, const ImplementationRegistry &implementations) {
+  partitionScalarSums(function, grain);
   if (failed(exposeStructuredWorksets(function, implementations))) return failure();
   SmallVector<scf::ParallelOp> roots;
   function.walk([&](scf::ParallelOp operation) {
