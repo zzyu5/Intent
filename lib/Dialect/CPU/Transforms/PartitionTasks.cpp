@@ -388,16 +388,25 @@ LogicalResult materializeTaskDispatches(func::FuncOp function) {
     Value nonempty = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, tasks.getCount(), index(b, loc, 0));
     auto active = b.create<scf::IfOp>(loc, nonempty, false);
     b.setInsertionPointToStart(active.thenBlock());
-    auto dispatch = b.create<TaskDispatchOp>(loc, tasks.getCount(), workers);
+    Value width = b.create<arith::DivSIOp>(loc, tasks.getCount(), workers);
+    Value remainder = b.create<arith::RemSIOp>(loc, tasks.getCount(), workers);
+    auto dispatch = b.create<TaskDispatchOp>(loc, workers, workers);
     Block *body = &dispatch.getBody().emplaceBlock();
     body->addArgument(b.getIndexType(), loc);
     IRMapping mapping;
     Block &original = tasks.getBody().front();
-    mapping.map(original.getArgument(0), body->getArgument(0));
     for (auto [argument, capture] : llvm::zip(original.getArguments().drop_front(), tasks.getCaptures()))
       mapping.map(argument, capture);
     b.setInsertionPointToStart(body);
-    for (Operation &operation : original.without_terminator()) b.clone(operation, mapping);
+    Value ordinal = body->getArgument(0);
+    Value extraBefore = b.create<arith::MinSIOp>(loc, ordinal, remainder);
+    Value begin = add(b, loc, multiply(b, loc, ordinal, width), extraBefore);
+    Value extra = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, ordinal, remainder);
+    Value count = add(b, loc, width, b.create<arith::SelectOp>(loc, extra, index(b, loc, 1), index(b, loc, 0)));
+    loop(b, loc, begin, add(b, loc, begin, count), 1, [&](Value task) {
+      mapping.map(original.getArgument(0), task);
+      for (Operation &operation : original.without_terminator()) b.clone(operation, mapping);
+    });
     b.create<TaskYieldOp>(loc);
     tasks.erase();
   }
