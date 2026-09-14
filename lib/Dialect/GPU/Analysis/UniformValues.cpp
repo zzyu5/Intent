@@ -7,7 +7,6 @@
 using namespace mlir;
 namespace intent::gpu {
 
-namespace {
 std::optional<int64_t> constantPhysicalExpression(PhysicalExprAttr expression) {
   auto kind = static_cast<PhysicalExprKind>(expression.getKind());
   if (kind == PhysicalExprKind::Constant)
@@ -55,8 +54,6 @@ std::optional<int64_t> constantPhysicalExpression(PhysicalExprAttr expression) {
     return std::nullopt;
   return static_cast<int64_t>(result);
 }
-} // namespace
-
 Type uniformElementType(Type type) {
   if (auto fragment = dyn_cast<FragmentType>(type)) return fragment.getElementType();
   return type;

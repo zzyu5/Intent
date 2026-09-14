@@ -1,5 +1,6 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
@@ -2578,17 +2579,10 @@ bool fullStaticReductionNeedsTraversal(ContractOp contract) {
   if (contract.getLhsReductionAxes().size() != 1 ||
       contract.getRhsReductionAxes().size() != 1)
     return false;
-  auto integer = [](Value value) -> std::optional<int64_t> {
-    FailureOr<Value> scalar = scalarSource(value);
-    if (failed(scalar))
-      return std::nullopt;
-    if (auto constant = scalar->getDefiningOp<arith::ConstantOp>())
-      if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
-        return integer.getInt();
-    if (auto physical = scalar->getDefiningOp<PhysicalExprOp>();
-        physical && physical.getExpression().getKind() ==
-                        static_cast<uint32_t>(PhysicalExprKind::Constant))
-      return physical.getExpression().getValue();
+  UniformValueAnalysis constants(describeUniformValue);
+  auto integer = [&](Value value) -> std::optional<int64_t> {
+    if (auto literal = dyn_cast_or_null<IntegerAttr>(constants.evaluate(value)))
+      return literal.getInt();
     return std::nullopt;
   };
   auto kernel = contract->getParentOfType<func::FuncOp>();
@@ -2602,10 +2596,9 @@ bool fullStaticReductionNeedsTraversal(ContractOp contract) {
         std::pair<Value, int64_t>{contract.getRhs(),
                                   contract.getRhsReductionAxes().front()}}) {
     auto type = cast<FragmentType>(operand.getType());
-    auto extent = cast<PhysicalExprAttr>(type.getShape()[axis]);
-    if (extent.getKind() !=
-            static_cast<uint32_t>(PhysicalExprKind::Constant) ||
-        extent.getValue() <= largestTile)
+    auto extent = constantPhysicalExpression(
+        cast<PhysicalExprAttr>(type.getShape()[axis]));
+    if (!extent || *extent <= largestTile)
       return false;
     PhysicalRangeFact ranges = analysis.axisRanges(operand, axis);
     if (!ranges.unitStep || failed(queryExactLogicalRange(ranges)))
@@ -2613,10 +2606,10 @@ bool fullStaticReductionNeedsTraversal(ContractOp contract) {
     for (MakeRangeOp range : ranges.roots) {
       auto begin = integer(range.getLogicalStart());
       auto end = integer(range.getLogicalStop());
-      if (!begin || !end || integer(range.getExtent()) != extent.getValue() ||
+      if (!begin || !end || integer(range.getExtent()) != *extent ||
           !samePhysicalScalarExpression(range.getStart(),
                                         range.getLogicalStart()) ||
-          static_cast<__int128>(*end) - *begin != extent.getValue())
+          static_cast<__int128>(*end) - *begin != *extent)
         return false;
     }
   }

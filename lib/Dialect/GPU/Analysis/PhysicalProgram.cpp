@@ -2199,6 +2199,34 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     return;
   }
   if (auto argument = dyn_cast<BlockArgument>(value)) {
+    if (auto reduce = dyn_cast<ReduceOp>(argument.getOwner()->getParentOp())) {
+      unsigned index = argument.getArgNumber();
+      unsigned count = reduce.getIdentityCount();
+      if (index >= 2 * count) {
+        Value capture = reduce.getInputs()[reduce.getSourceCount() + count +
+                                          index - 2 * count];
+        collectAxisRanges(capture, fragmentAxis, result, visited);
+        return;
+      }
+      Value source = reduce.getInputs()[index % count];
+      auto sourceType = dyn_cast<FragmentType>(source.getType());
+      if (!sourceType) {
+        result.state = PhysicalFactState::Unknown;
+        appendUnique(result.blockers, reduce);
+        return;
+      }
+      SmallVector<unsigned> freeAxes;
+      for (unsigned axis = 0; axis < sourceType.getShape().size(); ++axis)
+        if (!llvm::is_contained(reduce.getAxes(), static_cast<int64_t>(axis)))
+          freeAxes.push_back(axis);
+      if (fragmentAxis >= freeAxes.size()) {
+        result.state = PhysicalFactState::Unknown;
+        appendUnique(result.blockers, reduce);
+        return;
+      }
+      collectAxisRanges(source, freeAxes[fragmentAxis], result, visited);
+      return;
+    }
     SmallVector<Value, 2> outer = structuredSourcesForArgument(argument);
     bool followed = false;
     for (Value related : outer) {
@@ -2517,31 +2545,17 @@ void PhysicalProgramAnalysis::collectAxisRanges(
   }
   if (auto reduce = dyn_cast<ReduceOp>(operation)) {
     auto opResult = dyn_cast<OpResult>(value);
-    if (!opResult || opResult.getResultNumber() >= reduce.getSourceCount()) {
+    auto yield = dyn_cast<YieldOp>(reduce.getCombine().front().getTerminator());
+    if (!opResult || !yield ||
+        opResult.getResultNumber() >= yield.getValues().size()) {
       result.state = PhysicalFactState::Unknown;
       appendUnique(result.blockers, operation);
       return;
     }
-    auto source = dyn_cast<FragmentType>(
-        reduce.getInputs()[opResult.getResultNumber()].getType());
-    if (!source) {
-      result.state = PhysicalFactState::Unknown;
-      appendUnique(result.blockers, operation);
-      return;
-    }
-    llvm::SmallDenseSet<int64_t> reduced(reduce.getAxes().begin(),
-                                         reduce.getAxes().end());
-    SmallVector<unsigned> freeAxes;
-    for (unsigned axis = 0; axis < source.getShape().size(); ++axis)
-      if (!reduced.contains(axis))
-        freeAxes.push_back(axis);
-    if (fragmentAxis >= freeAxes.size()) {
-      result.state = PhysicalFactState::Unknown;
-      appendUnique(result.blockers, operation);
-      return;
-    }
-    collectAxisRanges(reduce.getInputs()[opResult.getResultNumber()],
-                      freeAxes[fragmentAxis], result, visited);
+    // Tuple results can depend on another component through the combine body
+    // (for example an arg-reduce index selected by the value comparison).
+    collectAxisRanges(yield.getValues()[opResult.getResultNumber()],
+                      fragmentAxis, result, visited);
     return;
   }
   if (auto contract = dyn_cast<ContractOp>(operation)) {

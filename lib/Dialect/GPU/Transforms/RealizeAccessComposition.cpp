@@ -35,6 +35,23 @@ FailureOr<Value> replayFragmentValue(OpBuilder &builder, Value value,
   auto fragment = dyn_cast<FragmentType>(value.getType());
   if (!fragment)
     return value;
+  if (auto range = value.getDefiningOp<MakeRangeOp>()) {
+    Value replacement;
+    for (const auto &entry : mapping.getValueMap()) {
+      auto known = entry.first.getDefiningOp<MakeRangeOp>();
+      if (!known || !sameLogicalRange(range, known) ||
+          !samePhysicalScalarExpression(range.getStart(), known.getStart()) ||
+          !samePhysicalScalarExpression(range.getExtent(), known.getExtent()))
+        continue;
+      if (replacement && replacement != entry.second)
+        return failure();
+      replacement = entry.second;
+    }
+    if (!replacement)
+      return failure();
+    mapping.map(value, replacement);
+    return replacement;
+  }
   if (auto extract = value.getDefiningOp<ExtractOp>()) {
     auto record = extract.getRecord().getDefiningOp<MakeRecordOp>();
     if (!record)
@@ -50,7 +67,7 @@ FailureOr<Value> replayFragmentValue(OpBuilder &builder, Value value,
       value, std::nullopt, PhysicalReplayScope::Coordinate,
       /*allowAccesses=*/false);
   Operation *producer = value.getDefiningOp();
-  if (!producer || isa<MakeRangeOp>(producer) || !replay.isReplayable())
+  if (!producer || !replay.isReplayable())
     return failure();
   for (Value operand : producer->getOperands()) {
     FailureOr<Value> replacement =

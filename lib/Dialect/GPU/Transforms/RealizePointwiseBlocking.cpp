@@ -14,6 +14,7 @@
 #include "llvm/Support/MathExtras.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Transforms/RegionUtils.h"
@@ -249,71 +250,6 @@ struct ProductConstraint {
   unsigned parameterCount = 0;
 };
 
-PhysicalExprAttr replaceParameter(PhysicalExprAttr current, StringAttr name,
-                                  PhysicalExprAttr replacement) {
-  auto kind = static_cast<PhysicalExprKind>(current.getKind());
-  if (kind == PhysicalExprKind::Parameter && current.getSymbol() == name)
-    return replacement;
-  SmallVector<Attribute> operands;
-  bool changed = false;
-  for (Attribute operand : current.getOperands()) {
-    auto rewritten = replaceParameter(cast<PhysicalExprAttr>(operand), name,
-                                      replacement);
-    operands.push_back(rewritten);
-    changed |= rewritten != operand;
-  }
-  if (!changed)
-    return current;
-  return PhysicalExprAttr::get(current.getContext(), current.getKind(),
-                               current.getValue(), current.getSymbol(),
-                               ArrayAttr::get(current.getContext(), operands));
-}
-
-Attribute replaceParameter(Attribute current, StringAttr name,
-                           PhysicalExprAttr replacement) {
-  if (auto expression = dyn_cast<PhysicalExprAttr>(current))
-    return replaceParameter(expression, name, replacement);
-  if (auto array = dyn_cast<ArrayAttr>(current)) {
-    SmallVector<Attribute> values;
-    bool changed = false;
-    for (Attribute value : array) {
-      Attribute rewritten = replaceParameter(value, name, replacement);
-      values.push_back(rewritten);
-      changed |= rewritten != value;
-    }
-    return changed ? Attribute(ArrayAttr::get(current.getContext(), values))
-                   : current;
-  }
-  if (auto dictionary = dyn_cast<DictionaryAttr>(current)) {
-    SmallVector<NamedAttribute> values;
-    bool changed = false;
-    for (NamedAttribute value : dictionary) {
-      Attribute rewritten =
-          replaceParameter(value.getValue(), name, replacement);
-      values.emplace_back(value.getName(), rewritten);
-      changed |= rewritten != value.getValue();
-    }
-    return changed
-               ? Attribute(DictionaryAttr::get(current.getContext(), values))
-               : current;
-  }
-  return current;
-}
-
-void replaceParameterAttributes(Operation *operation, StringAttr name,
-                                PhysicalExprAttr replacement) {
-  SmallVector<NamedAttribute> attributes;
-  bool changed = false;
-  for (NamedAttribute attribute : operation->getAttrs()) {
-    Attribute rewritten =
-        replaceParameter(attribute.getValue(), name, replacement);
-    attributes.emplace_back(attribute.getName(), rewritten);
-    changed |= rewritten != attribute.getValue();
-  }
-  if (changed)
-    operation->setAttrs(DictionaryAttr::get(operation->getContext(), attributes));
-}
-
 bool collectProductConstraint(PhysicalExprAttr extent,
                               ProductConstraint &constraint) {
   auto kind = static_cast<PhysicalExprKind>(extent.getKind());
@@ -341,10 +277,11 @@ bool collectProductConstraint(PhysicalExprAttr extent,
              cast<PhysicalExprAttr>(extent.getOperands()[1]), constraint);
 }
 
-bool collectProductConstraint(FragmentType fragment,
+bool collectProductConstraint(FragmentType fragment, ArrayRef<int64_t> axes,
                               ProductConstraint &constraint) {
-  for (Attribute extent : fragment.getShape())
-    if (!collectProductConstraint(cast<PhysicalExprAttr>(extent), constraint))
+  for (int64_t axis : axes)
+    if (!collectProductConstraint(
+            cast<PhysicalExprAttr>(fragment.getShape()[axis]), constraint))
       return false;
   return true;
 }
@@ -358,71 +295,62 @@ LogicalResult bindStructurallyRequiredStaticFragments(func::FuncOp kernel) {
     auto result = dyn_cast<FragmentType>(reshape.getResult().getType());
     if (!source || !result)
       continue;
-    ProductConstraint sourceProduct;
-    ProductConstraint resultProduct;
-    if (!collectProductConstraint(source, sourceProduct) ||
-        !collectProductConstraint(result, resultProduct) ||
-        sourceProduct.parameterCount != 1 ||
-        resultProduct.parameterCount != 0 ||
-        resultProduct.constant % sourceProduct.constant != 0)
-      continue;
-    FailureOr<ParameterOp> declaration =
-        queryParameterBySymbol(kernel, sourceProduct.parameter);
-    if (failed(declaration))
-      continue;
-    ParameterOp parameter = *declaration;
-    PhysicalParameterBinding binding = queryParameterBinding(parameter);
-    if (!binding.isExact() || !binding.source)
-      continue;
-    int64_t candidate = resultProduct.constant / sourceProduct.constant;
-    if (!llvm::is_contained(
-            parameter.getParameter().getCandidates().asArrayRef(), candidate))
-      return reshape.emitOpError(
-          "reshape requires a static fragment extent outside its legal domain");
-    auto found = required.find(parameter);
-    if (found != required.end() && found->second != candidate)
-      return parameter.emitOpError(
-          "one static fragment has incompatible structural extent requirements");
-    required[parameter] = candidate;
+    for (Attribute attribute : reshape.getReassociation()) {
+      auto group = cast<ReshapeGroupAttr>(attribute);
+      auto sourceAxes = group.getSourceAxes().asArrayRef();
+      auto resultAxes = group.getResultAxes().asArrayRef();
+      // Unmerged axes carry their tile extent through the reshape. They do
+      // not become full-coverage dimensions because other axes are reshaped.
+      if (sourceAxes.size() <= 1 && resultAxes.size() <= 1)
+        continue;
+      ProductConstraint sourceProduct;
+      ProductConstraint resultProduct;
+      if (!collectProductConstraint(source, sourceAxes, sourceProduct) ||
+          !collectProductConstraint(result, resultAxes, resultProduct) ||
+          sourceProduct.parameterCount != 1 ||
+          resultProduct.parameterCount != 0 ||
+          resultProduct.constant % sourceProduct.constant != 0)
+        continue;
+      FailureOr<ParameterOp> declaration =
+          queryParameterBySymbol(kernel, sourceProduct.parameter);
+      if (failed(declaration))
+        continue;
+      ParameterOp parameter = *declaration;
+      PhysicalParameterBinding binding = queryParameterBinding(parameter);
+      if (!binding.isExact() || !binding.source)
+        continue;
+      int64_t candidate = resultProduct.constant / sourceProduct.constant;
+      if (!llvm::is_contained(
+              parameter.getParameter().getCandidates().asArrayRef(), candidate))
+        return reshape.emitOpError(
+            "reshape requires a static fragment extent outside its legal domain");
+      auto found = required.find(parameter);
+      if (found != required.end() && found->second != candidate)
+        return parameter.emitOpError(
+            "one static fragment has incompatible structural extent requirements");
+      required[parameter] = candidate;
+    }
   }
 
   for (auto [parameter, candidate] : required) {
     StringAttr parameterName = parameter.getParameter().getName();
-    PhysicalParameterBinding binding = queryParameterBinding(parameter);
-    if (!binding.isExact() || !binding.source)
-      return parameter.emitOpError(
-          "structural fragment parameter lost its typed source-axis binding");
-    PhysicalSourceAxis source = *binding.source;
     PhysicalExprAttr fixedExtent =
         expression(kernel.getContext(), PhysicalExprKind::Constant, candidate);
-    replaceParameterAttributes(kernel.getOperation(), parameterName,
-                               fixedExtent);
-    kernel.walk([&](Operation *operation) {
-      replaceParameterAttributes(operation, parameterName, fixedExtent);
-    });
-    SmallVector<Value> fragmentRoots;
-    kernel.walk([&](Operation *operation) {
-      fragmentRoots.append(operation->getResults().begin(),
-                           operation->getResults().end());
-      for (Region &region : operation->getRegions())
-        for (Block &block : region)
-          fragmentRoots.append(block.getArguments().begin(),
-                               block.getArguments().end());
-    });
-    for (Value root : fragmentRoots)
-      retargetSourceExtent(root, source, fixedExtent);
-    SmallVector<MakeRangeOp> ranges;
-    kernel.walk([&](MakeRangeOp range) {
-      if (sourceAxisIdentity(range) == source)
-        ranges.push_back(range);
-    });
-    for (MakeRangeOp range : ranges) {
-      retargetSourceExtent(range.getResult(), source, fixedExtent);
-      OpBuilder builder(range);
-      Value fixed =
-          builder.create<arith::ConstantIndexOp>(range.getLoc(), candidate);
-      range->setOperand(1, fixed);
-    }
+    // A parameter binding applies to every typed occurrence of its symbol,
+    // including values reached through positional axis rebinding.
+    AttrTypeReplacer replacer;
+    replacer.addReplacement(
+        [&](PhysicalExprAttr current) -> std::optional<Attribute> {
+          if (current.getKind() ==
+                  static_cast<uint32_t>(PhysicalExprKind::Parameter) &&
+              current.getSymbol() == parameterName)
+            return fixedExtent;
+          return std::nullopt;
+        });
+    replacer.recursivelyReplaceElementsIn(kernel.getOperation(),
+                                          /*replaceAttrs=*/true,
+                                          /*replaceLocs=*/false,
+                                          /*replaceTypes=*/true);
     OpBuilder builder(parameter);
     Value fixed =
         builder.create<arith::ConstantIndexOp>(parameter.getLoc(), candidate);
