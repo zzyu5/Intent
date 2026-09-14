@@ -210,7 +210,7 @@ def validate_program(path: Path, *, language: str, generated_source: bool = Fals
     intent_names = set()
     torch_names = set()
     torch_result_types = {"max", "min"}
-    torch_api = {"Tensor", "dtype", "device", "empty", "empty_like", "empty_strided", "finfo", "iinfo", "is_tensor", "numel",
+    torch_api = {"Tensor", "Size", "dtype", "device", "empty", "empty_like", "empty_strided", "zeros", "finfo", "iinfo", "is_tensor", "numel",
                  "bool", "int", "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "long", "short",
                  "float", "float16", "float32", "float64", "bfloat16", "half", "double", "complex64", "complex128",
                  "strided", "contiguous_format", "preserve_format", "channels_last"}

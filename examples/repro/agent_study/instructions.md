@@ -16,6 +16,8 @@ allowed. Torch may allocate empty tensors and perform metadata-only views; GPU
 arithmetic, reductions, copies, conversions and library kernels must use the
 assigned language. Do not replace computation with PyTorch, CUDA extensions or
 another language. Do not infer outputs from the particular input distribution.
+When the task contract requires a constant CPU zero tensor, its host construction
+may use torch.zeros with device="cpu"; this does not permit Torch GPU operations.
 The editing directory is not a Git repository. Do not run Git commands or try to
 install/import the execution environment here; submission invokes that environment.
 
