@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from intent.frontend.mlir import MlirValue
 from intent.frontend.semantics import BufferType
+from intent.frontend.semantics import BinaryOperator
 from intent.frontend.semantics import DomainFlavor
 from intent.frontend.semantics import DomainType
 from intent.frontend.semantics import LogicalIndexType
@@ -96,6 +97,18 @@ def _domain(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
             lowerer.zero_based_domain_extents[stop] = extent
     else:
         extent = lowerer.fresh_dynamic_dimension("domain_extent")
+        if all(lowerer.dtype_and_shape(value.type, node)[0] == intent_index
+               for value in operands[:2]):
+            length = lowerer.emit(
+                OperationKind.BINARY,
+                lowerer.location(node),
+                operands=(operands[1], operands[0]),
+                result_types=(ScalarType(intent_index),),
+                attributes={"operator_kind": BinaryOperator.SUBTRACT},
+            ).results[0]
+            bounds = lowerer.integer_expression_bounds(length)
+            if bounds is not None and bounds[0] >= 0:
+                extent = lowerer.integer_shape_dimension(length, extent)
     operation = lowerer.emit(
         OperationKind.DOMAIN,
         lowerer.location(node),
@@ -109,6 +122,7 @@ def _domain(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     )
     result = operation.results[0]
     lowerer.iteration_shapes[result] = (extent,)
+    lowerer.iteration_bounds[result] = operands[:2]
     return result
 
 

@@ -233,12 +233,18 @@ def lower_index(
                             )
                         bounds.append(bound)
                     start, stop = bounds
-                    if start.type == stop.type and isinstance(start.type, ScalarType):
+                    if (
+                        isinstance(start.type, (ScalarType, LogicalIndexType))
+                        and isinstance(stop.type, (ScalarType, LogicalIndexType))
+                        and lowerer.dtype_and_shape(start.type, raw_term)[0]
+                        == lowerer.dtype_and_shape(stop.type, raw_term)[0]
+                    ):
+                        length_type = ScalarType(lowerer.dtype_and_shape(stop.type, raw_term)[0])
                         length = lowerer.emit(
                             OperationKind.BINARY,
                             lowerer.location(raw_term),
                             operands=(stop, start),
-                            result_types=(stop.type,),
+                            result_types=(length_type,),
                             attributes={"operator_kind": BinaryOperator.SUBTRACT},
                         ).results[0]
                         dimension = lowerer.integer_shape_dimension(length, dimension)
@@ -343,21 +349,34 @@ def _subscript_region(
         if isinstance(source.type, DomainType)
         else source.type.source_id
     )
+    known_bounds = lowerer.iteration_bounds.get(source)
+    result_bounds = known_bounds
     if not has_start and not has_stop:
         extent_shape = lowerer.dynamic_shape_for_region(source)
     else:
         extent_shape = (lowerer.fresh_dynamic_dimension("subregion_extent"),)
-        if has_start and has_stop:
+        start_expression = (boundary_expressions[0] if has_start
+                            else known_bounds[0] if known_bounds else None)
+        stop_expression = (boundary_expressions[-1] if has_stop
+                           else known_bounds[1] if known_bounds else None)
+        if start_expression is not None and stop_expression is not None:
             stop, start = lowerer.coerce_pair(
-                boundary_expressions[1], boundary_expressions[0], node
+                stop_expression, start_expression, node
             )
-            if stop.type == start.type and isinstance(stop.type, ScalarType):
-                operands[1:] = [start, stop]
+            result_bounds = (start, stop)
+            if (
+                isinstance(start.type, (ScalarType, LogicalIndexType))
+                and isinstance(stop.type, (ScalarType, LogicalIndexType))
+                and lowerer.dtype_and_shape(start.type, node)[0]
+                == lowerer.dtype_and_shape(stop.type, node)[0]
+            ):
+                length_type = ScalarType(lowerer.dtype_and_shape(stop.type, node)[0])
+                operands[1:] = ([start] if has_start else []) + ([stop] if has_stop else [])
                 length = lowerer.emit(
                     OperationKind.BINARY,
                     lowerer.location(node),
                     operands=(stop, start),
-                    result_types=(stop.type,),
+                    result_types=(length_type,),
                     attributes={"operator_kind": BinaryOperator.SUBTRACT},
                 ).results[0]
                 # A valid unit-step subregion has length end - begin. Reuse
@@ -379,6 +398,8 @@ def _subscript_region(
     )
     result = operation.results[0]
     lowerer.iteration_shapes[result] = extent_shape
+    if result_bounds is not None:
+        lowerer.iteration_bounds[result] = result_bounds
     return result
 
 

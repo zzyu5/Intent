@@ -11,6 +11,7 @@ from intent.frontend.semantics import ConstexprType
 from intent.frontend.semantics import BufferType
 from intent.frontend.semantics import BinaryOperator
 from intent.frontend.semantics import DynamicDim
+from intent.frontend.semantics import DomainType
 from intent.frontend.semantics import Effect
 from intent.frontend.mlir import FunctionState
 from intent.frontend.semantics import ValueType
@@ -86,6 +87,7 @@ class FunctionLowerer:
         self.inline_helpers: list[InlineHelperFrame] = []
         self.ragged_mappings: dict[MlirValue, MlirValue] = {}
         self.iteration_shapes: dict[MlirValue, tuple[object, ...]] = {}
+        self.iteration_bounds: dict[MlirValue, tuple[MlirValue, MlirValue]] = {}
         self.dimension_values: dict[MlirValue, object] = {}
         self.zero_based_domain_extents: dict[MlirValue, object] = {}
         self.dimension_origins: dict[object, list[ShapeDimension]] = {}
@@ -481,6 +483,15 @@ class FunctionLowerer:
         )
         key = (value.type, terms)
         dimension = self._integer_shape_dimensions.get(key)
+        if dimension is None and not terms[0] and isinstance(value.type, ScalarType):
+            dtype = value.type.dtype
+            modulus = 1 << dtype.bits
+            constant_extent = terms[1] % modulus
+            if dtype.category in (DTypeCategory.SIGNED_INTEGER, DTypeCategory.INDEX):
+                if constant_extent >= modulus // 2:
+                    constant_extent -= modulus
+            if constant_extent >= 0:
+                dimension = StaticDim(constant_extent)
         if dimension is None:
             dimension = self.zero_based_domain_extents.get(value)
         if dimension is None:
@@ -488,6 +499,37 @@ class FunctionLowerer:
         self._integer_shape_dimensions[key] = dimension
         self.dimension_values[value] = dimension
         return dimension
+
+    def integer_expression_bounds(self, value: MlirValue) -> tuple[int, int] | None:
+        if not isinstance(value.type, (ScalarType, LogicalIndexType)):
+            return None
+        dtype = value.type.dtype if isinstance(value.type, ScalarType) else intent_index
+        terms, constant = self._integer_shape_terms.get(
+            value, (frozenset({(("value", value), 1)}), 0)
+        )
+        lower = upper = constant
+        for (kind, atom), coefficient in terms:
+            if kind != "value" or not isinstance(atom.type, LogicalIndexType):
+                return None
+            domain = next((domain for domain in self.iteration_bounds
+                           if isinstance(domain.type, DomainType)
+                           and domain.type.origin_id == atom.type.source_id), None)
+            if domain is None:
+                return None
+            start, stop = self.iteration_bounds[domain]
+            start_bounds = self.integer_expression_bounds(start)
+            stop_bounds = self.integer_expression_bounds(stop)
+            if start_bounds is None or stop_bounds is None:
+                return None
+            begin, end = start_bounds[0], stop_bounds[1] - 1
+            if begin > end:
+                return None
+            lower += coefficient * (begin if coefficient > 0 else end)
+            upper += coefficient * (end if coefficient > 0 else begin)
+        signed = dtype.category in (DTypeCategory.SIGNED_INTEGER, DTypeCategory.INDEX)
+        minimum = -(1 << (dtype.bits - 1)) if signed else 0
+        maximum = (1 << (dtype.bits - int(signed))) - 1
+        return (lower, upper) if minimum <= lower <= upper <= maximum else None
 
     def read_value(self, expression: Expression, node: ast.AST) -> MlirValue:
         value = self.materialize(expression, node)
