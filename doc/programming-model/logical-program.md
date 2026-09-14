@@ -145,7 +145,7 @@ emit(A ++ B, state)
 
 `summarize`/`combine`/`apply`/`emit`都是typed pure helpers。`emit`产生与该source slice同一logical成员关系的output；operation把各slice outputs重新组成原source axis上的结果，并返回`apply(summarize(full_source), initial_state)`作为final state。Compiler选择的segment数量、边界和内部prefix states不可由作者观察，也不能成为result shape或ABI。若算法本身输出per-chunk states或chunk数量出现在ABI中，chunk是logical data，作者应使用显式chunk domain、source subregions与ordinary scan，而不是`region_scan`。
 
-`reduce/scan`处理element summaries；`region_fold/region_scan`只在作者确实写下region-level summarizer或emitter时使用。它们可共享summary schema与pure helper检查，但不强制使用相同的顺序合同或physical realization。只有region body已经通过对应的ordinary reduce/scan声明相同的代数、顺序及prefix语义时，frontend才可canonicalize回该operation；不能把仅保证结合的ordered region fold改成允许交换的reduce。
+`reduce/scan`处理element summaries；`region_fold/region_scan`只在作者确实写下region-level summarizer或emitter时使用。Compiler依据这些作者定义形成合法的分段遍历、段内计算、摘要合并与输出结构，保留各operation的source顺序和effects合同；内部operations继续按各自语义lowering。
 
 若 page、window、group 或 chunk boundary本身影响读取集合、输出shape或ABI，作者显式计算边界并构造source-derived subregion。若boundary只服务physical blocking，作者不写其extent；只有上述homomorphism使compiler-selected segmentation具有唯一语义。
 
