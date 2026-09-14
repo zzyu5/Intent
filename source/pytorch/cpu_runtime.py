@@ -124,6 +124,21 @@ def dequant_bf16_fp4_matmul(activation, packed):
     return (activation.float() @ decoded.float().T).bfloat16()
 
 
+def deepgemm_fp8_2xacc(lhs, rhs, lhs_scale, rhs_scale):
+    left = (lhs.float() * lhs_scale[:, :, None]).flatten(1)
+    right = (rhs.float() * rhs_scale.repeat_interleave(128, dim=0)[:, :, None]).flatten(1)
+    return (left @ right.T).bfloat16()
+
+
+def scaled_fp8_splitk_matmul(lhs, rhs, output, lhs_scale, rhs_scale):
+    for split in range(lhs.shape[2]):
+        left = lhs[:, :, split, :].float().flatten(1)
+        right = rhs[:, split, :, :].float().flatten(0, 1)
+        partial = ((left @ right) * lhs_scale * rhs_scale).half()
+        output.add_(partial)
+    return output
+
+
 def f32_groupwise_fp8_quantize(x, scales):
     values = x.reshape(x.shape[0], -1, 128)
     scale = values.abs().amax(dim=-1).clamp_min(1e-4) / 448.0

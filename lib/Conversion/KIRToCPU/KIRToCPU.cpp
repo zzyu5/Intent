@@ -1290,6 +1290,59 @@ private:
       values.map(operation.getResult(), dotProduct(lhs, rhs, extent, accumulator, {map, map}, loc));
       return success();
     }
+    if (!batchRank && pairs.size() > 1 && resultType.getRank() == 2 &&
+        lhsType.getRank() == static_cast<int64_t>(pairs.size()) + 1 &&
+        rhsType.getRank() == static_cast<int64_t>(pairs.size()) + 1 && (floating || integer)) {
+      Location loc = operation.getLoc();
+      Value lhs = values.lookup(operation.getLhs()), rhs = values.lookup(operation.getRhs());
+      SmallVector<unsigned> leftAxes, rightAxes;
+      SmallVector<Value> reductionSizes;
+      Value depth = constant(loc, 1);
+      for (Attribute pair : pairs) {
+        auto axes = cast<ArrayAttr>(pair);
+        leftAxes.push_back(cast<IntegerAttr>(axes[0]).getInt());
+        rightAxes.push_back(cast<IntegerAttr>(axes[1]).getInt());
+        Value size = builder.create<memref::DimOp>(loc, lhs, leftAxes.back());
+        reductionSizes.push_back(size);
+        depth = builder.create<arith::MulIOp>(loc, depth, size);
+      }
+      auto pack = [&](Value source, ArrayRef<unsigned> axes, bool left) {
+        auto type = cast<MemRefType>(source.getType());
+        unsigned freeAxis = 0;
+        while (llvm::is_contained(axes, freeAxis)) ++freeAxis;
+        Value freeSize = builder.create<memref::DimOp>(loc, source, freeAxis);
+        SmallVector<int64_t> shape = left
+            ? SmallVector<int64_t>{type.getDimSize(freeAxis), ShapedType::kDynamic}
+            : SmallVector<int64_t>{ShapedType::kDynamic, type.getDimSize(freeAxis)};
+        SmallVector<Value> sizes = left ? SmallVector<Value>{freeSize, depth}
+                                       : SmallVector<Value>{depth, freeSize};
+        Value packed = allocate(RankedTensorType::get(shape, inputElement), sizes, loc);
+        // Sliced paired axes need not be physically contiguous. Materialize
+        // their logical coordinates before exposing the rank-two contraction.
+        builder.create<linalg::GenericOp>(loc, ValueRange{}, ValueRange{packed},
+            SmallVector<AffineMap>{builder.getMultiDimIdentityMap(2)},
+            SmallVector<utils::IteratorType>(2, utils::IteratorType::parallel),
+            [&](OpBuilder &b, Location loc, ValueRange) {
+              SmallVector<Value> coordinates(type.getRank());
+              coordinates[freeAxis] = b.create<linalg::IndexOp>(loc, left ? 0 : 1);
+              Value linear = b.create<linalg::IndexOp>(loc, left ? 1 : 0);
+              for (int64_t position = axes.size() - 1; position > 0; --position) {
+                coordinates[axes[position]] = b.create<arith::RemSIOp>(loc, linear, reductionSizes[position]);
+                linear = b.create<arith::DivSIOp>(loc, linear, reductionSizes[position]);
+              }
+              coordinates[axes[0]] = linear;
+              b.create<linalg::YieldOp>(loc, ValueRange{b.create<memref::LoadOp>(loc, source, coordinates)});
+            });
+        return packed;
+      };
+      Value left = pack(lhs, leftAxes, true), right = pack(rhs, rightAxes, false);
+      auto sizes = extents(resultType, loc);
+      if (failed(sizes)) return failure();
+      Value output = allocate(resultType, *sizes, loc);
+      matrix(left, right, output, loc);
+      values.map(operation.getResult(), output);
+      return success();
+    }
     if (lhsType.getRank() != batchRank + 2 || rhsType.getRank() != batchRank + 2 || pairs.size() != 1 ||
         cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[0]).getInt() != batchRank + 1 ||
         cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[1]).getInt() != batchRank ||
@@ -1407,12 +1460,15 @@ private:
       return format == ScaledFormat::E4M3 ? isa<Float8E4M3FNType>(element)
            : format == ScaledFormat::E2M1 && element.isInteger(8);
     };
+    auto scale = [](Value value) {
+      Type element = cast<RankedTensorType>(value.getType()).getElementType();
+      return element.isInteger(8) || element.isF32();
+    };
     if (!outputType.getElementType().isF32() ||
         !carrier(operation.getLhs(), operation.getLhsFormat()) ||
         !carrier(operation.getRhs(), operation.getRhsFormat()) ||
-        !cast<RankedTensorType>(operation.getLhsScale().getType()).getElementType().isInteger(8) ||
-        !cast<RankedTensorType>(operation.getRhsScale().getType()).getElementType().isInteger(8))
-      return operation.emitError("CPU scaled contraction requires E4M3 or E2M1 carriers, byte E8M0 scales and f32 accumulation");
+        !scale(operation.getLhsScale()) || !scale(operation.getRhsScale()))
+      return operation.emitError("CPU scaled contraction requires E4M3 or E2M1 carriers, byte E8M0 or f32 scales and f32 accumulation");
     Location loc = operation.getLoc();
     int64_t groupSize = operation.getLhsGroupSize();
     Value lhs = values.lookup(operation.getLhs()), rhs = values.lookup(operation.getRhs());
@@ -1460,13 +1516,16 @@ private:
               number = b.create<arith::SelectOp>(loc, negative, b.create<arith::NegFOp>(loc, number), number);
             }
             Value rawScale = b.create<memref::LoadOp>(loc, scales, ValueRange{free, group});
-            Value exponent = b.create<arith::ExtUIOp>(loc, b.getI32Type(), rawScale);
-            Value bits = b.create<arith::ShLIOp>(loc, exponent, integer(23));
-            Value subnormal = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, exponent, integer(0));
-            bits = b.create<arith::SelectOp>(loc, subnormal, integer(0x00400000), bits);
-            Value nan = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, exponent, integer(255));
-            bits = b.create<arith::SelectOp>(loc, nan, integer(0x7fc00000), bits);
-            Value scale = b.create<arith::BitcastOp>(loc, b.getF32Type(), bits);
+            Value scale = rawScale;
+            if (!scale.getType().isF32()) {
+              Value exponent = b.create<arith::ExtUIOp>(loc, b.getI32Type(), rawScale);
+              Value bits = b.create<arith::ShLIOp>(loc, exponent, integer(23));
+              Value subnormal = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, exponent, integer(0));
+              bits = b.create<arith::SelectOp>(loc, subnormal, integer(0x00400000), bits);
+              Value nan = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, exponent, integer(255));
+              bits = b.create<arith::SelectOp>(loc, nan, integer(0x7fc00000), bits);
+              scale = b.create<arith::BitcastOp>(loc, b.getF32Type(), bits);
+            }
             b.create<linalg::YieldOp>(loc, ValueRange{b.create<arith::MulFOp>(loc, number, scale)});
           });
       return decoded;

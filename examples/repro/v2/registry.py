@@ -300,6 +300,9 @@ MOJO = (
     Entry("w4a8_gemm", "M4096-K4096-N14336-i8-packed-w4-i32-NM-8cores-host", "w4a8_packed_matmul", ("contraction/weight_only_int4.py:w4a8_packed_matmul",), "source/pytorch/cpu_runtime.py"),
     Entry("bitnet_int2_decode", "M1-N4096-K4096-i8-interleaved-u2-i32-8cores-host", "bitnet_int2_matmul", ("contraction/weight_only_int4.py:bitnet_int2_matmul",), "source/pytorch/cpu_runtime.py"),
     Entry("dequant_bf16_fp4", "M4096-N4096-K4096-bf16-packed-fp4-8cores-host", "dequant_bf16_fp4_matmul", ("contraction/weight_only_int4.py:dequant_bf16_fp4_matmul",), "source/pytorch/cpu_runtime.py"),
+    Entry("deepgemm_fp8_2xacc", "M4096-N4096-K4096-e4m3-f32scales-bf16-8cores-host", "deepgemm_fp8_2xacc", ("contraction/block_scaled.py:deepgemm_fp8_2xacc",), "source/pytorch/cpu_runtime.py"),
+    Entry("scaled_fp8_gemm", "M4096-N14336-K4096-e4m3-scale1-f16-8cores-host", "scaled_fp8_matmul", ("contraction/block_scaled.py:scaled_fp8_matmul",), None),
+    Entry("scaled_fp8_splitk_gemm", "M4096-N14336-K4096-e4m3-split4-f16-8cores-host", "scaled_fp8_splitk_matmul", ("contraction/block_scaled.py:scaled_fp8_splitk_matmul",), "source/pytorch/cpu_runtime.py"),
 )
 
 

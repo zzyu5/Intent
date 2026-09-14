@@ -3,6 +3,7 @@ from dataclasses import replace
 import intent
 import torch
 from kernels.contraction.block_scaled import block_scaled_matmul
+from kernels.contraction.block_scaled import deepgemm_fp8_2xacc, scaled_fp8_matmul, scaled_fp8_splitk_matmul
 from kernels.contraction.block_sparse import block_sparse_matmul
 from kernels.contraction.gemm import Activation, gemm_f32, bf16_gemm, gemm as half_gemm_definition
 from kernels.contraction.gemm import quantized_gemm as quantized_gemm_definition
@@ -22,6 +23,8 @@ from kernels.contraction.vector import matrix_vector as matrix_vector_definition
 from kernels.contraction.vector import vector_matrix as vector_matrix_definition
 from kernels.contraction.vector import vector_outer as vector_outer_definition
 from ...model import Tolerance, IntegerTolerance, SimilarityTolerance
+from ...model import PreparedComparison, PreparedLaunch
+from ...measurement import report_stage
 from ...loading import load_module
 from .common import configure_cpu_budget, prepare_comparison, prepare_host_comparison
 
@@ -221,6 +224,54 @@ def dequant_bf16_fp4(context):
                                    "dequant_bf16_fp4_matmul", Tolerance(atol=1.0, rtol=2e-2))
 
 
+def deepgemm_fp8(context):
+    lhs_values = torch.randn((4096, 4096), dtype=torch.bfloat16).view(4096, 32, 128)
+    lhs_max = lhs_values.abs().float().amax(dim=2).clamp_min(1e-4)
+    lhs = (lhs_values * (448.0 / lhs_max[:, :, None])).to(torch.float8_e4m3fn)
+    rhs_values = torch.randn((4096, 4096), dtype=torch.bfloat16).view(32, 128, 32, 128)
+    rhs_max = rhs_values.abs().float().amax(dim=(1, 3), keepdim=True).clamp_min(1e-4)
+    rhs = (rhs_values * (448.0 / rhs_max)).to(torch.float8_e4m3fn).view(4096, 32, 128)
+    return prepare_host_comparison(context, deepgemm_fp8_2xacc,
+                                   (lhs, rhs, lhs_max / 448.0, (rhs_max / 448.0).view(32, 32)),
+                                   "deepgemm_fp8_2xacc", Tolerance(atol=1.0, rtol=2e-2))
+
+
+def scaled_fp8(context):
+    lhs = torch.randn((4096, 4096), dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    rhs = torch.randn((4096, 14336), dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    report_stage("generated_compilation")
+    artifact = intent.compile(scaled_fp8_matmul, target=context.target, compiler=context.compiler,
+                              tuning_config=context.tuning_config)
+    state = {}
+
+    def launch():
+        state["output"] = artifact.run(lhs, rhs, 1.0, 1.0)
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(PreparedLaunch(launch, lambda: state["output"]), None, None,
+        cuda_graph=False, status="run_only", device_type="cpu", cpu_host_timing=True,
+        note="原作者普通 scalar-scaled FP8 GEMM，复用同文件 split-K production 的4096x4096x14336输入规模、FP8 dtype和scale1，输出f16；没有该entry的现成reference，仅验证完整调用可运行，含输出分配和同步。")
+
+
+def scaled_fp8_splitk(context):
+    lhs = torch.randn((4096, 4096), dtype=torch.bfloat16).to(torch.float8_e4m3fn).view(4096, 4, 4, 256)
+    rhs = torch.randn((4096, 14336), dtype=torch.bfloat16).to(torch.float8_e4m3fn).view(4, 4, 256, 14336)
+    report_stage("generated_compilation")
+    artifact = intent.compile(scaled_fp8_splitk_matmul, target=context.target, compiler=context.compiler,
+                              tuning_config=context.tuning_config)
+    runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_reference")
+
+    def side(function):
+        output = torch.zeros((4096, 14336), dtype=torch.float16)
+        return PreparedLaunch(lambda: function(lhs, rhs, output, 1.0, 1.0), lambda: output,
+                              prepare=lambda: output.zero_())
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(side(artifact.run), side(runtime.scaled_fp8_splitk_matmul),
+        Tolerance(atol=5e-1, rtol=1e-2), cuda_graph=False, device_type="cpu", cpu_host_timing=True,
+        note="原4096x4096x14336/IT4/split4/Kblock256 FP8 GEMM；每split独立f32累加、缩放并转f16，再对InOut输出f16相加；双方输出预分配，每次清零不计时；PyTorch CPU reference采用递增split顺序，保留原容差。")
+
+
 def _block_quantize_mxfp8(x, block_size):
     dtype_max = torch.finfo(torch.float8_e4m3fn).max
     x_block = x.reshape(*x.shape[:-1], x.shape[-1] // block_size, block_size)
@@ -325,6 +376,8 @@ CASES = {"dense_gemm_f32": gemm, "dense_gemm": half_gemm, "tilegym_dense_gemm": 
          "weight_only_int4": weight_only_int4,
          "w4a8_gemm": w4a8_gemm, "bitnet_int2_decode": bitnet_int2,
          "dequant_bf16_fp4": dequant_bf16_fp4,
+         "deepgemm_fp8_2xacc": deepgemm_fp8, "scaled_fp8_gemm": scaled_fp8,
+         "scaled_fp8_splitk_gemm": scaled_fp8_splitk,
          "vector_dot": vector_dot, "matrix_vector": matrix_vector,
          "vector_matrix": vector_matrix, "vector_outer": vector_outer,
          "mxfp8_gemm": mxfp8_gemm, "block_sparse_gemm": block_sparse_gemm,
