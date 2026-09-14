@@ -1160,6 +1160,77 @@ def mamba_state_passing_fwd(chunk_states, chunk_decay, initial_states):
     return previous, state
 
 
+def chunk_gated_delta_fwd(query, key, value, gate, beta, scale):
+    batch, sequence, heads, dimension = query.shape
+    chunk = 64
+    chunks = sequence // chunk
+
+    def partition(tensor):
+        return tensor.float().reshape(batch, chunks, chunk, heads, tensor.shape[-1]).permute(0, 3, 1, 2, 4)
+
+    q, k, v = partition(query) * scale, partition(key), partition(value)
+    weights = beta.float().transpose(1, 2).reshape(batch, heads, chunks, chunk)
+    cumulative = gate.float().transpose(1, 2).reshape(batch, heads, chunks, chunk).cumsum(-1)
+    causal = torch.ones((chunk, chunk), dtype=torch.bool).tril()
+    decay = (cumulative[..., :, None] - cumulative[..., None, :]).exp().masked_fill(~causal, 0.0)
+    weighted = k * weights[..., None]
+    triangular = (-(weighted @ k.transpose(-1, -2)) * decay).tril(-1)
+    fast = triangular.abs().sum(-1).amax(-1) < 1.0
+    identity = torch.eye(chunk, dtype=torch.float32)
+    inverse = torch.empty_like(triangular)
+    if fast.any():
+        power = triangular[fast]
+        result = identity + power
+        for _ in range(1, 6):
+            power = power @ power
+            result = result @ (identity + power)
+        inverse[fast] = result
+    if (~fast).any():
+        result = triangular[~fast].clone()
+        for row in range(1, chunk):
+            correction = (result[:, row:row + 1].clone() @ result).squeeze(1)
+            result[:, row] += correction
+        inverse[~fast] = result + identity
+    corrected = (inverse @ (v * weights[..., None])).to(query.dtype).float()
+    cumulative_keys = (inverse @ (weighted * cumulative.exp()[..., None])).to(query.dtype).float()
+    q = q.to(query.dtype).float()
+    state = torch.zeros((batch, heads, dimension, value.shape[-1]), dtype=torch.float32)
+    output = torch.empty((batch, heads, chunks, chunk, value.shape[-1]), dtype=query.dtype)
+    for position in range(chunks):
+        gates = cumulative[:, :, position]
+        query_chunk, key_chunk = q[:, :, position], k[:, :, position]
+        adjusted = corrected[:, :, position] - cumulative_keys[:, :, position] @ state
+        inter = (query_chunk * gates.exp()[..., None]) @ state
+        scores = (query_chunk @ key_chunk.transpose(-1, -2)) * decay[:, :, position]
+        output[:, :, position] = (inter + scores @ adjusted).to(query.dtype)
+        weighted_key = key_chunk * (gates[..., -1:] - gates).exp()[..., None]
+        state = state * gates[..., -1].exp()[..., None, None] + weighted_key.transpose(-1, -2) @ adjusted
+    return output.permute(0, 2, 3, 1, 4).reshape(batch, sequence, heads, value.shape[-1]), state
+
+
+def linear_attention_backward(q, k, v, grad_output, scale):
+    batch, sequence, heads, dimension = q.shape
+    chunk = 64
+
+    def partition(tensor):
+        return tensor.float().reshape(batch, sequence // chunk, chunk, heads, tensor.shape[-1]).permute(0, 3, 1, 2, 4)
+
+    query, key, value, gradient = tuple(partition(tensor) for tensor in (q, k, v, grad_output))
+    query = query * scale
+    prefix = (key.transpose(-1, -2) @ value).cumsum(2)
+    previous = torch.cat((torch.zeros_like(prefix[:, :, :1]), prefix[:, :, :-1]), dim=2)
+    contributions = query.transpose(-1, -2) @ gradient
+    suffix = contributions.flip(2).cumsum(2).flip(2)
+    following = torch.cat((suffix[:, :, 1:], torch.zeros_like(suffix[:, :, :1])), dim=2)
+    score_gradient = (gradient @ value.transpose(-1, -2)).tril()
+    grad_q = (gradient @ previous.transpose(-1, -2) + score_gradient @ key) * scale
+    grad_k = value @ following.transpose(-1, -2) + score_gradient.transpose(-1, -2) @ query
+    scores = (query @ key.transpose(-1, -2)).tril()
+    grad_v = key @ following + scores.transpose(-1, -2) @ gradient
+    return tuple(tensor.permute(0, 2, 3, 1, 4).reshape(batch, sequence, heads, tensor.shape[-1])
+                 for tensor in (grad_q, grad_k, grad_v))
+
+
 def moe_expert_ffn(x, route_offsets, member_routes, route_token, route_weights, w1, w2, y):
     for expert in range(w1.shape[0]):
         routes = member_routes[route_offsets[expert]:route_offsets[expert + 1]].long()

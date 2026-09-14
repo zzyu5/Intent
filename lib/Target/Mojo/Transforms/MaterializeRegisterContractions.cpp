@@ -5,7 +5,6 @@
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -257,7 +256,6 @@ int64_t registerContractionRows(linalg::GenericOp operation) {
 LogicalResult materializeRegisterContractions(func::FuncOp function) {
   ImplementationInputs inputs(function);
   SmallVector<linalg::GenericOp> operations;
-  SmallVector<scf::ForOp> reductions;
   function.walk([&](linalg::GenericOp operation) {
     if (operation->hasAttr("intent_cpu.microtile") || operation.getNumReductionLoops())
       operations.push_back(operation);
@@ -306,7 +304,6 @@ LogicalResult materializeRegisterContractions(func::FuncOp function) {
       }
     Value depth = b.create<memref::DimOp>(loc, lhs, 1);
     auto reduction = b.create<scf::ForOp>(loc, index(b, loc, 0), depth, index(b, loc, 1), accumulators);
-    reductions.push_back(reduction);
     {
       OpBuilder::InsertionGuard guard(b);
       b.setInsertionPointToStart(reduction.getBody());
@@ -367,9 +364,6 @@ LogicalResult materializeRegisterContractions(func::FuncOp function) {
       epilogue->allocation.erase();
     }
   }
-  for (scf::ForOp reduction : reductions)
-    if (failed(mlir::loopUnrollByFactor(reduction, 4)))
-      return function.emitError("CPU register contraction loop cannot realize its adjacent four-step issue group");
   return success();
 }
 

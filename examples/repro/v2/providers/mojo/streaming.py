@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import math
 
+import intent
 import torch
 
 from kernels.streaming.gated_delta import recurrent_gated_delta_fwd
+from kernels.streaming.gated_delta import chunk_gated_delta_prepare, chunk_gated_delta_recurrence
 from kernels.streaming.linear_attention import fused_chunk_linear_attention_fwd
-from kernels.streaming.linear_attention import chunk_retention_fwd
+from kernels.streaming.linear_attention import fused_chunk_linear_attention_bwd, chunk_retention_fwd
 from kernels.streaming.mamba import mamba_chunk_state_fwd
 from kernels.streaming.mamba import mamba_chunk_state_bf16_fwd, mamba_state_passing_fwd
 from kernels.streaming.mamba import mamba3_siso_step, mamba3_siso_forward
@@ -20,7 +22,9 @@ from kernels.streaming.selective_scan import (
     selective_state_scan,
 )
 
-from ...model import Context, PreparedComparison, Tolerance
+from ...loading import load_module
+from ...measurement import report_stage
+from ...model import Context, PreparedComparison, PreparedLaunch, Tolerance
 from .common import configure_cpu_budget, prepare_host_comparison, prepare_host_run_only
 
 
@@ -256,6 +260,42 @@ def mamba3_forward(context):
         note="原Mamba3 forward B1/S2048/H16/QKH4/DQK32/DV64 BF16输入；五个InOut stores在每次kernel内先完整写入再读取，host预分配；原source标记semantics gap，无可比CPU reference，仅运行，不作数值或相对性能结论。")
 
 
+def chunk_gated_delta(context):
+    query = torch.randn((2, 2048, 8, 128), dtype=torch.bfloat16) * 0.1
+    key, value = torch.randn_like(query) * 0.1, torch.randn_like(query) * 0.1
+    gate = -torch.rand((2, 2048, 8), dtype=torch.bfloat16) * 0.5
+    beta = torch.sigmoid(torch.randn_like(gate))
+    arguments = (query, key, value, gate, beta, 128**-0.5)
+    report_stage("generated_compilation")
+    preparation, recurrence = (intent.compile(definition, target=context.target, compiler=context.compiler,
+                                              tuning_config=context.tuning_config)
+                               for definition in (chunk_gated_delta_prepare, chunk_gated_delta_recurrence))
+    runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_reference")
+    generated, source = {}, {}
+
+    def launch():
+        generated["output"] = recurrence.run(*preparation.run(*arguments))
+
+    def reference():
+        source["output"] = runtime.chunk_gated_delta_fwd(*arguments)
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(PreparedLaunch(launch, lambda: generated["output"]),
+        PreparedLaunch(reference, lambda: source["output"]),
+        (Tolerance(atol=1e-1, rtol=5e-2), Tolerance(atol=1e-1, rtol=5e-2)),
+        cuda_graph=False, device_type="cpu", cpu_host_timing=True,
+        note="原B2/S2048/H8/K128/V128 BF16 chunk64 gated-delta完整prepare+recurrence，含中间buffer分配，比较output和f32 final state；CPU参考保留source guarded Neumann/serial triangular solve和chunk recurrence，BF16中间ABI，matmul使用f32而非原GPU TF32或Intent显式BF16输入转换，原容差。")
+
+
+def linear_attention_backward(context):
+    q = torch.randn((1, 2048, 16, 128), dtype=torch.float16)
+    k, v, gradient = torch.randn_like(q), torch.randn_like(q), torch.randn_like(q)
+    tolerance = Tolerance(atol=1e-1, rtol=5e-2)
+    return prepare_host_comparison(context, fused_chunk_linear_attention_bwd, (q, k, v, gradient, 128**-0.5),
+        "linear_attention_backward", (tolerance, tolerance, tolerance),
+        note="原B1/S2048/H16/D128 f16输入，三个f32梯度；CPU参考使用source chunk64前缀/后缀矩阵公式，以f32计算；生成端保留作者局部score及state的f16转换，原容差。")
+
+
 def retention(context):
     q = torch.randn((1, 2048, 16, 128), dtype=torch.float16)
     k, v = torch.randn_like(q), torch.randn_like(q)
@@ -276,5 +316,7 @@ CASES = {
     "mamba_chunk_scan_bf16": mamba_chunk_scan_bf16,
     "mamba3_siso_step": mamba3_step,
     "mamba3_siso_forward": mamba3_forward,
+    "chunk_gated_delta": chunk_gated_delta,
+    "linear_attention_backward": linear_attention_backward,
     "chunk_retention": retention,
 }
