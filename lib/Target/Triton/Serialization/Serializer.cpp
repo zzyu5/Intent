@@ -26,8 +26,6 @@ using namespace mlir;
 namespace intent::triton {
 namespace {
 
-constexpr llvm::StringLiteral reduceFormAttr = "intent_gpu.triton.reduce_form";
-
 std::string pythonType(Type type, bool torch = false) {
   if (type.isIndex())
     return torch ? "torch.int64" : "tl.int64";
@@ -1179,45 +1177,6 @@ private:
           ", axis=" + std::to_string(axis) + ", combine_fn=" + helperNames.lookup(&operation).front();
       if (scan) call += std::string(", reverse=") + (scan.getReverse() ? "True" : "False");
       assignResults(operation.getResults(), call + ")");
-      return;
-    }
-    if (auto reduce = dyn_cast<gpu::ReduceOp>(operation)) {
-      std::string sources;
-      ValueRange sourceValues =
-          reduce.getInputs().take_front(reduce.getSourceCount());
-      if (sourceValues.size() == 1) {
-        sources = valueString(sourceValues.front());
-      } else {
-        sources = "(";
-        for (auto [index, source] : llvm::enumerate(sourceValues)) {
-          if (index)
-            sources += ", ";
-          sources += valueString(source);
-        }
-        sources += ")";
-      }
-      std::string call;
-      if (auto form = reduce->getAttrOfType<StringAttr>(reduceFormAttr)) {
-        StringRef primitive;
-        if (form.getValue() == "sum")
-          primitive = "tl.sum";
-        else if (form.getValue() == "max")
-          primitive = "tl.max";
-        else if (form.getValue() == "min")
-          primitive = "tl.min";
-        else {
-          reduce.emitOpError("has an unknown Triton native reduction form");
-          failed = true;
-          return;
-        }
-        call = primitive.str() + "(" + sources + ", axis=" +
-               std::to_string(reduce.getAxes().front()) + ")";
-      } else {
-        reduce.emitOpError("custom reduction callback was not legalized");
-        failed = true;
-        return;
-      }
-      assignResults(reduce.getResults(), call);
       return;
     }
     if (auto histogram = dyn_cast<gpu::HistogramOp>(operation)) {
