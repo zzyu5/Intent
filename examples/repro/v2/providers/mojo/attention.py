@@ -13,11 +13,14 @@ from kernels.streaming.attention import flash_attention_fwd, flash_gqa_attention
 from kernels.streaming.attention import flash_attention_bias_fwd, continuous_gqa_decode
 from kernels.streaming.attention import flash_varlen_attention_fwd, flash_varlen_gqa_prefill
 from kernels.streaming.attention import VARLEN_BATCH, VARLEN_TOTAL_TOKENS
+from kernels.streaming.attention import grouped_flash_decode_partials, varlen_gqa_decode_with_sink_logits
 from kernels.streaming.block_sparse_attention import block_sparse_gqa_decode_combine
 from kernels.streaming.block_sparse_attention import block_sparse_gqa_decode_partials
 from kernels.streaming.paged_attention import paged_gqa_decode_partials
+from kernels.streaming.paged_attention import paged_gqa_decode_attention, splitk_paged_gqa_decode_partials
 from kernels.streaming.splitk_reduce import splitk_attention_f32_to_f16_reduce
 from kernels.streaming.splitk_reduce import splitk_attention_reduce
+from kernels.streaming.splitk_reduce import splitk_attention_weighted_sum_reduce, splitk_attention_bf16_to_f16_reduce
 from ...loading import load_module
 from ...measurement import report_stage
 from ...model import Context, PreparedComparison, PreparedLaunch, Tolerance
@@ -477,6 +480,108 @@ def native_sparse_prefill(context):
         note="原provider实际B2/Q=K4096/HQ32/HK4/D128/S64/block64（其旧registry写HK2），使用原0..63连续selected blocks；CPU参考按每query/group gather并保留causal mask。" + F16_PRECISION_NOTE)
 
 
+def grouped_flash_decode(context):
+    q = torch.randn((8, 32, 1, 128), dtype=torch.bfloat16)
+    k = torch.randn((8, 8, 8192, 128), dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    report_stage("generated_compilation")
+    partials = intent.compile(grouped_flash_decode_partials, target=context.target, compiler=context.compiler,
+                              tuning_config=context.tuning_config,
+                              constexprs={"HEAD_GROUP": 4, "P": 32, "SPLIT_SIZE": 256})
+    reduction = intent.compile(splitk_attention_reduce, target=context.target, compiler=context.compiler,
+                               tuning_config=context.tuning_config)
+    runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_reference")
+    generated, source = {}, {}
+
+    def launch():
+        lse, partial = partials.run(q, k, v, 128**-0.5)
+        generated["output"] = reduction.run(partial, lse).unsqueeze(2)
+
+    def reference():
+        source["output"] = runtime.grouped_flash_decode(q, k, v, 128**-0.5)
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(PreparedLaunch(launch, lambda: generated["output"]),
+        PreparedLaunch(reference, lambda: source["output"]), Tolerance(atol=1e-1, rtol=5e-2),
+        cuda_graph=False, device_type="cpu", cpu_host_timing=True,
+        note="原B8/HQ32/HK8/K8192/D128 BF16 grouped decode，split256/P32完整partial+reduce含workspace分配；生成LSEf32/partial BF16，CPU数学参考f32概率，最终BF16[B,H,1,D]，原容差。")
+
+
+def varlen_sink_decode(context):
+    lengths = 4096 - torch.arange(16, dtype=torch.int32) * 64
+    offsets = torch.cat((torch.zeros(1, dtype=torch.int32), lengths.cumsum(0).int()))
+    q = torch.randn((16, 32, 64), dtype=torch.float16)
+    k = torch.randn((57856, 8, 64), dtype=torch.float16)
+    v = torch.randn_like(k)
+    sink = torch.zeros((32,), dtype=torch.float32)
+    return prepare_host_comparison(context, varlen_gqa_decode_with_sink_logits,
+        (q, k, v, offsets, sink, 64**-0.5), "varlen_gqa_decode_with_sink_logits",
+        (Tolerance(atol=5e-2, rtol=2e-2), Tolerance(atol=5e-2, rtol=2e-2)),
+        constexprs={"HEAD_GROUP": 4, "MAX_BLOCKS": 64},
+        note="原B16/U57856/HQ32/HK8/D64 f16、length4096-64*i及零f32 sink；比较output和64项block maxima概率；该sink按作者语义直接加到scaled denominator，CPU数学参考f32，原容差。")
+
+
+def paged_gqa_monolithic(context):
+    lengths = torch.tensor((8191, 7937, 7683, 7429, 7175, 6921, 6667, 6413), dtype=torch.int32)
+    counts = (lengths + 63) // 64
+    offsets = torch.cat((torch.zeros(1, dtype=torch.int32), counts.cumsum(0).int()))
+    pages = int(offsets[-1])
+    indices = torch.randperm(pages).to(torch.int32)
+    q = torch.randn((8, 32, 128), dtype=torch.float16) * 0.5
+    key = torch.randn((pages, 64, 8, 128), dtype=torch.float16) * 0.5
+    value = torch.randn_like(key) * 0.5
+    return prepare_host_comparison(context, paged_gqa_decode_attention,
+        (q, key, value, offsets, indices, lengths, 128**-0.5), "paged_gqa_decode_attention", Tolerance(atol=3e-2),
+        constexprs={"PAGE_SIZE": 64, "HEAD_GROUP": 4},
+        note="原B8/HQ32/HK8/D128/page64变长paged GQA，q/K/V *.5、随机page permutation与原lengths；CPU参考保留page table和length，f32概率，最终f16，原容差；未增加D80/空长度测试。")
+
+
+def _paged_gqa_split(context, reducer, compare):
+    q = torch.randn((16, 32, 128), dtype=torch.float16)
+    key = torch.randn((8192, 16, 8, 128), dtype=torch.float16)
+    value = torch.randn_like(key)
+    indices = torch.arange(8192, dtype=torch.int32)
+    offsets = torch.arange(0, 8193, 512, dtype=torch.int32)
+    splits = torch.arange(0, 8193, 64, dtype=torch.int32)
+    lengths = torch.full((16,), 8192, dtype=torch.int32)
+    arguments = (q, key, value, offsets, indices, lengths, splits, 128**-0.5)
+    report_stage("generated_compilation")
+    partials = intent.compile(splitk_paged_gqa_decode_partials, target=context.target, compiler=context.compiler,
+                              tuning_config=context.tuning_config,
+                              constexprs={"PAGE_SIZE": 16, "HEAD_GROUP": 4, "SPLITS": 8})
+    reduction = intent.compile(reducer, target=context.target, compiler=context.compiler,
+                               tuning_config=context.tuning_config)
+    generated, source = {}, {}
+
+    def launch():
+        lse, partial = partials.run(*arguments)
+        generated["output"] = reduction.run(partial, lse)
+
+    if compare:
+        runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_reference")
+
+        def reference():
+            source["output"] = runtime.paged_gqa_decode_bf16(*arguments)
+
+        source_launch = PreparedLaunch(reference, lambda: source["output"])
+        tolerance, status = Tolerance(atol=1e-1, rtol=5e-2), "pass"
+        note = "原B16/HQ32/HK8/K8192/D128/page16/split8 f16输入，BF16 partial+weighted BF16 reduce完整调用含workspace分配；CPU参考page-table attention f32概率后直接转BF16，原容差。"
+    else:
+        source_launch, tolerance, status = None, None, "run_only"
+        note = "复用既有B16/HQ32/HK8/K8192/D128/page16/split8的BF16 partial producer，连接作者BF16-to-F16 reducer，保留LSEf32；该组合无原runner/reference/容差，仅验证完整调用与最终f16 ABI，不作数值或相对性能结论。"
+    report_stage("adapter_preparation")
+    return PreparedComparison(PreparedLaunch(launch, lambda: generated["output"]), source_launch, tolerance,
+        cuda_graph=False, status=status, device_type="cpu", cpu_host_timing=True, note=note)
+
+
+def paged_gqa_weighted(context):
+    return _paged_gqa_split(context, splitk_attention_weighted_sum_reduce, True)
+
+
+def paged_gqa_f16_reduction(context):
+    return _paged_gqa_split(context, splitk_attention_bf16_to_f16_reduce, False)
+
+
 CASES = {
     "causal_attention_f32": causal_attention,
     "causal_linear_attention_f32": causal_linear_attention,
@@ -494,6 +599,11 @@ CASES = {
     "block_causal_attention": block_causal,
     "varlen_block_causal_attention": varlen_block_causal,
     "native_sparse_attention": native_sparse_prefill,
+    "grouped_flash_decode": grouped_flash_decode,
+    "varlen_gqa_decode_with_sink_logits": varlen_sink_decode,
+    "paged_gqa_decode_attention": paged_gqa_monolithic,
+    "splitk_paged_gqa_decode": paged_gqa_weighted,
+    "paged_gqa_f16_reduction": paged_gqa_f16_reduction,
     "gemma_decode": gemma_decode,
     "paged_gqa_decode": paged_gqa_decode,
     "block_sparse_gqa_decode": block_sparse_gqa_decode,

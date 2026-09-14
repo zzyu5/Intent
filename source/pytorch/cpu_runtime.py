@@ -1367,8 +1367,38 @@ def gemma_decode(q, k, v, scale, *, window_size, soft_cap, kv_len_per_split):
     ]).unsqueeze(2)
 
 
-def paged_gqa_decode(q, key_cache, value_cache, page_offsets, page_indices,
-                     lengths, split_offsets, scale, *, page_size):
+def grouped_flash_decode(q, k, v, scale):
+    return torch.stack([
+        _grouped_decode(q[batch, :, 0], k[batch].transpose(0, 1),
+                        v[batch].transpose(0, 1), scale)
+        for batch in range(q.shape[0])
+    ]).unsqueeze(2)
+
+
+def varlen_gqa_decode_with_sink_logits(q, k, v, offsets, sink, scale):
+    output = torch.empty((*q.shape[:-1], v.shape[-1]), dtype=q.dtype)
+    block_logits = torch.zeros((*q.shape[:-1], 64), dtype=torch.float32)
+    groups, heads = k.shape[1], q.shape[1]
+    for batch in range(q.shape[0]):
+        begin, end = int(offsets[batch]), int(offsets[batch + 1])
+        if begin == end:
+            output[batch].zero_()
+            continue
+        query = q[batch].float().reshape(groups, heads // groups, q.shape[-1])
+        scores = ((query @ k[begin:end].float().permute(1, 2, 0)) * scale).reshape(heads, end - begin)
+        maximum = scores.amax(dim=-1, keepdim=True)
+        probabilities = torch.exp(scores - maximum)
+        denominator = probabilities.sum(dim=-1, keepdim=True) + sink[:, None]
+        values = (probabilities.reshape(groups, heads // groups, end - begin)
+                  @ v[begin:end].float().permute(1, 0, 2)).reshape(heads, v.shape[-1])
+        output[batch] = (values / denominator).to(q.dtype)
+        for block, start in enumerate(range(0, end - begin, 64)):
+            block_maximum = scores[:, start:start + 64].amax(dim=-1, keepdim=True)
+            block_logits[batch, :, block] = (torch.exp(block_maximum - maximum) / denominator).squeeze(-1)
+    return output, block_logits
+
+
+def _paged_gqa_decode(q, key_cache, value_cache, page_offsets, page_indices, lengths, scale):
     outputs = []
     for batch in range(q.shape[0]):
         pages = page_indices[page_offsets[batch]:page_offsets[batch + 1]].long()
@@ -1376,6 +1406,21 @@ def paged_gqa_decode(q, key_cache, value_cache, page_offsets, page_indices,
         value = value_cache[pages].reshape(-1, *value_cache.shape[2:])[:lengths[batch]]
         outputs.append(_grouped_decode(q[batch], key, value, scale))
     return torch.stack(outputs)
+
+
+def paged_gqa_decode(q, key_cache, value_cache, page_offsets, page_indices,
+                     lengths, split_offsets, scale, *, page_size):
+    return _paged_gqa_decode(q, key_cache, value_cache, page_offsets, page_indices, lengths, scale)
+
+
+def paged_gqa_decode_attention(q, key_cache, value_cache, page_offsets, page_indices, lengths, scale):
+    return _paged_gqa_decode(q, key_cache, value_cache, page_offsets, page_indices, lengths, scale)
+
+
+def paged_gqa_decode_bf16(q, key_cache, value_cache, page_offsets, page_indices,
+                          lengths, split_offsets, scale):
+    return _paged_gqa_decode(q.float(), key_cache, value_cache, page_offsets,
+                             page_indices, lengths, scale).to(torch.bfloat16)
 
 
 def block_sparse_gqa_decode(q, k, v, selected, lengths, split_offsets, scale, *, block_size):
@@ -1408,6 +1453,69 @@ def paged_mla_decode(q_latent, q_rope, latent_cache, rope_cache,
         output = torch.softmax(scores, dim=-1) @ latent.permute(1, 0, 2)
         outputs.append(output.reshape(q_latent.shape[1], latent.shape[-1]).to(q_latent.dtype))
     return torch.stack(outputs)
+
+
+def mla_prefill(query, query_rope, key, key_rope, value, scale):
+    output = torch.empty((*query.shape[:-1], value.shape[-1]), dtype=query.dtype)
+    heads = query.shape[1]
+    columns = torch.arange(key.shape[2])[None, :]
+    for batch in range(query.shape[0]):
+        keys = key[batch].repeat_interleave(heads // key.shape[1], dim=0).float()
+        ropes = key_rope[batch].repeat_interleave(heads // key_rope.shape[1], dim=0).float()
+        values = value[batch].repeat_interleave(heads // value.shape[1], dim=0).float()
+        for begin in range(0, query.shape[2], 128):
+            end = min(begin + 128, query.shape[2])
+            scores = query[batch, :, begin:end].float() @ keys.transpose(-1, -2)
+            scores += query_rope[batch, :, begin:end].float() @ ropes.transpose(-1, -2)
+            scores *= scale
+            scores.masked_fill_(columns > torch.arange(begin, end)[:, None], float('-inf'))
+            output[batch, :, begin:end] = (torch.softmax(scores, dim=-1) @ values).to(query.dtype)
+    return output
+
+
+def absorbed_mla_prefill(query, query_rope, cache, cache_rope, scale):
+    return mla_prefill(query.transpose(1, 2), query_rope.transpose(1, 2), cache.unsqueeze(1),
+                       cache_rope.unsqueeze(1), cache.unsqueeze(1), scale).transpose(1, 2)
+
+
+def absorbed_mla_decode(query, query_rope, cache, cache_rope, scale):
+    values = cache.float()
+    scores = (query.float() @ values.transpose(-1, -2)
+              + query_rope.float() @ cache_rope.float().transpose(-1, -2)) * scale
+    return (torch.softmax(scores, dim=-1) @ values).to(query.dtype)
+
+
+def _token_sparse_mla(query, query_rope, key, value, key_rope, selected, scale, *, statistics):
+    output = torch.empty((*query.shape[:-1], value.shape[-1]), dtype=query.dtype)
+    if statistics:
+        maximum = torch.empty(query.shape[:-1], dtype=torch.float32)
+        lse = torch.empty_like(maximum)
+    for begin in range(0, query.shape[0], 32):
+        end = min(begin + 32, query.shape[0])
+        raw = selected[begin:end].long()
+        valid = (raw >= 0) & (raw < key.shape[0])
+        safe = raw.clamp(0, key.shape[0] - 1)
+        keys, ropes, values = key[safe].float(), key_rope[safe].float(), value[safe].float()
+        scores = (query[begin:end].float() @ keys.transpose(-1, -2)
+                  + query_rope[begin:end].float() @ ropes.transpose(-1, -2)) * (scale * np.log2(np.e))
+        scores.masked_fill_(~valid[:, None, :], float('-inf'))
+        active = valid.any(-1)[:, None]
+        peak = torch.where(active, scores.amax(-1), 0.0)
+        weights = torch.exp2(scores - peak[..., None])
+        denominator = torch.where(active, weights.sum(-1), 1.0)
+        if statistics:
+            maximum[begin:end] = peak
+            lse[begin:end] = torch.where(active, peak + denominator.log2(), float('-inf'))
+        output[begin:end] = ((weights / denominator[..., None]) @ values).to(query.dtype)
+    return (output, maximum, lse) if statistics else output
+
+
+def token_sparse_mla_prefill(query, query_rope, cache, cache_rope, selected, scale):
+    return _token_sparse_mla(query, query_rope, cache, cache, cache_rope, selected, scale, statistics=True)
+
+
+def token_sparse_mla_value_prefill(query, query_rope, key, value, key_rope, selected, scale):
+    return _token_sparse_mla(query, query_rope, key, value, key_rope, selected, scale, statistics=False)
 
 
 def prepare_sparse_mla_backward(query, key_value, grad_output, selected_indices, scale):

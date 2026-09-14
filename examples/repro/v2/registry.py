@@ -341,6 +341,18 @@ MOJO = (
     Entry("flash_attention_inline", "B4-H32-S4096-D128-f16-causal-8cores-host", "flash_attention_inline_fwd", ("variants/streaming.py:flash_attention_inline_fwd",), None),
     Entry("flash_attention_select", "B4-H32-S4096-D128-f16-causal-8cores-host", "flash_attention_select_fwd", ("variants/streaming.py:flash_attention_select_fwd",), None),
     Entry("flash_attention_full_causal_stream", "B4-H32-S4096-D128-f16-causal-8cores-host", "flash_attention_full_causal_stream_fwd", ("variants/streaming.py:flash_attention_full_causal_stream_fwd",), None),
+    Entry("mla_prefill", "B1-HQ128-HK1-S2048-D128-R64-f16-8cores-host", "mla_prefill", ("streaming/attention.py:mla_prefill",), "source/pytorch/cpu_runtime.py"),
+    Entry("absorbed_mla_prefill", "B1-S512-H8-C512-R64-f16-8cores-host", "absorbed_mla_prefill", ("streaming/mla.py:absorbed_mla_prefill",), "source/pytorch/cpu_runtime.py"),
+    Entry("absorbed_mla_decode", "B8-H64-S8192-C512-R64-f16-8cores-host", "absorbed_mla_decode", ("streaming/mla.py:absorbed_mla_decode",), "source/pytorch/cpu_runtime.py"),
+    Entry("splitk_mla_decode", "B8-H64-S8192-C512-R64-f16-split512-P16-8cores-host", "splitk_mla_decode", ("streaming/mla.py:splitk_mla_decode_partials", "streaming/splitk_reduce.py:splitk_attention_reduce_f16"), "source/pytorch/cpu_runtime.py"),
+    Entry("token_sparse_mla_prefill", "Q64-H8-K4096-T256-C512-R64-bf16-8cores-host", "token_sparse_mla_prefill", ("streaming/mla.py:token_sparse_mla_prefill",), "source/pytorch/cpu_runtime.py"),
+    Entry("token_sparse_mla_value_prefill", "Q2048-H64-K4096-T512-D128-DV128-R64-bf16-8cores-host", "token_sparse_mla_value_prefill", ("streaming/mla.py:token_sparse_mla_value_prefill",), "source/pytorch/cpu_runtime.py"),
+    Entry("grouped_flash_decode", "B8-HQ32-HK8-K8192-D128-bf16-P32-8cores-host", "grouped_flash_decode", ("streaming/attention.py:grouped_flash_decode_partials", "streaming/splitk_reduce.py:splitk_attention_reduce"), "source/pytorch/cpu_runtime.py"),
+    Entry("varlen_gqa_decode_with_sink_logits", "B16-U57856-HQ32-HK8-D64-f16-block64-8cores-host", "varlen_gqa_decode_with_sink_logits", ("streaming/attention.py:varlen_gqa_decode_with_sink_logits",), "source/pytorch/cpu_runtime.py"),
+    Entry("paged_gqa_decode_attention", "B8-HQ32-HK8-D128-page64-varlen-f16-8cores-host", "paged_gqa_decode_attention", ("streaming/paged_attention.py:paged_gqa_decode_attention",), "source/pytorch/cpu_runtime.py"),
+    Entry("splitk_paged_gqa_decode", "B16-HQ32-HK8-K8192-D128-page16-split8-f16-bf16-8cores-host", "splitk_paged_gqa_decode", ("streaming/paged_attention.py:splitk_paged_gqa_decode_partials", "streaming/splitk_reduce.py:splitk_attention_weighted_sum_reduce"), "source/pytorch/cpu_runtime.py"),
+    Entry("paged_gqa_f16_reduction", "B16-HQ32-HK8-K8192-D128-page16-split8-bf16-f16-8cores-host", "paged_gqa_f16_reduction", ("streaming/paged_attention.py:splitk_paged_gqa_decode_partials", "streaming/splitk_reduce.py:splitk_attention_bf16_to_f16_reduce"), None),
+    Entry("paged_mla_decode_partials", "B8-HQ128-HK1-K8192-C512-R64-page16-split8-f16-8cores-host", "paged_mla_decode_partials", ("streaming/mla.py:paged_mla_decode_partials", "streaming/splitk_reduce.py:splitk_attention_f32_to_f16_reduce"), "source/pytorch/cpu_runtime.py"),
 )
 
 
