@@ -7,6 +7,7 @@ add_mlir_dialect_library(MLIRIntentDialect
 
   LINK_LIBS PUBLIC
   MLIRIR
+  MLIRPresburger
   MLIRControlFlowInterfaces
   MLIRSideEffectInterfaces
   MLIRSupport

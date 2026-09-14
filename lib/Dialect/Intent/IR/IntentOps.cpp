@@ -1,5 +1,6 @@
 #include "Intent/Dialect/Intent/IR/IntentOps.h"
 
+#include "mlir/Analysis/Presburger/PresburgerRelation.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -1586,6 +1587,27 @@ bool hasPreviousIterationViewDefinition(Operation *read, ViewStoreOp store,
             end = prefix.getBounds()[1];
           }
         }
+        if (readTerm.getKind() == 3 && begin && end != induction) {
+          Value index = indexTermOperand(read, readTerm);
+          // A guarded scalar iteration can read the same completed prefix as
+          // an explicit subregion. Only the true branch of a strict comparison
+          // provides this upper bound; the domain still proves its lower bound.
+          for (Operation *child = read, *parent = read->getParentOp();
+               parent && parent != loop; child = parent, parent = parent->getParentOp()) {
+            auto branch = dyn_cast<IfOp>(parent);
+            if (!branch || child->getParentRegion() != &branch.getThenRegion())
+              continue;
+            auto comparison = branch.getCondition().getDefiningOp<CompareOp>();
+            if (comparison &&
+                ((comparison.getPredicate() == ComparePredicate::Lt &&
+                  comparison.getLhs() == index && comparison.getRhs() == induction) ||
+                 (comparison.getPredicate() == ComparePredicate::Gt &&
+                  comparison.getRhs() == index && comparison.getLhs() == induction))) {
+              end = induction;
+              break;
+            }
+          }
+        }
         if (previousRange || !begin || end != induction ||
             !sameInvariantExtent(begin, domain.getBounds().front(), loop,
                                  dominance)) {
@@ -1763,6 +1785,67 @@ bool hasDominatingViewDefinition(Operation *read, RankedTensorType tensor) {
       }
     }
     if (complete)
+      return true;
+  }
+  if (!tensor.hasStaticShape())
+    return false;
+  // Several unconditional writes may partition one output. Preserve their
+  // Cartesian correlations when proving that the whole view is initialized.
+  using namespace mlir::presburger;
+  PresburgerSpace space = PresburgerSpace::getSetSpace(tensor.getRank());
+  IntegerPolyhedron whole(space);
+  for (unsigned axis = 0; axis < tensor.getRank(); ++axis) {
+    whole.addBound(BoundType::LB, axis, 0);
+    whole.addBound(BoundType::UB, axis, tensor.getDimSize(axis) - 1);
+  }
+  PresburgerSet unwritten(whole);
+  for (Operation *user : resource.getUsers()) {
+    auto store = dyn_cast<ViewStoreOp>(user);
+    if (!store || store->getOperand(0) != resource ||
+        store->hasAttr("valid_operand_index") ||
+        !dominance.dominates(store, read))
+      continue;
+    auto relation = store->getAttrOfType<IndexRelationAttr>("index");
+    if (!relation || relation.getSourceRank() != tensor.getRank() ||
+        relation.getTerms().size() != static_cast<size_t>(tensor.getRank()))
+      continue;
+    IntegerPolyhedron written(space);
+    bool exact = true;
+    for (auto [axis, attribute] : llvm::enumerate(relation.getTerms())) {
+      auto term = cast<IndexTermAttr>(attribute);
+      std::optional<int64_t> begin, end;
+      if (term.getKind() == 0) {
+        begin = 0;
+        end = tensor.getDimSize(axis);
+      } else if (term.getKind() == 2 || term.getKind() == 3) {
+        Value index = indexTermOperand(store, term);
+        if (term.getKind() == 2 && term.getStaticValues().size() == 1)
+          begin = term.getStaticValues()[0];
+        else
+          begin = index ? getConstantInteger(index) : std::nullopt;
+        if (begin && *begin < std::numeric_limits<int64_t>::max())
+          end = *begin + 1;
+      } else if (term.getKind() == 4) {
+        Value index = indexTermOperand(store, term);
+        auto domain = index ? index.getDefiningOp<DomainOp>() : DomainOp();
+        if (domain && domain.getBounds().size() >= 2 &&
+            (domain.getBounds().size() == 2 ||
+             getConstantInteger(domain.getBounds()[2]) == 1)) {
+          begin = getConstantInteger(domain.getBounds()[0]);
+          end = getConstantInteger(domain.getBounds()[1]);
+        }
+      }
+      if (!begin || !end || *begin >= *end) {
+        exact = false;
+        break;
+      }
+      written.addBound(BoundType::LB, axis, *begin);
+      written.addBound(BoundType::UB, axis, *end - 1);
+    }
+    if (!exact)
+      continue;
+    unwritten = unwritten.subtract(PresburgerSet(written));
+    if (unwritten.isIntegerEmpty())
       return true;
   }
   return false;
