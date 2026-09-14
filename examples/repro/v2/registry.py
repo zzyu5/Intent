@@ -287,6 +287,16 @@ MOJO = (
     Entry("causal_conv_update_bf16", "B32-D4096-W4-bf16-f32-silu-8cores-host", "causal_depthwise_conv1d_update_bf16", ("convolution/direct.py:causal_depthwise_conv1d_update_bf16",), "source/pytorch/cpu_runtime.py"),
     Entry("fused_cross_entropy_bf16", "8192x32768-bf16-i64-8cores-host", "fused_cross_entropy_bf16", ("loss/cross_entropy.py:fused_cross_entropy_bf16",), "source/pytorch/cpu_runtime.py"),
     Entry("flash_cross_entropy_bf16", "8192x32768-bf16-i64-zloss1e-4-8cores-host", "flash_cross_entropy_bf16", ("loss/cross_entropy.py:flash_cross_entropy_bf16",), "source/pytorch/cpu_runtime.py"),
+    Entry("ragged_grouped_gemm_bf16", "rows256-512-1024-2048-K4096-N4096-bf16-8cores-host", "ragged_grouped_gemm_bf16", ("ragged/grouped_gemm.py:ragged_grouped_gemm_bf16",), "source/pytorch/cpu_runtime.py"),
+    Entry("grouped_gemm_backward", "rows256-512-1024-2048-K4096-N4096-f16-8cores-host", "ragged_grouped_gemm_backward_weight", ("ragged/grouped_gemm.py:ragged_grouped_gemm_backward_weight",), "source/pytorch/cpu_runtime.py"),
+    Entry("moe_expert_projection", "T2048-E8-top2-4096x14336-bf16-8cores-host", "routed_expert_projection_bf16", ("ragged/grouped_gemm.py:routed_expert_projection_bf16",), "source/pytorch/cpu_runtime.py"),
+    Entry("mhc_gemm_rms_scale", "T2048-H4096-streams4-P16-bf16-8cores-host", "mhc_gemm_rms_scale", ("routing/mhc.py:mhc_gemm_rms_partial", "routing/mhc.py:mhc_gemm_rms_finalize"), "source/pytorch/cpu_runtime.py"),
+    Entry("mhc_pre", "T2048-H4096-streams4-bf16-8cores-host", "mhc_pre", ("routing/mhc.py:mhc_pre_gemm_sqrsum", "routing/mhc.py:mhc_pre_fuse"), "source/pytorch/cpu_runtime.py"),
+    Entry("mhc_sinkhorn", "T8192-streams4-f32-8cores-host", "mhc_sinkhorn", ("routing/mhc.py:mhc_sinkhorn",), "source/pytorch/cpu_runtime.py"),
+    Entry("quantized_gemm", "M4096-K4096-N14336-f16-i8-8cores-host", "quantized_gemm", ("contraction/gemm.py:quantized_gemm",), "source/pytorch/cpu_runtime.py"),
+    Entry("fp8_e5m2_gemm", "M1024-N1024-K1024-f8e5m2-8cores-host", "fp8_e5m2_matmul", ("contraction/weight_only_int4.py:fp8_e5m2_matmul",), "source/pytorch/cpu_runtime.py"),
+    Entry("weight_only_int4", "M512-K2048-N4096-signed-w4-group64-f16-8cores-host", "weight_only_int4_matmul", ("contraction/weight_only_int4.py:weight_only_int4_matmul",), "source/pytorch/cpu_runtime.py"),
+    Entry("per_token_fp8", "8192x8192-f32-group128-e4m3-8cores-host", "f32_groupwise_fp8_quantize", ("quantization/fp8.py:f32_groupwise_fp8_quantize",), "source/pytorch/cpu_runtime.py"),
 )
 
 

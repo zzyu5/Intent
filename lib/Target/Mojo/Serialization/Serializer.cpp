@@ -381,7 +381,8 @@ private:
             if (dense.isSplat()) break;
           }
         }
-        assign(op.getResult(), valueType(op.getType()) + "(" + join(elements) + ")", true);
+        std::string fill = dense.isSplat() && dense.getElementType().isInteger(1) ? "fill=" : "";
+        assign(op.getResult(), valueType(op.getType()) + "(" + fill + join(elements) + ")", true);
       } else return op.emitError("unsupported Mojo constant");
     } else if (auto op = dyn_cast<memref::DimOp>(operation)) {
       auto axis = op.getConstantIndex();

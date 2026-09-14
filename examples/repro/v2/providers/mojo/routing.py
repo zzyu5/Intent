@@ -4,6 +4,8 @@ import intent
 import torch
 
 from kernels.routing.mhc import mhc_apply_residual as mhc_apply_residual_definition
+from kernels.routing.mhc import mhc_gemm_rms_partial, mhc_gemm_rms_finalize
+from kernels.routing.mhc import mhc_pre_gemm_sqrsum, mhc_pre_fuse, mhc_sinkhorn
 from kernels.routing.moe_align import BLOCK_SIZE
 from kernels.routing.moe_align import EXPERTS
 from kernels.routing.moe_align import PADDED_ROUTES
@@ -141,6 +143,87 @@ def mhc_post(context: Context) -> PreparedComparison:
     )
 
 
+def mhc_gemm_rms_scale(context):
+    x = torch.randn((2048, 16384), dtype=torch.bfloat16)
+    weight = torch.randn((16384, 24), dtype=torch.bfloat16)
+    bias = torch.randn((24,), dtype=torch.bfloat16)
+    report_stage("generated_compilation")
+    partial = intent.compile(mhc_gemm_rms_partial, target=context.target, compiler=context.compiler,
+                             tuning_config=context.tuning_config, constexprs={"P": 16})
+    finalize = intent.compile(mhc_gemm_rms_finalize, target=context.target, compiler=context.compiler,
+                              tuning_config=context.tuning_config,
+                              constexprs={"P": 16, "STREAMS": 4, "ALPHA_PRE": 1.0,
+                                          "ALPHA_POST": 1.0, "ALPHA_RESIDUAL": 1.0})
+    runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_reference")
+    generated, source = {}, {}
+
+    def launch():
+        linear, square_sum = partial.run(x, weight)
+        generated["output"] = finalize.run(linear, square_sum, bias, x.shape[1])
+
+    def reference():
+        source["output"] = runtime.mhc_gemm_rms_scale(x, weight, bias)
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(
+        PreparedLaunch(launch, lambda: generated["output"]), PreparedLaunch(reference, lambda: source["output"]),
+        (Tolerance(atol=5e-2, rtol=2e-2), Tolerance(atol=5e-3, rtol=1e-3)),
+        cuda_graph=False, device_type="cpu", cpu_host_timing=True,
+        note="既有 T2048/H4096/streams4/P16 bf16 MHC GEMM+RMS；partial/finalize 两 kernel 完整 host 调用，含中间及输出分配；PyTorch CPU reference，保留 split16、bf16 mixed、f32 rms 与原容差，单 NUMA 8 核。",
+    )
+
+
+def mhc_pre(context):
+    factors = 1 + torch.arange(4).mul(0.01).view(1, -1, 1)
+    residual = (torch.randn((2048, 4, 4096), dtype=torch.float32) * factors).bfloat16()
+    weight = (torch.randn((24, 4, 4096), dtype=torch.float32) * 1e-4 * factors).flatten(1, 2)
+    scale = torch.randn((3,), dtype=torch.float32) * 0.1
+    base = torch.randn((24,), dtype=torch.float32) * 0.1
+    report_stage("generated_compilation")
+    first = intent.compile(mhc_pre_gemm_sqrsum, target=context.target, compiler=context.compiler,
+                           tuning_config=context.tuning_config)
+    second = intent.compile(mhc_pre_fuse, target=context.target, compiler=context.compiler,
+                            tuning_config=context.tuning_config,
+                            constexprs={"RMS_EPS": 1e-6, "PRE_EPS": 1e-6, "SINKHORN_EPS": 1e-6,
+                                        "POST_MULTIPLIER": 1.0, "SINKHORN_REPEATS": 10})
+    runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_reference")
+    generated, source = {}, {}
+
+    def launch():
+        mixes, square_sum = first.run(residual.flatten(1, 2), weight)
+        generated["output"] = second.run(mixes, square_sum, scale, base, residual)
+
+    def reference():
+        source["output"] = runtime.mhc_pre(residual, weight, scale, base)
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(
+        PreparedLaunch(launch, lambda: generated["output"]), PreparedLaunch(reference, lambda: source["output"]),
+        (Tolerance(atol=1e-2, rtol=1e-3), Tolerance(atol=1e-2, rtol=1e-3), Tolerance(atol=5e-2, rtol=2e-2)),
+        cuda_graph=False, device_type="cpu", cpu_host_timing=True,
+        note="既有 T2048/H4096/streams4 MHC pre 两 kernel；weight 先转 bf16，f32 GEMM/RMS/混合，Sinkhorn10 次、原 epsilon 和容差；PyTorch CPU reference 沿用 source 的 mhc_pre_ref 算法，计完整 host 调用及分配，单 NUMA 8 核。",
+    )
+
+
+def mhc_sinkhorn_case(context):
+    initial = torch.randn((8192, 4, 4), dtype=torch.float32)
+    report_stage("generated_compilation")
+    artifact = intent.compile(mhc_sinkhorn, target=context.target, compiler=context.compiler,
+                              tuning_config=context.tuning_config)
+    runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_reference")
+
+    def side(function):
+        values = initial.clone()
+        return PreparedLaunch(lambda: function(values), lambda: values, prepare=lambda: values.copy_(initial))
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(
+        side(artifact.run), side(runtime.mhc_sinkhorn), Tolerance(atol=2e-4, rtol=1e-4),
+        cuda_graph=False, device_type="cpu", cpu_host_timing=True,
+        note="既有 T8192/streams4 f32 MHC Sinkhorn；exp 后固定 20 次行列归一化、无 epsilon；每次恢复独立输入且恢复不计时，PyTorch CPU reference、原容差，完整 host 调用，单 NUMA 8 核。",
+    )
+
+
 def flaggems_fp8_mqa_logits(context: Context) -> PreparedComparison:
     configure_cpu_budget()
     queries, keys, heads, dimension = 256, 4096, 32, 128
@@ -167,5 +250,8 @@ def flaggems_fp8_mqa_logits(context: Context) -> PreparedComparison:
 CASES = {
     "moe_alignment": moe_alignment,
     "mhc_post": mhc_post,
+    "mhc_gemm_rms_scale": mhc_gemm_rms_scale,
+    "mhc_pre": mhc_pre,
+    "mhc_sinkhorn": mhc_sinkhorn_case,
     "flaggems_fp8_mqa_logits": flaggems_fp8_mqa_logits,
 }

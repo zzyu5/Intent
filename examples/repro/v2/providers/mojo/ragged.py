@@ -14,6 +14,9 @@ from kernels.ragged.grouped_gemm import K as GROUPED_K
 from kernels.ragged.grouped_gemm import N as GROUPED_N
 from kernels.ragged.grouped_gemm import ROWS as GROUPED_ROWS
 from kernels.ragged.grouped_gemm import ragged_grouped_gemm
+from kernels.ragged.grouped_gemm import ragged_grouped_gemm_bf16
+from kernels.ragged.grouped_gemm import ragged_grouped_gemm_backward_weight
+from kernels.ragged.grouped_gemm import routed_expert_projection_bf16
 from kernels.ragged.jagged_mean import jagged_mean
 from kernels.ragged.nested_pool import DOCUMENTS
 from kernels.ragged.nested_pool import FEATURES as NESTED_FEATURES
@@ -62,6 +65,48 @@ def grouped_gemm(context):
         (x, offsets, weight),
         "ragged_grouped_gemm",
         Tolerance(atol=5e-2),
+    )
+
+
+def grouped_gemm_bf16(context):
+    rows = (256, 512, 1024, 2048)
+    x = torch.cat(tuple(torch.randn((count, 4096), dtype=torch.bfloat16) for count in rows))
+    weight = torch.stack(tuple(torch.randn((4096, 4096), dtype=torch.bfloat16) for _ in rows))
+    offsets = torch.tensor((0, 256, 768, 1792, 3840), dtype=torch.int32)
+    return prepare_host_comparison(context, ragged_grouped_gemm_bf16, (x, offsets, weight),
+                                   "ragged_grouped_gemm", Tolerance(atol=5e-2, rtol=2e-2))
+
+
+def grouped_gemm_backward(context):
+    left = torch.randn((3840, 4096), dtype=torch.float16)
+    right = torch.randn_like(left)
+    offsets = torch.tensor((0, 256, 768, 1792, 3840), dtype=torch.int32)
+    generated = torch.empty((4, 4096, 4096), dtype=torch.float16)
+    source = torch.empty_like(generated)
+    report_stage("generated_compilation")
+    artifact = intent.compile(ragged_grouped_gemm_backward_weight, target=context.target,
+                              compiler=context.compiler, tuning_config=context.tuning_config)
+    runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_reference")
+    report_stage("adapter_preparation")
+    return PreparedComparison(
+        PreparedLaunch(lambda: artifact(left, right, offsets, generated), lambda: generated),
+        PreparedLaunch(lambda: runtime.ragged_grouped_gemm_backward_weight(left, right, offsets, source), lambda: source),
+        Tolerance(atol=5e-2, rtol=2e-2), cuda_graph=False, device_type="cpu", cpu_host_timing=True,
+        note="既有 rows256/512/1024/2048、K4096/N4096、f16 grouped GEMM weight backward；f32 累加，完整分组调用；双方输出预分配，PyTorch CPU reference，单 NUMA 8 核，沿用原容差。",
+    )
+
+
+def moe_expert_projection(context):
+    tokens, hidden, output, experts = 2048, 4096, 14336, 8
+    x = torch.randn((tokens, hidden), dtype=torch.bfloat16)
+    weight = torch.randn((experts, output, hidden), dtype=torch.bfloat16)
+    ids = torch.stack((torch.arange(tokens) % experts, (torch.arange(tokens) + 1) % experts), dim=1).to(torch.int32)
+    member_routes = torch.argsort(ids.reshape(-1), stable=True).to(torch.int32)
+    counts = torch.bincount(ids.reshape(-1), minlength=experts)
+    offsets = torch.cat((torch.zeros(1, dtype=torch.int64), counts.cumsum(0))).to(torch.int32)
+    return prepare_host_comparison(
+        context, routed_expert_projection_bf16, (x, offsets, member_routes, weight),
+        "routed_expert_projection_bf16", Tolerance(atol=1e-1, rtol=5e-2), constexprs={"TOP_K": 2},
     )
 
 
@@ -177,6 +222,9 @@ def moe_expert_ffn_case(context):
 CASES = {
     "jagged_mean": jagged_mean_case,
     "ragged_grouped_gemm": grouped_gemm,
+    "ragged_grouped_gemm_bf16": grouped_gemm_bf16,
+    "grouped_gemm_backward": grouped_gemm_backward,
+    "moe_expert_projection": moe_expert_projection,
     "nested_jagged_mean_pool": nested_pool,
     "moe_expert_ffn": moe_expert_ffn_case,
 }

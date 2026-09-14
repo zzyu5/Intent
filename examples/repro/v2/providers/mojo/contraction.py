@@ -5,6 +5,7 @@ import torch
 from kernels.contraction.block_scaled import block_scaled_matmul
 from kernels.contraction.block_sparse import block_sparse_matmul
 from kernels.contraction.gemm import Activation, gemm_f32, bf16_gemm, gemm as half_gemm_definition
+from kernels.contraction.gemm import quantized_gemm as quantized_gemm_definition
 from kernels.contraction.batched_gemm import batched_gemm_nn
 from kernels.contraction.batched_gemm import batched_gemm_nt as batched_gemm_nt_definition
 from kernels.contraction.batched_gemm import batched_gemm_tn as batched_gemm_tn_definition
@@ -13,12 +14,13 @@ from kernels.contraction.dual_gemm import gated_dual_gemm
 from kernels.contraction.qkv import fused_qkv_projection
 from kernels.contraction.sparse_2to4 import sparse_2to4_gemm
 from kernels.contraction.weight_only_int4 import fp8_e4m3_matmul
+from kernels.contraction.weight_only_int4 import fp8_e5m2_matmul, weight_only_int4_matmul
 from kernels.contraction.mla import mla_head_projection as mla_head_projection_definition
 from kernels.contraction.vector import vector_dot as vector_dot_definition
 from kernels.contraction.vector import matrix_vector as matrix_vector_definition
 from kernels.contraction.vector import vector_matrix as vector_matrix_definition
 from kernels.contraction.vector import vector_outer as vector_outer_definition
-from ...model import Tolerance
+from ...model import Tolerance, IntegerTolerance, SimilarityTolerance
 from ...loading import load_module
 from .common import configure_cpu_budget, prepare_comparison, prepare_host_comparison
 
@@ -160,6 +162,38 @@ def fp8_gemm(context):
                                    Tolerance(atol=0.5, rtol=5e-2))
 
 
+def fp8_e5m2_gemm(context):
+    lhs = torch.randn((1024, 1024), dtype=torch.float16).to(torch.float8_e5m2)
+    rhs = torch.randn((1024, 1024), dtype=torch.float16).to(torch.float8_e5m2)
+    comparison = prepare_host_comparison(context, fp8_e5m2_matmul, (lhs, rhs), "fp8_matmul",
+                                         SimilarityTolerance(max_error=1e-3))
+    return replace(comparison, note=comparison.note + " 沿用 extended FP8 E5M2 原始 normalized similarity error <=1e-3；未改变既有 E4M3 case 的逐元素容差。")
+
+
+def quantized_gemm(context):
+    lhs = torch.randn((4096, 4096), dtype=torch.float16) / math.sqrt(4096)
+    rhs = torch.randn((4096, 14336), dtype=torch.float16)
+    bias = torch.randn((14336,), dtype=torch.float32) * 0.25
+    residual = torch.randn((4096, 14336), dtype=torch.float16) * 0.25
+    scale = torch.linspace(1.0 / 48.0, 1.0 / 24.0, 14336, dtype=torch.float32)
+    comparison = prepare_host_comparison(
+        context, quantized_gemm_definition, (lhs, rhs, bias, residual, scale), "quantized_gemm",
+        IntegerTolerance(max_abs=2),
+    )
+    return replace(comparison, note=comparison.note + " 原 GEMM+ReLU+bias+residual+scale+clamp 输出 i8；沿用 extended max_int8_error<=2。")
+
+
+def weight_only_int4(context):
+    activation = torch.randn((512, 2048), dtype=torch.float16) * 0.05
+    logical = torch.randint(-8, 8, (2048, 4096), dtype=torch.int32)
+    packed = torch.zeros((256, 4096), dtype=torch.int32)
+    for lane in range(8):
+        packed |= (logical[lane::8] & 15) << (4 * lane)
+    scales = 0.01 + 0.02 * torch.rand((32, 4096), dtype=torch.float16)
+    return prepare_host_comparison(context, weight_only_int4_matmul, (activation, packed, scales),
+                                   "weight_only_int4_matmul", Tolerance(atol=4e-2))
+
+
 def _block_quantize_mxfp8(x, block_size):
     dtype_max = torch.finfo(torch.float8_e4m3fn).max
     x_block = x.reshape(*x.shape[:-1], x.shape[-1] // block_size, block_size)
@@ -260,6 +294,8 @@ CASES = {"dense_gemm_f32": gemm, "dense_gemm": half_gemm, "tilegym_dense_gemm": 
          "mla_head_value_projection": mla_head_value_projection,
          "qkv_projection": qkv_projection,
          "gated_dual_gemm": dual_gemm, "fp8_gemm": fp8_gemm,
+         "fp8_e5m2_gemm": fp8_e5m2_gemm, "quantized_gemm": quantized_gemm,
+         "weight_only_int4": weight_only_int4,
          "vector_dot": vector_dot, "matrix_vector": matrix_vector,
          "vector_matrix": vector_matrix, "vector_outer": vector_outer,
          "mxfp8_gemm": mxfp8_gemm, "block_sparse_gemm": block_sparse_gemm,

@@ -88,6 +88,28 @@ def fp8_matmul(lhs, rhs_transposed):
     return (lhs.float() @ rhs_transposed.float().T).to(lhs.dtype)
 
 
+def quantized_gemm(lhs, rhs, bias, residual, scale):
+    accumulator = lhs.float() @ rhs.float()
+    fused = torch.relu(accumulator + bias) + residual.float()
+    return (fused / scale).clamp(-128.0, 127.0).to(torch.int8)
+
+
+def weight_only_int4_matmul(activation, packed, scales):
+    positions = torch.arange(activation.shape[1])
+    nibble = (packed[positions // 8] >> ((positions % 8) * 4)[:, None]) & 15
+    signed = nibble - ((nibble & 8) << 1)
+    dequantized = signed.float() * scales.float().repeat_interleave(64, dim=0)
+    return (activation.float() @ dequantized).half()
+
+
+def f32_groupwise_fp8_quantize(x, scales):
+    values = x.reshape(x.shape[0], -1, 128)
+    scale = values.abs().amax(dim=-1).clamp_min(1e-4) / 448.0
+    scales.copy_(scale)
+    output = (values / scale[:, :, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).reshape_as(x)
+    return output, scales
+
+
 def qkv_projection(x, weights):
     values = x.float()
     return torch.stack(tuple((values @ weight.float()).to(x.dtype) for weight in weights))
@@ -682,6 +704,23 @@ def ragged_grouped_gemm(x, offsets, weight):
     return output
 
 
+def ragged_grouped_gemm_backward_weight(left, right, offsets, output):
+    for group in range(output.shape[0]):
+        begin, end = int(offsets[group]), int(offsets[group + 1])
+        output[group] = left[begin:end].float().T @ right[begin:end].float()
+    return output
+
+
+def routed_expert_projection_bf16(x, offsets, member_routes, weight):
+    top_k = member_routes.numel() // x.shape[0]
+    output = torch.empty((x.shape[0] * top_k, weight.shape[1]), dtype=x.dtype)
+    for expert in range(weight.shape[0]):
+        routes = member_routes[int(offsets[expert]):int(offsets[expert + 1])].long()
+        values = x[routes // top_k].float() @ weight[expert].float().T
+        output[routes] = values.to(x.dtype)
+    return output.reshape(x.shape[0], top_k, weight.shape[1])
+
+
 def nested_jagged_mean_pool(document_offsets, sentence_offsets, values):
     sentence_lengths = sentence_offsets[1:] - sentence_offsets[:-1]
     document_lengths = document_offsets[1:] - document_offsets[:-1]
@@ -877,6 +916,47 @@ def moe_align_block_size(topk_ids, block_size, num_experts):
         expert_ids[begin // block_size:end // block_size] = expert
         source_offset += count
     return sorted_ids, expert_ids, offsets[-1:].to(torch.int32)
+
+
+def mhc_gemm_rms_scale(x, weight, bias):
+    width = x.shape[1] // 16
+    linear, squares = [], []
+    for part in range(16):
+        values = x[:, part * width:(part + 1) * width].float()
+        linear.append(values @ weight[part * width:(part + 1) * width].float())
+        squares.append(values.square().sum(dim=1))
+    total = torch.stack(linear).sum(dim=0)
+    rstd = (torch.stack(squares).sum(dim=0) / x.shape[1]).rsqrt()
+    mixed = total * rstd[:, None] + bias.float()
+    mixed[:, :4] = mixed[:, :4].sigmoid()
+    mixed[:, 4:8] = 2 * mixed[:, 4:8].sigmoid()
+    return mixed.bfloat16(), rstd.reciprocal()[:, None]
+
+
+def mhc_pre(residual, weight, scale, base):
+    values = residual.flatten(1, 2).float()
+    rstd = (values.square().sum(dim=1) / weight.shape[1] + 1e-6).rsqrt()
+    mixes = (values @ weight.bfloat16().float().T) * rstd[:, None]
+    factors = torch.cat((scale[0].expand(4), scale[1].expand(4), scale[2].expand(16)))
+    mixes = mixes * factors + base
+    pre = mixes[:, :4].sigmoid() + 1e-6
+    post = mixes[:, 4:8].sigmoid()
+    matrix = mixes[:, 8:].reshape(-1, 4, 4).softmax(dim=-1) + 1e-6
+    matrix = matrix / (matrix.sum(dim=-2, keepdim=True) + 1e-6)
+    for _ in range(9):
+        matrix = matrix / (matrix.sum(dim=-1, keepdim=True) + 1e-6)
+        matrix = matrix / (matrix.sum(dim=-2, keepdim=True) + 1e-6)
+    layer_input = (residual.float() * pre[:, :, None]).sum(dim=1).bfloat16()
+    return post, matrix, layer_input
+
+
+def mhc_sinkhorn(values):
+    matrix = values.exp()
+    for _ in range(20):
+        matrix = matrix / matrix.sum(dim=-1, keepdim=True)
+        matrix = matrix / matrix.sum(dim=-2, keepdim=True)
+    values.copy_(matrix)
+    return values
 
 
 def mhc_apply_residual(residual, layer_output, post_mix, residual_mix):

@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 import statistics
 import time
+import math
 
 import torch
 
@@ -17,6 +18,7 @@ from .model import PreparedComparison
 from .model import PreparedLaunch
 from .model import TensorTree
 from .model import Tolerance
+from .model import IntegerTolerance, SimilarityTolerance, NumericalTolerance
 
 
 class PipelineStageError(RuntimeError):
@@ -132,7 +134,7 @@ def _result_structure(value: TensorTree):
 def compare_outputs(
     generated: TensorTree,
     source: TensorTree,
-    tolerance: Tolerance | tuple[Tolerance, ...],
+    tolerance: NumericalTolerance | tuple[NumericalTolerance, ...],
 ) -> tuple[float, ...]:
     generated_structure = _result_structure(generated)
     source_structure = _result_structure(source)
@@ -172,6 +174,35 @@ def compare_outputs(
                 f"generated/source result {leaf_index} dtype differs: "
                 f"{generated_value.dtype} != {source_value.dtype}"
             )
+        if isinstance(leaf_tolerance, IntegerTolerance):
+            if generated_value.dtype not in (torch.int8, torch.uint8, torch.int16, torch.int32):
+                raise TypeError("integer absolute comparison requires at most 32-bit integer outputs")
+            actual, expected = generated_value.reshape(-1), source_value.reshape(-1)
+            maximum = 0
+            for begin in range(0, actual.numel(), COMPARISON_CHUNK_ELEMENTS):
+                end = begin + COMPARISON_CHUNK_ELEMENTS
+                difference = (actual[begin:end].long() - expected[begin:end].long()).abs()
+                maximum = max(maximum, difference.max().item())
+            if maximum > leaf_tolerance.max_abs:
+                raise NumericalComparisonError(
+                    f"generated/source integer result {leaf_index} differs: max_abs={maximum}, limit={leaf_tolerance.max_abs}"
+                )
+            errors.append(float(maximum))
+            continue
+        if isinstance(leaf_tolerance, SimilarityTolerance):
+            if not generated_value.is_floating_point():
+                raise TypeError("similarity comparison requires floating outputs")
+            actual, expected = generated_value.double(), source_value.double()
+            if not (torch.isfinite(actual).all() and torch.isfinite(expected).all()):
+                raise NumericalComparisonError(f"similarity comparison requires finite result {leaf_index}")
+            denominator = (actual * actual + expected * expected).sum()
+            error = 0.0 if denominator.item() == 0.0 else abs(1.0 - (2.0 * (actual * expected).sum() / denominator).item())
+            if not math.isfinite(error) or error > leaf_tolerance.max_error:
+                raise NumericalComparisonError(
+                    f"generated/source result {leaf_index} differs: similarity_error={error}, limit={leaf_tolerance.max_error}"
+                )
+            errors.append(error)
+            continue
         if generated_value.dtype == torch.bool or not generated_value.is_floating_point():
             if not torch.equal(generated_value, source_value):
                 raise NumericalComparisonError(

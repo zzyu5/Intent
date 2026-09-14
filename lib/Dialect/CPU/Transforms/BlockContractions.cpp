@@ -19,7 +19,8 @@ Value subview(OpBuilder &b, Location loc, Value source,
 }
 
 LogicalResult block(linalg::GenericOp operation, const Configuration &config,
-                    const ImplementationRegistry &implementations, ImplementationInputs &inputs) {
+                    const ImplementationRegistry &implementations, ImplementationInputs &inputs,
+                    bool parallelTiles = false) {
   auto implementation = implementations.lookup(operation);
   if (failed(implementation)) return failure();
   auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
@@ -161,7 +162,7 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
       bounded(n, fullN, bn, [&](Value nBegin, Value nCount) { tile(mBegin, nBegin, mCount, nCount); });
     });
   };
-  if (operation->getParentOfType<scf::ForOp>() || operation->getParentOfType<scf::ParallelOp>()) {
+  if (!parallelTiles && (operation->getParentOfType<scf::ForOp>() || operation->getParentOfType<scf::ParallelOp>())) {
     loop(b, loc, zero, mTasks, 1, [&](Value m) {
       loop(b, loc, zero, nTasks, 1, [&](Value n) { emitTile(m, n); });
     });
@@ -178,12 +179,54 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
   return success();
 }
 
+LogicalResult exposeGroupedTiles(func::FuncOp function, const Configuration &config,
+    const ImplementationRegistry &implementations, ImplementationInputs &inputs) {
+  auto capabilities = function->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities");
+  if (capabilities.getWorkers() <= 1) return success();
+  SmallVector<scf::ParallelOp> groups;
+  function.walk([&](scf::ParallelOp loop) {
+    if (loop->getParentOfType<scf::ParallelOp>() || loop->getParentOfType<scf::ForOp>() ||
+        loop.getNumLoops() != 1 || loop.getNumResults() ||
+        !matchPattern(loop.getLowerBound()[0], m_Zero()) || !matchPattern(loop.getStep()[0], m_One())) return;
+    if (llvm::any_of(loop.getBody()->getOps<linalg::GenericOp>(), [](linalg::GenericOp operation) {
+          return isMatrixContraction(operation) && !operation->hasAttr("intent_cpu.microtile");
+        })) groups.push_back(loop);
+  });
+  for (auto group : groups) {
+    OpBuilder b(group);
+    Location loc = group.getLoc();
+    Value tasks = b.create<arith::CeilDivSIOp>(loc, group.getUpperBound()[0], index(b, loc, config.taskGrain));
+    Value fewGroups = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt,
+        tasks, index(b, loc, capabilities.getWorkers()));
+    auto selection = b.create<scf::IfOp>(loc, fewGroups, true);
+    b.setInsertionPointToStart(selection.thenBlock());
+    auto serial = b.create<scf::ForOp>(loc, group.getLowerBound()[0], group.getUpperBound()[0], group.getStep()[0]);
+    b.setInsertionPointToStart(serial.getBody());
+    IRMapping mapping;
+    mapping.map(group.getInductionVars()[0], serial.getInductionVar());
+    SmallVector<linalg::GenericOp> contractions;
+    for (Operation &operation : group.getBody()->without_terminator()) {
+      Operation *copy = b.clone(operation, mapping);
+      if (auto contraction = dyn_cast<linalg::GenericOp>(copy);
+          contraction && isMatrixContraction(contraction) && !contraction->hasAttr("intent_cpu.microtile"))
+        contractions.push_back(contraction);
+    }
+    group->moveBefore(selection.elseBlock()->getTerminator());
+    // Group preparation and epilogues retain their lexical owner. Tile tasks
+    // finish before the group consumes or releases their shared buffers.
+    for (auto contraction : contractions)
+      if (failed(block(contraction, config, implementations, inputs, true))) return failure();
+  }
+  return success();
+}
+
 }
 
 LogicalResult blockContractions(func::FuncOp function, const Configuration &configuration,
                                 const ImplementationRegistry &implementations) {
   SmallVector<linalg::GenericOp> contractions;
   ImplementationInputs inputs(function);
+  if (failed(exposeGroupedTiles(function, configuration, implementations, inputs))) return failure();
   function.walk([&](linalg::GenericOp operation) {
     if (isMatrixContraction(operation) && !operation->hasAttr("intent_cpu.microtile"))
       contractions.push_back(operation);
