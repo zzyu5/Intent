@@ -1113,7 +1113,7 @@ private:
       Value result = values.lookup(combine.getTerminator()->getOperand(0));
       builder.create<cpu::YieldOp>(loc, result);
       auto *combineOp = result.getDefiningOp();
-      if (combineOp && isa<arith::AddFOp, arith::MaxNumFOp>(combineOp) &&
+      if (combineOp && isa<arith::AddFOp, arith::MaxNumFOp, arith::MaximumFOp>(combineOp) &&
           body->getArgument(0).hasOneUse() &&
           llvm::is_contained(combineOp->getOperands(), body->getArgument(0)))
         reduction.setOrderAttr(cpu::ReductionOrderAttr::get(builder.getContext(), true));

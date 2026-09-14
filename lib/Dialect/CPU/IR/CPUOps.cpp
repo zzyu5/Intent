@@ -57,9 +57,9 @@ LogicalResult ReduceOp::verify() {
   if (getOrder().getAdjacentReassociation()) {
     Operation *combine = yield.getValue().getDefiningOp();
     Value accumulator = block.getArgument(0);
-    if (!combine || !isa<arith::AddFOp, arith::MaxNumFOp>(combine) || !accumulator.hasOneUse() ||
+    if (!combine || !isa<arith::AddFOp, arith::MaxNumFOp, arith::MaximumFOp>(combine) || !accumulator.hasOneUse() ||
         !llvm::is_contained(combine->getOperands(), accumulator))
-      return emitOpError("adjacent reassociation requires one floating-add/maximumNumber accumulator consumer");
+      return emitOpError("adjacent reassociation requires one floating-add or floating-maximum accumulator consumer");
   }
   return success();
 }

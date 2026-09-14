@@ -157,7 +157,7 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonemp
              original.getBody()->getTerminator()->getOperands())) {
       if (!carry.getType().isF32() || !carry.hasOneUse()) return;
       Operation *combine = yielded.getDefiningOp();
-      if (!combine || !isa<arith::AddFOp, arith::MaxNumFOp>(combine)) return;
+      if (!combine || !isa<arith::AddFOp, arith::MaxNumFOp, arith::MaximumFOp>(combine)) return;
       if (combine->getOperand(0) == carry) reductionInputs.push_back(combine->getOperand(1));
       else if (combine->getOperand(1) == carry) reductionInputs.push_back(combine->getOperand(0));
       else return;

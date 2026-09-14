@@ -37,7 +37,10 @@ bool supportedType(Type type) {
 }
 
 bool needsFloatingPointEnvironment(Operation *scope) {
-  auto floating = [](Type type) { return isa<FloatType>(getElementTypeOrSelf(type)); };
+  auto floating = [](Type type) {
+    if (auto vector = dyn_cast<VectorType>(type)) type = vector.getElementType();
+    return isa<FloatType>(type);
+  };
   return scope->walk([&](Operation *operation) {
     // Calls may depend on the caller's FP state even with an integer-only ABI.
     if (isa<func::CallOp>(operation) ||
