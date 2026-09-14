@@ -141,7 +141,7 @@ Physical IR可以与KIR op graph不同，但变化必须属于KIR semantics允�
 
 - 合并pure producer与consumer；
 - rematerialize pure value；
-- 对reduce/scan/contract采用operation允许的reassociation；
+- ordinary reduce可按其结合交换合同重结合与重排；scan和ordered region operations只按各自合同保留成员顺序地重结合；contract采用其独立数值合同允许的reassociation；
 - 按DSL局部contraction-add规则合并零初值contraction与唯一同dtype加法consumer；
 - flatten/permutation paired contract axes；
 - 创建blocking loops与fragment accumulators；

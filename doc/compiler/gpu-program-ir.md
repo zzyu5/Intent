@@ -146,7 +146,8 @@ Broadcast、reshape、transpose、slice、tuple/record extraction与pure helper 
 
 Physical structured operations消费当前scalar/fragment SSA：
 
-- reduce与scan：physical axes、逐component identity、typed pure combine region、direction、inclusive/exclusive、dynamic extent、result relation与accumulator flow；
+- reduce：physical axes、逐component identity、声明可结合与交换的typed pure combine region、dynamic extent、result relation与accumulator flow；
+- scan：physical axis、逐component identity、可结合的typed pure combine region、direction、inclusive/exclusive、prefix result relation与carry；它保留prefix成员顺序，不继承reduce的重排许可；
 - region fold：physical segment loop、source-slice operands、typed summarizer region、summary identity/combine、captures与result flow；
 - region scan：physical segment loop、summarizer与transition combine、incoming-state application、slice emitter、source-aligned output assembly与final-state flow；
 - contract：physical lhs/rhs/accumulator fragments、paired reduction与batch axis maps、free/result-axis order、zero-reduction result rule、result relation与accumulator dtype；
@@ -155,6 +156,8 @@ Physical structured operations消费当前scalar/fragment SSA：
 -其它被canonical KIR正式定义的local structured operation。
 
 Arg-reduce等复合result还保存tie、NaN与index semantics；ordinary ordered loop则显式保存runtime condition/bounds、loop-carried values、effects与terminators。Region summarizer内原本显式存在的contract/reduce继续是独立physical structured ops；compiler不需要从summary combine猜回它们。上述ops不携带provider primitive名称、MMA version、input precision hint、K-pack、warp policy或pipeline stage。Provider可以直接映射到native primitive、合法展开或明确拒绝，但不得改变KIR semantic schema。
+
+普通reduce的结合交换合同来自operation语义，不需要附加一份combine代数证明或重排计划。Shared passes形成blocking、access与accumulator flow；provider已有等价collective时，其内部归约树、lane/warp通信与同步由provider compiler完成。Scan与ordered region operations继续按各自的顺序合同lower，不为统一实现而把ordinary reduce变成scan再取末项。
 
 Structured op可以另外保存一个由typed predicate analysis得到的physical effective source range。该range只能收窄physical traversal，不修改KIR logical source；被排除的members必须已被证明对每个free lane产生identity/no effect。All-true区间可删除predicate，mixed区间保留原validity，all-false区间可从physical loop/access graph中删除。Effective range与改写后的loop/access SSA属于current program；proof是由current coordinate/predicate relations重算的analysis result，可缓存但不参与执行解释。
 

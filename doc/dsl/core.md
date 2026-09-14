@@ -148,7 +148,9 @@ source与accumulator都可以是scalar、tensor、tuple或typed record。source 
 - runtime captures必须成为显式operands；
 - 不得包含read/write/atomic/RNG或buffer mutation。
 
-作者选择reduce，即选择其允许的logical-order-preserving reassociation；不保证ordinary left fold。identity逐component显式给出，空reduction返回identity。
+作者选择reduce，即声明combine满足结合、交换与identity中立的并行归约合同。Compiler允许重结合与重排elements，不保证logical source order或ordinary left fold；floating-point接受数值章节规定的舍入差异。Compiler验证typed schema、purity与effects，不对任意helper重新证明代数定律。Identity逐component显式给出，空reduction返回identity。
+
+Generic reduce没有独立于其source component的隐藏accumulator dtype：进入combine的element dtype与对应identity/result一致。Builtin的`acc_dtype`和默认widening先对source做定义明确的转换，再构造generic reduce；这不要求external input view与accumulator具有相同dtype。
 
 `reduce.sum/max/any/all`是具名计算入口，统一归一到generic reduce：
 
@@ -176,7 +178,7 @@ prefix = I.scan(
 )
 ```
 
-scan使用与reduce相同的typed pure combine，定义每个logical prefix。`inclusive/exclusive`与forward/reverse是operation semantics。严格顺序、不可重结合的recurrence使用ordinary loop。
+Scan复用typed pure combine的schema，但只要求结合，不要求交换；它定义每个logical prefix，允许保序重结合，不允许像ordinary reduce一样重排elements。`inclusive/exclusive`与forward/reverse是operation semantics。严格顺序、不可重结合的recurrence使用ordinary loop。
 
 常用prefix计算使用具名入口：
 
@@ -223,7 +225,7 @@ combine(identity, x) == combine(x, identity) == x
 
 其中`A`、`B`是相邻source slices。Combine保持logical order但允许任意parenthesization。Empty source返回identity；physical tail或padding也可以安全使用identity，因此不能把在combine中产生NaN的sentinel冒充identity。需要区分“没有成员”时，summary显式携带bool validity或等价typed状态。
 
-Ordinary reduce是element-summary的受限形式。二者共享homomorphic summary interface与physical reduction framework；若region summarizer只是用同一个combine折叠slice elements，frontend canonicalize为ordinary reduce。
+Ordinary reduce与region fold可复用summary schema和pure helper机制，但前者允许重排，后者保留slice order，不能无条件互换。只有region summarizer本身是使用同一combine的ordinary reduce、因而已经声明相同的结合交换合同时，frontend才可将该region fold canonicalize为ordinary reduce；不能仅凭相同shape、combine body或最终result取消有序合同。
 
 ### 9.2 Region scan
 
@@ -296,7 +298,7 @@ I.outer(lhs, rhs)
 
 表中的M/K/N描述执行转置之后的运算形状。例如原始`lhs=[64,32]`、`rhs=[64,16]`配`transpose_lhs=True`得到`[32,16]`；原始matrix为`[64,32]`时，`matvec(..., transpose=True)`要求vector长度64，结果长度32。转置不取消inner-extent匹配要求。
 
-普通乘加要求同numeric dtype，异型operand由作者显式cast，accumulator/result dtype显式给出。没有隐式共轭、TF32、alpha/beta或mutable C初值；empty K返回accumulator dtype零。前端生成逻辑transpose/broadcast与paired axes并归一到contract，保存dynamic extent identity及运行时广播条件，不从provider matrix form反推public rank。
+普通乘加的lhs/rhs要求同numeric dtype，异型operand由作者显式cast；accumulator/result dtype独立、显式给出，不要求与lhs/rhs相同。没有隐式共轭、TF32、alpha/beta或mutable C初值；empty K返回accumulator dtype零。前端生成逻辑transpose/broadcast与paired axes并归一到contract，保存dynamic extent identity及运行时广播条件，不从provider matrix form反推public rank。
 
 Outer只增加size-one axes后执行普通broadcast multiply，保持input dtype与逐元素乘法数值规则；它不生成空reduction contract或隐含accumulator。更一般的轴关系使用下面的generic contract。
 

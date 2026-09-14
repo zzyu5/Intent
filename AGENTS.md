@@ -11,7 +11,10 @@
 
 - `doc/` 是最终设计规格。动 DSL、KIR、compiler IR/pass、provider 或 runtime 前，从 `doc/index.md` 进入并完整阅读相关章节；实现向规格收敛，不为保住现状反改规格。
 - 只有用户确认设计变化才改规格；进度、实验失败、临时字段和性能数字不写入 `doc/`。Memory、短期记录和 report 只能帮助定位，不能替代当前原文。
-- 架构、pass 与性能决策先对照 `ref/triton`、`ref/tilelang` 或相应成熟目标实现：确认同类职责由哪层承担，关键结论给出双方 file:line、具体差异与后果。参考边界与机制，不照搬 surface，不凭框架名称作判断。
+- 架构、pass 与性能决策先对照外部 `../ref/triton`、`../ref/tilelang` 或相应成熟目标实现：先比较 surface 的语义合同，再确认同类职责由哪层承担；关键结论给出双方 file:line、具体差异与后果。参考边界与机制，不照搬 surface，不凭框架名称作判断。
+- 不把已有文档中的更强保证自动当作必要目标。默认保序、严格逐操作舍入、额外 dtype 限制等若强于成熟参考，先说明作者需求、适用范围与实现成本；发现合同本身不合理时先提出语义修正，不持续堆 lowering 迁就它。普通 reduce、prefix scan 与 ordered loop 各按自己的合同处理。
+- 合同相同且 provider 已有原生 primitive 时优先直接映射。Triton/TileLang 已承担的归约树、线程通信、布局和 pipeline 不在 Intent 重建；不为同一个原生能力另造 form、plan 或运行时分支。只有实际缺失的执行事实或不匹配的目标能力才引入必要扩展。
+- dtype 分清外部存储/ABI、source 运算、accumulator/result 与后端内部计算。先核对参考的 promotion、literal 推导和 store conversion；typed IR 要求类型闭合，不等于作者必须处处同 dtype 或显式 cast。额外限制须有独立理由，也不能以复用后端为由改变已声明的累加精度、NaN/tie 或 ABI。
 - `source/` 是 provider source/runtime corpus，`examples/kernels/` 是作者算法，registry 连接完整 callable，CSV 是运行观察；它们不定义语言语义或 compiler policy。
 
 ## IR、pass 与目录

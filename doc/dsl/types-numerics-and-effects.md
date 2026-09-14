@@ -39,7 +39,7 @@ Ranked tensor与external view的`.shape`是logical extent tuple；dynamic member
 
 Python literal是untyped source literal，可以按直接使用位置的expected dtype实例化，前提是其值可表示。
 
-两个runtime numeric operands不会采用provider自己的promotion rules：
+Pointwise表达式在frontend确定结果dtype，再以显式typed operations进入KIR；不让provider默认promotion重新决定逻辑结果。下面的混合runtime dtype显式转换规则是本surface的数值选择，不是Triton或typed IR的必然要求。跨provider一致性来自统一的语言规则及其lowering，不要求所有语言都禁止implicit promotion：
 
 - dtype相同可直接运算；
 - dtype不同必须显式`I.cast`；
@@ -54,6 +54,8 @@ Python literal是untyped source literal，可以按直接使用位置的expected
 - `f32/f64`保持输入dtype。
 
 其它builtin reduce与cummax默认保持输入dtype，除非surface明确要求另一result schema。Dot/matvec/vecmat/matmul保持与contract相同的显式accumulator/result dtype，不从provider推导输入精度；outer使用普通同dtype乘法。
+
+External view的storage dtype、进入运算的operand dtype、accumulator/result dtype与provider内部instruction dtype是不同层次。Builtin `acc_dtype`及本节固定widening由frontend插入转换，不要求作者先转换整个external tensor；generic reduce/scan则要求进入combine的各component与对应identity/result dtype一致。后端可以用不同的内部计算表示实现同一数值合同，不要求每条机器指令的dtype与logical value逐一相同。
 
 ## 4. Integer arithmetic
 
@@ -118,7 +120,11 @@ fixed-width integers使用二进制补码与modulo arithmetic：
 
 ## 6. Reduce 与 scan 数值语义
 
-generic reduce/scan的combine按logical element order允许任意parenthesization，但不允许任意permutation。作者选择这些operations，即接受这种reassociation可能导致的finite-precision差异；要求严格left fold时使用ordinary loop。source component可以含被归约axes；删除这些axes后的component shape是accumulator、identity、combine参数与result shape。
+Generic reduce是并行归约。作者选择该operation，即声明combine具有结合、交换及identity中立的算法合同；compiler可以选择parenthesization与element permutation，不保证logical source order或ordinary left fold。对于floating-point，这项许可接受并行归约树与重排带来的finite-precision差异，不要求combine逐bit满足实数代数等式；它不改变输入成员、声明的accumulator/result dtype、NaN/tie规则或effects，也不授权未声明的TF32、FTZ或其它近似。
+
+Scan定义每个logical prefix。它要求combine可结合，但不要求可交换；允许保持prefix内source order的parenthesization，不允许重排prefix成员或改变各prefix的成员集合。严格left fold、不可重结合的recurrence及ordered effects使用ordinary loop。
+
+这些代数性质是作者选择operation时承担的前置条件；compiler验证typed schema、axes、purity、captures与effects，不为每个自定义combine重新证明结合律或交换律。Source component可以含被归约axes；删除这些axes后的component shape是accumulator、identity、combine参数与result shape。
 
 Generic reduce/scan的identity逐component显式给出；builtin reduce/prefix由操作定义产生同一canonical identity，不要求作者重复传入：
 
@@ -128,7 +134,7 @@ Generic reduce/scan的identity逐component显式给出；builtin reduce/prefix�
 
 NaN与tie behavior来自明确combine。`reduce.max`与`cummax`使用propagating maximum；其identity为dtype最小值：有infinity的float取负无穷，f8e4m3fn取-448，signed integer/index取最小整数，unsigned integer取0。Sum/cumsum的identity为result dtype的加法零，bool any/all分别为false/true。`arg_reduce.max`在values相等时选择lowest logical index，并传播NaN。其它策略必须通过不同typed combine明确写出。
 
-Region fold/scan沿compiler-selected连续source slices允许同样的logical-order-preserving reassociation。它们另外要求region summarizer与summary combine满足：
+Region fold/scan沿compiler-selected连续source slices允许logical-order-preserving reassociation，不继承ordinary reduce的permutation许可。它们要求region summarizer与summary combine满足：
 
 ```text
 summarize(A ++ B) == combine(summarize(A), summarize(B))
