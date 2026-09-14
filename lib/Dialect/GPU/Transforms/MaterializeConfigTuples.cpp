@@ -68,9 +68,10 @@ bool isBlockedReductionFreeAxis(func::FuncOp kernel, ParameterOp parameter) {
   StringAttr name = parameter.getParameter().getName();
   bool found = false;
   kernel.walk([&](ReduceOp reduce) {
-    if (found || reduce.getAxes().empty() || reduce.getSourceCount() != 1 ||
-        reduce.getIdentityCount() != 1 || reduce.getNumResults() != 1)
+    if (found || reduce.getAxes().empty())
       return;
+    // Every component contributes a live free-axis footprint. Its tuning
+    // preference does not require the other components to share its schema.
     for (Value source :
          reduce.getInputs().take_front(reduce.getSourceCount())) {
       auto fragment = dyn_cast<FragmentType>(source.getType());
