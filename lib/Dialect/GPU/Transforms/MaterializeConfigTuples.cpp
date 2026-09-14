@@ -870,14 +870,46 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
   }
   if (profileCount == 0)
     profileCount = 1;
+  llvm::DenseSet<Operation *> reductionRows;
+  llvm::DenseSet<Operation *> pointwiseTraversals;
+  bool hasContraction = false;
+  int64_t largestReduction = 0;
+  kernel.walk([&](Operation *operation) {
+    hasContraction |= isa<ContractOp, ScaledContractOp, SparseContractOp>(operation);
+  });
+  for (ParameterOp parameter : parameters) {
+    if (isBlockedReductionFreeAxis(kernel, parameter))
+      reductionRows.insert(parameter);
+    if (parameter->hasAttr(pointwiseChunkAttr))
+      kernel.walk([&](scf::ForOp loop) {
+        if (samePhysicalScalarExpression(loop.getStep(), parameter.getResult()))
+          pointwiseTraversals.insert(parameter);
+      });
+    auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());
+    if (role == ParameterRole::Reduction || role == ParameterRole::ReductionInner ||
+        role == ParameterRole::ReductionOuter)
+      for (const TuningProfile &profile : parameterProfiles.find(parameter)->second)
+        largestReduction = std::max(largestReduction, requestedValue(profile, role));
+  }
   auto freeExtents = contractionFreeExtents(kernel, parameters);
-  auto appendTuple = [&](llvm::function_ref<const TuningProfile &(ParameterOp)> profileFor) {
+  auto appendTuple = [&](llvm::function_ref<const TuningProfile &(ParameterOp)> profileFor,
+                         bool compactRows = false) {
     NamedAttrList bindings;
     for (ParameterOp parameter : parameters) {
       auto schema = parameter.getParameter();
       auto role = static_cast<ParameterRole>(schema.getRole());
-      int64_t selected = selectCandidate(schema.getCandidates().asArrayRef(),
-                                         requestedValue(profileFor(parameter), role));
+      int64_t requested = requestedValue(profileFor(parameter), role);
+      if (compactRows && reductionRows.contains(parameter)) {
+        for (const TuningProfile &profile : parameterProfiles.find(parameter)->second)
+          requested = std::min(requested, requestedValue(profile, role));
+      } else if (compactRows &&
+                 (pointwiseTraversals.contains(parameter) ||
+                  role == ParameterRole::Reduction ||
+                  role == ParameterRole::ReductionInner ||
+                  role == ParameterRole::ReductionOuter)) {
+        requested = largestReduction;
+      }
+      int64_t selected = selectCandidate(schema.getCandidates().asArrayRef(), requested);
       bindings.set(schema.getName(), builder.getI64IntegerAttr(selected));
     }
     bindContractionFreeExtents(freeExtents, bindings, profileFor, builder);
@@ -895,6 +927,14 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
       return profiles[selectedProfile];
     });
   }
+  // Independent rows and their local traversals consume different axes of the
+  // resource budget. Keep one correlated small-row/large-chunk tuple instead
+  // of pairing both granularities solely by their profile row number.
+  if (!hasContraction && !reductionRows.empty() &&
+      !pointwiseTraversals.empty() && largestReduction > 0)
+    appendTuple([&](ParameterOp parameter) -> const TuningProfile & {
+      return parameterProfiles.find(parameter)->second.front();
+    }, true);
   for (const CorrelatedProfileParameters &correlated : correlatedProfiles) {
     appendTuple([&](ParameterOp parameter) -> const TuningProfile & {
       const auto &profiles = parameterProfiles.find(parameter)->second;
