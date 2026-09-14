@@ -7,6 +7,7 @@
 #include "mlir/IR/Dominance.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -379,7 +380,7 @@ private:
                      bool followScalarDependencies = true);
   void collectAxisRanges(mlir::Value value, unsigned fragmentAxis,
                          PhysicalRangeFact &result,
-                         llvm::SmallPtrSetImpl<mlir::Operation *> &visited);
+                         llvm::DenseSet<std::pair<mlir::Value, unsigned>> &visited);
   void analyzeReplay(mlir::Value value,
                      std::optional<PhysicalSourceAxis> source,
                      PhysicalReplayScope scope, bool allowAccesses,

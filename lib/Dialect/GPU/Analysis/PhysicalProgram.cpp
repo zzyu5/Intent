@@ -2190,8 +2190,8 @@ PhysicalProgramAnalysis::programRanges(PhysicalSourceAxis source) {
 
 void PhysicalProgramAnalysis::collectAxisRanges(
     Value value, unsigned fragmentAxis, PhysicalRangeFact &result,
-    SmallPtrSetImpl<Operation *> &visited) {
-  if (!value)
+    llvm::DenseSet<std::pair<Value, unsigned>> &visited) {
+  if (!value || !visited.insert({value, fragmentAxis}).second)
     return;
   auto fragment = dyn_cast<FragmentType>(value.getType());
   if (!fragment || fragmentAxis >= fragment.getShape().size()) {
@@ -2243,7 +2243,7 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     return;
   }
   Operation *operation = value.getDefiningOp();
-  if (!operation || !visited.insert(operation).second)
+  if (!operation)
     return;
   if (auto range = dyn_cast<MakeRangeOp>(operation)) {
     if (fragmentAxis == 0)
@@ -2362,6 +2362,14 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     if (!followed) {
       result.state = PhysicalFactState::Unknown;
       appendUnique(result.blockers, operation);
+    }
+    return;
+  }
+  if (auto join = dyn_cast<JoinOp>(operation)) {
+    auto input = cast<FragmentType>(join.getLhs().getType());
+    if (fragmentAxis < input.getShape().size()) {
+      collectAxisRanges(join.getLhs(), fragmentAxis, result, visited);
+      collectAxisRanges(join.getRhs(), fragmentAxis, result, visited);
     }
     return;
   }
@@ -2660,7 +2668,7 @@ PhysicalRangeFact PhysicalProgramAnalysis::axisRanges(Value value,
                                                       unsigned fragmentAxis) {
   PhysicalRangeFact result;
   result.state = PhysicalFactState::Exact;
-  SmallPtrSet<Operation *, 32> visited;
+  llvm::DenseSet<std::pair<Value, unsigned>> visited;
   collectAxisRanges(value, fragmentAxis, result, visited);
   if (result.state == PhysicalFactState::Unknown || !result.blockers.empty())
     result.state = PhysicalFactState::Unknown;
@@ -3036,13 +3044,18 @@ PhysicalProgramAnalysis::rangeAxes(Value value,
   result.state = PhysicalFactState::Exact;
   for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
     PhysicalRangeFact ranges = axisRanges(value, axis);
-    bool selected = llvm::any_of(ranges.roots, [&](MakeRangeOp range) {
+    auto selectedRange = [&](MakeRangeOp range) {
       return llvm::any_of(selectedRoots, [&](MakeRangeOp selectedRoot) {
         return range == selectedRoot || sameLogicalRange(range, selectedRoot);
       });
-    });
+    };
+    bool selected = llvm::any_of(ranges.roots, selectedRange);
     if (selected) {
-      if (failed(queryExactLogicalRange(ranges))) {
+      if (failed(queryExactLogicalRange(ranges)) &&
+          (ranges.state == PhysicalFactState::Unknown ||
+           !ranges.blockers.empty() ||
+           !llvm::all_of(ranges.roots, selectedRange) ||
+           !lockstepRanges(ranges.roots).isExact())) {
         result.state = PhysicalFactState::Ambiguous;
         result.blockers.append(ranges.blockers.begin(), ranges.blockers.end());
         return result;

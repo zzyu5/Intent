@@ -2760,11 +2760,43 @@ FailureOr<bool> realizeFullResultTraversal(
     for (Value value :
          {Value(contract.getLhs()), Value(contract.getRhs()),
           Value(contract.getAccumulator())}) {
+      SmallVector<MakeRangeOp> operandRoots(roots);
+      Value operandRange = tileRange;
+      if (value == contract.getAccumulator()) {
+        PhysicalRangeFact accumulatorRanges =
+            PhysicalProgramAnalysis(kernel).axisRanges(value, resultAxis);
+        if (!accumulatorRanges.roots.empty()) {
+          auto accumulatorRange = queryExactLogicalRange(accumulatorRanges);
+          SmallVector<MakeRangeOp> lockstep(accumulatorRanges.roots.begin(),
+                                           accumulatorRanges.roots.end());
+          lockstep.append(roots);
+          if (failed(accumulatorRange) ||
+              !PhysicalProgramAnalysis(kernel).lockstepRanges(lockstep).isExact())
+            return contract.emitOpError(
+                "accumulator free axis has no exact lockstep coordinate relation");
+          operandRoots.assign(accumulatorRanges.roots.begin(),
+                              accumulatorRanges.roots.end());
+          auto original = cast<FragmentType>((*accumulatorRange).getResult().getType());
+          auto type = FragmentType::get(
+              kernel.getContext(), original.getElementType(),
+              nested.getArrayAttr({tileExtent}), original.getAxisMaps(),
+              original.getValidity(), original.getOwner());
+          operandRange = nested.create<MakeRangeOp>(
+              location, type, loop.getInductionVar(), block.getResult(),
+              (*accumulatorRange).getStep(),
+              (*accumulatorRange).getLogicalStart(),
+              (*accumulatorRange).getLogicalStop(),
+              (*accumulatorRange).getSourceId(),
+              (*accumulatorRange).getSourceAxis(),
+              (*accumulatorRange).getDerived());
+          inheritRangeAuthority(operandRange, *accumulatorRange);
+        }
+      }
       IRMapping mapping;
-      for (MakeRangeOp root : roots)
-        mapping.map(root.getResult(), tileRange);
+      for (MakeRangeOp root : operandRoots)
+        mapping.map(root.getResult(), operandRange);
       FailureOr<Value> sliced = replaySourceValue(
-          nested, location, value, tileExtent, roots, tileRange, mapping,
+          nested, location, value, tileExtent, operandRoots, operandRange, mapping,
           loop.getOperation());
       if (failed(sliced))
         return contract.emitOpError(

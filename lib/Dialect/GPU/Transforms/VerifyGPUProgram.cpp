@@ -334,9 +334,9 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
       auto parent =
           operation->getAttrOfType<IntegerAttr>(sourceSubregionAttr);
       if (!parent || parent.getInt() <= 0 ||
-          !launchDimensions.contains(parent.getInt())) {
+          !isa<RangeOp, MakeRangeOp>(operation)) {
         operation->emitOpError(
-            "physical subregion requires one launch-visible parent dimension");
+            "physical subregion requires a typed coordinate range and parent identity");
         return WalkResult::interrupt();
       }
     }

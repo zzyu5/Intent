@@ -276,7 +276,9 @@ LogicalResult alignElementwiseOperands(OpBuilder &builder, Location location,
       left.getValidity() == right.getValidity()) {
     bool leftMatches = carriesLogicalDimensions(left, leftLogical);
     bool rightMatches = carriesLogicalDimensions(right, rightLogical);
-    if (leftMatches != rightMatches) {
+    if (leftMatches != rightMatches &&
+        gpu::queryAxisProjection(leftMatches ? right : left,
+                                 leftMatches ? left : right).isExact()) {
       gpu::FragmentType relationTarget = leftMatches ? left : right;
       gpu::FragmentType extentSource = leftMatches ? right : left;
       FailureOr<gpu::FragmentType> target =
@@ -5032,20 +5034,21 @@ private:
         SmallVector<Value> loopResults;
         auto loop = nested.create<scf::ForOp>(
             location, lowers[axis], uppers[axis], steps[axis], carries,
-            [&](OpBuilder &bodyBuilder, Location, Value induction,
+            [](OpBuilder &bodyBuilder, Location location, Value,
                 ValueRange innerCarries) {
-              SmallVector<Value> nextCoordinates(coordinates);
-              nextCoordinates.push_back(induction);
-              SmallVector<Value> yielded =
-                  lowerAxis(bodyBuilder, axis + 1, std::move(nextCoordinates),
-                            innerCarries);
-              if (!nestedFailed)
-                bodyBuilder.create<scf::YieldOp>(location, yielded);
+              bodyBuilder.create<scf::YieldOp>(location, innerCarries);
             });
+        OpBuilder bodyBuilder(loop.getBody()->getTerminator());
+        SmallVector<Value> nextCoordinates(coordinates);
+        nextCoordinates.push_back(loop.getInductionVar());
+        SmallVector<Value> yielded = lowerAxis(
+            bodyBuilder, axis + 1, std::move(nextCoordinates),
+            loop.getRegionIterArgs());
         if (nestedFailed) {
           loop.erase();
           return {};
         }
+        loop.getBody()->getTerminator()->setOperands(yielded);
         if (isa<intent::ParallelOp>(operation))
           loop->setAttr(gpu::independentIterationAttr, nested.getUnitAttr());
         auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());

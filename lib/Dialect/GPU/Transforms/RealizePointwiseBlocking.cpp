@@ -1271,15 +1271,41 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
   for (Value operand : replayOperands) {
     PhysicalSourceAxis operandSource = source;
     SmallVector<int64_t> operandDimensions(traversalDimensions);
-    if (isa<BroadcastOp>(producer)) {
+    if (isa<BroadcastOp, ReshapeOp>(producer)) {
       auto input = dyn_cast<FragmentType>(operand.getType());
       auto output = dyn_cast<FragmentType>(value.getType());
       PhysicalAxisProjection requested = queryFragmentAxis(output, source);
       if (input && requested.isExact() &&
           llvm::is_contained(traversalDimensions, requested.dimensionId)) {
-        BroadcastProjection projection = queryAxisProjection(input, output);
-        if (projection.isExact())
-          if (auto axis = projection.targetToSource[requested.fragmentAxis]) {
+        std::optional<unsigned> inputAxis;
+        if (isa<BroadcastOp>(producer)) {
+          BroadcastProjection projection = queryAxisProjection(input, output);
+          if (projection.isExact())
+            inputAxis = projection.targetToSource[requested.fragmentAxis];
+        } else {
+          auto reassociation = cast<ReshapeOp>(producer).getReassociation();
+          unsigned sourceRank = 0, resultRank = 0;
+          for (Attribute attribute : reassociation) {
+            auto group = cast<ReshapeGroupAttr>(attribute);
+            for (int64_t axis : group.getSourceAxes().asArrayRef())
+              sourceRank = std::max(sourceRank, static_cast<unsigned>(axis + 1));
+            for (int64_t axis : group.getResultAxes().asArrayRef())
+              resultRank = std::max(resultRank, static_cast<unsigned>(axis + 1));
+          }
+          unsigned sourcePrefix = input.getShape().size() - sourceRank;
+          unsigned resultPrefix = output.getShape().size() - resultRank;
+          for (Attribute attribute : reassociation) {
+            auto group = cast<ReshapeGroupAttr>(attribute);
+            if (group.getSourceAxes().size() == 1 &&
+                group.getResultAxes().size() == 1 &&
+                resultPrefix + group.getResultAxes()[0] ==
+                    static_cast<int64_t>(requested.fragmentAxis) &&
+                input.getShape()[sourcePrefix + group.getSourceAxes()[0]] ==
+                    output.getShape()[requested.fragmentAxis])
+              inputAxis = sourcePrefix + group.getSourceAxes()[0];
+          }
+        }
+        if (auto axis = inputAxis) {
             auto axisMap = cast<AxisMapAttr>(input.getAxisMaps()[*axis]);
             PhysicalRangeFact ranges =
                 PhysicalProgramAnalysis(kernel).axisRanges(operand, *axis);
@@ -1307,13 +1333,13 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
                   return (sameExtent || sameBounds) &&
                          samePhysicalScalarExpression(range.getStep(), blocked.getStep());
                 })) {
-              // The broadcast can rename an exact coordinate traversal.
+              // An explicit projection can rename an exact coordinate traversal.
               operandSource = sourceAxisIdentity(axisMap);
               for (int64_t &dimension : operandDimensions)
                 if (dimension == requested.dimensionId)
                   dimension = axisMap.getDimensionId();
             }
-          }
+        }
       }
     }
     FailureOr<Value> replacement = replayPointwiseValue(
@@ -1415,7 +1441,8 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
       clone->setAttr(originAttr, origin);
     replayed = clone.getResult();
   } else if (auto reshape = dyn_cast<ReshapeOp>(producer);
-             reshape && !containsSource(reshape.getValue(), source)) {
+             reshape && !containsSource(reshape.getValue(), source) &&
+             mapped(reshape.getValue()) == reshape.getValue()) {
     if (!resultType)
       return failure();
     replayed = builder.create<BroadcastOp>(producer->getLoc(), resultType,
@@ -4635,7 +4662,17 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     }
     bool requiredByEveryEffect =
         llvm::all_of(writeEffects, [&](const WriteEffectFacts &effect) {
-          return effectDependsOn(effect, source);
+          if (effectDependsOn(effect, source))
+            return true;
+          auto root = occurrenceRoots.lookup(range.getOperation());
+          if (!root || !positionalOccurrences.contains(range.getOperation()))
+            return false;
+          return llvm::any_of(occurrenceRoots, [&](const auto &entry) {
+            return entry.second == root &&
+                   positionalOccurrences.contains(entry.first) &&
+                   effectDependsOn(effect,
+                       sourceAxisIdentity(cast<MakeRangeOp>(entry.first)));
+          });
         });
     auto dimension = sourceDimensions.find(source);
     bool jointlyOwned =
