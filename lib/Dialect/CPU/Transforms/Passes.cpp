@@ -88,7 +88,8 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
     for (auto &item : *replacement) (*profiles)[item.first] = std::move(item.second);
   }
   auto original = *module.getOps<func::FuncOp>().begin();
-  if (failed(foldUniformComputations(original)) || failed(fuseStructuredComputations(original)) || failed(normalize(module)) ||
+  if (failed(realizeSliceScans(original)) || failed(foldUniformComputations(original)) ||
+      failed(fuseStructuredComputations(original)) || failed(normalize(module)) ||
       failed(verifyCPUProgram(module, false))) return failure();
   llvm::StringRef family = implementations.profile(original);
   auto rows = profiles->getArray(family);

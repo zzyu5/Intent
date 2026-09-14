@@ -5,6 +5,7 @@ add_mlir_dialect_library(MLIRIntentCPUDialect
   DEPENDS IntentCPUIncGen
   LINK_LIBS PUBLIC
   MLIRArithDialect
+  MLIRLinalgDialect
   MLIRMemRefDialect
   MLIRIR
   MLIRSideEffectInterfaces

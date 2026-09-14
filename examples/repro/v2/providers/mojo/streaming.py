@@ -6,6 +6,7 @@ import torch
 
 from kernels.streaming.gated_delta import recurrent_gated_delta_fwd
 from kernels.streaming.linear_attention import fused_chunk_linear_attention_fwd
+from kernels.streaming.linear_attention import chunk_retention_fwd
 from kernels.streaming.mamba import mamba_chunk_state_fwd
 from kernels.streaming.mamba import mamba_chunk_state_bf16_fwd, mamba_state_passing_fwd
 from kernels.streaming.mamba import mamba3_siso_step, mamba3_siso_forward
@@ -255,6 +256,13 @@ def mamba3_forward(context):
         note="原Mamba3 forward B1/S2048/H16/QKH4/DQK32/DV64 BF16输入；五个InOut stores在每次kernel内先完整写入再读取，host预分配；原source标记semantics gap，无可比CPU reference，仅运行，不作数值或相对性能结论。")
 
 
+def retention(context):
+    q = torch.randn((1, 2048, 16, 128), dtype=torch.float16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    return prepare_host_run_only(context, chunk_retention_fwd, (q, k, v, 128**-0.5),
+        note="原B1/S2048/H16/D128 f16 retention输入；作者decay为1-exp(-5-head)，原TileLang source为1-exp2(-5-head)，数值算法不同，保留当前Intent语义。无同合同CPU reference，仅运行，不作数值或相对性能结论。")
+
+
 CASES = {
     "selective_state_scan": selective_scan,
     "streamed_online_softmax_f16": online_softmax,
@@ -268,4 +276,5 @@ CASES = {
     "mamba_chunk_scan_bf16": mamba_chunk_scan_bf16,
     "mamba3_siso_step": mamba3_step,
     "mamba3_siso_forward": mamba3_forward,
+    "chunk_retention": retention,
 }

@@ -36,14 +36,21 @@ def IntentCPU_YieldOp : IntentCPU_Op<"yield", [Pure, Terminator,
   let arguments = (ins AnyFloat:$value);
 }
 
-def IntentCPU_ScanOp : IntentCPU_Op<"scan", [SingleBlock, AttrSizedOperandSegments]> {
-  let summary = "Ordered prefixes over a source axis with a typed scalar combine";
-  let arguments = (ins Arg<Variadic<AnyMemRef>, "", [MemRead]>:$sources,
+def IntentCPU_ScanOp : IntentCPU_Op<"scan", [SingleBlock, IsolatedFromAbove, AttrSizedOperandSegments,
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Ordered prefixes with typed scalar or destination-passing slice combines";
+  let arguments = (ins Variadic<AnyMemRef>:$sources,
       Variadic<AnyType>:$initials, Variadic<AnyType>:$captures,
-      Arg<Variadic<AnyMemRef>, "", [MemWrite]>:$outputs,
+      Variadic<AnyMemRef>:$outputs,
       I64Attr:$axis, BoolAttr:$inclusive, BoolAttr:$reverse);
   let regions = (region AnyRegion:$combine);
   let hasVerifier = 1;
+  let extraClassDeclaration = [{
+    bool isDestinationPassing() {
+      return !getCombine().empty() && getCombine().front().getNumArguments() ==
+          3 * getSources().size() + getCaptures().size();
+    }
+  }];
 }
 
 def IntentCPU_ScanYieldOp : IntentCPU_Op<"scan_yield", [Pure, Terminator,

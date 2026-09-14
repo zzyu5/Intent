@@ -344,7 +344,8 @@ private:
       copyToSlot(value, slot, original.getLoc());
     for (Value allocation : llvm::reverse(allocations.back())) builder.create<memref::DeallocOp>(original.getLoc(), allocation);
     allocations.pop_back();
-    builder.create<cpu::RegionYieldOp>(original.getLoc());
+    if (isa<cpu::ScanOp>(target.getParentOp())) builder.create<cpu::ScanYieldOp>(original.getLoc(), ValueRange{});
+    else builder.create<cpu::RegionYieldOp>(original.getLoc());
     dimensions = std::move(savedDimensions);
     return success();
   }
@@ -1044,11 +1045,13 @@ private:
     auto inputs = operation.getInputs();
     auto first = cast<RankedTensorType>(inputs[0].getType());
     SmallVector<Value> sources, initials, captures, outputs;
+    bool scalar = true;
     for (int64_t component = 0; component < count; ++component) {
       auto type = cast<RankedTensorType>(inputs[component].getType());
-      if (type.getShape() != first.getShape() || type.getEncoding() != first.getEncoding() ||
-          inputs[count + component].getType() != type.getElementType())
-        return operation.emitError("CPU scalar scan requires matching logical source axes and scalar identities; slice-valued combines are not implemented");
+      if (static_cast<uint64_t>(operation.getAxis()) >= static_cast<uint64_t>(type.getRank()))
+        return operation.emitError("CPU scan axis is outside a source component rank");
+      scalar &= type.getShape() == first.getShape() && type.getEncoding() == first.getEncoding() &&
+          inputs[count + component].getType() == type.getElementType();
       sources.push_back(values.lookup(inputs[component]));
       initials.push_back(values.lookup(inputs[count + component]));
       auto sizes = extents(type, operation.getLoc());
@@ -1057,12 +1060,33 @@ private:
     }
     for (Value input : inputs.drop_front(count * 2)) {
       Value capture = values.lookup(input);
-      if (!isa<IntegerType, IndexType, FloatType>(capture.getType()))
-        return operation.emitError("CPU scalar scan requires scalar captures");
+      scalar &= isa<IntegerType, IndexType, FloatType>(capture.getType());
       captures.push_back(capture);
     }
     auto target = builder.create<cpu::ScanOp>(operation.getLoc(), sources, initials, captures, outputs,
         operation.getAxis(), operation.getInclusive(), operation.getReverse());
+    if (!scalar) {
+      SmallVector<Type> states, members;
+      for (auto [source, initial] : llvm::zip(sources, initials)) {
+        auto memory = cast<MemRefType>(source.getType());
+        auto state = dyn_cast<MemRefType>(initial.getType());
+        if (!state) state = MemRefType::get({}, initial.getType());
+        SmallVector<int64_t> shape(memory.getShape());
+        shape.erase(shape.begin() + operation.getAxis());
+        if (ArrayRef<int64_t>(shape) != state.getShape())
+          return operation.emitError("CPU slice scan requires a full slice identity for each component");
+        states.push_back(MemRefType::get(shape, state.getElementType()));
+        members.push_back(MemRefType::get(shape, memory.getElementType(),
+            StridedLayoutAttr::get(builder.getContext(), ShapedType::kDynamic,
+                SmallVector<int64_t>(shape.size(), ShapedType::kDynamic))));
+      }
+      SmallVector<Type> arguments(states);
+      llvm::append_range(arguments, members);
+      llvm::append_range(arguments, TypeRange(captures));
+      if (failed(helper(operation.getCombine(), target.getCombine(), arguments, states))) return failure();
+      for (auto [result, output] : llvm::zip(operation.getResults(), outputs)) values.map(result, output);
+      return success();
+    }
     Block &source = operation.getCombine().front();
     Block *body = &target.getCombine().emplaceBlock();
     for (BlockArgument argument : source.getArguments()) {

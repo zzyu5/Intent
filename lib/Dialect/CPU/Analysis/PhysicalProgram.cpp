@@ -116,6 +116,8 @@ SmallVector<MemoryAccess> PhysicalProgramAnalysis::accesses(Operation *scope) {
       for (Value input : reduce.getInputs()) add(input, true, false);
     } else if (auto scan = dyn_cast<ScanOp>(operation)) {
       for (Value input : scan.getSources()) add(input, true, false);
+      for (Value input : scan.getInitials()) add(input, true, false);
+      for (Value input : scan.getCaptures()) add(input, true, false);
       for (Value output : scan.getOutputs()) add(output, false, true);
     } else if (auto histogram = dyn_cast<HistogramOp>(operation)) {
       add(histogram.getValues(), true, false); add(histogram.getValid(), true, false);
@@ -257,6 +259,7 @@ LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
 }
 
 bool isElementwiseContiguousScan(ScanOp operation) {
+  if (operation.isDestinationPassing()) return false;
   auto type = cast<MemRefType>(operation.getSources()[0].getType());
   if (operation.getAxis() + 1 != static_cast<uint64_t>(type.getRank())) return false;
   auto contiguous = [](Value memory) {

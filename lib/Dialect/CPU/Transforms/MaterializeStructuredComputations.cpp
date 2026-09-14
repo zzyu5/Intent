@@ -228,6 +228,76 @@ LogicalResult materialize(ScanOp operation) {
 
 }
 
+LogicalResult realizeSliceScans(func::FuncOp function) {
+  SmallVector<ScanOp> scans;
+  function.walk<WalkOrder::PostOrder>([&](ScanOp operation) {
+    if (operation.isDestinationPassing()) scans.push_back(operation);
+  });
+  for (ScanOp operation : scans) {
+    OpBuilder b(operation);
+    Location loc = operation.getLoc();
+    SmallVector<Value> states, next;
+    auto copy = [&](Value source, Value destination) {
+      if (isa<MemRefType>(source.getType())) b.create<memref::CopyOp>(loc, source, destination);
+      else b.create<memref::StoreOp>(loc, source, destination, ValueRange{});
+    };
+    for (Value initial : operation.getInitials()) {
+      auto type = dyn_cast<MemRefType>(initial.getType());
+      if (!type) type = MemRefType::get({}, initial.getType());
+      SmallVector<Value> sizes;
+      for (int64_t axis = 0; axis < type.getRank(); ++axis)
+        if (type.isDynamicDim(axis)) sizes.push_back(b.create<memref::DimOp>(loc, initial, axis));
+      auto slot = MemRefType::get(type.getShape(), type.getElementType());
+      states.push_back(b.create<memref::AllocOp>(loc, slot, sizes));
+      next.push_back(b.create<memref::AllocOp>(loc, slot, sizes));
+      copy(initial, states.back());
+    }
+    Value zero = index(b, loc, 0), one = index(b, loc, 1);
+    Value extent = b.create<memref::DimOp>(loc, operation.getSources()[0], operation.getAxis());
+    auto scan = b.create<scf::ForOp>(loc, zero, extent, one);
+    {
+      OpBuilder::InsertionGuard guard(b);
+      b.setInsertionPointToStart(scan.getBody());
+      Value coordinate = scan.getInductionVar();
+      if (operation.getReverse())
+        coordinate = b.create<arith::SubIOp>(loc, b.create<arith::SubIOp>(loc, extent, one), coordinate);
+      auto slice = [&](Value source) -> Value {
+        auto type = cast<MemRefType>(source.getType());
+        SmallVector<OpFoldResult> offsets, sizes, strides(type.getRank(), b.getIndexAttr(1));
+        SmallVector<int64_t> shape;
+        for (int64_t axis = 0; axis < type.getRank(); ++axis) {
+          bool member = static_cast<uint64_t>(axis) == operation.getAxis();
+          offsets.push_back(member ? OpFoldResult(coordinate) : OpFoldResult(b.getIndexAttr(0)));
+          sizes.push_back(member ? OpFoldResult(b.getIndexAttr(1)) : type.isDynamicDim(axis)
+              ? OpFoldResult(b.create<memref::DimOp>(loc, source, axis).getResult())
+              : OpFoldResult(b.getIndexAttr(type.getDimSize(axis))));
+          if (!member) shape.push_back(type.getDimSize(axis));
+        }
+        auto result = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(shape, type, offsets, sizes, strides));
+        return b.create<memref::SubViewOp>(loc, result, source, offsets, sizes, strides);
+      };
+      SmallVector<Value> arguments(states);
+      for (Value source : operation.getSources()) arguments.push_back(slice(source));
+      llvm::append_range(arguments, operation.getCaptures());
+      llvm::append_range(arguments, next);
+      Block &body = operation.getCombine().front();
+      IRMapping mapping;
+      for (auto [argument, input] : llvm::zip(body.getArguments(), arguments)) {
+        if (input.getType() != argument.getType()) input = b.create<memref::CastOp>(loc, argument.getType(), input);
+        mapping.map(argument, input);
+      }
+      for (Operation &nested : body.without_terminator()) b.clone(nested, mapping);
+      for (auto [prefix, destination] : llvm::zip(operation.getInclusive() ? next : states, operation.getOutputs()))
+        copy(prefix, slice(destination));
+      for (auto [source, destination] : llvm::zip(next, states)) copy(source, destination);
+    }
+    for (Value value : next) b.create<memref::DeallocOp>(loc, value);
+    for (Value value : states) b.create<memref::DeallocOp>(loc, value);
+    operation.erase();
+  }
+  return success();
+}
+
 LogicalResult realizeHistograms(func::FuncOp function) {
   auto capabilities = function->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities");
   auto configuration = function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration");
