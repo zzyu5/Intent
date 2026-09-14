@@ -18,6 +18,7 @@ public:
       ConfigurationAttr configuration, llvm::ArrayRef<InputRequirement> requirements);
 
 private:
+  mlir::Operation *consumerScope(mlir::Value source, mlir::linalg::GenericOp operation);
   InputSupply materialize(mlir::Value source, const InputRequirement &requirement, mlir::Operation *scope);
   struct Prepared {
     mlir::Value source;
@@ -27,6 +28,7 @@ private:
   };
   mlir::func::FuncOp function;
   llvm::SmallVector<Prepared> prepared;
+  llvm::SmallVector<mlir::Operation *> guardedLoops;
 };
 
 }

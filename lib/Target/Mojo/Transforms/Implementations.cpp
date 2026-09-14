@@ -71,9 +71,13 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
     Value out = subview(b, loc, tile.output, {m, add(b, loc, tile.nBegin, n)},
         {b.getIndexAttr(rows), b.getIndexAttr(columns)});
     Type accumulator = cast<MemRefType>(tile.output.getType()).getElementType();
-    auto partial = b.create<memref::AllocaOp>(loc, MemRefType::get({rows, columns}, accumulator));
-    partial.setAlignment(width * accumulator.getIntOrFloatBitWidth() / 8);
-    b.create<linalg::FillOp>(loc, ValueRange{tile.initial}, ValueRange{partial});
+    Value partial = out;
+    if (tile.first) {
+      auto storage = b.create<memref::AllocaOp>(loc, MemRefType::get({rows, columns}, accumulator));
+      storage.setAlignment(width * accumulator.getIntOrFloatBitWidth() / 8);
+      b.create<linalg::FillOp>(loc, ValueRange{tile.initial}, ValueRange{storage});
+      partial = storage;
+    }
     auto contract = b.create<linalg::GenericOp>(loc, ValueRange{left, right}, ValueRange{partial},
         operation.getIndexingMapsArray(), operation.getIteratorTypesArray(),
         [&](OpBuilder &nested, Location loc, ValueRange arguments) {
@@ -90,17 +94,12 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
         });
     contract->setAttr("intent_cpu.implementation", binding);
     contract->setAttr("intent_cpu.microtile", MicrotileAttr::get(b.getContext(), rows, columns, width));
-    SmallVector<Value> inputs{partial};
-    if (!tile.first) inputs.insert(inputs.begin(), out);
-    b.create<linalg::GenericOp>(loc, inputs, ValueRange{out},
-        SmallVector<AffineMap>(inputs.size() + 1, b.getMultiDimIdentityMap(2)),
+    if (!tile.first) return;
+    b.create<linalg::GenericOp>(loc, ValueRange{partial}, ValueRange{out},
+        SmallVector<AffineMap>(2, b.getMultiDimIdentityMap(2)),
         SmallVector<utils::IteratorType>(2, utils::IteratorType::parallel),
-        [&](OpBuilder &nested, Location loc, ValueRange arguments) {
-          Value value = arguments[0];
-          if (!tile.first) value = isa<FloatType>(accumulator)
-              ? Value(nested.create<arith::AddFOp>(loc, value, arguments[1]))
-              : Value(nested.create<arith::AddIOp>(loc, value, arguments[1]));
-          nested.create<linalg::YieldOp>(loc, value);
+        [](OpBuilder &nested, Location loc, ValueRange arguments) {
+          nested.create<linalg::YieldOp>(loc, arguments[0]);
         });
   };
   struct RowRegion { int64_t rows; Value begin, end; };

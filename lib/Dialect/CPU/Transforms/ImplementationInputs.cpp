@@ -1,6 +1,7 @@
 #include "ImplementationInputs.h"
 #include "Utilities.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Dominance.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -44,9 +45,46 @@ FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepare(linalg::Generi
     if (failed(validateRepresentation(operation, source,
         operation.getRegion().front().getArgument(requirement.operand), requirement))) return failure();
     if (requirement.reuse == InputReuse::Group) continue;
-    supplies.push_back(materialize(source, requirement, operation));
+    supplies.push_back(materialize(source, requirement, consumerScope(source, operation)));
   }
   return supplies;
+}
+
+Operation *ImplementationInputs::consumerScope(Value source, linalg::GenericOp operation) {
+  auto loop = dyn_cast<scf::ForOp>(operation->getParentOp());
+  if (!loop || loop.getNumResults()) return operation;
+  auto step = getConstantIntValue(loop.getStep());
+  if (!step || *step <= 0 || !DominanceInfo(function).dominates(source, loop)) return operation;
+  auto effects = getEffectsRecursively(loop);
+  if (!effects) return operation;
+  bool known = true;
+  loop->walk([&](Operation *nested) {
+    if (!isa<MemoryEffectOpInterface>(nested) &&
+        !nested->hasTrait<OpTrait::HasRecursiveMemoryEffects>()) known = false;
+  });
+  if (!known) return operation;
+  PhysicalProgramAnalysis physical(function);
+  Value sourceRoot = physical.storageRoot(source);
+  auto fresh = [](Value value) {
+    return isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(value.getDefiningOp());
+  };
+  for (auto &effect : *effects) {
+    if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect())) continue;
+    Value memory = effect.getValue();
+    if (!memory || !isa<MemRefType>(memory.getType()) ||
+        !isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect())) return operation;
+    Value root = physical.storageRoot(memory);
+    if (root == sourceRoot || (!fresh(root) && !fresh(sourceRoot))) return operation;
+  }
+  if (!llvm::is_contained(guardedLoops, loop.getOperation())) {
+    OpBuilder b(loop);
+    Value nonempty = b.create<arith::CmpIOp>(loop.getLoc(), arith::CmpIPredicate::slt,
+        loop.getLowerBound(), loop.getUpperBound());
+    auto guard = b.create<scf::IfOp>(loop.getLoc(), nonempty, false);
+    loop->moveBefore(guard.thenBlock()->getTerminator());
+    guardedLoops.push_back(loop);
+  }
+  return loop;
 }
 
 FailureOr<InputSupply> ImplementationInputs::prepareCaptured(linalg::GenericOp operation,

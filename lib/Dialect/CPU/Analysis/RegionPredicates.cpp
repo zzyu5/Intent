@@ -13,9 +13,53 @@ using namespace mlir;
 namespace intent::cpu {
 namespace {
 
-Value stripCast(Value value) {
-  while (auto cast = value.getDefiningOp<memref::CastOp>()) value = cast.getSource();
-  return value;
+bool fullSubview(memref::SubViewOp view) {
+  auto type = view.getSourceType();
+  if (type.getRank() != view.getType().getRank()) return false;
+  for (unsigned axis = 0; axis < type.getRank(); ++axis) {
+    if (getConstantIntValue(view.getMixedOffsets()[axis]) != 0 ||
+        getConstantIntValue(view.getMixedStrides()[axis]) != 1) return false;
+    OpFoldResult size = view.getMixedSizes()[axis];
+    if (!type.isDynamicDim(axis)) {
+      if (getConstantIntValue(size) != type.getDimSize(axis)) return false;
+      continue;
+    }
+    auto extent = dyn_cast<Value>(size);
+    if (!extent) return false;
+    if (auto allocation = view.getSource().getDefiningOp<memref::AllocOp>())
+      if (extent == allocation.getDynamicSizes()[type.getDynamicDimIndex(axis)]) continue;
+    auto dimension = extent.getDefiningOp<memref::DimOp>();
+    if (!dimension || dimension.getSource() != view.getSource() || dimension.getConstantIndex() != axis)
+      return false;
+  }
+  return true;
+}
+Value stripIdentityViews(Value value) {
+  while (true) {
+    if (auto cast = value.getDefiningOp<memref::CastOp>()) { value = cast.getSource(); continue; }
+    if (auto view = value.getDefiningOp<memref::SubViewOp>(); view && fullSubview(view)) {
+      value = view.getSource();
+      continue;
+    }
+    return value;
+  }
+}
+std::optional<SmallVector<Value>> fullAliases(Value value) {
+  SmallVector<Value> aliases{stripIdentityViews(value)};
+  llvm::SmallDenseSet<Value> seen;
+  seen.insert(aliases.front());
+  for (unsigned index = 0; index < aliases.size(); ++index) {
+    for (Operation *user : aliases[index].getUsers()) {
+      Value alias;
+      if (auto cast = dyn_cast<memref::CastOp>(user)) alias = cast.getResult();
+      else if (auto view = dyn_cast<memref::SubViewOp>(user)) {
+        if (!fullSubview(view)) return std::nullopt;
+        alias = view.getResult();
+      }
+      if (alias && seen.insert(alias).second) aliases.push_back(alias);
+    }
+  }
+  return aliases;
 }
 bool nonnegative(Value value) {
   if (auto constant = getConstantIntValue(value)) return *constant >= 0;
@@ -32,12 +76,14 @@ bool nonnegative(Value value) {
 }
 
 Operation *lastWriter(Value value) {
+  auto aliases = fullAliases(value);
+  if (!aliases) return nullptr;
   Operation *last = nullptr;
-  for (Operation *user : value.getUsers()) {
-    if (isa<memref::CastOp, memref::SubViewOp>(user)) return nullptr;
+  for (Value alias : *aliases) for (Operation *user : alias.getUsers()) {
+    if (isa<memref::CastOp, memref::SubViewOp>(user)) continue;
     bool writes = false;
-    if (auto generic = dyn_cast<linalg::LinalgOp>(user)) writes = llvm::is_contained(generic.getDpsInits(), value);
-    else if (auto copy = dyn_cast<memref::CopyOp>(user)) writes = copy.getTarget() == value;
+    if (auto generic = dyn_cast<linalg::LinalgOp>(user)) writes = llvm::is_contained(generic.getDpsInits(), alias);
+    else if (auto copy = dyn_cast<memref::CopyOp>(user)) writes = copy.getTarget() == alias;
     else if (!isa<memref::DimOp, memref::LoadOp, memref::DeallocOp>(user)) return nullptr;
     if (!writes) continue;
     if (last && user->getBlock() != last->getBlock()) return nullptr;
@@ -48,7 +94,7 @@ Operation *lastWriter(Value value) {
 linalg::GenericOp producer(Value value) {
   llvm::SmallDenseSet<Value> seen;
   while (seen.insert(value).second) {
-    value = stripCast(value);
+    value = stripIdentityViews(value);
     Operation *writer = lastWriter(value);
     if (auto copy = dyn_cast_or_null<memref::CopyOp>(writer)) value = copy.getSource();
     else return dyn_cast_or_null<linalg::GenericOp>(writer);
@@ -56,14 +102,16 @@ linalg::GenericOp producer(Value value) {
   return {};
 }
 bool initializedFalse(Value value, Operation *before) {
+  auto aliases = fullAliases(value);
+  if (!aliases) return false;
   Operation *writer = nullptr;
-  for (Operation *user : value.getUsers()) {
-    if (isa<memref::CastOp, memref::SubViewOp>(user)) return false;
+  for (Value alias : *aliases) for (Operation *user : alias.getUsers()) {
+    if (user == before || isa<memref::CastOp, memref::SubViewOp>(user)) continue;
     bool writes = false;
-    if (auto generic = dyn_cast<linalg::LinalgOp>(user)) writes = llvm::is_contained(generic.getDpsInits(), value);
-    else if (auto copy = dyn_cast<memref::CopyOp>(user)) writes = copy.getTarget() == value;
-    else if (isa<memref::StoreOp>(user)) return false;
-    if (!writes || user == before) continue;
+    if (auto generic = dyn_cast<linalg::LinalgOp>(user)) writes = llvm::is_contained(generic.getDpsInits(), alias);
+    else if (auto copy = dyn_cast<memref::CopyOp>(user)) writes = copy.getTarget() == alias;
+    else if (!isa<memref::DimOp, memref::LoadOp, memref::DeallocOp>(user)) return false;
+    if (!writes) continue;
     if (user->getBlock() != before->getBlock()) return false;
     if (user->isBeforeInBlock(before) && (!writer || writer->isBeforeInBlock(user))) writer = user;
   }
@@ -83,14 +131,14 @@ std::optional<unsigned> validityField(RegionProgram program, linalg::GenericOp m
     if (!type.getElementType().isInteger(1)) continue;
     auto reduction = producer(slot);
     if (!reduction || reduction.getNumDpsInputs() != 1 || reduction.getNumDpsInits() != 1 ||
-        reduction.getNumReductionLoops() != 1 || stripCast(reduction.getInputs()[0]) != membership.getOutputs()[0] ||
+        reduction.getNumReductionLoops() != 1 || stripIdentityViews(reduction.getInputs()[0]) != stripIdentityViews(membership.getOutputs()[0]) ||
         !initializedFalse(reduction.getOutputs()[0], reduction)) continue;
     auto sourceMap = reduction.getIndexingMapsArray()[0];
     auto coordinate = dyn_cast<AffineDimExpr>(sourceMap.getResult(memberAxis));
     if (!coordinate || reduction.getIteratorTypesArray()[coordinate.getPosition()] != utils::IteratorType::reduction) continue;
     Block &body = reduction.getRegion().front();
     if (!isBooleanUnion(values, body.getTerminator()->getOperand(0), body.getArgument(0), body.getArgument(1))) continue;
-    Value identity = stripCast(program.identities()[field]);
+    Value identity = stripIdentityViews(program.identities()[field]);
     if (!initializedFalse(identity, program.getOperation())) continue;
     auto combined = producer(combine.getArguments().take_back(count)[field]);
     if (!combined || combined.getNumReductionLoops() || combined.getNumDpsInits() != 1 ||
@@ -98,8 +146,8 @@ std::optional<unsigned> validityField(RegionProgram program, linalg::GenericOp m
     Value lhs, rhs;
     for (auto [index, input] : llvm::enumerate(combined.getInputs())) {
       if (!combined.getIndexingMapsArray()[index].isIdentity()) continue;
-      if (stripCast(input) == combine.getArgument(field)) lhs = combined.getRegion().front().getArgument(index);
-      if (stripCast(input) == combine.getArgument(count + field)) rhs = combined.getRegion().front().getArgument(index);
+      if (stripIdentityViews(input) == combine.getArgument(field)) lhs = combined.getRegion().front().getArgument(index);
+      if (stripIdentityViews(input) == combine.getArgument(count + field)) rhs = combined.getRegion().front().getArgument(index);
     }
     Value result = combined.getRegion().front().getTerminator()->getOperand(0);
     if (lhs && rhs && isBooleanUnion(values, result, lhs, rhs) && hasTrueStateInvariant(values, result, lhs)) return field;
@@ -113,7 +161,7 @@ public:
 
   Attribute read(Value value, const UniformBindings &scalars = UniformBindings()) {
     if (!isa<MemRefType>(value.getType())) return values.evaluate(value, scalars);
-    value = stripCast(value);
+    value = stripIdentityViews(value);
     auto found = facts.find(value);
     return found != facts.end() ? found->second : facts.lookup(physical.storageRoot(value));
   }
@@ -123,7 +171,7 @@ public:
     for (auto &fact : facts)
       if (physical.storageRoot(fact.first) == root) invalidated.push_back(fact.first);
     for (Value alias : invalidated) facts.erase(alias);
-    if (constant) facts[stripCast(value)] = constant;
+    if (constant) facts[stripIdentityViews(value)] = constant;
   }
   void visit(Operation *operation, const UniformBindings &scalars = UniformBindings()) {
     if (auto fill = dyn_cast<linalg::FillOp>(operation)) {
@@ -274,7 +322,7 @@ std::optional<RegionPredicatePlan> analyzeRegionPredicate(RegionProgram program)
     auto operand = [&](Value value) -> std::optional<std::pair<BlockArgument, unsigned>> {
       auto argument = dyn_cast<BlockArgument>(value);
       if (!argument || argument.getOwner() != &generic.getRegion().front() || argument.getArgNumber() >= generic.getNumDpsInputs()) return std::nullopt;
-      Value input = stripCast(generic.getInputs()[argument.getArgNumber()]);
+      Value input = stripIdentityViews(generic.getInputs()[argument.getArgNumber()]);
       AffineMap coordinates = generic.getIndexingMapsArray()[argument.getArgNumber()];
       Operation *consumer = generic;
       llvm::SmallDenseSet<Value> seen;
@@ -290,7 +338,7 @@ std::optional<RegionPredicatePlan> analyzeRegionPredicate(RegionProgram program)
             llvm::any_of(body.without_terminator(), [](Operation &op) { return op.getNumRegions() || !isMemoryEffectFree(&op); })) return std::nullopt;
         auto maps = forward.getIndexingMapsArray();
         coordinates = maps[yielded.getArgNumber()].compose(inversePermutation(maps.back())).compose(coordinates);
-        input = stripCast(forward.getInputs()[yielded.getArgNumber()]);
+        input = stripIdentityViews(forward.getInputs()[yielded.getArgNumber()]);
         consumer = forward;
       }
       auto formal = dyn_cast<BlockArgument>(input);
