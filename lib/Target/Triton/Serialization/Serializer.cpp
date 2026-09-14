@@ -9,6 +9,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -264,6 +265,7 @@ private:
               : 0};
       metadataByName[name] = metadata;
       metadataArguments.push_back(metadata);
+      constexprValues.insert(argument);
       if (kind == "dimension")
         dimensionBindings[metadata.dimension] = metadata;
     }
@@ -882,17 +884,20 @@ private:
         assign(constant.getResult(), value);
       } else {
         values[constant.getResult()] = value;
+        constexprValues.insert(constant.getResult());
       }
       return;
     }
     if (auto parameter = dyn_cast<gpu::ParameterOp>(operation)) {
       values[parameter.getResult()] =
           parameter.getParameter().getName().getValue().str();
+      constexprValues.insert(parameter.getResult());
       return;
     }
     if (auto physical = dyn_cast<gpu::PhysicalExprOp>(operation)) {
       assign(physical.getResult(),
-             expressionString(physical.getExpression(), false));
+             expressionString(physical.getExpression(), false),
+             isConstexprExpression(physical.getExpression()));
       return;
     }
     if (auto program = dyn_cast<gpu::ProgramIdOp>(operation)) {
@@ -908,7 +913,8 @@ private:
       auto view = dim.getView().getType();
       auto extent = cast<gpu::PhysicalExprAttr>(
           view.getLayout().getExtents()[dim.getAxis()]);
-      assign(dim.getResult(), expressionString(extent, false));
+      assign(dim.getResult(), expressionString(extent, false),
+             isConstexprExpression(extent));
       return;
     }
     if (auto range = dyn_cast<gpu::RangeOp>(operation)) {
@@ -937,7 +943,11 @@ private:
       return;
     }
     if (auto binary = dyn_cast<gpu::BinaryOp>(operation)) {
-      assign(binary.getResult(), binaryExpression(binary));
+      assign(binary.getResult(), binaryExpression(binary),
+             (binary.getResult().getType().isIndex() ||
+              binary.getResult().getType().isInteger(1)) &&
+                 constexprValues.contains(binary.getLhs()) &&
+                 constexprValues.contains(binary.getRhs()));
       return;
     }
     if (auto unary = dyn_cast<gpu::UnaryOp>(operation)) {
@@ -958,7 +968,10 @@ private:
       }();
       assign(compare.getResult(), "(" + valueString(compare.getLhs()) + " " +
                                       predicate.str() + " " +
-                                      valueString(compare.getRhs()) + ")");
+                                      valueString(compare.getRhs()) + ")",
+             compare.getResult().getType().isInteger(1) &&
+                 constexprValues.contains(compare.getLhs()) &&
+                 constexprValues.contains(compare.getRhs()));
       return;
     }
     if (auto range = dyn_cast<gpu::MakeRangeOp>(operation)) {
@@ -1800,10 +1813,21 @@ private:
     return found->second;
   }
 
-  void assign(Value value, const std::string &expression) {
+  bool isConstexprExpression(gpu::PhysicalExprAttr expression) {
+    if (expression.getKind() ==
+        static_cast<uint32_t>(gpu::PhysicalExprKind::ScalarABI))
+      return false;
+    return llvm::all_of(expression.getOperands(), [&](Attribute operand) {
+      return isConstexprExpression(cast<gpu::PhysicalExprAttr>(operand));
+    });
+  }
+
+  void assign(Value value, const std::string &expression, bool compileTime = false) {
     std::string name = newName();
     values[value] = name;
-    line(name + " = " + expression);
+    if (compileTime)
+      constexprValues.insert(value);
+    line(name + (compileTime ? ": tl.constexpr = " : " = ") + expression);
   }
 
   void assignResults(ResultRange results, const std::string &expression) {
@@ -1873,6 +1897,7 @@ private:
   func::FuncOp kernel;
   raw_ostream &output;
   llvm::DenseMap<Value, std::string> values;
+  llvm::DenseSet<Value> constexprValues;
   SmallVector<ViewABI> views;
   SmallVector<ScalarABI> scalars;
   SmallVector<MetadataABI> metadataArguments;
