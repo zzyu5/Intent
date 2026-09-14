@@ -70,7 +70,7 @@
     {"id":"sub","family":"pointwise","input_index":8,"tolerance":"fp32"},
     {"id":"i0","family":"pointwise","input_index":8,"tolerance":"fp32"},
     {"id":"add","family":"pointwise","input_index":8,"tolerance":"fp32"},
-    {"id":"fused_silu_layer_norm_conv2d","family":"fusion","input_index":1,"tolerance":"fp32"},
+    {"id":"fused_silu_layer_norm_conv2d","family":"fusion","input_index":1,"tolerance":"fp32","description":"Apply conv2d to x with conv_weight, conv_bias, conv_stride, conv_padding, conv_dilation and conv_groups. Apply layer normalization independently for each batch element over all remaining output dimensions together (channels and both spatial dimensions), using population variance and ln_eps, without affine weight or bias. Return SiLU of the normalized tensor. The weight argument is accepted but does not participate in this callable's computation."},
     {"id":"fused_lu_solve","family":"linear_algebra","input_index":0,"tolerance":"linear_algebra","timing":"cuda_event"},
     {"id":"normalize_pairwise_distance","family":"fusion","input_index":4,"tolerance":"fp32"},
     {"id":"log_softmax_linear","family":"fusion","input_index":4,"tolerance":"fp32"},
