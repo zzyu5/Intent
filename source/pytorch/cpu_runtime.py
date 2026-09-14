@@ -532,6 +532,12 @@ def index_select(source, indices):
     return torch.index_select(source, 0, indices)
 
 
+def scaled_index_add(destination, indices, source, scaling, alpha):
+    updated = destination[indices].float() + alpha * scaling.float()[None, None, :] * source.float()
+    destination[indices] = updated.to(destination.dtype)
+    return destination
+
+
 def gated_dual_gemm(x, gate_weight, value_weight):
     gate = x.float() @ gate_weight.float()
     value = x.float() @ value_weight.float()

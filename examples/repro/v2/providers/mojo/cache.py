@@ -9,6 +9,7 @@ from kernels.cache.reshape_and_cache import HEADS
 from kernels.cache.reshape_and_cache import HEAD_DIMENSION
 from kernels.cache.reshape_and_cache import TOKENS
 from kernels.cache.reshape_and_cache import reshape_and_cache
+from kernels.variants.decomposition import reshape_key_cache, reshape_value_cache
 
 from ...loading import load_module
 from ...measurement import report_stage
@@ -90,4 +91,36 @@ def reshape_and_cache_case(context: Context) -> PreparedComparison:
     )
 
 
-CASES = {"reshape_and_cache": reshape_and_cache_case}
+def reshape_and_cache_split(context):
+    key = torch.randn((TOKENS, HEADS, HEAD_DIMENSION), dtype=torch.float16)
+    value = torch.randn_like(key)
+    slots = torch.randperm(BLOCKS * BLOCK_SIZE, dtype=torch.int64)[:TOKENS].to(torch.int32)
+    report_stage("generated_compilation")
+    key_program, value_program = (intent.compile(definition, target=context.target, compiler=context.compiler,
+                                                 tuning_config=context.tuning_config)
+                                  for definition in (reshape_key_cache, reshape_value_cache))
+    runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_reference")
+
+    def pipeline(key_cache, value_cache):
+        key_program.run(key, slots, key_cache)
+        value_program.run(value, slots, value_cache)
+
+    def reference(key_cache, value_cache):
+        runtime.reshape_and_cache(key, value, slots, key_cache, value_cache)
+
+    def side(function):
+        caches = tuple(torch.zeros((BLOCKS, BLOCK_SIZE, HEADS, HEAD_DIMENSION), dtype=torch.float16) for _ in range(2))
+
+        def prepare():
+            for cache in caches:
+                cache.zero_()
+
+        return PreparedLaunch(lambda: function(*caches), lambda: caches, prepare=prepare)
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(side(pipeline), side(reference), Tolerance(atol=0.0),
+        cuda_graph=False, device_type="cpu", cpu_host_timing=True,
+        note="原T4096/H8/D128/2048x16 cache两kernel变体，随机唯一i32 slots，f16复制精确比较；双cache独立，清零不计时；计key/value两次kernel完整host调用。")
+
+
+CASES = {"reshape_and_cache": reshape_and_cache_case, "reshape_and_cache_split": reshape_and_cache_split}

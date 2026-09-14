@@ -1,4 +1,5 @@
 import torch
+import intent
 
 from kernels.backward.embedding import embedding_forward_lookup
 from kernels.backward.embedding import embedding_forward_lookup_bf16
@@ -14,10 +15,13 @@ from kernels.indexing.relations import (
 )
 from kernels.indexing.relations import index_select_rows
 from kernels.indexing.relations import scalar_table_lookup
+from kernels.indexing.relations import scaled_index_add_unique
 from kernels.pointwise.select import COLUMNS as SELECT_COLUMNS
 from kernels.pointwise.select import ROWS as SELECT_ROWS
 from kernels.pointwise.select import alternating_signed_indices
-from ...model import Tolerance
+from ...loading import load_module
+from ...measurement import report_stage
+from ...model import PreparedComparison, PreparedLaunch, Tolerance
 from .common import prepare_host_comparison
 
 
@@ -40,6 +44,27 @@ def index_select(context):
     indices = torch.arange(0, 32768 * 2, 2, dtype=torch.int64)
     return prepare_host_comparison(context, index_select_rows,
         (source, indices), "index_select", Tolerance(atol=0.0))
+
+
+def scaled_index_add(context):
+    initial = torch.randn((65536, 1, 4096), dtype=torch.float16)
+    source = torch.randn((32768, 1, 4096), dtype=torch.float16)
+    indices = torch.arange(0, 65536, 2, dtype=torch.int64)
+    scaling = torch.randn((4096,), dtype=torch.float16)
+    report_stage("generated_compilation")
+    artifact = intent.compile(scaled_index_add_unique, target=context.target, compiler=context.compiler,
+                              tuning_config=context.tuning_config)
+    runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_reference")
+
+    def side(function):
+        output = initial.clone()
+        return PreparedLaunch(lambda: function(output, indices, source, scaling, 1.0), lambda: output,
+                              prepare=lambda: output.copy_(initial))
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(side(artifact.run), side(runtime.scaled_index_add),
+        Tolerance(atol=2e-2, rtol=1e-2), cuda_graph=False, device_type="cpu", cpu_host_timing=True,
+        note="原65536x1x4096/32768唯一偶数indices f16 scaled-index-add，f32更新后f16写回；独立InOut状态每次恢复且恢复不计时；PyTorch CPU reference，原容差，完整host调用。")
 
 
 def scalar_lookup(context):
@@ -99,6 +124,7 @@ def alternating_indices(context):
 
 CASES = {"embedding_lookup": embedding, "embedding_lookup_f32": embedding_f32,
          "index_select": index_select,
+         "scaled_index_add": scaled_index_add,
          "scalar_table_lookup": scalar_lookup,
          "shifted_row_copy": shifted_row,
          "roll_rows_forward": rolled_rows,

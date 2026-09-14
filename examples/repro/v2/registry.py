@@ -303,6 +303,13 @@ MOJO = (
     Entry("deepgemm_fp8_2xacc", "M4096-N4096-K4096-e4m3-f32scales-bf16-8cores-host", "deepgemm_fp8_2xacc", ("contraction/block_scaled.py:deepgemm_fp8_2xacc",), "source/pytorch/cpu_runtime.py"),
     Entry("scaled_fp8_gemm", "M4096-N14336-K4096-e4m3-scale1-f16-8cores-host", "scaled_fp8_matmul", ("contraction/block_scaled.py:scaled_fp8_matmul",), None),
     Entry("scaled_fp8_splitk_gemm", "M4096-N14336-K4096-e4m3-split4-f16-8cores-host", "scaled_fp8_splitk_matmul", ("contraction/block_scaled.py:scaled_fp8_splitk_matmul",), "source/pytorch/cpu_runtime.py"),
+    Entry("rotary_embedding_flat", "R65536-D128-H32-f16-8cores-host", "rotary_embedding_flat", ("position/rope.py:rotary_embedding_flat",), "source/pytorch/cpu_runtime.py"),
+    Entry("streamed_online_softmax", "8192x8192-f32-8cores-host", "streamed_online_softmax", ("streaming/online_softmax.py:streamed_online_softmax",), "source/pytorch/cpu_runtime.py"),
+    Entry("matrix_transpose_product_domains", "4093x8191-f16-8cores-host", "matrix_transpose_product_domains", ("variants/decomposition.py:matrix_transpose_product_domains",), "source/pytorch/cpu_runtime.py"),
+    Entry("scaled_index_add", "65536x1x4096-from32768-f16-8cores-host", "scaled_index_add_unique", ("indexing/relations.py:scaled_index_add_unique",), "source/pytorch/cpu_runtime.py"),
+    Entry("adamw_split", "N8388608-f32-split2-8cores-host", "adamw_split", ("variants/decomposition.py:adamw_update_moments", "variants/decomposition.py:adamw_update_parameter"), "source/pytorch/cpu_runtime.py"),
+    Entry("adafactor_scalar_product", "4096x4096-f32-3kernels-8cores-host", "adafactor_scalar_product", ("optimization/adafactor.py:adafactor_update_rows", "optimization/adafactor.py:adafactor_update_columns", "variants/decomposition.py:adafactor_apply_scalar_product"), "source/pytorch/cpu_runtime.py"),
+    Entry("reshape_and_cache_split", "T4096-H8-D128-cache2048x16-f16-8cores-host", "reshape_and_cache_split", ("variants/decomposition.py:reshape_key_cache", "variants/decomposition.py:reshape_value_cache"), "source/pytorch/cpu_runtime.py"),
 )
 
 

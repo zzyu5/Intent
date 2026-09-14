@@ -3,6 +3,7 @@ import intent
 
 from kernels.position.rope import PARTIAL_ROTARY_DIMENSION
 from kernels.position.rope import rotary_embedding_bf16
+from kernels.position.rope import rotary_embedding_flat
 from kernels.position.rope import rotary_qk_bf16_inplace
 from kernels.position.rope import rotary_qk_inplace
 from kernels.position.rope import rotary_qk_partial_inplace
@@ -12,6 +13,14 @@ from ...loading import load_module
 from ...measurement import report_stage
 from ...model import PreparedComparison, PreparedLaunch, Tolerance
 from .common import configure_cpu_budget, prepare_host_comparison
+
+
+def rope_flat(context):
+    values = torch.randn((65536, 128), dtype=torch.float16)
+    cosine = torch.randn((2048, 64), dtype=torch.float16)
+    sine = torch.randn_like(cosine)
+    return prepare_host_comparison(context, rotary_embedding_flat, (values, cosine, sine),
+                                   "rotary_embedding_flat", Tolerance(atol=1e-2), constexprs={"HEADS": 32})
 
 
 def rope_qk(context):
@@ -337,7 +346,7 @@ def padded_rope_cache_update(context):
     )
 
 
-CASES = {"rope_qk": rope_qk, "rope_qk_partial": rope_qk_partial,
+CASES = {"rotary_embedding_flat": rope_flat, "rope_qk": rope_qk, "rope_qk_partial": rope_qk_partial,
          "rotary_embedding_bf16": rotary_embedding,
          "rope_qk_bf16_inplace": rope_qk_bf16,
          "padded_rope_cache_update": padded_rope_cache_update}

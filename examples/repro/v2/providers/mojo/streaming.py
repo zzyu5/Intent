@@ -8,6 +8,7 @@ from kernels.streaming.gated_delta import recurrent_gated_delta_fwd
 from kernels.streaming.linear_attention import fused_chunk_linear_attention_fwd
 from kernels.streaming.mamba import mamba_chunk_state_fwd
 from kernels.streaming.online_softmax import streamed_online_softmax_f16
+from kernels.streaming.online_softmax import streamed_online_softmax
 from kernels.streaming.selective_scan import (
     BATCH as SELECTIVE_SCAN_BATCH,
     LENGTH as SELECTIVE_SCAN_LENGTH,
@@ -45,6 +46,11 @@ def online_softmax(context: Context) -> PreparedComparison:
         "streamed_online_softmax_f16",
         Tolerance(atol=1.0e-2, rtol=1.0e-2),
     )
+
+
+def online_softmax_f32(context):
+    x = torch.randn((8192, 8192), dtype=torch.float32)
+    return prepare_host_comparison(context, streamed_online_softmax, (x,), "softmax", Tolerance(atol=1e-5))
 
 
 def recurrent_gated_delta(context: Context) -> PreparedComparison:
@@ -178,6 +184,7 @@ def linear_attention(context: Context) -> PreparedComparison:
 CASES = {
     "selective_state_scan": selective_scan,
     "streamed_online_softmax_f16": online_softmax,
+    "streamed_online_softmax": online_softmax_f32,
     "recurrent_gated_delta_fwd": recurrent_gated_delta,
     "mamba_chunk_scan": mamba_chunk_scan,
     "mamba_chunk_state": mamba_chunk_state,

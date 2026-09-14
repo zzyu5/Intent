@@ -11,6 +11,7 @@ from kernels.factorization.cholesky import SIZE as CHOLESKY_SIZE
 from kernels.variants.activation import swiglu_forward_helper
 from kernels.variants.contraction import gemm_loop_interchange
 from kernels.variants.decomposition import batched_cholesky_right_looking
+from kernels.variants.decomposition import matrix_transpose_product_domains
 from kernels.variants.indexing import rotary_embedding_equivalent_index
 from kernels.variants.layout import matrix_transpose_scalar_domains
 from kernels.variants.normalization import stable_softmax_online
@@ -85,6 +86,12 @@ def transpose_scalar_domains(context):
         "transpose",
         Tolerance(atol=0.0),
     )
+
+
+def transpose_product_domains(context):
+    x = torch.randn((TRANSPOSE_ROWS, TRANSPOSE_COLUMNS), dtype=torch.float16)
+    return prepare_host_comparison(context, matrix_transpose_product_domains, (x,),
+                                   "transpose", Tolerance(atol=0.0))
 
 
 def softmax_online(context):
@@ -164,6 +171,7 @@ CASES = {
     "gemm_loop_interchange": gemm_loop,
     "rotary_embedding_equivalent_index": rotary_embedding_index,
     "matrix_transpose_scalar_domains": transpose_scalar_domains,
+    "matrix_transpose_product_domains": transpose_product_domains,
     "stable_softmax_online": softmax_online,
     "streamed_online_softmax_inline": online_softmax_inline,
     "batched_cholesky_right_looking": cholesky_right_looking,
