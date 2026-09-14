@@ -18,10 +18,21 @@ struct ScanConsumerMatch {
   SmallVector<MakeRangeOp> ranges;
 };
 
+bool isScanProjection(CastOp cast) {
+  if (!cast || !canPredicateValueOperation(cast))
+    return false;
+  auto source = dyn_cast<FragmentType>(cast.getValue().getType());
+  auto result = dyn_cast<FragmentType>(cast.getType());
+  return source && result && source.getShape() == result.getShape() &&
+         source.getAxisMaps() == result.getAxisMaps() &&
+         source.getOwner() == result.getOwner() &&
+         source.getValidity() == result.getValidity();
+}
+
 std::optional<ScanConsumerMatch>
 matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
   if (scan.getSourceCount() != 1 || scan.getIdentityCount() != 1 ||
-      scan.getCaptureCount() || scan.getAxis() != 0 || !scan.getInclusive() ||
+      scan.getCaptureCount() || scan.getAxis() != 0 ||
       scan.getReverse())
     return std::nullopt;
   auto type = dyn_cast<FragmentType>(scan.getResult(0).getType());
@@ -38,7 +49,17 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
   }
   if (match.identity.getType() != type.getElementType())
     return std::nullopt;
-  for (Operation *user : scan.getResult(0).getUsers()) {
+  SmallVector<Value> projections{scan.getResult(0)};
+  llvm::DenseSet<Value> visitedProjections;
+  for (unsigned position = 0; position < projections.size(); ++position) {
+    if (!visitedProjections.insert(projections[position]).second)
+      continue;
+    for (Operation *user : projections[position].getUsers()) {
+      if (auto cast = dyn_cast<CastOp>(user);
+          isScanProjection(cast) && cast->getBlock() == scan->getBlock()) {
+        projections.push_back(cast.getResult());
+        continue;
+      }
     auto gather = dyn_cast<GatherOp>(user);
     auto loop = user->getParentOfType<scf::ForOp>();
     if (!gather || !loop || !loop->hasAttr(independentIterationAttr) ||
@@ -49,6 +70,7 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
         gather.getSourceAxes() != ArrayRef<int64_t>{0})
       return std::nullopt;
     match.loop = loop;
+    }
   }
   if (!match.loop || !canPredicateScalarBlock(*match.loop.getBody()) ||
       !match.loop.getInductionVar().getType().isIndex())
@@ -207,6 +229,7 @@ LogicalResult realizeScanConsumerMatch(func::FuncOp kernel,
             location, (*replayed).getType(), tail, *replayed, identity);
         replay.map(scan.getInputs()[0], sourceSlice);
         auto local = cast<ScanOp>(nested.clone(*scan, replay));
+        local.setInclusive(true);
         retargetSourceExtent(local.getResult(0), source, extent);
         IRMapping combine;
         Block &body = local.getCombine().front();
@@ -218,8 +241,28 @@ LogicalResult realizeScanConsumerMatch(func::FuncOp kernel,
           nested.clone(operation, combine);
         Value prefix = combine.lookup(
             cast<YieldOp>(body.getTerminator()).getValues().front());
+        Value consumerPrefix = prefix;
+        if (!scan.getInclusive()) {
+          Value ordinal = nested.create<BinaryOp>(
+              location, fragment(nested.getIndexType()), range, lift(offset),
+              BinaryOperator::Subtract);
+          Value shifted = nested.create<BinaryOp>(
+              location, fragment(nested.getIndexType()), ordinal, lift(one),
+              BinaryOperator::Subtract);
+          Value zero = nested.create<arith::ConstantIndexOp>(location, 0);
+          Value lower = nested.create<CompareOp>(
+              location, fragment(nested.getI1Type()), shifted, lift(zero), ComparePredicate::Ge);
+          Value upper = nested.create<CompareOp>(
+              location, fragment(nested.getI1Type()), shifted, lift(chunk), ComparePredicate::Lt);
+          Value valid = nested.create<BinaryOp>(
+              location, fragment(nested.getI1Type()), lower, upper, BinaryOperator::LogicalAnd);
+          consumerPrefix = nested.create<GatherOp>(
+              location, prefix.getType(), prefix, ValueRange{shifted}, valid,
+              lift(carry.front()), nested.getDenseI64ArrayAttr({0}));
+        }
         IRMapping consumers;
         consumers.map(match.loop.getInductionVar(), range);
+        consumers.map(scan.getResult(0), consumerPrefix);
         auto mapped = [&](Value value) { return consumers.lookupOrDefault(value); };
         auto validity = [&](Value valid) -> Value {
           if (!valid)
@@ -229,8 +272,25 @@ LogicalResult realizeScanConsumerMatch(func::FuncOp kernel,
               BinaryOperator::LogicalAnd);
         };
         for (Operation &operation : match.loop.getBody()->without_terminator()) {
-          if (auto gather = dyn_cast<GatherOp>(operation);
-              gather && gather.getSource() == scan.getResult(0)) {
+          auto gather = dyn_cast<GatherOp>(operation);
+          Value root = gather ? gather.getSource() : Value();
+          SmallVector<CastOp> projections;
+          while (root) {
+            auto cast = root.getDefiningOp<CastOp>();
+            if (!isScanProjection(cast))
+              break;
+            projections.push_back(cast);
+            root = cast.getValue();
+          }
+          if (gather && root == scan.getResult(0)) {
+            for (CastOp cast : llvm::reverse(projections))
+              if (!consumers.lookupOrNull(cast.getResult())) {
+                auto result = llvm::cast<FragmentType>(cast.getResult().getType());
+                Value projected = nested.create<CastOp>(
+                    cast.getLoc(), fragment(result.getElementType()), mapped(cast.getValue()));
+                consumers.map(cast.getResult(), projected);
+              }
+            Value selectedPrefix = mapped(gather.getSource());
             Value fill =
                 gather.getFill() ? lift(mapped(gather.getFill())) : Value();
             if (!fill) {
@@ -239,8 +299,8 @@ LogicalResult realizeScanConsumerMatch(func::FuncOp kernel,
               fill = lift(zero);
             }
             Value result = nested.create<SelectOp>(
-                gather.getLoc(), prefix.getType(), validity(gather.getValid()),
-                prefix, fill);
+                gather.getLoc(), selectedPrefix.getType(), validity(gather.getValid()),
+                selectedPrefix, fill);
             consumers.map(gather.getResult(), result);
             continue;
           }
@@ -264,7 +324,6 @@ LogicalResult realizeScanConsumerMatch(func::FuncOp kernel,
   if (failedBody)
     return failure();
   match.loop.erase();
-  scan.erase();
   eraseDeadPhysicalValues(kernel);
   return success();
 }

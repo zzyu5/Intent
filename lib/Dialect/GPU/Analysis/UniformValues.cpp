@@ -1,8 +1,61 @@
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
+#include "Intent/Dialect/GPU/IR/Program.h"
+
+#include <limits>
 
 using namespace mlir;
 namespace intent::gpu {
+
+namespace {
+std::optional<int64_t> constantPhysicalExpression(PhysicalExprAttr expression) {
+  auto kind = static_cast<PhysicalExprKind>(expression.getKind());
+  if (kind == PhysicalExprKind::Constant)
+    return expression.getValue();
+  if (kind == PhysicalExprKind::Parameter || kind == PhysicalExprKind::Dimension ||
+      kind == PhysicalExprKind::ScalarABI)
+    return std::nullopt;
+  SmallVector<int64_t> operands;
+  for (Attribute attribute : expression.getOperands()) {
+    auto value = constantPhysicalExpression(cast<PhysicalExprAttr>(attribute));
+    if (!value)
+      return std::nullopt;
+    operands.push_back(*value);
+  }
+  __int128 result;
+  if (kind == PhysicalExprKind::NextPowerOfTwo && operands.size() == 1) {
+    result = 1;
+    while (result < operands[0])
+      result *= 2;
+  } else if (kind == PhysicalExprKind::Select && operands.size() == 3) {
+    result = operands[0] ? operands[1] : operands[2];
+  } else if (operands.size() == 2) {
+    __int128 lhs = operands[0], rhs = operands[1];
+    switch (kind) {
+    case PhysicalExprKind::Add: result = lhs + rhs; break;
+    case PhysicalExprKind::Subtract: result = lhs - rhs; break;
+    case PhysicalExprKind::Multiply: result = lhs * rhs; break;
+    case PhysicalExprKind::Minimum: result = std::min(lhs, rhs); break;
+    case PhysicalExprKind::Maximum: result = std::max(lhs, rhs); break;
+    case PhysicalExprKind::FloorDiv:
+      if (!rhs) return std::nullopt;
+      result = lhs / rhs - (lhs % rhs != 0 && ((lhs < 0) != (rhs < 0)));
+      break;
+    case PhysicalExprKind::CeilDiv:
+      if (!rhs) return std::nullopt;
+      result = lhs / rhs + (lhs % rhs != 0 && ((lhs < 0) == (rhs < 0)));
+      break;
+    default: return std::nullopt;
+    }
+  } else {
+    return std::nullopt;
+  }
+  if (result < std::numeric_limits<int64_t>::min() ||
+      result > std::numeric_limits<int64_t>::max())
+    return std::nullopt;
+  return static_cast<int64_t>(result);
+}
+} // namespace
 
 Type uniformElementType(Type type) {
   if (auto fragment = dyn_cast<FragmentType>(type)) return fragment.getElementType();
@@ -15,6 +68,13 @@ UniformExpression describeUniformValue(Value value) {
   Operation *op = value.getDefiningOp();
   if (!op) return result;
   using K = UniformKind;
+  if (auto physical = dyn_cast<PhysicalExprOp>(op)) {
+    if (auto literal = constantPhysicalExpression(physical.getExpression())) {
+      result.kind = K::Constant;
+      result.literal = IntegerAttr::get(value.getType(), *literal);
+    }
+    return result;
+  }
   if (isa<BroadcastOp, SplatOp, ReshapeOp, TransposeOp>(op)) result.kind = K::Forward;
   else if (isa<JoinOp>(op)) result.kind = K::Join;
   else if (isa<MakeRecordOp>(op)) result.kind = K::Aggregate;

@@ -30,6 +30,7 @@ from intent.language import index as intent_index
 from intent.language import DTypeCategory
 
 from .model import ShapeValue
+from .model import ShapeDimension
 from .model import RaggedSpec
 from .model import StaticTuple
 
@@ -214,7 +215,34 @@ def lower_index(
                         tuple(static_values),
                     )
                 )
-                result_shape.append(DynamicDim(f"slice_{source.id}_{source_axis}"))
+                dimension = DynamicDim(f"slice_{source.id}_{source_axis}")
+                if raw_term.step is None or static_values[2] == 1:
+                    bounds = []
+                    for component in range(2):
+                        position = positions[component]
+                        static = static_values[component]
+                        if position is not None:
+                            bound = operands[position - first_operand_position]
+                        elif static is not None:
+                            bound = lowerer.emit_literal(static, raw_term, ScalarType(intent_index))
+                        elif component == 0:
+                            bound = lowerer.emit_literal(0, raw_term, ScalarType(intent_index))
+                        else:
+                            bound = lowerer.materialize_dimension(
+                                ShapeDimension(source_dimension, source, source_axis), raw_term
+                            )
+                        bounds.append(bound)
+                    start, stop = bounds
+                    if start.type == stop.type and isinstance(start.type, ScalarType):
+                        length = lowerer.emit(
+                            OperationKind.BINARY,
+                            lowerer.location(raw_term),
+                            operands=(stop, start),
+                            result_types=(stop.type,),
+                            attributes={"operator_kind": BinaryOperator.SUBTRACT},
+                        ).results[0]
+                        dimension = lowerer.integer_shape_dimension(length, dimension)
+                result_shape.append(dimension)
             source_axis += 1
             continue
         static = _static_integer(raw_term)

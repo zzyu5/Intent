@@ -295,15 +295,19 @@ LogicalResult alignElementwiseOperands(OpBuilder &builder, Location location,
     }
   }
   if (leftLogical && rightLogical &&
-      dimensionIds(leftLogical) == dimensionIds(rightLogical) &&
+      leftLogical.getShape() == rightLogical.getShape() &&
+      left.getShape().size() == static_cast<size_t>(leftLogical.getRank()) &&
+      right.getShape().size() == static_cast<size_t>(rightLogical.getRank()) &&
       left.getShape() == right.getShape() &&
       left.getOwner() == right.getOwner() &&
       left.getValidity() == right.getValidity()) {
-    bool sameDimensions = left.getAxisMaps().size() == right.getAxisMaps().size();
-    for (auto [leftMapping, rightMapping] :
-         llvm::zip(left.getAxisMaps(), right.getAxisMaps()))
-      sameDimensions &= cast<gpu::AxisMapAttr>(leftMapping).getDimensionId() ==
-                        cast<gpu::AxisMapAttr>(rightMapping).getDimensionId();
+    bool sameDimensions = true;
+    auto leftDimensions = dimensionIds(leftLogical);
+    auto rightDimensions = dimensionIds(rightLogical);
+    for (unsigned axis = 0; axis < left.getShape().size(); ++axis)
+      if (leftLogical.isDynamicDim(axis))
+        sameDimensions &= leftDimensions && rightDimensions &&
+                          leftDimensions[axis] == rightDimensions[axis];
     if (sameDimensions) {
       SmallVector<Attribute> mappings;
       for (auto [leftAttribute, rightAttribute] :
@@ -318,10 +322,23 @@ LogicalResult alignElementwiseOperands(OpBuilder &builder, Location location,
       auto target = gpu::FragmentType::get(
           lhs.getContext(), left.getElementType(), left.getShape(),
           builder.getArrayAttr(mappings), left.getValidity(), left.getOwner());
-      FailureOr<Value> alignedLeft =
-          retargetBroadcast(builder, location, lhs, target);
-      FailureOr<Value> alignedRight =
-          retargetBroadcast(builder, location, rhs, target);
+      auto rebind = [&](Value value) -> FailureOr<Value> {
+        auto source = cast<gpu::FragmentType>(value.getType());
+        auto rebound = gpu::FragmentType::get(
+            value.getContext(), source.getElementType(), target.getShape(),
+            target.getAxisMaps(), target.getValidity(), target.getOwner());
+        if (source == rebound)
+          return value;
+        auto reassociation = gpu::inferReshapeReassociation(source, rebound);
+        if (failed(reassociation))
+          return failure();
+        return Value(builder.create<gpu::ReshapeOp>(
+            location, rebound, value, *reassociation));
+      };
+      // Canonical pointwise operands already refer to the same logical
+      // positions. Preserve lane order while rebinding their provenance.
+      FailureOr<Value> alignedLeft = rebind(lhs);
+      FailureOr<Value> alignedRight = rebind(rhs);
       if (failed(alignedLeft) || failed(alignedRight))
         return failure();
       lhs = *alignedLeft;
@@ -2073,20 +2090,28 @@ private:
             }
           }
           SmallVector<Attribute> mappings;
-          for (Attribute attribute : fragment.getAxisMaps()) {
+          for (auto [axis, attribute] : llvm::enumerate(fragment.getAxisMaps())) {
             auto mapping = cast<gpu::AxisMapAttr>(attribute);
+            int64_t dimension = mapping.getDimensionId();
+            if (logicalCoordinate)
+              dimension = relation.getResultDimensions()[
+                  *advancedStart + advancedRank - fragment.getShape().size() + axis];
             mappings.push_back(gpu::AxisMapAttr::get(
                 operation->getContext(), mapping.getSourceId(),
-                mapping.getSourceAxis(), mapping.getDimensionId(),
+                mapping.getSourceAxis(), dimension,
                 mappings.size(), mapping.getDerived()));
           }
           auto target = gpu::FragmentType::get(
               operation->getContext(), fragment.getElementType(),
               fragment.getShape(), builder.getArrayAttr(mappings),
               fragment.getValidity(), fragment.getOwner());
-          if (target != fragment)
-            physicalCoordinate = builder.create<gpu::BroadcastOp>(
-                operation->getLoc(), target, physicalCoordinate);
+          if (target != fragment) {
+            auto reassociation = gpu::inferReshapeReassociation(fragment, target);
+            if (failed(reassociation))
+              return failure();
+            physicalCoordinate = builder.create<gpu::ReshapeOp>(
+                operation->getLoc(), target, physicalCoordinate, *reassociation);
+          }
         }
         FailureOr<Value> logicalIndex =
             asLogicalIndex(operation->getLoc(), physicalCoordinate);
@@ -2268,6 +2293,7 @@ private:
           dimension = mapping.getDimensionId();
           derived = mapping.getDerived();
         }
+        dimension = relation.getResultDimensions()[resultAxis];
         if (dimension <= 0)
           return failure();
         FailureOr<Value> coordinate = makeRange(
@@ -5249,7 +5275,10 @@ bool capturesScanPrefixAxis(const LogicalWorksetFact &workset,
                                 provenance.origins.end());
   }
   WalkResult result = workset.body->walk([&](intent::GatherOp gather) {
-    auto scan = gather.getInputs().front().getDefiningOp<intent::ScanOp>();
+    Value source = gather.getInputs().front();
+    while (auto cast = source.getDefiningOp<intent::CastOp>())
+      source = cast.getInput();
+    auto scan = source.getDefiningOp<intent::ScanOp>();
     if (!scan || workset.parallel->isProperAncestor(scan))
       return WalkResult::advance();
     FailureOr<IndexRelationFact> relation = analysis.indexRelation(gather);

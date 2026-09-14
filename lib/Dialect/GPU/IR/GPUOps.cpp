@@ -204,7 +204,11 @@ LogicalResult verifyAccessAxisExtents(Operation *owner, Type payload,
         Attribute extent = coordinateType.getShape()[coordinateAxis];
         if (coordinateExtent && *coordinateExtent != extent)
           return owner->emitOpError(
-              "access payload axis has ambiguous coordinate extents");
+              "access payload axis has ambiguous coordinate extents")
+                 << "; payload_axis=" << payloadAxis
+                 << "; selected_extent=" << *coordinateExtent
+                 << "; coordinate_extent=" << extent
+                 << "; coordinate=" << coordinate;
         coordinateExtent = extent;
       }
     }
@@ -280,6 +284,13 @@ static FailureOr<ArrayAttr> inferReshapeReassociationImpl(
   unsigned sourceBegin = 0;
   unsigned resultBegin = 0;
   SmallVector<Attribute> groups;
+  if (sourceShape == resultShape) {
+    for (unsigned axis = 0; axis < sourceRank; ++axis) {
+      auto axes = DenseI64ArrayAttr::get(context, {static_cast<int64_t>(axis)});
+      groups.push_back(ReshapeGroupAttr::get(context, axes, axes));
+    }
+    return ArrayAttr::get(context, groups);
+  }
   auto relationScore = [&](unsigned sourceBegin, unsigned sourceEnd,
                            unsigned resultBegin, unsigned resultEnd) {
     if (sourceMappings.size() != sourceShape.size() ||

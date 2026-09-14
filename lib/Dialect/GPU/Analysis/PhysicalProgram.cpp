@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 
 #include "Intent/Dialect/GPU/IR/Program.h"
 
@@ -351,7 +352,18 @@ bool upperBoundWithinResource(Value value, Value resource, unsigned axis) {
 
 Value stripIntegerIndexCasts(Value value) {
   value = stripBroadcast(value);
-  while (auto cast = value.getDefiningOp<CastOp>()) {
+  while (true) {
+    if (auto reshape = value.getDefiningOp<ReshapeOp>()) {
+      auto source = dyn_cast<FragmentType>(reshape.getValue().getType());
+      auto result = dyn_cast<FragmentType>(reshape.getResult().getType());
+      if (source && result && source.getShape() == result.getShape()) {
+        value = stripBroadcast(reshape.getValue());
+        continue;
+      }
+    }
+    auto cast = value.getDefiningOp<CastOp>();
+    if (!cast)
+      break;
     auto element = [](Type type) {
       if (auto fragment = dyn_cast<FragmentType>(type))
         return fragment.getElementType();
@@ -866,23 +878,6 @@ bool hasExactPhysicalRangeCoverage(Value coordinate, Value upperBound) {
   return extent && sameScalarExpression(extent, range.getExtent());
 }
 
-bool isProvablySingletonLogicalRange(MakeRangeOp range) {
-  std::optional<int64_t> start = integerConstant(range.getLogicalStart());
-  std::optional<int64_t> stop = integerConstant(range.getLogicalStop());
-  std::optional<int64_t> step = integerConstant(range.getStep());
-  if (start && stop && step && *step > 0)
-    return *stop > *start && *stop - *start <= *step;
-
-  Value logicalStop = stripScalarIdentity(range.getLogicalStop());
-  auto add = logicalStop.getDefiningOp<BinaryOp>();
-  if (!add || add.getOperatorKind() != BinaryOperator::Add)
-    return false;
-  return (sameScalarExpression(add.getLhs(), range.getLogicalStart()) &&
-          sameScalarExpression(add.getRhs(), range.getStep())) ||
-         (sameScalarExpression(add.getRhs(), range.getLogicalStart()) &&
-          sameScalarExpression(add.getLhs(), range.getStep()));
-}
-
 bool reductionTypeConsumesSource(Type type, ArrayRef<int64_t> axes,
                                  PhysicalSourceAxis source) {
   if (auto record = dyn_cast<RecordType>(type))
@@ -1175,6 +1170,23 @@ bool writeDefinesRead(const PhysicalAccessFootprint &write,
 
 } // namespace
 
+bool isProvablySingletonLogicalRange(MakeRangeOp range) {
+  std::optional<int64_t> start = integerConstant(range.getLogicalStart());
+  std::optional<int64_t> stop = integerConstant(range.getLogicalStop());
+  std::optional<int64_t> step = integerConstant(range.getStep());
+  if (start && stop && step && *step > 0)
+    return *stop > *start && *stop - *start <= *step;
+
+  Value logicalStop = stripScalarIdentity(range.getLogicalStop());
+  auto add = logicalStop.getDefiningOp<BinaryOp>();
+  if (!add || add.getOperatorKind() != BinaryOperator::Add)
+    return false;
+  return (sameScalarExpression(add.getLhs(), range.getLogicalStart()) &&
+          sameScalarExpression(add.getRhs(), range.getStep())) ||
+         (sameScalarExpression(add.getRhs(), range.getLogicalStart()) &&
+          sameScalarExpression(add.getLhs(), range.getStep()));
+}
+
 std::optional<BinaryOperator> queryBinaryCombineKind(Region &region) {
   if (!llvm::hasSingleElement(region))
     return std::nullopt;
@@ -1367,7 +1379,15 @@ FailureOr<int64_t> queryRangeDimension(MakeRangeOp range) {
 }
 
 bool samePhysicalScalarExpression(Value lhs, Value rhs) {
-  return sameScalarExpression(lhs, rhs);
+  if (sameScalarExpression(lhs, rhs))
+    return true;
+  if (lhs.getType() != rhs.getType() ||
+      !isa<IndexType, IntegerType>(lhs.getType()))
+    return false;
+  UniformValueAnalysis constants(describeUniformValue);
+  Attribute left = constants.evaluate(lhs);
+  Attribute right = constants.evaluate(rhs);
+  return left && right && equalUniformConstants(left, right);
 }
 
 PhysicalExprAttr queryLaunchExpression(Value value) {
@@ -2257,6 +2277,11 @@ void PhysicalProgramAnalysis::collectAxisRanges(
       if (!llvm::is_contained(group.getResultAxes().asArrayRef(),
                               logicalResultAxis))
         continue;
+      if (group.getSourceAxes().size() == 1 &&
+          group.getResultAxes().size() == 1) {
+        sourceAxis = sourcePrefix + group.getSourceAxes()[0];
+        break;
+      }
       for (int64_t logicalSourceAxis : group.getSourceAxes().asArrayRef()) {
         if (logicalSourceAxis < 0 ||
             sourcePrefix + static_cast<unsigned>(logicalSourceAxis) >=
@@ -2371,49 +2396,26 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
     if (!input)
       return;
-    if (input.getShape().size() > fragment.getShape().size()) {
+    BroadcastProjection projection = queryAxisProjection(input, fragment);
+    if (!projection.isExact()) {
       result.state = PhysicalFactState::Unknown;
       appendUnique(result.blockers, operation);
       return;
     }
-    if (input.getShape().size() != fragment.getShape().size()) {
-      auto expected =
-          cast<AxisMapAttr>(fragment.getAxisMaps()[fragmentAxis]);
-      std::optional<unsigned> inputAxis;
-      for (unsigned axis = 0; axis < input.getShape().size(); ++axis) {
-        auto mapping = cast<AxisMapAttr>(input.getAxisMaps()[axis]);
-        if (!(sourceAxisIdentity(mapping) == sourceAxisIdentity(expected)) ||
-            mapping.getDimensionId() != expected.getDimensionId())
-          continue;
-        if (inputAxis) {
-          result.state = PhysicalFactState::Ambiguous;
-          return;
-        }
-        inputAxis = axis;
-      }
-      if (!inputAxis)
-        return;
-      collectAxisRanges(broadcast.getValue(), *inputAxis, result, visited);
+    std::optional<unsigned> inputAxis = projection.targetToSource[fragmentAxis];
+    if (!inputAxis)
       return;
-    }
-    unsigned offset = fragment.getShape().size() - input.getShape().size();
-    if (fragmentAxis < offset)
-      return;
-    unsigned inputAxis = fragmentAxis - offset;
-    auto inputExtent = cast<PhysicalExprAttr>(input.getShape()[inputAxis]);
+    auto inputExtent = cast<PhysicalExprAttr>(input.getShape()[*inputAxis]);
     auto outputExtent = cast<PhysicalExprAttr>(fragment.getShape()[fragmentAxis]);
     if (inputExtent.getKind() ==
             static_cast<uint32_t>(PhysicalExprKind::Constant) &&
         inputExtent.getValue() == 1 && inputExtent != outputExtent) {
-      auto inputMapping = cast<AxisMapAttr>(input.getAxisMaps()[inputAxis]);
-      auto outputMapping =
-          cast<AxisMapAttr>(fragment.getAxisMaps()[fragmentAxis]);
-      if (!(sourceAxisIdentity(inputMapping) ==
-                sourceAxisIdentity(outputMapping)) ||
-          inputMapping.getDimensionId() != outputMapping.getDimensionId())
+      PhysicalRangeFact inputRanges = axisRanges(broadcast.getValue(), *inputAxis);
+      if (inputRanges.isExact() &&
+          llvm::all_of(inputRanges.roots, isProvablySingletonLogicalRange))
         return;
     }
-    collectAxisRanges(broadcast.getValue(), inputAxis, result, visited);
+    collectAxisRanges(broadcast.getValue(), *inputAxis, result, visited);
     return;
   }
   if (auto transpose = dyn_cast<TransposeOp>(operation)) {
@@ -2572,6 +2574,25 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     }
     collectAxisRanges(resultSources[fragmentAxis].first,
                       resultSources[fragmentAxis].second, result, visited);
+    return;
+  }
+  if (auto branch = dyn_cast<scf::IfOp>(operation)) {
+    auto opResult = dyn_cast<OpResult>(value);
+    if (!opResult || branch.getElseRegion().empty()) {
+      result.state = PhysicalFactState::Unknown;
+      appendUnique(result.blockers, operation);
+      return;
+    }
+    for (Region &region : branch->getRegions()) {
+      auto yield = dyn_cast<scf::YieldOp>(region.front().getTerminator());
+      if (!yield || opResult.getResultNumber() >= yield.getNumOperands()) {
+        result.state = PhysicalFactState::Unknown;
+        appendUnique(result.blockers, operation);
+        return;
+      }
+      collectAxisRanges(yield.getOperand(opResult.getResultNumber()),
+                        fragmentAxis, result, visited);
+    }
     return;
   }
   if (auto loop = dyn_cast<scf::ForOp>(operation)) {
@@ -2840,7 +2861,9 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
               static_cast<uint32_t>(PhysicalExprKind::Constant) &&
           extent.getValue() == 1 && !ranges.roots.empty() &&
           llvm::any_of(ranges.roots, [](MakeRangeOp range) {
-            return !isProvablySingletonLogicalRange(range);
+            return !isProvablySingletonLogicalRange(range) &&
+                   samePhysicalScalarExpression(range.getStart(),
+                                                range.getLogicalStart());
           });
       result.physicalized =
           !result.constructionScalarSeed && !ranges.roots.empty() &&
@@ -2862,7 +2885,9 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
           static_cast<uint32_t>(PhysicalExprKind::Constant) &&
       extent.getValue() == 1 && !ranges.roots.empty() &&
       llvm::any_of(ranges.roots, [](MakeRangeOp range) {
-        return !isProvablySingletonLogicalRange(range);
+        return !isProvablySingletonLogicalRange(range) &&
+               samePhysicalScalarExpression(range.getStart(),
+                                            range.getLogicalStart());
       });
   result.physicalized =
       !result.constructionScalarSeed && !ranges.roots.empty() &&
@@ -2870,6 +2895,17 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
          return valueMatchesExtent(range.getExtent(), extent);
        });
   if (value.getDefiningOp<ReshapeOp>()) {
+    if (ranges.isExact() && ranges.roots.empty()) {
+      if (extent.getKind() ==
+              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          extent.getValue() == 1) {
+        result.state = PhysicalFactState::Exact;
+        result.physicalized = true;
+        result.extentAuthority =
+            PhysicalAxisRealizationFact::ExtentAuthority::Structural;
+      }
+      return result;
+    }
     // A verified reshape carries its own row-major physical reassociation.  Its
     // result extent remains exact even when no single pre-reshape range can be
     // projected to one split/merged result axis.  Keep that extent fact
@@ -2882,29 +2918,13 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
   }
   if (ranges.state == PhysicalFactState::Unknown || !ranges.blockers.empty())
     return result;
-  if (!ranges.roots.empty() && failed(queryExactLogicalRange(ranges))) {
+  if (!ranges.roots.empty() && failed(queryExactLogicalRange(ranges)) &&
+      !lockstepRanges(ranges.roots).isExact()) {
     result.state = PhysicalFactState::Ambiguous;
     return result;
   }
 
   result.state = PhysicalFactState::Exact;
-  if (ranges.roots.empty() && value.getDefiningOp() &&
-      isCoordinateReplayNode(value.getDefiningOp()) &&
-      extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
-    FailureOr<ParameterOp> parameter = queryParameterBySymbol(kernel, extent.getSymbol());
-    if (succeeded(parameter)) {
-      PhysicalParameterBinding binding = queryParameterBinding(*parameter);
-      bool hasBinding = binding.dimension || binding.source;
-      if (binding.isExact() && hasBinding &&
-          (!binding.dimension || *binding.dimension == result.dimensionId) &&
-          (!binding.source || *binding.source == result.source))
-        // A uniform axis has no coordinate range, but its explicitly bound
-        // physical extent still governs pointwise broadcasting.  This does
-        // not prove that any logical traversal has been materialized.
-        result.extentAuthority =
-            PhysicalAxisRealizationFact::ExtentAuthority::Structural;
-    }
-  }
   if (result.physicalized)
     result.extentAuthority =
         PhysicalAxisRealizationFact::ExtentAuthority::Range;
@@ -3149,11 +3169,17 @@ void PhysicalProgramAnalysis::analyzeReplay(
     return;
   if (auto argument = dyn_cast<BlockArgument>(value)) {
     Operation *owner = argument.getOwner()->getParentOp();
-    if (auto loop = dyn_cast_or_null<scf::ForOp>(owner);
-        loop && argument != loop.getInductionVar()) {
-      appendUnique(result.blockers, loop);
-      result.state = PhysicalFactState::Unknown;
-      return;
+    if (auto loop = dyn_cast_or_null<scf::ForOp>(owner)) {
+      ReplayContext context{source, sourceDimension};
+      bool replayingLoop = scope == PhysicalReplayScope::ValueGraph &&
+          llvm::is_contained(visited[loop], context);
+      if (replayingLoop && argument == loop.getInductionVar())
+        return;
+      if (!replayingLoop && argument != loop.getInductionVar()) {
+        appendUnique(result.blockers, loop);
+        result.state = PhysicalFactState::Unknown;
+        return;
+      }
     }
     SmallVector<Value, 2> outer = structuredSourcesForArgument(argument);
     if (outer.empty()) {
@@ -3184,6 +3210,60 @@ void PhysicalProgramAnalysis::analyzeReplay(
         result.state = PhysicalFactState::Unknown;
       }
     }
+    return;
+  }
+  if (isa<scf::IfOp, scf::ForOp>(operation) &&
+      scope == PhysicalReplayScope::ValueGraph && source && sourceDimension) {
+    auto readOnly = [](Operation *root) {
+      return !root->walk([](Operation *nested) {
+        return isa<LoadOp, GatherOp, scf::IfOp, scf::ForOp>(nested) ||
+                       isMemoryEffectFree(nested)
+                   ? WalkResult::advance() : WalkResult::interrupt();
+      }).wasInterrupted();
+    };
+    SmallVector<Value> controls;
+    if (auto branch = dyn_cast<scf::IfOp>(operation))
+      controls.push_back(branch.getCondition());
+    else {
+      auto loop = cast<scf::ForOp>(operation);
+      controls = {loop.getLowerBound(), loop.getUpperBound(), loop.getStep()};
+    }
+    llvm::DenseSet<Value> controlValues;
+    bool dependentControl = false;
+    for (unsigned index = 0; index < controls.size(); ++index) {
+      Value control = controls[index];
+      if (!controlValues.insert(control).second)
+        continue;
+      dependentControl |= typeCarriesTraversal(control.getType(), *source, *sourceDimension);
+      if (Operation *producer = control.getDefiningOp())
+        controls.append(producer->getOperands().begin(), producer->getOperands().end());
+    }
+    bool preservesReads = readOnly(operation);
+    if (insertionAnchor && preservesReads) {
+      Operation *anchor = insertionAnchor;
+      while (anchor && anchor->getBlock() != operation->getBlock()) {
+        preservesReads &= readOnly(anchor);
+        anchor = anchor->getParentOp();
+      }
+      preservesReads &= anchor && (anchor == operation || operation->isBeforeInBlock(anchor));
+      if (preservesReads && anchor != operation)
+        for (Operation *next = operation->getNextNode(); next != anchor;
+             next = next->getNextNode())
+          preservesReads &= readOnly(next);
+    }
+    if (!preservesReads || dependentControl) {
+      appendUnique(result.blockers, operation);
+      result.state = PhysicalFactState::Unknown;
+      return;
+    }
+    for (Value operand : operation->getOperands())
+      analyzeReplay(operand, source, scope, allowAccesses, insertionAnchor,
+                    sourceDimension, dominance, result, visited);
+    for (Region &region : operation->getRegions())
+      for (Block &block : region)
+        for (Value yielded : block.getTerminator()->getOperands())
+          analyzeReplay(yielded, source, scope, allowAccesses, insertionAnchor,
+                        sourceDimension, dominance, result, visited);
     return;
   }
   if (!physicalValue) {

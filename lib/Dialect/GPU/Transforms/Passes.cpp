@@ -30,9 +30,10 @@ LogicalResult formPointwiseOwnership(ModuleOp module, func::FuncOp kernel) {
   if (failed(realizePointwiseOwnership(module)) ||
       failed(refreshReshapeRelations(kernel)) ||
       failed(alignPointwiseValueRelations(kernel)) ||
-      failed(alignContractValueRelations(kernel)))
+      failed(alignContractValueRelations(kernel)) ||
+      failed(closeReductionValueRelations(kernel)))
     return failure();
-  return closeReductionValueRelations(kernel);
+  return alignAccessValueRelations(kernel);
 }
 
 LogicalResult predicateScalarControlGroup(ModuleOp module, func::FuncOp) {
@@ -199,12 +200,14 @@ LogicalResult runSharedGPUPasses(ModuleOp module, const TuningProfiles &profiles
       {"eliminate-common-values", simplifyValues},
   };
   for (const TransformationGroup &group : groups) {
-    if (failed(group.run(module, *kernel)))
+    if (failed(group.run(module, *kernel))) {
       return module.emitError()
              << "shared GPU transformation failed: " << group.name;
-    if (failed(verifyGPUProgram(module)))
+    }
+    if (failed(verifyGPUProgram(module))) {
       return module.emitError()
              << "shared GPU postcondition failed: " << group.name;
+    }
   }
   if (failed(closeSharedConfigurations(*kernel, profiles)))
     return failure();

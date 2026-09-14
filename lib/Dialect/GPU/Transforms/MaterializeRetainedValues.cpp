@@ -18,6 +18,40 @@ bool isZero(Value value) {
          expression.getValue() == 0;
 }
 
+Value createInvocationWorkspace(func::FuncOp kernel, Location location,
+                                FragmentType payload, ArrayAttr shape) {
+  uint64_t instance = 1;
+  llvm::StringSet<> names;
+  for (BlockArgument argument : kernel.getArguments()) {
+    names.insert(kernel.getArgAttrDict(argument.getArgNumber())
+                     .getAs<StringAttr>(abiNameAttr).getValue());
+    if (auto buffer = dyn_cast<BufferType>(argument.getType()))
+      instance = std::max(instance, buffer.getInstance() + 1);
+  }
+  kernel.walk([&](BufferOp buffer) {
+    instance = std::max(instance, buffer.getResult().getType().getInstance() + 1);
+  });
+  std::string name = ("_workspace_" + Twine(instance)).str();
+  while (!names.insert(name).second)
+    name += "_";
+  OpBuilder builder(kernel.getContext());
+  auto type = BufferType::get(
+      kernel.getContext(), payload.getElementType(), shape,
+      BufferScopeAttr::get(kernel.getContext(), BufferScope::InvocationWorkspace),
+      instance, payload.getOwner(),
+      BufferInitializationAttr::get(kernel.getContext(), BufferInitialization::FirstWrite),
+      BufferLifetimeAttr::get(kernel.getContext(), BufferLifetime::Invocation),
+      /*visibility=*/1, /*workspace=*/true);
+  unsigned argument = kernel.getNumArguments();
+  kernel.insertArgument(
+      argument, type,
+      builder.getDictionaryAttr({
+          builder.getNamedAttr(abiKindAttr, builder.getStringAttr("workspace")),
+          builder.getNamedAttr(abiNameAttr, builder.getStringAttr(name)),
+      }), location);
+  return kernel.getArgument(argument);
+}
+
 template <typename Emit>
 LogicalResult buildStoreTraversal(OpBuilder &builder, Location location,
                                   ArrayRef<MakeRangeOp> ranges,
@@ -94,16 +128,19 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
     auto range = coordinate.getDefiningOp<MakeRangeOp>();
     auto extent = cast<PhysicalExprAttr>(payload.getShape()[axis]);
     if (!range || !isZero(range.getStart()) || !isZero(range.getLogicalStart()) ||
-        !isUnitStepRange(range) ||
-        extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter))
-      return false;
-    FailureOr<ParameterOp> parameter =
-        queryParameterBySymbol(kernel, extent.getSymbol());
-    if (failed(parameter) || !(*parameter)->hasAttr(coverageDimensionAttr))
+        !isUnitStepRange(range))
       return false;
     PhysicalExprAttr end = queryLaunchExpression(range.getLogicalStop());
     if (!end || end != output.getLayout().getExtents()[axis])
       return false;
+    if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
+      FailureOr<ParameterOp> parameter = queryParameterBySymbol(kernel, extent.getSymbol());
+      if (failed(parameter) || !(*parameter)->hasAttr(coverageDimensionAttr))
+        return false;
+    } else if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+               extent != end) {
+      return false;
+    }
     ranges.push_back(range);
     shape.push_back(end);
   }
@@ -135,6 +172,28 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
     if (available && blocked) {
       clobber = write;
       break;
+    }
+  }
+  if (!clobber) {
+    auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+    __int128 footprint = std::max(1u,
+        (payload.getElementType().getIntOrFloatBitWidth() + 31) / 32);
+    bool fixed = true;
+    for (Attribute attribute : shape) {
+      auto extent = cast<PhysicalExprAttr>(attribute);
+      fixed &= extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant);
+      if (fixed)
+        footprint *= extent.getValue();
+    }
+    if (fixed && footprint > capabilities.getRegistersPerUnit()) {
+      auto replay = analysis.replayability(store.getValue(), source,
+          PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true, store);
+      if (replay.isReplayable() && !replay.accesses.empty() &&
+          llvm::all_of(replay.accesses, [&](Operation *access) {
+            auto load = dyn_cast<LoadOp>(access);
+            return load && canReplayReadAt(load, store);
+          }))
+        clobber = store;
     }
   }
   if (!clobber)
@@ -195,38 +254,10 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
       return false;
   }
 
-  uint64_t instance = 1;
-  llvm::StringSet<> names;
-  for (BlockArgument argument : kernel.getArguments()) {
-    names.insert(kernel.getArgAttrDict(argument.getArgNumber())
-                     .getAs<StringAttr>(abiNameAttr).getValue());
-    if (auto buffer = dyn_cast<BufferType>(argument.getType()))
-      instance = std::max(instance, buffer.getInstance() + 1);
-  }
-  kernel.walk([&](BufferOp buffer) {
-    instance = std::max(instance, buffer.getResult().getType().getInstance() + 1);
-  });
-  std::string name = ("_workspace_" + Twine(instance)).str();
-  while (!names.insert(name).second)
-    name += "_";
   OpBuilder builder(clobber);
-  auto bufferType = BufferType::get(
-      kernel.getContext(), payload.getElementType(), builder.getArrayAttr(shape),
-      BufferScopeAttr::get(kernel.getContext(), BufferScope::InvocationWorkspace),
-      instance, payload.getOwner(),
-      BufferInitializationAttr::get(kernel.getContext(),
-                                    BufferInitialization::FirstWrite),
-      BufferLifetimeAttr::get(kernel.getContext(), BufferLifetime::Invocation),
-      /*visibility=*/1, /*workspace=*/true);
-  unsigned argument = kernel.getNumArguments();
-  kernel.insertArgument(
-      argument, bufferType,
-      builder.getDictionaryAttr({
-          builder.getNamedAttr(abiKindAttr, builder.getStringAttr("workspace")),
-          builder.getNamedAttr(abiNameAttr, builder.getStringAttr(name)),
-      }),
-      store.getLoc());
-  Value workspace = kernel.getArgument(argument);
+  Value workspace = createInvocationWorkspace(
+      kernel, store.getLoc(), payload, builder.getArrayAttr(shape));
+  uint64_t instance = cast<BufferType>(workspace.getType()).getInstance();
   ParameterOp chunk = getOrCreatePhysicalParameter(
       kernel, ("MATERIALIZE_ROWS_" + Twine(instance)).str(),
       ParameterRole::ReductionOuter, ParameterCategory::Reduction,
@@ -292,6 +323,106 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
   return true;
 }
 
+FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) {
+  Value source = gather.getSource();
+  auto payload = dyn_cast<FragmentType>(source.getType());
+  auto result = dyn_cast<FragmentType>(gather.getResult().getType());
+  if (!payload || !result || payload.getShape().size() != 1 ||
+      result.getShape().size() != 1 || gather.getCoordinates().size() != 1 ||
+      gather.getSourceAxes() != ArrayRef<int64_t>{0})
+    return false;
+  auto full = cast<PhysicalExprAttr>(payload.getShape()[0]);
+  auto chunkExtent = cast<PhysicalExprAttr>(result.getShape()[0]);
+  auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+  if (full.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+      full.getValue() <= capabilities.getRegistersPerUnit() || full == chunkExtent ||
+      (chunkExtent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter) &&
+       chunkExtent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant)))
+    return false;
+  Operation *definition = source.getDefiningOp();
+  if (!definition)
+    return false;
+  SmallVector<GatherOp> readers;
+  for (Operation *user : source.getUsers()) {
+    auto reader = dyn_cast<GatherOp>(user);
+    if (!reader || reader.getSource() != source ||
+        reader.getSourceAxes() != ArrayRef<int64_t>{0})
+      return false;
+    readers.push_back(reader);
+  }
+  PhysicalProgramAnalysis analysis(kernel);
+  PhysicalRangeFact ranges = analysis.axisRanges(source, 0);
+  FailureOr<MakeRangeOp> range = queryExactLogicalRange(ranges);
+  if (failed(range) || ranges.roots.empty() || !isZero((*range).getStart()) ||
+      !isZero((*range).getLogicalStart()) || !isUnitStepRange(*range) ||
+      queryLaunchExpression((*range).getLogicalStop()) != full)
+    return false;
+  PhysicalSourceAxis axis = sourceAxisIdentity(*range);
+  auto replay = analysis.replayability(source, axis, PhysicalReplayScope::ValueGraph,
+                                      /*allowAccesses=*/true, definition);
+  if (!replay.isReplayable() || llvm::any_of(replay.accesses, [&](Operation *access) {
+        auto load = dyn_cast<LoadOp>(access);
+        return !load || !canReplayReadAt(load, definition);
+      }))
+    return false;
+  SmallVector<Value> dependencies{source};
+  llvm::DenseSet<Operation *> visited;
+  for (unsigned index = 0; index < dependencies.size(); ++index) {
+    Operation *producer = dependencies[index].getDefiningOp();
+    if (!producer || !visited.insert(producer).second)
+      continue;
+    if (producer->getNumRegions() || isa<GatherOp>(producer))
+      return false;
+    dependencies.append(producer->getOperands().begin(), producer->getOperands().end());
+  }
+  OpBuilder builder(definition);
+  Value chunk;
+  if (chunkExtent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
+    FailureOr<ParameterOp> parameter = queryParameterBySymbol(kernel, chunkExtent.getSymbol());
+    if (failed(parameter))
+      return failure();
+    chunk = parameter->getResult();
+  } else {
+    chunk = builder.create<arith::ConstantIndexOp>(gather.getLoc(), chunkExtent.getValue());
+  }
+  Value workspace = createInvocationWorkspace(kernel, gather.getLoc(), payload,
+                                              builder.getArrayAttr({full}));
+  auto blocked = FragmentType::get(kernel.getContext(), payload.getElementType(),
+      builder.getArrayAttr({chunkExtent}), payload.getAxisMaps(),
+      payload.getValidity(), payload.getOwner());
+  ReplayMaterializationOptions options;
+  options.fragmentAxis = 0;
+  options.traversalRanges = ranges.roots;
+  options.materializeZeroFill = true;
+  if (failed(buildStoreTraversal(
+          builder, gather.getLoc(), ArrayRef<MakeRangeOp>(*range), ranges.roots,
+          chunk, blocked,
+          [&](OpBuilder &nested, IRMapping &mapping, ValueRange coordinates,
+              Value valid) -> LogicalResult {
+            options.segmentTail = valid;
+            FailureOr<Value> value = materializeReplayedValue(
+                nested, gather.getLoc(), source, axis, chunkExtent, mapping, options);
+            if (failed(value))
+              return gather.emitOpError("retained gather source has no bounded producer replay");
+            nested.create<StoreOp>(gather.getLoc(), workspace, coordinates, *value,
+                                   valid, gather.getSourceAxes());
+            return success();
+          })))
+    return failure();
+  for (GatherOp reader : readers) {
+    builder.setInsertionPoint(reader);
+    auto load = builder.create<LoadOp>(reader.getLoc(), reader.getResult().getType(),
+        workspace, reader.getCoordinates(), reader.getValid(), reader.getFill(),
+        reader.getSourceAxes());
+    if (Attribute origin = reader->getAttr(originAttr))
+      load->setAttr(originAttr, origin);
+    reader.getResult().replaceAllUsesWith(load.getResult());
+    reader.erase();
+  }
+  eraseDeadPhysicalValues(kernel);
+  return true;
+}
+
 } // namespace
 
 LogicalResult materializeRetainedValues(ModuleOp module) {
@@ -308,9 +439,22 @@ LogicalResult materializeRetainedValues(ModuleOp module) {
       }))
     return success();
   while (true) {
+    SmallVector<GatherOp> gathers;
+    kernel.walk([&](GatherOp gather) { gathers.push_back(gather); });
+    bool changed = false;
+    for (GatherOp gather : gathers) {
+      FailureOr<bool> result = materializeRetainedGather(gather, kernel);
+      if (failed(result))
+        return failure();
+      if (*result) {
+        changed = true;
+        break;
+      }
+    }
+    if (changed)
+      continue;
     SmallVector<StoreOp> stores;
     kernel.walk([&](StoreOp store) { stores.push_back(store); });
-    bool changed = false;
     for (StoreOp store : stores) {
       FailureOr<bool> result = materializeRetainedStore(store, kernel);
       if (failed(result))

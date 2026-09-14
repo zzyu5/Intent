@@ -808,6 +808,57 @@ bool typeFitsTritonTensor(Type type, const TritonConfig &config) {
   return true;
 }
 
+bool fitsReductionRegisterBudget(gpu::ReduceOp reduce,
+                                 const TritonConfig &config,
+                                 func::FuncOp kernel) {
+  auto capabilities =
+      kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+  if (!capabilities || capabilities.getRegistersPerUnit() <= 0)
+    return true;
+  std::function<bool(gpu::PhysicalExprAttr)> isTunableExtent =
+      [&](gpu::PhysicalExprAttr extent) {
+    if (static_cast<gpu::PhysicalExprKind>(extent.getKind()) ==
+        gpu::PhysicalExprKind::Parameter) {
+      auto parameter = gpu::queryParameterBySymbol(kernel, extent.getSymbol());
+      if (failed(parameter))
+        return false;
+      auto role = static_cast<gpu::ParameterRole>(parameter->getParameter().getRole());
+      return role == gpu::ParameterRole::OwnershipM ||
+             role == gpu::ParameterRole::OwnershipN ||
+             role == gpu::ParameterRole::Reduction ||
+             role == gpu::ParameterRole::ReductionOuter ||
+             role == gpu::ParameterRole::ReductionInner;
+    }
+    return llvm::any_of(extent.getOperands(), [&](Attribute operand) {
+      return isTunableExtent(cast<gpu::PhysicalExprAttr>(operand));
+    });
+  };
+  __int128 registers = 0;
+  for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+    auto fragment = dyn_cast<gpu::FragmentType>(source.getType());
+    if (!fragment || !llvm::any_of(fragment.getShape(), [&](Attribute extent) {
+          return isTunableExtent(cast<gpu::PhysicalExprAttr>(extent));
+        }))
+      continue;
+    Type element = fragment.getElementType();
+    unsigned bits = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
+    __int128 footprint = std::max(1u, (bits + 31) / 32);
+    for (Attribute extent : fragment.getShape()) {
+      auto size = evaluateCompileTimeExpression(
+          cast<gpu::PhysicalExprAttr>(extent), config);
+      if (!size)
+        return true;
+      footprint *= *size;
+      if (footprint > capabilities.getRegistersPerUnit())
+        return false;
+    }
+    registers += footprint;
+    if (registers > capabilities.getRegistersPerUnit())
+      return false;
+  }
+  return true;
+}
+
 bool descriptorFragmentFits(gpu::FragmentType fragment,
                             const TritonConfig &config,
                             const llvm::StringMap<SmallVector<int64_t>>
@@ -974,6 +1025,11 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
     kernel.walk([&](Operation *operation) {
       if (!legal)
         return WalkResult::interrupt();
+      if (auto reduce = dyn_cast<gpu::ReduceOp>(operation))
+        if (!fitsReductionRegisterBudget(reduce, config, kernel)) {
+          legal = false;
+          return WalkResult::interrupt();
+        }
       if (auto range = dyn_cast<gpu::MakeRangeOp>(operation)) {
         auto fragment = dyn_cast<gpu::FragmentType>(range.getResult().getType());
         if (!fragment || fragment.getShape().size() != 1) {
@@ -1029,7 +1085,7 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
   }
   if (encoded.empty())
     return kernel.emitError(
-        "all Triton parameter candidates violate typed fragment legality");
+        "all Triton parameter candidates violate typed fragment legality or the reduction register budget");
   kernel->setAttr(gpu::tritonConfigsAttr, builder.getArrayAttr(encoded));
   SmallVector<NamedAttribute> reductionBounds;
   kernel.walk([&](gpu::ParameterOp parameter) {
@@ -1260,6 +1316,7 @@ LogicalResult legalizeSplitGatherPairs(func::FuncOp kernel) {
 }
 
 LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
+  auto [nextSource, nextDimension] = gpu::nextPhysicalAxisIdentities(kernel);
   SmallVector<gpu::GatherOp> gathers;
   kernel.walk([&](gpu::GatherOp gather) { gathers.push_back(gather); });
   for (gpu::GatherOp gather : gathers) {
@@ -1276,23 +1333,78 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
     };
     auto source = dyn_cast<gpu::FragmentType>(gather.getSource().getType());
     auto result = dyn_cast<gpu::FragmentType>(gather.getResult().getType());
-    if (source && !result && source.getShape().size() == 1 &&
-        gather.getCoordinates().size() == 1 &&
-        gather.getSourceAxes() == ArrayRef<int64_t>{0} &&
-        isa<IndexType, IntegerType>(gather.getCoordinates().front().getType()) &&
+    if (source && !result && !source.getShape().empty() &&
+        gather.getCoordinates().size() == source.getShape().size() &&
+        llvm::all_of(gather.getCoordinates(), [](Value coordinate) {
+          return isa<IndexType, IntegerType>(coordinate.getType());
+        }) &&
         gather.getValid().getType().isInteger(1)) {
       OpBuilder builder(gather);
+      Location location = gather.getLoc();
+      Value sourceValue = gather.getSource();
       Value coordinate = gather.getCoordinates().front();
+      Value valid = gather.getValid();
+      if (source.getShape().size() > 1) {
+        SmallVector<Value> coordinates(source.getShape().size());
+        for (auto [axis, value] :
+             llvm::zip(gather.getSourceAxes(), gather.getCoordinates()))
+          coordinates[axis] = value;
+        auto elements = cast<gpu::PhysicalExprAttr>(source.getShape()[0]);
+        coordinate = builder.create<arith::ConstantIndexOp>(location, 0);
+        for (auto [axis, value] : llvm::enumerate(coordinates)) {
+          auto extent = cast<gpu::PhysicalExprAttr>(source.getShape()[axis]);
+          if (axis)
+            elements = gpu::PhysicalExprAttr::get(
+                kernel.getContext(),
+                static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
+                builder.getStringAttr(""), builder.getArrayAttr({elements, extent}));
+          Value size = builder.create<gpu::PhysicalExprOp>(
+              location, builder.getIndexType(), extent);
+          if (!value.getType().isIndex())
+            value = builder.create<gpu::CastOp>(location, builder.getIndexType(), value);
+          coordinate = builder.create<gpu::BinaryOp>(
+              location, builder.getIndexType(), coordinate, size, BinaryOperator::Multiply);
+          coordinate = builder.create<gpu::BinaryOp>(
+              location, builder.getIndexType(), coordinate, value, BinaryOperator::Add);
+        }
+        if (auto count = evaluateCompileTimeExpression(elements, TritonConfig{}))
+          elements = gpu::PhysicalExprAttr::get(
+              kernel.getContext(),
+              static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), *count,
+              builder.getStringAttr(""), builder.getArrayAttr({}));
+        auto mapping = gpu::AxisMapAttr::get(
+            kernel.getContext(), nextSource++, 0, nextDimension++, 0, true);
+        auto flatType = gpu::FragmentType::get(
+            kernel.getContext(), source.getElementType(),
+            builder.getArrayAttr({elements}), builder.getArrayAttr({mapping}),
+            source.getValidity(), source.getOwner());
+        auto reassociation = gpu::inferReshapeReassociation(source, flatType);
+        if (failed(reassociation))
+          return gather.emitOpError("scalar gather has no exact row-major linearization");
+        sourceValue = builder.create<gpu::ReshapeOp>(
+            location, flatType, sourceValue, *reassociation);
+        Value size = builder.create<gpu::PhysicalExprOp>(
+            location, builder.getIndexType(), elements);
+        Value first = builder.create<arith::ConstantIndexOp>(location, 0);
+        Value lower = builder.create<gpu::CompareOp>(
+            location, builder.getI1Type(), coordinate, first, ComparePredicate::Ge);
+        Value upper = builder.create<gpu::CompareOp>(
+            location, builder.getI1Type(), coordinate, size, ComparePredicate::Lt);
+        valid = builder.create<gpu::BinaryOp>(
+            location, builder.getI1Type(), valid, lower, BinaryOperator::LogicalAnd);
+        valid = builder.create<gpu::BinaryOp>(
+            location, builder.getI1Type(), valid, upper, BinaryOperator::LogicalAnd);
+      }
       FailureOr<Value> zero = zeroLike(builder, gather.getLoc(), coordinate.getType());
       if (failed(zero))
         return gather.emitOpError("scalar gather coordinate has no integral zero");
       Value safeIndex = builder.create<gpu::SelectOp>(
-          gather.getLoc(), coordinate.getType(), gather.getValid(), coordinate, *zero);
+          gather.getLoc(), coordinate.getType(), valid, coordinate, *zero);
       auto loaded = builder.create<gpu::GatherOp>(
-          gather.getLoc(), gather.getResult().getType(), gather.getSource(),
-          ValueRange{safeIndex}, Value(), Value(), gather.getSourceAxes());
+          gather.getLoc(), gather.getResult().getType(), sourceValue,
+          ValueRange{safeIndex}, Value(), Value(), ArrayRef<int64_t>{0});
       auto selected = builder.create<gpu::SelectOp>(
-          gather.getLoc(), gather.getResult().getType(), gather.getValid(),
+          gather.getLoc(), gather.getResult().getType(), valid,
           loaded.getResult(), gather.getFill());
       if (Attribute origin = gather->getAttr(gpu::originAttr))
         selected->setAttr(gpu::originAttr, origin);
@@ -1856,11 +1968,12 @@ void selectContractForms(func::FuncOp kernel) {
                         StringAttr::get(kernel.getContext(), "multiply_sum"));
       continue;
     }
-    if (lhs.getShape().size() != 2 || !lhs.getElementType().isF32() ||
+    if (lhs.getShape().size() < 2 || !lhs.getElementType().isF32() ||
         !contract.getRhs().getType().getElementType().isF32() ||
         !contract.getAccumulator().getType().getElementType().isF32())
       continue;
-    auto rows = cast<gpu::PhysicalExprAttr>(lhs.getShape()[0]);
+    auto rows = cast<gpu::PhysicalExprAttr>(
+        lhs.getShape()[lhs.getShape().size() - 2]);
     if (rows.getKind() == static_cast<uint32_t>(gpu::PhysicalExprKind::Constant)) {
       if (rows.getValue() <= 4)
         contract->setAttr(contractFormAttr,
@@ -2042,8 +2155,8 @@ LogicalResult legalizeCollectiveCallbacks(func::FuncOp kernel) {
     auto scan = dyn_cast<gpu::ScanOp>(operation);
     unsigned count = reduce ? reduce.getSourceCount() : scan.getSourceCount();
     if ((reduce && (reduce.getAxes().size() != 1 || reduce.getCaptureCount())) ||
-        (scan && (!scan.getInclusive() || scan.getCaptureCount())))
-      return operation->emitOpError("native collective requires one axis and an inclusive, capture-free callback");
+        (scan && scan.getCaptureCount()))
+      return operation->emitOpError("native collective requires one axis and a capture-free callback");
     Region &region = reduce ? reduce.getCombine() : scan.getCombine();
     Block &body = region.front();
     for (Operation &nested : body) {
@@ -2094,7 +2207,60 @@ LogicalResult legalizeCollectiveCallbacks(func::FuncOp kernel) {
       for (Value result : cloned->getResults())
         result.setType(scalarCallbackType(result.getType()));
     }
-    operation->replaceAllUsesWith(native->getResults());
+    SmallVector<Value> results(native->getResults());
+    if (scan && !scan.getInclusive()) {
+      builder.setInsertionPointAfter(native);
+      Location location = scan.getLoc();
+      for (unsigned component = 0; component < count; ++component) {
+        auto type = dyn_cast<gpu::FragmentType>(results[component].getType());
+        if (!type || scan.getAxis() >= type.getShape().size())
+          return scan.emitOpError("exclusive scan requires a ranked physical result");
+        auto axis = cast<gpu::AxisMapAttr>(type.getAxisMaps()[scan.getAxis()]);
+        auto extent = cast<gpu::PhysicalExprAttr>(type.getShape()[scan.getAxis()]);
+        auto ordinalAxis = gpu::AxisMapAttr::get(
+            kernel.getContext(), axis.getSourceId(), axis.getSourceAxis(),
+            axis.getDimensionId(), 0, axis.getDerived());
+        auto rangeType = gpu::FragmentType::get(
+            kernel.getContext(), builder.getIndexType(),
+            builder.getArrayAttr({extent}), builder.getArrayAttr({ordinalAxis}),
+            type.getValidity(), type.getOwner());
+        auto indexType = gpu::FragmentType::get(
+            kernel.getContext(), builder.getIndexType(), type.getShape(),
+            type.getAxisMaps(), type.getValidity(), type.getOwner());
+        auto predicateType = gpu::FragmentType::get(
+            kernel.getContext(), builder.getI1Type(), type.getShape(),
+            type.getAxisMaps(), type.getValidity(), type.getOwner());
+        Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+        Value one = builder.create<arith::ConstantIndexOp>(location, 1);
+        Value size = builder.create<gpu::PhysicalExprOp>(
+            location, builder.getIndexType(), extent);
+        Value ordinal = builder.create<gpu::MakeRangeOp>(
+            location, rangeType, zero, size, one, zero, size,
+            axis.getSourceId(), axis.getSourceAxis(), axis.getDerived());
+        ordinal = builder.create<gpu::BroadcastOp>(location, indexType, ordinal);
+        Value step = builder.create<gpu::BroadcastOp>(location, indexType, one);
+        Value first = builder.create<gpu::BroadcastOp>(location, indexType, zero);
+        Value shifted = builder.create<gpu::BinaryOp>(
+            location, indexType, ordinal, step,
+            scan.getReverse() ? BinaryOperator::Add : BinaryOperator::Subtract);
+        Value bound = scan.getReverse()
+                          ? Value(builder.create<gpu::BroadcastOp>(location, indexType, size))
+                          : first;
+        Value valid = builder.create<gpu::CompareOp>(
+            location, predicateType, shifted, bound,
+            scan.getReverse() ? ComparePredicate::Lt : ComparePredicate::Ge);
+        Value safeIndex = builder.create<gpu::SelectOp>(
+            location, indexType, valid, shifted, first);
+        Value prefix = builder.create<gpu::GatherOp>(
+            location, type, results[component], ValueRange{safeIndex},
+            Value(), Value(), ArrayRef<int64_t>{static_cast<int64_t>(scan.getAxis())});
+        Value identity = builder.create<gpu::BroadcastOp>(
+            location, type, scan.getInputs()[count + component]);
+        results[component] = builder.create<gpu::SelectOp>(
+            location, type, valid, prefix, identity);
+      }
+    }
+    operation->replaceAllUsesWith(results);
     operation->erase();
   }
   return success();
@@ -2533,6 +2699,144 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
   return result.wasInterrupted() ? failure() : success();
 }
 
+bool viewsMayAlias(Value lhs, Value rhs) {
+  if (lhs == rhs)
+    return true;
+  auto left = cast<gpu::ViewType>(lhs.getType());
+  auto right = cast<gpu::ViewType>(rhs.getType());
+  return !left.getLayout().getNoalias() && !right.getLayout().getNoalias();
+}
+
+bool hasOrderedViewDependencies(func::FuncOp kernel) {
+  llvm::DenseSet<Value> reads, writes;
+  kernel.walk([&](gpu::LoadOp load) {
+    if (isa<gpu::ViewType>(load.getResource().getType()))
+      reads.insert(load.getResource());
+  });
+  kernel.walk([&](gpu::StoreOp store) {
+    if (isa<gpu::ViewType>(store.getResource().getType()))
+      writes.insert(store.getResource());
+  });
+  return llvm::any_of(reads, [&](Value resource) {
+    return llvm::any_of(writes, [&](Value other) { return viewsMayAlias(resource, other); });
+  });
+}
+
+LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
+  if (!hasOrderedViewDependencies(kernel))
+    return success();
+  using Accesses = llvm::DenseMap<Value, unsigned>;
+  auto accesses = [](Operation *operation) {
+    Accesses modes;
+    operation->walk([&](Operation *nested) {
+      if (auto load = dyn_cast<gpu::LoadOp>(nested)) {
+        if (isa<gpu::ViewType>(load.getResource().getType()))
+          modes[load.getResource()] |= 1;
+      } else if (auto store = dyn_cast<gpu::StoreOp>(nested)) {
+        if (isa<gpu::ViewType>(store.getResource().getType()))
+          modes[store.getResource()] |= 2;
+      }
+    });
+    return modes;
+  };
+  auto conflicts = [](const Accesses &pending, const Accesses &current) {
+    for (auto [resource, mode] : pending)
+      for (auto [other, otherMode] : current)
+        if (((mode | otherMode) & 2) && viewsMayAlias(resource, other))
+          return true;
+    return false;
+  };
+  llvm::DenseSet<Value> visiting;
+  std::function<bool(Value)> uniform = [&](Value value) {
+    if (isa<gpu::FragmentType, gpu::RecordType>(value.getType()))
+      return false;
+    if (!visiting.insert(value).second)
+      return true;
+    bool result = false;
+    if (auto argument = dyn_cast<BlockArgument>(value)) {
+      Operation *parent = argument.getOwner()->getParentOp();
+      if (isa<func::FuncOp>(parent)) {
+        result = true;
+      } else if (auto loop = dyn_cast<scf::ForOp>(parent)) {
+        result = uniform(loop.getLowerBound()) && uniform(loop.getUpperBound()) &&
+                 uniform(loop.getStep());
+        if (result && argument.getArgNumber()) {
+          unsigned index = argument.getArgNumber() - 1;
+          result = uniform(loop.getInitArgs()[index]) &&
+                   uniform(loop.getBody()->getTerminator()->getOperand(index));
+        }
+      }
+    } else if (Operation *producer = value.getDefiningOp()) {
+      if (auto loop = dyn_cast<scf::ForOp>(producer)) {
+        auto index = cast<OpResult>(value).getResultNumber();
+        result = uniform(loop.getRegionIterArgs()[index]);
+      } else if (isa<gpu::ReduceOp, gpu::GatherOp, gpu::DimOp, gpu::ParameterOp,
+              gpu::PhysicalExprOp, gpu::ProgramIdOp, arith::ConstantOp>(producer)) {
+        result = true;
+      } else if (isa<gpu::LoadOp, gpu::UnaryOp, gpu::BinaryOp, gpu::CompareOp,
+                     gpu::SelectOp, gpu::CastOp, gpu::BitcastOp,
+                     gpu::WorksetCoordinateOp, gpu::DelinearizeOp>(producer)) {
+        result = llvm::all_of(producer->getOperands(), uniform);
+      }
+    }
+    visiting.erase(value);
+    return result;
+  };
+  std::function<LogicalResult(Block &, bool, bool, Accesses &)> synchronize =
+      [&](Block &block, bool loopBody, bool uniformControl,
+          Accesses &pending) -> LogicalResult {
+    Accesses bodyAccesses;
+    for (Operation &operation : block)
+      for (auto [resource, mode] : accesses(&operation))
+        bodyAccesses[resource] |= mode;
+    for (Operation &operation : llvm::make_early_inc_range(block.without_terminator())) {
+      if (isa<CtaBarrierOp>(operation)) {
+        pending.clear();
+        continue;
+      }
+      Accesses current = accesses(&operation);
+      if (conflicts(pending, current)) {
+        if (!uniformControl)
+          return operation.emitOpError("ordered view dependency requires uniform CTA control before synchronization");
+        OpBuilder builder(&operation);
+        builder.create<CtaBarrierOp>(operation.getLoc());
+        pending.clear();
+      }
+      if (operation.getNumRegions()) {
+        bool nestedUniform = uniformControl;
+        if (auto branch = dyn_cast<scf::IfOp>(operation))
+          nestedUniform &= uniform(branch.getCondition());
+        else if (auto loop = dyn_cast<scf::ForOp>(operation))
+          nestedUniform &= uniform(loop.getInductionVar());
+        else if (isa<scf::WhileOp>(operation))
+          nestedUniform = false;
+        for (Region &region : operation.getRegions())
+          for (Block &nested : region) {
+            Accesses outstanding;
+            if (failed(synchronize(nested, isa<scf::ForOp, scf::WhileOp>(operation),
+                                   nestedUniform, outstanding)))
+              return failure();
+            for (auto [resource, mode] : outstanding)
+              pending[resource] |= mode;
+          }
+      } else {
+        for (auto [resource, mode] : current)
+          pending[resource] |= mode;
+      }
+    }
+    if (loopBody && conflicts(pending, bodyAccesses)) {
+      if (!uniformControl)
+        return block.getTerminator()->emitOpError("loop-carried view dependency requires uniform CTA control before synchronization");
+      OpBuilder builder(block.getTerminator());
+      builder.create<CtaBarrierOp>(block.getTerminator()->getLoc());
+      pending.clear();
+    }
+    return success();
+  };
+  Accesses pending;
+  return synchronize(kernel.front(), false, true, pending);
+}
+
 } // namespace
 
 LogicalResult verifyTritonProgram(ModuleOp module) {
@@ -2566,9 +2870,9 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       failed(legalizeContractShapes(kernel)) ||
       failed(gpu::verifyGPUProgram(module)))
     return failure();
-  bool hasWorkspace = llvm::any_of(kernel.getArgumentTypes(), [](Type type) {
+  bool requiresCtaSynchronization = llvm::any_of(kernel.getArgumentTypes(), [](Type type) {
     return isa<gpu::BufferType>(type);
-  });
+  }) || hasOrderedViewDependencies(kernel);
   SmallVector<gpu::ParameterCategory> categories;
   bool twoAxisPointwise = false;
   kernel.walk([&](gpu::ParameterOp parameter) {
@@ -2601,7 +2905,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   SmallVector<int64_t> warpDomain, stageDomain, ctaDomain;
   for (const auto &row : *rows) {
     int64_t warps = row[0], stages = row[1], ctas = row[2];
-    if (hasWorkspace && ctas != 1)
+    if (requiresCtaSynchronization && ctas != 1)
       continue;
     if ((warps & (warps - 1)) != 0 ||
         warps > capabilities.getMaxThreadsPerBlock() / 32 ||
@@ -2642,7 +2946,9 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   declareProviderParameter("NUM_CTAS", gpu::ParameterRole::ProviderCTAs,
                            ctaDomain);
   if (failed(gpu::verifyGPUProgram(module)) ||
-      failed(lowerInvocationWorkspaces(module)) ||
+      failed(lowerInvocationWorkspaces(module)))
+    return failure();
+  if (failed(legalizeOrderedViewDependencies(kernel)) ||
       failed(legalizeSplitGatherPairs(kernel)) ||
       failed(materializeBlockPointerForms(kernel)))
     return failure();

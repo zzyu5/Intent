@@ -1,6 +1,7 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -10,6 +11,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/MathExtras.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AttrTypeSubElements.h"
@@ -666,12 +668,17 @@ FailureOr<Value> projectPredicate(OpBuilder &builder, Location location,
       target.getValidity(), target.getOwner());
   Value result = predicate;
   if (base != reshaped) {
-    FailureOr<ArrayAttr> reassociation =
-        inferReshapeReassociation(base, reshaped);
-    if (failed(reassociation))
-      return failure();
+    SmallVector<Attribute> groups;
+    for (unsigned resultAxis = 0; resultAxis < shape.size(); ++resultAxis) {
+      SmallVector<int64_t> sourceAxes;
+      if (resultAxis == axis)
+        sourceAxes.push_back(0);
+      groups.push_back(ReshapeGroupAttr::get(
+          target.getContext(), builder.getDenseI64ArrayAttr(sourceAxes),
+          builder.getDenseI64ArrayAttr({static_cast<int64_t>(resultAxis)})));
+    }
     result = builder.create<ReshapeOp>(location, reshaped, result,
-                                      *reassociation);
+                                      builder.getArrayAttr(groups));
   }
   auto projected = FragmentType::get(
       target.getContext(), builder.getI1Type(), target.getShape(),
@@ -798,6 +805,34 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
         projectFragmentValue(builder, location, broadcast.getValue(), target);
     if (succeeded(projected))
       return *projected;
+  } else if (auto reshape = value.getDefiningOp<ReshapeOp>()) {
+    auto input = cast<FragmentType>(reshape.getValue().getType());
+    bool positional = input.getShape().size() == source.getShape().size() &&
+                      source.getShape().size() == target.getShape().size();
+    for (auto [axis, attribute] : llvm::enumerate(reshape.getReassociation())) {
+      auto group = cast<ReshapeGroupAttr>(attribute);
+      positional &= group.getSourceAxes().size() == 1 &&
+                    group.getResultAxes().size() == 1 &&
+                    group.getSourceAxes()[0] == static_cast<int64_t>(axis) &&
+                    group.getResultAxes()[0] == static_cast<int64_t>(axis);
+    }
+    positional &= reshape.getReassociation().size() <= input.getShape().size();
+    if (positional) {
+      unsigned prefix = input.getShape().size() - reshape.getReassociation().size();
+      for (unsigned axis = 0; axis < prefix; ++axis)
+        positional &= input.getAxisMaps()[axis] == source.getAxisMaps()[axis] &&
+                      input.getShape()[axis] == source.getShape()[axis];
+    }
+    if (positional) {
+      auto inputTarget = FragmentType::get(
+          target.getContext(), input.getElementType(), target.getShape(),
+          input.getAxisMaps(), target.getValidity(), target.getOwner());
+      FailureOr<Value> projected =
+          projectFragmentValue(builder, location, reshape.getValue(), inputTarget);
+      if (succeeded(projected))
+        projection = builder.create<ReshapeOp>(
+            location, target, *projected, reshape.getReassociation());
+    }
   }
   if (!projection && queryBroadcastProjection(source, target).isExact())
     projection = builder.create<BroadcastOp>(location, target, value);
@@ -1483,6 +1518,35 @@ FailureOr<Value> materializeReplayedValue(
       }
     }
 
+    if (auto reshape = dyn_cast<ReshapeOp>(producer)) {
+      auto input = cast<FragmentType>(reshape.getValue().getType());
+      for (Attribute attribute : reshape.getReassociation()) {
+        auto group = cast<ReshapeGroupAttr>(attribute);
+        if (group.getSourceAxes().size() != 1 ||
+            group.getResultAxes().size() != 1 ||
+            group.getResultAxes()[0] != static_cast<int64_t>(axis))
+          continue;
+        unsigned inputAxis = group.getSourceAxes()[0];
+        auto inputMap = cast<AxisMapAttr>(input.getAxisMaps()[inputAxis]);
+        auto resultMap = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+        if (sourceAxisIdentity(inputMap) == sourceAxisIdentity(resultMap) ||
+            input.getShape()[inputAxis] != fragment.getShape()[axis])
+          continue;
+        ReplayMaterializationOptions inputOptions = options;
+        inputOptions.fragmentAxis = inputAxis;
+        FailureOr<Value> replayed = materializeReplayedValue(
+            builder, location, reshape.getValue(), sourceAxisIdentity(inputMap),
+            blockedExtent, mapping, inputOptions);
+        if (failed(replayed))
+          return failure();
+        Value projected = builder.create<ReshapeOp>(
+            location, replaceReplayAxis(fragment, axis), *replayed,
+            reshape.getReassociation());
+        remember(current, projected, projection);
+        return projected;
+      }
+    }
+
     if (auto contract = dyn_cast<ContractOp>(producer);
         contract && hasMultipleReplayAxes(fragment)) {
       SmallVector<std::pair<unsigned, unsigned>> freeAxes;
@@ -1813,13 +1877,15 @@ FailureOr<FragmentType> refinePhysicalSchema(func::FuncOp kernel,
           sourceExtent.getKind() ==
               static_cast<uint32_t>(PhysicalExprKind::Constant) &&
           sourceExtent.getValue() == 1;
-      // A singleton axis is an exact value relation but not an extent decision
-      // for a pointwise consumer: broadcast may legally expand it.  Treating a
-      // reshape-introduced unit axis as the winner made ordinary predicates
-      // compete with the consumer's blocked axis.
+      // A logical singleton may broadcast. A selected one-lane slice of a
+      // larger logical range instead owns that consumer's physical extent.
       sourceAuthority[sourceAxis] = realization.hasExtentAuthority() &&
                                     !realization.constructionScalarSeed &&
-                                    !singleton;
+                                    (!singleton ||
+                                     (realization.physicalized &&
+                                      llvm::any_of(realization.roots, [](MakeRangeOp range) {
+                                        return !isProvablySingletonLogicalRange(range);
+                                      })));
       hasAuthority |= sourceAuthority[sourceAxis];
     }
     if (!hasAuthority)
@@ -1922,8 +1988,15 @@ FailureOr<FragmentType> refineAccessResultSchema(
           extent.getKind() ==
               static_cast<uint32_t>(PhysicalExprKind::Constant) &&
           extent.getValue() == 1;
-      if (!realization.hasExtentAuthority() ||
-          realization.constructionScalarSeed || singleton)
+      PhysicalRangeFact ranges = analysis.axisRanges(coordinate, sourceAxis);
+      FailureOr<MakeRangeOp> range = queryExactLogicalRange(ranges);
+      bool scalarCoordinate = singleton && succeeded(range) &&
+                              (*range).getResult() == coordinate &&
+                              isUnitStepRange(*range) &&
+                              queryLaunchExpression((*range).getExtent()) == extent;
+      if (!scalarCoordinate &&
+          (!realization.hasExtentAuthority() ||
+           realization.constructionScalarSeed || singleton))
         continue;
 
       auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
@@ -1947,8 +2020,14 @@ FailureOr<FragmentType> refineAccessResultSchema(
       // not expose.  Such an axis is not an access-result extent authority.
       if (!targetAxis)
         continue;
-      if (refined[*targetAxis] && shape[*targetAxis] != extent)
+      if (refined[*targetAxis] && shape[*targetAxis] != extent) {
+        emitError(coordinate.getLoc(), "access coordinate relations disagree")
+            << "; payload_axis=" << *targetAxis
+            << "; selected_extent=" << shape[*targetAxis]
+            << "; coordinate_extent=" << extent
+            << "; coordinate=" << coordinate;
         return failure();
+      }
       shape[*targetAxis] = extent;
       refined[*targetAxis] = true;
       changed |= target.getShape()[*targetAxis] != extent;
@@ -2006,6 +2085,8 @@ LogicalResult alignAccessResultRelations(func::FuncOp kernel) {
   return result.wasInterrupted() ? failure() : success();
 }
 
+static LogicalResult refreshReshapeRelation(ReshapeOp reshape);
+
 LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
   auto isParameterExtent = [](Attribute attribute) {
     auto extent = dyn_cast<PhysicalExprAttr>(attribute);
@@ -2025,73 +2106,23 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
     auto source = dyn_cast<FragmentType>(value.getType());
     if (source && sameSchema(source, targetShape))
       return success();
-    if (!source) {
-      if (!isa<IntegerType, FloatType, IndexType>(value.getType()))
-        return failure();
-      auto target = FragmentType::get(
-          kernel.getContext(), value.getType(), targetShape.getShape(),
-          targetShape.getAxisMaps(), targetShape.getValidity(),
-          targetShape.getOwner());
-      OpBuilder builder(operation);
-      Value replacement =
-          builder.create<SplatOp>(operation->getLoc(), target, value);
-      if (Operation *definition = value.getDefiningOp())
-        if (Attribute origin = definition->getAttr(originAttr))
-          replacement.getDefiningOp()->setAttr(originAttr, origin);
-      operation->setOperand(operandIndex, replacement);
-      return success();
-    }
-    if (source.getShape().size() > targetShape.getShape().size())
-      return failure();
-    Operation *definition = value.getDefiningOp();
-    if (auto broadcast = dyn_cast_or_null<BroadcastOp>(definition)) {
-      auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
-      if (!input || queryBroadcastProjection(input, targetShape).isExact()) {
-        Type element = input ? input.getElementType()
-                             : broadcast.getValue().getType();
-        auto target = FragmentType::get(
-            kernel.getContext(), element, targetShape.getShape(),
-            targetShape.getAxisMaps(), targetShape.getValidity(),
-            targetShape.getOwner());
-        OpBuilder builder(operation);
-        Value replacement = builder.create<BroadcastOp>(
-            operation->getLoc(), target, broadcast.getValue());
-        if (Attribute origin = definition->getAttr(originAttr))
-          replacement.getDefiningOp()->setAttr(originAttr, origin);
-        operation->setOperand(operandIndex, replacement);
-        return success();
-      }
-    }
-    if (auto splat = dyn_cast_or_null<SplatOp>(definition)) {
-      auto target = FragmentType::get(
-          kernel.getContext(), splat.getValue().getType(), targetShape.getShape(),
-          targetShape.getAxisMaps(), targetShape.getValidity(),
-          targetShape.getOwner());
-      OpBuilder builder(operation);
-      Value replacement = builder.create<SplatOp>(operation->getLoc(), target,
-                                                  splat.getValue());
-      if (Attribute origin = definition->getAttr(originAttr))
-        replacement.getDefiningOp()->setAttr(originAttr, origin);
-      operation->setOperand(operandIndex, replacement);
-      return success();
-    }
-    if (!queryBroadcastProjection(source, targetShape).isExact())
-      return failure();
     auto target = FragmentType::get(
-        kernel.getContext(), source.getElementType(), targetShape.getShape(),
-        targetShape.getAxisMaps(), targetShape.getValidity(),
+        kernel.getContext(), source ? source.getElementType() : value.getType(),
+        targetShape.getShape(), targetShape.getAxisMaps(), targetShape.getValidity(),
         targetShape.getOwner());
     OpBuilder builder(operation);
-    Value replacement =
-        builder.create<BroadcastOp>(operation->getLoc(), target, value);
-    if (definition)
-      if (Attribute origin = definition->getAttr(originAttr))
-        replacement.getDefiningOp()->setAttr(originAttr, origin);
-    operation->setOperand(operandIndex, replacement);
+    FailureOr<Value> replacement =
+        projectFragmentValue(builder, operation->getLoc(), value, target);
+    if (failed(replacement))
+      return failure();
+    operation->setOperand(operandIndex, *replacement);
     return success();
   };
 
   WalkResult result = kernel.walk([&](Operation *operation) {
+    if (auto reshape = dyn_cast<ReshapeOp>(operation))
+      return failed(refreshReshapeRelation(reshape)) ? WalkResult::interrupt()
+                                                     : WalkResult::advance();
     if (auto transpose = dyn_cast<TransposeOp>(operation)) {
       auto source = cast<FragmentType>(transpose.getValue().getType());
       auto target = cast<FragmentType>(transpose.getResult().getType());
@@ -2145,6 +2176,15 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
                 static_cast<uint32_t>(PhysicalExprKind::Constant) &&
             targetExtent.getValue() == 1;
         if (targetSingleton) {
+          PhysicalProgramAnalysis analysis(kernel);
+          if (analysis.axisRealization(broadcast.getResult(), targetAxis)
+                  .constructionScalarSeed) {
+            auto targetMap = cast<AxisMapAttr>(target.getAxisMaps()[targetAxis]);
+            retargetSourceExtent(broadcast.getResult(),
+                                 sourceAxisIdentity(targetMap), sourceExtent);
+            target = cast<FragmentType>(broadcast.getResult().getType());
+            continue;
+          }
           broadcast.emitOpError(
               "broadcast cannot contract a non-singleton physical axis")
               << "; input=" << source << "; result=" << target;
@@ -2280,6 +2320,43 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
       return failure();
     return projectPhysicalValueToSchema(builder, location, value, target);
   };
+  auto alignCoordinates = [&](auto access) -> LogicalResult {
+    auto payload = dyn_cast<FragmentType>(access.getResult().getType());
+    if (!payload)
+      return success();
+    PhysicalProgramAnalysis analysis(kernel);
+    for (auto [slot, coordinate] : llvm::enumerate(access.getCoordinates())) {
+      auto type = dyn_cast<FragmentType>(coordinate.getType());
+      if (!type)
+        continue;
+      SmallVector<Attribute> shape(type.getShape().begin(), type.getShape().end());
+      bool changed = false;
+      for (auto [axis, attribute] : llvm::enumerate(type.getAxisMaps())) {
+        auto mapping = cast<AxisMapAttr>(attribute);
+        auto projection = queryFragmentAxis(payload, sourceAxisIdentity(mapping));
+        if (!projection.isExact() || projection.dimensionId != mapping.getDimensionId() ||
+            shape[axis] == payload.getShape()[projection.fragmentAxis])
+          continue;
+        PhysicalRangeFact ranges = analysis.axisRanges(coordinate, axis);
+        if (!ranges.isExact() || !ranges.roots.empty())
+          continue;
+        shape[axis] = payload.getShape()[projection.fragmentAxis];
+        changed = true;
+      }
+      if (!changed)
+        continue;
+      auto target = FragmentType::get(
+          kernel.getContext(), type.getElementType(), ArrayAttr::get(kernel.getContext(), shape),
+          type.getAxisMaps(), type.getValidity(), type.getOwner());
+      OpBuilder builder(access);
+      FailureOr<Value> aligned = project(builder, access.getLoc(), coordinate, target);
+      if (failed(aligned))
+        return access.emitOpError("cannot align broadcast coordinate with its access schema")
+               << "; coordinate=" << coordinate;
+      access.getCoordinatesMutable().slice(slot, 1).assign(*aligned);
+    }
+    return success();
+  };
 
   SmallVector<LoadOp> loads;
   SmallVector<GatherOp> gathers;
@@ -2289,6 +2366,8 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
   kernel.walk([&](StoreOp store) { stores.push_back(store); });
 
   for (LoadOp load : loads) {
+    if (failed(alignCoordinates(load)))
+      return failure();
     if (!load.getValid() && !load.getFill())
       continue;
     if (!load.getValid())
@@ -2332,6 +2411,8 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
   }
 
   for (GatherOp gather : gathers) {
+    if (failed(alignCoordinates(gather)))
+      return failure();
     if (!gather.getValid() && !gather.getFill())
       continue;
     if (!gather.getValid())
@@ -2451,8 +2532,8 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
   return success();
 }
 
-LogicalResult refreshReshapeRelations(func::FuncOp kernel) {
-  WalkResult result = kernel.walk([&](ReshapeOp reshape) {
+static LogicalResult refreshReshapeRelation(ReshapeOp reshape) {
+    auto kernel = reshape->getParentOfType<func::FuncOp>();
     // Reassociation is the typed row-major relation selected from canonical
     // KIR.  Refinement passes may change physical extents, but they may not
     // rediscover and replace that relation from the new shapes: doing so turns
@@ -2464,7 +2545,7 @@ LogicalResult refreshReshapeRelations(func::FuncOp kernel) {
     if (!source || !target) {
       reshape.emitOpError(
           "reshape relation requires physical fragment operands and result");
-      return WalkResult::interrupt();
+      return failure();
     }
     unsigned logicalSourceRank = 0;
     unsigned logicalResultRank = 0;
@@ -2472,7 +2553,7 @@ LogicalResult refreshReshapeRelations(func::FuncOp kernel) {
       auto group = dyn_cast<ReshapeGroupAttr>(attribute);
       if (!group) {
         reshape.emitOpError("reshape relation contains an untyped group");
-        return WalkResult::interrupt();
+        return failure();
       }
       if (!group.getSourceAxes().empty())
         logicalSourceRank = std::max(
@@ -2489,7 +2570,7 @@ LogicalResult refreshReshapeRelations(func::FuncOp kernel) {
         logicalResultRank > target.getShape().size()) {
       reshape.emitOpError(
           "reshape relation rank exceeds the current physical fragments");
-      return WalkResult::interrupt();
+      return failure();
     }
     unsigned sourcePrefix = source.getShape().size() - logicalSourceRank;
     unsigned resultPrefix = target.getShape().size() - logicalResultRank;
@@ -2525,8 +2606,13 @@ LogicalResult refreshReshapeRelations(func::FuncOp kernel) {
         kernel.getContext(), target.getElementType(),
         ArrayAttr::get(kernel.getContext(), resultShape), target.getAxisMaps(),
         target.getValidity(), target.getOwner()));
-    return failed(reshape.verify()) ? WalkResult::interrupt()
-                                    : WalkResult::advance();
+    return reshape.verify();
+}
+
+LogicalResult refreshReshapeRelations(func::FuncOp kernel) {
+  WalkResult result = kernel.walk([&](ReshapeOp reshape) {
+    return failed(refreshReshapeRelation(reshape)) ? WalkResult::interrupt()
+                                                  : WalkResult::advance();
   });
   return result.wasInterrupted() ? failure() : success();
 }
@@ -2857,14 +2943,6 @@ static void retargetExtent(Value root, AxisSelector selects,
         // decision; leaving the operand behind creates two executable
         // authorities for one traversal.
         if (auto range = value.getDefiningOp<MakeRangeOp>()) {
-          auto originalExtent =
-              range.getExtent().getDefiningOp<arith::ConstantIndexOp>();
-          bool coveredIntroducedUnitDomain =
-              originalExtent && originalExtent.value() == 1 &&
-              samePhysicalScalarExpression(range.getStart(),
-                                           range.getLogicalStart()) &&
-              samePhysicalScalarExpression(range.getExtent(),
-                                           range.getLogicalStop());
           OpBuilder builder(range);
           Value physicalExtent;
           if (extent.getKind() ==
@@ -2875,8 +2953,6 @@ static void retargetExtent(Value root, AxisSelector selects,
             physicalExtent = builder.create<PhysicalExprOp>(
                 range.getLoc(), builder.getIndexType(), extent);
           range->setOperand(1, physicalExtent);
-          if (coveredIntroducedUnitDomain)
-            range->setOperand(4, physicalExtent);
         }
       }
     }
@@ -3224,7 +3300,8 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
   if (!runtimeDimension && staticDimension &&
       currentExtent.getKind() ==
           static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-      currentExtent.getValue() == *staticDimension)
+      currentExtent.getValue() == *staticDimension &&
+      llvm::isPowerOf2_64(*staticDimension))
     return success();
   if (!runtimeDimension && !subregion) {
     FailureOr<MakeRangeOp> authority = queryExactLogicalRange(ranges);
@@ -3250,6 +3327,42 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
       if (!samePhysicalScalarExpression(range.getLogicalStop(), runtimeDimension))
         return range.emitOpError(
             "subregion full coverage does not end at its parent extent");
+
+  if (!staticDimension)
+    if (auto value = dyn_cast_or_null<IntegerAttr>(
+            UniformValueAnalysis(describeUniformValue).evaluate(runtimeDimension)))
+      staticDimension = value.getInt();
+  if (!staticDimension && coverageBound.getKind() ==
+                              static_cast<uint32_t>(PhysicalExprKind::Constant))
+    staticDimension = coverageBound.getValue();
+  if (staticDimension && *staticDimension >= 0) {
+    uint64_t size = llvm::PowerOf2Ceil(
+        static_cast<uint64_t>(std::max<int64_t>(*staticDimension, 1)));
+    if (size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+      return kernel.emitError("full-coverage extent exceeds the index range");
+    auto covered = PhysicalExprAttr::get(kernel.getContext(),
+        static_cast<uint32_t>(PhysicalExprKind::Constant), size,
+        StringAttr::get(kernel.getContext(), ""), ArrayAttr::get(kernel.getContext(), {}));
+    if (currentExtent == covered &&
+        analysis.axisRealization(source, fragmentAxis).physicalized)
+      return success();
+    OpBuilder builder(&kernel.front(), kernel.front().begin());
+    Value physicalExtent = builder.create<arith::ConstantIndexOp>(source.getLoc(), size);
+    llvm::SmallDenseSet<int64_t> rangeDimensions;
+    for (MakeRangeOp range : ranges.roots) {
+      FailureOr<int64_t> rangeDimension = queryRangeDimension(range);
+      if (failed(rangeDimension))
+        return range.emitOpError("full coverage has no range dimension authority");
+      rangeDimensions.insert(*rangeDimension);
+    }
+    if (rangeDimensions.empty())
+      rangeDimensions.insert(dimension);
+    for (int64_t rangeDimension : rangeDimensions)
+      if (failed(bindFullCoverageDimension(kernel, rangeDimension, physicalExtent)))
+        return failure();
+    retargetDimensionExtent(source, dimension, covered);
+    return success();
+  }
 
   ParameterOp parameter;
   if (currentExtent.getKind() ==
@@ -3390,13 +3503,11 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
 LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
                                         Value physicalExtent) {
   auto parameter = physicalExtent.getDefiningOp<ParameterOp>();
-  if (!parameter)
+  PhysicalExprAttr parameterExtent = queryLaunchExpression(physicalExtent);
+  if (!parameterExtent ||
+      (!parameter && parameterExtent.getKind() !=
+                         static_cast<uint32_t>(PhysicalExprKind::Constant)))
     return failure();
-  PhysicalExprAttr parameterExtent = PhysicalExprAttr::get(
-      kernel.getContext(),
-      static_cast<uint32_t>(PhysicalExprKind::Parameter), 0,
-      parameter.getParameter().getName(),
-      ArrayAttr::get(kernel.getContext(), {}));
   SmallVector<MakeRangeOp> ranges;
   kernel.walk([&](MakeRangeOp range) {
     FailureOr<int64_t> sourceDimension = querySourceDimension(
@@ -3529,17 +3640,25 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
 
   auto materializeTail = [&](OpBuilder &builder, Location location,
                              FragmentType target,
-                             ArrayRef<MakeRangeOp> sources) -> FailureOr<Value> {
+                             ArrayRef<MakeRangeOp> sources,
+                             Value data = Value()) -> FailureOr<Value> {
     Value result;
     for (MakeRangeOp range : sources) {
-      SmallVector<PhysicalAxisProjection, 2> projections =
-          queryRangeProjections(target, range);
-      if (projections.empty())
+      SmallVector<unsigned, 2> axes;
+      for (PhysicalAxisProjection projection : queryRangeProjections(target, range))
+        axes.push_back(projection.fragmentAxis);
+      if (axes.empty() && data) {
+        PhysicalRangeAxisFact relation =
+            PhysicalProgramAnalysis(kernel).rangeAxes(data, {range});
+        if (relation.isExact())
+          axes.append(relation.fragmentAxes.begin(), relation.fragmentAxes.end());
+      }
+      if (axes.empty())
         return failure();
-      for (PhysicalAxisProjection projection : projections) {
+      for (unsigned axis : axes) {
         FailureOr<Value> current = projectPredicate(
             builder, location, predicates.lookup(range.getOperation()), target,
-            projection.fragmentAxis);
+            axis);
         if (failed(current))
           return failure();
         result = result ? Value(builder.create<BinaryOp>(
@@ -3584,7 +3703,7 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
       continue;
     OpBuilder builder(load);
     FailureOr<Value> tail =
-        materializeTail(builder, load.getLoc(), type, sources);
+        materializeTail(builder, load.getLoc(), type, sources, load.getResult());
     if (failed(tail))
       return load.emitOpError(
           "cannot project full-coverage dimension to load validity")

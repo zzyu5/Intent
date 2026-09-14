@@ -65,6 +65,37 @@ bool isCompileTimeValue(Value value) {
          value.getDefiningOp<PhysicalExprOp>();
 }
 
+bool exceedsRegisterFile(Value source, func::FuncOp kernel) {
+  auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+  auto fragment = dyn_cast<FragmentType>(source.getType());
+  if (!fragment || !capabilities || capabilities.getRegistersPerUnit() <= 0)
+    return false;
+  Type element = fragment.getElementType();
+  unsigned bits = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
+  __int128 registers = std::max(1u, (bits + 31) / 32);
+  __int128 budget = capabilities.getRegistersPerUnit();
+  for (Attribute attribute : fragment.getShape()) {
+    auto extent = cast<PhysicalExprAttr>(attribute);
+    int64_t minimum;
+    if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant)) {
+      minimum = extent.getValue();
+    } else if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
+      auto parameter = queryParameterBySymbol(kernel, extent.getSymbol());
+      if (failed(parameter))
+        return false;
+      minimum = *llvm::min_element(parameter->getParameter().getCandidates().asArrayRef());
+    } else {
+      return false;
+    }
+    if (minimum <= 0)
+      return false;
+    registers = std::min(budget + 1, registers * minimum);
+  }
+  // Even the smallest source must leave space for the reduction state.
+  // Larger concrete tuples are filtered after all parameters are bound.
+  return registers >= budget;
+}
+
 bool requiresPhysicalRealization(ReduceOp reduce) {
   auto kernel = reduce->getParentOfType<func::FuncOp>();
   if (!kernel)
@@ -562,9 +593,15 @@ analyzeRoot(LoadOp load, ArrayRef<MakeRangeOp> reductionRanges,
                 [&](const auto &occurrence) {
                   return occurrence.second == reductionAxis;
                 });
-  if (alignedOccurrences.size() == 1)
+  if (!alignedOccurrences.empty())
     occurrences = std::move(alignedOccurrences);
-  if (occurrences.size() != 1) {
+  bool projectsToReductionAxis = llvm::all_of(occurrences, [&](const auto &occurrence) {
+    auto type = cast<FragmentType>(load.getCoordinates()[occurrence.first].getType());
+    auto projection = queryAxisProjection(type, fragment);
+    return projection.isExact() &&
+           projection.targetToSource[reductionAxis] == occurrence.second;
+  });
+  if (occurrences.empty() || !projectsToReductionAxis) {
     InFlightDiagnostic diagnostic = load.emitOpError(
         "reduction source provenance is absent from load coordinates");
     diagnostic << "; reduction_range=" << resultAuthority.getResult().getType()
@@ -617,6 +654,10 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned reductionAxis) {
   for (MakeRangeOp range : graphRanges.roots) {
     if (llvm::is_contained(plan.ranges, range) ||
         otherAxisRanges.contains(range.getOperation()))
+      continue;
+    if (!llvm::any_of(plan.ranges, [&](MakeRangeOp selected) {
+          return sameLogicalRange(range, selected);
+        }))
       continue;
     SmallVector<MakeRangeOp> combined(plan.ranges.begin(), plan.ranges.end());
     combined.push_back(range);
@@ -1306,6 +1347,51 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
              << "; dimension=" << dimension;
   }
 
+  auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+  if (capabilities && capabilities.getRegistersPerUnit() > 0) {
+    for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+      auto fragment = dyn_cast<FragmentType>(source.getType());
+      if (!fragment)
+        continue;
+      for (auto [axis, attribute] : llvm::enumerate(fragment.getShape())) {
+        if (llvm::is_contained(reduce.getAxes(), static_cast<int64_t>(axis)))
+          continue;
+        auto parameter = parameterForExtent(kernel, cast<PhysicalExprAttr>(attribute));
+        if (failed(parameter))
+          continue;
+        auto schema = parameter->getParameter();
+        auto role = static_cast<ParameterRole>(schema.getRole());
+        if (role != ParameterRole::OwnershipM && role != ParameterRole::OwnershipN)
+          continue;
+        Type element = fragment.getElementType();
+        unsigned bits = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
+        __int128 registers = std::max(1u, (bits + 31) / 32);
+        bool known = true;
+        for (auto [otherAxis, otherAttribute] : llvm::enumerate(fragment.getShape())) {
+          if (axis == otherAxis)
+            continue;
+          auto extent = cast<PhysicalExprAttr>(otherAttribute);
+          if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+              extent.getValue() <= 0) {
+            known = false;
+            break;
+          }
+          registers *= extent.getValue();
+        }
+        if (!known)
+          continue;
+        SmallVector<int64_t> candidates;
+        for (int64_t candidate : schema.getCandidates().asArrayRef())
+          if (registers * candidate <= capabilities.getRegistersPerUnit())
+            candidates.push_back(candidate);
+        if (!candidates.empty() &&
+            candidates.size() != static_cast<size_t>(schema.getCandidates().size()))
+          parameter->setParameterAttr(ParameterAttr::get(
+              kernel.getContext(), schema.getName(), schema.getRole(), schema.getCategory(),
+              schema.getElementBitWidth(), DenseI64ArrayAttr::get(kernel.getContext(), candidates)));
+      }
+    }
+  }
   return alignReductionResultRelations(kernel);
 }
 
@@ -1789,23 +1875,8 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
     return reduce.emitOpError(
         "multi-axis reduction has no load-rooted traversal authority");
   auto sharesOuterTraversal = [&](MakeRangeOp range) {
-    FailureOr<int64_t> dimension = queryRangeDimension(range);
-    FailureOr<int64_t> masterDimension =
-        queryRangeDimension(master->range);
-    return range.getSourceId() == master->range.getSourceId() &&
-           range.getSourceAxis() == master->range.getSourceAxis() &&
-           range.getDerived() == master->range.getDerived() &&
-           succeeded(dimension) && succeeded(masterDimension) &&
-           *dimension == *masterDimension &&
-           samePhysicalScalarExpression(range.getStart(),
-                                        master->range.getStart()) &&
-           samePhysicalScalarExpression(range.getExtent(),
-                                        master->range.getExtent()) &&
-           sameScalarValue(range.getLogicalStart(),
-                           master->range.getLogicalStart()) &&
-           sameScalarValue(range.getLogicalStop(),
-                           master->range.getLogicalStop()) &&
-           sameScalarValue(range.getStep(), master->range.getStep());
+    return PhysicalProgramAnalysis(kernel)
+        .lockstepRanges({range, master->range}).isExact();
   };
   for (const auto &component : accesses)
     for (RootAccess access : component) {
@@ -1998,27 +2069,18 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                  llvm::enumerate(load.getCoordinates())) {
               if (coordinateIndex == access.coordinateIndex)
                 continue;
-              FailureOr<Value> outerCoordinate = materializeReplayedValue(
-                  nested, nestedLocation, original, accessSource,
-                  outerSliceExtent, mapping);
-              if (failed(outerCoordinate)) {
-                bodyFailed = true;
-                failureReason =
-                    "source coordinate could not adopt the outer slice";
-                return;
-              }
-              coordinates[coordinateIndex] = *outerCoordinate;
               MakeRangeOp range = sourceRange(original);
-              if (!range)
-                continue;
-              auto rangeType = cast<FragmentType>(range.getResult().getType());
-              replayAxes.emplace_back(
-                  sourceAxisIdentity(range),
-                  cast<PhysicalExprAttr>(rangeType.getShape()[0]));
+              PhysicalSourceAxis coordinateSource = accessSource;
+              PhysicalExprAttr coordinateExtent = outerSliceExtent;
+              if (range) {
+                auto rangeType = cast<FragmentType>(range.getResult().getType());
+                coordinateSource = sourceAxisIdentity(range);
+                coordinateExtent = cast<PhysicalExprAttr>(rangeType.getShape()[0]);
+                replayAxes.emplace_back(coordinateSource, coordinateExtent);
+              }
               FailureOr<Value> replayedCoordinate = materializeReplayedValue(
-                  nested, nestedLocation, *outerCoordinate,
-                  sourceAxisIdentity(range),
-                  cast<PhysicalExprAttr>(rangeType.getShape()[0]), mapping);
+                  nested, nestedLocation, original, coordinateSource,
+                  coordinateExtent, mapping);
               if (failed(replayedCoordinate)) {
                 bodyFailed = true;
                 failureReason =
@@ -2368,6 +2430,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
     if (queryFragmentAxes(firstSource,
                           sourcePlans.front().sourceIdentity).size() > 1)
       name += ("_F" + Twine(sourcePlans.front().reductionAxis)).str();
+    if (reductionRole == ParameterRole::ReductionInner)
+      name += "_INNER";
     SmallVector<int64_t> candidates{4,   8,    16,   32,   64,   128, 256,
                                     512, 1024, 2048, 4096, 8192};
     chunk = getOrCreatePhysicalParameter(
@@ -2783,7 +2847,10 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
 LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
   if (failed(bindReductionFreeAxes(reduce, kernel)))
     return failure();
-  const bool required = requiresPhysicalRealization(reduce);
+  const bool oversized = llvm::any_of(
+      reduce.getInputs().take_front(reduce.getSourceCount()),
+      [&](Value source) { return exceedsRegisterFile(source, kernel); });
+  const bool required = requiresPhysicalRealization(reduce) || oversized;
   auto unhandled = [&](const Twine &reason) -> LogicalResult {
     return required ? reduce.emitOpError()
                           << "cannot form a complete physical reduction: "
@@ -2889,6 +2956,12 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
         return unhandled(
             "load-rooted producer has no unit-step reduction coordinate");
       RootAccess access = **analyzed;
+      PhysicalProgramAnalysis analysis(kernel);
+      hasDerivedSource |= llvm::count_if(
+          access.load.getCoordinates(), [&](Value coordinate) {
+            auto axes = analysis.rangeAxes(coordinate, {access.range});
+            return !axes.fragmentAxes.empty();
+          }) > 1;
       Value identity = reduce.getInputs()[reduce.getSourceCount() +
                                           sourcePlans.size()];
       if (access.load.getValid() &&
@@ -2923,7 +2996,7 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
       if (needsPairedTraversal(plan))
         plan.ranges.push_back(traversal.authority);
   }
-  if (!isCompileTimeExtent(sourceExtent) || hasDerivedSource ||
+  if (oversized || !isCompileTimeExtent(sourceExtent) || hasDerivedSource ||
       hasRuntimeSourceRange || hasConstructionScalarSource)
     return realizeRuntimeReduce(reduce, sourcePlans, kernel,
                                 /*tileProducerFreeAxis=*/false);
@@ -3048,8 +3121,6 @@ FailureOr<SourcePlan> nestedScalarReductionSource(ReduceOp reduce,
   if (succeeded(parameter)) {
     if (!(*parameter)->hasAttr(coverageDimensionAttr))
       return failure();
-  } else if (!analysis.axisRealization(source, 0).constructionScalarSeed) {
-    return failure();
   }
   FailureOr<SourcePlan> plan = analyzeSource(source, 0);
   if (failed(plan) ||
@@ -3077,10 +3148,22 @@ FailureOr<SourcePlan> nestedScalarReductionSource(ReduceOp reduce,
       continue;
     if (isa<ScanOp>(producer))
       return failure();
-    hasNestedReduction |= isa<ReduceOp>(producer);
+    if (auto nested = dyn_cast<ReduceOp>(producer))
+      for (Value result : nested.getResults()) {
+        auto fragment = dyn_cast<FragmentType>(result.getType());
+        if (fragment &&
+            !queryFragmentAxes(fragment, plan->sourceIdentity).empty())
+          hasNestedReduction = true;
+      }
     values.append(producer->getOperands().begin(), producer->getOperands().end());
   }
   if (!hasNestedReduction)
+    return failure();
+  if (failed(parameter) &&
+      !analysis.axisRealization(source, 0).constructionScalarSeed &&
+      !llvm::any_of(values, [&](Value value) {
+        return exceedsRegisterFile(value, kernel);
+      }))
     return failure();
   // Shared one-dimensional ancestors may remain outside the traversal. Nested
   // reductions and their multidimensional producers must move as a closed slice.

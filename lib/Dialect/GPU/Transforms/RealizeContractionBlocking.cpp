@@ -869,6 +869,15 @@ LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
   auto fragment = dyn_cast<FragmentType>(source.getType());
   if (!fragment)
     return failure();
+  for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
+    auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
+    if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+        extent.getValue() <= 0 || llvm::isPowerOf2_64(extent.getValue()))
+      continue;
+    if (failed(realizeFullCoverageDimension(kernel, source, axis)))
+      return failure();
+    fragment = cast<FragmentType>(source.getType());
+  }
   for (int64_t axis : axes) {
     if (axis < 0 || axis >= static_cast<int64_t>(fragment.getShape().size()))
       return failure();
@@ -878,16 +887,26 @@ LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
       PhysicalAxisRealizationFact coverage =
           PhysicalProgramAnalysis(kernel).axisRealization(source, axis);
       if (!coverage.isExact() || !coverage.physicalized ||
-          coverage.constructionScalarSeed)
+          coverage.constructionScalarSeed) {
+        if (!coverage.roots.empty() &&
+            llvm::all_of(coverage.roots, [](MakeRangeOp range) {
+              return isUnitStepRange(range) && samePhysicalScalarExpression(
+                  range.getStart(), range.getLogicalStart());
+            }) && succeeded(realizeFullCoverageDimension(kernel, source, axis))) {
+          fragment = cast<FragmentType>(source.getType());
+          continue;
+        }
         return kernel.emitError(
             "native contraction axis has no exact physical coverage")
                << "; axis=" << axis << "; source=" << source.getType()
                << "; construction_seed=" << coverage.constructionScalarSeed;
+      }
       continue;
     }
     uint32_t role = parameter->getParameter().getRole();
     if (role == static_cast<uint32_t>(ParameterRole::ScanChunk) ||
-        role == static_cast<uint32_t>(ParameterRole::Reduction))
+        role == static_cast<uint32_t>(ParameterRole::Reduction) ||
+        role == static_cast<uint32_t>(ParameterRole::FullCoverage))
       continue;
     PhysicalParameterBinding binding = queryParameterBinding(*parameter);
     if (!binding.isExact() || !binding.dimension)
@@ -1059,11 +1078,16 @@ LogicalResult neutralizeFullCoverageOperand(ContractOp contract,
   for (int64_t axis : axes) {
     Value source = operand.get();
     auto type = cast<FragmentType>(source.getType());
-    if (!isFullCoverageExtent(contract, type.getShape()[axis]))
+    bool fullCoverage = isFullCoverageExtent(contract, type.getShape()[axis]);
+    auto extent = cast<PhysicalExprAttr>(type.getShape()[axis]);
+    if (!fullCoverage && extent.getKind() !=
+                             static_cast<uint32_t>(PhysicalExprKind::Constant))
       continue;
     PhysicalRangeFact fact = PhysicalProgramAnalysis(kernel).axisRanges(
         source, static_cast<unsigned>(axis));
     FailureOr<MakeRangeOp> range = queryExactLogicalRange(fact);
+    if (!fullCoverage && (failed(range) || !isUnitStepRange(*range)))
+      continue;
     if (failed(range) || !isUnitStepRange(*range))
       return contract.emitOpError(
           "full-coverage contraction tail requires an exact unit-step range");
@@ -1150,8 +1174,7 @@ LogicalResult normalizeMatrixContractForms(func::FuncOp kernel) {
     // contraction, and restore the logical result shape afterwards.  This
     // keeps the outer axis as M/N rather than degrading it into a batch of
     // one-row contractions.
-    if (contract.getLhsBatchAxes().empty() &&
-        contract.getRhsBatchAxes().empty()) {
+    {
       auto freeAxes = [](FragmentType type, ArrayRef<int64_t> reduction) {
         SmallVector<unsigned> result;
         for (unsigned axis = 0; axis < type.getShape().size(); ++axis)
@@ -1189,8 +1212,13 @@ LogicalResult normalizeMatrixContractForms(func::FuncOp kernel) {
             rhsErased.push_back(axis);
       const size_t lhsRemaining = lhsFree.size() - lhsErased.size();
       const size_t rhsRemaining = rhsFree.size() - rhsErased.size();
+      bool removesBatches = llvm::all_of(contract.getLhsBatchAxes(), [&](int64_t axis) {
+        return llvm::is_contained(lhsErased, axis);
+      }) && llvm::all_of(contract.getRhsBatchAxes(), [&](int64_t axis) {
+        return llvm::is_contained(rhsErased, axis);
+      });
       if ((!lhsErased.empty() || !rhsErased.empty()) && lhsRemaining == 1 &&
-          rhsRemaining == 1) {
+          rhsRemaining == 1 && removesBatches) {
         auto eraseAxes = [&](FragmentType source,
                              ArrayRef<unsigned> erased) {
           SmallVector<Attribute> shape;
@@ -1225,8 +1253,11 @@ LogicalResult normalizeMatrixContractForms(func::FuncOp kernel) {
         SmallVector<unsigned> resultErased;
         FragmentType originalResult = contract.getResult().getType();
         auto appendResultAxes = [&](FragmentType operand,
-                                    ArrayRef<unsigned> erased) {
+                                    ArrayRef<unsigned> erased,
+                                    ArrayRef<int64_t> pairedBatch) {
           for (unsigned axis : erased) {
+            if (llvm::is_contained(pairedBatch, axis))
+              continue;
             auto mapping = cast<AxisMapAttr>(operand.getAxisMaps()[axis]);
             auto projection = queryFragmentDimension(
                 originalResult, mapping.getDimensionId());
@@ -1237,8 +1268,8 @@ LogicalResult normalizeMatrixContractForms(func::FuncOp kernel) {
           }
           return success();
         };
-        if (failed(appendResultAxes(lhs, lhsErased)) ||
-            failed(appendResultAxes(rhs, rhsErased)))
+        if (failed(appendResultAxes(lhs, lhsErased, {})) ||
+            failed(appendResultAxes(rhs, rhsErased, contract.getRhsBatchAxes())))
           return contract.emitOpError(
               "singleton matrix axes have no exact result projection");
         FragmentType squeezedLhs = eraseAxes(lhs, lhsErased);
@@ -1297,6 +1328,8 @@ LogicalResult normalizeMatrixContractForms(func::FuncOp kernel) {
             "rhs_reduction_axes",
             builder.getDenseI64ArrayAttr(
                 remap(contract.getRhsReductionAxes(), rhsErased)));
+        contract->setAttr("lhs_batch_axes", builder.getDenseI64ArrayAttr({}));
+        contract->setAttr("rhs_batch_axes", builder.getDenseI64ArrayAttr({}));
         contract.getResult().setType(squeezedResult);
 
         SmallVector<Attribute> restoredGroups;
@@ -3133,9 +3166,8 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   if (failed(rowMap) || failed(lhsReductionMap) || failed(rhsReductionMap) ||
       failed(columnMap) ||
       lhsReductionMap->getDimensionId() <= 0 ||
-      lhsReductionMap->getDimensionId() !=
-          rhsReductionMap->getDimensionId())
-    return unhandled("paired reduction coordinates lack one shared provenance");
+      rhsReductionMap->getDimensionId() <= 0)
+    return unhandled("paired reduction axes have no logical dimensions");
 
   FailureOr<unsigned> lhsRowCoordinate =
       accessCoordinatePosition(lhsLoad, *rowMap);
@@ -3183,7 +3215,8 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
                         : FailureOr<int64_t>(failure());
   if (!rowRange || !lhsReductionRange || !rhsReductionRange || !columnRange ||
       failed(lhsReductionDimension) || failed(rhsReductionDimension) ||
-      *lhsReductionDimension != *rhsReductionDimension)
+      !PhysicalProgramAnalysis(kernel)
+           .lockstepRanges({lhsReductionRange, rhsReductionRange}).isExact())
     return unhandled("physical coordinates are not explicit compatible ranges");
   FailureOr<Value> rowLogicalEnd = resolveLogicalRangeEnd(kernel, rowRange);
   FailureOr<Value> reductionLogicalEnd =
@@ -3499,6 +3532,9 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   FragmentType reductionIndexType = fragmentType(
       context, builder.getIndexType(), {unitK}, {*lhsReductionMap},
       lhsType.getOwner());
+  FragmentType rhsReductionIndexType = fragmentType(
+      context, builder.getIndexType(), {unitK}, {*rhsReductionMap},
+      rhsType.getOwner());
   FragmentType rowPredicateType = fragmentType(
       context, builder.getI1Type(), {unitM}, {*rowMap}, lhsType.getOwner());
   FragmentType columnPredicateType = fragmentType(
@@ -3506,6 +3542,9 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   FragmentType reductionPredicateType = fragmentType(
       context, builder.getI1Type(), {unitK}, {*lhsReductionMap},
       lhsType.getOwner());
+  FragmentType rhsReductionPredicateType = fragmentType(
+      context, builder.getI1Type(), {unitK}, {*rhsReductionMap},
+      rhsType.getOwner());
   FragmentType blockedLhsType = fragmentType(
       context, lhsType.getElementType(), {unitM, unitK},
       {*rowMap, *lhsReductionMap}, lhsType.getOwner());
@@ -3646,9 +3685,18 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
               lhsReductionMap->getSourceId(), lhsReductionMap->getSourceAxis(),
               lhsReductionMap->getDerived());
           inheritRangeAuthority(reductions, lhsReductionRange);
+          Value rhsReductionCoordinates = nested.create<MakeRangeOp>(
+              nestedLocation, rhsReductionIndexType, kStart, blockK.getResult(), one,
+              rhsReductionRange.getLogicalStart(), rhsReductionRange.getLogicalStop(),
+              rhsReductionMap->getSourceId(), rhsReductionMap->getSourceAxis(),
+              rhsReductionMap->getDerived());
+          inheritRangeAuthority(rhsReductionCoordinates, rhsReductionRange);
           Value reductionValid = rangeBoundsValidity(
               nested, nestedLocation, reductionIndexType,
               reductionPredicateType, reductions, reductionStop);
+          Value rhsReductionValid = rangeBoundsValidity(
+              nested, nestedLocation, rhsReductionIndexType,
+              rhsReductionPredicateType, rhsReductionCoordinates, reductionStop);
           Value lhsRows =
               broadcastAxis(nested, nestedLocation, lhsPredicateType, rowValid, 0);
           Value lhsReductions = broadcastAxis(nested, nestedLocation,
@@ -3657,7 +3705,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
                                   lhsRows, lhsReductions,
                                   BinaryOperator::LogicalAnd);
           Value rhsReductions = broadcastAxis(nested, nestedLocation,
-                                          rhsPredicateType, reductionValid, 0);
+                                          rhsPredicateType, rhsReductionValid, 0);
           Value rhsColumns =
               broadcastAxis(nested, nestedLocation, rhsPredicateType, columnValid, 1);
           Value rhsValid = binary(nested, nestedLocation, rhsPredicateType,
@@ -3699,7 +3747,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
           lhsCoordinates[*lhsRowCoordinate] = blockedLhsRowCoordinate;
           lhsCoordinates[*lhsReductionCoordinate] = reductions;
           SmallVector<Value> rhsCoordinates(rhsLoad.getCoordinates());
-          rhsCoordinates[*rhsReductionCoordinate] = reductions;
+          rhsCoordinates[*rhsReductionCoordinate] = rhsReductionCoordinates;
           rhsCoordinates[*rhsColumnCoordinate] = columns;
           FailureOr<Value> lhsFill = retargetFill(
               nested, nestedLocation, lhsLoad.getFill(), blockedLhsType);
@@ -4740,6 +4788,200 @@ void transposeClonedLoop(scf::ForOp loop) {
   });
 }
 
+FailureOr<bool> projectScalarContractResult(ContractOp contract) {
+  if (!contract.getResult().hasOneUse())
+    return false;
+  auto gather = dyn_cast<GatherOp>(*contract.getResult().getUsers().begin());
+  auto resultType = contract.getResult().getType();
+  if (!gather || gather.getSource() != contract.getResult() ||
+      isa<FragmentType>(gather.getResult().getType()) ||
+      gather.getCoordinates().size() != resultType.getShape().size() ||
+      failed(scalarSource(contract.getAccumulator())) ||
+      !canReplayContractionReads(contract))
+    return false;
+  auto kernel = contract->getParentOfType<func::FuncOp>();
+  DominanceInfo dominance(kernel);
+  llvm::SmallDenseSet<Value> checked;
+  std::function<bool(Value)> canMoveCoordinate = [&](Value value) {
+    if (dominance.dominates(value, contract.getOperation()))
+      return true;
+    if (!checked.insert(value).second)
+      return true;
+    Operation *producer = value.getDefiningOp();
+    return producer && producer->getNumRegions() == 0 &&
+           !isa<FragmentType, RecordType>(value.getType()) &&
+           (isa<arith::ConstantOp, PhysicalExprOp>(producer) ||
+            isPhysicalReplayNode(producer, PhysicalReplayScope::Coordinate,
+                                 /*allowAccesses=*/false)) &&
+           llvm::all_of(producer->getOperands(), canMoveCoordinate);
+  };
+  if (gather.getValid() && !canMoveCoordinate(gather.getValid()))
+    return false;
+  SmallVector<Value> selected(resultType.getShape().size());
+  for (auto [coordinate, axis] : llvm::zip(gather.getCoordinates(), gather.getSourceAxes())) {
+    if (axis < 0 || axis >= static_cast<int64_t>(selected.size()) ||
+        selected[axis] || isa<FragmentType>(coordinate.getType()) ||
+        !canMoveCoordinate(coordinate))
+      return false;
+    selected[axis] = coordinate;
+  }
+  auto isUnit = [](Attribute attribute) {
+    auto extent = cast<PhysicalExprAttr>(attribute);
+    return extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+           extent.getValue() == 1;
+  };
+  SmallVector<SmallVector<unsigned>, 2> resultAxes(2);
+  unsigned nextResultAxis = 0;
+  unsigned side = 0;
+  for (auto [operand, reductions] :
+       {std::pair{contract.getLhs(), contract.getLhsReductionAxes()},
+        std::pair{contract.getRhs(), contract.getRhsReductionAxes()}}) {
+    auto type = cast<FragmentType>(operand.getType());
+    resultAxes[side].resize(type.getShape().size());
+    for (unsigned axis = 0; axis < type.getShape().size(); ++axis) {
+      if (llvm::is_contained(reductions, static_cast<int64_t>(axis)))
+        continue;
+      auto batch = llvm::find(contract.getRhsBatchAxes(), static_cast<int64_t>(axis));
+      if (side == 1 && batch != contract.getRhsBatchAxes().end()) {
+        unsigned pair = std::distance(contract.getRhsBatchAxes().begin(), batch);
+        resultAxes[side][axis] = resultAxes[0][contract.getLhsBatchAxes()[pair]];
+      } else {
+        resultAxes[side][axis] = nextResultAxis++;
+      }
+    }
+    ++side;
+  }
+  PhysicalProgramAnalysis analysis(kernel);
+  side = 0;
+  for (auto [operand, reductions] :
+       {std::pair{contract.getLhs(), contract.getLhsReductionAxes()},
+        std::pair{contract.getRhs(), contract.getRhsReductionAxes()}}) {
+    auto type = cast<FragmentType>(operand.getType());
+    for (unsigned axis = 0; axis < type.getShape().size(); ++axis) {
+      if (llvm::is_contained(reductions, static_cast<int64_t>(axis)))
+        continue;
+      auto mapping = cast<AxisMapAttr>(type.getAxisMaps()[axis]);
+      auto resultMapping = cast<AxisMapAttr>(
+          resultType.getAxisMaps()[resultAxes[side][axis]]);
+      bool pairedRhsBatch = side == 1 && llvm::is_contained(
+          contract.getRhsBatchAxes(), static_cast<int64_t>(axis));
+      if (!pairedRhsBatch &&
+          (mapping.getDimensionId() <= 0 ||
+           mapping.getDimensionId() != resultMapping.getDimensionId()))
+        return false;
+      if (isUnit(type.getShape()[axis]) &&
+          isIntegerConstant(selected[resultAxes[side][axis]], 0))
+        continue;
+      auto roots = analysis.axisRanges(operand, axis);
+      auto range = queryExactLogicalRange(roots);
+      auto occurrences = analysis.rangeAxes(operand, roots.roots);
+      if (failed(range) || !isUnitStepRange(*range) ||
+          !analysis.lockstepRanges(roots.roots).isExact() ||
+          !occurrences.isExact() ||
+          occurrences.fragmentAxes != SmallVector<unsigned>{axis} ||
+          !isIntegerConstant((*range).getStart(), 0) ||
+          !isIntegerConstant((*range).getLogicalStart(), 0) ||
+          !samePhysicalScalarExpression((*range).getExtent(),
+                                        (*range).getLogicalStop()))
+        return false;
+    }
+    ++side;
+  }
+  OpBuilder builder(contract);
+  IRMapping coordinates;
+  std::function<Value(Value)> moveCoordinate = [&](Value value) -> Value {
+    if (Value mapped = coordinates.lookupOrNull(value))
+      return mapped;
+    if (dominance.dominates(value, contract.getOperation()))
+      return value;
+    Operation *producer = value.getDefiningOp();
+    for (Value operand : producer->getOperands())
+      coordinates.map(operand, moveCoordinate(operand));
+    Operation *clone = builder.clone(*producer, coordinates);
+    return clone->getResult(cast<OpResult>(value).getResultNumber());
+  };
+  for (Value &coordinate : selected)
+    coordinate = moveCoordinate(coordinate);
+  Value gatherValidity = gather.getValid() ? moveCoordinate(gather.getValid()) : Value();
+  PhysicalExprAttr unit = expression(kernel.getContext(), PhysicalExprKind::Constant, 1);
+  Value one = builder.create<arith::ConstantIndexOp>(contract.getLoc(), 1);
+  side = 0;
+  SmallVector<Value> operands;
+  for (auto [original, reductions] :
+       {std::pair{contract.getLhs(), contract.getLhsReductionAxes()},
+        std::pair{contract.getRhs(), contract.getRhsReductionAxes()}}) {
+    Value operand = original;
+    auto originalType = cast<FragmentType>(original.getType());
+    for (unsigned axis = 0; axis < originalType.getShape().size(); ++axis) {
+      if (llvm::is_contained(reductions, static_cast<int64_t>(axis)))
+        continue;
+      Value coordinate = selected[resultAxes[side][axis]];
+      if (isUnit(originalType.getShape()[axis]) && isIntegerConstant(coordinate, 0))
+        continue;
+      auto roots = PhysicalProgramAnalysis(kernel).axisRanges(operand, axis);
+      auto authority = queryExactLogicalRange(roots);
+      if (failed(authority))
+        return contract.emitOpError("scalar contraction projection lost its free-axis range");
+      auto mapping = cast<AxisMapAttr>(originalType.getAxisMaps()[axis]);
+      auto coordinateType = fragmentType(kernel.getContext(), builder.getIndexType(),
+                                          {unit}, {mapping}, originalType.getOwner());
+      auto range = builder.create<MakeRangeOp>(
+          contract.getLoc(), coordinateType, coordinate, one, one,
+          (*authority).getLogicalStart(), (*authority).getLogicalStop(),
+          mapping.getSourceId(), mapping.getSourceAxis(), mapping.getDerived());
+      inheritRangeAuthority(range, *authority);
+      IRMapping replay;
+      for (MakeRangeOp root : roots.roots)
+        replay.map(root.getResult(), range.getResult());
+      ReplayMaterializationOptions options;
+      options.fragmentAxis = axis;
+      options.traversalRanges = roots.roots;
+      auto tail = buildRangeTailPredicate(builder, contract.getLoc(), range, *authority);
+      if (failed(tail))
+        return contract.emitOpError("scalar contraction projection has no range validity");
+      options.segmentTail = *tail;
+      if (gatherValidity) {
+        auto valid = materializeValidityConjunction(
+            builder, contract.getLoc(), *tail, gatherValidity, coordinateType);
+        if (failed(valid))
+          return contract.emitOpError("scalar contraction cannot preserve gather validity");
+        options.segmentTail = *valid;
+      }
+      options.materializeZeroFill = true;
+      auto projected = materializeReplayedValue(
+          builder, contract.getLoc(), operand, sourceAxisIdentity(mapping),
+          unit, replay, options);
+      if (failed(projected))
+        return contract.emitOpError("cannot project a scalar contraction input");
+      operand = *projected;
+    }
+    operands.push_back(operand);
+    ++side;
+  }
+  SmallVector<Attribute> shape(resultType.getShape().size(), unit);
+  auto projectedType = FragmentType::get(
+      kernel.getContext(), resultType.getElementType(), builder.getArrayAttr(shape),
+      resultType.getAxisMaps(), resultType.getValidity(), resultType.getOwner());
+  auto accumulator = projectPhysicalValueToSchema(
+      builder, contract.getLoc(), contract.getAccumulator(), projectedType);
+  if (failed(accumulator))
+    return contract.emitOpError("scalar contraction has no uniform accumulator projection");
+  auto projected = builder.create<ContractOp>(
+      contract.getLoc(), projectedType, operands[0], operands[1], *accumulator,
+      contract.getLhsReductionAxes(), contract.getRhsReductionAxes(),
+      contract.getLhsBatchAxes(), contract.getRhsBatchAxes());
+  builder.setInsertionPoint(gather);
+  Value zero = builder.create<arith::ConstantIndexOp>(gather.getLoc(), 0);
+  SmallVector<Value> zeros(selected.size(), zero);
+  auto replacement = builder.create<GatherOp>(
+      gather.getLoc(), gather.getResult().getType(), projected, zeros,
+      gather.getValid(), gather.getFill(), gather.getSourceAxes());
+  gather.getResult().replaceAllUsesWith(replacement.getResult());
+  gather.erase();
+  contract.erase();
+  return true;
+}
+
 } // namespace
 
 LogicalResult orientLoopContractions(ModuleOp module) {
@@ -5012,6 +5254,12 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
   func::FuncOp kernel = *physicalKernel;
   fuseContractionAdds(kernel);
   SmallVector<ContractOp> contracts;
+  kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
+  for (ContractOp contract : contracts)
+    if (failed(projectScalarContractResult(contract)))
+      return failure();
+  eraseDeadPhysicalValues(kernel);
+  contracts.clear();
   kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
   bool collapsed = false;
   for (ContractOp contract : contracts)
