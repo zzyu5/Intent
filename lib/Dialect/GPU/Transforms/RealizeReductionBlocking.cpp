@@ -958,6 +958,14 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
         analysis.axisRanges(source, static_cast<unsigned>(reductionAxis));
     FailureOr<MakeRangeOp> authority =
         queryExactLogicalRange(reductionRanges);
+    if (failed(authority) &&
+        reductionRanges.state != PhysicalFactState::Unknown &&
+        reductionRanges.blockers.empty()) {
+      PhysicalLockstepTraversalFact traversal =
+          analysis.lockstepRanges(reductionRanges.roots);
+      if (traversal.isExact())
+        authority = traversal.authority;
+    }
     if (failed(authority) && reductionRanges.roots.empty()) {
       auto mapping = cast<AxisMapAttr>(
           fragment.getAxisMaps()[static_cast<unsigned>(reductionAxis)]);
@@ -1392,7 +1400,9 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
       }
     }
   }
-  return alignReductionResultRelations(kernel);
+  if (failed(alignReductionResultRelations(kernel)))
+    return failure();
+  return alignReductionIdentityRelations(kernel);
 }
 
 FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &region,
@@ -2072,7 +2082,19 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
               MakeRangeOp range = sourceRange(original);
               PhysicalSourceAxis coordinateSource = accessSource;
               PhysicalExprAttr coordinateExtent = outerSliceExtent;
-              if (range) {
+              ReplayMaterializationOptions coordinateOptions;
+              auto coordinateType = dyn_cast<FragmentType>(original.getType());
+              BroadcastProjection relation =
+                  coordinateType ? queryAxisProjection(coordinateType, sourceType)
+                                 : BroadcastProjection{};
+              if (relation.isExact() &&
+                  relation.targetToSource[access.fragmentAxis]) {
+                unsigned coordinateAxis =
+                    *relation.targetToSource[access.fragmentAxis];
+                coordinateOptions.fragmentAxis = coordinateAxis;
+                coordinateSource = sourceAxisIdentity(cast<AxisMapAttr>(
+                    coordinateType.getAxisMaps()[coordinateAxis]));
+              } else if (range) {
                 auto rangeType = cast<FragmentType>(range.getResult().getType());
                 coordinateSource = sourceAxisIdentity(range);
                 coordinateExtent = cast<PhysicalExprAttr>(rangeType.getShape()[0]);
@@ -2080,7 +2102,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
               }
               FailureOr<Value> replayedCoordinate = materializeReplayedValue(
                   nested, nestedLocation, original, coordinateSource,
-                  coordinateExtent, mapping);
+                  coordinateExtent, mapping, coordinateOptions);
               if (failed(replayedCoordinate)) {
                 bodyFailed = true;
                 failureReason =
@@ -2432,6 +2454,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
       name += ("_F" + Twine(sourcePlans.front().reductionAxis)).str();
     if (reductionRole == ParameterRole::ReductionInner)
       name += "_INNER";
+    else if (reductionRole == ParameterRole::ReductionOuter)
+      name += "_OUTER";
     SmallVector<int64_t> candidates{4,   8,    16,   32,   64,   128, 256,
                                     512, 1024, 2048, 4096, 8192};
     chunk = getOrCreatePhysicalParameter(

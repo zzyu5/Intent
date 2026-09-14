@@ -46,7 +46,33 @@ FailureOr<Value> projectOperand(OpBuilder &builder, ContractOp contract,
         contract.getContext(), source.getElementType(), builder.getArrayAttr(shape),
         builder.getArrayAttr(mappings), source.getValidity(), source.getOwner());
     operand = builder.create<TransposeOp>(contract.getLoc(), transposed, operand, permutation);
+    source = transposed;
   }
+  SmallVector<Attribute> shape(productType.getShape().size(),
+      PhysicalExprAttr::get(contract.getContext(),
+          static_cast<uint32_t>(PhysicalExprKind::Constant), 1,
+          builder.getStringAttr(""), builder.getArrayAttr({})));
+  SmallVector<std::optional<unsigned>> sourceAxes(shape.size());
+  for (auto [axis, originalAxis] : llvm::enumerate(permutation)) {
+    unsigned targetAxis = targetAxes[originalAxis];
+    shape[targetAxis] = source.getShape()[axis];
+    sourceAxes[targetAxis] = axis;
+  }
+  SmallVector<Attribute> groups;
+  for (auto [axis, sourceAxis] : llvm::enumerate(sourceAxes)) {
+    SmallVector<int64_t> inputs;
+    if (sourceAxis)
+      inputs.push_back(*sourceAxis);
+    groups.push_back(ReshapeGroupAttr::get(
+        contract.getContext(), builder.getDenseI64ArrayAttr(inputs),
+        builder.getDenseI64ArrayAttr({static_cast<int64_t>(axis)})));
+  }
+  auto expanded = FragmentType::get(
+      contract.getContext(), source.getElementType(), builder.getArrayAttr(shape),
+      productType.getAxisMaps(), source.getValidity(), source.getOwner());
+  if (expanded != source)
+    operand = builder.create<ReshapeOp>(contract.getLoc(), expanded, operand,
+                                        builder.getArrayAttr(groups));
   return materializeBroadcastToFragment(builder, contract.getLoc(), operand, productType);
 }
 

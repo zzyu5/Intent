@@ -909,6 +909,10 @@ FailureOr<Value> projectPhysicalValueToSchema(OpBuilder &builder,
   return projected.getResult();
 }
 
+FailureOr<FragmentType> refinePhysicalSchema(func::FuncOp kernel,
+                                             FragmentType target,
+                                             ValueRange contributors);
+
 LogicalResult alignReductionResultRelations(func::FuncOp kernel) {
   WalkResult result = kernel.walk([&](Operation *operation) {
     SmallVector<Value> sources;
@@ -932,6 +936,34 @@ LogicalResult alignReductionResultRelations(func::FuncOp kernel) {
     }
     if (sources.size() != results.size())
       return WalkResult::interrupt();
+    for (auto [index, source] : llvm::enumerate(sources)) {
+      auto sourceType = dyn_cast<FragmentType>(source.getType());
+      if (!sourceType || llvm::all_of(sources, [&](Value other) {
+            auto type = dyn_cast<FragmentType>(other.getType());
+            return type && type.getShape() == sourceType.getShape();
+          }))
+        continue;
+      FailureOr<FragmentType> refined =
+          refinePhysicalSchema(kernel, sourceType, sources);
+      if (failed(refined)) {
+        operation->emitOpError(
+            "tuple reduction sources have no common physical extent relation");
+        return WalkResult::interrupt();
+      }
+      auto target = FragmentType::get(
+          kernel.getContext(), sourceType.getElementType(), (*refined).getShape(),
+          sourceType.getAxisMaps(), sourceType.getValidity(), sourceType.getOwner());
+      OpBuilder builder(operation);
+      FailureOr<Value> projected = projectPhysicalValueToSchema(
+          builder, operation->getLoc(), source, target);
+      if (failed(projected)) {
+        operation->emitOpError(
+            "tuple reduction source cannot adopt its physical extent relation");
+        return WalkResult::interrupt();
+      }
+      operation->setOperand(index, *projected);
+      sources[index] = *projected;
+    }
     for (auto [source, currentResult] : llvm::zip_equal(sources, results)) {
       if (scan) {
         currentResult.setType(source.getType());
@@ -1680,6 +1712,31 @@ FailureOr<Value> materializeReplayedValue(
         return failure();
       cloneMapping.map(operand, *replayed);
     }
+    FragmentType pointwiseType;
+    if (isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp>(producer)) {
+      SmallVector<Value> operands;
+      for (Value operand : producer->getOperands())
+        operands.push_back(cloneMapping.lookupOrDefault(operand));
+      auto refined = refinePhysicalSchema(
+          kernel, replaceReplayAxis(fragment, axis), operands);
+      if (failed(refined))
+        return failure();
+      pointwiseType = *refined;
+      for (Value operand : producer->getOperands()) {
+        Value replayed = cloneMapping.lookupOrDefault(operand);
+        Type element = replayed.getType();
+        if (auto type = dyn_cast<FragmentType>(element))
+          element = type.getElementType();
+        auto target = FragmentType::get(
+            kernel.getContext(), element, pointwiseType.getShape(),
+            pointwiseType.getAxisMaps(), pointwiseType.getValidity(),
+            pointwiseType.getOwner());
+        auto projected = projectPhysicalValueToSchema(builder, location, replayed, target);
+        if (failed(projected))
+          return failure();
+        cloneMapping.map(operand, *projected);
+      }
+    }
     Operation *clone = builder.clone(*producer, cloneMapping);
     bool structuredResults = isa<ReduceOp, ScanOp>(clone);
     for (auto [original, cloned] :
@@ -1717,7 +1774,9 @@ FailureOr<Value> materializeReplayedValue(
                                        static_cast<int64_t>(axis));
            }));
     }
-    if (!introducedUnitAxis)
+    if (pointwiseType)
+      clonedValue.setType(pointwiseType);
+    else if (!introducedUnitAxis)
       clonedValue.setType(replaceReplayAxis(clonedType, axis));
     remember(current, clonedValue, projection);
     return clonedValue;
@@ -2959,37 +3018,6 @@ static void retargetExtent(Value root, AxisSelector selects,
         }
       }
     }
-    Operation *definition = value.getDefiningOp();
-    if (isa_and_nonnull<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp,
-                        BitcastOp, ReshapeOp, LoadOp>(definition)) {
-      worklist.append(definition->getOperands().begin(),
-                      definition->getOperands().end());
-    } else if (auto broadcast = dyn_cast_or_null<BroadcastOp>(definition)) {
-      auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
-      auto result = dyn_cast<FragmentType>(broadcast.getResult().getType());
-      bool preserves = false;
-      if (source && result) {
-        BroadcastProjection projection = queryAxisProjection(source, result);
-        if (projection.isExact())
-          for (auto [targetAxis, sourceAxis] :
-               llvm::enumerate(projection.targetToSource)) {
-            if (!sourceAxis ||
-                !selects(
-                    cast<AxisMapAttr>(result.getAxisMaps()[targetAxis])))
-              continue;
-            auto sourceExtent =
-                cast<PhysicalExprAttr>(source.getShape()[*sourceAxis]);
-            bool expandsSingleton =
-                sourceExtent.getKind() ==
-                    static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-                sourceExtent.getValue() == 1 &&
-                source.getShape()[*sourceAxis] != result.getShape()[targetAxis];
-            preserves |= !expandsSingleton;
-          }
-      }
-      if (preserves)
-        worklist.push_back(broadcast.getValue());
-    }
     // Product fields and structured helper arguments are part of the same
     // physical value flow even though MLIR does not connect them with ordinary
     // result uses.  A blocking decision for one provenance axis must cross
@@ -3089,7 +3117,6 @@ static void retargetExtent(Value root, AxisSelector selects,
               ScanOp, RandomBitsOp,
               ScatterReduceOp, AtomicStoreOp, AtomicRMWOp,
               AtomicCompareExchangeOp>(user)) {
-        worklist.append(user->getOperands().begin(), user->getOperands().end());
         for (Region &region : user->getRegions())
           for (Block &block : region)
             for (BlockArgument argument : block.getArguments())
@@ -3306,21 +3333,28 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
       currentExtent.getValue() == *staticDimension &&
       llvm::isPowerOf2_64(*staticDimension))
     return success();
-  if (!runtimeDimension && !subregion) {
+  if (!runtimeDimension) {
     FailureOr<MakeRangeOp> authority = queryExactLogicalRange(ranges);
     PhysicalExprAttr start = succeeded(authority)
                                 ? queryNonNegativeIndexUpperBound(
                                       (*authority).getLogicalStart())
                                 : PhysicalExprAttr();
+    PhysicalExprAttr end = succeeded(authority)
+                               ? queryLaunchExpression((*authority).getLogicalStop())
+                               : PhysicalExprAttr();
+    std::optional<int64_t> stop =
+        end ? constantPhysicalExpression(end) : std::nullopt;
+    bool staticSubregionBound = subregion && stop && *stop >= 0;
     if (start &&
         start.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-        start.getValue() == 0 &&
-        queryLaunchExpression((*authority).getLogicalStop()))
+        (start.getValue() == 0 || staticSubregionBound) &&
+        end)
       runtimeDimension = (*authority).getLogicalStop();
   }
   if (!runtimeDimension)
-    return kernel.emitError(
-        "full-coverage physicalization has no runtime or static dimension authority");
+    return emitError(source.getLoc(),
+                     "full-coverage physicalization has no runtime or static dimension authority")
+           << "; dimension=" << dimension << "; source=" << source;
   PhysicalExprAttr coverageBound = queryLaunchExpression(runtimeDimension);
   if (!coverageBound)
     return kernel.emitError(

@@ -3517,14 +3517,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     if (PhysicalProgramAnalysis(kernel)
             .axisRealization(range.getResult(), 0)
             .constructionScalarSeed) {
-      bool launchVisible = false;
-      if (FailureOr<uint64_t> dimension = ownershipDimension(kernel, range);
-          succeeded(dimension))
-        launchVisible = succeeded(dimensionArgument(kernel, *dimension));
-      if (ownershipOnly || launchVisible) {
-        dynamicRanges.push_back(range);
-        return;
-      }
+      dynamicRanges.push_back(range);
+      return;
     }
     if (!ownershipOnly ||
         !range.getExtent().getDefiningOp<arith::ConstantIndexOp>())

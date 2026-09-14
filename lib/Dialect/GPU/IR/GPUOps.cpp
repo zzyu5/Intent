@@ -198,9 +198,20 @@ LogicalResult verifyAccessAxisExtents(Operation *owner, Type payload,
         if (!sameSource)
           continue;
         if (payloadMapping.getDimensionId() !=
-            coordinateMapping.getDimensionId())
+            coordinateMapping.getDimensionId()) {
+          bool anotherOccurrence = llvm::any_of(
+              fragment.getAxisMaps(), [&](Attribute attribute) {
+                auto other = cast<AxisMapAttr>(attribute);
+                return other.getSourceId() == coordinateMapping.getSourceId() &&
+                       other.getSourceAxis() == coordinateMapping.getSourceAxis() &&
+                       other.getDerived() == coordinateMapping.getDerived() &&
+                       other.getDimensionId() == coordinateMapping.getDimensionId();
+              });
+          if (anotherOccurrence)
+            continue;
           return owner->emitOpError(
               "access payload and coordinate disagree on logical dimension");
+        }
         Attribute extent = coordinateType.getShape()[coordinateAxis];
         if (coordinateExtent && *coordinateExtent != extent)
           return owner->emitOpError(

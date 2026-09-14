@@ -392,7 +392,7 @@ bool derivesFromAccessCoordinate(Value value, Value coordinate) {
     return true;
   value = stripIntegerIndexCasts(value);
   coordinate = stripIntegerIndexCasts(coordinate);
-  if (value == coordinate)
+  if (sameScalarExpression(value, coordinate))
     return true;
   auto valueRange = value.getDefiningOp<MakeRangeOp>();
   auto coordinateRange = coordinate.getDefiningOp<MakeRangeOp>();
@@ -1187,6 +1187,15 @@ bool isProvablySingletonLogicalRange(MakeRangeOp range) {
           sameScalarExpression(add.getLhs(), range.getStep()));
 }
 
+bool isProgramCoordinateRange(MakeRangeOp range) {
+  auto coordinate = range.getStart().getDefiningOp<WorksetCoordinateOp>();
+  return coordinate && range->hasAttr(worksetCoordinateRangeAttr) &&
+         coordinate.getSourceId() == range.getSourceId() &&
+         coordinate.getSourceAxis() == range.getSourceAxis() &&
+         !range.getDerived() &&
+         sameScalarExpression(coordinate.getStep(), range.getStep());
+}
+
 std::optional<BinaryOperator> queryBinaryCombineKind(Region &region) {
   if (!llvm::hasSingleElement(region))
     return std::nullopt;
@@ -1757,25 +1766,37 @@ bool sameLogicalRange(MakeRangeOp lhs, MakeRangeOp rhs) {
       lhs.getSourceAxis() != rhs.getSourceAxis() ||
       lhs.getDerived() != rhs.getDerived())
     return false;
-  return sameScalarExpression(lhs.getLogicalStart(), rhs.getLogicalStart()) &&
-         sameScalarExpression(lhs.getLogicalStop(), rhs.getLogicalStop()) &&
-         sameScalarExpression(lhs.getStep(), rhs.getStep());
+  return samePhysicalScalarExpression(lhs.getLogicalStart(), rhs.getLogicalStart()) &&
+         samePhysicalScalarExpression(lhs.getLogicalStop(), rhs.getLogicalStop()) &&
+         samePhysicalScalarExpression(lhs.getStep(), rhs.getStep());
 }
 
 bool canReplayReadAt(LoadOp load, Operation *insertionAnchor) {
   if (!load || !insertionAnchor)
     return false;
-  auto readOnly = [](Operation *operation) {
-    return !operation->walk([](Operation *nested) {
+  auto preservesRead = [&](Operation *operation) {
+    return !operation->walk([&](Operation *nested) {
       if (isa<LoadOp, GatherOp, scf::ForOp, scf::IfOp, scf::WhileOp>(nested) ||
           isMemoryEffectFree(nested))
         return WalkResult::advance();
+      Value written = accessResource(nested);
+      if (written && written != load.getResource()) {
+        auto readBuffer = dyn_cast<BufferType>(load.getResource().getType());
+        auto writtenBuffer = dyn_cast<BufferType>(written.getType());
+        bool privateAllocation =
+            (readBuffer && isa<ViewType>(written.getType())) ||
+            (writtenBuffer && isa<ViewType>(load.getResource().getType())) ||
+            (readBuffer && writtenBuffer &&
+             readBuffer.getInstance() != writtenBuffer.getInstance());
+        if (privateAllocation && isa<StoreOp>(nested))
+          return WalkResult::advance();
+      }
       return WalkResult::interrupt();
     }).wasInterrupted();
   };
   Operation *ancestor = insertionAnchor;
   while (ancestor && ancestor->getBlock() != load->getBlock()) {
-    if (!readOnly(ancestor))
+    if (!preservesRead(ancestor))
       return false;
     ancestor = ancestor->getParentOp();
   }
@@ -1784,11 +1805,11 @@ bool canReplayReadAt(LoadOp load, Operation *insertionAnchor) {
     return false;
   // Entering a loop can repeat this read after writes from an earlier
   // iteration, even when the first insertion point precedes those writes.
-  if (ancestor != insertionAnchor && !readOnly(ancestor))
+  if (ancestor != insertionAnchor && !preservesRead(ancestor))
     return false;
   for (Operation *next = load->getNextNode(); next != ancestor;
        next = next->getNextNode())
-    if (!readOnly(next))
+    if (!preservesRead(next))
       return false;
   return true;
 }
@@ -2702,6 +2723,24 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
 
   if (auto argument = dyn_cast<BlockArgument>(value)) {
     Operation *owner = argument.getOwner()->getParentOp();
+    if (auto loop = dyn_cast_or_null<scf::ForOp>(owner);
+        loop && argument.getOwner() == loop.getBody() &&
+        argument.getArgNumber() > 0) {
+      Value initial = loop.getInitArgs()[argument.getArgNumber() - 1];
+      if (initial.getType() == fragment) {
+        PhysicalAxisRealizationFact input =
+            axisRealization(initial, fragmentAxis);
+        if (input.hasExtentAuthority()) {
+          result.state = PhysicalFactState::Exact;
+          result.physicalized = input.physicalized;
+          result.constructionScalarSeed = input.constructionScalarSeed;
+          result.roots = input.roots;
+          result.extentAuthority =
+              PhysicalAxisRealizationFact::ExtentAuthority::Structural;
+          return result;
+        }
+      }
+    }
     auto isSegmentSource = [&](uint64_t sourceCount, uint64_t axis,
                                Block &region) {
       return argument.getOwner() == &region &&
@@ -2753,6 +2792,34 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
     }
   }
 
+  if (Operation *producer = value.getDefiningOp();
+      isa_and_nonnull<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp>(producer)) {
+    for (Value operand : producer->getOperands()) {
+      auto source = dyn_cast<FragmentType>(operand.getType());
+      if (!source)
+        continue;
+      BroadcastProjection projection = queryAxisProjection(source, fragment);
+      if (!projection.isExact() || !projection.targetToSource[fragmentAxis])
+        continue;
+      unsigned sourceAxis = *projection.targetToSource[fragmentAxis];
+      if (source.getShape()[sourceAxis] != extent)
+        continue;
+      PhysicalAxisRealizationFact input = axisRealization(operand, sourceAxis);
+      bool introducedUnit =
+          extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          extent.getValue() == 1 && input.roots.empty();
+      if (input.hasExtentAuthority() && input.physicalized &&
+          !input.constructionScalarSeed && !introducedUnit) {
+        result.state = PhysicalFactState::Exact;
+        result.physicalized = true;
+        result.roots = input.roots;
+        result.extentAuthority =
+            PhysicalAxisRealizationFact::ExtentAuthority::Structural;
+        return result;
+      }
+    }
+  }
+
   if (auto loop = value.getDefiningOp<scf::ForOp>()) {
     auto reductions = loop->getAttrOfType<ArrayAttr>(reductionSourcesAttr);
     auto opResult = dyn_cast<OpResult>(value);
@@ -2776,7 +2843,12 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
       bool physicalExtent =
           kind != PhysicalExprKind::Dimension &&
           kind != PhysicalExprKind::ScalarABI &&
-          !(kind == PhysicalExprKind::Constant && extent.getValue() == 1);
+          (!(kind == PhysicalExprKind::Constant && extent.getValue() == 1) ||
+           (!provenance.roots.empty() &&
+            llvm::all_of(provenance.roots, [](MakeRangeOp range) {
+              return isProvablySingletonLogicalRange(range) ||
+                     isProgramCoordinateRange(range);
+            })));
       bool exactYield = provenance.isExact() && !provenance.roots.empty() &&
                         llvm::all_of(provenance.roots, [&](MakeRangeOp range) {
                           FailureOr<int64_t> dimension =
@@ -2884,6 +2956,7 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
           extent.getValue() == 1 && !ranges.roots.empty() &&
           llvm::any_of(ranges.roots, [](MakeRangeOp range) {
             return !isProvablySingletonLogicalRange(range) &&
+                   !isProgramCoordinateRange(range) &&
                    samePhysicalScalarExpression(range.getStart(),
                                                 range.getLogicalStart());
           });
@@ -2908,6 +2981,7 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
       extent.getValue() == 1 && !ranges.roots.empty() &&
       llvm::any_of(ranges.roots, [](MakeRangeOp range) {
         return !isProvablySingletonLogicalRange(range) &&
+               !isProgramCoordinateRange(range) &&
                samePhysicalScalarExpression(range.getStart(),
                                             range.getLogicalStart());
       });
