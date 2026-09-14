@@ -5,9 +5,6 @@
   "benchmark_seconds": 300,
   "max_tuning_configurations": 16,
   "input_seed": 0,
-  "reference_corrections": {
-    "sub_gelu": "sub_gelu_standard_gelu"
-  },
   "prompt_entry_overrides": {
     "31": {"entry": "mean", "reason": "The mean description omits its function name and starts with input (Tensor)."},
     "141": {"entry": "solve", "reason": "The linear solve description gives argument names but omits its function name."},
@@ -61,7 +58,7 @@
     {"id": "add_gelu", "family": "fusion", "input_index": 8, "tolerance": "fp16"},
     {"id": "mul_relu", "family": "fusion", "input_index": 8, "tolerance": "fp32"},
     {"id": "mul_sub", "family": "fusion", "input_index": 8, "tolerance": "fp32"},
-    {"id": "sub_gelu", "family": "fusion", "input_index": 8, "tolerance": "fp32"},
+    {"id": "sub_gelu", "family": "fusion", "input_index": 8, "tolerance": "fp32", "description": "Compute z = input - alpha * other. Follow the original reference: when approximate is not 'tanh', return 0.5 * z * erf(z / sqrt(2)), without an added 1 in the erf factor. For approximate='tanh', use 0.5 * z * (1 + tanh(sqrt(2/pi) * (z + 0.044715*z^3))). Preserve optional out behavior."},
     {"id": "relu_conv2d", "family": "fusion", "input_index": 3, "tolerance": "fp32"},
     {"id": "gelu_conv2d", "family": "fusion", "input_index": 4, "tolerance": "fp32"},
     {"id": "conv2d_add", "family": "fusion", "input_index": 0, "tolerance": "fp32", "note": "Original smallest spatial profile; no additional input matrix."},
