@@ -225,7 +225,7 @@ combine(identity, x) == combine(x, identity) == x
 
 其中`A`、`B`是相邻source slices。Combine保持logical order但允许任意parenthesization。Empty source返回identity；physical tail或padding也可以安全使用identity，因此不能把在combine中产生NaN的sentinel冒充identity。需要区分“没有成员”时，summary显式携带bool validity或等价typed状态。
 
-Ordinary reduce与region fold可复用summary schema和pure helper机制，但前者允许重排，后者保留slice order，不能无条件互换。只有region summarizer本身是使用同一combine的ordinary reduce、因而已经声明相同的结合交换合同时，frontend才可将该region fold canonicalize为ordinary reduce；不能仅凭相同shape、combine body或最终result取消有序合同。
+`region_fold`依据作者定义的`summarize`、`combine`与`identity`，lower成分段遍历、段内计算和跨段摘要合并。Summarizer内部已有的reduce、scan、contract等操作继续按各自语义lowering。
 
 ### 9.2 Region scan
 
