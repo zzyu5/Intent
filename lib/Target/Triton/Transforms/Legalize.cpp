@@ -1659,35 +1659,6 @@ bool isAddCombine(gpu::ScatterReduceOp scatter) {
          BinaryOperator::Add;
 }
 
-bool hasExactCommutativeCombine(gpu::ReduceOp reduce) {
-  if (reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 ||
-      reduce.getCaptureCount() != 0 || reduce.getResults().size() != 1 ||
-      reduce.getCombine().empty() || reduce.getCombine().getBlocks().size() != 1)
-    return false;
-  std::optional<BinaryOperator> combine =
-      gpu::queryBinaryCombineKind(reduce.getCombine());
-  if (!combine)
-    return false;
-  auto source = dyn_cast<gpu::FragmentType>(reduce.getInputs().front().getType());
-  if (!source)
-    return false;
-  // These min/max operations preserve NaNs and distinguish the signs of zero.
-  if (*combine == BinaryOperator::Maximum || *combine == BinaryOperator::Minimum)
-    return true;
-  if (!isa<IntegerType, IndexType>(source.getElementType()))
-    return false;
-  switch (*combine) {
-  case BinaryOperator::Add:
-  case BinaryOperator::Multiply:
-  case BinaryOperator::BitwiseAnd:
-  case BinaryOperator::BitwiseOr:
-  case BinaryOperator::BitwiseXor:
-    return true;
-  default:
-    return false;
-  }
-}
-
 LogicalResult legalizeContractShapes(func::FuncOp kernel) {
   auto [nextSource, nextDimension] = gpu::nextPhysicalAxisIdentities(kernel);
   SmallVector<gpu::ContractOp> contracts;
@@ -2060,138 +2031,6 @@ Type scalarCallbackType(Type type) {
   return type;
 }
 
-Value broadcastCollectiveAxes(OpBuilder &builder, Location location, Value value,
-                              gpu::FragmentType target,
-                              ArrayRef<int64_t> targetAxes) {
-  if (value.getType() == target)
-    return value;
-  if (auto source = dyn_cast<gpu::FragmentType>(value.getType())) {
-    auto one = gpu::PhysicalExprAttr::get(
-        builder.getContext(),
-        static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), 1,
-        builder.getStringAttr(""), builder.getArrayAttr({}));
-    SmallVector<Attribute> shape(target.getShape().size(), one);
-    for (auto [axis, extent] : llvm::zip(targetAxes, source.getShape()))
-      shape[axis] = extent;
-    auto expanded = gpu::FragmentType::get(
-        builder.getContext(), source.getElementType(), builder.getArrayAttr(shape),
-        target.getAxisMaps(), source.getValidity(), source.getOwner());
-    SmallVector<int64_t> from, to;
-    for (unsigned axis = 0; axis < source.getShape().size(); ++axis)
-      from.push_back(axis);
-    for (unsigned axis = 0; axis < target.getShape().size(); ++axis)
-      to.push_back(axis);
-    auto group = gpu::ReshapeGroupAttr::get(
-        builder.getContext(), builder.getDenseI64ArrayAttr(from),
-        builder.getDenseI64ArrayAttr(to));
-    value = builder.create<gpu::ReshapeOp>(
-        location, expanded, value, builder.getArrayAttr({group}));
-  }
-  return builder.create<gpu::BroadcastOp>(location, target, value);
-}
-
-SmallVector<Value> extractScanTerminal(OpBuilder &builder, ScanOp scan,
-                                      TypeRange resultTypes) {
-  Location location = scan.getLoc();
-  SmallVector<Value> sources, identities;
-  SmallVector<Type> bitResultTypes, bitElementTypes;
-  for (auto [scanned, resultType] : llvm::zip(scan.getOutputs(), resultTypes)) {
-    auto source = cast<gpu::FragmentType>(scanned.getType());
-    unsigned axis = scan.getAxis();
-    auto extent = cast<gpu::PhysicalExprAttr>(source.getShape()[axis]);
-    auto mapping = cast<gpu::AxisMapAttr>(source.getAxisMaps()[axis]);
-    auto rangeType = gpu::FragmentType::get(
-        builder.getContext(), builder.getIndexType(),
-        builder.getArrayAttr({extent}),
-        builder.getArrayAttr({gpu::AxisMapAttr::get(
-            builder.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-            mapping.getDimensionId(), 0, mapping.getDerived())}),
-        source.getValidity(), source.getOwner());
-    auto withElement = [&](Type type, Type element) -> Type {
-      if (auto fragment = dyn_cast<gpu::FragmentType>(type))
-        return gpu::FragmentType::get(
-            builder.getContext(), element, fragment.getShape(),
-            fragment.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
-      return element;
-    };
-    Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
-    Value one = builder.create<arith::ConstantIndexOp>(location, 1);
-    Value count = builder.create<gpu::PhysicalExprOp>(
-        location, builder.getIndexType(), extent);
-    Value positions = builder.create<gpu::MakeRangeOp>(
-        location, rangeType, zero, count, one, zero, count,
-        mapping.getSourceId(), mapping.getSourceAxis(), mapping.getDerived());
-    Value last = builder.create<gpu::BinaryOp>(
-        location, builder.getIndexType(), count, one, BinaryOperator::Subtract);
-    Value lastRange = builder.create<gpu::BroadcastOp>(location, rangeType, last);
-    Value terminal = builder.create<gpu::CompareOp>(
-        location, withElement(rangeType, builder.getI1Type()), positions,
-        lastRange, ComparePredicate::Eq);
-    Type predicateType = withElement(source, builder.getI1Type());
-    if (terminal.getType() != predicateType)
-      terminal = broadcastCollectiveAxes(
-          builder, location, terminal, cast<gpu::FragmentType>(predicateType),
-          {static_cast<int64_t>(axis)});
-
-    Type element = source.getElementType();
-    unsigned width = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
-    Type bits = builder.getIntegerType(width);
-    Type bitSource = withElement(source, bits);
-    Type bitResult = withElement(resultType, bits);
-    Value sourceBits = element.isIndex()
-                           ? Value(builder.create<gpu::CastOp>(
-                                 location, bitSource, scanned))
-                           : Value(builder.create<gpu::BitcastOp>(
-                                 location, bitSource, scanned));
-    Value bitZero = builder.create<arith::ConstantOp>(
-        location, builder.getIntegerAttr(bits, 0));
-    Value zeroSource = builder.create<gpu::BroadcastOp>(
-        location, cast<gpu::FragmentType>(bitSource), bitZero);
-    sources.push_back(builder.create<gpu::SelectOp>(
-        location, bitSource, terminal, sourceBits, zeroSource));
-    Value identity = bitZero;
-    if (auto fragment = dyn_cast<gpu::FragmentType>(bitResult))
-      identity = builder.create<gpu::BroadcastOp>(location, fragment, bitZero);
-    identities.push_back(identity);
-    bitResultTypes.push_back(bitResult);
-    bitElementTypes.push_back(bits);
-  }
-
-  // Exactly one element contributes, so integer OR preserves its full bit pattern.
-  OperationState state(location, ReduceOp::getOperationName());
-  state.addOperands(sources);
-  state.addOperands(identities);
-  state.addTypes(bitResultTypes);
-  state.addAttribute("source_count", builder.getI64IntegerAttr(sources.size()));
-  state.addAttribute("axis", builder.getI64IntegerAttr(scan.getAxis()));
-  state.addAttribute("reverse", builder.getBoolAttr(false));
-  state.addRegion();
-  auto selected = cast<ReduceOp>(builder.create(state));
-  {
-    OpBuilder::InsertionGuard guard(builder);
-    Block *body = new Block();
-    selected.getCombine().push_back(body);
-    for (unsigned side = 0; side < 2; ++side)
-      for (Type element : bitElementTypes)
-        body->addArgument(element, location);
-    builder.setInsertionPointToEnd(body);
-    SmallVector<Value> values;
-    for (unsigned i = 0; i < sources.size(); ++i)
-      values.push_back(builder.create<gpu::BinaryOp>(
-          location, bitElementTypes[i], body->getArgument(i),
-          body->getArgument(sources.size() + i), BinaryOperator::BitwiseOr));
-    builder.create<gpu::YieldOp>(location, values);
-  }
-  SmallVector<Value> results;
-  for (auto [value, type] : llvm::zip(selected.getOutputs(), resultTypes))
-    results.push_back(elementType(type).isIndex()
-                          ? Value(builder.create<gpu::CastOp>(
-                                location, type, value))
-                          : Value(builder.create<gpu::BitcastOp>(
-                                location, type, value)));
-  return results;
-}
-
 LogicalResult legalizeCollectiveCallbacks(func::FuncOp kernel) {
   SmallVector<Operation *> collectives;
   kernel.walk([&](Operation *operation) {
@@ -2202,7 +2041,6 @@ LogicalResult legalizeCollectiveCallbacks(func::FuncOp kernel) {
     auto reduce = dyn_cast<gpu::ReduceOp>(operation);
     auto scan = dyn_cast<gpu::ScanOp>(operation);
     unsigned count = reduce ? reduce.getSourceCount() : scan.getSourceCount();
-    bool ordered = reduce && !hasExactCommutativeCombine(reduce);
     if ((reduce && (reduce.getAxes().size() != 1 || reduce.getCaptureCount())) ||
         (scan && (!scan.getInclusive() || scan.getCaptureCount())))
       return operation->emitOpError("native collective requires one axis and an inclusive, capture-free callback");
@@ -2231,28 +2069,10 @@ LogicalResult legalizeCollectiveCallbacks(func::FuncOp kernel) {
       }
     }
     OpBuilder builder(operation);
-    OperationState state(operation->getLoc(), ordered || scan
-                                                 ? ScanOp::getOperationName()
-                                                 : ReduceOp::getOperationName());
-    if (ordered) {
-      ValueRange sources = operation->getOperands().take_front(count);
-      state.addOperands(sources);
-      state.addTypes(sources.getTypes());
-      for (unsigned i = 0; i < count; ++i) {
-        auto source = cast<gpu::FragmentType>(sources[i].getType());
-        SmallVector<int64_t> freeAxes;
-        for (unsigned axis = 0; axis < source.getShape().size(); ++axis)
-          if (axis != reduce.getAxes().front())
-            freeAxes.push_back(axis);
-        Value identity = broadcastCollectiveAxes(
-            builder, operation->getLoc(), operation->getOperand(count + i),
-            source, freeAxes);
-        state.addOperands(identity);
-      }
-    } else {
-      state.addOperands(operation->getOperands());
-      state.addTypes(operation->getResultTypes());
-    }
+    OperationState state(operation->getLoc(), reduce ? ReduceOp::getOperationName()
+                                                    : ScanOp::getOperationName());
+    state.addOperands(operation->getOperands());
+    state.addTypes(operation->getResultTypes());
     state.addAttribute("source_count", builder.getI64IntegerAttr(count));
     state.addAttribute("axis", builder.getI64IntegerAttr(reduce ? reduce.getAxes().front() : scan.getAxis()));
     state.addAttribute("reverse", builder.getBoolAttr(scan && scan.getReverse()));
@@ -2274,12 +2094,7 @@ LogicalResult legalizeCollectiveCallbacks(func::FuncOp kernel) {
       for (Value result : cloned->getResults())
         result.setType(scalarCallbackType(result.getType()));
     }
-    builder.setInsertionPointAfter(native);
-    if (ordered)
-      operation->replaceAllUsesWith(extractScanTerminal(
-          builder, cast<ScanOp>(native), operation->getResultTypes()));
-    else
-      operation->replaceAllUsesWith(native->getResults());
+    operation->replaceAllUsesWith(native->getResults());
     operation->erase();
   }
   return success();
