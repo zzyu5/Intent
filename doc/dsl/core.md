@@ -67,7 +67,7 @@ pointwise surface允许scalar与size-one broadcast；frontend必须将其归一�
 
 Floating division可使用具名入口 `I.fdiv(lhs, rhs, *, approximate=False, flush_to_zero=False)`，默认与普通 `/` 相同。`I.exp2(value, *, approximate=False, flush_to_zero=False)` 与 `I.tanh(value, *, approximate=False)` 允许作者逐操作显式选择近似数学。选项是硬件无关的 constexpr bool；非默认模式只接受 `f32`，FTZ 必须与 `approximate=True` 一起选择。它们归一到同一 canonical binary/unary operation 的数值属性，不产生另一套算法、全局 fast-math 环境或 target query；具体精度与特殊值规则见数值章节。
 
-`reshape` 保持logical row-major element order与元素总数；`transpose/permute` 显式给出axis permutation。
+`reshape` 保持logical row-major element order与元素总数；`transpose/permute` 的axis permutation必须与输入rank等长，包含`0..rank-1`的每个axis且仅一次。`transpose`省略permutation时反转全部axis顺序。
 
 Ranked tensor与external view暴露`.shape`，返回保留dynamic-extent identity的logical extent tuple。Scalar、tuple、record与domain/subregion本身没有统一`.shape`。`.shape`可用于shape arithmetic、domain、shape transform和tensor construction，不表示physical fragment或block shape。
 
@@ -76,7 +76,7 @@ mask = I.full(scores.shape, fill=True, dtype=I.bool)
 zeros = I.full((M, N), fill=0.0, dtype=I.f32)
 ```
 
-`I.full(shape, fill, dtype=...)`产生无effect、无alias的ranked tensor SSA value。`shape`的每一维是非负logical extent，可为静态值或保留identity的runtime shape value；`fill`是按显式`dtype`实例化并广播到所有logical elements的scalar。它不分配logical buffer、不初始化external view，也不携带storage/layout/padding。`I.zeros(shape,dtype)`是`I.full(shape, fill=0, dtype=dtype)`的surface shorthand。
+`I.full(shape, fill, dtype=...)`产生无effect、无alias的ranked tensor SSA value。`shape`的每一维是非负logical extent，可为静态值或保留identity的runtime shape value；`fill`是按显式`dtype`实例化并广播到所有logical elements的scalar。空shape `()`构造rank-0 tensor，可用于显式统一scalar与rank-0 tensor的分支或carry schema。它不分配logical buffer、不初始化external view，也不携带storage/layout/padding。`I.zeros(shape,dtype)`是`I.full(shape, fill=0, dtype=dtype)`的surface shorthand。
 
 `join` 只表示两个同dtype、同shape values沿新的trailing logical axis堆叠：
 

@@ -98,7 +98,7 @@
     {"id":"fused_masked_select_add_gelu","family":"fusion","input_index":8,"tolerance":"fp32","timing":"cuda_event"},
     {"id":"fused_pairwise_distance_adaptive_avg_pool2d","family":"fusion","input_index":1,"tolerance":"fp32"},
     {"id":"fused_add_mul_groupnorm","family":"fusion","input_index":0,"tolerance":"fp32"},
-    {"id":"relu_batch_norm_conv2d","family":"fusion","input_index":0,"tolerance":"fp32"},
+    {"id":"relu_batch_norm_conv2d","family":"fusion","input_index":0,"tolerance":"fp32","description":"Apply conv2d with the supplied convolution parameters, followed by batch normalization and ReLU. For the fixed invocation with training=False, normalize using the supplied running_mean and running_var and eps, then apply bn_weight and bn_bias. Do not compute batch statistics or update running statistics. Preserve the original output shape and dtype."},
     {"id":"normalized_cosine_similarity","family":"fusion","input_index":0,"tolerance":"fp32"},
     {"id":"fused_cross_entropy_log_softmax","family":"fusion","input_index":0,"tolerance":"fp32"},
     {"id":"sigmoid_adaptive_avg_pool2d","family":"fusion","input_index":1,"tolerance":"fp32"},
