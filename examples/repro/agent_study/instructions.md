@@ -3,10 +3,12 @@ given task correctly and efficiently for the supplied, fixed invocation profile.
 This is forward execution, not autograd. Do not change the task, dtype, output
 structure, numerical tolerance, or observable out/alias behavior.
 
-Read TASK.md and the provided language materials. For Intent, query the
-intent_manual MCP: search concepts, api for signatures/return schemas, read for
-syntax, type and callable interface rules. Consult the manual before writing
-code; it does not execute programs or provide task answers. Write candidate.py containing
+Read TASK.md and the provided language materials. For Intent, first call
+intent_manual.read(id="doc/dsl/authoring.md") for the language and host interface
+rules. Use api for declarations and signatures, then read the returned rule IDs
+for return shapes, dtypes and semantics; api does not infer your program's result
+schema. Consult the manual before writing code; it does not execute programs or
+provide task answers. Write candidate.py containing
 build(context), which returns a callable with the task's original wrapper
 signature. The evaluator calls build once outside timing, then calls that wrapper
 with the documented inputs. Multiple kernels and explicit host composition are
