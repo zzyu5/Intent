@@ -163,7 +163,7 @@ I.reduce.all(value, *, axis)
 
 它们接收ranked tensor，axis为一个axis或非空axis tuple；负axis按rank归一。sum使用加法零，max使用result dtype的最小值（有负无穷时为负无穷），any/all对bool input分别使用false/true。Builtin产生其固定combine与identity，作者不传`identity/combine/combine_operands`；custom summary使用generic reduce。Sum默认accumulator widening与max的NaN规则见数值章节。Empty reduce返回对应identity。
 
-`arg_reduce.max`同样归一到generic reduce，固定lowest logical index tie-break。
+`arg_reduce.max`同样归一到generic reduce，固定lowest logical index tie-break。返回的indices是输入tensor被归约轴内从0开始的逻辑位置，不是底层view、domain或subregion的绝对坐标。
 
 ## 8. Scan
 
