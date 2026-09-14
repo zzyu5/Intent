@@ -288,7 +288,28 @@ bool collectProductConstraint(FragmentType fragment, ArrayRef<int64_t> axes,
 
 LogicalResult bindStructurallyRequiredStaticFragments(func::FuncOp kernel) {
   llvm::MapVector<ParameterOp, int64_t> required;
+  auto requireExtent = [&](Operation *operation, StringAttr symbol,
+                           int64_t candidate) -> LogicalResult {
+    FailureOr<ParameterOp> declaration = queryParameterBySymbol(kernel, symbol);
+    if (failed(declaration))
+      return success();
+    ParameterOp parameter = *declaration;
+    PhysicalParameterBinding binding = queryParameterBinding(parameter);
+    if (!binding.isExact() || !binding.source)
+      return success();
+    if (!llvm::is_contained(
+            parameter.getParameter().getCandidates().asArrayRef(), candidate))
+      return operation->emitOpError(
+          "reshape requires a static fragment extent outside its legal domain");
+    auto found = required.find(parameter);
+    if (found != required.end() && found->second != candidate)
+      return parameter.emitOpError(
+          "one static fragment has incompatible structural extent requirements");
+    required[parameter] = candidate;
+    return success();
+  };
   SmallVector<ReshapeOp> reshapes;
+  SmallVector<std::pair<Value, unsigned>> fixedAxes;
   kernel.walk([&](ReshapeOp reshape) { reshapes.push_back(reshape); });
   for (ReshapeOp reshape : reshapes) {
     auto source = dyn_cast<FragmentType>(reshape.getValue().getType());
@@ -306,29 +327,91 @@ LogicalResult bindStructurallyRequiredStaticFragments(func::FuncOp kernel) {
       ProductConstraint sourceProduct;
       ProductConstraint resultProduct;
       if (!collectProductConstraint(source, sourceAxes, sourceProduct) ||
-          !collectProductConstraint(result, resultAxes, resultProduct) ||
-          sourceProduct.parameterCount != 1 ||
+          !collectProductConstraint(result, resultAxes, resultProduct))
+        continue;
+      if (sourceAxes.size() > 1 && resultAxes.size() == 1 &&
+          sourceProduct.parameterCount == 0 &&
+          resultProduct.parameterCount == 0 && resultProduct.constant > 1 &&
+          sourceProduct.constant == resultProduct.constant)
+        fixedAxes.emplace_back(reshape.getResult(), resultAxes.front());
+      if (sourceProduct.parameterCount != 1 ||
           resultProduct.parameterCount != 0 ||
           resultProduct.constant % sourceProduct.constant != 0)
         continue;
-      FailureOr<ParameterOp> declaration =
-          queryParameterBySymbol(kernel, sourceProduct.parameter);
-      if (failed(declaration))
-        continue;
-      ParameterOp parameter = *declaration;
-      PhysicalParameterBinding binding = queryParameterBinding(parameter);
-      if (!binding.isExact() || !binding.source)
-        continue;
       int64_t candidate = resultProduct.constant / sourceProduct.constant;
-      if (!llvm::is_contained(
-              parameter.getParameter().getCandidates().asArrayRef(), candidate))
-        return reshape.emitOpError(
-            "reshape requires a static fragment extent outside its legal domain");
-      auto found = required.find(parameter);
-      if (found != required.end() && found->second != candidate)
-        return parameter.emitOpError(
-            "one static fragment has incompatible structural extent requirements");
-      required[parameter] = candidate;
+      if (failed(requireExtent(reshape, sourceProduct.parameter, candidate)))
+        return failure();
+    }
+  }
+
+  // A retained static merge fixes its lane count through explicit pointwise
+  // and one-to-one reshape relations, including positional source rebinding.
+  // Propagate that structural constraint, not equality of unrelated shapes.
+  for (auto [seed, seedAxis] : fixedAxes) {
+    int64_t extent = cast<PhysicalExprAttr>(
+        cast<FragmentType>(seed.getType()).getShape()[seedAxis]).getValue();
+    SmallVector<std::pair<Value, unsigned>> pending{{seed, seedAxis}};
+    llvm::DenseSet<std::pair<Value, unsigned>> visited;
+    while (!pending.empty()) {
+      auto [value, axis] = pending.pop_back_val();
+      if (!visited.insert({value, axis}).second)
+        continue;
+      auto source = cast<FragmentType>(value.getType());
+      for (Operation *user : value.getUsers()) {
+        if (user->getNumResults() != 1)
+          continue;
+        auto result = dyn_cast<FragmentType>(user->getResult(0).getType());
+        if (!result)
+          continue;
+        std::optional<unsigned> resultAxis;
+        if (auto reshape = dyn_cast<ReshapeOp>(user)) {
+          for (Attribute attribute : reshape.getReassociation()) {
+            auto group = cast<ReshapeGroupAttr>(attribute);
+            if (group.getSourceAxes().size() == 1 &&
+                group.getResultAxes().size() == 1 &&
+                group.getSourceAxes()[0] == static_cast<int64_t>(axis))
+              resultAxis = group.getResultAxes()[0];
+          }
+        } else if (isa<BroadcastOp, UnaryOp, BinaryOp, CompareOp, SelectOp,
+                       CastOp, BitcastOp>(user)) {
+          BroadcastProjection projection = queryAxisProjection(source, result);
+          if (projection.isExact())
+            for (auto [position, inputAxis] :
+                 llvm::enumerate(projection.targetToSource))
+              if (inputAxis && *inputAxis == axis)
+                resultAxis = position;
+        }
+        if (!resultAxis)
+          continue;
+        auto constrain = [&](PhysicalExprAttr expression,
+                             bool mayBroadcast = false) -> LogicalResult {
+          if (expression.getKind() ==
+              static_cast<uint32_t>(PhysicalExprKind::Parameter))
+            return requireExtent(user, expression.getSymbol(), extent);
+          if (expression.getKind() ==
+                  static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+              expression.getValue() != extent &&
+              !(mayBroadcast && expression.getValue() == 1))
+            return user->emitOpError(
+                "pointwise relation conflicts with a static reshape extent");
+          return success();
+        };
+        if (failed(constrain(
+                cast<PhysicalExprAttr>(result.getShape()[*resultAxis]))))
+          return failure();
+        if (!isa<ReshapeOp>(user))
+          for (Value operand : user->getOperands()) {
+            auto input = dyn_cast<FragmentType>(operand.getType());
+            if (!input)
+              continue;
+            BroadcastProjection projection = queryAxisProjection(input, result);
+            if (projection.isExact() && projection.targetToSource[*resultAxis] &&
+                failed(constrain(cast<PhysicalExprAttr>(input.getShape()[
+                    *projection.targetToSource[*resultAxis]]), true)))
+              return failure();
+          }
+        pending.emplace_back(user->getResult(0), *resultAxis);
+      }
     }
   }
 
@@ -376,17 +459,29 @@ bool hasExactStaticFullCoverage(func::FuncOp kernel, Value source,
       fact.roots.empty())
     return false;
   return llvm::all_of(fact.roots, [&](MakeRangeOp range) {
-    if (range->hasAttr(sourceSubregionAttr) ||
-        !samePhysicalScalarExpression(range.getStart(),
+    if (!samePhysicalScalarExpression(range.getStart(),
                                       range.getLogicalStart()))
       return false;
     auto start = range.getLogicalStart().getDefiningOp<arith::ConstantIndexOp>();
     auto stop = range.getLogicalStop().getDefiningOp<arith::ConstantIndexOp>();
     auto step = range.getStep().getDefiningOp<arith::ConstantIndexOp>();
-    return start && stop && step && step.value() > 0 &&
-           stop.value() >= start.value() &&
+    if (!step || step.value() <= 0)
+      return false;
+    if (start && stop)
+      return stop.value() >= start.value() &&
+             static_cast<__int128>(extent.getValue()) * step.value() >=
+                 static_cast<__int128>(stop.value()) - start.value();
+    // A nonnegative dynamic start needs at most the bounded stop's lanes.
+    // The original tail predicate still selects the subregion's members.
+    PhysicalExprAttr startBound =
+        queryNonNegativeIndexUpperBound(range.getLogicalStart());
+    PhysicalExprAttr stopBound =
+        queryNonNegativeIndexUpperBound(range.getLogicalStop());
+    return startBound && stopBound &&
+           stopBound.getKind() ==
+               static_cast<uint32_t>(PhysicalExprKind::Constant) &&
            static_cast<__int128>(extent.getValue()) * step.value() >=
-               static_cast<__int128>(stop.value() - start.value());
+               stopBound.getValue();
   });
 }
 
@@ -1445,8 +1540,11 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
              mapped(reshape.getValue()) == reshape.getValue()) {
     if (!resultType)
       return failure();
-    replayed = builder.create<BroadcastOp>(producer->getLoc(), resultType,
-                                           mapped(reshape.getValue()));
+    FailureOr<Value> projected = materializeBroadcastToFragment(
+        builder, producer->getLoc(), value, resultType);
+    if (failed(projected))
+      return failure();
+    replayed = *projected;
   } else {
     Operation *clone = builder.clone(*producer, mapping);
     for (auto [original, cloned] :
@@ -4398,7 +4496,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             nonUniqueContractionDimensions.insert(mapping->getDimensionId());
         }
   });
+  llvm::SmallPtrSet<Operation *, 8> contractionOwnedRanges;
   auto hasPointwiseOwnership = [&](MakeRangeOp range) {
+    if (contractionOwnedRanges.contains(range.getOperation()))
+      return false;
     FailureOr<uint64_t> dimension = ownershipDimension(kernel, range);
     // Dimension equality proves an extent, not a Cartesian coordinate. Leave
     // non-unique free-axis occurrences to contraction blocking, which binds
@@ -4456,6 +4557,18 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           !address.blockers.empty() || !payload.blockers.empty() ||
           address.roots.empty() || payload.roots.empty())
         continue;
+      if (llvm::any_of(payload.roots, [&](MakeRangeOp range) {
+            auto dimension = queryRangeDimension(range);
+            return succeeded(dimension) &&
+                   nonUniqueContractionDimensions.contains(*dimension);
+          })) {
+        // Positional output rebinding can hide repeated contraction free axes
+        // behind different address dimensions. Their operand occurrences must
+        // remain separate until contraction blocking binds each side.
+        for (MakeRangeOp range : address.roots)
+          contractionOwnedRanges.insert(range.getOperation());
+        continue;
+      }
       bool positionalRemap = llvm::any_of(payload.roots, [&](MakeRangeOp range) {
         FailureOr<int64_t> sourceDimension = queryRangeDimension(range);
         return succeeded(sourceDimension) && *sourceDimension != dimension;
@@ -4722,7 +4835,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       fullCoverageRanges.push_back(range);
     }
   llvm::erase_if(dynamicRanges, [&](MakeRangeOp range) {
-    return llvm::is_contained(fullCoverageRanges, range);
+    return llvm::is_contained(fullCoverageRanges, range) ||
+           (!ownershipOnly && range->hasAttr(sourceSubregionAttr) &&
+            hasExactStaticFullCoverage(kernel, range.getResult(), 0));
   });
   for (MakeRangeOp range : dynamicRanges) {
     if (ownershipOnly &&

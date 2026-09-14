@@ -199,11 +199,8 @@ FailureOr<Value> predicateForReductionSource(OpBuilder &builder,
                                              unsigned reductionAxis) {
   if (reductionAxis >= source.getAxisMaps().size())
     return failure();
-  auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[reductionAxis]);
-  return projectPredicateToFragment(
-      builder, location, predicate, source,
-      PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis(),
-                           mapping.getDerived()});
+  return projectPredicateToFragmentAxis(builder, location, predicate, source,
+                                        reductionAxis);
 }
 
 void retargetHelperSourceExtent(Region &region, PhysicalSourceAxis source,
@@ -358,6 +355,29 @@ FailureOr<Value> clonePaddedProducer(
   }
 
   if (auto load = dyn_cast<LoadOp>(producer)) {
+    Operation *anchor = builder.getInsertionPoint() ==
+                                builder.getInsertionBlock()->end()
+                            ? nullptr
+                            : &*builder.getInsertionPoint();
+    if (anchor != load.getOperation() && !canReplayReadAt(load, anchor)) {
+      // Keep a read that crosses a possible writer at its original definition.
+      // Its coordinate dependencies already dominate that point; a separate
+      // mapping prevents later padded coordinates from moving before them.
+      OpBuilder snapshotBuilder(load);
+      Value snapshotExtent = snapshotBuilder.create<arith::ConstantIndexOp>(
+          load.getLoc(), physicalExtent.getValue());
+      IRMapping snapshotMapping;
+      SmallVector<Value> snapshotTails;
+      FailureOr<Value> snapshot = clonePaddedProducer(
+          snapshotBuilder, load.getLoc(), value, projectedAxis, reductionSource,
+          selectedRanges, logicalExtent, physicalExtent, snapshotExtent,
+          snapshotMapping, snapshotTails);
+      if (failed(snapshot))
+        return failure();
+      mapping.map(value, *snapshot);
+      tailPredicates.append(snapshotTails.begin(), snapshotTails.end());
+      return *snapshot;
+    }
     SmallVector<Value> coordinates;
     for (Value coordinate : load.getCoordinates()) {
       FailureOr<Value> replayed = clonePaddedProducer(
@@ -1053,13 +1073,6 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
         diagnostic << "; blocker=" << blocker->getName();
       return failure();
     }
-    if (llvm::any_of(replay.accesses, [&](Operation *access) {
-          auto load = dyn_cast<LoadOp>(access);
-          return load && !canReplayReadAt(load, reduce);
-        }))
-      return reduce.emitOpError(
-                 "static reduction padding would change a read snapshot"),
-             failure();
     IRMapping mapping;
     SmallVector<Value> tailPredicates;
     FailureOr<Value> source = clonePaddedProducer(
@@ -3289,8 +3302,12 @@ LogicalResult realizeReductionBlocking(ModuleOp module) {
                                     kernel, /*tileProducerFreeAxis=*/true)))
       return failure();
   }
-  // Pad composed value graphs before their upstream reductions become loops.
-  // Padding can erase dead producers, so rebuild the worklist after each change.
+  // Keep reductions structured until ownership and the enclosing consumer
+  // traversal have been chosen.
+  if (failed(decomposeMultiAxisReductions(module)))
+    return failure();
+  // Pad the remaining reductions before lowering them. Padding can erase dead
+  // producers, so rebuild the worklist after each change.
   while (true) {
     SmallVector<ReduceOp> candidates;
     kernel.walk([&](ReduceOp reduce) { candidates.push_back(reduce); });

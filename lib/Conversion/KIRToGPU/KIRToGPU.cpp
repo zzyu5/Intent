@@ -240,6 +240,22 @@ bool carriesLogicalDimensions(gpu::FragmentType fragment,
 
 FailureOr<Value> projectAccumulatorIdentity(OpBuilder &builder, Location location,
                                             Value identity, Type accumulator) {
+  if (identity.getType() == accumulator)
+    return identity;
+  auto source = dyn_cast<gpu::FragmentType>(identity.getType());
+  auto target = dyn_cast<gpu::FragmentType>(accumulator);
+  if (source && target && source.getElementType() == target.getElementType() &&
+      source.getShape() == target.getShape() &&
+      source.getOwner() == target.getOwner() &&
+      source.getValidity() == target.getValidity()) {
+    SmallVector<Attribute> groups;
+    for (unsigned axis = 0; axis < source.getShape().size(); ++axis)
+      groups.push_back(gpu::ReshapeGroupAttr::get(
+          builder.getContext(), builder.getDenseI64ArrayAttr({axis}),
+          builder.getDenseI64ArrayAttr({axis})));
+    return Value(builder.create<gpu::ReshapeOp>(
+        location, target, identity, builder.getArrayAttr(groups)));
+  }
   return gpu::projectPhysicalValueToSchema(builder, location, identity,
                                            accumulator);
 }
@@ -5072,6 +5088,10 @@ private:
           FailureOr<Value> aligned = projectAccumulatorIdentity(
               before, location, yielded, initial.getType());
           if (failed(aligned)) {
+            operation->emitOpError(
+                "loop update cannot preserve its physical carry relation")
+                << "; initial=" << initial.getType()
+                << "; yielded=" << yielded.getType();
             nestedFailed = true;
             break;
           }

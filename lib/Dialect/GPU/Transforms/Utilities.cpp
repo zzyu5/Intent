@@ -807,25 +807,50 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
       return *projected;
   } else if (auto reshape = value.getDefiningOp<ReshapeOp>()) {
     auto input = cast<FragmentType>(reshape.getValue().getType());
-    bool positional = input.getShape().size() == source.getShape().size() &&
-                      source.getShape().size() == target.getShape().size();
-    for (auto [axis, attribute] : llvm::enumerate(reshape.getReassociation())) {
+    unsigned inputRank = 0, resultRank = 0;
+    for (Attribute attribute : reshape.getReassociation()) {
       auto group = cast<ReshapeGroupAttr>(attribute);
-      positional &= group.getSourceAxes().size() == 1 &&
-                    group.getResultAxes().size() == 1 &&
-                    group.getSourceAxes()[0] == static_cast<int64_t>(axis) &&
-                    group.getResultAxes()[0] == static_cast<int64_t>(axis);
+      inputRank += group.getSourceAxes().size();
+      resultRank += group.getResultAxes().size();
     }
-    positional &= reshape.getReassociation().size() <= input.getShape().size();
-    if (positional) {
-      unsigned prefix = input.getShape().size() - reshape.getReassociation().size();
-      for (unsigned axis = 0; axis < prefix; ++axis)
-        positional &= input.getAxisMaps()[axis] == source.getAxisMaps()[axis] &&
-                      input.getShape()[axis] == source.getShape()[axis];
+    bool projects = inputRank <= input.getShape().size() &&
+                    resultRank <= source.getShape().size() &&
+                    source.getShape().size() == target.getShape().size();
+    BroadcastProjection relation = queryAxisProjection(source, target);
+    projects &= relation.isExact() && llvm::all_of(
+        llvm::enumerate(relation.targetToSource), [](auto item) {
+          return item.value() && *item.value() == item.index();
+        });
+    SmallVector<Attribute> inputShape(input.getShape().begin(),
+                                       input.getShape().end());
+    if (projects) {
+      unsigned inputPrefix = input.getShape().size() - inputRank;
+      unsigned resultPrefix = source.getShape().size() - resultRank;
+      projects = inputPrefix == resultPrefix;
+      if (projects)
+        for (unsigned axis = 0; axis < inputPrefix; ++axis)
+          inputShape[axis] = target.getShape()[axis];
+      for (Attribute attribute : reshape.getReassociation()) {
+        auto group = cast<ReshapeGroupAttr>(attribute);
+        bool changed = llvm::any_of(group.getResultAxes().asArrayRef(),
+                                    [&](int64_t axis) {
+          return source.getShape()[resultPrefix + axis] !=
+                 target.getShape()[resultPrefix + axis];
+        });
+        if (!changed)
+          continue;
+        if (group.getSourceAxes().size() != 1 ||
+            group.getResultAxes().size() != 1) {
+          projects = false;
+          break;
+        }
+        inputShape[inputPrefix + group.getSourceAxes()[0]] =
+            target.getShape()[resultPrefix + group.getResultAxes()[0]];
+      }
     }
-    if (positional) {
+    if (projects) {
       auto inputTarget = FragmentType::get(
-          target.getContext(), input.getElementType(), target.getShape(),
+          target.getContext(), input.getElementType(), builder.getArrayAttr(inputShape),
           input.getAxisMaps(), target.getValidity(), target.getOwner());
       FailureOr<Value> projected =
           projectFragmentValue(builder, location, reshape.getValue(), inputTarget);
@@ -913,8 +938,8 @@ FailureOr<FragmentType> refinePhysicalSchema(func::FuncOp kernel,
                                              FragmentType target,
                                              ValueRange contributors);
 
-LogicalResult alignReductionResultRelations(func::FuncOp kernel) {
-  WalkResult result = kernel.walk([&](Operation *operation) {
+static WalkResult alignReductionResultRelation(Operation *operation) {
+    auto kernel = operation->getParentOfType<func::FuncOp>();
     SmallVector<Value> sources;
     SmallVector<Value> results;
     llvm::SmallDenseSet<int64_t> reducedAxes;
@@ -943,8 +968,13 @@ LogicalResult alignReductionResultRelations(func::FuncOp kernel) {
             return type && type.getShape() == sourceType.getShape();
           }))
         continue;
+      SmallVector<Value> related;
+      llvm::copy_if(sources, std::back_inserter(related), [&](Value other) {
+        auto type = dyn_cast<FragmentType>(other.getType());
+        return type && type.getAxisMaps() == sourceType.getAxisMaps();
+      });
       FailureOr<FragmentType> refined =
-          refinePhysicalSchema(kernel, sourceType, sources);
+          refinePhysicalSchema(kernel, sourceType, related);
       if (failed(refined)) {
         operation->emitOpError(
             "tuple reduction sources have no common physical extent relation");
@@ -1002,12 +1032,14 @@ LogicalResult alignReductionResultRelations(func::FuncOp kernel) {
           sourceType.getValidity(), sourceType.getOwner()));
     }
     return WalkResult::advance();
-  });
+}
+
+LogicalResult alignReductionResultRelations(func::FuncOp kernel) {
+  WalkResult result = kernel.walk(alignReductionResultRelation);
   return result.wasInterrupted() ? failure() : success();
 }
 
-LogicalResult alignReductionIdentityRelations(func::FuncOp kernel) {
-  WalkResult result = kernel.walk([&](Operation *operation) {
+static WalkResult alignReductionIdentityRelation(Operation *operation) {
     auto align = [&](ValueRange inputs, ValueRange results, Region &combine,
                      uint64_t sourceCount,
                      uint64_t identityCount) -> LogicalResult {
@@ -1047,7 +1079,10 @@ LogicalResult alignReductionIdentityRelations(func::FuncOp kernel) {
                  ? WalkResult::interrupt()
                  : WalkResult::advance();
     return WalkResult::advance();
-  });
+}
+
+LogicalResult alignReductionIdentityRelations(func::FuncOp kernel) {
+  WalkResult result = kernel.walk(alignReductionIdentityRelation);
   return result.wasInterrupted() ? failure() : success();
 }
 
@@ -1541,10 +1576,12 @@ FailureOr<Value> materializeReplayedValue(
                 inputOptions);
             if (failed(replayed))
               return failure();
-            Value projected = builder.create<BroadcastOp>(
-                location, replaceReplayAxis(fragment, axis), *replayed);
-            remember(current, projected, projection);
-            return projected;
+            FailureOr<Value> projected = projectPhysicalValueToSchema(
+                builder, location, *replayed, replaceReplayAxis(fragment, axis));
+            if (failed(projected))
+              return failure();
+            remember(current, *projected, projection);
+            return *projected;
           }
         }
       }
@@ -1639,6 +1676,17 @@ FailureOr<Value> materializeReplayedValue(
       return clone->getResult(0);
     }
 
+    if (isa<BroadcastOp, SplatOp>(producer)) {
+      FailureOr<Value> replayed = replayOperand(producer->getOperand(0));
+      if (failed(replayed))
+        return failure();
+      FailureOr<Value> projected = projectPhysicalValueToSchema(
+          builder, location, *replayed, replaceReplayAxis(fragment, axis));
+      if (failed(projected))
+        return failure();
+      remember(current, *projected, projection);
+      return *projected;
+    }
     if (auto load = dyn_cast<LoadOp>(producer)) {
       SmallVector<Value> coordinates;
       for (Value coordinate : load.getCoordinates()) {
@@ -2037,10 +2085,20 @@ FailureOr<FragmentType> refineAccessResultSchema(
   SmallVector<bool> refined(shape.size(), false);
   bool changed = false;
   PhysicalProgramAnalysis analysis(kernel);
+  SmallVector<Value> fragmentCoordinates;
+  for (Value coordinate : coordinates)
+    if (isa<FragmentType>(coordinate.getType()))
+      fragmentCoordinates.push_back(coordinate);
+  bool cartesian = fragmentCoordinates.size() == target.getShape().size() &&
+      llvm::all_of(fragmentCoordinates, [](Value coordinate) {
+        return cast<FragmentType>(coordinate.getType()).getShape().size() == 1;
+      });
+  unsigned fragmentSlot = 0;
   for (Value coordinate : coordinates) {
     auto source = dyn_cast<FragmentType>(coordinate.getType());
     if (!source)
       continue;
+    unsigned coordinateSlot = fragmentSlot++;
     for (unsigned sourceAxis = 0; sourceAxis < source.getShape().size();
          ++sourceAxis) {
       PhysicalAxisRealizationFact realization =
@@ -2063,8 +2121,18 @@ FailureOr<FragmentType> refineAccessResultSchema(
 
       auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
       std::optional<unsigned> targetAxis;
+      if (cartesian) {
+        auto candidate = cast<AxisMapAttr>(target.getAxisMaps()[coordinateSlot]);
+        if (sourceAxisIdentity(candidate) == sourceAxisIdentity(mapping) &&
+            candidate.getDimensionId() == mapping.getDimensionId())
+          targetAxis = coordinateSlot;
+      }
       for (auto [axis, attribute] : llvm::enumerate(target.getAxisMaps())) {
-        if (attribute != mapping)
+        if (cartesian && targetAxis)
+          break;
+        auto candidate = cast<AxisMapAttr>(attribute);
+        if (!(sourceAxisIdentity(candidate) == sourceAxisIdentity(mapping)) ||
+            candidate.getDimensionId() != mapping.getDimensionId())
           continue;
         if (targetAxis)
           return failure();
@@ -2181,7 +2249,13 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
     return success();
   };
 
-  WalkResult result = kernel.walk([&](Operation *operation) {
+  WalkResult result = kernel.walk<WalkOrder::PreOrder>([&](Operation *operation) {
+    if (isa<ReduceOp, ScanOp>(operation)) {
+      if (alignReductionResultRelation(operation).wasInterrupted() ||
+          alignReductionIdentityRelation(operation).wasInterrupted())
+        return WalkResult::interrupt();
+      return WalkResult::advance();
+    }
     if (auto reshape = dyn_cast<ReshapeOp>(operation))
       return failed(refreshReshapeRelation(reshape)) ? WalkResult::interrupt()
                                                      : WalkResult::advance();
@@ -2202,6 +2276,15 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
       auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
       if (!target || !source)
         return WalkResult::advance();
+      if (!queryBroadcastProjection(source, target).isExact()) {
+        OpBuilder builder(broadcast);
+        FailureOr<Value> projected = projectPhysicalValueToSchema(
+            builder, broadcast.getLoc(), broadcast.getValue(), target);
+        if (succeeded(projected)) {
+          broadcast->setOperand(0, *projected);
+          source = cast<FragmentType>(projected->getType());
+        }
+      }
       BroadcastProjection projection = queryAxisProjection(source, target);
       if (!projection.isExact()) {
         broadcast.emitOpError(
@@ -2536,7 +2619,8 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
           continue;
         PhysicalAxisProjection projection =
             queryFragmentAxis(coordinateType, sourceAxisIdentity(mapping));
-        if (!projection.isExact())
+        if (!projection.isExact() ||
+            projection.dimensionId != mapping.getDimensionId())
           continue;
         retargetSourceExtent(coordinate, projection.source, extent);
       }

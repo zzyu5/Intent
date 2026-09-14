@@ -1,9 +1,11 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/AttrTypeSubElements.h"
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringMap.h"
@@ -656,6 +658,77 @@ void bindContractionFreeExtents(
   }
 }
 
+LogicalResult bindPointwiseTraversalFootprints(
+    func::FuncOp kernel, ArrayRef<ParameterOp> parameters,
+    NamedAttrList &bindings, Builder &builder) {
+  auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+  if (!capabilities || capabilities.getRegistersPerUnit() <= 0)
+    return success();
+  for (ParameterOp parameter : parameters) {
+    if (!parameter->hasAttr(pointwiseChunkAttr))
+      continue;
+    auto schema = parameter.getParameter();
+    llvm::SmallDenseSet<FragmentType> fragments;
+    kernel.walk([&](Operation *operation) {
+      for (Value value : operation->getResults())
+        if (auto type = dyn_cast<FragmentType>(value.getType());
+            type && llvm::any_of(type.getShape(), [&](Attribute extent) {
+              return expressionReferencesParameter(cast<PhysicalExprAttr>(extent),
+                                                   schema.getName());
+            }))
+          fragments.insert(type);
+    });
+    auto fits = [&](int64_t candidate) {
+      AttrTypeReplacer replacer;
+      replacer.addReplacement(
+          [&](PhysicalExprAttr expression) -> std::optional<Attribute> {
+        if (expression.getKind() !=
+            static_cast<uint32_t>(PhysicalExprKind::Parameter))
+          return std::nullopt;
+        auto binding = dyn_cast_or_null<IntegerAttr>(
+            bindings.get(expression.getSymbol().getValue()));
+        if (!binding)
+          return std::nullopt;
+        int64_t value = expression.getSymbol() == schema.getName()
+                            ? candidate : binding.getInt();
+        return PhysicalExprAttr::get(kernel.getContext(),
+            static_cast<uint32_t>(PhysicalExprKind::Constant), value,
+            builder.getStringAttr(""), builder.getArrayAttr({}));
+      });
+      for (FragmentType fragment : fragments) {
+        Type element = fragment.getElementType();
+        unsigned bits = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
+        __int128 registers = std::max(1u, (bits + 31) / 32);
+        bool known = true;
+        for (Attribute attribute : fragment.getShape()) {
+          auto extent = constantPhysicalExpression(
+              cast<PhysicalExprAttr>(replacer.replace(attribute)));
+          if (!extent || *extent <= 0) {
+            known = false;
+            break;
+          }
+          registers = std::min<__int128>(capabilities.getRegistersPerUnit(),
+                                         registers * *extent);
+        }
+        if (known && registers >= capabilities.getRegistersPerUnit())
+          return false;
+      }
+      return true;
+    };
+    int64_t requested = cast<IntegerAttr>(
+        bindings.get(schema.getName().getValue())).getInt();
+    std::optional<int64_t> selected;
+    for (int64_t candidate : schema.getCandidates().asArrayRef())
+      if (candidate <= requested && (!selected || candidate > *selected) &&
+          fits(candidate))
+        selected = candidate;
+    if (!selected)
+      return failure();
+    bindings.set(schema.getName(), builder.getI64IntegerAttr(*selected));
+  }
+  return success();
+}
+
 void appendFullResultContractionTuples(
     func::FuncOp kernel, const NamedAttrList &bindings,
     llvm::function_ref<const TuningProfile &(ParameterOp)> profileFor,
@@ -893,6 +966,7 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
         largestReduction = std::max(largestReduction, requestedValue(profile, role));
   }
   auto freeExtents = contractionFreeExtents(kernel, parameters);
+  bool invalidFootprint = false;
   auto appendTuple = [&](llvm::function_ref<const TuningProfile &(ParameterOp)> profileFor,
                          bool compactRows = false) {
     NamedAttrList bindings;
@@ -914,6 +988,11 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
       bindings.set(schema.getName(), builder.getI64IntegerAttr(selected));
     }
     bindContractionFreeExtents(freeExtents, bindings, profileFor, builder);
+    if (failed(bindPointwiseTraversalFootprints(kernel, parameters, bindings,
+                                                builder))) {
+      invalidFootprint = true;
+      return;
+    }
     DictionaryAttr tuple = bindings.getDictionary(kernel.getContext());
     if (!llvm::is_contained(tuples, Attribute(tuple))) tuples.push_back(tuple);
     appendFullResultContractionTuples(kernel, bindings, profileFor, builder,
@@ -961,6 +1040,9 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
       });
     }
   }
+  if (invalidFootprint && tuples.empty())
+    return kernel.emitOpError(
+        "pointwise traversal has no profile within the fragment register budget");
   if (tuples.empty())
     tuples.push_back(builder.getDictionaryAttr({}));
   kernel->setAttr(sharedConfigTuplesAttr, builder.getArrayAttr(tuples));

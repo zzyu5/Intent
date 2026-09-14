@@ -87,6 +87,19 @@ BroadcastProjection queryAxisProjection(FragmentType source,
                axis.getSourceAxis() == other.getSourceAxis() &&
                axis.getDerived() == other.getDerived();
       };
+      auto sameOccurrence = [&](Attribute candidate) {
+        return sameSource(candidate) && axis.getDimensionId() > 0 &&
+               axis.getDimensionId() ==
+                   cast<AxisMapAttr>(candidate).getDimensionId();
+      };
+      if (llvm::count_if(source.getAxisMaps(), sameOccurrence) == 1 &&
+          llvm::count_if(target.getAxisMaps(), sameOccurrence) == 1) {
+        if (!bindUnique(sourceIndex, [&](AxisMapAttr other) {
+              return sameOccurrence(other);
+            }))
+          return result;
+        continue;
+      }
       if (llvm::count_if(source.getAxisMaps(), sameSource) == 1 &&
           llvm::count_if(target.getAxisMaps(), sameSource) == 1)
         if (!bindUnique(sourceIndex, [&](AxisMapAttr other) { return sameSource(other); }))

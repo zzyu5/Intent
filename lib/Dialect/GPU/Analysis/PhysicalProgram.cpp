@@ -379,6 +379,157 @@ Value stripIntegerIndexCasts(Value value) {
   return value;
 }
 
+bool sameBroadcastCoordinateExpression(Value lhs, Value rhs) {
+  auto leftType = dyn_cast<FragmentType>(lhs.getType());
+  auto rightType = dyn_cast<FragmentType>(rhs.getType());
+  if (!leftType || !rightType)
+    return false;
+  FragmentType common = leftType.getShape().size() > rightType.getShape().size()
+                            ? leftType : rightType;
+  auto leftProjection = queryBroadcastProjection(leftType, common);
+  auto rightProjection = queryBroadcastProjection(rightType, common);
+  if (!leftProjection.isExact() || !rightProjection.isExact())
+    return false;
+  using Axes = SmallVector<std::optional<unsigned>, 4>;
+  auto element = [](Type type) {
+    auto fragment = dyn_cast<FragmentType>(type);
+    return fragment ? fragment.getElementType() : type;
+  };
+  auto projectOperand = [&](Value operand, Value parent,
+                            ArrayRef<std::optional<unsigned>> axes)
+      -> FailureOr<Axes> {
+    Axes projected(axes.size());
+    auto source = dyn_cast<FragmentType>(operand.getType());
+    if (!source)
+      return projected;
+    auto target = dyn_cast<FragmentType>(parent.getType());
+    if (!target)
+      return failure();
+    auto projection = queryBroadcastProjection(source, target);
+    if (!projection.isExact())
+      return failure();
+    for (auto [axis, parentAxis] : llvm::enumerate(axes))
+      if (parentAxis)
+        projected[axis] = projection.targetToSource[*parentAxis];
+    return projected;
+  };
+  auto sameLanes = [](Type type, ArrayRef<std::optional<unsigned>> left,
+                      ArrayRef<std::optional<unsigned>> right) {
+    auto fragment = dyn_cast<FragmentType>(type);
+    if (!fragment)
+      return true;
+    auto varying = [&](std::optional<unsigned> axis) {
+      if (axis) {
+        auto extent = cast<PhysicalExprAttr>(fragment.getShape()[*axis]);
+        if (extent.getKind() ==
+                static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+            extent.getValue() == 1)
+          return std::optional<unsigned>();
+      }
+      return axis;
+    };
+    return llvm::all_of(llvm::zip(left, right), [&](auto pair) {
+      return varying(std::get<0>(pair)) == varying(std::get<1>(pair));
+    });
+  };
+  std::function<bool(Value, Axes, Value, Axes, unsigned)> equivalent;
+  equivalent = [&](Value left, Axes leftAxes, Value right, Axes rightAxes,
+                   unsigned depth) -> bool {
+    if (depth >= 32 || element(left.getType()) != element(right.getType()))
+      return false;
+    if (left == right)
+      return sameLanes(left.getType(), leftAxes, rightAxes);
+    auto unwrap = [&](Value current, Axes axes)
+        -> std::optional<std::pair<Value, Axes>> {
+      Value input;
+      if (auto broadcast = current.getDefiningOp<BroadcastOp>())
+        input = broadcast.getValue();
+      else if (auto splat = current.getDefiningOp<SplatOp>())
+        input = splat.getValue();
+      else if (auto reshape = current.getDefiningOp<ReshapeOp>()) {
+        auto source = cast<FragmentType>(reshape.getValue().getType());
+        auto target = cast<FragmentType>(current.getType());
+        if (source.getShape() == target.getShape())
+          return std::make_pair(reshape.getValue(), std::move(axes));
+        unsigned sourceRank = 0, resultRank = 0;
+        for (Attribute attribute : reshape.getReassociation()) {
+          auto group = cast<ReshapeGroupAttr>(attribute);
+          sourceRank += group.getSourceAxes().size();
+          resultRank += group.getResultAxes().size();
+        }
+        unsigned sourcePrefix = source.getShape().size() - sourceRank;
+        unsigned resultPrefix = target.getShape().size() - resultRank;
+        if (sourcePrefix != resultPrefix)
+          return std::nullopt;
+        Axes resultToSource(target.getShape().size());
+        for (unsigned axis = 0; axis < sourcePrefix; ++axis)
+          resultToSource[axis] = axis;
+        for (Attribute attribute : reshape.getReassociation()) {
+          auto group = cast<ReshapeGroupAttr>(attribute);
+          if (group.getSourceAxes().empty() || group.getResultAxes().empty())
+            continue;
+          if (group.getSourceAxes().size() != 1 ||
+              group.getResultAxes().size() != 1)
+            return std::nullopt;
+          unsigned sourceAxis = sourcePrefix + group.getSourceAxes()[0];
+          unsigned resultAxis = resultPrefix + group.getResultAxes()[0];
+          if (source.getShape()[sourceAxis] != target.getShape()[resultAxis])
+            return std::nullopt;
+          resultToSource[resultAxis] = sourceAxis;
+        }
+        Axes projected(axes.size());
+        for (auto [axis, resultAxis] : llvm::enumerate(axes))
+          if (resultAxis)
+            projected[axis] = resultToSource[*resultAxis];
+        return std::make_pair(reshape.getValue(), std::move(projected));
+      }
+      if (!input)
+        return std::nullopt;
+      FailureOr<Axes> projected = projectOperand(input, current, axes);
+      return succeeded(projected)
+                 ? std::optional(std::make_pair(input, std::move(*projected)))
+                 : std::nullopt;
+    };
+    if (auto unwrapped = unwrap(left, leftAxes))
+      return equivalent(unwrapped->first, std::move(unwrapped->second), right,
+                        std::move(rightAxes), depth + 1);
+    if (auto unwrapped = unwrap(right, rightAxes))
+      return equivalent(left, std::move(leftAxes), unwrapped->first,
+                        std::move(unwrapped->second), depth + 1);
+    if (!isa<FragmentType>(left.getType()) &&
+        !isa<FragmentType>(right.getType()))
+      return sameScalarExpression(left, right);
+    auto leftRange = left.getDefiningOp<MakeRangeOp>();
+    auto rightRange = right.getDefiningOp<MakeRangeOp>();
+    if (leftRange || rightRange)
+      return leftRange && rightRange &&
+             sameLanes(left.getType(), leftAxes, rightAxes) &&
+             sourceAxisIdentity(leftRange) == sourceAxisIdentity(rightRange) &&
+             samePhysicalScalarExpression(leftRange.getStart(), rightRange.getStart()) &&
+             samePhysicalScalarExpression(leftRange.getExtent(), rightRange.getExtent()) &&
+             samePhysicalScalarExpression(leftRange.getStep(), rightRange.getStep());
+    auto leftBinary = left.getDefiningOp<BinaryOp>();
+    auto rightBinary = right.getDefiningOp<BinaryOp>();
+    if (!leftBinary || !rightBinary ||
+        leftBinary.getOperatorKind() != rightBinary.getOperatorKind() ||
+        leftBinary.getApproximate() != rightBinary.getApproximate() ||
+        leftBinary.getFlushToZero() != rightBinary.getFlushToZero())
+      return false;
+    for (auto [leftOperand, rightOperand] : llvm::zip(leftBinary->getOperands(),
+                                                    rightBinary->getOperands())) {
+      FailureOr<Axes> leftMapping = projectOperand(leftOperand, left, leftAxes);
+      FailureOr<Axes> rightMapping = projectOperand(rightOperand, right, rightAxes);
+      if (failed(leftMapping) || failed(rightMapping) ||
+          !equivalent(leftOperand, *leftMapping, rightOperand, *rightMapping,
+                      depth + 1))
+        return false;
+    }
+    return true;
+  };
+  return equivalent(lhs, leftProjection.targetToSource, rhs,
+                    rightProjection.targetToSource, 0);
+}
+
 bool derivesFromAccessCoordinate(Value value, Value coordinate) {
   // Coordinate replay can duplicate a pure expression before CSE. Its bounds
   // still apply when the complete typed expression and SSA leaves are equal.
@@ -389,6 +540,8 @@ bool derivesFromAccessCoordinate(Value value, Value coordinate) {
   if (valueType && coordinateType &&
       queryBroadcastProjection(valueType, coordinateType).isExact() &&
       sameScalarExpression(stripBroadcast(value), stripBroadcast(coordinate)))
+    return true;
+  if (sameBroadcastCoordinateExpression(value, coordinate))
     return true;
   value = stripIntegerIndexCasts(value);
   coordinate = stripIntegerIndexCasts(coordinate);
@@ -2490,6 +2643,26 @@ void PhysicalProgramAnalysis::collectAxisRanges(
   if (auto load = dyn_cast<LoadOp>(operation)) {
     appendUnique(result.accesses, operation);
     auto expected = cast<AxisMapAttr>(fragment.getAxisMaps()[fragmentAxis]);
+    SmallVector<Value> positionalCoordinates;
+    bool rankOneCoordinates = true;
+    for (Value coordinate : load.getCoordinates()) {
+      auto type = dyn_cast<FragmentType>(coordinate.getType());
+      if (!type)
+        continue;
+      rankOneCoordinates &= type.getShape().size() == 1;
+      positionalCoordinates.push_back(coordinate);
+    }
+    if (rankOneCoordinates &&
+        positionalCoordinates.size() == fragment.getShape().size()) {
+      Value coordinate = positionalCoordinates[fragmentAxis];
+      auto type = cast<FragmentType>(coordinate.getType());
+      auto occurrence = cast<AxisMapAttr>(type.getAxisMaps()[0]);
+      if (sourceAxisIdentity(occurrence) == sourceAxisIdentity(expected) &&
+          occurrence.getDimensionId() == expected.getDimensionId()) {
+        collectAxisRanges(coordinate, 0, result, visited);
+        return;
+      }
+    }
     using CoordinateOccurrence = std::pair<Value, unsigned>;
     enum class OccurrencePriority {
       SourceAndDimension,
