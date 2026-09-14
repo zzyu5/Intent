@@ -171,6 +171,11 @@ def compare_outputs(
                 f"generated/source result {leaf_index} dtype differs: "
                 f"{generated_value.dtype} != {source_value.dtype}"
             )
+        if generated_value.device != source_value.device:
+            raise NumericalComparisonError(
+                f"generated/source result {leaf_index} device differs: "
+                f"{generated_value.device} != {source_value.device}"
+            )
         if generated_value.dtype == torch.bool or not generated_value.is_floating_point():
             if not torch.equal(generated_value, source_value):
                 raise NumericalComparisonError(
@@ -235,10 +240,14 @@ def _compare_float_chunk(
         limit = tolerance.atol + tolerance.rtol * source_compare[finite].abs()
         maximum = difference.max().item()
         if torch.any(difference > limit):
+            worst = (difference - limit).argmax()
             raise NumericalComparisonError(
                 f"generated/source floating result {leaf_index} differs: "
                 f"max_abs={maximum}, atol={tolerance.atol}, "
-                f"rtol={tolerance.rtol}"
+                f"rtol={tolerance.rtol}; largest tolerance excess has "
+                f"generated={generated_compare[finite][worst].item()}, "
+                f"source={source_compare[finite][worst].item()}, "
+                f"abs_error={difference[worst].item()}, limit={limit[worst].item()}"
             )
         return maximum
     return 0.0
