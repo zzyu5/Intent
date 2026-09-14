@@ -2770,6 +2770,11 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
       if (auto loop = dyn_cast<scf::ForOp>(producer)) {
         auto index = cast<OpResult>(value).getResultNumber();
         result = uniform(loop.getRegionIterArgs()[index]);
+      } else if (auto branch = dyn_cast<scf::IfOp>(producer)) {
+        unsigned index = cast<OpResult>(value).getResultNumber();
+        result = uniform(branch.getCondition()) &&
+                 uniform(branch.thenBlock()->getTerminator()->getOperand(index)) &&
+                 uniform(branch.elseBlock()->getTerminator()->getOperand(index));
       } else if (isa<gpu::ReduceOp, gpu::GatherOp, gpu::DimOp, gpu::ParameterOp,
               gpu::PhysicalExprOp, gpu::ProgramIdOp, arith::ConstantOp>(producer)) {
         result = true;
