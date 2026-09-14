@@ -47,7 +47,7 @@ mlir::LogicalResult partitionTasks(mlir::func::FuncOp function, int64_t grain,
 mlir::LogicalResult isolateTasks(mlir::func::FuncOp function);
 mlir::LogicalResult realizeRegions(mlir::func::FuncOp function, const Configuration &configuration,
                                   const ImplementationRegistry &implementations);
-mlir::LogicalResult materializeTaskLoops(mlir::func::FuncOp function);
+mlir::LogicalResult materializeTaskDispatches(mlir::func::FuncOp function);
 mlir::LogicalResult runCPUPasses(mlir::ModuleOp module, int64_t vectorBits,
                                int64_t workers, bool matrixI8I32, llvm::StringRef defaults,
                                llvm::StringRef overrides,

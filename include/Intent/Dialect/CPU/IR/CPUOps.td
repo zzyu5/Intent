@@ -17,8 +17,17 @@ def IntentCPU_TasksOp : IntentCPU_Op<"tasks", [SingleBlock,
   let hasVerifier = 1;
 }
 
-def IntentCPU_TaskYieldOp : IntentCPU_Op<"task_yield", [Pure, Terminator,
-    HasParent<"TasksOp">]>;
+def IntentCPU_TaskDispatchOp : IntentCPU_Op<"task_dispatch", [SingleBlock,
+    AutomaticAllocationScope, RecursiveMemoryEffects]> {
+  let summary = "Synchronous task invocation with an explicit active worker budget";
+  let arguments = (ins Index:$count, Index:$worker_count);
+  let regions = (region AnyRegion:$body);
+  let hasVerifier = 1;
+}
+
+def IntentCPU_TaskYieldOp : IntentCPU_Op<"task_yield", [Pure, Terminator]> {
+  let hasVerifier = 1;
+}
 
 def IntentCPU_ReduceOp : IntentCPU_Op<"reduce", [SingleBlock,
     MemoryEffects<[MemRead]>]> {

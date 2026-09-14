@@ -122,7 +122,7 @@ void promotePrivateScratch(func::FuncOp function, int64_t budget) {
 LogicalResult checkSurface(ModuleOp module) {
   bool invalid = false;
   module.walk([&](Operation *operation) {
-    if (isa<ModuleOp, func::FuncOp, func::ReturnOp, scf::YieldOp, scf::ConditionOp, scf::ReduceOp>(operation)) return;
+    if (isa<ModuleOp, func::FuncOp, func::ReturnOp, scf::YieldOp, scf::ConditionOp, cpu::TaskYieldOp>(operation)) return;
     bool supported = isa<arith::ConstantOp, arith::AddFOp, arith::AddIOp,
         arith::SubFOp, arith::SubIOp, arith::MulFOp, arith::MulIOp,
         arith::DivFOp, arith::DivSIOp, arith::RemSIOp, arith::DivUIOp, arith::RemUIOp,
@@ -138,7 +138,7 @@ LogicalResult checkSurface(ModuleOp module) {
         memref::ExtractStridedMetadataOp,
         memref::AllocaOp, memref::AllocOp, memref::DeallocOp, memref::PrefetchOp,
         vector::LoadOp, vector::StoreOp, vector::BroadcastOp, vector::ShuffleOp, vector::StepOp,
-        vector::ExtractElementOp, arith::CmpIOp, scf::IfOp, scf::ForOp, scf::WhileOp, scf::ParallelOp,
+        vector::ExtractElementOp, arith::CmpIOp, scf::IfOp, scf::ForOp, scf::WhileOp, cpu::TaskDispatchOp,
         cpu::AtomicLoadOp, cpu::AtomicStoreOp, cpu::AtomicRMWOp, cpu::AtomicCompareExchangeOp>(operation);
     supported &= llvm::all_of(operation->getOperandTypes(), supportedType);
     supported &= llvm::all_of(operation->getResultTypes(), supportedType);
@@ -160,10 +160,6 @@ LogicalResult checkSurface(ModuleOp module) {
       if (auto rmw = dyn_cast<cpu::AtomicRMWOp>(operation))
         supported &= directAtomicAdd(element) && rmw.getKind() == AtomicRMWKind::Add;
     }
-    if (auto parallel = dyn_cast<scf::ParallelOp>(operation))
-      supported &= parallel.getNumResults() == 0 && parallel.getNumLoops() == 1 &&
-          matchPattern(parallel.getLowerBound()[0], m_Zero()) &&
-          matchPattern(parallel.getStep()[0], m_One());
     if (!supported) {
       operation->emitError("current operation/type has no supported Mojo CPU surface form");
       invalid = true;
@@ -262,7 +258,7 @@ LogicalResult legalizeProgram(ModuleOp module) {
   if (!capabilities || (capabilities.getVectorBits() != 256 && capabilities.getVectorBits() != 512))
     return module.emitError("Mojo native currently requires an AVX2 or AVX512 CPU capability");
   for (func::FuncOp function : module.getOps<func::FuncOp>())
-    if (failed(cpu::materializeTaskLoops(function))) return failure();
+    if (failed(cpu::materializeTaskDispatches(function))) return failure();
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
     if (failed(materializeRegisterContractions(function)) ||
         failed(cpu::materializeStructuredComputations(function))) return failure();
@@ -318,8 +314,8 @@ LogicalResult legalizeProgram(ModuleOp module) {
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
     if (function.isExternal()) continue;
     if (needsFloatingPointEnvironment(function)) scopes.push_back(&function.front());
-    function.walk([&](scf::ParallelOp parallel) {
-      if (needsFloatingPointEnvironment(parallel)) scopes.push_back(parallel.getBody());
+    function.walk([&](cpu::TaskDispatchOp dispatch) {
+      if (needsFloatingPointEnvironment(dispatch)) scopes.push_back(&dispatch.getBody().front());
     });
   }
   if (scopes.empty()) return success();

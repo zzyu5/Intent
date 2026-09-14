@@ -244,15 +244,9 @@ LogicalResult partition(scf::ParallelOp root, int64_t grain) {
     b.setInsertionPointToStart(tasks.getBody());
     Value begin = multiply(b, loc, tasks.getInductionVars()[0], chunk);
     Value end = b.create<arith::MinSIOp>(loc, add(b, loc, begin, chunk), size);
-    loop(b, loc, begin, end, 1, [&](Value linear) {
+    auto clonePoint = [&](ValueRange point) {
       IRMapping mapping;
-      Value remainder = linear;
-      for (int64_t axis = extents.size() - 1; axis >= 0; --axis) {
-        Value coordinate = axis == 0 ? remainder
-            : Value(b.create<arith::RemSIOp>(loc, remainder, extents[axis]));
-        mapping.map(coordinates[axis], coordinate);
-        if (axis) remainder = b.create<arith::DivSIOp>(loc, remainder, extents[axis]);
-      }
+      mapping.map(ValueRange(coordinates), point);
       std::function<void(scf::ParallelOp)> cloneBody = [&](scf::ParallelOp parallel) {
         for (Operation &operation : parallel.getBody()->without_terminator()) {
           if (auto child = dyn_cast<scf::ParallelOp>(&operation); child && llvm::is_contained(nest, child)) cloneBody(child);
@@ -260,7 +254,42 @@ LogicalResult partition(scf::ParallelOp root, int64_t grain) {
         }
       };
       cloneBody(root);
-    });
+    };
+    if (extents.size() == 1) {
+      loop(b, loc, begin, end, 1, [&](Value linear) { clonePoint(ValueRange{linear}); });
+    } else {
+      Value nonempty = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, begin, end);
+      auto active = b.create<scf::IfOp>(loc, nonempty, false);
+      OpBuilder::InsertionGuard guard(b);
+      b.setInsertionPointToStart(active.thenBlock());
+      auto decode = [&](Value ordinal) {
+        SmallVector<Value> point(extents.size());
+        for (int64_t axis = extents.size() - 1; axis >= 0; --axis) {
+          point[axis] = axis == 0 ? ordinal
+              : Value(b.create<arith::RemSIOp>(loc, ordinal, extents[axis]));
+          if (axis) ordinal = b.create<arith::DivSIOp>(loc, ordinal, extents[axis]);
+        }
+        return point;
+      };
+      auto first = decode(begin);
+      auto last = decode(b.create<arith::SubIOp>(loc, end, one));
+      SmallVector<Value> lastEnds, point(extents.size());
+      for (Value coordinate : last) lastEnds.push_back(add(b, loc, coordinate, one));
+      Value boundary = b.create<arith::ConstantOp>(loc, b.getBoolAttr(true));
+      std::function<void(unsigned, Value, Value)> traverse = [&](unsigned axis, Value firstPrefix, Value lastPrefix) {
+        Value lower = b.createOrFold<arith::SelectOp>(loc, firstPrefix, first[axis], zero);
+        Value upper = b.createOrFold<arith::SelectOp>(loc, lastPrefix, lastEnds[axis], extents[axis]);
+        loop(b, loc, lower, upper, 1, [&](Value coordinate) {
+          point[axis] = coordinate;
+          if (axis + 1 == extents.size()) { clonePoint(point); return; }
+          Value atFirst = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, coordinate, first[axis]);
+          Value atLast = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, coordinate, last[axis]);
+          traverse(axis + 1, b.createOrFold<arith::AndIOp>(loc, firstPrefix, atFirst),
+              b.createOrFold<arith::AndIOp>(loc, lastPrefix, atLast));
+        });
+      };
+      traverse(0, boundary, boundary);
+    }
   }
   SmallVector<scf::ParallelOp> nested;
   tasks.walk<WalkOrder::PostOrder>([&](scf::ParallelOp parallel) {
@@ -347,21 +376,29 @@ LogicalResult isolateTasks(func::FuncOp function) {
   return success();
 }
 
-LogicalResult materializeTaskLoops(func::FuncOp function) {
+LogicalResult materializeTaskDispatches(func::FuncOp function) {
+  auto capabilities = function->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities");
   SmallVector<TasksOp> operations;
   function.walk([&](TasksOp tasks) { operations.push_back(tasks); });
   for (auto tasks : operations) {
     OpBuilder b(tasks);
     Location loc = tasks.getLoc();
-    Value zero = index(b, loc, 0), one = index(b, loc, 1);
-    auto parallel = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{tasks.getCount()}, ValueRange{one});
-    b.setInsertionPointToStart(parallel.getBody());
-    Block &body = tasks.getBody().front();
+    Value workers = b.create<arith::MaxSIOp>(loc, index(b, loc, 1),
+        b.create<arith::MinSIOp>(loc, tasks.getCount(), index(b, loc, capabilities.getWorkers())));
+    Value nonempty = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, tasks.getCount(), index(b, loc, 0));
+    auto active = b.create<scf::IfOp>(loc, nonempty, false);
+    b.setInsertionPointToStart(active.thenBlock());
+    auto dispatch = b.create<TaskDispatchOp>(loc, tasks.getCount(), workers);
+    Block *body = &dispatch.getBody().emplaceBlock();
+    body->addArgument(b.getIndexType(), loc);
     IRMapping mapping;
-    mapping.map(body.getArgument(0), parallel.getInductionVars()[0]);
-    for (auto [argument, capture] : llvm::zip(body.getArguments().drop_front(), tasks.getCaptures()))
+    Block &original = tasks.getBody().front();
+    mapping.map(original.getArgument(0), body->getArgument(0));
+    for (auto [argument, capture] : llvm::zip(original.getArguments().drop_front(), tasks.getCaptures()))
       mapping.map(argument, capture);
-    for (Operation &operation : body.without_terminator()) b.clone(operation, mapping);
+    b.setInsertionPointToStart(body);
+    for (Operation &operation : original.without_terminator()) b.clone(operation, mapping);
+    b.create<TaskYieldOp>(loc);
     tasks.erase();
   }
   return success();

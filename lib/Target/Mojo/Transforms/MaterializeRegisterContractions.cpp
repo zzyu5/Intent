@@ -134,7 +134,7 @@ FailureOr<bool> materializeIndexedContraction(linalg::GenericOp operation, Imple
   int64_t replicas = implementationParameter(binding, "register_replicas");
   DominanceInfo dominance(operation->getParentOfType<func::FuncOp>());
   Operation *scope = operation;
-  for (Operation *parent = operation->getParentOp(); isa<scf::ForOp, scf::ParallelOp>(parent);
+  for (Operation *parent = operation->getParentOp(); isa<scf::ForOp, scf::ParallelOp, TaskDispatchOp>(parent);
        parent = parent->getParentOp()) {
     if (!dominance.dominates(rhs, parent)) break;
     scope = parent;

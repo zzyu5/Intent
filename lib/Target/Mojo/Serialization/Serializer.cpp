@@ -118,8 +118,6 @@ public:
 
   LogicalResult function(func::FuncOp function) {
     names.clear(); memories.clear(); allocations.clear(); scope.clear(); next = 0;
-    workers = function->getParentOfType<ModuleOp>()->getAttrOfType<cpu::CapabilitiesAttr>(
-        "intent_cpu.capabilities").getWorkers();
     SmallVector<std::string> signature;
     for (auto [number, argument] : llvm::enumerate(function.getArguments())) {
       std::string name = "a" + std::to_string(number);
@@ -238,20 +236,20 @@ private:
     return success();
   }
 
-  LogicalResult parallel(scf::ParallelOp parallel) {
-    if (parallel.getNumLoops() != 1 || parallel.getNumResults())
-      return parallel.emitError("Mojo serialization requires a realized one-dimensional task region");
+  LogicalResult dispatch(cpu::TaskDispatchOp dispatch) {
+    Block &body = dispatch.getBody().front();
     SmallVector<std::string> captures;
     for (const std::string &value : scope) captures.push_back("imm " + value);
     auto saved = scope.size();
     std::string task = "task_" + std::to_string(next++);
-    std::string iv = fresh(parallel.getInductionVars()[0]);
+    std::string iv = fresh(body.getArgument(0));
     line("def " + task + "(" + iv + ": Int) {" + join(captures) + "}:");
     ++indent;
-    if (failed(block(*parallel.getBody()))) return failure();
+    if (failed(block(body))) return failure();
+    if (body.getOperations().size() == 1) line("pass");
     --indent;
     scope.resize(saved);
-    line("parallelize(" + task + ", " + name(parallel.getUpperBound()[0]) + ", " + std::to_string(workers) + ")");
+    line("parallelize(" + task + ", " + name(dispatch.getCount()) + ", " + name(dispatch.getWorkerCount()) + ")");
     return success();
   }
 
@@ -488,8 +486,8 @@ private:
       return forLoop(op);
     } else if (auto op = dyn_cast<scf::WhileOp>(operation)) {
       return whileLoop(op);
-    } else if (auto op = dyn_cast<scf::ParallelOp>(operation)) {
-      return parallel(op);
+    } else if (auto op = dyn_cast<cpu::TaskDispatchOp>(operation)) {
+      return dispatch(op);
     } else if (auto op = dyn_cast<scf::IfOp>(operation)) {
       return conditional(op);
     } else if (auto op = dyn_cast<arith::CmpIOp>(operation)) {
@@ -609,7 +607,6 @@ private:
   llvm::DenseMap<Value, std::string> allocations;
   SmallVector<std::string> scope;
   unsigned indent = 0, next = 0;
-  int64_t workers = 0;
 };
 
 }

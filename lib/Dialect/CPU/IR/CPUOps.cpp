@@ -23,8 +23,30 @@ LogicalResult TasksOp::verify() {
   llvm::APInt count;
   if (matchPattern(getCount(), m_ConstantInt(&count)) && count.isNegative())
     return emitOpError("task count cannot be negative");
-  if (getOperation()->getParentOfType<TasksOp>())
+  if (getOperation()->getParentOfType<TasksOp>() || getOperation()->getParentOfType<TaskDispatchOp>())
     return emitOpError("nested task scheduling has not been realized by CPU partitioning");
+  return success();
+}
+
+LogicalResult TaskDispatchOp::verify() {
+  Block &body = getBody().front();
+  if (body.empty() || body.getNumArguments() != 1 ||
+      !body.getArgument(0).getType().isIndex() || !isa<TaskYieldOp>(body.getTerminator()))
+    return emitOpError("task dispatch requires one coordinate and task_yield");
+  llvm::APInt count;
+  if (matchPattern(getCount(), m_ConstantInt(&count)) && count.isNegative())
+    return emitOpError("task dispatch count cannot be negative");
+  llvm::APInt workers;
+  if (matchPattern(getWorkerCount(), m_ConstantInt(&workers)) && !workers.isStrictlyPositive())
+    return emitOpError("task dispatch worker budget must be positive");
+  if (getOperation()->getParentOfType<TasksOp>() || getOperation()->getParentOfType<TaskDispatchOp>())
+    return emitOpError("task dispatch cannot introduce nested scheduling");
+  return success();
+}
+
+LogicalResult TaskYieldOp::verify() {
+  if (!isa<TasksOp, TaskDispatchOp>(getOperation()->getParentOp()))
+    return emitOpError("must terminate tasks or task_dispatch");
   return success();
 }
 
