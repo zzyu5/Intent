@@ -113,7 +113,7 @@ for row in I.parallel(I.domain(0, M)):
 
 ## 6. Ordered control 与 carry
 
-普通Python `if`、`for`、`while` lower为structured control。普通domain iteration按logical order执行，循环中更新的SSA values是loop carry。
+普通Python `if`、`for`、`while` lower为structured control。普通domain iteration按logical order执行，循环中更新的SSA values是loop carry。每个carry的初值、循环参数与每轮更新值必须保持相同的dtype、rank和可证明相同的logical shape；tuple/record按component检查。循环体内的broadcast不会扩大carry的初始schema。
 
 ```python
 state = initial

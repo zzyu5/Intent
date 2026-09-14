@@ -37,7 +37,7 @@ Ranked tensor与external view的`.shape`是logical extent tuple；dynamic member
 
 ## 3. Literals 与 promotion
 
-Python literal是untyped source literal，可以按直接使用位置的expected dtype实例化，前提是其值可表示。
+Python literal是untyped source literal，可以按直接使用位置的expected dtype实例化，前提是其值可表示。首次形成runtime value而没有expected dtype时，Python `bool/int/float`分别实例化为`bool/i64/f64`；后续使用不反向改变已形成value的dtype。
 
 Pointwise表达式在frontend确定结果dtype，再以显式typed operations进入KIR；不让provider默认promotion重新决定逻辑结果。下面的混合runtime dtype显式转换规则是本surface的数值选择，不是Triton或typed IR的必然要求。跨provider一致性来自统一的语言规则及其lowering，不要求所有语言都禁止implicit promotion：
 

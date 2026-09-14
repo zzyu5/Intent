@@ -19,6 +19,10 @@ another language. Do not infer outputs from the particular input distribution.
 The editing directory is not a Git repository. Do not run Git commands or try to
 install/import the execution environment here; submission invokes that environment.
 
+Before submitting, review the complete source against TASK.md and the queried
+rules. Check the returned callable and its defaults, the result tree, runtime
+argument order, and the dtype and shape of loop state and helper results.
+
 For Intent generation, define ordinary @intent.kernel / @intent.fn programs using
 intent.language. Inside build, use context.compile("unique_literal_name", kernel,
 constexprs={...}) for each kernel. This invokes the unmodified public
