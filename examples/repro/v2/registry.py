@@ -310,6 +310,12 @@ MOJO = (
     Entry("adamw_split", "N8388608-f32-split2-8cores-host", "adamw_split", ("variants/decomposition.py:adamw_update_moments", "variants/decomposition.py:adamw_update_parameter"), "source/pytorch/cpu_runtime.py"),
     Entry("adafactor_scalar_product", "4096x4096-f32-3kernels-8cores-host", "adafactor_scalar_product", ("optimization/adafactor.py:adafactor_update_rows", "optimization/adafactor.py:adafactor_update_columns", "variants/decomposition.py:adafactor_apply_scalar_product"), "source/pytorch/cpu_runtime.py"),
     Entry("reshape_and_cache_split", "T4096-H8-D128-cache2048x16-f16-8cores-host", "reshape_and_cache_split", ("variants/decomposition.py:reshape_key_cache", "variants/decomposition.py:reshape_value_cache"), "source/pytorch/cpu_runtime.py"),
+    Entry("flash_attention_f16", "B4-H32-S4096-D128-f16-causal-8cores-host", "flash_attention_fwd", ("streaming/attention.py:flash_attention_fwd",), "source/pytorch/cpu_runtime.py"),
+    Entry("flash_gqa_attention_f16", "B4-QH32-KVH8-S4096-D128-f16-causal-8cores-host", "flash_gqa_attention_fwd", ("streaming/attention.py:flash_gqa_attention_fwd",), "source/pytorch/cpu_runtime.py"),
+    Entry("continuous_gqa_decode", "B32-QH32-KVH8-K8192-D128-f16-mask1-8cores-host", "continuous_gqa_decode", ("streaming/attention.py:continuous_gqa_decode",), "source/pytorch/cpu_runtime.py"),
+    Entry("flash_varlen_gqa_prefill", "B8-U29184-QH32-KVH8-D128-f16-causal-8cores-host", "flash_varlen_gqa_prefill", ("streaming/attention.py:flash_varlen_gqa_prefill",), "source/pytorch/cpu_runtime.py"),
+    Entry("flash_attention_bias", "B4-H32-S4096-D128-f16-bias-f32-8cores-host", "flash_attention_bias_fwd", ("streaming/attention.py:flash_attention_bias_fwd",), None),
+    Entry("flash_varlen_attention", "B8-U29114-D128-f16-balanced-causal-8cores-host", "flash_varlen_attention_fwd", ("streaming/attention.py:flash_varlen_attention_fwd",), None),
 )
 
 

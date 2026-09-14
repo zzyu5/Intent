@@ -159,6 +159,30 @@ def flash_attention_bf16_fwd(query, key, value, scale):
     return F.scaled_dot_product_attention(query.float(), keys, values, is_causal=True, scale=scale).to(query.dtype)
 
 
+def continuous_gqa_decode(query, key, value, valid_mask, scale):
+    results = []
+    for batch in range(query.shape[0]):
+        key_heads = key.shape[2]
+        q = query[batch].float().reshape(key_heads, query.shape[1] // key_heads, query.shape[2])
+        scores = (q @ key[batch].float().permute(1, 2, 0)) * scale
+        valid = valid_mask[batch].T[:, None, :] != 0
+        active = valid.any(dim=-1, keepdim=True)
+        scores = torch.where(valid, scores, float('-inf'))
+        probabilities = torch.softmax(torch.where(active, scores, 0.0), dim=-1)
+        result = probabilities @ value[batch].float().permute(1, 0, 2)
+        results.append(torch.where(active, result, 0.0).reshape(query.shape[1], value.shape[-1]).to(query.dtype))
+    return torch.stack(results)
+
+
+def flash_varlen_gqa_prefill(query, key, value, sequence_lengths, offsets, scale):
+    output = torch.empty((query.shape[0], query.shape[1], value.shape[-1]), dtype=query.dtype)
+    for sequence in range(sequence_lengths.numel()):
+        begin, end = int(offsets[sequence]), int(offsets[sequence + 1])
+        tensors = tuple(tensor[begin:end].transpose(0, 1).unsqueeze(0) for tensor in (query, key, value))
+        output[begin:end] = flash_attention_bf16_fwd(*tensors, scale)[0].transpose(0, 1)
+    return output
+
+
 def swiglu(gate, up):
     values = gate.float()
     sigmoid = 1.0 / (1.0 + torch.exp(-values))

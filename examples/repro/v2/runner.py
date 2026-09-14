@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -40,6 +40,7 @@ FIELDS = (
 )
 
 WORKER_TIMEOUT_SECONDS = 300
+CPU_WAIT_ENVIRONMENT = {"OMP_WAIT_POLICY": "PASSIVE", "KMP_BLOCKTIME": "0", "GOMP_SPINCOUNT": "0"}
 
 
 def _target(provider: str, entry):
@@ -146,6 +147,9 @@ def _run_entry(
         return ResultRow(entry.kernel, entry.case, None, None, None, status,
                          "; ".join(str(error).splitlines()[:2]))
 
+    if provider == "mojo":
+        settings = ", ".join(f"{name}={os.environ.get(name, 'unset')}" for name in CPU_WAIT_ENVIRONMENT)
+        comparison = replace(comparison, note=comparison.note + " CPU idle wait: " + settings + ".")
     try:
         generated_p50, source_p50 = evaluate(
             comparison, before_benchmark=before_benchmark,
@@ -266,6 +270,9 @@ def _run_batch(arguments, indexes, publish) -> None:
                     command.extend(("--tuning-config", str(arguments.tuning_config)))
                 process = subprocess.Popen(
                     command, stdin=subprocess.PIPE, text=True, start_new_session=True,
+                    # Torch preparation and Mojo execution use separate pools
+                    # on the same CPU budget; idle workers must yield the cores.
+                    env={**os.environ, **CPU_WAIT_ENVIRONMENT} if provider == "mojo" else None,
                 )
                 workers.append(_Worker(index, process, output, phase, time.monotonic()))
                 print(f"{provider}:{BY_PROVIDER[provider][index].kernel}: preparing", flush=True)

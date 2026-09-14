@@ -57,7 +57,7 @@ def prepare_comparison(context, definition, arguments, runtime_path, tolerance, 
     )
 
 
-def prepare_host_comparison(context, definition, arguments, reference, tolerance, *, constexprs=None):
+def prepare_host_comparison(context, definition, arguments, reference, tolerance, *, constexprs=None, note=""):
     report_stage("generated_compilation")
     artifact = intent.compile(definition, target=context.target, compiler=context.compiler,
                               tuning_config=context.tuning_config, constexprs=constexprs)
@@ -81,5 +81,5 @@ def prepare_host_comparison(context, definition, arguments, reference, tolerance
     return PreparedComparison(
         side(artifact.run, artifact._namespace["native_program"]), side(getattr(runtime, reference)), tolerance,
         cuda_graph=False, device_type="cpu", cpu_host_timing=True,
-        note="既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。",
+        note="既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。" + note,
     )

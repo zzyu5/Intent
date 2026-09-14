@@ -6,6 +6,10 @@ import torch
 from kernels.streaming.attention_specialized import gemma_gqa_decode_partials
 from kernels.streaming.attention_f32 import causal_attention_f32, causal_linear_attention_f32
 from kernels.streaming.attention import flash_attention_bf16_fwd
+from kernels.streaming.attention import flash_attention_fwd, flash_gqa_attention_fwd
+from kernels.streaming.attention import flash_attention_bias_fwd, continuous_gqa_decode
+from kernels.streaming.attention import flash_varlen_attention_fwd, flash_varlen_gqa_prefill
+from kernels.streaming.attention import VARLEN_BATCH, VARLEN_TOTAL_TOKENS
 from kernels.streaming.block_sparse_attention import block_sparse_gqa_decode_combine
 from kernels.streaming.block_sparse_attention import block_sparse_gqa_decode_partials
 from kernels.streaming.paged_attention import paged_gqa_decode_partials
@@ -15,6 +19,9 @@ from ...loading import load_module
 from ...measurement import report_stage
 from ...model import Context, PreparedComparison, PreparedLaunch, Tolerance
 from .common import configure_cpu_budget, prepare_comparison, prepare_host_comparison
+
+
+F16_PRECISION_NOTE = "生成端保留作者的chunk概率f16转换后与V作f32累加；CPU数学reference使用f32概率，最终双方输出f16；沿用原production容差。"
 
 
 def causal_attention(context):
@@ -46,6 +53,78 @@ def flash_attention_bf16(context):
         Tolerance(atol=5e-2, rtol=2e-2),
         constexprs={"HEAD_GROUP": 4, "CAUSAL": True},
     )
+
+
+def flash_attention_f16(context):
+    q = torch.randn((4, 32, 4096, 128), dtype=torch.float16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    return prepare_host_comparison(context, flash_attention_fwd, (q, k, v, 128**-0.5),
+                                   "flash_attention_bf16_fwd", Tolerance(atol=2e-2, rtol=2e-2),
+                                   constexprs={"CAUSAL": True}, note=F16_PRECISION_NOTE)
+
+
+def flash_gqa_attention_f16(context):
+    q = torch.randn((4, 32, 4096, 128), dtype=torch.float16)
+    k = torch.randn((4, 8, 4096, 128), dtype=torch.float16)
+    v = torch.randn_like(k)
+    return prepare_host_comparison(context, flash_gqa_attention_fwd, (q, k, v, 128**-0.5),
+                                   "flash_attention_bf16_fwd", Tolerance(atol=5e-2, rtol=2e-2),
+                                   constexprs={"HEAD_GROUP": 4, "CAUSAL": True}, note=F16_PRECISION_NOTE)
+
+
+def continuous_gqa(context):
+    q = torch.randn((32, 32, 128), dtype=torch.float16)
+    k = torch.randn((32, 8192, 8, 128), dtype=torch.float16)
+    v = torch.randn_like(k)
+    mask = torch.ones((32, 8192, 8), dtype=torch.uint8)
+    return prepare_host_comparison(context, continuous_gqa_decode, (q, k, v, mask, 128**-0.5),
+                                   "continuous_gqa_decode", Tolerance(atol=5e-2, rtol=2e-2),
+                                   constexprs={"HEAD_GROUP": 4}, note=F16_PRECISION_NOTE)
+
+
+def varlen_gqa_prefill(context):
+    lengths = torch.tensor((4096, 3968, 3840, 3712, 3584, 3456, 3328, 3200), dtype=torch.int32)
+    offsets = torch.cat((torch.zeros(1, dtype=torch.int32), lengths.cumsum(0).int()))
+    q = torch.randn((29184, 32, 128), dtype=torch.float16)
+    k = torch.randn((29184, 8, 128), dtype=torch.float16)
+    v = torch.randn_like(k)
+    return prepare_host_comparison(context, flash_varlen_gqa_prefill,
+                                   (q, k, v, lengths, offsets, 128**-0.5),
+                                   "flash_varlen_gqa_prefill", Tolerance(atol=5e-2, rtol=2e-2),
+                                   constexprs={"HEAD_GROUP": 4}, note=F16_PRECISION_NOTE)
+
+
+def _attention_run_only(context, definition, arguments, constexprs, note):
+    report_stage("generated_compilation")
+    artifact = intent.compile(definition, target=context.target, compiler=context.compiler,
+                              tuning_config=context.tuning_config, constexprs=constexprs)
+    state = {}
+
+    def launch():
+        state["output"] = artifact.run(*arguments)
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(PreparedLaunch(launch, lambda: state["output"]), None, None,
+        cuda_graph=False, status="run_only", device_type="cpu", cpu_host_timing=True, note=note)
+
+
+def biased_attention(context):
+    q = torch.randn((4, 32, 4096, 128), dtype=torch.float16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    bias = torch.randn((4, 32, 4096), dtype=torch.float32)
+    return _attention_run_only(context, flash_attention_bias_fwd, (q, k, v, bias, 128**-0.5), {},
+        "既有B4/H32/S4096/D128 f16 attention+bias f32 metadata；原provider没有可运行reference和容差，仅验证当前kernel完整host调用可运行，输出f16，非causal，不作数值或相对性能结论。")
+
+
+def varlen_attention(context):
+    lengths = torch.full((VARLEN_BATCH,), VARLEN_TOTAL_TOKENS // VARLEN_BATCH, dtype=torch.int32)
+    lengths[:VARLEN_TOTAL_TOKENS % VARLEN_BATCH] += 1
+    offsets = torch.cat((torch.zeros(1, dtype=torch.int32), lengths.cumsum(0).int()))
+    q = torch.randn((VARLEN_TOTAL_TOKENS, 128), dtype=torch.float16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    return _attention_run_only(context, flash_varlen_attention_fwd,
+        (q, k, v, lengths, offsets, 128**-0.5), {"CAUSAL": True},
+        "按作者B8/U29114常量构造平衡分段，f16/D128/causal；该entry无既有production runner、reference或容差，仅验证完整host调用可运行，不作数值或相对性能结论。")
 
 
 def gemma_decode(context: Context) -> PreparedComparison:
@@ -329,6 +408,12 @@ CASES = {
     "causal_attention_f32": causal_attention,
     "causal_linear_attention_f32": causal_linear_attention,
     "flash_attention_bf16": flash_attention_bf16,
+    "flash_attention_f16": flash_attention_f16,
+    "flash_gqa_attention_f16": flash_gqa_attention_f16,
+    "continuous_gqa_decode": continuous_gqa,
+    "flash_varlen_gqa_prefill": varlen_gqa_prefill,
+    "flash_attention_bias": biased_attention,
+    "flash_varlen_attention": varlen_attention,
     "gemma_decode": gemma_decode,
     "paged_gqa_decode": paged_gqa_decode,
     "block_sparse_gqa_decode": block_sparse_gqa_decode,
