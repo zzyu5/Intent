@@ -204,6 +204,47 @@ private:
     return result;
   }
 
+  LogicalResult bindShape(Operation *operation) {
+    auto shape = operation->getAttrOfType<ShapeRelationAttr>("shape");
+    if (!shape) return success();
+    Location loc = operation->getLoc();
+    SmallVector<Value> sizes;
+    std::optional<int64_t> inferred;
+    for (Attribute axis : shape.getAxes()) {
+      auto expression = cast<ShapeExprAttr>(axis);
+      if (expression.getKind() == 2) {
+        inferred = expression.getDimension();
+        continue;
+      }
+      Value size;
+      if (expression.getKind() == 0) {
+        size = constant(loc, expression.getPayload());
+      } else {
+        Value operand = operation->getOperand(expression.getPayload());
+        auto extent = indexValue(values.lookup(operand), operand.getType(), loc);
+        if (failed(extent)) return failure();
+        size = *extent;
+      }
+      dimensions[expression.getDimension()] = size;
+      sizes.push_back(size);
+    }
+    if (inferred) {
+      Value knownElements = constant(loc, 1);
+      for (Value size : sizes)
+        knownElements = builder.createOrFold<arith::MulIOp>(loc, knownElements, size);
+      if (matchPattern(knownElements, m_Zero()))
+        return operation->emitError("CPU inferred reshape requires a uniquely determined extent");
+      Value source = values.lookup(operation->getOperand(0));
+      Value sourceElements = constant(loc, 1);
+      for (int64_t axis = 0; axis < cast<MemRefType>(source.getType()).getRank(); ++axis)
+        sourceElements = builder.createOrFold<arith::MulIOp>(loc, sourceElements,
+            builder.createOrFold<memref::DimOp>(loc, source, axis));
+      // A legal inferred reshape has a nonzero known product and exact quotient.
+      dimensions[*inferred] = builder.createOrFold<arith::DivSIOp>(loc, sourceElements, knownElements);
+    }
+    return success();
+  }
+
   Value allocate(RankedTensorType tensor, ArrayRef<Value> sizes, Location loc) {
     SmallVector<Value> dynamic;
     for (auto [axis, size] : llvm::enumerate(sizes))
@@ -1716,6 +1757,7 @@ private:
 
   LogicalResult lowerOperation(Operation *operation) {
     Location loc = operation->getLoc();
+    if (failed(bindShape(operation))) return failure();
     if (auto op = dyn_cast<ConstantOp>(operation)) {
       Type type = op.getResult().getType();
       TypedAttr attribute;
@@ -1780,7 +1822,10 @@ private:
       Value coordinate = builder.createOrFold<arith::AddIOp>(loc, domain.begin,
           builder.createOrFold<arith::MulIOp>(loc, parallel.getInductionVars()[0], domain.step));
       values.map(op.getBody().front().getArgument(0), coordinate);
-      return lowerBlock(op.getBody().front());
+      auto savedDimensions = dimensions;
+      LogicalResult result = lowerBlock(op.getBody().front());
+      dimensions = std::move(savedDimensions);
+      return result;
     } else if (isa<IfOp, ForOp, WhileOp>(operation)) {
       return orderedControl(operation);
     } else if (auto op = dyn_cast<BufferOp>(operation)) {
@@ -1888,6 +1933,32 @@ private:
       auto tensor = cast<RankedTensorType>(operation->getResult(0).getType());
       auto sizes = extents(tensor, loc);
       if (failed(sizes)) return failure();
+      auto allocation = input.getDefiningOp<memref::AllocOp>();
+      Value logicalInput = operation->getOperand(0);
+      if (isa<ReshapeOp>(operation) && logicalInput.hasOneUse() &&
+          isa_and_nonnull<ViewLoadOp, GatherOp>(logicalInput.getDefiningOp()) && allocation &&
+          allocation->getBlock() == builder.getInsertionBlock() && source.getLayout().isIdentity() &&
+          source.getElementType() == tensor.getElementType()) {
+        auto type = MemRefType::get(tensor.getShape(), tensor.getElementType(),
+            MemRefLayoutAttrInterface(), source.getMemorySpace());
+        SmallVector<int64_t> staticStrides;
+        int64_t offset;
+        if (failed(type.getStridesAndOffset(staticStrides, offset)))
+          return operation->emitError("CPU contiguous reshape has no row-major strides");
+        SmallVector<OpFoldResult> shape(tensor.getRank()), strides(tensor.getRank());
+        Value stride = constant(loc, 1);
+        for (int64_t axis = tensor.getRank() - 1; axis >= 0; --axis) {
+          shape[axis] = tensor.isDynamicDim(axis) ? OpFoldResult((*sizes)[axis])
+              : OpFoldResult(builder.getIndexAttr(tensor.getDimSize(axis)));
+          strides[axis] = ShapedType::isDynamic(staticStrides[axis]) ? OpFoldResult(stride)
+              : OpFoldResult(builder.getIndexAttr(staticStrides[axis]));
+          if (axis) stride = builder.createOrFold<arith::MulIOp>(loc, stride, (*sizes)[axis]);
+        }
+        Value view = builder.create<memref::ReinterpretCastOp>(loc, type, input,
+            builder.getIndexAttr(0), shape, strides);
+        values.map(operation->getResult(0), view);
+        return success();
+      }
       SmallVector<AffineExpr> coordinates(source.getRank());
       if (auto transpose = dyn_cast<TransposeOp>(operation)) {
         for (auto [axis, permuted] : llvm::enumerate(transpose.getPermutation()))

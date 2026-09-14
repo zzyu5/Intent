@@ -15,24 +15,25 @@ namespace intent::cpu {
 namespace {
 
 struct PreparedInput {
-  linalg::GenericOp producer;
+  linalg::LinalgOp producer;
   memref::AllocOp allocation;
   memref::DeallocOp end;
   ImplementationAttr consumer;
 };
 
-std::optional<PreparedInput> scopedInput(linalg::GenericOp producer, Operation *loop,
+std::optional<PreparedInput> scopedInput(linalg::LinalgOp producer, Operation *loop,
     PhysicalProgramAnalysis &physical, ArrayRef<MemoryEffects::EffectInstance> effects,
-    ArrayRef<MemoryAccess> accesses) {
-  if (producer.getNumResults() || producer.getNumDpsInits() != 1 || producer.getNumReductionLoops() ||
+    ArrayRef<MemoryAccess> accesses, const llvm::SmallDenseSet<Value> &groupInputs) {
+  if (producer->getNumResults() || producer.getNumDpsInits() != 1 || producer.getNumReductionLoops() ||
       !producer.getIndexingMapsArray().back().isIdentity() ||
-      !producer.getRegion().front().getArguments().back().use_empty()) return std::nullopt;
-  auto allocation = producer.getOutputs()[0].getDefiningOp<memref::AllocOp>();
+      !producer->getRegion(0).front().getArguments().back().use_empty()) return std::nullopt;
+  auto allocation = producer.getDpsInits()[0].getDefiningOp<memref::AllocOp>();
   if (!allocation || allocation->getBlock() != producer->getBlock() ||
       !allocation->isBeforeInBlock(producer)) return std::nullopt;
   auto stable = [&](Value memory) {
     if (physical.isReadOnly(memory)) return true;
     Value root = physical.storageRoot(memory);
+    if (groupInputs.contains(root)) return true;
     Operation *owner = root.getDefiningOp();
     if (!isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(owner) || loop->isAncestor(owner)) return false;
     if (llvm::any_of(accesses, [&](const MemoryAccess &access) {
@@ -43,9 +44,9 @@ std::optional<PreparedInput> scopedInput(linalg::GenericOp producer, Operation *
           (effect.getValue() && physical.storageRoot(effect.getValue()) != root);
     });
   };
-  for (Value input : producer.getInputs())
+  for (Value input : producer.getDpsInputs())
     if (isa<MemRefType>(input.getType()) && !stable(input)) return std::nullopt;
-  for (Operation &operation : producer.getRegion().front().without_terminator()) {
+  for (Operation &operation : producer->getRegion(0).front().without_terminator()) {
     if (operation.getNumRegions()) return std::nullopt;
     if (auto load = dyn_cast<memref::LoadOp>(operation)) {
       if (!stable(load.getMemref())) return std::nullopt;
@@ -64,6 +65,7 @@ std::optional<PreparedInput> scopedInput(linalg::GenericOp producer, Operation *
       if (!loop->isAncestor(user)) return std::nullopt;
       if (auto view = dyn_cast<memref::SubViewOp>(user)) aliases.push_back(view.getResult());
       else if (auto cast = dyn_cast<memref::CastOp>(user)) aliases.push_back(cast.getResult());
+      else if (auto view = dyn_cast<memref::ReinterpretCastOp>(user)) aliases.push_back(view.getResult());
       else if (isa<memref::DimOp>(user)) continue;
       else if (auto end = dyn_cast<memref::DeallocOp>(user)) {
         if (value != allocation.getResult() || result.end || end->getBlock() != producer->getBlock())
@@ -98,6 +100,7 @@ void groupScopedInputs(func::FuncOp function) {
   });
   for (Operation *loop : llvm::reverse(loops)) {
     Value lower, upper, step, induction;
+    SmallVector<Value> outerCoordinates;
     Block *body;
     if (auto serial = dyn_cast<scf::ForOp>(loop)) {
       if (serial.getNumResults()) continue;
@@ -105,9 +108,10 @@ void groupScopedInputs(func::FuncOp function) {
       induction = serial.getInductionVar(); body = serial.getBody();
     } else {
       auto parallel = cast<scf::ParallelOp>(loop);
-      if (parallel.getNumLoops() != 1 || parallel.getNumResults()) continue;
-      lower = parallel.getLowerBound()[0]; upper = parallel.getUpperBound()[0]; step = parallel.getStep()[0];
-      induction = parallel.getInductionVars()[0]; body = parallel.getBody();
+      if (!parallel.getNumLoops() || parallel.getNumResults()) continue;
+      lower = parallel.getLowerBound().back(); upper = parallel.getUpperBound().back(); step = parallel.getStep().back();
+      induction = parallel.getInductionVars().back(); body = parallel.getBody();
+      llvm::append_range(outerCoordinates, ValueRange(parallel.getInductionVars()).drop_back());
     }
     if (getConstantIntValue(lower) != 0 || getConstantIntValue(step) != 1) continue;
     auto effects = getEffectsRecursively(loop);
@@ -125,13 +129,18 @@ void groupScopedInputs(func::FuncOp function) {
       if (quotient.getLhs() != induction || !divisor || *divisor <= 1) continue;
       SmallVector<PreparedInput> preparations;
       llvm::SetVector<Operation *> dependencies;
-      for (auto producer : body->getOps<linalg::GenericOp>()) {
-        auto prepared = scopedInput(producer, loop, physical, *effects, accesses);
+      llvm::SmallDenseSet<Value> groupInputs;
+      bool groupDependent = false;
+      for (Operation &operation : body->without_terminator()) {
+        auto producer = dyn_cast<linalg::LinalgOp>(operation);
+        if (!producer) continue;
+        auto prepared = scopedInput(producer, loop, physical, *effects, accesses, groupInputs);
         if (!prepared) continue;
         llvm::SetVector<Operation *> needed;
         bool usesQuotient = false;
         std::function<bool(Value)> invariant = [&](Value value) {
           if (value == quotient.getResult()) { usesQuotient = true; return true; }
+          if (groupInputs.contains(value) || llvm::is_contained(outerCoordinates, value)) return true;
           Operation *scope = value.getParentRegion()->getParentOp();
           if (scope != loop && !loop->isAncestor(scope)) return true;
           Operation *definition = value.getDefiningOp();
@@ -143,23 +152,29 @@ void groupScopedInputs(func::FuncOp function) {
           return true;
         };
         llvm::SetVector<Value> inputs;
-        getUsedValuesDefinedAbove(producer.getRegion(), inputs);
-        inputs.insert(producer.getInputs().begin(), producer.getInputs().end());
+        getUsedValuesDefinedAbove(producer->getRegion(0), inputs);
+        auto operands = producer.getDpsInputs();
+        inputs.insert(operands.begin(), operands.end());
         inputs.insert(prepared->allocation->operand_begin(), prepared->allocation->operand_end());
-        if (!llvm::all_of(inputs, invariant) || !usesQuotient) continue;
+        if (!llvm::all_of(inputs, invariant)) continue;
         dependencies.insert(needed.begin(), needed.end());
         preparations.push_back(*prepared);
+        groupInputs.insert(prepared->allocation.getResult());
+        groupDependent |= usesQuotient;
       }
-      if (preparations.empty()) continue;
+      if (!groupDependent) continue;
       OpBuilder builder(loop);
       Location loc = loop->getLoc();
       Value size = index(builder, loc, *divisor);
       Value count = builder.create<arith::CeilDivSIOp>(loc, upper, size);
       Value ordinal;
       Block *group;
-      if (isa<scf::ParallelOp>(loop)) {
-        auto outer = builder.create<scf::ParallelOp>(loc, ValueRange{lower}, ValueRange{count}, ValueRange{step});
-        group = outer.getBody(); ordinal = outer.getInductionVars()[0];
+      scf::ParallelOp parallel = dyn_cast<scf::ParallelOp>(loop), outerParallel;
+      if (parallel) {
+        SmallVector<Value> ends(parallel.getUpperBound());
+        ends.back() = count;
+        outerParallel = builder.create<scf::ParallelOp>(loc, parallel.getLowerBound(), ends, parallel.getStep());
+        group = outerParallel.getBody(); ordinal = outerParallel.getInductionVars().back();
       } else {
         auto outer = builder.create<scf::ForOp>(loc, lower, count, step);
         group = outer.getBody(); ordinal = outer.getInductionVar();
@@ -169,24 +184,35 @@ void groupScopedInputs(func::FuncOp function) {
       Value remaining = builder.create<arith::SubIOp>(loc, upper, begin);
       Value extent = builder.create<arith::MinSIOp>(loc, size, remaining);
       Value end = add(builder, loc, begin, extent);
-      loop->moveBefore(group->getTerminator());
-      if (auto serial = dyn_cast<scf::ForOp>(loop)) {
-        serial.setLowerBound(begin); serial.setUpperBound(end);
+      if (parallel) {
+        auto inner = builder.create<scf::ForOp>(loc, begin, end, step);
+        auto replacements = outerParallel.getInductionVars();
+        for (auto [original, replacement] : llvm::zip(outerCoordinates, ArrayRef(replacements).drop_back()))
+          original.replaceAllUsesWith(replacement);
+        induction.replaceAllUsesWith(inner.getInductionVar());
+        for (Operation &operation : llvm::make_early_inc_range(body->without_terminator()))
+          operation.moveBefore(inner.getBody()->getTerminator());
+        parallel.erase();
+        loop = inner;
+        body = inner.getBody();
       } else {
-        auto parallel = cast<scf::ParallelOp>(loop);
-        parallel.getLowerBoundMutable().assign(ValueRange{begin});
-        parallel.getUpperBoundMutable().assign(ValueRange{end});
+        auto serial = cast<scf::ForOp>(loop);
+        serial->moveBefore(group->getTerminator());
+        serial.setLowerBound(begin); serial.setUpperBound(end);
       }
       quotient.getResult().replaceAllUsesWith(ordinal);
       quotient.erase();
-      for (Operation *dependency : dependencies) dependency->moveBefore(loop);
-      // The representation has one owner for the quotient range; every inner
-      // iteration only reads it, and the original consumer order is retained.
       for (auto preparation : preparations) {
-        preparation.allocation->moveBefore(loop);
-        preparation.producer->moveBefore(loop);
-        preparation.end->moveAfter(loop);
+        dependencies.insert(preparation.allocation);
+        dependencies.insert(preparation.producer);
       }
+      SmallVector<Operation *> ordered;
+      for (Operation &operation : body->without_terminator())
+        if (dependencies.contains(&operation)) ordered.push_back(&operation);
+      // Preserve the preparation chain's original order, including allocations
+      // used by later views and producers; all consumers finish before release.
+      for (Operation *operation : ordered) operation->moveBefore(loop);
+      for (auto preparation : preparations) preparation.end->moveAfter(loop);
       break;
     }
   }
@@ -202,7 +228,7 @@ std::optional<PreparedInput> preparedInput(linalg::GenericOp producer) {
   auto allocation = output.getDefiningOp<memref::AllocOp>();
   if (!allocation || allocation->getBlock() != producer->getBlock() ||
       !allocation->isBeforeInBlock(producer)) return std::nullopt;
-  PreparedInput result{producer, allocation, {}, {}};
+  PreparedInput result{cast<linalg::LinalgOp>(producer.getOperation()), allocation, {}, {}};
   SmallVector<Value> aliases{output};
   llvm::SmallDenseSet<Value> seen;
   SmallVector<Operation *> users;
@@ -253,7 +279,7 @@ bool equivalent(PreparedInput &lhs, PreparedInput &rhs, PhysicalProgramAnalysis 
           return llvm::is_contained(map.getResults(), loop);
         })) return false;
   }
-  for (Value input : lhs.producer.getInputs())
+  for (Value input : lhs.producer.getDpsInputs())
     if (isa<MemRefType>(input.getType()) && !physical.mayReadAt(input, lhs.producer, rhs.producer)) return false;
   llvm::DenseMap<Value, Value> pairs;
   pairs[lhs.allocation] = rhs.allocation;
