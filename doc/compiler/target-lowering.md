@@ -36,6 +36,8 @@ Passes查询features而不是匹配设备名称。SM90、SM100、SM120或gfx fam
 
 否则使用thin legalization或直接serialization。
 
+设计local form前先核对source与provider的operation合同。合同相同且provider已有原生primitive时，优先直接映射；不能因为Intent内部helper的组织方式，重新分类或实现provider已负责的reduce/scan tree、thread communication或layout strategy。额外更强的顺序或数值要求须有明确作者语义依据，不能从现有lowering或旧文档的偶然限制反推必要性。
+
 显式近似数学与 FTZ 属于已有 unary/binary operation 的共同数值语义，不为 provider API 名称另建 dialect。Provider legality 检查 dtype 与硬件能力；serialization 机械发出满足该数值属性的原语或原语包装，不开启影响整份 kernel 的 fast-math 编译选项。Cloning、bufferization 和 scalarization 必须保留这两个属性；普通运算的既有 lowering 不因相邻操作 opt-in 而改变。
 
 ## 4. Triton
@@ -47,9 +49,13 @@ Passes查询features而不是匹配设备名称。SM90、SM100、SM120或gfx fam
 - explicit access/validity/fill → pointer expressions、mask/other与`tl.load/store`；
 - predicate-proven physical effective ranges → 已选loop bounds、all-valid unmasked body与mixed-range guard；
 - gather/scatter/atomic →对应Triton operations；
-- physical reduce/scan/contract → `tl.reduce/associative_scan/dot/dot_scaled`或合法展开；
+- physical reduce → `tl.reduce`，保留已确定的component dtype、identity与NaN/tie规则；
+- physical scan → `tl.associative_scan`，保留prefix、direction与inclusive/exclusive语义；
+- physical contract/scaled contract → `tl.dot/dot_scaled`或满足原合同的合法展开；
 - physical region fold/scan → 已选segment loop、summarizer body、summary combine、scan apply/emit与其中显式structured operations；
 - structured control → Python/Triton structured control。
+
+普通reduce已经声明结合交换合同，provider无需从combine body重新证明该合同，也无需额外生成保序树或Scan+terminal路径。Triton的默认promotion、NaN规则或dot精度不一定等于Intent合同：先用已确定的类型转换、callback与原生精度选项闭合差异，不将“直接映射”理解为盲用默认参数，也不复制外部compiler的内部instruction dtype。
 
 Triton-local form可以包括真正影响source program的descriptor value/access、某些provider compile-time branches与Config binding。若pointer/descriptor只是终端spelling差异，可直接serialize；若descriptor选择改变operands、static block constraints并被多个passes消费，则用local extension op表达。
 
@@ -89,6 +95,8 @@ TileLang同样消费共同的grid、loops、fragments、accesses与structured co
 - synchronization与barrier forms。
 
 TileLang provider pass根据共同IR的lifetime、sharing、access、dependency与structured-op facts形成必要的storage/copy/sync extensions。Region fold/scan的segment loop、summary/state flow与chunk-local contract已经来自共同IR；TileLang只补其storage、copy、pipeline与sync形式。WGMMA、TCGEN05、mbarrier parity、named barrier、TMA instruction preference等只留在TileLang CUDA-target lowering或local extensions。
+
+TileLang的普通reduce与cumsum使用各自的原生operation。映射成立时，后续LayoutInference、reducer materialization及thread all-reduce属于TileLang compiler；Intent不复制这些plans。自定义combine若没有等价TileLang原语，必须按真实能力合法展开或拒绝，不能由固定sum/max等原语的存在推断任意callback均受支持。
 
 若共同program可以直接使用普通TileLang loops/access/compute表达，则不创建extension；不能为了让三家形式对称而强制Triton/cuTile也拥有allocation/copy dialect。
 

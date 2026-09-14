@@ -96,8 +96,8 @@ Intent 不提供允许 arbitrary body 随 compiler-selected extent 重新分段�
 
 语言区分五种结构：
 
-1. 每个 logical element 已经是 summary，只需要最终可重结合结果：`reduce`；
-2. 每个 logical element 已经是 summary，需要每个 logical prefix：`scan`；
+1. 每个 logical element 已经是 summary，combine可结合、可交换，只需要最终可重结合与重排的结果：`reduce`；
+2. 每个 logical element 已经是 summary，combine可结合，需要保持成员顺序的每个 logical prefix：`scan`；
 3. 作者定义“任意连续 source slice 怎样产生 summary”，只需要最终 summary：`region_fold`；
 4. 作者同时定义 slice summary、summary composition、incoming state application 与 slice output，需要每个 logical position 的结果：`region_scan`；
 5. 更新依赖严格顺序、动态停止、非结合 state或 ordered effects：普通 `for/while` 与 loop carry。
@@ -145,7 +145,7 @@ emit(A ++ B, state)
 
 `summarize`/`combine`/`apply`/`emit`都是typed pure helpers。`emit`产生与该source slice同一logical成员关系的output；operation把各slice outputs重新组成原source axis上的结果，并返回`apply(summarize(full_source), initial_state)`作为final state。Compiler选择的segment数量、边界和内部prefix states不可由作者观察，也不能成为result shape或ABI。若算法本身输出per-chunk states或chunk数量出现在ABI中，chunk是logical data，作者应使用显式chunk domain、source subregions与ordinary scan，而不是`region_scan`。
 
-`reduce/scan`是element-summary的受限形式；`region_fold/region_scan`只在作者确实写下region-level summarizer或emitter时使用。四者属于同一个homomorphic structured-operation family，共享summary schema、combine legality与physical realization规则；frontend将退化成纯element fold/scan的region写法canonicalize回ordinary reduce/scan，避免两条等价canonical路径。
+`reduce/scan`处理element summaries；`region_fold/region_scan`只在作者确实写下region-level summarizer或emitter时使用。它们可共享summary schema与pure helper检查，但不强制使用相同的顺序合同或physical realization。只有region body已经通过对应的ordinary reduce/scan声明相同的代数、顺序及prefix语义时，frontend才可canonicalize回该operation；不能把仅保证结合的ordered region fold改成允许交换的reduce。
 
 若 page、window、group 或 chunk boundary本身影响读取集合、输出shape或ABI，作者显式计算边界并构造source-derived subregion。若boundary只服务physical blocking，作者不写其extent；只有上述homomorphism使compiler-selected segmentation具有唯一语义。
 
@@ -153,8 +153,8 @@ emit(A ++ B, state)
 
 `reduce`、`scan`、`contract`、`scaled_contract`、`sparse_contract` 和 `histogram` 是 first-class logical tensor operations，不是 target primitive请求。
 
-- reduce 保存 accumulator schema、axes、identity 与 typed pure combine；
-- scan 保存相同 combine，并定义 direction 与 inclusive/exclusive prefixes；
+- reduce 保存 accumulator schema、axes、identity 与声明可结合、可交换的typed pure combine；
+- scan 保存可结合的typed pure combine，并定义保留成员顺序的direction与inclusive/exclusive prefixes；
 - contract 保存二元 multiply-add contraction 的 paired batch/reduction axes、free axes 与 accumulator；
 - scaled contract 用closed `[M,G,C]/[M,G] × [G,C,N]/[N,G]` positional schema保存microscaling formats、scale relation与逻辑contraction；
 - sparse contract 保存 compressed values、typed format schema、metadata interpretation与逻辑 contraction；
