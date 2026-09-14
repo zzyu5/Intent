@@ -1432,30 +1432,50 @@ bool sameInvariantExtent(Value lhs, Value rhs, ForOp loop,
 bool readsPreviousReverseSuffix(Value readIndex, Value writtenIndex,
                                  DomainOp domain, ForOp loop,
                                  DominanceInfo &dominance) {
-  auto suffix = readIndex ? readIndex.getDefiningOp<SubregionOp>() : SubregionOp();
-  if (!suffix || !suffix.getHasStart() || !suffix.getHasStop() ||
-      getConstantInteger(domain.getBounds().front()) != 0)
+  if (!readIndex || getConstantInteger(domain.getBounds().front()) != 0)
     return false;
-  auto source = suffix.getInputs().front().getDefiningOp<DomainOp>();
-  if (!source || source.getBounds().size() < 2 ||
-      getConstantInteger(source.getBounds().front()) != 0 ||
-      (source.getBounds().size() == 3 &&
-       getConstantInteger(source.getBounds()[2]) != 1) ||
-      !sameInvariantExtent(source.getBounds()[1], domain.getBounds()[1], loop,
-                           dominance) ||
-      !sameInvariantExtent(suffix.getInputs().back(), domain.getBounds()[1],
-                           loop, dominance))
+  Value begin, end;
+  if (auto suffix = readIndex.getDefiningOp<SubregionOp>()) {
+    if (!suffix.getHasStart() || !suffix.getHasStop())
+      return false;
+    auto source = suffix.getInputs().front().getDefiningOp<DomainOp>();
+    if (!source || source.getBounds().size() < 2 ||
+        getConstantInteger(source.getBounds().front()) != 0 ||
+        (source.getBounds().size() == 3 &&
+         getConstantInteger(source.getBounds()[2]) != 1) ||
+        !sameInvariantExtent(source.getBounds()[1], domain.getBounds()[1], loop,
+                             dominance))
+      return false;
+    begin = suffix.getInputs()[1];
+    end = suffix.getInputs().back();
+  } else if (auto suffix = readIndex.getDefiningOp<DomainOp>()) {
+    if (suffix.getBounds().size() < 2 ||
+        (suffix.getBounds().size() == 3 &&
+         getConstantInteger(suffix.getBounds()[2]) != 1))
+      return false;
+    begin = suffix.getBounds()[0];
+    end = suffix.getBounds()[1];
+  } else {
+    return false;
+  }
+  if (!sameInvariantExtent(end, domain.getBounds()[1], loop, dominance))
     return false;
   auto reverse = writtenIndex.getDefiningOp<BinaryOp>();
-  auto last = reverse ? reverse.getLhs().getDefiningOp<BinaryOp>() : BinaryOp();
-  auto start = suffix.getInputs()[1].getDefiningOp<BinaryOp>();
-  return reverse && reverse.getOperatorKind() == BinaryOperator::Subtract &&
-         reverse.getRhs() == loop.getBody().front().getArgument(0) &&
-         last && last.getOperatorKind() == BinaryOperator::Subtract &&
-         getConstantInteger(last.getRhs()) == 1 &&
-         sameInvariantExtent(last.getLhs(), domain.getBounds()[1], loop,
-                              dominance) &&
-         start && start.getOperatorKind() == BinaryOperator::Add &&
+  if (!reverse || reverse.getOperatorKind() != BinaryOperator::Subtract ||
+      reverse.getRhs() != loop.getBody().front().getArgument(0))
+    return false;
+  bool lastCoordinate = false;
+  if (auto last = reverse.getLhs().getDefiningOp<BinaryOp>())
+    lastCoordinate = last.getOperatorKind() == BinaryOperator::Subtract &&
+                     getConstantInteger(last.getRhs()) == 1 &&
+                     sameInvariantExtent(last.getLhs(), domain.getBounds()[1],
+                                          loop, dominance);
+  if (auto extent = getConstantInteger(domain.getBounds()[1]);
+      extent && *extent >= 0)
+    lastCoordinate |= getConstantInteger(reverse.getLhs()) == *extent - 1;
+  auto start = begin.getDefiningOp<BinaryOp>();
+  return lastCoordinate && start &&
+         start.getOperatorKind() == BinaryOperator::Add &&
          start.getLhs() == writtenIndex && getConstantInteger(start.getRhs()) == 1;
 }
 
@@ -1519,8 +1539,24 @@ bool hasPreviousIterationViewDefinition(Operation *read, ViewStoreOp store,
         break;
       }
       Value writtenIndex = indexTermOperand(store, writeTerm);
-      if (writeTerm.getKind() == 3 && readTerm.getKind() == 4 && writtenIndex &&
-          readsPreviousReverseSuffix(indexTermOperand(read, readTerm),
+      Value readRange = readTerm.getKind() == 4
+                            ? indexTermOperand(read, readTerm) : Value();
+      if (readTerm.getKind() == 3) {
+        auto index = dyn_cast_or_null<BlockArgument>(indexTermOperand(read, readTerm));
+        auto inner = index ? dyn_cast<ForOp>(index.getOwner()->getParentOp()) : ForOp();
+        if (inner && inner->getParentOp() == loop &&
+            inner.getBody().hasOneBlock() && index.getArgNumber() == 0 &&
+            !inner.getInputs().empty() && inner->isAncestor(read)) {
+          bool writesResource = false;
+          inner.walk([&](ViewStoreOp nested) {
+            writesResource |= nested->getOperand(0) == read->getOperand(0);
+          });
+          if (!writesResource)
+            readRange = inner.getInputs().front();
+        }
+      }
+      if (writeTerm.getKind() == 3 && readRange && writtenIndex &&
+          readsPreviousReverseSuffix(readRange,
                                      writtenIndex, domain, loop, dominance)) {
         if (previousRange) {
           covered = false;
@@ -1582,18 +1618,6 @@ bool hasPreviousIterationViewDefinition(Operation *read, ViewStoreOp store,
 bool hasCompletedLoopViewDefinition(Operation *read, ViewStoreOp store,
                                     RankedTensorType tensor,
                                     DominanceInfo &dominance) {
-  auto loop = dyn_cast<ForOp>(store->getParentOp());
-  if (!loop || loop.getInputs().empty() || !loop.getBody().hasOneBlock() ||
-      loop.getBody().front().getNumArguments() == 0 ||
-      loop->isAncestor(read) || !dominance.dominates(loop, read) ||
-      !dominance.dominates(read->getOperand(0), loop))
-    return false;
-  auto domain = loop.getInputs().front().getDefiningOp<DomainOp>();
-  if (!domain || domain.getBounds().size() < 2 ||
-      getConstantInteger(domain.getBounds().front()) != 0 ||
-      (domain.getBounds().size() == 3 &&
-       getConstantInteger(domain.getBounds()[2]) != 1))
-    return false;
   auto readRelation = read->getAttrOfType<IndexRelationAttr>("index");
   auto writeRelation = store->getAttrOfType<IndexRelationAttr>("index");
   if (!readRelation || !writeRelation ||
@@ -1602,43 +1626,79 @@ bool hasCompletedLoopViewDefinition(Operation *read, ViewStoreOp store,
       readRelation.getTerms().size() != static_cast<size_t>(tensor.getRank()) ||
       writeRelation.getTerms().size() != static_cast<size_t>(tensor.getRank()))
     return false;
-  Value induction = loop.getBody().front().getArgument(0);
-  bool completeAxis = false;
-  for (auto [axis, pair] : llvm::enumerate(
-           llvm::zip(readRelation.getTerms(), writeRelation.getTerms()))) {
-    auto readTerm = dyn_cast<IndexTermAttr>(std::get<0>(pair));
-    auto writeTerm = dyn_cast<IndexTermAttr>(std::get<1>(pair));
-    if (!readTerm || !writeTerm)
-      return false;
-    if (writeTerm.getKind() == 3 &&
-        indexTermOperand(store, writeTerm) == induction) {
-      if (completeAxis ||
-          !extentValueMatchesAxis(domain.getBounds()[1], tensor, axis))
-        return false;
-      completeAxis = true;
+  SmallVector<ForOp> loops;
+  SmallVector<Value> stops;
+  for (Operation *parent = store->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    auto loop = dyn_cast<ForOp>(parent);
+    if (!loop || loop.getInputs().empty() || !loop.getBody().hasOneBlock() ||
+        loop.getBody().front().getNumArguments() == 0)
+      break;
+    auto domain = loop.getInputs().front().getDefiningOp<DomainOp>();
+    if (!domain || domain.getBounds().size() < 2 ||
+        getConstantInteger(domain.getBounds().front()) != 0 ||
+        (domain.getBounds().size() == 3 &&
+         getConstantInteger(domain.getBounds()[2]) != 1))
+      break;
+    loops.push_back(loop);
+    stops.push_back(domain.getBounds()[1]);
+    if (loop->isAncestor(read) || !dominance.dominates(loop, read) ||
+        !dominance.dominates(read->getOperand(0), loop))
       continue;
-    }
-    if (readTerm.getKind() != writeTerm.getKind() ||
-        readTerm.getStaticValues() != writeTerm.getStaticValues() ||
-        readTerm.getOperandPositions().size() !=
-            writeTerm.getOperandPositions().size())
-      return false;
-    for (auto [readPosition, writePosition] : llvm::zip(
-             readTerm.getOperandPositions().asArrayRef(),
-             writeTerm.getOperandPositions().asArrayRef())) {
-      if (readPosition == -1 && writePosition == -1)
+    llvm::SmallDenseSet<unsigned> coveredLoops;
+    bool covered = true;
+    for (auto [axis, pair] : llvm::enumerate(
+             llvm::zip(readRelation.getTerms(), writeRelation.getTerms()))) {
+      auto readTerm = dyn_cast<IndexTermAttr>(std::get<0>(pair));
+      auto writeTerm = dyn_cast<IndexTermAttr>(std::get<1>(pair));
+      if (!readTerm || !writeTerm) {
+        covered = false;
+        break;
+      }
+      Value index = indexTermOperand(store, writeTerm);
+      std::optional<unsigned> completeLoop;
+      for (auto [position, nested] : llvm::enumerate(loops))
+        if (writeTerm.getKind() == 3 &&
+            index == nested.getBody().front().getArgument(0))
+          completeLoop = position;
+      if (completeLoop) {
+        if (!coveredLoops.insert(*completeLoop).second ||
+            !extentValueMatchesAxis(stops[*completeLoop], tensor, axis)) {
+          covered = false;
+          break;
+        }
         continue;
-      if (readPosition <= 0 || writePosition <= 0 ||
-          readPosition >= read->getNumOperands() ||
-          writePosition >= store->getNumOperands() ||
-          read->getOperand(readPosition) != store->getOperand(writePosition) ||
-          !dominance.dominates(read->getOperand(readPosition), loop))
-        return false;
+      }
+      if (readTerm.getKind() != writeTerm.getKind() ||
+          readTerm.getStaticValues() != writeTerm.getStaticValues() ||
+          readTerm.getOperandPositions().size() !=
+              writeTerm.getOperandPositions().size()) {
+        covered = false;
+        break;
+      }
+      for (auto [readPosition, writePosition] : llvm::zip(
+               readTerm.getOperandPositions().asArrayRef(),
+               writeTerm.getOperandPositions().asArrayRef())) {
+        if (readPosition == -1 && writePosition == -1)
+          continue;
+        if (readPosition <= 0 || writePosition <= 0 ||
+            readPosition >= read->getNumOperands() ||
+            writePosition >= store->getNumOperands() ||
+            read->getOperand(readPosition) != store->getOperand(writePosition) ||
+            !dominance.dominates(read->getOperand(readPosition), loop)) {
+          covered = false;
+          break;
+        }
+      }
+      if (!covered)
+        break;
     }
+    // Every loop covers a different complete axis; remaining coordinates
+    // identify the same invariant slice after the whole nest has completed.
+    if (covered && coveredLoops.size() == loops.size())
+      return true;
   }
-  // The unconditional store covers a full axis before the later read starts;
-  // every other coordinate names the same loop-invariant slice.
-  return completeAxis;
+  return false;
 }
 
 bool hasDominatingViewDefinition(Operation *read, RankedTensorType tensor) {
