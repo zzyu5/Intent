@@ -26,7 +26,6 @@ namespace intent::triton {
 namespace {
 
 constexpr llvm::StringLiteral legalizedAttr = "intent_gpu.triton.legalized";
-constexpr llvm::StringLiteral reduceFormAttr = "intent_gpu.triton.reduce_form";
 constexpr llvm::StringLiteral contractFormAttr =
     "intent_gpu.triton.contract_form";
 constexpr llvm::StringLiteral tensorDescriptorChoice =
@@ -1034,8 +1033,10 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
   kernel->setAttr(gpu::tritonConfigsAttr, builder.getArrayAttr(encoded));
   SmallVector<NamedAttribute> reductionBounds;
   kernel.walk([&](gpu::ParameterOp parameter) {
-    if (parameter.getParameter().getRole() !=
-            static_cast<uint32_t>(gpu::ParameterRole::Reduction) ||
+    auto role = static_cast<gpu::ParameterRole>(parameter.getParameter().getRole());
+    if ((role != gpu::ParameterRole::Reduction &&
+         role != gpu::ParameterRole::ReductionOuter &&
+         role != gpu::ParameterRole::ReductionInner) ||
         parameter->hasAttr(gpu::coverageDimensionAttr))
       return;
     auto dimension = parameter->getAttrOfType<IntegerAttr>(gpu::dimensionAttr);
@@ -1658,35 +1659,6 @@ bool isAddCombine(gpu::ScatterReduceOp scatter) {
          BinaryOperator::Add;
 }
 
-std::optional<StringRef> nativeReduceForm(gpu::ReduceOp reduce) {
-  if (reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 ||
-      reduce.getCaptureCount() != 0 || reduce.getResults().size() != 1 ||
-      reduce.getCombine().empty() || reduce.getCombine().getBlocks().size() != 1)
-    return std::nullopt;
-  std::optional<BinaryOperator> combine =
-      gpu::queryBinaryCombineKind(reduce.getCombine());
-  if (!combine)
-    return std::nullopt;
-  if (*combine == BinaryOperator::Add)
-    return "sum";
-  auto source = dyn_cast<gpu::FragmentType>(reduce.getInputs().front().getType());
-  if (!source || !isa<IntegerType, IndexType>(source.getElementType()))
-    return std::nullopt;
-  if (*combine == BinaryOperator::Maximum)
-    return "max";
-  if (*combine == BinaryOperator::Minimum)
-    return "min";
-  return std::nullopt;
-}
-
-void selectNativeReduceForms(func::FuncOp kernel) {
-  kernel.walk([&](gpu::ReduceOp reduce) {
-    if (std::optional<StringRef> form = nativeReduceForm(reduce))
-      reduce->setAttr(reduceFormAttr,
-                      StringAttr::get(kernel.getContext(), *form));
-  });
-}
-
 LogicalResult legalizeContractShapes(func::FuncOp kernel) {
   auto [nextSource, nextDimension] = gpu::nextPhysicalAxisIdentities(kernel);
   SmallVector<gpu::ContractOp> contracts;
@@ -2062,11 +2034,8 @@ Type scalarCallbackType(Type type) {
 LogicalResult legalizeCollectiveCallbacks(func::FuncOp kernel) {
   SmallVector<Operation *> collectives;
   kernel.walk([&](Operation *operation) {
-    if (auto reduce = dyn_cast<gpu::ReduceOp>(operation)) {
-      if (!reduce->hasAttr(reduceFormAttr)) collectives.push_back(operation);
-    } else if (isa<gpu::ScanOp>(operation)) {
+    if (isa<gpu::ReduceOp, gpu::ScanOp>(operation))
       collectives.push_back(operation);
-    }
   });
   for (Operation *operation : collectives) {
     auto reduce = dyn_cast<gpu::ReduceOp>(operation);
@@ -2100,7 +2069,8 @@ LogicalResult legalizeCollectiveCallbacks(func::FuncOp kernel) {
       }
     }
     OpBuilder builder(operation);
-    OperationState state(operation->getLoc(), reduce ? ReduceOp::getOperationName() : ScanOp::getOperationName());
+    OperationState state(operation->getLoc(), reduce ? ReduceOp::getOperationName()
+                                                    : ScanOp::getOperationName());
     state.addOperands(operation->getOperands());
     state.addTypes(operation->getResultTypes());
     state.addAttribute("source_count", builder.getI64IntegerAttr(count));
@@ -2503,15 +2473,9 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
         gather.emitOpError("Triton scalar gather requires one scalar index into a vector");
         return WalkResult::interrupt();
       }
-    } else if (auto reduce = dyn_cast<gpu::ReduceOp>(operation)) {
-      if (reduce.getAxes().size() != 1 || reduce.getCaptureCount() != 0 ||
-          !reduce->hasAttr(reduceFormAttr)) {
-        reduce.emitOpError(
-            "Triton reduce requires a native form or an explicitly scalarized callback");
-        return WalkResult::interrupt();
-      }
-    } else if (auto scan = dyn_cast<gpu::ScanOp>(operation)) {
-      scan.emitOpError("Triton associative_scan requires an explicitly scalarized callback");
+    } else if (isa<gpu::ReduceOp, gpu::ScanOp>(operation)) {
+      operation->emitOpError(
+          "Triton collective requires an explicitly scalarized callback");
       return WalkResult::interrupt();
     } else if (auto contract = dyn_cast<gpu::ScaledContractOp>(operation)) {
       unsigned lhsRank = contract.getLhs().getType().getShape().size();
@@ -2556,7 +2520,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
             gpu::CompareOp, gpu::SelectOp, gpu::CastOp, gpu::BitcastOp,
             gpu::ReshapeOp, gpu::TransposeOp, gpu::JoinOp, gpu::MakeRecordOp,
             gpu::ExtractOp, gpu::LoadOp, gpu::GatherOp, gpu::StoreOp,
-            gpu::ContractOp, gpu::ReduceOp, gpu::ScanOp,
+            gpu::ContractOp,
             gpu::ScaledContractOp, gpu::HistogramOp, gpu::AtomicStoreOp,
             gpu::AtomicRMWOp, gpu::AtomicCompareExchangeOp,
             gpu::RandomBitsOp, gpu::YieldOp, arith::ConstantOp, scf::ForOp,
@@ -2602,7 +2566,6 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       failed(legalizeContractShapes(kernel)) ||
       failed(gpu::verifyGPUProgram(module)))
     return failure();
-  selectNativeReduceForms(kernel);
   bool hasWorkspace = llvm::any_of(kernel.getArgumentTypes(), [](Type type) {
     return isa<gpu::BufferType>(type);
   });

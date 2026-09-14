@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import csv
+import inspect
 import json
 import os
 from pathlib import Path
@@ -55,6 +56,7 @@ def generate_trial(arguments, row, language) -> dict:
     directory = Path(tempfile.mkdtemp(prefix=f"{row['task']}-{language}-", dir=arguments.state_root / "candidates")).resolve()
     materials = materialize_language(arguments.project, arguments.triton_ref, directory / "materials", language)
     task_text = description(arguments.reference, row)
+    task_text += "\n\nCallable parameter signature (names, order and defaults):\n" + row["reference_signature"]
     task_text += "\n\nFixed profile parameters (reference defaults included; tensor values are not disclosed):\n" + json.dumps(row["invocation"], indent=2)
     task_text += "\nParameters at their defaults may be omitted by the caller. Preserve optional parameter defaults in the returned callable."
     task_text += "\n\nExpected return structure, shape and dtype:\n" + json.dumps(row["return_contract"], indent=2)
@@ -125,8 +127,10 @@ def main() -> None:
         row["timing"] = by_id[row["task"]].get("timing", arguments.suite["timing"])
         material_inputs = invocation(arguments.reference, row, by_id[row["task"]], arguments.suite, device="cpu")
         row["invocation"] = material_inputs.metadata()
+        source = reference(arguments.reference, row)
+        row["reference_signature"] = str(inspect.signature(source))
         with torch.no_grad():
-            row["return_contract"] = return_contract(material_inputs.call(reference(arguments.reference, row)))
+            row["return_contract"] = return_contract(material_inputs.call(source))
     arguments.output = arguments.output.resolve()
     arguments.output.mkdir(parents=True, exist_ok=False)
     (arguments.state_root / "candidates").mkdir(exist_ok=True, mode=0o700)
