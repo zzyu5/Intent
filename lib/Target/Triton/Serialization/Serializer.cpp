@@ -872,7 +872,17 @@ private:
             TensorDescriptorOp>(operation))
       return;
     if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
-      values[constant.getResult()] = literal(constant.getValue());
+      std::string value = literal(constant.getValue());
+      if (auto floating = dyn_cast<FloatAttr>(constant.getValue())) {
+        value = "tl.full((), " + value + ", " +
+                pythonType(constant.getType()) + ")";
+        // Triton's scalar constructor canonicalizes both zero signs to +0.
+        if (floating.getValue().isNegZero())
+          value = "(-" + value + ")";
+        assign(constant.getResult(), value);
+      } else {
+        values[constant.getResult()] = value;
+      }
       return;
     }
     if (auto parameter = dyn_cast<gpu::ParameterOp>(operation)) {
@@ -1776,7 +1786,7 @@ private:
   std::string loopInitialValue(Value value) {
     std::string result = valueString(value);
     if (value.getDefiningOp<arith::ConstantOp>() &&
-        isa<IntegerType, IndexType, FloatType>(value.getType()))
+        isa<IntegerType, IndexType>(value.getType()))
       return "tl.full((), " + result + ", " + pythonType(value.getType()) + ")";
     return result;
   }
