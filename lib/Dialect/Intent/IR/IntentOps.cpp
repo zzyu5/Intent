@@ -1566,16 +1566,29 @@ bool hasPreviousIterationViewDefinition(Operation *read, ViewStoreOp store,
         continue;
       }
       if (writeTerm.getKind() == 3 && writtenIndex == induction) {
-        Value readIndex = indexTermOperand(read, readTerm);
-        auto prefix = readIndex ? readIndex.getDefiningOp<SubregionOp>()
-                                : SubregionOp();
-        if (previousRange || readTerm.getKind() != 4 || !prefix ||
-            prefix.getInputs().empty() ||
-            prefix.getInputs().front() != domain.getResult() ||
-            !prefix.getHasStop() ||
-            prefix.getInputs().back() != induction ||
-            (prefix.getHasStart() &&
-             prefix.getInputs()[1] != domain.getBounds().front())) {
+        Value begin, end;
+        if (auto prefix = readRange ? readRange.getDefiningOp<SubregionOp>()
+                                    : SubregionOp()) {
+          if (!prefix.getInputs().empty() &&
+              prefix.getInputs().front() == domain.getResult() &&
+              prefix.getHasStop()) {
+            begin = prefix.getHasStart() ? prefix.getInputs()[1]
+                                         : domain.getBounds().front();
+            end = prefix.getInputs().back();
+          }
+        } else if (auto prefix = readRange
+                                     ? readRange.getDefiningOp<DomainOp>()
+                                     : DomainOp()) {
+          if (prefix.getBounds().size() >= 2 &&
+              (prefix.getBounds().size() == 2 ||
+               getConstantInteger(prefix.getBounds()[2]) == 1)) {
+            begin = prefix.getBounds()[0];
+            end = prefix.getBounds()[1];
+          }
+        }
+        if (previousRange || !begin || end != induction ||
+            !sameInvariantExtent(begin, domain.getBounds().front(), loop,
+                                 dominance)) {
           covered = false;
           break;
         }
