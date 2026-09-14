@@ -6,6 +6,7 @@ import torch
 from kernels.routing.mhc import mhc_apply_residual as mhc_apply_residual_definition
 from kernels.routing.mhc import mhc_gemm_rms_partial, mhc_gemm_rms_finalize
 from kernels.routing.mhc import mhc_pre_gemm_sqrsum, mhc_pre_fuse, mhc_sinkhorn
+from kernels.variants.decomposition import moe_count_routes_product_domain
 from kernels.routing.moe_align import BLOCK_SIZE
 from kernels.routing.moe_align import EXPERTS
 from kernels.routing.moe_align import PADDED_ROUTES
@@ -143,6 +144,23 @@ def mhc_post(context: Context) -> PreparedComparison:
     )
 
 
+def moe_count_routes(context):
+    ids = torch.randint(0, 64, (4096, 2), dtype=torch.int32)
+    report_stage("generated_compilation")
+    artifact = intent.compile(moe_count_routes_product_domain, target=context.target, compiler=context.compiler,
+                              tuning_config=context.tuning_config)
+    runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_reference")
+
+    def side(function):
+        counts = torch.zeros((64,), dtype=torch.int32)
+        return PreparedLaunch(lambda: function(ids, counts), lambda: counts, prepare=lambda: counts.zero_())
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(side(artifact.run), side(runtime.moe_count_routes), Tolerance(atol=0.0),
+        cuda_graph=False, device_type="cpu", cpu_host_timing=True,
+        note="原product-domain MoE count T4096/top2/E64、随机i32 IDs，relaxed i32 atomic add；独立counts每次清零且清零不计时，CPU bincount参考，精确比较，完整host调用。")
+
+
 def mhc_gemm_rms_scale(context):
     x = torch.randn((2048, 16384), dtype=torch.bfloat16)
     weight = torch.randn((16384, 24), dtype=torch.bfloat16)
@@ -253,5 +271,6 @@ CASES = {
     "mhc_gemm_rms_scale": mhc_gemm_rms_scale,
     "mhc_pre": mhc_pre,
     "mhc_sinkhorn": mhc_sinkhorn_case,
+    "moe_count_routes_product_domain": moe_count_routes,
     "flaggems_fp8_mqa_logits": flaggems_fp8_mqa_logits,
 }

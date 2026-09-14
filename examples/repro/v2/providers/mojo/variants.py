@@ -10,11 +10,14 @@ from kernels.factorization.cholesky import BATCH as CHOLESKY_BATCH
 from kernels.factorization.cholesky import SIZE as CHOLESKY_SIZE
 from kernels.variants.activation import swiglu_forward_helper
 from kernels.variants.contraction import gemm_loop_interchange
+from kernels.variants.contraction import conv2d_reduce_order
 from kernels.variants.decomposition import batched_cholesky_right_looking
 from kernels.variants.decomposition import matrix_transpose_product_domains
+from kernels.variants.decomposition import ordered_prefix_nested
 from kernels.variants.indexing import rotary_embedding_equivalent_index
 from kernels.variants.layout import matrix_transpose_scalar_domains
 from kernels.variants.normalization import stable_softmax_online
+from kernels.variants.normalization import weighted_layer_norm_second_moment
 from kernels.variants.streaming import streamed_online_softmax_inline
 from kernels.activation.swiglu import FEATURES as SWIGLU_FEATURES
 from kernels.activation.swiglu import TOKENS as SWIGLU_TOKENS
@@ -92,6 +95,25 @@ def transpose_product_domains(context):
     x = torch.randn((TRANSPOSE_ROWS, TRANSPOSE_COLUMNS), dtype=torch.float16)
     return prepare_host_comparison(context, matrix_transpose_product_domains, (x,),
                                    "transpose", Tolerance(atol=0.0))
+
+
+def conv2d_reduction(context):
+    x = torch.randn((16, 256, 256), dtype=torch.float16) * 0.1
+    weight = torch.randn((3, 3), dtype=torch.float16) * 0.1
+    return prepare_host_comparison(context, conv2d_reduce_order, (x, weight), "conv2d", Tolerance(atol=3e-3))
+
+
+def layer_norm_second_moment(context):
+    x = torch.randn((8192, 4096), dtype=torch.float32)
+    weight = torch.randn((4096,), dtype=torch.float32)
+    bias = torch.randn_like(weight)
+    return prepare_host_comparison(context, weighted_layer_norm_second_moment,
+                                   (x, weight, bias, 1.0 / 4096, 1e-5), "layer_norm", Tolerance(atol=5e-5))
+
+
+def prefix_nested(context):
+    x = torch.randn((512, 17, 31), dtype=torch.float32) * 0.1
+    return prepare_host_comparison(context, ordered_prefix_nested, (x,), "ordered_prefix", Tolerance(atol=2e-5))
 
 
 def softmax_online(context):
@@ -172,6 +194,9 @@ CASES = {
     "rotary_embedding_equivalent_index": rotary_embedding_index,
     "matrix_transpose_scalar_domains": transpose_scalar_domains,
     "matrix_transpose_product_domains": transpose_product_domains,
+    "conv2d_reduce_order": conv2d_reduction,
+    "weighted_layer_norm_second_moment": layer_norm_second_moment,
+    "ordered_prefix_nested": prefix_nested,
     "stable_softmax_online": softmax_online,
     "streamed_online_softmax_inline": online_softmax_inline,
     "batched_cholesky_right_looking": cholesky_right_looking,

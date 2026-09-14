@@ -316,6 +316,13 @@ MOJO = (
     Entry("flash_varlen_gqa_prefill", "B8-U29184-QH32-KVH8-D128-f16-causal-8cores-host", "flash_varlen_gqa_prefill", ("streaming/attention.py:flash_varlen_gqa_prefill",), "source/pytorch/cpu_runtime.py"),
     Entry("flash_attention_bias", "B4-H32-S4096-D128-f16-bias-f32-8cores-host", "flash_attention_bias_fwd", ("streaming/attention.py:flash_attention_bias_fwd",), None),
     Entry("flash_varlen_attention", "B8-U29114-D128-f16-balanced-causal-8cores-host", "flash_varlen_attention_fwd", ("streaming/attention.py:flash_varlen_attention_fwd",), None),
+    Entry("conv2d_nhwc", "N32-H128-W128-CI256-CO512-K3-f16-8cores-host", "conv2d_nhwc", ("convolution/direct.py:conv2d_nhwc",), "source/pytorch/cpu_runtime.py"),
+    Entry("conv2d_reduce_order", "B16-256x256-K3-f16-8cores-host", "conv2d_reduce_order", ("variants/contraction.py:conv2d_reduce_order",), "source/pytorch/cpu_runtime.py"),
+    Entry("weighted_layer_norm_second_moment", "8192x4096-f32-eps1e-5-8cores-host", "weighted_layer_norm_second_moment", ("variants/normalization.py:weighted_layer_norm_second_moment",), "source/pytorch/cpu_runtime.py"),
+    Entry("ordered_prefix_nested", "512x17x31-f32-8cores-host", "ordered_prefix_nested", ("variants/decomposition.py:ordered_prefix_nested",), "source/pytorch/cpu_runtime.py"),
+    Entry("moe_count_routes_product_domain", "T4096-top2-E64-i32-random-8cores-host", "moe_count_routes_product_domain", ("variants/decomposition.py:moe_count_routes_product_domain",), "source/pytorch/cpu_runtime.py"),
+    Entry("nested_jagged_mean_pool_identity", "D256-S4096-T65536-F128-f32-indexed-8cores-host", "nested_jagged_mean_pool_identity", ("variants/decomposition.py:nested_jagged_mean_pool_identity",), "source/pytorch/cpu_runtime.py"),
+    Entry("nested_jagged_mean_pool_split", "D256-S4096-T65536-F128-f32-2kernels-8cores-host", "nested_jagged_mean_pool_split", ("variants/decomposition.py:nested_sentence_pool", "variants/decomposition.py:nested_document_pool"), "source/pytorch/cpu_runtime.py"),
 )
 
 

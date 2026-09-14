@@ -23,6 +23,7 @@ from kernels.convolution.direct import (
     causal_depthwise_conv1d_bf16,
     conv1d_same,
     conv2d_same,
+    conv2d_nhwc,
     causal_depthwise_conv1d_update,
     causal_depthwise_conv1d_update_bf16,
 )
@@ -83,6 +84,13 @@ def causal_conv1d_bf16(context):
         context, causal_depthwise_conv1d_bf16, (x, weight, bias), "causal_conv1d",
         Tolerance(atol=5e-2, rtol=5e-2), constexprs={"SILU": True},
     )
+
+
+def conv2d_channels_last(context):
+    x = torch.randn((32, 128, 128, 256), dtype=torch.float16)
+    weight = torch.randn((3, 3, 256, 512), dtype=torch.float16)
+    return prepare_host_comparison(context, conv2d_nhwc, (x, weight), "conv2d_nhwc",
+                                   Tolerance(atol=2e-2, rtol=2e-2))
 
 
 def causal_conv1d_backward(context):
@@ -239,6 +247,7 @@ CASES = {
     "causal_conv1d": causal_conv1d,
     "causal_conv1d_bf16": causal_conv1d_bf16,
     "conv2d": conv2d,
+    "conv2d_nhwc": conv2d_channels_last,
     "causal_conv1d_backward": causal_conv1d_backward,
     "varlen_causal_conv1d": varlen_conv1d,
     "causal_conv_update": causal_conv_update,

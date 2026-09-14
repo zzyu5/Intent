@@ -17,6 +17,7 @@ from kernels.ragged.grouped_gemm import ragged_grouped_gemm
 from kernels.ragged.grouped_gemm import ragged_grouped_gemm_bf16
 from kernels.ragged.grouped_gemm import ragged_grouped_gemm_backward_weight
 from kernels.ragged.grouped_gemm import routed_expert_projection_bf16
+from kernels.variants.decomposition import nested_jagged_mean_pool_identity, nested_sentence_pool, nested_document_pool
 from kernels.ragged.jagged_mean import jagged_mean
 from kernels.ragged.nested_pool import DOCUMENTS
 from kernels.ragged.nested_pool import FEATURES as NESTED_FEATURES
@@ -110,7 +111,7 @@ def moe_expert_projection(context):
     )
 
 
-def nested_pool(context):
+def _nested_pool_inputs():
     document_lengths = torch.tensor(
         [8 if index % 2 == 0 else 24 for index in range(DOCUMENTS)],
         dtype=torch.int32,
@@ -124,6 +125,11 @@ def nested_pool(context):
     document_offsets[1:] = document_lengths.cumsum(dim=0)
     sentence_offsets[1:] = sentence_lengths.cumsum(dim=0)
     values = torch.randn((NESTED_TOKENS, NESTED_FEATURES), dtype=torch.float32)
+    return document_offsets, sentence_offsets, values
+
+
+def nested_pool(context):
+    document_offsets, sentence_offsets, values = _nested_pool_inputs()
     return prepare_host_comparison(
         context,
         nested_jagged_mean_pool,
@@ -131,6 +137,38 @@ def nested_pool(context):
         "nested_jagged_mean_pool",
         (Tolerance(atol=2e-5), Tolerance(atol=2e-5)),
     )
+
+
+def nested_pool_identity(context):
+    document_offsets, sentence_offsets, values = _nested_pool_inputs()
+    document_indices = torch.arange(SENTENCES, dtype=torch.int32)
+    token_indices = torch.arange(NESTED_TOKENS, dtype=torch.int32)
+    return prepare_host_comparison(context, nested_jagged_mean_pool_identity,
+        (document_offsets, sentence_offsets, document_indices, token_indices, values),
+        "nested_jagged_mean_pool_indexed", (Tolerance(atol=2e-5), Tolerance(atol=2e-5)))
+
+
+def nested_pool_split(context):
+    document_offsets, sentence_offsets, values = _nested_pool_inputs()
+    report_stage("generated_compilation")
+    sentences, documents = (intent.compile(definition, target=context.target, compiler=context.compiler,
+                                           tuning_config=context.tuning_config)
+                            for definition in (nested_sentence_pool, nested_document_pool))
+    runtime = load_module(context.project_root / "source/pytorch/cpu_runtime.py", "intent_cpu_reference")
+    generated, source = {}, {}
+
+    def launch():
+        sums, means = sentences.run(sentence_offsets, values)
+        generated["output"] = means, documents.run(document_offsets, sentence_offsets, sums)
+
+    def reference():
+        source["output"] = runtime.nested_jagged_mean_pool(document_offsets, sentence_offsets, values)
+
+    report_stage("adapter_preparation")
+    return PreparedComparison(PreparedLaunch(launch, lambda: generated["output"]),
+        PreparedLaunch(reference, lambda: source["output"]),
+        (Tolerance(atol=2e-5), Tolerance(atol=2e-5)), cuda_graph=False, device_type="cpu", cpu_host_timing=True,
+        note="原D256/S4096/T65536/F128 f32 nested pool拆分变体；8/24交替正长度，sentence sum/mean后document mean，完整两kernel调用含scratch和输出分配；CPU fused数学参考、原容差。")
 
 
 def _make_moe_routes():
@@ -226,5 +264,7 @@ CASES = {
     "grouped_gemm_backward": grouped_gemm_backward,
     "moe_expert_projection": moe_expert_projection,
     "nested_jagged_mean_pool": nested_pool,
+    "nested_jagged_mean_pool_identity": nested_pool_identity,
+    "nested_jagged_mean_pool_split": nested_pool_split,
     "moe_expert_ffn": moe_expert_ffn_case,
 }

@@ -309,6 +309,11 @@ def conv2d(x, weight):
     return F.conv2d(x[:, None].float(), weight[None, None].float(), padding=1)[:, 0].to(x.dtype)
 
 
+def conv2d_nhwc(x, weight):
+    output = F.conv2d(x.permute(0, 3, 1, 2).float(), weight.permute(3, 2, 0, 1).float(), padding=1)
+    return output.permute(0, 2, 3, 1).to(x.dtype)
+
+
 def causal_conv1d_backward(x, weight, grad_output):
     batch, channels, length = x.shape
     width = weight.shape[1]
@@ -802,6 +807,20 @@ def nested_jagged_mean_pool(document_offsets, sentence_offsets, values):
     return sentence_sums / sentence_lengths[:, None], document_sums / document_tokens[:, None]
 
 
+def nested_jagged_mean_pool_indexed(document_offsets, sentence_offsets, document_indices, token_indices, values):
+    sentence_lengths = sentence_offsets[1:] - sentence_offsets[:-1]
+    document_lengths = document_offsets[1:] - document_offsets[:-1]
+    sentence_ids = torch.repeat_interleave(torch.arange(sentence_lengths.numel()), sentence_lengths.long())
+    sentence_sums = torch.zeros((sentence_lengths.numel(), values.shape[1]), dtype=values.dtype)
+    sentence_sums.index_add_(0, sentence_ids, values[token_indices.long()])
+    document_ids = torch.repeat_interleave(torch.arange(document_lengths.numel()), document_lengths.long())
+    document_sums = torch.zeros((document_lengths.numel(), values.shape[1]), dtype=values.dtype)
+    document_sums.index_add_(0, document_ids, sentence_sums[document_indices.long()])
+    document_tokens = torch.zeros(document_lengths.shape, dtype=torch.int32)
+    document_tokens.index_add_(0, document_ids, sentence_lengths[document_indices.long()])
+    return sentence_sums / sentence_lengths.clamp_min(1)[:, None], document_sums / document_tokens.clamp_min(1)[:, None]
+
+
 def selective_state_scan(x, decay, drive):
     state = torch.zeros((x.shape[0],), dtype=x.dtype)
     output = torch.empty_like(x)
@@ -964,6 +983,11 @@ def padded_rope_cache_update(packed_input, sequence_lengths, output_storage, the
     key_cache[rows, positions] = rotated[:, query_heads:].to(packed_input.dtype)
     value_cache[rows, positions] = packed_input[:, query_heads + kv_heads:]
     return output_storage
+
+
+def moe_count_routes(topk_ids, counts):
+    counts.add_(torch.bincount(topk_ids.flatten().long(), minlength=counts.numel()).int())
+    return counts
 
 
 def moe_align_block_size(topk_ids, block_size, num_experts):
