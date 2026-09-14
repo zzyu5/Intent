@@ -900,8 +900,28 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
       // Unmerged axes retain their current tile and coordinates, including
       // program-local batch coordinates and already blocked free dimensions.
       for (MakeRangeOp root : sourceRoots[group.getSourceAxes()[0]]) {
+        unsigned axis = group.getResultAxes()[0];
+        SmallVector<Attribute> shape(resultRank,
+            PhysicalExprAttr::get(result.getContext(),
+                static_cast<uint32_t>(PhysicalExprKind::Constant), 1,
+                builder.getStringAttr(""), builder.getArrayAttr({})));
+        shape[axis] = root.getResult().getType().getShape()[0];
+        SmallVector<Attribute> groups;
+        for (unsigned position = 0; position < resultRank; ++position) {
+          SmallVector<int64_t> inputAxes;
+          if (position == axis)
+            inputAxes.push_back(0);
+          groups.push_back(ReshapeGroupAttr::get(result.getContext(),
+              builder.getDenseI64ArrayAttr(inputAxes),
+              builder.getDenseI64ArrayAttr({position})));
+        }
+        auto shaped = FragmentType::get(result.getContext(), builder.getIndexType(),
+            builder.getArrayAttr(shape), indexType.getAxisMaps(),
+            indexType.getValidity(), indexType.getOwner());
+        Value positioned = builder.create<ReshapeOp>(reshape.getLoc(), shaped,
+            root.getResult(), builder.getArrayAttr(groups));
         FailureOr<Value> projected = projectPhysicalValueToSchema(
-            builder, reshape.getLoc(), root.getResult(), indexType);
+            builder, reshape.getLoc(), positioned, indexType);
         if (failed(projected))
           return reshape.emitOpError("collapsed load lost an unmerged axis projection");
         mapping.map(root.getResult(), *projected);

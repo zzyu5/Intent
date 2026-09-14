@@ -1102,6 +1102,20 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
   return true;
 }
 
+bool sameFullOrdinalTraversal(ArrayRef<MakeRangeOp> ranges) {
+  if (ranges.empty())
+    return false;
+  auto cardinality = constantLogicalRangeCardinality(ranges.front());
+  if (!cardinality)
+    return false;
+  MakeRangeOp first = ranges.front();
+  return llvm::all_of(ranges, [&](MakeRangeOp range) {
+    return constantLogicalRangeCardinality(range) == cardinality &&
+           samePhysicalScalarExpression(range.getStart(), range.getLogicalStart()) &&
+           samePhysicalScalarExpression(range.getExtent(), first.getExtent());
+  });
+}
+
 LogicalResult neutralizeReductionTails(ReduceOp reduce, func::FuncOp kernel) {
   if (reduce.getAxes().size() != 1)
     return success();
@@ -1130,7 +1144,8 @@ LogicalResult neutralizeReductionTails(ReduceOp reduce, func::FuncOp kernel) {
     });
     if (!needsTail)
       continue;
-    if ((!ranges.isExact() && !analysis.lockstepRanges(ranges.roots).isExact()) ||
+    if ((!ranges.isExact() && !analysis.lockstepRanges(ranges.roots).isExact() &&
+         !sameFullOrdinalTraversal(ranges.roots)) ||
         !ranges.blockers.empty())
       return reduce.emitOpError(
           "padded reduction has no exact logical member traversal");
@@ -1771,10 +1786,7 @@ bool isSingleComponentAddReduce(ReduceOp reduce) {
 }
 
 FailureOr<bool> decomposeFullCoverageMultiAxisReduce(
-    ReduceOp reduce, func::FuncOp kernel, unsigned outerAxis,
-    MakeRangeOp traversalRange) {
-  if (traversalRange->hasAttr(sourceSubregionAttr))
-    return false;
+    ReduceOp reduce, func::FuncOp kernel, unsigned outerAxis) {
   for (Operation &operation : reduce.getCombine().front().without_terminator())
     if (!canLiftCombineOperation(operation))
       return false;
@@ -1788,16 +1800,27 @@ FailureOr<bool> decomposeFullCoverageMultiAxisReduce(
   FailureOr<ParameterOp> coverage =
       outerExtent ? fullCoverageParameter(kernel, outerExtent)
                   : FailureOr<ParameterOp>(failure());
-  if (failed(coverage))
-    return false;
-  auto dimension =
-      (*coverage)->getAttrOfType<IntegerAttr>(coverageDimensionAttr);
-  if (!dimension ||
-      failed(bindFullCoverageDimension(kernel, dimension.getInt(),
-                                       coverage->getResult())))
-    return reduce.emitOpError(
-               "multi-axis full-coverage fragment could not bind its logical dimension"),
-           failure();
+  if (succeeded(coverage)) {
+    auto dimension = (*coverage)->getAttrOfType<IntegerAttr>(coverageDimensionAttr);
+    if (!dimension || failed(bindFullCoverageDimension(
+            kernel, dimension.getInt(), coverage->getResult())))
+      return reduce.emitOpError(
+                 "multi-axis full-coverage fragment could not bind its logical dimension"),
+             failure();
+  } else {
+    auto extent = outerExtent ? constantPhysicalExpression(outerExtent) : std::nullopt;
+    if (!extent || *extent <= 0)
+      return false;
+    for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+      auto ranges = PhysicalProgramAnalysis(kernel).axisRanges(source, outerAxis);
+      if (!ranges.blockers.empty() || !sameFullOrdinalTraversal(ranges.roots) ||
+          exceedsRegisterFile(source, kernel))
+        return false;
+      auto size = constantLogicalRangeCardinality(ranges.roots.front());
+      if (!size || *size > *extent)
+        return false;
+    }
+  }
 
   SmallVector<int64_t> innerAxes;
   for (int64_t axis : reduce.getAxes())
@@ -1906,6 +1929,12 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
         "multi-axis reduction decomposition requires at least one source");
 
   unsigned outerAxis = static_cast<unsigned>(reduce.getAxes().front());
+  FailureOr<bool> fullCoverage =
+      decomposeFullCoverageMultiAxisReduce(reduce, kernel, outerAxis);
+  if (failed(fullCoverage))
+    return failure();
+  if (*fullCoverage)
+    return success();
   SmallVector<SourcePlan> plans;
   SmallVector<SmallVector<RootAccess>> accesses;
   for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
@@ -1916,13 +1945,19 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
           fragment ? queryAxisMap(fragment, outerAxis)
                    : FailureOr<AxisMapAttr>(failure());
       if (!fragment || failed(mapping) ||
-          !isReplayableWithoutLoad(source, sourceAxisIdentity(*mapping)))
-        return reduce.emitOpError()
-               << "multi-axis reduction outer axis is neither load-rooted nor a replayable pure source; source type="
-               << source.getType() << ", producer="
-               << (source.getDefiningOp()
-                       ? source.getDefiningOp()->getName().getStringRef()
-                       : StringRef("block argument"));
+          !isReplayableWithoutLoad(source, sourceAxisIdentity(*mapping))) {
+        auto diagnostic = reduce.emitOpError()
+            << "multi-axis reduction outer axis is neither load-rooted nor a replayable pure source; source type="
+            << source.getType() << ", producer="
+            << (source.getDefiningOp()
+                    ? source.getDefiningOp()->getName().getStringRef()
+                    : StringRef("block argument"));
+        auto ranges = PhysicalProgramAnalysis(kernel).axisRanges(source, outerAxis);
+        diagnostic << "; axis=" << outerAxis;
+        for (MakeRangeOp range : ranges.roots)
+          diagnostic << "; range=" << range.getResult();
+        return failure();
+      }
       plan = SourcePlan{source, sourceAxisIdentity(*mapping), outerAxis, {}, {},
                         {}};
     }
@@ -1962,13 +1997,6 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
     if (plan.reductionRange && !sharesOuterTraversal(plan.reductionRange))
       return reduce.emitOpError(
           "multi-axis reduction sources do not share one exact outer traversal");
-
-  FailureOr<bool> fullCoverage = decomposeFullCoverageMultiAxisReduce(
-      reduce, kernel, outerAxis, master->range);
-  if (failed(fullCoverage))
-    return failure();
-  if (*fullCoverage)
-    return success();
 
   SmallVector<int64_t> retainedInnerAxes;
   SmallVector<int64_t> innerAxes;

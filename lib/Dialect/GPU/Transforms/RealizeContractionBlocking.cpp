@@ -2573,6 +2573,7 @@ bool fullStaticReductionNeedsTraversal(ContractOp contract) {
   int64_t largestTile = *std::max_element(
       std::begin(contractionReductionCandidates),
       std::end(contractionReductionCandidates));
+  std::optional<int64_t> cardinality;
   for (auto [operand, axis] :
        {std::pair<Value, int64_t>{contract.getLhs(),
                                   contract.getLhsReductionAxes().front()},
@@ -2587,13 +2588,15 @@ bool fullStaticReductionNeedsTraversal(ContractOp contract) {
     if (!ranges.unitStep || failed(queryExactLogicalRange(ranges)))
       return false;
     for (MakeRangeOp range : ranges.roots) {
-      auto begin = integer(range.getLogicalStart());
-      auto end = integer(range.getLogicalStop());
-      if (!begin || !end || integer(range.getExtent()) != *extent ||
+      auto size = constantLogicalRangeCardinality(range);
+      if (!size || *size <= 0 || *size > *extent ||
+          (cardinality && *cardinality != *size) ||
+          integer(range.getExtent()) != *extent ||
           !samePhysicalScalarExpression(range.getStart(),
                                         range.getLogicalStart()) ||
-          static_cast<__int128>(*end) - *begin != *extent)
+          (*size < *extent && !isZeroPastLogicalEnd(operand, range)))
         return false;
+      cardinality = *size;
     }
   }
   // A static logical extent does not select a hardware reduction tile.

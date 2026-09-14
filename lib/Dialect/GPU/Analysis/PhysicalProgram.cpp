@@ -668,6 +668,10 @@ bool valueKnownNonNegative(Value value, unsigned depth = 0) {
   if (!value || depth >= 32)
     return false;
   value = stripIntegerIndexCasts(value);
+  if (auto reshape = value.getDefiningOp<ReshapeOp>())
+    return valueKnownNonNegative(reshape.getValue(), depth + 1);
+  if (auto transpose = value.getDefiningOp<TransposeOp>())
+    return valueKnownNonNegative(transpose.getValue(), depth + 1);
   if (auto physical = value.getDefiningOp<PhysicalExprOp>())
     return physicalIndexSign(physical.getExpression(),
                              physical->getParentOfType<func::FuncOp>()) !=
@@ -938,6 +942,11 @@ bool coordinateRangeWithinResource(Value coordinate, Value resource,
   if (axis == 0 && linearizedGatherWithinResource(coordinate, resource))
     return true;
   coordinate = stripIntegerIndexCasts(coordinate);
+  // Reassociation and permutation preserve the set of coordinate values.
+  if (auto reshape = coordinate.getDefiningOp<ReshapeOp>())
+    return coordinateRangeWithinResource(reshape.getValue(), resource, axis);
+  if (auto transpose = coordinate.getDefiningOp<TransposeOp>())
+    return coordinateRangeWithinResource(transpose.getValue(), resource, axis);
   if (std::optional<int64_t> constant = integerConstant(coordinate)) {
     PhysicalExprAttr extent = resourceExtentExpression(resource, axis);
     if (extent && *constant >= 0 && extent.getKind() ==
@@ -1323,12 +1332,39 @@ bool writeDefinesRead(const PhysicalAccessFootprint &write,
 
 } // namespace
 
+std::optional<int64_t> constantLogicalRangeCardinality(MakeRangeOp range) {
+  auto constant = [](Value value) -> std::optional<int64_t> {
+    auto folded = dyn_cast_or_null<IntegerAttr>(
+        UniformValueAnalysis(describeUniformValue).evaluate(value));
+    return folded && folded.getValue().getBitWidth() <= 64
+               ? std::optional<int64_t>(folded.getInt()) : std::nullopt;
+  };
+  auto step = constant(range.getStep());
+  if (!step || *step <= 0)
+    return std::nullopt;
+  std::optional<__int128> distance;
+  auto start = constant(range.getLogicalStart());
+  auto stop = constant(range.getLogicalStop());
+  if (start && stop)
+    distance = static_cast<__int128>(*stop) - *start;
+  else if (auto add = stripScalarIdentity(range.getLogicalStop())
+                          .getDefiningOp<BinaryOp>();
+           add && add.getOperatorKind() == BinaryOperator::Add)
+    for (auto [base, offset] : {std::pair{add.getLhs(), add.getRhs()},
+                               std::pair{add.getRhs(), add.getLhs()}})
+      if (samePhysicalScalarExpression(base, range.getLogicalStart()))
+        if (auto size = constant(offset))
+          distance = *size;
+  if (!distance || *distance < 0)
+    return std::nullopt;
+  __int128 size = (*distance + *step - 1) / *step;
+  return size <= std::numeric_limits<int64_t>::max()
+             ? std::optional<int64_t>(size) : std::nullopt;
+}
+
 bool isProvablySingletonLogicalRange(MakeRangeOp range) {
-  std::optional<int64_t> start = integerConstant(range.getLogicalStart());
-  std::optional<int64_t> stop = integerConstant(range.getLogicalStop());
-  std::optional<int64_t> step = integerConstant(range.getStep());
-  if (start && stop && step && *step > 0)
-    return *stop > *start && *stop - *start <= *step;
+  if (auto size = constantLogicalRangeCardinality(range))
+    return *size == 1;
 
   Value logicalStop = stripScalarIdentity(range.getLogicalStop());
   auto add = logicalStop.getDefiningOp<BinaryOp>();
