@@ -1661,24 +1661,24 @@ bool hasCompletedLoopViewDefinition(Operation *read, ViewStoreOp store,
       readRelation.getTerms().size() != static_cast<size_t>(tensor.getRank()) ||
       writeRelation.getTerms().size() != static_cast<size_t>(tensor.getRank()))
     return false;
-  SmallVector<ForOp> loops;
+  SmallVector<BlockArgument> inductionValues;
   SmallVector<Value> stops;
   for (Operation *parent = store->getParentOp(); parent;
        parent = parent->getParentOp()) {
-    auto loop = dyn_cast<ForOp>(parent);
-    if (!loop || loop.getInputs().empty() || !loop.getBody().hasOneBlock() ||
-        loop.getBody().front().getNumArguments() == 0)
+    if (!isa<ForOp, ParallelOp>(parent) || parent->getNumOperands() == 0 ||
+        !parent->getRegion(0).hasOneBlock() ||
+        parent->getRegion(0).front().getNumArguments() == 0)
       break;
-    auto domain = loop.getInputs().front().getDefiningOp<DomainOp>();
+    auto domain = parent->getOperand(0).getDefiningOp<DomainOp>();
     if (!domain || domain.getBounds().size() < 2 ||
         getConstantInteger(domain.getBounds().front()) != 0 ||
         (domain.getBounds().size() == 3 &&
          getConstantInteger(domain.getBounds()[2]) != 1))
       break;
-    loops.push_back(loop);
+    inductionValues.push_back(parent->getRegion(0).front().getArgument(0));
     stops.push_back(domain.getBounds()[1]);
-    if (loop->isAncestor(read) || !dominance.dominates(loop, read) ||
-        !dominance.dominates(read->getOperand(0), loop))
+    if (parent->isAncestor(read) || !dominance.dominates(parent, read) ||
+        !dominance.dominates(read->getOperand(0), parent))
       continue;
     llvm::SmallDenseSet<unsigned> coveredLoops;
     bool covered = true;
@@ -1692,9 +1692,8 @@ bool hasCompletedLoopViewDefinition(Operation *read, ViewStoreOp store,
       }
       Value index = indexTermOperand(store, writeTerm);
       std::optional<unsigned> completeLoop;
-      for (auto [position, nested] : llvm::enumerate(loops))
-        if (writeTerm.getKind() == 3 &&
-            index == nested.getBody().front().getArgument(0))
+      for (auto [position, induction] : llvm::enumerate(inductionValues))
+        if (writeTerm.getKind() == 3 && index == induction)
           completeLoop = position;
       if (completeLoop) {
         if (!coveredLoops.insert(*completeLoop).second ||
@@ -1720,7 +1719,7 @@ bool hasCompletedLoopViewDefinition(Operation *read, ViewStoreOp store,
             readPosition >= read->getNumOperands() ||
             writePosition >= store->getNumOperands() ||
             read->getOperand(readPosition) != store->getOperand(writePosition) ||
-            !dominance.dominates(read->getOperand(readPosition), loop)) {
+            !dominance.dominates(read->getOperand(readPosition), parent)) {
           covered = false;
           break;
         }
@@ -1730,7 +1729,7 @@ bool hasCompletedLoopViewDefinition(Operation *read, ViewStoreOp store,
     }
     // Every loop covers a different complete axis; remaining coordinates
     // identify the same invariant slice after the whole nest has completed.
-    if (covered && coveredLoops.size() == loops.size())
+    if (covered && coveredLoops.size() == inductionValues.size())
       return true;
   }
   return false;
