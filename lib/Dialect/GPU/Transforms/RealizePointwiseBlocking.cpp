@@ -1554,10 +1554,18 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
     }
     if (!blockedValidity)
       return valid;
-    FailureOr<Value> projected = materializeBroadcastToFragment(
-        builder, producer->getLoc(), blockedValidity, predicateType(resultType));
+    auto axes = queryFragmentAxes(resultType, source);
+    llvm::erase_if(axes, [&](const PhysicalAxisProjection &axis) {
+      return !llvm::is_contained(traversalDimensions, axis.dimensionId);
+    });
+    FailureOr<Value> projected = axes.size() == 1
+        ? projectPredicateToFragmentAxis(builder, producer->getLoc(),
+                                         blockedValidity, resultType,
+                                         axes.front().fragmentAxis)
+        : materializeBroadcastToFragment(builder, producer->getLoc(),
+                                          blockedValidity, predicateType(resultType));
     if (failed(projected))
-      return failure();
+      return producer->emitOpError("pointwise tile validity lost its access-axis projection");
     if (!valid)
       return *projected;
     FailureOr<Value> original =
@@ -1622,7 +1630,8 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
     FailureOr<Value> projected = materializeBroadcastToFragment(
         builder, producer->getLoc(), value, resultType);
     if (failed(projected))
-      return failure();
+      return producer->emitOpError("retained reshape cannot adopt the pointwise tile")
+             << "; value=" << value.getType() << "; target=" << resultType;
     replayed = *projected;
   } else {
     SmallVector<MakeRangeOp> controlSourceRanges;
