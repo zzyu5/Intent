@@ -3586,13 +3586,14 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
       if (failed(rangeDimension))
         return range.emitOpError("full coverage has no range dimension authority");
       rangeDimensions.insert(*rangeDimension);
+      retargetDimensionExtent(range.getResult(), *rangeDimension, covered);
     }
+    retargetDimensionExtent(source, dimension, covered);
     if (rangeDimensions.empty())
       rangeDimensions.insert(dimension);
     for (int64_t rangeDimension : rangeDimensions)
       if (failed(bindFullCoverageDimension(kernel, rangeDimension, physicalExtent)))
         return failure();
-    retargetDimensionExtent(source, dimension, covered);
     return success();
   }
 
@@ -3761,6 +3762,24 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
         return;
     }
     ranges.push_back(range);
+  });
+  // Validity can carry an independent occurrence of the same coordinates.
+  SmallVector<MakeRangeOp> authorities(ranges.begin(), ranges.end());
+  kernel.walk([&](MakeRangeOp range) {
+    if (llvm::is_contained(ranges, range) ||
+        range->getParentOfType<RegionFoldOp>() ||
+        range->getParentOfType<RegionScanOp>())
+      return;
+    auto sourceDimension = queryRangeDimension(range);
+    if (failed(sourceDimension) ||
+        *sourceDimension != static_cast<int64_t>(dimension))
+      return;
+    if (llvm::any_of(authorities, [&](MakeRangeOp authority) {
+          return sameLogicalRange(range, authority) &&
+                 samePhysicalScalarExpression(range.getStart(),
+                                              authority.getStart());
+        }))
+      ranges.push_back(range);
   });
   bool alreadyBound = !ranges.empty() &&
                       llvm::all_of(ranges, [&](MakeRangeOp range) {

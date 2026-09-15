@@ -4339,8 +4339,38 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
               replay.crossesAccess && hasMaterializedReductionStoreFork(
                                           store.getValue(), store, source,
                                           dimension, materializationVisited);
+          // Replaying a read of the destination also crosses its writes from
+          // earlier chunks. Preserve that snapshot unless all addresses agree.
+          bool clobbersLaterChunk = llvm::any_of(
+              replay.accesses, [&](Operation *access) {
+                auto load = dyn_cast<LoadOp>(access);
+                if (!load || load.getResource() != store.getResource() ||
+                    canReplayReadAt(load, store->getNextNode()))
+                  return false;
+                if (load.getSourceAxes().size() != store.getSourceAxes().size())
+                  return true;
+                auto coordinate =
+                    queryCoordinateIndex(store.getCoordinates(), source);
+                if (!coordinate.isExact() || coordinate.dimensionId != dimension)
+                  return true;
+                return llvm::any_of(llvm::enumerate(store.getSourceAxes()),
+                    [&](auto axis) {
+                      auto readAxis = llvm::find(load.getSourceAxes(), axis.value());
+                      return readAxis == load.getSourceAxes().end() ||
+                             !samePhysicalScalarExpression(
+                                 load.getCoordinates()[readAxis - load.getSourceAxes().begin()],
+                                 store.getCoordinates()[axis.index()]);
+                    });
+              });
+          if (clobbersLaterChunk)
+            for (PhysicalAxisProjection projection :
+                 queryFragmentAxes(store.getValue().getType(), source))
+              if (projection.dimensionId == dimension &&
+                  failed(requireFullDimensionCoverage(
+                      kernel, store.getValue(), projection.fragmentAxis)))
+                return failure();
           useReplayTraversal &=
-              replay.isReplayable() && !materializedFork &&
+              replay.isReplayable() && !materializedFork && !clobbersLaterChunk &&
               (effectLocal == effectLocalOrigins.end() ||
                !replay.crossesStructuredProgram);
         }
@@ -4666,7 +4696,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         PhysicalExprAttr right = queryLaunchExpression(rhs);
         return left && right && left == right;
       };
-      bool equivalentSources = cartesian && !repeatedDimension && address.isExact() &&
+      bool equivalentSources = store->getParentOfType<scf::IfOp>() && cartesian &&
+          !repeatedDimension && address.isExact() &&
           llvm::any_of(payload.roots, [&](MakeRangeOp range) {
             return llvm::none_of(address.roots, [&](MakeRangeOp coordinate) {
               return sourceAxisIdentity(range) == sourceAxisIdentity(coordinate);
