@@ -1967,17 +1967,39 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
     writerBoundary = nullptr;
     bool exact = true;
     AccessDomain write;
-    // Invert direct scalar loop coordinates. Each selected writer iteration is
+    // Invert scalar loop coordinates with unit affine stride. Each writer is
     // a witness for this read address; no triangle or algorithm name is needed.
     for (auto [axis, attribute] : llvm::enumerate(writeRelation.getTerms())) {
       auto term = cast<IndexTermAttr>(attribute);
       Value value = term.getKind() == 3 ? indexTermOperand(store, term) : Value();
-      auto argument = dyn_cast_or_null<BlockArgument>(value);
+      Value coordinateIV = value;
+      AffineExpr witness = coordinates[axis];
+      if (auto binary = value ? value.getDefiningOp<BinaryOp>() : BinaryOp()) {
+        auto kind = binary.getOperatorKind();
+        if ((kind != BinaryOperator::Add && kind != BinaryOperator::Subtract) ||
+            !index(value))
+          continue;
+        if (auto offset = getConstantInteger(binary.getRhs());
+            offset && *offset != std::numeric_limits<int64_t>::min()) {
+          coordinateIV = binary.getLhs();
+          witness = kind == BinaryOperator::Add
+                        ? coordinates[axis] - *offset
+                        : coordinates[axis] + *offset;
+        } else if (auto offset = getConstantInteger(binary.getLhs());
+                   offset && *offset != std::numeric_limits<int64_t>::min()) {
+          coordinateIV = binary.getRhs();
+          witness = kind == BinaryOperator::Add
+                        ? coordinates[axis] - *offset
+                        : getAffineConstantExpr(*offset, context) - coordinates[axis];
+        }
+      }
+      auto argument = dyn_cast_or_null<BlockArgument>(coordinateIV);
       Operation *parent = argument ? argument.getOwner()->getParentOp() : nullptr;
-      if (parent && induction(parent) == value && llvm::is_contained(writePath, parent)) {
-        auto [found, inserted] = substitutions.try_emplace(value, coordinates[axis]);
+      if (parent && induction(parent) == coordinateIV &&
+          llvm::is_contained(writePath, parent)) {
+        auto [found, inserted] = substitutions.try_emplace(coordinateIV, witness);
         if (!inserted)
-          write.constraints.emplace_back(found->second - coordinates[axis], true);
+          write.constraints.emplace_back(found->second - witness, true);
       }
     }
     for (Operation *operation : writePath) {
