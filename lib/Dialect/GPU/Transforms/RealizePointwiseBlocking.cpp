@@ -699,11 +699,10 @@ LogicalResult requireStructuredReductionFullCoverage(func::FuncOp kernel,
     PhysicalSourceAxis sourceAxis = sourceAxisIdentity(sourceMapping);
     FailureOr<int64_t> bound = exactSubregionStaticBound(ranges, sourceAxis);
     auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
-    if (failed(bound) ||
-        extent.getKind() !=
+    if (failed(bound) || extent.getKind() !=
             static_cast<uint32_t>(PhysicalExprKind::Constant) ||
         extent.getValue() < *bound)
-      return failure();
+      return realizeFullCoverageDimension(kernel, source, axis);
     for (MakeRangeOp range : ranges.roots)
       retargetSourceExtent(range.getResult(), sourceAxis, extent);
     retargetSourceExtent(source, sourceAxis, extent);
@@ -4969,9 +4968,47 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           dynamicRanges.push_back(range);
       }
   }
+  SmallVector<std::pair<Value, unsigned>> retainedGatherAxes;
+  kernel.walk([&](GatherOp gather) {
+    auto fragment = dyn_cast<FragmentType>(gather.getSource().getType());
+    if (!fragment)
+      return;
+    for (int64_t axis : gather.getSourceAxes()) {
+      auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+      auto replay = PhysicalProgramAnalysis(kernel).replayability(
+          gather.getSource(), sourceAxisIdentity(mapping),
+          PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true);
+      if (llvm::any_of(replay.blockers, [](Operation *operation) {
+            return isa<scf::ForOp>(operation);
+          }) && !llvm::is_contained(retainedGatherAxes,
+                                    std::pair<Value, unsigned>{gather.getSource(), axis}))
+        retainedGatherAxes.emplace_back(gather.getSource(), axis);
+    }
+  });
+  llvm::SmallPtrSet<Operation *, 16> retainedGatherRanges;
+  for (auto [source, axis] : retainedGatherAxes) {
+    if (failed(requireStructuredReductionFullCoverage(kernel, source, axis)))
+      return emitError(source.getLoc(), "ordered tensor gather has no full source-axis realization");
+    auto roots = PhysicalProgramAnalysis(kernel).axisRanges(source, axis);
+    for (MakeRangeOp range : allRanges)
+      if (llvm::any_of(roots.roots, [&](MakeRangeOp root) {
+            return sameLogicalRange(root, range) &&
+                   samePhysicalScalarExpression(root.getStart(), range.getStart());
+          })) {
+        // A surviving gather consumes an immutable ordered carry, including
+        // members outside an output tile. Retain that source axis; unrelated
+        // free axes still participate in ordinary ownership selection.
+        internalTraversalRanges.insert(range.getOperation());
+        retainedGatherRanges.insert(range.getOperation());
+      }
+  }
   SmallVector<MakeRangeOp> fullCoverageRanges;
   if (!ownershipOnly)
     for (MakeRangeOp range : dynamicRanges) {
+      if (retainedGatherRanges.contains(range.getOperation())) {
+        fullCoverageRanges.push_back(range);
+        continue;
+      }
       if (!internalTraversalRanges.contains(range.getOperation()) ||
           (structuredTraversalRanges.contains(range.getOperation()) &&
            !writeTraversalRanges.contains(range.getOperation())) ||
