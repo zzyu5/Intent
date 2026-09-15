@@ -24,6 +24,8 @@ install/import the execution environment here; submission invokes that environme
 Before submitting, review the complete source against TASK.md and the queried
 rules. Check the returned callable and its defaults, the result tree, runtime
 argument order, and the dtype and shape of loop state and helper results.
+Check that build(context) itself returns the host callable on the supplied
+profile, rather than only defining or returning from that inner callable.
 
 For Intent generation, define ordinary @intent.kernel / @intent.fn programs using
 intent.language. Inside build, use context.compile("unique_literal_name", kernel,
@@ -37,6 +39,11 @@ runtime arguments. Constexpr arguments are bound at compilation and omitted here
 All compile calls must execute during build, not inside the timed wrapper. Do not
 call intent.compile/generate or invoke a different compiler yourself. Choose the
 kernel algorithm, not hardware block sizes or provider-specific emission.
+Python math and Torch calls are host-only; inside Intent kernels and helpers,
+use documented DSL intrinsics and syntax shorthands. Reduction removes its axes,
+and broadcasting aligns trailing axes; add explicit size-one axes when needed.
+A name read after a runtime if must already be defined or be assigned in every
+normally continuing branch; implications between conditions do not define it.
 
 For direct Triton generation, define @triton.jit kernels and an ordinary wrapper;
 context need not be used.

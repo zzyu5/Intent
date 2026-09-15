@@ -44,6 +44,8 @@ Python tuple 与 `I.record(field=value, ...)` 是结构化 products，不要求�
 
 普通 `for/while` 保持顺序与 loop carry；carry 的初值与每轮更新必须保持 dtype、rank 和逻辑 shape，循环体内的 broadcast 不会改变初始 schema。Tensor carry 可按目标 shape 初始化，例如 `state = I.full(value.shape, 0.0, I.f32)`；`I.cast(0.0, I.f32)` 初始化的是 scalar。`I.parallel(domain)` 表达独立无序点，不允许 carry。Tensor predicate 使用 `I.select`，不控制 statement `if`。`Out` 进入 kernel 时未定义，读取前必须先定义；不能用 InOut 掩盖未定义读取。
 
+Runtime `if` 之后读取的名字，必须在分支前已有定义，或在每个正常继续执行的分支中赋值。不同条件之间的逻辑蕴含不会自动建立名字的定义；先初始化共同状态，再在分支中更新。
+
 Python `range` 是 domain 遍历的 shorthand，遵循正步长合同。逆序遍历使用正向 ordinal 并显式计算反向坐标，具体规则见 [core.md 的 domains 章节](core.md#3-domains-与-source-derived-subregions)。
 
 `I.mask(value, predicate, fill)` 等价于 `I.select(predicate, value, fill)`：predicate 为真保留 value，为假使用 fill。它只选择值，不抑制写入；对写入坐标使用 `I.mask` 会把未选中成员写到 fill 指定的地址。`I.store` 和下标赋值没有 `mask` 或 `valid` 参数。条件写入使用 scalar 条件下的 structured control，或只遍历实际参与写入的 domain/subregion；普通并行写入仍须满足目标地址不冲突的合同。
