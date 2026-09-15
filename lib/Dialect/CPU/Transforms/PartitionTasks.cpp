@@ -2,6 +2,7 @@
 #include "Utilities.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Transforms/RegionUtils.h"
@@ -319,6 +320,86 @@ LogicalResult partition(scf::ParallelOp root, int64_t grain) {
   return success();
 }
 
+void foldDisjointCompareExchange(func::FuncOp function, scf::ParallelOp root) {
+  if (root->getBlock() != &function.front() || root.getNumLoops() != 1 || root.getNumResults()) return;
+  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  if (!interface || !interface.getDisjointOutputs()) return;
+  SmallVector<AtomicCompareExchangeOp> exchanges;
+  root.walk([&](AtomicCompareExchangeOp operation) { exchanges.push_back(operation); });
+  if (exchanges.size() != 1) return;
+  auto exchange = exchanges.front();
+  auto element = dyn_cast<IntegerType>(exchange.getOldValue().getType());
+  if (exchange.getOrdering() != AtomicOrdering::Relaxed || !element || !element.isSignless()) return;
+  PhysicalProgramAnalysis physical(function);
+  Value point = root.getInductionVars()[0];
+  auto projection = [&](Value memory, ValueRange indices) -> Value {
+    while (auto cast = memory.getDefiningOp<memref::CastOp>()) memory = cast.getSource();
+    if (auto view = memory.getDefiningOp<memref::SubViewOp>()) {
+      if (view.getSourceType().getRank() != 1 ||
+          view.getMixedOffsets()[0] != OpFoldResult(point) ||
+          getConstantIntValue(view.getMixedSizes()[0]) != 1 ||
+          getConstantIntValue(view.getMixedStrides()[0]) != 1 ||
+          !(indices.empty() || (indices.size() == 1 && matchPattern(indices[0], m_Zero())))) return {};
+      memory = view.getSource();
+    } else if (indices.size() != 1 || indices[0] != point) return {};
+    auto type = cast<MemRefType>(memory.getType());
+    auto external = physical.externalView(memory);
+    if (type.getRank() != 1 || !type.getLayout().isIdentity() ||
+        memory != physical.storageRoot(memory) || !external || external.getAccess() == 0) return {};
+    return memory;
+  };
+  Value target = projection(exchange.getTarget(), exchange.getIndices());
+  if (!target || physical.externalView(target).getAccess() != 2) return;
+  SmallVector<std::pair<memref::LoadOp, Value>> loads;
+  SmallVector<std::pair<memref::StoreOp, Value>> stores;
+  SmallVector<Operation *> aliases;
+  bool valid = true;
+  root.walk([&](Operation *operation) {
+    if (operation == root || operation == exchange || isa<scf::ReduceOp>(operation)) return;
+    if (auto load = dyn_cast<memref::LoadOp>(operation)) {
+      if (physical.isReadOnly(load.getMemref())) return;
+      if (Value memory = projection(load.getMemref(), load.getIndices())) loads.emplace_back(load, memory);
+      else valid = false;
+      return;
+    }
+    if (auto store = dyn_cast<memref::StoreOp>(operation)) {
+      if (Value memory = projection(store.getMemref(), store.getIndices())) stores.emplace_back(store, memory);
+      else valid = false;
+      return;
+    }
+    if (isa<memref::SubViewOp, memref::CastOp>(operation)) { aliases.push_back(operation); return; }
+    if (isa<memref::DimOp>(operation)) return;
+    if (!isMemoryEffectFree(operation) || operation->getNumRegions() ||
+        llvm::any_of(operation->getOperandTypes(), [](Type type) { return isa<MemRefType>(type); }) ||
+        llvm::any_of(operation->getResultTypes(), [](Type type) { return isa<MemRefType>(type); })) valid = false;
+  });
+  if (!valid) return;
+
+  // Every writable address belongs to this point, and readonly ABI inputs
+  // cannot overlap it. No other participant can observe the relaxed CAS.
+  OpBuilder b(exchange);
+  Location loc = exchange.getLoc();
+  Value old = b.create<memref::LoadOp>(loc, target, ValueRange{point});
+  Value success = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, old, exchange.getExpected());
+  Value value = b.create<arith::SelectOp>(loc, success, exchange.getDesired(), old);
+  b.create<memref::StoreOp>(loc, value, target, ValueRange{point});
+  exchange.getOldValue().replaceAllUsesWith(old);
+  exchange.getSuccess().replaceAllUsesWith(success);
+  exchange.erase();
+  for (auto [load, memory] : loads) {
+    b.setInsertionPoint(load);
+    load.replaceAllUsesWith(b.create<memref::LoadOp>(load.getLoc(), memory, ValueRange{point}).getResult());
+    load.erase();
+  }
+  for (auto [store, memory] : stores) {
+    b.setInsertionPoint(store);
+    b.create<memref::StoreOp>(store.getLoc(), store.getValue(), memory, ValueRange{point});
+    store.erase();
+  }
+  for (Operation *alias : llvm::reverse(aliases))
+    if (alias->use_empty()) alias->erase();
+}
+
 scf::ParallelOp partitionAtomicRows(func::FuncOp function, scf::ParallelOp root, int64_t grain) {
   if (root->getBlock() != &function.front() || root.getNumLoops() != 1 || root.getNumResults() ||
       !matchPattern(root.getLowerBound()[0], m_Zero()) || !matchPattern(root.getStep()[0], m_One())) return {};
@@ -433,6 +514,7 @@ LogicalResult partitionTasks(func::FuncOp function, int64_t grain, const Impleme
     if (!operation->getParentOfType<scf::ParallelOp>()) roots.push_back(operation);
   });
   for (scf::ParallelOp root : roots) {
+    foldDisjointCompareExchange(function, root);
     auto owners = partitionAtomicRows(function, root, grain);
     // Atomic row worksets have already consumed the grain and worker budget.
     if (failed(partition(owners ? owners : root, owners ? 1 : grain))) return failure();
