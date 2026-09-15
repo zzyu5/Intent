@@ -3679,6 +3679,27 @@ void PhysicalProgramAnalysis::analyzeReplay(
       result.state = PhysicalFactState::Unknown;
       return;
     }
+    if (auto load = dyn_cast<LoadOp>(operation); load && insertionAnchor) {
+      bool replayedRegion = false;
+      if (scope == PhysicalReplayScope::ValueGraph && source && sourceDimension)
+        for (Operation *parent = load->getParentOp();
+             isa_and_nonnull<scf::IfOp, scf::ForOp>(parent);
+             parent = parent->getParentOp()) {
+          auto found = visited.find(parent);
+          if (found != visited.end() &&
+              llvm::is_contained(found->second, context)) {
+            replayedRegion = true;
+            break;
+          }
+        }
+      // Enclosing replay regions already prove read-only motion. Standalone
+      // reads must also preserve their value across intervening writes.
+      if (!replayedRegion && !canReplayReadAt(load, insertionAnchor)) {
+        appendUnique(result.blockers, operation);
+        result.state = PhysicalFactState::Unknown;
+        return;
+      }
+    }
   } else if (auto fold = dyn_cast<RegionFoldOp>(operation)) {
     result.crossesStructuredProgram = true;
     appendUnique(result.structuredPrograms, operation);
