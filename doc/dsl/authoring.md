@@ -12,6 +12,8 @@ Literal 首次形成 runtime value 时若没有 expected dtype，Python `bool/in
 
 Tensor 和 view 有 `.shape`；scalar、tuple、record、domain 没有统一 `.shape`。`I.full(shape, fill, dtype)` 产生 tensor value，不分配跨 kernel workspace。`I.dot(lhs, rhs, acc_dtype=...)` 必须显式指定累加 dtype，只接受两个 rank-1 tensor，返回 rank-0 tensor `[]`，不是 rank-1 `[1]` 或一个 Python number。Scalar 和 rank-0 tensor 是不同类型；需要将 scalar 放入 rank-0 tensor 的分支或 carry schema 时，可用 `I.full((), value, dtype=...)` 显式构造。Pointwise scalar broadcast 由 frontend 显式表达。
 
+`I.zeros`、`I.full` 和 indexed read 的结果都是不可变 tensor SSA values。下标赋值和 `I.store` 的写入目标必须是可写 view 或 logical buffer，不能原地修改这些 tensor values。Tensor carry 通过计算新 tensor 并重新绑定名字更新；逐地址写入则使用显式存储。
+
 ## Domain、index 与 broadcast
 
 `rows = I.domain(0, M)` 是 logical coordinate domain，不是整数 tensor，也不是归约的 axis 编号。Domain 本身不参与数值算术或比较；需要坐标值时先使用 `I.indices(rows)` 产生 logical index tensor。坐标使用 `I.index`，与 runtime `I.i64` 不同；参与坐标算术的 runtime 步幅、偏移等先显式转为 `I.index`。`x[rows, columns]` 读取完整二维 logical region；`I.reduce.sum(value, axis=1)` 的 `1` 指 value 的第二个 axis。
