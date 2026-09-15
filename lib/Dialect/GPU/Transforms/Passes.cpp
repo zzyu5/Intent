@@ -30,9 +30,10 @@ LogicalResult formPointwiseOwnership(ModuleOp module, func::FuncOp kernel) {
       failed(refreshReshapeRelations(kernel)) ||
       failed(alignPointwiseValueRelations(kernel)) ||
       failed(alignContractValueRelations(kernel)) ||
-      failed(closeReductionValueRelations(kernel)))
+      failed(closeReductionValueRelations(kernel)) ||
+      failed(alignAccessValueRelations(kernel)))
     return failure();
-  return alignAccessValueRelations(kernel);
+  return alignPointwiseValueRelations(kernel);
 }
 
 LogicalResult predicateScalarControlGroup(ModuleOp module, func::FuncOp) {

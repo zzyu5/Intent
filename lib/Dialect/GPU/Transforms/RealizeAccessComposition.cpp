@@ -1776,14 +1776,18 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
       auto axisType = FragmentType::get(
           store.getContext(), builder.getIndexType(), builder.getArrayAttr(axisShape),
           input.getAxisMaps(), input.getValidity(), input.getOwner());
-      auto relation = inferReshapeReassociation(rangeType, axisType);
-      if (failed(relation))
-        return store.emitOpError("flattened store has no source-coordinate projection")
-               << "; source_axis=" << sourceAxis
-               << "; source=" << inputRanges[sourceAxis].getResult().getType()
-               << "; target=" << indexType;
+      SmallVector<Attribute> relation;
+      for (unsigned axis = 0; axis < input.getShape().size(); ++axis) {
+        SmallVector<int64_t> sourceAxes;
+        if (axis == sourceAxis)
+          sourceAxes.push_back(0);
+        relation.push_back(ReshapeGroupAttr::get(
+            store.getContext(), builder.getDenseI64ArrayAttr(sourceAxes),
+            builder.getDenseI64ArrayAttr({static_cast<int64_t>(axis)})));
+      }
       Value projected = builder.create<ReshapeOp>(
-          store.getLoc(), axisType, inputRanges[sourceAxis].getResult(), *relation);
+          store.getLoc(), axisType, inputRanges[sourceAxis].getResult(),
+          builder.getArrayAttr(relation));
       if (axisType != indexType)
         projected = builder.create<BroadcastOp>(store.getLoc(), indexType, projected);
       if (ordinal) {

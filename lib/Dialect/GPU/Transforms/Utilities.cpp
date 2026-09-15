@@ -2536,8 +2536,8 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
       return failure();
     return projectPhysicalValueToSchema(builder, location, value, target);
   };
-  auto alignCoordinates = [&](auto access) -> LogicalResult {
-    auto payload = dyn_cast<FragmentType>(access.getResult().getType());
+  auto alignCoordinates = [&](auto access, Type valueType) -> LogicalResult {
+    auto payload = dyn_cast<FragmentType>(valueType);
     if (!payload)
       return success();
     PhysicalProgramAnalysis analysis(kernel);
@@ -2582,7 +2582,7 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
   kernel.walk([&](StoreOp store) { stores.push_back(store); });
 
   for (LoadOp load : loads) {
-    if (failed(alignCoordinates(load)))
+    if (failed(alignCoordinates(load, load.getResult().getType())))
       return failure();
     if (!load.getValid() && !load.getFill())
       continue;
@@ -2627,7 +2627,7 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
   }
 
   for (GatherOp gather : gathers) {
-    if (failed(alignCoordinates(gather)))
+    if (failed(alignCoordinates(gather, gather.getResult().getType())))
       return failure();
     if (!gather.getValid() && !gather.getFill())
       continue;
@@ -2665,6 +2665,8 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
   }
 
   for (StoreOp store : stores) {
+    if (failed(alignCoordinates(store, store.getValue().getType())))
+      return failure();
     if (!store.getValid())
       continue;
     auto currentType = dyn_cast<FragmentType>(store.getValue().getType());
