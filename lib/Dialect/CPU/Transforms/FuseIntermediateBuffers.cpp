@@ -5,6 +5,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
@@ -154,9 +155,131 @@ Value replay(Value value, Operation *root, OpBuilder &builder, IRMapping &mappin
   return mapping.lookup(value);
 }
 
+bool dependsOn(Value value, Value coordinate, Operation *root) {
+  if (value == coordinate) return true;
+  Operation *operation = value.getDefiningOp();
+  return operation && root->isAncestor(operation) &&
+      llvm::any_of(operation->getOperands(), [&](Value operand) {
+        return dependsOn(operand, coordinate, root);
+      });
+}
+
+bool canReplayVector(Value value, Value coordinate, Operation *root) {
+  if (value == coordinate || !dependsOn(value, coordinate, root)) return true;
+  Operation *operation = value.getDefiningOp();
+  if (auto load = dyn_cast<memref::LoadOp>(operation)) {
+    auto type = load.getMemRefType();
+    SmallVector<int64_t> strides;
+    int64_t offset;
+    return type.getRank() && !type.getElementType().isInteger(1) &&
+        succeeded(type.getStridesAndOffset(strides, offset)) && strides.back() == 1 &&
+        !dependsOn(load.getMemref(), coordinate, root) &&
+        load.getIndices().back() == coordinate &&
+        llvm::none_of(load.getIndices().drop_back(), [&](Value index) {
+          return dependsOn(index, coordinate, root);
+        });
+  }
+  return operation->hasTrait<OpTrait::Elementwise>() &&
+      llvm::all_of(operation->getOperandTypes(), [](Type type) {
+        return isa<FloatType, IntegerType, IndexType>(type);
+      }) && llvm::all_of(operation->getOperands(), [&](Value operand) {
+        return canReplayVector(operand, coordinate, root);
+      });
+}
+
+Value replayVector(Value value, Value coordinate, Operation *root, int64_t width,
+                   OpBuilder &builder, IRMapping &scalars, IRMapping &vectors) {
+  if (vectors.contains(value)) return vectors.lookup(value);
+  auto type = VectorType::get({width}, value.getType());
+  Location loc = root->getLoc();
+  Value result;
+  if (value == coordinate) {
+    Value start = builder.create<vector::BroadcastOp>(loc, type, scalars.lookup(value));
+    result = builder.create<arith::AddIOp>(loc, start, builder.create<vector::StepOp>(loc, type));
+  } else if (!dependsOn(value, coordinate, root)) {
+    result = builder.create<vector::BroadcastOp>(loc, type, replay(value, root, builder, scalars));
+  } else if (auto load = value.getDefiningOp<memref::LoadOp>()) {
+    SmallVector<Value> indices;
+    for (Value index : load.getIndices()) indices.push_back(replay(index, root, builder, scalars));
+    result = builder.create<vector::LoadOp>(loc, type,
+        replay(load.getMemref(), root, builder, scalars), indices);
+  } else {
+    Operation *operation = value.getDefiningOp();
+    IRMapping mapping;
+    for (Value operand : operation->getOperands())
+      mapping.map(operand, replayVector(operand, coordinate, root, width, builder, scalars, vectors));
+    Operation *cloned = builder.clone(*operation, mapping);
+    cloned->getResult(0).setType(type);
+    result = cloned->getResult(0);
+  }
+  vectors.map(value, result);
+  return result;
+}
+
+bool fullVectorRead(vector::LoadOp load, memref::AllocOp allocation) {
+  auto type = allocation.getType();
+  auto vector = load.getVectorType();
+  SmallVector<int64_t> strides;
+  int64_t offset;
+  if (!type.getRank() || !type.getLayout().isIdentity() || vector.getRank() != 1 || vector.isScalable() ||
+      failed(type.getStridesAndOffset(strides, offset)) || strides.back() != 1) return false;
+  unsigned dynamicAxis = 0;
+  for (int64_t axis = 0; axis + 1 < type.getRank(); ++axis) {
+    int64_t size = type.getDimSize(axis);
+    Value extent = type.isDynamicDim(axis) ? allocation.getDynamicSizes()[dynamicAxis++] : Value{};
+    Value position = load.getIndices()[axis];
+    if (auto constant = getConstantIntValue(position)) {
+      if (extent || *constant < 0 || *constant >= size) return false;
+      continue;
+    }
+    auto coordinate = dyn_cast<BlockArgument>(position);
+    auto traversal = coordinate ? dyn_cast<scf::ForOp>(coordinate.getOwner()->getParentOp()) : scf::ForOp{};
+    auto step = traversal ? getConstantIntValue(traversal.getStep()) : std::nullopt;
+    auto begin = traversal ? getConstantIntValue(traversal.getLowerBound()) : std::nullopt;
+    if (!traversal || position != traversal.getInductionVar() || !step || *step <= 0 ||
+        !begin || *begin < 0) return false;
+    auto end = getConstantIntValue(traversal.getUpperBound());
+    if (extent ? traversal.getUpperBound() != extent : !end || *end > size) return false;
+  }
+  int64_t width = vector.getDimSize(0);
+  int64_t staticExtent = type.getShape().back();
+  Value extent;
+  if (ShapedType::isDynamic(staticExtent)) extent = allocation.getDynamicSizes().back();
+  auto isExtent = [&](Value value) {
+    auto constant = getConstantIntValue(value);
+    return extent ? value == extent : constant && *constant == staticExtent;
+  };
+  Value begin = load.getIndices().back();
+  if (auto constant = getConstantIntValue(begin))
+    return !extent && *constant >= 0 && *constant <= staticExtent && width <= staticExtent - *constant;
+  auto coordinate = dyn_cast<BlockArgument>(begin);
+  auto traversal = coordinate ? dyn_cast<scf::ForOp>(coordinate.getOwner()->getParentOp()) : scf::ForOp{};
+  auto step = traversal ? getConstantIntValue(traversal.getStep()) : std::nullopt;
+  if (!traversal || begin != traversal.getInductionVar() || !step || *step != width ||
+      !matchPattern(traversal.getLowerBound(), m_Zero())) return false;
+  Value end = traversal.getUpperBound();
+  if (auto constant = getConstantIntValue(end))
+    return !extent && *constant >= 0 && *constant <= staticExtent && *constant % width == 0;
+  // Full blocks use either n - n % width or (n / width) * width.
+  // A plain vector.load does not itself promise that its entire slice is in bounds.
+  if (auto subtract = end.getDefiningOp<arith::SubIOp>()) {
+    auto remainder = subtract.getRhs().getDefiningOp<arith::RemSIOp>();
+    return isExtent(subtract.getLhs()) && remainder && isExtent(remainder.getLhs()) &&
+        getConstantIntValue(remainder.getRhs()) == width;
+  }
+  if (auto product = end.getDefiningOp<arith::MulIOp>()) {
+    Value quotient;
+    if (getConstantIntValue(product.getLhs()) == width) quotient = product.getRhs();
+    else if (getConstantIntValue(product.getRhs()) == width) quotient = product.getLhs();
+    auto division = quotient ? quotient.getDefiningOp<arith::DivSIOp>() : arith::DivSIOp{};
+    return division && isExtent(division.getLhs()) && getConstantIntValue(division.getRhs()) == width;
+  }
+  return false;
+}
+
 bool fuse(memref::AllocOp allocation) {
   memref::StoreOp store;
-  SmallVector<memref::LoadOp> loads;
+  SmallVector<Operation *> loads;
   SmallVector<memref::DeallocOp> deallocations;
   for (Operation *user : allocation->getUsers()) {
     if (auto write = dyn_cast<memref::StoreOp>(user)) {
@@ -164,13 +287,16 @@ bool fuse(memref::AllocOp allocation) {
       store = write;
     } else if (auto read = dyn_cast<memref::LoadOp>(user)) {
       loads.push_back(read);
+    } else if (auto read = dyn_cast<vector::LoadOp>(user)) {
+      if (!fullVectorRead(read, allocation)) return false;
+      loads.push_back(read);
     } else if (auto dealloc = dyn_cast<memref::DeallocOp>(user)) {
       deallocations.push_back(dealloc);
     } else return false;
   }
   if (!store || loads.empty()) return false;
   llvm::SmallPtrSet<Operation *, 4> consumers;
-  for (memref::LoadOp load : loads) {
+  for (Operation *load : loads) {
     Operation *stage = allocation->getBlock()->findAncestorOpInBlock(*load);
     if (!stage) return false;
     consumers.insert(stage);
@@ -205,6 +331,9 @@ bool fuse(memref::AllocOp allocation) {
   if (otherEffect) return false;
   llvm::SmallPtrSet<Operation *, 16> seen;
   if (!canReplay(store.getValue(), root, seen)) return false;
+  for (Operation *load : loads)
+    if (isa<vector::LoadOp>(load) && (loops.empty() ||
+        !canReplayVector(store.getValue(), loops.back().getInductionVar(), root))) return false;
   if (consumers.size() != 1) {
     auto integer = [](Type type) { return isa<IndexType, IntegerType>(type); };
     if (!integer(store.getValue().getType()) || llvm::any_of(seen, [&](Operation *operation) {
@@ -215,15 +344,23 @@ bool fuse(memref::AllocOp allocation) {
   for (Operation *operation : seen)
     if (auto read = dyn_cast<memref::LoadOp>(operation); read && !stableRead(read, root, function)) return false;
   DominanceInfo dominance(function);
-  for (memref::LoadOp load : loads)
+  for (Operation *load : loads)
     if (root->isAncestor(load) || !dominance.dominates(root, load)) return false;
-  for (memref::LoadOp load : loads) {
+  for (Operation *load : loads) {
     IRMapping mapping;
-    for (auto [loop, coordinate] : llvm::zip(loops, load.getIndices()))
+    ValueRange indices = isa<memref::LoadOp>(load) ? cast<memref::LoadOp>(load).getIndices()
+                                                 : cast<vector::LoadOp>(load).getIndices();
+    for (auto [loop, coordinate] : llvm::zip(loops, indices))
       mapping.map(loop.getInductionVar(), coordinate);
     OpBuilder builder(load);
-    load.getResult().replaceAllUsesWith(replay(store.getValue(), root, builder, mapping));
-    load.erase();
+    Value replacement;
+    if (auto vector = dyn_cast<vector::LoadOp>(load)) {
+      IRMapping vectors;
+      replacement = replayVector(store.getValue(), loops.back().getInductionVar(), root,
+          vector.getVectorType().getDimSize(0), builder, mapping, vectors);
+    } else replacement = replay(store.getValue(), root, builder, mapping);
+    load->getResult(0).replaceAllUsesWith(replacement);
+    load->erase();
   }
   root->erase();
   for (memref::DeallocOp dealloc : deallocations) dealloc.erase();

@@ -1231,7 +1231,7 @@ private:
       maps.push_back(AffineMap::get(type.getRank(), 0, freeAxes, builder.getContext()));
     }
     LogicalResult status = success();
-    builder.create<linalg::GenericOp>(loc, inputs, outputs, maps, iterators,
+    auto reduction = builder.create<linalg::GenericOp>(loc, inputs, outputs, maps, iterators,
         [&](OpBuilder &nestedBuilder, Location, ValueRange scalars) {
       OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPoint(nestedBuilder.getInsertionBlock(), nestedBuilder.getInsertionPoint());
@@ -1250,6 +1250,8 @@ private:
       scalarized = false;
       if (succeeded(status)) builder.create<linalg::YieldOp>(loc, flattened(combine.getTerminator()->getOperands()));
     });
+    reduction->setAttr("intent_cpu.reduction_order",
+        cpu::ReductionOrderAttr::get(builder.getContext(), true));
     if (failed(status)) return failure();
     bindSlots(operation.getResults(), outputs, loc);
     return success();
