@@ -319,6 +319,110 @@ LogicalResult partition(scf::ParallelOp root, int64_t grain) {
   return success();
 }
 
+scf::ParallelOp partitionAtomicRows(func::FuncOp function, scf::ParallelOp root, int64_t grain) {
+  if (root->getBlock() != &function.front() || root.getNumLoops() != 1 || root.getNumResults() ||
+      !matchPattern(root.getLowerBound()[0], m_Zero()) || !matchPattern(root.getStep()[0], m_One())) return {};
+  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  if (!interface || !interface.getDisjointOutputs()) return {};
+  SmallVector<AtomicRMWOp> updates;
+  root.walk([&](AtomicRMWOp update) { updates.push_back(update); });
+  if (updates.size() != 1) return {};
+  auto update = updates.front();
+  auto target = cast<MemRefType>(update.getTarget().getType());
+  PhysicalProgramAnalysis physical(function);
+  auto external = physical.externalView(update.getTarget());
+  if (update.getOrdering() != AtomicOrdering::Relaxed || update.getKind() != AtomicRMWKind::Add ||
+      !update.getValue().getType().isF32() || !update->getResult(0).use_empty() ||
+      target.getRank() < 2 || !target.getLayout().isIdentity() || !external || external.getAccess() != 2 ||
+      update.getTarget() != physical.storageRoot(update.getTarget()) ||
+      !update->getParentOfType<scf::ForOp>()) return {};
+
+  bool valid = true;
+  root.walk([&](Operation *operation) {
+    if (operation == root || operation == update || isa<scf::YieldOp, scf::ReduceOp>(operation)) return;
+    if (auto loop = dyn_cast<scf::ForOp>(operation)) {
+      valid &= loop.getNumResults() == 0;
+      return;
+    }
+    if (auto load = dyn_cast<memref::LoadOp>(operation)) {
+      valid &= physical.isReadOnly(load.getMemref());
+      return;
+    }
+    if (isa<memref::SubViewOp, memref::CastOp, memref::DimOp>(operation)) return;
+    if (!isMemoryEffectFree(operation) || operation->getNumRegions() ||
+        llvm::any_of(operation->getOperandTypes(), [](Type type) { return isa<MemRefType>(type); }) ||
+        llvm::any_of(operation->getResultTypes(), [](Type type) { return isa<MemRefType>(type); })) valid = false;
+  });
+  if (!valid) return {};
+
+  // Only the row coordinate is evaluated by every owner. Loads must already
+  // execute once per original iteration; nested scalar dependencies must be
+  // safe even when a feature loop is empty.
+  llvm::SetVector<Operation *> dependencies;
+  std::function<bool(Value)> collect = [&](Value value) {
+    if (value == root.getInductionVars()[0]) return true;
+    if (auto argument = dyn_cast<BlockArgument>(value))
+      return !root->isAncestor(argument.getOwner()->getParentOp());
+    Operation *definition = value.getDefiningOp();
+    if (!definition || !root->isAncestor(definition)) return true;
+    if (dependencies.contains(definition)) return true;
+    if (auto load = dyn_cast<memref::LoadOp>(definition)) {
+      if (load->getBlock() != root.getBody() || !physical.isReadOnly(load.getMemref())) return false;
+    } else if (!isMemoryEffectFree(definition) || !isSpeculatable(definition) || definition->getNumRegions() ||
+               llvm::any_of(definition->getResultTypes(), [](Type type) { return isa<MemRefType>(type); })) return false;
+    if (definition->getBlock() != root.getBody() &&
+        !isa<arith::ConstantOp, arith::IndexCastOp, arith::IndexCastUIOp,
+             arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp>(definition)) return false;
+    if (!llvm::all_of(definition->getOperands(), collect)) return false;
+    dependencies.insert(definition);
+    return true;
+  };
+  Value row = update.getIndices().front();
+  if (!collect(row)) return {};
+
+  auto capabilities = function->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities");
+  OpBuilder b(root);
+  Location loc = root.getLoc();
+  Value zero = index(b, loc, 0), one = index(b, loc, 1);
+  Value rows = b.create<memref::DimOp>(loc, update.getTarget(), 0);
+  Value count = b.create<arith::CeilDivSIOp>(loc, rows, index(b, loc, grain));
+  count = b.create<arith::MaxSIOp>(loc, one,
+      b.create<arith::MinSIOp>(loc, count, index(b, loc, capabilities.getWorkers())));
+  Value width = b.create<arith::DivSIOp>(loc, rows, count);
+  Value remainder = b.create<arith::RemSIOp>(loc, rows, count);
+  auto owners = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{count}, ValueRange{one});
+  owners->setDiscardableAttrs(root->getDiscardableAttrDictionary());
+  b.setInsertionPointToStart(owners.getBody());
+  Value owner = owners.getInductionVars()[0];
+  Value begin = add(b, loc, multiply(b, loc, owner, width),
+      b.create<arith::MinSIOp>(loc, owner, remainder));
+  Value extra = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, owner, remainder);
+  Value end = add(b, loc, begin, add(b, loc, width, b.create<arith::SelectOp>(loc, extra, one, zero)));
+  auto tokens = b.create<scf::ForOp>(loc, root.getLowerBound()[0], root.getUpperBound()[0], root.getStep()[0]);
+  b.setInsertionPointToStart(tokens.getBody());
+  IRMapping mapping;
+  mapping.map(root.getInductionVars()[0], tokens.getInductionVar());
+  for (Operation *dependency : dependencies) b.clone(*dependency, mapping);
+  Value selected = mapping.lookupOrDefault(row);
+  Value lower = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge, selected, begin);
+  Value upper = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, selected, end);
+  auto active = b.create<scf::IfOp>(loc, b.create<arith::AndIOp>(loc, lower, upper), false);
+  b.setInsertionPointToStart(active.thenBlock());
+  for (Operation &operation : root.getBody()->without_terminator())
+    if (!dependencies.contains(&operation)) b.clone(operation, mapping);
+
+  // Every physical destination row now has one task owner. Keep every
+  // original f32 update in token order, without a partial sum or reassociation.
+  auto local = mapping.lookup(update->getResult(0)).getDefiningOp<AtomicRMWOp>();
+  b.setInsertionPoint(local);
+  Value old = b.create<memref::LoadOp>(loc, local.getTarget(), local.getIndices());
+  Value sum = b.create<arith::AddFOp>(loc, old, local.getValue());
+  b.create<memref::StoreOp>(loc, sum, local.getTarget(), local.getIndices());
+  local.erase();
+  root.erase();
+  return owners;
+}
+
 }
 
 LogicalResult partitionTasks(func::FuncOp function, int64_t grain, const ImplementationRegistry &implementations) {
@@ -328,8 +432,11 @@ LogicalResult partitionTasks(func::FuncOp function, int64_t grain, const Impleme
   function.walk([&](scf::ParallelOp operation) {
     if (!operation->getParentOfType<scf::ParallelOp>()) roots.push_back(operation);
   });
-  for (scf::ParallelOp root : roots)
-    if (failed(partition(root, grain))) return failure();
+  for (scf::ParallelOp root : roots) {
+    auto owners = partitionAtomicRows(function, root, grain);
+    // Atomic row worksets have already consumed the grain and worker budget.
+    if (failed(partition(owners ? owners : root, owners ? 1 : grain))) return failure();
+  }
   return success();
 }
 
