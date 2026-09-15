@@ -1850,6 +1850,10 @@ private:
         return failure();
       gpu::PhysicalProgramAnalysis analysis(physicalKernel);
       if (analysis.axisRealization(resource, axis).constructionScalarSeed) {
+        auto mapping = cast<gpu::AxisMapAttr>(fragment.getAxisMaps()[axis]);
+        auto dimension = dimensions.find(mapping.getDimensionId());
+        if (dimension != dimensions.end())
+          return dimension->second;
         FailureOr<gpu::MakeRangeOp> range =
             gpu::queryExactLogicalRange(analysis.axisRanges(resource, axis));
         if (failed(range))
@@ -2888,8 +2892,11 @@ private:
         continue;
       FailureOr<Value> extent =
           resourceExtent(operation->getLoc(), resource, sourceAxis);
-      if (failed(extent))
+      if (failed(extent)) {
+        operation->emitOpError("indexed resource extent is unavailable")
+            << "; resource=" << resource << "; axis=" << sourceAxis;
         return failure();
+      }
 
       Value index = coordinate;
       Value upper = *extent;
@@ -2935,8 +2942,11 @@ private:
       if (payloadFragment) {
         FailureOr<Value> projected = projectAccessOperand(
             operation->getLoc(), axisValid, payloadFragment);
-        if (failed(projected))
+        if (failed(projected)) {
+          operation->emitOpError("index bounds have no payload projection")
+              << "; index=" << index << "; payload=" << payloadFragment;
           return failure();
+        }
         axisValid = *projected;
       }
       if (axisValid.getType() != predicateType)

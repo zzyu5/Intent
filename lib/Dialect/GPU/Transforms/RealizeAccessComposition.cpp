@@ -1,6 +1,7 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
@@ -183,12 +184,10 @@ bool sameUniformValue(Value lhs, Value rhs) {
     return true;
   auto scalar = [](Value value) {
     while (value) {
-      if (auto splat = value.getDefiningOp<SplatOp>())
-        value = splat.getValue();
-      else if (auto broadcast = value.getDefiningOp<BroadcastOp>())
-        value = broadcast.getValue();
-      else
+      UniformExpression expression = describeUniformValue(value);
+      if (expression.kind != UniformKind::Forward || expression.operands.size() != 1)
         break;
+      value = expression.operands.front();
     }
     return value;
   };
@@ -199,9 +198,8 @@ bool sameUniformValue(Value lhs, Value rhs) {
     return false;
   if (lhs == rhs)
     return true;
-  auto left = lhs.getDefiningOp<arith::ConstantOp>();
-  auto right = rhs.getDefiningOp<arith::ConstantOp>();
-  return left && right && left.getValue() == right.getValue();
+  UniformValueAnalysis constants(describeUniformValue);
+  return equalUniformConstants(constants.evaluate(lhs), constants.evaluate(rhs));
 }
 
 FailureOr<bool> composeSelectLoad(SelectOp select) {
@@ -1119,83 +1117,156 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
   if (!findReshape(store.getValue(), outerAxes))
     return false;
   SmallVector<LoadOp> companions;
-  llvm::SmallDenseSet<Value> checked;
-  std::function<bool(Value)> canReplayEpilogue = [&](Value value) {
-    if (value == reshape.getResult() || !isa<FragmentType>(value.getType()) ||
-        !checked.insert(value).second)
+  SmallVector<ReshapeOp> sourceReshapes{reshape};
+  llvm::DenseMap<Value, unsigned> companionAxes;
+  using OutputAxes = SmallVector<std::optional<unsigned>>;
+  llvm::DenseMap<Value, OutputAxes> checked;
+  auto isSourceFrame = [&](ArrayRef<std::optional<unsigned>> axes) {
+    return axes.size() == outerAxes.size() &&
+           llvm::all_of(llvm::zip(axes, outerAxes), [](const auto &pair) {
+             return std::get<0>(pair) == std::get<1>(pair);
+           });
+  };
+  std::function<bool(Value, OutputAxes)> canReplayEpilogue =
+      [&](Value value, OutputAxes axes) {
+    auto result = dyn_cast<FragmentType>(value.getType());
+    if (value == reshape.getResult())
+      return isSourceFrame(axes);
+    if (!result)
       return true;
-    Operation *producer = value.getDefiningOp();
-    if (isa_and_nonnull<TransposeOp>(producer) && !transposes.contains(producer))
+    if (axes.size() != result.getShape().size())
       return false;
-    if (auto broadcast = dyn_cast_or_null<BroadcastOp>(producer)) {
-      if (auto source = dyn_cast<FragmentType>(broadcast.getValue().getType())) {
-        auto target = cast<FragmentType>(broadcast.getResult().getType());
-        BroadcastProjection projection = queryBroadcastProjection(source, target);
-        if (!projection.isExact())
+    auto [entry, inserted] = checked.try_emplace(value, axes);
+    if (!inserted) {
+      bool changed = false;
+      for (auto [known, current] : llvm::zip(entry->second, axes)) {
+        if (known && current && known != current)
           return false;
-        for (auto [axis, sourceAxis] : llvm::enumerate(projection.targetToSource)) {
-          if (!sourceAxis)
-            continue;
-          auto sourceMap = cast<AxisMapAttr>(source.getAxisMaps()[*sourceAxis]);
-          auto targetMap = cast<AxisMapAttr>(target.getAxisMaps()[axis]);
-          PhysicalRangeFact ranges =
-              analysis.axisRanges(broadcast.getValue(), *sourceAxis);
-          auto extent = cast<PhysicalExprAttr>(source.getShape()[*sourceAxis]);
-          if (extent.getKind() ==
-                  static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-              extent.getValue() == 1 && ranges.isExact() && ranges.roots.empty())
-            continue;
-          bool storeCoordinate = transposes.empty() && axis < outputRanges.size() &&
-              succeeded(queryExactLogicalRange(ranges)) &&
-              llvm::all_of(ranges.roots, [&](MakeRangeOp range) {
-                return sameLogicalRange(range, outputRanges[axis]);
-              });
-          if (sourceMap.getDimensionId() != targetMap.getDimensionId() &&
-              !isPositionalRebinding(broadcast) && !storeCoordinate)
-            return false;
+        if (!known && current) {
+          known = current;
+          changed = true;
         }
       }
+      if (!changed)
+        return true;
+      axes = entry->second;
+    }
+    Operation *producer = value.getDefiningOp();
+    if (auto transpose = dyn_cast_or_null<TransposeOp>(producer)) {
+      if (!transposes.contains(producer))
+        return false;
+      OutputAxes inputAxes(axes.size());
+      for (auto [axis, inputAxis] : llvm::enumerate(transpose.getPermutation()))
+        inputAxes[inputAxis] = axes[axis];
+      return canReplayEpilogue(transpose.getValue(), std::move(inputAxes));
     }
     if (auto load = dyn_cast_or_null<LoadOp>(producer)) {
       if (!canReplayReadAt(load, store))
         return false;
+      for (auto [axis, outputAxis] : llvm::enumerate(axes)) {
+        PhysicalRangeFact ranges = analysis.axisRanges(value, axis);
+        if (ranges.state == PhysicalFactState::Unknown || !ranges.blockers.empty())
+          return false;
+        if (ranges.roots.empty())
+          continue;
+        if (!outputAxis || *outputAxis >= outputRanges.size())
+          return false;
+        for (MakeRangeOp range : ranges.roots) {
+          if (!analysis.lockstepRanges({range, outputRanges[*outputAxis]}).isExact())
+            return false;
+          auto [found, inserted] = companionAxes.try_emplace(range.getResult(), *outputAxis);
+          if (!inserted && found->second != *outputAxis)
+            return false;
+        }
+      }
       companions.push_back(load);
       return true;
     }
     if (auto companion = dyn_cast_or_null<ReshapeOp>(producer)) {
       auto source = cast<FragmentType>(companion.getValue().getType());
-      auto result = cast<FragmentType>(companion.getResult().getType());
-      auto unitAxes = [](FragmentType type, ArrayRef<int64_t> axes) {
+      auto primarySource = cast<FragmentType>(reshape.getValue().getType());
+      auto primaryResult = cast<FragmentType>(reshape.getResult().getType());
+      if (companion.getReassociation() == reshape.getReassociation() &&
+          source.getShape() == primarySource.getShape() &&
+          source.getAxisMaps() == primarySource.getAxisMaps() &&
+          source.getOwner() == primarySource.getOwner() &&
+          source.getValidity() == primarySource.getValidity() &&
+          result.getShape() == primaryResult.getShape() &&
+          result.getAxisMaps() == primaryResult.getAxisMaps() &&
+          result.getOwner() == primaryResult.getOwner() &&
+          result.getValidity() == primaryResult.getValidity()) {
+        if (!isSourceFrame(axes))
+          return false;
+        if (!llvm::is_contained(sourceReshapes, companion))
+          sourceReshapes.push_back(companion);
+        return true;
+      }
+      auto unitAxes = [](FragmentType type, ArrayRef<int64_t> axes, unsigned prefix) {
         return llvm::all_of(axes, [&](int64_t axis) {
-          auto extent = cast<PhysicalExprAttr>(type.getShape()[axis]);
+          auto extent = cast<PhysicalExprAttr>(type.getShape()[prefix + axis]);
           return extent.getKind() ==
                      static_cast<uint32_t>(PhysicalExprKind::Constant) &&
                  extent.getValue() == 1;
         });
       };
+      unsigned sourceRank = 0, resultRank = 0;
+      for (Attribute attribute : companion.getReassociation()) {
+        auto group = cast<ReshapeGroupAttr>(attribute);
+        sourceRank += group.getSourceAxes().size();
+        resultRank += group.getResultAxes().size();
+      }
+      unsigned sourcePrefix = source.getShape().size() - sourceRank;
+      unsigned resultPrefix = result.getShape().size() - resultRank;
+      if (sourcePrefix != resultPrefix)
+        return false;
+      OutputAxes inputAxes(source.getShape().size());
+      for (unsigned axis = 0; axis < sourcePrefix; ++axis)
+        inputAxes[axis] = axes[axis];
       for (Attribute attribute : companion.getReassociation()) {
         auto group = cast<ReshapeGroupAttr>(attribute);
         if (group.getSourceAxes().empty()) {
-          if (!unitAxes(result, group.getResultAxes().asArrayRef()))
+          if (!unitAxes(result, group.getResultAxes().asArrayRef(), resultPrefix))
             return false;
         } else if (group.getResultAxes().empty()) {
-          if (!unitAxes(source, group.getSourceAxes().asArrayRef()))
+          if (!unitAxes(source, group.getSourceAxes().asArrayRef(), sourcePrefix))
             return false;
         } else if (group.getSourceAxes().size() != 1 ||
                    group.getResultAxes().size() != 1) {
           return false;
+        } else {
+          inputAxes[sourcePrefix + group.getSourceAxes()[0]] =
+              axes[resultPrefix + group.getResultAxes()[0]];
         }
       }
+      return canReplayEpilogue(companion.getValue(), std::move(inputAxes));
     }
-    if (!isPointwise(producer) &&
-        !isa_and_nonnull<TransposeOp, ReshapeOp>(producer))
+    if (!isPointwise(producer))
       return false;
-    return llvm::all_of(producer->getOperands(), canReplayEpilogue);
+    return llvm::all_of(producer->getOperands(), [&](Value operand) {
+      auto input = dyn_cast<FragmentType>(operand.getType());
+      if (!input)
+        return true;
+      auto projection = queryBroadcastProjection(input, result);
+      if (!projection.isExact())
+        return false;
+      OutputAxes inputAxes(input.getShape().size());
+      for (auto [axis, inputAxis] : llvm::enumerate(projection.targetToSource)) {
+        if (!inputAxis || !axes[axis])
+          continue;
+        if (inputAxes[*inputAxis] && inputAxes[*inputAxis] != axes[axis])
+          return false;
+        inputAxes[*inputAxis] = axes[axis];
+      }
+      return canReplayEpilogue(operand, std::move(inputAxes));
+    });
   };
-  if (!canReplayEpilogue(store.getValue()))
+  OutputAxes outputAxes;
+  for (unsigned axis = 0; axis < outputRank; ++axis)
+    outputAxes.push_back(axis);
+  if (!canReplayEpilogue(store.getValue(), std::move(outputAxes)))
     return false;
   auto input = dyn_cast<FragmentType>(reshape.getValue().getType());
-  if (!input || input.getShape().size() > outputRank)
+  if (!input)
     return false;
   unsigned logicalSourceRank = 0;
   unsigned logicalResultRank = 0;
@@ -1213,6 +1284,11 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
   for (unsigned axis = 0; axis < input.getShape().size(); ++axis) {
     PhysicalRangeFact ranges = analysis.axisRanges(reshape.getValue(), axis);
     FailureOr<MakeRangeOp> range = queryExactLogicalRange(ranges);
+    if (failed(range) && ranges.blockers.empty()) {
+      auto traversal = analysis.lockstepRanges(ranges.roots);
+      if (traversal.isExact())
+        range = traversal.authority;
+    }
     if (failed(range) || !isZero((*range).getStart()) ||
         !isZero((*range).getLogicalStart()) || !isUnitStepRange(*range))
       return false;
@@ -1323,6 +1399,9 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
       }
       coordinates[coordinateSlots[outerAxis]] = coordinate;
       mapping.map(range.getResult(), coordinate);
+      for (auto [root, axis] : companionAxes)
+        if (axis == outerAxis)
+          mapping.map(root, coordinate);
       kernel.walk([&](MakeRangeOp occurrence) {
         FailureOr<int64_t> occurrenceDimension = queryRangeDimension(occurrence);
         FailureOr<int64_t> rangeDimension = queryRangeDimension(range);
@@ -1360,6 +1439,17 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
   if (source.getType() != input)
     source = builder.create<BroadcastOp>(store.getLoc(), input, source);
   mapping.map(reshape.getResult(), source);
+  for (ReshapeOp companion : llvm::drop_begin(sourceReshapes)) {
+    auto original = cast<FragmentType>(companion.getValue().getType());
+    auto target = FragmentType::get(
+        input.getContext(), original.getElementType(), input.getShape(),
+        input.getAxisMaps(), input.getValidity(), input.getOwner());
+    FailureOr<Value> value = projectPhysicalValueToSchema(
+        builder, store.getLoc(), companion.getValue(), target);
+    if (failed(value))
+      return store.emitOpError("aligned reshapes have no common input relation");
+    mapping.map(companion.getResult(), *value);
+  }
   for (LoadOp companion : companions) {
     auto companionType = FragmentType::get(
         input.getContext(), cast<FragmentType>(companion.getResult().getType()).getElementType(),

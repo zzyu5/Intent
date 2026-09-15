@@ -772,6 +772,62 @@ bool coordinateRangeWithinResource(Value coordinate, Value resource,
                                    unsigned axis);
 bool valueMatchesExtent(Value value, PhysicalExprAttr extent);
 
+std::optional<std::pair<int64_t, int64_t>>
+positiveExtentBounds(func::FuncOp kernel, PhysicalExprAttr extent) {
+  if (!extent)
+    return std::nullopt;
+  auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+  if (kind == PhysicalExprKind::Constant) {
+    if (extent.getValue() <= 0)
+      return std::nullopt;
+    return std::pair{extent.getValue(), extent.getValue()};
+  }
+  if (kind == PhysicalExprKind::Parameter) {
+    FailureOr<ParameterOp> parameter =
+        queryParameterBySymbol(kernel, extent.getSymbol());
+    if (failed(parameter))
+      return std::nullopt;
+    auto candidates = parameter->getParameter().getCandidates().asArrayRef();
+    if (candidates.empty() ||
+        llvm::any_of(candidates, [](int64_t value) { return value <= 0; }))
+      return std::nullopt;
+    if (auto tuples = kernel->getAttrOfType<ArrayAttr>(sharedConfigTuplesAttr);
+        tuples && !tuples.empty()) {
+      int64_t minimum = std::numeric_limits<int64_t>::max();
+      int64_t maximum = 0;
+      bool bound = true;
+      for (Attribute attribute : tuples) {
+        auto tuple = dyn_cast<DictionaryAttr>(attribute);
+        auto selected = tuple ? tuple.getAs<IntegerAttr>(extent.getSymbol())
+                              : IntegerAttr();
+        if (!selected || selected.getInt() <= 0 ||
+            !llvm::is_contained(candidates, selected.getInt())) {
+          bound = false;
+          break;
+        }
+        minimum = std::min(minimum, selected.getInt());
+        maximum = std::max(maximum, selected.getInt());
+      }
+      if (bound)
+        return std::pair{minimum, maximum};
+    }
+    return std::pair{*llvm::min_element(candidates),
+                     *llvm::max_element(candidates)};
+  }
+  if (kind != PhysicalExprKind::Multiply || extent.getOperands().size() != 2)
+    return std::nullopt;
+  auto lhs = positiveExtentBounds(
+      kernel, cast<PhysicalExprAttr>(extent.getOperands()[0]));
+  auto rhs = positiveExtentBounds(
+      kernel, cast<PhysicalExprAttr>(extent.getOperands()[1]));
+  if (!lhs || !rhs)
+    return std::nullopt;
+  __int128 maximum = static_cast<__int128>(lhs->second) * rhs->second;
+  if (maximum > std::numeric_limits<int64_t>::max())
+    return std::nullopt;
+  return std::pair{lhs->first * rhs->first, static_cast<int64_t>(maximum)};
+}
+
 bool linearizedGatherWithinResource(Value coordinate, Value resource) {
   auto sourceReshape = resource.getDefiningOp<ReshapeOp>();
   auto source = sourceReshape
@@ -846,51 +902,9 @@ bool linearizedGatherWithinResource(Value coordinate, Value resource) {
     return false;
 
   auto kernel = sourceReshape->getParentOfType<func::FuncOp>();
-  std::function<std::optional<int64_t>(PhysicalExprAttr)> positiveExtentLimit =
-      [&](PhysicalExprAttr extent) -> std::optional<int64_t> {
-    auto kind = static_cast<PhysicalExprKind>(extent.getKind());
-    if (kind == PhysicalExprKind::Constant)
-      return extent.getValue() > 0 ? std::optional<int64_t>(extent.getValue())
-                                   : std::nullopt;
-    if (kind == PhysicalExprKind::Parameter) {
-      FailureOr<ParameterOp> parameter =
-          queryParameterBySymbol(kernel, extent.getSymbol());
-      if (failed(parameter))
-        return std::nullopt;
-      auto candidates = parameter->getParameter().getCandidates().asArrayRef();
-      if (candidates.empty() ||
-          llvm::any_of(candidates, [](int64_t value) { return value <= 0; }))
-        return std::nullopt;
-      if (auto tuples = kernel->getAttrOfType<ArrayAttr>(sharedConfigTuplesAttr);
-          tuples && !tuples.empty()) {
-        int64_t maximum = 0;
-        bool bound = true;
-        for (Attribute attribute : tuples) {
-          auto tuple = dyn_cast<DictionaryAttr>(attribute);
-          auto selected = tuple ? tuple.getAs<IntegerAttr>(extent.getSymbol())
-                                : IntegerAttr();
-          if (!selected || selected.getInt() <= 0 ||
-              !llvm::is_contained(candidates, selected.getInt())) {
-            bound = false;
-            break;
-          }
-          maximum = std::max(maximum, selected.getInt());
-        }
-        if (bound)
-          return maximum;
-      }
-      return *llvm::max_element(candidates);
-    }
-    if (kind != PhysicalExprKind::Multiply || extent.getOperands().size() != 2)
-      return std::nullopt;
-    auto lhs = positiveExtentLimit(cast<PhysicalExprAttr>(extent.getOperands()[0]));
-    auto rhs = positiveExtentLimit(cast<PhysicalExprAttr>(extent.getOperands()[1]));
-    if (!lhs || !rhs)
-      return std::nullopt;
-    __int128 product = static_cast<__int128>(*lhs) * *rhs;
-    return product <= std::numeric_limits<int64_t>::max()
-               ? std::optional<int64_t>(static_cast<int64_t>(product))
-               : std::nullopt;
+  auto positiveExtentLimit = [&](PhysicalExprAttr extent) -> std::optional<int64_t> {
+    auto bounds = positiveExtentBounds(kernel, extent);
+    return bounds ? std::optional<int64_t>(bounds->second) : std::nullopt;
   };
   if (!positiveExtentLimit(resourceExtentExpression(resource, 0)) ||
       !positiveExtentLimit(resourceExtentExpression(index, 0)))
@@ -949,21 +963,9 @@ bool coordinateRangeWithinResource(Value coordinate, Value resource,
     return coordinateRangeWithinResource(transpose.getValue(), resource, axis);
   if (std::optional<int64_t> constant = integerConstant(coordinate)) {
     PhysicalExprAttr extent = resourceExtentExpression(resource, axis);
-    if (extent && *constant >= 0 && extent.getKind() ==
-            static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
-      auto kernel = resource.getParentRegion()->getParentOfType<func::FuncOp>();
-      FailureOr<ParameterOp> parameter = queryParameterBySymbol(kernel, extent.getSymbol());
-      if (succeeded(parameter)) {
-        auto candidates = (*parameter).getParameter().getCandidates().asArrayRef();
-        return !candidates.empty() && llvm::all_of(candidates, [&](int64_t size) {
-          return *constant < size;
-        });
-      }
-    }
-    return extent &&
-           extent.getKind() ==
-               static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-           *constant >= 0 && *constant < extent.getValue();
+    auto kernel = resource.getParentRegion()->getParentOfType<func::FuncOp>();
+    auto bounds = positiveExtentBounds(kernel, extent);
+    return bounds && *constant >= 0 && *constant < bounds->first;
   }
   if (auto select = coordinate.getDefiningOp<SelectOp>()) {
     if (!coordinateRangeWithinResource(select.getFalseValue(), resource, axis))
@@ -2674,6 +2676,36 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     collectAxisRanges(transpose.getValue(),
                       static_cast<unsigned>(permutation[fragmentAxis]), result,
                       visited);
+    return;
+  }
+  if (auto gather = dyn_cast<GatherOp>(operation)) {
+    auto input = dyn_cast<FragmentType>(gather.getSource().getType());
+    auto expected = cast<AxisMapAttr>(fragment.getAxisMaps()[fragmentAxis]);
+    auto retained = input ? queryFragmentAxis(input, sourceAxisIdentity(expected))
+                          : PhysicalAxisProjection{};
+    auto output = queryFragmentAxis(fragment, sourceAxisIdentity(expected));
+    if (retained.isExact() && retained.dimensionId == expected.getDimensionId() &&
+        output.isExact() && output.fragmentAxis == fragmentAxis &&
+        !llvm::is_contained(gather.getSourceAxes(), retained.fragmentAxis) &&
+        input.getShape()[retained.fragmentAxis] == fragment.getShape()[fragmentAxis]) {
+      collectAxisRanges(gather.getSource(), retained.fragmentAxis, result, visited);
+      return;
+    }
+    bool followed = false;
+    for (Value coordinate : gather.getCoordinates()) {
+      auto type = dyn_cast<FragmentType>(coordinate.getType());
+      auto projection = type ? queryFragmentAxis(type, sourceAxisIdentity(expected))
+                             : PhysicalAxisProjection{};
+      if (!projection.isExact() || projection.dimensionId != expected.getDimensionId() ||
+          type.getShape()[projection.fragmentAxis] != fragment.getShape()[fragmentAxis])
+        continue;
+      collectAxisRanges(coordinate, projection.fragmentAxis, result, visited);
+      followed = true;
+    }
+    if (followed)
+      return;
+    result.state = PhysicalFactState::Unknown;
+    appendUnique(result.blockers, operation);
     return;
   }
   if (auto load = dyn_cast<LoadOp>(operation)) {

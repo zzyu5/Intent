@@ -173,6 +173,12 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
   // and structured realization are subsequent transformations of this program.
   if (failed(realizeAccessComposition(module)))
     return failure();
+  FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
+  if (failed(kernel) || failed(alignContractValueRelations(*kernel)) ||
+      failed(alignAggregateValueRelations(*kernel)) ||
+      failed(alignPointwiseValueRelations(*kernel)) ||
+      failed(alignAccessValueRelations(*kernel)))
+    return failure();
   return verifyGPUProgram(module);
 }
 

@@ -1312,8 +1312,13 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
       return blockedRange;
     }
     auto originalType = dyn_cast<FragmentType>(range.getResult().getType());
+    bool sameBounds =
+        sourceAxisIdentity(range) == source &&
+        samePhysicalScalarExpression(range.getLogicalStart(), blocked.getLogicalStart()) &&
+        samePhysicalScalarExpression(range.getLogicalStop(), blocked.getLogicalStop()) &&
+        samePhysicalScalarExpression(range.getStep(), blocked.getStep());
     if (!blocked || failed(rangeDimension) || failed(blockedDimension) ||
-        *rangeDimension != *blockedDimension || !originalType ||
+        (*rangeDimension != *blockedDimension && !sameBounds) || !originalType ||
         originalType.getShape().size() != 1) {
       InFlightDiagnostic diagnostic = range.emitOpError(
           "pointwise replay reached a range without an exact shared dimension relation");
@@ -1409,14 +1414,7 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
                 PhysicalProgramAnalysis(kernel).axisRanges(operand, *axis);
             bool renamedAxis =
                 input.getShape()[*axis] ==
-                    output.getShape()[requested.fragmentAxis] &&
-                llvm::all_of(ranges.roots, [&](MakeRangeOp range) {
-                  FailureOr<int64_t> dimension = queryRangeDimension(range);
-                  return sourceAxisIdentity(range) ==
-                             sourceAxisIdentity(blocked) &&
-                         succeeded(dimension) &&
-                         *dimension == *blockedDimension;
-                });
+                    output.getShape()[requested.fragmentAxis];
             if ((axisMap.getDimensionId() == *blockedDimension || renamedAxis) &&
                 ranges.state != PhysicalFactState::Unknown &&
                 ranges.blockers.empty() &&
@@ -4557,12 +4555,14 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       auto type = dyn_cast<FragmentType>(coordinate.getType());
       if (!type)
         continue;
-      if (type.getShape().size() != 1)
-        return WalkResult::advance();
       coordinates.push_back(coordinate);
     }
-    if (!valueType || valueType.getShape().size() != coordinates.size())
+    if (!valueType || coordinates.empty())
       return WalkResult::advance();
+    bool cartesian = valueType.getShape().size() == coordinates.size() &&
+        llvm::all_of(coordinates, [](Value value) {
+          return cast<FragmentType>(value.getType()).getShape().size() == 1;
+        });
     PhysicalProgramAnalysis analysis(kernel);
     llvm::DenseMap<Operation *, unsigned> resultAxes;
     for (auto [axis, attribute] : llvm::enumerate(valueType.getAxisMaps())) {
@@ -4576,7 +4576,35 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           }) >= 2;
       // Rank-one Cartesian coordinates concatenate into the result axes.
       // Equal dimension values do not equate those independent occurrences.
-      PhysicalRangeFact address = analysis.axisRanges(coordinates[axis], 0);
+      PhysicalRangeFact address;
+      if (cartesian) {
+        address = analysis.axisRanges(coordinates[axis], 0);
+      } else {
+        address.state = PhysicalFactState::Exact;
+        for (Value coordinate : coordinates) {
+          auto source = cast<FragmentType>(coordinate.getType());
+          auto projection = queryAxisProjection(source, valueType);
+          if (!projection.isExact()) {
+            address.state = PhysicalFactState::Unknown;
+            break;
+          }
+          auto sourceAxis = projection.targetToSource[axis];
+          if (!sourceAxis)
+            continue;
+          PhysicalRangeFact ranges = analysis.axisRanges(coordinate, *sourceAxis);
+          if (ranges.state == PhysicalFactState::Unknown || !ranges.blockers.empty()) {
+            address.state = PhysicalFactState::Unknown;
+            break;
+          }
+          for (MakeRangeOp range : ranges.roots)
+            if (!llvm::is_contained(address.roots, range))
+              address.roots.push_back(range);
+        }
+        if (!address.roots.empty() &&
+            !analysis.lockstepRanges(address.roots).isExact())
+          address.state = PhysicalFactState::Unknown;
+        address.unitStep = llvm::all_of(address.roots, isUnitStepRange);
+      }
       PhysicalRangeFact payload = analysis.axisRanges(store.getValue(), axis);
       if (address.state == PhysicalFactState::Unknown ||
           payload.state == PhysicalFactState::Unknown ||

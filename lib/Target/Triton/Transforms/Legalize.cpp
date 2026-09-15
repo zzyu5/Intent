@@ -1466,9 +1466,11 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
               ? dyn_cast<gpu::PhysicalExprAttr>(source.getShape()[selectedAxis])
               : gpu::PhysicalExprAttr();
       bool compatible = selectedExtent &&
-                        selectedExtent.getKind() == static_cast<uint32_t>(
-                                                        gpu::PhysicalExprKind::Constant) &&
-                        selectedExtent.getValue() > 0;
+          ((selectedExtent.getKind() == static_cast<uint32_t>(
+                                           gpu::PhysicalExprKind::Constant) &&
+            selectedExtent.getValue() > 0) ||
+           selectedExtent.getKind() == static_cast<uint32_t>(
+                                          gpu::PhysicalExprKind::Parameter));
       unsigned resultAxis = 0;
       for (unsigned sourceAxis = 0;
            compatible && sourceAxis < source.getShape().size(); ++sourceAxis) {

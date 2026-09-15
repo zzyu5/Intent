@@ -625,34 +625,25 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
   PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
       value, source, PhysicalReplayScope::ValueGraph,
       /*allowAccesses=*/true, /*insertionAnchor=*/nullptr, *dimension);
-  if (!replay.isReplayable()) {
-    InFlightDiagnostic diagnostic =
-        value.getDefiningOp()
-            ? value.getDefiningOp()->emitOpError(
-                  "contraction operand has no exact coordinate replay fact")
-            : kernel.emitError(
-                  "contraction operand has no exact coordinate replay fact");
-    for (Operation *blocker : replay.blockers)
-      diagnostic << "; blocker=" << blocker->getName();
-    return failure();
-  }
-  bool preserveRead = llvm::any_of(replay.accesses, [&](Operation *access) {
-    auto load = dyn_cast<LoadOp>(access);
-    return load && !canReplayReadAt(load, insertionAnchor);
-  });
-  if (preserveRead) {
+  bool preserveValue = !replay.isReplayable() ||
+      llvm::any_of(replay.accesses, [&](Operation *access) {
+        auto load = dyn_cast<LoadOp>(access);
+        return load && !canReplayReadAt(load, insertionAnchor);
+      });
+  if (preserveValue) {
+    Operation *owner = value.getDefiningOp() ? value.getDefiningOp()
+                                           : kernel.getOperation();
     PhysicalProgramAnalysis analysis(kernel);
     PhysicalRangeAxisFact selected = analysis.rangeAxes(value, roots);
     auto original = dyn_cast<FragmentType>(value.getType());
     DominanceInfo dominance(kernel);
     if (!original || !selected.isExact() || selected.fragmentAxes.size() != 1 ||
         !dominance.dominates(value, insertionAnchor))
-      return (value.getDefiningOp() ? value.getDefiningOp() : kernel.getOperation())
-          ->emitError("contraction replay cannot preserve the original read value");
+      return owner->emitError("contraction blocking cannot slice the original value");
     unsigned axis = selected.fragmentAxes.front();
     if (!analysis.axisRealization(value, axis).physicalized) {
       if (failed(realizeFullCoverageDimension(kernel, value, axis)))
-        return value.getDefiningOp()->emitOpError(
+        return owner->emitError(
             "retained contraction read could not be fully materialized");
       original = cast<FragmentType>(value.getType());
       analysis = PhysicalProgramAnalysis(kernel);
@@ -662,7 +653,7 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
     if (failed(authority) || !isUnitStepRange(*authority) ||
         !analysis.lockstepRanges(sourceRanges.roots).isExact() ||
         !analysis.axisRealization(value, axis).physicalized)
-      return value.getDefiningOp()->emitOpError(
+      return owner->emitError(
           "retained contraction value has no realized slice coordinate relation");
     SmallVector<Attribute> shape(original.getShape().begin(),
                                   original.getShape().end());
@@ -682,7 +673,7 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
     FailureOr<Value> indices = projectPhysicalValueToSchema(
         builder, location, ordinal, indexType);
     if (failed(indices))
-      return value.getDefiningOp()->emitOpError(
+      return owner->emitError(
           "retained contraction slice has no index projection");
     auto predicate = FragmentType::get(
         target.getContext(), builder.getI1Type(), target.getShape(),
