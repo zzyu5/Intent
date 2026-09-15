@@ -1,5 +1,6 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Utilities.h"
+#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -24,11 +25,18 @@ void forwardDestinations(func::FuncOp function) {
     Value target = copy.getTarget();
     if (allocation.getType().getRank() != copy.getTarget().getType().getRank()) continue;
     PhysicalProgramAnalysis analysis(function);
+    AliasAnalysis aliasAnalysis(function);
     Value targetRoot = analysis.storageRoot(target);
     auto external = analysis.externalView(target);
     if (!targetRoot.getDefiningOp<memref::AllocOp>() &&
         (!external || external.getAccess() != 1)) continue;
     if (targetRoot == allocation.getResult()) continue;
+    auto disjoint = [&](Value memory) {
+      Value root = analysis.storageRoot(memory);
+      if (root == targetRoot) return false;
+      if (aliasAnalysis.alias(root, targetRoot).isNo()) return true;
+      return external && analysis.externalView(root);
+    };
     auto targetOp = target.getDefiningOp();
     DominanceInfo dominance(function);
     if (targetOp && !dominance.dominates(targetOp, allocation)) {
@@ -39,6 +47,7 @@ void forwardDestinations(func::FuncOp function) {
           })) continue;
     }
     bool legal = true;
+    Operation *lastUse = copy;
     SmallVector<memref::DeallocOp> deallocations;
     SmallVector<Value> aliases{allocation.getResult()};
     for (unsigned i = 0; i < aliases.size(); ++i) {
@@ -53,13 +62,18 @@ void forwardDestinations(func::FuncOp function) {
         else if (!isa<memref::CopyOp, memref::DimOp, memref::LoadOp, memref::StoreOp,
                       linalg::LinalgOp, ReduceOp, ScanOp, HistogramOp, QuantizedDotOp>(user)) legal = false;
         Operation *ancestor = copy->getBlock()->findAncestorOpInBlock(*user);
-        if (!ancestor || (ancestor != copy && !ancestor->isBeforeInBlock(copy))) legal = false;
+        if (!ancestor) { legal = false; continue; }
+        if (ancestor != copy && copy->isBeforeInBlock(ancestor)) {
+          if (!isa<memref::LoadOp, memref::DimOp, memref::SubViewOp, memref::CastOp>(user)) legal = false;
+          if (lastUse->isBeforeInBlock(ancestor)) lastUse = ancestor;
+        }
       }
     }
     // Forwarding moves the destination writes earlier. Its previous contents
-    // must not be observed or changed anywhere in that interval.
-    for (Operation *between = allocation->getNextNode(); legal && between != copy;
+    // must remain unobserved before the copy and stable through all later reads.
+    for (Operation *between = allocation->getNextNode(); legal && between != lastUse->getNextNode();
          between = between->getNextNode()) {
+      if (between == copy) continue;
       between->walk([&](Operation *operation) {
         if (isMemoryEffectFree(operation)) return;
         auto effects = dyn_cast<MemoryEffectOpInterface>(operation);
@@ -71,7 +85,7 @@ void forwardDestinations(func::FuncOp function) {
         effects.getEffects(instances);
         for (auto &effect : instances) {
           if (isa<MemoryEffects::Allocate>(effect.getEffect())) continue;
-          if (!effect.getValue() || analysis.storageRoot(effect.getValue()) == targetRoot)
+          if (!effect.getValue() || !disjoint(effect.getValue()))
             legal = false;
         }
       });
@@ -105,7 +119,19 @@ bool stableRead(memref::LoadOp load, Operation *producer, func::FuncOp function)
     if (argument.getOwner() != &function.front()) return false;
     auto abi = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
     auto field = dyn_cast<ViewArgumentAttr>(abi.getArguments()[argument.getArgNumber()]);
-    return field && field.getAccess() == 0;
+    if (!field) return false;
+    if (field.getAccess() == 0) return true;
+    SmallVector<Value> aliases{base};
+    for (unsigned i = 0; i < aliases.size(); ++i)
+      for (Operation *user : aliases[i].getUsers()) {
+        if (isa<memref::LoadOp, memref::DimOp>(user)) continue;
+        if (auto view = dyn_cast<memref::SubViewOp>(user)) { aliases.push_back(view.getResult()); continue; }
+        if (auto cast = dyn_cast<memref::CastOp>(user)) { aliases.push_back(cast.getResult()); continue; }
+        if (!isa<memref::StoreOp>(user)) return false;
+        Operation *write = producer->getBlock()->findAncestorOpInBlock(*user);
+        if (!write || write == producer || !write->isBeforeInBlock(producer)) return false;
+      }
+    return true;
   }
   auto allocation = base.getDefiningOp<memref::AllocOp>();
   if (!allocation) return false;
