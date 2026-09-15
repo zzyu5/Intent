@@ -27,6 +27,8 @@ struct Configuration {
 mlir::LogicalResult fuseStructuredComputations(mlir::func::FuncOp function);
 mlir::LogicalResult foldUniformComputations(mlir::func::FuncOp function);
 mlir::LogicalResult reusePreparedInputs(mlir::func::FuncOp function);
+mlir::LogicalResult groupRegionComputations(mlir::func::FuncOp function,
+                                          const Configuration &configuration);
 mlir::LogicalResult groupQuantizedDots(mlir::func::FuncOp function,
                                      const ImplementationRegistry &implementations);
 void forwardCPUOutputs(mlir::func::FuncOp function);
