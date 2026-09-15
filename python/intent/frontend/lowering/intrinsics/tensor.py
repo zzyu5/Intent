@@ -12,6 +12,7 @@ from intent.frontend.semantics import TensorType
 from intent.frontend.semantics import UnaryOperator
 from intent.frontend.mlir import MlirValue
 from intent.frontend.semantics import broadcast_shape
+from intent.frontend.semantics import static_numel
 from intent.language import DType
 from intent.language import DTypeCategory
 from intent.language import bool as intent_bool
@@ -77,6 +78,10 @@ def _reshape(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     if not isinstance(source.type, TensorType):
         lowerer.error(node, "I.reshape input must be a tensor")
     shape = lower_shape(lowerer, bound["shape"], first_operand_position=1)
+    source_numel = static_numel(source.type.shape)
+    result_numel = static_numel(shape.dimensions)
+    if source_numel is not None and result_numel is not None and source_numel != result_numel:
+        lowerer.error(node, f"I.reshape must preserve element count: {source_numel} to {result_numel}")
     operation = lowerer.emit(
         OperationKind.RESHAPE,
         lowerer.location(node),
