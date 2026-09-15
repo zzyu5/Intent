@@ -417,6 +417,27 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
           "loaded source coordinate cannot be composed with gather indexing");
       return failure();
     }
+    Value original = sourceLoad.getCoordinates()[target.fragmentAxis];
+    auto range = original.getDefiningOp<MakeRangeOp>();
+    if (!range) {
+      auto coordinateType = dyn_cast<FragmentType>(original.getType());
+      if (!coordinateType || coordinateType.getShape().size() != 1)
+        return false;
+      PhysicalRangeFact roots = analysis.axisRanges(original, 0);
+      if (!roots.isUnique() ||
+          !analysis.replayability(original, std::nullopt,
+                                  PhysicalReplayScope::Coordinate,
+                                  /*allowAccesses=*/false).isReplayable())
+        return false;
+      range = roots.roots.front();
+      auto dimension = queryRangeDimension(range);
+      auto axis = queryAxisMap(coordinateType, 0);
+      if (coordinateType.getShape()[0] !=
+              range.getResult().getType().getShape()[0] ||
+          failed(dimension) || failed(axis) ||
+          *dimension != axis->getDimensionId())
+        return false;
+    }
     if (resultType) {
       Type element = coordinate.getType();
       if (auto fragment = dyn_cast<FragmentType>(element))
@@ -431,9 +452,7 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
             "composed gather index cannot adopt its result coordinate relation");
       coordinate = *projected;
     }
-    Value original = sourceLoad.getCoordinates()[target.fragmentAxis];
-    if (auto range = original.getDefiningOp<MakeRangeOp>();
-        range && (!isZero(range.getStart()) || !isUnitStepRange(range))) {
+    if (!isZero(range.getStart()) || !isUnitStepRange(range)) {
       Type indexType = range.getResult().getType().getElementType();
       if (auto fragment = dyn_cast<FragmentType>(coordinate.getType()))
         indexType = FragmentType::get(
@@ -457,10 +476,16 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
             gather.getLoc(), indexType, projectedBound(range.getStart()), coordinate,
             BinaryOperator::Add);
     }
+    replay.map(range.getResult(), coordinate);
+    if (original != range.getResult()) {
+      FailureOr<Value> selected = resultType
+          ? replayFragmentValue(builder, original, resultType, replay, analysis)
+          : replayScalarValue(builder, original, replay, analysis);
+      if (failed(selected))
+        return gather.emitOpError("indexed load coordinate cannot follow its source range");
+      coordinate = *selected;
+    }
     replay.map(original, coordinate);
-    PhysicalRangeFact roots = analysis.sourceRanges(original);
-    if (roots.isUnique() && !replay.lookupOrNull(roots.roots.front().getResult()))
-      replay.map(roots.roots.front().getResult(), coordinate);
     coordinates[target.fragmentAxis] = coordinate;
   }
 
