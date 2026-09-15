@@ -16,7 +16,7 @@ Tensor 和 view 有 `.shape`；scalar、tuple、record、domain 没有统一 `.s
 
 ## Domain、index 与 broadcast
 
-`rows = I.domain(0, M)` 是 logical coordinate domain，不是整数 tensor，也不是归约的 axis 编号。Domain 本身不参与数值算术或比较；需要坐标值时先使用 `I.indices(rows)` 产生 logical index tensor。坐标使用 `I.index`，与 runtime `I.i64` 不同；参与坐标算术的 runtime 步幅、偏移等先显式转为 `I.index`。`x[rows, columns]` 读取完整二维 logical region；`I.reduce.sum(value, axis=1)` 的 `1` 指 value 的第二个 axis。
+`rows = I.domain(0, M)` 是 logical coordinate domain，不是整数 tensor，也不是归约的 axis 编号。Domain 本身不参与数值算术或比较；需要坐标值时先使用 `I.indices(rows)` 产生 logical index tensor。坐标和 domain 循环变量使用 `I.index`，与 runtime `I.i64` 不同；参与坐标算术的 runtime 步幅、偏移等先显式转为 `I.index`，循环变量参与浮点运算前则转为相应浮点 dtype。`x[rows, columns]` 读取完整二维 logical region；`I.reduce.sum(value, axis=1)` 的 `1` 指 value 的第二个 axis。
 
 Pointwise 按尾部对齐，允许 scalar/size-one broadcast。`[M]` 与 `[M,N]` 相加不会自动按行匹配：先 `I.reshape(row_value, (M, 1))`；`[N]` 可以直接广播到 `[M,N]`。两个未知 extent 不是因为都 dynamic 就兼容。
 
@@ -43,6 +43,8 @@ Python tuple 与 `I.record(field=value, ...)` 是结构化 products，不要求�
 ## Control、effects 与多个 kernels
 
 普通 `for/while` 保持顺序与 loop carry；carry 的初值与每轮更新必须保持 dtype、rank 和逻辑 shape，循环体内的 broadcast 不会改变初始 schema。Tensor carry 可按目标 shape 初始化，例如 `state = I.full(value.shape, 0.0, I.f32)`；`I.cast(0.0, I.f32)` 初始化的是 scalar。`I.parallel(domain)` 表达独立无序点，不允许 carry。Tensor predicate 使用 `I.select`，不控制 statement `if`。`Out` 进入 kernel 时未定义，读取前必须先定义；不能用 InOut 掩盖未定义读取。
+
+Python `range` 是 domain 遍历的 shorthand，遵循正步长合同。逆序遍历使用正向 ordinal 并显式计算反向坐标，具体规则见 [core.md 的 domains 章节](core.md#3-domains-与-source-derived-subregions)。
 
 `I.mask(value, predicate, fill)` 等价于 `I.select(predicate, value, fill)`：predicate 为真保留 value，为假使用 fill。它只选择值，不抑制写入；对写入坐标使用 `I.mask` 会把未选中成员写到 fill 指定的地址。`I.store` 和下标赋值没有 `mask` 或 `valid` 参数。条件写入使用 scalar 条件下的 structured control，或只遍历实际参与写入的 domain/subregion；普通并行写入仍须满足目标地址不冲突的合同。
 
