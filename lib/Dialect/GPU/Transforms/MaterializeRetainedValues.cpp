@@ -60,7 +60,7 @@ namespace {
 template <typename Emit>
 LogicalResult buildStoreTraversal(OpBuilder &builder, Location location,
                                   ArrayRef<MakeRangeOp> ranges,
-                                  ArrayRef<MakeRangeOp> roots, Value rowChunk,
+                                  ArrayRef<std::pair<MakeRangeOp, unsigned>> roots, Value rowChunk,
                                   FragmentType payload, Emit emit) {
   OpBuilder::InsertionGuard guard(builder);
   IRMapping mapping;
@@ -92,9 +92,22 @@ LogicalResult buildStoreTraversal(OpBuilder &builder, Location location,
     auto current = builder.create<MakeRangeOp>(
         location, type, start, chunk, one, zero, stop, range.getSourceId(),
         range.getSourceAxis(), range.getDerived());
-    for (MakeRangeOp root : roots)
-      if (sameLogicalRange(root, range))
+    for (auto [root, rootAxis] : roots) {
+      if (rootAxis != axis)
+        continue;
+      if (sameLogicalRange(root, range)) {
         mapping.map(root.getResult(), current.getResult());
+        continue;
+      }
+      auto original = root.getResult().getType();
+      auto rebound = FragmentType::get(
+          builder.getContext(), original.getElementType(), type.getShape(),
+          original.getAxisMaps(), original.getValidity(), original.getOwner());
+      Value equivalent = builder.create<MakeRangeOp>(
+          location, rebound, start, chunk, one, root.getLogicalStart(),
+          root.getLogicalStop(), root.getSourceId(), root.getSourceAxis(), root.getDerived());
+      mapping.map(root.getResult(), equivalent);
+    }
     mapping.map(range.getResult(), current.getResult());
     coordinates.push_back(current);
     auto boolean = FragmentType::get(
@@ -224,15 +237,27 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
   PhysicalRangeFact facts = analysis.sourceRanges(store.getValue());
   SmallVector<MakeRangeOp> roots(facts.roots.begin(), facts.roots.end());
   roots.append(ranges.begin(), ranges.end());
+  SmallVector<std::pair<MakeRangeOp, unsigned>> rootBindings;
   SmallVector<MakeRangeOp> rowRoots;
   for (MakeRangeOp root : roots) {
-    auto selected = llvm::find_if(ranges, [&](MakeRangeOp range) {
-      return sameLogicalRange(root, range) && isZero(root.getStart()) &&
-             analysis.lockstepRanges({root, range}).isExact();
-    });
-    if (selected == ranges.end())
+    std::optional<unsigned> selected;
+    bool exactSource = false;
+    for (auto [axis, range] : llvm::enumerate(ranges)) {
+      if (!isZero(root.getStart()) ||
+          !analysis.lockstepRanges({root, range}).isExact())
+        continue;
+      bool sameSource = sameLogicalRange(root, range);
+      if (selected && sameSource == exactSource)
+        return false;
+      if (!selected || sameSource) {
+        selected = axis;
+        exactSource = sameSource;
+      }
+    }
+    if (!selected)
       return false;
-    if (*selected == ranges.front() && !llvm::is_contained(rowRoots, root))
+    rootBindings.emplace_back(root, *selected);
+    if (*selected == 0 && !llvm::is_contained(rowRoots, root))
       rowRoots.push_back(root);
   }
   for (Operation *producer : visited)
@@ -304,7 +329,7 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
   options.fragmentAxis = 0;
   options.traversalRanges = rowRoots;
   LogicalResult initialized = buildStoreTraversal(
-      builder, store.getLoc(), ranges, roots, chunk, blocked,
+      builder, store.getLoc(), ranges, rootBindings, chunk, blocked,
       [&](OpBuilder &nested, IRMapping &mapping, ValueRange coordinates,
           Value valid) -> LogicalResult {
         for (const auto &entry : constantValues.getValueMap())
@@ -322,7 +347,7 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
     return failure();
   builder.setInsertionPoint(store);
   LogicalResult copied = buildStoreTraversal(
-      builder, store.getLoc(), ranges, roots, chunk, blocked,
+      builder, store.getLoc(), ranges, rootBindings, chunk, blocked,
       [&](OpBuilder &nested, IRMapping &mapping, ValueRange coordinates,
           Value valid) -> LogicalResult {
         if (store.getValid()) {
@@ -426,8 +451,11 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
   options.fragmentAxis = 0;
   options.traversalRanges = ranges.roots;
   options.materializeZeroFill = true;
+  SmallVector<std::pair<MakeRangeOp, unsigned>> rootBindings;
+  for (MakeRangeOp root : ranges.roots)
+    rootBindings.emplace_back(root, 0);
   if (failed(buildStoreTraversal(
-          builder, gather.getLoc(), ArrayRef<MakeRangeOp>(*range), ranges.roots,
+          builder, gather.getLoc(), ArrayRef<MakeRangeOp>(*range), rootBindings,
           chunk, blocked,
           [&](OpBuilder &nested, IRMapping &mapping, ValueRange coordinates,
               Value valid) -> LogicalResult {

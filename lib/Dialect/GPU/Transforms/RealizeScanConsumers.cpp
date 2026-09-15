@@ -161,8 +161,8 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
   return match;
 }
 
-LogicalResult realizeScanConsumerMatch(func::FuncOp kernel,
-                                      ScanConsumerMatch &match) {
+FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
+                                               ScanConsumerMatch &match) {
   ScanOp scan = match.scan;
   auto original = cast<FragmentType>(scan.getResult(0).getType());
   auto mapping = cast<AxisMapAttr>(original.getAxisMaps()[0]);
@@ -333,7 +333,7 @@ LogicalResult realizeScanConsumerMatch(func::FuncOp kernel,
     return failure();
   match.loop.erase();
   eraseDeadPhysicalValues(kernel);
-  return success();
+  return chunk;
 }
 
 FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
@@ -351,7 +351,16 @@ FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
       }))
     return false;
   SmallVector<GatherOp> readers;
+  SmallVector<StoreOp> stores;
   for (Operation *user : scan.getResult(0).getUsers()) {
+    if (auto store = dyn_cast<StoreOp>(user);
+        store && store.getValue() == scan.getResult(0) &&
+        store->getBlock() == scan->getBlock() &&
+        scan->isBeforeInBlock(store) && store.getCoordinates().size() == 1 &&
+        store.getSourceAxes() == ArrayRef<int64_t>{0}) {
+      stores.push_back(store);
+      continue;
+    }
     auto gather = dyn_cast<GatherOp>(user);
     if (!gather || gather.getSource() != scan.getResult(0) ||
         gather.getCoordinates().size() != 1 ||
@@ -359,21 +368,30 @@ FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
       return false;
     readers.push_back(gather);
   }
-  if (readers.empty())
+  if (readers.empty() && stores.empty())
     return false;
   PhysicalRangeFact ranges = analysis.axisRanges(scan.getInputs()[0], 0);
   FailureOr<MakeRangeOp> root = queryExactLogicalRange(ranges);
   if (failed(root))
     return false;
   PhysicalExprAttr stop = queryLaunchExpression((*root).getLogicalStop());
-  if (!stop || stop.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant))
+  if (!stop)
     return false;
   auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   Type element = type.getElementType();
   unsigned bits = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
-  if (static_cast<__int128>(stop.getValue()) * ((bits + 31) / 32) <=
+  if (stop.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+      static_cast<__int128>(stop.getValue()) * ((bits + 31) / 32) <=
       capabilities.getRegistersPerUnit())
     return false;
+  for (StoreOp store : stores) {
+    auto range = store.getCoordinates().front().getDefiningOp<MakeRangeOp>();
+    if (!range || !sameLogicalRange(range, *root) ||
+        !analysis.lockstepRanges({range, *root}).isExact() ||
+        (store.getValid() &&
+         !analysis.isTailPredicate(store.getValid(), {{range, range.getLogicalStop()}})))
+      return false;
+  }
   for (Operation *access : ranges.accesses) {
     auto load = dyn_cast<LoadOp>(access);
     if (!load || !canReplayReadAt(load, scan))
@@ -406,14 +424,67 @@ FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
     reader.getResult().replaceAllUsesWith(load.getResult());
     reader.erase();
   }
+  // Preserve the scan's immutable snapshot before any external output write.
+  // Direct vector stores use the same private prefix as indexed consumers;
+  // their copy is tiled after the bounded scan has been formed.
+  for (StoreOp store : stores) {
+    builder.setInsertionPoint(store);
+    auto fill = materializeZeroFragment(builder, store.getLoc(), type);
+    if (failed(fill))
+      return failure();
+    Value value = builder.create<LoadOp>(
+        store.getLoc(), type, workspace, store.getCoordinates(),
+        store.getValid(), store.getValid() ? *fill : Value(), store.getSourceAxes());
+    store.getValueMutable().assign(value);
+  }
   // The copy is an independent consumer of an immutable scan. Reuse the same
   // bounded prefix traversal; the original ordered consumers stay after it.
   PhysicalProgramAnalysis currentAnalysis(kernel);
   auto match = matchScanConsumer(scan, currentAnalysis);
   if (!match)
     return scan.emitOpError("scan snapshot has no legal bounded prefix traversal");
-  if (failed(realizeScanConsumerMatch(kernel, *match)))
+  auto chunk = realizeScanConsumerMatch(kernel, *match);
+  if (failed(chunk))
     return failure();
+  for (StoreOp store : stores) {
+    builder.setInsertionPoint(store);
+    Location location = store.getLoc();
+    auto outputRange = store.getCoordinates().front().getDefiningOp<MakeRangeOp>();
+    auto coordinateType = outputRange.getResult().getType();
+    PhysicalExprAttr extent = queryLaunchExpression(*chunk);
+    auto fragment = [&](Type element) {
+      return FragmentType::get(
+          kernel.getContext(), element, builder.getArrayAttr({extent}),
+          coordinateType.getAxisMaps(), coordinateType.getValidity(),
+          coordinateType.getOwner());
+    };
+    Value begin = builder.create<arith::ConstantIndexOp>(location, 0);
+    Value step = builder.create<arith::ConstantIndexOp>(location, 1);
+    auto loop = builder.create<scf::ForOp>(
+        location, begin, outputRange.getLogicalStop(), *chunk);
+    builder.setInsertionPointToStart(loop.getBody());
+    Value coordinate = builder.create<MakeRangeOp>(
+        location, fragment(builder.getIndexType()), loop.getInductionVar(),
+        *chunk, step, begin, outputRange.getLogicalStop(),
+        outputRange.getSourceId(), outputRange.getSourceAxis(), outputRange.getDerived());
+    Value end = builder.create<BroadcastOp>(
+        location, fragment(builder.getIndexType()), outputRange.getLogicalStop());
+    Value valid = builder.create<CompareOp>(
+        location, fragment(builder.getI1Type()), coordinate, end, ComparePredicate::Lt);
+    auto outputType = fragment(element);
+    auto fill = materializeZeroFragment(builder, location, outputType);
+    if (failed(fill))
+      return failure();
+    Value value = builder.create<LoadOp>(
+        location, outputType, workspace, ValueRange{coordinate}, valid, *fill,
+        store.getSourceAxes());
+    auto replacement = builder.create<StoreOp>(
+        location, store.getResource(), ValueRange{coordinate}, value, valid,
+        store.getSourceAxes());
+    replacement->setAttrs(store->getAttrs());
+    store.erase();
+  }
+  eraseDeadPhysicalValues(kernel);
   return true;
 }
 } // namespace
