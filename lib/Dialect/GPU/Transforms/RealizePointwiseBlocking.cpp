@@ -1007,6 +1007,7 @@ LogicalResult addTailValidity(func::FuncOp kernel,
 
   if (!includeStores)
     return success();
+  SmallVector<std::pair<MakeRangeOp, IRMapping>> storeReplays;
   for (StoreOp store : stores) {
     bool affected = llvm::any_of(store.getCoordinates(), [&](Value coordinate) {
       return hasTailPredicate(coordinate, rangePredicates);
@@ -1052,6 +1053,21 @@ LogicalResult addTailValidity(func::FuncOp kernel,
         if (valueType.getShape()[projection.fragmentAxis] == blockedExtent)
           continue;
         IRMapping mapping;
+        DominanceInfo dominance(kernel);
+        for (auto &entry : storeReplays) {
+          MakeRangeOp previous = entry.first;
+          auto previousDimension = queryRangeDimension(previous);
+          if (failed(previousDimension) || *previousDimension != *dimension ||
+              !samePhysicalScalarExpression(previous.getStart(), range.getStart()) ||
+              !samePhysicalScalarExpression(previous.getExtent(), range.getExtent()) ||
+              !samePhysicalScalarExpression(previous.getLogicalStart(), range.getLogicalStart()) ||
+              !samePhysicalScalarExpression(previous.getLogicalStop(), range.getLogicalStop()) ||
+              !samePhysicalScalarExpression(previous.getStep(), range.getStep()))
+            continue;
+          for (auto [original, replayed] : entry.second.getValueMap())
+            if (dominance.dominates(replayed, store.getOperation()))
+              mapping.map(original, replayed);
+        }
         SmallVector<int64_t> traversalDimensions{*dimension};
         FailureOr<Value> replayed = replayPointwiseValue(
             builder, payload, sourceAxisIdentity(range), traversalDimensions,
@@ -1078,6 +1094,7 @@ LogicalResult addTailValidity(func::FuncOp kernel,
                 "pointwise store validity cannot be replayed with its payload");
           existingValidity = *replayedValidity;
         }
+        storeReplays.emplace_back(range, mapping);
         payload = *replayed;
         valueType = dyn_cast<FragmentType>(payload.getType());
         if (!valueType)
@@ -1456,6 +1473,13 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
   collectTraversalDimensions(value.getType(), source, valueDimensions);
   for (int64_t dimension : valueDimensions) {
     if (!llvm::is_contained(traversalDimensions, dimension))
+      continue;
+    // Pure scalar/pointwise nodes are proved by replaying their operands below.
+    // A bound operand can already hold a snapshot made before an intervening
+    // store; following its old graph would incorrectly require another load.
+    if (producer->getNumRegions() == 0 &&
+        isPhysicalReplayNode(producer, PhysicalReplayScope::ValueGraph,
+                             /*allowAccesses=*/false))
       continue;
     PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
         value, source, PhysicalReplayScope::ValueGraph,
@@ -3648,6 +3672,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     return failure();
   func::FuncOp kernel = *physicalKernel;
   auto finalizeValueRelations = [&]() -> LogicalResult {
+    eraseDeadPhysicalValues(kernel);
     if (failed(bindStructurallyRequiredStaticFragments(kernel)))
       return failure();
     if (failed(alignStructuredCaptureRelations(kernel)) ||
@@ -4801,8 +4826,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         }
   });
   llvm::SmallPtrSet<Operation *, 8> contractionOwnedRanges;
+  llvm::SmallPtrSet<Operation *, 8> retainedCartesianRanges;
   auto hasPointwiseOwnership = [&](MakeRangeOp range) {
-    if (contractionOwnedRanges.contains(range.getOperation()))
+    if (contractionOwnedRanges.contains(range.getOperation()) ||
+        retainedCartesianRanges.contains(range.getOperation()))
       return false;
     FailureOr<uint64_t> dimension = ownershipDimension(kernel, range);
     // Dimension equality proves an extent, not a Cartesian coordinate. Leave
@@ -4844,6 +4871,50 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         llvm::all_of(coordinates, [](Value value) {
           return cast<FragmentType>(value.getType()).getShape().size() == 1;
         });
+    auto ordered = store->getParentOfType<scf::ForOp>();
+    if (cartesian && ordered && !ordered->hasAttr(independentIterationAttr)) {
+      PhysicalProgramAnalysis analysis(kernel);
+      llvm::DenseMap<Operation *, unsigned> sourceAxes;
+      SmallVector<MakeRangeOp> shared;
+      for (unsigned axis = 0; axis < valueType.getShape().size(); ++axis) {
+        auto ranges = analysis.axisRanges(store.getValue(), axis);
+        if (!ranges.isExact() || !ranges.blockers.empty())
+          continue;
+        for (MakeRangeOp range : ranges.roots) {
+          auto dimension = queryRangeDimension(range);
+          if (failed(dimension) || nonUniqueContractionDimensions.contains(*dimension) ||
+              isProvablySingletonLogicalRange(range) ||
+              !ordered->isProperAncestor(range))
+            continue;
+          auto [previous, inserted] = sourceAxes.try_emplace(range.getOperation(), axis);
+          if (!inserted && previous->second != axis &&
+              !llvm::is_contained(shared, range))
+            shared.push_back(range);
+        }
+      }
+      // A local vector may feed both axes of an outer product inside an ordered
+      // update. Retain its snapshot and full coverage instead of assigning that
+      // one producer two independent program ownership axes.
+      for (MakeRangeOp range : allRanges) {
+        if (range->hasAttr(worksetCoordinateRangeAttr) ||
+            !ordered->isProperAncestor(range) ||
+            !llvm::any_of(shared, [&](MakeRangeOp root) {
+              auto dimension = queryRangeDimension(range);
+              auto rootDimension = queryRangeDimension(root);
+              return sameLogicalRange(range, root) && succeeded(dimension) &&
+                     succeeded(rootDimension) && *dimension == *rootDimension;
+            }))
+          continue;
+        if (failed(requireFullDimensionCoverage(kernel, range.getResult(), 0))) {
+          store.emitOpError("shared Cartesian producer has no exact local full coverage");
+          return WalkResult::interrupt();
+        }
+        retainedCartesianRanges.insert(range.getOperation());
+        internalTraversalRanges.insert(range.getOperation());
+        occurrenceRoots.erase(range.getOperation());
+      }
+      valueType = cast<FragmentType>(store.getValue().getType());
+    }
     PhysicalProgramAnalysis analysis(kernel);
     llvm::DenseMap<Operation *, unsigned> resultAxes;
     for (auto [axis, attribute] : llvm::enumerate(valueType.getAxisMaps())) {
@@ -4887,6 +4958,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         address.unitStep = llvm::all_of(address.roots, isUnitStepRange);
       }
       PhysicalRangeFact payload = analysis.axisRanges(store.getValue(), axis);
+      if (llvm::any_of(payload.roots, [&](MakeRangeOp range) {
+            return retainedCartesianRanges.contains(range.getOperation());
+          }))
+        continue;
       if (cartesian && address.isExact() && !address.roots.empty() &&
           address.blockers.empty() && payload.isExact() && payload.roots.empty() &&
           payload.blockers.empty()) {
@@ -4922,7 +4997,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         PhysicalExprAttr right = queryLaunchExpression(rhs);
         return left && right && left == right;
       };
-      bool equivalentSources = store->getParentOfType<scf::IfOp>() && cartesian &&
+      bool equivalentSources = cartesian &&
           !repeatedDimension && address.isExact() &&
           llvm::any_of(payload.roots, [&](MakeRangeOp range) {
             return llvm::none_of(address.roots, [&](MakeRangeOp coordinate) {
