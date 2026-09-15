@@ -352,6 +352,7 @@ FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
     return false;
   SmallVector<GatherOp> readers;
   SmallVector<StoreOp> stores;
+  llvm::SmallPtrSet<Operation *, 8> pointwiseUsers;
   for (Operation *user : scan.getResult(0).getUsers()) {
     if (auto store = dyn_cast<StoreOp>(user);
         store && store.getValue() == scan.getResult(0) &&
@@ -361,6 +362,11 @@ FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
       stores.push_back(store);
       continue;
     }
+    if (user->getBlock() == scan->getBlock() && scan->isBeforeInBlock(user) &&
+        canPredicateValueOperation(user)) {
+      pointwiseUsers.insert(user);
+      continue;
+    }
     auto gather = dyn_cast<GatherOp>(user);
     if (!gather || gather.getSource() != scan.getResult(0) ||
         gather.getCoordinates().size() != 1 ||
@@ -368,12 +374,22 @@ FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
       return false;
     readers.push_back(gather);
   }
-  if (readers.empty() && stores.empty())
+  if (readers.empty() && stores.empty() && pointwiseUsers.empty())
     return false;
   PhysicalRangeFact ranges = analysis.axisRanges(scan.getInputs()[0], 0);
   FailureOr<MakeRangeOp> root = queryExactLogicalRange(ranges);
   if (failed(root))
     return false;
+  for (MakeRangeOp range : ranges.roots) {
+    auto begin = queryLaunchExpression(range.getStart());
+    auto logicalBegin = queryLaunchExpression(range.getLogicalStart());
+    auto zero = [](PhysicalExprAttr value) {
+      return value && value.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+             value.getValue() == 0;
+    };
+    if (!zero(begin) || !zero(logicalBegin) || !isUnitStepRange(range))
+      return false;
+  }
   PhysicalExprAttr stop = queryLaunchExpression((*root).getLogicalStop());
   if (!stop)
     return false;
@@ -414,6 +430,25 @@ FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
                                         builder.getDenseI64ArrayAttr({0}));
   builder.create<StoreOp>(scan.getLoc(), workspace, ValueRange{coordinate}, value,
                            Value(), builder.getDenseI64ArrayAttr({0}));
+  if (!pointwiseUsers.empty()) {
+    builder.setInsertionPointAfter(copy);
+    Value coordinate = (*root).getResult();
+    auto coordinateType = cast<FragmentType>(coordinate.getType());
+    auto boolean = FragmentType::get(kernel.getContext(), builder.getI1Type(),
+        type.getShape(), type.getAxisMaps(), type.getValidity(), type.getOwner());
+    Value stop = builder.create<BroadcastOp>(scan.getLoc(), coordinateType,
+                                            (*root).getLogicalStop());
+    Value valid = builder.create<CompareOp>(scan.getLoc(), boolean, coordinate,
+                                            stop, ComparePredicate::Lt);
+    auto fill = materializeZeroFragment(builder, scan.getLoc(), type);
+    if (failed(fill))
+      return failure();
+    Value snapshot = builder.create<LoadOp>(scan.getLoc(), type, workspace,
+        ValueRange{coordinate}, valid, *fill, builder.getDenseI64ArrayAttr({0}));
+    scan.getResult(0).replaceUsesWithIf(snapshot, [&](OpOperand &use) {
+      return pointwiseUsers.contains(use.getOwner());
+    });
+  }
   for (GatherOp reader : readers) {
     builder.setInsertionPoint(reader);
     auto load = builder.create<LoadOp>(

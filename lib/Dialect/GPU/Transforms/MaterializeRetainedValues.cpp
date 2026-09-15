@@ -147,22 +147,46 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
   auto payload = dyn_cast<FragmentType>(store.getValue().getType());
   auto output = dyn_cast<ViewType>(store.getResource().getType());
   if (store->getBlock() != &kernel.front() || !payload || !output ||
-      payload.getShape().size() != 2 || output.getRank() != 2 ||
-      store.getSourceAxes() != ArrayRef<int64_t>{0, 1})
+      !((payload.getShape().size() == 2 && output.getRank() == 2 &&
+         store.getSourceAxes() == ArrayRef<int64_t>{0, 1}) ||
+        (payload.getShape().size() == 1 && output.getRank() == 1 &&
+         store.getSourceAxes() == ArrayRef<int64_t>{0})))
     return false;
   PhysicalProgramAnalysis analysis(kernel);
-  if (!analysis.boundaryValidity(store).isExact())
+  bool indirect = payload.getShape().size() == 1 &&
+                  !store.getCoordinates().front().getDefiningOp<MakeRangeOp>();
+  if (indirect ? !analysis.accessBounds(store).isExact()
+               : !analysis.boundaryValidity(store).isExact())
     return false;
+  SmallVector<Value> retained{store.getValue()};
+  if (indirect) {
+    retained.push_back(store.getCoordinates().front());
+    if (store.getValid())
+      retained.push_back(store.getValid());
+    if (!llvm::all_of(retained, [&](Value value) {
+          auto type = dyn_cast<FragmentType>(value.getType());
+          return type && type.getShape().size() == 1 &&
+                 type.getShape() == payload.getShape();
+        }))
+      return false;
+  }
   SmallVector<MakeRangeOp> ranges;
   SmallVector<Attribute> shape;
   for (auto [axis, coordinate] : llvm::enumerate(store.getCoordinates())) {
     auto range = coordinate.getDefiningOp<MakeRangeOp>();
+    if (indirect) {
+      auto facts = analysis.axisRanges(store.getValue(), axis);
+      if (facts.state == PhysicalFactState::Unknown || facts.roots.empty() || !facts.blockers.empty() ||
+          !analysis.lockstepRanges(facts.roots).isExact())
+        return false;
+      range = facts.roots.front();
+    }
     auto extent = cast<PhysicalExprAttr>(payload.getShape()[axis]);
     if (!range || !isZero(range.getStart()) || !isZero(range.getLogicalStart()) ||
         !isUnitStepRange(range))
       return false;
     PhysicalExprAttr end = queryLaunchExpression(range.getLogicalStop());
-    if (!end || end != output.getLayout().getExtents()[axis])
+    if (!end || (!indirect && end != output.getLayout().getExtents()[axis]))
       return false;
     if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
       FailureOr<ParameterOp> parameter = queryParameterBySymbol(kernel, extent.getSymbol());
@@ -175,9 +199,39 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
     ranges.push_back(range);
     shape.push_back(end);
   }
-  if (ranges.size() != 2)
-    return false;
   PhysicalSourceAxis source = sourceAxisIdentity(ranges.front());
+  SmallVector<std::pair<PhysicalSourceAxis, int64_t>> replayAxes;
+  for (Value value : retained) {
+    auto mapping = cast<AxisMapAttr>(cast<FragmentType>(value.getType()).getAxisMaps()[0]);
+    std::pair axis{sourceAxisIdentity(mapping), mapping.getDimensionId()};
+    if (!llvm::is_contained(replayAxes, axis))
+      replayAxes.push_back(axis);
+    auto facts = analysis.axisRanges(value, 0);
+    for (MakeRangeOp root : facts.roots) {
+      auto mapping = cast<AxisMapAttr>(root.getResult().getType().getAxisMaps()[0]);
+      std::pair axis{sourceAxisIdentity(root), mapping.getDimensionId()};
+      if (!llvm::is_contained(replayAxes, axis))
+        replayAxes.push_back(axis);
+    }
+  }
+  auto replayAt = [&](Operation *anchor, bool &blocked) {
+    bool reads = false;
+    for (Value value : retained)
+      for (auto [axis, dimension] : replayAxes) {
+        auto replay = analysis.replayability(value, axis,
+            PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true, anchor, dimension);
+        if (!replay.isReplayable())
+          return false;
+        for (Operation *access : replay.accesses) {
+          auto load = dyn_cast<LoadOp>(access);
+          if (!load || !canReplayReadAt(load, anchor))
+            return false;
+          reads = true;
+          blocked |= !canReplayReadAt(load, store);
+        }
+      }
+    return reads;
+  };
   // Preserve the read snapshot before the first clobber, then perform the
   // external write at its original position using the private saved value.
   StoreOp clobber;
@@ -187,19 +241,8 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
     auto write = dyn_cast<StoreOp>(operation);
     if (!write || !isa<ViewType>(write.getResource().getType()))
       continue;
-    PhysicalReplayFact replay = analysis.replayability(
-        store.getValue(), source, PhysicalReplayScope::ValueGraph,
-        /*allowAccesses=*/true, write);
-    if (!replay.isReplayable() || replay.accesses.empty())
-      continue;
     bool blocked = false;
-    bool available = llvm::all_of(replay.accesses, [&](Operation *access) {
-      auto load = dyn_cast<LoadOp>(access);
-      if (!load || !canReplayReadAt(load, write))
-        return false;
-      blocked |= !canReplayReadAt(load, store);
-      return true;
-    });
+    bool available = replayAt(write, blocked);
     if (available && blocked) {
       clobber = write;
       break;
@@ -216,23 +259,18 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
       if (fixed)
         footprint *= extent.getValue();
     }
-    // A launch-dependent full matrix has no proven register bound. Use the
-    // same bounded traversal as an oversized static matrix; its workspace
+    // A launch-dependent full tensor has no proven register bound. Use the
+    // same bounded traversal as an oversized static tensor; its workspace
     // still follows the original runtime shape and store order.
     if (!fixed || footprint > capabilities.getRegistersPerUnit()) {
-      auto replay = analysis.replayability(store.getValue(), source,
-          PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true, store);
-      if (replay.isReplayable() && !replay.accesses.empty() &&
-          llvm::all_of(replay.accesses, [&](Operation *access) {
-            auto load = dyn_cast<LoadOp>(access);
-            return load && canReplayReadAt(load, store);
-          }))
+      bool blocked = false;
+      if (replayAt(store, blocked))
         clobber = store;
     }
   }
   if (!clobber)
     return false;
-  SmallVector<Value> dependencies{store.getValue()};
+  SmallVector<Value> dependencies(retained);
   llvm::DenseSet<Operation *> visited;
   for (unsigned index = 0; index < dependencies.size(); ++index) {
     Operation *producer = dependencies[index].getDefiningOp();
@@ -243,8 +281,13 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
     dependencies.append(producer->getOperands().begin(),
                         producer->getOperands().end());
   }
-  PhysicalRangeFact facts = analysis.sourceRanges(store.getValue());
-  SmallVector<MakeRangeOp> roots(facts.roots.begin(), facts.roots.end());
+  SmallVector<MakeRangeOp> roots;
+  for (Value value : retained) {
+    PhysicalRangeFact facts = analysis.sourceRanges(value);
+    for (MakeRangeOp root : facts.roots)
+      if (!llvm::is_contained(roots, root))
+        roots.push_back(root);
+  }
   roots.append(ranges.begin(), ranges.end());
   SmallVector<std::pair<MakeRangeOp, unsigned>> rootBindings;
   SmallVector<MakeRangeOp> rowRoots;
@@ -319,14 +362,19 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
   for (auto [original, constant] : constants)
     constantValues.map(original, builder.create<arith::ConstantOp>(
         store.getLoc(), original.getType(), constant));
-  Value workspace = createInvocationWorkspace(
-      kernel, store.getLoc(), payload, builder.getArrayAttr(shape));
+  SmallVector<Value> workspaces;
+  for (Value value : retained)
+    workspaces.push_back(createInvocationWorkspace(kernel, store.getLoc(),
+        cast<FragmentType>(value.getType()), builder.getArrayAttr(shape)));
+  Value workspace = workspaces.front();
   uint64_t instance = cast<BufferType>(workspace.getType()).getInstance();
   ParameterOp chunk = getOrCreatePhysicalParameter(
       kernel, ("MATERIALIZE_ROWS_" + Twine(instance)).str(),
       ParameterRole::ReductionOuter, ParameterCategory::Reduction,
       payload.getElementType().getIntOrFloatBitWidth(),
-      {1, 2, 4, 8, 16, 32, 64});
+      payload.getShape().size() == 1
+          ? ArrayRef<int64_t>{32, 64, 128, 256, 512, 1024, 2048, 4096, 8192}
+          : ArrayRef<int64_t>{1, 2, 4, 8, 16, 32, 64});
   SmallVector<Attribute> blockedShape(payload.getShape().begin(),
                                       payload.getShape().end());
   blockedShape[0] = queryLaunchExpression(chunk);
@@ -343,13 +391,15 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
           Value valid) -> LogicalResult {
         for (const auto &entry : constantValues.getValueMap())
           mapping.map(entry.first, entry.second);
-        FailureOr<Value> value = materializeReplayedValue(
-            nested, store.getLoc(), store.getValue(), source,
-            queryLaunchExpression(chunk), mapping, options);
-        if (failed(value))
-          return store.emitOpError("retained value has no bounded producer replay");
-        nested.create<StoreOp>(store.getLoc(), workspace, coordinates, *value,
-                               valid, store.getSourceAxes());
+        for (auto [original, snapshot] : llvm::zip(retained, workspaces)) {
+          FailureOr<Value> value = materializeReplayedValue(
+              nested, store.getLoc(), original, source,
+              queryLaunchExpression(chunk), mapping, options);
+          if (failed(value))
+            return store.emitOpError("retained value has no bounded producer replay");
+          nested.create<StoreOp>(store.getLoc(), snapshot, coordinates, *value,
+                                 valid, store.getSourceAxes());
+        }
         return success();
       });
   if (failed(initialized))
@@ -359,7 +409,7 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
       builder, store.getLoc(), ranges, rootBindings, chunk, blocked, 0,
       [&](OpBuilder &nested, IRMapping &mapping, ValueRange coordinates,
           Value valid) -> LogicalResult {
-        if (store.getValid()) {
+        if (store.getValid() && !indirect) {
           FailureOr<Value> predicate = materializeReplayedValue(
               nested, store.getLoc(), store.getValid(), source,
               queryLaunchExpression(chunk), mapping, options);
@@ -369,15 +419,50 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
           valid = nested.create<BinaryOp>(store.getLoc(), type, valid, *predicate,
                                           BinaryOperator::LogicalAnd);
         }
-        FailureOr<Value> zero =
-            materializeZeroFragment(nested, store.getLoc(), blocked);
-        if (failed(zero))
-          return failure();
-        Value value = nested.create<LoadOp>(
-            store.getLoc(), blocked, workspace, coordinates, valid, *zero,
-            store.getSourceAxes());
+        SmallVector<Value> restored;
+        for (auto [original, snapshot] : llvm::zip(retained, workspaces)) {
+          auto type = cast<FragmentType>(original.getType());
+          auto current = FragmentType::get(kernel.getContext(), type.getElementType(),
+              blocked.getShape(), type.getAxisMaps(), type.getValidity(), type.getOwner());
+          auto zero = materializeZeroFragment(nested, store.getLoc(), current);
+          if (failed(zero))
+            return failure();
+          restored.push_back(nested.create<LoadOp>(store.getLoc(), current, snapshot,
+              coordinates, valid, *zero, store.getSourceAxes()));
+        }
+        SmallVector<Value> destinations(coordinates);
+        if (indirect) {
+          destinations[0] = restored[1];
+          if (store.getValid()) {
+            auto predicate = materializeBroadcastToFragment(nested, store.getLoc(),
+                restored[2], cast<FragmentType>(valid.getType()));
+            if (failed(predicate))
+              return failure();
+            valid = nested.create<BinaryOp>(store.getLoc(), valid.getType(), valid,
+                                            *predicate, BinaryOperator::LogicalAnd);
+          }
+          // The original access was in bounds. Retain that executable proof
+          // after its address and predicate have become separate saved values.
+          auto originalIndex = cast<FragmentType>(destinations[0].getType());
+          auto indexType = FragmentType::get(kernel.getContext(), nested.getIndexType(),
+              originalIndex.getShape(), originalIndex.getAxisMaps(),
+              originalIndex.getValidity(), originalIndex.getOwner());
+          if (originalIndex != indexType)
+            destinations[0] = nested.create<CastOp>(store.getLoc(), indexType, destinations[0]);
+          Value zero = nested.create<arith::ConstantIndexOp>(store.getLoc(), 0);
+          Value end = nested.create<DimOp>(store.getLoc(), nested.getIndexType(),
+                                          store.getResource(), store.getSourceAxes()[0]);
+          for (auto [bound, predicate] :
+               {std::pair{zero, ComparePredicate::Ge}, std::pair{end, ComparePredicate::Lt}}) {
+            Value limit = nested.create<BroadcastOp>(store.getLoc(), indexType, bound);
+            Value inBounds = nested.create<CompareOp>(store.getLoc(), valid.getType(),
+                                                      destinations[0], limit, predicate);
+            valid = nested.create<BinaryOp>(store.getLoc(), valid.getType(), valid,
+                                            inBounds, BinaryOperator::LogicalAnd);
+          }
+        }
         auto replacement = nested.create<StoreOp>(
-            store.getLoc(), store.getResource(), coordinates, value, valid,
+            store.getLoc(), store.getResource(), destinations, restored.front(), valid,
             store.getSourceAxes());
         replacement->setAttrs(store->getAttrs());
         return success();
