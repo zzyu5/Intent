@@ -1032,12 +1032,17 @@ LogicalResult addTailValidity(func::FuncOp kernel,
       }
       for (MakeRangeOp range : blockedRanges) {
         FailureOr<int64_t> dimension = queryRangeDimension(range);
-        PhysicalDimensionProjection projection =
+        auto sourceProjection = queryFragmentAxis(valueType, sourceAxisIdentity(range));
+        PhysicalDimensionProjection dimensionProjection =
             succeeded(dimension)
                 ? queryFragmentDimension(valueType, *dimension)
                 : PhysicalDimensionProjection{};
-        if (!projection.isExact())
+        if (failed(dimension) ||
+            (!sourceProjection.isExact() && !dimensionProjection.isExact()))
           continue;
+        unsigned payloadAxis = sourceProjection.isExact()
+                                   ? sourceProjection.fragmentAxis
+                                   : dimensionProjection.fragmentAxis;
         auto rangeType = cast<FragmentType>(range.getResult().getType());
         auto blockedExtent =
             cast<PhysicalExprAttr>(rangeType.getShape()[0]);
@@ -1050,7 +1055,7 @@ LogicalResult addTailValidity(func::FuncOp kernel,
             return store.emitOpError(
                 "histogram writeback lost its physical result schema");
         }
-        if (valueType.getShape()[projection.fragmentAxis] == blockedExtent)
+        if (valueType.getShape()[payloadAxis] == blockedExtent)
           continue;
         IRMapping mapping;
         DominanceInfo dominance(kernel);
@@ -1439,8 +1444,15 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
         samePhysicalScalarExpression(range.getLogicalStart(), blocked.getLogicalStart()) &&
         samePhysicalScalarExpression(range.getLogicalStop(), blocked.getLogicalStop()) &&
         samePhysicalScalarExpression(range.getStep(), blocked.getStep());
+    auto sourceSize = constantLogicalRangeCardinality(range);
+    auto targetSize = constantLogicalRangeCardinality(blocked);
+    bool positional = sourceAxisIdentity(range) == source &&
+        succeeded(rangeDimension) &&
+        llvm::is_contained(traversalDimensions, *rangeDimension) &&
+        isUnitStepRange(range) && isUnitStepRange(blocked) &&
+        sourceSize && targetSize && *sourceSize == *targetSize;
     if (!blocked || failed(rangeDimension) || failed(blockedDimension) ||
-        (*rangeDimension != *blockedDimension && !sameBounds) || !originalType ||
+        (*rangeDimension != *blockedDimension && !sameBounds && !positional) || !originalType ||
         originalType.getShape().size() != 1) {
       InFlightDiagnostic diagnostic = range.emitOpError(
           "pointwise replay reached a range without an exact shared dimension relation");
@@ -5175,6 +5187,83 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   });
   if (occurrences.wasInterrupted())
     return failure();
+  // Ordered writes to a parent and its subregion use one absolute tile anchor.
+  // Shift the subregion's positional payload by the same ordinal displacement.
+  llvm::DenseMap<Operation *, int64_t> parentAnchorOffsets;
+  auto constantBound = [](Value value) -> std::optional<int64_t> {
+    auto bound = queryLaunchExpression(value);
+    if (!bound || bound.getKind() !=
+                      static_cast<uint32_t>(PhysicalExprKind::Constant))
+      return std::nullopt;
+    return bound.getValue();
+  };
+  SmallVector<StoreOp> precedingStores;
+  WalkResult parentAnchors = kernel.walk([&](StoreOp store) {
+    PhysicalProgramAnalysis analysis(kernel);
+    for (auto [position, coordinate] : llvm::enumerate(store.getCoordinates())) {
+      auto type = dyn_cast<FragmentType>(coordinate.getType());
+      if (!type || type.getShape().size() != 1)
+        continue;
+      auto child = queryExactLogicalRange(analysis.axisRanges(coordinate, 0));
+      if (failed(child) || !isUnitStepRange(*child))
+        continue;
+      auto parentDimension = querySubregionParentDimension(*child);
+      auto childStart = constantBound(child->getLogicalStart());
+      auto childStop = constantBound(child->getLogicalStop());
+      if (failed(parentDimension) || !childStart || !childStop || *childStart < 0)
+        continue;
+      std::optional<int64_t> offset;
+      for (StoreOp previous : precedingStores) {
+        if (previous.getResource() != store.getResource() ||
+            previous->getBlock() != store->getBlock())
+          continue;
+        auto sourceAxis = store.getSourceAxes()[position];
+        for (auto [parentPosition, parentCoordinate] :
+             llvm::enumerate(previous.getCoordinates())) {
+          if (previous.getSourceAxes()[parentPosition] != sourceAxis)
+            continue;
+          auto parentType = dyn_cast<FragmentType>(parentCoordinate.getType());
+          if (!parentType || parentType.getShape().size() != 1)
+            continue;
+          auto parent = queryExactLogicalRange(analysis.axisRanges(parentCoordinate, 0));
+          if (failed(parent) || !isUnitStepRange(*parent) ||
+              !(sourceAxisIdentity(*parent) == sourceAxisIdentity(*child)))
+            continue;
+          auto dimension = queryRangeDimension(*parent);
+          auto start = constantBound(parent->getLogicalStart());
+          auto stop = constantBound(parent->getLogicalStop());
+          if (failed(dimension) || *dimension != *parentDimension ||
+              !start || !stop || *start < 0 || *start > *childStart ||
+              *stop < *childStop)
+            continue;
+          int64_t current = *start - *childStart;
+          if (offset && *offset != current) {
+            store.emitOpError("subregion writes have incompatible parent tile anchors");
+            return WalkResult::interrupt();
+          }
+          offset = current;
+        }
+      }
+      if (!offset || *offset == 0)
+        continue;
+      MakeRangeOp root = occurrenceRoots.lookup(child->getOperation());
+      if (!root)
+        root = *child;
+      for (MakeRangeOp range : allRanges) {
+        if (range != *child && occurrenceRoots.lookup(range.getOperation()) != root)
+          continue;
+        auto [entry, inserted] = parentAnchorOffsets.try_emplace(range.getOperation(), *offset);
+        if (!inserted && entry->second != *offset) {
+          store.emitOpError("shared pointwise producer requires incompatible ordinal anchors");
+          return WalkResult::interrupt();
+        }
+      }
+    }
+    precedingStores.push_back(store);
+    return WalkResult::advance();
+  });
+  if (parentAnchors.wasInterrupted())
+    return failure();
   if (ownershipOnly)
     for (auto &entry : occurrenceRoots) {
       auto range = cast<MakeRangeOp>(entry.first);
@@ -6380,8 +6469,16 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       Value scaledOffset = builder.create<BinaryOp>(
           range.getLoc(), builder.getIndexType(), tileOffset, range.getStep(),
           BinaryOperator::Multiply);
+      Value anchor = range.getLogicalStart();
+      auto parentOffset = parentAnchorOffsets.find(range.getOperation());
+      if (parentOffset != parentAnchorOffsets.end()) {
+        Value offset = builder.create<arith::ConstantIndexOp>(
+            range.getLoc(), parentOffset->second);
+        anchor = builder.create<BinaryOp>(range.getLoc(), builder.getIndexType(),
+                                          anchor, offset, BinaryOperator::Add);
+      }
       start = builder.create<BinaryOp>(
-          range.getLoc(), builder.getIndexType(), range.getLogicalStart(), scaledOffset,
+          range.getLoc(), builder.getIndexType(), anchor, scaledOffset,
           BinaryOperator::Add);
       end = range.getLogicalStop();
     }
@@ -6418,6 +6515,15 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         ComparePredicate::Lt);
     validComparison->setAttr(physicalTailAttr, builder.getUnitAttr());
     Value valid = validComparison.getResult();
+    if (parentAnchorOffsets.contains(range.getOperation())) {
+      Value lower = builder.create<BroadcastOp>(
+          range.getLoc(), blockedType, range.getLogicalStart());
+      Value active = builder.create<CompareOp>(
+          range.getLoc(), predicateType(blockedType), blocked, lower,
+          ComparePredicate::Ge);
+      valid = builder.create<BinaryOp>(range.getLoc(), predicateType(blockedType),
+                                       active, valid, BinaryOperator::LogicalAnd);
+    }
     range.getResult().replaceAllUsesWith(blocked);
     rangePredicates[blocked] = valid;
     range.erase();
