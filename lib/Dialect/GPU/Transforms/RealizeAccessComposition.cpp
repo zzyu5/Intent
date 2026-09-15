@@ -1722,7 +1722,7 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
   }
   for (Attribute attribute : reshape.getReassociation()) {
     auto group = cast<ReshapeGroupAttr>(attribute);
-    if (group.getSourceAxes().empty() || group.getResultAxes().empty())
+    if (group.getSourceAxes().empty() && group.getResultAxes().empty())
       return false;
     SmallVector<Attribute> sourceExtents;
     for (int64_t axis : group.getSourceAxes().asArrayRef()) {
@@ -1796,6 +1796,10 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
       } else {
         ordinal = projected;
       }
+    }
+    if (!ordinal) {
+      Value zero = builder.create<arith::ConstantIndexOp>(store.getLoc(), 0);
+      ordinal = builder.create<SplatOp>(store.getLoc(), indexType, zero);
     }
     auto axes = group.getResultAxes().asArrayRef();
     for (unsigned position = axes.size(); position-- > 0;) {
