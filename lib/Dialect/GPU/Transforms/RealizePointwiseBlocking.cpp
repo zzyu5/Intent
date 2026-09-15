@@ -132,6 +132,8 @@ PhysicalExprAttr binaryExpression(MLIRContext *context, PhysicalExprKind kind,
 }
 
 PhysicalExprAttr launchRangeExtent(MakeRangeOp range) {
+  if (auto count = constantLogicalRangeCardinality(range))
+    return expression(range.getContext(), PhysicalExprKind::Constant, *count);
   PhysicalExprAttr start = queryLaunchExpression(range.getLogicalStart());
   PhysicalExprAttr stop = queryLaunchExpression(range.getLogicalStop());
   PhysicalExprAttr step = queryLaunchExpression(range.getStep());
@@ -5373,18 +5375,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     ownershipAxes.clear();
 
   if (ownershipOnly) {
-    auto staticLogicalExtent = [](MakeRangeOp range) -> std::optional<int64_t> {
-      auto start =
-          range.getLogicalStart().getDefiningOp<arith::ConstantIndexOp>();
-      auto stop =
-          range.getLogicalStop().getDefiningOp<arith::ConstantIndexOp>();
-      auto step = range.getStep().getDefiningOp<arith::ConstantIndexOp>();
-      if (!start || !stop || !step || step.value() <= 0 ||
-          stop.value() < start.value())
-        return std::nullopt;
-      int64_t distance = stop.value() - start.value();
-      return (distance + step.value() - 1) / step.value();
-    };
     llvm::SmallDenseSet<Attribute> internalOwnershipAxes;
     for (Attribute axis : ownershipAxes) {
       if (llvm::any_of(axes.lookup(axis), [](MakeRangeOp range) {
@@ -5435,7 +5425,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                   if (range->hasAttr(worksetCoordinateRangeAttr) ||
                       range->hasAttr(sourceSubregionAttr))
                     return true;
-                  std::optional<int64_t> current = staticLogicalExtent(range);
+                  std::optional<int64_t> current =
+                      constantLogicalRangeCardinality(range);
                   if (!current || (extent && *extent != *current))
                     return true;
                   extent = *current;
@@ -5760,16 +5751,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   bool mappingChanged = false;
   SmallVector<std::pair<Attribute, unsigned>> reusedCoordinates;
   SmallVector<Attribute> appendedCoordinates;
-  auto staticLogicalExtent = [](MakeRangeOp range) -> std::optional<int64_t> {
-    auto start = range.getLogicalStart().getDefiningOp<arith::ConstantIndexOp>();
-    auto stop = range.getLogicalStop().getDefiningOp<arith::ConstantIndexOp>();
-    auto step = range.getStep().getDefiningOp<arith::ConstantIndexOp>();
-    if (!start || !stop || !step || step.value() <= 0 ||
-        stop.value() < start.value())
-      return std::nullopt;
-    int64_t distance = stop.value() - start.value();
-    return (distance + step.value() - 1) / step.value();
-  };
   for (auto [axisKey, ranges] : axes) {
     MakeRangeOp range = ranges.front();
     const bool worksetRange = range->hasAttr(worksetCoordinateRangeAttr);
@@ -5812,7 +5793,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       // domain steps.
       dimension = mapping.getExtents()[*worksetPosition];
     } else if (isSourceAxisKey(axisKey)) {
-      staticExtent = staticLogicalExtent(range);
+      staticExtent = constantLogicalRangeCardinality(range);
       if (staticExtent)
         dimension = mappingBuilder.create<arith::ConstantIndexOp>(
             mapping.getLoc(), *staticExtent);
