@@ -1159,10 +1159,17 @@ LogicalResult neutralizeReductionTails(ReduceOp reduce, func::FuncOp kernel) {
     for (MakeRangeOp range : ranges.roots) {
       if (range.getResult().getType().getShape()[0] != type.getShape()[axis])
         continue;
-      if (!isUnitStepRange(range) ||
-          !dominance.dominates(range.getOperation(), reduce.getOperation()))
+      if (!isUnitStepRange(range))
         return reduce.emitOpError(
             "padded reduction has no dominating coordinate predicate");
+      if (!dominance.dominates(range.getOperation(), reduce.getOperation())) {
+        if (!llvm::all_of(range->getOperands(), [&](Value operand) {
+              return dominance.dominates(operand, reduce.getOperation());
+            }))
+          return reduce.emitOpError(
+              "padded reduction coordinate depends on an inner traversal");
+        range = cast<MakeRangeOp>(builder.clone(*range.getOperation()));
+      }
       auto coordinates = range.getResult().getType();
       auto predicate = FragmentType::get(kernel.getContext(), builder.getI1Type(),
           coordinates.getShape(), coordinates.getAxisMaps(),
@@ -1825,6 +1832,38 @@ FailureOr<bool> decomposeFullCoverageMultiAxisReduce(
       if (!size || *size > *extent)
         return false;
     }
+    // A load-rooted source with free output lanes can trade reduction width
+    // for a larger output tile. Keep that width parameterized even when the
+    // logical reduction extent is static; retained/pure sources stay native.
+    SmallVector<MakeRangeOp> chunkRanges;
+    bool canChunk = hasNonUnitFreeAxis(reduce);
+    for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+      auto plan = analyzeSource(source, outerAxis);
+      if (failed(plan) || plan->roots.empty()) {
+        canChunk = false;
+        break;
+      }
+      for (MakeRangeOp range : plan->ranges) {
+        canChunk &= !range->hasAttr(sourceSubregionAttr);
+        chunkRanges.push_back(range);
+      }
+      if (plan->reductionRange)
+        chunkRanges.push_back(plan->reductionRange);
+      for (LoadOp load : plan->roots) {
+        auto access = analyzeRoot(load, plan->ranges, plan->reductionAxis);
+        if (failed(access) || !*access ||
+            (*access)->range->hasAttr(sourceSubregionAttr)) {
+          canChunk = false;
+          break;
+        }
+        chunkRanges.push_back((*access)->range);
+      }
+      if (!canChunk)
+        break;
+    }
+    if (canChunk &&
+        PhysicalProgramAnalysis(kernel).lockstepRanges(chunkRanges).isExact())
+      return false;
   }
 
   SmallVector<int64_t> innerAxes;
@@ -2038,8 +2077,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
       return sourceAxisIdentity(range) == sourceAxisIdentity(master->range) &&
              range->hasAttr(sourceSubregionAttr);
     });
-  bool blockOuterAxis = reduce.getAxes().size() == 2 &&
-                        !outerHasSubregion &&
+  bool blockOuterAxis = !outerHasSubregion &&
                         llvm::all_of(
                             reduce.getCombine().front().without_terminator(),
                             [](Operation &operation) {
@@ -2053,8 +2091,16 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
          Twine(master->range.getSourceAxis()) +
          (master->range.getDerived() ? "_DERIVED" : ""))
             .str();
-    SmallVector<int64_t> candidates{4, 8, 16, 32, 64, 128,
+    SmallVector<int64_t> candidates{1, 2, 4, 8, 16, 32, 64, 128,
                                     256, 512, 1024, 2048, 4096};
+    if (auto count = constantLogicalRangeCardinality(master->range)) {
+      uint64_t padded = llvm::PowerOf2Ceil(
+          static_cast<uint64_t>(std::max<int64_t>(*count, 1)));
+      llvm::erase_if(candidates, [&](int64_t value) {
+        return static_cast<uint64_t>(value) > padded;
+      });
+      name += ("_E" + Twine(padded)).str();
+    }
     auto firstSource =
         cast<FragmentType>(reduce.getInputs().front().getType());
     if (queryFragmentAxes(firstSource, plans.front().sourceIdentity).size() > 1)
