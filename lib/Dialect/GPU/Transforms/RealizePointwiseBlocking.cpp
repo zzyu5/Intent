@@ -3663,6 +3663,47 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         failed(alignAccessValueRelations(kernel)) ||
         failed(alignPointwiseValueRelations(kernel)))
       return failure();
+    PhysicalProgramAnalysis analysis(kernel);
+    WalkResult localized = kernel.walk([&](GatherOp gather) {
+      auto source = dyn_cast<FragmentType>(gather.getSource().getType());
+      if (!source)
+        return WalkResult::advance();
+      for (auto [position, axis] : llvm::enumerate(gather.getSourceAxes())) {
+        Value coordinate = gather.getCoordinates()[position];
+        Value origin = coordinate;
+        while (auto broadcast = origin.getDefiningOp<BroadcastOp>())
+          origin = broadcast.getValue();
+        auto range = origin.getDefiningOp<MakeRangeOp>();
+        auto begin = range ? queryLaunchExpression(range.getLogicalStart())
+                           : PhysicalExprAttr();
+        if (!range || !isUnitStepRange(range) ||
+            !begin || begin.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+            begin.getValue() != 0 ||
+            samePhysicalScalarExpression(range.getStart(), range.getLogicalStart()) ||
+            range.getResult().getType().getShape()[0] != source.getShape()[axis])
+          continue;
+        auto roots = analysis.axisRanges(gather.getSource(), axis);
+        if (!roots.isExact() || roots.roots.empty() || !roots.blockers.empty() ||
+            !llvm::all_of(roots.roots, [&](MakeRangeOp root) {
+              return sameLogicalRange(root, range) &&
+                     samePhysicalScalarExpression(root.getStart(), range.getStart()) &&
+                     samePhysicalScalarExpression(root.getExtent(), range.getExtent());
+            }))
+          continue;
+        OpBuilder builder(gather);
+        auto type = cast<FragmentType>(coordinate.getType());
+        auto start = materializeBroadcastToFragment(builder, gather.getLoc(),
+                                                    range.getStart(), type);
+        if (failed(start))
+          return WalkResult::interrupt();
+        Value ordinal = builder.create<BinaryOp>(
+            gather.getLoc(), type, coordinate, *start, BinaryOperator::Subtract);
+        gather.getCoordinatesMutable().slice(position, 1).assign(ordinal);
+      }
+      return WalkResult::advance();
+    });
+    if (localized.wasInterrupted())
+      return failure();
     eraseDeadPhysicalValues(kernel);
     return success();
   };

@@ -968,6 +968,14 @@ bool coordinateRangeWithinResource(Value coordinate, Value resource,
     return coordinateRangeWithinResource(reshape.getValue(), resource, axis);
   if (auto transpose = coordinate.getDefiningOp<TransposeOp>())
     return coordinateRangeWithinResource(transpose.getValue(), resource, axis);
+  if (auto subtract = coordinate.getDefiningOp<BinaryOp>();
+      subtract && subtract.getOperatorKind() == BinaryOperator::Subtract) {
+    auto range = stripIntegerIndexCasts(subtract.getLhs()).getDefiningOp<MakeRangeOp>();
+    if (range && isUnitStepValue(range.getStep()) &&
+        sameScalarExpression(stripBroadcast(subtract.getRhs()), range.getStart()) &&
+        matchesResourceExtent(range.getExtent(), resource, axis))
+      return true;
+  }
   if (std::optional<int64_t> constant = integerConstant(coordinate)) {
     PhysicalExprAttr extent = resourceExtentExpression(resource, axis);
     auto kernel = resource.getParentRegion()->getParentOfType<func::FuncOp>();
