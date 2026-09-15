@@ -4,6 +4,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   ReusePreparedInputs.cpp
   GroupQuantizedDots.cpp
   GroupRegionComputations.cpp
+  GroupWorksetComputations.cpp
   MaterializeStructuredComputations.cpp
   FuseIntermediateBuffers.cpp
   FuseReductionTraversals.cpp

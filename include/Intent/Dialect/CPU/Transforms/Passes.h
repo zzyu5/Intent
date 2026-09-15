@@ -31,6 +31,10 @@ mlir::LogicalResult groupRegionComputations(mlir::func::FuncOp function,
                                           const Configuration &configuration);
 mlir::LogicalResult groupQuantizedDots(mlir::func::FuncOp function,
                                      const ImplementationRegistry &implementations);
+mlir::LogicalResult groupWorksetComputations(mlir::func::FuncOp function,
+                                           const ImplementationRegistry &implementations);
+mlir::LogicalResult exposeStructuredWorksets(mlir::func::FuncOp function,
+    const ImplementationRegistry &implementations, llvm::ArrayRef<mlir::Value> leadingExtents = {});
 void forwardCPUOutputs(mlir::func::FuncOp function);
 mlir::LogicalResult materializeStructuredComputations(mlir::func::FuncOp function);
 mlir::LogicalResult realizeSliceScans(mlir::func::FuncOp function);

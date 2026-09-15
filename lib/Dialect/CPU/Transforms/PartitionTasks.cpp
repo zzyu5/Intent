@@ -78,7 +78,10 @@ void partitionScalarSums(func::FuncOp function, int64_t grain) {
   }
 }
 
-LogicalResult exposeStructuredWorksets(func::FuncOp function, const ImplementationRegistry &implementations) {
+}
+
+LogicalResult exposeStructuredWorksets(func::FuncOp function, const ImplementationRegistry &implementations,
+                                      ArrayRef<Value> leadingExtents) {
   AliasAnalysis aliases(function);
   PhysicalProgramAnalysis analysis(function);
   auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
@@ -92,6 +95,7 @@ LogicalResult exposeStructuredWorksets(func::FuncOp function, const Implementati
   for (auto operation : computations) {
     if (!operation.getNumLoops() || operation.getNumResults() || operation.getOutputs().empty() ||
         operation.getIteratorTypesArray()[0] != utils::IteratorType::parallel) continue;
+    if (!leadingExtents.empty() && isMatrixContraction(operation)) continue;
     auto maps = operation.getIndexingMapsArray();
     if (llvm::any_of(maps, [](AffineMap map) {
           return map.getNumSymbols() || llvm::any_of(map.getResults(), [](AffineExpr expression) {
@@ -123,6 +127,13 @@ LogicalResult exposeStructuredWorksets(func::FuncOp function, const Implementati
         independent &= disjoint(load.getMemref(), output);
     }
     if (!independent) continue;
+    OpBuilder b(operation);
+    Location loc = operation.getLoc();
+    Value extent = b.createOrFold<memref::DimOp>(loc, operation.getOutputs()[0], 0);
+    if (!leadingExtents.empty() && !llvm::any_of(leadingExtents, [&](Value candidate) {
+          auto constant = getConstantIntValue(extent);
+          return extent == candidate || (constant && constant == getConstantIntValue(candidate));
+        })) continue;
     int64_t rows = 1;
     if (auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation")) {
       auto implementation = implementations.lookup(operation);
@@ -130,15 +141,14 @@ LogicalResult exposeStructuredWorksets(func::FuncOp function, const Implementati
       if ((*implementation)->worksetRows) rows = (*implementation)->worksetRows(operation, binding);
       if (rows <= 0) return operation.emitError("implementation requires a positive leading parallel workset");
     }
-    OpBuilder b(operation);
-    Location loc = operation.getLoc();
+    if (!leadingExtents.empty() && rows != 1) continue;
     Value zero = index(b, loc, 0), one = index(b, loc, 1);
-    Value extent = b.create<memref::DimOp>(loc, operation.getOutputs()[0], 0);
     Value window = index(b, loc, rows);
     Value count = rows == 1 ? extent : b.create<arith::CeilDivSIOp>(loc, extent, window);
     auto workset = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{count}, ValueRange{one});
     b.setInsertionPointToStart(workset.getBody());
-    Value row = multiply(b, loc, workset.getInductionVars()[0], window);
+    Value row = rows == 1 ? workset.getInductionVars()[0]
+                         : multiply(b, loc, workset.getInductionVars()[0], window);
     OpFoldResult rowCount = b.getIndexAttr(1);
     if (rows != 1)
       rowCount = b.create<arith::MinSIOp>(loc, window, b.create<arith::SubIOp>(loc, extent, row)).getResult();
@@ -181,6 +191,8 @@ LogicalResult exposeStructuredWorksets(func::FuncOp function, const Implementati
   }
   return success();
 }
+
+namespace {
 
 LogicalResult partition(scf::ParallelOp root, int64_t grain) {
   auto function = root->getParentOfType<func::FuncOp>();

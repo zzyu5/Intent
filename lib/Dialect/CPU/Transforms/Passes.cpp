@@ -163,7 +163,8 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
     auto binding = function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration");
     Configuration config{binding.getTaskGrain(), binding.getTileM(), binding.getTileN(),
         binding.getTileK(), binding.getRegionSize(), {}};
-    if (failed(blockContractions(function, config, implementations)) ||
+    if (failed(groupWorksetComputations(function, implementations)) ||
+        failed(blockContractions(function, config, implementations)) ||
         failed(blockStructuredComputations(function, implementations)) || failed(verifyCPUProgram(module, false)) ||
         failed(partitionTasks(function, config.taskGrain, implementations))) return failure();
   }
