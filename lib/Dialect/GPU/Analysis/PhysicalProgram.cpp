@@ -1523,6 +1523,58 @@ std::optional<int64_t> constantLogicalRangeCardinality(MakeRangeOp range) {
       if (samePhysicalScalarExpression(base, range.getLogicalStart()))
         if (auto size = constant(offset))
           distance = *size;
+  if (!distance) {
+    struct Offset {
+      Value base;
+      __int128 amount = 0;
+      __int128 minimum = 0;
+      __int128 maximum = 0;
+    };
+    std::function<Offset(Value)> splitOffset = [&](Value value) -> Offset {
+      value = stripScalarIdentity(value);
+      auto binary = value.getDefiningOp<BinaryOp>();
+      if (!binary)
+        return {value};
+      Value base;
+      std::optional<__int128> increment;
+      if (binary.getOperatorKind() == BinaryOperator::Add) {
+        if (auto rhs = constant(binary.getRhs())) {
+          base = binary.getLhs();
+          increment = *rhs;
+        } else if (auto lhs = constant(binary.getLhs())) {
+          base = binary.getRhs();
+          increment = *lhs;
+        }
+      } else if (binary.getOperatorKind() == BinaryOperator::Subtract) {
+        if (auto rhs = constant(binary.getRhs())) {
+          base = binary.getLhs();
+          increment = -static_cast<__int128>(*rhs);
+        }
+      }
+      if (!increment)
+        return {value};
+      Offset result = splitOffset(base);
+      result.amount += *increment;
+      result.minimum = std::min(result.minimum, result.amount);
+      result.maximum = std::max(result.maximum, result.amount);
+      return result;
+    };
+    Offset begin = splitOffset(range.getLogicalStart());
+    Offset end = splitOffset(range.getLogicalStop());
+    if (samePhysicalScalarExpression(begin.base, end.base)) {
+      auto upper = queryNonNegativeIndexUpperBound(begin.base);
+      // Cancel a common affine base only when every index addition/subtraction
+      // stays in range; signed wrap must not turn a short slice into a full one.
+      if (upper && upper.getKind() ==
+                       static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          std::min(begin.minimum, end.minimum) >=
+              std::numeric_limits<int64_t>::min() &&
+          static_cast<__int128>(upper.getValue()) +
+                  std::max(begin.maximum, end.maximum) <=
+              std::numeric_limits<int64_t>::max())
+        distance = end.amount - begin.amount;
+    }
+  }
   if (!distance || *distance < 0)
     return std::nullopt;
   __int128 size = (*distance + *step - 1) / *step;
