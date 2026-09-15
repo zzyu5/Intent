@@ -2478,28 +2478,45 @@ LogicalResult legalizeLargeScalarGathers(func::FuncOp kernel) {
     if (!fixed || !oversized || (result && result.getShape().empty()))
       continue;
     SmallVector<std::pair<unsigned, Value>> selected;
+    SmallVector<std::pair<unsigned, Value>> indexed;
     llvm::SmallDenseSet<unsigned> axes;
+    llvm::SmallDenseSet<unsigned> seenAxes;
     bool compatible = true;
     for (auto [coordinate, axis] :
          llvm::zip(gather.getCoordinates(), gather.getSourceAxes())) {
+      Value originalCoordinate = coordinate;
       coordinate = stripShapeOnly(coordinate);
       if (axis < 0 || static_cast<unsigned>(axis) >= source.getShape().size() ||
-          !axes.insert(axis).second ||
-          !isa<IntegerType, IndexType>(coordinate.getType())) {
+          !seenAxes.insert(axis).second) {
         compatible = false;
         break;
       }
+      if (auto fragment = dyn_cast<gpu::FragmentType>(coordinate.getType())) {
+        if (!isa<IntegerType, IndexType>(fragment.getElementType())) {
+          compatible = false;
+          break;
+        }
+        indexed.emplace_back(axis, originalCoordinate);
+        continue;
+      }
+      if (!isa<IntegerType, IndexType>(coordinate.getType())) {
+        compatible = false;
+        break;
+      }
+      axes.insert(axis);
       selected.emplace_back(axis, coordinate);
     }
+    if (!compatible || selected.empty())
+      continue;
     unsigned resultAxis = 0;
-    for (unsigned axis = 0; compatible && axis < source.getShape().size(); ++axis)
+    for (unsigned axis = 0; indexed.empty() && compatible && axis < source.getShape().size(); ++axis)
       if (!axes.contains(axis)) {
         compatible = result && resultAxis < result.getShape().size() &&
                      source.getShape()[axis] == result.getShape()[resultAxis];
         ++resultAxis;
       }
-    if (!compatible || (result ? resultAxis != result.getShape().size()
-                               : resultAxis != 0))
+    if (!compatible || (indexed.empty() &&
+                        (result ? resultAxis != result.getShape().size() : resultAxis != 0)))
       continue;
 
     // Exactly one source element contributes to each result lane. Combining
@@ -2599,6 +2616,24 @@ LogicalResult legalizeLargeScalarGathers(func::FuncOp kernel) {
           kernel.getContext(), source.getElementType(), fragment.getShape(),
           fragment.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
     value = builder.create<gpu::BitcastOp>(location, decodedType, value);
+    if (!indexed.empty()) {
+      SmallVector<Value> coordinates;
+      SmallVector<int64_t> sourceAxes;
+      for (auto [axis, coordinate] : indexed) {
+        unsigned removed = llvm::count_if(selected, [&](const auto &item) {
+          return item.first < axis;
+        });
+        coordinates.push_back(coordinate);
+        sourceAxes.push_back(axis - removed);
+      }
+      value = builder.create<gpu::GatherOp>(location, gather.getResult().getType(),
+          value, coordinates, gather.getValid(), gather.getFill(), sourceAxes);
+      if (Attribute origin = gather->getAttr(gpu::originAttr))
+        value.getDefiningOp()->setAttr(gpu::originAttr, origin);
+      gather.getResult().replaceAllUsesWith(value);
+      gather.erase();
+      continue;
+    }
     if (value.getType() != gather.getResult().getType()) {
       auto reassociation = gpu::inferReshapeReassociation(
           cast<gpu::FragmentType>(value.getType()), result);
