@@ -334,6 +334,11 @@ LogicalResult bindStructurallyRequiredStaticFragments(func::FuncOp kernel) {
           resultProduct.parameterCount == 0 && resultProduct.constant > 1 &&
           sourceProduct.constant == resultProduct.constant)
         fixedAxes.emplace_back(reshape.getResult(), resultAxes.front());
+      if (sourceAxes.size() == 1 && resultAxes.size() > 1 &&
+          sourceProduct.parameterCount == 0 && resultProduct.parameterCount == 0 &&
+          sourceProduct.constant == resultProduct.constant)
+        for (int64_t axis : resultAxes)
+          fixedAxes.emplace_back(reshape.getResult(), axis);
       if (sourceProduct.parameterCount != 1 ||
           resultProduct.parameterCount != 0 ||
           resultProduct.constant % sourceProduct.constant != 0)
@@ -1300,6 +1305,75 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
       selectedResult.getResultNumber() >= producer->getNumResults())
     return producer->emitOpError(
         "pointwise replay has no exact producer result occurrence");
+  if (auto reshape = dyn_cast<ReshapeOp>(producer)) {
+    auto original = cast<FragmentType>(value.getType());
+    auto target = cast<FragmentType>(replaceTraversalExtent(
+        original, source, traversalDimensions, blockedExtent));
+    SmallVector<unsigned> changedAxes;
+    for (auto [axis, extent] : llvm::enumerate(original.getShape()))
+      if (extent != target.getShape()[axis])
+        changedAxes.push_back(axis);
+    if (changedAxes.size() == 1) {
+      unsigned axis = changedAxes.front();
+      unsigned resultRank = 0;
+      for (Attribute attribute : reshape.getReassociation())
+        resultRank += cast<ReshapeGroupAttr>(attribute).getResultAxes().size();
+      unsigned prefix = original.getShape().size() - resultRank;
+      bool split = llvm::any_of(reshape.getReassociation(), [&](Attribute attribute) {
+        auto group = cast<ReshapeGroupAttr>(attribute);
+        return group.getResultAxes().size() > 1 &&
+               llvm::is_contained(group.getResultAxes().asArrayRef(),
+                                  static_cast<int64_t>(axis) - prefix);
+      });
+      auto extent = cast<PhysicalExprAttr>(original.getShape()[axis]);
+      auto size = constantLogicalRangeCardinality(blocked);
+      auto begin = queryLaunchExpression(blocked.getLogicalStart());
+      if (split && size && isUnitStepRange(blocked) &&
+          extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          extent.getValue() == *size && begin &&
+          begin.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          begin.getValue() == 0 && DominanceInfo(kernel).dominates(value, insertionAnchor)) {
+        // A split axis cannot be tiled by changing the reshape's lane count.
+        // Extract the requested subset instead; access composition can pull
+        // this gather through the row-major reshape and its pointwise inputs.
+        auto axisMap = cast<AxisMapAttr>(original.getAxisMaps()[axis]);
+        auto coordinate = FragmentType::get(
+            kernel.getContext(), builder.getIndexType(), builder.getArrayAttr({blockedExtent}),
+            builder.getArrayAttr({AxisMapAttr::get(
+                kernel.getContext(), axisMap.getSourceId(), axisMap.getSourceAxis(),
+                axisMap.getDimensionId(), 0, axisMap.getDerived())}),
+            original.getValidity(), original.getOwner());
+        auto identity = builder.getArrayAttr({ReshapeGroupAttr::get(
+            kernel.getContext(), builder.getDenseI64ArrayAttr({0}),
+            builder.getDenseI64ArrayAttr({0}))});
+        Value indices = builder.create<ReshapeOp>(
+            reshape.getLoc(), coordinate, blockedRange, identity);
+        Value stop = builder.create<arith::ConstantIndexOp>(reshape.getLoc(), *size);
+        Value valid = builder.create<CompareOp>(
+            reshape.getLoc(), predicateType(coordinate), indices,
+            builder.create<BroadcastOp>(reshape.getLoc(), coordinate, stop),
+            ComparePredicate::Lt);
+        Value zero = builder.create<arith::ConstantIndexOp>(reshape.getLoc(), 0);
+        Value nonnegative = builder.create<CompareOp>(
+            reshape.getLoc(), predicateType(coordinate), indices,
+            builder.create<BroadcastOp>(reshape.getLoc(), coordinate, zero),
+            ComparePredicate::Ge);
+        valid = builder.create<BinaryOp>(reshape.getLoc(), predicateType(coordinate),
+                                          valid, nonnegative, BinaryOperator::LogicalAnd);
+        auto projected = projectPredicateToFragmentAxis(builder, reshape.getLoc(), valid, target, axis);
+        auto fill = materializeZeroFragment(builder, reshape.getLoc(), target);
+        if (failed(projected) || failed(fill))
+          return failure();
+        auto selected = builder.create<GatherOp>(
+            reshape.getLoc(), target, value, ValueRange{indices}, *projected, *fill,
+            ArrayRef<int64_t>{static_cast<int64_t>(axis)});
+        if (Attribute origin = reshape->getAttr(originAttr))
+          selected->setAttr(originAttr, origin);
+        mapping.map(value, selected.getResult());
+        return selected.getResult();
+      }
+    }
+  }
   if (auto range = dyn_cast<MakeRangeOp>(producer)) {
     FailureOr<int64_t> rangeDimension = queryRangeDimension(range);
     if (sourceAxisIdentity(range) == source &&
@@ -1414,7 +1488,8 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
             bool renamedAxis =
                 input.getShape()[*axis] ==
                     output.getShape()[requested.fragmentAxis];
-            if ((axisMap.getDimensionId() == *blockedDimension || renamedAxis) &&
+            if (renamedAxis ||
+                (axisMap.getDimensionId() == *blockedDimension &&
                 ranges.state != PhysicalFactState::Unknown &&
                 ranges.blockers.empty() &&
                 PhysicalProgramAnalysis(kernel).lockstepRanges(ranges.roots).isExact() &&
@@ -1431,7 +1506,7 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
                                          *sourceSize == *targetSize;
                   return (sameExtent || sameBounds || sameCardinality) &&
                          samePhysicalScalarExpression(range.getStep(), blocked.getStep());
-                })) {
+                }))) {
               // An explicit projection can rename an exact coordinate traversal.
               operandSource = sourceAxisIdentity(axisMap);
               for (int64_t &dimension : operandDimensions)
@@ -3509,6 +3584,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     return failure();
   func::FuncOp kernel = *physicalKernel;
   auto finalizeValueRelations = [&]() -> LogicalResult {
+    if (failed(bindStructurallyRequiredStaticFragments(kernel)))
+      return failure();
     if (failed(alignStructuredCaptureRelations(kernel)) ||
         failed(alignReductionResultRelations(kernel)) ||
         failed(alignReductionIdentityRelations(kernel)) ||
@@ -5990,8 +6067,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     return failure();
   }
   if (failed(alignContractValueRelations(kernel)))
-    return failure();
-  if (failed(bindStructurallyRequiredStaticFragments(kernel)))
     return failure();
   return finalizeValueRelations();
 }

@@ -360,6 +360,8 @@ public:
                                              bool allowRangeGuards = false);
   PhysicalAccessBoundsFact accessBounds(mlir::Operation *access);
   PhysicalBufferDataflowFact bufferDataflow(mlir::Value buffer);
+  bool isProgramOwnedRange(MakeRangeOp range) const;
+  bool hasDisjointWorkspaceSlices(mlir::Value buffer) const;
 
   /// Recognizes a predicate composed only from exact range-bound comparisons,
   /// predicate-preserving shape operations and boolean conjunction.  This is

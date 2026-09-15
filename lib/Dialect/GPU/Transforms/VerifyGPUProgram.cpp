@@ -154,9 +154,9 @@ LogicalResult verifyBufferDataflow(func::FuncOp kernel,
           return expression.getKind() ==
                      static_cast<uint32_t>(PhysicalExprKind::Constant) &&
                  expression.getValue() == 1;
-        }))
+        }) && !analysis.hasDisjointWorkspaceSlices(argument))
       return kernel.emitError(
-          "workspace ownership across multiple program instances is not implemented");
+          "workspace accesses have no proven disjoint program slices");
     PhysicalBufferDataflowFact fact = analysis.bufferDataflow(argument);
     if (!fact.isExact()) {
       InFlightDiagnostic diagnostic = kernel.emitError(

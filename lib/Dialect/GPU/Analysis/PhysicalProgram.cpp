@@ -1138,8 +1138,114 @@ bool hasUpperTailGuard(Value predicate, Value coordinate,
          valueMatchesExtent(stripBroadcast(compare.getRhs()), extent);
 }
 
+bool isExclusiveProgramRange(MakeRangeOp range, func::FuncOp kernel) {
+  if (!range || integerConstant(range.getLogicalStart()) != 0 ||
+      integerConstant(range.getStep()) != 1)
+    return false;
+  Value extent = stripScalarIdentity(range.getExtent());
+  if (auto expression = extent.getDefiningOp<PhysicalExprOp>();
+      expression && expression.getExpression().getKind() ==
+          static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
+    auto parameter = queryParameterBySymbol(kernel, expression.getExpression().getSymbol());
+    if (failed(parameter))
+      return false;
+    extent = parameter->getResult();
+  }
+  bool positive = integerConstant(extent).value_or(0) > 0;
+  if (auto parameter = extent.getDefiningOp<ParameterOp>())
+    positive = llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
+                           [](int64_t value) { return value > 0; });
+  auto multiply = stripScalarIdentity(range.getStart()).getDefiningOp<BinaryOp>();
+  if (!positive || !multiply ||
+      multiply.getOperatorKind() != BinaryOperator::Multiply)
+    return false;
+  Value coordinate;
+  if (sameScalarExpression(multiply.getLhs(), extent))
+    coordinate = stripScalarIdentity(multiply.getRhs());
+  else if (sameScalarExpression(multiply.getRhs(), extent))
+    coordinate = stripScalarIdentity(multiply.getLhs());
+  auto delinearize = coordinate ? coordinate.getDefiningOp<DelinearizeOp>() : DelinearizeOp();
+  if (!delinearize || delinearize.getNumResults() != 1 ||
+      delinearize.getLaunchExtents().size() != 1)
+    return false;
+  auto program = delinearize.getLinear().getDefiningOp<ProgramIdOp>();
+  auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
+  if (!program || program.getAxis() != 0 || !space || space.empty() ||
+      space[0] != delinearize.getLaunchExtents()[0])
+    return false;
+  for (Attribute attribute : space.getValue().drop_front()) {
+    auto expression = cast<PhysicalExprAttr>(attribute);
+    if (expression.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+        expression.getValue() != 1)
+      return false;
+  }
+  auto launch = cast<PhysicalExprAttr>(space[0]);
+  return launch.getKind() == static_cast<uint32_t>(PhysicalExprKind::CeilDiv) &&
+         launch.getOperands().size() == 2 &&
+         launch.getOperands()[0] == queryLaunchExpression(range.getLogicalStop()) &&
+         launch.getOperands()[1] == queryLaunchExpression(extent);
+}
+
+Value stripRangeProjection(Value value) {
+  Value original = value;
+  SmallVector<Operation *> projections;
+  while (value) {
+    if (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
+      projections.push_back(broadcast);
+      value = broadcast.getValue();
+      continue;
+    }
+    auto reshape = value.getDefiningOp<ReshapeOp>();
+    if (!reshape || llvm::any_of(reshape.getReassociation(), [](Attribute attribute) {
+          auto group = cast<ReshapeGroupAttr>(attribute);
+          return group.getSourceAxes().size() > 1 || group.getResultAxes().size() > 1;
+        }))
+      break;
+    projections.push_back(reshape);
+    value = reshape.getValue();
+  }
+  auto range = value.getDefiningOp<MakeRangeOp>();
+  if (!range)
+    return original;
+  unsigned axis = 0;
+  for (Operation *operation : llvm::reverse(projections)) {
+    auto input = cast<FragmentType>(operation->getOperand(0).getType());
+    auto output = cast<FragmentType>(operation->getResult(0).getType());
+    std::optional<unsigned> projected;
+    if (auto reshape = dyn_cast<ReshapeOp>(operation)) {
+      unsigned rank = 0;
+      for (Attribute attribute : reshape.getReassociation())
+        rank += cast<ReshapeGroupAttr>(attribute).getSourceAxes().size();
+      unsigned prefix = input.getShape().size() - rank;
+      if (axis < prefix)
+        projected = axis;
+      else
+        for (Attribute attribute : reshape.getReassociation()) {
+          auto group = cast<ReshapeGroupAttr>(attribute);
+          if (group.getSourceAxes().size() == 1 && group.getResultAxes().size() == 1 &&
+              group.getSourceAxes()[0] + prefix == axis)
+            projected = group.getResultAxes()[0] + prefix;
+        }
+    } else {
+      auto mapping = queryAxisProjection(input, output);
+      if (mapping.isExact())
+        for (auto [position, source] : llvm::enumerate(mapping.targetToSource))
+          if (source && *source == axis) {
+            if (projected)
+              return original;
+            projected = position;
+          }
+    }
+    if (!projected || input.getShape()[axis] != output.getShape()[*projected])
+      return original;
+    axis = *projected;
+  }
+  return value;
+}
+
 bool unconditionalStoreCoversBuffer(Operation *operation, Value buffer,
-                                    ArrayRef<LoopCoordinate> loops) {
+                                    ArrayRef<LoopCoordinate> loops,
+                                    Operation *read) {
   ValueRange coordinates;
   ArrayRef<int64_t> sourceAxes;
   Value valid;
@@ -1184,6 +1290,19 @@ bool unconditionalStoreCoversBuffer(Operation *operation, Value buffer,
     });
     auto bufferExtent = cast<PhysicalExprAttr>(type.getShape()[sourceAxis]);
     if (loop == loops.end()) {
+      auto readLoad = dyn_cast_if_present<LoadOp>(read);
+      if (range && readLoad &&
+          isExclusiveProgramRange(range, operation->getParentOfType<func::FuncOp>()) &&
+          valueMatchesExtent(range.getLogicalStop(), bufferExtent)) {
+        auto position = llvm::find(readLoad.getSourceAxes(), sourceAxis);
+        if (position == readLoad.getSourceAxes().end() ||
+            !sameScalarExpression(coordinate, stripRangeProjection(readLoad.getCoordinates()[
+                position - readLoad.getSourceAxes().begin()])))
+          return false;
+        tails.emplace_back(range, range.getLogicalStop());
+        hasWholeAxis = true;
+        continue;
+      }
       if (!range || integerConstant(range.getStart()) != 0 ||
           integerConstant(range.getLogicalStart()) != 0 ||
           integerConstant(range.getStep()) != 1 ||
@@ -1247,17 +1366,19 @@ bool unconditionalStoreCoversBuffer(Operation *operation, Value buffer,
 }
 
 bool regionInitializesBuffer(Region &region, Value buffer,
-                             SmallVectorImpl<LoopCoordinate> &loops);
+                             SmallVectorImpl<LoopCoordinate> &loops,
+                             Operation *read);
 
 bool operationInitializesBuffer(Operation *operation, Value buffer,
-                                SmallVectorImpl<LoopCoordinate> &loops) {
-  if (unconditionalStoreCoversBuffer(operation, buffer, loops))
+                                SmallVectorImpl<LoopCoordinate> &loops,
+                                Operation *read) {
+  if (unconditionalStoreCoversBuffer(operation, buffer, loops, read))
     return true;
   if (auto loop = dyn_cast<scf::ForOp>(operation)) {
     loops.push_back(
         {loop.getInductionVar(), loop.getLowerBound(), loop.getUpperBound(),
          loop.getStep()});
-    bool initializes = regionInitializesBuffer(loop.getRegion(), buffer, loops);
+    bool initializes = regionInitializesBuffer(loop.getRegion(), buffer, loops, read);
     loops.pop_back();
     return initializes;
   }
@@ -1266,18 +1387,19 @@ bool operationInitializesBuffer(Operation *operation, Value buffer,
       return false;
     SmallVector<LoopCoordinate> thenLoops(loops.begin(), loops.end());
     SmallVector<LoopCoordinate> elseLoops(loops.begin(), loops.end());
-    return regionInitializesBuffer(branch.getThenRegion(), buffer, thenLoops) &&
-           regionInitializesBuffer(branch.getElseRegion(), buffer, elseLoops);
+    return regionInitializesBuffer(branch.getThenRegion(), buffer, thenLoops, read) &&
+           regionInitializesBuffer(branch.getElseRegion(), buffer, elseLoops, read);
   }
   return false;
 }
 
 bool regionInitializesBuffer(Region &region, Value buffer,
-                             SmallVectorImpl<LoopCoordinate> &loops) {
+                             SmallVectorImpl<LoopCoordinate> &loops,
+                             Operation *read) {
   if (!llvm::hasSingleElement(region))
     return false;
   for (Operation &operation : region.front())
-    if (operationInitializesBuffer(&operation, buffer, loops))
+    if (operationInitializesBuffer(&operation, buffer, loops, read))
       return true;
   return false;
 }
@@ -1302,7 +1424,7 @@ bool precedingRegionInitializesBuffer(Operation *read, Value buffer,
         !dominance.properlyDominates(candidate, read))
       continue;
     SmallVector<LoopCoordinate> loops;
-    if (operationInitializesBuffer(candidate, buffer, loops))
+    if (operationInitializesBuffer(candidate, buffer, loops, read))
       return true;
   }
   return false;
@@ -3840,14 +3962,20 @@ PhysicalReplayFact PhysicalProgramAnalysis::replayability(
 PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
     Value value, PhysicalSourceAxis source,
     std::optional<int64_t> sourceDimension) {
-  SmallPtrSet<Operation *, 32> visited;
-  std::function<PhysicalReductionDependencyFact(Value)> analyze =
-      [&](Value current) -> PhysicalReductionDependencyFact {
+  using Traversal = std::pair<PhysicalSourceAxis, std::optional<int64_t>>;
+  llvm::DenseMap<Value, SmallVector<Traversal, 2>> visited;
+  std::function<PhysicalReductionDependencyFact(Value, PhysicalSourceAxis,
+                                               std::optional<int64_t>)> analyze =
+      [&](Value current, PhysicalSourceAxis source,
+          std::optional<int64_t> sourceDimension) -> PhysicalReductionDependencyFact {
     PhysicalReductionDependencyFact exact;
     exact.state = PhysicalFactState::Exact;
     Operation *operation = current.getDefiningOp();
-    if (!operation || !visited.insert(operation).second)
+    auto &contexts = visited[current];
+    Traversal context{source, sourceDimension};
+    if (!operation || llvm::is_contained(contexts, context))
       return exact;
+    contexts.push_back(context);
     if (auto range = dyn_cast<MakeRangeOp>(operation)) {
       // Reaching a coordinate proves an ordinary value dependency, not a
       // reduction dependency.  Only an operation that removes or carries this
@@ -3932,7 +4060,7 @@ PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
       unsigned index = result.getResultNumber();
       for (Value related :
            {loop.getInitArgs()[index], yield.getResults()[index]}) {
-        PhysicalReductionDependencyFact nested = analyze(related);
+        PhysicalReductionDependencyFact nested = analyze(related, source, sourceDimension);
         if (nested.depends)
           return nested;
         if (!nested.isExact()) {
@@ -3948,17 +4076,60 @@ PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
       return exact;
     }
     for (Value operand : operation->getOperands()) {
-      PhysicalReductionDependencyFact nested = analyze(operand);
-      if (nested.depends)
-        return nested;
-      if (!nested.isExact()) {
-        exact.state = PhysicalFactState::Unknown;
-        llvm::append_range(exact.blockers, nested.blockers);
+      SmallVector<Traversal, 4> traversals{context};
+      auto input = dyn_cast<FragmentType>(operand.getType());
+      auto output = dyn_cast<FragmentType>(current.getType());
+      auto requested = output ? queryFragmentAxis(output, source) : PhysicalAxisProjection{};
+      if (input && requested.isExact() &&
+          (!sourceDimension || requested.dimensionId == *sourceDimension)) {
+        SmallVector<unsigned> inputAxes;
+        if (auto reshape = dyn_cast<ReshapeOp>(operation)) {
+          unsigned sourceRank = 0, resultRank = 0;
+          for (Attribute attribute : reshape.getReassociation()) {
+            auto group = cast<ReshapeGroupAttr>(attribute);
+            sourceRank += group.getSourceAxes().size();
+            resultRank += group.getResultAxes().size();
+          }
+          unsigned sourcePrefix = input.getShape().size() - sourceRank;
+          unsigned resultPrefix = output.getShape().size() - resultRank;
+          if (requested.fragmentAxis < resultPrefix && sourcePrefix == resultPrefix)
+            inputAxes.push_back(requested.fragmentAxis);
+          else
+            for (Attribute attribute : reshape.getReassociation()) {
+              auto group = cast<ReshapeGroupAttr>(attribute);
+              if (llvm::is_contained(group.getResultAxes().asArrayRef(),
+                    static_cast<int64_t>(requested.fragmentAxis) - resultPrefix))
+                for (int64_t axis : group.getSourceAxes().asArrayRef())
+                  inputAxes.push_back(sourcePrefix + axis);
+            }
+        } else if (auto transpose = dyn_cast<TransposeOp>(operation)) {
+          inputAxes.push_back(transpose.getPermutation()[requested.fragmentAxis]);
+        } else if (isa<BroadcastOp, UnaryOp, BinaryOp, CompareOp, SelectOp,
+                       CastOp, BitcastOp>(operation)) {
+          auto projection = queryAxisProjection(input, output);
+          if (projection.isExact() && projection.targetToSource[requested.fragmentAxis])
+            inputAxes.push_back(*projection.targetToSource[requested.fragmentAxis]);
+        }
+        for (unsigned axis : inputAxes) {
+          auto mapping = cast<AxisMapAttr>(input.getAxisMaps()[axis]);
+          Traversal projected{sourceAxisIdentity(mapping), mapping.getDimensionId()};
+          if (!llvm::is_contained(traversals, projected))
+            traversals.push_back(projected);
+        }
+      }
+      for (auto [selected, dimension] : traversals) {
+        PhysicalReductionDependencyFact nested = analyze(operand, selected, dimension);
+        if (nested.depends)
+          return nested;
+        if (!nested.isExact()) {
+          exact.state = PhysicalFactState::Unknown;
+          llvm::append_range(exact.blockers, nested.blockers);
+        }
       }
     }
     return exact;
   };
-  return analyze(value);
+  return analyze(value, source, sourceDimension);
 }
 
 bool PhysicalProgramAnalysis::isTailPredicate(
@@ -4388,6 +4559,52 @@ PhysicalProgramAnalysis::accessBounds(Operation *access) {
                accessFact.validity ? accessFact.validity.getDefiningOp()
                                    : access);
   return result;
+}
+
+bool PhysicalProgramAnalysis::isProgramOwnedRange(MakeRangeOp range) const {
+  return isExclusiveProgramRange(range, kernel);
+}
+
+bool PhysicalProgramAnalysis::hasDisjointWorkspaceSlices(Value buffer) const {
+  auto type = dyn_cast<BufferType>(buffer.getType());
+  if (!type)
+    return false;
+  for (unsigned axis = 0; axis < type.getShape().size(); ++axis) {
+    MakeRangeOp owner;
+    bool consistent = true;
+    for (Operation *user : buffer.getUsers()) {
+      ValueRange coordinates;
+      ArrayRef<int64_t> sourceAxes;
+      if (auto load = dyn_cast<LoadOp>(user)) {
+        coordinates = load.getCoordinates();
+        sourceAxes = load.getSourceAxes();
+      } else if (auto store = dyn_cast<StoreOp>(user)) {
+        coordinates = store.getCoordinates();
+        sourceAxes = store.getSourceAxes();
+      } else if (isa<DimOp, AssumeInBoundsOp>(user)) {
+        continue;
+      } else {
+        consistent = false;
+        break;
+      }
+      auto position = llvm::find(sourceAxes, axis);
+      auto range = position == sourceAxes.end() ? MakeRangeOp() :
+          stripRangeProjection(coordinates[position - sourceAxes.begin()])
+              .getDefiningOp<MakeRangeOp>();
+      if (!range || !isExclusiveProgramRange(range, kernel) ||
+          queryLaunchExpression(range.getLogicalStop()) != type.getShape()[axis] ||
+          (owner && (!sameLogicalRange(owner, range) ||
+                     !sameScalarExpression(owner.getStart(), range.getStart()) ||
+                     !sameScalarExpression(owner.getExtent(), range.getExtent())))) {
+        consistent = false;
+        break;
+      }
+      owner = range;
+    }
+    if (consistent && owner)
+      return true;
+  }
+  return false;
 }
 
 PhysicalBufferDataflowFact

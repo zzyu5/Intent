@@ -61,7 +61,7 @@ template <typename Emit>
 LogicalResult buildStoreTraversal(OpBuilder &builder, Location location,
                                   ArrayRef<MakeRangeOp> ranges,
                                   ArrayRef<std::pair<MakeRangeOp, unsigned>> roots, Value rowChunk,
-                                  FragmentType payload, Emit emit) {
+                                  FragmentType payload, unsigned chunkAxis, Emit emit) {
   OpBuilder::InsertionGuard guard(builder);
   IRMapping mapping;
   SmallVector<Value> coordinates;
@@ -69,33 +69,41 @@ LogicalResult buildStoreTraversal(OpBuilder &builder, Location location,
   for (unsigned axis = 0; axis < ranges.size(); ++axis) {
     MakeRangeOp range = ranges[axis];
     Value chunk = rowChunk;
-    if (axis != 0)
+    if (axis != chunkAxis)
       chunk = builder.create<PhysicalExprOp>(
           location, builder.getIndexType(),
           cast<PhysicalExprAttr>(payload.getShape()[axis]));
     Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
     Value one = builder.create<arith::ConstantIndexOp>(location, 1);
-    Value stop = builder.create<PhysicalExprOp>(
-        location, builder.getIndexType(),
-        queryLaunchExpression(range.getLogicalStop()));
-    Value start = zero;
-    if (axis == 0) {
+    Value stop;
+    if (auto constant = dyn_cast_or_null<IntegerAttr>(
+            UniformValueAnalysis(describeUniformValue).evaluate(range.getLogicalStop())))
+      stop = builder.create<arith::ConstantIndexOp>(location, constant.getInt());
+    else
+      stop = builder.create<PhysicalExprOp>(location, builder.getIndexType(),
+                                           queryLaunchExpression(range.getLogicalStop()));
+    Value start = isZero(range.getStart()) ? zero : range.getStart();
+    if (axis == chunkAxis) {
       auto loop = builder.create<scf::ForOp>(location, zero, stop, chunk);
       builder.setInsertionPointToStart(loop.getBody());
       start = loop.getInductionVar();
     }
     auto original = range.getResult().getType();
+    auto axisMap = cast<AxisMapAttr>(payload.getAxisMaps()[axis]);
     auto type = FragmentType::get(
         builder.getContext(), original.getElementType(),
         builder.getArrayAttr({queryLaunchExpression(chunk)}),
-        original.getAxisMaps(), original.getValidity(), original.getOwner());
+        builder.getArrayAttr({AxisMapAttr::get(builder.getContext(),
+            axisMap.getSourceId(), axisMap.getSourceAxis(), axisMap.getDimensionId(),
+            0, axisMap.getDerived())}), original.getValidity(), original.getOwner());
     auto current = builder.create<MakeRangeOp>(
-        location, type, start, chunk, one, zero, stop, range.getSourceId(),
-        range.getSourceAxis(), range.getDerived());
+        location, type, start, chunk, one, zero, stop, axisMap.getSourceId(),
+        axisMap.getSourceAxis(), axisMap.getDerived());
     for (auto [root, rootAxis] : roots) {
       if (rootAxis != axis)
         continue;
-      if (sameLogicalRange(root, range)) {
+      if (sameLogicalRange(root, current) &&
+          root.getResult().getType().getAxisMaps() == type.getAxisMaps()) {
         mapping.map(root.getResult(), current.getResult());
         continue;
       }
@@ -108,7 +116,8 @@ LogicalResult buildStoreTraversal(OpBuilder &builder, Location location,
           root.getLogicalStop(), root.getSourceId(), root.getSourceAxis(), root.getDerived());
       mapping.map(root.getResult(), equivalent);
     }
-    mapping.map(range.getResult(), current.getResult());
+    if (!mapping.contains(range.getResult()))
+      mapping.map(range.getResult(), current.getResult());
     coordinates.push_back(current);
     auto boolean = FragmentType::get(
         builder.getContext(), builder.getI1Type(), type.getShape(),
@@ -329,7 +338,7 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
   options.fragmentAxis = 0;
   options.traversalRanges = rowRoots;
   LogicalResult initialized = buildStoreTraversal(
-      builder, store.getLoc(), ranges, rootBindings, chunk, blocked,
+      builder, store.getLoc(), ranges, rootBindings, chunk, blocked, 0,
       [&](OpBuilder &nested, IRMapping &mapping, ValueRange coordinates,
           Value valid) -> LogicalResult {
         for (const auto &entry : constantValues.getValueMap())
@@ -347,7 +356,7 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
     return failure();
   builder.setInsertionPoint(store);
   LogicalResult copied = buildStoreTraversal(
-      builder, store.getLoc(), ranges, rootBindings, chunk, blocked,
+      builder, store.getLoc(), ranges, rootBindings, chunk, blocked, 0,
       [&](OpBuilder &nested, IRMapping &mapping, ValueRange coordinates,
           Value valid) -> LogicalResult {
         if (store.getValid()) {
@@ -384,17 +393,47 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
   Value source = gather.getSource();
   auto payload = dyn_cast<FragmentType>(source.getType());
   auto result = dyn_cast<FragmentType>(gather.getResult().getType());
-  if (!payload || !result || payload.getShape().size() != 1 ||
-      result.getShape().size() != 1 || gather.getCoordinates().size() != 1 ||
-      gather.getSourceAxes() != ArrayRef<int64_t>{0})
+  if (!payload || !result ||
+      gather.getCoordinates().size() != payload.getShape().size() ||
+      !isa<FloatType, IntegerType>(payload.getElementType()))
     return false;
-  auto full = cast<PhysicalExprAttr>(payload.getShape()[0]);
-  auto chunkExtent = cast<PhysicalExprAttr>(result.getShape()[0]);
+  unsigned rank = payload.getShape().size();
+  unsigned chunkAxis = 0;
+  int64_t largest = 0;
+  for (auto [axis, attribute] : llvm::enumerate(payload.getShape())) {
+    auto extent = cast<PhysicalExprAttr>(attribute);
+    if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+        extent.getValue() > largest) {
+      largest = extent.getValue();
+      chunkAxis = axis;
+    }
+  }
+  auto full = cast<PhysicalExprAttr>(payload.getShape()[chunkAxis]);
   auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
-  if (full.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
-      full.getValue() <= capabilities.getRegistersPerUnit() || full == chunkExtent ||
-      (chunkExtent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter) &&
-       chunkExtent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant)))
+  if (full.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant))
+    return false;
+  int64_t footprint = std::max(1u,
+      (payload.getElementType().getIntOrFloatBitWidth() + 31) / 32);
+  for (Attribute attribute : payload.getShape()) {
+    auto extent = cast<PhysicalExprAttr>(attribute);
+    int64_t minimum;
+    if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant)) {
+      minimum = extent.getValue();
+    } else if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
+      auto parameter = queryParameterBySymbol(kernel, extent.getSymbol());
+      if (failed(parameter))
+        return false;
+      minimum = *llvm::min_element(parameter->getParameter().getCandidates().asArrayRef());
+    } else {
+      return false;
+    }
+    if (minimum <= 0)
+      return false;
+    footprint = std::min<__int128>(
+        static_cast<__int128>(footprint) * minimum,
+        static_cast<__int128>(capabilities.getRegistersPerUnit()) + 1);
+  }
+  if (footprint <= capabilities.getRegistersPerUnit())
     return false;
   Operation *definition = source.getDefiningOp();
   if (!definition)
@@ -403,23 +442,95 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
   for (Operation *user : source.getUsers()) {
     auto reader = dyn_cast<GatherOp>(user);
     if (!reader || reader.getSource() != source ||
-        reader.getSourceAxes() != ArrayRef<int64_t>{0})
+        reader.getCoordinates().size() != rank)
       return false;
     readers.push_back(reader);
   }
   PhysicalProgramAnalysis analysis(kernel);
-  PhysicalRangeFact ranges = analysis.axisRanges(source, 0);
-  FailureOr<MakeRangeOp> range = queryExactLogicalRange(ranges);
-  if (failed(range) || ranges.roots.empty() || !isZero((*range).getStart()) ||
-      !isZero((*range).getLogicalStart()) || !isUnitStepRange(*range) ||
-      queryLaunchExpression((*range).getLogicalStop()) != full)
+  SmallVector<MakeRangeOp> ranges;
+  SmallVector<std::pair<MakeRangeOp, unsigned>> rootBindings;
+  SmallVector<MakeRangeOp> traversalRoots;
+  SmallVector<Attribute> shape;
+  SmallVector<unsigned> ownedAxes;
+  for (unsigned axis = 0; axis < rank; ++axis) {
+    auto facts = analysis.axisRanges(source, axis);
+    if (facts.roots.empty() || !facts.blockers.empty() ||
+        !analysis.lockstepRanges(facts.roots).isExact())
+      return false;
+    MakeRangeOp range = facts.roots.front();
+    if (!isZero(range.getLogicalStart()) || !isUnitStepRange(range))
+      return false;
+    auto extent = queryLaunchExpression(range.getLogicalStop());
+    if (auto constant = dyn_cast_or_null<IntegerAttr>(
+            UniformValueAnalysis(describeUniformValue).evaluate(range.getLogicalStop())))
+      extent = PhysicalExprAttr::get(kernel.getContext(),
+          static_cast<uint32_t>(PhysicalExprKind::Constant), constant.getInt(),
+          StringAttr::get(kernel.getContext(), ""), ArrayAttr::get(kernel.getContext(), {}));
+    if (!extent ||
+        (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+         extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Dimension)))
+      return false;
+    if (analysis.isProgramOwnedRange(range))
+      ownedAxes.push_back(axis);
+    else if (!isZero(range.getStart()) || extent != payload.getShape()[axis])
+      return false;
+    ranges.push_back(range);
+    shape.push_back(extent);
+    for (MakeRangeOp root : facts.roots) {
+      rootBindings.emplace_back(root, axis);
+      if (axis == chunkAxis)
+        traversalRoots.push_back(root);
+    }
+  }
+  if (llvm::any_of(ownedAxes, [&](unsigned axis) { return axis >= chunkAxis; }))
     return false;
-  PhysicalSourceAxis axis = sourceAxisIdentity(*range);
+  auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
+  if (ownedAxes.empty() && !llvm::all_of(space, [](Attribute attribute) {
+        auto extent = cast<PhysicalExprAttr>(attribute);
+        return extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+               extent.getValue() == 1;
+      }))
+    return false;
+  auto ordinalRange = [](Value value) {
+    while (value) {
+      if (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
+        value = broadcast.getValue();
+        continue;
+      }
+      if (auto reshape = value.getDefiningOp<ReshapeOp>()) {
+        if (llvm::any_of(reshape.getReassociation(), [](Attribute attribute) {
+              auto group = cast<ReshapeGroupAttr>(attribute);
+              return group.getSourceAxes().size() > 1 || group.getResultAxes().size() > 1;
+            }))
+          return MakeRangeOp();
+        value = reshape.getValue();
+        continue;
+      }
+      break;
+    }
+    return value.getDefiningOp<MakeRangeOp>();
+  };
+  for (GatherOp reader : readers)
+    for (unsigned axis : ownedAxes) {
+      auto position = llvm::find(reader.getSourceAxes(), axis);
+      if (position == reader.getSourceAxes().end())
+        return false;
+      auto ordinal = ordinalRange(reader.getCoordinates()[position - reader.getSourceAxes().begin()]);
+      if (!ordinal || !isZero(ordinal.getStart()) ||
+          !isZero(ordinal.getLogicalStart()) || !isUnitStepRange(ordinal) ||
+          queryLaunchExpression(ordinal.getExtent()) != queryLaunchExpression(ranges[axis].getExtent()) ||
+          queryLaunchExpression(ordinal.getLogicalStop()) != queryLaunchExpression(ranges[axis].getExtent()))
+        return false;
+    }
+  Operation *insertionAnchor = definition->getNextNode();
+  if (!insertionAnchor)
+    return false;
+  PhysicalSourceAxis axis = sourceAxisIdentity(ranges[chunkAxis]);
   auto replay = analysis.replayability(source, axis, PhysicalReplayScope::ValueGraph,
-                                      /*allowAccesses=*/true, definition);
+                                      /*allowAccesses=*/true, insertionAnchor);
   if (!replay.isReplayable() || llvm::any_of(replay.accesses, [&](Operation *access) {
         auto load = dyn_cast<LoadOp>(access);
-        return !load || !canReplayReadAt(load, definition);
+        return !load || !canReplayReadAt(load, insertionAnchor);
       }))
     return false;
   SmallVector<Value> dependencies{source};
@@ -432,8 +543,26 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
       return false;
     dependencies.append(producer->getOperands().begin(), producer->getOperands().end());
   }
-  OpBuilder builder(definition);
+  OpBuilder builder(insertionAnchor);
+  PhysicalExprAttr chunkExtent;
   Value chunk;
+  bool readerChunk = rank == 1 && result.getShape().size() == 1;
+  if (readerChunk) {
+    chunkExtent = cast<PhysicalExprAttr>(result.getShape()[0]);
+    if (chunkExtent == full)
+      return false;
+  }
+  Value workspace = createInvocationWorkspace(kernel, gather.getLoc(), payload,
+                                              builder.getArrayAttr(shape));
+  if (!readerChunk) {
+    auto instance = cast<BufferType>(workspace.getType()).getInstance();
+    auto parameter = getOrCreatePhysicalParameter(kernel,
+        ("MATERIALIZE_AXIS_" + Twine(instance)).str(),
+        ParameterRole::ReductionOuter, ParameterCategory::Reduction,
+        payload.getElementType().getIntOrFloatBitWidth(),
+        {64, 128, 256, 512, 1024, 2048});
+    chunkExtent = queryLaunchExpression(parameter);
+  }
   if (chunkExtent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
     FailureOr<ParameterOp> parameter = queryParameterBySymbol(kernel, chunkExtent.getSymbol());
     if (failed(parameter))
@@ -442,37 +571,79 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
   } else {
     chunk = builder.create<arith::ConstantIndexOp>(gather.getLoc(), chunkExtent.getValue());
   }
-  Value workspace = createInvocationWorkspace(kernel, gather.getLoc(), payload,
-                                              builder.getArrayAttr({full}));
+  SmallVector<Attribute> blockedShape(payload.getShape().begin(), payload.getShape().end());
+  blockedShape[chunkAxis] = chunkExtent;
   auto blocked = FragmentType::get(kernel.getContext(), payload.getElementType(),
-      builder.getArrayAttr({chunkExtent}), payload.getAxisMaps(),
+      builder.getArrayAttr(blockedShape), payload.getAxisMaps(),
       payload.getValidity(), payload.getOwner());
   ReplayMaterializationOptions options;
-  options.fragmentAxis = 0;
-  options.traversalRanges = ranges.roots;
+  options.fragmentAxis = chunkAxis;
+  options.traversalRanges = traversalRoots;
   options.materializeZeroFill = true;
-  SmallVector<std::pair<MakeRangeOp, unsigned>> rootBindings;
-  for (MakeRangeOp root : ranges.roots)
-    rootBindings.emplace_back(root, 0);
+  SmallVector<int64_t> sourceAxes;
+  for (unsigned axis = 0; axis < rank; ++axis)
+    sourceAxes.push_back(axis);
+  SmallVector<Value> ownedCoordinates(rank);
   if (failed(buildStoreTraversal(
-          builder, gather.getLoc(), ArrayRef<MakeRangeOp>(*range), rootBindings,
-          chunk, blocked,
+          builder, gather.getLoc(), ranges, rootBindings,
+          chunk, blocked, chunkAxis,
           [&](OpBuilder &nested, IRMapping &mapping, ValueRange coordinates,
               Value valid) -> LogicalResult {
-            options.segmentTail = valid;
+            for (unsigned axis : ownedAxes)
+              ownedCoordinates[axis] = coordinates[axis];
+            auto coordinateType = cast<FragmentType>(coordinates[chunkAxis].getType());
+            auto tailType = FragmentType::get(kernel.getContext(), nested.getI1Type(),
+                coordinateType.getShape(), coordinateType.getAxisMaps(),
+                coordinateType.getValidity(), coordinateType.getOwner());
+            Value end = nested.create<BroadcastOp>(gather.getLoc(), coordinateType,
+                                                   ranges[chunkAxis].getLogicalStop());
+            options.segmentTail = nested.create<CompareOp>(gather.getLoc(), tailType,
+                coordinates[chunkAxis], end, ComparePredicate::Lt);
             FailureOr<Value> value = materializeReplayedValue(
                 nested, gather.getLoc(), source, axis, chunkExtent, mapping, options);
             if (failed(value))
               return gather.emitOpError("retained gather source has no bounded producer replay");
             nested.create<StoreOp>(gather.getLoc(), workspace, coordinates, *value,
-                                   valid, gather.getSourceAxes());
+                                   valid, sourceAxes);
             return success();
           })))
     return failure();
   for (GatherOp reader : readers) {
     builder.setInsertionPoint(reader);
+    auto result = cast<FragmentType>(reader.getResult().getType());
+    auto indexType = FragmentType::get(result.getContext(), builder.getIndexType(),
+        result.getShape(), result.getAxisMaps(), result.getValidity(), result.getOwner());
+    auto predicate = FragmentType::get(result.getContext(), builder.getI1Type(),
+        result.getShape(), result.getAxisMaps(), result.getValidity(), result.getOwner());
+    SmallVector<Value> coordinates(reader.getCoordinates());
+    Value valid = reader.getValid();
+    for (unsigned axis : ownedAxes) {
+      unsigned position = llvm::find(reader.getSourceAxes(), axis) - reader.getSourceAxes().begin();
+      auto ordinal = ordinalRange(reader.getCoordinates()[position]);
+      auto identity = builder.getArrayAttr({ReshapeGroupAttr::get(
+          kernel.getContext(), builder.getDenseI64ArrayAttr({0}),
+          builder.getDenseI64ArrayAttr({0}))});
+      Value rebound = builder.create<ReshapeOp>(reader.getLoc(),
+          ordinal.getResult().getType(), ownedCoordinates[axis], identity);
+      auto projected = projectPhysicalValueToSchema(builder, reader.getLoc(), rebound, indexType);
+      if (failed(projected))
+        return reader.emitOpError("workspace reader lost its owned range projection");
+      coordinates[position] = *projected;
+      Value end = builder.create<SplatOp>(reader.getLoc(), indexType, ranges[axis].getLogicalStop());
+      Value tail = builder.create<CompareOp>(reader.getLoc(), predicate, *projected, end,
+                                             ComparePredicate::Lt);
+      valid = valid ? Value(builder.create<BinaryOp>(reader.getLoc(), predicate, valid,
+                         tail, BinaryOperator::LogicalAnd)) : tail;
+    }
+    Value fill = reader.getFill();
+    if (valid && !fill) {
+      auto zero = materializeZeroFragment(builder, reader.getLoc(), result);
+      if (failed(zero))
+        return failure();
+      fill = *zero;
+    }
     auto load = builder.create<LoadOp>(reader.getLoc(), reader.getResult().getType(),
-        workspace, reader.getCoordinates(), reader.getValid(), reader.getFill(),
+        workspace, coordinates, valid, fill,
         reader.getSourceAxes());
     if (Attribute origin = reader->getAttr(originAttr))
       load->setAttr(originAttr, origin);
@@ -490,14 +661,6 @@ LogicalResult materializeRetainedValues(ModuleOp module) {
   if (failed(physicalKernel))
     return failure();
   func::FuncOp kernel = *physicalKernel;
-  auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
-  if (!llvm::all_of(space, [](Attribute attribute) {
-        auto extent = cast<PhysicalExprAttr>(attribute);
-        return extent.getKind() ==
-                   static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-               extent.getValue() == 1;
-      }))
-    return success();
   while (true) {
     SmallVector<GatherOp> gathers;
     kernel.walk([&](GatherOp gather) { gathers.push_back(gather); });
@@ -513,6 +676,13 @@ LogicalResult materializeRetainedValues(ModuleOp module) {
     }
     if (changed)
       continue;
+    auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
+    if (!llvm::all_of(space, [](Attribute attribute) {
+          auto extent = cast<PhysicalExprAttr>(attribute);
+          return extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                 extent.getValue() == 1;
+        }))
+      return success();
     SmallVector<StoreOp> stores;
     kernel.walk([&](StoreOp store) { stores.push_back(store); });
     for (StoreOp store : stores) {

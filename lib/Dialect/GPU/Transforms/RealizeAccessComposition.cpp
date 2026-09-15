@@ -247,6 +247,184 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
   return true;
 }
 
+FailureOr<bool> composeReshapedGather(GatherOp gather) {
+  auto reshape = gather.getSource().getDefiningOp<ReshapeOp>();
+  auto result = dyn_cast<FragmentType>(gather.getResult().getType());
+  if (!reshape || !result)
+    return false;
+  auto source = cast<FragmentType>(reshape.getValue().getType());
+  auto shaped = cast<FragmentType>(reshape.getResult().getType());
+  if (source.getShape() == shaped.getShape() &&
+      llvm::all_of(reshape.getReassociation(), [](Attribute attribute) {
+        auto group = cast<ReshapeGroupAttr>(attribute);
+        return group.getSourceAxes().size() == 1 && group.getResultAxes().size() == 1 &&
+               group.getSourceAxes()[0] == group.getResultAxes()[0];
+      }))
+    return false;
+  PhysicalProgramAnalysis analysis(gather->getParentOfType<func::FuncOp>());
+  for (unsigned axis = 0; axis < source.getShape().size(); ++axis)
+    if (analysis.axisRealization(reshape.getValue(), axis).constructionScalarSeed)
+      return false;
+  for (unsigned axis = 0; axis < shaped.getShape().size(); ++axis)
+    if (analysis.axisRealization(reshape.getResult(), axis).constructionScalarSeed)
+      return false;
+  unsigned sourceRank = 0, resultRank = 0;
+  for (Attribute attribute : reshape.getReassociation()) {
+    auto group = cast<ReshapeGroupAttr>(attribute);
+    sourceRank += group.getSourceAxes().size();
+    resultRank += group.getResultAxes().size();
+  }
+  unsigned sourcePrefix = source.getShape().size() - sourceRank;
+  unsigned resultPrefix = shaped.getShape().size() - resultRank;
+  if (sourcePrefix != resultPrefix)
+    return false;
+  for (Attribute attribute : reshape.getReassociation()) {
+    auto group = cast<ReshapeGroupAttr>(attribute);
+    if (group.getSourceAxes().size() == 1 && group.getResultAxes().size() == 1)
+      continue;
+    for (auto [type, axes] :
+         {std::pair{source, group.getSourceAxes().asArrayRef()},
+          std::pair{shaped, group.getResultAxes().asArrayRef()}})
+      for (int64_t axis : axes) {
+        auto extent = cast<PhysicalExprAttr>(type.getShape()[sourcePrefix + axis]);
+        if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+            extent.getValue() <= 0)
+          return false;
+      }
+  }
+  SmallVector<Value> coordinates(shaped.getShape().size());
+  for (auto [coordinate, axis] :
+       llvm::zip(gather.getCoordinates(), gather.getSourceAxes()))
+    coordinates[axis] = coordinate;
+  SmallVector<unsigned> retainedAxes(shaped.getShape().size());
+  for (unsigned axis = 0; axis < coordinates.size(); ++axis) {
+    if (coordinates[axis])
+      continue;
+    auto mapping = cast<AxisMapAttr>(shaped.getAxisMaps()[axis]);
+    auto projection = queryFragmentAxis(result, sourceAxisIdentity(mapping));
+    if (!projection.isExact() || projection.dimensionId != mapping.getDimensionId() ||
+        result.getShape()[projection.fragmentAxis] != shaped.getShape()[axis])
+      return false;
+    retainedAxes[axis] = projection.fragmentAxis;
+  }
+  OpBuilder builder(gather);
+  Location location = gather.getLoc();
+  auto indexType = FragmentType::get(
+      result.getContext(), builder.getIndexType(), result.getShape(),
+      result.getAxisMaps(), result.getValidity(), result.getOwner());
+  auto extentValue = [&](Attribute attribute) -> Value {
+    auto extent = cast<PhysicalExprAttr>(attribute);
+    if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant))
+      return builder.create<arith::ConstantIndexOp>(location, extent.getValue());
+    return builder.create<PhysicalExprOp>(location, builder.getIndexType(), extent);
+  };
+  Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+  Value one = builder.create<arith::ConstantIndexOp>(location, 1);
+  for (unsigned axis = 0; axis < coordinates.size(); ++axis) {
+    Value coordinate = coordinates[axis];
+    if (!coordinate) {
+      auto mapping = cast<AxisMapAttr>(result.getAxisMaps()[retainedAxes[axis]]);
+      auto type = FragmentType::get(
+          result.getContext(), builder.getIndexType(),
+          builder.getArrayAttr({shaped.getShape()[axis]}),
+          builder.getArrayAttr({AxisMapAttr::get(
+              result.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+              mapping.getDimensionId(), 0, mapping.getDerived())}),
+          result.getValidity(), result.getOwner());
+      Value extent = extentValue(shaped.getShape()[axis]);
+      coordinate = builder.create<MakeRangeOp>(
+          location, type, zero, extent, one, zero, extent,
+          mapping.getSourceId(), mapping.getSourceAxis(), mapping.getDerived());
+    }
+    Type element = coordinate.getType();
+    if (auto fragment = dyn_cast<FragmentType>(element))
+      element = fragment.getElementType();
+    if (!element.isIndex()) {
+      Type target = builder.getIndexType();
+      if (auto fragment = dyn_cast<FragmentType>(coordinate.getType()))
+        target = FragmentType::get(result.getContext(), builder.getIndexType(),
+            fragment.getShape(), fragment.getAxisMaps(), fragment.getValidity(),
+            fragment.getOwner());
+      coordinate = builder.create<CastOp>(location, target, coordinate);
+    }
+    auto projected = projectPhysicalValueToSchema(builder, location, coordinate, indexType);
+    if (failed(projected))
+      return gather.emitOpError("reshape gather lost an exact result coordinate projection");
+    coordinates[axis] = *projected;
+  }
+  SmallVector<Value> selected(source.getShape().size());
+  for (unsigned axis = 0; axis < sourcePrefix; ++axis)
+    selected[axis] = coordinates[axis];
+  for (Attribute attribute : reshape.getReassociation()) {
+    auto group = cast<ReshapeGroupAttr>(attribute);
+    if (group.getSourceAxes().empty())
+      continue;
+    if (group.getSourceAxes().size() == 1 && group.getResultAxes().size() == 1) {
+      selected[sourcePrefix + group.getSourceAxes()[0]] =
+          coordinates[resultPrefix + group.getResultAxes()[0]];
+      continue;
+    }
+    Value ordinal = builder.create<SplatOp>(location, indexType, zero);
+    for (int64_t axis : group.getResultAxes().asArrayRef()) {
+      Value extent = builder.create<SplatOp>(location, indexType,
+          extentValue(shaped.getShape()[resultPrefix + axis]));
+      ordinal = builder.create<BinaryOp>(location, indexType, ordinal, extent,
+                                        BinaryOperator::Multiply);
+      ordinal = builder.create<BinaryOp>(location, indexType, ordinal,
+          coordinates[resultPrefix + axis], BinaryOperator::Add);
+    }
+    auto axes = group.getSourceAxes().asArrayRef();
+    for (unsigned position = axes.size(); position-- > 0;) {
+      unsigned axis = sourcePrefix + axes[position];
+      Value coordinate = ordinal;
+      if (position != 0) {
+        Value extent = builder.create<SplatOp>(location, indexType,
+                                              extentValue(source.getShape()[axis]));
+        coordinate = builder.create<BinaryOp>(location, indexType, ordinal, extent,
+                                              BinaryOperator::Remainder);
+        ordinal = builder.create<BinaryOp>(location, indexType, ordinal, extent,
+                                           BinaryOperator::FloorDivide);
+      }
+      selected[axis] = coordinate;
+    }
+  }
+  SmallVector<int64_t> axes;
+  auto predicate = FragmentType::get(result.getContext(), builder.getI1Type(),
+      result.getShape(), result.getAxisMaps(), result.getValidity(), result.getOwner());
+  Value valid = gather.getValid();
+  Value lower = builder.create<SplatOp>(location, indexType, zero);
+  for (unsigned axis = 0; axis < selected.size(); ++axis)
+  {
+    axes.push_back(axis);
+    Value upper = builder.create<SplatOp>(location, indexType,
+                                         extentValue(source.getShape()[axis]));
+    Value nonnegative = builder.create<CompareOp>(location, predicate,
+        selected[axis], lower, ComparePredicate::Ge);
+    Value below = builder.create<CompareOp>(location, predicate,
+        selected[axis], upper, ComparePredicate::Lt);
+    Value bounded = builder.create<BinaryOp>(location, predicate, nonnegative,
+                                            below, BinaryOperator::LogicalAnd);
+    auto combined = combinePredicates(builder, location, result, valid, bounded);
+    if (failed(combined))
+      return failure();
+    valid = *combined;
+  }
+  Value fill = gather.getFill();
+  if (!fill) {
+    auto zeroFill = materializeZeroFragment(builder, location, result);
+    if (failed(zeroFill))
+      return failure();
+    fill = *zeroFill;
+  }
+  auto replacement = builder.create<GatherOp>(location, result, reshape.getValue(),
+      selected, valid, fill, axes);
+  if (Attribute origin = gather->getAttr(originAttr))
+    replacement->setAttr(originAttr, origin);
+  gather.getResult().replaceAllUsesWith(replacement.getResult());
+  gather.erase();
+  return true;
+}
+
 FailureOr<bool> composePointwiseGather(GatherOp gather) {
   auto source = dyn_cast<FragmentType>(gather.getSource().getType());
   auto result = dyn_cast<FragmentType>(gather.getResult().getType());
@@ -1881,6 +2059,13 @@ LogicalResult realizeAccessComposition(ModuleOp module) {
     for (GatherOp gather : gathers) {
       if (!gather->getBlock())
         continue;
+      FailureOr<bool> reshaped = composeReshapedGather(gather);
+      if (failed(reshaped))
+        return failure();
+      if (*reshaped) {
+        changed = true;
+        continue;
+      }
       FailureOr<bool> pointwise = composePointwiseGather(gather);
       if (failed(pointwise))
         return failure();
