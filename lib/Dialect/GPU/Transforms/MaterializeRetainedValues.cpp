@@ -368,11 +368,14 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
         cast<FragmentType>(value.getType()), builder.getArrayAttr(shape)));
   Value workspace = workspaces.front();
   uint64_t instance = cast<BufferType>(workspace.getType()).getInstance();
+  bool linearTraversal = payload.getShape().size() == 1;
   ParameterOp chunk = getOrCreatePhysicalParameter(
-      kernel, ("MATERIALIZE_ROWS_" + Twine(instance)).str(),
-      ParameterRole::ReductionOuter, ParameterCategory::Reduction,
+      kernel, ((linearTraversal ? "MATERIALIZE_ELEMENTS_" : "MATERIALIZE_ROWS_") +
+               Twine(instance)).str(),
+      linearTraversal ? ParameterRole::OwnershipN : ParameterRole::ReductionOuter,
+      linearTraversal ? ParameterCategory::Pointwise : ParameterCategory::Reduction,
       payload.getElementType().getIntOrFloatBitWidth(),
-      payload.getShape().size() == 1
+      linearTraversal
           ? ArrayRef<int64_t>{32, 64, 128, 256, 512, 1024, 2048, 4096, 8192}
           : ArrayRef<int64_t>{1, 2, 4, 8, 16, 32, 64});
   SmallVector<Attribute> blockedShape(payload.getShape().begin(),
