@@ -811,7 +811,54 @@ bool typeFitsTritonTensor(Type type, const TritonConfig &config) {
 
 bool isTritonFragmentExtent(Attribute attribute);
 
-LogicalResult materializeDeferredTensorBounds(func::FuncOp kernel) {
+gpu::PhysicalExprAttr reductionRegisterFootprint(ValueRange sources,
+                                               func::FuncOp kernel) {
+  std::function<bool(gpu::PhysicalExprAttr)> isTunableExtent =
+      [&](gpu::PhysicalExprAttr extent) {
+    if (static_cast<gpu::PhysicalExprKind>(extent.getKind()) ==
+        gpu::PhysicalExprKind::Parameter) {
+      auto parameter = gpu::queryParameterBySymbol(kernel, extent.getSymbol());
+      if (failed(parameter))
+        return false;
+      auto role = static_cast<gpu::ParameterRole>(parameter->getParameter().getRole());
+      return role == gpu::ParameterRole::OwnershipM ||
+             role == gpu::ParameterRole::OwnershipN ||
+             role == gpu::ParameterRole::Reduction ||
+             role == gpu::ParameterRole::ReductionOuter ||
+             role == gpu::ParameterRole::ReductionInner;
+    }
+    return llvm::any_of(extent.getOperands(), [&](Attribute operand) {
+      return isTunableExtent(cast<gpu::PhysicalExprAttr>(operand));
+    });
+  };
+  auto expression = [&](gpu::PhysicalExprKind kind, int64_t value,
+                        ArrayRef<Attribute> operands) {
+    return gpu::PhysicalExprAttr::get(
+        kernel.getContext(), static_cast<uint32_t>(kind), value,
+        StringAttr::get(kernel.getContext(), ""),
+        ArrayAttr::get(kernel.getContext(), operands));
+  };
+  gpu::PhysicalExprAttr registers;
+  for (Value source : sources) {
+    auto fragment = dyn_cast<gpu::FragmentType>(source.getType());
+    if (!fragment || !llvm::any_of(fragment.getShape(), [&](Attribute extent) {
+          return isTunableExtent(cast<gpu::PhysicalExprAttr>(extent));
+        }))
+      continue;
+    Type element = fragment.getElementType();
+    unsigned bits = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
+    auto footprint = expression(gpu::PhysicalExprKind::Constant,
+                                std::max(1u, (bits + 31) / 32), {});
+    for (Attribute extent : fragment.getShape())
+      footprint = expression(gpu::PhysicalExprKind::Multiply, 0,
+                             {footprint, extent});
+    registers = !registers ? footprint : expression(
+        gpu::PhysicalExprKind::Add, 0, {registers, footprint});
+  }
+  return registers;
+}
+
+LogicalResult materializeDeferredResourceBounds(func::FuncOp kernel) {
   TritonConfig known;
   kernel.walk([&](gpu::ParameterOp parameter) {
     auto schema = parameter.getParameter();
@@ -859,20 +906,37 @@ LogicalResult materializeDeferredTensorBounds(func::FuncOp kernel) {
     if (!llvm::is_contained(bounds, elements))
       bounds.push_back(elements);
   }
-  if (bounds.empty())
-    return success();
   kernel.getContext()->getOrLoadDialect<cf::ControlFlowDialect>();
   OpBuilder builder = OpBuilder::atBlockBegin(&kernel.front());
-  Value maximum = builder.create<arith::ConstantIndexOp>(
-      kernel.getLoc(), maxTritonTensorElements);
-  for (gpu::PhysicalExprAttr elements : bounds) {
+  auto assertBound = [&](gpu::PhysicalExprAttr expression, int64_t limit,
+                         StringRef message) {
+    Value maximum = builder.create<arith::ConstantIndexOp>(kernel.getLoc(), limit);
     Value count = builder.create<gpu::PhysicalExprOp>(
-        kernel.getLoc(), builder.getIndexType(), elements);
+        kernel.getLoc(), builder.getIndexType(), expression);
     Value valid = builder.create<gpu::CompareOp>(
         kernel.getLoc(), builder.getI1Type(), count, maximum, ComparePredicate::Le);
-    builder.create<cf::AssertOp>(
-        kernel.getLoc(), valid,
-        "Triton block tensor exceeds the maximum element count");
+    builder.create<cf::AssertOp>(kernel.getLoc(), valid, message);
+  };
+  for (gpu::PhysicalExprAttr elements : bounds)
+    assertBound(elements, maxTritonTensorElements,
+                "Triton block tensor exceeds the maximum element count");
+  auto capabilities =
+      kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+  if (capabilities && capabilities.getRegistersPerUnit() > 0) {
+    bounds.clear();
+    kernel.walk([&](ReduceOp reduce) {
+      auto footprint = reductionRegisterFootprint(
+          reduce.getInputs().take_front(reduce.getSourceCount()), kernel);
+      if (footprint && !evaluateCompileTimeExpression(footprint, known) &&
+          !llvm::is_contained(bounds, footprint))
+        bounds.push_back(footprint);
+    });
+    for (gpu::PhysicalExprAttr footprint : bounds) {
+      if (!isTritonFragmentExtent(footprint))
+        return kernel.emitError("Triton register bounds require constexpr fragment extents");
+      assertBound(footprint, capabilities.getRegistersPerUnit(),
+                  "Triton reduction source exceeds the register budget");
+    }
   }
   return success();
 }
@@ -884,44 +948,15 @@ bool fitsReductionRegisterBudget(gpu::ReduceOp reduce,
       kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
   if (!capabilities || capabilities.getRegistersPerUnit() <= 0)
     return true;
-  std::function<bool(gpu::PhysicalExprAttr)> isTunableExtent =
-      [&](gpu::PhysicalExprAttr extent) {
-    if (static_cast<gpu::PhysicalExprKind>(extent.getKind()) ==
-        gpu::PhysicalExprKind::Parameter) {
-      auto parameter = gpu::queryParameterBySymbol(kernel, extent.getSymbol());
-      if (failed(parameter))
-        return false;
-      auto role = static_cast<gpu::ParameterRole>(parameter->getParameter().getRole());
-      return role == gpu::ParameterRole::OwnershipM ||
-             role == gpu::ParameterRole::OwnershipN ||
-             role == gpu::ParameterRole::Reduction ||
-             role == gpu::ParameterRole::ReductionOuter ||
-             role == gpu::ParameterRole::ReductionInner;
-    }
-    return llvm::any_of(extent.getOperands(), [&](Attribute operand) {
-      return isTunableExtent(cast<gpu::PhysicalExprAttr>(operand));
-    });
-  };
   __int128 registers = 0;
   for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
-    auto fragment = dyn_cast<gpu::FragmentType>(source.getType());
-    if (!fragment || !llvm::any_of(fragment.getShape(), [&](Attribute extent) {
-          return isTunableExtent(cast<gpu::PhysicalExprAttr>(extent));
-        }))
+    auto footprint = reductionRegisterFootprint(ValueRange{source}, kernel);
+    if (!footprint)
       continue;
-    Type element = fragment.getElementType();
-    unsigned bits = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
-    __int128 footprint = std::max(1u, (bits + 31) / 32);
-    for (Attribute extent : fragment.getShape()) {
-      auto size = evaluateCompileTimeExpression(
-          cast<gpu::PhysicalExprAttr>(extent), config);
-      if (!size)
-        return true;
-      footprint *= *size;
-      if (footprint > capabilities.getRegistersPerUnit())
-        return false;
-    }
-    registers += footprint;
+    auto size = evaluateCompileTimeExpression(footprint, config);
+    if (!size)
+      return true;
+    registers += *size;
     if (registers > capabilities.getRegistersPerUnit())
       return false;
   }
@@ -3373,7 +3408,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
     assumption.erase();
   if (failed(gpu::eliminateCommonValues(module)) ||
       failed(legalizeCollectiveCallbacks(kernel)) ||
-      failed(materializeDeferredTensorBounds(kernel)) ||
+      failed(materializeDeferredResourceBounds(kernel)) ||
       failed(verifyTritonProgram(module)))
     return failure();
   kernel->setAttr(legalizedAttr, UnitAttr::get(module.getContext()));
