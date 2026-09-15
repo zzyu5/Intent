@@ -20,6 +20,18 @@ _DTYPES = {
 }
 
 
+@dataclass(slots=True)
+class _View:
+    shape: tuple[int, ...]
+    strides: tuple[int, ...]
+    pointer: int
+    allocation: int
+    offset: int
+    dtype: torch.dtype
+    begin: int
+    end: int
+
+
 def _timing_samples(measure, arguments: tuple[object, ...], *, samples: int) -> float:
     first = measure(*arguments, 1)
     if first <= 0:
@@ -102,30 +114,41 @@ class NativeProgram:
         self.winners = _winners.setdefault(self.compilation.identity, {})
         self.timings = _candidate_timings.setdefault(self.compilation.identity, {})
 
-    def _view(self, parameter, tensor, dimensions: dict[int, int]) -> None:
-        if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu" or tensor.dtype != _DTYPES[parameter["dtype"]]:
+    def _view(self, parameter, tensor, dimensions: dict[int, int]) -> _View:
+        dtype = _DTYPES[parameter["dtype"]]
+        if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu" or tensor.dtype != dtype:
             raise ValueError(f"{parameter['name']} must be a CPU {parameter['dtype']} tensor")
         if tensor.numel() == 0:
             raise NotImplementedError("Mojo CPU empty-storage pointer ABI is not implemented")
-        if tensor.ndim != len(parameter["shape"]):
+        shape, strides = tuple(tensor.shape), tuple(tensor.stride())
+        if len(shape) != len(parameter["shape"]):
             raise ValueError(f"{parameter['name']} has an incompatible rank")
         if self.contiguous_views or parameter["access"] != 0:
             expected_stride = 1
-            for extent, stride in zip(reversed(tensor.shape), reversed(tensor.stride())):
+            for extent, stride in zip(reversed(shape), reversed(strides)):
                 if stride != expected_stride:
                     raise NotImplementedError("Mojo CPU writable views require canonical contiguous strides")
                 expected_stride *= extent
-        for constraint, stride in zip(parameter["strides"], tensor.stride()):
+        for constraint, stride in zip(parameter["strides"], strides):
             if constraint is not None and constraint != stride:
                 raise ValueError(f"{parameter['name']} violates an author stride constraint")
-        for axis, (static, identity) in enumerate(zip(parameter["shape"], parameter["dimensions"])):
-            extent = tensor.shape[axis]
+        for static, identity, extent in zip(parameter["shape"], parameter["dimensions"], shape):
             if static >= 0 and static != extent:
                 raise ValueError(f"{parameter['name']} has an incompatible static extent")
             if identity > 0 and identity in dimensions and dimensions[identity] != extent:
                 raise ValueError("CPU views disagree on a canonical dimension identity")
             if identity > 0:
                 dimensions[identity] = extent
+        pointer = tensor.data_ptr()
+        element_size = tensor.element_size()
+        lower, upper = 0, 1
+        for extent, stride in zip(shape, strides):
+            offset = (extent - 1) * stride
+            lower += min(0, offset)
+            upper += max(0, offset)
+        return _View(shape, strides, pointer, tensor.untyped_storage().data_ptr(),
+                     tensor.storage_offset(), dtype, pointer + lower * element_size,
+                     pointer + upper * element_size)
 
     def prepare(self, arguments: tuple[object, ...], *, explicit_outputs: bool = False) -> NativeCall:
         expected = len(self.parameters) if explicit_outputs else sum(
@@ -135,13 +158,15 @@ class NativeProgram:
         dimensions: dict[int, int] = {}
         supplied = iter(arguments)
         all_arguments: list[object] = []
+        bindings: list[_View | None] = []
         for parameter in self.parameters:
             if parameter["kind"] == "view" and parameter["access"] == 1 and not explicit_outputs:
                 all_arguments.append(None)
+                bindings.append(None)
                 continue
             value = next(supplied)
-            if parameter["kind"] == "view":
-                self._view(parameter, value, dimensions)
+            bindings.append(self._view(parameter, value, dimensions)
+                            if parameter["kind"] == "view" else None)
             all_arguments.append(value)
         outputs = []
         for index, parameter in enumerate(self.parameters):
@@ -151,21 +176,14 @@ class NativeProgram:
                 shape = tuple(static if static >= 0 else dimensions[identity]
                               for static, identity in zip(parameter["shape"], parameter["dimensions"]))
                 all_arguments[index] = torch.empty(shape, dtype=_DTYPES[parameter["dtype"]], device="cpu")
-                self._view(parameter, all_arguments[index], dimensions)
+                bindings[index] = self._view(parameter, all_arguments[index], dimensions)
             outputs.append(all_arguments[index])
-        views = [(parameter, value) for parameter, value in zip(self.parameters, all_arguments)
-                 if parameter["kind"] == "view"]
-        def span(tensor):
-            offsets = [(extent - 1) * stride for extent, stride in zip(tensor.shape, tensor.stride())]
-            return (tensor.data_ptr() + sum(min(0, offset) for offset in offsets) * tensor.element_size(),
-                    tensor.data_ptr() + (sum(max(0, offset) for offset in offsets) + 1) * tensor.element_size())
-
-        for index, (parameter, value) in enumerate(views):
-            begin, end = span(value)
+        views = [(parameter, view) for parameter, view in zip(self.parameters, bindings)
+                 if view is not None]
+        for index, (parameter, view) in enumerate(views):
             for other_parameter, other in views[index + 1:]:
-                same_allocation = value.untyped_storage().data_ptr() == other.untyped_storage().data_ptr()
-                other_begin, other_end = span(other)
-                overlap = begin < other_end and other_begin < end
+                same_allocation = view.allocation == other.allocation
+                overlap = view.begin < other.end and other.begin < view.end
                 if overlap and (parameter["access"] != 0 or other_parameter["access"] != 0):
                     raise NotImplementedError("Mojo CPU overlapping writable views are not implemented")
                 if same_allocation and (parameter["noalias"] or other_parameter["noalias"]):
@@ -175,12 +193,11 @@ class NativeProgram:
         native: list[object] = []
         key: list[object] = []
         allocation_groups: dict[int, int] = {}
-        for parameter, value in zip(self.parameters, all_arguments):
-            if parameter["kind"] == "view":
-                native.extend([value.data_ptr(), *value.shape, *value.stride()])
-                allocation = value.untyped_storage().data_ptr()
-                group = allocation_groups.setdefault(allocation, len(allocation_groups))
-                key.append((tuple(value.shape), tuple(value.stride()), value.storage_offset(), value.dtype, group))
+        for parameter, value, view in zip(self.parameters, all_arguments, bindings):
+            if view is not None:
+                native.extend([view.pointer, *view.shape, *view.strides])
+                group = allocation_groups.setdefault(view.allocation, len(allocation_groups))
+                key.append((view.shape, view.strides, view.offset, view.dtype, group))
             else:
                 native.append(value)
                 key.append(parameter["dtype"])
