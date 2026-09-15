@@ -736,6 +736,7 @@ FailureOr<Value> buildRangeTailPredicate(OpBuilder &builder, Location location,
 }
 
 LogicalResult appendTailValidity(Location location, Value source,
+                                 ArrayRef<MakeRangeOp> ranges,
                                  Value tailPredicate,
                                  IRMapping &mapping) {
   SmallVector<Value> pending{source};
@@ -755,18 +756,25 @@ LogicalResult appendTailValidity(Location location, Value source,
       auto resultType = dyn_cast<FragmentType>(load.getResult().getType());
       if (!resultType)
         return load.emitOpError(
-            "blocked sparse tail requires a fragment load result");
+            "blocked contraction tail requires a fragment load result");
       auto predicateType = FragmentType::get(
           resultType.getContext(), IntegerType::get(resultType.getContext(), 1),
           resultType.getShape(),
           resultType.getAxisMaps(), resultType.getValidity(),
           resultType.getOwner());
       OpBuilder validityBuilder(load);
-      FailureOr<Value> projected = projectPhysicalValueToSchema(
-          validityBuilder, location, tailPredicate, predicateType);
+      auto kernel = originalLoad->getParentOfType<func::FuncOp>();
+      auto axes = PhysicalProgramAnalysis(kernel).rangeAxes(
+          originalLoad.getResult(), ranges);
+      if (!axes.isExact() || axes.fragmentAxes.size() != 1)
+        return load.emitOpError(
+            "blocked contraction tail has no unique load-axis relation");
+      FailureOr<Value> projected = projectPredicateToFragmentAxis(
+          validityBuilder, location, tailPredicate, predicateType,
+          axes.fragmentAxes.front());
       if (failed(projected))
         return load.emitOpError(
-            "blocked sparse tail cannot project to its load coordinates");
+            "blocked contraction tail cannot project to its load coordinates");
       Value valid = *projected;
       if (load.getValid()) {
         Value existing = load.getValid();
@@ -775,7 +783,7 @@ LogicalResult appendTailValidity(Location location, Value source,
               validityBuilder, location, existing, predicateType);
           if (failed(projectedExisting))
             return load.emitOpError(
-                "blocked sparse tail cannot preserve existing load validity");
+                "blocked contraction tail cannot preserve existing load validity");
           existing = *projectedExisting;
         }
         valid = validityBuilder.create<BinaryOp>(
@@ -2554,9 +2562,9 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
           return;
         }
         if (failed(appendTailValidity(nestedLocation, contract.getLhs(),
-                                      *lhsTail, lhsReplay)) ||
+                                      lhsRanges, *lhsTail, lhsReplay)) ||
             failed(appendTailValidity(nestedLocation, contract.getRhs(),
-                                      *rhsTail, rhsReplay))) {
+                                      rhsRanges, *rhsTail, rhsReplay))) {
           bodyFailed = true;
           return;
         }
@@ -3150,12 +3158,12 @@ LogicalResult realizeSparseReductionTraversal(SparseContractOp contract,
           return;
         }
         if (failed(appendTailValidity(nestedLocation, contract.getCompressed(),
-                                      *compressedTail,
+                                      compressedRanges, *compressedTail,
                                       compressedReplay)) ||
             failed(appendTailValidity(nestedLocation, contract.getRhs(),
-                                      *denseTail, denseReplay)) ||
+                                      denseRanges, *denseTail, denseReplay)) ||
             failed(appendTailValidity(nestedLocation, contract.getMetadata(),
-                                      *metadataTail,
+                                      metadataRanges, *metadataTail,
                                       metadataReplay))) {
           bodyFailed = true;
           return;
