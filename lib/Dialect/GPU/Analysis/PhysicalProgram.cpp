@@ -2793,6 +2793,27 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     if (occurrences.empty())
       occurrences = selectOccurrence(OccurrencePriority::UniqueSource);
     if (occurrences.empty()) {
+      auto extent = cast<PhysicalExprAttr>(fragment.getShape()[fragmentAxis]);
+      bool broadcastAxis =
+          extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          extent.getValue() == 1 &&
+          llvm::all_of(load.getCoordinates(), [&](Value coordinate) {
+            auto type = dyn_cast<FragmentType>(coordinate.getType());
+            if (!type)
+              return true;
+            BroadcastProjection projection = queryAxisProjection(type, fragment);
+            return projection.isExact() &&
+                   !projection.targetToSource[fragmentAxis];
+          });
+      if (broadcastAxis) {
+        // Address coordinates do not vary along this introduced unit axis.
+        // Validity or fill may still carry a traversal, so retain their roots
+        // instead of mistaking an unexpanded range for a uniform value.
+        for (Value dependency : {load.getValid(), load.getFill()})
+          if (dependency)
+            collectAxisRanges(dependency, fragmentAxis, result, visited);
+        return;
+      }
       result.state = PhysicalFactState::Unknown;
       appendUnique(result.blockers, operation);
       return;
@@ -3596,14 +3617,28 @@ void PhysicalProgramAnalysis::analyzeReplay(
     }
     bool preservesReads = readOnly(operation);
     if (insertionAnchor && preservesReads) {
+      // Nested control is cloned as part of an already visited replay region.
+      // Check motion from that enclosing region, rather than trying to walk
+      // an outer insertion point into the nested operation's original block.
+      Operation *replayRoot = operation;
+      for (Operation *parent = operation->getParentOp();
+           isa_and_nonnull<scf::IfOp, scf::ForOp>(parent);
+           parent = parent->getParentOp()) {
+        auto found = visited.find(parent);
+        if (found == visited.end() ||
+            !llvm::is_contained(found->second, context))
+          break;
+        replayRoot = parent;
+      }
       Operation *anchor = insertionAnchor;
-      while (anchor && anchor->getBlock() != operation->getBlock()) {
+      while (anchor && anchor->getBlock() != replayRoot->getBlock()) {
         preservesReads &= readOnly(anchor);
         anchor = anchor->getParentOp();
       }
-      preservesReads &= anchor && (anchor == operation || operation->isBeforeInBlock(anchor));
-      if (preservesReads && anchor != operation)
-        for (Operation *next = operation->getNextNode(); next != anchor;
+      preservesReads &= anchor &&
+          (anchor == replayRoot || replayRoot->isBeforeInBlock(anchor));
+      if (preservesReads && anchor != replayRoot)
+        for (Operation *next = replayRoot->getNextNode(); next != anchor;
              next = next->getNextNode())
           preservesReads &= readOnly(next);
     }

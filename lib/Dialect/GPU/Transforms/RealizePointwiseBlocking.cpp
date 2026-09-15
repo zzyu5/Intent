@@ -1426,7 +1426,11 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
                   bool sameBounds = samePhysicalScalarExpression(
                       range.getLogicalStart(), blocked.getLogicalStart()) &&
                       samePhysicalScalarExpression(range.getLogicalStop(), blocked.getLogicalStop());
-                  return (sameExtent || sameBounds) &&
+                  auto sourceSize = constantLogicalRangeCardinality(range);
+                  auto targetSize = constantLogicalRangeCardinality(blocked);
+                  bool sameCardinality = renamedAxis && sourceSize && targetSize &&
+                                         *sourceSize == *targetSize;
+                  return (sameExtent || sameBounds || sameCardinality) &&
                          samePhysicalScalarExpression(range.getStep(), blocked.getStep());
                 })) {
               // An explicit projection can rename an exact coordinate traversal.
@@ -1547,6 +1551,28 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
       return failure();
     replayed = *projected;
   } else {
+    SmallVector<MakeRangeOp> controlSourceRanges;
+    if (isa<scf::IfOp, scf::ForOp>(producer) && result) {
+      PhysicalProgramAnalysis analysis(kernel);
+      for (auto [axis, attribute] : llvm::enumerate(result.getAxisMaps())) {
+        auto relation = cast<AxisMapAttr>(attribute);
+        if (!(sourceAxisIdentity(relation) == source) ||
+            !llvm::is_contained(traversalDimensions, relation.getDimensionId()))
+          continue;
+        PhysicalRangeFact ranges = analysis.axisRanges(value, axis);
+        if (!ranges.isExact())
+          continue;
+        for (MakeRangeOp range : ranges.roots) {
+          auto sourceSize = constantLogicalRangeCardinality(range);
+          auto targetSize = constantLogicalRangeCardinality(blocked);
+          if (producer->isProperAncestor(range) && sourceSize && targetSize &&
+              *sourceSize == *targetSize &&
+              samePhysicalScalarExpression(range.getStep(), blocked.getStep()) &&
+              !llvm::is_contained(controlSourceRanges, range))
+            controlSourceRanges.push_back(range);
+        }
+      }
+    }
     Operation *clone = builder.clone(*producer, mapping);
     for (auto [original, cloned] :
          llvm::zip(producer->getResults(), clone->getResults())) {
@@ -1556,6 +1582,11 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
         mapping.map(original, cloned);
     }
     bool structuredControl = isa<scf::IfOp, scf::ForOp>(clone);
+    llvm::SmallPtrSet<Operation *, 8> controlRanges;
+    for (MakeRangeOp sourceRange : controlSourceRanges)
+      if (Value mappedRange = mapping.lookupOrNull(sourceRange.getResult()))
+        if (auto range = mappedRange.getDefiningOp<MakeRangeOp>())
+          controlRanges.insert(range);
     llvm::DenseMap<Value, Value> controlTails;
     if (isa<ReduceOp, ScanOp, RegionFoldOp, RegionScanOp>(clone) || structuredControl)
       for (Region &region : clone->getRegions())
@@ -1577,11 +1608,14 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
             FailureOr<int64_t> dimension =
                 range ? queryRangeDimension(range)
                       : FailureOr<int64_t>(failure());
-            if (!range || !(sourceAxisIdentity(range) == source) ||
-                failed(dimension) ||
-                !llvm::is_contained(traversalDimensions, *dimension))
+            if (!range ||
+                (!controlRanges.contains(range) &&
+                 (!(sourceAxisIdentity(range) == source) || failed(dimension) ||
+                  !llvm::is_contained(traversalDimensions, *dimension))))
               return;
             if (structuredControl) {
+              retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
+                                   blockedExtent);
               OpBuilder nestedBuilder(range);
               Value offset = nestedBuilder.create<BinaryOp>(range.getLoc(), nestedBuilder.getIndexType(),
                   blocked.getStart(), blocked.getLogicalStart(), BinaryOperator::Subtract);
@@ -4643,6 +4677,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         SmallVector<MakeRangeOp> related;
         for (auto &entry : occurrenceRoots) {
           auto previous = cast<MakeRangeOp>(entry.first);
+          auto previousAxis = resultAxes.find(previous.getOperation());
+          if (previousAxis != resultAxes.end() && previousAxis->second != axis)
+            continue;
           if (positionalOccurrences.contains(entry.first) &&
               llvm::any_of(ranges, [&](MakeRangeOp range) {
                 return sameLogicalRange(range, previous);
