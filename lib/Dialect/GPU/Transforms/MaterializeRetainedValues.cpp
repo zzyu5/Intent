@@ -19,6 +19,8 @@ bool isZero(Value value) {
          expression.getValue() == 0;
 }
 
+} // namespace
+
 Value createInvocationWorkspace(func::FuncOp kernel, Location location,
                                 FragmentType payload, ArrayAttr shape) {
   uint64_t instance = 1;
@@ -52,6 +54,8 @@ Value createInvocationWorkspace(func::FuncOp kernel, Location location,
       }), location);
   return kernel.getArgument(argument);
 }
+
+namespace {
 
 template <typename Emit>
 LogicalResult buildStoreTraversal(OpBuilder &builder, Location location,
@@ -252,6 +256,13 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
       continue;
     }
     PhysicalRangeAxisFact axes = analysis.rangeAxes(dependency, rowRoots);
+    // The mapped ranges also reconstruct pure column coordinates and their
+    // predicates. These do not carry a row axis; data reads still require it.
+    if (axes.isExact() && axes.fragmentAxes.empty() &&
+        analysis.replayability(dependency, std::nullopt,
+                               PhysicalReplayScope::Coordinate,
+                               /*allowAccesses=*/false).isReplayable())
+      continue;
     bool scalarBroadcast = dependency.getDefiningOp<SplatOp>() != nullptr;
     if (auto broadcast = dependency.getDefiningOp<BroadcastOp>())
       scalarBroadcast |=

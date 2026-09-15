@@ -130,6 +130,10 @@ void clonePredicatedScalarOperation(mlir::OpBuilder &builder,
                                    mlir::Value predicate,
                                    FragmentType shape = {});
 mlir::LogicalResult realizeScanConsumerTraversals(mlir::ModuleOp module);
+mlir::Value createInvocationWorkspace(mlir::func::FuncOp kernel,
+                                      mlir::Location location,
+                                      FragmentType payload,
+                                      mlir::ArrayAttr shape);
 mlir::LogicalResult materializeRetainedValues(mlir::ModuleOp module);
 mlir::LogicalResult realizeRegionFolds(mlir::ModuleOp module);
 mlir::LogicalResult realizeRegionScans(mlir::ModuleOp module);

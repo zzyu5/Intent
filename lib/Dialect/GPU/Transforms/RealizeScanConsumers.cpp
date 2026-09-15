@@ -129,7 +129,15 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
         break;
       }
     }
-    if (!matched)
+    bool privateWrites = llvm::all_of(
+        match.loop.getBody()->without_terminator(), [](Operation &operation) {
+          auto store = dyn_cast<StoreOp>(operation);
+          if (!store)
+            return true;
+          auto buffer = dyn_cast<BufferType>(store.getResource().getType());
+          return buffer && buffer.getScope().getValue() == BufferScope::InvocationWorkspace;
+        });
+    if (!matched && !privateWrites)
       return std::nullopt;
     sourceLoads.insert(load);
   }
@@ -327,6 +335,87 @@ LogicalResult realizeScanConsumerMatch(func::FuncOp kernel,
   eraseDeadPhysicalValues(kernel);
   return success();
 }
+
+FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
+                                       PhysicalProgramAnalysis &analysis) {
+  auto type = dyn_cast<FragmentType>(scan.getResult(0).getType());
+  if (scan.getSourceCount() != 1 || scan.getIdentityCount() != 1 ||
+      scan.getCaptureCount() || scan.getAxis() != 0 || scan.getReverse() ||
+      scan->getBlock() != &kernel.front() || !type || type.getShape().size() != 1)
+    return false;
+  auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
+  if (!llvm::all_of(space, [](Attribute attribute) {
+        auto extent = cast<PhysicalExprAttr>(attribute);
+        return extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+               extent.getValue() == 1;
+      }))
+    return false;
+  SmallVector<GatherOp> readers;
+  for (Operation *user : scan.getResult(0).getUsers()) {
+    auto gather = dyn_cast<GatherOp>(user);
+    if (!gather || gather.getSource() != scan.getResult(0) ||
+        gather.getCoordinates().size() != 1 ||
+        gather.getSourceAxes() != ArrayRef<int64_t>{0})
+      return false;
+    readers.push_back(gather);
+  }
+  if (readers.empty())
+    return false;
+  PhysicalRangeFact ranges = analysis.axisRanges(scan.getInputs()[0], 0);
+  FailureOr<MakeRangeOp> root = queryExactLogicalRange(ranges);
+  if (failed(root))
+    return false;
+  PhysicalExprAttr stop = queryLaunchExpression((*root).getLogicalStop());
+  if (!stop || stop.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant))
+    return false;
+  auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+  Type element = type.getElementType();
+  unsigned bits = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
+  if (static_cast<__int128>(stop.getValue()) * ((bits + 31) / 32) <=
+      capabilities.getRegistersPerUnit())
+    return false;
+  for (Operation *access : ranges.accesses) {
+    auto load = dyn_cast<LoadOp>(access);
+    if (!load || !canReplayReadAt(load, scan))
+      return false;
+  }
+
+  OpBuilder builder(scan);
+  Value workspace = createInvocationWorkspace(kernel, scan.getLoc(), type,
+                                               builder.getArrayAttr({stop}));
+  builder.setInsertionPointAfter(scan);
+  Value zero = builder.create<arith::ConstantIndexOp>(scan.getLoc(), 0);
+  Value one = builder.create<arith::ConstantIndexOp>(scan.getLoc(), 1);
+  auto copy = builder.create<scf::ForOp>(scan.getLoc(), zero,
+                                        (*root).getLogicalStop(), one);
+  copy->setAttr(independentIterationAttr, builder.getUnitAttr());
+  builder.setInsertionPointToStart(copy.getBody());
+  Value coordinate = copy.getInductionVar();
+  Value value = builder.create<GatherOp>(scan.getLoc(), element, scan.getResult(0),
+                                        ValueRange{coordinate}, Value(), Value(),
+                                        builder.getDenseI64ArrayAttr({0}));
+  builder.create<StoreOp>(scan.getLoc(), workspace, ValueRange{coordinate}, value,
+                           Value(), builder.getDenseI64ArrayAttr({0}));
+  for (GatherOp reader : readers) {
+    builder.setInsertionPoint(reader);
+    auto load = builder.create<LoadOp>(
+        reader.getLoc(), reader.getResult().getType(), workspace,
+        reader.getCoordinates(), reader.getValid(), reader.getFill(), reader.getSourceAxes());
+    if (Attribute origin = reader->getAttr(originAttr))
+      load->setAttr(originAttr, origin);
+    reader.getResult().replaceAllUsesWith(load.getResult());
+    reader.erase();
+  }
+  // The copy is an independent consumer of an immutable scan. Reuse the same
+  // bounded prefix traversal; the original ordered consumers stay after it.
+  PhysicalProgramAnalysis currentAnalysis(kernel);
+  auto match = matchScanConsumer(scan, currentAnalysis);
+  if (!match)
+    return scan.emitOpError("scan snapshot has no legal bounded prefix traversal");
+  if (failed(realizeScanConsumerMatch(kernel, *match)))
+    return failure();
+  return true;
+}
 } // namespace
 
 LogicalResult realizeScanConsumerTraversals(ModuleOp module) {
@@ -340,10 +429,25 @@ LogicalResult realizeScanConsumerTraversals(ModuleOp module) {
       match = matchScanConsumer(scan, analysis);
       return match ? WalkResult::interrupt() : WalkResult::advance();
     });
-    if (!match)
+    if (match) {
+      if (failed(realizeScanConsumerMatch(*kernel, *match)))
+        return failure();
+      continue;
+    }
+    SmallVector<ScanOp> scans;
+    kernel->walk([&](ScanOp scan) { scans.push_back(scan); });
+    bool materialized = false;
+    for (ScanOp scan : scans) {
+      FailureOr<bool> result = materializeScanSnapshot(scan, *kernel, analysis);
+      if (failed(result))
+        return failure();
+      if (*result) {
+        materialized = true;
+        break;
+      }
+    }
+    if (!materialized)
       break;
-    if (failed(realizeScanConsumerMatch(*kernel, *match)))
-      return failure();
   }
   return success();
 }
