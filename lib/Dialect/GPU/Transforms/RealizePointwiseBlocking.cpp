@@ -4828,6 +4828,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::DenseMap<Operation *, MakeRangeOp> occurrenceRoots;
   llvm::DenseMap<Operation *, ParameterOp> occurrenceParameters;
   llvm::SmallPtrSet<Operation *, 8> positionalOccurrences;
+  uint64_t nextOccurrenceSource = nextPhysicalAxisIdentities(kernel).first;
   WalkResult occurrences = kernel.walk([&](StoreOp store) {
     auto valueType = dyn_cast<FragmentType>(store.getValue().getType());
     SmallVector<Value> coordinates;
@@ -4886,6 +4887,15 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         address.unitStep = llvm::all_of(address.roots, isUnitStepRange);
       }
       PhysicalRangeFact payload = analysis.axisRanges(store.getValue(), axis);
+      if (cartesian && address.isExact() && !address.roots.empty() &&
+          address.blockers.empty() && payload.isExact() && payload.roots.empty() &&
+          payload.blockers.empty()) {
+        // A uniform payload still writes an independent Cartesian address
+        // axis. Give that occurrence its own source-bound ownership parameter.
+        for (MakeRangeOp range : address.roots)
+          occurrenceRoots.try_emplace(range.getOperation(), address.roots.front());
+        continue;
+      }
       if (address.state == PhysicalFactState::Unknown ||
           payload.state == PhysicalFactState::Unknown ||
           !address.blockers.empty() || !payload.blockers.empty() ||
@@ -4935,6 +4945,71 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         continue;
       if (positionalRemap && !address.isExact())
         continue;
+      if (ownershipOnly && cartesian && positionalRemap)
+        for (MakeRangeOp range : payload.roots) {
+          if (reductionTraversalRanges.contains(range.getOperation()) ||
+              llvm::any_of(writeEffects, [&](const WriteEffectFacts &effect) {
+                return coordinatesUseRange(effect.coordinates, range);
+              }))
+            continue;
+          bool independentAddress = false;
+          for (auto [otherAxis, coordinate] : llvm::enumerate(coordinates)) {
+            if (otherAxis == axis)
+              continue;
+            auto otherPayload = analysis.axisRanges(store.getValue(), otherAxis);
+            auto otherAddress = analysis.axisRanges(coordinate, 0);
+            independentAddress |= otherPayload.isExact() && otherPayload.roots.empty() &&
+                otherPayload.blockers.empty() && otherAddress.isExact() &&
+                llvm::any_of(otherAddress.roots, [&](MakeRangeOp other) {
+                  return other != range && sameLogicalRange(other, range);
+                });
+          }
+          if (!independentAddress)
+            continue;
+          // A read-only occurrence used in another result position does not
+          // own the independent Cartesian address, even with the same domain.
+          // Rebind its current value-axis flow, leaving logical coordinates and
+          // every write-address occurrence unchanged.
+          PhysicalSourceAxis previous = sourceAxisIdentity(range);
+          uint64_t sourceId = nextOccurrenceSource++;
+          SmallVector<std::pair<Value, FragmentType>> replacements;
+          auto collect = [&](Value value) {
+            auto type = dyn_cast<FragmentType>(value.getType());
+            if (!type)
+              return;
+            SmallVector<Attribute> maps(type.getAxisMaps().begin(), type.getAxisMaps().end());
+            bool changed = false;
+            for (auto [position, attribute] : llvm::enumerate(type.getAxisMaps())) {
+              auto mapping = cast<AxisMapAttr>(attribute);
+              if (!(sourceAxisIdentity(mapping) == previous))
+                continue;
+              auto roots = analysis.axisRanges(value, position);
+              if (roots.state == PhysicalFactState::Unknown || !roots.blockers.empty() ||
+                  roots.roots.empty() ||
+                  !llvm::all_of(roots.roots, [&](MakeRangeOp root) { return root == range; }))
+                continue;
+              maps[position] = AxisMapAttr::get(kernel.getContext(), sourceId,
+                  mapping.getSourceAxis(), mapping.getDimensionId(), position, true);
+              changed = true;
+            }
+            if (changed)
+              replacements.emplace_back(value, FragmentType::get(kernel.getContext(),
+                  type.getElementType(), type.getShape(), ArrayAttr::get(kernel.getContext(), maps),
+                  type.getValidity(), type.getOwner()));
+          };
+          kernel.walk([&](Operation *operation) {
+            for (Value result : operation->getResults())
+              collect(result);
+            for (Region &region : operation->getRegions())
+              for (Block &block : region)
+                for (BlockArgument argument : block.getArguments())
+                  collect(argument);
+          });
+          for (auto [value, type] : replacements)
+            value.setType(type);
+          range.setSourceId(sourceId);
+          range.setDerived(true);
+        }
       SmallVector<MakeRangeOp> ranges(address.roots.begin(), address.roots.end());
       for (MakeRangeOp range : payload.roots)
         if (!llvm::is_contained(ranges, range))
