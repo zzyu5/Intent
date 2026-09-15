@@ -54,7 +54,7 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
     return operation.emitError("CPU contraction blocking requires the closed zero-initialized contraction; splitting a nonzero fused accumulator is not implemented");
   auto requirements = (*implementation)->inputs ? (*implementation)->inputs(operation, shared, binding)
       : SmallVector<InputRequirement>{};
-  auto supplies = inputs.prepare(operation, requirements);
+  auto supplies = inputs.prepare(operation, requirements, **implementation);
   if (failed(supplies)) return failure();
   int64_t groupM = 0, groupN = 0;
   for (auto requirement : requirements) {

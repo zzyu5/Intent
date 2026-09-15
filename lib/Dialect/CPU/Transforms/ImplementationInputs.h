@@ -10,7 +10,7 @@ class ImplementationInputs {
 public:
   explicit ImplementationInputs(mlir::func::FuncOp function) : function(function) {}
   mlir::FailureOr<llvm::SmallVector<InputSupply>> prepare(mlir::linalg::GenericOp operation,
-      llvm::ArrayRef<InputRequirement> requirements);
+      llvm::ArrayRef<InputRequirement> requirements, const Implementation &implementation);
   mlir::FailureOr<InputSupply> prepareCaptured(mlir::linalg::GenericOp operation,
       mlir::memref::LoadOp input, const InputRequirement &requirement, mlir::Operation *scope);
   mlir::FailureOr<llvm::SmallVector<InputSupply>> prepareGroup(mlir::OpBuilder &builder,
@@ -18,7 +18,8 @@ public:
       ConfigurationAttr configuration, llvm::ArrayRef<InputRequirement> requirements);
 
 private:
-  mlir::Operation *consumerScope(mlir::Value source, mlir::linalg::GenericOp operation);
+  mlir::Operation *consumerScope(mlir::Value source, mlir::linalg::GenericOp operation,
+      const InputRequirement &requirement, const Implementation &implementation);
   InputSupply materialize(mlir::Value source, const InputRequirement &requirement, mlir::Operation *scope);
   struct Prepared {
     mlir::Value source;

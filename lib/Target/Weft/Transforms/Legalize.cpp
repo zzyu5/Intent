@@ -4,6 +4,7 @@
 #include "Intent/Dialect/CPU/Analysis/AxisRelations.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
+#include "Weft/Dialect/Kernel/IR/SubviewBounds.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -594,6 +595,42 @@ private:
       if (failed(region)) return failure();
       auto aligned = alignValue(value, valueType(element(value.getType()), shape((*region).getType()), axes((*region).getType())), memory.getLoc());
       if (failed(aligned)) return failure();
+      auto dimensions = shape((*region).getType()), ids = axes((*region).getType());
+      if (wk::hasDynamicSubviewExtent<wk::SubviewOp, wk::SliceOp, wk::FieldOp>(*region) &&
+          llvm::any_of(dimensions, [](int64_t extent) { return extent < 0; })) {
+        SmallVector<Attribute> selectors;
+        SmallVector<int64_t> fixedShape, fixedAxes;
+        for (auto [extent, axis] : llvm::zip(dimensions, ids)) {
+          selectors.push_back(b.getStringAttr(extent < 0 ? "index" : "all"));
+          if (extent >= 0) { fixedShape.push_back(extent); fixedAxes.push_back(axis); }
+        }
+        auto selectedType = wk::SliceType::get(b.getContext(),
+            cast<wk::SliceType>((*region).getType()).getEncoding(), array(fixedShape), array(fixedAxes));
+        auto selectedValue = valueType(element((*aligned).getType()), fixedShape, fixedAxes);
+        SmallVector<Value> indices;
+        // Keep the window's runtime extents in loop bounds and issue only
+        // fixed-shape projections, as required by the Weft memory consumer.
+        std::function<void(unsigned)> project = [&](unsigned axis) {
+          if (axis == dimensions.size()) {
+            Value selected = b.create<wk::SliceOp>(memory.getLoc(), selectedType, *region,
+                indices, b.getArrayAttr(selectors));
+            Value payload = b.create<wk::ExtractOp>(memory.getLoc(), selectedValue, *aligned,
+                indices, b.getArrayAttr(selectors));
+            b.create<wk::CommitOp>(memory.getLoc(), payload, selected);
+            return;
+          }
+          if (dimensions[axis] >= 0) { project(axis + 1); return; }
+          Value end = b.create<wk::ExtentOp>(memory.getLoc(), b.getIndexType(), *region, axis);
+          auto loop = b.create<scf::ForOp>(memory.getLoc(), index(memory.getLoc(), 0), end, index(memory.getLoc(), 1));
+          OpBuilder::InsertionGuard guard(b);
+          b.setInsertionPointToStart(loop.getBody());
+          indices.push_back(loop.getInductionVar());
+          project(axis + 1);
+          indices.pop_back();
+        };
+        project(0);
+        return success();
+      }
       b.create<wk::CommitOp>(memory.getLoc(), *aligned, *region);
       return success();
     }

@@ -30,10 +30,15 @@ LogicalResult validateRepresentation(Operation *operation, Value source, Value e
   return success();
 }
 
+bool sameRepresentation(const InputRequirement &first, const InputRequirement &second) {
+  return first.elementType == second.elementType && first.panelAxis == second.panelAxis &&
+      first.panelSize == second.panelSize && first.alignment == second.alignment && first.reuse == second.reuse;
+}
+
 }
 
 FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepare(linalg::GenericOp operation,
-    ArrayRef<InputRequirement> requirements) {
+    ArrayRef<InputRequirement> requirements, const Implementation &implementation) {
   SmallVector<InputSupply> supplies;
   SmallVector<unsigned> operands;
   for (auto requirement : requirements) {
@@ -45,12 +50,30 @@ FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepare(linalg::Generi
     if (failed(validateRepresentation(operation, source,
         operation.getRegion().front().getArgument(requirement.operand), requirement))) return failure();
     if (requirement.reuse == InputReuse::Group) continue;
-    supplies.push_back(materialize(source, requirement, consumerScope(source, operation)));
+    supplies.push_back(materialize(source, requirement, consumerScope(source, operation, requirement, implementation)));
   }
   return supplies;
 }
 
-Operation *ImplementationInputs::consumerScope(Value source, linalg::GenericOp operation) {
+Operation *ImplementationInputs::consumerScope(Value source, linalg::GenericOp operation,
+    const InputRequirement &requirement, const Implementation &implementation) {
+  if (auto branch = dyn_cast<scf::IfOp>(operation->getParentOp()); branch && !branch.getElseRegion().empty()) {
+    PhysicalProgramAnalysis physical(function);
+    if (physical.isReadOnly(source) && DominanceInfo(function).dominates(source, branch)) {
+      auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
+      auto configuration = function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration");
+      Block *other = operation->getParentRegion() == &branch.getThenRegion() ? branch.elseBlock() : branch.thenBlock();
+      // Both successors must unconditionally require the same read-only
+      // snapshot. Enclosing guards, including empty-work guards, stay intact.
+      for (auto candidate : other->getOps<linalg::GenericOp>()) {
+        if (!isMatrixContraction(candidate) || candidate->hasAttr("intent_cpu.microtile") ||
+            candidate->getAttrOfType<ImplementationAttr>("intent_cpu.implementation") != binding) continue;
+        for (auto requested : implementation.inputs(candidate, configuration, binding))
+          if (requested.operand < candidate.getInputs().size() &&
+              candidate.getInputs()[requested.operand] == source && sameRepresentation(requirement, requested)) return branch;
+      }
+    }
+  }
   auto loop = dyn_cast<scf::ForOp>(operation->getParentOp());
   if (!loop || loop.getNumResults()) return operation;
   auto step = getConstantIntValue(loop.getStep());
@@ -103,18 +126,21 @@ FailureOr<InputSupply> ImplementationInputs::prepareCaptured(linalg::GenericOp o
 
 InputSupply ImplementationInputs::materialize(Value source, const InputRequirement &requirement, Operation *scope) {
   PhysicalProgramAnalysis analysis(function);
+  DominanceInfo dominance(function);
   auto type = cast<MemRefType>(source.getType());
   memref::AllocOp storage;
   for (auto &previous : prepared) {
+    Operation *consumer = previous.allocation->getBlock()->findAncestorOpInBlock(*scope);
     if (previous.source != source || previous.requirement.panelAxis != requirement.panelAxis ||
         previous.requirement.elementType != requirement.elementType ||
         previous.requirement.panelSize != requirement.panelSize ||
         previous.requirement.alignment < requirement.alignment ||
-        previous.allocation->getBlock() != scope->getBlock() ||
-        !previous.allocation->isBeforeInBlock(scope) ||
-        !analysis.mayReadAt(source, previous.allocation, scope)) continue;
+        !consumer || !dominance.dominates(previous.allocation.getOperation(), scope) ||
+        !previous.allocation->isBeforeInBlock(consumer) ||
+        (previous.allocation->getBlock() != scope->getBlock() && !analysis.isReadOnly(source)) ||
+        !analysis.mayReadAt(source, previous.allocation, consumer)) continue;
     storage = previous.allocation;
-    previous.end->moveAfter(scope);
+    if (previous.end->isBeforeInBlock(consumer)) previous.end->moveAfter(consumer);
     break;
   }
   if (!storage) {
