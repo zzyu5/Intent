@@ -5214,8 +5214,14 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       if (!selected) {
         FailureOr<ParameterOp> existing =
             queryOwnershipBlockingParameter(kernel, occurrenceRoot);
-        if (succeeded(existing))
-          selected = *existing;
+        if (succeeded(existing)) {
+          PhysicalParameterBinding binding = queryParameterBinding(*existing);
+          // Repeated Cartesian axes have distinct occurrence classes even
+          // when their logical extents share the same dimension identity.
+          if (binding.isExact() && binding.source &&
+              *binding.source == sourceAxisIdentity(occurrenceRoot))
+            selected = *existing;
+        }
       }
       parameter = selected ? FailureOr<ParameterOp>(selected)
                            : FailureOr<ParameterOp>(failure());
