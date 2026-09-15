@@ -762,7 +762,8 @@ FailureOr<Value> accessValidity(OpBuilder &builder, Location location,
     FailureOr<Value> broadcast =
         materializeBroadcastToFragment(builder, location, existing, target);
     if (failed(broadcast))
-      return failure();
+      return emitError(location, "pointwise access existing validity has incompatible schema")
+             << "; predicate=" << existing.getType() << "; target=" << target;
     result = *broadcast;
   }
   SmallVector<Value> fragmentCoordinates;
@@ -798,7 +799,8 @@ FailureOr<Value> accessValidity(OpBuilder &builder, Location location,
       FailureOr<Value> broadcast = projectPredicateToFragmentAxis(
           builder, location, found->second, target, *axis);
       if (failed(broadcast))
-        return failure();
+        return emitError(location, "pointwise access tail has incompatible schema")
+               << "; tail=" << found->second.getType() << "; target=" << target;
       result = result ? Value(builder.create<BinaryOp>(
                             location, target, result, *broadcast,
                             BinaryOperator::LogicalAnd))
@@ -1200,6 +1202,34 @@ Type replaceTraversalExtent(Type type, PhysicalSourceAxis source,
 
 bool containsSource(Value value, PhysicalSourceAxis source) {
   return queryFragmentAxis(value.getType(), source).isExact();
+}
+
+std::optional<int64_t> minimumFragmentRegisters(func::FuncOp kernel,
+                                               FragmentType fragment) {
+  if (!fragment || !isa<IntegerType, FloatType>(fragment.getElementType()))
+    return std::nullopt;
+  int64_t limit = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr).getRegistersPerUnit();
+  int64_t footprint = std::max(1u,
+      (fragment.getElementType().getIntOrFloatBitWidth() + 31) / 32);
+  for (Attribute attribute : fragment.getShape()) {
+    auto extent = cast<PhysicalExprAttr>(attribute);
+    int64_t minimum;
+    if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant)) {
+      minimum = extent.getValue();
+    } else if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
+      auto parameter = queryParameterBySymbol(kernel, extent.getSymbol());
+      if (failed(parameter))
+        return std::nullopt;
+      minimum = *llvm::min_element(parameter->getParameter().getCandidates().asArrayRef());
+    } else {
+      return std::nullopt;
+    }
+    if (minimum <= 0)
+      return std::nullopt;
+    footprint = std::min<__int128>(static_cast<__int128>(footprint) * minimum,
+                                   static_cast<__int128>(limit) + 1);
+  }
+  return footprint;
 }
 
 bool containsTraversal(Value value, PhysicalSourceAxis source,
@@ -4159,7 +4189,18 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             succeeded(key) &&
             llvm::is_contained(postStructuredWritebackKeys, *key) &&
             replay.isReplayable();
-        if (!postStructuredWriteback) {
+        bool boundedWriteback = false;
+        if (!ownershipOnly && replay.isReplayable() && !replay.crossesStructuredProgram &&
+            replay.structuredPrograms.empty() && replay.contractions.empty() &&
+            llvm::any_of(writeCoordinates, [&](ArrayRef<Value> coordinates) {
+              return !coordinatesUseRange(coordinates, range);
+            })) {
+          auto fragment = dyn_cast<FragmentType>(store.getValue().getType());
+          auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+          auto footprint = minimumFragmentRegisters(kernel, fragment);
+          boundedWriteback = footprint && *footprint > capabilities.getRegistersPerUnit();
+        }
+        if (!postStructuredWriteback && !boundedWriteback) {
           PhysicalReductionDependencyFact dependency =
               PhysicalProgramAnalysis(kernel).reductionDependency(
                   store.getValue(), sourceAxisIdentity(range), sourceDimension);
@@ -4270,6 +4311,14 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     for (MakeRangeOp range : dynamicRanges) {
       auto fragment = cast<FragmentType>(range.getResult().getType());
       auto physicalExtent = cast<PhysicalExprAttr>(fragment.getShape()[0]);
+      const bool fixedSubregion =
+          range->hasAttr(sourceSubregionAttr) &&
+          physicalExtent.getKind() ==
+              static_cast<uint32_t>(PhysicalExprKind::Constant);
+      if (!fixedSubregion && reuseTraversalRanges.contains(range.getOperation())) {
+        unresolved.push_back(range);
+        continue;
+      }
       if (PhysicalProgramAnalysis(kernel)
               .axisRealization(range.getResult(), 0)
               .constructionScalarSeed) {
@@ -4309,15 +4358,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         else
           retargetSourceExtent(range.getResult(), sourceAxisIdentity(range), physicalExtent);
         fragment = cast<FragmentType>(range.getResult().getType());
-      }
-      const bool fixedSubregion =
-          range->hasAttr(sourceSubregionAttr) &&
-          physicalExtent.getKind() ==
-              static_cast<uint32_t>(PhysicalExprKind::Constant);
-      if (!fixedSubregion &&
-          reuseTraversalRanges.contains(range.getOperation())) {
-        unresolved.push_back(range);
-        continue;
       }
       if (physicalExtent.getKind() !=
           static_cast<uint32_t>(PhysicalExprKind::Constant)) {
@@ -4424,6 +4464,23 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
               replay.crossesAccess && hasMaterializedReductionStoreFork(
                                           store.getValue(), store, source,
                                           dimension, materializationVisited);
+          auto completeReplay = analysis.replayability(
+              store.getValue(), std::nullopt, PhysicalReplayScope::ValueGraph,
+              /*allowAccesses=*/true);
+          auto reduction = analysis.reductionDependency(store.getValue(), source, dimension);
+          bool retainedContraction = completeReplay.isReplayable() &&
+              !completeReplay.contractions.empty() && reduction.isExact() && reduction.depends;
+          if (retainedContraction) {
+            auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+            for (Operation *contract : completeReplay.contractions) {
+              auto fragment = dyn_cast<FragmentType>(contract->getResult(0).getType());
+              auto footprint = minimumFragmentRegisters(kernel, fragment);
+              if (!footprint || *footprint > capabilities.getRegistersPerUnit()) {
+                retainedContraction = false;
+                break;
+              }
+            }
+          }
           // Replaying a read of the destination also crosses its writes from
           // earlier chunks. Preserve that snapshot unless all addresses agree.
           bool clobbersLaterChunk = llvm::any_of(
@@ -4455,7 +4512,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                       kernel, store.getValue(), projection.fragmentAxis)))
                 return failure();
           useReplayTraversal &=
-              replay.isReplayable() && !materializedFork && !clobbersLaterChunk &&
+              replay.isReplayable() && !materializedFork && !retainedContraction && !clobbersLaterChunk &&
               (effectLocal == effectLocalOrigins.end() ||
                !replay.crossesStructuredProgram);
         }
