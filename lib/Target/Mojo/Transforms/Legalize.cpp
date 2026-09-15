@@ -161,7 +161,9 @@ LogicalResult checkSurface(ModuleOp module) {
         supported &= directAtomicAdd(element) && rmw.getKind() == AtomicRMWKind::Add;
     }
     if (!supported) {
-      operation->emitError("current operation/type has no supported Mojo CPU surface form");
+      operation->emitError("current operation/type has no supported Mojo CPU surface form: ")
+          << operation->getName() << "; operands=" << operation->getOperandTypes()
+          << "; results=" << operation->getResultTypes();
       invalid = true;
     }
   });
@@ -262,6 +264,9 @@ LogicalResult legalizeProgram(ModuleOp module) {
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
     if (failed(materializeRegisterContractions(function)) ||
         failed(cpu::materializeStructuredComputations(function))) return failure();
+    // Implementation supplies may introduce additional independent worksets.
+    if (failed(cpu::isolateTasks(function)) ||
+        failed(cpu::materializeTaskDispatches(function))) return failure();
   }
   auto normalize = [&]() {
     PassManager manager(module.getContext());

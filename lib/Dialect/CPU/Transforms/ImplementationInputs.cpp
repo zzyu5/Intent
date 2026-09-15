@@ -173,7 +173,8 @@ InputSupply ImplementationInputs::materialize(Value source, const InputRequireme
     };
     Value full = b.create<arith::DivSIOp>(loc, extent, panel);
     Value tail = b.create<arith::RemSIOp>(loc, extent, panel);
-    if (scope->getParentOfType<scf::ForOp>() || scope->getParentOfType<scf::ParallelOp>()) {
+    if (scope->getParentOfType<scf::ForOp>() || scope->getParentOfType<scf::ParallelOp>() ||
+        scope->getParentOfType<TasksOp>() || scope->getParentOfType<TaskDispatchOp>()) {
       loop(b, loc, zero, full, 1, [&](Value ordinal) { copyPanel(ordinal, panel); });
     } else {
       auto parallel = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{full}, ValueRange{one});

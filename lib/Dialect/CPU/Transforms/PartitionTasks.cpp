@@ -336,7 +336,10 @@ LogicalResult partitionTasks(func::FuncOp function, int64_t grain, const Impleme
 LogicalResult isolateTasks(func::FuncOp function) {
   SmallVector<QuantizeOp> preparations;
   function.walk([&](QuantizeOp operation) {
-    if (!operation->getParentOfType<scf::ParallelOp>()) preparations.push_back(operation);
+    if (!operation->getParentOfType<scf::ParallelOp>() &&
+        !operation->getParentOfType<TasksOp>() &&
+        !operation->getParentOfType<TaskDispatchOp>())
+      preparations.push_back(operation);
   });
   for (auto preparation : preparations) {
     OpBuilder b(preparation);
