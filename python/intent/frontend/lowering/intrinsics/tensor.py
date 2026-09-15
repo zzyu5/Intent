@@ -249,13 +249,14 @@ def _mask(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     value_expression = lowerer.lower_expression(bound["value"])
     value = lowerer.read_value(value_expression, bound["value"])
     dtype, _ = lowerer.dtype_and_shape(value.type, node)
-    predicate = lowerer.materialize(lowerer.lower_expression(bound["valid"]), bound["valid"])
+    predicate = lowerer.read_value(lowerer.lower_expression(bound["valid"]), bound["valid"])
     fill_expression = lowerer.lower_expression(bound["fill"])
     fill = lowerer.materialize(
         fill_expression,
         bound["fill"],
         ScalarType(dtype) if isinstance(fill_expression, Literal) else None,
     )
+    fill = lowerer.read_value(fill, bound["fill"])
     _, value_shape = lowerer.dtype_and_shape(value.type, node)
     fill_dtype, fill_shape = lowerer.dtype_and_shape(fill.type, node)
     if fill_dtype != dtype:
@@ -288,7 +289,7 @@ def _select(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         ("condition", "true_value", "false_value"),
         required=("condition", "true_value", "false_value"),
     )
-    condition = lowerer.materialize(
+    condition = lowerer.read_value(
         lowerer.lower_expression(bound["condition"]), bound["condition"]
     )
     lhs, rhs = lowerer.coerce_pair(
