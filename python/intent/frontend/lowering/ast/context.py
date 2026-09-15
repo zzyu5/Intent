@@ -250,6 +250,31 @@ class FunctionLowerer:
                     frozenset((atom, coefficient) for atom, coefficient in terms.items() if coefficient),
                     constant,
                 )
+            elif properties.get("operator_kind") is BinaryOperator.MULTIPLY:
+                for factor, value in (operands, tuple(reversed(operands))):
+                    factor_terms = self._integer_shape_terms.get(factor)
+                    if factor.type != result.type or factor_terms is None or factor_terms[0]:
+                        continue
+                    bounds = self.integer_expression_bounds(value)
+                    if bounds is None:
+                        continue
+                    scale = factor_terms[1]
+                    lower, upper = sorted(bound * scale for bound in bounds)
+                    dtype = result.type.dtype
+                    signed = dtype.category in (DTypeCategory.SIGNED_INTEGER, DTypeCategory.INDEX)
+                    minimum = -(1 << (dtype.bits - 1)) if signed else 0
+                    maximum = (1 << (dtype.bits - int(signed))) - 1
+                    if not minimum <= lower <= upper <= maximum:
+                        continue
+                    nested, constant = (frozenset({(("value", value), 1)}), 0)
+                    if value.type == result.type:
+                        nested, constant = self._integer_shape_terms.get(value, (nested, constant))
+                    self._integer_shape_terms[result] = (
+                        frozenset((atom, coefficient * scale) for atom, coefficient in nested
+                                  if coefficient * scale),
+                        constant * scale,
+                    )
+                    break
         self.operation_blocks[operation.id] = self.current_block
         for result in operation.results:
             self.value_blocks[result] = self.current_block
