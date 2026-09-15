@@ -249,7 +249,7 @@ cpu::ImplementationRegistry implementations() {
       vectorLegal, scanParameters(false), {}, {}});
   result.add({"mojo.scan_vector", [](Operation *op) { return isa<cpu::ScanOp>(op); },
       [](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
-        return vectorLegal(op, capabilities, config) && isElementwiseContiguousScan(cast<cpu::ScanOp>(op));
+        return vectorLegal(op, capabilities, config) && supportsVectorScan(cast<cpu::ScanOp>(op));
       }, scanParameters(true), {}, {}});
   return result;
 }

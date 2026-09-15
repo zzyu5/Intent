@@ -103,21 +103,56 @@ LogicalResult materialize(ReduceOp operation) {
   return success();
 }
 
-LogicalResult materialize(ScanOp operation) {
+LogicalResult materialize(ScanOp operation, int64_t width) {
   OpBuilder b(operation);
   Location loc = operation.getLoc();
   auto type = cast<MemRefType>(operation.getSources()[0].getType());
   int64_t scanAxis = operation.getAxis();
+  if (width > 1 && !supportsVectorScan(operation))
+    return operation.emitError("selected vector scan requires an elementwise last-axis scan with supported strides");
+  SmallVector<memref::ExtractStridedMetadataOp> descriptors;
+  Value contiguous;
+  if (width > 1)
+    for (Value memory : llvm::concat<const Value>(operation.getSources(), operation.getOutputs())) {
+      auto memoryType = cast<MemRefType>(memory.getType());
+      auto [strides, offset] = memoryType.getStridesAndOffset();
+      if (!ShapedType::isDynamic(strides.back())) continue;
+      auto metadata = b.create<memref::ExtractStridedMetadataOp>(loc, memory);
+      descriptors.push_back(metadata);
+      Value unit = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+          metadata.getStrides().back(), index(b, loc, 1));
+      contiguous = contiguous ? Value(b.create<arith::AndIOp>(loc, contiguous, unit)) : unit;
+    }
+  if (contiguous) {
+    auto dispatch = b.create<scf::IfOp>(loc, contiguous, true);
+    b.setInsertionPointToStart(dispatch.thenBlock());
+    IRMapping mapping;
+    for (auto metadata : descriptors) {
+      auto sourceType = cast<MemRefType>(metadata.getSource().getType());
+      auto [strides, offset] = sourceType.getStridesAndOffset();
+      strides.back() = 1;
+      SmallVector<OpFoldResult> sizes, steps;
+      for (int64_t axis = 0; axis < sourceType.getRank(); ++axis) {
+        sizes.push_back(sourceType.isDynamicDim(axis) ? OpFoldResult(metadata.getSizes()[axis])
+            : OpFoldResult(b.getIndexAttr(sourceType.getDimSize(axis))));
+        steps.push_back(ShapedType::isDynamic(strides[axis]) ? OpFoldResult(metadata.getStrides()[axis])
+            : OpFoldResult(b.getIndexAttr(strides[axis])));
+      }
+      auto viewType = MemRefType::get(sourceType.getShape(), sourceType.getElementType(),
+          StridedLayoutAttr::get(b.getContext(), offset, strides), sourceType.getMemorySpace());
+      OpFoldResult begin = ShapedType::isDynamic(offset) ? OpFoldResult(metadata.getOffset())
+          : OpFoldResult(b.getIndexAttr(offset));
+      mapping.map(metadata.getSource(), b.create<memref::ReinterpretCastOp>(loc,
+          viewType, metadata.getBaseBuffer(), begin, sizes, steps));
+    }
+    auto vectorScan = cast<ScanOp>(b.clone(*operation, mapping));
+    if (failed(materialize(vectorScan, width))) return failure();
+    operation->moveBefore(dispatch.elseBlock(), dispatch.elseBlock()->begin());
+    return materialize(operation, 1);
+  }
   SmallVector<Value> sizes, position(type.getRank());
   for (int64_t axis = 0; axis < type.getRank(); ++axis)
     sizes.push_back(b.create<memref::DimOp>(loc, operation.getSources()[0], axis));
-  int64_t width = 1;
-  auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
-  if (binding)
-    if (auto parameter = dyn_cast_or_null<IntegerAttr>(binding.getParameters().get("scan_width")))
-      width = parameter.getInt();
-  if (width > 1 && !isElementwiseContiguousScan(operation))
-    return operation.emitError("selected vector scan requires a contiguous last axis and an elementwise combine");
   auto combine = [&](ValueRange left, ValueRange right, bool vectorized) {
     Block &body = operation.getCombine().front();
     IRMapping mapping;
@@ -224,6 +259,15 @@ LogicalResult materialize(ScanOp operation) {
   traverse(0);
   operation.erase();
   return success();
+}
+
+LogicalResult materialize(ScanOp operation) {
+  int64_t width = 1;
+  auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
+  if (binding)
+    if (auto parameter = dyn_cast_or_null<IntegerAttr>(binding.getParameters().get("scan_width")))
+      width = parameter.getInt();
+  return materialize(operation, width);
 }
 
 }

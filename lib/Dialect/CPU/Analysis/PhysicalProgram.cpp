@@ -288,7 +288,7 @@ LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
   return failure(invalid);
 }
 
-bool isElementwiseContiguousScan(ScanOp operation) {
+bool supportsVectorScan(ScanOp operation) {
   if (operation.isDestinationPassing()) return false;
   auto type = cast<MemRefType>(operation.getSources()[0].getType());
   if (operation.getAxis() + 1 != static_cast<uint64_t>(type.getRank())) return false;
@@ -296,7 +296,8 @@ bool isElementwiseContiguousScan(ScanOp operation) {
     auto type = cast<MemRefType>(memory.getType());
     SmallVector<int64_t> strides;
     int64_t offset;
-    return !type.getElementType().isInteger(1) && succeeded(type.getStridesAndOffset(strides, offset)) && strides.back() == 1;
+    return !type.getElementType().isInteger(1) && succeeded(type.getStridesAndOffset(strides, offset)) &&
+        (strides.back() == 1 || ShapedType::isDynamic(strides.back()));
   };
   return llvm::all_of(operation.getSources(), contiguous) && llvm::all_of(operation.getOutputs(), contiguous) &&
       llvm::all_of(operation.getCombine().front().without_terminator(), [](Operation &instruction) {

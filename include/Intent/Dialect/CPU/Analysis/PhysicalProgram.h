@@ -44,7 +44,7 @@ private:
 bool isMatrixContraction(mlir::linalg::GenericOp operation);
 std::optional<llvm::SmallVector<std::pair<unsigned, unsigned>>>
 unitReshapeAxes(mlir::Operation *operation);
-bool isElementwiseContiguousScan(ScanOp operation);
+bool supportsVectorScan(ScanOp operation);
 mlir::LogicalResult verifyCPUProgram(mlir::ModuleOp module, bool realized);
 
 }
