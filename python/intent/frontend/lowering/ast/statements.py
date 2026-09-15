@@ -224,6 +224,57 @@ def _lower_return(lowerer: object, node: ast.Return) -> None:
     lowerer.error(node, "only the kernel entry may return outside an inline @intent.fn")
 
 
+def normalize_helper_returns(lowerer: object, function: ast.FunctionDef) -> list[ast.stmt]:
+    def has_return(statements: list[ast.stmt]) -> bool:
+        return any(isinstance(child, ast.Return)
+                   for statement in statements for child in ast.walk(statement))
+
+    if not any(isinstance(statement, ast.If) and has_return([statement])
+               for statement in function.body):
+        return function.body
+    if any(isinstance(node, ast.Return) and node.value is None
+           for node in ast.walk(function)):
+        return function.body
+    result_name = _fresh_loop_control_name(lowerer, function, "return_value")
+
+    def normalize(statements: list[ast.stmt], continuation: list[ast.stmt]) -> list[ast.stmt]:
+        normalized: list[ast.stmt] = []
+        for position, statement in enumerate(statements):
+            if isinstance(statement, ast.Return):
+                if position + 1 != len(statements):
+                    lowerer.error(statements[position + 1], "statement is unreachable after helper return")
+                if statement.value is None:
+                    lowerer.error(statement, "conditional helper return requires a value")
+                assignment = ast.Assign(
+                    targets=[_control_name(result_name, ast.Store(), statement)],
+                    value=statement.value,
+                )
+                normalized.append(ast.copy_location(assignment, statement))
+                return normalized
+            if isinstance(statement, ast.If) and has_return([statement]):
+                remaining = statements[position + 1:] + continuation
+                branch = ast.If(
+                    test=statement.test,
+                    body=normalize(statement.body, remaining),
+                    orelse=normalize(statement.orelse, remaining),
+                )
+                normalized.append(ast.copy_location(branch, statement))
+                return normalized
+            normalized.append(statement)
+        if continuation:
+            normalized.extend(normalize(continuation, []))
+            return normalized
+        return normalized
+
+    # Move the continuation into the branches that have not returned. The usual
+    # if lowering then merges one result, without inventing an undefined initial
+    # value or executing statements after an early return.
+    body = normalize(function.body, [])
+    returned = ast.Return(value=_control_name(result_name, ast.Load(), function))
+    body.append(ast.copy_location(returned, function))
+    return body
+
+
 def _control_value_type(value_type: object) -> object:
     if isinstance(value_type, LogicalIndexType):
         return ScalarType(intent_index)

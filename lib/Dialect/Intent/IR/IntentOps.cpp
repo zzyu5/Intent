@@ -1735,6 +1735,332 @@ bool hasCompletedLoopViewDefinition(Operation *read, ViewStoreOp store,
   return false;
 }
 
+bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
+                                      DominanceInfo &dominance) {
+  using namespace mlir::presburger;
+  using Constraint = std::pair<AffineExpr, bool>;
+  struct AccessDomain {
+    SmallVector<Constraint> constraints;
+    SmallVector<AffineExpr> order;
+  };
+  auto function = read->getParentOfType<func::FuncOp>();
+  MLIRContext *context = read->getContext();
+  llvm::DenseMap<Value, unsigned> variables;
+  llvm::DenseMap<std::pair<Value, int64_t>, Value> shapeValues;
+  llvm::DenseMap<Value, AffineExpr> substitutions;
+  Operation *writerBoundary = nullptr;
+  auto constantIndex = [](Value value) -> std::optional<int64_t> {
+    auto constant = getConstantInteger(value);
+    auto integer = dyn_cast<IntegerType>(value.getType());
+    if (constant && integer && integer.isUnsigned() && integer.getWidth() < 64) {
+      auto attribute = value.getDefiningOp()->getAttrOfType<IntegerAttr>("value");
+      return attribute.getValue().zextOrTrunc(integer.getWidth()).getZExtValue();
+    }
+    return constant;
+  };
+  using Bounds = std::pair<__int128, __int128>;
+  std::function<std::optional<Bounds>(Value)> bounds =
+      [&](Value value) -> std::optional<Bounds> {
+    if (!value || !isIntegerLike(value.getType()))
+      return std::nullopt;
+    unsigned width = 64;
+    bool isUnsigned = false;
+    if (auto integer = dyn_cast<IntegerType>(value.getType())) {
+      width = integer.getWidth();
+      isUnsigned = integer.isUnsigned();
+    }
+    if (width > 64 || (isUnsigned && width == 64))
+      return std::nullopt;
+    Bounds limits = isUnsigned
+        ? Bounds{0, (__int128(1) << width) - 1}
+        : Bounds{-(__int128(1) << (width - 1)), (__int128(1) << (width - 1)) - 1};
+    if (auto constant = constantIndex(value))
+      return Bounds{*constant, *constant};
+    if (value.getDefiningOp<DimOp>())
+      return Bounds{0, limits.second};
+    if (auto argument = dyn_cast<BlockArgument>(value);
+        argument && argument.getArgNumber() == 0) {
+      Operation *loop = argument.getOwner()->getParentOp();
+      auto domain = isa<ForOp, ParallelOp>(loop) && loop->getNumOperands()
+                        ? loop->getOperand(0).getDefiningOp<DomainOp>() : DomainOp();
+      if (domain && domain.getBounds().size() >= 2) {
+        auto begin = bounds(domain.getBounds()[0]), end = bounds(domain.getBounds()[1]);
+        if (begin && end && begin->first < end->second)
+          return Bounds{begin->first, end->second - 1};
+      }
+    }
+    if (auto binary = value.getDefiningOp<BinaryOp>()) {
+      auto lhs = bounds(binary.getLhs()), rhs = bounds(binary.getRhs());
+      if (!lhs || !rhs)
+        return std::nullopt;
+      Bounds result;
+      switch (binary.getOperatorKind()) {
+      case BinaryOperator::Add:
+        result = {lhs->first + rhs->first, lhs->second + rhs->second}; break;
+      case BinaryOperator::Subtract:
+        result = {lhs->first - rhs->second, lhs->second - rhs->first}; break;
+      case BinaryOperator::Multiply: {
+        __int128 products[] = {lhs->first * rhs->first, lhs->first * rhs->second,
+                               lhs->second * rhs->first, lhs->second * rhs->second};
+        auto extrema = std::minmax_element(std::begin(products), std::end(products));
+        result = {*extrema.first, *extrema.second}; break;
+      }
+      default: return std::nullopt;
+      }
+      if (result.first < limits.first || result.second > limits.second)
+        return std::nullopt;
+      return result;
+    }
+    return limits;
+  };
+  std::function<AffineExpr(Value)> index = [&](Value value) -> AffineExpr {
+    if (!value || !isIntegerLike(value.getType()))
+      return {};
+    if (auto integer = dyn_cast<IntegerType>(value.getType());
+        integer && integer.isUnsigned() && integer.getWidth() == 64)
+      return {};
+    if (auto found = substitutions.find(value); found != substitutions.end())
+      return found->second;
+    if (auto constant = constantIndex(value))
+      return getAffineConstantExpr(*constant, context);
+    if (auto dimension = value.getDefiningOp<DimOp>()) {
+      Value shaped = dimension->getOperand(0);
+      auto axis = dimension->getAttrOfType<IntegerAttr>("axis");
+      if (!axis || (writerBoundary &&
+                    !dominance.dominates(shaped, writerBoundary)))
+        return {};
+      auto [known, inserted] = shapeValues.try_emplace(
+          std::make_pair(shaped, axis.getInt()), value);
+      auto [found, fresh] = variables.try_emplace(known->second, variables.size());
+      return getAffineDimExpr(found->second, context);
+    }
+    if (auto binary = value.getDefiningOp<BinaryOp>()) {
+      // Presburger arithmetic is unbounded. Only linearize source arithmetic
+      // whose operand ranges prove that its declared integer width cannot wrap.
+      if (!bounds(value))
+        return {};
+      AffineExpr lhs = index(binary.getLhs()), rhs = index(binary.getRhs());
+      if (!lhs || !rhs)
+        return {};
+      switch (binary.getOperatorKind()) {
+      case BinaryOperator::Add: return lhs + rhs;
+      case BinaryOperator::Subtract: return lhs - rhs;
+      case BinaryOperator::Multiply:
+        if (isa<AffineConstantExpr>(lhs) || isa<AffineConstantExpr>(rhs))
+          return lhs * rhs;
+        break;
+      default: break;
+      }
+      return {};
+    }
+    if (writerBoundary && !dominance.dominates(value, writerBoundary))
+      return {};
+    auto [found, inserted] = variables.try_emplace(value, variables.size());
+    return getAffineDimExpr(found->second, context);
+  };
+  auto path = [&](Operation *operation) {
+    SmallVector<Operation *> result;
+    for (; operation && operation != function; operation = operation->getParentOp())
+      result.push_back(operation);
+    std::reverse(result.begin(), result.end());
+    return result;
+  };
+  SmallVector<Operation *> readPath = path(read);
+  auto induction = [](Operation *operation) -> Value {
+    if (!isa<ForOp, ParallelOp>(operation) || operation->getNumOperands() == 0 ||
+        !operation->getRegion(0).hasOneBlock() ||
+        operation->getRegion(0).front().getNumArguments() == 0)
+      return {};
+    return operation->getRegion(0).front().getArgument(0);
+  };
+  auto describe = [&](ArrayRef<Operation *> operations,
+                      AccessDomain &domain) -> bool {
+    for (auto [position, operation] : llvm::enumerate(operations)) {
+      domain.order.push_back(getAffineConstantExpr(
+          std::distance(operation->getBlock()->begin(), operation->getIterator()), context));
+      if (position + 1 == operations.size())
+        break;
+      if (Value iv = induction(operation)) {
+        auto range = operation->getOperand(0).getDefiningOp<DomainOp>();
+        if (!range || range.getBounds().size() < 2 ||
+            (range.getBounds().size() == 3 &&
+             getConstantInteger(range.getBounds()[2]) != 1))
+          return false;
+        AffineExpr current = index(iv), begin = index(range.getBounds()[0]),
+                   end = index(range.getBounds()[1]);
+        if (!current || !begin || !end)
+          return false;
+        domain.constraints.emplace_back(current - begin, false);
+        domain.constraints.emplace_back(end - current - 1, false);
+        domain.order.push_back(current);
+        continue;
+      }
+      auto branch = dyn_cast<IfOp>(operation);
+      auto comparison = branch ? branch.getCondition().getDefiningOp<CompareOp>()
+                               : CompareOp();
+      if (!comparison)
+        return false;
+      AffineExpr lhs = index(comparison.getLhs()), rhs = index(comparison.getRhs());
+      if (!lhs || !rhs)
+        return false;
+      bool thenBranch = operations[position + 1]->getParentRegion() ==
+                        &branch.getThenRegion();
+      auto predicate = comparison.getPredicate();
+      if (!thenBranch) {
+        switch (predicate) {
+        case ComparePredicate::Lt: predicate = ComparePredicate::Ge; break;
+        case ComparePredicate::Le: predicate = ComparePredicate::Gt; break;
+        case ComparePredicate::Gt: predicate = ComparePredicate::Le; break;
+        case ComparePredicate::Ge: predicate = ComparePredicate::Lt; break;
+        case ComparePredicate::Ne: predicate = ComparePredicate::Eq; break;
+        default: return false;
+        }
+      }
+      switch (predicate) {
+      case ComparePredicate::Lt: domain.constraints.emplace_back(rhs - lhs - 1, false); break;
+      case ComparePredicate::Le: domain.constraints.emplace_back(rhs - lhs, false); break;
+      case ComparePredicate::Gt: domain.constraints.emplace_back(lhs - rhs - 1, false); break;
+      case ComparePredicate::Ge: domain.constraints.emplace_back(lhs - rhs, false); break;
+      case ComparePredicate::Eq: domain.constraints.emplace_back(lhs - rhs, true); break;
+      default: return false;
+      }
+    }
+    return true;
+  };
+  AccessDomain reads;
+  if (!describe(readPath, reads))
+    return false;
+  auto relation = read->getAttrOfType<IndexRelationAttr>("index");
+  if (!relation || relation.getTerms().size() != static_cast<size_t>(tensor.getRank()))
+    return false;
+  SmallVector<AffineExpr> coordinates;
+  for (Attribute attribute : relation.getTerms()) {
+    auto term = cast<IndexTermAttr>(attribute);
+    AffineExpr coordinate;
+    if (term.getKind() == 2 && term.getStaticValues().size() == 1)
+      coordinate = getAffineConstantExpr(term.getStaticValues()[0], context);
+    else if (term.getKind() == 3)
+      coordinate = index(indexTermOperand(read, term));
+    if (!coordinate)
+      return false;
+    coordinates.push_back(coordinate);
+  }
+  SmallVector<AccessDomain> writes;
+  for (Operation *user : read->getOperand(0).getUsers()) {
+    auto store = dyn_cast<ViewStoreOp>(user);
+    auto writeRelation = store ? store->getAttrOfType<IndexRelationAttr>("index")
+                               : IndexRelationAttr();
+    if (!store || store->getOperand(0) != read->getOperand(0) ||
+        store->hasAttr("valid_operand_index") || !writeRelation ||
+        writeRelation.getTerms().size() != coordinates.size())
+      continue;
+    SmallVector<Operation *> writePath = path(store);
+    substitutions.clear();
+    writerBoundary = nullptr;
+    bool exact = true;
+    AccessDomain write;
+    // Invert direct scalar loop coordinates. Each selected writer iteration is
+    // a witness for this read address; no triangle or algorithm name is needed.
+    for (auto [axis, attribute] : llvm::enumerate(writeRelation.getTerms())) {
+      auto term = cast<IndexTermAttr>(attribute);
+      Value value = term.getKind() == 3 ? indexTermOperand(store, term) : Value();
+      auto argument = dyn_cast_or_null<BlockArgument>(value);
+      Operation *parent = argument ? argument.getOwner()->getParentOp() : nullptr;
+      if (parent && induction(parent) == value && llvm::is_contained(writePath, parent)) {
+        auto [found, inserted] = substitutions.try_emplace(value, coordinates[axis]);
+        if (!inserted)
+          write.constraints.emplace_back(found->second - coordinates[axis], true);
+      }
+    }
+    for (Operation *operation : writePath) {
+      Value iv = induction(operation);
+      if (!iv)
+        continue;
+      if (!writerBoundary)
+        writerBoundary = operation;
+      bool shared = llvm::is_contained(readPath, operation);
+      if (!substitutions.contains(iv)) {
+        if (!shared) { exact = false; break; }
+        auto found = variables.find(iv);
+        if (found == variables.end()) { exact = false; break; }
+        substitutions[iv] = getAffineDimExpr(found->second, context);
+      }
+      if (shared && isa<ParallelOp>(operation)) {
+        auto found = variables.find(iv);
+        if (found == variables.end()) { exact = false; break; }
+        write.constraints.emplace_back(
+            substitutions.lookup(iv) - getAffineDimExpr(found->second, context), true);
+      }
+    }
+    if (!exact || !describe(writePath, write))
+      continue;
+    for (auto [axis, attribute] : llvm::enumerate(writeRelation.getTerms())) {
+      auto term = cast<IndexTermAttr>(attribute);
+      AffineExpr coordinate;
+      if (term.getKind() == 2 && term.getStaticValues().size() == 1)
+        coordinate = getAffineConstantExpr(term.getStaticValues()[0], context);
+      else if (term.getKind() == 3)
+        coordinate = index(indexTermOperand(store, term));
+      if (!coordinate) { exact = false; break; }
+      write.constraints.emplace_back(coordinate - coordinates[axis], true);
+    }
+    if (exact)
+      writes.push_back(std::move(write));
+  }
+  PresburgerSpace space = PresburgerSpace::getSetSpace(variables.size());
+  auto add = [&](IntegerPolyhedron &set, AffineExpr expression, bool equality) {
+    SmallVector<int64_t> row(variables.size() + 1, 0);
+    auto fits = [](__int128 value) {
+      return value >= std::numeric_limits<int64_t>::min() &&
+             value <= std::numeric_limits<int64_t>::max();
+    };
+    std::function<bool(AffineExpr, int64_t)> flatten = [&](AffineExpr term, int64_t scale) {
+      if (auto constant = dyn_cast<AffineConstantExpr>(term)) {
+        __int128 value = static_cast<__int128>(scale) * constant.getValue() + row.back();
+        if (!fits(value)) return false;
+        row.back() = value;
+        return true;
+      }
+      if (auto dim = dyn_cast<AffineDimExpr>(term)) {
+        __int128 value = static_cast<__int128>(row[dim.getPosition()]) + scale;
+        if (!fits(value)) return false;
+        row[dim.getPosition()] = value;
+        return true;
+      }
+      auto binary = cast<AffineBinaryOpExpr>(term);
+      if (binary.getKind() == AffineExprKind::Add)
+        return flatten(binary.getLHS(), scale) && flatten(binary.getRHS(), scale);
+      auto constant = dyn_cast<AffineConstantExpr>(binary.getRHS());
+      if (binary.getKind() != AffineExprKind::Mul || !constant)
+        return false;
+      __int128 product = static_cast<__int128>(scale) * constant.getValue();
+      return fits(product) && flatten(binary.getLHS(), product);
+    };
+    if (!flatten(expression, 1)) return false;
+    if (equality) set.addEquality(row);
+    else set.addInequality(row);
+    return true;
+  };
+  IntegerPolyhedron readSet(space);
+  for (auto [expression, equality] : reads.constraints)
+    if (!add(readSet, expression, equality)) return false;
+  PresburgerSet unwritten(readSet);
+  for (const AccessDomain &write : writes) {
+    IntegerPolyhedron prefix(space);
+    for (auto [expression, equality] : write.constraints)
+      if (!add(prefix, expression, equality)) return false;
+    for (auto [writtenTime, readTime] : llvm::zip(write.order, reads.order)) {
+      IntegerPolyhedron earlier(prefix);
+      if (!add(earlier, readTime - writtenTime - 1, false)) return false;
+      unwritten = unwritten.subtract(PresburgerSet(earlier));
+      if (!add(prefix, readTime - writtenTime, true)) return false;
+    }
+    if (unwritten.isIntegerEmpty())
+      return true;
+  }
+  return false;
+}
+
 bool hasDominatingViewDefinition(Operation *read, RankedTensorType tensor) {
   Value resource = read->getOperand(0);
   auto function = read->getParentOfType<func::FuncOp>();
@@ -1786,6 +2112,8 @@ bool hasDominatingViewDefinition(Operation *read, RankedTensorType tensor) {
     if (complete)
       return true;
   }
+  if (hasAffinePrecedingViewDefinition(read, tensor, dominance))
+    return true;
   if (!tensor.hasStaticShape())
     return false;
   // Several unconditional writes may partition one output. Preserve their

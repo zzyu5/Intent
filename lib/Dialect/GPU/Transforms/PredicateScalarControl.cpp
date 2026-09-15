@@ -13,7 +13,16 @@ bool isScalar(Type type) {
   return isa<IntegerType, IndexType, FloatType>(type);
 }
 
-bool canPredicate(Block &block, bool allowStores = false) {
+bool isScalarProduct(Type type) {
+  if (auto record = dyn_cast<RecordType>(type))
+    return llvm::all_of(record.getFieldTypes(), [](Attribute field) {
+      return isScalarProduct(cast<TypeAttr>(field).getValue());
+    });
+  return isScalar(type);
+}
+
+bool canPredicate(Block &block, bool allowStores = false,
+                  bool allowProducts = false) {
   for (Operation &operation : block.without_terminator()) {
     if (auto store = dyn_cast<StoreOp>(operation)) {
       if (!allowStores || !isScalar(store.getValue().getType()) ||
@@ -24,7 +33,9 @@ bool canPredicate(Block &block, bool allowStores = false) {
       continue;
     }
     if (operation.getNumRegions() || !operation.getNumResults() ||
-        !llvm::all_of(operation.getResultTypes(), isScalar))
+        !llvm::all_of(operation.getResultTypes(), [&](Type type) {
+          return allowProducts ? isScalarProduct(type) : isScalar(type);
+        }))
       return false;
     ValueRange coordinates;
     if (auto load = dyn_cast<LoadOp>(operation))
@@ -35,7 +46,9 @@ bool canPredicate(Block &block, bool allowStores = false) {
           return isScalar(coordinate.getType());
         }))
       return false;
-    if (!canPredicateValueOperation(&operation))
+    bool product = allowProducts && isa<MakeRecordOp, ExtractOp>(operation) &&
+                   isSpeculatable(&operation) && isMemoryEffectFree(&operation);
+    if (!product && !canPredicateValueOperation(&operation))
       return false;
   }
   return true;
@@ -50,6 +63,26 @@ SmallVector<Value> predicateBlock(OpBuilder &builder, Block &block,
   for (Value value : block.getTerminator()->getOperands())
     results.push_back(mapping.lookupOrDefault(value));
   return results;
+}
+
+Value selectScalarProduct(OpBuilder &builder, Location location, Value condition,
+                          Value lhs, Value rhs) {
+  auto record = dyn_cast<RecordType>(lhs.getType());
+  if (!record)
+    return builder.create<SelectOp>(location, lhs.getType(), condition, lhs, rhs);
+  auto field = [&](Value value, unsigned index, Type type) -> Value {
+    if (auto made = value.getDefiningOp<MakeRecordOp>())
+      return made.getFields()[index];
+    return builder.create<ExtractOp>(location, type, value, index);
+  };
+  SmallVector<Value> fields;
+  for (auto [index, attribute] : llvm::enumerate(record.getFieldTypes())) {
+    Type type = cast<TypeAttr>(attribute).getValue();
+    fields.push_back(selectScalarProduct(builder, location, condition,
+                                         field(lhs, index, type),
+                                         field(rhs, index, type)));
+  }
+  return builder.create<MakeRecordOp>(location, record, fields);
 }
 
 } // namespace
@@ -184,9 +217,9 @@ LogicalResult predicateScalarControl(ModuleOp module) {
       continue;
     }
     if (conditional.getElseRegion().empty() ||
-        !llvm::all_of(conditional.getResultTypes(), isScalar) ||
-        !canPredicate(conditional.getThenRegion().front()) ||
-        !canPredicate(conditional.getElseRegion().front()))
+        !llvm::all_of(conditional.getResultTypes(), isScalarProduct) ||
+        !canPredicate(conditional.getThenRegion().front(), false, true) ||
+        !canPredicate(conditional.getElseRegion().front(), false, true))
       continue;
     OpBuilder builder(conditional);
     Value otherwise = builder.create<UnaryOp>(
@@ -198,12 +231,11 @@ LogicalResult predicateScalarControl(ModuleOp module) {
         builder, conditional.getElseRegion().front(), otherwise);
     for (auto [result, thenValue, elseValue] :
          llvm::zip(conditional.getResults(), thenValues, elseValues)) {
-      auto replacement = builder.create<SelectOp>(
-          conditional.getLoc(), result.getType(), conditional.getCondition(),
-          thenValue, elseValue);
+      Value replacement = selectScalarProduct(
+          builder, conditional.getLoc(), conditional.getCondition(), thenValue, elseValue);
       if (Attribute origin = conditional->getAttr(originAttr))
-        replacement->setAttr(originAttr, origin);
-      result.replaceAllUsesWith(replacement.getResult());
+        replacement.getDefiningOp()->setAttr(originAttr, origin);
+      result.replaceAllUsesWith(replacement);
     }
     conditional.erase();
   }

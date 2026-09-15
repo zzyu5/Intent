@@ -141,7 +141,16 @@ class FunctionLowerer:
         }
         self.loop_stack = []
         self.inline_helpers.append(frame)
-        self.lower_statements(source.function.body)
+        from .statements import normalize_helper_returns
+
+        body = normalize_helper_returns(self, source.function)
+        if body is source.function.body:
+            self.lower_statements(body)
+        else:
+            self.lower_statements(body[:-1])
+            if body[-1].value.id not in self.environment:
+                self.error(source.function, "@intent.fn must return a value on every runtime branch")
+            self.lower_statements(body[-1:])
         if frame.returned is None:
             self.error(source.function, "@intent.fn must end with an explicit return")
         results = frame.returned
