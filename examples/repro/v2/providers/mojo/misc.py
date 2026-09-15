@@ -53,7 +53,7 @@ def partitioned_max(context):
     state = {}
 
     def generated_launch():
-        workspace = torch.full((128, 300), -torch.inf, dtype=torch.float32)
+        workspace = torch.empty((128, 300), dtype=torch.float32)
         partial(x, workspace)
         state["generated"] = reduce.run(workspace)
 
@@ -65,7 +65,7 @@ def partitioned_max(context):
         PreparedLaunch(generated_launch, lambda: state["generated"]),
         PreparedLaunch(source_launch, lambda: state["source"]), Tolerance(atol=0.0),
         cuda_graph=False, device_type="cpu", cpu_host_timing=True,
-        note="既有M128-N257-P300两阶段max，包含空子区域；原负输入、exact输出；单NUMA8核，完整host含workspace分配/初始化及两kernel同步，PyTorch amax reference。",
+        note="既有M128-N257-P300两阶段max，包含空子区域；原负输入、exact输出；单NUMA8核，完整host含workspace分配及两kernel同步；partial kernel完整写入Out，PyTorch单次amax为数学reference。",
     )
 
 
