@@ -371,6 +371,45 @@ LogicalResult realizeHistograms(func::FuncOp function) {
 }
 
 LogicalResult materializeStructuredComputations(func::FuncOp function) {
+  SmallVector<Operation *> views;
+  function.walk([&](Operation *operation) {
+    if (isa<memref::ExpandShapeOp, memref::CollapseShapeOp>(operation)) views.push_back(operation);
+  });
+  for (Operation *operation : views) {
+    auto axes = unitReshapeAxes(operation);
+    if (!axes) return operation->emitError("CPU shape view materialization requires unit-axis reassociation");
+    OpBuilder b(operation);
+    Location loc = operation->getLoc();
+    auto type = cast<MemRefType>(operation->getResult(0).getType());
+    SmallVector<int64_t> staticStrides;
+    int64_t staticOffset;
+    if (failed(type.getStridesAndOffset(staticStrides, staticOffset)))
+      return operation->emitError("CPU shape view materialization requires strided storage");
+    auto metadata = b.create<memref::ExtractStridedMetadataOp>(loc, operation->getOperand(0));
+    SmallVector<OpFoldResult> sizes(type.getRank()), strides;
+    for (int64_t axis = 0; axis < type.getRank(); ++axis) {
+      if (!type.isDynamicDim(axis)) sizes[axis] = b.getIndexAttr(type.getDimSize(axis));
+      strides.push_back(b.getIndexAttr(ShapedType::isDynamic(staticStrides[axis]) ? 1 : staticStrides[axis]));
+    }
+    for (auto [source, result] : *axes) {
+      if (type.isDynamicDim(result)) sizes[result] = metadata.getSizes()[source];
+      if (ShapedType::isDynamic(staticStrides[result])) strides[result] = metadata.getStrides()[source];
+    }
+    if (auto expand = dyn_cast<memref::ExpandShapeOp>(operation))
+      for (auto [source, group] : llvm::enumerate(expand.getReassociationIndices())) {
+        Value stride = metadata.getStrides()[source];
+        for (int64_t result : llvm::reverse(group)) {
+          if (ShapedType::isDynamic(staticStrides[result])) strides[result] = stride;
+          if (result != group.front() && type.getDimSize(result) != 1)
+            stride = b.create<arith::MulIOp>(loc, stride, getValueOrCreateConstantIndexOp(b, loc, sizes[result]));
+        }
+      }
+    OpFoldResult offset = ShapedType::isDynamic(staticOffset) ? OpFoldResult(metadata.getOffset())
+                                                            : OpFoldResult(b.getIndexAttr(staticOffset));
+    Value view = b.create<memref::ReinterpretCastOp>(loc, type, metadata.getBaseBuffer(), offset, sizes, strides);
+    operation->getResult(0).replaceAllUsesWith(view);
+    operation->erase();
+  }
   SmallVector<Operation *> operations;
   function.walk([&](Operation *operation) {
     if (isa<linalg::GenericOp, linalg::FillOp, ReduceOp, ScanOp>(operation)) operations.push_back(operation);

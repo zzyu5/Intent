@@ -75,6 +75,12 @@ public:
     if (auto fill = dyn_cast<linalg::FillOp>(operation)) { (void)get(fill.getOutputs()[0]); return; }
     if (auto copy = dyn_cast<memref::CopyOp>(operation)) { bind(copy.getSource(), copy.getTarget()); return; }
     if (auto cast = dyn_cast<memref::CastOp>(operation)) { bind(cast.getSource(), cast.getResult()); return; }
+    if (auto axes = unitReshapeAxes(operation)) {
+      SmallVector<unsigned> source(get(operation->getOperand(0)));
+      auto result = get(operation->getResult(0));
+      for (auto [from, to] : *axes) join(source[from], result[to]);
+      return;
+    }
     if (auto view = dyn_cast<memref::SubViewOp>(operation)) {
       SmallVector<unsigned> source(get(view.getSource()));
       auto result = get(view.getResult());

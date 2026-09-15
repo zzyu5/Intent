@@ -13,6 +13,34 @@ using namespace mlir;
 
 namespace intent::cpu {
 
+std::optional<SmallVector<std::pair<unsigned, unsigned>>> unitReshapeAxes(Operation *operation) {
+  if (!operation) return std::nullopt;
+  bool expanding = isa<memref::ExpandShapeOp>(operation);
+  if (!expanding && !isa<memref::CollapseShapeOp>(operation)) return std::nullopt;
+  auto source = cast<MemRefType>(operation->getOperand(0).getType());
+  auto result = cast<MemRefType>(operation->getResult(0).getType());
+  auto groups = expanding ? cast<memref::ExpandShapeOp>(operation).getReassociationIndices()
+                          : cast<memref::CollapseShapeOp>(operation).getReassociationIndices();
+  auto wider = expanding ? result : source;
+  auto narrower = expanding ? source : result;
+  SmallVector<std::pair<unsigned, unsigned>> axes;
+  for (auto [axis, group] : llvm::enumerate(groups)) {
+    std::optional<unsigned> nonunit;
+    for (int64_t member : group)
+      if (wider.getDimSize(member) != 1) {
+        if (nonunit) return std::nullopt;
+        nonunit = member;
+      }
+    if (!nonunit) {
+      if (narrower.getDimSize(axis) != 1) return std::nullopt;
+      continue;
+    }
+    if (wider.getDimSize(*nonunit) != narrower.getDimSize(axis)) return std::nullopt;
+    axes.emplace_back(expanding ? axis : *nonunit, expanding ? *nonunit : axis);
+  }
+  return axes;
+}
+
 bool isMatrixContraction(linalg::GenericOp operation) {
   if (operation.getInputs().size() != 2 || operation.getOutputs().size() != 1 ||
       operation.getNumResults()) return false;
@@ -56,6 +84,8 @@ bool isMatrixContraction(linalg::GenericOp operation) {
 Value PhysicalProgramAnalysis::storageRoot(Value memory) {
   while (true) {
     if (auto view = memory.getDefiningOp<memref::SubViewOp>()) memory = view.getSource();
+    else if (auto view = memory.getDefiningOp<memref::ExpandShapeOp>()) memory = view.getSrc();
+    else if (auto view = memory.getDefiningOp<memref::CollapseShapeOp>()) memory = view.getSrc();
     else if (auto cast = memory.getDefiningOp<memref::CastOp>()) memory = cast.getSource();
     else if (auto cast = memory.getDefiningOp<memref::ReinterpretCastOp>()) memory = cast.getSource();
     else if (auto metadata = memory.getDefiningOp<memref::ExtractStridedMetadataOp>()) memory = metadata.getSource();

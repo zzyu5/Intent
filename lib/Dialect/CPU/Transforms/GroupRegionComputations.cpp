@@ -111,6 +111,8 @@ struct RegionGroup {
           if (lifted.contains(view.getSource())) changed |= mark(view.getResult());
         } else if (auto cast = dyn_cast<memref::CastOp>(operation)) {
           if (lifted.contains(cast.getSource())) changed |= mark(cast.getResult());
+        } else if (unitReshapeAxes(operation)) {
+          if (lifted.contains(operation->getOperand(0))) changed |= mark(operation->getResult(0));
         }
       });
     }
@@ -136,6 +138,10 @@ struct RegionGroup {
         return;
       }
       if (isa<linalg::FillOp, linalg::YieldOp, linalg::IndexOp>(operation)) return;
+      if (unitReshapeAxes(operation)) {
+        valid &= lifted.contains(operation->getOperand(0)) == lifted.contains(operation->getResult(0));
+        return;
+      }
       if (auto end = dyn_cast<memref::DeallocOp>(operation)) {
         auto allocation = end.getMemref().getDefiningOp<memref::AllocOp>();
         valid &= allocation && parallel->isAncestor(allocation);
@@ -232,6 +238,7 @@ struct RegionGroup {
         while (!headViews.count(projection.getDefiningOp())) {
           if (auto view = projection.getDefiningOp<memref::SubViewOp>()) projection = view.getSource();
           else if (auto cast = projection.getDefiningOp<memref::CastOp>()) projection = cast.getSource();
+          else if (unitReshapeAxes(projection.getDefiningOp())) projection = projection.getDefiningOp()->getOperand(0);
           else break;
         }
         auto view = projection.getDefiningOp<memref::SubViewOp>();
@@ -289,6 +296,10 @@ struct GroupRewriter {
 
   void clone(OpBuilder &b, Operation *operation, ArrayRef<AffineExpr> loops = {}) {
     Location loc = operation->getLoc();
+    if (unitReshapeAxes(operation) && group.lifted.contains(operation->getResult(0))) {
+      mapping.map(operation->getResult(0), mapping.lookupOrDefault(operation->getOperand(0)));
+      return;
+    }
     if (auto dimension = dyn_cast<memref::DimOp>(operation)) {
       if (group.lifted.contains(dimension.getSource())) {
         int64_t axis = *dimension.getConstantIndex();

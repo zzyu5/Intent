@@ -1985,6 +1985,35 @@ private:
         }
         while (next < tensor.getRank() && tensor.getDimSize(next) == 1) ++next;
         unitAxesOnly &= next == tensor.getRank();
+        if (unitAxesOnly && llvm::all_of(logicalInput.getUsers(), [&](Operation *user) {
+              return user == operation || isa<DimOp>(user);
+            })) {
+          auto reassociation = [](ArrayRef<int64_t> shape) {
+            SmallVector<ReassociationIndices> groups;
+            ReassociationIndices group;
+            bool nonunit = false;
+            for (auto [axis, size] : llvm::enumerate(shape)) {
+              if (size != 1 && nonunit) { groups.push_back(group); group.clear(); }
+              group.push_back(axis);
+              nonunit |= size != 1;
+            }
+            if (nonunit) groups.push_back(group);
+            return groups;
+          };
+          Value view = input;
+          if (llvm::is_contained(source.getShape(), int64_t{1}))
+            view = builder.create<memref::CollapseShapeOp>(loc, view, reassociation(source.getShape()));
+          if (llvm::is_contained(tensor.getShape(), int64_t{1})) {
+            SmallVector<OpFoldResult> shape;
+            for (int64_t axis = 0; axis < tensor.getRank(); ++axis)
+              shape.push_back(tensor.isDynamicDim(axis) ? OpFoldResult((*sizes)[axis])
+                  : OpFoldResult(builder.getIndexAttr(tensor.getDimSize(axis))));
+            view = builder.create<memref::ExpandShapeOp>(loc, tensor.getShape(), view,
+                reassociation(tensor.getShape()), shape);
+          }
+          values.map(operation->getResult(0), view);
+          return success();
+        }
         if (!unitAxesOnly) {
           SmallVector<Value> sourceSizes;
           for (int64_t axis = 0; axis < source.getRank(); ++axis)

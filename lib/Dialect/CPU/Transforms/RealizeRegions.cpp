@@ -89,6 +89,23 @@ LogicalResult instantiate(OpBuilder &b, Region &helper, ValueRange arguments,
             mapping.lookupOrDefault(cast.getSource())));
         continue;
       }
+      if (auto view = dyn_cast<memref::CollapseShapeOp>(operation)) {
+        mapping.map(view.getResult(), b.create<memref::CollapseShapeOp>(view.getLoc(),
+            mapping.lookupOrDefault(view.getSrc()), view.getReassociationIndices()));
+        continue;
+      }
+      if (auto view = dyn_cast<memref::ExpandShapeOp>(operation)) {
+        SmallVector<OpFoldResult> sizes;
+        auto selected = partition->axes.find(view.getResult());
+        for (auto [axis, size] : llvm::enumerate(getMixedValues(view.getStaticOutputShape(), view.getOutputShape(), b))) {
+          if (selected != partition->axes.end() && selected->second == axis) sizes.push_back(width);
+          else sizes.push_back(isa<Value>(size) ? OpFoldResult(mapping.lookupOrDefault(cast<Value>(size))) : size);
+        }
+        mapping.map(view.getResult(), b.create<memref::ExpandShapeOp>(view.getLoc(),
+            tiledType(view.getResult()).getShape(), mapping.lookupOrDefault(view.getSrc()),
+            view.getReassociationIndices(), sizes));
+        continue;
+      }
       if (auto view = dyn_cast<memref::SubViewOp>(operation)) {
         auto mapped = [&](ArrayRef<OpFoldResult> values) {
           SmallVector<OpFoldResult> result;
