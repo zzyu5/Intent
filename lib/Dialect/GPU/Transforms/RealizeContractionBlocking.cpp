@@ -1525,6 +1525,20 @@ bool collectStorePaths(Value value, SmallVector<CastOp> casts,
         return false;
       continue;
     }
+    if (auto broadcast = dyn_cast<BroadcastOp>(user)) {
+      auto source = dyn_cast<FragmentType>(value.getType());
+      auto result = dyn_cast<FragmentType>(broadcast.getResult().getType());
+      if (!source || !result || source.getShape() != result.getShape())
+        return false;
+      auto projection = queryAxisProjection(source, result);
+      if (!projection.isExact() ||
+          llvm::any_of(llvm::enumerate(projection.targetToSource), [](auto entry) {
+            return !entry.value() || *entry.value() != entry.index();
+          }) ||
+          !collectStorePaths(broadcast.getResult(), casts, paths, visited))
+        return false;
+      continue;
+    }
     auto store = dyn_cast<StoreOp>(user);
     if (!store || store.getValue() != value)
       return false;
@@ -5126,6 +5140,122 @@ LogicalResult orientLoopContractions(ModuleOp module) {
   return success();
 }
 
+static ReshapeOp exposeTransposedContractSplit(ContractOp contract) {
+  auto transpose = dyn_cast<TransposeOp>(*contract.getResult().getUsers().begin());
+  if (!transpose || transpose.getPermutation() != ArrayRef<int64_t>{1, 0} ||
+      !transpose.getResult().hasOneUse())
+    return {};
+  auto output = dyn_cast<ReshapeOp>(*transpose.getResult().getUsers().begin());
+  if (!output)
+    return {};
+  auto target = cast<FragmentType>(output.getResult().getType());
+  SmallVector<int64_t> freeAxes;
+  std::optional<int64_t> columnAxis;
+  llvm::SmallDenseSet<int64_t> units;
+  for (Attribute attribute : output.getReassociation()) {
+    auto group = cast<ReshapeGroupAttr>(attribute);
+    if (group.getSourceAxes().empty()) {
+      for (int64_t axis : group.getResultAxes().asArrayRef()) {
+        auto extent = cast<PhysicalExprAttr>(target.getShape()[axis]);
+        if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+            extent.getValue() != 1)
+          return {};
+        units.insert(axis);
+      }
+    } else if (group.getSourceAxes().asArrayRef() == ArrayRef<int64_t>{0} &&
+               group.getResultAxes().size() == 1 && !columnAxis) {
+      columnAxis = group.getResultAxes()[0];
+    } else if (group.getSourceAxes().asArrayRef() == ArrayRef<int64_t>{1} && freeAxes.empty()) {
+      llvm::append_range(freeAxes, group.getResultAxes().asArrayRef());
+    } else {
+      return {};
+    }
+  }
+  if (!columnAxis || freeAxes.size() < 2 ||
+      freeAxes.size() + units.size() + 1 != target.getShape().size())
+    return {};
+  auto rowExtent = cast<PhysicalExprAttr>(contract.getResult().getType().getShape()[0]);
+  if (rowExtent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+      rowExtent.getValue() <= 0)
+    return {};
+  int64_t product = 1;
+  for (int64_t axis : freeAxes) {
+    auto extent = cast<PhysicalExprAttr>(target.getShape()[axis]);
+    if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+        extent.getValue() <= 0 || product > rowExtent.getValue() / extent.getValue())
+      return {};
+    product *= extent.getValue();
+  }
+  if (product != rowExtent.getValue() ||
+      target.getShape()[*columnAxis] != contract.getResult().getType().getShape()[1])
+    return {};
+
+  // Commute a pure transpose with the declared row-major split, exposing
+  // [split rows..., column] to the existing contraction composition below.
+  OpBuilder builder(transpose);
+  SmallVector<Attribute> shape, mappings;
+  SmallVector<int64_t> splitAxes;
+  auto appendAxis = [&](int64_t axis) {
+    auto mapping = cast<AxisMapAttr>(target.getAxisMaps()[axis]);
+    mappings.push_back(AxisMapAttr::get(
+        contract.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+        mapping.getDimensionId(), shape.size(), mapping.getDerived()));
+    shape.push_back(target.getShape()[axis]);
+  };
+  for (int64_t axis : freeAxes) {
+    splitAxes.push_back(shape.size());
+    appendAxis(axis);
+  }
+  appendAxis(*columnAxis);
+  auto expanded = FragmentType::get(
+      contract.getContext(), target.getElementType(), builder.getArrayAttr(shape),
+      builder.getArrayAttr(mappings), target.getValidity(), target.getOwner());
+  auto split = builder.create<ReshapeOp>(
+      output.getLoc(), expanded, contract.getResult(), builder.getArrayAttr({
+          ReshapeGroupAttr::get(contract.getContext(), builder.getDenseI64ArrayAttr({0}),
+                               builder.getDenseI64ArrayAttr(splitAxes)),
+          ReshapeGroupAttr::get(contract.getContext(), builder.getDenseI64ArrayAttr({1}),
+                               builder.getDenseI64ArrayAttr({static_cast<int64_t>(freeAxes.size())}))}));
+  if (Attribute origin = output->getAttr(originAttr))
+    split->setAttr(originAttr, origin);
+  shape.clear();
+  mappings.clear();
+  SmallVector<int64_t> permutation;
+  SmallVector<Attribute> restore;
+  for (int64_t axis = 0; axis < static_cast<int64_t>(target.getShape().size()); ++axis) {
+    if (units.contains(axis)) {
+      restore.push_back(ReshapeGroupAttr::get(
+          contract.getContext(), builder.getDenseI64ArrayAttr({}),
+          builder.getDenseI64ArrayAttr({axis})));
+      continue;
+    }
+    int64_t inputAxis = axis == *columnAxis
+                            ? static_cast<int64_t>(freeAxes.size())
+                            : std::distance(freeAxes.begin(), llvm::find(freeAxes, axis));
+    permutation.push_back(inputAxis);
+    restore.push_back(ReshapeGroupAttr::get(
+        contract.getContext(), builder.getDenseI64ArrayAttr({static_cast<int64_t>(shape.size())}),
+        builder.getDenseI64ArrayAttr({axis})));
+    appendAxis(axis);
+  }
+  auto reordered = FragmentType::get(
+      contract.getContext(), target.getElementType(), builder.getArrayAttr(shape),
+      builder.getArrayAttr(mappings), target.getValidity(), target.getOwner());
+  Value value = builder.create<TransposeOp>(
+      output.getLoc(), reordered, split, builder.getDenseI64ArrayAttr(permutation));
+  if (Attribute origin = output->getAttr(originAttr))
+    value.getDefiningOp()->setAttr(originAttr, origin);
+  if (!units.empty()) {
+    value = builder.create<ReshapeOp>(output.getLoc(), target, value, builder.getArrayAttr(restore));
+    if (Attribute origin = output->getAttr(originAttr))
+      value.getDefiningOp()->setAttr(originAttr, origin);
+  }
+  output.getResult().replaceAllUsesWith(value);
+  output.erase();
+  transpose.erase();
+  return split;
+}
+
 LogicalResult composeContractResultReshapes(ModuleOp module) {
   FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
   if (failed(kernel))
@@ -5138,13 +5268,20 @@ LogicalResult composeContractResultReshapes(ModuleOp module) {
         contract.getLhs().getType().getShape().size() != 2 ||
         contract.getRhs().getType().getShape().size() != 2 ||
         contract.getLhsReductionAxes() != ArrayRef<int64_t>{1} ||
-        contract.getRhsReductionAxes() != ArrayRef<int64_t>{0} ||
+        (contract.getRhsReductionAxes() != ArrayRef<int64_t>{0} &&
+         contract.getRhsReductionAxes() != ArrayRef<int64_t>{1}) ||
         !contract.getLhsBatchAxes().empty() ||
         !contract.getRhsBatchAxes().empty())
       continue;
     auto input = contract.getLhs().getDefiningOp<ReshapeOp>();
     auto output = dyn_cast<ReshapeOp>(*contract.getResult().getUsers().begin());
     auto identity = contract.getAccumulator().getDefiningOp<SplatOp>();
+    if (!identity)
+      continue;
+    if (!output) {
+      output = exposeTransposedContractSplit(contract);
+      changed |= static_cast<bool>(output);
+    }
     if (!output || !identity || output.getReassociation().size() != 2)
       continue;
     auto target = cast<FragmentType>(output.getResult().getType());
@@ -5190,6 +5327,13 @@ LogicalResult composeContractResultReshapes(ModuleOp module) {
     // An inverse input reshape can be cancelled while retaining its original
     // coordinate roots; otherwise the same split applies to the flat lhs.
     OpBuilder builder(contract);
+    if (contract.getRhsReductionAxes() == ArrayRef<int64_t>{1}) {
+      Value rhs = contract.getRhs();
+      contract.getRhsMutable().assign(builder.create<TransposeOp>(
+          contract.getLoc(), transposeLastTwo(cast<FragmentType>(rhs.getType())),
+          rhs, builder.getDenseI64ArrayAttr({1, 0})));
+      contract->setAttr("rhs_reduction_axes", builder.getDenseI64ArrayAttr({0}));
+    }
     SmallVector<Attribute> shape, mappings, groups;
     for (unsigned axis = 0; axis < freeRank; ++axis) {
       shape.push_back(target.getShape()[axis]);
