@@ -2472,6 +2472,176 @@ void foldIntegerScanTails(func::FuncOp kernel) {
     gpu::eraseDeadPhysicalValues(kernel);
 }
 
+LogicalResult legalizeLargeScalarGathers(func::FuncOp kernel) {
+  auto capabilities =
+      kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+  SmallVector<gpu::GatherOp> gathers;
+  kernel.walk([&](gpu::GatherOp gather) { gathers.push_back(gather); });
+  for (gpu::GatherOp gather : gathers) {
+    auto source = dyn_cast<gpu::FragmentType>(gather.getSource().getType());
+    auto result = dyn_cast<gpu::FragmentType>(gather.getResult().getType());
+    if (!source || !isa<IntegerType, FloatType>(source.getElementType()) ||
+        gather.getCoordinates().empty() ||
+        gather.getCoordinates().size() != gather.getSourceAxes().size())
+      continue;
+    uint64_t bytes = (source.getElementType().getIntOrFloatBitWidth() + 7) / 8;
+    uint64_t limit = capabilities.getMaxDynamicSharedMemoryPerBlock();
+    bool oversized = bytes > limit;
+    bool fixed = true;
+    for (Attribute attribute : source.getShape()) {
+      auto extent = cast<gpu::PhysicalExprAttr>(attribute);
+      if (extent.getKind() != static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+          extent.getValue() <= 0) {
+        fixed = false;
+        break;
+      }
+      if (!oversized) {
+        oversized = bytes > limit / extent.getValue();
+        if (!oversized)
+          bytes *= extent.getValue();
+      }
+    }
+    if (!fixed || !oversized || (result && result.getShape().empty()))
+      continue;
+    SmallVector<std::pair<unsigned, Value>> selected;
+    llvm::SmallDenseSet<unsigned> axes;
+    bool compatible = true;
+    for (auto [coordinate, axis] :
+         llvm::zip(gather.getCoordinates(), gather.getSourceAxes())) {
+      coordinate = stripShapeOnly(coordinate);
+      if (axis < 0 || static_cast<unsigned>(axis) >= source.getShape().size() ||
+          !axes.insert(axis).second ||
+          !isa<IntegerType, IndexType>(coordinate.getType())) {
+        compatible = false;
+        break;
+      }
+      selected.emplace_back(axis, coordinate);
+    }
+    unsigned resultAxis = 0;
+    for (unsigned axis = 0; compatible && axis < source.getShape().size(); ++axis)
+      if (!axes.contains(axis)) {
+        compatible = result && resultAxis < result.getShape().size() &&
+                     source.getShape()[axis] == result.getShape()[resultAxis];
+        ++resultAxis;
+      }
+    if (!compatible || (result ? resultAxis != result.getShape().size()
+                               : resultAxis != 0))
+      continue;
+
+    // Exactly one source element contributes to each result lane. Combining
+    // its integer representation with zero preserves NaNs and signed zero,
+    // while native reductions avoid the whole-source scratch of a gather.
+    OpBuilder builder(gather);
+    Location location = gather.getLoc();
+    auto bits = builder.getIntegerType(source.getElementType().getIntOrFloatBitWidth());
+    auto bitsType = gpu::FragmentType::get(
+        kernel.getContext(), bits, source.getShape(), source.getAxisMaps(),
+        source.getValidity(), source.getOwner());
+    auto boolean = gpu::FragmentType::get(
+        kernel.getContext(), builder.getI1Type(), source.getShape(),
+        source.getAxisMaps(), source.getValidity(), source.getOwner());
+    Value mask;
+    for (auto [axis, coordinate] : selected) {
+      auto mapping = cast<gpu::AxisMapAttr>(source.getAxisMaps()[axis]);
+      auto ordinalAxis = gpu::AxisMapAttr::get(
+          kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+          mapping.getDimensionId(), 0, mapping.getDerived());
+      auto rangeType = gpu::FragmentType::get(
+          kernel.getContext(), builder.getIndexType(),
+          builder.getArrayAttr({source.getShape()[axis]}),
+          builder.getArrayAttr({ordinalAxis}), source.getValidity(), source.getOwner());
+      Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+      Value one = builder.create<arith::ConstantIndexOp>(location, 1);
+      Value size = builder.create<gpu::PhysicalExprOp>(
+          location, builder.getIndexType(), cast<gpu::PhysicalExprAttr>(source.getShape()[axis]));
+      Value ordinal = builder.create<gpu::MakeRangeOp>(
+          location, rangeType, zero, size, one, zero, size,
+          mapping.getSourceId(), mapping.getSourceAxis(), mapping.getDerived());
+      if (!coordinate.getType().isIndex())
+        coordinate = builder.create<gpu::CastOp>(location, builder.getIndexType(), coordinate);
+      Value index = builder.create<gpu::BroadcastOp>(location, rangeType, coordinate);
+      auto predicate = gpu::FragmentType::get(
+          kernel.getContext(), builder.getI1Type(), rangeType.getShape(),
+          rangeType.getAxisMaps(), rangeType.getValidity(), rangeType.getOwner());
+      Value equal = builder.create<gpu::CompareOp>(
+          location, predicate, ordinal, index, ComparePredicate::Eq);
+      auto expanded = gpu::projectPredicateToFragmentAxis(
+          builder, location, equal, source, axis);
+      if (failed(expanded))
+        return gather.emitOpError("scalar selection lost its source-axis projection");
+      mask = mask ? Value(builder.create<gpu::BinaryOp>(
+                        location, boolean, mask, *expanded, BinaryOperator::LogicalAnd))
+                  : *expanded;
+    }
+    Value value = builder.create<gpu::BitcastOp>(location, bitsType, gather.getSource());
+    auto zero = zeroLike(builder, location, bitsType);
+    if (failed(zero))
+      return failure();
+    value = builder.create<gpu::SelectOp>(location, bitsType, mask, value, *zero);
+    llvm::sort(selected, [](const auto &lhs, const auto &rhs) { return lhs.first > rhs.first; });
+    for (auto [axis, coordinate] : selected) {
+      auto input = cast<gpu::FragmentType>(value.getType());
+      SmallVector<Attribute> shape, mappings;
+      for (unsigned sourceAxis = 0; sourceAxis < input.getShape().size(); ++sourceAxis) {
+        if (sourceAxis == axis)
+          continue;
+        auto mapping = cast<gpu::AxisMapAttr>(input.getAxisMaps()[sourceAxis]);
+        mappings.push_back(gpu::AxisMapAttr::get(
+            kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+            mapping.getDimensionId(), shape.size(), mapping.getDerived()));
+        shape.push_back(input.getShape()[sourceAxis]);
+      }
+      Type reducedType = bits;
+      if (!shape.empty())
+        reducedType = gpu::FragmentType::get(
+            kernel.getContext(), bits, builder.getArrayAttr(shape),
+            builder.getArrayAttr(mappings), input.getValidity(), input.getOwner());
+      auto identity = zeroLike(builder, location, reducedType);
+      if (failed(identity))
+        return failure();
+      OperationState state(location, gpu::ReduceOp::getOperationName());
+      state.addOperands({value, *identity});
+      state.addTypes(reducedType);
+      state.addAttribute("axes", builder.getDenseI64ArrayAttr({axis}));
+      state.addAttribute("source_count", builder.getI64IntegerAttr(1));
+      state.addAttribute("identity_count", builder.getI64IntegerAttr(1));
+      state.addAttribute("capture_count", builder.getI64IntegerAttr(0));
+      state.addRegion();
+      auto reduction = cast<gpu::ReduceOp>(builder.create(state));
+      {
+        OpBuilder::InsertionGuard guard(builder);
+        Block *body = builder.createBlock(&reduction.getCombine(), {},
+            {reducedType, reducedType}, {location, location});
+        Value combined = builder.create<gpu::BinaryOp>(
+            location, reducedType, body->getArgument(0), body->getArgument(1),
+            BinaryOperator::BitwiseOr);
+        builder.create<gpu::YieldOp>(location, combined);
+      }
+      value = reduction.getResult(0);
+    }
+    Type decodedType = source.getElementType();
+    if (auto fragment = dyn_cast<gpu::FragmentType>(value.getType()))
+      decodedType = gpu::FragmentType::get(
+          kernel.getContext(), source.getElementType(), fragment.getShape(),
+          fragment.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
+    value = builder.create<gpu::BitcastOp>(location, decodedType, value);
+    if (value.getType() != gather.getResult().getType()) {
+      auto reassociation = gpu::inferReshapeReassociation(
+          cast<gpu::FragmentType>(value.getType()), result);
+      if (failed(reassociation))
+        return gather.emitOpError("scalar selection lost its result relation");
+      value = builder.create<gpu::ReshapeOp>(location, result, value, *reassociation);
+    }
+    if (gather.getValid())
+      value = builder.create<gpu::SelectOp>(
+          location, gather.getResult().getType(), gather.getValid(), value, gather.getFill());
+    gather.getResult().replaceAllUsesWith(value);
+    gather.erase();
+  }
+  gpu::eraseDeadPhysicalValues(kernel);
+  return success();
+}
+
 LogicalResult verifyKernel(func::FuncOp kernel) {
   auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
   if (!space || space.empty() || space.size() > 3)
@@ -2949,7 +3119,8 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       failed(gpu::verifyGPUProgram(module)))
     return failure();
   foldIntegerScanTails(kernel);
-  if (failed(legalizeMaskedGather(kernel)) ||
+  if (failed(legalizeLargeScalarGathers(kernel)) ||
+      failed(legalizeMaskedGather(kernel)) ||
       failed(legalizeExpandingGathers(kernel)) ||
       failed(legalizeScatterAdd(kernel)) ||
       failed(legalizeContractShapes(kernel)) ||
@@ -2971,6 +3142,34 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       categories.push_back(category);
   });
   auto capabilities = kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+  int64_t fixedCollectiveRegisters = 0;
+  kernel.walk([&](Operation *operation) {
+    if (!isa<gpu::ReduceOp, gpu::ScanOp>(operation))
+      return;
+    if (!llvm::is_contained(categories, gpu::ParameterCategory::Reduction))
+      categories.push_back(gpu::ParameterCategory::Reduction);
+    for (Value operand : operation->getOperands()) {
+      auto fragment = dyn_cast<gpu::FragmentType>(operand.getType());
+      if (!fragment)
+        continue;
+      Type element = fragment.getElementType();
+      int64_t registers = std::max(1u,
+          ((element.isIndex() ? 64 : element.getIntOrFloatBitWidth()) + 31) / 32);
+      bool fixed = true;
+      for (Attribute attribute : fragment.getShape()) {
+        auto extent = cast<gpu::PhysicalExprAttr>(attribute);
+        if (extent.getKind() != static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+            extent.getValue() <= 0 ||
+            registers > capabilities.getRegistersPerUnit() / extent.getValue()) {
+          fixed = false;
+          break;
+        }
+        registers *= extent.getValue();
+      }
+      if (fixed)
+        fixedCollectiveRegisters = std::max(fixedCollectiveRegisters, registers);
+    }
+  });
   bool blackwell = capabilities.getComputeCapabilityMajor() == 10 ||
                    capabilities.getComputeCapabilityMajor() == 12;
   bool hasContraction = false;
@@ -3000,6 +3199,11 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
     if (straightLinePointwise)
       stages = 1;
     if (requiresCtaSynchronization && ctas != 1)
+      continue;
+    // Static collectives have no blocking parameter from which to infer their
+    // warp demand. Prefer enough threads for the source itself to fit within
+    // NVIDIA's 255-register per-thread limit before considering intermediates.
+    if (fixedCollectiveRegisters > warps * 32 * 255)
       continue;
     if ((warps & (warps - 1)) != 0 ||
         warps > capabilities.getMaxThreadsPerBlock() / 32 ||
