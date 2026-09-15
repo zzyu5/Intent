@@ -3660,6 +3660,26 @@ void PhysicalProgramAnalysis::analyzeReplay(
     ReplayVisits &visited) {
   if (!value)
     return;
+  ReplayContext context{source, sourceDimension};
+  auto ensureEnclosingReplay = [&](Operation *parent) {
+    if (scope != PhysicalReplayScope::ValueGraph || !source || !sourceDimension)
+      return false;
+    Operation *root = nullptr;
+    for (; isa_and_nonnull<scf::IfOp, scf::ForOp>(parent);
+         parent = parent->getParentOp()) {
+      auto found = visited.find(parent);
+      if (found == visited.end() || found->second.empty())
+        break;
+      root = parent;
+    }
+    if (!root || !root->getNumResults())
+      return false;
+    if (!llvm::is_contained(visited.lookup(root), context))
+      analyzeReplay(root->getResult(0), source, scope, allowAccesses,
+                    insertionAnchor, sourceDimension, dominance, result, visited);
+    return result.state != PhysicalFactState::Unknown &&
+           llvm::is_contained(visited.lookup(root), context);
+  };
   bool carriesRequestedTraversal = false;
   if (source) {
     if (sourceDimension) {
@@ -3672,7 +3692,12 @@ void PhysicalProgramAnalysis::analyzeReplay(
       carriesRequestedTraversal = carriesSource(value.getType(), *source);
     }
   }
-  if (insertionAnchor && dominance &&
+  Operation *definition = value.getDefiningOp();
+  bool recheckRegion = isa_and_nonnull<scf::IfOp, scf::ForOp>(definition) &&
+      scope == PhysicalReplayScope::ValueGraph && source && sourceDimension &&
+      visited.count(definition) && !visited.lookup(definition).empty() &&
+      !llvm::is_contained(visited.lookup(definition), context);
+  if (insertionAnchor && dominance && !recheckRegion &&
       dominance->dominates(value, insertionAnchor) &&
       !carriesRequestedTraversal) {
     SmallPtrSet<Operation *, 16> dependencyVisited;
@@ -3704,9 +3729,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
   if (auto argument = dyn_cast<BlockArgument>(value)) {
     Operation *owner = argument.getOwner()->getParentOp();
     if (auto loop = dyn_cast_or_null<scf::ForOp>(owner)) {
-      ReplayContext context{source, sourceDimension};
-      bool replayingLoop = scope == PhysicalReplayScope::ValueGraph &&
-          llvm::is_contained(visited[loop], context);
+      bool replayingLoop = ensureEnclosingReplay(loop);
       if (replayingLoop && argument == loop.getInductionVar())
         return;
       if (!replayingLoop && argument != loop.getInductionVar()) {
@@ -3729,7 +3752,6 @@ void PhysicalProgramAnalysis::analyzeReplay(
   if (!operation)
     return;
   auto &contexts = visited[operation];
-  ReplayContext context{source, sourceDimension};
   if (llvm::is_contained(contexts, context))
     return;
   contexts.push_back(context);
@@ -3837,18 +3859,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
       return;
     }
     if (auto load = dyn_cast<LoadOp>(operation); load && insertionAnchor) {
-      bool replayedRegion = false;
-      if (scope == PhysicalReplayScope::ValueGraph && source && sourceDimension)
-        for (Operation *parent = load->getParentOp();
-             isa_and_nonnull<scf::IfOp, scf::ForOp>(parent);
-             parent = parent->getParentOp()) {
-          auto found = visited.find(parent);
-          if (found != visited.end() &&
-              llvm::is_contained(found->second, context)) {
-            replayedRegion = true;
-            break;
-          }
-        }
+      bool replayedRegion = ensureEnclosingReplay(load->getParentOp());
       // Enclosing replay regions already prove read-only motion. Standalone
       // reads must also preserve their value across intervening writes.
       if (!replayedRegion && !canReplayReadAt(load, insertionAnchor)) {

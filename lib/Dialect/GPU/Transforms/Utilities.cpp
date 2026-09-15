@@ -4199,23 +4199,29 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
 }
 
 void eraseDeadPhysicalValues(func::FuncOp kernel) {
-  SmallVector<Operation *> operations;
   bool changed = false;
   do {
     changed = false;
-    operations.clear();
-    kernel.walk([&](Operation *operation) { operations.push_back(operation); });
-    for (Operation *operation : llvm::reverse(operations)) {
+    kernel.walk<WalkOrder::PostOrder>([&](Operation *operation) {
       if (!operation->getBlock() || isa<DelinearizeOp, ParameterOp>(operation) ||
           operation == kernel.getOperation() || !operation->getNumResults() ||
           !llvm::all_of(operation->getResults(),
                         [](Value value) { return value.use_empty(); }))
-        continue;
-      if (isMemoryEffectFree(operation) || isa<LoadOp, GatherOp>(operation)) {
+        return;
+      bool unusedReadOnlyLoop = isa<scf::ForOp>(operation) &&
+          !operation->walk([](Operation *nested) {
+            if (isa<scf::WhileOp>(nested))
+              return WalkResult::interrupt();
+            return isa<scf::ForOp, scf::IfOp, LoadOp, GatherOp>(nested) ||
+                           isMemoryEffectFree(nested)
+                       ? WalkResult::advance() : WalkResult::interrupt();
+          }).wasInterrupted();
+      if (isMemoryEffectFree(operation) || isa<LoadOp, GatherOp>(operation) ||
+          unusedReadOnlyLoop) {
         operation->erase();
         changed = true;
       }
-    }
+    });
   } while (changed);
 
 }
