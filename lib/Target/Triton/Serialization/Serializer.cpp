@@ -826,7 +826,7 @@ private:
       if (auto yield = dyn_cast<scf::YieldOp>(operation)) {
         if (isLoop || !loopResults.empty())
           for (auto [name, value] : llvm::zip(loopResults, yield.getOperands()))
-            line(name + " = " + valueString(value));
+            line(name + " = " + controlValueString(value));
         continue;
       }
       if (isa<func::ReturnOp>(operation))
@@ -1283,7 +1283,7 @@ private:
       for (auto [result, initial] : llvm::zip(loop.getResults(), loop.getInitArgs())) {
         std::string name = newName();
         values[result] = name;
-        line(name + " = " + loopInitialValue(initial));
+        line(name + " = " + controlValueString(initial));
         results.push_back(name);
       }
       std::string induction = "iv" + std::to_string(counter++);
@@ -1324,7 +1324,7 @@ private:
            llvm::zip(whileOperation.getResults(), whileOperation.getInits())) {
         std::string name = newName();
         values[result] = name;
-        line(name + " = " + loopInitialValue(initial));
+        line(name + " = " + controlValueString(initial));
         carries.push_back(name);
       }
       Block &before = whileOperation.getBefore().front();
@@ -1343,7 +1343,7 @@ private:
       Block &after = whileOperation.getAfter().front();
       for (auto [argument, forwarded] :
            llvm::zip(after.getArguments(), condition.getArgs()))
-        values[argument] = valueString(forwarded);
+        values[argument] = controlValueString(forwarded);
       emitBlock(after, true, carries);
       --indent;
       --indent;
@@ -1770,11 +1770,13 @@ private:
     return "(" + result + ")";
   }
 
-  std::string loopInitialValue(Value value) {
+  std::string controlValueString(Value value) {
     std::string result = valueString(value);
-    if (value.getDefiningOp<arith::ConstantOp>() &&
-        isa<IntegerType, IndexType>(value.getType()))
-      return "tl.full((), " + result + ", " + pythonType(value.getType()) + ")";
+    if (isa<IntegerType, IndexType, FloatType>(value.getType())) {
+      if (value.getDefiningOp<arith::ConstantOp>())
+        return "tl.full((), " + result + ", " + pythonType(value.getType()) + ")";
+      return "tl.cast(" + result + ", " + pythonType(value.getType()) + ")";
+    }
     return result;
   }
 
