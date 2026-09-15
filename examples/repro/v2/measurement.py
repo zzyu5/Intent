@@ -260,13 +260,14 @@ def _synchronize(comparison: PreparedComparison) -> None:
         raise NotImplementedError(f"benchmark completion for {comparison.device_type}")
 
 
-def _benchmark_launch(launch: PreparedLaunch, comparison: PreparedComparison, warmup: int) -> float:
+def _benchmark_launch(launch: PreparedLaunch, comparison: PreparedComparison, warmup: int,
+                      time_budget_ms: float | None = None) -> float:
     if launch.native_benchmark is not None:
         return launch.native_benchmark()
     if comparison.device_type != "cuda":
         raise NotImplementedError("CPU benchmark requires a native repeat/timing entry")
     return benchmark(launch.launch, warmup=warmup, repetitions=MEASUREMENT_REPETITIONS,
-                     cuda_graph=comparison.cuda_graph, prepare=launch.prepare)[0]
+                     cuda_graph=comparison.cuda_graph, prepare=launch.prepare, time_budget_ms=time_budget_ms)[0]
 
 
 def evaluate(
@@ -274,6 +275,7 @@ def evaluate(
     *,
     before_benchmark: Callable[[], None] | None = None,
     source_timing_error: Callable[[Exception], bool] | None = None,
+    benchmark_time_budget_ms: float | None = None,
 ) -> tuple[float | None, float | None]:
     if comparison.device_type == "cpu" and before_benchmark is not None:
         before_benchmark()
@@ -316,13 +318,13 @@ def evaluate(
         before_benchmark()
     report_stage("generated_benchmark")
     try:
-        generated_first = _benchmark_launch(comparison.generated, comparison, 25)
+        generated_first = _benchmark_launch(comparison.generated, comparison, 25, benchmark_time_budget_ms)
     except Exception as error:
         raise PipelineStageError("generated_benchmark", str(error)) from error
     for stage, warmup in (("source_benchmark", 25), ("source_reverse_benchmark", 0)):
         report_stage(stage)
         try:
-            source_ms = _benchmark_launch(comparison.source, comparison, warmup)
+            source_ms = _benchmark_launch(comparison.source, comparison, warmup, benchmark_time_budget_ms)
         except Exception as error:
             if source_timing_error is not None and source_timing_error(error):
                 # The candidate window and numerical comparison already finished.
@@ -335,7 +337,7 @@ def evaluate(
             source_second = source_ms
     report_stage("generated_reverse_benchmark")
     try:
-        generated_second = _benchmark_launch(comparison.generated, comparison, 0)
+        generated_second = _benchmark_launch(comparison.generated, comparison, 0, benchmark_time_budget_ms)
     except Exception as error:
         raise PipelineStageError("generated_reverse_benchmark", str(error)) from error
     if comparison.device_type == "cpu":

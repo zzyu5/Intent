@@ -184,7 +184,7 @@ class TuningBudget:
             def candidate_call():
                 with self.policy():
                     return function()
-            return [benchmark(candidate_call, warmup=5, repetitions=30, cuda_graph=True)[0]]
+            return [benchmark(candidate_call, warmup=5, repetitions=30, cuda_graph=True, time_budget_ms=30)[0]]
 
     def __enter__(self):
         self._original = triton.autotune

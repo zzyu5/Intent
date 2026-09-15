@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import inspect
+import math
 from types import FunctionType
 
 import torch
@@ -20,6 +21,7 @@ def benchmark(
     repetitions: int = 100,
     cuda_graph: bool = False,
     prepare: Callable[[], object] | None = None,
+    time_budget_ms: float | None = None,
 ) -> tuple[float, float]:
     if cuda_graph and prepare is not None:
         raise ValueError("CUDA Graph measurement cannot reset inputs between replays")
@@ -28,6 +30,24 @@ def benchmark(
     if cuda_graph:
         measurement_stream = torch.cuda.Stream()
         measurement_stream.wait_stream(torch.cuda.current_stream())
+    if time_budget_ms is not None:
+        if time_budget_ms <= 0:
+            raise ValueError("measurement time budget must be positive")
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(measurement_stream):
+            if prepare is not None:
+                prepare()
+            start.record()
+            function()
+            end.record()
+        end.synchronize()
+        estimate_ms = start.elapsed_time(end)
+        if estimate_ms <= 0:
+            raise RuntimeError("CUDA event returned a nonpositive execution time")
+        # Keep the original sample caps and enough samples for a median.
+        warmup = min(warmup, math.ceil(time_budget_ms * warmup / repetitions / estimate_ms))
+        repetitions = min(repetitions, max(7, math.ceil(time_budget_ms / estimate_ms)))
+    if cuda_graph:
         with torch.cuda.stream(measurement_stream):
             for _ in range(warmup):
                 function()

@@ -7,12 +7,14 @@ import inspect
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 import torch
 import triton
@@ -25,19 +27,47 @@ def revision(directory: Path) -> str:
     return subprocess.check_output(["git", "-C", str(directory), "rev-parse", "HEAD"], text=True).strip()
 
 
-def run_benchmark(arguments, task, program, language, result_path) -> dict:
+def run_benchmark(arguments, task, program, language, result_path, *, artifacts=None) -> dict:
+    phase_read, phase_write = os.pipe()
     command = [sys.executable, "-B", "-m", "repro.agent_study.benchmark", "--reference", str(arguments.reference),
                "--compiler", str(arguments.compiler), "--task", task, "--program", str(program),
                "--language", language, "--result", str(result_path), "--gpu-lock", str(arguments.gpu_lock),
-               "--suite", str(arguments.suite_path)]
-    with tempfile.TemporaryFile(mode="w+") as log:
-        process = subprocess.Popen(command, stdout=log, stderr=log, start_new_session=True)
+               "--suite", str(arguments.suite_path), "--phase-fd", str(phase_write)]
+    if artifacts is not None:
+        command.extend(("--artifacts", str(artifacts)))
+    with os.fdopen(phase_read, "rb", buffering=0) as phases, tempfile.TemporaryFile(mode="w+") as log:
         try:
-            process.wait(timeout=arguments.suite["benchmark_seconds"])
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
-            return {"status": "benchmark_timeout", "error": "preparation/queue/execution exceeded the benchmark limit"}
+            process = subprocess.Popen(command, stdout=log, stderr=log, start_new_session=True,
+                                       pass_fds=(phase_write,))
+        finally:
+            os.close(phase_write)
+        started = time.monotonic()
+        queued_seconds, queued_at = 0.0, None
+        stage, pending = "worker_startup", b""
+        try:
+            while process.poll() is None:
+                if select.select([phases], [], [], 0.1)[0]:
+                    pending += phases.read(65536)
+                    while b"\n" in pending:
+                        line, pending = pending.split(b"\n", 1)
+                        event = json.loads(line)
+                        stage = event["stage"]
+                        if stage == "gpu_queue":
+                            queued_at = event["time"]
+                        elif queued_at is not None:
+                            queued_seconds += event["time"] - queued_at
+                            queued_at = None
+                now = time.monotonic()
+                active_seconds = now - started - queued_seconds
+                if queued_at is not None:
+                    active_seconds -= now - queued_at
+                if active_seconds > arguments.suite["benchmark_seconds"]:
+                    return {"status": "benchmark_timeout", "failure_stage": stage,
+                            "error": "preparation/execution exceeded the benchmark limit, excluding GPU queue time"}
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
         if not result_path.exists():
             log.seek(0)
             return {"status": "benchmark_environment_failure", "error": log.read()[-6000:]}
@@ -64,7 +94,10 @@ def generate_trial(arguments, row, language) -> dict:
     task_text += "\n\nTiming: " + row["timing"]
     task_text += "\n\nProfile note: " + row["reason"]
     (directory / "TASK.md").write_text(task_text)
-    agent = execute(directory, arguments.suite, f"Implement TASK.md using {language}. Submit one complete candidate.py.\n",
+    prompt = f"Implement TASK.md using {language}. Submit one complete candidate.py.\n"
+    if language == "intent":
+        prompt += "Use @intent.kernel and context.compile(); do not import or call Triton.\n"
+    agent = execute(directory, arguments.suite, prompt,
                     executable=arguments.codex, state_root=arguments.state_root, language=language, stop=arguments.stop)
     destination = arguments.output / row["task"] / language
     destination.mkdir(parents=True)

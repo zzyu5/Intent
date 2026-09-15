@@ -4,6 +4,7 @@ import argparse
 from contextlib import redirect_stdout
 import fcntl
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -14,7 +15,7 @@ from triton.compiler.errors import CompilationError
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_flatten
 
-from repro.v2.measurement import evaluate, NumericalComparisonError, PipelineStageError
+from repro.v2.measurement import evaluate, NumericalComparisonError, PipelineStageError, observe_stages, report_stage
 from repro.v2.model import PreparedComparison, PreparedLaunch
 
 from .program import load_program, ProgramContext, TuningBudget
@@ -91,6 +92,7 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
         return False
     started = time.monotonic()
     stage = "reference_preparation"
+    report_stage(stage)
     budget = TuningBudget(suite["max_tuning_configurations"], CandidateTorchPolicy)
     artifact_directory = arguments.artifacts or arguments.program.parent
     artifact_directory.mkdir(parents=True, exist_ok=True)
@@ -101,20 +103,25 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
         reference_call = invocation(arguments.reference, row, task, suite, device="cpu")
         reference_function = reference(arguments.reference, row)
         stage = "candidate_load"
+        report_stage(stage)
         with budget:
             with CandidateTorchPolicy():
                 module = load_program(arguments.program, language=arguments.language)
                 stage = "candidate_build"
+                report_stage(stage)
                 function = module.build(context)
                 if arguments.language == "intent" and not context.generated:
                     raise ValueError("Intent submission did not compile any Intent kernels")
             stage = "candidate_input_preparation"
             with arguments.gpu_lock.open("w") as lock:
+                report_stage("gpu_queue")
                 fcntl.flock(lock, fcntl.LOCK_EX)
+                report_stage(stage)
                 candidate_call = candidate_call.to_device("cuda")
                 reference_call = reference_call.to_device("cuda")
                 torch.cuda.synchronize()
             stage = "candidate_precompile"
+            report_stage(stage)
             compile_started = time.monotonic()
             with budget.compilation_only(), CandidateTorchPolicy():
                 candidate_call.call(function)
@@ -123,11 +130,14 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
             result["preparation_policy"] = "compile_only_before_gpu_timing_lock"
             stage = "comparison"
             with arguments.gpu_lock.open("w") as lock:
+                report_stage("gpu_queue")
                 fcntl.flock(lock, fcntl.LOCK_EX)
+                report_stage(stage)
                 candidate = _observe(candidate_call, function, task=arguments.task, enforce=True)
                 source = _observe(reference_call, reference_function, task=arguments.task, enforce=False)
                 measured, anchor = evaluate(PreparedComparison(candidate, source, tolerance(task, suite), cuda_graph=cuda_graph),
-                                            source_timing_error=source_timing_error)
+                                            source_timing_error=source_timing_error,
+                                            benchmark_time_budget_ms=200)
             result.update(status="pass", candidate_ms=measured, reference_ms=anchor,
                           ratio=measured / anchor if anchor is not None else None)
     except Exception as error:
@@ -167,13 +177,21 @@ def main() -> None:
     parser.add_argument("--result", type=Path, required=True)
     parser.add_argument("--gpu-lock", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, help="Separate compiler recheck artifacts from an existing submission")
+    parser.add_argument("--phase-fd", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--suite", type=Path, default=SUITE_PATH,
                         help="Fixed task and numerical configuration used by generation")
     parser.add_argument("--timing", choices=("cuda_graph", "cuda_event"),
                         help="Override the task's paired candidate/reference timing path")
     arguments = parser.parse_args()
     with redirect_stdout(sys.stderr):
-        result = run(arguments, suite_path=arguments.suite)
+        if arguments.phase_fd is None:
+            result = run(arguments, suite_path=arguments.suite)
+        else:
+            with os.fdopen(arguments.phase_fd, "w", buffering=1) as phases:
+                def publish(stage):
+                    phases.write(json.dumps({"stage": stage, "time": time.monotonic()}) + "\n")
+                with observe_stages(publish):
+                    result = run(arguments, suite_path=arguments.suite)
     arguments.result.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({key: value for key, value in result.items() if key != "traceback"}))
 
