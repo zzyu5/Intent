@@ -1358,20 +1358,22 @@ private:
       Block &before = whileOperation.getBefore().front();
       for (auto [argument, name] : llvm::zip(before.getArguments(), carries))
         values[argument] = name;
-      line("while True:");
+      std::string active = newName();
+      line(active + " = tl.full((), True, tl.int1)");
+      line("while " + active + ":");
       ++indent;
       for (Operation &nested : before.without_terminator())
         emitOperation(nested);
       auto condition = cast<scf::ConditionOp>(before.getTerminator());
-      line("if not " + valueString(condition.getCondition()) + ":");
+      line(active + " = " + valueString(condition.getCondition()));
+      line("if " + active + ":");
       ++indent;
-      line("break");
-      --indent;
       Block &after = whileOperation.getAfter().front();
       for (auto [argument, forwarded] :
            llvm::zip(after.getArguments(), condition.getArgs()))
         values[argument] = valueString(forwarded);
       emitBlock(after, true, carries);
+      --indent;
       --indent;
       return;
     }

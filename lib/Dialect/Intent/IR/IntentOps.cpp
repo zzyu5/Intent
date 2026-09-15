@@ -1755,6 +1755,7 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
   auto function = read->getParentOfType<func::FuncOp>();
   MLIRContext *context = read->getContext();
   llvm::DenseMap<Value, unsigned> variables;
+  unsigned variableCount = 0;
   llvm::DenseMap<std::pair<Value, int64_t>, Value> shapeValues;
   llvm::DenseMap<Value, AffineExpr> substitutions;
   Operation *writerBoundary = nullptr;
@@ -1840,7 +1841,9 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
         return {};
       auto [known, inserted] = shapeValues.try_emplace(
           std::make_pair(shaped, axis.getInt()), value);
-      auto [found, fresh] = variables.try_emplace(known->second, variables.size());
+      auto [found, fresh] = variables.try_emplace(known->second, variableCount);
+      if (fresh)
+        ++variableCount;
       return getAffineDimExpr(found->second, context);
     }
     if (auto binary = value.getDefiningOp<BinaryOp>()) {
@@ -1864,7 +1867,9 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
     }
     if (writerBoundary && !dominance.dominates(value, writerBoundary))
       return {};
-    auto [found, inserted] = variables.try_emplace(value, variables.size());
+    auto [found, inserted] = variables.try_emplace(value, variableCount);
+    if (inserted)
+      ++variableCount;
     return getAffineDimExpr(found->second, context);
   };
   auto path = [&](Operation *operation) {
@@ -1939,16 +1944,33 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
     return true;
   };
   AccessDomain reads;
-  if (!describe(readPath, reads))
-    return false;
+  bool completeView = false;
+  if (!describe(readPath, reads)) {
+    if (!tensor.hasStaticShape())
+      return false;
+    // Before opaque control, prove every view element defined. This does not
+    // assume an iteration count or reuse writes from inside that control.
+    completeView = true;
+    do {
+      readPath.pop_back();
+      reads = AccessDomain();
+    } while (!readPath.empty() && !describe(readPath, reads));
+    if (readPath.empty())
+      return false;
+  }
   auto relation = read->getAttrOfType<IndexRelationAttr>("index");
   if (!relation || relation.getTerms().size() != static_cast<size_t>(tensor.getRank()))
     return false;
   SmallVector<AffineExpr> coordinates;
-  for (Attribute attribute : relation.getTerms()) {
+  for (auto [axis, attribute] : llvm::enumerate(relation.getTerms())) {
     auto term = cast<IndexTermAttr>(attribute);
     AffineExpr coordinate;
-    if (term.getKind() == 2 && term.getStaticValues().size() == 1)
+    if (completeView) {
+      coordinate = getAffineDimExpr(variableCount++, context);
+      reads.constraints.emplace_back(coordinate, false);
+      reads.constraints.emplace_back(tensor.getDimSize(axis) - coordinate - 1,
+                                     false);
+    } else if (term.getKind() == 2 && term.getStaticValues().size() == 1)
       coordinate = getAffineConstantExpr(term.getStaticValues()[0], context);
     else if (term.getKind() == 3)
       coordinate = index(indexTermOperand(read, term));
@@ -2040,9 +2062,9 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
     if (exact)
       writes.push_back(std::move(write));
   }
-  PresburgerSpace space = PresburgerSpace::getSetSpace(variables.size());
+  PresburgerSpace space = PresburgerSpace::getSetSpace(variableCount);
   auto add = [&](IntegerPolyhedron &set, AffineExpr expression, bool equality) {
-    SmallVector<int64_t> row(variables.size() + 1, 0);
+    SmallVector<int64_t> row(variableCount + 1, 0);
     auto fits = [](__int128 value) {
       return value >= std::numeric_limits<int64_t>::min() &&
              value <= std::numeric_limits<int64_t>::max();

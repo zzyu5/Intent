@@ -3015,11 +3015,23 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
           result = uniform(loop.getInitArgs()[index]) &&
                    uniform(loop.getBody()->getTerminator()->getOperand(index));
         }
+      } else if (auto loop = dyn_cast<scf::WhileOp>(parent)) {
+        auto condition = cast<scf::ConditionOp>(loop.getBefore().front().getTerminator());
+        unsigned index = argument.getArgNumber();
+        if (argument.getOwner() == &loop.getBefore().front())
+          result = uniform(loop.getInits()[index]) &&
+                   uniform(loop.getAfter().front().getTerminator()->getOperand(index));
+        else
+          result = uniform(condition.getCondition()) && uniform(condition.getArgs()[index]);
       }
     } else if (Operation *producer = value.getDefiningOp()) {
       if (auto loop = dyn_cast<scf::ForOp>(producer)) {
         auto index = cast<OpResult>(value).getResultNumber();
         result = uniform(loop.getRegionIterArgs()[index]);
+      } else if (auto loop = dyn_cast<scf::WhileOp>(producer)) {
+        auto condition = cast<scf::ConditionOp>(loop.getBefore().front().getTerminator());
+        unsigned index = cast<OpResult>(value).getResultNumber();
+        result = uniform(condition.getCondition()) && uniform(condition.getArgs()[index]);
       } else if (auto branch = dyn_cast<scf::IfOp>(producer)) {
         unsigned index = cast<OpResult>(value).getResultNumber();
         result = uniform(branch.getCondition()) &&
@@ -3063,8 +3075,9 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
           nestedUniform &= uniform(branch.getCondition());
         else if (auto loop = dyn_cast<scf::ForOp>(operation))
           nestedUniform &= uniform(loop.getInductionVar());
-        else if (isa<scf::WhileOp>(operation))
-          nestedUniform = false;
+        else if (auto loop = dyn_cast<scf::WhileOp>(operation))
+          nestedUniform &= uniform(
+              cast<scf::ConditionOp>(loop.getBefore().front().getTerminator()).getCondition());
         for (Region &region : operation.getRegions())
           for (Block &nested : region) {
             Accesses outstanding;
