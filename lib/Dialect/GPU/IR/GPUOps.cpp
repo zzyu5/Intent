@@ -179,11 +179,32 @@ LogicalResult verifyAccessAxisExtents(Operation *owner, Type payload,
   auto fragment = dyn_cast<FragmentType>(payload);
   if (!fragment)
     return success();
+  SmallVector<Value> fragmentCoordinates;
+  for (Value coordinate : coordinates)
+    if (isa<FragmentType>(coordinate.getType()))
+      fragmentCoordinates.push_back(coordinate);
+  bool cartesian = fragmentCoordinates.size() == fragment.getShape().size() &&
+      llvm::all_of(fragmentCoordinates, [](Value coordinate) {
+        return cast<FragmentType>(coordinate.getType()).getShape().size() == 1;
+      });
   for (auto [payloadAxis, payloadAttribute] :
        llvm::enumerate(fragment.getAxisMaps())) {
     auto payloadMapping = cast<AxisMapAttr>(payloadAttribute);
+    Value positionalCoordinate;
+    if (cartesian) {
+      Value coordinate = fragmentCoordinates[payloadAxis];
+      auto mapping = cast<AxisMapAttr>(
+          cast<FragmentType>(coordinate.getType()).getAxisMaps()[0]);
+      if (mapping.getSourceId() == payloadMapping.getSourceId() &&
+          mapping.getSourceAxis() == payloadMapping.getSourceAxis() &&
+          mapping.getDerived() == payloadMapping.getDerived() &&
+          mapping.getDimensionId() == payloadMapping.getDimensionId())
+        positionalCoordinate = coordinate;
+    }
     std::optional<Attribute> coordinateExtent;
     for (Value coordinate : coordinates) {
+      if (positionalCoordinate && coordinate != positionalCoordinate)
+        continue;
       auto coordinateType = dyn_cast<FragmentType>(coordinate.getType());
       if (!coordinateType)
         continue;

@@ -1514,17 +1514,26 @@ private:
     llvm_unreachable("unhandled atomic sharing domain");
   }
 
-  std::string broadcastValue(Value value, gpu::FragmentType target) {
+  std::string broadcastValue(Value value, gpu::FragmentType target,
+                             std::optional<unsigned> coordinateAxis = std::nullopt) {
     auto source = dyn_cast<gpu::FragmentType>(value.getType());
     if (!source)
       return "tl.full(" + fragmentShape(target) + ", " + valueString(value) +
              ", " + pythonType(elementType(value.getType())) + ")";
     if (source == target)
       return valueString(value);
-    gpu::BroadcastProjection projection =
-        gpu::queryBroadcastProjection(source, target);
+    gpu::BroadcastProjection projection;
+    if (coordinateAxis) {
+      projection.state = gpu::BroadcastProjectionState::Exact;
+      projection.targetToSource.resize(target.getShape().size());
+      projection.targetToSource[*coordinateAxis] = 0;
+    } else {
+      projection = gpu::queryBroadcastProjection(source, target);
+    }
     if (!projection.isExact()) {
-      kernel.emitError("Triton broadcast lost its shared axis projection");
+      kernel.emitError("Triton broadcast lost its shared axis projection")
+          << "; source=" << source << "; target=" << target
+          << "; value=" << value;
       failed = true;
       return {};
     }
@@ -1764,6 +1773,16 @@ private:
     auto view = cast<gpu::ViewType>(resource.getType());
     auto strides = view.getLayout().getStrides();
     auto fragment = dyn_cast<gpu::FragmentType>(valueType);
+    SmallVector<Value> fragmentCoordinates;
+    for (Value coordinate : coordinates)
+      if (isa<gpu::FragmentType>(coordinate.getType()))
+        fragmentCoordinates.push_back(coordinate);
+    bool cartesian = fragment &&
+        fragmentCoordinates.size() == fragment.getShape().size() &&
+        llvm::all_of(fragmentCoordinates, [](Value coordinate) {
+          return cast<gpu::FragmentType>(coordinate.getType()).getShape().size() == 1;
+        });
+    unsigned coordinateSlot = 0;
     std::string result = values.lookup(resource);
     for (auto [axis, coordinate] : llvm::enumerate(coordinates)) {
       Attribute strideAttribute = strides[sourceAxes[axis]];
@@ -1776,8 +1795,24 @@ private:
         failed = true;
         return {};
       }
-      std::string coordinateExpression =
-          fragment ? broadcastValue(coordinate, fragment) : valueString(coordinate);
+      std::optional<unsigned> coordinateAxis;
+      if (cartesian && isa<gpu::FragmentType>(coordinate.getType())) {
+        auto source = cast<gpu::FragmentType>(coordinate.getType());
+        auto sourceMap = cast<gpu::AxisMapAttr>(source.getAxisMaps()[0]);
+        auto targetMap = cast<gpu::AxisMapAttr>(fragment.getAxisMaps()[coordinateSlot]);
+        // A Cartesian coordinate slot already defines its result axis, even
+        // when two slots carry the same logical source provenance.
+        if (sourceMap.getSourceId() == targetMap.getSourceId() &&
+            sourceMap.getSourceAxis() == targetMap.getSourceAxis() &&
+            sourceMap.getDerived() == targetMap.getDerived() &&
+            sourceMap.getDimensionId() == targetMap.getDimensionId() &&
+            source.getShape()[0] == fragment.getShape()[coordinateSlot])
+          coordinateAxis = coordinateSlot;
+        ++coordinateSlot;
+      }
+      std::string coordinateExpression = fragment
+          ? broadcastValue(coordinate, fragment, coordinateAxis)
+          : valueString(coordinate);
       result += " + (" + coordinateExpression + ") * " + stride;
     }
     return "(" + result + ")";

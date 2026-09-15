@@ -2679,6 +2679,14 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
     // the view's source identity, and the address does not overwrite a verified
     // row-major reshape decision.
     PhysicalProgramAnalysis analysis(kernel);
+    SmallVector<Value> fragmentCoordinates;
+    for (Value coordinate : store.getCoordinates())
+      if (isa<FragmentType>(coordinate.getType()))
+        fragmentCoordinates.push_back(coordinate);
+    bool cartesian = fragmentCoordinates.size() == currentType.getShape().size() &&
+        llvm::all_of(fragmentCoordinates, [](Value coordinate) {
+          return cast<FragmentType>(coordinate.getType()).getShape().size() == 1;
+        });
     for (unsigned axis = 0; axis < currentType.getShape().size(); ++axis) {
       PhysicalAxisRealizationFact realization =
           analysis.axisRealization(store.getValue(), axis);
@@ -2686,14 +2694,22 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
         continue;
       auto mapping = cast<AxisMapAttr>(currentType.getAxisMaps()[axis]);
       auto extent = cast<PhysicalExprAttr>(currentType.getShape()[axis]);
+      auto positional = cartesian
+          ? queryFragmentAxis(fragmentCoordinates[axis].getType(), sourceAxisIdentity(mapping))
+          : PhysicalAxisProjection{};
       for (Value coordinate : store.getCoordinates()) {
+        if (positional.isExact() &&
+            positional.dimensionId == mapping.getDimensionId() &&
+            coordinate != fragmentCoordinates[axis])
+          continue;
         auto coordinateType = dyn_cast<FragmentType>(coordinate.getType());
         if (!coordinateType)
           continue;
         PhysicalAxisProjection projection =
             queryFragmentAxis(coordinateType, sourceAxisIdentity(mapping));
         if (!projection.isExact() ||
-            projection.dimensionId != mapping.getDimensionId())
+            projection.dimensionId != mapping.getDimensionId() ||
+            coordinateType.getShape()[projection.fragmentAxis] == extent)
           continue;
         retargetSourceExtent(coordinate, projection.source, extent);
       }

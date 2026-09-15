@@ -1521,23 +1521,19 @@ FailureOr<Value> retargetFill(OpBuilder &builder, Location location,
 }
 
 struct StorePath {
-  SmallVector<CastOp> casts;
+  SmallVector<Operation *> operations;
   StoreOp store;
 };
 
-bool collectStorePaths(Value value, SmallVector<CastOp> casts,
+bool collectStorePaths(Value value, SmallVector<Operation *> operations,
                        SmallVectorImpl<StorePath> &paths,
-                       llvm::SmallPtrSetImpl<Operation *> &visited) {
+                       llvm::SmallPtrSetImpl<Operation *> &visited,
+                       Value root = {}) {
+  if (!root)
+    root = value;
   for (Operation *user : value.getUsers()) {
     if (!visited.insert(user).second)
       continue;
-    if (auto cast = dyn_cast<CastOp>(user)) {
-      SmallVector<CastOp> next(casts);
-      next.push_back(cast);
-      if (!collectStorePaths(cast.getResult(), std::move(next), paths, visited))
-        return false;
-      continue;
-    }
     if (auto broadcast = dyn_cast<BroadcastOp>(user)) {
       auto source = dyn_cast<FragmentType>(value.getType());
       auto result = dyn_cast<FragmentType>(broadcast.getResult().getType());
@@ -1547,17 +1543,135 @@ bool collectStorePaths(Value value, SmallVector<CastOp> casts,
       if (!projection.isExact() ||
           llvm::any_of(llvm::enumerate(projection.targetToSource), [](auto entry) {
             return !entry.value() || *entry.value() != entry.index();
-          }) ||
-          !collectStorePaths(broadcast.getResult(), casts, paths, visited))
+          }))
+        return false;
+    }
+    if (isa<CastOp, BitcastOp, BroadcastOp, UnaryOp, BinaryOp, CompareOp,
+            SelectOp>(user)) {
+      if (!isa<CastOp, BroadcastOp>(user) &&
+          (user->getBlock() != root.getParentBlock() ||
+           !root.hasOneUse() || !value.hasOneUse() ||
+           llvm::any_of(operations, [](Operation *operation) {
+             return !operation->getResult(0).hasOneUse();
+           })))
+        return false;
+      SmallVector<Operation *> next(operations);
+      next.push_back(user);
+      if (!collectStorePaths(user->getResult(0), std::move(next), paths,
+                             visited, root))
         return false;
       continue;
     }
     auto store = dyn_cast<StoreOp>(user);
     if (!store || store.getValue() != value)
       return false;
-    paths.push_back({std::move(casts), store});
+    paths.push_back({operations, store});
   }
   return !paths.empty();
+}
+
+FailureOr<Value> materializeStorePath(
+    OpBuilder &builder, func::FuncOp kernel, StorePath &path, Value original,
+    Value blocked, Value rows, Value columns, Operation *insertionAnchor) {
+  auto tile = cast<FragmentType>(blocked.getType());
+  auto schema = [&](Type type) {
+    auto fragment = cast<FragmentType>(type);
+    return FragmentType::get(
+        kernel.getContext(), fragment.getElementType(), tile.getShape(),
+        tile.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
+  };
+  auto capture = [&](Value value) -> FailureOr<Value> {
+    auto fragment = dyn_cast<FragmentType>(value.getType());
+    if (!fragment)
+      return value;
+    FragmentType target = schema(fragment);
+    if (auto scalar = scalarSource(value); succeeded(scalar))
+      return projectPhysicalValueToSchema(builder, path.store.getLoc(), *scalar,
+                                           target);
+    if (fragment.getShape().size() != 2)
+      return failure();
+    Value captured = value;
+    SmallVector<Value, 2> coordinates{rows, columns};
+    for (auto [axis, coordinate] : llvm::enumerate(coordinates)) {
+      auto replacement = coordinate.getDefiningOp<MakeRangeOp>();
+      PhysicalProgramAnalysis analysis(kernel);
+      PhysicalRangeFact ranges = analysis.axisRanges(captured, axis);
+      auto root = queryExactLogicalRange(ranges);
+      if (!replacement || failed(root) || !isUnitStepRange(*root) ||
+          !samePhysicalScalarExpression(root->getLogicalStart(),
+                                        replacement.getLogicalStart()) ||
+          !samePhysicalScalarExpression(root->getLogicalStop(),
+                                        replacement.getLogicalStop())) {
+        path.store.emitOpError("epilogue capture has no matching result-axis range")
+            << "; axis=" << axis << "; value=" << value
+            << "; root=" << (succeeded(root) ? root->getResult() : Value())
+            << "; replacement=" << coordinate;
+        return failure();
+      }
+      auto source = sourceAxisIdentity(cast<AxisMapAttr>(
+          cast<FragmentType>(value.getType()).getAxisMaps()[axis]));
+      if (!analysis.replayability(value, source, PhysicalReplayScope::ValueGraph,
+                                 /*allowAccesses=*/true, insertionAnchor)
+               .isReplayable()) {
+        path.store.emitOpError("epilogue capture cannot be replayed at its write")
+            << "; axis=" << axis << "; value=" << value;
+        return failure();
+      }
+      auto indexType = root->getResult().getType();
+      auto extent = cast<PhysicalExprAttr>(tile.getShape()[axis]);
+      indexType = FragmentType::get(
+          kernel.getContext(), indexType.getElementType(),
+          builder.getArrayAttr({extent}), indexType.getAxisMaps(),
+          indexType.getValidity(), indexType.getOwner());
+      Value range = builder.create<MakeRangeOp>(
+          path.store.getLoc(), indexType, replacement.getStart(),
+          replacement.getExtent(), root->getStep(), root->getLogicalStart(),
+          root->getLogicalStop(), root->getSourceId(), root->getSourceAxis(),
+          root->getDerived());
+      inheritRangeAuthority(range, *root);
+      auto predicateType = FragmentType::get(
+          kernel.getContext(), builder.getI1Type(), indexType.getShape(),
+          indexType.getAxisMaps(), indexType.getValidity(), indexType.getOwner());
+      Value tail = rangeBoundsValidity(builder, path.store.getLoc(), indexType,
+                                       predicateType, range, root->getLogicalStop());
+      IRMapping mapping;
+      for (MakeRangeOp sourceRange : ranges.roots)
+        mapping.map(sourceRange.getResult(), range);
+      ReplayMaterializationOptions options;
+      options.fragmentAxis = axis;
+      options.segmentTail = tail;
+      options.materializeZeroFill = true;
+      auto replayed = materializeReplayedValue(
+          builder, path.store.getLoc(), value, source, extent, mapping, options);
+      if (failed(replayed)) {
+        path.store.emitOpError("epilogue capture axis could not be materialized")
+            << "; axis=" << axis << "; value=" << value;
+        return failure();
+      }
+      value = *replayed;
+    }
+    return projectPhysicalValueToSchema(builder, path.store.getLoc(), value,
+                                         target);
+  };
+  IRMapping mapping;
+  mapping.map(original, blocked);
+  for (Operation *operation : path.operations) {
+    for (Value operand : operation->getOperands()) {
+      if (mapping.contains(operand))
+        continue;
+      auto replayed = capture(operand);
+      if (failed(replayed)) {
+        operation->emitOpError("contraction epilogue operand cannot be tiled")
+            << "; operand=" << operand;
+        return failure();
+      }
+      mapping.map(operand, *replayed);
+    }
+    Operation *clone = builder.clone(*operation, mapping);
+    clone->getResult(0).setType(schema(operation->getResult(0).getType()));
+  }
+  Value result = mapping.lookupOrNull(path.store.getValue());
+  return result ? FailureOr<Value>(result) : FailureOr<Value>(failure());
 }
 
 bool isTransparentMatrixReshape(ReshapeOp reshape) {
@@ -1822,21 +1936,30 @@ bool outputCoordinatesNeedRealization(ContractOp contract) {
     if (path.store.getCoordinates().size() != 2 ||
         path.store.getSourceAxes() != ArrayRef<int64_t>{0, 1})
       return false;
+    MakeRangeOp outputRanges[2], sourceRanges[2];
     for (unsigned axis = 0; axis < 2; ++axis) {
       auto output = sourceRange(path.store.getCoordinates()[axis]);
       auto source = queryExactLogicalRange(
           analysis.axisRanges(contract.getResult(), axis));
       if (!output || failed(source))
         continue;
-      if (output.getResult().getType().getShape() ==
-              source->getResult().getType().getShape() &&
-          samePhysicalScalarExpression(output.getLogicalStart(), source->getLogicalStart()) &&
+      if (samePhysicalScalarExpression(output.getLogicalStart(), source->getLogicalStart()) &&
           samePhysicalScalarExpression(output.getLogicalStop(), source->getLogicalStop()) &&
-          samePhysicalScalarExpression(output.getStep(), source->getStep()) &&
-          !samePhysicalScalarExpression(output.getStart(), source->getStart()))
-        return true;
+          samePhysicalScalarExpression(output.getStep(), source->getStep())) {
+        outputRanges[axis] = output;
+        sourceRanges[axis] = *source;
+        if (output.getResult().getType().getShape() ==
+                source->getResult().getType().getShape() &&
+            !samePhysicalScalarExpression(output.getStart(), source->getStart()))
+          return true;
+      }
     }
-    return false;
+    // Reusing an operand in two matrix roles does not equate the independent
+    // output coordinates. Realize their M/N ownership before a K-only loop.
+    return sourceRanges[0] && sourceRanges[1] &&
+           sameLogicalRange(sourceRanges[0], sourceRanges[1]) &&
+           outputRanges[0] && outputRanges[1] &&
+           outputRanges[0] != outputRanges[1];
   });
 }
 
@@ -3864,14 +3987,16 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
                                outputRows, outputColumns,
                                BinaryOperator::LogicalAnd);
     for (auto [pathIndex, path] : llvm::enumerate(paths)) {
-      Value output = loop.getResult(0);
-      for (CastOp conversion : path.casts) {
-        auto original = llvm::cast<FragmentType>(conversion.getResult().getType());
-        FragmentType converted = fragmentType(
-            context, original.getElementType(), {unitM, unitN},
-            {*rowMap, *columnMap}, original.getOwner());
-        output = rowBuilder.create<CastOp>(location, converted, output);
-      }
+      OpBuilder::InsertionGuard storeInsertion(rowBuilder);
+      if (!runtimeRowTraversal)
+        rowBuilder.setInsertionPoint(path.store);
+      auto output = materializeStorePath(
+          rowBuilder, kernel, path, contract.getResult(), loop.getResult(0),
+          rows, columns,
+          runtimeRowTraversal ? contract.getOperation() : path.store.getOperation());
+      if (failed(output))
+        return path.store.emitOpError(
+            "blocked contraction could not replay its pointwise epilogue");
       SmallVector<Value> coordinates =
           indirectRow ? replayedStoreCoordinates[pathIndex]
                       : SmallVector<Value>(path.store.getCoordinates());
@@ -3965,7 +4090,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
         return path.store.emitOpError(
             "blocked contract output validity could not be retargeted");
       auto replacement = rowBuilder.create<StoreOp>(
-          location, path.store.getResource(), coordinates, output, *valid,
+          location, path.store.getResource(), coordinates, *output, *valid,
           path.store.getSourceAxes());
       if (Attribute origin = path.store->getAttr(originAttr))
         replacement->setAttr(originAttr, origin);
@@ -4013,16 +4138,6 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
 
   for (StorePath &path : paths)
     path.store.erase();
-  for (StorePath &path : paths)
-    for (CastOp conversion : llvm::reverse(path.casts))
-      if (conversion->getBlock() && conversion.getResult().use_empty())
-        conversion.erase();
-  if (contract->getBlock() && contract.getResult().use_empty())
-    contract.erase();
-  if (lhsLoad->getBlock() && lhsLoad.getResult().use_empty())
-    lhsLoad.erase();
-  if (rhsLoad->getBlock() && rhsLoad.getResult().use_empty())
-    rhsLoad.erase();
   for (AssumeInBoundsOp assumption : rowAssumptions)
     if (assumption->getBlock())
       assumption.erase();
@@ -4664,14 +4779,13 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
   Value outputValid = binary(builder, location, outputPredicateType, outputRows,
                              outputColumns, BinaryOperator::LogicalAnd);
   for (StorePath &path : paths) {
-    Value output = loop.getResult(0);
-    for (CastOp conversion : path.casts) {
-      auto original = cast<FragmentType>(conversion.getResult().getType());
-      FragmentType converted = fragmentType(
-          context, original.getElementType(), {unitM, unitN},
-          {*rowMap, *columnMap}, original.getOwner());
-      output = builder.create<CastOp>(location, converted, output);
-    }
+    OpBuilder::InsertionGuard storeInsertion(builder);
+    builder.setInsertionPoint(path.store);
+    auto output = materializeStorePath(
+        builder, kernel, path, contract.getResult(), loop.getResult(0), rows,
+        columns, path.store.getOperation());
+    if (failed(output))
+      return reject("pointwise epilogue could not be replayed");
     SmallVector<Value> coordinates(path.store.getCoordinates());
     FailureOr<unsigned> storeRow = queryCoordinatePosition(
         path.store.getCoordinates(),
@@ -4702,7 +4816,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
     if (failed(valid))
       return reject("result store residual validity could not be retargeted");
     auto replacement = builder.create<StoreOp>(
-        location, path.store.getResource(), coordinates, output, *valid,
+        location, path.store.getResource(), coordinates, *output, *valid,
         path.store.getSourceAxes());
     if (Attribute origin = path.store->getAttr(originAttr))
       replacement->setAttr(originAttr, origin);
@@ -4710,15 +4824,6 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
 
   for (StorePath &path : paths)
     path.store.erase();
-  for (StorePath &path : paths)
-    for (CastOp conversion : llvm::reverse(path.casts))
-      if (conversion->getBlock() && conversion.getResult().use_empty())
-        conversion.erase();
-  if (contract->getBlock() && contract.getResult().use_empty())
-    contract.erase();
-  for (LoadOp load : {lhsLoad, lhsScaleLoad, rhsLoad, rhsScaleLoad})
-    if (load->getBlock() && load.getResult().use_empty())
-      load.erase();
   return success();
 }
 
@@ -5619,6 +5724,7 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
       return failure();
     }
 
+  eraseDeadPhysicalValues(kernel);
   WalkResult tails = kernel.walk([&](ContractOp contract) {
     if (failed(neutralizeFullCoverageOperand(
             contract, contract.getLhsMutable(), contract.getLhsReductionAxes(),
