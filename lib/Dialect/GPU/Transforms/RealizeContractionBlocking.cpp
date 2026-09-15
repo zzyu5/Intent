@@ -1800,7 +1800,9 @@ bool hasCompleteStorePath(ContractOp contract) {
 }
 
 bool outputCoordinatesNeedRealization(ContractOp contract) {
-  if (contract.getResult().getType().getShape().size() != 2)
+  if (contract.getResult().getType().getShape().size() != 2 ||
+      !contract.getLhsBatchAxes().empty() ||
+      !contract.getRhsBatchAxes().empty())
     return false;
   SmallVector<StorePath> paths;
   llvm::SmallPtrSet<Operation *, 8> visited;
@@ -3192,7 +3194,8 @@ LogicalResult realizeSparseReductionTraversal(SparseContractOp contract,
 LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   if (!contract->getBlock())
     return success();
-  const bool required = requiresPhysicalRealization(contract);
+  const bool required = requiresPhysicalRealization(contract) ||
+                        outputCoordinatesNeedRealization(contract);
   auto unhandled = [&](const Twine &reason) -> LogicalResult {
     if (!required)
       return success();
@@ -5531,7 +5534,12 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
     if (*fullResult)
       continue;
     bool realizeOutput = outputCoordinatesNeedRealization(contract);
-    if (requiresPhysicalRealization(contract) || realizeOutput) {
+    if (realizeOutput) {
+      if (failed(realizeContract(contract, kernel)))
+        return failure();
+      continue;
+    }
+    if (requiresPhysicalRealization(contract)) {
       FailureOr<bool> nativeSegment =
           realizeSegmentNativeReduction(contract, kernel);
       if (failed(nativeSegment))
@@ -5562,7 +5570,7 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
                  contract.getLhsBatchAxes().empty() &&
                  contract.getRhsBatchAxes().empty() &&
                  hasCompleteStorePath(contract) &&
-                 (freeAxesNeedRealization(contract, kernel) || realizeOutput)) {
+                 freeAxesNeedRealization(contract, kernel)) {
         if (failed(realizeContract(contract, kernel)))
           return failure();
       } else if (!rangeSingleReduction &&

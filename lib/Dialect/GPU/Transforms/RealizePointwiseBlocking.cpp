@@ -2671,9 +2671,25 @@ LogicalResult alignOrdinaryContractOperandTypes(func::FuncOp kernel) {
                static_cast<uint32_t>(PhysicalExprKind::Constant) &&
            extent.getValue() == 1;
   };
+  auto isUniformBatch = [&](Value value, unsigned axis) {
+    auto broadcast = value.getDefiningOp<BroadcastOp>();
+    auto source = broadcast
+                      ? dyn_cast<FragmentType>(broadcast.getValue().getType())
+                      : FragmentType();
+    auto target = cast<FragmentType>(value.getType());
+    if (!source)
+      return false;
+    auto projection = queryBroadcastProjection(source, target);
+    auto mapping = cast<AxisMapAttr>(target.getAxisMaps()[axis]);
+    if (!projection.isExact() || projection.targetToSource[axis] ||
+        queryFragmentAxes(target, sourceAxisIdentity(mapping)).size() != 1)
+      return false;
+    auto ranges = PhysicalProgramAnalysis(kernel).axisRanges(value, axis);
+    return ranges.isExact() && ranges.roots.empty() && ranges.blockers.empty();
+  };
   WalkResult result = kernel.walk([&](ContractOp contract) {
     auto alignPairs = [&](Value lhs, Value rhs, ArrayRef<int64_t> lhsAxes,
-                          ArrayRef<int64_t> rhsAxes) -> LogicalResult {
+                          ArrayRef<int64_t> rhsAxes, bool batch) -> LogicalResult {
       if (lhsAxes.size() != rhsAxes.size())
         return failure();
       for (auto [lhsAxis, rhsAxis] : llvm::zip(lhsAxes, rhsAxes)) {
@@ -2689,12 +2705,17 @@ LogicalResult alignOrdinaryContractOperandTypes(func::FuncOp kernel) {
           continue;
         bool lhsUnit = isUnit(lhsExtent);
         bool rhsUnit = isUnit(rhsExtent);
-        if (lhsUnit == rhsUnit)
+        bool rebindLhs = lhsUnit;
+        bool lhsUniform = batch && isUniformBatch(lhs, lhsAxis);
+        bool rhsUniform = batch && isUniformBatch(rhs, rhsAxis);
+        if (lhsUnit == rhsUnit && lhsUniform == rhsUniform)
           return contract.emitOpError(
                      "ordinary contract paired axes have conflicting physical extents")
                  << "; lhs_axis=" << lhsAxis << "; lhs_extent=" << lhsExtent
                  << "; rhs_axis=" << rhsAxis << "; rhs_extent=" << rhsExtent;
-        if (lhsUnit) {
+        if (lhsUnit == rhsUnit)
+          rebindLhs = lhsUniform;
+        if (rebindLhs) {
           auto mapping = cast<AxisMapAttr>(lhsType.getAxisMaps()[lhsAxis]);
           retargetSourceExtent(lhs, sourceAxisIdentity(mapping),
                                cast<PhysicalExprAttr>(rhsExtent));
@@ -2708,10 +2729,10 @@ LogicalResult alignOrdinaryContractOperandTypes(func::FuncOp kernel) {
     };
     if (failed(alignPairs(contract.getLhs(), contract.getRhs(),
                           contract.getLhsReductionAxes(),
-                          contract.getRhsReductionAxes())) ||
+                          contract.getRhsReductionAxes(), false)) ||
         failed(alignPairs(contract.getLhs(), contract.getRhs(),
                           contract.getLhsBatchAxes(),
-                          contract.getRhsBatchAxes())))
+                          contract.getRhsBatchAxes(), true)))
       return WalkResult::interrupt();
     return WalkResult::advance();
   });
@@ -5115,8 +5136,17 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       for (MakeRangeOp range : allRanges) {
         if (range->getParentOfType<RegionFoldOp>() ||
             range->getParentOfType<RegionScanOp>() ||
-            reductionTraversalRanges.contains(range.getOperation()) ||
-            !sameLogicalRange(seed, range))
+            reductionTraversalRanges.contains(range.getOperation()))
+          continue;
+        MakeRangeOp occurrence = occurrenceRoots.lookup(seed.getOperation());
+        bool sameOccurrence = occurrence &&
+            occurrence == occurrenceRoots.lookup(range.getOperation()) &&
+            positionalOccurrences.contains(seed.getOperation()) &&
+            positionalOccurrences.contains(range.getOperation());
+        // A positional store pairs producer and address axes by ordinal.
+        // Their different source identities still share the selected tile's
+        // ownership, including its start, not just its fragment extent.
+        if (!sameLogicalRange(seed, range) && !sameOccurrence)
           continue;
         internalTraversalRanges.erase(range.getOperation());
         if (!llvm::is_contained(dynamicRanges, range))
