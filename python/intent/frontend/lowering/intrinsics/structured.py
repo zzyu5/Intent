@@ -118,8 +118,6 @@ def _reduce(lowerer: FunctionLowerer, name: str, node: ast.Call) -> MlirValue:
         if name in ("reduce.any", "reduce.all"):
             if dtype != intent_bool:
                 lowerer.error(node, f"I.{name} requires a bool tensor")
-        elif dtype == intent_bool:
-            lowerer.error(node, f"I.{name} requires a numeric tensor")
 
     acc_dtype = optional_dtype(lowerer, bound.get("acc_dtype"))
     if acc_dtype is not None:
@@ -138,6 +136,8 @@ def _reduce(lowerer: FunctionLowerer, name: str, node: ast.Call) -> MlirValue:
                 ),
             ).results[0],
         )
+    if name in ("reduce.sum", "reduce.max") and source_components[0].type.dtype == intent_bool:
+        lowerer.error(node, f"I.{name} requires a numeric accumulator dtype")
 
     reduced = set(axes)
     result_components = tuple(
@@ -310,10 +310,8 @@ def _scan(lowerer: FunctionLowerer, node: ast.Call, name: str) -> MlirValue:
         not isinstance(value.type, TensorType) for value in source_components
     ):
         lowerer.error(node, "I.scan source components must be tensors")
-    if name != "scan" and (
-        component_names != ("value",) or source_components[0].type.dtype == intent_bool
-    ):
-        lowerer.error(node, f"I.{name} requires one numeric tensor")
+    if name != "scan" and component_names != ("value",):
+        lowerer.error(node, f"I.{name} requires one tensor")
     axes = normalize_axes(
         lowerer,
         require_axes(lowerer, bound["axis"]),
@@ -339,6 +337,8 @@ def _scan(lowerer: FunctionLowerer, node: ast.Call, name: str) -> MlirValue:
                     ),
                 ).results[0],
             )
+    if name != "scan" and source_components[0].type.dtype == intent_bool:
+        lowerer.error(node, f"I.{name} requires a numeric accumulator dtype")
     builtin_operator = {
         "cumsum": BinaryOperator.ADD,
         "cummax": BinaryOperator.MAXIMUM,
