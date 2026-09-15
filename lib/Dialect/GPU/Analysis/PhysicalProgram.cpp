@@ -1087,11 +1087,12 @@ bool hasExactPhysicalRangeCoverage(Value coordinate, Value upperBound) {
 }
 
 bool reductionTypeConsumesSource(Type type, ArrayRef<int64_t> axes,
-                                 PhysicalSourceAxis source) {
+                                 PhysicalSourceAxis source,
+                                 std::optional<int64_t> dimension) {
   if (auto record = dyn_cast<RecordType>(type))
     return llvm::any_of(record.getFieldTypes(), [&](Attribute field) {
       return reductionTypeConsumesSource(cast<TypeAttr>(field).getValue(), axes,
-                                         source);
+                                         source, dimension);
     });
   auto fragment = dyn_cast<FragmentType>(type);
   if (!fragment)
@@ -1101,7 +1102,8 @@ bool reductionTypeConsumesSource(Type type, ArrayRef<int64_t> axes,
       continue;
     auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
     if (PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis(),
-                           mapping.getDerived()} == source)
+                           mapping.getDerived()} == source &&
+        (!dimension || mapping.getDimensionId() == *dimension))
       return true;
   }
   return false;
@@ -3833,6 +3835,14 @@ void PhysicalProgramAnalysis::analyzeReplay(
   }
   if (isa<scf::IfOp, scf::ForOp>(operation) &&
       scope == PhysicalReplayScope::ValueGraph && source && sourceDimension) {
+    if (isa<scf::ForOp>(operation)) {
+      auto dependency = reductionDependency(value, *source, *sourceDimension);
+      if (!dependency.isExact() || dependency.depends) {
+        appendUnique(result.blockers, operation);
+        result.state = PhysicalFactState::Unknown;
+        return;
+      }
+    }
     auto readOnly = [](Operation *root) {
       return !root->walk([](Operation *nested) {
         return isa<LoadOp, GatherOp, scf::IfOp, scf::ForOp>(nested) ||
@@ -4098,7 +4108,7 @@ PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
       for (Value input :
            reduce.getInputs().take_front(reduce.getSourceCount())) {
         if (reductionTypeConsumesSource(input.getType(), reduce.getAxes(),
-                                        source)) {
+                                        source, sourceDimension)) {
           exact.depends = true;
           return exact;
         }
@@ -4131,7 +4141,7 @@ PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
         if (reductionTypeConsumesSource(
                 input.getType(),
                 ArrayRef<int64_t>{static_cast<int64_t>(scan.getAxis())},
-                source)) {
+                source, sourceDimension)) {
           exact.depends = true;
           return exact;
         }
@@ -4167,14 +4177,34 @@ PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
         return exact;
       }
       unsigned index = result.getResultNumber();
+      SmallVector<Traversal, 4> loopTraversals{context};
+      for (const auto &projection : queryFragmentAxes(current.getType(), source)) {
+        if (sourceDimension && projection.dimensionId != *sourceDimension)
+          continue;
+        auto ranges = axisRanges(current, projection.fragmentAxis);
+        if (!ranges.isExact() || !ranges.blockers.empty()) {
+          exact.state = PhysicalFactState::Unknown;
+          appendUnique(exact.blockers, operation);
+        } else
+          for (MakeRangeOp range : ranges.roots) {
+            auto dimension = queryRangeDimension(range);
+            if (failed(dimension))
+              continue;
+            Traversal related{sourceAxisIdentity(range), *dimension};
+            if (!llvm::is_contained(loopTraversals, related))
+              loopTraversals.push_back(related);
+          }
+      }
       for (Value related :
            {loop.getInitArgs()[index], yield.getResults()[index]}) {
-        PhysicalReductionDependencyFact nested = analyze(related, source, sourceDimension);
-        if (nested.depends)
-          return nested;
-        if (!nested.isExact()) {
-          exact.state = PhysicalFactState::Unknown;
-          llvm::append_range(exact.blockers, nested.blockers);
+        for (auto [identity, dimension] : loopTraversals) {
+          PhysicalReductionDependencyFact nested = analyze(related, identity, dimension);
+          if (nested.depends)
+            return nested;
+          if (!nested.isExact()) {
+            exact.state = PhysicalFactState::Unknown;
+            llvm::append_range(exact.blockers, nested.blockers);
+          }
         }
       }
       return exact;

@@ -1359,8 +1359,8 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
       selectedResult.getResultNumber() >= producer->getNumResults())
     return producer->emitOpError(
         "pointwise replay has no exact producer result occurrence");
-  if (auto reshape = dyn_cast<ReshapeOp>(producer)) {
-    auto original = cast<FragmentType>(value.getType());
+  if (auto original = dyn_cast<FragmentType>(value.getType());
+      original && isa<ReshapeOp, scf::ForOp>(producer)) {
     auto target = cast<FragmentType>(replaceTraversalExtent(
         original, source, traversalDimensions, blockedExtent));
     SmallVector<unsigned> changedAxes;
@@ -1369,27 +1369,35 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
         changedAxes.push_back(axis);
     if (changedAxes.size() == 1) {
       unsigned axis = changedAxes.front();
-      unsigned resultRank = 0;
-      for (Attribute attribute : reshape.getReassociation())
-        resultRank += cast<ReshapeGroupAttr>(attribute).getResultAxes().size();
-      unsigned prefix = original.getShape().size() - resultRank;
-      bool split = llvm::any_of(reshape.getReassociation(), [&](Attribute attribute) {
-        auto group = cast<ReshapeGroupAttr>(attribute);
-        return group.getResultAxes().size() > 1 &&
-               llvm::is_contained(group.getResultAxes().asArrayRef(),
-                                  static_cast<int64_t>(axis) - prefix);
-      });
+      bool retain = false;
+      if (auto reshape = dyn_cast<ReshapeOp>(producer)) {
+        unsigned resultRank = 0;
+        for (Attribute attribute : reshape.getReassociation())
+          resultRank += cast<ReshapeGroupAttr>(attribute).getResultAxes().size();
+        unsigned prefix = original.getShape().size() - resultRank;
+        retain = llvm::any_of(reshape.getReassociation(), [&](Attribute attribute) {
+          auto group = cast<ReshapeGroupAttr>(attribute);
+          return group.getResultAxes().size() > 1 &&
+                 llvm::is_contained(group.getResultAxes().asArrayRef(),
+                                    static_cast<int64_t>(axis) - prefix);
+        });
+      } else {
+        auto relation = cast<AxisMapAttr>(original.getAxisMaps()[axis]);
+        auto dependency = PhysicalProgramAnalysis(kernel).reductionDependency(
+            value, sourceAxisIdentity(relation), relation.getDimensionId());
+        retain = !dependency.isExact() || dependency.depends;
+      }
       auto extent = cast<PhysicalExprAttr>(original.getShape()[axis]);
       auto size = constantLogicalRangeCardinality(blocked);
       auto begin = queryLaunchExpression(blocked.getLogicalStart());
-      if (split && size && isUnitStepRange(blocked) &&
+      if (retain && size && isUnitStepRange(blocked) &&
           extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
           extent.getValue() == *size && begin &&
           begin.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
           begin.getValue() == 0 && DominanceInfo(kernel).dominates(value, insertionAnchor)) {
-        // A split axis cannot be tiled by changing the reshape's lane count.
-        // Extract the requested subset instead; access composition can pull
-        // this gather through the row-major reshape and its pointwise inputs.
+        // Preserve split shapes and complete loop-carried reduction inputs.
+        // Only the already-computed result is projected to the writeback tile.
+        Location location = producer->getLoc();
         auto axisMap = cast<AxisMapAttr>(original.getAxisMaps()[axis]);
         auto coordinate = FragmentType::get(
             kernel.getContext(), builder.getIndexType(), builder.getArrayAttr({blockedExtent}),
@@ -1401,27 +1409,27 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
             kernel.getContext(), builder.getDenseI64ArrayAttr({0}),
             builder.getDenseI64ArrayAttr({0}))});
         Value indices = builder.create<ReshapeOp>(
-            reshape.getLoc(), coordinate, blockedRange, identity);
-        Value stop = builder.create<arith::ConstantIndexOp>(reshape.getLoc(), *size);
+            location, coordinate, blockedRange, identity);
+        Value stop = builder.create<arith::ConstantIndexOp>(location, *size);
         Value valid = builder.create<CompareOp>(
-            reshape.getLoc(), predicateType(coordinate), indices,
-            builder.create<BroadcastOp>(reshape.getLoc(), coordinate, stop),
+            location, predicateType(coordinate), indices,
+            builder.create<BroadcastOp>(location, coordinate, stop),
             ComparePredicate::Lt);
-        Value zero = builder.create<arith::ConstantIndexOp>(reshape.getLoc(), 0);
+        Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
         Value nonnegative = builder.create<CompareOp>(
-            reshape.getLoc(), predicateType(coordinate), indices,
-            builder.create<BroadcastOp>(reshape.getLoc(), coordinate, zero),
+            location, predicateType(coordinate), indices,
+            builder.create<BroadcastOp>(location, coordinate, zero),
             ComparePredicate::Ge);
-        valid = builder.create<BinaryOp>(reshape.getLoc(), predicateType(coordinate),
+        valid = builder.create<BinaryOp>(location, predicateType(coordinate),
                                           valid, nonnegative, BinaryOperator::LogicalAnd);
-        auto projected = projectPredicateToFragmentAxis(builder, reshape.getLoc(), valid, target, axis);
-        auto fill = materializeZeroFragment(builder, reshape.getLoc(), target);
+        auto projected = projectPredicateToFragmentAxis(builder, location, valid, target, axis);
+        auto fill = materializeZeroFragment(builder, location, target);
         if (failed(projected) || failed(fill))
           return failure();
         auto selected = builder.create<GatherOp>(
-            reshape.getLoc(), target, value, ValueRange{indices}, *projected, *fill,
+            location, target, value, ValueRange{indices}, *projected, *fill,
             ArrayRef<int64_t>{static_cast<int64_t>(axis)});
-        if (Attribute origin = reshape->getAttr(originAttr))
+        if (Attribute origin = producer->getAttr(originAttr))
           selected->setAttr(originAttr, origin);
         mapping.map(value, selected.getResult());
         return selected.getResult();
