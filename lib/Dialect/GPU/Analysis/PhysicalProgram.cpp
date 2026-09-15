@@ -2823,7 +2823,8 @@ void PhysicalProgramAnalysis::collectAxisRanges(
             static_cast<uint32_t>(PhysicalExprKind::Constant) &&
         inputExtent.getValue() == 1 && inputExtent != outputExtent) {
       PhysicalRangeFact inputRanges = axisRanges(broadcast.getValue(), *inputAxis);
-      if (inputRanges.isExact() &&
+      if (inputRanges.state != PhysicalFactState::Unknown &&
+          inputRanges.blockers.empty() &&
           llvm::all_of(inputRanges.roots, isProvablySingletonLogicalRange))
         return;
     }

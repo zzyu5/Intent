@@ -150,6 +150,8 @@ def lower_index(
     *,
     first_operand_position: int,
 ) -> LoweredIndex:
+    from .expressions import compile_time_value
+
     source_type = source.type
     if not isinstance(source_type, (TensorType, BufferType)):
         lowerer.error(slice_node, "index source must be tensor or buffer")
@@ -197,12 +199,13 @@ def lower_index(
                         positions.append(None)
                         static_values.append(None)
                     else:
-                        static = _static_integer(component)
-                        if static is not None:
+                        expression = lowerer.lower_expression(component)
+                        known, static = compile_time_value(expression)
+                        if known and isinstance(static, int) and not isinstance(static, bool):
                             positions.append(None)
                             static_values.append(static)
                         else:
-                            value = lowerer.materialize(lowerer.lower_expression(component), component)
+                            value = lowerer.materialize(expression, component)
                             if not is_integer(value.type):
                                 lowerer.error(component, "dynamic slice bound must be scalar integer/index")
                             positions.append(first_operand_position + len(operands))
