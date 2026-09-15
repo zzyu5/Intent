@@ -102,7 +102,7 @@ LogicalResult buildStoreTraversal(OpBuilder &builder, Location location,
     for (auto [root, rootAxis] : roots) {
       if (rootAxis != axis)
         continue;
-      if (sameLogicalRange(root, current) &&
+      if (sameLogicalRange(root, range) &&
           root.getResult().getType().getAxisMaps() == type.getAxisMaps()) {
         mapping.map(root.getResult(), current.getResult());
         continue;
