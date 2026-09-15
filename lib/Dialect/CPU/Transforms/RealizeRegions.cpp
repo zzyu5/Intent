@@ -204,7 +204,8 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
   if (predicate) {
     auto source = coordinateSequence(sources[predicate->source], operation);
     auto capture = coordinateSequence(captures[predicate->capture], operation);
-    if (source && capture && source->nonnegative && capture->nonnegative) {
+    if (source && capture && source->origin == capture->origin &&
+        source->nonnegativeOffsets && capture->nonnegativeOffsets) {
       auto start = [&](const CoordinateSequence &sequence) {
         Value result = zero;
         for (OpFoldResult offset : sequence.offsets)
@@ -226,7 +227,7 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
           b.create<memref::DimOp>(loc, captures[predicate->capture], 0));
       intervals = partitionCoordinatePredicate(predicate->comparison, {sourceBegin, sourceEnd},
           {captureBegin, captureEnd}, zero, one, expression);
-      specializeState = source->beginsAtZero && predicate->validityField &&
+      specializeState = source->startsAtOrigin && predicate->validityField &&
           predicate->comparison == UniformPredicate::LessEqual;
       if (specializeState) {
         truthSlot = scratch(b, loc, ValueRange{panelState[*predicate->validityField]}).front();

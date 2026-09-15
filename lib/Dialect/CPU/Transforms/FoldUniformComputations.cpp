@@ -148,15 +148,15 @@ private:
         coordinate.getArgNumber() >= predicate.getNumDpsInputs() ||
         !predicate.getIndexingMapsArray()[coordinate.getArgNumber()].isIdentity()) return false;
     auto sequence = coordinateSequence(predicate.getInputs()[coordinate.getArgNumber()], predicate);
-    if (!sequence) return false;
-    if (comparison.getPredicate() == arith::CmpIPredicate::sge && sequence->nonnegative) {
+    if (!sequence || sequence->origin) return false;
+    if (comparison.getPredicate() == arith::CmpIPredicate::sge && sequence->nonnegativeOffsets) {
       if (!disjunction) {
         // Every member is true; conjunction leaves the incoming state intact,
         // including an empty domain.
         reduction.erase();
         return true;
       }
-    } else if (comparison.getPredicate() != arith::CmpIPredicate::eq || !sequence->beginsAtZero) {
+    } else if (comparison.getPredicate() != arith::CmpIPredicate::eq || !sequence->startsAtOrigin) {
       return false;
     }
     OpBuilder builder(reduction);
