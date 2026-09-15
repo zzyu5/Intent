@@ -204,7 +204,24 @@ bool sameUniformValue(Value lhs, Value rhs) {
 
 FailureOr<bool> composeSelectLoad(SelectOp select) {
   auto resultType = dyn_cast<FragmentType>(select.getResult().getType());
-  auto load = select.getTrueValue().getDefiningOp<LoadOp>();
+  Value loaded = select.getTrueValue();
+  SmallVector<BroadcastOp> projections;
+  while (auto broadcast = loaded.getDefiningOp<BroadcastOp>()) {
+    auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
+    auto result = dyn_cast<FragmentType>(broadcast.getResult().getType());
+    if (!source || !result || source.getShape() != result.getShape() ||
+        !broadcast.getResult().hasOneUse())
+      return false;
+    auto projection = queryAxisProjection(source, result);
+    if (!projection.isExact() || llvm::any_of(
+            llvm::enumerate(projection.targetToSource), [](auto item) {
+              return !item.value() || *item.value() != item.index();
+            }))
+      return false;
+    projections.push_back(broadcast);
+    loaded = broadcast.getValue();
+  }
+  auto load = loaded.getDefiningOp<LoadOp>();
   if (!resultType || !load || !load.getResult().hasOneUse() ||
       !canReplayReadAt(load, select))
     return false;
@@ -218,17 +235,20 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
   }
 
   OpBuilder builder(select);
+  auto loadedType = projections.empty()
+                        ? resultType
+                        : cast<FragmentType>(load.getResult().getType());
   FailureOr<Value> valid = combinePredicates(
-      builder, select.getLoc(), resultType, load.getValid(),
+      builder, select.getLoc(), loadedType, load.getValid(),
       select.getCondition());
   if (failed(valid)) {
     select.emitOpError(
         "masked load predicate cannot adopt the loaded value relation");
     return failure();
   }
-  if (fill.getType() != resultType) {
+  if (fill.getType() != loadedType) {
     FailureOr<Value> projected = materializeBroadcastToFragment(
-        builder, select.getLoc(), fill, resultType);
+        builder, select.getLoc(), fill, loadedType);
     if (failed(projected)) {
       select.emitOpError(
           "masked load fill cannot adopt the loaded value relation");
@@ -237,12 +257,21 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
     fill = *projected;
   }
   auto replacement = builder.create<LoadOp>(
-      select.getLoc(), resultType, load.getResource(), load.getCoordinates(),
+      select.getLoc(), loadedType, load.getResource(), load.getCoordinates(),
       *valid, fill, load.getSourceAxes());
   if (Attribute origin = load->getAttr(originAttr))
     replacement->setAttr(originAttr, origin);
-  select.getResult().replaceAllUsesWith(replacement.getResult());
+  // Positional broadcasts may rebind unit-axis provenance. Preserve that
+  // relation instead of changing the load schema without its coordinates.
+  IRMapping mapping;
+  mapping.map(load.getResult(), replacement.getResult());
+  for (BroadcastOp broadcast : llvm::reverse(projections))
+    builder.clone(*broadcast, mapping);
+  select.getResult().replaceAllUsesWith(
+      mapping.lookupOrDefault(select.getTrueValue()));
   select.erase();
+  for (BroadcastOp broadcast : projections)
+    broadcast.erase();
   load.erase();
   return true;
 }
@@ -2041,6 +2070,7 @@ LogicalResult realizeAccessComposition(ModuleOp module) {
   FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);
   if (failed(physicalKernel))
     return failure();
+  eraseDeadPhysicalValues(*physicalKernel);
   bool changed;
   do {
     changed = false;
