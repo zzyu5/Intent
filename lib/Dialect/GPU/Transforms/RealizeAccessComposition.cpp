@@ -859,12 +859,22 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
   if (source.getShape().size() <= result.getShape().size() &&
       !hasNonUnitAxisSplit(reshape) && !transposed)
     return false;
+  auto kernel = reshape->getParentOfType<func::FuncOp>();
+  PhysicalProgramAnalysis analysis(kernel);
   unsigned sourceRank = 0;
   unsigned resultRank = 0;
   for (Attribute attribute : reshape.getReassociation()) {
     auto group = cast<ReshapeGroupAttr>(attribute);
     if (group.getResultAxes().empty())
-      return false;
+      for (int64_t axis : group.getSourceAxes().asArrayRef()) {
+        auto extent = cast<PhysicalExprAttr>(source.getShape()[axis]);
+        PhysicalRangeFact ranges = analysis.axisRanges(sourceValue, axis);
+        if (extent.getKind() !=
+                static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+            extent.getValue() != 1 || !ranges.isExact() ||
+            !llvm::all_of(ranges.roots, isProvablySingletonLogicalRange))
+          return false;
+      }
     if (group.getSourceAxes().empty())
       for (int64_t axis : group.getResultAxes().asArrayRef()) {
         auto extent = cast<PhysicalExprAttr>(result.getShape()[axis]);
@@ -880,8 +890,6 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
   }
   if (sourceRank != source.getShape().size() || resultRank != result.getShape().size())
     return false;
-  auto kernel = reshape->getParentOfType<func::FuncOp>();
-  PhysicalProgramAnalysis analysis(kernel);
   SmallVector<bool> preservedSource(sourceRank, false);
   SmallVector<bool> preservedResult(resultRank, false);
   for (Attribute attribute : reshape.getReassociation()) {
@@ -889,6 +897,11 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
     if (group.getSourceAxes().empty()) {
       for (int64_t axis : group.getResultAxes().asArrayRef())
         preservedResult[axis] = true;
+      continue;
+    }
+    if (group.getResultAxes().empty()) {
+      for (int64_t axis : group.getSourceAxes().asArrayRef())
+        preservedSource[axis] = true;
       continue;
     }
     if (group.getSourceAxes().size() != 1 ||
@@ -959,6 +972,8 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
   SmallVector<PhysicalExprAttr> resultExtents(resultRank);
   for (Attribute attribute : reshape.getReassociation()) {
     auto group = cast<ReshapeGroupAttr>(attribute);
+    if (group.getResultAxes().empty())
+      continue;
     unsigned resultAxis = group.getResultAxes()[0];
     if (preservedResult[resultAxis])
       continue;
@@ -1050,6 +1065,15 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
     auto group = cast<ReshapeGroupAttr>(attribute);
     if (group.getSourceAxes().empty())
       continue;
+    if (group.getResultAxes().empty()) {
+      // A removed logical singleton still contributes its original address.
+      // It becomes uniform in the destination shape, not an extra flat axis.
+      for (int64_t axis : group.getSourceAxes().asArrayRef())
+        for (MakeRangeOp root : sourceRoots[axis])
+          mapping.map(root.getResult(), builder.create<SplatOp>(
+              reshape.getLoc(), indexType, root.getStart()).getResult());
+      continue;
+    }
     if (preservedResult[group.getResultAxes()[0]]) {
       // Unmerged axes retain their current tile and coordinates, including
       // program-local batch coordinates and already blocked free dimensions.
