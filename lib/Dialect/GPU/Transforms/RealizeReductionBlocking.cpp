@@ -3445,30 +3445,18 @@ LogicalResult decomposeMultiAxisReductions(ModuleOp module) {
   if (failed(physicalKernel))
     return failure();
   func::FuncOp kernel = *physicalKernel;
-  auto remainingExcessAxes = [&]() {
-    uint64_t result = 0;
-    kernel.walk([&](ReduceOp reduce) {
-      if (reduce.getAxes().size() > 1)
-        result += reduce.getAxes().size() - 1;
-    });
-    return result;
-  };
-  uint64_t previous = remainingExcessAxes();
-  while (previous != 0) {
+  // Tile consumers while their producers are still structured reductions.
+  // Decomposition can clone or erase ancestors, so refresh after every rewrite.
+  while (true) {
     SmallVector<ReduceOp> reductions;
     kernel.walk([&](ReduceOp reduce) {
       if (reduce.getAxes().size() > 1)
         reductions.push_back(reduce);
     });
-    for (ReduceOp reduce : reductions)
-      if (reduce->getBlock() &&
-          failed(decomposeMultiAxisReduce(reduce, kernel)))
-        return failure();
-    uint64_t current = remainingExcessAxes();
-    if (current >= previous)
-      return kernel.emitError(
-          "multi-axis reduction normalization made no structural progress");
-    previous = current;
+    if (reductions.empty())
+      break;
+    if (failed(decomposeMultiAxisReduce(reductions.back(), kernel)))
+      return failure();
   }
   return success();
 }

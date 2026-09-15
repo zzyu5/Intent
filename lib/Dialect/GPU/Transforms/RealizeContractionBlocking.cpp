@@ -1585,6 +1585,9 @@ FailureOr<Value> materializeStorePath(
     if (!fragment)
       return value;
     FragmentType target = schema(fragment);
+    if (value.getType() == target &&
+        DominanceInfo(kernel).dominates(value, insertionAnchor))
+      return value;
     if (auto scalar = scalarSource(value); succeeded(scalar))
       return projectPhysicalValueToSchema(builder, path.store.getLoc(), *scalar,
                                            target);
