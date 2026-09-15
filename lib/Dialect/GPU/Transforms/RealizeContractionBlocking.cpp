@@ -352,54 +352,58 @@ LogicalResult refineOwnershipParameter(func::FuncOp kernel, MakeRangeOp range,
   return replacePhysicalParameter(kernel, *previous, replacement);
 }
 
-LogicalResult collectProducerRanges(
-    Value value, PhysicalSourceAxis source,
-    SmallVectorImpl<MakeRangeOp> &ranges);
+LogicalResult collectReductionAxisRanges(
+    Value value, unsigned axis, SmallVectorImpl<MakeRangeOp> &ranges) {
+  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
+  auto type = dyn_cast<FragmentType>(value.getType());
+  if (!kernel || !type || axis >= type.getShape().size())
+    return failure();
+  PhysicalProgramAnalysis analysis(kernel);
+  PhysicalRangeFact fact = analysis.axisRanges(value, axis);
+  FailureOr<MakeRangeOp> authority = queryExactLogicalRange(fact);
+  if (failed(authority) || !fact.unitStep ||
+      !analysis.lockstepRanges(fact.roots).isExact())
+    return failure();
+  PhysicalRangeAxisFact selected = analysis.rangeAxes(value, fact.roots);
+  if (!selected.isExact() ||
+      selected.fragmentAxes != ArrayRef<unsigned>{axis} ||
+      llvm::any_of(fact.roots, [&](MakeRangeOp range) {
+        return !sameLogicalRange(range, *authority) ||
+               range.getResult().getType().getShape()[0] !=
+                   type.getShape()[axis];
+      }))
+    return failure();
+  ranges.assign(fact.roots.begin(), fact.roots.end());
+  return success();
+}
 
-bool hasExplicitPairedReductionRanges(ContractOp contract) {
+LogicalResult collectPairedReductionRanges(
+    ContractOp contract, SmallVectorImpl<MakeRangeOp> &lhsRanges,
+    SmallVectorImpl<MakeRangeOp> &rhsRanges) {
   if (contract.getLhsReductionAxes().size() != 1 ||
       contract.getRhsReductionAxes().size() != 1)
-    return false;
+    return failure();
   auto lhsType = dyn_cast<FragmentType>(contract.getLhs().getType());
   auto rhsType = dyn_cast<FragmentType>(contract.getRhs().getType());
   if (!lhsType || !rhsType)
-    return false;
-  FailureOr<AxisMapAttr> lhsMap =
-      queryAxisMap(lhsType, contract.getLhsReductionAxes().front());
-  FailureOr<AxisMapAttr> rhsMap =
-      queryAxisMap(rhsType, contract.getRhsReductionAxes().front());
-  if (failed(lhsMap) || failed(rhsMap))
-    return false;
-  auto hasRanges = [&](Value value, AxisMapAttr mapping) {
-    SmallVector<MakeRangeOp> ranges;
-    if (failed(collectProducerRanges(
-            value,
-            sourceAxisIdentity(mapping),
-            ranges)) ||
-        ranges.empty())
-      return false;
-    return llvm::all_of(ranges, [&](MakeRangeOp range) {
-      return sourceAxisIdentity(range) == sourceAxisIdentity(mapping);
-    });
-  };
-  return hasRanges(contract.getLhs(), *lhsMap) &&
-         hasRanges(contract.getRhs(), *rhsMap);
+    return failure();
+  if (failed(collectReductionAxisRanges(
+          contract.getLhs(), contract.getLhsReductionAxes().front(), lhsRanges)) ||
+      failed(collectReductionAxisRanges(
+          contract.getRhs(), contract.getRhsReductionAxes().front(), rhsRanges)))
+    return failure();
+  MakeRangeOp lhs = lhsRanges.front(), rhs = rhsRanges.front();
+  if (samePhysicalScalarExpression(lhs.getLogicalStart(), rhs.getLogicalStart()) &&
+      samePhysicalScalarExpression(lhs.getLogicalStop(), rhs.getLogicalStop()))
+    return success();
+  auto lhsSize = constantLogicalRangeCardinality(lhs);
+  auto rhsSize = constantLogicalRangeCardinality(rhs);
+  return success(lhsSize && rhsSize && *lhsSize == *rhsSize);
 }
 
-LogicalResult collectProducerRanges(
-    Value value, PhysicalSourceAxis source,
-    SmallVectorImpl<MakeRangeOp> &ranges) {
-  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
-  if (!kernel)
-    return failure();
-  PhysicalProgramAnalysis analysis(kernel);
-  PhysicalRangeFact fact = analysis.sourceRanges(value, source);
-  if (fact.state == PhysicalFactState::Unknown)
-    return failure();
-  for (MakeRangeOp range : fact.roots)
-    if (!llvm::is_contained(ranges, range))
-      ranges.push_back(range);
-  return ranges.empty() ? failure() : success();
+bool hasExplicitPairedReductionRanges(ContractOp contract) {
+  SmallVector<MakeRangeOp> lhsRanges, rhsRanges;
+  return succeeded(collectPairedReductionRanges(contract, lhsRanges, rhsRanges));
 }
 
 FailureOr<MakeRangeOp> producerRange(Value value, PhysicalSourceAxis source) {
@@ -2370,27 +2374,9 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
     return contract.emitOpError(
         "reduction-only contraction blocking lost paired reduction provenance");
   PhysicalProgramAnalysis physicalAnalysis(kernel);
-  auto rangesFor = [&](Value value, unsigned fragmentAxis, AxisMapAttr mapping,
-                       SmallVectorImpl<MakeRangeOp> &ranges) {
-    PhysicalRangeFact fact =
-        physicalAnalysis.axisRanges(value, fragmentAxis);
-    if (failed(queryExactLogicalRange(fact)) &&
-        queryFragmentAxes(value.getType(), sourceAxisIdentity(mapping)).size() ==
-            1)
-      fact = physicalAnalysis.sourceRanges(value, sourceAxisIdentity(mapping));
-    if (failed(queryExactLogicalRange(fact)) || !fact.unitStep)
-      return failure();
-    ranges.assign(fact.roots.begin(), fact.roots.end());
-    return llvm::all_of(ranges, [&](MakeRangeOp range) {
-             return sourceAxisIdentity(range) == sourceAxisIdentity(mapping);
-           })
-               ? success()
-               : failure();
-  };
   SmallVector<MakeRangeOp> lhsRanges;
   SmallVector<MakeRangeOp> rhsRanges;
-  if (failed(rangesFor(contract.getLhs(), lhsReduction, *lhsMap, lhsRanges)) ||
-      failed(rangesFor(contract.getRhs(), rhsReduction, *rhsMap, rhsRanges))) {
+  if (failed(collectPairedReductionRanges(contract, lhsRanges, rhsRanges))) {
     PhysicalRangeFact lhsFact =
         physicalAnalysis.axisRanges(contract.getLhs(), lhsReduction);
     PhysicalRangeFact rhsFact =
@@ -2421,6 +2407,17 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
     return contract.emitOpError(
         "reduction-only contraction blocking requires a unit-step range with an exact logical end");
 
+  // These are logical full ranges, even when their current fragment has a
+  // constant padded extent. Establish the identity before replaying the
+  // producer graph into K tiles; masking loads alone does not neutralize exp.
+  if (failed(neutralizeFullCoverageOperand(
+          contract, contract.getLhsMutable(), contract.getLhsReductionAxes(),
+          kernel)) ||
+      failed(neutralizeFullCoverageOperand(
+          contract, contract.getRhsMutable(), contract.getRhsReductionAxes(),
+          kernel)))
+    return failure();
+
   std::string suffix =
       ("_" + Twine(lhsMap->getSourceId()) + "_" +
        Twine(rhsMap->getSourceId()))
@@ -2444,9 +2441,13 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
   PhysicalExprAttr unitK = parameterExpression(
       context, blockK.getParameter().getName().getValue());
   auto lhsIndexType = fragmentType(
-      context, IndexType::get(context), {unitK}, {*lhsMap}, lhsType.getOwner());
+      context, IndexType::get(context), {unitK},
+      {cast<AxisMapAttr>(lhsRange.getResult().getType().getAxisMaps()[0])},
+      lhsType.getOwner());
   auto rhsIndexType = fragmentType(
-      context, IndexType::get(context), {unitK}, {*rhsMap}, rhsType.getOwner());
+      context, IndexType::get(context), {unitK},
+      {cast<AxisMapAttr>(rhsRange.getResult().getType().getAxisMaps()[0])},
+      rhsType.getOwner());
 
   Location location = contract.getLoc();
   OpBuilder builder(contract);
@@ -2461,8 +2462,8 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
         Value lhsK = nested.create<MakeRangeOp>(
             nestedLocation, lhsIndexType, kStart, blockK.getResult(), one,
             lhsRange.getLogicalStart(), lhsRange.getLogicalStop(),
-            lhsMap->getSourceId(), lhsMap->getSourceAxis(),
-            lhsMap->getDerived());
+            lhsRange.getSourceId(), lhsRange.getSourceAxis(),
+            lhsRange.getDerived());
         inheritRangeAuthority(lhsK, lhsRange);
         Value rhsOffset = binary(
             nested, nestedLocation, nested.getIndexType(), kStart,
@@ -2473,8 +2474,8 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
         Value rhsK = nested.create<MakeRangeOp>(
             nestedLocation, rhsIndexType, rhsStart, blockK.getResult(), one,
             rhsRange.getLogicalStart(), rhsRange.getLogicalStop(),
-            rhsMap->getSourceId(), rhsMap->getSourceAxis(),
-            rhsMap->getDerived());
+            rhsRange.getSourceId(), rhsRange.getSourceAxis(),
+            rhsRange.getDerived());
         inheritRangeAuthority(rhsK, rhsRange);
         FailureOr<Value> lhsTail = buildRangeTailPredicate(
             nested, nestedLocation, lhsK, lhsRange);
@@ -2584,8 +2585,7 @@ bool fullStaticReductionNeedsTraversal(ContractOp contract) {
           (cardinality && *cardinality != *size) ||
           integer(range.getExtent()) != *extent ||
           !samePhysicalScalarExpression(range.getStart(),
-                                        range.getLogicalStart()) ||
-          (*size < *extent && !isZeroPastLogicalEnd(operand, range)))
+                                        range.getLogicalStart()))
         return false;
       cardinality = *size;
     }
