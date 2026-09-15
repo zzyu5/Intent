@@ -109,7 +109,8 @@ bool canReplay(Value value, Operation *root, llvm::SmallPtrSetImpl<Operation *> 
   return llvm::all_of(operation->getOperands(), [&](Value input) { return canReplay(input, root, seen); });
 }
 
-bool stableRead(memref::LoadOp load, Operation *producer, func::FuncOp function) {
+bool stableRead(memref::LoadOp load, Operation *producer, func::FuncOp function,
+                ArrayRef<Operation *> consumers) {
   Value base = load.getMemref();
   while (true) {
     if (auto view = base.getDefiningOp<memref::SubViewOp>()) base = view.getSource();
@@ -136,11 +137,31 @@ bool stableRead(memref::LoadOp load, Operation *producer, func::FuncOp function)
   }
   auto allocation = base.getDefiningOp<memref::AllocOp>();
   if (!allocation) return false;
-  for (Operation *user : base.getUsers()) {
-    if (isa<memref::LoadOp, memref::DimOp, memref::DeallocOp>(user)) continue;
-    if (!isa<memref::StoreOp>(user)) return false;
-    Operation *write = producer->getBlock()->findAncestorOpInBlock(*user);
-    if (!write || write == producer || !write->isBeforeInBlock(producer)) return false;
+  Block *owner = allocation->getBlock();
+  Operation *preparation = owner->findAncestorOpInBlock(*producer);
+  if (!preparation) return false;
+  memref::DeallocOp end;
+  SmallVector<Value> aliases{base};
+  for (unsigned i = 0; i < aliases.size(); ++i)
+    for (Operation *user : aliases[i].getUsers()) {
+      if (isa<memref::LoadOp, vector::LoadOp, memref::DimOp>(user)) continue;
+      if (auto view = dyn_cast<memref::SubViewOp>(user)) { aliases.push_back(view.getResult()); continue; }
+      if (auto cast = dyn_cast<memref::CastOp>(user)) { aliases.push_back(cast.getResult()); continue; }
+      if (auto release = dyn_cast<memref::DeallocOp>(user)) {
+        if (release.getMemref() != base || end || release->getBlock() != owner) return false;
+        end = release;
+        continue;
+      }
+      if (!isa<memref::StoreOp, vector::StoreOp>(user)) return false;
+      Operation *write = owner->findAncestorOpInBlock(*user);
+      if (!write || write == preparation || !write->isBeforeInBlock(preparation)) return false;
+    }
+  // Replaying a read also extends its use of the backing storage. A snapshot
+  // may outlive its source, in which case it must keep its own materialization.
+  if (!end) return false;
+  for (Operation *consumer : consumers) {
+    Operation *use = owner->findAncestorOpInBlock(*consumer);
+    if (!use || !use->isBeforeInBlock(end)) return false;
   }
   return true;
 }
@@ -337,12 +358,13 @@ bool fuse(memref::AllocOp allocation) {
   if (consumers.size() != 1) {
     auto integer = [](Type type) { return isa<IndexType, IntegerType>(type); };
     if (!integer(store.getValue().getType()) || llvm::any_of(seen, [&](Operation *operation) {
-          return !isMemoryEffectFree(operation) || !llvm::all_of(operation->getResultTypes(), integer);
+          return (!isMemoryEffectFree(operation) && !isa<memref::LoadOp>(operation)) ||
+              !llvm::all_of(operation->getResultTypes(), integer);
         })) return false;
   }
   auto function = allocation->getParentOfType<func::FuncOp>();
   for (Operation *operation : seen)
-    if (auto read = dyn_cast<memref::LoadOp>(operation); read && !stableRead(read, root, function)) return false;
+    if (auto read = dyn_cast<memref::LoadOp>(operation); read && !stableRead(read, root, function, loads)) return false;
   DominanceInfo dominance(function);
   for (Operation *load : loads)
     if (root->isAncestor(load) || !dominance.dominates(root, load)) return false;

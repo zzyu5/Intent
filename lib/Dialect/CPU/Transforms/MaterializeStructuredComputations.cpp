@@ -222,15 +222,40 @@ LogicalResult materialize(linalg::GenericOp operation) {
   }
   if (llvm::any_of(sizes, [](Value size) { return !size; }))
     return operation.emitError("CPU structured traversal has an unbound loop extent");
-  std::function<void(unsigned)> visit = [&](unsigned axis) {
-    if (axis != sizes.size()) {
-      loop(b, loc, index(b, loc, 0), sizes[axis], 1, [&](Value i) {
-        position.push_back(i); visit(axis + 1); position.pop_back();
+  Block &body = operation.getRegion().front();
+  auto order = operation->getAttrOfType<ReductionOrderAttr>("intent_cpu.reduction_order");
+  auto iterators = operation.getIteratorTypesArray();
+  SmallVector<AffineExpr> freeAxes;
+  for (unsigned axis = 0; axis + 1 < sizes.size(); ++axis)
+    freeAxes.push_back(b.getAffineDimExpr(axis));
+  auto freeMap = AffineMap::get(sizes.size(), 0, freeAxes, b.getContext());
+  bool carryReduction = order && operation.getOutputs().size() == 1 && !sizes.empty() &&
+      iterators.back() == utils::IteratorType::reduction &&
+      llvm::all_of(ArrayRef(iterators).drop_back(), [](utils::IteratorType iterator) {
+        return iterator == utils::IteratorType::parallel;
+      }) && maps.back() == freeMap && !body.getArguments().back().use_empty() &&
+      llvm::all_of(body.without_terminator(), [](Operation &instruction) {
+        return !instruction.getNumRegions() && isMemoryEffectFree(&instruction);
       });
-      return;
+  if (carryReduction) {
+    auto function = operation->getParentOfType<func::FuncOp>();
+    PhysicalProgramAnalysis physical(function);
+    AliasAnalysis aliases(function);
+    auto abi = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+    Value output = physical.storageRoot(operation.getOutputs()[0]);
+    for (Value input : operation.getInputs()) {
+      if (!isa<MemRefType>(input.getType())) continue;
+      input = physical.storageRoot(input);
+      if (input != output && aliases.alias(input, output).isNo()) continue;
+      auto source = physical.externalView(input), destination = physical.externalView(output);
+      if (input != output && abi && abi.getDisjointOutputs() && source && destination &&
+          (source.getAccess() != 0 || destination.getAccess() != 0)) continue;
+      carryReduction = false;
+      break;
     }
+  }
+  auto compute = [&](Value carry = {}) {
     IRMapping mapping;
-    Block &body = operation.getRegion().front();
     for (auto [number, input] : llvm::enumerate(operation.getInputs())) {
       Value value = input;
       if (isa<MemRefType>(input.getType()))
@@ -240,14 +265,47 @@ LogicalResult materialize(linalg::GenericOp operation) {
     for (auto [number, output] : llvm::enumerate(operation.getOutputs())) {
       unsigned argument = operation.getInputs().size() + number;
       if (!body.getArgument(argument).use_empty())
-        mapping.map(body.getArgument(argument), b.create<memref::LoadOp>(loc, output, coordinates(b, loc, maps[argument], position)));
+        mapping.map(body.getArgument(argument), carry ? carry : Value(b.create<memref::LoadOp>(
+            loc, output, coordinates(b, loc, maps[argument], position))));
     }
     for (Operation &nested : body.without_terminator()) {
       if (auto index = dyn_cast<linalg::IndexOp>(nested)) mapping.map(index.getResult(), position[index.getDim()]);
       else b.clone(nested, mapping);
     }
+    SmallVector<Value> results;
+    for (Value value : body.getTerminator()->getOperands()) results.push_back(mapping.lookupOrDefault(value));
+    return results;
+  };
+  std::function<void(unsigned)> visit = [&](unsigned axis) {
+    if (carryReduction && axis + 1 == sizes.size()) {
+      Value zero = index(b, loc, 0), one = index(b, loc, 1);
+      auto active = b.create<scf::IfOp>(loc,
+          b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, sizes[axis], zero), false);
+      OpBuilder::InsertionGuard guard(b);
+      b.setInsertionPointToStart(active.thenBlock());
+      Value output = operation.getOutputs()[0];
+      Value initial = b.create<memref::LoadOp>(loc, output, position);
+      auto reduction = b.create<scf::ForOp>(loc, zero, sizes[axis], one, ValueRange{initial});
+      reduction->setAttr("intent_cpu.reduction_order", order);
+      {
+        OpBuilder::InsertionGuard loopGuard(b);
+        b.setInsertionPointToStart(reduction.getBody());
+        position.push_back(reduction.getInductionVar());
+        b.create<scf::YieldOp>(loc, compute(reduction.getRegionIterArgs()[0]));
+        position.pop_back();
+      }
+      b.create<memref::StoreOp>(loc, reduction.getResult(0), output, position);
+      return;
+    }
+    if (axis != sizes.size()) {
+      loop(b, loc, index(b, loc, 0), sizes[axis], 1, [&](Value i) {
+        position.push_back(i); visit(axis + 1); position.pop_back();
+      });
+      return;
+    }
+    auto results = compute();
     for (auto [number, output] : llvm::enumerate(operation.getOutputs()))
-      b.create<memref::StoreOp>(loc, mapping.lookupOrDefault(body.getTerminator()->getOperand(number)), output,
+      b.create<memref::StoreOp>(loc, results[number], output,
           coordinates(b, loc, maps[operation.getInputs().size() + number], position));
   };
   visit(0);
