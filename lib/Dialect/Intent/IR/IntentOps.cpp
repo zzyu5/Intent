@@ -1961,8 +1961,8 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
   auto relation = read->getAttrOfType<IndexRelationAttr>("index");
   if (!relation || relation.getTerms().size() != static_cast<size_t>(tensor.getRank()))
     return false;
-  std::function<bool(Value, AffineExpr)> constrainRegion =
-      [&](Value region, AffineExpr coordinate) {
+  std::function<bool(Value, AffineExpr, AccessDomain &)> constrainRegion =
+      [&](Value region, AffineExpr coordinate, AccessDomain &access) {
     Value begin, end;
     if (auto domain = region.getDefiningOp<DomainOp>()) {
       if (domain.getBounds().size() < 2 ||
@@ -1973,7 +1973,7 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
       end = domain.getBounds()[1];
     } else if (auto subregion = region.getDefiningOp<SubregionOp>()) {
       if (subregion.getInputs().empty() ||
-          !constrainRegion(subregion.getInputs().front(), coordinate))
+          !constrainRegion(subregion.getInputs().front(), coordinate, access))
         return false;
       if (subregion.getHasStart())
         begin = subregion.getInputs()[1];
@@ -1986,14 +1986,38 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
       AffineExpr lower = index(begin);
       if (!lower)
         return false;
-      reads.constraints.emplace_back(coordinate - lower, false);
+      access.constraints.emplace_back(coordinate - lower, false);
     }
     if (end) {
       AffineExpr upper = index(end);
       if (!upper)
         return false;
-      reads.constraints.emplace_back(upper - coordinate - 1, false);
+      access.constraints.emplace_back(upper - coordinate - 1, false);
     }
+    return true;
+  };
+  auto constrainSlice = [&](Operation *operation, IndexTermAttr term,
+                            unsigned axis, AffineExpr coordinate,
+                            AccessDomain &access) {
+    auto component = [&](unsigned slot, std::optional<int64_t> implicit) -> AffineExpr {
+      if (term.getKind() == 5) {
+        int64_t position = term.getOperandPositions()[slot];
+        if (position >= 0)
+          return index(operation->getOperand(position));
+        int64_t value = term.getStaticValues()[slot];
+        if (value != std::numeric_limits<int64_t>::min())
+          return getAffineConstantExpr(value, context);
+      }
+      return implicit ? getAffineConstantExpr(*implicit, context) : AffineExpr();
+    };
+    AffineExpr begin = component(0, 0);
+    AffineExpr end = component(1, tensor.isDynamicDim(axis)
+        ? std::nullopt : std::optional<int64_t>(tensor.getDimSize(axis)));
+    auto step = dyn_cast_or_null<AffineConstantExpr>(component(2, 1));
+    if (!begin || !end || !step || step.getValue() != 1)
+      return false;
+    access.constraints.emplace_back(coordinate - begin, false);
+    access.constraints.emplace_back(end - coordinate - 1, false);
     return true;
   };
   SmallVector<AffineExpr> coordinates;
@@ -2012,7 +2036,11 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
     else if (term.getKind() == 4) {
       Value region = indexTermOperand(read, term);
       coordinate = getAffineDimExpr(variableCount++, context);
-      if (!region || !constrainRegion(region, coordinate))
+      if (!region || !constrainRegion(region, coordinate, reads))
+        return false;
+    } else if (term.getKind() == 0 || term.getKind() == 5) {
+      coordinate = getAffineDimExpr(variableCount++, context);
+      if (!constrainSlice(read, term, axis, coordinate, reads))
         return false;
     }
     if (!coordinate)
@@ -2091,6 +2119,20 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
         coordinate = getAffineConstantExpr(term.getStaticValues()[0], context);
       else if (term.getKind() == 3)
         coordinate = index(indexTermOperand(store, term));
+      else if (term.getKind() == 4) {
+        Value region = indexTermOperand(store, term);
+        if (!region || !constrainRegion(region, coordinates[axis], write)) {
+          exact = false;
+          break;
+        }
+        continue;
+      } else if (term.getKind() == 0 || term.getKind() == 5) {
+        if (!constrainSlice(store, term, axis, coordinates[axis], write)) {
+          exact = false;
+          break;
+        }
+        continue;
+      }
       if (!coordinate) { exact = false; break; }
       write.constraints.emplace_back(coordinate - coordinates[axis], true);
     }
