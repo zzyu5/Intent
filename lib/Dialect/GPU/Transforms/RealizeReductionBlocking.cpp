@@ -2187,12 +2187,36 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
             FragmentType slicedType = replaceExtent(
                 sourceType, access.fragmentAxis, outerSliceExtent);
             SmallVector<Value> coordinates(load.getCoordinates());
-            // Bind companion ranges before replaying any coordinate, so a
-            // compound coordinate and its bounds use the same range values.
-            for (Value original : load.getCoordinates()) {
-              MakeRangeOp range = sourceRange(original);
-              if (!range || mapping.lookupOrNull(range.getResult()))
+            // Coordinates, validity and fill can hold separate SSA occurrences
+            // of the same range. Bind all of them before replaying the access.
+            SmallVector<Value> accessValues(load.getCoordinates());
+            if (load.getValid())
+              accessValues.push_back(load.getValid());
+            if (load.getFill())
+              accessValues.push_back(load.getFill());
+            SmallVector<MakeRangeOp> companionRanges;
+            PhysicalProgramAnalysis rangeAnalysis(kernel);
+            for (Value value : accessValues)
+              for (MakeRangeOp range : rangeAnalysis.sourceRanges(value).roots)
+                if (!llvm::is_contained(companionRanges, range))
+                  companionRanges.push_back(range);
+            for (MakeRangeOp range : companionRanges) {
+              if (mapping.lookupOrNull(range.getResult()))
                 continue;
+              auto dimension = queryRangeDimension(range);
+              auto accessDimension = queryRangeDimension(access.range);
+              if (sameLogicalRange(range, access.range) &&
+                  succeeded(dimension) && succeeded(accessDimension) &&
+                  *dimension == *accessDimension &&
+                  samePhysicalScalarExpression(range.getStart(),
+                                               access.range.getStart())) {
+                if (failed(mapOuterRange(range))) {
+                  bodyFailed = true;
+                  failureReason = "outer access companion range could not be blocked";
+                  return;
+                }
+                continue;
+              }
               auto rangeType = cast<FragmentType>(range.getResult().getType());
               auto clone = nested.create<MakeRangeOp>(
                   nestedLocation, rangeType, range.getStart(),
