@@ -194,7 +194,10 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
       if (fixed)
         footprint *= extent.getValue();
     }
-    if (fixed && footprint > capabilities.getRegistersPerUnit()) {
+    // A launch-dependent full matrix has no proven register bound. Use the
+    // same bounded traversal as an oversized static matrix; its workspace
+    // still follows the original runtime shape and store order.
+    if (!fixed || footprint > capabilities.getRegistersPerUnit()) {
       auto replay = analysis.replayability(store.getValue(), source,
           PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true, store);
       if (replay.isReplayable() && !replay.accesses.empty() &&
