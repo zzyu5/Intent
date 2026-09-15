@@ -4036,6 +4036,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   kernel.walk([&](StoreOp store) { candidateStores.push_back(store); });
   SmallVector<Attribute> postStructuredWritebackKeys;
   llvm::SmallPtrSet<Operation *, 16> reductionCaptureWritebackRanges;
+  llvm::SmallPtrSet<Operation *, 16> boundedWritebackRanges;
   for (StoreOp store : candidateStores) {
     for (MakeRangeOp range : allRanges) {
       if (!storeAxisForRange(store, range))
@@ -4200,6 +4201,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           auto footprint = minimumFragmentRegisters(kernel, fragment);
           boundedWriteback = footprint && *footprint > capabilities.getRegistersPerUnit();
         }
+        if (boundedWriteback)
+          boundedWritebackRanges.insert(range.getOperation());
         if (!postStructuredWriteback && !boundedWriteback) {
           PhysicalReductionDependencyFact dependency =
               PhysicalProgramAnalysis(kernel).reductionDependency(
@@ -4315,7 +4318,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           range->hasAttr(sourceSubregionAttr) &&
           physicalExtent.getKind() ==
               static_cast<uint32_t>(PhysicalExprKind::Constant);
-      if (!fixedSubregion && reuseTraversalRanges.contains(range.getOperation())) {
+      if (!fixedSubregion && boundedWritebackRanges.contains(range.getOperation()) &&
+          reuseTraversalRanges.contains(range.getOperation())) {
         unresolved.push_back(range);
         continue;
       }
@@ -4358,6 +4362,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         else
           retargetSourceExtent(range.getResult(), sourceAxisIdentity(range), physicalExtent);
         fragment = cast<FragmentType>(range.getResult().getType());
+      }
+      if (!fixedSubregion && reuseTraversalRanges.contains(range.getOperation())) {
+        unresolved.push_back(range);
+        continue;
       }
       if (physicalExtent.getKind() !=
           static_cast<uint32_t>(PhysicalExprKind::Constant)) {
@@ -4475,7 +4483,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             for (Operation *contract : completeReplay.contractions) {
               auto fragment = dyn_cast<FragmentType>(contract->getResult(0).getType());
               auto footprint = minimumFragmentRegisters(kernel, fragment);
-              if (!footprint || *footprint > capabilities.getRegistersPerUnit()) {
+              if (!footprint || *footprint >= capabilities.getRegistersPerUnit()) {
                 retainedContraction = false;
                 break;
               }
