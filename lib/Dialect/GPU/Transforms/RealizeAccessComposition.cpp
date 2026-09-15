@@ -589,7 +589,20 @@ FailureOr<bool> composePointwiseGather(GatherOp gather) {
 
 FailureOr<bool> composeLoadGather(GatherOp gather) {
   auto sourceType = dyn_cast<FragmentType>(gather.getSource().getType());
-  auto sourceLoad = gather.getSource().getDefiningOp<LoadOp>();
+  Value loaded = gather.getSource();
+  while (auto transpose = loaded.getDefiningOp<TransposeOp>()) {
+    auto input = cast<FragmentType>(transpose.getValue().getType());
+    auto output = transpose.getResult().getType();
+    for (auto [axis, sourceAxis] : llvm::enumerate(transpose.getPermutation())) {
+      auto original = cast<AxisMapAttr>(input.getAxisMaps()[sourceAxis]);
+      auto transposed = cast<AxisMapAttr>(output.getAxisMaps()[axis]);
+      if (!(sourceAxisIdentity(original) == sourceAxisIdentity(transposed)) ||
+          original.getDimensionId() != transposed.getDimensionId())
+        return false;
+    }
+    loaded = transpose.getValue();
+  }
+  auto sourceLoad = loaded.getDefiningOp<LoadOp>();
   if (!sourceType || !sourceLoad ||
       !isa<ViewType>(sourceLoad.getResource().getType()) ||
       !canReplayReadAt(sourceLoad, gather))
