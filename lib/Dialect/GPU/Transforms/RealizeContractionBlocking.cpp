@@ -1794,6 +1794,37 @@ bool hasCompleteStorePath(ContractOp contract) {
   return collectStorePaths(contract.getResult(), {}, paths, visited);
 }
 
+bool outputCoordinatesNeedRealization(ContractOp contract) {
+  if (contract.getResult().getType().getShape().size() != 2)
+    return false;
+  SmallVector<StorePath> paths;
+  llvm::SmallPtrSet<Operation *, 8> visited;
+  if (!collectStorePaths(contract.getResult(), {}, paths, visited))
+    return false;
+  auto kernel = contract->getParentOfType<func::FuncOp>();
+  PhysicalProgramAnalysis analysis(kernel);
+  return llvm::any_of(paths, [&](StorePath &path) {
+    if (path.store.getCoordinates().size() != 2 ||
+        path.store.getSourceAxes() != ArrayRef<int64_t>{0, 1})
+      return false;
+    for (unsigned axis = 0; axis < 2; ++axis) {
+      auto output = sourceRange(path.store.getCoordinates()[axis]);
+      auto source = queryExactLogicalRange(
+          analysis.axisRanges(contract.getResult(), axis));
+      if (!output || failed(source))
+        continue;
+      if (output.getResult().getType().getShape() ==
+              source->getResult().getType().getShape() &&
+          samePhysicalScalarExpression(output.getLogicalStart(), source->getLogicalStart()) &&
+          samePhysicalScalarExpression(output.getLogicalStop(), source->getLogicalStop()) &&
+          samePhysicalScalarExpression(output.getStep(), source->getStep()) &&
+          !samePhysicalScalarExpression(output.getStart(), source->getStart()))
+        return true;
+    }
+    return false;
+  });
+}
+
 FragmentType eraseFragmentAxis(FragmentType source, unsigned erasedAxis) {
   SmallVector<Attribute> shape;
   SmallVector<Attribute> mappings;
@@ -5478,7 +5509,8 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
       return failure();
     if (*fullResult)
       continue;
-    if (requiresPhysicalRealization(contract)) {
+    bool realizeOutput = outputCoordinatesNeedRealization(contract);
+    if (requiresPhysicalRealization(contract) || realizeOutput) {
       FailureOr<bool> nativeSegment =
           realizeSegmentNativeReduction(contract, kernel);
       if (failed(nativeSegment))
@@ -5509,7 +5541,7 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
                  contract.getLhsBatchAxes().empty() &&
                  contract.getRhsBatchAxes().empty() &&
                  hasCompleteStorePath(contract) &&
-                 freeAxesNeedRealization(contract, kernel)) {
+                 (freeAxesNeedRealization(contract, kernel) || realizeOutput)) {
         if (failed(realizeContract(contract, kernel)))
           return failure();
       } else if (!rangeSingleReduction &&
