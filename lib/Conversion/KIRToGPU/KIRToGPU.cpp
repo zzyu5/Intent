@@ -638,11 +638,20 @@ FailureOr<PhysicalABI> buildPhysicalABI(func::FuncOp function,
               ? Attribute(dimensionExpression(context, dimension))
               : Attribute(expression(context, PhysicalExprKind::Constant,
                                      tensor.getDimSize(axis))));
-      if (dimension > 0 && !result.dimensions.count(dimension))
-        result.dimensions.try_emplace(
+      if (dimension > 0) {
+        auto [binding, inserted] = result.dimensions.try_emplace(
             dimension,
             MetadataBinding{dimension, static_cast<unsigned>(abi), axis,
                             ("D" + Twine(dimension)).str()});
+        // Automatic output allocation must derive shared dimensions from an
+        // input, including inputs declared after the output in the source ABI.
+        if (!inserted && logicalView.getAccess() != 1 &&
+            cast<ViewType>(sourceEntry.getArgument(binding->second.sourceABI)
+                               .getType()).getAccess() == 1) {
+          binding->second.sourceABI = abi;
+          binding->second.sourceAxis = axis;
+        }
+      }
     }
     auto constraints = logicalView.getConstraints();
     auto layout = gpu::ViewLayoutAttr::get(
