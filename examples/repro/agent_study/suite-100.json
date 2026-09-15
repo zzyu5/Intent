@@ -109,7 +109,7 @@
     {"id":"erfc_sqrt","family":"pointwise","input_index":8,"tolerance":"fp32"},
     {"id":"softmax_log","family":"reduction","input_index":6,"tolerance":"fp32"},
     {"id":"batch_norm","family":"fusion","input_index":0,"tolerance":"fp16"},
-    {"id":"gammaln","family":"pointwise","input_index":8,"tolerance":"fp32"},
+    {"id":"gammaln","family":"pointwise","input_index":8,"tolerance":"fp32","description":"Compute log(abs(Gamma(input))) elementwise with the numerical domain behavior of torch.special.gammaln. The absolute value applies to Gamma(input), not to input before evaluating Gamma. Preserve the input shape, dtype and device, and the reference behavior at poles and nonfinite inputs. If out is supplied, write and return that tensor."},
     {"id":"bitwise_and","family":"pointwise","input_index":8,"tolerance":"exact"}
   ],
   "outside_scope": {"Adam":"Optimizer state transformation, not a forward tensor kernel.","SGD":"Model, loss, backward and optimizer update.","quantize_dynamic":"nn.Module transformation, not a tensor kernel.","autocast":"Execution context manager, not a tensor result.","rand":"Output RNG stream contract is not closed in this deterministic experiment.","bitwise_and_binomial":"Binomial sampling; the reference also discards its bitwise result.","fused_fractional_max_pool2d_with_relu":"Random pooling samples are not explicit common inputs.","fused_transformer_block":"The callable applies training-time dropout; a common explicit RNG input contract is absent."},
