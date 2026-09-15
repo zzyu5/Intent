@@ -1750,7 +1750,7 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
   struct AccessDomain {
     SmallVector<Constraint> constraints;
     SmallVector<AffineExpr> disequalities;
-    SmallVector<AffineExpr> order;
+    SmallVector<std::pair<AffineExpr, bool>> order;
   };
   auto function = read->getParentOfType<func::FuncOp>();
   MLIRContext *context = read->getContext();
@@ -1890,8 +1890,8 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
   auto describe = [&](ArrayRef<Operation *> operations,
                       AccessDomain &domain) -> bool {
     for (auto [position, operation] : llvm::enumerate(operations)) {
-      domain.order.push_back(getAffineConstantExpr(
-          std::distance(operation->getBlock()->begin(), operation->getIterator()), context));
+      domain.order.emplace_back(getAffineConstantExpr(
+          std::distance(operation->getBlock()->begin(), operation->getIterator()), context), true);
       if (position + 1 == operations.size())
         break;
       if (Value iv = induction(operation)) {
@@ -1906,7 +1906,7 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
           return false;
         domain.constraints.emplace_back(current - begin, false);
         domain.constraints.emplace_back(end - current - 1, false);
-        domain.order.push_back(current);
+        domain.order.emplace_back(current, !isa<ParallelOp>(operation));
         continue;
       }
       auto branch = dyn_cast<IfOp>(operation);
@@ -1961,6 +1961,41 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
   auto relation = read->getAttrOfType<IndexRelationAttr>("index");
   if (!relation || relation.getTerms().size() != static_cast<size_t>(tensor.getRank()))
     return false;
+  std::function<bool(Value, AffineExpr)> constrainRegion =
+      [&](Value region, AffineExpr coordinate) {
+    Value begin, end;
+    if (auto domain = region.getDefiningOp<DomainOp>()) {
+      if (domain.getBounds().size() < 2 ||
+          (domain.getBounds().size() == 3 &&
+           getConstantInteger(domain.getBounds()[2]) != 1))
+        return false;
+      begin = domain.getBounds()[0];
+      end = domain.getBounds()[1];
+    } else if (auto subregion = region.getDefiningOp<SubregionOp>()) {
+      if (subregion.getInputs().empty() ||
+          !constrainRegion(subregion.getInputs().front(), coordinate))
+        return false;
+      if (subregion.getHasStart())
+        begin = subregion.getInputs()[1];
+      if (subregion.getHasStop())
+        end = subregion.getInputs().back();
+    } else {
+      return false;
+    }
+    if (begin) {
+      AffineExpr lower = index(begin);
+      if (!lower)
+        return false;
+      reads.constraints.emplace_back(coordinate - lower, false);
+    }
+    if (end) {
+      AffineExpr upper = index(end);
+      if (!upper)
+        return false;
+      reads.constraints.emplace_back(upper - coordinate - 1, false);
+    }
+    return true;
+  };
   SmallVector<AffineExpr> coordinates;
   for (auto [axis, attribute] : llvm::enumerate(relation.getTerms())) {
     auto term = cast<IndexTermAttr>(attribute);
@@ -1974,6 +2009,12 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
       coordinate = getAffineConstantExpr(term.getStaticValues()[0], context);
     else if (term.getKind() == 3)
       coordinate = index(indexTermOperand(read, term));
+    else if (term.getKind() == 4) {
+      Value region = indexTermOperand(read, term);
+      coordinate = getAffineDimExpr(variableCount++, context);
+      if (!region || !constrainRegion(region, coordinate))
+        return false;
+    }
     if (!coordinate)
       return false;
     coordinates.push_back(coordinate);
@@ -2039,12 +2080,6 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
         auto found = variables.find(iv);
         if (found == variables.end()) { exact = false; break; }
         substitutions[iv] = getAffineDimExpr(found->second, context);
-      }
-      if (shared && isa<ParallelOp>(operation)) {
-        auto found = variables.find(iv);
-        if (found == variables.end()) { exact = false; break; }
-        write.constraints.emplace_back(
-            substitutions.lookup(iv) - getAffineDimExpr(found->second, context), true);
       }
     }
     if (!exact || !describe(writePath, write))
@@ -2124,9 +2159,14 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
     PresburgerSet prefix = *prefixSet;
     for (auto [writtenTime, readTime] : llvm::zip(write.order, reads.order)) {
       IntegerPolyhedron earlier(space), equal(space);
-      if (!add(earlier, readTime - writtenTime - 1, false)) return false;
-      unwritten = unwritten.subtract(prefix.intersect(PresburgerSet(earlier)));
-      if (!add(equal, readTime - writtenTime, true)) return false;
+      // Parallel members have no relative order inside the same enclosing
+      // execution. Earlier ordered iterations have already completed all their
+      // members, so do not constrain those writers to the reader's member.
+      if (writtenTime.second && readTime.second) {
+        if (!add(earlier, readTime.first - writtenTime.first - 1, false)) return false;
+        unwritten = unwritten.subtract(prefix.intersect(PresburgerSet(earlier)));
+      }
+      if (!add(equal, readTime.first - writtenTime.first, true)) return false;
       prefix = prefix.intersect(PresburgerSet(equal));
     }
     if (unwritten.isIntegerEmpty())
