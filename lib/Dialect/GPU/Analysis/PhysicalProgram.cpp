@@ -3738,7 +3738,10 @@ void PhysicalProgramAnalysis::analyzeReplay(
     Operation *owner = argument.getOwner()->getParentOp();
     if (auto loop = dyn_cast_or_null<scf::ForOp>(owner)) {
       bool replayingLoop = ensureEnclosingReplay(loop);
-      if (replayingLoop && argument == loop.getInductionVar())
+      // Replaying the complete loop checks its initial operands and all
+      // yields. Its block arguments are local bindings, including unchanged
+      // carries whose backedge would otherwise recurse into themselves.
+      if (replayingLoop)
         return;
       if (!replayingLoop && argument != loop.getInductionVar()) {
         appendUnique(result.blockers, loop);
