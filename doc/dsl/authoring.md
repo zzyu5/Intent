@@ -40,7 +40,7 @@ Python tuple 与 `I.record(field=value, ...)` 是结构化 products，不要求�
 
 ## Control、effects 与多个 kernels
 
-普通 `for/while` 保持顺序与 loop carry；carry 的初值与每轮更新必须保持 dtype、rank 和逻辑 shape，循环体内的 broadcast 不会改变初始 schema。`I.parallel(domain)` 表达独立无序点，不允许 carry。Tensor predicate 使用 `I.select`，不控制 statement `if`。`Out` 进入 kernel 时未定义，读取前必须先定义；不能用 InOut 掩盖未定义读取。
+普通 `for/while` 保持顺序与 loop carry；carry 的初值与每轮更新必须保持 dtype、rank 和逻辑 shape，循环体内的 broadcast 不会改变初始 schema。Tensor carry 可按目标 shape 初始化，例如 `state = I.full(value.shape, 0.0, I.f32)`；`I.cast(0.0, I.f32)` 初始化的是 scalar。`I.parallel(domain)` 表达独立无序点，不允许 carry。Tensor predicate 使用 `I.select`，不控制 statement `if`。`Out` 进入 kernel 时未定义，读取前必须先定义；不能用 InOut 掩盖未定义读取。
 
 `I.mask(value, predicate, fill)` 等价于 `I.select(predicate, value, fill)`：predicate 为真保留 value，为假使用 fill。它只选择值，不抑制写入；对写入坐标使用 `I.mask` 会把未选中成员写到 fill 指定的地址。`I.store` 和下标赋值没有 `mask` 或 `valid` 参数。条件写入使用 scalar 条件下的 structured control，或只遍历实际参与写入的 domain/subregion；普通并行写入仍须满足目标地址不冲突的合同。
 
