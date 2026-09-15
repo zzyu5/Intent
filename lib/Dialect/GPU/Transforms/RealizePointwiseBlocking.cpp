@@ -5752,6 +5752,93 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     pointwiseOwnershipAxes.insert(pointwiseOwnershipAxes.end() - 1, inputAxis);
   });
 
+  if (orderedByStore && pointwiseOwnershipAxes.size() > 2 &&
+      llvm::all_of(pointwiseOwnershipAxes, [&](Attribute axis) {
+        return llvm::all_of(axes.lookup(axis), [&](MakeRangeOp range) {
+          return contractFreeAxisSides(kernel, range) == ContractFreeAxisNone;
+        });
+      })) {
+    PhysicalProgramAnalysis analysis(kernel);
+    llvm::DenseMap<Attribute, uint64_t> invariantReadVolume;
+    bool knownReads = true;
+    auto ownerOfRange = [&](MakeRangeOp range) -> Attribute {
+      MakeRangeOp occurrence = occurrenceRoots.lookup(range.getOperation());
+      for (Attribute axis : pointwiseOwnershipAxes)
+        if (llvm::any_of(axes.lookup(axis), [&](MakeRangeOp candidate) {
+              return candidate == range ||
+                     (occurrence && occurrenceRoots.lookup(
+                                        candidate.getOperation()) == occurrence);
+            }))
+          return axis;
+      return {};
+    };
+    kernel.walk([&](LoadOp load) {
+      if (!knownReads)
+        return;
+      SmallVector<MakeRangeOp> roots;
+      SmallVector<Value> dependencies(load.getCoordinates());
+      if (load.getValid())
+        dependencies.push_back(load.getValid());
+      if (load.getFill())
+        dependencies.push_back(load.getFill());
+      for (Value value : dependencies) {
+        auto fact = analysis.sourceRanges(value);
+        if (!fact.blockers.empty() || !fact.accesses.empty()) {
+          knownReads = false;
+          return;
+        }
+        for (MakeRangeOp root : fact.roots)
+          if (!llvm::is_contained(roots, root))
+            roots.push_back(root);
+      }
+      uint64_t volume = physicalElementBitWidth(load.getResult().getType());
+      llvm::SmallDenseSet<Attribute> countedOwners;
+      llvm::SmallDenseSet<Attribute> varyingAxes;
+      for (MakeRangeOp root : roots) {
+        Attribute owner = ownerOfRange(root);
+        if (owner)
+          varyingAxes.insert(owner);
+        // Estimate a fragment with the current inner output axis free and the
+        // other program-grid axes fixed. Local/reduction ranges remain live.
+        if (owner && owner != pointwiseOwnershipAxes.back())
+          continue;
+        if (owner && !countedOwners.insert(owner).second)
+          continue;
+        auto extent = constantLogicalRangeCardinality(root);
+        if (!extent || *extent <= 0 ||
+            volume > std::numeric_limits<uint64_t>::max() / *extent) {
+          knownReads = false;
+          return;
+        }
+        volume *= *extent;
+      }
+      for (Attribute axis : pointwiseOwnershipAxes) {
+        if (varyingAxes.contains(axis))
+          continue;
+        uint64_t &score = invariantReadVolume[axis];
+        if (score > std::numeric_limits<uint64_t>::max() - volume) {
+          knownReads = false;
+          return;
+        }
+        score += volume;
+      }
+    });
+    Attribute selected = pointwiseOwnershipAxes[pointwiseOwnershipAxes.size() - 2];
+    for (Attribute axis : llvm::drop_end(pointwiseOwnershipAxes)) {
+      ParameterOp parameter = parameters.lookup(axis);
+      if (knownReads &&
+          llvm::any_of(parameter.getParameter().getCandidates().asArrayRef(),
+                       [](int64_t extent) { return extent > 1; }) &&
+          invariantReadVolume.lookup(axis) > invariantReadVolume.lookup(selected))
+        selected = axis;
+    }
+    // Keep the current output direction and tile the independent axis that
+    // reuses the largest input fragment. This estimates repeated reads, not
+    // pointer contiguity; the access graph retains the actual ABI strides.
+    pointwiseOwnershipAxes.erase(llvm::find(pointwiseOwnershipAxes, selected));
+    pointwiseOwnershipAxes.insert(pointwiseOwnershipAxes.end() - 1, selected);
+  }
+
   llvm::DenseMap<Attribute, CoordinateRole> contractionCoordinateRoles;
   for (auto [ownershipIndex, axis] :
        llvm::enumerate(pointwiseOwnershipAxes)) {
