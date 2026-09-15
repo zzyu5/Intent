@@ -2986,10 +2986,19 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       hasContraction && allFp32), kernel.getLoc());
   if (failed(rows))
     return failure();
+  bool straightLinePointwise =
+      llvm::is_contained(categories, gpu::ParameterCategory::Pointwise) &&
+      llvm::all_of(categories, [](gpu::ParameterCategory category) {
+        return category == gpu::ParameterCategory::Pointwise;
+      }) && llvm::all_of(kernel.front(), [](Operation &operation) {
+        return operation.getNumRegions() == 0;
+      });
   SmallVector<TritonLocalOptions> localOptions;
   SmallVector<int64_t> warpDomain, stageDomain, ctaDomain;
   for (const auto &row : *rows) {
     int64_t warps = row[0], stages = row[1], ctas = row[2];
+    if (straightLinePointwise)
+      stages = 1;
     if (requiresCtaSynchronization && ctas != 1)
       continue;
     if ((warps & (warps - 1)) != 0 ||
@@ -2997,6 +3006,11 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
         stages > std::numeric_limits<int32_t>::max() ||
         (ctas & (ctas - 1)) != 0 || ctas > 16 ||
         (ctas > 1 && capabilities.getComputeCapabilityMajor() < 9))
+      continue;
+    if (llvm::any_of(localOptions, [&](const TritonLocalOptions &option) {
+          return option.warps == warps && option.stages == stages &&
+                 option.ctas == ctas;
+        }))
       continue;
     localOptions.push_back({warps, stages, ctas});
     if (!llvm::is_contained(warpDomain, warps)) warpDomain.push_back(warps);

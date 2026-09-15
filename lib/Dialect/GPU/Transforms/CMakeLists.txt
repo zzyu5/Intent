@@ -19,6 +19,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   VerifyGPUProgram.cpp
 
   LINK_LIBS PUBLIC
+  MLIRAnalysis
   MLIRArithDialect
   MLIRFuncDialect
   MLIRIR
