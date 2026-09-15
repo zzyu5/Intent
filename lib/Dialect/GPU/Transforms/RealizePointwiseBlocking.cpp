@@ -3549,7 +3549,9 @@ LogicalResult rankLiftPointwiseValueGraph(
     gather.getResult().replaceAllUsesWith(replacement.getResult());
     gather.erase();
   }
-  return success();
+  // Ownership queries consume operand relations, not just the lifted result
+  // types. Make scalar and coordinate broadcasts explicit before those queries.
+  return alignPointwiseValueRelations(kernel);
 }
 
 enum ContractFreeAxisSide : unsigned {
