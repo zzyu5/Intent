@@ -144,7 +144,7 @@ def mhc_post(context: Context) -> PreparedComparison:
     )
 
 
-def moe_count_routes(context):
+def moe_count_routes_product_domain_case(context):
     ids = torch.randint(0, 64, (4096, 2), dtype=torch.int32)
     report_stage("generated_compilation")
     artifact = intent.compile(moe_count_routes_product_domain, target=context.target, compiler=context.compiler,
@@ -271,6 +271,6 @@ CASES = {
     "mhc_gemm_rms_scale": mhc_gemm_rms_scale,
     "mhc_pre": mhc_pre,
     "mhc_sinkhorn": mhc_sinkhorn_case,
-    "moe_count_routes_product_domain": moe_count_routes,
+    "moe_count_routes_product_domain": moe_count_routes_product_domain_case,
     "flaggems_fp8_mqa_logits": flaggems_fp8_mqa_logits,
 }
