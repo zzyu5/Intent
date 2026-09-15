@@ -137,7 +137,7 @@ LogicalResult checkSurface(ModuleOp module) {
         memref::SubViewOp, memref::CastOp, memref::ReinterpretCastOp, memref::LoadOp, memref::StoreOp,
         memref::ExtractStridedMetadataOp,
         memref::AllocaOp, memref::AllocOp, memref::DeallocOp, memref::PrefetchOp,
-        vector::LoadOp, vector::StoreOp, vector::BroadcastOp, vector::ShuffleOp, vector::StepOp,
+        vector::LoadOp, vector::StoreOp, vector::BroadcastOp, vector::FromElementsOp, vector::ShuffleOp, vector::StepOp,
         vector::ExtractElementOp, arith::CmpIOp, scf::IfOp, scf::ForOp, scf::WhileOp, cpu::TaskDispatchOp,
         cpu::AtomicLoadOp, cpu::AtomicStoreOp, cpu::AtomicRMWOp, cpu::AtomicCompareExchangeOp>(operation);
     supported &= llvm::all_of(operation->getOperandTypes(), supportedType);

@@ -464,6 +464,13 @@ private:
     } else if (auto op = dyn_cast<vector::BroadcastOp>(operation)) {
       assign(op.getResult(), valueType(op.getType()) + "(" +
           (op.getType().getElementType().isInteger(1) ? "fill=" : "") + name(op.getSource()) + ")");
+    } else if (auto op = dyn_cast<vector::FromElementsOp>(operation)) {
+      SmallVector<std::string> lanes;
+      Type element = op.getType().getElementType();
+      for (Value value : op.getElements())
+        lanes.push_back(element.isInteger(1) || element.isIndex()
+            ? memoryElement(element) + "(" + name(value) + ")" : name(value));
+      assign(op.getResult(), valueType(op.getType()) + "(" + join(lanes) + ")");
     } else if (auto op = dyn_cast<vector::StepOp>(operation)) {
       SmallVector<std::string> lanes;
       for (int64_t lane = 0; lane < op.getType().getNumElements(); ++lane) lanes.push_back(std::to_string(lane));

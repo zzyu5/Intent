@@ -51,6 +51,7 @@ bool materializeProductReduction(linalg::GenericOp operation) {
   for (unsigned axis = 0; axis + 1 < operation.getNumLoops(); ++axis)
     freeAxes.push_back(getAffineDimExpr(axis, operation.getContext()));
   auto outputMap = AffineMap::get(operation.getNumLoops(), 0, freeAxes, operation.getContext());
+  SmallVector<bool> vectorLoads(components, false);
   for (unsigned component = 0; component < components; ++component) {
     auto source = dyn_cast<MemRefType>(operation.getInputs()[component].getType());
     auto output = dyn_cast<MemRefType>(operation.getOutputs()[component].getType());
@@ -58,11 +59,12 @@ bool materializeProductReduction(linalg::GenericOp operation) {
     int64_t offset;
     if (!source || !output || source.getShape() != sourceType.getShape() ||
         source.getElementType() != output.getElementType() ||
-        !scalarType(source.getElementType()) || source.getElementType().isInteger(1) ||
+        !scalarType(source.getElementType()) ||
         !maps[component].isIdentity() || maps[inputs + component] != outputMap ||
         output.getShape() != sourceType.getShape().drop_back() ||
-        failed(source.getStridesAndOffset(strides, offset)) || strides.back() != 1)
+        failed(source.getStridesAndOffset(strides, offset)))
       return false;
+    vectorLoads[component] = strides.back() == 1 && !source.getElementType().isInteger(1);
   }
   for (unsigned capture = components; capture < inputs; ++capture)
     for (AffineExpr expression : maps[capture].getResults())
@@ -164,9 +166,21 @@ bool materializeProductReduction(linalg::GenericOp operation) {
       b.setInsertionPointToStart(blocks.getBody());
       position.back() = blocks.getInductionVar();
       SmallVector<Value> partial;
-      for (Value source : operation.getInputs().take_front(components))
-        partial.push_back(b.create<vector::LoadOp>(loc,
-            VectorType::get({width}, cast<MemRefType>(source.getType()).getElementType()), source, position));
+      for (auto [component, source] : llvm::enumerate(operation.getInputs().take_front(components))) {
+        auto type = VectorType::get({width}, cast<MemRefType>(source.getType()).getElementType());
+        if (vectorLoads[component]) {
+          partial.push_back(b.create<vector::LoadOp>(loc, type, source, position));
+          continue;
+        }
+        // Scalar lane reads retain the memref's element representation and
+        // strides, including bool storage whose vector packing is target-specific.
+        SmallVector<Value> lanes, coordinate(position);
+        for (int64_t lane = 0; lane < width; ++lane) {
+          coordinate.back() = b.create<arith::AddIOp>(loc, position.back(), index(b, loc, lane));
+          lanes.push_back(b.create<memref::LoadOp>(loc, source, coordinate));
+        }
+        partial.push_back(b.create<vector::FromElementsOp>(loc, type, lanes));
+      }
       // Reduce adjacent ranges using the entire product combine. Components
       // cannot use independent reductions: predicates may relate value/index.
       for (int64_t count = width; count > 1; count /= 2) {
