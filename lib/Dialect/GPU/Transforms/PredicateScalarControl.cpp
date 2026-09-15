@@ -2,6 +2,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 using namespace mlir;
@@ -22,8 +23,21 @@ bool isScalarProduct(Type type) {
 }
 
 bool canPredicate(Block &block, bool allowStores = false,
-                  bool allowProducts = false) {
+                  bool allowProducts = false, bool allowLoops = false) {
   for (Operation &operation : block.without_terminator()) {
+    if (auto loop = dyn_cast<scf::ForOp>(operation)) {
+      APInt lower, upper, step;
+      if (!allowLoops ||
+          !matchPattern(loop.getLowerBound(), m_ConstantInt(&lower)) ||
+          !matchPattern(loop.getUpperBound(), m_ConstantInt(&upper)) ||
+          !matchPattern(loop.getStep(), m_ConstantInt(&step)) ||
+          !step.isStrictlyPositive() ||
+          !llvm::all_of(loop.getResultTypes(), isScalarProduct) ||
+          !canPredicate(*loop.getBody(), /*allowStores=*/false,
+                        /*allowProducts=*/true, /*allowLoops=*/true))
+        return false;
+      continue;
+    }
     if (auto store = dyn_cast<StoreOp>(operation)) {
       if (!allowStores || !isScalar(store.getValue().getType()) ||
           !llvm::all_of(store.getCoordinates(), [](Value coordinate) {
@@ -156,7 +170,33 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
                             location, builder.getZeroAttr(type)));
   };
   Operation *clone;
-  if (auto store = dyn_cast<StoreOp>(operation)) {
+  if (auto loop = dyn_cast<scf::ForOp>(operation)) {
+    assert(!shape && "ordered loops are predicated before fragment lifting");
+    auto result = builder.create<scf::ForOp>(
+        location, mapped(loop.getLowerBound()), mapped(loop.getUpperBound()),
+        mapped(loop.getStep()), coordinates(loop.getInitArgs()));
+    result->setAttrs(loop->getAttrs());
+    if (!result.getBody()->empty())
+      result.getBody()->back().erase();
+    IRMapping bodyMapping(mapping);
+    bodyMapping.map(loop.getInductionVar(), result.getInductionVar());
+    bodyMapping.map(loop.getRegionIterArgs(), result.getRegionIterArgs());
+    {
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(result.getBody());
+      for (Operation &nested : loop.getBody()->without_terminator())
+        clonePredicatedScalarOperation(builder, &nested, bodyMapping, predicate);
+      SmallVector<Value> yielded;
+      for (auto [value, carried] :
+           llvm::zip(loop.getBody()->getTerminator()->getOperands(),
+                     result.getRegionIterArgs()))
+        yielded.push_back(selectScalarProduct(
+            builder, location, predicate, bodyMapping.lookupOrDefault(value),
+            carried));
+      builder.create<scf::YieldOp>(location, yielded);
+    }
+    clone = result;
+  } else if (auto store = dyn_cast<StoreOp>(operation)) {
     clone = builder.create<StoreOp>(
         location, mapped(store.getResource()), coordinates(store.getCoordinates()),
         lift(mapped(store.getValue())), maskedValidity(store.getValid()),
@@ -218,8 +258,8 @@ LogicalResult predicateScalarControl(ModuleOp module) {
     }
     if (conditional.getElseRegion().empty() ||
         !llvm::all_of(conditional.getResultTypes(), isScalarProduct) ||
-        !canPredicate(conditional.getThenRegion().front(), false, true) ||
-        !canPredicate(conditional.getElseRegion().front(), false, true))
+        !canPredicate(conditional.getThenRegion().front(), false, true, true) ||
+        !canPredicate(conditional.getElseRegion().front(), false, true, true))
       continue;
     OpBuilder builder(conditional);
     Value otherwise = builder.create<UnaryOp>(
