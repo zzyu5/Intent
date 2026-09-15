@@ -1749,6 +1749,7 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
   using Constraint = std::pair<AffineExpr, bool>;
   struct AccessDomain {
     SmallVector<Constraint> constraints;
+    SmallVector<AffineExpr> disequalities;
     SmallVector<AffineExpr> order;
   };
   auto function = read->getParentOfType<func::FuncOp>();
@@ -1920,6 +1921,7 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
         case ComparePredicate::Le: predicate = ComparePredicate::Gt; break;
         case ComparePredicate::Gt: predicate = ComparePredicate::Le; break;
         case ComparePredicate::Ge: predicate = ComparePredicate::Lt; break;
+        case ComparePredicate::Eq: predicate = ComparePredicate::Ne; break;
         case ComparePredicate::Ne: predicate = ComparePredicate::Eq; break;
         default: return false;
         }
@@ -1930,6 +1932,7 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
       case ComparePredicate::Gt: domain.constraints.emplace_back(lhs - rhs - 1, false); break;
       case ComparePredicate::Ge: domain.constraints.emplace_back(lhs - rhs, false); break;
       case ComparePredicate::Eq: domain.constraints.emplace_back(lhs - rhs, true); break;
+      case ComparePredicate::Ne: domain.disequalities.push_back(lhs - rhs); break;
       default: return false;
       }
     }
@@ -2071,19 +2074,38 @@ bool hasAffinePrecedingViewDefinition(Operation *read, RankedTensorType tensor,
     else set.addInequality(row);
     return true;
   };
-  IntegerPolyhedron readSet(space);
-  for (auto [expression, equality] : reads.constraints)
-    if (!add(readSet, expression, equality)) return false;
-  PresburgerSet unwritten(readSet);
+  auto domainSet = [&](const AccessDomain &domain) -> FailureOr<PresburgerSet> {
+    IntegerPolyhedron conjunction(space);
+    for (auto [expression, equality] : domain.constraints)
+      if (!add(conjunction, expression, equality)) return failure();
+    PresburgerSet result(conjunction);
+    for (AffineExpr expression : domain.disequalities) {
+      // Integer inequality is the union of the two strict half-spaces. Keep
+      // both branches in the same address/order proof instead of discarding
+      // conditional writers or assuming that either branch defines everything.
+      IntegerPolyhedron positive(space), negative(space);
+      if (!add(positive, expression - 1, false) ||
+          !add(negative, -expression - 1, false))
+        return failure();
+      PresburgerSet nonzero(positive);
+      nonzero.unionInPlace(PresburgerSet(negative));
+      result = result.intersect(nonzero);
+    }
+    return result;
+  };
+  FailureOr<PresburgerSet> readSet = domainSet(reads);
+  if (failed(readSet)) return false;
+  PresburgerSet unwritten = *readSet;
   for (const AccessDomain &write : writes) {
-    IntegerPolyhedron prefix(space);
-    for (auto [expression, equality] : write.constraints)
-      if (!add(prefix, expression, equality)) return false;
+    FailureOr<PresburgerSet> prefixSet = domainSet(write);
+    if (failed(prefixSet)) return false;
+    PresburgerSet prefix = *prefixSet;
     for (auto [writtenTime, readTime] : llvm::zip(write.order, reads.order)) {
-      IntegerPolyhedron earlier(prefix);
+      IntegerPolyhedron earlier(space), equal(space);
       if (!add(earlier, readTime - writtenTime - 1, false)) return false;
-      unwritten = unwritten.subtract(PresburgerSet(earlier));
-      if (!add(prefix, readTime - writtenTime, true)) return false;
+      unwritten = unwritten.subtract(prefix.intersect(PresburgerSet(earlier)));
+      if (!add(equal, readTime - writtenTime, true)) return false;
+      prefix = prefix.intersect(PresburgerSet(equal));
     }
     if (unwritten.isIntegerEmpty())
       return true;
