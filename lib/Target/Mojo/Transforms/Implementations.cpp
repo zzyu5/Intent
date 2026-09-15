@@ -174,13 +174,27 @@ cpu::ImplementationRegistry implementations() {
     };
   };
   auto directLegal = contraction.legal;
-  auto addInteger = [&](StringRef name) {
+  auto addInteger = [&](StringRef name, StringRef exactFloatName) {
     Implementation integer = contraction;
     integer.name = name;
     integer.applicable = [](Operation *op) {
       auto generic = dyn_cast<linalg::GenericOp>(op);
       return generic && isMatrixContraction(generic) &&
           cast<MemRefType>(generic.getOutputs()[0].getType()).getElementType().isSignlessInteger(32);
+    };
+    result.add(integer);
+    integer.name = exactFloatName;
+    auto integerLegal = integer.legal;
+    integer.legal = [integerLegal](Operation *operation, CapabilitiesAttr capabilities, const Configuration &config) {
+      // Integer partials remain live across each local floating reduction.
+      return integerLegal(operation, capabilities, config) &&
+          config.parameter("micro_m") * config.parameter("micro_n") * config.parameter("vector_width") <=
+              capabilities.getPrivateBytes() / 8;
+    };
+    integer.parameters = [](Builder &b, const Configuration &config) {
+      NamedAttrList fields(config.local);
+      fields.append("exact_f32_chunk", b.getI64IntegerAttr(1024));
+      return fields.getDictionary(b.getContext());
     };
     result.add(std::move(integer));
   };
@@ -191,7 +205,7 @@ cpu::ImplementationRegistry implementations() {
         config.parameter("vector_width") / config.parameter("micro_n");
   };
   result.add(contraction);
-  addInteger("mojo.register_integer");
+  addInteger("mojo.register_integer", "mojo.register_integer_f32");
   contraction.name = "mojo.register_float_shared";
   contraction.inputs = inputRequirements(InputReuse::Consumers);
   contraction.legal = [directLegal](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
@@ -199,7 +213,7 @@ cpu::ImplementationRegistry implementations() {
         config.tileN % (config.parameter("vector_width") * config.parameter("micro_n")) == 0;
   };
   result.add(contraction);
-  addInteger("mojo.register_integer_shared");
+  addInteger("mojo.register_integer_shared", "mojo.register_integer_f32_shared");
   contraction.name = "mojo.register_float_direct";
   contraction.legal = [directLegal](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
     SmallVector<int64_t> strides;
@@ -210,7 +224,7 @@ cpu::ImplementationRegistry implementations() {
   };
   contraction.inputs = {};
   result.add(contraction);
-  addInteger("mojo.register_integer_direct");
+  addInteger("mojo.register_integer_direct", "mojo.register_integer_f32_direct");
   contraction.name = "mojo.register_float_widened";
   contraction.legal = [directLegal](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
     if (!directLegal(op, capabilities, config) ||

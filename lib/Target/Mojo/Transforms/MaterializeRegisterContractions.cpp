@@ -7,6 +7,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 using namespace mlir;
@@ -278,24 +279,37 @@ LogicalResult materializeRegisterContractions(func::FuncOp function) {
     int64_t width = tile.getVectorWidth(), columns = tile.getColumns() / width;
     Type accumulator = outputType.getElementType();
     auto vectorType = VectorType::get({width}, accumulator);
+    auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
+    if (!binding) return operation.emitError("CPU register contraction requires a selected implementation");
+    auto exactChunk = dyn_cast_or_null<IntegerAttr>(binding.getParameters().get("exact_f32_chunk"));
+    if (exactChunk && (!accumulator.isInteger(32) ||
+        !cast<MemRefType>(lhs.getType()).getElementType().isInteger(8) ||
+        !cast<MemRefType>(rhs.getType()).getElementType().isInteger(8) ||
+        exactChunk.getInt() <= 0 || exactChunk.getInt() > 1024))
+      return operation.emitError("exact f32 integer contraction requires signed i8 operands, i32 state and at most 1024 products per chunk");
+    Type computation = exactChunk ? b.getF32Type() : accumulator;
+    auto computationVector = VectorType::get({width}, computation);
     auto widen = [&](Value value, Type type) -> Value {
       if (value.getType() == type) return value;
+      if (isa<FloatType>(getElementTypeOrSelf(type)) &&
+          isa<IntegerType>(getElementTypeOrSelf(value.getType())))
+        return b.create<arith::SIToFPOp>(loc, type, value);
       if (isa<FloatType>(accumulator)) return b.create<arith::ExtFOp>(loc, type, value);
       return b.create<arith::ExtSIOp>(loc, type, value);
     };
     SmallVector<Value> rows, offsets, accumulators;
     for (int64_t row = 0; row < tile.getRows(); ++row) rows.push_back(index(b, loc, row));
     for (int64_t column = 0; column < columns; ++column) offsets.push_back(index(b, loc, column * width));
-    auto load = [&](Value source, Value row, Value column) -> Value {
+    auto load = [&](Value source, Value row, Value column, Type target) -> Value {
       Type element = cast<MemRefType>(source.getType()).getElementType();
       Value value = width == 1
           ? Value(b.create<memref::LoadOp>(loc, source, ValueRange{row, column}))
           : Value(b.create<vector::LoadOp>(loc, VectorType::get({width}, element), source, ValueRange{row, column}));
-      return widen(value, width == 1 ? accumulator : vectorType);
+      return widen(value, width == 1 ? target : Type(VectorType::get({width}, target)));
     };
     for (Value row : rows)
       for (Value offset : offsets) {
-        if (!epilogue) accumulators.push_back(load(output, row, offset));
+        if (!epilogue) accumulators.push_back(load(output, row, offset, accumulator));
         else {
           Value initial = epilogue->initialization.getInputs()[0];
           accumulators.push_back(width == 1 ? initial
@@ -303,11 +317,11 @@ LogicalResult materializeRegisterContractions(func::FuncOp function) {
         }
       }
     Value depth = b.create<memref::DimOp>(loc, lhs, 1);
-    auto reduction = b.create<scf::ForOp>(loc, index(b, loc, 0), depth, index(b, loc, 1), accumulators);
-    {
+    auto reduce = [&](Value base, Value count, ValueRange initials) {
+      auto reduction = b.create<scf::ForOp>(loc, index(b, loc, 0), count, index(b, loc, 1), initials);
       OpBuilder::InsertionGuard guard(b);
       b.setInsertionPointToStart(reduction.getBody());
-      Value k = reduction.getInductionVar();
+      Value k = add(b, loc, base, reduction.getInductionVar());
       if (width > 1) {
         Value last = b.create<arith::SubIOp>(loc, depth, index(b, loc, 1));
         Value ahead = b.create<arith::MinSIOp>(loc, add(b, loc, k, index(b, loc, 4)), last);
@@ -315,15 +329,15 @@ LogicalResult materializeRegisterContractions(func::FuncOp function) {
           b.create<memref::PrefetchOp>(loc, rhs, ValueRange{ahead, offset}, false, 3, true);
       }
       SmallVector<Value> right;
-      for (Value offset : offsets) right.push_back(load(rhs, k, offset));
+      for (Value offset : offsets) right.push_back(load(rhs, k, offset, computation));
       SmallVector<Value> next;
       for (auto [number, row] : llvm::enumerate(rows)) {
         Value left = b.create<memref::LoadOp>(loc, lhs, ValueRange{row, k});
-        left = widen(left, accumulator);
-        if (width != 1) left = b.create<vector::BroadcastOp>(loc, vectorType, left);
+        left = widen(left, computation);
+        if (width != 1) left = b.create<vector::BroadcastOp>(loc, computationVector, left);
         for (int64_t column = 0; column < columns; ++column) {
           Value previous = reduction.getRegionIterArgs()[number * columns + column];
-          if (isa<FloatType>(accumulator))
+          if (isa<FloatType>(computation))
             next.push_back(b.create<math::FmaOp>(loc, left, right[column], previous));
           else
             next.push_back(b.create<arith::AddIOp>(loc,
@@ -331,16 +345,44 @@ LogicalResult materializeRegisterContractions(func::FuncOp function) {
         }
       }
       b.create<scf::YieldOp>(loc, next);
+      return reduction;
+    };
+    SmallVector<Value> results;
+    if (exactChunk) {
+      // Each signed i8 product has magnitude at most 2^14. In <= 2^10
+      // consecutive products every prefix is an exactly representable f32
+      // integer (magnitude <= 2^24). Keep prior i32 state out of this sum.
+      Value zero = b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(0));
+      if (width != 1) zero = b.create<vector::BroadcastOp>(loc, computationVector, zero);
+      SmallVector<Value> initials(accumulators.size(), zero);
+      Value limit = index(b, loc, exactChunk.getInt());
+      auto chunks = b.create<scf::ForOp>(loc, index(b, loc, 0), depth, limit, accumulators);
+      {
+        OpBuilder::InsertionGuard guard(b);
+        b.setInsertionPointToStart(chunks.getBody());
+        Value base = chunks.getInductionVar();
+        Value count = b.create<arith::MinSIOp>(loc, limit, b.create<arith::SubIOp>(loc, depth, base));
+        auto partial = reduce(base, count, initials);
+        SmallVector<Value> next;
+        for (auto [value, previous] : llvm::zip(partial.getResults(), chunks.getRegionIterArgs())) {
+          Value integer = b.create<arith::FPToSIOp>(loc, previous.getType(), value);
+          next.push_back(b.create<arith::AddIOp>(loc, previous, integer));
+        }
+        b.create<scf::YieldOp>(loc, next);
+      }
+      llvm::append_range(results, chunks.getResults());
+    } else {
+      llvm::append_range(results, reduce(index(b, loc, 0), depth, accumulators).getResults());
     }
     for (auto [number, row] : llvm::enumerate(rows))
       for (int64_t column = 0; column < columns; ++column) {
-        Value value = reduction.getResult(number * columns + column);
+        Value value = results[number * columns + column];
         Value destination = output;
         if (epilogue) {
           IRMapping mapping;
           Block &body = epilogue->consumer.getRegion().front();
           for (auto [position, input] : llvm::enumerate(epilogue->consumer.getInputs()))
-            mapping.map(body.getArgument(position), input == output ? value : load(input, row, offsets[column]));
+            mapping.map(body.getArgument(position), input == output ? value : load(input, row, offsets[column], accumulator));
           for (Operation &nested : body.without_terminator()) {
             if (auto constant = dyn_cast<arith::ConstantOp>(&nested); constant && width != 1) {
               Value splat = b.create<arith::ConstantOp>(loc, vectorType,
