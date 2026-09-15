@@ -504,6 +504,28 @@ scf::ParallelOp partitionAtomicRows(func::FuncOp function, scf::ParallelOp root,
   return owners;
 }
 
+void foldSequentialAtomicAdds(func::FuncOp function) {
+  SmallVector<AtomicRMWOp> updates;
+  function.walk([&](AtomicRMWOp update) {
+    if (update.getOrdering() != AtomicOrdering::Relaxed || update.getKind() != AtomicRMWKind::Add ||
+        !isa<FloatType>(update.getValue().getType())) return;
+    // CPU task dispatches join before continuation; only sequential control
+    // may enclose an update with no concurrent invocation-local participant.
+    for (Operation *parent = update->getParentOp(); parent != function; parent = parent->getParentOp())
+      if (!isa<scf::ForOp, scf::IfOp>(parent)) return;
+    updates.push_back(update);
+  });
+  for (auto update : updates) {
+    OpBuilder b(update);
+    Location loc = update.getLoc();
+    Value old = b.create<memref::LoadOp>(loc, update.getTarget(), update.getIndices());
+    Value sum = b.create<arith::AddFOp>(loc, old, update.getValue());
+    b.create<memref::StoreOp>(loc, sum, update.getTarget(), update.getIndices());
+    update.getOldValue().replaceAllUsesWith(old);
+    update.erase();
+  }
+}
+
 }
 
 LogicalResult partitionTasks(func::FuncOp function, int64_t grain, const ImplementationRegistry &implementations) {
@@ -519,6 +541,7 @@ LogicalResult partitionTasks(func::FuncOp function, int64_t grain, const Impleme
     // Atomic row worksets have already consumed the grain and worker budget.
     if (failed(partition(owners ? owners : root, owners ? 1 : grain))) return failure();
   }
+  foldSequentialAtomicAdds(function);
   return success();
 }
 
