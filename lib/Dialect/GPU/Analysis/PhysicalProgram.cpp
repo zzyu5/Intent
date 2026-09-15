@@ -203,6 +203,13 @@ bool sameScalarExpression(Value lhs, Value rhs, unsigned depth = 0) {
   if (leftConstant || rightConstant)
     return leftConstant && rightConstant &&
            leftConstant.getValue() == rightConstant.getValue();
+  auto leftExpression = lhs.getDefiningOp<PhysicalExprOp>();
+  auto rightExpression = rhs.getDefiningOp<PhysicalExprOp>();
+  if (leftExpression || rightExpression)
+    return leftExpression && rightExpression &&
+           leftExpression->getParentOfType<func::FuncOp>() ==
+               rightExpression->getParentOfType<func::FuncOp>() &&
+           leftExpression.getExpression() == rightExpression.getExpression();
   auto leftBinary = lhs.getDefiningOp<BinaryOp>();
   auto rightBinary = rhs.getDefiningOp<BinaryOp>();
   if (leftBinary || rightBinary)
@@ -1827,6 +1834,12 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
          (rhsConstant && *rhsConstant == 0)))
       return {true, expression(PhysicalExprKind::Constant, 0)};
     if (binary.getOperatorKind() == BinaryOperator::Subtract) {
+      if (auto constant = integerConstant(binary.getLhs());
+          constant && *constant >= 0 && rhsConstant &&
+          *rhsConstant <= *constant)
+        return {true, expression(PhysicalExprKind::Constant,
+                                 *constant - rhs.lower),
+                *constant - *rhsConstant};
       auto ordinal = dyn_cast<BlockArgument>(stripScalarIdentity(binary.getRhs()));
       auto loop = ordinal
                       ? dyn_cast<scf::ForOp>(ordinal.getOwner()->getParentOp())
@@ -2720,8 +2733,9 @@ void PhysicalProgramAnalysis::collectAxisRanges(
       rankOneCoordinates &= type.getShape().size() == 1;
       positionalCoordinates.push_back(coordinate);
     }
-    if (rankOneCoordinates &&
-        positionalCoordinates.size() == fragment.getShape().size()) {
+    bool cartesian = rankOneCoordinates &&
+        positionalCoordinates.size() == fragment.getShape().size();
+    if (cartesian) {
       Value coordinate = positionalCoordinates[fragmentAxis];
       auto type = cast<FragmentType>(coordinate.getType());
       auto occurrence = cast<AxisMapAttr>(type.getAxisMaps()[0]);
@@ -2806,7 +2820,7 @@ void PhysicalProgramAnalysis::collectAxisRanges(
       MakeRangeOp authority = accessRoots.front();
       if (!llvm::all_of(accessRoots, [&](MakeRangeOp range) {
             return sameLogicalRange(authority, range);
-          })) {
+          }) && (cartesian || !lockstepRanges(accessRoots).isExact())) {
         result.state = PhysicalFactState::Ambiguous;
         appendUnique(result.blockers, operation);
       }

@@ -4761,6 +4761,15 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                });
       });
       for (Operation *user : value.getUsers()) {
+        if (auto yield = dyn_cast<scf::YieldOp>(user)) {
+          if (auto branch = dyn_cast<scf::IfOp>(yield->getParentOp()))
+            for (auto [position, yielded] : llvm::enumerate(yield.getOperands()))
+              if (yielded == value && position < branch.getNumResults() &&
+                  queryFragmentDimensions(branch.getResult(position).getType(),
+                                          *dimension).size() == 1)
+                worklist.push_back(branch.getResult(position));
+          continue;
+        }
         if (!isa<LoadOp, UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp,
                  BitcastOp, BroadcastOp, TransposeOp, ReshapeOp>(user))
           continue;
@@ -4896,7 +4905,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     }
   llvm::erase_if(dynamicRanges, [&](MakeRangeOp range) {
     return llvm::is_contained(fullCoverageRanges, range) ||
-           (!ownershipOnly && range->hasAttr(sourceSubregionAttr) &&
+           (!ownershipOnly &&
             hasExactStaticFullCoverage(kernel, range.getResult(), 0));
   });
   for (MakeRangeOp range : dynamicRanges) {

@@ -854,37 +854,6 @@ FailureOr<PhysicalAxisIdentity>
 resultAxisIdentity(Operation *operation, unsigned resultIndex = 0,
                    unsigned axis = 0);
 
-FailureOr<int64_t> physicalDimensionIdentity(Operation *origin,
-                                             int64_t logicalIdentity) {
-  if (!origin || logicalIdentity <= 0)
-    return failure();
-  func::FuncOp function = origin->getParentOfType<func::FuncOp>();
-  if (!function)
-    return logicalIdentity;
-  std::optional<int64_t> physicalIdentity;
-  bool conflict = false;
-  function.walk([&](intent::SubregionOp subregion) {
-    bool definesIdentity = llvm::any_of(
-        subregion.getExtentDimensions(), [&](Attribute attribute) {
-          return cast<IntegerAttr>(attribute).getInt() == logicalIdentity;
-        });
-    if (!definesIdentity)
-      return;
-    std::optional<int64_t> candidate =
-        sourceExtentDimension(subregion.getInputs().front());
-    if (!candidate)
-      return;
-    if (physicalIdentity && *physicalIdentity != *candidate)
-      conflict = true;
-    else
-      physicalIdentity = *candidate;
-  });
-  if (conflict)
-    return failure();
-  return physicalIdentity ? FailureOr<int64_t>(*physicalIdentity)
-                          : FailureOr<int64_t>(logicalIdentity);
-}
-
 FailureOr<PhysicalAxisIdentity>
 physicalAxisIdentity(Operation *origin, int64_t logicalIdentity,
                      unsigned logicalAxis) {
@@ -1048,36 +1017,19 @@ std::optional<int64_t> subregionStaticExtentBound(Operation *origin,
   return conflict ? std::nullopt : result;
 }
 
-FailureOr<PhysicalExprAttr> fragmentExtentForDimension(Operation *origin,
-                                                      int64_t dimension) {
-  if (!origin || dimension <= 0)
-    return failure();
-  // Construction owns one logical member until a shared decision pass binds a
-  // compile-time blocking parameter.  Runtime launch dimensions remain in
-  // program-space, ranges and validity; a parameter selected for another
-  // traversal of the same logical dimension is not an extent authority here.
-  return expression(origin->getContext(), PhysicalExprKind::Constant, 1);
-}
-
 FailureOr<PhysicalExprAttr> fragmentExtentExpression(RankedTensorType tensor,
                                                      Operation *origin,
                                                      unsigned axis) {
   DenseI64ArrayAttr identities = dimensionIds(tensor);
-  if (!identities || axis >= identities.size())
+  if (!origin || !identities || axis >= identities.size() || identities[axis] <= 0)
     return failure();
   if (std::optional<int64_t> staticBound =
           subregionStaticExtentBound(origin, identities[axis]))
     return expression(tensor.getContext(), PhysicalExprKind::Constant,
                       *staticBound);
-  FailureOr<int64_t> physicalIdentity =
-      physicalDimensionIdentity(origin, identities[axis]);
-  if (failed(physicalIdentity))
-    return failure();
-  FailureOr<PhysicalExprAttr> extent =
-      fragmentExtentForDimension(origin, *physicalIdentity);
-  if (failed(extent))
-    return failure();
-  return *extent;
+  // Initial scalar ownership needs no choice between equal-length source
+  // occurrences. Their own ranges retain the logical coordinates and bounds.
+  return expression(origin->getContext(), PhysicalExprKind::Constant, 1);
 }
 
 Type convertScalarType(Type type, uint64_t owner = 1) {
@@ -3201,11 +3153,20 @@ private:
         } else {
           auto logical = cast<RankedTensorType>(indices.getSource().getType());
           auto identities = dimensionIds(logical);
-          PhysicalExprAttr logicalExtent =
-              logical.isDynamicDim(axis)
-                  ? dimensionExpression(operation->getContext(), identities[axis])
-                  : expression(operation->getContext(), PhysicalExprKind::Constant,
-                               logical.getDimSize(axis));
+          PhysicalExprAttr logicalExtent;
+          if (logical.isDynamicDim(axis)) {
+            auto function = operation->getParentOfType<func::FuncOp>();
+            FailureOr<PhysicalExprAttr> resolved =
+                logicalDimensionExpression(function, identities[axis]);
+            if (failed(resolved))
+              return indices.emitOpError(
+                  "tensor index axis has conflicting logical extent relations");
+            logicalExtent = *resolved;
+          } else {
+            logicalExtent = expression(operation->getContext(),
+                                       PhysicalExprKind::Constant,
+                                       logical.getDimSize(axis));
+          }
           FailureOr<Value> stop = physicalExtentValue(location, logicalExtent);
           if (failed(stop))
             return indices.emitOpError(

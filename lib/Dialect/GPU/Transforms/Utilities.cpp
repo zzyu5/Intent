@@ -795,6 +795,15 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
   if (!isa<IntegerType, FloatType, IndexType>(element) ||
       element != target.getElementType())
     return failure();
+  Value scalar = value;
+  while (isa<FragmentType>(scalar.getType())) {
+    UniformExpression expression = describeUniformValue(scalar);
+    if (expression.kind != UniformKind::Forward || expression.operands.size() != 1)
+      break;
+    scalar = expression.operands.front();
+  }
+  if (scalar.getType() == element)
+    return Value(builder.create<SplatOp>(location, target, scalar));
   if (source)
     if (auto constant = dyn_cast_or_null<TypedAttr>(
             UniformValueAnalysis(describeUniformValue).evaluate(value));
@@ -1283,6 +1292,28 @@ FailureOr<Value> materializeReplayedValue(
     PhysicalAxisProjection projection =
         fragment ? replayProjection(fragment, axis)
                  : PhysicalAxisProjection{};
+    if (fragment && !projection.isExact() &&
+        projection.state != PhysicalFactState::Ambiguous &&
+        !options.traversalRanges.empty()) {
+      std::optional<unsigned> selected;
+      for (unsigned candidate = 0; candidate < fragment.getShape().size(); ++candidate) {
+        if (axis && candidate != *axis)
+          continue;
+        PhysicalRangeFact fact = analysis.axisRanges(current, candidate);
+        if (fact.state == PhysicalFactState::Unknown || !fact.blockers.empty() ||
+            fact.roots.empty())
+          continue;
+        SmallVector<MakeRangeOp> combined(fact.roots.begin(), fact.roots.end());
+        combined.append(options.traversalRanges.begin(), options.traversalRanges.end());
+        if (!analysis.lockstepRanges(combined).isExact())
+          continue;
+        if (selected)
+          return std::nullopt;
+        selected = candidate;
+      }
+      if (selected)
+        return selected;
+    }
     if (!fragment || !projection.isExact())
       return std::nullopt;
     if (options.traversalRanges.empty())
@@ -1457,8 +1488,29 @@ FailureOr<Value> materializeReplayedValue(
       Value replayed = clone->getResult(result.getResultNumber());
       return replayed;
     }
-    if (!fragment || !projection)
+    if (!fragment)
       return current;
+    if (!projection) {
+      Operation *producer = current.getDefiningOp();
+      if (!producer || !isPhysicalReplayNode(
+                           producer, PhysicalReplayScope::Coordinate,
+                           /*allowAccesses=*/false))
+        return current;
+      IRMapping cloneMapping(mapping);
+      bool changed = false;
+      for (Value operand : producer->getOperands()) {
+        FailureOr<Value> replayed = materialize(operand, std::nullopt);
+        if (failed(replayed))
+          return failure();
+        cloneMapping.map(operand, *replayed);
+        changed |= *replayed != operand;
+      }
+      if (!changed)
+        return current;
+      Operation *clone = builder.clone(*producer, cloneMapping);
+      remember(current, clone->getResult(0), std::nullopt);
+      return clone->getResult(0);
+    }
     unsigned axis = *projection;
     Operation *producer = current.getDefiningOp();
     if (!producer)
@@ -1511,9 +1563,7 @@ FailureOr<Value> materializeReplayedValue(
       if (Value mapped = mapping.lookupOrNull(operand);
           mapped && !hasMultipleReplayAxes(operand.getType()))
         return mapped;
-      return selectedReplayAxis(operand, operandAxis)
-                 ? materialize(operand, operandAxis)
-                 : FailureOr<Value>(operand);
+      return materialize(operand, operandAxis);
     };
     auto combineTail = [&](FragmentType target,
                            Value valid) -> FailureOr<Value> {
@@ -2373,12 +2423,12 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
           return WalkResult::interrupt();
         }
         if (targetParameter)
-          retargetDimensionExtent(
-              broadcast.getValue(), sourceMap.getDimensionId(),
+          retargetSourceExtent(
+              broadcast.getValue(), sourceAxisIdentity(sourceMap),
               cast<PhysicalExprAttr>(target.getShape()[targetAxis]));
         else
-          retargetDimensionExtent(broadcast.getResult(),
-                                  targetMap.getDimensionId(), sourceExtent);
+          retargetSourceExtent(broadcast.getResult(),
+                               sourceAxisIdentity(targetMap), sourceExtent);
         source = cast<FragmentType>(broadcast.getValue().getType());
         target = cast<FragmentType>(broadcast.getResult().getType());
       }
@@ -2452,8 +2502,9 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
             "pointwise result refinement has no logical dimension authority");
         return WalkResult::interrupt();
       }
-      retargetDimensionExtent(
-          operation->getResult(0), dimension,
+      retargetSourceExtent(
+          operation->getResult(0),
+          sourceAxisIdentity(cast<AxisMapAttr>(target.getAxisMaps()[axis])),
           cast<PhysicalExprAttr>((*refined).getShape()[axis]));
     }
     target = *refined;
@@ -3475,16 +3526,17 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
                                       (*authority).getLogicalStart())
                                 : PhysicalExprAttr();
     PhysicalExprAttr end = succeeded(authority)
-                               ? queryLaunchExpression((*authority).getLogicalStop())
-                               : PhysicalExprAttr();
-    std::optional<int64_t> stop =
-        end ? constantPhysicalExpression(end) : std::nullopt;
-    bool staticSubregionBound = subregion && stop && *stop >= 0;
-    if (start &&
-        start.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-        (start.getValue() == 0 || staticSubregionBound) &&
-        end)
-      runtimeDimension = (*authority).getLogicalStop();
+                              ? queryNonNegativeIndexUpperBound(
+                                    (*authority).getLogicalStop())
+                              : PhysicalExprAttr();
+    if (start && end && isUnitStepRange(*authority)) {
+      // With a nonnegative start, an upper bound on stop also bounds the
+      // number of members. Keep the actual prefix/suffix in the range and
+      // cover it with this launch-visible capacity plus its existing tail.
+      OpBuilder builder(&kernel.front(), kernel.front().begin());
+      runtimeDimension = builder.create<PhysicalExprOp>(
+          source.getLoc(), builder.getIndexType(), end);
+    }
   }
   if (!runtimeDimension)
     return emitError(source.getLoc(),
@@ -3495,10 +3547,18 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
     return kernel.emitError(
         "full-coverage physicalization has no launch-visible extent expression");
   if (subregion)
-    for (MakeRangeOp range : ranges.roots)
-      if (!samePhysicalScalarExpression(range.getLogicalStop(), runtimeDimension))
+    for (MakeRangeOp range : ranges.roots) {
+      auto end = queryNonNegativeIndexUpperBound(range.getLogicalStop());
+      auto endConstant = end ? constantPhysicalExpression(end) : std::nullopt;
+      auto coverageConstant = constantPhysicalExpression(coverageBound);
+      bool bounded = end &&
+          (end == coverageBound ||
+           (endConstant && coverageConstant && *endConstant <= *coverageConstant));
+      if (!samePhysicalScalarExpression(range.getLogicalStop(), runtimeDimension) &&
+          !bounded)
         return range.emitOpError(
-            "subregion full coverage does not end at its parent extent");
+            "subregion full coverage has no proven stop bound");
+    }
 
   if (!staticDimension)
     if (auto value = dyn_cast_or_null<IntegerAttr>(

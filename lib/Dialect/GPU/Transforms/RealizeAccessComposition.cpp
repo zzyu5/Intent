@@ -247,6 +247,139 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
   return true;
 }
 
+FailureOr<bool> composePointwiseGather(GatherOp gather) {
+  auto source = dyn_cast<FragmentType>(gather.getSource().getType());
+  auto result = dyn_cast<FragmentType>(gather.getResult().getType());
+  Operation *producer = gather.getSource().getDefiningOp();
+  if (!source || !result || !producer ||
+      !isa<UnaryOp, BinaryOp, BroadcastOp, SplatOp, ReshapeOp>(producer) ||
+      !isa<FloatType>(source.getElementType()) ||
+      gather.getSourceAxes().size() != source.getShape().size())
+    return false;
+  bool positionalRebind = false;
+  if (auto reshape = dyn_cast<ReshapeOp>(producer)) {
+    auto input = cast<FragmentType>(reshape.getValue().getType());
+    positionalRebind = input.getShape() == source.getShape() &&
+        llvm::all_of(reshape.getReassociation(), [](Attribute attribute) {
+          auto group = cast<ReshapeGroupAttr>(attribute);
+          return group.getSourceAxes().size() == 1 &&
+                 group.getResultAxes().size() == 1 &&
+                 group.getSourceAxes()[0] == group.getResultAxes()[0];
+        });
+    if (!positionalRebind)
+      return false;
+  }
+  SmallVector<Value> coordinates(source.getShape().size());
+  for (auto [coordinate, axis] :
+       llvm::zip(gather.getCoordinates(), gather.getSourceAxes())) {
+    if (axis < 0 || axis >= static_cast<int64_t>(coordinates.size()) ||
+        coordinates[axis])
+      return false;
+    coordinates[axis] = coordinate;
+  }
+  if (llvm::any_of(coordinates, [](Value value) { return !value; }))
+    return false;
+  PhysicalProgramAnalysis analysis(gather->getParentOfType<func::FuncOp>());
+  auto broadcastUnit = [&](Value operand, unsigned axis) {
+    auto input = cast<FragmentType>(operand.getType());
+    auto extent = cast<PhysicalExprAttr>(input.getShape()[axis]);
+    if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+        extent.getValue() != 1)
+      return false;
+    PhysicalRangeFact ranges = analysis.axisRanges(operand, axis);
+    return ranges.isExact() && llvm::all_of(ranges.roots, [](MakeRangeOp range) {
+      return isProvablySingletonLogicalRange(range);
+    });
+  };
+  SmallVector<SmallVector<unsigned>> operandAxes;
+  for (Value operand : producer->getOperands()) {
+    SmallVector<unsigned> axes;
+    if (auto input = dyn_cast<FragmentType>(operand.getType())) {
+      if (positionalRebind) {
+        for (unsigned axis = 0; axis < input.getShape().size(); ++axis)
+          axes.push_back(axis);
+        operandAxes.push_back(std::move(axes));
+        continue;
+      }
+      BroadcastProjection projection = queryAxisProjection(input, source);
+      if (!projection.isExact())
+        return false;
+      for (unsigned inputAxis = 0; inputAxis < input.getShape().size(); ++inputAxis) {
+        std::optional<unsigned> selected;
+        for (auto [axis, mapped] : llvm::enumerate(projection.targetToSource))
+          if (mapped && *mapped == inputAxis) {
+            if (selected)
+              return false;
+            selected = axis;
+          }
+        if (!selected)
+          return false;
+        if (!broadcastUnit(operand, inputAxis) &&
+            input.getShape()[inputAxis] != source.getShape()[*selected])
+          return false;
+        axes.push_back(*selected);
+      }
+    }
+    operandAxes.push_back(std::move(axes));
+  }
+  OpBuilder builder(gather);
+  IRMapping mapping;
+  for (auto [operand, axes] : llvm::zip(producer->getOperands(), operandAxes)) {
+    auto input = dyn_cast<FragmentType>(operand.getType());
+    if (!input || mapping.contains(operand))
+      continue;
+    auto selectedType = FragmentType::get(
+        result.getContext(), input.getElementType(), result.getShape(),
+        result.getAxisMaps(), result.getValidity(), result.getOwner());
+    SmallVector<Value> selectedCoordinates;
+    SmallVector<int64_t> selectedAxes;
+    for (auto [axis, sourceAxis] : llvm::enumerate(axes)) {
+      Value coordinate = coordinates[sourceAxis];
+      if (broadcastUnit(operand, axis))
+        coordinate = builder.create<arith::ConstantIndexOp>(gather.getLoc(), 0);
+      Type element = coordinate.getType();
+      if (auto fragment = dyn_cast<FragmentType>(element))
+        element = fragment.getElementType();
+      auto indexType = FragmentType::get(
+          result.getContext(), element, result.getShape(), result.getAxisMaps(),
+          result.getValidity(), result.getOwner());
+      FailureOr<Value> projected = projectPhysicalValueToSchema(
+          builder, gather.getLoc(), coordinate, indexType);
+      if (failed(projected))
+        return gather.emitOpError("pointwise gather index lost its result projection");
+      selectedCoordinates.push_back(*projected);
+      selectedAxes.push_back(axis);
+    }
+    Value fill;
+    if (gather.getValid()) {
+      FailureOr<Value> zero = materializeZeroFragment(builder, gather.getLoc(), selectedType);
+      if (failed(zero))
+        return failure();
+      fill = *zero;
+    }
+    mapping.map(operand, builder.create<GatherOp>(
+        gather.getLoc(), selectedType, operand, selectedCoordinates,
+        gather.getValid(), fill, selectedAxes).getResult());
+  }
+  // Keep reductions and immutable reads as captured SSA producers. Only the
+  // floating pointwise suffix moves to the selected coordinates. Inactive
+  // operands use zero; restore the original gather fill after IEEE arithmetic.
+  Value value;
+  if (positionalRebind) {
+    value = mapping.lookup(producer->getOperand(0));
+  } else {
+    Operation *replacement = builder.clone(*producer, mapping);
+    replacement->getResult(0).setType(result);
+    value = replacement->getResult(0);
+  }
+  if (gather.getValid())
+    value = builder.create<SelectOp>(gather.getLoc(), result, gather.getValid(),
+                                     value, gather.getFill());
+  gather.getResult().replaceAllUsesWith(value);
+  gather.erase();
+  return true;
+}
+
 FailureOr<bool> composeLoadGather(GatherOp gather) {
   auto sourceType = dyn_cast<FragmentType>(gather.getSource().getType());
   auto sourceLoad = gather.getSource().getDefiningOp<LoadOp>();
@@ -620,8 +753,16 @@ bool hasNonUnitAxisSplit(ReshapeOp reshape) {
   bool split = false;
   for (Attribute attribute : reshape.getReassociation()) {
     auto group = cast<ReshapeGroupAttr>(attribute);
-    if (group.getSourceAxes().empty() || group.getResultAxes().empty())
+    if (group.getResultAxes().empty())
       return false;
+    if (group.getSourceAxes().empty())
+      for (int64_t axis : group.getResultAxes().asArrayRef()) {
+        auto extent = cast<PhysicalExprAttr>(result.getShape()[axis]);
+        if (extent.getKind() !=
+                static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+            extent.getValue() != 1)
+          return false;
+      }
     if (group.getSourceAxes().size() == 1 && group.getResultAxes().size() > 1) {
       for (int64_t axis : group.getResultAxes().asArrayRef()) {
         auto extent = cast<PhysicalExprAttr>(result.getShape()[axis]);
@@ -722,8 +863,16 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
   unsigned resultRank = 0;
   for (Attribute attribute : reshape.getReassociation()) {
     auto group = cast<ReshapeGroupAttr>(attribute);
-    if (group.getSourceAxes().empty() || group.getResultAxes().empty())
+    if (group.getResultAxes().empty())
       return false;
+    if (group.getSourceAxes().empty())
+      for (int64_t axis : group.getResultAxes().asArrayRef()) {
+        auto extent = cast<PhysicalExprAttr>(result.getShape()[axis]);
+        if (extent.getKind() !=
+                static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+            extent.getValue() != 1)
+          return false;
+      }
     for (int64_t axis : group.getSourceAxes().asArrayRef())
       sourceRank = std::max(sourceRank, static_cast<unsigned>(axis + 1));
     for (int64_t axis : group.getResultAxes().asArrayRef())
@@ -737,6 +886,11 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
   SmallVector<bool> preservedResult(resultRank, false);
   for (Attribute attribute : reshape.getReassociation()) {
     auto group = cast<ReshapeGroupAttr>(attribute);
+    if (group.getSourceAxes().empty()) {
+      for (int64_t axis : group.getResultAxes().asArrayRef())
+        preservedResult[axis] = true;
+      continue;
+    }
     if (group.getSourceAxes().size() != 1 ||
         group.getResultAxes().size() != 1)
       continue;
@@ -894,6 +1048,8 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
   IRMapping mapping;
   for (Attribute attribute : reshape.getReassociation()) {
     auto group = cast<ReshapeGroupAttr>(attribute);
+    if (group.getSourceAxes().empty())
+      continue;
     if (preservedResult[group.getResultAxes()[0]]) {
       // Unmerged axes retain their current tile and coordinates, including
       // program-local batch coordinates and already blocked free dimensions.
@@ -1676,6 +1832,13 @@ LogicalResult realizeAccessComposition(ModuleOp module) {
     for (GatherOp gather : gathers) {
       if (!gather->getBlock())
         continue;
+      FailureOr<bool> pointwise = composePointwiseGather(gather);
+      if (failed(pointwise))
+        return failure();
+      if (*pointwise) {
+        changed = true;
+        continue;
+      }
       FailureOr<bool> identity = composeIdentityFragmentGather(gather);
       if (failed(identity))
         return failure();
