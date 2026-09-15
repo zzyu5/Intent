@@ -57,8 +57,6 @@ inline constexpr llvm::StringLiteral programBoundedOriginAttr =
     "intent_gpu.program_bounded_origin";
 inline constexpr llvm::StringLiteral tritonConfigsAttr =
     "intent_gpu.triton.configs";
-inline constexpr llvm::StringLiteral tritonReductionBoundsAttr =
-    "intent_gpu.triton.reduction_bounds";
 inline constexpr llvm::StringLiteral cuTileConfigsAttr =
     "intent_gpu.cutile.configs";
 inline constexpr llvm::StringLiteral tileLangConfigsAttr =
