@@ -3,6 +3,7 @@ add_mlir_library(MLIRIntentTritonSerialization
 
   LINK_LIBS PUBLIC
   MLIRArithDialect
+  MLIRControlFlowDialect
   MLIRFuncDialect
   MLIRIR
   MLIRSCFDialect

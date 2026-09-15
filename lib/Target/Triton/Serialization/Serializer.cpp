@@ -6,6 +6,7 @@
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Target/Triton/IR/TritonOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/DenseMap.h"
@@ -14,6 +15,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/JSON.h"
 
 #include <cmath>
 #include <functional>
@@ -838,6 +840,17 @@ private:
   }
 
   void emitOperation(Operation &operation) {
+    if (auto assertion = dyn_cast<cf::AssertOp>(operation)) {
+      if (!constexprValues.contains(assertion.getArg())) {
+        assertion.emitOpError("Triton static assertion condition is not constexpr");
+        failed = true;
+        return;
+      }
+      std::string message;
+      llvm::raw_string_ostream(message) << llvm::json::Value(assertion.getMsg());
+      line("tl.static_assert(" + valueString(assertion.getArg()) + ", " + message + ")");
+      return;
+    }
     if (isa<CtaBarrierOp>(operation)) {
       line("tl.debug_barrier()");
       return;

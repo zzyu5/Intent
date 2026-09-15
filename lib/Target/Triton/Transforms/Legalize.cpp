@@ -7,6 +7,7 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Target/Triton/IR/TritonOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/TypeUtilities.h"
@@ -806,6 +807,74 @@ bool typeFitsTritonTensor(Type type, const TritonConfig &config) {
       return typeFitsTritonTensor(cast<TypeAttr>(field).getValue(), config);
     });
   return true;
+}
+
+bool isTritonFragmentExtent(Attribute attribute);
+
+LogicalResult materializeDeferredTensorBounds(func::FuncOp kernel) {
+  TritonConfig known;
+  kernel.walk([&](gpu::ParameterOp parameter) {
+    auto schema = parameter.getParameter();
+    if (schema.getCategory() !=
+            static_cast<uint32_t>(gpu::ParameterCategory::Coverage) &&
+        !parameter->hasAttr(gpu::coverageDimensionAttr))
+      known.kernelParameters[schema.getName().getValue().str()] =
+          schema.getCandidates().asArrayRef().front();
+  });
+  SmallVector<gpu::FragmentType> fragments;
+  std::function<void(Type)> collect = [&](Type type) {
+    if (auto fragment = dyn_cast<gpu::FragmentType>(type)) {
+      if (!llvm::is_contained(fragments, fragment))
+        fragments.push_back(fragment);
+    } else if (auto record = dyn_cast<gpu::RecordType>(type)) {
+      for (Attribute field : record.getFieldTypes())
+        collect(cast<TypeAttr>(field).getValue());
+    }
+  };
+  kernel.walk([&](Operation *operation) {
+    for (Type type : operation->getOperandTypes())
+      collect(type);
+    for (Type type : operation->getResultTypes())
+      collect(type);
+  });
+  SmallVector<gpu::PhysicalExprAttr> bounds;
+  for (gpu::FragmentType fragment : fragments) {
+    gpu::PhysicalExprAttr elements;
+    for (Attribute attribute : fragment.getShape()) {
+      auto extent = cast<gpu::PhysicalExprAttr>(attribute);
+      if (extent.getKind() ==
+              static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+          extent.getValue() == 1)
+        continue;
+      elements = !elements ? extent : gpu::PhysicalExprAttr::get(
+          kernel.getContext(),
+          static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
+          StringAttr::get(kernel.getContext(), ""),
+          ArrayAttr::get(kernel.getContext(), {elements, extent}));
+    }
+    if (!elements || evaluateCompileTimeExpression(elements, known))
+      continue;
+    if (!isTritonFragmentExtent(elements))
+      return kernel.emitError("Triton tensor bounds require constexpr fragment extents");
+    if (!llvm::is_contained(bounds, elements))
+      bounds.push_back(elements);
+  }
+  if (bounds.empty())
+    return success();
+  kernel.getContext()->getOrLoadDialect<cf::ControlFlowDialect>();
+  OpBuilder builder = OpBuilder::atBlockBegin(&kernel.front());
+  Value maximum = builder.create<arith::ConstantIndexOp>(
+      kernel.getLoc(), maxTritonTensorElements);
+  for (gpu::PhysicalExprAttr elements : bounds) {
+    Value count = builder.create<gpu::PhysicalExprOp>(
+        kernel.getLoc(), builder.getIndexType(), elements);
+    Value valid = builder.create<gpu::CompareOp>(
+        kernel.getLoc(), builder.getI1Type(), count, maximum, ComparePredicate::Le);
+    builder.create<cf::AssertOp>(
+        kernel.getLoc(), valid,
+        "Triton block tensor exceeds the maximum element count");
+  }
+  return success();
 }
 
 bool fitsReductionRegisterBudget(gpu::ReduceOp reduce,
@@ -2130,7 +2199,8 @@ bool isTritonFragmentExtent(Attribute attribute) {
     return false;
   auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
   return kind != gpu::PhysicalExprKind::ScalarABI &&
-         isTritonExpression(expression);
+         isTritonExpression(expression) &&
+         llvm::all_of(expression.getOperands(), isTritonFragmentExtent);
 }
 
 bool isTritonExpression(gpu::PhysicalExprAttr expression) {
@@ -2709,6 +2779,18 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     return failure();
 
   WalkResult result = kernel.walk([&](Operation *operation) {
+    if (auto assertion = dyn_cast<cf::AssertOp>(operation)) {
+      auto compare = assertion.getArg().getDefiningOp<gpu::CompareOp>();
+      if (!compare || !llvm::all_of(compare->getOperands(), [&](Value operand) {
+            if (auto expression = operand.getDefiningOp<gpu::PhysicalExprOp>())
+              return isTritonFragmentExtent(expression.getExpression());
+            return operand.getDefiningOp<arith::ConstantOp>() != nullptr;
+          })) {
+        assertion.emitOpError("Triton assertions require a constexpr condition");
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    }
     if (auto unary = dyn_cast<gpu::UnaryOp>(operation);
         unary && unary.getApproximate() &&
         unary.getOperatorKind() == UnaryOperator::Tanh) {
@@ -3291,6 +3373,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
     assumption.erase();
   if (failed(gpu::eliminateCommonValues(module)) ||
       failed(legalizeCollectiveCallbacks(kernel)) ||
+      failed(materializeDeferredTensorBounds(kernel)) ||
       failed(verifyTritonProgram(module)))
     return failure();
   kernel->setAttr(legalizedAttr, UnitAttr::get(module.getContext()));

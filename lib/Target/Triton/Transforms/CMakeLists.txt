@@ -5,6 +5,7 @@ add_mlir_library(MLIRIntentTritonTransforms
 
   LINK_LIBS PUBLIC
   MLIRArithDialect
+  MLIRControlFlowDialect
   MLIRFuncDialect
   MLIRIR
   MLIRSCFDialect
