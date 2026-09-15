@@ -1079,9 +1079,14 @@ LogicalResult neutralizeFullCoverageOperand(ContractOp contract,
     if (!fullCoverage && extent.getKind() !=
                              static_cast<uint32_t>(PhysicalExprKind::Constant))
       continue;
-    PhysicalRangeFact fact = PhysicalProgramAnalysis(kernel).axisRanges(
-        source, static_cast<unsigned>(axis));
-    FailureOr<MakeRangeOp> range = queryExactLogicalRange(fact);
+    PhysicalProgramAnalysis analysis(kernel);
+    PhysicalRangeFact fact = analysis.axisRanges(source, static_cast<unsigned>(axis));
+    auto traversal = analysis.lockstepRanges(fact.roots);
+    FailureOr<MakeRangeOp> range =
+        fact.state != PhysicalFactState::Unknown && fact.blockers.empty() &&
+                traversal.isExact()
+            ? FailureOr<MakeRangeOp>(traversal.authority)
+            : FailureOr<MakeRangeOp>(failure());
     if (!fullCoverage && (failed(range) || !isUnitStepRange(*range)))
       continue;
     if (failed(range) || !isUnitStepRange(*range))
@@ -2651,14 +2656,14 @@ FailureOr<bool> realizeFullResultTraversal(
         return isFullCoverageExtent(contract, cast<PhysicalExprAttr>(extent));
       }))
     return false;
-  SmallVector<std::pair<Value, unsigned>> freeAxes(resultType.getShape().size());
+  SmallVector<std::pair<OpOperand *, unsigned>> freeAxes(resultType.getShape().size());
   unsigned freeAxisCount = 0;
   for (auto [operand, reductions] :
-       {std::pair<Value, ArrayRef<int64_t>>{contract.getLhs(),
+       {std::pair<OpOperand *, ArrayRef<int64_t>>{&contract.getLhsMutable(),
                                           contract.getLhsReductionAxes()},
-        std::pair<Value, ArrayRef<int64_t>>{contract.getRhs(),
+        std::pair<OpOperand *, ArrayRef<int64_t>>{&contract.getRhsMutable(),
                                           contract.getRhsReductionAxes()}}) {
-    auto type = cast<FragmentType>(operand.getType());
+    auto type = cast<FragmentType>(operand->get().getType());
     for (unsigned axis = 0; axis < type.getShape().size(); ++axis) {
       if (llvm::is_contained(reductions, static_cast<int64_t>(axis)))
         continue;
@@ -2693,18 +2698,22 @@ FailureOr<bool> realizeFullResultTraversal(
     if (!isFullCoverageExtent(contract, fullExtent))
       continue;
     PhysicalProgramAnalysis analysis(kernel);
-    PhysicalRangeFact fact = analysis.axisRanges(selected.first, selected.second);
-    FailureOr<MakeRangeOp> authority = queryExactLogicalRange(fact);
+    PhysicalRangeFact fact = analysis.axisRanges(selected.first->get(), selected.second);
+    auto traversal = analysis.lockstepRanges(fact.roots);
+    FailureOr<MakeRangeOp> authority =
+        fact.state != PhysicalFactState::Unknown && fact.blockers.empty() &&
+                traversal.isExact()
+            ? FailureOr<MakeRangeOp>(traversal.authority)
+            : FailureOr<MakeRangeOp>(failure());
     FailureOr<ParameterOp> fullParameter = parameterForExtent(kernel, fullExtent);
     FailureOr<AxisMapAttr> axisMap =
-        queryAxisMap(selected.first.getType(), selected.second);
+        queryAxisMap(selected.first->get().getType(), selected.second);
     if (failed(authority) || failed(fullParameter) || failed(axisMap) ||
         !fact.unitStep ||
         !samePhysicalScalarExpression((*authority).getStart(),
                                       (*authority).getLogicalStart()))
       continue;
-    SmallVector<MakeRangeOp> roots(fact.roots.begin(), fact.roots.end());
-    bool lhsAxis = selected.first == contract.getLhs();
+    bool lhsAxis = selected.first == &contract.getLhsMutable();
     std::string name =
         ((lhsAxis ? "BLOCK_M_CACHE_" : "BLOCK_N_CACHE_") +
          Twine(axisMap->getSourceId()) + "_" + Twine(axisMap->getSourceAxis()) +
@@ -2731,15 +2740,17 @@ FailureOr<bool> realizeFullResultTraversal(
         kernel.getContext(), resultType.getElementType(),
         ArrayAttr::get(kernel.getContext(), tileShape), resultType.getAxisMaps(),
         resultType.getValidity(), resultType.getOwner());
-    auto rangeType = cast<FragmentType>((*authority).getResult().getType());
     auto fullRangeType = FragmentType::get(
-        kernel.getContext(), rangeType.getElementType(),
-        ArrayAttr::get(kernel.getContext(), {fullExtent}), rangeType.getAxisMaps(),
-        rangeType.getValidity(), rangeType.getOwner());
+        kernel.getContext(), IndexType::get(kernel.getContext()),
+        ArrayAttr::get(kernel.getContext(), {fullExtent}),
+        ArrayAttr::get(kernel.getContext(), {AxisMapAttr::get(
+            kernel.getContext(), axisMap->getSourceId(), axisMap->getSourceAxis(),
+            axisMap->getDimensionId(), 0, axisMap->getDerived())}),
+        resultType.getValidity(), resultType.getOwner());
     auto tileRangeType = FragmentType::get(
-        kernel.getContext(), rangeType.getElementType(),
-        ArrayAttr::get(kernel.getContext(), {tileExtent}), rangeType.getAxisMaps(),
-        rangeType.getValidity(), rangeType.getOwner());
+        kernel.getContext(), fullRangeType.getElementType(),
+        ArrayAttr::get(kernel.getContext(), {tileExtent}), fullRangeType.getAxisMaps(),
+        fullRangeType.getValidity(), fullRangeType.getOwner());
     auto indexType = FragmentType::get(
         kernel.getContext(), IndexType::get(kernel.getContext()),
         resultType.getShape(), resultType.getAxisMaps(), resultType.getValidity(),
@@ -2778,56 +2789,66 @@ FailureOr<bool> realizeFullResultTraversal(
         buildRangeTailPredicate(nested, location, tileRange, *authority);
     if (failed(tail))
       return failure();
+    Value origin = nested.create<BroadcastOp>(
+        location, tileRangeType, (*authority).getLogicalStart());
+    Value ordinal = binary(nested, location, tileRangeType, tileRange, origin,
+                           BinaryOperator::Subtract);
     SmallVector<Value> operands;
-    for (Value value :
-         {Value(contract.getLhs()), Value(contract.getRhs()),
-          Value(contract.getAccumulator())}) {
-      SmallVector<MakeRangeOp> operandRoots(roots);
-      Value operandRange = tileRange;
-      if (value == contract.getAccumulator()) {
-        PhysicalRangeFact accumulatorRanges =
-            PhysicalProgramAnalysis(kernel).axisRanges(value, resultAxis);
-        if (!accumulatorRanges.roots.empty()) {
-          auto accumulatorRange = queryExactLogicalRange(accumulatorRanges);
-          SmallVector<MakeRangeOp> lockstep(accumulatorRanges.roots.begin(),
-                                           accumulatorRanges.roots.end());
-          lockstep.append(roots);
-          if (failed(accumulatorRange) ||
-              !PhysicalProgramAnalysis(kernel).lockstepRanges(lockstep).isExact())
-            return contract.emitOpError(
-                "accumulator free axis has no exact lockstep coordinate relation");
-          operandRoots.assign(accumulatorRanges.roots.begin(),
-                              accumulatorRanges.roots.end());
-          auto original = cast<FragmentType>((*accumulatorRange).getResult().getType());
-          auto type = FragmentType::get(
-              kernel.getContext(), original.getElementType(),
-              nested.getArrayAttr({tileExtent}), original.getAxisMaps(),
-              original.getValidity(), original.getOwner());
-          operandRange = nested.create<MakeRangeOp>(
-              location, type, loop.getInductionVar(), block.getResult(),
-              (*accumulatorRange).getStep(),
-              (*accumulatorRange).getLogicalStart(),
-              (*accumulatorRange).getLogicalStop(),
-              (*accumulatorRange).getSourceId(),
-              (*accumulatorRange).getSourceAxis(),
-              (*accumulatorRange).getDerived());
-          inheritRangeAuthority(operandRange, *accumulatorRange);
-        }
+    for (OpOperand *operand :
+         {&contract.getLhsMutable(), &contract.getRhsMutable(),
+          &contract.getAccumulatorMutable()}) {
+      Value value = operand->get();
+      bool accumulator = operand == &contract.getAccumulatorMutable();
+      if (operand != selected.first && !accumulator) {
+        operands.push_back(value);
+        continue;
       }
-      IRMapping mapping;
-      for (MakeRangeOp root : operandRoots)
-        mapping.map(root.getResult(), operandRange);
-      FailureOr<Value> sliced = replaySourceValue(
-          nested, location, value, tileExtent, operandRoots, operandRange, mapping,
-          loop.getOperation());
-      if (failed(sliced))
-        return contract.emitOpError(
-            "full-result traversal could not form its operand slice");
-      if (!queryFragmentAxes(value.getType(), sourceAxisIdentity(*axisMap))
-               .empty() &&
-          failed(appendTailValidity(location, value, *tail, mapping)))
+      unsigned axis = accumulator ? resultAxis : selected.second;
+      auto source = cast<FragmentType>(value.getType());
+      SmallVector<Attribute> shape(source.getShape().begin(), source.getShape().end());
+      shape[axis] = tileExtent;
+      auto slicedType = FragmentType::get(
+          kernel.getContext(), source.getElementType(), nested.getArrayAttr(shape),
+          source.getAxisMaps(), source.getValidity(), source.getOwner());
+      FailureOr<Value> fill = materializeZeroFragment(nested, location, slicedType);
+      if (failed(fill))
         return failure();
-      operands.push_back(*sliced);
+      if (accumulator && isLiteralZeroProjection(value)) {
+        operands.push_back(*fill);
+        continue;
+      }
+      auto sourceMap = cast<AxisMapAttr>(source.getAxisMaps()[axis]);
+      auto coordinateType = FragmentType::get(
+          kernel.getContext(), nested.getIndexType(), nested.getArrayAttr({tileExtent}),
+          nested.getArrayAttr({AxisMapAttr::get(
+              kernel.getContext(), sourceMap.getSourceId(), sourceMap.getSourceAxis(),
+              sourceMap.getDimensionId(), 0, sourceMap.getDerived())}),
+          source.getValidity(), source.getOwner());
+      Value coordinate = nested.create<ReshapeOp>(
+          location, coordinateType, ordinal, nested.getArrayAttr({ReshapeGroupAttr::get(
+              kernel.getContext(), nested.getDenseI64ArrayAttr({0}),
+              nested.getDenseI64ArrayAttr({0}))}));
+      auto valid = projectPredicateToFragmentAxis(nested, location, *tail, slicedType, axis);
+      if (failed(valid))
+        return failure();
+      auto coordinatePredicate = FragmentType::get(
+          kernel.getContext(), nested.getI1Type(), coordinateType.getShape(),
+          coordinateType.getAxisMaps(), coordinateType.getValidity(), coordinateType.getOwner());
+      Value zero = nested.create<arith::ConstantIndexOp>(location, 0);
+      Value lower = nested.create<BroadcastOp>(location, coordinateType, zero);
+      Value upper = nested.create<BroadcastOp>(location, coordinateType, (*fullParameter).getResult());
+      Value bounded = binary(nested, location, coordinatePredicate,
+          compare(nested, location, coordinatePredicate, coordinate, lower, ComparePredicate::Ge),
+          compare(nested, location, coordinatePredicate, coordinate, upper, ComparePredicate::Lt),
+          BinaryOperator::LogicalAnd);
+      auto projectedBounds = projectPredicateToFragmentAxis(nested, location, bounded, slicedType, axis);
+      if (failed(projectedBounds))
+        return failure();
+      Value activeSlice = binary(nested, location, (*valid).getType(), *valid,
+                                 *projectedBounds, BinaryOperator::LogicalAnd);
+      operands.push_back(nested.create<GatherOp>(
+          location, slicedType, value, ValueRange{coordinate}, activeSlice, *fill,
+          ArrayRef<int64_t>{static_cast<int64_t>(axis)}));
     }
     FailureOr<Value> accumulator = projectPhysicalValueToSchema(
         nested, location, operands[2], tileResultType);

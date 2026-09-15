@@ -1643,17 +1643,24 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
       continue;
     OpBuilder builder(gather);
     Value coordinate = gather.getCoordinates().front();
-    if (!isa<gpu::FragmentType>(coordinate.getType())) {
+    if (!samePhysicalShape(gather.getValid().getType(), coordinate.getType())) {
       auto predicateType = dyn_cast<gpu::FragmentType>(gather.getValid().getType());
-      if (!predicateType ||
-          !isa<IntegerType, IndexType>(coordinate.getType()))
+      Type indexElement = elementType(coordinate.getType());
+      if (!predicateType || !isa<IntegerType, IndexType>(indexElement))
+        continue;
+      if (isa<gpu::FragmentType>(coordinate.getType()) &&
+          (!source || !result || gather.getSourceAxes().size() != 1 ||
+           source.getShape().size() != result.getShape().size()))
         continue;
       auto coordinateType = gpu::FragmentType::get(
-          gather.getContext(), coordinate.getType(), predicateType.getShape(),
+          gather.getContext(), indexElement, predicateType.getShape(),
           predicateType.getAxisMaps(), predicateType.getValidity(),
           predicateType.getOwner());
-      coordinate = builder.create<gpu::BroadcastOp>(gather.getLoc(),
-                                                     coordinateType, coordinate);
+      auto projected = gpu::projectPhysicalValueToSchema(
+          builder, gather.getLoc(), coordinate, coordinateType);
+      if (failed(projected))
+        continue;
+      coordinate = *projected;
     }
     if (!samePhysicalShape(gather.getValid().getType(), coordinate.getType()) ||
         !samePhysicalShape(gather.getValid().getType(),

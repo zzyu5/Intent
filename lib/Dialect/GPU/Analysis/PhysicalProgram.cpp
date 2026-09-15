@@ -983,6 +983,35 @@ bool coordinateRangeWithinResource(Value coordinate, Value resource,
     bool upper = false;
     std::function<void(Value)> inspectPredicate = [&](Value predicate) {
       predicate = stripBroadcast(predicate);
+      if (auto reshape = predicate.getDefiningOp<ReshapeOp>()) {
+        auto source = cast<FragmentType>(reshape.getValue().getType());
+        auto target = cast<FragmentType>(predicate.getType());
+        auto unit = [](Attribute attribute) {
+          auto extent = cast<PhysicalExprAttr>(attribute);
+          return extent.getKind() ==
+                     static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                 extent.getValue() == 1;
+        };
+        bool projection = llvm::all_of(
+            reshape.getReassociation(), [&](Attribute attribute) {
+              auto group = cast<ReshapeGroupAttr>(attribute);
+              auto inputs = group.getSourceAxes().asArrayRef();
+              auto outputs = group.getResultAxes().asArrayRef();
+              if (inputs.empty())
+                return llvm::all_of(outputs, [&](int64_t axis) {
+                  return unit(target.getShape()[axis]);
+                });
+              if (outputs.empty())
+                return llvm::all_of(inputs, [&](int64_t axis) {
+                  return unit(source.getShape()[axis]);
+                });
+              return inputs.size() == 1 && outputs.size() == 1 &&
+                     source.getShape()[inputs[0]] == target.getShape()[outputs[0]];
+            });
+        if (projection)
+          inspectPredicate(reshape.getValue());
+        return;
+      }
       if (integerConstant(predicate) == 0) {
         lower = upper = true;
         return;
@@ -3585,25 +3614,30 @@ PhysicalProgramAnalysis::lockstepRanges(ArrayRef<MakeRangeOp> ranges) {
   PhysicalLockstepTraversalFact result;
   if (ranges.empty())
     return result;
-  auto sameLogicalTraversal = [](MakeRangeOp lhs, MakeRangeOp rhs) {
-    return samePhysicalScalarExpression(lhs.getLogicalStart(),
-                                        rhs.getLogicalStart()) &&
-           samePhysicalScalarExpression(lhs.getLogicalStop(),
-                                        rhs.getLogicalStop()) &&
-           samePhysicalScalarExpression(lhs.getStep(), rhs.getStep());
+  auto sameValue = [](Value lhs, Value rhs) {
+    if (samePhysicalScalarExpression(lhs, rhs))
+      return true;
+    PhysicalExprAttr left = queryLaunchExpression(lhs);
+    PhysicalExprAttr right = queryLaunchExpression(rhs);
+    return left && right && left == right;
   };
-  auto sameTraversal = [](MakeRangeOp lhs, MakeRangeOp rhs) {
+  auto sameLogicalTraversal = [&](MakeRangeOp lhs, MakeRangeOp rhs) {
+    return sameValue(lhs.getLogicalStart(), rhs.getLogicalStart()) &&
+           sameValue(lhs.getLogicalStop(), rhs.getLogicalStop()) &&
+           sameValue(lhs.getStep(), rhs.getStep());
+  };
+  auto sameTraversal = [&](MakeRangeOp lhs, MakeRangeOp rhs) {
     auto isZero = [](Value value) {
       PhysicalExprAttr bound = queryNonNegativeIndexUpperBound(value);
       return bound &&
              bound.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
              bound.getValue() == 0;
     };
-    bool sameStart = samePhysicalScalarExpression(lhs.getStart(), rhs.getStart()) ||
+    bool sameStart = sameValue(lhs.getStart(), rhs.getStart()) ||
                      (isZero(lhs.getStart()) && isZero(rhs.getStart()));
     return sameStart &&
-           samePhysicalScalarExpression(lhs.getExtent(), rhs.getExtent()) &&
-           samePhysicalScalarExpression(lhs.getStep(), rhs.getStep());
+           sameValue(lhs.getExtent(), rhs.getExtent()) &&
+           sameValue(lhs.getStep(), rhs.getStep());
   };
   result.authority = ranges.front();
   for (MakeRangeOp range : llvm::drop_begin(ranges))

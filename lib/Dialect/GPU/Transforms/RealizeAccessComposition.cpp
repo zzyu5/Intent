@@ -601,7 +601,13 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
 
   OpBuilder builder(gather);
   auto resultType = dyn_cast<FragmentType>(gather.getResult().getType());
-  SmallVector<Value> coordinates(sourceLoad.getCoordinates());
+  SmallVector<Value> originalCoordinates;
+  for (Value coordinate : sourceLoad.getCoordinates()) {
+    while (auto broadcast = coordinate.getDefiningOp<BroadcastOp>())
+      coordinate = broadcast.getValue();
+    originalCoordinates.push_back(coordinate);
+  }
+  SmallVector<Value> coordinates(originalCoordinates);
   IRMapping replay;
   PhysicalProgramAnalysis analysis(gather->getParentOfType<func::FuncOp>());
   for (auto [coordinate, sourceAxis] :
@@ -618,13 +624,13 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
       return failure();
     }
     PhysicalAxisProjection target = queryCoordinateIndex(
-        sourceLoad.getCoordinates(), sourceAxisIdentity(*mapping));
+        originalCoordinates, sourceAxisIdentity(*mapping));
     if (!target.isExact() || target.dimensionId != mapping->getDimensionId()) {
       gather.emitOpError(
           "loaded source coordinate cannot be composed with gather indexing");
       return failure();
     }
-    Value original = sourceLoad.getCoordinates()[target.fragmentAxis];
+    Value original = originalCoordinates[target.fragmentAxis];
     auto range = original.getDefiningOp<MakeRangeOp>();
     if (!range) {
       auto coordinateType = dyn_cast<FragmentType>(original.getType());
@@ -697,7 +703,7 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
   }
 
   if (resultType) {
-    for (auto [slot, original] : llvm::enumerate(sourceLoad.getCoordinates())) {
+    for (auto [slot, original] : llvm::enumerate(originalCoordinates)) {
       if (replay.lookupOrNull(original) || !isa<FragmentType>(original.getType()))
         continue;
       auto coordinateType = cast<FragmentType>(original.getType());
