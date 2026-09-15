@@ -4659,7 +4659,28 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           contractionOwnedRanges.insert(range.getOperation());
         continue;
       }
-      bool positionalRemap = llvm::any_of(payload.roots, [&](MakeRangeOp range) {
+      auto sameBound = [](Value lhs, Value rhs) {
+        if (samePhysicalScalarExpression(lhs, rhs))
+          return true;
+        PhysicalExprAttr left = queryLaunchExpression(lhs);
+        PhysicalExprAttr right = queryLaunchExpression(rhs);
+        return left && right && left == right;
+      };
+      bool equivalentSources = cartesian && !repeatedDimension && address.isExact() &&
+          llvm::any_of(payload.roots, [&](MakeRangeOp range) {
+            return llvm::none_of(address.roots, [&](MakeRangeOp coordinate) {
+              return sourceAxisIdentity(range) == sourceAxisIdentity(coordinate);
+            });
+          }) && llvm::all_of(payload.roots, [&](MakeRangeOp range) {
+            auto sourceDimension = queryRangeDimension(range);
+            return succeeded(sourceDimension) && *sourceDimension == dimension &&
+                   llvm::all_of(address.roots, [&](MakeRangeOp coordinate) {
+                     return sameBound(range.getLogicalStart(), coordinate.getLogicalStart()) &&
+                            sameBound(range.getLogicalStop(), coordinate.getLogicalStop()) &&
+                            sameBound(range.getStep(), coordinate.getStep());
+                   });
+          });
+      bool positionalRemap = equivalentSources || llvm::any_of(payload.roots, [&](MakeRangeOp range) {
         FailureOr<int64_t> sourceDimension = queryRangeDimension(range);
         return succeeded(sourceDimension) && *sourceDimension != dimension;
       });
@@ -4692,13 +4713,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       }
       MakeRangeOp root = ranges.front();
       FailureOr<int64_t> addressExtent = exactStaticTraversalExtent(address);
-      auto sameBound = [](Value lhs, Value rhs) {
-        if (samePhysicalScalarExpression(lhs, rhs))
-          return true;
-        PhysicalExprAttr left = queryLaunchExpression(lhs);
-        PhysicalExprAttr right = queryLaunchExpression(rhs);
-        return left && right && left == right;
-      };
       if (!llvm::all_of(ranges, [&](MakeRangeOp range) {
             if (positionalRemap) {
               // The store pairs these tensor axes by ordinal, even when the
