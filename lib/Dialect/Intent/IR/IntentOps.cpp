@@ -1570,9 +1570,17 @@ bool hasPreviousIterationViewDefinition(Operation *read, ViewStoreOp store,
         Value begin, end;
         if (auto prefix = readRange ? readRange.getDefiningOp<SubregionOp>()
                                     : SubregionOp()) {
-          if (!prefix.getInputs().empty() &&
-              prefix.getInputs().front() == domain.getResult() &&
-              prefix.getHasStop()) {
+          auto source = prefix.getInputs().empty()
+                            ? DomainOp()
+                            : prefix.getInputs().front().getDefiningOp<DomainOp>();
+          bool sameDomain = source && source.getBounds().size() >= 2 &&
+              (source.getBounds().size() == 2 ||
+               getConstantInteger(source.getBounds()[2]) == 1) &&
+              sameInvariantExtent(source.getBounds()[0], domain.getBounds()[0],
+                                  loop, dominance) &&
+              sameInvariantExtent(source.getBounds()[1], domain.getBounds()[1],
+                                  loop, dominance);
+          if (sameDomain && prefix.getHasStop()) {
             begin = prefix.getHasStart() ? prefix.getInputs()[1]
                                          : domain.getBounds().front();
             end = prefix.getInputs().back();
