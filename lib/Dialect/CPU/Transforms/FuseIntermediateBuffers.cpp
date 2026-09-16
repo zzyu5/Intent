@@ -141,6 +141,7 @@ bool stableRead(memref::LoadOp load, Operation *producer, func::FuncOp function,
   Operation *preparation = owner->findAncestorOpInBlock(*producer);
   if (!preparation) return false;
   memref::DeallocOp end;
+  SmallVector<Operation *> overwrites;
   SmallVector<Value> aliases{base};
   for (unsigned i = 0; i < aliases.size(); ++i)
     for (Operation *user : aliases[i].getUsers()) {
@@ -154,7 +155,15 @@ bool stableRead(memref::LoadOp load, Operation *producer, func::FuncOp function,
       }
       if (!isa<memref::StoreOp, vector::StoreOp>(user)) return false;
       Operation *write = owner->findAncestorOpInBlock(*user);
-      if (!write || write == preparation || !write->isBeforeInBlock(preparation)) return false;
+      if (!write || write == preparation) return false;
+      // A later overwrite cannot change a replayed read that has already
+      // completed. Same-loop writes stay excluded by the owner-block order.
+      if (write->isBeforeInBlock(preparation)) continue;
+      if (!llvm::all_of(consumers, [&](Operation *consumer) {
+            Operation *use = owner->findAncestorOpInBlock(*consumer);
+            return use && use->isBeforeInBlock(write);
+          })) return false;
+      overwrites.push_back(write);
     }
   // Replaying a read also extends its use of the backing storage. A snapshot
   // may outlive its source, in which case it must keep its own materialization.
@@ -163,7 +172,7 @@ bool stableRead(memref::LoadOp load, Operation *producer, func::FuncOp function,
     Operation *use = owner->findAncestorOpInBlock(*consumer);
     if (!use || !use->isBeforeInBlock(end)) return false;
   }
-  return true;
+  return llvm::all_of(overwrites, [&](Operation *write) { return write->isBeforeInBlock(end); });
 }
 
 Value replay(Value value, Operation *root, OpBuilder &builder, IRMapping &mapping) {

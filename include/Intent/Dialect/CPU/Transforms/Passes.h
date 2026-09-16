@@ -25,6 +25,7 @@ struct Configuration {
 };
 
 mlir::LogicalResult fuseStructuredComputations(mlir::func::FuncOp function);
+mlir::LogicalResult reusePrivateStorage(mlir::func::FuncOp function);
 mlir::LogicalResult foldUniformComputations(mlir::func::FuncOp function);
 mlir::LogicalResult reusePreparedInputs(mlir::func::FuncOp function);
 mlir::LogicalResult groupRegionComputations(mlir::func::FuncOp function,

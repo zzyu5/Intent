@@ -238,6 +238,98 @@ bool fuseOne(Operation *consumer, unsigned inputNumber,
   return true;
 }
 
+bool reusePrivateInput(linalg::GenericOp consumer, Value buffer,
+                       PhysicalProgramAnalysis &analysis) {
+  auto source = buffer.getDefiningOp<memref::AllocOp>();
+  if (!source || consumer.getNumResults() || consumer.getOutputs().size() != 1 ||
+      consumer.getNumReductionLoops() || source->getBlock() != consumer->getBlock()) return false;
+  auto output = consumer.getOutputs()[0].getDefiningOp<memref::AllocOp>();
+  if (!output || output == source || output->getBlock() != source->getBlock() ||
+      !source->isBeforeInBlock(output) || !output->isBeforeInBlock(consumer) ||
+      source.getType() != output.getType() || !source.getType().getLayout().isIdentity() ||
+      !llvm::equal(source.getDynamicSizes(), output.getDynamicSizes()) ||
+      source.getAlignment().value_or(0) < output.getAlignment().value_or(0)) return false;
+  Block &body = consumer.getRegion().front();
+  auto pure = [](Block &block) {
+    return llvm::all_of(block.without_terminator(), [](Operation &operation) {
+      return !operation.getNumRegions() && isMemoryEffectFree(&operation);
+    });
+  };
+  if (!body.getArguments().back().use_empty() || !pure(body)) return false;
+  auto maps = consumer.getIndexingMapsArray();
+  if (!maps.back().isIdentity()) return false;
+  AliasAnalysis aliases(consumer->getParentOfType<func::FuncOp>());
+  bool readsSource = false;
+  for (auto [number, input] : llvm::enumerate(consumer.getInputs())) {
+    if (!isa<MemRefType>(input.getType())) continue;
+    Value root = analysis.storageRoot(input);
+    if (root == output.getResult()) return false;
+    if (root == buffer) {
+      if (input != buffer || maps[number] != maps.back()) return false;
+      readsSource |= !body.getArgument(number).use_empty();
+    } else if (!aliases.alias(root, buffer).isNo()) return false;
+  }
+  if (!readsSource) return false;
+
+  auto lifetime = [&](memref::AllocOp allocation, bool oldValues) -> memref::DeallocOp {
+    Block *owner = allocation->getBlock();
+    SmallVector<Value> views{allocation.getResult()};
+    SmallVector<Operation *> users, accesses;
+    memref::DeallocOp end;
+    for (unsigned i = 0; i < views.size(); ++i)
+      for (Operation *user : views[i].getUsers()) {
+        users.push_back(user);
+        if (auto view = dyn_cast<memref::SubViewOp>(user)) {
+          views.push_back(view.getResult());
+          continue;
+        }
+        if (auto cast = dyn_cast<memref::CastOp>(user)) {
+          views.push_back(cast.getResult());
+          continue;
+        }
+        if (isa<memref::DimOp>(user)) continue;
+        if (auto release = dyn_cast<memref::DeallocOp>(user)) {
+          if (end || release.getMemref() != allocation.getResult() || release->getBlock() != owner) return {};
+          end = release;
+          continue;
+        }
+        if (auto computation = dyn_cast<linalg::LinalgOp>(user)) {
+          if (computation->getNumResults() || computation->getNumRegions() != 1 ||
+              !pure(computation->getRegion(0).front())) return {};
+        } else if (auto reduction = dyn_cast<ReduceOp>(user)) {
+          if (!pure(reduction.getCombine().front())) return {};
+        } else if (!isa<memref::LoadOp, memref::StoreOp, memref::CopyOp>(user)) return {};
+        accesses.push_back(user);
+      }
+    if (!end) return {};
+    for (Operation *user : users) {
+      if (user == end) continue;
+      Operation *stage = owner->findAncestorOpInBlock(*user);
+      if (!stage || !stage->isBeforeInBlock(end)) return {};
+    }
+    for (Operation *access : accesses) {
+      if (access == consumer) continue;
+      Operation *stage = owner->findAncestorOpInBlock(*access);
+      if (oldValues ? !stage->isBeforeInBlock(consumer) : !consumer->isBeforeInBlock(stage)) return {};
+    }
+    return end;
+  };
+  auto sourceEnd = lifetime(source, true), outputEnd = lifetime(output, false);
+  if (!sourceEnd || !outputEnd) return false;
+  auto yielded = dyn_cast<BlockArgument>(body.getTerminator()->getOperand(0));
+  bool identity = body.without_terminator().empty() && yielded && yielded.getOwner() == &body &&
+      yielded.getArgNumber() < consumer.getInputs().size() &&
+      consumer.getInputs()[yielded.getArgNumber()] == buffer;
+  // The pointwise phase reads each old element before overwriting that element.
+  // All other old-value observations have finished; later phases use the result.
+  if (sourceEnd->isBeforeInBlock(outputEnd)) sourceEnd->moveAfter(outputEnd);
+  outputEnd.erase();
+  output.getResult().replaceAllUsesWith(buffer);
+  output.erase();
+  if (identity) consumer.erase();
+  return true;
+}
+
 bool reuseOutput(linalg::GenericOp consumer, Value buffer,
                  PhysicalProgramAnalysis &analysis) {
   auto allocation = buffer.getDefiningOp<memref::AllocOp>();
@@ -442,6 +534,22 @@ LogicalResult fuseStructuredComputations(func::FuncOp function) {
   }
   forwardPointwiseCopies(function);
   eraseDeadBuffers(function);
+  return success();
+}
+
+LogicalResult reusePrivateStorage(func::FuncOp function) {
+  // Preserve separate values until region predicates and pointwise bodies have
+  // folded, so a constant replacement can discard its old computation first.
+  eraseDeadBuffers(function);
+  SmallVector<linalg::GenericOp> consumers;
+  function.walk([&](linalg::GenericOp operation) { consumers.push_back(operation); });
+  for (auto consumer : llvm::reverse(consumers)) {
+    SmallVector<Value> inputs(consumer.getInputs());
+    for (Value input : inputs) {
+      PhysicalProgramAnalysis analysis(function);
+      if (reusePrivateInput(consumer, input, analysis)) break;
+    }
+  }
   return success();
 }
 
