@@ -5226,6 +5226,54 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   });
   if (occurrences.wasInterrupted())
     return failure();
+
+  // A write's range can own a resource slice only if every access to that
+  // resource uses the same traversal on that axis. In particular, an initial
+  // copy cannot be distributed while a later recurrence reads whole prefixes.
+  llvm::SmallPtrSet<Operation *, 8> dependentResourceRanges;
+  PhysicalProgramAnalysis accessAnalysis(kernel);
+  auto projectedRange = [](Value value) {
+    while (Operation *operation = value.getDefiningOp()) {
+      if (!isa<BroadcastOp, ReshapeOp>(operation))
+        break;
+      value = operation->getOperand(0);
+    }
+    return value.getDefiningOp<MakeRangeOp>();
+  };
+  kernel.walk([&](StoreOp store) {
+    for (auto [coordinate, axis] : llvm::zip(store.getCoordinates(), store.getSourceAxes())) {
+      llvm::SmallPtrSet<Operation *, 8> roots;
+      collectCoordinateRanges(coordinate, roots);
+      if (roots.empty())
+        continue;
+      auto range = projectedRange(coordinate);
+      for (Operation *user : store.getResource().getUsers()) {
+        if (user == store.getOperation() || isa<DimOp, AssumeInBoundsOp>(user))
+          continue;
+        auto access = accessAnalysis.footprint(user);
+        auto position = llvm::find(access.sourceAxes, axis);
+        auto other = position == access.sourceAxes.end() ? MakeRangeOp() :
+            projectedRange(access.coordinates[position - access.sourceAxes.begin()]);
+        auto occurrence = range ? occurrenceRoots.lookup(range.getOperation()) : MakeRangeOp();
+        bool sameOwnership = range && other &&
+            (sameLogicalRange(range, other) ||
+             (occurrence && occurrence == occurrenceRoots.lookup(other.getOperation())));
+        if (access.state != PhysicalFactState::Exact || !sameOwnership ||
+            !accessAnalysis.lockstepRanges({range, other}).isExact()) {
+          dependentResourceRanges.insert(roots.begin(), roots.end());
+          break;
+        }
+      }
+    }
+  });
+  for (MakeRangeOp range : allRanges)
+    if (llvm::any_of(dependentResourceRanges, [&](Operation *operation) {
+          auto dependent = cast<MakeRangeOp>(operation);
+          auto occurrence = occurrenceRoots.lookup(range.getOperation());
+          return sameLogicalRange(range, dependent) ||
+              (occurrence && occurrence == occurrenceRoots.lookup(operation));
+        }))
+      internalTraversalRanges.insert(range.getOperation());
   // Ordered writes to a parent and its subregion use one absolute tile anchor.
   // Shift the subregion's positional payload by the same ordinal displacement.
   llvm::DenseMap<Operation *, int64_t> parentAnchorOffsets;
@@ -5475,6 +5523,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         // Their different source identities still share the selected tile's
         // ownership, including its start, not just its fragment extent.
         if (!sameLogicalRange(seed, range) && !sameOccurrence)
+          continue;
+        if (dependentResourceRanges.contains(range.getOperation()))
           continue;
         internalTraversalRanges.erase(range.getOperation());
         if (!llvm::is_contained(dynamicRanges, range))
