@@ -2649,10 +2649,15 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
       reduce.getContext(), PhysicalExprKind::Parameter, 0,
       chunk.getParameter().getName().getValue());
 
+  Type accumulatorElement = reduce.getResult(0).getType();
+  if (auto fragment = dyn_cast<FragmentType>(accumulatorElement))
+    accumulatorElement = fragment.getElementType();
+  auto scalarIdentity = scalarSource(reduce.getInputs()[reduce.getSourceCount()]);
   const bool vectorAccumulation =
       isSingleComponentAddReduce(reduce) &&
-      isa<IntegerType>(firstSource.getElementType()) &&
-      succeeded(scalarSource(reduce.getInputs()[reduce.getSourceCount()]));
+      isa<IntegerType, FloatType>(firstSource.getElementType()) &&
+      firstSource.getElementType() == accumulatorElement &&
+      succeeded(scalarIdentity) && (*scalarIdentity).getType() == accumulatorElement;
   SmallVector<FragmentType> blockedSourceTypes;
   for (const SourcePlan &plan : sourcePlans) {
     auto originalSource = cast<FragmentType>(plan.source.getType());
