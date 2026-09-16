@@ -236,11 +236,7 @@ def _arg_reduce_max(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
     )
     if len(axes) != 1:
         lowerer.error(node, "I.arg_reduce.max requires exactly one axis")
-    acc_dtype = (
-        require_dtype(lowerer, bound["acc_dtype"])
-        if "acc_dtype" in bound
-        else source.type.dtype
-    )
+    acc_dtype = optional_dtype(lowerer, bound.get("acc_dtype")) or source.type.dtype
     if source.type.dtype != acc_dtype:
         source = lowerer.emit(
             OperationKind.CAST,
