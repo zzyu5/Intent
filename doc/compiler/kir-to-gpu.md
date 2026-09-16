@@ -73,7 +73,7 @@ KIR中的每次logical buffer allocation都有lexical allocation instance。Cons
 - **invocation workspace**：同一次kernel invocation中的多个program instances按显式ownership slices访问一份compiler-private resource；它作为hidden ABI argument由runtime分配，但不能引入额外launch；
 - **external view**：由public ABI传入，allocation、initial contents与跨kernel lifetime由host程序拥有。
 
-若KIR提供完整initial value，该initialization在每个logical allocation instance上恰好执行一次。若KIR创建未初始化buffer，construction不得合成默认初始化；每个被读取element必须由该read的dominant first write定义。若一个mutable buffer在program instances间形成非atomic dependence，保守construction必须把这些computations收回同一program instance；不能依赖kernel内不存在的global barrier。Invocation workspace只有在每个slice有唯一owner，或KIR已有scatter-reduction/atomic semantics时才能并行共享。
+若KIR提供完整initial value，该initialization在每个logical allocation instance上恰好执行一次。若KIR创建未初始化buffer，construction不得合成默认初始化，须保留作者的先写后读义务及已有读写顺序；静态初始化证明不足不阻断construction或保序的storage lowering。依赖初始化事实的变换仍须证明其所需条件。若一个mutable buffer在program instances间形成非atomic dependence，保守construction必须把这些computations收回同一program instance；不能依赖kernel内不存在的global barrier。Invocation workspace只有在每个slice有唯一owner，或KIR已有scatter-reduction/atomic semantics时才能并行共享。
 
 Atomic op保存KIR memory order、logical allocation/address relation、返回值schema及其logical sharing domain。Physical pass根据program mapping选择provider所需的scope；不得把scope写死在KIR，也不得丢失old-value/CAS success语义。
 
@@ -123,7 +123,7 @@ Initial conversion完成后必须验证：
 - ordered dependencies没有跨独立program instances断开；
 - unordered conflicts由unique、reduction或atomic semantics闭合；
 - every access的coordinates、validity与fill/effect完整；
-- every buffer read有dominant initialization或write；
+- every buffer保留initial value或作者的first-write obligation，读写的ordered dependencies完整；
 - every structured op具有完整operands、results、regions与accumulator；
 - every region fold/scan的segment source relation、summarizer、identity、combine以及scan apply/emit/result assembly完整，且没有segment identity/extent泄漏为KIR observable value；
 - all physical values具有合法scalar/fragment types；

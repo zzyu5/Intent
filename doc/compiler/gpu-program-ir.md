@@ -87,7 +87,7 @@ Physical buffer是kernel内mutable resource，显式保存：
 - sharing/visibility obligation；
 - 是否需要compiler-private workspace ABI。
 
-具有full initial value的buffer在每个logical allocation instance上恰好初始化一次。未初始化buffer不产生默认fill；verifier逐element证明每次read由dominant write定义。Invocation workspace由runtime在同一次launch前分配；每个slice必须有唯一owner或明确的atomic/scatter-reduction semantics，不能依赖隐藏init kernel或kernel-global barrier。
+具有full initial value的buffer在每个logical allocation instance上恰好初始化一次。未初始化buffer不产生默认fill，保留作者的先写后读义务；verifier不因静态初始化证明不足而拒绝程序。依赖初始化事实的优化仍须取得所需证明，不能把Unknown当成已初始化。Invocation workspace由runtime在同一次launch前分配；每个slice必须有唯一owner或明确的atomic/scatter-reduction semantics，不能依赖隐藏init kernel或kernel-global barrier。
 
 共同IR不指定register、local、shared或TMEM。它先决定SSA value、program-private resource还是invocation workspace；provider/storage passes再从lifetime、sharing、resource limits与capability选择目标memory form。
 

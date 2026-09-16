@@ -36,8 +36,6 @@ LogicalResult materializeProgramBuffers(ModuleOp module) {
         type.getLifetime().getValue() != gpu::BufferLifetime::Program ||
         buffer->getBlock() != &kernel.front())
       return buffer.emitOpError("Triton mutable buffer requires an entry program allocation");
-    if (!gpu::PhysicalProgramAnalysis(kernel).bufferDataflow(buffer.getResult()).isExact())
-      return buffer.emitOpError("Triton mutable buffer has no exact initialization proof");
     for (Operation *user : buffer.getResult().getUsers())
       if (!isa<gpu::LoadOp, gpu::StoreOp, gpu::AssumeInBoundsOp>(user))
         return user->emitOpError("Triton mutable buffer supports explicit loads and stores");
@@ -130,8 +128,6 @@ LogicalResult materializeProgramBuffers(ModuleOp module) {
     }
     buffer.getResult().replaceAllUsesWith(workspace);
     buffer.erase();
-    if (!gpu::PhysicalProgramAnalysis(kernel).bufferDataflow(workspace).isExact())
-      return kernel.emitError("Triton buffer materialization lost its initialization proof");
   }
   gpu::eraseDeadPhysicalValues(kernel);
   return success();
@@ -171,9 +167,6 @@ LogicalResult lowerInvocationWorkspaces(ModuleOp module) {
         return user->emitOpError(
             "Triton workspace supports explicit loads and stores");
     }
-    if (!gpu::PhysicalProgramAnalysis(kernel).bufferDataflow(workspace).isExact())
-      return kernel.emitError("Triton workspace reads require exact initialization dataflow");
-
     unsigned argumentIndex = workspace.getArgNumber();
     SmallVector<int64_t> dimensions;
     SmallVector<Attribute> strides;

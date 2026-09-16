@@ -300,16 +300,6 @@ struct PhysicalAccessBoundsFact {
   bool isExact() const { return state == PhysicalFactState::Exact; }
 };
 
-/// Current-IR initialization and resource-use legality for one physical
-/// mutable buffer.  Exact means every read is dominated either by a direct
-/// initializing write or by a proven full-domain loop/branch initialization.
-struct PhysicalBufferDataflowFact {
-  PhysicalFactState state = PhysicalFactState::Unknown;
-  llvm::SmallVector<mlir::Operation *, 4> blockers;
-
-  bool isExact() const { return state == PhysicalFactState::Exact; }
-};
-
 /// Recomputable facts derived only from the current executable GPU IR.
 /// A transformation constructs this object after the preceding mutation,
 /// queries all plans it needs, then discards it before rewriting the IR.
@@ -359,7 +349,6 @@ public:
   PhysicalAccessBoundaryFact boundaryValidity(mlir::Operation *access,
                                              bool allowRangeGuards = false);
   PhysicalAccessBoundsFact accessBounds(mlir::Operation *access);
-  PhysicalBufferDataflowFact bufferDataflow(mlir::Value buffer);
   bool isProgramOwnedRange(MakeRangeOp range) const;
   bool hasDisjointWorkspaceSlices(mlir::Value buffer) const;
 

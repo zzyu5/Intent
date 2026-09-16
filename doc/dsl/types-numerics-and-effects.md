@@ -198,11 +198,15 @@ logical buffer是kernel-local mutable state：
 - shape与dtype由作者定义；
 - 新buffer不alias external views或其它新buffer；
 - 可以用完整initial value创建，也可以未初始化创建；
-- verifier必须证明每次read之前对应element已经被写入；
+- 作者必须保证每次active read之前，对应element已在同一allocation instance中写入；
 - lifetime是lexical，buffer不能逃逸到kernel外；
 - storage、materialization与placement由compiler决定。
 
 跨kernel存活的tensor由host显式拥有，不是logical buffer。
+
+静态初始化证明不足不作为编译拒绝条件，也不代表element已经初始化。
+依赖初始化事实的优化仍须证明其所需条件；普通lowering保持作者的读写顺序和effects。
+读取尚未写入的element违反语言约定，编译成功不保证程序满足先写后读义务。
 
 ## 10. Indexed access 与 collision semantics
 

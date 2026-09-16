@@ -100,8 +100,20 @@ LogicalResult verifyStructuredSegment(Operation *operation,
                    "structured segment parameter has the wrong physical role");
 }
 
-LogicalResult verifyBufferDataflow(func::FuncOp kernel,
-                                   PhysicalProgramAnalysis &analysis) {
+LogicalResult verifyBufferResources(func::FuncOp kernel,
+                                    PhysicalProgramAnalysis &analysis) {
+  auto verifyUses = [](Value buffer) -> LogicalResult {
+    for (OpOperand &use : buffer.getUses()) {
+      Operation *user = use.getOwner();
+      if (isa<AssumeInBoundsOp, DimOp>(user))
+        continue;
+      bool resourceUse = isa<LoadOp, StoreOp, ScatterReduceOp, AtomicLoadOp,
+                             AtomicStoreOp, AtomicRMWOp, AtomicCompareExchangeOp>(user);
+      if (!resourceUse || use.getOperandNumber() != 0)
+        return user->emitOpError("physical buffer use is not an explicit resource access");
+    }
+    return success();
+  };
   llvm::DenseSet<uint64_t> instances;
   LogicalResult result = success();
   kernel.walk([&](BufferOp buffer) {
@@ -124,12 +136,7 @@ LogicalResult verifyBufferDataflow(func::FuncOp kernel,
       result = failure();
       return WalkResult::interrupt();
     }
-    PhysicalBufferDataflowFact fact = analysis.bufferDataflow(buffer.getResult());
-    if (!fact.isExact()) {
-      InFlightDiagnostic diagnostic = buffer.emitOpError(
-          "physical buffer dataflow is not exact in the current program");
-      for (Operation *blocker : fact.blockers)
-        diagnostic << "; blocker=" << blocker->getName();
+    if (failed(verifyUses(buffer.getResult()))) {
       result = failure();
       return WalkResult::interrupt();
     }
@@ -157,14 +164,8 @@ LogicalResult verifyBufferDataflow(func::FuncOp kernel,
         }) && !analysis.hasDisjointWorkspaceSlices(argument))
       return kernel.emitError(
           "workspace accesses have no proven disjoint program slices");
-    PhysicalBufferDataflowFact fact = analysis.bufferDataflow(argument);
-    if (!fact.isExact()) {
-      InFlightDiagnostic diagnostic = kernel.emitError(
-          "workspace read lacks a dominating definition of its accessed elements");
-      for (Operation *blocker : fact.blockers)
-        diagnostic << "; blocker=" << blocker->getName();
+    if (failed(verifyUses(argument)))
       return failure();
-    }
   }
   return result;
 }
@@ -485,7 +486,7 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
       diagnostic << origin << ",";
     return failure();
   }
-  return verifyBufferDataflow(kernel, physicalAnalysis);
+  return verifyBufferResources(kernel, physicalAnalysis);
 }
 
 } // namespace intent::gpu
