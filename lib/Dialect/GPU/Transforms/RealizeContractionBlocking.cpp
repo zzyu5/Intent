@@ -16,6 +16,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 
 #include <functional>
+#include <limits>
 #include <tuple>
 
 using namespace mlir;
@@ -2735,8 +2736,44 @@ FailureOr<bool> realizeFullResultTraversal(
       !contract.getRhsBatchAxes().empty())
     return false;
   FragmentType resultType = contract.getResult().getType();
+  auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+  uint64_t retainedBytes =
+      (resultType.getElementType().getIntOrFloatBitWidth() + 7) / 8;
+  bool boundedResult = static_cast<bool>(capabilities);
+  for (Attribute attribute : resultType.getShape()) {
+    auto extent = cast<PhysicalExprAttr>(attribute);
+    auto width = constantPhysicalExpression(extent);
+    if (!width && extent.getKind() ==
+                      static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
+      auto parameter = parameterForExtent(kernel, extent);
+      if (succeeded(parameter)) {
+        auto candidates = (*parameter).getParameter().getCandidates().asArrayRef();
+        if (!candidates.empty())
+          width = *std::min_element(candidates.begin(), candidates.end());
+      }
+    }
+    if (!width || *width <= 0 ||
+        retainedBytes > std::numeric_limits<uint64_t>::max() / *width) {
+      boundedResult = false;
+      break;
+    }
+    retainedBytes *= *width;
+  }
+  // Introduce retained-result traversal only when even the smallest existing
+  // fragment exceeds the local budget; larger candidates do not force a loop
+  // on otherwise small ownership tiles.
+  const bool largeRetainedResult =
+      boundedResult && retainedBytes >
+                           static_cast<uint64_t>(
+                               capabilities.getMaxDynamicSharedMemoryPerBlock());
+  auto needsTraversal = [&](PhysicalExprAttr extent) {
+    return isFullCoverageExtent(contract, extent) ||
+           (largeRetainedResult && extent.getKind() ==
+                                      static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+            extent.getValue() > 1);
+  };
   if (llvm::none_of(resultType.getShape(), [&](Attribute extent) {
-        return isFullCoverageExtent(contract, cast<PhysicalExprAttr>(extent));
+        return needsTraversal(cast<PhysicalExprAttr>(extent));
       }))
     return false;
   SmallVector<std::pair<OpOperand *, unsigned>> freeAxes(resultType.getShape().size());
@@ -2778,7 +2815,7 @@ FailureOr<bool> realizeFullResultTraversal(
 
   for (auto [resultAxis, selected] : llvm::enumerate(freeAxes)) {
     auto fullExtent = cast<PhysicalExprAttr>(resultType.getShape()[resultAxis]);
-    if (!isFullCoverageExtent(contract, fullExtent))
+    if (!needsTraversal(fullExtent))
       continue;
     PhysicalProgramAnalysis analysis(kernel);
     PhysicalRangeFact fact = analysis.axisRanges(selected.first->get(), selected.second);
@@ -2791,11 +2828,23 @@ FailureOr<bool> realizeFullResultTraversal(
     FailureOr<ParameterOp> fullParameter = parameterForExtent(kernel, fullExtent);
     FailureOr<AxisMapAttr> axisMap =
         queryAxisMap(selected.first->get().getType(), selected.second);
-    if (failed(authority) || failed(fullParameter) || failed(axisMap) ||
+    if (failed(authority) || failed(axisMap) ||
+        (failed(fullParameter) && fullExtent.getKind() !=
+                                     static_cast<uint32_t>(PhysicalExprKind::Constant)) ||
         !fact.unitStep ||
         !samePhysicalScalarExpression((*authority).getStart(),
                                       (*authority).getLogicalStart()))
       continue;
+    if (failed(fullParameter)) {
+      auto cardinality = constantLogicalRangeCardinality(*authority);
+      UniformValueAnalysis constants(describeUniformValue);
+      auto actualExtent = dyn_cast_or_null<IntegerAttr>(
+          constants.evaluate((*authority).getExtent()));
+      if (!cardinality || *cardinality <= 0 ||
+          *cardinality > fullExtent.getValue() || !actualExtent ||
+          actualExtent.getInt() != fullExtent.getValue())
+        continue;
+    }
     bool lhsAxis = selected.first == &contract.getLhsMutable();
     std::string name =
         ((lhsAxis ? "BLOCK_M_CACHE_" : "BLOCK_N_CACHE_") +
@@ -2844,9 +2893,13 @@ FailureOr<bool> realizeFullResultTraversal(
         resultType.getOwner());
     OpBuilder builder(contract);
     Location location = contract.getLoc();
+    Value fullSize = succeeded(fullParameter)
+                         ? (*fullParameter).getResult()
+                         : Value(builder.create<arith::ConstantIndexOp>(
+                               location, fullExtent.getValue()));
     Value fullRange = builder.create<MakeRangeOp>(
         location, fullRangeType, (*authority).getLogicalStart(),
-        (*fullParameter).getResult(), (*authority).getStep(),
+        fullSize, (*authority).getStep(),
         (*authority).getLogicalStart(), (*authority).getLogicalStop(),
         axisMap->getSourceId(), axisMap->getSourceAxis(), axisMap->getDerived());
     inheritRangeAuthority(fullRange, *authority);
@@ -2919,7 +2972,7 @@ FailureOr<bool> realizeFullResultTraversal(
           coordinateType.getAxisMaps(), coordinateType.getValidity(), coordinateType.getOwner());
       Value zero = nested.create<arith::ConstantIndexOp>(location, 0);
       Value lower = nested.create<BroadcastOp>(location, coordinateType, zero);
-      Value upper = nested.create<BroadcastOp>(location, coordinateType, (*fullParameter).getResult());
+      Value upper = nested.create<BroadcastOp>(location, coordinateType, fullSize);
       Value bounded = binary(nested, location, coordinatePredicate,
           compare(nested, location, coordinatePredicate, coordinate, lower, ComparePredicate::Ge),
           compare(nested, location, coordinatePredicate, coordinate, upper, ComparePredicate::Lt),
