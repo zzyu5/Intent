@@ -150,6 +150,12 @@ LogicalResult refineMapping(ModuleOp module, func::FuncOp) {
   return refineProgramMapping(module);
 }
 
+LogicalResult vectorizeBufferGroup(ModuleOp module, func::FuncOp kernel) {
+  if (failed(vectorizeBufferLoops(module)))
+    return failure();
+  return closeValueAccessRelations(kernel);
+}
+
 LogicalResult simplifyValues(ModuleOp module, func::FuncOp) {
   if (failed(eliminateCommonValues(module)))
     return failure();
@@ -204,6 +210,7 @@ LogicalResult runSharedGPUPasses(ModuleOp module, const TuningProfiles &profiles
       {"realize-reductions", realizeReductionGroup},
       {"realize-contractions", realizeContractionGroup},
       {"compose-realized-accesses", composeRealizedAccesses},
+      {"vectorize-buffer-loops", vectorizeBufferGroup},
       {"refine-program-mapping", refineMapping},
       {"eliminate-common-values", simplifyValues},
   };
