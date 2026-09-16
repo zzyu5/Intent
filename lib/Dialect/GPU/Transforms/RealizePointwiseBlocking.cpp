@@ -5078,7 +5078,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
               continue;
             auto otherPayload = analysis.axisRanges(store.getValue(), otherAxis);
             auto otherAddress = analysis.axisRanges(coordinate, 0);
-            independentAddress |= otherPayload.isExact() && otherPayload.roots.empty() &&
+            independentAddress |= otherPayload.isExact() &&
+                !llvm::is_contained(otherPayload.roots, range) &&
                 otherPayload.blockers.empty() && otherAddress.isExact() &&
                 llvm::any_of(otherAddress.roots, [&](MakeRangeOp other) {
                   return other != range && sameLogicalRange(other, range);
