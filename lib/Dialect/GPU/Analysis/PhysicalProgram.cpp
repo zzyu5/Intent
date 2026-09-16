@@ -2530,6 +2530,29 @@ void PhysicalProgramAnalysis::collectRanges(
       appendUnique(result.roots, range);
     return;
   }
+  if (isa<scf::ForOp>(operation)) {
+    if (auto fragment = dyn_cast<FragmentType>(value.getType())) {
+      // A completed loop contributes its result lanes to an indirect access,
+      // not the reduction lanes used to compute each index. Follow the typed
+      // yield/carry relation already used by axis-specific provenance.
+      for (auto [axis, attribute] : llvm::enumerate(fragment.getAxisMaps())) {
+        if (source &&
+            !(sourceAxisIdentity(cast<AxisMapAttr>(attribute)) == *source))
+          continue;
+        PhysicalRangeFact fact = axisRanges(value, axis);
+        if (result.state != PhysicalFactState::Unknown &&
+            fact.state != PhysicalFactState::Exact)
+          result.state = fact.state;
+        for (MakeRangeOp range : fact.roots)
+          appendUnique(result.roots, range);
+        for (Operation *access : fact.accesses)
+          appendUnique(result.accesses, access);
+        for (Operation *blocker : fact.blockers)
+          appendUnique(result.blockers, blocker);
+      }
+      return;
+    }
+  }
   // Reshape preserves the row-major coordinate relation carried by its
   // reassociation groups.  Source-specific range queries follow that typed
   // relation through the input instead of treating reshape as an opaque value
@@ -3132,13 +3155,20 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     auto opResult = dyn_cast<OpResult>(value);
     auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
     if (!opResult || !yield ||
-        opResult.getResultNumber() >= yield.getResults().size()) {
+        opResult.getResultNumber() >= yield.getResults().size() ||
+        opResult.getResultNumber() >= loop.getInitArgs().size()) {
       result.state = PhysicalFactState::Unknown;
       appendUnique(result.blockers, operation);
       return;
     }
-    collectAxisRanges(yield.getResults()[opResult.getResultNumber()],
-                      fragmentAxis, result, visited);
+    auto lower = integerConstant(loop.getLowerBound());
+    auto upper = integerConstant(loop.getUpperBound());
+    if (!lower || !upper || *lower >= *upper)
+      collectAxisRanges(loop.getInitArgs()[opResult.getResultNumber()],
+                        fragmentAxis, result, visited);
+    if (!lower || !upper || *lower < *upper)
+      collectAxisRanges(yield.getResults()[opResult.getResultNumber()],
+                        fragmentAxis, result, visited);
     return;
   }
   if (auto select = dyn_cast<SelectOp>(operation)) {
