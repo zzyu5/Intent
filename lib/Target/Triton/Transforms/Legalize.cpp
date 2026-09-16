@@ -3442,7 +3442,8 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       failed(gpu::verifyGPUProgram(module)))
     return failure();
   foldIntegerScanTails(kernel);
-  if (failed(legalizeLargeScalarGathers(kernel)) ||
+  if (failed(materializeProgramBuffers(module)) ||
+      failed(legalizeLargeScalarGathers(kernel)) ||
       failed(materializeOversizedGathers(kernel)) ||
       failed(legalizeMaskedGather(kernel)) ||
       failed(legalizeExpandingGathers(kernel)) ||

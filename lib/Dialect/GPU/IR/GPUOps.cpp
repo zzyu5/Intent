@@ -1538,7 +1538,8 @@ LogicalResult BufferOp::verify() {
         initial && (initial.getShape() != type.getShape() ||
                     initial.getOwner() != type.getOwner()))
       return emitOpError(
-          "buffer full-value initializer must cover its physical shape and owner");
+          "buffer full-value initializer must cover its physical shape and owner")
+          << "; initializer=" << initial << "; buffer=" << type;
   return success();
 }
 

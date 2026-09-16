@@ -207,6 +207,7 @@ def _buffer(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
                 bound["init"],
                 ScalarType(dtype) if isinstance(expression, Literal) else None,
             )
+            initializer = lowerer.read_value(initializer, bound["init"])
     shape = lower_shape(lowerer, bound["shape"], first_operand_position=0)
     operands = shape.operands + ((initializer,) if initializer is not None else ())
     attributes: dict[str, object] = {"shape": shape.relation}

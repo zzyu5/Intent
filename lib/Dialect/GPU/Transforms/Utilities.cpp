@@ -3256,6 +3256,37 @@ static void retargetExtent(Value root, AxisSelector selects,
       }
     appendStructuredResultRelations(value, worklist);
     for (Operation *user : value.getUsers()) {
+      if (auto buffer = dyn_cast<BufferOp>(user);
+          buffer && buffer.getInitialValue() == value && previousFragment) {
+        auto storage = buffer.getResult().getType();
+        auto initial = dyn_cast<FragmentType>(value.getType());
+        if (initial && storage.getShape() == previousFragment.getShape() &&
+            storage.getOwner() == previousFragment.getOwner() &&
+            initial.getOwner() == storage.getOwner()) {
+          bool padding = llvm::all_of(
+              llvm::zip(previousFragment.getShape(), initial.getShape()),
+              [](auto dimensions) {
+                auto [before, after] = dimensions;
+                if (before == after)
+                  return true;
+                auto oldExtent = cast<PhysicalExprAttr>(before);
+                auto newExtent = cast<PhysicalExprAttr>(after);
+                return oldExtent.getKind() ==
+                           static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                       newExtent.getKind() ==
+                           static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                       oldExtent.getValue() > 0 &&
+                       static_cast<uint64_t>(newExtent.getValue()) ==
+                           llvm::PowerOf2Ceil(static_cast<uint64_t>(oldExtent.getValue()));
+              });
+          if (padding)
+            buffer.getResult().setType(BufferType::get(
+                storage.getContext(), storage.getElementType(), initial.getShape(),
+                storage.getScope(), storage.getInstance(), storage.getOwner(),
+                storage.getInitialization(), storage.getLifetime(),
+                storage.getVisibility(), storage.getWorkspace()));
+        }
+      }
       if (auto broadcast = dyn_cast<BroadcastOp>(user)) {
         auto target = dyn_cast<FragmentType>(broadcast.getResult().getType());
         if (previousFragment && target) {
