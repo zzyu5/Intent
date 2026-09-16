@@ -4876,6 +4876,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::DenseMap<Operation *, MakeRangeOp> occurrenceRoots;
   llvm::DenseMap<Operation *, ParameterOp> occurrenceParameters;
   llvm::SmallPtrSet<Operation *, 8> positionalOccurrences;
+  llvm::SmallDenseSet<uint64_t> independentCartesianDimensions;
   uint64_t nextOccurrenceSource = nextPhysicalAxisIdentities(kernel).first;
   WalkResult occurrences = kernel.walk([&](StoreOp store) {
     auto valueType = dyn_cast<FragmentType>(store.getValue().getType());
@@ -4892,6 +4893,19 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         llvm::all_of(coordinates, [](Value value) {
           return cast<FragmentType>(value.getType()).getShape().size() == 1;
         });
+    if (cartesian) {
+      PhysicalProgramAnalysis analysis(kernel);
+      llvm::DenseMap<uint64_t, unsigned> positions;
+      for (auto [position, coordinate] : llvm::enumerate(coordinates))
+        for (MakeRangeOp range : analysis.axisRanges(coordinate, 0).roots) {
+          auto dimension = ownershipDimension(kernel, range);
+          if (failed(dimension))
+            continue;
+          auto [previous, inserted] = positions.try_emplace(*dimension, position);
+          if (!inserted && previous->second != position)
+            independentCartesianDimensions.insert(*dimension);
+        }
+    }
     auto ordered = store->getParentOfType<scf::ForOp>();
     if (cartesian && ordered && !ordered->hasAttr(independentIterationAttr)) {
       PhysicalProgramAnalysis analysis(kernel);
@@ -5028,9 +5042,18 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             auto sourceDimension = queryRangeDimension(range);
             return succeeded(sourceDimension) && *sourceDimension == dimension &&
                    llvm::all_of(address.roots, [&](MakeRangeOp coordinate) {
-                     return sameBound(range.getLogicalStart(), coordinate.getLogicalStart()) &&
-                            sameBound(range.getLogicalStop(), coordinate.getLogicalStop()) &&
-                            sameBound(range.getStep(), coordinate.getStep());
+                     auto addressDimension = queryRangeDimension(coordinate);
+                     bool sameExtent = succeeded(addressDimension) &&
+                                       *addressDimension == *sourceDimension;
+                     // A positional store pairs ordinals of the same logical
+                     // extent even when the source and destination start at
+                     // different coordinates. Keep each range's own origin.
+                     return sameBound(range.getStep(), coordinate.getStep()) &&
+                            (sameExtent ||
+                             (sameBound(range.getLogicalStart(),
+                                        coordinate.getLogicalStart()) &&
+                              sameBound(range.getLogicalStop(),
+                                        coordinate.getLogicalStop())));
                    });
           });
       bool positionalRemap = equivalentSources || llvm::any_of(payload.roots, [&](MakeRangeOp range) {
@@ -5142,8 +5165,13 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
               bool sameStaticCardinality = succeeded(addressExtent) &&
                                            succeeded(extent) &&
                                            *addressExtent == *extent;
+              auto rootDimension = queryRangeDimension(root);
+              auto rangeDimension = queryRangeDimension(range);
+              bool sameLogicalExtent = succeeded(rootDimension) &&
+                                       succeeded(rangeDimension) &&
+                                       *rootDimension == *rangeDimension;
               return isUnitStepRange(root) && isUnitStepRange(range) &&
-                     (sameStaticCardinality ||
+                     (sameLogicalExtent || sameStaticCardinality ||
                       (length && length == launchRangeExtent(range)));
             }
             return sameBound(root.getLogicalStart(), range.getLogicalStart()) &&
@@ -5548,8 +5576,16 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           PhysicalParameterBinding binding = queryParameterBinding(*existing);
           // Repeated Cartesian axes have distinct occurrence classes even
           // when their logical extents share the same dimension identity.
-          if (binding.isExact() && binding.source &&
-              *binding.source == sourceAxisIdentity(occurrenceRoot))
+          auto dimension = ownershipDimension(kernel, occurrenceRoot);
+          bool sharedDimension = binding.isExact() && !binding.source &&
+              binding.dimension && succeeded(dimension) &&
+              *binding.dimension == static_cast<int64_t>(*dimension) &&
+              !independentCartesianDimensions.contains(*dimension) &&
+              positionalOccurrences.contains(range.getOperation()) &&
+              positionalOccurrences.contains(occurrenceRoot.getOperation());
+          if (sharedDimension ||
+              (binding.isExact() && binding.source &&
+               *binding.source == sourceAxisIdentity(occurrenceRoot)))
             selected = *existing;
         }
       }
