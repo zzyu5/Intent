@@ -3444,8 +3444,8 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   foldIntegerScanTails(kernel);
   if (failed(materializeProgramBuffers(module)) ||
       failed(legalizeLargeScalarGathers(kernel)) ||
-      failed(materializeOversizedGathers(kernel)) ||
       failed(legalizeMaskedGather(kernel)) ||
+      failed(materializeOversizedGathers(kernel)) ||
       failed(legalizeExpandingGathers(kernel)) ||
       failed(legalizeScatterAdd(kernel)) ||
       failed(legalizeContractShapes(kernel)) ||
