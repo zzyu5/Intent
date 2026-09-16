@@ -504,9 +504,20 @@ class FunctionLowerer:
             ),
             None,
         )
-        if origin is None:
-            self.error(node, f"dynamic shape extent {dimension} has no SSA source")
-        return self.materialize_dimension(origin, node)
+        if origin is not None:
+            return self.materialize_dimension(origin, node)
+        for value, known in self.dimension_values.items():
+            if known != dimension or not self._block_dominates(
+                self.value_blocks.get(value), self.current_block
+            ):
+                continue
+            if value.type == ScalarType(intent_index):
+                return value
+            return self.emit(
+                OperationKind.CAST, self.location(node), operands=(value,),
+                result_types=(ScalarType(intent_index),),
+            ).results[0]
+        self.error(node, f"dynamic shape extent {dimension} has no SSA source")
 
     def integer_shape_dimension(self, value: MlirValue, preferred: object = None) -> object:
         dimension = self.dimension_values.get(value)

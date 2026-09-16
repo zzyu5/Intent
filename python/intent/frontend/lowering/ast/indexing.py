@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 
 from intent.frontend.semantics import BufferType
 from intent.frontend.semantics import BinaryOperator
-from intent.frontend.semantics import DynamicDim
 from intent.frontend.semantics import DomainType
 from intent.frontend.semantics import Effect
 from intent.frontend.semantics import EffectKind
@@ -218,7 +217,7 @@ def lower_index(
                         tuple(static_values),
                     )
                 )
-                dimension = DynamicDim(f"slice_{source.id}_{source_axis}")
+                dimension = lowerer.fresh_dynamic_dimension("slice_extent")
                 if raw_term.step is None or static_values[2] == 1:
                     bounds = []
                     for component in range(2):
