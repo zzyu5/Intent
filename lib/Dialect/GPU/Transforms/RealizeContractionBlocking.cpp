@@ -2149,25 +2149,26 @@ LogicalResult decomposeMultiReductionContract(ContractOp contract) {
     return success();
   if (contract.getLhsReductionAxes().size() !=
           contract.getRhsReductionAxes().size() ||
-      !contract.getLhsBatchAxes().empty() ||
-      !contract.getRhsBatchAxes().empty())
+      contract.getLhsBatchAxes().size() != contract.getRhsBatchAxes().size())
     return contract.emitOpError(
-        "multi-pair contraction decomposition requires paired reductions and no batch axes");
+        "multi-pair contraction decomposition requires paired reduction and batch axes");
   func::FuncOp kernel = contract->getParentOfType<func::FuncOp>();
   Location location = contract.getLoc();
   std::string failureReason;
   auto unit = expression(kernel.getContext(), PhysicalExprKind::Constant, 1);
   std::function<FailureOr<Value>(OpBuilder &, Value, Value,
+                                SmallVector<int64_t>, SmallVector<int64_t>,
                                 SmallVector<int64_t>, SmallVector<int64_t>, Value)>
       build;
   build = [&](OpBuilder &builder, Value lhs, Value rhs,
               SmallVector<int64_t> lhsReductions,
               SmallVector<int64_t> rhsReductions,
+              SmallVector<int64_t> lhsBatch, SmallVector<int64_t> rhsBatch,
               Value accumulator) -> FailureOr<Value> {
     if (lhsReductions.size() == 1) {
       auto product = builder.create<ContractOp>(
           location, contract.getResult().getType(), lhs, rhs, accumulator,
-          lhsReductions, rhsReductions, ArrayRef<int64_t>{}, ArrayRef<int64_t>{});
+          lhsReductions, rhsReductions, lhsBatch, rhsBatch);
       if (Attribute origin = contract->getAttr(originAttr))
         product->setAttr(originAttr, origin);
       return product.getResult();
@@ -2253,7 +2254,8 @@ LogicalResult decomposeMultiReductionContract(ContractOp contract) {
           }
           FailureOr<Value> product = build(
               nested, *lhsSlice, *rhsSlice, eraseAxis(lhsReductions, lhsAxis),
-              eraseAxis(rhsReductions, rhsAxis), carries.front());
+              eraseAxis(rhsReductions, rhsAxis), eraseAxis(lhsBatch, lhsAxis),
+              eraseAxis(rhsBatch, rhsAxis), carries.front());
           if (failed(product)) {
             failedBody = true;
             if (failureReason.empty())
@@ -2275,7 +2277,9 @@ LogicalResult decomposeMultiReductionContract(ContractOp contract) {
   FailureOr<Value> replacement = build(
       builder, contract.getLhs(), contract.getRhs(),
       SmallVector<int64_t>(contract.getLhsReductionAxes()),
-      SmallVector<int64_t>(contract.getRhsReductionAxes()), contract.getAccumulator());
+      SmallVector<int64_t>(contract.getRhsReductionAxes()),
+      SmallVector<int64_t>(contract.getLhsBatchAxes()),
+      SmallVector<int64_t>(contract.getRhsBatchAxes()), contract.getAccumulator());
   if (failed(replacement))
     return contract.emitOpError(
                "multi-pair contraction could not be decomposed into provider-native contractions: ")
