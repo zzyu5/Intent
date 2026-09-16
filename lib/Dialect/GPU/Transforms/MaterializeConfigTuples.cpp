@@ -666,11 +666,8 @@ struct LiveFragmentFootprint {
 };
 
 SmallVector<LiveFragmentFootprint>
-straightLineFragmentLiveness(func::FuncOp kernel) {
-  if (!kernel.getBody().hasOneBlock() ||
-      llvm::any_of(kernel.front(), [](Operation &operation) {
-        return operation.getNumRegions() != 0;
-      }))
+blockFragmentLiveness(func::FuncOp kernel) {
+  if (!kernel.getBody().hasOneBlock())
     return {};
   Liveness liveness(kernel);
   const LivenessBlockInfo *block = liveness.getLiveness(&kernel.front());
@@ -1032,9 +1029,8 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
         largestReduction = std::max(largestReduction, requestedValue(profile, role));
   }
   auto freeExtents = contractionFreeExtents(kernel, parameters);
-  SmallVector<LiveFragmentFootprint> liveFragments;
-  if (pointwiseOnlyProgram)
-    liveFragments = straightLineFragmentLiveness(kernel);
+  SmallVector<LiveFragmentFootprint> liveFragments =
+      blockFragmentLiveness(kernel);
   bool invalidFootprint = false;
   auto appendTuple = [&](llvm::function_ref<const TuningProfile &(ParameterOp)> profileFor,
                          bool compactRows = false) {
