@@ -3259,7 +3259,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       categories.push_back(category);
   });
   auto capabilities = kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
-  int64_t fixedCollectiveRegisters = 0;
+  int64_t fixedCollectiveWords = 0;
   kernel.walk([&](Operation *operation) {
     if (!isa<gpu::ReduceOp, gpu::ScanOp>(operation))
       return;
@@ -3270,21 +3270,21 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       if (!fragment)
         continue;
       Type element = fragment.getElementType();
-      int64_t registers = std::max(1u,
+      int64_t words = std::max(1u,
           ((element.isIndex() ? 64 : element.getIntOrFloatBitWidth()) + 31) / 32);
       bool fixed = true;
       for (Attribute attribute : fragment.getShape()) {
         auto extent = cast<gpu::PhysicalExprAttr>(attribute);
         if (extent.getKind() != static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
             extent.getValue() <= 0 ||
-            registers > capabilities.getRegistersPerUnit() / extent.getValue()) {
+            words > std::numeric_limits<int64_t>::max() / extent.getValue()) {
           fixed = false;
           break;
         }
-        registers *= extent.getValue();
+        words *= extent.getValue();
       }
       if (fixed)
-        fixedCollectiveRegisters = std::max(fixedCollectiveRegisters, registers);
+        fixedCollectiveWords = std::max(fixedCollectiveWords, words);
     }
   });
   bool blackwell = capabilities.getComputeCapabilityMajor() == 10 ||
@@ -3318,22 +3318,28 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   });
   SmallVector<TritonLocalOptions> localOptions;
   SmallVector<int64_t> warpDomain, stageDomain, ctaDomain;
+  auto isDeviceOption = [&](int64_t warps, int64_t stages, int64_t ctas) {
+    return (!requiresCtaSynchronization || ctas == 1) &&
+           (warps & (warps - 1)) == 0 &&
+           warps <= capabilities.getMaxThreadsPerBlock() / 32 &&
+           stages <= std::numeric_limits<int32_t>::max() &&
+           (ctas & (ctas - 1)) == 0 && ctas <= 16 &&
+           (ctas == 1 || capabilities.getComputeCapabilityMajor() >= 9);
+  };
+  int64_t maximumWarps = 0;
+  for (const auto &row : *rows)
+    if (isDeviceOption(row[0], row[1], row[2]))
+      maximumWarps = std::max(maximumWarps, row[0]);
   for (const auto &row : *rows) {
     int64_t warps = row[0], stages = row[1], ctas = row[2];
     if (straightLinePointwise)
       stages = 1;
-    if (requiresCtaSynchronization && ctas != 1)
+    if (!isDeviceOption(warps, stages, ctas))
       continue;
-    // Static collectives have no blocking parameter from which to infer their
-    // warp demand. Prefer enough threads for the source itself to fit within
-    // NVIDIA's 255-register per-thread limit before considering intermediates.
-    if (fixedCollectiveRegisters > warps * 32 * 255)
-      continue;
-    if ((warps & (warps - 1)) != 0 ||
-        warps > capabilities.getMaxThreadsPerBlock() / 32 ||
-        stages > std::numeric_limits<int32_t>::max() ||
-        (ctas & (ctas - 1)) != 0 || ctas > 16 ||
-        (ctas > 1 && capabilities.getComputeCapabilityMajor() < 9))
+    // This whole-fragment footprint guides thread distribution; the provider
+    // still chooses its layout and may spill. Keep the widest supplied option
+    // even when no option's nominal per-thread share fits the register limit.
+    if (fixedCollectiveWords > warps * 32 * 255 && warps < maximumWarps)
       continue;
     if (llvm::any_of(localOptions, [&](const TritonLocalOptions &option) {
           // Pure loops with IEEE f32 contractions have no asynchronous
