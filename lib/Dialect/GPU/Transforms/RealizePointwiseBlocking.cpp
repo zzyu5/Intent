@@ -1073,7 +1073,9 @@ LogicalResult addTailValidity(func::FuncOp kernel,
             if (dominance.dominates(replayed, store.getOperation()))
               mapping.map(original, replayed);
         }
-        SmallVector<int64_t> traversalDimensions{*dimension};
+        auto payloadMapping =
+            cast<AxisMapAttr>(valueType.getAxisMaps()[payloadAxis]);
+        SmallVector<int64_t> traversalDimensions{payloadMapping.getDimensionId()};
         FailureOr<Value> replayed = replayPointwiseValue(
             builder, payload, sourceAxisIdentity(range), traversalDimensions,
             blockedExtent,
