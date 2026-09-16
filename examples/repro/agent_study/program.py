@@ -77,6 +77,7 @@ class TuningBudget:
         original_autotuner = Autotuner.run
         autotuning = 0
         future_names = {}
+        compilation_errors = []
         policy = self.policy
 
         class CompileExecutor(ThreadPoolExecutor):
@@ -108,6 +109,7 @@ class TuningBudget:
                 # Match Triton's candidate-failure policy. Normal autotuning
                 # still evaluates the same bounded set and rejects these forms.
                 self.precompile_failures.append({"kernel": kernel.__name__, "error": str(error)})
+                compilation_errors.append(error)
                 return None
 
         def compile_tuner(tuner, *args, **kwargs):
@@ -115,6 +117,7 @@ class TuningBudget:
             kwargs.pop("warmup", None)
             autotuning += 1
             try:
+                error_count = len(compilation_errors)
                 tuner.nargs = dict(zip(tuner.arg_names, args))
                 compiled = []
                 for configuration in tuner.prune_configs(kwargs):
@@ -131,13 +134,15 @@ class TuningBudget:
                             resolved.append(prepare_kernel(kernel.result()))
                         except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as error:
                             self.precompile_failures.append({"kernel": future_names[kernel], "error": str(error)})
+                            compilation_errors.append(error)
                     elif kernel is not None:
                         resolved.append(kernel)
                 # Return a resolved kernel, preserving the explicit-output
                 # artifact interface. All candidate failures were inspected.
                 if resolved:
                     return resolved[0]
-                raise RuntimeError("no bounded autotune configuration is executable on the current device")
+                cause = compilation_errors[-1] if len(compilation_errors) > error_count else None
+                raise RuntimeError("no bounded autotune configuration is executable on the current device") from cause
             finally:
                 autotuning -= 1
 

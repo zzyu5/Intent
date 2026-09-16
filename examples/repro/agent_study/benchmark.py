@@ -11,7 +11,8 @@ import time
 import traceback
 
 import torch
-from triton.compiler.errors import CompilationError
+from triton.compiler.errors import CompilationError, CompileTimeAssertionFailure
+from triton.runtime.errors import OutOfResources, PTXASError
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_flatten
 
@@ -126,7 +127,6 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
             with budget.compilation_only(), CandidateTorchPolicy():
                 candidate_call.call(function)
             result["precompile_seconds"] = time.monotonic() - compile_started
-            result["precompile_failures"] = budget.precompile_failures
             result["preparation_policy"] = "compile_only_before_gpu_timing_lock"
             stage = "comparison"
             with arguments.gpu_lock.open("w") as lock:
@@ -157,11 +157,12 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
         elif hasattr(error, "stage"):
             status = "compilation_failure"
             stage = error.stage
-        elif arguments.language == "intent" and any(isinstance(cause, CompilationError) for cause in causes):
+        elif arguments.language == "intent" and any(isinstance(cause, (CompilationError, CompileTimeAssertionFailure, OutOfResources, PTXASError)) for cause in causes):
             status, stage = "compilation_failure", "provider_compilation"
         else:
             status = "reference_failure" if stage == "reference_preparation" else "agent_program_error"
         result.update(status=status, failure_stage=stage, error=str(error), traceback=traceback.format_exc())
+    result["precompile_failures"] = budget.precompile_failures
     result["tuning"] = budget.records()
     result["preparation_and_benchmark_seconds"] = time.monotonic() - started
     return result
