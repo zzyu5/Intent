@@ -135,6 +135,10 @@ mlir::Value createInvocationWorkspace(mlir::func::FuncOp kernel,
                                       FragmentType payload,
                                       mlir::ArrayAttr shape);
 mlir::LogicalResult materializeRetainedValues(mlir::ModuleOp module);
+mlir::FailureOr<mlir::Value> materializeRetainedSlice(
+    mlir::OpBuilder &builder, mlir::Location location, mlir::Value value,
+    unsigned axis, PhysicalExprAttr blockedExtent, mlir::Value coordinates,
+    mlir::Operation *insertionAnchor);
 mlir::LogicalResult realizeRegionFolds(mlir::ModuleOp module);
 mlir::LogicalResult realizeRegionScans(mlir::ModuleOp module);
 mlir::LogicalResult realizeContractionBlocking(mlir::ModuleOp module);

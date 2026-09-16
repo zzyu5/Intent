@@ -2944,9 +2944,22 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                 coordinate = *projected;
               }
             }
-            Value blockedLoad = nested.create<LoadOp>(
-                nestedLocation, blockedRoot, load.getResource(), coordinates,
-                valid, fill, load.getSourceAxes());
+            Value blockedLoad;
+            if (canReplayReadAt(load, reduce)) {
+              blockedLoad = nested.create<LoadOp>(
+                  nestedLocation, blockedRoot, load.getResource(), coordinates,
+                  valid, fill, load.getSourceAxes());
+            } else {
+              FailureOr<Value> retained = materializeRetainedSlice(
+                  nested, nestedLocation, load.getResult(), access.fragmentAxis,
+                  chunkExtent, coordinate, reduce);
+              if (failed(retained)) {
+                bodyFailed = true;
+                bodyFailure = "could not preserve the original reduction read";
+                return;
+              }
+              blockedLoad = *retained;
+            }
             mapping.map(load.getResult(), blockedLoad);
             if (!sourceTail) {
               auto tail = predicateForReductionSource(

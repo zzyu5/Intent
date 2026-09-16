@@ -644,69 +644,12 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
     if (!original || !selected.isExact() || selected.fragmentAxes.size() != 1 ||
         !dominance.dominates(value, insertionAnchor))
       return owner->emitError("contraction blocking cannot slice the original value");
-    unsigned axis = selected.fragmentAxes.front();
-    if (!analysis.axisRealization(value, axis).physicalized) {
-      if (failed(realizeFullCoverageDimension(kernel, value, axis)))
-        return owner->emitError(
-            "retained contraction read could not be fully materialized");
-      original = cast<FragmentType>(value.getType());
-      analysis = PhysicalProgramAnalysis(kernel);
-    }
-    PhysicalRangeFact sourceRanges = analysis.axisRanges(value, axis);
-    FailureOr<MakeRangeOp> authority = queryExactLogicalRange(sourceRanges);
-    if (failed(authority) || !isUnitStepRange(*authority) ||
-        !analysis.lockstepRanges(sourceRanges.roots).isExact() ||
-        !analysis.axisRealization(value, axis).physicalized)
-      return owner->emitError(
-          "retained contraction value has no realized slice coordinate relation");
-    SmallVector<Attribute> shape(original.getShape().begin(),
-                                  original.getShape().end());
-    shape[axis] = blockedExtent;
-    auto target = FragmentType::get(
-        original.getContext(), original.getElementType(),
-        builder.getArrayAttr(shape), original.getAxisMaps(),
-        original.getValidity(), original.getOwner());
-    auto coordinate = cast<FragmentType>(replacement.getType());
-    Value start = builder.create<SplatOp>(location, coordinate,
-                                          (*authority).getStart());
-    Value ordinal = builder.create<BinaryOp>(
-        location, coordinate, replacement, start, BinaryOperator::Subtract);
-    auto indexType = FragmentType::get(
-        target.getContext(), builder.getIndexType(), target.getShape(),
-        target.getAxisMaps(), target.getValidity(), target.getOwner());
-    FailureOr<Value> indices = projectPhysicalValueToSchema(
-        builder, location, ordinal, indexType);
-    if (failed(indices))
-      return owner->emitError(
-          "retained contraction slice has no index projection");
-    auto predicate = FragmentType::get(
-        target.getContext(), builder.getI1Type(), target.getShape(),
-        target.getAxisMaps(), target.getValidity(), target.getOwner());
-    Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
-    Value lower = builder.create<SplatOp>(location, indexType, zero);
-    Value extent = builder.create<SplatOp>(location, indexType,
-                                           (*authority).getExtent());
-    Value nonNegative = builder.create<CompareOp>(
-        location, predicate, *indices, lower, ComparePredicate::Ge);
-    Value inExtent = builder.create<CompareOp>(
-        location, predicate, *indices, extent, ComparePredicate::Lt);
-    Value valid = builder.create<BinaryOp>(
-        location, predicate, nonNegative, inExtent, BinaryOperator::LogicalAnd);
-    Value activeLength = builder.create<BinaryOp>(
-        location, builder.getIndexType(), (*authority).getLogicalStop(),
-        (*authority).getStart(), BinaryOperator::Subtract);
-    Value activeExtent = builder.create<SplatOp>(location, indexType, activeLength);
-    Value active = builder.create<CompareOp>(
-        location, predicate, *indices, activeExtent, ComparePredicate::Lt);
-    valid = builder.create<BinaryOp>(
-        location, predicate, valid, active, BinaryOperator::LogicalAnd);
-    FailureOr<Value> fill = materializeZeroFragment(builder, location, target);
-    if (failed(fill))
+    FailureOr<Value> sliced = materializeRetainedSlice(
+        builder, location, value, selected.fragmentAxes.front(), blockedExtent,
+        replacement, insertionAnchor);
+    if (failed(sliced))
       return failure();
-    Value sliced = builder.create<GatherOp>(
-        location, target, value, ValueRange{*indices}, valid, *fill,
-        ArrayRef<int64_t>{static_cast<int64_t>(axis)});
-    mapping.map(value, sliced);
+    mapping.map(value, *sliced);
     return sliced;
   }
   FailureOr<Value> result = replaySourceValueImpl(
