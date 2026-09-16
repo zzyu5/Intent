@@ -1962,10 +1962,35 @@ FailureOr<Value> materializeRetargetedValidity(
   if (!kernel)
     return failure();
   PhysicalProgramAnalysis analysis(kernel);
+  SmallVector<std::pair<MakeRangeOp, Value>> equivalentTailRanges(
+      originalTailRanges.begin(), originalTailRanges.end());
+  if (original && isa<FragmentType>(original.getType())) {
+    for (auto [expected, end] : originalTailRanges) {
+      auto axis =
+          queryFragmentAxis(original.getType(), sourceAxisIdentity(expected));
+      auto dimension = queryRangeDimension(expected);
+      if (!axis.isExact() || failed(dimension) || axis.dimensionId != *dimension)
+        continue;
+      auto ranges = analysis.axisRanges(original, axis.fragmentAxis);
+      if (ranges.state == PhysicalFactState::Unknown || !ranges.blockers.empty())
+        continue;
+      SmallVector<MakeRangeOp> coincident{expected};
+      llvm::append_range(coincident, ranges.roots);
+      if (!analysis.lockstepRanges(coincident).isExact())
+        continue;
+      // A predicate may carry the output's coordinate identity on this input
+      // axis. Keep the positional proof as well as equal physical traversal;
+      // equal range bounds alone do not equate independent Cartesian axes.
+      for (MakeRangeOp range : ranges.roots)
+        if (!llvm::is_contained(equivalentTailRanges,
+                                std::pair<MakeRangeOp, Value>{range, end}))
+          equivalentTailRanges.emplace_back(range, end);
+    }
+  }
 
   std::function<FailureOr<Value>(Value)> residual =
       [&](Value value) -> FailureOr<Value> {
-    if (!value || analysis.isTailPredicate(value, originalTailRanges))
+    if (!value || analysis.isTailPredicate(value, equivalentTailRanges))
       return Value();
     if (value.getType().isInteger(1))
       return value;
