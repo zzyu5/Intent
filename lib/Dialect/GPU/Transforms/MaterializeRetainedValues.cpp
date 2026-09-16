@@ -481,14 +481,34 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
   Value source = gather.getSource();
   auto payload = dyn_cast<FragmentType>(source.getType());
   auto result = dyn_cast<FragmentType>(gather.getResult().getType());
-  if (!payload || !result ||
+  if (!payload || payload.getShape().empty() ||
       gather.getCoordinates().size() != payload.getShape().size() ||
       !isa<FloatType, IntegerType>(payload.getElementType()))
     return false;
   unsigned rank = payload.getShape().size();
+  auto coverageBound = [&](unsigned axis) -> PhysicalExprAttr {
+    auto extent = cast<PhysicalExprAttr>(payload.getShape()[axis]);
+    if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter))
+      return {};
+    auto parameter = queryParameterBySymbol(kernel, extent.getSymbol());
+    if (failed(parameter))
+      return {};
+    auto dimension = (*parameter)->getAttrOfType<IntegerAttr>(coverageDimensionAttr);
+    auto mapping = cast<AxisMapAttr>(payload.getAxisMaps()[axis]);
+    if (!dimension || dimension.getInt() != mapping.getDimensionId())
+      return {};
+    return (*parameter)->getAttrOfType<PhysicalExprAttr>(coverageBoundAttr);
+  };
   unsigned chunkAxis = 0;
   int64_t largest = 0;
+  bool dynamicCoverage = false;
   for (auto [axis, attribute] : llvm::enumerate(payload.getShape())) {
+    auto bound = coverageBound(axis);
+    if (bound && bound.getKind() == static_cast<uint32_t>(PhysicalExprKind::Dimension)) {
+      chunkAxis = axis;
+      dynamicCoverage = true;
+      break;
+    }
     auto extent = cast<PhysicalExprAttr>(attribute);
     if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
         extent.getValue() > largest) {
@@ -498,7 +518,8 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
   }
   auto full = cast<PhysicalExprAttr>(payload.getShape()[chunkAxis]);
   auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
-  if (full.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant))
+  if (!dynamicCoverage &&
+      full.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant))
     return false;
   int64_t footprint = std::max(1u,
       (payload.getElementType().getIntOrFloatBitWidth() + 31) / 32);
@@ -521,7 +542,7 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
         static_cast<__int128>(footprint) * minimum,
         static_cast<__int128>(capabilities.getRegistersPerUnit()) + 1);
   }
-  if (footprint <= capabilities.getRegistersPerUnit())
+  if (!dynamicCoverage && footprint <= capabilities.getRegistersPerUnit())
     return false;
   Operation *definition = source.getDefiningOp();
   if (!definition)
@@ -560,7 +581,8 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
       return false;
     if (analysis.isProgramOwnedRange(range))
       ownedAxes.push_back(axis);
-    else if (!isZero(range.getStart()) || extent != payload.getShape()[axis])
+    else if (!isZero(range.getStart()) ||
+             (extent != payload.getShape()[axis] && extent != coverageBound(axis)))
       return false;
     ranges.push_back(range);
     shape.push_back(extent);
@@ -571,6 +593,8 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
     }
   }
   if (llvm::any_of(ownedAxes, [&](unsigned axis) { return axis >= chunkAxis; }))
+    return false;
+  if (!result && !ownedAxes.empty())
     return false;
   auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
   if (ownedAxes.empty() && !llvm::all_of(space, [](Attribute attribute) {
@@ -634,7 +658,7 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
   OpBuilder builder(insertionAnchor);
   PhysicalExprAttr chunkExtent;
   Value chunk;
-  bool readerChunk = rank == 1 && result.getShape().size() == 1;
+  bool readerChunk = rank == 1 && result && result.getShape().size() == 1;
   if (readerChunk) {
     chunkExtent = cast<PhysicalExprAttr>(result.getShape()[0]);
     if (chunkExtent == full)
@@ -698,14 +722,14 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
     return failure();
   for (GatherOp reader : readers) {
     builder.setInsertionPoint(reader);
-    auto result = cast<FragmentType>(reader.getResult().getType());
-    auto indexType = FragmentType::get(result.getContext(), builder.getIndexType(),
-        result.getShape(), result.getAxisMaps(), result.getValidity(), result.getOwner());
-    auto predicate = FragmentType::get(result.getContext(), builder.getI1Type(),
-        result.getShape(), result.getAxisMaps(), result.getValidity(), result.getOwner());
+    auto result = dyn_cast<FragmentType>(reader.getResult().getType());
     SmallVector<Value> coordinates(reader.getCoordinates());
     Value valid = reader.getValid();
     for (unsigned axis : ownedAxes) {
+      auto indexType = FragmentType::get(result.getContext(), builder.getIndexType(),
+          result.getShape(), result.getAxisMaps(), result.getValidity(), result.getOwner());
+      auto predicate = FragmentType::get(result.getContext(), builder.getI1Type(),
+          result.getShape(), result.getAxisMaps(), result.getValidity(), result.getOwner());
       unsigned position = llvm::find(reader.getSourceAxes(), axis) - reader.getSourceAxes().begin();
       auto ordinal = ordinalRange(reader.getCoordinates()[position]);
       auto identity = builder.getArrayAttr({ReshapeGroupAttr::get(
@@ -725,10 +749,15 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
     }
     Value fill = reader.getFill();
     if (valid && !fill) {
-      auto zero = materializeZeroFragment(builder, reader.getLoc(), result);
-      if (failed(zero))
-        return failure();
-      fill = *zero;
+      if (result) {
+        auto zero = materializeZeroFragment(builder, reader.getLoc(), result);
+        if (failed(zero))
+          return failure();
+        fill = *zero;
+      } else {
+        fill = builder.create<arith::ConstantOp>(reader.getLoc(),
+            builder.getZeroAttr(reader.getResult().getType()));
+      }
     }
     auto load = builder.create<LoadOp>(reader.getLoc(), reader.getResult().getType(),
         workspace, coordinates, valid, fill,
