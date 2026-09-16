@@ -1196,19 +1196,37 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
     if (failed(authority))
       return false;
     for (MakeRangeOp root : fact.roots) {
-      if (!isZero(root.getStart()) || !isZero(root.getLogicalStart()) ||
+      if (!samePhysicalScalarExpression(root.getStart(),
+                                         root.getLogicalStart()) ||
           !isUnitStepRange(root))
         return false;
+      auto count = constantLogicalRangeCardinality(root);
+      auto physical =
+          cast<PhysicalExprAttr>(root.getResult().getType().getShape()[0]);
+      bool covered = count &&
+                     physical.getKind() ==
+                         static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                     physical.getValue() >= *count;
       auto realization = analysis.axisRealization(root.getResult(), 0);
-      if (!realization.constructionScalarSeed &&
-          !samePhysicalScalarExpression(root.getExtent(), root.getLogicalStop()))
+      if (!covered &&
+          (!isZero(root.getLogicalStart()) ||
+           (!realization.constructionScalarSeed &&
+            !samePhysicalScalarExpression(root.getExtent(),
+                                           root.getLogicalStop()))))
         return false;
     }
     MakeRangeOp range = *authority;
-    PhysicalExprAttr extent = queryLaunchExpression(range.getLogicalStop());
+    auto count = constantLogicalRangeCardinality(range);
+    PhysicalExprAttr extent =
+        count ? PhysicalExprAttr::get(
+                    reshape.getContext(),
+                    static_cast<uint32_t>(PhysicalExprKind::Constant), *count,
+                    StringAttr::get(reshape.getContext(), ""),
+                    ArrayAttr::get(reshape.getContext(), {}))
+              : queryLaunchExpression(range.getLogicalStop());
     if (!extent)
       return false;
-    if (!queryNonNegativeIndexUpperBound(range.getLogicalStop())) {
+    if (!count && !queryNonNegativeIndexUpperBound(range.getLogicalStop())) {
       auto zero = PhysicalExprAttr::get(
           reshape.getContext(), static_cast<uint32_t>(PhysicalExprKind::Constant),
           0, StringAttr::get(reshape.getContext(), ""), ArrayAttr::get(reshape.getContext(), {}));
@@ -1374,13 +1392,20 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
       Value coordinate = ordinal;
       if (position != 0) {
         Value divisor = builder.create<BinaryOp>(
-            reshape.getLoc(), builder.getIndexType(), range.getLogicalStop(), one,
+            reshape.getLoc(), builder.getIndexType(),
+            materializeExtent(cast<PhysicalExprAttr>(sourceExtents[axis])), one,
             BinaryOperator::Maximum);
         Value extent = builder.create<SplatOp>(reshape.getLoc(), indexType, divisor);
         coordinate = builder.create<BinaryOp>(
             reshape.getLoc(), indexType, ordinal, extent, BinaryOperator::Remainder);
         ordinal = builder.create<BinaryOp>(
             reshape.getLoc(), indexType, ordinal, extent, BinaryOperator::FloorDivide);
+      }
+      if (!isZero(range.getLogicalStart())) {
+        Value start = builder.create<SplatOp>(
+            reshape.getLoc(), indexType, range.getLogicalStart());
+        coordinate = builder.create<BinaryOp>(
+            reshape.getLoc(), indexType, start, coordinate, BinaryOperator::Add);
       }
       sourceCoordinates[axis] = coordinate;
       for (MakeRangeOp root : sourceRoots[axis])
@@ -1404,12 +1429,13 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
   auto predicate = FragmentType::get(
       result.getContext(), builder.getI1Type(), result.getShape(), result.getAxisMaps(),
       result.getValidity(), result.getOwner());
-  Value lower = builder.create<SplatOp>(reshape.getLoc(), indexType, zero);
   Value active = *valid;
   for (unsigned axis = 0; axis < sourceRank; ++axis) {
     if (preservedSource[axis])
       continue;
     Value coordinate = sourceCoordinates[axis];
+    Value lower = builder.create<SplatOp>(
+        reshape.getLoc(), indexType, sourceRanges[axis].getLogicalStart());
     Value end = builder.create<SplatOp>(
         reshape.getLoc(), indexType, sourceRanges[axis].getLogicalStop());
     Value nonNegative = builder.create<CompareOp>(
