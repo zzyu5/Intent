@@ -2114,6 +2114,10 @@ void selectContractForms(func::FuncOp kernel) {
   kernel.walk([&](gpu::ContractOp contract) { contracts.push_back(contract); });
   for (gpu::ContractOp contract : contracts) {
     auto lhs = contract.getLhs().getType();
+    auto rhs = contract.getRhs().getType();
+    bool ieeeFp32 = lhs.getElementType().isF32() &&
+                    rhs.getElementType().isF32() &&
+                    contract.getResult().getType().getElementType().isF32();
     if (lhs.getShape().empty())
       continue;
     auto reductionExtent =
@@ -2123,13 +2127,16 @@ void selectContractForms(func::FuncOp kernel) {
       continue;
     if (reductionExtent.getKind() ==
         static_cast<uint32_t>(gpu::PhysicalExprKind::Constant)) {
-      if (reductionExtent.getValue() < 16)
+      if (reductionExtent.getValue() < 16) {
         contract->setAttr(contractFormAttr,
                           StringAttr::get(kernel.getContext(), "multiply_sum"));
-      continue;
+        continue;
+      }
+      if (!ieeeFp32)
+        continue;
     }
-    // Free-axis widths are native layout choices. Only a reduction extent
-    // below the provider's dot minimum needs the pointwise expansion.
+    // IEEE dot layout conversion can stage its operands in shared memory.
+    // Preserve the explicit FMA form when that footprint exceeds capacity.
     OpBuilder builder(contract);
     Value extent = builder.create<gpu::PhysicalExprOp>(
         contract.getLoc(), builder.getIndexType(), reductionExtent);
@@ -2137,6 +2144,28 @@ void selectContractForms(func::FuncOp kernel) {
     Value small = builder.create<gpu::CompareOp>(
         contract.getLoc(), builder.getI1Type(), extent, minimum,
         ComparePredicate::Lt);
+    if (ieeeFp32) {
+      Value footprint = builder.create<arith::ConstantIndexOp>(contract.getLoc(), 0);
+      for (auto operand : {lhs, rhs}) {
+        Value bytes = builder.create<arith::ConstantIndexOp>(contract.getLoc(), 4);
+        for (Attribute dimension : operand.getShape()) {
+          Value width = builder.create<gpu::PhysicalExprOp>(
+              contract.getLoc(), builder.getIndexType(),
+              cast<gpu::PhysicalExprAttr>(dimension));
+          bytes = builder.create<gpu::BinaryOp>(contract.getLoc(),
+              builder.getIndexType(), bytes, width, BinaryOperator::Multiply);
+        }
+        footprint = builder.create<gpu::BinaryOp>(contract.getLoc(),
+            builder.getIndexType(), footprint, bytes, BinaryOperator::Add);
+      }
+      auto capabilities = kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+      Value capacity = builder.create<arith::ConstantIndexOp>(
+          contract.getLoc(), capabilities.getMaxDynamicSharedMemoryPerBlock());
+      Value oversized = builder.create<gpu::CompareOp>(contract.getLoc(),
+          builder.getI1Type(), footprint, capacity, ComparePredicate::Gt);
+      small = builder.create<gpu::BinaryOp>(contract.getLoc(), builder.getI1Type(),
+          small, oversized, BinaryOperator::LogicalOr);
+    }
     auto choice = builder.create<scf::IfOp>(
         contract.getLoc(), TypeRange{contract.getResult().getType()}, small, true);
     builder.setInsertionPointToStart(&choice.getThenRegion().front());
