@@ -2111,6 +2111,7 @@ LogicalResult legalizeContractShapes(func::FuncOp kernel) {
 }
 
 void selectContractForms(func::FuncOp kernel) {
+  kernel.getContext()->getOrLoadDialect<cf::ControlFlowDialect>();
   SmallVector<gpu::ContractOp> contracts;
   kernel.walk([&](gpu::ContractOp contract) { contracts.push_back(contract); });
   for (gpu::ContractOp contract : contracts) {
@@ -2126,9 +2127,26 @@ void selectContractForms(func::FuncOp kernel) {
             lhs.getShape()[lhs.getShape().size() - 1]);
     if (!reductionExtent)
       continue;
+    OpBuilder builder(contract);
+    auto expandedFits = [&]() -> Value {
+      auto elements = reductionExtent;
+      for (Attribute dimension : contract.getAccumulator().getType().getShape())
+        elements = gpu::PhysicalExprAttr::get(
+            kernel.getContext(),
+            static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
+            builder.getStringAttr(""), builder.getArrayAttr({elements, dimension}));
+      Value count = builder.create<gpu::PhysicalExprOp>(
+          contract.getLoc(), builder.getIndexType(), elements);
+      Value maximum = builder.create<arith::ConstantIndexOp>(
+          contract.getLoc(), maxTritonTensorElements);
+      return builder.create<gpu::CompareOp>(contract.getLoc(), builder.getI1Type(),
+                                           count, maximum, ComparePredicate::Le);
+    };
     if (reductionExtent.getKind() ==
         static_cast<uint32_t>(gpu::PhysicalExprKind::Constant)) {
       if (reductionExtent.getValue() < 16) {
+        builder.create<cf::AssertOp>(contract.getLoc(), expandedFits(),
+            "Triton expanded contraction exceeds the maximum element count");
         contract->setAttr(contractFormAttr,
                           StringAttr::get(kernel.getContext(), "multiply_sum"));
         continue;
@@ -2136,9 +2154,9 @@ void selectContractForms(func::FuncOp kernel) {
       if (!ieeeFp32)
         continue;
     }
-    // IEEE dot layout conversion can stage its operands in shared memory.
-    // Preserve the explicit FMA form when that footprint exceeds capacity.
-    OpBuilder builder(contract);
+    // Prefer a legal expansion when IEEE dot's estimated staging is too large.
+    // The provider still validates the native form's actual resource usage.
+    Value canExpand = expandedFits();
     Value extent = builder.create<gpu::PhysicalExprOp>(
         contract.getLoc(), builder.getIndexType(), reductionExtent);
     Value minimum = builder.create<arith::ConstantIndexOp>(contract.getLoc(), 16);
@@ -2164,12 +2182,16 @@ void selectContractForms(func::FuncOp kernel) {
           contract.getLoc(), capabilities.getMaxDynamicSharedMemoryPerBlock());
       Value oversized = builder.create<gpu::CompareOp>(contract.getLoc(),
           builder.getI1Type(), footprint, capacity, ComparePredicate::Gt);
+      oversized = builder.create<gpu::BinaryOp>(contract.getLoc(),
+          builder.getI1Type(), oversized, canExpand, BinaryOperator::LogicalAnd);
       small = builder.create<gpu::BinaryOp>(contract.getLoc(), builder.getI1Type(),
           small, oversized, BinaryOperator::LogicalOr);
     }
     auto choice = builder.create<scf::IfOp>(
         contract.getLoc(), TypeRange{contract.getResult().getType()}, small, true);
     builder.setInsertionPointToStart(&choice.getThenRegion().front());
+    builder.create<cf::AssertOp>(contract.getLoc(), canExpand,
+        "Triton expanded contraction exceeds the maximum element count");
     auto expanded = cast<gpu::ContractOp>(builder.clone(*contract));
     expanded->setAttr(contractFormAttr,
                       StringAttr::get(kernel.getContext(), "multiply_sum"));

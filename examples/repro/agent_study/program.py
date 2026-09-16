@@ -86,15 +86,22 @@ class TuningBudget:
                         return function(*args, **kwargs)
                 return super().submit(compile_with_policy)
 
+        def prepare_kernel(compiled):
+            # Run Triton's resource checks in the caller's CUDA device context.
+            # Loading the compiled module does not execute the kernel.
+            compiled._init_handles()
+            return compiled
+
         def compile_kernel(kernel, *args, **kwargs):
             kwargs["warmup"] = True
             try:
                 compiled = original_jit(kernel, *args, **kwargs)
                 if isinstance(compiled, triton.FutureKernel):
                     if not autotuning:
-                        return compiled.result()
+                        return prepare_kernel(compiled.result())
                     future_names[compiled] = kernel.__name__
-                return compiled
+                    return compiled
+                return prepare_kernel(compiled)
             except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as error:
                 if not autotuning:
                     raise
@@ -121,7 +128,7 @@ class TuningBudget:
                 for kernel in compiled:
                     if isinstance(kernel, triton.FutureKernel):
                         try:
-                            resolved.append(kernel.result())
+                            resolved.append(prepare_kernel(kernel.result()))
                         except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as error:
                             self.precompile_failures.append({"kernel": future_names[kernel], "error": str(error)})
                     elif kernel is not None:
@@ -130,7 +137,7 @@ class TuningBudget:
                 # artifact interface. All candidate failures were inspected.
                 if resolved:
                     return resolved[0]
-                raise RuntimeError("no bounded autotune configuration compiled successfully")
+                raise RuntimeError("no bounded autotune configuration is executable on the current device")
             finally:
                 autotuning -= 1
 
