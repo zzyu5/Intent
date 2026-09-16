@@ -2837,6 +2837,11 @@ static LogicalResult refreshReshapeRelation(ReshapeOp reshape) {
     unsigned resultPrefix = target.getShape().size() - logicalResultRank;
     SmallVector<Attribute> resultShape(target.getShape().begin(),
                                        target.getShape().end());
+    if (sourcePrefix == resultPrefix &&
+        llvm::equal(source.getAxisMaps().getValue().take_front(sourcePrefix),
+                    target.getAxisMaps().getValue().take_front(resultPrefix)))
+      llvm::copy(source.getShape().getValue().take_front(sourcePrefix),
+                 resultShape.begin());
     for (Attribute attribute : reshape.getReassociation()) {
       auto group = cast<ReshapeGroupAttr>(attribute);
       ArrayRef<int64_t> sourceAxes = group.getSourceAxes().asArrayRef();

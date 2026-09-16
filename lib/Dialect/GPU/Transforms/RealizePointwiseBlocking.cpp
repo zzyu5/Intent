@@ -3015,13 +3015,32 @@ bool supportsCartesianPointwiseValueGraph(
 /// independent. Read-only ordered loops may carry the free axis without
 /// changing their scalar bounds. Paired/batched dependence and non-store
 /// effects remain excluded.
-bool supportsStructuredFreeAxisValueGraph(WorksetCoordinateOp coordinate) {
-  llvm::SmallDenseSet<Value> dependent{coordinate.getResult()};
-  SmallVector<Value> worklist{coordinate.getResult()};
+bool supportsStructuredFreeAxisValueGraph(
+    ArrayRef<WorksetCoordinateOp> coordinates,
+    llvm::SmallPtrSetImpl<Operation *> *ownedStores = nullptr) {
+  if (coordinates.size() > 1) {
+    llvm::SmallPtrSet<Operation *, 4> stores;
+    for (auto [index, coordinate] : llvm::enumerate(coordinates)) {
+      llvm::SmallPtrSet<Operation *, 4> currentStores;
+      if (!supportsStructuredFreeAxisValueGraph({coordinate}, &currentStores))
+        return false;
+      if (index == 0)
+        stores.insert(currentStores.begin(), currentStores.end());
+      else if (stores.size() != currentStores.size() ||
+               !llvm::all_of(stores, [&](Operation *store) {
+                 return currentStores.contains(store);
+               }))
+        return false;
+    }
+  }
+  llvm::SmallDenseSet<Value> dependent;
+  SmallVector<Value> worklist;
   auto enqueue = [&](Value value) {
     if (dependent.insert(value).second)
       worklist.push_back(value);
   };
+  for (WorksetCoordinateOp coordinate : coordinates)
+    enqueue(coordinate.getResult());
   llvm::SmallPtrSet<Operation *, 32> visited;
   llvm::SmallPtrSet<Operation *, 8> loops;
   SmallVector<Operation *> operations;
@@ -3113,6 +3132,8 @@ bool supportsStructuredFreeAxisValueGraph(WorksetCoordinateOp coordinate) {
       if (!ownedCoordinate || !depends(store.getValue()))
         return false;
       sawOwnedStore = true;
+      if (ownedStores)
+        ownedStores->insert(store.getOperation());
     }
   }
   return (sawContract || sawReduction) && sawOwnedStore &&
@@ -3834,12 +3855,13 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         SmallVector<WorksetCoordinateOp> candidates{
             uncovered[uncovered.size() - 2].second,
             uncovered.back().second};
-        if (supportsCartesianPointwiseValueGraph(candidates))
+        if (supportsCartesianPointwiseValueGraph(candidates) ||
+            supportsStructuredFreeAxisValueGraph(candidates))
           lifted = std::move(candidates);
       }
       if (lifted.empty())
         for (auto [_, coordinate] : llvm::reverse(uncovered))
-          if (supportsStructuredFreeAxisValueGraph(coordinate) ||
+          if (supportsStructuredFreeAxisValueGraph({coordinate}) ||
               supportsCartesianPointwiseValueGraph({coordinate}, true)) {
             lifted.push_back(coordinate);
             break;
