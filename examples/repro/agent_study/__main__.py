@@ -62,8 +62,11 @@ def run_benchmark(arguments, task, program, language, result_path, *, artifacts=
                 if queued_at is not None:
                     active_seconds -= now - queued_at
                 if active_seconds > arguments.suite["benchmark_seconds"]:
+                    log.seek(0)
+                    diagnostic = log.read()[-6000:]
                     return {"status": "benchmark_timeout", "failure_stage": stage,
-                            "error": "preparation/execution exceeded the benchmark limit, excluding GPU queue time"}
+                            "error": "preparation/execution exceeded the benchmark limit, excluding GPU queue time"
+                                     + ("\n" + diagnostic if diagnostic else "")}
         finally:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
