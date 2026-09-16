@@ -50,6 +50,12 @@ LogicalResult TaskYieldOp::verify() {
   return success();
 }
 
+void ReduceOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  for (OpOperand &operand : getOperation()->getOpOperands())
+    if (isa<MemRefType>(operand.get().getType()))
+      effects.emplace_back(MemoryEffects::Read::get(), &operand);
+}
+
 LogicalResult ReduceOp::verify() {
   if (getInitial().getType() != getResult().getType() || getInputs().empty() ||
       getIndexingMaps().size() != getInputs().size() ||

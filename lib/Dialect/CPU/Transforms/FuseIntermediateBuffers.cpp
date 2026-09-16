@@ -21,10 +21,31 @@ void forwardDestinations(func::FuncOp function) {
   SmallVector<memref::CopyOp> copies;
   function.walk([&](memref::CopyOp copy) { copies.push_back(copy); });
   for (memref::CopyOp copy : copies) {
-    auto allocation = copy.getSource().getDefiningOp<memref::AllocOp>();
+    Value source = copy.getSource();
+    Operation *reshape = source.getDefiningOp();
+    if (unitReshapeAxes(reshape)) {
+      if (!source.hasOneUse() || reshape->getBlock() != copy->getBlock()) continue;
+      source = reshape->getOperand(0);
+    } else reshape = nullptr;
+    auto allocation = source.getDefiningOp<memref::AllocOp>();
     if (!allocation || allocation->getBlock() != copy->getBlock()) continue;
     Value target = copy.getTarget();
-    if (allocation.getType().getRank() != copy.getTarget().getType().getRank()) continue;
+    MemRefType replacementType = cast<MemRefType>(copy.getTarget().getType());
+    SmallVector<ReassociationIndices> reassociation;
+    if (auto collapse = dyn_cast_or_null<memref::CollapseShapeOp>(reshape)) {
+      reassociation = collapse.getReassociationIndices();
+      auto expanded = memref::ExpandShapeOp::computeExpandedType(
+          replacementType, allocation.getType().getShape(), reassociation);
+      if (failed(expanded)) continue;
+      replacementType = *expanded;
+    } else if (auto expand = dyn_cast_or_null<memref::ExpandShapeOp>(reshape)) {
+      reassociation = expand.getReassociationIndices();
+      if (!memref::CollapseShapeOp::isGuaranteedCollapsible(replacementType, reassociation)) continue;
+      replacementType = memref::CollapseShapeOp::computeCollapsedType(replacementType, reassociation);
+    }
+    if (allocation.getType().getRank() != replacementType.getRank()) continue;
+    if (reshape && (replacementType.getShape() != allocation.getType().getShape() ||
+                    replacementType.getMemorySpace() != allocation.getType().getMemorySpace())) continue;
     PhysicalProgramAnalysis analysis(function);
     AliasAnalysis aliasAnalysis(function);
     Value targetRoot = analysis.storageRoot(target);
@@ -53,11 +74,16 @@ void forwardDestinations(func::FuncOp function) {
     SmallVector<Value> aliases{allocation.getResult()};
     for (unsigned i = 0; i < aliases.size(); ++i) {
       for (Operation *user : aliases[i].getUsers()) {
+        if (user == reshape) continue;
         if (auto dealloc = dyn_cast<memref::DeallocOp>(user)) {
           if (aliases[i] != allocation.getResult()) legal = false;
           else deallocations.push_back(dealloc);
           continue;
         }
+        // Existing derived views encode the private allocation's layout. Keep
+        // them only when the inverse output view has exactly that same type.
+        if (reshape && replacementType != allocation.getType() &&
+            isa<memref::SubViewOp, memref::CastOp>(user)) { legal = false; continue; }
         if (auto view = dyn_cast<memref::SubViewOp>(user)) aliases.push_back(view.getResult());
         else if (auto cast = dyn_cast<memref::CastOp>(user)) aliases.push_back(cast.getResult());
         else if (!isa<memref::CopyOp, memref::DimOp, memref::LoadOp, memref::StoreOp,
@@ -93,9 +119,26 @@ void forwardDestinations(func::FuncOp function) {
     }
     if (!legal) continue;
     if (targetOp && !dominance.dominates(targetOp, allocation)) targetOp->moveBefore(allocation);
+    if (reshape) {
+      OpBuilder builder(allocation);
+      if (isa<memref::CollapseShapeOp>(reshape)) {
+        SmallVector<OpFoldResult> shape;
+        unsigned dynamicAxis = 0;
+        for (int64_t size : allocation.getType().getShape())
+          shape.push_back(ShapedType::isDynamic(size)
+              ? OpFoldResult(allocation.getDynamicSizes()[dynamicAxis++])
+              : OpFoldResult(builder.getIndexAttr(size)));
+        target = builder.create<memref::ExpandShapeOp>(allocation.getLoc(), replacementType,
+            target, reassociation, shape);
+      } else {
+        target = builder.create<memref::CollapseShapeOp>(allocation.getLoc(), replacementType,
+            target, reassociation);
+      }
+    }
     for (memref::DeallocOp dealloc : deallocations) dealloc.erase();
-    allocation.getResult().replaceAllUsesExcept(target, copy);
     copy.erase();
+    if (reshape) reshape->erase();
+    allocation.getResult().replaceAllUsesWith(target);
     allocation.erase();
   }
 }
