@@ -1400,9 +1400,9 @@ private:
       std::string computation = floating.getWidth() < 32
                                     ? "tl.float32" : pythonType(element);
       std::string result =
-          "tl.fdiv(tl.cast(" + valueString(binary.getLhs()) + ", " +
+          "libdevice.div_rn(tl.cast(" + valueString(binary.getLhs()) + ", " +
           computation + "), tl.cast(" + valueString(binary.getRhs()) + ", " +
-          computation + "), ieee_rounding=True)";
+          computation + "))";
       return floating.getWidth() < 32
                  ? "tl.cast(" + result + ", " + pythonType(element) + ")"
                  : result;
@@ -1491,7 +1491,7 @@ private:
     case UnaryOperator::Abs:
       return "tl.abs(" + input + ")";
     case UnaryOperator::Sqrt:
-      return libraryCall("libdevice.sqrt");
+      return libraryCall("libdevice.sqrt_rn");
     default:
       failed = true;
       return "<unsupported-unary>";
