@@ -6023,8 +6023,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       if (auto broadcast = copied.getDefiningOp<BroadcastOp>()) {
         auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
         auto target = cast<FragmentType>(broadcast.getResult().getType());
-        if (source && source.getShape() == target.getShape() &&
-            source.getAxisMaps() == target.getAxisMaps()) {
+        if (source && source.getShape().size() == target.getShape().size() &&
+            queryAxisProjection(source, target).isExact()) {
           copied = broadcast.getValue();
           continue;
         }
