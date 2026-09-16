@@ -1635,7 +1635,8 @@ LogicalResult cloneLiftedCombineRegion(Region &source, Region &target,
   for (auto [original, replacement] :
        llvm::zip(sourceBlock.getArguments(), targetBlock->getArguments()))
     mapping.map(original, replacement);
-  OpBuilder builder(targetBlock, targetBlock->end());
+  OpBuilder builder(source.getContext());
+  builder.setInsertionPointToEnd(targetBlock);
 
   auto mappedOperands = [&](Operation &operation) {
     SmallVector<Value> values;
@@ -1776,25 +1777,6 @@ FragmentType eraseFragmentAxes(FragmentType source,
                            ArrayAttr::get(source.getContext(), shape),
                            ArrayAttr::get(source.getContext(), mappings),
                            source.getValidity(), source.getOwner());
-}
-
-bool isSingleComponentAddReduce(ReduceOp reduce) {
-  if (reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 ||
-      reduce.getCaptureCount() != 0 || reduce.getCombine().empty() ||
-      reduce.getCombine().getBlocks().size() != 1)
-    return false;
-  Block &block = reduce.getCombine().front();
-  if (block.getNumArguments() != 2)
-    return false;
-  auto yield = dyn_cast<YieldOp>(block.getTerminator());
-  if (!yield || yield.getValues().size() != 1)
-    return false;
-  auto combine = yield.getValues().front().getDefiningOp<BinaryOp>();
-  return combine && combine->getBlock() == &block &&
-         combine.getOperatorKind() == BinaryOperator::Add &&
-         combine.getLhs() == block.getArgument(0) &&
-         combine.getRhs() == block.getArgument(1) &&
-         std::distance(block.begin(), block.end()) == 2;
 }
 
 FailureOr<bool> decomposeFullCoverageMultiAxisReduce(
@@ -2649,15 +2631,6 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
       reduce.getContext(), PhysicalExprKind::Parameter, 0,
       chunk.getParameter().getName().getValue());
 
-  Type accumulatorElement = reduce.getResult(0).getType();
-  if (auto fragment = dyn_cast<FragmentType>(accumulatorElement))
-    accumulatorElement = fragment.getElementType();
-  auto scalarIdentity = scalarSource(reduce.getInputs()[reduce.getSourceCount()]);
-  const bool vectorAccumulation =
-      isSingleComponentAddReduce(reduce) &&
-      isa<IntegerType, FloatType>(firstSource.getElementType()) &&
-      firstSource.getElementType() == accumulatorElement &&
-      succeeded(scalarIdentity) && (*scalarIdentity).getType() == accumulatorElement;
   SmallVector<FragmentType> blockedSourceTypes;
   for (const SourcePlan &plan : sourcePlans) {
     auto originalSource = cast<FragmentType>(plan.source.getType());
@@ -2677,6 +2650,25 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
           .end());
   ValueRange captures = reduce.getInputs().drop_front(
       reduce.getSourceCount() + reduce.getIdentityCount());
+
+  Region vectorCombine;
+  bool vectorAccumulation = llvm::all_of(captures, [](Value capture) {
+    return isa<IntegerType, FloatType, IndexType>(capture.getType());
+  }) && llvm::all_of(llvm::enumerate(blockedSourceTypes), [&](auto component) {
+    FragmentType type = component.value();
+    Type element = type.getElementType();
+    auto identity = scalarSource(identities[component.index()]);
+    return isa<IntegerType, FloatType, IndexType>(element) &&
+           succeeded(identity) && (*identity).getType() == element &&
+           dataElementType(reduce.getResult(component.index()).getType()) == element &&
+           sameExecutionSchema(type, blockedSourceTypes.front());
+  });
+  if (vectorAccumulation) {
+    SmallVector<Type> accumulatorTypes(blockedSourceTypes.begin(), blockedSourceTypes.end());
+    std::string reason;
+    vectorAccumulation = succeeded(cloneLiftedCombineRegion(
+        reduce.getCombine(), vectorCombine, accumulatorTypes, reason));
+  }
 
   SmallVector<Value> loopInitials(identities);
   if (vectorAccumulation) {
@@ -3017,10 +3009,16 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
           return;
 
         if (vectorAccumulation) {
-          Value combined = nested.create<BinaryOp>(
-              nestedLocation, blockedSourceTypes.front(), carries.front(),
-              blockedSources.front(), BinaryOperator::Add);
-          nested.create<scf::YieldOp>(nestedLocation, combined);
+          SmallVector<Value> combineArguments(carries.begin(), carries.end());
+          llvm::append_range(combineArguments, blockedSources);
+          llvm::append_range(combineArguments, captures);
+          auto combined = inlinePureRegion(
+              nested, vectorCombine, combineArguments, bodyFailure);
+          if (failed(combined)) {
+            bodyFailed = true;
+            return;
+          }
+          nested.create<scf::YieldOp>(nestedLocation, *combined);
           return;
         }
 
@@ -3071,6 +3069,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
   if (vectorAccumulation) {
     SmallVector<Value> finalInputs(realizedResults);
     finalInputs.append(identities.begin(), identities.end());
+    finalInputs.append(captures.begin(), captures.end());
     OperationState state(location, ReduceOp::getOperationName());
     state.addOperands(finalInputs);
     state.addTypes(reduce.getResultTypes());
