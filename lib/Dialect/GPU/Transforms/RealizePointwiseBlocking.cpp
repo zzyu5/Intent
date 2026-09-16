@@ -4321,6 +4321,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           if (!dependency.isExact() || !dependency.depends ||
               dependency.throughStructuredReduction)
             continue;
+          reductionCaptureWritebackRanges.insert(range.getOperation());
         }
       }
       candidates.emplace_back(range, *sourceAxis);
@@ -5409,7 +5410,16 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       if (llvm::any_of(reductionCaptureWritebackRanges,
                        [&](Operation *operation) {
                          auto captured = cast<MakeRangeOp>(operation);
-                         return sameLogicalRange(range, captured) &&
+                         MakeRangeOp occurrence =
+                             occurrenceRoots.lookup(range.getOperation());
+                         bool sameOccurrence =
+                             occurrence &&
+                             occurrence == occurrenceRoots.lookup(
+                                               captured.getOperation()) &&
+                             positionalOccurrences.contains(range.getOperation()) &&
+                             positionalOccurrences.contains(captured.getOperation());
+                         return (sameLogicalRange(range, captured) ||
+                                 sameOccurrence) &&
                                 PhysicalProgramAnalysis(kernel)
                                     .lockstepRanges({range, captured})
                                     .isExact();

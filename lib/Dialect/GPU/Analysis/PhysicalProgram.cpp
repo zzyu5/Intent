@@ -4207,10 +4207,69 @@ PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
         return exact;
       }
       unsigned index = result.getResultNumber();
+      auto carryFeedsReduction = [&](unsigned carryAxis) {
+        SmallVector<std::pair<Value, unsigned>> pending{
+            {loop.getRegionIterArgs()[index], carryAxis}};
+        llvm::DenseMap<Value, SmallVector<unsigned, 2>> reached;
+        for (unsigned cursor = 0; cursor < pending.size(); ++cursor) {
+          auto [carried, axis] = pending[cursor];
+          auto &axes = reached[carried];
+          if (llvm::is_contained(axes, axis))
+            continue;
+          axes.push_back(axis);
+          auto input = cast<FragmentType>(carried.getType());
+          for (OpOperand &use : carried.getUses()) {
+            Operation *user = use.getOwner();
+            if (!loop->isProperAncestor(user))
+              continue;
+            if (auto reduce = dyn_cast<ReduceOp>(user)) {
+              if (use.getOperandNumber() < reduce.getSourceCount() &&
+                  llvm::is_contained(reduce.getAxes(), static_cast<int64_t>(axis)))
+                return true;
+              continue;
+            }
+            if (user->getNumResults() != 1)
+              continue;
+            auto output = dyn_cast<FragmentType>(user->getResult(0).getType());
+            if (!output)
+              continue;
+            if (auto reshape = dyn_cast<ReshapeOp>(user)) {
+              bool positional = input.getShape() == output.getShape() &&
+                  llvm::all_of(reshape.getReassociation(), [](Attribute attribute) {
+                    auto group = cast<ReshapeGroupAttr>(attribute);
+                    return group.getSourceAxes() == group.getResultAxes();
+                  });
+              if (positional)
+                pending.emplace_back(user->getResult(0), axis);
+            } else if (auto transpose = dyn_cast<TransposeOp>(user)) {
+              for (auto [targetAxis, sourceAxis] :
+                   llvm::enumerate(transpose.getPermutation()))
+                if (sourceAxis == static_cast<int64_t>(axis))
+                  pending.emplace_back(user->getResult(0), targetAxis);
+            } else if (isa<BroadcastOp, UnaryOp, BinaryOp, CompareOp, SelectOp,
+                           CastOp, BitcastOp>(user)) {
+              auto projection = queryBroadcastProjection(input, output);
+              if (projection.isExact())
+                for (auto [targetAxis, sourceAxis] :
+                     llvm::enumerate(projection.targetToSource))
+                  if (sourceAxis && *sourceAxis == axis)
+                    pending.emplace_back(user->getResult(0), targetAxis);
+            }
+          }
+        }
+        return false;
+      };
       SmallVector<Traversal, 4> loopTraversals{context};
       for (const auto &projection : queryFragmentAxes(current.getType(), source)) {
         if (sourceDimension && projection.dimensionId != *sourceDimension)
           continue;
+        // A loop carry can be rebound to another operand's positional axes
+        // before it is reduced. Its output coordinate roots alone do not
+        // expose that recurrence; follow the carry's exact pointwise uses.
+        if (carryFeedsReduction(projection.fragmentAxis)) {
+          exact.depends = true;
+          return exact;
+        }
         auto ranges = axisRanges(current, projection.fragmentAxis);
         if (!ranges.isExact() || !ranges.blockers.empty()) {
           exact.state = PhysicalFactState::Unknown;
