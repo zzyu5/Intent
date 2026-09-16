@@ -2347,7 +2347,8 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
         broadcast.emitOpError(
             projection.state == BroadcastProjectionState::Ambiguous
                 ? "broadcast has an ambiguous physical source projection"
-                : "broadcast has no physical source projection");
+                : "broadcast has no physical source projection")
+            << "; input=" << source << "; result=" << target;
         return WalkResult::interrupt();
       }
       // A non-singleton BroadcastOp is an explicit extent-preserving value

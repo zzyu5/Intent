@@ -238,12 +238,12 @@ bool carriesLogicalDimensions(gpu::FragmentType fragment,
   return true;
 }
 
-FailureOr<Value> projectAccumulatorIdentity(OpBuilder &builder, Location location,
-                                            Value identity, Type accumulator) {
-  if (identity.getType() == accumulator)
+FailureOr<Value> projectPositionalValue(OpBuilder &builder, Location location,
+                                       Value identity, Type targetType) {
+  if (identity.getType() == targetType)
     return identity;
   auto source = dyn_cast<gpu::FragmentType>(identity.getType());
-  auto target = dyn_cast<gpu::FragmentType>(accumulator);
+  auto target = dyn_cast<gpu::FragmentType>(targetType);
   if (source && target && source.getElementType() == target.getElementType() &&
       source.getShape() == target.getShape() &&
       source.getOwner() == target.getOwner() &&
@@ -257,7 +257,7 @@ FailureOr<Value> projectAccumulatorIdentity(OpBuilder &builder, Location locatio
         location, target, identity, builder.getArrayAttr(groups)));
   }
   return gpu::projectPhysicalValueToSchema(builder, location, identity,
-                                           accumulator);
+                                           targetType);
 }
 
 LogicalResult alignElementwiseOperands(OpBuilder &builder, Location location,
@@ -1594,7 +1594,7 @@ private:
       if (yielded->size() != resultTypes.size())
         return failure();
       for (auto [index, type] : llvm::enumerate(resultTypes)) {
-        FailureOr<Value> projected = projectAccumulatorIdentity(
+        FailureOr<Value> projected = projectPositionalValue(
             builder, source.getParentOp()->getLoc(), (*yielded)[index], type);
         if (failed(projected))
           return failure();
@@ -3805,8 +3805,20 @@ private:
       if (auto target = dyn_cast<gpu::FragmentType>((*trueValue).getType())) {
         auto predicate = dyn_cast<gpu::FragmentType>((*condition).getType());
         if (predicate && !samePhysicalShape(predicate, target)) {
-          FailureOr<Value> aligned =
-              retargetBroadcast(builder, location, *condition, target);
+          auto logicalPredicate = dyn_cast<RankedTensorType>(select.getCondition().getType());
+          auto logicalValue = dyn_cast<RankedTensorType>(select.getTrueValue().getType());
+          auto predicateTarget = gpu::FragmentType::get(
+              predicate.getContext(), predicate.getElementType(), target.getShape(),
+              target.getAxisMaps(), target.getValidity(), target.getOwner());
+          // Canonical select operands are already broadcast by logical axis.
+          // Preserve that positional value instead of stripping its broadcast
+          // and matching a reused row coordinate to the wrong matrix axis.
+          bool positional = logicalPredicate && logicalValue &&
+              dimensionIds(logicalPredicate) == dimensionIds(logicalValue) &&
+              predicate.getShape() == target.getShape();
+          FailureOr<Value> aligned = positional
+              ? projectPositionalValue(builder, location, *condition, predicateTarget)
+              : retargetBroadcast(builder, location, *condition, target);
           if (failed(aligned))
             return select.emitOpError(
                        "select predicate cannot adopt the selected physical axes: ")
@@ -3916,7 +3928,7 @@ private:
       }
       for (unsigned index = 0; index < reduce.getIdentityCount(); ++index) {
         unsigned operand = reduce.getSourceCount() + index;
-        FailureOr<Value> identity = projectAccumulatorIdentity(
+        FailureOr<Value> identity = projectPositionalValue(
             builder, location, inputs[operand], results[index]);
         if (failed(identity))
           return reduce.emitOpError(
@@ -3969,7 +3981,7 @@ private:
       }
       for (unsigned index = 0; index < scan.getIdentityCount(); ++index) {
         unsigned operand = scan.getSourceCount() + index;
-        FailureOr<Value> identity = projectAccumulatorIdentity(
+        FailureOr<Value> identity = projectPositionalValue(
             builder, location, inputs[operand], results[index]);
         if (failed(identity))
           return scan.emitOpError(
@@ -4022,7 +4034,7 @@ private:
       }
       for (unsigned index = 0; index < fold.getIdentityCount(); ++index) {
         unsigned operand = fold.getSourceCount() + index;
-        FailureOr<Value> identity = projectAccumulatorIdentity(
+        FailureOr<Value> identity = projectPositionalValue(
             builder, location, inputs[operand], results[index]);
         if (failed(identity))
           return fold.emitOpError(
@@ -4917,7 +4929,7 @@ private:
         if (failed(yielded) || yielded->size() != resultTypes.size())
           return failure();
         for (auto [index, resultType] : llvm::enumerate(resultTypes)) {
-          FailureOr<Value> projected = projectAccumulatorIdentity(
+          FailureOr<Value> projected = projectPositionalValue(
               nested, location, (*yielded)[index], resultType);
           if (failed(projected))
             return failure();
@@ -5065,7 +5077,7 @@ private:
           // identities, but those identities must not replace the source
           // provenance carried across iterations.
           OpBuilder before(yield);
-          FailureOr<Value> aligned = projectAccumulatorIdentity(
+          FailureOr<Value> aligned = projectPositionalValue(
               before, location, yielded, initial.getType());
           if (failed(aligned)) {
             operation->emitOpError(
