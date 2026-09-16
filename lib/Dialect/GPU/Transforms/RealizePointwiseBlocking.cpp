@@ -2910,6 +2910,54 @@ bool analyzeStructuredRegionFold(
   return true;
 }
 
+FailureOr<bool> propagateOrderedCarryDependency(
+    Value value, Operation *user, llvm::function_ref<void(Value)> enqueue,
+    llvm::SmallPtrSetImpl<Operation *> &loops) {
+  if (auto yield = dyn_cast<scf::YieldOp>(user)) {
+    auto loop = dyn_cast<scf::ForOp>(yield->getParentOp());
+    if (!loop)
+      return failure();
+    loops.insert(loop);
+    for (auto [index, operand] : llvm::enumerate(yield.getResults()))
+      if (operand == value) {
+        enqueue(loop.getRegionIterArgs()[index]);
+        enqueue(loop.getResult(index));
+      }
+    return true;
+  }
+  if (auto loop = dyn_cast<scf::ForOp>(user)) {
+    if (value == loop.getLowerBound() || value == loop.getUpperBound() ||
+        value == loop.getStep())
+      return failure();
+    loops.insert(loop);
+    for (auto [index, operand] : llvm::enumerate(loop.getInitArgs()))
+      if (operand == value) {
+        enqueue(loop.getRegionIterArgs()[index]);
+        enqueue(loop.getResult(index));
+      }
+    return true;
+  }
+  return false;
+}
+
+bool hasReadOnlyOrderedBodies(const llvm::SmallPtrSetImpl<Operation *> &loops) {
+  for (Operation *loop : loops) {
+    WalkResult effects = loop->walk([&](Operation *operation) {
+      if (isa<scf::ForOp, ReduceOp>(operation))
+        return WalkResult::advance();
+      if (operation->getNumRegions() != 0)
+        return WalkResult::interrupt();
+      return isa<scf::YieldOp, LoadOp>(operation) ||
+                     isMemoryEffectFree(operation)
+                 ? WalkResult::advance()
+                 : WalkResult::interrupt();
+    });
+    if (effects.wasInterrupted())
+      return false;
+  }
+  return true;
+}
+
 bool supportsCartesianPointwiseValueGraph(
     ArrayRef<WorksetCoordinateOp> coordinates, bool allowOrderedLoops = false) {
   llvm::SmallDenseSet<Value> dependent;
@@ -2927,30 +2975,12 @@ bool supportsCartesianPointwiseValueGraph(
     Value value = worklist.pop_back_val();
     for (Operation *user : value.getUsers()) {
       if (allowOrderedLoops) {
-        if (auto yield = dyn_cast<scf::YieldOp>(user)) {
-          auto loop = dyn_cast<scf::ForOp>(yield->getParentOp());
-          if (!loop)
-            return false;
-          loops.insert(loop);
-          for (auto [index, operand] : llvm::enumerate(yield.getResults()))
-            if (operand == value) {
-              enqueue(loop.getRegionIterArgs()[index]);
-              enqueue(loop.getResult(index));
-            }
+        FailureOr<bool> propagated =
+            propagateOrderedCarryDependency(value, user, enqueue, loops);
+        if (failed(propagated))
+          return false;
+        if (*propagated)
           continue;
-        }
-        if (auto loop = dyn_cast<scf::ForOp>(user)) {
-          if (value == loop.getLowerBound() || value == loop.getUpperBound() ||
-              value == loop.getStep())
-            return false;
-          loops.insert(loop);
-          for (auto [index, operand] : llvm::enumerate(loop.getInitArgs()))
-            if (operand == value) {
-              enqueue(loop.getRegionIterArgs()[index]);
-              enqueue(loop.getResult(index));
-            }
-          continue;
-        }
       }
       if (!visited.insert(user).second)
         continue;
@@ -2973,21 +3003,7 @@ bool supportsCartesianPointwiseValueGraph(
       }
     }
   }
-  for (Operation *loop : loops) {
-    WalkResult effects = loop->walk([&](Operation *operation) {
-      if (isa<scf::ForOp>(operation))
-        return WalkResult::advance();
-      if (operation->getNumRegions() != 0)
-        return WalkResult::interrupt();
-      return isa<scf::YieldOp, LoadOp>(operation) ||
-                     isMemoryEffectFree(operation)
-                 ? WalkResult::advance()
-                 : WalkResult::interrupt();
-    });
-    if (effects.wasInterrupted())
-      return false;
-  }
-  return true;
+  return hasReadOnlyOrderedBodies(loops);
 }
 
 /// A structured free workset axis is still lane-wise: it may flow through
@@ -2996,17 +3012,29 @@ bool supportsCartesianPointwiseValueGraph(
 /// needed to group independent rows/columns while keeping invariant matrix
 /// operands shared by the group.  A region fold may carry the axis through
 /// immutable captures and summaries, but its source traversal remains
-/// independent.  Control flow, paired/batched dependence, and non-store
+/// independent. Read-only ordered loops may carry the free axis without
+/// changing their scalar bounds. Paired/batched dependence and non-store
 /// effects remain excluded.
 bool supportsStructuredFreeAxisValueGraph(WorksetCoordinateOp coordinate) {
   llvm::SmallDenseSet<Value> dependent{coordinate.getResult()};
   SmallVector<Value> worklist{coordinate.getResult()};
+  auto enqueue = [&](Value value) {
+    if (dependent.insert(value).second)
+      worklist.push_back(value);
+  };
   llvm::SmallPtrSet<Operation *, 32> visited;
+  llvm::SmallPtrSet<Operation *, 8> loops;
   SmallVector<Operation *> operations;
   bool sawNestedContract = false;
   while (!worklist.empty()) {
     Value value = worklist.pop_back_val();
     for (Operation *user : value.getUsers()) {
+      FailureOr<bool> propagated =
+          propagateOrderedCarryDependency(value, user, enqueue, loops);
+      if (failed(propagated))
+        return false;
+      if (*propagated)
+        continue;
       if (!visited.insert(user).second)
         continue;
       operations.push_back(user);
@@ -3087,7 +3115,8 @@ bool supportsStructuredFreeAxisValueGraph(WorksetCoordinateOp coordinate) {
       sawOwnedStore = true;
     }
   }
-  return (sawContract || sawReduction) && sawOwnedStore;
+  return (sawContract || sawReduction) && sawOwnedStore &&
+         hasReadOnlyOrderedBodies(loops);
 }
 
 LogicalResult rankLiftPointwiseValueGraph(
