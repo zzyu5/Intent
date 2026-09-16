@@ -1126,6 +1126,24 @@ LogicalResult neutralizeReductionTails(ReduceOp reduce, func::FuncOp kernel) {
     auto type = dyn_cast<FragmentType>(source.getType());
     if (!type || axis >= type.getShape().size())
       continue;
+    if (auto loop = source.getDefiningOp<scf::ForOp>()) {
+      auto traversals = loop->getAttrOfType<ArrayAttr>(reductionSourcesAttr);
+      auto mapping = cast<AxisMapAttr>(type.getAxisMaps()[axis]);
+      auto traversal = PhysicalSourceAttr::get(
+          kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+          mapping.getDerived());
+      unsigned result = cast<OpResult>(source).getResultNumber();
+      // Reduction blocking pads each chunk with its identity before updating
+      // this carry. Its completed lanes no longer share an inner chunk's tail.
+      if (traversals &&
+          llvm::equal(reduce.getInputs().take_front(reduce.getSourceCount()),
+                      loop.getResults()) &&
+          llvm::is_contained(traversals, Attribute(traversal)) &&
+          queryLaunchExpression(loop.getStep()) == type.getShape()[axis] &&
+          sameScalarValue(loop.getInitArgs()[result],
+                          reduce.getInputs()[reduce.getSourceCount() + component]))
+        continue;
+    }
     PhysicalProgramAnalysis analysis(kernel);
     PhysicalRangeFact ranges = analysis.axisRanges(source, axis);
     auto constant = [](Value value) -> std::optional<int64_t> {
