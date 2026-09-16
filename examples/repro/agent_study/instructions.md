@@ -39,6 +39,9 @@ runtime arguments. Constexpr arguments are bound at compilation and omitted here
 All compile calls must execute during build, not inside the timed wrapper. Do not
 call intent.compile/generate or invoke a different compiler yourself. Choose the
 kernel algorithm, not hardware block sizes or provider-specific emission.
+Each @intent.kernel produces one GPU launch. The compiler does not insert extra
+launches; algorithms with multiple kernel stages require your explicit kernels
+and host composition.
 Python math and Torch calls are host-only; inside Intent kernels and helpers,
 use documented DSL intrinsics and syntax shorthands. Reduction removes its axes,
 and broadcasting aligns trailing axes; add explicit size-one axes when needed.
