@@ -2618,23 +2618,24 @@ LogicalResult legalizeLargeScalarGathers(func::FuncOp kernel) {
     auto bitsType = gpu::FragmentType::get(
         kernel.getContext(), bits, source.getShape(), source.getAxisMaps(),
         source.getValidity(), source.getOwner());
-    auto boolean = gpu::FragmentType::get(
-        kernel.getContext(), builder.getI1Type(), source.getShape(),
-        source.getAxisMaps(), source.getValidity(), source.getOwner());
-    Value mask;
+    Value value = builder.create<gpu::BitcastOp>(location, bitsType, gather.getSource());
+    llvm::sort(selected, [](const auto &lhs, const auto &rhs) { return lhs.first > rhs.first; });
     for (auto [axis, coordinate] : selected) {
-      auto mapping = cast<gpu::AxisMapAttr>(source.getAxisMaps()[axis]);
+      // Select one axis at a time so later selections consume the reduced
+      // fragment rather than constructing another full-source predicate.
+      auto input = cast<gpu::FragmentType>(value.getType());
+      auto mapping = cast<gpu::AxisMapAttr>(input.getAxisMaps()[axis]);
       auto ordinalAxis = gpu::AxisMapAttr::get(
           kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
           mapping.getDimensionId(), 0, mapping.getDerived());
       auto rangeType = gpu::FragmentType::get(
           kernel.getContext(), builder.getIndexType(),
-          builder.getArrayAttr({source.getShape()[axis]}),
-          builder.getArrayAttr({ordinalAxis}), source.getValidity(), source.getOwner());
+          builder.getArrayAttr({input.getShape()[axis]}),
+          builder.getArrayAttr({ordinalAxis}), input.getValidity(), input.getOwner());
       Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
       Value one = builder.create<arith::ConstantIndexOp>(location, 1);
       Value size = builder.create<gpu::PhysicalExprOp>(
-          location, builder.getIndexType(), cast<gpu::PhysicalExprAttr>(source.getShape()[axis]));
+          location, builder.getIndexType(), cast<gpu::PhysicalExprAttr>(input.getShape()[axis]));
       Value ordinal = builder.create<gpu::MakeRangeOp>(
           location, rangeType, zero, size, one, zero, size,
           mapping.getSourceId(), mapping.getSourceAxis(), mapping.getDerived());
@@ -2647,21 +2648,13 @@ LogicalResult legalizeLargeScalarGathers(func::FuncOp kernel) {
       Value equal = builder.create<gpu::CompareOp>(
           location, predicate, ordinal, index, ComparePredicate::Eq);
       auto expanded = gpu::projectPredicateToFragmentAxis(
-          builder, location, equal, source, axis);
+          builder, location, equal, input, axis);
       if (failed(expanded))
         return gather.emitOpError("scalar selection lost its source-axis projection");
-      mask = mask ? Value(builder.create<gpu::BinaryOp>(
-                        location, boolean, mask, *expanded, BinaryOperator::LogicalAnd))
-                  : *expanded;
-    }
-    Value value = builder.create<gpu::BitcastOp>(location, bitsType, gather.getSource());
-    auto zero = zeroLike(builder, location, bitsType);
-    if (failed(zero))
-      return failure();
-    value = builder.create<gpu::SelectOp>(location, bitsType, mask, value, *zero);
-    llvm::sort(selected, [](const auto &lhs, const auto &rhs) { return lhs.first > rhs.first; });
-    for (auto [axis, coordinate] : selected) {
-      auto input = cast<gpu::FragmentType>(value.getType());
+      auto emptyBits = zeroLike(builder, location, input);
+      if (failed(emptyBits))
+        return failure();
+      value = builder.create<gpu::SelectOp>(location, input, *expanded, value, *emptyBits);
       SmallVector<Attribute> shape, mappings;
       for (unsigned sourceAxis = 0; sourceAxis < input.getShape().size(); ++sourceAxis) {
         if (sourceAxis == axis)
