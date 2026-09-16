@@ -1282,6 +1282,23 @@ Value stripRangeProjection(Value value) {
   return value;
 }
 
+bool isPrivateWorkspaceProgramIndex(Value coordinate, Value buffer,
+                                    Operation *access) {
+  auto program = coordinate.getDefiningOp<ProgramIdOp>();
+  auto kernel = access->getParentOfType<func::FuncOp>();
+  auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
+  if (!program || program.getAxis() != 0 || !space || space.size() != 1)
+    return false;
+  DominanceInfo dominance(kernel);
+  return llvm::any_of(buffer.getUsers(), [&](Operation *user) {
+    auto assumption = dyn_cast<AssumeInBoundsOp>(user);
+    return assumption && assumption.getResource() == buffer &&
+           assumption.getIndex() == coordinate &&
+           assumption.getAxis() == 0 &&
+           dominance.properlyDominates(assumption, access);
+  });
+}
+
 bool unconditionalStoreCoversBuffer(Operation *operation, Value buffer,
                                     ArrayRef<LoopCoordinate> loops,
                                     Operation *read) {
@@ -1330,6 +1347,14 @@ bool unconditionalStoreCoversBuffer(Operation *operation, Value buffer,
     auto bufferExtent = cast<PhysicalExprAttr>(type.getShape()[sourceAxis]);
     if (loop == loops.end()) {
       auto readLoad = dyn_cast_if_present<LoadOp>(read);
+      if (sourceAxis == 0 && readLoad &&
+          isPrivateWorkspaceProgramIndex(coordinate, buffer, operation)) {
+        auto position = llvm::find(readLoad.getSourceAxes(), sourceAxis);
+        if (position == readLoad.getSourceAxes().end() ||
+            readLoad.getCoordinates()[position - readLoad.getSourceAxes().begin()] != coordinate)
+          return false;
+        continue;
+      }
       if (range && readLoad &&
           isExclusiveProgramRange(range, operation->getParentOfType<func::FuncOp>()) &&
           valueMatchesExtent(range.getLogicalStop(), bufferExtent)) {
@@ -4799,6 +4824,7 @@ bool PhysicalProgramAnalysis::hasDisjointWorkspaceSlices(Value buffer) const {
     return false;
   for (unsigned axis = 0; axis < type.getShape().size(); ++axis) {
     MakeRangeOp owner;
+    Value programOwner;
     bool consistent = true;
     for (Operation *user : buffer.getUsers()) {
       ValueRange coordinates;
@@ -4816,6 +4842,18 @@ bool PhysicalProgramAnalysis::hasDisjointWorkspaceSlices(Value buffer) const {
         break;
       }
       auto position = llvm::find(sourceAxes, axis);
+      if (axis == 0 && position != sourceAxes.end()) {
+        Value coordinate = coordinates[position - sourceAxes.begin()];
+        if (!owner && isPrivateWorkspaceProgramIndex(coordinate, buffer, user) &&
+            (!programOwner || programOwner == coordinate)) {
+          programOwner = coordinate;
+          continue;
+        }
+      }
+      if (programOwner) {
+        consistent = false;
+        break;
+      }
       auto range = position == sourceAxes.end() ? MakeRangeOp() :
           stripRangeProjection(coordinates[position - sourceAxes.begin()])
               .getDefiningOp<MakeRangeOp>();
@@ -4829,7 +4867,7 @@ bool PhysicalProgramAnalysis::hasDisjointWorkspaceSlices(Value buffer) const {
       }
       owner = range;
     }
-    if (consistent && owner)
+    if (consistent && (owner || programOwner))
       return true;
   }
   return false;
@@ -4873,7 +4911,8 @@ PhysicalProgramAnalysis::bufferDataflow(Value buffer) {
       continue;
     bool initialized = llvm::any_of(initializingWrites, [&](Operation *write) {
       return dominance.properlyDominates(write, read) &&
-             writeDefinesRead(footprint(write), readAccess);
+             (writeDefinesRead(footprint(write), readAccess) ||
+              unconditionalStoreCoversBuffer(write, buffer, {}, read));
     });
     if (!initialized)
       initialized = precedingRegionInitializesBuffer(

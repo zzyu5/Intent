@@ -15,6 +15,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/StringSet.h"
 
 #include <algorithm>
@@ -2763,6 +2764,160 @@ LogicalResult legalizeLargeScalarGathers(func::FuncOp kernel) {
   return success();
 }
 
+LogicalResult materializeOversizedGathers(func::FuncOp kernel) {
+  auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
+  auto tuples = kernel->getAttrOfType<ArrayAttr>(gpu::sharedConfigTuplesAttr);
+  if (!space || space.size() != 1 || !tuples || tuples.empty())
+    return success();
+  int64_t maximumPrograms = 0;
+  for (Attribute attribute : tuples) {
+    auto tuple = cast<DictionaryAttr>(attribute);
+    TritonConfig config;
+    kernel.walk([&](gpu::ParameterOp parameter) {
+      auto schema = parameter.getParameter();
+      if (schema.getCandidates().size() == 1)
+        config.kernelParameters[schema.getName().getValue().str()] =
+            schema.getCandidates()[0];
+    });
+    for (NamedAttribute entry : tuple)
+      config.kernelParameters[entry.getName().getValue().str()] =
+          cast<IntegerAttr>(entry.getValue()).getInt();
+    auto count = evaluateCompileTimeExpression(
+        cast<gpu::PhysicalExprAttr>(space[0]), config);
+    if (!count || *count <= 0)
+      return success();
+    maximumPrograms = std::max(maximumPrograms, *count);
+  }
+  auto capabilities = kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+  llvm::MapVector<Value, SmallVector<gpu::GatherOp>> readers;
+  kernel.walk([&](gpu::GatherOp gather) {
+    auto source = dyn_cast<gpu::FragmentType>(gather.getSource().getType());
+    auto result = dyn_cast<gpu::FragmentType>(gather.getResult().getType());
+    if (!source || !result || !gather.getSource().getDefiningOp() ||
+        source.getShape().size() != result.getShape().size() ||
+        gather.getCoordinates().size() != 1 || gather.getSourceAxes().size() != 1 ||
+        !isa<FloatType, IntegerType>(source.getElementType()))
+      return;
+    unsigned selected = gather.getSourceAxes()[0];
+    int64_t bytes = (source.getElementType().getIntOrFloatBitWidth() + 7) / 8;
+    for (auto [axis, attribute] : llvm::enumerate(source.getShape())) {
+      auto extent = cast<gpu::PhysicalExprAttr>(attribute);
+      if (extent.getKind() != static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+          extent.getValue() <= 0 ||
+          bytes > std::numeric_limits<int64_t>::max() / extent.getValue() ||
+          (axis != selected &&
+           (source.getShape()[axis] != result.getShape()[axis] ||
+            source.getAxisMaps()[axis] != result.getAxisMaps()[axis])))
+        return;
+      bytes *= extent.getValue();
+    }
+    if (bytes <= capabilities.getMaxDynamicSharedMemoryPerBlock())
+      return;
+    for (unsigned axis = 0; axis < source.getShape().size(); ++axis) {
+      Type coordinateType;
+      if (axis == selected) {
+        coordinateType = gather.getCoordinates()[0].getType();
+      } else {
+        auto mapping = cast<gpu::AxisMapAttr>(source.getAxisMaps()[axis]);
+        auto ordinal = gpu::AxisMapAttr::get(kernel.getContext(),
+            mapping.getSourceId(), mapping.getSourceAxis(), mapping.getDimensionId(),
+            0, mapping.getDerived());
+        coordinateType = gpu::FragmentType::get(kernel.getContext(),
+            IndexType::get(kernel.getContext()), ArrayAttr::get(kernel.getContext(),
+                {source.getShape()[axis]}), ArrayAttr::get(kernel.getContext(), {ordinal}),
+            source.getValidity(), source.getOwner());
+      }
+      if (auto coordinate = dyn_cast<gpu::FragmentType>(coordinateType)) {
+        auto projected = gpu::FragmentType::get(kernel.getContext(),
+            coordinate.getElementType(), result.getShape(), result.getAxisMaps(),
+            result.getValidity(), result.getOwner());
+        if (!gpu::queryBroadcastProjection(coordinate, projected).isExact())
+          return;
+      }
+    }
+    readers[gather.getSource()].push_back(gather);
+  });
+  if (readers.empty())
+    return success();
+  OpBuilder entry(&kernel.front(), kernel.front().begin());
+  gpu::ProgramIdOp programId;
+  kernel.walk([&](gpu::ProgramIdOp operation) {
+    if (operation.getAxis() == 0)
+      programId = operation;
+  });
+  if (programId) {
+    if (programId->getBlock() != &kernel.front() ||
+        programId.getOperation() != &kernel.front().front())
+      programId->moveBefore(&kernel.front(), kernel.front().begin());
+  } else {
+    programId = entry.create<gpu::ProgramIdOp>(kernel.getLoc(), entry.getIndexType(), 0);
+  }
+  Value program = programId.getResult();
+  entry.setInsertionPointAfter(programId);
+  auto prefix = gpu::PhysicalExprAttr::get(kernel.getContext(),
+      static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), maximumPrograms,
+      entry.getStringAttr(""), entry.getArrayAttr({}));
+  for (auto &[source, gathers] : readers) {
+    auto payload = cast<gpu::FragmentType>(source.getType());
+    SmallVector<Attribute> shape{prefix};
+    llvm::append_range(shape, payload.getShape());
+    Value workspace = gpu::createInvocationWorkspace(
+        kernel, source.getLoc(), payload, entry.getArrayAttr(shape));
+    // The maximum is evaluated over every shared tuple; the private prefix
+    // remains valid while Triton chooses its local configuration.
+    entry.create<gpu::AssumeInBoundsOp>(source.getLoc(), program, workspace, 0);
+    OpBuilder builder(source.getDefiningOp());
+    builder.setInsertionPointAfter(source.getDefiningOp());
+    SmallVector<Value> coordinates{program};
+    SmallVector<int64_t> sourceAxes{0};
+    SmallVector<Value> ordinals;
+    for (auto [axis, attribute] : llvm::enumerate(payload.getShape())) {
+      auto mapping = cast<gpu::AxisMapAttr>(payload.getAxisMaps()[axis]);
+      auto ordinalMap = gpu::AxisMapAttr::get(kernel.getContext(),
+          mapping.getSourceId(), mapping.getSourceAxis(), mapping.getDimensionId(),
+          0, mapping.getDerived());
+      auto type = gpu::FragmentType::get(kernel.getContext(), builder.getIndexType(),
+          builder.getArrayAttr({attribute}), builder.getArrayAttr({ordinalMap}),
+          payload.getValidity(), payload.getOwner());
+      Value zero = builder.create<arith::ConstantIndexOp>(source.getLoc(), 0);
+      Value one = builder.create<arith::ConstantIndexOp>(source.getLoc(), 1);
+      Value size = builder.create<gpu::PhysicalExprOp>(source.getLoc(),
+          builder.getIndexType(), cast<gpu::PhysicalExprAttr>(attribute));
+      Value ordinal = builder.create<gpu::MakeRangeOp>(source.getLoc(), type,
+          zero, size, one, zero, size, mapping.getSourceId(), mapping.getSourceAxis(),
+          mapping.getDerived());
+      ordinals.push_back(ordinal);
+      coordinates.push_back(ordinal);
+      sourceAxes.push_back(axis + 1);
+    }
+    builder.create<gpu::StoreOp>(source.getLoc(), workspace, coordinates, source,
+                                 Value(), sourceAxes);
+    for (gpu::GatherOp gather : gathers) {
+      builder.setInsertionPoint(gather);
+      auto result = cast<gpu::FragmentType>(gather.getResult().getType());
+      SmallVector<Value> access{program};
+      for (unsigned axis = 0; axis < payload.getShape().size(); ++axis) {
+        Value coordinate = axis == static_cast<unsigned>(gather.getSourceAxes()[0])
+                               ? gather.getCoordinates()[0] : ordinals[axis];
+        auto indices = gpu::FragmentType::get(kernel.getContext(),
+            elementType(coordinate.getType()), result.getShape(), result.getAxisMaps(),
+            result.getValidity(), result.getOwner());
+        if (coordinate.getType() != indices)
+          coordinate = builder.create<gpu::BroadcastOp>(gather.getLoc(), indices, coordinate);
+        access.push_back(coordinate);
+      }
+      auto load = builder.create<gpu::LoadOp>(gather.getLoc(), result, workspace,
+          access, gather.getValid(), gather.getFill(), sourceAxes);
+      if (Attribute origin = gather->getAttr(gpu::originAttr))
+        load->setAttr(gpu::originAttr, origin);
+      gather.getResult().replaceAllUsesWith(load.getResult());
+      gather.erase();
+    }
+  }
+  gpu::eraseDeadPhysicalValues(kernel);
+  return success();
+}
+
 LogicalResult verifyKernel(func::FuncOp kernel) {
   auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
   if (!space || space.empty() || space.size() > 3)
@@ -3266,6 +3421,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
     return failure();
   foldIntegerScanTails(kernel);
   if (failed(legalizeLargeScalarGathers(kernel)) ||
+      failed(materializeOversizedGathers(kernel)) ||
       failed(legalizeMaskedGather(kernel)) ||
       failed(legalizeExpandingGathers(kernel)) ||
       failed(legalizeScatterAdd(kernel)) ||

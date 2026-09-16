@@ -38,6 +38,22 @@ LogicalResult lowerInvocationWorkspaces(ModuleOp module) {
       return kernel.emitError(
           "Triton requires an invocation workspace with explicit first writes");
 
+    auto anchorIn = [](Operation *operation, Block *block) {
+      while (operation && operation->getBlock() != block)
+        operation = operation->getParentOp();
+      return operation;
+    };
+    Block *scope = nullptr;
+    for (Operation *user : workspace.getUsers()) {
+      if (isa<gpu::DimOp, gpu::AssumeInBoundsOp>(user))
+        continue;
+      if (!scope)
+        scope = user->getBlock();
+      while (scope && !anchorIn(user, scope))
+        scope = scope->getParentOp()->getBlock();
+    }
+    if (!scope)
+      return kernel.emitError("Triton workspace has no common access scope");
     Operation *writer = nullptr;
     SmallVector<Operation *> readers;
     for (Operation *user : workspace.getUsers()) {
@@ -46,9 +62,7 @@ LogicalResult lowerInvocationWorkspaces(ModuleOp module) {
       if (!isa<gpu::LoadOp, gpu::StoreOp>(user))
         return user->emitOpError(
             "Triton workspace supports explicit loads and stores");
-      Operation *anchor = user;
-      while (anchor->getBlock() != &kernel.front())
-        anchor = anchor->getParentOp();
+      Operation *anchor = anchorIn(user, scope);
       if (isa<gpu::StoreOp>(user)) {
         if (writer && writer != anchor)
           return user->emitOpError(
