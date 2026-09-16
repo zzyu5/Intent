@@ -104,8 +104,10 @@ class Manual:
             raise ValueError("query must contain a name or search term")
         results = []
         if kind in {"all", "api"}:
+            api_terms = [term.removeprefix("intent.language.").removeprefix("i.")
+                         for term in terms]
             for name, entry in self.corpus["symbols"].items():
-                score = sum(term in name.lower() for term in terms)
+                score = sum(bool(term) and term in name.lower() for term in api_terms)
                 if score:
                     results.append((100 * score, {"id": name, "kind": "api", "title": name,
                                                   "signature": entry["signature"]}))
