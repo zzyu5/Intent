@@ -3,6 +3,7 @@
 
 #include "Intent/Dialect/CPU/Transforms/Implementation.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 
 namespace intent::cpu {
 
@@ -18,6 +19,9 @@ public:
       ConfigurationAttr configuration, llvm::ArrayRef<InputRequirement> requirements);
 
 private:
+  std::optional<InputSupply> prepareWindow(mlir::Value source, const InputRequirement &requirement,
+      mlir::linalg::GenericOp operation);
+  void guardLoop(mlir::scf::ForOp loop);
   mlir::Operation *consumerScope(mlir::Value source, mlir::linalg::GenericOp operation,
       const InputRequirement &requirement, const Implementation &implementation);
   InputSupply materialize(mlir::Value source, const InputRequirement &requirement, mlir::Operation *scope);
@@ -27,8 +31,16 @@ private:
     mlir::memref::AllocOp allocation;
     mlir::memref::DeallocOp end;
   };
+  struct PreparedWindow {
+    mlir::Value source;
+    InputRequirement requirement;
+    mlir::scf::ForOp scope;
+    mlir::memref::AllocOp storage;
+    mlir::memref::AllocOp initialized;
+  };
   mlir::func::FuncOp function;
   llvm::SmallVector<Prepared> prepared;
+  llvm::SmallVector<PreparedWindow> windows;
   llvm::SmallVector<mlir::Operation *> guardedLoops;
 };
 
