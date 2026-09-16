@@ -22,7 +22,8 @@ bool isZero(Value value) {
 } // namespace
 
 Value createInvocationWorkspace(func::FuncOp kernel, Location location,
-                                FragmentType payload, ArrayAttr shape) {
+                                Type elementType, ArrayAttr shape,
+                                uint64_t owner) {
   uint64_t instance = 1;
   llvm::StringSet<> names;
   for (BlockArgument argument : kernel.getArguments()) {
@@ -39,9 +40,9 @@ Value createInvocationWorkspace(func::FuncOp kernel, Location location,
     name += "_";
   OpBuilder builder(kernel.getContext());
   auto type = BufferType::get(
-      kernel.getContext(), payload.getElementType(), shape,
+      kernel.getContext(), elementType, shape,
       BufferScopeAttr::get(kernel.getContext(), BufferScope::InvocationWorkspace),
-      instance, payload.getOwner(),
+      instance, owner,
       BufferInitializationAttr::get(kernel.getContext(), BufferInitialization::FirstWrite),
       BufferLifetimeAttr::get(kernel.getContext(), BufferLifetime::Invocation),
       /*visibility=*/1, /*workspace=*/true);
@@ -423,9 +424,11 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
     constantValues.map(original, builder.create<arith::ConstantOp>(
         store.getLoc(), original.getType(), constant));
   SmallVector<Value> workspaces;
-  for (Value value : retained)
+  for (Value value : retained) {
+    auto type = cast<FragmentType>(value.getType());
     workspaces.push_back(createInvocationWorkspace(kernel, store.getLoc(),
-        cast<FragmentType>(value.getType()), builder.getArrayAttr(shape)));
+        type.getElementType(), builder.getArrayAttr(shape), type.getOwner()));
+  }
   Value workspace = workspaces.front();
   uint64_t instance = cast<BufferType>(workspace.getType()).getInstance();
   bool linearTraversal = payload.getShape().size() == 1;
@@ -724,8 +727,9 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
     if (chunkExtent == full)
       return false;
   }
-  Value workspace = createInvocationWorkspace(kernel, gather.getLoc(), payload,
-                                              builder.getArrayAttr(shape));
+  Value workspace = createInvocationWorkspace(
+      kernel, gather.getLoc(), payload.getElementType(),
+      builder.getArrayAttr(shape), payload.getOwner());
   if (!readerChunk) {
     auto instance = cast<BufferType>(workspace.getType()).getInstance();
     auto parameter = getOrCreatePhysicalParameter(kernel,

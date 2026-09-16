@@ -4387,9 +4387,21 @@ private:
     if (auto buffer = dyn_cast<intent::BufferOp>(operation)) {
       auto logical = cast<intent::BufferType>(buffer.getResult().getType());
       auto tensor = cast<RankedTensorType>(logical.getTensor());
-      FailureOr<FragmentType> valueType = convertTensorType(tensor, operation);
-      if (failed(valueType))
-        return buffer.emitOpError("logical buffer shape is not physicalizable");
+      SmallVector<Attribute> shape;
+      for (Attribute attribute : buffer.getShape().getAxes()) {
+        auto axis = cast<intent::ShapeExprAttr>(attribute);
+        FailureOr<PhysicalExprAttr> extent = failure();
+        if (axis.getKind() == 0)
+          extent = expression(operation->getContext(),
+                              PhysicalExprKind::Constant, axis.getPayload());
+        else if (axis.getKind() == 1)
+          extent = launchExpression(buffer.getInputs()[axis.getPayload()],
+                                    operation->getParentOfType<func::FuncOp>());
+        if (failed(extent))
+          return buffer.emitOpError(
+              "logical buffer allocation requires a launch-visible extent");
+        shape.push_back(*extent);
+      }
       LogicalBufferFact allocation = canonicalAnalysis.logicalBuffer(operation);
       if (!allocation.isExact())
         return buffer.emitOpError(
@@ -4403,7 +4415,7 @@ private:
               ? gpu::BufferLifetime::Program
               : gpu::BufferLifetime::Iteration;
       auto physicalType = gpu::BufferType::get(
-          operation->getContext(), tensor.getElementType(), valueType->getShape(),
+          operation->getContext(), tensor.getElementType(), builder.getArrayAttr(shape),
           gpu::BufferScopeAttr::get(operation->getContext(), scope),
           allocation.instanceIdentity,
           /*owner=*/1,

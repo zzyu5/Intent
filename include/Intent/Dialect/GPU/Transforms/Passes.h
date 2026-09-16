@@ -132,8 +132,8 @@ void clonePredicatedScalarOperation(mlir::OpBuilder &builder,
 mlir::LogicalResult realizeScanConsumerTraversals(mlir::ModuleOp module);
 mlir::Value createInvocationWorkspace(mlir::func::FuncOp kernel,
                                       mlir::Location location,
-                                      FragmentType payload,
-                                      mlir::ArrayAttr shape);
+                                      mlir::Type elementType,
+                                      mlir::ArrayAttr shape, uint64_t owner);
 mlir::LogicalResult materializeRetainedValues(mlir::ModuleOp module);
 mlir::FailureOr<mlir::Value> materializeRetainedSlice(
     mlir::OpBuilder &builder, mlir::Location location, mlir::Value value,

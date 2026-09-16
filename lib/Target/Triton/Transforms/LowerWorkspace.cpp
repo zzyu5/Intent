@@ -41,27 +41,32 @@ LogicalResult materializeProgramBuffers(ModuleOp module) {
         return user->emitOpError("Triton mutable buffer supports explicit loads and stores");
     for (Attribute attribute : type.getShape()) {
       auto extent = cast<gpu::PhysicalExprAttr>(attribute);
-      if (extent.getKind() != static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
-          extent.getValue() <= 0)
-        return buffer.emitOpError("Triton mutable buffer requires a positive static shape");
+      auto kind = static_cast<gpu::PhysicalExprKind>(extent.getKind());
+      if ((kind != gpu::PhysicalExprKind::Constant &&
+           kind != gpu::PhysicalExprKind::Dimension) || extent.getValue() <= 0)
+        return buffer.emitOpError(
+            "Triton mutable buffer requires positive constants or ABI dimensions");
+      if (buffer.getInitialValue() && kind != gpu::PhysicalExprKind::Constant)
+        return buffer.emitOpError(
+            "Triton mutable buffer initialization requires a static shape");
     }
 
     OpBuilder builder(buffer);
     Value initial = buffer.getInitialValue();
-    auto payload = initial ? dyn_cast<gpu::FragmentType>(initial.getType())
-                           : gpu::FragmentType();
-    if (!payload) {
-      SmallVector<Attribute> maps;
-      for (unsigned axis = 0; axis < type.getShape().size(); ++axis)
-        maps.push_back(gpu::AxisMapAttr::get(kernel.getContext(), source, axis,
-                                            dimension++, axis, false));
-      ++source;
-      payload = gpu::FragmentType::get(kernel.getContext(), type.getElementType(),
-          type.getShape(), builder.getArrayAttr(maps), 1, type.getOwner());
-    }
     Value workspace = gpu::createInvocationWorkspace(
-        kernel, buffer.getLoc(), payload, type.getShape());
+        kernel, buffer.getLoc(), type.getElementType(), type.getShape(),
+        type.getOwner());
     if (initial) {
+      auto payload = dyn_cast<gpu::FragmentType>(initial.getType());
+      if (!payload) {
+        SmallVector<Attribute> maps;
+        for (unsigned axis = 0; axis < type.getShape().size(); ++axis)
+          maps.push_back(gpu::AxisMapAttr::get(kernel.getContext(), source, axis,
+                                              dimension++, axis, false));
+        ++source;
+        payload = gpu::FragmentType::get(kernel.getContext(), type.getElementType(),
+            type.getShape(), builder.getArrayAttr(maps), 1, type.getOwner());
+      }
       if (auto splat = initial.getDefiningOp<gpu::SplatOp>())
         initial = splat.getValue();
       if (auto broadcast = initial.getDefiningOp<gpu::BroadcastOp>();

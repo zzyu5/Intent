@@ -415,8 +415,9 @@ FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
   }
 
   OpBuilder builder(scan);
-  Value workspace = createInvocationWorkspace(kernel, scan.getLoc(), type,
-                                               builder.getArrayAttr({stop}));
+  Value workspace = createInvocationWorkspace(
+      kernel, scan.getLoc(), type.getElementType(),
+      builder.getArrayAttr({stop}), type.getOwner());
   builder.setInsertionPointAfter(scan);
   Value zero = builder.create<arith::ConstantIndexOp>(scan.getLoc(), 0);
   Value one = builder.create<arith::ConstantIndexOp>(scan.getLoc(), 1);

@@ -2894,7 +2894,8 @@ LogicalResult materializeOversizedGathers(func::FuncOp kernel) {
     SmallVector<Attribute> shape{prefix};
     llvm::append_range(shape, payload.getShape());
     Value workspace = gpu::createInvocationWorkspace(
-        kernel, source.getLoc(), payload, entry.getArrayAttr(shape));
+        kernel, source.getLoc(), payload.getElementType(),
+        entry.getArrayAttr(shape), payload.getOwner());
     // The maximum is evaluated over every shared tuple; the private prefix
     // remains valid while Triton chooses its local configuration.
     entry.create<gpu::AssumeInBoundsOp>(source.getLoc(), program, workspace, 0);
