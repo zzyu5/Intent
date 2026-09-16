@@ -2973,8 +2973,6 @@ bool supportsCartesianPointwiseValueGraph(
       }
     }
   }
-  if (allowOrderedLoops && loops.empty())
-    return false;
   for (Operation *loop : loops) {
     WalkResult effects = loop->walk([&](Operation *operation) {
       if (isa<scf::ForOp>(operation))
