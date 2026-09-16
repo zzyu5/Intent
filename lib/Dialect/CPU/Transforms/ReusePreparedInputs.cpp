@@ -1,4 +1,5 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
+#include "ImplementationInputs.h"
 #include "Utilities.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -91,9 +92,67 @@ std::optional<PreparedInput> scopedInput(linalg::LinalgOp producer, Operation *l
   return result;
 }
 
-void groupScopedInputs(func::FuncOp function) {
+Value inputGroupSize(OpBuilder &builder, scf::ParallelOp parallel, int64_t divisor, int64_t workers) {
+  Location loc = parallel.getLoc();
+  Value zero = index(builder, loc, 0), one = index(builder, loc, 1);
+  Value remaining = index(builder, loc, workers);
+  auto account = [&](scf::ParallelOp owner, unsigned axes) {
+    for (unsigned axis = 0; axis < axes; ++axis) {
+      auto step = getConstantIntValue(owner.getStep()[axis]);
+      if (!step || *step <= 0) continue;
+      Value extent = builder.create<arith::SubIOp>(loc, owner.getUpperBound()[axis], owner.getLowerBound()[axis]);
+      extent = builder.create<arith::MaxSIOp>(loc, extent, zero);
+      Value count = builder.create<arith::CeilDivSIOp>(loc, extent, owner.getStep()[axis]);
+      count = builder.create<arith::MaxSIOp>(loc, count, one);
+      remaining = builder.create<arith::CeilDivSIOp>(loc, remaining, count);
+    }
+  };
+  account(parallel, parallel.getNumLoops() - 1);
+  for (Operation *parent = parallel->getParentOp(); parent; parent = parent->getParentOp())
+    if (auto outer = dyn_cast<scf::ParallelOp>(parent)) account(outer, outer.getNumLoops());
+  Value budget = builder.create<arith::DivSIOp>(loc, parallel.getUpperBound().back(), remaining);
+  SmallVector<int64_t> sizes{divisor};
+  while (sizes.back() % 2 == 0) sizes.push_back(sizes.back() / 2);
+  if (sizes.back() != 1) sizes.push_back(1);
+  Value size = one;
+  // Choose subgroup sizes that divide the original quotient cohort, retaining
+  // enough nominal worksets for the worker budget across parallel axes.
+  for (int64_t candidate : llvm::reverse(sizes)) {
+    if (candidate == 1) continue;
+    Value value = index(builder, loc, candidate);
+    Value fits = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge, budget, value);
+    size = builder.create<arith::SelectOp>(loc, fits, value, size);
+  }
+  return size;
+}
+
+LogicalResult groupScopedInputs(func::FuncOp function, const ImplementationRegistry &implementations) {
   auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
-  if (!interface || !interface.getDisjointOutputs()) return;
+  if (!interface || !interface.getDisjointOutputs()) return success();
+  auto configuration = function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration");
+  llvm::DenseMap<Value, SmallVector<memref::SubViewOp>> requestedWindows;
+  auto requests = function.walk([&](linalg::GenericOp operation) -> WalkResult {
+    if (!isMatrixContraction(operation) || operation->hasAttr("intent_cpu.microtile")) return WalkResult::advance();
+    auto implementation = implementations.lookup(operation);
+    if (failed(implementation)) return WalkResult::interrupt();
+    if (!(*implementation)->inputs) return WalkResult::advance();
+    auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
+    for (auto requirement : (*implementation)->inputs(operation, configuration, binding)) {
+      if (requirement.operand >= operation.getInputs().size()) continue;
+      Value source = operation.getInputs()[requirement.operand];
+      Value base = consumerWindowBase(source, requirement);
+      if (!base || !base.getDefiningOp()) continue;
+      Operation *owner = base.getDefiningOp()->getParentOp();
+      bool serial = true;
+      for (Operation *parent = operation->getParentOp(); parent != owner; parent = parent->getParentOp()) {
+        if (auto loop = dyn_cast<scf::ForOp>(parent)) serial &= loop.getNumResults() == 0;
+        else if (!isa<scf::IfOp>(parent)) { serial = false; break; }
+      }
+      if (serial) requestedWindows[base].push_back(source.getDefiningOp<memref::SubViewOp>());
+    }
+    return WalkResult::advance();
+  });
+  if (requests.wasInterrupted()) return failure();
   SmallVector<Operation *> loops;
   function.walk([&](Operation *operation) {
     if (isa<scf::ForOp, scf::ParallelOp>(operation)) loops.push_back(operation);
@@ -132,10 +191,6 @@ void groupScopedInputs(func::FuncOp function) {
       llvm::SmallDenseSet<Value> groupInputs;
       bool groupDependent = false;
       for (Operation &operation : body->without_terminator()) {
-        auto producer = dyn_cast<linalg::LinalgOp>(operation);
-        if (!producer) continue;
-        auto prepared = scopedInput(producer, loop, physical, *effects, accesses, groupInputs);
-        if (!prepared) continue;
         llvm::SetVector<Operation *> needed;
         bool usesQuotient = false;
         std::function<bool(Value)> invariant = [&](Value value) {
@@ -151,6 +206,34 @@ void groupScopedInputs(func::FuncOp function) {
           needed.insert(definition);
           return true;
         };
+        if (auto view = dyn_cast<memref::SubViewOp>(operation);
+            view && requestedWindows.count(view.getResult()) && physical.isReadOnly(view)) {
+          Value root = physical.storageRoot(view);
+          bool stable = llvm::all_of(*effects, [&](const MemoryEffects::EffectInstance &effect) {
+            if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect())) return true;
+            Value memory = effect.getValue();
+            if (!memory || !isa<MemRefType>(memory.getType()) ||
+                !isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect())) return false;
+            Value written = physical.storageRoot(memory);
+            if (written == root) return false;
+            if (isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(written.getDefiningOp())) return true;
+            auto external = physical.externalView(written);
+            return external && external.getAccess() != 0;
+          });
+          if (stable && llvm::any_of(requestedWindows[view], [&](memref::SubViewOp window) {
+                return hasIndependentWindowCoordinates(window, loop, quotient.getResult());
+              }) && invariant(view.getResult()) && usesQuotient) {
+            // Share only the invariant descriptor here. The selected input
+            // supply retains its original guards when it later fills storage.
+            dependencies.insert(needed.begin(), needed.end());
+            groupDependent = true;
+          }
+          continue;
+        }
+        auto producer = dyn_cast<linalg::LinalgOp>(operation);
+        if (!producer) continue;
+        auto prepared = scopedInput(producer, loop, physical, *effects, accesses, groupInputs);
+        if (!prepared) continue;
         llvm::SetVector<Value> inputs;
         getUsedValuesDefinedAbove(producer->getRegion(0), inputs);
         auto operands = producer.getDpsInputs();
@@ -165,11 +248,14 @@ void groupScopedInputs(func::FuncOp function) {
       if (!groupDependent) continue;
       OpBuilder builder(loop);
       Location loc = loop->getLoc();
-      Value size = index(builder, loc, *divisor);
+      scf::ParallelOp parallel = dyn_cast<scf::ParallelOp>(loop), outerParallel;
+      auto capabilities = function->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities");
+      Value size = parallel ? inputGroupSize(builder, parallel, *divisor, capabilities.getWorkers())
+                            : index(builder, loc, *divisor);
+      Value originalDivisor = index(builder, loc, *divisor);
       Value count = builder.create<arith::CeilDivSIOp>(loc, upper, size);
       Value ordinal;
       Block *group;
-      scf::ParallelOp parallel = dyn_cast<scf::ParallelOp>(loop), outerParallel;
       if (parallel) {
         SmallVector<Value> ends(parallel.getUpperBound());
         ends.back() = count;
@@ -181,6 +267,7 @@ void groupScopedInputs(func::FuncOp function) {
       }
       builder.setInsertionPointToStart(group);
       Value begin = multiply(builder, loc, ordinal, size);
+      Value sourceGroup = builder.create<arith::DivSIOp>(loc, begin, originalDivisor);
       Value remaining = builder.create<arith::SubIOp>(loc, upper, begin);
       Value extent = builder.create<arith::MinSIOp>(loc, size, remaining);
       Value end = add(builder, loc, begin, extent);
@@ -200,7 +287,7 @@ void groupScopedInputs(func::FuncOp function) {
         serial->moveBefore(group->getTerminator());
         serial.setLowerBound(begin); serial.setUpperBound(end);
       }
-      quotient.getResult().replaceAllUsesWith(ordinal);
+      quotient.getResult().replaceAllUsesWith(sourceGroup);
       quotient.erase();
       for (auto preparation : preparations) {
         dependencies.insert(preparation.allocation);
@@ -216,6 +303,7 @@ void groupScopedInputs(func::FuncOp function) {
       break;
     }
   }
+  return success();
 }
 
 std::optional<PreparedInput> preparedInput(linalg::GenericOp producer) {
@@ -290,8 +378,8 @@ bool equivalent(PreparedInput &lhs, PreparedInput &rhs, PhysicalProgramAnalysis 
 
 }
 
-LogicalResult reusePreparedInputs(func::FuncOp function) {
-  groupScopedInputs(function);
+LogicalResult reusePreparedInputs(func::FuncOp function, const ImplementationRegistry &implementations) {
+  if (failed(groupScopedInputs(function, implementations))) return failure();
   bool changed;
   do {
     changed = false;

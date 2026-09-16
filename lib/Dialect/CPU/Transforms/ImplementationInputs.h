@@ -7,6 +7,10 @@
 
 namespace intent::cpu {
 
+mlir::Value consumerWindowBase(mlir::Value source, const InputRequirement &requirement);
+bool hasIndependentWindowCoordinates(mlir::memref::SubViewOp window,
+    mlir::Operation *loop, mlir::Value groupCoordinate = {});
+
 class ImplementationInputs {
 public:
   explicit ImplementationInputs(mlir::func::FuncOp function) : function(function) {}

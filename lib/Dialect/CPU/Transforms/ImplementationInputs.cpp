@@ -77,6 +77,42 @@ memref::AllocOp allocateRepresentation(OpBuilder &b, Location loc, Value source,
 
 }
 
+Value consumerWindowBase(Value source, const InputRequirement &requirement) {
+  auto view = source.getDefiningOp<memref::SubViewOp>();
+  if (requirement.reuse != InputReuse::Consumers || requirement.panelAxis >= 2 ||
+      !view || view.getType().getRank() != 2 || view.getSourceType().getRank() != 2 ||
+      llvm::any_of(view.getMixedStrides(), [](OpFoldResult stride) { return getConstantIntValue(stride) != 1; }))
+    return {};
+  Builder builder(source.getContext());
+  auto extent = dimension(view.getSource(), requirement.panelAxis, builder);
+  auto size = view.getMixedSizes()[requirement.panelAxis];
+  if (!extent || getConstantIntValue(view.getMixedOffsets()[requirement.panelAxis]) != 0 ||
+      (*extent != size && (!getConstantIntValue(*extent) || getConstantIntValue(*extent) != getConstantIntValue(size))))
+    return {};
+  return view.getSource();
+}
+
+bool hasIndependentWindowCoordinates(memref::SubViewOp window, Operation *scope, Value groupCoordinate) {
+  llvm::SmallPtrSet<Operation *, 16> checked;
+  std::function<bool(Value)> independent = [&](Value value) {
+    if (value == groupCoordinate) return true;
+    Operation *owner = value.getParentRegion()->getParentOp();
+    if (owner != scope && !scope->isAncestor(owner)) return true;
+    if (auto argument = dyn_cast<BlockArgument>(value)) {
+      auto inner = dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
+      return inner && inner != scope && scope->isAncestor(inner) && argument == inner.getInductionVar();
+    }
+    Operation *definition = value.getDefiningOp();
+    if (!definition || definition->getNumRegions() || !isMemoryEffectFree(definition)) return false;
+    if (!checked.insert(definition).second) return true;
+    return llvm::all_of(definition->getOperands(), independent);
+  };
+  // Inner traversals still identify actual source rows. A window that advances
+  // directly with this consumer loop does not provide reuse across its iterations.
+  auto invariant = [&](OpFoldResult value) { return isa<Attribute>(value) || independent(cast<Value>(value)); };
+  return llvm::all_of(window.getMixedOffsets(), invariant) && llvm::all_of(window.getMixedSizes(), invariant);
+}
+
 FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepare(linalg::GenericOp operation,
     ArrayRef<InputRequirement> requirements, const Implementation &implementation) {
   SmallVector<InputSupply> supplies;
@@ -108,22 +144,15 @@ void ImplementationInputs::guardLoop(scf::ForOp loop) {
 
 std::optional<InputSupply> ImplementationInputs::prepareWindow(Value source,
     const InputRequirement &requirement, linalg::GenericOp operation) {
+  Value base = consumerWindowBase(source, requirement);
+  if (!base) return std::nullopt;
   auto view = source.getDefiningOp<memref::SubViewOp>();
-  if (!view || view.getType().getRank() != 2 || view.getSourceType().getRank() != 2 ||
-      llvm::any_of(view.getMixedStrides(), [](OpFoldResult stride) { return getConstantIntValue(stride) != 1; }))
-    return std::nullopt;
-  Value base = view.getSource();
   PhysicalProgramAnalysis physical(function);
   auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
   if (!interface || !interface.getDisjointOutputs() || !physical.isReadOnly(base)) return std::nullopt;
   unsigned axis = 1 - requirement.panelAxis;
   OpBuilder b(operation);
-  auto extent = dimension(base, requirement.panelAxis, b);
   auto sizes = view.getMixedSizes(), offsets = view.getMixedOffsets();
-  if (!extent || getConstantIntValue(offsets[requirement.panelAxis]) != 0 ||
-      (*extent != sizes[requirement.panelAxis] &&
-       (!getConstantIntValue(*extent) || getConstantIntValue(*extent) != getConstantIntValue(sizes[requirement.panelAxis]))))
-    return std::nullopt;
 
   DominanceInfo dominance(function);
   scf::ForOp scope;
@@ -133,20 +162,7 @@ std::optional<InputSupply> ImplementationInputs::prepareWindow(Value source,
     if (!candidate || candidate.getNumResults()) break;
     auto step = getConstantIntValue(candidate.getStep());
     if (!step || *step <= 0 || !candidate->isAncestor(view) || !dominance.dominates(base, candidate)) continue;
-    llvm::SmallPtrSet<Operation *, 16> checked;
-    std::function<bool(Value)> independent = [&](Value value) {
-      if (dominance.dominates(value, candidate)) return true;
-      if (auto argument = dyn_cast<BlockArgument>(value)) {
-        auto inner = dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
-        return inner && inner != candidate && candidate->isAncestor(inner) && argument == inner.getInductionVar();
-      }
-      Operation *definition = value.getDefiningOp();
-      if (!definition || definition->getNumRegions() || !isMemoryEffectFree(definition)) return false;
-      if (!checked.insert(definition).second) return true;
-      return llvm::all_of(definition->getOperands(), independent);
-    };
-    auto invariant = [&](OpFoldResult value) { return isa<Attribute>(value) || independent(cast<Value>(value)); };
-    if (!llvm::all_of(offsets, invariant) || !llvm::all_of(sizes, invariant)) continue;
+    if (!hasIndependentWindowCoordinates(view, candidate)) continue;
     auto effects = getEffectsRecursively(candidate);
     if (!effects) continue;
     bool stable = true;
