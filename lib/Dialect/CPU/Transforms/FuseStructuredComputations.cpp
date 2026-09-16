@@ -12,9 +12,8 @@
 using namespace mlir;
 
 namespace intent::cpu {
-namespace {
 
-void eraseDeadBuffers(func::FuncOp function) {
+void eraseDeadPrivateBuffers(func::FuncOp function) {
   SmallVector<memref::AllocOp> allocations;
   function.walk([&](memref::AllocOp allocation) { allocations.push_back(allocation); });
   for (auto allocation : llvm::reverse(allocations)) {
@@ -49,6 +48,8 @@ void eraseDeadBuffers(func::FuncOp function) {
     allocation.erase();
   }
 }
+
+namespace {
 
 linalg::GenericOp pointwiseProducer(Value buffer, Operation *consumer,
                                     PhysicalProgramAnalysis &analysis) {
@@ -533,14 +534,14 @@ LogicalResult fuseStructuredComputations(func::FuncOp function) {
     }
   }
   forwardPointwiseCopies(function);
-  eraseDeadBuffers(function);
+  eraseDeadPrivateBuffers(function);
   return success();
 }
 
 LogicalResult reusePrivateStorage(func::FuncOp function) {
   // Preserve separate values until region predicates and pointwise bodies have
   // folded, so a constant replacement can discard its old computation first.
-  eraseDeadBuffers(function);
+  eraseDeadPrivateBuffers(function);
   SmallVector<linalg::GenericOp> consumers;
   function.walk([&](linalg::GenericOp operation) { consumers.push_back(operation); });
   for (auto consumer : llvm::reverse(consumers)) {

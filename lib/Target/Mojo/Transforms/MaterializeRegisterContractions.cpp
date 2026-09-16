@@ -141,7 +141,7 @@ FailureOr<bool> materializeIndexedContraction(linalg::GenericOp operation, Imple
     scope = parent;
   }
   int64_t panelSize = width * replicas;
-  InputRequirement requirement{1, outputType.getElementType(), 1, panelSize, width * 4, InputReuse::Consumers};
+  InputRequirement requirement{1, outputType.getElementType(), 1, panelSize, width * 4, InputReuse::Consumers, panelSize};
   auto supplied = inputs.prepareCaptured(operation, load, requirement, scope);
   if (failed(supplied)) return failure();
   OpBuilder b(operation);

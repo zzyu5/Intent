@@ -140,15 +140,17 @@ LogicalResult groupScopedInputs(func::FuncOp function, const ImplementationRegis
     for (auto requirement : (*implementation)->inputs(operation, configuration, binding)) {
       if (requirement.operand >= operation.getInputs().size()) continue;
       Value source = operation.getInputs()[requirement.operand];
-      Value base = consumerWindowBase(source, requirement);
-      if (!base || !base.getDefiningOp()) continue;
+      auto window = consumerWindow(source, requirement, operation);
+      if (!window) continue;
+      Value base = window->view.getSource();
+      if (!base.getDefiningOp()) continue;
       Operation *owner = base.getDefiningOp()->getParentOp();
       bool serial = true;
       for (Operation *parent = operation->getParentOp(); parent != owner; parent = parent->getParentOp()) {
         if (auto loop = dyn_cast<scf::ForOp>(parent)) serial &= loop.getNumResults() == 0;
         else if (!isa<scf::IfOp>(parent)) { serial = false; break; }
       }
-      if (serial) requestedWindows[base].push_back(source.getDefiningOp<memref::SubViewOp>());
+      if (serial) requestedWindows[base].push_back(window->view);
     }
     return WalkResult::advance();
   });
@@ -222,11 +224,11 @@ LogicalResult groupScopedInputs(func::FuncOp function, const ImplementationRegis
           });
           if (stable && llvm::any_of(requestedWindows[view], [&](memref::SubViewOp window) {
                 return hasIndependentWindowCoordinates(window, loop, quotient.getResult());
-              }) && invariant(view.getResult()) && usesQuotient) {
+              }) && invariant(view.getResult())) {
             // Share only the invariant descriptor here. The selected input
             // supply retains its original guards when it later fills storage.
             dependencies.insert(needed.begin(), needed.end());
-            groupDependent = true;
+            groupDependent |= usesQuotient;
           }
           continue;
         }

@@ -233,6 +233,7 @@ LogicalResult blockContractions(func::FuncOp function, const Configuration &conf
   });
   for (linalg::GenericOp operation : contractions)
     if (failed(block(operation, configuration, implementations, inputs))) return failure();
+  eraseDeadPrivateBuffers(function);
   return success();
 }
 

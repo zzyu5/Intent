@@ -3,6 +3,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Dominance.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -14,6 +15,7 @@ LogicalResult validateRepresentation(Operation *operation, Value source, Value e
                                      const InputRequirement &requirement) {
   auto type = dyn_cast<MemRefType>(source.getType());
   if (!type || requirement.panelSize <= 0 || requirement.alignment <= 0 ||
+      requirement.windowAlignment <= 0 || requirement.panelSize % requirement.windowAlignment != 0 ||
       !llvm::isPowerOf2_64(requirement.alignment))
     return operation->emitError("implementation has an invalid input representation requirement");
   if (!requirement.elementType || !requirement.elementType.isIntOrIndexOrFloat())
@@ -50,20 +52,21 @@ std::optional<OpFoldResult> dimension(Value source, unsigned axis, Builder &buil
 }
 
 memref::AllocOp allocateRepresentation(OpBuilder &b, Location loc, Value source,
-    const InputRequirement &requirement, SmallVectorImpl<Value> &sourceSizes) {
+    const InputRequirement &requirement, SmallVectorImpl<Value> &sourceSizes, bool transposed = false) {
   auto type = cast<MemRefType>(source.getType());
+  auto sourceAxis = [&](unsigned axis) { return transposed ? 1 - axis : axis; };
   for (int64_t axis = 0; axis < type.getRank(); ++axis)
-    sourceSizes.push_back(b.create<memref::DimOp>(loc, source, axis));
+    sourceSizes.push_back(b.create<memref::DimOp>(loc, source, sourceAxis(axis)));
   Value panel = index(b, loc, requirement.panelSize);
   Value count = b.create<arith::CeilDivSIOp>(loc, sourceSizes[requirement.panelAxis], panel);
-  int64_t staticExtent = type.getDimSize(requirement.panelAxis);
+  int64_t staticExtent = type.getDimSize(sourceAxis(requirement.panelAxis));
   SmallVector<int64_t> shape{ShapedType::isDynamic(staticExtent) ? ShapedType::kDynamic
       : static_cast<int64_t>(llvm::divideCeil(static_cast<uint64_t>(staticExtent),
                                             static_cast<uint64_t>(requirement.panelSize)))};
   SmallVector<Value> sizes{count};
   for (int64_t axis = 0; axis < type.getRank(); ++axis) {
     if (axis == requirement.panelAxis) continue;
-    shape.push_back(type.getDimSize(axis));
+    shape.push_back(type.getDimSize(sourceAxis(axis)));
     sizes.push_back(sourceSizes[axis]);
   }
   shape.push_back(requirement.panelSize);
@@ -75,21 +78,85 @@ memref::AllocOp allocateRepresentation(OpBuilder &b, Location loc, Value source,
   return storage;
 }
 
+bool panelAligned(OpFoldResult offset, int64_t panel) {
+  if (panel == 1) return true;
+  llvm::DenseMap<Value, bool> known;
+  std::function<bool(OpFoldResult)> aligned = [&](OpFoldResult value) {
+    if (auto constant = getConstantIntValue(value)) return *constant % panel == 0;
+    if (!llvm::isPowerOf2_64(panel)) return false;
+    Value dynamic = cast<Value>(value);
+    auto found = known.find(dynamic);
+    if (found != known.end()) return found->second;
+    bool result = false;
+    if (auto argument = dyn_cast<BlockArgument>(dynamic)) {
+      if (auto loop = dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
+          loop && argument == loop.getInductionVar())
+        result = aligned(loop.getLowerBound()) && aligned(loop.getStep());
+    } else if (auto product = dynamic.getDefiningOp<arith::MulIOp>()) {
+      result = aligned(product.getLhs()) || aligned(product.getRhs());
+    } else if (auto subtract = dynamic.getDefiningOp<arith::SubIOp>()) {
+      auto remainder = subtract.getRhs().getDefiningOp<arith::RemSIOp>();
+      auto divisor = remainder ? getConstantIntValue(remainder.getRhs()) : std::nullopt;
+      result = remainder && remainder.getLhs() == subtract.getLhs() && divisor &&
+          *divisor > 0 && *divisor % panel == 0;
+      result |= aligned(subtract.getLhs()) && aligned(subtract.getRhs());
+    } else if (auto select = dynamic.getDefiningOp<arith::SelectOp>()) {
+      result = aligned(select.getTrueValue()) && aligned(select.getFalseValue());
+    } else if (Operation *operation = dynamic.getDefiningOp();
+        isa_and_nonnull<arith::AddIOp, arith::MinSIOp, arith::MaxSIOp>(operation)) {
+      result = llvm::all_of(operation->getOperands(), [&](Value operand) { return aligned(operand); });
+    }
+    known[dynamic] = result;
+    return result;
+  };
+  return aligned(offset);
 }
 
-Value consumerWindowBase(Value source, const InputRequirement &requirement) {
-  auto view = source.getDefiningOp<memref::SubViewOp>();
+}
+
+std::optional<ConsumerWindow> consumerWindow(Value source, const InputRequirement &requirement,
+                                            Operation *consumer) {
   if (requirement.reuse != InputReuse::Consumers || requirement.panelAxis >= 2 ||
-      !view || view.getType().getRank() != 2 || view.getSourceType().getRank() != 2 ||
+      requirement.panelSize <= 0 || requirement.windowAlignment <= 0) return std::nullopt;
+  auto view = source.getDefiningOp<memref::SubViewOp>();
+  bool transposed = false;
+  if (!view && source.getDefiningOp<memref::AllocOp>()) {
+    PhysicalProgramAnalysis physical(consumer->getParentOfType<func::FuncOp>());
+    auto swap = AffineMap::getPermutationMap(ArrayRef<unsigned>{1, 0}, source.getContext());
+    for (Operation *user : source.getUsers()) {
+      auto producer = dyn_cast<linalg::GenericOp>(user);
+      if (!producer || producer.getNumResults() || producer.getInputs().size() != 1 ||
+          producer.getOutputs().size() != 1 || producer.getOutputs()[0] != source ||
+          producer.getIteratorTypesArray() != SmallVector<utils::IteratorType>{
+              utils::IteratorType::parallel, utils::IteratorType::parallel}) continue;
+      Block &body = producer.getRegion().front();
+      auto maps = producer.getIndexingMapsArray();
+      if (body.getOperations().size() != 1 || body.getTerminator()->getOperand(0) != body.getArgument(0) ||
+          !maps[0].isPermutation() || !maps[1].isPermutation() ||
+          maps[0].compose(inversePermutation(maps[1])) != swap ||
+          !physical.mayReadAt(source, producer, consumer)) continue;
+      view = producer.getInputs()[0].getDefiningOp<memref::SubViewOp>();
+      if (view) { transposed = true; break; }
+    }
+  }
+  if (!view || view.getType().getRank() != 2 || view.getSourceType().getRank() != 2 ||
       llvm::any_of(view.getMixedStrides(), [](OpFoldResult stride) { return getConstantIntValue(stride) != 1; }))
-    return {};
+    return std::nullopt;
   Builder builder(source.getContext());
-  auto extent = dimension(view.getSource(), requirement.panelAxis, builder);
-  auto size = view.getMixedSizes()[requirement.panelAxis];
-  if (!extent || getConstantIntValue(view.getMixedOffsets()[requirement.panelAxis]) != 0 ||
-      (*extent != size && (!getConstantIntValue(*extent) || getConstantIntValue(*extent) != getConstantIntValue(size))))
-    return {};
-  return view.getSource();
+  auto full = [&](unsigned axis) {
+    auto extent = dimension(view.getSource(), axis, builder);
+    auto size = view.getMixedSizes()[axis];
+    return extent && getConstantIntValue(view.getMixedOffsets()[axis]) == 0 &&
+        (*extent == size || (getConstantIntValue(*extent) && getConstantIntValue(*extent) == getConstantIntValue(size)));
+  };
+  unsigned axis;
+  if (full(1)) axis = 0;
+  else if (full(0)) axis = 1;
+  else return std::nullopt;
+  unsigned panelAxis = transposed ? 1 - requirement.panelAxis : requirement.panelAxis;
+  if (axis == panelAxis && getConstantIntValue(view.getMixedSizes()[axis]) != 1 &&
+      !panelAligned(view.getMixedOffsets()[axis], requirement.windowAlignment)) return std::nullopt;
+  return ConsumerWindow{view, axis, transposed};
 }
 
 bool hasIndependentWindowCoordinates(memref::SubViewOp window, Operation *scope, Value groupCoordinate) {
@@ -144,13 +211,15 @@ void ImplementationInputs::guardLoop(scf::ForOp loop) {
 
 std::optional<InputSupply> ImplementationInputs::prepareWindow(Value source,
     const InputRequirement &requirement, linalg::GenericOp operation) {
-  Value base = consumerWindowBase(source, requirement);
-  if (!base) return std::nullopt;
-  auto view = source.getDefiningOp<memref::SubViewOp>();
+  auto window = consumerWindow(source, requirement, operation);
+  if (!window) return std::nullopt;
+  auto view = window->view;
+  Value base = view.getSource();
   PhysicalProgramAnalysis physical(function);
   auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
   if (!interface || !interface.getDisjointOutputs() || !physical.isReadOnly(base)) return std::nullopt;
-  unsigned axis = 1 - requirement.panelAxis;
+  unsigned axis = window->axis;
+  unsigned logicalAxis = window->transposed ? 1 - axis : axis;
   OpBuilder b(operation);
   auto sizes = view.getMixedSizes(), offsets = view.getMixedOffsets();
 
@@ -182,9 +251,10 @@ std::optional<InputSupply> ImplementationInputs::prepareWindow(Value source,
   if (!scope) return std::nullopt;
 
   PreparedWindow *prepared = nullptr;
-  for (auto &window : windows)
-    if (window.source == base && window.scope == scope && sameRepresentation(window.requirement, requirement)) {
-      prepared = &window;
+  for (auto &candidate : windows)
+    if (candidate.source == base && candidate.scope == scope && candidate.axis == axis &&
+        candidate.transposed == window->transposed && sameRepresentation(candidate.requirement, requirement)) {
+      prepared = &candidate;
       break;
     }
   Location loc = operation.getLoc();
@@ -192,26 +262,26 @@ std::optional<InputSupply> ImplementationInputs::prepareWindow(Value source,
     guardLoop(scope);
     b.setInsertionPoint(scope);
     SmallVector<Value> sourceSizes;
-    auto storage = allocateRepresentation(b, loc, base, requirement, sourceSizes);
+    auto storage = allocateRepresentation(b, loc, base, requirement, sourceSizes, window->transposed);
     auto initialized = b.create<memref::AllocOp>(loc, MemRefType::get({ShapedType::kDynamic}, b.getI1Type()),
-        ValueRange{sourceSizes[axis]});
+        ValueRange{sourceSizes[logicalAxis]});
     Value zero = index(b, loc, 0), clear = b.create<arith::ConstantIntOp>(loc, 0, 1);
-    loop(b, loc, zero, sourceSizes[axis], 1, [&](Value row) {
+    loop(b, loc, zero, sourceSizes[logicalAxis], 1, [&](Value row) {
       b.create<memref::StoreOp>(loc, clear, initialized, row);
     });
     b.setInsertionPointAfter(scope);
     b.create<memref::DeallocOp>(loc, initialized);
     b.create<memref::DeallocOp>(loc, storage);
-    windows.push_back({base, requirement, scope, storage, initialized});
+    windows.push_back({base, requirement, axis, window->transposed, scope, storage, initialized});
     prepared = &windows.back();
   }
   b.setInsertionPoint(operation);
   Value zero = index(b, loc, 0), panel = index(b, loc, requirement.panelSize);
   Value begin = getValueOrCreateConstantIndexOp(b, loc, offsets[axis]);
   Value count = getValueOrCreateConstantIndexOp(b, loc, sizes[axis]);
-  Value width = getValueOrCreateConstantIndexOp(b, loc, sizes[requirement.panelAxis]);
+  Value width = getValueOrCreateConstantIndexOp(b, loc, sizes[1 - axis]);
   Value clear = b.create<arith::ConstantIntOp>(loc, 0, 1), ready = b.create<arith::ConstantIntOp>(loc, 1, 1);
-  // A marker covers one complete source row, including only its valid tail.
+  // A marker covers one complete source slice, including only its valid tail.
   // Fill at the original consumer so guards never introduce extra input reads.
   loop(b, loc, zero, count, 1, [&](Value row) {
     Value coordinate = add(b, loc, begin, row);
@@ -220,24 +290,31 @@ std::optional<InputSupply> ImplementationInputs::prepareWindow(Value source,
     auto fill = b.create<scf::IfOp>(loc, needed, false);
     OpBuilder::InsertionGuard guard(b);
     b.setInsertionPointToStart(fill.thenBlock());
-    auto copy = [&](Value ordinal, Value lanes) {
-      Value start = multiply(b, loc, ordinal, panel);
-      loop(b, loc, zero, lanes, 1, [&](Value lane) {
-        SmallVector<Value> logical(2);
-        logical[axis] = row;
-        logical[requirement.panelAxis] = add(b, loc, start, lane);
-        Value value = b.create<memref::LoadOp>(loc, source, logical);
-        if (value.getType() != requirement.elementType) value = b.create<arith::ExtFOp>(loc, requirement.elementType, value);
-        b.create<memref::StoreOp>(loc, value, prepared->storage, ValueRange{ordinal, coordinate, lane});
-      });
+    auto copy = [&](Value other, Value ordinal, Value storageRow, Value lane) {
+      SmallVector<Value> logical(2);
+      logical[axis] = row;
+      logical[1 - axis] = other;
+      Value value = b.create<memref::LoadOp>(loc, view, logical);
+      if (value.getType() != requirement.elementType) value = b.create<arith::ExtFOp>(loc, requirement.elementType, value);
+      b.create<memref::StoreOp>(loc, value, prepared->storage, ValueRange{ordinal, storageRow, lane});
     };
-    Value full = b.create<arith::DivSIOp>(loc, width, panel), tail = b.create<arith::RemSIOp>(loc, width, panel);
-    loop(b, loc, zero, full, 1, [&](Value ordinal) { copy(ordinal, panel); });
-    copy(full, tail);
+    if (logicalAxis == requirement.panelAxis) {
+      Value ordinal = b.create<arith::DivSIOp>(loc, coordinate, panel);
+      Value lane = b.create<arith::RemSIOp>(loc, coordinate, panel);
+      loop(b, loc, zero, width, 1, [&](Value other) { copy(other, ordinal, other, lane); });
+    } else {
+      auto copyPanel = [&](Value ordinal, Value lanes) {
+        Value start = multiply(b, loc, ordinal, panel);
+        loop(b, loc, zero, lanes, 1, [&](Value lane) { copy(add(b, loc, start, lane), ordinal, coordinate, lane); });
+      };
+      Value full = b.create<arith::DivSIOp>(loc, width, panel), tail = b.create<arith::RemSIOp>(loc, width, panel);
+      loop(b, loc, zero, full, 1, [&](Value ordinal) { copyPanel(ordinal, panel); });
+      copyPanel(full, tail);
+    }
     b.create<memref::StoreOp>(loc, ready, prepared->initialized, coordinate);
   });
   SmallVector<Value> begins(2, zero);
-  begins[axis] = b.create<arith::SubIOp>(loc, zero, begin);
+  begins[logicalAxis] = b.create<arith::SubIOp>(loc, zero, begin);
   return InputSupply{requirement.operand, requirement.panelAxis, requirement.panelSize, prepared->storage, std::move(begins)};
 }
 

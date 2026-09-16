@@ -126,6 +126,16 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
   };
   // The selected input representation is shared by all M microtiles.
   Value columnBegin = zero;
+  if (const InputSupply *supply = supplies[1]) {
+    Value panel = index(b, loc, supply->panelSize);
+    Value relative = b.create<arith::SubIOp>(loc, tile.nBegin, supply->begins[1]);
+    Value lane = b.create<arith::RemSIOp>(loc, relative, panel);
+    Value aligned = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, lane, zero);
+    Value room = b.create<arith::SubIOp>(loc, panel, lane);
+    Value count = b.create<arith::MinSIOp>(loc, tile.nCount, room);
+    columnBegin = b.create<arith::SelectOp>(loc, aligned, zero, count);
+    loop(b, loc, zero, columnBegin, 1, [&](Value n) { rows(n, 1, 1); });
+  }
   int64_t previousVectors = microN + 1;
   for (int64_t vectors : {microN, int64_t{2}, int64_t{1}}) {
     if (vectors >= previousVectors) continue;
@@ -170,7 +180,7 @@ cpu::ImplementationRegistry implementations() {
       int64_t width = implementationParameter(binding, "vector_width");
       Type element = cast<MemRefType>(operation.getInputs()[1].getType()).getElementType();
       int64_t bytes = element.getIntOrFloatBitWidth() / 8;
-      return SmallVector<InputRequirement>{{1, element, 1, width * implementationParameter(binding, "micro_n"), width * bytes, reuse}};
+      return SmallVector<InputRequirement>{{1, element, 1, width * implementationParameter(binding, "micro_n"), width * bytes, reuse, 1}};
     };
   };
   auto directLegal = contraction.legal;
@@ -240,8 +250,8 @@ cpu::ImplementationRegistry implementations() {
     Type element = cast<MemRefType>(operation.getOutputs()[0].getType()).getElementType();
     int64_t alignment = width * element.getIntOrFloatBitWidth() / 8;
     return SmallVector<InputRequirement>{
-        {0, element, 1, config.getTileK(), alignment, InputReuse::Consumers},
-        {1, element, 1, width * implementationParameter(binding, "micro_n"), alignment, InputReuse::Consumers}};
+        {0, element, 1, config.getTileK(), alignment, InputReuse::Consumers, config.getTileK()},
+        {1, element, 1, width * implementationParameter(binding, "micro_n"), alignment, InputReuse::Consumers, 1}};
   };
   result.add(std::move(contraction));
   Implementation vector{"mojo.vector", [](Operation *op) {

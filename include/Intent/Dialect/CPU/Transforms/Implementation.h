@@ -17,6 +17,7 @@ struct InputRequirement {
   int64_t panelSize;
   int64_t alignment;
   InputReuse reuse;
+  int64_t windowAlignment; // Required panel-axis origin multiple for non-singleton windows.
 };
 
 struct InputSupply {

@@ -7,7 +7,14 @@
 
 namespace intent::cpu {
 
-mlir::Value consumerWindowBase(mlir::Value source, const InputRequirement &requirement);
+struct ConsumerWindow {
+  mlir::memref::SubViewOp view;
+  unsigned axis;
+  bool transposed;
+};
+
+std::optional<ConsumerWindow> consumerWindow(mlir::Value source,
+    const InputRequirement &requirement, mlir::Operation *consumer);
 bool hasIndependentWindowCoordinates(mlir::memref::SubViewOp window,
     mlir::Operation *loop, mlir::Value groupCoordinate = {});
 
@@ -38,6 +45,8 @@ private:
   struct PreparedWindow {
     mlir::Value source;
     InputRequirement requirement;
+    unsigned axis;
+    bool transposed;
     mlir::scf::ForOp scope;
     mlir::memref::AllocOp storage;
     mlir::memref::AllocOp initialized;
