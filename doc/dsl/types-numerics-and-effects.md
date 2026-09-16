@@ -185,6 +185,10 @@ external view定义：
 
 ## 9. Logical buffer
 
+调用形式为 `I.buffer(shape, dtype, init=None)`。`shape` 是逻辑维度 tuple，
+`dtype` 是 Intent dtype；两者必填。省略 `init` 或传入 `None` 创建未初始化
+buffer；`I.buffer(values.shape, I.f32, init=values)` 显式提供初值。
+
 logical buffer是kernel-local mutable state：
 
 - shape与dtype由作者定义；

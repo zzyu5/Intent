@@ -33,6 +33,7 @@ INTRINSIC_SIGNATURES = {
     "transpose": _signature(("value",), optional_positional=(("permutation", None),)),
     "full": _signature(("shape", "fill", "dtype")),
     "zeros": _signature(("shape", "dtype")),
+    "buffer": _signature(("shape", "dtype"), optional_positional=(("init", None),)),
     "record": Signature([Parameter("fields", Parameter.VAR_KEYWORD)]),
     "cast": _signature(("value", "dtype")),
     "bitcast": _signature(("value", "dtype")),

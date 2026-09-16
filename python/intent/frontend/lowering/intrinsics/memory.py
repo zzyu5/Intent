@@ -201,11 +201,12 @@ def _buffer(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     initializer: MlirValue | None = None
     if "init" in bound:
         expression = lowerer.lower_expression(bound["init"])
-        initializer = lowerer.materialize(
-            expression,
-            bound["init"],
-            ScalarType(dtype) if isinstance(expression, Literal) else None,
-        )
+        if expression is not None:
+            initializer = lowerer.materialize(
+                expression,
+                bound["init"],
+                ScalarType(dtype) if isinstance(expression, Literal) else None,
+            )
     shape = lower_shape(lowerer, bound["shape"], first_operand_position=0)
     operands = shape.operands + ((initializer,) if initializer is not None else ())
     attributes: dict[str, object] = {"shape": shape.relation}
