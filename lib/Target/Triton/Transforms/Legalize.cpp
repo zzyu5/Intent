@@ -1638,7 +1638,7 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
             static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), 1,
             builder.getStringAttr(""), builder.getArrayAttr({}));
         auto coordinateType = gpu::FragmentType::get(
-            gather.getContext(), gather.getCoordinates().front().getType(),
+            gather.getContext(), elementType(gather.getCoordinates().front().getType()),
             builder.getArrayAttr(selectedShape), source.getAxisMaps(),
             source.getValidity(), source.getOwner());
         auto predicateType = gpu::FragmentType::get(

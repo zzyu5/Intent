@@ -580,7 +580,8 @@ LogicalResult BroadcastOp::verify() {
     if (input.getElementType() != result.getElementType() ||
         input.getOwner() != result.getOwner() ||
         input.getShape().size() > result.getShape().size())
-      return emitOpError("broadcast physical schema is invalid");
+      return emitOpError("broadcast physical schema is invalid")
+             << "; input=" << input << "; result=" << result;
     BroadcastProjection projection = queryBroadcastProjection(input, result);
     if (!projection.isExact())
       return emitOpError(
