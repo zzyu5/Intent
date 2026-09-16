@@ -760,6 +760,11 @@ LogicalResult bindTraversalFragmentFootprints(
       if (livePointwise) {
         SmallVector<int64_t> changes;
         for (const LiveFragmentFootprint &live : liveFragments) {
+          // This knob controls only its parameter-dependent working set.
+          // Fixed SSA values may spill in the provider's register allocator;
+          // they cannot make every binding of an unrelated knob illegal.
+          if (!fragmentReferencesParameter(live.type, schema.getName()))
+            continue;
           auto registers = footprint(live.type);
           // Unknown extents do not provide a bound for candidate filtering.
           if (!registers)
