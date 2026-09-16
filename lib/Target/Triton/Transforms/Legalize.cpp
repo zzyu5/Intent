@@ -13,6 +13,7 @@
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringSet.h"
 
@@ -3315,6 +3316,13 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       }) && llvm::all_of(kernel.front(), [](Operation &operation) {
         return operation.getNumRegions() == 0;
       });
+  bool pipelineStagesAffectProgram = hasContraction && !allFp32;
+  kernel.walk([&](Operation *operation) {
+    pipelineStagesAffectProgram |=
+        isa<gpu::ScaledContractOp, gpu::SparseContractOp>(operation) ||
+        (operation->getParentOfType<scf::ForOp>() &&
+         !isMemoryEffectFree(operation));
+  });
   SmallVector<TritonLocalOptions> localOptions;
   SmallVector<int64_t> warpDomain, stageDomain, ctaDomain;
   for (const auto &row : *rows) {
@@ -3335,7 +3343,11 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
         (ctas > 1 && capabilities.getComputeCapabilityMajor() < 9))
       continue;
     if (llvm::any_of(localOptions, [&](const TritonLocalOptions &option) {
-          return option.warps == warps && option.stages == stages &&
+          // Pure loops with IEEE f32 contractions have no asynchronous
+          // pipeline producer. Keep one supplied stage setting for each
+          // warp/CTA choice instead of recompiling identical schedules.
+          return option.warps == warps &&
+                 (!pipelineStagesAffectProgram || option.stages == stages) &&
                  option.ctas == ctas;
         }))
       continue;
