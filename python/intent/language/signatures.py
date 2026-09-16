@@ -40,7 +40,7 @@ INTRINSIC_SIGNATURES = {
     "mask": _signature(("value", "valid", "fill")),
     "select": _signature(("condition", "true_value", "false_value")),
     **{name: _signature(("value",)) for name in
-       ("exp", "log", "sin", "cos", "floor", "erf", "rsqrt", "sqrt", "sigmoid", "abs")},
+       ("exp", "log", "lgamma", "sin", "cos", "floor", "erf", "rsqrt", "sqrt", "sigmoid", "abs")},
     **{name: _signature(("lhs", "rhs")) for name in
        ("add", "maximum", "minimum", "maximum_num", "minimum_num")},
     "reduce": _signature(("value", "axis", "identity", "combine"),

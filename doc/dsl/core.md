@@ -65,6 +65,8 @@ for ordinal in I.domain(0, n):
 
 pointwise surface允许scalar与size-one broadcast；frontend必须将其归一成显式broadcast relation。dynamic extents保留identity/equality conditions，不以“都是dynamic”判为兼容。
 
+`I.lgamma(value)` 计算自然对数 `log|Gamma(value)|`，接受浮点 scalar 或 tensor，保持输入的 dtype 与 shape。它是普通 pure unary operation，特殊值规则见数值章节。
+
 Floating division可使用具名入口 `I.fdiv(lhs, rhs, *, approximate=False, flush_to_zero=False)`，默认与普通 `/` 相同。`I.exp2(value, *, approximate=False, flush_to_zero=False)` 与 `I.tanh(value, *, approximate=False)` 允许作者逐操作显式选择近似数学。选项是硬件无关的 constexpr bool；非默认模式只接受 `f32`，FTZ 必须与 `approximate=True` 一起选择。它们归一到同一 canonical binary/unary operation 的数值属性，不产生另一套算法、全局 fast-math 环境或 target query；具体精度与特殊值规则见数值章节。
 
 `reshape` 保持logical row-major element order与元素总数；`transpose/permute` 的axis permutation必须与输入rank等长，包含`0..rank-1`的每个axis且仅一次。`transpose`省略permutation时反转全部axis顺序。
@@ -163,7 +165,7 @@ I.reduce.all(value, *, axis)
 
 它们接收ranked tensor，axis为一个axis或非空axis tuple；负axis按rank归一。sum使用加法零，max使用result dtype的最小值（有负无穷时为负无穷），any/all对bool input分别使用false/true。Builtin产生其固定combine与identity，作者不传`identity/combine/combine_operands`；custom summary使用generic reduce。Sum默认accumulator widening与max的NaN规则见数值章节。Empty reduce返回对应identity。
 
-`arg_reduce.max`同样归一到generic reduce，固定lowest logical index tie-break。返回的indices是输入tensor被归约轴内从0开始的逻辑位置，不是底层view、domain或subregion的绝对坐标。
+`arg_reduce.max`同样归一到generic reduce，固定lowest logical index tie-break。返回 `(value, indices)`，两者的shape均为删除被归约轴后的shape；没有剩余轴时两者均为scalar。`indices`的dtype始终为`I.index`，表示输入tensor被归约轴内从0开始的逻辑位置，不是底层view、domain或subregion的绝对坐标。
 
 ## 8. Scan
 

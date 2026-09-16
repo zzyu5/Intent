@@ -79,6 +79,10 @@ fixed-width integers使用二进制补码与modulo arithmetic：
 
 普通floating operations遵循对应格式的IEEE-754值与round-to-nearest-even。除本节规定的局部contraction-add融合、作者使用structured operation或显式approximate math外，compiler保持source expression的数据依赖与求值关系，不启用会改变结果集合的隐式fast-math。
 
+`I.lgamma(x)` 的数学定义为 `log|Gamma(x)|`。在 1、2 处返回 `+0`；
+在非正整数极点（包括正负零）和正负无穷处返回 `+inf`；NaN 输入返回 NaN。
+结果使用原浮点 dtype，仍受该格式的表示范围与普通转换规则约束。
+
 ### 5.1 显式近似数学
 
 `fdiv`、`exp2` 和 `tanh` 的 `approximate` 是操作本身的语义，不是优化 hint；默认 `False` 保持普通运算。`fdiv/exp2` 另外接受 `flush_to_zero`，仅允许在 `approximate=True` 时启用。两个参数必须是 constexpr bool，非默认模式的 operands/result 都是 `f32`，不做隐式 dtype 转换。这是一个闭合的逐操作能力，不授权普通 add/mul/FMA 重结合或改变 contraction/reduction 的语义。

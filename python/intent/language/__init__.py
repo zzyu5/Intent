@@ -54,6 +54,7 @@ from .builtins import indices
 from .builtins import join
 from .builtins import inf
 from .builtins import log
+from .builtins import lgamma
 from .builtins import mask
 from .builtins import maximum
 from .builtins import maximum_num
@@ -174,6 +175,7 @@ __all__ = [
     "join",
     "inf",
     "log",
+    "lgamma",
     "mask",
     "maximum",
     "maximum_num",

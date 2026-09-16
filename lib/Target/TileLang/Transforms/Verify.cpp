@@ -58,6 +58,11 @@ LogicalResult verifyTileLangKernel(func::FuncOp kernel) {
         "TileLang provider program contains a nested launch configuration");
   WalkResult result = kernel.walk([&](Operation *operation) {
     if (auto unary = dyn_cast<gpu::UnaryOp>(operation);
+        unary && unary.getOperatorKind() == UnaryOperator::Lgamma) {
+      unary.emitOpError("lgamma is unsupported by the TileLang provider");
+      return WalkResult::interrupt();
+    }
+    if (auto unary = dyn_cast<gpu::UnaryOp>(operation);
         unary && unary.getApproximate() &&
         unary.getOperatorKind() == UnaryOperator::Tanh) {
       auto capabilities =

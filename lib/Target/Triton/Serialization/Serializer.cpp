@@ -1468,6 +1468,8 @@ private:
       return libraryCall("libdevice.exp2");
     case UnaryOperator::Log:
       return libraryCall("libdevice.log");
+    case UnaryOperator::Lgamma:
+      return libraryCall("libdevice.lgamma");
     case UnaryOperator::Sin:
       return libraryCall("libdevice.sin");
     case UnaryOperator::Cos:

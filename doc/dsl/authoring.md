@@ -32,13 +32,13 @@ Domain 索引按资源索引顺序形成读取结果的 tensor axes，赋值仍�
 
 `I.reduce.sum/max/any/all` 返回归约后的 values，没有 `keepdim`；非空 axis tuple 可同时归约多轴。若所有轴都被归约，结果是 scalar，而非零维 tensor。补 size-one 轴时，tensor value 使用 `I.reshape`；scalar 不能 reshape，可用 `I.full` 构造 tensor，或按赋值的广播规则直接写出。
 
-`I.arg_reduce.max(value, axis=...)` 沿一个 tensor axis 归约，返回 `(values, indices)`，不能把整对结果当 indices。Indices 是输入 tensor 被归约轴内从 0 开始的位置，不自动返回底层 domain/subregion 的绝对坐标。完整归约时两项均为 scalar；保留轴时两项均为保留这些轴的 tensor。分别核对两个 component 的 dtype；写入不同 dtype 的输出前必须显式 `I.cast`，包括 `I.i64` 与 `I.index` 之间，不能因它们都使用 64 bits 就视为同一类型。
+`I.arg_reduce.max(value, axis=...)` 沿一个 tensor axis 归约，返回 `(values, indices)`，不能把整对结果当 indices。Indices 的 dtype 为 `I.index`，表示输入 tensor 被归约轴内从 0 开始的位置，不自动返回底层 domain/subregion 的绝对坐标。完整归约时两项均为 scalar；保留轴时两项均为保留这些轴的 tensor。分别核对两个 component 的 dtype；写入不同 dtype 的输出前必须显式 `I.cast`，包括 `I.i64` 与 `I.index` 之间，不能因它们都使用 64 bits 就视为同一类型。
 
 Generic `I.reduce(value, axis=..., identity=..., combine=helper)` 的 identity、两组 combine 参数和返回值必须具有删除归约轴后的同一 schema。例如 `[M,N]` 沿 `1` 归约得到 `[M]`，identity 可写成 `I.full((M,), 0.0, dtype=I.f32)`。这里检查的是进入 combine 的 dtype；builtin 的 `acc_dtype` 或默认 widening 会先转换 source，不要求原 external view 与 accumulator 同 dtype。
 
 Python tuple 与 `I.record(field=value, ...)` 是结构化 products，不要求各 component 同 dtype/shape，但每个 component 必须与对应 identity/combine/result 一致。Tuple 静态解构，record 用 `.field`；都不直接成为 host-visible kernel return。
 
-`@intent.fn` 是 typed kernel helper，不是任意 Python 调用；普通 Python `abs/math.*` 不会自动变成 DSL。先查当前 API，使用 `I.abs`、`I.sqrt` 等已声明入口，不猜 `I.log1p`、`I.keepdim` 等名字。Runtime captures 显式传参，structured combine 必须 pure。
+`@intent.fn` 是 typed kernel helper，不是任意 Python 调用；普通 Python `abs/math.*` 不会自动变成 DSL。先查当前 API，使用 `I.abs`、`I.sqrt`、`I.lgamma` 等已声明入口，不猜 `I.log1p`、`I.keepdim` 等名字。Runtime captures 显式传参，structured combine 必须 pure。
 
 ## Control、effects 与多个 kernels
 

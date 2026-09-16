@@ -790,6 +790,10 @@ private:
                  : call("T.tanh");
     case UnaryOperator::Abs: return call("T.abs");
     case UnaryOperator::Sqrt: return call("T.sqrt");
+    case UnaryOperator::Lgamma:
+      unary.emitOpError("lgamma is unsupported by the TileLang provider");
+      failed = true;
+      return "<unsupported-lgamma>";
     }
     llvm_unreachable("unhandled Intent unary operator");
   }

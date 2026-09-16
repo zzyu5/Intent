@@ -2896,6 +2896,11 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
   };
   WalkResult result = kernel.walk([&](Operation *operation) {
     if (auto unary = dyn_cast<gpu::UnaryOp>(operation);
+        unary && unary.getOperatorKind() == UnaryOperator::Lgamma) {
+      unary.emitOpError("lgamma is unsupported by the cuTile provider");
+      return WalkResult::interrupt();
+    }
+    if (auto unary = dyn_cast<gpu::UnaryOp>(operation);
         unary && unary.getApproximate() &&
         unary.getOperatorKind() == UnaryOperator::Tanh &&
         10 * capabilities.getComputeCapabilityMajor() +

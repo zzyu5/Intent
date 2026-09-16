@@ -130,6 +130,7 @@ class UnaryOperator(IntEnum):
     TANH = 11
     ABS = 12
     SQRT = 13
+    LGAMMA = 14
 
 
 class BinaryOperator(IntEnum):

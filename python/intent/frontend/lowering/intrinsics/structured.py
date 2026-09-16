@@ -256,13 +256,7 @@ def _arg_reduce_max(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
         result_types=(TensorType(intent_index, source.type.shape),),
         attributes={"tensor_axis": axes[0]},
     ).results[0]
-    indices = lowerer.emit(
-        OperationKind.CAST,
-        lowerer.location(node),
-        operands=(indices,),
-        result_types=(TensorType(i64, source.type.shape),),
-    ).results[0]
-    index_identity = lowerer.emit_literal((1 << 63) - 1, node, ScalarType(i64))
+    index_identity = lowerer.emit_literal((1 << 63) - 1, node, ScalarType(intent_index))
     combine = _argmax_combine_region(lowerer, ScalarType(acc_dtype), node)
     result_shape = tuple(
         dimension
@@ -275,7 +269,7 @@ def _arg_reduce_max(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
         operands=(source, indices, identity, index_identity),
         result_types=(
             lowerer.value_result_type(acc_dtype, result_shape),
-            lowerer.value_result_type(i64, result_shape),
+            lowerer.value_result_type(intent_index, result_shape),
         ),
         attributes={
             "axes": axes,
@@ -1120,7 +1114,7 @@ def _argmax_combine_region(
     value_type: ValueType,
     node: ast.AST,
 ):
-    types = (value_type, ScalarType(i64))
+    types = (value_type, ScalarType(intent_index))
     region = lowerer.make_region(lowerer.location(node), types + types)
     saved = lowerer.current_block
     lowerer.current_block = region.blocks[0]

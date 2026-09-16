@@ -89,6 +89,7 @@ select = Intrinsic("select")
 exp = Intrinsic("exp")
 exp2 = Intrinsic("exp2")
 log = Intrinsic("log")
+lgamma = Intrinsic("lgamma")
 sin = Intrinsic("sin")
 cos = Intrinsic("cos")
 floor = Intrinsic("floor")
@@ -182,6 +183,7 @@ INTRINSICS = {
         exp,
         exp2,
         log,
+        lgamma,
         sin,
         cos,
         floor,

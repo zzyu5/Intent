@@ -50,6 +50,7 @@ def lower_tensor_intrinsic(
         "exp": lambda context, call: _unary(context, call, UnaryOperator.EXP),
         "exp2": lambda context, call: _unary(context, call, UnaryOperator.EXP2),
         "log": lambda context, call: _unary(context, call, UnaryOperator.LOG),
+        "lgamma": lambda context, call: _unary(context, call, UnaryOperator.LGAMMA),
         "sin": lambda context, call: _unary(context, call, UnaryOperator.SIN),
         "cos": lambda context, call: _unary(context, call, UnaryOperator.COS),
         "floor": lambda context, call: _unary(context, call, UnaryOperator.FLOOR),

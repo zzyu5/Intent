@@ -1957,6 +1957,7 @@ bool isExpensiveReplayProducer(Value value) {
   case UnaryOperator::Exp:
   case UnaryOperator::Exp2:
   case UnaryOperator::Log:
+  case UnaryOperator::Lgamma:
   case UnaryOperator::Sin:
   case UnaryOperator::Cos:
   case UnaryOperator::Erf:

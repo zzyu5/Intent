@@ -1280,6 +1280,10 @@ private:
                  : call("ct.tanh");
     case UnaryOperator::Abs: return call("ct.abs");
     case UnaryOperator::Sqrt: return call("ct.sqrt");
+    case UnaryOperator::Lgamma:
+      unary.emitOpError("lgamma is unsupported by the cuTile provider");
+      failed = true;
+      return "<unsupported-lgamma>";
     }
     llvm_unreachable("unhandled Intent unary operator");
   }
