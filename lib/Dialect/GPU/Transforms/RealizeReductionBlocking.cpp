@@ -3118,7 +3118,31 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
   const bool oversized = llvm::any_of(
       reduce.getInputs().take_front(reduce.getSourceCount()),
       [&](Value source) { return exceedsRegisterFile(source, kernel); });
-  const bool required = requiresPhysicalRealization(reduce) || oversized;
+  const bool needsRealization = requiresPhysicalRealization(reduce);
+  if (!needsRealization && oversized && reduce.getAxes().size() == 1) {
+    PhysicalProgramAnalysis analysis(kernel);
+    const unsigned axis = reduce.getAxes().front();
+    bool complete = llvm::all_of(
+        reduce.getInputs().take_front(reduce.getSourceCount()),
+        [&](Value source) {
+          auto fact = analysis.axisRealization(source, axis);
+          return fact.isExact() && fact.physicalized;
+        });
+    if (complete && llvm::any_of(
+            reduce.getInputs().take_front(reduce.getSourceCount()),
+            [&](Value source) {
+              auto type = cast<FragmentType>(source.getType());
+              auto mapping = cast<AxisMapAttr>(type.getAxisMaps()[axis]);
+              return !analysis.replayability(
+                  source, sourceAxisIdentity(mapping),
+                  PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true,
+                  reduce, mapping.getDimensionId()).isReplayable();
+            }))
+      // Chunking cannot reduce a fully retained, non-replayable producer.
+      // Keep its current SSA value for the provider-native reduction.
+      return success();
+  }
+  const bool required = needsRealization || oversized;
   auto unhandled = [&](const Twine &reason) -> LogicalResult {
     return required ? reduce.emitOpError()
                           << "cannot form a complete physical reduction: "
