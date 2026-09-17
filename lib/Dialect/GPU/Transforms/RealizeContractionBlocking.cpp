@@ -301,12 +301,15 @@ FailureOr<unsigned> mappingAxisForScalar(Value value, DelinearizeOp mapping) {
   const int64_t pointwiseOwnership =
       static_cast<int64_t>(CoordinateRole::PointwiseOwnership);
   llvm::SmallDenseSet<unsigned, 2> axes;
+  bool otherCoordinate = false;
   llvm::SmallPtrSet<Operation *, 16> visited;
   std::function<void(Value)> collect = [&](Value current) {
     for (auto [axis, coordinate] : llvm::enumerate(mapping.getCoordinates()))
       if (current == coordinate) {
         if (roles[axis] == pointwiseOwnership)
           axes.insert(axis);
+        else
+          otherCoordinate = true;
         return;
       }
     Operation *producer = current.getDefiningOp();
@@ -317,8 +320,9 @@ FailureOr<unsigned> mappingAxisForScalar(Value value, DelinearizeOp mapping) {
       collect(operand);
   };
   collect(value);
-  return axes.size() == 1 ? FailureOr<unsigned>(*axes.begin())
-                          : FailureOr<unsigned>(failure());
+  return !otherCoordinate && axes.size() == 1
+             ? FailureOr<unsigned>(*axes.begin())
+             : FailureOr<unsigned>(failure());
 }
 
 LogicalResult refineOwnershipParameter(func::FuncOp kernel, MakeRangeOp range,
@@ -3346,13 +3350,11 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
            << freeAxesNeedRealization(contract, kernel)
            << "; selected_free_axes=" << hasSelectedFreeAxes(contract);
   };
-  auto lhsLoad = matrixOperandLoad(contract.getLhs());
-  auto rhsLoad = matrixOperandLoad(contract.getRhs());
-  if (!lhsLoad || !rhsLoad || contract.getLhsReductionAxes().size() != 1 ||
+  if (contract.getLhsReductionAxes().size() != 1 ||
       contract.getRhsReductionAxes().size() != 1 ||
       !contract.getLhsBatchAxes().empty() ||
       !contract.getRhsBatchAxes().empty())
-    return unhandled("requires direct loads, one reduction pair, and no batch axes");
+    return unhandled("requires one reduction pair and no batch axes");
 
   auto lhsType = contract.getLhs().getType();
   auto rhsType = contract.getRhs().getType();
@@ -3373,6 +3375,30 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       lhsReductionMap->getDimensionId() <= 0 ||
       rhsReductionMap->getDimensionId() <= 0)
     return unhandled("paired reduction axes have no logical dimensions");
+
+  auto matrixAccess = [&](Value operand, AxisMapAttr free,
+                          AxisMapAttr reduction) -> LoadOp {
+    auto replay = PhysicalProgramAnalysis(kernel).replayability(
+        operand, std::nullopt, PhysicalReplayScope::ValueGraph,
+        /*allowAccesses=*/true);
+    if (!replay.isReplayable())
+      return {};
+    for (Operation *access : replay.accesses) {
+      auto load = dyn_cast<LoadOp>(access);
+      if (!load)
+        continue;
+      auto freeCoordinate = accessCoordinatePosition(load, free);
+      auto reductionCoordinate = accessCoordinatePosition(load, reduction);
+      if (succeeded(freeCoordinate) && succeeded(reductionCoordinate) &&
+          *freeCoordinate != *reductionCoordinate)
+        return load;
+    }
+    return {};
+  };
+  auto lhsLoad = matrixAccess(contract.getLhs(), *rowMap, *lhsReductionMap);
+  auto rhsLoad = matrixAccess(contract.getRhs(), *columnMap, *rhsReductionMap);
+  if (!lhsLoad || !rhsLoad || !canReplayContractionReads(contract))
+    return unhandled("operands have no replayable matrix coordinate accesses");
 
   FailureOr<unsigned> lhsRowCoordinate =
       accessCoordinatePosition(lhsLoad, *rowMap);
@@ -3423,6 +3449,16 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       !PhysicalProgramAnalysis(kernel)
            .lockstepRanges({lhsReductionRange, rhsReductionRange}).isExact())
     return unhandled("physical coordinates are not explicit compatible ranges");
+  for (auto [operand, axis, range] : {
+           std::tuple<Value, unsigned, MakeRangeOp>{contract.getLhs(), *lhsFree,
+                                                   rowRange},
+           {contract.getLhs(), lhsReduction, lhsReductionRange},
+           {contract.getRhs(), rhsReduction, rhsReductionRange},
+           {contract.getRhs(), *rhsFree, columnRange}}) {
+    auto selected = PhysicalProgramAnalysis(kernel).rangeAxes(operand, {range});
+    if (!selected.isExact() || selected.fragmentAxes != ArrayRef<unsigned>{axis})
+      return unhandled("matrix coordinates do not select independent operand axes");
+  }
   FailureOr<Value> rowLogicalEnd = resolveLogicalRangeEnd(kernel, rowRange);
   FailureOr<Value> reductionLogicalEnd =
       resolveLogicalRangeEnd(kernel, lhsReductionRange);
@@ -3451,22 +3487,10 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   llvm::SmallPtrSet<Operation *, 8> visited;
   if (!collectStorePaths(contract.getResult(), {}, paths, visited))
     return unhandled("result does not have a complete unique-store path");
-  SmallVector<std::pair<MakeRangeOp, Value>> lhsTailRanges = {
-      {rowRange, *rowLogicalEnd},
-      {lhsReductionRange, *reductionLogicalEnd},
-  };
   SmallVector<std::pair<MakeRangeOp, Value>> outputTailRanges = {
       {rowRange, *rowLogicalEnd},
       {columnRange, *columnLogicalEnd},
   };
-  SmallVector<std::pair<MakeRangeOp, Value>> rhsTailRanges = {
-      {rhsReductionRange, *reductionLogicalEnd},
-      {columnRange, *columnLogicalEnd},
-  };
-  if (lhsLoad.getFill() && !isZeroScalar(lhsLoad.getFill()))
-    return unhandled("lhs invalid fill is not the contraction zero");
-  if (rhsLoad.getFill() && !isZeroScalar(rhsLoad.getFill()))
-    return unhandled("rhs invalid fill is not the contraction zero");
 
   SmallVector<AssumeInBoundsOp> rowAssumptions;
   if (indirectRow)
@@ -3555,6 +3579,9 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       mappingAxisForScalar(rowRange.getStart(), mapping);
   FailureOr<unsigned> existingColumnAxis =
       mappingAxisForScalar(columnRange.getStart(), mapping);
+  Value reductionStart = lhsReductionRange.getStart();
+  if (succeeded(mappingAxisForScalar(reductionStart, mapping)))
+    reductionStart = lhsReductionRange.getLogicalStart();
   if (succeeded(existingRowAxis) && succeeded(existingColumnAxis) &&
       *existingRowAxis == *existingColumnAxis)
     return unhandled(
@@ -3793,33 +3820,12 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
                                    rowBuilder.getUnitAttr());
     Value rowValid = rangeBoundsValidity(rowBuilder, location, rowIndexType,
                                          rowPredicateType, rows, rowStop);
-    Value blockedLhsRowCoordinate = rows;
     IRMapping rowReplay;
-    Value replayedLhsRowValidity;
-    if (runtimeRowTraversal) {
+    if (runtimeRowTraversal)
       rowReplay.map(rowRange.getResult(), rows);
-      if (lhsLoad.getValid()) {
-        FailureOr<Value> replayed = replaySourceValue(
-            rowBuilder, location, kernel, lhsLoad.getValid(),
-            sourceAxisIdentity(*rowMap), unitM, rowRange, rows, rowReplay,
-            contract.getOperation());
-        if (failed(replayed))
-          return lhsLoad.emitOpError(
-              "blocked contraction could not replay row-dependent validity");
-        replayedLhsRowValidity = *replayed;
-      }
-    }
     SmallVector<SmallVector<Value>> replayedStoreCoordinates;
     SmallVector<Value> replayedStoreValidities;
     if (indirectRow) {
-      FailureOr<Value> rowCoordinate = replaySourceValue(
-          rowBuilder, location, kernel, originalLhsRowCoordinate,
-          sourceAxisIdentity(*rowMap),
-          unitM, rowRange, rows, rowReplay);
-      if (failed(rowCoordinate))
-        return contract.emitOpError(
-            "blocked contraction could not replay its row coordinate graph");
-      blockedLhsRowCoordinate = *rowCoordinate;
       for (AssumeInBoundsOp assumption : rowAssumptions) {
         FailureOr<Value> index = replaySourceValue(
             rowBuilder, location, kernel, assumption.getIndex(),
@@ -3879,8 +3885,13 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
 
     std::string loopBodyFailure;
     auto loop = rowBuilder.create<scf::ForOp>(
-        location, lhsReductionRange.getStart(), reductionStop,
+        location, reductionStart, reductionStop,
         blockK.getResult(), ValueRange{*accumulator},
+        [](OpBuilder &body, Location location, Value, ValueRange carries) {
+          body.create<scf::YieldOp>(location, carries);
+        });
+    OpBuilder reductionBuilder(loop.getBody()->getTerminator());
+    auto emitReductionBody =
         [&](OpBuilder &nested, Location nestedLocation, Value kStart,
             ValueRange carries) {
           Value reductions = nested.create<MakeRangeOp>(
@@ -3916,65 +3927,69 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
           Value rhsValid = binary(nested, nestedLocation, rhsPredicateType,
                                   rhsReductions, rhsColumns,
                                   BinaryOperator::LogicalAnd);
-          FailureOr<Value> retargetedLhs = failure();
-          if (replayedLhsRowValidity) {
+          // Replay each operand independently: a shared source can occupy
+          // different M/N roles, and pointwise producers remain part of the dot.
+          auto replayOperand = [&](Value source, const IRMapping &freeSeeds,
+                                   MakeRangeOp freeRange,
+                                   Value freeCoordinates,
+                                   PhysicalExprAttr freeExtent, Value freeValid,
+                                   MakeRangeOp reductionRange,
+                                   Value reductionCoordinates, Value kValid,
+                                   FragmentType target, Value valid)
+              -> FailureOr<Value> {
+            IRMapping freeReplay(freeSeeds);
+            freeReplay.map(freeRange.getResult(), freeCoordinates);
+            auto freeValue = replaySourceValue(
+                nested, nestedLocation, source, freeExtent,
+                ArrayRef<MakeRangeOp>(freeRange), freeCoordinates, freeReplay,
+                contract.getOperation());
+            if (failed(freeValue) ||
+                failed(appendTailValidity(nestedLocation, source,
+                                         ArrayRef<MakeRangeOp>(freeRange),
+                                         freeValid, freeReplay)))
+              return failure();
             IRMapping reductionReplay;
-            reductionReplay.map(lhsReductionRange.getResult(), reductions);
-            FailureOr<Value> replayed = replaySourceValue(
-                nested, nestedLocation, kernel, replayedLhsRowValidity,
-                sourceAxisIdentity(*lhsReductionMap), unitK,
-                lhsReductionRange, reductions, reductionReplay);
-            if (failed(replayed)) {
-              loopBodyFailure =
-                  "lhs row-dependent validity could not be replayed";
-              return;
-            }
-            retargetedLhs = materializeValidityConjunction(
-                nested, nestedLocation, lhsValid, *replayed,
-                lhsPredicateType);
-          } else {
-            retargetedLhs = materializeRetargetedValidity(
-                nested, nestedLocation, lhsLoad.getValid(), lhsTailRanges,
-                lhsValid, lhsPredicateType);
-          }
-          FailureOr<Value> retargetedRhs = materializeRetargetedValidity(
-              nested, nestedLocation, rhsLoad.getValid(), rhsTailRanges,
-              rhsValid, rhsPredicateType);
-          if (failed(retargetedLhs) || failed(retargetedRhs)) {
-            loopBodyFailure = failed(retargetedLhs)
-                                  ? "lhs residual validity could not be retargeted"
-                                  : "rhs residual validity could not be retargeted";
+            reductionReplay.map(reductionRange.getResult(),
+                                reductionCoordinates);
+            auto value = replaySourceValue(
+                nested, nestedLocation, *freeValue, unitK,
+                ArrayRef<MakeRangeOp>(reductionRange), reductionCoordinates,
+                reductionReplay, loop.getBody()->getTerminator());
+            if (failed(value) ||
+                failed(appendTailValidity(nestedLocation, *freeValue,
+                                         ArrayRef<MakeRangeOp>(reductionRange),
+                                         kValid, reductionReplay)))
+              return failure();
+            auto projected = projectPhysicalValueToSchema(
+                nested, nestedLocation, *value, target);
+            auto zero = materializeZeroFragment(nested, nestedLocation, target);
+            if (failed(projected) || failed(zero))
+              return failure();
+            return nested
+                .create<SelectOp>(nestedLocation, target, valid, *projected, *zero)
+                .getResult();
+          };
+          auto lhs = replayOperand(
+              contract.getLhs(), rowReplay, rowRange, rows, unitM, rowValid,
+              lhsReductionRange, reductions, reductionValid, blockedLhsType,
+              lhsValid);
+          auto rhs = replayOperand(
+              contract.getRhs(), IRMapping{}, columnRange, columns, unitN,
+              columnValid,
+              rhsReductionRange, rhsReductionCoordinates, rhsReductionValid,
+              blockedRhsType, rhsValid);
+          if (failed(lhs) || failed(rhs)) {
+            loopBodyFailure = "operand value graph could not be replayed";
             return;
           }
-          lhsValid = *retargetedLhs;
-          rhsValid = *retargetedRhs;
-          SmallVector<Value> lhsCoordinates(lhsLoad.getCoordinates());
-          lhsCoordinates[*lhsRowCoordinate] = blockedLhsRowCoordinate;
-          lhsCoordinates[*lhsReductionCoordinate] = reductions;
-          SmallVector<Value> rhsCoordinates(rhsLoad.getCoordinates());
-          rhsCoordinates[*rhsReductionCoordinate] = rhsReductionCoordinates;
-          rhsCoordinates[*rhsColumnCoordinate] = columns;
-          FailureOr<Value> lhsFill = retargetFill(
-              nested, nestedLocation, lhsLoad.getFill(), blockedLhsType);
-          FailureOr<Value> rhsFill = retargetFill(
-              nested, nestedLocation, rhsLoad.getFill(), blockedRhsType);
-          if (failed(lhsFill) || failed(rhsFill)) {
-            loopBodyFailure = failed(lhsFill) ? "lhs fill could not be retargeted"
-                                              : "rhs fill could not be retargeted";
-            return;
-          }
-          Value lhs = nested.create<LoadOp>(
-              nestedLocation, blockedLhsType, lhsLoad.getResource(),
-              lhsCoordinates, lhsValid, *lhsFill, lhsLoad.getSourceAxes());
-          Value rhs = nested.create<LoadOp>(
-              nestedLocation, blockedRhsType, rhsLoad.getResource(),
-              rhsCoordinates, rhsValid, *rhsFill, rhsLoad.getSourceAxes());
           Value product = nested.create<ContractOp>(
-              nestedLocation, blockedResultType, lhs, rhs, carries.front(),
+              nestedLocation, blockedResultType, *lhs, *rhs, carries.front(),
               ArrayRef<int64_t>{1}, ArrayRef<int64_t>{0}, ArrayRef<int64_t>{},
               ArrayRef<int64_t>{});
-          nested.create<scf::YieldOp>(nestedLocation, product);
-        });
+          loop.getBody()->getTerminator()->setOperands(product);
+        };
+    emitReductionBody(reductionBuilder, location, loop.getInductionVar(),
+                      loop.getRegionIterArgs());
     if (!loopBodyFailure.empty()) {
       loop.erase();
       return contract.emitOpError(
@@ -4003,20 +4018,18 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       SmallVector<Value> coordinates =
           indirectRow ? replayedStoreCoordinates[pathIndex]
                       : SmallVector<Value>(path.store.getCoordinates());
-      FailureOr<unsigned> storeColumn = queryCoordinatePosition(
-          path.store.getCoordinates(),
-          sourceAxisIdentity(*columnMap));
+      FailureOr<unsigned> storeColumn = directRankOneAccessPosition(
+          path.store.getCoordinates(), path.store.getValue().getType(), 1);
       if (failed(storeColumn))
-        storeColumn = directRankOneAccessPosition(
-            path.store.getCoordinates(), path.store.getValue().getType(), 1);
-      FailureOr<unsigned> storeRow;
+        storeColumn = queryCoordinatePosition(
+            path.store.getCoordinates(), sourceAxisIdentity(*columnMap));
+      FailureOr<unsigned> storeRow = failure();
       if (!indirectRow) {
-        storeRow = queryCoordinatePosition(
-            path.store.getCoordinates(),
-            sourceAxisIdentity(*rowMap));
+        storeRow = directRankOneAccessPosition(
+            path.store.getCoordinates(), path.store.getValue().getType(), 0);
         if (failed(storeRow))
-          storeRow = directRankOneAccessPosition(
-              path.store.getCoordinates(), path.store.getValue().getType(), 0);
+          storeRow = queryCoordinatePosition(
+              path.store.getCoordinates(), sourceAxisIdentity(*rowMap));
       }
       if (failed(storeColumn))
         return path.store.emitOpError(
@@ -4102,7 +4115,6 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   };
 
   if (runtimeRowTraversal) {
-    bool rowBodyFailed = false;
     Value rowStart = rowRange.getStart();
     if (failed(existingRowAxis))
       rowStart = binary(
@@ -4114,16 +4126,9 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
                            blockM.getResult(), rowWorkers.getResult(),
                            BinaryOperator::Multiply);
     auto rowLoop = builder.create<scf::ForOp>(
-        location, rowStart, rowStop, rowStep, ValueRange{},
-        [&](OpBuilder &nested, Location nestedLocation, Value rowStart,
-            ValueRange) {
-          if (failed(emitRowBlock(nested, rowStart))) {
-            rowBodyFailed = true;
-            return;
-          }
-          nested.create<scf::YieldOp>(nestedLocation);
-        });
-    if (rowBodyFailed) {
+        location, rowStart, rowStop, rowStep);
+    OpBuilder nested(rowLoop.getBody()->getTerminator());
+    if (failed(emitRowBlock(nested, rowLoop.getInductionVar()))) {
       rowLoop.erase();
       return failure();
     }
@@ -5740,6 +5745,64 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
   });
   if (tails.wasInterrupted())
     return failure();
+  eraseDeadPhysicalValues(kernel);
+  // A reduction can consume a provisional pointwise axis. Once its old value
+  // graph is gone, that unused axis must not multiply the output workset.
+  SmallVector<DelinearizeOp> mappings;
+  kernel.walk([&](DelinearizeOp mapping) { mappings.push_back(mapping); });
+  for (DelinearizeOp mapping : mappings) {
+    auto roles = mapping->getAttrOfType<DenseI64ArrayAttr>(coordinateRolesAttr);
+    auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
+    auto offset = mapping->getAttrOfType<PhysicalExprAttr>(segmentOffsetAttr);
+    auto length = mapping->getAttrOfType<PhysicalExprAttr>(segmentLengthAttr);
+    auto program = mapping.getLinear().getDefiningOp<ProgramIdOp>();
+    if (!roles || roles.size() != mapping.getNumResults() ||
+        !llvm::is_contained(roles.asArrayRef(),
+                            static_cast<int64_t>(CoordinateRole::ContractionM)) ||
+        !llvm::is_contained(roles.asArrayRef(),
+                            static_cast<int64_t>(CoordinateRole::ContractionN)) ||
+        !program || program.getAxis() != 0 ||
+        !program.getResult().hasOneUse() || !space ||
+        space.size() != 1 || !offset || !length || space[0] != length ||
+        offset.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+        offset.getValue() != 0)
+      continue;
+    SmallVector<Type> types;
+    SmallVector<Value> extents;
+    SmallVector<Attribute> launch;
+    SmallVector<int64_t> retainedRoles;
+    SmallVector<Value> retainedCoordinates;
+    for (auto [axis, coordinate] : llvm::enumerate(mapping.getCoordinates())) {
+      if (coordinate.use_empty() &&
+          roles[axis] == static_cast<int64_t>(CoordinateRole::PointwiseOwnership))
+        continue;
+      types.push_back(coordinate.getType());
+      extents.push_back(mapping.getExtents()[axis]);
+      launch.push_back(mapping.getLaunchExtents()[axis]);
+      retainedRoles.push_back(roles[axis]);
+      retainedCoordinates.push_back(coordinate);
+    }
+    if (types.size() == mapping.getNumResults())
+      continue;
+    OpBuilder builder(mapping);
+    auto compact = builder.create<DelinearizeOp>(
+        mapping.getLoc(), types, mapping.getLinear(), extents,
+        builder.getArrayAttr(launch));
+    compact->setAttrs(mapping->getAttrs());
+    compact.setLaunchExtentsAttr(builder.getArrayAttr(launch));
+    compact->setAttr(coordinateRolesAttr,
+                     builder.getDenseI64ArrayAttr(retainedRoles));
+    length = cast<PhysicalExprAttr>(launch.front());
+    for (Attribute extent : llvm::drop_begin(launch))
+      length = binaryExpression(kernel.getContext(), PhysicalExprKind::Multiply,
+                                length, cast<PhysicalExprAttr>(extent));
+    compact->setAttr(segmentLengthAttr, length);
+    kernel->setAttr(programSpaceAttr, builder.getArrayAttr({length}));
+    for (auto [old, current] :
+         llvm::zip(retainedCoordinates, compact.getCoordinates()))
+      old.replaceAllUsesWith(current);
+    mapping.erase();
+  }
   eraseDeadPhysicalValues(kernel);
   return success();
 }
