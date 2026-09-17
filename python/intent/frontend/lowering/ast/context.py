@@ -152,7 +152,7 @@ class FunctionLowerer:
                 self.error(source.function, "@intent.fn must return a value on every runtime branch")
             self.lower_statements(body[-1:])
         if frame.returned is None:
-            self.error(source.function, "@intent.fn must end with an explicit return")
+            frame.returned = ()
         results = frame.returned
         self.inline_helpers.pop()
         self.definition = saved_definition

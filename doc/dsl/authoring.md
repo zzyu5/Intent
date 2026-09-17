@@ -40,6 +40,8 @@ Python tuple 与 `I.record(field=value, ...)` 是结构化 products，不要求�
 
 `@intent.fn` 是 typed kernel helper，不是任意 Python 调用；普通 Python `abs/math.*` 不会自动变成 DSL。先查当前 API，使用 `I.abs`、`I.sqrt`、`I.lgamma` 等已声明入口，不猜 `I.log1p`、`I.keepdim` 等名字。Runtime captures 显式传参，structured combine 必须 pure。
 
+Helper 可以没有返回值；函数体自然结束与裸 `return` 等价，都保留已经执行的 reads/effects。有值返回仍须满足 runtime 分支的返回 schema 一致性。
+
 ## Control、effects 与多个 kernels
 
 普通 `for/while` 保持顺序与 loop carry；carry 的初值与每轮更新必须保持 dtype、rank 和逻辑 shape，循环体内的 broadcast 不会改变初始 schema。Tensor carry 可按目标 shape 初始化，例如 `state = I.full(value.shape, 0.0, I.f32)`；`I.cast(0.0, I.f32)` 初始化的是 scalar。`I.parallel(domain)` 表达独立无序点，不允许 carry。Tensor predicate 使用 `I.select`，不控制 statement `if`。`Out` 进入 kernel 时未定义，读取前必须先定义；不能用 InOut 掩盖未定义读取。
