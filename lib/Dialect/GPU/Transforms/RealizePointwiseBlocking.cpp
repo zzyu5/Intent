@@ -5264,7 +5264,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       }
       for (MakeRangeOp range : ranges) {
         occurrenceRoots[range.getOperation()] = root;
-        if (positionalRemap && !repeatedDimension)
+        // The occurrence class is axis-specific even when extents repeat.
+        if (positionalRemap)
           positionalOccurrences.insert(range.getOperation());
         ownershipSources.insert(sourceAxisIdentity(range));
         if (positionalRemap)
