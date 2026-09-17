@@ -19,7 +19,6 @@ LogicalResult closeReductionValueRelations(func::FuncOp kernel) {
 
 LogicalResult normalizeStructuredSources(ModuleOp module, func::FuncOp kernel) {
   if (failed(composeContractResultReshapes(module)) ||
-      failed(realizeVectorContractions(module)) ||
       failed(refreshReshapeRelations(kernel)))
     return failure();
   return success();
@@ -51,6 +50,12 @@ LogicalResult formPointwiseBlocking(ModuleOp module, func::FuncOp kernel) {
       failed(alignAccessValueRelations(kernel)) ||
       failed(refreshReshapeRelations(kernel)) ||
       failed(alignContractValueRelations(kernel)))
+    return failure();
+  // Independent workset axes can lift a vector dot into a matrix contraction.
+  if (failed(realizeVectorContractions(module)) ||
+      failed(refreshReshapeRelations(kernel)) ||
+      failed(alignAccessValueRelations(kernel)) ||
+      failed(alignPointwiseValueRelations(kernel)))
     return failure();
   return closeReductionValueRelations(kernel);
 }

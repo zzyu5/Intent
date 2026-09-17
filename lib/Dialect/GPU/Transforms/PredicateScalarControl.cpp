@@ -4,6 +4,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 using namespace mlir;
 
@@ -14,12 +15,26 @@ bool isScalar(Type type) {
   return isa<IntegerType, IndexType, FloatType>(type);
 }
 
-bool isScalarProduct(Type type) {
+bool isPredicatableProduct(Type type) {
   if (auto record = dyn_cast<RecordType>(type))
     return llvm::all_of(record.getFieldTypes(), [](Attribute field) {
-      return isScalarProduct(cast<TypeAttr>(field).getValue());
+      return isPredicatableProduct(cast<TypeAttr>(field).getValue());
     });
-  return isScalar(type);
+  return isScalar(type) || isa<FragmentType>(type);
+}
+
+bool dependsOnWorksetCoordinate(Value value) {
+  SmallVector<Value> worklist{value};
+  llvm::SmallPtrSet<Operation *, 16> visited;
+  while (!worklist.empty()) {
+    Operation *producer = worklist.pop_back_val().getDefiningOp();
+    if (!producer || !visited.insert(producer).second)
+      continue;
+    if (isa<WorksetCoordinateOp>(producer))
+      return true;
+    llvm::append_range(worklist, producer->getOperands());
+  }
+  return false;
 }
 
 bool canPredicate(Block &block, bool allowStores = false,
@@ -32,7 +47,7 @@ bool canPredicate(Block &block, bool allowStores = false,
           !matchPattern(loop.getUpperBound(), m_ConstantInt(&upper)) ||
           !matchPattern(loop.getStep(), m_ConstantInt(&step)) ||
           !step.isStrictlyPositive() ||
-          !llvm::all_of(loop.getResultTypes(), isScalarProduct) ||
+          !llvm::all_of(loop.getResultTypes(), isPredicatableProduct) ||
           !canPredicate(*loop.getBody(), /*allowStores=*/false,
                         /*allowProducts=*/true, /*allowLoops=*/true))
         return false;
@@ -46,9 +61,19 @@ bool canPredicate(Block &block, bool allowStores = false,
         return false;
       continue;
     }
+    if (allowProducts &&
+        isa<ContractOp, ReduceOp, ReshapeOp, TransposeOp>(operation)) {
+      if (!llvm::all_of(operation.getResultTypes(), isPredicatableProduct) ||
+          !isMemoryEffectFree(&operation))
+        return false;
+      if (auto reduce = dyn_cast<ReduceOp>(operation))
+        if (!canPredicate(reduce.getCombine().front(), false, true, false))
+          return false;
+      continue;
+    }
     if (operation.getNumRegions() || !operation.getNumResults() ||
         !llvm::all_of(operation.getResultTypes(), [&](Type type) {
-          return allowProducts ? isScalarProduct(type) : isScalar(type);
+          return allowProducts ? isPredicatableProduct(type) : isScalar(type);
         }))
       return false;
     ValueRange coordinates;
@@ -56,8 +81,9 @@ bool canPredicate(Block &block, bool allowStores = false,
       coordinates = load.getCoordinates();
     else if (auto gather = dyn_cast<GatherOp>(operation))
       coordinates = gather.getCoordinates();
-    if (!llvm::all_of(coordinates, [](Value coordinate) {
-          return isScalar(coordinate.getType());
+    if (!llvm::all_of(coordinates, [&](Value coordinate) {
+          return allowProducts ? isPredicatableProduct(coordinate.getType())
+                               : isScalar(coordinate.getType());
         }))
       return false;
     bool product = allowProducts && isa<MakeRecordOp, ExtractOp>(operation) &&
@@ -82,8 +108,15 @@ SmallVector<Value> predicateBlock(OpBuilder &builder, Block &block,
 Value selectScalarProduct(OpBuilder &builder, Location location, Value condition,
                           Value lhs, Value rhs) {
   auto record = dyn_cast<RecordType>(lhs.getType());
-  if (!record)
+  if (!record) {
+    if (auto fragment = dyn_cast<FragmentType>(lhs.getType())) {
+      auto predicate = FragmentType::get(
+          fragment.getContext(), builder.getI1Type(), fragment.getShape(),
+          fragment.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
+      condition = builder.create<BroadcastOp>(location, predicate, condition);
+    }
     return builder.create<SelectOp>(location, lhs.getType(), condition, lhs, rhs);
+  }
   auto field = [&](Value value, unsigned index, Type type) -> Value {
     if (auto made = value.getDefiningOp<MakeRecordOp>())
       return made.getFields()[index];
@@ -154,20 +187,38 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
                : Value(builder.create<BroadcastOp>(location, target, value));
   };
   auto mapped = [&](Value value) { return mapping.lookupOrDefault(value); };
-  auto maskedValidity = [&](Value valid) -> Value {
+  auto maskedValidity = [&](Value valid, Type dataType) -> Value {
+    Type maskType = builder.getI1Type();
+    if (auto fragment = dyn_cast<FragmentType>(resultType(dataType)))
+      maskType = FragmentType::get(
+          fragment.getContext(), builder.getI1Type(), fragment.getShape(),
+          fragment.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
+    auto project = [&](Value value) -> Value {
+      return value.getType() == maskType
+                 ? value
+                 : Value(builder.create<BroadcastOp>(
+                       location, cast<FragmentType>(maskType), value));
+    };
+    Value condition = project(predicate);
     if (!valid)
-      return predicate;
+      return condition;
     return builder.create<BinaryOp>(
-        location, resultType(builder.getI1Type()), predicate, lift(mapped(valid)),
+        location, maskType, condition, project(mapped(valid)),
         BinaryOperator::LogicalAnd);
   };
   auto coordinates = [&](ValueRange values) {
     return llvm::to_vector(llvm::map_range(values, mapped));
   };
   auto fill = [&](Value value, Type type) -> Value {
-    return lift(value ? mapped(value)
-                      : builder.create<arith::ConstantOp>(
-                            location, builder.getZeroAttr(type)));
+    if (value)
+      return lift(mapped(value));
+    auto fragment = dyn_cast<FragmentType>(type);
+    Type element = fragment ? fragment.getElementType() : type;
+    Value zero = builder.create<arith::ConstantOp>(
+        location, builder.getZeroAttr(element));
+    if (fragment)
+      zero = builder.create<SplatOp>(location, fragment, zero);
+    return lift(zero);
   };
   Operation *clone;
   if (auto loop = dyn_cast<scf::ForOp>(operation)) {
@@ -199,18 +250,21 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
   } else if (auto store = dyn_cast<StoreOp>(operation)) {
     clone = builder.create<StoreOp>(
         location, mapped(store.getResource()), coordinates(store.getCoordinates()),
-        lift(mapped(store.getValue())), maskedValidity(store.getValid()),
+        lift(mapped(store.getValue())),
+        maskedValidity(store.getValid(), store.getValue().getType()),
         store.getSourceAxes());
   } else if (auto gather = dyn_cast<GatherOp>(operation)) {
     clone = builder.create<GatherOp>(
         location, resultType(gather.getType()), mapped(gather.getSource()),
-        coordinates(gather.getCoordinates()), maskedValidity(gather.getValid()),
+        coordinates(gather.getCoordinates()),
+        maskedValidity(gather.getValid(), gather.getType()),
         fill(gather.getFill(), gather.getType()), gather.getSourceAxes());
   } else if (auto load = dyn_cast<LoadOp>(operation)) {
     // Predicated iterations must not issue accesses in inactive lanes.
     clone = builder.create<LoadOp>(
         location, resultType(load.getType()), mapped(load.getResource()),
-        coordinates(load.getCoordinates()), maskedValidity(load.getValid()),
+        coordinates(load.getCoordinates()),
+        maskedValidity(load.getValid(), load.getType()),
         fill(load.getFill(), load.getType()), load.getSourceAxes());
   } else {
     bool vector = shape && llvm::any_of(operation->getOperands(), [&](Value value) {
@@ -257,9 +311,16 @@ LogicalResult predicateScalarControl(ModuleOp module) {
       continue;
     }
     if (conditional.getElseRegion().empty() ||
-        !llvm::all_of(conditional.getResultTypes(), isScalarProduct) ||
+        !llvm::all_of(conditional.getResultTypes(), isPredicatableProduct) ||
         !canPredicate(conditional.getThenRegion().front(), false, true, true) ||
         !canPredicate(conditional.getElseRegion().front(), false, true, true))
+      continue;
+    bool hasFragment = false;
+    for (Type type : conditional.getResultTypes())
+      type.walk([&](FragmentType) { hasFragment = true; });
+    // Tensor predication must enable workset lifting, not duplicate both
+    // sides of a launch-wide algorithm choice.
+    if (hasFragment && !dependsOnWorksetCoordinate(conditional.getCondition()))
       continue;
     OpBuilder builder(conditional);
     Value otherwise = builder.create<UnaryOp>(
