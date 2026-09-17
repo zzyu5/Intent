@@ -5,6 +5,7 @@
 #include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 #include <functional>
 
@@ -230,6 +231,27 @@ scf::IfOp independentUniformBranches(func::FuncOp kernel) {
       !conditional->use_empty() ||
       !isLaunchUniformScalar(conditional.getCondition(), kernel))
     return {};
+  // Branch-local tuning parameters are renamed and bound independently.
+  // The dispatch condition must retain one shared ABI meaning.
+  SmallVector<Value> conditions{conditional.getCondition()};
+  llvm::SmallPtrSet<Operation *, 16> visited;
+  bool referencesParameter = false;
+  AttrTypeWalker expressions;
+  expressions.addWalk([&](PhysicalExprAttr expression) {
+    referencesParameter |= expression.getKind() ==
+                           static_cast<uint32_t>(PhysicalExprKind::Parameter);
+  });
+  while (!conditions.empty()) {
+    Operation *producer = conditions.pop_back_val().getDefiningOp();
+    if (!producer || !visited.insert(producer).second)
+      continue;
+    if (isa<ParameterOp>(producer))
+      return {};
+    expressions.walk(producer->getAttrDictionary());
+    if (referencesParameter)
+      return {};
+    llvm::append_range(conditions, producer->getOperands());
+  }
   unsigned mappings = 0;
   bool hasStores[2] = {false, false};
   WalkResult eligible = kernel.walk([&](Operation *operation) {
@@ -371,11 +393,17 @@ FailureOr<bool> realizeUniformBranches(ModuleOp module, func::FuncOp kernel,
     return PhysicalExprAttr::get(module.getContext(), static_cast<uint32_t>(kind),
         value, builder.getStringAttr(""), builder.getArrayAttr(operands));
   };
-  PhysicalExprAttr offset = expression(PhysicalExprKind::Constant, 0);
+  PhysicalExprAttr zero = expression(PhysicalExprKind::Constant, 0);
+  PhysicalExprAttr offset = zero;
+  PhysicalExprAttr launchCondition = queryLaunchExpression(condition);
   for (auto [index, branch] : llvm::enumerate(branches)) {
     auto function = *getPhysicalKernel(*branch);
     auto space = function->getAttrOfType<ArrayAttr>(programSpaceAttr);
     auto length = cast<PhysicalExprAttr>(space[0]);
+    if (launchCondition)
+      length = expression(PhysicalExprKind::Select, 0,
+          {launchCondition, index == 0 ? length : zero,
+           index == 0 ? zero : length});
     IRMapping mapping;
     mapping.map(function.getArguments(), combined.getArguments());
     function.walk([&](ParameterOp parameter) {

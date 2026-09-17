@@ -589,6 +589,10 @@ IndexSign physicalIndexSign(PhysicalExprAttr expression, func::FuncOp kernel) {
     return llvm::all_of(candidates, [](int64_t value) { return value >= 0; })
                ? IndexSign::NonNegative : IndexSign::Unknown;
   }
+  if (kind == PhysicalExprKind::Select && expression.getOperands().size() == 3)
+    return std::min(
+        physicalIndexSign(cast<PhysicalExprAttr>(expression.getOperands()[1]), kernel),
+        physicalIndexSign(cast<PhysicalExprAttr>(expression.getOperands()[2]), kernel));
   if (expression.getOperands().size() != 2)
     return IndexSign::Unknown;
   IndexSign lhs = physicalIndexSign(
@@ -1706,6 +1710,26 @@ PhysicalExprAttr queryLaunchExpression(Value value) {
       return query(bound.getBound() == 0 ? range.getStart()
                    : bound.getBound() == 1 ? range.getStop() : range.getStep(),
                    depth + 1);
+    }
+    if (auto compare = current.getDefiningOp<CompareOp>()) {
+      bool equal = compare.getPredicate() == ComparePredicate::Eq;
+      if ((!equal && compare.getPredicate() != ComparePredicate::Ne) ||
+          compare.getLhs().getType() != compare.getRhs().getType())
+        return {};
+      PhysicalExprAttr lhs = query(compare.getLhs(), depth + 1);
+      PhysicalExprAttr rhs = query(compare.getRhs(), depth + 1);
+      if (!lhs || !rhs)
+        return {};
+      // Earlier fixed-width arithmetic may wrap differently from Python's
+      // launch evaluation. Direct ABI values and constants have no such step.
+      if (!lhs.getOperands().empty() || !rhs.getOperands().empty())
+        return {};
+      // Equality only observes a zero difference, which is preserved by
+      // same-width integer wraparound and host launch arithmetic alike.
+      auto difference = expression(PhysicalExprKind::Subtract, 0, {}, {lhs, rhs});
+      return expression(PhysicalExprKind::Select, 0, {},
+          {difference, expression(PhysicalExprKind::Constant, equal ? 0 : 1),
+           expression(PhysicalExprKind::Constant, equal ? 1 : 0)});
     }
     auto binary = current.getDefiningOp<BinaryOp>();
     if (!binary || !current.getType().isIndex())
