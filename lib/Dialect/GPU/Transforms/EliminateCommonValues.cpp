@@ -12,6 +12,36 @@ using namespace mlir;
 namespace intent::gpu {
 namespace {
 
+bool isSingletonInsertion(ReshapeOp reshape) {
+  auto source = cast<FragmentType>(reshape.getValue().getType());
+  auto target = cast<FragmentType>(reshape.getResult().getType());
+  if (source.getShape().size() >= target.getShape().size())
+    return false;
+  for (Attribute attribute : reshape.getReassociation()) {
+    auto group = cast<ReshapeGroupAttr>(attribute);
+    if (group.getResultAxes().empty() || group.getSourceAxes().size() > 1 ||
+        (!group.getSourceAxes().empty() && group.getResultAxes().size() != 1))
+      return false;
+  }
+  auto projection = queryBroadcastProjection(source, target);
+  if (!projection.isExact())
+    return false;
+  unsigned nextSource = 0;
+  for (auto [axis, mapped] : llvm::enumerate(projection.targetToSource)) {
+    if (mapped) {
+      if (*mapped != nextSource++ ||
+          source.getShape()[*mapped] != target.getShape()[axis])
+        return false;
+      continue;
+    }
+    auto extent = cast<PhysicalExprAttr>(target.getShape()[axis]);
+    if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+        extent.getValue() != 1)
+      return false;
+  }
+  return nextSource == source.getShape().size();
+}
+
 void eliminateInBlock(Block &block) {
   llvm::DenseMap<OperationName, SmallVector<Operation *>> available;
   for (Operation &operation : llvm::make_early_inc_range(block)) {
@@ -50,6 +80,17 @@ LogicalResult eliminateCommonValues(ModuleOp module) {
   FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
+  // Preserve the explicit axis projection for provider analysis and CSE.
+  kernel->walk([&](ReshapeOp reshape) {
+    if (!isSingletonInsertion(reshape))
+      return;
+    OpBuilder builder(reshape);
+    auto broadcast = builder.create<BroadcastOp>(
+        reshape.getLoc(), reshape.getResult().getType(), reshape.getValue());
+    broadcast->setDiscardableAttrs(llvm::to_vector(reshape->getDiscardableAttrs()));
+    reshape.getResult().replaceAllUsesWith(broadcast.getResult());
+    reshape.erase();
+  });
   for (Block &block : kernel->getBody())
     eliminateInBlock(block);
   return success();
