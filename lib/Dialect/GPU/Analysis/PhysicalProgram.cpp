@@ -748,6 +748,31 @@ bool valueKnownNonNegative(Value value, unsigned depth = 0) {
   case BinaryOperator::Subtract: {
     if (valueBelowDelinearizeExtent(binary.getRhs(), binary.getLhs(), depth + 1))
       return true;
+    if (lhs && rhs) {
+      std::function<bool(Value, unsigned)> orderedByCondition =
+          [&](Value condition, unsigned remaining) {
+        if (remaining == 0)
+          return false;
+        if (auto conjunction = condition.getDefiningOp<BinaryOp>())
+          if (conjunction.getOperatorKind() == BinaryOperator::LogicalAnd)
+            return orderedByCondition(conjunction.getLhs(), remaining - 1) ||
+                   orderedByCondition(conjunction.getRhs(), remaining - 1);
+        auto compare = condition.getDefiningOp<CompareOp>();
+        return compare &&
+               ((compare.getPredicate() == ComparePredicate::Ge &&
+                 compare.getLhs() == binary.getLhs() &&
+                 compare.getRhs() == binary.getRhs()) ||
+                (compare.getPredicate() == ComparePredicate::Le &&
+                 compare.getRhs() == binary.getLhs() &&
+                 compare.getLhs() == binary.getRhs()));
+      };
+      for (Operation *parent = binary->getParentOp(); parent;
+           parent = parent->getParentOp())
+        if (auto conditional = dyn_cast<scf::IfOp>(parent))
+          if (conditional.getThenRegion().isAncestor(binary->getParentRegion()) &&
+              orderedByCondition(conditional.getCondition(), 32 - depth))
+            return true;
+    }
     std::optional<int64_t> subtrahend = integerConstant(binary.getRhs());
     if (!subtrahend)
       return false;
@@ -1575,6 +1600,32 @@ bool samePhysicalScalarExpression(Value lhs, Value rhs) {
   Attribute left = constants.evaluate(lhs);
   Attribute right = constants.evaluate(rhs);
   return left && right && equalUniformConstants(left, right);
+}
+
+bool isLaunchUniformScalar(Value value, func::FuncOp kernel) {
+  SmallVector<Value> pending{value};
+  llvm::SmallPtrSet<Operation *, 16> visited;
+  while (!pending.empty()) {
+    Value current = pending.pop_back_val();
+    if (!current.getType().isIntOrIndexOrFloat())
+      return false;
+    if (auto argument = dyn_cast<BlockArgument>(current)) {
+      if (argument.getOwner() != &kernel.front())
+        return false;
+      continue;
+    }
+    Operation *producer = current.getDefiningOp();
+    if (!producer)
+      return false;
+    if (!visited.insert(producer).second)
+      continue;
+    if (isa<arith::ConstantOp, PhysicalExprOp, ParameterOp>(producer))
+      continue;
+    if (!isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp>(producer))
+      return false;
+    llvm::append_range(pending, producer->getOperands());
+  }
+  return true;
 }
 
 PhysicalExprAttr queryLaunchExpression(Value value) {

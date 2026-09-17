@@ -38,32 +38,6 @@ bool dependsOnWorksetCoordinate(Value value) {
   return false;
 }
 
-bool isLaunchUniformScalar(Value value, func::FuncOp kernel) {
-  SmallVector<Value> pending{value};
-  llvm::SmallPtrSet<Operation *, 16> visited;
-  while (!pending.empty()) {
-    Value current = pending.pop_back_val();
-    if (!isScalar(current.getType()))
-      return false;
-    if (auto argument = dyn_cast<BlockArgument>(current)) {
-      if (argument.getOwner() != &kernel.front())
-        return false;
-      continue;
-    }
-    Operation *producer = current.getDefiningOp();
-    if (!producer)
-      return false;
-    if (!visited.insert(producer).second)
-      continue;
-    if (isa<arith::ConstantOp, PhysicalExprOp, ParameterOp>(producer))
-      continue;
-    if (!isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp>(producer))
-      return false;
-    llvm::append_range(pending, producer->getOperands());
-  }
-  return true;
-}
-
 bool canPredicate(Block &block, bool allowStores = false,
                   bool allowProducts = false, bool allowLoops = false) {
   for (Operation &operation : block.without_terminator()) {

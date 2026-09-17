@@ -90,6 +90,7 @@ mlir::FailureOr<AxisMapAttr> queryAxisMap(mlir::Type type,
                                          unsigned fragmentAxis);
 mlir::FailureOr<int64_t> queryRangeDimension(MakeRangeOp range);
 bool samePhysicalScalarExpression(mlir::Value lhs, mlir::Value rhs);
+bool isLaunchUniformScalar(mlir::Value value, mlir::func::FuncOp kernel);
 
 /// Exact launch-visible integer expression from current scalar SSA. Device
 /// accesses, program coordinates and ordered carries are not launch leaves.
