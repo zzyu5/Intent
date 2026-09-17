@@ -2110,6 +2110,66 @@ LogicalResult legalizeContractShapes(func::FuncOp kernel) {
   return success();
 }
 
+void canonicalizeContractProjections(func::FuncOp kernel) {
+  SmallVector<Value> pending;
+  kernel.walk([&](gpu::ContractOp contract) {
+    pending.push_back(contract.getLhs());
+    pending.push_back(contract.getRhs());
+  });
+  llvm::DenseSet<Operation *> visited;
+  SmallVector<gpu::ReshapeOp> projections;
+  while (!pending.empty()) {
+    Operation *producer = pending.pop_back_val().getDefiningOp();
+    if (!producer || !visited.insert(producer).second)
+      continue;
+    llvm::append_range(pending, producer->getOperands());
+    for (Region &region : producer->getRegions())
+      for (Block &block : region)
+        llvm::append_range(pending, block.getTerminator()->getOperands());
+    auto reshape = dyn_cast<gpu::ReshapeOp>(producer);
+    if (!reshape)
+      continue;
+    auto source = cast<gpu::FragmentType>(reshape.getValue().getType());
+    auto target = cast<gpu::FragmentType>(reshape.getResult().getType());
+    if (source.getShape().size() >= target.getShape().size() ||
+        !llvm::all_of(reshape.getReassociation(), [](Attribute attribute) {
+          auto group = cast<gpu::ReshapeGroupAttr>(attribute);
+          return !group.getResultAxes().empty() &&
+                 group.getSourceAxes().size() <= 1 &&
+                 (group.getSourceAxes().empty() ||
+                  group.getResultAxes().size() == 1);
+        }))
+      continue;
+    auto projection = gpu::queryBroadcastProjection(source, target);
+    if (!projection.isExact())
+      continue;
+    unsigned nextSource = 0;
+    bool insertsUnits = llvm::all_of(
+        llvm::enumerate(projection.targetToSource), [&](const auto &entry) {
+          auto [axis, mapped] = entry;
+          if (mapped)
+            return *mapped == nextSource++ &&
+                   source.getShape()[*mapped] == target.getShape()[axis];
+          auto extent = cast<gpu::PhysicalExprAttr>(target.getShape()[axis]);
+          return extent.getKind() ==
+                     static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+                 extent.getValue() == 1;
+        });
+    if (insertsUnits && nextSource == source.getShape().size())
+      projections.push_back(reshape);
+  }
+  // Explicit expand-dims preserve pointer/mask alignment around Triton's dot
+  // pipeline. Keep unrelated high-rank reduction layout choices free.
+  for (gpu::ReshapeOp reshape : projections) {
+    OpBuilder builder(reshape);
+    auto broadcast = builder.create<gpu::BroadcastOp>(
+        reshape.getLoc(), reshape.getResult().getType(), reshape.getValue());
+    broadcast->setDiscardableAttrs(llvm::to_vector(reshape->getDiscardableAttrs()));
+    reshape.getResult().replaceAllUsesWith(broadcast.getResult());
+    reshape.erase();
+  }
+}
+
 void selectContractForms(func::FuncOp kernel) {
   kernel.getContext()->getOrLoadDialect<cf::ControlFlowDialect>();
   SmallVector<gpu::ContractOp> contracts;
@@ -3532,6 +3592,9 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
                contract.getRhs().getType().getElementType().isF32() &&
                contract.getResult().getType().getElementType().isF32();
   });
+  if (hasContraction &&
+      !llvm::is_contained(categories, gpu::ParameterCategory::Contraction))
+    categories.push_back(gpu::ParameterCategory::Contraction);
   auto rows = profiles.get("triton", localOptionsFamily(
       categories, twoAxisPointwise, blackwell && hasRecurrentContraction(kernel),
       hasContraction && allFp32), kernel.getLoc());
@@ -3630,6 +3693,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       failed(materializeLegalConfigs(kernel, *tensorDescriptorForms, localOptions)))
     return failure();
   selectContractForms(kernel);
+  canonicalizeContractProjections(kernel);
   SmallVector<gpu::AssumeInBoundsOp> boundsAssumptions;
   kernel.walk([&](gpu::AssumeInBoundsOp assumption) {
     boundsAssumptions.push_back(assumption);
