@@ -1,6 +1,7 @@
 #include "Intent/Target/Triton/Transforms/Passes.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -2110,6 +2111,34 @@ LogicalResult legalizeContractShapes(func::FuncOp kernel) {
   return success();
 }
 
+void foldExactConstantDivisions(func::FuncOp kernel) {
+  kernel.walk([&](gpu::BinaryOp binary) {
+    Type element = gpu::uniformElementType(binary.getResult().getType());
+    if (binary.getOperatorKind() != BinaryOperator::TrueDivide ||
+        binary.getApproximate() || binary.getFlushToZero() ||
+        (!element.isF32() && !element.isF64()))
+      return;
+    auto constant = dyn_cast_or_null<FloatAttr>(
+        UniformValueAnalysis(gpu::describeUniformValue).evaluate(binary.getRhs()));
+    if (!constant || !constant.getValue().isNormal())
+      return;
+    llvm::APFloat inverse(constant.getValue().getSemantics());
+    if (!constant.getValue().getExactInverse(&inverse) || !inverse.isNormal())
+      return;
+    OpBuilder builder(binary);
+    Value reciprocal = builder.create<arith::ConstantOp>(
+        binary.getLoc(), FloatAttr::get(element, inverse));
+    if (auto fragment = dyn_cast<gpu::FragmentType>(binary.getRhs().getType()))
+      reciprocal = builder.create<gpu::SplatOp>(binary.getLoc(), fragment, reciprocal);
+    auto product = builder.create<gpu::BinaryOp>(
+        binary.getLoc(), binary.getResult().getType(), binary.getLhs(), reciprocal,
+        BinaryOperator::Multiply);
+    product->setDiscardableAttrs(llvm::to_vector(binary->getDiscardableAttrs()));
+    binary.getResult().replaceAllUsesWith(product.getResult());
+    binary.erase();
+  });
+}
+
 void canonicalizeContractProjections(func::FuncOp kernel) {
   SmallVector<Value> pending;
   kernel.walk([&](gpu::ContractOp contract) {
@@ -3693,6 +3722,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       failed(materializeLegalConfigs(kernel, *tensorDescriptorForms, localOptions)))
     return failure();
   selectContractForms(kernel);
+  foldExactConstantDivisions(kernel);
   canonicalizeContractProjections(kernel);
   SmallVector<gpu::AssumeInBoundsOp> boundsAssumptions;
   kernel.walk([&](gpu::AssumeInBoundsOp assumption) {
