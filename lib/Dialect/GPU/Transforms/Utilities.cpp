@@ -1318,6 +1318,14 @@ FailureOr<Value> materializeReplayedValue(
       for (unsigned candidate = 0; candidate < fragment.getShape().size(); ++candidate) {
         if (axis && candidate != *axis)
           continue;
+        // Equal traversal bounds do not identify independent logical axes.
+        auto candidateMap = cast<AxisMapAttr>(fragment.getAxisMaps()[candidate]);
+        if (!llvm::any_of(options.traversalRanges, [&](MakeRangeOp range) {
+              auto dimension = queryRangeDimension(range);
+              return succeeded(dimension) &&
+                     *dimension == candidateMap.getDimensionId();
+            }))
+          continue;
         PhysicalRangeFact fact = analysis.axisRanges(current, candidate);
         if (fact.state == PhysicalFactState::Unknown || !fact.blockers.empty() ||
             fact.roots.empty())

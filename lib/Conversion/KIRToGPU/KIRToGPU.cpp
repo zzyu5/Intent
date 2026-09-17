@@ -43,6 +43,8 @@ RankedTensorType viewTensor(Value value) {
 }
 
 bool isCanonicalEffect(Operation *operation) {
+  if (auto buffer = dyn_cast<BufferOp>(operation))
+    return buffer.getInitialOperand().has_value();
   return isa<ViewStoreOp, BufferStoreOp, ScatterUniqueOp, ScatterReduceOp,
              AtomicStoreOp, AtomicRMWOp, AtomicCompareExchangeOp>(operation);
 }
@@ -4420,10 +4422,7 @@ private:
           allocation.instanceIdentity,
           /*owner=*/1,
           gpu::BufferInitializationAttr::get(
-              operation->getContext(),
-              allocation.hasFullInitialValue
-                  ? gpu::BufferInitialization::FullValue
-                  : gpu::BufferInitialization::FirstWrite),
+              operation->getContext(), gpu::BufferInitialization::FirstWrite),
           gpu::BufferLifetimeAttr::get(operation->getContext(), lifetime),
           /*visibility=*/0, /*workspace=*/false);
       Value initial;
@@ -4434,8 +4433,68 @@ private:
           return buffer.emitOpError("logical buffer initializer is unavailable");
         initial = *lowered;
       }
-      auto target =
-          builder.create<gpu::BufferOp>(location, physicalType, initial);
+      // Materialize initialization as an ordered write in the shared program.
+      if (initial && !isa<gpu::FragmentType>(initial.getType()) && !shape.empty()) {
+        auto payload = convertTensorType(tensor, operation);
+        if (failed(payload))
+          return buffer.emitOpError("scalar initializer has no buffer shape");
+        initial = builder.create<gpu::SplatOp>(location, *payload, initial);
+      }
+      if (initial)
+        for (unsigned axis = 0; axis < shape.size(); ++axis)
+          if (cast<gpu::FragmentType>(initial.getType()).getShape()[axis] !=
+                  shape[axis] &&
+              failed(gpu::realizeFullCoverageDimension(physicalKernel, initial,
+                                                      axis)))
+            return buffer.emitOpError(
+                "buffer initializer has no complete physical value");
+      auto target = builder.create<gpu::BufferOp>(location, physicalType, Value());
+      if (initial) {
+        auto payload = dyn_cast<gpu::FragmentType>(initial.getType());
+        SmallVector<Value> coordinates;
+        SmallVector<int64_t> axes;
+        Value valid;
+        Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+        Value one = builder.create<arith::ConstantIndexOp>(location, 1);
+        for (unsigned axis = 0; axis < shape.size(); ++axis) {
+          auto mapping = cast<gpu::AxisMapAttr>(payload.getAxisMaps()[axis]);
+          auto coordinateType = gpu::FragmentType::get(
+              operation->getContext(), builder.getIndexType(),
+              builder.getArrayAttr({payload.getShape()[axis]}),
+              builder.getArrayAttr({gpu::AxisMapAttr::get(
+                  operation->getContext(), mapping.getSourceId(),
+                  mapping.getSourceAxis(), mapping.getDimensionId(), 0,
+                  mapping.getDerived())}),
+              payload.getValidity(), payload.getOwner());
+          Value stop = builder.create<gpu::PhysicalExprOp>(
+              location, builder.getIndexType(), cast<PhysicalExprAttr>(shape[axis]));
+          Value width = builder.create<gpu::PhysicalExprOp>(
+              location, builder.getIndexType(),
+              cast<PhysicalExprAttr>(payload.getShape()[axis]));
+          Value coordinate = builder.create<gpu::MakeRangeOp>(
+              location, coordinateType, zero, width, one, zero, stop,
+              mapping.getSourceId(), mapping.getSourceAxis(), mapping.getDerived());
+          coordinates.push_back(coordinate);
+          axes.push_back(axis);
+          auto predicateType = gpu::FragmentType::get(
+              operation->getContext(), builder.getI1Type(),
+              coordinateType.getShape(), coordinateType.getAxisMaps(),
+              coordinateType.getValidity(), coordinateType.getOwner());
+          Value end = builder.create<gpu::SplatOp>(location, coordinateType, stop);
+          Value predicate = builder.create<gpu::CompareOp>(
+              location, predicateType, coordinate, end, ComparePredicate::Lt);
+          auto projected = gpu::projectPredicateToFragmentAxis(
+              builder, location, predicate, payload, axis);
+          if (failed(projected))
+            return buffer.emitOpError("buffer initializer has no tail projection");
+          valid = valid ? createBinary(builder, location, (*projected).getType(),
+                                        valid, *projected, BinaryOperator::LogicalAnd)
+                        : *projected;
+        }
+        auto initialized = builder.create<gpu::StoreOp>(
+            location, target, coordinates, initial, valid, axes);
+        attachOrigin(operation, initialized);
+      }
       mapResults(operation, target);
       return success();
     }

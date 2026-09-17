@@ -3,11 +3,7 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Target/Triton/IR/TritonOps.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "llvm/ADT/StringSet.h"
-#include "llvm/Support/MathExtras.h"
-
-#include <limits>
 
 using namespace mlir;
 
@@ -29,13 +25,14 @@ LogicalResult materializeProgramBuffers(ModuleOp module) {
                extent.getValue() == 1;
       }))
     return kernel.emitError("Triton mutable buffers require one physical program");
-  auto [source, dimension] = gpu::nextPhysicalAxisIdentities(kernel);
   for (gpu::BufferOp buffer : buffers) {
     auto type = buffer.getResult().getType();
     if (type.getScope().getValue() != gpu::BufferScope::ProgramPrivate ||
         type.getLifetime().getValue() != gpu::BufferLifetime::Program ||
         buffer->getBlock() != &kernel.front())
       return buffer.emitOpError("Triton mutable buffer requires an entry program allocation");
+    if (buffer.getInitialValue())
+      return buffer.emitOpError("buffer initialization must be lowered to explicit writes");
     for (Operation *user : buffer.getResult().getUsers())
       if (!isa<gpu::LoadOp, gpu::StoreOp, gpu::AssumeInBoundsOp>(user))
         return user->emitOpError("Triton mutable buffer supports explicit loads and stores");
@@ -46,91 +43,11 @@ LogicalResult materializeProgramBuffers(ModuleOp module) {
            kind != gpu::PhysicalExprKind::Dimension) || extent.getValue() <= 0)
         return buffer.emitOpError(
             "Triton mutable buffer requires positive constants or ABI dimensions");
-      if (buffer.getInitialValue() && kind != gpu::PhysicalExprKind::Constant)
-        return buffer.emitOpError(
-            "Triton mutable buffer initialization requires a static shape");
     }
 
-    OpBuilder builder(buffer);
-    Value initial = buffer.getInitialValue();
     Value workspace = gpu::createInvocationWorkspace(
         kernel, buffer.getLoc(), type.getElementType(), type.getShape(),
         type.getOwner());
-    if (initial) {
-      auto payload = dyn_cast<gpu::FragmentType>(initial.getType());
-      if (!payload) {
-        SmallVector<Attribute> maps;
-        for (unsigned axis = 0; axis < type.getShape().size(); ++axis)
-          maps.push_back(gpu::AxisMapAttr::get(kernel.getContext(), source, axis,
-                                              dimension++, axis, false));
-        ++source;
-        payload = gpu::FragmentType::get(kernel.getContext(), type.getElementType(),
-            type.getShape(), builder.getArrayAttr(maps), 1, type.getOwner());
-      }
-      if (auto splat = initial.getDefiningOp<gpu::SplatOp>())
-        initial = splat.getValue();
-      if (auto broadcast = initial.getDefiningOp<gpu::BroadcastOp>();
-          broadcast && !isa<gpu::FragmentType, gpu::RecordType>(broadcast.getValue().getType()))
-        initial = broadcast.getValue();
-      SmallVector<Value> coordinates, predicates;
-      SmallVector<int64_t> axes;
-      SmallVector<Attribute> shape;
-      for (auto [axis, attribute] : llvm::enumerate(type.getShape())) {
-        int64_t count = cast<gpu::PhysicalExprAttr>(attribute).getValue();
-        uint64_t padded = llvm::PowerOf2Ceil(static_cast<uint64_t>(count));
-        if (padded > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
-          return buffer.emitOpError("Triton buffer initialization extent exceeds index range");
-        auto extent = gpu::PhysicalExprAttr::get(kernel.getContext(),
-            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), padded,
-            builder.getStringAttr(""), builder.getArrayAttr({}));
-        shape.push_back(extent);
-        auto mapping = cast<gpu::AxisMapAttr>(payload.getAxisMaps()[axis]);
-        auto ordinal = gpu::AxisMapAttr::get(kernel.getContext(),
-            mapping.getSourceId(), mapping.getSourceAxis(), mapping.getDimensionId(),
-            0, mapping.getDerived());
-        auto rangeType = gpu::FragmentType::get(kernel.getContext(), builder.getIndexType(),
-            builder.getArrayAttr({extent}), builder.getArrayAttr({ordinal}),
-            payload.getValidity(), payload.getOwner());
-        Value zero = builder.create<arith::ConstantIndexOp>(buffer.getLoc(), 0);
-        Value one = builder.create<arith::ConstantIndexOp>(buffer.getLoc(), 1);
-        Value size = builder.create<arith::ConstantIndexOp>(buffer.getLoc(), count);
-        Value width = builder.create<arith::ConstantIndexOp>(buffer.getLoc(), padded);
-        Value range = builder.create<gpu::MakeRangeOp>(buffer.getLoc(), rangeType,
-            zero, width, one, zero, size, mapping.getSourceId(), mapping.getSourceAxis(),
-            mapping.getDerived());
-        coordinates.push_back(range);
-        axes.push_back(axis);
-        if (padded != static_cast<uint64_t>(count)) {
-          Value end = builder.create<gpu::BroadcastOp>(buffer.getLoc(), rangeType, size);
-          auto boolean = gpu::FragmentType::get(kernel.getContext(), builder.getI1Type(),
-              rangeType.getShape(), rangeType.getAxisMaps(),
-              rangeType.getValidity(), rangeType.getOwner());
-          predicates.push_back(builder.create<gpu::CompareOp>(buffer.getLoc(),
-              boolean, range, end, ComparePredicate::Lt));
-        }
-      }
-      auto boolean = gpu::FragmentType::get(kernel.getContext(), builder.getI1Type(),
-          builder.getArrayAttr(shape), payload.getAxisMaps(),
-          payload.getValidity(), payload.getOwner());
-      Value valid;
-      for (Value predicate : predicates) {
-        auto projected = gpu::materializeBroadcastToFragment(
-            builder, buffer.getLoc(), predicate, boolean);
-        if (failed(projected))
-          return buffer.emitOpError("Triton buffer initialization predicate has no exact projection");
-        valid = valid ? Value(builder.create<gpu::BinaryOp>(buffer.getLoc(), boolean,
-                    valid, *projected, BinaryOperator::LogicalAnd)) : *projected;
-      }
-      auto valueType = gpu::FragmentType::get(kernel.getContext(), type.getElementType(),
-          builder.getArrayAttr(shape), payload.getAxisMaps(),
-          payload.getValidity(), payload.getOwner());
-      if (!isa<gpu::FragmentType>(initial.getType()))
-        initial = builder.create<gpu::BroadcastOp>(buffer.getLoc(), valueType, initial);
-      else if (initial.getType() != valueType)
-        return buffer.emitOpError("Triton buffer initializer requires complete physical padding");
-      builder.create<gpu::StoreOp>(buffer.getLoc(), workspace,
-                                   coordinates, initial, valid, axes);
-    }
     buffer.getResult().replaceAllUsesWith(workspace);
     buffer.erase();
   }

@@ -1978,18 +1978,25 @@ bool canReplayReadAt(LoadOp load, Operation *insertionAnchor) {
       return WalkResult::interrupt();
     }).wasInterrupted();
   };
+  // A branch only needs its executed prefix; entering a loop also exposes
+  // this read to writes from earlier iterations.
   Operation *ancestor = insertionAnchor;
   while (ancestor && ancestor->getBlock() != load->getBlock()) {
-    if (!preservesRead(ancestor))
+    Operation *parent = ancestor->getParentOp();
+    if (!isa_and_nonnull<scf::IfOp, scf::ForOp, scf::WhileOp>(parent))
       return false;
-    ancestor = ancestor->getParentOp();
+    if (!isa<scf::IfOp>(parent) && !preservesRead(parent))
+      return false;
+    for (Operation &preceding : *ancestor->getBlock()) {
+      if (&preceding == ancestor)
+        break;
+      if (!preservesRead(&preceding))
+        return false;
+    }
+    ancestor = parent;
   }
   if (!ancestor || ancestor == load ||
       !load->isBeforeInBlock(ancestor))
-    return false;
-  // Entering a loop can repeat this read after writes from an earlier
-  // iteration, even when the first insertion point precedes those writes.
-  if (ancestor != insertionAnchor && !preservesRead(ancestor))
     return false;
   for (Operation *next = load->getNextNode(); next != ancestor;
        next = next->getNextNode())
@@ -3405,9 +3412,19 @@ PhysicalProgramAnalysis::rangeAxes(Value value,
   result.state = PhysicalFactState::Exact;
   for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
     PhysicalRangeFact ranges = axisRanges(value, axis);
+    auto axisMap = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
     auto selectedRange = [&](MakeRangeOp range) {
       return llvm::any_of(selectedRoots, [&](MakeRangeOp selectedRoot) {
-        return range == selectedRoot || sameLogicalRange(range, selectedRoot);
+        if (range == selectedRoot || sameLogicalRange(range, selectedRoot))
+          return true;
+        // A renamed coordinate must project through the already selected axis.
+        auto dimension = queryRangeDimension(range);
+        auto selectedDimension = queryRangeDimension(selectedRoot);
+        return succeeded(dimension) && succeeded(selectedDimension) &&
+               *dimension == *selectedDimension &&
+               axisMap.getDimensionId() == *selectedDimension &&
+               sourceAxisIdentity(axisMap) == sourceAxisIdentity(selectedRoot) &&
+               lockstepRanges({range, selectedRoot}).isExact();
       });
     };
     bool selected = llvm::any_of(ranges.roots, selectedRange);

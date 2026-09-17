@@ -444,8 +444,14 @@ FailureOr<Value> replaySourceValueImpl(OpBuilder &builder, Location location,
   if (auto range = value.getDefiningOp<MakeRangeOp>())
     if (llvm::any_of(roots, [&](MakeRangeOp root) {
           return range == root || sameLogicalRange(range, root);
-        }))
-      return replacement;
+        })) {
+      auto original = range.getResult().getType();
+      auto coordinate = cast<FragmentType>(replacement.getType());
+      auto target = FragmentType::get(
+          value.getContext(), original.getElementType(), coordinate.getShape(),
+          original.getAxisMaps(), original.getValidity(), original.getOwner());
+      return projectPhysicalValueToSchema(builder, location, replacement, target);
+    }
   bool relocate = insertionAnchor && dominance &&
                   !dominance->dominates(value, insertionAnchor);
   auto originalResultType = dyn_cast<FragmentType>(value.getType());
@@ -511,10 +517,16 @@ FailureOr<Value> replaySourceValueImpl(OpBuilder &builder, Location location,
         "selected range value does not have a single replayable result");
     return failure();
   }
+  SmallVector<MakeRangeOp> operandRoots(roots.begin(), roots.end());
+  for (unsigned axis : selected.fragmentAxes)
+    for (MakeRangeOp root :
+         PhysicalProgramAnalysis(kernel).axisRanges(value, axis).roots)
+      if (!llvm::is_contained(operandRoots, root))
+        operandRoots.push_back(root);
   for (Value operand : producer->getOperands()) {
     FailureOr<Value> replayed = replaySourceValueImpl(
-        builder, location, kernel, operand, blockedExtent, roots, replacement,
-        mapping, insertionAnchor, dominance);
+        builder, location, kernel, operand, blockedExtent, operandRoots,
+        replacement, mapping, insertionAnchor, dominance);
     if (failed(replayed)) {
       producer->emitOpError(
           "selected range value has an operand that cannot be replayed");
