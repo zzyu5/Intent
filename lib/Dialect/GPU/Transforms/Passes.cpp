@@ -467,7 +467,9 @@ LogicalResult runSharedGPUPasses(ModuleOp module, const TuningProfiles &profiles
   if (!realizedBranches && failed(runTransformations(module, *kernel))) {
     return failure();
   }
-  if (failed(closeSharedConfigurations(*kernel, profiles)))
+  if (failed(closeSharedConfigurations(*kernel, profiles)) ||
+      failed(fuseIndependentTraversals(module)) ||
+      failed(verifySharedConfigTuples(*kernel)))
     return failure();
   return verifyGPUProgram(module);
 }
