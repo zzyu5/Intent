@@ -14,6 +14,10 @@ Tensor 和 view 有 `.shape`；scalar、tuple、record、domain 没有统一 `.s
 
 `I.zeros`、`I.full` 和 indexed read 的结果都是不可变 tensor SSA values。下标赋值和 `I.store` 的写入目标必须是可写 view 或 logical buffer，不能原地修改这些 tensor values。Tensor carry 通过计算新 tensor 并重新绑定名字更新；逐地址写入则使用显式存储。
 
+### Comparison operators（比较运算）
+
+Scalar/tensor 比较使用 Python 运算符 `==`、`!=`、`<`、`<=`、`>`、`>=`，结果 dtype 为 `I.bool`。操作数按普通 literal/dtype 与尾部 broadcast 规则对齐，结果保留广播后的 shape；这些运算符不是 `I.eq` 等 intrinsic 调用。
+
 ## Domain、index 与 broadcast
 
 `rows = I.domain(0, M)` 是 logical coordinate domain，不是整数 tensor，也不是归约的 axis 编号。Domain 本身不参与数值算术或比较；需要坐标值时先使用 `I.indices(rows)` 产生 logical index tensor。坐标和 domain 循环变量使用 `I.index`，与 runtime `I.i64` 不同；参与坐标算术的 runtime 步幅、偏移等先显式转为 `I.index`，循环变量参与浮点运算前则转为相应浮点 dtype。`x[rows, columns]` 读取完整二维 logical region；`I.reduce.sum(value, axis=1)` 的 `1` 指 value 的第二个 axis。
@@ -25,6 +29,8 @@ Pointwise 按尾部对齐，允许 scalar/size-one broadcast。`[M]` 与 `[M,N]`
 Domain 索引按资源索引顺序形成读取结果的 tensor axes，赋值仍按 positional axes 对齐，不按 domain 变量名自动换轴。例如两个等长 domains 下，`output[rows, columns] = input[columns, rows]` 不表示矩阵转置；应显式转置读取的 tensor value，或构造具有所需对应关系的坐标 tensor。不同 subregions 的动态长度也不会因本次输入碰巧等长而成为同一 extent；需要使用已成立的 shape relation，或在共同输出 domain 上表达坐标映射。
 
 多个 tensor indices 按 broadcast 规则形成共同的索引 shape，坐标逐位置配对，不自动形成 Cartesian product；所有 tensor indices 共同贡献一份 broadcast shape，每个 domain index 另外引入一个独立 logical axis。Tensor index 的 size-one 轴也属于这份 shape，不会因旁边有 domain 而自动消失。索引赋值的右值必须能 broadcast 到该索引表达式的结果 shape，目标 view 不会替右值隐式降维。例如二维逐元素按第 0 轴 gather，使用 `index=(indices[rows, columns], I.reshape(I.indices(columns), (1, N)))`。这里第二项是可广播的列坐标 tensor，直接传 `columns` domain 会额外引入一个轴。
+
+`I.gather(source, index, valid=True, fill=0)` 使用与 `source[index]` 相同的索引关系。`valid` 必须为 bool，`fill` 与 source 同 dtype，两者均须能广播到索引结果的 shape，不能扩大它。无效成员不读取 source，而返回 fill；省略 fill 时使用 source dtype 的零，bool 使用 `False`。
 
 ## Reduce、tuple 与 helpers
 

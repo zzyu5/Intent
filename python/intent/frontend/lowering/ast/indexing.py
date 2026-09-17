@@ -142,6 +142,15 @@ def lower_subscript(
     return operation.results[0]
 
 
+def index_expressions(node: ast.AST):
+    terms = node.elts if isinstance(node, ast.Tuple) else (node,)
+    for term in terms:
+        if isinstance(term, ast.Slice):
+            yield from (value for value in (term.lower, term.upper, term.step) if value is not None)
+        elif not (_is_new_axis(term) or _is_ellipsis(term) or _is_full_slice_call(term)):
+            yield term
+
+
 def lower_index(
     lowerer: FunctionLowerer,
     source: MlirValue,

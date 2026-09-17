@@ -52,6 +52,7 @@ INTRINSIC_SIGNATURES = {
     "region_scan": _signature(("source", "axis", "summarize", "combine", "identity", "initial_state", "apply", "emit"),
                               optional_positional=(("operands", ()),)),
     "histogram": _signature(("values", "bins", "valid", "count_dtype")),
+    "gather": _signature(("source", "index"), optional_positional=(("valid", True), ("fill", 0))),
     "store": _signature(("target", "index", "value")),
     "mutable_load": _signature(("target", "index")),
     "random.bits": _signature(("seed", "logical_counter")),

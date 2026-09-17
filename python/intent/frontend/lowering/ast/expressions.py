@@ -351,9 +351,18 @@ def _lower_call(lowerer: object, node: ast.Call) -> Expression:
         from ..intrinsics import lower_intrinsic
 
         if callee.name in INTRINSIC_SIGNATURES:
+            from .indexing import index_expressions
+
+            index_argument = None
+            if callee.name in {"gather", "store", "mutable_load"}:
+                index_argument = node.args[1] if len(node.args) > 1 else next(
+                    (keyword.value for keyword in node.keywords if keyword.arg == "index"), None
+                )
+            # Index syntax is consumed later; cache its expressions, not its tuple.
             evaluated = {
-                argument: lowerer.lower_expression(argument)
+                expression: lowerer.lower_expression(expression)
                 for argument in (*node.args, *(keyword.value for keyword in node.keywords))
+                for expression in (index_expressions(argument) if argument is index_argument else (argument,))
             }
             previous = lowerer.call_arguments
             lowerer.call_arguments = {**previous, **evaluated}
