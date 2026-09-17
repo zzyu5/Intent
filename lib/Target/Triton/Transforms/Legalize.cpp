@@ -2302,6 +2302,16 @@ void selectContractForms(func::FuncOp kernel) {
   for (gpu::ContractOp contract : contracts) {
     OpBuilder builder(contract);
     auto shape = contract.getAccumulator().getType().getShape().getValue();
+    // A unit matrix axis offers no second free axis to amortize serial K work.
+    // Keep its legal multiply/reduce expansion parallel along K.
+    ArrayRef<Attribute> matrixAxes =
+        shape.take_back(std::min<size_t>(2, shape.size()));
+    if (llvm::any_of(matrixAxes, [&](Attribute dimension) {
+          auto extent = evaluateCompileTimeExpression(
+              cast<gpu::PhysicalExprAttr>(dimension), TritonConfig{});
+          return extent && *extent == 1;
+        }))
+      continue;
     auto elements = cast<gpu::PhysicalExprAttr>(shape.front());
     for (Attribute extent : shape.drop_front())
       elements = gpu::PhysicalExprAttr::get(
@@ -2321,6 +2331,19 @@ void selectContractForms(func::FuncOp kernel) {
     Value wide = builder.create<gpu::CompareOp>(
         contract.getLoc(), builder.getI1Type(), count, limit,
         ComparePredicate::Ge);
+    for (Attribute dimension : matrixAxes) {
+      auto extent = cast<gpu::PhysicalExprAttr>(dimension);
+      if (evaluateCompileTimeExpression(extent, TritonConfig{}))
+        continue;
+      Value width = builder.create<gpu::PhysicalExprOp>(
+          contract.getLoc(), builder.getIndexType(), extent);
+      Value one = builder.create<arith::ConstantIndexOp>(contract.getLoc(), 1);
+      Value multiple = builder.create<gpu::CompareOp>(
+          contract.getLoc(), builder.getI1Type(), width, one, ComparePredicate::Gt);
+      wide = builder.create<gpu::BinaryOp>(
+          contract.getLoc(), builder.getI1Type(), wide, multiple,
+          BinaryOperator::LogicalAnd);
+    }
     auto choice = builder.create<scf::IfOp>(
         contract.getLoc(), TypeRange{contract.getResult().getType()}, wide, true);
     builder.setInsertionPointToStart(&choice.getThenRegion().front());
