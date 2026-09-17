@@ -28,7 +28,9 @@ Pointwise 按尾部对齐，允许 scalar/size-one broadcast。`[M]` 与 `[M,N]`
 
 Domain 索引按资源索引顺序形成读取结果的 tensor axes，赋值仍按 positional axes 对齐，不按 domain 变量名自动换轴。例如两个等长 domains 下，`output[rows, columns] = input[columns, rows]` 不表示矩阵转置；应显式转置读取的 tensor value，或构造具有所需对应关系的坐标 tensor。不同 subregions 的动态长度也不会因本次输入碰巧等长而成为同一 extent；需要使用已成立的 shape relation，或在共同输出 domain 上表达坐标映射。
 
-多个 tensor indices 按 broadcast 规则形成共同的索引 shape，坐标逐位置配对，不自动形成 Cartesian product；所有 tensor indices 共同贡献一份 broadcast shape，每个 domain index 另外引入一个独立 logical axis。Tensor index 的 size-one 轴也属于这份 shape，不会因旁边有 domain 而自动消失。索引赋值的右值必须能 broadcast 到该索引表达式的结果 shape，目标 view 不会替右值隐式降维。例如二维逐元素按第 0 轴 gather，使用 `index=(indices[rows, columns], I.reshape(I.indices(columns), (1, N)))`。这里第二项是可广播的列坐标 tensor，直接传 `columns` domain 会额外引入一个轴。
+多个 tensor indices 按 broadcast 规则形成共同的索引 shape，坐标逐位置配对，不自动形成 Cartesian product。对二维 `x`，两个 `[K]` 坐标 tensor 的 `x[r, c]` 结果是 `[K]`；需要 `[M,N]` 坐标组合时，可写 `x[I.reshape(r, (M, 1)), I.reshape(c, (1, N))]`。`[M]` 与 `[1,N]` 仍在末轴比较 `M` 和 `N`，不表示 `[M,N]`。
+
+所有 tensor indices 共同贡献一份 broadcast shape，每个 domain index 另外引入一个独立 logical axis。Tensor index 的 size-one 轴也属于这份 shape，不会因旁边有 domain 而自动消失。索引赋值的右值必须能 broadcast 到该索引表达式的结果 shape，目标 view 不会替右值隐式降维。
 
 `I.gather(source, index, valid=True, fill=0)` 使用与 `source[index]` 相同的索引关系。`valid` 必须为 bool，`fill` 与 source 同 dtype，两者均须能广播到索引结果的 shape，不能扩大它。无效成员不读取 source，而返回 fill；省略 fill 时使用 source dtype 的零，bool 使用 `False`。
 
