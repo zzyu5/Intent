@@ -3019,7 +3019,8 @@ bool supportsCartesianPointwiseValueGraph(
 /// effects remain excluded.
 bool supportsStructuredFreeAxisValueGraph(
     ArrayRef<WorksetCoordinateOp> coordinates,
-    llvm::SmallPtrSetImpl<Operation *> *ownedStores = nullptr) {
+    llvm::SmallPtrSetImpl<Operation *> *ownedStores = nullptr,
+    llvm::DenseMap<Operation *, bool> *contractSides = nullptr) {
   if (coordinates.size() > 1) {
     llvm::SmallPtrSet<Operation *, 4> stores;
     for (auto [index, coordinate] : llvm::enumerate(coordinates)) {
@@ -3104,6 +3105,8 @@ bool supportsStructuredFreeAxisValueGraph(
       bool rhs = depends(contract.getRhs());
       if (lhs == rhs || depends(contract.getAccumulator()))
         return false;
+      if (contractSides)
+        (*contractSides)[contract] = lhs;
       sawContract = true;
       continue;
     }
@@ -3140,6 +3143,57 @@ bool supportsStructuredFreeAxisValueGraph(
   }
   return (sawContract || sawReduction) && sawOwnedStore &&
          hasReadOnlyOrderedBodies(loops);
+}
+
+SmallVector<WorksetCoordinateOp> orthogonalContractCoordinates(
+    ArrayRef<WorksetCoordinateOp> coordinates) {
+  for (auto [index, coordinate] : llvm::enumerate(llvm::reverse(coordinates))) {
+    WorksetCoordinateOp first = coordinate;
+    llvm::SmallPtrSet<Operation *, 4> firstStores;
+    llvm::DenseMap<Operation *, bool> firstSides;
+    if (!supportsStructuredFreeAxisValueGraph({first}, &firstStores, &firstSides) ||
+        firstSides.empty() ||
+        !llvm::all_of(firstSides, [](const auto &entry) {
+          auto contract = cast<ContractOp>(entry.first);
+          return contract.getLhs().getType().getShape().size() == 1 &&
+                 contract.getRhs().getType().getShape().size() == 1 &&
+                 contract.getResult().getType().getShape().empty() &&
+                 contract.getLhsReductionAxes().size() == 1 &&
+                 contract.getRhsReductionAxes().size() == 1 &&
+                 contract.getLhsBatchAxes().empty();
+        }))
+      continue;
+    bool firstIsLhs = firstSides.begin()->second;
+    if (!llvm::all_of(firstSides, [&](const auto &entry) {
+          return entry.second == firstIsLhs;
+        }))
+      continue;
+    for (WorksetCoordinateOp second :
+         llvm::reverse(coordinates.drop_back(index + 1))) {
+      if (first.getSourceId() == second.getSourceId() &&
+          first.getSourceAxis() == second.getSourceAxis())
+        continue;
+      llvm::SmallPtrSet<Operation *, 4> secondStores;
+      llvm::DenseMap<Operation *, bool> secondSides;
+      if (!supportsStructuredFreeAxisValueGraph(
+              {second}, &secondStores, &secondSides) ||
+          firstStores.size() != secondStores.size() ||
+          !llvm::all_of(firstStores, [&](Operation *store) {
+            return secondStores.contains(store);
+          }) ||
+          firstSides.size() != secondSides.size() ||
+          !llvm::all_of(firstSides, [&](const auto &entry) {
+            auto side = secondSides.find(entry.first);
+            return side != secondSides.end() && side->second != entry.second;
+          }))
+        continue;
+      // Each lift prepends its free axis. Lift RHS first to retain the
+      // contraction result order [lhs free axes, rhs free axes].
+      return firstIsLhs ? SmallVector<WorksetCoordinateOp>{second, first}
+                        : SmallVector<WorksetCoordinateOp>{first, second};
+    }
+  }
+  return {};
 }
 
 LogicalResult rankLiftPointwiseValueGraph(
@@ -3812,6 +3866,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     SmallVector<MakeRangeOp> existingRanges;
     kernel.walk([&](MakeRangeOp range) { existingRanges.push_back(range); });
     SmallVector<WorksetCoordinateOp> lifted;
+    bool liftSeparately = false;
     if (existingRanges.empty()) {
       if (supportsCartesianPointwiseValueGraph(pointwiseCoordinates))
         lifted.append(pointwiseCoordinates.begin(), pointwiseCoordinates.end());
@@ -3848,12 +3903,17 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       llvm::stable_sort(uncovered, [](const auto &lhs, const auto &rhs) {
         return lhs.first < rhs.first;
       });
+      SmallVector<WorksetCoordinateOp> uncoveredCoordinates;
+      for (auto [_, coordinate] : uncovered)
+        uncoveredCoordinates.push_back(coordinate);
+      lifted = orthogonalContractCoordinates(uncoveredCoordinates);
+      liftSeparately = !lifted.empty();
       // A blocked pointwise program can keep one existing local vector range
       // while tiling the two innermost independent workset axes (for example
       // sequence/head around a feature vector).  Lift only when both axes
       // exist: a lone workset coordinate should remain the scalar program owner
       // of the existing local range.
-      if (uncovered.size() >= 2) {
+      if (lifted.empty() && uncovered.size() >= 2) {
         SmallVector<WorksetCoordinateOp> candidates{
             uncovered[uncovered.size() - 2].second,
             uncovered.back().second};
@@ -3905,6 +3965,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                    use.getOwner() != logicalStopProducer;
           });
       liftedRanges.push_back(range);
+      if (liftSeparately) {
+        if (failed(rankLiftPointwiseValueGraph(kernel, {range})))
+          return kernel.emitError(
+              "failed to rank-lift an independent contraction axis");
+        liftedRanges.clear();
+      }
     }
     if (failed(rankLiftPointwiseValueGraph(kernel, liftedRanges)))
       return kernel.emitError(

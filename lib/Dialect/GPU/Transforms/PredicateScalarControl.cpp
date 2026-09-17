@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -260,12 +261,24 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
         maskedValidity(gather.getValid(), gather.getType()),
         fill(gather.getFill(), gather.getType()), gather.getSourceAxes());
   } else if (auto load = dyn_cast<LoadOp>(operation)) {
-    // Predicated iterations must not issue accesses in inactive lanes.
-    clone = builder.create<LoadOp>(
-        location, resultType(load.getType()), mapped(load.getResource()),
-        coordinates(load.getCoordinates()),
-        maskedValidity(load.getValid(), load.getType()),
-        fill(load.getFill(), load.getType()), load.getSourceAxes());
+    bool safeRead = false;
+    auto view = dyn_cast<ViewType>(load.getResource().getType());
+    if (!shape && isa<FragmentType>(load.getType()) && view &&
+        view.getAccess() == 0) {
+      PhysicalProgramAnalysis analysis(load->getParentOfType<func::FuncOp>());
+      auto bounds = analysis.accessBounds(load);
+      safeRead = bounds.isExact() && bounds.assumedAxes.empty();
+    }
+    // Value branches contain no writes. An independently bounded input read
+    // can keep its original mask without acquiring unrelated lane dependence.
+    if (safeRead)
+      clone = builder.clone(*operation, mapping);
+    else
+      clone = builder.create<LoadOp>(
+          location, resultType(load.getType()), mapped(load.getResource()),
+          coordinates(load.getCoordinates()),
+          maskedValidity(load.getValid(), load.getType()),
+          fill(load.getFill(), load.getType()), load.getSourceAxes());
   } else {
     bool vector = shape && llvm::any_of(operation->getOperands(), [&](Value value) {
       return isa<FragmentType>(mapped(value).getType());
