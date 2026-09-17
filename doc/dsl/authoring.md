@@ -62,6 +62,8 @@ Public 调用为 `intent.compile(kernel, compiler=..., target=..., constexprs=..
 
 `constexprs` 绑定 kernel 签名中声明的 `I.Constexpr[...]` 参数。View shape 的静态 extent 使用非负整数，如 `1`；字符串必须是合法符号名，如 `"M"`、`"K"`，`"1"` 不是整数 extent。注解中的符号名不会绑定 Python 局部变量；使用前写 `M, K = input.shape` 读取这些 extents，这也不会声明同名 constexpr 参数。只有动态 shape 的 kernel 无需把本次输入尺寸传入 `constexprs`。
 
+同一 kernel 的 view shape 注解中，相同符号名表示同一 logical extent，调用时这些维度必须相等；不同符号名不声明相等关系。需要表达相等维度时复用符号名，不能依赖本次输入碰巧具有相同大小。
+
 评测中的 `build(context)` 只是上述调用的薄适配：在 build 内分别 `context.compile("name", kernel)`，返回一个 host callable，在 callable 中分配中间 tensors 并调用 artifacts。它不改变 DSL，也不要求整个任务只能写一个 kernel。
 
 ## 诊断的含义

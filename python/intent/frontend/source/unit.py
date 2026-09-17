@@ -49,6 +49,8 @@ class SourceUnit:
         function = functions[0]
         if function.name != definition.__name__:
             raise FrontendError("definition source name does not match decorated function", location)
+        if ast.get_docstring(function, clean=False) is not None:
+            function.body = function.body[1:]
         closure = inspect.getclosurevars(definition.python_function)
         bindings = dict(definition.python_function.__globals__)
         bindings.update(closure.globals)
