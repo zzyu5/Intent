@@ -3,7 +3,6 @@
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 
-#include "mlir/Analysis/Liveness.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AttrTypeSubElements.h"
@@ -659,37 +658,8 @@ void bindContractionFreeExtents(
   }
 }
 
-struct LiveFragmentFootprint {
-  FragmentType type;
-  unsigned first;
-  unsigned last;
-};
-
-SmallVector<LiveFragmentFootprint>
-blockFragmentLiveness(func::FuncOp kernel) {
-  if (!kernel.getBody().hasOneBlock())
-    return {};
-  Liveness liveness(kernel);
-  const LivenessBlockInfo *block = liveness.getLiveness(&kernel.front());
-  llvm::DenseMap<Operation *, unsigned> positions;
-  unsigned position = 0;
-  for (Operation &operation : kernel.front())
-    positions[&operation] = position++;
-  SmallVector<LiveFragmentFootprint> result;
-  for (Operation &operation : kernel.front())
-    for (Value value : operation.getResults()) {
-      auto type = dyn_cast<FragmentType>(value.getType());
-      if (!type || value.use_empty())
-        continue;
-      Operation *end = block->getEndOperation(value, &operation);
-      result.push_back({type, positions.lookup(&operation), positions.lookup(end)});
-    }
-  return result;
-}
-
 LogicalResult bindTraversalFragmentFootprints(
     func::FuncOp kernel, ArrayRef<ParameterOp> parameters,
-    ArrayRef<LiveFragmentFootprint> liveFragments,
     NamedAttrList &bindings, Builder &builder) {
   auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   if (!capabilities || capabilities.getRegistersPerUnit() <= 0)
@@ -702,11 +672,10 @@ LogicalResult bindTraversalFragmentFootprints(
                      (role == ParameterRole::Reduction ||
                       role == ParameterRole::ReductionInner ||
                       role == ParameterRole::ReductionOuter);
-    bool livePointwise =
-        !liveFragments.empty() &&
+    bool pointwise =
         category == ParameterCategory::Pointwise &&
         (role == ParameterRole::OwnershipM || role == ParameterRole::OwnershipN);
-    if (!parameter->hasAttr(pointwiseChunkAttr) && !reduction && !livePointwise)
+    if (!parameter->hasAttr(pointwiseChunkAttr) && !reduction && !pointwise)
       continue;
     llvm::SmallDenseSet<FragmentType> fragments;
     kernel.walk([&](Operation *operation) {
@@ -752,34 +721,12 @@ LogicalResult bindTraversalFragmentFootprints(
         }
         return known ? std::optional<int64_t>(registers) : std::nullopt;
       };
+      // Bound individual fragments. Logical SSA liveness does not model the
+      // provider's broadcast/layout reuse or machine-register scheduling.
       for (FragmentType fragment : fragments) {
         auto registers = footprint(fragment);
         if (registers && *registers >= capabilities.getRegistersPerUnit())
           return false;
-      }
-      if (livePointwise) {
-        SmallVector<int64_t> changes;
-        for (const LiveFragmentFootprint &live : liveFragments) {
-          // This knob controls only its parameter-dependent working set.
-          // Fixed SSA values may spill in the provider's register allocator;
-          // they cannot make every binding of an unrelated knob illegal.
-          if (!fragmentReferencesParameter(live.type, schema.getName()))
-            continue;
-          auto registers = footprint(live.type);
-          // Unknown extents do not provide a bound for candidate filtering.
-          if (!registers)
-            return true;
-          if (changes.size() <= live.last + 1)
-            changes.resize(live.last + 2, 0);
-          changes[live.first] += *registers;
-          changes[live.last + 1] -= *registers;
-        }
-        int64_t workingSet = 0;
-        for (int64_t change : changes) {
-          workingSet += change;
-          if (workingSet >= capabilities.getRegistersPerUnit())
-            return false;
-        }
       }
       return true;
     };
@@ -1034,8 +981,6 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
         largestReduction = std::max(largestReduction, requestedValue(profile, role));
   }
   auto freeExtents = contractionFreeExtents(kernel, parameters);
-  SmallVector<LiveFragmentFootprint> liveFragments =
-      blockFragmentLiveness(kernel);
   bool invalidFootprint = false;
   auto appendTuple = [&](llvm::function_ref<const TuningProfile &(ParameterOp)> profileFor,
                          bool compactRows = false) {
@@ -1058,8 +1003,8 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
       bindings.set(schema.getName(), builder.getI64IntegerAttr(selected));
     }
     bindContractionFreeExtents(freeExtents, bindings, profileFor, builder);
-    if (failed(bindTraversalFragmentFootprints(kernel, parameters, liveFragments,
-                                               bindings, builder))) {
+    if (failed(bindTraversalFragmentFootprints(kernel, parameters, bindings,
+                                               builder))) {
       invalidFootprint = true;
       return;
     }
