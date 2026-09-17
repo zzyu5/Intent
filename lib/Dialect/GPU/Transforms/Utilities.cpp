@@ -608,11 +608,30 @@ void appendStructuredChildRelations(Operation *user, Value value,
 }
 
 void appendStructuredResultRelations(Value value,
-                                     SmallVectorImpl<Value> &worklist) {
+                                     SmallVectorImpl<Value> &worklist,
+                                     AxisSelector selects) {
   auto result = dyn_cast<OpResult>(value);
   if (!result)
     return;
   unsigned index = result.getResultNumber();
+  if (auto reduce = dyn_cast<ReduceOp>(result.getOwner())) {
+    unsigned sources = reduce.getSourceCount();
+    unsigned identities = reduce.getIdentityCount();
+    Value source = reduce.getInputs()[index];
+    auto fragment = dyn_cast<FragmentType>(source.getType());
+    // Only retained axes connect a reduction result back to its source.
+    if (fragment && llvm::none_of(reduce.getAxes(), [&](int64_t axis) {
+          return selects(cast<AxisMapAttr>(fragment.getAxisMaps()[axis]));
+        }))
+      worklist.push_back(source);
+    worklist.push_back(reduce.getInputs()[sources + index]);
+    worklist.push_back(reduce.getCombine().front().getArgument(index));
+    worklist.push_back(
+        reduce.getCombine().front().getArgument(identities + index));
+    worklist.push_back(cast<YieldOp>(reduce.getCombine().front().getTerminator())
+                           .getValues()[index]);
+    return;
+  }
   if (auto fold = dyn_cast<RegionFoldOp>(result.getOwner())) {
     unsigned sources = fold.getSourceCount();
     unsigned identities = fold.getIdentityCount();
@@ -3051,7 +3070,8 @@ LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
       };
       if (failed(collectDimensions(target))) {
         fold.emitOpError(
-            "region-fold summary has conflicting physical dimension extents");
+            "region-fold summary has conflicting physical dimension extents")
+            << "; summary_index=" << index << "; summary=" << target;
         return WalkResult::interrupt();
       }
       for (auto [dimension, extent] : dimensions)
@@ -3259,7 +3279,7 @@ static void retargetExtent(Value root, AxisSelector selects,
         worklist.push_back(thenYield.getResults()[index]);
         worklist.push_back(elseYield.getResults()[index]);
       }
-    appendStructuredResultRelations(value, worklist);
+    appendStructuredResultRelations(value, worklist, selects);
     for (Operation *user : value.getUsers()) {
       if (auto buffer = dyn_cast<BufferOp>(user);
           buffer && buffer.getInitialValue() == value && previousFragment) {
