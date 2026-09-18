@@ -881,7 +881,9 @@ LogicalResult StoreOp::verify() {
     return emitOpError("store coordinate/effect schema is inconsistent");
   if (getValid() && (!elementType(getValid().getType()).isInteger(1) ||
                      !sameShape(getValid().getType(), getValue().getType())))
-    return emitOpError("store validity must match its value fragment");
+    return emitOpError("store validity must match its value fragment")
+           << "; validity=" << getValid().getType()
+           << "; value=" << getValue().getType();
   llvm::DenseSet<int64_t> axes;
   for (int64_t axis : getSourceAxes())
     if (axis < 0 || axis >= static_cast<int64_t>(coordinateCount) ||

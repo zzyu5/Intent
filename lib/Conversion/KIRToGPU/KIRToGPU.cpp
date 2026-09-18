@@ -1953,9 +1953,11 @@ private:
         return failure();
       if (term.getKind() == 0) {
         auto view = dyn_cast<gpu::ViewType>((*resource).getType());
+        auto buffer = dyn_cast<gpu::BufferType>((*resource).getType());
         auto fragment = dyn_cast<gpu::FragmentType>((*resource).getType());
-        if ((!view && !fragment) ||
+        if ((!view && !buffer && !fragment) ||
             (view && *physicalSourceAxis >= view.getRank()) ||
+            (buffer && *physicalSourceAxis >= buffer.getShape().size()) ||
             (fragment &&
              *physicalSourceAxis >= fragment.getShape().size())) {
           operation->emitOpError(
@@ -1968,15 +1970,19 @@ private:
         PhysicalExprAttr extent;
         uint32_t logicalSourceAxis = sourceAxis;
         bool derived = false;
-        if (view) {
-          sourceId = view.getSourceId();
+        if (view || buffer) {
+          // A buffer is a canonical value result, using the same derived
+          // identity convention as resultAxisIdentity.
+          sourceId = view ? view.getSourceId() : buffer.getInstance() + 1;
+          derived = static_cast<bool>(buffer);
           extent = cast<PhysicalExprAttr>(
-              view.getLayout().getExtents()[*physicalSourceAxis]);
+              view ? view.getLayout().getExtents()[*physicalSourceAxis]
+                   : buffer.getShape()[*physicalSourceAxis]);
           FailureOr<Value> physicalStop =
               physicalExtentValue(operation->getLoc(), extent);
           if (failed(physicalStop)) {
             operation->emitOpError(
-                "view full-slice extent is not materialized in the current program: ")
+                "resource full-slice extent is not materialized in the current program: ")
                 << extent;
             return failure();
           }
@@ -2009,6 +2015,8 @@ private:
           if (*physicalSourceAxis >= dimensions.size())
             return failure();
           dimension = dimensions[*physicalSourceAxis];
+        } else if (buffer) {
+          dimension = relation.getResultDimensions()[resultAxis];
         } else {
           dimension = cast<gpu::AxisMapAttr>(
                           fragment.getAxisMaps()[*physicalSourceAxis])
@@ -2019,7 +2027,7 @@ private:
         // A full slice of an already-physical fragment consumes that
         // fragment's current extent.  Reconstructing the helper-local logical
         // result dimension here would discard an enclosing region segment.
-        if (view) {
+        if (view || buffer) {
           FailureOr<PhysicalExprAttr> resultPhysicalExtent =
               resultExtent(resultAxis, extent);
           if (failed(resultPhysicalExtent))
@@ -2210,9 +2218,11 @@ private:
                 operation->getLoc(), literal));
           } else {
             auto view = dyn_cast<gpu::ViewType>((*resource).getType());
+            auto buffer = dyn_cast<gpu::BufferType>((*resource).getType());
             auto fragment = dyn_cast<gpu::FragmentType>((*resource).getType());
-            if ((!view && !fragment) ||
+            if ((!view && !buffer && !fragment) ||
                 (view && *physicalSourceAxis >= view.getRank()) ||
+                (buffer && *physicalSourceAxis >= buffer.getShape().size()) ||
                 (fragment &&
                  *physicalSourceAxis >= fragment.getShape().size()))
               return failure();
@@ -2220,11 +2230,12 @@ private:
               bounds.push_back(builder.create<arith::ConstantIndexOp>(
                   operation->getLoc(), 0));
             } else if (component == 1) {
-              if (view) {
+              if (view || buffer) {
                 FailureOr<Value> physicalExtent = physicalExtentValue(
                     operation->getLoc(),
                     cast<PhysicalExprAttr>(
-                        view.getLayout().getExtents()[*physicalSourceAxis]));
+                        view ? view.getLayout().getExtents()[*physicalSourceAxis]
+                             : buffer.getShape()[*physicalSourceAxis]));
                 if (failed(physicalExtent))
                   return failure();
                 bounds.push_back(*physicalExtent);
@@ -2243,17 +2254,18 @@ private:
           }
         }
         auto view = dyn_cast<gpu::ViewType>((*resource).getType());
+        auto buffer = dyn_cast<gpu::BufferType>((*resource).getType());
         auto fragment = dyn_cast<gpu::FragmentType>((*resource).getType());
-        if ((!view && !fragment) ||
+        if ((!view && !buffer && !fragment) ||
             (view && *physicalSourceAxis >= view.getRank()) ||
+            (buffer && *physicalSourceAxis >= buffer.getShape().size()) ||
             (fragment &&
              *physicalSourceAxis >= fragment.getShape().size()))
           return failure();
-        PhysicalExprAttr fallback =
-            view ? cast<PhysicalExprAttr>(
-                       view.getLayout().getExtents()[*physicalSourceAxis])
-                 : cast<PhysicalExprAttr>(
-                       fragment.getShape()[*physicalSourceAxis]);
+        PhysicalExprAttr fallback = cast<PhysicalExprAttr>(
+            view     ? view.getLayout().getExtents()[*physicalSourceAxis]
+            : buffer ? buffer.getShape()[*physicalSourceAxis]
+                     : fragment.getShape()[*physicalSourceAxis]);
         FailureOr<PhysicalExprAttr> physicalExtent =
             resultExtent(resultAxis, fallback);
         if (failed(physicalExtent))
@@ -2269,6 +2281,9 @@ private:
           if (*physicalSourceAxis >= dimensions.size())
             return failure();
           dimension = dimensions[*physicalSourceAxis];
+        } else if (buffer) {
+          sourceId = buffer.getInstance() + 1;
+          derived = true;
         } else {
           auto mapping =
               cast<gpu::AxisMapAttr>(

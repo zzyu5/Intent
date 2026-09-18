@@ -359,7 +359,7 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
       types.push_back(resultType(type));
     SmallVector<int64_t> axes(reduce.getAxes());
     for (int64_t &axis : axes)
-      axis += shape.getShape().size();
+      axis += shape ? shape.getShape().size() : 0;
     auto result = builder.create<ReduceOp>(location, types, inputs, axes,
         reduce.getSourceCount(), reduce.getIdentityCount(), reduce.getCaptureCount());
     for (NamedAttribute attribute : reduce->getDiscardableAttrs())
