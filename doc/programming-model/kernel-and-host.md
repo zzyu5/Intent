@@ -16,7 +16,9 @@ kernel：
 
 ## 2. Multi-kernel algorithm
 
-真实算法若需要多个 kernels，作者显式定义多个 `@intent.kernel`，并由普通 Python host code：
+作者可以选择一个或多个 kernels 实现同一外部 callable 合同，并须保持任务规定的数值、effects 与接口语义。内部 kernel interfaces、逻辑分组与中间 tensor shape 可由作者设计，无须由外部调用方给定。这里的可观察接口也包括 wrapper 内部实际传入各 kernel 的 views 和 scalars。
+
+选择多个 kernels 时，作者显式定义多个 `@intent.kernel`，并由普通 Python host code：
 
 1. 选择算法 specialization 与编译 target；
 2. 分配输出和中间 tensors；

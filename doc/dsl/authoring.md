@@ -2,6 +2,8 @@
 
 本页是 [core.md](core.md) 与[数值规则](types-numerics-and-effects.md)的使用入口，不定义第二套语义。MCP 的 `search` 找概念/API/诊断，`api` 查当前声明及返回规则，`read` 读语言规则与接口说明。公开声明不等于所有 target 已支持；没有性能测量不能宣称高效。
 
+完整 callable 的算法组织由作者选择。在满足任务的数值、effects 与外部接口合同的前提下，作者可以自行设计内部 kernel interfaces、逻辑分组和中间 tensor shape；这些内容无须出现在任务签名中。内部 kernel 之间实际传递的 tensor interface 同样是可观察语义，由 compiler 保持。Compiler 为每个已声明的 kernel 形成物理执行程序。
+
 ## 类型、literal 与 shape
 
 程序使用 `import intent` 和 `import intent.language as I`；kernel/helper 分别用 `@intent.kernel`、`@intent.fn` 声明，装饰器不在 `I` 命名空间。`I.In/I.Out/I.InOut` 描述外部 views，必须同时给出 dtype 和 shape，例如 `I.In[I.f32, ("M", "N")]`；rank-0 view 的 shape 写 `()`。`I.f32` 等描述 scalar dtype；Python literal 可按上下文实例化，但两个不同 dtype 的 runtime values 必须显式 `I.cast`。例如先把 bf16 输入 cast 到 f32，再和 f32 累加器计算，最后 cast 回输出 dtype。

@@ -4,6 +4,11 @@ This is forward execution, not autograd. Do not change the task, dtype, output
 structure, numerical tolerance, or observable out/alias behavior.
 Preserve computation stages and intermediate dtypes explicitly required by TASK.md.
 Algebraic equivalence alone does not preserve a stated floating-point contract.
+Choose the algorithm for the complete invocation before writing the kernels.
+Assess its independent work, data dependencies, total computation, intermediate
+memory traffic and the combined cost of all kernel invocations. Internal kernel
+interfaces and logical grouping are your implementation choices unless TASK.md
+constrains them; preserve the task's external and numerical contract.
 
 Read TASK.md and the provided language materials. For Intent, first call
 intent_manual.read(id="doc/dsl/authoring.md") for the language and host interface
@@ -28,6 +33,9 @@ rules. Check the returned callable and its defaults, the result tree, runtime
 argument order, and the dtype and shape of loop state and helper results.
 Check that build(context) itself returns the host callable on the supplied
 profile, rather than only defining or returning from that inner callable.
+Review whether the submitted source expresses the independent work and stage
+dependencies of the chosen algorithm. Evaluate the complete callable's expected
+runtime, including all intermediate handling, when selecting that organization.
 
 For Intent generation, define ordinary @intent.kernel / @intent.fn programs using
 intent.language. Inside build, use context.compile("unique_literal_name", kernel,
@@ -44,8 +52,11 @@ kernel algorithm, not hardware block sizes or provider-specific emission.
 Each @intent.kernel produces one GPU launch. The compiler does not insert extra
 launches; algorithms with multiple kernel stages require your explicit kernels
 and host composition.
-Logical group counts, source-domain boundaries and intermediate tensor shapes
-may be part of the authored algorithm; they are not hardware block sizes.
+You may choose logical group counts, source-domain boundaries and intermediate
+tensor shapes as part of the algorithm, including interfaces used only inside
+the host wrapper. They need not appear in TASK.md or the external signature.
+These choices define logical values and dependencies; physical block sizes,
+layouts and provider configurations are chosen by the compiler for each kernel.
 I.parallel expresses unordered logical iterations, and source subregions express
 membership. Neither selects a thread-block count or introduces another launch.
 Allocate cross-kernel tensors in the host callable and pass them as explicit view
