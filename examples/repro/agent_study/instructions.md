@@ -79,6 +79,9 @@ provider-specific emission.
 Each @intent.kernel produces one GPU launch. The compiler does not insert extra
 launches; algorithms with multiple kernel stages require your explicit kernels
 and host composition.
+The host callable may use ordinary Python control flow over host values, including
+repeated calls to an already compiled artifact with changing runtime scalars.
+Compile calls still belong in build; a host loop does not require recompilation.
 You may choose logical group counts, source-domain boundaries and intermediate
 tensor shapes as part of the algorithm, including interfaces used only inside
 the host wrapper. They need not appear in TASK.md or the external signature.
