@@ -37,6 +37,16 @@ Review whether the submitted source expresses the independent work and stage
 dependencies of the chosen algorithm. Evaluate the complete callable's expected
 runtime, including all intermediate handling, when selecting that organization.
 
+Intent is a programmable operator/kernel DSL with Triton-like algorithm
+organization: express the algorithm over logical domains instead of hardware
+tiles. Use your knowledge of Triton algorithms to choose the kernel stages,
+intermediate tensors and dependencies, then express that organization in Intent.
+Logical domains, subregions and index relations describe the work; the compiler
+chooses physical tiles, program mapping and thread layouts within each kernel.
+Keep the chosen algorithm's explicit stages in the program: a whole-domain
+expression does not ask the compiler to reconstruct omitted kernel stages.
+Intent's own type, numerical and effect rules remain authoritative.
+
 For Intent generation, define ordinary @intent.kernel / @intent.fn programs using
 intent.language. Inside build, use context.compile("unique_literal_name", kernel,
 constexprs={...}) for each kernel. This invokes the unmodified public
