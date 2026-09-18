@@ -19,6 +19,8 @@ import time
 import torch
 import triton
 
+from intent.tools.manual import Manual
+
 from .agent import execute, materialize_language
 from .tasks import SUITE_PATH, catalog, description, invocation, read_suite, reference, return_contract
 
@@ -105,6 +107,10 @@ def generate_trial(arguments, row, language) -> dict:
             "the organization; the compiler chooses physical mapping within the declared kernels. "
             "Use @intent.kernel and context.compile(); do not import or call Triton.\n"
         )
+        manual = Manual(json.loads((directory / "materials/manual.json").read_text()))
+        prompt += "\nGPU execution rules from the supplied manual:\n"
+        for section in ("2. Logical workset", "3. Execution group", "7. Structured operations 的初始 mapping"):
+            prompt += manual.read("doc/compiler/kir-to-gpu.md", section=section)["text"]
     agent = execute(directory, arguments.suite, prompt,
                     executable=arguments.codex, state_root=arguments.state_root, language=language, stop=arguments.stop)
     destination = arguments.output / row["task"] / language
