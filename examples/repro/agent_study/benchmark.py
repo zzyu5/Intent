@@ -128,6 +128,8 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
                 candidate_call.call(function)
             result["precompile_seconds"] = time.monotonic() - compile_started
             result["preparation_policy"] = "compile_only_before_gpu_timing_lock"
+            for artifact in context.generated.values():
+                artifact.backend_ir.clear()
             stage = "comparison"
             with arguments.gpu_lock.open("w") as lock:
                 report_stage("gpu_queue")
@@ -140,6 +142,7 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
                                             benchmark_time_budget_ms=200)
             result.update(status="pass", candidate_ms=measured, reference_ms=anchor,
                           ratio=measured / anchor if anchor is not None else None)
+            context.save_backend_ir(budget.executed)
     except Exception as error:
         # A failed program is a result in the fixed denominator, never a fallback.
         causes = []

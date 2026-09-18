@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import intent
+from intent.runtime.artifact import CompiledArtifact
 from intent.runtime.source import materialize_python_source
 from intent.runtime.triton import materialize_triton_artifact, TuningHooks
 from intent.targets import TritonTarget
@@ -26,7 +27,7 @@ class ProgramContext:
         self.directory = directory
         self.language = language
         self.keep_ir = keep_ir
-        self.generated: dict[str, object] = {}
+        self.generated: dict[str, CompiledArtifact] = {}
 
     def compile(self, name: str, definition, *, constexprs=None):
         if self.language != "intent":
@@ -42,11 +43,22 @@ class ProgramContext:
                     definition, target=TritonTarget(), compiler=self.compiler, constexprs=constexprs)
                 (self.directory / f"{name}.shared.mlir").write_text(shared)
             raise
-        self.generated[name] = program
         (self.directory / f"{name}.py").write_text(program.source)
         if self.keep_ir:
             (self.directory / f"{name}.mlir").write_text(program.ir)
-        return materialize_triton_artifact(program.source, program.ir, definition.__name__, 0)
+        artifact = materialize_triton_artifact(program.source, program.ir, definition.__name__, 0)
+        self.generated[name] = artifact
+        return artifact
+
+    def save_backend_ir(self, executed):
+        if not self.keep_ir:
+            return
+        for name, artifact in self.generated.items():
+            for entry in artifact._namespace.values():
+                if isinstance(entry, Autotuner) and entry in executed:
+                    artifact.backend_ir = artifact._backend_ir_collector(executed[entry])
+            for kind, text in artifact.backend_ir.items():
+                (self.directory / f"{name}.backend.{kind}").write_text(text)
 
     def load_source(self, filename: str):
         if self.language != "triton":
@@ -69,6 +81,7 @@ class TuningBudget:
         self.limit = limit
         self.policy = policy
         self.tuners = []
+        self.executed = {}
         self.precompile_failures = []
 
     @contextmanager
@@ -200,11 +213,20 @@ class TuningBudget:
 
     def __enter__(self):
         self._original = triton.autotune
+        self._original_run = Autotuner.run
+
+        def run(tuner, *args, **kwargs):
+            compiled = self._original_run(tuner, *args, **kwargs)
+            self.executed[tuner] = compiled
+            return compiled
+
         triton.autotune = self._decorate
+        Autotuner.run = run
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         triton.autotune = self._original
+        Autotuner.run = self._original_run
 
     def records(self) -> list[dict]:
         return [{"kernel": tuner.base_fn.__name__, "declared": len(tuner.configs),
