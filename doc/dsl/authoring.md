@@ -8,6 +8,8 @@
 
 程序使用 `import intent` 和 `import intent.language as I`；kernel/helper 分别用 `@intent.kernel`、`@intent.fn` 声明，装饰器不在 `I` 命名空间。`I.In/I.Out/I.InOut` 描述外部 views，必须同时给出 dtype 和 shape，例如 `I.In[I.f32, ("M", "N")]`；rank-0 view 的 shape 写 `()`。`I.f32` 等描述 scalar dtype；Python literal 可按上下文实例化，但两个不同 dtype 的 runtime values 必须显式 `I.cast`。例如先把 bf16 输入 cast 到 f32，再和 f32 累加器计算，最后 cast 回输出 dtype。
 
+View 注解的第三个可选参数是 `I.constraints(...)`，例如 `I.Out[I.f32, ("N",), I.constraints(noalias=True)]`。不同 view 默认可以 alias；`noalias=True` 声明该 view 的底层 allocation 与其它 view 不重叠，是调用方必须满足的前置条件，不能仅凭 `Out` 访问方向推断。`alias="group"` 声明 alias group，不能与 `noalias=True` 同时指定；这些字段不改变读写方向、shape 或 dtype。
+
 Rank-0 view 使用空索引 tuple：`value = view[()]` 读取 scalar，`view[()] = value` 写入 scalar。读写仍遵守 view 的访问方向、dtype 和先写后读规则。
 
 Literal 首次形成 runtime value 时若没有 expected dtype，Python `bool/int/float` 分别采用 `bool/i64/f64`。需要 f32 的循环状态可用 `I.cast(1.0, I.f32)` 初始化；后续使用不会反向改变它的 dtype。正/负无穷常量使用 `I.inf` / `-I.inf`，可写 `I.cast(I.inf, I.f32)` 指定 dtype。
