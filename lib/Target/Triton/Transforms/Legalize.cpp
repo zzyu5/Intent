@@ -1159,6 +1159,13 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
   }
   if (!warps || !stages || !ctas)
     return kernel.emitError("Triton provider parameter domains are incomplete");
+  int64_t maximumWarps = *llvm::max_element(warps->candidates);
+  SmallVector<gpu::PhysicalExprAttr> collectiveFootprints;
+  for (gpu::FragmentType fragment : collectiveFragments(kernel)) {
+    auto footprint = fragmentRegisterFootprint(fragment);
+    if (!llvm::is_contained(collectiveFootprints, footprint))
+      collectiveFootprints.push_back(footprint);
+  }
   for (Attribute attribute : shared) {
     auto tuple = dyn_cast<DictionaryAttr>(attribute);
     if (!tuple)
@@ -1207,6 +1214,14 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
   for (const TritonConfig &config : configs) {
     if (config.warps <= 0 || config.stages <= 0 || config.ctas <= 0)
       return kernel.emitError("Triton provider parameter domains are incomplete");
+    // Apply the existing per-fragment policy after binding the shared tuple.
+    // ABI-dependent extents retain their deferred specialization assertion.
+    if (config.warps < maximumWarps &&
+        llvm::any_of(collectiveFootprints, [&](gpu::PhysicalExprAttr footprint) {
+          auto words = evaluateCompileTimeExpression(footprint, config);
+          return words && *words > config.warps * 32 * 255;
+        }))
+      continue;
     bool legal = true;
     bool descriptorConfig =
         descriptorChoice &&
@@ -3693,7 +3708,6 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       categories.push_back(category);
   });
   auto capabilities = kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
-  int64_t fixedFragmentWords = 0;
   bool mayFormDot = false;
   kernel.walk([&](Operation *operation) {
     // Triton can combine a broadcast-multiply-reduce into a dot later.
@@ -3702,10 +3716,6 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
         !llvm::is_contained(categories, gpu::ParameterCategory::Reduction))
       categories.push_back(gpu::ParameterCategory::Reduction);
   });
-  for (gpu::FragmentType fragment : collectiveFragments(kernel))
-    if (auto words = evaluateCompileTimeExpression(
-            fragmentRegisterFootprint(fragment), TritonConfig{}))
-      fixedFragmentWords = std::max(fixedFragmentWords, *words);
   bool blackwell = capabilities.getComputeCapabilityMajor() == 10 ||
                    capabilities.getComputeCapabilityMajor() == 12;
   bool hasContraction = false;
@@ -3749,20 +3759,11 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
            (ctas & (ctas - 1)) == 0 && ctas <= 16 &&
            (ctas == 1 || capabilities.getComputeCapabilityMajor() >= 9);
   };
-  int64_t maximumWarps = 0;
-  for (const auto &row : *rows)
-    if (isDeviceOption(row[0], row[1], row[2]))
-      maximumWarps = std::max(maximumWarps, row[0]);
   for (const auto &row : *rows) {
     int64_t warps = row[0], stages = row[1], ctas = row[2];
     if (straightLinePointwise)
       stages = 1;
     if (!isDeviceOption(warps, stages, ctas))
-      continue;
-    // This whole-fragment footprint guides thread distribution; the provider
-    // still chooses its layout and may spill. Keep the widest supplied option
-    // even when no option's nominal per-thread share fits the register limit.
-    if (fixedFragmentWords > warps * 32 * 255 && warps < maximumWarps)
       continue;
     if (llvm::any_of(localOptions, [&](const TritonLocalOptions &option) {
           // Kernel-level stages pipeline dot producers. Ordinary loads need
