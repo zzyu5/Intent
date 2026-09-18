@@ -79,6 +79,13 @@ bool canVectorizeIterations(Block &block, scf::ForOp loop,
             return data(value.getType());
           }))
         return false;
+    } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
+      if (!llvm::all_of(reduce.getCombine().front().without_terminator(),
+                        [](Operation &nested) {
+                          return canPredicateValueOperation(&nested) &&
+                                 !isa<LoadOp, GatherOp>(nested);
+                        }))
+        return false;
     } else if (operation.getNumRegions() ||
                !canPredicateValueOperation(&operation)) {
       return false;
@@ -124,25 +131,32 @@ bool isOutsideIterationRange(Value coordinate, scf::ForOp loop) {
   return false;
 }
 
-bool hasIndependentBufferUpdates(scf::ForOp loop, func::FuncOp kernel) {
+bool hasIndependentUpdates(scf::ForOp loop, func::FuncOp kernel,
+                           SmallVectorImpl<Value> &guardedViews,
+                           llvm::DenseMap<Value, bool> &varying) {
   llvm::DenseMap<Value, unsigned> writtenAxes;
   bool independent = true;
   loop.walk([&](StoreOp store) {
     auto buffer = store.getResource().getDefiningOp<BufferOp>();
     auto type = dyn_cast<BufferType>(store.getResource().getType());
-    if (!buffer || buffer->getBlock() != &kernel.front() || !type ||
-        type.getWorkspace() ||
-        type.getScope().getValue() != BufferScope::ProgramPrivate ||
-        type.getLifetime().getValue() != BufferLifetime::Program) {
+    auto view = dyn_cast<ViewType>(store.getResource().getType());
+    bool privateBuffer = buffer && buffer->getBlock() == &kernel.front() &&
+        type && !type.getWorkspace() &&
+        type.getScope().getValue() == BufferScope::ProgramPrivate &&
+        type.getLifetime().getValue() == BufferLifetime::Program;
+    if (!privateBuffer && (!view || !view.getLayout().getHasStrides() ||
+                          view.getLayout().getStrides().size() != view.getRank())) {
       independent = false;
       return;
     }
+    if (view && !llvm::is_contained(guardedViews, store.getResource()))
+      guardedViews.push_back(store.getResource());
     std::optional<unsigned> selected;
     for (auto [axis, coordinate] :
          llvm::zip(store.getSourceAxes(), store.getCoordinates())) {
       if (coordinate == loop.getInductionVar() && !selected)
         selected = axis;
-      else if (!loop.isDefinedOutsideOfLoop(coordinate))
+      else if (variesWithIteration(coordinate, loop, varying))
         independent = false;
     }
     if (!selected) {
@@ -156,9 +170,20 @@ bool hasIndependentBufferUpdates(scf::ForOp loop, func::FuncOp kernel) {
   if (!independent || writtenAxes.empty())
     return false;
 
-  // Fresh logical buffers cannot alias other resources. Each written buffer
-  // uses a distinct slice for every iteration. Reads must stay in that slice
-  // or outside the written range, without changing ordered arithmetic.
+  // Layout injectivity says nothing about two external views aliasing. Keep
+  // this proof to one external resource and fresh, disjoint local buffers.
+  if (guardedViews.size() > 1)
+    return false;
+  if (!guardedViews.empty())
+    loop.walk([&](LoadOp load) {
+      if (isa<ViewType>(load.getResource().getType()) &&
+          load.getResource() != guardedViews.front())
+        independent = false;
+    });
+
+  // Fresh buffers are disjoint, and external views need the layout guard below.
+  // Each iteration owns one slice. Reads must stay in that slice or outside
+  // the written range, without changing ordered arithmetic.
   loop.walk([&](LoadOp load) {
     auto written = writtenAxes.find(load.getResource());
     if (written == writtenAxes.end())
@@ -174,6 +199,57 @@ bool hasIndependentBufferUpdates(scf::ForOp loop, func::FuncOp kernel) {
   return independent;
 }
 
+FailureOr<Value> nonOverlappingView(func::FuncOp kernel, Value resource) {
+  auto view = cast<ViewType>(resource.getType());
+  SmallVector<OpFoldResult> strides;
+  for (Attribute attribute : view.getLayout().getStrides()) {
+    if (auto constant = dyn_cast<IntegerAttr>(attribute)) {
+      strides.push_back(constant);
+      continue;
+    }
+    auto name = dyn_cast<StringAttr>(attribute);
+    Value stride;
+    if (name)
+      for (BlockArgument argument : kernel.getArguments())
+        if (kernel.getArgAttrOfType<StringAttr>(argument.getArgNumber(),
+                                               abiNameAttr) == name)
+          stride = argument;
+    if (!stride || !stride.getType().isIndex())
+      return failure();
+    strides.push_back(stride);
+  }
+  if (strides.empty())
+    return failure();
+  OpBuilder builder(&kernel.front(), kernel.front().begin());
+  Location location = resource.getLoc();
+  Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+  Value one = builder.create<arith::ConstantIndexOp>(location, 1);
+  SmallVector<Value> values;
+  for (OpFoldResult stride : strides)
+    values.push_back(isa<Value>(stride) ? cast<Value>(stride) : Value(
+        builder.create<arith::ConstantIndexOp>(
+            location, cast<IntegerAttr>(cast<Attribute>(stride)).getInt())));
+  Value valid = builder.create<CompareOp>(location, builder.getI1Type(),
+                                         values.back(), zero, ComparePredicate::Gt);
+  for (unsigned axis = values.size() - 1; axis > 0; --axis) {
+    Value divisor = builder.create<BinaryOp>(location, builder.getIndexType(),
+        values[axis], one, BinaryOperator::Maximum);
+    Value slots = builder.create<BinaryOp>(location, builder.getIndexType(),
+        values[axis - 1], divisor, BinaryOperator::FloorDivide);
+    Value extent = builder.create<DimOp>(location, builder.getIndexType(),
+                                         resource, axis);
+    extent = builder.create<BinaryOp>(location, builder.getIndexType(), extent,
+                                       one, BinaryOperator::Maximum);
+    // Division avoids overflow in stride >= extent * next_stride. Every
+    // accepted suffix has positive strides and fits inside its outer stride.
+    Value separate = builder.create<CompareOp>(location, builder.getI1Type(),
+                                               slots, extent, ComparePredicate::Ge);
+    valid = builder.create<BinaryOp>(location, builder.getI1Type(), valid,
+                                      separate, BinaryOperator::LogicalAnd);
+  }
+  return valid;
+}
+
 LogicalResult vectorizeIterations(func::FuncOp kernel,
                                  uint64_t &source, int64_t &dimension) {
   SmallVector<scf::ForOp> loops;
@@ -183,10 +259,11 @@ LogicalResult vectorizeIterations(func::FuncOp kernel,
   for (scf::ForOp loop : loops) {
     auto step = loop.getStep().getDefiningOp<arith::ConstantIndexOp>();
     llvm::DenseMap<Value, bool> varying;
+    SmallVector<Value> guardedViews;
     if (loop.getNumResults() || !step || step.value() != 1 ||
         !canVectorizeIterations(*loop.getBody(), loop, varying) ||
         (!loop->hasAttr(independentIterationAttr) &&
-         !hasIndependentBufferUpdates(loop, kernel)))
+         !hasIndependentUpdates(loop, kernel, guardedViews, varying)))
       continue;
     uint32_t elementBitWidth = 0;
     loop.walk([&](StoreOp store) {
@@ -198,6 +275,17 @@ LogicalResult vectorizeIterations(func::FuncOp kernel,
     });
     if (!elementBitWidth)
       continue;
+    if (!guardedViews.empty()) {
+      FailureOr<Value> injective = nonOverlappingView(kernel, guardedViews.front());
+      if (failed(injective))
+        continue;
+      OpBuilder builder(loop);
+      auto branch = builder.create<scf::IfOp>(loop.getLoc(), *injective, true);
+      builder.setInsertionPointToStart(branch.thenBlock());
+      auto selected = cast<scf::ForOp>(builder.clone(*loop));
+      loop->moveBefore(branch.elseBlock()->getTerminator());
+      loop = selected;
+    }
     auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
     SmallVector<int64_t> candidates;
     for (int64_t width = 1; width <= capabilities.getMaxThreadsPerBlock();
