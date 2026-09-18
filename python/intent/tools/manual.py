@@ -10,8 +10,30 @@ import re
 import subprocess
 
 
+def _sections(text: str) -> list[tuple[int, int, int, str]]:
+    sections = []
+    fence = ""
+    offset = 0
+    for number, line in enumerate(text.splitlines(keepends=True), 1):
+        content = line.rstrip("\r\n")
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", content)
+        if fence:
+            if (marker and marker[1][0] == fence[0]
+                    and len(marker[1]) >= len(fence) and not marker[2].strip()):
+                fence = ""
+        elif marker and not (marker[1][0] == "`" and "`" in marker[2]):
+            fence = marker[1]
+        else:
+            heading = re.match(r"^ {0,3}(#{1,6})[ \t]+(.+?)\s*$", content)
+            if heading:
+                title = re.sub(r"[ \t]+#+$", "", heading[2])
+                sections.append((offset, number, len(heading[1]), title))
+        offset += len(line)
+    return sections
+
+
 def snapshot(project: Path) -> dict:
-    """Freeze public language rules and declarations, without algorithm examples."""
+    """Freeze language and GPU execution contracts, without algorithm examples."""
     project = project.resolve()
     import intent
     import intent.language as language
@@ -19,24 +41,27 @@ def snapshot(project: Path) -> dict:
     from intent.language.signatures import INTRINSIC_SIGNATURES
 
     documents = {}
-    for directory in (project / "doc/dsl", project / "doc/programming-model"):
-        for path in sorted(directory.glob("*.md")):
-            identifier = str(path.relative_to(project))
-            text = path.read_text()
-            sections = list(re.finditer(r"^#{1,3} (.+)$", text, re.MULTILINE))
-            documents[identifier] = {
-                "id": identifier, "title": sections[0][1] if sections else path.stem,
+    paths = [path for directory in (project / "doc/dsl", project / "doc/programming-model")
+             for path in directory.glob("*.md")]
+    paths.append(project / "doc/compiler/kir-to-gpu.md")
+    for path in sorted(paths):
+        identifier = str(path.relative_to(project))
+        text = path.read_text()
+        sections = _sections(text)
+        documents[identifier] = {
+            "id": identifier, "title": sections[0][3] if sections else path.stem,
+            "kind": "concept",
+            "source": identifier, "line": 1, "text": text,
+        }
+        for index, (start, line, level, title) in enumerate(sections):
+            end = next((start for start, _, depth, _ in sections[index + 1:]
+                        if depth <= level), len(text))
+            section_id = f"{identifier}#L{line}"
+            documents[section_id] = {
+                "id": section_id, "title": title,
                 "kind": "concept",
-                "source": identifier, "line": 1, "text": text,
+                "source": identifier, "line": line, "text": text[start:end],
             }
-            for index, section in enumerate(sections):
-                end = sections[index + 1].start() if index + 1 < len(sections) else len(text)
-                line = text.count("\n", 0, section.start()) + 1
-                section_id = f"{identifier}#L{line}"
-                documents[section_id] = {
-                    "id": section_id, "title": section[1], "kind": "concept",
-                    "source": identifier, "line": line, "text": text[section.start():end],
-                }
 
     exports = {name: getattr(language, name) for name in language.__all__}
     exports.update(INTRINSICS)
@@ -164,7 +189,7 @@ def main() -> None:
 
     manual = Manual(json.loads(arguments.corpus.read_text()))
     server = FastMCP("intent_manual", instructions=(
-        "Intent public manual. Call api(name='I.domain') for exact declarations and rule IDs; "
+        "Intent language and GPU execution contracts. Call api(name='I.domain') for exact declarations and rule IDs; "
         "read(id=...) for syntax, types, semantics and callable interface rules. "
         "read(id=..., section=...) accepts an exact section title. "
         "Use search(query=..., kind=...) to find names and IDs. "

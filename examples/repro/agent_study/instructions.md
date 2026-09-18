@@ -12,7 +12,10 @@ constrains them; preserve the task's external and numerical contract.
 
 Read TASK.md and the provided language materials. For Intent, first call
 intent_manual.read(id="doc/dsl/authoring.md") for the language and host interface
-rules. Use api for declarations and signatures, then read the returned rule IDs
+rules, then read(id="doc/compiler/kir-to-gpu.md") for the GPU execution contract.
+Use its workset and dependence rules to identify the independent logical work
+in each kernel; initial mapping and later physical optimization are distinct.
+Use api for declarations and signatures, then read the returned rule IDs
 for return shapes, dtypes and semantics; api does not infer your program's result
 schema. Consult the manual before writing code; it does not execute programs or
 provide task answers. Write candidate.py containing
