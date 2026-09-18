@@ -74,6 +74,8 @@ Python `range` 是 domain 遍历的 shorthand，遵循正步长合同。逆序�
 
 Public 调用为 `intent.compile(kernel, compiler=..., target=..., constexprs=...)`，返回 artifact。显式调用 `artifact(...)` 按 kernel 声明顺序传入全部 runtime 参数，`Out` 保留在声明位置；`artifact.run(...)` 只省略 `Out`，其余 views 与 scalars 保持原顺序，由 runtime 分配并返回输出。例如声明顺序为 `A: In, B: Out, scale: f32` 时，调用为 `artifact(A, B, scale)` 或 `artifact.run(A, scale)`。`Constexpr` 在编译时绑定，不传入这两种 runtime 调用。
 
+Host callable 可以用普通 Python `for/while/if` 编排已经编译的 artifacts，包括重复调用同一个 artifact。每次调用都是一次 kernel invocation，runtime scalars 可随调用变化；这与在 `@intent.kernel` 内写循环不同，也不要求在 host 循环中重新编译。`Constexpr` 的绑定仍属于编译阶段。
+
 编译与 launch 分开。`intent.generate` 只生成 source/IR；target 在 host 选择，例如 `intent.targets.TritonTarget()`，不能在 kernel 查询设备或选择 warp/tile。
 
 标量 constexpr 使用 Python 类型注解，例如 `STEP: I.Constexpr[int]`、`EPS: I.Constexpr[float]`、`ENABLED: I.Constexpr[bool]`。`I.f32` 等是 runtime scalar dtype 描述符。
