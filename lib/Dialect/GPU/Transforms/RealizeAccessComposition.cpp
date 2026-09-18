@@ -587,6 +587,33 @@ FailureOr<bool> composePointwiseGather(GatherOp gather) {
   return true;
 }
 
+Value cancelIndexOffset(OpBuilder &builder, Value coordinate, Value offset) {
+  if (!uniformElementType(coordinate.getType()).isIndex())
+    return {};
+  if (auto subtract = coordinate.getDefiningOp<BinaryOp>();
+      subtract && subtract.getOperatorKind() == BinaryOperator::Subtract) {
+    Value bound = subtract.getRhs();
+    while (true) {
+      UniformExpression expression = describeUniformValue(bound);
+      if (expression.kind != UniformKind::Forward ||
+          expression.operands.size() != 1)
+        break;
+      bound = expression.operands.front();
+    }
+    if (samePhysicalScalarExpression(bound, offset))
+      return subtract.getLhs();
+  }
+  Operation *projection = coordinate.getDefiningOp();
+  if (!isa_and_nonnull<BroadcastOp, ReshapeOp, TransposeOp>(projection))
+    return {};
+  Value translated = cancelIndexOffset(builder, projection->getOperand(0), offset);
+  if (!translated)
+    return {};
+  IRMapping mapping;
+  mapping.map(projection->getOperand(0), translated);
+  return builder.clone(*projection, mapping)->getResult(0);
+}
+
 FailureOr<bool> composeLoadGather(GatherOp gather) {
   auto sourceType = dyn_cast<FragmentType>(gather.getSource().getType());
   Value loaded = gather.getSource();
@@ -664,6 +691,14 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
           *dimension != axis->getDimensionId())
         return false;
     }
+    // The ordinal of a retained slice often subtracts its original base.
+    // Compose the inverse translation before rebuilding the access: keeping
+    // start + (coordinate - start) would hide the original range's bounds.
+    Value absolute = isUnitStepRange(range)
+                         ? cancelIndexOffset(builder, coordinate, range.getStart())
+                         : Value();
+    if (absolute)
+      coordinate = absolute;
     if (resultType) {
       Type element = coordinate.getType();
       if (auto fragment = dyn_cast<FragmentType>(element))
@@ -678,7 +713,7 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
             "composed gather index cannot adopt its result coordinate relation");
       coordinate = *projected;
     }
-    if (!isZero(range.getStart()) || !isUnitStepRange(range)) {
+    if (!absolute && (!isZero(range.getStart()) || !isUnitStepRange(range))) {
       Type indexType = range.getResult().getType().getElementType();
       if (auto fragment = dyn_cast<FragmentType>(coordinate.getType()))
         indexType = FragmentType::get(
