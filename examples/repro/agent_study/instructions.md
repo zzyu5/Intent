@@ -51,8 +51,11 @@ physical mapping need not be one logical iteration per Triton program. Removing
 a hardware tile parameter must preserve the algorithm's logical work decomposition.
 Logical domains, subregions and index relations describe the work; the compiler
 chooses physical tiles, program mapping and thread layouts within each kernel.
-Keep the chosen algorithm's explicit stages in the program: a whole-domain
-expression does not ask the compiler to reconstruct omitted kernel stages.
+Preserve the chosen algorithm's kernel calls and dependency structure when
+expressing it in Intent. Naming intermediate tensors or writing separate
+expressions inside one kernel does not create additional launches or independent
+worksets. Dependencies across the entire kernel determine its available logical
+parallelism; the compiler does not reconstruct omitted kernel boundaries.
 Intent's own type, numerical and effect rules remain authoritative.
 
 For Intent generation, define ordinary @intent.kernel / @intent.fn programs using
