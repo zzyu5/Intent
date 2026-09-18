@@ -6108,8 +6108,11 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     for (auto [position, coordinate] : llvm::enumerate(load.getCoordinates())) {
       if (load.getSourceAxes()[position] + 1 != input.getRank())
         continue;
-      auto range = coordinate.getDefiningOp<MakeRangeOp>();
-      if (!range || !isUnitStepRange(range))
+      auto range =
+          stripAdditiveProjection(coordinate).getDefiningOp<MakeRangeOp>();
+      if (!range || !isUnitStepRange(range) ||
+          !queryFragmentAxis(coordinate.getType(), sourceAxisIdentity(range))
+               .isExact())
         return;
       for (Attribute axis : pointwiseOwnershipAxes)
         if (llvm::is_contained(axes.lookup(axis), range)) {
