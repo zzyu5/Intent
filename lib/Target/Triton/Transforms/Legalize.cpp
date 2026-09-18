@@ -3694,7 +3694,10 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   });
   auto capabilities = kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
   int64_t fixedFragmentWords = 0;
+  bool mayFormDot = false;
   kernel.walk([&](Operation *operation) {
+    // Triton can combine a broadcast-multiply-reduce into a dot later.
+    mayFormDot |= isa<gpu::ReduceOp, ReduceOp>(operation);
     if (isa<gpu::ReduceOp, gpu::ScanOp>(operation) &&
         !llvm::is_contained(categories, gpu::ParameterCategory::Reduction))
       categories.push_back(gpu::ParameterCategory::Reduction);
@@ -3732,7 +3735,8 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   kernel.walk([&](Operation *operation) {
     pipelineStagesAffectProgram |=
         isa<gpu::ScaledContractOp, gpu::SparseContractOp>(operation) ||
-        (operation->getParentOfType<scf::ForOp>() &&
+        ((hasContraction || mayFormDot) &&
+         operation->getParentOfType<scf::ForOp>() &&
          !isMemoryEffectFree(operation));
   });
   SmallVector<TritonLocalOptions> localOptions;
@@ -3761,9 +3765,9 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
     if (fixedFragmentWords > warps * 32 * 255 && warps < maximumWarps)
       continue;
     if (llvm::any_of(localOptions, [&](const TritonLocalOptions &option) {
-          // Pure loops with IEEE f32 contractions have no asynchronous
-          // pipeline producer. Keep one supplied stage setting for each
-          // warp/CTA choice instead of recompiling identical schedules.
+          // Kernel-level stages pipeline dot producers. Ordinary loads need
+          // an explicit tl.range stage binding; keep one supplied setting
+          // when the current program has no such pipeline producer.
           return option.warps == warps &&
                  (!pipelineStagesAffectProgram || option.stages == stages) &&
                  option.ctas == ctas;
