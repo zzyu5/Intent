@@ -205,28 +205,75 @@ bool sameUniformValue(Value lhs, Value rhs) {
 FailureOr<bool> composeSelectLoad(SelectOp select) {
   auto resultType = dyn_cast<FragmentType>(select.getResult().getType());
   Value loaded = select.getTrueValue();
-  SmallVector<BroadcastOp> projections;
-  while (auto broadcast = loaded.getDefiningOp<BroadcastOp>()) {
-    auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
-    auto result = dyn_cast<FragmentType>(broadcast.getResult().getType());
-    if (!source || !result || source.getShape() != result.getShape() ||
-        !broadcast.getResult().hasOneUse())
+  SmallVector<Operation *> projections;
+  while (Operation *operation = loaded.getDefiningOp()) {
+    if (!isa<BroadcastOp, TransposeOp>(operation))
+      break;
+    auto source = dyn_cast<FragmentType>(operation->getOperand(0).getType());
+    auto result = dyn_cast<FragmentType>(loaded.getType());
+    if (!source || !result || !loaded.hasOneUse())
       return false;
-    auto projection = queryAxisProjection(source, result);
-    if (!projection.isExact() || llvm::any_of(
-            llvm::enumerate(projection.targetToSource), [](auto item) {
-              return !item.value() || *item.value() != item.index();
-            }))
-      return false;
-    projections.push_back(broadcast);
-    loaded = broadcast.getValue();
+    if (auto transpose = dyn_cast<TransposeOp>(operation)) {
+      for (auto [axis, sourceAxis] : llvm::enumerate(transpose.getPermutation())) {
+        auto original = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
+        auto transposed = cast<AxisMapAttr>(result.getAxisMaps()[axis]);
+        if (!(sourceAxisIdentity(original) == sourceAxisIdentity(transposed)) ||
+            original.getDimensionId() != transposed.getDimensionId())
+          return false;
+      }
+    } else {
+      auto projection = queryAxisProjection(source, result);
+      if (source.getShape() != result.getShape() || !projection.isExact() ||
+          llvm::any_of(llvm::enumerate(projection.targetToSource), [](auto item) {
+            return !item.value() || *item.value() != item.index();
+          }))
+        return false;
+    }
+    projections.push_back(operation);
+    loaded = operation->getOperand(0);
   }
   auto load = loaded.getDefiningOp<LoadOp>();
   if (!resultType || !load || !load.getResult().hasOneUse() ||
       !canReplayReadAt(load, select))
     return false;
 
-  Value fill = select.getFalseValue();
+  OpBuilder builder(select);
+  auto projectBack = [&](Value value) -> FailureOr<Value> {
+    for (Operation *projection : projections) {
+      auto source = cast<FragmentType>(projection->getOperand(0).getType());
+      auto result = cast<FragmentType>(projection->getResult(0).getType());
+      Type element = uniformElementType(value.getType());
+      auto sourceSchema = FragmentType::get(
+          source.getContext(), element, source.getShape(), source.getAxisMaps(),
+          source.getValidity(), source.getOwner());
+      if (auto transpose = dyn_cast<TransposeOp>(projection)) {
+        auto resultSchema = FragmentType::get(
+            result.getContext(), element, result.getShape(), result.getAxisMaps(),
+            result.getValidity(), result.getOwner());
+        auto projected = materializeBroadcastToFragment(
+            builder, select.getLoc(), value, resultSchema);
+        if (failed(projected))
+          return failure();
+        SmallVector<int64_t> inverse(transpose.getPermutation().size());
+        for (auto [axis, sourceAxis] : llvm::enumerate(transpose.getPermutation()))
+          inverse[sourceAxis] = axis;
+        value = builder.create<TransposeOp>(select.getLoc(), sourceSchema,
+                                            *projected, inverse);
+      } else {
+        auto projected = materializeBroadcastToFragment(
+            builder, select.getLoc(), value, sourceSchema);
+        if (failed(projected))
+          return failure();
+        value = *projected;
+      }
+    }
+    return value;
+  };
+  auto condition = projectBack(select.getCondition());
+  auto projectedFill = projectBack(select.getFalseValue());
+  if (failed(condition) || failed(projectedFill))
+    return false;
+  Value fill = *projectedFill;
   if (load.getValid()) {
     if (!load.getFill() || !sameUniformValue(load.getFill(), fill))
       return false;
@@ -234,13 +281,11 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
     return false;
   }
 
-  OpBuilder builder(select);
   auto loadedType = projections.empty()
                         ? resultType
                         : cast<FragmentType>(load.getResult().getType());
   FailureOr<Value> valid = combinePredicates(
-      builder, select.getLoc(), loadedType, load.getValid(),
-      select.getCondition());
+      builder, select.getLoc(), loadedType, load.getValid(), *condition);
   if (failed(valid)) {
     select.emitOpError(
         "masked load predicate cannot adopt the loaded value relation");
@@ -261,17 +306,17 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
       *valid, fill, load.getSourceAxes());
   if (Attribute origin = load->getAttr(originAttr))
     replacement->setAttr(originAttr, origin);
-  // Positional broadcasts may rebind unit-axis provenance. Preserve that
-  // relation instead of changing the load schema without its coordinates.
+  // Keep the original load and value schemas. Only the predicate and fill
+  // travel backwards through the inverse projection.
   IRMapping mapping;
   mapping.map(load.getResult(), replacement.getResult());
-  for (BroadcastOp broadcast : llvm::reverse(projections))
-    builder.clone(*broadcast, mapping);
+  for (Operation *projection : llvm::reverse(projections))
+    builder.clone(*projection, mapping);
   select.getResult().replaceAllUsesWith(
       mapping.lookupOrDefault(select.getTrueValue()));
   select.erase();
-  for (BroadcastOp broadcast : projections)
-    broadcast.erase();
+  for (Operation *projection : projections)
+    projection->erase();
   load.erase();
   return true;
 }
