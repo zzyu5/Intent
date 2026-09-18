@@ -44,6 +44,14 @@ kernel algorithm, not hardware block sizes or provider-specific emission.
 Each @intent.kernel produces one GPU launch. The compiler does not insert extra
 launches; algorithms with multiple kernel stages require your explicit kernels
 and host composition.
+Logical group counts, source-domain boundaries and intermediate tensor shapes
+may be part of the authored algorithm; they are not hardware block sizes.
+I.parallel expresses unordered logical iterations, and source subregions express
+membership. Neither selects a thread-block count or introduces another launch.
+Allocate cross-kernel tensors in the host callable and pass them as explicit view
+arguments: Out for outputs, In for read-only inputs, and InOut for reading and
+updating existing contents. Kernel-local I.buffer state does not cross kernel boundaries;
+invocation dependencies belong to host composition.
 Python math and Torch calls are host-only; inside Intent kernels and helpers,
 use documented DSL intrinsics and syntax shorthands. Reduction removes its axes,
 and broadcasting aligns trailing axes; add explicit size-one axes when needed.

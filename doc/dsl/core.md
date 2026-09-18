@@ -488,19 +488,7 @@ canonical bits operation固定Philox4x32-10。scalar logical counter按`block_co
 
 ## 18. Logical parts 不使用 `partition`
 
-```python
-parts = I.domain(0, P)
-source = I.domain(0, N)
-width = (N + P - 1) // P
-
-for part in I.parallel(parts):
-    begin = I.minimum(part * width, N)
-    end = I.minimum((part + 1) * width, N)
-    region = source[begin:end]
-    partial[part] = I.reduce.sum(x[region], axis=0)
-```
-
-part identity、boundary formula、empty/tail与partial tensor interface由普通constructs明确表达。`partition(auto/count/extent)`均不是public或canonical operation。
+当 part 数量、identity、边界公式或中间 tensor interface 属于算法时，作者用普通 domain、source-derived subregion、index arithmetic 与 control 表达。Empty/tail 仍遵守 domain 与 subregion 的成员合同。这些可观察的逻辑划分不指定 physical tile、线程块或 launch 数量；各 kernel 内不可观察的物理分块由 compiler 决定。`partition(auto/count/extent)`均不是public或canonical operation。
 
 ## 19. Surface 归属总表
 

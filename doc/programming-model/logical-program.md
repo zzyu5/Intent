@@ -164,21 +164,7 @@ emit(A ++ B, state)
 
 ## 7. Logical parts 不使用 `partition`
 
-若 `P`、part identity、边界公式或 partial tensor interface 可观察，作者用普通 constructs写出：
-
-```python
-source = I.domain(0, N)
-parts = I.domain(0, P)
-width = (N + P - 1) // P
-
-for part in I.parallel(parts):
-    begin = I.minimum(part * width, N)
-    end = I.minimum((part + 1) * width, N)
-    region = source[begin:end]
-    partial[part] = I.reduce.sum(x[region], axis=0)
-```
-
-`parallel` 表达 parts 无序独立；boundary arithmetic 定义算法采用的分割公式；source slicing定义 part 到成员集合的关系。空 part、tail 与 partial tensor shape都因此明确。
+若 part 数量、identity、边界公式或中间 tensor interface 可观察，作者用普通 domain、source-derived subregion、index arithmetic 与 control 写出这些逻辑关系。`parallel` 表达逻辑 points 无序独立；source slicing 定义实际成员集合。空 part、tail 与中间 tensor shape 都属于作者定义的算法，不表示 physical tile、线程块或额外 launch。
 
 Intent 不提供 `partition(auto/count/extent)` operation。可观察 partitioning 已由普通语义完整表达；不可观察 blocking 属于 physical program。
 

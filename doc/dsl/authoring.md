@@ -62,6 +62,8 @@ Python `range` 是 domain 遍历的 shorthand，遵循正步长合同。逆序�
 
 一个 kernel 不自动拆成多个 launches。多个 kernels 由 host 分别编译、显式调用；跨 kernel tensors 的分配与生命周期由 host 管理。Kernel 数量与算法编排由作者定义，各 kernel 内的物理分块、布局与 target 配置由 compiler 形成。
 
+算法定义的逻辑分组数量、边界和中间 tensor shape 可以显式表达，不属于硬件 block size。`I.parallel` 表达无序独立的逻辑 points，source-derived subregion 表达成员集合；两者都不指定线程块数量，也不产生额外 launch。跨 kernel 的中间 tensor 由 host 分配，作为显式 view 参数传递：使用 `Out` 表达输出、`In` 表达只读输入、`InOut` 表达对已有内容的读写。`I.buffer` 是 kernel-local 状态，不能跨 kernel 传递。
+
 ### Host 编译与调用
 
 Public 调用为 `intent.compile(kernel, compiler=..., target=..., constexprs=...)`，返回 artifact。显式调用 `artifact(...)` 按 kernel 声明顺序传入全部 runtime 参数，`Out` 保留在声明位置；`artifact.run(...)` 只省略 `Out`，其余 views 与 scalars 保持原顺序，由 runtime 分配并返回输出。例如声明顺序为 `A: In, B: Out, scale: f32` 时，调用为 `artifact(A, B, scale)` 或 `artifact.run(A, scale)`。`Constexpr` 在编译时绑定，不传入这两种 runtime 调用。
