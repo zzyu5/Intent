@@ -5623,6 +5623,14 @@ static LogicalResult fuseMultiplyReductions(ModuleOp module) {
     };
     lhs = squeeze(lhs, lhsKept);
     rhs = squeeze(rhs, rhsKept);
+    // Preserve the innermost result coordinates as the matrix column axes.
+    // The multiplication's operand order does not define matrix orientation.
+    if (lhsBatch.empty() && rhsBatch.empty() &&
+        lhsOutput.back() > rhsOutput.back()) {
+      std::swap(lhs, rhs);
+      std::swap(lhsReduced, rhsReduced);
+      std::swap(lhsOutput, rhsOutput);
+    }
     SmallVector<int64_t> outputAxes(lhsOutput);
     llvm::append_range(outputAxes, rhsOutput);
     SmallVector<Attribute> shape, mappings;
