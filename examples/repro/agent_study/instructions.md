@@ -57,6 +57,11 @@ expressions inside one kernel does not create additional launches or independent
 worksets. Dependencies across the entire kernel determine its available logical
 parallelism; the compiler does not reconstruct omitted kernel boundaries.
 Intent's own type, numerical and effect rules remain authoritative.
+An accumulation written as an ordinary for/while loop is ordered even when its
+mathematical operation is associative; the compiler cannot infer permission to
+reassociate it. Choose reduce, scan or parallel constructs when their documented
+semantics match the computation and TASK.md, and ordinary loops when their
+sequential dependencies are required.
 
 For Intent generation, define ordinary @intent.kernel / @intent.fn programs using
 intent.language. Inside build, use context.compile("unique_literal_name", kernel,
