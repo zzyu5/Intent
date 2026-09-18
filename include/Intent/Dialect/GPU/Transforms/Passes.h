@@ -145,6 +145,7 @@ mlir::LogicalResult realizeRegionScans(mlir::ModuleOp module);
 mlir::LogicalResult realizeContractionBlocking(mlir::ModuleOp module);
 mlir::LogicalResult orientLoopContractions(mlir::ModuleOp module);
 mlir::LogicalResult realizeVectorContractions(mlir::ModuleOp module);
+mlir::LogicalResult fuseMultiplyReductions(mlir::ModuleOp module);
 mlir::LogicalResult composeContractResultReshapes(mlir::ModuleOp module);
 mlir::LogicalResult decomposeMultiAxisReductions(mlir::ModuleOp module);
 mlir::LogicalResult realizeOnlineReductions(mlir::ModuleOp module);

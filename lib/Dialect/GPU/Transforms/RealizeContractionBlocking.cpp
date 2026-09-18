@@ -5444,6 +5444,253 @@ static ReshapeOp exposeTransposedContractSplit(ContractOp contract) {
   return split;
 }
 
+LogicalResult fuseMultiplyReductions(ModuleOp module) {
+  auto kernel = getPhysicalKernel(module);
+  if (failed(kernel))
+    return failure();
+  SmallVector<ReduceOp> reductions;
+  kernel->walk([&](ReduceOp reduce) { reductions.push_back(reduce); });
+  for (ReduceOp reduce : reductions) {
+    if (reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 ||
+        reduce.getCaptureCount() != 0 || reduce.getNumResults() != 1 ||
+        !isLiteralZeroProjection(reduce.getInputs()[1]))
+      continue;
+    auto resultType = dyn_cast<FragmentType>(reduce.getResult(0).getType());
+    // The existing matrix path provides full-precision f32 accumulation.
+    // Other accumulator formats keep their native reduction until that path
+    // can preserve their precision without imposing new provider restrictions.
+    if (!resultType || !resultType.getElementType().isF32())
+      continue;
+    if (queryBinaryCombineKind(reduce.getCombine()) != BinaryOperator::Add)
+      continue;
+
+    Value product = reduce.getInputs().front();
+    // Builtin sum may retain an identity cast. A numeric conversion, including
+    // default accumulator widening, is a rounding boundary and cannot fuse.
+    while (product.hasOneUse()) {
+      auto cast = product.getDefiningOp<CastOp>();
+      if (!cast || cast.getValue().getType() != product.getType())
+        break;
+      product = cast.getValue();
+    }
+    auto multiply = product.getDefiningOp<BinaryOp>();
+    auto productType = dyn_cast<FragmentType>(product.getType());
+    if (!multiply || !product.hasOneUse() || !productType ||
+        multiply.getOperatorKind() != BinaryOperator::Multiply ||
+        productType.getElementType() != resultType.getElementType())
+      continue;
+    auto unbroadcast = [&](Value value) {
+      auto source = dyn_cast<FragmentType>(value.getType());
+      BroadcastProjection projection;
+      if (source)
+        projection = queryBroadcastProjection(source, productType);
+      if (!projection.isExact())
+        return std::pair{value, projection};
+      while (Operation *producer = value.getDefiningOp()) {
+        if (auto broadcast = dyn_cast<BroadcastOp>(producer)) {
+          auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
+          auto output = cast<FragmentType>(value.getType());
+          if (!input || input.getValidity() != output.getValidity())
+            break;
+          auto step = queryBroadcastProjection(input, output);
+          if (!step.isExact())
+            break;
+          for (auto &axis : projection.targetToSource)
+            if (axis)
+              axis = step.targetToSource[*axis];
+          value = broadcast.getValue();
+        } else if (auto conversion = dyn_cast<CastOp>(producer)) {
+          if (conversion.getValue().getType() != value.getType())
+            break;
+          value = conversion.getValue();
+        } else if (auto reshape = dyn_cast<ReshapeOp>(producer)) {
+          auto source = dyn_cast<FragmentType>(reshape.getValue().getType());
+          auto target = dyn_cast<FragmentType>(value.getType());
+          if (!source || !target || source.getShape() != target.getShape() ||
+              source.getValidity() != target.getValidity() ||
+              !llvm::all_of(reshape.getReassociation(), [](Attribute attribute) {
+                auto group = cast<ReshapeGroupAttr>(attribute);
+                return group.getSourceAxes().size() == 1 &&
+                       group.getSourceAxes() == group.getResultAxes();
+              }))
+            break;
+          value = reshape.getValue();
+        } else {
+          break;
+        }
+      }
+      return std::pair{value, projection};
+    };
+    auto [lhs, lhsProjection] = unbroadcast(multiply.getLhs());
+    auto [rhs, rhsProjection] = unbroadcast(multiply.getRhs());
+    auto lhsType = dyn_cast<FragmentType>(lhs.getType());
+    auto rhsType = dyn_cast<FragmentType>(rhs.getType());
+    if (!lhsType || !rhsType ||
+        lhsType.getElementType() != productType.getElementType() ||
+        rhsType.getElementType() != productType.getElementType())
+      continue;
+    if (!lhsProjection.isExact() || !rhsProjection.isExact())
+      continue;
+    PhysicalProgramAnalysis analysis(*kernel);
+    auto broadcastsAxis = [&](Value value, std::optional<unsigned> axis) {
+      if (!axis)
+        return true;
+      auto type = cast<FragmentType>(value.getType());
+      if (constantPhysicalExpression(
+              cast<PhysicalExprAttr>(type.getShape()[*axis])) != 1)
+        return false;
+      // A one-element physical tile can still carry a non-unit logical axis.
+      // Drop only introduced units or ranges proven logically singleton.
+      auto ranges = analysis.axisRanges(value, *axis);
+      return ranges.isExact() &&
+             llvm::all_of(ranges.roots, isProvablySingletonLogicalRange);
+    };
+    SmallVector<int64_t> lhsKept, rhsKept, lhsReduced, rhsReduced;
+    SmallVector<int64_t> lhsBatch, rhsBatch, lhsOutput, rhsOutput;
+    bool compatible = true;
+    unsigned lhsFree = 0, rhsFree = 0;
+    for (unsigned axis = 0; axis < productType.getShape().size(); ++axis) {
+      auto left = lhsProjection.targetToSource[axis];
+      auto right = rhsProjection.targetToSource[axis];
+      bool leftBroadcast = broadcastsAxis(lhs, left);
+      bool rightBroadcast = broadcastsAxis(rhs, right);
+      bool reduced = llvm::is_contained(reduce.getAxes(), axis);
+      if (reduced && (!left || !right || leftBroadcast || rightBroadcast)) {
+        compatible = false;
+        break;
+      }
+      // Retain a common unit result axis once, just like a batch axis. Other
+      // singleton broadcasts introduce no independent contraction work.
+      if (!reduced && leftBroadcast && rightBroadcast) {
+        if (!left) {
+          compatible = false;
+          break;
+        }
+        leftBroadcast = false;
+      }
+      int64_t leftAxis = lhsKept.size(), rightAxis = rhsKept.size();
+      if (!leftBroadcast)
+        lhsKept.push_back(*left);
+      if (!rightBroadcast)
+        rhsKept.push_back(*right);
+      if (reduced) {
+        lhsReduced.push_back(leftAxis);
+        rhsReduced.push_back(rightAxis);
+      } else {
+        if (!leftBroadcast)
+          lhsOutput.push_back(axis);
+        if (!leftBroadcast && !rightBroadcast) {
+          lhsBatch.push_back(leftAxis);
+          rhsBatch.push_back(rightAxis);
+        } else if (!rightBroadcast) {
+          rhsOutput.push_back(axis);
+          ++rhsFree;
+        } else {
+          ++lhsFree;
+        }
+      }
+    }
+    // Expose matrix reuse. Vector inner products already have a native reduce
+    // path; turning every such reduction into a contraction adds no reuse.
+    if (!compatible || !lhsFree || !rhsFree)
+      continue;
+    OpBuilder builder(reduce);
+    auto squeeze = [&](Value value, ArrayRef<int64_t> kept) -> Value {
+      auto source = cast<FragmentType>(value.getType());
+      if (kept.size() == source.getShape().size())
+        return value;
+      SmallVector<Attribute> shape, mappings, groups;
+      for (unsigned axis = 0; axis < source.getShape().size(); ++axis) {
+        SmallVector<int64_t> resultAxes;
+        if (llvm::is_contained(kept, axis)) {
+          resultAxes.push_back(shape.size());
+          shape.push_back(source.getShape()[axis]);
+          auto map = cast<AxisMapAttr>(source.getAxisMaps()[axis]);
+          mappings.push_back(AxisMapAttr::get(
+              module.getContext(), map.getSourceId(), map.getSourceAxis(),
+              map.getDimensionId(), mappings.size(), map.getDerived()));
+        }
+        groups.push_back(ReshapeGroupAttr::get(
+            module.getContext(), builder.getDenseI64ArrayAttr({axis}),
+            builder.getDenseI64ArrayAttr(resultAxes)));
+      }
+      auto target = FragmentType::get(
+          module.getContext(), source.getElementType(),
+          builder.getArrayAttr(shape), builder.getArrayAttr(mappings),
+          source.getValidity(), source.getOwner());
+      return builder.create<ReshapeOp>(reduce.getLoc(), target, value,
+                                       builder.getArrayAttr(groups));
+    };
+    lhs = squeeze(lhs, lhsKept);
+    rhs = squeeze(rhs, rhsKept);
+    SmallVector<int64_t> outputAxes(lhsOutput);
+    llvm::append_range(outputAxes, rhsOutput);
+    SmallVector<Attribute> shape, mappings;
+    auto appendOutput = [&](Value value, ArrayRef<int64_t> reduced,
+                            ArrayRef<int64_t> batched) {
+      auto type = cast<FragmentType>(value.getType());
+      for (unsigned axis = 0; axis < type.getShape().size(); ++axis) {
+        if (llvm::is_contained(reduced, axis) ||
+            llvm::is_contained(batched, axis))
+          continue;
+        shape.push_back(type.getShape()[axis]);
+        auto map = cast<AxisMapAttr>(type.getAxisMaps()[axis]);
+        mappings.push_back(AxisMapAttr::get(
+            module.getContext(), map.getSourceId(), map.getSourceAxis(),
+            map.getDimensionId(), mappings.size(), map.getDerived()));
+      }
+    };
+    appendOutput(lhs, lhsReduced, {});
+    appendOutput(rhs, rhsReduced, rhsBatch);
+    auto contractedType = FragmentType::get(
+        module.getContext(), resultType.getElementType(),
+        builder.getArrayAttr(shape), builder.getArrayAttr(mappings),
+        resultType.getValidity(), resultType.getOwner());
+    auto zero = projectPhysicalValueToSchema(
+        builder, reduce.getLoc(), reduce.getInputs()[1], contractedType);
+    if (failed(zero))
+      return reduce.emitOpError("cannot form the multiply-reduction identity");
+    auto contract = builder.create<ContractOp>(
+        reduce.getLoc(), contractedType, lhs, rhs, *zero, lhsReduced, rhsReduced,
+        lhsBatch, rhsBatch);
+    if (Attribute origin = reduce->getAttr(originAttr))
+      contract->setAttr(originAttr, origin);
+    SmallVector<int64_t> permutation;
+    for (unsigned axis = 0; axis < productType.getShape().size(); ++axis) {
+      if (llvm::is_contained(reduce.getAxes(), axis))
+        continue;
+      permutation.push_back(llvm::find(outputAxes, axis) - outputAxes.begin());
+    }
+    Value replacement = contract.getResult();
+    if (!llvm::all_of(llvm::enumerate(permutation), [](auto item) {
+          return item.index() == static_cast<unsigned>(item.value());
+        })) {
+      SmallVector<Attribute> reorderedShape, reorderedMappings;
+      for (int64_t axis : permutation) {
+        reorderedShape.push_back(shape[axis]);
+        auto map = cast<AxisMapAttr>(mappings[axis]);
+        reorderedMappings.push_back(AxisMapAttr::get(
+            module.getContext(), map.getSourceId(), map.getSourceAxis(),
+            map.getDimensionId(), reorderedMappings.size(), map.getDerived()));
+      }
+      auto reorderedType = FragmentType::get(
+          module.getContext(), resultType.getElementType(),
+          builder.getArrayAttr(reorderedShape),
+          builder.getArrayAttr(reorderedMappings),
+          resultType.getValidity(), resultType.getOwner());
+      replacement = builder.create<TransposeOp>(
+          reduce.getLoc(), reorderedType, replacement, permutation);
+    }
+    if (replacement.getType() != resultType)
+      replacement = builder.create<BroadcastOp>(reduce.getLoc(), resultType,
+                                                replacement);
+    reduce.getResult(0).replaceAllUsesWith(replacement);
+    reduce.erase();
+  }
+  eraseDeadPhysicalValues(*kernel);
+  return success();
+}
+
 LogicalResult composeContractResultReshapes(ModuleOp module) {
   FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
   if (failed(kernel))
