@@ -2,12 +2,179 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
 
 namespace intent::gpu {
 namespace {
+
+bool variesWithIteration(Value value, scf::ForOp loop,
+                        llvm::DenseMap<Value, bool> &known) {
+  if (loop.isDefinedOutsideOfLoop(value))
+    return false;
+  if (auto found = known.find(value); found != known.end())
+    return found->second;
+  bool varies = true;
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    auto nested = dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
+    if (nested && nested != loop && argument == nested.getInductionVar())
+      varies = variesWithIteration(nested.getLowerBound(), loop, known) ||
+               variesWithIteration(nested.getUpperBound(), loop, known) ||
+               variesWithIteration(nested.getStep(), loop, known);
+  } else if (Operation *producer = value.getDefiningOp();
+             producer && !producer->getNumRegions() &&
+             canPredicateValueOperation(producer) &&
+             !isa<LoadOp, GatherOp>(producer)) {
+    varies = llvm::any_of(producer->getOperands(), [&](Value operand) {
+      return variesWithIteration(operand, loop, known);
+    });
+  }
+  known[value] = varies;
+  return varies;
+}
+
+bool canVectorizeIterations(Block &block, scf::ForOp loop,
+                           llvm::DenseMap<Value, bool> &varying) {
+  auto scalar = [](Type type) {
+    return isa<IntegerType, IndexType, FloatType>(type);
+  };
+  for (Operation &operation : block.without_terminator()) {
+    if (!llvm::all_of(operation.getResultTypes(), scalar) ||
+        llvm::any_of(operation.getOperandTypes(), [](Type type) {
+          return isa<FragmentType, RecordType>(type);
+        }))
+      return false;
+    if (auto nested = dyn_cast<scf::ForOp>(operation)) {
+      if (variesWithIteration(nested.getLowerBound(), loop, varying) ||
+          variesWithIteration(nested.getUpperBound(), loop, varying) ||
+          variesWithIteration(nested.getStep(), loop, varying) ||
+          !canVectorizeIterations(*nested.getBody(), loop, varying))
+        return false;
+    } else if (auto branch = dyn_cast<scf::IfOp>(operation)) {
+      if (!canVectorizeIterations(*branch.thenBlock(), loop, varying) ||
+          (!branch.getElseRegion().empty() &&
+           !canVectorizeIterations(*branch.elseBlock(), loop, varying)))
+        return false;
+    } else if (auto store = dyn_cast<StoreOp>(operation)) {
+      // Compiler-created retained storage may be reused sequentially by the
+      // original points. Its allocation has not been widened to lane slices.
+      if (auto buffer = dyn_cast<BufferType>(store.getResource().getType());
+          buffer && buffer.getWorkspace())
+        return false;
+      if (!scalar(store.getValue().getType()) ||
+          !llvm::all_of(store.getCoordinates(), [&](Value value) {
+            return scalar(value.getType());
+          }))
+        return false;
+    } else if (operation.getNumRegions() ||
+               !canPredicateValueOperation(&operation)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+LogicalResult vectorizeExplicitIterations(func::FuncOp kernel,
+                                         uint64_t &source, int64_t &dimension) {
+  SmallVector<scf::ForOp> loops;
+  kernel.walk<WalkOrder::PreOrder>([&](scf::ForOp loop) {
+    auto step = loop.getStep().getDefiningOp<arith::ConstantIndexOp>();
+    llvm::DenseMap<Value, bool> varying;
+    if (!loop->hasAttr(independentIterationAttr) || loop.getNumResults() ||
+        !step || step.value() != 1 ||
+        !canVectorizeIterations(*loop.getBody(), loop, varying))
+      return WalkResult::advance();
+    loops.push_back(loop);
+    return WalkResult::skip();
+  });
+  for (scf::ForOp loop : loops) {
+    uint32_t elementBitWidth = 0;
+    loop.walk([&](StoreOp store) {
+      Type type = store.getValue().getType();
+      elementBitWidth = std::max(
+          elementBitWidth, type.isIndex() ? 64u : type.getIntOrFloatBitWidth());
+    });
+    if (!elementBitWidth)
+      continue;
+    auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+    SmallVector<int64_t> candidates;
+    for (int64_t width = 1; width <= capabilities.getMaxThreadsPerBlock();
+         width *= 2)
+      candidates.push_back(width);
+    auto name = ("ITERATION_" + Twine(source)).str();
+    ParameterOp width = getOrCreatePhysicalParameter(
+        kernel, name, ParameterRole::OwnershipN, ParameterCategory::Pointwise,
+        elementBitWidth, candidates);
+    if (!width)
+      return failure();
+    OpBuilder builder(loop);
+    // This is a fresh one-dimensional iteration domain. Load/store sourceAxes
+    // continue to map its coordinates to the original resource axes.
+    auto ordinal = AxisMapAttr::get(kernel.getContext(), source++, 0,
+                                   dimension++, 0, false);
+    width->setAttr(parameterSourceAttr,
+                   PhysicalSourceAttr::get(kernel.getContext(),
+                                           ordinal.getSourceId(), 0, false));
+    width->setAttr(pointwiseChunkAttr, builder.getUnitAttr());
+    auto extent = PhysicalExprAttr::get(
+        kernel.getContext(), static_cast<uint32_t>(PhysicalExprKind::Parameter),
+        0, builder.getStringAttr(name), builder.getArrayAttr({}));
+    auto shape = FragmentType::get(
+        kernel.getContext(), builder.getIndexType(), builder.getArrayAttr({extent}),
+        builder.getArrayAttr({ordinal}), 1, /*owner=*/1);
+    auto boolean = FragmentType::get(
+        kernel.getContext(), builder.getI1Type(), shape.getShape(),
+        shape.getAxisMaps(), shape.getValidity(), shape.getOwner());
+    Location location = loop.getLoc();
+    Type index = builder.getIndexType();
+    Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+    Value one = builder.create<arith::ConstantIndexOp>(location, 1);
+    Value nonempty = builder.create<CompareOp>(
+        location, builder.getI1Type(), loop.getLowerBound(), loop.getUpperBound(),
+        ComparePredicate::Lt);
+    Value span = builder.create<BinaryOp>(
+        location, index, loop.getUpperBound(), loop.getLowerBound(),
+        BinaryOperator::Subtract);
+    Value last = builder.create<BinaryOp>(location, index, span, one,
+                                         BinaryOperator::Subtract);
+    last = builder.create<SelectOp>(location, index, nonempty, last, zero);
+    Value chunks = builder.create<BinaryOp>(
+        location, index, last, width.getResult(), BinaryOperator::FloorDivide);
+    Value present = builder.create<CastOp>(location, index, nonempty);
+    chunks = builder.create<BinaryOp>(location, index, chunks, present,
+                                     BinaryOperator::Add);
+    auto blocked = builder.create<scf::ForOp>(location, zero, chunks, one);
+    blocked->setAttrs(loop->getAttrs());
+    builder.setInsertionPoint(blocked.getBody()->getTerminator());
+    Value offset = builder.create<BinaryOp>(
+        location, index, blocked.getInductionVar(), width.getResult(),
+        BinaryOperator::Multiply);
+    Value start = builder.create<BinaryOp>(location, index, loop.getLowerBound(),
+                                          offset, BinaryOperator::Add);
+    Value members = builder.create<MakeRangeOp>(
+        loop.getLoc(), shape, start, width.getResult(), loop.getStep(),
+        loop.getLowerBound(), loop.getUpperBound(),
+        ordinal.getSourceId(), 0, false);
+    // Count chunks and guard lane ordinals so a padded final lane cannot wrap
+    // past a large logical upper bound and accidentally become active again.
+    Value remaining = builder.create<BinaryOp>(location, index, span, offset,
+                                              BinaryOperator::Subtract);
+    Value base = builder.create<BroadcastOp>(location, shape, start);
+    Value lanes = builder.create<BinaryOp>(location, shape, members, base,
+                                          BinaryOperator::Subtract);
+    Value end = builder.create<BroadcastOp>(location, shape, remaining);
+    Value active = builder.create<CompareOp>(loop.getLoc(), boolean, lanes, end,
+                                            ComparePredicate::Lt);
+    IRMapping values;
+    values.map(loop.getInductionVar(), members);
+    for (Operation &operation : loop.getBody()->without_terminator())
+      clonePredicatedScalarOperation(builder, &operation, values, active, shape);
+    loop.erase();
+  }
+  return success();
+}
 
 void vectorizeIndependentUpdates(BufferOp buffer, func::FuncOp kernel,
                                  uint64_t &source, int64_t &dimension) {
@@ -135,6 +302,8 @@ LogicalResult vectorizeBufferLoops(ModuleOp module) {
       }))
     return success();
   auto [source, dimension] = nextPhysicalAxisIdentities(kernel);
+  if (failed(vectorizeExplicitIterations(kernel, source, dimension)))
+    return failure();
   SmallVector<BufferOp> buffers;
   kernel.walk([&](BufferOp buffer) { buffers.push_back(buffer); });
   for (BufferOp buffer : buffers)

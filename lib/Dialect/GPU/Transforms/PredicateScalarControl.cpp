@@ -223,10 +223,12 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
   };
   Operation *clone;
   if (auto loop = dyn_cast<scf::ForOp>(operation)) {
-    assert(!shape && "ordered loops are predicated before fragment lifting");
+    SmallVector<Value> initial = coordinates(loop.getInitArgs());
+    for (Value &value : initial)
+      value = lift(value);
     auto result = builder.create<scf::ForOp>(
         location, mapped(loop.getLowerBound()), mapped(loop.getUpperBound()),
-        mapped(loop.getStep()), coordinates(loop.getInitArgs()));
+        mapped(loop.getStep()), initial);
     result->setAttrs(loop->getAttrs());
     if (!result.getBody()->empty())
       result.getBody()->back().erase();
@@ -237,17 +239,51 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
       OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPointToStart(result.getBody());
       for (Operation &nested : loop.getBody()->without_terminator())
-        clonePredicatedScalarOperation(builder, &nested, bodyMapping, predicate);
+        clonePredicatedScalarOperation(builder, &nested, bodyMapping, predicate,
+                                       shape);
       SmallVector<Value> yielded;
       for (auto [value, carried] :
            llvm::zip(loop.getBody()->getTerminator()->getOperands(),
                      result.getRegionIterArgs()))
         yielded.push_back(selectScalarProduct(
-            builder, location, predicate, bodyMapping.lookupOrDefault(value),
+            builder, location, predicate, lift(bodyMapping.lookupOrDefault(value)),
             carried));
       builder.create<scf::YieldOp>(location, yielded);
     }
     clone = result;
+  } else if (auto branch = dyn_cast<scf::IfOp>(operation)) {
+    Value condition = lift(mapped(branch.getCondition()));
+    if (condition.getType() != predicate.getType())
+      condition = builder.create<BroadcastOp>(
+          location, cast<FragmentType>(predicate.getType()), condition);
+    Value zero = builder.create<arith::ConstantOp>(location,
+                                                 builder.getBoolAttr(false));
+    if (auto fragment = dyn_cast<FragmentType>(condition.getType()))
+      zero = builder.create<SplatOp>(location, fragment, zero);
+    Value inverse = builder.create<CompareOp>(
+        location, condition.getType(), condition, zero, ComparePredicate::Eq);
+    auto cloneBranch = [&](Region &region, Value selected) {
+      SmallVector<Value> results;
+      if (region.empty())
+        return results;
+      Value active = builder.create<BinaryOp>(
+          location, predicate.getType(), predicate, selected,
+          BinaryOperator::LogicalAnd);
+      IRMapping branchMapping(mapping);
+      for (Operation &nested : region.front().without_terminator())
+        clonePredicatedScalarOperation(builder, &nested, branchMapping, active,
+                                       shape);
+      for (Value value : region.front().getTerminator()->getOperands())
+        results.push_back(lift(branchMapping.lookupOrDefault(value)));
+      return results;
+    };
+    SmallVector<Value> thenValues = cloneBranch(branch.getThenRegion(), condition);
+    SmallVector<Value> elseValues = cloneBranch(branch.getElseRegion(), inverse);
+    for (auto [result, lhs, rhs] :
+         llvm::zip(branch.getResults(), thenValues, elseValues))
+      mapping.map(result, selectScalarProduct(builder, location, condition,
+                                              lhs, rhs));
+    return;
   } else if (auto store = dyn_cast<StoreOp>(operation)) {
     clone = builder.create<StoreOp>(
         location, mapped(store.getResource()), coordinates(store.getCoordinates()),
