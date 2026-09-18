@@ -2723,8 +2723,24 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
     if (!store.getValid())
       continue;
     auto currentType = dyn_cast<FragmentType>(store.getValue().getType());
-    if (!currentType)
-      continue;
+    if (!currentType) {
+      auto validity = dyn_cast<FragmentType>(store.getValid().getType());
+      if (!validity || !llvm::all_of(validity.getShape(), [](Attribute extent) {
+            return constantPhysicalExpression(cast<PhysicalExprAttr>(extent)) == 1;
+          }))
+        continue;
+      // Ownership can retain a one-lane predicate for a scalar write.  Adopt
+      // that schema without widening the write into additional lanes.
+      currentType = FragmentType::get(
+          kernel.getContext(), store.getValue().getType(), validity.getShape(),
+          validity.getAxisMaps(), validity.getValidity(), validity.getOwner());
+      OpBuilder builder(store);
+      FailureOr<Value> value = project(builder, store.getLoc(), store.getValue(),
+                                       currentType);
+      if (failed(value))
+        return store.emitOpError("cannot align scalar store with its one-lane validity");
+      store.getValueMutable().assign(*value);
+    }
     // A value whose extent is already selected by an exact range or verified
     // reshape is the physical data authority for the write.  Retarget the
     // address relation to that extent before reconciling schemas.  This keeps
@@ -3001,10 +3017,30 @@ LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
         elseYield.getResults().size() != branch.getNumResults())
       return WalkResult::interrupt();
     for (unsigned index = 0; index < branch.getNumResults(); ++index) {
+      Value leftValue = thenYield.getResults()[index];
+      Value rightValue = elseYield.getResults()[index];
+      Type leftType = leftValue.getType(), rightType = rightValue.getType();
+      UniformValueAnalysis uniform(describeUniformValue);
+      bool leftUniform = static_cast<bool>(uniform.evaluate(leftValue));
+      bool rightUniform = static_cast<bool>(uniform.evaluate(rightValue));
+      if (leftUniform != rightUniform) {
+        Type &uniformType = leftUniform ? leftType : rightType;
+        if (auto fragment = dyn_cast<FragmentType>(uniformType)) {
+          // A uniform branch adopts the other branch's selected physical
+          // extents, while retaining its axis, dtype and ownership obligations.
+          auto unit = PhysicalExprAttr::get(
+              kernel.getContext(), static_cast<uint32_t>(PhysicalExprKind::Constant),
+              1, StringAttr::get(kernel.getContext(), ""),
+              ArrayAttr::get(kernel.getContext(), {}));
+          SmallVector<Attribute> units(fragment.getShape().size(), unit);
+          uniformType = FragmentType::get(
+              kernel.getContext(), fragment.getElementType(),
+              ArrayAttr::get(kernel.getContext(), units), fragment.getAxisMaps(),
+              fragment.getValidity(), fragment.getOwner());
+        }
+      }
       FailureOr<Type> target = joinTypes(
-          branch.getResult(index).getType(),
-          thenYield.getResults()[index].getType(),
-          elseYield.getResults()[index].getType());
+          branch.getResult(index).getType(), leftType, rightType);
       if (failed(target)) {
         branch.emitOpError(
             "control-flow branches have no unique physical result relation")
