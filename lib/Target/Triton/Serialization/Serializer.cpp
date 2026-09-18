@@ -596,6 +596,12 @@ private:
       output << ", " << parameter << ": tl.constexpr";
     output << "):\n";
     indent = 1;
+    kernel.walk([&](gpu::ParameterOp parameter) {
+      if (parameter.getParameter().getRole() ==
+          static_cast<uint32_t>(gpu::ParameterRole::ProviderWarps))
+        line(parameter.getParameter().getName().getValue().str() +
+             ": tl.constexpr = tl.extra.cuda.num_warps()");
+    });
     emitBlock(kernel.getBody().front(), /*isLoop=*/false, {});
     output << "\n";
   }

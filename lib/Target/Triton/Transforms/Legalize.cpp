@@ -814,6 +814,50 @@ bool typeFitsTritonTensor(Type type, const TritonConfig &config) {
 
 bool isTritonFragmentExtent(Attribute attribute);
 
+SmallVector<gpu::FragmentType> collectiveFragments(func::FuncOp kernel) {
+  SmallVector<gpu::FragmentType> fragments;
+  kernel.walk([&](Operation *operation) {
+    auto store = dyn_cast<gpu::StoreOp>(operation);
+    bool workspaceStore = store && isa<gpu::BufferType>(store.getResource().getType());
+    if (store)
+      if (auto argument = dyn_cast<BlockArgument>(store.getResource());
+          argument && argument.getOwner() == &kernel.front()) {
+        auto kind = kernel.getArgAttrOfType<StringAttr>(
+            argument.getArgNumber(), gpu::abiKindAttr);
+        workspaceStore |= kind && kind.getValue() == "workspace";
+      }
+    if (!isa<gpu::ReduceOp, gpu::ScanOp, ReduceOp, ScanOp>(operation) &&
+        !workspaceStore)
+      return;
+    auto collect = [&](Value operand) {
+      if (auto fragment = dyn_cast<gpu::FragmentType>(operand.getType());
+          fragment && !llvm::is_contained(fragments, fragment))
+        fragments.push_back(fragment);
+    };
+    if (workspaceStore)
+      collect(store.getValue());
+    else
+      for (Value operand : operation->getOperands())
+        collect(operand);
+  });
+  return fragments;
+}
+
+gpu::PhysicalExprAttr fragmentRegisterFootprint(gpu::FragmentType fragment) {
+  Type element = fragment.getElementType();
+  unsigned bits = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
+  MLIRContext *context = fragment.getContext();
+  auto footprint = gpu::PhysicalExprAttr::get(
+      context, static_cast<uint32_t>(gpu::PhysicalExprKind::Constant),
+      std::max(1u, (bits + 31) / 32), StringAttr::get(context, ""),
+      ArrayAttr::get(context, {}));
+  for (Attribute extent : fragment.getShape())
+    footprint = gpu::PhysicalExprAttr::get(
+        context, static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
+        StringAttr::get(context, ""), ArrayAttr::get(context, {footprint, extent}));
+  return footprint;
+}
+
 gpu::PhysicalExprAttr reductionRegisterFootprint(ValueRange sources,
                                                func::FuncOp kernel) {
   std::function<bool(gpu::PhysicalExprAttr)> isTunableExtent =
@@ -848,13 +892,7 @@ gpu::PhysicalExprAttr reductionRegisterFootprint(ValueRange sources,
           return isTunableExtent(cast<gpu::PhysicalExprAttr>(extent));
         }))
       continue;
-    Type element = fragment.getElementType();
-    unsigned bits = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
-    auto footprint = expression(gpu::PhysicalExprKind::Constant,
-                                std::max(1u, (bits + 31) / 32), {});
-    for (Attribute extent : fragment.getShape())
-      footprint = expression(gpu::PhysicalExprKind::Multiply, 0,
-                             {footprint, extent});
+    auto footprint = fragmentRegisterFootprint(fragment);
     registers = !registers ? footprint : expression(
         gpu::PhysicalExprKind::Add, 0, {registers, footprint});
   }
@@ -863,8 +901,12 @@ gpu::PhysicalExprAttr reductionRegisterFootprint(ValueRange sources,
 
 LogicalResult materializeDeferredResourceBounds(func::FuncOp kernel) {
   TritonConfig known;
+  gpu::ParameterAttr warpParameter;
   kernel.walk([&](gpu::ParameterOp parameter) {
     auto schema = parameter.getParameter();
+    if (schema.getRole() ==
+        static_cast<uint32_t>(gpu::ParameterRole::ProviderWarps))
+      warpParameter = schema;
     if (schema.getCategory() !=
             static_cast<uint32_t>(gpu::ParameterCategory::Coverage) &&
         !parameter->hasAttr(gpu::coverageDimensionAttr))
@@ -939,6 +981,47 @@ LogicalResult materializeDeferredResourceBounds(func::FuncOp kernel) {
         return kernel.emitError("Triton register bounds require constexpr fragment extents");
       assertBound(footprint, capabilities.getRegistersPerUnit(),
                   "Triton reduction source exceeds the register budget");
+    }
+    if (warpParameter && warpParameter.getCandidates().size() > 1) {
+      auto expression = [&](gpu::PhysicalExprKind kind, int64_t value,
+                            ArrayRef<Attribute> operands) {
+        return gpu::PhysicalExprAttr::get(
+            kernel.getContext(), static_cast<uint32_t>(kind), value,
+            builder.getStringAttr(""), builder.getArrayAttr(operands));
+      };
+      auto constant = [&](int64_t value) {
+        return expression(gpu::PhysicalExprKind::Constant, value, {});
+      };
+      auto warps = gpu::PhysicalExprAttr::get(
+          kernel.getContext(),
+          static_cast<uint32_t>(gpu::PhysicalExprKind::Parameter), 0,
+          warpParameter.getName(), builder.getArrayAttr({}));
+      int64_t maximumWarps =
+          *llvm::max_element(warpParameter.getCandidates().asArrayRef());
+      auto belowMaximum = expression(gpu::PhysicalExprKind::Subtract, 0,
+                                     {warps, constant(maximumWarps)});
+      auto nominalBudget = expression(gpu::PhysicalExprKind::Multiply, 0,
+                                      {warps, constant(32 * 255)});
+      // Apply the same per-fragment policy after specialization binds the
+      // physical extents. The widest supplied option may spill.
+      auto budget = expression(gpu::PhysicalExprKind::Select, 0,
+                               {belowMaximum, nominalBudget,
+                                constant(std::numeric_limits<int64_t>::max())});
+      for (gpu::FragmentType fragment : collectiveFragments(kernel)) {
+        auto footprint = fragmentRegisterFootprint(fragment);
+        if (evaluateCompileTimeExpression(footprint, TritonConfig{}))
+          continue;
+        Value count = builder.create<gpu::PhysicalExprOp>(
+            kernel.getLoc(), builder.getIndexType(), footprint);
+        Value maximum = builder.create<gpu::PhysicalExprOp>(
+            kernel.getLoc(), builder.getIndexType(), budget);
+        Value valid = builder.create<gpu::CompareOp>(
+            kernel.getLoc(), builder.getI1Type(), count, maximum,
+            ComparePredicate::Le);
+        builder.create<cf::AssertOp>(
+            kernel.getLoc(), valid,
+            "Triton collective fragment exceeds the nominal per-thread register budget");
+      }
     }
   }
   return success();
@@ -3600,40 +3683,14 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   auto capabilities = kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
   int64_t fixedFragmentWords = 0;
   kernel.walk([&](Operation *operation) {
-    bool collective = isa<gpu::ReduceOp, gpu::ScanOp>(operation);
-    auto store = dyn_cast<gpu::StoreOp>(operation);
-    bool workspaceStore = store && isa<gpu::BufferType>(store.getResource().getType());
-    if (!collective && !workspaceStore)
-      return;
-    if (collective && !llvm::is_contained(categories, gpu::ParameterCategory::Reduction))
+    if (isa<gpu::ReduceOp, gpu::ScanOp>(operation) &&
+        !llvm::is_contained(categories, gpu::ParameterCategory::Reduction))
       categories.push_back(gpu::ParameterCategory::Reduction);
-    SmallVector<Value> operands;
-    if (workspaceStore)
-      operands.push_back(store.getValue());
-    else
-      llvm::append_range(operands, operation->getOperands());
-    for (Value operand : operands) {
-      auto fragment = dyn_cast<gpu::FragmentType>(operand.getType());
-      if (!fragment)
-        continue;
-      Type element = fragment.getElementType();
-      int64_t words = std::max(1u,
-          ((element.isIndex() ? 64 : element.getIntOrFloatBitWidth()) + 31) / 32);
-      bool fixed = true;
-      for (Attribute attribute : fragment.getShape()) {
-        auto extent = cast<gpu::PhysicalExprAttr>(attribute);
-        if (extent.getKind() != static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
-            extent.getValue() <= 0 ||
-            words > std::numeric_limits<int64_t>::max() / extent.getValue()) {
-          fixed = false;
-          break;
-        }
-        words *= extent.getValue();
-      }
-      if (fixed)
-        fixedFragmentWords = std::max(fixedFragmentWords, words);
-    }
   });
+  for (gpu::FragmentType fragment : collectiveFragments(kernel))
+    if (auto words = evaluateCompileTimeExpression(
+            fragmentRegisterFootprint(fragment), TritonConfig{}))
+      fixedFragmentWords = std::max(fixedFragmentWords, *words);
   bool blackwell = capabilities.getComputeCapabilityMajor() == 10 ||
                    capabilities.getComputeCapabilityMajor() == 12;
   bool hasContraction = false;
