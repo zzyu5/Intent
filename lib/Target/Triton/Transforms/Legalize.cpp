@@ -2326,7 +2326,8 @@ void selectContractForms(func::FuncOp kernel) {
       if (!ieeeFp32)
         continue;
     }
-    // Prefer a legal expansion when IEEE dot's estimated staging is too large.
+    // IEEE dot has no matrix reuse along a unit free axis. Prefer its parallel
+    // reduction expansion there, as well as when estimated staging is too large.
     // The provider still validates the native form's actual resource usage.
     Value canExpand = expandedFits();
     Value extent = builder.create<gpu::PhysicalExprOp>(
@@ -2352,12 +2353,23 @@ void selectContractForms(func::FuncOp kernel) {
       auto capabilities = kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
       Value capacity = builder.create<arith::ConstantIndexOp>(
           contract.getLoc(), capabilities.getMaxDynamicSharedMemoryPerBlock());
-      Value oversized = builder.create<gpu::CompareOp>(contract.getLoc(),
+      Value preferExpansion = builder.create<gpu::CompareOp>(contract.getLoc(),
           builder.getI1Type(), footprint, capacity, ComparePredicate::Gt);
-      oversized = builder.create<gpu::BinaryOp>(contract.getLoc(),
-          builder.getI1Type(), oversized, canExpand, BinaryOperator::LogicalAnd);
+      auto shape = contract.getAccumulator().getType().getShape().getValue();
+      for (Attribute dimension : shape.take_back(std::min<size_t>(2, shape.size()))) {
+        Value width = builder.create<gpu::PhysicalExprOp>(
+            contract.getLoc(), builder.getIndexType(),
+            cast<gpu::PhysicalExprAttr>(dimension));
+        Value one = builder.create<arith::ConstantIndexOp>(contract.getLoc(), 1);
+        Value unit = builder.create<gpu::CompareOp>(contract.getLoc(),
+            builder.getI1Type(), width, one, ComparePredicate::Eq);
+        preferExpansion = builder.create<gpu::BinaryOp>(contract.getLoc(),
+            builder.getI1Type(), preferExpansion, unit, BinaryOperator::LogicalOr);
+      }
+      preferExpansion = builder.create<gpu::BinaryOp>(contract.getLoc(),
+          builder.getI1Type(), preferExpansion, canExpand, BinaryOperator::LogicalAnd);
       small = builder.create<gpu::BinaryOp>(contract.getLoc(), builder.getI1Type(),
-          small, oversized, BinaryOperator::LogicalOr);
+          small, preferExpansion, BinaryOperator::LogicalOr);
     }
     auto choice = builder.create<scf::IfOp>(
         contract.getLoc(), TypeRange{contract.getResult().getType()}, small, true);
