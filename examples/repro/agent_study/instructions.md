@@ -41,6 +41,11 @@ Intent is a programmable operator/kernel DSL with Triton-like algorithm
 organization: express the algorithm over logical domains instead of hardware
 tiles. Use your knowledge of Triton algorithms to choose the kernel stages,
 intermediate tensors and dependencies, then express that organization in Intent.
+When a Triton algorithm uses program_id to distinguish independent pieces of
+logical work, express those pieces through logical domains, I.parallel iterations
+and source subregions. Their grouping is part of the authored algorithm; the
+physical mapping need not be one logical iteration per Triton program. Removing
+a hardware tile parameter must preserve the algorithm's logical work decomposition.
 Logical domains, subregions and index relations describe the work; the compiler
 chooses physical tiles, program mapping and thread layouts within each kernel.
 Keep the chosen algorithm's explicit stages in the program: a whole-domain
