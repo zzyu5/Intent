@@ -363,7 +363,19 @@ Value stripIntegerIndexCasts(Value value) {
     if (auto reshape = value.getDefiningOp<ReshapeOp>()) {
       auto source = dyn_cast<FragmentType>(reshape.getValue().getType());
       auto result = dyn_cast<FragmentType>(reshape.getResult().getType());
-      if (source && result && source.getShape() == result.getShape()) {
+      auto nonUnitShape = [](ArrayAttr shape) {
+        SmallVector<Attribute> extents;
+        for (Attribute attribute : shape) {
+          auto extent = cast<PhysicalExprAttr>(attribute);
+          if (constantPhysicalExpression(extent) != 1)
+            extents.push_back(extent);
+        }
+        return extents;
+      };
+      // Inserting or removing size-one axes preserves every coordinate value
+      // and its linear order, including the coordinate guarded by a mask.
+      if (source && result &&
+          nonUnitShape(source.getShape()) == nonUnitShape(result.getShape())) {
         value = stripBroadcast(reshape.getValue());
         continue;
       }

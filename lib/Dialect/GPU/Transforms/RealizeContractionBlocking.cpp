@@ -5444,7 +5444,7 @@ static ReshapeOp exposeTransposedContractSplit(ContractOp contract) {
   return split;
 }
 
-LogicalResult fuseMultiplyReductions(ModuleOp module) {
+static LogicalResult fuseMultiplyReductions(ModuleOp module) {
   auto kernel = getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
@@ -5691,11 +5691,23 @@ LogicalResult fuseMultiplyReductions(ModuleOp module) {
   return success();
 }
 
-LogicalResult composeContractResultReshapes(ModuleOp module) {
+LogicalResult normalizeContractionSources(ModuleOp module) {
   FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
+  if (failed(fuseMultiplyReductions(module)) ||
+      failed(realizeAccessComposition(module)))
+    return failure();
   SmallVector<ContractOp> contracts;
+  kernel->walk([&](ContractOp contract) { contracts.push_back(contract); });
+  // Collapse complete logical reduction ranges before ownership introduces
+  // physical padding or scalar tiles that no longer admit this reassociation.
+  bool collapsed = false;
+  for (ContractOp contract : contracts)
+    collapsed |= collapseMultiReductionContract(contract);
+  if (collapsed && failed(realizeAccessComposition(module)))
+    return failure();
+  contracts.clear();
   kernel->walk([&](ContractOp contract) { contracts.push_back(contract); });
   bool changed = false;
   for (ContractOp contract : contracts) {

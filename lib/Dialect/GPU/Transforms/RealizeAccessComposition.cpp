@@ -1318,8 +1318,62 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
           ArrayAttr::get(reshape.getContext(), {extent, sourceExtents[axis]}));
     resultExtents[resultAxis] = extent;
   }
-  if (llvm::all_of(preservedResult, [](bool preserved) { return preserved; }))
-    return false;
+  if (llvm::all_of(preservedResult, [](bool preserved) { return preserved; })) {
+    bool exposesReductionPairs = llvm::any_of(
+        reshape.getResult().getUsers(), [&](Operation *user) {
+          auto contract = dyn_cast<ContractOp>(user);
+          return contract && contract.getLhsReductionAxes().size() > 1 &&
+                 (contract.getLhs() == reshape.getResult() ||
+                  contract.getRhs() == reshape.getResult());
+        });
+    if (transposed || !exposesReductionPairs)
+      return false;
+    // Unit-axis insertion/removal changes the access schema, not its members.
+    // Expose the load when this enables multi-pair contraction normalization;
+    // a single-pair contraction can retain its existing load factorization.
+    OpBuilder builder(reshape);
+    auto project = [&](Value value) -> FailureOr<Value> {
+      if (!value)
+        return Value();
+      auto fragment = dyn_cast<FragmentType>(value.getType());
+      if (!fragment)
+        return value;
+      auto expandedType = FragmentType::get(
+          source.getContext(), fragment.getElementType(), source.getShape(),
+          source.getAxisMaps(), source.getValidity(), source.getOwner());
+      auto expanded = materializeBroadcastToFragment(
+          builder, reshape.getLoc(), value, expandedType);
+      if (failed(expanded))
+        return failure();
+      auto projectedType = FragmentType::get(
+          result.getContext(), fragment.getElementType(), result.getShape(),
+          result.getAxisMaps(), result.getValidity(), result.getOwner());
+      return Value(builder.create<ReshapeOp>(
+          reshape.getLoc(), projectedType, *expanded,
+          reshape.getReassociation()));
+    };
+    SmallVector<Value> coordinates;
+    for (Value coordinate : load.getCoordinates()) {
+      auto projected = project(coordinate);
+      if (failed(projected))
+        return reshape.emitOpError("cannot project a unit-axis load coordinate"),
+               failure();
+      coordinates.push_back(*projected);
+    }
+    auto valid = project(load.getValid());
+    auto fill = project(load.getFill());
+    if (failed(valid) || failed(fill))
+      return reshape.emitOpError("cannot project unit-axis load validity/fill"),
+             failure();
+    auto replacement = builder.create<LoadOp>(
+        reshape.getLoc(), result, load.getResource(), coordinates, *valid, *fill,
+        load.getSourceAxesAttr());
+    replacement->setDiscardableAttrs(
+        llvm::to_vector(load->getDiscardableAttrs()));
+    reshape.getResult().replaceAllUsesWith(replacement.getResult());
+    reshape.erase();
+    return true;
+  }
   OpBuilder builder(reshape);
   auto materializeExtent = [&](PhysicalExprAttr extent) -> Value {
     if (extent.getKind() ==
