@@ -68,6 +68,22 @@ bool hasObservableEffect(Operation *operation) {
              AtomicCompareExchangeOp>(operation);
 }
 
+bool mutuallyExclusiveEffects(Operation *lhs, Operation *rhs) {
+  // A versioned operation may occur once in each exclusive branch, but never
+  // twice on the same dynamic control path.
+  for (Region *region = lhs->getParentRegion(); region;
+       region = region->getParentRegion()) {
+    auto branch = dyn_cast_or_null<scf::IfOp>(region->getParentOp());
+    if (!branch || branch.getElseRegion().empty())
+      continue;
+    Region &other = region == &branch.getThenRegion()
+                        ? branch.getElseRegion() : branch.getThenRegion();
+    if (other.isAncestor(rhs->getParentRegion()))
+      return true;
+  }
+  return false;
+}
+
 bool isPhysicalAccess(Operation *operation) {
   return isa<LoadOp, GatherOp, StoreOp, ScatterReduceOp, AtomicLoadOp,
              AtomicStoreOp, AtomicRMWOp, AtomicCompareExchangeOp>(operation);
@@ -286,6 +302,7 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
           "expected effect origins must be unique non-negative IDs");
   }
   llvm::DenseSet<int64_t> actualEffectOrigins;
+  llvm::DenseMap<int64_t, SmallVector<Operation *>> effectDefinitions;
   llvm::DenseSet<int64_t> programAxes;
   llvm::DenseMap<int64_t, std::pair<PhysicalExprAttr, PhysicalExprAttr>>
       executionGroups;
@@ -441,11 +458,16 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
     }
     if (hasObservableEffect(operation)) {
       auto origin = operation->getAttrOfType<IntegerAttr>(originAttr);
-      if (!origin || !actualEffectOrigins.insert(origin.getInt()).second) {
+      if (!origin || !llvm::all_of(effectDefinitions[origin.getInt()],
+                                   [&](Operation *previous) {
+                                     return mutuallyExclusiveEffects(previous, operation);
+                                   })) {
         operation->emitOpError(
-            "observable effect requires one unique canonical origin");
+            "observable effect requires one canonical origin per control path");
         return WalkResult::interrupt();
       }
+      actualEffectOrigins.insert(origin.getInt());
+      effectDefinitions[origin.getInt()].push_back(operation);
     }
     SmallVector<PhysicalExprAttr> expressions;
     for (Type type : operation->getOperandTypes())

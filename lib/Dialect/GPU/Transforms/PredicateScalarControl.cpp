@@ -286,6 +286,37 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
     }
     clone = result;
   } else if (auto branch = dyn_cast<scf::IfOp>(operation)) {
+    // An iteration-invariant condition remains scalar after remapping. Keep
+    // its branches lazy while predicating the accesses in the selected branch.
+    if (shape && mapped(branch.getCondition()).getType().isInteger(1)) {
+      SmallVector<Type> types;
+      for (Type type : branch.getResultTypes())
+        types.push_back(resultType(type));
+      auto result = builder.create<scf::IfOp>(location, types,
+          mapped(branch.getCondition()), !branch.getElseRegion().empty());
+      for (auto [original, region] :
+           llvm::zip(branch->getRegions(), result->getRegions())) {
+        if (original.empty())
+          continue;
+        Block &body = region.front();
+        if (!body.empty())
+          body.back().erase();
+        IRMapping branchMapping(mapping);
+        OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(&body);
+        for (Operation &nested : original.front().without_terminator())
+          clonePredicatedScalarOperation(builder, &nested, branchMapping,
+                                         predicate, shape);
+        SmallVector<Value> yielded;
+        for (Value value : original.front().getTerminator()->getOperands())
+          yielded.push_back(lift(branchMapping.lookupOrDefault(value)));
+        builder.create<scf::YieldOp>(location, yielded);
+      }
+      if (Attribute origin = operation->getAttr(originAttr))
+        result->setAttr(originAttr, origin);
+      mapping.map(branch.getResults(), result.getResults());
+      return;
+    }
     Value condition = lift(mapped(branch.getCondition()));
     if (condition.getType() != predicate.getType())
       condition = builder.create<BroadcastOp>(
@@ -318,6 +349,38 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
       mapping.map(result, selectScalarProduct(builder, location, condition,
                                               lhs, rhs));
     return;
+  } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
+    // New independent iteration axes are free axes of the original reduction.
+    SmallVector<Value> inputs;
+    SmallVector<Type> types;
+    for (Value value : reduce.getInputs())
+      inputs.push_back(lift(mapped(value)));
+    for (Type type : reduce.getResultTypes())
+      types.push_back(resultType(type));
+    SmallVector<int64_t> axes(reduce.getAxes());
+    for (int64_t &axis : axes)
+      axis += shape.getShape().size();
+    auto result = builder.create<ReduceOp>(location, types, inputs, axes,
+        reduce.getSourceCount(), reduce.getIdentityCount(), reduce.getCaptureCount());
+    for (NamedAttribute attribute : reduce->getDiscardableAttrs())
+      result->setAttr(attribute.getName(), attribute.getValue());
+    {
+      OpBuilder::InsertionGuard guard(builder);
+      SmallVector<Type> arguments;
+      for (Type type : reduce.getCombine().front().getArgumentTypes())
+        arguments.push_back(resultType(type));
+      Block *body = builder.createBlock(&result.getCombine(), {}, arguments,
+                                        SmallVector<Location>(arguments.size(), location));
+      IRMapping nestedMapping(mapping);
+      nestedMapping.map(reduce.getCombine().front().getArguments(), body->getArguments());
+      for (Operation &nested : reduce.getCombine().front().without_terminator())
+        clonePredicatedScalarOperation(builder, &nested, nestedMapping, predicate, shape);
+      SmallVector<Value> yielded;
+      for (Value value : reduce.getCombine().front().getTerminator()->getOperands())
+        yielded.push_back(lift(nestedMapping.lookupOrDefault(value)));
+      builder.create<YieldOp>(location, yielded);
+    }
+    clone = result;
   } else if (auto store = dyn_cast<StoreOp>(operation)) {
     clone = builder.create<StoreOp>(
         location, mapped(store.getResource()), coordinates(store.getCoordinates()),

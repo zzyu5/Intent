@@ -1390,6 +1390,14 @@ private:
         result += ", propagate_nan=tl.PropagateNan." + propagateNan.str();
       return result + ")";
     };
+    if (binary.getResult().getType().isIndex() &&
+        constexprValues.contains(binary.getLhs()) &&
+        constexprValues.contains(binary.getRhs())) {
+      if (binary.getOperatorKind() == BinaryOperator::Maximum)
+        return call("max");
+      if (binary.getOperatorKind() == BinaryOperator::Minimum)
+        return call("min");
+    }
     switch (binary.getOperatorKind()) {
     case BinaryOperator::Add: return infix("+");
     case BinaryOperator::Subtract: return infix("-");
