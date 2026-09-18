@@ -37,15 +37,27 @@ bool variesWithIteration(Value value, scf::ForOp loop,
 
 bool canVectorizeIterations(Block &block, scf::ForOp loop,
                            llvm::DenseMap<Value, bool> &varying) {
-  auto scalar = [](Type type) {
-    return isa<IntegerType, IndexType, FloatType>(type);
+  auto data = [](Type type) {
+    return isa<IntegerType, IndexType, FloatType, FragmentType>(type);
   };
   for (Operation &operation : block.without_terminator()) {
-    if (!llvm::all_of(operation.getResultTypes(), scalar) ||
+    if (!llvm::all_of(operation.getResultTypes(), data) ||
         llvm::any_of(operation.getOperandTypes(), [](Type type) {
-          return isa<FragmentType, RecordType>(type);
+          return isa<RecordType>(type);
         }))
       return false;
+    // A range still describes one shared column domain. A lane-dependent
+    // extent needs a different traversal, not a tensor-valued range bound.
+    if (isa<MakeRangeOp>(operation) &&
+        llvm::any_of(operation.getOperands(), [&](Value operand) {
+          return variesWithIteration(operand, loop, varying);
+        }))
+      return false;
+    // Gathering from a lane-expanded source would also need a new source-axis
+    // coordinate. Keep this transform to reads from an unchanged SSA source.
+    if (auto gather = dyn_cast<GatherOp>(operation))
+      if (!loop.isDefinedOutsideOfLoop(gather.getSource()))
+        return false;
     if (auto nested = dyn_cast<scf::ForOp>(operation)) {
       if (variesWithIteration(nested.getLowerBound(), loop, varying) ||
           variesWithIteration(nested.getUpperBound(), loop, varying) ||
@@ -63,9 +75,9 @@ bool canVectorizeIterations(Block &block, scf::ForOp loop,
       if (auto buffer = dyn_cast<BufferType>(store.getResource().getType());
           buffer && buffer.getWorkspace())
         return false;
-      if (!scalar(store.getValue().getType()) ||
+      if (!data(store.getValue().getType()) ||
           !llvm::all_of(store.getCoordinates(), [&](Value value) {
-            return scalar(value.getType());
+            return data(value.getType());
           }))
         return false;
     } else if (operation.getNumRegions() ||
@@ -79,20 +91,23 @@ bool canVectorizeIterations(Block &block, scf::ForOp loop,
 LogicalResult vectorizeExplicitIterations(func::FuncOp kernel,
                                          uint64_t &source, int64_t &dimension) {
   SmallVector<scf::ForOp> loops;
-  kernel.walk<WalkOrder::PreOrder>([&](scf::ForOp loop) {
-    auto step = loop.getStep().getDefiningOp<arith::ConstantIndexOp>();
-    llvm::DenseMap<Value, bool> varying;
-    if (!loop->hasAttr(independentIterationAttr) || loop.getNumResults() ||
-        !step || step.value() != 1 ||
-        !canVectorizeIterations(*loop.getBody(), loop, varying))
-      return WalkResult::advance();
-    loops.push_back(loop);
-    return WalkResult::skip();
+  // Lift the inner independent axis first. Its fragment becomes the suffix
+  // when an enclosing independent loop is subsequently widened.
+  kernel.walk<WalkOrder::PostOrder>([&](scf::ForOp loop) {
+    if (loop->hasAttr(independentIterationAttr))
+      loops.push_back(loop);
   });
   for (scf::ForOp loop : loops) {
+    auto step = loop.getStep().getDefiningOp<arith::ConstantIndexOp>();
+    llvm::DenseMap<Value, bool> varying;
+    if (loop.getNumResults() || !step || step.value() != 1 ||
+        !canVectorizeIterations(*loop.getBody(), loop, varying))
+      continue;
     uint32_t elementBitWidth = 0;
     loop.walk([&](StoreOp store) {
       Type type = store.getValue().getType();
+      if (auto fragment = dyn_cast<FragmentType>(type))
+        type = fragment.getElementType();
       elementBitWidth = std::max(
           elementBitWidth, type.isIndex() ? 64u : type.getIntOrFloatBitWidth());
     });

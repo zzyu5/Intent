@@ -141,8 +141,21 @@ bool canPredicateValueOperation(Operation *operation) {
   if (auto binary = dyn_cast<BinaryOp>(operation)) {
     auto kind = binary.getOperatorKind();
     if (kind == BinaryOperator::FloorDivide ||
-        kind == BinaryOperator::Remainder ||
-        kind == BinaryOperator::LeftShift ||
+        kind == BinaryOperator::Remainder) {
+      // Physical chunk counts divide by a positive compile-time width. Such
+      // scalar arithmetic remains defined in an inactive predicated branch.
+      APInt divisor;
+      bool positive = matchPattern(binary.getRhs(), m_ConstantInt(&divisor)) &&
+                      divisor.isStrictlyPositive();
+      if (auto parameter = binary.getRhs().getDefiningOp<ParameterOp>()) {
+        auto candidates = parameter.getParameter().getCandidates().asArrayRef();
+        positive = !candidates.empty() && llvm::all_of(
+            candidates, [](int64_t value) { return value > 0; });
+      }
+      if (!positive)
+        return false;
+    }
+    if (kind == BinaryOperator::LeftShift ||
         kind == BinaryOperator::RightShift)
       return false;
   }
@@ -171,21 +184,48 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
                                    IRMapping &mapping, Value predicate,
                                    FragmentType shape) {
   Location location = operation->getLoc();
-  auto resultType = [&](Type element) -> Type {
-    return shape ? FragmentType::get(shape.getContext(), element,
-                                     shape.getShape(), shape.getAxisMaps(),
-                                     shape.getValidity(), shape.getOwner())
-                 : element;
+  auto hasIterationAxes = [&](Type type) {
+    auto fragment = dyn_cast<FragmentType>(type);
+    return shape && fragment &&
+           llvm::all_of(shape.getAxisMaps(), [&](Attribute axis) {
+             auto source = cast<AxisMapAttr>(axis);
+             return llvm::any_of(fragment.getAxisMaps(), [&](Attribute candidate) {
+               auto target = cast<AxisMapAttr>(candidate);
+               return sourceAxisIdentity(source) == sourceAxisIdentity(target) &&
+                      source.getDimensionId() == target.getDimensionId();
+             });
+           });
   };
-  auto lift = [&](Value value) -> Value {
-    if (!shape)
-      return value;
-    auto fragment = dyn_cast<FragmentType>(value.getType());
-    Type target =
-        resultType(fragment ? fragment.getElementType() : value.getType());
+  auto resultType = [&](Type element) -> Type {
+    if (!shape || hasIterationAxes(element))
+      return element;
+    // Independent iterations form a new prefix; an existing column fragment
+    // keeps its own axes. BroadcastOp projects by these identities, so a row
+    // vector embeds as [R, 1] and a column vector as [1, C].
+    SmallVector<Attribute> extents(shape.getShape().begin(), shape.getShape().end());
+    SmallVector<Attribute> axes(shape.getAxisMaps().begin(),
+                               shape.getAxisMaps().end());
+    if (auto fragment = dyn_cast<FragmentType>(element)) {
+      element = fragment.getElementType();
+      llvm::append_range(extents, fragment.getShape());
+      for (Attribute attribute : fragment.getAxisMaps()) {
+        auto axis = cast<AxisMapAttr>(attribute);
+        axes.push_back(AxisMapAttr::get(
+            shape.getContext(), axis.getSourceId(), axis.getSourceAxis(),
+            axis.getDimensionId(), axes.size(), axis.getDerived()));
+      }
+    }
+    return FragmentType::get(
+        shape.getContext(), element, builder.getArrayAttr(extents),
+        builder.getArrayAttr(axes), shape.getValidity(), shape.getOwner());
+  };
+  auto project = [&](Value value, Type target) -> Value {
     return value.getType() == target
                ? value
                : Value(builder.create<BroadcastOp>(location, target, value));
+  };
+  auto lift = [&](Value value) -> Value {
+    return project(value, resultType(value.getType()));
   };
   auto mapped = [&](Value value) { return mapping.lookupOrDefault(value); };
   auto maskedValidity = [&](Value valid, Type dataType) -> Value {
@@ -194,17 +234,11 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
       maskType = FragmentType::get(
           fragment.getContext(), builder.getI1Type(), fragment.getShape(),
           fragment.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
-    auto project = [&](Value value) -> Value {
-      return value.getType() == maskType
-                 ? value
-                 : Value(builder.create<BroadcastOp>(
-                       location, cast<FragmentType>(maskType), value));
-    };
-    Value condition = project(predicate);
+    Value condition = project(predicate, maskType);
     if (!valid)
       return condition;
     return builder.create<BinaryOp>(
-        location, maskType, condition, project(mapped(valid)),
+        location, maskType, condition, project(mapped(valid), maskType),
         BinaryOperator::LogicalAnd);
   };
   auto coordinates = [&](ValueRange values) {
@@ -212,7 +246,7 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
   };
   auto fill = [&](Value value, Type type) -> Value {
     if (value)
-      return lift(mapped(value));
+      return project(mapped(value), resultType(type));
     auto fragment = dyn_cast<FragmentType>(type);
     Type element = fragment ? fragment.getElementType() : type;
     Value zero = builder.create<arith::ConstantOp>(
@@ -287,7 +321,7 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
   } else if (auto store = dyn_cast<StoreOp>(operation)) {
     clone = builder.create<StoreOp>(
         location, mapped(store.getResource()), coordinates(store.getCoordinates()),
-        lift(mapped(store.getValue())),
+        project(mapped(store.getValue()), resultType(store.getValue().getType())),
         maskedValidity(store.getValid(), store.getValue().getType()),
         store.getSourceAxes());
   } else if (auto gather = dyn_cast<GatherOp>(operation)) {
@@ -317,16 +351,31 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
           fill(load.getFill(), load.getType()), load.getSourceAxes());
   } else {
     bool vector = shape && llvm::any_of(operation->getOperands(), [&](Value value) {
-      return isa<FragmentType>(mapped(value).getType());
+      return hasIterationAxes(mapped(value).getType());
     });
-    clone = builder.clone(*operation, mapping);
-    if (vector) {
+    if (vector && isa<SplatOp, BroadcastOp>(operation)) {
+      clone = builder.create<BroadcastOp>(
+          location, resultType(operation->getResult(0).getType()),
+          mapped(operation->getOperand(0)));
+    } else {
+      clone = builder.clone(*operation, mapping);
+    }
+    if (vector &&
+        isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp>(operation)) {
       OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPoint(clone);
-      for (OpOperand &operand : clone->getOpOperands())
-        operand.set(lift(operand.get()));
       for (Value result : clone->getResults())
         result.setType(resultType(result.getType()));
+      auto schema = cast<FragmentType>(clone->getResult(0).getType());
+      for (OpOperand &operand : clone->getOpOperands()) {
+        Type element = operand.get().getType();
+        if (auto fragment = dyn_cast<FragmentType>(element))
+          element = fragment.getElementType();
+        auto target = FragmentType::get(
+            schema.getContext(), element, schema.getShape(), schema.getAxisMaps(),
+            schema.getValidity(), schema.getOwner());
+        operand.set(project(operand.get(), target));
+      }
     }
   }
   if (Attribute origin = operation->getAttr(originAttr))
