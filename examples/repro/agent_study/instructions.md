@@ -69,13 +69,17 @@ returns Out tensors; omit only Out arguments and preserve the order of all other
 runtime arguments. Constexpr arguments are bound at compilation and omitted here.
 All compile calls must execute during build, not inside the timed wrapper. Do not
 call intent.compile/generate or invoke a different compiler yourself. Choose the
-kernel algorithm, not hardware block sizes or provider-specific emission.
+algorithm's logical partitions; the compiler chooses hardware tiles and
+provider-specific emission.
 Each @intent.kernel produces one GPU launch. The compiler does not insert extra
 launches; algorithms with multiple kernel stages require your explicit kernels
 and host composition.
 You may choose logical group counts, source-domain boundaries and intermediate
 tensor shapes as part of the algorithm, including interfaces used only inside
 the host wrapper. They need not appear in TASK.md or the external signature.
+Fixed partition extents and constexpr domain boundaries are allowed source
+choices. A size that defines logical members or an intermediate tensor remains
+part of the algorithm even when another language calls that partition a block.
 These choices define logical values and dependencies; physical block sizes,
 layouts and provider configurations are chosen by the compiler for each kernel.
 I.parallel expresses unordered logical iterations, and source subregions express
