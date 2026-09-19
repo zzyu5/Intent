@@ -5927,12 +5927,16 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
     if (!hasFragmentSchema(contract))
       return contract.emitOpError(
           "shared contraction blocking requires fragment operands and result");
-    FailureOr<bool> fullResult =
-        realizeFullResultTraversal(contract, kernel, contracts);
-    if (failed(fullResult))
-      return failure();
-    if (*fullResult)
-      continue;
+    // A complete matrix-to-store path can tile the result and its epilogue
+    // together. Retaining the full result first would hide that ownership.
+    if (!requiresPhysicalRealization(contract) || !hasRangeContractForm(contract)) {
+      FailureOr<bool> fullResult =
+          realizeFullResultTraversal(contract, kernel, contracts);
+      if (failed(fullResult))
+        return failure();
+      if (*fullResult)
+        continue;
+    }
     bool realizeOutput = outputCoordinatesNeedRealization(contract);
     if (realizeOutput) {
       if (failed(realizeContract(contract, kernel)))
