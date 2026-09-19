@@ -13,6 +13,13 @@ def IntentTriton_CtaBarrierOp : IntentTriton_Op<"cta_barrier", [
     MemoryEffects<[MemRead, MemWrite]>
   ]>;
 
+def IntentTriton_ViewOverlapOp : IntentTriton_Op<"view_overlap", [Pure]> {
+  let summary = "Launch-time overlap of external view byte-span bounds";
+  let arguments = (ins IntentGPU_ViewValue:$lhs, IntentGPU_ViewValue:$rhs);
+  let results = (outs I1:$result);
+  let hasVerifier = 1;
+}
+
 def IntentTriton_TensorDescriptorChoiceOp :
     IntentTriton_Op<"tensor_descriptor_choice", [Pure]> {
   let arguments = (ins Variadic<IntentGPU_ViewValue>:$descriptors,

@@ -3,6 +3,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+def view_byte_span(view) -> tuple[int, int]:
+    pointer = view.data_ptr()
+    if view.numel() == 0:
+        return pointer, pointer
+    low = high = 0
+    for extent, stride in zip(view.shape, view.stride()):
+        displacement = (extent - 1) * stride
+        low += min(0, displacement)
+        high += max(0, displacement)
+    size = view.element_size()
+    return pointer + low * size, pointer + (high + 1) * size
+
+
+def views_overlap(lhs, rhs) -> bool:
+    left_start, left_end = view_byte_span(lhs)
+    right_start, right_end = view_byte_span(rhs)
+    return (left_start < left_end and right_start < right_end and
+            left_start < right_end and right_start < left_end)
+
+
 @dataclass
 class _StorageSpan:
     start: int
@@ -18,15 +38,9 @@ class TuningState:
 
         spans = []
         for index, view in enumerate(views):
-            if view.numel() == 0:
+            start, end = view_byte_span(view)
+            if start == end:
                 continue
-            low = high = 0
-            for extent, stride in zip(view.shape, view.stride()):
-                displacement = (extent - 1) * stride
-                low += min(0, displacement)
-                high += max(0, displacement)
-            start = view.data_ptr() + low * view.element_size()
-            end = view.data_ptr() + (high + 1) * view.element_size()
             spans.append(_StorageSpan(start, end, [(index, view, start, end)]))
         spans.sort(key=lambda span: span.start)
         groups: list[_StorageSpan] = []

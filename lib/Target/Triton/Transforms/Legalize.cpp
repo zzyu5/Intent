@@ -3476,7 +3476,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
       }
     }
 
-    if (isa<CtaBarrierOp, TensorDescriptorChoiceOp, TensorDescriptorAllocatorOp,
+    if (isa<CtaBarrierOp, ViewOverlapOp, TensorDescriptorChoiceOp, TensorDescriptorAllocatorOp,
             TensorDescriptorOp, BlockLoadOp, BlockStoreOp, DescriptorLoadOp,
             DescriptorStoreOp, SplitOp, ReduceOp, ScanOp, gpu::ParameterOp,
             gpu::PhysicalExprOp,
@@ -3547,6 +3547,55 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
           return true;
     return false;
   };
+  std::map<std::pair<unsigned, unsigned>, Value> overlapFacts;
+  auto insertBarrier = [&](OpBuilder &builder, Location location,
+                           Accesses &pending, const Accesses &current) {
+    SmallVector<std::pair<unsigned, unsigned>> pairs;
+    auto externalArgument = [&](Value value) -> BlockArgument {
+      auto argument = dyn_cast<BlockArgument>(value);
+      if (!argument || argument.getOwner() != &kernel.front())
+        return {};
+      auto kind = kernel.getArgAttrOfType<StringAttr>(argument.getArgNumber(),
+                                                    gpu::abiKindAttr);
+      return kind && kind.getValue() == "view" ? argument : BlockArgument();
+    };
+    for (auto [resource, mode] : pending)
+      for (auto [other, otherMode] : current) {
+        if (!((mode | otherMode) & 2) || !viewsMayAlias(resource, other))
+          continue;
+        auto left = externalArgument(resource);
+        auto right = externalArgument(other);
+        if (resource == other || !left || !right) {
+          builder.create<CtaBarrierOp>(location);
+          pending.clear();
+          return;
+        }
+        unsigned lhs = left.getArgNumber(), rhs = right.getArgNumber();
+        pairs.emplace_back(std::min(lhs, rhs), std::max(lhs, rhs));
+      }
+    llvm::sort(pairs);
+    pairs.erase(std::unique(pairs.begin(), pairs.end()), pairs.end());
+    Value condition;
+    for (auto pair : pairs) {
+      Value &overlap = overlapFacts[pair];
+      if (!overlap) {
+        OpBuilder entry(&kernel.front(), kernel.front().begin());
+        overlap = entry.create<ViewOverlapOp>(
+            location, entry.getI1Type(), kernel.getArgument(pair.first),
+            kernel.getArgument(pair.second));
+      }
+      condition = condition
+                      ? Value(builder.create<gpu::BinaryOp>(
+                            location, builder.getI1Type(), condition, overlap,
+                            BinaryOperator::LogicalOr))
+                      : overlap;
+    }
+    auto guard = builder.create<scf::IfOp>(location, condition, false);
+    OpBuilder nested = guard.getThenBodyBuilder();
+    nested.create<CtaBarrierOp>(location);
+    // A false guard performs no synchronization: keep all outstanding accesses
+    // so a later operation cannot lose an unrelated dependency.
+  };
   llvm::DenseSet<Value> visiting;
   std::function<bool(Value)> uniform = [&](Value value) {
     if (isa<gpu::FragmentType, gpu::RecordType>(value.getType()))
@@ -3589,7 +3638,8 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
                  uniform(branch.thenBlock()->getTerminator()->getOperand(index)) &&
                  uniform(branch.elseBlock()->getTerminator()->getOperand(index));
       } else if (isa<gpu::ReduceOp, gpu::GatherOp, gpu::DimOp, gpu::ParameterOp,
-              gpu::PhysicalExprOp, gpu::ProgramIdOp, arith::ConstantOp>(producer)) {
+              gpu::PhysicalExprOp, gpu::ProgramIdOp, ViewOverlapOp,
+              arith::ConstantOp>(producer)) {
         result = true;
       } else if (isa<gpu::LoadOp, gpu::UnaryOp, gpu::BinaryOp, gpu::CompareOp,
                      gpu::SelectOp, gpu::CastOp, gpu::BitcastOp,
@@ -3617,8 +3667,7 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
         if (!uniformControl)
           return operation.emitOpError("ordered view dependency requires uniform CTA control before synchronization");
         OpBuilder builder(&operation);
-        builder.create<CtaBarrierOp>(operation.getLoc());
-        pending.clear();
+        insertBarrier(builder, operation.getLoc(), pending, current);
       }
       if (operation.getNumRegions()) {
         bool nestedUniform = uniformControl;
@@ -3647,8 +3696,8 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
       if (!uniformControl)
         return block.getTerminator()->emitOpError("loop-carried view dependency requires uniform CTA control before synchronization");
       OpBuilder builder(block.getTerminator());
-      builder.create<CtaBarrierOp>(block.getTerminator()->getLoc());
-      pending.clear();
+      insertBarrier(builder, block.getTerminator()->getLoc(), pending,
+                    bodyAccesses);
     }
     return success();
   };
