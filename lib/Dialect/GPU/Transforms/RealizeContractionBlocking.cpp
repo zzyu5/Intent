@@ -4094,6 +4094,10 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
             PhysicalProgramAnalysis(kernel).isTailPredicate(originalValidity, storeTailRanges))
           originalValidity = Value();
         if (originalValidity) {
+          if (isa<FragmentType>(originalValidity.getType()) &&
+              sourceAxisIdentity(*rowMap) == sourceAxisIdentity(*columnMap))
+            return path.store.emitOpError(
+                "contraction output mask needs distinct Cartesian occurrence authority");
           IRMapping replay;
           replay.map(rowRange.getResult(), rows);
           FailureOr<Value> replayed = replaySourceValue(
@@ -4105,14 +4109,21 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
                 "blocked contraction could not relocate output validity");
           originalValidity = *replayed;
         }
-        if (runtimeRowTraversal && originalValidity)
-          valid = materializeValidityConjunction(
-              rowBuilder, location, outputValid, originalValidity,
-              outputPredicateType);
-        else
-          valid = materializeRetargetedValidity(
-              rowBuilder, location, originalValidity, outputTailRanges,
-              outputValid, outputPredicateType);
+        if (originalValidity) {
+          IRMapping replay;
+          replay.map(columnRange.getResult(), columns);
+          FailureOr<Value> replayed = replaySourceValue(
+              rowBuilder, location, kernel, originalValidity,
+              sourceAxisIdentity(*columnMap), unitN, columnRange, columns,
+              replay, contract.getOperation());
+          if (failed(replayed))
+            return path.store.emitOpError(
+                "blocked contraction could not relocate output column validity");
+          originalValidity = *replayed;
+        }
+        valid = materializeValidityConjunction(
+            rowBuilder, location, outputValid, originalValidity,
+            outputPredicateType);
       }
       if (failed(valid))
         return path.store.emitOpError(

@@ -100,6 +100,10 @@ PhysicalExprAttr queryLaunchExpression(mlir::Value value);
 /// index, derived from current mapping, dimensions and clamps. Null means unknown.
 PhysicalExprAttr queryNonNegativeIndexUpperBound(mlir::Value value);
 
+/// Launch-visible capacity for a unit-step logical range. Logical bounds and
+/// validity remain unchanged; the host evaluates this bound before allocation.
+PhysicalExprAttr queryLogicalRangeCapacity(MakeRangeOp range);
+
 /// Returns the single typed binary operation implemented by a two-argument
 /// combine region. Physical broadcast projections inserted while aligning
 /// helper arguments do not change that semantic operation and are ignored.
