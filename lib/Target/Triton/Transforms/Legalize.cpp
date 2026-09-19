@@ -2259,9 +2259,16 @@ void canonicalizeBroadcastProjections(func::FuncOp kernel) {
   // A load's address and predicate producers are outside this additional scope.
   kernel.walk([&](gpu::ReshapeOp reshape) {
     auto source = cast<gpu::FragmentType>(reshape.getValue().getType());
-    if (source.getShape().size() == 1 &&
-        isa_and_nonnull<gpu::LoadOp, BlockLoadOp>(
-            reshape.getValue().getDefiningOp()) &&
+    Value resource;
+    if (auto load = reshape.getValue().getDefiningOp<gpu::LoadOp>())
+      resource = load.getResource();
+    else if (auto load = reshape.getValue().getDefiningOp<BlockLoadOp>())
+      resource = load.getView();
+    else
+      return;
+    // A vector resource may be loaded across several execution axes.
+    auto view = dyn_cast<gpu::ViewType>(resource.getType());
+    if ((source.getShape().size() == 1 || (view && view.getRank() == 1)) &&
         visited.insert(reshape).second)
       candidates.push_back(reshape);
   });
