@@ -3578,7 +3578,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       kernel, "BLOCK_N" + suffix, ParameterRole::OwnershipN,
       contractionCategory,
       rhsType.getElementType().getIntOrFloatBitWidth(),
-      {32, 64, 128, 256});
+      {16, 32, 64, 128, 256});
   ParameterOp blockK = getOrCreatePhysicalParameter(
       kernel, "BLOCK_K" + suffix, ParameterRole::Reduction,
       contractionCategory,
