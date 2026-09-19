@@ -4574,6 +4574,34 @@ private:
               "gather resource-bounds validity has no typed fill");
         fill = *zero;
       }
+      if (coordinates->empty() && axes->empty() && source->getType() == *result) {
+        Value target = *source;
+        if (valid) {
+          target = builder.create<gpu::SelectOp>(location, *result, valid,
+                                                  target, fill);
+          attachOrigin(operation, target.getDefiningOp());
+        }
+        values[gather.getResult()] = target;
+        return success();
+      }
+      if (auto scalarTensor = dyn_cast<gpu::FragmentType>(source->getType());
+          scalarTensor && scalarTensor.getShape().empty() &&
+          coordinates->empty() && axes->empty()) {
+        FailureOr<PhysicalAxisIdentity> identity = resultAxisIdentity(operation, 0, 0);
+        if (failed(identity))
+          return gather.emitOpError("scalar extraction has no physical value identity");
+        auto singleton = fragmentType(
+            operation->getContext(), scalarTensor.getElementType(),
+            {expression(operation->getContext(), PhysicalExprKind::Constant, 1)},
+            {*identity}, scalarTensor.getOwner());
+        auto reassociation = builder.getArrayAttr({gpu::ReshapeGroupAttr::get(
+            operation->getContext(), builder.getDenseI64ArrayAttr({}),
+            builder.getDenseI64ArrayAttr({0}))});
+        source = Value(builder.create<gpu::ReshapeOp>(
+            location, singleton, *source, reassociation));
+        coordinates->push_back(builder.create<arith::ConstantIndexOp>(location, 0));
+        axes->push_back(0);
+      }
       auto target = builder.create<gpu::GatherOp>(
           location, *result, *source, *coordinates, valid, fill, *axes);
       mapResults(operation, target);
