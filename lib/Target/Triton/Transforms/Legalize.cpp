@@ -2328,6 +2328,31 @@ LogicalResult legalizeContractShapes(func::FuncOp kernel) {
 void foldExactConstantDivisions(func::FuncOp kernel) {
   kernel.walk([&](gpu::BinaryOp binary) {
     Type element = gpu::uniformElementType(binary.getResult().getType());
+    if ((binary.getOperatorKind() == BinaryOperator::FloorDivide ||
+         binary.getOperatorKind() == BinaryOperator::Remainder) &&
+        isa<IndexType, IntegerType>(element)) {
+      auto constant = dyn_cast_or_null<IntegerAttr>(
+          UniformValueAnalysis(gpu::describeUniformValue).evaluate(binary.getRhs()));
+      if (!constant || !constant.getValue().isStrictlyPositive() ||
+          !constant.getValue().isPowerOf2())
+        return;
+      bool remainder = binary.getOperatorKind() == BinaryOperator::Remainder;
+      int64_t value = remainder ? constant.getInt() - 1
+                                : constant.getValue().logBase2();
+      OpBuilder builder(binary);
+      Value operand = builder.create<arith::ConstantOp>(
+          binary.getLoc(), IntegerAttr::get(element, value));
+      if (auto fragment = dyn_cast<gpu::FragmentType>(binary.getRhs().getType()))
+        operand = builder.create<gpu::SplatOp>(binary.getLoc(), fragment, operand);
+      // Arithmetic right shift and a low-bit mask implement floor division
+      // and remainder by positive powers of two, including negative inputs.
+      // Expose these before native layout analysis; a truncation correction
+      // otherwise obscures the contiguous groups in reshaped addresses.
+      binary->setOperand(1, operand);
+      binary.setOperatorKind(remainder ? BinaryOperator::BitwiseAnd
+                                       : BinaryOperator::RightShift);
+      return;
+    }
     if (binary.getOperatorKind() != BinaryOperator::TrueDivide ||
         binary.getApproximate() || binary.getFlushToZero() ||
         (!element.isF32() && !element.isF64()))
