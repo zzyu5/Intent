@@ -253,6 +253,25 @@ bool hasFlattenableDescriptorLayout(func::FuncOp kernel, gpu::ViewType view) {
 
 } // namespace
 
+LogicalResult ViewOverlapOp::verify() {
+  auto kernel = (*this)->getParentOfType<func::FuncOp>();
+  if (!kernel || !kernel->hasAttr(gpu::kernelAttr) ||
+      (*this)->getBlock() != &kernel.front())
+    return emitOpError("must be declared in a physical GPU kernel entry block");
+  if (getLhs() == getRhs())
+    return emitOpError("requires two distinct external view arguments");
+  for (Value value : getOperands()) {
+    auto argument = dyn_cast<BlockArgument>(value);
+    if (!argument || argument.getOwner() != &kernel.front())
+      return emitOpError("requires external view ABI arguments");
+    auto kind = kernel.getArgAttrOfType<StringAttr>(argument.getArgNumber(),
+                                                  gpu::abiKindAttr);
+    if (!kind || kind.getValue() != "view")
+      return emitOpError("requires external view ABI arguments");
+  }
+  return success();
+}
+
 LogicalResult ReduceOp::verify() {
   if (getReverse())
     return emitOpError("native reduction does not reverse logical order");

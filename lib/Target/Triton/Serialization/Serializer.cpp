@@ -274,6 +274,7 @@ private:
     kernel.walk([&](gpu::ParameterOp parameter) {
       auto schema = parameter.getParameter();
       std::string name = schema.getName().getValue().str();
+      argumentNames.insert(name);
       auto dimension =
           parameter->getAttrOfType<IntegerAttr>(gpu::coverageDimensionAttr);
       if (!dimension)
@@ -293,6 +294,8 @@ private:
     kernel.walk([&](TensorDescriptorChoiceOp choice) {
       descriptorChoice = choice;
       values[choice.getResult()] = choice.getConfigParameter().str();
+      argumentNames.insert(choice.getConfigParameter());
+      argumentNames.insert(choice.getEligibilityArgument());
     });
     kernel.walk([&](TensorDescriptorAllocatorOp allocator) {
       descriptorAllocator = allocator;
@@ -302,6 +305,17 @@ private:
           "_intent_descriptor_" + std::to_string(descriptors.size());
       descriptors.push_back({descriptor, name});
       values[descriptor.getResult()] = name;
+      argumentNames.insert(name);
+    });
+    while (!argumentNames.insert(overlapFunction).second)
+      overlapFunction += "_";
+    kernel.walk([&](ViewOverlapOp overlap) {
+      std::string name = "_intent_overlap_" + std::to_string(overlapFacts.size());
+      while (!argumentNames.insert(name).second)
+        name += "_";
+      overlapFacts.push_back(overlap);
+      values[overlap.getResult()] = name;
+      constexprValues.insert(overlap.getResult());
     });
     if (descriptorChoice && !descriptorAllocator) {
       kernel.emitError(
@@ -316,6 +330,9 @@ private:
               "from triton.tools.tensor_descriptor import TensorDescriptor\n"
               "from intent.runtime.triton import TuningHooks\n"
               "from intent.runtime.triton_math import contract_fma\n\n";
+    if (!overlapFacts.empty())
+      output << "from intent.runtime.tuning import views_overlap as "
+             << overlapFunction << "\n\n";
   }
 
   void emitDescriptorPruner() {
@@ -523,6 +540,12 @@ private:
       firstKey = false;
       output << "\"" << metadata.name << "\"";
     }
+    for (ViewOverlapOp overlap : overlapFacts) {
+      if (!firstKey)
+        output << ", ";
+      firstKey = false;
+      output << "\"" << valueString(overlap.getResult()) << "\"";
+    }
     if (descriptorChoice) {
       if (!firstKey)
         output << ", ";
@@ -571,6 +594,12 @@ private:
         output << ", ";
       first = false;
       output << metadata.name << ": tl.constexpr";
+    }
+    for (ViewOverlapOp overlap : overlapFacts) {
+      if (!first)
+        output << ", ";
+      first = false;
+      output << valueString(overlap.getResult()) << ": tl.constexpr";
     }
     if (descriptorChoice) {
       if (!first)
@@ -694,6 +723,10 @@ private:
         line(metadata.name + " = " + source.name + ".stride(" +
                  std::to_string(metadata.sourceAxis) + ")", 1);
     }
+    for (ViewOverlapOp overlap : overlapFacts)
+      line(valueString(overlap.getResult()) + " = " + overlapFunction + "(" +
+               valueString(overlap.getLhs()) + ", " +
+               valueString(overlap.getRhs()) + ")", 1);
     if (descriptorChoice) {
       std::string eligibility;
       for (const DescriptorABI &descriptor : descriptors) {
@@ -761,6 +794,8 @@ private:
     for (const MetadataABI &metadata : metadataArguments) {
       call += ", " + metadata.name;
     }
+    for (ViewOverlapOp overlap : overlapFacts)
+      call += ", " + valueString(overlap.getResult());
     if (descriptorChoice)
       call += ", " + descriptorChoice.getEligibilityArgument().str();
     // Ordinary arithmetic preserves rounding and subnormals; dot is explicit.
@@ -861,7 +896,7 @@ private:
       line("tl.debug_barrier()");
       return;
     }
-    if (isa<TensorDescriptorChoiceOp, TensorDescriptorAllocatorOp,
+    if (isa<ViewOverlapOp, TensorDescriptorChoiceOp, TensorDescriptorAllocatorOp,
             TensorDescriptorOp>(operation))
       return;
     if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
@@ -1941,6 +1976,8 @@ private:
   SmallVector<ViewABI> views;
   SmallVector<ScalarABI> scalars;
   SmallVector<MetadataABI> metadataArguments;
+  SmallVector<ViewOverlapOp> overlapFacts;
+  std::string overlapFunction = "_intent_views_overlap";
   llvm::StringMap<MetadataABI> metadataByName;
   llvm::DenseMap<int64_t, MetadataABI> dimensionBindings;
   std::map<std::string, CoverageParameter> fullCoverageParameters;
