@@ -59,6 +59,7 @@ class CompiledArtifact:
     _namespace: dict[str, object] = field(repr=False)
     device_type: str = field(default="cuda", kw_only=True)
     backend_ir: dict[str, str] = field(default_factory=dict, init=False)
+    _backend_ir_kernel: object = field(default_factory=object, init=False, repr=False)
 
     @property
     def entry(self) -> Callable[..., None]:
@@ -83,8 +84,11 @@ class CompiledArtifact:
 
     def __call__(self, *arguments: Any) -> None:
         compiled_kernel = self._invoke(self._launcher, arguments)
-        if self._backend_ir_collector is not None:
+        if self._backend_ir_collector is not None and (
+            compiled_kernel is not self._backend_ir_kernel or not self.backend_ir
+        ):
             self.backend_ir = self._backend_ir_collector(compiled_kernel)
+            self._backend_ir_kernel = compiled_kernel
 
     def _invoke(
         self,
