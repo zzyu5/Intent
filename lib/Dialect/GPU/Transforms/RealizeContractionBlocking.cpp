@@ -5455,6 +5455,142 @@ static ReshapeOp exposeTransposedContractSplit(ContractOp contract) {
   return split;
 }
 
+static void orientContractionOutputs(func::FuncOp kernel) {
+  SmallVector<ContractOp> contracts;
+  kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
+  for (ContractOp contract : contracts) {
+    auto result = contract.getResult().getType();
+    auto lhs = contract.getLhs().getType();
+    auto rhs = contract.getRhs().getType();
+    if (!lhs.getElementType().isF32() || !rhs.getElementType().isF32() ||
+        !result.getElementType().isF32() ||
+        !contract.getLhsBatchAxes().empty() ||
+        !contract.getRhsBatchAxes().empty())
+      continue;
+    unsigned lhsFree =
+        lhs.getShape().size() - contract.getLhsReductionAxes().size();
+    unsigned rhsFree =
+        rhs.getShape().size() - contract.getRhsReductionAxes().size();
+    if (!lhsFree || !rhsFree)
+      continue;
+    PhysicalProgramAnalysis analysis(kernel);
+
+    SmallVector<Value> pending{contract.getResult()};
+    llvm::DenseSet<Value> visited;
+    bool compatible = true;
+    bool sawStore = false;
+    while (compatible && !pending.empty()) {
+      Value value = pending.pop_back_val();
+      if (!visited.insert(value).second)
+        continue;
+      for (OpOperand &use : value.getUses()) {
+        Operation *user = use.getOwner();
+        if (auto store = dyn_cast<StoreOp>(user)) {
+          auto axes = store.getSourceAxes();
+          if (store.getValue() != value || axes.empty()) {
+            compatible = false;
+            break;
+          }
+          auto position = llvm::find(axes, static_cast<int64_t>(axes.size() - 1));
+          if (position == axes.end()) {
+            compatible = false;
+            break;
+          }
+          Value coordinate = store.getCoordinates()[position - axes.begin()];
+          while (auto projection = coordinate.getDefiningOp()) {
+            if (!isa<BroadcastOp, ReshapeOp>(projection))
+              break;
+            coordinate = projection->getOperand(0);
+          }
+          auto type = dyn_cast<FragmentType>(coordinate.getType());
+          if (!type || type.getShape().size() != 1) {
+            compatible = false;
+            break;
+          }
+          auto destination =
+              queryExactLogicalRange(analysis.sourceRanges(coordinate));
+          if (failed(destination)) {
+            compatible = false;
+            break;
+          }
+          auto matchesFreeAxis = [&](Value operand, ArrayRef<int64_t> reduction) {
+            auto fragment = cast<FragmentType>(operand.getType());
+            for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
+              if (llvm::is_contained(reduction, static_cast<int64_t>(axis)))
+                continue;
+              auto ranges = analysis.axisRanges(operand, axis);
+              if (ranges.isExact() && !ranges.roots.empty() &&
+                  ranges.blockers.empty() &&
+                  llvm::all_of(ranges.roots, [&](MakeRangeOp range) {
+                    return sameLogicalRange(range, *destination);
+                  }))
+                return true;
+            }
+            return false;
+          };
+          if (!matchesFreeAxis(contract.getLhs(),
+                               contract.getLhsReductionAxes()) ||
+              matchesFreeAxis(contract.getRhs(), contract.getRhsReductionAxes())) {
+            compatible = false;
+            break;
+          }
+          sawStore = true;
+          continue;
+        }
+        if (isa<scf::YieldOp>(user) &&
+            isa<scf::ForOp, scf::IfOp>(user->getParentOp())) {
+          pending.push_back(
+              user->getParentOp()->getResult(use.getOperandNumber()));
+          continue;
+        }
+        if (!isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp,
+                 SplatOp, BroadcastOp, ReshapeOp, TransposeOp>(user)) {
+          compatible = false;
+          break;
+        }
+        llvm::append_range(pending, user->getResults());
+      }
+    }
+    if (!compatible || !sawStore)
+      continue;
+
+    // Matrix columns follow the innermost output coordinate. Swap the free-axis
+    // groups and restore the original result schema for all existing users.
+    SmallVector<int64_t> permutation;
+    for (unsigned axis = lhsFree; axis < lhsFree + rhsFree; ++axis)
+      permutation.push_back(axis);
+    for (unsigned axis = 0; axis < lhsFree; ++axis)
+      permutation.push_back(axis);
+    SmallVector<Attribute> shape, mappings;
+    SmallVector<int64_t> inverse(permutation.size());
+    for (auto [position, axis] : llvm::enumerate(permutation)) {
+      shape.push_back(result.getShape()[axis]);
+      auto mapping = cast<AxisMapAttr>(result.getAxisMaps()[axis]);
+      mappings.push_back(AxisMapAttr::get(
+          kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+          mapping.getDimensionId(), position, mapping.getDerived()));
+      inverse[axis] = position;
+    }
+    OpBuilder builder(contract);
+    auto transposed = FragmentType::get(
+        kernel.getContext(), result.getElementType(), builder.getArrayAttr(shape),
+        builder.getArrayAttr(mappings), result.getValidity(), result.getOwner());
+    Value accumulator = builder.create<TransposeOp>(
+        contract.getLoc(), transposed, contract.getAccumulator(), permutation);
+    auto replacement = cast<ContractOp>(builder.clone(*contract));
+    replacement->setOperand(0, contract.getRhs());
+    replacement->setOperand(1, contract.getLhs());
+    replacement.getAccumulatorMutable().assign(accumulator);
+    replacement.setLhsReductionAxesAttr(contract.getRhsReductionAxesAttr());
+    replacement.setRhsReductionAxesAttr(contract.getLhsReductionAxesAttr());
+    replacement.getResult().setType(transposed);
+    Value restored = builder.create<TransposeOp>(
+        contract.getLoc(), result, replacement.getResult(), inverse);
+    contract.getResult().replaceAllUsesWith(restored);
+    contract.erase();
+  }
+}
+
 static LogicalResult fuseMultiplyReductions(ModuleOp module) {
   auto kernel = getPhysicalKernel(module);
   if (failed(kernel))
@@ -5717,6 +5853,7 @@ LogicalResult normalizeContractionSources(ModuleOp module) {
   if (failed(fuseMultiplyReductions(module)) ||
       failed(realizeAccessComposition(module)))
     return failure();
+  orientContractionOutputs(*kernel);
   SmallVector<ContractOp> contracts;
   kernel->walk([&](ContractOp contract) { contracts.push_back(contract); });
   // Collapse complete logical reduction ranges before ownership introduces
