@@ -14,6 +14,8 @@ Rank-0 view 使用空索引 tuple：`value = view[()]` 读取 scalar，`view[()]
 
 Literal 首次形成 runtime value 时若没有 expected dtype，Python `bool/int/float` 分别采用 `bool/i64/f64`。需要 f32 的循环状态可用 `I.cast(1.0, I.f32)` 初始化；后续使用不会反向改变它的 dtype。正/负无穷常量使用 `I.inf` / `-I.inf`，可写 `I.cast(I.inf, I.f32)` 指定 dtype。
 
+`I.exp2(x, approximate=True)`、`I.tanh(x, approximate=True)` 和 `I.fdiv(x, y, approximate=True)` 是已有的显式近似浮点接口；省略 `approximate` 时保持普通运算。非默认模式要求 operands/result 为 `I.f32`，`approximate` 必须是 constexpr bool。`exp2/fdiv` 还接受独立的 `flush_to_zero`，默认 `False`，仅在近似模式下可启用。各接口的误差界限、特殊值和 subnormal 规则见[显式近似数学](types-numerics-and-effects.md#51-显式近似数学)；这是逐操作数值合同，不改变相邻运算、归约精度或求值顺序。
+
 `I.select` 的 bool 条件不提供数值分支的 expected dtype。两个分支都写成 literal 时，不要从生成条件的 tensor 推断结果 dtype；例如需要 f32 符号值时写 `I.cast(I.select(mask, -1.0, 1.0), I.f32)`。已经产生的 runtime value 不会因后续与 f32 相乘而重新实例化。
 
 Tensor 和 view 有 `.shape`；scalar、tuple、record、domain 没有统一 `.shape`。`I.full(shape, fill, dtype)` 产生 tensor value，不分配跨 kernel workspace。`I.dot(lhs, rhs, acc_dtype=...)` 必须显式指定累加 dtype，只接受两个 rank-1 tensor，返回 rank-0 tensor `[]`，不是 rank-1 `[1]` 或一个 Python number。Scalar 和 rank-0 tensor 是不同类型；需要将 scalar 放入 rank-0 tensor 的分支或 carry schema 时，可用 `I.full((), value, dtype=...)` 显式构造。Pointwise scalar broadcast 由 frontend 显式表达。
