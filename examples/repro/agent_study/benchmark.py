@@ -156,14 +156,16 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
             status = "benchmark_environment_failure"
         elif isinstance(error, NumericalComparisonError):
             status = "numerical_failure"
+        elif isinstance(error, PipelineStageError) and error.stage.startswith("source_"):
+            status, stage = "reference_failure", error.stage
+        elif arguments.language == "intent" and any(isinstance(cause, (CompilationError, CompileTimeAssertionFailure, OutOfResources, PTXASError)) for cause in causes):
+            status, stage = "compilation_failure", "provider_compilation"
         elif isinstance(error, PipelineStageError):
             stage = error.stage
-            status = "reference_failure" if stage.startswith("source_") else "execution_failure"
+            status = "execution_failure"
         elif hasattr(error, "stage"):
             status = "compilation_failure"
             stage = error.stage
-        elif arguments.language == "intent" and any(isinstance(cause, (CompilationError, CompileTimeAssertionFailure, OutOfResources, PTXASError)) for cause in causes):
-            status, stage = "compilation_failure", "provider_compilation"
         else:
             status = "reference_failure" if stage == "reference_preparation" else "agent_program_error"
         result.update(status=status, failure_stage=stage, error=str(error), traceback=traceback.format_exc())

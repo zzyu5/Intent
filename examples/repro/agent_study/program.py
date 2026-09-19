@@ -99,22 +99,18 @@ class TuningBudget:
                         return function(*args, **kwargs)
                 return super().submit(compile_with_policy)
 
-        def prepare_kernel(compiled):
-            # Run Triton's resource checks in the caller's CUDA device context.
-            # Loading the compiled module does not execute the kernel.
-            compiled._init_handles()
-            return compiled
-
         def compile_kernel(kernel, *args, **kwargs):
             kwargs["warmup"] = True
             try:
                 compiled = original_jit(kernel, *args, **kwargs)
                 if isinstance(compiled, triton.FutureKernel):
                     if not autotuning:
-                        return prepare_kernel(compiled.result())
+                        return compiled.result()
                     future_names[compiled] = kernel.__name__
                     return compiled
-                return prepare_kernel(compiled)
+                # Triton initializes device handles on the first real launch,
+                # inside the evaluator's GPU lock.
+                return compiled
             except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as error:
                 if not autotuning:
                     raise
@@ -143,7 +139,7 @@ class TuningBudget:
                 for kernel in compiled:
                     if isinstance(kernel, triton.FutureKernel):
                         try:
-                            resolved.append(prepare_kernel(kernel.result()))
+                            resolved.append(kernel.result())
                         except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as error:
                             self.precompile_failures.append({"kernel": future_names[kernel], "error": str(error)})
                             compilation_errors.append(error)
