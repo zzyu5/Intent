@@ -25,14 +25,16 @@ from .tasks import SUITE_PATH, catalog, invocation, read_suite, reference, toler
 
 class CandidateTorchPolicy(TorchDispatchMode):
     def __torch_dispatch__(self, function, types, args=(), kwargs=None):
-        tensors = [value for value in tree_flatten((args, kwargs))[0] if isinstance(value, torch.Tensor)]
         allowed = {"aten.empty", "aten.empty_strided", "aten.empty_like", "aten.new_empty", "aten.view", "aten._unsafe_view",
                    "aten.as_strided", "aten.detach", "aten.alias", "aten.permute", "aten.transpose",
                    "aten.squeeze", "aten.unsqueeze", "aten.slice", "aten.select", "aten.expand"}
         name = str(function).rsplit(".", 1)[0]
+        if name in allowed:
+            return function(*args, **(kwargs or {}))
+        tensors = [value for value in tree_flatten((args, kwargs))[0] if isinstance(value, torch.Tensor)]
         device = (kwargs or {}).get("device")
         uses_cuda = any(value.is_cuda for value in tensors) or device is not None and torch.device(device).type == "cuda"
-        if uses_cuda and name not in allowed:
+        if uses_cuda:
             raise ValueError(f"GPU computation must use the submitted language, not PyTorch {function}")
         return function(*args, **(kwargs or {}))
 
