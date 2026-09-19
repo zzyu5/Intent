@@ -75,10 +75,9 @@ class ProgramContext:
 
 
 class TuningBudget:
-    """Apply the same finite search policy at Triton's public autotune boundary."""
+    """Apply the shared measurement and preparation policy to native autotuning."""
 
-    def __init__(self, limit: int, policy):
-        self.limit = limit
+    def __init__(self, policy):
         self.policy = policy
         self.tuners = []
         self.executed = {}
@@ -120,7 +119,7 @@ class TuningBudget:
                 if not autotuning:
                     raise
                 # Match Triton's candidate-failure policy. Normal autotuning
-                # still evaluates the same bounded set and rejects these forms.
+                # still evaluates the same legal configurations and rejects these forms.
                 self.precompile_failures.append({"kernel": kernel.__name__, "error": str(error)})
                 compilation_errors.append(error)
                 return None
@@ -155,7 +154,7 @@ class TuningBudget:
                 if resolved:
                     return resolved[0]
                 cause = compilation_errors[-1] if len(compilation_errors) > error_count else None
-                raise RuntimeError("no bounded autotune configuration is executable on the current device") from cause
+                raise RuntimeError("no legal autotune configuration is executable on the current device") from cause
             finally:
                 autotuning -= 1
 
@@ -178,7 +177,6 @@ class TuningBudget:
 
         def register(function):
             tuner = decorate(function)
-            original_prune = tuner.prune_configs
 
             for name in ("pre_hook", "post_hook"):
                 hook = getattr(tuner, name)
@@ -190,14 +188,6 @@ class TuningBudget:
                             return _hook(*arguments, **keywords)
                     setattr(tuner, name, runtime_hook)
 
-            def prune(arguments):
-                legal = original_prune(arguments)
-                if len(legal) <= self.limit:
-                    return legal
-                return [legal[index * (len(legal) - 1) // (self.limit - 1)]
-                        for index in range(self.limit)]
-
-            tuner.prune_configs = prune
             self.tuners.append(tuner)
             return tuner
         return register
