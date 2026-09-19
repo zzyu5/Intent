@@ -449,6 +449,26 @@ LogicalResult materializeBlockPointerForms(func::FuncOp kernel) {
 }
 
 void orientPointerLoads(func::FuncOp kernel) {
+  llvm::DenseMap<Operation *, SmallVector<gpu::ContractOp>> simtRhsConsumers;
+  kernel.walk([&](gpu::ContractOp contract) {
+    if (!gpu::uniformElementType(contract.getLhs().getType()).isF32() ||
+        !gpu::uniformElementType(contract.getRhs().getType()).isF32())
+      return;
+    SmallVector<Value> pending{contract.getRhs()};
+    llvm::DenseSet<Operation *> visited;
+    while (!pending.empty()) {
+      Operation *producer = pending.pop_back_val().getDefiningOp();
+      if (!producer || !visited.insert(producer).second)
+        continue;
+      if (auto load = dyn_cast<gpu::LoadOp>(producer)) {
+        simtRhsConsumers[load].push_back(contract);
+        continue;
+      }
+      if (isa<gpu::BroadcastOp, gpu::ReshapeOp, gpu::TransposeOp, gpu::CastOp,
+              gpu::UnaryOp, gpu::BinaryOp, gpu::SelectOp>(producer))
+        llvm::append_range(pending, producer->getOperands());
+    }
+  });
   SmallVector<gpu::LoadOp> loads;
   kernel.walk([&](gpu::LoadOp load) {
     if (isa<gpu::ViewType>(load.getResource().getType()) &&
@@ -460,6 +480,7 @@ void orientPointerLoads(func::FuncOp kernel) {
     unsigned rank = result.getShape().size();
     if (rank < 2)
       continue;
+    gpu::PhysicalProgramAnalysis analysis(kernel);
     SmallVector<int64_t> viewAxes(rank, -1);
     Value innermostCoordinate;
     int64_t innermostViewAxis = -1;
@@ -481,11 +502,21 @@ void orientPointerLoads(func::FuncOp kernel) {
         if (extent.getKind() == static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
             extent.getValue() == 1)
           continue;
-        if (++varying != 1 || viewAxes[axis] != -1) {
+        auto ranges = analysis.axisRanges(coordinate, *source);
+        if (!ranges.isExact() || !ranges.blockers.empty() ||
+            !ranges.accesses.empty()) {
           exact = false;
           break;
         }
-        viewAxes[axis] = load.getSourceAxes()[position];
+        if (ranges.roots.empty())
+          continue;
+        if (++varying != 1) {
+          exact = false;
+          break;
+        }
+        // A broadcast axis does not vary. Reshape-derived coordinates may
+        // share one varying fragment axis across several resource axes.
+        viewAxes[axis] = std::max(viewAxes[axis], load.getSourceAxes()[position]);
         if (viewAxes[axis] > innermostViewAxis) {
           innermostViewAxis = viewAxes[axis];
           innermostCoordinate = coordinate;
@@ -523,6 +554,21 @@ void orientPointerLoads(func::FuncOp kernel) {
     if (llvm::all_of(llvm::enumerate(permutation), [](auto entry) {
           return static_cast<int64_t>(entry.index()) == entry.value();
         }))
+      continue;
+    // IEEE f32 dot uses SIMT FMA. Its RHS shared tile has no native swizzle;
+    // making K the leading load axis can serialize the free-axis reads.
+    auto leadingRanges = analysis.axisRanges(load.getResult(), permutation.front());
+    bool reductionLeading = llvm::any_of(simtRhsConsumers.lookup(load),
+        [&](gpu::ContractOp contract) {
+          if (!leadingRanges.isExact() || leadingRanges.roots.empty())
+            return false;
+          auto axes = analysis.rangeAxes(contract.getRhs(), leadingRanges.roots);
+          return axes.isExact() &&
+                 llvm::any_of(axes.fragmentAxes, [&](unsigned axis) {
+                   return llvm::is_contained(contract.getRhsReductionAxes(), axis);
+                 });
+        });
+    if (reductionLeading)
       continue;
     OpBuilder builder(load);
     auto permutedType = [&](gpu::FragmentType type, ArrayRef<int64_t> order) {
