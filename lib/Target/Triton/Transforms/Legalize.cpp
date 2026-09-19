@@ -686,7 +686,7 @@ bool descriptorAccessEligible(func::FuncOp kernel, Value viewValue,
     return false;
   auto lastOffset =
       offsets[blockAxes.back()].getDefiningOp<arith::ConstantIndexOp>();
-  return lastOffset && (lastOffset.value() * *elementBytes) % 16 == 0;
+  return lastOffset && lastOffset.value() % (16 / *elementBytes) == 0;
 }
 
 void copyOrigin(Operation *source, Operation *target) {
@@ -723,6 +723,27 @@ FailureOr<SmallVector<Value>> materializeDescriptorOffsets(
     OpBuilder &builder, func::FuncOp kernel, Location location, Value viewValue,
     ValueRange offsets) {
   auto view = cast<gpu::ViewType>(viewValue.getType());
+  if (view.getRank() == 2) {
+    // Descriptor shapes are at most INT32_MAX and blocks at most 2^20
+    // elements. A start outside signed i32 therefore denotes an entirely
+    // padded block; preserve that fact instead of wrapping it into the view.
+    Value minimum = builder.create<arith::ConstantIndexOp>(
+        location, std::numeric_limits<int32_t>::min());
+    Value maximum = builder.create<arith::ConstantIndexOp>(
+        location, std::numeric_limits<int32_t>::max());
+    SmallVector<Value> nativeOffsets;
+    for (Value offset : offsets) {
+      Value lower = builder.create<gpu::CompareOp>(
+          location, builder.getI1Type(), offset, minimum, ComparePredicate::Ge);
+      Value upper = builder.create<gpu::CompareOp>(
+          location, builder.getI1Type(), offset, maximum, ComparePredicate::Le);
+      Value inside = builder.create<gpu::BinaryOp>(
+          location, builder.getI1Type(), lower, upper, BinaryOperator::LogicalAnd);
+      nativeOffsets.push_back(builder.create<gpu::SelectOp>(
+          location, builder.getIndexType(), inside, offset, minimum));
+    }
+    return nativeOffsets;
+  }
   Value rowElements;
   for (unsigned axis = 0; axis + 1 < view.getRank(); ++axis) {
     FailureOr<Value> stride =
