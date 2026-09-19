@@ -290,16 +290,15 @@ bool isTrueValue(Value value) {
 }
 
 bool isZeroValue(Value value) {
-  value = stripShapeOnly(value);
-  while (auto cast = value.getDefiningOp<gpu::CastOp>())
-    value = cast.getValue();
-  auto constant = value.getDefiningOp<arith::ConstantOp>();
+  Attribute constant =
+      UniformValueAnalysis(gpu::describeUniformValue).evaluate(value);
   if (!constant)
     return false;
-  if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
+  if (auto integer = dyn_cast<IntegerAttr>(constant))
     return integer.getValue().isZero();
-  if (auto floating = dyn_cast<FloatAttr>(constant.getValue()))
-    return floating.getValue().isZero();
+  // Native zero padding produces positive floating zero.
+  if (auto floating = dyn_cast<FloatAttr>(constant))
+    return floating.getValue().isZero() && !floating.getValue().isNegative();
   return false;
 }
 
