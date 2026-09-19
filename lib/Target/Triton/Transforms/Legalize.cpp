@@ -448,6 +448,122 @@ LogicalResult materializeBlockPointerForms(func::FuncOp kernel) {
   return success();
 }
 
+void orientPointerLoads(func::FuncOp kernel) {
+  SmallVector<gpu::LoadOp> loads;
+  kernel.walk([&](gpu::LoadOp load) {
+    if (isa<gpu::ViewType>(load.getResource().getType()) &&
+        isa<gpu::FragmentType>(load.getResult().getType()))
+      loads.push_back(load);
+  });
+  for (gpu::LoadOp load : loads) {
+    auto result = cast<gpu::FragmentType>(load.getResult().getType());
+    unsigned rank = result.getShape().size();
+    if (rank < 2)
+      continue;
+    SmallVector<int64_t> viewAxes(rank, -1);
+    Value innermostCoordinate;
+    int64_t innermostViewAxis = -1;
+    bool exact = true;
+    for (auto [position, coordinate] : llvm::enumerate(load.getCoordinates())) {
+      auto type = dyn_cast<gpu::FragmentType>(coordinate.getType());
+      if (!type)
+        continue;
+      auto projection = gpu::queryAxisProjection(type, result);
+      if (!projection.isExact()) {
+        exact = false;
+        break;
+      }
+      unsigned varying = 0;
+      for (auto [axis, source] : llvm::enumerate(projection.targetToSource)) {
+        if (!source)
+          continue;
+        auto extent = cast<gpu::PhysicalExprAttr>(type.getShape()[*source]);
+        if (extent.getKind() == static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+            extent.getValue() == 1)
+          continue;
+        if (++varying != 1 || viewAxes[axis] != -1) {
+          exact = false;
+          break;
+        }
+        viewAxes[axis] = load.getSourceAxes()[position];
+        if (viewAxes[axis] > innermostViewAxis) {
+          innermostViewAxis = viewAxes[axis];
+          innermostCoordinate = coordinate;
+        }
+      }
+      if (!exact)
+        break;
+    }
+    // Leave a unit-step innermost view coordinate to native coalescing. A
+    // unit-step coordinate on an outer view axis can still be strided.
+    auto view = cast<gpu::ViewType>(load.getResource().getType());
+    if (innermostCoordinate && innermostViewAxis + 1 == view.getRank()) {
+      auto range = gpu::stripAdditiveProjection(innermostCoordinate)
+                       .getDefiningOp<gpu::MakeRangeOp>();
+      if (range && gpu::isUnitStepRange(range))
+        continue;
+    }
+    auto sameSchema = [&](Type element) {
+      return gpu::FragmentType::get(kernel.getContext(), element,
+          result.getShape(), result.getAxisMaps(), result.getValidity(),
+          result.getOwner());
+    };
+    for (Value operand : load->getOperands())
+      if (auto fragment = dyn_cast<gpu::FragmentType>(operand.getType()))
+        exact &= gpu::queryBroadcastProjection(
+            fragment, sameSchema(fragment.getElementType())).isExact();
+    if (!exact)
+      continue;
+    SmallVector<int64_t> permutation;
+    for (unsigned axis = 0; axis < rank; ++axis)
+      permutation.push_back(axis);
+    llvm::stable_sort(permutation, [&](int64_t lhs, int64_t rhs) {
+      return viewAxes[lhs] > viewAxes[rhs];
+    });
+    if (llvm::all_of(llvm::enumerate(permutation), [](auto entry) {
+          return static_cast<int64_t>(entry.index()) == entry.value();
+        }))
+      continue;
+    OpBuilder builder(load);
+    auto permutedType = [&](gpu::FragmentType type, ArrayRef<int64_t> order) {
+      SmallVector<Attribute> shape, mappings;
+      for (auto [position, axis] : llvm::enumerate(order)) {
+        shape.push_back(type.getShape()[axis]);
+        auto mapping = cast<gpu::AxisMapAttr>(type.getAxisMaps()[axis]);
+        mappings.push_back(gpu::AxisMapAttr::get(kernel.getContext(),
+            mapping.getSourceId(), mapping.getSourceAxis(),
+            mapping.getDimensionId(), position, mapping.getDerived()));
+      }
+      return gpu::FragmentType::get(kernel.getContext(),
+          type.getElementType(), builder.getArrayAttr(shape),
+          builder.getArrayAttr(mappings), type.getValidity(), type.getOwner());
+    };
+    auto transpose = [&](Value value, ArrayRef<int64_t> order) -> Value {
+      auto target = permutedType(cast<gpu::FragmentType>(value.getType()), order);
+      return builder.create<gpu::TransposeOp>(load.getLoc(), target, value, order);
+    };
+    IRMapping mapping;
+    for (Value operand : load->getOperands()) {
+      auto type = dyn_cast<gpu::FragmentType>(operand.getType());
+      if (!type || mapping.contains(operand))
+        continue;
+      auto target = sameSchema(type.getElementType());
+      Value expanded = operand;
+      if (type != target)
+        expanded = builder.create<gpu::BroadcastOp>(load.getLoc(), target, operand);
+      mapping.map(operand, transpose(expanded, permutation));
+    }
+    auto oriented = cast<gpu::LoadOp>(builder.clone(*load, mapping));
+    oriented.getResult().setType(permutedType(result, permutation));
+    SmallVector<int64_t> inverse(rank);
+    for (auto [position, axis] : llvm::enumerate(permutation))
+      inverse[axis] = position;
+    Value restored = transpose(oriented.getResult(), inverse);
+    load.getResult().replaceAllUsesWith(restored);
+    load.erase();
+  }
+}
+
 std::optional<int64_t> descriptorElementBytes(Type type) {
   unsigned bitWidth = type.getIntOrFloatBitWidth();
   if (bitWidth < 8 || bitWidth % 8 != 0)
@@ -3995,6 +4111,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       failed(legalizeSplitGatherPairs(kernel)) ||
       failed(materializeBlockPointerForms(kernel)))
     return failure();
+  orientPointerLoads(kernel);
   FailureOr<TensorDescriptorChoiceOp> tensorDescriptorForms =
       materializeTensorDescriptorForms(kernel, localOptions);
   if (failed(tensorDescriptorForms) ||
