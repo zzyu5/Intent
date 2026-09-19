@@ -49,6 +49,40 @@ PhysicalExprAttr nextPowerOfTwo(PhysicalExprAttr source) {
                     {}, {source});
 }
 
+bool isShapeBound(PhysicalExprAttr bound) {
+  return bound.getKind() !=
+             static_cast<uint32_t>(PhysicalExprKind::ScalarABI) &&
+         llvm::all_of(bound.getOperands(), [](Attribute operand) {
+           return isShapeBound(cast<PhysicalExprAttr>(operand));
+         });
+}
+
+PhysicalExprAttr boundedReductionChunk(ParameterOp chunk, MakeRangeOp range) {
+  auto extent = expression(chunk.getContext(), PhysicalExprKind::Parameter, 0,
+                           chunk.getParameter().getName().getValue());
+  auto capacity = queryLogicalRangeCapacity(range);
+  if (!capacity || !isShapeBound(capacity) ||
+      chunk->hasAttr(coverageDimensionAttr))
+    return extent;
+  int64_t maximum =
+      *llvm::max_element(chunk.getParameter().getCandidates().asArrayRef());
+  if (maximum > (int64_t{1} << 62))
+    return extent;
+  if (capacity.getKind() ==
+          static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+      capacity.getValue() >= maximum)
+    return extent;
+  auto one = expression(chunk.getContext(), PhysicalExprKind::Constant, 1);
+  auto positive = expression(chunk.getContext(), PhysicalExprKind::Maximum, 0,
+                             {}, {capacity, one});
+  auto bounded = expression(
+      chunk.getContext(), PhysicalExprKind::Minimum, 0, {},
+      {positive, expression(chunk.getContext(), PhysicalExprKind::Constant,
+                            maximum)});
+  return expression(chunk.getContext(), PhysicalExprKind::Minimum, 0, {},
+                    {extent, nextPowerOfTwo(bounded)});
+}
+
 bool isCompileTimeExtent(PhysicalExprAttr expression) {
   auto kind = static_cast<PhysicalExprKind>(expression.getKind());
   if (kind == PhysicalExprKind::Constant || kind == PhysicalExprKind::Parameter)
@@ -2645,9 +2679,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                "reduction blocking has no unique physical parameter relation")
            << "; source=" << sourcePlans.front().source.getType()
            << "; axis=" << sourcePlans.front().reductionAxis;
-  PhysicalExprAttr chunkExtent = expression(
-      reduce.getContext(), PhysicalExprKind::Parameter, 0,
-      chunk.getParameter().getName().getValue());
+  PhysicalExprAttr chunkExtent = boundedReductionChunk(chunk, firstRange);
 
   SmallVector<FragmentType> blockedSourceTypes;
   for (const SourcePlan &plan : sourcePlans) {
@@ -2658,6 +2690,11 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
 
   OpBuilder builder(reduce);
   Location location = reduce.getLoc();
+  Value chunkSize = chunk.getResult();
+  if (chunkExtent.getKind() !=
+      static_cast<uint32_t>(PhysicalExprKind::Parameter))
+    chunkSize = builder.create<PhysicalExprOp>(
+        location, builder.getIndexType(), chunkExtent);
   Value stop = *firstEnd;
   SmallVector<Value> identities(
       reduce.getInputs()
@@ -2705,7 +2742,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
   bool bodyFailed = false;
   std::string bodyFailure = "unknown producer replay failure";
   auto loop = builder.create<scf::ForOp>(
-      location, firstRange.getStart(), stop, chunk.getResult(), loopInitials,
+      location, firstRange.getStart(), stop, chunkSize, loopInitials,
       [](OpBuilder &, Location, Value, ValueRange) {});
   auto buildBody = [&](OpBuilder &nested, Location nestedLocation, Value chunkStart,
           ValueRange carries) {
@@ -2718,7 +2755,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
             ArrayAttr::get(reduce.getContext(), masterShape),
             masterType.getAxisMaps(), 2, masterType.getOwner());
         Value masterCoordinate = nested.create<MakeRangeOp>(
-            nestedLocation, blockedMaster, chunkStart, chunk.getResult(),
+            nestedLocation, blockedMaster, chunkStart, chunkSize,
             firstRange.getStep(), firstRange.getLogicalStart(),
             firstRange.getLogicalStop(), firstRange.getSourceId(),
             firstRange.getSourceAxis(), firstRange.getDerived());
@@ -2757,7 +2794,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                 originalCoordinate.getOwner());
             auto coordinate = nested.create<MakeRangeOp>(
                 nestedLocation, blockedCoordinate, chunkStart,
-                chunk.getResult(), range.getStep(), range.getLogicalStart(),
+                chunkSize, range.getStep(), range.getLogicalStart(),
                 range.getLogicalStop(), range.getSourceId(),
                 range.getSourceAxis(), range.getDerived());
             inheritRangeAuthority(coordinate, range);
@@ -2803,7 +2840,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                 range.getResult().getType().getValidity(),
                 range.getResult().getType().getOwner());
             Value coordinate = nested.create<MakeRangeOp>(
-                nestedLocation, blockedCoordinate, chunkStart, chunk.getResult(),
+                nestedLocation, blockedCoordinate, chunkStart, chunkSize,
                 range.getStep(), range.getLogicalStart(), range.getLogicalStop(),
                 range.getSourceId(), range.getSourceAxis(), range.getDerived());
             inheritRangeAuthority(coordinate.getDefiningOp(), range);

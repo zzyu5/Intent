@@ -582,6 +582,9 @@ bool valueKnownNonNegative(Value value, unsigned depth);
 
 enum class IndexSign { Unknown, NonNegative, Positive };
 
+std::optional<std::pair<int64_t, int64_t>>
+positiveExtentBounds(func::FuncOp kernel, PhysicalExprAttr extent);
+
 IndexSign physicalIndexSign(PhysicalExprAttr expression, func::FuncOp kernel) {
   auto kind = static_cast<PhysicalExprKind>(expression.getKind());
   if (kind == PhysicalExprKind::Constant)
@@ -605,6 +608,9 @@ IndexSign physicalIndexSign(PhysicalExprAttr expression, func::FuncOp kernel) {
     return std::min(
         physicalIndexSign(cast<PhysicalExprAttr>(expression.getOperands()[1]), kernel),
         physicalIndexSign(cast<PhysicalExprAttr>(expression.getOperands()[2]), kernel));
+  if (kind == PhysicalExprKind::NextPowerOfTwo)
+    return positiveExtentBounds(kernel, expression) ? IndexSign::Positive
+                                                    : IndexSign::Unknown;
   if (expression.getOperands().size() != 2)
     return IndexSign::Unknown;
   IndexSign lhs = physicalIndexSign(
@@ -862,12 +868,34 @@ positiveExtentBounds(func::FuncOp kernel, PhysicalExprAttr extent) {
     return std::pair{*llvm::min_element(candidates),
                      *llvm::max_element(candidates)};
   }
-  if (kind != PhysicalExprKind::Multiply || extent.getOperands().size() != 2)
+  if (kind == PhysicalExprKind::NextPowerOfTwo &&
+      extent.getOperands().size() == 1) {
+    auto bounds = positiveExtentBounds(
+        kernel, cast<PhysicalExprAttr>(extent.getOperands()[0]));
+    if (!bounds || bounds->second > (int64_t{1} << 62))
+      return std::nullopt;
+    return std::pair{static_cast<int64_t>(llvm::PowerOf2Ceil(bounds->first)),
+                     static_cast<int64_t>(llvm::PowerOf2Ceil(bounds->second))};
+  }
+  if ((kind != PhysicalExprKind::Multiply &&
+       kind != PhysicalExprKind::Minimum) || extent.getOperands().size() != 2)
     return std::nullopt;
   auto lhs = positiveExtentBounds(
       kernel, cast<PhysicalExprAttr>(extent.getOperands()[0]));
   auto rhs = positiveExtentBounds(
       kernel, cast<PhysicalExprAttr>(extent.getOperands()[1]));
+  if (kind == PhysicalExprKind::Minimum) {
+    if (lhs && rhs)
+      return std::pair{std::min(lhs->first, rhs->first),
+                       std::min(lhs->second, rhs->second)};
+    for (unsigned known : {0u, 1u}) {
+      auto bound = known == 0 ? lhs : rhs;
+      auto other = cast<PhysicalExprAttr>(extent.getOperands()[1 - known]);
+      if (bound && physicalIndexSign(other, kernel) == IndexSign::Positive)
+        return std::pair{int64_t{1}, bound->second};
+    }
+    return std::nullopt;
+  }
   if (!lhs || !rhs)
     return std::nullopt;
   __int128 maximum = static_cast<__int128>(lhs->second) * rhs->second;
