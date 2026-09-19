@@ -96,7 +96,7 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
     started = time.monotonic()
     stage = "reference_preparation"
     report_stage(stage)
-    budget = TuningBudget(suite["max_tuning_configurations"], CandidateTorchPolicy)
+    budget = TuningBudget(CandidateTorchPolicy)
     artifact_directory = arguments.artifacts or arguments.program.parent
     artifact_directory.mkdir(parents=True, exist_ok=True)
     context = ProgramContext(arguments.compiler, artifact_directory, language=arguments.language,

@@ -121,9 +121,8 @@ or benchmarks. You submit once; there is no benchmark-feedback repair round.
 No reference implementation or reference output values are available to you. Do not seek other task answers,
 personal memory, external websites or subagents.
 
-Triton's autotuner considers at most 16 legal configurations per kernel. When
-there are more, it samples uniformly spaced list positions, including both ends,
-after existing legality pruning. Both arms use the same median-only CUDA Graph
+Triton's native autotuner measures the configurations remaining after existing
+legality pruning. Both arms use the same median-only CUDA Graph
 measurement policy. Tuning is evaluator-side execution preparation, not another
 agent submission.
 
