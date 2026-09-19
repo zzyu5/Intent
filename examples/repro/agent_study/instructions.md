@@ -62,6 +62,9 @@ mathematical operation is associative; the compiler cannot infer permission to
 reassociate it. Choose reduce, scan or parallel constructs when their documented
 semantics match the computation and TASK.md, and ordinary loops when their
 sequential dependencies are required.
+An accumulator being loop-carried does not itself mean that the algorithm requires
+that evaluation order. Before submitting, distinguish a required recurrence from
+a mathematical reduction or contraction whose order the task leaves unspecified.
 
 For Intent generation, define ordinary @intent.kernel / @intent.fn programs using
 intent.language. Inside build, use context.compile("unique_literal_name", kernel,
