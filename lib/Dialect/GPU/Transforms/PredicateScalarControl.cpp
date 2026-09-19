@@ -39,8 +39,14 @@ bool dependsOnWorksetCoordinate(Value value) {
 }
 
 bool canPredicate(Block &block, bool allowStores = false,
-                  bool allowProducts = false, bool allowLoops = false) {
+                  bool allowProducts = false, bool allowLoops = false,
+                  bool allowAssumptions = false) {
   for (Operation &operation : block.without_terminator()) {
+    if (auto assumption = dyn_cast<AssumeInBoundsOp>(operation)) {
+      if (!allowAssumptions || !isScalar(assumption.getIndex().getType()))
+        return false;
+      continue;
+    }
     if (auto loop = dyn_cast<scf::ForOp>(operation)) {
       APInt lower, upper, step;
       if (!allowLoops ||
@@ -56,8 +62,9 @@ bool canPredicate(Block &block, bool allowStores = false,
     }
     if (auto store = dyn_cast<StoreOp>(operation)) {
       if (!allowStores || !isScalar(store.getValue().getType()) ||
-          !llvm::all_of(store.getCoordinates(), [](Value coordinate) {
-            return isScalar(coordinate.getType());
+          !llvm::all_of(store.getCoordinates(), [&](Value coordinate) {
+            return isScalar(coordinate.getType()) &&
+                   (!allowAssumptions || coordinate.getType().isIntOrIndex());
           }))
         return false;
       continue;
@@ -83,6 +90,8 @@ bool canPredicate(Block &block, bool allowStores = false,
     else if (auto gather = dyn_cast<GatherOp>(operation))
       coordinates = gather.getCoordinates();
     if (!llvm::all_of(coordinates, [&](Value coordinate) {
+          if (allowAssumptions && !coordinate.getType().isIntOrIndex())
+            return false;
           return allowProducts ? isPredicatableProduct(coordinate.getType())
                                : isScalar(coordinate.getType());
         }))
@@ -93,6 +102,66 @@ bool canPredicate(Block &block, bool allowStores = false,
       return false;
   }
   return true;
+}
+
+void dischargeScalarAssumptions(Block &block) {
+  SmallVector<AssumeInBoundsOp> assumptions;
+  for (Operation &operation : block.without_terminator())
+    if (auto assumption = dyn_cast<AssumeInBoundsOp>(operation))
+      assumptions.push_back(assumption);
+  if (assumptions.empty())
+    return;
+  // A fact inside a branch is not true for inactive lanes after if-conversion.
+  // Close the accesses with explicit validity before removing that lexical fact.
+  // These guards are true for every active access of a legal source program.
+  for (Operation &operation : llvm::make_early_inc_range(block.without_terminator())) {
+    auto load = dyn_cast<LoadOp>(operation);
+    auto store = dyn_cast<StoreOp>(operation);
+    if (!load && !store)
+      continue;
+    Value resource = load ? load.getResource() : store.getResource();
+    SmallVector<Value> coordinates = llvm::to_vector(
+        load ? load.getCoordinates() : store.getCoordinates());
+    if (coordinates.empty())
+      continue;
+    ArrayRef<int64_t> axes = load ? load.getSourceAxes() : store.getSourceAxes();
+    Value valid = load ? load.getValid() : store.getValid();
+    OpBuilder builder(&operation);
+    Location location = operation.getLoc();
+    Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+    for (unsigned position = 0; position < coordinates.size(); ++position) {
+      Value &coordinate = coordinates[position];
+      int64_t axis = axes[position];
+      if (!coordinate.getType().isIndex())
+        coordinate = builder.create<CastOp>(location, builder.getIndexType(), coordinate);
+      Value extent;
+      if (auto buffer = dyn_cast<BufferType>(resource.getType()))
+        extent = builder.create<PhysicalExprOp>(location, builder.getIndexType(),
+            cast<PhysicalExprAttr>(buffer.getShape()[axis]));
+      else
+        extent = builder.create<DimOp>(location, builder.getIndexType(), resource, axis);
+      Value lower = builder.create<CompareOp>(location, builder.getI1Type(),
+          coordinate, zero, ComparePredicate::Ge);
+      Value upper = builder.create<CompareOp>(location, builder.getI1Type(),
+          coordinate, extent, ComparePredicate::Lt);
+      Value bounded = builder.create<BinaryOp>(location, builder.getI1Type(),
+          lower, upper, BinaryOperator::LogicalAnd);
+      valid = valid ? Value(builder.create<BinaryOp>(location, builder.getI1Type(),
+          valid, bounded, BinaryOperator::LogicalAnd)) : bounded;
+    }
+    if (load) {
+      load.getCoordinatesMutable().assign(coordinates);
+      load.getValidMutable().assign(valid);
+      if (!load.getFill())
+        load.getFillMutable().assign(builder.create<arith::ConstantOp>(
+            location, builder.getZeroAttr(load.getType())).getResult());
+    } else {
+      store.getCoordinatesMutable().assign(coordinates);
+      store.getValidMutable().assign(valid);
+    }
+  }
+  for (AssumeInBoundsOp assumption : assumptions)
+    assumption.erase();
 }
 
 SmallVector<Value> predicateBlock(OpBuilder &builder, Block &block,
@@ -463,8 +532,10 @@ LogicalResult predicateScalarControl(ModuleOp module) {
           conditional.getElseRegion().front().without_terminator().empty();
       if (!emptyElse ||
           !canPredicate(conditional.getThenRegion().front(),
-                        /*allowStores=*/true))
+                        /*allowStores=*/true, /*allowProducts=*/false,
+                        /*allowLoops=*/false, /*allowAssumptions=*/true))
         continue;
+      dischargeScalarAssumptions(conditional.getThenRegion().front());
       OpBuilder builder(conditional);
       predicateBlock(builder, conditional.getThenRegion().front(),
                      conditional.getCondition());
