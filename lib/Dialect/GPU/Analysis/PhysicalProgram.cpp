@@ -2032,6 +2032,53 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
   return result.nonNegative ? result.upper : PhysicalExprAttr();
 }
 
+PhysicalExprAttr queryLogicalRangeCapacity(MakeRangeOp range) {
+  if (!isUnitStepRange(range))
+    return {};
+  if (queryNonNegativeIndexUpperBound(range.getLogicalStart()))
+    if (auto stop = queryNonNegativeIndexUpperBound(range.getLogicalStop()))
+      return stop;
+
+  auto stop = queryLaunchExpression(range.getLogicalStop());
+  if (!stop)
+    return {};
+  auto start = queryLaunchExpression(range.getLogicalStart());
+  if (!start) {
+    Value first = stripScalarIdentity(range.getLogicalStart());
+    if (auto add = first.getDefiningOp<BinaryOp>();
+        add && add.getOperatorKind() == BinaryOperator::Add) {
+      if (integerConstant(add.getRhs()) == 1)
+        first = stripScalarIdentity(add.getLhs());
+      else if (integerConstant(add.getLhs()) == 1)
+        first = stripScalarIdentity(add.getRhs());
+    }
+    auto induction = dyn_cast<BlockArgument>(first);
+    auto loop = induction
+                    ? dyn_cast<scf::ForOp>(induction.getOwner()->getParentOp())
+                    : scf::ForOp();
+    if (!loop || induction != loop.getInductionVar() ||
+        !loop->isAncestor(range) || integerConstant(loop.getStep()) != 1 ||
+        !samePhysicalScalarExpression(range.getLogicalStop(), loop.getUpperBound()))
+      return {};
+    // In an executing [lower, upper) loop, iv and iv+1 are <= upper.
+    // The successor cannot overflow because iv < upper <= INDEX_MAX.
+    start = queryLaunchExpression(loop.getLowerBound());
+    if (!start)
+      return {};
+  }
+  auto expression = [&](PhysicalExprKind kind, ArrayRef<Attribute> operands) {
+    auto context = range.getContext();
+    return PhysicalExprAttr::get(context, static_cast<uint32_t>(kind), 0,
+                                 StringAttr::get(context, ""),
+                                 ArrayAttr::get(context, operands));
+  };
+  // This is host capacity arithmetic, not a proof that a device subtraction
+  // cannot wrap. Coverage selection rejects spans outside its finite domain.
+  auto span = expression(PhysicalExprKind::Subtract, {stop, start});
+  auto zero = expression(PhysicalExprKind::Constant, {});
+  return expression(PhysicalExprKind::Maximum, {span, zero});
+}
+
 bool sameLogicalRange(MakeRangeOp lhs, MakeRangeOp rhs) {
   if (!lhs || !rhs || lhs.getSourceId() != rhs.getSourceId() ||
       lhs.getSourceAxis() != rhs.getSourceAxis() ||

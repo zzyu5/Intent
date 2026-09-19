@@ -3665,21 +3665,13 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
     return success();
   if (!runtimeDimension) {
     FailureOr<MakeRangeOp> authority = queryExactLogicalRange(ranges);
-    PhysicalExprAttr start = succeeded(authority)
-                                ? queryNonNegativeIndexUpperBound(
-                                      (*authority).getLogicalStart())
-                                : PhysicalExprAttr();
-    PhysicalExprAttr end = succeeded(authority)
-                              ? queryNonNegativeIndexUpperBound(
-                                    (*authority).getLogicalStop())
-                              : PhysicalExprAttr();
-    if (start && end && isUnitStepRange(*authority)) {
-      // With a nonnegative start, an upper bound on stop also bounds the
-      // number of members. Keep the actual prefix/suffix in the range and
-      // cover it with this launch-visible capacity plus its existing tail.
+    PhysicalExprAttr capacity = succeeded(authority)
+                                   ? queryLogicalRangeCapacity(*authority)
+                                   : PhysicalExprAttr();
+    if (capacity) {
       OpBuilder builder(&kernel.front(), kernel.front().begin());
       runtimeDimension = builder.create<PhysicalExprOp>(
-          source.getLoc(), builder.getIndexType(), end);
+          source.getLoc(), builder.getIndexType(), capacity);
     }
   }
   if (!runtimeDimension)
@@ -4016,10 +4008,29 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
     Value logicalDistance = builder.create<BinaryOp>(
         range.getLoc(), builder.getIndexType(), logicalExtent, range.getStep(),
         BinaryOperator::Multiply);
-    Value stop = builder.create<BinaryOp>(
-        range.getLoc(), builder.getIndexType(), range.getStart(), logicalDistance,
-        BinaryOperator::Add);
     auto coordinate = cast<FragmentType>(range.getResult().getType());
+    Value member = range.getResult();
+    Value stop;
+    if (isUnitStepRange(range) &&
+        (!queryNonNegativeIndexUpperBound(range.getLogicalStart()) ||
+         !queryNonNegativeIndexUpperBound(range.getLogicalStop()))) {
+      Value nonempty = builder.create<CompareOp>(
+          range.getLoc(), builder.getI1Type(), range.getLogicalStart(),
+          range.getLogicalStop(), ComparePredicate::Lt);
+      Value zero = builder.create<arith::ConstantIndexOp>(range.getLoc(), 0);
+      stop = builder.create<SelectOp>(range.getLoc(), builder.getIndexType(),
+                                       nonempty, logicalDistance, zero);
+      Value base = builder.create<BroadcastOp>(range.getLoc(), coordinate,
+                                               range.getStart());
+      // Unit-step offsets remain [0, extent) even when an inactive padded
+      // absolute coordinate wraps. Preserve the range's physical origin.
+      member = builder.create<BinaryOp>(range.getLoc(), coordinate, member,
+                                         base, BinaryOperator::Subtract);
+    } else {
+      stop = builder.create<BinaryOp>(
+          range.getLoc(), builder.getIndexType(), range.getStart(), logicalDistance,
+          BinaryOperator::Add);
+    }
     Value stopFragment =
         builder.create<BroadcastOp>(range.getLoc(), coordinate, stop);
     auto predicate = FragmentType::get(
@@ -4027,7 +4038,7 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
         coordinate.getAxisMaps(), coordinate.getValidity(),
         coordinate.getOwner());
     auto tail = builder.create<CompareOp>(range.getLoc(), predicate,
-                                          range.getResult(), stopFragment,
+                                          member, stopFragment,
                                           ComparePredicate::Lt);
     tail->setAttr(physicalTailAttr, builder.getUnitAttr());
     predicates[range.getOperation()] = tail.getResult();
