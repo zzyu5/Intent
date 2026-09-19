@@ -188,7 +188,8 @@ public:
   LogicalResult emit() {
     bindArguments();
     emitPreamble();
-    emitDescriptorPruner();
+    emitDescriptorHelpers();
+    emitConfigPruner();
     emitHelpers();
     emitKernel();
     emitLaunch();
@@ -335,7 +336,7 @@ private:
              << overlapFunction << "\n\n";
   }
 
-  void emitDescriptorPruner() {
+  void emitDescriptorHelpers() {
     if (!descriptorChoice)
       return;
     output << "def _intent_tensor_descriptor_legal(\n"
@@ -377,26 +378,6 @@ private:
               "        elements <= maximum_block_elements\n"
               "        and block_shape[-1] * element_size >= minimum_contiguous_bytes\n"
               "    )\n\n"
-              "def _intent_prune_tensor_descriptor_configs(configs, named_args, **kwargs):\n"
-              "    if not named_args[\""
-           << descriptorChoice.getEligibilityArgument()
-           << "\"]:\n"
-              "        return [config for config in configs "
-              "if not config.kwargs[\""
-           << descriptorChoice.getConfigParameter()
-           << "\"]]\n"
-              "    retained = []\n"
-              "    for config in configs:\n"
-              "        if not config.kwargs[\""
-           << descriptorChoice.getConfigParameter()
-           << "\"]:\n"
-              "            retained.append(config)\n"
-              "            continue\n"
-              "        args = dict(named_args)\n"
-              "        args.update(config.kwargs)\n"
-              "        if _intent_tensor_descriptor_shapes_legal(args):\n"
-              "            retained.append(config)\n"
-              "    return retained\n\n"
               "def _intent_tensor_descriptor_shapes_legal(args):\n"
               "    descriptors = (\n";
     for (const DescriptorABI &descriptor : descriptors) {
@@ -430,6 +411,61 @@ private:
       output << "    args[\"" << descriptor.name << "\"].block_shape = "
              << descriptorBlockShape(descriptor) << "\n";
     output << "\n";
+  }
+
+  void emitConfigPruner() {
+    auto boundExpression = [&](Value value) -> std::string {
+      if (auto constant = value.getDefiningOp<arith::ConstantIndexOp>())
+        return std::to_string(constant.value());
+      if (auto physical = value.getDefiningOp<gpu::PhysicalExprOp>())
+        if (isConstexprExpression(physical.getExpression()))
+          return descriptorArgumentExpression(physical.getExpression());
+      return {};
+    };
+    SmallVector<std::string> bounds;
+    // The same current-IR assertions also guard compilation. Evaluate their
+    // constexpr bounds before the native tuner spends its candidate budget.
+    for (auto assertion : kernel.front().getOps<cf::AssertOp>()) {
+      auto comparison = assertion.getArg().getDefiningOp<gpu::CompareOp>();
+      if (!comparison || comparison.getPredicate() != ComparePredicate::Le)
+        continue;
+      std::string lhs = boundExpression(comparison.getLhs());
+      std::string rhs = boundExpression(comparison.getRhs());
+      if (!lhs.empty() && !rhs.empty())
+        bounds.push_back("(" + lhs + " <= " + rhs + ")");
+    }
+    hasConfigPruner = descriptorChoice || !bounds.empty();
+    if (!hasConfigPruner)
+      return;
+    output << "def _intent_prune_configs(configs, named_args, **kwargs):\n"
+              "    retained = []\n"
+              "    for config in configs:\n"
+              "        args = {**named_args, **kwargs, **config.kwargs}\n";
+    kernel.walk([&](gpu::ParameterOp parameter) {
+      auto role = static_cast<gpu::ParameterRole>(
+          parameter.getParameter().getRole());
+      StringRef field;
+      if (role == gpu::ParameterRole::ProviderWarps)
+        field = "num_warps";
+      else if (role == gpu::ParameterRole::ProviderStages)
+        field = "num_stages";
+      else if (role == gpu::ParameterRole::ProviderCTAs)
+        field = "num_ctas";
+      if (!field.empty())
+        output << "        args[\"" << parameter.getParameter().getName().getValue()
+               << "\"] = config." << field << "\n";
+    });
+    if (descriptorChoice)
+      output << "        if args[\"" << descriptorChoice.getConfigParameter()
+             << "\"] and (not args[\""
+             << descriptorChoice.getEligibilityArgument()
+             << "\"] or not _intent_tensor_descriptor_shapes_legal(args)):\n"
+                "            continue\n";
+    for (const std::string &bound : bounds)
+      output << "        if not " << bound << ":\n"
+                "            continue\n";
+    output << "        retained.append(config)\n"
+              "    return retained\n\n";
   }
 
   void emitHelper(Operation *owner, Region &region, StringRef role) {
@@ -554,9 +590,9 @@ private:
     output << "],\n";
     output << "    pre_hook=_intent_tuning_hooks.before,\n"
               "    post_hook=_intent_tuning_hooks.after,\n";
-    if (descriptorChoice)
+    if (hasConfigPruner)
       output << "    prune_configs_by={\"early_config_prune\": "
-                "_intent_prune_tensor_descriptor_configs},\n";
+                "_intent_prune_configs},\n";
     output << ")\n";
     if (!fullCoverageParameters.empty()) {
       output << "@triton.heuristics({\n";
@@ -1989,6 +2025,7 @@ private:
   unsigned counter = 0;
   unsigned helperCounter = 0;
   bool emittingHelper = false;
+  bool hasConfigPruner = false;
   bool failed = false;
 };
 

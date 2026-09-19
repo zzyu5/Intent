@@ -63,6 +63,15 @@ bool expressionReferencesParameter(PhysicalExprAttr expression,
   });
 }
 
+bool expressionHasParameter(PhysicalExprAttr expression) {
+  if (expression.getKind() ==
+      static_cast<uint32_t>(PhysicalExprKind::Parameter))
+    return true;
+  return llvm::any_of(expression.getOperands(), [](Attribute operand) {
+    return expressionHasParameter(cast<PhysicalExprAttr>(operand));
+  });
+}
+
 bool isBlockedReductionFreeAxis(func::FuncOp kernel, ParameterOp parameter) {
   auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());
   if (role != ParameterRole::OwnershipM && role != ParameterRole::OwnershipN)
@@ -85,7 +94,7 @@ bool isBlockedReductionFreeAxis(func::FuncOp kernel, ParameterOp parameter) {
         auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
         auto kind = static_cast<PhysicalExprKind>(extent.getKind());
         return (kind == PhysicalExprKind::Constant && extent.getValue() > 0) ||
-               kind == PhysicalExprKind::Parameter;
+               expressionHasParameter(extent);
       });
       if (!blockedReduction)
         continue;
@@ -241,7 +250,9 @@ bool isStatefulReduction(func::FuncOp kernel, ParameterOp parameter) {
   // Its chunk controls that state directly, so it needs a profile distinct from
   // ordinary scalar reductions even though both use the Reduction role.
   kernel.walk([&](scf::ForOp loop) {
-    if (found || loop.getStep() != parameter.getResult() ||
+    auto step = queryLaunchExpression(loop.getStep());
+    if (found || !step ||
+        !expressionReferencesParameter(step, parameter.getParameter().getName()) ||
         !loop->hasAttr(reductionSourcesAttr) || loop.getNumResults() < 2)
       return;
     loop.getBody()->walk([&](ReduceOp reduce) {

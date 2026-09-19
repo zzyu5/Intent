@@ -242,10 +242,10 @@ evaluateCompileTimeExpression(gpu::PhysicalExprAttr expression,
 bool isCompileTimeExpression(gpu::PhysicalExprAttr expression) {
   auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
   if (kind == gpu::PhysicalExprKind::Constant ||
-      kind == gpu::PhysicalExprKind::Parameter)
+      kind == gpu::PhysicalExprKind::Parameter ||
+      kind == gpu::PhysicalExprKind::Dimension)
     return true;
-  if (kind == gpu::PhysicalExprKind::Dimension ||
-      kind == gpu::PhysicalExprKind::ScalarABI)
+  if (kind == gpu::PhysicalExprKind::ScalarABI)
     return false;
   return llvm::all_of(expression.getOperands(), [](Attribute operand) {
     return isCompileTimeExpression(cast<gpu::PhysicalExprAttr>(operand));
