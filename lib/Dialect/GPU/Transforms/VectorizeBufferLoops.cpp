@@ -9,31 +9,6 @@ using namespace mlir;
 namespace intent::gpu {
 namespace {
 
-bool variesWithIteration(Value value, scf::ForOp loop,
-                        llvm::DenseMap<Value, bool> &known) {
-  if (loop.isDefinedOutsideOfLoop(value))
-    return false;
-  if (auto found = known.find(value); found != known.end())
-    return found->second;
-  bool varies = true;
-  if (auto argument = dyn_cast<BlockArgument>(value)) {
-    auto nested = dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
-    if (nested && nested != loop && argument == nested.getInductionVar())
-      varies = variesWithIteration(nested.getLowerBound(), loop, known) ||
-               variesWithIteration(nested.getUpperBound(), loop, known) ||
-               variesWithIteration(nested.getStep(), loop, known);
-  } else if (Operation *producer = value.getDefiningOp();
-             producer && !producer->getNumRegions() &&
-             canPredicateValueOperation(producer) &&
-             !isa<LoadOp, GatherOp>(producer)) {
-    varies = llvm::any_of(producer->getOperands(), [&](Value operand) {
-      return variesWithIteration(operand, loop, known);
-    });
-  }
-  known[value] = varies;
-  return varies;
-}
-
 bool canVectorizeIterations(Block &block, scf::ForOp loop,
                            llvm::DenseMap<Value, bool> &varying) {
   auto data = [](Type type) {
@@ -199,57 +174,6 @@ bool hasIndependentUpdates(scf::ForOp loop, func::FuncOp kernel,
   return independent;
 }
 
-FailureOr<Value> nonOverlappingView(func::FuncOp kernel, Value resource) {
-  auto view = cast<ViewType>(resource.getType());
-  SmallVector<OpFoldResult> strides;
-  for (Attribute attribute : view.getLayout().getStrides()) {
-    if (auto constant = dyn_cast<IntegerAttr>(attribute)) {
-      strides.push_back(constant);
-      continue;
-    }
-    auto name = dyn_cast<StringAttr>(attribute);
-    Value stride;
-    if (name)
-      for (BlockArgument argument : kernel.getArguments())
-        if (kernel.getArgAttrOfType<StringAttr>(argument.getArgNumber(),
-                                               abiNameAttr) == name)
-          stride = argument;
-    if (!stride || !stride.getType().isIndex())
-      return failure();
-    strides.push_back(stride);
-  }
-  if (strides.empty())
-    return failure();
-  OpBuilder builder(&kernel.front(), kernel.front().begin());
-  Location location = resource.getLoc();
-  Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
-  Value one = builder.create<arith::ConstantIndexOp>(location, 1);
-  SmallVector<Value> values;
-  for (OpFoldResult stride : strides)
-    values.push_back(isa<Value>(stride) ? cast<Value>(stride) : Value(
-        builder.create<arith::ConstantIndexOp>(
-            location, cast<IntegerAttr>(cast<Attribute>(stride)).getInt())));
-  Value valid = builder.create<CompareOp>(location, builder.getI1Type(),
-                                         values.back(), zero, ComparePredicate::Gt);
-  for (unsigned axis = values.size() - 1; axis > 0; --axis) {
-    Value divisor = builder.create<BinaryOp>(location, builder.getIndexType(),
-        values[axis], one, BinaryOperator::Maximum);
-    Value slots = builder.create<BinaryOp>(location, builder.getIndexType(),
-        values[axis - 1], divisor, BinaryOperator::FloorDivide);
-    Value extent = builder.create<DimOp>(location, builder.getIndexType(),
-                                         resource, axis);
-    extent = builder.create<BinaryOp>(location, builder.getIndexType(), extent,
-                                       one, BinaryOperator::Maximum);
-    // Division avoids overflow in stride >= extent * next_stride. Every
-    // accepted suffix has positive strides and fits inside its outer stride.
-    Value separate = builder.create<CompareOp>(location, builder.getI1Type(),
-                                               slots, extent, ComparePredicate::Ge);
-    valid = builder.create<BinaryOp>(location, builder.getI1Type(), valid,
-                                      separate, BinaryOperator::LogicalAnd);
-  }
-  return valid;
-}
-
 LogicalResult vectorizeIterations(func::FuncOp kernel,
                                  uint64_t &source, int64_t &dimension) {
   SmallVector<scf::ForOp> loops;
@@ -276,7 +200,8 @@ LogicalResult vectorizeIterations(func::FuncOp kernel,
     if (!elementBitWidth)
       continue;
     if (!guardedViews.empty()) {
-      FailureOr<Value> injective = nonOverlappingView(kernel, guardedViews.front());
+      FailureOr<Value> injective =
+          materializeNonOverlappingView(kernel, guardedViews.front());
       if (failed(injective))
         continue;
       OpBuilder builder(loop);

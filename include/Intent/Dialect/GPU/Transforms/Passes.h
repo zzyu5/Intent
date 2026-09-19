@@ -8,6 +8,7 @@
 #include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Support/LogicalResult.h"
@@ -31,6 +32,10 @@ mlir::FailureOr<mlir::func::FuncOp>
 getPhysicalKernel(mlir::ModuleOp module);
 std::pair<uint64_t, int64_t>
 nextPhysicalAxisIdentities(mlir::func::FuncOp kernel);
+bool variesWithIteration(mlir::Value value, mlir::scf::ForOp loop,
+                         llvm::DenseMap<mlir::Value, bool> &known);
+mlir::FailureOr<mlir::Value>
+materializeNonOverlappingView(mlir::func::FuncOp kernel, mlir::Value resource);
 ParameterOp getOrCreatePhysicalParameter(
     mlir::func::FuncOp kernel, llvm::StringRef name, ParameterRole role,
     ParameterCategory category, uint32_t elementBitWidth,
