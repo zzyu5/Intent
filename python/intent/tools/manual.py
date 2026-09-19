@@ -110,6 +110,18 @@ def snapshot(project: Path) -> dict:
             "members": list(value.members) if isinstance(value, IntrinsicNamespace) else [],
             "availability": "public declaration; backend support and performance are not implied",
         }
+    # Core surface shorthands keep their own signatures and share canonical rules.
+    for canonical, shorthands in {
+        "reduce": ("reduce.sum", "reduce.max", "reduce.any", "reduce.all", "arg_reduce.max"),
+        "scan": ("cumsum", "cummax"),
+        "contract": ("dot", "matvec", "vecmat", "matmul"),
+        "scaled_contract": ("scaled_matmul",),
+        "sparse_contract": ("sparse_matmul", "sparse_contract_2to4"),
+    }.items():
+        rules = [identifier for identifier in symbols[canonical]["sections"]
+                 if documents[identifier]["kind"] == "concept"]
+        for name in shorthands:
+            symbols[name]["sections"] = list(dict.fromkeys((*symbols[name]["sections"], *rules)))
     return {
         "revision": subprocess.check_output(["git", "-C", str(project), "rev-parse", "HEAD"], text=True).strip(),
         "documents": documents, "symbols": symbols,
