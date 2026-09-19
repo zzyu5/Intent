@@ -287,8 +287,18 @@ LogicalResult vectorizeIterations(func::FuncOp kernel,
       loop = selected;
     }
     auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+    int64_t maximumWidth = capabilities.getMaxThreadsPerBlock();
+    auto lower = loop.getLowerBound().getDefiningOp<arith::ConstantIndexOp>();
+    auto upper = loop.getUpperBound().getDefiningOp<arith::ConstantIndexOp>();
+    if (lower && upper) {
+      __int128 length = static_cast<__int128>(upper.value()) - lower.value();
+      int64_t covered = 1;
+      while (covered < length && covered <= maximumWidth / 2)
+        covered *= 2;
+      maximumWidth = covered;
+    }
     SmallVector<int64_t> candidates;
-    for (int64_t width = 1; width <= capabilities.getMaxThreadsPerBlock();
+    for (int64_t width = 1; width <= maximumWidth;
          width *= 2)
       candidates.push_back(width);
     auto name = ("ITERATION_" + Twine(source)).str();
@@ -364,6 +374,60 @@ LogicalResult vectorizeIterations(func::FuncOp kernel,
   return success();
 }
 
+void assignIterationRoles(func::FuncOp kernel) {
+  llvm::DenseMap<Operation *, unsigned> roles;
+  kernel.walk([&](StoreOp store) {
+    auto value = dyn_cast<FragmentType>(store.getValue().getType());
+    if (!value || value.getShape().size() != 2)
+      return;
+    SmallVector<std::pair<int64_t, ParameterOp>, 2> axes;
+    for (auto [coordinate, resourceAxis] :
+         llvm::zip(store.getCoordinates(), store.getSourceAxes())) {
+      auto type = dyn_cast<FragmentType>(coordinate.getType());
+      if (!type)
+        continue;
+      if (type.getShape().size() != 1)
+        return;
+      auto extent = cast<PhysicalExprAttr>(type.getShape()[0]);
+      if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter))
+        return;
+      auto parameter = queryParameterBySymbol(kernel, extent.getSymbol());
+      if (failed(parameter) || !(*parameter)->hasAttr(pointwiseChunkAttr) ||
+          parameter->getParameter().getCategory() !=
+              static_cast<uint32_t>(ParameterCategory::Pointwise) ||
+          parameter->getParameter().getCandidates().size() < 2)
+        return;
+      auto source = sourceAxisIdentity(cast<AxisMapAttr>(type.getAxisMaps()[0]));
+      auto binding = queryParameterBinding(*parameter);
+      auto projection = queryFragmentAxis(value, source);
+      if (!binding.isExact() || !binding.source || !(*binding.source == source) ||
+          !projection.isExact() ||
+          value.getShape()[projection.fragmentAxis] != extent)
+        return;
+      axes.emplace_back(resourceAxis, *parameter);
+    }
+    if (axes.size() != 2 || axes[0].second == axes[1].second ||
+        axes[0].first == axes[1].first)
+      return;
+    if (axes[0].first > axes[1].first)
+      std::swap(axes[0], axes[1]);
+    roles[axes[0].second] |= 1;
+    roles[axes[1].second] |= 2;
+  });
+  // Use the resource axis order, not the fragment prefix order introduced by
+  // nested-loop lifting. Independent one-dimensional stages keep their roles.
+  for (auto [operation, mask] : roles) {
+    if (mask == 3)
+      continue;
+    auto parameter = cast<ParameterOp>(operation);
+    auto schema = parameter.getParameter();
+    auto role = mask == 1 ? ParameterRole::OwnershipM : ParameterRole::OwnershipN;
+    parameter->setAttr("parameter", ParameterAttr::get(
+        kernel.getContext(), schema.getName(), static_cast<uint32_t>(role),
+        schema.getCategory(), schema.getElementBitWidth(), schema.getCandidates()));
+  }
+}
+
 } // namespace
 
 LogicalResult vectorizeBufferLoops(ModuleOp module) {
@@ -381,6 +445,7 @@ LogicalResult vectorizeBufferLoops(ModuleOp module) {
   auto [source, dimension] = nextPhysicalAxisIdentities(kernel);
   if (failed(vectorizeIterations(kernel, source, dimension)))
     return failure();
+  assignIterationRoles(kernel);
   eraseDeadPhysicalValues(kernel);
   return success();
 }
