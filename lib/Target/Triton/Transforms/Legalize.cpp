@@ -2237,14 +2237,14 @@ void foldExactConstantDivisions(func::FuncOp kernel) {
   });
 }
 
-void canonicalizeContractProjections(func::FuncOp kernel) {
+void canonicalizeBroadcastProjections(func::FuncOp kernel) {
   SmallVector<Value> pending;
   kernel.walk([&](gpu::ContractOp contract) {
     pending.push_back(contract.getLhs());
     pending.push_back(contract.getRhs());
   });
   llvm::DenseSet<Operation *> visited;
-  SmallVector<gpu::ReshapeOp> projections;
+  SmallVector<gpu::ReshapeOp> candidates;
   while (!pending.empty()) {
     Operation *producer = pending.pop_back_val().getDefiningOp();
     if (!producer || !visited.insert(producer).second)
@@ -2253,9 +2253,20 @@ void canonicalizeContractProjections(func::FuncOp kernel) {
     for (Region &region : producer->getRegions())
       for (Block &block : region)
         llvm::append_range(pending, block.getTerminator()->getOperands());
-    auto reshape = dyn_cast<gpu::ReshapeOp>(producer);
-    if (!reshape)
-      continue;
+    if (auto reshape = dyn_cast<gpu::ReshapeOp>(producer))
+      candidates.push_back(reshape);
+  }
+  // A load's address and predicate producers are outside this additional scope.
+  kernel.walk([&](gpu::ReshapeOp reshape) {
+    auto source = cast<gpu::FragmentType>(reshape.getValue().getType());
+    if (source.getShape().size() == 1 &&
+        isa_and_nonnull<gpu::LoadOp, BlockLoadOp>(
+            reshape.getValue().getDefiningOp()) &&
+        visited.insert(reshape).second)
+      candidates.push_back(reshape);
+  });
+  SmallVector<gpu::ReshapeOp> projections;
+  for (gpu::ReshapeOp reshape : candidates) {
     auto source = cast<gpu::FragmentType>(reshape.getValue().getType());
     auto target = cast<gpu::FragmentType>(reshape.getResult().getType());
     if (source.getShape().size() >= target.getShape().size() ||
@@ -2285,8 +2296,9 @@ void canonicalizeContractProjections(func::FuncOp kernel) {
     if (insertsUnits && nextSource == source.getShape().size())
       projections.push_back(reshape);
   }
-  // Explicit expand-dims preserve pointer/mask alignment around Triton's dot
-  // pipeline. Keep unrelated high-rank reduction layout choices free.
+  // Expand-dims preserves dot input alignment and avoids redundant register
+  // copies (and loads) when broadcasting a loaded vector. Leave unrelated
+  // high-rank and reduction result layout choices free.
   for (gpu::ReshapeOp reshape : projections) {
     OpBuilder builder(reshape);
     auto broadcast = builder.create<gpu::BroadcastOp>(
@@ -3983,7 +3995,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
     return failure();
   selectContractForms(kernel);
   foldExactConstantDivisions(kernel);
-  canonicalizeContractProjections(kernel);
+  canonicalizeBroadcastProjections(kernel);
   SmallVector<gpu::AssumeInBoundsOp> boundsAssumptions;
   kernel.walk([&](gpu::AssumeInBoundsOp assumption) {
     boundsAssumptions.push_back(assumption);
