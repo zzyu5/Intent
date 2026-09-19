@@ -198,8 +198,7 @@ FailureOr<Value> scalarSource(Value value) {
     value = record.getFields()[extract.getField()];
   }
   if (auto broadcast = value.getDefiningOp<BroadcastOp>())
-    if (!isa<FragmentType>(broadcast.getValue().getType()))
-      return broadcast.getValue();
+    return scalarSource(broadcast.getValue());
   if (auto splat = value.getDefiningOp<SplatOp>())
     return splat.getValue();
   return failure();
@@ -1812,6 +1811,33 @@ LogicalResult cloneLiftedCombineRegion(Region &source, Region &target,
   return success();
 }
 
+bool prepareVectorAccumulation(ReduceOp reduce,
+                               ArrayRef<FragmentType> accumulatorTypes,
+                               Region &combine) {
+  ValueRange identities = reduce.getInputs().slice(
+      reduce.getSourceCount(), reduce.getIdentityCount());
+  ValueRange captures = reduce.getInputs().drop_front(
+      reduce.getSourceCount() + reduce.getIdentityCount());
+  if (!llvm::all_of(captures, [](Value capture) {
+        return isa<IntegerType, FloatType, IndexType>(capture.getType());
+      }) ||
+      !llvm::all_of(llvm::enumerate(accumulatorTypes), [&](auto component) {
+        FragmentType type = component.value();
+        Type element = type.getElementType();
+        auto identity = scalarSource(identities[component.index()]);
+        return isa<IntegerType, FloatType, IndexType>(element) &&
+               succeeded(identity) && (*identity).getType() == element &&
+               dataElementType(reduce.getResult(component.index()).getType()) ==
+                   element &&
+               sameExecutionSchema(type, accumulatorTypes.front());
+      }))
+    return false;
+  SmallVector<Type> types(accumulatorTypes.begin(), accumulatorTypes.end());
+  std::string reason;
+  return succeeded(
+      cloneLiftedCombineRegion(reduce.getCombine(), combine, types, reason));
+}
+
 FragmentType eraseFragmentAxes(FragmentType source,
                                ArrayRef<int64_t> erasedAxes) {
   SmallVector<Attribute> shape;
@@ -2159,13 +2185,59 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
   }
   OpBuilder builder(reduce);
   Location location = reduce.getLoc();
+  SmallVector<FragmentType> accumulatorTypes;
+  if (blockOuterAxis)
+    for (const SourcePlan &plan : plans)
+      accumulatorTypes.push_back(eraseFragmentAxes(
+          replaceExtent(cast<FragmentType>(plan.source.getType()), outerAxis,
+                        outerSliceExtent),
+          retainedInnerAxes));
+  Region vectorCombine;
+  bool vectorAccumulation =
+      blockOuterAxis &&
+      prepareVectorAccumulation(reduce, accumulatorTypes, vectorCombine);
+  // Retain outer-axis partials across chunks and reduce those lanes once.
+  SmallVector<Value> loopInitials(identities);
+  if (vectorAccumulation) {
+    loopInitials.clear();
+    for (auto [identity, type] : llvm::zip(identities, accumulatorTypes))
+      loopInitials.push_back(builder.create<SplatOp>(
+          location, type, *scalarSource(identity)));
+  }
+  unsigned outerResultAxis = 0;
+  for (unsigned axis = 0; axis < outerAxis; ++axis)
+    if (!llvm::is_contained(retainedInnerAxes, static_cast<int64_t>(axis)))
+      ++outerResultAxis;
+  auto reduceOuterAxis = [&](OpBuilder &at, Location loc,
+                             ValueRange sources) {
+    SmallVector<Value> inputs(sources);
+    inputs.append(identities.begin(), identities.end());
+    inputs.append(captures.begin(), captures.end());
+    OperationState state(loc, ReduceOp::getOperationName());
+    state.addOperands(inputs);
+    state.addTypes(reduce.getResultTypes());
+    state.addAttribute("axes", DenseI64ArrayAttr::get(
+                                   reduce.getContext(),
+                                   {static_cast<int64_t>(outerResultAxis)}));
+    state.addAttribute("source_count", reduce->getAttr("source_count"));
+    state.addAttribute("identity_count", reduce->getAttr("identity_count"));
+    state.addAttribute("capture_count", reduce->getAttr("capture_count"));
+    state.addRegion();
+    auto outerReduce = cast<ReduceOp>(at.create(state));
+    if (Attribute origin = reduce->getAttr(originAttr))
+      outerReduce->setAttr(originAttr, origin);
+    IRMapping mapping;
+    reduce.getCombine().cloneInto(&outerReduce.getCombine(), mapping);
+    return SmallVector<Value>(outerReduce.getResults().begin(),
+                              outerReduce.getResults().end());
+  };
   bool bodyFailed = false;
   std::string failureReason;
   Value outerLoopStep =
       blockOuterAxis ? outerChunk.getResult() : master->range.getStep();
   auto loop = builder.create<scf::ForOp>(
       location, master->range.getLogicalStart(),
-      master->range.getLogicalStop(), outerLoopStep, identities,
+      master->range.getLogicalStop(), outerLoopStep, loopInitials,
       [](OpBuilder &, Location, Value, ValueRange) {});
   // Replay analyses require the new values to belong to the current kernel.
   // A ForOp build callback runs before the loop is attached to that kernel.
@@ -2482,46 +2554,15 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
 
         SmallVector<Value> summaries(innerReduce.getResults().begin(),
                                      innerReduce.getResults().end());
-        if (blockOuterAxis) {
-          unsigned outerResultAxis = 0;
-          for (unsigned axis = 0; axis < outerAxis; ++axis)
-            if (!llvm::is_contained(retainedInnerAxes,
-                                    static_cast<int64_t>(axis)))
-              ++outerResultAxis;
-          SmallVector<Value> outerInputs(summaries);
-          outerInputs.append(identities.begin(), identities.end());
-          outerInputs.append(captures.begin(), captures.end());
-          OperationState outerState(nestedLocation,
-                                    ReduceOp::getOperationName());
-          outerState.addOperands(outerInputs);
-          outerState.addTypes(reduce.getResultTypes());
-          outerState.addAttribute(
-              "axes", DenseI64ArrayAttr::get(
-                          reduce.getContext(),
-                          ArrayRef<int64_t>{
-                              static_cast<int64_t>(outerResultAxis)}));
-          outerState.addAttribute("source_count",
-                                  reduce->getAttr("source_count"));
-          outerState.addAttribute("identity_count",
-                                  reduce->getAttr("identity_count"));
-          outerState.addAttribute("capture_count",
-                                  reduce->getAttr("capture_count"));
-          outerState.addRegion();
-          auto outerReduce = cast<ReduceOp>(nested.create(outerState));
-          if (Attribute origin = reduce->getAttr(originAttr))
-            outerReduce->setAttr(originAttr, origin);
-          IRMapping regionMapping;
-          reduce.getCombine().cloneInto(&outerReduce.getCombine(),
-                                        regionMapping);
-          summaries.assign(outerReduce.getResults().begin(),
-                           outerReduce.getResults().end());
-        }
+        if (blockOuterAxis && !vectorAccumulation)
+          summaries = reduceOuterAxis(nested, nestedLocation, summaries);
 
         SmallVector<Value> combineArguments(carries.begin(), carries.end());
         combineArguments.append(summaries.begin(), summaries.end());
         combineArguments.append(captures.begin(), captures.end());
         FailureOr<SmallVector<Value>> combined = inlinePureRegion(
-            nested, reduce.getCombine(), combineArguments, failureReason);
+            nested, vectorAccumulation ? vectorCombine : reduce.getCombine(),
+            combineArguments, failureReason);
         if (failed(combined)) {
           bodyFailed = true;
           return;
@@ -2539,8 +2580,12 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
   if (Attribute origin = reduce->getAttr(originAttr))
     loop->setAttr(originAttr, origin);
   loop->setAttr(reductionSourcesAttr, reductionSources(reduce));
+  SmallVector<Value> realizedResults(loop.getResults().begin(),
+                                     loop.getResults().end());
+  if (vectorAccumulation)
+    realizedResults = reduceOuterAxis(builder, location, realizedResults);
   for (auto [oldResult, newResult] :
-       llvm::zip(reduce.getResults(), loop.getResults()))
+       llvm::zip(reduce.getResults(), realizedResults))
     oldResult.replaceAllUsesWith(newResult);
   reduce.erase();
   eraseDeadPhysicalValues(kernel);
@@ -2707,23 +2752,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
       reduce.getSourceCount() + reduce.getIdentityCount());
 
   Region vectorCombine;
-  bool vectorAccumulation = llvm::all_of(captures, [](Value capture) {
-    return isa<IntegerType, FloatType, IndexType>(capture.getType());
-  }) && llvm::all_of(llvm::enumerate(blockedSourceTypes), [&](auto component) {
-    FragmentType type = component.value();
-    Type element = type.getElementType();
-    auto identity = scalarSource(identities[component.index()]);
-    return isa<IntegerType, FloatType, IndexType>(element) &&
-           succeeded(identity) && (*identity).getType() == element &&
-           dataElementType(reduce.getResult(component.index()).getType()) == element &&
-           sameExecutionSchema(type, blockedSourceTypes.front());
-  });
-  if (vectorAccumulation) {
-    SmallVector<Type> accumulatorTypes(blockedSourceTypes.begin(), blockedSourceTypes.end());
-    std::string reason;
-    vectorAccumulation = succeeded(cloneLiftedCombineRegion(
-        reduce.getCombine(), vectorCombine, accumulatorTypes, reason));
-  }
+  bool vectorAccumulation =
+      prepareVectorAccumulation(reduce, blockedSourceTypes, vectorCombine);
 
   SmallVector<Value> loopInitials(identities);
   if (vectorAccumulation) {
