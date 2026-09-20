@@ -207,7 +207,8 @@ int main(int argc, char **argv) {
       computeCapabilityMajor,
       computeCapabilityMinor,
       matrixUnits,
-      dynamicVectorWidth};
+      dynamicVectorWidth,
+      target == TargetKind::Triton};
   if (mlir::failed(intent::lowerCanonicalKIRToGPU(*module, capabilities))) {
     llvm::errs() << "Intent KIR-to-GPU construction failed\n";
     return exitCode(ExitCode::PhysicalProgram);

@@ -15,6 +15,7 @@ struct GPUCapabilities {
   int64_t computeCapabilityMinor;
   bool matrixUnits;
   bool dynamicVectorWidth;
+  bool nativeTupleReductions;
 };
 
 /// Consumes canonical KIR and replaces it with one complete conservative

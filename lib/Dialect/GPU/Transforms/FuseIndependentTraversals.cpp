@@ -58,6 +58,38 @@ bool collectViewReads(scf::ForOp loop, bool allowScratchWrites,
   }).wasInterrupted();
 }
 
+bool hoistInputsBefore(Operation *first, Operation *second,
+                       func::FuncOp kernel) {
+  DominanceInfo dominance(kernel);
+  SmallVector<Operation *> hoist;
+  llvm::DenseSet<Value> visited;
+  std::function<bool(Value)> availableBeforeFirst = [&](Value value) {
+    if (dominance.properlyDominates(value, first))
+      return true;
+    if (!visited.insert(value).second)
+      return true;
+    Operation *producer = value.getDefiningOp();
+    if (!producer || producer->getBlock() != first->getBlock() ||
+        !first->isBeforeInBlock(producer) ||
+        !producer->isBeforeInBlock(second) || producer->getNumRegions() ||
+        !isMemoryEffectFree(producer) ||
+        !llvm::all_of(producer->getOperands(), availableBeforeFirst))
+      return false;
+    if (!llvm::is_contained(hoist, producer))
+      hoist.push_back(producer);
+    return true;
+  };
+  llvm::SetVector<Value> captures;
+  for (Region &region : second->getRegions())
+    getUsedValuesDefinedAbove(region, region, captures);
+  if (!llvm::all_of(second->getOperands(), availableBeforeFirst) ||
+      !llvm::all_of(captures, availableBeforeFirst))
+    return false;
+  for (Operation *operation : hoist)
+    operation->moveBefore(first);
+  return true;
+}
+
 bool tryFuse(scf::ForOp first, scf::ForOp second, func::FuncOp kernel,
              ArrayAttr tuples) {
   if (first->getBlock() != second->getBlock() ||
@@ -89,32 +121,8 @@ bool tryFuse(scf::ForOp first, scf::ForOp second, func::FuncOp kernel,
     if (!isMemoryEffectFree(operation))
       return false;
 
-  DominanceInfo dominance(kernel);
-  SmallVector<Operation *> hoist;
-  llvm::DenseSet<Value> visited;
-  std::function<bool(Value)> availableBeforeFirst = [&](Value value) {
-    if (dominance.properlyDominates(value, first))
-      return true;
-    if (!visited.insert(value).second)
-      return true;
-    Operation *producer = value.getDefiningOp();
-    if (!producer || producer->getBlock() != first->getBlock() ||
-        !first->isBeforeInBlock(producer) ||
-        !producer->isBeforeInBlock(second) || producer->getNumRegions() ||
-        !isMemoryEffectFree(producer) ||
-        !llvm::all_of(producer->getOperands(), availableBeforeFirst))
-      return false;
-    if (!llvm::is_contained(hoist, producer))
-      hoist.push_back(producer);
-    return true;
-  };
-  llvm::SetVector<Value> captures;
-  getUsedValuesDefinedAbove(second.getRegion(), second.getRegion(), captures);
-  if (!llvm::all_of(second->getOperands(), availableBeforeFirst) ||
-      !llvm::all_of(captures, availableBeforeFirst))
+  if (!hoistInputsBefore(first, second, kernel))
     return false;
-  for (Operation *operation : hoist)
-    operation->moveBefore(first);
 
   // The complete candidate set proves equal granularity even when the two
   // traversals retain distinct parameter roles in their fragment schemas.
@@ -133,7 +141,123 @@ bool tryFuse(scf::ForOp first, scf::ForOp second, func::FuncOp kernel,
   return true;
 }
 
+ReduceOp tryFuse(ReduceOp first, ReduceOp second, func::FuncOp kernel) {
+  if (first->getBlock() != second->getBlock() ||
+      !first->isBeforeInBlock(second) || first.getAxes() != second.getAxes())
+    return {};
+  auto shape = dyn_cast<FragmentType>(first.getInputs().front().getType());
+  if (!shape)
+    return {};
+  for (ReduceOp reduce : {first, second}) {
+    for (NamedAttribute attribute : reduce->getDiscardableAttrs())
+      if (attribute.getName() != originAttr)
+        return {};
+    for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+      auto type = dyn_cast<FragmentType>(source.getType());
+      if (!type || type.getShape() != shape.getShape() ||
+          type.getAxisMaps() != shape.getAxisMaps() ||
+          type.getValidity() != shape.getValidity() ||
+          type.getOwner() != shape.getOwner())
+        return {};
+    }
+  }
+  if (!hoistInputsBefore(first, second, kernel))
+    return {};
+
+  unsigned count = first.getSourceCount() + second.getSourceCount();
+  SmallVector<Value> sources, identities, captures;
+  SmallVector<Type> results;
+  for (ReduceOp reduce : {first, second}) {
+    llvm::append_range(sources,
+                       reduce.getInputs().take_front(reduce.getSourceCount()));
+    llvm::append_range(identities, reduce.getInputs().slice(
+                                      reduce.getSourceCount(),
+                                      reduce.getIdentityCount()));
+    llvm::append_range(captures, reduce.getInputs().take_back(
+                                    reduce.getCaptureCount()));
+    llvm::append_range(results, reduce.getResultTypes());
+  }
+  OpBuilder builder(first);
+  Location location = builder.getFusedLoc({first.getLoc(), second.getLoc()});
+  OperationState state(location, ReduceOp::getOperationName());
+  state.addOperands(sources);
+  state.addOperands(identities);
+  state.addOperands(captures);
+  state.addTypes(results);
+  state.addAttribute("axes", first.getAxesAttr());
+  state.addAttribute("source_count", builder.getI64IntegerAttr(count));
+  state.addAttribute("identity_count", builder.getI64IntegerAttr(count));
+  state.addAttribute("capture_count",
+                     builder.getI64IntegerAttr(captures.size()));
+  if (Attribute origin = first->getAttr(originAttr))
+    state.addAttribute(originAttr, origin);
+  state.addRegion();
+  auto fused = cast<ReduceOp>(builder.create(state));
+  SmallVector<Type> arguments(results);
+  llvm::append_range(arguments, results);
+  for (Value capture : captures)
+    arguments.push_back(capture.getType());
+  Block *body = builder.createBlock(&fused.getCombine(), {}, arguments,
+                                    SmallVector<Location>(arguments.size(),
+                                                          location));
+  SmallVector<Value> yields;
+  unsigned componentOffset = 0, captureOffset = 0;
+  for (ReduceOp reduce : {first, second}) {
+    Block &combine = reduce.getCombine().front();
+    unsigned size = reduce.getSourceCount();
+    IRMapping mapping;
+    for (unsigned index = 0; index < size; ++index) {
+      mapping.map(combine.getArgument(index),
+                  body->getArgument(componentOffset + index));
+      mapping.map(combine.getArgument(size + index),
+                  body->getArgument(count + componentOffset + index));
+    }
+    for (unsigned index = 0; index < reduce.getCaptureCount(); ++index)
+      mapping.map(combine.getArgument(2 * size + index),
+                  body->getArgument(2 * count + captureOffset + index));
+    for (Operation &operation : combine.without_terminator())
+      builder.clone(operation, mapping);
+    for (Value value : combine.getTerminator()->getOperands())
+      yields.push_back(mapping.lookupOrDefault(value));
+    componentOffset += size;
+    captureOffset += reduce.getCaptureCount();
+  }
+  builder.create<YieldOp>(location, yields);
+  first->replaceAllUsesWith(fused.getResults().take_front(first.getNumResults()));
+  second->replaceAllUsesWith(fused.getResults().take_back(second.getNumResults()));
+  first.erase();
+  second.erase();
+  return fused;
+}
+
 } // namespace
+
+LogicalResult fuseIndependentReductions(ModuleOp module) {
+  FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);
+  if (failed(physicalKernel))
+    return failure();
+  func::FuncOp kernel = *physicalKernel;
+  if (!kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr)
+           .getNativeTupleReductions())
+    return success();
+  kernel.walk<WalkOrder::PostOrder>([&](Block *block) {
+    SmallVector<ReduceOp> reductions(block->getOps<ReduceOp>());
+    for (unsigned first = 0; first < reductions.size(); ++first) {
+      if (!reductions[first])
+        continue;
+      for (unsigned second = first + 1; second < reductions.size(); ++second) {
+        if (!reductions[second])
+          continue;
+        if (ReduceOp fused =
+                tryFuse(reductions[first], reductions[second], kernel)) {
+          reductions[first] = fused;
+          reductions[second] = {};
+        }
+      }
+    }
+  });
+  return success();
+}
 
 LogicalResult fuseIndependentTraversals(ModuleOp module) {
   FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);

@@ -119,7 +119,8 @@ LogicalResult materializeRetainedValueGroup(ModuleOp module, func::FuncOp kernel
 }
 
 LogicalResult realizeReductionGroup(ModuleOp module, func::FuncOp kernel) {
-  if (failed(realizeReductionBlocking(module)) ||
+  if (failed(fuseIndependentReductions(module)) ||
+      failed(realizeReductionBlocking(module)) ||
       failed(alignAggregateValueRelations(kernel)) ||
       failed(alignAccessResultRelations(kernel)) ||
       failed(alignReductionResultRelations(kernel)) ||
