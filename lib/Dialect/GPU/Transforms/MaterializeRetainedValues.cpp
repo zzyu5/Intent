@@ -356,7 +356,9 @@ bool materializeLoopState(scf::ForOp loop, func::FuncOp kernel) {
   return false;
 }
 
-FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
+FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
+                                                func::FuncOp kernel,
+                                                unsigned chunkAxis) {
   auto payload = dyn_cast<FragmentType>(store.getValue().getType());
   auto output = dyn_cast<ViewType>(store.getResource().getType());
   auto buffer = dyn_cast<BufferType>(store.getResource().getType());
@@ -479,42 +481,33 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
       return false;
     rootBindings.emplace_back(root, *selected);
   }
-  std::optional<unsigned> chunkAxis;
   SmallVector<MakeRangeOp> chunkRoots;
-  for (unsigned candidate = 0; candidate < ranges.size(); ++candidate) {
-    SmallVector<MakeRangeOp> candidateRoots;
-    for (auto [root, axis] : rootBindings)
-      if (axis == candidate && !llvm::is_contained(candidateRoots, root))
-        candidateRoots.push_back(root);
-    bool independent = llvm::all_of(visited, [&](Operation *producer) {
-      auto reduce = dyn_cast<ReduceOp>(producer);
-      if (!reduce)
-        return true;
-      return llvm::all_of(
-          reduce.getInputs().take_front(reduce.getSourceCount()), [&](Value input) {
-            auto axes = analysis.rangeAxes(input, candidateRoots);
-            return axes.isExact() && llvm::none_of(axes.fragmentAxes, [&](unsigned axis) {
-              return llvm::is_contained(reduce.getAxes(), axis);
-            });
+  for (auto [root, axis] : rootBindings)
+    if (axis == chunkAxis && !llvm::is_contained(chunkRoots, root))
+      chunkRoots.push_back(root);
+  bool independent = llvm::all_of(visited, [&](Operation *producer) {
+    auto reduce = dyn_cast<ReduceOp>(producer);
+    if (!reduce)
+      return true;
+    return llvm::all_of(
+        reduce.getInputs().take_front(reduce.getSourceCount()), [&](Value input) {
+          auto axes = analysis.rangeAxes(input, chunkRoots);
+          return axes.isExact() && llvm::none_of(axes.fragmentAxes, [&](unsigned axis) {
+            return llvm::is_contained(reduce.getAxes(), axis);
           });
-    });
-    if (independent) {
-      chunkAxis = candidate;
-      chunkRoots = std::move(candidateRoots);
-      break;
-    }
-  }
-  if (!chunkAxis)
+        });
+  });
+  if (!independent)
     return false;
-  PhysicalSourceAxis source = sourceAxisIdentity(ranges[*chunkAxis]);
+  PhysicalSourceAxis source = sourceAxisIdentity(ranges[chunkAxis]);
   SmallVector<std::pair<PhysicalSourceAxis, int64_t>> replayAxes;
   for (Value value : retained) {
     auto mapping = cast<AxisMapAttr>(
-        cast<FragmentType>(value.getType()).getAxisMaps()[*chunkAxis]);
+        cast<FragmentType>(value.getType()).getAxisMaps()[chunkAxis]);
     std::pair axis{sourceAxisIdentity(mapping), mapping.getDimensionId()};
     if (!llvm::is_contained(replayAxes, axis))
       replayAxes.push_back(axis);
-    auto facts = analysis.axisRanges(value, *chunkAxis);
+    auto facts = analysis.axisRanges(value, chunkAxis);
     for (MakeRangeOp root : facts.roots) {
       auto mapping = cast<AxisMapAttr>(root.getResult().getType().getAxisMaps()[0]);
       std::pair axis{sourceAxisIdentity(root), mapping.getDimensionId()};
@@ -522,13 +515,15 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
         replayAxes.push_back(axis);
     }
   }
-  auto replayAt = [&](Operation *anchor, bool &blocked) {
+  auto replayAt = [&](Operation *anchor, bool &blocked, bool allowContractions) {
     bool reads = false;
     for (Value value : retained)
       for (auto [axis, dimension] : replayAxes) {
         auto replay = analysis.replayability(value, axis,
             PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true, anchor, dimension);
         if (!replay.isReplayable())
+          return false;
+        if (!allowContractions && !replay.contractions.empty())
           return false;
         for (Operation *access : replay.accesses) {
           auto load = dyn_cast<LoadOp>(access);
@@ -550,7 +545,7 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
     if (!write || !isa<ViewType>(write.getResource().getType()))
       continue;
     bool blocked = false;
-    bool available = replayAt(write, blocked);
+    bool available = replayAt(write, blocked, /*allowContractions=*/true);
     if (available && blocked) {
       clobber = write;
       break;
@@ -570,9 +565,11 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
     // A launch-dependent full tensor has no proven register bound. Use the
     // same bounded traversal as an oversized static tensor; its workspace
     // still follows the original runtime shape and store order.
-    if (!fixed || footprint > capabilities.getRegistersPerUnit()) {
+    // The payload must leave registers for addresses and traversal state.
+    if (!fixed || footprint >= capabilities.getRegistersPerUnit()) {
       bool blocked = false;
-      if (replayAt(store, blocked))
+      // Contraction blocking owns its result footprint and program slices.
+      if (replayAt(store, blocked, /*allowContractions=*/false))
         clobber = store;
     }
   }
@@ -656,16 +653,16 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
           : ArrayRef<int64_t>{1, 2, 4, 8, 16, 32, 64});
   SmallVector<Attribute> blockedShape(payload.getShape().begin(),
                                       payload.getShape().end());
-  blockedShape[*chunkAxis] = queryLaunchExpression(chunk);
+  blockedShape[chunkAxis] = queryLaunchExpression(chunk);
   auto blocked = FragmentType::get(
       kernel.getContext(), payload.getElementType(),
       builder.getArrayAttr(blockedShape), payload.getAxisMaps(),
       payload.getValidity(), payload.getOwner());
   ReplayMaterializationOptions options;
-  options.fragmentAxis = *chunkAxis;
+  options.fragmentAxis = chunkAxis;
   options.traversalRanges = chunkRoots;
   LogicalResult initialized = buildStoreTraversal(
-      builder, store.getLoc(), ranges, rootBindings, chunk, blocked, *chunkAxis,
+      builder, store.getLoc(), ranges, rootBindings, chunk, blocked, chunkAxis,
       [&](OpBuilder &nested, IRMapping &mapping, ValueRange coordinates,
           Value valid) -> LogicalResult {
         for (const auto &entry : constantValues.getValueMap())
@@ -704,7 +701,7 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
   }
   builder.setInsertionPoint(store);
   LogicalResult copied = buildStoreTraversal(
-      builder, store.getLoc(), ranges, rootBindings, chunk, blocked, *chunkAxis,
+      builder, store.getLoc(), ranges, rootBindings, chunk, blocked, chunkAxis,
       [&](OpBuilder &nested, IRMapping &mapping, ValueRange coordinates,
           Value valid) -> LogicalResult {
         if (store.getValid() && !indirect) {
@@ -770,6 +767,18 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
   store.erase();
   eraseDeadPhysicalValues(kernel);
   return true;
+}
+
+FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
+  auto payload = dyn_cast<FragmentType>(store.getValue().getType());
+  if (!payload || payload.getShape().empty() || payload.getShape().size() > 2)
+    return false;
+  for (unsigned axis = 0; axis < payload.getShape().size(); ++axis) {
+    auto result = materializeRetainedStoreAlongAxis(store, kernel, axis);
+    if (failed(result) || *result)
+      return result;
+  }
+  return false;
 }
 
 FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) {
