@@ -610,29 +610,40 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
       return false;
   }
 
+  auto preservesUnreadChunks = [&] {
+    for (Value value : retained)
+      for (auto [axis, dimension] : replayAxes) {
+        auto replay = analysis.replayability(
+            value, axis, PhysicalReplayScope::ValueGraph,
+            /*allowAccesses=*/true, store, dimension);
+        if (!replay.isReplayable())
+          return false;
+        for (Operation *access : replay.accesses) {
+          auto load = dyn_cast<LoadOp>(access);
+          if (!load)
+            return false;
+          if (load.getResource() != store.getResource())
+            continue;
+          auto position = llvm::find(load.getSourceAxes(), chunkAxis);
+          if (position == load.getSourceAxes().end())
+            return false;
+          auto range = load.getCoordinates()[position - load.getSourceAxes().begin()]
+                           .getDefiningOp<MakeRangeOp>();
+          // Replayed destination reads must stay inside the block written by
+          // this traversal. Invariant SSA captures retain their old values.
+          if (!range || !llvm::is_contained(chunkRoots, range))
+            return false;
+        }
+      }
+    return true;
+  };
+  bool direct = buffer && !indirect && clobber == store && preservesUnreadChunks();
   OpBuilder builder(clobber);
   IRMapping constantValues;
   for (auto [original, constant] : constants)
     constantValues.map(original, builder.create<arith::ConstantOp>(
         store.getLoc(), original.getType(), constant));
   SmallVector<Value> workspaces;
-  SmallVector<Value> writeDependencies(store->getOperands().begin(),
-                                       store->getOperands().end());
-  llvm::DenseSet<Operation *> writeProducers;
-  bool readsDestination = false;
-  for (unsigned index = 0; index < writeDependencies.size(); ++index) {
-    Operation *producer = writeDependencies[index].getDefiningOp();
-    if (!producer || !writeProducers.insert(producer).second)
-      continue;
-    readsDestination |= producer->walk([&](LoadOp load) {
-      return load.getResource() == store.getResource()
-                 ? WalkResult::interrupt()
-                 : WalkResult::advance();
-    }).wasInterrupted();
-    writeDependencies.append(producer->getOperands().begin(),
-                             producer->getOperands().end());
-  }
-  bool direct = buffer && !indirect && clobber == store && !readsDestination;
   for (Value value : retained) {
     auto type = cast<FragmentType>(value.getType());
     workspaces.push_back(direct ? store.getResource() :
