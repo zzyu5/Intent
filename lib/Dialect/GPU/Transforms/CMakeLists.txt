@@ -7,6 +7,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   RealizeScanConsumers.cpp
   MaterializeRetainedValues.cpp
   VectorizeBufferLoops.cpp
+  PromoteBufferValues.cpp
   RealizeOnlineReduction.cpp
   RealizeRegionFold.cpp
   RealizeReductionBlocking.cpp
