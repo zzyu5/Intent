@@ -1107,6 +1107,32 @@ FailureOr<bool> composeIdentityFragmentGather(GatherOp gather) {
       gather.getCoordinates().size() != source.getShape().size() ||
       gather.getSourceAxes().size() != source.getShape().size())
     return false;
+  // Gather indexes fragment positions. A complete one-dimensional ordinal
+  // range is an identity even when storage and consumer use different axes.
+  if (source.getShape().size() == 1 && source.getShape() == result.getShape() &&
+      gather.getSourceAxes() == ArrayRef<int64_t>{0}) {
+    auto range = gather.getCoordinates().front().getDefiningOp<MakeRangeOp>();
+    if (range && range.getResult().getType().getShape() == result.getShape() &&
+        range.getResult().getType().getAxisMaps() == result.getAxisMaps() &&
+        isZero(range.getStart()) &&
+        isUnitStepRange(range) &&
+        queryLaunchExpression(range.getExtent()) == source.getShape()[0]) {
+      OpBuilder builder(gather);
+      auto group = ReshapeGroupAttr::get(
+          builder.getContext(), builder.getDenseI64ArrayAttr({0}),
+          builder.getDenseI64ArrayAttr({0}));
+      Value replacement = builder.create<ReshapeOp>(
+          gather.getLoc(), result, gather.getSource(), builder.getArrayAttr({group}));
+      if (gather.getValid())
+        replacement = builder.create<SelectOp>(gather.getLoc(), result,
+            gather.getValid(), replacement, gather.getFill());
+      if (Attribute origin = gather->getAttr(originAttr))
+        replacement.getDefiningOp()->setAttr(originAttr, origin);
+      gather.getResult().replaceAllUsesWith(replacement);
+      gather.erase();
+      return true;
+    }
+  }
   SmallVector<bool> represented(result.getShape().size(), false);
   for (auto [coordinate, sourceAxis] :
        llvm::zip(gather.getCoordinates(), gather.getSourceAxes())) {

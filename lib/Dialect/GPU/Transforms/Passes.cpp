@@ -170,6 +170,12 @@ LogicalResult vectorizeBufferGroup(ModuleOp module, func::FuncOp kernel) {
   return closeValueAccessRelations(kernel);
 }
 
+LogicalResult promoteBufferGroup(ModuleOp module, func::FuncOp kernel) {
+  if (failed(promoteBufferValues(module)))
+    return failure();
+  return closeValueAccessRelations(kernel);
+}
+
 LogicalResult simplifyValues(ModuleOp module, func::FuncOp) {
   if (failed(eliminateCommonValues(module)))
     return failure();
@@ -204,6 +210,7 @@ LogicalResult runTransformations(ModuleOp module, func::FuncOp kernel) {
       {"realize-contractions", realizeContractionGroup},
       {"compose-realized-accesses", composeRealizedAccesses},
       {"vectorize-buffer-loops", vectorizeBufferGroup},
+      {"promote-buffer-values", promoteBufferGroup},
       {"refine-program-mapping", refineMapping},
       {"eliminate-common-values", simplifyValues},
   };
