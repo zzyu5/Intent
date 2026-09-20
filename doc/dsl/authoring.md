@@ -66,7 +66,7 @@ Helper 可以没有返回值；函数体自然结束与裸 `return` 等价，都
 
 Runtime `if` 之后读取的名字，必须在分支前已有定义，或在每个正常继续执行的分支中赋值。不同条件之间的逻辑蕴含不会自动建立名字的定义；先初始化共同状态，再在分支中更新。
 
-Python `range` 是 domain 遍历的 shorthand，遵循正步长合同。逆序遍历使用正向 ordinal 并显式计算反向坐标，具体规则见 [core.md 的 domains 章节](core.md#3-domains-与-source-derived-subregions)。
+Kernel/helper 中的 Python `range` 是 domain 遍历的 shorthand，遵循正步长合同。即使边界都是常量，循环变量的 dtype 仍是 `I.index`，不是可按浮点上下文实例化的 Python literal；参与浮点计算前须显式 `I.cast`。逆序遍历使用正向 ordinal 并显式计算反向坐标，具体规则见 [core.md 的 domains 章节](core.md#3-domains-与-source-derived-subregions)。
 
 `I.mask(value, predicate, fill)` 等价于 `I.select(predicate, value, fill)`：predicate 为真保留 value，为假使用 fill。它只选择值，不抑制写入；对写入坐标使用 `I.mask` 会把未选中成员写到 fill 指定的地址。`I.store` 和下标赋值没有 `mask` 或 `valid` 参数。条件写入使用 scalar 条件下的 structured control，或只遍历实际参与写入的 domain/subregion；普通并行写入仍须满足目标地址不冲突的合同。
 
