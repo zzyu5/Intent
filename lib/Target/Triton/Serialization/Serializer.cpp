@@ -1380,9 +1380,15 @@ private:
       values[loop.getInductionVar()] = induction;
       for (auto [argument, name] : llvm::zip(loop.getRegionIterArgs(), results))
         values[argument] = name;
-      line("for " + induction + " in range(" + valueString(loop.getLowerBound()) +
-           ", " + valueString(loop.getUpperBound()) + ", " +
-           valueString(loop.getStep()) + "):");
+      auto unroll = loop->getAttrOfType<IntegerAttr>(
+          "intent_gpu.triton.loop_unroll_factor");
+      std::string range = unroll ? "tl.range(" : "range(";
+      range += valueString(loop.getLowerBound()) + ", " +
+               valueString(loop.getUpperBound()) + ", " +
+               valueString(loop.getStep());
+      if (unroll)
+        range += ", loop_unroll_factor=" + std::to_string(unroll.getInt());
+      line("for " + induction + " in " + range + "):");
       ++indent;
       emitBlock(*loop.getBody(), true, results);
       --indent;
