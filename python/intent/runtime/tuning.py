@@ -5,8 +5,11 @@ from dataclasses import dataclass
 
 def view_byte_span(view) -> tuple[int, int]:
     pointer = view.data_ptr()
-    if view.numel() == 0:
+    elements = view.numel()
+    if elements == 0:
         return pointer, pointer
+    if view.is_contiguous():
+        return pointer, pointer + elements * view.element_size()
     low = high = 0
     for extent, stride in zip(view.shape, view.stride()):
         displacement = (extent - 1) * stride
