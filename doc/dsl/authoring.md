@@ -22,6 +22,8 @@ Tensor 和 view 有 `.shape`；scalar、tuple、record、domain 没有统一 `.s
 
 `I.zeros`、`I.full` 和 indexed read 的结果都是不可变 tensor SSA values。下标赋值和 `I.store` 的写入目标必须是可写 view 或 logical buffer，不能原地修改这些 tensor values。Tensor carry 通过计算新 tensor 并重新绑定名字更新；逐地址写入则使用显式存储。
 
+`I.buffer` 返回可变存储对象，buffer 名字本身不是 tensor value。把其中内容用于赋值右值、pointwise 或 reduce 时，先通过下标读取为 scalar/tensor；例如 `value = state[:, :]` 读取二维 buffer 的完整内容。
+
 ### Comparison operators（比较运算）
 
 Scalar/tensor 比较使用 Python 运算符 `==`、`!=`、`<`、`<=`、`>`、`>=`，结果 dtype 为 `I.bool`。操作数按普通 literal/dtype 与尾部 broadcast 规则对齐，结果保留广播后的 shape；这些运算符不是 `I.eq` 等 intrinsic 调用。
