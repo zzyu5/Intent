@@ -4045,6 +4045,57 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
   return synchronize(kernel.front(), false, true, pending);
 }
 
+void selectOrderedLoadUnrolling(func::FuncOp kernel) {
+  UniformValueAnalysis constants(gpu::describeUniformValue);
+  auto integer = [&](Value value) {
+    return dyn_cast_or_null<IntegerAttr>(constants.evaluate(value));
+  };
+  kernel.walk([&](scf::ForOp loop) {
+    if (loop.getNumResults() != 1 ||
+        !isa<FloatType>(gpu::uniformElementType(loop.getResult(0).getType())))
+      return;
+    auto lower = integer(loop.getLowerBound());
+    auto step = integer(loop.getStep());
+    if (!lower || !lower.getValue().isZero() || !step ||
+        !step.getValue().isOne() ||
+        !gpu::queryNonNegativeIndexUpperBound(loop.getUpperBound()))
+      return;
+    if (auto upper = integer(loop.getUpperBound());
+        upper && upper.getValue().sle(16))
+      return;
+
+    unsigned loads = 0;
+    bool product = false;
+    Value carry = loop.getRegionIterArgs().front();
+    for (Operation &operation : loop.getBody()->without_terminator()) {
+      if (operation.getNumRegions() ||
+          isa<gpu::ContractOp, gpu::ScaledContractOp, gpu::SparseContractOp,
+              gpu::HistogramOp>(operation))
+        return;
+      if (auto load = dyn_cast<gpu::LoadOp>(operation)) {
+        for (Value operand : load->getOperands()) {
+          llvm::SmallDenseSet<Value, 32> visited;
+          if (valueDependsOn(operand, carry, loop, visited))
+            return;
+        }
+        ++loads;
+      } else if (!isMemoryEffectFree(&operation)) {
+        return;
+      }
+      if (auto binary = dyn_cast<gpu::BinaryOp>(operation))
+        product |= binary.getOperatorKind() == BinaryOperator::Multiply &&
+                   isa<FloatType>(
+                       gpu::uniformElementType(binary.getResult().getType()));
+    }
+    if (loads != 2 || !product)
+      return;
+    // Native unrolling preserves the accumulator chain and handles the tail;
+    // independent reads from later iterations can overlap the current update.
+    loop->setAttr("intent_gpu.triton.loop_unroll_factor",
+                  IntegerAttr::get(IntegerType::get(kernel.getContext(), 32), 4));
+  });
+}
+
 } // namespace
 
 LogicalResult verifyTritonProgram(ModuleOp module) {
@@ -4219,8 +4270,10 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
     assumption.erase();
   if (failed(gpu::eliminateCommonValues(module)) ||
       failed(legalizeCollectiveCallbacks(kernel)) ||
-      failed(materializeDeferredResourceBounds(kernel)) ||
-      failed(verifyTritonProgram(module)))
+      failed(materializeDeferredResourceBounds(kernel)))
+    return failure();
+  selectOrderedLoadUnrolling(kernel);
+  if (failed(verifyTritonProgram(module)))
     return failure();
   kernel->setAttr(legalizedAttr, UnitAttr::get(module.getContext()));
   return success();
