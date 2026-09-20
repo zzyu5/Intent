@@ -38,7 +38,7 @@ Passes查询features而不是匹配设备名称。SM90、SM100、SM120或gfx fam
 
 设计local form前先核对source与provider的operation合同。合同相同且provider已有原生primitive时，优先直接映射；不能因为Intent内部helper的组织方式，重新分类或实现provider已负责的reduce/scan tree、thread communication或layout strategy。额外更强的顺序或数值要求须有明确作者语义依据，不能从现有lowering或旧文档的偶然限制反推必要性。
 
-显式近似数学与 FTZ 属于已有 unary/binary operation 的共同数值语义，不为 provider API 名称另建 dialect。Provider legality 检查 dtype 与硬件能力；serialization 机械发出满足该数值属性的原语或原语包装，不开启影响整份 kernel 的 fast-math 编译选项。Cloning、bufferization 和 scalarization 必须保留这两个属性；普通运算的既有 lowering 不因相邻操作 opt-in 而改变。
+显式近似数学与 FTZ 属于已有 unary/binary operation 的共同数值语义，不为 provider API 名称另建 dialect。Provider legality 检查 dtype 与硬件能力；serialization 机械发出满足该数值属性的原语或原语包装，不得把逐操作 opt-in 扩大为影响整份 kernel 的 fast-math 选项。Cloning、bufferization 和 scalarization 必须保留这两个属性；普通运算的既有 lowering 不因相邻操作 opt-in 而改变。
 
 ## 4. Triton
 
@@ -56,6 +56,8 @@ Passes查询features而不是匹配设备名称。SM90、SM100、SM120或gfx fam
 - structured control → Python/Triton structured control。
 
 普通reduce已经声明结合交换合同，provider无需从combine body重新证明该合同，也无需额外生成保序树或Scan+terminal路径。Triton的默认promotion、NaN规则或dot精度不一定等于Intent合同：先用已确定的类型转换、callback与原生精度选项闭合差异，不将“直接映射”理解为盲用默认参数，也不复制外部compiler的内部instruction dtype。
+
+普通浮点乘加按[数值合同](../dsl/types-numerics-and-effects.md#55-普通乘加的fma融合)使用Triton的`enable_fp_fusion=True`，由其LLVM/PTX lowering形成合法FMA；不另建乘加识别路径或调优参数。该开关独立于任意重结合、dot输入精度和FTZ；libdevice的FTZ reflection保持关闭。显式数值cast和operation规定的独立舍入边界必须由相应lowering保留，不能因开启普通FMA而消失。
 
 Triton-local form可以包括真正影响source program的descriptor value/access、某些provider compile-time branches与Config binding。若pointer/descriptor只是终端spelling差异，可直接serialize；若descriptor选择改变operands、static block constraints并被多个passes消费，则用local extension op表达。
 
