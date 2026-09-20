@@ -1956,8 +1956,8 @@ SmallVector<int64_t> eraseAxis(ArrayRef<int64_t> axes, unsigned erasedAxis) {
 }
 
 bool collapseMultiReductionContract(ContractOp contract) {
-  ArrayRef<int64_t> lhsAxes = contract.getLhsReductionAxes();
-  ArrayRef<int64_t> rhsAxes = contract.getRhsReductionAxes();
+  SmallVector<int64_t> lhsAxes(contract.getLhsReductionAxes());
+  SmallVector<int64_t> rhsAxes(contract.getRhsReductionAxes());
   if (lhsAxes.size() <= 1 || lhsAxes.size() != rhsAxes.size() ||
       !contract.getLhsBatchAxes().empty() || !contract.getRhsBatchAxes().empty())
     return false;
@@ -1988,6 +1988,7 @@ bool collapseMultiReductionContract(ContractOp contract) {
       }
     }
   }
+  SmallVector<PhysicalExprAttr> reductionExtents;
   for (auto [lhsAxis, rhsAxis] : llvm::zip(lhsAxes, rhsAxes)) {
     SmallVector<MakeRangeOp> paired;
     for (auto [operand, axis] :
@@ -2012,6 +2013,32 @@ bool collapseMultiReductionContract(ContractOp contract) {
     }
     if (!analysis.lockstepRanges(paired).isExact())
       return false;
+    reductionExtents.push_back(
+        queryLaunchExpression(paired.front().getLogicalStop()));
+  }
+
+  // Put a complete power-of-two tile inside a non-power-of-two outer group.
+  // The outer coordinates then stay constant across aligned K lanes, allowing
+  // the provider's axis analysis to share their delinearization arithmetic.
+  auto tail = reductionExtents.back();
+  if (tail.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+      tail.getValue() > 0 && !llvm::isPowerOf2_64(tail.getValue())) {
+    unsigned inner = lhsAxes.size() - 1;
+    int64_t largest = 0;
+    for (auto [position, extent] : llvm::enumerate(reductionExtents)) {
+      if (extent.getKind() !=
+              static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+          extent.getValue() < contractionReductionCandidates[0] ||
+          !llvm::isPowerOf2_64(extent.getValue()) ||
+          extent.getValue() <= largest)
+        continue;
+      inner = position;
+      largest = extent.getValue();
+    }
+    std::rotate(lhsAxes.begin() + inner, lhsAxes.begin() + inner + 1,
+                lhsAxes.end());
+    std::rotate(rhsAxes.begin() + inner, rhsAxes.begin() + inner + 1,
+                rhsAxes.end());
   }
 
   auto [sourceId, dimensionId] = nextPhysicalAxisIdentities(kernel);
@@ -2026,8 +2053,8 @@ bool collapseMultiReductionContract(ContractOp contract) {
                                       static_cast<int64_t>(entry.index());
         });
     if (!contiguous) {
-      // Preserve free-axis order and the order of paired reductions. The
-      // permutation makes their existing exact ranges one collapsible group.
+      // Preserve free-axis order and use the same paired-reduction order on
+      // both operands to make their exact ranges one collapsible group.
       SmallVector<int64_t> permutation;
       for (unsigned axis = 0; axis < source.getShape().size(); ++axis)
         if (!llvm::is_contained(reductions, static_cast<int64_t>(axis)))
