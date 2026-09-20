@@ -134,7 +134,7 @@ def IntentGPU_ViewLayoutAttr : AttrDef<IntentGPU_Dialect, "ViewLayout"> {
 
 def IntentGPU_CapabilitiesAttr : AttrDef<IntentGPU_Dialect, "Capabilities"> {
   let mnemonic = "capabilities";
-  let summary = "Selected GPU hardware resources used by shared legality";
+  let summary = "Selected GPU resources and provider primitives used by shared lowering";
   let parameters = (ins
     "int64_t":$computeUnits,
     "int64_t":$sharedMemoryPerUnit,
@@ -144,10 +144,11 @@ def IntentGPU_CapabilitiesAttr : AttrDef<IntentGPU_Dialect, "Capabilities"> {
     "int64_t":$computeCapabilityMajor,
     "int64_t":$computeCapabilityMinor,
     "bool":$matrixUnits,
-    "bool":$dynamicVectorWidth
+    "bool":$dynamicVectorWidth,
+    "bool":$nativeTupleReductions
   );
   let assemblyFormat =
-      "`<` $computeUnits `,` $sharedMemoryPerUnit `,` $maxDynamicSharedMemoryPerBlock `,` $registersPerUnit `,` $maxThreadsPerBlock `,` $computeCapabilityMajor `,` $computeCapabilityMinor `,` $matrixUnits `,` $dynamicVectorWidth `>`";
+      "`<` $computeUnits `,` $sharedMemoryPerUnit `,` $maxDynamicSharedMemoryPerBlock `,` $registersPerUnit `,` $maxThreadsPerBlock `,` $computeCapabilityMajor `,` $computeCapabilityMinor `,` $matrixUnits `,` $dynamicVectorWidth `,` $nativeTupleReductions `>`";
   let genVerifyDecl = 1;
 }
 

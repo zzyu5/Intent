@@ -386,9 +386,10 @@ LogicalResult CapabilitiesAttr::verify(
     int64_t sharedMemoryPerUnit, int64_t maxDynamicSharedMemoryPerBlock,
     int64_t registersPerUnit, int64_t maxThreadsPerBlock,
     int64_t computeCapabilityMajor, int64_t computeCapabilityMinor,
-    bool matrixUnits, bool dynamicVectorWidth) {
+    bool matrixUnits, bool dynamicVectorWidth, bool nativeTupleReductions) {
   (void)matrixUnits;
   (void)dynamicVectorWidth;
+  (void)nativeTupleReductions;
   if (computeUnits <= 0 || sharedMemoryPerUnit <= 0 ||
       maxDynamicSharedMemoryPerBlock <= 0 || registersPerUnit <= 0 ||
       maxThreadsPerBlock <= 0 || computeCapabilityMajor <= 0 ||

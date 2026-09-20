@@ -159,6 +159,7 @@ mlir::LogicalResult realizePointwiseOwnership(mlir::ModuleOp module);
 mlir::LogicalResult realizePointwiseBlocking(mlir::ModuleOp module);
 mlir::LogicalResult refineProgramMapping(mlir::ModuleOp module);
 mlir::LogicalResult eliminateCommonValues(mlir::ModuleOp module);
+mlir::LogicalResult fuseIndependentReductions(mlir::ModuleOp module);
 mlir::LogicalResult fuseIndependentTraversals(mlir::ModuleOp module);
 mlir::LogicalResult materializeSharedConfigTuples(mlir::func::FuncOp kernel,
                                                  const TuningProfiles &profiles);
