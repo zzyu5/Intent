@@ -4,6 +4,11 @@ This is forward execution, not autograd. Do not change the task, dtype, output
 structure, numerical tolerance, or observable out/alias behavior.
 Preserve computation stages and intermediate dtypes explicitly required by TASK.md.
 Algebraic equivalence alone does not preserve a stated floating-point contract.
+A mathematical formula alone does not require separately rounded intermediates.
+Unless TASK.md explicitly fixes intermediate dtypes, evaluation order or observable
+stages, choose an organization satisfying its logical result and accuracy contract.
+The language's numerical rules govern the program you write and its compilation,
+not the reference library's internal implementation.
 Choose the algorithm for the complete invocation before writing the kernels.
 Assess its independent work, data dependencies, total computation, intermediate
 memory traffic and the combined cost of all kernel invocations. Internal kernel
