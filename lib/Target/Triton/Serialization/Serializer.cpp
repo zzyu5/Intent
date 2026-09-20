@@ -515,6 +515,8 @@ private:
         emitHelper(operation, reduce.getCombine(), "reduce");
       else if (auto scan = dyn_cast<ScanOp>(operation))
         emitHelper(operation, scan.getCombine(), "scan");
+      else if (auto map = dyn_cast<MapElementwiseOp>(operation))
+        emitHelper(operation, map.getBody(), "map");
     });
   }
 
@@ -1085,6 +1087,13 @@ private:
       assign(select.getResult(), "tl.where(" + valueString(select.getCondition()) +
                                       ", " + valueString(select.getTrueValue()) +
                                       ", " + valueString(select.getFalseValue()) + ")");
+      return;
+    }
+    if (auto map = dyn_cast<MapElementwiseOp>(operation)) {
+      std::string call = "tl.map_elementwise(" + helperNames[&operation].front();
+      for (Value input : map.getInputs())
+        call += ", " + controlValueString(input);
+      assign(map.getResult(), call + ")");
       return;
     }
     if (auto reshape = dyn_cast<gpu::ReshapeOp>(operation)) {

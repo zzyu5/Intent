@@ -134,4 +134,13 @@ class IntentTriton_ElementwiseCollective<string mnemonic> :
 def IntentTriton_ReduceOp : IntentTriton_ElementwiseCollective<"reduce">;
 def IntentTriton_ScanOp : IntentTriton_ElementwiseCollective<"scan">;
 
+def IntentTriton_MapElementwiseOp : IntentTriton_Op<"map_elementwise", [
+    IsolatedFromAbove, RecursiveMemoryEffects
+  ]> {
+  let arguments = (ins Variadic<IntentGPU_DataValue>:$inputs);
+  let results = (outs IntentGPU_FragmentValue:$result);
+  let regions = (region SizedRegion<1>:$body);
+  let hasVerifier = 1;
+}
+
 #endif
