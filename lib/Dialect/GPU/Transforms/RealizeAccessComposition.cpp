@@ -821,7 +821,7 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
   }
   auto sourceLoad = loaded.getDefiningOp<LoadOp>();
   if (!sourceType || !sourceLoad ||
-      !isa<ViewType>(sourceLoad.getResource().getType()) ||
+      !isa<ViewType, BufferType>(sourceLoad.getResource().getType()) ||
       !canReplayReadAt(sourceLoad, gather))
     return false;
   if (gather.getCoordinates().size() != gather.getSourceAxes().size()) {

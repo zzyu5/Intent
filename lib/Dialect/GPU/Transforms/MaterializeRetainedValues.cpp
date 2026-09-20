@@ -204,6 +204,158 @@ LogicalResult buildStoreTraversal(OpBuilder &builder, Location location,
   return emit(builder, mapping, coordinates, valid);
 }
 
+bool hasLaunchUniformBounds(scf::ForOp loop, func::FuncOp kernel) {
+  return llvm::all_of(
+      ValueRange{loop.getLowerBound(), loop.getUpperBound(), loop.getStep()},
+      [&](Value bound) { return isLaunchUniformScalar(bound, kernel); });
+}
+
+bool materializeLoopState(scf::ForOp loop, func::FuncOp kernel) {
+  if (loop->hasAttr(reductionSourcesAttr) || !hasLaunchUniformBounds(loop, kernel))
+    return false;
+  for (Operation *parent = loop->getParentOp(); parent != kernel;
+       parent = parent->getParentOp()) {
+    auto branch = dyn_cast<scf::IfOp>(parent);
+    if (!branch || !isLaunchUniformScalar(branch.getCondition(), kernel))
+      return false;
+  }
+  auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+  for (auto [slot, initial] : llvm::enumerate(loop.getInitArgs())) {
+    auto type = dyn_cast<FragmentType>(initial.getType());
+    if (!type || type.getShape().empty() || type.getShape().size() > 2)
+      continue;
+    __int128 words = type.getElementType().isIndex()
+                         ? 2
+                         : std::max(1u, (type.getElementType().getIntOrFloatBitWidth() + 31) / 32);
+    bool fixed = true;
+    for (Attribute attribute : type.getShape()) {
+      auto extent = cast<PhysicalExprAttr>(attribute);
+      if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+          extent.getValue() <= 0) {
+        fixed = false;
+        break;
+      }
+      if (words <= capabilities.getRegistersPerUnit())
+        words *= extent.getValue();
+    }
+    if (!fixed || words <= capabilities.getRegistersPerUnit())
+      continue;
+
+    PhysicalProgramAnalysis analysis(kernel);
+    DominanceInfo dominance(kernel);
+    bool completeRanges = true;
+    for (auto [axis, attribute] : llvm::enumerate(type.getShape())) {
+      auto map = cast<AxisMapAttr>(type.getAxisMaps()[axis]);
+      auto facts = analysis.axisRanges(initial, axis);
+      auto range = queryExactLogicalRange(facts);
+      if (failed(range) || !analysis.lockstepRanges(facts.roots).isExact() ||
+          !dominance.dominates((*range).getResult(), loop) ||
+          !isZero((*range).getStart()) || !isZero((*range).getLogicalStart()) ||
+          !isUnitStepRange(*range) ||
+          queryLaunchExpression((*range).getExtent()) != attribute ||
+          queryLaunchExpression((*range).getLogicalStop()) != attribute ||
+          !(sourceAxisIdentity(*range) == sourceAxisIdentity(map))) {
+        completeRanges = false;
+        break;
+      }
+      auto dimension = queryRangeDimension(*range);
+      if (failed(dimension) || *dimension != map.getDimensionId()) {
+        completeRanges = false;
+        break;
+      }
+      for (unsigned prior = 0; prior < axis; ++prior)
+        if (sourceAxisIdentity(cast<AxisMapAttr>(type.getAxisMaps()[prior])) ==
+            sourceAxisIdentity(map))
+          completeRanges = false;
+    }
+    if (!completeRanges)
+      continue;
+
+    OpBuilder builder(loop);
+    Value workspace = createInvocationWorkspace(
+        kernel, loop.getLoc(), type.getElementType(), type.getShape(), type.getOwner());
+    Value zero = builder.create<arith::ConstantIndexOp>(loop.getLoc(), 0);
+    Value one = builder.create<arith::ConstantIndexOp>(loop.getLoc(), 1);
+    SmallVector<Value> coordinates;
+    SmallVector<int64_t> axes;
+    auto predicateType = FragmentType::get(
+        kernel.getContext(), builder.getI1Type(), type.getShape(), type.getAxisMaps(),
+        type.getValidity(), type.getOwner());
+    Value valid;
+    for (auto [axis, attribute] : llvm::enumerate(type.getShape())) {
+      auto extent = cast<PhysicalExprAttr>(attribute);
+      auto map = cast<AxisMapAttr>(type.getAxisMaps()[axis]);
+      auto coordinateType = FragmentType::get(
+          kernel.getContext(), builder.getIndexType(), builder.getArrayAttr({extent}),
+          builder.getArrayAttr({AxisMapAttr::get(
+              kernel.getContext(), map.getSourceId(), map.getSourceAxis(),
+              map.getDimensionId(), 0, map.getDerived())}),
+          type.getValidity(), type.getOwner());
+      Value end = builder.create<arith::ConstantIndexOp>(loop.getLoc(), extent.getValue());
+      coordinates.push_back(builder.create<MakeRangeOp>(
+          loop.getLoc(), coordinateType, zero, end, one, zero, end,
+          map.getSourceId(), map.getSourceAxis(), map.getDerived()));
+      axes.push_back(axis);
+      auto axisPredicate = FragmentType::get(
+          kernel.getContext(), builder.getI1Type(), coordinateType.getShape(),
+          coordinateType.getAxisMaps(), type.getValidity(), type.getOwner());
+      Value upper = builder.create<SplatOp>(loop.getLoc(), coordinateType, end);
+      Value active = builder.create<CompareOp>(
+          loop.getLoc(), axisPredicate, coordinates.back(), upper, ComparePredicate::Lt);
+      active = builder.create<BroadcastOp>(loop.getLoc(), predicateType, active);
+      valid = valid ? Value(builder.create<BinaryOp>(
+                          loop.getLoc(), predicateType, valid, active,
+                          BinaryOperator::LogicalAnd))
+                    : active;
+    }
+    Value scalarFill = builder.create<arith::ConstantOp>(
+        loop.getLoc(), builder.getZeroAttr(type.getElementType()));
+    Value fill = builder.create<SplatOp>(loop.getLoc(), type, scalarFill);
+    builder.create<StoreOp>(loop.getLoc(), workspace, coordinates, initial, valid, axes);
+
+    SmallVector<Value> remaining;
+    for (auto [position, value] : llvm::enumerate(loop.getInitArgs()))
+      if (position != slot)
+        remaining.push_back(value);
+    auto replacement = builder.create<scf::ForOp>(
+        loop.getLoc(), loop.getLowerBound(), loop.getUpperBound(), loop.getStep(), remaining);
+    replacement->setAttrs(loop->getAttrs());
+    if (!replacement.getBody()->empty())
+      replacement.getBody()->back().erase();
+    builder.setInsertionPointToStart(replacement.getBody());
+    Value current = builder.create<LoadOp>(
+        loop.getLoc(), type, workspace, coordinates, valid, fill, axes);
+    loop.getInductionVar().replaceAllUsesWith(replacement.getInductionVar());
+    unsigned next = 0;
+    for (auto [position, argument] : llvm::enumerate(loop.getRegionIterArgs()))
+      argument.replaceAllUsesWith(position == slot
+                                      ? current
+                                      : replacement.getRegionIterArgs()[next++]);
+    replacement.getBody()->getOperations().splice(
+        replacement.getBody()->end(), loop.getBody()->getOperations());
+    auto yield = cast<scf::YieldOp>(replacement.getBody()->getTerminator());
+    builder.setInsertionPoint(yield);
+    builder.create<StoreOp>(loop.getLoc(), workspace, coordinates,
+                            yield.getOperand(slot), valid, axes);
+    remaining.clear();
+    for (auto [position, value] : llvm::enumerate(yield.getOperands()))
+      if (position != slot)
+        remaining.push_back(value);
+    builder.create<scf::YieldOp>(loop.getLoc(), remaining);
+    yield.erase();
+
+    builder.setInsertionPointAfter(replacement);
+    Value final = builder.create<LoadOp>(
+        loop.getLoc(), type, workspace, coordinates, valid, fill, axes);
+    next = 0;
+    for (auto [position, result] : llvm::enumerate(loop.getResults()))
+      result.replaceAllUsesWith(position == slot ? final : replacement.getResult(next++));
+    loop.erase();
+    return true;
+  }
+  return false;
+}
+
 FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
   auto payload = dyn_cast<FragmentType>(store.getValue().getType());
   auto output = dyn_cast<ViewType>(store.getResource().getType());
@@ -218,15 +370,24 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
         (payload.getShape().size() == 1 && rank == 1 &&
          store.getSourceAxes() == ArrayRef<int64_t>{0})))
     return false;
+  auto enclosingLoop = store->getParentOfType<scf::ForOp>();
   for (Operation *parent = store->getParentOp(); parent != kernel;
-       parent = parent->getParentOp())
-    if (!isa<scf::IfOp>(parent))
+       parent = parent->getParentOp()) {
+    if (auto loop = dyn_cast<scf::ForOp>(parent)) {
+      if (!hasLaunchUniformBounds(loop, kernel))
+        return false;
+    } else if (auto branch = dyn_cast<scf::IfOp>(parent)) {
+      if (enclosingLoop && !isLaunchUniformScalar(branch.getCondition(), kernel))
+        return false;
+    } else {
       return false;
+    }
+  }
   PhysicalProgramAnalysis analysis(kernel);
   bool indirect = payload.getShape().size() == 1 &&
                   !store.getCoordinates().front().getDefiningOp<MakeRangeOp>();
-  if (indirect ? !analysis.accessBounds(store).isExact()
-               : !analysis.boundaryValidity(store).isExact())
+  if ((indirect || buffer) ? !analysis.accessBounds(store).isExact()
+                           : !analysis.boundaryValidity(store).isExact())
     return false;
   SmallVector<Value> retained{store.getValue()};
   if (indirect) {
@@ -268,6 +429,13 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
     }
     ranges.push_back(range);
     shape.push_back(end);
+  }
+  if (buffer && !indirect) {
+    SmallVector<std::pair<MakeRangeOp, Value>> boundaries;
+    for (MakeRangeOp range : ranges)
+      boundaries.emplace_back(range, range.getLogicalStop());
+    if (!analysis.isTailPredicate(store.getValid(), boundaries))
+      return false;
   }
   SmallVector<Value> dependencies(retained);
   llvm::DenseSet<Operation *> visited;
@@ -467,9 +635,7 @@ FailureOr<bool> materializeRetainedStore(StoreOp store, func::FuncOp kernel) {
     writeDependencies.append(producer->getOperands().begin(),
                              producer->getOperands().end());
   }
-  bool direct = buffer && !indirect && clobber == store &&
-                store.getResource().getDefiningOp<BufferOp>() &&
-                !readsDestination;
+  bool direct = buffer && !indirect && clobber == store && !readsDestination;
   for (Value value : retained) {
     auto type = cast<FragmentType>(value.getType());
     workspaces.push_back(direct ? store.getResource() :
@@ -930,6 +1096,15 @@ LogicalResult materializeRetainedValues(ModuleOp module) {
                  extent.getValue() == 1;
         }))
       return success();
+    SmallVector<scf::ForOp> loops;
+    kernel.walk([&](scf::ForOp loop) { loops.push_back(loop); });
+    for (scf::ForOp loop : loops)
+      if (materializeLoopState(loop, kernel)) {
+        changed = true;
+        break;
+      }
+    if (changed)
+      continue;
     SmallVector<StoreOp> stores;
     kernel.walk([&](StoreOp store) { stores.push_back(store); });
     for (StoreOp store : stores) {
