@@ -77,7 +77,7 @@ fixed-width integers使用二进制补码与modulo arithmetic：
 
 ## 5. Floating point、cast 与 bitcast
 
-普通floating operations遵循对应格式的IEEE-754值与round-to-nearest-even。除本节规定的局部乘加融合、作者使用structured operation或显式approximate math外，compiler保持source expression的数据依赖与求值关系，不启用会改变结果集合的隐式fast-math。
+普通floating operations遵循对应格式的IEEE-754值与round-to-nearest-even。除本节规定的乘加融合、作者使用structured operation或显式approximate math外，compiler保持source expression的数据依赖与求值关系，不启用会改变结果集合的隐式fast-math。
 
 `I.lgamma(x)` 的数学定义为 `log|Gamma(x)|`。在 1、2 处返回 `+0`；
 在非正整数极点（包括正负零）和正负无穷处返回 `+inf`；NaN 输入返回 NaN。
@@ -85,7 +85,7 @@ fixed-width integers使用二进制补码与modulo arithmetic：
 
 ### 5.1 显式近似数学
 
-`fdiv`、`exp2` 和 `tanh` 的 `approximate` 是操作本身的语义，不是优化 hint；默认 `False` 保持普通运算。`fdiv/exp2` 另外接受 `flush_to_zero`，仅允许在 `approximate=True` 时启用。两个参数必须是 constexpr bool，非默认模式的 operands/result 都是 `f32`，不做隐式 dtype 转换。这是一个闭合的逐操作能力，不授权普通 add/mul/FMA 重结合或改变 contraction/reduction 的语义。
+`fdiv`、`exp2` 和 `tanh` 的 `approximate` 是操作本身的语义，不是优化 hint；默认 `False` 保持普通运算。`fdiv/exp2` 另外接受 `flush_to_zero`，仅允许在 `approximate=True` 时启用。两个参数必须是 constexpr bool，非默认模式的 operands/result 都是 `f32`，不做隐式 dtype 转换。这是一个闭合的逐操作能力，不额外改变相邻普通运算、contraction或reduction的数值合同。
 
 近似模式采用以下跨 target 的数值契约，不承诺 correctly-rounded 或不同 target bitwise 相同：
 
@@ -120,13 +120,21 @@ fixed-width integers使用二进制补码与modulo arithmetic：
 
 普通`contract`的零初值结果只有一个加法consumer，且另一operand `C`与contraction accumulator/result具有相同dtype和逐元素对应的结果关系时，`contract(A, B) + C`或`C + contract(A, B)`允许实现为以`C`为初值的contraction累加。该局部组合采用融合累加的舍入与特殊值语义，不承诺先独立舍入完整contraction再做add；空reduction的融合结果为`C`。Compiler必须保持lhs/rhs输入精度、paired axes、accumulator dtype与所有外部effects，不引入TF32、FTZ或其它近似选择。
 
-该许可不依赖target或kernel identity，不需要新的作者hint或tuning参数。它不覆盖跨数值cast、多个consumer、非零初值contraction的再次重结合，也不授权普通add/mul/FMA的全局fast-math。纯shape projection只有在逐元素对应关系保持不变时才能随融合改写。
+该许可不依赖target或kernel identity，不需要新的作者hint或tuning参数。它不覆盖跨数值cast、多个consumer、非零初值contraction的再次重结合，也不授权任意重结合或未声明的近似运算。纯shape projection只有在逐元素对应关系保持不变时才能随融合改写。
 
 ### 5.4 局部乘法归约融合
 
 浮点乘法结果仅供一个以加法零为identity、以同dtype普通加法为combine的reduce使用，且乘法到归约之间没有数值cast、乘积与accumulator/result的dtype相同时，允许将该组合实现为普通contract。纯shape projection必须保持逐元素关系；paired reduction、batch与free axes必须由原broadcast和归约关系确定，不改变参与归约的成员、结果坐标或effects。默认widening引入的数值cast不属于此许可，ordered loop与scan也不属于此规则。
 
-融合保持lhs/rhs输入精度与accumulator dtype，不启用TF32、FTZ或其它近似。该局部组合采用contract的融合乘加数值语义：允许FMA改变舍入，也允许极端溢出或抵消时的Inf/NaN结果不同于先舍入乘积再归约；空归约仍返回原dtype的加法零。这不是普通运算的全局fast-math许可，不需要新增作者hint或tuning参数。
+融合保持lhs/rhs输入精度与accumulator dtype，不启用TF32、FTZ或其它近似。该局部组合采用contract的融合乘加数值语义：允许FMA改变舍入，也允许极端溢出或抵消时的Inf/NaN结果不同于先舍入乘积再归约；空归约仍返回原dtype的加法零。该规则不额外扩大其它普通运算的数值许可，不需要新增作者hint或tuning参数。
+
+### 5.5 普通乘加的FMA融合
+
+普通同dtype浮点乘加表达式，如`a*b+c`、`c+a*b`、`a*b-c`和`c-a*b`，允许使用原生FMA完成一次round-to-nearest-even舍入，不要求先独立舍入乘积再执行加减。融合可以改变末位、signed-zero以及极端溢出或抵消时的Inf/NaN结果；未融合的使用处仍遵循对应普通运算的规则。该许可不要求乘法结果只有一个consumer，但不能因一个使用处的融合而改变其它使用处所需的独立乘法结果。
+
+Compiler保持operand/result dtype、输入精度、数值cast、循环迭代顺序与external effects。该许可只覆盖乘加融合，不授权普通加法或乘法的任意重结合、输入降精度、TF32、FTZ或未声明的近似数学。是否融合由provider选择，不增加作者hint、调优参数或另一套算法；不同合法实现不保证逐操作bitwise一致。
+
+Operation显式规定的独立舍入边界优先于本节，例如[量化计算](quantized-operations.md)中每条record内的`R32`序列；不得跨过这些边界形成FMA。
 
 ## 6. Reduce 与 scan 数值语义
 
