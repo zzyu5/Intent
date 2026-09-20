@@ -9,6 +9,9 @@ Unless TASK.md explicitly fixes intermediate dtypes, evaluation order or observa
 stages, choose an organization satisfying its logical result and accuracy contract.
 The language's numerical rules govern the program you write and its compilation,
 not the reference library's internal implementation.
+Choose among documented exact and explicit approximate operations according to
+TASK.md's accuracy and input-domain requirements. Approximate modes must respect
+their documented error bounds, range and special-value rules.
 Choose the algorithm for the complete invocation before writing the kernels.
 Assess its independent work, data dependencies, total computation, intermediate
 memory traffic and the combined cost of all kernel invocations. Internal kernel
