@@ -531,6 +531,51 @@ LogicalResult SplitOp::verify() {
   return success();
 }
 
+LogicalResult MapElementwiseOp::verify() {
+  auto result = getResult().getType();
+  Block &body = getBody().front();
+  auto yield = dyn_cast<gpu::YieldOp>(body.getTerminator());
+  if (getInputs().empty() || body.getNumArguments() != getInputs().size() ||
+      !yield || yield.getValues().size() != 1 ||
+      yield.getValues().front().getType() != result.getElementType())
+    return emitOpError("requires explicit scalar arguments and one element-typed yield");
+  bool hasFragment = false;
+  for (auto [input, argument] : llvm::zip(getInputs(), body.getArguments())) {
+    Type element = input.getType();
+    if (auto fragment = dyn_cast<gpu::FragmentType>(element)) {
+      hasFragment = true;
+      if (fragment.getShape() != result.getShape() ||
+          fragment.getAxisMaps() != result.getAxisMaps() ||
+          fragment.getValidity() != result.getValidity() ||
+          fragment.getOwner() != result.getOwner())
+        return emitOpError("inputs must preserve the result elementwise relation");
+      element = fragment.getElementType();
+    }
+    if (!isa<IntegerType, IndexType, FloatType>(element) ||
+        argument.getType() != element)
+      return emitOpError("body arguments must be numeric scalar input elements");
+  }
+  if (!hasFragment)
+    return emitOpError("requires at least one fragment input");
+  WalkResult valid = getBody().walk([&](Operation *operation) {
+    if (!isMemoryEffectFree(operation) ||
+        !llvm::all_of(operation->getResultTypes(), [](Type type) {
+          return isa<IntegerType, IndexType, FloatType>(type);
+        }))
+      return WalkResult::interrupt();
+    for (Region &region : operation->getRegions())
+      for (Block &block : region)
+        if (!llvm::all_of(block.getArgumentTypes(), [](Type type) {
+              return isa<IntegerType, IndexType, FloatType>(type);
+            }))
+          return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
+  if (valid.wasInterrupted())
+    return emitOpError("body must contain only pure scalar computations");
+  return success();
+}
+
 } // namespace intent::triton
 
 #define GET_OP_CLASSES

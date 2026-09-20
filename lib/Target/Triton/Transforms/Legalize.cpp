@@ -14,7 +14,9 @@
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/StringSet.h"
@@ -2788,6 +2790,215 @@ Type scalarCallbackType(Type type) {
   return type;
 }
 
+bool hasMapRelation(Type type, gpu::FragmentType result) {
+  if (auto fragment = dyn_cast<gpu::FragmentType>(type))
+    return fragment.getShape() == result.getShape() &&
+           fragment.getAxisMaps() == result.getAxisMaps() &&
+           fragment.getValidity() == result.getValidity() &&
+           fragment.getOwner() == result.getOwner();
+  return isa<IntegerType, IndexType, FloatType>(type);
+}
+
+bool isScalarizableMapProducer(Operation *operation,
+                              gpu::FragmentType result) {
+  if (!llvm::all_of(operation->getOperandTypes(), [&](Type type) {
+        return hasMapRelation(type, result);
+      }) || !llvm::all_of(operation->getResultTypes(), [&](Type type) {
+        return hasMapRelation(type, result);
+      }))
+    return false;
+  if (auto loop = dyn_cast<scf::ForOp>(operation)) {
+    APInt lower, upper, step;
+    if (!matchPattern(loop.getLowerBound(), m_ConstantInt(&lower)) ||
+        !matchPattern(loop.getUpperBound(), m_ConstantInt(&upper)) ||
+        !matchPattern(loop.getStep(), m_ConstantInt(&step)) ||
+        !step.isStrictlyPositive())
+      return false;
+    if (lower.slt(upper)) {
+      bool overflow = false;
+      (void)(upper - 1).sadd_ov(step, overflow);
+      if (overflow)
+        return false;
+    }
+    return llvm::all_of(loop.getBody()->without_terminator(),
+                       [&](Operation &nested) {
+                         return isScalarizableMapProducer(&nested, result);
+                       });
+  }
+  return isa<arith::ConstantOp, gpu::SplatOp, gpu::BroadcastOp,
+             gpu::UnaryOp, gpu::BinaryOp, gpu::CompareOp, gpu::SelectOp,
+             gpu::CastOp, gpu::BitcastOp>(operation);
+}
+
+SmallVector<Value> mapProducerInputs(Operation *operation) {
+  llvm::SetVector<Value> inputs;
+  inputs.insert(operation->operand_begin(), operation->operand_end());
+  for (Region &region : operation->getRegions())
+    getUsedValuesDefinedAbove(region, inputs);
+  return SmallVector<Value>(inputs.begin(), inputs.end());
+}
+
+bool hasExpensiveMapProducer(Operation *operation) {
+  if (isa<scf::ForOp>(operation))
+    return true;
+  if (auto binary = dyn_cast<gpu::BinaryOp>(operation))
+    return binary.getOperatorKind() == BinaryOperator::TrueDivide ||
+           binary.getOperatorKind() == BinaryOperator::Power;
+  auto unary = dyn_cast<gpu::UnaryOp>(operation);
+  if (!unary)
+    return false;
+  switch (unary.getOperatorKind()) {
+  case UnaryOperator::Exp:
+  case UnaryOperator::Exp2:
+  case UnaryOperator::Log:
+  case UnaryOperator::Lgamma:
+  case UnaryOperator::Sin:
+  case UnaryOperator::Cos:
+  case UnaryOperator::Erf:
+  case UnaryOperator::Tanh:
+    return !unary.getApproximate();
+  default:
+    return false;
+  }
+}
+
+void sinkSelectProducers(func::FuncOp kernel) {
+  SmallVector<gpu::SelectOp> selects;
+  bool changed = false;
+  kernel.walk([&](gpu::SelectOp select) { selects.push_back(select); });
+  // Start at consumers so nested selects stay inside one scalar callback.
+  for (gpu::SelectOp select : llvm::reverse(selects)) {
+    auto resultType = dyn_cast<gpu::FragmentType>(select.getType());
+    if (!resultType || select->use_empty())
+      continue;
+    Block *block = select->getBlock();
+    llvm::SmallPtrSet<Operation *, 32> slices[2];
+    for (unsigned arm = 0; arm < 2; ++arm) {
+      SmallVector<Value> pending{select->getOperand(arm + 1)};
+      while (!pending.empty()) {
+        Operation *producer = pending.pop_back_val().getDefiningOp();
+        if (!producer || producer->getBlock() != block ||
+            (!isa<arith::ConstantOp>(producer) &&
+             !llvm::any_of(producer->getResultTypes(), [](Type type) {
+               return isa<gpu::FragmentType>(type);
+             })) ||
+            !isScalarizableMapProducer(producer, resultType) ||
+            !slices[arm].insert(producer).second)
+          continue;
+        llvm::append_range(pending, mapProducerInputs(producer));
+      }
+    }
+    // Shared producers and values used outside the selected arm stay eager.
+    // Only a closed, finite, effect-free slice can move under the condition.
+    llvm::SmallPtrSet<Operation *, 32> exclusive[2];
+    for (unsigned arm = 0; arm < 2; ++arm)
+      for (Operation *producer : slices[arm])
+        if (!slices[1 - arm].contains(producer))
+          exclusive[arm].insert(producer);
+    for (unsigned arm = 0; arm < 2; ++arm) {
+      bool changed;
+      do {
+        SmallVector<Operation *> retained;
+        for (Operation *producer : exclusive[arm])
+          if (llvm::any_of(producer->getResults(), [&](Value value) {
+                return llvm::any_of(value.getUses(), [&](OpOperand &use) {
+                  if (use.getOwner() == select)
+                    return use.getOperandNumber() != arm + 1;
+                  Operation *owner = use.getOwner();
+                  while (owner->getBlock() != block && owner->getParentOp())
+                    owner = owner->getParentOp();
+                  return !exclusive[arm].contains(owner);
+                });
+              }))
+            retained.push_back(producer);
+        for (Operation *producer : retained)
+          exclusive[arm].erase(producer);
+        changed = !retained.empty();
+      } while (changed);
+    }
+    // Without branch frequencies, keep short expressions predicated. A scalar
+    // callback must avoid a loop or multiple library calls to pay for control.
+    auto profitable = [&](const auto &slice) {
+      return llvm::any_of(slice, [](Operation *operation) {
+               return isa<scf::ForOp>(operation);
+             }) || llvm::count_if(slice, hasExpensiveMapProducer) >= 2;
+    };
+    if (!profitable(exclusive[0]) && !profitable(exclusive[1]))
+      continue;
+
+    llvm::SetVector<Value> captures;
+    captures.insert(select.getCondition());
+    for (unsigned arm = 0; arm < 2; ++arm) {
+      auto capture = [&](Value value) {
+        if (!exclusive[arm].contains(value.getDefiningOp()))
+          captures.insert(value);
+      };
+      capture(select->getOperand(arm + 1));
+      for (Operation &operation : *block)
+        if (exclusive[arm].contains(&operation))
+          for (Value input : mapProducerInputs(&operation))
+            capture(input);
+    }
+    if (!llvm::all_of(captures, [&](Value value) {
+          return hasMapRelation(value.getType(), resultType);
+        }) || !llvm::any_of(captures, [](Value value) {
+          return isa<gpu::FragmentType>(value.getType());
+        }))
+      continue;
+    OpBuilder builder(select);
+    auto map = builder.create<MapElementwiseOp>(select.getLoc(), resultType,
+                                                captures.getArrayRef());
+    if (Attribute origin = select->getAttr(gpu::originAttr))
+      map->setAttr(gpu::originAttr, origin);
+    SmallVector<Type> types;
+    for (Value value : captures)
+      types.push_back(scalarCallbackType(value.getType()));
+    Block *body = builder.createBlock(&map.getBody(), {}, types,
+        SmallVector<Location>(types.size(), select.getLoc()));
+    IRMapping mapping;
+    mapping.map(captures.getArrayRef(), body->getArguments());
+    auto conditional = builder.create<scf::IfOp>(select.getLoc(),
+        TypeRange{resultType.getElementType()},
+        mapping.lookup(select.getCondition()), /*withElseRegion=*/true);
+    for (unsigned arm = 0; arm < 2; ++arm) {
+      Block &branch = conditional->getRegion(arm).front();
+      builder.setInsertionPointToStart(&branch);
+      IRMapping branchMapping(mapping);
+      for (Operation &operation : *block) {
+        if (!exclusive[arm].contains(&operation))
+          continue;
+        Operation *clone = builder.clone(operation, branchMapping);
+        clone->walk([&](Operation *nested) {
+          for (Value result : nested->getResults())
+            result.setType(scalarCallbackType(result.getType()));
+          for (Region &region : nested->getRegions())
+            for (Block &block : region)
+              for (BlockArgument argument : block.getArguments())
+                argument.setType(scalarCallbackType(argument.getType()));
+        });
+      }
+      builder.create<scf::YieldOp>(select.getLoc(),
+          branchMapping.lookup(select->getOperand(arm + 1)));
+    }
+    builder.setInsertionPointToEnd(body);
+    builder.create<gpu::YieldOp>(select.getLoc(), conditional.getResults());
+    SmallVector<Operation *> broadcasts;
+    map.walk([&](Operation *operation) {
+      if (isa<gpu::SplatOp, gpu::BroadcastOp>(operation))
+        broadcasts.push_back(operation);
+    });
+    for (Operation *broadcast : llvm::reverse(broadcasts)) {
+      broadcast->getResult(0).replaceAllUsesWith(broadcast->getOperand(0));
+      broadcast->erase();
+    }
+    select.getResult().replaceAllUsesWith(map.getResult());
+    select.erase();
+    changed = true;
+  }
+  if (changed)
+    gpu::eraseDeadPhysicalValues(kernel);
+}
+
 LogicalResult legalizeCollectiveCallbacks(func::FuncOp kernel) {
   SmallVector<Operation *> collectives;
   kernel.walk([&](Operation *operation) {
@@ -3704,7 +3915,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
 
     if (isa<CtaBarrierOp, ViewOverlapOp, TensorDescriptorChoiceOp, TensorDescriptorAllocatorOp,
             TensorDescriptorOp, BlockLoadOp, BlockStoreOp, DescriptorLoadOp,
-            DescriptorStoreOp, SplitOp, ReduceOp, ScanOp, gpu::ParameterOp,
+            DescriptorStoreOp, SplitOp, ReduceOp, ScanOp, MapElementwiseOp, gpu::ParameterOp,
             gpu::PhysicalExprOp,
             gpu::ProgramIdOp,
             gpu::WorksetCoordinateOp, gpu::DelinearizeOp,
@@ -4273,6 +4484,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       failed(materializeDeferredResourceBounds(kernel)))
     return failure();
   selectOrderedLoadUnrolling(kernel);
+  sinkSelectProducers(kernel);
   if (failed(verifyTritonProgram(module)))
     return failure();
   kernel->setAttr(legalizedAttr, UnitAttr::get(module.getContext()));
