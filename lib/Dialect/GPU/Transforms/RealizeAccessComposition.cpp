@@ -325,6 +325,9 @@ bool foldIndexRecompositions(func::FuncOp kernel) {
 bool sameUniformValue(Value lhs, Value rhs) {
   if (lhs == rhs)
     return true;
+  UniformValueAnalysis constants(describeUniformValue);
+  if (equalUniformConstants(constants.evaluate(lhs), constants.evaluate(rhs)))
+    return true;
   auto scalar = [](Value value) {
     while (value) {
       UniformExpression expression = describeUniformValue(value);
@@ -341,8 +344,7 @@ bool sameUniformValue(Value lhs, Value rhs) {
     return false;
   if (lhs == rhs)
     return true;
-  UniformValueAnalysis constants(describeUniformValue);
-  return equalUniformConstants(constants.evaluate(lhs), constants.evaluate(rhs));
+  return false;
 }
 
 FailureOr<bool> composeSelectLoad(SelectOp select) {
