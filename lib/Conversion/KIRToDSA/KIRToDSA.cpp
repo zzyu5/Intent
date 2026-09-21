@@ -29,6 +29,7 @@ using AxisRequirements = SmallVector<bool, 4>;
 struct WorksetTiling {
   DenseMap<Value, AxisRequirements> requirements;
   SmallVector<Operation *> writes;
+  unsigned axis = 0;
 };
 struct AffineIndices {
   Value base;
@@ -545,7 +546,7 @@ private:
     }))) return failure();
     values.map(result, output); return success();
   }
-  LogicalResult localMatMul(ContractOp matrix, const LocalShape &shape) {
+  LogicalResult localMatMul(ContractOp matrix, const LocalShape &shape, Value output = {}, bool stream = true) {
     Location loc = matrix.getLoc();
     auto leftType = cast<RankedTensorType>(matrix.getLhs().getType());
     auto rightType = cast<RankedTensorType>(matrix.getRhs().getType());
@@ -554,9 +555,49 @@ private:
         !matrix.getBatch().empty() ||
         !cast<RankedTensorType>(matrix.getResult().getType()).getElementType().isF32())
       return matrix.emitError("DSA local matrix/vector multiplication requires one paired axis and f32 accumulation");
+    int64_t leftReduce = cast<IntegerAttr>(pair[0]).getInt(), rightReduce = cast<IntegerAttr>(pair[1]).getInt();
+    if (stream && shape.size() == 2 && leftType.getRank() == 2 && rightType.getRank() == 2) {
+      std::pair<Value, unsigned> roots[] = {{matrix.getLhs(), leftReduce}, {matrix.getRhs(), rightReduce}};
+      if (auto plan = planExecutionSlices(*matrix->getBlock(), 0, roots)) {
+        DenseMap<Value, LocalShape> complete;
+        Value size;
+        int64_t capacity = config.getTileK();
+        bool available = true, needsSlicing = false;
+        for (auto &entry : plan->requirements) {
+          auto selected = localShape(entry.first, loc);
+          if (failed(selected)) return failure();
+          for (unsigned axis = 0; axis < selected->size(); ++axis) if (entry.second[axis]) {
+            const auto &local = (*selected)[axis];
+            available &= matchPattern(local.begin, m_Zero()) && sameIndex(local.count, local.extent) &&
+                (!size || sameIndex(size, local.count));
+            size = local.count;
+            needsSlicing |= local.capacity > config.getTileK();
+            capacity = std::min(capacity, local.capacity);
+          }
+          complete[entry.first] = *selected;
+        }
+        if (available && needsSlicing && size) {
+          Value accumulator = allocateTensor(loc, b.getF32Type(), shape);
+          auto savedValues = values; auto savedProducts = products; auto savedSlices = valueSlices;
+          LogicalResult status = loop(loc, index(loc, 0), size, index(loc, capacity), [&](Value begin) {
+            Value count = b.create<arith::MinSIOp>(loc, sub(loc, size, begin), index(loc, capacity));
+            for (auto &entry : plan->requirements) {
+              LocalShape selected = complete.lookup(entry.first);
+              for (unsigned axis = 0; axis < selected.size(); ++axis)
+                if (entry.second[axis]) selected[axis] = {selected[axis].extent, begin, count, capacity};
+              valueSlices[entry.first] = std::move(selected);
+            }
+            return localMatMul(matrix, shape, accumulator, false);
+          });
+          values = std::move(savedValues); products = std::move(savedProducts); valueSlices = std::move(savedSlices);
+          if (failed(status)) return failure();
+          values.map(matrix.getResult(), accumulator);
+          return success();
+        }
+      }
+    }
     Value lhs = get(matrix.getLhs()), rhs = get(matrix.getRhs());
     if (!lhs || !rhs || !localShapes.count(lhs) || !localShapes.count(rhs)) return matrix.emitError("DSA local MatMul inputs are unavailable");
-    int64_t leftReduce = cast<IntegerAttr>(pair[0]).getInt(), rightReduce = cast<IntegerAttr>(pair[1]).getInt();
     auto normalize = [&](Value input, bool left, int64_t reduction) -> Value {
       LocalShape original = localShapes.lookup(input);
       bool transpose = original.size() == 2 && reduction == (left ? 0 : 1);
@@ -574,13 +615,14 @@ private:
     LocalShape leftShape = localShapes.lookup(lhs), rightShape = localShapes.lookup(rhs);
     lhs = normalize(lhs, true, leftReduce); rhs = normalize(rhs, false, rightReduce);
     if (!lhs || !rhs) return failure();
-    Value output = allocateTensor(loc, b.getF32Type(), shape);
+    if (!output) output = allocateTensor(loc, b.getF32Type(), shape);
     int64_t rows = cast<MemRefType>(lhs.getType()).getDimSize(0), columns = cast<MemRefType>(rhs.getType()).getDimSize(1);
     Value rowCount = leftShape.size() == 1 ? index(loc, 1) : leftShape[1 - leftReduce].count;
     Value columnCount = rightShape.size() == 1 ? index(loc, 1) : rightShape[1 - rightReduce].count;
     Value accumulator = output;
     if (cast<MemRefType>(output.getType()).getShape() != ArrayRef<int64_t>({rows, columns})) {
       accumulator = allocate(loc, b.getF32Type(), rows, columns);
+      b.create<dsa::FillOp>(loc, accumulator, b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(0)));
       b.create<dsa::FillOp>(loc, accumulator, b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(0)));
     }
     b.create<dsa::MatMulOp>(loc, lhs, rhs, accumulator, rowCount, leftShape[leftReduce].count, columnCount);
@@ -936,6 +978,71 @@ private:
     }
     return result;
   }
+  LogicalResult streamReduction(ReduceOp reduce, unsigned axis, int64_t dimension, const LocalShape &shape) {
+    Location loc = reduce.getLoc();
+    ValueRange sources = reduce.getInputs().take_front(reduce.getSourceCount());
+    ValueRange identities = reduce.getInputs().slice(reduce.getSourceCount(), reduce.getIdentityCount());
+    ValueRange captures = reduce.getInputs().take_back(reduce.getCaptureCount());
+    SmallVector<Value> initial = flatten(identities), outputs;
+    SmallVector<Type> elementTypes, resultTypes;
+    for (Type type : identities.getTypes()) leaves(type, elementTypes);
+    for (Type type : reduce->getResultTypes()) leaves(type, resultTypes);
+    if (initial.size() != elementTypes.size() || initial.size() != resultTypes.size() ||
+        llvm::any_of(elementTypes, [](Type type) { return isa<RankedTensorType>(type); }))
+      return reduce.emitError("DSA streamed reduction requires scalar summary fields for each output position");
+    LocalShape resultShape = shape;
+    resultShape.erase(resultShape.begin() + axis);
+    for (auto [value, type] : llvm::zip(initial, elementTypes)) {
+      Value output = allocateTensor(loc, type, resultShape);
+      Value identity = scalarCast(loc, value, cast<MemRefType>(output.getType()).getElementType());
+      if (!identity) return reduce.emitError("DSA streamed reduction identity dtype is unavailable");
+      b.create<dsa::FillOp>(loc, output, identity);
+      outputs.push_back(output);
+    }
+    // Captures are immutable whole values evaluated before source slicing;
+    // their storage and logical shape remain live across all chunks.
+    SmallVector<SmallVector<Value>> captured;
+    for (Value value : captures) captured.push_back(flatten(ValueRange{value}));
+    auto savedValues = values; auto savedProducts = products; auto savedBindings = axisBindings;
+    int64_t capacity = std::min(config.getRegionTile(), shape[axis].capacity);
+    LogicalResult status = loop(loc, index(loc, 0), shape[axis].count, index(loc, capacity), [&](Value begin) -> LogicalResult {
+      values = savedValues; products = savedProducts; axisBindings = savedBindings;
+      Value count = b.create<arith::MinSIOp>(loc, sub(loc, shape[axis].count, begin), index(loc, capacity));
+      axisBindings[dimension] = {shape[axis].extent, begin, count, capacity};
+      DenseSet<Value> visited;
+      for (Value source : sources) forgetReplayedTensors(source, visited);
+      auto inputs = flatten(sources);
+      if (inputs.size() != outputs.size() || llvm::is_contained(inputs, Value()))
+        return reduce.emitError("DSA streamed reduction source fields are unavailable");
+      // Keep the author's element-combination order while staging each source
+      // chunk once for all output positions.
+      return loop(loc, index(loc, 0), count, index(loc, 1), [&](Value member) {
+        return eachElement(loc, resultShape, [&](ValueRange coordinates) -> LogicalResult {
+          SmallVector<Value> sourceCoordinates(coordinates), old, elements;
+          sourceCoordinates.insert(sourceCoordinates.begin() + axis, member);
+          for (auto [output, input, type] : llvm::zip(outputs, inputs, elementTypes)) {
+            old.push_back(scalarCast(loc, loadLocal(loc, output, coordinates), type));
+            elements.push_back(scalarCast(loc, loadLocal(loc, input, sourceCoordinates), type));
+          }
+          auto arguments = splitFields(identities.getTypes(), old);
+          llvm::append_range(arguments, splitFields(identities.getTypes(), elements));
+          llvm::append_range(arguments, captured);
+          auto updated = helper(reduce.getCombine().front(), arguments);
+          if (failed(updated) || updated->size() != outputs.size()) return failure();
+          for (auto [value, output] : llvm::zip(*updated, outputs)) storeLocal(loc, value, output, coordinates);
+          return success();
+        });
+      });
+    });
+    values = std::move(savedValues); products = std::move(savedProducts); axisBindings = std::move(savedBindings);
+    if (failed(status)) return failure();
+    SmallVector<Value> results;
+    for (auto [type, output] : llvm::zip(resultTypes, outputs))
+      results.push_back(isa<RankedTensorType>(type) ? output : scalarCast(loc, loadLocal(loc, output, {}), type));
+    auto grouped = splitFields(reduce->getResultTypes(), results);
+    for (auto [result, fields] : llvm::zip(reduce->getResults(), grouped)) bindProduct(result, fields);
+    return success();
+  }
   LogicalResult reduceTensor(ReduceOp reduce) {
     Location loc = reduce.getLoc();
     if (reduce.getAxes().size() != 1) return reduce.emitError("DSA local reduction currently requires one selected axis");
@@ -943,12 +1050,45 @@ private:
     ValueRange sources = reduce.getInputs().take_front(reduce.getSourceCount());
     ValueRange identities = reduce.getInputs().slice(reduce.getSourceCount(), reduce.getIdentityCount());
     ValueRange captures = reduce.getInputs().take_back(reduce.getCaptureCount());
+    SmallVector<Type> sourceTypes;
+    for (Type type : sources.getTypes()) leaves(type, sourceTypes);
+    if (!sourceTypes.empty() && valueSlices.empty()) {
+      auto first = dyn_cast<RankedTensorType>(sourceTypes.front());
+      if (first && axis < first.getRank()) {
+        auto shape = localShape(first, loc);
+        if (failed(shape)) return failure();
+        int64_t elements = 1;
+        for (const auto &local : *shape) elements *= local.capacity;
+        int64_t bytes = std::max<int64_t>(1, (storageElement(first.getElementType()).getIntOrFloatBitWidth() + 7) / 8);
+        int64_t dimension = cast<TensorShapeAttr>(first.getEncoding()).getDimensions()[axis];
+        bool stream = (*shape)[axis].capacity > config.getRegionTile() &&
+            elements > config.getLocalBytes() / bytes / 2 && completeShape(*shape);
+        for (Type field : sourceTypes) {
+          auto type = dyn_cast<RankedTensorType>(field);
+          if (!type || type.getRank() != first.getRank()) { stream = false; break; }
+          auto ids = cast<TensorShapeAttr>(type.getEncoding()).getDimensions();
+          stream &= ids[axis] == dimension && llvm::count(ids.asArrayRef(), dimension) == 1;
+          for (unsigned a = 0; a < type.getRank(); ++a) stream &= equalAxisExtent(first, a, type, a);
+        }
+        DenseSet<Value> visited;
+        for (Value source : sources) stream &= replayableSlice(source, dimension, visited);
+        if (stream) return streamReduction(reduce, axis, dimension, *shape);
+      }
+    }
     auto inputs = flatten(sources), initial = flatten(identities);
     if (inputs.empty() || inputs.size() != initial.size()) return reduce.emitError("DSA reduction has unbound source fields");
     for (Value input : inputs)
       if (!input || !localShapes.count(input) || axis >= localShapes.lookup(input).size())
         return reduce.emitError("DSA reduction source has no bounded tensor shape");
     LocalShape inputShape = localShapes.lookup(inputs.front());
+    for (Value input : llvm::drop_begin(inputs)) {
+      LocalShape other = localShapes.lookup(input);
+      if (other.size() != inputShape.size())
+        return reduce.emitError("DSA jointly reduced source fields require matching local ranks");
+      for (unsigned a = 0; a < other.size(); ++a)
+        if (other[a].capacity != inputShape[a].capacity || !sameIndex(other[a].count, inputShape[a].count))
+          return reduce.emitError("DSA jointly reduced source fields require matching local extents");
+    }
     LocalShape resultShape = inputShape;
     resultShape.erase(resultShape.begin() + axis);
     SmallVector<Type> resultTypes;
@@ -1290,11 +1430,13 @@ private:
     if (!rhs.isDynamicDim(c) && l && matchPattern(l, m_ConstantInt(&constant))) return constant.getSExtValue() == rhs.getDimSize(c);
     return false;
   }
-  std::optional<WorksetTiling> planWorksetTiling(Block &block) {
+  std::optional<WorksetTiling> planExecutionSlices(Block &block, unsigned selectedAxis = 0,
+      ArrayRef<std::pair<Value, unsigned>> sources = {}) {
     WorksetTiling plan;
+    plan.axis = selectedAxis;
     DenseSet<Value> written;
     RankedTensorType outputType;
-    for (Operation &op : block.without_terminator()) {
+    if (sources.empty()) for (Operation &op : block.without_terminator()) {
       if (op.getNumRegions()) return std::nullopt;
       if (isa<ViewStoreOp, ScatterUniqueOp>(op)) {
         auto relation = analysis.indexRelation(&op);
@@ -1302,15 +1444,15 @@ private:
         auto type = dyn_cast<RankedTensorType>(data.getType());
         // Distinct writable views are disjoint in this target's launch ABI.
         // Reordering separate writes to one view needs an effect-footprint proof.
-        if (failed(relation) || !type || !type.getRank() || !written.insert(relation->source).second) return std::nullopt;
-        if (outputType && !equalAxisExtent(outputType, 0, type, 0)) return std::nullopt;
+        if (failed(relation) || !type || selectedAxis >= type.getRank() || !written.insert(relation->source).second) return std::nullopt;
+        if (outputType && !equalAxisExtent(outputType, selectedAxis, type, selectedAxis)) return std::nullopt;
         if (!outputType) outputType = type;
         plan.writes.push_back(&op);
       } else if (auto load = dyn_cast<ViewLoadOp>(op)) {
         if (cast<ViewType>(load.getInputs().front().getType()).getAccess() != 0) return std::nullopt;
       } else if (!isMemoryEffectFree(&op) && !isa<AssumeInBoundsOp>(op)) return std::nullopt;
     }
-    if (plan.writes.empty() || singletonAxis(outputType, 0)) return std::nullopt;
+    if (sources.empty() && (plan.writes.empty() || singletonAxis(outputType, selectedAxis))) return std::nullopt;
     std::function<bool(Value, AxisRequirements)> require;
     std::function<bool(Value)> scalar;
     std::function<bool(Operation *, RankedTensorType, const AxisRequirements &)> access;
@@ -1433,28 +1575,34 @@ private:
     for (Operation *write : plan.writes) {
       Value data = write->getOperand(write->getAttrOfType<IntegerAttr>("value_operand_index").getInt());
       auto type = cast<RankedTensorType>(data.getType());
-      AxisRequirements requested(type.getRank(), false); requested[0] = true;
+      AxisRequirements requested(type.getRank(), false); requested[selectedAxis] = true;
       if (!require(data, requested) || !access(write, type, requested)) return std::nullopt;
     }
-    for (Operation &op : block.without_terminator()) {
+    for (auto [source, axis] : sources) {
+      auto type = dyn_cast<RankedTensorType>(source.getType());
+      if (!type || axis >= type.getRank()) return std::nullopt;
+      AxisRequirements requested(type.getRank(), false); requested[axis] = true;
+      if (!require(source, requested)) return std::nullopt;
+    }
+    if (sources.empty()) for (Operation &op : block.without_terminator()) {
       if (canDefer(&op) || isa<ViewStoreOp, ScatterUniqueOp, DimOp, AssumeInBoundsOp>(op)) continue;
       for (Value result : op.getResults()) if (!scalar(result)) return std::nullopt;
     }
     return plan;
   }
-  LogicalResult lowerTiledWorkset(Block &block, const WorksetTiling &plan) {
+  LogicalResult lowerTiledWorkset(Block &block, const WorksetTiling &plan, bool prepared = false) {
     Location loc = block.getParentOp()->getLoc();
     // Scalar bounds and readonly scalar inputs keep their original evaluation
     // order. Tensor producers remain lazy until their selected slice is needed.
-    for (Operation &op : block.without_terminator()) {
+    if (!prepared) for (Operation &op : block.without_terminator()) {
       if (canDefer(&op) || isa<ViewStoreOp, ScatterUniqueOp>(op)) continue;
       if (failed(lowerOperation(&op))) return failure();
     }
     DenseMap<Value, LocalShape> complete;
     Value size;
-    int64_t capacity = config.getTileM();
+    int64_t capacity = plan.axis == 0 ? config.getTileM() : config.getTileN();
     for (auto &entry : plan.requirements) {
-      auto shape = localShape(cast<RankedTensorType>(entry.first.getType()), loc);
+      auto shape = localShape(entry.first, loc);
       if (failed(shape)) return failure();
       for (unsigned axis = 0; axis < shape->size(); ++axis) if (entry.second[axis]) {
         const auto &local = (*shape)[axis];
@@ -1476,6 +1624,7 @@ private:
           if (entry.second[axis]) shape[axis] = {shape[axis].extent, begin, count, capacity};
         valueSlices[entry.first] = std::move(shape);
       }
+      if (auto nested = planExecutionSlices(block, plan.axis + 1)) return lowerTiledWorkset(block, *nested, true);
       for (Operation *write : plan.writes) if (failed(lowerOperation(write))) return failure();
       return success();
     });
@@ -1492,7 +1641,7 @@ private:
       fold = region;
     }
     if (!fold) {
-      if (auto plan = planWorksetTiling(block)) return lowerTiledWorkset(block, *plan);
+      if (auto plan = planExecutionSlices(block)) return lowerTiledWorkset(block, *plan);
       return lowerOperations(block);
     }
     auto sourceType = cast<RankedTensorType>(fold.getInputs().front().getType());
