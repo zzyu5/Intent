@@ -644,15 +644,61 @@ FailureOr<bool> composeReshapedGather(GatherOp gather) {
   return true;
 }
 
+FailureOr<bool> composeRangeGather(GatherOp gather) {
+  auto range = gather.getSource().getDefiningOp<MakeRangeOp>();
+  auto result = dyn_cast<FragmentType>(gather.getResult().getType());
+  if (!range || !result || gather.getSourceAxes() != ArrayRef<int64_t>{0} ||
+      !uniformElementType(gather.getCoordinates().front().getType()).isIndex())
+    return false;
+  OpBuilder builder(gather);
+  Location location = gather.getLoc();
+  auto coordinate = projectPhysicalValueToSchema(
+      builder, location, gather.getCoordinates().front(), result);
+  if (failed(coordinate))
+    return gather.emitOpError("range gather lost its result coordinate projection");
+  Value start = builder.create<SplatOp>(location, result, range.getStart());
+  Value step = builder.create<SplatOp>(location, result, range.getStep());
+  Value offset = builder.create<BinaryOp>(location, result, *coordinate, step,
+                                         BinaryOperator::Multiply);
+  Value value = builder.create<BinaryOp>(location, result, start, offset,
+                                        BinaryOperator::Add);
+  if (gather.getValid())
+    value = builder.create<SelectOp>(location, result, gather.getValid(), value,
+                                     gather.getFill());
+  gather.getResult().replaceAllUsesWith(value);
+  gather.erase();
+  return true;
+}
+
 FailureOr<bool> composePointwiseGather(GatherOp gather) {
   auto source = dyn_cast<FragmentType>(gather.getSource().getType());
   auto result = dyn_cast<FragmentType>(gather.getResult().getType());
   Operation *producer = gather.getSource().getDefiningOp();
   if (!source || !result || !producer ||
-      !isa<UnaryOp, BinaryOp, BroadcastOp, SplatOp, ReshapeOp>(producer) ||
-      !isa<FloatType>(source.getElementType()) ||
+      !isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp,
+           BroadcastOp, SplatOp, ReshapeOp>(producer) ||
       gather.getSourceAxes().size() != source.getShape().size())
     return false;
+  if (auto binary = dyn_cast<BinaryOp>(producer);
+      binary && !isa<FloatType>(source.getElementType())) {
+    // Masked operands below are filled with zero. Do not introduce undefined
+    // integer arithmetic on those inactive lanes.
+    switch (binary.getOperatorKind()) {
+    case BinaryOperator::Add:
+    case BinaryOperator::Subtract:
+    case BinaryOperator::Multiply:
+    case BinaryOperator::Maximum:
+    case BinaryOperator::Minimum:
+    case BinaryOperator::LogicalAnd:
+    case BinaryOperator::LogicalOr:
+    case BinaryOperator::BitwiseAnd:
+    case BinaryOperator::BitwiseOr:
+    case BinaryOperator::BitwiseXor:
+      break;
+    default:
+      return false;
+    }
+  }
   bool positionalRebind = false;
   if (auto reshape = dyn_cast<ReshapeOp>(producer)) {
     auto input = cast<FragmentType>(reshape.getValue().getType());
@@ -759,8 +805,9 @@ FailureOr<bool> composePointwiseGather(GatherOp gather) {
         gather.getValid(), fill, selectedAxes).getResult());
   }
   // Keep reductions and immutable reads as captured SSA producers. Only the
-  // floating pointwise suffix moves to the selected coordinates. Inactive
-  // operands use zero; restore the original gather fill after IEEE arithmetic.
+  // pure pointwise suffix moves to the selected coordinates. Inactive operands
+  // use zero (also a valid cast input); restore the original gather fill after
+  // evaluating the unchanged typed operation.
   Value value;
   if (positionalRebind) {
     value = mapping.lookup(producer->getOperand(0));
@@ -2447,6 +2494,13 @@ LogicalResult realizeAccessComposition(ModuleOp module) {
     for (GatherOp gather : gathers) {
       if (!gather->getBlock())
         continue;
+      FailureOr<bool> range = composeRangeGather(gather);
+      if (failed(range))
+        return failure();
+      if (*range) {
+        changed = true;
+        continue;
+      }
       FailureOr<bool> reshaped = composeReshapedGather(gather);
       if (failed(reshaped))
         return failure();
