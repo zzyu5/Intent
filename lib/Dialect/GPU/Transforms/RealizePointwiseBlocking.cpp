@@ -4778,9 +4778,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       internalTraversalRanges.insert(range.getOperation());
     }
     llvm::erase_if(dynamicRanges, [&](MakeRangeOp range) {
-      return llvm::any_of(realized, [&](MakeRangeOp realizedRange) {
-        return sameLogicalRange(range, realizedRange);
-      });
+      return llvm::is_contained(realized, range);
     });
     eraseDeadPhysicalValues(kernel);
     allRanges.clear();
