@@ -37,6 +37,8 @@ from .builtins import e2m1
 from .builtins import e4m3
 from .builtins import e8m0
 from .builtins import erf
+from .builtins import erfc
+from .builtins import i0
 from .builtins import scaled_contract
 from .builtins import sparse
 from .builtins import sparse_contract
@@ -54,6 +56,7 @@ from .builtins import indices
 from .builtins import join
 from .builtins import inf
 from .builtins import log
+from .builtins import log1p
 from .builtins import lgamma
 from .builtins import mask
 from .builtins import maximum
@@ -147,6 +150,8 @@ __all__ = [
     "e4m3",
     "e8m0",
     "erf",
+    "erfc",
+    "i0",
     "scaled_contract",
     "sparse",
     "sparse_contract",
@@ -175,6 +180,7 @@ __all__ = [
     "join",
     "inf",
     "log",
+    "log1p",
     "lgamma",
     "mask",
     "maximum",

@@ -33,7 +33,10 @@ def Intent_UnaryOperator : Intent_I32Enum<"UnaryOperator",
       I32EnumAttrCase<"Tanh", 11, "tanh">,
       I32EnumAttrCase<"Abs", 12, "abs">,
       I32EnumAttrCase<"Sqrt", 13, "sqrt">,
-      I32EnumAttrCase<"Lgamma", 14, "lgamma">
+      I32EnumAttrCase<"Lgamma", 14, "lgamma">,
+      I32EnumAttrCase<"Log1p", 15, "log1p">,
+      I32EnumAttrCase<"Erfc", 16, "erfc">,
+      I32EnumAttrCase<"I0", 17, "i0">
     ]>;
 def Intent_UnaryOperatorAttr :
     Intent_I32EnumAttr<"unary_operator", Intent_UnaryOperator>;

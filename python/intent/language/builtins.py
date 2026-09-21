@@ -89,11 +89,14 @@ select = Intrinsic("select")
 exp = Intrinsic("exp")
 exp2 = Intrinsic("exp2")
 log = Intrinsic("log")
+log1p = Intrinsic("log1p")
 lgamma = Intrinsic("lgamma")
 sin = Intrinsic("sin")
 cos = Intrinsic("cos")
 floor = Intrinsic("floor")
 erf = Intrinsic("erf")
+erfc = Intrinsic("erfc")
+i0 = Intrinsic("i0")
 rsqrt = Intrinsic("rsqrt")
 sqrt = Intrinsic("sqrt")
 sigmoid = Intrinsic("sigmoid")
@@ -183,11 +186,14 @@ INTRINSICS = {
         exp,
         exp2,
         log,
+        log1p,
         lgamma,
         sin,
         cos,
         floor,
         erf,
+        erfc,
+        i0,
         rsqrt,
         sqrt,
         sigmoid,
