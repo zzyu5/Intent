@@ -129,9 +129,23 @@ LogicalResult intent::dsa::verifyProgram(ModuleOp module, bool bound) {
         return WalkResult::interrupt();
       }
     }
+    if (auto view = dyn_cast<memref::ReinterpretCastOp>(op)) {
+      auto source = cast<MemRefType>(view.getSource().getType()), result = view.getType();
+      Value owner = view.getSource();
+      while (auto parent = owner.getDefiningOp<memref::ReinterpretCastOp>()) owner = parent.getSource();
+      if (!tile(view.getSource()) || !tile(view.getResult()) || !owner.getDefiningOp<memref::AllocaOp>() ||
+          source.getElementType() != result.getElementType() || source.getNumElements() != result.getNumElements() ||
+          !source.getLayout().isIdentity() || !result.getLayout().isIdentity() ||
+          !view.getOffsets().empty() || !view.getSizes().empty() || !view.getStrides().empty() ||
+          view.getStaticOffsets() != ArrayRef<int64_t>({0}) || view.getStaticSizes() != result.getShape() ||
+          view.getStaticStrides() != ArrayRef<int64_t>({result.getDimSize(1), 1})) {
+        op->emitError("DSA local views require a same-dtype contiguous reshape of one complete owned allocation");
+        return WalkResult::interrupt();
+      }
+    }
     for (Type type : op->getResultTypes()) {
-      if (isa<MemRefType>(type) && !isa<memref::AllocaOp>(op)) {
-        op->emitError("DSA local buffers require explicit storage; alias results and escaping control state are not supported");
+      if (isa<MemRefType>(type) && !isa<memref::AllocaOp, memref::ReinterpretCastOp>(op)) {
+        op->emitError("DSA local buffers require explicit storage or an owned contiguous view; escaping control state is not supported");
         return WalkResult::interrupt();
       }
     }

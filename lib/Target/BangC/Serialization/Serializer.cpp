@@ -156,6 +156,10 @@ private:
           std::to_string(op->getAttrOfType<IntegerAttr>("bangc.offset").getInt()) + ");", depth);
       return success();
     }
+    if (auto view = dyn_cast<memref::ReinterpretCastOp>(op)) {
+      line(ctype(view.getType().getElementType()) + " *" + bind(view.getResult()) + " = " + name(view.getSource()) + ";", depth);
+      return success();
+    }
     if (auto load = dyn_cast<dsa::LoadTileOp>(op)) {
       bool local = cast<MemRefType>(load.getSource().getType()).getMemorySpaceAsInt() == dsa::nramSpace;
       line(std::string(local ? "intent_load_local_tile<" : "intent_load_tile<") + shape(load.getOutput()) + ">(" + name(load.getOutput()) + ", " + name(load.getSource()) +
@@ -295,6 +299,9 @@ private:
       std::string callee;
       if (isa<math::ExpOp>(op)) callee = "expf";
       if (isa<math::Exp2Op>(op)) callee = "exp2f";
+      if (isa<math::SinOp>(op)) callee = "sinf";
+      if (isa<math::CosOp>(op)) callee = "cosf";
+      if (isa<math::FloorOp>(op)) callee = "floorf";
       if (isa<math::LogOp>(op)) callee = "logf";
       if (isa<math::SqrtOp>(op)) callee = "sqrtf";
       if (isa<math::RsqrtOp>(op)) callee = "1.0f / sqrtf";

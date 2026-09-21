@@ -319,6 +319,105 @@ private:
     };
     return visit(0);
   }
+  bool compactPrefix(const LocalShape &shape) {
+    for (unsigned axis = 1; axis < shape.size(); ++axis) {
+      APInt count;
+      if (!matchPattern(shape[axis].count, m_ConstantInt(&count)) || count.getSExtValue() != shape[axis].capacity) return false;
+    }
+    return true;
+  }
+  bool completeShape(const LocalShape &shape) {
+    return llvm::all_of(shape, [&](const LocalAxis &axis) {
+      return matchPattern(axis.begin, m_Zero()) && sameIndex(axis.count, axis.extent);
+    });
+  }
+  Value contiguousView(Location loc, Value source, const LocalShape &shape) {
+    auto type = cast<MemRefType>(source.getType());
+    int64_t rows = 1;
+    for (unsigned axis = 0; axis + 1 < shape.size(); ++axis) rows *= shape[axis].capacity;
+    int64_t columns = shape.empty() ? 1 : shape.back().capacity;
+    auto targetType = MemRefType::get({rows, columns}, type.getElementType(), MemRefLayoutAttrInterface{}, type.getMemorySpace());
+    Value result = b.create<memref::ReinterpretCastOp>(loc, targetType, source, int64_t(0),
+        ArrayRef<int64_t>{rows, columns}, ArrayRef<int64_t>{columns, 1});
+    localShapes[result] = shape;
+    return result;
+  }
+  LogicalResult reshapeTensor(Operation *op, const LocalShape &shape) {
+    Location loc = op->getLoc();
+    Value input = get(op->getOperand(0));
+    if (!input || !localShapes.count(input)) return op->emitError("DSA reshape input is unavailable");
+    LocalShape original = localShapes.lookup(input);
+    if (!completeShape(original) || !completeShape(shape))
+      return op->emitError("DSA reshape requires a complete logical tensor before selecting execution slices");
+    int64_t elements = 1;
+    for (const auto &axis : shape) elements *= axis.capacity;
+    Value output;
+    if (compactPrefix(original) && compactPrefix(shape) && elements == cast<MemRefType>(input.getType()).getNumElements()) {
+      output = contiguousView(loc, input, shape);
+    } else {
+      output = allocateTensor(loc, cast<RankedTensorType>(op->getResult(0).getType()).getElementType(), shape);
+      if (failed(eachElement(loc, shape, [&](ValueRange coordinates) {
+        Value linear = index(loc, 0);
+        for (unsigned axis = 0; axis < shape.size(); ++axis)
+          linear = add(loc, mul(loc, linear, shape[axis].count), coordinates[axis]);
+        SmallVector<Value> source(original.size());
+        for (int64_t axis = static_cast<int64_t>(original.size()) - 1; axis >= 0; --axis) {
+          // A zero-sized tensor has no active iterations; use a nonzero divisor
+          // so its unreachable indexing remains well-defined during folding.
+          Value count = b.create<arith::MaxSIOp>(loc, original[axis].count, index(loc, 1));
+          source[axis] = b.create<arith::RemSIOp>(loc, linear, count);
+          linear = b.create<arith::DivSIOp>(loc, linear, count);
+        }
+        storeLocal(loc, loadLocal(loc, input, source), output, coordinates);
+        return success();
+      }))) return failure();
+    }
+    values.map(op->getResult(0), output); return success();
+  }
+  LogicalResult joinTensor(Operation *op, const LocalShape &shape) {
+    Location loc = op->getLoc();
+    Value lhs = get(op->getOperand(0)), rhs = get(op->getOperand(1));
+    if (!lhs || !rhs || !localShapes.count(lhs) || !localShapes.count(rhs))
+      return op->emitError("DSA join inputs are unavailable");
+    LocalShape inputShape = localShapes.lookup(lhs), rightShape = localShapes.lookup(rhs);
+    if (shape.size() != inputShape.size() + 1 || rightShape.size() != inputShape.size() ||
+        shape.back().capacity != 2 || !matchPattern(shape.back().begin, m_Zero()) ||
+        !sameIndex(shape.back().count, index(loc, 2)))
+      return op->emitError("DSA join requires an unsliced trailing pair axis");
+    for (unsigned axis = 0; axis < inputShape.size(); ++axis) {
+      const LocalAxis *others[] = {&rightShape[axis], &shape[axis]};
+      for (const auto *other : others)
+        if (other->capacity != inputShape[axis].capacity || !sameIndex(other->begin, inputShape[axis].begin) ||
+            !sameIndex(other->count, inputShape[axis].count))
+          return op->emitError("DSA join inputs and output must have matching execution slices; axis ") << axis
+              << ", input capacity=" << inputShape[axis].capacity << ", other capacity=" << other->capacity
+              << ", input begin=" << inputShape[axis].begin << ", other begin=" << other->begin
+              << ", input count=" << inputShape[axis].count << ", other count=" << other->count;
+    }
+    Value output = allocateTensor(loc, cast<RankedTensorType>(op->getResult(0).getType()).getElementType(), shape);
+    if (!inputShape.empty() && compactPrefix(inputShape)) {
+      auto physical = cast<MemRefType>(lhs.getType());
+      LocalShape interleaved = inputShape;
+      auto &last = interleaved.back();
+      last.extent = mul(loc, last.extent, index(loc, 2));
+      last.begin = mul(loc, last.begin, index(loc, 2));
+      last.count = mul(loc, last.count, index(loc, 2));
+      last.capacity *= 2;
+      Value destination = contiguousView(loc, output, interleaved), rows = index(loc, 1);
+      for (unsigned axis = 0; axis + 1 < inputShape.size(); ++axis) rows = mul(loc, rows, inputShape[axis].count);
+      for (auto [slot, input] : llvm::enumerate(SmallVector<Value>{lhs, rhs}))
+        b.create<dsa::StoreTileOp>(loc, input, destination, index(loc, slot), index(loc, 2 * physical.getDimSize(1)),
+            index(loc, 2), rows, inputShape.back().count);
+    } else if (failed(eachElement(loc, inputShape, [&](ValueRange coordinates) {
+      SmallVector<Value> target(coordinates);
+      target.push_back(index(loc, 0));
+      storeLocal(loc, loadLocal(loc, lhs, coordinates), output, target);
+      target.back() = index(loc, 1);
+      storeLocal(loc, loadLocal(loc, rhs, coordinates), output, target);
+      return success();
+    }))) return failure();
+    values.map(op->getResult(0), output); return success();
+  }
   bool canDefer(Operation *op) {
     if (isa<RegionFoldOp, RegionScanOp, IfOp, ForOp, WhileOp, ParallelOp>(op)) return false;
     bool aggregate = llvm::any_of(op->getResultTypes(), [&](Type type) {
@@ -361,6 +460,8 @@ private:
     auto type = cast<RankedTensorType>(result.getType());
     auto shape = localShape(result, loc);
     if (failed(shape)) return failure();
+    if (isa<ReshapeOp>(op)) return reshapeTensor(op, *shape);
+    if (isa<JoinOp>(op)) return joinTensor(op, *shape);
     if (auto matrix = dyn_cast<ContractOp>(op)) return localMatMul(matrix, *shape);
     if (auto indices = dyn_cast<IndicesOp>(op)) {
       Value source = indices->getOperand(0);
@@ -2411,12 +2512,29 @@ private:
         if (unary.getApproximate() || unary.getFlushToZero()) return unary.emitError("DSA scalar numerical mode is not implemented");
         Value output;
         switch (unary.getOperatorKind()) {
+        case UnaryOperator::Sigmoid: {
+          Type declared = input.getType();
+          if (declared.isF16() || declared.isBF16()) input = scalarCast(loc, input, b.getF32Type());
+          Value one = b.create<arith::ConstantOp>(loc, b.getFloatAttr(input.getType(), 1.0));
+          Value zero = b.create<arith::ConstantOp>(loc, b.getZeroAttr(input.getType()));
+          Value absolute = b.create<math::AbsFOp>(loc, input);
+          Value negative = b.create<arith::NegFOp>(loc, absolute);
+          Value exponential = b.create<math::ExpOp>(loc, negative);
+          Value denominator = b.create<arith::AddFOp>(loc, one, exponential);
+          Value belowZero = b.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OLT, input, zero);
+          Value numerator = b.create<arith::SelectOp>(loc, belowZero, exponential, one);
+          output = scalarCast(loc, b.create<arith::DivFOp>(loc, numerator, denominator), declared);
+          break;
+        }
         case UnaryOperator::Exp: output = b.create<math::ExpOp>(loc, input); break;
         case UnaryOperator::Exp2: output = b.create<math::Exp2Op>(loc, input); break;
         case UnaryOperator::Log: output = b.create<math::LogOp>(loc, input); break;
         case UnaryOperator::Sqrt: output = b.create<math::SqrtOp>(loc, input); break;
         case UnaryOperator::Rsqrt: output = b.create<math::RsqrtOp>(loc, input); break;
         case UnaryOperator::Tanh: output = b.create<math::TanhOp>(loc, input); break;
+        case UnaryOperator::Sin: output = b.create<math::SinOp>(loc, input); break;
+        case UnaryOperator::Cos: output = b.create<math::CosOp>(loc, input); break;
+        case UnaryOperator::Floor: output = b.create<math::FloorOp>(loc, input); break;
         case UnaryOperator::Abs: output = b.create<math::AbsFOp>(loc, input); break;
         case UnaryOperator::Negate: output = b.create<arith::NegFOp>(loc, input); break;
         default: return unary.emitError("DSA scalar unary operation is not implemented");

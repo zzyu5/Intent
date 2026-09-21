@@ -14,7 +14,8 @@ namespace intent::bangc {
 namespace {
 bool supportedUnary(UnaryOperator kind) {
   return kind == UnaryOperator::Exp || kind == UnaryOperator::Exp2 || kind == UnaryOperator::Log || kind == UnaryOperator::Sqrt ||
-      kind == UnaryOperator::Rsqrt || kind == UnaryOperator::Tanh || kind == UnaryOperator::Abs || kind == UnaryOperator::Negate;
+      kind == UnaryOperator::Rsqrt || kind == UnaryOperator::Tanh || kind == UnaryOperator::Abs || kind == UnaryOperator::Negate ||
+      kind == UnaryOperator::Sin || kind == UnaryOperator::Cos || kind == UnaryOperator::Floor;
 }
 bool supportedBinary(BinaryOperator kind) {
   return kind == BinaryOperator::Add || kind == BinaryOperator::Subtract || kind == BinaryOperator::Multiply ||
@@ -79,9 +80,51 @@ LogicalResult realizeMatMul(dsa::MatMulOp matrix, dsa::ConfigurationAttr config)
   matrix.erase();
   return success();
 }
-// Local allocations have no escaping aliases in the bound DSA surface. Lift
-// every nested use to the allocation's block: a value read in a loop remains
-// live across the complete loop, including its backedge.
+LogicalResult realizeSigmoid(dsa::UnaryOp sigmoid) {
+  if (sigmoid.getApproximate() || sigmoid.getFlushToZero())
+    return sigmoid.emitError("sigmoid numerical mode has no selected BANG C implementation");
+  Location loc = sigmoid.getLoc();
+  OpBuilder b(sigmoid);
+  auto type = cast<MemRefType>(sigmoid.getInput().getType());
+  Value input = sigmoid.getInput(), output = sigmoid.getOutput();
+  if (!type.getElementType().isF32()) {
+    input = allocate(b, loc, b.getF32Type(), type.getShape(), dsa::nramSpace);
+    output = allocate(b, loc, b.getF32Type(), type.getShape(), dsa::nramSpace);
+    b.create<dsa::CastOp>(loc, sigmoid.getInput(), input);
+  }
+  Value absolute = allocate(b, loc, b.getF32Type(), type.getShape(), dsa::nramSpace);
+  Value negative = allocate(b, loc, b.getF32Type(), type.getShape(), dsa::nramSpace);
+  auto unary = [&](Value from, Value to, UnaryOperator kind) {
+    b.create<dsa::UnaryOp>(loc, from, to, UnaryOperatorAttr::get(b.getContext(), kind),
+        b.getBoolAttr(false), b.getBoolAttr(false));
+  };
+  unary(input, absolute, UnaryOperator::Abs);
+  unary(absolute, negative, UnaryOperator::Negate);
+  unary(negative, absolute, UnaryOperator::Exp);
+  auto index = [&](int64_t n) -> Value { return b.create<arith::ConstantIndexOp>(loc, n); };
+  Value one = b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(1));
+  Value zero = b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(0));
+  auto rows = b.create<scf::ForOp>(loc, index(0), index(type.getDimSize(0)), index(1));
+  {
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(rows.getBody());
+    auto columns = b.create<scf::ForOp>(loc, index(0), index(type.getDimSize(1)), index(1));
+    b.setInsertionPointToStart(columns.getBody());
+    SmallVector<Value> coordinates{rows.getInductionVar(), columns.getInductionVar()};
+    Value x = b.create<memref::LoadOp>(loc, input, coordinates);
+    Value e = b.create<memref::LoadOp>(loc, absolute, coordinates);
+    Value denominator = b.create<arith::AddFOp>(loc, one, e);
+    Value belowZero = b.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OLT, x, zero);
+    Value numerator = b.create<arith::SelectOp>(loc, belowZero, e, one);
+    Value result = b.create<arith::DivFOp>(loc, numerator, denominator);
+    b.create<memref::StoreOp>(loc, result, output, coordinates);
+  }
+  if (output != sigmoid.getOutput()) b.create<dsa::CastOp>(loc, output, sigmoid.getOutput());
+  sigmoid.erase();
+  return success();
+}
+// Contiguous views retain the allocation's ownership. Follow their uses and
+// lift nested uses to the allocation's block, retaining loop backedge liveness.
 void bindStorage(func::FuncOp function, int64_t &nram, int64_t &wram) {
   DenseMap<Operation *, uint64_t> begin, end;
   uint64_t clock = 0;
@@ -97,9 +140,12 @@ void bindStorage(func::FuncOp function, int64_t &nram, int64_t &wram) {
   SmallVector<Range> live;
   function.walk<WalkOrder::PreOrder>([&](memref::AllocaOp allocation) {
     uint64_t start = begin[allocation], finish = end[allocation];
-    for (Operation *user : allocation.getResult().getUsers()) {
-      while (user->getBlock() != allocation->getBlock()) user = user->getParentOp();
-      finish = std::max(finish, end[user]);
+    SmallVector<Value> aliases{allocation.getResult()};
+    for (unsigned i = 0; i < aliases.size(); ++i) for (Operation *user : aliases[i].getUsers()) {
+      if (auto view = dyn_cast<memref::ReinterpretCastOp>(user)) aliases.push_back(view.getResult());
+      Operation *scope = user;
+      while (scope->getBlock() != allocation->getBlock()) scope = scope->getParentOp();
+      finish = std::max(finish, end[scope]);
     }
     auto type = allocation.getType();
     bool matrix = type.getMemorySpaceAsInt() == dsa::matrixSpace;
@@ -167,11 +213,17 @@ LogicalResult legalizeProgram(ModuleOp module, StringRef architecture) {
       builder.create<dsa::CastOp>(op->getLoc(), output, destination);
     }
   }
+  // The hardware activation approximations truncate part of sigmoid's domain.
+  // Keep exp(-abs(x)) and a sign-selected numerator explicit instead.
+  SmallVector<dsa::UnaryOp> sigmoids;
+  function.walk([&](dsa::UnaryOp op) { if (op.getKind() == UnaryOperator::Sigmoid) sigmoids.push_back(op); });
+  for (auto sigmoid : sigmoids) if (failed(realizeSigmoid(sigmoid))) return failure();
   SmallVector<Operation *> bf16Scalar;
   function.walk([&](Operation *op) {
     if (isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp, arith::NegFOp,
             arith::MaximumFOp, arith::MinimumFOp, arith::MaxNumFOp, arith::MinNumFOp, arith::CmpFOp,
-            math::ExpOp, math::Exp2Op, math::LogOp, math::SqrtOp, math::RsqrtOp, math::TanhOp, math::AbsFOp>(op) &&
+            math::ExpOp, math::Exp2Op, math::LogOp, math::SqrtOp, math::RsqrtOp, math::TanhOp, math::AbsFOp,
+            math::SinOp, math::CosOp, math::FloorOp>(op) &&
         llvm::any_of(op->getOperandTypes(), [](Type type) { return type.isBF16(); })) bf16Scalar.push_back(op);
   });
   for (Operation *op : bf16Scalar) {
@@ -206,6 +258,9 @@ LogicalResult legalizeProgram(ModuleOp module, StringRef architecture) {
         case UnaryOperator::Tanh: callee = "__cn_vector_tanh"; break;
         case UnaryOperator::Sqrt: callee = "__cn_vector_sqrt"; break;
         case UnaryOperator::Rsqrt: callee = "__cn_vector_rsqrt"; break;
+        case UnaryOperator::Sin: callee = "__cn_vector_sin"; break;
+        case UnaryOperator::Cos: callee = "__cn_vector_cos"; break;
+        case UnaryOperator::Floor: callee = "__cn_vector_floor"; break;
         default: break;
         }
         if (!callee.empty()) op->setAttr("bangc.callee", StringAttr::get(module.getContext(), callee.str() + (element.isF16() ? "_f16" : "_f32")));
@@ -239,7 +294,8 @@ LogicalResult legalizeProgram(ModuleOp module, StringRef architecture) {
              arith::AndIOp, arith::OrIOp, arith::XOrIOp, arith::ShLIOp, arith::ShRSIOp,
              arith::MaximumFOp, arith::MinimumFOp, arith::MaxNumFOp, arith::MinNumFOp,
              arith::NegFOp, math::ExpOp, math::Exp2Op, math::LogOp, math::SqrtOp, math::RsqrtOp, math::TanhOp, math::AbsFOp,
-             memref::DimOp, memref::AllocaOp, memref::LoadOp, memref::StoreOp, memref::CopyOp,
+             math::SinOp, math::CosOp, math::FloorOp,
+             memref::DimOp, memref::AllocaOp, memref::ReinterpretCastOp, memref::LoadOp, memref::StoreOp, memref::CopyOp,
              scf::ForOp, scf::WhileOp, scf::IfOp, scf::ConditionOp, scf::YieldOp, func::FuncOp, func::ReturnOp>(op)) {
       op->emitError("operation is outside the bound BANG C surface"); return WalkResult::interrupt();
     }
