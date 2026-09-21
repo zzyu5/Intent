@@ -105,10 +105,9 @@ LogicalResult collectLogicalWorkset(
         directWrite |= hasObservableWrite(candidate);
     });
   }
-  if (!children.empty()) {
-    if (directWrite)
-      return parallel.emitOpError(
-          "parallel region mixes direct writes with nested independent worksets");
+  // Flatten only a pure parallel nest. Direct effects belong to the outer
+  // iteration and must not be repeated for each point of a child workset.
+  if (!children.empty() && !directWrite) {
     for (ParallelOp child : children)
       if (failed(collectLogicalWorkset(child, current.domains,
                                        current.coordinates, worksets)))
