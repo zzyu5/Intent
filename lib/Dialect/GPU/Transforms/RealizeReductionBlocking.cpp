@@ -3564,6 +3564,120 @@ FailureOr<SourcePlan> nestedScalarReductionSource(ReduceOp reduce,
   return plan;
 }
 
+BinaryOp singleReductionUpdate(scf::ForOp loop) {
+  if (!loop || !loop->hasAttr(reductionSourcesAttr) ||
+      loop.getNumRegionIterArgs() != 1)
+    return {};
+  Value carry = loop.getRegionIterArg(0);
+  auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+  auto update = yield.getOperand(0).getDefiningOp<BinaryOp>();
+  if (!update || update->getBlock() != loop.getBody() ||
+      !update.getResult().hasOneUse() || !carry.hasOneUse() ||
+      update.getLhs() != carry)
+    return {};
+  return update;
+}
+
+bool sameReductionBinary(BinaryOp lhs, BinaryOp rhs) {
+  return lhs.getOperatorKind() == rhs.getOperatorKind() &&
+         lhs.getApproximate() == rhs.getApproximate() &&
+         lhs.getFlushToZero() == rhs.getFlushToZero() &&
+         dataElementType(lhs.getResult().getType()) ==
+             dataElementType(rhs.getResult().getType());
+}
+
+bool hoistNestedReduction(scf::ForOp outer, func::FuncOp kernel) {
+  BinaryOp update = singleReductionUpdate(outer);
+  if (!update)
+    return false;
+  FailureOr<Value> identity = scalarSource(outer.getInitArgs().front());
+  if (failed(identity) || !DominanceInfo(kernel).dominates(*identity, outer))
+    return false;
+
+  SmallVector<ReduceOp> reductions;
+  Value source = update.getRhs();
+  while (auto reduce = source.getDefiningOp<ReduceOp>()) {
+    if (reduce->getBlock() != outer.getBody() ||
+        reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 ||
+        reduce.getCaptureCount() != 0 || reduce.getNumResults() != 1 ||
+        !source.hasOneUse() ||
+        !sameScalarValue(reduce.getInputs()[1], *identity))
+      return false;
+    Block &combine = reduce.getCombine().front();
+    if (combine.getNumArguments() != 2 ||
+        !llvm::hasSingleElement(combine.without_terminator()))
+      return false;
+    auto binary = dyn_cast<BinaryOp>(combine.front());
+    auto yield = cast<YieldOp>(combine.getTerminator());
+    if (!binary || !sameReductionBinary(binary, update) ||
+        binary.getLhs() != combine.getArgument(0) ||
+        binary.getRhs() != combine.getArgument(1) ||
+        yield.getValues().size() != 1 ||
+        yield.getValues().front() != binary.getResult())
+      return false;
+    reductions.push_back(reduce);
+    source = reduce.getInputs().front();
+  }
+  auto inner = source.getDefiningOp<scf::ForOp>();
+  BinaryOp innerUpdate = singleReductionUpdate(inner);
+  auto tileType = dyn_cast<FragmentType>(source.getType());
+  if (reductions.empty() || !innerUpdate || !tileType ||
+      inner->getBlock() != outer.getBody() || !source.hasOneUse() ||
+      !sameReductionBinary(innerUpdate, update) ||
+      !sameScalarValue(inner.getInitArgs().front(), *identity))
+    return false;
+
+  // These are compiler-created ordinary-reduction traversals. Keep their
+  // existing tile, loads, masks and effects, but carry the tile through both
+  // loops so the native collective runs only after traversal is complete.
+  // The one-use checks exclude observable partial sums and ordered carries.
+  OpBuilder builder(outer);
+  Value initial = builder.create<SplatOp>(outer.getLoc(), tileType, *identity);
+  auto replacement = builder.create<scf::ForOp>(
+      outer.getLoc(), outer.getLowerBound(), outer.getUpperBound(),
+      outer.getStep(), ValueRange{initial});
+  replacement->setAttrs(outer->getAttrs());
+  SmallVector<Attribute> traversals;
+  for (scf::ForOp loop : {outer, inner})
+    for (Attribute traversal :
+         loop->getAttrOfType<ArrayAttr>(reductionSourcesAttr))
+      if (!llvm::is_contained(traversals, traversal))
+        traversals.push_back(traversal);
+  replacement->setAttr(reductionSourcesAttr, builder.getArrayAttr(traversals));
+
+  IRMapping mapping;
+  mapping.map(outer.getInductionVar(), replacement.getInductionVar());
+  builder.setInsertionPointToStart(replacement.getBody());
+  for (Operation &operation : outer.getBody()->without_terminator()) {
+    if (&operation == update.getOperation() ||
+        llvm::any_of(reductions, [&](ReduceOp reduce) {
+          return reduce.getOperation() == &operation;
+        }))
+      continue;
+    Operation *cloned = builder.clone(operation, mapping);
+    if (&operation == inner.getOperation())
+      cast<scf::ForOp>(cloned).getInitArgsMutable().assign(
+          replacement.getRegionIterArgs());
+  }
+  builder.create<scf::YieldOp>(outer.getLoc(), mapping.lookup(source));
+
+  builder.setInsertionPointAfter(replacement);
+  Value result = replacement.getResult(0);
+  for (ReduceOp reduce : llvm::reverse(reductions)) {
+    IRMapping reduceMapping;
+    reduceMapping.map(reduce.getInputs().front(), result);
+    Value projectedIdentity = *identity;
+    if (auto fragment = dyn_cast<FragmentType>(reduce.getInputs()[1].getType()))
+      projectedIdentity = builder.create<SplatOp>(
+          reduce.getLoc(), fragment, projectedIdentity);
+    reduceMapping.map(reduce.getInputs()[1], projectedIdentity);
+    result = builder.clone(*reduce, reduceMapping)->getResult(0);
+  }
+  outer.getResult(0).replaceAllUsesWith(result);
+  outer.erase();
+  return true;
+}
+
 } // namespace
 
 LogicalResult decomposeMultiAxisReductions(ModuleOp module) {
@@ -3648,6 +3762,14 @@ LogicalResult realizeReductionBlocking(ModuleOp module) {
         return failure();
     }
   }
+  SmallVector<scf::ForOp> loops;
+  kernel.walk<WalkOrder::PostOrder>(
+      [&](scf::ForOp loop) { loops.push_back(loop); });
+  bool changed = false;
+  for (scf::ForOp loop : loops)
+    changed |= hoistNestedReduction(loop, kernel);
+  if (changed)
+    eraseDeadPhysicalValues(kernel);
   return success();
 }
 
