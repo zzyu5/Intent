@@ -71,9 +71,14 @@ bool hoistInputsBefore(Operation *first, Operation *second,
     Operation *producer = value.getDefiningOp();
     if (!producer || producer->getBlock() != first->getBlock() ||
         !first->isBeforeInBlock(producer) ||
-        !producer->isBeforeInBlock(second) || producer->getNumRegions() ||
-        !isMemoryEffectFree(producer) ||
-        !llvm::all_of(producer->getOperands(), availableBeforeFirst))
+        !producer->isBeforeInBlock(second) || producer->getNumRegions())
+      return false;
+    if (!isMemoryEffectFree(producer)) {
+      auto load = dyn_cast<LoadOp>(producer);
+      if (!load || !canReplayReadAt(load, first))
+        return false;
+    }
+    if (!llvm::all_of(producer->getOperands(), availableBeforeFirst))
       return false;
     if (!llvm::is_contained(hoist, producer))
       hoist.push_back(producer);

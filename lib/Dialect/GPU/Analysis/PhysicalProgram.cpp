@@ -2140,6 +2140,16 @@ bool canReplayReadAt(LoadOp load, Operation *insertionAnchor) {
       return WalkResult::interrupt();
     }).wasInterrupted();
   };
+  // This motion stays in the same invocation of the enclosing block, including
+  // the same iteration when the block belongs to an ordered loop.
+  if (insertionAnchor->getBlock() == load->getBlock() &&
+      insertionAnchor->isBeforeInBlock(load)) {
+    for (Operation *operation = insertionAnchor; operation != load;
+         operation = operation->getNextNode())
+      if (!preservesRead(operation))
+        return false;
+    return true;
+  }
   // A branch only needs its executed prefix; entering a loop also exposes
   // this read to writes from earlier iterations.
   Operation *ancestor = insertionAnchor;
