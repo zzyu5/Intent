@@ -5749,9 +5749,10 @@ static LogicalResult fuseMultiplyReductions(ModuleOp module) {
         }
       }
     }
-    // Expose matrix reuse. Vector inner products already have a native reduce
-    // path; turning every such reduction into a contraction adds no reuse.
-    if (!compatible || !lhsFree || !rhsFree)
+    // Preserve matrix-vector reuse before ownership can lift an independent
+    // workset axis onto the other operand. Remaining vector contractions are
+    // realized as native reductions after blocking.
+    if (!compatible || (!lhsFree && !rhsFree))
       continue;
     OpBuilder builder(reduce);
     auto squeeze = [&](Value value, ArrayRef<int64_t> kept) -> Value {
@@ -5784,7 +5785,8 @@ static LogicalResult fuseMultiplyReductions(ModuleOp module) {
     rhs = squeeze(rhs, rhsKept);
     // Preserve the innermost result coordinates as the matrix column axes.
     // The multiplication's operand order does not define matrix orientation.
-    if (lhsBatch.empty() && rhsBatch.empty() &&
+    if (lhsBatch.empty() && rhsBatch.empty() && !lhsOutput.empty() &&
+        !rhsOutput.empty() &&
         lhsOutput.back() > rhsOutput.back()) {
       std::swap(lhs, rhs);
       std::swap(lhsReduced, rhsReduced);
