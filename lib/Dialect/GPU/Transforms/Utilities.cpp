@@ -2520,9 +2520,13 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
             targetExtent.getValue() == 1;
         if (targetSingleton) {
           PhysicalProgramAnalysis analysis(kernel);
+          auto sourceMap = cast<AxisMapAttr>(source.getAxisMaps()[*sourceAxis]);
+          auto targetMap = cast<AxisMapAttr>(target.getAxisMaps()[targetAxis]);
+          bool derivedOccurrence =
+              targetMap.getDerived() && sourceMap.getDimensionId() > 0 &&
+              sourceMap.getDimensionId() == targetMap.getDimensionId();
           if (analysis.axisRealization(broadcast.getResult(), targetAxis)
-                  .constructionScalarSeed) {
-            auto targetMap = cast<AxisMapAttr>(target.getAxisMaps()[targetAxis]);
+                  .constructionScalarSeed || derivedOccurrence) {
             retargetSourceExtent(broadcast.getResult(),
                                  sourceAxisIdentity(targetMap), sourceExtent);
             target = cast<FragmentType>(broadcast.getResult().getType());
