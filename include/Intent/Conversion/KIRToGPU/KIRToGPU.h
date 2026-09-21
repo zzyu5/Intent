@@ -13,6 +13,7 @@ struct GPUCapabilities {
   int64_t maxThreadsPerBlock;
   int64_t computeCapabilityMajor;
   int64_t computeCapabilityMinor;
+  int64_t singleToDoublePrecisionPerfRatio;
   bool matrixUnits;
   bool dynamicVectorWidth;
   bool nativeTupleReductions;

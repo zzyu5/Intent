@@ -13,6 +13,7 @@ class GpuDeviceCapabilities:
     max_threads_per_block: int
     compute_capability_major: int
     compute_capability_minor: int
+    single_to_double_precision_perf_ratio: int
     matrix_units: bool
     dynamic_vector_width: bool
 
@@ -26,6 +27,7 @@ class GpuDeviceCapabilities:
             f"--max-threads-per-block={self.max_threads_per_block}",
             f"--compute-capability-major={self.compute_capability_major}",
             f"--compute-capability-minor={self.compute_capability_minor}",
+            f"--single-to-double-precision-perf-ratio={self.single_to_double_precision_perf_ratio}",
             f"--matrix-units={'true' if self.matrix_units else 'false'}",
             f"--dynamic-vector-width={'true' if self.dynamic_vector_width else 'false'}",
         )
@@ -80,6 +82,9 @@ def resolve_gpu_device(device: int) -> GpuDeviceCapabilities:
         ),
         compute_capability_major=major,
         compute_capability_minor=minor,
+        single_to_double_precision_perf_ratio=attribute(
+            driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO
+        ),
         matrix_units=major >= 7,
         dynamic_vector_width=False,
     )
