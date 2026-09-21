@@ -1294,6 +1294,100 @@ FailureOr<bool> projectFragmentGather(GatherOp gather) {
   return true;
 }
 
+FailureOr<bool> composeBroadcastGather(GatherOp gather) {
+  auto source = dyn_cast<FragmentType>(gather.getSource().getType());
+  auto result = dyn_cast<FragmentType>(gather.getResult().getType());
+  if (!source || !result || !gather.getValid() ||
+      source.getOwner() != result.getOwner() ||
+      gather.getCoordinates().size() != source.getShape().size())
+    return false;
+
+  SmallVector<Value> coordinates;
+  FragmentType indexSchema;
+  for (Value coordinate : gather.getCoordinates()) {
+    if (!uniformElementType(coordinate.getType()).isIndex())
+      return false;
+    if (auto fragment = dyn_cast<FragmentType>(coordinate.getType());
+        fragment && (!indexSchema || fragment.getShape().size() >
+                                       indexSchema.getShape().size()))
+      indexSchema = fragment;
+    coordinates.push_back(coordinate);
+  }
+  if (!indexSchema || indexSchema.getOwner() != result.getOwner() ||
+      indexSchema.getShape().size() >= result.getShape().size())
+    return false;
+  auto expansion = queryBroadcastProjection(indexSchema, result);
+  if (!expansion.isExact())
+    return false;
+  for (Value coordinate : coordinates) {
+    auto fragment = dyn_cast<FragmentType>(coordinate.getType());
+    if (!fragment)
+      continue;
+    auto projection = queryBroadcastProjection(fragment, indexSchema);
+    auto original = queryBroadcastProjection(fragment, result);
+    if (!projection.isExact() || !original.isExact())
+      return false;
+    for (auto [axis, indexAxis] : llvm::enumerate(expansion.targetToSource))
+      if ((indexAxis ? projection.targetToSource[*indexAxis] : std::nullopt) !=
+          original.targetToSource[axis])
+        return false;
+  }
+
+  OpBuilder builder(gather);
+  Location location = gather.getLoc();
+  auto selectedType = FragmentType::get(
+      result.getContext(), result.getElementType(), indexSchema.getShape(),
+      indexSchema.getAxisMaps(), indexSchema.getValidity(), result.getOwner());
+  auto predicateType = FragmentType::get(
+      result.getContext(), builder.getI1Type(), indexSchema.getShape(),
+      indexSchema.getAxisMaps(), indexSchema.getValidity(), result.getOwner());
+  Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+  Value lower = builder.create<SplatOp>(location, indexSchema, zero);
+  Value valid;
+  for (auto [coordinate, axis] :
+       llvm::zip(coordinates, gather.getSourceAxes())) {
+    auto projected = projectPhysicalValueToSchema(
+        builder, location, coordinate, indexSchema);
+    if (failed(projected))
+      return gather.emitOpError("gather lost its exact index broadcast relation");
+    coordinate = *projected;
+    auto extent = cast<PhysicalExprAttr>(source.getShape()[axis]);
+    Value upper = extent.getKind() ==
+                          static_cast<uint32_t>(PhysicalExprKind::Constant)
+                      ? Value(builder.create<arith::ConstantIndexOp>(
+                            location, extent.getValue()))
+                      : Value(builder.create<PhysicalExprOp>(
+                            location, builder.getIndexType(), extent));
+    upper = builder.create<SplatOp>(location, indexSchema, upper);
+    Value nonnegative = builder.create<CompareOp>(
+        location, predicateType, coordinate, lower, ComparePredicate::Ge);
+    Value below = builder.create<CompareOp>(
+        location, predicateType, coordinate, upper, ComparePredicate::Lt);
+    Value bounded = builder.create<BinaryOp>(
+        location, predicateType, nonnegative, below, BinaryOperator::LogicalAnd);
+    valid = valid ? Value(builder.create<BinaryOp>(
+                        location, predicateType, valid, bounded,
+                        BinaryOperator::LogicalAnd))
+                  : bounded;
+  }
+  auto fill = materializeZeroFragment(builder, location, selectedType);
+  if (failed(fill))
+    return failure();
+  // Only indices determine the immutable SSA read. Keep its own bounds before
+  // broadcasting; the original lane-dependent predicate and fill remain below.
+  Value selected = builder.create<GatherOp>(
+      location, selectedType, gather.getSource(), coordinates, valid, *fill,
+      gather.getSourceAxes());
+  Value expanded = builder.create<BroadcastOp>(location, result, selected);
+  auto replacement = builder.create<SelectOp>(
+      location, result, gather.getValid(), expanded, gather.getFill());
+  if (Attribute origin = gather->getAttr(originAttr))
+    replacement->setAttr(originAttr, origin);
+  gather.getResult().replaceAllUsesWith(replacement.getResult());
+  gather.erase();
+  return true;
+}
+
 bool hasNonUnitAxisSplit(ReshapeOp reshape) {
   auto source = cast<FragmentType>(reshape.getValue().getType());
   auto result = cast<FragmentType>(reshape.getResult().getType());
@@ -2526,6 +2620,13 @@ LogicalResult realizeAccessComposition(ModuleOp module) {
       if (failed(projection))
         return failure();
       if (*projection) {
+        changed = true;
+        continue;
+      }
+      FailureOr<bool> broadcast = composeBroadcastGather(gather);
+      if (failed(broadcast))
+        return failure();
+      if (*broadcast) {
         changed = true;
         continue;
       }
