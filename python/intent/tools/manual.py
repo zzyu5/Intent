@@ -32,6 +32,12 @@ def _sections(text: str) -> list[tuple[int, int, int, str]]:
     return sections
 
 
+def _section_body(text: str) -> str:
+    """Index a heading's own text without repeating its child sections."""
+    sections = _sections(text)
+    return text[:sections[1][0]] if len(sections) > 1 else text
+
+
 def snapshot(project: Path) -> dict:
     """Freeze public language and kernel/host contracts, without algorithm examples."""
     project = project.resolve()
@@ -90,6 +96,8 @@ def snapshot(project: Path) -> dict:
                 "source": source, "line": node.lineno,
                 "text": "Current implementation diagnostic, not a language restriction or proof that its guard applies:\n" + message.value,
             }
+    section_bodies = {identifier: _section_body(entry["text"])
+                      for identifier, entry in documents.items()}
     symbols = {}
     for name, value in exports.items():
         if isinstance(value, (Intrinsic, IntrinsicNamespace)):
@@ -102,7 +110,8 @@ def snapshot(project: Path) -> dict:
             signature, source = None, "python/intent/language/__init__.py"
         pattern = re.compile(r"(?<![\w.])(?:I\.)?" + re.escape(name) + r"(?![\w.])")
         references = [d["id"] for d in documents.values()
-                      if ("#L" in d["id"] or d["kind"] != "concept") and pattern.search(d["text"])]
+                      if ("#L" in d["id"] or d["kind"] != "concept")
+                      and pattern.search(section_bodies[d["id"]])]
         symbols[name] = {
             "name": name, "signature": str(signature) if signature else None,
             "declaration": source, "sections": references,
@@ -130,6 +139,8 @@ def snapshot(project: Path) -> dict:
 class Manual:
     def __init__(self, corpus: dict):
         self.corpus = corpus
+        self._section_bodies = {identifier: _section_body(entry["text"])
+                                for identifier, entry in corpus["documents"].items()}
 
     def search(self, query: str, kind: str = "all") -> dict:
         """Find API names, language rules and diagnostics. Read returned IDs for full context."""
@@ -152,7 +163,8 @@ class Manual:
                 continue
             if "#L" not in entry["id"] and entry["kind"] == "concept":
                 continue
-            body, title = entry["text"].lower(), entry["title"].lower()
+            body = self._section_bodies[entry["id"]].lower()
+            title = entry["title"].lower()
             score = sum(5 * (term in title) + (term in body) for term in terms)
             if score:
                 results.append((score, {key: entry[key] for key in ("id", "title", "kind", "source", "line")}))
