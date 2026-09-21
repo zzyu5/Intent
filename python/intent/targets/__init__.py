@@ -5,6 +5,7 @@ from .triton import TritonTarget
 from .tilelang import ResolvedTileLangTarget
 from .tilelang import TileLangTarget
 from .mojo import MojoTarget
+from .bangc import BangCTarget
 from .mojo import ResolvedMojoTarget
 from .weft import WeftTarget, ResolvedWeftTarget
 
@@ -17,6 +18,7 @@ __all__ = [
     "TileLangTarget",
     "TritonTarget",
     "MojoTarget",
+    "BangCTarget",
     "ResolvedMojoTarget",
     "WeftTarget",
     "ResolvedWeftTarget",

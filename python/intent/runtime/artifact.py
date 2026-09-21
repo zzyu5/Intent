@@ -91,7 +91,7 @@ class CompiledArtifact:
         function: Callable[..., object],
         arguments: tuple[Any, ...],
     ) -> object:
-        if self.device_type == "cpu":
+        if self.device_type in {"cpu", "mlu"}:
             return function(*arguments)
         import torch
 

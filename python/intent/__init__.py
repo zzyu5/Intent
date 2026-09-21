@@ -18,6 +18,7 @@ from .targets import CuTileTarget
 from .targets import TileLangTarget
 from .targets import TritonTarget
 from .targets import MojoTarget
+from .targets import BangCTarget
 from .targets import WeftTarget
 
 
@@ -41,6 +42,7 @@ __all__ = [
     "TileLangTarget",
     "TritonTarget",
     "MojoTarget",
+    "BangCTarget",
     "WeftTarget",
     "FrontendError",
     "lower_to_mlir",
