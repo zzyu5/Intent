@@ -5042,6 +5042,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     auto ordered = store->getParentOfType<scf::ForOp>();
     if (cartesian && ordered && !ordered->hasAttr(independentIterationAttr)) {
       PhysicalProgramAnalysis analysis(kernel);
+      DominanceInfo dominance(kernel);
       llvm::DenseMap<Operation *, unsigned> sourceAxes;
       SmallVector<MakeRangeOp> shared;
       for (unsigned axis = 0; axis < valueType.getShape().size(); ++axis) {
@@ -5052,7 +5053,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           auto dimension = queryRangeDimension(range);
           if (failed(dimension) || nonUniqueContractionDimensions.contains(*dimension) ||
               isProvablySingletonLogicalRange(range) ||
-              !ordered->isProperAncestor(range))
+              (!ordered->isProperAncestor(range) &&
+               (!dominance.dominates(range.getOperation(), ordered.getOperation()) ||
+                !hasExactStaticFullCoverage(kernel, range.getResult(), 0))))
             continue;
           auto [previous, inserted] = sourceAxes.try_emplace(range.getOperation(), axis);
           if (!inserted && previous->second != axis &&
@@ -5060,12 +5063,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             shared.push_back(range);
         }
       }
-      // A local vector may feed both axes of an outer product inside an ordered
-      // update. Retain its snapshot and full coverage instead of assigning that
-      // one producer two independent program ownership axes.
+      // One vector can feed both axes of an ordered Cartesian update. Preserve
+      // its full snapshot, including an already complete dominating capture.
       for (MakeRangeOp range : allRanges) {
+        bool local = ordered->isProperAncestor(range);
         if (range->hasAttr(worksetCoordinateRangeAttr) ||
-            !ordered->isProperAncestor(range) ||
+            (!local && !llvm::is_contained(shared, range)) ||
             !llvm::any_of(shared, [&](MakeRangeOp root) {
               auto dimension = queryRangeDimension(range);
               auto rootDimension = queryRangeDimension(root);
@@ -5073,7 +5076,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                      succeeded(rootDimension) && *dimension == *rootDimension;
             }))
           continue;
-        if (failed(requireFullDimensionCoverage(kernel, range.getResult(), 0))) {
+        if (local &&
+            failed(requireFullDimensionCoverage(kernel, range.getResult(), 0))) {
           store.emitOpError("shared Cartesian producer has no exact local full coverage");
           return WalkResult::interrupt();
         }
