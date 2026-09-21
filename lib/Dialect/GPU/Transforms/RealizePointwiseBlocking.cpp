@@ -4271,30 +4271,30 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       recordScanTraversal(source, scan.getAxis());
     collectStructuredRegionRanges(scan, sources, scan.getAxis());
   });
+  auto collectReductionAxis = [&](Value source, int64_t axis) {
+    auto fragment = dyn_cast<FragmentType>(source.getType());
+    if (!fragment || axis < 0 ||
+        axis >= static_cast<int64_t>(fragment.getShape().size()))
+      return;
+    PhysicalProgramAnalysis analysis(kernel);
+    PhysicalAxisRealizationFact fact = analysis.axisRealization(source, axis);
+    for (MakeRangeOp range : allRanges) {
+      if (!llvm::any_of(fact.roots, [&](MakeRangeOp root) {
+            return sameLogicalRange(root, range) &&
+                   analysis.lockstepRanges({root, range}).isExact();
+          }))
+        continue;
+      structuredTraversalRanges.insert(range.getOperation());
+      reductionTraversalRanges.insert(range.getOperation());
+    }
+  };
   kernel.walk([&](ReduceOp reduce) {
     for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
       auto fragment = dyn_cast<FragmentType>(source.getType());
       if (!fragment)
         continue;
-      for (int64_t rawAxis : reduce.getAxes()) {
-        if (rawAxis < 0 ||
-            rawAxis >= static_cast<int64_t>(fragment.getShape().size()))
-          continue;
-        unsigned axis = static_cast<unsigned>(rawAxis);
-        PhysicalAxisRealizationFact fact =
-            PhysicalProgramAnalysis(kernel).axisRealization(source, axis);
-        for (MakeRangeOp range : allRanges) {
-          if (!llvm::any_of(fact.roots, [&](MakeRangeOp root) {
-                return sameLogicalRange(root, range) &&
-                       PhysicalProgramAnalysis(kernel)
-                           .lockstepRanges({root, range})
-                           .isExact();
-              }))
-            continue;
-          structuredTraversalRanges.insert(range.getOperation());
-          reductionTraversalRanges.insert(range.getOperation());
-        }
-      }
+      for (int64_t axis : reduce.getAxes())
+        collectReductionAxis(source, axis);
       for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
         if (llvm::is_contained(reduce.getAxes(), static_cast<int64_t>(axis)))
           continue;
@@ -4359,6 +4359,19 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   });
   llvm::SmallPtrSet<Operation *, 32> contractionTraversalRanges;
   kernel.walk([&](ContractOp contract) {
+    auto collectConsumedAxes = [&](Value operand, ArrayRef<int64_t> axes) {
+      auto type = cast<FragmentType>(operand.getType());
+      for (int64_t axis : axes) {
+        auto source = sourceAxisIdentity(cast<AxisMapAttr>(type.getAxisMaps()[axis]));
+        // A source can occupy both K and a retained operand position. Its
+        // retained occurrence still needs the contract's free-axis mapping.
+        if (!queryFragmentAxes(contract.getResult().getType(), source).empty())
+          continue;
+        collectReductionAxis(operand, axis);
+      }
+    };
+    collectConsumedAxes(contract.getLhs(), contract.getLhsReductionAxes());
+    collectConsumedAxes(contract.getRhs(), contract.getRhsReductionAxes());
     collectAllAxesInto(contract.getLhs(), contractionTraversalRanges);
     collectAllAxesInto(contract.getRhs(), contractionTraversalRanges);
     PhysicalContractFreeAxisFact freeAxes =

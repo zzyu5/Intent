@@ -4122,6 +4122,18 @@ PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
       }
       return exact;
     }
+    if (auto contract = dyn_cast<ContractOp>(operation)) {
+      // Preserve the reduction dependency before vector/matrix realization
+      // chooses the native operation for this contraction.
+      exact.depends = reductionTypeConsumesSource(
+                          contract.getLhs().getType(),
+                          contract.getLhsReductionAxes(), source, sourceDimension) ||
+                      reductionTypeConsumesSource(
+                          contract.getRhs().getType(),
+                          contract.getRhsReductionAxes(), source, sourceDimension);
+      if (exact.depends)
+        return exact;
+    }
     if (auto scan = dyn_cast<ScanOp>(operation)) {
       for (Value input : scan.getInputs().take_front(scan.getSourceCount()))
         if (reductionTypeConsumesSource(
