@@ -78,10 +78,12 @@ LogicalResult legalizeProgram(ModuleOp module, StringRef architecture) {
   SmallVector<dsa::MatMulOp> matrices;
   function.walk([&](dsa::MatMulOp op) { matrices.push_back(op); });
   for (auto matrix : matrices) {
+    OpBuilder b(matrix);
     auto type = cast<MemRefType>(matrix.getRhs().getType());
+    if (!type.getElementType().isF16() && !type.getElementType().isBF16() && !type.getElementType().isF32())
+      return matrix.emitError("MLU370 matrix profile requires f16/bf16/f32 input tiles");
     if (type.getDimSize(1) != 64 || (type.getDimSize(0) * type.getElementTypeBitWidth() / 8) % 64)
       return matrix.emitError("MLU370 matrix implementation requires an N=64 tile and a K row aligned to 64 bytes");
-    OpBuilder b(matrix);
     Value packed = allocate(b, matrix.getLoc(), type.getElementType(), type.getShape(), dsa::matrixSpace);
     Value transpose = allocate(b, matrix.getLoc(), type.getElementType(),
         {type.getDimSize(1), type.getDimSize(0)}, dsa::nramSpace);
@@ -92,6 +94,62 @@ LogicalResult legalizeProgram(ModuleOp module, StringRef architecture) {
     matrix.getScratchMutable().assign(partial);
     packed.getDefiningOp()->setAttr("bangc.layout", b.getStringAttr("matrix_transposed64"));
     matrix->setAttr("bangc.implementation", b.getStringAttr("matmul_local_f32_accumulator"));
+  }
+  // Pointwise bf16 arithmetic likewise uses f32 local operations with an
+  // explicit round-to-bf16 result at each original source operation.
+  SmallVector<Operation *> bf16Pointwise;
+  function.walk([&](Operation *op) {
+    Value output;
+    if (auto unary = dyn_cast<dsa::UnaryOp>(op)) output = unary.getOutput();
+    if (auto binary = dyn_cast<dsa::BinaryOp>(op)) output = binary.getOutput();
+    if (output && cast<MemRefType>(output.getType()).getElementType().isBF16()) bf16Pointwise.push_back(op);
+  });
+  for (Operation *op : bf16Pointwise) {
+    OpBuilder builder(op);
+    auto convert = [&](Value source) {
+      auto type = cast<MemRefType>(source.getType());
+      Value result = allocate(builder, op->getLoc(), builder.getF32Type(), type.getShape(), dsa::nramSpace);
+      builder.create<dsa::CastOp>(op->getLoc(), source, result);
+      return result;
+    };
+    Value destination;
+    if (auto unary = dyn_cast<dsa::UnaryOp>(op)) {
+      destination = unary.getOutput();
+      Value input = convert(unary.getInput());
+      Value output = allocate(builder, op->getLoc(), builder.getF32Type(), cast<MemRefType>(input.getType()).getShape(), dsa::nramSpace);
+      unary.getInputMutable().assign(input); unary.getOutputMutable().assign(output);
+      builder.setInsertionPointAfter(op);
+      builder.create<dsa::CastOp>(op->getLoc(), output, destination);
+    } else {
+      auto binary = cast<dsa::BinaryOp>(op);
+      destination = binary.getOutput();
+      Value lhs = convert(binary.getLhs()), rhs = convert(binary.getRhs());
+      Value output = allocate(builder, op->getLoc(), builder.getF32Type(), cast<MemRefType>(lhs.getType()).getShape(), dsa::nramSpace);
+      binary.getLhsMutable().assign(lhs); binary.getRhsMutable().assign(rhs); binary.getOutputMutable().assign(output);
+      builder.setInsertionPointAfter(op);
+      builder.create<dsa::CastOp>(op->getLoc(), output, destination);
+    }
+  }
+  SmallVector<Operation *> bf16Scalar;
+  function.walk([&](Operation *op) {
+    if (isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp, arith::NegFOp,
+            arith::MaximumFOp, arith::MinimumFOp, arith::MaxNumFOp, arith::MinNumFOp, arith::CmpFOp,
+            math::ExpOp, math::Exp2Op, math::LogOp, math::SqrtOp, math::RsqrtOp, math::TanhOp, math::AbsFOp>(op) &&
+        llvm::any_of(op->getOperandTypes(), [](Type type) { return type.isBF16(); })) bf16Scalar.push_back(op);
+  });
+  for (Operation *op : bf16Scalar) {
+    OpBuilder builder(op);
+    SmallVector<Value> arguments;
+    for (Value input : op->getOperands())
+      arguments.push_back(input.getType().isBF16() ? Value(builder.create<arith::ExtFOp>(op->getLoc(), builder.getF32Type(), input)) : input);
+    OperationState state(op->getLoc(), op->getName());
+    state.addOperands(arguments); state.addAttributes(op->getAttrs());
+    Type original = op->getResult(0).getType();
+    state.addTypes(original.isBF16() ? builder.getF32Type() : original);
+    Value result = builder.create(state)->getResult(0);
+    if (original.isBF16()) result = builder.create<arith::TruncFOp>(op->getLoc(), original, result);
+    op->getResult(0).replaceAllUsesWith(result);
+    op->erase();
   }
   auto walk = function.walk([&](Operation *op) {
     if (auto unary = dyn_cast<dsa::UnaryOp>(op)) {

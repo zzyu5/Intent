@@ -13,7 +13,7 @@ namespace {
 bool tile(Value value) {
   auto type = dyn_cast<MemRefType>(value.getType());
   return type && type.getRank() == 2 && type.hasStaticShape() &&
-      type.getNumElements() > 0 && (type.getElementType().isF16() || type.getElementType().isF32() ||
+      type.getNumElements() > 0 && (type.getElementType().isF16() || type.getElementType().isBF16() || type.getElementType().isF32() ||
                                   type.getElementType().isInteger(1) || type.getElementType().isInteger(32) || type.getElementType().isInteger(64)) &&
       type.getMemorySpaceAsInt() == nramSpace;
 }

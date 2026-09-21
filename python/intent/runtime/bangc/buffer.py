@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 _runtimes: dict[str, Runtime] = {}
-ELEMENT_BYTES = {"f16": 2, "f32": 4, "i32": 4, "i64": 8, "bool": 1}
+ELEMENT_BYTES = {"f16": 2, "bf16": 2, "f32": 4, "i32": 4, "i64": 8, "bool": 1}
 
 
 class Runtime:

@@ -32,7 +32,7 @@ public:
       if (auto view = dyn_cast<ViewType>(argument.getType())) {
         auto tensor = cast<RankedTensorType>(view.getTensor());
         Type element = tensor.getElementType();
-        if (!element.isF16() && !element.isF32() && !element.isInteger(32) && !element.isInteger(64) && !element.isInteger(1))
+        if (!element.isF16() && !element.isBF16() && !element.isF32() && !element.isInteger(32) && !element.isInteger(64) && !element.isInteger(1))
           return source.emitError("DSA construction does not implement this view storage type");
         auto shape = dyn_cast_or_null<TensorShapeAttr>(tensor.getEncoding());
         if (!shape) return source.emitError("DSA view has no dimension identities");
@@ -151,6 +151,10 @@ private:
       return b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, value, zero);
     }
     if (isa<FloatType>(value.getType()) && isa<FloatType>(type)) {
+      if (value.getType().getIntOrFloatBitWidth() == type.getIntOrFloatBitWidth()) {
+        Value wider = b.create<arith::ExtFOp>(loc, b.getF32Type(), value);
+        return b.create<arith::TruncFOp>(loc, type, wider);
+      }
       if (value.getType().getIntOrFloatBitWidth() < type.getIntOrFloatBitWidth())
         return b.create<arith::ExtFOp>(loc, type, value);
       return b.create<arith::TruncFOp>(loc, type, value);
@@ -578,7 +582,11 @@ private:
       if (!input) return operation->emitError("DSA broadcast input is unavailable");
       if (isa<MemRefType>(input.getType())) { values.map(operation->getResult(0), input); return success(); }
       auto type = cast<RankedTensorType>(operation->getResult(0).getType());
-      Value output = allocate(loc, type.getElementType(), 1, config.getTile());
+      Value output;
+      if (matrixResultType && type.getShape() == matrixResultType.getShape() && type.getEncoding() == matrixResultType.getEncoding())
+        output = allocateLike(loc, matrixResultTile, type.getElementType());
+      else if (type.getRank() == 1 && activeCount) output = allocate(loc, type.getElementType(), 1, config.getTile());
+      else return operation->emitError("DSA broadcast requires a bound tensor tile");
       input = scalarCast(loc, input, type.getElementType());
       if (!input) return operation->emitError("DSA broadcast requires a compatible float scalar");
       b.create<dsa::FillOp>(loc, output, input);
@@ -691,7 +699,7 @@ private:
     if (auto reduce = dyn_cast<ReduceOp>(operation)) {
       if (reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 || reduce.getCaptureCount() ||
           reduce.getAxes().size() != 1 || cast<IntegerAttr>(reduce.getAxes()[0]).getInt() != 0 ||
-          reduce->getNumResults() != 1 || !isa<FloatType>(reduce->getResult(0).getType()))
+          reduce->getNumResults() != 1 || !reduce->getResult(0).getType().isF32())
         return reduceProduct(reduce);
       auto operations = reduce.getCombine().front().without_terminator();
       if (!llvm::hasSingleElement(operations)) return reduceProduct(reduce);
@@ -749,13 +757,15 @@ private:
       if (after) epilogue.push_back(&op);
       else if (!isa<ConstantOp, DimOp, DomainOp, ViewLoadOp>(op))
         return op.emitError("DSA matrix inputs must be direct views");
+      else if (!isa<ViewLoadOp>(op) && failed(lowerOperation(&op))) return failure();
     }
     ViewStoreOp output;
     for (Operation *op : epilogue) {
       if (auto store = dyn_cast<ViewStoreOp>(op)) {
         if (output) return store.emitError("DSA matrix epilogue currently requires one output");
         output = store;
-      } else if (!isa<CastOp>(op)) return op->emitError("DSA matrix epilogue currently supports casts and a full output store");
+      } else if (!isa<ConstantOp, DimOp, BroadcastOp, FullOp, CastOp, UnaryOp, BinaryOp, SelectOp>(op))
+        return op->emitError("DSA matrix epilogue requires local pointwise computation and a full output store");
     }
     if (!output) return matrix.emitError("DSA MatMul has no output store");
     auto outputFact = analysis.indexRelation(output);
@@ -803,8 +813,12 @@ private:
         return success();
       }))) return failure();
       values.map(matrix.getResult(), accumulator);
+      auto previousType = matrixResultType;
+      auto previousTile = matrixResultTile;
+      matrixResultType = cast<RankedTensorType>(matrix.getResult().getType());
+      matrixResultTile = accumulator;
       for (Operation *op : epilogue) {
-        if (isa<CastOp>(op)) { if (failed(lowerOperation(op))) return failure(); }
+        if (!isa<ViewStoreOp>(op)) { if (failed(lowerOperation(op))) return failure(); }
         else {
           Value result = get(output.getInputs()[output.getValueOperandIndex()]);
           if (!result) return output.emitError("DSA matrix result is unavailable");
@@ -813,6 +827,7 @@ private:
               add(loc, mul(loc, m0, rowStride), mul(loc, n0, colStride)), rowStride, colStride, rows, cols);
         }
       }
+      matrixResultType = previousType; matrixResultTile = previousTile;
       return success();
     });
   }
@@ -827,6 +842,8 @@ private:
   DenseMap<int64_t, Value> dimensions;
   DenseMap<Value, Domain> domains;
   Value taskId, taskCount, activeBegin, activeCount;
+  RankedTensorType matrixResultType;
+  Value matrixResultTile;
   int64_t activeDimension = 0;
   unsigned parallelDepth = 0;
   SmallVector<int64_t> fullExtents;

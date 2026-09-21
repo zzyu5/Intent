@@ -21,7 +21,7 @@ void IntentDSADialect::initialize() {
 LogicalResult ViewArgumentAttr::verify(function_ref<InFlightDiagnostic()> error,
     StringAttr name, Type element, DenseI64ArrayAttr shape,
     DenseI64ArrayAttr dimensions, uint32_t access, intent::ViewConstraintsAttr constraints) {
-  if (!name || name.empty() || (!element.isF16() && !element.isF32() && !element.isInteger(32) && !element.isInteger(64) && !element.isInteger(1)) ||
+  if (!name || name.empty() || (!element.isF16() && !element.isBF16() && !element.isF32() && !element.isInteger(32) && !element.isInteger(64) && !element.isInteger(1)) ||
       !shape || !dimensions || shape.size() != dimensions.size() || access > 2 || !constraints)
     return error() << "DSA view requires supported numeric storage and a complete typed interface";
   for (auto [extent, dimension] : llvm::zip(shape.asArrayRef(), dimensions.asArrayRef()))

@@ -15,6 +15,7 @@ namespace {
 #include "../Runtime/TileImplementations.inc"
 std::string ctype(Type type) {
   if (type.isF16()) return "half";
+  if (type.isBF16()) return "uint16_t";
   if (type.isF32()) return "float";
   if (type.isF64()) return "double";
   if (type.isInteger(1)) return "bool";
@@ -23,6 +24,7 @@ std::string ctype(Type type) {
 }
 std::string dtype(Type type) {
   if (type.isF16()) return "f16";
+  if (type.isBF16()) return "bf16";
   if (type.isF32()) return "f32";
   if (type.isInteger(1)) return "bool";
   if (type.isInteger(32)) return "i32";
@@ -100,6 +102,7 @@ private:
     return ctype(type.getElementType()) + ", " + std::to_string(type.getDimSize(0)) + ", " + std::to_string(type.getDimSize(1));
   }
   std::string floatLiteral(FloatAttr attribute) {
+    if (attribute.getType().isBF16()) return std::to_string(attribute.getValue().bitcastToAPInt().getZExtValue());
     double value = attribute.getValueAsDouble();
     if (std::isnan(value)) return "NAN";
     if (std::isinf(value)) return value < 0 ? "(-INFINITY)" : "INFINITY";
@@ -163,7 +166,7 @@ private:
           ", " + name(store.getRows()) + ", " + name(store.getColumns()) + ");", depth); return success();
     }
     if (auto fill = dyn_cast<dsa::FillOp>(op)) {
-      if (isa<FloatType>(fill.getValue().getType()))
+      if (fill.getValue().getType().isF16() || fill.getValue().getType().isF32())
         line("__bang_write_value(" + name(fill.getOutput()) + ", " + count(fill.getOutput()) + ", " + name(fill.getValue()) + ");", depth);
       else line("intent_fill_local<" + ctype(fill.getValue().getType()) + ", " + count(fill.getOutput()) + ">(" + name(fill.getOutput()) + ", " + name(fill.getValue()) + ");", depth);
       return success();
@@ -226,8 +229,14 @@ private:
       auto to = cast<MemRefType>(castOp.getOutput().getType()).getElementType();
       if (from == to) line("__memcpy(" + name(castOp.getOutput()) + ", " + name(castOp.getInput()) + ", " +
           count(castOp.getOutput()) + " * sizeof(" + ctype(to) + "), NRAM2NRAM);", depth);
-      else line(std::string(to.isF32() ? "__bang_half2float(" : "__bang_float2half_rn(") + name(castOp.getOutput()) + ", " +
-          name(castOp.getInput()) + ", " + count(castOp.getOutput()) + ");", depth);
+      else if ((from.isF16() && to.isF32()) || (from.isF32() && to.isF16()))
+        line(std::string(to.isF32() ? "__bang_half2float(" : "__bang_float2half_rn(") + name(castOp.getOutput()) + ", " +
+            name(castOp.getInput()) + ", " + count(castOp.getOutput()) + ");", depth);
+      else if ((from.isBF16() && to.isF32()) || (from.isF32() && to.isBF16()))
+        line(std::string(to.isF32() ? "intent_bf16_to_f32_tile<" : "intent_f32_to_bf16_tile<") + count(castOp.getOutput()) + ">(" +
+            name(castOp.getOutput()) + ", " + name(castOp.getInput()) + ");", depth);
+      else line("intent_cast_local<" + ctype(from) + ", " + ctype(to) + ", " + count(castOp.getOutput()) + ">(" +
+          name(castOp.getOutput()) + ", " + name(castOp.getInput()) + ");", depth);
       return success();
     }
     if (auto reduce = dyn_cast<dsa::ReduceOp>(op)) {
@@ -261,8 +270,12 @@ private:
       if (auto floating = dyn_cast<FloatAttr>(constant.getValue())) expression = floatLiteral(floating);
       else expression = std::to_string(cast<IntegerAttr>(constant.getValue()).getInt());
     } else if (isa<arith::ExtFOp, arith::TruncFOp, arith::IndexCastOp, arith::ExtSIOp, arith::ExtUIOp,
-                   arith::TruncIOp, arith::SIToFPOp, arith::FPToSIOp>(op))
-      expression = "static_cast<" + ctype(op->getResult(0).getType()) + ">(" + name(op->getOperand(0)) + ")";
+                   arith::TruncIOp, arith::SIToFPOp, arith::FPToSIOp>(op)) {
+      Type from = op->getOperand(0).getType(), to = op->getResult(0).getType();
+      std::string value = name(op->getOperand(0));
+      if (from.isBF16()) value = "intent_bf16_to_float(" + value + ")";
+      expression = to.isBF16() ? "intent_number_to_bf16(" + value + ")" : "static_cast<" + ctype(to) + ">(" + value + ")";
+    }
     else if (auto select = dyn_cast<arith::SelectOp>(op)) expression = name(select.getCondition()) + " ? " + name(select.getTrueValue()) + " : " + name(select.getFalseValue());
     else if (isa<arith::NegFOp>(op)) expression = "-" + name(op->getOperand(0));
     else if (op->getName().getDialectNamespace() == "math" && op->getNumOperands() == 1) {
