@@ -1407,6 +1407,12 @@ FailureOr<Value> materializeReplayedValue(
         if (fact.state == PhysicalFactState::Unknown || !fact.blockers.empty() ||
             fact.roots.empty())
           continue;
+        if (!llvm::any_of(fact.roots, [&](MakeRangeOp root) {
+              return llvm::any_of(options.traversalRanges, [&](MakeRangeOp range) {
+                return sameLogicalRange(root, range);
+              });
+            }))
+          continue;
         SmallVector<MakeRangeOp> combined(fact.roots.begin(), fact.roots.end());
         combined.append(options.traversalRanges.begin(), options.traversalRanges.end());
         if (!analysis.lockstepRanges(combined).isExact())
@@ -1674,10 +1680,8 @@ FailureOr<Value> materializeReplayedValue(
       if (!options.segmentTail)
         return valid ? FailureOr<Value>(valid)
                      : FailureOr<Value>(Value());
-      auto targetAxis = cast<AxisMapAttr>(target.getAxisMaps()[axis]);
-      FailureOr<Value> tail = projectPredicateToFragment(
-          builder, location, options.segmentTail, target,
-          sourceAxisIdentity(targetAxis));
+      FailureOr<Value> tail = projectPredicateToFragmentAxis(
+          builder, location, options.segmentTail, target, axis);
       if (failed(tail))
         return failure();
       if (!valid)
@@ -3685,6 +3689,12 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
       cast<PhysicalExprAttr>(fragment.getShape()[fragmentAxis]);
   PhysicalProgramAnalysis analysis(kernel);
   PhysicalRangeFact ranges = analysis.axisRanges(source, fragmentAxis);
+  if (ranges.roots.empty())
+    for (auto [axis, attribute] : llvm::enumerate(fragment.getAxisMaps()))
+      if (cast<AxisMapAttr>(attribute).getDimensionId() == dimension &&
+          fragment.getShape()[axis] != currentExtent)
+        return emitError(source.getLoc(),
+                         "full coverage has no range authority for distinct physical occurrences");
   int64_t coverageDimension = dimension;
   bool subregion = llvm::any_of(ranges.roots, [](MakeRangeOp range) {
     return range->hasAttr(sourceSubregionAttr);
@@ -3806,9 +3816,10 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
       if (failed(rangeDimension))
         return range.emitOpError("full coverage has no range dimension authority");
       rangeDimensions.insert(*rangeDimension);
-      retargetDimensionExtent(range.getResult(), *rangeDimension, covered);
+      retargetSourceExtent(range.getResult(), sourceAxisIdentity(range), covered);
     }
-    retargetDimensionExtent(source, dimension, covered);
+    if (ranges.roots.empty())
+      retargetDimensionExtent(source, dimension, covered);
     if (rangeDimensions.empty())
       rangeDimensions.insert(dimension);
     for (int64_t rangeDimension : rangeDimensions)
@@ -3943,9 +3954,10 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
     if (failed(rangeDimension) || *rangeDimension != dimension)
       return range.emitOpError(
           "full-coverage range does not cover the selected logical dimension");
-    retargetDimensionExtent(range.getResult(), dimension, covered);
+    retargetSourceExtent(range.getResult(), sourceAxisIdentity(range), covered);
   }
-  retargetDimensionExtent(source, dimension, covered);
+  if (ranges.roots.empty())
+    retargetDimensionExtent(source, dimension, covered);
   if (failed(bindFullCoverageDimension(kernel, dimension,
                                        parameter.getResult())))
     return kernel.emitError(
@@ -4006,7 +4018,8 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
                         return range.getExtent() == physicalExtent;
                       });
   for (MakeRangeOp range : ranges)
-    retargetDimensionExtent(range.getResult(), dimension, parameterExtent);
+    retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
+                         parameterExtent);
   if (ranges.empty() || alreadyBound)
     return success();
 

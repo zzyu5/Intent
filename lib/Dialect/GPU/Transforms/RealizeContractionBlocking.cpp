@@ -1809,14 +1809,6 @@ bool hasRangeContractForm(ContractOp contract) {
   return collectStorePaths(contract.getResult(), {}, paths, visited);
 }
 
-bool hasSelectedFreeAxes(ContractOp contract) {
-  return llvm::all_of(contract.getResult().getType().getShape(),
-                      [](Attribute extent) {
-                        return isCompileTimeExtent(
-                            cast<PhysicalExprAttr>(extent));
-                      });
-}
-
 bool freeAxesNeedRealization(ContractOp contract, func::FuncOp kernel) {
   return PhysicalProgramAnalysis(kernel)
       .contractFreeAxes(contract.getOperation())
@@ -1827,7 +1819,7 @@ bool freeAxesReadyForReductionTraversal(ContractOp contract,
                                         func::FuncOp kernel) {
   PhysicalContractFreeAxisFact freeAxes =
       PhysicalProgramAnalysis(kernel).contractFreeAxes(contract.getOperation());
-  if (freeAxes.axes.empty())
+  if (!freeAxes.isExact() || freeAxes.axes.empty())
     return false;
   return llvm::all_of(freeAxes.axes, [&](const PhysicalContractFreeAxis &axis) {
     if (axis.realization.physicalized)
@@ -2537,9 +2529,9 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
   FragmentType lhsType = contract.getLhs().getType();
   FragmentType rhsType = contract.getRhs().getType();
   FragmentType resultType = contract.getResult().getType();
-  if (llvm::any_of(resultType.getShape(), [](Attribute extent) {
-        return !isCompileTimeExtent(cast<PhysicalExprAttr>(extent));
-      }))
+  // Selected tiles can be clamped by a launch dimension. Their typed
+  // realization, rather than a constant-only expression, owns the free axes.
+  if (!freeAxesReadyForReductionTraversal(contract, kernel))
     return contract.emitOpError(
         "reduction-only contraction blocking requires already-selected free-axis fragments");
 
@@ -3379,7 +3371,8 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
            << "; rhs_batch=" << contract.getRhsBatchAxes()
            << "; free_axes_need_realization="
            << freeAxesNeedRealization(contract, kernel)
-           << "; selected_free_axes=" << hasSelectedFreeAxes(contract);
+           << "; selected_free_axes="
+           << freeAxesReadyForReductionTraversal(contract, kernel);
   };
   if (contract.getLhsReductionAxes().size() != 1 ||
       contract.getRhsReductionAxes().size() != 1 ||
@@ -6128,7 +6121,6 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
           contract.getLhsReductionAxes().size() == 1 &&
           contract.getRhsReductionAxes().size() == 1 &&
           freeAxesReadyForReductionTraversal(contract, kernel) &&
-          hasSelectedFreeAxes(contract) &&
           reductionAxesNeedTraversal(contract, kernel) &&
           hasExplicitPairedReductionRanges(contract)) {
         SmallVector<ContractOp> replayed;

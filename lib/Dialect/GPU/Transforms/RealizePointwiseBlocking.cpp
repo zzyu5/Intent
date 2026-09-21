@@ -2009,6 +2009,146 @@ bool hasMaterializedReductionStoreFork(
   });
 }
 
+std::optional<unsigned> repeatedReductionOutputAxis(
+    Value value, MakeRangeOp range) {
+  auto reduce = value.getDefiningOp<ReduceOp>();
+  if (!reduce || reduce.getSourceCount() != 1 || reduce->getNumResults() != 1 ||
+      !isUnitStepRange(range))
+    return std::nullopt;
+  PhysicalSourceAxis source = sourceAxisIdentity(range);
+  auto input = dyn_cast<FragmentType>(reduce.getInputs().front().getType());
+  auto output = queryFragmentAxis(value.getType(), source);
+  if (!input || !output.isExact())
+    return std::nullopt;
+  SmallVector<unsigned> freeAxes;
+  bool reducesSource = false;
+  for (auto [axis, attribute] : llvm::enumerate(input.getAxisMaps())) {
+    bool reduced = llvm::is_contained(reduce.getAxes(), static_cast<int64_t>(axis));
+    if (!reduced)
+      freeAxes.push_back(axis);
+    else
+      reducesSource |= sourceAxisIdentity(cast<AxisMapAttr>(attribute)) == source;
+  }
+  if (!reducesSource || output.fragmentAxis >= freeAxes.size() ||
+      !(sourceAxisIdentity(cast<AxisMapAttr>(
+            input.getAxisMaps()[freeAxes[output.fragmentAxis]])) == source))
+    return std::nullopt;
+  auto kernel = reduce->getParentOfType<func::FuncOp>();
+  PhysicalProgramAnalysis analysis(kernel);
+  auto ranges = analysis.axisRanges(reduce.getInputs().front(),
+                                    freeAxes[output.fragmentAxis]);
+  if (!ranges.isExact() || !ranges.blockers.empty() || ranges.roots.empty())
+    return std::nullopt;
+  SmallVector<MakeRangeOp> authorities(ranges.roots.begin(), ranges.roots.end());
+  authorities.push_back(range);
+  if (!analysis.lockstepRanges(authorities).isExact())
+    return std::nullopt;
+  return output.fragmentAxis;
+}
+
+LogicalResult separateReductionOutputOccurrences(func::FuncOp kernel) {
+  // A source reused in two operand positions can be both reduced and retained.
+  // Give the retained occurrence its own derived range before ownership sees it.
+  // The positional replay leaves the original occurrence available to other uses.
+  uint64_t nextSource = nextPhysicalAxisIdentities(kernel).first;
+  SmallVector<StoreOp> stores;
+  kernel.walk([&](StoreOp store) { stores.push_back(store); });
+  for (StoreOp store : stores) {
+    SmallVector<Value> coordinates(store.getCoordinates());
+    for (auto [position, coordinate] : llvm::enumerate(coordinates)) {
+      auto type = dyn_cast<FragmentType>(coordinate.getType());
+      if (!type || type.getShape().size() != 1)
+        continue;
+      PhysicalProgramAnalysis analysis(kernel);
+      auto address = analysis.axisRanges(coordinate, 0);
+      auto range = queryExactLogicalRange(address);
+      if (failed(range))
+        continue;
+      auto axis = repeatedReductionOutputAxis(store.getValue(), *range);
+      if (!axis)
+        continue;
+      auto source = sourceAxisIdentity(*range);
+      auto replay = analysis.replayability(
+          store.getValue(), source, PhysicalReplayScope::ValueGraph,
+          /*allowAccesses=*/true, store);
+      auto replayable = [&](Value value) {
+        return !value || analysis.replayability(
+            value, source, PhysicalReplayScope::ValueGraph,
+            /*allowAccesses=*/true, store).isReplayable();
+      };
+      if (!replay.isReplayable() || replay.crossesStructuredProgram ||
+          !llvm::all_of(replay.contractions, [](Operation *operation) {
+            return isa<ContractOp>(operation);
+          }) ||
+          llvm::any_of(replay.accesses, [&](Operation *access) {
+            return llvm::any_of(access->getResults(), [&](Value value) {
+              return queryFragmentAxes(value.getType(), source).size() > 1;
+            });
+          }) ||
+          !replayable(coordinate) || !replayable(store.getValid()))
+        continue;
+      auto roots = analysis.axisRanges(store.getValue(), *axis);
+      for (MakeRangeOp root : address.roots)
+        if (!llvm::is_contained(roots.roots, root))
+          roots.roots.push_back(root);
+      auto extent = cast<PhysicalExprAttr>(type.getShape()[0]);
+      if (cast<FragmentType>(store.getValue().getType()).getShape()[*axis] !=
+              extent ||
+          llvm::any_of(roots.roots, [&](MakeRangeOp root) {
+            return root.getResult().getType().getShape()[0] != extent;
+          }))
+        continue;
+      OpBuilder builder(store);
+      IRMapping mapping;
+      auto original = cast<AxisMapAttr>(type.getAxisMaps()[0]);
+      auto selected = AxisMapAttr::get(
+          kernel.getContext(), nextSource++, original.getSourceAxis(),
+          original.getDimensionId(), 0, true);
+      for (MakeRangeOp root : roots.roots) {
+        auto fragment = cast<FragmentType>(root.getResult().getType());
+        auto replacementType = FragmentType::get(
+            kernel.getContext(), fragment.getElementType(), fragment.getShape(),
+            builder.getArrayAttr({selected}), fragment.getValidity(),
+            fragment.getOwner());
+        auto replacement = builder.create<MakeRangeOp>(
+            root.getLoc(), replacementType, root.getStart(), root.getExtent(),
+            root.getStep(), root.getLogicalStart(), root.getLogicalStop(),
+            selected.getSourceId(), selected.getSourceAxis(), true);
+        inheritRangeAuthority(replacement, root);
+        mapping.map(root.getResult(), replacement.getResult());
+      }
+      ReplayMaterializationOptions options;
+      options.fragmentAxis = *axis;
+      options.traversalRanges = roots.roots;
+      options.segmentMapping = selected;
+      auto payload = materializeReplayedValue(
+          builder, store.getLoc(), store.getValue(), source, extent, mapping,
+          options);
+      if (failed(payload))
+        return store.emitOpError("reduction output occurrence cannot be separated");
+      options.fragmentAxis = 0;
+      auto addressValue = materializeReplayedValue(
+          builder, store.getLoc(), coordinate, source, extent, mapping, options);
+      if (failed(addressValue))
+        return store.emitOpError("reduction output address cannot be separated");
+      if (store.getValid()) {
+        options.fragmentAxis = *axis;
+        auto valid = materializeReplayedValue(
+            builder, store.getLoc(), store.getValid(), source, extent, mapping,
+            options);
+        if (failed(valid))
+          return store.emitOpError("reduction output validity cannot be separated");
+        store.getValidMutable().assign(*valid);
+      }
+      store.getValueMutable().assign(*payload);
+      coordinates[position] = *addressValue;
+      store.getCoordinatesMutable().assign(coordinates);
+    }
+  }
+  eraseDeadPhysicalValues(kernel);
+  return success();
+}
+
 LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
                                              MakeRangeOp range,
                                              ArrayRef<StoreOp> stores,
@@ -3811,6 +3951,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   if (failed(physicalKernel))
     return failure();
   func::FuncOp kernel = *physicalKernel;
+  if (ownershipOnly && failed(separateReductionOutputOccurrences(kernel)))
+    return failure();
   auto finalizeValueRelations = [&]() -> LogicalResult {
     eraseDeadPhysicalValues(kernel);
     if (failed(bindStructurallyRequiredStaticFragments(kernel)))
@@ -4981,15 +5123,55 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   });
   llvm::SmallPtrSet<Operation *, 8> contractionOwnedRanges;
   llvm::SmallPtrSet<Operation *, 8> retainedCartesianRanges;
+  llvm::SmallPtrSet<Operation *, 8> independentContractionRanges;
+  for (MakeRangeOp range : allRanges) {
+    auto dimension = ownershipDimension(kernel, range);
+    if (failed(dimension) || !nonUniqueContractionDimensions.contains(*dimension))
+      continue;
+    auto facts = contractFreeAxisFacts(kernel, range);
+    if (facts.sides != ContractFreeAxisLhs && facts.sides != ContractFreeAxisRhs)
+      continue;
+    bool reduced = false;
+    PhysicalProgramAnalysis analysis(kernel);
+    kernel.walk([&](ContractOp contract) {
+      auto freeAxes = analysis.contractFreeAxes(contract);
+      reduced |= llvm::count_if(freeAxes.axes, [&](const auto &axis) {
+        return llvm::any_of(axis.ranges.roots, [&](MakeRangeOp root) {
+          return sameLogicalRange(root, range);
+        });
+      }) > 1;
+      for (auto [operand, axes] :
+           {std::pair{contract.getLhs(), contract.getLhsReductionAxes()},
+            std::pair{contract.getRhs(), contract.getRhsReductionAxes()}})
+        for (int64_t axis : axes) {
+          auto roots = analysis.axisRanges(operand, axis);
+          reduced |= !roots.isExact() || !roots.blockers.empty() ||
+              llvm::any_of(roots.roots, [&](MakeRangeOp root) {
+                return sameLogicalRange(root, range);
+              });
+        }
+    });
+    kernel.walk([&](Operation *operation) {
+      if (!isa<ScaledContractOp, SparseContractOp>(operation))
+        return;
+      for (Value operand : operation->getOperands())
+        reduced |= !queryFragmentAxes(operand.getType(), sourceAxisIdentity(range))
+                        .empty();
+    });
+    if (!reduced)
+      independentContractionRanges.insert(range.getOperation());
+  }
   auto hasPointwiseOwnership = [&](MakeRangeOp range) {
     if (contractionOwnedRanges.contains(range.getOperation()) ||
         retainedCartesianRanges.contains(range.getOperation()))
       return false;
     FailureOr<uint64_t> dimension = ownershipDimension(kernel, range);
-    // Dimension equality proves an extent, not a Cartesian coordinate. Leave
-    // non-unique free-axis occurrences to contraction blocking, which binds
-    // each operand/result position to its own mapping, ranges and validity.
-    if (succeeded(dimension) && nonUniqueContractionDimensions.contains(*dimension))
+    // Equal dimensions do not identify Cartesian coordinates. Only a distinct
+    // free occurrence can bind source-specific ownership here; contraction
+    // blocking owns the remaining operand/result positions.
+    if (succeeded(dimension) &&
+        nonUniqueContractionDimensions.contains(*dimension) &&
+        !independentContractionRanges.contains(range.getOperation()))
       return false;
     PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
                               range.getDerived()};
@@ -5011,6 +5193,19 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::SmallPtrSet<Operation *, 8> positionalOccurrences;
   llvm::SmallDenseSet<uint64_t> independentCartesianDimensions;
   uint64_t nextOccurrenceSource = nextPhysicalAxisIdentities(kernel).first;
+  for (MakeRangeOp range : allRanges) {
+    if (!independentContractionRanges.contains(range.getOperation()) ||
+        !ownershipSources.contains(sourceAxisIdentity(range)))
+      continue;
+    MakeRangeOp root = range;
+    for (const auto &entry : occurrenceRoots)
+      if (sameLogicalRange(range, entry.second)) {
+        root = entry.second;
+        break;
+      }
+    occurrenceRoots[range.getOperation()] = root;
+    positionalOccurrences.insert(range.getOperation());
+  }
   WalkResult occurrences = kernel.walk([&](StoreOp store) {
     auto valueType = dyn_cast<FragmentType>(store.getValue().getType());
     SmallVector<Value> coordinates;
@@ -6732,7 +6927,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     PhysicalExprAttr tileExtent = fragmentExtent(*parameter);
     if (sourceType.getShape()[0] != tileExtent) {
       if (FailureOr<uint64_t> dimension = rangeDimension(range);
-          succeeded(dimension))
+          succeeded(dimension) && !queryParameterBinding(*parameter).source)
         retargetDimensionExtent(range.getResult(), *dimension, tileExtent);
       else
         retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
