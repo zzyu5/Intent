@@ -226,6 +226,10 @@ LogicalResult vectorizeIterations(func::FuncOp kernel,
     for (int64_t width = 1; width <= maximumWidth;
          width *= 2)
       candidates.push_back(width);
+    bool completeChunks = lower && upper && upper.value() > lower.value() &&
+        llvm::all_of(candidates, [&](int64_t width) {
+          return (static_cast<__int128>(upper.value()) - lower.value()) % width == 0;
+        });
     auto name = ("ITERATION_" + Twine(source)).str();
     ParameterOp width = getOrCreatePhysicalParameter(
         kernel, name, ParameterRole::OwnershipN, ParameterCategory::Pointwise,
@@ -282,14 +286,19 @@ LogicalResult vectorizeIterations(func::FuncOp kernel,
         ordinal.getSourceId(), 0, false);
     // Count chunks and guard lane ordinals so a padded final lane cannot wrap
     // past a large logical upper bound and accidentally become active again.
-    Value remaining = builder.create<BinaryOp>(location, index, span, offset,
-                                              BinaryOperator::Subtract);
-    Value base = builder.create<BroadcastOp>(location, shape, start);
-    Value lanes = builder.create<BinaryOp>(location, shape, members, base,
-                                          BinaryOperator::Subtract);
-    Value end = builder.create<BroadcastOp>(location, shape, remaining);
-    Value active = builder.create<CompareOp>(loop.getLoc(), boolean, lanes, end,
-                                            ComparePredicate::Lt);
+    Value active;
+    if (completeChunks) {
+      active = builder.create<arith::ConstantIntOp>(location, 1, 1);
+    } else {
+      Value remaining = builder.create<BinaryOp>(location, index, span, offset,
+                                                BinaryOperator::Subtract);
+      Value base = builder.create<BroadcastOp>(location, shape, start);
+      Value lanes = builder.create<BinaryOp>(location, shape, members, base,
+                                            BinaryOperator::Subtract);
+      Value end = builder.create<BroadcastOp>(location, shape, remaining);
+      active = builder.create<CompareOp>(loop.getLoc(), boolean, lanes, end,
+                                        ComparePredicate::Lt);
+    }
     IRMapping values;
     values.map(loop.getInductionVar(), members);
     for (Operation &operation : loop.getBody()->without_terminator())
