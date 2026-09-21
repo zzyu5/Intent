@@ -33,7 +33,7 @@ def _sections(text: str) -> list[tuple[int, int, int, str]]:
 
 
 def snapshot(project: Path) -> dict:
-    """Freeze language and GPU execution contracts, without algorithm examples."""
+    """Freeze public language and kernel/host contracts, without algorithm examples."""
     project = project.resolve()
     import intent
     import intent.language as language
@@ -43,7 +43,6 @@ def snapshot(project: Path) -> dict:
     documents = {}
     paths = [path for directory in (project / "doc/dsl", project / "doc/programming-model")
              for path in directory.glob("*.md")]
-    paths.append(project / "doc/compiler/kir-to-gpu.md")
     for path in sorted(paths):
         identifier = str(path.relative_to(project))
         text = path.read_text()
