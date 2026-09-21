@@ -4024,6 +4024,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     kernel.walk([&](MakeRangeOp range) { existingRanges.push_back(range); });
     SmallVector<WorksetCoordinateOp> lifted;
     bool liftSeparately = false;
+    bool preserveContractionOrder = false;
     if (existingRanges.empty()) {
       if (supportsCartesianPointwiseValueGraph(pointwiseCoordinates, true))
         lifted.append(pointwiseCoordinates.begin(), pointwiseCoordinates.end());
@@ -4067,9 +4068,14 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         SmallVector<WorksetCoordinateOp> candidates{
             uncovered[uncovered.size() - 2].second,
             uncovered.back().second};
-        if (supportsCartesianPointwiseValueGraph(candidates) ||
-            supportsStructuredFreeAxisValueGraph(candidates))
+        llvm::DenseMap<Operation *, bool> contractSides;
+        if (supportsCartesianPointwiseValueGraph(candidates)) {
           lifted = std::move(candidates);
+        } else if (supportsStructuredFreeAxisValueGraph(
+                       candidates, nullptr, &contractSides)) {
+          lifted = std::move(candidates);
+          preserveContractionOrder = !contractSides.empty();
+        }
       }
       if (lifted.empty())
         for (auto [_, coordinate] : llvm::reverse(uncovered))
@@ -4122,6 +4128,11 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         liftedRanges.clear();
       }
     }
+    // Native matrix forms use the last free operand axis for M/N. Preserve
+    // logical nesting on a proven free side so the innermost workset axis,
+    // rather than an outer independent axis, occupies that matrix dimension.
+    if (preserveContractionOrder)
+      std::reverse(liftedRanges.begin(), liftedRanges.end());
     if (failed(rankLiftPointwiseValueGraph(kernel, liftedRanges)))
       return kernel.emitError(
           "failed to rank-lift a legal pointwise ownership graph");
