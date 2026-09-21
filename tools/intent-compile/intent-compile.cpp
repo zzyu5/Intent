@@ -86,6 +86,8 @@ int main(int argc, char **argv) {
                                                 llvm::cl::init(0));
   llvm::cl::opt<int64_t> computeCapabilityMinor("compute-capability-minor",
                                                 llvm::cl::init(-1));
+  llvm::cl::opt<int64_t> singleToDoublePrecisionPerfRatio(
+      "single-to-double-precision-perf-ratio", llvm::cl::init(0));
   llvm::cl::opt<bool> matrixUnits("matrix-units", llvm::cl::init(false));
   llvm::cl::opt<bool> dynamicVectorWidth("dynamic-vector-width",
                                          llvm::cl::init(false));
@@ -206,6 +208,7 @@ int main(int argc, char **argv) {
       maxThreadsPerBlock,
       computeCapabilityMajor,
       computeCapabilityMinor,
+      singleToDoublePrecisionPerfRatio,
       matrixUnits,
       dynamicVectorWidth,
       target == TargetKind::Triton};

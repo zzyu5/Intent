@@ -386,6 +386,7 @@ LogicalResult CapabilitiesAttr::verify(
     int64_t sharedMemoryPerUnit, int64_t maxDynamicSharedMemoryPerBlock,
     int64_t registersPerUnit, int64_t maxThreadsPerBlock,
     int64_t computeCapabilityMajor, int64_t computeCapabilityMinor,
+    int64_t singleToDoublePrecisionPerfRatio,
     bool matrixUnits, bool dynamicVectorWidth, bool nativeTupleReductions) {
   (void)matrixUnits;
   (void)dynamicVectorWidth;
@@ -393,7 +394,7 @@ LogicalResult CapabilitiesAttr::verify(
   if (computeUnits <= 0 || sharedMemoryPerUnit <= 0 ||
       maxDynamicSharedMemoryPerBlock <= 0 || registersPerUnit <= 0 ||
       maxThreadsPerBlock <= 0 || computeCapabilityMajor <= 0 ||
-      computeCapabilityMinor < 0)
+      computeCapabilityMinor < 0 || singleToDoublePrecisionPerfRatio <= 0)
     return emitError() << "selected GPU capabilities require positive resource limits";
   return success();
 }

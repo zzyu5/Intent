@@ -2393,7 +2393,38 @@ LogicalResult legalizeContractShapes(func::FuncOp kernel) {
   return success();
 }
 
+std::optional<llvm::APFloat>
+widenedConstantReciprocal(const llvm::APFloat &divisor) {
+  constexpr auto rounding = llvm::APFloat::rmNearestTiesToEven;
+  bool losesInfo = false;
+  llvm::APFloat denominator(divisor);
+  denominator.convert(llvm::APFloat::IEEEdouble(), rounding, &losesInfo);
+  llvm::APFloat inverse(1.0);
+  inverse.divide(denominator, rounding);
+
+  // The 53-bit reciprocal times the 24-bit divisor is exact in binary128.
+  llvm::APFloat error(inverse);
+  error.convert(llvm::APFloat::IEEEquad(), rounding, &losesInfo);
+  denominator.convert(llvm::APFloat::IEEEquad(), rounding, &losesInfo);
+  error.multiply(denominator, rounding);
+  llvm::APFloat one(1.0);
+  one.convert(llvm::APFloat::IEEEquad(), rounding, &losesInfo);
+  error.subtract(one, rounding);
+  error.clearSign();
+  llvm::APFloat bound(0x1p-54);
+  bound.convert(llvm::APFloat::IEEEquad(), rounding, &losesInfo);
+  if (error.compare(bound) == llvm::APFloat::cmpGreaterThan)
+    return std::nullopt;
+  // This bound keeps exact f32 midpoints (including subnormal ones) in their
+  // f64 RN interval. Other f32 quotients are farther from any midpoint than
+  // the reciprocal error plus f64 multiplication rounding can reach.
+  return inverse;
+}
+
 void foldExactConstantDivisions(func::FuncOp kernel) {
+  auto capabilities =
+      kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+  bool fastFloat64 = capabilities.getSingleToDoublePrecisionPerfRatio() <= 2;
   kernel.walk([&](gpu::BinaryOp binary) {
     Type element = gpu::uniformElementType(binary.getResult().getType());
     if ((binary.getOperatorKind() == BinaryOperator::FloorDivide ||
@@ -2430,18 +2461,44 @@ void foldExactConstantDivisions(func::FuncOp kernel) {
     if (!constant || !constant.getValue().isNormal())
       return;
     llvm::APFloat inverse(constant.getValue().getSemantics());
-    if (!constant.getValue().getExactInverse(&inverse) || !inverse.isNormal())
-      return;
+    bool widened = false;
+    if (!constant.getValue().getExactInverse(&inverse) || !inverse.isNormal()) {
+      if (!element.isF32() || !fastFloat64)
+        return;
+      auto reciprocal = widenedConstantReciprocal(constant.getValue());
+      if (!reciprocal)
+        return;
+      inverse = std::move(*reciprocal);
+      widened = true;
+    }
     OpBuilder builder(binary);
+    Type computationElement = widened ? builder.getF64Type() : element;
+    auto computationType = [&](Type type) -> Type {
+      if (auto fragment = dyn_cast<gpu::FragmentType>(type))
+        return gpu::FragmentType::get(
+            kernel.getContext(), computationElement, fragment.getShape(),
+            fragment.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
+      return computationElement;
+    };
     Value reciprocal = builder.create<arith::ConstantOp>(
-        binary.getLoc(), FloatAttr::get(element, inverse));
+        binary.getLoc(), FloatAttr::get(computationElement, inverse));
     if (auto fragment = dyn_cast<gpu::FragmentType>(binary.getRhs().getType()))
-      reciprocal = builder.create<gpu::SplatOp>(binary.getLoc(), fragment, reciprocal);
+      reciprocal = builder.create<gpu::SplatOp>(
+          binary.getLoc(), cast<gpu::FragmentType>(computationType(fragment)),
+          reciprocal);
+    Value lhs = binary.getLhs();
+    if (widened)
+      lhs = builder.create<gpu::CastOp>(binary.getLoc(),
+                                       computationType(lhs.getType()), lhs);
     auto product = builder.create<gpu::BinaryOp>(
-        binary.getLoc(), binary.getResult().getType(), binary.getLhs(), reciprocal,
+        binary.getLoc(), computationType(binary.getType()), lhs, reciprocal,
         BinaryOperator::Multiply);
-    product->setDiscardableAttrs(llvm::to_vector(binary->getDiscardableAttrs()));
-    binary.getResult().replaceAllUsesWith(product.getResult());
+    Value result = product.getResult();
+    if (widened)
+      result = builder.create<gpu::CastOp>(binary.getLoc(), binary.getType(), result);
+    result.getDefiningOp()->setDiscardableAttrs(
+        llvm::to_vector(binary->getDiscardableAttrs()));
+    binary.getResult().replaceAllUsesWith(result);
     binary.erase();
   });
 }
