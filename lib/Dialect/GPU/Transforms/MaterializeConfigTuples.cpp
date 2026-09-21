@@ -8,6 +8,7 @@
 #include "mlir/IR/AttrTypeSubElements.h"
 
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/StringMap.h"
 
 #include <algorithm>
@@ -931,6 +932,52 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
              ScaledContractOp, SparseContractOp, HistogramOp, ScatterReduceOp>(
             operation);
   });
+  SmallVector<ParameterOp> pointwiseRowAxes;
+  if (pointwiseOnlyProgram)
+    for (ParameterOp parameter : parameters) {
+      ParameterAttr schema = parameter.getParameter();
+      if (schema.getCategory() ==
+              static_cast<uint32_t>(ParameterCategory::Pointwise) &&
+          schema.getRole() == static_cast<uint32_t>(ParameterRole::OwnershipM) &&
+          llvm::is_contained(schema.getCandidates().asArrayRef(), 1) &&
+          llvm::any_of(schema.getCandidates().asArrayRef(),
+                       [](int64_t extent) { return extent > 1; }))
+        pointwiseRowAxes.push_back(parameter);
+    }
+  SmallVector<unsigned> rowLeaders;
+  for (unsigned index = 0; index < pointwiseRowAxes.size(); ++index)
+    rowLeaders.push_back(index);
+  auto leader = [&](unsigned index) {
+    while (rowLeaders[index] != index)
+      index = rowLeaders[index];
+    return index;
+  };
+  kernel.walk([&](Operation *operation) {
+    for (Value result : operation->getResults()) {
+      auto fragment = dyn_cast<FragmentType>(result.getType());
+      if (!fragment)
+        continue;
+      std::optional<unsigned> first;
+      for (auto [index, parameter] : llvm::enumerate(pointwiseRowAxes)) {
+        if (!fragmentReferencesParameter(fragment,
+                                          parameter.getParameter().getName()))
+          continue;
+        if (first)
+          rowLeaders[leader(index)] = leader(*first);
+        else
+          first = index;
+      }
+    }
+  });
+  llvm::MapVector<unsigned, SmallVector<ParameterOp>> rowGroups;
+  for (auto [index, parameter] : llvm::enumerate(pointwiseRowAxes))
+    rowGroups[leader(index)].push_back(parameter);
+  unsigned rowChoiceCount = 1;
+  for (const auto &group : rowGroups)
+    rowChoiceCount = std::max<unsigned>(rowChoiceCount, group.second.size());
+  // Bind the existing M/N profile along each outer axis of a fixed fragment.
+  // Separate worksets keep separate row bindings; correlate their choices as
+  // profile rows instead of constructing a Cartesian product of all axes.
   SmallVector<CorrelatedProfileParameters> correlatedProfiles =
       correlatedReductionContractionParameters(
           kernel, parameters, hasTwoAxisPointwiseOwnership,
@@ -995,34 +1042,42 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
   bool invalidFootprint = false;
   auto appendTuple = [&](llvm::function_ref<const TuningProfile &(ParameterOp)> profileFor,
                          bool compactRows = false) {
-    NamedAttrList bindings;
-    for (ParameterOp parameter : parameters) {
-      auto schema = parameter.getParameter();
-      auto role = static_cast<ParameterRole>(schema.getRole());
-      int64_t requested = requestedValue(profileFor(parameter), role);
-      if (compactRows && reductionRows.contains(parameter)) {
-        for (const TuningProfile &profile : parameterProfiles.find(parameter)->second)
-          requested = std::min(requested, requestedValue(profile, role));
-      } else if (compactRows &&
-                 (pointwiseTraversals.contains(parameter) ||
-                  role == ParameterRole::Reduction ||
-                  role == ParameterRole::ReductionInner ||
-                  role == ParameterRole::ReductionOuter)) {
-        requested = largestReduction;
+    for (unsigned choice = 0; choice < rowChoiceCount; ++choice) {
+      llvm::SmallDenseSet<Operation *> selectedRows;
+      for (const auto &group : rowGroups)
+        selectedRows.insert(group.second[choice % group.second.size()]);
+      NamedAttrList bindings;
+      for (ParameterOp parameter : parameters) {
+        auto schema = parameter.getParameter();
+        auto role = static_cast<ParameterRole>(schema.getRole());
+        int64_t requested = requestedValue(profileFor(parameter), role);
+        if (!selectedRows.contains(parameter) &&
+            llvm::is_contained(pointwiseRowAxes, parameter))
+          requested = 1;
+        if (compactRows && reductionRows.contains(parameter)) {
+          for (const TuningProfile &profile : parameterProfiles.find(parameter)->second)
+            requested = std::min(requested, requestedValue(profile, role));
+        } else if (compactRows &&
+                   (pointwiseTraversals.contains(parameter) ||
+                    role == ParameterRole::Reduction ||
+                    role == ParameterRole::ReductionInner ||
+                    role == ParameterRole::ReductionOuter)) {
+          requested = largestReduction;
+        }
+        int64_t selected = selectCandidate(schema.getCandidates().asArrayRef(), requested);
+        bindings.set(schema.getName(), builder.getI64IntegerAttr(selected));
       }
-      int64_t selected = selectCandidate(schema.getCandidates().asArrayRef(), requested);
-      bindings.set(schema.getName(), builder.getI64IntegerAttr(selected));
+      bindContractionFreeExtents(freeExtents, bindings, profileFor, builder);
+      if (failed(bindTraversalFragmentFootprints(kernel, parameters, bindings,
+                                                 builder))) {
+        invalidFootprint = true;
+        continue;
+      }
+      DictionaryAttr tuple = bindings.getDictionary(kernel.getContext());
+      if (!llvm::is_contained(tuples, Attribute(tuple))) tuples.push_back(tuple);
+      appendFullResultContractionTuples(kernel, bindings, profileFor, builder,
+                                       tuples);
     }
-    bindContractionFreeExtents(freeExtents, bindings, profileFor, builder);
-    if (failed(bindTraversalFragmentFootprints(kernel, parameters, bindings,
-                                               builder))) {
-      invalidFootprint = true;
-      return;
-    }
-    DictionaryAttr tuple = bindings.getDictionary(kernel.getContext());
-    if (!llvm::is_contained(tuples, Attribute(tuple))) tuples.push_back(tuple);
-    appendFullResultContractionTuples(kernel, bindings, profileFor, builder,
-                                     tuples);
   };
   for (unsigned profileIndex = 0; profileIndex < profileCount;
        ++profileIndex) {

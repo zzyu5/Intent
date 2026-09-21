@@ -4025,23 +4025,16 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     SmallVector<WorksetCoordinateOp> lifted;
     bool liftSeparately = false;
     if (existingRanges.empty()) {
-      if (supportsCartesianPointwiseValueGraph(pointwiseCoordinates))
+      if (supportsCartesianPointwiseValueGraph(pointwiseCoordinates, true))
         lifted.append(pointwiseCoordinates.begin(), pointwiseCoordinates.end());
       else {
-        if (pointwiseCoordinates.size() >= 2) {
-          SmallVector<WorksetCoordinateOp> candidates{
-              pointwiseCoordinates[pointwiseCoordinates.size() - 2],
-              pointwiseCoordinates.back()};
+        // A coordinate used by ordered control can stay scalar without
+        // excluding other independent coordinates from the ownership tile.
+        for (WorksetCoordinateOp coordinate : llvm::reverse(pointwiseCoordinates)) {
+          SmallVector<WorksetCoordinateOp> candidates(lifted);
+          candidates.insert(candidates.begin(), coordinate);
           if (supportsCartesianPointwiseValueGraph(candidates, true))
             lifted = std::move(candidates);
-        }
-        if (lifted.empty()) {
-          for (WorksetCoordinateOp coordinate : llvm::reverse(pointwiseCoordinates)) {
-            SmallVector<WorksetCoordinateOp> candidates(lifted);
-            candidates.insert(candidates.begin(), coordinate);
-            if (supportsCartesianPointwiseValueGraph(candidates, true))
-              lifted = std::move(candidates);
-          }
         }
       }
     } else {
@@ -6357,7 +6350,15 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     pointwiseOwnershipAxes.insert(pointwiseOwnershipAxes.end() - 1, inputAxis);
   });
 
-  if (orderedByStore && pointwiseOwnershipAxes.size() > 2 &&
+  bool pointwiseOnlyProgram = true;
+  kernel.walk([&](Operation *operation) {
+    pointwiseOnlyProgram &=
+        !isa<ContractOp, ReduceOp, ScanOp, RegionFoldOp, RegionScanOp,
+             ScaledContractOp, SparseContractOp, HistogramOp, ScatterReduceOp>(
+            operation);
+  });
+  if (!pointwiseOnlyProgram && orderedByStore &&
+      pointwiseOwnershipAxes.size() > 2 &&
       llvm::all_of(pointwiseOwnershipAxes, [&](Attribute axis) {
         return llvm::all_of(axes.lookup(axis), [&](MakeRangeOp range) {
           return contractFreeAxisSides(kernel, range) == ContractFreeAxisNone;
@@ -6459,7 +6460,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           std::max(contractElementBitWidth, facts.operandElementBitWidth);
     }
     const bool contractionAxis = contractSides != ContractFreeAxisNone;
-    const bool scalarGridAxis = !contractionAxis &&
+    const bool scalarGridAxis = !pointwiseOnlyProgram && !contractionAxis &&
         ownershipIndex + 2 < pointwiseOwnershipAxes.size();
     ParameterRole ownershipRole = ParameterRole::OwnershipN;
     auto declaredRole =
@@ -6474,7 +6475,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
          declaredRole == ParameterRole::OwnershipN))
       ownershipRole = declaredRole;
     else if (!scalarGridAxis &&
-             ownershipIndex + 2 == pointwiseOwnershipAxes.size())
+             ownershipIndex + 1 < pointwiseOwnershipAxes.size())
       ownershipRole = ParameterRole::OwnershipM;
     parameter->removeAttr(coverageDimensionAttr);
     parameter->removeAttr(coverageBoundAttr);
