@@ -1281,9 +1281,13 @@ private:
     case UnaryOperator::Abs: return call("ct.abs");
     case UnaryOperator::Sqrt: return call("ct.sqrt");
     case UnaryOperator::Lgamma:
-      unary.emitOpError("lgamma is unsupported by the cuTile provider");
+    case UnaryOperator::Log1p:
+    case UnaryOperator::Erfc:
+    case UnaryOperator::I0:
+      unary.emitOpError() << stringifyUnaryOperator(unary.getOperatorKind())
+                         << " is unsupported by the cuTile provider";
       failed = true;
-      return "<unsupported-lgamma>";
+      return "<unsupported-unary>";
     }
     llvm_unreachable("unhandled Intent unary operator");
   }

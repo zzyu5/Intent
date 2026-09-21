@@ -131,6 +131,9 @@ class UnaryOperator(IntEnum):
     ABS = 12
     SQRT = 13
     LGAMMA = 14
+    LOG1P = 15
+    ERFC = 16
+    I0 = 17
 
 
 class BinaryOperator(IntEnum):

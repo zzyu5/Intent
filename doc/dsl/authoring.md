@@ -56,7 +56,7 @@ Generic `I.reduce(value, axis=..., identity=..., combine=helper)` 的 identity�
 
 Python tuple 与 `I.record(field=value, ...)` 是结构化 products，不要求各 component 同 dtype/shape，但每个 component 必须与对应 identity/combine/result 一致。Tuple 静态解构，record 用 `.field`；都不直接成为 host-visible kernel return。
 
-`@intent.fn` 是 typed kernel helper，不是任意 Python 调用；普通 Python `abs/math.*` 不会自动变成 DSL。先查当前 API，使用 `I.abs`、`I.sqrt`、`I.lgamma` 等已声明入口，不猜 `I.log1p`、`I.keepdim` 等名字。Runtime captures 显式传参，structured combine 必须 pure。
+`@intent.fn` 是 typed kernel helper，不是任意 Python 调用；普通 Python `abs/math.*` 不会自动变成 DSL。先查当前 API，使用 `I.abs`、`I.sqrt`、`I.lgamma`、`I.log1p`、`I.erfc`、`I.i0` 等已声明数学入口，不猜 `I.keepdim` 等未声明名字。Runtime captures 显式传参，structured combine 必须 pure。
 
 Helper 可以没有返回值；函数体自然结束与裸 `return` 等价，都保留已经执行的 reads/effects。有值返回仍须满足 runtime 分支的返回 schema 一致性。
 

@@ -65,9 +65,11 @@ for ordinal in I.domain(0, n):
 
 pointwise surface允许scalar与size-one broadcast；frontend必须将其归一成显式broadcast relation。dynamic extents保留identity/equality conditions，不以“都是dynamic”判为兼容。
 
-已有的一元逐元素数学入口（unary / elementwise math）使用 `I.exp(value)`、`I.log(value)`、`I.lgamma(value)`、`I.sin(value)`、`I.cos(value)`、`I.floor(value)`、`I.erf(value)`、`I.rsqrt(value)`、`I.sqrt(value)`、`I.sigmoid(value)` 与 `I.abs(value)`。其中 `I.erf` 是误差函数（error function）；浮点数值与特殊值遵循数值章节。带额外数值选项的 `I.exp2`、`I.tanh` 见下文。
+已有的一元逐元素数学入口（unary / elementwise math）使用 `I.exp(value)`、`I.log(value)`、`I.log1p(value)`、`I.lgamma(value)`、`I.sin(value)`、`I.cos(value)`、`I.floor(value)`、`I.erf(value)`、`I.erfc(value)`、`I.i0(value)`、`I.rsqrt(value)`、`I.sqrt(value)`、`I.sigmoid(value)` 与 `I.abs(value)`。其中 `I.erf` 是误差函数（error function）；浮点数值与特殊值遵循数值章节。带额外数值选项的 `I.exp2`、`I.tanh` 见下文。
 
 `I.lgamma(value)` 计算自然对数 `log|Gamma(value)|`，接受浮点 scalar 或 tensor，保持输入的 dtype 与 shape。它是普通 pure unary operation，特殊值规则见数值章节。
+
+`I.log1p(value)` 计算 `log(1 + value)`；`I.erfc(value)` 计算互补误差函数；`I.i0(value)` 计算第一类零阶修正贝塞尔函数（modified Bessel function of the first kind, order zero）。它们接受浮点 scalar 或 tensor，保持输入的 dtype 与 shape，归一到同一类 pure unary operation。它们是独立的数学库入口，不要求展开为普通加减法或手写近似式；数值与特殊值规则见数值章节。
 
 Floating division可使用具名入口 `I.fdiv(lhs, rhs, *, approximate=False, flush_to_zero=False)`，默认与普通 `/` 相同。`I.exp2(value, *, approximate=False, flush_to_zero=False)` 与 `I.tanh(value, *, approximate=False)` 允许作者逐操作显式选择近似数学。选项是硬件无关的 constexpr bool；非默认模式只接受 `f32`，FTZ 必须与 `approximate=True` 一起选择。它们归一到同一 canonical binary/unary operation 的数值属性，不产生另一套算法、全局 fast-math 环境或 target query；具体精度与特殊值规则见数值章节。
 

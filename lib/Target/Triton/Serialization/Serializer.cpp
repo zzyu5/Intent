@@ -1568,6 +1568,8 @@ private:
       return libraryCall("libdevice.exp2");
     case UnaryOperator::Log:
       return libraryCall("libdevice.log");
+    case UnaryOperator::Log1p:
+      return libraryCall("libdevice.log1p");
     case UnaryOperator::Lgamma:
       return libraryCall("libdevice.lgamma");
     case UnaryOperator::Sin:
@@ -1578,6 +1580,10 @@ private:
       return "tl.floor(" + input + ")";
     case UnaryOperator::Erf:
       return libraryCall("libdevice.erf");
+    case UnaryOperator::Erfc:
+      return libraryCall("libdevice.erfc");
+    case UnaryOperator::I0:
+      return libraryCall("libdevice.cyl_bessel_i0");
     case UnaryOperator::Rsqrt:
       return libraryCall("libdevice.rsqrt");
     case UnaryOperator::Sigmoid:

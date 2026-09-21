@@ -83,6 +83,14 @@ fixed-width integers使用二进制补码与modulo arithmetic：
 在非正整数极点（包括正负零）和正负无穷处返回 `+inf`；NaN 输入返回 NaN。
 结果使用原浮点 dtype，仍受该格式的表示范围与普通转换规则约束。
 
+`I.log1p(x)`、`I.erfc(x)`、`I.i0(x)` 是 pure 逐元素数学库函数，保持输入的浮点 dtype 与 shape：
+
+- `log1p` 计算 `log(1+x)`，不按先舍入 `1+x` 再取对数的普通运算组合定义；保留 signed zero，`-1` 返回 `-inf`，小于 `-1` 返回 NaN，`+inf` 返回 `+inf`。
+- `erfc` 计算互补误差函数，不按先舍入 `erf(x)` 再从 1 相减的普通运算组合定义；正负零返回 1，`+inf` 返回 `+0`，`-inf` 返回 2。
+- `i0` 计算第一类零阶修正贝塞尔函数，是偶函数；正负零返回 1，正负无穷返回 `+inf`，有限大值受结果格式的溢出规则约束。
+
+三者均传播 NaN。它们采用数学库精度，不承诺 correctly-rounded 或内部近似式的逐步舍入结果。`f32/f64` 相对对应格式 RN-even 结果的最大 ULP 误差分别为：`log1p` 1/1、`erfc` 4/5、`i0` 6/6；更低精度浮点输入按 f32 求值后遵循普通 cast 规则返回原 dtype。这些界限参照 [CUDA 数学库精度说明](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-c-programming-guide/index.html#mathematical-functions-appendix)，不改变相邻普通算术、显式近似或 FTZ 的合同。
+
 ### 5.1 显式近似数学
 
 `fdiv`、`exp2` 和 `tanh` 的 `approximate` 是操作本身的语义，不是优化 hint；默认 `False` 保持普通运算。`fdiv/exp2` 另外接受 `flush_to_zero`，仅允许在 `approximate=True` 时启用。两个参数必须是 constexpr bool，非默认模式的 operands/result 都是 `f32`，不做隐式 dtype 转换。这是一个闭合的逐操作能力，不额外改变相邻普通运算、contraction或reduction的数值合同。

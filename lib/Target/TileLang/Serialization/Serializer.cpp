@@ -768,6 +768,16 @@ private:
     auto call = [&](StringRef function) {
       return function.str() + "(" + input + ")";
     };
+    auto libraryCall = [&](StringRef function, bool external) {
+      Type element = unary.getResult().getType();
+      std::string argument = element.isF32()
+                                 ? input : "T.cast(" + input + ", T.float32)";
+      std::string result = external
+          ? "T.call_pure_extern(\"float32\", \"" + function.str() + "\", " + argument + ")"
+          : function.str() + "(" + argument + ")";
+      return element.isF32()
+                 ? result : "T.cast(" + result + ", " + tileLangType(element) + ")";
+    };
     switch (unary.getOperatorKind()) {
     case UnaryOperator::Negate: return "(-" + input + ")";
     case UnaryOperator::Not: return "(~" + input + ")";
@@ -778,10 +788,13 @@ private:
                std::string(unary.getFlushToZero() ? "_ftz" : "") + "\", " + input + ")";
       return call("T.exp2");
     case UnaryOperator::Log: return call("T.log");
+    case UnaryOperator::Log1p: return libraryCall("T.log1p", /*external=*/false);
     case UnaryOperator::Sin: return call("T.sin");
     case UnaryOperator::Cos: return call("T.cos");
     case UnaryOperator::Floor: return call("T.floor");
     case UnaryOperator::Erf: return call("T.erf");
+    case UnaryOperator::Erfc: return libraryCall("erfcf", /*external=*/true);
+    case UnaryOperator::I0: return libraryCall("cyl_bessel_i0f", /*external=*/true);
     case UnaryOperator::Rsqrt: return call("T.rsqrt");
     case UnaryOperator::Sigmoid: return call("T.sigmoid");
     case UnaryOperator::Tanh:

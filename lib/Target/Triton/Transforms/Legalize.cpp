@@ -2908,10 +2908,13 @@ bool hasExpensiveMapProducer(Operation *operation) {
   case UnaryOperator::Exp:
   case UnaryOperator::Exp2:
   case UnaryOperator::Log:
+  case UnaryOperator::Log1p:
   case UnaryOperator::Lgamma:
   case UnaryOperator::Sin:
   case UnaryOperator::Cos:
   case UnaryOperator::Erf:
+  case UnaryOperator::Erfc:
+  case UnaryOperator::I0:
   case UnaryOperator::Tanh:
     return !unary.getApproximate();
   default:
