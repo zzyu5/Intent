@@ -196,6 +196,32 @@ private:
     auto shape = dyn_cast_or_null<TensorShapeAttr>(type.getEncoding());
     return shape ? dimensions.lookup(shape.getDimensions()[axis]) : Value();
   }
+  bool bindLogicalExtent(Value source, int64_t dimension, DenseSet<Value> &visited) {
+    if (dimensions.count(dimension)) return true;
+    if (!visited.insert(source).second) return false;
+    Operation *op = source.getDefiningOp();
+    if (!op) return false;
+    if (isa<DomainOp, SubregionOp>(op)) {
+      auto ids = op->getAttrOfType<ArrayAttr>("extent_dimensions");
+      if (ids && llvm::any_of(ids, [&](Attribute id) { return cast<IntegerAttr>(id).getInt() == dimension; }))
+        return bindDomain(source) && dimensions.count(dimension);
+    }
+    if (auto relation = op->getAttrOfType<ShapeRelationAttr>("shape")) {
+      for (Attribute attribute : relation.getAxes()) {
+        auto expression = cast<ShapeExprAttr>(attribute);
+        if (expression.getDimension() != dimension) continue;
+        Value size;
+        if (expression.getKind() == 0) size = index(op->getLoc(), expression.getPayload());
+        if (expression.getKind() == 1) size = asIndex(get(op->getOperand(expression.getPayload())), op->getLoc());
+        if (size) { dimensions[dimension] = size; return true; }
+      }
+    }
+    // Follow the actual value's definition without materializing its tensor.
+    // A logical extent may be established in an ancestor workset's domain.
+    for (Value operand : op->getOperands())
+      if (bindLogicalExtent(operand, dimension, visited)) return true;
+    return false;
+  }
   Value allocate(Location loc, Type element, int64_t rows, int64_t columns, int64_t space = dsa::nramSpace) {
     auto type = MemRefType::get({rows, columns}, element, MemRefLayoutAttrInterface{}, b.getI64IntegerAttr(space));
     auto allocation = b.create<memref::AllocaOp>(loc, type);
@@ -232,7 +258,13 @@ private:
   Type storageElement(Type type) { return type.isIndex() ? b.getI64Type() : type; }
   FailureOr<LocalShape> localShape(Value value, Location loc) {
     if (auto selected = valueSlices.find(value); selected != valueSlices.end()) return selected->second;
-    return localShape(cast<RankedTensorType>(value.getType()), loc);
+    auto type = cast<RankedTensorType>(value.getType());
+    auto ids = cast<TensorShapeAttr>(type.getEncoding()).getDimensions();
+    for (unsigned axis = 0; axis < type.getRank(); ++axis) if (!extent(type, axis, loc)) {
+      DenseSet<Value> visited;
+      bindLogicalExtent(value, ids[axis], visited);
+    }
+    return localShape(type, loc);
   }
   Value allocateTensor(Location loc, Type element, const LocalShape &shape) {
     int64_t rows = 1;
@@ -1055,7 +1087,7 @@ private:
     if (!sourceTypes.empty() && valueSlices.empty()) {
       auto first = dyn_cast<RankedTensorType>(sourceTypes.front());
       if (first && axis < first.getRank()) {
-        auto shape = localShape(first, loc);
+        auto shape = localShape(sources.front(), loc);
         if (failed(shape)) return failure();
         int64_t elements = 1;
         for (const auto &local : *shape) elements *= local.capacity;
@@ -1866,8 +1898,13 @@ private:
       if (llvm::count(ids.asArrayRef(), dimension) != 1 || !replayableSlice(source, dimension, visited))
         return op->emitError("DSA source slicing requires an independent axis and immutable replayable inputs; this source needs explicit snapshot materialization");
     }
+    DenseSet<Value> extentDefinitions;
+    bindLogicalExtent(sources.front(), dimension, extentDefinitions);
     Value size = extent(sourceType, axis, loc);
-    if (!size || axisBindings.count(dimension)) return op->emitError("DSA region source requires an unpartitioned logical traversal");
+    if (!size) return op->emitError("DSA region source has no bound logical extent");
+    if (auto bound = axisBindings.find(dimension); bound != axisBindings.end())
+      if (!matchPattern(bound->second.begin, m_Zero()) || !sameIndex(bound->second.count, size) || !sameIndex(bound->second.extent, size))
+        return op->emitError("DSA region source requires an unpartitioned logical traversal");
     auto initial = flatten(identities), initialState = flatten(states);
     auto slots = makeSlots(identities.getTypes(), loc), next = makeSlots(identities.getTypes(), loc);
     if (failed(slots) || failed(next) || initial.size() != slots->size()) return failure();
@@ -2487,6 +2524,11 @@ private:
     }
     if (auto dim = dyn_cast<DimOp>(operation)) {
       Value value = dimensions.lookup(dim.getDimension());
+      if (!value) {
+        DenseSet<Value> visited;
+        bindLogicalExtent(dim.getSource(), dim.getDimension(), visited);
+        value = dimensions.lookup(dim.getDimension());
+      }
       if (!value && isa<ViewType>(dim.getSource().getType())) value = b.create<memref::DimOp>(loc, get(dim.getSource()), dim.getAxis());
       if (!value) return dim.emitError("DSA dimension has no runtime binding");
       values.map(dim.getResult(), value); return success();
