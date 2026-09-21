@@ -64,6 +64,10 @@ expressing it in Intent. Naming intermediate tensors or writing separate
 expressions inside one kernel does not create additional launches or independent
 worksets. Dependencies across the entire kernel determine its available logical
 parallelism; the compiler does not reconstruct omitted kernel boundaries.
+Collectives do not imply hidden communication between independent GPU programs.
+A prefix dependency spanning an entire logical axis remains global even when its
+consumer uses I.parallel. Express any separate stages and their intermediate
+values explicitly in the kernel and host organization you choose.
 Intent's own type, numerical and effect rules remain authoritative.
 An accumulation written as an ordinary for/while loop is ordered even when its
 mathematical operation is associative; the compiler cannot infer permission to
