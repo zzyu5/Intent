@@ -2830,18 +2830,10 @@ FailureOr<bool> realizeFullResultTraversal(
     for (unsigned axis = 0; axis < type.getShape().size(); ++axis) {
       if (llvm::is_contained(reductions, static_cast<int64_t>(axis)))
         continue;
-      auto mapping = cast<AxisMapAttr>(type.getAxisMaps()[axis]);
-      auto source = queryFragmentAxis(resultType, sourceAxisIdentity(mapping));
-      auto dimension =
-          queryFragmentDimension(resultType, mapping.getDimensionId());
-      if (source.isExact() && dimension.isExact() &&
-          source.fragmentAxis != dimension.fragmentAxis)
-        return false;
-      if (!source.isExact() && !dimension.isExact())
-        return false;
-      int64_t resultAxis =
-          source.isExact() ? source.fragmentAxis : dimension.fragmentAxis;
-      if (freeAxes[resultAxis].first ||
+      // Contract results concatenate lhs and rhs free axes. Source identities
+      // may repeat, including when the same matrix supplies both operands.
+      unsigned resultAxis = freeAxisCount;
+      if (resultAxis >= freeAxes.size() ||
           resultType.getShape()[resultAxis] != type.getShape()[axis])
         return false;
       freeAxes[resultAxis] = {operand, axis};

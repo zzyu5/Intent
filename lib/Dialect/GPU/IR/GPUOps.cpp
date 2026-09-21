@@ -208,8 +208,12 @@ LogicalResult verifyAccessAxisExtents(Operation *owner, Type payload,
       auto coordinateType = dyn_cast<FragmentType>(coordinate.getType());
       if (!coordinateType)
         continue;
+      bool positional = coordinateType.getOwner() == fragment.getOwner() &&
+                        coordinateType.getAxisMaps() == fragment.getAxisMaps();
       for (auto [coordinateAxis, coordinateAttribute] :
            llvm::enumerate(coordinateType.getAxisMaps())) {
+        if (positional && coordinateAxis != payloadAxis)
+          continue;
         auto coordinateMapping = cast<AxisMapAttr>(coordinateAttribute);
         bool sameSource =
             payloadMapping.getSourceId() == coordinateMapping.getSourceId() &&

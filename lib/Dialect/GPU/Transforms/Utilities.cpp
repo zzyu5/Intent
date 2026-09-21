@@ -2285,6 +2285,9 @@ FailureOr<FragmentType> refineAccessResultSchema(
     if (!source)
       continue;
     unsigned coordinateSlot = fragmentSlot++;
+    bool positional = source.getOwner() == target.getOwner() &&
+                      source.getShape() == target.getShape() &&
+                      source.getAxisMaps() == target.getAxisMaps();
     for (unsigned sourceAxis = 0; sourceAxis < source.getShape().size();
          ++sourceAxis) {
       PhysicalAxisRealizationFact realization =
@@ -2307,14 +2310,18 @@ FailureOr<FragmentType> refineAccessResultSchema(
 
       auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
       std::optional<unsigned> targetAxis;
-      if (cartesian) {
+      if (positional) {
+        // Matching access schemas already identify each occurrence. Refining
+        // repeated-source extents still requires a unique propagation relation.
+        targetAxis = sourceAxis;
+      } else if (cartesian) {
         auto candidate = cast<AxisMapAttr>(target.getAxisMaps()[coordinateSlot]);
         if (sourceAxisIdentity(candidate) == sourceAxisIdentity(mapping) &&
             candidate.getDimensionId() == mapping.getDimensionId())
           targetAxis = coordinateSlot;
       }
       for (auto [axis, attribute] : llvm::enumerate(target.getAxisMaps())) {
-        if (cartesian && targetAxis)
+        if ((positional || cartesian) && targetAxis)
           break;
         auto candidate = cast<AxisMapAttr>(attribute);
         if (!(sourceAxisIdentity(candidate) == sourceAxisIdentity(mapping)) ||
