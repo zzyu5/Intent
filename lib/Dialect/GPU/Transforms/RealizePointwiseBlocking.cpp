@@ -4878,15 +4878,14 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
               replay.crossesAccess && hasMaterializedReductionStoreFork(
                                           store.getValue(), store, source,
                                           dimension, materializationVisited);
-          auto completeReplay = analysis.replayability(
-              store.getValue(), std::nullopt, PhysicalReplayScope::ValueGraph,
-              /*allowAccesses=*/true);
           auto reduction = analysis.reductionDependency(store.getValue(), source, dimension);
-          bool retainedContraction = completeReplay.isReplayable() &&
-              !completeReplay.contractions.empty() && reduction.isExact() && reduction.depends;
+          // Dominating contractions outside this traversal are captured SSA,
+          // not work that a blocked writeback would recompute.
+          bool retainedContraction = replay.isReplayable() &&
+              !replay.contractions.empty() && reduction.isExact() && reduction.depends;
           if (retainedContraction) {
             auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
-            for (Operation *contract : completeReplay.contractions) {
+            for (Operation *contract : replay.contractions) {
               auto fragment = dyn_cast<FragmentType>(contract->getResult(0).getType());
               auto footprint = minimumFragmentRegisters(kernel, fragment);
               if (!footprint || *footprint >= capabilities.getRegistersPerUnit()) {
