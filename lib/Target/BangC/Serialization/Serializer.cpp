@@ -76,6 +76,7 @@ public:
         {"parameters", std::move(parameters)}, {"entry", "intent_launch"},
         {"tile", config.getTile()}, {"tasks", config.getTasks()},
         {"tile_m", config.getTileM()}, {"tile_n", config.getTileN()}, {"tile_k", config.getTileK()},
+        {"region_tile", config.getRegionTile()},
         {"local_bytes", config.getLocalBytes()},
         {"full_extent_dimensions", std::move(fullExtents)}, {"disjoint_outputs", true}};
     out << tileImplementations << "\n__mlu_global__ void intent_device(" << llvm::join(signature, ", ") << ") {\n";
@@ -156,12 +157,14 @@ private:
       return success();
     }
     if (auto load = dyn_cast<dsa::LoadTileOp>(op)) {
-      line("intent_load_tile<" + shape(load.getOutput()) + ">(" + name(load.getOutput()) + ", " + name(load.getSource()) +
+      bool local = cast<MemRefType>(load.getSource().getType()).getMemorySpaceAsInt() == dsa::nramSpace;
+      line(std::string(local ? "intent_load_local_tile<" : "intent_load_tile<") + shape(load.getOutput()) + ">(" + name(load.getOutput()) + ", " + name(load.getSource()) +
           ", " + name(load.getOffset()) + ", " + name(load.getRowStride()) + ", " + name(load.getColumnStride()) +
           ", " + name(load.getRows()) + ", " + name(load.getColumns()) + ");", depth); return success();
     }
     if (auto store = dyn_cast<dsa::StoreTileOp>(op)) {
-      line("intent_store_tile<" + shape(store.getInput()) + ">(" + name(store.getDestination()) + ", " + name(store.getInput()) +
+      bool local = cast<MemRefType>(store.getDestination().getType()).getMemorySpaceAsInt() == dsa::nramSpace;
+      line(std::string(local ? "intent_store_local_tile<" : "intent_store_tile<") + shape(store.getInput()) + ">(" + name(store.getDestination()) + ", " + name(store.getInput()) +
           ", " + name(store.getOffset()) + ", " + name(store.getRowStride()) + ", " + name(store.getColumnStride()) +
           ", " + name(store.getRows()) + ", " + name(store.getColumns()) + ");", depth); return success();
     }
@@ -190,6 +193,11 @@ private:
     }
     if (auto binary = dyn_cast<dsa::BinaryOp>(op)) {
       if (binary.getKind() == BinaryOperator::TrueDivide) {
+        if (op->getAttrOfType<StringAttr>("bangc.implementation").getValue() == "divide_f32") {
+          line("intent_divide_f32<" + count(binary.getOutput()) + ", " + (binary.getApproximate() ? "true" : "false") + ", " +
+              (binary.getFlushToZero() ? "true" : "false") + ">(" + name(binary.getOutput()) + ", " + name(binary.getLhs()) + ", " + name(binary.getRhs()) + ");", depth);
+          return success();
+        }
         line("intent_divide_local<" + ctype(cast<MemRefType>(binary.getOutput().getType()).getElementType()) + ", " +
             count(binary.getOutput()) + ">(" + name(binary.getOutput()) + ", " + name(binary.getLhs()) + ", " + name(binary.getRhs()) + ");", depth);
         return success();
@@ -209,13 +217,18 @@ private:
           name(binary.getRhs()) + ", " + count(binary.getOutput()) + ");", depth); return success();
     }
     if (auto unary = dyn_cast<dsa::UnaryOp>(op)) {
+      if (auto callee = op->getAttrOfType<StringAttr>("bangc.callee")) {
+        line(callee.getValue().str() + "(" + count(unary.getOutput()) + ", " + name(unary.getOutput()) + ", " + name(unary.getInput()) + ");", depth);
+        return success();
+      }
+      if (auto implementation = op->getAttrOfType<StringAttr>("bangc.implementation");
+          implementation && implementation.getValue() == "exp2_f32") {
+        line("intent_exp2_tile<" + count(unary.getOutput()) + ", " + (unary.getFlushToZero() ? "true" : "false") + ">(" +
+            name(unary.getOutput()) + ", " + name(unary.getInput()) + ");", depth);
+        return success();
+      }
       std::string intrinsic;
       switch (unary.getKind()) {
-      case UnaryOperator::Exp: intrinsic = "__bang_active_exp"; break;
-      case UnaryOperator::Log: intrinsic = "__bang_active_log"; break;
-      case UnaryOperator::Sqrt: intrinsic = "__bang_sqrt"; break;
-      case UnaryOperator::Rsqrt: intrinsic = "__bang_rsqrt"; break;
-      case UnaryOperator::Tanh: intrinsic = "__bang_active_tanh"; break;
       case UnaryOperator::Abs: intrinsic = "__bang_abs"; break;
       case UnaryOperator::Negate:
         line("__bang_mul_scalar(" + name(unary.getOutput()) + ", " + name(unary.getInput()) + ", " +
@@ -248,7 +261,7 @@ private:
       line("intent_prepare_matrix<" + shape(prepare.getInput()) + ">(" + name(prepare.getOutput()) + ", " +
           name(prepare.getInput()) + ", " + name(prepare.getScratch()) + ");", depth); return success();
     }
-    if (auto matrix = dyn_cast<dsa::MatMulOp>(op)) {
+    if (auto matrix = dyn_cast<dsa::MatrixTileOp>(op)) {
       auto a = cast<MemRefType>(matrix.getLhs().getType()), c = cast<MemRefType>(matrix.getAccumulator().getType());
       line("intent_matmul<" + ctype(a.getElementType()) + ", " + std::to_string(a.getDimSize(0)) + ", " +
           std::to_string(a.getDimSize(1)) + ", " + std::to_string(c.getDimSize(1)) + ">(" + name(matrix.getAccumulator()) + ", " +
@@ -270,7 +283,7 @@ private:
       if (auto floating = dyn_cast<FloatAttr>(constant.getValue())) expression = floatLiteral(floating);
       else expression = std::to_string(cast<IntegerAttr>(constant.getValue()).getInt());
     } else if (isa<arith::ExtFOp, arith::TruncFOp, arith::IndexCastOp, arith::ExtSIOp, arith::ExtUIOp,
-                   arith::TruncIOp, arith::SIToFPOp, arith::FPToSIOp>(op)) {
+                   arith::TruncIOp, arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp>(op)) {
       Type from = op->getOperand(0).getType(), to = op->getResult(0).getType();
       std::string value = name(op->getOperand(0));
       if (from.isBF16()) value = "intent_bf16_to_float(" + value + ")";

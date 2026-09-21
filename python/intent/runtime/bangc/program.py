@@ -43,12 +43,19 @@ class NativeProgram:
     def __init__(self, source: str, metadata: dict[str, object], target) -> None:
         if metadata.get("provider") != "bangc" or metadata.get("architecture") != target.architecture:
             raise ValueError("BANG C artifact and target disagree")
-        for binding in ("tile", "tile_m", "tile_n", "tile_k", "tasks", "local_bytes"):
+        for binding in ("tile", "tile_m", "tile_n", "tile_k", "region_tile", "tasks", "local_bytes"):
             if metadata[binding] != getattr(target, binding):
                 raise ValueError(f"BANG C artifact and target disagree on {binding}")
         self.target = target
         self.metadata = metadata
         self.parameters = metadata["parameters"]
+        parameters_by_name = {parameter["name"]: parameter for parameter in self.parameters}
+        for name, shape in target.shapes:
+            parameter = parameters_by_name.get(name)
+            if parameter is None or parameter["kind"] != "view" or len(shape) != len(parameter["shape"]):
+                raise ValueError("BANG C artifact and target disagree on bound parameter shapes")
+            if any(extent >= 0 and extent != declared for extent, declared in zip(shape, parameter["shape"])):
+                raise ValueError("BANG C artifact and target disagree on bound extents")
         self.compilation = compile_library(source, target)
         self.runtime = runtime(target.neuware)
         self.runtime.select(target.device)

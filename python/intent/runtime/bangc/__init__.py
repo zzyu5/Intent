@@ -39,7 +39,7 @@ def load_artifact(directory: str | Path, target=None) -> CompiledArtifact:
     metadata = json.loads((path / "artifact.json").read_text())
     if target is None:
         target = BangCTarget(**{name: metadata[name] for name in
-            ("architecture", "tile", "tile_m", "tile_n", "tile_k", "tasks", "local_bytes")})
+            ("architecture", "tile", "tile_m", "tile_n", "tile_k", "region_tile", "tasks", "local_bytes")})
     return materialize_bangc_artifact((path / "kernel.mlu").read_text(),
         (path / "program.mlir").read_text(), metadata, target.resolve())
 

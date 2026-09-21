@@ -37,6 +37,7 @@
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace {
@@ -108,8 +109,11 @@ int main(int argc, char **argv) {
   llvm::cl::opt<int64_t> dsaTileM("dsa-tile-m", llvm::cl::init(16));
   llvm::cl::opt<int64_t> dsaTileN("dsa-tile-n", llvm::cl::init(64));
   llvm::cl::opt<int64_t> dsaTileK("dsa-tile-k", llvm::cl::init(64));
+  llvm::cl::opt<int64_t> dsaRegionTile("dsa-region-tile", llvm::cl::init(64));
+  llvm::cl::opt<std::string> dsaShapes("dsa-shapes", llvm::cl::init("{}"),
+      llvm::cl::desc("JSON parameter shapes for compile-call specialization; -1 keeps an axis dynamic"));
   llvm::cl::opt<int64_t> dsaTasks("dsa-tasks", llvm::cl::init(16));
-  llvm::cl::opt<int64_t> dsaLocalBytes("dsa-local-bytes", llvm::cl::init(384 * 1024));
+  llvm::cl::opt<int64_t> dsaLocalBytes("dsa-local-bytes", llvm::cl::init(512 * 1024));
   llvm::cl::opt<bool> stopAfterShared(
       "stop-after-shared",
       llvm::cl::desc("stop after the selected execution family's shared verifier"),
@@ -170,9 +174,29 @@ int main(int argc, char **argv) {
     }
     auto configuration = intent::dsa::ConfigurationAttr::getChecked(
         [&]() { return module->emitError(); }, &context, dsaTile.getValue(), dsaTileM.getValue(), dsaTileN.getValue(),
-        dsaTileK.getValue(), dsaTasks.getValue(), dsaLocalBytes.getValue());
+        dsaTileK.getValue(), dsaRegionTile.getValue(), dsaTasks.getValue(), dsaLocalBytes.getValue());
     if (!configuration) return exitCode(ExitCode::Invocation);
-    if (mlir::failed(intent::lowerCanonicalKIRToDSA(*module, configuration)))
+    auto parsedShapes = llvm::json::parse(dsaShapes.getValue());
+    if (!parsedShapes) {
+      llvm::errs() << "invalid DSA shape bindings: " << llvm::toString(parsedShapes.takeError()) << "\n";
+      return exitCode(ExitCode::Invocation);
+    }
+    auto object = parsedShapes->getAsObject();
+    if (!object) { llvm::errs() << "DSA shape bindings must be a JSON object\n"; return exitCode(ExitCode::Invocation); }
+    mlir::NamedAttrList bindings;
+    mlir::Builder builder(&context);
+    for (auto &[name, value] : *object) {
+      auto dimensions = value.getAsArray();
+      if (!dimensions) { llvm::errs() << "DSA parameter shape must be an integer array\n"; return exitCode(ExitCode::Invocation); }
+      llvm::SmallVector<int64_t> extents;
+      for (auto &dimension : *dimensions) {
+        auto extent = dimension.getAsInteger();
+        if (!extent || *extent < -1) { llvm::errs() << "invalid DSA bound extent\n"; return exitCode(ExitCode::Invocation); }
+        extents.push_back(*extent);
+      }
+      bindings.append(name.str(), builder.getDenseI64ArrayAttr(extents));
+    }
+    if (mlir::failed(intent::lowerCanonicalKIRToDSA(*module, configuration, bindings.getDictionary(&context))))
       return exitCode(ExitCode::PhysicalProgram);
     if (stopAfterShared) return emitShared();
     if (mlir::failed(intent::bangc::legalizeProgram(*module, dsaArchitecture)))

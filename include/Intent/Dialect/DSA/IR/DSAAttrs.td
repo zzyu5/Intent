@@ -26,9 +26,9 @@ def IntentDSA_Interface : AttrDef<IntentDSA_Dialect, "Interface"> {
 def IntentDSA_Configuration : AttrDef<IntentDSA_Dialect, "Configuration"> {
   let mnemonic = "configuration";
   let parameters = (ins "int64_t":$tile, "int64_t":$tileM,
-    "int64_t":$tileN, "int64_t":$tileK, "int64_t":$tasks,
+    "int64_t":$tileN, "int64_t":$tileK, "int64_t":$regionTile, "int64_t":$tasks,
     "int64_t":$localBytes);
-  let assemblyFormat = "`<` $tile `,` $tileM `,` $tileN `,` $tileK `,` $tasks `,` $localBytes `>`";
+  let assemblyFormat = "`<` $tile `,` $tileM `,` $tileN `,` $tileK `,` $regionTile `,` $tasks `,` $localBytes `>`";
   let genVerifyDecl = 1;
 }
 #endif

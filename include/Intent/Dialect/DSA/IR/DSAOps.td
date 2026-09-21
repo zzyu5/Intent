@@ -67,9 +67,17 @@ def IntentDSA_PrepareMatrixOp : IntentDSA_Op<"prepare_matrix"> {
     Arg<AnyMemRef, "", [MemWrite]>:$scratch);
 }
 def IntentDSA_MatMulOp : IntentDSA_Op<"matmul"> {
+  let summary = "Accumulate a bounded logical MatMul within local tensor storage";
   let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$lhs,
     Arg<AnyMemRef, "", [MemRead]>:$rhs,
     Arg<AnyMemRef, "", [MemRead, MemWrite]>:$accumulator,
-    Arg<Optional<AnyMemRef>, "", [MemWrite]>:$scratch);
+    Index:$rows, Index:$depth, Index:$columns);
+}
+def IntentDSA_MatrixTileOp : IntentDSA_Op<"matrix_tile"> {
+  let summary = "Accumulate one selected matrix tile with prepared operands";
+  let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$lhs,
+    Arg<AnyMemRef, "", [MemRead]>:$rhs,
+    Arg<AnyMemRef, "", [MemRead, MemWrite]>:$accumulator,
+    Arg<AnyMemRef, "", [MemWrite]>:$scratch);
 }
 #endif

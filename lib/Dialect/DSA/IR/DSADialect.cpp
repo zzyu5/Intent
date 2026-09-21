@@ -49,8 +49,8 @@ LogicalResult InterfaceAttr::verify(function_ref<InFlightDiagnostic()> error, Ar
   return success();
 }
 LogicalResult ConfigurationAttr::verify(function_ref<InFlightDiagnostic()> error,
-    int64_t tile, int64_t m, int64_t n, int64_t k, int64_t tasks, int64_t bytes) {
-  if (tile <= 0 || tile % 64 || m <= 0 || n <= 0 || k <= 0 || tasks <= 0 || bytes <= 0)
+    int64_t tile, int64_t m, int64_t n, int64_t k, int64_t region, int64_t tasks, int64_t bytes) {
+  if (tile <= 0 || tile % 64 || m <= 0 || n <= 0 || k <= 0 || region <= 0 || tasks <= 0 || bytes <= 0)
     return error() << "DSA configuration requires positive blocks/resources and a vector tile divisible by 64";
   return success();
 }

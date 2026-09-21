@@ -92,8 +92,17 @@ LogicalResult MatMulOp::verify() {
   return tile(getLhs()) && tile(getAccumulator()) && b.hasStaticShape() && b.getRank() == 2 &&
       a.getElementType() == b.getElementType() && c.getElementType().isF32() &&
       a.getDimSize(1) == b.getDimSize(0) && a.getDimSize(0) == c.getDimSize(0) &&
-      b.getDimSize(1) == c.getDimSize(1) && (!getScratch() || same(getScratch(), getAccumulator()))
+      b.getDimSize(1) == c.getDimSize(1) && b.getMemorySpaceAsInt() == nramSpace
       ? success() : emitOpError("matmul requires matching M/K/N tiles and an f32 accumulator");
+}
+LogicalResult MatrixTileOp::verify() {
+  auto a = cast<MemRefType>(getLhs().getType()), b = cast<MemRefType>(getRhs().getType());
+  auto c = cast<MemRefType>(getAccumulator().getType());
+  return tile(getLhs()) && tile(getAccumulator()) && b.hasStaticShape() && b.getRank() == 2 &&
+      b.getMemorySpaceAsInt() == matrixSpace && a.getElementType() == b.getElementType() && c.getElementType().isF32() &&
+      a.getDimSize(1) == b.getDimSize(0) && a.getDimSize(0) == c.getDimSize(0) &&
+      b.getDimSize(1) == c.getDimSize(1) && same(getScratch(), getAccumulator())
+      ? success() : emitOpError("matrix tile requires prepared storage, matching M/K/N shapes and f32 scratch");
 }
 LogicalResult intent::dsa::verifyProgram(ModuleOp module, bool bound) {
   if (failed(mlir::verify(module))) return failure();

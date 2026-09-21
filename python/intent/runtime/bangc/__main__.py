@@ -18,7 +18,7 @@ def main() -> None:
     args = parser.parse_args()
     metadata = json.loads((args.artifact / "artifact.json").read_text())
     target = BangCTarget(**{name: metadata[name] for name in
-        ("architecture", "tile", "tile_m", "tile_n", "tile_k", "tasks", "local_bytes")},
+        ("architecture", "tile", "tile_m", "tile_n", "tile_k", "region_tile", "tasks", "local_bytes")},
         device=args.device, neuware=args.neuware).resolve()
     program = NativeProgram((args.artifact / "kernel.mlu").read_text(), metadata, target)
     buffers = []

@@ -27,6 +27,58 @@ Value allocate(OpBuilder &b, Location loc, Type element, ArrayRef<int64_t> shape
   result.setAlignment(128);
   return result;
 }
+LogicalResult realizeMatMul(dsa::MatMulOp matrix, dsa::ConfigurationAttr config) {
+  Location loc = matrix.getLoc();
+  OpBuilder b(matrix);
+  auto lhsType = cast<MemRefType>(matrix.getLhs().getType());
+  auto rhsType = cast<MemRefType>(matrix.getRhs().getType());
+  auto accType = cast<MemRefType>(matrix.getAccumulator().getType());
+  Type element = lhsType.getElementType();
+  if (!element.isF16() && !element.isBF16() && !element.isF32())
+    return matrix.emitError("MLU370 matrix profile requires f16/bf16/f32 input tiles");
+  int64_t bm = config.getTileM(), bn = 64, bk = config.getTileK();
+  if ((bk * element.getIntOrFloatBitWidth() / 8) % 64)
+    return matrix.emitError("MLU370 matrix K block must be aligned to 64 bytes");
+  auto index = [&](int64_t value) -> Value { return b.create<arith::ConstantIndexOp>(loc, value); };
+  auto offset = [&](Value row, Value column, int64_t stride) -> Value {
+    return b.create<arith::AddIOp>(loc, b.create<arith::MulIOp>(loc, row, index(stride)), column);
+  };
+  auto count = [&](Value extent, Value begin, int64_t tile) -> Value {
+    return b.create<arith::MinSIOp>(loc, b.create<arith::SubIOp>(loc, extent, begin), index(tile));
+  };
+  auto rows = b.create<scf::ForOp>(loc, index(0), matrix.getRows(), index(bm));
+  b.setInsertionPointToStart(rows.getBody());
+  Value m = rows.getInductionVar(), mCount = count(matrix.getRows(), m, bm);
+  auto columns = b.create<scf::ForOp>(loc, index(0), matrix.getColumns(), index(bn));
+  b.setInsertionPointToStart(columns.getBody());
+  Value n = columns.getInductionVar(), nCount = count(matrix.getColumns(), n, bn);
+  Value lhs = allocate(b, loc, element, {bm, bk}, dsa::nramSpace);
+  Value rhs = allocate(b, loc, element, {bk, bn}, dsa::nramSpace);
+  Value accumulator = allocate(b, loc, b.getF32Type(), {bm, bn}, dsa::nramSpace);
+  Value partial = allocate(b, loc, b.getF32Type(), {bm, bn}, dsa::nramSpace);
+  Value transpose = allocate(b, loc, element, {bn, bk}, dsa::nramSpace);
+  Value packed = allocate(b, loc, element, {bk, bn}, dsa::matrixSpace);
+  packed.getDefiningOp()->setAttr("bangc.layout", b.getStringAttr("matrix_transposed64"));
+  b.create<dsa::LoadTileOp>(loc, matrix.getAccumulator(), accumulator,
+      offset(m, n, accType.getDimSize(1)), index(accType.getDimSize(1)), index(1), mCount, nCount);
+  auto reduction = b.create<scf::ForOp>(loc, index(0), matrix.getDepth(), index(bk));
+  {
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(reduction.getBody());
+    Value k = reduction.getInductionVar(), kCount = count(matrix.getDepth(), k, bk);
+    b.create<dsa::LoadTileOp>(loc, matrix.getLhs(), lhs, offset(m, k, lhsType.getDimSize(1)),
+        index(lhsType.getDimSize(1)), index(1), mCount, kCount);
+    b.create<dsa::LoadTileOp>(loc, matrix.getRhs(), rhs, offset(k, n, rhsType.getDimSize(1)),
+        index(rhsType.getDimSize(1)), index(1), kCount, nCount);
+    b.create<dsa::PrepareMatrixOp>(loc, rhs, packed, transpose);
+    auto tile = b.create<dsa::MatrixTileOp>(loc, lhs, packed, accumulator, partial);
+    tile->setAttr("bangc.implementation", b.getStringAttr("matmul_local_f32_accumulator"));
+  }
+  b.create<dsa::StoreTileOp>(loc, accumulator, matrix.getAccumulator(), offset(m, n, accType.getDimSize(1)),
+      index(accType.getDimSize(1)), index(1), mCount, nCount);
+  matrix.erase();
+  return success();
+}
 // Local allocations have no escaping aliases in the bound DSA surface. Lift
 // every nested use to the allocation's block: a value read in a loop remains
 // live across the complete loop, including its backedge.
@@ -77,34 +129,19 @@ LogicalResult legalizeProgram(ModuleOp module, StringRef architecture) {
   module->setAttr("bangc.architecture", StringAttr::get(module.getContext(), architecture));
   SmallVector<dsa::MatMulOp> matrices;
   function.walk([&](dsa::MatMulOp op) { matrices.push_back(op); });
-  for (auto matrix : matrices) {
-    OpBuilder b(matrix);
-    auto type = cast<MemRefType>(matrix.getRhs().getType());
-    if (!type.getElementType().isF16() && !type.getElementType().isBF16() && !type.getElementType().isF32())
-      return matrix.emitError("MLU370 matrix profile requires f16/bf16/f32 input tiles");
-    if (type.getDimSize(1) != 64 || (type.getDimSize(0) * type.getElementTypeBitWidth() / 8) % 64)
-      return matrix.emitError("MLU370 matrix implementation requires an N=64 tile and a K row aligned to 64 bytes");
-    Value packed = allocate(b, matrix.getLoc(), type.getElementType(), type.getShape(), dsa::matrixSpace);
-    Value transpose = allocate(b, matrix.getLoc(), type.getElementType(),
-        {type.getDimSize(1), type.getDimSize(0)}, dsa::nramSpace);
-    auto accumulator = cast<MemRefType>(matrix.getAccumulator().getType());
-    Value partial = allocate(b, matrix.getLoc(), accumulator.getElementType(), accumulator.getShape(), dsa::nramSpace);
-    b.create<dsa::PrepareMatrixOp>(matrix.getLoc(), matrix.getRhs(), packed, transpose);
-    matrix.getRhsMutable().assign(packed);
-    matrix.getScratchMutable().assign(partial);
-    packed.getDefiningOp()->setAttr("bangc.layout", b.getStringAttr("matrix_transposed64"));
-    matrix->setAttr("bangc.implementation", b.getStringAttr("matmul_local_f32_accumulator"));
-  }
-  // Pointwise bf16 arithmetic likewise uses f32 local operations with an
-  // explicit round-to-bf16 result at each original source operation.
-  SmallVector<Operation *> bf16Pointwise;
+  for (auto matrix : matrices) if (failed(realizeMatMul(matrix, config))) return failure();
+  // Operations without a full-domain native storage-dtype implementation use
+  // f32 local arithmetic and an explicit cast back to the declared dtype.
+  SmallVector<Operation *> promotedPointwise;
   function.walk([&](Operation *op) {
     Value output;
     if (auto unary = dyn_cast<dsa::UnaryOp>(op)) output = unary.getOutput();
     if (auto binary = dyn_cast<dsa::BinaryOp>(op)) output = binary.getOutput();
-    if (output && cast<MemRefType>(output.getType()).getElementType().isBF16()) bf16Pointwise.push_back(op);
+    if (!output) return;
+    Type element = cast<MemRefType>(output.getType()).getElementType();
+    if (element.isBF16()) promotedPointwise.push_back(op);
   });
-  for (Operation *op : bf16Pointwise) {
+  for (Operation *op : promotedPointwise) {
     OpBuilder builder(op);
     auto convert = [&](Value source) {
       auto type = cast<MemRefType>(source.getType());
@@ -153,16 +190,34 @@ LogicalResult legalizeProgram(ModuleOp module, StringRef architecture) {
   }
   auto walk = function.walk([&](Operation *op) {
     if (auto unary = dyn_cast<dsa::UnaryOp>(op)) {
-      if (!supportedUnary(unary.getKind()) || unary.getApproximate() || unary.getFlushToZero()) {
+      bool approximateExp2 = unary.getKind() == UnaryOperator::Exp2 && unary.getApproximate() &&
+          cast<MemRefType>(unary.getInput().getType()).getElementType().isF32();
+      if (approximateExp2) op->setAttr("bangc.implementation", StringAttr::get(module.getContext(), "exp2_f32"));
+      else if (!supportedUnary(unary.getKind()) || unary.getApproximate() || unary.getFlushToZero()) {
         op->emitError("unary numerical mode has no selected BANG C implementation"); return WalkResult::interrupt();
+      }
+      Type element = cast<MemRefType>(unary.getInput().getType()).getElementType();
+      if (!unary.getApproximate() && (element.isF32() || element.isF16())) {
+        StringRef callee;
+        switch (unary.getKind()) {
+        case UnaryOperator::Exp: callee = "__cn_vector_exp"; break;
+        case UnaryOperator::Log: callee = "__cn_vector_log"; break;
+        case UnaryOperator::Tanh: callee = "__cn_vector_tanh"; break;
+        case UnaryOperator::Sqrt: callee = "__cn_vector_sqrt"; break;
+        case UnaryOperator::Rsqrt: callee = "__cn_vector_rsqrt"; break;
+        default: break;
+        }
+        if (!callee.empty()) op->setAttr("bangc.callee", StringAttr::get(module.getContext(), callee.str() + (element.isF16() ? "_f16" : "_f32")));
       }
     }
     if (auto binary = dyn_cast<dsa::BinaryOp>(op)) {
-      if (!supportedBinary(binary.getKind()) || binary.getApproximate() || binary.getFlushToZero()) {
+      bool division = binary.getKind() == BinaryOperator::TrueDivide &&
+          cast<MemRefType>(binary.getLhs().getType()).getElementType().isF32();
+      if (!supportedBinary(binary.getKind()) || ((binary.getApproximate() || binary.getFlushToZero()) && !division)) {
         op->emitError("binary numerical mode has no selected BANG C implementation"); return WalkResult::interrupt();
       }
       if (binary.getKind() == BinaryOperator::TrueDivide)
-        op->setAttr("bangc.implementation", StringAttr::get(module.getContext(), "scalar_divide"));
+        op->setAttr("bangc.implementation", StringAttr::get(module.getContext(), division ? "divide_f32" : "scalar_divide"));
     }
     if (auto reduction = dyn_cast<dsa::ReduceOp>(op)) {
       if (!cast<MemRefType>(reduction.getInput().getType()).getElementType().isF32() ||
@@ -174,12 +229,12 @@ LogicalResult legalizeProgram(ModuleOp module, StringRef architecture) {
     }
     if (!isa<dsa::SynchronizeOp, dsa::TaskIdOp, dsa::TaskCountOp, dsa::StrideOp, dsa::LoadScalarOp, dsa::StoreScalarOp,
              dsa::LoadTileOp, dsa::StoreTileOp, dsa::FillOp, dsa::SelectOp, dsa::UnaryOp, dsa::BinaryOp,
-             dsa::CastOp, dsa::ReduceOp, dsa::PrepareMatrixOp, dsa::MatMulOp,
+             dsa::CastOp, dsa::ReduceOp, dsa::PrepareMatrixOp, dsa::MatrixTileOp,
              arith::ConstantOp, arith::AddIOp, arith::SubIOp, arith::MulIOp,
              arith::DivSIOp, arith::RemSIOp, arith::CeilDivSIOp, arith::FloorDivSIOp, arith::MinSIOp, arith::MaxSIOp,
              arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp,
              arith::ExtFOp, arith::TruncFOp, arith::IndexCastOp, arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp,
-             arith::SIToFPOp, arith::FPToSIOp, arith::CmpIOp, arith::CmpFOp, arith::SelectOp,
+             arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::CmpIOp, arith::CmpFOp, arith::SelectOp,
              arith::AndIOp, arith::OrIOp, arith::XOrIOp, arith::ShLIOp, arith::ShRSIOp,
              arith::MaximumFOp, arith::MinimumFOp, arith::MaxNumFOp, arith::MinNumFOp,
              arith::NegFOp, math::ExpOp, math::Exp2Op, math::LogOp, math::SqrtOp, math::RsqrtOp, math::TanhOp, math::AbsFOp,
@@ -200,7 +255,7 @@ LogicalResult legalizeProgram(ModuleOp module, StringRef architecture) {
   SmallVector<Operation *> localEffects;
   function.walk([&](Operation *op) {
     if (isa<dsa::LoadTileOp, dsa::StoreTileOp, dsa::FillOp, dsa::SelectOp, dsa::UnaryOp,
-            dsa::BinaryOp, dsa::CastOp, dsa::ReduceOp, dsa::PrepareMatrixOp, dsa::MatMulOp,
+            dsa::BinaryOp, dsa::CastOp, dsa::ReduceOp, dsa::PrepareMatrixOp, dsa::MatrixTileOp,
             memref::StoreOp, memref::CopyOp>(op)) localEffects.push_back(op);
   });
   for (Operation *op : localEffects) {
