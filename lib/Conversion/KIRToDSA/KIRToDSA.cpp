@@ -12,10 +12,11 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include <functional>
+#include <limits>
 using namespace mlir;
 namespace intent {
 namespace {
-struct Domain { Value begin, end, step; int64_t dimension; };
+struct Domain { Value begin, end, step; int64_t dimension; std::optional<int64_t> capacity; };
 // An axis keeps its source extent even when only one execution slice is local.
 struct LocalAxis { Value extent, begin, count; int64_t capacity; };
 using LocalShape = SmallVector<LocalAxis, 2>;
@@ -171,7 +172,8 @@ private:
   }
   Value asIndex(Value value, Location loc) {
     if (value && value.getType().isIndex()) return value;
-    if (value && value.getType().isInteger(64)) return b.create<arith::IndexCastOp>(loc, b.getIndexType(), value);
+    if (value && value.getType().isInteger(1)) value = b.create<arith::ExtUIOp>(loc, b.getI64Type(), value);
+    if (value && isa<IntegerType>(value.getType())) return b.create<arith::IndexCastOp>(loc, b.getIndexType(), value);
     return {};
   }
   Value extent(RankedTensorType type, unsigned axis, Location loc) {
@@ -190,7 +192,6 @@ private:
     return allocate(loc, element ? element : type.getElementType(), type.getDimSize(0), type.getDimSize(1));
   }
   FailureOr<LocalShape> localShape(RankedTensorType type, Location loc) {
-    if (type.getRank() > 2) return emitError(loc, "DSA local tensor rank exceeds two"), failure();
     auto ids = cast<TensorShapeAttr>(type.getEncoding()).getDimensions();
     LocalShape shape;
     for (int64_t axis = 0; axis < type.getRank(); ++axis) {
@@ -205,11 +206,18 @@ private:
       int64_t capacity = constant.getSExtValue();
       shape.push_back({size, index(loc, 0), size, std::max<int64_t>(capacity, 1)});
     }
+    int64_t elements = 1;
+    for (const auto &axis : shape) {
+      if (elements > std::numeric_limits<int64_t>::max() / axis.capacity)
+        return emitError(loc, "DSA selected tensor capacity exceeds the address range"), failure();
+      elements *= axis.capacity;
+    }
     return shape;
   }
   Type storageElement(Type type) { return type.isIndex() ? b.getI64Type() : type; }
   Value allocateTensor(Location loc, Type element, const LocalShape &shape) {
-    int64_t rows = shape.size() == 2 ? shape[0].capacity : 1;
+    int64_t rows = 1;
+    for (unsigned axis = 0; axis + 1 < shape.size(); ++axis) rows *= shape[axis].capacity;
     int64_t cols = shape.empty() ? 1 : shape.back().capacity;
     Value value = allocate(loc, storageElement(element), rows, cols);
     localShapes[value] = shape;
@@ -241,6 +249,16 @@ private:
     if (!changed) return value;
     auto physical = cast<MemRefType>(value.getType());
     Value result = allocateTensor(loc, type.getElementType(), selected);
+    if (selected.size() > 2) {
+      if (failed(eachElement(loc, selected, [&](ValueRange coordinates) {
+        SmallVector<Value> source;
+        for (unsigned axis = 0; axis < selected.size(); ++axis)
+          source.push_back(add(loc, coordinates[axis], sub(loc, selected[axis].begin, original[axis].begin)));
+        storeLocal(loc, loadLocal(loc, value, source), result, coordinates);
+        return success();
+      }))) return {};
+      return result;
+    }
     Value offset = index(loc, 0);
     if (selected.size() == 2)
       offset = mul(loc, sub(loc, selected[0].begin, original[0].begin), index(loc, physical.getDimSize(1)));
@@ -250,16 +268,22 @@ private:
         selected.size() == 2 ? selected[0].count : index(loc, 1), selected.empty() ? index(loc, 1) : selected.back().count);
     return result;
   }
-  SmallVector<Value> physicalCoordinates(Location loc, ValueRange coordinates) {
-    if (coordinates.size() == 2) return llvm::to_vector(coordinates);
-    return {index(loc, 0), coordinates.empty() ? index(loc, 0) : coordinates.front()};
+  SmallVector<Value> physicalCoordinates(Location loc, Value buffer, ValueRange coordinates) {
+    Value row = index(loc, 0);
+    if (coordinates.size() >= 2) row = coordinates.front();
+    if (coordinates.size() > 2) {
+      const auto &shape = localShapes.find(buffer)->second;
+      for (unsigned axis = 1; axis + 1 < coordinates.size(); ++axis)
+        row = add(loc, mul(loc, row, index(loc, shape[axis].capacity)), coordinates[axis]);
+    }
+    return {row, coordinates.empty() ? index(loc, 0) : coordinates.back()};
   }
   Value loadLocal(Location loc, Value value, ValueRange coordinates) {
-    return b.create<memref::LoadOp>(loc, value, physicalCoordinates(loc, coordinates));
+    return b.create<memref::LoadOp>(loc, value, physicalCoordinates(loc, value, coordinates));
   }
   void storeLocal(Location loc, Value value, Value buffer, ValueRange coordinates) {
     value = scalarCast(loc, value, cast<MemRefType>(buffer.getType()).getElementType());
-    b.create<memref::StoreOp>(loc, value, buffer, physicalCoordinates(loc, coordinates));
+    b.create<memref::StoreOp>(loc, value, buffer, physicalCoordinates(loc, buffer, coordinates));
   }
   LogicalResult eachElement(Location loc, const LocalShape &shape,
       const std::function<LogicalResult(ValueRange)> &body) {
@@ -447,19 +471,61 @@ private:
     }
     values.map(matrix.getResult(), output); return success();
   }
+  FailureOr<std::pair<Value, Value>> affineIndex(Value original) {
+    Location loc = original.getLoc();
+    auto type = dyn_cast<RankedTensorType>(original.getType());
+    if (!type) {
+      Value scalar = asIndex(get(original), loc);
+      if (!scalar) return failure();
+      return std::make_pair(scalar, index(loc, 0));
+    }
+    if (type.getRank() != 1 || (!type.getElementType().isIndex() && !type.getElementType().isInteger(64))) return failure();
+    if (auto indices = original.getDefiningOp<IndicesOp>()) {
+      if (!bindDomain(indices.getSource())) return failure();
+      Domain domain = domains.lookup(indices.getSource());
+      return std::make_pair(domain.begin, domain.step);
+    }
+    Operation *op = original.getDefiningOp();
+    if (!op) return failure();
+    if (isa<BroadcastOp, FullOp>(op)) {
+      auto source = affineIndex(op->getOperand(0));
+      if (failed(source)) return failure();
+      if (auto input = dyn_cast<RankedTensorType>(op->getOperand(0).getType())) {
+        Value size = extent(input, 0, loc);
+        if (size && matchPattern(size, m_One())) source->second = index(loc, 0);
+      }
+      return source;
+    }
+    if (auto cast = dyn_cast<CastOp>(op)) {
+      auto input = dyn_cast<RankedTensorType>(cast.getInput().getType());
+      if (!input || (!input.getElementType().isIndex() && !input.getElementType().isInteger(64))) return failure();
+      return affineIndex(cast.getInput());
+    }
+    auto binary = dyn_cast<BinaryOp>(op);
+    if (!binary) return failure();
+    auto lhs = affineIndex(binary.getLhs()), rhs = affineIndex(binary.getRhs());
+    if (failed(lhs) || failed(rhs)) return failure();
+    if (binary.getOperatorKind() == BinaryOperator::Add)
+      return std::make_pair(add(loc, lhs->first, rhs->first), add(loc, lhs->second, rhs->second));
+    if (binary.getOperatorKind() == BinaryOperator::Subtract)
+      return std::make_pair(sub(loc, lhs->first, rhs->first), sub(loc, lhs->second, rhs->second));
+    if (binary.getOperatorKind() == BinaryOperator::Multiply) {
+      if (matchPattern(lhs->second, m_Zero()))
+        return std::make_pair(mul(loc, lhs->first, rhs->first), mul(loc, lhs->first, rhs->second));
+      if (matchPattern(rhs->second, m_Zero()))
+        return std::make_pair(mul(loc, lhs->first, rhs->first), mul(loc, lhs->second, rhs->first));
+    }
+    return failure();
+  }
   LogicalResult tensorAccess(Operation *op) {
-    if (streamedStores.contains(op)) return success();
     auto relation = analysis.indexRelation(op);
     if (failed(relation)) return failure();
     Location loc = op->getLoc();
-    bool store = isa<ViewStoreOp>(op);
+    bool store = isa<ViewStoreOp, ScatterUniqueOp>(op);
     bool external = isa<ViewType>(relation->source.getType());
     Value source = get(relation->source);
     if (!source) return op->emitError("DSA indexed source is unavailable");
-    for (const auto &term : relation->terms)
-      if (term.kind == 3 && llvm::any_of(term.operands, [](Value value) { return isa<RankedTensorType>(value.getType()); }))
-        return op->emitError("DSA tensor-index access requires an explicit advanced-index axis mapping");
-    Value original = store ? cast<ViewStoreOp>(op).getInputs()[cast<ViewStoreOp>(op).getValueOperandIndex()] : op->getResult(0);
+    Value original = store ? op->getOperand(op->getAttrOfType<IntegerAttr>("value_operand_index").getInt()) : op->getResult(0);
     auto tensor = dyn_cast<RankedTensorType>(original.getType());
     LocalShape shape;
     if (tensor) {
@@ -475,31 +541,65 @@ private:
     Value fill = fillIndex ? get(op->getOperand(fillIndex.getInt())) : Value();
     if ((validIndex && !valid) || (fillIndex && !fill)) return op->emitError("DSA access predicate or fill is unavailable");
 
+    unsigned advancedRank = 0, resultAxis = 0;
+    for (const auto &term : relation->terms) if (term.kind == 3)
+      if (auto indices = dyn_cast<RankedTensorType>(term.operands.front().getType())) advancedRank = std::max<unsigned>(advancedRank, indices.getRank());
+    std::optional<unsigned> advancedStart;
+    SmallVector<int64_t> outputAxes;
+    for (const auto &term : relation->terms) {
+      if (term.kind == 3 && isa<RankedTensorType>(term.operands.front().getType())) {
+        if (!advancedStart) { advancedStart = resultAxis; resultAxis += advancedRank; }
+        outputAxes.push_back(*advancedStart);
+      } else if (term.kind == 0 || term.kind == 1 || term.kind == 4 || term.kind == 5) outputAxes.push_back(resultAxis++);
+      else outputAxes.push_back(-1);
+    }
+    if (resultAxis != shape.size()) return op->emitError("DSA index relation requires rank-one basic regions and a broadcasted advanced-index group");
+    auto sourceExtent = [&](unsigned axis) -> Value {
+      if (!external) return localShapes.lookup(source)[axis].extent;
+      auto buffer = cast<MemRefType>(source.getType());
+      return buffer.isDynamicDim(axis) ? Value(b.create<memref::DimOp>(loc, source, axis)) : index(loc, buffer.getDimSize(axis));
+    };
+    auto staticCoordinate = [&](const IndexTermFact &term) {
+      int64_t literal = *term.staticValues.front();
+      return literal < 0 ? add(loc, sourceExtent(*term.sourceAxis), index(loc, literal)) : index(loc, literal);
+    };
+
     // Rectangular external accesses preserve arbitrary view strides. Their
     // selected origins and tails are explicit before BANG C serialization.
-    bool rectangle = external && !validIndex && tensor;
+    bool rectangle = external && !validIndex && tensor && shape.size() <= 2;
+    DenseMap<Value, std::pair<Value, Value>> affine;
     for (const auto &term : relation->terms) {
-      rectangle &= term.kind == 0 || term.kind == 1 || term.kind == 4 ||
-          (term.kind == 3 && term.operands.size() == 1 && !isa<RankedTensorType>(term.operands[0].getType()));
+      rectangle &= term.kind >= 0 && term.kind <= 4;
+      if (term.kind == 3 && isa<RankedTensorType>(term.operands.front().getType())) {
+        auto coordinate = advancedRank == 1 ? affineIndex(term.operands.front()) : FailureOr<std::pair<Value, Value>>(failure());
+        if (failed(coordinate)) rectangle = false;
+        else affine[term.operands.front()] = *coordinate;
+      }
     }
     if (rectangle) {
       Value offset = index(loc, 0);
-      SmallVector<Value> strides;
-      unsigned outputAxis = 0;
-      for (const auto &term : relation->terms) {
-        if (term.kind == 1) { strides.push_back(index(loc, 0)); ++outputAxis; continue; }
+      SmallVector<Value> strides(shape.size(), index(loc, 0));
+      for (auto [termIndex, term] : llvm::enumerate(relation->terms)) {
+        int64_t outputAxis = outputAxes[termIndex];
+        if (term.kind == 1) continue;
         if (!term.sourceAxis) return op->emitError("DSA access has no source axis");
         Value step = stride(loc, source, *term.sourceAxis), coordinate;
-        if (term.kind == 3) coordinate = asIndex(get(term.operands.front()), loc);
+        if (term.kind == 2) coordinate = staticCoordinate(term);
+        else if (term.kind == 3) {
+          if (auto found = affine.find(term.operands.front()); found != affine.end()) {
+            coordinate = add(loc, found->second.first, mul(loc, shape[outputAxis].begin, found->second.second));
+            strides[outputAxis] = add(loc, strides[outputAxis], mul(loc, step, found->second.second));
+          } else coordinate = asIndex(get(term.operands.front()), loc);
+        }
         else {
-          coordinate = shape[outputAxis++].begin;
+          coordinate = shape[outputAxis].begin;
           if (term.kind == 4) {
             if (term.operands.size() != 1 || !bindDomain(term.operands[0])) return op->emitError("DSA access interval is unavailable");
             Domain domain = domains.lookup(term.operands[0]);
             coordinate = add(loc, domain.begin, mul(loc, coordinate, domain.step));
             step = mul(loc, step, domain.step);
           }
-          strides.push_back(step);
+          strides[outputAxis] = add(loc, strides[outputAxis], step);
         }
         if (!coordinate) return op->emitError("DSA scalar address is unavailable");
         offset = add(loc, offset, mul(loc, coordinate, stride(loc, source, *term.sourceAxis)));
@@ -515,27 +615,43 @@ private:
     auto readAt = [&](Value value, ValueRange coordinates) {
       return isa<MemRefType>(value.getType()) ? loadLocal(loc, value, coordinates) : value;
     };
+    DenseMap<Value, Value> indexValues;
+    for (const auto &term : relation->terms) if (term.kind == 3) {
+      Value value = get(term.operands.front());
+      if (!value) return op->emitError("DSA index operand is unavailable");
+      indexValues[term.operands.front()] = value;
+    }
     if (failed(eachElement(loc, shape, [&](ValueRange coordinates) -> LogicalResult {
       if (fill) storeLocal(loc, readAt(fill, coordinates), data, coordinates);
       auto access = [&]() -> LogicalResult {
         Value offset = index(loc, 0);
         SmallVector<Value> sourceCoordinates;
-        unsigned outputAxis = 0;
-        for (const auto &term : relation->terms) {
-          if (term.kind == 1) { ++outputAxis; continue; }
+        for (auto [termIndex, term] : llvm::enumerate(relation->terms)) {
+          int64_t outputAxis = outputAxes[termIndex];
+          if (term.kind == 1) continue;
           if (!term.sourceAxis) return op->emitError("DSA indexing requires explicit source axes");
           Value coordinate;
           if (term.kind == 0 || term.kind == 4) {
-            coordinate = add(loc, shape[outputAxis].begin, coordinates[outputAxis]); ++outputAxis;
+            coordinate = add(loc, shape[outputAxis].begin, coordinates[outputAxis]);
             if (term.kind == 4) {
               if (!bindDomain(term.operands.front())) return op->emitError("DSA index interval is unavailable");
               Domain domain = domains.lookup(term.operands.front());
               coordinate = add(loc, domain.begin, mul(loc, coordinate, domain.step));
             }
-          } else if (term.kind == 3 && term.operands.size() == 1) {
-            Value value = get(term.operands.front());
+          } else if (term.kind == 2) coordinate = staticCoordinate(term);
+          else if (term.kind == 3 && term.operands.size() == 1) {
+            Value value = indexValues.lookup(term.operands.front());
             if (!value) return op->emitError("DSA index operand is unavailable");
-            coordinate = asIndex(readAt(value, coordinates), loc);
+            if (auto indexType = dyn_cast<RankedTensorType>(term.operands.front().getType())) {
+              SmallVector<Value> indexCoordinates;
+              const auto &indexShape = localShapes.lookup(value);
+              for (int64_t axis = 0; axis < indexType.getRank(); ++axis) {
+                unsigned mapped = *advancedStart + advancedRank - indexType.getRank() + axis;
+                bool singleton = indexType.getDimSize(axis) == 1 || matchPattern(indexShape[axis].extent, m_One());
+                indexCoordinates.push_back(singleton ? index(loc, 0) : sub(loc, add(loc, shape[mapped].begin, coordinates[mapped]), indexShape[axis].begin));
+              }
+              coordinate = asIndex(loadLocal(loc, value, indexCoordinates), loc);
+            } else coordinate = asIndex(value, loc);
           }
           if (!coordinate) return op->emitError("DSA access index form is not implemented");
           if (external) offset = add(loc, offset, mul(loc, coordinate, stride(loc, source, *term.sourceAxis)));
@@ -598,6 +714,7 @@ private:
     auto savedValues = values; auto savedProducts = products;
     auto savedDimensions = dimensions; auto savedAxes = axisBindings;
     auto savedShapes = localShapes;
+    auto savedStreamed = streamedOperations;
     for (auto [i, formal] : llvm::enumerate(block.getArguments()))
       bindHelperValue(formal, arguments[i], i < sourceCount, sourceAxis);
     LogicalResult status = lowerOperations(block);
@@ -605,6 +722,7 @@ private:
     if (succeeded(status)) result = flatten(block.getTerminator()->getOperands());
     values = std::move(savedValues); products = std::move(savedProducts);
     dimensions = std::move(savedDimensions); axisBindings = std::move(savedAxes);
+    streamedOperations = std::move(savedStreamed);
     for (auto &entry : savedShapes) localShapes[entry.first] = entry.second;
     if (failed(status) || result.empty() || llvm::is_contained(result, Value())) return failure();
     return result;
@@ -666,7 +784,10 @@ private:
       Value reduced = allocate(loc, b.getF32Type(), 1, 1);
       Value identity = scalarCast(loc, initial.front(), b.getF32Type());
       if (failed(eachElement(loc, resultShape, [&](ValueRange coordinates) {
-        Value offset = coordinates.empty() ? index(loc, 0) : mul(loc, coordinates[0], index(loc, inputShape[axis].capacity));
+        SmallVector<Value> sourceCoordinates(coordinates);
+        sourceCoordinates.push_back(index(loc, 0));
+        auto physical = physicalCoordinates(loc, input, sourceCoordinates);
+        Value offset = mul(loc, physical[0], index(loc, inputShape[axis].capacity));
         b.create<dsa::LoadTileOp>(loc, input, row, offset, index(loc, 0), index(loc, 1), index(loc, 1), inputShape[axis].count);
         b.create<dsa::ReduceOp>(loc, row, reduced, scratch, inputShape[axis].count, identity,
             BinaryOperatorAttr::get(b.getContext(), kind));
@@ -712,7 +833,249 @@ private:
     return success();
   }
 
+  LogicalResult advanceScan(ScanOp scan, ValueRange slots, ValueRange next,
+                           ValueRange elements, ArrayRef<SmallVector<Value>> captures) {
+    ValueRange identities = scan.getInputs().slice(scan.getSourceCount(), scan.getIdentityCount());
+    auto arguments = splitFields(identities.getTypes(), slots);
+    llvm::append_range(arguments, splitFields(identities.getTypes(), elements));
+    llvm::append_range(arguments, captures);
+    auto updated = helper(scan.getCombine().front(), arguments);
+    if (failed(updated) || updated->size() != slots.size()) return failure();
+    for (auto [value, slot] : llvm::zip(*updated, next))
+      if (failed(copyTo(value, slot, scan.getLoc()))) return failure();
+    for (auto [value, slot] : llvm::zip(next, slots))
+      if (failed(copyTo(value, slot, scan.getLoc()))) return failure();
+    return success();
+  }
+  LogicalResult scanTensor(ScanOp scan) {
+    Location loc = scan.getLoc();
+    unsigned axis = scan.getAxis();
+    ValueRange sources = scan.getInputs().take_front(scan.getSourceCount());
+    ValueRange identities = scan.getInputs().slice(scan.getSourceCount(), scan.getIdentityCount());
+    auto inputs = flatten(sources), initial = flatten(identities);
+    SmallVector<Type> schema;
+    for (Type type : identities.getTypes()) leaves(type, schema);
+    if (inputs.empty() || inputs.size() != initial.size() || inputs.size() != schema.size())
+      return scan.emitError("DSA scan has unbound source or identity fields");
+    for (Value input : inputs)
+      if (!input || !localShapes.count(input) || axis >= localShapes.lookup(input).size())
+        return scan.emitError("DSA scan source requires a bounded local shape");
+    LocalShape firstShape = localShapes.lookup(inputs.front());
+    bool elementwise = llvm::none_of(schema, [](Type type) { return isa<RankedTensorType>(type); });
+    LocalShape independentShape;
+    if (elementwise) {
+      independentShape = firstShape;
+      independentShape.erase(independentShape.begin() + axis);
+    }
+    for (auto [input, type] : llvm::zip(inputs, schema)) {
+      LocalShape slice = localShapes.lookup(input);
+      if (!sameIndex(slice[axis].count, firstShape[axis].count))
+        return scan.emitError("DSA scan source fields require a common traversal extent");
+      slice.erase(slice.begin() + axis);
+      auto tensor = dyn_cast<RankedTensorType>(type);
+      LocalShape stateShape;
+      if (tensor) {
+        auto shape = localShape(tensor, loc);
+        if (failed(shape)) return failure();
+        stateShape = *shape;
+      }
+      const auto &required = elementwise ? independentShape : stateShape;
+      if (slice.size() != required.size()) return scan.emitError("DSA scan state must match a source slice");
+      for (unsigned i = 0; i < slice.size(); ++i)
+        if (slice[i].capacity != required[i].capacity || !sameIndex(slice[i].count, required[i].count))
+          return scan.emitError("DSA scan state and source slices have different local extents");
+    }
+    auto slots = makeSlots(identities.getTypes(), loc), next = makeSlots(identities.getTypes(), loc);
+    auto items = makeSlots(identities.getTypes(), loc);
+    if (failed(slots) || failed(next) || failed(items)) return failure();
+    SmallVector<Value> outputs;
+    for (Value input : inputs)
+      outputs.push_back(allocateTensor(loc, cast<MemRefType>(input.getType()).getElementType(), localShapes.lookup(input)));
+    SmallVector<SmallVector<Value>> captures;
+    for (Value capture : scan.getInputs().take_back(scan.getCaptureCount())) {
+      auto fields = flatten(ValueRange{capture});
+      if (fields.empty() || llvm::is_contained(fields, Value())) return failure();
+      captures.push_back(std::move(fields));
+    }
+    if (failed(eachElement(loc, independentShape, [&](ValueRange independent) -> LogicalResult {
+      for (auto [value, slot] : llvm::zip(initial, *slots)) if (failed(copyTo(value, slot, loc))) return failure();
+      return loop(loc, index(loc, 0), firstShape[axis].count, index(loc, 1), [&](Value position) -> LogicalResult {
+        Value i = scan.getReverse() ? sub(loc, sub(loc, firstShape[axis].count, index(loc, 1)), position) : position;
+        auto transfer = [&](ValueRange state, bool read) -> LogicalResult {
+          for (auto [field, slot] : llvm::enumerate(state)) {
+            LocalShape slice = elementwise ? LocalShape{} : localShapes.lookup(slot);
+            if (failed(eachElement(loc, slice, [&](ValueRange coordinates) {
+              SmallVector<Value> sourceCoordinates(elementwise ? independent : coordinates);
+              sourceCoordinates.insert(sourceCoordinates.begin() + axis, i);
+              if (read) storeLocal(loc, loadLocal(loc, inputs[field], sourceCoordinates), slot, coordinates);
+              else storeLocal(loc, loadLocal(loc, slot, coordinates), outputs[field], sourceCoordinates);
+              return success();
+            }))) return failure();
+          }
+          return success();
+        };
+        if (!scan.getInclusive() && failed(transfer(*slots, false))) return failure();
+        if (failed(transfer(*items, true)) || failed(advanceScan(scan, *slots, *next, *items, captures))) return failure();
+        if (scan.getInclusive() && failed(transfer(*slots, false))) return failure();
+        return success();
+      });
+    }))) return failure();
+    auto grouped = splitFields(scan->getResultTypes(), outputs);
+    for (auto [result, fields] : llvm::zip(scan->getResults(), grouped)) bindProduct(result, fields);
+    return success();
+  }
+
+  bool canStreamScan(ScanOp scan, Block &block) {
+    unsigned axis = scan.getAxis();
+    auto sources = scan.getInputs().take_front(scan.getSourceCount());
+    auto identities = scan.getInputs().slice(scan.getSourceCount(), scan.getIdentityCount());
+    auto first = cast<RankedTensorType>(sources.front().getType());
+    int64_t dimension = cast<TensorShapeAttr>(first.getEncoding()).getDimensions()[axis];
+    if (dimension <= 0 || axisBindings.count(dimension) ||
+        llvm::none_of(identities, [](Value value) { return isa<RankedTensorType>(value.getType()); })) return false;
+    for (auto [source, identity] : llvm::zip(sources, identities)) {
+      auto type = cast<RankedTensorType>(source.getType());
+      auto ids = cast<TensorShapeAttr>(type.getEncoding()).getDimensions();
+      auto state = dyn_cast<RankedTensorType>(identity.getType());
+      if (axis >= type.getRank() || ids[axis] != dimension || llvm::count(ids.asArrayRef(), dimension) != 1 ||
+          type.getRank() != (state ? state.getRank() : 0) + 1) return false;
+      DenseSet<Value> visited;
+      if (!replayableSlice(source, dimension, visited)) return false;
+    }
+    // All observable consumers must keep the prefix position free. A pair of
+    // prefix axes, a reduction over it, or a nonlocal lookup needs materialization.
+    DenseSet<Operation *> dependent;
+    SmallVector<Value> pending(scan->getResults());
+    while (!pending.empty()) {
+      Value value = pending.pop_back_val();
+      for (Operation *user : value.getUsers()) {
+        if (user->getBlock() != &block || user == block.getTerminator()) return false;
+        if (dependent.insert(user).second) llvm::append_range(pending, user->getResults());
+      }
+    }
+    auto ids = [](Value value) -> ArrayRef<int64_t> {
+      auto type = dyn_cast<RankedTensorType>(value.getType());
+      return type ? cast<TensorShapeAttr>(type.getEncoding()).getDimensions().asArrayRef() : ArrayRef<int64_t>();
+    };
+    bool after = false, hasOutput = false;
+    for (Operation &op : block.without_terminator()) {
+      if (&op == scan) { after = true; continue; }
+      if (auto store = dyn_cast<ViewStoreOp>(op)) {
+        if (!after || !dependent.contains(&op) || llvm::count(ids(store.getInputs()[store.getValueOperandIndex()]), dimension) != 1)
+          return false;
+        hasOutput = true;
+      } else if (auto load = dyn_cast<ViewLoadOp>(op)) {
+        if (cast<ViewType>(load.getInputs().front().getType()).getAccess() != 0) return false;
+      } else if (!isMemoryEffectFree(&op)) return false;
+      if (isa<ScanOp, RegionFoldOp, RegionScanOp, ForOp, WhileOp, IfOp, ParallelOp, ReshapeOp, JoinOp>(op)) return false;
+      for (Type type : op.getResultTypes()) {
+        SmallVector<Type> fields; leaves(type, fields);
+        for (Type field : fields) if (auto tensor = dyn_cast<RankedTensorType>(field))
+          if (llvm::count(cast<TensorShapeAttr>(tensor.getEncoding()).getDimensions().asArrayRef(), dimension) > 1) return false;
+      }
+      if (auto reduce = dyn_cast<ReduceOp>(op))
+        for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+          SmallVector<Type> fields; leaves(source.getType(), fields);
+          for (Type field : fields) if (auto tensor = dyn_cast<RankedTensorType>(field))
+            for (Attribute reduced : reduce.getAxes())
+              if (cast<TensorShapeAttr>(tensor.getEncoding()).getDimensions()[cast<IntegerAttr>(reduced).getInt()] == dimension) return false;
+        }
+      if (auto matrix = dyn_cast<ContractOp>(op)) {
+        if (!matrix.getBatch().empty()) return false;
+        for (Attribute entry : matrix.getReduce()) {
+          auto pair = cast<ArrayAttr>(entry);
+          if (ids(matrix.getLhs())[cast<IntegerAttr>(pair[0]).getInt()] == dimension ||
+              ids(matrix.getRhs())[cast<IntegerAttr>(pair[1]).getInt()] == dimension) return false;
+        }
+      }
+      if (auto gather = dyn_cast<GatherOp>(op)) {
+        auto relation = analysis.indexRelation(gather);
+        if (failed(relation)) return false;
+        for (const auto &term : relation->terms)
+          if (term.sourceAxis && ids(relation->source)[*term.sourceAxis] == dimension && term.kind != 0) return false;
+      }
+    }
+    return hasOutput;
+  }
+  LogicalResult streamScan(ScanOp scan, Block &block) {
+    Location loc = scan.getLoc();
+    unsigned axis = scan.getAxis();
+    auto sources = scan.getInputs().take_front(scan.getSourceCount());
+    auto identities = scan.getInputs().slice(scan.getSourceCount(), scan.getIdentityCount());
+    auto first = cast<RankedTensorType>(sources.front().getType());
+    int64_t dimension = cast<TensorShapeAttr>(first.getEncoding()).getDimensions()[axis];
+    for (Operation &op : block.without_terminator()) {
+      if (&op == scan) break;
+      if (!canDefer(&op) && failed(lowerOperation(&op))) return failure();
+    }
+    Value size = extent(first, axis, loc);
+    if (!size) return scan.emitError("DSA scan traversal extent is unavailable");
+    auto initial = flatten(identities);
+    auto slots = makeSlots(identities.getTypes(), loc), next = makeSlots(identities.getTypes(), loc);
+    auto items = makeSlots(identities.getTypes(), loc);
+    if (failed(slots) || failed(next) || failed(items) || initial.size() != slots->size()) return failure();
+    for (auto [value, slot] : llvm::zip(initial, *slots)) if (failed(copyTo(value, slot, loc))) return failure();
+    SmallVector<SmallVector<Value>> captures;
+    for (Value capture : scan.getInputs().take_back(scan.getCaptureCount())) {
+      auto fields = flatten(ValueRange{capture});
+      if (fields.empty() || llvm::is_contained(fields, Value())) return failure();
+      captures.push_back(std::move(fields));
+    }
+    auto savedValues = values; auto savedProducts = products; auto savedAxes = axisBindings;
+    auto savedDimensions = dimensions;
+    LogicalResult status = loop(loc, index(loc, 0), size, index(loc, 1), [&](Value position) -> LogicalResult {
+      Value i = scan.getReverse() ? sub(loc, sub(loc, size, index(loc, 1)), position) : position;
+      LocalAxis selected{size, i, index(loc, 1), 1};
+      axisBindings[dimension] = selected;
+      DenseSet<Value> replayed;
+      for (Value source : sources) forgetReplayedTensors(source, replayed);
+      auto inputs = flatten(sources);
+      if (inputs.size() != items->size() || llvm::is_contained(inputs, Value())) return failure();
+      for (auto [input, item] : llvm::zip(inputs, *items)) {
+        LocalShape slice = localShapes.lookup(item);
+        if (failed(eachElement(loc, slice, [&](ValueRange coordinates) {
+          SmallVector<Value> from(coordinates); from.insert(from.begin() + axis, index(loc, 0));
+          storeLocal(loc, loadLocal(loc, input, from), item, coordinates);
+          return success();
+        }))) return failure();
+      }
+      auto emit = [&]() -> LogicalResult {
+        auto savedShapes = localShapes;
+        for (auto [result, slot] : llvm::zip(scan->getResults(), *slots)) {
+          auto type = cast<RankedTensorType>(result.getType());
+          auto shape = localShape(type, loc);
+          if (failed(shape)) return failure();
+          int64_t rows = 1;
+          for (unsigned a = 0; a + 1 < shape->size(); ++a) rows *= (*shape)[a].capacity;
+          Value output = slot;
+          auto physical = cast<MemRefType>(slot.getType());
+          if (physical.getDimSize(0) != rows || physical.getDimSize(1) != shape->back().capacity) {
+            output = allocateTensor(loc, type.getElementType(), *shape);
+            if (failed(eachElement(loc, localShapes.lookup(slot), [&](ValueRange coordinates) {
+              SmallVector<Value> to(coordinates); to.insert(to.begin() + axis, index(loc, 0));
+              storeLocal(loc, loadLocal(loc, slot, coordinates), output, to);
+              return success();
+            }))) return failure();
+          } else localShapes[output] = *shape;
+          values.map(result, output);
+        }
+        for (Operation *op = scan->getNextNode(); op && op != block.getTerminator(); op = op->getNextNode())
+          if (!canDefer(op) && failed(lowerOperation(op))) return failure();
+        for (auto &entry : savedShapes) localShapes[entry.first] = entry.second;
+        return success();
+      };
+      if (!scan.getInclusive() && failed(emit())) return failure();
+      if (failed(advanceScan(scan, *slots, *next, *items, captures))) return failure();
+      return scan.getInclusive() ? emit() : success();
+    });
+    values = std::move(savedValues); products = std::move(savedProducts);
+    axisBindings = std::move(savedAxes); dimensions = std::move(savedDimensions);
+    return status;
+  }
+
   LogicalResult lowerStructuredBlock(Block &block) {
+    for (Operation &op : block.without_terminator())
+      if (auto scan = dyn_cast<ScanOp>(op); scan && canStreamScan(scan, block)) return streamScan(scan, block);
     RegionFoldOp fold;
     for (Operation &op : block.without_terminator()) if (auto region = dyn_cast<RegionFoldOp>(op)) {
       if (fold) return op.emitError("DSA multiple region folds in one workset need an explicit shared projection");
@@ -803,8 +1166,10 @@ private:
     } else if (!isMemoryEffectFree(op)) return false;
     if (isa<RegionFoldOp, RegionScanOp, ScanOp, ReshapeOp, JoinOp>(op)) return false;
     auto containsAxis = [&](Value input, unsigned axis) {
-      auto type = dyn_cast<RankedTensorType>(input.getType());
-      return type && cast<TensorShapeAttr>(type.getEncoding()).getDimensions()[axis] == dimension;
+      SmallVector<Type> fields; leaves(input.getType(), fields);
+      for (Type field : fields) if (auto tensor = dyn_cast<RankedTensorType>(field))
+        if (cast<TensorShapeAttr>(tensor.getEncoding()).getDimensions()[axis] == dimension) return true;
+      return false;
     };
     if (auto reduce = dyn_cast<ReduceOp>(op))
       for (Value input : reduce.getInputs().take_front(reduce.getSourceCount()))
@@ -834,6 +1199,87 @@ private:
     for (Value operand : op->getOperands()) forgetReplayedTensors(operand, visited);
   }
 
+  FailureOr<SmallVector<Operation *>> regionConsumers(Operation *region, unsigned outputCount, int64_t dimension) {
+    DenseSet<Operation *> consumers;
+    SmallVector<Value> pending(region->getResults().take_front(outputCount));
+    while (!pending.empty()) {
+      Value value = pending.pop_back_val();
+      for (Operation *user : value.getUsers()) {
+        if (user->getBlock() != region->getBlock() || user == region->getBlock()->getTerminator())
+          return region->emitError("DSA streamed region outputs require consumers in the same workset"), failure();
+        if (!consumers.insert(user).second) continue;
+        bool write = isa<ViewStoreOp, ScatterUniqueOp>(user);
+        if (!write && (!isMemoryEffectFree(user) || user->getNumRegions()))
+          return user->emitError("DSA streamed region consumer requires a pure position-preserving computation"), failure();
+        if (isa<ReshapeOp, JoinOp>(user))
+          return user->emitError("DSA streamed region consumer needs an explicit position mapping"), failure();
+        for (Type type : user->getResultTypes()) {
+          SmallVector<Type> fields; leaves(type, fields);
+          for (Type field : fields) if (auto tensor = dyn_cast<RankedTensorType>(field))
+            if (llvm::count(cast<TensorShapeAttr>(tensor.getEncoding()).getDimensions().asArrayRef(), dimension) > 1)
+              return user->emitError("DSA streamed region consumer couples distinct source positions"), failure();
+        }
+        if (auto matrix = dyn_cast<ContractOp>(user)) {
+          for (Attribute entry : matrix.getReduce()) {
+            auto pair = cast<ArrayAttr>(entry);
+            for (auto [input, axis] : llvm::zip(matrix->getOperands(), pair)) {
+              auto ids = cast<TensorShapeAttr>(cast<RankedTensorType>(input.getType()).getEncoding()).getDimensions();
+              if (ids[cast<IntegerAttr>(axis).getInt()] == dimension)
+                return user->emitError("DSA streamed region consumer reduces the source-position axis"), failure();
+            }
+          }
+        }
+        if (auto gather = dyn_cast<GatherOp>(user)) {
+          auto relation = analysis.indexRelation(gather);
+          if (failed(relation)) return failure();
+          auto ids = cast<TensorShapeAttr>(cast<RankedTensorType>(relation->source.getType()).getEncoding()).getDimensions();
+          for (const auto &term : relation->terms)
+            if (term.sourceAxis && ids[*term.sourceAxis] == dimension && term.kind != 0)
+              return user->emitError("DSA streamed region consumer performs a nonlocal lookup"), failure();
+        }
+        if (write) {
+          auto data = user->getOperand(user->getAttrOfType<IntegerAttr>("value_operand_index").getInt());
+          auto type = dyn_cast<RankedTensorType>(data.getType());
+          if (!type || llvm::count(cast<TensorShapeAttr>(type.getEncoding()).getDimensions().asArrayRef(), dimension) != 1)
+            return user->emitError("DSA streamed region output must preserve one source-position axis"), failure();
+        }
+        llvm::append_range(pending, user->getResults());
+      }
+    }
+    SmallVector<Operation *> ordered;
+    DenseSet<Value> checkedFinal;
+    std::function<bool(Value)> requiresFinal = [&](Value value) {
+      if (value.getDefiningOp() == region) return cast<OpResult>(value).getResultNumber() >= outputCount;
+      if (!checkedFinal.insert(value).second) return false;
+      Operation *definition = value.getDefiningOp();
+      return definition && llvm::any_of(definition->getOperands(), requiresFinal);
+    };
+    for (Operation *op = region->getNextNode(); op && op != region->getBlock()->getTerminator(); op = op->getNextNode()) {
+      if (consumers.contains(op)) {
+        for (Value operand : op->getOperands()) {
+          if (requiresFinal(operand))
+            return op->emitError("DSA region output consumer requires the final state before traversal completes"), failure();
+          if (operand.getDefiningOp() == region) {
+            continue;
+          }
+          if (consumers.contains(operand.getDefiningOp())) continue;
+          DenseSet<Value> visited;
+          if (!replayableSlice(operand, dimension, visited))
+            return op->emitError("DSA region consumer input needs complete materialization before streaming"), failure();
+        }
+        ordered.push_back(op);
+      }
+    }
+    if (!ordered.empty()) {
+      for (Operation *between = region->getNextNode(); between != ordered.back(); between = between->getNextNode()) {
+        if (consumers.contains(between) || isMemoryEffectFree(between)) continue;
+        if (auto load = dyn_cast<ViewLoadOp>(between))
+          if (cast<ViewType>(load.getInputs().front().getType()).getAccess() == 0) continue;
+        return between->emitError("DSA streaming output cannot cross an observable access"), failure();
+      }
+    }
+    return ordered;
+  }
   LogicalResult lowerRegion(Operation *op) {
     Location loc = op->getLoc();
     bool scan = isa<RegionScanOp>(op);
@@ -866,24 +1312,8 @@ private:
     for (auto [value, slot] : llvm::zip(initial, *slots)) if (failed(copyTo(value, slot, loc))) return failure();
     SmallVector<SmallVector<Value>> captureFields;
     for (Value capture : captures) captureFields.push_back(flatten(ValueRange{capture}));
-    SmallVector<SmallVector<ViewStoreOp>> stores;
-    for (unsigned i = 0; i < outputCount; ++i) {
-      SmallVector<ViewStoreOp> destinations;
-      for (OpOperand &use : op->getResult(i).getUses()) {
-        auto store = dyn_cast<ViewStoreOp>(use.getOwner());
-        if (!store || store->getBlock() != op->getBlock() || use.getOperandNumber() != store.getValueOperandIndex())
-          return op->emitError("DSA region-scan output currently requires a direct output-view consumer");
-        for (Operation *between = op->getNextNode(); between && between != store; between = between->getNextNode()) {
-          if (isa<ViewStoreOp>(between)) {
-            auto written = cast<ViewStoreOp>(between).getInputs()[cast<ViewStoreOp>(between).getValueOperandIndex()];
-            if (written.getDefiningOp() == op) continue;
-          }
-          if (!isMemoryEffectFree(between)) return store.emitError("DSA streaming output cannot cross an observable access");
-        }
-        destinations.push_back(store);
-      }
-      stores.push_back(std::move(destinations));
-    }
+    auto consumers = regionConsumers(op, outputCount, dimension);
+    if (failed(consumers)) return failure();
     auto savedValues = values; auto savedProducts = products; auto savedAxes = axisBindings;
     if (failed(loop(loc, index(loc, 0), size, index(loc, config.getRegionTile()), [&](Value begin) -> LogicalResult {
       Value count = b.create<arith::MinSIOp>(loc, sub(loc, size, begin), index(loc, config.getRegionTile()));
@@ -909,19 +1339,24 @@ private:
         llvm::append_range(emittedArgs, splitFields(states.getTypes(), *incoming));
         llvm::append_range(emittedArgs, captureFields);
         auto emitted = helper(op->getRegion(3).front(), emittedArgs, sourceCount, axis);
-        if (failed(emitted) || emitted->size() != outputCount) return op->emitError("DSA scan output schema is unavailable");
-        for (unsigned i = 0; i < outputCount; ++i) {
+        SmallVector<Type> outputTypes;
+        ValueRange outputValues = op->getResults().take_front(outputCount);
+        for (Type type : outputValues.getTypes()) leaves(type, outputTypes);
+        if (failed(emitted) || emitted->size() != outputTypes.size()) return op->emitError("DSA scan output schema is unavailable");
+        for (unsigned i = 0; i < outputTypes.size(); ++i) {
           // Reattach the helper-local slice to the complete output's source
           // coordinates before its view consumers form destination addresses.
-          auto outputType = cast<RankedTensorType>(op->getResult(i).getType());
+          auto outputType = cast<RankedTensorType>(outputTypes[i]);
           auto outputIds = cast<TensorShapeAttr>(outputType.getEncoding()).getDimensions();
           LocalShape outputShape = localShapes.lookup((*emitted)[i]);
           for (int64_t outputAxis = 0; outputAxis < outputType.getRank(); ++outputAxis)
             if (outputIds[outputAxis] == dimension) outputShape[outputAxis] = {size, begin, count, config.getRegionTile()};
           localShapes[(*emitted)[i]] = std::move(outputShape);
-          values.map(op->getResult(i), (*emitted)[i]);
-          for (ViewStoreOp store : stores[i]) if (failed(tensorAccess(store))) return failure();
         }
+        auto outputFields = splitFields(outputValues.getTypes(), *emitted);
+        for (auto [result, fields] : llvm::zip(outputValues, outputFields)) bindProduct(result, fields);
+        for (Operation *consumer : *consumers)
+          if (!canDefer(consumer) && failed(lowerOperation(consumer))) return failure();
       }
       auto combinedArgs = splitFields(identities.getTypes(), *slots);
       llvm::append_range(combinedArgs, splitFields(identities.getTypes(), *part));
@@ -939,7 +1374,7 @@ private:
     if (failed(finalState)) return failure();
     auto grouped = splitFields(states.getTypes(), *finalState);
     for (auto [result, fields] : llvm::zip(op->getResults().drop_front(outputCount), grouped)) bindProduct(result, fields);
-    for (const auto &destinations : stores) for (ViewStoreOp store : destinations) streamedStores.insert(store);
+    for (Operation *consumer : *consumers) streamedOperations.insert(consumer);
     return success();
   }
   LogicalResult loop(Location loc, Value begin, Value end, Value step,
@@ -954,8 +1389,32 @@ private:
   }
   bool bindDomain(Value value) {
     if (domains.count(value)) return true;
-    auto definition = value.getDefiningOp<DomainOp>();
-    return definition && succeeded(lowerOperation(definition));
+    Operation *definition = value.getDefiningOp();
+    return definition && isa<DomainOp, SubregionOp>(definition) && succeeded(lowerOperation(definition));
+  }
+  // Bounds constrain the author's logical interval. They size local storage
+  // without replacing the runtime extent or the source coordinate origin.
+  std::optional<int64_t> upperDistance(Value end, Value begin) {
+    if (sameIndex(end, begin)) return 0;
+    APInt a, c;
+    if (matchPattern(end, m_ConstantInt(&a)) && matchPattern(begin, m_ConstantInt(&c))) {
+      APInt distance = a.sext(128) - c.sext(128);
+      if (distance.isSignedIntN(64)) return std::max<int64_t>(0, distance.getSExtValue());
+    }
+    if (auto sum = end.getDefiningOp<arith::AddIOp>()) {
+      Value extra;
+      if (sameIndex(sum.getLhs(), begin)) extra = sum.getRhs();
+      if (sameIndex(sum.getRhs(), begin)) extra = sum.getLhs();
+      if (extra && matchPattern(extra, m_ConstantInt(&a)) && !a.isNegative()) return a.getSExtValue();
+    }
+    auto tighter = [](std::optional<int64_t> lhs, std::optional<int64_t> rhs) {
+      return lhs && rhs ? std::optional<int64_t>(std::min(*lhs, *rhs)) : lhs ? lhs : rhs;
+    };
+    if (auto minimum = end.getDefiningOp<arith::MinSIOp>())
+      return tighter(upperDistance(minimum.getLhs(), begin), upperDistance(minimum.getRhs(), begin));
+    if (auto maximum = begin.getDefiningOp<arith::MaxSIOp>())
+      return tighter(upperDistance(end, maximum.getLhs()), upperDistance(end, maximum.getRhs()));
+    return std::nullopt;
   }
   bool independentDomains(const LogicalWorksetFact &workset) {
     DenseSet<Value> seen;
@@ -1010,6 +1469,11 @@ private:
   Value scalarCast(Location loc, Value value, Type type) {
     if (!value) return {};
     if (value.getType() == type) return value;
+    if (value.getType().isIndex() && isa<FloatType>(type))
+      return scalarCast(loc, b.create<arith::IndexCastOp>(loc, b.getI64Type(), value), type);
+    if (isa<FloatType>(value.getType()) && type.isIndex())
+      return b.create<arith::IndexCastOp>(loc, type, b.create<arith::FPToSIOp>(loc, b.getI64Type(), value));
+    if (value.getType().isInteger(1) && type.isIndex()) return asIndex(value, loc);
     if (type.isInteger(1)) {
       if (isa<FloatType>(value.getType())) {
         Value zero = b.create<arith::ConstantOp>(loc, b.getFloatAttr(value.getType(), 0.0));
@@ -1150,6 +1614,15 @@ private:
   LogicalResult orderedControl(Operation *operation) {
     Location loc = operation->getLoc();
     auto savedDimensions = dimensions;
+    auto savedAxes = axisBindings;
+    auto savedValues = values;
+    auto savedProducts = products;
+    auto savedStreamed = streamedOperations;
+    auto restore = [&]() {
+      dimensions = savedDimensions; axisBindings = savedAxes;
+      values = savedValues; products = savedProducts;
+      streamedOperations = savedStreamed;
+    };
     auto slots = makeSlots(operation->getResultTypes(), loc);
     if (failed(slots)) return failure();
     if (auto conditional = dyn_cast<IfOp>(operation)) {
@@ -1158,7 +1631,7 @@ private:
         OpBuilder::InsertionGuard guard(b);
         b.setInsertionPointToStart(&destination.front());
         if (failed(lowerResults(source.front(), *slots))) return failure();
-        dimensions = savedDimensions;
+        restore();
       }
     } else {
       auto forLoop = dyn_cast<ForOp>(operation);
@@ -1167,6 +1640,7 @@ private:
       auto next = makeSlots(operation->getResultTypes(), loc);
       if (failed(next)) return failure();
       for (auto [value, slot] : llvm::zip(initial, *slots)) if (failed(copyTo(value, slot, loc))) return failure();
+      savedValues = values; savedProducts = products;
       auto advance = [&]() -> LogicalResult {
         for (auto [value, slot] : llvm::zip(*next, *slots)) if (failed(copyTo(value, slot, loc))) return failure();
         return success();
@@ -1193,6 +1667,7 @@ private:
           if (failed(predicate) || !*predicate || failed(advance())) return failure();
           b.create<scf::ConditionOp>(loc, *predicate, ValueRange{});
         }
+        restore();
         {
           OpBuilder::InsertionGuard guard(b);
           b.setInsertionPointToStart(&target.getAfter().front());
@@ -1203,7 +1678,7 @@ private:
         }
       }
     }
-    dimensions = std::move(savedDimensions);
+    restore();
     bindSlots(operation->getResults(), *slots, loc);
     return success();
   }
@@ -1404,11 +1879,13 @@ private:
     return success();
   }
   LogicalResult lowerOperation(Operation *operation) {
+    if (streamedOperations.contains(operation)) return success();
     Location loc = operation->getLoc();
     if (structured) {
       if (isa<RegionFoldOp, RegionScanOp>(operation)) return lowerRegion(operation);
       if (auto reduce = dyn_cast<ReduceOp>(operation)) return reduceTensor(reduce);
-      if (isa<ViewLoadOp, ViewStoreOp, GatherOp>(operation)) return tensorAccess(operation);
+      if (auto scan = dyn_cast<ScanOp>(operation)) return scanTensor(scan);
+      if (isa<ViewLoadOp, ViewStoreOp, GatherOp, ScatterUniqueOp>(operation)) return tensorAccess(operation);
       if (operation->getNumResults() == 1 && isa<RankedTensorType>(operation->getResult(0).getType()) &&
           !isa<ExtractOp, IfOp, ForOp, WhileOp, ScanOp>(operation)) return tensorOperation(operation);
     }
@@ -1459,9 +1936,30 @@ private:
       Value step = domain.getBounds().size() == 3 ? asIndex(get(domain.getBounds()[2]), loc) : index(loc, 1);
       if (!begin || !end || !step || !matchPattern(step, m_One())) return domain.emitError("DSA construction requires a unit-step interval");
       int64_t identity = cast<IntegerAttr>(domain.getExtentDimensions()[0]).getInt();
-      domains[domain.getResult()] = {begin, end, step, identity};
-      if (identity > 0) dimensions[identity] = sub(loc, end, begin);
+      domains[domain.getResult()] = {begin, end, step, identity, upperDistance(end, begin)};
+      if (identity > 0) dimensions[identity] = b.createOrFold<arith::MaxSIOp>(loc, sub(loc, end, begin), index(loc, 0));
       return success();
+    }
+    if (auto region = dyn_cast<SubregionOp>(operation)) {
+      if (!bindDomain(region.getInputs().front()) || region.getExtentDimensions().size() != 1)
+        return region.emitError("DSA subregion needs one bound source interval");
+      Domain source = domains.lookup(region.getInputs().front());
+      unsigned operand = 1;
+      Value begin = region.getHasStart() ? asIndex(get(region.getInputs()[operand++]), loc) : source.begin;
+      Value end = region.getHasStop() ? asIndex(get(region.getInputs()[operand]), loc) : source.end;
+      if (!begin || !end) return region.emitError("DSA subregion bounds are unavailable");
+      int64_t dimension = cast<IntegerAttr>(region.getExtentDimensions()[0]).getInt();
+      auto capacity = upperDistance(end, begin);
+      if (source.capacity) capacity = capacity ? std::min(*capacity, *source.capacity) : source.capacity;
+      domains[region.getResult()] = {begin, end, source.step, dimension, capacity};
+      Value count = sub(loc, end, begin);
+      dimensions[dimension] = count;
+      if (capacity) axisBindings[dimension] = {count, index(loc, 0), count, std::max<int64_t>(1, *capacity)};
+      return success();
+    }
+    if (auto end = dyn_cast<RegionEndOp>(operation)) {
+      if (!bindDomain(end.getSource())) return end.emitError("DSA region end needs a bound source interval");
+      values.map(end.getResult(), domains.lookup(end.getSource()).end); return success();
     }
     if (auto parallel = dyn_cast<ParallelOp>(operation)) {
       if (parallel == distributedRoot) return distributeWorkset(loc);
@@ -1773,7 +2271,7 @@ private:
   DenseSet<Operation *> materializing;
   DenseMap<int64_t, LocalAxis> axisBindings;
   DenseMap<Value, LocalShape> localShapes;
-  DenseSet<Operation *> streamedStores;
+  DenseSet<Operation *> streamedOperations;
   std::optional<LogicalWorksetFact> distributedWorkset;
   ParallelOp distributedRoot;
 };

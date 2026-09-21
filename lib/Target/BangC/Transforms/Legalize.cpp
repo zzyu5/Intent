@@ -13,7 +13,7 @@ using namespace mlir;
 namespace intent::bangc {
 namespace {
 bool supportedUnary(UnaryOperator kind) {
-  return kind == UnaryOperator::Exp || kind == UnaryOperator::Log || kind == UnaryOperator::Sqrt ||
+  return kind == UnaryOperator::Exp || kind == UnaryOperator::Exp2 || kind == UnaryOperator::Log || kind == UnaryOperator::Sqrt ||
       kind == UnaryOperator::Rsqrt || kind == UnaryOperator::Tanh || kind == UnaryOperator::Abs || kind == UnaryOperator::Negate;
 }
 bool supportedBinary(BinaryOperator kind) {
@@ -201,6 +201,7 @@ LogicalResult legalizeProgram(ModuleOp module, StringRef architecture) {
         StringRef callee;
         switch (unary.getKind()) {
         case UnaryOperator::Exp: callee = "__cn_vector_exp"; break;
+        case UnaryOperator::Exp2: callee = "__cn_vector_exp2"; break;
         case UnaryOperator::Log: callee = "__cn_vector_log"; break;
         case UnaryOperator::Tanh: callee = "__cn_vector_tanh"; break;
         case UnaryOperator::Sqrt: callee = "__cn_vector_sqrt"; break;

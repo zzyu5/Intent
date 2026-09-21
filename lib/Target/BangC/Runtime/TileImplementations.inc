@@ -182,7 +182,7 @@ __mlu_func__ void intent_load_tile(T *dst, const T *src, int64_t offset,
                             columns * sizeof(T), GDRAM2NRAM);
     } else {
       for (int64_t c = 0; c < columns; ++c)
-        dst[r * C + c] = src[offset + r * row_stride + c * column_stride];
+        intent_write_local(dst + r * C + c, src[offset + r * row_stride + c * column_stride]);
     }
   }
 }
@@ -195,7 +195,7 @@ __mlu_func__ void intent_store_tile(T *dst, const T *src, int64_t offset,
                             columns * sizeof(T), NRAM2GDRAM);
     } else {
       for (int64_t c = 0; c < columns; ++c)
-        dst[offset + r * row_stride + c * column_stride] = src[r * C + c];
+        dst[offset + r * row_stride + c * column_stride] = intent_read_local(src + r * C + c);
     }
   }
 }
@@ -263,24 +263,25 @@ __mlu_func__ void intent_reduce(float *out, const float *input, float *scratch,
   // The scratch and result storage are explicit operands in the DSA program.
   // MLU370 reduce_sum forms 128-byte partial sums; the remaining scalar fold
   // combines those partials and the declared identity.
-  for (int64_t i = 0; i < N; ++i) scratch[i] = i < count ? input[i] : identity;
+  for (int64_t i = 0; i < N; ++i)
+    intent_write_local(scratch + i, i < count ? intent_read_local(input + i) : identity);
   if (Kind == 0) {
     static_assert(N >= 32 && N % 32 == 0, "reduce_sum requires 128-byte input groups");
     __bang_reduce_sum(scratch, scratch, N);
     __sync_compute();
     float value = identity;
-    for (int i = 0; i < N / 32; ++i) value += scratch[i * 32];
-    out[0] = value;
+    for (int i = 0; i < N / 32; ++i) value += intent_read_local(scratch + i * 32);
+    intent_write_local(out, value);
   } else {
     float value = identity;
     for (int64_t i = 0; i < count; ++i) {
-      const float next = scratch[i];
+      const float next = intent_read_local(scratch + i);
       if (Kind == 7) value = isnan(value) || isnan(next) ? NAN : fmaxf(value, next);
       if (Kind == 8) value = isnan(value) || isnan(next) ? NAN : fminf(value, next);
       if (Kind == 9) value = fmaxf(value, next);
       if (Kind == 10) value = fminf(value, next);
     }
-    out[0] = value;
+    intent_write_local(out, value);
   }
 }
 )BANG";
