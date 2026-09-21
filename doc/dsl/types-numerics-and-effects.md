@@ -300,4 +300,6 @@ result = (c0, c1, c2, c3)[word]
 - `I.assume_in_bounds(index, view_or_buffer, axis=...)`声明给定typed index relation在指定resource axis内；
 - external view annotation中的`alias/noalias`约束base allocation relation。
 
+`I.assume_in_bounds`是无返回值的约束语句，不产生新的index或tensor。调用后继续使用原`index`，不要把调用结果赋给索引变量。
+
 语言不提供接受任意bool expression的`assume`，也不把alignment、contiguity、sorted/unique、shape equality或encoded-format validity作为优化hint。将来只有真实kernel无法由现有类型、relation和operations表达时才增加新的约束；新增项必须具有closed typed schema、明确违反语义以及唯一canonical KIR表示，不能成为开放式布尔断言或授权优化的hint。
