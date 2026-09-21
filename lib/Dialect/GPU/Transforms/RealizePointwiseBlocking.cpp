@@ -2994,7 +2994,14 @@ bool supportsCartesianPointwiseValueGraph(
         // control-flow terminator or effectful region cannot: promoting the
         // predicate/carry would change scalar program structure into a lane
         // program without a physical control-flow realization.
-        if (!isa<StoreOp>(user) || user->getNumRegions() != 0)
+        auto store = dyn_cast<StoreOp>(user);
+        if (!store || user->getNumRegions() != 0)
+          return false;
+        // Coarsening program ownership does not replicate local allocation
+        // instances. Keep those stores scalar until storage is made explicit.
+        if (auto buffer = dyn_cast<BufferType>(store.getResource().getType());
+            buffer && buffer.getScope().getValue() !=
+                          BufferScope::InvocationWorkspace)
           return false;
         continue;
       }
@@ -3064,7 +3071,12 @@ bool supportsStructuredFreeAxisValueGraph(
         continue;
       operations.push_back(user);
       if (user->getNumResults() == 0) {
-        if (!isa<StoreOp>(user) || user->getNumRegions() != 0)
+        auto store = dyn_cast<StoreOp>(user);
+        if (!store || user->getNumRegions() != 0)
+          return false;
+        if (auto buffer = dyn_cast<BufferType>(store.getResource().getType());
+            buffer && buffer.getScope().getValue() !=
+                          BufferScope::InvocationWorkspace)
           return false;
         continue;
       }
