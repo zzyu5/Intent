@@ -20,6 +20,20 @@ struct Domain { Value begin, end, step; int64_t dimension; std::optional<int64_t
 // An axis keeps its source extent even when only one execution slice is local.
 struct LocalAxis { Value extent, begin, count; int64_t capacity; };
 using LocalShape = SmallVector<LocalAxis, 2>;
+struct AccessAxes {
+  unsigned rank = 0, advancedRank = 0;
+  std::optional<unsigned> advancedStart;
+  SmallVector<int64_t> terms;
+};
+using AxisRequirements = SmallVector<bool, 4>;
+struct WorksetTiling {
+  DenseMap<Value, AxisRequirements> requirements;
+  SmallVector<Operation *> writes;
+};
+struct AffineIndices {
+  Value base;
+  SmallVector<Value> steps;
+};
 class Construction {
 public:
   Construction(ModuleOp original, ModuleOp target, dsa::ConfigurationAttr configuration, DictionaryAttr shapes)
@@ -159,7 +173,7 @@ private:
       value = values.lookupOrNull(source);
     }
     if (value && structured) if (auto tensor = dyn_cast<RankedTensorType>(source.getType())) {
-      value = projectTensor(source.getLoc(), tensor, value);
+      value = projectTensor(source.getLoc(), tensor, value, source);
       if (value) values.map(source, value);
     }
     return value;
@@ -215,6 +229,10 @@ private:
     return shape;
   }
   Type storageElement(Type type) { return type.isIndex() ? b.getI64Type() : type; }
+  FailureOr<LocalShape> localShape(Value value, Location loc) {
+    if (auto selected = valueSlices.find(value); selected != valueSlices.end()) return selected->second;
+    return localShape(cast<RankedTensorType>(value.getType()), loc);
+  }
   Value allocateTensor(Location loc, Type element, const LocalShape &shape) {
     int64_t rows = 1;
     for (unsigned axis = 0; axis + 1 < shape.size(); ++axis) rows *= shape[axis].capacity;
@@ -231,15 +249,17 @@ private:
     APInt lhs, rhs;
     return matchPattern(a, m_ConstantInt(&lhs)) && matchPattern(c, m_ConstantInt(&rhs)) && lhs == rhs;
   }
-  Value projectTensor(Location loc, RankedTensorType type, Value value) {
+  Value projectTensor(Location loc, RankedTensorType type, Value value, Value source = {}) {
     if (!localShapes.count(value)) return value;
     LocalShape original = localShapes.lookup(value), selected = original;
     auto ids = cast<TensorShapeAttr>(type.getEncoding()).getDimensions();
     bool changed = false;
+    auto planned = valueSlices.find(source);
     for (int64_t axis = 0; axis < type.getRank(); ++axis) {
       auto binding = axisBindings.find(ids[axis]);
-      if (type.getDimSize(axis) == 1 || binding == axisBindings.end()) continue;
-      const auto &current = original[axis], &required = binding->second;
+      if (type.getDimSize(axis) == 1 || (planned == valueSlices.end() && binding == axisBindings.end())) continue;
+      const auto &current = original[axis];
+      const auto &required = planned == valueSlices.end() ? binding->second : planned->second[axis];
       if (current.capacity == required.capacity && sameIndex(current.begin, required.begin) && sameIndex(current.count, required.count)) continue;
       if (!matchPattern(current.begin, m_Zero()) || !sameIndex(current.count, current.extent) || !sameIndex(current.extent, required.extent)) {
         emitError(loc, "DSA cached tensor projection requires an available complete logical axis"); return {};
@@ -339,7 +359,7 @@ private:
     Location loc = op->getLoc();
     Value result = op->getResult(0);
     auto type = cast<RankedTensorType>(result.getType());
-    auto shape = localShape(type, loc);
+    auto shape = localShape(result, loc);
     if (failed(shape)) return failure();
     if (auto matrix = dyn_cast<ContractOp>(op)) return localMatMul(matrix, *shape);
     if (auto indices = dyn_cast<IndicesOp>(op)) {
@@ -471,51 +491,130 @@ private:
     }
     values.map(matrix.getResult(), output); return success();
   }
-  FailureOr<std::pair<Value, Value>> affineIndex(Value original) {
+  bool constantTrue(Value value) {
+    Operation *op = value.getDefiningOp();
+    if (!op) return false;
+    if (isa<FullOp, BroadcastOp>(op)) return constantTrue(op->getOperand(0));
+    auto constant = dyn_cast<ConstantOp>(op);
+    auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue()) : IntegerAttr();
+    return integer && integer.getType().isInteger(1) && integer.getValue().isOne();
+  }
+  FailureOr<AffineIndices> affineIndex(Value original) {
     Location loc = original.getLoc();
     auto type = dyn_cast<RankedTensorType>(original.getType());
     if (!type) {
       Value scalar = asIndex(get(original), loc);
       if (!scalar) return failure();
-      return std::make_pair(scalar, index(loc, 0));
+      return AffineIndices{scalar, {}};
     }
-    if (type.getRank() != 1 || (!type.getElementType().isIndex() && !type.getElementType().isInteger(64))) return failure();
+    if (!type.getElementType().isIndex() && !type.getElementType().isInteger(64)) return failure();
     if (auto indices = original.getDefiningOp<IndicesOp>()) {
       if (!bindDomain(indices.getSource())) return failure();
       Domain domain = domains.lookup(indices.getSource());
-      return std::make_pair(domain.begin, domain.step);
+      return AffineIndices{domain.begin, {domain.step}};
     }
     Operation *op = original.getDefiningOp();
     if (!op) return failure();
     if (isa<BroadcastOp, FullOp>(op)) {
       auto source = affineIndex(op->getOperand(0));
       if (failed(source)) return failure();
+      AffineIndices result{source->base, SmallVector<Value>(type.getRank(), index(loc, 0))};
       if (auto input = dyn_cast<RankedTensorType>(op->getOperand(0).getType())) {
-        Value size = extent(input, 0, loc);
-        if (size && matchPattern(size, m_One())) source->second = index(loc, 0);
+        if (input.getRank() > type.getRank()) return failure();
+        unsigned leading = type.getRank() - input.getRank();
+        for (unsigned axis = 0; axis < input.getRank(); ++axis) {
+          if (singletonAxis(input, axis)) continue;
+          if (!equalAxisExtent(input, axis, type, leading + axis)) return failure();
+          result.steps[leading + axis] = source->steps[axis];
+        }
       }
-      return source;
+      return result;
     }
     if (auto cast = dyn_cast<CastOp>(op)) {
       auto input = dyn_cast<RankedTensorType>(cast.getInput().getType());
       if (!input || (!input.getElementType().isIndex() && !input.getElementType().isInteger(64))) return failure();
       return affineIndex(cast.getInput());
     }
+    if (auto transpose = dyn_cast<TransposeOp>(op)) {
+      auto source = affineIndex(transpose.getInput());
+      if (failed(source)) return failure();
+      AffineIndices result{source->base, {}};
+      for (Attribute axis : transpose.getPermutation()) result.steps.push_back(source->steps[cast<IntegerAttr>(axis).getInt()]);
+      return result;
+    }
+    if (auto gather = dyn_cast<GatherOp>(op)) {
+      if (auto valid = op->getAttrOfType<IntegerAttr>("valid_operand_index"))
+        if (!constantTrue(op->getOperand(valid.getInt()))) return failure();
+      auto relation = analysis.indexRelation(gather);
+      if (failed(relation)) return failure();
+      auto source = affineIndex(relation->source);
+      if (failed(source)) return failure();
+      auto axes = accessAxes(*relation);
+      AffineIndices result{source->base, SmallVector<Value>(type.getRank(), index(loc, 0))};
+      for (auto [position, term] : llvm::enumerate(relation->terms)) {
+        if (term.kind == 1) continue;
+        if (!term.sourceAxis) return failure();
+        Value coefficient = source->steps[*term.sourceAxis];
+        if (term.kind == 0) result.steps[axes.terms[position]] = coefficient;
+        else if (term.kind == 4) {
+          if (!bindDomain(term.operands.front())) return failure();
+          Domain domain = domains.lookup(term.operands.front());
+          result.base = add(loc, result.base, mul(loc, coefficient, domain.begin));
+          result.steps[axes.terms[position]] = mul(loc, coefficient, domain.step);
+        } else if (term.kind == 2) {
+          int64_t literal = *term.staticValues.front();
+          Value coordinate = index(loc, literal);
+          if (literal < 0) {
+            Value size = extent(cast<RankedTensorType>(relation->source.getType()), *term.sourceAxis, loc);
+            if (!size) return failure();
+            coordinate = add(loc, size, coordinate);
+          }
+          result.base = add(loc, result.base, mul(loc, coefficient, coordinate));
+        } else return failure();
+      }
+      return result;
+    }
     auto binary = dyn_cast<BinaryOp>(op);
     if (!binary) return failure();
     auto lhs = affineIndex(binary.getLhs()), rhs = affineIndex(binary.getRhs());
     if (failed(lhs) || failed(rhs)) return failure();
-    if (binary.getOperatorKind() == BinaryOperator::Add)
-      return std::make_pair(add(loc, lhs->first, rhs->first), add(loc, lhs->second, rhs->second));
-    if (binary.getOperatorKind() == BinaryOperator::Subtract)
-      return std::make_pair(sub(loc, lhs->first, rhs->first), sub(loc, lhs->second, rhs->second));
+    if (lhs->steps.empty()) lhs->steps.assign(type.getRank(), index(loc, 0));
+    if (rhs->steps.empty()) rhs->steps.assign(type.getRank(), index(loc, 0));
+    if (lhs->steps.size() != type.getRank() || rhs->steps.size() != type.getRank()) return failure();
+    AffineIndices result{Value(), SmallVector<Value>(type.getRank())};
+    if (binary.getOperatorKind() == BinaryOperator::Add || binary.getOperatorKind() == BinaryOperator::Subtract) {
+      bool plus = binary.getOperatorKind() == BinaryOperator::Add;
+      result.base = plus ? add(loc, lhs->base, rhs->base) : sub(loc, lhs->base, rhs->base);
+      for (unsigned axis = 0; axis < type.getRank(); ++axis)
+        result.steps[axis] = plus ? add(loc, lhs->steps[axis], rhs->steps[axis]) : sub(loc, lhs->steps[axis], rhs->steps[axis]);
+      return result;
+    }
     if (binary.getOperatorKind() == BinaryOperator::Multiply) {
-      if (matchPattern(lhs->second, m_Zero()))
-        return std::make_pair(mul(loc, lhs->first, rhs->first), mul(loc, lhs->first, rhs->second));
-      if (matchPattern(rhs->second, m_Zero()))
-        return std::make_pair(mul(loc, lhs->first, rhs->first), mul(loc, lhs->second, rhs->first));
+      auto uniform = [](const AffineIndices &map) { return llvm::all_of(map.steps, [](Value step) { return matchPattern(step, m_Zero()); }); };
+      const AffineIndices *variable = nullptr; Value factor;
+      if (uniform(*lhs)) { variable = &*rhs; factor = lhs->base; }
+      else if (uniform(*rhs)) { variable = &*lhs; factor = rhs->base; }
+      if (variable) {
+        result.base = mul(loc, lhs->base, rhs->base);
+        for (unsigned axis = 0; axis < type.getRank(); ++axis) result.steps[axis] = mul(loc, factor, variable->steps[axis]);
+        return result;
+      }
     }
     return failure();
+  }
+  AccessAxes accessAxes(const IndexRelationFact &relation) {
+    AccessAxes axes;
+    for (const auto &term : relation.terms) if (term.kind == 3)
+      if (auto indices = dyn_cast<RankedTensorType>(term.operands.front().getType()))
+        axes.advancedRank = std::max<unsigned>(axes.advancedRank, indices.getRank());
+    for (const auto &term : relation.terms) {
+      if (term.kind == 3 && isa<RankedTensorType>(term.operands.front().getType())) {
+        if (!axes.advancedStart) { axes.advancedStart = axes.rank; axes.rank += axes.advancedRank; }
+        axes.terms.push_back(*axes.advancedStart);
+      } else if (term.kind == 0 || term.kind == 1 || term.kind == 4 || term.kind == 5) axes.terms.push_back(axes.rank++);
+      else axes.terms.push_back(-1);
+    }
+    return axes;
   }
   LogicalResult tensorAccess(Operation *op) {
     auto relation = analysis.indexRelation(op);
@@ -529,7 +628,7 @@ private:
     auto tensor = dyn_cast<RankedTensorType>(original.getType());
     LocalShape shape;
     if (tensor) {
-      auto selected = localShape(tensor, loc);
+      auto selected = localShape(original, loc);
       if (failed(selected)) return failure();
       shape = *selected;
     }
@@ -541,19 +640,11 @@ private:
     Value fill = fillIndex ? get(op->getOperand(fillIndex.getInt())) : Value();
     if ((validIndex && !valid) || (fillIndex && !fill)) return op->emitError("DSA access predicate or fill is unavailable");
 
-    unsigned advancedRank = 0, resultAxis = 0;
-    for (const auto &term : relation->terms) if (term.kind == 3)
-      if (auto indices = dyn_cast<RankedTensorType>(term.operands.front().getType())) advancedRank = std::max<unsigned>(advancedRank, indices.getRank());
-    std::optional<unsigned> advancedStart;
-    SmallVector<int64_t> outputAxes;
-    for (const auto &term : relation->terms) {
-      if (term.kind == 3 && isa<RankedTensorType>(term.operands.front().getType())) {
-        if (!advancedStart) { advancedStart = resultAxis; resultAxis += advancedRank; }
-        outputAxes.push_back(*advancedStart);
-      } else if (term.kind == 0 || term.kind == 1 || term.kind == 4 || term.kind == 5) outputAxes.push_back(resultAxis++);
-      else outputAxes.push_back(-1);
-    }
-    if (resultAxis != shape.size()) return op->emitError("DSA index relation requires rank-one basic regions and a broadcasted advanced-index group");
+    auto axes = accessAxes(*relation);
+    unsigned advancedRank = axes.advancedRank;
+    auto advancedStart = axes.advancedStart;
+    const auto &outputAxes = axes.terms;
+    if (axes.rank != shape.size()) return op->emitError("DSA index relation requires rank-one basic regions and a broadcasted advanced-index group");
     auto sourceExtent = [&](unsigned axis) -> Value {
       if (!external) return localShapes.lookup(source)[axis].extent;
       auto buffer = cast<MemRefType>(source.getType());
@@ -567,11 +658,11 @@ private:
     // Rectangular external accesses preserve arbitrary view strides. Their
     // selected origins and tails are explicit before BANG C serialization.
     bool rectangle = external && !validIndex && tensor && shape.size() <= 2;
-    DenseMap<Value, std::pair<Value, Value>> affine;
+    DenseMap<Value, AffineIndices> affine;
     for (const auto &term : relation->terms) {
       rectangle &= term.kind >= 0 && term.kind <= 4;
       if (term.kind == 3 && isa<RankedTensorType>(term.operands.front().getType())) {
-        auto coordinate = advancedRank == 1 ? affineIndex(term.operands.front()) : FailureOr<std::pair<Value, Value>>(failure());
+        auto coordinate = affineIndex(term.operands.front());
         if (failed(coordinate)) rectangle = false;
         else affine[term.operands.front()] = *coordinate;
       }
@@ -587,8 +678,15 @@ private:
         if (term.kind == 2) coordinate = staticCoordinate(term);
         else if (term.kind == 3) {
           if (auto found = affine.find(term.operands.front()); found != affine.end()) {
-            coordinate = add(loc, found->second.first, mul(loc, shape[outputAxis].begin, found->second.second));
-            strides[outputAxis] = add(loc, strides[outputAxis], mul(loc, step, found->second.second));
+            coordinate = found->second.base;
+            auto type = cast<RankedTensorType>(term.operands.front().getType());
+            for (unsigned axis = 0; axis < type.getRank(); ++axis) {
+              if (singletonAxis(type, axis)) continue;
+              unsigned mapped = *advancedStart + advancedRank - type.getRank() + axis;
+              Value coefficient = found->second.steps[axis];
+              coordinate = add(loc, coordinate, mul(loc, shape[mapped].begin, coefficient));
+              strides[mapped] = add(loc, strides[mapped], mul(loc, step, coefficient));
+            }
           } else coordinate = asIndex(get(term.operands.front()), loc);
         }
         else {
@@ -1073,6 +1171,217 @@ private:
     return status;
   }
 
+  bool singletonAxis(RankedTensorType type, unsigned axis) {
+    if (!type.isDynamicDim(axis)) return type.getDimSize(axis) == 1;
+    auto ids = cast<TensorShapeAttr>(type.getEncoding()).getDimensions();
+    Value size = dimensions.lookup(ids[axis]);
+    return size && matchPattern(size, m_One());
+  }
+  bool equalAxisExtent(RankedTensorType lhs, unsigned a, RankedTensorType rhs, unsigned c) {
+    if (!lhs.isDynamicDim(a) && !rhs.isDynamicDim(c)) return lhs.getDimSize(a) == rhs.getDimSize(c);
+    auto lhsIds = cast<TensorShapeAttr>(lhs.getEncoding()).getDimensions();
+    auto rhsIds = cast<TensorShapeAttr>(rhs.getEncoding()).getDimensions();
+    if (lhsIds[a] > 0 && lhsIds[a] == rhsIds[c]) return true;
+    Value l = dimensions.lookup(lhsIds[a]), r = dimensions.lookup(rhsIds[c]);
+    if (l && r && sameIndex(l, r)) return true;
+    APInt constant;
+    if (!lhs.isDynamicDim(a) && r && matchPattern(r, m_ConstantInt(&constant))) return constant.getSExtValue() == lhs.getDimSize(a);
+    if (!rhs.isDynamicDim(c) && l && matchPattern(l, m_ConstantInt(&constant))) return constant.getSExtValue() == rhs.getDimSize(c);
+    return false;
+  }
+  std::optional<WorksetTiling> planWorksetTiling(Block &block) {
+    WorksetTiling plan;
+    DenseSet<Value> written;
+    RankedTensorType outputType;
+    for (Operation &op : block.without_terminator()) {
+      if (op.getNumRegions()) return std::nullopt;
+      if (isa<ViewStoreOp, ScatterUniqueOp>(op)) {
+        auto relation = analysis.indexRelation(&op);
+        Value data = op.getOperand(op.getAttrOfType<IntegerAttr>("value_operand_index").getInt());
+        auto type = dyn_cast<RankedTensorType>(data.getType());
+        // Distinct writable views are disjoint in this target's launch ABI.
+        // Reordering separate writes to one view needs an effect-footprint proof.
+        if (failed(relation) || !type || !type.getRank() || !written.insert(relation->source).second) return std::nullopt;
+        if (outputType && !equalAxisExtent(outputType, 0, type, 0)) return std::nullopt;
+        if (!outputType) outputType = type;
+        plan.writes.push_back(&op);
+      } else if (auto load = dyn_cast<ViewLoadOp>(op)) {
+        if (cast<ViewType>(load.getInputs().front().getType()).getAccess() != 0) return std::nullopt;
+      } else if (!isMemoryEffectFree(&op) && !isa<AssumeInBoundsOp>(op)) return std::nullopt;
+    }
+    if (plan.writes.empty() || singletonAxis(outputType, 0)) return std::nullopt;
+    std::function<bool(Value, AxisRequirements)> require;
+    std::function<bool(Value)> scalar;
+    std::function<bool(Operation *, RankedTensorType, const AxisRequirements &)> access;
+    DenseSet<Value> scalarSeen;
+    scalar = [&](Value value) -> bool {
+      if (auto tensor = dyn_cast<RankedTensorType>(value.getType())) return require(value, AxisRequirements(tensor.getRank(), false));
+      if (components(value.getType())) return false;
+      if (!scalarSeen.insert(value).second || values.lookupOrNull(value)) return true;
+      Operation *op = value.getDefiningOp();
+      if (!op || isa<DimOp>(op)) return true;
+      if (op->getNumRegions()) return false;
+      if (auto load = dyn_cast<ViewLoadOp>(op)) {
+        if (cast<ViewType>(load.getInputs().front().getType()).getAccess() != 0) return false;
+      } else if (!isMemoryEffectFree(op) && !isa<DomainOp, SubregionOp>(op)) return false;
+      return llvm::all_of(op->getOperands(), scalar);
+    };
+    access = [&](Operation *op, RankedTensorType result, const AxisRequirements &requested) -> bool {
+      auto relation = analysis.indexRelation(op);
+      if (failed(relation)) return false;
+      auto axes = accessAxes(*relation);
+      if (axes.rank != requested.size()) return false;
+      auto local = dyn_cast<RankedTensorType>(relation->source.getType());
+      AxisRequirements sourceAxes(local ? local.getRank() : 0, false);
+      for (auto [position, term] : llvm::enumerate(relation->terms)) {
+        if (term.kind == 0 && local) sourceAxes[*term.sourceAxis] = requested[axes.terms[position]];
+        if (term.kind == 3 && isa<RankedTensorType>(term.operands.front().getType())) {
+          Value indices = term.operands.front();
+          auto type = cast<RankedTensorType>(indices.getType());
+          AxisRequirements indexAxes(type.getRank(), false);
+          for (unsigned axis = 0; axis < type.getRank(); ++axis) {
+            unsigned mapped = *axes.advancedStart + axes.advancedRank - type.getRank() + axis;
+            if (!singletonAxis(type, axis) && requested[mapped]) {
+              if (!equalAxisExtent(type, axis, result, mapped)) return false;
+              indexAxes[axis] = true;
+            }
+          }
+          if (!require(indices, indexAxes)) return false;
+        } else for (Value operand : term.operands) if (!scalar(operand)) return false;
+      }
+      // Nonlocal gathers retain the complete indexed source axis. Full slices
+      // project one result axis directly; inserted axes never consume a source axis.
+      if (local && !require(relation->source, sourceAxes)) return false;
+      for (StringRef attribute : {"valid_operand_index", "fill_operand_index"})
+        if (auto operand = op->getAttrOfType<IntegerAttr>(attribute)) {
+          Value value = op->getOperand(operand.getInt());
+          if (isa<RankedTensorType>(value.getType())) {
+            if (!require(value, requested)) return false;
+          } else if (!scalar(value)) return false;
+        }
+      return true;
+    };
+    require = [&](Value value, AxisRequirements requested) -> bool {
+      auto type = dyn_cast<RankedTensorType>(value.getType());
+      if (!type || requested.size() != type.getRank()) return false;
+      for (unsigned axis = 0; axis < requested.size(); ++axis)
+        if (singletonAxis(type, axis)) requested[axis] = false;
+      auto [entry, inserted] = plan.requirements.try_emplace(value, requested);
+      if (!inserted) return entry->second == requested;
+      // A pre-existing immutable SSA snapshot can be projected locally.
+      if (values.lookupOrNull(value)) return true;
+      Operation *op = value.getDefiningOp();
+      if (!op || op->getNumRegions()) return false;
+      if (isa<ViewLoadOp, GatherOp>(op)) {
+        if (auto load = dyn_cast<ViewLoadOp>(op))
+          if (cast<ViewType>(load.getInputs().front().getType()).getAccess() != 0) return false;
+        return access(op, type, requested);
+      }
+      if (!isMemoryEffectFree(op)) return false;
+      if (isa<IndicesOp, FullOp>(op)) return llvm::all_of(op->getOperands(), scalar);
+      if (auto broadcast = dyn_cast<BroadcastOp>(op)) {
+        Value input = broadcast->getOperand(0);
+        auto source = dyn_cast<RankedTensorType>(input.getType());
+        if (!source) return scalar(input);
+        if (source.getRank() > type.getRank()) return false;
+        AxisRequirements inputAxes(source.getRank(), false);
+        unsigned leading = type.getRank() - source.getRank();
+        for (unsigned axis = 0; axis < source.getRank(); ++axis)
+          if (requested[leading + axis] && !singletonAxis(source, axis)) {
+            if (!equalAxisExtent(source, axis, type, leading + axis)) return false;
+            inputAxes[axis] = true;
+          }
+        return require(input, inputAxes);
+      }
+      if (auto transpose = dyn_cast<TransposeOp>(op)) {
+        AxisRequirements inputAxes(type.getRank(), false);
+        for (auto [axis, perm] : llvm::enumerate(transpose.getPermutation())) inputAxes[cast<IntegerAttr>(perm).getInt()] = requested[axis];
+        return require(transpose.getInput(), inputAxes);
+      }
+      if (auto matrix = dyn_cast<ContractOp>(op)) {
+        auto lhs = cast<RankedTensorType>(matrix.getLhs().getType()), rhs = cast<RankedTensorType>(matrix.getRhs().getType());
+        AxisRequirements l(lhs.getRank(), false), r(rhs.getRank(), false);
+        DenseSet<unsigned> leftReduced, rightReduced, rightBatched;
+        DenseMap<unsigned, unsigned> batches;
+        for (Attribute entry : matrix.getReduce()) {
+          auto pair = cast<ArrayAttr>(entry);
+          leftReduced.insert(cast<IntegerAttr>(pair[0]).getInt()); rightReduced.insert(cast<IntegerAttr>(pair[1]).getInt());
+        }
+        for (Attribute entry : matrix.getBatch()) {
+          auto pair = cast<ArrayAttr>(entry);
+          unsigned a = cast<IntegerAttr>(pair[0]).getInt(), c = cast<IntegerAttr>(pair[1]).getInt();
+          batches[a] = c; rightBatched.insert(c);
+        }
+        unsigned resultAxis = 0;
+        for (unsigned axis = 0; axis < l.size(); ++axis) if (!leftReduced.contains(axis)) {
+          l[axis] = requested[resultAxis++];
+          if (batches.count(axis)) r[batches.lookup(axis)] = l[axis];
+        }
+        for (unsigned axis = 0; axis < r.size(); ++axis)
+          if (!rightReduced.contains(axis) && !rightBatched.contains(axis)) r[axis] = requested[resultAxis++];
+        return resultAxis == requested.size() && require(matrix.getLhs(), l) && require(matrix.getRhs(), r);
+      }
+      if (!isa<UnaryOp, BinaryOp, CompareOp, SelectOp, MaskOp, CastOp>(op)) return false;
+      for (Value input : op->getOperands()) {
+        if (isa<RankedTensorType>(input.getType())) {
+          if (!require(input, requested)) return false;
+        } else if (!scalar(input)) return false;
+      }
+      return true;
+    };
+    for (Operation *write : plan.writes) {
+      Value data = write->getOperand(write->getAttrOfType<IntegerAttr>("value_operand_index").getInt());
+      auto type = cast<RankedTensorType>(data.getType());
+      AxisRequirements requested(type.getRank(), false); requested[0] = true;
+      if (!require(data, requested) || !access(write, type, requested)) return std::nullopt;
+    }
+    for (Operation &op : block.without_terminator()) {
+      if (canDefer(&op) || isa<ViewStoreOp, ScatterUniqueOp, DimOp, AssumeInBoundsOp>(op)) continue;
+      for (Value result : op.getResults()) if (!scalar(result)) return std::nullopt;
+    }
+    return plan;
+  }
+  LogicalResult lowerTiledWorkset(Block &block, const WorksetTiling &plan) {
+    Location loc = block.getParentOp()->getLoc();
+    // Scalar bounds and readonly scalar inputs keep their original evaluation
+    // order. Tensor producers remain lazy until their selected slice is needed.
+    for (Operation &op : block.without_terminator()) {
+      if (canDefer(&op) || isa<ViewStoreOp, ScatterUniqueOp>(op)) continue;
+      if (failed(lowerOperation(&op))) return failure();
+    }
+    DenseMap<Value, LocalShape> complete;
+    Value size;
+    int64_t capacity = config.getTileM();
+    for (auto &entry : plan.requirements) {
+      auto shape = localShape(cast<RankedTensorType>(entry.first.getType()), loc);
+      if (failed(shape)) return failure();
+      for (unsigned axis = 0; axis < shape->size(); ++axis) if (entry.second[axis]) {
+        const auto &local = (*shape)[axis];
+        if (!matchPattern(local.begin, m_Zero()) || !sameIndex(local.extent, local.count))
+          return emitError(loc, "DSA workset tiling requires an available complete result axis");
+        if (size && !sameIndex(size, local.count)) return emitError(loc, "DSA coordinated tile axes have different extents");
+        size = local.count;
+        capacity = std::min(capacity, local.capacity);
+      }
+      complete[entry.first] = *shape;
+    }
+    if (!size) return emitError(loc, "DSA workset tiling has no selected result axis");
+    auto savedValues = values; auto savedProducts = products; auto savedSlices = valueSlices;
+    LogicalResult status = loop(loc, index(loc, 0), size, index(loc, capacity), [&](Value begin) {
+      Value count = b.create<arith::MinSIOp>(loc, sub(loc, size, begin), index(loc, capacity));
+      for (auto &entry : plan.requirements) {
+        LocalShape shape = complete.lookup(entry.first);
+        for (unsigned axis = 0; axis < shape.size(); ++axis)
+          if (entry.second[axis]) shape[axis] = {shape[axis].extent, begin, count, capacity};
+        valueSlices[entry.first] = std::move(shape);
+      }
+      for (Operation *write : plan.writes) if (failed(lowerOperation(write))) return failure();
+      return success();
+    });
+    values = std::move(savedValues); products = std::move(savedProducts); valueSlices = std::move(savedSlices);
+    return status;
+  }
+
   LogicalResult lowerStructuredBlock(Block &block) {
     for (Operation &op : block.without_terminator())
       if (auto scan = dyn_cast<ScanOp>(op); scan && canStreamScan(scan, block)) return streamScan(scan, block);
@@ -1081,7 +1390,10 @@ private:
       if (fold) return op.emitError("DSA multiple region folds in one workset need an explicit shared projection");
       fold = region;
     }
-    if (!fold) return lowerOperations(block);
+    if (!fold) {
+      if (auto plan = planWorksetTiling(block)) return lowerTiledWorkset(block, *plan);
+      return lowerOperations(block);
+    }
     auto sourceType = cast<RankedTensorType>(fold.getInputs().front().getType());
     auto sourceIds = cast<TensorShapeAttr>(sourceType.getEncoding()).getDimensions();
     int64_t query = 0;
@@ -2271,6 +2583,7 @@ private:
   DenseSet<Operation *> materializing;
   DenseMap<int64_t, LocalAxis> axisBindings;
   DenseMap<Value, LocalShape> localShapes;
+  DenseMap<Value, LocalShape> valueSlices;
   DenseSet<Operation *> streamedOperations;
   std::optional<LogicalWorksetFact> distributedWorkset;
   ParallelOp distributedRoot;
