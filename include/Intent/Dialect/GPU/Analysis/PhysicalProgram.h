@@ -50,6 +50,8 @@ bool isPhysicalReplayNode(mlir::Operation *operation,
 
 /// Includes writes in structured iterations entered between the read and use.
 /// ABI aliases are conservatively treated as potentially overlapping.
+/// Moving to an earlier anchor also requires the caller to make operands
+/// available there; this query only establishes memory stability.
 bool canReplayReadAt(LoadOp load, mlir::Operation *insertionAnchor);
 
 struct PhysicalAxisProjection {
