@@ -7,6 +7,7 @@ if [[ $# -lt 2 ]]; then
 fi
 
 provider=$1
+target=${INTENT_TARGET:-${provider}}
 output=$2
 shift 2
 
@@ -33,7 +34,6 @@ case "${provider}" in
   cutile)
     experiment=gpu
     default_python=/home/kingdom/.venvs/intentdsl-cutile/bin/python
-    tuning_config=${INTENT_TUNING_CONFIG:-${project_root}/experiments/gpu/providers/cutile/tuning.json}
     ;;
   tilelang)
     experiment=gpu
@@ -53,6 +53,10 @@ case "${provider}" in
     exit 2
     ;;
 esac
+if [[ "${target}" == cutile ]]; then
+  tuning_config=${INTENT_TUNING_CONFIG:-${project_root}/experiments/gpu/providers/cutile/tuning.json}
+  default_python=/home/kingdom/.venvs/intentdsl-cutile/bin/python
+fi
 
 cmake_arguments=()
 if [[ -n "${INTENT_WEFT_SOURCE_DIR:-}" ]]; then
@@ -73,6 +77,7 @@ cmake --build "${build_root}" --target intent-compile --parallel "${INTENT_BUILD
 
 arguments=(
   "${provider}"
+  --target "${target}"
   --compiler "${build_root}/tools/intent-compile/intent-compile"
   --output "${output}"
   --jobs "${INTENT_BENCHMARK_JOBS:-4}"

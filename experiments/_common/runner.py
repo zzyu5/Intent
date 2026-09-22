@@ -97,7 +97,7 @@ def _write_stage(path: Path, stage: str) -> None:
 
 def _run_entry(
     provider: str, compiler: str, entry, compiler_timeout: int,
-    tuning_config: Path | None, before_benchmark,
+    tuning_config: Path | None, before_benchmark, *, target: str,
 ) -> ResultRow:
     report_stage("device_setup")
     if provider == "mojo":
@@ -110,7 +110,7 @@ def _run_entry(
     context = Context(
         compiler=compiler,
         project_root=project_root,
-        target=_target(provider, entry),
+        target=_target(target, entry),
         provider=provider,
         compiler_timeout_seconds=compiler_timeout,
         tuning_config=tuning_config,
@@ -153,6 +153,8 @@ def _run_entry(
     if provider == "mojo":
         settings = ", ".join(f"{name}={os.environ.get(name, 'unset')}" for name in CPU_WAIT_ENVIRONMENT)
         comparison = replace(comparison, note=comparison.note + " CPU idle wait: " + settings + ".")
+    if target != provider:
+        comparison = replace(comparison, note=f"Intent target={target}; source corpus={provider}. " + comparison.note)
     try:
         generated_p50, source_p50 = evaluate(
             comparison, before_benchmark=before_benchmark,
@@ -270,6 +272,7 @@ def _run_batch(arguments, indexes, publish) -> None:
                     "--worker-kernel", entry.kernel, "--worker-case", entry.case,
                     "--wait-for-benchmark",
                     "--cutile-compiler-timeout", str(arguments.cutile_compiler_timeout),
+                    "--target", arguments.target,
                 ]
                 if arguments.tuning_config is not None:
                     command.extend(("--tuning-config", str(arguments.tuning_config)))
@@ -333,6 +336,8 @@ def _run_batch(arguments, indexes, publish) -> None:
 def main(*, providers: tuple[str, ...] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("provider", choices=sorted(BY_PROVIDER if providers is None else providers))
+    parser.add_argument("--target", choices=sorted(BY_PROVIDER),
+                        help="generated Intent backend; defaults to the source corpus provider")
     parser.add_argument("--compiler", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--kernel", action="append")
@@ -358,6 +363,9 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
         arguments.tuning_config = arguments.tuning_config.resolve(strict=True)
 
     provider = arguments.provider
+    arguments.target = arguments.target or provider
+    if arguments.target != provider and {arguments.target, provider} != {"triton", "cutile"}:
+        parser.error("cross-backend comparisons currently support Triton and cuTile corpora")
     selected = set(arguments.kernel or ())
     entries = tuple(
         entry
@@ -379,7 +387,7 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
         phase_path = arguments.output.with_suffix(".phase.json")
         with observe_stages(lambda stage: _write_stage(phase_path, stage)):
             compile_budget = nullcontext()
-            if provider == "cutile":
+            if "cutile" in {provider, arguments.target}:
                 report_stage("provider_compiler_setup")
                 import cuda.tile as ct
                 compile_budget = ct.compiler_timeout(arguments.cutile_compiler_timeout)
@@ -388,6 +396,7 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
                     provider, arguments.compiler, entry, arguments.cutile_compiler_timeout,
                     arguments.tuning_config,
                     _wait_for_benchmark if arguments.wait_for_benchmark else None,
+                    target=arguments.target,
                 )])
         return
 

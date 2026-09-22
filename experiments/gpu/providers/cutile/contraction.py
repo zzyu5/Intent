@@ -20,6 +20,7 @@ from experiments._common.model import PreparedLaunch
 from experiments._common.model import Tolerance
 from .common import contraction_configs
 from .common import official_source
+from .common import source_tuning_artifact
 from .common import tilegym_source
 
 
@@ -45,6 +46,7 @@ def block_scaled_gemm(context: Context) -> PreparedComparison:
         rhs_scale.view(torch.uint8),
     )
     artifact, generated = compile_single(context, block_scaled_matmul, arguments)
+    artifact = source_tuning_artifact(context, artifact, block_scaled_matmul)
     configs = contraction_configs(
         artifact, (*arguments, generated.outputs()),
         m_axis=(0, 0), n_axis=(2, 2), k_axis=(0, 1), fixed_options={},
@@ -75,6 +77,7 @@ def dense_gemm(context: Context) -> PreparedComparison:
             (a, b),
             constexprs={"ACTIVATION": Activation.NONE},
         )
+    artifact = source_tuning_artifact(context, artifact, gemm, constexprs={"ACTIVATION": Activation.NONE})
     configs = contraction_configs(
         artifact, (a, b, generated.outputs()),
         m_axis=(0, 0), n_axis=(1, 1), k_axis=(0, 1), fixed_options={},
@@ -103,6 +106,7 @@ def tilegym_dense_gemm(context: Context) -> PreparedComparison:
     b = torch.randn((k, n), device="cuda", dtype=torch.bfloat16)
     with ct.compiler_timeout(context.compiler_timeout_seconds):
         artifact, generated = compile_single(context, bf16_gemm, (a, b))
+    artifact = source_tuning_artifact(context, artifact, bf16_gemm)
     configurations = contraction_configs(
         artifact, (a, b, generated.outputs()),
         m_axis=(0, 0), n_axis=(1, 1), k_axis=(0, 1), fixed_options={},
@@ -142,6 +146,7 @@ def batched_gemm(context: Context) -> PreparedComparison:
     b = torch.randn((batch, k, n), device="cuda", dtype=torch.bfloat16)
     with ct.compiler_timeout(context.compiler_timeout_seconds):
         artifact, generated = compile_single(context, batched_gemm_nn, (a, b))
+    artifact = source_tuning_artifact(context, artifact, batched_gemm_nn)
     configs = contraction_configs(
         artifact, (a, b, generated.outputs()),
         m_axis=(0, 1), n_axis=(1, 2), k_axis=(0, 2), batch_axis=(0, 0),

@@ -28,12 +28,12 @@ def revision(directory: Path) -> str:
     return subprocess.check_output(["git", "-C", str(directory), "rev-parse", "HEAD"], text=True).strip()
 
 
-def run_benchmark(arguments, task, program, language, result_path, *, artifacts=None) -> dict:
+def run_benchmark(arguments, task, program, language, result_path, *, artifacts=None, target="triton") -> dict:
     phase_read, phase_write = os.pipe()
     command = [sys.executable, "-B", "-m", "experiments.agent_tritonbench.benchmark", "--reference", str(arguments.reference),
                "--compiler", str(arguments.compiler), "--task", task, "--program", str(program),
                "--language", language, "--result", str(result_path), "--gpu-lock", str(arguments.gpu_lock),
-               "--suite", str(arguments.suite_path), "--phase-fd", str(phase_write)]
+               "--suite", str(arguments.suite_path), "--phase-fd", str(phase_write), "--target", target]
     if artifacts is not None:
         command.extend(("--artifacts", str(artifacts)))
     with os.fdopen(phase_read, "rb", buffering=0) as phases, tempfile.TemporaryFile(mode="w+") as log:

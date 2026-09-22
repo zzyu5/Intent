@@ -19,6 +19,7 @@ from experiments._common.model import PreparedComparison
 from experiments._common.model import PreparedLaunch
 from experiments._common.model import Tolerance
 from .common import tilegym_source
+from .common import source_tuning_artifact
 
 
 def recurrent_gated_delta(context: Context) -> PreparedComparison:
@@ -45,6 +46,8 @@ def recurrent_gated_delta(context: Context) -> PreparedComparison:
         (query, key, value, gate, beta, scale),
         constexprs={"HEAD_GROUP": 1},
     )
+    artifact = source_tuning_artifact(context, artifact, recurrent_gated_delta_fwd,
+                                    constexprs={"HEAD_GROUP": 1})
     report_stage("generated_tuning_metadata")
     try:
         configurations = artifact.tuning_configurations(

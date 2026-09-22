@@ -3,12 +3,26 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import intent
 from intent.runtime.artifact import ParameterRole
 
 from experiments._common.loading import load_module
 from experiments._common.measurement import PipelineStageError
 from experiments._common.measurement import report_stage
 from experiments._common.model import Context
+
+
+def source_tuning_artifact(context: Context, artifact, definition, *, constexprs=None):
+    if isinstance(context.target, intent.CuTileTarget):
+        return artifact
+    # Preserve the original cuTile source's candidate binding when only the
+    # generated backend changes. This artifact supplies metadata, not a launch.
+    report_stage("source_candidate_compilation")
+    return intent.compile(
+        definition, target=intent.CuTileTarget(device=context.target.device),
+        compiler=context.compiler, constexprs=constexprs,
+        tuning_config=context.project_root / "experiments/gpu/providers/cutile/tuning.json",
+    )
 
 
 def contraction_configs(
@@ -28,8 +42,8 @@ def contraction_configs(
             configuration.parameters, configuration.values, strict=True,
         ):
             role, axis = parameter.role, parameter.view_axis
-            if role == ParameterRole.PROVIDER_LOAD_POLICY:
-                # Source kernels retain their own load scheduling policy.
+            if role in (ParameterRole.PROVIDER_LOAD_POLICY, ParameterRole.PROVIDER_WARPS):
+                # Source kernels retain their own load and worker scheduling.
                 continue
             elif role == ParameterRole.PROVIDER_ACCESS_FORM:
                 field = "ACCESS_FORM"

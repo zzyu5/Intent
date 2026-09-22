@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import ast
+import io
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import intent
 from intent.runtime.artifact import CompiledArtifact
 from intent.runtime.source import materialize_python_source
+from intent.runtime.cutile import materialize_cutile_artifact
 from intent.runtime.triton import materialize_triton_artifact, TuningHooks
-from intent.targets import TritonTarget
+from intent.targets import CuTileTarget, TritonTarget
 import triton
 from triton.compiler.errors import CompileTimeAssertionFailure
 from triton.runtime.autotuner import Autotuner
@@ -22,12 +25,17 @@ from experiments._common.loading import load_module
 
 
 class ProgramContext:
-    def __init__(self, compiler: Path, directory: Path, *, language: str, keep_ir: bool = False):
+    def __init__(self, compiler: Path, directory: Path, *, language: str,
+                 target: str = "triton", keep_ir: bool = False):
         self.compiler = compiler
         self.directory = directory
         self.language = language
+        self.target = {"triton": TritonTarget, "cutile": CuTileTarget}[target]()
+        self.target_name = target
         self.keep_ir = keep_ir
         self.generated: dict[str, CompiledArtifact] = {}
+        self.tuning: list[dict] = []
+        self.precompile_failures: list[dict] = []
 
     def compile(self, name: str, definition, *, constexprs=None):
         if self.language != "intent":
@@ -35,20 +43,107 @@ class ProgramContext:
         if not name.isidentifier() or name in self.generated:
             raise ValueError("each compile() needs a distinct literal identifier")
         try:
-            program = intent.generate(definition, target=TritonTarget(), compiler=self.compiler,
+            program = intent.generate(definition, target=self.target, compiler=self.compiler,
                                       constexprs=constexprs)
         except intent.CompilationStageError as error:
             if error.stage in {"provider_lowering", "provider_program_verification", "serialization"}:
                 shared = intent.compile_shared_gpu(
-                    definition, target=TritonTarget(), compiler=self.compiler, constexprs=constexprs)
+                    definition, target=self.target, compiler=self.compiler, constexprs=constexprs)
                 (self.directory / f"{name}.shared.mlir").write_text(shared)
             raise
         (self.directory / f"{name}.py").write_text(program.source)
         if self.keep_ir:
             (self.directory / f"{name}.mlir").write_text(program.ir)
-        artifact = materialize_triton_artifact(program.source, program.ir, definition.__name__, 0)
+        materialize = {"triton": materialize_triton_artifact, "cutile": materialize_cutile_artifact}[self.target_name]
+        artifact = materialize(program.source, program.ir, definition.__name__, 0)
+        if self.target_name == "cutile":
+            search = artifact._namespace["exhaustive_search"]
+
+            def record_search(configs, *args, **kwargs):
+                result = search(configs, *args, **kwargs)
+                self.tuning.append({"kernel": name, "declared": len(configs),
+                                    "measured": len(result.successes),
+                                    "failures": [(str(cfg), kind, message) for cfg, kind, message in result.failures],
+                                    "winner": str(result.best.config)})
+                return result
+
+            artifact._namespace["exhaustive_search"] = record_search
+
+            def trusted_runtime(function):
+                def invoke(*args, **kwargs):
+                    # Compiler-owned trial buffers may copy state. Candidate
+                    # host code remains under CandidateTorchPolicy.
+                    with _disable_current_modes():
+                        return function(*args, **kwargs)
+                return invoke
+
+            artifact._launcher = trusted_runtime(artifact._launcher)
+            artifact._runner = trusted_runtime(artifact._runner)
         self.generated[name] = artifact
         return artifact
+
+    @contextmanager
+    def compilation_only(self):
+        import cuda.tile as ct
+        from cuda.tile.compilation import CallingConvention, KernelSignature, export_kernel
+        import torch
+
+        major, minor = torch.cuda.get_device_capability(self.target.device)
+        gpu_code = f"sm_{major}{minor}"
+
+        def compile_kernel(stream, grid, kernel, arguments):
+            # Generated kernels have the view/scalar ABI. Match cuTile's JIT
+            # convention for static array dimensions, including rank-zero views.
+            static_arrays = any(annotation.array is not None and annotation.array.static_shape_dims
+                                for annotation in kernel._annotated_function.parameter_annotations)
+            convention = (CallingConvention.cutile_python_v2() if static_arrays
+                          else CallingConvention.cutile_python_v1())
+            signature = KernelSignature.from_kernel_args(kernel, arguments, convention)
+            export_kernel(kernel, (signature,), io.BytesIO(), gpu_code=gpu_code, output_format="cubin")
+
+        def compile_search(configs, stream, grid_fn, kernel, args_fn, hints_fn=None, **kwargs):
+            first = None
+            last_error = None
+            for config in configs:
+                candidate = kernel.replace_hints(**(hints_fn(config) if hints_fn else {}))
+                try:
+                    compile_kernel(stream, grid_fn(config), candidate, args_fn(config))
+                except ct.TileError as error:
+                    last_error = error
+                    self.precompile_failures.append({"kernel": kernel._pyfunc.__name__,
+                                                     "config": str(config), "error": str(error)})
+                    continue
+                if first is None:
+                    first = config
+            if first is None:
+                raise RuntimeError("no cuTile configuration compiled for the current device") from last_error
+            # The compiler-only invocation never runs this configuration or
+            # publishes a winner. Native tuning runs after restoring the cache.
+            return SimpleNamespace(best=SimpleNamespace(config=first))
+
+        class CompilationState:
+            def __init__(self, views, writable):
+                self.views = views
+
+            def arguments(self, arguments):
+                return arguments
+
+        original_launch = ct.launch
+        saved = []
+        for artifact in self.generated.values():
+            namespace = artifact._namespace
+            saved.append((namespace, namespace["TuningState"], namespace["exhaustive_search"]))
+            namespace["TuningState"] = CompilationState
+            namespace["exhaustive_search"] = compile_search
+        ct.launch = compile_kernel
+        try:
+            yield
+        finally:
+            ct.launch = original_launch
+            for namespace, state, search in saved:
+                namespace["TuningState"] = state
+                namespace["exhaustive_search"] = search
+                namespace["_TUNE_CACHE"].clear()
 
     def save_backend_ir(self, executed):
         if not self.keep_ir:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 import fcntl
 import json
 import os
@@ -78,6 +78,7 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
     timing = arguments.timing or task.get("timing", suite["timing"])
     cuda_graph = timing == "cuda_graph"
     result = {"status": "pending", "candidate_ms": None, "reference_ms": None, "ratio": None,
+              "target": arguments.target,
               "reference_timing_note": None,
               "timing": timing, "tolerance": suite["tolerances"][task["tolerance"]]}
     def source_timing_error(error: Exception) -> bool:
@@ -100,6 +101,7 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
     artifact_directory = arguments.artifacts or arguments.program.parent
     artifact_directory.mkdir(parents=True, exist_ok=True)
     context = ProgramContext(arguments.compiler, artifact_directory, language=arguments.language,
+                             target=arguments.target,
                              keep_ir=arguments.artifacts is not None)
     try:
         candidate_call = invocation(arguments.reference, row, task, suite, device="cpu")
@@ -107,7 +109,11 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
         reference_function = reference(arguments.reference, row)
         stage = "candidate_load"
         report_stage(stage)
-        with budget:
+        provider_budget = nullcontext()
+        if arguments.target == "cutile":
+            import cuda.tile as ct
+            provider_budget = ct.compiler_timeout(arguments.cutile_compiler_timeout)
+        with budget, provider_budget:
             with CandidateTorchPolicy():
                 module = load_program(arguments.program, language=arguments.language)
                 stage = "candidate_build"
@@ -126,7 +132,9 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
             stage = "candidate_precompile"
             report_stage(stage)
             compile_started = time.monotonic()
-            with budget.compilation_only(), CandidateTorchPolicy():
+            preparation = (budget.compilation_only() if arguments.target == "triton"
+                           else context.compilation_only())
+            with preparation, CandidateTorchPolicy():
                 candidate_call.call(function)
             result["precompile_seconds"] = time.monotonic() - compile_started
             result["preparation_policy"] = "compile_only_before_gpu_timing_lock"
@@ -152,13 +160,16 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
         while cause is not None:
             causes.append(cause)
             cause = cause.__cause__
-        if any(isinstance(cause, ModuleNotFoundError) and cause.name.split(".")[0] in {"mlir", "torch", "triton", "intent"} for cause in causes):
+        if any(isinstance(cause, ModuleNotFoundError) and cause.name.split(".")[0] in {"mlir", "torch", "triton", "intent", "cuda"} for cause in causes):
             status = "benchmark_environment_failure"
         elif isinstance(error, NumericalComparisonError):
             status = "numerical_failure"
         elif isinstance(error, PipelineStageError) and error.stage.startswith("source_"):
             status, stage = "reference_failure", error.stage
-        elif arguments.language == "intent" and any(isinstance(cause, (CompilationError, CompileTimeAssertionFailure, OutOfResources, PTXASError)) for cause in causes):
+        elif arguments.language == "intent" and (
+            any(isinstance(cause, (CompilationError, CompileTimeAssertionFailure, OutOfResources, PTXASError)) for cause in causes)
+            or arguments.target == "cutile" and any(isinstance(cause, ct.TileError) for cause in causes)
+        ):
             status, stage = "compilation_failure", "provider_compilation"
         elif isinstance(error, PipelineStageError):
             stage = error.stage
@@ -169,8 +180,8 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
         else:
             status = "reference_failure" if stage == "reference_preparation" else "agent_program_error"
         result.update(status=status, failure_stage=stage, error=str(error), traceback=traceback.format_exc())
-    result["precompile_failures"] = budget.precompile_failures
-    result["tuning"] = budget.records()
+    result["precompile_failures"] = budget.precompile_failures + context.precompile_failures
+    result["tuning"] = context.tuning if arguments.target == "cutile" else budget.records()
     result["preparation_and_benchmark_seconds"] = time.monotonic() - started
     return result
 
@@ -182,6 +193,9 @@ def main() -> None:
     parser.add_argument("--task", required=True)
     parser.add_argument("--program", type=Path, required=True)
     parser.add_argument("--language", choices=("intent", "triton"), required=True)
+    parser.add_argument("--target", choices=("triton", "cutile"), default="triton",
+                        help="backend for the unchanged Intent submission")
+    parser.add_argument("--cutile-compiler-timeout", type=int, default=15)
     parser.add_argument("--result", type=Path, required=True)
     parser.add_argument("--gpu-lock", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, help="Separate compiler recheck artifacts from an existing submission")
@@ -191,6 +205,10 @@ def main() -> None:
     parser.add_argument("--timing", choices=("cuda_graph", "cuda_event"),
                         help="Override the task's paired candidate/reference timing path")
     arguments = parser.parse_args()
+    if arguments.language != "intent" and arguments.target != "triton":
+        parser.error("only Intent submissions can select a different backend")
+    if arguments.cutile_compiler_timeout <= 0:
+        parser.error("--cutile-compiler-timeout must be positive")
     with redirect_stdout(sys.stderr):
         if arguments.phase_fd is None:
             result = run(arguments, suite_path=arguments.suite)
