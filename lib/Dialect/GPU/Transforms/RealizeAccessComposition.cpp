@@ -1236,6 +1236,172 @@ FailureOr<bool> composeIdentityFragmentGather(GatherOp gather) {
   return true;
 }
 
+FailureOr<bool> composeReductionGathers(ReduceOp reduce) {
+  if (reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 ||
+      reduce.getCaptureCount() != 0 || reduce.getNumResults() != 1 ||
+      reduce.getAxes() != ArrayRef<int64_t>{0})
+    return false;
+  Value input = reduce.getInputs().front();
+  auto schema = dyn_cast<FragmentType>(input.getType());
+  auto result = dyn_cast<FragmentType>(reduce.getResult(0).getType());
+  if (!schema || schema.getShape().size() != 1 ||
+      (result && !result.getShape().empty()))
+    return false;
+  auto extent = cast<PhysicalExprAttr>(schema.getShape()[0]);
+  int64_t size = extent.getValue();
+  if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+      size <= 0 || (size & (size - 1)) != 0 ||
+      size > std::numeric_limits<int64_t>::max() / 2)
+    return false;
+
+  SmallVector<GatherOp> gathers;
+  SmallVector<MakeRangeOp> ranges;
+  llvm::DenseSet<Value> visited;
+  std::function<bool(Value)> collect = [&](Value value) {
+    auto fragment = dyn_cast<FragmentType>(value.getType());
+    if (!fragment || !visited.insert(value).second)
+      return true;
+    if (fragment.getShape() != schema.getShape() ||
+        fragment.getAxisMaps() != schema.getAxisMaps() ||
+        fragment.getValidity() != schema.getValidity() ||
+        fragment.getOwner() != schema.getOwner())
+      return false;
+    if (auto range = value.getDefiningOp<MakeRangeOp>()) {
+      ranges.push_back(range);
+      return true;
+    }
+    if (auto gather = value.getDefiningOp<GatherOp>()) {
+      auto source = cast<FragmentType>(gather.getSource().getType());
+      if (source.getShape() != schema.getShape() ||
+          source.getOwner() != schema.getOwner() ||
+          gather.getSourceAxes() != ArrayRef<int64_t>{0} ||
+          gather.getCoordinates().size() != 1 || !gather.getValid() ||
+          !gather.getFill() ||
+          !gather.getCoordinates().front().getDefiningOp<MakeRangeOp>())
+        return false;
+      if (!collect(gather.getCoordinates().front()) ||
+          !collect(gather.getValid()) || !collect(gather.getFill()))
+        return false;
+      gathers.push_back(gather);
+      return true;
+    }
+    Operation *producer = value.getDefiningOp();
+    if (!isa_and_nonnull<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp,
+                        BitcastOp, SplatOp, BroadcastOp, ReshapeOp>(producer) ||
+        producer->getNumResults() != 1 || !isMemoryEffectFree(producer))
+      return false;
+    return llvm::all_of(producer->getOperands(), collect);
+  };
+  if (!collect(input) || gathers.empty() || ranges.empty())
+    return false;
+  MakeRangeOp range = ranges.front();
+  if (isZero(range.getStart()) || !isUnitStepRange(range) ||
+      !samePhysicalScalarExpression(range.getStart(), range.getLogicalStart()))
+    return false;
+  for (MakeRangeOp other : ranges)
+    if (!sameLogicalRange(range, other) ||
+        !samePhysicalScalarExpression(range.getStart(), other.getStart()) ||
+        !samePhysicalScalarExpression(range.getExtent(), other.getExtent()))
+      return false;
+  PhysicalExprAttr bound = queryNonNegativeIndexUpperBound(range.getStart());
+  if (!bound ||
+      bound.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+      bound.getValue() > size)
+    return false;
+
+  UniformValueAnalysis uniform(describeUniformValue);
+  for (GatherOp gather : gathers) {
+    Value coordinate = gather.getCoordinates().front();
+    SmallVector<Value> predicates{gather.getValid()};
+    bool bounded = false;
+    while (!predicates.empty()) {
+      Value predicate = predicates.pop_back_val();
+      if (auto binary = predicate.getDefiningOp<BinaryOp>();
+          binary &&
+          (binary.getOperatorKind() == BinaryOperator::LogicalAnd ||
+           binary.getOperatorKind() == BinaryOperator::BitwiseAnd)) {
+        predicates.push_back(binary.getLhs());
+        predicates.push_back(binary.getRhs());
+      } else if (auto compare = predicate.getDefiningOp<CompareOp>();
+                 compare && compare.getPredicate() == ComparePredicate::Lt &&
+                 compare.getLhs() == coordinate) {
+        auto upper = dyn_cast_or_null<IntegerAttr>(
+            uniform.evaluate(compare.getRhs()));
+        bounded |= upper && upper.getInt() <= size;
+      }
+    }
+    if (!bounded)
+      return false;
+  }
+  auto kernel = reduce->getParentOfType<func::FuncOp>();
+  PhysicalProgramAnalysis analysis(kernel);
+  PhysicalSourceAxis source = sourceAxisIdentity(range);
+  if (!analysis.replayability(input, source, PhysicalReplayScope::ValueGraph,
+                             /*allowAccesses=*/true).isReplayable())
+    return false;
+
+  // Ordinary reduce permits a permutation of its inputs. For a shifted
+  // [k, k + N) range, visit [N, N + k) then [k, N) instead. This retains
+  // every original value, including padding/fill, while valid gathers become
+  // identity reads from the immutable parent fragment. Other users keep their
+  // original coordinates; no scan or ordered state is permuted.
+  OpBuilder builder(reduce);
+  Location location = reduce.getLoc();
+  auto [sourceId, dimensionId] = nextPhysicalAxisIdentities(kernel);
+  auto axis = AxisMapAttr::get(builder.getContext(), sourceId, 0, dimensionId,
+                             0, true);
+  auto typeFor = [&](Type element) {
+    return FragmentType::get(builder.getContext(), element, schema.getShape(),
+                            builder.getArrayAttr({axis}), schema.getValidity(),
+                            schema.getOwner());
+  };
+  auto indexType = typeFor(builder.getIndexType());
+  Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+  Value one = builder.create<arith::ConstantIndexOp>(location, 1);
+  Value count = builder.create<arith::ConstantIndexOp>(location, size);
+  Value ordinal = builder.create<MakeRangeOp>(
+      location, indexType, zero, count, one, zero, count, sourceId, 0, true);
+  Value start = builder.create<SplatOp>(location, indexType, range.getStart());
+  Value prefix = builder.create<CompareOp>(location, typeFor(builder.getI1Type()),
+                                          ordinal, start, ComparePredicate::Lt);
+  Value shifted = builder.create<BinaryOp>(
+      location, indexType, ordinal,
+      builder.create<SplatOp>(location, indexType, count), BinaryOperator::Add);
+  Value coordinate = builder.create<SelectOp>(location, indexType, prefix,
+                                              shifted, ordinal);
+  IRMapping mapping;
+  for (MakeRangeOp original : ranges)
+    mapping.map(original.getResult(), coordinate);
+  ReplayMaterializationOptions options;
+  options.traversalRanges = ranges;
+  options.fragmentAxis = 0;
+  options.segmentMapping = axis;
+  auto replay = [&](Value value) {
+    return materializeReplayedValue(builder, location, value, source, extent,
+                                    mapping, options);
+  };
+  auto group = ReshapeGroupAttr::get(builder.getContext(),
+                                    builder.getDenseI64ArrayAttr({0}),
+                                    builder.getDenseI64ArrayAttr({0}));
+  for (GatherOp gather : gathers) {
+    auto valid = replay(gather.getValid());
+    auto fill = replay(gather.getFill());
+    if (failed(valid) || failed(fill))
+      return reduce.emitOpError("cannot permute gather validity/fill"), failure();
+    auto type = typeFor(uniformElementType(gather.getResult().getType()));
+    Value parent = builder.create<ReshapeOp>(
+        location, type, gather.getSource(), builder.getArrayAttr({group}));
+    Value replacement = builder.create<SelectOp>(location, type, *valid,
+                                                 parent, *fill);
+    mapping.map(gather.getResult(), replacement);
+  }
+  auto replacement = replay(input);
+  if (failed(replacement))
+    return reduce.emitOpError("cannot permute gather reduction inputs"), failure();
+  reduce->setOperand(0, *replacement);
+  return true;
+}
+
 FailureOr<bool> projectFragmentGather(GatherOp gather) {
   auto source = dyn_cast<FragmentType>(gather.getSource().getType());
   auto result = dyn_cast<FragmentType>(gather.getResult().getType());
@@ -2657,6 +2823,14 @@ LogicalResult realizeAccessComposition(ModuleOp module) {
     }
     changed |= deduplicateImmutableLoads(*physicalKernel);
     changed |= foldIndexRecompositions(*physicalKernel);
+    SmallVector<ReduceOp> reductions;
+    physicalKernel->walk([&](ReduceOp reduce) { reductions.push_back(reduce); });
+    for (ReduceOp reduce : reductions) {
+      FailureOr<bool> composed = composeReductionGathers(reduce);
+      if (failed(composed))
+        return failure();
+      changed |= *composed;
+    }
     eraseDeadPhysicalValues(*physicalKernel);
   } while (changed);
   if (failed(materializeIndexedFragments(*physicalKernel)))
