@@ -54,7 +54,7 @@ class PreparedComparison:
 @dataclass(frozen=True)
 class NativeComparisonResult:
     generated_ms: float
-    source_ms: float
+    source_ms: float | None
     generated: TensorTree
     source: TensorTree
 

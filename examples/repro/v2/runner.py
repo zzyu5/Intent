@@ -52,6 +52,8 @@ def _target(provider: str, entry):
         profile = TargetProfile.from_deployment(json.loads(path.read_text()))
         return intent.WeftTarget(vector_bits=profile.vlen_bits, workers=len(profile.cpus),
                                  matrix_extension=profile.matrix_extension)
+    if provider == "bangc":
+        return intent.BangCTarget(device=int(os.environ.get("INTENT_BANGC_DEVICE", "0")))
     if provider == "triton":
         return intent.TritonTarget(device=0)
     if provider == "cutile":
@@ -176,10 +178,12 @@ def _run_entry(
             "numerical comparison completed; timing contract is not comparable"
         )
         return ResultRow(entry.kernel, entry.case, None, None, None, comparison.status)
-    ratio = generated_p50 / source_p50
+    ratio = generated_p50 / source_p50 if generated_p50 is not None and source_p50 is not None else None
+    def formatted(value):
+        return "unavailable" if value is None else f"{value:.6f}"
     print(
         f"{provider}:{entry.kernel}: {comparison.status} "
-        f"generated={generated_p50:.6f} ms source={source_p50:.6f} ms ratio={ratio:.6f}"
+        f"generated={formatted(generated_p50)} ms source={formatted(source_p50)} ms ratio={formatted(ratio)}"
     )
     return ResultRow(
         entry.kernel,

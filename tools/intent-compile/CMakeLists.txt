@@ -18,6 +18,9 @@ target_link_libraries(intent-compile PRIVATE
   MLIRIntentDialect
   MLIRIntentKIRToGPU
   MLIRIntentKIRToCPU
+  MLIRIntentKIRToDSA
+  MLIRIntentDSADialect
+  MLIRIntentBangC
   MLIRIntentCPUTransforms
   MLIRIntentCPUDialect
   MLIRIntentMojoSerialization

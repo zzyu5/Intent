@@ -1,5 +1,7 @@
 #include "Intent/Conversion/KIRToGPU/KIRToGPU.h"
 #include "Intent/Conversion/KIRToCPU/KIRToCPU.h"
+#include "Intent/Conversion/KIRToDSA/KIRToDSA.h"
+#include "Intent/Target/BangC/Passes.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Target/Mojo/Serialization/Serializer.h"
 #include "Intent/Target/Mojo/Transforms/Passes.h"
@@ -35,11 +37,12 @@
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace {
 
-enum class TargetKind { Triton, CuTile, TileLang, Mojo, Weft };
+enum class TargetKind { Triton, CuTile, TileLang, Mojo, Weft, BangC };
 
 enum class ExitCode : int {
   Success = 0,
@@ -69,7 +72,8 @@ int main(int argc, char **argv) {
           clEnumValN(TargetKind::CuTile, "cutile", "cuTile DSL"),
           clEnumValN(TargetKind::TileLang, "tilelang", "TileLang DSL"),
           clEnumValN(TargetKind::Mojo, "mojo", "Mojo CPU native"),
-          clEnumValN(TargetKind::Weft, "weft", "Canonical Weft generation only")));
+          clEnumValN(TargetKind::Weft, "weft", "Canonical Weft generation only"),
+          clEnumValN(TargetKind::BangC, "bangc", "BANG C local-memory DSA")));
 
   // Compile-call inputs are parsed but not interpreted before the shared
   // executable GPU Program exists.
@@ -102,6 +106,16 @@ int main(int argc, char **argv) {
   llvm::cl::opt<int64_t> cpuVectorBits("cpu-vector-bits", llvm::cl::init(0));
   llvm::cl::opt<int64_t> cpuWorkers("cpu-workers", llvm::cl::init(0));
   llvm::cl::opt<bool> cpuMatrixI8I32("cpu-matrix-i8-i32", llvm::cl::init(false));
+  llvm::cl::opt<std::string> dsaArchitecture("dsa-architecture", llvm::cl::init("mtp_372"));
+  llvm::cl::opt<int64_t> dsaTile("dsa-tile", llvm::cl::init(1024));
+  llvm::cl::opt<int64_t> dsaTileM("dsa-tile-m", llvm::cl::init(16));
+  llvm::cl::opt<int64_t> dsaTileN("dsa-tile-n", llvm::cl::init(64));
+  llvm::cl::opt<int64_t> dsaTileK("dsa-tile-k", llvm::cl::init(64));
+  llvm::cl::opt<int64_t> dsaRegionTile("dsa-region-tile", llvm::cl::init(64));
+  llvm::cl::opt<std::string> dsaShapes("dsa-shapes", llvm::cl::init("{}"),
+      llvm::cl::desc("JSON parameter shapes for compile-call specialization; -1 keeps an axis dynamic"));
+  llvm::cl::opt<int64_t> dsaTasks("dsa-tasks", llvm::cl::init(16));
+  llvm::cl::opt<int64_t> dsaLocalBytes("dsa-local-bytes", llvm::cl::init(512 * 1024));
   llvm::cl::opt<bool> stopAfterShared(
       "stop-after-shared",
       llvm::cl::desc("stop after the selected execution family's shared verifier"),
@@ -112,13 +126,13 @@ int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
   registry.insert<intent::IntentDialect, intent::gpu::IntentGPUDialect,
-                  intent::cpu::IntentCPUDialect,
+                  intent::cpu::IntentCPUDialect, intent::dsa::IntentDSADialect,
                   intent::cutile::IntentCuTileDialect,
                   intent::tilelang::IntentTileLangDialect,
                   intent::triton::IntentTritonDialect>();
   mlir::MLIRContext context(registry);
   context.loadDialect<intent::IntentDialect, intent::gpu::IntentGPUDialect,
-                      intent::cpu::IntentCPUDialect,
+                      intent::cpu::IntentCPUDialect, intent::dsa::IntentDSADialect,
                       intent::cutile::IntentCuTileDialect,
                       intent::tilelang::IntentTileLangDialect,
                       intent::triton::IntentTritonDialect,
@@ -154,7 +168,45 @@ int main(int argc, char **argv) {
     irOutput << "\n";
     return exitCode(ExitCode::Success);
   };
-  if (target == TargetKind::Mojo || target == TargetKind::Weft) {
+  if (target == TargetKind::BangC) {
+    context.loadDialect<mlir::memref::MemRefDialect, mlir::math::MathDialect>();
+    if (!tuningConfigFilename.empty()) {
+      llvm::errs() << "BANG C currently takes explicit DSA block bindings, not a tuning profile\n";
+      return exitCode(ExitCode::Invocation);
+    }
+    auto configuration = intent::dsa::ConfigurationAttr::getChecked(
+        [&]() { return module->emitError(); }, &context, dsaTile.getValue(), dsaTileM.getValue(), dsaTileN.getValue(),
+        dsaTileK.getValue(), dsaRegionTile.getValue(), dsaTasks.getValue(), dsaLocalBytes.getValue());
+    if (!configuration) return exitCode(ExitCode::Invocation);
+    auto parsedShapes = llvm::json::parse(dsaShapes.getValue());
+    if (!parsedShapes) {
+      llvm::errs() << "invalid DSA shape bindings: " << llvm::toString(parsedShapes.takeError()) << "\n";
+      return exitCode(ExitCode::Invocation);
+    }
+    auto object = parsedShapes->getAsObject();
+    if (!object) { llvm::errs() << "DSA shape bindings must be a JSON object\n"; return exitCode(ExitCode::Invocation); }
+    mlir::NamedAttrList bindings;
+    mlir::Builder builder(&context);
+    for (auto &[name, value] : *object) {
+      auto dimensions = value.getAsArray();
+      if (!dimensions) { llvm::errs() << "DSA parameter shape must be an integer array\n"; return exitCode(ExitCode::Invocation); }
+      llvm::SmallVector<int64_t> extents;
+      for (auto &dimension : *dimensions) {
+        auto extent = dimension.getAsInteger();
+        if (!extent || *extent < -1) { llvm::errs() << "invalid DSA bound extent\n"; return exitCode(ExitCode::Invocation); }
+        extents.push_back(*extent);
+      }
+      bindings.append(name.str(), builder.getDenseI64ArrayAttr(extents));
+    }
+    if (mlir::failed(intent::lowerCanonicalKIRToDSA(*module, configuration, bindings.getDictionary(&context))))
+      return exitCode(ExitCode::PhysicalProgram);
+    if (stopAfterShared) return emitShared();
+    if (mlir::failed(intent::bangc::legalizeProgram(*module, dsaArchitecture)))
+      return exitCode(ExitCode::ProviderProgramVerification);
+    metadata.clear();
+    if (mlir::failed(intent::bangc::serializeProgram(*module, source, metadata)))
+      return exitCode(ExitCode::TerminalTranslation);
+  } else if (target == TargetKind::Mojo || target == TargetKind::Weft) {
     context.loadDialect<mlir::linalg::LinalgDialect, mlir::math::MathDialect,
                         mlir::memref::MemRefDialect, mlir::vector::VectorDialect>();
     if (mlir::failed(intent::lowerCanonicalKIRToCPU(*module,
@@ -240,6 +292,7 @@ int main(int argc, char **argv) {
     break;
   case TargetKind::Mojo:
   case TargetKind::Weft:
+  case TargetKind::BangC:
     llvm_unreachable("CPU construction is selected before GPU construction");
   }
   if (mlir::failed(provider))
