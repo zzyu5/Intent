@@ -55,7 +55,16 @@ case "${provider}" in
 esac
 if [[ "${target}" == cutile ]]; then
   tuning_config=${INTENT_TUNING_CONFIG:-${project_root}/experiments/gpu/providers/cutile/tuning.json}
-  default_python=/home/kingdom/.venvs/intentdsl-cutile/bin/python
+  if [[ "${provider}" == triton ]]; then
+    cutile_python=${INTENT_CUTILE_PYTHON:-${HOME}/.venvs/intentdsl-cutile/bin/python}
+    INTENT_CUTILE_SITE_PACKAGES=$("${cutile_python}" -c \
+      'from pathlib import Path; import cuda.tile; print(Path(cuda.tile.__file__).resolve().parents[2])')
+    export INTENT_CUTILE_SITE_PACKAGES
+    export CUDA_HOME="${CUDA_HOME:-${INTENT_CUTILE_SITE_PACKAGES}/nvidia/cu13}"
+    export PATH="${INTENT_CUTILE_SITE_PACKAGES}/nvidia/cu13/bin:${PATH}"
+  else
+    default_python=/home/kingdom/.venvs/intentdsl-cutile/bin/python
+  fi
 fi
 
 cmake_arguments=()

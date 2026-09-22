@@ -38,16 +38,16 @@ splitk_paged_attention,B16-QH32-KVH8-S8192-D128-page16-split8-fp16,0.355656,0.45
 paged_mla_decode,B8-QH128-KVH1-S8192-C512-R64-page16-fp16,,,,source_abi_gap,Numerical comparison passed; existing source ABI/semantics contract excludes timing. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
 block_sparse_gqa_decode,B8-QH32-KVH8-S8192-D128-blocks32x128,,,,source_abi_gap,Numerical comparison passed; existing source ABI/semantics contract excludes timing.
 flaggems_conv1d,B64-L16384-K5-fp16-same,0.007936,0.061152,0.129775,pass,Intent target=cutile; source corpus=triton.
-flaggems_triangular_solve,B4096-N16-fp32-lower,,,,source_benchmark_failed,'str' object cannot be interpreted as an integer
+flaggems_triangular_solve,B4096-N16-fp32-lower,0.033232,0.028688,1.158394,pass,Intent target=cutile; source corpus=triton; reference stack Torch 2.10.0+cu130 and Triton 3.6.0; cuTile 1.5.0.
 flaggems_embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.175872,0.174832,1.005949,pass,Intent target=cutile; source corpus=triton.
 flaggems_roll,8192x4096-fp16-shift-1-axis0,0.087792,0.089088,0.985453,pass,Intent target=cutile; source corpus=triton.
-flaggems_transpose_copy,4093x8191-fp16,,,,source_launch_process_failed,worker exited with code -11
+flaggems_transpose_copy,4093x8191-fp16,0.105216,0.308992,0.340514,pass,Intent target=cutile; source corpus=triton; reference stack Torch 2.10.0+cu130 and Triton 3.6.0; cuTile 1.5.0.
 flaggems_batch_norm_training,B32-C64-S4096-fp16,0.102896,0.026608,3.867108,pass,Intent target=cutile; source corpus=triton.
 flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.042752,0.050912,0.839723,pass,Intent target=cutile; source corpus=triton.
 flaggems_logsumexp,8192x8192-fp32,0.184096,0.175904,1.046571,pass,Intent target=cutile; source corpus=triton.
 flaggems_softmax_backward,4096x4097-fp32,,,,numerical_failed,"generated/source floating result 0 differs: max_abs=0.00012362003326416016, atol=0.0001, rtol=1e-05; first_failure=15327822; largest tolerance excess has generated=0.08494142442941666, source=0.08482552319765091, abs_error=0.00011590123176574707, limit=0.00010084825044032186"
 flaggems_fused_adamw,N8388608-fp32,0.153888,0.157664,0.976050,pass,Intent target=cutile; source corpus=triton.
-flaggems_addcmul,B64-C128-L4096-bf16,,,,source_launch_process_failed,worker exited with code -11
+flaggems_addcmul,B64-C128-L4096-bf16,0.087776,0.087824,0.999453,pass,Intent target=cutile; source corpus=triton; reference stack Torch 2.10.0+cu130 and Triton 3.6.0; cuTile 1.5.0.
 flaggems_fp8_mqa_logits,Q256-K4096-H32-D128-e4m3,0.070824,0.087672,0.807829,pass,Intent target=cutile; source corpus=triton. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
 flaggems_cumsum,8192x8192-fp32-axis1,0.350008,0.351960,0.994454,pass,Intent target=cutile; source corpus=triton.
 flaggems_histogram,N8388608-bins256-fp32,1.157264,1.241080,0.932465,pass,Intent target=cutile; source corpus=triton.
