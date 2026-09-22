@@ -2005,18 +2005,37 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
     auto emitGatherLoad = [&](OpBuilder &nested) -> FailureOr<Value> {
       FailureOr<SmallVector<Value>> coordinates = orderedCoordinates(
           load, load.getResource(), load.getCoordinates(), load.getSourceAxes());
-      FailureOr<Value> fill = scalarFill(load, load.getFill());
-      if (failed(coordinates) || failed(fill))
+      if (failed(coordinates))
         return failure();
+      Value fill = uniformScalarFill(load.getFill());
+      bool fragmentFill = load.getFill() && !fill;
+      if (fragmentFill) {
+        if (!load.getValid())
+          return load.emitOpError(
+              "fragment padding requires an explicit access validity");
+        FailureOr<Value> zero = gpu::materializeScalarConstant(
+            nested, load.getLoc(), nested.getZeroAttr(view.getElementType()),
+            view.getElementType());
+        if (failed(zero))
+          return failure();
+        fill = *zero;
+      }
       FailureOr<SmallVector<Value>> materialized =
           materializeCoordinateDomains(nested, load, *coordinates, result);
       if (failed(materialized))
         return failure();
       auto replacement = nested.create<GatherLoadOp>(
           load.getLoc(), result, load.getResource(), *materialized,
-          load.getValid(), *fill, loopLatency, identityAxes(view.getRank()),
+          load.getValid(), fill, loopLatency, identityAxes(view.getRank()),
           activeInBounds ? nested.getUnitAttr() : UnitAttr());
       createdOperations.push_back(replacement);
+      if (fragmentFill) {
+        auto selected = nested.create<gpu::SelectOp>(
+            load.getLoc(), result, load.getValid(), replacement.getResult(),
+            load.getFill());
+        createdOperations.push_back(selected);
+        return selected.getResult();
+      }
       return replacement.getResult();
     };
     auto emitNativeOrFill = [&](OpBuilder &nested) -> Value {
@@ -2487,9 +2506,10 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
     if (!view)
       return atomic.emitOpError(
           "cuTile atomic RMW requires an external view resource");
-    if (atomic.getValid())
+    if (atomic.getValid() &&
+        (!atomic.getResult().use_empty() || view.getRank() == 0))
       return atomic.emitOpError(
-          "cuTile atomic RMW has no native arbitrary-validity form");
+          "masked cuTile array atomic requires a ranked view and an unused old value");
     FailureOr<SmallVector<Value>> coordinates = orderedCoordinates(
         atomic, atomic.getResource(), atomic.getCoordinates(),
         atomic.getSourceAxes());
@@ -2502,6 +2522,33 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
       if (failed(materialized))
         return failure();
       coordinates = std::move(*materialized);
+    }
+    if (atomic.getValid()) {
+      // Native array atomics suppress out-of-bounds lanes but leave their
+      // returned old values unspecified. The old value is unused here, so
+      // encode the validity in the existing native bounds predicate.
+      Type coordinateType = withElementType(atomic.getValue().getType(),
+                                            builder.getIndexType());
+      Value zero = builder.create<arith::ConstantIndexOp>(atomic.getLoc(), 0);
+      Value end = builder.create<gpu::DimOp>(
+          atomic.getLoc(), builder.getIndexType(), atomic.getResource(), 0);
+      for (auto [axis, coordinate] : llvm::enumerate(*coordinates)) {
+        Type indexed = withElementType(coordinate.getType(),
+                                       builder.getIndexType());
+        if (coordinate.getType() != indexed)
+          coordinate = builder.create<gpu::CastOp>(atomic.getLoc(), indexed,
+                                                   coordinate);
+        auto active = gpu::projectPhysicalValueToSchema(
+            builder, atomic.getLoc(), coordinate, coordinateType);
+        auto inactive = gpu::projectPhysicalValueToSchema(
+            builder, atomic.getLoc(), axis == 0 ? end : zero, coordinateType);
+        if (failed(active) || failed(inactive))
+          return atomic.emitOpError(
+              "masked atomic coordinate cannot adopt its value domain");
+        (*coordinates)[axis] = builder.create<gpu::SelectOp>(
+            atomic.getLoc(), coordinateType, atomic.getValid(), *active,
+            *inactive);
+      }
     }
     auto replacement = builder.create<AtomicRMWOp>(
         atomic.getLoc(), atomic.getResult().getType(), atomic.getResource(),
