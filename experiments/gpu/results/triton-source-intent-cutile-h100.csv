@@ -42,7 +42,7 @@ flaggems_triangular_solve,B4096-N16-fp32-lower,0.123688,0.122000,1.013836,pass,I
 flaggems_embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.168504,0.166888,1.009683,pass,Intent target=cutile; source corpus=triton.
 flaggems_roll,8192x4096-fp16-shift-1-axis0,0.092968,0.089120,1.043178,pass,Intent target=cutile; source corpus=triton.
 flaggems_transpose_copy,4093x8191-fp16,0.152648,0.578136,0.264035,pass,Intent target=cutile; source corpus=triton.
-flaggems_batch_norm_training,B32-C64-S4096-fp16,0.428488,0.060536,7.078235,pass,Intent target=cutile; source corpus=triton.
+flaggems_batch_norm_training,B32-C64-S4096-fp16,0.387536,0.061768,6.274058,pass,Intent target=cutile; source corpus=triton.
 flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.088488,0.124496,0.710770,pass,Intent target=cutile; source corpus=triton.
 flaggems_logsumexp,8192x8192-fp32,0.201040,0.174240,1.153811,pass,Intent target=cutile; source corpus=triton.
 flaggems_softmax_backward,4096x4097-fp32,,,,numerical_failed,"generated/source floating result 0 differs: max_abs=0.000152587890625, atol=0.0001, rtol=1e-05; first_failure=13331922; largest tolerance excess has generated=1.2312570810317993, source=1.2313878536224365, abs_error=0.00013077259063720703, limit=0.00011231387907173485"

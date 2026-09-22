@@ -42,7 +42,7 @@ flaggems_triangular_solve,B4096-N16-fp32-lower,0.033232,0.028688,1.158394,pass,I
 flaggems_embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.175872,0.174832,1.005949,pass,Intent target=cutile; source corpus=triton.
 flaggems_roll,8192x4096-fp16-shift-1-axis0,0.087792,0.089088,0.985453,pass,Intent target=cutile; source corpus=triton.
 flaggems_transpose_copy,4093x8191-fp16,0.105216,0.308992,0.340514,pass,Intent target=cutile; source corpus=triton; reference stack Torch 2.10.0+cu130 and Triton 3.6.0; cuTile 1.5.0.
-flaggems_batch_norm_training,B32-C64-S4096-fp16,0.103728,0.026632,3.894863,pass,Intent target=cutile; source corpus=triton.
+flaggems_batch_norm_training,B32-C64-S4096-fp16,0.084704,0.028640,2.957542,pass,Intent target=cutile; source corpus=triton.
 flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.042752,0.050912,0.839723,pass,Intent target=cutile; source corpus=triton.
 flaggems_logsumexp,8192x8192-fp32,0.179968,0.176128,1.021802,pass,Intent target=cutile; source corpus=triton.
 flaggems_softmax_backward,4096x4097-fp32,,,,numerical_failed,"generated/source floating result 0 differs: max_abs=0.00012362003326416016, atol=0.0001, rtol=1e-05; first_failure=15327822; largest tolerance excess has generated=0.08494142442941666, source=0.08482552319765091, abs_error=0.00011590123176574707, limit=0.00010084825044032186"

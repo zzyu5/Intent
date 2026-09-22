@@ -122,6 +122,13 @@ void foldExactConstantDivisions(func::FuncOp kernel) {
           !constant.getValue().isPowerOf2())
         return;
       bool remainder = binary.getOperatorKind() == BinaryOperator::Remainder;
+      if (!remainder && constant.getValue().isOne()) {
+        if (binary.getLhs().getType() == binary.getResult().getType()) {
+          binary.getResult().replaceAllUsesWith(binary.getLhs());
+          binary.erase();
+        }
+        return;
+      }
       int64_t value = remainder ? constant.getInt() - 1
                                 : constant.getValue().logBase2();
       OpBuilder builder(binary);
