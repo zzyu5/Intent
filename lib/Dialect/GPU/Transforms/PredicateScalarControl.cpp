@@ -386,10 +386,12 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
       mapping.map(branch.getResults(), result.getResults());
       return;
     }
-    Value condition = lift(mapped(branch.getCondition()));
-    if (condition.getType() != predicate.getType())
-      condition = builder.create<BroadcastOp>(
-          location, cast<FragmentType>(predicate.getType()), condition);
+    // A complete chunk can have scalar `true` validity even when the branch
+    // condition varies by iteration. Lift both predicates to that iteration
+    // schema before combining them.
+    Value activePredicate = lift(predicate);
+    Value condition = project(lift(mapped(branch.getCondition())),
+                              activePredicate.getType());
     Value zero = builder.create<arith::ConstantOp>(location,
                                                  builder.getBoolAttr(false));
     if (auto fragment = dyn_cast<FragmentType>(condition.getType()))
@@ -401,7 +403,7 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
       if (region.empty())
         return results;
       Value active = builder.create<BinaryOp>(
-          location, predicate.getType(), predicate, selected,
+          location, activePredicate.getType(), activePredicate, selected,
           BinaryOperator::LogicalAnd);
       IRMapping branchMapping(mapping);
       for (Operation &nested : region.front().without_terminator())
