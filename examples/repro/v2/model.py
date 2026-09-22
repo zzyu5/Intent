@@ -18,6 +18,19 @@ class Tolerance:
 
 
 @dataclass(frozen=True)
+class IntegerTolerance:
+    max_abs: int
+
+
+@dataclass(frozen=True)
+class SimilarityTolerance:
+    max_error: float
+
+
+NumericalTolerance: TypeAlias = Tolerance | IntegerTolerance | SimilarityTolerance
+
+
+@dataclass(frozen=True)
 class PreparedLaunch:
     launch: Callable[[], object]
     outputs: Callable[[], TensorTree]
@@ -29,12 +42,13 @@ class PreparedLaunch:
 class PreparedComparison:
     generated: PreparedLaunch | None
     source: PreparedLaunch | None
-    tolerance: Tolerance | tuple[Tolerance, ...]
+    tolerance: NumericalTolerance | tuple[NumericalTolerance, ...] | None
     cuda_graph: bool
     status: str = "pass"
     note: str = ""
     device_type: str = "cuda"
     native_comparison: Callable[[], NativeComparisonResult] | None = None
+    cpu_host_timing: bool = False
 
 
 @dataclass(frozen=True)

@@ -295,12 +295,13 @@ def Intent_BufferStoreOp : Intent_Op<"buffer_store", [MemoryEffects<[MemWrite]>]
                        I64Attr:$value_operand_index);
   let results = (outs);
 }
-def Intent_AtomicLoadOp : Intent_Op<"atomic_load", [MemoryEffects<[MemRead]>]> {
+// Atomic observations and synchronization cannot be folded as ordinary reads.
+def Intent_AtomicLoadOp : Intent_Op<"atomic_load", [MemoryEffects<[MemRead, MemWrite]>]> {
   let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
                        Intent_AtomicOrderingAttr:$ordering);
   let results = (outs Intent_DataValue:$result);
 }
-def Intent_AtomicStoreOp : Intent_Op<"atomic_store", [MemoryEffects<[MemWrite]>]> {
+def Intent_AtomicStoreOp : Intent_Op<"atomic_store", [MemoryEffects<[MemRead, MemWrite]>]> {
   let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
                        I64Attr:$value_operand,
                        Intent_AtomicOrderingAttr:$ordering);

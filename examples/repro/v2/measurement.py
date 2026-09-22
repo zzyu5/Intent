@@ -4,6 +4,8 @@ from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from contextvars import ContextVar
 import statistics
+import time
+import math
 
 import torch
 
@@ -16,6 +18,7 @@ from .model import PreparedComparison
 from .model import PreparedLaunch
 from .model import TensorTree
 from .model import Tolerance
+from .model import IntegerTolerance, SimilarityTolerance, NumericalTolerance
 
 
 class PipelineStageError(RuntimeError):
@@ -131,7 +134,7 @@ def _result_structure(value: TensorTree):
 def compare_outputs(
     generated: TensorTree,
     source: TensorTree,
-    tolerance: Tolerance | tuple[Tolerance, ...],
+    tolerance: NumericalTolerance | tuple[NumericalTolerance, ...],
 ) -> tuple[float, ...]:
     generated_structure = _result_structure(generated)
     source_structure = _result_structure(source)
@@ -176,6 +179,35 @@ def compare_outputs(
                 f"generated/source result {leaf_index} device differs: "
                 f"{generated_value.device} != {source_value.device}"
             )
+        if isinstance(leaf_tolerance, IntegerTolerance):
+            if generated_value.dtype not in (torch.int8, torch.uint8, torch.int16, torch.int32):
+                raise TypeError("integer absolute comparison requires at most 32-bit integer outputs")
+            actual, expected = generated_value.reshape(-1), source_value.reshape(-1)
+            maximum = 0
+            for begin in range(0, actual.numel(), COMPARISON_CHUNK_ELEMENTS):
+                end = begin + COMPARISON_CHUNK_ELEMENTS
+                difference = (actual[begin:end].long() - expected[begin:end].long()).abs()
+                maximum = max(maximum, difference.max().item())
+            if maximum > leaf_tolerance.max_abs:
+                raise NumericalComparisonError(
+                    f"generated/source integer result {leaf_index} differs: max_abs={maximum}, limit={leaf_tolerance.max_abs}"
+                )
+            errors.append(float(maximum))
+            continue
+        if isinstance(leaf_tolerance, SimilarityTolerance):
+            if not generated_value.is_floating_point():
+                raise TypeError("similarity comparison requires floating outputs")
+            actual, expected = generated_value.double(), source_value.double()
+            if not (torch.isfinite(actual).all() and torch.isfinite(expected).all()):
+                raise NumericalComparisonError(f"similarity comparison requires finite result {leaf_index}")
+            denominator = (actual * actual + expected * expected).sum()
+            error = 0.0 if denominator.item() == 0.0 else abs(1.0 - (2.0 * (actual * expected).sum() / denominator).item())
+            if not math.isfinite(error) or error > leaf_tolerance.max_error:
+                raise NumericalComparisonError(
+                    f"generated/source result {leaf_index} differs: similarity_error={error}, limit={leaf_tolerance.max_error}"
+                )
+            errors.append(error)
+            continue
         if generated_value.dtype == torch.bool or not generated_value.is_floating_point():
             if not torch.equal(generated_value, source_value):
                 raise NumericalComparisonError(
@@ -192,7 +224,7 @@ def compare_outputs(
                 maximum,
                 _compare_float_chunk(
                     generated_flat[begin:end], source_flat[begin:end],
-                    leaf_tolerance, leaf_index,
+                    leaf_tolerance, leaf_index, begin,
                 ),
             )
         errors.append(maximum)
@@ -204,9 +236,11 @@ def _compare_float_chunk(
     source: torch.Tensor,
     tolerance: Tolerance,
     leaf_index: int,
+    begin: int,
 ) -> float:
-    generated_compare = generated.float()
-    source_compare = source.float()
+    comparison_dtype = torch.float64 if source.dtype == torch.float64 else torch.float32
+    generated_compare = generated.to(comparison_dtype)
+    source_compare = source.to(comparison_dtype)
     generated_finite = torch.isfinite(generated_compare)
     source_finite = torch.isfinite(source_compare)
     if not torch.equal(generated_finite, source_finite):
@@ -241,10 +275,13 @@ def _compare_float_chunk(
         maximum = difference.max().item()
         if torch.any(difference > limit):
             worst = (difference - limit).argmax()
+            first_failure = torch.nonzero(difference > limit)[0, 0]
+            first_position = torch.nonzero(finite)[first_failure, 0].item()
             raise NumericalComparisonError(
                 f"generated/source floating result {leaf_index} differs: "
                 f"max_abs={maximum}, atol={tolerance.atol}, "
-                f"rtol={tolerance.rtol}; largest tolerance excess has "
+                f"rtol={tolerance.rtol}; first_failure={begin + first_position}; "
+                f"largest tolerance excess has "
                 f"generated={generated_compare[finite][worst].item()}, "
                 f"source={source_compare[finite][worst].item()}, "
                 f"abs_error={difference[worst].item()}, limit={limit[worst].item()}"
@@ -262,6 +299,23 @@ def _synchronize(comparison: PreparedComparison) -> None:
 
 def _benchmark_launch(launch: PreparedLaunch, comparison: PreparedComparison, warmup: int,
                       time_budget_ms: float | None = None) -> float:
+    if comparison.device_type == "cpu" and comparison.cpu_host_timing:
+        def invoke() -> float:
+            if launch.prepare is not None:
+                launch.prepare()
+            begin = time.perf_counter_ns()
+            launch.launch()
+            return (time.perf_counter_ns() - begin) * 1e-6
+
+        first = invoke()
+        remaining_warmup_ms = warmup - first
+        while remaining_warmup_ms > 0:
+            first = invoke()
+            remaining_warmup_ms -= first
+        repetitions = min(50, max(1, int(10.0 / first)))
+        return statistics.median(
+            sum(invoke() for _ in range(repetitions)) / repetitions for _ in range(7)
+        )
     if launch.native_benchmark is not None:
         return launch.native_benchmark()
     if comparison.device_type != "cuda":
@@ -277,6 +331,12 @@ def evaluate(
     source_timing_error: Callable[[Exception], bool] | None = None,
     benchmark_time_budget_ms: float | None = None,
 ) -> tuple[float | None, float | None]:
+    run_only = comparison.status == "run_only"
+    if run_only:
+        if comparison.source is not None or comparison.tolerance is not None or comparison.native_comparison is not None:
+            raise PipelineStageError("adapter_preparation", "run_only requires a generated launch without reference or tolerance")
+    elif comparison.tolerance is None or (comparison.source is None and comparison.native_comparison is None):
+        raise PipelineStageError("adapter_preparation", "comparison requires an explicit reference and tolerance")
     if comparison.device_type == "cpu" and before_benchmark is not None:
         before_benchmark()
     if comparison.native_comparison is not None:
@@ -293,6 +353,21 @@ def evaluate(
         _synchronize(comparison)
     except Exception as error:
         raise PipelineStageError("generated_launch", str(error)) from error
+    if run_only:
+        if comparison.device_type != "cpu" and before_benchmark is not None:
+            before_benchmark()
+        report_stage("generated_benchmark")
+        try:
+            first = _benchmark_launch(comparison.generated, comparison, 25)
+            second = _benchmark_launch(comparison.generated, comparison, 0)
+        except Exception as error:
+            raise PipelineStageError("generated_benchmark", str(error)) from error
+        report_stage("generated_result_access")
+        try:
+            _result_structure(comparison.generated.outputs())
+        except Exception as error:
+            raise PipelineStageError("generated_result_access", str(error)) from error
+        return statistics.median((first, second)), None
     report_stage("source_launch")
     try:
         if comparison.source.prepare is not None:

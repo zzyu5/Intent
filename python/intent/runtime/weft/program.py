@@ -122,7 +122,15 @@ class NativeProgram:
         self.profile = TargetProfile(**manifest["profile"])
         self.metadata = manifest["program"]
         self.parameters = self.metadata["parameters"]
+        if any(parameter["kind"] == "view" and parameter["access"] == 2
+               for parameter in self.parameters):
+            raise NotImplementedError("Weft InOut trial state restoration is not implemented")
         self.candidates = self.metadata["candidates"]
+        kernels = {kernel["symbol"]: kernel for kernel in manifest["weft"]["kernels"]}
+        self.candidate_extensions = tuple(frozenset(
+            extension for task in self.metadata["tasks"] if task["cpu_entry"] == candidate["entry"]
+            for extension in kernels[task["abi"]["symbol"]]["used_extensions"])
+            for candidate in self.candidates)
         self.used_extensions = frozenset(extension for kernel in manifest["weft"]["kernels"]
                                          for extension in kernel["used_extensions"])
         _check_execution(self.profile, self.used_extensions)

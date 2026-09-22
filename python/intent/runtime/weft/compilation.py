@@ -63,7 +63,12 @@ def validate_artifact(manifest: dict) -> None:
         used = {extension for task in manifest["program"]["tasks"]
                 if task["cpu_entry"] == candidate["entry"]
                 for extension in kernels[task["abi"]["symbol"]]["used_extensions"]}
-        if not set(profile.required_extensions).issubset(used):
+        required = set(profile.required_extensions)
+        if candidate["requires_matrix_i8_i32"]:
+            if profile.matrix_extension is None:
+                raise ValueError("Weft candidate requires an unavailable integer matrix capability")
+            required.add(profile.matrix_extension)
+        if not required.issubset(used):
             raise ValueError("Weft candidate does not use the required matrix extension")
 
 

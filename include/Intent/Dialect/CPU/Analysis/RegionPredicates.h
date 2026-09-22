@@ -9,8 +9,10 @@ namespace intent::cpu {
 
 struct CoordinateSequence {
   llvm::SmallVector<mlir::OpFoldResult> offsets;
-  bool beginsAtZero;
-  bool nonnegative;
+  bool startsAtOrigin;
+  bool nonnegativeOffsets;
+  // A translated producer is accepted only when signed ordering cannot wrap.
+  mlir::Value origin;
 };
 struct RegionPredicatePlan {
   mlir::Value predicate;

@@ -33,7 +33,7 @@ SmallVector<Value> scratch(OpBuilder &b, Location loc, ValueRange prototypes) {
 
 LogicalResult instantiate(OpBuilder &b, Region &helper, ValueRange arguments,
                           const RegionPartition *partition, Value begin, OpFoldResult width,
-                          Value predicateTrue = {}, Operation *trueReduction = nullptr) {
+                          Value predicate = {}, bool predicateValue = false, Operation *trueReduction = nullptr) {
   Block &body = helper.front();
   if (arguments.size() != body.getNumArguments()) return helper.getParentOp()->emitError("region helper binding is incomplete");
   IRMapping mapping;
@@ -89,6 +89,23 @@ LogicalResult instantiate(OpBuilder &b, Region &helper, ValueRange arguments,
             mapping.lookupOrDefault(cast.getSource())));
         continue;
       }
+      if (auto view = dyn_cast<memref::CollapseShapeOp>(operation)) {
+        mapping.map(view.getResult(), b.create<memref::CollapseShapeOp>(view.getLoc(),
+            mapping.lookupOrDefault(view.getSrc()), view.getReassociationIndices()));
+        continue;
+      }
+      if (auto view = dyn_cast<memref::ExpandShapeOp>(operation)) {
+        SmallVector<OpFoldResult> sizes;
+        auto selected = partition->axes.find(view.getResult());
+        for (auto [axis, size] : llvm::enumerate(getMixedValues(view.getStaticOutputShape(), view.getOutputShape(), b))) {
+          if (selected != partition->axes.end() && selected->second == axis) sizes.push_back(width);
+          else sizes.push_back(isa<Value>(size) ? OpFoldResult(mapping.lookupOrDefault(cast<Value>(size))) : size);
+        }
+        mapping.map(view.getResult(), b.create<memref::ExpandShapeOp>(view.getLoc(),
+            tiledType(view.getResult()).getShape(), mapping.lookupOrDefault(view.getSrc()),
+            view.getReassociationIndices(), sizes));
+        continue;
+      }
       if (auto view = dyn_cast<memref::SubViewOp>(operation)) {
         auto mapped = [&](ArrayRef<OpFoldResult> values) {
           SmallVector<OpFoldResult> result;
@@ -107,11 +124,11 @@ LogicalResult instantiate(OpBuilder &b, Region &helper, ValueRange arguments,
       }
     }
     Operation *cloned = b.clone(operation, mapping);
-    if (predicateTrue)
-      if (Value condition = mapping.lookupOrNull(predicateTrue);
+    if (predicate)
+      if (Value condition = mapping.lookupOrNull(predicate);
           condition && cloned->isAncestor(condition.getDefiningOp())) {
         OpBuilder builder(condition.getDefiningOp());
-        Value truth = builder.create<arith::ConstantOp>(condition.getLoc(), builder.getBoolAttr(true));
+        Value truth = builder.create<arith::ConstantOp>(condition.getLoc(), builder.getBoolAttr(predicateValue));
         condition.replaceAllUsesWith(truth);
       }
     if (partition) {
@@ -204,7 +221,8 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
   if (predicate) {
     auto source = coordinateSequence(sources[predicate->source], operation);
     auto capture = coordinateSequence(captures[predicate->capture], operation);
-    if (source && capture && source->nonnegative && capture->nonnegative) {
+    if (source && capture && source->origin == capture->origin &&
+        source->nonnegativeOffsets && capture->nonnegativeOffsets) {
       auto start = [&](const CoordinateSequence &sequence) {
         Value result = zero;
         for (OpFoldResult offset : sequence.offsets)
@@ -226,7 +244,7 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
           b.create<memref::DimOp>(loc, captures[predicate->capture], 0));
       intervals = partitionCoordinatePredicate(predicate->comparison, {sourceBegin, sourceEnd},
           {captureBegin, captureEnd}, zero, one, expression);
-      specializeState = source->beginsAtZero && predicate->validityField &&
+      specializeState = source->startsAtOrigin && predicate->validityField &&
           predicate->comparison == UniformPredicate::LessEqual;
       if (specializeState) {
         truthSlot = scratch(b, loc, ValueRange{panelState[*predicate->validityField]}).front();
@@ -235,17 +253,19 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
       }
     }
   }
-  auto expand = [&](Region &helper, ValueRange arguments, bool predicateIsTrue = false, bool summaryIsNonempty = false) {
+  auto expand = [&](Region &helper, ValueRange arguments, std::optional<bool> knownPredicate = std::nullopt,
+                    bool summaryIsNonempty = false) {
     return instantiate(b, helper, arguments, partition ? &*partition : nullptr, beginPanel, panelWidth,
-        predicateIsTrue ? predicate->predicate : Value(), summaryIsNonempty ? predicate->validityReduction : nullptr);
+        knownPredicate ? predicate->predicate : Value(), knownPredicate.value_or(false),
+        summaryIsNonempty ? predicate->validityReduction : nullptr);
   };
-  auto visitOne = [&](Value begin, int64_t width, bool predicateIsTrue,
+  auto visitOne = [&](Value begin, int64_t width, std::optional<bool> knownPredicate,
                       bool summaryIsNonempty, bool omitValidity) -> LogicalResult {
     OpFoldResult extent = b.getIndexAttr(width);
     auto inputs = slices(b, loc, sources, program.count("axis"), begin, extent);
     SmallVector<Value> arguments(inputs);
     llvm::append_range(arguments, captures); llvm::append_range(arguments, summary);
-    if (failed(expand(program.summarize(), arguments, predicateIsTrue, summaryIsNonempty))) return failure();
+    if (failed(expand(program.summarize(), arguments, knownPredicate, summaryIsNonempty))) return failure();
     if (program.isScan()) {
       arguments = inputs; llvm::append_range(arguments, panelState); llvm::append_range(arguments, captures);
       auto outputAxes = operation->getAttrOfType<DenseI64ArrayAttr>("output_axes").asArrayRef();
@@ -264,12 +284,13 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
       if (!omitValidity || index != *predicate->validityField) copy(b, loc, source, target);
     return success();
   };
-  auto visit = [&](Value lower, Value upper, int64_t width, bool predicateIsTrue, bool omitValidity) -> LogicalResult {
+  auto visit = [&](Value lower, Value upper, int64_t width, std::optional<bool> knownPredicate,
+                   bool omitValidity) -> LogicalResult {
     auto loop = b.create<scf::ForOp>(loc, lower, upper, b.create<arith::ConstantIndexOp>(loc, width));
     loop->setAttr("intent_cpu.region_axis", b.getI64IntegerAttr(program.count("axis")));
     OpBuilder::InsertionGuard guard(b);
     b.setInsertionPointToStart(loop.getBody());
-    return visitOne(loop.getInductionVar(), width, predicateIsTrue, predicateIsTrue, omitValidity);
+    return visitOne(loop.getInductionVar(), width, knownPredicate, knownPredicate == true, omitValidity);
   };
   auto remainder = [&](Value start, bool omitValidity) -> LogicalResult {
     Value end = count;
@@ -282,23 +303,34 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
     Value completeEnd = b.create<arith::SubIOp>(loc, end, b.create<arith::RemSIOp>(loc, end, step));
     Value lower = b.create<arith::MinSIOp>(loc, start, completeEnd);
     if (intervals) {
-      Value raw = intervals->allTrueBegin;
-      Value residue = b.create<arith::RemSIOp>(loc, raw, step);
-      Value adjustment = b.create<arith::MinSIOp>(loc, b.create<arith::SubIOp>(loc, count, raw),
-          b.create<arith::SubIOp>(loc, step, residue));
-      Value aligned = b.create<arith::SelectOp>(loc, b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, residue, zero),
-          raw, b.create<arith::AddIOp>(loc, raw, adjustment));
+      auto alignUp = [&](Value raw) -> Value {
+        Value residue = b.create<arith::RemSIOp>(loc, raw, step);
+        Value adjustment = b.create<arith::MinSIOp>(loc, b.create<arith::SubIOp>(loc, count, raw),
+            b.create<arith::SubIOp>(loc, step, residue));
+        return b.create<arith::SelectOp>(loc, b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, residue, zero),
+            raw, b.create<arith::AddIOp>(loc, raw, adjustment));
+      };
+      Value falseEnd = b.create<arith::SubIOp>(loc, intervals->possibleBegin,
+          b.create<arith::RemSIOp>(loc, intervals->possibleBegin, step));
+      falseEnd = b.create<arith::MinSIOp>(loc, completeEnd, b.create<arith::MaxSIOp>(loc, lower, falseEnd));
+      if (failed(visit(lower, falseEnd, segmentSize, false, omitValidity))) return failure();
+      lower = falseEnd;
+      Value aligned = alignUp(intervals->allTrueBegin);
       Value trueBegin = b.create<arith::MinSIOp>(loc, completeEnd, b.create<arith::MaxSIOp>(loc, lower, aligned));
       Value trueEnd = b.create<arith::SubIOp>(loc, intervals->allTrueEnd,
           b.create<arith::RemSIOp>(loc, intervals->allTrueEnd, step));
       trueEnd = b.create<arith::MaxSIOp>(loc, trueBegin, b.create<arith::MinSIOp>(loc, completeEnd, trueEnd));
-      if (failed(visit(lower, trueBegin, segmentSize, false, omitValidity)) ||
+      if (failed(visit(lower, trueBegin, segmentSize, std::nullopt, omitValidity)) ||
           failed(visit(trueBegin, trueEnd, segmentSize, true, omitValidity))) return failure();
-      lower = trueEnd;
+      Value falseBegin = b.create<arith::MinSIOp>(loc, completeEnd,
+          b.create<arith::MaxSIOp>(loc, trueEnd, alignUp(intervals->possibleEnd)));
+      if (failed(visit(trueEnd, falseBegin, segmentSize, std::nullopt, omitValidity)) ||
+          failed(visit(falseBegin, completeEnd, segmentSize, false, omitValidity))) return failure();
+      lower = completeEnd;
     }
     Value tail = b.create<arith::MaxSIOp>(loc, start, completeEnd);
-    return success(succeeded(visit(lower, completeEnd, segmentSize, false, omitValidity)) &&
-                   succeeded(visit(tail, end, 1, false, omitValidity)));
+    return success(succeeded(visit(lower, completeEnd, segmentSize, std::nullopt, omitValidity)) &&
+                   succeeded(visit(tail, end, 1, std::nullopt, omitValidity)));
   };
   if (specializeState) {
     Value nonempty = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, count, zero);
@@ -311,11 +343,11 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
       OpBuilder::InsertionGuard branch(b);
       b.setInsertionPointToStart(first.thenBlock());
       allocate();
-      if (failed(visitOne(zero, segmentSize, false, true, false))) return failure();
+      if (failed(visitOne(zero, segmentSize, std::nullopt, true, false))) return failure();
       release();
       b.setInsertionPointToStart(first.elseBlock());
       allocate();
-      if (failed(visitOne(zero, 1, false, true, false))) return failure();
+      if (failed(visitOne(zero, 1, std::nullopt, true, false))) return failure();
       release();
     }
     allocate();

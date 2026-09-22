@@ -6,11 +6,30 @@ import statistics
 
 import torch
 
-from .compilation import compile_library
+from .compilation import SCALAR_CTYPES, compile_library
 
 
 _winners: dict[tuple[object, ...], dict[tuple[object, ...], int]] = {}
 _candidate_timings: dict[tuple[object, ...], dict[tuple[object, ...], tuple[float, ...]]] = {}
+
+_DTYPES = {
+    "f16": torch.float16, "bf16": torch.bfloat16, "f32": torch.float32, "f64": torch.float64,
+    "i1": torch.bool, "i8": torch.int8, "i16": torch.int16, "i32": torch.int32, "i64": torch.int64,
+    "ui8": torch.uint8, "ui16": torch.uint16, "ui32": torch.uint32, "ui64": torch.uint64,
+    "f8e4m3fn": torch.float8_e4m3fn, "f8e5m2": torch.float8_e5m2,
+}
+
+
+@dataclass(slots=True)
+class _View:
+    shape: tuple[int, ...]
+    strides: tuple[int, ...]
+    pointer: int
+    allocation: int
+    offset: int
+    dtype: torch.dtype
+    begin: int
+    end: int
 
 
 def _timing_samples(measure, arguments: tuple[object, ...], *, samples: int) -> float:
@@ -19,6 +38,23 @@ def _timing_samples(measure, arguments: tuple[object, ...], *, samples: int) -> 
         raise RuntimeError("native monotonic timing returned a non-positive duration")
     repetitions = min(50, max(1, int(10.0 / first)))
     return statistics.median(measure(*arguments, repetitions) for _ in range(samples))
+
+
+def _measure_candidates(measurements, arguments: tuple[object, ...]) -> tuple[float, ...]:
+    probes = [measure(*arguments, 1) for measure in measurements]
+    if any(elapsed <= 0 for elapsed in probes):
+        raise RuntimeError("native monotonic timing returned a non-positive duration")
+    repetitions = [min(50, max(1, int(10.0 / elapsed))) for elapsed in probes]
+    samples = [[] for _ in measurements]
+    for round_index in range(3):
+        order = list(range(len(measurements)))
+        if round_index == 1:
+            order.reverse()
+        elif round_index == 2:
+            order = order[1:] + order[:1]
+        for candidate in order:
+            samples[candidate].append(measurements[candidate](*arguments, repetitions[candidate]))
+    return tuple(statistics.median(values) for values in samples)
 
 
 @dataclass
@@ -34,8 +70,7 @@ class NativeCall:
         if self.winner is not None:
             return self.winner
         if self.key not in self.program.winners:
-            timings = tuple(_timing_samples(measure, self.native_arguments, samples=3)
-                            for measure in self.program.measurements)
+            timings = _measure_candidates(self.program.measurements, self.native_arguments)
             self.program.winners[self.key] = min(range(len(timings)), key=timings.__getitem__)
             self.program.timings[self.key] = timings
         self.winner = self.program.winners[self.key]
@@ -55,49 +90,65 @@ class NativeProgram:
     def __init__(self, source: str, metadata: dict[str, object], target) -> None:
         self.parameters = metadata["parameters"]
         self.candidates = metadata["candidates"]
-        if not metadata["contiguous_views"] or not metadata["disjoint_outputs"]:
-            raise NotImplementedError("Mojo runtime requires declared contiguous/disjoint-output entry legality")
+        self.contiguous_views = metadata["contiguous_views"]
+        if not metadata["disjoint_outputs"]:
+            raise NotImplementedError("Mojo runtime requires declared disjoint-output entry legality")
         self.compilation = compile_library(source, metadata, target)
         argument_types = []
         for parameter in self.parameters:
             if parameter["kind"] == "view":
                 argument_types.extend([ctypes.c_void_p, *([ctypes.c_int64] * (2 * len(parameter["shape"])))])
             else:
-                argument_types.append(ctypes.c_float if parameter["dtype"] == "f32" else ctypes.c_int64)
+                argument_types.append(SCALAR_CTYPES[parameter["dtype"]])
         self.functions = []
         self.measurements = []
-        for candidate in self.candidates:
-            function = getattr(self.compilation.library, candidate["entry"])
+        for candidate, compilation in zip(self.candidates, self.compilation.libraries):
+            function = getattr(compilation.library, candidate["entry"])
             function.argtypes = argument_types
             function.restype = None
             self.functions.append(function)
-            measure = getattr(self.compilation.library, candidate["entry"] + "_benchmark")
+            measure = getattr(compilation.library, candidate["entry"] + "_benchmark")
             measure.argtypes = [*argument_types, ctypes.c_int64]
             measure.restype = ctypes.c_double
             self.measurements.append(measure)
         self.winners = _winners.setdefault(self.compilation.identity, {})
         self.timings = _candidate_timings.setdefault(self.compilation.identity, {})
 
-    def _view(self, parameter, tensor, dimensions: dict[int, int]) -> None:
-        if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu" or tensor.dtype != torch.float32:
-            raise ValueError(f"{parameter['name']} must be a CPU f32 tensor")
+    def _view(self, parameter, tensor, dimensions: dict[int, int]) -> _View:
+        dtype = _DTYPES[parameter["dtype"]]
+        if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu" or tensor.dtype != dtype:
+            raise ValueError(f"{parameter['name']} must be a CPU {parameter['dtype']} tensor")
         if tensor.numel() == 0:
             raise NotImplementedError("Mojo CPU empty-storage pointer ABI is not implemented")
-        if tensor.ndim != len(parameter["shape"]):
+        shape, strides = tuple(tensor.shape), tuple(tensor.stride())
+        if len(shape) != len(parameter["shape"]):
             raise ValueError(f"{parameter['name']} has an incompatible rank")
-        expected_stride = 1
-        for extent, stride in zip(reversed(tensor.shape), reversed(tensor.stride())):
-            if stride != expected_stride:
-                raise NotImplementedError("Mojo CPU views require canonical contiguous strides")
-            expected_stride *= extent
-        for axis, (static, identity) in enumerate(zip(parameter["shape"], parameter["dimensions"])):
-            extent = tensor.shape[axis]
+        if self.contiguous_views or parameter["access"] != 0:
+            expected_stride = 1
+            for extent, stride in zip(reversed(shape), reversed(strides)):
+                if stride != expected_stride:
+                    raise NotImplementedError("Mojo CPU writable views require canonical contiguous strides")
+                expected_stride *= extent
+        for constraint, stride in zip(parameter["strides"], strides):
+            if constraint is not None and constraint != stride:
+                raise ValueError(f"{parameter['name']} violates an author stride constraint")
+        for static, identity, extent in zip(parameter["shape"], parameter["dimensions"], shape):
             if static >= 0 and static != extent:
                 raise ValueError(f"{parameter['name']} has an incompatible static extent")
             if identity > 0 and identity in dimensions and dimensions[identity] != extent:
                 raise ValueError("CPU views disagree on a canonical dimension identity")
             if identity > 0:
                 dimensions[identity] = extent
+        pointer = tensor.data_ptr()
+        element_size = tensor.element_size()
+        lower, upper = 0, 1
+        for extent, stride in zip(shape, strides):
+            offset = (extent - 1) * stride
+            lower += min(0, offset)
+            upper += max(0, offset)
+        return _View(shape, strides, pointer, tensor.untyped_storage().data_ptr(),
+                     tensor.storage_offset(), dtype, pointer + lower * element_size,
+                     pointer + upper * element_size)
 
     def prepare(self, arguments: tuple[object, ...], *, explicit_outputs: bool = False) -> NativeCall:
         expected = len(self.parameters) if explicit_outputs else sum(
@@ -107,32 +158,33 @@ class NativeProgram:
         dimensions: dict[int, int] = {}
         supplied = iter(arguments)
         all_arguments: list[object] = []
+        bindings: list[_View | None] = []
         for parameter in self.parameters:
             if parameter["kind"] == "view" and parameter["access"] == 1 and not explicit_outputs:
                 all_arguments.append(None)
+                bindings.append(None)
                 continue
             value = next(supplied)
-            if parameter["kind"] == "view":
-                self._view(parameter, value, dimensions)
+            bindings.append(self._view(parameter, value, dimensions)
+                            if parameter["kind"] == "view" else None)
             all_arguments.append(value)
         outputs = []
         for index, parameter in enumerate(self.parameters):
-            if parameter["kind"] != "view" or parameter["access"] != 1:
+            if parameter["kind"] != "view" or parameter["access"] == 0:
                 continue
-            if not explicit_outputs:
+            if parameter["access"] == 1 and not explicit_outputs:
                 shape = tuple(static if static >= 0 else dimensions[identity]
                               for static, identity in zip(parameter["shape"], parameter["dimensions"]))
-                all_arguments[index] = torch.empty(shape, dtype=torch.float32, device="cpu")
-                self._view(parameter, all_arguments[index], dimensions)
+                all_arguments[index] = torch.empty(shape, dtype=_DTYPES[parameter["dtype"]], device="cpu")
+                bindings[index] = self._view(parameter, all_arguments[index], dimensions)
             outputs.append(all_arguments[index])
-        views = [(parameter, value) for parameter, value in zip(self.parameters, all_arguments)
-                 if parameter["kind"] == "view"]
-        for index, (parameter, value) in enumerate(views):
-            begin, end = value.data_ptr(), value.data_ptr() + value.numel() * value.element_size()
+        views = [(parameter, view) for parameter, view in zip(self.parameters, bindings)
+                 if view is not None]
+        for index, (parameter, view) in enumerate(views):
             for other_parameter, other in views[index + 1:]:
-                same_allocation = value.untyped_storage().data_ptr() == other.untyped_storage().data_ptr()
-                overlap = begin < other.data_ptr() + other.numel() * other.element_size() and other.data_ptr() < end
-                if overlap and (parameter["access"] == 1 or other_parameter["access"] == 1):
+                same_allocation = view.allocation == other.allocation
+                overlap = view.begin < other.end and other.begin < view.end
+                if overlap and (parameter["access"] != 0 or other_parameter["access"] != 0):
                     raise NotImplementedError("Mojo CPU overlapping writable views are not implemented")
                 if same_allocation and (parameter["noalias"] or other_parameter["noalias"]):
                     raise ValueError("CPU invocation violates an author noalias constraint")
@@ -141,12 +193,11 @@ class NativeProgram:
         native: list[object] = []
         key: list[object] = []
         allocation_groups: dict[int, int] = {}
-        for parameter, value in zip(self.parameters, all_arguments):
-            if parameter["kind"] == "view":
-                native.extend([value.data_ptr(), *value.shape, *value.stride()])
-                allocation = value.untyped_storage().data_ptr()
-                group = allocation_groups.setdefault(allocation, len(allocation_groups))
-                key.append((tuple(value.shape), tuple(value.stride()), value.storage_offset(), value.dtype, group))
+        for parameter, value, view in zip(self.parameters, all_arguments, bindings):
+            if view is not None:
+                native.extend([view.pointer, *view.shape, *view.strides])
+                group = allocation_groups.setdefault(view.allocation, len(allocation_groups))
+                key.append((view.shape, view.strides, view.offset, view.dtype, group))
             else:
                 native.append(value)
                 key.append(parameter["dtype"])

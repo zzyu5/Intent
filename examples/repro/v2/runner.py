@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -40,6 +40,7 @@ FIELDS = (
 )
 
 WORKER_TIMEOUT_SECONDS = 300
+CPU_WAIT_ENVIRONMENT = {"OMP_WAIT_POLICY": "PASSIVE", "KMP_BLOCKTIME": "0", "GOMP_SPINCOUNT": "0"}
 
 
 def _target(provider: str, entry):
@@ -132,7 +133,7 @@ def _run_entry(
         return ResultRow(entry.kernel, entry.case, None, None, None, error.status)
     except NotImplementedError as error:
         print(f"{provider}:{entry.kernel}: unsupported: {error}")
-        return ResultRow(entry.kernel, entry.case, None, None, None, "unsupported")
+        return ResultRow(entry.kernel, entry.case, None, None, None, "unsupported", str(error))
     except PipelineStageError as error:
         status = f"{error.stage}_failed"
         print(f"{provider}:{entry.kernel}: {status}: {error}")
@@ -143,8 +144,12 @@ def _run_entry(
     except Exception as error:
         status = "adapter_preparation_failed"
         print(f"{provider}:{entry.kernel}: {status}: {error}")
-        return ResultRow(entry.kernel, entry.case, None, None, None, status)
+        return ResultRow(entry.kernel, entry.case, None, None, None, status,
+                         "; ".join(str(error).splitlines()[:2]))
 
+    if provider == "mojo":
+        settings = ", ".join(f"{name}={os.environ.get(name, 'unset')}" for name in CPU_WAIT_ENVIRONMENT)
+        comparison = replace(comparison, note=comparison.note + " CPU idle wait: " + settings + ".")
     try:
         generated_p50, source_p50 = evaluate(
             comparison, before_benchmark=before_benchmark,
@@ -162,6 +167,9 @@ def _run_entry(
             "; ".join(str(error).splitlines()[:2]),
         )
 
+    if comparison.status == "run_only":
+        print(f"{provider}:{entry.kernel}: run_only generated={generated_p50:.6f} ms; no reference")
+        return ResultRow(entry.kernel, entry.case, generated_p50, None, None, "run_only", comparison.note)
     if comparison.status != "pass":
         print(
             f"{provider}:{entry.kernel}: {comparison.status}: "
@@ -247,19 +255,24 @@ def _run_batch(arguments, indexes, publish) -> None:
     with tempfile.TemporaryDirectory(prefix="intentdsl-baseline-v2-") as directory:
         try:
             for index in indexes:
+                entry = BY_PROVIDER[provider][index]
                 output = Path(directory) / f"{index}.csv"
                 phase = output.with_suffix(".phase.json")
                 _write_stage(phase, "worker_startup")
                 command = [
                     sys.executable, "-u", "-m", "repro.v2.runner", provider,
                     "--compiler", arguments.compiler, "--output", str(output),
-                    "--worker-entry", str(index), "--wait-for-benchmark",
+                    "--worker-kernel", entry.kernel, "--worker-case", entry.case,
+                    "--wait-for-benchmark",
                     "--cutile-compiler-timeout", str(arguments.cutile_compiler_timeout),
                 ]
                 if arguments.tuning_config is not None:
                     command.extend(("--tuning-config", str(arguments.tuning_config)))
                 process = subprocess.Popen(
                     command, stdin=subprocess.PIPE, text=True, start_new_session=True,
+                    # Torch preparation and Mojo execution use separate pools
+                    # on the same CPU budget; idle workers must yield the cores.
+                    env={**os.environ, **CPU_WAIT_ENVIRONMENT} if provider == "mojo" else None,
                 )
                 workers.append(_Worker(index, process, output, phase, time.monotonic()))
                 print(f"{provider}:{BY_PROVIDER[provider][index].kernel}: preparing", flush=True)
@@ -273,6 +286,8 @@ def _run_batch(arguments, indexes, publish) -> None:
                     if returncode is not None:
                         if returncode == 0 and worker.output.exists():
                             row = _read_worker_row(worker.output)
+                            if (row.kernel, row.case) != (entry.kernel, entry.case):
+                                raise RuntimeError(f"worker returned {row.kernel}:{row.case} for {entry.kernel}:{entry.case}")
                         else:
                             row = ResultRow(
                                 entry.kernel, entry.case, None, None, None,
@@ -324,7 +339,8 @@ def main() -> None:
                         help="limit for preparation or measurement; scheduling wait is excluded")
     parser.add_argument("--cutile-compiler-timeout", type=int, default=15,
                         help="default external cuTile compiler limit per candidate, in seconds")
-    parser.add_argument("--worker-entry", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-kernel", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-case", help=argparse.SUPPRESS)
     parser.add_argument("--wait-for-benchmark", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args()
     if arguments.worker_timeout <= 0:
@@ -347,8 +363,14 @@ def main() -> None:
         unknown = ", ".join(sorted(selected - {entry.kernel for entry in entries}))
         parser.error(f"unknown {provider} V2 kernel(s): {unknown}")
 
-    if arguments.worker_entry is not None:
-        entry = BY_PROVIDER[provider][arguments.worker_entry]
+    if (arguments.worker_kernel is None) != (arguments.worker_case is None):
+        parser.error("worker kernel and case must be provided together")
+    if arguments.worker_kernel is not None:
+        matching = [entry for entry in BY_PROVIDER[provider]
+                    if (entry.kernel, entry.case) == (arguments.worker_kernel, arguments.worker_case)]
+        if len(matching) != 1:
+            parser.error("worker kernel/case no longer identifies one registry entry")
+        entry = matching[0]
         phase_path = arguments.output.with_suffix(".phase.json")
         with observe_stages(lambda stage: _write_stage(phase_path, stage)):
             compile_budget = nullcontext()

@@ -13,6 +13,34 @@ using namespace mlir;
 
 namespace intent::cpu {
 
+std::optional<SmallVector<std::pair<unsigned, unsigned>>> unitReshapeAxes(Operation *operation) {
+  if (!operation) return std::nullopt;
+  bool expanding = isa<memref::ExpandShapeOp>(operation);
+  if (!expanding && !isa<memref::CollapseShapeOp>(operation)) return std::nullopt;
+  auto source = cast<MemRefType>(operation->getOperand(0).getType());
+  auto result = cast<MemRefType>(operation->getResult(0).getType());
+  auto groups = expanding ? cast<memref::ExpandShapeOp>(operation).getReassociationIndices()
+                          : cast<memref::CollapseShapeOp>(operation).getReassociationIndices();
+  auto wider = expanding ? result : source;
+  auto narrower = expanding ? source : result;
+  SmallVector<std::pair<unsigned, unsigned>> axes;
+  for (auto [axis, group] : llvm::enumerate(groups)) {
+    std::optional<unsigned> nonunit;
+    for (int64_t member : group)
+      if (wider.getDimSize(member) != 1) {
+        if (nonunit) return std::nullopt;
+        nonunit = member;
+      }
+    if (!nonunit) {
+      if (narrower.getDimSize(axis) != 1) return std::nullopt;
+      continue;
+    }
+    if (wider.getDimSize(*nonunit) != narrower.getDimSize(axis)) return std::nullopt;
+    axes.emplace_back(expanding ? axis : *nonunit, expanding ? *nonunit : axis);
+  }
+  return axes;
+}
+
 bool isMatrixContraction(linalg::GenericOp operation) {
   if (operation.getInputs().size() != 2 || operation.getOutputs().size() != 1 ||
       operation.getNumResults()) return false;
@@ -28,9 +56,19 @@ bool isMatrixContraction(linalg::GenericOp operation) {
           utils::IteratorType::reduction}) return false;
   Block &body = operation.getRegion().front();
   auto fma = body.getTerminator()->getOperand(0).getDefiningOp<math::FmaOp>();
-  if (fma)
-    return llvm::hasSingleElement(body.without_terminator()) && fma.getA() == body.getArgument(0) &&
-        fma.getB() == body.getArgument(1) && fma.getC() == body.getArgument(2);
+  if (fma) {
+    if (fma.getC() != body.getArgument(2)) return false;
+    llvm::SmallPtrSet<Operation *, 4> computation{fma};
+    auto input = [&](Value value, Value argument) {
+      if (value == argument) return true;
+      auto widen = value.getDefiningOp<arith::ExtFOp>();
+      if (!widen || widen.getIn() != argument || widen.getType() != fma.getType()) return false;
+      computation.insert(widen);
+      return true;
+    };
+    return input(fma.getA(), body.getArgument(0)) && input(fma.getB(), body.getArgument(1)) &&
+        computation.size() == static_cast<size_t>(std::distance(body.begin(), body.end()) - 1);
+  }
   auto add = body.getTerminator()->getOperand(0).getDefiningOp<arith::AddIOp>();
   if (!add || !body.getArgument(0).getType().isSignlessInteger(8) ||
       !body.getArgument(1).getType().isSignlessInteger(8) ||
@@ -46,7 +84,11 @@ bool isMatrixContraction(linalg::GenericOp operation) {
 Value PhysicalProgramAnalysis::storageRoot(Value memory) {
   while (true) {
     if (auto view = memory.getDefiningOp<memref::SubViewOp>()) memory = view.getSource();
+    else if (auto view = memory.getDefiningOp<memref::ExpandShapeOp>()) memory = view.getSrc();
+    else if (auto view = memory.getDefiningOp<memref::CollapseShapeOp>()) memory = view.getSrc();
     else if (auto cast = memory.getDefiningOp<memref::CastOp>()) memory = cast.getSource();
+    else if (auto cast = memory.getDefiningOp<memref::ReinterpretCastOp>()) memory = cast.getSource();
+    else if (auto metadata = memory.getDefiningOp<memref::ExtractStridedMetadataOp>()) memory = metadata.getSource();
     else if (auto argument = dyn_cast<BlockArgument>(memory)) {
       auto tasks = dyn_cast<TasksOp>(argument.getOwner()->getParentOp());
       if (!tasks || argument.getArgNumber() == 0) return memory;
@@ -78,11 +120,9 @@ bool PhysicalProgramAnalysis::mayReadAt(Value memory, Operation *from, Operation
   for (Operation *operation = from->getNextNode(); operation != to;
        operation = operation->getNextNode()) {
     if (isMemoryEffectFree(operation)) continue;
-    auto effects = dyn_cast<MemoryEffectOpInterface>(operation);
+    auto effects = getEffectsRecursively(operation);
     if (!effects) return false;
-    SmallVector<MemoryEffects::EffectInstance> instances;
-    effects.getEffects(instances);
-    for (auto &effect : instances) {
+    for (auto &effect : *effects) {
       if (isa<MemoryEffects::Read>(effect.getEffect())) continue;
       if (!effect.getValue() || storageRoot(effect.getValue()) == root) return false;
     }
@@ -104,6 +144,24 @@ SmallVector<MemoryAccess> PhysicalProgramAnalysis::accesses(Operation *scope) {
         add(output.get(), generic.payloadUsesValueFromOperand(&output), true);
     } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
       for (Value input : reduce.getInputs()) add(input, true, false);
+    } else if (auto scan = dyn_cast<ScanOp>(operation)) {
+      for (Value input : scan.getSources()) add(input, true, false);
+      for (Value input : scan.getInitials()) add(input, true, false);
+      for (Value input : scan.getCaptures()) add(input, true, false);
+      for (Value output : scan.getOutputs()) add(output, false, true);
+    } else if (auto histogram = dyn_cast<HistogramOp>(operation)) {
+      add(histogram.getValues(), true, false); add(histogram.getValid(), true, false);
+      add(histogram.getOutput(), false, true);
+    } else if (auto atomic = dyn_cast<AtomicLoadOp>(operation)) {
+      add(atomic.getTarget(), true, false);
+    } else if (auto atomic = dyn_cast<AtomicStoreOp>(operation)) {
+      add(atomic.getTarget(), false, true);
+    } else if (auto atomic = dyn_cast<AtomicRMWOp>(operation)) {
+      add(atomic.getTarget(), true, true);
+    } else if (auto atomic = dyn_cast<AtomicCompareExchangeOp>(operation)) {
+      add(atomic.getTarget(), true, true);
+    } else if (auto update = dyn_cast<memref::GenericAtomicRMWOp>(operation)) {
+      add(update.getMemref(), true, true);
     } else if (isa<RegionFoldOp, RegionScanOp>(operation)) {
       RegionProgram program(operation);
       for (Value input : program.sources()) add(input, true, false);
@@ -148,6 +206,8 @@ SmallVector<AllocationFacts> PhysicalProgramAnalysis::allocations() {
       else if (auto copy = dyn_cast<memref::CopyOp>(user)) writes = copy.getTarget() == value;
       else if (auto quantize = dyn_cast<QuantizeOp>(user)) writes = quantize.getOutput() == value;
       else if (auto dot = dyn_cast<QuantizedDotOp>(user)) writes = dot.getOutput() == value;
+      else if (auto scan = dyn_cast<ScanOp>(user)) writes = llvm::is_contained(scan.getOutputs(), value);
+      else if (auto histogram = dyn_cast<HistogramOp>(user)) writes = histogram.getOutput() == value;
       else if (!isa<memref::LoadOp, memref::DimOp, memref::DeallocOp, ReduceOp, QuantizedDotOp>(user))
         multiple = true;
       if (writes) {
@@ -164,16 +224,29 @@ SmallVector<AllocationFacts> PhysicalProgramAnalysis::allocations() {
 LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
   auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
   if (!interface || interface.getArguments().size() != function.getNumArguments() ||
-      !interface.getContiguousViews() || !interface.getDisjointOutputs())
+      !interface.getDisjointOutputs())
     return function.emitError("CPU function requires its complete typed native interface");
   for (auto [argument, field] : llvm::zip(function.getArguments(), interface.getArguments())) {
+    auto storageType = [&](Type logical) -> Type {
+      if (auto integer = dyn_cast<IntegerType>(logical)) return IntegerType::get(function.getContext(), integer.getWidth());
+      return logical;
+    };
     if (auto view = dyn_cast<ViewArgumentAttr>(field)) {
       auto type = dyn_cast<MemRefType>(argument.getType());
-      if (!type || type.getElementType() != view.getElementType() ||
-          type.getShape() != view.getShape().asArrayRef() || !type.getLayout().isIdentity())
+      if (!type || type.getElementType() != storageType(view.getElementType()) ||
+          type.getShape() != view.getShape().asArrayRef())
         return function.emitError("CPU view type disagrees with its physical ABI");
+      SmallVector<int64_t> strides;
+      int64_t offset;
+      if (failed(type.getStridesAndOffset(strides, offset)) || offset != 0 ||
+          ((interface.getContiguousViews() || view.getAccess() != 0) && !type.getLayout().isIdentity()))
+        return function.emitError("CPU view layout disagrees with its physical ABI");
+      for (auto [constraint, stride] : llvm::zip(view.getStrides(), strides))
+        if (auto fixed = dyn_cast<IntegerAttr>(constraint);
+            fixed && !ShapedType::isDynamic(stride) && fixed.getInt() != stride)
+          return function.emitError("CPU view layout contradicts its declared stride constraint");
     } else if (auto scalar = dyn_cast<ScalarArgumentAttr>(field)) {
-      if (scalar.getType() != argument.getType())
+      if (storageType(scalar.getType()) != argument.getType())
         return function.emitError("CPU scalar type disagrees with its physical ABI");
     } else return function.emitError("CPU interface contains an unknown argument schema");
   }
@@ -201,18 +274,36 @@ LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
   bool invalid = false;
   for (MemoryAccess access : accesses(function)) {
     auto view = externalView(access.memory);
-    if (access.write && view && view.getAccess() != 1) {
+    if (access.write && view && view.getAccess() == 0) {
       access.operation->emitError("CPU write contradicts its input-only ABI");
       invalid = true;
     }
   }
   function.walk([&](Operation *operation) {
-    if (realized && (isa<RegionFoldOp, RegionScanOp, ReduceOp, QuantizeOp, QuantizedDotOp>(operation) || operation->getName().getDialectNamespace() == "linalg")) {
+    if (realized && (isa<RegionFoldOp, RegionScanOp, ReduceOp, ScanOp, HistogramOp, QuantizeOp, QuantizedDotOp>(operation) || operation->getName().getDialectNamespace() == "linalg")) {
       operation->emitError("CPU structured operation has not been materialized for the provider");
       invalid = true;
     }
   });
   return failure(invalid);
+}
+
+bool supportsVectorScan(ScanOp operation) {
+  if (operation.isDestinationPassing()) return false;
+  auto type = cast<MemRefType>(operation.getSources()[0].getType());
+  if (operation.getAxis() + 1 != static_cast<uint64_t>(type.getRank())) return false;
+  auto contiguous = [](Value memory) {
+    auto type = cast<MemRefType>(memory.getType());
+    SmallVector<int64_t> strides;
+    int64_t offset;
+    return !type.getElementType().isInteger(1) && succeeded(type.getStridesAndOffset(strides, offset)) &&
+        (strides.back() == 1 || ShapedType::isDynamic(strides.back()));
+  };
+  return llvm::all_of(operation.getSources(), contiguous) && llvm::all_of(operation.getOutputs(), contiguous) &&
+      llvm::all_of(operation.getCombine().front().without_terminator(), [](Operation &instruction) {
+        return isa<arith::ConstantOp>(instruction) ||
+            (instruction.hasTrait<OpTrait::Elementwise>() && instruction.getNumResults() == 1);
+      });
 }
 
 LogicalResult verifyCPUProgram(ModuleOp module, bool realized) {

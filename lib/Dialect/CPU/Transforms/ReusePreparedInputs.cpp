@@ -1,19 +1,312 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
+#include "ImplementationInputs.h"
+#include "Utilities.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/OperationSupport.h"
+#include "mlir/Transforms/RegionUtils.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SetVector.h"
+#include <functional>
 
 using namespace mlir;
 namespace intent::cpu {
 namespace {
 
 struct PreparedInput {
-  linalg::GenericOp producer;
+  linalg::LinalgOp producer;
   memref::AllocOp allocation;
   memref::DeallocOp end;
   ImplementationAttr consumer;
 };
+
+std::optional<PreparedInput> scopedInput(linalg::LinalgOp producer, Operation *loop,
+    PhysicalProgramAnalysis &physical, ArrayRef<MemoryEffects::EffectInstance> effects,
+    ArrayRef<MemoryAccess> accesses, const llvm::SmallDenseSet<Value> &groupInputs) {
+  if (producer->getNumResults() || producer.getNumDpsInits() != 1 || producer.getNumReductionLoops() ||
+      !producer.getIndexingMapsArray().back().isIdentity() ||
+      !producer->getRegion(0).front().getArguments().back().use_empty()) return std::nullopt;
+  auto allocation = producer.getDpsInits()[0].getDefiningOp<memref::AllocOp>();
+  if (!allocation || allocation->getBlock() != producer->getBlock() ||
+      !allocation->isBeforeInBlock(producer)) return std::nullopt;
+  auto stable = [&](Value memory) {
+    if (physical.isReadOnly(memory)) return true;
+    Value root = physical.storageRoot(memory);
+    if (groupInputs.contains(root)) return true;
+    Operation *owner = root.getDefiningOp();
+    if (!isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(owner) || loop->isAncestor(owner)) return false;
+    if (llvm::any_of(accesses, [&](const MemoryAccess &access) {
+          return access.write && physical.storageRoot(access.memory) == root;
+        })) return false;
+    return llvm::all_of(effects, [&](const MemoryEffects::EffectInstance &effect) {
+      return isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect()) ||
+          (effect.getValue() && physical.storageRoot(effect.getValue()) != root);
+    });
+  };
+  for (Value input : producer.getDpsInputs())
+    if (isa<MemRefType>(input.getType()) && !stable(input)) return std::nullopt;
+  for (Operation &operation : producer->getRegion(0).front().without_terminator()) {
+    if (operation.getNumRegions()) return std::nullopt;
+    if (auto load = dyn_cast<memref::LoadOp>(operation)) {
+      if (!stable(load.getMemref())) return std::nullopt;
+    } else if (!isMemoryEffectFree(&operation)) return std::nullopt;
+  }
+
+  PreparedInput result{producer, allocation, {}, {}};
+  SmallVector<Value> aliases{allocation.getResult()};
+  llvm::SmallDenseSet<Value> seen;
+  SmallVector<Operation *> reads;
+  for (unsigned i = 0; i < aliases.size(); ++i) {
+    Value value = aliases[i];
+    if (!seen.insert(value).second) continue;
+    for (Operation *user : value.getUsers()) {
+      if (user == producer) continue;
+      if (!loop->isAncestor(user)) return std::nullopt;
+      if (auto view = dyn_cast<memref::SubViewOp>(user)) aliases.push_back(view.getResult());
+      else if (auto cast = dyn_cast<memref::CastOp>(user)) aliases.push_back(cast.getResult());
+      else if (auto view = dyn_cast<memref::ReinterpretCastOp>(user)) aliases.push_back(view.getResult());
+      else if (isa<memref::DimOp>(user)) continue;
+      else if (auto end = dyn_cast<memref::DeallocOp>(user)) {
+        if (value != allocation.getResult() || result.end || end->getBlock() != producer->getBlock())
+          return std::nullopt;
+        result.end = end;
+      } else {
+        if (auto copy = dyn_cast<memref::CopyOp>(user)) {
+          if (physical.storageRoot(copy.getTarget()) == allocation.getResult()) return std::nullopt;
+        } else if (auto generic = dyn_cast<linalg::LinalgOp>(user)) {
+          for (Value output : generic.getDpsInits())
+            if (physical.storageRoot(output) == allocation.getResult()) return std::nullopt;
+        } else if (!isa<memref::LoadOp>(user)) return std::nullopt;
+        reads.push_back(user);
+      }
+    }
+  }
+  if (!result.end || reads.empty() || !producer->isBeforeInBlock(result.end)) return std::nullopt;
+  for (Operation *read : reads) {
+    Operation *ancestor = producer->getBlock()->findAncestorOpInBlock(*read);
+    if (!ancestor || !producer->isBeforeInBlock(ancestor) || !ancestor->isBeforeInBlock(result.end))
+      return std::nullopt;
+  }
+  return result;
+}
+
+Value inputGroupSize(OpBuilder &builder, scf::ParallelOp parallel, int64_t divisor, int64_t workers) {
+  Location loc = parallel.getLoc();
+  Value zero = index(builder, loc, 0), one = index(builder, loc, 1);
+  Value remaining = index(builder, loc, workers);
+  auto account = [&](scf::ParallelOp owner, unsigned axes) {
+    for (unsigned axis = 0; axis < axes; ++axis) {
+      auto step = getConstantIntValue(owner.getStep()[axis]);
+      if (!step || *step <= 0) continue;
+      Value extent = builder.create<arith::SubIOp>(loc, owner.getUpperBound()[axis], owner.getLowerBound()[axis]);
+      extent = builder.create<arith::MaxSIOp>(loc, extent, zero);
+      Value count = builder.create<arith::CeilDivSIOp>(loc, extent, owner.getStep()[axis]);
+      count = builder.create<arith::MaxSIOp>(loc, count, one);
+      remaining = builder.create<arith::CeilDivSIOp>(loc, remaining, count);
+    }
+  };
+  account(parallel, parallel.getNumLoops() - 1);
+  for (Operation *parent = parallel->getParentOp(); parent; parent = parent->getParentOp())
+    if (auto outer = dyn_cast<scf::ParallelOp>(parent)) account(outer, outer.getNumLoops());
+  Value budget = builder.create<arith::DivSIOp>(loc, parallel.getUpperBound().back(), remaining);
+  SmallVector<int64_t> sizes{divisor};
+  while (sizes.back() % 2 == 0) sizes.push_back(sizes.back() / 2);
+  if (sizes.back() != 1) sizes.push_back(1);
+  Value size = one;
+  // Choose subgroup sizes that divide the original quotient cohort, retaining
+  // enough nominal worksets for the worker budget across parallel axes.
+  for (int64_t candidate : llvm::reverse(sizes)) {
+    if (candidate == 1) continue;
+    Value value = index(builder, loc, candidate);
+    Value fits = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge, budget, value);
+    size = builder.create<arith::SelectOp>(loc, fits, value, size);
+  }
+  return size;
+}
+
+LogicalResult groupScopedInputs(func::FuncOp function, const ImplementationRegistry &implementations) {
+  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  if (!interface || !interface.getDisjointOutputs()) return success();
+  auto configuration = function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration");
+  llvm::DenseMap<Value, SmallVector<memref::SubViewOp>> requestedWindows;
+  auto requests = function.walk([&](linalg::GenericOp operation) -> WalkResult {
+    if (!isMatrixContraction(operation) || operation->hasAttr("intent_cpu.microtile")) return WalkResult::advance();
+    auto implementation = implementations.lookup(operation);
+    if (failed(implementation)) return WalkResult::interrupt();
+    if (!(*implementation)->inputs) return WalkResult::advance();
+    auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
+    for (auto requirement : (*implementation)->inputs(operation, configuration, binding)) {
+      if (requirement.operand >= operation.getInputs().size()) continue;
+      Value source = operation.getInputs()[requirement.operand];
+      auto window = consumerWindow(source, requirement, operation);
+      if (!window) continue;
+      Value base = window->view.getSource();
+      if (!base.getDefiningOp()) continue;
+      Operation *owner = base.getDefiningOp()->getParentOp();
+      bool serial = true;
+      for (Operation *parent = operation->getParentOp(); parent != owner; parent = parent->getParentOp()) {
+        if (auto loop = dyn_cast<scf::ForOp>(parent)) serial &= loop.getNumResults() == 0;
+        else if (!isa<scf::IfOp>(parent)) { serial = false; break; }
+      }
+      if (serial) requestedWindows[base].push_back(window->view);
+    }
+    return WalkResult::advance();
+  });
+  if (requests.wasInterrupted()) return failure();
+  SmallVector<Operation *> loops;
+  function.walk([&](Operation *operation) {
+    if (isa<scf::ForOp, scf::ParallelOp>(operation)) loops.push_back(operation);
+  });
+  for (Operation *loop : llvm::reverse(loops)) {
+    Value lower, upper, step, induction;
+    SmallVector<Value> outerCoordinates;
+    Block *body;
+    if (auto serial = dyn_cast<scf::ForOp>(loop)) {
+      if (serial.getNumResults()) continue;
+      lower = serial.getLowerBound(); upper = serial.getUpperBound(); step = serial.getStep();
+      induction = serial.getInductionVar(); body = serial.getBody();
+    } else {
+      auto parallel = cast<scf::ParallelOp>(loop);
+      if (!parallel.getNumLoops() || parallel.getNumResults()) continue;
+      lower = parallel.getLowerBound().back(); upper = parallel.getUpperBound().back(); step = parallel.getStep().back();
+      induction = parallel.getInductionVars().back(); body = parallel.getBody();
+      llvm::append_range(outerCoordinates, ValueRange(parallel.getInductionVars()).drop_back());
+    }
+    if (getConstantIntValue(lower) != 0 || getConstantIntValue(step) != 1) continue;
+    auto effects = getEffectsRecursively(loop);
+    if (!effects) continue;
+    bool knownEffects = true;
+    loop->walk([&](Operation *operation) {
+      if (!isa<MemoryEffectOpInterface>(operation) &&
+          !operation->hasTrait<OpTrait::HasRecursiveMemoryEffects>()) knownEffects = false;
+    });
+    if (!knownEffects) continue;
+    PhysicalProgramAnalysis physical(function);
+    auto accesses = physical.accesses(loop);
+    for (auto quotient : body->getOps<arith::FloorDivSIOp>()) {
+      auto divisor = getConstantIntValue(quotient.getRhs());
+      if (quotient.getLhs() != induction || !divisor || *divisor <= 1) continue;
+      SmallVector<PreparedInput> preparations;
+      llvm::SetVector<Operation *> dependencies;
+      llvm::SmallDenseSet<Value> groupInputs;
+      bool groupDependent = false;
+      for (Operation &operation : body->without_terminator()) {
+        llvm::SetVector<Operation *> needed;
+        bool usesQuotient = false;
+        std::function<bool(Value)> invariant = [&](Value value) {
+          if (value == quotient.getResult()) { usesQuotient = true; return true; }
+          if (groupInputs.contains(value) || llvm::is_contained(outerCoordinates, value)) return true;
+          Operation *scope = value.getParentRegion()->getParentOp();
+          if (scope != loop && !loop->isAncestor(scope)) return true;
+          Operation *definition = value.getDefiningOp();
+          if (!definition || definition->getBlock() != body || definition->getNumRegions() ||
+              !isMemoryEffectFree(definition)) return false;
+          if (needed.contains(definition)) return true;
+          if (!llvm::all_of(definition->getOperands(), invariant)) return false;
+          needed.insert(definition);
+          return true;
+        };
+        if (auto view = dyn_cast<memref::SubViewOp>(operation);
+            view && requestedWindows.count(view.getResult()) && physical.isReadOnly(view)) {
+          Value root = physical.storageRoot(view);
+          bool stable = llvm::all_of(*effects, [&](const MemoryEffects::EffectInstance &effect) {
+            if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect())) return true;
+            Value memory = effect.getValue();
+            if (!memory || !isa<MemRefType>(memory.getType()) ||
+                !isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect())) return false;
+            Value written = physical.storageRoot(memory);
+            if (written == root) return false;
+            if (isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(written.getDefiningOp())) return true;
+            auto external = physical.externalView(written);
+            return external && external.getAccess() != 0;
+          });
+          if (stable && llvm::any_of(requestedWindows[view], [&](memref::SubViewOp window) {
+                return hasIndependentWindowCoordinates(window, loop, quotient.getResult());
+              }) && invariant(view.getResult())) {
+            // Share only the invariant descriptor here. The selected input
+            // supply retains its original guards when it later fills storage.
+            dependencies.insert(needed.begin(), needed.end());
+            groupDependent |= usesQuotient;
+          }
+          continue;
+        }
+        auto producer = dyn_cast<linalg::LinalgOp>(operation);
+        if (!producer) continue;
+        auto prepared = scopedInput(producer, loop, physical, *effects, accesses, groupInputs);
+        if (!prepared) continue;
+        llvm::SetVector<Value> inputs;
+        getUsedValuesDefinedAbove(producer->getRegion(0), inputs);
+        auto operands = producer.getDpsInputs();
+        inputs.insert(operands.begin(), operands.end());
+        inputs.insert(prepared->allocation->operand_begin(), prepared->allocation->operand_end());
+        if (!llvm::all_of(inputs, invariant)) continue;
+        dependencies.insert(needed.begin(), needed.end());
+        preparations.push_back(*prepared);
+        groupInputs.insert(prepared->allocation.getResult());
+        groupDependent |= usesQuotient;
+      }
+      if (!groupDependent) continue;
+      OpBuilder builder(loop);
+      Location loc = loop->getLoc();
+      scf::ParallelOp parallel = dyn_cast<scf::ParallelOp>(loop), outerParallel;
+      auto capabilities = function->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities");
+      Value size = parallel ? inputGroupSize(builder, parallel, *divisor, capabilities.getWorkers())
+                            : index(builder, loc, *divisor);
+      Value originalDivisor = index(builder, loc, *divisor);
+      Value count = builder.create<arith::CeilDivSIOp>(loc, upper, size);
+      Value ordinal;
+      Block *group;
+      if (parallel) {
+        SmallVector<Value> ends(parallel.getUpperBound());
+        ends.back() = count;
+        outerParallel = builder.create<scf::ParallelOp>(loc, parallel.getLowerBound(), ends, parallel.getStep());
+        group = outerParallel.getBody(); ordinal = outerParallel.getInductionVars().back();
+      } else {
+        auto outer = builder.create<scf::ForOp>(loc, lower, count, step);
+        group = outer.getBody(); ordinal = outer.getInductionVar();
+      }
+      builder.setInsertionPointToStart(group);
+      Value begin = multiply(builder, loc, ordinal, size);
+      Value sourceGroup = builder.create<arith::DivSIOp>(loc, begin, originalDivisor);
+      Value remaining = builder.create<arith::SubIOp>(loc, upper, begin);
+      Value extent = builder.create<arith::MinSIOp>(loc, size, remaining);
+      Value end = add(builder, loc, begin, extent);
+      if (parallel) {
+        auto inner = builder.create<scf::ForOp>(loc, begin, end, step);
+        auto replacements = outerParallel.getInductionVars();
+        for (auto [original, replacement] : llvm::zip(outerCoordinates, ArrayRef(replacements).drop_back()))
+          original.replaceAllUsesWith(replacement);
+        induction.replaceAllUsesWith(inner.getInductionVar());
+        for (Operation &operation : llvm::make_early_inc_range(body->without_terminator()))
+          operation.moveBefore(inner.getBody()->getTerminator());
+        parallel.erase();
+        loop = inner;
+        body = inner.getBody();
+      } else {
+        auto serial = cast<scf::ForOp>(loop);
+        serial->moveBefore(group->getTerminator());
+        serial.setLowerBound(begin); serial.setUpperBound(end);
+      }
+      quotient.getResult().replaceAllUsesWith(sourceGroup);
+      quotient.erase();
+      for (auto preparation : preparations) {
+        dependencies.insert(preparation.allocation);
+        dependencies.insert(preparation.producer);
+      }
+      SmallVector<Operation *> ordered;
+      for (Operation &operation : body->without_terminator())
+        if (dependencies.contains(&operation)) ordered.push_back(&operation);
+      // Preserve the preparation chain's original order, including allocations
+      // used by later views and producers; all consumers finish before release.
+      for (Operation *operation : ordered) operation->moveBefore(loop);
+      for (auto preparation : preparations) preparation.end->moveAfter(loop);
+      break;
+    }
+  }
+  return success();
+}
 
 std::optional<PreparedInput> preparedInput(linalg::GenericOp producer) {
   if (producer.getNumResults() || producer.getOutputs().size() != 1 ||
@@ -25,7 +318,7 @@ std::optional<PreparedInput> preparedInput(linalg::GenericOp producer) {
   auto allocation = output.getDefiningOp<memref::AllocOp>();
   if (!allocation || allocation->getBlock() != producer->getBlock() ||
       !allocation->isBeforeInBlock(producer)) return std::nullopt;
-  PreparedInput result{producer, allocation, {}, {}};
+  PreparedInput result{cast<linalg::LinalgOp>(producer.getOperation()), allocation, {}, {}};
   SmallVector<Value> aliases{output};
   llvm::SmallDenseSet<Value> seen;
   SmallVector<Operation *> users;
@@ -76,7 +369,7 @@ bool equivalent(PreparedInput &lhs, PreparedInput &rhs, PhysicalProgramAnalysis 
           return llvm::is_contained(map.getResults(), loop);
         })) return false;
   }
-  for (Value input : lhs.producer.getInputs())
+  for (Value input : lhs.producer.getDpsInputs())
     if (isa<MemRefType>(input.getType()) && !physical.mayReadAt(input, lhs.producer, rhs.producer)) return false;
   llvm::DenseMap<Value, Value> pairs;
   pairs[lhs.allocation] = rhs.allocation;
@@ -87,7 +380,8 @@ bool equivalent(PreparedInput &lhs, PreparedInput &rhs, PhysicalProgramAnalysis 
 
 }
 
-LogicalResult reusePreparedInputs(func::FuncOp function) {
+LogicalResult reusePreparedInputs(func::FuncOp function, const ImplementationRegistry &implementations) {
+  if (failed(groupScopedInputs(function, implementations))) return failure();
   bool changed;
   do {
     changed = false;

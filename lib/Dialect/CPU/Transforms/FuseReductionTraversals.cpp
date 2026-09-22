@@ -69,12 +69,14 @@ bool fuse(scf::ForOp first, scf::ForOp second, DominanceInfo &dominance) {
     }
     if (!consumes) return false;
   }
+  // Captures must be available before the joined loop. A completed result of
+  // the first reduction cannot be consumed during that same traversal.
   for (Value operand : second.getInitArgs())
-    if (!dominance.dominates(operand, first)) return false;
-  for (Operation &operation : second.getBody()->without_terminator())
+    if (!dominance.properlyDominates(operand, first)) return false;
+  for (Operation &operation : *second.getBody())
     for (Value operand : operation.getOperands())
       if (!second.getRegion().isAncestor(operand.getParentRegion()) &&
-          !dominance.dominates(operand, first)) return false;
+          !dominance.properlyDominates(operand, first)) return false;
 
   OpBuilder b(first);
   SmallVector<Value> initial(first.getInitArgs());

@@ -1,5 +1,8 @@
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/DialectImplementation.h"
+#include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -21,35 +24,80 @@ void IntentCPUDialect::initialize() {
       >();
 }
 
+namespace {
+
+struct CanonicalViewDimension : OpRewritePattern<memref::DimOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(memref::DimOp operation, PatternRewriter &rewriter) const override {
+    auto argument = dyn_cast<BlockArgument>(operation.getSource());
+    auto axis = operation.getConstantIndex();
+    if (!argument || !axis) return failure();
+    auto function = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
+    if (!function || argument.getOwner() != &function.front()) return failure();
+    auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+    if (!interface) return failure();
+    auto view = dyn_cast<ViewArgumentAttr>(interface.getArguments()[argument.getArgNumber()]);
+    if (!view || *axis < 0 || *axis >= view.getDimensions().size()) return failure();
+    int64_t identity = view.getDimensions()[*axis];
+    if (!identity) return failure();
+    // CPU invocation binds every occurrence of a nonzero dimension identity
+    // to the same extent; retain one entry view as its SSA representative.
+    for (auto [number, field] : llvm::enumerate(interface.getArguments())) {
+      auto candidate = dyn_cast<ViewArgumentAttr>(field);
+      if (!candidate) continue;
+      for (auto [dimension, value] : llvm::enumerate(candidate.getDimensions().asArrayRef())) {
+        if (value != identity) continue;
+        if (number == argument.getArgNumber() && dimension == static_cast<size_t>(*axis)) return failure();
+        rewriter.replaceOpWithNewOp<memref::DimOp>(operation, function.getArgument(number), dimension);
+        return success();
+      }
+    }
+    return failure();
+  }
+};
+
+}
+
+void IntentCPUDialect::getCanonicalizationPatterns(RewritePatternSet &patterns) const {
+  patterns.add<CanonicalViewDimension>(getContext());
+}
+
 LogicalResult ViewArgumentAttr::verify(
     llvm::function_ref<InFlightDiagnostic()> error, StringAttr name,
     Type element, DenseI64ArrayAttr shape, DenseI64ArrayAttr dimensions,
-    uint32_t access, StringAttr alias, bool) {
+    ArrayAttr strides, uint32_t access, StringAttr alias, bool) {
   if (!name || name.getValue().empty() ||
-      (!element.isF32() && !element.isUnsignedInteger(8) &&
-       !element.isSignlessInteger(8) && !element.isSignlessInteger(32)) || !shape || !dimensions ||
-      shape.size() != dimensions.size() || access > 1 || !alias)
-    return error() << "CPU view argument requires a named f32/u8/i8/i32 In/Out view and complete shape identities";
+      (!element.isF16() && !element.isBF16() && !element.isF32() && !element.isF64() &&
+       !llvm::isa<Float8E4M3FNType, Float8E5M2Type>(element) &&
+       !element.isInteger(8) && !element.isInteger(16) && !element.isInteger(32) &&
+       !element.isInteger(64) && !element.isInteger(1)) || !shape || !dimensions ||
+      shape.size() != dimensions.size() || !strides || strides.size() != static_cast<size_t>(shape.size()) || access > 2 || !alias)
+    return error() << "CPU view argument requires a named numeric view and complete shape identities";
   for (auto [size, dimension] : llvm::zip(shape.asArrayRef(), dimensions.asArrayRef()))
     if ((size < 0 && !ShapedType::isDynamic(size)) || dimension < 0 ||
         (ShapedType::isDynamic(size) && dimension == 0))
       return error() << "CPU view extent or dynamic dimension identity is invalid";
+  for (Attribute stride : strides)
+    if (!mlir::isa<UnitAttr, IntegerAttr>(stride))
+      return error() << "CPU stride constraint must be an integer or unconstrained";
   return success();
 }
 
 LogicalResult ScalarArgumentAttr::verify(
     llvm::function_ref<InFlightDiagnostic()> error, StringAttr name, Type type) {
   if (!name || name.getValue().empty() ||
-      (!type.isF32() && !type.isIndex() && !type.isInteger(64)))
-    return error() << "CPU scalar argument requires a name and f32/index/i64 type";
+      (!type.isF32() && !type.isF64() && !type.isIndex() && !type.isInteger(8) &&
+       !type.isInteger(16) && !type.isInteger(32) && !type.isInteger(64) && !type.isInteger(1)))
+    return error() << "CPU scalar argument requires a name and a supported C ABI numeric type";
   return success();
 }
 
 LogicalResult InterfaceAttr::verify(
     llvm::function_ref<InFlightDiagnostic()> error, ArrayAttr arguments,
-    bool contiguousViews, bool disjointOutputs) {
-  if (!arguments || arguments.empty() || !contiguousViews || !disjointOutputs)
-    return error() << "CPU interface requires contiguous views and disjoint outputs";
+    bool, bool disjointOutputs) {
+  if (!arguments || arguments.empty() || !disjointOutputs)
+    return error() << "CPU interface requires typed arguments and disjoint outputs";
   llvm::DenseSet<StringAttr> names;
   for (Attribute argument : arguments) {
     StringAttr name;

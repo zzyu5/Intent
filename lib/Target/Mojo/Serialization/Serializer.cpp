@@ -18,25 +18,67 @@ struct Memory {
   std::string pointer;
   SmallVector<std::string> sizes;
   SmallVector<std::string> strides;
+  std::string base;
+  std::string offset;
 };
 
 std::string join(ArrayRef<std::string> values, llvm::StringRef separator = ", ") {
   return llvm::join(values, separator);
 }
 
-std::string memoryElement(Type type) {
-  if (type.isF32()) return "Float32";
-  if (type.isInteger(1)) return "SIMD[DType.bool, 1]";
-  assert(type.isIndex() || type.isInteger(64));
-  return "Int64";
+std::string dtype(Type type) {
+  if (auto vector = dyn_cast<VectorType>(type)) type = vector.getElementType();
+  if (type.isF16()) return "float16";
+  if (type.isBF16()) return "bfloat16";
+  if (type.isF32()) return "float32";
+  if (type.isF64()) return "float64";
+  if (isa<Float8E4M3FNType>(type)) return "float8_e4m3fn";
+  if (isa<Float8E5M2Type>(type)) return "float8_e5m2";
+  if (type.isInteger(1)) return "bool";
+  if (type.isIndex()) return "int64";
+  return "int" + std::to_string(cast<IntegerType>(type).getWidth());
 }
 
-std::string floatingLiteral(const llvm::APFloat &value) {
+std::string memoryElement(Type type) {
+  return "SIMD[DType." + dtype(type) + ", 1]";
+}
+
+std::string valueType(Type type) {
+  if (auto vector = dyn_cast<VectorType>(type))
+    return "SIMD[DType." + dtype(vector) + ", " + std::to_string(vector.getNumElements()) + "]";
+  if (type.isIndex()) return "Int";
+  if (type.isInteger(1)) return "Bool";
+  return memoryElement(type);
+}
+
+std::string ordering(AtomicOrdering order) {
+  switch (order) {
+  case AtomicOrdering::Relaxed: return "Ordering.RELAXED";
+  case AtomicOrdering::Acquire: return "Ordering.ACQUIRE";
+  case AtomicOrdering::Release: return "Ordering.RELEASE";
+  case AtomicOrdering::AcquireRelease: return "Ordering.ACQUIRE_RELEASE";
+  }
+  llvm_unreachable("unknown atomic ordering");
+}
+
+std::string abiDType(Type type) {
+  if (type.isIndex()) return "i64";
+  if (isa<Float8E4M3FNType>(type)) return "f8e4m3fn";
+  if (isa<Float8E5M2Type>(type)) return "f8e5m2";
+  std::string result;
+  llvm::raw_string_ostream out(result);
+  type.print(out);
+  return result;
+}
+
+std::string floatingLiteral(Type element, const llvm::APFloat &value) {
+  std::string type = valueType(element);
   if (!value.isFinite())
-    return std::string("(Float32(") + (value.isNaN() ? "0" : value.isNegative() ? "-1" : "1") + ") / Float32(0))";
+    return "(" + type + "(" + (value.isNaN() ? "0" : value.isNegative() ? "-1" : "1") + ") / " + type + "(0))";
+  if (value.isZero() && value.isNegative()) return type + "(-0.0)";
   llvm::SmallString<32> literal;
   value.toString(literal);
-  return "Float32(" + literal.str().str() + ")";
+  return type + "(" + literal.str().str() + ")";
 }
 
 llvm::json::Array json(DenseI64ArrayAttr attribute) {
@@ -49,15 +91,22 @@ llvm::json::Array parameters(cpu::InterfaceAttr interface) {
   llvm::json::Array result;
   for (Attribute argument : interface.getArguments()) {
     if (auto view = dyn_cast<cpu::ViewArgumentAttr>(argument)) {
+      llvm::json::Array strides;
+      for (Attribute constraint : view.getStrides()) {
+        if (auto fixed = dyn_cast<IntegerAttr>(constraint)) strides.push_back(fixed.getInt());
+        else strides.push_back(nullptr);
+      }
       result.push_back(llvm::json::Object{
           {"name", view.getName().getValue().str()}, {"kind", "view"},
+          {"dtype", abiDType(view.getElementType())},
           {"access", static_cast<int64_t>(view.getAccess())}, {"shape", json(view.getShape())},
-          {"dimensions", json(view.getDimensions())}, {"alias", view.getAlias().getValue().str()},
+          {"dimensions", json(view.getDimensions())}, {"strides", std::move(strides)},
+          {"alias", view.getAlias().getValue().str()},
           {"noalias", view.getNoalias()}});
     } else {
       auto scalar = cast<cpu::ScalarArgumentAttr>(argument);
       result.push_back(llvm::json::Object{{"name", scalar.getName().getValue().str()},
-          {"kind", "scalar"}, {"dtype", scalar.getType().isF32() ? "f32" : "i64"}});
+          {"kind", "scalar"}, {"dtype", abiDType(scalar.getType())}});
     }
   }
   return result;
@@ -69,15 +118,13 @@ public:
 
   LogicalResult function(func::FuncOp function) {
     names.clear(); memories.clear(); allocations.clear(); scope.clear(); next = 0;
-    workers = function->getParentOfType<ModuleOp>()->getAttrOfType<cpu::CapabilitiesAttr>(
-        "intent_cpu.capabilities").getWorkers();
     SmallVector<std::string> signature;
     for (auto [number, argument] : llvm::enumerate(function.getArguments())) {
       std::string name = "a" + std::to_string(number);
       bind(argument, name);
       if (auto type = dyn_cast<MemRefType>(argument.getType())) {
-        signature.push_back(name + ": Pointer[Float32, MutUntrackedOrigin]");
-        Memory memory{name, {}, {}};
+        signature.push_back(name + ": Pointer[" + memoryElement(type.getElementType()) + ", MutUntrackedOrigin]");
+        Memory memory{name, {}, {}, name, "0"};
         SmallVector<int64_t> staticStrides;
         int64_t staticOffset;
         if (failed(type.getStridesAndOffset(staticStrides, staticOffset)))
@@ -98,7 +145,7 @@ public:
         }
         memories[argument] = std::move(memory);
       } else {
-        signature.push_back(name + ": " + (argument.getType().isF32() ? "Float32" : "Int64"));
+        signature.push_back(name + ": " + valueType(argument.getType().isIndex() ? IntegerType::get(function.getContext(), 64) : argument.getType()));
         if (argument.getType().isIndex()) names[argument] = "Int(" + name + ")";
       }
     }
@@ -152,6 +199,12 @@ private:
     return memories.at(memory).pointer + ".unsafe_offset(" + offset(memory, indices) + ")";
   }
 
+  std::string unsignedValue(Value value) {
+    Type type = getElementTypeOrSelf(value.getType());
+    std::string input = value.getType().isIndex() ? "Int64(" + name(value) + ")" : name(value);
+    return "bitcast[DType.uint" + std::to_string(type.isIndex() ? 64 : type.getIntOrFloatBitWidth()) + "](" + input + ")";
+  }
+
   LogicalResult block(Block &body) {
     for (Operation &operation : body.without_terminator())
       if (failed(emit(&operation))) return failure();
@@ -183,37 +236,77 @@ private:
     return success();
   }
 
-  LogicalResult parallel(scf::ParallelOp parallel) {
-    if (parallel.getNumLoops() != 1 || parallel.getNumResults())
-      return parallel.emitError("Mojo serialization requires a realized one-dimensional task region");
+  LogicalResult dispatch(cpu::TaskDispatchOp dispatch) {
+    Block &body = dispatch.getBody().front();
     SmallVector<std::string> captures;
     for (const std::string &value : scope) captures.push_back("imm " + value);
     auto saved = scope.size();
     std::string task = "task_" + std::to_string(next++);
-    std::string iv = fresh(parallel.getInductionVars()[0]);
+    std::string iv = fresh(body.getArgument(0));
     line("def " + task + "(" + iv + ": Int) {" + join(captures) + "}:");
     ++indent;
-    if (failed(block(*parallel.getBody()))) return failure();
+    if (failed(block(body))) return failure();
+    if (body.getOperations().size() == 1) line("pass");
     --indent;
     scope.resize(saved);
-    line("parallelize(" + task + ", " + name(parallel.getUpperBound()[0]) + ", " + std::to_string(workers) + ")");
+    line("parallelize(" + task + ", " + name(dispatch.getCount()) + ", " + name(dispatch.getWorkerCount()) + ")");
+    return success();
+  }
+
+  LogicalResult whileLoop(scf::WhileOp loop) {
+    Block &before = loop.getBefore().front(), &after = loop.getAfter().front();
+    for (auto [argument, initial] : llvm::zip(before.getArguments(), loop.getInits()))
+      assign(argument, name(initial));
+    for (BlockArgument argument : after.getArguments())
+      line("var " + fresh(argument) + ": " + valueType(argument.getType()));
+    auto saved = scope.size();
+    auto transfer = [&](ValueRange from, ValueRange to) {
+      SmallVector<std::string> nextValues;
+      for (Value value : from) {
+        std::string temporary = "next_" + std::to_string(next++);
+        line("var " + temporary + " = " + name(value));
+        nextValues.push_back(temporary);
+      }
+      for (auto [value, temporary] : llvm::zip(to, nextValues)) line(name(value) + " = " + temporary);
+    };
+    line("while True:");
+    ++indent;
+    if (failed(block(before))) return failure();
+    auto condition = cast<scf::ConditionOp>(before.getTerminator());
+    transfer(condition.getArgs(), after.getArguments());
+    line("if not " + name(condition.getCondition()) + ":");
+    ++indent; line("break"); --indent;
+    if (failed(block(after))) return failure();
+    transfer(after.getTerminator()->getOperands(), before.getArguments());
+    --indent;
+    scope.resize(saved);
+    for (auto [result, argument] : llvm::zip(loop.getResults(), after.getArguments())) names[result] = name(argument);
     return success();
   }
 
   LogicalResult conditional(scf::IfOp operation) {
-    if (operation.getNumResults()) return operation.emitError("Mojo conditional SSA results are not implemented");
+    SmallVector<std::string> results;
+    for (Value result : operation.getResults()) {
+      results.push_back(fresh(result));
+      line("var " + results.back() + ": " + valueType(result.getType()));
+    }
     auto saved = scope.size();
+    auto branch = [&](Block *body) {
+      if (failed(block(*body))) return failure();
+      for (auto [result, value] : llvm::zip(results, body->getTerminator()->getOperands()))
+        line(result + " = " + name(value));
+      if (body->getOperations().size() == 1 && results.empty()) line("pass");
+      return success();
+    };
     line("if " + name(operation.getCondition()) + ":");
     ++indent;
-    if (failed(block(*operation.thenBlock()))) return failure();
-    if (operation.thenBlock()->getOperations().size() == 1) line("pass");
+    if (failed(branch(operation.thenBlock()))) return failure();
     --indent;
     scope.resize(saved);
     if (!operation.getElseRegion().empty()) {
       line("else:");
       ++indent;
-      if (failed(block(*operation.elseBlock()))) return failure();
-      if (operation.elseBlock()->getOperations().size() == 1) line("pass");
+      if (failed(branch(operation.elseBlock()))) return failure();
       --indent;
       scope.resize(saved);
     }
@@ -222,12 +315,14 @@ private:
 
   LogicalResult allocation(Operation *operation, Value memory, ValueRange dynamicSizes, bool stack) {
     auto type = cast<MemRefType>(memory.getType());
+    if (!type.getLayout().isIdentity())
+      return operation->emitError("Mojo allocation requires an explicit dense storage layout");
     if (stack && !type.hasStaticShape())
       return operation->emitError("Mojo stack allocation requires static extents");
     std::string element = memoryElement(type.getElementType());
     std::string value = fresh(memory);
     std::string storage = "storage_" + value;
-    Memory descriptor{value, {}, {}};
+    Memory descriptor{value, {}, {}, value, "0"};
     unsigned dynamicAxis = 0;
     for (int64_t axis = 0; axis < type.getRank(); ++axis)
       descriptor.sizes.push_back(type.isDynamicDim(axis) ? name(dynamicSizes[dynamicAxis++])
@@ -239,12 +334,16 @@ private:
       stride = "(" + stride + ") * (" + descriptor.sizes[axis] + ")";
     }
     if (stack) {
-      int64_t alignment = cast<memref::AllocaOp>(operation).getAlignment().value_or(4);
+      int64_t elementBytes = type.getElementType().isIndex() ? 8 : (type.getElementTypeBitWidth() + 7) / 8;
+      int64_t alignment = cast<memref::AllocaOp>(operation).getAlignment().value_or(elementBytes);
       line("var " + value + " = unsafe_stack_allocation[" +
           std::to_string(type.getNumElements()) + ", " + element + ", alignment=" +
           std::to_string(alignment) + "]()");
     } else {
-      line("var " + storage + " = alloc(Layout[" + element + "](count=" + stride + "))");
+      auto alignment = cast<memref::AllocOp>(operation).getAlignment();
+      std::string layout = "Layout[" + element + "]";
+      if (alignment) layout += ".aligned[" + std::to_string(*alignment) + "]";
+      line("var " + storage + " = alloc(" + layout + "(count=" + stride + "))");
       line("var " + value + " = " + storage + ".unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()");
       allocations[memory] = storage;
     }
@@ -264,22 +363,40 @@ private:
         if (op.getResult().getType().isInteger(1))
           assign(op.getResult(), integer.getValue().isZero() ? "False" : "True", true);
         else
-          assign(op.getResult(), std::string(op.getResult().getType().isIndex() ? "Int(" : "Int64(") + std::to_string(integer.getInt()) + ")", true);
+          assign(op.getResult(), valueType(op.getType()) + "(" + std::to_string(integer.getInt()) + ")", true);
       } else if (auto floating = dyn_cast<FloatAttr>(op.getValue())) {
-        assign(op.getResult(), floatingLiteral(floating.getValue()), true);
-      } else if (auto dense = dyn_cast<DenseFPElementsAttr>(op.getValue())) {
+        assign(op.getResult(), floatingLiteral(op.getType(), floating.getValue()), true);
+      } else if (auto dense = dyn_cast<DenseElementsAttr>(op.getValue())) {
         SmallVector<std::string> elements;
-        for (llvm::APFloat value : dense.getValues<llvm::APFloat>()) {
-          elements.push_back(floatingLiteral(value));
-          if (dense.isSplat()) break;
+        if (isa<FloatType>(dense.getElementType())) {
+          for (llvm::APFloat value : dense.getValues<llvm::APFloat>()) {
+            elements.push_back(floatingLiteral(dense.getElementType(), value));
+            if (dense.isSplat()) break;
+          }
+        } else {
+          for (llvm::APInt value : dense.getValues<llvm::APInt>()) {
+            elements.push_back(dense.getElementType().isInteger(1) ? (value.isZero() ? "False" : "True") : std::to_string(value.getSExtValue()));
+            if (dense.isSplat()) break;
+          }
         }
-        assign(op.getResult(), "SIMD[DType.float32, " +
-            std::to_string(cast<VectorType>(op.getResult().getType()).getNumElements()) + "](" + join(elements) + ")", true);
+        std::string fill = dense.isSplat() && dense.getElementType().isInteger(1) ? "fill=" : "";
+        assign(op.getResult(), valueType(op.getType()) + "(" + fill + join(elements) + ")", true);
       } else return op.emitError("unsupported Mojo constant");
     } else if (auto op = dyn_cast<memref::DimOp>(operation)) {
       auto axis = op.getConstantIndex();
       if (!axis) return op.emitError("Mojo memory descriptor dimension must be static");
       assign(op.getResult(), memories.at(op.getSource()).sizes[*axis]);
+    } else if (auto op = dyn_cast<memref::ExtractStridedMetadataOp>(operation)) {
+      const Memory memory = memories.at(op.getSource());
+      if (!op.getBaseBuffer().use_empty()) {
+        assign(op.getBaseBuffer(), memory.base);
+        memories[op.getBaseBuffer()] = {name(op.getBaseBuffer()), {}, {}, memory.base, "0"};
+      }
+      if (!op.getOffset().use_empty()) assign(op.getOffset(), memory.offset);
+      for (auto [value, size] : llvm::zip(op.getSizes(), memory.sizes))
+        if (!value.use_empty()) assign(value, size);
+      for (auto [value, stride] : llvm::zip(op.getStrides(), memory.strides))
+        if (!value.use_empty()) assign(value, stride);
     } else if (auto op = dyn_cast<memref::SubViewOp>(operation)) {
       const Memory source = memories.at(op.getSource());
       auto offsets = op.getMixedOffsets(), sizes = op.getMixedSizes(), strides = op.getMixedStrides();
@@ -295,6 +412,17 @@ private:
       }
       assign(op.getResult(), source.pointer + ".unsafe_offset(" + join(terms, " + ") + ")");
       result.pointer = name(op.getResult());
+      result.base = source.base;
+      result.offset = "(" + source.offset + ") + (" + join(terms, " + ") + ")";
+      memories[op.getResult()] = std::move(result);
+    } else if (auto op = dyn_cast<memref::ReinterpretCastOp>(operation)) {
+      Memory result;
+      result.base = memories.at(op.getSource()).base;
+      result.offset = fold(op.getMixedOffsets()[0]);
+      for (OpFoldResult size : op.getMixedSizes()) result.sizes.push_back(fold(size));
+      for (OpFoldResult stride : op.getMixedStrides()) result.strides.push_back(fold(stride));
+      assign(op.getResult(), result.base + ".unsafe_offset(" + result.offset + ")");
+      result.pointer = name(op.getResult());
       memories[op.getResult()] = std::move(result);
     } else if (auto op = dyn_cast<memref::CastOp>(operation)) {
       memories[op.getResult()] = memories.at(op.getSource());
@@ -309,6 +437,23 @@ private:
       if (op.getValue().getType().isIndex()) value = "Int64(" + value + ")";
       if (op.getValue().getType().isInteger(1)) value = "SIMD[DType.bool, 1](" + value + ")";
       line(pointer(op.getMemref(), op.getIndices()) + ".unsafe_store(" + value + ")");
+    } else if (auto op = dyn_cast<cpu::AtomicLoadOp>(operation)) {
+      assign(op.getValue(), "Atomic[DType." + dtype(op.getValue().getType()) + "].load[ordering=" +
+          ordering(op.getOrdering()) + "](" + pointer(op.getTarget(), op.getIndices()) + ")");
+    } else if (auto op = dyn_cast<cpu::AtomicStoreOp>(operation)) {
+      line("Atomic[DType." + dtype(op.getValue().getType()) + "].store[ordering=" + ordering(op.getOrdering()) +
+          "](" + pointer(op.getTarget(), op.getIndices()) + ", " + name(op.getValue()) + ")");
+    } else if (auto op = dyn_cast<cpu::AtomicRMWOp>(operation)) {
+      if (op.getKind() != AtomicRMWKind::Add) return op.emitError("Mojo atomic RMW was not expanded before serialization");
+      assign(op.getOldValue(), "Atomic[DType." + dtype(op.getValue().getType()) + "].fetch_add[ordering=" +
+          ordering(op.getOrdering()) + "](" + pointer(op.getTarget(), op.getIndices()) + ", " + name(op.getValue()) + ")");
+    } else if (auto op = dyn_cast<cpu::AtomicCompareExchangeOp>(operation)) {
+      assign(op.getOldValue(), name(op.getExpected()));
+      auto failureOrder = op.getOrdering() == AtomicOrdering::Acquire || op.getOrdering() == AtomicOrdering::AcquireRelease
+          ? AtomicOrdering::Acquire : AtomicOrdering::Relaxed;
+      assign(op.getSuccess(), "Atomic[DType." + dtype(op.getExpected().getType()) + "].compare_exchange[success_ordering=" +
+          ordering(op.getOrdering()) + ", failure_ordering=" + ordering(failureOrder) + ", weak=False](" +
+          pointer(op.getTarget(), op.getIndices()) + ", " + name(op.getOldValue()) + ", " + name(op.getDesired()) + ")");
     } else if (auto op = dyn_cast<vector::LoadOp>(operation)) {
       assign(op.getResult(), pointer(op.getBase(), op.getIndices()) + ".unsafe_load[width=" + std::to_string(op.getVectorType().getNumElements()) + "]()");
     } else if (auto op = dyn_cast<vector::StoreOp>(operation)) {
@@ -317,13 +462,25 @@ private:
       line("prefetch[PrefetchOptions().for_read().high_locality().to_data_cache()](" +
           pointer(op.getMemref(), op.getIndices()) + ")");
     } else if (auto op = dyn_cast<vector::BroadcastOp>(operation)) {
-      assign(op.getResult(), "SIMD[DType.float32, " + std::to_string(cast<VectorType>(op.getResult().getType()).getNumElements()) + "](" + name(op.getSource()) + ")");
+      assign(op.getResult(), valueType(op.getType()) + "(" +
+          (op.getType().getElementType().isInteger(1) ? "fill=" : "") + name(op.getSource()) + ")");
+    } else if (auto op = dyn_cast<vector::FromElementsOp>(operation)) {
+      SmallVector<std::string> lanes;
+      Type element = op.getType().getElementType();
+      for (Value value : op.getElements())
+        lanes.push_back(element.isInteger(1) || element.isIndex()
+            ? memoryElement(element) + "(" + name(value) + ")" : name(value));
+      assign(op.getResult(), valueType(op.getType()) + "(" + join(lanes) + ")");
+    } else if (auto op = dyn_cast<vector::StepOp>(operation)) {
+      SmallVector<std::string> lanes;
+      for (int64_t lane = 0; lane < op.getType().getNumElements(); ++lane) lanes.push_back(std::to_string(lane));
+      assign(op.getResult(), valueType(op.getType()) + "(" + join(lanes) + ")", true);
     } else if (auto op = dyn_cast<vector::ShuffleOp>(operation)) {
       SmallVector<std::string> lanes;
       int64_t lhsSize = cast<VectorType>(op.getV1().getType()).getNumElements();
       for (int64_t lane : op.getMask())
         lanes.push_back(name(lane < lhsSize ? op.getV1() : op.getV2()) + "[" + std::to_string(lane < lhsSize ? lane : lane - lhsSize) + "]");
-      assign(op.getResult(), "SIMD[DType.float32, " + std::to_string(lanes.size()) + "](" + join(lanes) + ")");
+      assign(op.getResult(), valueType(op.getType()) + "(" + join(lanes) + ")");
     } else if (auto op = dyn_cast<vector::ExtractElementOp>(operation)) {
       assign(op.getResult(), name(op.getVector()) + "[" + name(op.getPosition()) + "]");
     } else if (auto op = dyn_cast<memref::AllocaOp>(operation)) {
@@ -335,86 +492,117 @@ private:
     } else if (auto op = dyn_cast<scf::ForOp>(operation)) {
       return forLoop(op);
     } else if (auto op = dyn_cast<scf::WhileOp>(operation)) {
-      if (op.getNumResults() || op.getNumOperands()) return op.emitError("Mojo while requires realized destination-passing state");
-      auto saved = scope.size();
-      line("while True:");
-      ++indent;
-      if (failed(block(op.getBefore().front()))) return failure();
-      line("if not " + name(cast<scf::ConditionOp>(op.getBefore().front().getTerminator()).getCondition()) + ":");
-      ++indent; line("break"); --indent;
-      if (failed(block(op.getAfter().front()))) return failure();
-      --indent;
-      scope.resize(saved);
-    } else if (auto op = dyn_cast<scf::ParallelOp>(operation)) {
-      return parallel(op);
+      return whileLoop(op);
+    } else if (auto op = dyn_cast<cpu::TaskDispatchOp>(operation)) {
+      return dispatch(op);
     } else if (auto op = dyn_cast<scf::IfOp>(operation)) {
       return conditional(op);
     } else if (auto op = dyn_cast<arith::CmpIOp>(operation)) {
-      StringRef token;
+      StringRef token, method;
+      bool isUnsigned = false;
       switch (op.getPredicate()) {
-      case arith::CmpIPredicate::eq: token = " == "; break;
-      case arith::CmpIPredicate::ne: token = " != "; break;
-      case arith::CmpIPredicate::slt: token = " < "; break;
-      case arith::CmpIPredicate::sle: token = " <= "; break;
-      case arith::CmpIPredicate::sgt: token = " > "; break;
-      case arith::CmpIPredicate::sge: token = " >= "; break;
-      default: return op.emitError("unsupported Mojo unsigned comparison");
+      case arith::CmpIPredicate::eq: token = " == "; method = "eq"; break;
+      case arith::CmpIPredicate::ne: token = " != "; method = "ne"; break;
+      case arith::CmpIPredicate::slt: token = " < "; method = "lt"; break;
+      case arith::CmpIPredicate::sle: token = " <= "; method = "le"; break;
+      case arith::CmpIPredicate::sgt: token = " > "; method = "gt"; break;
+      case arith::CmpIPredicate::sge: token = " >= "; method = "ge"; break;
+      case arith::CmpIPredicate::ult: token = " < "; method = "lt"; isUnsigned = true; break;
+      case arith::CmpIPredicate::ule: token = " <= "; method = "le"; isUnsigned = true; break;
+      case arith::CmpIPredicate::ugt: token = " > "; method = "gt"; isUnsigned = true; break;
+      case arith::CmpIPredicate::uge: token = " >= "; method = "ge"; isUnsigned = true; break;
       }
-      assign(op.getResult(), name(op.getLhs()) + token.str() + name(op.getRhs()));
+      std::string lhs = isUnsigned ? unsignedValue(op.getLhs()) : name(op.getLhs());
+      std::string rhs = isUnsigned ? unsignedValue(op.getRhs()) : name(op.getRhs());
+      assign(op.getResult(), isa<VectorType>(op.getLhs().getType())
+          ? lhs + "." + method.str() + "(" + rhs + ")" : lhs + token.str() + rhs);
     } else if (auto op = dyn_cast<arith::CmpFOp>(operation)) {
-      StringRef token;
+      StringRef token, method;
       switch (op.getPredicate()) {
-      case arith::CmpFPredicate::OEQ: token = " == "; break;
-      case arith::CmpFPredicate::UNE: token = " != "; break;
-      case arith::CmpFPredicate::OLT: token = " < "; break;
-      case arith::CmpFPredicate::OLE: token = " <= "; break;
-      case arith::CmpFPredicate::OGT: token = " > "; break;
-      case arith::CmpFPredicate::OGE: token = " >= "; break;
+      case arith::CmpFPredicate::OEQ: token = " == "; method = "eq"; break;
+      case arith::CmpFPredicate::UNE: token = " != "; method = "ne"; break;
+      case arith::CmpFPredicate::OLT: token = " < "; method = "lt"; break;
+      case arith::CmpFPredicate::OLE: token = " <= "; method = "le"; break;
+      case arith::CmpFPredicate::OGT: token = " > "; method = "gt"; break;
+      case arith::CmpFPredicate::OGE: token = " >= "; method = "ge"; break;
       default: return op.emitError("unsupported Mojo floating comparison");
       }
-      assign(op.getResult(), name(op.getLhs()) + token.str() + name(op.getRhs()));
+      assign(op.getResult(), isa<VectorType>(op.getLhs().getType())
+          ? name(op.getLhs()) + "." + method.str() + "(" + name(op.getRhs()) + ")"
+          : name(op.getLhs()) + token.str() + name(op.getRhs()));
     } else if (auto op = dyn_cast<arith::SelectOp>(operation)) {
       assign(op.getResult(), isa<VectorType>(op.getCondition().getType())
           ? name(op.getCondition()) + ".select(" + name(op.getTrueValue()) + ", " + name(op.getFalseValue()) + ")"
           : name(op.getTrueValue()) + " if " + name(op.getCondition()) + " else " + name(op.getFalseValue()));
     } else if (auto op = dyn_cast<math::FmaOp>(operation)) {
       assign(op.getResult(), "fma(" + name(op.getA()) + ", " + name(op.getB()) + ", " + name(op.getC()) + ")");
-    } else if (auto op = dyn_cast<math::SqrtOp>(operation)) {
-      assign(op.getResult(), "sqrt(" + name(op.getOperand()) + ")");
-    } else if (auto op = dyn_cast<math::ExpOp>(operation)) {
-      assign(op.getResult(), "exp(" + name(op.getOperand()) + ")");
-    } else if (auto op = dyn_cast<math::Exp2Op>(operation)) {
-      assign(op.getResult(), "exp2(" + name(op.getOperand()) + ")");
-    } else if (isa<arith::MaxNumFOp, arith::MaximumFOp, arith::MinimumFOp>(operation)) {
-      auto vector = dyn_cast<VectorType>(operation->getResult(0).getType());
-      std::string type = vector ? "SIMD[DType.float32, " + std::to_string(vector.getNumElements()) + "]" : "Float32";
+    } else if (isa<math::SqrtOp, math::ExpOp, math::Exp2Op, math::LogOp, math::TanhOp,
+                   math::SinOp, math::CosOp, math::FloorOp, math::ErfOp, math::AbsFOp, math::AbsIOp>(operation)) {
+      StringRef function = operation->getName().stripDialect();
+      if (isa<math::AbsFOp, math::AbsIOp>(operation)) function = "abs";
+      assign(operation->getResult(0), function.str() + "(" + name(operation->getOperand(0)) + ")");
+    } else if (isa<arith::MaxNumFOp, arith::MinNumFOp, arith::MaximumFOp, arith::MinimumFOp>(operation)) {
+      std::string type = valueType(operation->getResult(0).getType());
       StringRef intrinsic = isa<arith::MaxNumFOp>(operation) ? "llvm.maximumnum" :
+          isa<arith::MinNumFOp>(operation) ? "llvm.minimumnum" :
           isa<arith::MaximumFOp>(operation) ? "llvm.maximum" : "llvm.minimum";
       assign(operation->getResult(0), "llvm_intrinsic[\"" + intrinsic.str() + "\", " + type + "](" +
           name(operation->getOperand(0)) + ", " + name(operation->getOperand(1)) + ")");
-    } else if (auto op = dyn_cast<arith::SIToFPOp>(operation)) {
-      assign(op.getResult(), "Float32(" + name(op.getIn()) + ")");
+    } else if (auto op = dyn_cast<arith::BitcastOp>(operation)) {
+      assign(op.getResult(), "bitcast[DType." + dtype(op.getType()) + "](" + name(op.getIn()) + ")");
+    } else if (isa<arith::DivUIOp, arith::RemUIOp, arith::ShRUIOp, arith::MinUIOp, arith::MaxUIOp>(operation)) {
+      std::string lhs = unsignedValue(operation->getOperand(0)), rhs = unsignedValue(operation->getOperand(1));
+      std::string expression;
+      if (isa<arith::MinUIOp, arith::MaxUIOp>(operation))
+        expression = std::string(isa<arith::MinUIOp>(operation) ? "min(" : "max(") + lhs + ", " + rhs + ")";
+      else expression = "(" + lhs + ") " + (isa<arith::DivUIOp>(operation) ? "/" : isa<arith::RemUIOp>(operation) ? "%" : ">>") + " (" + rhs + ")";
+      assign(operation->getResult(0), "bitcast[DType." + dtype(operation->getResult(0).getType()) + "](" + expression + ")");
+    } else if (isa<arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::FPToUIOp, arith::ExtFOp,
+                   arith::TruncFOp, arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp>(operation)) {
+      Value input = operation->getOperand(0), result = operation->getResult(0);
+      std::string expression = name(input);
+      if (input.getType().isInteger(1)) expression = "SIMD[DType.bool, 1](" + expression + ")";
+      else if (!getElementTypeOrSelf(input.getType()).isInteger(1) && isa<arith::UIToFPOp, arith::ExtUIOp>(operation))
+        expression = unsignedValue(input);
+      if (isa<arith::FPToUIOp>(operation)) {
+        auto bits = getElementTypeOrSelf(result.getType()).getIntOrFloatBitWidth();
+        expression += ".cast[DType.uint" + std::to_string(bits) + "]()";
+        assign(result, "bitcast[DType." + dtype(result.getType()) + "](" + expression + ")");
+      } else assign(result, expression + ".cast[DType." + dtype(result.getType()) + "]()");
     } else if (auto op = dyn_cast<arith::NegFOp>(operation)) {
       assign(op.getResult(), "-" + name(op.getOperand()));
-    } else if (isa<arith::IndexCastOp>(operation)) {
-      assign(operation->getResult(0), std::string(operation->getResult(0).getType().isIndex() ? "Int(" : "Int64(") + name(operation->getOperand(0)) + ")");
+    } else if (auto op = dyn_cast<arith::RemSIOp>(operation)) {
+      std::string lhs = name(op.getLhs()), rhs = name(op.getRhs());
+      std::string quotient = op.getType().isIndex() ? "Int(Int64(" + lhs + ") / Int64(" + rhs + "))"
+          : "(" + lhs + ") / (" + rhs + ")";
+      assign(op.getResult(), "(" + lhs + ") - (" + quotient + ") * (" + rhs + ")");
+    } else if (auto op = dyn_cast<arith::DivSIOp>(operation); op && op.getType().isIndex()) {
+      assign(op.getResult(), "Int(Int64(" + name(op.getLhs()) + ") / Int64(" + name(op.getRhs()) + "))");
+    } else if (isa<arith::IndexCastOp, arith::IndexCastUIOp>(operation)) {
+      Value result = operation->getResult(0);
+      Value input = operation->getOperand(0);
+      bool unsignedSource = isa<arith::IndexCastUIOp>(operation) && !getElementTypeOrSelf(input.getType()).isIndex();
+      std::string expression = unsignedSource ? unsignedValue(input) : name(input);
+      if (isa<VectorType>(result.getType()))
+        assign(result, expression + ".cast[DType." + dtype(result.getType()) + "]()");
+      else assign(result, valueType(result.getType()) + "(" + expression + ")");
     } else {
       std::string token;
       if (isa<arith::AddFOp, arith::AddIOp>(operation)) token = "+";
       else if (isa<arith::SubFOp, arith::SubIOp>(operation)) token = "-";
       else if (isa<arith::MulFOp, arith::MulIOp>(operation)) token = "*";
       else if (isa<arith::DivFOp>(operation)) token = "/";
-      else if (isa<arith::DivSIOp, arith::FloorDivSIOp>(operation)) token = "//";
-      else if (isa<arith::RemSIOp>(operation)) token = "%";
+      else if (isa<math::PowFOp>(operation)) token = "**";
+      else if (isa<arith::DivSIOp>(operation)) token = "/";
       else if (isa<arith::AndIOp>(operation)) token = "&";
       else if (isa<arith::OrIOp>(operation)) token = "|";
       else if (isa<arith::XOrIOp>(operation)) token = "^";
+      else if (isa<arith::ShLIOp>(operation)) token = "<<";
+      else if (isa<arith::ShRSIOp>(operation)) token = ">>";
       if (!token.empty()) {
         assign(operation->getResult(0), "(" + name(operation->getOperand(0)) + ") " + token + " (" + name(operation->getOperand(1)) + ")");
       } else if (isa<arith::MinSIOp, arith::MaxSIOp>(operation)) {
         assign(operation->getResult(0), std::string(isa<arith::MinSIOp>(operation) ? "min(" : "max(") + name(operation->getOperand(0)) + ", " + name(operation->getOperand(1)) + ")");
-      } else if (auto op = dyn_cast<arith::CeilDivSIOp>(operation)) {
-        assign(op.getResult(), "(" + name(op.getLhs()) + " + " + name(op.getRhs()) + " - 1) // " + name(op.getRhs()));
       } else return operation->emitError("Mojo serialization has no spelling for this realized CPU operation");
     }
     return success();
@@ -426,7 +614,6 @@ private:
   llvm::DenseMap<Value, std::string> allocations;
   SmallVector<std::string> scope;
   unsigned indent = 0, next = 0;
-  int64_t workers = 0;
 };
 
 }
@@ -435,19 +622,23 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string
   if (failed(cpu::verifyCPUProgram(module, true))) return failure();
   llvm::raw_string_ostream output(source);
   output << "from std.ffi import external_call\n"
-            "from std.memory import Layout, alloc, dealloc, unsafe_stack_allocation\n"
+            "from std.atomic import Atomic, Ordering\n"
+            "from std.memory import Layout, alloc, dealloc, unsafe_stack_allocation, bitcast\n"
             "from std.sys import prefetch, llvm_intrinsic\n"
             "from std.sys.intrinsics import PrefetchOptions\n"
-            "from std.math import fma, sqrt, exp, exp2, min, max\n"
+            "from std.math import fma, sqrt, exp, exp2, log, tanh, sin, cos, floor, erf, abs, min, max\n"
             "from std.runtime import initialize_runtime\n"
             "from max.algorithm import parallelize\n\n";
   Serializer serializer(output);
   llvm::json::Object interface;
+  interface["source_prelude_end"] = static_cast<int64_t>(output.tell());
   llvm::json::Array candidates;
   bool first = true;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
     if (function.isExternal()) continue;
+    int64_t sourceBegin = output.tell();
     if (failed(serializer.function(function))) return failure();
+    int64_t sourceEnd = output.tell();
     if (first) {
       auto abi = function->getAttrOfType<cpu::InterfaceAttr>("intent_cpu.interface");
       interface["parameters"] = parameters(abi);
@@ -467,6 +658,7 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string
     }
     candidates.push_back(llvm::json::Object{
         {"entry", function.getName().str()},
+        {"source_range", llvm::json::Array{sourceBegin, sourceEnd}},
         {"values", llvm::json::Array{configuration.getTaskGrain(),
             configuration.getTileM(), configuration.getTileN(), configuration.getTileK(), configuration.getRegionSize()}},
         {"implementations", std::move(implementations)}});

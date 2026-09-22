@@ -17,11 +17,20 @@ def IntentCPU_TasksOp : IntentCPU_Op<"tasks", [SingleBlock,
   let hasVerifier = 1;
 }
 
-def IntentCPU_TaskYieldOp : IntentCPU_Op<"task_yield", [Pure, Terminator,
-    HasParent<"TasksOp">]>;
+def IntentCPU_TaskDispatchOp : IntentCPU_Op<"task_dispatch", [SingleBlock,
+    AutomaticAllocationScope, RecursiveMemoryEffects]> {
+  let summary = "Synchronous task invocation with an explicit active worker budget";
+  let arguments = (ins Index:$count, Index:$worker_count);
+  let regions = (region AnyRegion:$body);
+  let hasVerifier = 1;
+}
+
+def IntentCPU_TaskYieldOp : IntentCPU_Op<"task_yield", [Pure, Terminator]> {
+  let hasVerifier = 1;
+}
 
 def IntentCPU_ReduceOp : IntentCPU_Op<"reduce", [SingleBlock,
-    MemoryEffects<[MemRead]>]> {
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Ordered one-axis reduction with an explicit scalar combine region";
   let arguments = (ins Index:$extent, AnyFloat:$initial,
     Variadic<AnyType>:$inputs, ArrayAttr:$indexingMaps,
@@ -34,6 +43,66 @@ def IntentCPU_ReduceOp : IntentCPU_Op<"reduce", [SingleBlock,
 def IntentCPU_YieldOp : IntentCPU_Op<"yield", [Pure, Terminator,
     HasParent<"ReduceOp">]> {
   let arguments = (ins AnyFloat:$value);
+}
+
+def IntentCPU_ScanOp : IntentCPU_Op<"scan", [SingleBlock, IsolatedFromAbove, AttrSizedOperandSegments,
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Ordered prefixes with typed scalar or destination-passing slice combines";
+  let arguments = (ins Variadic<AnyMemRef>:$sources,
+      Variadic<AnyType>:$initials, Variadic<AnyType>:$captures,
+      Variadic<AnyMemRef>:$outputs,
+      I64Attr:$axis, BoolAttr:$inclusive, BoolAttr:$reverse);
+  let regions = (region AnyRegion:$combine);
+  let hasVerifier = 1;
+  let extraClassDeclaration = [{
+    bool isDestinationPassing() {
+      return !getCombine().empty() && getCombine().front().getNumArguments() ==
+          3 * getSources().size() + getCaptures().size();
+    }
+  }];
+}
+
+def IntentCPU_ScanYieldOp : IntentCPU_Op<"scan_yield", [Pure, Terminator,
+    HasParent<"ScanOp">]> {
+  let arguments = (ins Variadic<AnyType>:$values);
+}
+
+def IntentCPU_HistogramOp : IntentCPU_Op<"histogram"> {
+  let summary = "Typed active values contributing to logical integer bins";
+  let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$values,
+      Arg<AnyMemRef, "", [MemRead]>:$valid,
+      Arg<AnyMemRef, "", [MemWrite]>:$output, BoolAttr:$unsigned_values);
+  let hasVerifier = 1;
+}
+
+// Synchronization orders surrounding memory effects, not only the target cell.
+class IntentCPU_AtomicOp<string name> : IntentCPU_Op<name,
+    [MemoryEffects<[MemRead, MemWrite]>]> {
+  let hasVerifier = 1;
+}
+
+def IntentCPU_AtomicLoadOp : IntentCPU_AtomicOp<"atomic_load"> {
+  let arguments = (ins AnyMemRef:$target, Variadic<Index>:$indices,
+      Intent_AtomicOrderingAttr:$ordering);
+  let results = (outs AnyType:$value);
+}
+
+def IntentCPU_AtomicStoreOp : IntentCPU_AtomicOp<"atomic_store"> {
+  let arguments = (ins AnyMemRef:$target, AnyType:$value,
+      Variadic<Index>:$indices, Intent_AtomicOrderingAttr:$ordering);
+}
+
+def IntentCPU_AtomicRMWOp : IntentCPU_AtomicOp<"atomic_rmw"> {
+  let arguments = (ins AnyMemRef:$target, AnyType:$value,
+      Variadic<Index>:$indices, Intent_AtomicOrderingAttr:$ordering,
+      Intent_AtomicRMWKindAttr:$kind, BoolAttr:$unsigned_integer);
+  let results = (outs AnyType:$old_value);
+}
+
+def IntentCPU_AtomicCompareExchangeOp : IntentCPU_AtomicOp<"atomic_compare_exchange"> {
+  let arguments = (ins AnyMemRef:$target, AnyType:$expected, AnyType:$desired,
+      Variadic<Index>:$indices, Intent_AtomicOrderingAttr:$ordering);
+  let results = (outs AnyType:$old_value, I1:$success);
 }
 
 def IntentCPU_QuantizeOp : IntentCPU_Op<"quantize"> {

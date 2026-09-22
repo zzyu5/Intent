@@ -8,6 +8,7 @@ def IntentCPU_Dialect : Dialect {
   let cppNamespace = "::intent::cpu";
   let summary = "Provider-neutral executable CPU programs";
   let useDefaultAttributePrinterParser = 1;
+  let hasCanonicalizer = 1;
 }
 
 #endif

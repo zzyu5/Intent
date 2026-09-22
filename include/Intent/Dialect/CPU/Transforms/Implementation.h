@@ -6,10 +6,33 @@
 
 namespace intent::cpu {
 
+enum class InputReuse { Group, Consumers };
+
+// Storage order is [panel, unsplit source axes..., lane within panel]. A group
+// supply covers one compute group; consumer reuse preserves a source snapshot.
+struct InputRequirement {
+  unsigned operand;
+  mlir::Type elementType;
+  unsigned panelAxis;
+  int64_t panelSize;
+  int64_t alignment;
+  InputReuse reuse;
+  int64_t windowAlignment; // Required panel-axis origin multiple for non-singleton windows.
+};
+
+struct InputSupply {
+  unsigned operand;
+  unsigned panelAxis;
+  int64_t panelSize;
+  mlir::Value storage;
+  llvm::SmallVector<mlir::Value> begins; // Logical source coordinates of the supplied window.
+};
+
 struct ContractionTile {
   mlir::Value lhs, rhs, output, initial;
   mlir::Value mBegin, mCount, nBegin, nCount, kBegin, depth;
   bool first;
+  llvm::ArrayRef<InputSupply> inputs;
 };
 
 struct ContractionRequirements {
@@ -21,7 +44,7 @@ struct ContractionRequirements {
 struct Implementation {
   llvm::StringRef name;
   std::function<bool(mlir::Operation *)> applicable;
-  std::function<bool(CapabilitiesAttr, const Configuration &)> legal;
+  std::function<bool(mlir::Operation *, CapabilitiesAttr, const Configuration &)> legal;
   std::function<mlir::DictionaryAttr(mlir::Builder &, const Configuration &)> parameters;
   std::function<mlir::LogicalResult(mlir::OpBuilder &, mlir::linalg::GenericOp,
       const ContractionTile &, ConfigurationAttr, ImplementationAttr)> formTile;
@@ -29,21 +52,27 @@ struct Implementation {
       mlir::OpBuilder &, mlir::Operation *, mlir::ValueRange, int64_t &)> expand;
   ContractionRequirements contraction;
   std::function<int64_t(ImplementationAttr)> parallelWindow;
+  bool requiresMatrixI8I32 = false;
+  std::function<llvm::SmallVector<InputRequirement>(mlir::linalg::GenericOp,
+      ConfigurationAttr, ImplementationAttr)> inputs;
+  // Leading parallel rows retained together inside one independent work item.
+  std::function<int64_t(mlir::linalg::GenericOp, ImplementationAttr)> worksetRows;
 };
 
 class ImplementationRegistry {
 public:
   std::function<llvm::StringRef(mlir::func::FuncOp)> profile;
   void add(Implementation implementation) { implementations.push_back(std::move(implementation)); }
-  mlir::FailureOr<const Implementation *> select(mlir::Operation *operation) const;
   mlir::FailureOr<const Implementation *> lookup(mlir::Operation *operation) const;
+  llvm::SmallVector<llvm::SmallVector<ImplementationAttr>> candidates(
+      mlir::func::FuncOp function, CapabilitiesAttr capabilities,
+      const Configuration &configuration) const;
   mlir::LogicalResult bind(mlir::func::FuncOp function, CapabilitiesAttr capabilities,
-                           const Configuration &configuration) const;
-  bool legal(mlir::func::FuncOp function, CapabilitiesAttr capabilities,
-             const Configuration &configuration) const;
+                           const Configuration &configuration,
+                           llvm::ArrayRef<ImplementationAttr> bindings) const;
 
 private:
-  llvm::SmallVector<Implementation> implementations;
+  llvm::SmallVector<Implementation, 0> implementations;
 };
 
 bool needsImplementation(mlir::Operation *operation);

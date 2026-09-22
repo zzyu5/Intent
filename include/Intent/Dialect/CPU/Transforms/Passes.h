@@ -25,12 +25,23 @@ struct Configuration {
 };
 
 mlir::LogicalResult fuseStructuredComputations(mlir::func::FuncOp function);
+void eraseDeadPrivateBuffers(mlir::func::FuncOp function);
+mlir::LogicalResult reusePrivateStorage(mlir::func::FuncOp function);
 mlir::LogicalResult foldUniformComputations(mlir::func::FuncOp function);
-mlir::LogicalResult reusePreparedInputs(mlir::func::FuncOp function);
+mlir::LogicalResult reusePreparedInputs(mlir::func::FuncOp function,
+                                      const ImplementationRegistry &implementations);
+mlir::LogicalResult groupRegionComputations(mlir::func::FuncOp function,
+                                          const Configuration &configuration);
 mlir::LogicalResult groupQuantizedDots(mlir::func::FuncOp function,
                                      const ImplementationRegistry &implementations);
+mlir::LogicalResult groupWorksetComputations(mlir::func::FuncOp function,
+                                           const ImplementationRegistry &implementations);
+mlir::LogicalResult exposeStructuredWorksets(mlir::func::FuncOp function,
+    const ImplementationRegistry &implementations, llvm::ArrayRef<mlir::Value> leadingExtents = {});
 void forwardCPUOutputs(mlir::func::FuncOp function);
 mlir::LogicalResult materializeStructuredComputations(mlir::func::FuncOp function);
+mlir::LogicalResult realizeSliceScans(mlir::func::FuncOp function);
+mlir::LogicalResult realizeHistograms(mlir::func::FuncOp function);
 mlir::LogicalResult fuseIntermediateBuffers(mlir::func::FuncOp function);
 mlir::LogicalResult fuseReductionTraversals(mlir::func::FuncOp function);
 mlir::LogicalResult blockContractions(mlir::func::FuncOp function,
@@ -40,11 +51,12 @@ mlir::LogicalResult blockStructuredComputations(mlir::func::FuncOp function,
                                     const ImplementationRegistry &implementations);
 mlir::LogicalResult vectorizeLoops(mlir::func::FuncOp function, int64_t width,
                                    int64_t replicas, int64_t reductionReplicas);
-mlir::LogicalResult partitionTasks(mlir::func::FuncOp function, int64_t grain);
+mlir::LogicalResult partitionTasks(mlir::func::FuncOp function, int64_t grain,
+                                 const ImplementationRegistry &implementations);
 mlir::LogicalResult isolateTasks(mlir::func::FuncOp function);
 mlir::LogicalResult realizeRegions(mlir::func::FuncOp function, const Configuration &configuration,
                                   const ImplementationRegistry &implementations);
-mlir::LogicalResult materializeTaskLoops(mlir::func::FuncOp function);
+mlir::LogicalResult materializeTaskDispatches(mlir::func::FuncOp function);
 mlir::LogicalResult runCPUPasses(mlir::ModuleOp module, int64_t vectorBits,
                                int64_t workers, bool matrixI8I32, llvm::StringRef defaults,
                                llvm::StringRef overrides,

@@ -44,6 +44,9 @@ public:
     OpFoldResult size = view.getMixedSizes()[axis];
     auto type = view.getSourceType();
     if (!type.isDynamicDim(axis)) return getConstantIntValue(size) == type.getDimSize(axis);
+    if (auto allocation = view.getSource().getDefiningOp<memref::AllocOp>())
+      if (auto value = dyn_cast<Value>(size))
+        if (value == allocation.getDynamicSizes()[type.getDynamicDimIndex(axis)]) return true;
     if (auto value = dyn_cast<Value>(size))
       if (auto dimension = value.getDefiningOp<memref::DimOp>())
         return dimension.getSource() == view.getSource() && dimension.getConstantIndex() == axis;
@@ -72,6 +75,12 @@ public:
     if (auto fill = dyn_cast<linalg::FillOp>(operation)) { (void)get(fill.getOutputs()[0]); return; }
     if (auto copy = dyn_cast<memref::CopyOp>(operation)) { bind(copy.getSource(), copy.getTarget()); return; }
     if (auto cast = dyn_cast<memref::CastOp>(operation)) { bind(cast.getSource(), cast.getResult()); return; }
+    if (auto axes = unitReshapeAxes(operation)) {
+      SmallVector<unsigned> source(get(operation->getOperand(0)));
+      auto result = get(operation->getResult(0));
+      for (auto [from, to] : *axes) join(source[from], result[to]);
+      return;
+    }
     if (auto view = dyn_cast<memref::SubViewOp>(operation)) {
       SmallVector<unsigned> source(get(view.getSource()));
       auto result = get(view.getResult());
@@ -135,6 +144,17 @@ public:
               if (!allocation.getType().isDynamicDim(i)) continue;
               if (dynamic++ == use.getOperandNumber())
                 matches = target != result.axes.end() && target->second == i;
+            }
+            legal &= matches;
+          } else if (auto view = dyn_cast<memref::SubViewOp>(use.getOwner())) {
+            auto source = result.axes.find(view.getSource());
+            unsigned operand = 1;
+            for (OpFoldResult offset : view.getMixedOffsets()) operand += isa<Value>(offset);
+            bool matches = false;
+            for (auto [axis, size] : llvm::enumerate(view.getMixedSizes())) {
+              if (!isa<Value>(size)) continue;
+              if (operand++ == use.getOperandNumber())
+                matches = source != result.axes.end() && source->second == axis && fullSubviewAxis(view, axis);
             }
             legal &= matches;
           } else legal = false;

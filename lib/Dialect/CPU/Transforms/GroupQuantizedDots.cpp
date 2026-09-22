@@ -9,6 +9,11 @@ using namespace mlir;
 namespace intent::cpu {
 namespace {
 
+Value withoutCasts(Value value) {
+  while (auto cast = value.getDefiningOp<memref::CastOp>()) value = cast.getSource();
+  return value;
+}
+
 bool rowProjection(memref::SubViewOp view, Value row, unsigned rank) {
   if (!view || view.getSourceType().getRank() != rank ||
       view.getType().getRank() != rank - 1 || !view.getDroppedDims().test(0) ||
@@ -51,8 +56,8 @@ LogicalResult group(scf::ParallelOp parallel, const ImplementationRegistry &impl
   int64_t width = (*implementation)->parallelWindow(binding);
   if (width <= 1) return success();
   Value row = parallel.getInductionVars()[0];
-  auto lhs = dot.getLhs().getDefiningOp<memref::SubViewOp>();
-  auto output = dot.getOutput().getDefiningOp<memref::SubViewOp>();
+  auto lhs = withoutCasts(dot.getLhs()).getDefiningOp<memref::SubViewOp>();
+  auto output = withoutCasts(dot.getOutput()).getDefiningOp<memref::SubViewOp>();
   if (!rowProjection(lhs, row, 3) || !rowProjection(output, row, 1)) return success();
   auto function = parallel->getParentOfType<func::FuncOp>();
   DominanceInfo dominance(function);

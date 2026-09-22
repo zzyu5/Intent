@@ -4,6 +4,7 @@
 #include "Intent/Dialect/CPU/Transforms/Implementation.h"
 namespace intent::mojo {
 cpu::ImplementationRegistry implementations();
+int64_t registerContractionRows(mlir::linalg::GenericOp operation);
 mlir::LogicalResult materializeRegisterContractions(mlir::func::FuncOp function);
 mlir::LogicalResult legalizeProgram(mlir::ModuleOp module);
 }

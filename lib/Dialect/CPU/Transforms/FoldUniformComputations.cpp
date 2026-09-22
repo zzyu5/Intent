@@ -1,8 +1,10 @@
 #include "Intent/Dialect/CPU/Analysis/UniformValues.h"
+#include "Intent/Dialect/CPU/Analysis/RegionPredicates.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 using namespace mlir;
@@ -59,6 +61,7 @@ public:
           inputs[input] = !aliasesOutput || sameElement ? read(input) : Attribute();
         }
         if (unsafeAlias) { forget(output); continue; }
+        if (foldCoordinateReduction(generic)) { forget(output); continue; }
         inputs[output] = read(output);
         Attribute constant = foldUniformComputation(generic, inputs);
         if (!contraction && !constant) {
@@ -104,6 +107,72 @@ public:
   }
 
 private:
+  bool foldCoordinateReduction(linalg::GenericOp reduction) {
+    if (reduction.getNumDpsInputs() != 1 || reduction.getNumReductionLoops() != 1 ||
+        reduction.getNumLoops() != 1) return false;
+    Value input = reduction.getInputs()[0], output = reduction.getOutputs()[0];
+    auto inputType = dyn_cast<MemRefType>(input.getType());
+    auto outputType = cast<MemRefType>(output.getType());
+    if (!inputType || inputType.getRank() != 1 || !inputType.getElementType().isInteger(1) ||
+        outputType.getRank() != 0 || !outputType.getElementType().isInteger(1) ||
+        !input.getDefiningOp<memref::AllocOp>()) return false;
+    auto maps = reduction.getIndexingMapsArray();
+    if (!maps.front().isIdentity() || maps.back().getNumResults() != 0) return false;
+    Block &body = reduction.getRegion().front();
+    Operation *combine = body.getTerminator()->getOperand(0).getDefiningOp();
+    if (!combine || !isa<arith::AndIOp, arith::OrIOp>(combine) ||
+        !((combine->getOperand(0) == body.getArgument(0) && combine->getOperand(1) == body.getArgument(1)) ||
+          (combine->getOperand(1) == body.getArgument(0) && combine->getOperand(0) == body.getArgument(1)))) return false;
+    bool disjunction = isa<arith::OrIOp>(combine);
+
+    linalg::GenericOp predicate;
+    for (Operation *user : input.getUsers()) {
+      auto writer = dyn_cast<linalg::GenericOp>(user);
+      if (!writer || !llvm::is_contained(writer.getOutputs(), input)) continue;
+      if (predicate) return false;
+      predicate = writer;
+    }
+    if (!predicate || predicate.getNumResults() || predicate.getOutputs().size() != 1 ||
+        predicate.getNumReductionLoops() || predicate.getNumLoops() != 1 ||
+        !predicate.getIndexingMapsArray().back().isIdentity() ||
+        !physical.mayReadAt(input, predicate, reduction)) return false;
+    Block &predicateBody = predicate.getRegion().front();
+    if (!predicateBody.getArguments().back().use_empty() ||
+        llvm::any_of(predicateBody.without_terminator(), [](Operation &operation) {
+          return operation.getNumRegions() || !isMemoryEffectFree(&operation);
+        })) return false;
+    auto comparison = predicateBody.getTerminator()->getOperand(0).getDefiningOp<arith::CmpIOp>();
+    if (!comparison || !matchPattern(comparison.getRhs(), m_Zero())) return false;
+    auto coordinate = dyn_cast<BlockArgument>(comparison.getLhs());
+    if (!coordinate || coordinate.getOwner() != &predicateBody ||
+        coordinate.getArgNumber() >= predicate.getNumDpsInputs() ||
+        !predicate.getIndexingMapsArray()[coordinate.getArgNumber()].isIdentity()) return false;
+    auto sequence = coordinateSequence(predicate.getInputs()[coordinate.getArgNumber()], predicate);
+    if (!sequence || sequence->origin) return false;
+    if (comparison.getPredicate() == arith::CmpIPredicate::sge && sequence->nonnegativeOffsets) {
+      if (!disjunction) {
+        // Every member is true; conjunction leaves the incoming state intact,
+        // including an empty domain.
+        reduction.erase();
+        return true;
+      }
+    } else if (comparison.getPredicate() != arith::CmpIPredicate::eq || !sequence->startsAtOrigin) {
+      return false;
+    }
+    OpBuilder builder(reduction);
+    Location loc = reduction.getLoc();
+    Value extent = builder.create<memref::DimOp>(loc, input, 0);
+    Value bound = builder.create<arith::ConstantIndexOp>(loc, disjunction ? 0 : 1);
+    Value aggregate = builder.create<arith::CmpIOp>(loc,
+        disjunction ? arith::CmpIPredicate::sgt : arith::CmpIPredicate::sle, extent, bound);
+    Value initial = builder.create<memref::LoadOp>(loc, output, ValueRange{});
+    Value result = disjunction ? Value(builder.create<arith::OrIOp>(loc, initial, aggregate))
+                               : Value(builder.create<arith::AndIOp>(loc, initial, aggregate));
+    builder.create<memref::StoreOp>(loc, result, output, ValueRange{});
+    reduction.erase();
+    return true;
+  }
+
   PhysicalProgramAnalysis physical;
   UniformValueAnalysis values;
 };

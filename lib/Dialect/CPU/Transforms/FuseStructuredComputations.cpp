@@ -1,18 +1,19 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
+#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
 using namespace mlir;
 
 namespace intent::cpu {
-namespace {
 
-void eraseDeadBuffers(func::FuncOp function) {
+void eraseDeadPrivateBuffers(func::FuncOp function) {
   SmallVector<memref::AllocOp> allocations;
   function.walk([&](memref::AllocOp allocation) { allocations.push_back(allocation); });
   for (auto allocation : llvm::reverse(allocations)) {
@@ -48,6 +49,8 @@ void eraseDeadBuffers(func::FuncOp function) {
   }
 }
 
+namespace {
+
 linalg::GenericOp pointwiseProducer(Value buffer, Operation *consumer,
                                     PhysicalProgramAnalysis &analysis) {
   if (!buffer.getDefiningOp<memref::AllocOp>()) return {};
@@ -70,11 +73,35 @@ linalg::GenericOp pointwiseProducer(Value buffer, Operation *consumer,
       !producer.getIndexingMapsArray().back().isIdentity()) return {};
   Block &body = producer.getRegion().front();
   if (!body.getArguments().back().use_empty()) return {};
-  for (Operation &operation : body.without_terminator())
-    if (operation.getNumRegions() || !isMemoryEffectFree(&operation)) return {};
+  SmallVector<Value> reads;
+  for (Operation &operation : body.without_terminator()) {
+    if (operation.getNumRegions()) return {};
+    if (auto load = dyn_cast<memref::LoadOp>(operation)) {
+      if (isa<ReduceOp>(consumer)) return {};
+      reads.push_back(load.getMemref());
+    }
+    else if (!isMemoryEffectFree(&operation)) return {};
+  }
   for (Value input : producer.getInputs())
-    if (isa<MemRefType>(input.getType()) && !analysis.mayReadAt(input, producer, consumer))
-      return {};
+    if (isa<MemRefType>(input.getType())) reads.push_back(input);
+  if (auto reduce = dyn_cast<ReduceOp>(consumer))
+    for (Operation &operation : reduce.getCombine().front().without_terminator())
+      if (operation.getNumRegions() || !isMemoryEffectFree(&operation))
+        return {};
+  auto generic = dyn_cast<linalg::GenericOp>(consumer);
+  auto function = consumer->getParentOfType<func::FuncOp>();
+  AliasAnalysis aliases(function);
+  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  for (Value read : reads) {
+    if (!analysis.mayReadAt(read, producer, consumer)) return {};
+    if (!generic) continue;
+    for (Value output : generic.getOutputs()) {
+      if (aliases.alias(read, output).isNo()) continue;
+      auto source = analysis.externalView(read), target = analysis.externalView(output);
+      if (!source || !target || analysis.storageRoot(read) == analysis.storageRoot(output) ||
+          !interface.getDisjointOutputs() || (source.getAccess() == 0 && target.getAccess() == 0)) return {};
+    }
+  }
   return producer;
 }
 
@@ -137,6 +164,16 @@ bool fuseOne(Operation *consumer, unsigned inputNumber,
       maps.push_back(oldMaps[i]);
     }
   }
+  if (generic) {
+    // Removing an input must not remove the only shape binding for a loop.
+    llvm::SmallBitVector bound(generic.getNumLoops());
+    for (AffineMap map : maps)
+      for (AffineExpr expression : map.getResults())
+        if (auto dimension = dyn_cast<AffineDimExpr>(expression)) bound.set(dimension.getPosition());
+    for (AffineExpr expression : oldMaps.back().getResults())
+      if (auto dimension = dyn_cast<AffineDimExpr>(expression)) bound.set(dimension.getPosition());
+    if (!bound.all()) return false;
+  }
   auto populate = [&](OpBuilder &b, Block &target, Block &oldBody, unsigned prefix) {
     IRMapping mapping;
     unsigned current = prefix;
@@ -185,6 +222,7 @@ bool fuseOne(Operation *consumer, unsigned inputNumber,
     auto replacement = builder.create<ReduceOp>(reduce.getLoc(), reduce.getResult().getType(),
         reduce.getExtent(), reduce.getInitial(), inputs, builder.getArrayAttr(attributes),
         reduce.getOrder());
+    replacement->setDiscardableAttrs(llvm::to_vector(reduce->getDiscardableAttrs()));
     Block &body = replacement.getCombine().emplaceBlock();
     body.addArgument(reduce.getInitial().getType(), reduce.getLoc());
     for (Value input : inputs) {
@@ -198,6 +236,98 @@ bool fuseOne(Operation *consumer, unsigned inputNumber,
     reduce.erase();
   }
   eraseUnusedProducer(producer);
+  return true;
+}
+
+bool reusePrivateInput(linalg::GenericOp consumer, Value buffer,
+                       PhysicalProgramAnalysis &analysis) {
+  auto source = buffer.getDefiningOp<memref::AllocOp>();
+  if (!source || consumer.getNumResults() || consumer.getOutputs().size() != 1 ||
+      consumer.getNumReductionLoops() || source->getBlock() != consumer->getBlock()) return false;
+  auto output = consumer.getOutputs()[0].getDefiningOp<memref::AllocOp>();
+  if (!output || output == source || output->getBlock() != source->getBlock() ||
+      !source->isBeforeInBlock(output) || !output->isBeforeInBlock(consumer) ||
+      source.getType() != output.getType() || !source.getType().getLayout().isIdentity() ||
+      !llvm::equal(source.getDynamicSizes(), output.getDynamicSizes()) ||
+      source.getAlignment().value_or(0) < output.getAlignment().value_or(0)) return false;
+  Block &body = consumer.getRegion().front();
+  auto pure = [](Block &block) {
+    return llvm::all_of(block.without_terminator(), [](Operation &operation) {
+      return !operation.getNumRegions() && isMemoryEffectFree(&operation);
+    });
+  };
+  if (!body.getArguments().back().use_empty() || !pure(body)) return false;
+  auto maps = consumer.getIndexingMapsArray();
+  if (!maps.back().isIdentity()) return false;
+  AliasAnalysis aliases(consumer->getParentOfType<func::FuncOp>());
+  bool readsSource = false;
+  for (auto [number, input] : llvm::enumerate(consumer.getInputs())) {
+    if (!isa<MemRefType>(input.getType())) continue;
+    Value root = analysis.storageRoot(input);
+    if (root == output.getResult()) return false;
+    if (root == buffer) {
+      if (input != buffer || maps[number] != maps.back()) return false;
+      readsSource |= !body.getArgument(number).use_empty();
+    } else if (!aliases.alias(root, buffer).isNo()) return false;
+  }
+  if (!readsSource) return false;
+
+  auto lifetime = [&](memref::AllocOp allocation, bool oldValues) -> memref::DeallocOp {
+    Block *owner = allocation->getBlock();
+    SmallVector<Value> views{allocation.getResult()};
+    SmallVector<Operation *> users, accesses;
+    memref::DeallocOp end;
+    for (unsigned i = 0; i < views.size(); ++i)
+      for (Operation *user : views[i].getUsers()) {
+        users.push_back(user);
+        if (auto view = dyn_cast<memref::SubViewOp>(user)) {
+          views.push_back(view.getResult());
+          continue;
+        }
+        if (auto cast = dyn_cast<memref::CastOp>(user)) {
+          views.push_back(cast.getResult());
+          continue;
+        }
+        if (isa<memref::DimOp>(user)) continue;
+        if (auto release = dyn_cast<memref::DeallocOp>(user)) {
+          if (end || release.getMemref() != allocation.getResult() || release->getBlock() != owner) return {};
+          end = release;
+          continue;
+        }
+        if (auto computation = dyn_cast<linalg::LinalgOp>(user)) {
+          if (computation->getNumResults() || computation->getNumRegions() != 1 ||
+              !pure(computation->getRegion(0).front())) return {};
+        } else if (auto reduction = dyn_cast<ReduceOp>(user)) {
+          if (!pure(reduction.getCombine().front())) return {};
+        } else if (!isa<memref::LoadOp, memref::StoreOp, memref::CopyOp>(user)) return {};
+        accesses.push_back(user);
+      }
+    if (!end) return {};
+    for (Operation *user : users) {
+      if (user == end) continue;
+      Operation *stage = owner->findAncestorOpInBlock(*user);
+      if (!stage || !stage->isBeforeInBlock(end)) return {};
+    }
+    for (Operation *access : accesses) {
+      if (access == consumer) continue;
+      Operation *stage = owner->findAncestorOpInBlock(*access);
+      if (oldValues ? !stage->isBeforeInBlock(consumer) : !consumer->isBeforeInBlock(stage)) return {};
+    }
+    return end;
+  };
+  auto sourceEnd = lifetime(source, true), outputEnd = lifetime(output, false);
+  if (!sourceEnd || !outputEnd) return false;
+  auto yielded = dyn_cast<BlockArgument>(body.getTerminator()->getOperand(0));
+  bool identity = body.without_terminator().empty() && yielded && yielded.getOwner() == &body &&
+      yielded.getArgNumber() < consumer.getInputs().size() &&
+      consumer.getInputs()[yielded.getArgNumber()] == buffer;
+  // The pointwise phase reads each old element before overwriting that element.
+  // All other old-value observations have finished; later phases use the result.
+  if (sourceEnd->isBeforeInBlock(outputEnd)) sourceEnd->moveAfter(outputEnd);
+  outputEnd.erase();
+  output.getResult().replaceAllUsesWith(buffer);
+  output.erase();
+  if (identity) consumer.erase();
   return true;
 }
 
@@ -362,8 +492,23 @@ LogicalResult fuseStructuredComputations(func::FuncOp function) {
     function.walk([&](Operation *operation) {
       if (isa<ReduceOp>(operation)) consumers.push_back(operation);
       else if (auto generic = dyn_cast<linalg::GenericOp>(operation);
-               generic && !generic.getNumReductionLoops() && generic.getOutputs().size() == 1)
+               generic && !isMatrixContraction(generic) && !generic.getNumResults() &&
+               generic.getOutputs().size() == 1 &&
+               llvm::all_of(generic.getRegion().front().without_terminator(), [](Operation &nested) {
+                 return !nested.getNumRegions() && (isa<memref::LoadOp>(nested) || isMemoryEffectFree(&nested));
+               })) {
+        if (generic.getNumReductionLoops()) {
+          llvm::SmallBitVector outputAxes(generic.getNumLoops());
+          for (AffineExpr expression : generic.getIndexingMapsArray().back().getResults()) {
+            auto axis = dyn_cast<AffineDimExpr>(expression);
+            if (!axis || outputAxes.test(axis.getPosition())) return;
+            outputAxes.set(axis.getPosition());
+          }
+          for (auto [axis, kind] : llvm::enumerate(generic.getIteratorTypesArray()))
+            if (outputAxes.test(axis) != (kind == utils::IteratorType::parallel)) return;
+        }
         consumers.push_back(operation);
+      }
     });
     for (Operation *consumer : llvm::reverse(consumers)) {
       PhysicalProgramAnalysis analysis(function);
@@ -389,7 +534,23 @@ LogicalResult fuseStructuredComputations(func::FuncOp function) {
     }
   }
   forwardPointwiseCopies(function);
-  eraseDeadBuffers(function);
+  eraseDeadPrivateBuffers(function);
+  return success();
+}
+
+LogicalResult reusePrivateStorage(func::FuncOp function) {
+  // Preserve separate values until region predicates and pointwise bodies have
+  // folded, so a constant replacement can discard its old computation first.
+  eraseDeadPrivateBuffers(function);
+  SmallVector<linalg::GenericOp> consumers;
+  function.walk([&](linalg::GenericOp operation) { consumers.push_back(operation); });
+  for (auto consumer : llvm::reverse(consumers)) {
+    SmallVector<Value> inputs(consumer.getInputs());
+    for (Value input : inputs) {
+      PhysicalProgramAnalysis analysis(function);
+      if (reusePrivateInput(consumer, input, analysis)) break;
+    }
+  }
   return success();
 }
 
