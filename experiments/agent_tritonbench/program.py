@@ -26,13 +26,12 @@ from experiments._common.loading import load_module
 
 class ProgramContext:
     def __init__(self, compiler: Path, directory: Path, *, language: str,
-                 target: str = "triton", keep_ir: bool = False):
+                 target: str = "triton"):
         self.compiler = compiler
         self.directory = directory
         self.language = language
         self.target = {"triton": TritonTarget, "cutile": CuTileTarget}[target]()
         self.target_name = target
-        self.keep_ir = keep_ir
         self.generated: dict[str, CompiledArtifact] = {}
         self.tuning: list[dict] = []
         self.precompile_failures: list[dict] = []
@@ -42,20 +41,15 @@ class ProgramContext:
             raise ValueError("only Intent generation may invoke the Intent compiler")
         if not name.isidentifier() or name in self.generated:
             raise ValueError("each compile() needs a distinct literal identifier")
-        try:
-            program = intent.generate(definition, target=self.target, compiler=self.compiler,
-                                      constexprs=constexprs)
-        except intent.CompilationStageError as error:
-            if error.stage in {"provider_lowering", "provider_program_verification", "serialization"}:
-                shared = intent.compile_shared_gpu(
-                    definition, target=self.target, compiler=self.compiler, constexprs=constexprs)
-                (self.directory / f"{name}.shared.mlir").write_text(shared)
-            raise
-        (self.directory / f"{name}.py").write_text(program.source)
-        if self.keep_ir:
-            (self.directory / f"{name}.mlir").write_text(program.ir)
+        program = intent.generate(definition, target=self.target, compiler=self.compiler,
+                                  constexprs=constexprs)
         materialize = {"triton": materialize_triton_artifact, "cutile": materialize_cutile_artifact}[self.target_name]
-        artifact = materialize(program.source, program.ir, definition.__name__, 0)
+        try:
+            artifact = materialize(program.source, program.ir, definition.__name__, 0)
+        except Exception as error:
+            raise intent.CompilationStageError("generated_source_materialization", str(error),
+                                               cache_directory=program.cache_directory) from error
+        artifact.cache_directory = program.cache_directory
         if self.target_name == "cutile":
             search = artifact._namespace["exhaustive_search"]
 
@@ -144,16 +138,6 @@ class ProgramContext:
                 namespace["TuningState"] = state
                 namespace["exhaustive_search"] = search
                 namespace["_TUNE_CACHE"].clear()
-
-    def save_backend_ir(self, executed):
-        if not self.keep_ir:
-            return
-        for name, artifact in self.generated.items():
-            for entry in artifact._namespace.values():
-                if isinstance(entry, Autotuner) and entry in executed:
-                    artifact.backend_ir = artifact._backend_ir_collector(executed[entry])
-            for kind, text in artifact.backend_ir.items():
-                (self.directory / f"{name}.backend.{kind}").write_text(text)
 
     def load_source(self, filename: str):
         if self.language != "triton":

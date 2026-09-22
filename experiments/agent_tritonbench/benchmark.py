@@ -10,6 +10,7 @@ import sys
 import time
 import traceback
 
+import intent
 import torch
 from triton.compiler.errors import CompilationError, CompileTimeAssertionFailure
 from triton.runtime.errors import OutOfResources, PTXASError
@@ -98,11 +99,8 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
     stage = "reference_preparation"
     report_stage(stage)
     budget = TuningBudget(CandidateTorchPolicy)
-    artifact_directory = arguments.artifacts or arguments.program.parent
-    artifact_directory.mkdir(parents=True, exist_ok=True)
-    context = ProgramContext(arguments.compiler, artifact_directory, language=arguments.language,
-                             target=arguments.target,
-                             keep_ir=arguments.artifacts is not None)
+    context = ProgramContext(arguments.compiler, arguments.program.parent,
+                             language=arguments.language, target=arguments.target)
     try:
         candidate_call = invocation(arguments.reference, row, task, suite, device="cpu")
         reference_call = invocation(arguments.reference, row, task, suite, device="cpu")
@@ -152,7 +150,6 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
                                             benchmark_time_budget_ms=200)
             result.update(status="pass", candidate_ms=measured, reference_ms=anchor,
                           ratio=measured / anchor if anchor is not None else None)
-            context.save_backend_ir(budget.executed)
     except Exception as error:
         # A failed program is a result in the fixed denominator, never a fallback.
         causes = []
@@ -180,6 +177,10 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
         else:
             status = "reference_failure" if stage == "reference_preparation" else "agent_program_error"
         result.update(status=status, failure_stage=stage, error=str(error), traceback=traceback.format_exc())
+        if isinstance(error, intent.CompilationStageError) and error.cache_directory is not None:
+            result["failed_compiler_artifact"] = str(error.cache_directory)
+    result["compiler_artifacts"] = {name: str(artifact.cache_directory)
+                                    for name, artifact in context.generated.items()}
     result["precompile_failures"] = budget.precompile_failures + context.precompile_failures
     result["tuning"] = context.tuning if arguments.target == "cutile" else budget.records()
     result["preparation_and_benchmark_seconds"] = time.monotonic() - started
@@ -198,7 +199,6 @@ def main() -> None:
     parser.add_argument("--cutile-compiler-timeout", type=int, default=15)
     parser.add_argument("--result", type=Path, required=True)
     parser.add_argument("--gpu-lock", type=Path, required=True)
-    parser.add_argument("--artifacts", type=Path, help="Separate compiler recheck artifacts from an existing submission")
     parser.add_argument("--phase-fd", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--suite", type=Path, default=SUITE_PATH,
                         help="Fixed task and numerical configuration used by generation")

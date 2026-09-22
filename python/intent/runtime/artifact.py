@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field
 from enum import IntEnum
+from pathlib import Path
 from typing import Any
 
 
@@ -58,6 +59,7 @@ class CompiledArtifact:
     _backend_ir_collector: BackendIRCollector | None = field(repr=False)
     _namespace: dict[str, object] = field(repr=False)
     device_type: str = field(default="cuda", kw_only=True)
+    cache_directory: Path | None = field(default=None, kw_only=True)
     backend_ir: dict[str, str] = field(default_factory=dict, init=False)
     _backend_ir_kernel: object = field(default_factory=object, init=False, repr=False)
 

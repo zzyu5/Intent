@@ -26,9 +26,12 @@ def compile(
         raise NotImplementedError("This target only generates source; use intent.generate, not intent.compile")
     program = _generate_source(kernel_mlir, resolved, compiler, tuning_config)
     try:
-        return resolved.materialize(program.source, program.ir, definition.__name__, program.metadata)
+        artifact = resolved.materialize(program.source, program.ir, definition.__name__, program.metadata)
+        artifact.cache_directory = program.cache_directory
+        return artifact
     except Exception as error:
-        raise CompilationStageError("generated_source_materialization", str(error)) from error
+        raise CompilationStageError("generated_source_materialization", str(error),
+                                    cache_directory=program.cache_directory) from error
 
 
 def generate(
@@ -56,7 +59,7 @@ def _inputs(definition, target, constexprs) -> tuple[str, ResolvedSourceTarget]:
 
 
 def _generate_source(kernel_mlir, resolved, compiler, tuning_config) -> GeneratedProgram:
-    source, realized_mlir, metadata = run_compiler(
+    source, realized_mlir, metadata, cache_directory = run_compiler(
         compiler,
         kernel_mlir,
         resolved.compiler_options + (
@@ -65,7 +68,7 @@ def _generate_source(kernel_mlir, resolved, compiler, tuning_config) -> Generate
         ),
         resolved.compiler_role,
     )
-    return GeneratedProgram(source, realized_mlir, metadata)
+    return GeneratedProgram(source, realized_mlir, metadata, cache_directory)
 
 
 def compile_shared_gpu(

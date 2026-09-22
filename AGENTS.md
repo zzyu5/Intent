@@ -17,6 +17,7 @@
 - dtype 分清外部存储/ABI、source 运算、accumulator/result 与后端内部计算。先核对参考的 promotion、literal 推导和 store conversion；typed IR 要求类型闭合，不等于作者必须处处同 dtype 或显式 cast。额外限制须有独立理由，也不能以复用后端为由改变已声明的累加精度、NaN/tie 或 ABI。
 - `examples/kernels/` 只保存作者算法；`experiments/{gpu,cpu,mlu,agent_tritonbench}/` 分别保存对应实验的执行入口、操作说明、baseline 与结果。GPU 当前推进 Triton/cuTile，保留 TileLang corpus 与旧结果。
 - Provider source/runtime corpus 放在实验组的 `baselines/`；registry 连接完整 callable，CSV 是运行观察。后续全量、单点和 pass 效果实验均归入对应组的 `results/`，分析与操作也保存在同组；这些材料不定义语言语义或 compiler policy。
+- 中间 MLIR、生成的后端源码和编译缓存放在仓库外（如 `~/.cache/intentdsl/`）；实验目录只保留执行入口、必要的 baseline 和结果。
 
 ## IR、pass 与目录
 

@@ -101,6 +101,10 @@ Compiled-candidate identity至少包含：
 
 Autotune winner cache另外以runtime tuning key索引候选timings。Compiled artifact cache与winner cache是不同层次，不能把winner写进IR冒充编译决定。
 
+Intent 的编译产物默认保存到 `$XDG_CACHE_HOME/intentdsl/`，未设置 XDG 路径时使用 `~/.cache/intentdsl/`；`INTENT_CACHE_DIR` 可指定根目录。每项保存输入 KIR、目标 IR、provider source 与接口 metadata，`intent.generate` 和 `intent.compile` 的结果通过 `cache_directory` 暴露其位置。相同编译输入复用生成结果；compiler 文件身份、target/capability options、默认 profiles 或显式 tuning 配置内容改变时不复用旧项。并发请求只在相同 cache entry 上串行，成功产物完整后才发布；失败保留输入与诊断，但不作为成功结果复用。
+
+这层缓存对应 Intent 的 source/IR 编译调用。Triton、cuTile 等下层仍使用各自的原生 JIT cache，负责 runtime specialization、具体候选与 native binary 的身份和复用；实验目录不另存生成的源码或中间 IR。
+
 ## 8. Baseline 对照边界
 
 比较generated与手写provider source的算子性能时，以算法、输入shape、外部dtype与明确的调用和计时范围为基础。双方可各自调优，不要求先对齐完整candidate集合或穷举全部候选才允许测量。舍入位置、近似数学和中间精度的细微差异应注明，不一概阻断同算法的性能比较；这不放松compiler对Intent语义的保持要求。
