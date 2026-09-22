@@ -1,2 +1,3 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
 scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,6.827672,9.363640,0.729169,pass,
+mamba3_siso_forward,B1-S2048-HQK4-H16-DQK32-DV64-bf16,,,,source_semantics_gap,

@@ -3270,6 +3270,92 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
     }
   }
 
+  if (auto splat = value.getDefiningOp<SplatOp>()) {
+    auto size = constantPhysicalExpression(extent);
+    if (size) {
+      DominanceInfo dominance(kernel);
+      SmallVector<MakeRangeOp> visible;
+      for (MakeRangeOp range : programRanges(result.source).roots) {
+        auto dimension = queryRangeDimension(range);
+        if (succeeded(dimension) && *dimension == result.dimensionId &&
+            dominance.dominates(range.getOperation(), splat.getOperation()) &&
+            valueMatchesExtent(range.getExtent(), extent) &&
+            constantLogicalRangeCardinality(range) == size &&
+            samePhysicalScalarExpression(range.getStart(),
+                                         range.getLogicalStart()))
+          visible.push_back(range);
+      }
+      if (lockstepRanges(visible).isExact()) {
+        result.state = PhysicalFactState::Exact;
+        result.physicalized = true;
+        result.roots = std::move(visible);
+        result.extentAuthority =
+            PhysicalAxisRealizationFact::ExtentAuthority::Range;
+        return result;
+      }
+    }
+  }
+
+  if (auto join = value.getDefiningOp<JoinOp>()) {
+    if (fragmentAxis == join.getAxis()) {
+      result.state = PhysicalFactState::Exact;
+      result.physicalized = true;
+      result.extentAuthority =
+          PhysicalAxisRealizationFact::ExtentAuthority::Structural;
+      return result;
+    }
+    auto lhs = axisRealization(join.getLhs(), fragmentAxis);
+    auto rhs = axisRealization(join.getRhs(), fragmentAxis);
+    if (lhs.isExact() && lhs.physicalized && !lhs.constructionScalarSeed &&
+        rhs.isExact() && rhs.physicalized && !rhs.constructionScalarSeed) {
+      result.state = PhysicalFactState::Exact;
+      result.physicalized = true;
+      auto ranges = axisRanges(value, fragmentAxis);
+      if (ranges.isExact())
+        result.roots = std::move(ranges.roots);
+      result.extentAuthority =
+          PhysicalAxisRealizationFact::ExtentAuthority::Structural;
+      return result;
+    }
+  }
+
+  if (auto reshape = value.getDefiningOp<ReshapeOp>()) {
+    auto inputType = cast<FragmentType>(reshape.getValue().getType());
+    unsigned sourceRank = 0, resultRank = 0;
+    for (Attribute attribute : reshape.getReassociation()) {
+      auto group = cast<ReshapeGroupAttr>(attribute);
+      sourceRank += group.getSourceAxes().size();
+      resultRank += group.getResultAxes().size();
+    }
+    unsigned sourcePrefix = inputType.getShape().size() - sourceRank;
+    unsigned resultPrefix = fragment.getShape().size() - resultRank;
+    if (fragmentAxis < resultPrefix)
+      return axisRealization(reshape.getValue(), fragmentAxis);
+    for (Attribute attribute : reshape.getReassociation()) {
+      auto group = cast<ReshapeGroupAttr>(attribute);
+      if (!llvm::is_contained(group.getResultAxes().asArrayRef(),
+                              fragmentAxis - resultPrefix))
+        continue;
+      bool physicalized = llvm::all_of(
+          group.getSourceAxes().asArrayRef(), [&](int64_t axis) {
+            auto input = axisRealization(reshape.getValue(), sourcePrefix + axis);
+            return input.isExact() && input.physicalized &&
+                   !input.constructionScalarSeed;
+          });
+      if (physicalized) {
+        result.state = PhysicalFactState::Exact;
+        result.physicalized = true;
+        auto ranges = axisRanges(value, fragmentAxis);
+        if (ranges.isExact())
+          result.roots = std::move(ranges.roots);
+        result.extentAuthority =
+            PhysicalAxisRealizationFact::ExtentAuthority::Structural;
+        return result;
+      }
+      break;
+    }
+  }
+
   if (Operation *producer = value.getDefiningOp();
       isa_and_nonnull<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp>(producer)) {
     for (Value operand : producer->getOperands()) {

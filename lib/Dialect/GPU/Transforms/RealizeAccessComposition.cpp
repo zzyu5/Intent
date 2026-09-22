@@ -473,6 +473,28 @@ FailureOr<bool> composeReshapedGather(GatherOp gather) {
     return false;
   auto source = cast<FragmentType>(reshape.getValue().getType());
   auto shaped = cast<FragmentType>(reshape.getResult().getType());
+  // Scalar indexing is a rectangular extraction in the reshaped layout.
+  // Flattening it can turn a native split into a strided fragment gather.
+  if (!gather.getCoordinates().empty() &&
+      llvm::all_of(llvm::zip(gather.getCoordinates(), gather.getSourceAxes()),
+                   [&](auto entry) {
+        Value coordinate = std::get<0>(entry);
+        int64_t axis = std::get<1>(entry);
+        while (isa<FragmentType>(coordinate.getType())) {
+          UniformExpression expression = describeUniformValue(coordinate);
+          if (expression.kind != UniformKind::Forward ||
+              expression.operands.size() != 1)
+            break;
+          coordinate = expression.operands.front();
+        }
+        if (!isa<FragmentType>(coordinate.getType()))
+          return true;
+        auto range = coordinate.getDefiningOp<MakeRangeOp>();
+        return range && isZero(range.getStart()) && isUnitStepRange(range) &&
+               queryLaunchExpression(range.getExtent()) ==
+                   shaped.getShape()[axis];
+      }))
+    return false;
   if (source.getShape() == shaped.getShape() &&
       llvm::all_of(reshape.getReassociation(), [](Attribute attribute) {
         auto group = cast<ReshapeGroupAttr>(attribute);

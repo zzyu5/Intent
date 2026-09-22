@@ -1699,7 +1699,7 @@ bool hasLoopCarriedFragment(func::FuncOp kernel) {
 bool hasOccupancySensitiveTileCompute(func::FuncOp kernel) {
   bool found = false;
   kernel.walk([&](Operation *operation) {
-    found |= isa<gpu::ContractOp, gpu::ScaledContractOp, gpu::ReduceOp,
+    found |= isa<gpu::ContractOp, gpu::ScaledContractOp, gpu::ReduceOp, gpu::HistogramOp,
                  gpu::ScanOp, MMAOp, ScaledMMAOp, ReduceOp, ScanOp>(operation);
   });
   return found;
@@ -1790,6 +1790,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
   SmallVector<gpu::ContractOp> contracts;
   SmallVector<gpu::ScaledContractOp> scaledContracts;
   SmallVector<gpu::ReduceOp> reductions;
+  SmallVector<gpu::HistogramOp> histograms;
   SmallVector<gpu::ScanOp> scans;
   SmallVector<gpu::StoreOp> stores;
   SmallVector<gpu::AtomicRMWOp> atomics;
@@ -1800,6 +1801,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
   kernel.walk(
       [&](gpu::ScaledContractOp op) { scaledContracts.push_back(op); });
   kernel.walk([&](gpu::ReduceOp op) { reductions.push_back(op); });
+  kernel.walk([&](gpu::HistogramOp op) { histograms.push_back(op); });
   kernel.walk([&](gpu::ScanOp op) { scans.push_back(op); });
   kernel.walk([&](gpu::StoreOp op) { stores.push_back(op); });
   kernel.walk([&](gpu::AtomicRMWOp op) { atomics.push_back(op); });
@@ -2259,6 +2261,70 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
     }
     gather.getResult().replaceAllUsesWith(value);
     gather.erase();
+  }
+
+  for (gpu::HistogramOp histogram : histograms) {
+    auto source = cast<gpu::FragmentType>(histogram.getValues().getType());
+    auto result = cast<gpu::FragmentType>(histogram.getResult().getType());
+    if (source.getShape().size() != 1)
+      return histogram.emitOpError(
+          "cuTile histogram requires a realized one-axis input fragment");
+    OpBuilder builder(histogram);
+    Location location = histogram.getLoc();
+    auto sourceInteger = dyn_cast<IntegerType>(source.getElementType());
+    Type comparisonElement = sourceInteger && sourceInteger.isUnsigned()
+                                 ? IntegerType::get(kernel.getContext(), 64,
+                                                    IntegerType::Unsigned)
+                                 : builder.getI64Type();
+    auto binMap = cast<gpu::AxisMapAttr>(result.getAxisMaps()[0]);
+    auto inputMap = cast<gpu::AxisMapAttr>(source.getAxisMaps()[0]);
+    auto inputAxis = gpu::AxisMapAttr::get(
+        kernel.getContext(), inputMap.getSourceId(), inputMap.getSourceAxis(),
+        inputMap.getDimensionId(), 1, inputMap.getDerived());
+    auto shape = builder.getArrayAttr(
+        {result.getShape()[0], source.getShape()[0]});
+    auto maps = builder.getArrayAttr({binMap, inputAxis});
+    auto relation = [&](Type element) {
+      return gpu::FragmentType::get(kernel.getContext(), element, shape, maps,
+                                    result.getValidity(), result.getOwner());
+    };
+    auto binType = gpu::FragmentType::get(
+        kernel.getContext(), builder.getIndexType(), result.getShape(),
+        result.getAxisMaps(), result.getValidity(), result.getOwner());
+    Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+    Value one = builder.create<arith::ConstantIndexOp>(location, 1);
+    Value bins = builder.create<gpu::MakeRangeOp>(
+        location, binType, zero, histogram.getBins(), one, zero,
+        histogram.getBins(), binMap.getSourceId(), binMap.getSourceAxis(),
+        binMap.getDerived());
+    bins = builder.create<gpu::CastOp>(
+        location, withElementType(binType, comparisonElement), bins);
+    Value input = builder.create<gpu::CastOp>(
+        location, withElementType(source, comparisonElement),
+        histogram.getValues());
+    Value values = builder.create<gpu::BroadcastOp>(
+        location, relation(comparisonElement), input);
+    Value selectedBins = builder.create<gpu::BroadcastOp>(
+        location, relation(comparisonElement), bins);
+    Value members = builder.create<gpu::CompareOp>(
+        location, relation(builder.getI1Type()), values, selectedBins,
+        ComparePredicate::Eq);
+    if (histogram.getValid()) {
+      Value valid = builder.create<gpu::BroadcastOp>(
+          location, relation(builder.getI1Type()), histogram.getValid());
+      members = builder.create<gpu::BinaryOp>(
+          location, relation(builder.getI1Type()), members, valid,
+          BinaryOperator::LogicalAnd);
+    }
+    Value counts = builder.create<gpu::CastOp>(
+        location, relation(result.getElementType()), members);
+    auto replacement = builder.create<ReduceOp>(
+        location, TypeRange{result}, ValueRange{counts}, 1, 1, false,
+        BinaryOperatorAttr::get(kernel.getContext(), BinaryOperator::Add));
+    if (Attribute origin = histogram->getAttr(gpu::originAttr))
+      replacement->setAttr(gpu::originAttr, origin);
+    histogram.getResult().replaceAllUsesWith(replacement.getResult(0));
+    histogram.erase();
   }
 
   for (gpu::ReduceOp reduce : reductions) {
