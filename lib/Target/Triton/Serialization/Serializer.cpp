@@ -1085,8 +1085,8 @@ private:
     }
     if (auto select = dyn_cast<gpu::SelectOp>(operation)) {
       assign(select.getResult(), "tl.where(" + valueString(select.getCondition()) +
-                                      ", " + valueString(select.getTrueValue()) +
-                                      ", " + valueString(select.getFalseValue()) + ")");
+                                      ", " + controlValueString(select.getTrueValue()) +
+                                      ", " + controlValueString(select.getFalseValue()) + ")");
       return;
     }
     if (auto map = dyn_cast<MapElementwiseOp>(operation)) {
