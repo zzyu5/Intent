@@ -3,9 +3,9 @@ fused_softmax,8192x8192-fp16,0.175712,0.188032,0.934479,pass,Intent target=cutil
 dense_gemm,M4096-N14336-K4096-fp16,2.053824,2.110240,0.973266,pass,Intent target=cutile; source corpus=triton. 
 grouped_gemm,E8-M1024-K4096-N14336-fp16,4.299344,4.573904,0.939973,pass,Intent target=cutile; source corpus=triton. 
 flash_attention_forward,B4-H32-S4096-D128-fp16-causal,,,,source_provider_jit_or_initial_launch_failed,PassManager::run failed
-layer_norm,8192x4096-fp16,,,,generated_provider_jit_or_initial_launch_timeout,exceeded 300 seconds
+layer_norm,8192x4096-fp16,0.089864,0.089872,0.999911,pass,Intent target=cutile; source corpus=triton. 
 flash_cross_entropy,8192x32768-bf16,0.341832,0.343464,0.995248,pass,Intent target=cutile; source corpus=triton. 
-flash_layer_norm,8192x4096-bf16,,,,generated_provider_jit_or_initial_launch_timeout,exceeded 300 seconds
+flash_layer_norm,8192x4096-bf16,0.087824,0.087776,1.000547,pass,Intent target=cutile; source corpus=triton. 
 rotary_embedding,B4-S4096-H32-D128-bf16,0.177920,0.179648,0.990381,pass,Intent target=cutile; source corpus=triton. 
 swiglu,8192x14336-bf16,0.450304,0.450568,0.999414,pass,Intent target=cutile; source corpus=triton. 
 embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.175280,0.173664,1.009305,pass,Intent target=cutile; source corpus=triton. 
@@ -17,7 +17,7 @@ xformers_rms_norm,8192x4096-bf16,0.080000,0.086696,0.922765,pass,Intent target=c
 qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,1.769472,1.896960,0.932794,pass,Intent target=cutile; source corpus=triton. 
 index_select,source65536-selected32768-hidden4096-fp16,0.357912,0.366400,0.976834,pass,Intent target=cutile; source corpus=triton. 
 scaled_index_add,destination65536-routed32768-hidden4096-fp16,0.520224,0.530528,0.980578,pass,Intent target=cutile; source corpus=triton.
-scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,,,,generated_provider_program_verification_failed,"Intent cuTile compiler failed with exit code 6:; loc(""<stdin>"":26:13): error: 'intent_gpu.atomic_rmw' op cuTile atomic RMW has no native arbitrary-validity form"
+scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,,,,numerical_failed,"generated/source floating result 0 differs: max_abs=276.03125, atol=0.5, rtol=0.01; first_failure=0; largest tolerance excess has generated=51.28125, source=-224.75, abs_error=276.03125, limit=2.747499942779541"
 jagged_mean,B512-T33024-D128-fp32,0.017512,0.018144,0.965168,pass,Intent target=cutile; source corpus=triton. 
 fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.067312,0.124656,0.539982,pass,Intent target=cutile; source corpus=triton. 
 rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.237568,0.439792,0.540183,pass,Intent target=cutile; source corpus=triton. 
@@ -42,7 +42,7 @@ flaggems_triangular_solve,B4096-N16-fp32-lower,,,,source_benchmark_process_faile
 flaggems_embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.175872,0.174832,1.005949,pass,Intent target=cutile; source corpus=triton. 
 flaggems_roll,8192x4096-fp16-shift-1-axis0,0.087792,0.089088,0.985453,pass,Intent target=cutile; source corpus=triton. 
 flaggems_transpose_copy,4093x8191-fp16,,,,source_launch_process_failed,worker exited with code -11
-flaggems_batch_norm_training,B32-C64-S4096-fp16,,,,generated_physical_program_verification_failed,"Intent cuTile compiler failed with exit code 4:; loc(""<stdin>"":2:3): error: failed to rank-lift a legal pointwise ownership graph"
+flaggems_batch_norm_training,B32-C64-S4096-fp16,0.102896,0.026608,3.867108,pass,Intent target=cutile; source corpus=triton. 
 flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.042752,0.050912,0.839723,pass,Intent target=cutile; source corpus=triton. 
 flaggems_logsumexp,8192x8192-fp32,0.184096,0.175904,1.046571,pass,Intent target=cutile; source corpus=triton. 
 flaggems_softmax_backward,4096x4097-fp32,,,,numerical_failed,"generated/source floating result 0 differs: max_abs=0.00012362003326416016, atol=0.0001, rtol=1e-05; first_failure=15327822; largest tolerance excess has generated=0.08494142442941666, source=0.08482552319765091, abs_error=0.00011590123176574707, limit=0.00010084825044032186"
@@ -51,5 +51,5 @@ flaggems_addcmul,B64-C128-L4096-bf16,,,,source_launch_process_failed,worker exit
 flaggems_fp8_mqa_logits,Q256-K4096-H32-D128-e4m3,,,,generated_provider_jit_or_initial_launch_timeout,exceeded 300 seconds
 flaggems_cumsum,8192x8192-fp32-axis1,0.350008,0.351960,0.994454,pass,Intent target=cutile; source corpus=triton. 
 flaggems_histogram,N8388608-bins256-fp32,,,,generated_provider_program_verification_failed,"Intent cuTile compiler failed with exit code 6:; loc(""<stdin>"":17:11): error: 'intent_gpu.histogram' op is outside the closed cuTile provider surface"
-flaggems_max_pool2d_with_indices,B8-C32-H128-W128-K3-S2-P1-fp16,,,,generated_physical_program_verification_failed,"Intent cuTile compiler failed with exit code 4:; loc(""<stdin>"":2:3): error: failed to rank-lift a legal pointwise ownership graph"
+flaggems_max_pool2d_with_indices,B8-C32-H128-W128-K3-S2-P1-fp16,0.018176,0.018176,1.000000,pass,Intent target=cutile; source corpus=triton. 
 legacy_flash_attention_bias,B4-H32-S4096-D128-fp16-vector-bias,,,,source_compatibility_gap,

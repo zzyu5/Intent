@@ -3631,6 +3631,17 @@ LogicalResult rankLiftPointwiseValueGraph(
           dependsOnLiftedAxis);
       if (!sourceDepends)
         return WalkResult::interrupt();
+      OpBuilder builder(reduce);
+      for (unsigned index = 0; index < reduce.getSourceCount(); ++index) {
+        Value source = reduce.getInputs()[index];
+        FailureOr<Value> projected = projectPhysicalValueToSchema(
+            builder, reduce.getLoc(), source, liftedValueType(source.getType()));
+        if (failed(projected)) {
+          reduce.emitOpError("source cannot adopt the lifted free axes");
+          return WalkResult::interrupt();
+        }
+        reduce->setOperand(index, *projected);
+      }
       reduce->setAttr("axes", DenseI64ArrayAttr::get(
                                   kernel.getContext(),
                                   shiftedAxes(reduce.getAxes())));
@@ -3644,25 +3655,14 @@ LogicalResult rankLiftPointwiseValueGraph(
         combine.getArgument(index).setType(value.getType());
         combine.getArgument(reduce.getIdentityCount() + index)
             .setType(value.getType());
+        liftedValues.insert(combine.getArgument(index));
+        liftedValues.insert(
+            combine.getArgument(reduce.getIdentityCount() + index));
         liftedValues.insert(value);
       }
-      WalkResult helper = combine.walk([&](Operation *nested) {
-        if (isa<YieldOp>(nested))
-          return WalkResult::advance();
-        if (!isCartesianPointwiseValueOp(nested) ||
-            nested->getNumRegions() != 0)
+      for (Operation &nested : combine.without_terminator())
+        if (liftOperation(&nested).wasInterrupted())
           return WalkResult::interrupt();
-        if (auto splat = dyn_cast<SplatOp>(nested);
-            splat && isa<FragmentType>(splat.getValue().getType()))
-          rememberRankLiftedSplat(splat);
-        for (Value value : nested->getResults()) {
-          value.setType(liftedValueType(value.getType()));
-          liftedValues.insert(value);
-        }
-        return WalkResult::advance();
-      });
-      if (helper.wasInterrupted())
-        return WalkResult::interrupt();
       return WalkResult::advance();
     }
     if (auto record = dyn_cast<MakeRecordOp>(operation)) {
