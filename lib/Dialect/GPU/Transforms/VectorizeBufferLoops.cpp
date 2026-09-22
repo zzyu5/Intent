@@ -302,7 +302,8 @@ LogicalResult vectorizeIterations(func::FuncOp kernel,
     IRMapping values;
     values.map(loop.getInductionVar(), members);
     for (Operation &operation : loop.getBody()->without_terminator())
-      clonePredicatedScalarOperation(builder, &operation, values, active, shape);
+      clonePredicatedScalarOperation(builder, &operation, values, active, shape,
+                                     /*nonemptyIterations=*/true);
     loop.erase();
   }
   return success();
