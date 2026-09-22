@@ -144,6 +144,11 @@ __mlu_func__ void intent_divide_local(T *output, const T *lhs, const T *rhs) {
 }
 template<int N, bool Approximate, bool Flush>
 __mlu_func__ void intent_divide_f32(float *output, const float *lhs, const float *rhs) {
+  if (!Approximate && !Flush) {
+    // compute_30 implements this with the same IEEE fdiv as scalar div.rn.
+    __cn_vector_div_f32_rn(N, output, lhs, rhs);
+    return;
+  }
   for (int i = 0; i < N; ++i) {
     float a = intent_read_local(lhs + i), b = intent_read_local(rhs + i);
     if (Flush) { a = intent_flush_subnormal(a); b = intent_flush_subnormal(b); }
@@ -176,6 +181,18 @@ __mlu_func__ void intent_load_tile(T *dst, const T *src, int64_t offset,
     int64_t row_stride, int64_t column_stride, int64_t rows, int64_t columns) {
   intent_zero_tile<R * C>(dst);
   __sync_compute();
+  if (!rows || !columns) return;
+  if (column_stride == 1 && row_stride >= columns) {
+    // The native two-dimensional transfer counts additional rows after the
+    // first one. MLU370 permits at most 65535 additional rows per transfer.
+    for (int64_t first = 0; first < rows; first += 65536) {
+      const int64_t take = rows - first < 65536 ? rows - first : 65536;
+      __memcpy(dst + first * C, src + offset + first * row_stride,
+               columns * sizeof(T), GDRAM2NRAM,
+               C * sizeof(T), row_stride * sizeof(T), take - 1);
+    }
+    return;
+  }
   for (int64_t r = 0; r < rows; ++r) {
     if (column_stride == 1) {
       if (columns) __memcpy(dst + r * C, src + offset + r * row_stride,
@@ -189,6 +206,16 @@ __mlu_func__ void intent_load_tile(T *dst, const T *src, int64_t offset,
 template<class T, int R, int C>
 __mlu_func__ void intent_store_tile(T *dst, const T *src, int64_t offset,
     int64_t row_stride, int64_t column_stride, int64_t rows, int64_t columns) {
+  if (!rows || !columns) return;
+  if (column_stride == 1 && row_stride >= columns) {
+    for (int64_t first = 0; first < rows; first += 65536) {
+      const int64_t take = rows - first < 65536 ? rows - first : 65536;
+      __memcpy(dst + offset + first * row_stride, src + first * C,
+               columns * sizeof(T), NRAM2GDRAM,
+               row_stride * sizeof(T), C * sizeof(T), take - 1);
+    }
+    return;
+  }
   for (int64_t r = 0; r < rows; ++r) {
     if (column_stride == 1) {
       if (columns) __memcpy(dst + offset + r * row_stride, src + r * C,
@@ -263,10 +290,15 @@ __mlu_func__ void intent_reduce(float *out, const float *input, float *scratch,
   // The scratch and result storage are explicit operands in the DSA program.
   // MLU370 reduce_sum forms 128-byte partial sums; the remaining scalar fold
   // combines those partials and the declared identity.
-  for (int64_t i = 0; i < N; ++i)
-    intent_write_local(scratch + i, i < count ? intent_read_local(input + i) : identity);
   if (Kind == 0) {
     static_assert(N >= 32 && N % 32 == 0, "reduce_sum requires 128-byte input groups");
+    // Padding is neutral; the declared initial value is folded exactly once.
+    if (count != N) {
+      __bang_write_value(scratch, N, 0.0f);
+      __sync_compute();
+    }
+    if (count) __memcpy(scratch, input, count * sizeof(float), NRAM2NRAM);
+    __sync_move();
     __bang_reduce_sum(scratch, scratch, N);
     __sync_compute();
     float value = identity;
@@ -275,7 +307,7 @@ __mlu_func__ void intent_reduce(float *out, const float *input, float *scratch,
   } else {
     float value = identity;
     for (int64_t i = 0; i < count; ++i) {
-      const float next = intent_read_local(scratch + i);
+      const float next = intent_read_local(input + i);
       if (Kind == 7) value = isnan(value) || isnan(next) ? NAN : fmaxf(value, next);
       if (Kind == 8) value = isnan(value) || isnan(next) ? NAN : fminf(value, next);
       if (Kind == 9) value = fmaxf(value, next);

@@ -3,7 +3,6 @@ from __future__ import annotations
 import ctypes
 from dataclasses import dataclass
 import statistics
-import time
 
 from .buffer import DeviceBuffer, DeviceView, runtime
 from .compilation import compile_library
@@ -16,27 +15,81 @@ class NativeCall:
     native_arguments: tuple[object, ...]
     outputs: tuple[DeviceBuffer, ...]
 
-    def launch(self) -> None:
+    def _validate(self) -> None:
         if not self.program.queue.value:
             raise ValueError("BANG C program is closed")
         if any(isinstance(value, (DeviceBuffer, DeviceView)) and not value.pointer for value in self.arguments):
             raise ValueError("BANG C call refers to a closed device allocation")
         self.program.runtime.select(self.program.target.device)
-        status = self.program.function(self.program.queue, *self.native_arguments)
+
+    def _submit(self, queue: ctypes.c_void_p) -> None:
+        status = self.program.function(queue, *self.native_arguments)
         if status:
             raise RuntimeError(f"BANG C kernel submission failed with CNRT status {status}")
+
+    def enqueue(self, queue: ctypes.c_void_p | None = None) -> None:
+        self._validate()
+        self._submit(self.program.queue if queue is None else queue)
+
+    def launch(self) -> None:
+        self.enqueue()
         self.program.runtime.invoke("cnrtQueueSync", self.program.queue)
 
     def result(self):
         return self.outputs[0] if len(self.outputs) == 1 else self.outputs
 
     def benchmark(self) -> float:
+        return benchmark_calls((self,))
+
+
+def _queue_owner(calls: tuple[NativeCall, ...]):
+    if not calls:
+        raise ValueError("a BANG C launch sequence must contain at least one call")
+    owner = calls[0].program
+    if any(call.program.runtime is not owner.runtime or call.program.target.device != owner.target.device for call in calls):
+        raise ValueError("a BANG C launch sequence must use one runtime and device")
+    if not owner.queue.value:
+        raise ValueError("BANG C launch sequence queue is closed")
+    return owner
+
+
+def launch_calls(calls: tuple[NativeCall, ...]) -> None:
+    """Execute an explicitly supplied host sequence on one CNRT queue."""
+    owner = _queue_owner(calls)
+    for call in calls:
+        call.enqueue(owner.queue)
+    owner.runtime.invoke("cnrtQueueSync", owner.queue)
+
+
+def benchmark_calls(calls: tuple[NativeCall, ...], *, prepare=None, repetitions: int = 10) -> float:
+    owner = _queue_owner(calls)
+    if repetitions <= 0:
+        raise ValueError("BANG C measurement repetitions must be positive")
+    owner.runtime.select(owner.target.device)
+    start, end = ctypes.c_void_p(), ctypes.c_void_p()
+    owner.runtime.invoke("cnrtNotifierCreate", ctypes.byref(start))
+    try:
+        owner.runtime.invoke("cnrtNotifierCreate", ctypes.byref(end))
         samples = []
-        for _ in range(10):
-            begin = time.perf_counter_ns()
-            self.launch()
-            samples.append((time.perf_counter_ns() - begin) * 1e-6)
+        for _ in range(repetitions):
+            if prepare is not None:
+                prepare()
+            for call in calls:
+                call._validate()
+            owner.runtime.invoke("cnrtPlaceNotifier", start, owner.queue)
+            for call in calls:
+                call._submit(owner.queue)
+            owner.runtime.invoke("cnrtPlaceNotifier", end, owner.queue)
+            owner.runtime.invoke("cnrtQueueSync", owner.queue)
+            microseconds = ctypes.c_float()
+            owner.runtime.invoke("cnrtNotifierDuration", start, end, ctypes.byref(microseconds))
+            samples.append(microseconds.value * 1e-3)
         return statistics.median(samples)
+    finally:
+        owner.runtime.invoke("cnrtQueueSync", owner.queue)
+        if end.value:
+            owner.runtime.invoke("cnrtNotifierDestroy", end)
+        owner.runtime.invoke("cnrtNotifierDestroy", start)
 
 
 class NativeProgram:

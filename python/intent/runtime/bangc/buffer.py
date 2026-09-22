@@ -22,6 +22,10 @@ class Runtime:
             "cnrtQueueCreate": [ctypes.POINTER(ctypes.c_void_p)],
             "cnrtQueueSync": [ctypes.c_void_p],
             "cnrtQueueDestroy": [ctypes.c_void_p],
+            "cnrtNotifierCreate": [ctypes.POINTER(ctypes.c_void_p)],
+            "cnrtNotifierDestroy": [ctypes.c_void_p],
+            "cnrtPlaceNotifier": [ctypes.c_void_p, ctypes.c_void_p],
+            "cnrtNotifierDuration": [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_float)],
         }
         for name, signature in signatures.items():
             function = getattr(self.library, name)
@@ -94,7 +98,7 @@ class DeviceBuffer:
         self.runtime.select(self.device)
         if self.nbytes:
             owner = (ctypes.c_ubyte * self.nbytes).from_buffer(output)
-            self.runtime.invoke("cnrtMemcpy", ctypes.addressof(owner), self.pointer, self.nbytes, 1)
+            self.runtime.invoke("cnrtMemcpy", ctypes.addressof(owner), self.pointer, self.nbytes, 2)
         return output
 
     def close(self) -> None:
@@ -174,7 +178,7 @@ class DeviceView:
         span = bytearray(upper - lower)
         if span:
             staging = (ctypes.c_ubyte * len(span)).from_buffer(span)
-            self.runtime.invoke("cnrtMemcpy", ctypes.addressof(staging), lower, len(span), 1)
+            self.runtime.invoke("cnrtMemcpy", ctypes.addressof(staging), lower, len(span), 2)
         width = ELEMENT_BYTES[self.dtype]
         output = bytearray(self.nbytes)
         for linear, coordinates in enumerate(product(*(range(size) for size in self.shape))):
