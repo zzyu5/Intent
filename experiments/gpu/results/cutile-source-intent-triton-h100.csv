@@ -11,7 +11,7 @@ grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,0.196416,0.197048,0.996793,pas
 swiglu,8192x14336-bf16,0.403056,0.415376,0.970340,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法
 splitk_attention_reduce,B8-H32-S8192-splits16-D128,0.012344,0.011792,1.046811,pass,Intent target=triton; source corpus=cutile.
 mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,7.005920,0.919040,7.623085,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法
-batched_gemm,B32-M512-N512-K1024-bf16,0.098872,0.081920,1.206934,pass,Intent target=triton; source corpus=cutile.
+batched_gemm,B32-M512-N512-K1024-bf16,0.098808,0.082048,1.204271,pass,Intent target=triton; source corpus=cutile.
 tilegym_dense_gemm,M8192-N11008-K4096-bf16,2.527856,3.994168,0.632887,pass,Intent target=triton; source corpus=cutile.
 grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.734848,0.945624,0.777104,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 host group shapes
 moe_alignment,T4096-top2-E64,0.053424,0.097736,0.546615,pass,Intent target=triton; source corpus=cutile. 同算法计数/前缀和/散射；初始化与辅助输出计入调用
@@ -24,7 +24,7 @@ relu,8192x4096-fp16,0.088792,0.089280,0.994534,pass,Intent target=triton; source
 dropout,8192x4096-fp16-p0.1,0.088632,0.108760,0.814932,pass,Intent target=triton; source corpus=cutile.
 attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,4.235576,1.137704,3.722916,pass,Intent target=triton; source corpus=cutile. 同算法；source 的布局转换与辅助工作计入其调用时间
 attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,1.904280,4.962584,0.383728,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 bf16 LSE 与近似除法
-mhc_apply_residual,T2048-H4096-streams4-bf16,0.278808,0.103416,2.695985,pass,Intent target=triton; source corpus=cutile. 同算法；source 保留 bf16 中间累加
+mhc_apply_residual,T2048-H4096-streams4-bf16,0.141568,0.103800,1.363854,pass,Intent target=triton; source corpus=cutile. 同算法；source 保留 bf16 中间累加
 gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,10.311560,0.890776,11.575929,pass,Intent target=triton; source corpus=cutile. 同算法；中间精度和舍入不同
 gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,0.233152,0.690904,0.337459,pass,Intent target=triton; source corpus=cutile. 同算法；中间精度和舍入不同
 mhc_sinkhorn,T8192-streams4-fp32,0.022864,0.093744,0.243898,pass,Intent target=triton; source corpus=cutile. 同算法；source 用 exp2(x * log2(e)) 实现 exp

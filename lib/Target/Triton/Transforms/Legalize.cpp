@@ -4064,9 +4064,12 @@ void selectOrderedLoadUnrolling(func::FuncOp kernel) {
         !step.getValue().isOne() ||
         !gpu::queryNonNegativeIndexUpperBound(loop.getUpperBound()))
       return;
-    if (auto upper = integer(loop.getUpperBound());
-        upper && upper.getValue().sle(16))
-      return;
+    int64_t factor = 4;
+    if (auto upper = integer(loop.getUpperBound())) {
+      if (upper.getInt() <= 1)
+        return;
+      factor = std::min<int64_t>(factor, upper.getInt());
+    }
 
     unsigned loads = 0;
     bool product = false;
@@ -4096,7 +4099,8 @@ void selectOrderedLoadUnrolling(func::FuncOp kernel) {
     // Native unrolling preserves the accumulator chain and handles the tail;
     // independent reads from later iterations can overlap the current update.
     loop->setAttr("intent_gpu.triton.loop_unroll_factor",
-                  IntegerAttr::get(IntegerType::get(kernel.getContext(), 32), 4));
+                  IntegerAttr::get(IntegerType::get(kernel.getContext(), 32),
+                                   factor));
   });
 }
 
@@ -4254,8 +4258,10 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       failed(gpu::lowerInvocationWorkspaces(module)))
     return failure();
   if (failed(legalizeOrderedViewDependencies(kernel)) ||
-      failed(legalizeSplitGatherPairs(kernel)) ||
-      failed(materializeBlockPointerForms(kernel)))
+      failed(legalizeSplitGatherPairs(kernel)))
+    return failure();
+  selectOrderedLoadUnrolling(kernel);
+  if (failed(materializeBlockPointerForms(kernel)))
     return failure();
   orientPointerLoads(kernel);
   FailureOr<TensorDescriptorChoiceOp> tensorDescriptorForms =
@@ -4276,7 +4282,6 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       failed(legalizeCollectiveCallbacks(kernel)) ||
       failed(materializeDeferredResourceBounds(kernel)))
     return failure();
-  selectOrderedLoadUnrolling(kernel);
   sinkSelectProducers(kernel);
   if (failed(verifyTritonProgram(module)))
     return failure();
