@@ -1843,11 +1843,18 @@ private:
       return {};
     };
 
+    SmallVector<std::string> baseOffsets;
     std::string base = valueString(viewValue);
     for (int64_t viewAxis = 0;
          viewAxis < static_cast<int64_t>(view.getRank()); ++viewAxis) {
-      base += " + tl.cast(" + valueString(offsets[viewAxis]) +
-              ", tl.int64) * " + strideString(viewAxis);
+      std::string offset = "tl.cast(" + valueString(offsets[viewAxis]) +
+                           ", tl.int64)";
+      // Rebase positive i64 offsets; keep negative block offsets visible to
+      // native boundary checks instead of moving the base before the view.
+      if (llvm::is_contained(blockAxes, viewAxis))
+        offset = "tl.maximum(" + offset + ", 0)";
+      baseOffsets.push_back(offset);
+      base += " + " + offset + " * " + strideString(viewAxis);
     }
 
     SmallVector<std::string> shape;
@@ -1855,13 +1862,18 @@ private:
     SmallVector<std::string> offsetExpressions;
     for (int64_t viewAxis : blockAxes) {
       shape.push_back(
-          "(" +
+          "tl.maximum((" +
           expressionString(cast<gpu::PhysicalExprAttr>(
                                view.getLayout().getExtents()[viewAxis]),
                            false) +
-          " - tl.cast(" + valueString(offsets[viewAxis]) + ", tl.int64))");
+          " - " + baseOffsets[viewAxis] + "), 0)");
       blockStrides.push_back(strideString(viewAxis));
-      offsetExpressions.push_back("0");
+      // A block has at most 2^20 lanes, so an offset below INT32_MIN is
+      // entirely padding. Clamping it preserves that fact without wrapping.
+      offsetExpressions.push_back(
+          "tl.cast(tl.maximum(tl.minimum(tl.cast(" +
+          valueString(offsets[viewAxis]) +
+          ", tl.int64), 0), -2147483648), tl.int32)");
     }
     return "tl.make_block_ptr(base=(" + base + ")" +
            ", shape=" + stringTuple(shape) +
