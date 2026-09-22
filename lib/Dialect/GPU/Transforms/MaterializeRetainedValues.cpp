@@ -611,6 +611,15 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
   }
 
   auto preservesUnreadChunks = [&] {
+    if (output) {
+      SmallVector<std::pair<MakeRangeOp, Value>> boundaries;
+      for (MakeRangeOp range : ranges)
+        boundaries.emplace_back(range, range.getLogicalStop());
+      // A data-dependent write mask can itself observe the destination. Only
+      // range validity may be reconstructed while streaming a direct output.
+      if (!analysis.isTailPredicate(store.getValid(), boundaries))
+        return false;
+    }
     for (Value value : retained)
       for (auto [axis, dimension] : replayAxes) {
         auto replay = analysis.replayability(
@@ -622,8 +631,17 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
           auto load = dyn_cast<LoadOp>(access);
           if (!load)
             return false;
-          if (load.getResource() != store.getResource())
+          if (load.getResource() != store.getResource()) {
+            if (output) {
+              auto input = dyn_cast<ViewType>(load.getResource().getType());
+              if (input && !input.getLayout().getNoalias() &&
+                  !output.getLayout().getNoalias())
+                return false;
+            }
             continue;
+          }
+          if (output)
+            return false;
           auto position = llvm::find(load.getSourceAxes(), chunkAxis);
           if (position == load.getSourceAxes().end())
             return false;
@@ -637,7 +655,7 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
       }
     return true;
   };
-  bool direct = buffer && !indirect && clobber == store && preservesUnreadChunks();
+  bool direct = !indirect && clobber == store && preservesUnreadChunks();
   OpBuilder builder(clobber);
   IRMapping constantValues;
   for (auto [original, constant] : constants)
@@ -651,11 +669,14 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
             type.getElementType(), builder.getArrayAttr(shape), type.getOwner()));
   }
   Value workspace = workspaces.front();
-  uint64_t instance = cast<BufferType>(workspace.getType()).getInstance();
+  auto workspaceBuffer = dyn_cast<BufferType>(workspace.getType());
+  std::string resourceId = workspaceBuffer
+      ? std::to_string(workspaceBuffer.getInstance())
+      : ("VIEW_" + Twine(cast<ViewType>(workspace.getType()).getSourceId())).str();
   bool linearTraversal = payload.getShape().size() == 1;
   ParameterOp chunk = getOrCreatePhysicalParameter(
       kernel, ((linearTraversal ? "MATERIALIZE_ELEMENTS_" : "MATERIALIZE_AXIS_") +
-               Twine(instance)).str(),
+               resourceId),
       linearTraversal ? ParameterRole::OwnershipN : ParameterRole::ReductionOuter,
       linearTraversal ? ParameterCategory::Pointwise : ParameterCategory::Reduction,
       payload.getElementType().getIntOrFloatBitWidth(),
