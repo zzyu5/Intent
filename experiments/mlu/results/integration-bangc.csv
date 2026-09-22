@@ -1,0 +1,2 @@
+kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
+relu,8192x4096-fp16,2.584000,,,pass,MLU CNRT notifier timing; original native source is a numerical reference; no cross-device latency ratio

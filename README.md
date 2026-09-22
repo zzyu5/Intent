@@ -1,6 +1,6 @@
 # Requirements
 
-- Linux with an NVIDIA GPU and a CUDA-compatible driver.
+- Linux. GPU experiments require an NVIDIA GPU and a CUDA-compatible driver; CPU and MLU toolchains are described in their experiment directories.
 - CMake 3.20 or newer, Ninja, and a C++17 compiler.
 - LLVM and MLIR CMake packages. The default paths used by the project are `/usr/lib/llvm-20/lib/cmake/llvm` and `/usr/lib/llvm-20/lib/cmake/mlir`.
 - Python 3 and the CUDA build of PyTorch required by the selected backend: PyTorch 2.10.0 for Triton or TileLang, and PyTorch 2.13.0 for cuTile.
@@ -40,5 +40,7 @@ cmake --build /tmp/intentdsl-build --target intent-compile
 Emit Triton backend code and run one numerical reproduction:
 
 ```bash
-INTENT_PYTHON="$PWD/.venv/bin/python" ./examples/run/repro.sh triton softmax
+INTENT_PYTHON="$PWD/.venv/bin/python" ./experiments/run.sh triton experiments/gpu/results/triton-single.csv fused_softmax
 ```
+
+GPU、CPU、MLU 与 agent TritonBench 的执行说明、baseline 和实验结果见 [experiments/](experiments/README.md)。作者算法示例保留在 [examples/kernels/](examples/kernels/)。

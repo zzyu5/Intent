@@ -1,0 +1,119 @@
+from __future__ import annotations
+
+from dataclasses import asdict, replace
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+
+import torch
+import intent
+from intent.runtime.weft import TargetProfile, export_artifact
+from intent.runtime.weft.compilation import flattened_signature, lower_artifact
+from kernels.quantization.quantized_projection import quantized_projection
+
+from experiments._common.loading import load_module
+from experiments._common.measurement import NumericalComparisonError, PipelineStageError, report_stage
+from experiments._common.model import NativeComparisonResult, PreparedComparison, Tolerance
+
+
+SOURCE = "experiments/cpu/baselines/weft/tianchenrv/contraction/q4_k_projection"
+
+
+def _source_artifact(context, directory: Path, profile: TargetProfile, compiler: str, metadata: dict) -> None:
+    import weft
+    module = load_module(context.project_root / SOURCE / "q4_k_projection.py", "weft_source_projection")
+    canonical = weft.lower_to_mlir(module.production_mul_mat_q4_k)
+    artifact = lower_artifact(canonical, compiler=compiler, profile=profile)
+    kernel, = artifact["kernels"]
+    symbol = kernel["symbol"]
+    signature, _ = flattened_signature(metadata["parameters"])
+    dimensions = {"N": "a0_d0", "K": "a1_d0 * 256", "M": "1"}
+    shape_arguments = [dimensions[name] for name in kernel["shape_parameters"]]
+    pointer_types = [argument["c_type"] for argument in kernel["arguments"]]
+    host = (
+        "#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n"
+        f"extern void {symbol}({', '.join([*pointer_types, *(['size_t'] * len(shape_arguments))])});\n"
+        f"void source_projection({', '.join(signature)}) {{\n"
+        "  size_t bytes = a1_d0 * 292;\n"
+        "  void *quantized = aligned_alloc(16, (bytes + 15) / 16 * 16);\n"
+        "  if (!quantized && bytes) abort();\n"
+        f"  {symbol}({', '.join(['a0', 'a1', 'quantized', 'a2', *shape_arguments])});\n"
+        "  free(quantized);\n}\n"
+    )
+    source_metadata = {**metadata, "host_source": host,
+                       "tasks": [{"cpu_entry": "source_projection", "abi": {key: kernel[key] for key in ("symbol", "arguments", "shape_parameters")}}],
+                       "candidates": [{"entry": "source_projection", "values": [], "implementations": [],
+                                       "requires_matrix_i8_i32": False}]}
+    directory.mkdir(exist_ok=True)
+    (directory / "canonical.mlir").write_text(canonical)
+    (directory / "host.c").write_text(host)
+    (directory / "kernels.c").write_text(artifact["intrinsic_c"])
+    (directory / "artifact.json").write_text(json.dumps({
+        "profile": asdict(profile), "program": source_metadata, "weft": artifact,
+    }))
+
+
+def projection(context, deployment_name="rvv.json"):
+    deployment_path = Path(os.environ.get("INTENT_WEFT_PROFILE", Path(__file__).with_name(deployment_name)))
+    deployment = json.loads(deployment_path.read_text())
+    profile = TargetProfile.from_deployment(deployment)
+    compiler = os.environ["INTENT_WEFT_COMPILER"]
+    root = Path.home() / ".cache/intentdsl/benchmarks" / context.project_root.name / f"q4_k_{profile.matrix_extension or 'rvv'}"
+    root.mkdir(parents=True, exist_ok=True)
+    report_stage("generated_compilation")
+    program = intent.generate(quantized_projection, target=context.target, compiler=context.compiler,
+                              tuning_config=context.tuning_config)
+    (root / "input.mlir").write_text(program.source)
+    (root / "cpu.mlir").write_text(program.ir)
+    report_stage("source_compilation")
+    _source_artifact(context, root / "source", replace(profile, required_extensions=()), compiler, program.metadata)
+    report_stage("generated_weft_compilation")
+    export_artifact(program, root / "generated", compiler=compiler, profile=profile)
+    shutil.copytree(context.project_root / "python/intent", root / "python/intent", dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    shutil.copyfile(context.project_root / SOURCE / "q4_k_projection_runtime.py", root / "runtime.py")
+    (root / "deployment.json").write_text(json.dumps(deployment))
+    report_stage("native_deployment")
+    host = deployment["host"]
+    remote = subprocess.run(["ssh", host, "mktemp -d /tmp/intentdsl-weft-benchmark.XXXXXX"],
+                            check=True, text=True, capture_output=True).stdout.strip()
+    subprocess.run(["scp", "-qr", *(str(path) for path in sorted(root.iterdir())), f"{host}:{remote}/"], check=True)
+    command = shlex.join(["env", f"PYTHONPATH={remote}/python", "python3", f"{remote}/runtime.py", remote])
+    process = subprocess.Popen(["ssh", host, command], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    ready = process.stdout.readline()
+    if not ready:
+        process.wait()
+        raise PipelineStageError("native_preparation", f"remote native preparation exited {process.returncode}")
+    if json.loads(ready) != {"ready": True}:
+        raise RuntimeError("invalid native preparation response")
+
+    def measure():
+        try:
+            process.stdin.write("benchmark\n")
+            process.stdin.flush()
+            output = process.stdout.readline()
+            process.wait()
+            if process.returncode:
+                raise PipelineStageError("native_benchmark", f"remote invocation exited {process.returncode}")
+            result = json.loads(output)
+            generated = torch.tensor(result["generated"], dtype=torch.float32)
+            source = torch.tensor(result["source"], dtype=torch.float32)
+            if not torch.isfinite(generated).all() or not torch.isfinite(source).all():
+                raise NumericalComparisonError("Q4_K projection requires finite output values")
+            print(f"weft: selected {result['winner']}; extensions={result['used_extensions']}", flush=True)
+            return NativeComparisonResult(result["generated_ms"], result["source_ms"], generated, source)
+        finally:
+            process.stdin.close()
+            process.stdout.close()
+
+    return PreparedComparison(
+        generated=None, source=None, tolerance=Tolerance(1e-4, 2e-3), cuda_graph=False,
+        device_type="cpu", native_comparison=measure,
+        note=f"单核；generated {'RVV/IME1 合法实现选优' if profile.matrix_extension else 'RVV'} / source RVV；完整 native invocation 含 Q8_K 量化及内部 workspace 分配/释放；同算法、相同 cold-cache，10 次中位数。",
+    )
+
+
+CASES = {"q4_k_projection": projection, "q4_k_projection_ime": lambda context: projection(context, "ime.json")}

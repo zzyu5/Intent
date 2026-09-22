@@ -15,7 +15,8 @@
 - 不把已有文档中的更强保证自动当作必要目标。默认保序、严格逐操作舍入、额外 dtype 限制等若强于成熟参考，先说明作者需求、适用范围与实现成本；发现合同本身不合理时先提出语义修正，不持续堆 lowering 迁就它。普通 reduce、prefix scan 与 ordered loop 各按自己的合同处理。
 - 合同相同且 provider 已有原生 primitive 时优先直接映射。Triton/TileLang 已承担的归约树、线程通信、布局和 pipeline 不在 Intent 重建；不为同一个原生能力另造 form、plan 或运行时分支。只有实际缺失的执行事实或不匹配的目标能力才引入必要扩展。
 - dtype 分清外部存储/ABI、source 运算、accumulator/result 与后端内部计算。先核对参考的 promotion、literal 推导和 store conversion；typed IR 要求类型闭合，不等于作者必须处处同 dtype 或显式 cast。额外限制须有独立理由，也不能以复用后端为由改变已声明的累加精度、NaN/tie 或 ABI。
-- `source/` 是 provider source/runtime corpus，`examples/kernels/` 是作者算法，registry 连接完整 callable，CSV 是运行观察；它们不定义语言语义或 compiler policy。
+- `examples/kernels/` 只保存作者算法；`experiments/{gpu,cpu,mlu,agent_tritonbench}/` 分别保存对应实验的执行入口、操作说明、baseline 与结果。GPU 当前推进 Triton/cuTile，保留 TileLang corpus 与旧结果。
+- Provider source/runtime corpus 放在实验组的 `baselines/`；registry 连接完整 callable，CSV 是运行观察。后续全量、单点和 pass 效果实验均归入对应组的 `results/`，分析与操作也保存在同组；这些材料不定义语言语义或 compiler policy。
 
 ## IR、pass 与目录
 

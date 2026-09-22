@@ -1,0 +1,99 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TypeAlias
+
+import torch
+
+
+TensorTree: TypeAlias = torch.Tensor | tuple["TensorTree", ...]
+
+
+@dataclass(frozen=True)
+class Entry:
+    kernel: str
+    case: str
+    generated: str
+    examples: tuple[str, ...]
+    source_runtime: str
+    deployment: str | None = None
+
+
+@dataclass(frozen=True)
+class Tolerance:
+    atol: float
+    rtol: float = 0.0
+
+
+@dataclass(frozen=True)
+class IntegerTolerance:
+    max_abs: int
+
+
+@dataclass(frozen=True)
+class SimilarityTolerance:
+    max_error: float
+
+
+NumericalTolerance: TypeAlias = Tolerance | IntegerTolerance | SimilarityTolerance
+
+
+@dataclass(frozen=True)
+class PreparedLaunch:
+    launch: Callable[[], object]
+    outputs: Callable[[], TensorTree]
+    prepare: Callable[[], object] | None = None
+    native_benchmark: Callable[[], float] | None = None
+
+
+@dataclass(frozen=True)
+class PreparedComparison:
+    generated: PreparedLaunch | None
+    source: PreparedLaunch | None
+    tolerance: NumericalTolerance | tuple[NumericalTolerance, ...] | None
+    cuda_graph: bool
+    status: str = "pass"
+    note: str = ""
+    device_type: str = "cuda"
+    native_comparison: Callable[[], NativeComparisonResult] | None = None
+    cpu_host_timing: bool = False
+
+
+@dataclass(frozen=True)
+class NativeComparisonResult:
+    generated_ms: float
+    source_ms: float | None
+    generated: TensorTree
+    source: TensorTree
+
+
+@dataclass(frozen=True)
+class Context:
+    compiler: str
+    project_root: Path
+    target: object
+    provider: str
+    compiler_timeout_seconds: int = 15
+    tuning_config: Path | None = None
+
+
+@dataclass(frozen=True)
+class ResultRow:
+    kernel: str
+    case: str
+    generated_p50_ms: float | None
+    source_p50_ms: float | None
+    ratio: float | None
+    status: str
+    note: str = ""
+
+
+CaseFactory: TypeAlias = Callable[[Context], PreparedComparison]
+
+
+class ComparisonUnavailable(RuntimeError):
+    def __init__(self, status: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
