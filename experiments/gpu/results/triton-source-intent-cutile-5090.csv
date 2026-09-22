@@ -2,7 +2,7 @@ kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
 fused_softmax,8192x8192-fp16,0.175712,0.188032,0.934479,pass,Intent target=cutile; source corpus=triton.
 dense_gemm,M4096-N14336-K4096-fp16,2.053824,2.110240,0.973266,pass,Intent target=cutile; source corpus=triton.
 grouped_gemm,E8-M1024-K4096-N14336-fp16,4.299344,4.573904,0.939973,pass,Intent target=cutile; source corpus=triton.
-flash_attention_forward,B4-H32-S4096-D128-fp16-causal,,,,source_provider_jit_or_initial_launch_failed,PassManager::run failed
+flash_attention_forward,B4-H32-S4096-D128-fp16-causal,5.716064,2.793200,2.046421,pass,Intent target=cutile; source corpus=triton. 同算法；CUDA graph 设备执行计时；source 额外写 f32 M 辅助结果。 Reference stack Torch 2.10.0+cu130 and Triton 3.6.0; cuTile 1.5.0.
 layer_norm,8192x4096-fp16,0.089864,0.089872,0.999911,pass,Intent target=cutile; source corpus=triton.
 flash_cross_entropy,8192x32768-bf16,0.341832,0.343464,0.995248,pass,Intent target=cutile; source corpus=triton.
 flash_layer_norm,8192x4096-bf16,0.087824,0.087776,1.000547,pass,Intent target=cutile; source corpus=triton.
@@ -45,7 +45,7 @@ flaggems_transpose_copy,4093x8191-fp16,0.105216,0.308992,0.340514,pass,Intent ta
 flaggems_batch_norm_training,B32-C64-S4096-fp16,0.102896,0.026608,3.867108,pass,Intent target=cutile; source corpus=triton.
 flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.042752,0.050912,0.839723,pass,Intent target=cutile; source corpus=triton.
 flaggems_logsumexp,8192x8192-fp32,0.184096,0.175904,1.046571,pass,Intent target=cutile; source corpus=triton.
-flaggems_softmax_backward,4096x4097-fp32,,,,numerical_failed,"generated/source floating result 0 differs: max_abs=0.00012362003326416016, atol=0.0001, rtol=1e-05; first_failure=15327822; largest tolerance excess has generated=0.08494142442941666, source=0.08482552319765091, abs_error=0.00011590123176574707, limit=0.00010084825044032186"
+flaggems_softmax_backward,4096x4097-fp32,,,,numerical_failed,"generated/source floating result 0 differs: max_abs=0.00012362003326416016, atol=0.0001, rtol=1e-05; first_failure=15327822; largest tolerance excess has generated=0.08494142442941666, source=0.08482552319765091, abs_error=0.00011590123176574707, limit=0.00010084825044032186; reference stack Torch 2.10.0+cu130 and Triton 3.6.0; cuTile 1.5.0"
 flaggems_fused_adamw,N8388608-fp32,0.153888,0.157664,0.976050,pass,Intent target=cutile; source corpus=triton.
 flaggems_addcmul,B64-C128-L4096-bf16,0.087776,0.087824,0.999453,pass,Intent target=cutile; source corpus=triton; reference stack Torch 2.10.0+cu130 and Triton 3.6.0; cuTile 1.5.0.
 flaggems_fp8_mqa_logits,Q256-K4096-H32-D128-e4m3,0.070824,0.087672,0.807829,pass,Intent target=cutile; source corpus=triton. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
