@@ -3718,6 +3718,34 @@ void retargetDimensionExtent(Value root, int64_t dimensionId,
 }
 
 LogicalResult alignStructuredCaptureRelations(func::FuncOp kernel) {
+  auto sinkUniformCapture = [&](Operation *owner, unsigned operand,
+                                ArrayRef<BlockArgument> arguments) {
+    Value capture = owner->getOperand(operand);
+    auto fragment = dyn_cast<FragmentType>(capture.getType());
+    if (!fragment)
+      return;
+    Value scalar = capture;
+    while (isa<FragmentType>(scalar.getType())) {
+      UniformExpression expression = describeUniformValue(scalar);
+      if (expression.kind != UniformKind::Forward ||
+          expression.operands.size() != 1)
+        break;
+      scalar = expression.operands.front();
+    }
+    if (scalar.getType() != fragment.getElementType())
+      return;
+    // Capture the uniform seed and construct its fragment inside the helper.
+    // This keeps the region closed while allowing each use to adopt its own
+    // physical extent through the ordinary splat projection rule.
+    for (BlockArgument argument : arguments) {
+      auto type = cast<FragmentType>(argument.getType());
+      argument.setType(scalar.getType());
+      OpBuilder builder(argument.getOwner(), argument.getOwner()->begin());
+      auto splat = builder.create<SplatOp>(owner->getLoc(), type, argument);
+      argument.replaceAllUsesExcept(splat.getResult(), splat.getOperation());
+    }
+    owner->setOperand(operand, scalar);
+  };
   auto align = [&](Operation *owner, Value capture,
                    BlockArgument argument) -> LogicalResult {
     auto authority = dyn_cast<FragmentType>(capture.getType());
@@ -3750,11 +3778,15 @@ LogicalResult alignStructuredCaptureRelations(func::FuncOp kernel) {
     if (auto fold = dyn_cast<RegionFoldOp>(operation)) {
       unsigned sourceCount = fold.getSourceCount();
       unsigned captureOffset = sourceCount + fold.getIdentityCount();
-      for (unsigned index = 0; index < fold.getCaptureCount(); ++index)
+      for (unsigned index = 0; index < fold.getCaptureCount(); ++index) {
+        sinkUniformCapture(
+            operation, captureOffset + index,
+            {fold.getSummarize().front().getArgument(sourceCount + index)});
         if (failed(align(operation, fold.getInputs()[captureOffset + index],
                          fold.getSummarize().front().getArgument(sourceCount +
                                                                  index))))
           return WalkResult::interrupt();
+      }
       return WalkResult::advance();
     }
     auto scan = dyn_cast<RegionScanOp>(operation);
@@ -3765,6 +3797,10 @@ LogicalResult alignStructuredCaptureRelations(func::FuncOp kernel) {
     unsigned captureOffset =
         sourceCount + scan.getIdentityCount() + stateCount;
     for (unsigned index = 0; index < scan.getCaptureCount(); ++index) {
+      sinkUniformCapture(
+          operation, captureOffset + index,
+          {scan.getSummarize().front().getArgument(sourceCount + index),
+           scan.getEmit().front().getArgument(sourceCount + stateCount + index)});
       Value capture = scan.getInputs()[captureOffset + index];
       if (failed(align(operation, capture,
                        scan.getSummarize().front().getArgument(sourceCount +

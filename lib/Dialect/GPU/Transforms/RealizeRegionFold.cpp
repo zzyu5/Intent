@@ -1932,11 +1932,17 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
       succeeded(partition) && partition->prefixSpecializable;
   Value memberPredicate =
       physicalTailMembershipPredicate(fold, identities, fold.getSegment(), plans);
-  if (!memberPredicate)
-    return fold.emitOpError(
-        "region-fold summarizer has no typed membership predicate that makes a physical tail equal to identity");
-  std::optional<SummaryEmptinessPlan> emptiness =
-      summaryEmptinessPlan(fold, identities, memberPredicate);
+  Value scalarTailStep;
+  PhysicalExprAttr scalarTailExtent;
+  if (!memberPredicate) {
+    scalarTailStep = builder.create<arith::ConstantIndexOp>(location, 1);
+    scalarTailExtent = PhysicalExprAttr::get(
+        fold.getContext(), static_cast<uint32_t>(PhysicalExprKind::Constant), 1,
+        builder.getStringAttr(""), builder.getArrayAttr({}));
+  }
+  std::optional<SummaryEmptinessPlan> emptiness;
+  if (memberPredicate)
+    emptiness = summaryEmptinessPlan(fold, identities, memberPredicate);
   std::optional<OnlineRegionPlan> online = onlineRegionPlan(fold, emptiness);
   // A nonempty normalized-exponential summary contains exp(0), hence its
   // accumulated mass cannot be zero. Nonfinite scores produce NaN mass, for
@@ -1979,9 +1985,17 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     Value segmentTail;
     IRMapping sliceMapping;
     SmallVector<std::shared_ptr<IRMapping>> sourceMappings;
+    bool scalarTail = !fullSegment && !memberPredicate;
+    // Without an identity proof, visit the remaining real members as complete
+    // unit slices. Padding a custom summary could otherwise turn 0 * NaN into
+    // a contribution that did not exist in the author's logical domain.
+    Value physicalSegment = scalarTail ? scalarTailStep : segment.getResult();
+    PhysicalExprAttr physicalExtent =
+        scalarTail ? scalarTailExtent : sliceExtent;
+    fullSegment |= scalarTail;
     if (failed(buildSourceSlices(nested, nestedLocation, plans, sliceTypes,
                                  offset,
-                                 segment.getResult(), sliceExtent,
+                                 physicalSegment, physicalExtent,
                                  fullSegment, slices,
                                  segmentTail, sliceMapping, sourceMappings,
                                  failureReason)))
@@ -2037,8 +2051,10 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   };
   auto emitLoop = [&](Value lower, Value upper, ValueRange initial,
                       bool fullSegment, bool predicateIsTrue) {
+    Value step = !fullSegment && !memberPredicate ? scalarTailStep
+                                                 : segment.getResult();
     auto loop = builder.create<scf::ForOp>(
-      location, lower, upper, segment.getResult(), initial,
+      location, lower, upper, step, initial,
       [&](OpBuilder &nested, Location nestedLocation, Value offset,
           ValueRange carries) {
         IRMapping summaryMapping;
@@ -2127,7 +2143,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     return finish();
   };
 
-  if (segment->hasAttr(coverageDimensionAttr)) {
+  if (segment->hasAttr(coverageDimensionAttr) && memberPredicate) {
     FailureOr<SmallVector<Value>> summary =
         emitSummary(builder, location, zero, /*fullSegment=*/false,
                     /*predicateIsTrue=*/false,
