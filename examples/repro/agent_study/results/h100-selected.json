@@ -1,0 +1,3663 @@
+{
+  "measured_on": "2026-09-22",
+  "measurement_kind": "development_recheck_of_selected_programs",
+  "scope_note": "已选程序的开发复测；包含编译器修复和材料改进后的独立新提交，不是一轮全新 Luna high 100 题首次生成成绩。原始单次提交程序及其旧成绩保留。",
+  "hardware": {
+    "device": "NVIDIA H100 80GB HBM3",
+    "compute_capability": [
+      9,
+      0
+    ]
+  },
+  "software": {
+    "intent_compiler_commit": "5ac80a94",
+    "experiment_code_commit": "96aed7b3",
+    "torch": "2.10.0+cu128",
+    "cuda": "12.8",
+    "triton": "3.6.0",
+    "provider_note": "双方共用同一 reduction-tree-fma 原生 Triton 构建。",
+    "native_provider_path": "h100-full-20260919/python-triton-reduction-tree-fma"
+  },
+  "suite": "examples/repro/agent_study/suite-100.json",
+  "runner": "examples/repro/agent_study/benchmark.py",
+  "source_root": "/home/kingdom/.local/share/intentdsl/agent-evaluation",
+  "source_artifact": "first-stage-performance-h100-current-selected-full-20260922b",
+  "result_files": {
+    "operator_comparison": "h100-selected.csv",
+    "measurements": "本文件 records，共 172 条实测记录"
+  },
+  "units": {
+    "csv_latency": "microseconds",
+    "record_latency": "milliseconds",
+    "csv_ratios": "Intent / 对应 baseline；小于 1 表示 Intent 更快",
+    "record_ratio": "candidate_ms / reference_ms；candidate 是该记录 language 对应的程序"
+  },
+  "timing": {
+    "by_language": {
+      "intent": {
+        "cuda_graph": 87,
+        "cuda_event": 13
+      },
+      "triton": {
+        "cuda_graph": 66,
+        "cuda_event": 6
+      }
+    },
+    "policy": "保持每题既有 CUDA Graph 或 CUDA event 计时合同，完整 callable 内全部 kernel 及 GPU 数据处理纳入同一计时范围；median 耗时，原始输入和容差不变。",
+    "preparation": "编译、JIT 和 autotune 不计入算子耗时。",
+    "host_scope": "CUDA Graph 重放不包括 capture 时的 Python/host 开销；CUDA event 在既有 wrapper 调用边界记录，可能反映 host launch 间隙。两种计时结果不能混作同一个 host 开销测量。"
+  },
+  "comparison_rules": {
+    "not_slower": "耗时比 <= 1；5% 仅用于描述差距，不充当通过容差。",
+    "reference_us": "CSV 的 reference_us 来自该 Intent 程序同次运行的 reference；records 保留两组各自实测的 reference_ms。",
+    "missing_triton": "冻结的 Triton 组只有 72 份程序参加本次复测。CSV 空值表示本次无可用配对，不能当作零耗时或补算正确率。",
+    "gpu_exclusions": {
+      "matrix_power_eig": "Intent 数值失败",
+      "solve_symmetric_ldl": "Intent 数值失败",
+      "fused_svd_reconstruct": "重建恒等式捷径，不计为 GPU 算法性能胜出",
+      "sum_std": "常量 CPU 结果，不计为 GPU 算法性能胜出"
+    },
+    "same_precision_pair_exclusion": {
+      "tensordot_rsqrt": "agent Triton 使用 TF32，Intent/reference 使用 IEEE 输入精度；保留时间，排除于同精度 Triton 配对统计。"
+    },
+    "remaining_precision_caveat": "同精度配对筛选排除了已识别的 TF32 差异，但不等于逐操作数值合同完全相同；例如 erfc_sqrt 的 Intent sqrt 为 RN，Triton tl.sqrt 为 fast sqrt。",
+    "both_not_slower_denominator": 69,
+    "small_differences": "接近 1 的名次可能随测量波动，不能把全部小差距解释为已定位的 compiler 缺陷。"
+  },
+  "summary": {
+    "status": {
+      "intent": {
+        "pass": 98,
+        "numerical_failure": 2
+      },
+      "triton": {
+        "pass": 71,
+        "numerical_failure": 1
+      }
+    },
+    "eligible_gpu": 96,
+    "not_slower_ref": 78,
+    "triton_pairs": 70,
+    "not_slower_triton": 39,
+    "same_precision_triton_pairs": 69,
+    "not_slower_same_precision_triton": 39,
+    "both_not_slower": 35,
+    "behind_at_least_one_comparable": 42,
+    "behind_by_at_most_5_percent": 27,
+    "behind_by_5_to_20_percent": 7,
+    "behind_by_over_20_percent": 8
+  },
+  "not_included_in_results": [
+    "自然 K 顺序诊断会拖慢另外三个卷积，改动已撤回，没有计入 main 或本表。",
+    "单次 launch 复用 view byte span 的候选仅完成 100 题 Intent 源码编译；尚无 GPU 数值/性能复测，保留在开发 worktree，未计入本表。",
+    "静态形状冗余 ABI 参数仍在调查，尚未实现，也未计入本表。"
+  ],
+  "records": [
+    {
+      "task": "abs",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013351999688893557,
+      "reference_ms": 0.013743999879807234,
+      "ratio": 0.9714784491893363,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/abs/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 2048, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "abs",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01356800040230155,
+      "reference_ms": 0.013863999862223864,
+      "ratio": 0.9786497790779094,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/abs/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "add",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.016631999984383583,
+      "reference_ms": 0.016335999593138695,
+      "ratio": 1.0181195150965363,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/add/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 2048, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "add",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.016168000176548958,
+      "reference_ms": 0.016176000237464905,
+      "ratio": 0.9995054363996967,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/add/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "add_gelu",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01411199988797307,
+      "reference_ms": 0.026888000778853893,
+      "ratio": 0.5248437771197728,
+      "tolerance": {
+        "atol": 0.01,
+        "rtol": 0.01
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/add_gelu/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 512, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "add_gelu",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.015312000177800655,
+      "reference_ms": 0.024791999720036983,
+      "ratio": 0.6176186007869886,
+      "tolerance": {
+        "atol": 0.01,
+        "rtol": 0.01
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/add_gelu/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "add_mean",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.019264000467956066,
+      "reference_ms": 0.04227200150489807,
+      "ratio": 0.4557153619925931,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-broad-organization/add_mean/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "num_warps: 1, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "add_mean",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.020136000588536263,
+      "reference_ms": 0.04363999888300896,
+      "ratio": 0.46141157433384183,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/add_mean/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "addmm",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.02427199948579073,
+      "reference_ms": 0.027816000394523144,
+      "ratio": 0.8725912834891169,
+      "tolerance": {
+        "atol": 0.01,
+        "rtol": 0.01
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/addmm/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "BLOCK_K_2_3: 64, FRAGMENT_S26_A0: 64, FRAGMENT_S26_A1: 128, USE_TENSOR_DESCRIPTOR: 0, num_warps: 4, num_ctas: 1, num_stages: 4, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "addmm",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.034272000193595886,
+      "reference_ms": 0.027463999576866627,
+      "ratio": 1.2478881707551346,
+      "tolerance": {
+        "atol": 0.01,
+        "rtol": 0.01
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/addmm/triton/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_addmm_kernel",
+          "winner": "BLOCK_M: 128, BLOCK_N: 128, BLOCK_K: 32, GROUP_M: 8, num_warps: 4, num_ctas: 1, num_stages: 4, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "argmax",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.018496000207960606,
+      "reference_ms": 0.031216000206768513,
+      "ratio": 0.5925166608613153,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-gpu-contract-singlepoint/argmax/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "num_warps: 1, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "REDUCE_CHUNK_1_A0: 8192, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "argmax",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.018976000137627125,
+      "reference_ms": 0.030608000233769417,
+      "ratio": 0.6199686354122261,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/argmax/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "asin",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.011840000282973051,
+      "reference_ms": 0.011999999638646841,
+      "ratio": 0.9866667199590156,
+      "tolerance": {
+        "atol": 0.01,
+        "rtol": 0.01
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/asin/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 512, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "asin",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.011607999913394451,
+      "reference_ms": 0.012127999681979418,
+      "ratio": 0.9571240285108502,
+      "tolerance": {
+        "atol": 0.01,
+        "rtol": 0.01
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/asin/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "batch_norm",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.2065040022134781,
+      "reference_ms": 0.3965519964694977,
+      "ratio": 0.5207488653492686,
+      "tolerance": {
+        "atol": 0.01,
+        "rtol": 0.01
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/batch_norm/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1, FRAGMENT_D2: 1, FRAGMENT_D3: 64, FRAGMENT_D4: 64, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "batch_norm",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.20333600044250488,
+      "reference_ms": 0.396680012345314,
+      "ratio": 0.5125945198002535,
+      "tolerance": {
+        "atol": 0.01,
+        "rtol": 0.01
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/batch_norm/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "bitwise_and",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01611199975013733,
+      "reference_ms": 0.01640000008046627,
+      "ratio": 0.9824390043343979,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/bitwise_and/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 2048, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "bitwise_and",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.016087999567389488,
+      "reference_ms": 0.01611199975013733,
+      "ratio": 0.9985104156454796,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/bitwise_and/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "chebyshev_polynomial_t",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013040000107139349,
+      "reference_ms": 0.017512000165879726,
+      "ratio": 0.7446322512345794,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/chebyshev_polynomial_t/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 2048, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "chebyshev_polynomial_t",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.012839999981224537,
+      "reference_ms": 0.01726400014013052,
+      "ratio": 0.7437442004751665,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/chebyshev_polynomial_t/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "combined_activation",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.04628800041973591,
+      "reference_ms": 0.07002400234341621,
+      "ratio": 0.6610304876994508,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/combined_activation/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "BLOCK_K_1_0_0_1_1_0_2_0_0_2_1_0_3_0: 64, BLOCK_M_1_0_0_1_1_0_2_0_0_2_1_0_3_0: 32, BLOCK_N_1_0_0_1_1_0_2_0_0_2_1_0_3_0: 64, GROUP_SIZE_M: 8, USE_TENSOR_DESCRIPTOR: 0, num_warps: 8, num_ctas: 1, num_stages: 3, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "combined_activation",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.07133599743247032,
+      "reference_ms": 0.07170400023460388,
+      "ratio": 0.9948677507401329,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/combined_activation/triton/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_combined_activation_kernel",
+          "winner": "BLOCK_M: 64, BLOCK_N: 64, BLOCK_K: 32, num_warps: 4, num_ctas: 1, num_stages: 4, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "conv2d",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.054608000442385674,
+      "reference_ms": 0.10053599625825882,
+      "ratio": 0.5431686408329568,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/conv2d/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "BLOCK_K_50_50: 32, FRAGMENT_S10_A0: 32, FRAGMENT_S12_A0: 4, FRAGMENT_S13_A0: 16, FRAGMENT_S6_A0: 1, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "conv2d_add",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.08171200007200241,
+      "reference_ms": 0.06881599873304367,
+      "ratio": 1.1873983023771246,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-pointwise-convolution-refresh/conv2d_add/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "BLOCK_K_136_136: 32, FRAGMENT_S10_A0: 2, FRAGMENT_S11_A0: 32, FRAGMENT_S7_A0: 1, FRAGMENT_S9_A0: 32, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "conv2d_add",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.06591200083494186,
+      "reference_ms": 0.06878399848937988,
+      "ratio": 0.9582461369284682,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/conv2d_add/triton/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_conv2d_add_kernel",
+          "winner": "BLOCK_M: 64, BLOCK_N: 32, BLOCK_K: 32, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "cos",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.014512000139802694,
+      "reference_ms": 0.01485599996522069,
+      "ratio": 0.9768443843414558,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/cos/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1024, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "cos",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.0144960000179708,
+      "reference_ms": 0.014719999860972166,
+      "ratio": 0.9847826192175948,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/cos/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "cos_avg_pool1d",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.017151999287307262,
+      "reference_ms": 0.0370319988578558,
+      "ratio": 0.46316698575045234,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/cos_avg_pool1d/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S4_A0: 1, FRAGMENT_S5_A0: 1, FRAGMENT_S7_A0: 512, num_warps: 16, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "determinant_via_qr",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_event",
+      "candidate_ms": 0.0820159986615181,
+      "reference_ms": 0.5473920106887817,
+      "ratio": 0.14983046347044343,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 0.0001
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/determinant_via_qr/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S4_A0: 1, FRAGMENT_S5_A0: 32, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "ITERATION_23: 16, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "determinant_via_qr",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_event",
+      "candidate_ms": 0.09961599856615067,
+      "reference_ms": 0.5524320006370544,
+      "ratio": 0.18032264324165748,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 0.0001
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/determinant_via_qr/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "div",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01647199969738722,
+      "reference_ms": 0.016944000497460365,
+      "ratio": 0.9721434852327883,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/div/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1024, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "erfc_sqrt",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.015696000307798386,
+      "reference_ms": 0.03412799909710884,
+      "ratio": 0.45991563300082466,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/erfc_sqrt/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1024, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "erfc_sqrt",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.014816000126302242,
+      "reference_ms": 0.03466400131583214,
+      "ratio": 0.4274174810723686,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/erfc_sqrt/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "exp",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013791999779641628,
+      "reference_ms": 0.013927999883890152,
+      "ratio": 0.9902354892746784,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/exp/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1024, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "exp",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013560000341385603,
+      "reference_ms": 0.013760000001639128,
+      "ratio": 0.9854651409716788,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/exp/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "exp_mean",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01767200045287609,
+      "reference_ms": 0.03346399962902069,
+      "ratio": 0.5280899070280457,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-broad-organization/exp_mean/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S14_A0: 16, num_warps: 32, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "exp_mean",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01742399949580431,
+      "reference_ms": 0.03357600048184395,
+      "ratio": 0.518942079037265,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/exp_mean/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "exp_sqrt",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013919999822974205,
+      "reference_ms": 0.019487999379634857,
+      "ratio": 0.7142857279398693,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/exp_sqrt/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 256, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "exp_sqrt",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013832000084221363,
+      "reference_ms": 0.02042399998754263,
+      "ratio": 0.6772424643878782,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/exp_sqrt/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "floor",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013376000337302685,
+      "reference_ms": 0.013584000058472157,
+      "ratio": 0.9846878886723984,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/floor/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 8192, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "floor",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013839999679476023,
+      "reference_ms": 0.013535999692976475,
+      "ratio": 1.0224586283536403,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/floor/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "fused_add_mul_groupnorm",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.15724000334739685,
+      "reference_ms": 0.33555199205875397,
+      "ratio": 0.46860101286439293,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-global-performance-organization/fused_add_mul_groupnorm/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S18_A0: 1, FRAGMENT_S22_A0: 1, POINTWISE_CHUNK_S15_A0: 32, REDUCE_CHUNK_11_A0_E8: 8, REDUCE_CHUNK_13_A0_E128: 32, num_warps: 32, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_add_mul_groupnorm",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.25441598892211914,
+      "reference_ms": 0.33587199449539185,
+      "ratio": 0.7574790190660261,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/fused_add_mul_groupnorm/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "fused_avg_pool2d_cosine_similarity",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.027927999384701252,
+      "reference_ms": 0.1072239987552166,
+      "ratio": 0.26046407249237674,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-broad-fusion-organization/fused_avg_pool2d_cosine_similarity/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1, FRAGMENT_D3: 1, FRAGMENT_D4: 64, REDUCE_CHUNK_8_A0: 128, num_warps: 1, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 8, FRAGMENT_D2: 1, FRAGMENT_D5: 1, FRAGMENT_D6: 16, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_avg_pool2d_cosine_similarity",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.21191200613975525,
+      "reference_ms": 0.10700799897313118,
+      "ratio": 1.980337995040582,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/fused_avg_pool2d_cosine_similarity/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "fused_cholesky_solve",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_event",
+      "candidate_ms": 11.35160779953003,
+      "reference_ms": 3.1687039136886597,
+      "ratio": 3.582413538384445,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 0.0001
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-global-performance-organization/fused_cholesky_solve/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "ITERATION_3: 256, num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S5_A0: 1, num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S5_A0: 1, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_cosine_embedding_loss_with_normalization",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.022375999949872494,
+      "reference_ms": 0.08753599971532822,
+      "ratio": 0.2556205449488262,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-broad-fusion-organization/fused_cosine_embedding_loss_with_normalization/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "REDUCE_CHUNK_9_A0: 8192, num_warps: 1, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "REDUCE_CHUNK_5_A0: 8192, num_warps: 16, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_cross_entropy_log_softmax",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.017551999539136887,
+      "reference_ms": 0.05301600135862827,
+      "ratio": 0.331069848523767,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/fused_cross_entropy_log_softmax/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 16, REDUCE_CHUNK_9_A0: 8192, num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "REDUCE_CHUNK_5_A0: 1024, num_warps: 16, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_cross_entropy_log_softmax",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.024720000103116035,
+      "reference_ms": 0.05284000001847744,
+      "ratio": 0.4678274052700943,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/fused_cross_entropy_log_softmax/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "fused_cross_entropy_softmax_layernorm",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.019551999866962433,
+      "reference_ms": 0.05556800030171871,
+      "ratio": 0.35185717968616,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-fused-visible-contract-singlepoint/fused_cross_entropy_softmax_layernorm/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "REDUCE_CHUNK_6_A0: 8192, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_cross_entropy_softmax_layernorm",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.017967999912798405,
+      "reference_ms": 0.05530400015413761,
+      "ratio": 0.3248951226442906,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/fused_cross_entropy_softmax_layernorm/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "fused_embedding_add_tanh",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.010864000301808119,
+      "reference_ms": 0.019351999275386333,
+      "ratio": 0.5613890403368277,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/fused_embedding_add_tanh/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1, FRAGMENT_D2: 1, FRAGMENT_D3: 256, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_gather_masked_fill",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.03195999935269356,
+      "reference_ms": 0.04816799983382225,
+      "ratio": 0.6635110335275355,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/fused_gather_masked_fill/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S7_A0: 1, FRAGMENT_S8_A0: 256, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_gather_masked_fill",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.0342399999499321,
+      "reference_ms": 0.048583999276161194,
+      "ratio": 0.7047587777882399,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/fused_gather_masked_fill/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "fused_hardsigmoid_batch_norm",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013799999840557575,
+      "reference_ms": 0.04575200006365776,
+      "ratio": 0.3016261545147038,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-h100-numerical-organization-refresh/fused_hardsigmoid_batch_norm/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1, FRAGMENT_D3: 1, FRAGMENT_D4: 32, FRAGMENT_S11_A0: 32, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "fused_hardsigmoid_batch_norm",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013895999640226364,
+      "reference_ms": 0.04601600021123886,
+      "ratio": 0.30198191012769576,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/fused_hardsigmoid_batch_norm/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "fused_index_select_eq",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.010408000089228153,
+      "reference_ms": 0.015320000238716602,
+      "ratio": 0.6793733633844943,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/fused_index_select_eq/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S6_A0: 1, FRAGMENT_S8_A0: 128, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_index_select_eq",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01089600007981062,
+      "reference_ms": 0.015632000286132097,
+      "ratio": 0.697031722132003,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/fused_index_select_eq/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "fused_instance_norm_selu_conv2d",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.04132799990475178,
+      "reference_ms": 0.08060800284147263,
+      "ratio": 0.5127034344968118,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/fused_instance_norm_selu_conv2d/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "BLOCK_K_69_69: 16, FRAGMENT_S10_A0: 1, FRAGMENT_S11_A0: 64, FRAGMENT_S6_A0: 1, FRAGMENT_S8_A0: 32, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S5_A0: 1, FRAGMENT_S7_A0: 1, POINTWISE_CHUNK_S10_A0: 64, REDUCE_CHUNK_9_A0_E64: 64, num_warps: 16, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_layer_norm_relu_linear",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.12111999839544296,
+      "reference_ms": 0.22111999988555908,
+      "ratio": 0.547756867122507,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-remaining-performance-organization/fused_layer_norm_relu_linear/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "BLOCK_K_1_0_0_1_1_0_2_1_0_2_0_0_3_0: 128, BLOCK_M_1_0_0_1_1_0_2_1_0_2_0_0_3_0: 32, BLOCK_N_1_0_0_1_1_0_2_1_0_2_0_0_3_0: 16, GROUP_SIZE_M: 8, USE_TENSOR_DESCRIPTOR: 0, num_warps: 4, num_ctas: 1, num_stages: 4, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S5_A0: 1, POINTWISE_CHUNK_S7_A0: 2048, num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_layer_norm_relu_linear",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.14550400525331497,
+      "reference_ms": 0.22127199918031693,
+      "ratio": 0.6575798374503871,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/fused_layer_norm_relu_linear/triton/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_linear_relu_kernel",
+          "winner": "BLOCK_M: 4, BLOCK_N: 128, BLOCK_K: 64, num_warps: 4, num_ctas: 1, num_stages: 3, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_lu_solve",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_event",
+      "candidate_ms": 6.428440093994141,
+      "reference_ms": 2.768048048019409,
+      "ratio": 2.3223730161020186,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 0.0001
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-h100-linalg-public-materials-20260922/fused_lu_solve/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "ITERATION_13: 32, ITERATION_14: 32, ITERATION_15: 32, MATERIALIZE_AXIS_VIEW_2: 16, REDUCE_CHUNK_12_A0: 128, num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "REDUCE_CHUNK_28_A0: 8192, REDUCE_CHUNK_9_A0: 8192, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_masked_select_add_gelu",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_event",
+      "candidate_ms": 1.4388480186462402,
+      "reference_ms": 0.09279999881982803,
+      "ratio": 15.504827984316849,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-parallel-organization-refresh/fused_masked_select_add_gelu/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "SCAN_CHUNK_S4_A0: 8192, num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1024, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "fused_masked_select_add_gelu",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_event",
+      "candidate_ms": 0.03173599950969219,
+      "reference_ms": 0.09070400148630142,
+      "ratio": 0.3498853301911396,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/fused_masked_select_add_gelu/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "fused_mv_sigmoid_sub",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013471999671310186,
+      "reference_ms": 0.023984000086784363,
+      "ratio": 0.5617077894664249,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/fused_mv_sigmoid_sub/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S11_A0: 1, num_warps: 1, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_mv_sigmoid_sub",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.017487999983131886,
+      "reference_ms": 0.023519999347627163,
+      "ratio": 0.7435374348722581,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/fused_mv_sigmoid_sub/triton/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_fused_mv_sigmoid_sub_scalar",
+          "winner": "BLOCK_M: 4, BLOCK_K: 256, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_pairwise_distance_adaptive_avg_pool2d",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.010511999949812889,
+      "reference_ms": 0.039135999977588654,
+      "ratio": 0.2686017977267124,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-broad-fusion-organization/fused_pairwise_distance_adaptive_avg_pool2d/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S24_A0: 1, REDUCE_CHUNK_13_A0_E16: 16, REDUCE_CHUNK_9_A0_E4: 4, num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_pairwise_distance_adaptive_avg_pool2d",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.010591999627649784,
+      "reference_ms": 0.03971199877560139,
+      "ratio": 0.26672038563209743,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/fused_pairwise_distance_adaptive_avg_pool2d/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "fused_qr_solve",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_event",
+      "candidate_ms": 13.067840099334717,
+      "reference_ms": 4.388015985488892,
+      "ratio": 2.9780748617484267,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 0.0001
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-h100-linalg-public-materials-20260922/fused_qr_solve/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "ITERATION_10: 16, ITERATION_8: 32, ITERATION_9: 16, REDUCE_CHUNK_7_A0: 8192, num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_silu_layer_norm_conv2d",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.3793199956417084,
+      "reference_ms": 0.7572319805622101,
+      "ratio": 0.5009297089645905,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/fused_silu_layer_norm_conv2d/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S10_A0: 8, FRAGMENT_S14_A0: 1, FRAGMENT_S18_A0: 64, FRAGMENT_S6_A0: 1, num_warps: 2, num_ctas: 1, num_stages: 5, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S12_A0: 1, POINTWISE_CHUNK_S8_A0: 8, REDUCE_CHUNK_5_A0_E64: 64, REDUCE_CHUNK_7_A0_E64: 8, num_warps: 32, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_svd_reconstruct",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_event",
+      "candidate_ms": 0.008136000018566847,
+      "reference_ms": 2.84825599193573,
+      "ratio": 0.002856484824960366,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 0.0001
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/fused_svd_reconstruct/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 8, FRAGMENT_D2: 128, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_svd_reconstruct",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_event",
+      "candidate_ms": 0.00854399986565113,
+      "reference_ms": 2.8872400522232056,
+      "ratio": 0.002959227397483683,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 0.0001
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/fused_svd_reconstruct/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "fused_tile_exp",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.014624000061303377,
+      "reference_ms": 0.023312000557780266,
+      "ratio": 0.6273163911890303,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/fused_tile_exp/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S10_A0: 2, FRAGMENT_S4_A0: 1024, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "fused_tile_exp",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.016607999801635742,
+      "reference_ms": 0.02332800067961216,
+      "ratio": 0.7119341271346301,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/fused_tile_exp/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "gammaln",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01788800023496151,
+      "reference_ms": 0.020560000091791153,
+      "ratio": 0.8700389180495931,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/gammaln/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 256, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "gammaln",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.02687999978661537,
+      "reference_ms": 0.020376000553369522,
+      "ratio": 1.3191990114159229,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/gammaln/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "gelu",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.014655999839305878,
+      "reference_ms": 0.014431999996304512,
+      "ratio": 1.015521053427018,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/gelu/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 256, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "gelu",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01508800033479929,
+      "reference_ms": 0.01473599998280406,
+      "ratio": 1.0238871031763024,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/gelu/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "gelu_conv2d",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.08596000075340271,
+      "reference_ms": 0.12238400056958199,
+      "ratio": 0.7023793988866196,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/gelu_conv2d/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S10_A0: 1, FRAGMENT_S11_A0: 64, FRAGMENT_S6_A0: 1, FRAGMENT_S8_A0: 32, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "gelu_conv2d",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.1143919974565506,
+      "reference_ms": 0.12227199971675873,
+      "ratio": 0.9355535013865641,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/gelu_conv2d/triton/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_conv3x3_gelu",
+          "winner": "BLOCK_M: 64, BLOCK_N: 32, BLOCK_K: 32, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "grid_sample",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.04110400006175041,
+      "reference_ms": 0.04639999940991402,
+      "ratio": 0.8858620815621813,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-remaining-performance-organization/grid_sample/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D2: 1, FRAGMENT_D5: 16, FRAGMENT_D6: 128, num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "i0",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.014039999805390835,
+      "reference_ms": 0.022247999906539917,
+      "ratio": 0.6310679550687927,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/i0/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 256, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "i0",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.019039999693632126,
+      "reference_ms": 0.022975999861955643,
+      "ratio": 0.8286907994441249,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/i0/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "ifftshift",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013279999606311321,
+      "reference_ms": 0.023215999826788902,
+      "ratio": 0.5720192843466321,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/ifftshift/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1024, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "ifftshift",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013679999858140945,
+      "reference_ms": 0.023439999669790268,
+      "ratio": 0.583617749609949,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/ifftshift/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "leaky_relu",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013439999893307686,
+      "reference_ms": 0.013679999858140945,
+      "ratio": 0.9824561427396188,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/leaky_relu/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 8192, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "leaky_relu",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013687999919056892,
+      "reference_ms": 0.013791999779641628,
+      "ratio": 0.9924594067396775,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/leaky_relu/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "leaky_relu_conv2d",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.0830879956483841,
+      "reference_ms": 0.30323199927806854,
+      "ratio": 0.2740080065632885,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-h100-ordered-convolution/leaky_relu_conv2d/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S15_A0: 1, FRAGMENT_S19_A0: 64, REDUCE_CHUNK_23_A0_E4: 4, REDUCE_CHUNK_24_A0_E4: 4, num_warps: 1, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "leaky_relu_conv2d",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.0804160013794899,
+      "reference_ms": 0.3035760074853897,
+      "ratio": 0.2648957736996396,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/leaky_relu_conv2d/triton/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_conv2d_leaky",
+          "winner": "BLOCK_PIX: 256, BLOCK_OC: 8, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "least_squares_qr",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_event",
+      "candidate_ms": 0.07523999735713005,
+      "reference_ms": 0.3877919912338257,
+      "ratio": 0.19402153488972607,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 0.0001
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-h100-leastqr-primary-recovery-20260922/least_squares_qr/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "ITERATION_11: 16, ITERATION_12: 16, num_warps: 2, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "least_squares_qr",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_event",
+      "candidate_ms": 0.06849600002169609,
+      "reference_ms": 0.38728000223636627,
+      "ratio": 0.17686428327350437,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 0.0001
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/least_squares_qr/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "log",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.014671999961137772,
+      "reference_ms": 0.014640000183135271,
+      "ratio": 1.0021857771586207,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/log/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 256, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "log",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.014183999970555305,
+      "reference_ms": 0.014175999909639359,
+      "ratio": 1.0005643383864942,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/log/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "log1p",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01432000007480383,
+      "reference_ms": 0.013904000166803598,
+      "ratio": 1.0299194406652445,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-h100-standard-math/log1p/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 256, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "log1p",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.016383999958634377,
+      "reference_ms": 0.014415999874472618,
+      "ratio": 1.136514990378616,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/log1p/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "log_softmax_linear",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.026328000240027905,
+      "reference_ms": 0.036103999242186546,
+      "ratio": 0.7292267004388907,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-performance-author-gaps/log_softmax_linear/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "BLOCK_K_1_2: 32, BLOCK_N_CACHE_2_0_0_D3: 256, FRAGMENT_D1: 4, USE_TENSOR_DESCRIPTOR: 0, num_warps: 4, num_ctas: 1, num_stages: 4, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "log_softmax_linear",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.029959999956190586,
+      "reference_ms": 0.035472000017762184,
+      "ratio": 0.8446098314498328,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/log_softmax_linear/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "log_tanh",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_event",
+      "candidate_ms": 0.016656000167131424,
+      "reference_ms": 0.06736800074577332,
+      "ratio": 0.24723904498793406,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/log_tanh/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 256, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "logit",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.015199999790638685,
+      "reference_ms": 0.02863200008869171,
+      "ratio": 0.5308745370059553,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/logit/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 256, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "logit",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.014711999800056219,
+      "reference_ms": 0.02914400026202202,
+      "ratio": 0.504803721787899,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/logit/triton/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_logit_kernel",
+          "winner": "BLOCK_SIZE: 256, num_warps: 2, num_ctas: 1, num_stages: 3, maxnreg: None"
+        },
+        {
+          "kernel": "_logit_eps_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "logsumexp",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01991999987512827,
+      "reference_ms": 0.0825279988348484,
+      "ratio": 0.2413726269431462,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-broad-organization/logsumexp/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "num_warps: 1, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "num_warps: 16, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "logsumexp",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.02526400052011013,
+      "reference_ms": 0.07925600185990334,
+      "ratio": 0.318764509024414,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/logsumexp/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "matmul",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.02175999991595745,
+      "reference_ms": 0.021424000151455402,
+      "ratio": 1.0156833346773115,
+      "tolerance": {
+        "atol": 0.01,
+        "rtol": 0.01
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/matmul/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "BLOCK_K_1_0_0_1_1_0_2_0_0_2_1_0_3_0: 64, BLOCK_M_1_0_0_1_1_0_2_0_0_2_1_0_3_0: 64, BLOCK_N_1_0_0_1_1_0_2_0_0_2_1_0_3_0: 128, GROUP_SIZE_M: 8, USE_TENSOR_DESCRIPTOR: 0, num_warps: 4, num_ctas: 1, num_stages: 4, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "matmul",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.028880000114440918,
+      "reference_ms": 0.021007999777793884,
+      "ratio": 1.3747144145045158,
+      "tolerance": {
+        "atol": 0.01,
+        "rtol": 0.01
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/matmul/triton/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_matmul_kernel",
+          "winner": "BLOCK_M: 64, BLOCK_N: 128, BLOCK_K: 32, GROUP_SIZE_M: 8, num_warps: 4, num_ctas: 1, num_stages: 4, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "matrix_power_eig",
+      "language": "intent",
+      "status": "numerical_failure",
+      "timing": "cuda_event",
+      "candidate_ms": null,
+      "reference_ms": null,
+      "ratio": null,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 0.0001
+      },
+      "reference_timing_note": null,
+      "failure_stage": "comparison",
+      "error": "generated/source floating result 0 differs: max_abs=0.0421142578125, atol=0.0001, rtol=0.0001; largest tolerance excess has generated=161.16188049316406, source=161.20399475097656, abs_error=0.0421142578125, limit=0.016220398247241974",
+      "program": "first-stage-high-100-intent-contraction-closure/matrix_power_eig/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S4_A0: 8, FRAGMENT_S5_A0: 8, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "BLOCK_K_4_0_0_5_0_0_4_0_0_5_0_0_3_0: 128, BLOCK_M_4_0_0_5_0_0_4_0_0_5_0_0_3_0: 32, BLOCK_N_4_0_0_5_0_0_4_0_0_5_0_0_3_0: 16, GROUP_SIZE_M: 8, USE_TENSOR_DESCRIPTOR: 0, num_warps: 4, num_ctas: 1, num_stages: 4, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "max",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01800800021737814,
+      "reference_ms": 0.031279999762773514,
+      "ratio": 0.5757033361237283,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-broad-organization/max/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "num_warps: 1, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "max",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01848800014704466,
+      "reference_ms": 0.030896000564098358,
+      "ratio": 0.5983946080234089,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/max/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "mean",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.016792000271379948,
+      "reference_ms": 0.025615999475121498,
+      "ratio": 0.6555278191541384,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-broad-organization/mean/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "num_warps: 1, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "num_warps: 1, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "min",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.015439999755471945,
+      "reference_ms": 0.04497599974274635,
+      "ratio": 0.3432941978785492,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/min/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D2: 8, REDUCE_CHUNK_5_A0: 2048, num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "mul",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.012527999933809042,
+      "reference_ms": 0.013040000107139349,
+      "ratio": 0.9607361833494166,
+      "tolerance": {
+        "atol": 0.01,
+        "rtol": 0.01
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/mul/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S5_A0: 4096, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "mul",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013079999946057796,
+      "reference_ms": 0.01321600005030632,
+      "ratio": 0.9897094352503902,
+      "tolerance": {
+        "atol": 0.01,
+        "rtol": 0.01
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/mul/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "mul_relu",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.016656000167131424,
+      "reference_ms": 0.0228880001232028,
+      "ratio": 0.7277175846502351,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/mul_relu/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1024, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "mul_relu",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01676000002771616,
+      "reference_ms": 0.02286399994045496,
+      "ratio": 0.7330300940939672,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/mul_relu/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "mul_sub",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01889600045979023,
+      "reference_ms": 0.03488000109791756,
+      "ratio": 0.5417431153956695,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/mul_sub/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 2048, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "mul_sub",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.018831999972462654,
+      "reference_ms": 0.03254400007426739,
+      "ratio": 0.5786627313632893,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/mul_sub/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "normalize_pairwise_distance",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.017791999503970146,
+      "reference_ms": 0.040623998269438744,
+      "ratio": 0.43796771026733206,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-h100-pointwise-materials-fallback-20260922/normalize_pairwise_distance/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S45_A0: 64, FRAGMENT_S45_A1: 2, REDUCE_CHUNK_11_A0: 8192, num_warps: 32, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D2: 64, FRAGMENT_S6_A0: 1, REDUCE_CHUNK_1_A1: 64, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "normalize_pairwise_distance",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.019727999344468117,
+      "reference_ms": 0.04057599976658821,
+      "ratio": 0.48619872481152976,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/normalize_pairwise_distance/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "normalized_cosine_similarity",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01208000024780631,
+      "reference_ms": 0.1080319993197918,
+      "ratio": 0.11181872337702092,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/normalized_cosine_similarity/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1, REDUCE_CHUNK_10_A0: 1024, num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "normalized_cosine_similarity",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.011208000127226114,
+      "reference_ms": 0.1135759986937046,
+      "ratio": 0.09868282256933711,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/normalized_cosine_similarity/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "permute_copy",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01333600003272295,
+      "reference_ms": 0.013496000319719315,
+      "ratio": 0.9881446144631025,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/permute_copy/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S4_A0: 32, FRAGMENT_S5_A0: 1, FRAGMENT_S6_A0: 1, FRAGMENT_S7_A0: 32, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "permute_copy",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01318400027230382,
+      "reference_ms": 0.01336000021547079,
+      "ratio": 0.9868263517718238,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/permute_copy/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "relu",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013679999858140945,
+      "reference_ms": 0.013968000188469887,
+      "ratio": 0.9793814199281958,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/relu/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 2048, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "relu",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013256000354886055,
+      "reference_ms": 0.013807999901473522,
+      "ratio": 0.9600232075227231,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/relu/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "relu_batch_norm_conv2d",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.07575999945402145,
+      "reference_ms": 0.0727040022611618,
+      "ratio": 1.0420334107864122,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-h100-manual-retrieval-20260922/relu_batch_norm_conv2d/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S12_A0: 64, FRAGMENT_S18_A0: 1, FRAGMENT_S22_A0: 32, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "relu_conv2d",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.04150400124490261,
+      "reference_ms": 0.07392000034451485,
+      "ratio": 0.5614718756962556,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/relu_conv2d/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S5_A0: 64, FRAGMENT_S9_A0: 64, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "relu_conv2d",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.04254399985074997,
+      "reference_ms": 0.0735200010240078,
+      "ratio": 0.5786724599861923,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/relu_conv2d/triton/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_conv_relu_kernel",
+          "winner": "BLOCK_M: 64, BLOCK_N: 64, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "relu_sqrt",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01435199985280633,
+      "reference_ms": 0.019783999770879745,
+      "ratio": 0.7254346956640776,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/relu_sqrt/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 2048, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "rsqrt",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_event",
+      "candidate_ms": 0.013423999771475792,
+      "reference_ms": 0.0729759968817234,
+      "ratio": 0.18395089269192003,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/rsqrt/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 2048, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "rsqrt",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_event",
+      "candidate_ms": 0.013344000093638897,
+      "reference_ms": 0.07420799881219864,
+      "ratio": 0.1798188915915807,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/rsqrt/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "selu",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013423999771475792,
+      "reference_ms": 0.057072000578045845,
+      "ratio": 0.23521165607500474,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/selu/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1024, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "sigmoid",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013528000097721815,
+      "reference_ms": 0.014032000210136175,
+      "ratio": 0.9640820905881765,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/sigmoid/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1024, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "sigmoid",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013983999844640493,
+      "reference_ms": 0.01470400020480156,
+      "ratio": 0.9510337085056656,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/sigmoid/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "sigmoid_adaptive_avg_pool2d",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.009120000060647726,
+      "reference_ms": 0.017231999896466732,
+      "ratio": 0.5292479175628187,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/sigmoid_adaptive_avg_pool2d/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S4_A0: 1, FRAGMENT_S5_A0: 1, REDUCE_CHUNK_7_A0_E16: 16, num_warps: 1, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "sigmoid_adaptive_avg_pool2d",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.00902399979531765,
+      "reference_ms": 0.015431999694555998,
+      "ratio": 0.5847589407678047,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/sigmoid_adaptive_avg_pool2d/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "sigmoid_argmax",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.014895999804139137,
+      "reference_ms": 0.03354400023818016,
+      "ratio": 0.44407344676751886,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/sigmoid_argmax/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1, REDUCE_CHUNK_1_A1: 8192, num_warps: 1, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "sigmoid_batch_norm",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.014487999957054853,
+      "reference_ms": 0.03726399876177311,
+      "ratio": 0.3887934853603854,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-h100-static-controls-20260921/sigmoid_batch_norm/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S11_A0: 128, FRAGMENT_S9_A0: 8, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "sigmoid_batch_norm",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01496800035238266,
+      "reference_ms": 0.03766399994492531,
+      "ratio": 0.3974086760373253,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/sigmoid_batch_norm/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "sigmoid_conv2d",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.09204800054430962,
+      "reference_ms": 0.11141600087285042,
+      "ratio": 0.8261650016442086,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/sigmoid_conv2d/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "BLOCK_K_52_52: 32, FRAGMENT_S10_A0: 1, FRAGMENT_S11_A0: 64, FRAGMENT_S8_A0: 64, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "sigmoid_conv2d",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.10484800115227699,
+      "reference_ms": 0.11143999919295311,
+      "ratio": 0.9408471097593748,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/sigmoid_conv2d/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "silu_batch_norm",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.03114399965852499,
+      "reference_ms": 0.08806400001049042,
+      "ratio": 0.35365188561517796,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/silu_batch_norm/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1, FRAGMENT_D2: 8, FRAGMENT_D3: 1, FRAGMENT_D4: 128, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "silu_batch_norm",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.03096000012010336,
+      "reference_ms": 0.08685600012540817,
+      "ratio": 0.3564520594478373,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/silu_batch_norm/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "softmax",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.016719999723136425,
+      "reference_ms": 0.021719999611377716,
+      "ratio": 0.7697974227576823,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-h100-static-controls-20260921/softmax/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "softmax",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.014624000061303377,
+      "reference_ms": 0.021296000108122826,
+      "ratio": 0.686701727416193,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/softmax/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "softmax_log",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.018760000355541706,
+      "reference_ms": 0.029488000087440014,
+      "ratio": 0.6361910031169681,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/softmax_log/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S4_A0: 1, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "softmax_log",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.017439999617636204,
+      "reference_ms": 0.029199999757111073,
+      "ratio": 0.5972602658460311,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/softmax_log/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "softplus_linear",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.025544000789523125,
+      "reference_ms": 0.04330400004982948,
+      "ratio": 0.5898762414587543,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/softplus_linear/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "BLOCK_K_1_2: 128, FRAGMENT_D1: 1, FRAGMENT_S2_A0: 16, USE_TENSOR_DESCRIPTOR: 0, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "solve",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_event",
+      "candidate_ms": 7.599040269851685,
+      "reference_ms": 1.4347519874572754,
+      "ratio": 5.296413830601487,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 0.0001
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-h100-linalg-public-materials-20260922/solve/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "ITERATION_10: 64, ITERATION_11: 64, ITERATION_6: 64, ITERATION_7: 64, ITERATION_8: 64, ITERATION_9: 64, REDUCE_CHUNK_5_A0: 64, num_warps: 16, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "ITERATION_6: 256, REDUCE_CHUNK_5_A0: 1024, num_warps: 1, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "solve",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_event",
+      "candidate_ms": 28.23920726776123,
+      "reference_ms": 1.4291679859161377,
+      "ratio": 19.75919384288411,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 0.0001
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/solve/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "solve_multiple_lu",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_event",
+      "candidate_ms": 0.7686560153961182,
+      "reference_ms": 0.4461759924888611,
+      "ratio": 1.7227641745321112,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 0.0001
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-h100-author-structure-20260921/solve_multiple_lu/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "ITERATION_11: 16, ITERATION_12: 16, ITERATION_13: 16, ITERATION_14: 16, REDUCE_CHUNK_10_A0_DERIVED: 1024, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "solve_symmetric_ldl",
+      "language": "intent",
+      "status": "numerical_failure",
+      "timing": "cuda_event",
+      "candidate_ms": null,
+      "reference_ms": null,
+      "ratio": null,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 0.0001
+      },
+      "reference_timing_note": null,
+      "failure_stage": "comparison",
+      "error": "generated/source floating result 0 differs: max_abs=214781.03125, atol=0.0001, rtol=0.0001; largest tolerance excess has generated=-243803.90625, source=-29022.873046875, abs_error=214781.03125, limit=2.9023871421813965",
+      "program": "first-stage-high-100-intent-contraction-closure/solve_symmetric_ldl/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "ITERATION_22: 32, ITERATION_23: 32, ITERATION_24: 32, ITERATION_25: 32, ITERATION_26: 32, ITERATION_27: 32, ITERATION_28: 32, ITERATION_29: 32, ITERATION_30: 32, ITERATION_31: 4, num_warps: 2, num_ctas: 1, num_stages: 5, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "ITERATION_6: 32, ITERATION_7: 32, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "sqrt",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013296000193804502,
+      "reference_ms": 0.014127999544143677,
+      "ratio": 0.9411098968583946,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/sqrt/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1024, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "sqrt_exp",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01384000014513731,
+      "reference_ms": 0.020015999674797058,
+      "ratio": 0.6914468610110843,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/sqrt_exp/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1024, num_warps: 8, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "sqrt_exp",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.013736000284552574,
+      "reference_ms": 0.02078399993479252,
+      "ratio": 0.6608930103756612,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/sqrt_exp/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "sqrt_tanh",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01484800036996603,
+      "reference_ms": 0.0321200005710125,
+      "ratio": 0.4622665039229788,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/sqrt_tanh/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 256, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "std",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.016648000106215477,
+      "reference_ms": 0.03519999980926514,
+      "ratio": 0.47295455103478407,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-visible-contract-singlepoint/std/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "num_warps: 1, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "std",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01958400011062622,
+      "reference_ms": 0.034703999757766724,
+      "ratio": 0.5643153598237143,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/std/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "sub",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.016528000123798847,
+      "reference_ms": 0.0227600010111928,
+      "ratio": 0.7261862649158404,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/sub/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 1024, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "sub_gelu",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01669600047171116,
+      "reference_ms": 0.047520000487565994,
+      "ratio": 0.3513468076684849,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/sub_gelu/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 256, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "sub_gelu",
+      "language": "triton",
+      "status": "numerical_failure",
+      "timing": "cuda_graph",
+      "candidate_ms": null,
+      "reference_ms": null,
+      "ratio": null,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "failure_stage": "comparison",
+      "error": "generated/source floating result 0 differs: max_abs=0.49934613704681396, atol=0.0001, rtol=1e-05; largest tolerance excess has generated=-0.15876401960849762, source=0.34058213233947754, abs_error=0.49934613704681396, limit=0.00010340582230128348",
+      "program": "first-stage-high-100-triton/sub_gelu/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "sum",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.017280000261962414,
+      "reference_ms": 0.026007999666035175,
+      "ratio": 0.6644109690807561,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-gpu-contract-singlepoint/sum/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S4_A0: 1, num_warps: 1, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "num_warps: 1, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "sum",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.017520000226795673,
+      "reference_ms": 0.02572799939662218,
+      "ratio": 0.6809701740391003,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/sum/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "sum_std",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.0025279999244958162,
+      "reference_ms": 0.0436639990657568,
+      "ratio": 0.05789666495477697,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/sum_std/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": null
+        }
+      ]
+    },
+    {
+      "task": "symmetric_mm_and_abs_sum",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.27108798921108246,
+      "reference_ms": 0.24299200624227524,
+      "ratio": 1.115625132708251,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-broad-organization/symmetric_mm_and_abs_sum/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "BLOCK_K_1_0_0_1_1_0_1_1_0_1_0_0_3_0: 32, BLOCK_M_1_0_0_1_1_0_1_1_0_1_0_0_3_0: 64, BLOCK_N_1_0_0_1_1_0_1_1_0_1_0_0_3_0: 64, GROUP_SIZE_M: 8, USE_TENSOR_DESCRIPTOR: 0, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        },
+        {
+          "kernel": "_intent_kernel",
+          "winner": "REDUCE_CHUNK_4_A0: 16, REDUCE_CHUNK_5_A0_INNER: 1024, num_warps: 32, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "symmetric_mm_and_abs_sum",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.17669600248336792,
+      "reference_ms": 0.2385760024189949,
+      "ratio": 0.7406277273983688,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/symmetric_mm_and_abs_sum/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "tanh",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.008239999879151583,
+      "reference_ms": 0.008064000401645899,
+      "ratio": 1.0218253309448946,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/tanh/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 256, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "tensordot",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.011624000035226345,
+      "reference_ms": 0.013560000341385603,
+      "ratio": 0.8572271196593915,
+      "tolerance": {
+        "atol": 0.01,
+        "rtol": 0.01
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/tensordot/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_S10_A0: 64, FRAGMENT_S11_A0: 128, num_warps: 8, num_ctas: 1, num_stages: 3, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "tensordot",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.011415999848395586,
+      "reference_ms": 0.012864000163972378,
+      "ratio": 0.8874377878482822,
+      "tolerance": {
+        "atol": 0.01,
+        "rtol": 0.01
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/tensordot/triton/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_tensordot_kernel",
+          "winner": "BLOCK_M: 64, BLOCK_N: 128, BLOCK_K: 64, num_warps: 4, num_ctas: 1, num_stages: 3, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "tensordot_rsqrt",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.19261599332094193,
+      "reference_ms": 0.19167199730873108,
+      "ratio": 1.0049250596094657,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/tensordot_rsqrt/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "BLOCK_K_5_0_0_9_0_0_9_0_0_7_0_0_3_0: 32, BLOCK_M_5_0_0_9_0_0_9_0_0_7_0_0_3_0: 64, BLOCK_N_5_0_0_9_0_0_9_0_0_7_0_0_3_0: 64, GROUP_SIZE_M: 8, USE_TENSOR_DESCRIPTOR: 1, num_warps: 4, num_ctas: 1, num_stages: 4, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "tensordot_rsqrt",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.09866399690508842,
+      "reference_ms": 0.19094400107860565,
+      "ratio": 0.51671692406022,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/tensordot_rsqrt/triton/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_tensordot_rsqr_kernel",
+          "winner": "BLOCK_M: 128, BLOCK_N: 64, BLOCK_K: 64, GROUP_M: 8, num_warps: 8, num_ctas: 1, num_stages: 4, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "trunc",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.014128000009804964,
+      "reference_ms": 0.013408000115305185,
+      "ratio": 1.053699275679294,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/trunc/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 256, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None"
+        }
+      ]
+    },
+    {
+      "task": "trunc",
+      "language": "triton",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01411199988797307,
+      "reference_ms": 0.013640000019222498,
+      "ratio": 1.0346040959006888,
+      "tolerance": {
+        "atol": 0,
+        "rtol": 0
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-triton/trunc/triton/candidate.py",
+      "tuning_winners": []
+    },
+    {
+      "task": "zeta",
+      "language": "intent",
+      "status": "pass",
+      "timing": "cuda_graph",
+      "candidate_ms": 0.01744000054895878,
+      "reference_ms": 0.017351999878883362,
+      "ratio": 1.0050715001550057,
+      "tolerance": {
+        "atol": 0.0001,
+        "rtol": 1e-05
+      },
+      "reference_timing_note": null,
+      "program": "first-stage-high-100-intent-contraction-closure/zeta/intent/candidate.py",
+      "tuning_winners": [
+        {
+          "kernel": "_intent_kernel",
+          "winner": "FRAGMENT_D1: 256, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None"
+        }
+      ]
+    }
+  ]
+}
