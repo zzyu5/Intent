@@ -960,6 +960,10 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
   if (!isa<IntegerType, FloatType, IndexType>(element) ||
       element != target.getElementType())
     return failure();
+  if (auto extract = value.getDefiningOp<ExtractOp>())
+    if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>())
+      return projectFragmentValue(builder, location,
+                                  record.getFields()[extract.getField()], target);
   Value scalar = value;
   while (isa<FragmentType>(scalar.getType())) {
     UniformExpression expression = describeUniformValue(scalar);
@@ -1038,6 +1042,61 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
       if (succeeded(projected))
         projection = builder.create<ReshapeOp>(
             location, target, *projected, reshape.getReassociation());
+    }
+  } else if (auto reduce = value.getDefiningOp<ReduceOp>();
+             reduce && reduce.getSourceCount() == 1 &&
+             reduce.getIdentityCount() == 1 && reduce.getCaptureCount() == 0 &&
+             reduce.getNumResults() == 1 &&
+             source.getOwner() == target.getOwner() &&
+             queryBinaryCombineKind(reduce.getCombine())) {
+    // A lane-wise combine preserves every non-reduced axis. Project the
+    // source's free axes with the result, rather than resizing a finished
+    // reduction or treating its construction extent as a broadcast scalar.
+    auto relation = queryAxisProjection(source, target);
+    bool projects =
+        source.getShape().size() == target.getShape().size() &&
+        relation.isExact() && llvm::all_of(
+            llvm::enumerate(relation.targetToSource), [](auto item) {
+              return item.value() && *item.value() == item.index();
+            });
+    if (projects) {
+      auto input = cast<FragmentType>(reduce.getInputs().front().getType());
+      llvm::SmallDenseSet<int64_t> axes(reduce.getAxes().begin(),
+                                       reduce.getAxes().end());
+      SmallVector<Attribute> shape(input.getShape().getValue());
+      unsigned resultAxis = 0;
+      for (unsigned axis = 0; axis < shape.size(); ++axis)
+        if (!axes.contains(axis))
+          shape[axis] = target.getShape()[resultAxis++];
+      auto inputTarget = FragmentType::get(
+          target.getContext(), input.getElementType(), builder.getArrayAttr(shape),
+          input.getAxisMaps(), input.getValidity(), input.getOwner());
+      auto resultTarget = FragmentType::get(
+          target.getContext(), target.getElementType(), target.getShape(),
+          source.getAxisMaps(), target.getValidity(), target.getOwner());
+      auto projectedSource = projectFragmentValue(
+          builder, location, reduce.getInputs().front(), inputTarget);
+      auto projectedIdentity = projectFragmentValue(
+          builder, location, reduce.getInputs()[1], resultTarget);
+      if (succeeded(projectedSource) && succeeded(projectedIdentity)) {
+        IRMapping mapping;
+        mapping.map(reduce.getInputs().front(), *projectedSource);
+        mapping.map(reduce.getInputs()[1], *projectedIdentity);
+        auto clone = cast<ReduceOp>(builder.clone(*reduce, mapping));
+        for (BlockArgument argument : clone.getCombine().front().getArguments())
+          for (unsigned axis = 0; axis < target.getShape().size(); ++axis)
+            if (source.getShape()[axis] != target.getShape()[axis])
+              retargetSourceExtent(
+                  argument,
+                  sourceAxisIdentity(
+                      cast<AxisMapAttr>(source.getAxisMaps()[axis])),
+                  cast<PhysicalExprAttr>(target.getShape()[axis]));
+        clone.getResult(0).setType(resultTarget);
+        projection = clone.getOperation();
+        if (resultTarget != target)
+          projection = builder.create<BroadcastOp>(location, target,
+                                                   clone.getResult(0));
+      }
     }
   }
   if (!projection && queryBroadcastProjection(source, target).isExact())
