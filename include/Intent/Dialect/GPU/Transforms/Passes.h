@@ -133,7 +133,8 @@ void clonePredicatedScalarOperation(mlir::OpBuilder &builder,
                                    mlir::Operation *operation,
                                    mlir::IRMapping &mapping,
                                    mlir::Value predicate,
-                                   FragmentType shape = {});
+                                   FragmentType shape = {},
+                                   bool nonemptyIterations = false);
 mlir::LogicalResult realizeScanConsumerTraversals(mlir::ModuleOp module);
 mlir::Value createInvocationWorkspace(mlir::func::FuncOp kernel,
                                       mlir::Location location,

@@ -251,7 +251,8 @@ bool canPredicateScalarBlock(Block &block) {
 
 void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
                                    IRMapping &mapping, Value predicate,
-                                   FragmentType shape) {
+                                   FragmentType shape,
+                                   bool nonemptyIterations) {
   Location location = operation->getLoc();
   auto hasIterationAxes = [&](Type type) {
     auto fragment = dyn_cast<FragmentType>(type);
@@ -343,7 +344,7 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
       builder.setInsertionPointToStart(result.getBody());
       for (Operation &nested : loop.getBody()->without_terminator())
         clonePredicatedScalarOperation(builder, &nested, bodyMapping, predicate,
-                                       shape);
+                                       shape, nonemptyIterations);
       SmallVector<Value> yielded;
       for (auto [value, carried] :
            llvm::zip(loop.getBody()->getTerminator()->getOperands(),
@@ -375,7 +376,7 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
         builder.setInsertionPointToStart(&body);
         for (Operation &nested : original.front().without_terminator())
           clonePredicatedScalarOperation(builder, &nested, branchMapping,
-                                         predicate, shape);
+                                         predicate, shape, nonemptyIterations);
         SmallVector<Value> yielded;
         for (Value value : original.front().getTerminator()->getOperands())
           yielded.push_back(lift(branchMapping.lookupOrDefault(value)));
@@ -407,6 +408,7 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
           BinaryOperator::LogicalAnd);
       IRMapping branchMapping(mapping);
       for (Operation &nested : region.front().without_terminator())
+        // This branch may have no active iteration, even in a nonempty chunk.
         clonePredicatedScalarOperation(builder, &nested, branchMapping, active,
                                        shape);
       for (Value value : region.front().getTerminator()->getOperands())
@@ -465,7 +467,14 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
         maskedValidity(gather.getValid(), gather.getType()),
         fill(gather.getFill(), gather.getType()), gather.getSourceAxes());
   } else if (auto load = dyn_cast<LoadOp>(operation)) {
-    bool safeRead = false;
+    // An executing independent chunk has at least one original iteration.
+    // If every read operand is invariant across those iterations, the original
+    // read (including its mask/fill) is already required. Keep its own axes and
+    // let its consumers broadcast, rather than issuing one copy per new lane.
+    bool safeRead = shape && nonemptyIterations &&
+        llvm::none_of(operation->getOperands(), [&](Value value) {
+          return hasIterationAxes(mapped(value).getType());
+        });
     auto view = dyn_cast<ViewType>(load.getResource().getType());
     if (!shape && isa<FragmentType>(load.getType()) && view &&
         view.getAccess() == 0) {
