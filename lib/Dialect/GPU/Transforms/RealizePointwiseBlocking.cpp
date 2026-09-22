@@ -5531,11 +5531,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       bool retainsReducedAxis = llvm::any_of(payload.roots, [&](MakeRangeOp range) {
         if (!reductionTraversalRanges.contains(range.getOperation()))
           return false;
-        auto dimension = queryRangeDimension(range);
-        if (failed(dimension))
-          return false;
+        // Query the current result relation: a structured result can rename
+        // the producer range without removing its reduction dependency.
         auto dependency = analysis.reductionDependency(
-            store.getValue(), sourceAxisIdentity(range), *dimension);
+            store.getValue(), sourceAxisIdentity(mapping), dimension);
         return dependency.isExact() && dependency.depends;
       });
       for (MakeRangeOp range : ranges) {
@@ -5914,6 +5913,14 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       }
   }
   SmallVector<MakeRangeOp> fullCoverageRanges;
+  // Contraction blocking owns the runtime row loop and tail validity for
+  // device-derived subregions. They are not pointwise full-coverage values.
+  if (!ownershipOnly)
+    llvm::erase_if(dynamicRanges, [&](MakeRangeOp range) {
+      return internalTraversalRanges.contains(range.getOperation()) &&
+             contractionTraversalRanges.contains(range.getOperation()) &&
+             hasAccessDependentSubregionBounds(kernel, range);
+    });
   if (!ownershipOnly)
     for (MakeRangeOp range : dynamicRanges) {
       if (retainedGatherRanges.contains(range.getOperation())) {

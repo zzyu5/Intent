@@ -13,7 +13,7 @@ splitk_attention_reduce,B8-H32-S8192-splits16-D128,0.012344,0.011792,1.046811,pa
 mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,7.878840,0.918616,8.576859,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法
 batched_gemm,B32-M512-N512-K1024-bf16,,,,source_provider_jit_or_initial_launch_timeout,exceeded 300 seconds
 tilegym_dense_gemm,M8192-N11008-K4096-bf16,2.527856,3.994168,0.632887,pass,Intent target=triton; source corpus=cutile. 
-grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,,,,generated_physical_program_verification_failed,"Intent Triton compiler failed with exit code 4:; loc(""<stdin>"":24:13): error: 'intent_gpu.make_range' op subregion full coverage has no proven nonnegative parent-bounded traversal"
+grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.734848,0.945624,0.777104,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 host group shapes
 moe_alignment,T4096-top2-E64,0.053424,0.097736,0.546615,pass,Intent target=triton; source corpus=cutile. 同算法计数/前缀和/散射；初始化与辅助输出计入调用
 mhc_gemm_rms_scale,T2048-H4096-streams4-bf16,0.114368,0.192448,0.594280,pass,Intent target=triton; source corpus=cutile. 同算法；source 用乘倒数实现归一化
 chunked_softmax,8192x32768-bf16,1.353984,2.019744,0.670374,pass,Intent target=triton; source corpus=cutile. 

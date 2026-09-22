@@ -4115,7 +4115,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
           FailureOr<Value> replayed = replaySourceValue(
               rowBuilder, location, kernel, originalValidity,
               sourceAxisIdentity(*rowMap), unitM, rowRange, rows, replay,
-              contract.getOperation());
+              &*rowBuilder.getInsertionPoint());
           if (failed(replayed))
             return path.store.emitOpError(
                 "blocked contraction could not relocate output validity");
@@ -4127,7 +4127,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
           FailureOr<Value> replayed = replaySourceValue(
               rowBuilder, location, kernel, originalValidity,
               sourceAxisIdentity(*columnMap), unitN, columnRange, columns,
-              replay, contract.getOperation());
+              replay, &*rowBuilder.getInsertionPoint());
           if (failed(replayed))
             return path.store.emitOpError(
                 "blocked contraction could not relocate output column validity");
