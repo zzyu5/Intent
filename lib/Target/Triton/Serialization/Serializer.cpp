@@ -1844,15 +1844,22 @@ private:
     };
 
     SmallVector<std::string> baseOffsets;
+    SmallVector<std::string> offsetLimits(view.getRank());
+    for (auto [blockAxis, viewAxis] : llvm::enumerate(blockAxes))
+      offsetLimits[viewAxis] = "(2147483648 - " +
+          expressionString(cast<gpu::PhysicalExprAttr>(
+                               fragment.getShape()[blockAxis]), false) + ")";
     std::string base = valueString(viewValue);
     for (int64_t viewAxis = 0;
          viewAxis < static_cast<int64_t>(view.getRank()); ++viewAxis) {
       std::string offset = "tl.cast(" + valueString(offsets[viewAxis]) +
                            ", tl.int64)";
-      // Rebase positive i64 offsets; keep negative block offsets visible to
-      // native boundary checks instead of moving the base before the view.
-      if (llvm::is_contained(blockAxes, viewAxis))
-        offset = "tl.maximum(" + offset + ", 0)";
+      // Keep ordinary coordinates in the native i32 offset. Only rebase when
+      // the end of the block would exceed that range, preserving a fixed view
+      // shape for native loop-bound and memory-pipeline optimization.
+      if (!offsetLimits[viewAxis].empty())
+        offset = "(tl.maximum(" + offset + ", " + offsetLimits[viewAxis] +
+                 ") - " + offsetLimits[viewAxis] + ")";
       baseOffsets.push_back(offset);
       base += " + " + offset + " * " + strideString(viewAxis);
     }
@@ -1873,7 +1880,8 @@ private:
       offsetExpressions.push_back(
           "tl.cast(tl.maximum(tl.minimum(tl.cast(" +
           valueString(offsets[viewAxis]) +
-          ", tl.int64), 0), -2147483648), tl.int32)");
+          ", tl.int64), " + offsetLimits[viewAxis] +
+          "), -2147483648), tl.int32)");
     }
     return "tl.make_block_ptr(base=(" + base + ")" +
            ", shape=" + stringTuple(shape) +
