@@ -106,7 +106,7 @@
     {"id":"log_tanh","family":"pointwise","input_index":8,"tolerance":"fp32","timing":"cuda_event"},
     {"id":"fused_avg_pool2d_cosine_similarity","family":"fusion","input_index":1,"tolerance":"fp32"},
     {"id":"erfc_sqrt","family":"pointwise","input_index":8,"tolerance":"fp32"},
-    {"id":"softmax_log","family":"reduction","input_index":6,"tolerance":"fp32"},
+    {"id":"softmax_log","family":"reduction","input_index":6,"tolerance":"fp32","description":"Compute the natural logarithm elementwise, then apply softmax to those log-values along dim. If dtype is not None, cast the input before both operations. Preserve the floating-point behavior of this composition, including its NaN/Inf/zero behavior and its normalization of large finite positive inputs. The formula input / sum(input) is a real-arithmetic identity on positive inputs, not an unconditional floating-point replacement."},
     {"id":"batch_norm","family":"fusion","input_index":0,"tolerance":"fp16"},
     {"id":"gammaln","family":"pointwise","input_index":8,"tolerance":"fp32","description":"Compute log(abs(Gamma(input))) elementwise with the numerical domain behavior of torch.special.gammaln. The absolute value applies to Gamma(input), not to input before evaluating Gamma. Preserve the input shape, dtype and device, and the reference behavior at poles and nonfinite inputs. If out is supplied, write and return that tensor."},
     {"id":"bitwise_and","family":"pointwise","input_index":8,"tolerance":"exact"}
