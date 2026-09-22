@@ -1646,6 +1646,15 @@ bool samePhysicalScalarExpression(Value lhs, Value rhs) {
   return left && right && equalUniformConstants(left, right);
 }
 
+bool isKnownPositiveExtent(PhysicalExprAttr extent, func::FuncOp kernel) {
+  return physicalIndexSign(extent, kernel) == IndexSign::Positive;
+}
+
+std::optional<std::pair<int64_t, int64_t>>
+queryPositiveExtentBounds(PhysicalExprAttr extent, func::FuncOp kernel) {
+  return positiveExtentBounds(kernel, extent);
+}
+
 bool isLaunchUniformScalar(Value value, func::FuncOp kernel) {
   SmallVector<Value> pending{value};
   llvm::SmallPtrSet<Operation *, 16> visited;

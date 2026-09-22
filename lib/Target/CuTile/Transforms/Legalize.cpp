@@ -8,7 +8,6 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/APFloat.h"
@@ -806,8 +805,12 @@ bool isKnownNonNegative(Value value, unsigned depth = 0) {
 }
 
 bool isKnownPositive(Value value) {
+  value = stripIndexIdentities(value);
   if (std::optional<int64_t> constant = constantValue(value))
     return *constant > 0;
+  if (auto expression = value.getDefiningOp<gpu::PhysicalExprOp>())
+    return gpu::isKnownPositiveExtent(
+        expression.getExpression(), expression->getParentOfType<func::FuncOp>());
   auto parameter = value.getDefiningOp<gpu::ParameterOp>();
   return parameter &&
          llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
@@ -2474,60 +2477,6 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
       if (origin)
         operation->setAttr(gpu::originAttr, origin);
     };
-    auto unitBatch = [](Type type) {
-      auto tile = cast<gpu::FragmentType>(type);
-      if (tile.getShape().size() != 3)
-        return false;
-      auto batch = cast<gpu::PhysicalExprAttr>(tile.getShape()[0]);
-      return batch.getKind() ==
-                 static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
-             batch.getValue() == 1;
-    };
-    if (unitBatch(contract.getLhs().getType()) &&
-        unitBatch(contract.getRhs().getType()) &&
-        unitBatch(contract.getAccumulator().getType()) &&
-        unitBatch(contract.getResult().getType())) {
-      auto matrixType = [&](gpu::FragmentType type) {
-        SmallVector<Attribute> axes;
-        for (Attribute attribute : type.getAxisMaps().getValue().drop_front()) {
-          auto axis = cast<gpu::AxisMapAttr>(attribute);
-          axes.push_back(gpu::AxisMapAttr::get(
-              kernel.getContext(), axis.getSourceId(), axis.getSourceAxis(),
-              axis.getDimensionId(), axes.size(), axis.getDerived()));
-        }
-        return gpu::FragmentType::get(
-            kernel.getContext(), type.getElementType(),
-            builder.getArrayAttr(type.getShape().getValue().drop_front()),
-            builder.getArrayAttr(axes), type.getValidity(), type.getOwner());
-      };
-      SmallVector<Value> operands;
-      for (Value operand : {contract.getLhs(), contract.getRhs(),
-                            contract.getAccumulator()}) {
-        auto source = cast<gpu::FragmentType>(operand.getType());
-        auto target = matrixType(source);
-        auto reassociation = gpu::inferReshapeReassociation(source, target);
-        if (failed(reassociation))
-          return contract.emitOpError("unit-batch MMA operand cannot preserve row-major elements");
-        auto reshape = builder.create<gpu::ReshapeOp>(
-            contract.getLoc(), target, operand, *reassociation);
-        inheritOrigin(reshape);
-        operands.push_back(reshape);
-      }
-      auto original = cast<gpu::FragmentType>(contract.getResult().getType());
-      auto projected = matrixType(original);
-      auto reassociation = gpu::inferReshapeReassociation(projected, original);
-      if (failed(reassociation))
-        return contract.emitOpError("unit-batch MMA result cannot restore row-major elements");
-      auto mma = builder.create<MMAOp>(
-          contract.getLoc(), projected, operands[0], operands[1], operands[2]);
-      auto result = builder.create<gpu::ReshapeOp>(
-          contract.getLoc(), original, mma, *reassociation);
-      inheritOrigin(mma);
-      inheritOrigin(result);
-      contract.getResult().replaceAllUsesWith(result);
-      contract.erase();
-      continue;
-    }
     auto replacement = builder.create<MMAOp>(
         contract.getLoc(), contract.getResult().getType(), contract.getLhs(),
         contract.getRhs(), contract.getAccumulator());
@@ -3390,8 +3339,14 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
 bool fitsNativeLoopBound(Value value, unsigned depth = 0) {
   if (depth >= 32)
     return false;
+  value = stripIndexIdentities(value);
   if (value.getDefiningOp<gpu::ProgramIdOp>())
     return true;
+  if (auto expression = value.getDefiningOp<gpu::PhysicalExprOp>()) {
+    auto bounds = gpu::queryPositiveExtentBounds(
+        expression.getExpression(), expression->getParentOfType<func::FuncOp>());
+    return bounds && llvm::isInt<32>(bounds->second);
+  }
   auto integer = dyn_cast<IntegerType>(value.getType());
   if (integer && (integer.getWidth() < 32 ||
                   (integer.getWidth() == 32 && !integer.isUnsigned())))
@@ -3439,6 +3394,13 @@ bool fitsNativeLoopBound(Value value, unsigned depth = 0) {
 }
 
 std::optional<int64_t> maximumNativeLoopStep(Value value) {
+  value = stripIndexIdentities(value);
+  if (auto expression = value.getDefiningOp<gpu::PhysicalExprOp>()) {
+    auto bounds = gpu::queryPositiveExtentBounds(
+        expression.getExpression(), expression->getParentOfType<func::FuncOp>());
+    if (bounds && llvm::isInt<32>(bounds->second))
+      return bounds->second;
+  }
   if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
     auto attribute = dyn_cast<IntegerAttr>(constant.getValue());
     if (attribute && attribute.getValue().isSignedIntN(32) &&
@@ -3454,38 +3416,6 @@ std::optional<int64_t> maximumNativeLoopStep(Value value) {
       return *llvm::max_element(candidates);
   }
   return std::nullopt;
-}
-
-void materializeUnitOwnershipExtents(func::FuncOp kernel) {
-  llvm::DenseSet<StringAttr> units;
-  kernel.walk([&](gpu::ParameterOp parameter) {
-    auto schema = parameter.getParameter();
-    auto role = static_cast<gpu::ParameterRole>(schema.getRole());
-    if ((role != gpu::ParameterRole::OwnershipM &&
-         role != gpu::ParameterRole::OwnershipN) ||
-        schema.getCandidates().size() != 1 || schema.getCandidates()[0] != 1)
-      return;
-    units.insert(schema.getName());
-    OpBuilder builder(parameter);
-    Value constant = builder.create<arith::ConstantOp>(
-        parameter.getLoc(), parameter.getResult().getType(),
-        builder.getIntegerAttr(parameter.getResult().getType(), 1));
-    parameter.getResult().replaceAllUsesWith(constant);
-  });
-  // Shared coverage and mapping are closed before singleton ownership is folded.
-  AttrTypeReplacer replacer;
-  replacer.addReplacement([&](gpu::PhysicalExprAttr extent) -> std::optional<Attribute> {
-    if (extent.getKind() != static_cast<uint32_t>(gpu::PhysicalExprKind::Parameter) ||
-        !units.contains(extent.getSymbol()))
-      return std::nullopt;
-    return gpu::PhysicalExprAttr::get(
-        kernel.getContext(), static_cast<uint32_t>(gpu::PhysicalExprKind::Constant),
-        1, StringAttr::get(kernel.getContext()), ArrayAttr::get(kernel.getContext(), {}));
-  });
-  replacer.recursivelyReplaceElementsIn(kernel.getOperation(),
-                                        /*replaceAttrs=*/true,
-                                        /*replaceLocs=*/false,
-                                        /*replaceTypes=*/true);
 }
 
 void realizeWideLoops(func::FuncOp kernel) {
@@ -3693,7 +3623,6 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   if (failed(gpu::normalizeMatrixContractShapes(*kernel)) ||
       failed(gpu::verifyGPUProgram(module)))
     return failure();
-  materializeUnitOwnershipExtents(*kernel);
   if (failed(gpu::materializeProgramBuffers(module)) ||
       failed(gpu::lowerInvocationWorkspaces(module)))
     return failure();

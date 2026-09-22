@@ -92,6 +92,9 @@ mlir::FailureOr<AxisMapAttr> queryAxisMap(mlir::Type type,
                                          unsigned fragmentAxis);
 mlir::FailureOr<int64_t> queryRangeDimension(MakeRangeOp range);
 bool samePhysicalScalarExpression(mlir::Value lhs, mlir::Value rhs);
+bool isKnownPositiveExtent(PhysicalExprAttr extent, mlir::func::FuncOp kernel);
+std::optional<std::pair<int64_t, int64_t>>
+queryPositiveExtentBounds(PhysicalExprAttr extent, mlir::func::FuncOp kernel);
 bool isLaunchUniformScalar(mlir::Value value, mlir::func::FuncOp kernel);
 
 /// Exact launch-visible integer expression from current scalar SSA. Device

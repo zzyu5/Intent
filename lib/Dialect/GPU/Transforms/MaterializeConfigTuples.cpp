@@ -932,6 +932,47 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
              ScaledContractOp, SparseContractOp, HistogramOp, ScatterReduceOp>(
             operation);
   });
+  llvm::DenseMap<Operation *, int64_t> pointwiseLocalMultiplicity;
+  if (pointwiseOnlyProgram && !hasTwoAxisPointwiseOwnership)
+    for (ParameterOp parameter : parameters) {
+      auto schema = parameter.getParameter();
+      if (schema.getCategory() != static_cast<uint32_t>(ParameterCategory::Pointwise) ||
+          schema.getRole() != static_cast<uint32_t>(ParameterRole::OwnershipN))
+        continue;
+      AttrTypeReplacer localShape;
+      localShape.addReplacement(
+          [&](PhysicalExprAttr extent) -> std::optional<Attribute> {
+        if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter) ||
+            extent.getSymbol() != schema.getName())
+          return std::nullopt;
+        return PhysicalExprAttr::get(kernel.getContext(),
+            static_cast<uint32_t>(PhysicalExprKind::Constant), 1,
+            builder.getStringAttr(""), builder.getArrayAttr({}));
+      });
+      int64_t multiplicity = 1;
+      kernel.walk([&](Operation *operation) {
+        for (Type type : operation->getResultTypes()) {
+          auto fragment = dyn_cast<FragmentType>(type);
+          if (!fragment || !fragmentReferencesParameter(fragment, schema.getName()))
+            continue;
+          int64_t elements = 1;
+          for (Attribute dimension : fragment.getShape()) {
+            auto extent = constantPhysicalExpression(
+                cast<PhysicalExprAttr>(localShape.replace(dimension)));
+            if (!extent)
+              continue;
+            if (*extent <= 0 ||
+                elements > std::numeric_limits<int64_t>::max() / *extent) {
+              elements = 1;
+              break;
+            }
+            elements *= *extent;
+          }
+          multiplicity = std::max(multiplicity, elements);
+        }
+      });
+      pointwiseLocalMultiplicity[parameter] = multiplicity;
+    }
   SmallVector<ParameterOp> pointwiseRowAxes;
   if (pointwiseOnlyProgram)
     for (ParameterOp parameter : parameters) {
@@ -1051,6 +1092,11 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
         auto schema = parameter.getParameter();
         auto role = static_cast<ParameterRole>(schema.getRole());
         int64_t requested = requestedValue(profileFor(parameter), role);
+        // A one-axis pointwise profile budgets the entire fragment. Static
+        // local axes consume that budget even without their own parameters.
+        if (auto local = pointwiseLocalMultiplicity.find(parameter);
+            local != pointwiseLocalMultiplicity.end())
+          requested = std::max<int64_t>(1, requested / local->second);
         if (!selectedRows.contains(parameter) &&
             llvm::is_contained(pointwiseRowAxes, parameter))
           requested = 1;

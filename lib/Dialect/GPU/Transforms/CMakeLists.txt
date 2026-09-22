@@ -30,6 +30,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   MLIRSCFDialect
   MLIRSCFUtils
   MLIRSideEffectInterfaces
+  MLIRTransformUtils
   MLIRIntentGPUAnalysis
   MLIRIntentGPUDialect
 )

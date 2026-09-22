@@ -9,6 +9,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -2906,11 +2907,14 @@ FailureOr<bool> realizeFullResultTraversal(
          "_" + Twine(axisMap->getDerived() ? 1 : 0) + "_D" +
          Twine(axisMap->getDimensionId()))
             .str();
+    Type inputElement = cast<FragmentType>(selected.first->get().getType())
+                            .getElementType();
     ParameterOp block = getOrCreatePhysicalParameter(
         kernel, name,
         lhsAxis ? ParameterRole::OwnershipM : ParameterRole::OwnershipN,
         ParameterCategory::Contraction,
-        resultType.getElementType().getIntOrFloatBitWidth(), {32, 64, 128, 256});
+        inputElement.isIndex() ? 64 : inputElement.getIntOrFloatBitWidth(),
+        {32, 64, 128, 256});
     if (!block)
       return failure();
     if (FailureOr<int64_t> dimension = queryRangeDimension(*authority);
@@ -5239,6 +5243,34 @@ FailureOr<bool> projectScalarContractResult(ContractOp contract) {
 } // namespace
 
 LogicalResult normalizeMatrixContractShapes(func::FuncOp kernel) {
+  llvm::DenseSet<StringAttr> units;
+  kernel.walk([&](ParameterOp parameter) {
+    auto schema = parameter.getParameter();
+    auto role = static_cast<ParameterRole>(schema.getRole());
+    if ((role != ParameterRole::OwnershipM &&
+         role != ParameterRole::OwnershipN) ||
+        schema.getCandidates().size() != 1 || schema.getCandidates()[0] != 1)
+      return;
+    units.insert(schema.getName());
+    OpBuilder builder(parameter);
+    Value constant = builder.create<arith::ConstantOp>(
+        parameter.getLoc(), parameter.getResult().getType(),
+        builder.getIntegerAttr(parameter.getResult().getType(), 1));
+    parameter.getResult().replaceAllUsesWith(constant);
+  });
+  // Ownership and coverage are already closed at this boundary. A singleton
+  // physical candidate is an exact extent, independent of the target API.
+  AttrTypeReplacer replacer;
+  replacer.addReplacement([&](PhysicalExprAttr extent) -> std::optional<Attribute> {
+    if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter) ||
+        !units.contains(extent.getSymbol()))
+      return std::nullopt;
+    return expression(kernel.getContext(), PhysicalExprKind::Constant, 1);
+  });
+  replacer.recursivelyReplaceElementsIn(kernel.getOperation(),
+                                        /*replaceAttrs=*/true,
+                                        /*replaceLocs=*/false,
+                                        /*replaceTypes=*/true);
   auto [nextSource, nextDimension] = nextPhysicalAxisIdentities(kernel);
   SmallVector<ContractOp> contracts;
   kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
@@ -5413,6 +5445,64 @@ LogicalResult normalizeMatrixContractShapes(func::FuncOp kernel) {
       return use.getOwner() != firstRestore &&
              use.getOwner() != result.getDefiningOp();
     });
+  }
+  for (ContractOp contract : contracts) {
+    auto unitBatch = [](FragmentType type) {
+      return type.getShape().size() == 3 &&
+             constantPhysicalExpression(
+                 cast<PhysicalExprAttr>(type.getShape()[0])) == 1;
+    };
+    if (contract.getLhsBatchAxes() != ArrayRef<int64_t>{0} ||
+        contract.getRhsBatchAxes() != ArrayRef<int64_t>{0} ||
+        contract.getLhsReductionAxes() != ArrayRef<int64_t>{2} ||
+        contract.getRhsReductionAxes() != ArrayRef<int64_t>{1} ||
+        !unitBatch(contract.getLhs().getType()) ||
+        !unitBatch(contract.getRhs().getType()) ||
+        !unitBatch(contract.getAccumulator().getType()) ||
+        !unitBatch(contract.getResult().getType()))
+      continue;
+    OpBuilder builder(contract);
+    auto matrixType = [&](FragmentType type) {
+      SmallVector<Attribute> axes;
+      for (Attribute attribute : type.getAxisMaps().getValue().drop_front()) {
+        auto axis = cast<AxisMapAttr>(attribute);
+        axes.push_back(AxisMapAttr::get(
+            kernel.getContext(), axis.getSourceId(), axis.getSourceAxis(),
+            axis.getDimensionId(), axes.size(), axis.getDerived()));
+      }
+      return FragmentType::get(
+          kernel.getContext(), type.getElementType(),
+          builder.getArrayAttr(type.getShape().getValue().drop_front()),
+          builder.getArrayAttr(axes), type.getValidity(), type.getOwner());
+    };
+    SmallVector<Value> operands;
+    for (Value operand : {contract.getLhs(), contract.getRhs(),
+                          contract.getAccumulator()}) {
+      auto source = cast<FragmentType>(operand.getType());
+      auto target = matrixType(source);
+      auto reassociation = inferReshapeReassociation(source, target);
+      if (failed(reassociation))
+        return contract.emitOpError("unit-batch operand has no exact row-major reshape");
+      operands.push_back(builder.create<ReshapeOp>(
+          contract.getLoc(), target, operand, *reassociation));
+    }
+    auto original = contract.getResult().getType();
+    auto projected = matrixType(original);
+    auto reassociation = inferReshapeReassociation(projected, original);
+    if (failed(reassociation))
+      return contract.emitOpError("unit-batch result has no inverse row-major reshape");
+    auto matrix = builder.create<ContractOp>(
+        contract.getLoc(), projected, operands[0], operands[1], operands[2],
+        ArrayRef<int64_t>{1}, ArrayRef<int64_t>{0},
+        ArrayRef<int64_t>{}, ArrayRef<int64_t>{});
+    auto restored = builder.create<ReshapeOp>(
+        contract.getLoc(), original, matrix, *reassociation);
+    if (Attribute origin = contract->getAttr(originAttr)) {
+      matrix->setAttr(originAttr, origin);
+      restored->setAttr(originAttr, origin);
+    }
+    contract.getResult().replaceAllUsesWith(restored);
+    contract.erase();
   }
   return success();
 }

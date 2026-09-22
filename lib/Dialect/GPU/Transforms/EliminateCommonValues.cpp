@@ -5,7 +5,9 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/OperationSupport.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -191,6 +193,17 @@ LogicalResult eliminateCommonValues(ModuleOp module) {
   FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
+  kernel->walk<WalkOrder::PostOrder>([&](LoopLikeOpInterface loop) {
+    moveLoopInvariantCode(
+        loop.getLoopRegions(),
+        [&](Value value, Region *) { return loop.isDefinedOutsideOfLoop(value); },
+        [&](Operation *operation, Region *) {
+          return isa<BroadcastOp, SplatOp, ReshapeOp, TransposeOp, JoinOp,
+                     MakeRecordOp, ExtractOp, arith::ConstantOp>(operation) &&
+                 isSpeculatable(operation) && isMemoryEffectFree(operation);
+        },
+        [&](Operation *operation, Region *) { loop.moveOutOfLoop(operation); });
+  });
   for (Block &block : kernel->getBody())
     eliminateInBlock(block);
   return success();
