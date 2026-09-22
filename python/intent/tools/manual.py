@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+from typing import Literal
 
 
 def _sections(text: str) -> list[tuple[int, int, int, str]]:
@@ -142,7 +143,8 @@ class Manual:
         self._section_bodies = {identifier: _section_body(entry["text"])
                                 for identifier, entry in corpus["documents"].items()}
 
-    def search(self, query: str, kind: str = "all") -> dict:
+    def search(self, query: str,
+               kind: Literal["all", "api", "concept", "diagnostic"] = "all") -> dict:
         """Find API names, language rules and diagnostics. Read returned IDs for full context."""
         if kind not in {"all", "api", "concept", "diagnostic"}:
             raise ValueError("kind must be all, api, concept or diagnostic")
