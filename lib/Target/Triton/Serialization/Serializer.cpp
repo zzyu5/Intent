@@ -1244,11 +1244,25 @@ private:
         }
         llvm_unreachable("unhandled Intent scaled format");
       };
+      auto extent = [](gpu::FragmentType type, unsigned axis) {
+        return expressionString(
+            cast<gpu::PhysicalExprAttr>(type.getShape()[axis]), false);
+      };
+      auto lhs = contract.getLhs().getType();
+      auto rhs = contract.getRhs().getType();
+      // The verified scaled-contract schema already fixes contiguous groups
+      // and packed carriers. dot_scaled spells that grouped K as one axis.
+      std::string lhsValue =
+          "tl.reshape(" + valueString(contract.getLhs()) + ", (" +
+          extent(lhs, 0) + ", " + extent(lhs, 1) + " * " + extent(lhs, 2) + "))";
+      std::string rhsValue =
+          "tl.reshape(" + valueString(contract.getRhs()) + ", (" +
+          extent(rhs, 0) + " * " + extent(rhs, 1) + ", " + extent(rhs, 2) + "))";
       assign(contract.getResult(),
-             "tl.dot_scaled(" + valueString(contract.getLhs()) + ", " +
+             "tl.dot_scaled(" + lhsValue + ", " +
                  valueString(contract.getLhsScale()) + ", \"" +
                  format(contract.getLhsFormat()).str() + "\", " +
-                 valueString(contract.getRhs()) + ", " +
+                 rhsValue + ", " +
                  valueString(contract.getRhsScale()) + ", \"" +
                  format(contract.getRhsFormat()).str() + "\", " +
                  valueString(contract.getAccumulator()) + ")");

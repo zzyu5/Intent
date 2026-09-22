@@ -3681,7 +3681,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
           contract.getLhsScale().getType().getElementType();
       Type rhsScaleElement =
           contract.getRhsScale().getType().getElementType();
-      if ((lhsRank != 2 && lhsRank != 3) || rhsRank != lhsRank ||
+      if (lhsRank != 3 || rhsRank != 3 ||
           contract.getLhsFormat() == ScaledFormat::E8M0 ||
           contract.getRhsFormat() == ScaledFormat::E8M0 ||
           contract.getLhsGroupSize() != 32 ||
@@ -3690,9 +3690,9 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
           !rhsScaleElement.isUnsignedInteger(8) ||
           !contract.getResult().getType().getElementType().isF32() ||
           contract.getLhsReductionAxes() !=
-              ArrayRef<int64_t>{static_cast<int64_t>(lhsRank - 1)} ||
+              ArrayRef<int64_t>{1, 2} ||
           contract.getRhsReductionAxes() !=
-              ArrayRef<int64_t>{static_cast<int64_t>(rhsRank - 2)}) {
+              ArrayRef<int64_t>{0, 1}) {
         contract.emitOpError(
             "is outside Triton tl.dot_scaled rank/format/e8m0-scale/group/axis legality");
         return WalkResult::interrupt();

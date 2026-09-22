@@ -2346,6 +2346,33 @@ FailureOr<bool> realizeStructuredNativeReduction(
   if (contract.getLhsReductionAxes().size() != 1 ||
       contract.getRhsReductionAxes().size() != 1)
     return false;
+  PhysicalProgramAnalysis analysis(kernel);
+  bool fullReduction = true;
+  bool retainedSource = false;
+  for (auto [operand, axis] :
+       {std::pair<Value, int64_t>{contract.getLhs(),
+                                  contract.getLhsReductionAxes().front()},
+        std::pair<Value, int64_t>{contract.getRhs(),
+                                  contract.getRhsReductionAxes().front()}}) {
+    auto type = cast<FragmentType>(operand.getType());
+    auto parameter = parameterForExtent(
+        kernel, cast<PhysicalExprAttr>(type.getShape()[axis]));
+    fullReduction &= succeeded(parameter) &&
+        parameter->getParameter().getRole() ==
+            static_cast<uint32_t>(ParameterRole::FullCoverage) &&
+        parameter->getParameter().getCategory() ==
+            static_cast<uint32_t>(ParameterCategory::Coverage);
+    auto mapping = cast<AxisMapAttr>(type.getAxisMaps()[axis]);
+    retainedSource |= !analysis.replayability(
+        operand, sourceAxisIdentity(mapping), PhysicalReplayScope::ValueGraph,
+        /*allowAccesses=*/true, contract, mapping.getDimensionId()).isReplayable();
+  }
+  if (fullReduction && retainedSource &&
+      freeAxesReadyForReductionTraversal(contract, kernel)) {
+    if (failed(markNativeCoverage(kernel, contract)))
+      return failure();
+    return true;
+  }
   LoadOp lhsLoad = matrixOperandLoad(contract.getLhs());
   LoadOp rhsLoad = matrixOperandLoad(contract.getRhs());
   if (!lhsLoad || !rhsLoad)
@@ -2355,7 +2382,6 @@ FailureOr<bool> realizeStructuredNativeReduction(
     ParameterOp parameter;
     std::optional<PhysicalSourceAxis> source;
   };
-  PhysicalProgramAnalysis analysis(kernel);
   auto operandSegment = [&](Value operand,
                             ArrayRef<int64_t> reductionAxes)
       -> FailureOr<SegmentFact> {

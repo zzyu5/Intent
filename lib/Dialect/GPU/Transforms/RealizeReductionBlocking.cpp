@@ -132,6 +132,8 @@ bool exceedsRegisterFile(Value source, func::FuncOp kernel) {
   return registers >= budget;
 }
 
+FailureOr<Value> scalarSource(Value value);
+
 bool requiresPhysicalRealization(ReduceOp reduce) {
   auto kernel = reduce->getParentOfType<func::FuncOp>();
   if (!kernel)
@@ -147,8 +149,31 @@ bool requiresPhysicalRealization(ReduceOp reduce) {
       PhysicalAxisRealizationFact fact =
           analysis.axisRealization(source, static_cast<unsigned>(axis));
       if (fact.constructionScalarSeed ||
-          (fact.isExact() && !fact.physicalized))
-        return true;
+          (fact.isExact() && !fact.physicalized)) {
+        auto extent = constantPhysicalExpression(
+            cast<PhysicalExprAttr>(fragment.getShape()[axis]));
+        bool pairedComplete = extent && succeeded(scalarSource(source)) &&
+            llvm::any_of(reduce.getInputs().take_front(reduce.getSourceCount()),
+                         [&](Value peer) {
+          auto peerType = dyn_cast<FragmentType>(peer.getType());
+          if (!peerType || peerType.getShape() != fragment.getShape() ||
+              peerType.getAxisMaps() != fragment.getAxisMaps() ||
+              peerType.getValidity() != fragment.getValidity() ||
+              peerType.getOwner() != fragment.getOwner())
+            return false;
+          auto coverage = analysis.axisRealization(peer, axis);
+          return coverage.isExact() && coverage.physicalized &&
+                 !coverage.constructionScalarSeed &&
+                 !coverage.roots.empty() &&
+                 llvm::all_of(coverage.roots, [&](MakeRangeOp range) {
+            return constantLogicalRangeCardinality(range) == extent &&
+                   samePhysicalScalarExpression(range.getStart(),
+                                                range.getLogicalStart());
+          });
+        });
+        if (!pairedComplete)
+          return true;
+      }
     }
   }
   return false;
@@ -3282,10 +3307,17 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
     }
     if (plan->ranges.empty()) {
       PhysicalProgramAnalysis analysis(kernel);
-      FailureOr<MakeRangeOp> authority = queryExactLogicalRange(
-          analysis.programRanges(plan->sourceIdentity));
-      if (succeeded(authority))
-        plan->ranges.push_back(*authority);
+      DominanceInfo dominance(kernel);
+      SmallVector<MakeRangeOp> visible;
+      for (MakeRangeOp range :
+           analysis.programRanges(plan->sourceIdentity).roots)
+        if (dominance.dominates(range.getOperation(), reduce.getOperation()) &&
+            range.getResult().getType().getShape()[0] ==
+                fragment.getShape()[reductionAxis])
+          visible.push_back(range);
+      auto traversal = analysis.lockstepRanges(visible);
+      if (traversal.isExact())
+        plan->ranges.push_back(traversal.authority);
     }
     if (plan->roots.empty() && plan->ranges.empty() &&
         failed(scalarSource(source)))

@@ -1,55 +1,55 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
-fused_softmax,8192x8192-fp16,0.276496,0.192336,1.437568,pass,Intent target=cutile; source corpus=triton. 
-dense_gemm,M4096-N14336-K4096-fp16,1.763288,1.722896,1.023444,pass,Intent target=cutile; source corpus=triton. 
-grouped_gemm,E8-M1024-K4096-N14336-fp16,5.371016,5.310040,1.011483,pass,Intent target=cutile; source corpus=triton. 
+fused_softmax,8192x8192-fp16,0.276496,0.192336,1.437568,pass,Intent target=cutile; source corpus=triton.
+dense_gemm,M4096-N14336-K4096-fp16,1.763288,1.722896,1.023444,pass,Intent target=cutile; source corpus=triton.
+grouped_gemm,E8-M1024-K4096-N14336-fp16,5.371016,5.310040,1.011483,pass,Intent target=cutile; source corpus=triton.
 flash_attention_forward,B4-H32-S4096-D128-fp16-causal,9.489128,3.247848,2.921666,pass,Intent target=cutile; source corpus=triton. 同算法；CUDA graph 设备执行计时；source 额外写 f32 M 辅助结果。
-layer_norm,8192x4096-fp16,0.123512,0.131360,0.940256,pass,Intent target=cutile; source corpus=triton. 
-flash_cross_entropy,8192x32768-bf16,0.660768,0.564944,1.169617,pass,Intent target=cutile; source corpus=triton. 
-flash_layer_norm,8192x4096-bf16,0.132328,0.096208,1.375437,pass,Intent target=cutile; source corpus=triton. 
-rotary_embedding,B4-S4096-H32-D128-bf16,0.172256,0.171328,1.005417,pass,Intent target=cutile; source corpus=triton. 
-swiglu,8192x14336-bf16,0.410088,0.403560,1.016176,pass,Intent target=cutile; source corpus=triton. 
-embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.166728,0.165936,1.004773,pass,Intent target=cutile; source corpus=triton. 
-cross_entropy,8192x32768-bf16,3.847288,1.748248,2.200653,pass,Intent target=cutile; source corpus=triton. 
-padded_rope_cache_update,B32-QH32-KVH8-D128-cache8192-fp16,0.014368,0.012800,1.122500,pass,Intent target=cutile; source corpus=triton. 
+layer_norm,8192x4096-fp16,0.123512,0.131360,0.940256,pass,Intent target=cutile; source corpus=triton.
+flash_cross_entropy,8192x32768-bf16,0.660768,0.564944,1.169617,pass,Intent target=cutile; source corpus=triton.
+flash_layer_norm,8192x4096-bf16,0.132328,0.096208,1.375437,pass,Intent target=cutile; source corpus=triton.
+rotary_embedding,B4-S4096-H32-D128-bf16,0.172256,0.171328,1.005417,pass,Intent target=cutile; source corpus=triton.
+swiglu,8192x14336-bf16,0.410088,0.403560,1.016176,pass,Intent target=cutile; source corpus=triton.
+embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.166728,0.165936,1.004773,pass,Intent target=cutile; source corpus=triton.
+cross_entropy,8192x32768-bf16,3.847288,1.748248,2.200653,pass,Intent target=cutile; source corpus=triton.
+padded_rope_cache_update,B32-QH32-KVH8-D128-cache8192-fp16,0.014368,0.012800,1.122500,pass,Intent target=cutile; source corpus=triton.
 fused_add_rms_norm,8192x4096-bf16,,,,generated_provider_jit_or_initial_launch_timeout,exceeded 300 seconds
-rms_norm,8192x4096-bf16,0.103424,0.090904,1.137728,pass,Intent target=cutile; source corpus=triton. 
-xformers_rms_norm,8192x4096-bf16,0.102984,0.089048,1.156500,pass,Intent target=cutile; source corpus=triton. 
-qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,7.616696,2.161104,3.524447,pass,Intent target=cutile; source corpus=triton. 
-index_select,source65536-selected32768-hidden4096-fp16,0.325480,0.415528,0.783293,pass,Intent target=cutile; source corpus=triton. 
-scaled_index_add,destination65536-routed32768-hidden4096-fp16,0.464136,0.537936,0.862809,pass,Intent target=cutile; source corpus=triton. 
-scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,16.812056,9.364128,1.795368,pass,Intent target=cutile; source corpus=triton. 
-jagged_mean,B512-T33024-D128-fp32,0.030016,0.026408,1.136625,pass,Intent target=cutile; source corpus=triton. 
-fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.177504,0.335024,0.529825,pass,Intent target=cutile; source corpus=triton. 
-rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.220232,0.896144,0.245755,pass,Intent target=cutile; source corpus=triton. 
-causal_conv1d,B4-C4096-S4096-W4-bf16-silu,1.201608,0.369056,3.255896,pass,Intent target=cutile; source corpus=triton. 
-varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.165800,0.117472,1.411400,pass,Intent target=cutile; source corpus=triton. 
-causal_conv1d_update,B32-D4096-W4-bf16,0.037536,0.010928,3.434846,pass,Intent target=cutile; source corpus=triton. 
-modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,0.686072,0.724256,0.947278,pass,Intent target=cutile; source corpus=triton. 
+rms_norm,8192x4096-bf16,0.103424,0.090904,1.137728,pass,Intent target=cutile; source corpus=triton.
+xformers_rms_norm,8192x4096-bf16,0.102984,0.089048,1.156500,pass,Intent target=cutile; source corpus=triton.
+qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,7.616696,2.161104,3.524447,pass,Intent target=cutile; source corpus=triton.
+index_select,source65536-selected32768-hidden4096-fp16,0.325480,0.415528,0.783293,pass,Intent target=cutile; source corpus=triton.
+scaled_index_add,destination65536-routed32768-hidden4096-fp16,0.464136,0.537936,0.862809,pass,Intent target=cutile; source corpus=triton.
+scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,16.812056,9.364128,1.795368,pass,Intent target=cutile; source corpus=triton.
+jagged_mean,B512-T33024-D128-fp32,0.030016,0.026408,1.136625,pass,Intent target=cutile; source corpus=triton.
+fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.177504,0.335024,0.529825,pass,Intent target=cutile; source corpus=triton.
+rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.220232,0.896144,0.245755,pass,Intent target=cutile; source corpus=triton.
+causal_conv1d,B4-C4096-S4096-W4-bf16-silu,1.201608,0.369056,3.255896,pass,Intent target=cutile; source corpus=triton.
+varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.165800,0.117472,1.411400,pass,Intent target=cutile; source corpus=triton.
+causal_conv1d_update,B32-D4096-W4-bf16,0.037536,0.010928,3.434846,pass,Intent target=cutile; source corpus=triton.
+modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,0.686072,0.724256,0.947278,pass,Intent target=cutile; source corpus=triton.
 mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,,,,generated_physical_program_verification_failed,"Intent cuTile compiler failed with exit code 4:; loc(""<stdin>"":2:3): error: native contraction axis has no exact physical coverage; axis=0; source='!intent_gpu.fragment<bf16, [#intent_gpu.expr<0, 32, """", []>, #intent_gpu.expr<0, 1, """", []>], [#intent_gpu.axis_map<171, 0, 3, 0, true>, #intent_gpu.axis_map<173, 1, 45, 1, true>], 1, 1>'; construction_seed=0"
 flash_attention_backward,B2-H16-S2048-D128-fp16-causal,,,,source_provider_jit_or_initial_launch_failed,at 77:13:;     k = tl.load(K_block_ptr)
-moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.121544,3.877256,0.547177,pass,Intent target=cutile; source corpus=triton. 
-moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,2.121736,8.443504,0.251286,pass,Intent target=cutile; source corpus=triton. 
+moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.121544,3.877256,0.547177,pass,Intent target=cutile; source corpus=triton.
+moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,2.121736,8.443504,0.251286,pass,Intent target=cutile; source corpus=triton.
 mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,,,,generated_physical_program_verification_failed,"Intent cuTile compiler failed with exit code 4:; loc(""<stdin>"":61:17): error: 'intent_gpu.contract' op full-coverage contraction tail requires an exact unit-step range"
-mamba_state_passing,B1-C8-H32-state8192-fp32,0.019424,0.024400,0.796066,pass,Intent target=cutile; source corpus=triton. 
+mamba_state_passing,B1-C8-H32-state8192-fp32,0.019424,0.024400,0.796066,pass,Intent target=cutile; source corpus=triton.
 mamba_chunk_scan,B1-S2048-H32-G8-P64-N128-C256-bf16,,,,numerical_failed,generated/source result 0 finite-value masks differ
 mamba3_siso_forward,B1-S2048-HQK4-H16-DQK32-DV64-bf16,,,,generated_physical_program_failed,"Intent cuTile compiler failed with exit code 3:; loc(""<stdin>"":89:17): error: 'intent_gpu.gather' op loaded source coordinate cannot be composed with gather indexing"
-paged_gqa_decode,B16-QH32-KVH8-S8192-D128-page16-fp16,,,,generated_provider_jit_or_initial_launch_timeout,exceeded 1800 seconds
-splitk_paged_attention,B16-QH32-KVH8-S8192-D128-page16-split8-fp16,,,,generated_physical_program_verification_failed,"Intent cuTile compiler failed with exit code 4:; loc(""<stdin>"":128:18): error: 'intent_gpu.gather' op access payload and coordinate extents disagree; payload_axis=0; payload_extent=#intent_gpu.expr<1, 0, ""FRAGMENT_S19_A0"", []>; coordinate_extent=#intent_gpu.expr<0, 4, """", []>"
-paged_mla_decode,B8-QH128-KVH1-S8192-C512-R64-page16-fp16,,,,generated_physical_program_verification_failed,"Intent cuTile compiler failed with exit code 4:; loc(""<stdin>"":128:20): error: 'intent_gpu.gather' op access payload and coordinate extents disagree; payload_axis=0; payload_extent=#intent_gpu.expr<1, 0, ""FRAGMENT_S52_A0"", []>; coordinate_extent=#intent_gpu.expr<0, 128, """", []>"
-block_sparse_gqa_decode,B8-QH32-KVH8-S8192-D128-blocks32x128,,,,generated_physical_program_verification_failed,"Intent cuTile compiler failed with exit code 4:; loc(""<stdin>"":154:20): error: full-coverage physicalization has no runtime or static dimension authority; dimension=5; source=%415 = ""intent_gpu.extract""(%arg45) <{field = 0 : i64}> {intent_gpu.origin = 137 : i64} : (!intent_gpu.record<[""valid"", ""maximum"", ""denominator"", ""accumulator""], [!intent_gpu.fragment<i1, [#intent_gpu.expr<0, 4, """", []>], [#intent_gpu.axis_map<16, 0, 5, 0, false>], 1, 1>, !intent_gpu.fragment<f32, [#intent_gpu.expr<0, 4, """", []>], [#intent_gpu.axis_map<16, 0, 5, 0, false>], 1, 1>, !intent_gpu.fragment<f32, [#intent_gpu.expr<0, 4, """", []>], [#intent_gpu.axis_map<16, 0, 5, 0, false>], 1, 1>, !intent_gpu.fragment<f32, [#intent_gpu.expr<0, 4, """", []>, #intent_gpu.expr<0, 1, """", []>], [#intent_gpu.axis_map<16, 0, 5, 0, false>, #intent_gpu.axis_map<55, 1, 4, 1, true>], 1, 1>], 1>) -> !intent_gpu.fragment<i1, [#intent_gpu.expr<0, 4, """", []>], [#intent_gpu.axis_map<16, 0, 5, 0, false>], 1, 1>"
-flaggems_conv1d,B64-L16384-K5-fp16-same,0.022296,0.279560,0.079754,pass,Intent target=cutile; source corpus=triton. 
-flaggems_triangular_solve,B4096-N16-fp32-lower,0.123688,0.122000,1.013836,pass,Intent target=cutile; source corpus=triton. 
-flaggems_embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.168504,0.166888,1.009683,pass,Intent target=cutile; source corpus=triton. 
-flaggems_roll,8192x4096-fp16-shift-1-axis0,0.092968,0.089120,1.043178,pass,Intent target=cutile; source corpus=triton. 
-flaggems_transpose_copy,4093x8191-fp16,0.152648,0.578136,0.264035,pass,Intent target=cutile; source corpus=triton. 
-flaggems_batch_norm_training,B32-C64-S4096-fp16,0.428488,0.060536,7.078235,pass,Intent target=cutile; source corpus=triton. 
-flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.088488,0.124496,0.710770,pass,Intent target=cutile; source corpus=triton. 
-flaggems_logsumexp,8192x8192-fp32,0.368216,0.172232,2.137907,pass,Intent target=cutile; source corpus=triton. 
+paged_gqa_decode,B16-QH32-KVH8-S8192-D128-page16-fp16,0.395400,0.507672,0.778849,pass,Intent target=cutile; source corpus=triton.
+splitk_paged_attention,B16-QH32-KVH8-S8192-D128-page16-split8-fp16,0.392544,1.986248,0.197631,pass,Intent target=cutile; source corpus=triton.
+paged_mla_decode,B8-QH128-KVH1-S8192-C512-R64-page16-fp16,,,,generated_provider_jit_or_initial_launch_failed,"No valid config found in search space.; Config: namespace(BLOCK_N_CACHE_3_2_0_D3=64, CUTILE_CTAS=1, CUTILE_LOAD_POLICY=11, CUTILE_OCCUPANCY=2, CUTILE_WORKER_WARPS=4, FRAGMENT_S52_A0=128, SEGMENT_N182_D6=128)"
+block_sparse_gqa_decode,B8-QH32-KVH8-S8192-D128-blocks32x128,,,,source_abi_gap,
+flaggems_conv1d,B64-L16384-K5-fp16-same,0.022296,0.279560,0.079754,pass,Intent target=cutile; source corpus=triton.
+flaggems_triangular_solve,B4096-N16-fp32-lower,0.123688,0.122000,1.013836,pass,Intent target=cutile; source corpus=triton.
+flaggems_embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.168504,0.166888,1.009683,pass,Intent target=cutile; source corpus=triton.
+flaggems_roll,8192x4096-fp16-shift-1-axis0,0.092968,0.089120,1.043178,pass,Intent target=cutile; source corpus=triton.
+flaggems_transpose_copy,4093x8191-fp16,0.152648,0.578136,0.264035,pass,Intent target=cutile; source corpus=triton.
+flaggems_batch_norm_training,B32-C64-S4096-fp16,0.428488,0.060536,7.078235,pass,Intent target=cutile; source corpus=triton.
+flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.088488,0.124496,0.710770,pass,Intent target=cutile; source corpus=triton.
+flaggems_logsumexp,8192x8192-fp32,0.368216,0.172232,2.137907,pass,Intent target=cutile; source corpus=triton.
 flaggems_softmax_backward,4096x4097-fp32,,,,numerical_failed,"generated/source floating result 0 differs: max_abs=0.000152587890625, atol=0.0001, rtol=1e-05; first_failure=13331922; largest tolerance excess has generated=1.2312570810317993, source=1.2313878536224365, abs_error=0.00013077259063720703, limit=0.00011231387907173485"
-flaggems_fused_adamw,N8388608-fp32,0.145888,0.151008,0.966095,pass,Intent target=cutile; source corpus=triton. 
-flaggems_addcmul,B64-C128-L4096-bf16,0.090168,0.199912,0.451038,pass,Intent target=cutile; source corpus=triton. 
+flaggems_fused_adamw,N8388608-fp32,0.145888,0.151008,0.966095,pass,Intent target=cutile; source corpus=triton.
+flaggems_addcmul,B64-C128-L4096-bf16,0.090168,0.199912,0.451038,pass,Intent target=cutile; source corpus=triton.
 flaggems_fp8_mqa_logits,Q256-K4096-H32-D128-e4m3,,,,generated_provider_jit_or_initial_launch_timeout,exceeded 300 seconds
-flaggems_cumsum,8192x8192-fp32-axis1,0.451952,0.320448,1.410375,pass,Intent target=cutile; source corpus=triton. 
+flaggems_cumsum,8192x8192-fp32-axis1,0.451952,0.320448,1.410375,pass,Intent target=cutile; source corpus=triton.
 flaggems_histogram,N8388608-bins256-fp32,,,,generated_provider_program_verification_failed,"Intent cuTile compiler failed with exit code 6:; loc(""<stdin>"":17:11): error: 'intent_gpu.histogram' op is outside the closed cuTile provider surface"
-flaggems_max_pool2d_with_indices,B8-C32-H128-W128-K3-S2-P1-fp16,0.090672,0.051680,1.754489,pass,Intent target=cutile; source corpus=triton. 
+flaggems_max_pool2d_with_indices,B8-C32-H128-W128-K3-S2-P1-fp16,0.090672,0.051680,1.754489,pass,Intent target=cutile; source corpus=triton.
 legacy_flash_attention_bias,B4-H32-S4096-D128-fp16-vector-bias,,,,source_compatibility_gap,

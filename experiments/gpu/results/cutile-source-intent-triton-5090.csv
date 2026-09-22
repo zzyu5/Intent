@@ -1,7 +1,7 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
 official_fmha,B4-QH32-KVH8-S4096-D128-fp16-causal,10.986080,32.727898,0.335679,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法
-block_scaled_gemm,M4096-N14336-K4096-fp8-block32,,,,generated_provider_program_verification_failed,"Intent Triton compiler failed with exit code 6:; loc(""<stdin>"":17:11): error: 'intent_gpu.scaled_contract' op is outside Triton tl.dot_scaled rank/format/e8m0-scale/group/axis legality"
-dense_gemm,M4096-N14336-K4096-fp16,2.067568,2.085632,0.991339,pass,Intent target=triton; source corpus=cutile. 
+block_scaled_gemm,M4096-N14336-K4096-fp8-block32,1.316312,1.061296,1.240287,pass,Intent target=triton; source corpus=cutile.
+dense_gemm,M4096-N14336-K4096-fp16,2.067568,2.085632,0.991339,pass,Intent target=triton; source corpus=cutile.
 moe_expert_projection,T4096-E8-top2-4096x14336-bf16,4.216592,6.156480,0.684903,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用预计算 block ownership
 layer_norm,8192x4096-bf16,0.086248,0.265304,0.325091,pass,Intent target=triton; source corpus=cutile. 同算法；source 额外写 Mean/Rstd
 silu_and_mul,4096x28672-to14336-bf16,0.226544,0.244448,0.926757,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法
@@ -9,30 +9,30 @@ attention_backward,B2-QH8-KVH2-S1024-D64-fp16-causal,0.135512,0.175872,0.770515,
 dense_attention_forward,B2-QH32-KVH8-S4096-D128-bf16-causal,5.275752,1.285456,4.104187,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法
 grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,0.188416,0.188416,1.000000,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法
 swiglu,8192x14336-bf16,0.450096,0.465864,0.966153,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法
-splitk_attention_reduce,B8-H32-S8192-splits16-D128,0.005152,0.005808,0.887052,pass,Intent target=triton; source corpus=cutile. 
+splitk_attention_reduce,B8-H32-S8192-splits16-D128,0.005152,0.005808,0.887052,pass,Intent target=triton; source corpus=cutile.
 mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,3.043584,0.947472,3.212321,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法
-batched_gemm,B32-M512-N512-K1024-bf16,0.298720,0.091920,3.249782,pass,Intent target=triton; source corpus=cutile. 
-tilegym_dense_gemm,M8192-N11008-K4096-bf16,3.088976,3.159312,0.977737,pass,Intent target=triton; source corpus=cutile. 
+batched_gemm,B32-M512-N512-K1024-bf16,0.298720,0.091920,3.249782,pass,Intent target=triton; source corpus=cutile.
+tilegym_dense_gemm,M8192-N11008-K4096-bf16,3.088976,3.159312,0.977737,pass,Intent target=triton; source corpus=cutile.
 grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.680560,0.641672,1.060604,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 host group shapes
 moe_alignment,T4096-top2-E64,0.020176,0.036864,0.547309,pass,Intent target=triton; source corpus=cutile. 同算法计数/前缀和/散射；初始化与辅助输出计入调用
 mhc_gemm_rms_scale,T2048-H4096-streams4-bf16,0.063560,0.077824,0.816715,pass,Intent target=triton; source corpus=cutile. 同算法；source 用乘倒数实现归一化
-chunked_softmax,8192x32768-bf16,0.702208,0.842496,0.833485,pass,Intent target=triton; source corpus=cutile. 
+chunked_softmax,8192x32768-bf16,0.702208,0.842496,0.833485,pass,Intent target=triton; source corpus=cutile.
 rope_qk,B2-S4096-QH32-KVH8-D128-bf16,0.133376,0.122272,1.090814,pass,Intent target=triton; source corpus=cutile. 同算法；source 保留 bf16 中间舍入
 gelu,8192x4096-fp16-tanh,0.087856,0.088384,0.994026,pass,Intent target=triton; source corpus=cutile. 同算法；source 保留 f16 中间舍入
 geglu,4096x28672-fp16-tanh,0.229008,0.225040,1.017632,pass,Intent target=triton; source corpus=cutile. 同算法；source 保留 f16 中间舍入
 relu,8192x4096-fp16,0.087488,0.087696,0.997628,pass,Intent target=triton; source corpus=cutile. 同算法；NaN 传播方式不同
-dropout,8192x4096-fp16-p0.1,0.089048,0.087808,1.014122,pass,Intent target=triton; source corpus=cutile. 
+dropout,8192x4096-fp16-p0.1,0.089048,0.087808,1.014122,pass,Intent target=triton; source corpus=cutile.
 attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,2.740904,0.788472,3.476222,pass,Intent target=triton; source corpus=cutile. 同算法；source 的布局转换与辅助工作计入其调用时间
 attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,0.714736,2.081160,0.343432,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 bf16 LSE 与近似除法
 mhc_apply_residual,T2048-H4096-streams4-bf16,0.107216,0.108624,0.987038,pass,Intent target=triton; source corpus=cutile. 同算法；source 保留 bf16 中间累加
 gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,5.466312,0.595520,9.179057,pass,Intent target=triton; source corpus=cutile. 同算法；中间精度和舍入不同
 gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,0.108544,0.698520,0.155391,pass,Intent target=triton; source corpus=cutile. 同算法；中间精度和舍入不同
 mhc_sinkhorn,T8192-streams4-fp32,0.006560,0.018432,0.355903,pass,Intent target=triton; source corpus=cutile. 同算法；source 用 exp2(x * log2(e)) 实现 exp
-absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,,,,generated_physical_program_failed,"Intent Triton compiler failed with exit code 3:; loc(""<stdin>"":134:15): error: 'intent_gpu.gather' op cannot align gather validity with its value schema"
-splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,,,,generated_physical_program_failed,"Intent Triton compiler failed with exit code 3:; loc(""<stdin>"":172:18): error: 'intent_gpu.gather' op cannot align gather validity with its value schema"
-sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,,,,generated_physical_program_failed,"Intent Triton compiler failed with exit code 3:; loc(""<stdin>"":2:3): error: full-coverage source has ambiguous physical range authority"
+absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,0.589048,2.071200,0.284399,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用近似除法并额外输出 LSE
+splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,0.178160,0.330352,0.539304,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法
+sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,,,,generated_provider_jit_or_initial_launch_failed,PassManager::run failed
 sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,5.394352,0.840048,6.421481,pass,Intent target=triton; source corpus=cutile. 同算法；source 的布局转换与辅助工作计入其调用时间
 rms_norm,8192x4096-bf16,0.085776,0.086080,0.996468,pass,Intent target=triton; source corpus=cutile. 同算法；source 额外写 Rstd
-recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,1.719680,0.936944,1.835414,pass,Intent target=triton; source corpus=cutile. 
-chunk_gated_delta,B2-S2048-H8-K128-V128-C64-bf16,,,,generated_physical_program_verification_failed,"Intent Triton compiler failed with exit code 4:; loc(""<stdin>"":121:18): error: 'intent_gpu.reduce' op padded reduction has no exact logical member traversal; source=%332 = ""intent_gpu.unary""(%331) <{approximate = false, flush_to_zero = false, operator_kind = #intent.unary_operator<abs>}> {intent_gpu.origin = 108 : i64} : (!intent_gpu.fragment<f32, [#intent_gpu.expr<0, 64, """", []>, #intent_gpu.expr<0, 64, """", []>], [#intent_gpu.axis_map<18, 0, 7, 0, false>, #intent_gpu.axis_map<18, 0, 7, 1, false>], 1, 1>) -> !intent_gpu.fragment<f32, [#intent_gpu.expr<0, 64, """", []>, #intent_gpu.expr<0, 64, """", []>], [#intent_gpu.axis_map<18, 0, 7, 0, false>, #intent_gpu.axis_map<18, 0, 7, 1, false>], 1, 1>; axis=1"
+recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,1.719680,0.936944,1.835414,pass,Intent target=triton; source corpus=cutile.
+chunk_gated_delta,B2-S2048-H8-K128-V128-C64-bf16,0.210944,1.554744,0.135678,pass,Intent target=triton; source corpus=cutile. 同算法；generated 使用 BF16 矩阵输入、FP32 累加与状态，source 使用 TF32 矩阵输入
 nvfp4_quantize,8192x4096-block16-bf16,0.060080,0.059136,1.015963,pass,Intent target=triton; source corpus=cutile. 同算法、group16；CUDA Graph 重放下的算子 GPU 执行延迟，不含编译、调优与输出分配

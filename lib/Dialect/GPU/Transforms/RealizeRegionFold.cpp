@@ -175,9 +175,17 @@ LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
       auto rangeType = cast<FragmentType>(range.getResult().getType());
       auto blockedRange =
           replaceSliceAxis(rangeType, 0, sliceExtent, segmentMapping);
+      Value logicalStart = range.getLogicalStart();
+      Value logicalStop = range.getLogicalStop();
+      if (fullSegment && isUnitExtent(sliceExtent)) {
+        logicalStart = start;
+        logicalStop = builder.create<BinaryOp>(
+            location, builder.getIndexType(), start, range.getStep(),
+            BinaryOperator::Add);
+      }
       Value value = builder.create<MakeRangeOp>(
           location, blockedRange, start, segment, range.getStep(),
-          range.getLogicalStart(), range.getLogicalStop(),
+          logicalStart, logicalStop,
           segmentMapping.getSourceId(), segmentMapping.getSourceAxis(),
           segmentMapping.getDerived());
       for (StringRef name :
@@ -2602,6 +2610,18 @@ LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
   return success();
 }
 
+LogicalResult alignInlinedRegionValues(func::FuncOp kernel) {
+  // Helper inlining substitutes physical extents throughout the cloned graph.
+  // Close the affected value relations before verifying this transformation.
+  if (failed(alignReductionResultRelations(kernel)) ||
+      failed(alignReductionIdentityRelations(kernel)) ||
+      failed(alignAggregateValueRelations(kernel)) ||
+      failed(alignPointwiseValueRelations(kernel)) ||
+      failed(alignReductionYieldRelations(kernel)))
+    return failure();
+  return success();
+}
+
 } // namespace
 
 LogicalResult realizeRegionFolds(ModuleOp module) {
@@ -2614,7 +2634,7 @@ LogicalResult realizeRegionFolds(ModuleOp module) {
   for (RegionFoldOp fold : folds)
     if (fold->getBlock() && failed(realizeFold(fold, kernel)))
       return failure();
-  return success();
+  return folds.empty() ? success() : alignInlinedRegionValues(kernel);
 }
 
 LogicalResult realizeRegionScans(ModuleOp module) {
@@ -2627,17 +2647,7 @@ LogicalResult realizeRegionScans(ModuleOp module) {
   for (RegionScanOp scan : scans)
     if (scan->getBlock() && failed(realizeScan(scan, kernel)))
       return failure();
-  // Helper inlining substitutes segment-local physical extents throughout the
-  // cloned graph.  Close every affected value relation here: a realized scan
-  // is a complete physical program transformation, not an invalid intermediate
-  // that a later, unrelated pipeline stage is expected to repair.
-  if (failed(alignReductionResultRelations(kernel)) ||
-      failed(alignReductionIdentityRelations(kernel)) ||
-      failed(alignAggregateValueRelations(kernel)) ||
-      failed(alignPointwiseValueRelations(kernel)) ||
-      failed(alignReductionYieldRelations(kernel)))
-    return failure();
-  return success();
+  return alignInlinedRegionValues(kernel);
 }
 
 } // namespace intent::gpu
