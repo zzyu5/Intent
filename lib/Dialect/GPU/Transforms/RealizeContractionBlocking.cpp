@@ -1997,8 +1997,9 @@ bool collapseMultiReductionContract(ContractOp contract) {
         if (!isZeroScalar(range.getStart()) ||
             !isZeroScalar(range.getLogicalStart()) || !isUnitStepRange(range) ||
             !queryLaunchExpression(range.getLogicalStop()) ||
-            (!realization.constructionScalarSeed &&
-             !samePhysicalScalarExpression(range.getExtent(), range.getLogicalStop())))
+            realization.constructionScalarSeed ||
+            !samePhysicalScalarExpression(range.getExtent(),
+                                          range.getLogicalStop()))
           return false;
         paired.push_back(range);
       }
