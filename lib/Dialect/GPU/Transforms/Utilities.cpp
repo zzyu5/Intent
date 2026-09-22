@@ -25,6 +25,75 @@ using namespace mlir;
 
 namespace intent::gpu {
 
+Type scalarCallbackType(Type type) {
+  if (auto fragment = dyn_cast<FragmentType>(type))
+    return fragment.getElementType();
+  if (auto record = dyn_cast<RecordType>(type)) {
+    SmallVector<Attribute> fields;
+    for (Attribute field : record.getFieldTypes())
+      fields.push_back(TypeAttr::get(
+          scalarCallbackType(cast<TypeAttr>(field).getValue())));
+    return RecordType::get(type.getContext(), record.getFieldNames(),
+                           ArrayAttr::get(type.getContext(), fields),
+                           record.getOwner());
+  }
+  return type;
+}
+
+LogicalResult scalarizeElementwiseCallback(Region &source, Region &target) {
+  if (!target.empty())
+    return target.getParentOp()->emitOpError(
+        "scalar callback target region must be empty");
+  Block &body = source.front();
+  for (Operation &nested : body) {
+    for (Value operand : nested.getOperands())
+      if (operand.getParentBlock() != &body)
+        return nested.emitOpError(
+            "native collective callback cannot capture enclosing values");
+    if (!isa<arith::ConstantOp, SplatOp, BroadcastOp, UnaryOp, BinaryOp,
+             CompareOp, SelectOp, CastOp, BitcastOp, MakeRecordOp, ExtractOp,
+             YieldOp>(nested))
+      return nested.emitOpError(
+          "native collective requires an elementwise scalarizable combine");
+    if (auto broadcast = dyn_cast<BroadcastOp>(nested)) {
+      auto sourceType = dyn_cast<FragmentType>(broadcast.getValue().getType());
+      if (sourceType) {
+        auto targetType = broadcast.getResult().getType();
+        auto projection = queryAxisProjection(sourceType, targetType);
+        if (sourceType.getShape() != targetType.getShape() ||
+            !projection.isExact() ||
+            llvm::any_of(llvm::enumerate(projection.targetToSource),
+                         [](auto pair) {
+                           return !pair.value() ||
+                                  *pair.value() != pair.index();
+                         }))
+          return broadcast.emitOpError(
+              "non-identity fragment broadcast in a collective requires prior lane-wise legalization");
+      }
+    }
+  }
+
+  Block *scalarBody = new Block();
+  target.push_back(scalarBody);
+  IRMapping mapping;
+  for (BlockArgument argument : body.getArguments())
+    mapping.map(argument, scalarBody->addArgument(
+                             scalarCallbackType(argument.getType()),
+                             argument.getLoc()));
+  OpBuilder builder(target.getContext());
+  builder.setInsertionPointToEnd(scalarBody);
+  for (Operation &nested : body) {
+    if (isa<SplatOp, BroadcastOp>(nested)) {
+      mapping.map(nested.getResult(0), mapping.lookup(nested.getOperand(0)));
+      continue;
+    }
+    Operation *cloned = builder.clone(nested, mapping);
+    for (Value result : cloned->getResults())
+      result.setType(scalarCallbackType(result.getType()));
+  }
+  return success();
+}
+
 bool variesWithIteration(Value value, scf::ForOp loop,
                         llvm::DenseMap<Value, bool> &known) {
   if (loop.isDefinedOutsideOfLoop(value))
@@ -3466,7 +3535,10 @@ static void retargetExtent(Value root, AxisSelector selects,
               bool unit = oldExtent.getKind() ==
                               static_cast<uint32_t>(PhysicalExprKind::Constant) &&
                           oldExtent.getValue() <= 1;
-              if (selects(inputMap) && !selects(targetMap) && !unit &&
+              bool sameLogicalExtent = inputMap.getDimensionId() > 0 &&
+                  inputMap.getDimensionId() == targetMap.getDimensionId();
+              if (selects(inputMap) && !selects(targetMap) &&
+                  (!unit || sameLogicalExtent) &&
                   !isIntroducedReshapeUnitAxis(value, *sourceAxis) &&
                   oldExtent == target.getShape()[targetAxis] &&
                   target.getShape()[targetAxis] != extent) {

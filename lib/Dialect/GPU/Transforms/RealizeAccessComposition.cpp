@@ -1190,6 +1190,10 @@ FailureOr<bool> composeIdentityFragmentGather(GatherOp gather) {
     PhysicalSourceAxis physicalSource = sourceAxisIdentity(expected);
     PhysicalAxisProjection resultAxis =
         queryFragmentAxis(result, physicalSource);
+    // Coordinate broadcasting does not change the ordinal of a full slice.
+    // Inspect the range before its singleton axes were inserted.
+    while (auto broadcast = coordinate.getDefiningOp<BroadcastOp>())
+      coordinate = broadcast.getValue();
     PhysicalAxisProjection coordinateAxis =
         queryCoordinateIndex(ValueRange{coordinate}, physicalSource);
     auto resultMapping =
@@ -2754,6 +2758,13 @@ LogicalResult realizeAccessComposition(ModuleOp module) {
     for (GatherOp gather : gathers) {
       if (!gather->getBlock())
         continue;
+      FailureOr<bool> identity = composeIdentityFragmentGather(gather);
+      if (failed(identity))
+        return failure();
+      if (*identity) {
+        changed = true;
+        continue;
+      }
       FailureOr<bool> range = composeRangeGather(gather);
       if (failed(range))
         return failure();
@@ -2772,13 +2783,6 @@ LogicalResult realizeAccessComposition(ModuleOp module) {
       if (failed(pointwise))
         return failure();
       if (*pointwise) {
-        changed = true;
-        continue;
-      }
-      FailureOr<bool> identity = composeIdentityFragmentGather(gather);
-      if (failed(identity))
-        return failure();
-      if (*identity) {
         changed = true;
         continue;
       }

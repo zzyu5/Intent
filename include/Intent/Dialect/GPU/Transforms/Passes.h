@@ -18,6 +18,10 @@
 
 namespace intent::gpu {
 
+mlir::Type scalarCallbackType(mlir::Type type);
+mlir::LogicalResult scalarizeElementwiseCallback(mlir::Region &source,
+                                                 mlir::Region &target);
+
 struct ReplayMaterializationOptions {
   PhysicalReplayScope scope = PhysicalReplayScope::ValueGraph;
   bool allowAccesses = true;
@@ -150,6 +154,10 @@ mlir::FailureOr<mlir::Value> materializeRetainedSlice(
 mlir::LogicalResult realizeRegionFolds(mlir::ModuleOp module);
 mlir::LogicalResult realizeRegionScans(mlir::ModuleOp module);
 mlir::LogicalResult realizeContractionBlocking(mlir::ModuleOp module);
+mlir::LogicalResult normalizeMatrixContractShapes(mlir::func::FuncOp kernel);
+void foldExactConstantDivisions(mlir::func::FuncOp kernel);
+mlir::LogicalResult materializeProgramBuffers(mlir::ModuleOp module);
+mlir::LogicalResult lowerInvocationWorkspaces(mlir::ModuleOp module);
 mlir::LogicalResult orientLoopContractions(mlir::ModuleOp module);
 mlir::LogicalResult realizeVectorContractions(mlir::ModuleOp module);
 mlir::LogicalResult normalizeContractionSources(mlir::ModuleOp module);

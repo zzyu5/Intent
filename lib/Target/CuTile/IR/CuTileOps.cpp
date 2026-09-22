@@ -471,7 +471,6 @@ LogicalResult MMAOp::verify() {
   for (unsigned axis = 0; valid && axis + 2 < rank; ++axis)
     valid = lhs.getShape()[axis] == rhs.getShape()[axis] &&
             lhs.getShape()[axis] == result.getShape()[axis] &&
-            sameLogicalAxis(lhs, axis, rhs, axis) &&
             sameLogicalAxis(lhs, axis, result, axis);
   if (valid) {
     const unsigned matrixAxis = rank - 2;
@@ -481,7 +480,6 @@ LogicalResult MMAOp::verify() {
             rhs.getShape()[matrixAxis + 1] ==
                 result.getShape()[matrixAxis + 1] &&
             sameLogicalAxis(lhs, matrixAxis, result, matrixAxis) &&
-            sameLogicalAxis(lhs, matrixAxis + 1, rhs, matrixAxis) &&
             sameLogicalAxis(rhs, matrixAxis + 1, result, matrixAxis + 1);
   }
   if (!valid) {
@@ -541,17 +539,27 @@ LogicalResult ScaledMMAOp::verify() {
 }
 
 LogicalResult ReduceOp::verify() {
-  if (static_cast<size_t>(getAxis()) >=
-      getSource().getType().getShape().size())
+  if (getReverse())
+    return emitOpError("native reduction does not reverse logical order");
+  if (!getKind())
+    return gpu::verifyScalarCollective(getOperation(), getInputs(), getResults(),
+                                      getCombine(), getSourceCount(), getAxis(),
+                                      false);
+  auto source = getInputs().size() == 1
+                    ? dyn_cast<gpu::FragmentType>(getInputs().front().getType())
+                    : gpu::FragmentType();
+  if (getSourceCount() != 1 || getNumResults() != 1 || !source ||
+      !getCombine().empty() ||
+      static_cast<size_t>(getAxis()) >= source.getShape().size())
     return emitOpError("has an invalid cuTile native reduction axis/kind");
-  switch (getKind()) {
+  switch (*getKind()) {
   case BinaryOperator::Add:
   case BinaryOperator::MaximumNum:
   case BinaryOperator::MinimumNum:
     return success();
   case BinaryOperator::LogicalOr:
   case BinaryOperator::LogicalAnd:
-    return elementType(getResult().getType()).isInteger(1)
+    return elementType(getResult(0).getType()).isInteger(1)
                ? success()
                : emitOpError("logical reduction kind requires an i1 result");
   default:
@@ -560,11 +568,19 @@ LogicalResult ReduceOp::verify() {
 }
 
 LogicalResult ScanOp::verify() {
-  if (static_cast<size_t>(getAxis()) >=
-          getSource().getType().getShape().size() ||
-      getKind() != BinaryOperator::Add)
+  if (!getKind())
+    return gpu::verifyScalarCollective(getOperation(), getInputs(), getResults(),
+                                      getCombine(), getSourceCount(), getAxis(),
+                                      true);
+  auto source = getInputs().size() == 1
+                    ? dyn_cast<gpu::FragmentType>(getInputs().front().getType())
+                    : gpu::FragmentType();
+  if (getSourceCount() != 1 || getNumResults() != 1 || !source ||
+      !getCombine().empty() ||
+      static_cast<size_t>(getAxis()) >= source.getShape().size() ||
+      *getKind() != BinaryOperator::Add)
     return emitOpError("cuTile native scan currently requires additive cumsum");
-  return getResult().getType() == getSource().getType()
+  return getResult(0).getType() == source
              ? success()
              : emitOpError("scan must preserve the physical tile schema");
 }

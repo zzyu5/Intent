@@ -251,12 +251,33 @@ gpu::FragmentType transposeRankTwo(gpu::FragmentType source) {
       source.getOwner());
 }
 
+bool isUnitExtent(Attribute attribute);
+
 FailureOr<SmallVector<unsigned>>
 coordinateTargetAxes(gpu::FragmentType source, gpu::FragmentType target) {
   if (source.getOwner() != target.getOwner() ||
       source.getShape().size() > target.getShape().size())
     return failure();
   SmallVector<unsigned> result(source.getShape().size());
+  bool positional = source.getShape().size() == target.getShape().size();
+  for (unsigned axis = 0; positional && axis < source.getShape().size(); ++axis) {
+    if (isUnitExtent(source.getShape()[axis]))
+      continue;
+    auto left = cast<gpu::AxisMapAttr>(source.getAxisMaps()[axis]);
+    auto right = cast<gpu::AxisMapAttr>(target.getAxisMaps()[axis]);
+    positional = gpu::sourceAxisIdentity(left) == gpu::sourceAxisIdentity(right) ||
+                 (left.getDimensionId() > 0 &&
+                  left.getDimensionId() == right.getDimensionId());
+  }
+  if (positional) {
+    auto projection = gpu::queryBroadcastProjection(source, target);
+    if (projection.isExact()) {
+      for (auto [axis, origin] : llvm::enumerate(projection.targetToSource))
+        if (origin)
+          result[*origin] = axis;
+      return result;
+    }
+  }
   SmallVector<unsigned> unitAxes;
   SmallVector<bool> usedTargetAxes(target.getShape().size(), false);
   for (auto [sourceIndex, sourceAttribute] :
@@ -274,6 +295,7 @@ coordinateTargetAxes(gpu::FragmentType source, gpu::FragmentType target) {
          llvm::enumerate(target.getAxisMaps())) {
       auto targetMap = cast<gpu::AxisMapAttr>(targetAttribute);
       if (usedTargetAxes[index] ||
+          source.getShape()[sourceIndex] != target.getShape()[index] ||
           sourceMap.getSourceId() != targetMap.getSourceId() ||
           sourceMap.getSourceAxis() != targetMap.getSourceAxis() ||
           sourceMap.getDimensionId() != targetMap.getDimensionId() ||
@@ -282,6 +304,25 @@ coordinateTargetAxes(gpu::FragmentType source, gpu::FragmentType target) {
       if (targetIndex)
         return failure();
       targetIndex = index;
+    }
+    if (!targetIndex && sourceMap.getDimensionId() > 0) {
+      unsigned occurrences = 0;
+      for (auto [axis, mapping] : llvm::enumerate(source.getAxisMaps()))
+        occurrences += cast<gpu::AxisMapAttr>(mapping).getDimensionId() ==
+                           sourceMap.getDimensionId() &&
+                       source.getShape()[axis] == source.getShape()[sourceIndex];
+      if (occurrences != 1)
+        return failure();
+      for (auto [axis, mapping] : llvm::enumerate(target.getAxisMaps())) {
+        if (usedTargetAxes[axis] ||
+            cast<gpu::AxisMapAttr>(mapping).getDimensionId() !=
+                sourceMap.getDimensionId() ||
+            target.getShape()[axis] != source.getShape()[sourceIndex])
+          continue;
+        if (targetIndex)
+          return failure();
+        targetIndex = axis;
+      }
     }
     if (!targetIndex)
       return failure();
@@ -425,6 +466,14 @@ Value uniformScalarFill(Value fill) {
     }
     if (auto broadcast = fill.getDefiningOp<gpu::BroadcastOp>()) {
       fill = broadcast.getValue();
+      continue;
+    }
+    if (auto transpose = fill.getDefiningOp<gpu::TransposeOp>()) {
+      fill = transpose.getValue();
+      continue;
+    }
+    if (auto reshape = fill.getDefiningOp<gpu::ReshapeOp>()) {
+      fill = reshape.getValue();
       continue;
     }
     if (auto select = fill.getDefiningOp<gpu::SelectOp>()) {
@@ -1361,9 +1410,16 @@ std::optional<BinaryOperator> nativeCombineKind(Region &region) {
   if (*kind == BinaryOperator::Add || *kind == BinaryOperator::MaximumNum ||
       *kind == BinaryOperator::MinimumNum)
     return kind;
-  auto result =
-      dyn_cast<gpu::FragmentType>(region.front().getArgument(0).getType());
-  if (result && result.getElementType().isInteger(1)) {
+  Type element = region.front().getArgument(0).getType();
+  if (auto fragment = dyn_cast<gpu::FragmentType>(element))
+    element = fragment.getElementType();
+  if (element.isIntOrIndex()) {
+    if (*kind == BinaryOperator::Maximum)
+      return BinaryOperator::MaximumNum;
+    if (*kind == BinaryOperator::Minimum)
+      return BinaryOperator::MinimumNum;
+  }
+  if (element.isInteger(1)) {
     if (*kind == BinaryOperator::LogicalOr)
       return BinaryOperator::LogicalOr;
     if (*kind == BinaryOperator::LogicalAnd)
@@ -1428,7 +1484,7 @@ bool isZeroFill(Value value) {
     if (cast.getValue().getType().isIntOrIndex() &&
         cast.getResult().getType().isIntOrIndex())
       return isZeroFill(cast.getValue());
-  Attribute constant = scalarConstant(value);
+  Attribute constant = scalarConstant(scalar ? scalar : value);
   if (!constant)
     return false;
   if (auto integer = dyn_cast<IntegerAttr>(constant))
@@ -1585,12 +1641,6 @@ LogicalResult verifyScan(gpu::ScanOp scan) {
       return scan.emitOpError(
           "cuTile scan identity must be an explicit scalar constant of the source dtype");
   }
-  for (Operation &operation : scan.getCombine().front())
-    if (!isa<arith::ConstantOp, gpu::UnaryOp, gpu::BinaryOp, gpu::CompareOp,
-             gpu::SelectOp, gpu::CastOp, gpu::BitcastOp, gpu::MakeRecordOp,
-             gpu::ExtractOp, gpu::YieldOp>(operation))
-      return scan.emitOpError(
-          "cuTile scan callback lowering requires scalar elementwise operations");
   return success();
 }
 
@@ -1983,21 +2033,23 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
                   reduce.getIdentityCount() == 1 &&
                   reduce.getCaptureCount() == 0 &&
                   reduce.getAxes().size() == 1 &&
-                  reduce.getNumResults() == 1 && kind.has_value() &&
-                  isNativeReductionIdentity(
-                      *kind, reduce.getInputs()[reduce.getSourceCount()]);
+                  reduce.getNumResults() == 1 && kind.has_value();
     if (native) {
+      // Shared realization has already filled inactive lanes with the declared
+      // identity. As with tl.reduce, the native tree consumes those values;
+      // it does not require that identity to be a compile-time literal.
       auto source =
           dyn_cast<gpu::FragmentType>(reduce.getInputs().front().getType());
       if (!source)
         return reduce.emitOpError("cuTile native reduce source must be a tile");
       OpBuilder builder(reduce);
       auto replacement = builder.create<ReduceOp>(
-          reduce.getLoc(), reduce.getResultTypes().front(),
-          reduce.getInputs().front(), reduce.getAxes().front(), *kind);
+          reduce.getLoc(), reduce.getResultTypes(),
+          ValueRange{reduce.getInputs().front()}, 1, reduce.getAxes().front(),
+          false, BinaryOperatorAttr::get(kernel.getContext(), *kind));
       if (Attribute origin = reduce->getAttr(gpu::originAttr))
         replacement->setAttr(gpu::originAttr, origin);
-      reduce.getResults().front().replaceAllUsesWith(replacement.getResult());
+      reduce.replaceAllUsesWith(replacement.getResults());
       reduce.erase();
       continue;
     }
@@ -2028,11 +2080,13 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
           location, sourcePredicateType, reduce.getInputs().front(),
           reduce.getInputs().front(), ComparePredicate::Ne);
       auto anyNan = builder.create<ReduceOp>(
-          location, resultPredicateType, isNan.getResult(),
-          reduce.getAxes().front(), BinaryOperator::LogicalOr);
+          location, TypeRange{resultPredicateType}, ValueRange{isNan.getResult()},
+          1, reduce.getAxes().front(), false,
+          BinaryOperatorAttr::get(kernel.getContext(), BinaryOperator::LogicalOr));
       auto numericMaximum = builder.create<ReduceOp>(
-          location, resultType, reduce.getInputs().front(),
-          reduce.getAxes().front(), BinaryOperator::MaximumNum);
+          location, TypeRange{resultType}, ValueRange{reduce.getInputs().front()},
+          1, reduce.getAxes().front(), false,
+          BinaryOperatorAttr::get(kernel.getContext(), BinaryOperator::MaximumNum));
       auto floatType = cast<FloatType>(sourceType.getElementType());
       auto nan = builder.create<arith::ConstantOp>(
           location, floatType,
@@ -2043,8 +2097,8 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
       if (isa<gpu::FragmentType>(resultType))
         nanValue = builder.create<gpu::SplatOp>(location, resultType, nanValue);
       auto replacement = builder.create<gpu::SelectOp>(
-          location, resultType, anyNan.getResult(), nanValue,
-          numericMaximum.getResult());
+          location, resultType, anyNan.getResult(0), nanValue,
+          numericMaximum.getResult(0));
       if (Attribute origin = reduce->getAttr(gpu::originAttr))
         replacement->setAttr(gpu::originAttr, origin);
       reduce.getResults().front().replaceAllUsesWith(replacement.getResult());
@@ -2071,22 +2125,41 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
           diagnostic << ", producer=" << producer->getName();
         return failure();
       }
+    OpBuilder builder(reduce);
+    auto replacement = builder.create<ReduceOp>(
+        reduce.getLoc(), reduce.getResultTypes(), reduce.getInputs(),
+        reduce.getSourceCount(), reduce.getAxes().front(), false,
+        BinaryOperatorAttr());
+    if (failed(gpu::scalarizeElementwiseCallback(reduce.getCombine(),
+                                                 replacement.getCombine())))
+      return failure();
+    if (Attribute origin = reduce->getAttr(gpu::originAttr))
+      replacement->setAttr(gpu::originAttr, origin);
+    reduce.replaceAllUsesWith(replacement.getResults());
+    reduce.erase();
   }
 
   for (gpu::ScanOp scan : scans) {
     if (failed(verifyScan(scan)))
       return failure();
     std::optional<BinaryOperator> kind = nativeCombineKind(scan.getCombine());
-    if (scan.getSourceCount() != 1 || !kind || *kind != BinaryOperator::Add ||
-        !isNativeReductionIdentity(*kind, scan.getInputs()[1]))
-      continue;
+    bool native = scan.getSourceCount() == 1 && kind &&
+                  *kind == BinaryOperator::Add &&
+                  isNativeReductionIdentity(*kind, scan.getInputs()[1]);
     OpBuilder builder(scan);
     auto replacement = builder.create<ScanOp>(
-        scan.getLoc(), cast<gpu::FragmentType>(scan.getResultTypes().front()),
-        scan.getInputs().front(), scan.getAxis(), *kind, scan.getReverse());
+        scan.getLoc(), scan.getResultTypes(),
+        native ? scan.getInputs().take_front(1) : scan.getInputs(),
+        scan.getSourceCount(), scan.getAxis(), scan.getReverse(),
+        native ? BinaryOperatorAttr::get(kernel.getContext(), *kind)
+               : BinaryOperatorAttr());
+    if (!native &&
+        failed(gpu::scalarizeElementwiseCallback(scan.getCombine(),
+                                                replacement.getCombine())))
+      return failure();
     if (Attribute origin = scan->getAttr(gpu::originAttr))
       replacement->setAttr(gpu::originAttr, origin);
-    scan.getResults().front().replaceAllUsesWith(replacement.getResult());
+    scan.replaceAllUsesWith(replacement.getResults());
     scan.erase();
   }
 
@@ -2645,7 +2718,7 @@ LogicalResult verifyClosedConfigs(func::FuncOp kernel) {
 
 bool isCuTileScalarType(Type type) {
   if (type.isIndex() ||
-      isa<Float16Type, BFloat16Type, Float32Type, Float8E4M3FNType,
+      isa<Float16Type, BFloat16Type, Float32Type, Float64Type, Float8E4M3FNType,
           Float8E5M2Type>(type))
     return true;
   auto integer = dyn_cast<IntegerType>(type);
@@ -2707,7 +2780,7 @@ ArrayAttr arrayIndexTileBounds(func::FuncOp kernel) {
   for (BlockArgument argument : kernel.getArguments())
     if (auto view = dyn_cast<gpu::ViewType>(argument.getType()))
       bounds[argument.getArgNumber()].assign(view.getRank(), one);
-  bool hasNativeAccess = false;
+  bool hasArrayAccess = false;
   auto result = kernel.walk([&](Operation *operation) {
     Value resource;
     gpu::FragmentType tile;
@@ -2724,13 +2797,23 @@ ArrayAttr arrayIndexTileBounds(func::FuncOp kernel) {
     } else if (auto store = dyn_cast<TileStoreOp>(operation)) {
       resource = store.getResource();
       tile = store.getValue().getType();
+    } else if (isa<ScalarLoadOp, ScalarStoreOp, GatherLoadOp, ScatterStoreOp>(operation)) {
+      // Gather/scatter use element coordinates.  Their active coordinates must
+      // already be in bounds before narrowing the array's index arithmetic.
+      if (!operation->hasAttr("in_bounds"))
+        return WalkResult::interrupt();
+      resource = operation->getOperand(0);
+    } else if (isa<AtomicRMWOp>(operation)) {
+      return WalkResult::interrupt();
     } else {
       return WalkResult::advance();
     }
-    hasNativeAccess = true;
+    hasArrayAccess = true;
     auto argument = dyn_cast<BlockArgument>(resource);
     if (!argument || argument.getOwner() != &kernel.getBody().front())
       return WalkResult::interrupt();
+    if (!tile)
+      return WalkResult::advance();
     auto &viewBounds = bounds[argument.getArgNumber()];
     if (tile.getShape().size() != viewBounds.size())
       return WalkResult::interrupt();
@@ -2747,7 +2830,7 @@ ArrayAttr arrayIndexTileBounds(func::FuncOp kernel) {
     }
     return WalkResult::advance();
   });
-  if (result.wasInterrupted() || !hasNativeAccess)
+  if (result.wasInterrupted() || !hasArrayAccess)
     return {};
   SmallVector<Attribute> encoded;
   for (const auto &shape : bounds)
@@ -2896,7 +2979,8 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
   };
   WalkResult result = kernel.walk([&](Operation *operation) {
     if (auto unary = dyn_cast<gpu::UnaryOp>(operation);
-        unary && (unary.getOperatorKind() == UnaryOperator::Lgamma ||
+        unary && (unary.getOperatorKind() == UnaryOperator::Erf ||
+                  unary.getOperatorKind() == UnaryOperator::Lgamma ||
                   unary.getOperatorKind() == UnaryOperator::Log1p ||
                   unary.getOperatorKind() == UnaryOperator::Erfc ||
                   unary.getOperatorKind() == UnaryOperator::I0)) {
@@ -2939,9 +3023,6 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
         return WalkResult::interrupt();
       }
     }
-    if (auto scan = dyn_cast<gpu::ScanOp>(operation))
-      if (failed(verifyScan(scan)))
-        return WalkResult::interrupt();
     if (auto loop = dyn_cast<scf::ForOp>(operation))
       if (!loop.getInductionVar().getType().isSignlessInteger(32)) {
         loop.emitOpError("cuTile native for requires an i32 induction variable");
@@ -2961,7 +3042,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     }
     if (isa<ArrayViewOp, TileLoadOp, TileStoreOp, ScalarLoadOp, ScalarStoreOp, GatherLoadOp,
             ScatterStoreOp, AtomicRMWOp, ExtractOp, MMAOp, ScaledMMAOp,
-            ReduceOp, ScanOp, gpu::ReduceOp, gpu::ScanOp, gpu::ParameterOp,
+            ReduceOp, ScanOp, gpu::ParameterOp,
             gpu::PhysicalExprOp, gpu::ProgramIdOp, gpu::WorksetCoordinateOp,
             gpu::DelinearizeOp,
             gpu::DimOp, gpu::RangeOp, gpu::RangeBoundOp, gpu::MakeRangeOp,
@@ -3281,7 +3362,14 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
+  if (failed(gpu::normalizeMatrixContractShapes(*kernel)) ||
+      failed(gpu::verifyGPUProgram(module)))
+    return failure();
   materializeUnitOwnershipExtents(*kernel);
+  if (failed(gpu::materializeProgramBuffers(module)) ||
+      failed(gpu::lowerInvocationWorkspaces(module)))
+    return failure();
+  gpu::foldExactConstantDivisions(*kernel);
   if (failed(formNativeTiles(*kernel, profiles)))
     return failure();
   if (failed(refineMMALoops(module)))

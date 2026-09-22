@@ -2853,11 +2853,23 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     if (inputExtent.getKind() ==
             static_cast<uint32_t>(PhysicalExprKind::Constant) &&
         inputExtent.getValue() == 1 && inputExtent != outputExtent) {
-      PhysicalRangeFact inputRanges = axisRanges(broadcast.getValue(), *inputAxis);
+      PhysicalRangeFact inputRanges;
+      inputRanges.state = PhysicalFactState::Exact;
+      collectAxisRanges(broadcast.getValue(), *inputAxis, inputRanges, visited);
       if (inputRanges.state != PhysicalFactState::Unknown &&
           inputRanges.blockers.empty() &&
           llvm::all_of(inputRanges.roots, isProvablySingletonLogicalRange))
         return;
+      if (result.state != PhysicalFactState::Unknown &&
+          inputRanges.state != PhysicalFactState::Exact)
+        result.state = inputRanges.state;
+      for (MakeRangeOp root : inputRanges.roots)
+        appendUnique(result.roots, root);
+      for (Operation *access : inputRanges.accesses)
+        appendUnique(result.accesses, access);
+      for (Operation *blocker : inputRanges.blockers)
+        appendUnique(result.blockers, blocker);
+      return;
     }
     collectAxisRanges(broadcast.getValue(), *inputAxis, result, visited);
     return;

@@ -2285,295 +2285,6 @@ bool isAddCombine(gpu::ScatterReduceOp scatter) {
          BinaryOperator::Add;
 }
 
-LogicalResult legalizeContractShapes(func::FuncOp kernel) {
-  auto [nextSource, nextDimension] = gpu::nextPhysicalAxisIdentities(kernel);
-  SmallVector<gpu::ContractOp> contracts;
-  kernel.walk([&](gpu::ContractOp contract) { contracts.push_back(contract); });
-  for (gpu::ContractOp contract : contracts) {
-    auto lhs = contract.getLhs().getType();
-    auto rhs = contract.getRhs().getType();
-    if (contract.getLhsReductionAxes().size() != 1 ||
-        contract.getRhsReductionAxes().size() != 1 ||
-        (lhs.getShape().size() <= 2 && rhs.getShape().size() <= 2))
-      continue;
-    ArrayRef<int64_t> lhsBatch = contract.getLhsBatchAxes();
-    ArrayRef<int64_t> rhsBatch = contract.getRhsBatchAxes();
-    unsigned batchRank = lhsBatch.size();
-    if (batchRank > 1)
-      continue;
-    auto canonicalBatch = [&](ArrayRef<int64_t> axes) {
-      return llvm::all_of(llvm::enumerate(axes), [](auto entry) {
-        return static_cast<int64_t>(entry.index()) == entry.value();
-      });
-    };
-    if (batchRank && lhs.getShape().size() == batchRank + 2 &&
-        rhs.getShape().size() == batchRank + 2 &&
-        canonicalBatch(lhsBatch) && canonicalBatch(rhsBatch) &&
-        contract.getLhsReductionAxes().front() == batchRank + 1 &&
-        contract.getRhsReductionAxes().front() == batchRank)
-      continue;
-    auto freeAxes = [](gpu::FragmentType type, int64_t reduction,
-                       ArrayRef<int64_t> batch) {
-      SmallVector<int64_t> axes;
-      for (int64_t axis = 0; axis < static_cast<int64_t>(type.getShape().size()); ++axis)
-        if (axis != reduction && !llvm::is_contained(batch, axis))
-          axes.push_back(axis);
-      return axes;
-    };
-    auto lhsFree = freeAxes(lhs, contract.getLhsReductionAxes().front(), lhsBatch);
-    auto rhsFree = freeAxes(rhs, contract.getRhsReductionAxes().front(), rhsBatch);
-    if (lhsFree.empty() || rhsFree.empty())
-      return contract.emitOpError("Triton matrix normalization requires free axes on both operands");
-    OpBuilder builder(contract);
-    Location location = contract.getLoc();
-    auto remap = [&](gpu::AxisMapAttr axis, unsigned position) {
-      return gpu::AxisMapAttr::get(kernel.getContext(), axis.getSourceId(),
-          axis.getSourceAxis(), axis.getDimensionId(), position, axis.getDerived());
-    };
-    auto collapsedAxis = [&](gpu::FragmentType type, ArrayRef<int64_t> axes,
-                             unsigned position) {
-      if (axes.size() == 1)
-        return remap(cast<gpu::AxisMapAttr>(type.getAxisMaps()[axes.front()]), position);
-      return gpu::AxisMapAttr::get(kernel.getContext(), nextSource++, 0,
-                                   nextDimension++, position, true);
-    };
-    auto product = [&](gpu::FragmentType type, ArrayRef<int64_t> axes) {
-      auto extent = cast<gpu::PhysicalExprAttr>(type.getShape()[axes.front()]);
-      for (int64_t axis : axes.drop_front())
-        extent = gpu::PhysicalExprAttr::get(kernel.getContext(),
-            static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
-            builder.getStringAttr(""),
-            builder.getArrayAttr({extent, type.getShape()[axis]}));
-      return extent;
-    };
-    auto makeType = [&](gpu::FragmentType source, ArrayRef<Attribute> shape,
-                        ArrayRef<Attribute> mappings) {
-      return gpu::FragmentType::get(kernel.getContext(), source.getElementType(),
-          builder.getArrayAttr(shape), builder.getArrayAttr(mappings),
-          source.getValidity(), source.getOwner());
-    };
-    auto transpose = [&](Value value, ArrayRef<int64_t> permutation) {
-      if (llvm::all_of(llvm::enumerate(permutation), [](auto entry) {
-            return static_cast<int64_t>(entry.index()) == entry.value();
-          }))
-        return value;
-      auto type = cast<gpu::FragmentType>(value.getType());
-      SmallVector<Attribute> shape, mappings;
-      for (auto [position, axis] : llvm::enumerate(permutation)) {
-        shape.push_back(type.getShape()[axis]);
-        mappings.push_back(remap(cast<gpu::AxisMapAttr>(type.getAxisMaps()[axis]), position));
-      }
-      return Value(builder.create<gpu::TransposeOp>(location,
-          makeType(type, shape, mappings), value, permutation));
-    };
-    auto reshape = [&](Value value, gpu::FragmentType target) -> FailureOr<Value> {
-      if (value.getType() == target) return value;
-      auto relation = gpu::inferReshapeReassociation(
-          cast<gpu::FragmentType>(value.getType()), target);
-      if (failed(relation)) return failure();
-      return Value(builder.create<gpu::ReshapeOp>(location, target, value, *relation));
-    };
-    auto originalResult = contract.getResult().getType();
-    SmallVector<int64_t> resultPermutation;
-    auto appendResultAxes = [&](gpu::FragmentType operand, ArrayRef<int64_t> axes) {
-      for (int64_t axis : axes) {
-        auto mapping = cast<gpu::AxisMapAttr>(operand.getAxisMaps()[axis]);
-        auto source = gpu::queryFragmentAxis(originalResult, gpu::sourceAxisIdentity(mapping));
-        auto dimension = gpu::queryFragmentDimension(originalResult, mapping.getDimensionId());
-        std::optional<int64_t> position;
-        if (source.isExact()) position = source.fragmentAxis;
-        else if (dimension.isExact()) position = dimension.fragmentAxis;
-        if (!position || llvm::is_contained(resultPermutation, *position))
-          return failure();
-        resultPermutation.push_back(*position);
-      }
-      return success();
-    };
-    if (failed(appendResultAxes(lhs, lhsBatch)) ||
-        failed(appendResultAxes(lhs, lhsFree)) ||
-        failed(appendResultAxes(rhs, rhsFree)) ||
-        resultPermutation.size() != originalResult.getShape().size())
-      return contract.emitOpError("Triton matrix free axes have no bijective result projection");
-    auto m = product(lhs, lhsFree);
-    auto n = product(rhs, rhsFree);
-    auto mAxis = collapsedAxis(lhs, lhsFree, batchRank);
-    auto nAxis = collapsedAxis(rhs, rhsFree, batchRank + 1);
-    int64_t lhsK = contract.getLhsReductionAxes().front();
-    int64_t rhsK = contract.getRhsReductionAxes().front();
-    SmallVector<int64_t> lhsPermutation(lhsBatch);
-    llvm::append_range(lhsPermutation, lhsFree);
-    lhsPermutation.push_back(lhsK);
-    SmallVector<int64_t> rhsPermutation(rhsBatch);
-    rhsPermutation.push_back(rhsK);
-    llvm::append_range(rhsPermutation, rhsFree);
-    SmallVector<Attribute> lhsShape, lhsMappings, rhsShape, rhsMappings;
-    SmallVector<Attribute> resultShape, resultMappings;
-    SmallVector<int64_t> matrixBatch;
-    for (auto [position, pair] : llvm::enumerate(llvm::zip(lhsBatch, rhsBatch))) {
-      auto [left, right] = pair;
-      lhsShape.push_back(lhs.getShape()[left]);
-      lhsMappings.push_back(remap(
-          cast<gpu::AxisMapAttr>(lhs.getAxisMaps()[left]), position));
-      rhsShape.push_back(rhs.getShape()[right]);
-      rhsMappings.push_back(remap(
-          cast<gpu::AxisMapAttr>(rhs.getAxisMaps()[right]), position));
-      int64_t resultAxis = resultPermutation[position];
-      resultShape.push_back(originalResult.getShape()[resultAxis]);
-      resultMappings.push_back(remap(
-          cast<gpu::AxisMapAttr>(originalResult.getAxisMaps()[resultAxis]), position));
-      matrixBatch.push_back(position);
-    }
-    llvm::append_range(lhsShape, ArrayRef<Attribute>{m, lhs.getShape()[lhsK]});
-    llvm::append_range(lhsMappings, ArrayRef<Attribute>{mAxis,
-        remap(cast<gpu::AxisMapAttr>(lhs.getAxisMaps()[lhsK]), batchRank + 1)});
-    llvm::append_range(rhsShape, ArrayRef<Attribute>{rhs.getShape()[rhsK], n});
-    llvm::append_range(rhsMappings, ArrayRef<Attribute>{
-        remap(cast<gpu::AxisMapAttr>(rhs.getAxisMaps()[rhsK]), batchRank), nAxis});
-    llvm::append_range(resultShape, ArrayRef<Attribute>{m, n});
-    llvm::append_range(resultMappings, ArrayRef<Attribute>{mAxis, nAxis});
-    auto matrixResult = makeType(originalResult, resultShape, resultMappings);
-    FailureOr<Value> matrixLhs = reshape(transpose(contract.getLhs(), lhsPermutation),
-        makeType(lhs, lhsShape, lhsMappings));
-    FailureOr<Value> matrixRhs = reshape(transpose(contract.getRhs(), rhsPermutation),
-        makeType(rhs, rhsShape, rhsMappings));
-    Value orderedAccumulator = transpose(contract.getAccumulator(), resultPermutation);
-    auto orderedResult = cast<gpu::FragmentType>(orderedAccumulator.getType());
-    FailureOr<Value> matrixAccumulator = reshape(orderedAccumulator, matrixResult);
-    if (failed(matrixLhs) || failed(matrixRhs) || failed(matrixAccumulator))
-      return contract.emitOpError("Triton matrix form has no exact row-major reshape");
-    contract->setOperands(ValueRange{*matrixLhs, *matrixRhs, *matrixAccumulator});
-    contract->setAttr("lhs_reduction_axes", builder.getDenseI64ArrayAttr({batchRank + 1}));
-    contract->setAttr("rhs_reduction_axes", builder.getDenseI64ArrayAttr({batchRank}));
-    contract->setAttr("lhs_batch_axes", builder.getDenseI64ArrayAttr(matrixBatch));
-    contract->setAttr("rhs_batch_axes", builder.getDenseI64ArrayAttr(matrixBatch));
-    contract.getResult().setType(matrixResult);
-    builder.setInsertionPointAfter(contract);
-    FailureOr<Value> restored = reshape(contract.getResult(), orderedResult);
-    if (failed(restored))
-      return contract.emitOpError("Triton matrix result has no inverse row-major reshape");
-    Operation *firstRestore = (*restored).getDefiningOp();
-    SmallVector<int64_t> inverse(resultPermutation.size());
-    for (auto [position, axis] : llvm::enumerate(resultPermutation))
-      inverse[axis] = position;
-    Value result = transpose(*restored, inverse);
-    contract.getResult().replaceUsesWithIf(result, [&](OpOperand &use) {
-      return use.getOwner() != firstRestore &&
-             use.getOwner() != result.getDefiningOp();
-    });
-  }
-  return success();
-}
-
-std::optional<llvm::APFloat>
-widenedConstantReciprocal(const llvm::APFloat &divisor) {
-  constexpr auto rounding = llvm::APFloat::rmNearestTiesToEven;
-  bool losesInfo = false;
-  llvm::APFloat denominator(divisor);
-  denominator.convert(llvm::APFloat::IEEEdouble(), rounding, &losesInfo);
-  llvm::APFloat inverse(1.0);
-  inverse.divide(denominator, rounding);
-
-  // The 53-bit reciprocal times the 24-bit divisor is exact in binary128.
-  llvm::APFloat error(inverse);
-  error.convert(llvm::APFloat::IEEEquad(), rounding, &losesInfo);
-  denominator.convert(llvm::APFloat::IEEEquad(), rounding, &losesInfo);
-  error.multiply(denominator, rounding);
-  llvm::APFloat one(1.0);
-  one.convert(llvm::APFloat::IEEEquad(), rounding, &losesInfo);
-  error.subtract(one, rounding);
-  error.clearSign();
-  llvm::APFloat bound(0x1p-54);
-  bound.convert(llvm::APFloat::IEEEquad(), rounding, &losesInfo);
-  if (error.compare(bound) == llvm::APFloat::cmpGreaterThan)
-    return std::nullopt;
-  // This bound keeps exact f32 midpoints (including subnormal ones) in their
-  // f64 RN interval. Other f32 quotients are farther from any midpoint than
-  // the reciprocal error plus f64 multiplication rounding can reach.
-  return inverse;
-}
-
-void foldExactConstantDivisions(func::FuncOp kernel) {
-  auto capabilities =
-      kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
-  bool fastFloat64 = capabilities.getSingleToDoublePrecisionPerfRatio() <= 2;
-  kernel.walk([&](gpu::BinaryOp binary) {
-    Type element = gpu::uniformElementType(binary.getResult().getType());
-    if ((binary.getOperatorKind() == BinaryOperator::FloorDivide ||
-         binary.getOperatorKind() == BinaryOperator::Remainder) &&
-        isa<IndexType, IntegerType>(element)) {
-      auto constant = dyn_cast_or_null<IntegerAttr>(
-          UniformValueAnalysis(gpu::describeUniformValue).evaluate(binary.getRhs()));
-      if (!constant || !constant.getValue().isStrictlyPositive() ||
-          !constant.getValue().isPowerOf2())
-        return;
-      bool remainder = binary.getOperatorKind() == BinaryOperator::Remainder;
-      int64_t value = remainder ? constant.getInt() - 1
-                                : constant.getValue().logBase2();
-      OpBuilder builder(binary);
-      Value operand = builder.create<arith::ConstantOp>(
-          binary.getLoc(), IntegerAttr::get(element, value));
-      if (auto fragment = dyn_cast<gpu::FragmentType>(binary.getRhs().getType()))
-        operand = builder.create<gpu::SplatOp>(binary.getLoc(), fragment, operand);
-      // Arithmetic right shift and a low-bit mask implement floor division
-      // and remainder by positive powers of two, including negative inputs.
-      // Expose these before native layout analysis; a truncation correction
-      // otherwise obscures the contiguous groups in reshaped addresses.
-      binary->setOperand(1, operand);
-      binary.setOperatorKind(remainder ? BinaryOperator::BitwiseAnd
-                                       : BinaryOperator::RightShift);
-      return;
-    }
-    if (binary.getOperatorKind() != BinaryOperator::TrueDivide ||
-        binary.getApproximate() || binary.getFlushToZero() ||
-        (!element.isF32() && !element.isF64()))
-      return;
-    auto constant = dyn_cast_or_null<FloatAttr>(
-        UniformValueAnalysis(gpu::describeUniformValue).evaluate(binary.getRhs()));
-    if (!constant || !constant.getValue().isNormal())
-      return;
-    llvm::APFloat inverse(constant.getValue().getSemantics());
-    bool widened = false;
-    if (!constant.getValue().getExactInverse(&inverse) || !inverse.isNormal()) {
-      if (!element.isF32() || !fastFloat64)
-        return;
-      auto reciprocal = widenedConstantReciprocal(constant.getValue());
-      if (!reciprocal)
-        return;
-      inverse = std::move(*reciprocal);
-      widened = true;
-    }
-    OpBuilder builder(binary);
-    Type computationElement = widened ? builder.getF64Type() : element;
-    auto computationType = [&](Type type) -> Type {
-      if (auto fragment = dyn_cast<gpu::FragmentType>(type))
-        return gpu::FragmentType::get(
-            kernel.getContext(), computationElement, fragment.getShape(),
-            fragment.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
-      return computationElement;
-    };
-    Value reciprocal = builder.create<arith::ConstantOp>(
-        binary.getLoc(), FloatAttr::get(computationElement, inverse));
-    if (auto fragment = dyn_cast<gpu::FragmentType>(binary.getRhs().getType()))
-      reciprocal = builder.create<gpu::SplatOp>(
-          binary.getLoc(), cast<gpu::FragmentType>(computationType(fragment)),
-          reciprocal);
-    Value lhs = binary.getLhs();
-    if (widened)
-      lhs = builder.create<gpu::CastOp>(binary.getLoc(),
-                                       computationType(lhs.getType()), lhs);
-    auto product = builder.create<gpu::BinaryOp>(
-        binary.getLoc(), computationType(binary.getType()), lhs, reciprocal,
-        BinaryOperator::Multiply);
-    Value result = product.getResult();
-    if (widened)
-      result = builder.create<gpu::CastOp>(binary.getLoc(), binary.getType(), result);
-    result.getDefiningOp()->setDiscardableAttrs(
-        llvm::to_vector(binary->getDiscardableAttrs()));
-    binary.getResult().replaceAllUsesWith(result);
-    binary.erase();
-  });
-}
-
 void canonicalizeBroadcastProjections(func::FuncOp kernel) {
   SmallVector<Value> pending;
   kernel.walk([&](gpu::ContractOp contract) {
@@ -2905,19 +2616,6 @@ LogicalResult verifyAccess(Operation *operation, Value resource,
   return success();
 }
 
-Type scalarCallbackType(Type type) {
-  if (auto fragment = dyn_cast<gpu::FragmentType>(type))
-    return fragment.getElementType();
-  if (auto record = dyn_cast<gpu::RecordType>(type)) {
-    SmallVector<Attribute> fields;
-    for (Attribute field : record.getFieldTypes())
-      fields.push_back(TypeAttr::get(scalarCallbackType(cast<TypeAttr>(field).getValue())));
-    return gpu::RecordType::get(type.getContext(), record.getFieldNames(),
-                                ArrayAttr::get(type.getContext(), fields), record.getOwner());
-  }
-  return type;
-}
-
 bool hasMapRelation(Type type, gpu::FragmentType result) {
   if (auto fragment = dyn_cast<gpu::FragmentType>(type))
     return fragment.getShape() == result.getShape() &&
@@ -3083,7 +2781,7 @@ void sinkSelectProducers(func::FuncOp kernel) {
       map->setAttr(gpu::originAttr, origin);
     SmallVector<Type> types;
     for (Value value : captures)
-      types.push_back(scalarCallbackType(value.getType()));
+      types.push_back(gpu::scalarCallbackType(value.getType()));
     Block *body = builder.createBlock(&map.getBody(), {}, types,
         SmallVector<Location>(types.size(), select.getLoc()));
     IRMapping mapping;
@@ -3101,11 +2799,11 @@ void sinkSelectProducers(func::FuncOp kernel) {
         Operation *clone = builder.clone(operation, branchMapping);
         clone->walk([&](Operation *nested) {
           for (Value result : nested->getResults())
-            result.setType(scalarCallbackType(result.getType()));
+            result.setType(gpu::scalarCallbackType(result.getType()));
           for (Region &region : nested->getRegions())
             for (Block &block : region)
               for (BlockArgument argument : block.getArguments())
-                argument.setType(scalarCallbackType(argument.getType()));
+              argument.setType(gpu::scalarCallbackType(argument.getType()));
         });
       }
       builder.create<scf::YieldOp>(select.getLoc(),
@@ -3144,29 +2842,6 @@ LogicalResult legalizeCollectiveCallbacks(func::FuncOp kernel) {
         (scan && scan.getCaptureCount()))
       return operation->emitOpError("native collective requires one axis and a capture-free callback");
     Region &region = reduce ? reduce.getCombine() : scan.getCombine();
-    Block &body = region.front();
-    for (Operation &nested : body) {
-      for (Value operand : nested.getOperands())
-        if (operand.getParentBlock() != &body)
-          return nested.emitOpError("native collective callback cannot capture enclosing values");
-      if (!isa<arith::ConstantOp, gpu::SplatOp, gpu::BroadcastOp,
-               gpu::UnaryOp, gpu::BinaryOp, gpu::CompareOp, gpu::SelectOp,
-               gpu::CastOp, gpu::BitcastOp, gpu::MakeRecordOp, gpu::ExtractOp,
-               gpu::YieldOp>(nested))
-        return nested.emitOpError("Triton native collective requires an elementwise scalarizable combine");
-      if (auto broadcast = dyn_cast<gpu::BroadcastOp>(nested)) {
-        auto source = dyn_cast<gpu::FragmentType>(broadcast.getValue().getType());
-        if (source) {
-          auto target = broadcast.getResult().getType();
-          auto projection = gpu::queryAxisProjection(source, target);
-          if (source.getShape() != target.getShape() || !projection.isExact() ||
-              llvm::any_of(llvm::enumerate(projection.targetToSource), [](auto pair) {
-                return !pair.value() || *pair.value() != pair.index();
-              }))
-            return broadcast.emitOpError("non-identity fragment broadcast in a collective requires prior lane-wise legalization");
-        }
-      }
-    }
     OpBuilder builder(operation);
     OperationState state(operation->getLoc(), reduce ? ReduceOp::getOperationName()
                                                     : ScanOp::getOperationName());
@@ -3178,21 +2853,8 @@ LogicalResult legalizeCollectiveCallbacks(func::FuncOp kernel) {
     if (Attribute origin = operation->getAttr(gpu::originAttr)) state.addAttribute(gpu::originAttr, origin);
     state.addRegion();
     Operation *native = builder.create(state);
-    Block *scalarBody = new Block();
-    native->getRegion(0).push_back(scalarBody);
-    IRMapping mapping;
-    for (BlockArgument argument : body.getArguments())
-      mapping.map(argument, scalarBody->addArgument(scalarCallbackType(argument.getType()), argument.getLoc()));
-    builder.setInsertionPointToEnd(scalarBody);
-    for (Operation &nested : body) {
-      if (isa<gpu::SplatOp, gpu::BroadcastOp>(nested)) {
-        mapping.map(nested.getResult(0), mapping.lookup(nested.getOperand(0)));
-        continue;
-      }
-      Operation *cloned = builder.clone(nested, mapping);
-      for (Value result : cloned->getResults())
-        result.setType(scalarCallbackType(result.getType()));
-    }
+    if (failed(gpu::scalarizeElementwiseCallback(region, native->getRegion(0))))
+      return failure();
     SmallVector<Value> results(native->getResults());
     if (scan && !scan.getInclusive()) {
       builder.setInsertionPointAfter(native);
@@ -4465,13 +4127,13 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       failed(gpu::verifyGPUProgram(module)))
     return failure();
   foldIntegerScanTails(kernel);
-  if (failed(materializeProgramBuffers(module)) ||
+  if (failed(gpu::materializeProgramBuffers(module)) ||
       failed(materializeOversizedGathers(kernel)) ||
       failed(legalizeLargeScalarGathers(kernel)) ||
       failed(legalizeMaskedGather(kernel)) ||
       failed(legalizeExpandingGathers(kernel)) ||
       failed(legalizeScatterAdd(kernel)) ||
-      failed(legalizeContractShapes(kernel)) ||
+      failed(gpu::normalizeMatrixContractShapes(kernel)) ||
       failed(gpu::verifyGPUProgram(module)))
     return failure();
   bool requiresCtaSynchronization = llvm::any_of(kernel.getArgumentTypes(), [](Type type) {
@@ -4589,7 +4251,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   declareProviderParameter("NUM_CTAS", gpu::ParameterRole::ProviderCTAs,
                            ctaDomain);
   if (failed(gpu::verifyGPUProgram(module)) ||
-      failed(lowerInvocationWorkspaces(module)))
+      failed(gpu::lowerInvocationWorkspaces(module)))
     return failure();
   if (failed(legalizeOrderedViewDependencies(kernel)) ||
       failed(legalizeSplitGatherPairs(kernel)) ||
@@ -4602,7 +4264,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       failed(materializeLegalConfigs(kernel, *tensorDescriptorForms, localOptions)))
     return failure();
   selectContractForms(kernel);
-  foldExactConstantDivisions(kernel);
+  gpu::foldExactConstantDivisions(kernel);
   canonicalizeBroadcastProjections(kernel);
   SmallVector<gpu::AssumeInBoundsOp> boundsAssumptions;
   kernel.walk([&](gpu::AssumeInBoundsOp assumption) {

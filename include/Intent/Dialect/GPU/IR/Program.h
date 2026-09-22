@@ -2,8 +2,17 @@
 #define INTENT_DIALECT_GPU_IR_PROGRAM_H
 
 #include "llvm/ADT/StringRef.h"
+#include "mlir/IR/Operation.h"
+#include "mlir/IR/Region.h"
+#include "mlir/IR/ValueRange.h"
+#include "mlir/Support/LogicalResult.h"
 
 namespace intent::gpu {
+
+mlir::LogicalResult verifyScalarCollective(
+    mlir::Operation *owner, mlir::ValueRange inputs,
+    mlir::ResultRange results, mlir::Region &combine, unsigned count,
+    int64_t axis, bool scan);
 
 inline constexpr llvm::StringLiteral kernelAttr = "intent_gpu.kernel";
 inline constexpr llvm::StringLiteral capabilitiesAttr =

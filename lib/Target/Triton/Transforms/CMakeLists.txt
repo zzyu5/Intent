@@ -1,7 +1,6 @@
 add_mlir_library(MLIRIntentTritonTransforms
   Legalize.cpp
   ProgramGrid.cpp
-  LowerWorkspace.cpp
 
   LINK_LIBS PUBLIC
   MLIRArithDialect

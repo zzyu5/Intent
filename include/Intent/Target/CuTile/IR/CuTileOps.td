@@ -143,21 +143,19 @@ def IntentCuTile_ScaledMMAOp : IntentCuTile_Op<"scaled_mma", [Pure]> {
   let hasVerifier = 1;
 }
 
-def IntentCuTile_ReduceOp : IntentCuTile_Op<"reduce", [Pure]> {
-  let arguments = (ins IntentGPU_FragmentValue:$source,
+class IntentCuTile_Collective<string mnemonic> :
+    IntentCuTile_Op<mnemonic, [Pure]> {
+  let arguments = (ins Variadic<IntentGPU_DataValue>:$inputs,
+                       I64Attr:$source_count,
                        I64Attr:$axis,
-                       Intent_BinaryOperatorAttr:$kind);
-  let results = (outs IntentGPU_DataValue:$result);
+                       BoolAttr:$reverse,
+                       OptionalAttr<Intent_BinaryOperatorAttr>:$kind);
+  let results = (outs Variadic<IntentGPU_DataValue>:$outputs);
+  let regions = (region AnyRegion:$combine);
   let hasVerifier = 1;
 }
 
-def IntentCuTile_ScanOp : IntentCuTile_Op<"scan", [Pure]> {
-  let arguments = (ins IntentGPU_FragmentValue:$source,
-                       I64Attr:$axis,
-                       Intent_BinaryOperatorAttr:$kind,
-                       BoolAttr:$reverse);
-  let results = (outs IntentGPU_FragmentValue:$result);
-  let hasVerifier = 1;
-}
+def IntentCuTile_ReduceOp : IntentCuTile_Collective<"reduce">;
+def IntentCuTile_ScanOp : IntentCuTile_Collective<"scan">;
 
 #endif

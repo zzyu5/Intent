@@ -43,6 +43,8 @@ std::string pythonType(Type type, bool torch = false) {
     return torch ? "torch.bfloat16" : "ct.bfloat16";
   if (isa<Float32Type>(type))
     return torch ? "torch.float32" : "ct.float32";
+  if (isa<Float64Type>(type))
+    return torch ? "torch.float64" : "ct.float64";
   if (isa<Float8E4M3FNType>(type))
     return torch ? "torch.float8_e4m3fn" : "ct.float8_e4m3fn";
   if (isa<Float8E5M2Type>(type))
@@ -89,7 +91,7 @@ std::string expressionString(gpu::PhysicalExprAttr expression,
     return "(" + operands[1] + " if " + operands[0] + " else " +
            operands[2] + ")";
   if (kind == gpu::PhysicalExprKind::NextPowerOfTwo)
-    return "ct.next_power_of_2(" + operands[0] + ")";
+    return "_intent_next_power_of_2(" + operands[0] + ")";
   return {};
 }
 
@@ -226,6 +228,7 @@ private:
     std::string name;
     gpu::ViewType type;
     ArrayAttr indexTileBounds;
+    bool workspace;
   };
   struct MetadataABI {
     unsigned argument;
@@ -257,10 +260,11 @@ private:
       std::string kind = attrs.getAs<StringAttr>(gpu::abiKindAttr).getValue().str();
       std::string name = attrs.getAs<StringAttr>(gpu::abiNameAttr).getValue().str();
       values[argument] = name;
-      if (kind == "view") {
+      if (kind == "view" || kind == "workspace") {
         views.push_back({static_cast<unsigned>(index), name,
                          cast<gpu::ViewType>(argument.getType()),
-                         indexBounds ? cast<ArrayAttr>(indexBounds[index]) : ArrayAttr()});
+                         indexBounds ? cast<ArrayAttr>(indexBounds[index]) : ArrayAttr(),
+                         kind == "workspace"});
       } else if (kind == "scalar" || kind == "constexpr" || kind == "value") {
         if (kind == "constexpr") {
           if (!argument.use_empty()) {
@@ -352,7 +356,17 @@ private:
               "from intent.runtime.artifact import ParameterRole, TuningConfiguration, TuningParameter\n"
               "from intent.runtime.cutile import array_index_kernels, bind_array_view, can_use_i32_array_indices\n"
               "from intent.runtime.tuning import TuningState\n\n"
-              "ConstInt = ct.Constant[int]\n\n";
+              "ConstInt = ct.Constant[int]\n\n"
+              "@ct.function(host=True)\n"
+              "def _intent_next_power_of_2(value):\n"
+              "    value = max(value, 1) - 1\n"
+              "    value = value | (value >> 1)\n"
+              "    value = value | (value >> 2)\n"
+              "    value = value | (value >> 4)\n"
+              "    value = value | (value >> 8)\n"
+              "    value = value | (value >> 16)\n"
+              "    value = value | (value >> 32)\n"
+              "    return value + 1\n\n";
   }
 
   Attribute scalarConstant(Value value) {
@@ -387,7 +401,8 @@ private:
   void emitCollectiveHelpers() {
     SmallVector<Operation *> collectives;
     kernel.walk([&](Operation *operation) {
-      if (isa<gpu::ReduceOp, gpu::ScanOp>(operation))
+      if (isa<ReduceOp, ScanOp>(operation) &&
+          !operation->getRegion(0).empty())
         collectives.push_back(operation);
     });
     for (Operation *collective : collectives) {
@@ -482,6 +497,8 @@ private:
   void emitArgumentBindings() {
     for (const MetadataABI &metadata : metadataArguments) {
       const ViewABI &source = viewByABI(metadata.sourceABI);
+      if (source.workspace)
+        continue;
       line(metadata.name + " = " + source.name +
                (metadata.kind == "dimension" ? ".shape[" : ".stride(") +
                std::to_string(metadata.sourceAxis) +
@@ -503,10 +520,34 @@ private:
     }
   }
 
+  void emitWorkspaceBindings() {
+    for (const ViewABI &view : views) {
+      if (!view.workspace)
+        continue;
+      auto deviceSource = llvm::find_if(views, [](const ViewABI &candidate) {
+        return !candidate.workspace;
+      });
+      if (deviceSource == views.end()) {
+        kernel.emitError("workspace allocation requires a public view device");
+        failed = true;
+        return;
+      }
+      line(view.name + " = torch.empty(" + outputShape(view) + ", device=" +
+               deviceSource->name + ".device, dtype=" +
+               pythonType(view.type.getElementType(), true) + ")", 1);
+    }
+    for (const MetadataABI &metadata : metadataArguments) {
+      const ViewABI &source = viewByABI(metadata.sourceABI);
+      if (source.workspace)
+        line(metadata.name + " = " + source.name + ".stride(" +
+                 std::to_string(metadata.sourceAxis) + ")", 1);
+    }
+  }
+
   void emitArrayBindings(StringRef trialState, unsigned level) {
     for (ArrayViewABI &view : arrayViews) {
       bool trial = !trialState.empty();
-      std::string source = trial
+      std::string source = trial && !views[view.sourceView].workspace
           ? trialState.str() + ".views[" + std::to_string(view.sourceView) + "]"
           : views[view.sourceView].name;
       std::string groups = "(";
@@ -596,6 +637,7 @@ private:
     emitTuningConfigurations();
     output << "def launch(" << joinLaunchArguments() << "):\n";
     emitArgumentBindings();
+    emitWorkspaceBindings();
     emitArrayBindings("", 1);
 
     llvm::StringSet<> occupiedNames;
@@ -658,10 +700,12 @@ private:
     }
     std::string trialState = trialStateName + " = TuningState((";
     for (const ViewABI &view : views)
-      trialState += view.name + ", ";
+      if (!view.workspace)
+        trialState += view.name + ", ";
     trialState += "), (";
     for (const ViewABI &view : views)
-      trialState += view.type.getAccess() != 0 ? "True, " : "False, ";
+      if (!view.workspace)
+        trialState += view.type.getAccess() != 0 ? "True, " : "False, ";
     line(trialState + "))", 2);
     emitArrayBindings(trialStateName, 2);
     auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
@@ -708,6 +752,8 @@ private:
     SmallVector<ViewABI> inputs;
     SmallVector<ViewABI> outputs;
     for (const ViewABI &view : views) {
+      if (view.workspace)
+        continue;
       if (view.type.getAccess() != 1)
         inputs.push_back(view);
       if (view.type.getAccess() == 1)
@@ -985,9 +1031,10 @@ private:
                  "), ct.bitcast(" + valueString(mma.getRhsScale()) +
                  ", ct.float8_e8m0fnu), " +
                  valueString(mma.getAccumulator()) + ")");
-    } else if (isa<gpu::ReduceOp, gpu::ScanOp>(operation)) {
-      auto reduce = dyn_cast<gpu::ReduceOp>(operation);
-      auto scan = dyn_cast<gpu::ScanOp>(operation);
+    } else if (isa<ReduceOp, ScanOp>(operation) &&
+               !operation.getRegion(0).empty()) {
+      auto reduce = dyn_cast<ReduceOp>(operation);
+      auto scan = dyn_cast<ScanOp>(operation);
       unsigned count = reduce ? reduce.getSourceCount() : scan.getSourceCount();
       ValueRange sources = operation.getOperands().take_front(count);
       ValueRange identities = operation.getOperands().slice(count, count);
@@ -1007,7 +1054,7 @@ private:
       }
       std::string call = std::string(reduce ? "ct.reduce(" : "ct.scan(") +
                          source + ", axis=" +
-                         std::to_string(reduce ? reduce.getAxes().front()
+                         std::to_string(reduce ? reduce.getAxis()
                                                : scan.getAxis()) +
                          ", func=" +
                          collectiveHelpers.lookup(&operation) +
@@ -1040,14 +1087,14 @@ private:
         }
       };
       std::string expression =
-          nativeReduction(reduce.getKind()).str() + "(" +
-          valueString(reduce.getSource()) + ", axis=" +
+          nativeReduction(*reduce.getKind()).str() + "(" +
+          valueString(reduce.getInputs().front()) + ", axis=" +
           std::to_string(reduce.getAxis()) + ")";
-      if (elementType(reduce.getResult().getType()).isInteger(1))
+      if (elementType(reduce.getResult(0).getType()).isInteger(1))
         expression = "ct.astype(" + expression + ", ct.bool_)";
-      assign(reduce.getResult(), expression);
+      assign(reduce.getResult(0), expression);
     } else if (auto scan = dyn_cast<ScanOp>(operation)) {
-      assign(scan.getResult(), "ct.cumsum(" + valueString(scan.getSource()) +
+      assign(scan.getResult(0), "ct.cumsum(" + valueString(scan.getInputs().front()) +
                                    ", axis=" + std::to_string(scan.getAxis()) +
                                    ", reverse=" +
                                    (scan.getReverse() ? "True" : "False") + ")");
@@ -1271,15 +1318,19 @@ private:
     case UnaryOperator::Sin: return call("ct.sin");
     case UnaryOperator::Cos: return call("ct.cos");
     case UnaryOperator::Floor: return call("ct.floor");
-    case UnaryOperator::Erf: return call("ct.erf");
     case UnaryOperator::Rsqrt: return call("ct.rsqrt");
-    case UnaryOperator::Sigmoid: return call("ct.sigmoid");
+    case UnaryOperator::Sigmoid:
+      return "ct.astype(1.0 / (1.0 + ct.exp(-ct.astype(" + input +
+             (elementType(unary.getInput().getType()).isF64()
+                  ? ", ct.float64))), " : ", ct.float32))), ") +
+             pythonType(elementType(unary.getResult().getType())) + ")";
     case UnaryOperator::Tanh:
       return unary.getApproximate()
                  ? "ct.tanh(" + input + ", rounding_mode=ct.RoundingMode.APPROX)"
                  : call("ct.tanh");
     case UnaryOperator::Abs: return call("ct.abs");
     case UnaryOperator::Sqrt: return call("ct.sqrt");
+    case UnaryOperator::Erf:
     case UnaryOperator::Lgamma:
     case UnaryOperator::Log1p:
     case UnaryOperator::Erfc:
@@ -1475,7 +1526,7 @@ private:
   std::string joinLaunchArguments(bool includeOutputs = true) const {
     std::map<unsigned, std::string> arguments;
     for (const ViewABI &view : views)
-      if (includeOutputs || view.type.getAccess() != 1)
+      if (!view.workspace && (includeOutputs || view.type.getAccess() != 1))
         arguments.emplace(view.argument, view.name);
     for (const ScalarABI &scalar : scalars)
       arguments.emplace(scalar.argument, scalar.name);
