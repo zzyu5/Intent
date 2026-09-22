@@ -25,27 +25,27 @@ causal_conv1d,B4-C4096-S4096-W4-bf16-silu,0.264976,0.193656,1.368282,pass,Intent
 varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.061440,0.057344,1.071429,pass,Intent target=cutile; source corpus=triton.
 causal_conv1d_update,B32-D4096-W4-bf16,0.014624,0.006520,2.242945,pass,Intent target=cutile; source corpus=triton.
 modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,,,,source_device_resource_gap,
-mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,,,,source_semantics_gap,Numerical comparison passed; existing source ABI/semantics contract excludes timing. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
+mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.012288,0.008192,1.500000,pass,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出 cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
 flash_attention_backward,B2-H16-S2048-D128-fp16-causal,,,,source_device_resource_gap,
 moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.247336,2.369408,0.948480,pass,Intent target=cutile; source corpus=triton.
 moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,2.258640,3.384432,0.667362,pass,Intent target=cutile; source corpus=triton.
 mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,0.028432,0.014080,2.019318,pass,Intent target=cutile; source corpus=triton. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
 mamba_state_passing,B1-C8-H32-state8192-fp32,0.012016,0.013968,0.860252,pass,Intent target=cutile; source corpus=triton.
 mamba_chunk_scan,B1-S2048-H32-G8-P64-N128-C256-bf16,0.059168,0.044800,1.320714,pass,Intent target=cutile; source corpus=triton. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
-mamba3_siso_forward,B1-S2048-HQK4-H16-DQK32-DV64-bf16,,,,source_semantics_gap,Numerical comparison passed; existing source ABI/semantics contract excludes timing. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
+mamba3_siso_forward,B1-S2048-HQK4-H16-DQK32-DV64-bf16,0.173912,0.227672,0.763871,pass,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲 cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
 paged_gqa_decode,B16-QH32-KVH8-S8192-D128-page16-fp16,0.357872,0.456184,0.784490,pass,Intent target=cutile; source corpus=triton.
 splitk_paged_attention,B16-QH32-KVH8-S8192-D128-page16-split8-fp16,0.355656,0.452088,0.786696,pass,Intent target=cutile; source corpus=triton.
-paged_mla_decode,B8-QH128-KVH1-S8192-C512-R64-page16-fp16,,,,source_abi_gap,Numerical comparison passed; existing source ABI/semantics contract excludes timing. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
-block_sparse_gqa_decode,B8-QH32-KVH8-S8192-D128-blocks32x128,,,,source_abi_gap,Numerical comparison passed; existing source ABI/semantics contract excludes timing.
+paged_mla_decode,B8-QH128-KVH1-S8192-C512-R64-page16-fp16,0.616592,0.381408,1.616620,pass,Intent target=cutile; source corpus=triton. 同算法；source 使用 packed KV/page-table ABI 并写辅助 LSE；输入布局适配在计时前完成，完整 source 调用含 scale 分配 cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
+block_sparse_gqa_decode,B8-QH32-KVH8-S8192-D128-blocks32x128,0.159744,0.092600,1.725097,pass,Intent target=cutile; source corpus=triton. 同算法；source 使用 packed KV/topk ABI；输入布局适配在计时前完成，完整 source 调用含 partial buffer 分配 cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
 flaggems_conv1d,B64-L16384-K5-fp16-same,0.007936,0.061152,0.129775,pass,Intent target=cutile; source corpus=triton.
 flaggems_triangular_solve,B4096-N16-fp32-lower,0.033232,0.028688,1.158394,pass,Intent target=cutile; source corpus=triton; reference stack Torch 2.10.0+cu130 and Triton 3.6.0; cuTile 1.5.0.
 flaggems_embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.175872,0.174832,1.005949,pass,Intent target=cutile; source corpus=triton.
 flaggems_roll,8192x4096-fp16-shift-1-axis0,0.087792,0.089088,0.985453,pass,Intent target=cutile; source corpus=triton.
 flaggems_transpose_copy,4093x8191-fp16,0.105216,0.308992,0.340514,pass,Intent target=cutile; source corpus=triton; reference stack Torch 2.10.0+cu130 and Triton 3.6.0; cuTile 1.5.0.
-flaggems_batch_norm_training,B32-C64-S4096-fp16,0.102896,0.026608,3.867108,pass,Intent target=cutile; source corpus=triton.
+flaggems_batch_norm_training,B32-C64-S4096-fp16,0.103728,0.026632,3.894863,pass,Intent target=cutile; source corpus=triton.
 flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.042752,0.050912,0.839723,pass,Intent target=cutile; source corpus=triton.
-flaggems_logsumexp,8192x8192-fp32,0.184096,0.175904,1.046571,pass,Intent target=cutile; source corpus=triton.
-flaggems_softmax_backward,4096x4097-fp32,,,,numerical_failed,"generated/source floating result 0 differs: max_abs=0.00012362003326416016, atol=0.0001, rtol=1e-05; first_failure=15327822; largest tolerance excess has generated=0.08494142442941666, source=0.08482552319765091, abs_error=0.00011590123176574707, limit=0.00010084825044032186; reference stack Torch 2.10.0+cu130 and Triton 3.6.0; cuTile 1.5.0"
+flaggems_logsumexp,8192x8192-fp32,0.179968,0.176128,1.021802,pass,Intent target=cutile; source corpus=triton.
+flaggems_softmax_backward,4096x4097-fp32,,,,numerical_failed,"generated/source floating result 0 differs: max_abs=0.00012362003326416016, atol=0.0001, rtol=1e-05; first_failure=15327822; largest tolerance excess has generated=0.08494142442941666, source=0.08482552319765091, abs_error=0.00011590123176574707, limit=0.00010084825044032186"
 flaggems_fused_adamw,N8388608-fp32,0.153888,0.157664,0.976050,pass,Intent target=cutile; source corpus=triton.
 flaggems_addcmul,B64-C128-L4096-bf16,0.087776,0.087824,0.999453,pass,Intent target=cutile; source corpus=triton; reference stack Torch 2.10.0+cu130 and Triton 3.6.0; cuTile 1.5.0.
 flaggems_fp8_mqa_logits,Q256-K4096-H32-D128-e4m3,0.070824,0.087672,0.807829,pass,Intent target=cutile; source corpus=triton. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.

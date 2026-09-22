@@ -486,7 +486,7 @@ def paged_mla(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=5e-2, rtol=5e-2),
         cuda_graph=False,
-        status="source_abi_gap",
+        note="同算法；source 使用 packed KV/page-table ABI 并写辅助 LSE；输入布局适配在计时前完成，完整 source 调用含 scale 分配",
     )
 
 
@@ -593,7 +593,7 @@ def block_sparse_gqa_decode(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=5e-2, rtol=5e-2),
         cuda_graph=False,
-        status="source_abi_gap",
+        note="同算法；source 使用 packed KV/topk ABI；输入布局适配在计时前完成，完整 source 调用含 partial buffer 分配",
     )
 
 

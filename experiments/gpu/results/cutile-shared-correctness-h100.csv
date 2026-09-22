@@ -1,0 +1,2 @@
+kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
+batched_gemm,B32-M512-N512-K1024-bf16,0.173224,0.166464,1.040609,pass,cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged. Same-target production check after shared matrix normalization.

@@ -127,7 +127,7 @@ def mamba3_step(context: Context) -> PreparedComparison:
             Tolerance(atol=5e-3, rtol=5e-2),
         ),
         cuda_graph=False,
-        status="source_semantics_gap",
+        note="同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出",
     )
 
 
@@ -232,7 +232,7 @@ def mamba3_siso_forward(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=1e-1, rtol=5e-2),
         cuda_graph=False,
-        status="source_semantics_gap",
+        note="同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲",
     )
 
 
