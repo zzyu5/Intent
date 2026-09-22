@@ -306,17 +306,24 @@ LogicalResult legalizeProgram(ModuleOp module, StringRef architecture) {
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
   if (failed(pm.run(module))) return failure();
-  // This implementation profile completes each local operation before its
-  // consumers or recycled allocations run. Future overlap must carry explicit
-  // completion dependencies in the DSA program before relaxing these waits.
+  // Scalar NRAM accesses preserve program order within a task. Complete them
+  // before entering a bulk operation, and complete bulk operations before any
+  // scalar consumer or allocation reuse. A fence inside every scalar store or
+  // scalar carry copy would serialize each element of broadcast/reduce loops.
   SmallVector<Operation *> localEffects;
   function.walk([&](Operation *op) {
     if (isa<dsa::LoadTileOp, dsa::StoreTileOp, dsa::FillOp, dsa::SelectOp, dsa::UnaryOp,
-            dsa::BinaryOp, dsa::CastOp, dsa::ReduceOp, dsa::PrepareMatrixOp, dsa::MatrixTileOp,
-            memref::StoreOp, memref::CopyOp>(op)) localEffects.push_back(op);
+            dsa::BinaryOp, dsa::CastOp, dsa::ReduceOp, dsa::PrepareMatrixOp, dsa::MatrixTileOp>(op))
+      localEffects.push_back(op);
+    if (auto copy = dyn_cast<memref::CopyOp>(op))
+      if (cast<MemRefType>(copy.getSource().getType()).getNumElements() > 1)
+        localEffects.push_back(op);
   });
   for (Operation *op : localEffects) {
-    OpBuilder builder(op); builder.setInsertionPointAfter(op);
+    OpBuilder builder(op);
+    if (!op->getPrevNode() || !isa<dsa::SynchronizeOp>(op->getPrevNode()))
+      builder.create<dsa::SynchronizeOp>(op->getLoc());
+    builder.setInsertionPointAfter(op);
     builder.create<dsa::SynchronizeOp>(op->getLoc());
   }
   int64_t nram = 0, wram = 0;

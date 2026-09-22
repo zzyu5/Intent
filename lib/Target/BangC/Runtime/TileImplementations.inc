@@ -74,7 +74,9 @@ template<> __mlu_func__ void intent_write_local(bool *p, bool v) {
 }
 template<class T, int N>
 __mlu_func__ void intent_copy_local(T *output, const T *input) {
-  for (int i = 0; i < N; ++i) intent_write_local(output + i, intent_read_local(input + i));
+  if (output == input) return;
+  if (N == 1) intent_write_local(output, intent_read_local(input));
+  else if (N > 1) __memcpy(output, input, N * sizeof(T), NRAM2NRAM);
 }
 template<class From, class To, int N>
 __mlu_func__ void intent_cast_local(To *output, const From *input) {
