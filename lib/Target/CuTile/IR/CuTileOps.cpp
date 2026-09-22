@@ -434,12 +434,9 @@ LogicalResult ExtractOp::verify() {
     auto extent = dyn_cast<gpu::PhysicalExprAttr>(getExtractionShape()[axis]);
     if (!extent)
       return emitOpError("extraction shape must contain physical expressions");
-    if (retained.test(axis)) {
-      if (extent != source.getShape()[axis] || !matchPattern(coordinate, m_Zero()))
-        return emitOpError("retained axes require full source extents and zero tile indices");
-    } else if (extent.getKind() !=
+    if (!retained.test(axis) && (extent.getKind() !=
                    static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
-               extent.getValue() != 1) {
+               extent.getValue() != 1)) {
       return emitOpError("selected axes require unit extraction extents");
     }
   }
@@ -452,7 +449,7 @@ LogicalResult ExtractOp::verify() {
       result.getOwner() != source.getOwner())
     return emitOpError("extracted fragment must preserve retained rank and owner");
   for (auto [resultAxis, sourceAxis] : llvm::enumerate(getRetainedAxes()))
-    if (result.getShape()[resultAxis] != source.getShape()[sourceAxis] ||
+    if (result.getShape()[resultAxis] != getExtractionShape()[sourceAxis] ||
         !sameLogicalAxis(source, sourceAxis, result, resultAxis))
       return emitOpError("extracted fragment must preserve retained axis relations");
   return success();
