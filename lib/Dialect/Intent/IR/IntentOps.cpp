@@ -1437,7 +1437,7 @@ bool readsPreviousReverseSuffix(Value readIndex, Value writtenIndex,
     return false;
   Value begin, end;
   if (auto suffix = readIndex.getDefiningOp<SubregionOp>()) {
-    if (!suffix.getHasStart() || !suffix.getHasStop())
+    if (!suffix.getHasStart())
       return false;
     auto source = suffix.getInputs().front().getDefiningOp<DomainOp>();
     if (!source || source.getBounds().size() < 2 ||
@@ -1448,7 +1448,7 @@ bool readsPreviousReverseSuffix(Value readIndex, Value writtenIndex,
                              dominance))
       return false;
     begin = suffix.getInputs()[1];
-    end = suffix.getInputs().back();
+    end = suffix.getHasStop() ? suffix.getInputs().back() : source.getBounds()[1];
   } else if (auto suffix = readIndex.getDefiningOp<DomainOp>()) {
     if (suffix.getBounds().size() < 2 ||
         (suffix.getBounds().size() == 3 &&
