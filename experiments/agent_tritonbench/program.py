@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import io
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -35,6 +34,7 @@ class ProgramContext:
         self.generated: dict[str, CompiledArtifact] = {}
         self.tuning: list[dict] = []
         self.precompile_failures: list[dict] = []
+        self.native_compile_reuses = 0
 
     def compile(self, name: str, definition, *, constexprs=None):
         if self.language != "intent":
@@ -77,13 +77,46 @@ class ProgramContext:
         return artifact
 
     @contextmanager
+    def native_compilation_cache(self):
+        if self.target_name != "cutile":
+            yield
+            return
+        import cuda.tile as ct
+        from cuda.tile._compile import get_sm_arch
+
+        original_compile = ct.kernel._compile
+        compiled = []
+
+        def compile_kernel(kernel, signature, context):
+            # Native signatures contain unhashable constraints. Value equality
+            # also lets the JIT's unnamed signature reuse the prepared symbol.
+            key = (kernel._pyfunc, kernel._compiler_options,
+                   signature.with_symbol(None), get_sm_arch(), context)
+            for previous, result, error in compiled:
+                if key == previous:
+                    self.native_compile_reuses += 1
+                    if error is not None:
+                        raise error
+                    return result
+            try:
+                result = original_compile(kernel, signature, context)
+            except ct.TileError as error:
+                compiled.append((key, None, error))
+                raise
+            compiled.append((key, result, None))
+            return result
+
+        ct.kernel._compile = compile_kernel
+        try:
+            yield
+        finally:
+            ct.kernel._compile = original_compile
+
+    @contextmanager
     def compilation_only(self):
         import cuda.tile as ct
-        from cuda.tile.compilation import CallingConvention, KernelSignature, export_kernel
-        import torch
-
-        major, minor = torch.cuda.get_device_capability(self.target.device)
-        gpu_code = f"sm_{major}{minor}"
+        from cuda.tile.compilation import CallingConvention, KernelSignature
+        from cuda.tile._cext import default_tile_context
 
         def compile_kernel(stream, grid, kernel, arguments):
             # Generated kernels have the view/scalar ABI. Match cuTile's JIT
@@ -93,9 +126,10 @@ class ProgramContext:
             convention = (CallingConvention.cutile_python_v2() if static_arrays
                           else CallingConvention.cutile_python_v1())
             signature = KernelSignature.from_kernel_args(kernel, arguments, convention)
-            export_kernel(kernel, (signature,), io.BytesIO(), gpu_code=gpu_code, output_format="cubin")
+            kernel._compile(signature, default_tile_context)
 
         def compile_search(configs, stream, grid_fn, kernel, args_fn, hints_fn=None, **kwargs):
+            first = None
             last_error = None
             for config in configs:
                 candidate = kernel.replace_hints(**(hints_fn(config) if hints_fn else {}))
@@ -106,11 +140,13 @@ class ProgramContext:
                     self.precompile_failures.append({"kernel": kernel._pyfunc.__name__,
                                                      "config": str(config), "error": str(error)})
                     continue
-                # Export does not populate the launch dispatcher's in-process
-                # cache. Establish compile support once; the native tuner owns
-                # the full search after acquiring the GPU lock.
-                return SimpleNamespace(best=SimpleNamespace(config=config))
-            raise RuntimeError("no cuTile configuration compiled for the current device") from last_error
+                if first is None:
+                    first = config
+            if first is None:
+                raise RuntimeError("no cuTile configuration compiled for the current device") from last_error
+            # The launch dispatcher receives these native compile results from
+            # the same signature-keyed hook; no kernel executes during prepare.
+            return SimpleNamespace(best=SimpleNamespace(config=first))
 
         class CompilationState:
             def __init__(self, views, writable):

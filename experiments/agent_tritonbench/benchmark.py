@@ -112,7 +112,7 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
         if arguments.target == "cutile":
             import cuda.tile as ct
             provider_budget = ct.compiler_timeout(arguments.cutile_compiler_timeout)
-        with budget, provider_budget:
+        with budget, provider_budget, context.native_compilation_cache():
             with CandidateTorchPolicy():
                 module = load_program(arguments.program, language=arguments.language)
                 stage = "candidate_build"
@@ -184,6 +184,8 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
     result["compiler_artifacts"] = {name: str(artifact.cache_directory)
                                     for name, artifact in context.generated.items()}
     result["precompile_failures"] = budget.precompile_failures + context.precompile_failures
+    if arguments.target == "cutile":
+        result["native_compile_reuses"] = context.native_compile_reuses
     result["tuning"] = context.tuning if arguments.target == "cutile" else budget.records()
     result["preparation_and_benchmark_seconds"] = time.monotonic() - started
     return result
