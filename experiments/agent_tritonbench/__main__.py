@@ -29,14 +29,18 @@ def revision(directory: Path) -> str:
 
 
 def run_benchmark(arguments, task, program, language, result_path, *, target="triton",
-                  reference_ms=None, timing=None) -> dict:
+                  reference_ms=None, reference_time_unavailable=False, timing=None) -> dict:
     phase_read, phase_write = os.pipe()
     command = [sys.executable, "-B", "-m", "experiments.agent_tritonbench.benchmark", "--reference", str(arguments.reference),
-               "--compiler", str(arguments.compiler), "--task", task, "--program", str(program),
+               "--compiler", str(arguments.compiler), "--task", task,
                "--language", language, "--result", str(result_path), "--gpu-lock", str(arguments.gpu_lock),
                "--suite", str(arguments.suite_path), "--phase-fd", str(phase_write), "--target", target]
+    if program is not None:
+        command.extend(("--program", str(program)))
     if reference_ms is not None:
         command.extend(("--reference-ms", str(reference_ms)))
+    if reference_time_unavailable:
+        command.append("--reference-time-unavailable")
     if timing is not None:
         command.extend(("--timing", timing))
     with os.fdopen(phase_read, "rb", buffering=0) as phases, tempfile.TemporaryFile(mode="w+") as log:

@@ -78,8 +78,9 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
     row = next(row for row in catalog(arguments.reference, suite) if row["task"] == arguments.task)
     timing = arguments.timing or task.get("timing", suite["timing"])
     cuda_graph = timing == "cuda_graph"
+    reference_only = arguments.language == "reference"
     result = {"status": "pending", "candidate_ms": None, "reference_ms": None, "ratio": None,
-              "target": arguments.target, "program": str(arguments.program),
+              "target": arguments.target, "program": str(arguments.program) if arguments.program is not None else None,
               "reference_time_reused": arguments.reference_ms is not None,
               "reference_timing_note": None,
               "timing": timing, "tolerance": suite["tolerances"][task["tolerance"]]}
@@ -89,8 +90,7 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
             if isinstance(cause, torch.AcceleratorError) and "operation not permitted when stream is capturing" in str(cause):
                 result["reference_timing_note"] = (
                     "The unchanged PyTorch reference cannot be captured by CUDA Graph. "
-                    "Its eager output remains the numerical oracle. Candidate time is "
-                    "the completed CUDA Graph window before reference capture; no reference ratio is available."
+                    "Its eager output remains the numerical oracle; no reference ratio is available."
                 )
                 result["reference_timing_error"] = str(cause)
                 return True
@@ -100,58 +100,72 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
     stage = "reference_preparation"
     report_stage(stage)
     budget = TuningBudget(CandidateTorchPolicy)
-    context = ProgramContext(arguments.compiler, arguments.program.parent,
-                             language=arguments.language, target=arguments.target)
+    context = None if reference_only else ProgramContext(arguments.compiler, arguments.program.parent,
+                                                        language=arguments.language, target=arguments.target)
     try:
-        candidate_call = invocation(arguments.reference, row, task, suite, device="cpu")
         reference_call = invocation(arguments.reference, row, task, suite, device="cpu")
         reference_function = reference(arguments.reference, row)
-        stage = "candidate_load"
-        report_stage(stage)
-        provider_budget = nullcontext()
-        if arguments.target == "cutile":
-            import cuda.tile as ct
-            provider_budget = ct.compiler_timeout(arguments.cutile_compiler_timeout)
-        with budget, provider_budget, context.native_compilation_cache():
-            with CandidateTorchPolicy():
-                module = load_program(arguments.program, language=arguments.language)
-                stage = "candidate_build"
-                report_stage(stage)
-                function = module.build(context)
-                if arguments.language == "intent" and not context.generated:
-                    raise ValueError("Intent submission did not compile any Intent kernels")
-            stage = "candidate_input_preparation"
+        if reference_only:
             with arguments.gpu_lock.open("w") as lock:
                 report_stage("gpu_queue")
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 report_stage(stage)
-                candidate_call = candidate_call.to_device("cuda")
                 reference_call = reference_call.to_device("cuda")
                 torch.cuda.synchronize()
-            stage = "candidate_precompile"
-            report_stage(stage)
-            compile_started = time.monotonic()
-            preparation = (budget.compilation_only() if arguments.target == "triton"
-                           else context.compilation_only())
-            with preparation, CandidateTorchPolicy():
-                candidate_call.call(function)
-            result["precompile_seconds"] = time.monotonic() - compile_started
-            result["preparation_policy"] = "compile_only_before_gpu_timing_lock"
-            for artifact in context.generated.values():
-                artifact.backend_ir.clear()
-            stage = "comparison"
-            with arguments.gpu_lock.open("w") as lock:
-                report_stage("gpu_queue")
-                fcntl.flock(lock, fcntl.LOCK_EX)
-                report_stage(stage)
-                candidate = _observe(candidate_call, function, task=arguments.task, enforce=True)
                 source = _observe(reference_call, reference_function, task=arguments.task, enforce=False)
-                measured, anchor = evaluate(PreparedComparison(candidate, source, tolerance(task, suite), cuda_graph=cuda_graph),
-                                            source_timing_error=source_timing_error,
-                                            benchmark_time_budget_ms=200,
-                                            source_time_ms=arguments.reference_ms)
-            result.update(status="pass", candidate_ms=measured, reference_ms=anchor,
-                          ratio=measured / anchor if anchor is not None else None)
+                _, anchor = evaluate(PreparedComparison(None, source, tolerance(task, suite), cuda_graph=cuda_graph),
+                                     source_timing_error=source_timing_error, benchmark_time_budget_ms=200)
+            result.update(status="reference_pass" if anchor is not None else "reference_timing_unavailable",
+                          reference_ms=anchor)
+        else:
+            candidate_call = invocation(arguments.reference, row, task, suite, device="cpu")
+            stage = "candidate_load"
+            report_stage(stage)
+            provider_budget = nullcontext()
+            if arguments.target == "cutile":
+                import cuda.tile as ct
+                provider_budget = ct.compiler_timeout(arguments.cutile_compiler_timeout)
+            with budget, provider_budget, context.native_compilation_cache():
+                with CandidateTorchPolicy():
+                    module = load_program(arguments.program, language=arguments.language)
+                    stage = "candidate_build"
+                    report_stage(stage)
+                    function = module.build(context)
+                    if arguments.language == "intent" and not context.generated:
+                        raise ValueError("Intent submission did not compile any Intent kernels")
+                stage = "candidate_input_preparation"
+                with arguments.gpu_lock.open("w") as lock:
+                    report_stage("gpu_queue")
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    report_stage(stage)
+                    candidate_call = candidate_call.to_device("cuda")
+                    reference_call = reference_call.to_device("cuda")
+                    torch.cuda.synchronize()
+                stage = "candidate_precompile"
+                report_stage(stage)
+                compile_started = time.monotonic()
+                preparation = (budget.compilation_only() if arguments.target == "triton"
+                               else context.compilation_only())
+                with preparation, CandidateTorchPolicy():
+                    candidate_call.call(function)
+                result["precompile_seconds"] = time.monotonic() - compile_started
+                result["preparation_policy"] = "compile_only_before_gpu_timing_lock"
+                for artifact in context.generated.values():
+                    artifact.backend_ir.clear()
+                stage = "comparison"
+                with arguments.gpu_lock.open("w") as lock:
+                    report_stage("gpu_queue")
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    report_stage(stage)
+                    candidate = _observe(candidate_call, function, task=arguments.task, enforce=True)
+                    source = _observe(reference_call, reference_function, task=arguments.task, enforce=False)
+                    measured, anchor = evaluate(PreparedComparison(candidate, source, tolerance(task, suite), cuda_graph=cuda_graph),
+                                                source_timing_error=source_timing_error,
+                                                benchmark_time_budget_ms=200,
+                                                source_time_ms=arguments.reference_ms,
+                                                measure_source=not arguments.reference_time_unavailable)
+                result.update(status="pass", candidate_ms=measured, reference_ms=anchor,
+                              ratio=measured / anchor if anchor is not None else None)
     except Exception as error:
         # A failed program is a result in the fixed denominator, never a fallback.
         causes = []
@@ -181,12 +195,13 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
         result.update(status=status, failure_stage=stage, error=str(error), traceback=traceback.format_exc())
         if isinstance(error, intent.CompilationStageError) and error.cache_directory is not None:
             result["failed_compiler_artifact"] = str(error.cache_directory)
-    result["compiler_artifacts"] = {name: str(artifact.cache_directory)
-                                    for name, artifact in context.generated.items()}
-    result["precompile_failures"] = budget.precompile_failures + context.precompile_failures
-    if arguments.target == "cutile":
-        result["native_compile_reuses"] = context.native_compile_reuses
-    result["tuning"] = context.tuning if arguments.target == "cutile" else budget.records()
+    if context is not None:
+        result["compiler_artifacts"] = {name: str(artifact.cache_directory)
+                                        for name, artifact in context.generated.items()}
+        result["precompile_failures"] = budget.precompile_failures + context.precompile_failures
+        if arguments.target == "cutile":
+            result["native_compile_reuses"] = context.native_compile_reuses
+        result["tuning"] = context.tuning if arguments.target == "cutile" else budget.records()
     result["preparation_and_benchmark_seconds"] = time.monotonic() - started
     return result
 
@@ -196,8 +211,8 @@ def main() -> None:
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--compiler", type=Path, required=True)
     parser.add_argument("--task", required=True)
-    parser.add_argument("--program", type=Path, required=True)
-    parser.add_argument("--language", choices=("intent", "triton"), required=True)
+    parser.add_argument("--program", type=Path)
+    parser.add_argument("--language", choices=("intent", "triton", "reference"), required=True)
     parser.add_argument("--target", choices=("triton", "cutile"), default="triton",
                         help="backend for the unchanged Intent submission")
     parser.add_argument("--cutile-compiler-timeout", type=int, default=15)
@@ -208,9 +223,17 @@ def main() -> None:
                         help="Fixed task and numerical configuration used by generation")
     parser.add_argument("--timing", choices=("cuda_graph", "cuda_event"),
                         help="Override the task's paired candidate/reference timing path")
-    parser.add_argument("--reference-ms", type=float,
-                        help="Reuse this workload's existing reference time; still check its output")
+    reference_timing = parser.add_mutually_exclusive_group()
+    reference_timing.add_argument("--reference-ms", type=float,
+                                  help="Reuse this workload's existing reference time; still check its output")
+    reference_timing.add_argument("--reference-time-unavailable", action="store_true",
+                                  help="Preserve unavailable reference timing; still check its output")
     arguments = parser.parse_args()
+    if arguments.language != "reference" and arguments.program is None:
+        parser.error("candidate evaluation requires --program")
+    if arguments.language == "reference" and (arguments.program is not None or arguments.reference_ms is not None
+                                               or arguments.reference_time_unavailable):
+        parser.error("reference measurement does not take a candidate or a reused reference time")
     if arguments.language != "intent" and arguments.target != "triton":
         parser.error("only Intent submissions can select a different backend")
     if arguments.cutile_compiler_timeout <= 0:

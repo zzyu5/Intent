@@ -347,14 +347,15 @@ def evaluate(
         report_stage("numerical_comparison")
         compare_outputs(measured.generated, measured.source, comparison.tolerance)
         return measured.generated_ms, measured.source_ms
-    report_stage("generated_launch")
-    try:
-        if comparison.generated.prepare is not None:
-            comparison.generated.prepare()
-        comparison.generated.launch()
-        _synchronize(comparison)
-    except Exception as error:
-        raise PipelineStageError("generated_launch", str(error)) from error
+    if comparison.generated is not None:
+        report_stage("generated_launch")
+        try:
+            if comparison.generated.prepare is not None:
+                comparison.generated.prepare()
+            comparison.generated.launch()
+            _synchronize(comparison)
+        except Exception as error:
+            raise PipelineStageError("generated_launch", str(error)) from error
     if run_only:
         if comparison.device_type != "cpu" and before_benchmark is not None:
             before_benchmark()
@@ -379,6 +380,25 @@ def evaluate(
     except Exception as error:
         raise PipelineStageError("source_launch", str(error)) from error
 
+    def measure_reference() -> float | None:
+        if source_time_ms is not None or not measure_source:
+            return source_time_ms
+        samples = []
+        for stage, warmup in (("source_benchmark", 25), ("source_reverse_benchmark", 0)):
+            report_stage(stage)
+            try:
+                samples.append(_benchmark_launch(comparison.source, comparison, warmup, benchmark_time_budget_ms))
+            except Exception as error:
+                if source_timing_error is not None and source_timing_error(error):
+                    return None
+                raise PipelineStageError(stage, str(error)) from error
+        return statistics.median(samples)
+
+    if comparison.generated is None:
+        if comparison.device_type != "cpu" and before_benchmark is not None:
+            before_benchmark()
+        return None, measure_reference()
+
     def validate_outputs() -> None:
         report_stage("numerical_comparison")
         compare_outputs(
@@ -398,23 +418,11 @@ def evaluate(
         generated_first = _benchmark_launch(comparison.generated, comparison, 25, benchmark_time_budget_ms)
     except Exception as error:
         raise PipelineStageError("generated_benchmark", str(error)) from error
-    if source_time_ms is not None or not measure_source:
-        source_first = source_second = source_time_ms
-    else:
-        for stage, warmup in (("source_benchmark", 25), ("source_reverse_benchmark", 0)):
-            report_stage(stage)
-            try:
-                source_ms = _benchmark_launch(comparison.source, comparison, warmup, benchmark_time_budget_ms)
-            except Exception as error:
-                if source_timing_error is not None and source_timing_error(error):
-                    # The candidate window and numerical comparison already finished.
-                    # Do not reuse a stream after an unsupported reference capture.
-                    return generated_first, None
-                raise PipelineStageError(stage, str(error)) from error
-            if warmup:
-                source_first = source_ms
-            else:
-                source_second = source_ms
+    source_ms = measure_reference()
+    if source_ms is None and measure_source:
+        # The candidate window and numerical comparison already finished.
+        # Do not reuse a stream after an unsupported reference capture.
+        return generated_first, None
     report_stage("generated_reverse_benchmark")
     try:
         generated_second = _benchmark_launch(comparison.generated, comparison, 0, benchmark_time_budget_ms)
@@ -425,5 +433,5 @@ def evaluate(
         validate_outputs()
     return (
         statistics.median((generated_first, generated_second)),
-        None if source_first is None else statistics.median((source_first, source_second)),
+        source_ms,
     )
