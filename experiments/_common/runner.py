@@ -351,7 +351,7 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
     parser.add_argument("--jobs", type=int, default=4,
                         help="maximum concurrent preparation workers; measurement is isolated")
     parser.add_argument("--tuning-config", type=Path,
-                        help="compile-time JSON profile override")
+                        help="compile-time JSON profile override; cuTile defaults to its production profile")
     parser.add_argument("--source-results", type=Path,
                         help="reuse source_p50_ms from an existing result CSV; still compare outputs")
     parser.add_argument("--worker-timeout", type=int, default=WORKER_TIMEOUT_SECONDS,
@@ -368,6 +368,8 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
         parser.error("--cutile-compiler-timeout must be positive")
     if arguments.jobs <= 0:
         parser.error("--jobs must be positive")
+    if arguments.tuning_config is None and (arguments.target or arguments.provider) == "cutile":
+        arguments.tuning_config = PROJECT_ROOT / "experiments/gpu/providers/cutile/tuning.json"
     if arguments.tuning_config is not None:
         arguments.tuning_config = arguments.tuning_config.resolve(strict=True)
     source_rows = None

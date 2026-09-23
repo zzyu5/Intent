@@ -54,7 +54,6 @@ case "${provider}" in
     ;;
 esac
 if [[ "${target}" == cutile ]]; then
-  tuning_config=${INTENT_TUNING_CONFIG:-${project_root}/experiments/gpu/providers/cutile/tuning.json}
   if [[ "${provider}" == triton ]]; then
     cutile_python=${INTENT_CUTILE_PYTHON:-${HOME}/.venvs/intentdsl-cutile/bin/python}
     INTENT_CUTILE_SITE_PACKAGES=$("${cutile_python}" -c \
