@@ -19,9 +19,9 @@ def view_byte_span(view) -> tuple[int, int]:
     return pointer + low * size, pointer + (high + 1) * size
 
 
-def views_overlap(lhs, rhs) -> bool:
-    left_start, left_end = view_byte_span(lhs)
-    right_start, right_end = view_byte_span(rhs)
+def byte_spans_overlap(lhs: tuple[int, int], rhs: tuple[int, int]) -> bool:
+    left_start, left_end = lhs
+    right_start, right_end = rhs
     return (left_start < left_end and right_start < right_end and
             left_start < right_end and right_start < left_end)
 

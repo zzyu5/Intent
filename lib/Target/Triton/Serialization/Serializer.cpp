@@ -302,20 +302,22 @@ private:
       descriptorAllocator = allocator;
     });
     kernel.walk([&](TensorDescriptorOp descriptor) {
-      std::string name =
-          "_intent_descriptor_" + std::to_string(descriptors.size());
-      descriptors.push_back({descriptor, name});
+      std::string name = "_intent_descriptor_" + std::to_string(descriptors.size());
+      while (!argumentNames.insert(name).second)
+        name += "_";
       values[descriptor.getResult()] = name;
-      argumentNames.insert(name);
+      descriptors.push_back({descriptor, name});
     });
     while (!argumentNames.insert(overlapFunction).second)
       overlapFunction += "_";
+    while (!argumentNames.insert(overlapSpanFunction).second)
+      overlapSpanFunction += "_";
+    while (!argumentNames.insert(overlapArgument).second)
+      overlapArgument += "_";
     kernel.walk([&](ViewOverlapOp overlap) {
-      std::string name = "_intent_overlap_" + std::to_string(overlapFacts.size());
-      while (!argumentNames.insert(name).second)
-        name += "_";
+      values[overlap.getResult()] = overlapArgument + "[" +
+                                   std::to_string(overlapFacts.size()) + "]";
       overlapFacts.push_back(overlap);
-      values[overlap.getResult()] = name;
       constexprValues.insert(overlap.getResult());
     });
     if (descriptorChoice && !descriptorAllocator) {
@@ -332,8 +334,9 @@ private:
               "from intent.runtime.triton import TuningHooks\n"
               "from intent.runtime.triton_math import contract_fma\n\n";
     if (!overlapFacts.empty())
-      output << "from intent.runtime.tuning import views_overlap as "
-             << overlapFunction << "\n\n";
+      output << "from intent.runtime.tuning import byte_spans_overlap as "
+             << overlapFunction << ", view_byte_span as "
+             << overlapSpanFunction << "\n\n";
   }
 
   void emitDescriptorHelpers() {
@@ -398,19 +401,26 @@ private:
               "    buffer = torch.empty(size, dtype=torch.int8, device=\"cuda\")\n"
               "    if buffer.data_ptr() % alignment != 0:\n"
               "        raise RuntimeError(\"Triton descriptor allocator returned a misaligned buffer\")\n"
-              "    return buffer\n\n"
-              "def _intent_host_tensor_descriptor_pre_hook(args):\n";
-    if (!descriptors.empty())
-      output << "    if not _intent_tensor_descriptor_shapes_legal(args, args[\"num_stages\"]):\n"
-                "        return\n"
-                "    if not isinstance(args[\""
-             << descriptors.front().name
-             << "\"], TensorDescriptor):\n"
-                "        return\n";
-    for (const DescriptorABI &descriptor : descriptors)
-      output << "    args[\"" << descriptor.name << "\"].block_shape = "
-             << descriptorBlockShape(descriptor) << "\n";
-    output << "\n";
+              "    return buffer\n\n";
+    for (const DescriptorABI &descriptor : descriptors) {
+      TensorDescriptorOp operation = descriptor.operation;
+      std::string base = "args[\"" + valueString(operation.getBase()) + "\"]";
+      SmallVector<std::string> shape;
+      SmallVector<std::string> strides;
+      for (Value extent : operation.getShape())
+        shape.push_back(descriptorHostValue(extent, /*argumentMap=*/true));
+      for (Value stride : operation.getStrides())
+        strides.push_back(descriptorHostValue(stride, /*argumentMap=*/true));
+      output << "def _intent_bind" << descriptor.name << "(args):\n"
+             << "    if not args[\"" << descriptorChoice.getConfigParameter()
+             << "\"]:\n"
+             << "        return " << base << "\n"
+             << "    return TensorDescriptor(" << base
+             << ", shape=" << stringList(shape)
+             << ", strides=" << stringList(strides)
+             << ", block_shape=" << descriptorBlockShape(descriptor)
+             << ", padding=\"" << operation.getPadding() << "\")\n\n";
+    }
   }
 
   void emitConfigPruner() {
@@ -564,11 +574,7 @@ private:
       }
       output << "}, num_warps=" << config.warps
              << ", num_stages=" << config.stages
-             << ", num_ctas=" << config.ctas;
-      if (descriptorChoice)
-        output << ", pre_hook=_intent_host_tensor_descriptor_pre_hook";
-      output
-             << "),\n";
+             << ", num_ctas=" << config.ctas << "),\n";
     }
     output << "    ],\n    key=[";
     bool firstKey = true;
@@ -578,11 +584,11 @@ private:
       firstKey = false;
       output << "\"" << metadata.name << "\"";
     }
-    for (ViewOverlapOp overlap : overlapFacts) {
+    if (!overlapFacts.empty()) {
       if (!firstKey)
         output << ", ";
       firstKey = false;
-      output << "\"" << valueString(overlap.getResult()) << "\"";
+      output << "\"" << overlapArgument << "\"";
     }
     if (descriptorChoice) {
       if (!firstKey)
@@ -596,11 +602,14 @@ private:
       output << "    prune_configs_by={\"early_config_prune\": "
                 "_intent_prune_configs},\n";
     output << ")\n";
-    if (!fullCoverageParameters.empty()) {
+    if (!fullCoverageParameters.empty() || !descriptors.empty()) {
       output << "@triton.heuristics({\n";
       for (const auto &[parameter, coverage] : fullCoverageParameters)
         output << "    \"" << parameter << "\": _intent_cover_" << parameter
                << ",\n";
+      for (const DescriptorABI &descriptor : descriptors)
+        output << "    \"" << descriptor.name << "\": _intent_bind"
+               << descriptor.name << ",\n";
       output << "})\n";
     }
     output << "@triton.jit\ndef _intent_kernel(";
@@ -610,12 +619,6 @@ private:
         output << ", ";
       first = false;
       output << view.name;
-    }
-    for (const DescriptorABI &descriptor : descriptors) {
-      if (!first)
-        output << ", ";
-      first = false;
-      output << descriptor.name;
     }
     for (const ScalarABI &scalar : scalars) {
       if (!first)
@@ -633,11 +636,11 @@ private:
       first = false;
       output << metadata.name << ": tl.constexpr";
     }
-    for (ViewOverlapOp overlap : overlapFacts) {
+    if (!overlapFacts.empty()) {
       if (!first)
         output << ", ";
       first = false;
-      output << valueString(overlap.getResult()) << ": tl.constexpr";
+      output << overlapArgument << ": tl.constexpr";
     }
     if (descriptorChoice) {
       if (!first)
@@ -661,6 +664,8 @@ private:
     });
     for (StringRef parameter : parameters)
       output << ", " << parameter << ": tl.constexpr";
+    for (const DescriptorABI &descriptor : descriptors)
+      output << ", " << descriptor.name;
     output << "):\n";
     indent = 1;
     kernel.walk([&](gpu::ParameterOp parameter) {
@@ -761,10 +766,23 @@ private:
         line(metadata.name + " = " + source.name + ".stride(" +
                  std::to_string(metadata.sourceAxis) + ")", 1);
     }
-    for (ViewOverlapOp overlap : overlapFacts)
-      line(valueString(overlap.getResult()) + " = " + overlapFunction + "(" +
-               valueString(overlap.getLhs()) + ", " +
-               valueString(overlap.getRhs()) + ")", 1);
+    llvm::DenseMap<Value, std::string> overlapSpans;
+    SmallVector<std::string> overlapChecks;
+    for (ViewOverlapOp overlap : overlapFacts) {
+      for (Value view : overlap.getOperands()) {
+        if (overlapSpans.count(view))
+          continue;
+        std::string name = newName();
+        overlapSpans[view] = name;
+        line(name + " = " + overlapSpanFunction + "(" + valueString(view) +
+                 ")", 1);
+      }
+      overlapChecks.push_back(overlapFunction + "(" +
+                              overlapSpans.lookup(overlap.getLhs()) + ", " +
+                              overlapSpans.lookup(overlap.getRhs()) + ")");
+    }
+    if (!overlapChecks.empty())
+      line(overlapArgument + " = " + stringTuple(overlapChecks), 1);
     if (descriptorChoice) {
       std::string eligibility;
       for (const DescriptorABI &descriptor : descriptors) {
@@ -775,27 +793,6 @@ private:
       }
       line(descriptorChoice.getEligibilityArgument().str() + " = (" +
                eligibility + ")",
-           1);
-    }
-    for (const DescriptorABI &descriptor : descriptors) {
-      TensorDescriptorOp declaration = descriptor.operation;
-      std::string view = valueString(declaration.getBase());
-      SmallVector<std::string> shape;
-      SmallVector<std::string> strides;
-      SmallVector<std::string> initialBlockShape;
-      for (Value extent : declaration.getShape())
-        shape.push_back(descriptorLaunchValue(extent));
-      for (Value stride : declaration.getStrides())
-        strides.push_back(descriptorLaunchValue(stride));
-      for (int64_t extent : declaration.getInitialBlockShape())
-        initialBlockShape.push_back(std::to_string(extent));
-      line(descriptor.name + " = (TensorDescriptor(" + view +
-               ", shape=" + stringList(shape) + ", strides=" +
-               stringList(strides) + ", block_shape=" +
-               stringList(initialBlockShape) + ", padding=\"" +
-               declaration.getPadding().str() + "\") if " +
-               descriptorChoice.getEligibilityArgument().str() + " else " + view +
-               ")",
            1);
     }
     auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
@@ -817,12 +814,6 @@ private:
       first = false;
       call += view.name;
     }
-    for (const DescriptorABI &descriptor : descriptors) {
-      if (!first)
-        call += ", ";
-      first = false;
-      call += descriptor.name;
-    }
     for (const ScalarABI &scalar : scalars) {
       if (!first)
         call += ", ";
@@ -832,8 +823,8 @@ private:
     for (const MetadataABI &metadata : metadataArguments) {
       call += ", " + metadata.name;
     }
-    for (ViewOverlapOp overlap : overlapFacts)
-      call += ", " + valueString(overlap.getResult());
+    if (!overlapFacts.empty())
+      call += ", " + overlapArgument;
     if (descriptorChoice)
       call += ", " + descriptorChoice.getEligibilityArgument().str();
     // Ordinary arithmetic permits FMA while preserving subnormals.
@@ -1229,7 +1220,7 @@ private:
       assign(contract.getResult(), "tl.dot(" + valueString(contract.getLhs()) +
                                       ", " + valueString(contract.getRhs()) +
                                       ", " + valueString(contract.getAccumulator()) +
-                                      ", input_precision=\"ieee\", out_dtype=" +
+                                      ", input_precision=\"ieee\", max_num_imprecise_acc=0, out_dtype=" +
                                       pythonType(contract.getResult()
                                                      .getType()
                                                      .getElementType()) + ")");
@@ -1799,10 +1790,6 @@ private:
     return "<unsupported-descriptor-launch-value>";
   }
 
-  std::string descriptorLaunchValue(Value value) {
-    return descriptorHostValue(value, /*argumentMap=*/false);
-  }
-
   std::string descriptorContractCall(const DescriptorABI &descriptor,
                                      bool argumentMap) {
     TensorDescriptorOp operation = descriptor.operation;
@@ -2067,7 +2054,9 @@ private:
   SmallVector<ScalarABI> scalars;
   SmallVector<MetadataABI> metadataArguments;
   SmallVector<ViewOverlapOp> overlapFacts;
-  std::string overlapFunction = "_intent_views_overlap";
+  std::string overlapArgument = "_intent_overlaps";
+  std::string overlapFunction = "_intent_byte_spans_overlap";
+  std::string overlapSpanFunction = "_intent_view_byte_span";
   llvm::StringMap<MetadataABI> metadataByName;
   llvm::DenseMap<int64_t, MetadataABI> dimensionBindings;
   std::map<std::string, CoverageParameter> fullCoverageParameters;
