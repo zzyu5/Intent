@@ -395,13 +395,7 @@ planBlockAccess(Value resource, ValueRange coordinates,
   } else if (fill) {
     return std::nullopt;
   }
-  for (int64_t viewAxis : boundaryFact.boundaryAxes) {
-    auto found = llvm::find(plan.blockAxes, viewAxis);
-    if (found == plan.blockAxes.end())
-      return std::nullopt;
-    plan.boundaryAxes.push_back(
-        static_cast<int64_t>(std::distance(plan.blockAxes.begin(), found)));
-  }
+  llvm::append_range(plan.boundaryAxes, boundaryFact.boundaryAxes);
   llvm::sort(plan.boundaryAxes);
   for (int64_t axis = 0;
        axis < static_cast<int64_t>(fragment.getShape().size()); ++axis)
@@ -416,13 +410,24 @@ LogicalResult materializeBlockPointerForms(func::FuncOp kernel) {
   SmallVector<std::pair<gpu::LoadOp, BlockAccessPlan>, 4> loads;
   SmallVector<std::pair<gpu::StoreOp, BlockAccessPlan>, 4> stores;
   gpu::PhysicalProgramAnalysis analysis(kernel);
+  auto projectBoundaries = [](BlockAccessPlan &plan) {
+    for (int64_t &axis : plan.boundaryAxes) {
+      auto found = llvm::find(plan.blockAxes, axis);
+      if (found == plan.blockAxes.end())
+        return false;
+      axis = std::distance(plan.blockAxes.begin(), found);
+    }
+    llvm::sort(plan.boundaryAxes);
+    return true;
+  };
   kernel.walk([&](gpu::LoadOp load) {
     gpu::PhysicalAccessBoundaryFact boundary =
         analysis.boundaryValidity(load);
     if (std::optional<BlockAccessPlan> plan = planBlockAccess(
             load.getResource(), load.getCoordinates(), load.getSourceAxes(),
             load.getResult().getType(), load.getValid(), load.getFill(),
-            boundary))
+            boundary);
+        plan && projectBoundaries(*plan))
       loads.emplace_back(load, std::move(*plan));
   });
   kernel.walk([&](gpu::StoreOp store) {
@@ -430,7 +435,8 @@ LogicalResult materializeBlockPointerForms(func::FuncOp kernel) {
         analysis.boundaryValidity(store);
     if (std::optional<BlockAccessPlan> plan = planBlockAccess(
             store.getResource(), store.getCoordinates(), store.getSourceAxes(),
-            store.getValue().getType(), store.getValid(), Value(), boundary))
+            store.getValue().getType(), store.getValid(), Value(), boundary);
+        plan && projectBoundaries(*plan))
       stores.emplace_back(store, std::move(*plan));
   });
   if (loads.empty() && stores.empty())
@@ -658,6 +664,7 @@ bool descriptorStrideAvailable(func::FuncOp kernel, gpu::ViewType view,
 }
 
 bool descriptorOffsetAligned(Value value, int64_t alignment,
+                             StringAttr alignedBlockParameter,
                              unsigned depth = 0) {
   if (!value || !value.getType().isIndex() || depth >= 32)
     return false;
@@ -678,13 +685,16 @@ bool descriptorOffsetAligned(Value value, int64_t alignment,
       parameter = *resolved;
   }
   if (parameter) {
+    if (parameter.getParameter().getName() == alignedBlockParameter)
+      return true;
     auto candidates = parameter.getParameter().getCandidates().asArrayRef();
     return !candidates.empty() && llvm::all_of(candidates, [&](int64_t candidate) {
       return candidate % alignment == 0;
     });
   }
   auto aligned = [&](Value operand) {
-    return descriptorOffsetAligned(operand, alignment, depth + 1);
+    return descriptorOffsetAligned(operand, alignment, alignedBlockParameter,
+                                   depth + 1);
   };
   if (auto argument = dyn_cast<BlockArgument>(value)) {
     auto loop = dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
@@ -706,18 +716,11 @@ bool descriptorOffsetAligned(Value value, int64_t alignment,
 bool descriptorAccessEligible(func::FuncOp kernel, Value viewValue,
                               ValueRange offsets,
                               ArrayRef<int64_t> blockAxes,
-                              ArrayRef<int64_t> boundaryAxes,
                               gpu::FragmentType fragment) {
   auto view = cast<gpu::ViewType>(viewValue.getType());
   unsigned blockRank = fragment.getShape().size();
-  if (view.getRank() < 2 || view.getRank() > 5 || blockRank != 2 ||
-      blockAxes != ArrayRef<int64_t>{
-                       static_cast<int64_t>(view.getRank()) - 2,
-                       static_cast<int64_t>(view.getRank()) - 1})
-    return false;
-  // Flattening batch axes cannot represent a boundary inside an individual
-  // matrix row dimension. Such accesses retain their native block pointer.
-  if (view.getRank() > 2 && llvm::is_contained(boundaryAxes, 0))
+  if (view.getRank() < 1 || view.getRank() > 5 || blockRank == 0 ||
+      !llvm::is_contained(blockAxes, static_cast<int64_t>(view.getRank()) - 1))
     return false;
   std::optional<int64_t> elementBytes =
       descriptorElementBytes(view.getElementType());
@@ -732,30 +735,27 @@ bool descriptorAccessEligible(func::FuncOp kernel, Value viewValue,
   if (auto last = dyn_cast<IntegerAttr>(strides[strides.size() - 1]);
       last && last.getInt() != 1)
     return false;
-  // The final two axes become descriptor rows and columns.  A padded row
-  // stride is directly representable, while earlier source axes must flatten
-  // contiguously into that row coordinate.
-  for (unsigned axis = 0; axis + 2 < view.getRank(); ++axis) {
+  for (unsigned axis = 0; axis + 1 < view.getRank(); ++axis) {
     auto stride = dyn_cast<IntegerAttr>(strides[axis]);
-    auto nextStride = dyn_cast<IntegerAttr>(strides[axis + 1]);
-    auto nextExtent =
-        dyn_cast<gpu::PhysicalExprAttr>(layout.getExtents()[axis + 1]);
-    if (!stride || !nextStride || !nextExtent ||
-        nextExtent.getKind() !=
-            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant))
-      continue;
-    __int128 expected = static_cast<__int128>(nextStride.getInt()) *
-                        nextExtent.getValue();
-    if (expected != stride.getInt())
+    if (stride && (stride.getInt() * *elementBytes) % 16 != 0)
       return false;
   }
-  auto rowStride = dyn_cast<IntegerAttr>(strides[view.getRank() - 2]);
-  if (rowStride && (rowStride.getInt() * *elementBytes) % 16 != 0)
-    return false;
   // TMA requires aligned coordinates, not constant coordinates. Tile starts
   // and reduction-loop induction values preserve power-of-two divisibility,
   // including under fixed-width index arithmetic.
-  return descriptorOffsetAligned(offsets[blockAxes.back()], 16 / *elementBytes);
+  // Descriptor configs already require a power-of-two contiguous block of
+  // at least 16 bytes. Its extent parameter is aligned in this branch even
+  // when the shared parameter domain also includes smaller pointer tiles.
+  unsigned contiguousAxis = std::distance(
+      blockAxes.begin(), llvm::find(blockAxes, view.getRank() - 1));
+  auto extent =
+      cast<gpu::PhysicalExprAttr>(fragment.getShape()[contiguousAxis]);
+  StringAttr alignedBlockParameter;
+  if (extent.getKind() ==
+      static_cast<uint32_t>(gpu::PhysicalExprKind::Parameter))
+    alignedBlockParameter = extent.getSymbol();
+  return descriptorOffsetAligned(offsets.back(), 16 / *elementBytes,
+                                  alignedBlockParameter);
 }
 
 void copyOrigin(Operation *source, Operation *target) {
@@ -789,9 +789,7 @@ FailureOr<Value> descriptorStrideValue(OpBuilder &builder, func::FuncOp kernel,
 }
 
 FailureOr<SmallVector<Value>> materializeDescriptorOffsets(
-    OpBuilder &builder, func::FuncOp kernel, Location location, Value viewValue,
-    ValueRange offsets) {
-  auto view = cast<gpu::ViewType>(viewValue.getType());
+    OpBuilder &builder, Location location, ValueRange offsets) {
   auto nativeOffsets = [&](ValueRange coordinates) {
     // Descriptor shapes are at most INT32_MAX and blocks at most 2^20
     // elements. A start outside signed i32 therefore denotes an entirely
@@ -813,31 +811,7 @@ FailureOr<SmallVector<Value>> materializeDescriptorOffsets(
     }
     return result;
   };
-  if (view.getRank() == 2)
-    return nativeOffsets(offsets);
-  Value rowElements;
-  for (unsigned axis = 0; axis + 1 < view.getRank(); ++axis) {
-    FailureOr<Value> stride =
-        descriptorStrideValue(builder, kernel, location, view, axis);
-    if (failed(stride))
-      return failure();
-    Value term = builder.create<gpu::BinaryOp>(
-        location, builder.getIndexType(), offsets[axis], *stride,
-        BinaryOperator::Multiply);
-    rowElements = rowElements
-                      ? Value(builder.create<gpu::BinaryOp>(
-                            location, builder.getIndexType(), rowElements, term,
-                            BinaryOperator::Add))
-                      : term;
-  }
-  FailureOr<Value> rowStride = descriptorStrideValue(
-      builder, kernel, location, view, view.getRank() - 2);
-  if (!rowElements || failed(rowStride))
-    return failure();
-  Value row = builder.create<gpu::BinaryOp>(
-      location, builder.getIndexType(), rowElements, *rowStride,
-      BinaryOperator::FloorDivide);
-  return nativeOffsets(ValueRange{row, offsets.back()});
+  return nativeOffsets(offsets);
 }
 
 FailureOr<TensorDescriptorChoiceOp>
@@ -854,19 +828,28 @@ materializeTensorDescriptorForms(
   if (!hasContraction)
     return TensorDescriptorChoiceOp();
 
-  SmallVector<BlockLoadOp> loads;
-  SmallVector<BlockStoreOp> stores;
-  kernel.walk([&](BlockLoadOp load) {
-    if (descriptorAccessEligible(kernel, load.getView(), load.getOffsets(),
-                                 load.getBlockAxes(), load.getBoundaryAxes(),
-                                 load.getResult().getType()))
-      loads.push_back(load);
+  SmallVector<std::pair<gpu::LoadOp, BlockAccessPlan>, 4> loads;
+  SmallVector<std::pair<gpu::StoreOp, BlockAccessPlan>, 4> stores;
+  gpu::PhysicalProgramAnalysis analysis(kernel);
+  kernel.walk([&](gpu::LoadOp load) {
+    auto plan = planBlockAccess(
+        load.getResource(), load.getCoordinates(), load.getSourceAxes(),
+        load.getResult().getType(), load.getValid(), load.getFill(),
+        analysis.boundaryValidity(load));
+    if (plan && descriptorAccessEligible(
+                    kernel, load.getResource(), plan->offsets, plan->blockAxes,
+                    cast<gpu::FragmentType>(load.getResult().getType())))
+      loads.emplace_back(load, std::move(*plan));
   });
-  kernel.walk([&](BlockStoreOp store) {
-    if (descriptorAccessEligible(kernel, store.getView(), store.getOffsets(),
-                                 store.getBlockAxes(), store.getBoundaryAxes(),
-                                 store.getValue().getType()))
-      stores.push_back(store);
+  kernel.walk([&](gpu::StoreOp store) {
+    auto plan = planBlockAccess(
+        store.getResource(), store.getCoordinates(), store.getSourceAxes(),
+        store.getValue().getType(), store.getValid(), Value(),
+        analysis.boundaryValidity(store));
+    if (plan && descriptorAccessEligible(
+                    kernel, store.getResource(), plan->offsets, plan->blockAxes,
+                    cast<gpu::FragmentType>(store.getValue().getType())))
+      stores.emplace_back(store, std::move(*plan));
   });
   if (loads.empty() && stores.empty())
     return TensorDescriptorChoiceOp();
@@ -879,36 +862,71 @@ materializeTensorDescriptorForms(
   struct DescriptorPlan {
     Value view;
     gpu::FragmentType fragment;
+    gpu::FragmentType orderedFragment;
+    gpu::FragmentType nativeFragment;
     SmallVector<int64_t> blockAxes;
+    SmallVector<int64_t> permutation;
     TensorDescriptorOp descriptor;
   };
   SmallVector<DescriptorPlan> descriptors;
+  auto [nextSource, nextDimension] = gpu::nextPhysicalAxisIdentities(kernel);
   auto descriptorFor = [&](Value viewValue, gpu::FragmentType fragment,
                            ArrayRef<int64_t> blockAxes)
-      -> FailureOr<TensorDescriptorOp> {
+      -> FailureOr<DescriptorPlan> {
     for (const DescriptorPlan &plan : descriptors)
       if (plan.view == viewValue && plan.fragment == fragment &&
           ArrayRef<int64_t>(plan.blockAxes) == blockAxes)
-        return plan.descriptor;
+        return plan;
     auto view = cast<gpu::ViewType>(viewValue.getType());
     SmallVector<Value> dimensions;
     for (unsigned axis = 0; axis < view.getRank(); ++axis)
       dimensions.push_back(entry.create<gpu::DimOp>(
           kernel.getLoc(), entry.getIndexType(), viewValue, axis));
-    Value rows = dimensions.front();
-    for (unsigned axis = 1; axis + 1 < dimensions.size(); ++axis)
-      rows = entry.create<gpu::BinaryOp>(kernel.getLoc(), entry.getIndexType(),
-                                        rows, dimensions[axis],
-                                        BinaryOperator::Multiply);
-    Value one = entry.create<arith::ConstantIndexOp>(kernel.getLoc(), 1);
-    SmallVector<Value> shape{rows, dimensions.back()};
-    FailureOr<Value> rowStride = descriptorStrideValue(
-        entry, kernel, kernel.getLoc(), view, view.getRank() - 2);
-    if (failed(rowStride))
-      return failure();
-    SmallVector<Value> strides{*rowStride, one};
+    SmallVector<Value> strides;
+    SmallVector<int64_t> alignedAxes;
+    for (unsigned axis = 0; axis + 1 < view.getRank(); ++axis) {
+      auto stride = descriptorStrideValue(entry, kernel, kernel.getLoc(), view,
+                                          axis);
+      if (failed(stride))
+        return failure();
+      strides.push_back(*stride);
+      alignedAxes.push_back(axis);
+    }
+    strides.push_back(entry.create<arith::ConstantIndexOp>(kernel.getLoc(), 1));
+    SmallVector<Attribute> shape, mappings, orderedShape, orderedMappings;
+    SmallVector<int64_t> permutation;
+    for (unsigned axis = 0; axis < view.getRank(); ++axis) {
+      auto found = llvm::find(blockAxes, axis);
+      if (found != blockAxes.end()) {
+        unsigned fragmentAxis = std::distance(blockAxes.begin(), found);
+        shape.push_back(fragment.getShape()[fragmentAxis]);
+        auto mapping = cast<gpu::AxisMapAttr>(fragment.getAxisMaps()[fragmentAxis]);
+        mappings.push_back(gpu::AxisMapAttr::get(
+            kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+            mapping.getDimensionId(), axis, mapping.getDerived()));
+        orderedShape.push_back(fragment.getShape()[fragmentAxis]);
+        orderedMappings.push_back(gpu::AxisMapAttr::get(
+            kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+            mapping.getDimensionId(), permutation.size(), mapping.getDerived()));
+        permutation.push_back(fragmentAxis);
+      } else {
+        shape.push_back(gpu::PhysicalExprAttr::get(
+            kernel.getContext(),
+            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), 1,
+            entry.getStringAttr(""), entry.getArrayAttr({})));
+        mappings.push_back(gpu::AxisMapAttr::get(
+            kernel.getContext(), nextSource++, 0, nextDimension++, axis, true));
+      }
+    }
+    auto nativeFragment = gpu::FragmentType::get(
+        kernel.getContext(), fragment.getElementType(), entry.getArrayAttr(shape),
+        entry.getArrayAttr(mappings), fragment.getValidity(), fragment.getOwner());
+    auto orderedFragment = gpu::FragmentType::get(
+        kernel.getContext(), fragment.getElementType(),
+        entry.getArrayAttr(orderedShape), entry.getArrayAttr(orderedMappings),
+        fragment.getValidity(), fragment.getOwner());
     SmallVector<Value> descriptorBlockShape;
-    for (Attribute extent : fragment.getShape())
+    for (Attribute extent : nativeFragment.getShape())
       descriptorBlockShape.push_back(entry.create<gpu::PhysicalExprOp>(
           kernel.getLoc(), entry.getIndexType(),
           cast<gpu::PhysicalExprAttr>(extent)));
@@ -926,15 +944,12 @@ materializeTensorDescriptorForms(
           maximumBlockElements,
           capabilities.getMaxDynamicSharedMemoryPerBlock() / *elementBytes);
     }
-    SmallVector<int64_t> flattenedContiguousAxes;
-    for (unsigned axis = 0; axis + 2 < view.getRank(); ++axis)
-      flattenedContiguousAxes.push_back(axis);
+    SmallVector<int64_t> initialBlockShape(view.getRank(), 1);
+    initialBlockShape.back() = 16 / *elementBytes;
     auto descriptor = entry.create<TensorDescriptorOp>(
-        kernel.getLoc(), viewValue.getType(), viewValue, shape, strides,
+        kernel.getLoc(), viewValue.getType(), viewValue, dimensions, strides,
         descriptorBlockShape, blockAxes,
-        ArrayRef<int64_t>{1, 16 / *elementBytes}, "flattened_row_major",
-        "zero", flattenedContiguousAxes,
-        ArrayRef<int64_t>{static_cast<int64_t>(view.getRank()) - 2},
+        initialBlockShape, "strided", "zero", alignedAxes,
         ArrayRef<int64_t>{static_cast<int64_t>(view.getRank()) - 1},
         /*requirePositiveShape=*/true,
         /*requirePositiveStrides=*/true,
@@ -943,18 +958,21 @@ materializeTensorDescriptorForms(
         /*maximumShapeExtent=*/std::numeric_limits<int32_t>::max(),
         maximumBlockElements);
     descriptors.push_back(
-        {viewValue, fragment,
-         SmallVector<int64_t>(blockAxes.begin(), blockAxes.end()), descriptor});
-    return descriptor;
+        {viewValue, fragment, orderedFragment, nativeFragment,
+         SmallVector<int64_t>(blockAxes.begin(), blockAxes.end()),
+         permutation, descriptor});
+    return descriptors.back();
   };
-  for (BlockLoadOp load : loads)
-    if (failed(descriptorFor(load.getView(), load.getResult().getType(),
-                             load.getBlockAxes())))
+  for (auto &[load, plan] : loads)
+    if (failed(descriptorFor(load.getResource(),
+                            cast<gpu::FragmentType>(load.getResult().getType()),
+                            plan.blockAxes)))
       return load.emitOpError(
           "could not declare its tensor-descriptor runtime contract");
-  for (BlockStoreOp store : stores)
-    if (failed(descriptorFor(store.getView(), store.getValue().getType(),
-                             store.getBlockAxes())))
+  for (auto &[store, plan] : stores)
+    if (failed(descriptorFor(store.getResource(),
+                            cast<gpu::FragmentType>(store.getValue().getType()),
+                            plan.blockAxes)))
       return store.emitOpError(
           "could not declare its tensor-descriptor runtime contract");
   SmallVector<Value> descriptorValues;
@@ -972,14 +990,24 @@ materializeTensorDescriptorForms(
     return OpBuilder(&block, block.end());
   };
 
-  for (BlockLoadOp load : loads) {
+  auto reshape = [&](OpBuilder &builder, Location location, Value value,
+                     gpu::FragmentType target) -> FailureOr<Value> {
+    if (value.getType() == target)
+      return value;
+    auto reassociation = gpu::inferReshapeReassociation(
+        cast<gpu::FragmentType>(value.getType()), target);
+    if (failed(reassociation))
+      return failure();
+    return Value(builder.create<gpu::ReshapeOp>(location, target, value,
+                                               *reassociation));
+  };
+  for (auto &[load, plan] : loads) {
     OpBuilder builder(load);
-    FailureOr<TensorDescriptorOp> descriptorDeclaration = descriptorFor(
-        load.getView(), load.getResult().getType(), load.getBlockAxes());
+    auto fragment = cast<gpu::FragmentType>(load.getResult().getType());
+    auto descriptor = descriptorFor(load.getResource(), fragment, plan.blockAxes);
     FailureOr<SmallVector<Value>> descriptorOffsets =
-        materializeDescriptorOffsets(builder, kernel, load.getLoc(),
-                                     load.getView(), load.getOffsets());
-    if (failed(descriptorDeclaration) || failed(descriptorOffsets))
+        materializeDescriptorOffsets(builder, load.getLoc(), plan.offsets);
+    if (failed(descriptor) || failed(descriptorOffsets))
       return load.emitOpError(
           "could not materialize the declared tensor-descriptor ABI");
     auto conditional = builder.create<scf::IfOp>(
@@ -987,50 +1015,62 @@ materializeTensorDescriptorForms(
         /*withElseRegion=*/true);
     OpBuilder descriptorBuilder = prepareBranch(conditional.getThenRegion());
     auto descriptorLoad = descriptorBuilder.create<DescriptorLoadOp>(
-        load.getLoc(), load.getResult().getType(),
-        descriptorDeclaration->getResult(),
-        *descriptorOffsets, load.getBoundaryAxesAttr());
+        load.getLoc(), descriptor->nativeFragment,
+        descriptor->descriptor.getResult(), *descriptorOffsets,
+        descriptorBuilder.getDenseI64ArrayAttr(plan.boundaryAxes));
     copyOrigin(load, descriptorLoad);
-    descriptorBuilder.create<scf::YieldOp>(load.getLoc(),
-                                           descriptorLoad.getResult());
+    auto result = reshape(descriptorBuilder, load.getLoc(),
+                          descriptorLoad.getResult(), descriptor->orderedFragment);
+    if (failed(result))
+      return load.emitOpError("cannot remove descriptor unit axes");
+    if (!llvm::is_sorted(descriptor->permutation)) {
+      SmallVector<int64_t> inverse(descriptor->permutation.size());
+      for (auto [axis, original] : llvm::enumerate(descriptor->permutation))
+        inverse[original] = axis;
+      result = Value(descriptorBuilder.create<gpu::TransposeOp>(
+          load.getLoc(), fragment, *result,
+          descriptorBuilder.getDenseI64ArrayAttr(inverse)));
+    }
+    descriptorBuilder.create<scf::YieldOp>(load.getLoc(), *result);
 
     OpBuilder blockBuilder = prepareBranch(conditional.getElseRegion());
-    auto block = blockBuilder.create<BlockLoadOp>(
-        load.getLoc(), load.getResult().getType(), load.getView(),
-        load.getOffsets(), load.getBlockAxesAttr(), load.getOrderAttr(),
-        load.getBoundaryAxesAttr(), load.getPaddingAttr());
-    copyOrigin(load, block);
+    auto block = cast<gpu::LoadOp>(blockBuilder.clone(*load));
     blockBuilder.create<scf::YieldOp>(load.getLoc(), block.getResult());
     load.getResult().replaceAllUsesWith(conditional.getResult(0));
     load.erase();
   }
 
-  for (BlockStoreOp store : stores) {
+  for (auto &[store, plan] : stores) {
     OpBuilder builder(store);
-    FailureOr<TensorDescriptorOp> descriptorDeclaration = descriptorFor(
-        store.getView(), store.getValue().getType(), store.getBlockAxes());
+    auto descriptor = descriptorFor(
+        store.getResource(), cast<gpu::FragmentType>(store.getValue().getType()),
+        plan.blockAxes);
     FailureOr<SmallVector<Value>> descriptorOffsets =
-        materializeDescriptorOffsets(builder, kernel, store.getLoc(),
-                                     store.getView(), store.getOffsets());
-    if (failed(descriptorDeclaration) || failed(descriptorOffsets))
+        materializeDescriptorOffsets(builder, store.getLoc(), plan.offsets);
+    if (failed(descriptor) || failed(descriptorOffsets))
       return store.emitOpError(
           "could not materialize the declared tensor-descriptor ABI");
     auto conditional = builder.create<scf::IfOp>(
         store.getLoc(), TypeRange{}, choice.getResult(),
         /*withElseRegion=*/true);
     OpBuilder descriptorBuilder = prepareBranch(conditional.getThenRegion());
+    Value ordered = store.getValue();
+    if (!llvm::is_sorted(descriptor->permutation))
+      ordered = descriptorBuilder.create<gpu::TransposeOp>(
+          store.getLoc(), descriptor->orderedFragment, ordered,
+          descriptorBuilder.getDenseI64ArrayAttr(descriptor->permutation));
+    auto value = reshape(descriptorBuilder, store.getLoc(), ordered,
+                         descriptor->nativeFragment);
+    if (failed(value))
+      return store.emitOpError("cannot insert descriptor unit axes");
     auto descriptorStore = descriptorBuilder.create<DescriptorStoreOp>(
-        store.getLoc(), descriptorDeclaration->getResult(), *descriptorOffsets,
-        store.getValue(), store.getBoundaryAxesAttr());
+        store.getLoc(), descriptor->descriptor.getResult(), *descriptorOffsets,
+        *value, descriptorBuilder.getDenseI64ArrayAttr(plan.boundaryAxes));
     copyOrigin(store, descriptorStore);
     descriptorBuilder.create<scf::YieldOp>(store.getLoc());
 
     OpBuilder blockBuilder = prepareBranch(conditional.getElseRegion());
-    auto block = blockBuilder.create<BlockStoreOp>(
-        store.getLoc(), store.getView(), store.getOffsets(), store.getValue(),
-        store.getBlockAxesAttr(), store.getOrderAttr(),
-        store.getBoundaryAxesAttr());
-    copyOrigin(store, block);
+    blockBuilder.clone(*store);
     blockBuilder.create<scf::YieldOp>(store.getLoc());
     store.erase();
   }
@@ -4261,13 +4301,14 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
       failed(legalizeSplitGatherPairs(kernel)))
     return failure();
   selectOrderedLoadUnrolling(kernel);
+  FailureOr<TensorDescriptorChoiceOp> tensorDescriptorForms =
+      materializeTensorDescriptorForms(kernel, localOptions);
+  if (failed(tensorDescriptorForms))
+    return failure();
   if (failed(materializeBlockPointerForms(kernel)))
     return failure();
   orientPointerLoads(kernel);
-  FailureOr<TensorDescriptorChoiceOp> tensorDescriptorForms =
-      materializeTensorDescriptorForms(kernel, localOptions);
-  if (failed(tensorDescriptorForms) ||
-      failed(materializeLegalConfigs(kernel, *tensorDescriptorForms, localOptions)))
+  if (failed(materializeLegalConfigs(kernel, *tensorDescriptorForms, localOptions)))
     return failure();
   selectContractForms(kernel);
   gpu::foldExactConstantDivisions(kernel);

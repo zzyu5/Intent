@@ -106,21 +106,6 @@ LogicalResult verifyDescriptorAccess(Operation *owner, Value descriptorValue,
   return success();
 }
 
-bool collectFlattenedDimensions(Value value, Value base,
-                                SmallVectorImpl<unsigned> &axes) {
-  if (auto dimension = value.getDefiningOp<gpu::DimOp>()) {
-    if (dimension.getView() != base)
-      return false;
-    axes.push_back(dimension.getAxis());
-    return true;
-  }
-  auto product = value.getDefiningOp<gpu::BinaryOp>();
-  if (!product || product.getOperatorKind() != BinaryOperator::Multiply)
-    return false;
-  return collectFlattenedDimensions(product.getLhs(), base, axes) &&
-         collectFlattenedDimensions(product.getRhs(), base, axes);
-}
-
 bool hasStrideBinding(func::FuncOp kernel, gpu::ViewType view, unsigned axis) {
   Attribute stride = view.getLayout().getStrides()[axis];
   if (auto constant = dyn_cast<IntegerAttr>(stride))
@@ -166,7 +151,7 @@ bool matchesStrideBinding(func::FuncOp kernel, gpu::ViewType view, unsigned axis
          sourceAxis.getInt() == axis && argument.getType().isIndex();
 }
 
-bool hasFlattenableDescriptorLayout(func::FuncOp kernel, gpu::ViewType view) {
+bool hasDescriptorLayout(func::FuncOp kernel, gpu::ViewType view) {
   auto layout = view.getLayout();
   if (!layout.getHasStrides() || layout.getStrides().size() != view.getRank())
     return false;
@@ -178,21 +163,10 @@ bool hasFlattenableDescriptorLayout(func::FuncOp kernel, gpu::ViewType view) {
       layout.getStrides()[layout.getStrides().size() - 1]);
   if (lastStride && lastStride.getInt() != 1)
     return false;
-  // The final two source axes become the descriptor row/column axes.  A padded
-  // row stride is representable directly; only axes flattened into the row
-  // coordinate must be mutually contiguous.
-  for (unsigned axis = 0; axis + 2 < view.getRank(); ++axis) {
+  unsigned elementBytes = view.getElementType().getIntOrFloatBitWidth() / 8;
+  for (unsigned axis = 0; axis + 1 < view.getRank(); ++axis) {
     auto stride = dyn_cast<IntegerAttr>(layout.getStrides()[axis]);
-    auto nextStride = dyn_cast<IntegerAttr>(layout.getStrides()[axis + 1]);
-    auto nextExtent =
-        dyn_cast<gpu::PhysicalExprAttr>(layout.getExtents()[axis + 1]);
-    if (!stride || !nextStride || !nextExtent ||
-        nextExtent.getKind() !=
-            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant))
-      continue;
-    __int128 expected = static_cast<__int128>(nextStride.getInt()) *
-                        nextExtent.getValue();
-    if (expected != stride.getInt())
+    if (stride && (stride.getInt() * elementBytes) % 16 != 0)
       return false;
   }
   return true;
@@ -321,26 +295,34 @@ LogicalResult TensorDescriptorOp::verify() {
       getResult().getType() != base)
     return emitOpError(
         "must preserve one external-view kernel argument as its base");
-  if (base.getRank() < 2 || base.getRank() > 5 || getShape().size() != 2 ||
-      getStrides().size() != 2 || getBlockShape().size() != 2)
+  unsigned rank = base.getRank();
+  if (rank < 1 || rank > 5 || getShape().size() != rank ||
+      getStrides().size() != rank || getBlockShape().size() != rank)
     return emitOpError(
-        "host tensor descriptor must declare a two-axis flattening of a rank-2-to-5 view");
-  if (getSourceBlockAxes() != ArrayRef<int64_t>{
-                                  static_cast<int64_t>(base.getRank()) - 2,
-                                  static_cast<int64_t>(base.getRank()) - 1})
+        "host tensor descriptor must preserve a rank-1-to-5 view");
+  auto blockAxes = getSourceBlockAxes();
+  if (blockAxes.empty() ||
+      !llvm::is_contained(blockAxes, static_cast<int64_t>(rank) - 1))
     return emitOpError(
-        "tensor descriptor flattening requires the final two source axes");
+        "tensor descriptor block axes must include the contiguous source axis");
+  llvm::SmallBitVector blocked(rank);
+  for (int64_t axis : blockAxes) {
+    if (axis < 0 || axis >= rank || blocked.test(axis))
+      return emitOpError("tensor descriptor block axes must be distinct source axes");
+    blocked.set(axis);
+  }
   int64_t elementBytes =
       static_cast<int64_t>(base.getElementType().getIntOrFloatBitWidth() / 8);
-  if (getInitialBlockShape().size() != 2 ||
-      getInitialBlockShape().front() != 1 ||
+  if (getInitialBlockShape().size() != rank ||
+      llvm::any_of(getInitialBlockShape().drop_back(),
+                   [](int64_t extent) { return extent != 1; }) ||
       getInitialBlockShape().back() <= 0 ||
       !llvm::isPowerOf2_64(getInitialBlockShape().back()) ||
       getInitialBlockShape().back() * elementBytes <
           static_cast<int64_t>(getMinimumContiguousBytes()))
     return emitOpError(
         "host tensor descriptor must declare a legal provider dummy block shape");
-  if (getBaseLayout() != "flattened_row_major" || getPadding() != "zero" ||
+  if (getBaseLayout() != "strided" || getPadding() != "zero" ||
       getAlignment() != 16 || getMinimumContiguousBytes() != 16 ||
       !getRequirePositiveShape() || !getRequirePositiveStrides() ||
       !getRequirePowerOfTwoBlockShape() ||
@@ -348,52 +330,44 @@ LogicalResult TensorDescriptorOp::verify() {
       getMaximumBlockElements() <= 0 ||
       getMaximumBlockElements() > (1 << 20))
     return emitOpError(
-        "host tensor descriptor requires the complete Triton 3.6 flattened-row-major runtime contract");
-  SmallVector<int64_t> expectedContiguousAxes;
-  for (unsigned axis = 0; axis + 2 < base.getRank(); ++axis)
-    expectedContiguousAxes.push_back(axis);
-  if (getFlattenedContiguousAxes() !=
-      ArrayRef<int64_t>(expectedContiguousAxes))
+        "host tensor descriptor requires the complete native strided runtime contract");
+  SmallVector<int64_t> alignedAxes;
+  for (unsigned axis = 0; axis + 1 < rank; ++axis)
+    alignedAxes.push_back(axis);
+  if (getAlignedStrideAxes() != ArrayRef<int64_t>(alignedAxes))
     return emitOpError(
-        "runtime contract must name every source axis flattened into descriptor rows");
-  if (getAlignedStrideAxes() != ArrayRef<int64_t>{
-                                    static_cast<int64_t>(base.getRank()) - 2})
-    return emitOpError(
-        "runtime contract must align the represented descriptor row stride");
+        "runtime contract must align every leading source stride");
   if (getUnitStrideAxes() !=
       ArrayRef<int64_t>{static_cast<int64_t>(base.getRank()) - 1})
     return emitOpError(
         "runtime contract must require the represented column stride to be one");
-  if (!hasFlattenableDescriptorLayout(kernel, base))
+  if (!hasDescriptorLayout(kernel, base))
     return emitOpError(
-        "host tensor descriptor base must carry a complete flattenable stride ABI");
+        "host tensor descriptor base must carry a complete aligned stride ABI");
   unsigned bitWidth = base.getElementType().getIntOrFloatBitWidth();
   if (bitWidth < 8 || bitWidth % 8 != 0)
     return emitOpError(
         "tensor descriptor element type must occupy whole bytes");
-  auto lastDimension = getShape().back().getDefiningOp<gpu::DimOp>();
-  SmallVector<unsigned> flattenedAxes;
-  if (!lastDimension || lastDimension.getView() != getBase() ||
-      lastDimension.getAxis() + 1 != base.getRank() ||
-      !matchesStrideBinding(kernel, base, base.getRank() - 2,
-                            getStrides().front()) ||
-      !collectFlattenedDimensions(getShape().front(), getBase(),
-                                  flattenedAxes))
-    return emitOpError(
-        "descriptor shape and strides must explicitly flatten all leading base axes");
-  SmallVector<unsigned> expectedAxes;
-  for (unsigned axis = 0; axis + 1 < base.getRank(); ++axis)
-    expectedAxes.push_back(axis);
-  if (flattenedAxes != expectedAxes)
-    return emitOpError(
-        "descriptor row shape must preserve every leading base dimension in order");
+  for (unsigned axis = 0; axis < rank; ++axis) {
+    auto dimension = getShape()[axis].getDefiningOp<gpu::DimOp>();
+    if (!dimension || dimension.getView() != getBase() ||
+        dimension.getAxis() != axis ||
+        (axis + 1 < rank &&
+         !matchesStrideBinding(kernel, base, axis, getStrides()[axis])))
+      return emitOpError(
+          "descriptor shape and strides must preserve each source axis");
+    auto extent = getBlockShape()[axis].getDefiningOp<gpu::PhysicalExprOp>();
+    if (!extent)
+      return emitOpError("descriptor block shape must use physical expressions");
+    if (!blocked.test(axis) &&
+        (extent.getExpression().getKind() !=
+             static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+         extent.getExpression().getValue() != 1))
+      return emitOpError("scalar source axes must have descriptor block extent one");
+  }
   auto unitStride = getStrides().back().getDefiningOp<arith::ConstantIndexOp>();
   if (!unitStride || unitStride.value() != 1)
     return emitOpError("tensor descriptor final stride must be one");
-  for (Value extent : getBlockShape())
-    if (!extent.getDefiningOp<gpu::PhysicalExprOp>())
-      return emitOpError(
-          "descriptor block shape must use declared physical expressions");
   unsigned choices = 0;
   unsigned allocators = 0;
   bool declaredByChoice = false;

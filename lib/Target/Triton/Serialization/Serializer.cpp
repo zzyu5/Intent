@@ -340,7 +340,7 @@ private:
     if (!descriptorChoice)
       return;
     output << "def _intent_tensor_descriptor_legal(\n"
-              "    tensor, shape, strides, source_rank, flattened_contiguous_axes,\n"
+              "    tensor, shape, strides, source_rank,\n"
               "    aligned_stride_axes, unit_stride_axes, require_positive_shape,\n"
               "    require_positive_strides, alignment, maximum_shape_extent,\n"
               "):\n"
@@ -360,9 +360,6 @@ private:
               "        return False\n"
               "    if any((tensor.stride(axis) * tensor.element_size()) % alignment != 0 "
               "for axis in aligned_stride_axes):\n"
-              "        return False\n"
-              "    if any(tensor.stride(axis) != tensor.stride(axis + 1) * tensor.shape[axis + 1] "
-              "for axis in flattened_contiguous_axes):\n"
               "        return False\n"
               "    return True\n\n"
               "def _intent_tensor_descriptor_block_shape_legal(\n"
@@ -1819,7 +1816,6 @@ private:
     return "_intent_tensor_descriptor_legal(" + base + ", " +
            stringList(shape) + ", " + stringList(strides) + ", " +
            std::to_string(view.getRank()) + ", " +
-           axisTuple(operation.getFlattenedContiguousAxes()) + ", " +
            axisTuple(operation.getAlignedStrideAxes()) + ", " +
            axisTuple(operation.getUnitStrideAxes()) + ", " +
            (operation.getRequirePositiveShape() ? "True" : "False") + ", " +

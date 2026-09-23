@@ -53,7 +53,6 @@ def IntentTriton_TensorDescriptorOp : IntentTriton_Op<"tensor_descriptor", [
                        DenseI64ArrayAttr:$initial_block_shape,
                        StrAttr:$base_layout,
                        StrAttr:$padding,
-                       DenseI64ArrayAttr:$flattened_contiguous_axes,
                        DenseI64ArrayAttr:$aligned_stride_axes,
                        DenseI64ArrayAttr:$unit_stride_axes,
                        BoolAttr:$require_positive_shape,

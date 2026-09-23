@@ -78,6 +78,12 @@ void eliminateInBlock(Block &block) {
         eliminateInBlock(nested);
     if (foldConstantDivision(operation))
       continue;
+    if (auto reshape = dyn_cast<ReshapeOp>(operation);
+        reshape && reshape.getValue().getType() == reshape.getResult().getType()) {
+      reshape.getResult().replaceAllUsesWith(reshape.getValue());
+      reshape.erase();
+      continue;
+    }
     // Parameter declarations also have symbolic type/attribute users. They are
     // retained and cleaned up by eraseUnusedPhysicalParameters, not SSA DCE.
     if (isa<ParameterOp, DelinearizeOp>(operation) ||

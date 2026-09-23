@@ -326,6 +326,25 @@ bool matchesResourceExtent(Value value, Value resource, unsigned axis) {
   return false;
 }
 
+bool capacityCoversResourceExtent(Value value, Value resource, unsigned axis) {
+  value = stripScalarIdentity(value);
+  ParameterOp parameter = value.getDefiningOp<ParameterOp>();
+  if (auto expression = value.getDefiningOp<PhysicalExprOp>();
+      expression && expression.getExpression().getKind() ==
+                        static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
+    auto resolved = queryParameterBySymbol(
+        expression->getParentOfType<func::FuncOp>(),
+        expression.getExpression().getSymbol());
+    if (succeeded(resolved))
+      parameter = *resolved;
+  }
+  if (!parameter || parameter.getParameter().getCategory() !=
+                        static_cast<uint32_t>(ParameterCategory::Coverage))
+    return false;
+  auto covered = parameter->getAttrOfType<PhysicalExprAttr>(coverageBoundAttr);
+  return covered && covered == resourceExtentExpression(resource, axis);
+}
+
 bool upperBoundWithinResource(Value value, Value resource, unsigned axis) {
   if (matchesResourceExtent(value, resource, axis))
     return true;
@@ -4588,6 +4607,7 @@ PhysicalProgramAnalysis::boundaryValidity(Operation *access,
   }
 
   llvm::DenseSet<int64_t> boundaryAxes;
+  std::optional<bool> boundedMembers;
   std::function<PhysicalFactState(Value)> analyze =
       [&](Value value) -> PhysicalFactState {
     if (auto broadcast = value.getDefiningOp<BroadcastOp>())
@@ -4674,6 +4694,16 @@ PhysicalProgramAnalysis::boundaryValidity(Operation *access,
       bool exactRange =
           upperComparison && hasExactPhysicalRangeCoverage(
                                  coordinate, comparison.getRhs());
+      if (upperComparison && !viewBoundary && !exactRange &&
+          capacityCoversResourceExtent(comparison.getRhs(), accessFact.resource,
+                                      sourceAxis)) {
+        // A padded capacity is a weaker bound than the view extent. It is
+        // redundant only when the original validity (or an unconditional
+        // range fact) already confines active members to that view.
+        if (!boundedMembers)
+          boundedMembers = accessBounds(access).isExact();
+        exactRange = *boundedMembers;
+      }
       MakeRangeOp guardedRange;
       Value rangeBound;
       if (allowRangeGuards && upperComparison && !viewBoundary && !exactRange) {
