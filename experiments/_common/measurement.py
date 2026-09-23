@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from contextvars import ContextVar
+import fcntl
+from functools import wraps
 import statistics
 import time
 import math
@@ -38,6 +40,8 @@ COMPARISON_CHUNK_ELEMENTS = 1 << 20
 _stage_observer: ContextVar[Callable[[str], None] | None] = ContextVar(
     "repro_stage_observer", default=None
 )
+_current_stage: ContextVar[str] = ContextVar("benchmark_stage", default="worker_startup")
+_gpu_window: ContextVar[object | None] = ContextVar("benchmark_gpu_window", default=None)
 
 
 @contextmanager
@@ -50,9 +54,85 @@ def observe_stages(observer: Callable[[str], None]):
 
 
 def report_stage(stage: str) -> None:
+    _current_stage.set(stage)
     observer = _stage_observer.get()
     if observer is not None:
         observer(stage)
+
+
+class _GPUWindow:
+    def __init__(self, stream):
+        self.stream = stream
+        self.locked = False
+        self.queued_seconds = 0.0
+
+    def acquire(self):
+        stage = _current_stage.get()
+        begin = time.monotonic()
+        report_stage("gpu_queue")
+        fcntl.flock(self.stream, fcntl.LOCK_EX)
+        self.queued_seconds += time.monotonic() - begin
+        self.locked = True
+        report_stage(stage)
+
+    def release(self):
+        fcntl.flock(self.stream, fcntl.LOCK_UN)
+        self.locked = False
+
+
+def gpu_queue_seconds() -> float:
+    window = _gpu_window.get()
+    return window.queued_seconds if window is not None else 0.0
+
+
+@contextmanager
+def cpu_preparation():
+    window = _gpu_window.get()
+    if window is None or not window.locked:
+        yield
+        return
+    window.release()
+    try:
+        yield
+    finally:
+        window.acquire()
+
+
+@contextmanager
+def gpu_execution(path, *, providers):
+    """Serialize device work, yielding the device during CPU compilation."""
+    with path.open("a") as stream, ExitStack() as patches:
+        window = _GPUWindow(stream)
+        token = _gpu_window.set(window)
+
+        def compile_outside_window(owner, name):
+            original = getattr(owner, name)
+
+            @wraps(original)
+            def compile_cpu(*args, **kwargs):
+                with cpu_preparation():
+                    return original(*args, **kwargs)
+
+            setattr(owner, name, compile_cpu)
+            patches.callback(setattr, owner, name, original)
+
+        try:
+            compile_outside_window(intent, "compile")
+            compile_outside_window(intent, "generate")
+            # These entries compile native binaries; their callers launch only
+            # after returning, when the execution window has been reacquired.
+            if "triton" in providers:
+                from triton.runtime.jit import JITFunction
+                compile_outside_window(JITFunction, "_do_compile")
+            if "cutile" in providers:
+                import cuda.tile as ct
+                compile_outside_window(ct.kernel, "_compile")
+            window.acquire()
+            yield
+        finally:
+            if window.locked:
+                window.release()
+            _gpu_window.reset(token)
 
 
 def initial_launch(function, *, side: str):

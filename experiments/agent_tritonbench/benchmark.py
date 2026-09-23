@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext, redirect_stdout
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -18,6 +17,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_flatten
 
 from experiments._common.measurement import evaluate, NumericalComparisonError, PipelineStageError, observe_stages, report_stage
+from experiments._common.measurement import gpu_execution
 from experiments._common.model import PreparedComparison, PreparedLaunch
 
 from .program import load_program, ProgramContext, TuningBudget
@@ -101,14 +101,13 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
     report_stage(stage)
     budget = TuningBudget(CandidateTorchPolicy)
     context = None if reference_only else ProgramContext(arguments.compiler, arguments.program.parent,
-                                                        language=arguments.language, target=arguments.target)
+                                                        language=arguments.language, target=arguments.target,
+                                                        tuning_config=arguments.tuning_config)
     try:
         reference_call = invocation(arguments.reference, row, task, suite, device="cpu")
         reference_function = reference(arguments.reference, row)
         if reference_only:
-            with arguments.gpu_lock.open("w") as lock:
-                report_stage("gpu_queue")
-                fcntl.flock(lock, fcntl.LOCK_EX)
+            with gpu_execution(arguments.gpu_lock, providers={"triton"}):
                 report_stage(stage)
                 reference_call = reference_call.to_device("cuda")
                 torch.cuda.synchronize()
@@ -134,9 +133,7 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
                     if arguments.language == "intent" and not context.generated:
                         raise ValueError("Intent submission did not compile any Intent kernels")
                 stage = "candidate_input_preparation"
-                with arguments.gpu_lock.open("w") as lock:
-                    report_stage("gpu_queue")
-                    fcntl.flock(lock, fcntl.LOCK_EX)
+                with gpu_execution(arguments.gpu_lock, providers={arguments.target}):
                     report_stage(stage)
                     candidate_call = candidate_call.to_device("cuda")
                     reference_call = reference_call.to_device("cuda")
@@ -153,9 +150,7 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
                 for artifact in context.generated.values():
                     artifact.backend_ir.clear()
                 stage = "comparison"
-                with arguments.gpu_lock.open("w") as lock:
-                    report_stage("gpu_queue")
-                    fcntl.flock(lock, fcntl.LOCK_EX)
+                with gpu_execution(arguments.gpu_lock, providers={arguments.target}):
                     report_stage(stage)
                     candidate = _observe(candidate_call, function, task=arguments.task, enforce=True)
                     source = _observe(reference_call, reference_function, task=arguments.task, enforce=False)
@@ -216,6 +211,8 @@ def main() -> None:
     parser.add_argument("--target", choices=("triton", "cutile"), default="triton",
                         help="backend for the unchanged Intent submission")
     parser.add_argument("--cutile-compiler-timeout", type=int, default=15)
+    parser.add_argument("--tuning-config", type=Path,
+                        help="fixed compiler profile for Intent generation; does not change the submission")
     parser.add_argument("--result", type=Path, required=True)
     parser.add_argument("--gpu-lock", type=Path, required=True)
     parser.add_argument("--phase-fd", type=int, help=argparse.SUPPRESS)
@@ -236,6 +233,8 @@ def main() -> None:
         parser.error("reference measurement does not take a candidate or a reused reference time")
     if arguments.language != "intent" and arguments.target != "triton":
         parser.error("only Intent submissions can select a different backend")
+    if arguments.tuning_config is not None and arguments.language != "intent":
+        parser.error("only Intent submissions use a compiler tuning profile")
     if arguments.cutile_compiler_timeout <= 0:
         parser.error("--cutile-compiler-timeout must be positive")
     if arguments.reference_ms is not None and not 0 < arguments.reference_ms < float("inf"):

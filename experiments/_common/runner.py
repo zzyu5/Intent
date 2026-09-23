@@ -22,6 +22,7 @@ from experiments import PROJECT_ROOT
 from .measurement import evaluate
 from .measurement import observe_stages
 from .measurement import report_stage
+from .measurement import cpu_preparation, gpu_execution, gpu_queue_seconds
 from .measurement import NumericalComparisonError
 from .measurement import PipelineStageError
 from .model import Context
@@ -92,7 +93,8 @@ def _write(path: Path, rows: list[ResultRow]) -> None:
 
 def _write_stage(path: Path, stage: str) -> None:
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"stage": stage}))
+    temporary.write_text(json.dumps({"stage": stage, "time": time.monotonic(),
+                                     "queued_seconds": gpu_queue_seconds()}))
     temporary.replace(path)
 
 
@@ -242,6 +244,7 @@ class _Worker:
     phase: Path
     started_at: float
     benchmarking: bool = False
+    queue_baseline: float = 0.0
 
 
 def _stop_worker(worker: _Worker) -> None:
@@ -256,9 +259,10 @@ def _stop_worker(worker: _Worker) -> None:
 
 
 def _wait_for_benchmark() -> None:
-    report_stage("ready_for_benchmark")
-    if sys.stdin.readline() != "benchmark\n":
-        raise RuntimeError("benchmark coordinator disconnected")
+    with cpu_preparation():
+        report_stage("ready_for_benchmark")
+        if sys.stdin.readline() != "benchmark\n":
+            raise RuntimeError("benchmark coordinator disconnected")
 
 
 def _run_batch(arguments, indexes, publish) -> None:
@@ -283,6 +287,8 @@ def _run_batch(arguments, indexes, publish) -> None:
                     command.extend(("--tuning-config", str(arguments.tuning_config)))
                 if arguments.source_results is not None:
                     command.extend(("--source-results", str(arguments.source_results)))
+                if arguments.gpu_lock is not None:
+                    command.extend(("--gpu-lock", str(arguments.gpu_lock)))
                 process = subprocess.Popen(
                     command, stdin=subprocess.PIPE, text=True, start_new_session=True,
                     # Torch preparation and Mojo execution use separate pools
@@ -296,7 +302,8 @@ def _run_batch(arguments, indexes, publish) -> None:
                 ready: list[_Worker] = []
                 for worker in tuple(workers):
                     entry = BY_PROVIDER[provider][worker.index]
-                    stage = json.loads(worker.phase.read_text())["stage"]
+                    phase = json.loads(worker.phase.read_text())
+                    stage = phase["stage"]
                     returncode = worker.process.poll()
                     if returncode is not None:
                         if returncode == 0 and worker.output.exists():
@@ -315,7 +322,11 @@ def _run_batch(arguments, indexes, publish) -> None:
                     if stage == "ready_for_benchmark" and not worker.benchmarking:
                         ready.append(worker)
                         continue
-                    if time.monotonic() - worker.started_at > arguments.worker_timeout:
+                    now = time.monotonic()
+                    queued = phase["queued_seconds"] - worker.queue_baseline
+                    if stage == "gpu_queue":
+                        queued += now - phase["time"]
+                    if now - worker.started_at - queued > arguments.worker_timeout:
                         _stop_worker(worker)
                         publish(ResultRow(
                             entry.kernel, entry.case, None, None, None,
@@ -324,10 +335,12 @@ def _run_batch(arguments, indexes, publish) -> None:
                         ))
                         worker.process.stdin.close()
                         workers.remove(worker)
-                if workers and len(ready) == len(workers):
+                can_measure = (arguments.gpu_lock is not None or len(ready) == len(workers))
+                if ready and can_measure and not any(worker.benchmarking for worker in workers):
                     worker = ready[0]
                     worker.benchmarking = True
                     worker.started_at = time.monotonic()
+                    worker.queue_baseline = json.loads(worker.phase.read_text())["queued_seconds"]
                     entry = BY_PROVIDER[provider][worker.index]
                     print(f"{provider}:{entry.kernel}: measuring", flush=True)
                     worker.process.stdin.write("benchmark\n")
@@ -354,6 +367,8 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
                         help="compile-time JSON profile override; cuTile defaults to its production profile")
     parser.add_argument("--source-results", type=Path,
                         help="reuse source_p50_ms from an existing result CSV; still compare outputs")
+    parser.add_argument("--gpu-lock", type=Path,
+                        help="shared GPU execution lock; native and Intent compilation run outside it")
     parser.add_argument("--worker-timeout", type=int, default=WORKER_TIMEOUT_SECONDS,
                         help="limit for preparation or measurement; scheduling wait is excluded")
     parser.add_argument("--cutile-compiler-timeout", type=int, default=15,
@@ -375,21 +390,31 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
     source_rows = None
     if arguments.source_results is not None:
         arguments.source_results = arguments.source_results.resolve(strict=True)
-        source_rows = _read_rows(arguments.source_results)
+        with arguments.source_results.open(newline="") as stream:
+            source_rows = tuple(csv.DictReader(stream))
 
     def saved_source_time(entry):
         if source_rows is None:
             return None
-        matches = [row.source_p50_ms for row in source_rows
-                   if (row.kernel, row.case) == (entry.kernel, entry.case)]
+        matches = [row["source_p50_ms"] for row in source_rows
+                   if (row["kernel"], row["case"]) == (entry.kernel, entry.case)]
         if len(matches) != 1:
             parser.error(f"source results need one row for {entry.kernel}:{entry.case}")
-        if matches[0] is not None and (not math.isfinite(matches[0]) or matches[0] <= 0):
+        value = float(matches[0]) if matches[0] else None
+        if value is not None and (not math.isfinite(value) or value <= 0):
             parser.error(f"saved source time must be positive and finite for {entry.kernel}:{entry.case}")
-        return matches[0]
+        return value
 
     provider = arguments.provider
     arguments.target = arguments.target or provider
+    if PROVIDER_GROUPS[provider] == "gpu":
+        if arguments.gpu_lock is None:
+            from intent.compiler.cache import cache_root
+            arguments.gpu_lock = cache_root() / "gpu.lock"
+        arguments.gpu_lock = arguments.gpu_lock.resolve()
+        arguments.gpu_lock.parent.mkdir(parents=True, exist_ok=True)
+    elif arguments.gpu_lock is not None:
+        parser.error("--gpu-lock requires a GPU provider")
     if arguments.target != provider and {arguments.target, provider} != {"triton", "cutile"}:
         parser.error("cross-backend comparisons currently support Triton and cuTile corpora")
     selected = set(arguments.kernel or ())
@@ -417,7 +442,10 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
                 report_stage("provider_compiler_setup")
                 import cuda.tile as ct
                 compile_budget = ct.compiler_timeout(arguments.cutile_compiler_timeout)
-            with compile_budget:
+            execution = (gpu_execution(arguments.gpu_lock,
+                                       providers={provider, arguments.target})
+                         if arguments.gpu_lock is not None else nullcontext())
+            with compile_budget, execution:
                 _write(arguments.output, [_run_entry(
                     provider, arguments.compiler, entry, arguments.cutile_compiler_timeout,
                     arguments.tuning_config,

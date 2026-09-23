@@ -29,7 +29,8 @@ def revision(directory: Path) -> str:
 
 
 def run_benchmark(arguments, task, program, language, result_path, *, target="triton",
-                  reference_ms=None, reference_time_unavailable=False, timing=None) -> dict:
+                  reference_ms=None, reference_time_unavailable=False, timing=None,
+                  tuning_config=None) -> dict:
     phase_read, phase_write = os.pipe()
     command = [sys.executable, "-B", "-m", "experiments.agent_tritonbench.benchmark", "--reference", str(arguments.reference),
                "--compiler", str(arguments.compiler), "--task", task,
@@ -43,6 +44,8 @@ def run_benchmark(arguments, task, program, language, result_path, *, target="tr
         command.append("--reference-time-unavailable")
     if timing is not None:
         command.extend(("--timing", timing))
+    if tuning_config is not None:
+        command.extend(("--tuning-config", str(tuning_config)))
     with os.fdopen(phase_read, "rb", buffering=0) as phases, tempfile.TemporaryFile(mode="w+") as log:
         try:
             process = subprocess.Popen(command, stdout=log, stderr=log, start_new_session=True,

@@ -25,12 +25,13 @@ from experiments._common.loading import load_module
 
 class ProgramContext:
     def __init__(self, compiler: Path, directory: Path, *, language: str,
-                 target: str = "triton"):
+                 target: str = "triton", tuning_config: Path | None = None):
         self.compiler = compiler
         self.directory = directory
         self.language = language
         self.target = {"triton": TritonTarget, "cutile": CuTileTarget}[target]()
         self.target_name = target
+        self.tuning_config = tuning_config
         self.generated: dict[str, CompiledArtifact] = {}
         self.tuning: list[dict] = []
         self.precompile_failures: list[dict] = []
@@ -42,7 +43,7 @@ class ProgramContext:
         if not name.isidentifier() or name in self.generated:
             raise ValueError("each compile() needs a distinct literal identifier")
         program = intent.generate(definition, target=self.target, compiler=self.compiler,
-                                  constexprs=constexprs)
+                                  constexprs=constexprs, tuning_config=self.tuning_config)
         materialize = {"triton": materialize_triton_artifact, "cutile": materialize_cutile_artifact}[self.target_name]
         try:
             artifact = materialize(program.source, program.ir, definition.__name__, 0)
