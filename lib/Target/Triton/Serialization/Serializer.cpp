@@ -301,6 +301,8 @@ private:
     kernel.walk([&](TensorDescriptorAllocatorOp allocator) {
       descriptorAllocator = allocator;
     });
+    while (!argumentNames.insert(metadataArgument).second)
+      metadataArgument += "_";
     kernel.walk([&](TensorDescriptorOp descriptor) {
       std::string name = "_intent_descriptor_" + std::to_string(descriptors.size());
       while (!argumentNames.insert(name).second)
@@ -578,11 +580,11 @@ private:
     }
     output << "    ],\n    key=[";
     bool firstKey = true;
-    for (const MetadataABI &metadata : metadataArguments) {
+    if (!metadataArguments.empty()) {
       if (!firstKey)
         output << ", ";
       firstKey = false;
-      output << "\"" << metadata.name << "\"";
+      output << "\"" << metadataArgument << "\"";
     }
     if (!overlapFacts.empty()) {
       if (!firstKey)
@@ -630,11 +632,11 @@ private:
       else
         output << ": " << pythonType(scalar.type);
     }
-    for (const MetadataABI &metadata : metadataArguments) {
+    if (!metadataArguments.empty()) {
       if (!first)
         output << ", ";
       first = false;
-      output << metadata.name << ": tl.constexpr";
+      output << metadataArgument << ": tl.constexpr";
     }
     if (!overlapFacts.empty()) {
       if (!first)
@@ -668,6 +670,9 @@ private:
       output << ", " << descriptor.name;
     output << "):\n";
     indent = 1;
+    for (auto [index, metadata] : llvm::enumerate(metadataArguments))
+      line(metadata.name + ": tl.constexpr = " + metadataArgument + "[" +
+           std::to_string(index) + "]");
     kernel.walk([&](gpu::ParameterOp parameter) {
       if (parameter.getParameter().getRole() ==
           static_cast<uint32_t>(gpu::ParameterRole::ProviderWarps))
@@ -820,8 +825,11 @@ private:
       first = false;
       call += scalar.name;
     }
-    for (const MetadataABI &metadata : metadataArguments) {
-      call += ", " + metadata.name;
+    if (!metadataArguments.empty()) {
+      SmallVector<std::string> metadata;
+      for (const MetadataABI &argument : metadataArguments)
+        metadata.push_back(argument.name);
+      call += ", " + stringTuple(metadata);
     }
     if (!overlapFacts.empty())
       call += ", " + overlapArgument;
@@ -896,9 +904,15 @@ private:
     auto begin = output.tell();
     for (Operation &operation : block) {
       if (auto yield = dyn_cast<scf::YieldOp>(operation)) {
-        if (isLoop || !loopResults.empty())
-          for (auto [name, value] : llvm::zip(loopResults, yield.getOperands()))
-            line(name + " = " + controlValueString(value));
+        if (!loopResults.empty()) {
+          SmallVector<std::string> yielded;
+          for (Value value : yield.getOperands())
+            yielded.push_back(controlValueString(value));
+          if (loopResults.size() == 1)
+            line(loopResults.front() + " = " + yielded.front());
+          else
+            line(stringTuple(loopResults) + " = " + stringTuple(yielded));
+        }
         continue;
       }
       if (isa<func::ReturnOp>(operation))
@@ -1706,6 +1720,14 @@ private:
     return stringList(expressions);
   }
 
+  std::string hostArgument(StringRef name) const {
+    for (auto [index, metadata] : llvm::enumerate(metadataArguments))
+      if (metadata.name == name)
+        return "args[\"" + metadataArgument + "\"][" +
+               std::to_string(index) + "]";
+    return ("args[\"" + name + "\"]").str();
+  }
+
   std::string descriptorArgumentExpression(
       gpu::PhysicalExprAttr expression) const {
     auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
@@ -1719,7 +1741,7 @@ private:
     }
     if (kind == gpu::PhysicalExprKind::Dimension ||
         kind == gpu::PhysicalExprKind::ScalarABI)
-      return ("args[\"" + expression.getSymbol().getValue() + "\"]").str();
+      return hostArgument(expression.getSymbol().getValue());
     SmallVector<std::string> operands;
     for (Attribute operand : expression.getOperands())
       operands.push_back(descriptorArgumentExpression(
@@ -1784,7 +1806,7 @@ private:
       }
     }
     if (isa<BlockArgument>(value))
-      return argumentMap ? "args[\"" + valueString(value) + "\"]"
+      return argumentMap ? hostArgument(valueString(value))
                          : valueString(value);
     failed = true;
     return "<unsupported-descriptor-launch-value>";
@@ -2053,6 +2075,7 @@ private:
   SmallVector<ViewABI> views;
   SmallVector<ScalarABI> scalars;
   SmallVector<MetadataABI> metadataArguments;
+  std::string metadataArgument = "_intent_metadata";
   SmallVector<ViewOverlapOp> overlapFacts;
   std::string overlapArgument = "_intent_overlaps";
   std::string overlapFunction = "_intent_byte_spans_overlap";
