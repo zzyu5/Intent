@@ -25,6 +25,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   LINK_LIBS PUBLIC
   MLIRAnalysis
   MLIRArithDialect
+  MLIRControlFlowDialect
   MLIRFuncDialect
   MLIRIR
   MLIRSCFDialect

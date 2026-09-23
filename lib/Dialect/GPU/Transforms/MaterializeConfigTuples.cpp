@@ -4,6 +4,7 @@
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AttrTypeSubElements.h"
 
@@ -1174,6 +1175,100 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
     tuples.push_back(builder.getDictionaryAttr({}));
   kernel->setAttr(sharedConfigTuplesAttr, builder.getArrayAttr(tuples));
   return success();
+}
+
+PhysicalExprAttr fragmentRegisterFootprint(FragmentType fragment) {
+  Type element = fragment.getElementType();
+  unsigned bits = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
+  MLIRContext *context = fragment.getContext();
+  auto footprint = PhysicalExprAttr::get(
+      context, static_cast<uint32_t>(PhysicalExprKind::Constant),
+      std::max(1u, (bits + 31) / 32), StringAttr::get(context, ""),
+      ArrayAttr::get(context, {}));
+  for (Attribute extent : fragment.getShape())
+    footprint = PhysicalExprAttr::get(
+        context, static_cast<uint32_t>(PhysicalExprKind::Multiply), 0,
+        StringAttr::get(context, ""), ArrayAttr::get(context, {footprint, extent}));
+  return footprint;
+}
+
+PhysicalExprAttr reductionRegisterFootprint(ValueRange sources,
+                                           func::FuncOp kernel) {
+  std::function<bool(PhysicalExprAttr)> isTunableExtent =
+      [&](PhysicalExprAttr extent) {
+    if (static_cast<PhysicalExprKind>(extent.getKind()) ==
+        PhysicalExprKind::Parameter) {
+      auto parameter = queryParameterBySymbol(kernel, extent.getSymbol());
+      if (failed(parameter))
+        return false;
+      auto role = static_cast<ParameterRole>(parameter->getParameter().getRole());
+      return role == ParameterRole::OwnershipM ||
+             role == ParameterRole::OwnershipN ||
+             role == ParameterRole::Reduction ||
+             role == ParameterRole::ReductionOuter ||
+             role == ParameterRole::ReductionInner;
+    }
+    return llvm::any_of(extent.getOperands(), [&](Attribute operand) {
+      return isTunableExtent(cast<PhysicalExprAttr>(operand));
+    });
+  };
+  PhysicalExprAttr registers;
+  for (Value source : sources) {
+    auto fragment = dyn_cast<FragmentType>(source.getType());
+    if (!fragment || !llvm::any_of(fragment.getShape(), [&](Attribute extent) {
+          return isTunableExtent(cast<PhysicalExprAttr>(extent));
+        }))
+      continue;
+    auto footprint = fragmentRegisterFootprint(fragment);
+    registers = !registers ? footprint : PhysicalExprAttr::get(
+        kernel.getContext(), static_cast<uint32_t>(PhysicalExprKind::Add), 0,
+        StringAttr::get(kernel.getContext(), ""),
+        ArrayAttr::get(kernel.getContext(), {registers, footprint}));
+  }
+  return registers;
+}
+
+void materializeDeferredReductionBounds(
+    func::FuncOp kernel, ArrayRef<ValueRange> sourceGroups) {
+  auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+  if (!capabilities || capabilities.getRegistersPerUnit() <= 0)
+    return;
+  AttrTypeReplacer knownParameters;
+  knownParameters.addReplacement(
+      [&](PhysicalExprAttr expression) -> std::optional<Attribute> {
+    if (expression.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter))
+      return std::nullopt;
+    auto parameter = queryParameterBySymbol(kernel, expression.getSymbol());
+    if (failed(parameter) || (*parameter)->hasAttr(coverageDimensionAttr) ||
+        parameter->getParameter().getCategory() ==
+            static_cast<uint32_t>(ParameterCategory::Coverage))
+      return std::nullopt;
+    return PhysicalExprAttr::get(
+        kernel.getContext(), static_cast<uint32_t>(PhysicalExprKind::Constant),
+        parameter->getParameter().getCandidates().asArrayRef().front(),
+        StringAttr::get(kernel.getContext(), ""), ArrayAttr::get(kernel.getContext(), {}));
+  });
+  SmallVector<PhysicalExprAttr> bounds;
+  for (ValueRange sources : sourceGroups) {
+    auto footprint = reductionRegisterFootprint(sources, kernel);
+    if (footprint &&
+        !constantPhysicalExpression(cast<PhysicalExprAttr>(
+            knownParameters.replace(footprint))) &&
+        !llvm::is_contained(bounds, footprint))
+      bounds.push_back(footprint);
+  }
+  kernel.getContext()->getOrLoadDialect<cf::ControlFlowDialect>();
+  OpBuilder builder = OpBuilder::atBlockBegin(&kernel.front());
+  for (PhysicalExprAttr footprint : bounds) {
+    Value count = builder.create<PhysicalExprOp>(
+        kernel.getLoc(), builder.getIndexType(), footprint);
+    Value maximum = builder.create<arith::ConstantIndexOp>(
+        kernel.getLoc(), capabilities.getRegistersPerUnit());
+    Value valid = builder.create<CompareOp>(kernel.getLoc(), builder.getI1Type(),
+                                           count, maximum, ComparePredicate::Le);
+    builder.create<cf::AssertOp>(
+        kernel.getLoc(), valid, "reduction source exceeds the candidate register budget");
+  }
 }
 
 LogicalResult verifySharedConfigTuples(func::FuncOp kernel) {

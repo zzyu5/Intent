@@ -7,6 +7,7 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/DenseMap.h"
@@ -353,6 +354,8 @@ private:
     bool libraryMath = false;
     kernel.walk([&](gpu::UnaryOp unary) {
       libraryMath |= unary.getOperatorKind() == UnaryOperator::Erf ||
+                     unary.getOperatorKind() == UnaryOperator::Erfc ||
+                     unary.getOperatorKind() == UnaryOperator::I0 ||
                      unary.getOperatorKind() == UnaryOperator::Lgamma ||
                      unary.getOperatorKind() == UnaryOperator::Log1p;
     });
@@ -597,6 +600,16 @@ private:
     output << "\n";
   }
 
+  std::string resourceCondition(cf::AssertOp assertion, bool configContext,
+                                StringRef configName = "cfg") {
+    auto comparison = assertion.getArg().getDefiningOp<gpu::CompareOp>();
+    auto count = comparison.getLhs().getDefiningOp<gpu::PhysicalExprOp>();
+    auto limit = comparison.getRhs().getDefiningOp<arith::ConstantIndexOp>();
+    return "(" + expressionString(count.getExpression(), configContext,
+                                    &fullCoverageParameterNames, configName) +
+           " <= " + std::to_string(limit.value()) + ")";
+  }
+
   void emitLaunch() {
     FailureOr<SmallVector<std::map<std::string, int64_t>>> configs =
         parameterConfigs(kernel);
@@ -654,6 +667,11 @@ private:
     std::string boundGridName = freshName("_intent_bound_grid");
     std::string boundArgumentsName = freshName("_intent_bound_arguments");
     std::string boundLaunchName = freshName("_intent_bound_launch");
+    SmallVector<std::string> resourceConditions;
+    for (auto assertion : kernel.front().getOps<cf::AssertOp>())
+      resourceConditions.push_back(resourceCondition(assertion, true, configName));
+    std::string candidatesName = resourceConditions.empty()
+                                     ? "_CONFIGS" : freshName("_intent_candidates");
 
     std::string key = tuneKeyName + " = (";
     for (const ViewABI &view : views)
@@ -664,6 +682,18 @@ private:
     line(key + ")", 1);
     line(streamName + " = torch.cuda.current_stream()", 1);
     line("if " + tuneKeyName + " not in _TUNE_CACHE:", 1);
+    if (!resourceConditions.empty()) {
+      std::string condition;
+      for (const std::string &bound : resourceConditions) {
+        if (!condition.empty())
+          condition += " and ";
+        condition += bound;
+      }
+      line(candidatesName + " = tuple(" + configName + " for " + configName +
+               " in _CONFIGS if " + condition + ")", 2);
+      line("if not " + candidatesName + ":", 2);
+      line("raise ValueError(\"no cuTile configuration satisfies the physical resource bounds\")", 3);
+    }
     if (kernel->hasAttr(arrayIndexTileBoundsAttr)) {
       std::string boundArguments = "(";
       std::string viewArguments = "(";
@@ -699,7 +729,7 @@ private:
     std::string hints;
     if (!providerHintParameters.empty())
       hints = ", lambda " + configName + ": " + compilerHints(configName);
-    line(searchResultName + " = exhaustive_search(_CONFIGS, " + streamName +
+    line(searchResultName + " = exhaustive_search(" + candidatesName + ", " + streamName +
              ", " + grid + ", " + selectedKernelName + ", lambda " + configName +
              ": " + trialStateName + ".arguments((" + joinKernelArguments(configName, true) + "))" + hints +
              ", quiet=True)",
@@ -818,8 +848,15 @@ private:
   void emitOperation(Operation &operation) {
     if (isa<ArrayViewOp>(operation)) {
       return;
+    } else if (auto assertion = dyn_cast<cf::AssertOp>(operation)) {
+      std::string message;
+      llvm::raw_string_ostream(message) << llvm::json::Value(assertion.getMsg());
+      line("ct.static_assert(" + resourceCondition(assertion, false) + ", " + message + ")");
     } else if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
-      values[constant.getResult()] = literal(constant.getValue());
+      std::string value = literal(constant.getValue());
+      if (constant.getType().isInteger(64))
+        value = "ct.astype(" + value + ", ct.int64)";
+      values[constant.getResult()] = value;
     } else if (auto parameter = dyn_cast<gpu::ParameterOp>(operation)) {
       values[parameter.getResult()] =
           parameter.getParameter().getName().getValue().str();
@@ -1314,12 +1351,8 @@ private:
     case UnaryOperator::Erf: return call("cutile_math.erf");
     case UnaryOperator::Log1p: return call("cutile_math.log1p");
     case UnaryOperator::Lgamma: return call("cutile_math.lgamma");
-    case UnaryOperator::Erfc:
-    case UnaryOperator::I0:
-      unary.emitOpError() << stringifyUnaryOperator(unary.getOperatorKind())
-                         << " is unsupported by the cuTile provider";
-      failed = true;
-      return "<unsupported-unary>";
+    case UnaryOperator::Erfc: return call("cutile_math.erfc");
+    case UnaryOperator::I0: return call("cutile_math.i0");
     }
     llvm_unreachable("unhandled Intent unary operator");
   }

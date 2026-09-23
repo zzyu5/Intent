@@ -7,6 +7,7 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
@@ -352,14 +353,33 @@ FailureOr<SmallVector<Value>> materializeCoordinateDomains(
     gpu::FragmentType target) {
   SmallVector<Value> results;
   results.reserve(coordinates.size());
+  bool cartesian = static_cast<size_t>(llvm::count_if(coordinates, [](Value value) {
+    return isa<gpu::FragmentType>(value.getType());
+  })) == target.getShape().size() &&
+      llvm::all_of(coordinates, [](Value value) {
+        auto fragment = dyn_cast<gpu::FragmentType>(value.getType());
+        return !fragment || fragment.getShape().size() == 1;
+      });
+  unsigned fragmentSlot = 0;
   for (Value coordinate : coordinates) {
     auto source = dyn_cast<gpu::FragmentType>(coordinate.getType());
+    unsigned position = source ? fragmentSlot++ : 0;
     if (!source || samePhysicalDomain(source, target)) {
       results.push_back(coordinate);
       continue;
     }
     FailureOr<SmallVector<unsigned>> targetAxes =
         coordinateTargetAxes(source, target);
+    if (failed(targetAxes) && cartesian && source.getOwner() == target.getOwner() &&
+        source.getShape()[0] == target.getShape()[position]) {
+      auto sourceAxis = cast<gpu::AxisMapAttr>(source.getAxisMaps()[0]);
+      auto targetAxis = cast<gpu::AxisMapAttr>(target.getAxisMaps()[position]);
+      // Cartesian coordinates are ordered by resource axis. Reusing the same
+      // range on two axes retains those distinct positional occurrences.
+      if (gpu::sourceAxisIdentity(sourceAxis) == gpu::sourceAxisIdentity(targetAxis) &&
+          sourceAxis.getDimensionId() == targetAxis.getDimensionId())
+        targetAxes = SmallVector<unsigned>{position};
+    }
     if (failed(targetAxes))
       return owner->emitOpError(
           "cuTile coordinate cannot adopt the selected physical domain");
@@ -2219,6 +2239,14 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
           coordinates[sourceAxis])
         return gather.emitOpError(
             "cuTile tile extraction source axes are not a unique subset");
+      while (true) {
+        if (auto splat = coordinate.getDefiningOp<gpu::SplatOp>())
+          coordinate = splat.getValue();
+        else if (auto broadcast = coordinate.getDefiningOp<gpu::BroadcastOp>())
+          coordinate = broadcast.getValue();
+        else
+          break;
+      }
       if (result) {
         if (isa<gpu::FragmentType>(coordinate.getType()) &&
             !getCompileTimeScalar(coordinate)) {
@@ -2288,6 +2316,28 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
         }
         auto integer =
             dyn_cast_or_null<IntegerAttr>(getCompileTimeScalar(coordinate));
+        if (!integer && !isa<gpu::FragmentType>(coordinate.getType())) {
+          // The shared access contract bounds active members. Clamp only the
+          // extraction address; the original validity still selects the fill.
+          if (!coordinate.getType().isIndex())
+            coordinate = builder.create<gpu::CastOp>(
+                gather.getLoc(), builder.getIndexType(), coordinate);
+          Value extent = builder.create<gpu::PhysicalExprOp>(
+              gather.getLoc(), builder.getIndexType(),
+              cast<gpu::PhysicalExprAttr>(source.getShape()[sourceAxis]));
+          Value zero = builder.create<arith::ConstantIndexOp>(gather.getLoc(), 0);
+          Value one = builder.create<arith::ConstantIndexOp>(gather.getLoc(), 1);
+          Value last = builder.create<gpu::BinaryOp>(
+              gather.getLoc(), builder.getIndexType(), extent, one,
+              BinaryOperator::Subtract);
+          Value nonnegative = builder.create<gpu::BinaryOp>(
+              gather.getLoc(), builder.getIndexType(), coordinate, zero,
+              BinaryOperator::Maximum);
+          coordinates[sourceAxis] = builder.create<gpu::BinaryOp>(
+              gather.getLoc(), builder.getIndexType(), nonnegative, last,
+              BinaryOperator::Minimum);
+          continue;
+        }
         auto extent = constantPhysicalExpression(
             cast<gpu::PhysicalExprAttr>(source.getShape()[sourceAxis]), kernel);
         if (!integer || !extent || integer.getInt() < 0 || integer.getInt() >= *extent)
@@ -2333,13 +2383,40 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
         tile = repeatTileForExtraction(
             builder, gather.getLoc(), tile, axis,
             cast<gpu::PhysicalExprAttr>(extractionShape[axis]));
+    Type extractedType = gather.getResult().getType();
+    if (result) {
+      SmallVector<Attribute> shape, maps;
+      auto tileType = cast<gpu::FragmentType>(tile.getType());
+      for (auto [resultAxis, sourceAxis] : llvm::enumerate(retainedAxes)) {
+        shape.push_back(extractionShape[sourceAxis]);
+        auto map = cast<gpu::AxisMapAttr>(tileType.getAxisMaps()[sourceAxis]);
+        maps.push_back(gpu::AxisMapAttr::get(
+            kernel.getContext(), map.getSourceId(), map.getSourceAxis(),
+            map.getDimensionId(), resultAxis, map.getDerived()));
+      }
+      if (builder.getArrayAttr(shape) != result.getShape())
+        return gather.emitOpError(
+            "cuTile extraction must retain result axes in source order");
+      extractedType = gpu::FragmentType::get(
+          kernel.getContext(), result.getElementType(), builder.getArrayAttr(shape),
+          builder.getArrayAttr(maps), result.getValidity(), result.getOwner());
+    }
     auto replacement = builder.create<ExtractOp>(
-        gather.getLoc(), gather.getResult().getType(), tile,
+        gather.getLoc(), extractedType, tile,
         coordinates, builder.getArrayAttr(extractionShape),
         builder.getDenseI64ArrayAttr(retainedAxes));
     if (Attribute origin = gather->getAttr(gpu::originAttr))
       replacement->setAttr(gpu::originAttr, origin);
     Value value = replacement.getResult();
+    if (extractedType != gather.getResult().getType()) {
+      auto reassociation = gpu::inferReshapeReassociation(
+          cast<gpu::FragmentType>(extractedType), result);
+      if (failed(reassociation))
+        return gather.emitOpError(
+            "cuTile extraction has no row-major result domain projection");
+      value = builder.create<gpu::ReshapeOp>(
+          gather.getLoc(), result, value, *reassociation);
+    }
     if (gather.getValid()) {
       auto selected = builder.create<gpu::SelectOp>(
           gather.getLoc(), gather.getResult().getType(), gather.getValid(),
@@ -3345,14 +3422,9 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
   };
   WalkResult result = kernel.walk([&](Operation *operation) {
     if (auto unary = dyn_cast<gpu::UnaryOp>(operation);
-        unary && (unary.getOperatorKind() == UnaryOperator::Erfc ||
-                  unary.getOperatorKind() == UnaryOperator::I0)) {
-      unary.emitOpError() << stringifyUnaryOperator(unary.getOperatorKind())
-                         << " is unsupported by the cuTile provider";
-      return WalkResult::interrupt();
-    }
-    if (auto unary = dyn_cast<gpu::UnaryOp>(operation);
         unary && (unary.getOperatorKind() == UnaryOperator::Erf ||
+                  unary.getOperatorKind() == UnaryOperator::Erfc ||
+                  unary.getOperatorKind() == UnaryOperator::I0 ||
                   unary.getOperatorKind() == UnaryOperator::Lgamma ||
                   unary.getOperatorKind() == UnaryOperator::Log1p)) {
       Type type = unary.getInput().getType();
@@ -3414,6 +3486,17 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
         operation->emitOpError("has a result type outside the cuTile surface");
         return WalkResult::interrupt();
       }
+    }
+    if (auto assertion = dyn_cast<cf::AssertOp>(operation)) {
+      auto comparison = assertion.getArg().getDefiningOp<gpu::CompareOp>();
+      if (assertion->getBlock() != &kernel.front() || !comparison ||
+          comparison.getPredicate() != ComparePredicate::Le ||
+          !comparison.getLhs().getDefiningOp<gpu::PhysicalExprOp>() ||
+          !comparison.getRhs().getDefiningOp<arith::ConstantIndexOp>()) {
+        assertion.emitOpError("cuTile resource assertion requires a constexpr physical bound");
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
     }
     if (isa<ArrayViewOp, TileLoadOp, TileStoreOp, ScalarLoadOp, ScalarStoreOp, GatherLoadOp,
             ScatterStoreOp, AtomicRMWOp, ExtractOp, MMAOp, ScaledMMAOp,
@@ -3739,6 +3822,11 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
     return failure();
   if (ArrayAttr bounds = arrayIndexTileBounds(*kernel))
     (*kernel)->setAttr(arrayIndexTileBoundsAttr, bounds);
+  SmallVector<ValueRange> reductionSources;
+  kernel->walk([&](ReduceOp reduce) {
+    reductionSources.push_back(reduce.getInputs().take_front(reduce.getSourceCount()));
+  });
+  gpu::materializeDeferredReductionBounds(*kernel, reductionSources);
   if (failed(verifyCuTileProgram(module)))
     return failure();
   (*kernel)->setAttr(legalizedAttr, UnitAttr::get(module.getContext()));

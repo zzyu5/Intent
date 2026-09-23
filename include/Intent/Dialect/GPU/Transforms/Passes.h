@@ -18,6 +18,12 @@
 
 namespace intent::gpu {
 
+PhysicalExprAttr fragmentRegisterFootprint(FragmentType fragment);
+PhysicalExprAttr reductionRegisterFootprint(mlir::ValueRange sources,
+                                            mlir::func::FuncOp kernel);
+void materializeDeferredReductionBounds(
+    mlir::func::FuncOp kernel, llvm::ArrayRef<mlir::ValueRange> sourceGroups);
+
 mlir::Type scalarCallbackType(mlir::Type type);
 mlir::LogicalResult scalarizeElementwiseCallback(mlir::Region &source,
                                                  mlir::Region &target);

@@ -3,6 +3,7 @@ add_mlir_library(MLIRIntentCuTileSerialization
 
   LINK_LIBS PUBLIC
   MLIRArithDialect
+  MLIRControlFlowDialect
   MLIRFuncDialect
   MLIRIR
   MLIRSCFDialect

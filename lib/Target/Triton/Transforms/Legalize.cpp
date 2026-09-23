@@ -1142,62 +1142,6 @@ SmallVector<gpu::FragmentType> collectiveFragments(func::FuncOp kernel) {
   return fragments;
 }
 
-gpu::PhysicalExprAttr fragmentRegisterFootprint(gpu::FragmentType fragment) {
-  Type element = fragment.getElementType();
-  unsigned bits = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
-  MLIRContext *context = fragment.getContext();
-  auto footprint = gpu::PhysicalExprAttr::get(
-      context, static_cast<uint32_t>(gpu::PhysicalExprKind::Constant),
-      std::max(1u, (bits + 31) / 32), StringAttr::get(context, ""),
-      ArrayAttr::get(context, {}));
-  for (Attribute extent : fragment.getShape())
-    footprint = gpu::PhysicalExprAttr::get(
-        context, static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
-        StringAttr::get(context, ""), ArrayAttr::get(context, {footprint, extent}));
-  return footprint;
-}
-
-gpu::PhysicalExprAttr reductionRegisterFootprint(ValueRange sources,
-                                               func::FuncOp kernel) {
-  std::function<bool(gpu::PhysicalExprAttr)> isTunableExtent =
-      [&](gpu::PhysicalExprAttr extent) {
-    if (static_cast<gpu::PhysicalExprKind>(extent.getKind()) ==
-        gpu::PhysicalExprKind::Parameter) {
-      auto parameter = gpu::queryParameterBySymbol(kernel, extent.getSymbol());
-      if (failed(parameter))
-        return false;
-      auto role = static_cast<gpu::ParameterRole>(parameter->getParameter().getRole());
-      return role == gpu::ParameterRole::OwnershipM ||
-             role == gpu::ParameterRole::OwnershipN ||
-             role == gpu::ParameterRole::Reduction ||
-             role == gpu::ParameterRole::ReductionOuter ||
-             role == gpu::ParameterRole::ReductionInner;
-    }
-    return llvm::any_of(extent.getOperands(), [&](Attribute operand) {
-      return isTunableExtent(cast<gpu::PhysicalExprAttr>(operand));
-    });
-  };
-  auto expression = [&](gpu::PhysicalExprKind kind, int64_t value,
-                        ArrayRef<Attribute> operands) {
-    return gpu::PhysicalExprAttr::get(
-        kernel.getContext(), static_cast<uint32_t>(kind), value,
-        StringAttr::get(kernel.getContext(), ""),
-        ArrayAttr::get(kernel.getContext(), operands));
-  };
-  gpu::PhysicalExprAttr registers;
-  for (Value source : sources) {
-    auto fragment = dyn_cast<gpu::FragmentType>(source.getType());
-    if (!fragment || !llvm::any_of(fragment.getShape(), [&](Attribute extent) {
-          return isTunableExtent(cast<gpu::PhysicalExprAttr>(extent));
-        }))
-      continue;
-    auto footprint = fragmentRegisterFootprint(fragment);
-    registers = !registers ? footprint : expression(
-        gpu::PhysicalExprKind::Add, 0, {registers, footprint});
-  }
-  return registers;
-}
-
 LogicalResult materializeDeferredResourceBounds(func::FuncOp kernel) {
   TritonConfig known;
   gpu::ParameterAttr warpParameter;
@@ -1266,21 +1210,12 @@ LogicalResult materializeDeferredResourceBounds(func::FuncOp kernel) {
                 "Triton block tensor exceeds the maximum element count");
   auto capabilities =
       kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+  SmallVector<ValueRange> reductionSources;
+  kernel.walk([&](ReduceOp reduce) {
+    reductionSources.push_back(reduce.getInputs().take_front(reduce.getSourceCount()));
+  });
+  gpu::materializeDeferredReductionBounds(kernel, reductionSources);
   if (capabilities && capabilities.getRegistersPerUnit() > 0) {
-    bounds.clear();
-    kernel.walk([&](ReduceOp reduce) {
-      auto footprint = reductionRegisterFootprint(
-          reduce.getInputs().take_front(reduce.getSourceCount()), kernel);
-      if (footprint && !evaluateCompileTimeExpression(footprint, known) &&
-          !llvm::is_contained(bounds, footprint))
-        bounds.push_back(footprint);
-    });
-    for (gpu::PhysicalExprAttr footprint : bounds) {
-      if (!isTritonFragmentExtent(footprint))
-        return kernel.emitError("Triton register bounds require constexpr fragment extents");
-      assertBound(footprint, capabilities.getRegistersPerUnit(),
-                  "Triton reduction source exceeds the register budget");
-    }
     if (warpParameter && warpParameter.getCandidates().size() > 1) {
       auto expression = [&](gpu::PhysicalExprKind kind, int64_t value,
                             ArrayRef<Attribute> operands) {
@@ -1307,7 +1242,7 @@ LogicalResult materializeDeferredResourceBounds(func::FuncOp kernel) {
                                {belowMaximum, nominalBudget,
                                 constant(std::numeric_limits<int64_t>::max())});
       for (gpu::FragmentType fragment : collectiveFragments(kernel)) {
-        auto footprint = fragmentRegisterFootprint(fragment);
+        auto footprint = gpu::fragmentRegisterFootprint(fragment);
         if (evaluateCompileTimeExpression(footprint, TritonConfig{}))
           continue;
         Value count = builder.create<gpu::PhysicalExprOp>(
@@ -1335,7 +1270,7 @@ bool fitsReductionRegisterBudget(gpu::ReduceOp reduce,
     return true;
   __int128 registers = 0;
   for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
-    auto footprint = reductionRegisterFootprint(ValueRange{source}, kernel);
+    auto footprint = gpu::reductionRegisterFootprint(ValueRange{source}, kernel);
     if (!footprint)
       continue;
     auto size = evaluateCompileTimeExpression(footprint, config);
@@ -1472,7 +1407,7 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
   int64_t maximumWarps = *llvm::max_element(warps->candidates);
   SmallVector<gpu::PhysicalExprAttr> collectiveFootprints;
   for (gpu::FragmentType fragment : collectiveFragments(kernel)) {
-    auto footprint = fragmentRegisterFootprint(fragment);
+    auto footprint = gpu::fragmentRegisterFootprint(fragment);
     if (!llvm::is_contained(collectiveFootprints, footprint))
       collectiveFootprints.push_back(footprint);
   }
