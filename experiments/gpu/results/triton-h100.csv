@@ -17,7 +17,7 @@ xformers_rms_norm,8192x4096-bf16,0.049600,0.050424,0.050336,1.016613,1.014839,pa
 qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,1.818600,1.264448,1.270584,0.695286,0.698661,pass,pass,,
 index_select,source65536-selected32768-hidden4096-fp16,0.222616,0.182888,0.184024,0.821540,0.826643,pass,pass,,
 scaled_index_add,destination65536-routed32768-hidden4096-fp16,0.303456,0.274840,0.268256,0.905700,0.884003,pass,pass,,
-scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,3.511208,1.987968,7.301776,0.566178,2.079562,pass,pass,,
+scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,3.511208,2.048984,7.288080,0.583555,2.075662,pass,pass,,
 jagged_mean,B512-T33024-D128-fp32,0.015408,0.014408,0.015056,0.935099,0.977155,pass,pass,,
 fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.162864,0.056624,0.060544,0.347677,0.371746,pass,pass,,
 rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.412336,0.123728,0.124176,0.300066,0.301152,pass,pass,,
@@ -42,7 +42,7 @@ flaggems_triangular_solve,B4096-N16-fp32-lower,0.039640,0.029680,0.024856,0.7487
 flaggems_embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.095128,0.094000,0.094488,0.988142,0.993272,pass,pass,,
 flaggems_roll,8192x4096-fp16-shift-1-axis0,0.049808,0.049944,0.049224,1.002730,0.988275,pass,pass,,
 flaggems_transpose_copy,4093x8191-fp16,0.280064,0.085312,0.085744,0.304616,0.306159,pass,pass,,
-flaggems_batch_norm_training,B32-C64-S4096-fp16,0.024336,0.044128,0.091608,1.813281,3.764300,pass,pass,,
+flaggems_batch_norm_training,B32-C64-S4096-fp16,0.024336,0.044128,0.092016,1.813281,3.781065,pass,pass,,
 flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.051216,0.043512,0.042848,0.849578,0.836614,pass,pass,,
 flaggems_logsumexp,8192x8192-fp32,0.106408,0.128112,0.124784,1.203970,1.172694,pass,pass,,
 flaggems_softmax_backward,4096x4097-fp32,0.093504,0.074528,,0.797057,,pass,numerical_failed,,"generated/source floating result 0 differs: max_abs=0.000152587890625, atol=0.0001, rtol=1e-05; first_failure=13331922; largest tolerance excess has generated=1.2312570810317993, source=1.2313878536224365, abs_error=0.00013077259063720703, limit=0.00011231387907173485"

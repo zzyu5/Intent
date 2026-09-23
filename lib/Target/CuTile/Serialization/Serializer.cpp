@@ -368,7 +368,7 @@ private:
               "from cuda.tile.tune import exhaustive_search\n"
               "from intent.runtime.artifact import ParameterRole, TuningConfiguration, TuningParameter\n"
               "from intent.runtime.cutile import array_index_kernels, bind_array_view, can_use_i32_array_indices\n"
-              "from intent.runtime.tuning import TuningState\n\n"
+              "from intent.runtime.tuning import TuningState, prune_padded_ownership\n\n"
               "ConstInt = ct.Constant[int]\n\n"
               "@ct.function(host=True)\n"
               "def _intent_next_power_of_2(value):\n"
@@ -594,8 +594,9 @@ private:
     });
     output << ")\n\ndef tuning_configurations(" << joinLaunchArguments() << "):\n";
     emitArgumentBindings();
+    emitConfigurationSelection("_intent_configs", "_intent_config", 1);
     line("return tuple(TuningConfiguration(_TUNING_PARAMETERS, " + bindings +
-             ")) for _intent_config in _CONFIGS)",
+             ")) for _intent_config in _intent_configs)",
          1);
     output << "\n";
   }
@@ -608,6 +609,28 @@ private:
     return "(" + expressionString(count.getExpression(), configContext,
                                     &fullCoverageParameterNames, configName) +
            " <= " + std::to_string(limit.value()) + ")";
+  }
+
+  void emitConfigurationSelection(StringRef candidates, StringRef config,
+                                  unsigned level) {
+    std::string condition;
+    for (auto assertion : kernel.front().getOps<cf::AssertOp>()) {
+      if (!condition.empty())
+        condition += " and ";
+      condition += resourceCondition(assertion, true, config);
+    }
+    if (!condition.empty()) {
+      line(candidates.str() + " = tuple(" + config.str() + " for " +
+               config.str() + " in _CONFIGS if " + condition + ")", level);
+      line("if not " + candidates.str() + ":", level);
+      line("raise ValueError(\"no cuTile configuration satisfies the physical resource bounds\")",
+           level + 1);
+    }
+    std::string arguments = joinLaunchArguments();
+    line(candidates.str() + " = prune_padded_ownership(" +
+             (condition.empty() ? "_CONFIGS" : candidates.str()) +
+             ", _TUNING_PARAMETERS, (" + arguments +
+             (arguments.empty() ? "" : ",") + "))", level);
   }
 
   void emitLaunch() {
@@ -667,11 +690,7 @@ private:
     std::string boundGridName = freshName("_intent_bound_grid");
     std::string boundArgumentsName = freshName("_intent_bound_arguments");
     std::string boundLaunchName = freshName("_intent_bound_launch");
-    SmallVector<std::string> resourceConditions;
-    for (auto assertion : kernel.front().getOps<cf::AssertOp>())
-      resourceConditions.push_back(resourceCondition(assertion, true, configName));
-    std::string candidatesName = resourceConditions.empty()
-                                     ? "_CONFIGS" : freshName("_intent_candidates");
+    std::string candidatesName = freshName("_intent_candidates");
 
     std::string key = tuneKeyName + " = (";
     for (const ViewABI &view : views)
@@ -682,18 +701,7 @@ private:
     line(key + ")", 1);
     line(streamName + " = torch.cuda.current_stream()", 1);
     line("if " + tuneKeyName + " not in _TUNE_CACHE:", 1);
-    if (!resourceConditions.empty()) {
-      std::string condition;
-      for (const std::string &bound : resourceConditions) {
-        if (!condition.empty())
-          condition += " and ";
-        condition += bound;
-      }
-      line(candidatesName + " = tuple(" + configName + " for " + configName +
-               " in _CONFIGS if " + condition + ")", 2);
-      line("if not " + candidatesName + ":", 2);
-      line("raise ValueError(\"no cuTile configuration satisfies the physical resource bounds\")", 3);
-    }
+    emitConfigurationSelection(candidatesName, configName, 2);
     if (kernel->hasAttr(arrayIndexTileBoundsAttr)) {
       std::string boundArguments = "(";
       std::string viewArguments = "(";

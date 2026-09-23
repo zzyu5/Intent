@@ -2,6 +2,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .artifact import ParameterRole
+
+
+def prune_padded_ownership(configs, parameters, arguments):
+    """Keep declared tuples with the least excess pointwise ownership padding."""
+    bounds = []
+    for parameter in parameters:
+        if (parameter.category != 0 or parameter.view_axis is None or
+                parameter.role not in {ParameterRole.OWNERSHIP_M, ParameterRole.OWNERSHIP_N}):
+            continue
+        argument, axis = parameter.view_axis
+        extent = max(1, arguments[argument].shape[axis])
+        bounds.append((parameter.name, 1 << (extent - 1).bit_length()))
+    if not bounds:
+        return configs
+    scored = []
+    for config in configs:
+        padding = 1
+        for name, extent in bounds:
+            padding *= max(1, (getattr(config, name) + extent - 1) // extent)
+        scored.append((config, padding))
+    minimum = min(padding for _, padding in scored)
+    return tuple(config for config, padding in scored if padding == minimum)
+
 
 def view_byte_span(view) -> tuple[int, int]:
     pointer = view.data_ptr()

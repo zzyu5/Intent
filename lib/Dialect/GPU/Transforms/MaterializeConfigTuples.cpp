@@ -692,6 +692,10 @@ LogicalResult bindTraversalFragmentFootprints(
       continue;
     llvm::SmallDenseSet<FragmentType> fragments;
     kernel.walk([&](Operation *operation) {
+      // Shape views do not materialize one register per expanded lane. Their
+      // producers and arithmetic/access consumers carry the actual payloads.
+      if (isa<BroadcastOp, SplatOp, ReshapeOp>(operation))
+        return;
       for (Value value : operation->getResults())
         if (auto type = dyn_cast<FragmentType>(value.getType());
             type && llvm::any_of(type.getShape(), [&](Attribute extent) {

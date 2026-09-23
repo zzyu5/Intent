@@ -4209,6 +4209,18 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
       (!parameter && parameterExtent.getKind() !=
                          static_cast<uint32_t>(PhysicalExprKind::Constant)))
     return failure();
+  std::function<bool(PhysicalExprAttr)> hasBlockedExtent =
+      [&](PhysicalExprAttr extent) {
+    if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
+      auto declaration = queryParameterBySymbol(kernel, extent.getSymbol());
+      return succeeded(declaration) && *declaration != parameter &&
+             declaration->getParameter().getRole() !=
+                 static_cast<uint32_t>(ParameterRole::FullCoverage);
+    }
+    return llvm::any_of(extent.getOperands(), [&](Attribute operand) {
+      return hasBlockedExtent(cast<PhysicalExprAttr>(operand));
+    });
+  };
   SmallVector<MakeRangeOp> ranges;
   kernel.walk([&](MakeRangeOp range) {
     FailureOr<int64_t> sourceDimension = querySourceDimension(
@@ -4220,15 +4232,8 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
         fragment.getShape().size() != 1)
       return;
     auto extent = cast<PhysicalExprAttr>(fragment.getShape()[0]);
-    if (extent.getKind() ==
-        static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
-      FailureOr<ParameterOp> declaration =
-          queryParameterBySymbol(kernel, extent.getSymbol());
-      if (succeeded(declaration) && *declaration != parameter &&
-          (*declaration).getParameter().getRole() !=
-              static_cast<uint32_t>(ParameterRole::FullCoverage))
-        return;
-    }
+    if (hasBlockedExtent(extent))
+      return;
     ranges.push_back(range);
   });
   // Validity can carry an independent occurrence of the same coordinates.

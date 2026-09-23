@@ -107,7 +107,10 @@ def IntentCuTile_AtomicRMWOp : IntentCuTile_Op<"atomic_rmw", [
                        IntentGPU_DataValue:$value,
                        Intent_AtomicRMWKindAttr:$kind,
                        Intent_AtomicOrderingAttr:$ordering,
-                       IntentGPU_AtomicSharingDomainAttr:$sharing);
+                       IntentGPU_AtomicSharingDomainAttr:$sharing,
+                       // Active coordinates are in bounds; inactive coordinates
+                       // use the view-end sentinel and still need native bounds checks.
+                       OptionalAttr<UnitAttr>:$in_bounds);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
 }

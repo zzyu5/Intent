@@ -2680,6 +2680,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
   }
 
   for (gpu::AtomicRMWOp atomic : atomics) {
+    bool activeInBounds = analysis.accessBounds(atomic).isExact();
     auto view = dyn_cast<gpu::ViewType>(atomic.getResource().getType());
     if (!view)
       return atomic.emitOpError(
@@ -2731,7 +2732,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
     auto replacement = builder.create<AtomicRMWOp>(
         atomic.getLoc(), atomic.getResult().getType(), atomic.getResource(),
         *coordinates, atomic.getValue(), atomic.getKind(), atomic.getOrdering(),
-        atomic.getSharing());
+        atomic.getSharing(), activeInBounds ? builder.getUnitAttr() : UnitAttr());
     if (Attribute origin = atomic->getAttr(gpu::originAttr))
       replacement->setAttr(gpu::originAttr, origin);
     atomic.getResult().replaceAllUsesWith(replacement.getResult());
@@ -3205,10 +3206,17 @@ gpu::PhysicalExprAttr arrayIndexTileBound(gpu::PhysicalExprAttr expression,
   SmallVector<Attribute> operands;
   for (Attribute operand : expression.getOperands()) {
     auto bound = arrayIndexTileBound(cast<gpu::PhysicalExprAttr>(operand), kernel);
-    if (!bound)
+    if (!bound && kind != gpu::PhysicalExprKind::Minimum)
       return {};
-    operands.push_back(bound);
+    if (bound)
+      operands.push_back(bound);
   }
+  // A bounded tile min(chunk, runtime_shape) is no wider than chunk. The
+  // unknown shape operand must not discard that already proven upper bound.
+  if (operands.empty())
+    return {};
+  if (operands.size() == 1)
+    return cast<gpu::PhysicalExprAttr>(operands.front());
   return gpu::PhysicalExprAttr::get(
       kernel.getContext(), expression.getKind(), expression.getValue(),
       expression.getSymbol(), ArrayAttr::get(kernel.getContext(), operands));
@@ -3240,14 +3248,13 @@ ArrayAttr arrayIndexTileBounds(func::FuncOp kernel) {
     } else if (auto store = dyn_cast<TileStoreOp>(operation)) {
       resource = store.getResource();
       tile = store.getValue().getType();
-    } else if (isa<ScalarLoadOp, ScalarStoreOp, GatherLoadOp, ScatterStoreOp>(operation)) {
+    } else if (isa<ScalarLoadOp, ScalarStoreOp, GatherLoadOp, ScatterStoreOp,
+                   AtomicRMWOp>(operation)) {
       // Gather/scatter use element coordinates.  Their active coordinates must
       // already be in bounds before narrowing the array's index arithmetic.
       if (!operation->hasAttr("in_bounds"))
         return WalkResult::interrupt();
       resource = operation->getOperand(0);
-    } else if (isa<AtomicRMWOp>(operation)) {
-      return WalkResult::interrupt();
     } else {
       return WalkResult::advance();
     }
