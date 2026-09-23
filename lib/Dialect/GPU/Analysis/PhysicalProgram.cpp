@@ -627,7 +627,8 @@ IndexSign physicalIndexSign(PhysicalExprAttr expression, func::FuncOp kernel) {
     return std::min(
         physicalIndexSign(cast<PhysicalExprAttr>(expression.getOperands()[1]), kernel),
         physicalIndexSign(cast<PhysicalExprAttr>(expression.getOperands()[2]), kernel));
-  if (kind == PhysicalExprKind::NextPowerOfTwo)
+  if (kind == PhysicalExprKind::NextPowerOfTwo ||
+      kind == PhysicalExprKind::Multiply)
     return positiveExtentBounds(kernel, expression) ? IndexSign::Positive
                                                     : IndexSign::Unknown;
   if (expression.getOperands().size() != 2)
@@ -4732,6 +4733,20 @@ PhysicalProgramAnalysis::boundaryValidity(Operation *access,
                               coordinate, accessFact.resource, sourceAxis);
     }
     if (!matchedAxis) {
+      // A component range of a composed address may have its own logical tail
+      // (for example group*width+channel). A whole-range guard discharges that
+      // predicate without equating it to a boundary of the resource axis.
+      if (allowRangeGuards)
+        for (MakeRangeOp range : accessFact.ranges) {
+          Value bound = stripScalarIdentity(range.getLogicalStop());
+          if (!isUnitStepRange(range) || !bound.getType().isIndex() ||
+              !isTailPredicate(value, {{range, bound}}))
+            continue;
+          if (!llvm::is_contained(result.rangeBounds,
+                                  std::make_pair(range, bound)))
+            result.rangeBounds.emplace_back(range, bound);
+          return PhysicalFactState::Exact;
+        }
       appendUnique(result.blockers, comparison);
       return PhysicalFactState::Unknown;
     }

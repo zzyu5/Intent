@@ -496,10 +496,10 @@ FailureOr<Value> scalarFill(Operation *owner, Value fill) {
 }
 
 struct NativeTileAxisPlan {
-  std::optional<unsigned> computationAxis;
+  SmallVector<unsigned> computationAxes;
   Value scalarIndex;
-  gpu::MakeRangeOp range;
-  SmallVector<Value> offsets;
+  SmallVector<std::pair<gpu::MakeRangeOp, int64_t>> ranges;
+  SmallVector<std::pair<Value, int64_t>> offsets;
   bool originInBounds = false;
 };
 
@@ -660,36 +660,66 @@ Value repeatTileForExtraction(OpBuilder &builder, Location location, Value value
       builder.getArrayAttr(mergeGroups));
 }
 
-bool collectTileOffsets(Value value, Value range,
-                        SmallVectorImpl<Value> &offsets) {
-  if (value == range)
+bool collectTileCoordinates(Value value, NativeTileAxisPlan &axis,
+                            int64_t scale = 1) {
+  if (auto range = value.getDefiningOp<gpu::MakeRangeOp>()) {
+    if (llvm::any_of(axis.ranges, [&](auto term) { return term.first == range; }))
+      return false;
+    axis.ranges.emplace_back(range, scale);
     return true;
-  if (auto broadcast = value.getDefiningOp<gpu::BroadcastOp>())
-    return collectTileOffsets(broadcast.getValue(), range, offsets);
-  if (auto reshape = value.getDefiningOp<gpu::ReshapeOp>())
-    return collectTileOffsets(reshape.getValue(), range, offsets);
-  if (auto transpose = value.getDefiningOp<gpu::TransposeOp>())
-    return collectTileOffsets(transpose.getValue(), range, offsets);
-  auto binary = value.getDefiningOp<gpu::BinaryOp>();
-  if (!binary || binary.getOperatorKind() != BinaryOperator::Add)
-    return false;
-  if (Value scalar = uniformScalarFill(binary.getRhs())) {
-    SmallVector<Value> nested;
-    if (collectTileOffsets(binary.getLhs(), range, nested)) {
-      offsets.append(nested);
-      offsets.push_back(scalar);
-      return true;
-    }
   }
-  if (Value scalar = uniformScalarFill(binary.getLhs())) {
-    SmallVector<Value> nested;
-    if (collectTileOffsets(binary.getRhs(), range, nested)) {
-      offsets.append(nested);
-      offsets.push_back(scalar);
-      return true;
+  if (Value scalar = uniformScalarFill(value)) {
+    if (!scalar.getType().isIndex())
+      return false;
+    axis.offsets.emplace_back(scalar, scale);
+    return true;
+  }
+  if (auto broadcast = value.getDefiningOp<gpu::BroadcastOp>())
+    return collectTileCoordinates(broadcast.getValue(), axis, scale);
+  if (auto reshape = value.getDefiningOp<gpu::ReshapeOp>())
+    return collectTileCoordinates(reshape.getValue(), axis, scale);
+  if (auto transpose = value.getDefiningOp<gpu::TransposeOp>())
+    return collectTileCoordinates(transpose.getValue(), axis, scale);
+  auto binary = value.getDefiningOp<gpu::BinaryOp>();
+  if (!binary)
+    return false;
+  if (binary.getOperatorKind() == BinaryOperator::Add)
+    return collectTileCoordinates(binary.getLhs(), axis, scale) &&
+           collectTileCoordinates(binary.getRhs(), axis, scale);
+  if (binary.getOperatorKind() == BinaryOperator::Multiply) {
+    for (unsigned i = 0; i != 2; ++i) {
+      Value scalar = uniformScalarFill(binary->getOperand(i));
+      auto factor = scalar ? constantValue(scalar) : std::nullopt;
+      int64_t product;
+      if (factor && *factor > 0 && !llvm::MulOverflow(scale, *factor, product))
+        return collectTileCoordinates(binary->getOperand(1 - i), axis, product);
     }
   }
   return false;
+}
+
+Value materializeTileOrigin(OpBuilder &builder, Location location,
+                            const NativeTileAxisPlan &axis) {
+  if (axis.scalarIndex)
+    return axis.scalarIndex;
+  Value origin;
+  auto add = [&](Value value, int64_t scale) {
+    if (scale != 1) {
+      Value coefficient = builder.create<arith::ConstantIndexOp>(location, scale);
+      value = builder.create<gpu::BinaryOp>(
+          location, builder.getIndexType(), value, coefficient,
+          BinaryOperator::Multiply);
+    }
+    origin = origin ? Value(builder.create<gpu::BinaryOp>(
+                          location, builder.getIndexType(), origin, value,
+                          BinaryOperator::Add))
+                    : value;
+  };
+  for (auto [range, scale] : axis.ranges)
+    add(range.getStart(), scale);
+  for (auto [offset, scale] : axis.offsets)
+    add(offset, scale);
+  return origin;
 }
 
 Value stripIndexIdentities(Value value) {
@@ -1217,7 +1247,7 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
         usedComputationAxis[computationAxis])
       return false;
     usedComputationAxis[computationAxis] = true;
-    plan.axes[resourceAxis].computationAxis = computationAxis;
+    plan.axes[resourceAxis].computationAxes.push_back(computationAxis);
     return true;
   };
 
@@ -1226,26 +1256,34 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
     NativeTileAxisPlan &axis = plan.axes[resourceAxis];
     Value coordinate = resourceCoordinates[resourceAxis];
     Value scalar = uniformScalarFill(coordinate);
-    gpu::PhysicalRangeFact ranges = analysis.sourceRanges(coordinate);
-    if (ranges.isExact() && ranges.roots.size() == 1) {
-      axis.range = ranges.roots.front();
-      SmallVector<gpu::PhysicalAxisProjection, 2> projections =
-          gpu::queryRangeProjections(computationType, axis.range);
-      auto rangeType =
-          dyn_cast<gpu::FragmentType>(axis.range.getResult().getType());
-      if (projections.size() != 1 ||
-          !assignComputationAxis(resourceAxis,
-                                 projections.front().fragmentAxis) ||
-          !gpu::isUnitStepRange(axis.range) || !rangeType ||
-          rangeType.getShape().size() != 1 ||
-          rangeType.getShape()[0] !=
-              computationType.getShape()[*axis.computationAxis] ||
-          !collectTileOffsets(coordinate, axis.range.getResult(), axis.offsets))
+    if (!scalar) {
+      if (!collectTileCoordinates(coordinate, axis) || axis.ranges.empty())
         return failure();
+      llvm::stable_sort(axis.ranges, [](auto lhs, auto rhs) {
+        return lhs.second > rhs.second;
+      });
+      for (auto [range, stride] : axis.ranges) {
+        auto projections = gpu::queryRangeProjections(computationType, range);
+        auto rangeType = dyn_cast<gpu::FragmentType>(range.getResult().getType());
+        if (projections.size() != 1 ||
+            !assignComputationAxis(resourceAxis, projections.front().fragmentAxis) ||
+            !gpu::isUnitStepRange(range) || !rangeType ||
+            rangeType.getShape().size() != 1 ||
+            rangeType.getShape()[0] !=
+                computationType.getShape()[axis.computationAxes.back()])
+          return failure();
+      }
       axis.originInBounds =
-          rangeOriginInView(axis.range, axis.offsets, view, resourceAxis,
-                            dimensions[resourceAxis], kernel) ||
           llvm::is_contained(accessBounds.assumedAxes, resourceAxis);
+      if (axis.ranges.size() == 1 && axis.ranges.front().second == 1 &&
+          llvm::all_of(axis.offsets, [](auto term) { return term.second == 1; })) {
+        SmallVector<Value> offsets;
+        for (auto term : axis.offsets)
+          offsets.push_back(term.first);
+        axis.originInBounds |= rangeOriginInView(
+            axis.ranges.front().first, offsets, view, resourceAxis,
+            dimensions[resourceAxis], kernel);
+      }
       continue;
     }
 
@@ -1267,7 +1305,7 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
       if (projection.isExact()) {
         if (!assignComputationAxis(resourceAxis, projection.fragmentAxis) ||
             !isUnitExtent(
-                computationType.getShape()[*axis.computationAxis]))
+                computationType.getShape()[axis.computationAxes.back()]))
           return failure();
       }
     } else {
@@ -1308,29 +1346,40 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
   packedMappings.reserve(computationRank);
   for (unsigned resourceAxis = 0; resourceAxis < resourceRank;
        ++resourceAxis) {
-    std::optional<unsigned> computationAxis =
-        plan.axes[resourceAxis].computationAxis;
-    if (!computationAxis) {
+    ArrayRef<unsigned> computationAxes = plan.axes[resourceAxis].computationAxes;
+    if (computationAxes.empty()) {
       resourceShape[resourceAxis] = unit;
       resourceMappings[resourceAxis] = gpu::AxisMapAttr::get(
           context, view.getSourceId(), resourceAxis,
           dimensions[resourceAxis], resourceAxis, false);
       continue;
     }
-    Attribute extent = computationType.getShape()[*computationAxis];
+    Attribute extent = unit;
     auto mapping = cast<gpu::AxisMapAttr>(
-        computationType.getAxisMaps()[*computationAxis]);
+        computationType.getAxisMaps()[computationAxes.front()]);
+    for (unsigned computationAxis : computationAxes) {
+      Attribute component = computationType.getShape()[computationAxis];
+      if (isUnitExtent(extent))
+        extent = component;
+      else if (!isUnitExtent(component))
+        extent = gpu::PhysicalExprAttr::get(
+            context, static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
+            StringAttr::get(context), ArrayAttr::get(context, {extent, component}));
+      auto componentMap = cast<gpu::AxisMapAttr>(
+          computationType.getAxisMaps()[computationAxis]);
+      unsigned packedAxis = packedShape.size();
+      packedShape.push_back(component);
+      packedMappings.push_back(gpu::AxisMapAttr::get(
+          context, componentMap.getSourceId(), componentMap.getSourceAxis(),
+          componentMap.getDimensionId(), packedAxis, componentMap.getDerived()));
+      plan.toComputation[computationAxis] = packedAxis;
+      plan.toResource[packedAxis] = computationAxis;
+    }
     resourceShape[resourceAxis] = extent;
     resourceMappings[resourceAxis] = gpu::AxisMapAttr::get(
         context, mapping.getSourceId(), mapping.getSourceAxis(),
-        mapping.getDimensionId(), resourceAxis, mapping.getDerived());
-    unsigned packedAxis = packedShape.size();
-    packedShape.push_back(extent);
-    packedMappings.push_back(gpu::AxisMapAttr::get(
-        context, mapping.getSourceId(), mapping.getSourceAxis(),
-        mapping.getDimensionId(), packedAxis, mapping.getDerived()));
-    plan.toComputation[*computationAxis] = packedAxis;
-    plan.toResource[packedAxis] = *computationAxis;
+        mapping.getDimensionId(), resourceAxis,
+        mapping.getDerived() || computationAxes.size() > 1);
   }
 
   plan.resourceType = gpu::FragmentType::get(
@@ -1369,16 +1418,9 @@ FailureOr<Value> materializeTileOriginGuard(
     NativeTileAxisPlan &axisPlan = plan.axes[axis];
     if (axisPlan.originInBounds)
       continue;
-    Value origin = axisPlan.scalarIndex;
-    if (!origin) {
-      if (!axisPlan.range)
-        return failure();
-      origin = axisPlan.range.getStart();
-      for (Value offset : axisPlan.offsets)
-        origin = builder.create<gpu::BinaryOp>(
-            owner->getLoc(), builder.getIndexType(), origin, offset,
-            BinaryOperator::Add);
-    }
+    Value origin = materializeTileOrigin(builder, owner->getLoc(), axisPlan);
+    if (!origin)
+      return failure();
     if (!zero)
       zero = builder.create<arith::ConstantIndexOp>(owner->getLoc(), 0);
     Value extent = builder.create<gpu::DimOp>(
@@ -1465,37 +1507,69 @@ materializeTileIndices(OpBuilder &builder, Operation *owner,
                        bool allowDynamicAlignment) {
   MaterializedTileIndices result;
   result.values.reserve(plan.axes.size());
-  for (const NativeTileAxisPlan &axis : plan.axes) {
+  auto require = [&](Value condition) {
+    result.alignment = result.alignment
+                           ? Value(builder.create<gpu::BinaryOp>(
+                                 owner->getLoc(), builder.getI1Type(),
+                                 result.alignment, condition,
+                                 BinaryOperator::LogicalAnd))
+                           : condition;
+  };
+  for (auto [resourceAxis, axis] : llvm::enumerate(plan.axes)) {
     if (axis.scalarIndex) {
       result.values.push_back(axis.scalarIndex);
       continue;
     }
-    gpu::MakeRangeOp range = axis.range;
-    Value start = range.getStart();
-    for (Value offset : axis.offsets)
-      start = builder.create<gpu::BinaryOp>(
-          owner->getLoc(), builder.getIndexType(), start, offset,
-          BinaryOperator::Add);
+    Value start = materializeTileOrigin(builder, owner->getLoc(), axis);
+    Value extent;
+    if (axis.ranges.size() == 1 && axis.ranges.front().second == 1) {
+      auto range = axis.ranges.front().first;
+      extent = range.getExtent();
+    } else {
+      extent = builder.create<gpu::PhysicalExprOp>(
+          owner->getLoc(), builder.getIndexType(),
+          cast<gpu::PhysicalExprAttr>(plan.resourceType.getShape()[resourceAxis]));
+      Value inner = builder.create<arith::ConstantIndexOp>(owner->getLoc(), 1);
+      Value one = inner;
+      // A varying axis is contiguous only when its stride equals the product
+      // of the inner tile extents. Unit axes contribute an origin, not a gap.
+      for (auto [range, stride] : llvm::reverse(axis.ranges)) {
+        Value coefficient = builder.create<arith::ConstantIndexOp>(
+            owner->getLoc(), stride);
+        Value unit = builder.create<gpu::CompareOp>(
+            owner->getLoc(), builder.getI1Type(), range.getExtent(), one,
+            ComparePredicate::Eq);
+        Value contiguous = builder.create<gpu::CompareOp>(
+            owner->getLoc(), builder.getI1Type(), coefficient, inner,
+            ComparePredicate::Eq);
+        require(builder.create<gpu::BinaryOp>(
+            owner->getLoc(), builder.getI1Type(), unit, contiguous,
+            BinaryOperator::LogicalOr));
+        inner = builder.create<gpu::BinaryOp>(
+            owner->getLoc(), builder.getIndexType(), inner, range.getExtent(),
+            BinaryOperator::Multiply);
+      }
+    }
     FailureOr<Value> index = tileIndex(builder, owner->getLoc(), start,
-                                       range.getExtent());
+                                       extent);
     if (succeeded(index)) {
       result.values.push_back(*index);
       continue;
     }
-    if (!allowDynamicAlignment || !isKnownPositive(range.getExtent()))
+    if (!allowDynamicAlignment || !isKnownPositive(extent))
       return failure();
     result.values.push_back(builder.create<gpu::BinaryOp>(
-        owner->getLoc(), builder.getIndexType(), start, range.getExtent(),
+        owner->getLoc(), builder.getIndexType(), start, extent,
         BinaryOperator::FloorDivide));
     Value remainder = builder.create<gpu::BinaryOp>(
-        owner->getLoc(), builder.getIndexType(), start, range.getExtent(),
+        owner->getLoc(), builder.getIndexType(), start, extent,
         BinaryOperator::Remainder);
     Value zero = builder.create<arith::ConstantIndexOp>(owner->getLoc(), 0);
     Value aligned = builder.create<gpu::CompareOp>(
         owner->getLoc(), builder.getI1Type(), remainder, zero,
         ComparePredicate::Eq);
-    if (hasPowerOfTwoDomain(range.getExtent())) {
-      auto factors = uniformAlignmentFactors(start, range.getExtent());
+    if (hasPowerOfTwoDomain(extent)) {
+      auto factors = uniformAlignmentFactors(start, extent);
       if (succeeded(factors)) {
         if (factors->empty())
           continue;
@@ -1503,7 +1577,7 @@ materializeTileIndices(OpBuilder &builder, Operation *owner,
         for (Value factor : *factors) {
           Value modulus = builder.create<gpu::BinaryOp>(
               owner->getLoc(), builder.getIndexType(), factor,
-              range.getExtent(), BinaryOperator::Remainder);
+              extent, BinaryOperator::Remainder);
           Value condition = builder.create<gpu::CompareOp>(
               owner->getLoc(), builder.getI1Type(), modulus, zero,
               ComparePredicate::Eq);
@@ -1519,12 +1593,7 @@ materializeTileIndices(OpBuilder &builder, Operation *owner,
             BinaryOperator::LogicalOr);
       }
     }
-    result.alignment =
-        result.alignment
-            ? Value(builder.create<gpu::BinaryOp>(
-                  owner->getLoc(), builder.getI1Type(), result.alignment,
-                  aligned, BinaryOperator::LogicalAnd))
-            : aligned;
+    require(aligned);
   }
   return result;
 }
@@ -3066,7 +3135,7 @@ ArrayAttr arrayIndexTileBounds(func::FuncOp kernel) {
         auto original = unfoldedArrayLoad(load);
         if (failed(original) || failed(load.verify()))
           return WalkResult::interrupt();
-        // The full inner-axis padding also bounds its contiguous alias.
+        // The original rectangular padding also bounds its contiguous alias.
         load = *original;
       }
       resource = load.getResource();
