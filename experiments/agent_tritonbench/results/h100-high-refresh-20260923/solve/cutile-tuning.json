@@ -1,0 +1,16 @@
+{
+  "shared": {
+    "contraction_narrow": [[128,128,32,1,128,1,8],[128,256,64,1,128,1,8],[64,64,64,1,64,1,8],[64,32,64,1,64,1,8]],
+    "region_contraction": [[128,128,64,1,128,1,8],[64,32,64,1,64,1,8]],
+    "region_contraction_multi_accumulator": [[64,32,64,1,64,1,8],[64,64,64,1,64,1,8]],
+    "reduction": [[64,64,256,1,128,1,8]]
+  },
+  "cutile": {
+    "ctas": [[1]],
+    "worker_warps": [[1]],
+    "access_form": [[3]],
+    "load_policy_loop": [[11]],
+    "occupancy_loop": [[1]],
+    "occupancy_persistent": [[2],[1]]
+  }
+}

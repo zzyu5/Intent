@@ -1,177 +1,132 @@
-**H100：相同 Intent 程序的 cuTile 正确性与性能分析（2026-09-23）**
+# H100 全量测评与定点修复
 
-当前目标是固定 Triton 高性能库的 **46 个配对**，把 cuTile/历史 Intent→Triton 耗时几何均值降到约 **1.20**。总表目前仍为 **2.2977，未达标**；没有删除慢项或更换分母。最新核查发现，H100 在原 benchmark 的 **100% GPU 利用率下仍固定在 600 MHz**，默认应用频率为 1980 MHz，功耗、温度及 application-clock 限频均未触发。恢复默认 GPU 时钟需要管理员权限，当前账户及无密码 sudo 均无法执行。
+本轮完成了冻结版本的全量测评，随后修复已定位的问题并做定点验证。**高性能库中，同一个 Intent 程序的两个 target 在整体上已经接近；新生成的 TritonBench 100 题，正确率优于现有 agent Triton 提交，但整体性能仍未达到 reference 或 agent Triton。** 不能把高性能库的结果套到新生成的 100 题上。
 
-这个设备状态已经影响原因判断：当前相同程序的 Triton 与 cuTile 在几个带宽算子上接近，但两者都慢于历史 Triton。它尚不能解释所有差距，也不能用频率比例换算成绩。需要恢复默认时钟后实际测量，才能判断距离 1.20 还剩多少；已有 source 时间继续复用。
+当前表包含全量结果及已完成的开发复测；没有再次全量运行最新编译器，也没有重新生成或修改这 100 份候选程序。冻结的全量结果分别保存在 Git 提交 `1917bbc9`（生产库）和 `5fab2401`（agent 实验）中。
 
-本轮在高性能库中修到了真实瓶颈：QKV 的 cuTile 完整算子从 **7.6167 ms 降至 1.6253 ms**，减少 **78.7%**，通过原容差且快于 source **1.8186 ms**。根因是 shared pass 没有跨单例轴 reshape 合并加载后的重复补零，造成额外的寄存器/shared-memory 搬运；不是作者必须改 DSL，也不是 cuTile 天生不能高效计算 QKV。另修复了调优候选遗漏访存参数组合的问题，Mamba chunk scan 从 **0.2491 ms 降至 0.1254 ms**。
+## 结果入口与统计口径
 
-整体目标仍未完成。TritonBench 已建立的 cuTile 全量基线为 **98/100 pass**，与 Intent→Triton 相同；本轮只做受影响单点，没有重新生成或再跑全 100。96 个有效 GPU 配对中，cuTile/Intent→Triton 耗时几何均值仍为 **1.2872**，有 **16 题慢于 2 倍**。高性能 Triton 库的 46 个严格配对也仍有 **25 项慢于 Intent→Triton 的 2 倍**。下面分别列已解决的原因、实际收益和未解决项。
+只维护以下三个输出：
 
-完整结果入口：
+- [Triton 来源高性能库：source、Intent→Triton、Intent→cuTile](results/triton-h100.csv)。
+- [cuTile 来源高性能库：source、Intent→Triton、Intent→cuTile](results/cutile-h100.csv)。
+- [新生成 100 题：reference、agent Triton、Intent→Triton、Intent→cuTile](../agent_tritonbench/results/h100-high-refresh-20260923/results.csv)。
 
-- [TritonBench 100 题四列对照](../agent_tritonbench/results/h100-selected.csv)：Intent→Triton、Intent→cuTile、reference、agent 直接写的 Triton，单位 μs；三组状态分别标明。
-- [程序来源、配置与测量记录](../agent_tritonbench/results/h100-selected.json)：原 172 条记录保留，`cutile.records` 增加相同 Intent 程序的 100 条记录。
-- [生产库 H100 整体对照](results/h100-comparison.csv)：89 个工作量，单位 ms；`dense_gemm`、`swiglu` 有两个可比较的 source，其余保留各自 source。RMSNorm 的两个 corpus 使用不同 epsilon，因此分别保留。
+时间单位均为 **ms，完整算子耗时**；JIT、编译、调优不计入性能列。加速比定义为“对照耗时 / Intent 耗时”，大于 1 才是加速。只在数值通过、有有效时间的配对上计算几何均值；不同配对数不混作同一批样本。
 
-本轮是已选程序的开发复测，不是重新让 Luna 生成一轮。复用原输入、dtype、容差、每题 CUDA Graph/event 边界及已有 reference 时间；reference 输出仍参与数值检查。准备并发，GPU 计时共用锁。5090D 未运行。
+生产库沿用原 baseline-v2 source 时间。为判断是否共同环境退化，只额外诊断了两个 source：varlen conv 为旧 0.050504、新 0.048496；layer norm 为旧 0.057824、新 0.061336。这不支持“当前所有 Triton 回退都由设备共同变慢导致”。诊断时间没有覆盖原 source 列。
 
-**正确性已经解决了什么**
+## 高性能库
 
-| 同一批 100 份 Intent 程序 | cuTile 本轮起点 | 修复后 |
+| 来源 | Intent→Triton 通过 | Intent→cuTile 通过 | Triton 相对 source 加速 | cuTile 相对 source 加速 | 同 DSL cuTile/Triton 耗时比 |
+|---|---:|---:|---:|---:|---:|
+| Triton 库 | 54/54 | 53/54 | 1.125×，52 对 | 1.106×，51 对 | 0.997×，53 对 |
+| cuTile 库 | 35/35 | 35/35 | 2.599×，35 对 | 2.435×，35 对 | 1.067×，35 对 |
+
+cuTile 库另有 2 条 H100/source 不支持的记录：block-scaled GEMM 的 SM100/E8M0 路径、NVFP4 packing 路径。保留状态，不强行运行，也不计入上表可运行分母。Triton 库有两条 source 时间不可用，但生成程序本次通过，不能把它们的 pass 清空。
+
+**整体耗时比已在 1.2 以内，不等于逐项达标。** Triton 来源中仍有 7 项 cuTile 比同 DSL Triton 慢超过 20%，其中 3 项超过 2 倍；cuTile 来源分别为 6 项和 3 项。
+
+| 主要长尾 | cuTile/Triton 耗时比 |
+|---|---:|
+| FP8 split-K GEMM | 3.673× |
+| batch norm training | 2.076× |
+| max pooling with indices | 2.038× |
+| attention sink decode | 5.060× |
+| sparse MLA prefill | 3.200× |
+| absorbed MLA decode | 2.179× |
+
+生产库仅剩 `softmax_backward` 的 cuTile 数值检查失败。当前证据是 f32 归约/融合后的误差超过原容差，尚未证明实现违反 Intent 数值合同；没有放宽容差或擅自改成 f64 累加。
+
+cuTile 来源的 2.435× 是相对这批固定 source 配置的结果，不能解释成“生成代码普遍比 cuTile 库快 2.4 倍”。例如 sparse MLA source 固定 `TILE_H=1, TILE_N=64`，本例产生 131072 个 blocks；生成程序采用已有的持久工作分配。原 source 308.889 ms 是这个具体入口的观测，不是最佳 cuTile 实现的证明。配置入口见 [attention.py](providers/cutile/attention.py)。
+
+## 新生成的 TritonBench 100 题
+
+| 语言组 | 冻结全量通过 | 定点修复后通过 |
 |---|---:|---:|
-| pass | 80 | 98 |
-| 编译失败 | 8 | 0 |
-| 准备/启动超时 | 10 | 0 |
-| 数值失败 | 2 | 2 |
+| reference | 100 | 100 |
+| 原 agent Triton 提交 | 73 | 73 |
+| 同一批 Intent→Triton | 90 | 94 |
+| 同一批 Intent→cuTile | 77 | 93 |
 
-8 个编译失败是 cuTile leaf 缺 `erf`、`log1p`、`lgamma` 的 lowering，不是 DSL 写错。现在提供 f16/bf16/f32 路径；尚未实现的 f64 明确拒绝，不把窄精度实现冒充 f64。
+agent Triton 另有 7 题无提交、11 题程序错误、9 题数值失败。没有重新生成 Triton 对照组。右列是原提交在修复后的编译器/定点配置下的开发结果，不能替代左列的冻结成绩。
 
-10 个超时不等于 kernel 执行很慢。部分程序有 200 多个 native 配置，失败配置每个可花 15 秒；原先预编译与启动调优还会重复处理。现在让启动复用同一签名的 native 编译结果及失败结果，并仅对未完成项目延长准备预算。例如 instance-norm+SELU+conv 有 238 个卷积配置和 54 个归一化配置，准备约 529 秒，但最终完整算子只有 **0.062032 ms**。这些准备时间不计入性能列。
+cuTile 的 `solve`、`normalize_pairwise_distance` 使用了定向静态配置，已在结果列注明，并保留 [solve 配置](../agent_tritonbench/results/h100-high-refresh-20260923/solve/cutile-tuning.json)和 [normalize 配置](../agent_tritonbench/results/h100-high-refresh-20260923/normalize_pairwise_distance/cutile-tuning.json)。因此 **93/100 不表示默认配置已全量验证到 93/100**。
 
-两项数值失败是 `matrix_power_eig`、`solve_symmetric_ldl`，原 Intent→Triton 也失败。本轮不通过修改程序或放宽容差把它们改成 pass。性能统计还排除 `sum_std` 的 CPU 常量结果、`fused_svd_reconstruct` 的恒等式捷径，得到 96 个有效 GPU 配对。
+| 当前可比较结果 | 几何加速比 | 配对数 |
+|---|---:|---:|
+| Intent→Triton 对比 reference | 0.930× | 92 |
+| Intent→cuTile 对比 reference | 0.689× | 91 |
+| Intent→Triton 对比 agent Triton | 0.753× | 68 |
+| Intent→cuTile 对比 agent Triton | 0.568× | 68 |
+| Intent→cuTile 对比同 DSL Triton | 0.738× | 91 |
 
-生产库总表的 89 个工作量中，cuTile 为 86 pass、1 项 `softmax_backward` 数值失败、2 项受硬件或 source 支持限制；这些状态继续保留。严格性能配对只纳入两 target 均 pass 且有对应 source 的项目。
+最后一行等价于 cuTile 耗时约为 Triton 的 **1.355 倍**。这些数值不能支持“这轮 Intent 整体性能已超过 agent Triton”。
 
-**整体性能**
+性能聚合排除 `sum_std` 的 CPU 常量结果和 `fused_svd_reconstruct` 的复制捷径；正确率仍以 100 题为分母。agent Triton 的 `tensordot_rsqrt` 使用 TF32，不进入同精度 agent 配对。
 
-下表均是耗时比，小于 1 表示 cuTile 更快；reference 和 agent Triton 使用已保存的 H100 时间。
+cuTile 从 77 增加到 93 个 pass 后，几何加速比反而降低，主要因为新增了原来不能计时的慢题；不能据此认定修复让原来通过的 75 个有效性能样本回退。它们并未在这次定点修复中全部重测。
 
-| 比较对象 | 配对数 | cuTile 耗时几何均值比 | cuTile 不慢于对方 |
-|---|---:|---:|---:|
-| 相同 Intent→Triton | 96 | 1.2872 | 13/96 |
-| reference | 96 | 0.8511 | 64/96 |
-| agent 直接写的 Triton，同精度 | 69 | 1.1906 | 24/69 |
+## 已修复的具体问题
 
-所以目前可以说：cuTile 生成的完整算子总体快于 reference，但总体仍慢于 Intent→Triton 和手写 agent Triton。相对 Intent→Triton，35 题慢超过 20%，其中 16 题超过 2 倍；不能把几何均值快于 reference 说成逐题达标。`tensordot_rsqrt` 的手写 Triton 使用 TF32，仍排除于同精度 agent 配对。
+| 问题 | 修复与实际结果 |
+|---|---|
+| Triton Mamba 单步回退 | launch 参数绑定反复处理维度、stride、alias 信息；复用 view span、打包 metadata/overlap，并用原生 heuristics 延迟构造 descriptor。0.248720 → **0.053720 ms**，原容差通过。完整算子计时没有改为只测 kernel。 |
+| varlen conv 配置缺档 | 共享 pointwise/reduction profile 缺中间 64 分块。0.131360 → **0.076976 ms**；仍慢于 source 0.050504 ms，未宣称完全追回。 |
+| cuTile chunked softmax 超时 | 原先只有 Triton 使用的动态归约资源约束上提并供两个 leaf 使用。剔除明显超出候选预算的组合后，**0.819568 ms、pass**。 |
+| matmul 结果被完整物化 | 合法的“matmul 后按 parallel 输出坐标取值”先形成 FULL_M×FULL_N，再 gather。扩展已有 contraction projection，沿 free axes 传递规则分块，保留 K、累加、有效性及轴置换。原 tensordot 现在 Triton **0.062720 ms**、cuTile **0.115952 ms**，均通过。 |
+| loop carry 覆盖 | Triton 多结果 yield 的顺序赋值破坏旧状态；改为同时赋值。Chebyshev 原提交通过。 |
+| retained read 与类型关系 | 提前物化需要保留的读，避免再修改新建的 chunk 坐标；保留 StoreOp 身份，重建失效的分析事实；修复 tuple reduction 分量的共同物理 shape。determinant 两个后端通过。 |
+| reverse suffix | 支持合法隐式 domain end 的反向后缀证明；least-squares QR 两个后端通过。 |
+| cuTile 操作缺口 | 补动态均匀行提取、重复 Cartesian 坐标的显式投影、i64 常量类型，以及 erfc/i0 lowering。log-softmax-linear、masked-select、erfc、i0 原用例通过。 |
+| subregion 容量过大 | 容量分析保留常量与循环下界，避免把 k+1 到 257 的最多 256 个成员补齐到 512；solve 尾部从 256×512 收紧为 256×256。静态归约候选也按容量去重。 |
 
-生产库保留已有更快且有效的测量，补入本轮改善的 QKV、Mamba、三角求解和 MQA。以下均直接按最终整体表回算；双 source 行共享同一组 Intent 成绩，各 corpus 使用表中自己的 source 时间作分母：
+这些改动没有自动增加 kernel，没有修改候选算法，也没有新增另一套 form/plan。主要实现位于 [GPU shared passes](../../lib/Dialect/GPU/Transforms/)、[Triton leaf](../../lib/Target/Triton/)、[cuTile leaf](../../lib/Target/CuTile/)。
 
-| 生产工作量来源 | 两个 target 均 pass | Intent→Triton / source | Intent→cuTile / source | cuTile / Triton |
-|---|---:|---:|---:|---:|
-| Triton 高性能库 | 46 | 0.7876 | 1.8096 | 2.2977 |
-| cuTile 高性能库 | 35 | 0.7614 | 0.6769 | 0.8889 |
+数学 helper 采用成熟算法：erfc 使用 [OpenLibm 分段算法](https://raw.githubusercontent.com/JuliaMath/openlibm/master/src/s_erf.c)，i0 使用 PyTorch/ATen 的 Cephes Chebyshev 形式。此次验证范围是原生产用例及其既定容差；未声称做过全定义域 ULP 验证，未实现的 f64 路径仍明确拒绝。
 
-这是保留已有有效成绩的整体对照，不是全部用当前编译器重新测量的回归表。按同一整体表口径，Triton corpus 的 cuTile/Triton 从本轮起点 **2.4786** 降到 **2.2977**，几何均值耗时减少约 **7.3%**；cuTile corpus 为 **0.8889**。历史分母与当前运行的设备频率尚未对齐，不能将整个比值解释成 cuTile leaf 的损失。
+## 超时究竟是什么
 
-Triton corpus 中 cuTile 仅 2/46 项不慢于历史 Intent→Triton，39/46 项仍慢于 source；cuTile corpus 则有 23/35 项不慢于 Intent→Triton，7/35 项慢于 source。高性能库的巨大差距还没有整体解决。
+静态配置表固定的是候选集合，不是每个候选的 native 编译时间或运行时间。此次至少有三种不同问题：
 
-本轮生产库结果如下，时间单位 ms，均使用原输入、dtype、容差与完整算子计时：
+1. **无意义的大物理形状。** tensordot 的整矩阵物化已修复；solve 的动态尾部容量已收紧。这是 compiler 工作。
+2. **合法复杂 kernel 的预算不足。** solve 选择一个 reduction=256、access=3、occupancy=1 的配置，native 准备实际约 26 秒；15 秒限制会误判失败。采用 60 秒编译预算后通过，完整算子 **12.480344 ms**。编译耗时没有放进性能列，但算子本身仍慢。
+3. **调优候选运行过慢或不返回。** attention sink 的诊断栈停在 cuTile warmup，GPU 持续工作。后续原生调优记录既有约 130 ms 的慢候选，也有触发 3 秒运行限制的候选，不能全部称为 JIT 卡住或死锁。
 
-| 算子 | 原表 cuTile | 当前保留 cuTile | 耗时减少 | 已确认的归因 |
-|---|---:|---:|---:|---|
-| QKV projection | 7.616696 | 1.625320 | 78.7% | shared 重复补零合并遗漏 |
-| triangular solve | 0.123688 | 0.067136 | 45.7% | 原分块候选使并行 program 数过少 |
-| Mamba chunk scan | 0.249072 | 0.125384 | 49.7% | 默认候选遗漏 access-form/load-latency 组合 |
-| Mamba chunk state | 0.089832 | 0.070296 | 21.7% | 同一访存参数组合问题 |
-| FP8 MQA logits | 0.299888 | 0.210448 | 29.8% | 保留更快的正确观测；早期前后生成代码相同，不能归因给新增 pass |
-| roll | 0.092968 | 0.088800 | 4.5% | 对齐且不跨回绕边界的取模访问进入 native tile load |
+实验入口现在使用 cuTile 自带的 `single_run_timeout_sec` 隔离候选运行，没有自建调优框架。attention sink 保留原有访问方式/occupancy 选择后得到 **3.999440 ms、pass**，source 为 4.336416 ms；仍明显慢于同 DSL Triton。
 
-QKV 本轮定向对照为 Intent→Triton **1.601104 ms**、Intent→cuTile **1.625320 ms**，相差约 **1.5%**。总表仍保留更早的 Triton **1.138512 ms**，因此相对历史最好值 cuTile 仍慢 **42.8%**，不能说已超过全部历史成绩。旧当前编译器的 Triton 点测为 **2.120656 ms**；本轮两 target 均通过原容差。
+只删除 gather 或 occupancy=2 来缩短准备是错误取舍：FP8 曾因此从约 7.91 ms 变成 10.44 ms。已恢复原选择；当前 **7.301776 ms**，winner 是 gather、occupancy=2、64×64 输出块。不能把该收益简单归因于新增 K=256 profile 行；最新程序已是每个 IT iteration 执行完整 256-K MMA。
 
-**已落实的 compiler 修复及证据**
+准备与 native 编译在不同工作进程间并发；实际 GPU 初始化、调优和计时共用锁，释放锁前同步 CUDA。不是用外层 flock 把整个实验串行化。
 
-1. **shared：多结果归约的 collective 放错了循环层级。**
+## 剩余失败的边界
 
-   Welford 的 `(count, mean, variance)` 已经有作者声明的普通归约 combine。旧优化只认识单个二元归约更新，不能把 tuple combine 的 native collective 移出遍历循环，导致每轮重复通信。现在在既有 `RealizeReductionBlocking` 中匹配相同的 typed combine、identity 和 use-def 关系，循环内携带 fragment，循环后做 native reduction；有可观察中间状态或不满足条件的程序不变。没有合成新算法、临时全局 buffer 或额外 kernel。
+两个 Intent target 共同剩下 6 题：
 
-   [实现入口](../../lib/Dialect/GPU/Transforms/RealizeReductionBlocking.cpp)为 `matchReductionCombine`、`isolatedReductionUpdate`、`hoistNestedReduction`。成熟 [FlagGems BN source](baselines/triton/flag-gems/normalization/batch_norm/batch_norm.py) 第 84–126 行同样在循环内更新局部 Welford 状态，循环后做最终归约；参考的是这条执行边界，不复制它的线程归约树。
+- `min`：提交将 min 的 identity 写成 -inf，运行得到非有限结果。
+- `combined_activation`：作者 reshape/broadcast 关系不合法。
+- `fused_cross_entropy_log_softmax`：把 domain 和 tensor index 混合后产生额外 Cartesian 轴，结果不能存入一维 losses。[现有索引合同](../../doc/dsl/authoring.md)明确了这一区别。
+- `fused_cross_entropy_softmax_layernorm`：数据产生的索引缺少当前合同要求的有效边界声明。
+- `solve_symmetric_ldl`：作者只实现 1×1 pivot，未覆盖 reference 的 2×2 pivot 行为。
+- `matrix_power_eig`：直接乘法与 reference 的 eig/reconstruction 路径在本例 f32 下超出既定容差。
 
-   | 生产 BN，原容差通过 | 本轮修复前 ms | 修复后 ms | 耗时减少 |
-   |---|---:|---:|---:|
-   | Intent→Triton | 0.350824 | 0.120992 | 65.5% |
-   | Intent→cuTile | 0.387536 | 0.285664 | 26.3% |
+**cuTile 另有 solve_multiple_lu 的数值错误，尚未解决。** 同一 canonical input 的两个 shared IR 在排除 target/config 属性后相同。固定为与 Triton 相同的 64 分块、分别使用 native-no-TMA 和 gather、以及 native O0，均出现相同错误。目前已排除这些单一原因，但尚未唯一定位到某个 cuTile primitive 或 serializer 行为。
 
-   这项修复对两个 leaf 都有效。历史表中还有更早的 Triton 0.022784 ms，有效旧成绩按用户要求保留；它与本轮编译器的差距仍未定位，不能拿历史值证明本次 pass 回归，也不能当作当前同轮结果。
+不能因为 Triton 有 debug_barrier 就给 cuTile 增加一套 CTA barrier。cuTile 的 block 内通信由下层处理，Tile IR 的 token order 能建立操作之间的顺序；这里已有同 workspace 的 alias/token 关系。[cuTile 执行模型](https://docs.nvidia.com/cuda/cutile-python/execution.html)、[Tile IR 内存模型](https://docs.nvidia.com/cuda/tile-ir/latest/sections/memory_model.html)支持这一职责边界，不能无证据归因为“缺同步”。
 
-2. **cuTile leaf：普通数学函数缺实现，以及实现精度档位不合适。**
+## 性能结论与后续优先级
 
-   Triton leaf 直接调用 libdevice（[Serializer.cpp](../../lib/Target/Triton/Serialization/Serializer.cpp) 第 1585–1596 行）；外部参考 `../ref/triton/third_party/nvidia/language/cuda/libdevice.py` 第 1254、1443、1506 行分别按 fp32/fp64 映射 native 函数。cuTile 当前没有相同的完整数学库入口，因此在 [cutile_math.py](../../python/intent/runtime/cutile_math.py) 补目标数学函数，serializer 只调用已确定的 helper，没有新建 shared IR/form/plan。
+目前可解释的结论是：
 
-   `erf` 使用 [OpenLibm 的单精度实现](https://github.com/JuliaMath/openlibm/blob/master/src/s_erff.c)，`lgamma` 使用 [Boost Lanczos 系数](https://github.com/boostorg/math/blob/boost-1.85.0/include/boost/math/special_functions/lanczos.hpp)。初始 erf helper 的双精度中间计算过重，换到成熟 f32 路径后，仍通过原容差：
+- 高性能库同 DSL 的整体差距已经收敛，但 FP8 split-K、跨行统计和不规则 KV 访问仍有长尾；不能概括为某个后端天然更好。
+- 新 100 题中，一部分差距来自作者组织。例如全局归约/扫描只有一个 kernel，而对照采用显式分阶段程序。compiler 不会替作者自动拆成多个 kernel。
+- 一部分确实来自 lowering：整矩阵保留、分块参数遗漏、host 绑定成本与数学 primitive 缺失，本轮已有真实修复收益。
+- `num_worker_warps=1` 在本实现中表示交给下层推断；cuTile 没有同名 `num_stages` 也不意味着没有 pipeline。Triton 源码存在 descriptor 分支不证明 winner 使用了 TMA。后续归因必须结合实际配置和 native 产物。
 
-   | 完整算子 | 双精度 helper ms | 当前 ms |
-   |---|---:|---:|
-   | add_gelu | 0.059408 | 0.032080 |
-   | gelu | 0.057840 | 0.031928 |
-   | sub_gelu | 0.057536 | 0.034232 |
-   | erfc_sqrt | 0.059456 | 0.033272 |
-   | gelu_conv2d | 0.441792 | 0.356408 |
+下一步保持定点推进：先定位 cuTile LU 数值问题，并让两项定向静态配置的经验进入通用候选选择；再按上表的性能长尾检查真实访存、数据搬运、归约和矩阵执行。新生成程序的算法组织问题另行归类，不改写本轮提交来追分。尚不能宣称全部正确性问题和性能目标已完成。
 
-   这些结果仍有性能差距，不能把“补齐了普通函数”说成已达到 libdevice 性能；没有用 tanh-GELU 近似替换原 erf 算法。
+## 执行入口
 
-3. **runner：预编译结果没有直接供启动调优复用。**
+生产库复用 `python -m experiments.gpu`，分别选择 provider=triton/cutile 和 target=triton/cutile；`--source-results` 与 `--output` 指向对应既有宽表，使用 `--jobs` 并发准备、`--gpu-lock` 串行 GPU 窗口。
 
-   [ProgramContext](../agent_tritonbench/program.py) 在单个 benchmark 进程内复用 cuTile `_compile` 返回值。键比较包含函数、编译选项、参数约束、调用约定、架构和 context，忽略由两条调用路径不同时间生成的 symbol。失败配置仍明确失败，只是不重复编译；cuTile 自己继续负责调优和真实 launch。该修改解决评测准备效率，不冒充 kernel 性能优化，也没有另建持久缓存系统。
-
-4. **shared：单例轴 reshape 阻断了 masked-load 合并。**
-
-   QKV 作者只有 matmul，没有额外的 `where`。原产物的权重路径是 `load → reshape → where(K 有效, 值, 0) → MMA`；load 已经负责相同的越界补零。[RealizeAccessComposition.cpp](../../lib/Dialect/GPU/Transforms/RealizeAccessComposition.cpp) 的 `composeSelectLoad` 原来只跨 broadcast/transpose。现在它也跨可逆的单例轴插入/删除，将条件和 fill 逆 reshape 回 load，并保留原坐标、validity、读写依赖与 execution prefix。一般 flatten/split 不套用这个规则。
-
-   外部 Triton 的 `../ref/triton/lib/Dialect/Triton/Transforms/Combine.cpp` 第 69–106 行也在 IR combine 阶段将 select 与 masked load 合并。Intent 的修复仍放在 shared pass，两个 leaf 只接收已经合并的结构。
-
-   使用相同的 QKV 获胜配置 `BM=BN=128, BK=32, CTA=1, warps=4, occupancy=2, load_policy=3`，H100 原容差通过，cuTile **7.616704 → 1.625320 ms**。实际 winner cubin 的 `LDS.128` 从 8 条变为 0，`STS.U16` 从 64 条变为 0，`PRMT` 从 32 条变为 0；HGMMA 仍为 8 条，TMA 输入维数没有改变。这支持“重复 select 阻断直接的矩阵操作数布局”这一归因，不把全部时间收益归给某一条指令。
-
-   此前仅把 3D TMA 输入折成 2D 的实验仍为 **7.614392 ms**，这些搬运指令没有减少；该实验代码已撤回，没有保留额外 alias 路径。
-
-5. **物理候选：遗漏了小分块及互相影响的访存参数组合。**
-
-   [shared TuningProfiles.json](../../lib/Dialect/GPU/Transforms/TuningProfiles.json) 的 pointwise 家族加入 32/64 分块。三角求解每个 batch 内的顺序依赖保持不变；原最小 batch tile 256 只产生 16 个 programs，而 H100 有 132 个 SM。更小分块改善并行度，cuTile **0.123688 → 0.067136 ms**，没有把顺序求解改成另一个算法。
-
-   [CuTile Legalize.cpp](../../lib/Target/CuTile/Transforms/Legalize.cpp) 的 `materializeClosedConfigs` 原来顺序扩展 load latency 和 access form，却把已选 latency 当作固定 core 属性，遗漏了 `CTA=1, warps=4, gather, latency=3, occupancy=2` 组合。现在在原来的两个 worker/CTA 端点保留 memory-option 组合，不对全部参数做无界笛卡尔积。
-
-   Mamba state/scan 的同配置前后对照分别约 **0.0703/0.0705 ms**、**0.1257/0.1254 ms**，说明收益不是 QKV 的 select 修复带来的。新默认候选确实包含获胜配置；从默认候选中定向选择后再次通过原 registry 数值检查，分别为 **0.070424/0.125632 ms**，总表保留更快有效值。两项默认候选由 204 增至 300；本轮只验证已确认的候选，没有再全部调优。这解决候选遗漏，准备成本仍需另行收敛。
-
-6. **cuTile：规则的复合轴访问现在可以进入 native load/store。**
-
-   [Legalize.cpp](../../lib/Target/CuTile/Transforms/Legalize.cpp) 的既有 `NativeTileAxisPlan` 支持 `group*width+channel` 这类正仿射轴组合；只有 stride 等于内部 tile extent 乘积、对齐和边界条件成立时才使用原生访问。内部 channel tile 不完整且外层 group 跨多组时存在空洞，仍保留 gather/scatter。shared [PhysicalProgram.cpp](../../lib/Dialect/GPU/Analysis/PhysicalProgram.cpp) 提供对应的 component-range tail 与乘积正值事实，没有新增另一套 IR/plan。
-
-   TritonBench groupnorm 的 native 路径已在原用例上单独通过容差，但耗时 **0.924544 ms**，比 gather 慢；默认调优仍选择 gather，当前最好 **0.470544 ms**，旧值 **0.482664 ms**。因此这里只确认能力缺口补齐，不宣称 groupnorm 性能问题已解决。
-
-7. **cuTile：编译期 shape identity 误被限制成字面常量。**
-
-   `ct.reduce` 的 identity 可以是编译期 scalar；shape `N` 经 index/i64 转换后仍满足这个合同。现在 [CuTileOps.cpp](../../lib/Target/CuTile/IR/CuTileOps.cpp) 统一解析合法 literal/constexpr expression，verifier 与 serializer 共用；运行时 scalar 仍不接受。两个原 CE 用例在联合归约路径通过了原容差，但全局启用 shared fuser 使 flash CE 从保留的 **0.660768 ms** 变为 **0.978600 ms**，因此该开关已撤回，只提交合法 identity 的能力修复。没有把编译通过当作性能提升。
-
-8. **cuTile：取模索引丢失了可证明的连续 tile 访问。**
-
-   Triton 的 `../ref/triton/lib/Analysis/AxisInfo.cpp:702–739` 在右侧沿轴不变且整除关系成立时保留 remainder 的 contiguity。Intent 的 cuTile 坐标收集原来直接拒绝顶层 remainder。现在复用 `NativeTileAxisPlan`：只有正 modulus、unit-step 正仿射坐标、索引不溢出、起点对齐、整个 tile 不跨回绕边界，并满足原有效域条件时，才使用 `ct.load/store`；其余继续原 gather/scatter。没有改变作者的 shift、边界或 kernel 数。
-
-   原 registry roll **0.092968 → 0.088800 ms**，原容差通过，winner 为 `access_form=3, fragment=4096`。实际 cubin 的输入从 32 条 `LDG.E.U16` 变为 4 条 `LDG.E.128`；但 shared 搬运仍在，shared allocation 从 9216 增至 17408 字节，不能称为消除了 shared repack。这个改动的收益是局部的，不能据此宣称整体达到 1.20。
-
-**本轮排除的错误归因与无收益尝试**
-
-同一当前 runner 的定向结果如下，单位 ms。这些当前 Triton 数值只用于定位原因，没有替换总表中更快的历史分母：
-
-| 原生产用例 | 历史 Triton | 当前 Triton | 同轮 cuTile，扩 occupancy 尝试 |
-|---|---:|---:|---:|
-| roll | 0.049504 | 0.092112 | 0.093616 |
-| embedding lookup | 0.089968 | 0.167408 | 0.167448 |
-| SwiGLU | 0.234880 | 0.403184 | 0.410888 |
-| addcmul | 0.049488 | 0.115304 | 0.091096 |
-
-roll 随后用原 registry 再次读取负载时钟，Triton 为 **0.092136 ms**；67%–100% 利用率样本全部为 **600 MHz**。历史数据来自 `61a6d9e7`；roll、embedding、addcmul 的作者程序、shape/dtype 和每样本 flush 2×L2 的计时边界没有变化。SwiGLU 后来增加了作者明确的近似除法/FTZ；不能把它称为完全相同的 arithmetic contract。历史 CSV 没有记录实际 compiler binary 或负载时钟，无法仅凭提交时间反推是哪次 pass 导致变慢。
-
-扩大 occupancy、给所有访存增加 worker-warps 候选都没有成组收益，已撤回。BN 的另一种多轴分块在合理候选下为 cuTile **0.318768 ms**、Triton **0.127696 ms**，也不及此前 **0.285664/0.120992 ms**；相关 shared 改动全部撤回。未把实验分支的成绩覆盖到整体表。
-
-**仍未解决的性能与正确性问题**
-
-| 一组问题 | 目前证据 | 下一步修复边界 |
-|---|---|---|
-| groupnorm | native 访问已经可生成且数值通过，但默认 winner 仍是 gather，耗时约为历史 Intent→Triton 的 2.99 倍 | 继续查实际 tile/layout、重复读取和 collective 成本，不能把“可生成 native”当作提速 |
-| 多处重复读取 | shared common-value cleanup 当前排除有 Read effect 的 load；groupnorm 的 input2 在同一计算段重复加载 | 只在相同访问且没有中间可别名写入时消除重复；跨循环缓存需另外证明生命周期 |
-| 卷积、linear、zeta/lgamma 等仍落后 | 96 项中有 16 项超过 2 倍；卷积/归一化/数学函数是主要成组差距 | 按同一程序的物理访存、运算展开、native 配置分析，不靠题目名称设规则，不要求 agent 换 DSL 写法掩盖 lowering 缺陷 |
-| QKV | shared 修复后当前定向对照只差约 1.5%；距历史 Triton 最好值还慢 42.8% | 大幅软件搬运已消除，剩余配置/生成代码差距仍需定位；不能从没有显式 `num_stages` 推断缺 pipeline |
-| 高性能库 BN、CE、pooling、causal conv、FP8 GEMM | BN 相对历史 Tr 为 12.54 倍，cross entropy 5.66 倍，max pooling 5.48 倍，causal-conv update 5.19 倍，scaled FP8 GEMM 5.06 倍；这些巨大差距仍在 | 优先成组核对相同 Intent 的物理循环、归约、访存和精度，尚不能统一归因给某个 backend |
-| 联合归约的收益条件 | shape identity 缺口已修复；直接全局启用合并会使 flash CE 变慢，因此 capability 仍关闭 | 核对未使用的 record 字段及 native DCE，再决定何时合并；不新建 online-summary 算法 |
-| FP8 accumulator 精度 | H100 Triton 默认允许 FP8 imprecise accumulation；cuTile `ct.mma` 默认 `use_fast_acc=False`。`input_precision="ieee"` 只控制 f32 输入，不能证明 FP8 累加模式相同 | 核对 Intent 已声明的 f32 accumulator 合同；不直接开启 cuTile fast accumulation 来追分，也不删除这项历史配对 |
-| 生产 softmax backward | cuTile 仍超原容差；静态核对未发现 accumulator 降精度，普通 reduction 的树/FMA 可以不同 | 仍保留 numerical_failed。允许重排不等于通过 comparator，也没有证据支持改容差或强加保序语义 |
-
-联合归约的 capability 入口为 [intent-compile.cpp](../../tools/intent-compile/intent-compile.cpp) 第 256–267 行；shared 合并位于 [FuseIndependentTraversals.cpp](../../lib/Dialect/GPU/Transforms/FuseIndependentTraversals.cpp) 第 149–247 行，cuTile identity 检查在 `formNativeTiles`。同一 flash-CE 程序的两 target 都保留四字段 summary，未使用字段是否被 native DCE 消除尚未验证；不能用 cuTile KIR 与手写 Triton source 的差别推断同 DSL 性能原因。重复加载的限制仍位于 [EliminateCommonValues.cpp](../../lib/Dialect/GPU/Transforms/EliminateCommonValues.cpp) 第 87–94 行。
-
-**为什么一些旧 pass 看起来消失了**
-
-旧 CSV 的 `intent_status` 是 Intent→Triton，`triton_status` 是 agent 手写 Triton，名称容易混淆。手写 Triton 原始 100 题只有 72 个 pass，这 72 个全部进入 H100 selected，没有漏掉旧 pass；另外 28 个原来就失败，本次未入选，所以留了空白。H100 对入选 72 个重新测量，得到 71 pass 和 `sub_gelu` 一项数值失败。
-
-现在列名明确为 `intent_triton_status`、`intent_cutile_status`、`agent_triton_status`，那 28 项写 `not_selected`。没有把原生成失败伪装成 H100 编译失败，也没有覆盖原始单次生成成绩。
-
-已提交的实现包括 `3da4ead5`（reference 时间复用）、`d6e8d4ff`（shared tuple reduction）、`b7e7211c`（数学函数）、`b63b772e`（native 编译结果复用）、`adc53c25`（复合轴 native 访问）、`2585221b`（小 pointwise 分块）、`ab420223`（跨单例 reshape 合并 masked load）、`1e50a0fe`（访存参数组合）、`2c471337`（编译期 collective identity）、`974b4d9a`（连续取模 tile 访问）。本轮构建成功，定向用例复用原生产检查；没有重新计时已有 source、改算法、加 kernel 或放宽容差。下一步首先解除默认 GPU 时钟的权限阻塞，再验证剩余成组性能差距；约 1.20 的目标尚未完成。
+已有 agent 提交复测使用 `python -m experiments.agent_tritonbench.benchmark`，传入原 `--program`、`--reference-ms`、`--timing` 和同一 `suite-100.json`。不调用包含生成步骤的主入口。solve 的 cuTile 定点命令额外传 `--cutile-compiler-timeout 60 --tuning-config .../solve/cutile-tuning.json`；normalize 使用其对应配置文件。其余编译缓存、中间 IR、native 源码和诊断观测均在仓库外。

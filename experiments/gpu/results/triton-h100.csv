@@ -1,9 +1,9 @@
 kernel,case,source_p50_ms,intent_triton_p50_ms,intent_cutile_p50_ms,intent_triton_ratio,intent_cutile_ratio,intent_triton_status,intent_cutile_status,intent_triton_note,intent_cutile_note
 fused_softmax,8192x8192-fp16,0.120304,0.130352,0.128160,1.083522,1.065301,pass,pass,,
-dense_gemm,M4096-N14336-K4096-fp16,1.416744,1.291512,1.421048,0.911606,1.003038,pass,pass,,
+dense_gemm,M4096-N14336-K4096-fp16,1.416744,1.265808,1.421048,0.893463,1.003038,pass,pass,,
 grouped_gemm,E8-M1024-K4096-N14336-fp16,4.798504,3.172440,3.841440,0.661131,0.800550,pass,pass,,
 flash_attention_forward,B4-H32-S4096-D128-fp16-causal,1.788424,2.780552,2.292928,1.554750,1.282094,pass,pass,同算法；CUDA graph 设备执行计时；source 额外写 f32 M 辅助结果。,同算法；CUDA graph 设备执行计时；source 额外写 f32 M 辅助结果。
-layer_norm,8192x4096-fp16,0.057824,0.050680,0.050880,0.876453,0.879911,pass,pass,,
+layer_norm,8192x4096-fp16,0.057824,0.051424,0.050880,0.889319,0.879911,pass,pass,,
 flash_cross_entropy,8192x32768-bf16,0.254280,0.400952,0.319568,1.576813,1.256756,pass,pass,,
 flash_layer_norm,8192x4096-bf16,0.051864,0.049976,0.051304,0.963597,0.989203,pass,pass,,
 rotary_embedding,B4-S4096-H32-D128-bf16,0.098072,0.097184,0.097568,0.990945,0.994861,pass,pass,,
@@ -17,15 +17,15 @@ xformers_rms_norm,8192x4096-bf16,0.049600,0.050424,0.050336,1.016613,1.014839,pa
 qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,1.818600,1.264448,1.270584,0.695286,0.698661,pass,pass,,
 index_select,source65536-selected32768-hidden4096-fp16,0.222616,0.182888,0.184024,0.821540,0.826643,pass,pass,,
 scaled_index_add,destination65536-routed32768-hidden4096-fp16,0.303456,0.274840,0.268256,0.905700,0.884003,pass,pass,,
-scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,3.511208,2.360024,7.913384,0.672140,2.253750,pass,pass,,
+scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,3.511208,1.987968,7.301776,0.566178,2.079562,pass,pass,,
 jagged_mean,B512-T33024-D128-fp32,0.015408,0.014408,0.015056,0.935099,0.977155,pass,pass,,
 fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.162864,0.056624,0.060544,0.347677,0.371746,pass,pass,,
 rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.412336,0.123728,0.124176,0.300066,0.301152,pass,pass,,
 causal_conv1d,B4-C4096-S4096-W4-bf16-silu,0.160520,0.219504,0.216968,1.367456,1.351657,pass,pass,,
-varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.050504,0.131360,0.061064,2.600982,1.209092,pass,pass,,
-causal_conv1d_update,B32-D4096-W4-bf16,0.005280,0.009568,0.011232,1.812121,2.127273,pass,pass,,
+varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.050504,0.076976,0.061064,1.524156,1.209092,pass,pass,,
+causal_conv1d_update,B32-D4096-W4-bf16,0.005280,0.009376,0.011232,1.775758,2.127273,pass,pass,,
 modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,0.290944,0.220736,0.175392,0.758689,0.602838,pass,pass,source launch uses num_stages=1 and num_warps=4.,source launch uses num_stages=1 and num_warps=4.
-mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.028912,0.248720,0.009496,8.602656,0.328445,pass,pass,同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出,同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出
+mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.028912,0.053720,0.009496,1.858052,0.328445,pass,pass,同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出,同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出
 flash_attention_backward,B2-H16-S2048-D128-fp16-causal,,2.179072,1.178576,,,pass,pass,source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。,source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。
 moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.671440,1.654848,1.618824,0.619459,0.605974,pass,pass,,
 moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,4.283064,1.665600,1.640936,0.388880,0.383122,pass,pass,,

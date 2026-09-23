@@ -16,14 +16,14 @@ tilegym_dense_gemm,M8192-N11008-K4096-bf16,3.951752,2.010664,1.990104,0.508803,0
 grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.821912,0.419568,0.518440,0.510478,0.630773,pass,pass,同算法；source 使用 host group shapes,同算法；source 使用 host group shapes
 moe_alignment,T4096-top2-E64,0.089608,0.041432,0.024384,0.462369,0.272119,pass,pass,同算法计数/前缀和/散射；初始化与辅助输出计入调用,同算法计数/前缀和/散射；初始化与辅助输出计入调用
 mhc_gemm_rms_scale,T2048-H4096-streams4-bf16,0.175896,0.072840,0.061200,0.414108,0.347933,pass,pass,同算法；source 用乘倒数实现归一化,同算法；source 用乘倒数实现归一化
-chunked_softmax,8192x32768-bf16,1.777344,0.704312,,0.396272,,pass,generated_provider_jit_or_initial_launch_timeout,,exceeded 600 seconds
+chunked_softmax,8192x32768-bf16,1.777344,0.704312,0.819568,0.396272,0.461120,pass,pass,,
 rope_qk,B2-S4096-QH32-KVH8-D128-bf16,0.115256,0.064688,0.064240,0.561255,0.557368,pass,pass,同算法；source 保留 bf16 中间舍入,同算法；source 保留 bf16 中间舍入
 gelu,8192x4096-fp16-tanh,0.107968,0.050704,0.051280,0.469621,0.474956,pass,pass,同算法；source 保留 f16 中间舍入,同算法；source 保留 f16 中间舍入
 geglu,4096x28672-fp16-tanh,0.446792,0.153064,0.139800,0.342584,0.312897,pass,pass,同算法；source 保留 f16 中间舍入,同算法；source 保留 f16 中间舍入
 relu,8192x4096-fp16,0.088456,0.049520,0.049528,0.559826,0.559917,pass,pass,同算法；NaN 传播方式不同,同算法；NaN 传播方式不同
 dropout,8192x4096-fp16-p0.1,0.096736,0.048968,0.049776,0.506202,0.514555,pass,pass,,
 attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,0.981592,0.765072,0.761400,0.779420,0.775679,pass,pass,同算法；source 的布局转换与辅助工作计入其调用时间,同算法；source 的布局转换与辅助工作计入其调用时间
-attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,4.336416,0.790344,,0.182257,,pass,generated_provider_jit_or_initial_launch_timeout,同算法；source 使用 bf16 LSE 与近似除法,exceeded 600 seconds
+attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,4.336416,0.790344,3.999440,0.182257,0.922292,pass,pass,同算法；source 使用 bf16 LSE 与近似除法,同算法；source 使用 bf16 LSE 与近似除法
 mhc_apply_residual,T2048-H4096-streams4-bf16,0.103088,0.072272,0.055272,0.701071,0.536163,pass,pass,同算法；source 保留 bf16 中间累加,同算法；source 保留 bf16 中间累加
 gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,0.760056,0.783456,0.736160,1.030787,0.968560,pass,pass,同算法；中间精度和舍入不同,同算法；中间精度和舍入不同
 gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,0.666336,0.101192,0.101296,0.151863,0.152019,pass,pass,同算法；中间精度和舍入不同,同算法；中间精度和舍入不同
