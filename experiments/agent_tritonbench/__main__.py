@@ -148,6 +148,8 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=8, help="Concurrent isolated code-generation workers")
     parser.add_argument("--benchmark-workers", type=int, default=4,
                         help="Concurrent compiler/JIT processes; GPU execution uses the shared lock")
+    parser.add_argument("--generate-only", action="store_true",
+                        help="Submit programs without compiling or evaluating them")
     parser.add_argument("--gpu-lock", type=Path)
     arguments = parser.parse_args()
     arguments.project = PROJECT_ROOT
@@ -183,7 +185,8 @@ def main() -> None:
     arguments.gpu_lock = arguments.gpu_lock or arguments.state_root / "gpu.lock"
     environment = {"project_revision": revision(arguments.project), "reference_revision": revision(arguments.reference),
                    "triton_ref_revision": revision(arguments.triton_ref), "compiler": str(arguments.compiler),
-                   "torch": torch.__version__, "triton": triton.__version__, "gpu": torch.cuda.get_device_name(0),
+                   "torch": torch.__version__, "triton": triton.__version__,
+                   "gpu": None if arguments.generate_only else torch.cuda.get_device_name(0),
                    "model": arguments.suite["model"], "reasoning_effort": arguments.suite["reasoning_effort"],
                    "suite": str(arguments.suite_path),
                    "tasks": rows, "submission_policy": "one complete program; documentation tools; no benchmark feedback",
@@ -205,7 +208,7 @@ def main() -> None:
                 for future in completed:
                     result = future.result()
                     generated = futures.pop(future)
-                    if generated and result["status"] == "submitted":
+                    if generated and result["status"] == "submitted" and not arguments.generate_only:
                         futures[evaluation.submit(evaluate_trial, arguments, result)] = False
                     else:
                         writer.writerow(result)
