@@ -3256,14 +3256,23 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
   };
   WalkResult result = kernel.walk([&](Operation *operation) {
     if (auto unary = dyn_cast<gpu::UnaryOp>(operation);
-        unary && (unary.getOperatorKind() == UnaryOperator::Erf ||
-                  unary.getOperatorKind() == UnaryOperator::Lgamma ||
-                  unary.getOperatorKind() == UnaryOperator::Log1p ||
-                  unary.getOperatorKind() == UnaryOperator::Erfc ||
+        unary && (unary.getOperatorKind() == UnaryOperator::Erfc ||
                   unary.getOperatorKind() == UnaryOperator::I0)) {
       unary.emitOpError() << stringifyUnaryOperator(unary.getOperatorKind())
                          << " is unsupported by the cuTile provider";
       return WalkResult::interrupt();
+    }
+    if (auto unary = dyn_cast<gpu::UnaryOp>(operation);
+        unary && (unary.getOperatorKind() == UnaryOperator::Erf ||
+                  unary.getOperatorKind() == UnaryOperator::Lgamma ||
+                  unary.getOperatorKind() == UnaryOperator::Log1p)) {
+      Type type = unary.getInput().getType();
+      if (auto fragment = dyn_cast<gpu::FragmentType>(type))
+        type = fragment.getElementType();
+      if (type.isF64()) {
+        unary.emitOpError("cuTile library lowering currently requires f32 or narrower inputs");
+        return WalkResult::interrupt();
+      }
     }
     if (auto unary = dyn_cast<gpu::UnaryOp>(operation);
         unary && unary.getApproximate() &&

@@ -348,6 +348,14 @@ private:
   }
 
   void emitPreamble() {
+    bool libraryMath = false;
+    kernel.walk([&](gpu::UnaryOp unary) {
+      libraryMath |= unary.getOperatorKind() == UnaryOperator::Erf ||
+                     unary.getOperatorKind() == UnaryOperator::Lgamma ||
+                     unary.getOperatorKind() == UnaryOperator::Log1p;
+    });
+    if (libraryMath)
+      output << "from intent.runtime import cutile_math\n";
     output << "from types import SimpleNamespace\n"
               "from typing import Annotated\n"
               "import torch\n"
@@ -1330,9 +1338,9 @@ private:
                  : call("ct.tanh");
     case UnaryOperator::Abs: return call("ct.abs");
     case UnaryOperator::Sqrt: return call("ct.sqrt");
-    case UnaryOperator::Erf:
-    case UnaryOperator::Lgamma:
-    case UnaryOperator::Log1p:
+    case UnaryOperator::Erf: return call("cutile_math.erf");
+    case UnaryOperator::Log1p: return call("cutile_math.log1p");
+    case UnaryOperator::Lgamma: return call("cutile_math.lgamma");
     case UnaryOperator::Erfc:
     case UnaryOperator::I0:
       unary.emitOpError() << stringifyUnaryOperator(unary.getOperatorKind())
