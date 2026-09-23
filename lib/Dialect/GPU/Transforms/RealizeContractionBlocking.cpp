@@ -5504,6 +5504,45 @@ LogicalResult normalizeMatrixContractShapes(func::FuncOp kernel) {
     contract.getResult().replaceAllUsesWith(restored);
     contract.erase();
   }
+  kernel.walk([&](scf::ForOp loop) {
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    for (auto [index, carried] : llvm::enumerate(loop.getRegionIterArgs())) {
+      if (!carried.hasOneUse())
+        continue;
+      auto projected = dyn_cast<ReshapeOp>(*carried.getUsers().begin());
+      auto restored = yield.getOperand(index).getDefiningOp<ReshapeOp>();
+      if (!projected || !restored ||
+          projected->getBlock() != loop.getBody() ||
+          restored->getBlock() != loop.getBody() ||
+          !restored.getResult().hasOneUse() ||
+          restored.getResult().getType() != carried.getType() ||
+          restored.getValue().getType() != projected.getResult().getType() ||
+          projected.getResult().getType() == carried.getType())
+        continue;
+
+      // Keep the carry in the computation's shape. The inverse pure views at
+      // the loop boundaries also preserve the value of a zero-trip loop.
+      OpBuilder builder(loop);
+      IRMapping initialMapping;
+      initialMapping.map(carried, loop.getInitArgs()[index]);
+      Operation *initial = builder.clone(*projected, initialMapping);
+      Type type = projected.getResult().getType();
+      loop.getInitArgsMutable()[index].assign(initial->getResult(0));
+      carried.setType(type);
+      loop.getResult(index).setType(type);
+      yield->setOperand(index, restored.getValue());
+
+      builder.setInsertionPointAfter(loop);
+      IRMapping resultMapping;
+      resultMapping.map(restored.getValue(), loop.getResult(index));
+      Operation *result = builder.clone(*restored, resultMapping);
+      loop.getResult(index).replaceUsesWithIf(result->getResult(0),
+          [&](OpOperand &use) { return use.getOwner() != result; });
+      projected.getResult().replaceAllUsesWith(carried);
+      restored.erase();
+      projected.erase();
+    }
+  });
   return success();
 }
 
