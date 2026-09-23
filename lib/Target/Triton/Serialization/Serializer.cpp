@@ -365,6 +365,7 @@ private:
               "def _intent_tensor_descriptor_block_shape_legal(\n"
               "    block_shape, element_size, minimum_contiguous_bytes,\n"
               "    require_power_of_two, maximum_block_elements,\n"
+              "    pipeline_block_alignment, num_stages,\n"
               "):\n"
               "    elements = 1\n"
               "    for extent in block_shape:\n"
@@ -374,8 +375,9 @@ private:
               "    return (\n"
               "        elements <= maximum_block_elements\n"
               "        and block_shape[-1] * element_size >= minimum_contiguous_bytes\n"
+              "        and (num_stages <= 1 or elements * element_size % pipeline_block_alignment == 0)\n"
               "    )\n\n"
-              "def _intent_tensor_descriptor_shapes_legal(args):\n"
+              "def _intent_tensor_descriptor_shapes_legal(args, num_stages):\n"
               "    descriptors = (\n";
     for (const DescriptorABI &descriptor : descriptors) {
       TensorDescriptorOp operation = descriptor.operation;
@@ -384,7 +386,8 @@ private:
              << "\"].element_size(), "
              << operation.getMinimumContiguousBytes() << ", "
              << (operation.getRequirePowerOfTwoBlockShape() ? "True" : "False")
-             << ", " << operation.getMaximumBlockElements() << "),\n";
+             << ", " << operation.getMaximumBlockElements() << ", "
+             << operation.getPipelineBlockAlignment() << ", num_stages),\n";
     }
     output << "    )\n"
               "    for contract in descriptors:\n"
@@ -398,7 +401,7 @@ private:
               "    return buffer\n\n"
               "def _intent_host_tensor_descriptor_pre_hook(args):\n";
     if (!descriptors.empty())
-      output << "    if not _intent_tensor_descriptor_shapes_legal(args):\n"
+      output << "    if not _intent_tensor_descriptor_shapes_legal(args, args[\"num_stages\"]):\n"
                 "        return\n"
                 "    if not isinstance(args[\""
              << descriptors.front().name
@@ -456,7 +459,7 @@ private:
       output << "        if args[\"" << descriptorChoice.getConfigParameter()
              << "\"] and (not args[\""
              << descriptorChoice.getEligibilityArgument()
-             << "\"] or not _intent_tensor_descriptor_shapes_legal(args)):\n"
+             << "\"] or not _intent_tensor_descriptor_shapes_legal(args, config.num_stages)):\n"
                 "            continue\n";
     for (const std::string &bound : bounds)
       output << "        if not " << bound << ":\n"

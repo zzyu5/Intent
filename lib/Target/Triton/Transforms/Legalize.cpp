@@ -955,6 +955,7 @@ materializeTensorDescriptorForms(
         /*requirePositiveStrides=*/true,
         /*requirePowerOfTwoBlockShape=*/true, /*alignment=*/16,
         /*minimumContiguousBytes=*/16,
+        /*pipelineBlockAlignment=*/1,
         /*maximumShapeExtent=*/std::numeric_limits<int32_t>::max(),
         maximumBlockElements);
     descriptors.push_back(
@@ -1010,6 +1011,9 @@ materializeTensorDescriptorForms(
     if (failed(descriptor) || failed(descriptorOffsets))
       return load.emitOpError(
           "could not materialize the declared tensor-descriptor ABI");
+    if (load->getParentOfType<scf::ForOp>())
+      descriptor->descriptor.setPipelineBlockAlignmentAttr(
+          builder.getI64IntegerAttr(128));
     auto conditional = builder.create<scf::IfOp>(
         load.getLoc(), TypeRange{load.getResult().getType()}, choice.getResult(),
         /*withElseRegion=*/true);
@@ -1346,6 +1350,7 @@ bool fitsReductionRegisterBudget(gpu::ReduceOp reduce,
 
 bool descriptorFragmentFits(gpu::FragmentType fragment,
                             const TritonConfig &config,
+                            int64_t pipelineBlockAlignment,
                             const llvm::StringMap<SmallVector<int64_t>>
                                 &parameterDomains,
                             const llvm::StringSet<> &coverageParameters) {
@@ -1354,6 +1359,8 @@ bool descriptorFragmentFits(gpu::FragmentType fragment,
   if (!elementBytes)
     return false;
   __int128 elements = 1;
+  __int128 concreteElements = 1;
+  bool concrete = true;
   int64_t minimumLastExtent = std::numeric_limits<int64_t>::max();
   bool runtimeGuardsLastExtent = false;
   bool runtimeGuardsElementCount = false;
@@ -1363,11 +1370,13 @@ bool descriptorFragmentFits(gpu::FragmentType fragment,
     if (std::optional<int64_t> value =
             evaluateCompileTimeExpression(expression, config)) {
       values.push_back(*value);
+      concreteElements *= *value;
     } else if (static_cast<gpu::PhysicalExprKind>(expression.getKind()) ==
                gpu::PhysicalExprKind::Parameter) {
       auto domain = parameterDomains.find(expression.getSymbol().getValue());
       if (domain == parameterDomains.end())
         return false;
+      concrete = false;
       values.append(domain->second.begin(), domain->second.end());
       if (axis + 1 == fragment.getShape().size())
         runtimeGuardsLastExtent =
@@ -1391,6 +1400,12 @@ bool descriptorFragmentFits(gpu::FragmentType fragment,
     if (elements > maxTritonTensorElements && !runtimeGuardsElementCount)
       return false;
   }
+  // Triton's canPipelineTMALoad requires each shared stage to begin at a
+  // 128-byte boundary. Small legal descriptor tiles can otherwise produce a
+  // misaligned second buffer in a multistage pipeline.
+  if (config.stages > 1 && concrete &&
+      (concreteElements * *elementBytes) % pipelineBlockAlignment != 0)
+    return false;
   return minimumLastExtent != std::numeric_limits<int64_t>::max() &&
          (runtimeGuardsLastExtent ||
           minimumLastExtent * *elementBytes >= 16);
@@ -1548,10 +1563,16 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
       if (descriptorConfig) {
         if (auto load = dyn_cast<DescriptorLoadOp>(operation))
           legal &= descriptorFragmentFits(load.getResult().getType(), config,
+                                          load.getDescriptor()
+                                              .getDefiningOp<TensorDescriptorOp>()
+                                              .getPipelineBlockAlignment(),
                                           parameterDomains,
                                           coverageParameters);
         else if (auto store = dyn_cast<DescriptorStoreOp>(operation))
           legal &= descriptorFragmentFits(store.getValue().getType(), config,
+                                          store.getDescriptor()
+                                              .getDefiningOp<TensorDescriptorOp>()
+                                              .getPipelineBlockAlignment(),
                                           parameterDomains,
                                           coverageParameters);
         if (!legal)

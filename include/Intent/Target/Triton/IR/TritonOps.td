@@ -60,6 +60,7 @@ def IntentTriton_TensorDescriptorOp : IntentTriton_Op<"tensor_descriptor", [
                        BoolAttr:$require_power_of_two_block_shape,
                        I64Attr:$alignment,
                        I64Attr:$minimum_contiguous_bytes,
+                       I64Attr:$pipeline_block_alignment,
                        I64Attr:$maximum_shape_extent,
                        I64Attr:$maximum_block_elements);
   let results = (outs IntentGPU_ViewValue:$result);

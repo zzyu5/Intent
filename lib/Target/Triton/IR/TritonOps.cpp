@@ -324,6 +324,7 @@ LogicalResult TensorDescriptorOp::verify() {
         "host tensor descriptor must declare a legal provider dummy block shape");
   if (getBaseLayout() != "strided" || getPadding() != "zero" ||
       getAlignment() != 16 || getMinimumContiguousBytes() != 16 ||
+      (getPipelineBlockAlignment() != 1 && getPipelineBlockAlignment() != 128) ||
       !getRequirePositiveShape() || !getRequirePositiveStrides() ||
       !getRequirePowerOfTwoBlockShape() ||
       getMaximumShapeExtent() != std::numeric_limits<int32_t>::max() ||
