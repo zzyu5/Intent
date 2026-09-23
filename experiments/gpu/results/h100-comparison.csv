@@ -1,0 +1,90 @@
+source_corpus,kernel,case,intent_triton_ms,intent_cutile_ms,triton_source_ms,cutile_source_ms,intent_triton_status,intent_cutile_status,cutile_over_triton,note
+triton,fused_softmax,8192x8192-fp16,0.113960,0.276496,0.120304,,pass,pass,2.426255,Intent target=cutile; source corpus=triton.
+triton+cutile,dense_gemm,M4096-N14336-K4096-fp16,1.350080,1.758128,1.416744,1.805016,pass,pass,1.302240,
+triton,grouped_gemm,E8-M1024-K4096-N14336-fp16,2.880400,5.371016,4.798504,,pass,pass,1.864677,Intent target=cutile; source corpus=triton.
+triton,flash_attention_forward,B4-H32-S4096-D128-fp16-causal,1.917008,9.489128,1.788424,,source_abi_gap,pass,,Intent target=cutile; source corpus=triton. 同算法；CUDA graph 设备执行计时；source 额外写 f32 M 辅助结果。
+triton,layer_norm,8192x4096-fp16,0.050640,0.123512,0.057824,,pass,pass,2.439021,Intent target=cutile; source corpus=triton.
+triton,flash_cross_entropy,8192x32768-bf16,0.229624,0.660768,0.254280,,pass,pass,2.877609,Intent target=cutile; source corpus=triton.
+triton,flash_layer_norm,8192x4096-bf16,0.050728,0.132328,0.051864,,pass,pass,2.608579,Intent target=cutile; source corpus=triton.
+triton,rotary_embedding,B4-S4096-H32-D128-bf16,0.097952,0.172256,0.098072,,pass,pass,1.758576,Intent target=cutile; source corpus=triton.
+triton+cutile,swiglu,8192x14336-bf16,0.234880,0.405256,0.238088,0.412816,pass,pass,1.725375,同算法；source 使用 FTZ 与近似除法
+triton,embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.089968,0.166728,0.089600,,pass,pass,1.853192,Intent target=cutile; source corpus=triton.
+triton,cross_entropy,8192x32768-bf16,0.679416,3.847288,0.730696,,pass,pass,5.662640,Intent target=cutile; source corpus=triton.
+triton,padded_rope_cache_update,B32-QH32-KVH8-D128-cache8192-fp16,0.005720,0.014368,0.005776,,pass,pass,2.511888,Intent target=cutile; source corpus=triton.
+triton,fused_add_rms_norm,8192x4096-bf16,0.094224,0.166656,0.094344,,pass,pass,1.768721,Intent target=cutile; source corpus=triton. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
+triton,rms_norm,8192x4096-bf16,0.050008,0.103424,0.050224,,pass,pass,2.068149,Intent target=cutile; source corpus=triton.
+triton,xformers_rms_norm,8192x4096-bf16,0.048504,0.102984,0.049600,,pass,pass,2.123206,Intent target=cutile; source corpus=triton.
+triton,qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,1.138512,7.616696,1.818600,,pass,pass,6.690044,Intent target=cutile; source corpus=triton. 
+triton,index_select,source65536-selected32768-hidden4096-fp16,0.183016,0.325480,0.222616,,pass,pass,1.778424,Intent target=cutile; source corpus=triton.
+triton,scaled_index_add,destination65536-routed32768-hidden4096-fp16,0.268928,0.464136,0.303456,,pass,pass,1.725875,Intent target=cutile; source corpus=triton.
+triton,scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,3.320376,16.812056,3.511208,,pass,pass,5.063299,Intent target=cutile; source corpus=triton.
+triton,jagged_mean,B512-T33024-D128-fp32,0.014576,0.030016,0.015408,,pass,pass,2.059276,Intent target=cutile; source corpus=triton.
+triton,fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.162656,0.177504,0.162864,,pass,pass,1.091285,Intent target=cutile; source corpus=triton.
+triton,rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.121624,0.220232,0.412336,,pass,pass,1.810761,Intent target=cutile; source corpus=triton.
+triton,causal_conv1d,B4-C4096-S4096-W4-bf16-silu,0.164376,0.532344,0.160520,,pass,pass,3.238575,Intent target=cutile; source corpus=triton.
+triton,varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.048160,0.166072,0.050504,,pass,pass,3.448339,Intent target=cutile; source corpus=triton.
+triton,causal_conv1d_update,B32-D4096-W4-bf16,0.005360,0.027816,0.005280,,pass,pass,5.189552,Intent target=cutile; source corpus=triton.
+triton,modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,0.156520,0.333152,0.290944,,pass,pass,2.128495,Intent target=cutile; source corpus=triton. source launch uses num_stages=1 and num_warps=4.
+triton,mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.069488,0.036648,0.028912,,source_semantics_gap,pass,,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出 cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
+triton,flash_attention_backward,B2-H16-S2048-D128-fp16-causal,,2.178776,,,worker_timeout,pass,,Intent target=cutile; source corpus=triton. source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。
+triton,moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.254608,2.121544,2.671440,,pass,pass,0.940981,Intent target=cutile; source corpus=triton.
+triton,moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,2.146448,2.121736,4.283064,,pass,pass,0.988487,Intent target=cutile; source corpus=triton.
+triton,mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,0.014544,0.089832,0.014720,,pass,pass,6.176568,Intent target=cutile; source corpus=triton. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
+triton,mamba_state_passing,B1-C8-H32-state8192-fp32,0.013104,0.019424,0.013200,,pass,pass,1.482295,Intent target=cutile; source corpus=triton.
+triton,mamba_chunk_scan,B1-S2048-H32-G8-P64-N128-C256-bf16,0.042288,0.249072,0.043648,,pass,pass,5.889898,Intent target=cutile; source corpus=triton. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
+triton,mamba3_siso_forward,B1-S2048-HQK4-H16-DQK32-DV64-bf16,0.195688,0.690800,0.181656,,source_semantics_gap,pass,,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲 cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
+triton,paged_gqa_decode,B16-QH32-KVH8-S8192-D128-page16-fp16,0.294112,0.395400,0.305912,,pass,pass,1.344386,Intent target=cutile; source corpus=triton.
+triton,splitk_paged_attention,B16-QH32-KVH8-S8192-D128-page16-split8-fp16,0.295848,0.392544,0.808280,,pass,pass,1.326844,Intent target=cutile; source corpus=triton.
+triton,paged_mla_decode,B8-QH128-KVH1-S8192-C512-R64-page16-fp16,0.297904,0.637712,0.370344,,source_abi_gap,pass,,Intent target=cutile; source corpus=triton. 同算法；source 使用 packed KV/page-table ABI 并写辅助 LSE；输入布局适配在计时前完成，完整 source 调用含 scale 分配 cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
+triton,block_sparse_gqa_decode,B8-QH32-KVH8-S8192-D128-blocks32x128,0.067568,0.488704,0.061680,,source_abi_gap,pass,,Intent target=cutile; source corpus=triton. 同算法；source 使用 packed KV/topk ABI；输入布局适配在计时前完成，完整 source 调用含 partial buffer 分配 cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
+triton,flaggems_conv1d,B64-L16384-K5-fp16-same,0.009728,0.022296,0.094392,,pass,pass,2.291941,Intent target=cutile; source corpus=triton.
+triton,flaggems_triangular_solve,B4096-N16-fp32-lower,0.018392,0.123688,0.039640,,pass,pass,6.725098,Intent target=cutile; source corpus=triton.
+triton,flaggems_embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.090032,0.168504,0.095128,,pass,pass,1.871601,Intent target=cutile; source corpus=triton.
+triton,flaggems_roll,8192x4096-fp16-shift-1-axis0,0.049504,0.092968,0.049808,,pass,pass,1.877990,Intent target=cutile; source corpus=triton.
+triton,flaggems_transpose_copy,4093x8191-fp16,0.085312,0.152648,0.280064,,pass,pass,1.789291,Intent target=cutile; source corpus=triton.
+triton,flaggems_batch_norm_training,B32-C64-S4096-fp16,0.022784,0.285664,0.024336,,pass,pass,12.537922,Intent target=cutile; source corpus=triton. 
+triton,flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.043744,0.088488,0.051216,,pass,pass,2.022860,Intent target=cutile; source corpus=triton.
+triton,flaggems_logsumexp,8192x8192-fp32,0.100424,0.201040,0.106408,,pass,pass,2.001912,Intent target=cutile; source corpus=triton.
+triton,flaggems_softmax_backward,4096x4097-fp32,0.076512,,0.093504,,pass,numerical_failed,,"generated/source floating result 0 differs: max_abs=0.000152587890625, atol=0.0001, rtol=1e-05; first_failure=13331922; largest tolerance excess has generated=1.2312570810317993, source=1.2313878536224365, abs_error=0.00013077259063720703, limit=0.00011231387907173485"
+triton,flaggems_fused_adamw,N8388608-fp32,0.082616,0.145888,0.083624,,pass,pass,1.765856,Intent target=cutile; source corpus=triton.
+triton,flaggems_addcmul,B64-C128-L4096-bf16,0.049488,0.090168,0.072624,,pass,pass,1.822017,Intent target=cutile; source corpus=triton.
+triton,flaggems_fp8_mqa_logits,Q256-K4096-H32-D128-e4m3,0.044768,0.299888,0.050624,,pass,pass,6.698713,Intent target=cutile; source corpus=triton. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
+triton,flaggems_cumsum,8192x8192-fp32-axis1,0.181984,0.451952,0.181864,,pass,pass,2.483471,Intent target=cutile; source corpus=triton.
+triton,flaggems_histogram,N8388608-bins256-fp32,1.954704,5.887024,2.170576,,pass,pass,3.011721,Intent target=cutile; source corpus=triton.
+triton,flaggems_max_pool2d_with_indices,B8-C32-H128-W128-K3-S2-P1-fp16,0.016544,0.090672,0.018208,,pass,pass,5.480658,Intent target=cutile; source corpus=triton.
+triton,legacy_flash_attention_bias,B4-H32-S4096-D128-fp16-vector-bias,,7.996064,,,source_compatibility_gap,pass,,Intent target=cutile; source corpus=triton. 同算法；source 额外写 LSE 和临时数据。
+cutile,official_fmha,B4-QH32-KVH8-S4096-D128-fp16-causal,6.320600,3.019576,,4.350520,pass,pass,0.477736,同算法；source 使用 FTZ 与近似除法
+cutile,block_scaled_gemm,M4096-N14336-K4096-fp8-block32,,,,,adapter_preparation_failed,hardware_unsupported,,H100 为 SM90；E8M0 scaled MMA 要求 compute capability 10.0 及以上
+cutile,moe_expert_projection,T4096-E8-top2-4096x14336-bf16,5.836152,3.638072,,3.707920,pass,pass,0.623368,同算法；source 使用预计算 block ownership
+cutile,layer_norm,8192x4096-bf16,0.093312,0.122488,,2.894040,pass,pass,1.312671,同算法；source 额外写 Mean/Rstd
+cutile,silu_and_mul,4096x28672-to14336-bf16,0.238112,0.212896,,0.228832,pass,pass,0.894100,同算法；source 使用 FTZ 与近似除法
+cutile,attention_backward,B2-QH8-KVH2-S1024-D64-fp16-causal,0.269512,0.193864,,0.195464,pass,pass,0.719315,同算法；中间精度和舍入不同
+cutile,dense_attention_forward,B2-QH32-KVH8-S4096-D128-bf16-causal,3.287448,1.566112,,2.314680,pass,pass,0.476391,同算法；source 使用 FTZ 与近似除法
+cutile,grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,0.195336,0.196720,,0.192048,pass,pass,1.007085,同算法；source 使用 FTZ 与近似除法
+cutile,splitk_attention_reduce,B8-H32-S8192-splits16-D128,0.012344,0.010912,,0.011472,pass,pass,0.883992,
+cutile,mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,2.131376,0.864584,,0.798664,pass,pass,0.405646,同算法；source 使用 FTZ 与近似除法
+cutile,batched_gemm,B32-M512-N512-K1024-bf16,0.098808,0.078960,,0.079424,pass,pass,0.799126,
+cutile,tilegym_dense_gemm,M8192-N11008-K4096-bf16,2.527856,2.463600,,3.951752,pass,pass,0.974581,
+cutile,grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.734848,0.828880,,0.821912,pass,pass,1.127961,同算法；source 使用 host group shapes
+cutile,moe_alignment,T4096-top2-E64,0.053424,0.051280,,0.089608,pass,pass,0.959868,同算法计数/前缀和/散射；初始化与辅助输出计入调用
+cutile,mhc_gemm_rms_scale,T2048-H4096-streams4-bf16,0.114368,0.142152,,0.175896,pass,pass,1.242935,同算法；source 用乘倒数实现归一化
+cutile,chunked_softmax,8192x32768-bf16,1.353984,1.758872,,1.777344,pass,pass,1.299035,
+cutile,rope_qk,B2-S4096-QH32-KVH8-D128-bf16,0.119120,0.116544,,0.115256,pass,pass,0.978375,同算法；source 保留 bf16 中间舍入
+cutile,gelu,8192x4096-fp16-tanh,0.125760,0.102240,,0.107968,pass,pass,0.812977,同算法；source 保留 f16 中间舍入
+cutile,geglu,4096x28672-fp16-tanh,0.286888,0.255816,,0.446792,pass,pass,0.891693,同算法；source 保留 f16 中间舍入
+cutile,relu,8192x4096-fp16,0.088792,0.088552,,0.088456,pass,pass,0.997297,同算法；NaN 传播方式不同
+cutile,dropout,8192x4096-fp16-p0.1,0.088632,0.095680,,0.096736,pass,pass,1.079520,
+cutile,attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,1.779952,0.869360,,0.981592,pass,pass,0.488418,同算法；source 的布局转换与辅助工作计入其调用时间
+cutile,attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,1.904280,3.836624,,4.336416,pass,pass,2.014737,同算法；source 使用 bf16 LSE 与近似除法
+cutile,mhc_apply_residual,T2048-H4096-streams4-bf16,0.141568,0.098504,,0.103088,pass,pass,0.695807,同算法；source 保留 bf16 中间累加
+cutile,gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,1.893664,0.831808,,0.760056,pass,pass,0.439258,同算法；中间精度和舍入不同
+cutile,gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,0.220016,0.194552,,0.666336,pass,pass,0.884263,同算法；中间精度和舍入不同
+cutile,mhc_sinkhorn,T8192-streams4-fp32,0.022864,0.081016,,0.081136,pass,pass,3.543387,同算法；source 用 exp2(x * log2(e)) 实现 exp
+cutile,absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,1.796840,0.566440,,0.654864,pass,pass,0.315242,同算法；source 使用近似除法并额外输出 LSE
+cutile,splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,0.542224,0.229688,,0.223296,pass,pass,0.423604,同算法；source 使用 FTZ 与近似除法
+cutile,sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,0.771864,4.998200,,308.888641,pass,pass,6.475493,同算法；source 使用 FTZ 与近似除法
+cutile,sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,1.744384,1.099520,,1.232720,pass,pass,0.630320,同算法；source 的布局转换与辅助工作计入其调用时间
+cutile,rms_norm,8192x4096-bf16,0.090704,0.050616,,0.050896,pass,pass,0.558035,同算法；source 额外写 Rstd
+cutile,recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,5.161168,2.859456,,3.024832,pass,pass,0.554033,
+cutile,chunk_gated_delta,B2-S2048-H8-K128-V128-C64-bf16,0.655184,0.663368,,4.617560,pass,pass,1.012491,同算法；generated 使用 BF16 矩阵输入、FP32 累加与状态，source 使用 TF32 矩阵输入
+cutile,nvfp4_quantize,8192x4096-block16-bf16,,,,,source_provider_jit_or_initial_launch_failed,source_hardware_unsupported,,generated 已编译运行；cuTile source 的 float4_e2m1fn/pack_to_bytes 不支持 SM90

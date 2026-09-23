@@ -24,12 +24,12 @@
   "source_artifact": "first-stage-performance-h100-current-selected-full-20260922b",
   "result_files": {
     "operator_comparison": "h100-selected.csv",
-    "measurements": "本文件 records，共 172 条实测记录"
+    "measurements": "原 records 保留 172 条 Intent→Triton/agent Triton 实测；cutile.records 增加相同 Intent 程序的 100 条 cuTile 开发复测。"
   },
   "units": {
     "csv_latency": "microseconds",
     "record_latency": "milliseconds",
-    "csv_ratios": "Intent / 对应 baseline；小于 1 表示 Intent 更快",
+    "csv_ratios": "列名分子 / 分母；小于 1 表示分子对应实现更快。intent_triton/intent_cutile 是同份 Intent 程序的两个 target，agent_triton 是 agent 直接编写的 Triton。",
     "record_ratio": "candidate_ms / reference_ms；candidate 是该记录 language 对应的程序"
   },
   "timing": {
@@ -49,8 +49,8 @@
   },
   "comparison_rules": {
     "not_slower": "耗时比 <= 1；5% 仅用于描述差距，不充当通过容差。",
-    "reference_us": "CSV 的 reference_us 来自该 Intent 程序同次运行的 reference；records 保留两组各自实测的 reference_ms。",
-    "missing_triton": "冻结的 Triton 组只有 72 份程序参加本次复测。CSV 空值表示本次无可用配对，不能当作零耗时或补算正确率。",
+    "reference_us": "保留原 Intent→Triton 测量的 reference_us；cuTile 复用该时间，仍按原输入与容差比较 reference 输出。",
+    "missing_triton": "agent_triton_status=not_selected 的 28 题是原始手写 Triton 组失败后未进入 H100 selected；原 72 个 pass 全部入选。H100 复测这 72 题为 71 pass、1 numerical_failure；不表示 Intent→Triton 丢失 pass。",
     "gpu_exclusions": {
       "matrix_power_eig": "Intent 数值失败",
       "solve_symmetric_ldl": "Intent 数值失败",
@@ -3659,5 +3659,2704 @@
         }
       ]
     }
-  ]
+  ],
+  "cutile": {
+    "measured_on": "2026-09-23",
+    "measurement_kind": "development_recheck_of_same_selected_intent_programs",
+    "software": {
+      "intent_compiler_changes": [
+        "d6e8d4ff",
+        "b7e7211c"
+      ],
+      "runner_commit": "b63b772e",
+      "cutile": "1.5.0"
+    },
+    "policy": "相同 Intent submission、输入、dtype、容差、kernel 数与每题 CUDA Graph/event 边界；准备并发，GPU 计时串行；复用已有 reference 时间；超时项定向延长准备预算，不重新生成程序。",
+    "summary": {
+      "status": {
+        "pass": 98,
+        "numerical_failure": 2
+      },
+      "eligible_gpu_pairs": 96,
+      "geomean_cutile_over_intent_triton": 1.287571285468841,
+      "geomean_cutile_over_reference": 0.8513549116282697,
+      "not_slower_intent_triton": 13,
+      "slower_than_intent_triton_by_over_20_percent": 35,
+      "slower_than_intent_triton_by_over_2x": 16,
+      "not_slower_reference": 64,
+      "same_precision_agent_triton_pairs": 69,
+      "geomean_cutile_over_agent_triton": 1.1910182370942828,
+      "not_slower_same_precision_agent_triton": 24
+    },
+    "records": [
+      {
+        "task": "abs",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/abs/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.013375999871641397,
+        "reference_ms": 0.013743999879807234,
+        "ratio": 0.9732246790320114,
+        "tolerance": {
+          "atol": 0,
+          "rtol": 0
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "abs_f32_1d": "/home/kingdom/.cache/intentdsl/compiler/683c4ca5152c41d38e56d154e6751e9f"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "abs_f32_1d",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, FRAGMENT_D1=2048)"
+          }
+        ]
+      },
+      {
+        "task": "add",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/add/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.016888000071048737,
+        "reference_ms": 0.016335999593138695,
+        "ratio": 1.0337904316636912,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "elementwise_add": "/home/kingdom/.cache/intentdsl/compiler/0c58943976334b8a92f193fbc5551ab7"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "elementwise_add",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_D1=2048)"
+          }
+        ]
+      },
+      {
+        "task": "add_gelu",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/add_gelu/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.03207999840378761,
+        "reference_ms": 0.026888000778853893,
+        "ratio": 1.1930971985472782,
+        "tolerance": {
+          "atol": 0.01,
+          "rtol": 0.01
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "add_gelu_none": "/home/kingdom/.cache/intentdsl/compiler/2a56455725c4486dae5e03dd7494c696",
+          "add_gelu_tanh": "/home/kingdom/.cache/intentdsl/compiler/e855faf664354eea9f881366e56a24c7"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "add_gelu_none",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, FRAGMENT_D1=128)"
+          }
+        ]
+      },
+      {
+        "task": "add_mean",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-broad-organization/add_mean/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.02015999983996153,
+        "reference_ms": 0.04227200150489807,
+        "ratio": 0.4769114099701568,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "add_mean_partial_sums": "/home/kingdom/.cache/intentdsl/compiler/b047de40b6a34dcbad3833f800c83c8c",
+          "add_mean_finish": "/home/kingdom/.cache/intentdsl/compiler/5e07ed897d5c495f9f98bd0e9b7d214b"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "add_mean_partial_sums",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=4)"
+          },
+          {
+            "kernel": "add_mean_finish",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=1)"
+          }
+        ]
+      },
+      {
+        "task": "addmm",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/addmm/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.022967999801039696,
+        "reference_ms": 0.027816000394523144,
+        "ratio": 0.825711801670883,
+        "tolerance": {
+          "atol": 0.01,
+          "rtol": 0.01
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "addmm_intent_kernel": "/home/kingdom/.cache/intentdsl/compiler/e2f4152ba47440f99d81a260ddc4e277"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "addmm_intent_kernel",
+            "winner": "namespace(BLOCK_K_2_3=64, CUTILE_ACCESS_FORM=1, CUTILE_CTAS=1, CUTILE_LOAD_POLICY=11, CUTILE_OCCUPANCY=1, CUTILE_WORKER_WARPS=1, FRAGMENT_S26_A0=64, FRAGMENT_S26_A1=128)"
+          }
+        ]
+      },
+      {
+        "task": "argmax",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-gpu-contract-singlepoint/argmax/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.01940000057220459,
+        "reference_ms": 0.031216000206768513,
+        "ratio": 0.6214761802826398,
+        "tolerance": {
+          "atol": 0,
+          "rtol": 0
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "argmax_partial": "/home/kingdom/.cache/intentdsl/compiler/7257836008064b4cb4147bbee0ba2c64",
+          "argmax_final": "/home/kingdom/.cache/intentdsl/compiler/60bb42eee30241eaa96d61239ffb5af9"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "argmax_partial",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=2)"
+          },
+          {
+            "kernel": "argmax_final",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=1, REDUCE_CHUNK_1_A0=128)"
+          }
+        ]
+      },
+      {
+        "task": "asin",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/asin/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.012848000042140484,
+        "reference_ms": 0.011999999638646841,
+        "ratio": 1.0706667024191066,
+        "tolerance": {
+          "atol": 0.01,
+          "rtol": 0.01
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "asin_intent_kernel": "/home/kingdom/.cache/intentdsl/compiler/810cb268adde485186e390fad41a21d6"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "asin_intent_kernel",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, FRAGMENT_D1=512)"
+          }
+        ]
+      },
+      {
+        "task": "batch_norm",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/batch_norm/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.20793599635362625,
+        "reference_ms": 0.3965519964694977,
+        "ratio": 0.5243599785271046,
+        "tolerance": {
+          "atol": 0.01,
+          "rtol": 0.01
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "batch_norm_affine": "/home/kingdom/.cache/intentdsl/compiler/2877b1c738d14b63b56aa929747b9d3e",
+          "batch_norm_no_affine": "/home/kingdom/.cache/intentdsl/compiler/1e8743f3e87b44b9be40ea2612155756",
+          "batch_norm_weight_only": "/home/kingdom/.cache/intentdsl/compiler/c3917eb6d86f49b8bde25552a10686fa",
+          "batch_norm_bias_only": "/home/kingdom/.cache/intentdsl/compiler/ad968d5d52024987938057193ab0d916"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "batch_norm_affine",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, FRAGMENT_D1=1, FRAGMENT_D2=1, FRAGMENT_D3=64, FRAGMENT_D4=64)"
+          }
+        ]
+      },
+      {
+        "task": "bitwise_and",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/bitwise_and/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.016528000123798847,
+        "reference_ms": 0.01640000008046627,
+        "ratio": 1.0078048806527162,
+        "tolerance": {
+          "atol": 0,
+          "rtol": 0
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "bitwise_and_int32": "/home/kingdom/.cache/intentdsl/compiler/5a5ebc9fe84b499281bcf3e4819da42a"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "bitwise_and_int32",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, FRAGMENT_D1=1024)"
+          }
+        ]
+      },
+      {
+        "task": "chebyshev_polynomial_t",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/chebyshev_polynomial_t/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.013616000302135944,
+        "reference_ms": 0.017512000165879726,
+        "ratio": 0.7775239934422383,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "chebyshev_t3": "/home/kingdom/.cache/intentdsl/compiler/927a8b5bb9ed4079b1c29586f0bde1dc"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "chebyshev_t3",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, FRAGMENT_D1=2048)"
+          }
+        ]
+      },
+      {
+        "task": "combined_activation",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/combined_activation/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.0690079964697361,
+        "reference_ms": 0.07002400234341621,
+        "ratio": 0.9854906055112738,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "combined_activation": "/home/kingdom/.cache/intentdsl/compiler/b8c99eb521a74ccabcdd84c1ef737157"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "combined_activation",
+            "winner": "namespace(BLOCK_K_1_0_0_1_1_0_2_0_0_2_1_0_3_0=32, BLOCK_M_1_0_0_1_1_0_2_0_0_2_1_0_3_0=32, BLOCK_N_1_0_0_1_1_0_2_0_0_2_1_0_3_0=64, CUTILE_ACCESS_FORM=3, CUTILE_CTAS=1, CUTILE_LOAD_POLICY=11, CUTILE_OCCUPANCY=1, CUTILE_WORKER_WARPS=4, GROUP_SIZE_M=8)"
+          }
+        ]
+      },
+      {
+        "task": "conv2d",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/conv2d/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.11402400210499763,
+        "reference_ms": 0.10053599625825882,
+        "ratio": 1.1341609607377896,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "conv2d_with_bias": "/home/kingdom/.cache/intentdsl/compiler/6332c4529ea4486ea63f650f9b9bd3bb",
+          "conv2d_without_bias": "/home/kingdom/.cache/intentdsl/compiler/e8f2db8aaabf43b798dc367cec40151e"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "conv2d_with_bias",
+            "winner": "namespace(BLOCK_K_50_50=32, CUTILE_ACCESS_FORM=1, CUTILE_CTAS=1, CUTILE_LOAD_POLICY=11, CUTILE_OCCUPANCY=1, CUTILE_WORKER_WARPS=8, FRAGMENT_S10_A0=32, FRAGMENT_S12_A0=4, FRAGMENT_S13_A0=16, FRAGMENT_S6_A0=1)"
+          }
+        ]
+      },
+      {
+        "task": "conv2d_add",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-pointwise-convolution-refresh/conv2d_add/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.12880799919366837,
+        "reference_ms": 0.06881599873304367,
+        "ratio": 1.8717740287887166,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "conv2d_add_fixed": "/home/kingdom/.cache/intentdsl/compiler/b96f0258dc6a4983b2fdc3c44ba0bbbe"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "conv2d_add_fixed",
+            "winner": "namespace(BLOCK_K_136_136=16, CUTILE_ACCESS_FORM=3, CUTILE_CTAS=1, CUTILE_LOAD_POLICY=11, CUTILE_OCCUPANCY=2, CUTILE_WORKER_WARPS=4, FRAGMENT_S10_A0=2, FRAGMENT_S11_A0=32, FRAGMENT_S7_A0=1, FRAGMENT_S9_A0=32)"
+          }
+        ]
+      },
+      {
+        "task": "cos",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/cos/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.014543999917805195,
+        "reference_ms": 0.01485599996522069,
+        "ratio": 0.9789983812502748,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "cos_kernel": "/home/kingdom/.cache/intentdsl/compiler/30afa585bb1842c29a3cd4bcd20284b7"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "cos_kernel",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, FRAGMENT_D1=1024)"
+          }
+        ]
+      },
+      {
+        "task": "cos_avg_pool1d",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/cos_avg_pool1d/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.021344000473618507,
+        "reference_ms": 0.0370319988578558,
+        "ratio": 0.5763664163942555,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "cos_avg_pool1d": "/home/kingdom/.cache/intentdsl/compiler/e38c3d784c4e4f5aa3b1eeeefd8529af"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "cos_avg_pool1d",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=2, FRAGMENT_S4_A0=1, FRAGMENT_S5_A0=32, FRAGMENT_S7_A0=8)"
+          }
+        ]
+      },
+      {
+        "task": "determinant_via_qr",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/determinant_via_qr/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_event",
+        "candidate_ms": 0.0838639996945858,
+        "reference_ms": 0.5473920106887817,
+        "ratio": 0.1532064737098738,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 0.0001
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "det_qr_copy": "/home/kingdom/.cache/intentdsl/compiler/d52801de31b840dcb95383d60105d12b",
+          "det_qr_householder": "/home/kingdom/.cache/intentdsl/compiler/2366ce7a8af742f6a6a64494c6ab518a"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "det_qr_copy",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, FRAGMENT_S4_A0=32, FRAGMENT_S5_A0=32)"
+          },
+          {
+            "kernel": "det_qr_householder",
+            "winner": "namespace(CUTILE_OCCUPANCY=4, ITERATION_23=16)"
+          }
+        ]
+      },
+      {
+        "task": "div",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/div/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.01714400015771389,
+        "reference_ms": 0.016944000497460365,
+        "ratio": 1.011803567893161,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "div_float32": "/home/kingdom/.cache/intentdsl/compiler/b4c92df0bc15471d93e788aeb9223466"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "div_float32",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, FRAGMENT_D1=256)"
+          }
+        ]
+      },
+      {
+        "task": "erfc_sqrt",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/erfc_sqrt/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.03327200002968311,
+        "reference_ms": 0.03412799909710884,
+        "ratio": 0.9749179825928252,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "erfc_sqrt_elementwise": "/home/kingdom/.cache/intentdsl/compiler/41277ed3aa8e46f585a94333f2b1729c"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "erfc_sqrt_elementwise",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, FRAGMENT_D1=256)"
+          }
+        ]
+      },
+      {
+        "task": "exp",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/exp/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.013352000154554844,
+        "reference_ms": 0.013927999883890152,
+        "ratio": 0.9586444762968774,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "exp_float32_1d": "/home/kingdom/.cache/intentdsl/compiler/9abfd8221b334a2ebc8053cf24dda506"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "exp_float32_1d",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, FRAGMENT_D1=2048)"
+          }
+        ]
+      },
+      {
+        "task": "exp_mean",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-broad-organization/exp_mean/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.018240000121295452,
+        "reference_ms": 0.03346399962902069,
+        "ratio": 0.5450633613286721,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "exp_mean_stage1": "/home/kingdom/.cache/intentdsl/compiler/39f89c0fe0894507a032a5c69f4de077",
+          "exp_mean_stage2": "/home/kingdom/.cache/intentdsl/compiler/c7b20f80d16947df8db86b52676ae30e"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "exp_mean_stage1",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=2, FRAGMENT_S14_A0=4)"
+          },
+          {
+            "kernel": "exp_mean_stage2",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=1)"
+          }
+        ]
+      },
+      {
+        "task": "exp_sqrt",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/exp_sqrt/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.014352000318467617,
+        "reference_ms": 0.019487999379634857,
+        "ratio": 0.736453241755826,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "exp_sqrt": "/home/kingdom/.cache/intentdsl/compiler/44b22af9661e404b9f487ed93a6b38f5"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "exp_sqrt",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_D1=1024)"
+          }
+        ]
+      },
+      {
+        "task": "floor",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/floor/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.013552000280469656,
+        "reference_ms": 0.013584000058472157,
+        "ratio": 0.9976443037496497,
+        "tolerance": {
+          "atol": 0,
+          "rtol": 0
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "floor_float32": "/home/kingdom/.cache/intentdsl/compiler/ab0e954898d6454eb15d2ffb0a440c96"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "floor_float32",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_D1=2048)"
+          }
+        ]
+      },
+      {
+        "task": "fused_add_mul_groupnorm",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-global-performance-organization/fused_add_mul_groupnorm/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.48266400396823883,
+        "reference_ms": 0.33555199205875397,
+        "ratio": 1.438417936388606,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "fused_add_mul_groupnorm": "/home/kingdom/.cache/intentdsl/compiler/feefa0f7fce04b3aabc194d8bc3de914"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "fused_add_mul_groupnorm",
+            "winner": "namespace(CUTILE_OCCUPANCY=2, FRAGMENT_S18_A0=1, FRAGMENT_S22_A0=1, POINTWISE_CHUNK_S15_A0=32, REDUCE_CHUNK_11_A0_E8=8, REDUCE_CHUNK_13_A0_E128=32)"
+          }
+        ]
+      },
+      {
+        "task": "fused_avg_pool2d_cosine_similarity",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-broad-fusion-organization/fused_avg_pool2d_cosine_similarity/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.02829599939286709,
+        "reference_ms": 0.1072239987552166,
+        "ratio": 0.26389614005596346,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "cosine_stage": "/home/kingdom/.cache/intentdsl/compiler/780eb30ee5f64f5aaa17b3c262cfdc26",
+          "avg_pool_stage": "/home/kingdom/.cache/intentdsl/compiler/18c2c76c56a64f6f860bba32256e94ac"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "cosine_stage",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, CUTILE_OCCUPANCY=1, FRAGMENT_D1=1, FRAGMENT_D3=4, FRAGMENT_D4=16, REDUCE_CHUNK_8_A0=32)"
+          },
+          {
+            "kernel": "avg_pool_stage",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_D1=16, FRAGMENT_D2=1, FRAGMENT_D5=1, FRAGMENT_D6=16)"
+          }
+        ]
+      },
+      {
+        "task": "fused_cholesky_solve",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-global-performance-organization/fused_cholesky_solve/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_event",
+        "candidate_ms": 17.215167999267578,
+        "reference_ms": 3.1687039136886597,
+        "ratio": 5.4328736506111595,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 0.0001
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "fused_cholesky_factor": "/home/kingdom/.cache/intentdsl/compiler/fdb45bc0026c4d36b1988382b3346fa4",
+          "fused_forward_substitution": "/home/kingdom/.cache/intentdsl/compiler/de5850d101c84ba19d6c7b3e54630f58",
+          "fused_backward_substitution": "/home/kingdom/.cache/intentdsl/compiler/03fca4756dc04bdca1aeebbcabc30322"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "fused_cholesky_factor",
+            "winner": "namespace(ITERATION_3=256)"
+          },
+          {
+            "kernel": "fused_forward_substitution",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_S5_A0=1)"
+          },
+          {
+            "kernel": "fused_backward_substitution",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_S5_A0=1)"
+          }
+        ]
+      },
+      {
+        "task": "fused_cosine_embedding_loss_with_normalization",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-broad-fusion-organization/fused_cosine_embedding_loss_with_normalization/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.02715999912470579,
+        "reference_ms": 0.08753599971532822,
+        "ratio": 0.3102723361020788,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "fused_cosine_row_loss": "/home/kingdom/.cache/intentdsl/compiler/81e9c75b91d44a7ebb5c35a866ea20e1",
+          "fused_cosine_reduce_loss": "/home/kingdom/.cache/intentdsl/compiler/d96d6c4d94a646c681995ab396fba523"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "fused_cosine_row_loss",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=2, REDUCE_CHUNK_9_A0=8192)"
+          },
+          {
+            "kernel": "fused_cosine_reduce_loss",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=1, REDUCE_CHUNK_5_A0=8192)"
+          }
+        ]
+      },
+      {
+        "task": "fused_cross_entropy_log_softmax",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/fused_cross_entropy_log_softmax/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.01891199965029955,
+        "reference_ms": 0.05301600135862827,
+        "ratio": 0.35672248313049454,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "fused_ce_log_softmax_rows": "/home/kingdom/.cache/intentdsl/compiler/10f1245031864340b6c08cd0d9191242",
+          "fused_ce_log_softmax_mean": "/home/kingdom/.cache/intentdsl/compiler/4f3c3c88a7c84d3d944ed6fdb785d35e"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "fused_ce_log_softmax_rows",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=2, FRAGMENT_D1=16, REDUCE_CHUNK_9_A0=8192)"
+          },
+          {
+            "kernel": "fused_ce_log_softmax_mean",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=2, REDUCE_CHUNK_5_A0=8192)"
+          }
+        ]
+      },
+      {
+        "task": "fused_cross_entropy_softmax_layernorm",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-fused-visible-contract-singlepoint/fused_cross_entropy_softmax_layernorm/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.019807999953627586,
+        "reference_ms": 0.05556800030171871,
+        "ratio": 0.3564641492599281,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "fused_cross_entropy_softmax_layernorm_rows": "/home/kingdom/.cache/intentdsl/compiler/87489f5bed2f4323b31d506df2a2137a",
+          "fused_cross_entropy_softmax_layernorm_mean": "/home/kingdom/.cache/intentdsl/compiler/8f1e74f39edc40c3902a5f73463a74eb"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "fused_cross_entropy_softmax_layernorm_rows",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, CUTILE_OCCUPANCY=2)"
+          },
+          {
+            "kernel": "fused_cross_entropy_softmax_layernorm_mean",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=2, REDUCE_CHUNK_6_A0=64)"
+          }
+        ]
+      },
+      {
+        "task": "fused_embedding_add_tanh",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/fused_embedding_add_tanh/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.010352000128477812,
+        "reference_ms": 0.019351999275386333,
+        "ratio": 0.5349318166647745,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "fused_embedding_add_tanh": "/home/kingdom/.cache/intentdsl/compiler/327dbaf9a785479984527830a309fce8"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "fused_embedding_add_tanh",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_D1=8, FRAGMENT_D2=1, FRAGMENT_D3=16)"
+          }
+        ]
+      },
+      {
+        "task": "fused_gather_masked_fill",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/fused_gather_masked_fill/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.03355200029909611,
+        "reference_ms": 0.04816799983382225,
+        "ratio": 0.696562041497451,
+        "tolerance": {
+          "atol": 0,
+          "rtol": 0
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "fused_gather_masked_fill": "/home/kingdom/.cache/intentdsl/compiler/8813dabc69934c849c70911dc7003739"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "fused_gather_masked_fill",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, FRAGMENT_S7_A0=1, FRAGMENT_S8_A0=256)"
+          }
+        ]
+      },
+      {
+        "task": "fused_hardsigmoid_batch_norm",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-h100-numerical-organization-refresh/fused_hardsigmoid_batch_norm/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.01464799977838993,
+        "reference_ms": 0.04575200006365776,
+        "ratio": 0.3201608619953053,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "fused_hardsigmoid_batch_norm_wb": "/home/kingdom/.cache/intentdsl/compiler/78de560900e041b88d25eb0b92fcfab7",
+          "fused_hardsigmoid_batch_norm_w": "/home/kingdom/.cache/intentdsl/compiler/df81f91798404d32a59e73b2266ded55",
+          "fused_hardsigmoid_batch_norm_b": "/home/kingdom/.cache/intentdsl/compiler/6f3fe3b591e74fbfbb4d4f6627849217",
+          "fused_hardsigmoid_batch_norm_none": "/home/kingdom/.cache/intentdsl/compiler/982710d52a734b73b413594ce8440c66"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "fused_hardsigmoid_batch_norm_wb",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, FRAGMENT_D1=1, FRAGMENT_D3=32, FRAGMENT_D4=32, FRAGMENT_S11_A0=1)"
+          }
+        ]
+      },
+      {
+        "task": "fused_index_select_eq",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/fused_index_select_eq/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.010815999936312437,
+        "reference_ms": 0.015320000238716602,
+        "ratio": 0.7060052067739734,
+        "tolerance": {
+          "atol": 0,
+          "rtol": 0
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "fused_index_select_eq": "/home/kingdom/.cache/intentdsl/compiler/6b1a09c3237f472a89ea5df02ffadd85"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "fused_index_select_eq",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, FRAGMENT_S6_A0=4, FRAGMENT_S8_A0=128)"
+          }
+        ]
+      },
+      {
+        "task": "fused_instance_norm_selu_conv2d",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/fused_instance_norm_selu_conv2d/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.06203199923038483,
+        "reference_ms": 0.08060800284147263,
+        "ratio": 0.7695513726146991,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "fused_conv_selu": "/home/kingdom/.cache/intentdsl/compiler/833717a2aece4fb9a1ca87325f5b4f3c",
+          "fused_conv_selu_no_bias": "/home/kingdom/.cache/intentdsl/compiler/4f94e98fb62c4c33b6669fd0c2b73b1c",
+          "fused_instance_norm": "/home/kingdom/.cache/intentdsl/compiler/0081fa86995941aa85970a0fa1ad75d0"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "fused_conv_selu",
+            "winner": "namespace(BLOCK_K_69_69=16, CUTILE_ACCESS_FORM=1, CUTILE_CTAS=1, CUTILE_LOAD_POLICY=11, CUTILE_OCCUPANCY=2, CUTILE_WORKER_WARPS=8, FRAGMENT_S10_A0=1, FRAGMENT_S11_A0=64, FRAGMENT_S6_A0=1, FRAGMENT_S8_A0=32)"
+          },
+          {
+            "kernel": "fused_instance_norm",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=2, FRAGMENT_S5_A0=1, FRAGMENT_S7_A0=1, POINTWISE_CHUNK_S10_A0=64, REDUCE_CHUNK_9_A0_E64=32)"
+          }
+        ]
+      },
+      {
+        "task": "fused_layer_norm_relu_linear",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-remaining-performance-organization/fused_layer_norm_relu_linear/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.37536799907684326,
+        "reference_ms": 0.22111999988555908,
+        "ratio": 1.6975759735488216,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "fused_linear_relu_bias": "/home/kingdom/.cache/intentdsl/compiler/8e4a89a568ff41fbad2c108854aba1a9",
+          "fused_linear_relu_no_bias": "/home/kingdom/.cache/intentdsl/compiler/da4ed372f88443b6abc60075b5088062",
+          "fused_layer_norm": "/home/kingdom/.cache/intentdsl/compiler/ecc7aef94fd64c4789482a6a7faa889b"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "fused_linear_relu_bias",
+            "winner": "namespace(BLOCK_K_1_0_0_1_1_0_2_1_0_2_0_0_3_0=128, BLOCK_M_1_0_0_1_1_0_2_1_0_2_0_0_3_0=32, BLOCK_N_1_0_0_1_1_0_2_1_0_2_0_0_3_0=16, CUTILE_ACCESS_FORM=3, CUTILE_CTAS=1, CUTILE_LOAD_POLICY=11, CUTILE_OCCUPANCY=1, CUTILE_WORKER_WARPS=4, GROUP_SIZE_M=8)"
+          },
+          {
+            "kernel": "fused_layer_norm",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=2, FRAGMENT_S5_A0=1, POINTWISE_CHUNK_S7_A0=2048)"
+          }
+        ]
+      },
+      {
+        "task": "fused_lu_solve",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-h100-linalg-public-materials-20260922/fused_lu_solve/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_event",
+        "candidate_ms": 8.077272415161133,
+        "reference_ms": 2.768048048019409,
+        "ratio": 2.9180390929054045,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 0.0001
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "lu_factor": "/home/kingdom/.cache/intentdsl/compiler/e361f4e6f19c4d29b652602ae595814b",
+          "lu_solve": "/home/kingdom/.cache/intentdsl/compiler/1ecbb4cef132468293c5414c954083ad"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "lu_factor",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=1, ITERATION_13=32, ITERATION_14=32, ITERATION_15=32, MATERIALIZE_AXIS_VIEW_2=16, REDUCE_CHUNK_12_A0=128)"
+          },
+          {
+            "kernel": "lu_solve",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=2, REDUCE_CHUNK_28_A0=1024, REDUCE_CHUNK_9_A0=1024)"
+          }
+        ]
+      },
+      {
+        "task": "fused_masked_select_add_gelu",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-parallel-organization-refresh/fused_masked_select_add_gelu/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_event",
+        "candidate_ms": 1.6705999970436096,
+        "reference_ms": 0.09279999881982803,
+        "ratio": 18.002155369496215,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "masked_select_gelu_prefix": "/home/kingdom/.cache/intentdsl/compiler/c27a5eec52b84e128f95a6aa36ff498f",
+          "masked_select_add_gelu_exact": "/home/kingdom/.cache/intentdsl/compiler/1166badab5d542c5aba32d0dd9c4a87f",
+          "masked_select_add_gelu_tanh": "/home/kingdom/.cache/intentdsl/compiler/bc825c70857041e4b9267f3c41c02c0e",
+          "masked_select_gelu_copy": "/home/kingdom/.cache/intentdsl/compiler/8def202427294999b8b4b28979a4852d"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "masked_select_gelu_prefix",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, CUTILE_OCCUPANCY=1, SCAN_CHUNK_S4_A0=2048)"
+          },
+          {
+            "kernel": "masked_select_add_gelu_exact",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, FRAGMENT_D1=256)"
+          }
+        ]
+      },
+      {
+        "task": "fused_mv_sigmoid_sub",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/fused_mv_sigmoid_sub/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.013536000158637762,
+        "reference_ms": 0.023984000086784363,
+        "ratio": 0.5643762554060511,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "fused_mv_sigmoid_sub_scalar": "/home/kingdom/.cache/intentdsl/compiler/4964b82c4f334345b55f39f39527c007"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "fused_mv_sigmoid_sub_scalar",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=2, FRAGMENT_S11_A0=1)"
+          }
+        ]
+      },
+      {
+        "task": "fused_pairwise_distance_adaptive_avg_pool2d",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-broad-fusion-organization/fused_pairwise_distance_adaptive_avg_pool2d/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.0205680001527071,
+        "reference_ms": 0.039135999977588654,
+        "ratio": 0.5255519257074158,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "fused_pairwise_distance": "/home/kingdom/.cache/intentdsl/compiler/8bf20e6ce87f4901877222be5ca1423c"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "fused_pairwise_distance",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=1, FRAGMENT_S24_A0=1, REDUCE_CHUNK_13_A0_E16=16, REDUCE_CHUNK_9_A0_E4=4)"
+          }
+        ]
+      },
+      {
+        "task": "fused_qr_solve",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-h100-linalg-public-materials-20260922/fused_qr_solve/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_event",
+        "candidate_ms": 27.19302463531494,
+        "reference_ms": 4.388015985488892,
+        "ratio": 6.197111570523421,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 0.0001
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "fused_qr_solve": "/home/kingdom/.cache/intentdsl/compiler/9881ead5bfd143ef93a97991ab6a503a"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "fused_qr_solve",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, CUTILE_OCCUPANCY=1, ITERATION_10=8, ITERATION_8=8, ITERATION_9=8, REDUCE_CHUNK_7_A0=128)"
+          }
+        ]
+      },
+      {
+        "task": "fused_silu_layer_norm_conv2d",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/fused_silu_layer_norm_conv2d/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 1.6591840386390686,
+        "reference_ms": 0.7572319805622101,
+        "ratio": 2.1911172285766383,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "fused_conv_bias": "/home/kingdom/.cache/intentdsl/compiler/77e50e89eb3347b791595e7f81b8e4a3",
+          "fused_conv_no_bias": "/home/kingdom/.cache/intentdsl/compiler/d3e12efe6a864294b256c982d8f4f96c",
+          "fused_layer_norm_silu": "/home/kingdom/.cache/intentdsl/compiler/ec9ca3fb2ef64e2292d4f983a032ee34"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "fused_conv_bias",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_S10_A0=8, FRAGMENT_S14_A0=1, FRAGMENT_S18_A0=64, FRAGMENT_S6_A0=1)"
+          },
+          {
+            "kernel": "fused_layer_norm_silu",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=1, FRAGMENT_S12_A0=1, POINTWISE_CHUNK_S8_A0=8, REDUCE_CHUNK_5_A0_E64=64, REDUCE_CHUNK_7_A0_E64=8)"
+          }
+        ]
+      },
+      {
+        "task": "fused_svd_reconstruct",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/fused_svd_reconstruct/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_event",
+        "candidate_ms": 0.008527999743819237,
+        "reference_ms": 2.84825599193573,
+        "ratio": 0.0029941128072633115,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 0.0001
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "fused_svd_reconstruct_identity": "/home/kingdom/.cache/intentdsl/compiler/f0f73e8e713b41fd8680057c1d05162e"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "fused_svd_reconstruct_identity",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, FRAGMENT_D1=8, FRAGMENT_D2=16)"
+          }
+        ]
+      },
+      {
+        "task": "fused_tile_exp",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/fused_tile_exp/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.015352000016719103,
+        "reference_ms": 0.023312000557780266,
+        "ratio": 0.6585449403481354,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "fused_tile_exp": "/home/kingdom/.cache/intentdsl/compiler/26da523afe964a9094382aac2975c565"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "fused_tile_exp",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, FRAGMENT_S10_A0=2, FRAGMENT_S4_A0=1024)"
+          }
+        ]
+      },
+      {
+        "task": "gammaln",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/gammaln/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.06268800050020218,
+        "reference_ms": 0.020560000091791153,
+        "ratio": 3.04902724807045,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "gammaln_elementwise": "/home/kingdom/.cache/intentdsl/compiler/3fc9a2a61d9149348e00732f727fdfd1"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "gammaln_elementwise",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, FRAGMENT_D1=256)"
+          }
+        ]
+      },
+      {
+        "task": "gelu",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/gelu/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.03192800097167492,
+        "reference_ms": 0.014431999996304512,
+        "ratio": 2.2123060545905258,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "gelu_none": "/home/kingdom/.cache/intentdsl/compiler/6b8adc0ebf174750a777fa613b4d4bfc",
+          "gelu_tanh": "/home/kingdom/.cache/intentdsl/compiler/92414cf8afee49b0af47fb7f8a708c0a"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "gelu_none",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_D1=256)"
+          }
+        ]
+      },
+      {
+        "task": "gelu_conv2d",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/gelu_conv2d/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.3564079850912094,
+        "reference_ms": 0.12238400056958199,
+        "ratio": 2.912210611129451,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "gelu_conv2d_no_bias_none": "/home/kingdom/.cache/intentdsl/compiler/5e42b4fba2b04129982650bc356be7bf",
+          "gelu_conv2d_no_bias_tanh": "/home/kingdom/.cache/intentdsl/compiler/59d96f19e31f4ffaa363edeb6934600c",
+          "gelu_conv2d_bias_none": "/home/kingdom/.cache/intentdsl/compiler/956855fa2d3d45c8ad0c8e638fc37b0d",
+          "gelu_conv2d_bias_tanh": "/home/kingdom/.cache/intentdsl/compiler/239503bc82c742e99a7b96c6d7d37421"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "gelu_conv2d_no_bias_none",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, CUTILE_CTAS=1, CUTILE_LOAD_POLICY=11, CUTILE_OCCUPANCY=1, CUTILE_WORKER_WARPS=8, FRAGMENT_S10_A0=1, FRAGMENT_S11_A0=64, FRAGMENT_S6_A0=1, FRAGMENT_S8_A0=32)"
+          }
+        ]
+      },
+      {
+        "task": "grid_sample",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-remaining-performance-organization/grid_sample/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.041495999321341515,
+        "reference_ms": 0.04639999940991402,
+        "ratio": 0.8943103415746015,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "grid_sample_bilinear_zeros": "/home/kingdom/.cache/intentdsl/compiler/18e7ee92112247539702a6d25c296ee4"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "grid_sample_bilinear_zeros",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, FRAGMENT_D2=1, FRAGMENT_D5=16, FRAGMENT_D6=128)"
+          }
+        ]
+      },
+      {
+        "task": "i0",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/i0/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.019168000668287277,
+        "reference_ms": 0.022247999906539917,
+        "ratio": 0.8615606233732832,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "i0_kernel": "/home/kingdom/.cache/intentdsl/compiler/0eca2a3d7d0a42e8bf3c4967f7a8cef8"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "i0_kernel",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_D1=256)"
+          }
+        ]
+      },
+      {
+        "task": "ifftshift",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/ifftshift/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.014008000027388334,
+        "reference_ms": 0.023215999826788902,
+        "ratio": 0.6033769870735667,
+        "tolerance": {
+          "atol": 0,
+          "rtol": 0
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "ifftshift_1d": "/home/kingdom/.cache/intentdsl/compiler/e8215e288ab2494c86213bbdd093bba8"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "ifftshift_1d",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, FRAGMENT_D1=2048)"
+          }
+        ]
+      },
+      {
+        "task": "leaky_relu",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/leaky_relu/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.013535999692976475,
+        "reference_ms": 0.013679999858140945,
+        "ratio": 0.989473672027944,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "leaky_relu_out": "/home/kingdom/.cache/intentdsl/compiler/bfa62ddfb0bd4dd691421223f602dafe",
+          "leaky_relu_inplace": "/home/kingdom/.cache/intentdsl/compiler/7e83e6a151824e52a7d1e53d21f9f43b"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "leaky_relu_out",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, FRAGMENT_D1=1024)"
+          }
+        ]
+      },
+      {
+        "task": "leaky_relu_conv2d",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-h100-ordered-convolution/leaky_relu_conv2d/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.17020799964666367,
+        "reference_ms": 0.30323199927806854,
+        "ratio": 0.5613127903779714,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "leaky_relu_conv2d": "/home/kingdom/.cache/intentdsl/compiler/f49eb135771244c3b3167da00d687c22",
+          "leaky_relu_conv2d_no_bias": "/home/kingdom/.cache/intentdsl/compiler/a3841e4fc26b4516ac82691dacc834e6"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "leaky_relu_conv2d",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=1, FRAGMENT_S15_A0=1, FRAGMENT_S19_A0=512, REDUCE_CHUNK_23_A0_E4=4, REDUCE_CHUNK_24_A0_E4=2)"
+          }
+        ]
+      },
+      {
+        "task": "least_squares_qr",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-h100-leastqr-primary-recovery-20260922/least_squares_qr/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_event",
+        "candidate_ms": 0.09912000223994255,
+        "reference_ms": 0.3877919912338257,
+        "ratio": 0.2556009522645775,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 0.0001
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "least_squares_qr_factor": "/home/kingdom/.cache/intentdsl/compiler/177b8845466b413496de530fca3b4558",
+          "least_squares_qr_solve": "/home/kingdom/.cache/intentdsl/compiler/070c73c690f3408f8324c5bfe89e3a45"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "least_squares_qr_factor",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=4, ITERATION_11=16, ITERATION_12=16)"
+          },
+          {
+            "kernel": "least_squares_qr_solve",
+            "winner": "namespace()"
+          }
+        ]
+      },
+      {
+        "task": "log",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/log/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.014984000474214554,
+        "reference_ms": 0.014640000183135271,
+        "ratio": 1.0234972873480943,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "log_elementwise": "/home/kingdom/.cache/intentdsl/compiler/88afd13a4724494499f4c24abaa6115d"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "log_elementwise",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, FRAGMENT_D1=256)"
+          }
+        ]
+      },
+      {
+        "task": "log1p",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-h100-standard-math/log1p/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.02104800008237362,
+        "reference_ms": 0.013904000166803598,
+        "ratio": 1.5138089635978738,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "log1p": "/home/kingdom/.cache/intentdsl/compiler/2f4659d1c33c4986a47867c7c44e4ce9"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "log1p",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_D1=256)"
+          }
+        ]
+      },
+      {
+        "task": "log_softmax_linear",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-performance-author-gaps/log_softmax_linear/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.026232000440359116,
+        "reference_ms": 0.036103999242186546,
+        "ratio": 0.7265677207778061,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "linear_log_softmax": "/home/kingdom/.cache/intentdsl/compiler/ddd980288dc24c0c810a7134bf0f0bac",
+          "linear_log_softmax_no_bias": "/home/kingdom/.cache/intentdsl/compiler/fa3a109076874c3ebc2febc68da7515d"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "linear_log_softmax",
+            "winner": "namespace(BLOCK_K_1_2=64, BLOCK_N_CACHE_2_0_0_D3=256, CUTILE_ACCESS_FORM=3, CUTILE_CTAS=1, CUTILE_LOAD_POLICY=11, CUTILE_OCCUPANCY=1, CUTILE_WORKER_WARPS=4, FRAGMENT_D1=1)"
+          }
+        ]
+      },
+      {
+        "task": "log_tanh",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/log_tanh/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_event",
+        "candidate_ms": 0.015784000977873802,
+        "reference_ms": 0.06736800074577332,
+        "ratio": 0.23429522626681323,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "log_tanh": "/home/kingdom/.cache/intentdsl/compiler/411f2262f03441c8b5c3cc1343529616"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "log_tanh",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, FRAGMENT_D1=1024)"
+          }
+        ]
+      },
+      {
+        "task": "logit",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/logit/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.015664000064134598,
+        "reference_ms": 0.02863200008869171,
+        "ratio": 0.5470801905425091,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "logit_none": "/home/kingdom/.cache/intentdsl/compiler/2c65354471c647f6967a7cb9f9fc9770",
+          "logit_eps": "/home/kingdom/.cache/intentdsl/compiler/a4d3c0a27dbb4d71b228fc0f6459f659"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "logit_none",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_D1=256)"
+          }
+        ]
+      },
+      {
+        "task": "logsumexp",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-broad-organization/logsumexp/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.02521600015461445,
+        "reference_ms": 0.0825279988348484,
+        "ratio": 0.30554479098754905,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "logsumexp_partial": "/home/kingdom/.cache/intentdsl/compiler/4e076851252a47569b2d4dba93e77dca",
+          "logsumexp_finalize": "/home/kingdom/.cache/intentdsl/compiler/93f30a1727dd4a918269c53f44857d2c"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "logsumexp_partial",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=4)"
+          },
+          {
+            "kernel": "logsumexp_finalize",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=2)"
+          }
+        ]
+      },
+      {
+        "task": "matmul",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/matmul/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.020167999900877476,
+        "reference_ms": 0.021424000151455402,
+        "ratio": 0.9413741485390812,
+        "tolerance": {
+          "atol": 0.01,
+          "rtol": 0.01
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "matmul_fp16": "/home/kingdom/.cache/intentdsl/compiler/b19e27a890f74218bed10b9dd2a5a29d"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "matmul_fp16",
+            "winner": "namespace(BLOCK_K_1_0_0_1_1_0_2_0_0_2_1_0_3_0=64, BLOCK_M_1_0_0_1_1_0_2_0_0_2_1_0_3_0=64, BLOCK_N_1_0_0_1_1_0_2_0_0_2_1_0_3_0=128, CUTILE_ACCESS_FORM=1, CUTILE_CTAS=1, CUTILE_LOAD_POLICY=11, CUTILE_OCCUPANCY=1, CUTILE_WORKER_WARPS=1, GROUP_SIZE_M=8)"
+          }
+        ]
+      },
+      {
+        "task": "matrix_power_eig",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/matrix_power_eig/intent/candidate.py",
+        "status": "numerical_failure",
+        "timing": "cuda_event",
+        "candidate_ms": null,
+        "reference_ms": null,
+        "ratio": null,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 0.0001
+        },
+        "failure_stage": "comparison",
+        "error": "generated/source floating result 0 differs: max_abs=0.0421295166015625, atol=0.0001, rtol=0.0001; first_failure=0; largest tolerance excess has generated=161.161865234375, source=161.20399475097656, abs_error=0.0421295166015625, limit=0.016220398247241974",
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "matrix_power_eig_symmetrize": "/home/kingdom/.cache/intentdsl/compiler/6f3f8703c0a0496db327a662108dd992",
+          "matrix_power_eig_power_two": "/home/kingdom/.cache/intentdsl/compiler/0aea1ca5022f4599b25d48f37bb82331"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "matrix_power_eig_symmetrize",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, FRAGMENT_S4_A0=8, FRAGMENT_S5_A0=16)"
+          },
+          {
+            "kernel": "matrix_power_eig_power_two",
+            "winner": "namespace(BLOCK_K_4_0_0_5_0_0_4_0_0_5_0_0_3_0=32, BLOCK_M_4_0_0_5_0_0_4_0_0_5_0_0_3_0=64, BLOCK_N_4_0_0_5_0_0_4_0_0_5_0_0_3_0=64, CUTILE_ACCESS_FORM=3, CUTILE_CTAS=4, CUTILE_LOAD_POLICY=3, CUTILE_OCCUPANCY=1, CUTILE_WORKER_WARPS=8, GROUP_SIZE_M=8)"
+          }
+        ]
+      },
+      {
+        "task": "max",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-broad-organization/max/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.020455999299883842,
+        "reference_ms": 0.031279999762773514,
+        "ratio": 0.6539641769508141,
+        "tolerance": {
+          "atol": 0,
+          "rtol": 0
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "chunk_argmax": "/home/kingdom/.cache/intentdsl/compiler/f68cd76ef67f48efb579a05a9c1a9b71",
+          "final_argmax": "/home/kingdom/.cache/intentdsl/compiler/c7347969c511409eafe8b93ec1a3346b"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "chunk_argmax",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=2)"
+          },
+          {
+            "kernel": "final_argmax",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=4)"
+          }
+        ]
+      },
+      {
+        "task": "mean",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-broad-organization/mean/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.01699999999254942,
+        "reference_ms": 0.025615999475121498,
+        "ratio": 0.6636477334823488,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "mean_partial_1024": "/home/kingdom/.cache/intentdsl/compiler/b5620756b9de4ab79d7802343e7ca4b5",
+          "mean_finalize_1024": "/home/kingdom/.cache/intentdsl/compiler/c84ba93c054044958907a7c6e364e46a"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "mean_partial_1024",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=1)"
+          },
+          {
+            "kernel": "mean_finalize_1024",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=2)"
+          }
+        ]
+      },
+      {
+        "task": "min",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/min/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.01500000013038516,
+        "reference_ms": 0.04497599974274635,
+        "ratio": 0.3335112107831318,
+        "tolerance": {
+          "atol": 0,
+          "rtol": 0
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "min_dim0_float32": "/home/kingdom/.cache/intentdsl/compiler/7fb3993f442e499d94c62538ab057f77"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "min_dim0_float32",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=1, FRAGMENT_D2=8, REDUCE_CHUNK_5_A0=2048)"
+          }
+        ]
+      },
+      {
+        "task": "mul",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/mul/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.01307199988514185,
+        "reference_ms": 0.013040000107139349,
+        "ratio": 1.0024539706855509,
+        "tolerance": {
+          "atol": 0.01,
+          "rtol": 0.01
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "mul_f16_1048576": "/home/kingdom/.cache/intentdsl/compiler/2e26763a551f4be28f58d3ed5a5f2917"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "mul_f16_1048576",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, FRAGMENT_S5_A0=4096)"
+          }
+        ]
+      },
+      {
+        "task": "mul_relu",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/mul_relu/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.01664000004529953,
+        "reference_ms": 0.0228880001232028,
+        "ratio": 0.7270185230570085,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "mul_relu_tensor": "/home/kingdom/.cache/intentdsl/compiler/aefbe613e19b4dfabcfbcd9c41cbbbb6",
+          "mul_relu_scalar": "/home/kingdom/.cache/intentdsl/compiler/ec7e5adbd0e94717990ab19fb0720269"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "mul_relu_tensor",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, FRAGMENT_D1=1024)"
+          }
+        ]
+      },
+      {
+        "task": "mul_sub",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/mul_sub/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.01960800029337406,
+        "reference_ms": 0.03488000109791756,
+        "ratio": 0.5621559540187262,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "mul_sub_f32_1d": "/home/kingdom/.cache/intentdsl/compiler/4c76594740bf405b89eaec9269fe8fe4"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "mul_sub_f32_1d",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_D1=2048)"
+          }
+        ]
+      },
+      {
+        "task": "normalize_pairwise_distance",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-h100-pointwise-materials-fallback-20260922/normalize_pairwise_distance/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.01852799952030182,
+        "reference_ms": 0.040623998269438744,
+        "ratio": 0.4560850804840732,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "normalize_pairwise_distance_distance": "/home/kingdom/.cache/intentdsl/compiler/294c42909b6c4f36a9ece8b80ef50e3a",
+          "normalize_pairwise_distance_normalize": "/home/kingdom/.cache/intentdsl/compiler/c5f8449e87814dd39bcd020feb17eeb0"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "normalize_pairwise_distance_distance",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=1, FRAGMENT_S45_A0=4, FRAGMENT_S45_A1=16, REDUCE_CHUNK_11_A0=32)"
+          },
+          {
+            "kernel": "normalize_pairwise_distance_normalize",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=2, FRAGMENT_D2=64, FRAGMENT_S6_A0=1, REDUCE_CHUNK_1_A1=64)"
+          }
+        ]
+      },
+      {
+        "task": "normalized_cosine_similarity",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/normalized_cosine_similarity/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.014296000357717276,
+        "reference_ms": 0.1080319993197918,
+        "ratio": 0.13233116528186112,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "normalized_cosine_similarity_main": "/home/kingdom/.cache/intentdsl/compiler/d0f6b2d21e4d47879d9c34248c9b99ca"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "normalized_cosine_similarity_main",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=2, FRAGMENT_D1=1, REDUCE_CHUNK_10_A0=1024)"
+          }
+        ]
+      },
+      {
+        "task": "permute_copy",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/permute_copy/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.013168000150471926,
+        "reference_ms": 0.013496000319719315,
+        "ratio": 0.9756964907026462,
+        "tolerance": {
+          "atol": 0,
+          "rtol": 0
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "permute_copy_reverse": "/home/kingdom/.cache/intentdsl/compiler/828d689173624b1a83af382c69af7095"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "permute_copy_reverse",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_S4_A0=32, FRAGMENT_S5_A0=1, FRAGMENT_S6_A0=1, FRAGMENT_S7_A0=32)"
+          }
+        ]
+      },
+      {
+        "task": "relu",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/relu/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.013520000036805868,
+        "reference_ms": 0.013968000188469887,
+        "ratio": 0.9679266791509763,
+        "tolerance": {
+          "atol": 0,
+          "rtol": 0
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "relu_out_of_place": "/home/kingdom/.cache/intentdsl/compiler/c761fb8bcc5b49c38c7e95071ba43612",
+          "relu_in_place": "/home/kingdom/.cache/intentdsl/compiler/562ab69ba7ae42cf89c0dfbb6066c4e2"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "relu_out_of_place",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, FRAGMENT_D1=2048)"
+          }
+        ]
+      },
+      {
+        "task": "relu_batch_norm_conv2d",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-h100-manual-retrieval-20260922/relu_batch_norm_conv2d/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.1130559965968132,
+        "reference_ms": 0.0727040022611618,
+        "ratio": 1.5550175104625192,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "fused_conv_bn_relu": "/home/kingdom/.cache/intentdsl/compiler/0a2333be1e9e4cad8da72665e1160fdf"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "fused_conv_bn_relu",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_CTAS=4, CUTILE_LOAD_POLICY=3, CUTILE_OCCUPANCY=1, CUTILE_WORKER_WARPS=8, FRAGMENT_S12_A0=32, FRAGMENT_S18_A0=2, FRAGMENT_S22_A0=32)"
+          }
+        ]
+      },
+      {
+        "task": "relu_conv2d",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/relu_conv2d/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.08831999823451042,
+        "reference_ms": 0.07392000034451485,
+        "ratio": 1.194805165352845,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "relu_conv2d_fixed": "/home/kingdom/.cache/intentdsl/compiler/09ba76c89f194d06bad16f37355dc19b"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "relu_conv2d_fixed",
+            "winner": "namespace(CUTILE_CTAS=1, CUTILE_OCCUPANCY=1, CUTILE_WORKER_WARPS=8, FRAGMENT_S5_A0=64, FRAGMENT_S9_A0=64)"
+          }
+        ]
+      },
+      {
+        "task": "relu_sqrt",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/relu_sqrt/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.014167999848723412,
+        "reference_ms": 0.019783999770879745,
+        "ratio": 0.7161342505461117,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "relu_sqrt_kernel": "/home/kingdom/.cache/intentdsl/compiler/ca5f913f1657480e9cd031e035713737"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "relu_sqrt_kernel",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, FRAGMENT_D1=1024)"
+          }
+        ]
+      },
+      {
+        "task": "rsqrt",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/rsqrt/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_event",
+        "candidate_ms": 0.013344000093638897,
+        "reference_ms": 0.0729759968817234,
+        "ratio": 0.18285464623753372,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "rsqrt_kernel": "/home/kingdom/.cache/intentdsl/compiler/05c61db6f8664249824789df11e18990"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "rsqrt_kernel",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_D1=1024)"
+          }
+        ]
+      },
+      {
+        "task": "selu",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/selu/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.014159999787807465,
+        "reference_ms": 0.057072000578045845,
+        "ratio": 0.2481076472594244,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "selu": "/home/kingdom/.cache/intentdsl/compiler/7642459166664e2cb8612d9a10aba21a"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "selu",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, FRAGMENT_D1=2048)"
+          }
+        ]
+      },
+      {
+        "task": "sigmoid",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/sigmoid/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.014079999644309282,
+        "reference_ms": 0.014032000210136175,
+        "ratio": 1.0034207121903,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "sigmoid_elementwise": "/home/kingdom/.cache/intentdsl/compiler/79dd40f2be2b4839aea9648f8e2cec7d"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "sigmoid_elementwise",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, FRAGMENT_D1=256)"
+          }
+        ]
+      },
+      {
+        "task": "sigmoid_adaptive_avg_pool2d",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/sigmoid_adaptive_avg_pool2d/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.009952000342309475,
+        "reference_ms": 0.017231999896466732,
+        "ratio": 0.577530199750642,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "sigmoid_adaptive_avg_pool2d": "/home/kingdom/.cache/intentdsl/compiler/3f9e01653c6046bbaf62e3be81fd6fc1"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "sigmoid_adaptive_avg_pool2d",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=1, FRAGMENT_S4_A0=1, FRAGMENT_S5_A0=2, REDUCE_CHUNK_7_A0_E16=16)"
+          }
+        ]
+      },
+      {
+        "task": "sigmoid_argmax",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/sigmoid_argmax/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.01701599918305874,
+        "reference_ms": 0.03354400023818016,
+        "ratio": 0.5072740001859092,
+        "tolerance": {
+          "atol": 0,
+          "rtol": 0
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "sigmoid_argmax": "/home/kingdom/.cache/intentdsl/compiler/f0618a1fbb1c43909aa18c63d2767682"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "sigmoid_argmax",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=1, FRAGMENT_D1=1, REDUCE_CHUNK_1_A1=1024)"
+          }
+        ]
+      },
+      {
+        "task": "sigmoid_batch_norm",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-h100-static-controls-20260921/sigmoid_batch_norm/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.01576000079512596,
+        "reference_ms": 0.03726399876177311,
+        "ratio": 0.4229283307966722,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "sigmoid_batch_norm_fused": "/home/kingdom/.cache/intentdsl/compiler/11809b3ee30441d8a37e9bae770dfc5a",
+          "sigmoid_batch_norm_no_weight": "/home/kingdom/.cache/intentdsl/compiler/fa6ec84f40aa4a6cbbc0fcd4a3bad943",
+          "sigmoid_batch_norm_no_bias": "/home/kingdom/.cache/intentdsl/compiler/217661d9fc074d2ca7e8496b9dade39d",
+          "sigmoid_batch_norm_no_affine": "/home/kingdom/.cache/intentdsl/compiler/6cedab903c8944c280f3593a00f69c12"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "sigmoid_batch_norm_fused",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, FRAGMENT_S11_A0=128, FRAGMENT_S9_A0=8)"
+          }
+        ]
+      },
+      {
+        "task": "sigmoid_conv2d",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/sigmoid_conv2d/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.18306399136781693,
+        "reference_ms": 0.11141600087285042,
+        "ratio": 1.643067332642214,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "sigmoid_conv2d_bias": "/home/kingdom/.cache/intentdsl/compiler/fdb4a2750e1444f88d8511dba75ebed5",
+          "sigmoid_conv2d_no_bias": "/home/kingdom/.cache/intentdsl/compiler/8666c71a5233404785fa21c8aab83684"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "sigmoid_conv2d_bias",
+            "winner": "namespace(BLOCK_K_52_52=16, CUTILE_ACCESS_FORM=1, CUTILE_CTAS=1, CUTILE_LOAD_POLICY=3, CUTILE_OCCUPANCY=2, CUTILE_WORKER_WARPS=4, FRAGMENT_S10_A0=1, FRAGMENT_S11_A0=64, FRAGMENT_S8_A0=32)"
+          }
+        ]
+      },
+      {
+        "task": "silu_batch_norm",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/silu_batch_norm/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.032519999891519547,
+        "reference_ms": 0.08806400001049042,
+        "ratio": 0.3692768882590579,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "silu_batch_norm_affine": "/home/kingdom/.cache/intentdsl/compiler/1638ba9746ad40f890b85f29073f1ead",
+          "silu_batch_norm_weight_only": "/home/kingdom/.cache/intentdsl/compiler/a91cd5a1d4c64056a3e50ce6e066939a",
+          "silu_batch_norm_bias_only": "/home/kingdom/.cache/intentdsl/compiler/7d11e816ec4b46268f28349e6adfa7c4",
+          "silu_batch_norm_no_affine": "/home/kingdom/.cache/intentdsl/compiler/de6b100246e14caabb8fd4bc5b3ce7b0"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "silu_batch_norm_affine",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_D1=1, FRAGMENT_D2=1, FRAGMENT_D3=64, FRAGMENT_D4=64)"
+          }
+        ]
+      },
+      {
+        "task": "softmax",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-h100-static-controls-20260921/softmax/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.01722400076687336,
+        "reference_ms": 0.021719999611377716,
+        "ratio": 0.7930018911165546,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "softmax_rows": "/home/kingdom/.cache/intentdsl/compiler/2d4f87a3c26645cebd8ee503889f70ef"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "softmax_rows",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=1, FRAGMENT_D1=1)"
+          }
+        ]
+      },
+      {
+        "task": "softmax_log",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/softmax_log/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.01943999994546175,
+        "reference_ms": 0.029488000087440014,
+        "ratio": 0.6592512170312268,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "softmax_log_last_1024": "/home/kingdom/.cache/intentdsl/compiler/7f2fa54803fe477a8d24a91ea638e02a"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "softmax_log_last_1024",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=4, FRAGMENT_S4_A0=1)"
+          }
+        ]
+      },
+      {
+        "task": "softplus_linear",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/softplus_linear/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.03151999972760677,
+        "reference_ms": 0.04330400004982948,
+        "ratio": 0.7278773252202342,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "softplus_linear_with_bias": "/home/kingdom/.cache/intentdsl/compiler/cc752eb0598847a1b57f8137e78d642c",
+          "softplus_linear_without_bias": "/home/kingdom/.cache/intentdsl/compiler/49e7973dd3fd47579e5c859f048f679d"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "softplus_linear_with_bias",
+            "winner": "namespace(BLOCK_K_1_2=128, CUTILE_ACCESS_FORM=3, CUTILE_CTAS=1, CUTILE_LOAD_POLICY=11, CUTILE_OCCUPANCY=1, CUTILE_WORKER_WARPS=4, FRAGMENT_D1=1, FRAGMENT_S2_A0=16)"
+          }
+        ]
+      },
+      {
+        "task": "solve",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-h100-linalg-public-materials-20260922/solve/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_event",
+        "candidate_ms": 9.13042402267456,
+        "reference_ms": 1.4347519874572754,
+        "ratio": 6.363764680232896,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 0.0001
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "lu_factor": "/home/kingdom/.cache/intentdsl/compiler/6a22d503e74b448380e70d2ae58b1510",
+          "lu_backsolve": "/home/kingdom/.cache/intentdsl/compiler/2008380620cd4c7da4c82ed065292f6e"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "lu_factor",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=1, ITERATION_10=32, ITERATION_11=32, ITERATION_6=32, ITERATION_7=32, ITERATION_8=32, ITERATION_9=32, REDUCE_CHUNK_5_A0=128)"
+          },
+          {
+            "kernel": "lu_backsolve",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=1, ITERATION_6=256, REDUCE_CHUNK_5_A0=8192)"
+          }
+        ]
+      },
+      {
+        "task": "solve_multiple_lu",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-h100-author-structure-20260921/solve_multiple_lu/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_event",
+        "candidate_ms": 1.034999966621399,
+        "reference_ms": 0.4461759924888611,
+        "ratio": 2.3197123647284497,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 0.0001
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "solve_multiple_lu_factor_no_pivot": "/home/kingdom/.cache/intentdsl/compiler/2490e06b490d47078fe0a249ce54c665",
+          "solve_multiple_lu_factor_pivot": "/home/kingdom/.cache/intentdsl/compiler/f30a2dbc4b87429e8baa40f0600205c2",
+          "solve_multiple_lu_solve_no_pivot": "/home/kingdom/.cache/intentdsl/compiler/9ec0ab3b61d54163b39d07746fb3dafe",
+          "solve_multiple_lu_solve_pivot": "/home/kingdom/.cache/intentdsl/compiler/78333cc1e60a42f49b6292500d665bcf"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "solve_multiple_lu_factor_pivot",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=1, ITERATION_11=16, ITERATION_12=16, ITERATION_13=16, ITERATION_14=16, REDUCE_CHUNK_10_A0_DERIVED=1024)"
+          },
+          {
+            "kernel": "solve_multiple_lu_solve_pivot",
+            "winner": "namespace()"
+          }
+        ]
+      },
+      {
+        "task": "solve_symmetric_ldl",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/solve_symmetric_ldl/intent/candidate.py",
+        "status": "numerical_failure",
+        "timing": "cuda_event",
+        "candidate_ms": null,
+        "reference_ms": null,
+        "ratio": null,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 0.0001
+        },
+        "failure_stage": "comparison",
+        "error": "generated/source floating result 0 differs: max_abs=214781.03125, atol=0.0001, rtol=0.0001; first_failure=0; largest tolerance excess has generated=-243803.90625, source=-29022.873046875, abs_error=214781.03125, limit=2.9023871421813965",
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "symmetric_ldl_factor": "/home/kingdom/.cache/intentdsl/compiler/67c1d958ebec4f95b49799a59fd430c8",
+          "symmetric_ldl_reconstruct_solve": "/home/kingdom/.cache/intentdsl/compiler/4f4b222ce9e2422b8f0117e7fdafc98d"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "symmetric_ldl_factor",
+            "winner": "namespace(ITERATION_22=16, ITERATION_23=16, ITERATION_24=16, ITERATION_25=16, ITERATION_26=16, ITERATION_27=16, ITERATION_28=16, ITERATION_29=16, ITERATION_30=16, ITERATION_31=16)"
+          },
+          {
+            "kernel": "symmetric_ldl_reconstruct_solve",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, ITERATION_6=32, ITERATION_7=32)"
+          }
+        ]
+      },
+      {
+        "task": "sqrt",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/sqrt/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.01387199992313981,
+        "reference_ms": 0.014127999544143677,
+        "ratio": 0.9818799809411105,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "sqrt_elementwise": "/home/kingdom/.cache/intentdsl/compiler/cb0f40266b034ac4b130d83208ede6a2"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "sqrt_elementwise",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_D1=1024)"
+          }
+        ]
+      },
+      {
+        "task": "sqrt_exp",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/sqrt_exp/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.014895999804139137,
+        "reference_ms": 0.020015999674797058,
+        "ratio": 0.7442046385969562,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "sqrt_exp_pointwise": "/home/kingdom/.cache/intentdsl/compiler/ae9fea99dd1d449d9142970c2e41f260"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "sqrt_exp_pointwise",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, FRAGMENT_D1=256)"
+          }
+        ]
+      },
+      {
+        "task": "sqrt_tanh",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/sqrt_tanh/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.015583999920636415,
+        "reference_ms": 0.0321200005710125,
+        "ratio": 0.4851805617556741,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "sqrt_tanh_elementwise": "/home/kingdom/.cache/intentdsl/compiler/76ff06ded3e648c68ce29ae5efed1526"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "sqrt_tanh_elementwise",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_D1=1024)"
+          }
+        ]
+      },
+      {
+        "task": "std",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-visible-contract-singlepoint/std/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.01815200038254261,
+        "reference_ms": 0.03519999980926514,
+        "ratio": 0.5156818318437817,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "std_partial": "/home/kingdom/.cache/intentdsl/compiler/8ac69c2fbf8d49649fbbb212aa494928",
+          "std_finish": "/home/kingdom/.cache/intentdsl/compiler/f96c69d32d134f1aa066be6850b46fae"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "std_partial",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=4)"
+          },
+          {
+            "kernel": "std_finish",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, CUTILE_OCCUPANCY=4)"
+          }
+        ]
+      },
+      {
+        "task": "sub",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/sub/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.016672000288963318,
+        "reference_ms": 0.0227600010111928,
+        "ratio": 0.7325131611709703,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "sub_float32_1d": "/home/kingdom/.cache/intentdsl/compiler/8c94e29f0d0e44cb8e203a7f9775b81a"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "sub_float32_1d",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, FRAGMENT_D1=1024)"
+          }
+        ]
+      },
+      {
+        "task": "sub_gelu",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/sub_gelu/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.03423199988901615,
+        "reference_ms": 0.047520000487565994,
+        "ratio": 0.7203703606436881,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "sub_gelu_exact": "/home/kingdom/.cache/intentdsl/compiler/567535216e3b4530b883369d5276710a",
+          "sub_gelu_tanh": "/home/kingdom/.cache/intentdsl/compiler/9ecc354c3c8f48fb806aa3e41954cf5f"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "sub_gelu_exact",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_D1=256)"
+          }
+        ]
+      },
+      {
+        "task": "sum",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-gpu-contract-singlepoint/sum/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.017632000148296356,
+        "reference_ms": 0.026007999666035175,
+        "ratio": 0.6779452620234631,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "sum_partial": "/home/kingdom/.cache/intentdsl/compiler/1b40d8fb7b984ba8b515cf75eb7732dd",
+          "sum_final": "/home/kingdom/.cache/intentdsl/compiler/50d64971762d40ceabefc5dbc35b00ec"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "sum_partial",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=1, FRAGMENT_S4_A0=1)"
+          },
+          {
+            "kernel": "sum_final",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, CUTILE_OCCUPANCY=2)"
+          }
+        ]
+      },
+      {
+        "task": "sum_std",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/sum_std/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.002615999896079302,
+        "reference_ms": 0.0436639990657568,
+        "ratio": 0.05991205459993889,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "sum_std_sum_all": "/home/kingdom/.cache/intentdsl/compiler/6b82aba0d7f041bfb768a2e30ef5666c"
+        },
+        "tuning_winners": []
+      },
+      {
+        "task": "symmetric_mm_and_abs_sum",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-broad-organization/symmetric_mm_and_abs_sum/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.5500720143318176,
+        "reference_ms": 0.24299200624227524,
+        "ratio": 2.263745309314283,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "symmetric_mm_form_result": "/home/kingdom/.cache/intentdsl/compiler/16d639f0a6194de78b294a7741b772f9",
+          "symmetric_mm_abs_sum": "/home/kingdom/.cache/intentdsl/compiler/6f9ab95573764a0a8c5241b3434b8683"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "symmetric_mm_form_result",
+            "winner": "namespace(BLOCK_K_1_0_0_1_1_0_1_1_0_1_0_0_3_0=16, BLOCK_M_1_0_0_1_1_0_1_1_0_1_0_0_3_0=32, BLOCK_N_1_0_0_1_1_0_1_1_0_1_0_0_3_0=64, CUTILE_ACCESS_FORM=3, CUTILE_CTAS=1, CUTILE_LOAD_POLICY=11, CUTILE_OCCUPANCY=1, CUTILE_WORKER_WARPS=4, GROUP_SIZE_M=8)"
+          },
+          {
+            "kernel": "symmetric_mm_abs_sum",
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=1, REDUCE_CHUNK_4_A0=16, REDUCE_CHUNK_5_A0_INNER=1024)"
+          }
+        ]
+      },
+      {
+        "task": "tanh",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/tanh/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.014047999866306782,
+        "reference_ms": 0.008064000401645899,
+        "ratio": 1.7420633887170345,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "tanh_f32_1d": "/home/kingdom/.cache/intentdsl/compiler/ecfd2a3b1d654220a0be70c4f7fa3bd3"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "tanh_f32_1d",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_D1=1024)"
+          }
+        ]
+      },
+      {
+        "task": "tensordot",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/tensordot/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.020495999604463577,
+        "reference_ms": 0.013560000341385603,
+        "ratio": 1.5115043575558813,
+        "tolerance": {
+          "atol": 0.01,
+          "rtol": 0.01
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "tensordot_1024x8x8": "/home/kingdom/.cache/intentdsl/compiler/971e382619134f1fb649a956c8bed13b"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "tensordot_1024x8x8",
+            "winner": "namespace(CUTILE_ACCESS_FORM=1, CUTILE_CTAS=2, CUTILE_OCCUPANCY=2, CUTILE_WORKER_WARPS=1, FRAGMENT_S10_A0=128, FRAGMENT_S11_A0=128)"
+          }
+        ]
+      },
+      {
+        "task": "tensordot_rsqrt",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/tensordot_rsqrt/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.41011999547481537,
+        "reference_ms": 0.19167199730873108,
+        "ratio": 2.139696988779349,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "tensordot_rsqrt_kernel": "/home/kingdom/.cache/intentdsl/compiler/1df4d0805f214a288b331f6a90c6af0f"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "tensordot_rsqrt_kernel",
+            "winner": "namespace(BLOCK_K_5_0_0_9_0_0_9_0_0_7_0_0_3_0=16, BLOCK_M_5_0_0_9_0_0_9_0_0_7_0_0_3_0=32, BLOCK_N_5_0_0_9_0_0_9_0_0_7_0_0_3_0=64, CUTILE_ACCESS_FORM=3, CUTILE_CTAS=1, CUTILE_LOAD_POLICY=11, CUTILE_OCCUPANCY=2, CUTILE_WORKER_WARPS=4, GROUP_SIZE_M=8)"
+          }
+        ]
+      },
+      {
+        "task": "trunc",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/trunc/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.013671999797224998,
+        "reference_ms": 0.013408000115305185,
+        "ratio": 1.0196897135776766,
+        "tolerance": {
+          "atol": 0,
+          "rtol": 0
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "trunc_f32": "/home/kingdom/.cache/intentdsl/compiler/b88d2934d3944490a2442180129400fd"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "trunc_f32",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_D1=1024)"
+          }
+        ]
+      },
+      {
+        "task": "zeta",
+        "language": "intent",
+        "target": "cutile",
+        "program": "first-stage-high-100-intent-contraction-closure/zeta/intent/candidate.py",
+        "status": "pass",
+        "timing": "cuda_graph",
+        "candidate_ms": 0.07755200192332268,
+        "reference_ms": 0.017351999878883362,
+        "ratio": 4.469340852042083,
+        "tolerance": {
+          "atol": 0.0001,
+          "rtol": 1e-05
+        },
+        "reference_timing_note": null,
+        "compiler_artifacts": {
+          "hurwitz_zeta_f32": "/home/kingdom/.cache/intentdsl/compiler/33541aef9ab5414d85c97d44e641901b"
+        },
+        "tuning_winners": [
+          {
+            "kernel": "hurwitz_zeta_f32",
+            "winner": "namespace(CUTILE_ACCESS_FORM=3, FRAGMENT_D1=256)"
+          }
+        ]
+      }
+    ]
+  }
 }
