@@ -40,7 +40,7 @@ triton,block_sparse_gqa_decode,B8-QH32-KVH8-S8192-D128-blocks32x128,0.067568,0.4
 triton,flaggems_conv1d,B64-L16384-K5-fp16-same,0.009728,0.022296,0.094392,,pass,pass,2.291941,Intent target=cutile; source corpus=triton.
 triton,flaggems_triangular_solve,B4096-N16-fp32-lower,0.018392,0.067136,0.039640,,pass,pass,3.650283,Intent target=cutile; source corpus=triton.
 triton,flaggems_embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.090032,0.168504,0.095128,,pass,pass,1.871601,Intent target=cutile; source corpus=triton.
-triton,flaggems_roll,8192x4096-fp16-shift-1-axis0,0.049504,0.092968,0.049808,,pass,pass,1.877990,Intent target=cutile; source corpus=triton.
+triton,flaggems_roll,8192x4096-fp16-shift-1-axis0,0.049504,0.088800,0.049808,,pass,pass,1.793794,Intent target=cutile; source corpus=triton.
 triton,flaggems_transpose_copy,4093x8191-fp16,0.085312,0.152648,0.280064,,pass,pass,1.789291,Intent target=cutile; source corpus=triton.
 triton,flaggems_batch_norm_training,B32-C64-S4096-fp16,0.022784,0.285664,0.024336,,pass,pass,12.537922,Intent target=cutile; source corpus=triton. 
 triton,flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.043744,0.088488,0.051216,,pass,pass,2.022860,Intent target=cutile; source corpus=triton.
