@@ -1,0 +1,5216 @@
+{
+  "project_revision": "a3bddc6a91917281dbe963a8f9cad8776302e6bd",
+  "reference_revision": "603e28a5050e8c268f6883a69709d477a272d49a",
+  "triton_ref_revision": "ef08c7fc412737f1663dbfc38a8bed3e9fbf82da",
+  "compiler": "/home/kingdom/.cache/intentdsl/main-build/tools/intent-compile/intent-compile",
+  "torch": "2.10.0+cu130",
+  "triton": "3.6.0",
+  "gpu": null,
+  "model": "gpt-5.6-luna",
+  "reasoning_effort": "high",
+  "suite": "/home/kingdom/phdworks/intentdsl/experiments/agent_tritonbench/suite-100.json",
+  "tasks": [
+    {
+      "task": "abs",
+      "entry": "abs",
+      "prompt_index": 134,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/abs.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/abs_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "abs",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "exact",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input_tensor": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out": null
+      },
+      "reference_signature": "abs(input_tensor, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "asin",
+      "entry": "asin",
+      "prompt_index": 65,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/asin.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/asin_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "asin",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp16",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input_tensor": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float16",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        }
+      },
+      "reference_signature": "asin(input_tensor)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float16"
+      }
+    },
+    {
+      "task": "cos",
+      "entry": "cos",
+      "prompt_index": 82,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/cos.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/cos_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "cos",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input_tensor": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        }
+      },
+      "reference_signature": "cos(input_tensor)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "exp",
+      "entry": "exp",
+      "prompt_index": 87,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/exp.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/exp_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "exp",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input_tensor": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out": null
+      },
+      "reference_signature": "exp(input_tensor, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "floor",
+      "entry": "floor",
+      "prompt_index": 129,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/floor.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/floor_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "floor",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "exact",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out": null
+      },
+      "reference_signature": "floor(input: 'torch.Tensor', out: 'torch.Tensor' = None) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "gelu",
+      "entry": "gelu",
+      "prompt_index": 126,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/gelu.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/gelu_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "gelu",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "approximate": "none"
+      },
+      "reference_signature": "gelu(input: 'torch.Tensor', approximate: 'str' = 'none') -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "leaky_relu",
+      "entry": "leaky_relu",
+      "prompt_index": 137,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/leaky_relu.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/leaky_relu_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "leaky_relu",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "negative_slope": 0.01,
+        "inplace": false
+      },
+      "reference_signature": "leaky_relu(input, negative_slope=0.01, inplace=False)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "log",
+      "entry": "log",
+      "prompt_index": 152,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/log.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/log_perf.py",
+      "disposition": "selected",
+      "reason": "Upstream performance call supplies out; its returned buffer identity remains observable.",
+      "id": "log",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "note": "Upstream performance call supplies out; its returned buffer identity remains observable.",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        }
+      },
+      "reference_signature": "log(input: 'torch.Tensor', out: 'torch.Tensor' = None) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "log1p",
+      "entry": "log1p",
+      "prompt_index": 39,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/log1p.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/log1p_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "log1p",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out": null
+      },
+      "reference_signature": "log1p(input: 'torch.Tensor', out: 'torch.Tensor' = None) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "mul",
+      "entry": "mul",
+      "prompt_index": 135,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/mul.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/mul_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "mul",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp16",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float16",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "other": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float16",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out": null
+      },
+      "reference_signature": "mul(input, other, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float16"
+      }
+    },
+    {
+      "task": "relu",
+      "entry": "relu",
+      "prompt_index": 23,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/relu.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/relu_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "relu",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "exact",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "inplace": false
+      },
+      "reference_signature": "relu(input: 'torch.Tensor', inplace: 'bool' = False) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "rsqrt",
+      "entry": "rsqrt",
+      "prompt_index": 12,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/rsqrt.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/rsqrt_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "rsqrt",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_event",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out": null
+      },
+      "reference_signature": "rsqrt(input: 'torch.Tensor', out: 'torch.Tensor' = None) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "sigmoid",
+      "entry": "sigmoid",
+      "prompt_index": 125,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/sigmoid.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/sigmoid_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "sigmoid",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out": null
+      },
+      "reference_signature": "sigmoid(input, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "sqrt",
+      "entry": "sqrt",
+      "prompt_index": 6,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/sqrt.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/sqrt_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "sqrt",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out": null
+      },
+      "reference_signature": "sqrt(input, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "tanh",
+      "entry": "tanh",
+      "prompt_index": 4,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/tanh.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/tanh_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "tanh",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input_tensor": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out_tensor": null
+      },
+      "reference_signature": "tanh(input_tensor, out_tensor=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "argmax",
+      "entry": "argmax",
+      "prompt_index": 18,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/argmax.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/argmax_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "argmax",
+      "family": "reduction",
+      "input_index": 8,
+      "tolerance": "exact",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input_tensor": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float16",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": 0,
+        "keepdim": false
+      },
+      "reference_signature": "argmax(input_tensor, dim, keepdim=False)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [],
+        "dtype": "torch.int64"
+      }
+    },
+    {
+      "task": "max",
+      "entry": "max",
+      "prompt_index": 21,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/max.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/max_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "max",
+      "family": "reduction",
+      "input_index": 8,
+      "tolerance": "exact",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": 0,
+        "keepdim": false
+      },
+      "reference_signature": "max(input, dim, keepdim=False)",
+      "return_contract": {
+        "type": "tuple",
+        "items": [
+          {
+            "type": "tensor",
+            "shape": [],
+            "dtype": "torch.float32"
+          },
+          {
+            "type": "tensor",
+            "shape": [],
+            "dtype": "torch.int64"
+          }
+        ]
+      }
+    },
+    {
+      "task": "mean",
+      "entry": "mean",
+      "prompt_index": 31,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/mean.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/mean_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "mean",
+      "family": "reduction",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input_tensor": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": 0,
+        "keepdim": false,
+        "dtype": null,
+        "out": null
+      },
+      "reference_signature": "mean(input_tensor, dim, keepdim=False, dtype=None, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "min",
+      "entry": "min",
+      "prompt_index": 112,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/min.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/min_perf.py",
+      "disposition": "selected",
+      "reason": "Compare the full values/indices return, not only values retained by the upstream performance wrapper.",
+      "id": "min",
+      "family": "reduction",
+      "input_index": 4,
+      "tolerance": "exact",
+      "note": "Compare the full values/indices return, not only values retained by the upstream performance wrapper.",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input_tensor": {
+          "shape": [
+            1024,
+            1024
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": 0,
+        "keepdim": false
+      },
+      "reference_signature": "min(input_tensor, dim, keepdim=False)",
+      "return_contract": {
+        "type": "tuple",
+        "items": [
+          {
+            "type": "tensor",
+            "shape": [
+              1024
+            ],
+            "dtype": "torch.float32"
+          },
+          {
+            "type": "tensor",
+            "shape": [
+              1024
+            ],
+            "dtype": "torch.int64"
+          }
+        ]
+      }
+    },
+    {
+      "task": "sum",
+      "entry": "sum",
+      "prompt_index": 116,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/sum.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/sum_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "sum",
+      "family": "reduction",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": 0,
+        "keepdim": false,
+        "dtype": null
+      },
+      "reference_signature": "sum(input, dim, keepdim=False, dtype=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "std",
+      "entry": "std",
+      "prompt_index": 139,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/std.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/std_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "std",
+      "family": "reduction",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": null,
+        "correction": 1,
+        "keepdim": false,
+        "out": null
+      },
+      "reference_signature": "std(input: 'torch.Tensor', dim=None, correction=1, keepdim=False, out=None) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "softmax",
+      "entry": "softmax",
+      "prompt_index": 136,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/softmax.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/softmax_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "softmax",
+      "family": "reduction",
+      "input_index": 6,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1024,
+            1024
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": 1,
+        "dtype": "torch.float32"
+      },
+      "reference_signature": "softmax(input: 'torch.Tensor', dim: 'int', dtype: 'torch.dtype' = None) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "logsumexp",
+      "entry": "logsumexp",
+      "prompt_index": 33,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/logsumexp.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/logsumexp_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "logsumexp",
+      "family": "reduction",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": 0,
+        "keepdim": false,
+        "out": null
+      },
+      "reference_signature": "logsumexp(input, dim, keepdim=False, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "add_mean",
+      "entry": "add_mean",
+      "prompt_index": 68,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/add_mean.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/add_mean_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "add_mean",
+      "family": "reduction",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "other": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": null,
+        "alpha": 1,
+        "keepdim": false,
+        "dtype": null,
+        "out": null
+      },
+      "reference_signature": "add_mean(input, other, dim=None, alpha=1, keepdim=False, dtype=None, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "exp_mean",
+      "entry": "exp_mean",
+      "prompt_index": 110,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/exp_mean.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/exp_mean_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "exp_mean",
+      "family": "reduction",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": null,
+        "keepdim": false,
+        "dtype": null,
+        "out": null
+      },
+      "reference_signature": "exp_mean(input, dim=None, keepdim=False, dtype=None, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "matmul",
+      "entry": "matmul",
+      "prompt_index": 76,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/matmul.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/matmul_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "matmul",
+      "family": "contraction",
+      "input_index": 6,
+      "tolerance": "fp16",
+      "timing": "cuda_graph",
+      "invocation": {
+        "tensor1": {
+          "shape": [
+            1024,
+            1024
+          ],
+          "dtype": "torch.float16",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "tensor2": {
+          "shape": [
+            1024,
+            1024
+          ],
+          "dtype": "torch.float16",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        }
+      },
+      "reference_signature": "matmul(tensor1, tensor2)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float16"
+      }
+    },
+    {
+      "task": "addmm",
+      "entry": "addmm",
+      "prompt_index": 79,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/addmm.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/addmm_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "addmm",
+      "family": "contraction",
+      "input_index": 6,
+      "tolerance": "fp16",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1024,
+            1024
+          ],
+          "dtype": "torch.float16",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "mat1": {
+          "shape": [
+            1024,
+            1024
+          ],
+          "dtype": "torch.float16",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "mat2": {
+          "shape": [
+            1024,
+            1024
+          ],
+          "dtype": "torch.float16",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "beta": 1,
+        "alpha": 1,
+        "out": null
+      },
+      "reference_signature": "addmm(input: 'torch.Tensor', mat1: 'torch.Tensor', mat2: 'torch.Tensor', beta: 'float' = 1, alpha: 'float' = 1, out: 'torch.Tensor' = None) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float16"
+      }
+    },
+    {
+      "task": "tensordot",
+      "entry": "tensordot",
+      "prompt_index": 63,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/tensordot.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/tensordot_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "tensordot",
+      "family": "contraction",
+      "input_index": 4,
+      "tolerance": "fp16",
+      "timing": "cuda_graph",
+      "invocation": {
+        "a": {
+          "shape": [
+            1024,
+            8,
+            8
+          ],
+          "dtype": "torch.float16",
+          "stride": [
+            64,
+            8,
+            1
+          ],
+          "device": "cuda"
+        },
+        "b": {
+          "shape": [
+            8,
+            8,
+            1024
+          ],
+          "dtype": "torch.float16",
+          "stride": [
+            8192,
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "dims": 2
+      },
+      "reference_signature": "tensordot(a: 'torch.Tensor', b: 'torch.Tensor', dims: 'Union[int, Tuple[List[int], List[int]], List[List[int]]]') -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float16"
+      }
+    },
+    {
+      "task": "tensordot_rsqrt",
+      "entry": "tensordot_rsqrt",
+      "prompt_index": 92,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/tensordot_rsqrt.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/tensordot_rsqrt_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "tensordot_rsqrt",
+      "family": "contraction",
+      "input_index": 5,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "a": {
+          "shape": [
+            1024,
+            1024
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "b": {
+          "shape": [
+            1024,
+            1024
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "dims": 1
+      },
+      "reference_signature": "tensordot_rsqrt(a: 'torch.Tensor', b: 'torch.Tensor', dims) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "conv2d",
+      "entry": "conv2d",
+      "prompt_index": 73,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/conv2d.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/conv2d_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "conv2d",
+      "family": "contraction",
+      "input_index": 2,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            8,
+            64,
+            16,
+            16
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            16384,
+            256,
+            16,
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight": {
+          "shape": [
+            128,
+            64,
+            3,
+            3
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            576,
+            9,
+            3,
+            1
+          ],
+          "device": "cuda"
+        },
+        "bias": {
+          "shape": [
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "stride": 1,
+        "padding": 0,
+        "dilation": 1,
+        "groups": 1
+      },
+      "reference_signature": "conv2d(input: 'torch.Tensor', weight: 'torch.Tensor', bias: 'torch.Tensor' = None, stride: 'int' = 1, padding: 'int' = 0, dilation: 'int' = 1, groups: 'int' = 1) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          8,
+          128,
+          14,
+          14
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "symmetric_mm_and_abs_sum",
+      "entry": "symmetric_mm_and_abs_sum",
+      "prompt_index": 113,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/symmetric_mm_and_abs_sum.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/symmetric_mm_and_abs_sum_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "symmetric_mm_and_abs_sum",
+      "family": "contraction",
+      "input_index": 6,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "A": {
+          "shape": [
+            1024,
+            1024
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "C": {
+          "shape": [
+            1024,
+            1024
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "alpha": 1.0,
+        "beta": 0.5
+      },
+      "reference_signature": "symmetric_mm_and_abs_sum(A: 'torch.Tensor', C: 'torch.Tensor', alpha: 'float', beta: 'float') -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "fused_mv_sigmoid_sub",
+      "entry": "fused_mv_sigmoid_sub",
+      "prompt_index": 35,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_mv_sigmoid_sub.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_mv_sigmoid_sub_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_mv_sigmoid_sub",
+      "family": "contraction",
+      "input_index": 4,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1024,
+            1024
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "vec": {
+          "shape": [
+            1024
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "other": 0.5,
+        "alpha": 1,
+        "out": null
+      },
+      "reference_signature": "fused_mv_sigmoid_sub(input, vec, other, alpha=1, *, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1024
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "solve",
+      "entry": "solve",
+      "prompt_index": 141,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/solve.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/solve_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "solve",
+      "family": "linear_algebra",
+      "input_index": 4,
+      "tolerance": "linear_algebra",
+      "timing": "cuda_event",
+      "invocation": {
+        "A": {
+          "shape": [
+            256,
+            256
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            256,
+            1
+          ],
+          "device": "cuda"
+        },
+        "B": {
+          "shape": [
+            256,
+            1
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1,
+            1
+          ],
+          "device": "cuda"
+        }
+      },
+      "reference_signature": "solve(A, B)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          256,
+          1
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "fused_cholesky_solve",
+      "entry": "fused_cholesky_solve",
+      "prompt_index": 75,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_cholesky_solve.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_cholesky_solve_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_cholesky_solve",
+      "family": "linear_algebra",
+      "input_index": 6,
+      "tolerance": "linear_algebra",
+      "timing": "cuda_event",
+      "invocation": {
+        "A": {
+          "shape": [
+            256,
+            256
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            256,
+            1
+          ],
+          "device": "cuda"
+        },
+        "b": {
+          "shape": [
+            256,
+            1
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1,
+            1
+          ],
+          "device": "cuda"
+        }
+      },
+      "reference_signature": "fused_cholesky_solve(A: 'torch.Tensor', b: 'torch.Tensor') -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          256,
+          1
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "fused_qr_solve",
+      "entry": "fused_qr_solve",
+      "prompt_index": 80,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_qr_solve.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_qr_solve_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_qr_solve",
+      "family": "linear_algebra",
+      "input_index": 4,
+      "tolerance": "linear_algebra",
+      "timing": "cuda_event",
+      "invocation": {
+        "A": {
+          "shape": [
+            512,
+            256
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            256,
+            1
+          ],
+          "device": "cuda"
+        },
+        "b": {
+          "shape": [
+            512,
+            10
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            10,
+            1
+          ],
+          "device": "cuda"
+        }
+      },
+      "reference_signature": "fused_qr_solve(A: 'torch.Tensor', b: 'torch.Tensor') -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          256,
+          10
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "add_gelu",
+      "entry": "add_gelu",
+      "prompt_index": 36,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/add_gelu.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/add_gelu_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "add_gelu",
+      "family": "fusion",
+      "input_index": 8,
+      "tolerance": "fp16",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float16",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "other": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float16",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "alpha": 1,
+        "approximate": "none",
+        "out": null
+      },
+      "reference_signature": "add_gelu(input, other, alpha=1, approximate='none', out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float16"
+      }
+    },
+    {
+      "task": "mul_relu",
+      "entry": "mul_relu",
+      "prompt_index": 53,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/mul_relu.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/mul_relu_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "mul_relu",
+      "family": "fusion",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "other": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "inplace": false,
+        "out": null
+      },
+      "reference_signature": "mul_relu(input, other, inplace=False, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "mul_sub",
+      "entry": "mul_sub",
+      "prompt_index": 132,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/mul_sub.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/mul_sub_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "mul_sub",
+      "family": "fusion",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "other_mul": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "other_sub": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "alpha": 1,
+        "out": null
+      },
+      "reference_signature": "mul_sub(input, other_mul, other_sub, alpha=1, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "sub_gelu",
+      "entry": "sub_gelu",
+      "prompt_index": 98,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/sub_gelu.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/sub_gelu_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "sub_gelu",
+      "family": "fusion",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "description": "Compute z = input - alpha * other. Follow the original reference: when approximate is not 'tanh', return 0.5 * z * erf(z / sqrt(2)), without an added 1 in the erf factor. For approximate='tanh', use 0.5 * z * (1 + tanh(sqrt(2/pi) * (z + 0.044715*z^3))). Preserve optional out behavior.",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "other": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "alpha": 1,
+        "approximate": "none",
+        "out": null
+      },
+      "reference_signature": "sub_gelu(input, other, alpha=1, approximate='none', out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "relu_conv2d",
+      "entry": "relu_conv2d",
+      "prompt_index": 151,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/relu_conv2d.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/relu_conv2d_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "relu_conv2d",
+      "family": "fusion",
+      "input_index": 3,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1,
+            3,
+            256,
+            256
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            196608,
+            65536,
+            256,
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight": {
+          "shape": [
+            64,
+            3,
+            3,
+            3
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            27,
+            9,
+            3,
+            1
+          ],
+          "device": "cuda"
+        },
+        "bias": null,
+        "stride": 1,
+        "padding": 1,
+        "dilation": 1,
+        "groups": 1,
+        "inplace": false
+      },
+      "reference_signature": "relu_conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, inplace=False)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1,
+          64,
+          256,
+          256
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "gelu_conv2d",
+      "entry": "gelu_conv2d",
+      "prompt_index": 54,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/gelu_conv2d.py",
+      "reference_line": 7,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/gelu_conv2d_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "gelu_conv2d",
+      "family": "fusion",
+      "input_index": 4,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            16,
+            16,
+            64,
+            64
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            65536,
+            4096,
+            64,
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight": {
+          "shape": [
+            32,
+            16,
+            3,
+            3
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            144,
+            9,
+            3,
+            1
+          ],
+          "device": "cuda"
+        },
+        "bias": null,
+        "stride": 1,
+        "padding": 1,
+        "dilation": 1,
+        "groups": 1,
+        "approximate": "none",
+        "out": null
+      },
+      "reference_signature": "gelu_conv2d(input: 'Tensor', weight: 'Tensor', bias: 'Optional[Tensor]' = None, stride: 'Union[int, Tuple[int, int]]' = 1, padding: 'Union[int, Tuple[int, int], str]' = 0, dilation: 'Union[int, Tuple[int, int]]' = 1, groups: 'int' = 1, approximate: 'str' = 'none', out: 'Optional[Tensor]' = None) -> 'Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          16,
+          32,
+          64,
+          64
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "conv2d_add",
+      "entry": "conv2d_add",
+      "prompt_index": 155,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/conv2d_add.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/conv2d_add_perf.py",
+      "disposition": "selected",
+      "reason": "Original smallest spatial profile; no additional input matrix.",
+      "id": "conv2d_add",
+      "family": "fusion",
+      "input_index": 0,
+      "tolerance": "fp32",
+      "note": "Original smallest spatial profile; no additional input matrix.",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            16,
+            32,
+            32,
+            32
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            32768,
+            1024,
+            32,
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight": {
+          "shape": [
+            32,
+            32,
+            3,
+            3
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            288,
+            9,
+            3,
+            1
+          ],
+          "device": "cuda"
+        },
+        "bias": null,
+        "other": {
+          "shape": [
+            16,
+            32,
+            32,
+            32
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            32768,
+            1024,
+            32,
+            1
+          ],
+          "device": "cuda"
+        },
+        "stride": 1,
+        "padding": 1,
+        "dilation": 1,
+        "groups": 1,
+        "alpha": 1,
+        "out": null
+      },
+      "reference_signature": "conv2d_add(input, weight, bias=None, other=None, stride=1, padding=0, dilation=1, groups=1, alpha=1, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          16,
+          32,
+          32,
+          32
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "combined_activation",
+      "entry": "combined_activation",
+      "prompt_index": 61,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/combined_activation.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/combined_activation_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed 2D upstream profile; not the broader rank range described by the prompt.",
+      "id": "combined_activation",
+      "family": "fusion",
+      "input_index": 6,
+      "tolerance": "fp32",
+      "note": "Fixed 2D upstream profile; not the broader rank range described by the prompt.",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            512,
+            512
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            512,
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight1": {
+          "shape": [
+            512,
+            512
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            512,
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight2": {
+          "shape": [
+            512
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "bias": {
+          "shape": [
+            512
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out": null
+      },
+      "reference_signature": "combined_activation(input, weight1, weight2, bias, *, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          512,
+          512
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "fused_layer_norm_relu_linear",
+      "entry": "fused_layer_norm_relu_linear",
+      "prompt_index": 69,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_layer_norm_relu_linear.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_layer_norm_relu_linear_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_layer_norm_relu_linear",
+      "family": "fusion",
+      "input_index": 4,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            32,
+            4096
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            4096,
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight": {
+          "shape": [
+            2048,
+            4096
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            4096,
+            1
+          ],
+          "device": "cuda"
+        },
+        "bias": {
+          "shape": [
+            2048
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "normalized_shape": [
+          2048
+        ],
+        "eps": 1e-05,
+        "elementwise_affine": true
+      },
+      "reference_signature": "fused_layer_norm_relu_linear(input: 'torch.Tensor', weight: 'torch.Tensor', bias: 'torch.Tensor' = None, normalized_shape: 'torch.Size' = None, eps: 'float' = 1e-05, elementwise_affine: 'bool' = True) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          32,
+          2048
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "softplus_linear",
+      "entry": "softplus_linear",
+      "prompt_index": 44,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/softplus_linear.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/softplus_linear_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "softplus_linear",
+      "family": "fusion",
+      "input_index": 6,
+      "tolerance": "fp32",
+      "description": "For input shape (M,K), weight has shape (N,K), and optional bias has shape (N). Let z[m,n] = sum_k input[m,k] * weight[n,k], plus bias[n] when supplied. Return z[m,n] when z[m,n] > threshold; otherwise return log(1 + exp(beta * z[m,n])) / beta. The threshold comparison uses z before scaling by beta. Return shape (M,N), preserving the reference floating dtype and device.",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1,
+            1024
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight": {
+          "shape": [
+            1024,
+            1024
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "bias": {
+          "shape": [
+            1024
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "beta": 1,
+        "threshold": 20
+      },
+      "reference_signature": "softplus_linear(input, weight, bias=None, beta=1, threshold=20)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1,
+          1024
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "permute_copy",
+      "entry": "permute_copy",
+      "prompt_index": 100,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/permute_copy.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/permute_copy_perf.py",
+      "disposition": "selected",
+      "reason": "Return a fresh allocation; a permuted alias is not the requested copy.",
+      "id": "permute_copy",
+      "family": "indexing_layout",
+      "input_index": 2,
+      "tolerance": "exact",
+      "note": "Return a fresh allocation; a permuted alias is not the requested copy.",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            32,
+            32,
+            32,
+            32
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            32768,
+            1024,
+            32,
+            1
+          ],
+          "device": "cuda"
+        },
+        "dims": [
+          3,
+          2,
+          1,
+          0
+        ]
+      },
+      "reference_signature": "permute_copy(input: 'torch.Tensor', dims: 'list') -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          32,
+          32,
+          32,
+          32
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "ifftshift",
+      "entry": "ifftshift",
+      "prompt_index": 156,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/ifftshift.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/ifftshift_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "ifftshift",
+      "family": "indexing_layout",
+      "input_index": 8,
+      "tolerance": "exact",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": null
+      },
+      "reference_signature": "ifftshift(input, dim=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "grid_sample",
+      "entry": "grid_sample",
+      "prompt_index": 9,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/grid_sample.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/grid_sample_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "grid_sample",
+      "family": "indexing_layout",
+      "input_index": 0,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            16,
+            3,
+            256,
+            256
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            196608,
+            65536,
+            256,
+            1
+          ],
+          "device": "cuda"
+        },
+        "grid": {
+          "shape": [
+            16,
+            128,
+            128,
+            2
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            32768,
+            256,
+            2,
+            1
+          ],
+          "device": "cuda"
+        },
+        "mode": "bilinear",
+        "padding_mode": "zeros",
+        "align_corners": false
+      },
+      "reference_signature": "grid_sample(input, grid, mode='bilinear', padding_mode='zeros', align_corners=False)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          16,
+          3,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "fused_gather_masked_fill",
+      "entry": "fused_gather_masked_fill",
+      "prompt_index": 77,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_gather_masked_fill.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_gather_masked_fill_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_gather_masked_fill",
+      "family": "indexing_layout",
+      "input_index": 5,
+      "tolerance": "exact",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1024,
+            1024
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": 0,
+        "index": {
+          "shape": [
+            1024,
+            1024
+          ],
+          "dtype": "torch.int64",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "mask": {
+          "shape": [
+            1024,
+            1024
+          ],
+          "dtype": "torch.bool",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "value": 0.5,
+        "sparse_grad": false,
+        "out": null
+      },
+      "reference_signature": "fused_gather_masked_fill(input, dim, index, mask, value, *, sparse_grad=False, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "fused_index_select_eq",
+      "entry": "fused_index_select_eq",
+      "prompt_index": 17,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_index_select_eq.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_index_select_eq_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_index_select_eq",
+      "family": "indexing_layout",
+      "input_index": 1,
+      "tolerance": "exact",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            8192,
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            128,
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": 0,
+        "index": {
+          "shape": [
+            1024
+          ],
+          "dtype": "torch.int64",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "other": 0.0,
+        "out": null
+      },
+      "reference_signature": "fused_index_select_eq(input, dim, index, other, *, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1024,
+          128
+        ],
+        "dtype": "torch.bool"
+      }
+    },
+    {
+      "task": "div",
+      "entry": "div",
+      "prompt_index": 1,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/div.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/div_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "div",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "other": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "rounding_mode": null,
+        "out": null
+      },
+      "reference_signature": "div(input, other, rounding_mode=None, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "sigmoid_conv2d",
+      "entry": "sigmoid_conv2d",
+      "prompt_index": 2,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/sigmoid_conv2d.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/sigmoid_conv2d_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "sigmoid_conv2d",
+      "family": "fusion",
+      "input_index": 2,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1,
+            64,
+            64,
+            64
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            262144,
+            4096,
+            64,
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight": {
+          "shape": [
+            128,
+            64,
+            3,
+            3
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            576,
+            9,
+            3,
+            1
+          ],
+          "device": "cuda"
+        },
+        "bias": {
+          "shape": [
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "stride": 1,
+        "padding": 0,
+        "dilation": 1,
+        "groups": 1,
+        "out": null
+      },
+      "reference_signature": "sigmoid_conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1,
+          128,
+          62,
+          62
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "solve_multiple_lu",
+      "entry": "solve_multiple_lu",
+      "prompt_index": 3,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/solve_multiple_lu.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/solve_multiple_lu_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "solve_multiple_lu",
+      "family": "linear_algebra",
+      "input_index": 1,
+      "tolerance": "linear_algebra",
+      "timing": "cuda_event",
+      "invocation": {
+        "A": {
+          "shape": [
+            64,
+            64
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            64,
+            1
+          ],
+          "device": "cuda"
+        },
+        "Bs": {
+          "shape": [
+            64,
+            64
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            64,
+            1
+          ],
+          "device": "cuda"
+        },
+        "pivot": true,
+        "out": null
+      },
+      "reference_signature": "solve_multiple_lu(A, Bs, *, pivot=True, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          64,
+          64
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "relu_sqrt",
+      "entry": "relu_sqrt",
+      "prompt_index": 5,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/relu_sqrt.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/relu_sqrt_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "relu_sqrt",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "inplace": false,
+        "out": null
+      },
+      "reference_signature": "relu_sqrt(input: 'Tensor', inplace: 'bool' = False, out: 'Tensor' = None) -> 'Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "sigmoid_argmax",
+      "entry": "sigmoid_argmax",
+      "prompt_index": 7,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/sigmoid_argmax.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/sigmoid_argmax_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "sigmoid_argmax",
+      "family": "reduction",
+      "input_index": 8,
+      "tolerance": "exact",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1024,
+            1024
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": -1,
+        "keepdim": false
+      },
+      "reference_signature": "sigmoid_argmax(input, dim=None, keepdim=False)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1024
+        ],
+        "dtype": "torch.int64"
+      }
+    },
+    {
+      "task": "sub",
+      "entry": "sub",
+      "prompt_index": 8,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/sub.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/sub_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "sub",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "other": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "alpha": 1,
+        "out": null
+      },
+      "reference_signature": "sub(input: 'torch.Tensor', other: 'torch.Tensor', *, alpha: 'float' = 1, out: 'torch.Tensor' = None) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "i0",
+      "entry": "i0",
+      "prompt_index": 11,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/i0.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/i0_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "i0",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input_tensor": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out": null
+      },
+      "reference_signature": "i0(input_tensor, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "add",
+      "entry": "add",
+      "prompt_index": 15,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/add.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/add_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "add",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "other": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "alpha": 1,
+        "out": null
+      },
+      "reference_signature": "add(input, other, alpha=1, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "fused_silu_layer_norm_conv2d",
+      "entry": "fused_silu_layer_norm_conv2d",
+      "prompt_index": 16,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_silu_layer_norm_conv2d.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_silu_layer_norm_conv2d_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_silu_layer_norm_conv2d",
+      "family": "fusion",
+      "input_index": 1,
+      "tolerance": "fp32",
+      "description": "Apply conv2d to x with conv_weight, conv_bias, conv_stride, conv_padding, conv_dilation and conv_groups. Apply layer normalization independently for each batch element over all remaining output dimensions together (channels and both spatial dimensions), using population variance and ln_eps, without affine weight or bias. Return SiLU of the normalized tensor. The weight argument is accepted but does not participate in this callable's computation.",
+      "timing": "cuda_graph",
+      "invocation": {
+        "x": {
+          "shape": [
+            2,
+            16,
+            64,
+            64
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            65536,
+            4096,
+            64,
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight": {
+          "shape": [
+            64
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "conv_weight": {
+          "shape": [
+            64,
+            16,
+            3,
+            3
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            144,
+            9,
+            3,
+            1
+          ],
+          "device": "cuda"
+        },
+        "conv_bias": {
+          "shape": [
+            64
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "conv_stride": 1,
+        "conv_padding": 0,
+        "conv_dilation": 1,
+        "conv_groups": 1,
+        "ln_eps": 1e-05
+      },
+      "reference_signature": "fused_silu_layer_norm_conv2d(x: 'torch.Tensor', weight: 'torch.Tensor', conv_weight: 'torch.Tensor', conv_bias: 'torch.Tensor' = None, conv_stride: 'int' = 1, conv_padding: 'int' = 0, conv_dilation: 'int' = 1, conv_groups: 'int' = 1, ln_eps: 'float' = 1e-05) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          2,
+          64,
+          62,
+          62
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "fused_lu_solve",
+      "entry": "fused_lu_solve",
+      "prompt_index": 19,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_lu_solve.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_lu_solve_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_lu_solve",
+      "family": "linear_algebra",
+      "input_index": 0,
+      "tolerance": "linear_algebra",
+      "timing": "cuda_event",
+      "description": "Let P, L and U be the partial-pivoting LU factors returned by torch.linalg.lu(A), with A = P L U. Return the solution of (L U) x = b, using b unchanged. The row permutation P is not applied to b in this reference. A is a square floating tensor and b is a vector; return a vector with b's shape and A's dtype and device.",
+      "invocation": {
+        "A": {
+          "shape": [
+            256,
+            256
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            256,
+            1
+          ],
+          "device": "cuda"
+        },
+        "b": {
+          "shape": [
+            256
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        }
+      },
+      "reference_signature": "fused_lu_solve(A: 'torch.Tensor', b: 'torch.Tensor') -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          256
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "normalize_pairwise_distance",
+      "entry": "normalize_pairwise_distance",
+      "prompt_index": 20,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/normalize_pairwise_distance.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/normalize_pairwise_distance_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "normalize_pairwise_distance",
+      "family": "fusion",
+      "input_index": 4,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "x1": {
+          "shape": [
+            16,
+            256,
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            32768,
+            128,
+            1
+          ],
+          "device": "cuda"
+        },
+        "x2": {
+          "shape": [
+            16,
+            256,
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            32768,
+            128,
+            1
+          ],
+          "device": "cuda"
+        },
+        "p_distance": 2.0,
+        "eps_distance": 1e-06,
+        "keepdim": false,
+        "p_norm": 2,
+        "dim_norm": 1,
+        "eps_norm": 1e-12
+      },
+      "reference_signature": "normalize_pairwise_distance(x1, x2, p_distance=2.0, eps_distance=1e-06, keepdim=False, p_norm=2, dim_norm=1, eps_norm=1e-12)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          16,
+          256
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "log_softmax_linear",
+      "entry": "log_softmax_linear",
+      "prompt_index": 22,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/log_softmax_linear.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/log_softmax_linear_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "log_softmax_linear",
+      "family": "fusion",
+      "input_index": 4,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            32,
+            256
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            256,
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight": {
+          "shape": [
+            256,
+            256
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            256,
+            1
+          ],
+          "device": "cuda"
+        },
+        "bias": {
+          "shape": [
+            256
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": -1,
+        "dtype": null
+      },
+      "reference_signature": "log_softmax_linear(input, weight, bias=None, dim=-1, dtype=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          32,
+          256
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "least_squares_qr",
+      "entry": "least_squares_qr",
+      "prompt_index": 24,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/least_squares_qr.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/least_squares_qr_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "least_squares_qr",
+      "family": "linear_algebra",
+      "input_index": 4,
+      "tolerance": "linear_algebra",
+      "timing": "cuda_event",
+      "invocation": {
+        "A": {
+          "shape": [
+            64,
+            16
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            16,
+            1
+          ],
+          "device": "cuda"
+        },
+        "b": {
+          "shape": [
+            64,
+            1
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1,
+            1
+          ],
+          "device": "cuda"
+        },
+        "mode": "reduced",
+        "out": null
+      },
+      "reference_signature": "least_squares_qr(A: 'torch.Tensor', b: 'torch.Tensor', *, mode: 'str' = 'reduced', out: 'torch.Tensor' = None) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          16,
+          1
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "determinant_via_qr",
+      "entry": "determinant_via_qr",
+      "prompt_index": 25,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/determinant_via_qr.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/determinant_via_qr_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "determinant_via_qr",
+      "family": "linear_algebra",
+      "input_index": 1,
+      "tolerance": "linear_algebra",
+      "timing": "cuda_event",
+      "invocation": {
+        "A": {
+          "shape": [
+            32,
+            32
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            32,
+            1
+          ],
+          "device": "cuda"
+        },
+        "mode": "reduced",
+        "out": null
+      },
+      "reference_signature": "determinant_via_qr(A, *, mode='reduced', out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "fused_tile_exp",
+      "entry": "fused_tile_exp",
+      "prompt_index": 26,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_tile_exp.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_tile_exp_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_tile_exp",
+      "family": "fusion",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "dims": [
+          2
+        ],
+        "out": null
+      },
+      "reference_signature": "fused_tile_exp(input, dims, *, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          2,
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "sqrt_tanh",
+      "entry": "sqrt_tanh",
+      "prompt_index": 27,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/sqrt_tanh.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/sqrt_tanh_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "sqrt_tanh",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out": null
+      },
+      "reference_signature": "sqrt_tanh(input, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "silu_batch_norm",
+      "entry": "silu_batch_norm",
+      "prompt_index": 28,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/silu_batch_norm.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/silu_batch_norm_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "silu_batch_norm",
+      "family": "fusion",
+      "input_index": 4,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            16,
+            256,
+            8,
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            262144,
+            1024,
+            128,
+            1
+          ],
+          "device": "cuda"
+        },
+        "running_mean": {
+          "shape": [
+            256
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "running_var": {
+          "shape": [
+            256
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight": {
+          "shape": [
+            256
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "bias": {
+          "shape": [
+            256
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "training": false,
+        "momentum": 0.1,
+        "eps": 1e-05
+      },
+      "reference_signature": "silu_batch_norm(input, running_mean, running_var, weight=None, bias=None, training=False, momentum=0.1, eps=1e-05)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          16,
+          256,
+          8,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "fused_cross_entropy_softmax_layernorm",
+      "entry": "fused_cross_entropy_softmax_layernorm",
+      "prompt_index": 30,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_cross_entropy_softmax_layernorm.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_cross_entropy_softmax_layernorm_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_cross_entropy_softmax_layernorm",
+      "family": "fusion",
+      "input_index": 0,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "logits": {
+          "shape": [
+            256,
+            1024
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "targets": {
+          "shape": [
+            256
+          ],
+          "dtype": "torch.int64",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "normalized_shape": 1024,
+        "weight": null,
+        "ignore_index": -100,
+        "reduction": "mean",
+        "label_smoothing": 0.0,
+        "eps": 1e-05,
+        "out": null
+      },
+      "reference_signature": "fused_cross_entropy_softmax_layernorm(logits, targets, normalized_shape, weight=None, ignore_index=-100, reduction='mean', label_smoothing=0.0, eps=1e-05, *, out=None)",
+      "return_contract": {
+        "type": "tuple",
+        "items": [
+          {
+            "type": "tensor",
+            "shape": [],
+            "dtype": "torch.float32"
+          },
+          {
+            "type": "tensor",
+            "shape": [
+              256,
+              1024
+            ],
+            "dtype": "torch.float32"
+          }
+        ]
+      }
+    },
+    {
+      "task": "fused_embedding_add_tanh",
+      "entry": "fused_embedding_add_tanh",
+      "prompt_index": 34,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_embedding_add_tanh.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_embedding_add_tanh_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_embedding_add_tanh",
+      "family": "fusion",
+      "input_index": 4,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input_indices": {
+          "shape": [
+            16,
+            16
+          ],
+          "dtype": "torch.int64",
+          "stride": [
+            16,
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight": {
+          "shape": [
+            1024,
+            16
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            16,
+            1
+          ],
+          "device": "cuda"
+        },
+        "other": {
+          "shape": [
+            16,
+            16,
+            16
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            256,
+            16,
+            1
+          ],
+          "device": "cuda"
+        },
+        "padding_idx": null,
+        "max_norm": null,
+        "norm_type": 2.0,
+        "scale_grad_by_freq": false,
+        "sparse": false,
+        "out": null
+      },
+      "reference_signature": "fused_embedding_add_tanh(input_indices, weight, other, *, padding_idx=None, max_norm=None, norm_type=2.0, scale_grad_by_freq=False, sparse=False, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          16,
+          16,
+          16
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "fused_cosine_embedding_loss_with_normalization",
+      "entry": "fused_cosine_embedding_loss_with_normalization",
+      "prompt_index": 37,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_cosine_embedding_loss_with_normalization.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_cosine_embedding_loss_with_normalization_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_cosine_embedding_loss_with_normalization",
+      "family": "fusion",
+      "input_index": 0,
+      "tolerance": "fp32",
+      "description": "For each row, let u = input1 / max(norm2(input1), 1e-12), v = input2 / max(norm2(input2), 1e-12), and c = sum(u * v) along dimension 1. The per-row loss is max(1 - c * float32(target), 0). When margin > 0, the per-row loss is max(that loss, margin - c). Return the per-row tensor for reduction='none', its sum for 'sum', or its mean for 'mean'. These equations define the loss for both target=1 and target=-1. The result retains the input device and floating dtype.",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input1": {
+          "shape": [
+            4096,
+            256
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            256,
+            1
+          ],
+          "device": "cuda"
+        },
+        "input2": {
+          "shape": [
+            4096,
+            256
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            256,
+            1
+          ],
+          "device": "cuda"
+        },
+        "target": {
+          "shape": [
+            4096
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "margin": 0,
+        "reduction": "mean"
+      },
+      "reference_signature": "fused_cosine_embedding_loss_with_normalization(input1: 'torch.Tensor', input2: 'torch.Tensor', target: 'torch.Tensor', margin: 'float' = 0, reduction: 'str' = 'mean') -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "sigmoid_batch_norm",
+      "entry": "sigmoid_batch_norm",
+      "prompt_index": 40,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/sigmoid_batch_norm.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/sigmoid_batch_norm_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "sigmoid_batch_norm",
+      "family": "fusion",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            32,
+            32768
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            32768,
+            1
+          ],
+          "device": "cuda"
+        },
+        "running_mean": {
+          "shape": [
+            32768
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "running_var": {
+          "shape": [
+            32768
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight": {
+          "shape": [
+            32768
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "bias": {
+          "shape": [
+            32768
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "training": false,
+        "momentum": 0.1,
+        "eps": 1e-05
+      },
+      "reference_signature": "sigmoid_batch_norm(input, running_mean, running_var, weight=None, bias=None, training=False, momentum=0.1, eps=1e-05)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          32,
+          32768
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "fused_hardsigmoid_batch_norm",
+      "entry": "fused_hardsigmoid_batch_norm",
+      "prompt_index": 41,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_hardsigmoid_batch_norm.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_hardsigmoid_batch_norm_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_hardsigmoid_batch_norm",
+      "family": "fusion",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "x": {
+          "shape": [
+            1,
+            64,
+            128,
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1048576,
+            16384,
+            128,
+            1
+          ],
+          "device": "cuda"
+        },
+        "running_mean": {
+          "shape": [
+            64
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "running_var": {
+          "shape": [
+            64
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight": {
+          "shape": [
+            64
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "bias": {
+          "shape": [
+            64
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "training": false,
+        "momentum": 0.1,
+        "eps": 1e-05,
+        "inplace": false
+      },
+      "reference_signature": "fused_hardsigmoid_batch_norm(x: 'torch.Tensor', running_mean: 'torch.Tensor', running_var: 'torch.Tensor', weight: 'torch.Tensor' = None, bias: 'torch.Tensor' = None, training: 'bool' = False, momentum: 'float' = 0.1, eps: 'float' = 1e-05, inplace: 'bool' = False) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1,
+          64,
+          128,
+          128
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "zeta",
+      "entry": "zeta",
+      "prompt_index": 42,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/zeta.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/zeta_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "zeta",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "description": "Compute the elementwise Hurwitz zeta function with the numerical domain behavior of torch.special.zeta: x=input, q=other, and zeta(x,q)=sum over k>=0 of (k+q)^(-x) on its convergent positive-q domain. The result is positive infinity when x=1 and NaN when x<1. For x>1 and q<=0, a nonpositive integer q gives positive infinity, while a noninteger q with noninteger x gives NaN. Preserve this nonfinite behavior, output shape, dtype and device. If out is supplied, write and return that tensor.",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "other": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out": null
+      },
+      "reference_signature": "zeta(input: 'torch.Tensor', other: 'torch.Tensor', out: 'torch.Tensor' = None) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "fused_svd_reconstruct",
+      "entry": "fused_svd_reconstruct",
+      "prompt_index": 45,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_svd_reconstruct.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_svd_reconstruct_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_svd_reconstruct",
+      "family": "linear_algebra",
+      "input_index": 0,
+      "tolerance": "linear_algebra",
+      "timing": "cuda_event",
+      "invocation": {
+        "A": {
+          "shape": [
+            64,
+            64
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            64,
+            1
+          ],
+          "device": "cuda"
+        }
+      },
+      "reference_signature": "fused_svd_reconstruct(A: 'torch.Tensor') -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          64,
+          64
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "selu",
+      "entry": "selu",
+      "prompt_index": 47,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/selu.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/selu_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "selu",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "description": "Return a fresh tensor with y = scale * (max(x, 0) + min(x, alpha * (exp(x) - 1))) elementwise, where x=input, alpha=1.6732632423543772 and scale=1.0507009873554805. The first argument of the minimum is x. The inplace parameter is accepted but the callable always returns a new tensor without modifying input. Preserve the input shape, dtype and device.",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "inplace": false
+      },
+      "reference_signature": "selu(input: 'torch.Tensor', inplace: 'bool' = False) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "leaky_relu_conv2d",
+      "entry": "leaky_relu_conv2d",
+      "prompt_index": 49,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/leaky_relu_conv2d.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/leaky_relu_conv2d_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "leaky_relu_conv2d",
+      "family": "fusion",
+      "input_index": 4,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1,
+            3,
+            768,
+            768
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1769472,
+            589824,
+            768,
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight": {
+          "shape": [
+            6,
+            3,
+            3,
+            3
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            27,
+            9,
+            3,
+            1
+          ],
+          "device": "cuda"
+        },
+        "bias": {
+          "shape": [
+            6
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "stride": 1,
+        "padding": 0,
+        "dilation": 1,
+        "groups": 1,
+        "negative_slope": 0.01,
+        "inplace": false
+      },
+      "reference_signature": "leaky_relu_conv2d(input: 'Tensor', weight: 'Tensor', bias: 'Tensor' = None, stride: 'int' = 1, padding: 'int' = 0, dilation: 'int' = 1, groups: 'int' = 1, negative_slope: 'float' = 0.01, inplace: 'bool' = False) -> 'Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1,
+          6,
+          766,
+          766
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "sqrt_exp",
+      "entry": "sqrt_exp",
+      "prompt_index": 50,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/sqrt_exp.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/sqrt_exp_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "sqrt_exp",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out": null
+      },
+      "reference_signature": "sqrt_exp(input, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "cos_avg_pool1d",
+      "entry": "cos_avg_pool1d",
+      "prompt_index": 51,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/cos_avg_pool1d.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/cos_avg_pool1d_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "cos_avg_pool1d",
+      "family": "fusion",
+      "input_index": 0,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            32,
+            32,
+            1536
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            49152,
+            1536,
+            1
+          ],
+          "device": "cuda"
+        },
+        "kernel_size": 3,
+        "stride": null,
+        "padding": 0,
+        "ceil_mode": false,
+        "count_include_pad": true
+      },
+      "reference_signature": "cos_avg_pool1d(input: 'torch.Tensor', kernel_size: 'int', stride: 'int' = None, padding: 'int' = 0, ceil_mode: 'bool' = False, count_include_pad: 'bool' = True) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          32,
+          32,
+          512
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "sum_std",
+      "entry": "sum_std",
+      "prompt_index": 52,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/sum_std.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/sum_std_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "sum_std",
+      "family": "reduction",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "description": "Let S be the sum of input along dim, honoring keepdim and dtype; dim=None reduces all input dimensions. Let n be the number of elements in S and m their mean. If n>correction, return the scalar sqrt(sum((S-m)^2)/(n-correction)) with S's dtype and device. If n<=correction, return a scalar zero tensor with S's dtype on the CPU, even when input is on CUDA. The out parameter is accepted but ignored. Preserve this zero and device behavior when there are insufficient degrees of freedom.",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": null,
+        "keepdim": false,
+        "dtype": null,
+        "correction": 1,
+        "out": null
+      },
+      "reference_signature": "sum_std(input, dim=None, keepdim=False, dtype=None, correction=1, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "fused_instance_norm_selu_conv2d",
+      "entry": "fused_instance_norm_selu_conv2d",
+      "prompt_index": 55,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_instance_norm_selu_conv2d.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_instance_norm_selu_conv2d_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_instance_norm_selu_conv2d",
+      "family": "fusion",
+      "input_index": 1,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            2,
+            16,
+            64,
+            64
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            65536,
+            4096,
+            64,
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight": {
+          "shape": [
+            64,
+            16,
+            3,
+            3
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            144,
+            9,
+            3,
+            1
+          ],
+          "device": "cuda"
+        },
+        "bias": {
+          "shape": [
+            64
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "stride": 1,
+        "padding": 0,
+        "dilation": 1,
+        "groups": 1,
+        "num_features": null,
+        "eps": 1e-05,
+        "momentum": 0.1,
+        "affine": false,
+        "track_running_stats": false
+      },
+      "reference_signature": "fused_instance_norm_selu_conv2d(input: 'torch.Tensor', weight: 'torch.Tensor', bias=None, stride=1, padding=0, dilation=1, groups=1, num_features=None, eps=1e-05, momentum=0.1, affine=False, track_running_stats=False) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          2,
+          64,
+          62,
+          62
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "chebyshev_polynomial_t",
+      "entry": "chebyshev_polynomial_t",
+      "prompt_index": 57,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/chebyshev_polynomial_t.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/chebyshev_polynomial_t_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "chebyshev_polynomial_t",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "n": 3,
+        "out": null
+      },
+      "reference_signature": "chebyshev_polynomial_t(input: 'torch.Tensor', n: 'int', out: 'torch.Tensor' = None) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "logit",
+      "entry": "logit",
+      "prompt_index": 58,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/logit.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/logit_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "logit",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "eps": null,
+        "out": null
+      },
+      "reference_signature": "logit(input: 'torch.Tensor', eps: 'float' = None, out: 'torch.Tensor' = None) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "solve_symmetric_ldl",
+      "entry": "solve_symmetric_ldl",
+      "prompt_index": 59,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/solve_symmetric_ldl.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/solve_symmetric_ldl_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "solve_symmetric_ldl",
+      "family": "linear_algebra",
+      "input_index": 2,
+      "tolerance": "linear_algebra",
+      "timing": "cuda_event",
+      "description": "Convert A and b to float32. Let (F,p) be the complete compact factor tensor and signed one-based pivot vector returned by the lower-triangle torch.linalg.ldl_factor convention, honoring hermitian. Define C = F diag(float32(p)) F^T, or F diag(float32(p)) F^H when hermitian=True. Return the solution of C x = b. This definition uses the complete packed tensor F, whose strictly upper triangle is zero in this reference, and uses the pivot integers themselves as the diagonal entries. The fixed profile supplies a real 32x32 SPD A and a 32x1 b; SPD does not imply that this factorization returns the identity pivot permutation. Return float32 on the input device; when out is supplied, copy the result into it and return it.",
+      "invocation": {
+        "A": {
+          "shape": [
+            32,
+            32
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            32,
+            1
+          ],
+          "device": "cuda"
+        },
+        "b": {
+          "shape": [
+            32,
+            1
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1,
+            1
+          ],
+          "device": "cuda"
+        },
+        "hermitian": false,
+        "out": null
+      },
+      "reference_signature": "solve_symmetric_ldl(A, b, hermitian=False, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          32,
+          1
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "exp_sqrt",
+      "entry": "exp_sqrt",
+      "prompt_index": 60,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/exp_sqrt.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/exp_sqrt_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "exp_sqrt",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out": null
+      },
+      "reference_signature": "exp_sqrt(input, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "fused_masked_select_add_gelu",
+      "entry": "fused_masked_select_add_gelu",
+      "prompt_index": 66,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_masked_select_add_gelu.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_masked_select_add_gelu_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_masked_select_add_gelu",
+      "family": "fusion",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_event",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "mask": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.bool",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "other": 0.5,
+        "alpha": 1,
+        "approximate": "none",
+        "out": null
+      },
+      "reference_signature": "fused_masked_select_add_gelu(input, mask, other, *, alpha=1, approximate='none', out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          524236
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "fused_pairwise_distance_adaptive_avg_pool2d",
+      "entry": "fused_pairwise_distance_adaptive_avg_pool2d",
+      "prompt_index": 67,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_pairwise_distance_adaptive_avg_pool2d.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_pairwise_distance_adaptive_avg_pool2d_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_pairwise_distance_adaptive_avg_pool2d",
+      "family": "fusion",
+      "input_index": 1,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "x1": {
+          "shape": [
+            16,
+            3,
+            32,
+            32
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            3072,
+            1024,
+            32,
+            1
+          ],
+          "device": "cuda"
+        },
+        "x2": {
+          "shape": [
+            16,
+            3,
+            32,
+            32
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            3072,
+            1024,
+            32,
+            1
+          ],
+          "device": "cuda"
+        },
+        "output_size": [
+          16,
+          16
+        ],
+        "p": 2.0,
+        "eps": 1e-06,
+        "keepdim": false
+      },
+      "reference_signature": "fused_pairwise_distance_adaptive_avg_pool2d(x1: 'torch.Tensor', x2: 'torch.Tensor', output_size: 'int or tuple', p: 'float' = 2.0, eps: 'float' = 1e-06, keepdim: 'bool' = False) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          16
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "fused_add_mul_groupnorm",
+      "entry": "fused_add_mul_groupnorm",
+      "prompt_index": 70,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_add_mul_groupnorm.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_add_mul_groupnorm_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_add_mul_groupnorm",
+      "family": "fusion",
+      "input_index": 0,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input1": {
+          "shape": [
+            16,
+            64,
+            128,
+            64
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            524288,
+            8192,
+            64,
+            1
+          ],
+          "device": "cuda"
+        },
+        "input2": {
+          "shape": [
+            16,
+            64,
+            128,
+            64
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            524288,
+            8192,
+            64,
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight": {
+          "shape": [
+            64
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "bias": {
+          "shape": [
+            64
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "num_groups": 8,
+        "eps": 1e-05,
+        "out": null
+      },
+      "reference_signature": "fused_add_mul_groupnorm(input1, input2, weight, bias, num_groups, eps=1e-05, *, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          16,
+          64,
+          128,
+          64
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "relu_batch_norm_conv2d",
+      "entry": "relu_batch_norm_conv2d",
+      "prompt_index": 72,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/relu_batch_norm_conv2d.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/relu_batch_norm_conv2d_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "relu_batch_norm_conv2d",
+      "family": "fusion",
+      "input_index": 0,
+      "tolerance": "fp32",
+      "description": "Apply conv2d with the supplied convolution parameters, followed by batch normalization and ReLU. For the fixed invocation with training=False, normalize using the supplied running_mean and running_var and eps, then apply bn_weight and bn_bias. Do not compute batch statistics or update running statistics. Preserve the original output shape and dtype.",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1,
+            64,
+            32,
+            32
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            65536,
+            1024,
+            32,
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight": {
+          "shape": [
+            128,
+            64,
+            3,
+            3
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            576,
+            9,
+            3,
+            1
+          ],
+          "device": "cuda"
+        },
+        "bias": null,
+        "stride": 1,
+        "padding": 1,
+        "dilation": 1,
+        "groups": 1,
+        "running_mean": {
+          "shape": [
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "running_var": {
+          "shape": [
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "bn_weight": {
+          "shape": [
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "bn_bias": {
+          "shape": [
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "training": false,
+        "momentum": 0.1,
+        "eps": 1e-05,
+        "inplace": false
+      },
+      "reference_signature": "relu_batch_norm_conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, running_mean=None, running_var=None, bn_weight=None, bn_bias=None, training=False, momentum=0.1, eps=1e-05, inplace=False)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1,
+          128,
+          32,
+          32
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "normalized_cosine_similarity",
+      "entry": "normalized_cosine_similarity",
+      "prompt_index": 74,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/normalized_cosine_similarity.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/normalized_cosine_similarity_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "normalized_cosine_similarity",
+      "family": "fusion",
+      "input_index": 0,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "x1": {
+          "shape": [
+            64,
+            1024
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "x2": {
+          "shape": [
+            64,
+            1024
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": 1,
+        "eps_similarity": 1e-08,
+        "p_norm": 2,
+        "eps_norm": 1e-12
+      },
+      "reference_signature": "normalized_cosine_similarity(x1: 'Tensor', x2: 'Tensor', dim: 'int' = 1, eps_similarity: 'float' = 1e-08, p_norm: 'float' = 2, eps_norm: 'float' = 1e-12) -> 'Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          64
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "fused_cross_entropy_log_softmax",
+      "entry": "fused_cross_entropy_log_softmax",
+      "prompt_index": 78,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_cross_entropy_log_softmax.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_cross_entropy_log_softmax_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_cross_entropy_log_softmax",
+      "family": "fusion",
+      "input_index": 0,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            4096,
+            128
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            128,
+            1
+          ],
+          "device": "cuda"
+        },
+        "target": {
+          "shape": [
+            4096
+          ],
+          "dtype": "torch.int64",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": 1,
+        "weight": null,
+        "ignore_index": -100,
+        "reduction": "mean",
+        "label_smoothing": 0.0
+      },
+      "reference_signature": "fused_cross_entropy_log_softmax(input: 'torch.Tensor', target: 'torch.Tensor', dim: 'int' = 1, weight: 'torch.Tensor' = None, ignore_index: 'int' = -100, reduction: 'str' = 'mean', label_smoothing: 'float' = 0.0) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "sigmoid_adaptive_avg_pool2d",
+      "entry": "sigmoid_adaptive_avg_pool2d",
+      "prompt_index": 81,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/sigmoid_adaptive_avg_pool2d.py",
+      "reference_line": 6,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/sigmoid_adaptive_avg_pool2d_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "sigmoid_adaptive_avg_pool2d",
+      "family": "fusion",
+      "input_index": 1,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            2,
+            2,
+            16,
+            16
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            512,
+            256,
+            16,
+            1
+          ],
+          "device": "cuda"
+        },
+        "output_size": [
+          1,
+          1
+        ]
+      },
+      "reference_signature": "sigmoid_adaptive_avg_pool2d(input: 'Tensor', output_size: 'Union[int, Tuple[int, int]]') -> 'Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "trunc",
+      "entry": "trunc",
+      "prompt_index": 84,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/trunc.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/trunc_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "trunc",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "exact",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out": null
+      },
+      "reference_signature": "trunc(input: 'torch.Tensor', out: 'torch.Tensor' = None) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "matrix_power_eig",
+      "entry": "matrix_power_eig",
+      "prompt_index": 85,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/matrix_power_eig.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/matrix_power_eig_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "matrix_power_eig",
+      "family": "linear_algebra",
+      "input_index": 0,
+      "tolerance": "linear_algebra",
+      "timing": "cuda_event",
+      "description": "For the supplied real symmetric matrix A, return the spectral power V diag(lambda^k) V^T, where lambda and V are the eigenvalues and orthonormal eigenvectors of the symmetric matrix represented by A's lower triangle. The eigensystem, elementwise powers and reconstruction products use A's floating dtype; the result has A's shape, dtype and device. The fixed profile supplies k=2. If out is supplied, write the result there and return out.",
+      "invocation": {
+        "A": {
+          "shape": [
+            256,
+            256
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            256,
+            1
+          ],
+          "device": "cuda"
+        },
+        "k": 2,
+        "out": null
+      },
+      "reference_signature": "matrix_power_eig(A: 'torch.Tensor', k: 'float', *, out: 'torch.Tensor' = None) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          256,
+          256
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "log_tanh",
+      "entry": "log_tanh",
+      "prompt_index": 86,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/log_tanh.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/log_tanh_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "log_tanh",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_event",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out": null
+      },
+      "reference_signature": "log_tanh(input, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "fused_avg_pool2d_cosine_similarity",
+      "entry": "fused_avg_pool2d_cosine_similarity",
+      "prompt_index": 89,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/fused_avg_pool2d_cosine_similarity.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/fused_avg_pool2d_cosine_similarity_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "fused_avg_pool2d_cosine_similarity",
+      "family": "fusion",
+      "input_index": 1,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "x1": {
+          "shape": [
+            16,
+            64,
+            32,
+            32
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            65536,
+            1024,
+            32,
+            1
+          ],
+          "device": "cuda"
+        },
+        "x2": {
+          "shape": [
+            16,
+            64,
+            32,
+            32
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            65536,
+            1024,
+            32,
+            1
+          ],
+          "device": "cuda"
+        },
+        "kernel_size": 3,
+        "stride": 2,
+        "padding": 1,
+        "eps": 1e-08
+      },
+      "reference_signature": "fused_avg_pool2d_cosine_similarity(x1: 'torch.Tensor', x2: 'torch.Tensor', kernel_size: 'int', stride: 'int' = None, padding: 'int' = 0, eps: 'float' = 1e-08) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          16,
+          1,
+          16,
+          16
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "erfc_sqrt",
+      "entry": "erfc_sqrt",
+      "prompt_index": 91,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/erfc_sqrt.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/erfc_sqrt_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "erfc_sqrt",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        }
+      },
+      "reference_signature": "erfc_sqrt(input: 'torch.Tensor') -> 'Tuple[torch.Tensor, torch.Tensor]'",
+      "return_contract": {
+        "type": "tuple",
+        "items": [
+          {
+            "type": "tensor",
+            "shape": [
+              1048576
+            ],
+            "dtype": "torch.float32"
+          },
+          {
+            "type": "tensor",
+            "shape": [
+              1048576
+            ],
+            "dtype": "torch.float32"
+          }
+        ]
+      }
+    },
+    {
+      "task": "softmax_log",
+      "entry": "softmax_log",
+      "prompt_index": 93,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/softmax_log.py",
+      "reference_line": 5,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/softmax_log_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "softmax_log",
+      "family": "reduction",
+      "input_index": 6,
+      "tolerance": "fp32",
+      "description": "Compute the natural logarithm elementwise, then apply softmax to those log-values along dim. If dtype is not None, cast the input before both operations. Preserve the floating-point behavior of this composition, including its NaN/Inf/zero behavior and its normalization of large finite positive inputs. The formula input / sum(input) is a real-arithmetic identity on positive inputs, not an unconditional floating-point replacement.",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1024,
+            1024
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1024,
+            1
+          ],
+          "device": "cuda"
+        },
+        "dim": -1,
+        "dtype": null
+      },
+      "reference_signature": "softmax_log(input, dim=-1, dtype=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1024,
+          1024
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "batch_norm",
+      "entry": "batch_norm",
+      "prompt_index": 95,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/batch_norm.py",
+      "reference_line": 4,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/batch_norm_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "batch_norm",
+      "family": "fusion",
+      "input_index": 0,
+      "tolerance": "fp16",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            32,
+            32,
+            640,
+            128
+          ],
+          "dtype": "torch.float16",
+          "stride": [
+            2621440,
+            81920,
+            128,
+            1
+          ],
+          "device": "cuda"
+        },
+        "running_mean": {
+          "shape": [
+            32
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "running_var": {
+          "shape": [
+            32
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "weight": {
+          "shape": [
+            32
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "bias": {
+          "shape": [
+            32
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "training": false,
+        "momentum": 0.1,
+        "eps": 1e-05
+      },
+      "reference_signature": "batch_norm(input, running_mean, running_var, weight=None, bias=None, training=False, momentum=0.1, eps=1e-05)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          32,
+          32,
+          640,
+          128
+        ],
+        "dtype": "torch.float16"
+      }
+    },
+    {
+      "task": "gammaln",
+      "entry": "gammaln",
+      "prompt_index": 96,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/gammaln.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/gammaln_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "gammaln",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "fp32",
+      "description": "Compute log(abs(Gamma(input))) elementwise with the numerical domain behavior of torch.special.gammaln. The absolute value applies to Gamma(input), not to input before evaluating Gamma. Preserve the input shape, dtype and device, and the reference behavior at poles and nonfinite inputs. If out is supplied, write and return that tensor.",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.float32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out": null
+      },
+      "reference_signature": "gammaln(input: 'torch.Tensor', out: 'torch.Tensor' = None) -> 'torch.Tensor'",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.float32"
+      }
+    },
+    {
+      "task": "bitwise_and",
+      "entry": "bitwise_and",
+      "prompt_index": 97,
+      "prompt_file": "data/TritonBench_T_comp_alpac_v1.json",
+      "reference_file": "data/TritonBench_T_v1/bitwise_and.py",
+      "reference_line": 3,
+      "profile_file": "performance_metrics/perf_T/golden_metrics/bitwise_and_perf.py",
+      "disposition": "selected",
+      "reason": "Fixed deterministic forward performance profile.",
+      "id": "bitwise_and",
+      "family": "pointwise",
+      "input_index": 8,
+      "tolerance": "exact",
+      "timing": "cuda_graph",
+      "invocation": {
+        "input": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.int32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "other": {
+          "shape": [
+            1048576
+          ],
+          "dtype": "torch.int32",
+          "stride": [
+            1
+          ],
+          "device": "cuda"
+        },
+        "out": null
+      },
+      "reference_signature": "bitwise_and(input, other, out=None)",
+      "return_contract": {
+        "type": "tensor",
+        "shape": [
+          1048576
+        ],
+        "dtype": "torch.int32"
+      }
+    }
+  ],
+  "submission_policy": "one complete program; documentation tools; no benchmark feedback",
+  "timing": "complete operator; per-task paired CUDA Graph or CUDA event timing; compilation/tuning excluded",
+  "isolation": "dedicated Codex state/provider; workspace-only shell, no network; read-only public manual MCP; no reference/history/agents",
+  "instructions": "You are the single programming agent in a GPU kernel experiment. Implement the\ngiven task correctly and efficiently for the supplied, fixed invocation profile.\nThis is forward execution, not autograd. Do not change the task, dtype, output\nstructure, numerical tolerance, or observable out/alias behavior.\nChoose the algorithm for the complete invocation before writing the kernels.\nFor each stage, settle its logical inputs and outputs, independent work and\nrequired sequential dependencies. Assess total computation, intermediate memory\ntraffic and the combined cost of all kernel invocations. Internal kernel\ninterfaces and logical grouping are your choices unless TASK.md constrains them.\n\nPreserve computation stages and intermediate dtypes explicitly required by TASK.md.\nAlgebraic equivalence alone does not preserve a stated floating-point contract.\nA mathematical formula alone does not require separately rounded intermediates.\nUnless TASK.md explicitly fixes intermediate dtypes, evaluation order or observable\nstages, choose an organization satisfying its logical result and accuracy contract.\nThe language's numerical rules govern the program you write and its compilation,\nnot the reference library's internal implementation.\nChoose among documented exact and explicit approximate operations according to\nTASK.md's accuracy and input-domain requirements. Approximate modes must respect\ntheir documented error bounds, range and special-value rules.\n\nRead TASK.md and the provided language materials. For Intent, first call\nintent_manual.read(id=\"doc/dsl/authoring.md\") for the language and host interface\nrules, then read(id=\"doc/programming-model/kernel-and-host.md\") for kernel,\nspecialization and multi-kernel composition semantics. Use the public contracts\nto express the independent logical work and dependencies of your algorithm.\nUse api for declarations and signatures, then read the returned rule IDs\nfor return shapes, dtypes and semantics; api does not infer your program's result\nschema. Consult the manual before writing code; it does not execute programs or\nprovide task answers. Write candidate.py containing\nbuild(context), which returns a callable with the task's original wrapper\nsignature. The evaluator calls build once outside timing, then calls that wrapper\nwith the documented inputs. Multiple kernels and explicit host composition are\nallowed. Torch may allocate empty tensors and perform metadata-only views; GPU\narithmetic, reductions, copies, conversions and library kernels must use the\nassigned language. Do not replace computation with PyTorch, CUDA extensions or\nanother language. Do not infer outputs from the particular input distribution.\nWhen the task contract requires a constant CPU zero tensor, its host construction\nmay use torch.zeros with device=\"cpu\"; this does not permit Torch GPU operations.\nThe editing directory is not a Git repository. Do not run Git commands or try to\ninstall/import the execution environment here; submission invokes that environment.\n\nBefore submitting, review the complete source against TASK.md and the queried\nrules. Check the returned callable and its defaults, the result tree, runtime\nargument order, and the dtype and shape of loop state and helper results.\nCheck that build(context) itself returns the host callable on the supplied\nprofile, rather than only defining or returning from that inner callable.\nCompare the actual source with the algorithm you chose: its kernel calls,\nindependent logical work, intermediate values and sequential dependencies must\nstill be present after translation. Check each ordinary loop against the\ndependency it expresses, including loops introduced while writing the code.\nDo this review on candidate.py; no separate planning or review file is needed.\n\nIntent is a programmable operator/kernel DSL with Triton-like algorithm\norganization: express the algorithm over logical domains instead of hardware\ntiles. Choose stages, intermediate tensors and dependencies using your knowledge\nof Triton algorithms, then retain that structure when expressing it in Intent.\nIntent's type, numerical and effect rules govern the resulting program.\n\nThe source constructs have distinct meanings:\n- Domains, subregions and index relations describe logical members and values.\n  I.parallel declares independent, unordered iterations; it does not specify a\n  GPU program or thread-block count.\n- Ordinary for/while loops declare ordered execution and loop-carried state.\n  An accumulator in the code does not by itself show that the mathematical task\n  requires this order. Reduce, scan and contraction have their own documented\n  dependence and numerical contracts; an ordinary loop does not inherit them.\n- Each @intent.kernel produces one GPU launch. Separate expressions or named\n  intermediates inside it do not create additional launches or independent work.\n  Collectives have no hidden communication between independent GPU programs.\n  A prefix over an entire axis remains global when its consumer uses I.parallel.\n\nChoose logical group counts, domain boundaries and intermediate tensor shapes as\npart of the algorithm. They may be fixed or constexpr and need not appear in\nTASK.md or the external signature. A partition defining logical members remains\nan algorithm choice even when Triton calls it a block. Express independent pieces\nnormally distinguished by program_id through those domains and subregions;\nremoving physical tile parameters must preserve the logical decomposition.\nThe compiler chooses physical tiles, program mapping, thread layouts and provider\nconfiguration within the declared kernels. It does not reconstruct missing stages.\n\nDefine multiple kernels and their host calls explicitly when the chosen algorithm\nhas multiple stages. Allocate cross-kernel tensors in the host callable and pass\nthem as views: Out for outputs, In for read-only inputs, and InOut for reading and\nupdating existing contents. Kernel-local I.buffer state cannot cross kernels.\nHost Python control flow may repeatedly call an already compiled artifact with\nchanging runtime scalars; each call is a launch and does not require recompilation.\n\nFor Intent generation, define ordinary @intent.kernel / @intent.fn programs using\nintent.language. Inside build, use context.compile(\"unique_literal_name\", kernel,\nconstexprs={...}) for each kernel. This invokes the unmodified public\nintent.generate path and materializes its generated Triton. The returned artifact\nsupports explicit-output launch with runtime arguments in kernel declaration\norder: artifact(*declared_runtime_arguments). Keep Out arguments in their declared\npositions, even when scalar inputs follow them. artifact.run(...) allocates and\nreturns Out tensors; omit only Out arguments and preserve the order of all other\nruntime arguments. Constexpr arguments are bound at compilation and omitted here.\nAll compile calls must execute during build, not inside the timed wrapper. Do not\ncall intent.compile/generate or invoke a different compiler yourself. Choose the\nalgorithm's logical partitions using the rules above.\nPython math and Torch calls are host-only; inside Intent kernels and helpers,\nuse documented DSL intrinsics and syntax shorthands. Reduction removes its axes,\nand broadcasting aligns trailing axes; add explicit size-one axes when needed.\nA name read after a runtime if must already be defined or be assigned in every\nnormally continuing branch; implications between conditions do not define it.\n\nFor direct Triton generation, define @triton.jit kernels and an ordinary wrapper;\ncontext need not be used.\n\nThe submission is the complete candidate.py. Use only torch, triton, intent, math, functools,\ntyping, collections, dataclasses and __future__ imports. File/network access,\ndynamic code loading and evaluator introspection are not part of the task.\n\nSubmitting triggers the production paired benchmark: one numerical comparison\nand complete-operator timing using the CUDA Graph or CUDA event path declared in\nTASK.md, including all of your kernels and internal data handling. Compilation,\nJIT, tuning and allocations outside timed execution do not count as operator\nmilliseconds. Do not run independent tests, input sweeps\nor benchmarks. You submit once; there is no benchmark-feedback repair round.\nNo reference implementation or reference output values are available to you. Do not seek other task answers,\npersonal memory, external websites or subagents.\n\nTriton's native autotuner measures the configurations remaining after existing\nlegality pruning. Both arms use the same median-only CUDA Graph\nmeasurement policy. Tuning is evaluator-side execution preparation, not another\nagent submission.\n\nWhen candidate.py is ready, finish with the specified JSON response:\n{\"action\": \"submit\", \"reason\": \"brief implementation or change description\"}.\nDo not claim correctness or speed that has not been measured by the evaluator.\n",
+  "generation_recovery": "Retained the first sqrt submission; remaining tasks generated after fixing the local native launcher path. No benchmark feedback was supplied."
+}
