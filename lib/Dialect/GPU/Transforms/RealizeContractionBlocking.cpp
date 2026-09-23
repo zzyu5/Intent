@@ -5201,7 +5201,7 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
       auto roots = PhysicalProgramAnalysis(kernel).axisRanges(operand, axis);
       auto authority = queryExactLogicalRange(roots);
       if (failed(authority))
-        return contract.emitOpError("scalar contraction projection lost its free-axis range");
+        return contract.emitOpError("contraction projection lost its free-axis range");
       auto mapping = cast<AxisMapAttr>(originalType.getAxisMaps()[axis]);
       unsigned resultAxis = resultAxes[side][axis];
       auto selectedRange = gatheredType ? coordinate.getDefiningOp<MakeRangeOp>()
@@ -5235,7 +5235,7 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
         options.segmentMapping = projectedMapping;
       auto tail = buildRangeTailPredicate(builder, contract.getLoc(), range, *authority);
       if (failed(tail))
-        return contract.emitOpError("scalar contraction projection has no range validity");
+        return contract.emitOpError("contraction projection has no range validity");
       options.segmentTail = *tail;
       if (gatherValidity) {
         auto valid = materializeValidityConjunction(
@@ -5249,7 +5249,7 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
           builder, contract.getLoc(), operand, sourceAxisIdentity(mapping),
           projectedExtent, replay, options);
       if (failed(projected))
-        return contract.emitOpError("cannot project a scalar contraction input");
+        return contract.emitOpError("cannot project a contraction input");
       operand = *projected;
     }
     operands.push_back(operand);
@@ -5276,7 +5276,7 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
   auto accumulator = projectPhysicalValueToSchema(
       builder, contract.getLoc(), contract.getAccumulator(), projectedType);
   if (failed(accumulator))
-    return contract.emitOpError("scalar contraction has no uniform accumulator projection");
+    return contract.emitOpError("contraction has no uniform accumulator projection");
   auto projected = builder.create<ContractOp>(
       contract.getLoc(), projectedType, operands[0], operands[1], *accumulator,
       contract.getLhsReductionAxes(), contract.getRhsReductionAxes(),
