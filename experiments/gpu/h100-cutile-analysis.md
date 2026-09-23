@@ -20,7 +20,7 @@
 
 | 来源 | Intent→Triton 通过 | Intent→cuTile 通过 | Triton 相对 source 加速 | cuTile 相对 source 加速 | 同 DSL cuTile/Triton 耗时比 |
 |---|---:|---:|---:|---:|---:|
-| Triton 库 | 54/54 | 53/54 | 1.125×，52 对 | 1.106×，51 对 | 0.997×，53 对 |
+| Triton 库 | 54/54 | 53/54 | 1.124×，52 对 | 1.106×，51 对 | 0.997×，53 对 |
 | cuTile 库 | 35/35 | 35/35 | 2.599×，35 对 | 2.435×，35 对 | 1.067×，35 对 |
 
 cuTile 库另有 2 条 H100/source 不支持的记录：block-scaled GEMM 的 SM100/E8M0 路径、NVFP4 packing 路径。保留状态，不强行运行，也不计入上表可运行分母。Triton 库有两条 source 时间不可用，但生成程序本次通过，不能把它们的 pass 清空。
@@ -29,8 +29,8 @@ cuTile 库另有 2 条 H100/source 不支持的记录：block-scaled GEMM 的 SM
 
 | 主要长尾 | cuTile/Triton 耗时比 |
 |---|---:|
-| FP8 split-K GEMM | 3.673× |
-| batch norm training | 2.076× |
+| FP8 split-K GEMM | 3.557× |
+| batch norm training | 2.085× |
 | max pooling with indices | 2.038× |
 | attention sink decode | 5.060× |
 | sparse MLA prefill | 3.200× |
@@ -51,17 +51,17 @@ cuTile 来源的 2.435× 是相对这批固定 source 配置的结果，不能�
 
 agent Triton 另有 7 题无提交、11 题程序错误、9 题数值失败。没有重新生成 Triton 对照组。右列是原提交在修复后的编译器/定点配置下的开发结果，不能替代左列的冻结成绩。
 
-cuTile 的 `solve`、`normalize_pairwise_distance` 使用了定向静态配置，已在结果列注明，并保留 [solve 配置](../agent_tritonbench/results/h100-high-refresh-20260923/solve/cutile-tuning.json)和 [normalize 配置](../agent_tritonbench/results/h100-high-refresh-20260923/normalize_pairwise_distance/cutile-tuning.json)。因此 **93/100 不表示默认配置已全量验证到 93/100**。
+cuTile 的 `solve` 仍使用[定向静态配置](../agent_tritonbench/results/h100-high-refresh-20260923/solve/cutile-tuning.json)和 60 秒 native 编译预算。`normalize_pairwise_distance` 已在默认配置下通过，其定向配置已删除。因此 **93/100 仍不表示默认配置已全量验证到 93/100**。
 
 | 当前可比较结果 | 几何加速比 | 配对数 |
 |---|---:|---:|
-| Intent→Triton 对比 reference | 0.930× | 92 |
-| Intent→cuTile 对比 reference | 0.689× | 91 |
-| Intent→Triton 对比 agent Triton | 0.753× | 68 |
-| Intent→cuTile 对比 agent Triton | 0.568× | 68 |
-| Intent→cuTile 对比同 DSL Triton | 0.738× | 91 |
+| Intent→Triton 对比 reference | 0.932× | 92 |
+| Intent→cuTile 对比 reference | 0.704× | 91 |
+| Intent→Triton 对比 agent Triton | 0.754× | 68 |
+| Intent→cuTile 对比 agent Triton | 0.584× | 68 |
+| Intent→cuTile 对比同 DSL Triton | 0.753× | 91 |
 
-最后一行等价于 cuTile 耗时约为 Triton 的 **1.355 倍**。这些数值不能支持“这轮 Intent 整体性能已超过 agent Triton”。
+最后一行等价于 cuTile 耗时约为 Triton 的 **1.329 倍**。这些数值不能支持“这轮 Intent 整体性能已超过 agent Triton”。
 
 性能聚合排除 `sum_std` 的 CPU 常量结果和 `fused_svd_reconstruct` 的复制捷径；正确率仍以 100 题为分母。agent Triton 的 `tensordot_rsqrt` 使用 TF32，不进入同精度 agent 配对。
 
@@ -80,6 +80,8 @@ cuTile 从 77 增加到 93 个 pass 后，几何加速比反而降低，主要�
 | reverse suffix | 支持合法隐式 domain end 的反向后缀证明；least-squares QR 两个后端通过。 |
 | cuTile 操作缺口 | 补动态均匀行提取、重复 Cartesian 坐标的显式投影、i64 常量类型，以及 erfc/i0 lowering。log-softmax-linear、masked-select、erfc、i0 原用例通过。 |
 | subregion 容量过大 | 容量分析保留常量与循环下界，避免把 k+1 到 257 的最多 256 个成员补齐到 512；solve 尾部从 256×512 收紧为 256×256。静态归约候选也按容量去重。 |
+| 写回分块与默认候选过大 | 将已有归约范围约束复用于逐点写回；全覆盖处理保留 `min(parameter, shape)` 的既有分块。cuTile 依据已导出的维度绑定，在合法候选中保留填充最少的 pointwise ownership 组合。normalize 默认配置 **Triton 0.009136、cuTile 0.009336 ms，均 pass**，reference 0.016984 ms；cuTile 比原定向结果 0.063112 ms 快 6.76 倍。 |
+| 资源估算与索引证明丢失 | 广播、splat、reshape 不再独立按展开后的 tile 计寄存器；参考 Triton 的 [view lowering](../../../ref/triton/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp)。cuTile 保留复合最小值和 atomic 活跃坐标边界，使已有运行时范围检查可以选择 32 位内部数组索引；不改变外部 ABI、逻辑 index 类型或数值精度。 |
 
 这些改动没有自动增加 kernel，没有修改候选算法，也没有新增另一套 form/plan。主要实现位于 [GPU shared passes](../../lib/Dialect/GPU/Transforms/)、[Triton leaf](../../lib/Target/Triton/)、[cuTile leaf](../../lib/Target/CuTile/)。
 
@@ -99,6 +101,8 @@ cuTile 从 77 增加到 93 个 pass 后，几何加速比反而降低，主要�
 
 准备与 native 编译在不同工作进程间并发；实际 GPU 初始化、调优和计时共用锁，释放锁前同步 CUDA。不是用外层 flock 把整个实验串行化。
 
+normalize 最终定点准备约 65.5 秒，两个 kernel 分别保留 24、45 个候选；后者有 3 个 native 候选超过 15 秒，其他候选及最终程序通过。这里解决的是整题超时，未声称所有 native 配置均可编译，也未以增加全局超时来取得 pass。
+
 ## 剩余失败的边界
 
 两个 Intent target 共同剩下 6 题：
@@ -110,7 +114,7 @@ cuTile 从 77 增加到 93 个 pass 后，几何加速比反而降低，主要�
 - `solve_symmetric_ldl`：作者只实现 1×1 pivot，未覆盖 reference 的 2×2 pivot 行为。
 - `matrix_power_eig`：直接乘法与 reference 的 eig/reconstruction 路径在本例 f32 下超出既定容差。
 
-**cuTile 另有 solve_multiple_lu 的数值错误，尚未解决。** 同一 canonical input 的两个 shared IR 在排除 target/config 属性后相同。固定为与 Triton 相同的 64 分块、分别使用 native-no-TMA 和 gather、以及 native O0，均出现相同错误。目前已排除这些单一原因，但尚未唯一定位到某个 cuTile primitive 或 serializer 行为。
+**cuTile 另有 solve_multiple_lu 的数值错误，尚未解决。** 同一 canonical input 的两个 shared IR 在排除 target/config 属性后相同。原 benchmark 的 workspace 观察进一步确认：首行和前两次 pivot 一致，但第一次 panel 更新已错；第二行数值恰好符合消元系数再次除以主元的结果。cuTile frontend IR 中只有一次 load/div，随后将同一值用于 store 和 broadcast/FMA，token 链完整；尚未证明是哪条 native 变换改变了该值。64 分块、不同 access、native O0、32 位数组索引，以及外部隔离的 CUDA 13.4.92 控制均未解决。正式环境仍保持 cuTile 1.5 / CUDA 13.3，没有改候选、容差或补猜测性的 barrier。
 
 不能因为 Triton 有 debug_barrier 就给 cuTile 增加一套 CTA barrier。cuTile 的 block 内通信由下层处理，Tile IR 的 token order 能建立操作之间的顺序；这里已有同 workspace 的 alias/token 关系。[cuTile 执行模型](https://docs.nvidia.com/cuda/cutile-python/execution.html)、[Tile IR 内存模型](https://docs.nvidia.com/cuda/tile-ir/latest/sections/memory_model.html)支持这一职责边界，不能无证据归因为“缺同步”。
 
@@ -123,10 +127,12 @@ cuTile 从 77 增加到 93 个 pass 后，几何加速比反而降低，主要�
 - 一部分确实来自 lowering：整矩阵保留、分块参数遗漏、host 绑定成本与数学 primitive 缺失，本轮已有真实修复收益。
 - `num_worker_warps=1` 在本实现中表示交给下层推断；cuTile 没有同名 `num_stages` 也不意味着没有 pipeline。Triton 源码存在 descriptor 分支不证明 winner 使用了 TMA。后续归因必须结合实际配置和 native 产物。
 
-下一步保持定点推进：先定位 cuTile LU 数值问题，并让两项定向静态配置的经验进入通用候选选择；再按上表的性能长尾检查真实访存、数据搬运、归约和矩阵执行。新生成程序的算法组织问题另行归类，不改写本轮提交来追分。尚不能宣称全部正确性问题和性能目标已完成。
+FP8 当前为 Triton **2.048984 ms**、cuTile **7.288080 ms**；BN cuTile **0.092016 ms**，与同机修复前 0.092672 ms 接近。本次边界/资源估算修复没有显著改善这两个长尾。FP8 winner 的 Nsight Compute 显示 L1/TEX 吞吐 66.99%、DRAM 吞吐 3.99%、Tensor pipe 活跃 4.07%；170 registers/thread、约 106.5 KB shared/block 将驻留限制在 2 blocks，achieved occupancy 12.45%。当前证据支持片上访存压力和低占用，不支持“缺少 MMA”或“DRAM 带宽耗尽”；原子活动 23.06% 也不足以单独认定原子是主因。Profiler 时间不写入 benchmark 表。
+
+下一步保持定点推进：继续定位 cuTile LU，解决 solve 对定向配置的依赖，并检查静态 K 的物理分块与上述性能长尾。新生成程序的算法组织问题另行归类，不改写本轮提交来追分。尚不能宣称全部正确性问题和性能目标已完成。
 
 ## 执行入口
 
 生产库复用 `python -m experiments.gpu`，分别选择 provider=triton/cutile 和 target=triton/cutile；`--source-results` 与 `--output` 指向对应既有宽表，使用 `--jobs` 并发准备、`--gpu-lock` 串行 GPU 窗口。
 
-已有 agent 提交复测使用 `python -m experiments.agent_tritonbench.benchmark`，传入原 `--program`、`--reference-ms`、`--timing` 和同一 `suite-100.json`。不调用包含生成步骤的主入口。solve 的 cuTile 定点命令额外传 `--cutile-compiler-timeout 60 --tuning-config .../solve/cutile-tuning.json`；normalize 使用其对应配置文件。其余编译缓存、中间 IR、native 源码和诊断观测均在仓库外。
+已有 agent 提交复测使用 `python -m experiments.agent_tritonbench.benchmark`，传入原 `--program`、`--reference-ms`、`--timing` 和同一 `suite-100.json`。不调用包含生成步骤的主入口。solve 的 cuTile 定点命令额外传 `--cutile-compiler-timeout 60 --tuning-config .../solve/cutile-tuning.json`；normalize 不再传定向配置。其余编译缓存、中间 IR、native 源码和诊断观测均在仓库外。
