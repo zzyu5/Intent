@@ -330,6 +330,7 @@ def evaluate(
     before_benchmark: Callable[[], None] | None = None,
     source_timing_error: Callable[[Exception], bool] | None = None,
     benchmark_time_budget_ms: float | None = None,
+    source_time_ms: float | None = None,
 ) -> tuple[float | None, float | None]:
     run_only = comparison.status == "run_only"
     if run_only:
@@ -396,20 +397,23 @@ def evaluate(
         generated_first = _benchmark_launch(comparison.generated, comparison, 25, benchmark_time_budget_ms)
     except Exception as error:
         raise PipelineStageError("generated_benchmark", str(error)) from error
-    for stage, warmup in (("source_benchmark", 25), ("source_reverse_benchmark", 0)):
-        report_stage(stage)
-        try:
-            source_ms = _benchmark_launch(comparison.source, comparison, warmup, benchmark_time_budget_ms)
-        except Exception as error:
-            if source_timing_error is not None and source_timing_error(error):
-                # The candidate window and numerical comparison already finished.
-                # Do not reuse a stream after an unsupported reference capture.
-                return generated_first, None
-            raise PipelineStageError(stage, str(error)) from error
-        if warmup:
-            source_first = source_ms
-        else:
-            source_second = source_ms
+    if source_time_ms is not None:
+        source_first = source_second = source_time_ms
+    else:
+        for stage, warmup in (("source_benchmark", 25), ("source_reverse_benchmark", 0)):
+            report_stage(stage)
+            try:
+                source_ms = _benchmark_launch(comparison.source, comparison, warmup, benchmark_time_budget_ms)
+            except Exception as error:
+                if source_timing_error is not None and source_timing_error(error):
+                    # The candidate window and numerical comparison already finished.
+                    # Do not reuse a stream after an unsupported reference capture.
+                    return generated_first, None
+                raise PipelineStageError(stage, str(error)) from error
+            if warmup:
+                source_first = source_ms
+            else:
+                source_second = source_ms
     report_stage("generated_reverse_benchmark")
     try:
         generated_second = _benchmark_launch(comparison.generated, comparison, 0, benchmark_time_budget_ms)

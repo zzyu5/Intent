@@ -79,7 +79,8 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
     timing = arguments.timing or task.get("timing", suite["timing"])
     cuda_graph = timing == "cuda_graph"
     result = {"status": "pending", "candidate_ms": None, "reference_ms": None, "ratio": None,
-              "target": arguments.target,
+              "target": arguments.target, "program": str(arguments.program),
+              "reference_time_reused": arguments.reference_ms is not None,
               "reference_timing_note": None,
               "timing": timing, "tolerance": suite["tolerances"][task["tolerance"]]}
     def source_timing_error(error: Exception) -> bool:
@@ -147,7 +148,8 @@ def run(arguments, *, suite_path: Path = SUITE_PATH) -> dict:
                 source = _observe(reference_call, reference_function, task=arguments.task, enforce=False)
                 measured, anchor = evaluate(PreparedComparison(candidate, source, tolerance(task, suite), cuda_graph=cuda_graph),
                                             source_timing_error=source_timing_error,
-                                            benchmark_time_budget_ms=200)
+                                            benchmark_time_budget_ms=200,
+                                            source_time_ms=arguments.reference_ms)
             result.update(status="pass", candidate_ms=measured, reference_ms=anchor,
                           ratio=measured / anchor if anchor is not None else None)
     except Exception as error:
@@ -204,11 +206,15 @@ def main() -> None:
                         help="Fixed task and numerical configuration used by generation")
     parser.add_argument("--timing", choices=("cuda_graph", "cuda_event"),
                         help="Override the task's paired candidate/reference timing path")
+    parser.add_argument("--reference-ms", type=float,
+                        help="Reuse this workload's existing reference time; still check its output")
     arguments = parser.parse_args()
     if arguments.language != "intent" and arguments.target != "triton":
         parser.error("only Intent submissions can select a different backend")
     if arguments.cutile_compiler_timeout <= 0:
         parser.error("--cutile-compiler-timeout must be positive")
+    if arguments.reference_ms is not None and not 0 < arguments.reference_ms < float("inf"):
+        parser.error("--reference-ms must be finite and positive")
     with redirect_stdout(sys.stderr):
         if arguments.phase_fd is None:
             result = run(arguments, suite_path=arguments.suite)

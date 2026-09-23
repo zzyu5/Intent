@@ -98,6 +98,7 @@ def _write_stage(path: Path, stage: str) -> None:
 def _run_entry(
     provider: str, compiler: str, entry, compiler_timeout: int,
     tuning_config: Path | None, before_benchmark, *, target: str,
+    source_time_ms: float | None = None,
 ) -> ResultRow:
     report_stage("device_setup")
     if provider == "mojo":
@@ -158,6 +159,7 @@ def _run_entry(
     try:
         generated_p50, source_p50 = evaluate(
             comparison, before_benchmark=before_benchmark,
+            source_time_ms=source_time_ms,
         )
     except NumericalComparisonError as error:
         print(f"{provider}:{entry.kernel}: numerical_failed: {error}")

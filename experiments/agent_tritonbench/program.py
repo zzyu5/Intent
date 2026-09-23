@@ -96,7 +96,6 @@ class ProgramContext:
             export_kernel(kernel, (signature,), io.BytesIO(), gpu_code=gpu_code, output_format="cubin")
 
         def compile_search(configs, stream, grid_fn, kernel, args_fn, hints_fn=None, **kwargs):
-            first = None
             last_error = None
             for config in configs:
                 candidate = kernel.replace_hints(**(hints_fn(config) if hints_fn else {}))
@@ -107,13 +106,11 @@ class ProgramContext:
                     self.precompile_failures.append({"kernel": kernel._pyfunc.__name__,
                                                      "config": str(config), "error": str(error)})
                     continue
-                if first is None:
-                    first = config
-            if first is None:
-                raise RuntimeError("no cuTile configuration compiled for the current device") from last_error
-            # The compiler-only invocation never runs this configuration or
-            # publishes a winner. Native tuning runs after restoring the cache.
-            return SimpleNamespace(best=SimpleNamespace(config=first))
+                # Export does not populate the launch dispatcher's in-process
+                # cache. Establish compile support once; the native tuner owns
+                # the full search after acquiring the GPU lock.
+                return SimpleNamespace(best=SimpleNamespace(config=config))
+            raise RuntimeError("no cuTile configuration compiled for the current device") from last_error
 
         class CompilationState:
             def __init__(self, views, writable):
