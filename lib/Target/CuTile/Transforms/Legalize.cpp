@@ -499,6 +499,7 @@ FailureOr<Value> scalarFill(Operation *owner, Value fill) {
 struct NativeTileAxisPlan {
   SmallVector<unsigned> computationAxes;
   Value scalarIndex;
+  Value modulus;
   SmallVector<std::pair<gpu::MakeRangeOp, int64_t>> ranges;
   SmallVector<std::pair<Value, int64_t>> offsets;
   bool originInBounds = false;
@@ -1258,6 +1259,13 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
     Value coordinate = resourceCoordinates[resourceAxis];
     Value scalar = uniformScalarFill(coordinate);
     if (!scalar) {
+      if (auto remainder = coordinate.getDefiningOp<gpu::BinaryOp>();
+          remainder && remainder.getOperatorKind() == BinaryOperator::Remainder) {
+        axis.modulus = uniformScalarFill(remainder.getRhs());
+        if (!axis.modulus || !axis.modulus.getType().isIndex())
+          return failure();
+        coordinate = remainder.getLhs();
+      }
       if (!collectTileCoordinates(coordinate, axis) || axis.ranges.empty())
         return failure();
       llvm::stable_sort(axis.ranges, [](auto lhs, auto rhs) {
@@ -1276,7 +1284,8 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
       }
       axis.originInBounds =
           llvm::is_contained(accessBounds.assumedAxes, resourceAxis);
-      if (axis.ranges.size() == 1 && axis.ranges.front().second == 1 &&
+      if (!axis.modulus && axis.ranges.size() == 1 &&
+          axis.ranges.front().second == 1 &&
           llvm::all_of(axis.offsets, [](auto term) { return term.second == 1; })) {
         SmallVector<Value> offsets;
         for (auto term : axis.offsets)
@@ -1422,6 +1431,10 @@ FailureOr<Value> materializeTileOriginGuard(
     Value origin = materializeTileOrigin(builder, owner->getLoc(), axisPlan);
     if (!origin)
       return failure();
+    if (axisPlan.modulus)
+      origin = builder.create<gpu::BinaryOp>(
+          owner->getLoc(), builder.getIndexType(), origin, axisPlan.modulus,
+          BinaryOperator::Remainder);
     if (!zero)
       zero = builder.create<arith::ConstantIndexOp>(owner->getLoc(), 0);
     Value extent = builder.create<gpu::DimOp>(
@@ -1550,6 +1563,37 @@ materializeTileIndices(OpBuilder &builder, Operation *owner,
             owner->getLoc(), builder.getIndexType(), inner, range.getExtent(),
             BinaryOperator::Multiply);
       }
+    }
+    if (axis.modulus) {
+      if (!isKnownPositive(extent))
+        return failure();
+      Location location = owner->getLoc();
+      Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+      Value one = builder.create<arith::ConstantIndexOp>(location, 1);
+      Value maximum = builder.create<arith::ConstantIndexOp>(
+          location, std::numeric_limits<int64_t>::max());
+      require(builder.create<gpu::CompareOp>(
+          location, builder.getI1Type(), axis.modulus, zero, ComparePredicate::Gt));
+      require(builder.create<gpu::CompareOp>(
+          location, builder.getI1Type(), start, zero, ComparePredicate::Ge));
+      Value available = builder.create<gpu::BinaryOp>(
+          location, builder.getIndexType(), maximum, start,
+          BinaryOperator::Subtract);
+      Value lastOffset = builder.create<gpu::BinaryOp>(
+          location, builder.getIndexType(), extent, one,
+          BinaryOperator::Subtract);
+      require(builder.create<gpu::CompareOp>(
+          location, builder.getI1Type(), available, lastOffset,
+          ComparePredicate::Ge));
+      start = builder.create<gpu::BinaryOp>(
+          location, builder.getIndexType(), start, axis.modulus,
+          BinaryOperator::Remainder);
+      Value remaining = builder.create<gpu::BinaryOp>(
+          location, builder.getIndexType(), axis.modulus, start,
+          BinaryOperator::Subtract);
+      // A tile that crosses the modulo boundary keeps its original gather.
+      require(builder.create<gpu::CompareOp>(
+          location, builder.getI1Type(), remaining, extent, ComparePredicate::Ge));
     }
     FailureOr<Value> index = tileIndex(builder, owner->getLoc(), start,
                                        extent);
