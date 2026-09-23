@@ -5,6 +5,7 @@ from contextlib import nullcontext
 import csv
 from dataclasses import dataclass, replace
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -278,6 +279,8 @@ def _run_batch(arguments, indexes, publish) -> None:
                 ]
                 if arguments.tuning_config is not None:
                     command.extend(("--tuning-config", str(arguments.tuning_config)))
+                if arguments.source_results is not None:
+                    command.extend(("--source-results", str(arguments.source_results)))
                 process = subprocess.Popen(
                     command, stdin=subprocess.PIPE, text=True, start_new_session=True,
                     # Torch preparation and Mojo execution use separate pools
@@ -347,6 +350,8 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
                         help="maximum concurrent preparation workers; measurement is isolated")
     parser.add_argument("--tuning-config", type=Path,
                         help="compile-time JSON profile override")
+    parser.add_argument("--source-results", type=Path,
+                        help="reuse source_p50_ms from an existing result CSV; still compare outputs")
     parser.add_argument("--worker-timeout", type=int, default=WORKER_TIMEOUT_SECONDS,
                         help="limit for preparation or measurement; scheduling wait is excluded")
     parser.add_argument("--cutile-compiler-timeout", type=int, default=15,
@@ -363,6 +368,20 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
         parser.error("--jobs must be positive")
     if arguments.tuning_config is not None:
         arguments.tuning_config = arguments.tuning_config.resolve(strict=True)
+    source_rows = None
+    if arguments.source_results is not None:
+        arguments.source_results = arguments.source_results.resolve(strict=True)
+        source_rows = _read_rows(arguments.source_results)
+
+    def saved_source_time(entry):
+        if source_rows is None:
+            return None
+        matches = [row.source_p50_ms for row in source_rows
+                   if (row.kernel, row.case) == (entry.kernel, entry.case)]
+        if (len(matches) != 1 or matches[0] is None or
+                not math.isfinite(matches[0]) or matches[0] <= 0):
+            parser.error(f"source results need one positive finite time for {entry.kernel}:{entry.case}")
+        return matches[0]
 
     provider = arguments.provider
     arguments.target = arguments.target or provider
@@ -399,6 +418,7 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
                     arguments.tuning_config,
                     _wait_for_benchmark if arguments.wait_for_benchmark else None,
                     target=arguments.target,
+                    source_time_ms=saved_source_time(entry),
                 )])
         return
 
@@ -423,6 +443,8 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
         for index, entry in enumerate(BY_PROVIDER[provider])
         if not selected or entry.kernel in selected
     ]
+    for entry in entries:
+        saved_source_time(entry)
     for offset in range(0, len(selected_indexes), arguments.jobs):
         _run_batch(arguments, selected_indexes[offset:offset + arguments.jobs], publish)
 
