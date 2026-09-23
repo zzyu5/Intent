@@ -1,2 +1,0 @@
-kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
-relu,8192x4096-fp16,0.087776,0.086904,1.010034,pass,同算法；NaN 传播方式不同

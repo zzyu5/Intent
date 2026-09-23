@@ -1,2 +1,0 @@
-kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
-scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,1.431456,2.536656,0.564308,pass,

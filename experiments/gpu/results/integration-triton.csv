@@ -1,2 +1,0 @@
-kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
-fused_softmax,8192x8192-fp16,0.173824,0.187592,0.926607,pass,
