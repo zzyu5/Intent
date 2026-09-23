@@ -90,7 +90,9 @@ FailureOr<Value> materializeRetainedSlice(
       target.getShape(), target.getAxisMaps(), target.getValidity(), target.getOwner());
   FailureOr<Value> indices = projectPhysicalValueToSchema(builder, location, ordinal, indexType);
   if (failed(indices))
-    return kernel.emitError("retained slice has no index projection");
+    return kernel.emitError("retained slice has no index projection")
+           << "; coordinate=" << coordinates << "; target=" << indexType
+           << "; source=" << original;
   auto predicate = FragmentType::get(target.getContext(), builder.getI1Type(),
       target.getShape(), target.getAxisMaps(), target.getValidity(), target.getOwner());
   Value zero = builder.create<arith::ConstantIndexOp>(location, 0);

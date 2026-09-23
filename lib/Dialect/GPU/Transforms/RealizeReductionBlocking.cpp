@@ -2666,6 +2666,19 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
     accesses.push_back(std::move(roots));
     traversalRanges.push_back(traversal.authority);
   }
+  // Preserve reads before creating the chunk traversal. Full-coverage
+  // materialization retargets the original coordinate domain; doing it inside
+  // the loop would also retarget the freshly created chunk coordinates.
+  for (const auto &component : accesses)
+    for (RootAccess access : component)
+      if (!canReplayReadAt(access.load, reduce) &&
+          !PhysicalProgramAnalysis(kernel)
+               .axisRealization(access.load.getResult(), access.fragmentAxis)
+               .physicalized &&
+          failed(realizeFullCoverageDimension(
+              kernel, access.load.getResult(), access.fragmentAxis)))
+        return reduce.emitOpError(
+            "reduction could not materialize its retained source read");
   for (Type result : reduce.getResultTypes())
     if (auto fragment = dyn_cast<FragmentType>(result))
       if (llvm::any_of(fragment.getShape(), [](Attribute extent) {
@@ -3061,7 +3074,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
             } else {
               FailureOr<Value> retained = materializeRetainedSlice(
                   nested, nestedLocation, load.getResult(), access.fragmentAxis,
-                  chunkExtent, coordinate, reduce);
+                  chunkExtent, coordinates[access.coordinateIndex], reduce);
               if (failed(retained)) {
                 bodyFailed = true;
                 bodyFailure = "could not preserve the original reduction read";

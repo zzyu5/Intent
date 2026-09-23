@@ -4873,7 +4873,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         continue;
       }
       for (StoreOp store : currentStores) {
-        PhysicalProgramAnalysis analysis(kernel);
         PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
                                   range.getDerived()};
         SmallVector<int64_t> valueDimensions;
@@ -4882,6 +4881,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         for (int64_t dimension : valueDimensions) {
           if (!llvm::is_contained(*traversalDimensions, dimension))
             continue;
+          PhysicalProgramAnalysis analysis(kernel);
           PhysicalReplayFact replay = analysis.replayability(
               store.getValue(), source, PhysicalReplayScope::ValueGraph,
               /*allowAccesses=*/true, store.getOperation(), dimension);
@@ -4929,15 +4929,18 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                                  store.getCoordinates()[axis.index()]);
                     });
               });
-          if (clobbersLaterChunk)
+          if (clobbersLaterChunk) {
             for (PhysicalAxisProjection projection :
                  queryFragmentAxes(store.getValue().getType(), source))
               if (projection.dimensionId == dimension &&
                   failed(requireFullDimensionCoverage(
                       kernel, store.getValue(), projection.fragmentAxis)))
                 return failure();
+            useReplayTraversal = false;
+            continue;
+          }
           useReplayTraversal &=
-              replay.isReplayable() && !materializedFork && !retainedContraction && !clobbersLaterChunk &&
+              replay.isReplayable() && !materializedFork && !retainedContraction &&
               (effectLocal == effectLocalOrigins.end() ||
                !replay.crossesStructuredProgram);
         }
@@ -6018,6 +6021,11 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
          ((hasPointwiseOwnership(range) &&
            !internalTraversalRanges.contains(range.getOperation())) ||
           reuseTraversalRanges.contains(range.getOperation())));
+    if (requiresBlockingParameter && succeeded(parameter) &&
+        (parameter->getParameter().getCategory() ==
+             static_cast<uint32_t>(ParameterCategory::Coverage) ||
+         (*parameter)->hasAttr(coverageDimensionAttr)))
+      parameter = failure();
     if (failed(parameter) && requiresBlockingParameter) {
       const bool worksetRange = range->hasAttr(worksetCoordinateRangeAttr);
       Value logicalExtentValue = range.getExtent();

@@ -50,7 +50,7 @@ LogicalResult scalarizeElementwiseCallback(Region &source, Region &target) {
       if (operand.getParentBlock() != &body)
         return nested.emitOpError(
             "native collective callback cannot capture enclosing values");
-    if (!isa<arith::ConstantOp, SplatOp, BroadcastOp, UnaryOp, BinaryOp,
+    if (!isa<arith::ConstantOp, SplatOp, BroadcastOp, ReshapeOp, UnaryOp, BinaryOp,
              CompareOp, SelectOp, CastOp, BitcastOp, MakeRecordOp, ExtractOp,
              YieldOp>(nested))
       return nested.emitOpError(
@@ -71,6 +71,11 @@ LogicalResult scalarizeElementwiseCallback(Region &source, Region &target) {
               "non-identity fragment broadcast in a collective requires prior lane-wise legalization");
       }
     }
+    if (auto reshape = dyn_cast<ReshapeOp>(nested))
+      if (cast<FragmentType>(reshape.getValue().getType()).getShape() !=
+          cast<FragmentType>(reshape.getResult().getType()).getShape())
+        return reshape.emitOpError(
+            "non-identity fragment reshape in a collective requires prior lane-wise legalization");
   }
 
   Block *scalarBody = new Block();
@@ -83,7 +88,7 @@ LogicalResult scalarizeElementwiseCallback(Region &source, Region &target) {
   OpBuilder builder(body.getTerminator()->getContext());
   builder.setInsertionPointToEnd(scalarBody);
   for (Operation &nested : body) {
-    if (isa<SplatOp, BroadcastOp>(nested)) {
+    if (isa<SplatOp, BroadcastOp, ReshapeOp>(nested)) {
       mapping.map(nested.getResult(0), mapping.lookup(nested.getOperand(0)));
       continue;
     }
@@ -1269,7 +1274,8 @@ static WalkResult alignReductionResultRelation(Operation *operation) {
       SmallVector<Value> related;
       llvm::copy_if(sources, std::back_inserter(related), [&](Value other) {
         auto type = dyn_cast<FragmentType>(other.getType());
-        return type && type.getAxisMaps() == sourceType.getAxisMaps();
+        return type && type.getShape().size() == sourceType.getShape().size() &&
+               queryAxisProjection(type, sourceType).isExact();
       });
       FailureOr<FragmentType> refined =
           refinePhysicalSchema(kernel, sourceType, related);
@@ -4524,12 +4530,8 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
       valid = builder.create<BinaryOp>(store.getLoc(), predicate, existing,
                                        valid, BinaryOperator::LogicalAnd);
     }
-    auto replacement = builder.create<StoreOp>(
-        store.getLoc(), store.getResource(), store.getCoordinates(),
-        *value, valid, store.getSourceAxes());
-    if (Attribute origin = store->getAttr(originAttr))
-      replacement->setAttr(originAttr, origin);
-    store.erase();
+    store.getValueMutable().assign(*value);
+    store.getValidMutable().assign(ValueRange{valid});
   }
 
   for (ScatterReduceOp scatter : scatters) {

@@ -349,6 +349,11 @@ bool upperBoundWithinResource(Value value, Value resource, unsigned axis) {
   if (matchesResourceExtent(value, resource, axis))
     return true;
   std::optional<int64_t> bound = integerConstant(value);
+  PhysicalExprAttr provenBound =
+      queryNonNegativeIndexUpperBound(stripScalarIdentity(value));
+  if (!bound && provenBound && provenBound.getKind() ==
+                                  static_cast<uint32_t>(PhysicalExprKind::Constant))
+    bound = provenBound.getValue();
   PhysicalExprAttr extent = resourceExtentExpression(resource, axis);
   if (!extent)
     return false;
@@ -369,7 +374,8 @@ bool upperBoundWithinResource(Value value, Value resource, unsigned axis) {
       static_cast<uint32_t>(ParameterCategory::Coverage))
     if (auto covered = (*parameter)->getAttrOfType<PhysicalExprAttr>(
             coverageBoundAttr);
-        covered && queryLaunchExpression(value) == covered)
+        covered && (queryLaunchExpression(value) == covered ||
+                    provenBound == covered))
       return true;
   return bound && *bound >= 0 &&
          llvm::all_of(parameter->getParameter().getCandidates().asArrayRef(),
@@ -1999,6 +2005,15 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
            {std::pair{binary.getLhs(), binary.getRhs()},
             std::pair{binary.getRhs(), binary.getLhs()}}) {
         auto subtract = difference.getDefiningOp<BinaryOp>();
+        if (subtract && subtract.getOperatorKind() == BinaryOperator::Subtract &&
+            sameScalarExpression(subtract.getRhs(), increment) &&
+            valueKnownNonNegative(increment)) {
+          // For nonnegative index values E and x, E-x is representable and
+          // (E-x)+x is exactly E, including when the intermediate is negative.
+          Bounds original = bound(subtract.getLhs(), depth + 1);
+          if (original.nonNegative)
+            return original;
+        }
         std::optional<int64_t> amount = integerConstant(increment);
         Bounds preceding = bound(difference, depth + 1);
         if (amount && *amount >= 0 && preceding.nonNegative && preceding.upper &&
