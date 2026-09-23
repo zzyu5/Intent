@@ -1,2 +1,4 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
 batched_gemm,B32-M512-N512-K1024-bf16,0.173224,0.166464,1.040609,pass,cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged. Same-target production check after shared matrix normalization.
+dense_attention_forward,B2-QH32-KVH8-S4096-D128-bf16-causal,10.874256,4.808056,2.261674,pass,cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged. 同算法；source 使用 FTZ 与近似除法
+sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,5.177128,4.610024,1.123015,pass,cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged. 同算法；source 的布局转换与辅助工作计入其调用时间
