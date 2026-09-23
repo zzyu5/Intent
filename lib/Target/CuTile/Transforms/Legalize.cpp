@@ -1,6 +1,7 @@
 #include "Intent/Target/CuTile/Transforms/Passes.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
@@ -1660,42 +1661,13 @@ bool hasNativeMMAAxes(gpu::ContractOp contract) {
          canonicalBatch;
 }
 
-Attribute scalarConstant(Value value) {
-  while (true) {
-    if (auto cast = value.getDefiningOp<gpu::CastOp>()) {
-      if (cast.getValue().getType() != cast.getResult().getType())
-        return {};
-      value = cast.getValue();
-      continue;
-    }
-    if (auto splat = value.getDefiningOp<gpu::SplatOp>()) {
-      value = splat.getValue();
-      continue;
-    }
-    if (auto broadcast = value.getDefiningOp<gpu::BroadcastOp>()) {
-      value = broadcast.getValue();
-      continue;
-    }
-    if (auto extract = value.getDefiningOp<gpu::ExtractOp>()) {
-      auto record = extract.getRecord().getDefiningOp<gpu::MakeRecordOp>();
-      if (record && extract.getField() < record.getFields().size()) {
-        value = record.getFields()[extract.getField()];
-        continue;
-      }
-    }
-    break;
-  }
-  auto constant = value.getDefiningOp<arith::ConstantOp>();
-  return constant ? constant.getValue() : Attribute();
-}
-
 bool isZeroFill(Value value) {
   Value scalar = uniformScalarFill(value);
   if (auto cast = scalar ? scalar.getDefiningOp<gpu::CastOp>() : gpu::CastOp())
     if (cast.getValue().getType().isIntOrIndex() &&
         cast.getResult().getType().isIntOrIndex())
       return isZeroFill(cast.getValue());
-  Attribute constant = scalarConstant(scalar ? scalar : value);
+  Attribute constant = getCompileTimeScalar(scalar ? scalar : value);
   if (!constant)
     return false;
   if (auto integer = dyn_cast<IntegerAttr>(constant))
@@ -1706,7 +1678,7 @@ bool isZeroFill(Value value) {
 }
 
 bool isNativeReductionIdentity(BinaryOperator kind, Value identity) {
-  Attribute constant = scalarConstant(identity);
+  Attribute constant = getCompileTimeScalar(identity);
   if (!constant)
     return false;
   if (auto integer = dyn_cast<IntegerAttr>(constant)) {
@@ -1847,10 +1819,10 @@ LogicalResult verifyScan(gpu::ScanOp scan) {
     if (!fragment || fragment.getShape() != source.getShape())
       return scan.emitOpError(
           "cuTile scan lowering requires source components with the same physical shape");
-    auto constant = dyn_cast_or_null<TypedAttr>(scalarConstant(identity));
-    if (!constant || constant.getType() != fragment.getElementType())
+    if (!getCompileTimeScalar(identity) ||
+        gpu::uniformElementType(identity.getType()) != fragment.getElementType())
       return scan.emitOpError(
-          "cuTile scan identity must be an explicit scalar constant of the source dtype");
+          "cuTile scan identity must be a compile-time scalar of the source dtype");
   }
   return success();
 }
@@ -2205,7 +2177,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
             "cuTile tile extraction source axes are not a unique subset");
       if (result) {
         if (isa<gpu::FragmentType>(coordinate.getType()) &&
-            !scalarConstant(coordinate)) {
+            !getCompileTimeScalar(coordinate)) {
           auto ranges = analysis.sourceRanges(coordinate);
           // Scalar offsets can make general range analysis unknown. Use its
           // root only as a candidate; extractionTileIndex proves unit slope,
@@ -2270,7 +2242,8 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
           slicedAxes[sourceAxis] = true;
           continue;
         }
-        auto integer = dyn_cast_or_null<IntegerAttr>(scalarConstant(coordinate));
+        auto integer =
+            dyn_cast_or_null<IntegerAttr>(getCompileTimeScalar(coordinate));
         auto extent = constantPhysicalExpression(
             cast<gpu::PhysicalExprAttr>(source.getShape()[sourceAxis]), kernel);
         if (!integer || !extent || integer.getInt() < 0 || integer.getInt() >= *extent)
@@ -2489,9 +2462,9 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
         return reduce.emitOpError("cuTile custom reduce source must be a tile");
     for (Value identity : reduce.getInputs().slice(
              reduce.getSourceCount(), reduce.getIdentityCount()))
-      if (!scalarConstant(identity)) {
+      if (!getCompileTimeScalar(identity)) {
         InFlightDiagnostic diagnostic = reduce.emitOpError(
-            "cuTile custom reduce identity must be an explicit scalar constant");
+            "cuTile custom reduce identity must be a compile-time scalar");
         diagnostic << "; identity type=" << identity.getType();
         if (Operation *producer = identity.getDefiningOp())
           diagnostic << ", producer=" << producer->getName();

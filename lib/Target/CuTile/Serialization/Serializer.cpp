@@ -108,6 +108,8 @@ std::string fragmentShape(gpu::FragmentType fragment) {
 }
 
 std::string literal(Attribute value) {
+  if (auto expression = dyn_cast<gpu::PhysicalExprAttr>(value))
+    return expressionString(expression, false);
   if (auto integer = dyn_cast<IntegerAttr>(value)) {
     if (integer.getType().isInteger(1))
       return integer.getInt() ? "True" : "False";
@@ -375,35 +377,6 @@ private:
               "    value = value | (value >> 16)\n"
               "    value = value | (value >> 32)\n"
               "    return value + 1\n\n";
-  }
-
-  Attribute scalarConstant(Value value) {
-    while (true) {
-      if (auto cast = value.getDefiningOp<gpu::CastOp>()) {
-        if (cast.getValue().getType() != cast.getResult().getType())
-          return {};
-        value = cast.getValue();
-        continue;
-      }
-      if (auto splat = value.getDefiningOp<gpu::SplatOp>()) {
-        value = splat.getValue();
-        continue;
-      }
-      if (auto broadcast = value.getDefiningOp<gpu::BroadcastOp>()) {
-        value = broadcast.getValue();
-        continue;
-      }
-      if (auto extract = value.getDefiningOp<gpu::ExtractOp>()) {
-        auto record = extract.getRecord().getDefiningOp<gpu::MakeRecordOp>();
-        if (record && extract.getField() < record.getFields().size()) {
-          value = record.getFields()[extract.getField()];
-          continue;
-        }
-      }
-      break;
-    }
-    auto constant = value.getDefiningOp<arith::ConstantOp>();
-    return constant ? constant.getValue() : Attribute();
   }
 
   void emitCollectiveHelpers() {
@@ -1050,13 +1023,13 @@ private:
                                       : tuple(sources);
       std::string identity;
       if (count == 1) {
-        identity = literal(scalarConstant(identities.front()));
+        identity = literal(getCompileTimeScalar(identities.front()));
       } else {
         identity = "(";
         for (auto [index, value] : llvm::enumerate(identities)) {
           if (index)
             identity += ", ";
-          identity += literal(scalarConstant(value));
+          identity += literal(getCompileTimeScalar(value));
         }
         identity += ")";
       }

@@ -18,6 +18,7 @@ inline bool isLegalLoadPolicy(int64_t value) {
   return value >= 1 && value <= inferredLoadPolicy;
 }
 mlir::FailureOr<TileLoadOp> unfoldedArrayLoad(TileLoadOp load);
+mlir::Attribute getCompileTimeScalar(mlir::Value value);
 }
 
 #endif

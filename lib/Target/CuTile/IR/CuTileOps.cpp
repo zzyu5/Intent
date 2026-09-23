@@ -1,5 +1,7 @@
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -7,6 +9,8 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SmallBitVector.h"
+
+#include <functional>
 
 using namespace mlir;
 
@@ -162,6 +166,54 @@ LogicalResult verifyFullTileCondition(TileLoadOp load) {
 }
 
 } // namespace
+
+Attribute getCompileTimeScalar(Value value) {
+  if (Attribute literal =
+          UniformValueAnalysis(gpu::describeUniformValue).evaluate(value))
+    return literal;
+  while (true) {
+    auto description = gpu::describeUniformValue(value);
+    if (description.kind == UniformKind::Forward &&
+        description.operands.size() == 1) {
+      value = description.operands.front();
+      continue;
+    }
+    auto cast = value.getDefiningOp<gpu::CastOp>();
+    if (!cast)
+      break;
+    Type source = gpu::uniformElementType(cast.getValue().getType());
+    Type target = gpu::uniformElementType(cast.getResult().getType());
+    if (source != target &&
+        !(source.isIndex() && target.isSignlessInteger(64)) &&
+        !(source.isSignlessInteger(64) && target.isIndex()))
+      return {};
+    value = cast.getValue();
+  }
+  auto expression = gpu::queryLaunchExpression(value);
+  if (!expression)
+    return {};
+  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
+  std::function<bool(gpu::PhysicalExprAttr)> isCompileTime =
+      [&](gpu::PhysicalExprAttr current) {
+    auto kind = static_cast<gpu::PhysicalExprKind>(current.getKind());
+    if (kind == gpu::PhysicalExprKind::ScalarABI) {
+      if (!kernel)
+        return false;
+      for (BlockArgument argument : kernel.getArguments()) {
+        auto attributes = kernel.getArgAttrDict(argument.getArgNumber());
+        auto name = attributes.getAs<StringAttr>(gpu::abiNameAttr);
+        auto abi = attributes.getAs<StringAttr>(gpu::abiKindAttr);
+        if (name && abi && name == current.getSymbol())
+          return abi.getValue() == "constexpr" || abi.getValue() == "stride";
+      }
+      return false;
+    }
+    return llvm::all_of(current.getOperands(), [&](Attribute operand) {
+      return isCompileTime(cast<gpu::PhysicalExprAttr>(operand));
+    });
+  };
+  return isCompileTime(expression) ? Attribute(expression) : Attribute();
+}
 
 LogicalResult ArrayViewOp::verify() {
   auto base = dyn_cast<BlockArgument>(getBase());
@@ -538,10 +590,17 @@ LogicalResult ScaledMMAOp::verify() {
 LogicalResult ReduceOp::verify() {
   if (getReverse())
     return emitOpError("native reduction does not reverse logical order");
-  if (!getKind())
-    return gpu::verifyScalarCollective(getOperation(), getInputs(), getResults(),
-                                      getCombine(), getSourceCount(), getAxis(),
-                                      false);
+  if (!getKind()) {
+    if (failed(gpu::verifyScalarCollective(
+            getOperation(), getInputs(), getResults(), getCombine(),
+            getSourceCount(), getAxis(), false)))
+      return failure();
+    for (Value identity : getInputs().slice(getSourceCount(), getSourceCount()))
+      if (!getCompileTimeScalar(identity))
+        return emitOpError(
+            "custom reduction identity must be a compile-time scalar");
+    return success();
+  }
   auto source = getInputs().size() == 1
                     ? dyn_cast<gpu::FragmentType>(getInputs().front().getType())
                     : gpu::FragmentType();
