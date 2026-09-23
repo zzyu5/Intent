@@ -352,7 +352,7 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
   Value loaded = select.getTrueValue();
   SmallVector<Operation *> projections;
   while (Operation *operation = loaded.getDefiningOp()) {
-    if (!isa<BroadcastOp, TransposeOp>(operation))
+    if (!isa<BroadcastOp, TransposeOp, ReshapeOp>(operation))
       break;
     auto source = dyn_cast<FragmentType>(operation->getOperand(0).getType());
     auto result = dyn_cast<FragmentType>(loaded.getType());
@@ -364,6 +364,47 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
         auto transposed = cast<AxisMapAttr>(result.getAxisMaps()[axis]);
         if (!(sourceAxisIdentity(original) == sourceAxisIdentity(transposed)) ||
             original.getDimensionId() != transposed.getDimensionId())
+          return false;
+      }
+    } else if (auto reshape = dyn_cast<ReshapeOp>(operation)) {
+      unsigned sourceRank = 0, resultRank = 0;
+      for (Attribute attribute : reshape.getReassociation()) {
+        auto group = cast<ReshapeGroupAttr>(attribute);
+        if (!group.getSourceAxes().empty())
+          sourceRank = group.getSourceAxes().asArrayRef().back() + 1;
+        if (!group.getResultAxes().empty())
+          resultRank = group.getResultAxes().asArrayRef().back() + 1;
+      }
+      unsigned sourcePrefix = source.getShape().size() - sourceRank;
+      unsigned resultPrefix = result.getShape().size() - resultRank;
+      auto unitAxes = [](FragmentType type, unsigned prefix,
+                         ArrayRef<int64_t> axes) {
+        return llvm::all_of(axes, [&](int64_t axis) {
+          auto extent = cast<PhysicalExprAttr>(type.getShape()[prefix + axis]);
+          return extent.getKind() ==
+                     static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                 extent.getValue() == 1;
+        });
+      };
+      for (Attribute attribute : reshape.getReassociation()) {
+        auto group = cast<ReshapeGroupAttr>(attribute);
+        auto from = group.getSourceAxes().asArrayRef();
+        auto to = group.getResultAxes().asArrayRef();
+        if (from.empty() || to.empty()) {
+          if (!unitAxes(source, sourcePrefix, from) ||
+              !unitAxes(result, resultPrefix, to))
+            return false;
+          continue;
+        }
+        if (from.size() != 1 || to.size() != 1)
+          return false;
+        unsigned sourceAxis = sourcePrefix + from.front();
+        unsigned resultAxis = resultPrefix + to.front();
+        auto original = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
+        auto target = cast<AxisMapAttr>(result.getAxisMaps()[resultAxis]);
+        if (!(sourceAxisIdentity(original) == sourceAxisIdentity(target)) ||
+            original.getDimensionId() != target.getDimensionId() ||
+            source.getShape()[sourceAxis] != result.getShape()[resultAxis])
           return false;
       }
     } else {
@@ -404,6 +445,22 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
           inverse[sourceAxis] = axis;
         value = builder.create<TransposeOp>(select.getLoc(), sourceSchema,
                                             *projected, inverse);
+      } else if (auto reshape = dyn_cast<ReshapeOp>(projection)) {
+        auto resultSchema = FragmentType::get(
+            result.getContext(), element, result.getShape(), result.getAxisMaps(),
+            result.getValidity(), result.getOwner());
+        auto projected = materializeBroadcastToFragment(
+            builder, select.getLoc(), value, resultSchema);
+        if (failed(projected))
+          return failure();
+        SmallVector<Attribute> inverse;
+        for (Attribute attribute : reshape.getReassociation()) {
+          auto group = cast<ReshapeGroupAttr>(attribute);
+          inverse.push_back(ReshapeGroupAttr::get(
+              select.getContext(), group.getResultAxes(), group.getSourceAxes()));
+        }
+        value = builder.create<ReshapeOp>(
+            select.getLoc(), sourceSchema, *projected, builder.getArrayAttr(inverse));
       } else {
         auto projected = materializeBroadcastToFragment(
             builder, select.getLoc(), value, sourceSchema);
