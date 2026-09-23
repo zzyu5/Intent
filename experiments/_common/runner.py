@@ -100,6 +100,7 @@ def _run_entry(
     provider: str, compiler: str, entry, compiler_timeout: int,
     tuning_config: Path | None, before_benchmark, *, target: str,
     source_time_ms: float | None = None,
+    measure_source: bool = True,
 ) -> ResultRow:
     report_stage("device_setup")
     if provider == "mojo":
@@ -161,6 +162,7 @@ def _run_entry(
         generated_p50, source_p50 = evaluate(
             comparison, before_benchmark=before_benchmark,
             source_time_ms=source_time_ms,
+            measure_source=measure_source,
         )
     except NumericalComparisonError as error:
         print(f"{provider}:{entry.kernel}: numerical_failed: {error}")
@@ -378,9 +380,10 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
             return None
         matches = [row.source_p50_ms for row in source_rows
                    if (row.kernel, row.case) == (entry.kernel, entry.case)]
-        if (len(matches) != 1 or matches[0] is None or
-                not math.isfinite(matches[0]) or matches[0] <= 0):
-            parser.error(f"source results need one positive finite time for {entry.kernel}:{entry.case}")
+        if len(matches) != 1:
+            parser.error(f"source results need one row for {entry.kernel}:{entry.case}")
+        if matches[0] is not None and (not math.isfinite(matches[0]) or matches[0] <= 0):
+            parser.error(f"saved source time must be positive and finite for {entry.kernel}:{entry.case}")
         return matches[0]
 
     provider = arguments.provider
@@ -419,6 +422,7 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
                     _wait_for_benchmark if arguments.wait_for_benchmark else None,
                     target=arguments.target,
                     source_time_ms=saved_source_time(entry),
+                    measure_source=source_rows is None,
                 )])
         return
 

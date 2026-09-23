@@ -331,6 +331,7 @@ def evaluate(
     source_timing_error: Callable[[Exception], bool] | None = None,
     benchmark_time_budget_ms: float | None = None,
     source_time_ms: float | None = None,
+    measure_source: bool = True,
 ) -> tuple[float | None, float | None]:
     run_only = comparison.status == "run_only"
     if run_only:
@@ -397,7 +398,7 @@ def evaluate(
         generated_first = _benchmark_launch(comparison.generated, comparison, 25, benchmark_time_budget_ms)
     except Exception as error:
         raise PipelineStageError("generated_benchmark", str(error)) from error
-    if source_time_ms is not None:
+    if source_time_ms is not None or not measure_source:
         source_first = source_second = source_time_ms
     else:
         for stage, warmup in (("source_benchmark", 25), ("source_reverse_benchmark", 0)):
@@ -424,5 +425,5 @@ def evaluate(
         validate_outputs()
     return (
         statistics.median((generated_first, generated_second)),
-        statistics.median((source_first, source_second)),
+        None if source_first is None else statistics.median((source_first, source_second)),
     )
