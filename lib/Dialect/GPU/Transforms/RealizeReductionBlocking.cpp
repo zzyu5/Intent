@@ -14,6 +14,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
+#include <functional>
 #include <tuple>
 
 using namespace mlir;
@@ -1698,7 +1699,8 @@ LogicalResult cloneLiftedCombineRegion(Region &source, Region &target,
 
   auto *targetBlock = new Block();
   target.push_back(targetBlock);
-  Location location = source.getLoc();
+  Location location = sourceYield.getLoc();
+  MLIRContext *context = location.getContext();
   for (Type type : accumulatorTypes)
     targetBlock->addArgument(type, location);
   for (Type type : accumulatorTypes)
@@ -1711,7 +1713,7 @@ LogicalResult cloneLiftedCombineRegion(Region &source, Region &target,
   for (auto [original, replacement] :
        llvm::zip(sourceBlock.getArguments(), targetBlock->getArguments()))
     mapping.map(original, replacement);
-  OpBuilder builder(source.getContext());
+  OpBuilder builder(context);
   builder.setInsertionPointToEnd(targetBlock);
 
   auto mappedOperands = [&](Operation &operation) {
@@ -1752,8 +1754,8 @@ LogicalResult cloneLiftedCombineRegion(Region &source, Region &target,
       for (Value field : operands)
         fields.push_back(TypeAttr::get(field.getType()));
       resultTypes.push_back(RecordType::get(
-          source.getContext(), original.getFieldNames(),
-          ArrayAttr::get(source.getContext(), fields), original.getOwner()));
+          context, original.getFieldNames(),
+          ArrayAttr::get(context, fields), original.getOwner()));
     } else if (auto extract = dyn_cast<ExtractOp>(operation)) {
       auto record = dyn_cast<RecordType>(operands.front().getType());
       if (!record || extract.getField() >= record.getFieldTypes().size()) {
@@ -3596,116 +3598,222 @@ FailureOr<SourcePlan> nestedScalarReductionSource(ReduceOp reduce,
   return plan;
 }
 
-BinaryOp singleReductionUpdate(scf::ForOp loop) {
-  if (!loop || !loop->hasAttr(reductionSourcesAttr) ||
-      loop.getNumRegionIterArgs() != 1)
-    return {};
-  Value carry = loop.getRegionIterArg(0);
-  auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
-  auto update = yield.getOperand(0).getDefiningOp<BinaryOp>();
-  if (!update || update->getBlock() != loop.getBody() ||
-      !update.getResult().hasOneUse() || !carry.hasOneUse() ||
-      update.getLhs() != carry)
-    return {};
-  return update;
+bool sameCombineType(Type lhs, Type rhs) {
+  lhs = dataElementType(lhs);
+  rhs = dataElementType(rhs);
+  if (auto record = dyn_cast<RecordType>(lhs)) {
+    auto other = dyn_cast<RecordType>(rhs);
+    if (!other || record.getFieldNames() != other.getFieldNames())
+      return false;
+    return llvm::all_of(llvm::zip(record.getFieldTypes(), other.getFieldTypes()),
+                        [](auto pair) {
+      return sameCombineType(cast<TypeAttr>(std::get<0>(pair)).getValue(),
+                             cast<TypeAttr>(std::get<1>(pair)).getValue());
+    });
+  }
+  return lhs == rhs;
 }
 
-bool sameReductionBinary(BinaryOp lhs, BinaryOp rhs) {
-  return lhs.getOperatorKind() == rhs.getOperatorKind() &&
-         lhs.getApproximate() == rhs.getApproximate() &&
-         lhs.getFlushToZero() == rhs.getFlushToZero() &&
-         dataElementType(lhs.getResult().getType()) ==
-             dataElementType(rhs.getResult().getType());
+bool matchReductionCombine(ReduceOp reference, Block *body, ValueRange left,
+                           SmallVectorImpl<Value> &right, ValueRange results,
+                           llvm::SmallPtrSetImpl<Operation *> &matched) {
+  unsigned count = reference.getSourceCount();
+  Block &combine = reference.getCombine().front();
+  if (reference.getCaptureCount() != 0 || left.size() != count ||
+      right.size() != count || results.size() != count ||
+      combine.getNumArguments() != count * 2)
+    return false;
+  IRMapping mapping;
+  for (unsigned i = 0; i < count; ++i) {
+    mapping.map(combine.getArgument(i), left[i]);
+    if (right[i])
+      mapping.map(combine.getArgument(count + i), right[i]);
+  }
+  std::function<bool(Value, Value)> match = [&](Value pattern, Value value) {
+    if (!sameCombineType(pattern.getType(), value.getType()))
+      return false;
+    if (Value mapped = mapping.lookupOrNull(pattern))
+      return mapped == value;
+    if (isa<BlockArgument>(pattern))
+      return false;
+    FailureOr<Value> scalar = scalarSource(pattern);
+    if (succeeded(scalar) && (*scalar).getDefiningOp<arith::ConstantOp>())
+      return sameScalarValue(pattern, value);
+    Operation *expected = pattern.getDefiningOp();
+    Operation *actual = value.getDefiningOp();
+    if (!expected || !actual || actual->getBlock() != body ||
+        !canLiftCombineOperation(*expected) ||
+        expected->getName() != actual->getName() ||
+        expected->getNumOperands() != actual->getNumOperands() ||
+        expected->getNumResults() != actual->getNumResults())
+      return false;
+    NamedAttrList expectedAttrs(expected->getAttrs());
+    NamedAttrList actualAttrs(actual->getAttrs());
+    expectedAttrs.erase(originAttr);
+    actualAttrs.erase(originAttr);
+    if (expectedAttrs != actualAttrs)
+      return false;
+    for (auto [a, b] : llvm::zip(expected->getOperands(), actual->getOperands()))
+      if (!match(a, b))
+        return false;
+    for (auto [a, b] : llvm::zip(expected->getResults(), actual->getResults())) {
+      if (!sameCombineType(a.getType(), b.getType()))
+        return false;
+      mapping.map(a, b);
+    }
+    matched.insert(actual);
+    return mapping.lookup(pattern) == value;
+  };
+  auto yield = cast<YieldOp>(combine.getTerminator());
+  for (auto [expected, actual] : llvm::zip(yield.getValues(), results))
+    if (!match(expected, actual))
+      return false;
+  return llvm::all_of(right, [](Value value) { return bool(value); });
+}
+
+bool isolatedReductionUpdate(scf::ForOp loop, ReduceOp reference,
+                             SmallVectorImpl<Value> &right,
+                             llvm::SmallPtrSetImpl<Operation *> &matched) {
+  if (!loop || !loop->hasAttr(reductionSourcesAttr) ||
+      loop.getNumRegionIterArgs() != reference.getSourceCount())
+    return false;
+  auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+  if (!matchReductionCombine(reference, loop.getBody(),
+                             loop.getRegionIterArgs(), right,
+                             yield.getOperands(), matched))
+    return false;
+  for (Value carry : loop.getRegionIterArgs())
+    for (Operation *user : carry.getUsers())
+      if (!matched.contains(user))
+        return false;
+  for (Operation *operation : matched)
+    for (Operation *user : operation->getUsers())
+      if (user != yield && !matched.contains(user))
+        return false;
+  return true;
 }
 
 bool hoistNestedReduction(scf::ForOp outer, func::FuncOp kernel) {
-  BinaryOp update = singleReductionUpdate(outer);
-  if (!update)
+  if (!outer->hasAttr(reductionSourcesAttr) ||
+      outer.getNumRegionIterArgs() == 0)
     return false;
-  FailureOr<Value> identity = scalarSource(outer.getInitArgs().front());
-  if (failed(identity) || !DominanceInfo(kernel).dominates(*identity, outer))
+  unsigned count = outer.getNumRegionIterArgs();
+  ReduceOp reference;
+  llvm::SmallPtrSet<Operation *, 32> updates;
+  for (ReduceOp candidate : outer.getBody()->getOps<ReduceOp>()) {
+    if (candidate.getNumResults() != count)
+      continue;
+    SmallVector<Value> right(candidate.getResults());
+    llvm::SmallPtrSet<Operation *, 32> candidateUpdates;
+    if (isolatedReductionUpdate(outer, candidate, right, candidateUpdates)) {
+      reference = candidate;
+      updates = std::move(candidateUpdates);
+      break;
+    }
+  }
+  if (!reference)
     return false;
+  SmallVector<Value> identities;
+  DominanceInfo dominance(kernel);
+  for (Value init : outer.getInitArgs()) {
+    FailureOr<Value> identity = scalarSource(init);
+    if (failed(identity) || !dominance.dominates(*identity, outer))
+      return false;
+    identities.push_back(*identity);
+  }
 
   SmallVector<ReduceOp> reductions;
-  Value source = update.getRhs();
-  while (auto reduce = source.getDefiningOp<ReduceOp>()) {
+  SmallVector<Value> sources(reference.getResults());
+  while (auto reduce = sources.front().getDefiningOp<ReduceOp>()) {
     if (reduce->getBlock() != outer.getBody() ||
-        reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 ||
-        reduce.getCaptureCount() != 0 || reduce.getNumResults() != 1 ||
-        !source.hasOneUse() ||
-        !sameScalarValue(reduce.getInputs()[1], *identity))
+        reduce.getSourceCount() != count || reduce.getIdentityCount() != count ||
+        reduce.getCaptureCount() != 0 || reduce.getNumResults() != count ||
+        !llvm::equal(sources, reduce.getResults()))
       return false;
     Block &combine = reduce.getCombine().front();
-    if (combine.getNumArguments() != 2 ||
-        !llvm::hasSingleElement(combine.without_terminator()))
+    SmallVector<Value> right(combine.getArguments().drop_front(count));
+    llvm::SmallPtrSet<Operation *, 32> matched;
+    if (!matchReductionCombine(reference, &combine,
+                               combine.getArguments().take_front(count), right,
+                               cast<YieldOp>(combine.getTerminator()).getValues(),
+                               matched))
       return false;
-    auto binary = dyn_cast<BinaryOp>(combine.front());
-    auto yield = cast<YieldOp>(combine.getTerminator());
-    if (!binary || !sameReductionBinary(binary, update) ||
-        binary.getLhs() != combine.getArgument(0) ||
-        binary.getRhs() != combine.getArgument(1) ||
-        yield.getValues().size() != 1 ||
-        yield.getValues().front() != binary.getResult())
-      return false;
+    for (unsigned i = 0; i < count; ++i) {
+      if (!sameScalarValue(reduce.getInputs()[count + i], identities[i]))
+        return false;
+      for (Operation *user : reduce.getResult(i).getUsers())
+        if (!updates.contains(user) &&
+            (reductions.empty() || user != reductions.back()))
+          return false;
+    }
     reductions.push_back(reduce);
-    source = reduce.getInputs().front();
+    sources.assign(reduce.getInputs().begin(), reduce.getInputs().begin() + count);
   }
-  auto inner = source.getDefiningOp<scf::ForOp>();
-  BinaryOp innerUpdate = singleReductionUpdate(inner);
-  auto tileType = dyn_cast<FragmentType>(source.getType());
-  if (reductions.empty() || !innerUpdate || !tileType ||
-      inner->getBlock() != outer.getBody() || !source.hasOneUse() ||
-      !sameReductionBinary(innerUpdate, update) ||
-      !sameScalarValue(inner.getInitArgs().front(), *identity))
+  SmallVector<Type> accumulatorTypes;
+  for (unsigned i = 0; i < count; ++i) {
+    auto type = dyn_cast<FragmentType>(sources[i].getType());
+    if (!type || !llvm::all_of(type.getShape(), [](Attribute extent) {
+          return isShapeBound(cast<PhysicalExprAttr>(extent));
+        }))
+      return false;
+    accumulatorTypes.push_back(type);
+  }
+  Region scalarCombine, vectorCombine;
+  std::string reason;
+  if (failed(scalarizeElementwiseCallback(reference.getCombine(), scalarCombine)) ||
+      failed(cloneLiftedCombineRegion(scalarCombine, vectorCombine,
+                                      accumulatorTypes, reason)))
     return false;
 
   // These are compiler-created ordinary-reduction traversals. Keep their
-  // existing tile, loads, masks and effects, but carry the tile through both
-  // loops so the native collective runs only after traversal is complete.
-  // The one-use checks exclude observable partial sums and ordered carries.
+  // existing tile, loads, masks and effects, but carry the tile through the
+  // loop so the native collective runs only after traversal is complete.
+  // The use checks exclude observable partial summaries and ordered carries.
   OpBuilder builder(outer);
-  Value initial = builder.create<SplatOp>(outer.getLoc(), tileType, *identity);
+  SmallVector<Value> initial;
+  for (auto [source, identity] : llvm::zip(sources, identities))
+    initial.push_back(builder.create<SplatOp>(
+        outer.getLoc(), cast<FragmentType>(source.getType()), identity));
   auto replacement = builder.create<scf::ForOp>(
       outer.getLoc(), outer.getLowerBound(), outer.getUpperBound(),
-      outer.getStep(), ValueRange{initial});
+      outer.getStep(), initial);
   replacement->setAttrs(outer->getAttrs());
-  SmallVector<Attribute> traversals;
-  for (scf::ForOp loop : {outer, inner})
-    for (Attribute traversal :
-         loop->getAttrOfType<ArrayAttr>(reductionSourcesAttr))
-      if (!llvm::is_contained(traversals, traversal))
-        traversals.push_back(traversal);
-  replacement->setAttr(reductionSourcesAttr, builder.getArrayAttr(traversals));
-
   IRMapping mapping;
   mapping.map(outer.getInductionVar(), replacement.getInductionVar());
   builder.setInsertionPointToStart(replacement.getBody());
   for (Operation &operation : outer.getBody()->without_terminator()) {
-    if (&operation == update.getOperation() ||
+    if (updates.contains(&operation) ||
         llvm::any_of(reductions, [&](ReduceOp reduce) {
           return reduce.getOperation() == &operation;
         }))
       continue;
-    Operation *cloned = builder.clone(operation, mapping);
-    if (&operation == inner.getOperation())
-      cast<scf::ForOp>(cloned).getInitArgsMutable().assign(
-          replacement.getRegionIterArgs());
+    builder.clone(operation, mapping);
   }
-  builder.create<scf::YieldOp>(outer.getLoc(), mapping.lookup(source));
+  SmallVector<Value> arguments(replacement.getRegionIterArgs());
+  for (Value source : sources)
+    arguments.push_back(mapping.lookupOrDefault(source));
+  FailureOr<SmallVector<Value>> carried =
+      inlinePureRegion(builder, vectorCombine, arguments, reason);
+  assert(succeeded(carried) && "validated reduction combine failed to inline");
+  builder.create<scf::YieldOp>(outer.getLoc(), *carried);
 
   builder.setInsertionPointAfter(replacement);
-  Value result = replacement.getResult(0);
+  SmallVector<Value> results(replacement.getResults());
   for (ReduceOp reduce : llvm::reverse(reductions)) {
     IRMapping reduceMapping;
-    reduceMapping.map(reduce.getInputs().front(), result);
-    Value projectedIdentity = *identity;
-    if (auto fragment = dyn_cast<FragmentType>(reduce.getInputs()[1].getType()))
-      projectedIdentity = builder.create<SplatOp>(
-          reduce.getLoc(), fragment, projectedIdentity);
-    reduceMapping.map(reduce.getInputs()[1], projectedIdentity);
-    result = builder.clone(*reduce, reduceMapping)->getResult(0);
+    for (unsigned i = 0; i < count; ++i) {
+      reduceMapping.map(reduce.getInputs()[i], results[i]);
+      Value projectedIdentity = identities[i];
+      Value originalIdentity = reduce.getInputs()[count + i];
+      if (auto fragment = dyn_cast<FragmentType>(originalIdentity.getType()))
+        projectedIdentity = builder.create<SplatOp>(
+            reduce.getLoc(), fragment, projectedIdentity);
+      reduceMapping.map(originalIdentity, projectedIdentity);
+    }
+    Operation *cloned = builder.clone(*reduce, reduceMapping);
+    results.assign(cloned->getResults().begin(), cloned->getResults().end());
   }
-  outer.getResult(0).replaceAllUsesWith(result);
+  outer.replaceAllUsesWith(results);
   outer.erase();
   return true;
 }

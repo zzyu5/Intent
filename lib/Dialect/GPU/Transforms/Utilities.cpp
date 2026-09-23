@@ -80,7 +80,7 @@ LogicalResult scalarizeElementwiseCallback(Region &source, Region &target) {
     mapping.map(argument, scalarBody->addArgument(
                              scalarCallbackType(argument.getType()),
                              argument.getLoc()));
-  OpBuilder builder(target.getContext());
+  OpBuilder builder(body.getTerminator()->getContext());
   builder.setInsertionPointToEnd(scalarBody);
   for (Operation &nested : body) {
     if (isa<SplatOp, BroadcastOp>(nested)) {
