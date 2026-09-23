@@ -122,10 +122,14 @@ def summarize_window_attention_f16(
         valid=values.valid,
         maximum=values.maximum,
         denominator=values.denominator,
-        accumulator=I.matmul(
-            I.cast(values.probability, I.f16),
-            value_chunk,
-            acc_dtype=I.f32,
+        accumulator=I.select(
+            values.valid[:, None],
+            I.matmul(
+                I.cast(values.probability, I.f16),
+                value_chunk,
+                acc_dtype=I.f32,
+            ),
+            0.0,
         ),
     )
 
@@ -156,10 +160,14 @@ def summarize_window_attention_bf16(
         valid=values.valid,
         maximum=values.maximum,
         denominator=values.denominator,
-        accumulator=I.matmul(
-            I.cast(values.probability, I.bf16),
-            value_chunk,
-            acc_dtype=I.f32,
+        accumulator=I.select(
+            values.valid[:, None],
+            I.matmul(
+                I.cast(values.probability, I.bf16),
+                value_chunk,
+                acc_dtype=I.f32,
+            ),
+            0.0,
         ),
     )
 

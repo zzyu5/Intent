@@ -273,13 +273,17 @@ const ExtentBinding *findBinding(ArrayRef<ExtentBinding> bindings,
 
 LogicalResult collectExtentBindings(Type expected, Type actual,
                                     SmallVectorImpl<ExtentBinding> &bindings,
-                                    std::string &reason) {
+                                    std::string &reason,
+                                    ArrayRef<unsigned> selectedAxes = {}) {
   if (auto expectedFragment = dyn_cast<FragmentType>(expected)) {
     auto actualFragment = dyn_cast<FragmentType>(actual);
     if (!actualFragment)
       return success();
     for (auto [expectedAxis, attribute] :
          llvm::enumerate(expectedFragment.getAxisMaps())) {
+      if (!selectedAxes.empty() &&
+          !llvm::is_contained(selectedAxes, expectedAxis))
+        continue;
       auto expectedMap = cast<AxisMapAttr>(attribute);
       std::optional<unsigned> actualAxis;
       for (auto [axis, candidate] :
@@ -555,6 +559,43 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
       continue;
     Operation *clone = builder.clone(operation, mapping);
     bindClonedOperationTypes(clone, extentBindings);
+    if (auto broadcast = dyn_cast<BroadcastOp>(operation)) {
+      auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
+      auto output = dyn_cast<FragmentType>(broadcast.getResult().getType());
+      auto cloned = cast<BroadcastOp>(clone);
+      auto actualInput = dyn_cast<FragmentType>(cloned.getValue().getType());
+      auto actualOutput = dyn_cast<FragmentType>(cloned.getResult().getType());
+      if (input && output && actualInput && actualOutput &&
+          input.getShape().size() == actualInput.getShape().size()) {
+        auto projection = queryAxisProjection(input, output);
+        SmallVector<Attribute> shape(actualOutput.getShape().getValue());
+        SmallVector<unsigned> changedAxes;
+        if (projection.isExact())
+          for (auto [axis, inputAxis] :
+               llvm::enumerate(projection.targetToSource)) {
+            if (!inputAxis || isUnitExtent(input.getShape()[*inputAxis]) ||
+                input.getShape()[*inputAxis] != output.getShape()[axis])
+              continue;
+            Attribute extent = actualInput.getShape()[*inputAxis];
+            if (shape[axis] != extent)
+              changedAxes.push_back(axis);
+            shape[axis] = extent;
+          }
+        if (!changedAxes.empty()) {
+          // A helper-local occurrence can rename a sliced axis. Carry its
+          // selected extent through that relation, including a one-lane tail;
+          // genuine singleton broadcasts retain their original expansion.
+          auto type = FragmentType::get(
+              actualOutput.getContext(), actualOutput.getElementType(),
+              builder.getArrayAttr(shape), actualOutput.getAxisMaps(),
+              actualOutput.getValidity(), actualOutput.getOwner());
+          cloned.getResult().setType(type);
+          if (failed(collectExtentBindings(output, type, extentBindings, reason,
+                                          changedAxes)))
+            return failure();
+        }
+      }
+    }
     for (auto [source, result] :
          llvm::zip(operation.getResults(), clone->getResults())) {
       if (source == conjunctSource) {

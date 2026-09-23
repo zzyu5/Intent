@@ -187,7 +187,7 @@ def summarize_attention_chunk_f16(
         valid=chunk_valid,
         maximum=maximum,
         denominator=denominator,
-        accumulator=accumulator,
+        accumulator=I.select(chunk_valid[:, None], accumulator, 0.0),
     )
 
 
@@ -224,10 +224,14 @@ def summarize_attention_chunk_bf16(
         valid=chunk_valid,
         maximum=maximum,
         denominator=I.reduce.sum(probability, axis=1),
-        accumulator=I.matmul(
-            I.cast(probability, I.bf16),
-            value_chunk,
-            acc_dtype=I.f32,
+        accumulator=I.select(
+            chunk_valid[:, None],
+            I.matmul(
+                I.cast(probability, I.bf16),
+                value_chunk,
+                acc_dtype=I.f32,
+            ),
+            0.0,
         ),
     )
 
@@ -398,10 +402,14 @@ def summarize_mla_chunk(
         valid=chunk_valid,
         maximum=maximum,
         denominator=I.reduce.sum(probability, axis=1),
-        accumulator=I.matmul(
-            I.cast(probability, I.f16),
-            value_chunk,
-            acc_dtype=I.f32,
+        accumulator=I.select(
+            chunk_valid[:, None],
+            I.matmul(
+                I.cast(probability, I.f16),
+                value_chunk,
+                acc_dtype=I.f32,
+            ),
+            0.0,
         ),
     )
 

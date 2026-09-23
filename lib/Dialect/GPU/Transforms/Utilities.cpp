@@ -1013,10 +1013,41 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
   } else if (auto splat = value.getDefiningOp<SplatOp>()) {
     projection = builder.create<SplatOp>(location, target, splat.getValue());
   } else if (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
-    FailureOr<Value> projected =
-        projectFragmentValue(builder, location, broadcast.getValue(), target);
-    if (succeeded(projected))
-      return *projected;
+    auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
+    if (input && input.getShape().size() < target.getShape().size()) {
+      auto inputRelation = queryAxisProjection(input, source);
+      auto resultRelation = queryAxisProjection(source, target);
+      if (inputRelation.isExact() && resultRelation.isExact()) {
+        SmallVector<Attribute> shape(input.getShape().getValue());
+        for (auto [targetAxis, sourceAxis] :
+             llvm::enumerate(resultRelation.targetToSource)) {
+          if (!sourceAxis || !inputRelation.targetToSource[*sourceAxis])
+            continue;
+          unsigned inputAxis = *inputRelation.targetToSource[*sourceAxis];
+          auto extent = cast<PhysicalExprAttr>(shape[inputAxis]);
+          if (extent.getKind() !=
+                  static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+              extent.getValue() != 1)
+            shape[inputAxis] = target.getShape()[targetAxis];
+        }
+        // Retile the producer in its own rank before expanding it. In
+        // particular, a reduced row predicate must remain a row reduction.
+        auto inputTarget = FragmentType::get(
+            target.getContext(), input.getElementType(),
+            builder.getArrayAttr(shape), input.getAxisMaps(),
+            input.getValidity(), input.getOwner());
+        FailureOr<Value> projected = projectFragmentValue(
+            builder, location, broadcast.getValue(), inputTarget);
+        if (succeeded(projected) &&
+            queryBroadcastProjection(inputTarget, target).isExact())
+          projection = builder.create<BroadcastOp>(location, target, *projected);
+      }
+    } else {
+      FailureOr<Value> projected =
+          projectFragmentValue(builder, location, broadcast.getValue(), target);
+      if (succeeded(projected))
+        return *projected;
+    }
   } else if (auto reshape = value.getDefiningOp<ReshapeOp>()) {
     auto input = cast<FragmentType>(reshape.getValue().getType());
     unsigned inputRank = 0, resultRank = 0;
