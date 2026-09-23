@@ -1931,7 +1931,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
           kernel, profiles, "ctas", ctasParameter,
           gpu::ParameterRole::ProviderCTAs, isLegalCTAs)))
     return failure();
-  if (matrixCompute &&
+  if (hasOccupancySensitiveTileCompute(kernel) &&
       failed(declareProviderParameter(
           kernel, profiles, "worker_warps", workerWarpsParameter,
           gpu::ParameterRole::ProviderWarps, isLegalWorkerWarps)))
@@ -2997,7 +2997,6 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
       }
     providerConfigurations = std::move(expanded);
   }
-  auto coreConfigurations = providerConfigurations;
   for (gpu::ParameterOp option : {loadPolicy, accessForm}) {
     if (!option)
       continue;
@@ -3034,19 +3033,14 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
       }
   }
   if (inferredWarps) {
-    // Add the lower compiler's default at each core setting without moving
-    // the existing explicit-count anchors or multiplying every local form.
-    for (auto configuration : coreConfigurations) {
+    // Preserve the lower compiler's default for the same memory options as
+    // explicit worker counts, including previously available gather forms.
+    auto inferredConfigurations = providerConfigurations;
+    for (auto configuration : inferredConfigurations) {
       for (NamedAttribute &binding : configuration)
         if (binding.getName() == inferredWarps.getParameter().getName())
           binding = builder.getNamedAttr(
               binding.getName(), builder.getI64IntegerAttr(inferredWorkerWarps));
-      for (gpu::ParameterOp option : {loadPolicy, accessForm})
-        if (option)
-          configuration.push_back(builder.getNamedAttr(
-              option.getParameter().getName(),
-              builder.getI64IntegerAttr(
-                  option.getParameter().getCandidates().asArrayRef().front())));
       if (!llvm::is_contained(providerConfigurations, configuration))
         providerConfigurations.push_back(std::move(configuration));
     }
