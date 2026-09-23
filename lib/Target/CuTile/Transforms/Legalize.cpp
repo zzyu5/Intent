@@ -2908,13 +2908,16 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
       continue;
     auto definition = option.getParameter();
     auto forms = definition.getCandidates().asArrayRef();
-    // Memory scheduling and occupancy interact through the register/shared
-    // memory budget. Preserve each occupancy setting at both core anchors.
+    // Access form and load latency interact. Preserve their combinations and
+    // each occupancy setting at both core anchors without multiplying all
+    // worker/CTA settings by every memory option.
     auto matchesCore = [&](ArrayRef<NamedAttribute> candidate,
                            ArrayRef<NamedAttribute> anchor) {
       NamedAttrList bindings(anchor);
       return llvm::all_of(candidate, [&](NamedAttribute attribute) {
         return attribute.getName().getValue() == occupancyParameter ||
+               (loadPolicy && attribute.getName() ==
+                                  loadPolicy.getParameter().getName()) ||
                bindings.get(attribute.getName()) == attribute.getValue();
       });
     };
