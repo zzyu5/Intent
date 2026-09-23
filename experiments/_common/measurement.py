@@ -76,6 +76,7 @@ class _GPUWindow:
         report_stage(stage)
 
     def release(self):
+        torch.cuda.synchronize()
         fcntl.flock(self.stream, fcntl.LOCK_UN)
         self.locked = False
 
