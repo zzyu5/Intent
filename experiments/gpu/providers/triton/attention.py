@@ -9,6 +9,7 @@ from kernels.backward.attention import attention_backward_delta
 from kernels.backward.attention import attention_backward_dkdv
 from kernels.backward.attention import attention_backward_dq
 from kernels.streaming.attention import flash_attention_fwd
+from kernels.streaming.attention import flash_attention_bias_fwd
 from kernels.streaming.block_sparse_attention import block_sparse_gqa_decode_combine
 from kernels.streaming.block_sparse_attention import block_sparse_gqa_decode_partials
 from kernels.streaming.mla import paged_mla_decode_partials
@@ -112,17 +113,42 @@ def modern_flash_attention_forward(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=2e-2, rtol=2e-2),
         cuda_graph=True,
+        note="source launch uses num_stages=1 and num_warps=4.",
     )
 
 
 def legacy_flash_attention_bias(context: Context) -> PreparedComparison:
-    del context
-    raise ComparisonUnavailable(
-        "source_compatibility_gap",
-        "the vendored legacy FlashAttention Triton kernel is numerically "
-        "incorrect under Triton 3.6 for both biased and unbiased forward "
-        "paths; keep the unmodified source as structure reference, not a "
-        "performance baseline",
+    batch, heads, sequence, dimension = 4, 32, 4096, 128
+    shape = (batch, heads, sequence, dimension)
+    q = torch.randn(shape, device="cuda", dtype=torch.float16) * 0.5
+    k = torch.randn_like(q) * 0.5
+    v = torch.randn_like(q) * 0.5
+    bias = torch.randn(
+        (batch, heads, sequence), device="cuda", dtype=torch.float32
+    ) * 0.125
+    scale = dimension**-0.5
+    runtime = load_module(
+        context.project_root
+        / "experiments/gpu/baselines/triton/flash-attention/attention/fused/flash_attn_triton_runtime.py",
+        "intent_v2_triton_legacy_flash_attention",
+    )
+    source_arguments = (
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        bias[:, :, None, :],
+        scale,
+    )
+    source = functional_launch(lambda: runtime.upstream(source_arguments))
+    _, generated = compile_single(
+        context, flash_attention_bias_fwd, (q, k, v, bias, scale)
+    )
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=2e-2, rtol=2e-2),
+        cuda_graph=True,
+        note="同算法；source 额外写 LSE 和临时数据。",
     )
 
 
@@ -618,6 +644,9 @@ def flash_attention_backward(context: Context) -> PreparedComparison:
     )
     _prepare_source_launch(lambda: source_module.flash(q, k, v, output, lse))
     grad_output = torch.randn_like(output) * 0.05
+    source = functional_launch(
+        lambda: source_module.flash_bwd(q, k, v, output, lse, grad_output)
+    )
     scale = dimension**-0.5
     _, delta = compile_single(
         context,
@@ -650,9 +679,6 @@ def flash_attention_backward(context: Context) -> PreparedComparison:
         launch=generated_launch,
         outputs=lambda: (dq.outputs(), *dkdv.outputs()),
     )
-    source = functional_launch(
-        lambda: source_module.flash_bwd(q, k, v, output, lse, grad_output)
-    )
     return PreparedComparison(
         generated,
         source,
@@ -662,6 +688,7 @@ def flash_attention_backward(context: Context) -> PreparedComparison:
             Tolerance(atol=1.25e-1),
         ),
         cuda_graph=False,
+        note="source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。",
     )
 
 

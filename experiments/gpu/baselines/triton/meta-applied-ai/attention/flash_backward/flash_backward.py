@@ -742,14 +742,14 @@ def _bwd_kernel_dk_dv(
         do = tl.load(DO_block_ptr)
         # Compute dV.
         ppT = pT
-        ppT = ppT.to(tl.bfloat16)
+        ppT = ppT.to(do.dtype)
         dv += tl.dot(ppT, do)
         # D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m)
         # Compute dP and dS.
         dpT = tl.dot(v, tl.trans(do))
         dsT = pT * (dpT - Di[None, :])
-        dsT = dsT.to(tl.bfloat16)
+        dsT = dsT.to(qT.dtype)
         dk += tl.dot(dsT, tl.trans(qT))
         # Increment pointers.
         curr_m += step_m
@@ -807,7 +807,7 @@ def _bwd_kernel_dq(dq, q, K, V,
         vT = tl.load(VT_block_ptr)
         dp = tl.dot(do, vT).to(tl.float32)
         ds = p * (dp - Di[:, None])
-        ds = ds.to(tl.bfloat16)
+        ds = ds.to(kT.dtype)
         # Compute dQ.0.
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         dq += tl.dot(ds, tl.trans(kT))
@@ -1151,6 +1151,8 @@ def flash(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, o: torch.Tensor, M:
         ENABLE_DROPOUT=False,
         RETURN_ENCODED_SOFTMAX=False,
         BATCH_SIZE= q.shape[0],
+        num_stages=1,
+        num_warps=4,
     )
     out = o.clone()
     return out

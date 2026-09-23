@@ -594,6 +594,33 @@ bool isIntroducedReshapeUnitAxis(Value value, unsigned fragmentAxis) {
   });
 }
 
+std::optional<unsigned> reshapeInputAxis(ReshapeOp reshape,
+                                         unsigned resultAxis) {
+  auto input = cast<FragmentType>(reshape.getValue().getType());
+  auto result = cast<FragmentType>(reshape.getResult().getType());
+  unsigned sourceRank = 0, resultRank = 0;
+  for (Attribute attribute : reshape.getReassociation()) {
+    auto group = cast<ReshapeGroupAttr>(attribute);
+    for (int64_t axis : group.getSourceAxes().asArrayRef())
+      sourceRank = std::max(sourceRank, static_cast<unsigned>(axis + 1));
+    for (int64_t axis : group.getResultAxes().asArrayRef())
+      resultRank = std::max(resultRank, static_cast<unsigned>(axis + 1));
+  }
+  unsigned sourcePrefix = input.getShape().size() - sourceRank;
+  unsigned resultPrefix = result.getShape().size() - resultRank;
+  if (resultAxis < resultPrefix)
+    return sourcePrefix == resultPrefix ? std::optional<unsigned>(resultAxis)
+                                         : std::nullopt;
+  for (Attribute attribute : reshape.getReassociation()) {
+    auto group = cast<ReshapeGroupAttr>(attribute);
+    if (group.getSourceAxes().size() == 1 &&
+        group.getResultAxes().size() == 1 &&
+        resultPrefix + group.getResultAxes()[0] == resultAxis)
+      return sourcePrefix + group.getSourceAxes()[0];
+  }
+  return std::nullopt;
+}
+
 bool selectsSegmentAxis(Type type, uint64_t axis, AxisSelector selects) {
   auto fragment = dyn_cast<FragmentType>(type);
   return fragment && axis < fragment.getAxisMaps().size() &&
@@ -1593,13 +1620,6 @@ FailureOr<Value> materializeReplayedValue(
                ? std::optional<unsigned>(projection.fragmentAxis)
                : std::nullopt;
   };
-  auto isUnitExtent = [](Attribute attribute) {
-    auto extent = dyn_cast<PhysicalExprAttr>(attribute);
-    return extent &&
-           extent.getKind() ==
-               static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-           extent.getValue() == 1;
-  };
   auto retargetHelperSourceExtent = [&](Region &region,
                                         PhysicalExprAttr logicalExtent) {
     auto retarget = [&](Value current) {
@@ -1774,17 +1794,9 @@ FailureOr<Value> materializeReplayedValue(
         } else if (auto transpose = dyn_cast<TransposeOp>(producer)) {
           operandAxis = transpose.getPermutation()[axis];
         } else if (auto reshape = dyn_cast<ReshapeOp>(producer)) {
-          for (Attribute attribute : reshape.getReassociation()) {
-            auto group = cast<ReshapeGroupAttr>(attribute);
-            if (group.getSourceAxes().empty() &&
-                llvm::is_contained(group.getResultAxes().asArrayRef(),
-                                   static_cast<int64_t>(axis)))
-              return operand;
-            if (group.getResultAxes().size() == 1 &&
-                group.getResultAxes()[0] == static_cast<int64_t>(axis) &&
-                group.getSourceAxes().size() == 1)
-              operandAxis = group.getSourceAxes()[0];
-          }
+          if (isIntroducedReshapeUnitAxis(current, axis))
+            return operand;
+          operandAxis = reshapeInputAxis(reshape, axis);
         } else if (reduction) {
           SmallVector<unsigned> freeAxes;
           for (unsigned inputAxis = 0; inputAxis < input.getShape().size();
@@ -1882,30 +1894,24 @@ FailureOr<Value> materializeReplayedValue(
 
     if (auto reshape = dyn_cast<ReshapeOp>(producer)) {
       auto input = cast<FragmentType>(reshape.getValue().getType());
-      for (Attribute attribute : reshape.getReassociation()) {
-        auto group = cast<ReshapeGroupAttr>(attribute);
-        if (group.getSourceAxes().size() != 1 ||
-            group.getResultAxes().size() != 1 ||
-            group.getResultAxes()[0] != static_cast<int64_t>(axis))
-          continue;
-        unsigned inputAxis = group.getSourceAxes()[0];
-        auto inputMap = cast<AxisMapAttr>(input.getAxisMaps()[inputAxis]);
+      if (auto inputAxis = reshapeInputAxis(reshape, axis)) {
+        auto inputMap = cast<AxisMapAttr>(input.getAxisMaps()[*inputAxis]);
         auto resultMap = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
-        if (sourceAxisIdentity(inputMap) == sourceAxisIdentity(resultMap) ||
-            input.getShape()[inputAxis] != fragment.getShape()[axis])
-          continue;
-        ReplayMaterializationOptions inputOptions = options;
-        inputOptions.fragmentAxis = inputAxis;
-        FailureOr<Value> replayed = materializeReplayedValue(
-            builder, location, reshape.getValue(), sourceAxisIdentity(inputMap),
-            blockedExtent, mapping, inputOptions);
-        if (failed(replayed))
-          return failure();
-        Value projected = builder.create<ReshapeOp>(
-            location, replaceReplayAxis(fragment, axis), *replayed,
-            reshape.getReassociation());
-        remember(current, projected, projection);
-        return projected;
+        if (!(sourceAxisIdentity(inputMap) == sourceAxisIdentity(resultMap)) &&
+            input.getShape()[*inputAxis] == fragment.getShape()[axis]) {
+          ReplayMaterializationOptions inputOptions = options;
+          inputOptions.fragmentAxis = *inputAxis;
+          FailureOr<Value> replayed = materializeReplayedValue(
+              builder, location, reshape.getValue(), sourceAxisIdentity(inputMap),
+              blockedExtent, mapping, inputOptions);
+          if (failed(replayed))
+            return failure();
+          Value projected = builder.create<ReshapeOp>(
+              location, replaceReplayAxis(fragment, axis), *replayed,
+              reshape.getReassociation());
+          remember(current, projected, projection);
+          return projected;
+        }
       }
     }
 
@@ -2102,19 +2108,7 @@ FailureOr<Value> materializeReplayedValue(
     auto clonedType = dyn_cast<FragmentType>(clonedValue.getType());
     if (!clonedType || axis >= clonedType.getShape().size())
       return failure();
-    bool introducedUnitAxis = false;
-    if (auto reshape = dyn_cast<ReshapeOp>(producer)) {
-      auto input = dyn_cast<FragmentType>(reshape.getValue().getType());
-      introducedUnitAxis =
-          isUnitExtent(clonedType.getShape()[axis]) &&
-          (!input || !queryFragmentAxis(input, source).isExact() ||
-           llvm::any_of(reshape.getReassociation(), [&](Attribute attribute) {
-             auto group = cast<ReshapeGroupAttr>(attribute);
-             return group.getSourceAxes().empty() &&
-                    llvm::is_contained(group.getResultAxes().asArrayRef(),
-                                       static_cast<int64_t>(axis));
-           }));
-    }
+    bool introducedUnitAxis = isIntroducedReshapeUnitAxis(current, axis);
     if (pointwiseType)
       clonedValue.setType(pointwiseType);
     else if (!introducedUnitAxis)
