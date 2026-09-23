@@ -3887,6 +3887,7 @@ enum ContractFreeAxisSide : unsigned {
 
 struct ContractFreeAxisFacts {
   unsigned sides = ContractFreeAxisNone;
+  unsigned matrixSides = ContractFreeAxisNone;
   bool regionContraction = false;
   bool batchedContraction = false;
   unsigned operandElementBitWidth = 0;
@@ -3901,15 +3902,26 @@ ContractFreeAxisFacts contractFreeAxisFacts(func::FuncOp kernel,
         analysis.contractFreeAxes(contract);
     if (!freeAxes.isExact())
       return;
+    bool matrixFreeAxes =
+        llvm::any_of(freeAxes.axes, [&](const auto &axis) {
+          return axis.operand == contract.getLhs();
+        }) &&
+        llvm::any_of(freeAxes.axes, [&](const auto &axis) {
+          return axis.operand == contract.getRhs();
+        });
     for (const PhysicalContractFreeAxis &axis : freeAxes.axes) {
       if (!llvm::any_of(axis.ranges.roots, [&](MakeRangeOp root) {
             return sameLogicalRange(root, range);
           }))
         continue;
+      unsigned side = ContractFreeAxisNone;
       if (axis.operand == contract.getLhs())
-        facts.sides |= ContractFreeAxisLhs;
+        side |= ContractFreeAxisLhs;
       if (axis.operand == contract.getRhs())
-        facts.sides |= ContractFreeAxisRhs;
+        side |= ContractFreeAxisRhs;
+      facts.sides |= side;
+      if (matrixFreeAxes)
+        facts.matrixSides |= side;
       facts.operandElementBitWidth = std::max(
           facts.operandElementBitWidth,
           std::max(physicalElementBitWidth(contract.getLhs().getType()),
@@ -6480,11 +6492,13 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
        llvm::enumerate(pointwiseOwnershipAxes)) {
     ParameterOp parameter = parameters.lookup(axis);
     unsigned contractSides = ContractFreeAxisNone;
+    unsigned matrixSides = ContractFreeAxisNone;
     bool batchedContraction = false;
     unsigned contractElementBitWidth = 0;
     for (MakeRangeOp range : axes.lookup(axis)) {
       ContractFreeAxisFacts facts = contractFreeAxisFacts(kernel, range);
       contractSides |= facts.sides;
+      matrixSides |= facts.matrixSides;
       batchedContraction |= facts.batchedContraction;
       contractElementBitWidth =
           std::max(contractElementBitWidth, facts.operandElementBitWidth);
@@ -6495,9 +6509,15 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     ParameterRole ownershipRole = ParameterRole::OwnershipN;
     auto declaredRole =
         static_cast<ParameterRole>(parameter.getParameter().getRole());
-    if (contractSides == ContractFreeAxisLhs)
+    // Matrix operands constrain M/N orientation. A vector contraction with
+    // other output axes uses their existing store order, so independent axes
+    // do not accidentally consume the same profile column.
+    unsigned orientedSides = pointwiseOwnershipAxes.size() == 1
+                                 ? contractSides
+                                 : matrixSides;
+    if (orientedSides == ContractFreeAxisLhs)
       ownershipRole = ParameterRole::OwnershipM;
-    else if (contractSides == ContractFreeAxisRhs)
+    else if (orientedSides == ContractFreeAxisRhs)
       ownershipRole = ParameterRole::OwnershipN;
     else if (parameter.getParameter().getCategory() ==
             static_cast<uint32_t>(ParameterCategory::Contraction) &&
