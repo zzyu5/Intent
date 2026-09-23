@@ -1071,7 +1071,9 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
       reductionRows.insert(parameter);
     if (parameter->hasAttr(pointwiseChunkAttr))
       kernel.walk([&](scf::ForOp loop) {
-        if (samePhysicalScalarExpression(loop.getStep(), parameter.getResult()))
+        auto step = queryLaunchExpression(loop.getStep());
+        if (step && expressionReferencesParameter(
+                        step, parameter.getParameter().getName()))
           pointwiseTraversals.insert(parameter);
       });
     auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());

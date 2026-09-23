@@ -19,6 +19,8 @@
 namespace intent::gpu {
 
 PhysicalExprAttr fragmentRegisterFootprint(FragmentType fragment);
+bool isShapeBound(PhysicalExprAttr bound);
+PhysicalExprAttr boundedTraversalChunk(ParameterOp chunk, MakeRangeOp range);
 PhysicalExprAttr reductionRegisterFootprint(mlir::ValueRange sources,
                                             mlir::func::FuncOp kernel);
 void materializeDeferredReductionBounds(

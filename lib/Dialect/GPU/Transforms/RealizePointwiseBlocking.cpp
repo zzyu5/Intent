@@ -2236,9 +2236,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
   if (!originalType || originalType.getShape().size() != 1)
     return range.emitOpError(
         "reuse-sensitive pointwise traversal requires one physical source axis");
-  PhysicalExprAttr chunkExtent = expression(
-      kernel.getContext(), PhysicalExprKind::Parameter, 0,
-      chunk.getParameter().getName().getValue());
+  PhysicalExprAttr chunkExtent = boundedTraversalChunk(chunk, range);
   SmallVector<Attribute> blockedMappings(originalType.getAxisMaps().begin(),
                                          originalType.getAxisMaps().end());
   if (accessDependentSubregion) {
@@ -2309,8 +2307,10 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
   OpBuilder builder(group.front());
   Operation *loopInsertionAnchor = group.front().getOperation();
   Value stop = range.getLogicalStop();
+  Value chunkSize = builder.create<PhysicalExprOp>(
+      range.getLoc(), builder.getIndexType(), chunkExtent);
   Value loopStep = builder.create<BinaryOp>(
-      range.getLoc(), builder.getIndexType(), chunk.getResult(), range.getStep(),
+      range.getLoc(), builder.getIndexType(), chunkSize, range.getStep(),
       BinaryOperator::Multiply);
   bool bodyFailed = false;
   std::string failureReason;
@@ -2318,7 +2318,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
       range.getLoc(), range.getStart(), stop, loopStep, ValueRange{},
       [&](OpBuilder &nested, Location location, Value tileStart, ValueRange) {
         Value blocked = nested.create<MakeRangeOp>(
-            location, blockedType, tileStart, chunk.getResult(), range.getStep(),
+            location, blockedType, tileStart, chunkSize, range.getStep(),
             range.getLogicalStart(), range.getLogicalStop(), range.getSourceId(),
             range.getSourceAxis(), range.getDerived());
         inheritRangeAuthority(blocked.getDefiningOp(), range);

@@ -50,40 +50,6 @@ PhysicalExprAttr nextPowerOfTwo(PhysicalExprAttr source) {
                     {}, {source});
 }
 
-bool isShapeBound(PhysicalExprAttr bound) {
-  return bound.getKind() !=
-             static_cast<uint32_t>(PhysicalExprKind::ScalarABI) &&
-         llvm::all_of(bound.getOperands(), [](Attribute operand) {
-           return isShapeBound(cast<PhysicalExprAttr>(operand));
-         });
-}
-
-PhysicalExprAttr boundedReductionChunk(ParameterOp chunk, MakeRangeOp range) {
-  auto extent = expression(chunk.getContext(), PhysicalExprKind::Parameter, 0,
-                           chunk.getParameter().getName().getValue());
-  auto capacity = queryLogicalRangeCapacity(range);
-  if (!capacity || !isShapeBound(capacity) ||
-      chunk->hasAttr(coverageDimensionAttr))
-    return extent;
-  int64_t maximum =
-      *llvm::max_element(chunk.getParameter().getCandidates().asArrayRef());
-  if (maximum > (int64_t{1} << 62))
-    return extent;
-  if (capacity.getKind() ==
-          static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-      capacity.getValue() >= maximum)
-    return extent;
-  auto one = expression(chunk.getContext(), PhysicalExprKind::Constant, 1);
-  auto positive = expression(chunk.getContext(), PhysicalExprKind::Maximum, 0,
-                             {}, {capacity, one});
-  auto bounded = expression(
-      chunk.getContext(), PhysicalExprKind::Minimum, 0, {},
-      {positive, expression(chunk.getContext(), PhysicalExprKind::Constant,
-                            maximum)});
-  return expression(chunk.getContext(), PhysicalExprKind::Minimum, 0, {},
-                    {extent, nextPowerOfTwo(bounded)});
-}
-
 bool isCompileTimeExtent(PhysicalExprAttr expression) {
   auto kind = static_cast<PhysicalExprKind>(expression.getKind());
   if (kind == PhysicalExprKind::Constant || kind == PhysicalExprKind::Parameter)
@@ -2773,7 +2739,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                "reduction blocking has no unique physical parameter relation")
            << "; source=" << sourcePlans.front().source.getType()
            << "; axis=" << sourcePlans.front().reductionAxis;
-  PhysicalExprAttr chunkExtent = boundedReductionChunk(chunk, firstRange);
+  PhysicalExprAttr chunkExtent = boundedTraversalChunk(chunk, firstRange);
 
   SmallVector<FragmentType> blockedSourceTypes;
   for (const SourcePlan &plan : sourcePlans) {

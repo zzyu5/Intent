@@ -25,6 +25,40 @@ using namespace mlir;
 
 namespace intent::gpu {
 
+bool isShapeBound(PhysicalExprAttr bound) {
+  return bound.getKind() != static_cast<uint32_t>(PhysicalExprKind::ScalarABI) &&
+         llvm::all_of(bound.getOperands(), [](Attribute operand) {
+           return isShapeBound(cast<PhysicalExprAttr>(operand));
+         });
+}
+
+PhysicalExprAttr boundedTraversalChunk(ParameterOp chunk, MakeRangeOp range) {
+  auto expression = [&](PhysicalExprKind kind, int64_t value = 0,
+                        StringRef symbol = {}, ArrayRef<Attribute> operands = {}) {
+    return PhysicalExprAttr::get(chunk.getContext(), static_cast<uint32_t>(kind),
+                                 value, StringAttr::get(chunk.getContext(), symbol),
+                                 ArrayAttr::get(chunk.getContext(), operands));
+  };
+  auto extent = expression(PhysicalExprKind::Parameter, 0,
+                           chunk.getParameter().getName().getValue());
+  auto capacity = queryLogicalRangeCapacity(range);
+  if (!capacity || !isShapeBound(capacity) || chunk->hasAttr(coverageDimensionAttr))
+    return extent;
+  int64_t maximum =
+      *llvm::max_element(chunk.getParameter().getCandidates().asArrayRef());
+  if (maximum > (int64_t{1} << 62))
+    return extent;
+  if (auto bound = constantPhysicalExpression(capacity);
+      bound && *bound >= maximum)
+    return extent;
+  auto positive = expression(PhysicalExprKind::Maximum, 0, {},
+                             {capacity, expression(PhysicalExprKind::Constant, 1)});
+  auto bounded = expression(PhysicalExprKind::Minimum, 0, {},
+                            {positive, expression(PhysicalExprKind::Constant, maximum)});
+  auto padded = expression(PhysicalExprKind::NextPowerOfTwo, 0, {}, {bounded});
+  return expression(PhysicalExprKind::Minimum, 0, {}, {extent, padded});
+}
+
 Type scalarCallbackType(Type type) {
   if (auto fragment = dyn_cast<FragmentType>(type))
     return fragment.getElementType();
