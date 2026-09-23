@@ -268,37 +268,42 @@ def _wait_for_benchmark() -> None:
 def _run_batch(arguments, indexes, publish) -> None:
     provider = arguments.provider
     workers: list[_Worker] = []
+    pending = iter(indexes)
     with tempfile.TemporaryDirectory(prefix="intentdsl-experiment-") as directory:
         try:
-            for index in indexes:
-                entry = BY_PROVIDER[provider][index]
-                output = Path(directory) / f"{index}.csv"
-                phase = output.with_suffix(".phase.json")
-                _write_stage(phase, "worker_startup")
-                command = [
-                    sys.executable, "-u", "-m", f"experiments.{PROVIDER_GROUPS[provider]}", provider,
-                    "--compiler", arguments.compiler, "--output", str(output),
-                    "--worker-kernel", entry.kernel, "--worker-case", entry.case,
-                    "--wait-for-benchmark",
-                    "--cutile-compiler-timeout", str(arguments.cutile_compiler_timeout),
-                    "--target", arguments.target,
-                ]
-                if arguments.tuning_config is not None:
-                    command.extend(("--tuning-config", str(arguments.tuning_config)))
-                if arguments.source_results is not None:
-                    command.extend(("--source-results", str(arguments.source_results)))
-                if arguments.gpu_lock is not None:
-                    command.extend(("--gpu-lock", str(arguments.gpu_lock)))
-                process = subprocess.Popen(
-                    command, stdin=subprocess.PIPE, text=True, start_new_session=True,
-                    # Torch preparation and Mojo execution use separate pools
-                    # on the same CPU budget; idle workers must yield the cores.
-                    env={**os.environ, **CPU_WAIT_ENVIRONMENT} if provider == "mojo" else None,
-                )
-                workers.append(_Worker(index, process, output, phase, time.monotonic()))
-                print(f"{provider}:{BY_PROVIDER[provider][index].kernel}: preparing", flush=True)
-
-            while workers:
+            while True:
+                while len(workers) < arguments.jobs:
+                    index = next(pending, None)
+                    if index is None:
+                        break
+                    entry = BY_PROVIDER[provider][index]
+                    output = Path(directory) / f"{index}.csv"
+                    phase = output.with_suffix(".phase.json")
+                    _write_stage(phase, "worker_startup")
+                    command = [
+                        sys.executable, "-u", "-m", f"experiments.{PROVIDER_GROUPS[provider]}", provider,
+                        "--compiler", arguments.compiler, "--output", str(output),
+                        "--worker-kernel", entry.kernel, "--worker-case", entry.case,
+                        "--wait-for-benchmark",
+                        "--cutile-compiler-timeout", str(arguments.cutile_compiler_timeout),
+                        "--target", arguments.target,
+                    ]
+                    if arguments.tuning_config is not None:
+                        command.extend(("--tuning-config", str(arguments.tuning_config)))
+                    if arguments.source_results is not None:
+                        command.extend(("--source-results", str(arguments.source_results)))
+                    if arguments.gpu_lock is not None:
+                        command.extend(("--gpu-lock", str(arguments.gpu_lock)))
+                    process = subprocess.Popen(
+                        command, stdin=subprocess.PIPE, text=True, start_new_session=True,
+                        # Torch preparation and Mojo execution use separate pools
+                        # on the same CPU budget; idle workers must yield the cores.
+                        env={**os.environ, **CPU_WAIT_ENVIRONMENT} if provider == "mojo" else None,
+                    )
+                    workers.append(_Worker(index, process, output, phase, time.monotonic()))
+                    print(f"{provider}:{entry.kernel}: preparing", flush=True)
+                if not workers:
+                    break
                 ready: list[_Worker] = []
                 for worker in tuple(workers):
                     entry = BY_PROVIDER[provider][worker.index]
@@ -479,8 +484,11 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
     ]
     for entry in entries:
         saved_source_time(entry)
-    for offset in range(0, len(selected_indexes), arguments.jobs):
-        _run_batch(arguments, selected_indexes[offset:offset + arguments.jobs], publish)
+    if arguments.gpu_lock is not None:
+        _run_batch(arguments, selected_indexes, publish)
+    else:
+        for offset in range(0, len(selected_indexes), arguments.jobs):
+            _run_batch(arguments, selected_indexes[offset:offset + arguments.jobs], publish)
 
 
 if __name__ == "__main__":
