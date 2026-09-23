@@ -5046,16 +5046,18 @@ void transposeClonedLoop(scf::ForOp loop) {
   });
 }
 
-FailureOr<bool> projectScalarContractResult(ContractOp contract) {
+FailureOr<bool> projectContractResult(ContractOp contract) {
   if (!contract.getResult().hasOneUse())
     return false;
   auto gather = dyn_cast<GatherOp>(*contract.getResult().getUsers().begin());
   auto resultType = contract.getResult().getType();
   if (!gather || gather.getSource() != contract.getResult() ||
-      isa<FragmentType>(gather.getResult().getType()) ||
       gather.getCoordinates().size() != resultType.getShape().size() ||
       failed(scalarSource(contract.getAccumulator())) ||
       !canReplayContractionReads(contract))
+    return false;
+  auto gatheredType = dyn_cast<FragmentType>(gather.getResult().getType());
+  if (gatheredType && gatheredType.getShape().size() != resultType.getShape().size())
     return false;
   auto kernel = contract->getParentOfType<func::FuncOp>();
   DominanceInfo dominance(kernel);
@@ -5067,20 +5069,37 @@ FailureOr<bool> projectScalarContractResult(ContractOp contract) {
       return true;
     Operation *producer = value.getDefiningOp();
     return producer && producer->getNumRegions() == 0 &&
-           !isa<FragmentType, RecordType>(value.getType()) &&
+           !isa<RecordType>(value.getType()) &&
+           (gatheredType || !isa<FragmentType>(value.getType())) &&
            (isa<arith::ConstantOp, PhysicalExprOp>(producer) ||
             isPhysicalReplayNode(producer, PhysicalReplayScope::Coordinate,
                                  /*allowAccesses=*/false)) &&
            llvm::all_of(producer->getOperands(), canMoveCoordinate);
   };
-  if (gather.getValid() && !canMoveCoordinate(gather.getValid()))
+  if (!gatheredType && gather.getValid() && !canMoveCoordinate(gather.getValid()))
     return false;
   SmallVector<Value> selected(resultType.getShape().size());
+  SmallVector<unsigned> resultOrder(resultType.getShape().size());
+  llvm::SmallDenseSet<unsigned> selectedResultAxes;
   for (auto [coordinate, axis] : llvm::zip(gather.getCoordinates(), gather.getSourceAxes())) {
     if (axis < 0 || axis >= static_cast<int64_t>(selected.size()) ||
-        selected[axis] || isa<FragmentType>(coordinate.getType()) ||
+        selected[axis] ||
         !canMoveCoordinate(coordinate))
       return false;
+    if (gatheredType) {
+      auto range = coordinate.getDefiningOp<MakeRangeOp>();
+      if (!range || !isUnitStepRange(range))
+        return false;
+      auto projections = queryRangeProjections(gatheredType, range);
+      if (projections.size() != 1 ||
+          !selectedResultAxes.insert(projections.front().fragmentAxis).second ||
+          gatheredType.getShape()[projections.front().fragmentAxis] !=
+              range.getResult().getType().getShape()[0])
+        return false;
+      resultOrder[axis] = projections.front().fragmentAxis;
+    } else if (isa<FragmentType>(coordinate.getType())) {
+      return false;
+    }
     selected[axis] = coordinate;
   }
   auto isUnit = [](Attribute attribute) {
@@ -5139,8 +5158,10 @@ FailureOr<bool> projectScalarContractResult(ContractOp contract) {
           occurrences.fragmentAxes != SmallVector<unsigned>{axis} ||
           !isIntegerConstant((*range).getStart(), 0) ||
           !isIntegerConstant((*range).getLogicalStart(), 0) ||
-          !samePhysicalScalarExpression((*range).getExtent(),
-                                        (*range).getLogicalStop()))
+          (!samePhysicalScalarExpression((*range).getExtent(),
+                                         (*range).getLogicalStop()) &&
+           !isFullCoverageExtent(contract,
+                                 cast<PhysicalExprAttr>(type.getShape()[axis]))))
         return false;
     }
     ++side;
@@ -5160,7 +5181,8 @@ FailureOr<bool> projectScalarContractResult(ContractOp contract) {
   };
   for (Value &coordinate : selected)
     coordinate = moveCoordinate(coordinate);
-  Value gatherValidity = gather.getValid() ? moveCoordinate(gather.getValid()) : Value();
+  Value gatherValidity = !gatheredType && gather.getValid()
+                             ? moveCoordinate(gather.getValid()) : Value();
   PhysicalExprAttr unit = expression(kernel.getContext(), PhysicalExprKind::Constant, 1);
   Value one = builder.create<arith::ConstantIndexOp>(contract.getLoc(), 1);
   side = 0;
@@ -5181,12 +5203,27 @@ FailureOr<bool> projectScalarContractResult(ContractOp contract) {
       if (failed(authority))
         return contract.emitOpError("scalar contraction projection lost its free-axis range");
       auto mapping = cast<AxisMapAttr>(originalType.getAxisMaps()[axis]);
+      unsigned resultAxis = resultAxes[side][axis];
+      auto selectedRange = gatheredType ? coordinate.getDefiningOp<MakeRangeOp>()
+                                       : MakeRangeOp();
+      auto projectedExtent = gatheredType
+                                 ? cast<PhysicalExprAttr>(
+                                       gatheredType.getShape()[resultOrder[resultAxis]])
+                                 : unit;
+      auto projectedMapping = gatheredType
+                                  ? cast<AxisMapAttr>(
+                                        gatheredType.getAxisMaps()[resultOrder[resultAxis]])
+                                  : mapping;
       auto coordinateType = fragmentType(kernel.getContext(), builder.getIndexType(),
-                                          {unit}, {mapping}, originalType.getOwner());
+                                          {projectedExtent}, {projectedMapping},
+                                          originalType.getOwner());
       auto range = builder.create<MakeRangeOp>(
-          contract.getLoc(), coordinateType, coordinate, one, one,
+          contract.getLoc(), coordinateType,
+          selectedRange ? selectedRange.getStart() : coordinate,
+          selectedRange ? selectedRange.getExtent() : one, one,
           (*authority).getLogicalStart(), (*authority).getLogicalStop(),
-          mapping.getSourceId(), mapping.getSourceAxis(), mapping.getDerived());
+          projectedMapping.getSourceId(), projectedMapping.getSourceAxis(),
+          projectedMapping.getDerived());
       inheritRangeAuthority(range, *authority);
       IRMapping replay;
       for (MakeRangeOp root : roots.roots)
@@ -5194,6 +5231,8 @@ FailureOr<bool> projectScalarContractResult(ContractOp contract) {
       ReplayMaterializationOptions options;
       options.fragmentAxis = axis;
       options.traversalRanges = roots.roots;
+      if (gatheredType)
+        options.segmentMapping = projectedMapping;
       auto tail = buildRangeTailPredicate(builder, contract.getLoc(), range, *authority);
       if (failed(tail))
         return contract.emitOpError("scalar contraction projection has no range validity");
@@ -5208,7 +5247,7 @@ FailureOr<bool> projectScalarContractResult(ContractOp contract) {
       options.materializeZeroFill = true;
       auto projected = materializeReplayedValue(
           builder, contract.getLoc(), operand, sourceAxisIdentity(mapping),
-          unit, replay, options);
+          projectedExtent, replay, options);
       if (failed(projected))
         return contract.emitOpError("cannot project a scalar contraction input");
       operand = *projected;
@@ -5220,6 +5259,20 @@ FailureOr<bool> projectScalarContractResult(ContractOp contract) {
   auto projectedType = FragmentType::get(
       kernel.getContext(), resultType.getElementType(), builder.getArrayAttr(shape),
       resultType.getAxisMaps(), resultType.getValidity(), resultType.getOwner());
+  if (gatheredType) {
+    SmallVector<Attribute> projectedShape, projectedMaps;
+    for (auto [axis, gatheredAxis] : llvm::enumerate(resultOrder)) {
+      projectedShape.push_back(gatheredType.getShape()[gatheredAxis]);
+      auto mapping = cast<AxisMapAttr>(gatheredType.getAxisMaps()[gatheredAxis]);
+      projectedMaps.push_back(AxisMapAttr::get(
+          kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+          mapping.getDimensionId(), axis, mapping.getDerived()));
+    }
+    projectedType = FragmentType::get(
+        kernel.getContext(), gatheredType.getElementType(),
+        builder.getArrayAttr(projectedShape), builder.getArrayAttr(projectedMaps),
+        gatheredType.getValidity(), gatheredType.getOwner());
+  }
   auto accumulator = projectPhysicalValueToSchema(
       builder, contract.getLoc(), contract.getAccumulator(), projectedType);
   if (failed(accumulator))
@@ -5229,6 +5282,24 @@ FailureOr<bool> projectScalarContractResult(ContractOp contract) {
       contract.getLhsReductionAxes(), contract.getRhsReductionAxes(),
       contract.getLhsBatchAxes(), contract.getRhsBatchAxes());
   builder.setInsertionPoint(gather);
+  if (gatheredType) {
+    Value result = projected.getResult();
+    SmallVector<int64_t> permutation(resultOrder.size());
+    for (auto [axis, gatheredAxis] : llvm::enumerate(resultOrder))
+      permutation[gatheredAxis] = axis;
+    if (llvm::any_of(llvm::enumerate(permutation), [](auto entry) {
+          return entry.index() != static_cast<unsigned>(entry.value());
+        }))
+      result = builder.create<TransposeOp>(gather.getLoc(), gatheredType, result,
+                                           permutation);
+    if (gather.getValid())
+      result = builder.create<SelectOp>(gather.getLoc(), gatheredType,
+                                       gather.getValid(), result, gather.getFill());
+    gather.getResult().replaceAllUsesWith(result);
+    gather.erase();
+    contract.erase();
+    return true;
+  }
   Value zero = builder.create<arith::ConstantIndexOp>(gather.getLoc(), 0);
   SmallVector<Value> zeros(selected.size(), zero);
   auto replacement = builder.create<GatherOp>(
@@ -6368,7 +6439,7 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
   SmallVector<ContractOp> contracts;
   kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
   for (ContractOp contract : contracts)
-    if (failed(projectScalarContractResult(contract)))
+    if (failed(projectContractResult(contract)))
       return failure();
   eraseDeadPhysicalValues(kernel);
   contracts.clear();
