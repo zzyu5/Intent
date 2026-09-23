@@ -14,7 +14,7 @@ triton,padded_rope_cache_update,B32-QH32-KVH8-D128-cache8192-fp16,0.005720,0.014
 triton,fused_add_rms_norm,8192x4096-bf16,0.094224,0.166656,0.094344,,pass,pass,1.768721,Intent target=cutile; source corpus=triton. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
 triton,rms_norm,8192x4096-bf16,0.050008,0.103424,0.050224,,pass,pass,2.068149,Intent target=cutile; source corpus=triton.
 triton,xformers_rms_norm,8192x4096-bf16,0.048504,0.102984,0.049600,,pass,pass,2.123206,Intent target=cutile; source corpus=triton.
-triton,qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,1.138512,7.616696,1.818600,,pass,pass,6.690044,Intent target=cutile; source corpus=triton. 
+triton,qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,1.138512,1.625320,1.818600,,pass,pass,1.427583,Intent target=cutile; source corpus=triton.
 triton,index_select,source65536-selected32768-hidden4096-fp16,0.183016,0.325480,0.222616,,pass,pass,1.778424,Intent target=cutile; source corpus=triton.
 triton,scaled_index_add,destination65536-routed32768-hidden4096-fp16,0.268928,0.464136,0.303456,,pass,pass,1.725875,Intent target=cutile; source corpus=triton.
 triton,scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,3.320376,16.812056,3.511208,,pass,pass,5.063299,Intent target=cutile; source corpus=triton.
@@ -29,16 +29,16 @@ triton,mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.069488,0.036648,0.028912,
 triton,flash_attention_backward,B2-H16-S2048-D128-fp16-causal,,2.178776,,,worker_timeout,pass,,Intent target=cutile; source corpus=triton. source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。
 triton,moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.254608,2.121544,2.671440,,pass,pass,0.940981,Intent target=cutile; source corpus=triton.
 triton,moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,2.146448,2.121736,4.283064,,pass,pass,0.988487,Intent target=cutile; source corpus=triton.
-triton,mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,0.014544,0.089832,0.014720,,pass,pass,6.176568,Intent target=cutile; source corpus=triton. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
+triton,mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,0.014544,0.070296,0.014720,,pass,pass,4.833333,Intent target=cutile; source corpus=triton.
 triton,mamba_state_passing,B1-C8-H32-state8192-fp32,0.013104,0.019424,0.013200,,pass,pass,1.482295,Intent target=cutile; source corpus=triton.
-triton,mamba_chunk_scan,B1-S2048-H32-G8-P64-N128-C256-bf16,0.042288,0.249072,0.043648,,pass,pass,5.889898,Intent target=cutile; source corpus=triton. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
+triton,mamba_chunk_scan,B1-S2048-H32-G8-P64-N128-C256-bf16,0.042288,0.125384,0.043648,,pass,pass,2.965002,Intent target=cutile; source corpus=triton.
 triton,mamba3_siso_forward,B1-S2048-HQK4-H16-DQK32-DV64-bf16,0.195688,0.690800,0.181656,,source_semantics_gap,pass,,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲 cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
 triton,paged_gqa_decode,B16-QH32-KVH8-S8192-D128-page16-fp16,0.294112,0.395400,0.305912,,pass,pass,1.344386,Intent target=cutile; source corpus=triton.
 triton,splitk_paged_attention,B16-QH32-KVH8-S8192-D128-page16-split8-fp16,0.295848,0.392544,0.808280,,pass,pass,1.326844,Intent target=cutile; source corpus=triton.
 triton,paged_mla_decode,B8-QH128-KVH1-S8192-C512-R64-page16-fp16,0.297904,0.637712,0.370344,,source_abi_gap,pass,,Intent target=cutile; source corpus=triton. 同算法；source 使用 packed KV/page-table ABI 并写辅助 LSE；输入布局适配在计时前完成，完整 source 调用含 scale 分配 cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
 triton,block_sparse_gqa_decode,B8-QH32-KVH8-S8192-D128-blocks32x128,0.067568,0.488704,0.061680,,source_abi_gap,pass,,Intent target=cutile; source corpus=triton. 同算法；source 使用 packed KV/topk ABI；输入布局适配在计时前完成，完整 source 调用含 partial buffer 分配 cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
 triton,flaggems_conv1d,B64-L16384-K5-fp16-same,0.009728,0.022296,0.094392,,pass,pass,2.291941,Intent target=cutile; source corpus=triton.
-triton,flaggems_triangular_solve,B4096-N16-fp32-lower,0.018392,0.123688,0.039640,,pass,pass,6.725098,Intent target=cutile; source corpus=triton.
+triton,flaggems_triangular_solve,B4096-N16-fp32-lower,0.018392,0.067136,0.039640,,pass,pass,3.650283,Intent target=cutile; source corpus=triton.
 triton,flaggems_embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.090032,0.168504,0.095128,,pass,pass,1.871601,Intent target=cutile; source corpus=triton.
 triton,flaggems_roll,8192x4096-fp16-shift-1-axis0,0.049504,0.092968,0.049808,,pass,pass,1.877990,Intent target=cutile; source corpus=triton.
 triton,flaggems_transpose_copy,4093x8191-fp16,0.085312,0.152648,0.280064,,pass,pass,1.789291,Intent target=cutile; source corpus=triton.
@@ -48,7 +48,7 @@ triton,flaggems_logsumexp,8192x8192-fp32,0.100424,0.201040,0.106408,,pass,pass,2
 triton,flaggems_softmax_backward,4096x4097-fp32,0.076512,,0.093504,,pass,numerical_failed,,"generated/source floating result 0 differs: max_abs=0.000152587890625, atol=0.0001, rtol=1e-05; first_failure=13331922; largest tolerance excess has generated=1.2312570810317993, source=1.2313878536224365, abs_error=0.00013077259063720703, limit=0.00011231387907173485"
 triton,flaggems_fused_adamw,N8388608-fp32,0.082616,0.145888,0.083624,,pass,pass,1.765856,Intent target=cutile; source corpus=triton.
 triton,flaggems_addcmul,B64-C128-L4096-bf16,0.049488,0.090168,0.072624,,pass,pass,1.822017,Intent target=cutile; source corpus=triton.
-triton,flaggems_fp8_mqa_logits,Q256-K4096-H32-D128-e4m3,0.044768,0.299888,0.050624,,pass,pass,6.698713,Intent target=cutile; source corpus=triton. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
+triton,flaggems_fp8_mqa_logits,Q256-K4096-H32-D128-e4m3,0.044768,0.210448,0.050624,,pass,pass,4.700858,Intent target=cutile; source corpus=triton.
 triton,flaggems_cumsum,8192x8192-fp32-axis1,0.181984,0.451952,0.181864,,pass,pass,2.483471,Intent target=cutile; source corpus=triton.
 triton,flaggems_histogram,N8388608-bins256-fp32,1.954704,5.887024,2.170576,,pass,pass,3.011721,Intent target=cutile; source corpus=triton.
 triton,flaggems_max_pool2d_with_indices,B8-C32-H128-W128-K3-S2-P1-fp16,0.016544,0.090672,0.018208,,pass,pass,5.480658,Intent target=cutile; source corpus=triton.

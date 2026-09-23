@@ -3666,7 +3666,9 @@
     "software": {
       "intent_compiler_changes": [
         "d6e8d4ff",
-        "b7e7211c"
+        "b7e7211c",
+        "adc53c25",
+        "2585221b"
       ],
       "runner_commit": "b63b772e",
       "cutile": "1.5.0"
@@ -3678,14 +3680,14 @@
         "numerical_failure": 2
       },
       "eligible_gpu_pairs": 96,
-      "geomean_cutile_over_intent_triton": 1.287571285468841,
-      "geomean_cutile_over_reference": 0.8513549116282697,
+      "geomean_cutile_over_intent_triton": 1.287230240872255,
+      "geomean_cutile_over_reference": 0.8511294095565284,
       "not_slower_intent_triton": 13,
       "slower_than_intent_triton_by_over_20_percent": 35,
       "slower_than_intent_triton_by_over_2x": 16,
       "not_slower_reference": 64,
       "same_precision_agent_triton_pairs": 69,
-      "geomean_cutile_over_agent_triton": 1.1910182370942828,
+      "geomean_cutile_over_agent_triton": 1.1905793448203394,
       "not_slower_same_precision_agent_triton": 24
     },
     "records": [
@@ -4271,21 +4273,21 @@
         "program": "first-stage-high-global-performance-organization/fused_add_mul_groupnorm/intent/candidate.py",
         "status": "pass",
         "timing": "cuda_graph",
-        "candidate_ms": 0.48266400396823883,
+        "candidate_ms": 0.4705439954996109,
         "reference_ms": 0.33555199205875397,
-        "ratio": 1.438417936388606,
+        "ratio": 1.4022983222737664,
         "tolerance": {
           "atol": 0.0001,
           "rtol": 1e-05
         },
         "reference_timing_note": null,
         "compiler_artifacts": {
-          "fused_add_mul_groupnorm": "/home/kingdom/.cache/intentdsl/compiler/feefa0f7fce04b3aabc194d8bc3de914"
+          "fused_add_mul_groupnorm": "/home/kingdom/.cache/intentdsl/compiler/98f9c06c9ea54727a3772c600aa47489"
         },
         "tuning_winners": [
           {
             "kernel": "fused_add_mul_groupnorm",
-            "winner": "namespace(CUTILE_OCCUPANCY=2, FRAGMENT_S18_A0=1, FRAGMENT_S22_A0=1, POINTWISE_CHUNK_S15_A0=32, REDUCE_CHUNK_11_A0_E8=8, REDUCE_CHUNK_13_A0_E128=32)"
+            "winner": "namespace(CUTILE_ACCESS_FORM=2, CUTILE_OCCUPANCY=2, FRAGMENT_S18_A0=1, FRAGMENT_S22_A0=1, POINTWISE_CHUNK_S15_A0=32, REDUCE_CHUNK_11_A0_E8=8, REDUCE_CHUNK_13_A0_E128=32)"
           }
         ]
       },
