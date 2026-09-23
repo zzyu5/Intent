@@ -1828,12 +1828,15 @@ PhysicalExprAttr queryLaunchExpression(Value value) {
   return query(value, 0);
 }
 
-PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
-  struct Bounds {
-    bool nonNegative = false;
-    PhysicalExprAttr upper;
-    int64_t lower = 0;
-  };
+namespace {
+struct IndexBounds {
+  bool nonNegative = false;
+  PhysicalExprAttr upper;
+  int64_t lower = 0;
+};
+
+IndexBounds queryIndexBounds(Value value) {
+  using Bounds = IndexBounds;
   auto constantUpper = [](Bounds bounds) -> std::optional<int64_t> {
     if (bounds.nonNegative && bounds.upper &&
         bounds.upper.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant))
@@ -1897,7 +1900,7 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
         if (lower.nonNegative && upper && step && *step > 0 &&
             *upper <= std::numeric_limits<int64_t>::max() - *step + 1)
           return {true, expression(PhysicalExprKind::Constant,
-                                   std::max<int64_t>(*upper - 1, 0))};
+                                   std::max<int64_t>(*upper - 1, 0)), lower.lower};
         if (lower.nonNegative && step && *step == 1) {
           // The induction value exists only in an executing loop body. Its
           // exclusive upper bound therefore exceeds the nonnegative lower
@@ -1949,7 +1952,7 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
       }
     if (std::optional<int64_t> constant = integerConstant(current)) {
       if (*constant >= 0)
-        return {true, expression(PhysicalExprKind::Constant, *constant)};
+        return {true, expression(PhysicalExprKind::Constant, *constant), *constant};
       return {};
     }
     auto binary = current.getDefiningOp<BinaryOp>();
@@ -2048,11 +2051,11 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
       if (binary.getOperatorKind() == BinaryOperator::Add &&
           *lhsConstant <= maximum - *rhsConstant)
         return {true, expression(PhysicalExprKind::Constant,
-                                 *lhsConstant + *rhsConstant)};
+                                 *lhsConstant + *rhsConstant), lhs.lower + rhs.lower};
       if (binary.getOperatorKind() == BinaryOperator::Multiply &&
           (*rhsConstant == 0 || *lhsConstant <= maximum / *rhsConstant))
         return {true, expression(PhysicalExprKind::Constant,
-                                 *lhsConstant * *rhsConstant)};
+                                 *lhsConstant * *rhsConstant), lhs.lower * rhs.lower};
     }
     if (binary.getOperatorKind() == BinaryOperator::Minimum) {
       PhysicalExprAttr upper = lhs.upper && rhs.upper
@@ -2100,16 +2103,35 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
     }
     return {};
   };
-  Bounds result = bound(value, 0);
+  return bound(value, 0);
+}
+} // namespace
+
+PhysicalExprAttr queryNonNegativeIndexUpperBound(Value value) {
+  IndexBounds result = queryIndexBounds(value);
   return result.nonNegative ? result.upper : PhysicalExprAttr();
 }
 
 PhysicalExprAttr queryLogicalRangeCapacity(MakeRangeOp range) {
   if (!isUnitStepRange(range))
     return {};
-  if (queryNonNegativeIndexUpperBound(range.getLogicalStart()))
-    if (auto stop = queryNonNegativeIndexUpperBound(range.getLogicalStop()))
-      return stop;
+  IndexBounds lower = queryIndexBounds(range.getLogicalStart());
+  if (lower.nonNegative)
+    if (auto stop = queryNonNegativeIndexUpperBound(range.getLogicalStop())) {
+      if (lower.lower == 0)
+        return stop;
+      auto make = [&](PhysicalExprKind kind, int64_t value,
+                      ArrayRef<Attribute> operands = {}) {
+        auto context = range.getContext();
+        return PhysicalExprAttr::get(context, static_cast<uint32_t>(kind), value,
+                                    StringAttr::get(context, ""),
+                                    ArrayAttr::get(context, operands));
+      };
+      auto span = make(PhysicalExprKind::Subtract, 0,
+                       {stop, make(PhysicalExprKind::Constant, lower.lower)});
+      return make(PhysicalExprKind::Maximum, 0,
+                  {span, make(PhysicalExprKind::Constant, 0)});
+    }
 
   auto stop = queryLaunchExpression(range.getLogicalStop());
   if (!stop)

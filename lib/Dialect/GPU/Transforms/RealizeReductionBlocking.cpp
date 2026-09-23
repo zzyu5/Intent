@@ -2749,6 +2749,15 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
       name += "_OUTER";
     SmallVector<int64_t> candidates{4,   8,    16,   32,   64,   128, 256,
                                     512, 1024, 2048, 4096, 8192};
+    if (auto capacity = queryLogicalRangeCapacity(firstRange))
+      if (auto constant = constantPhysicalExpression(capacity)) {
+        uint64_t padded = llvm::PowerOf2Ceil(
+            static_cast<uint64_t>(std::max<int64_t>(*constant, candidates.front())));
+        llvm::erase_if(candidates, [&](int64_t candidate) {
+          return static_cast<uint64_t>(candidate) > padded;
+        });
+        name += ("_E" + Twine(padded)).str();
+      }
     chunk = getOrCreatePhysicalParameter(
         kernel, name, reductionRole, ParameterCategory::Reduction,
         firstSource.getElementType().getIntOrFloatBitWidth(), candidates);
