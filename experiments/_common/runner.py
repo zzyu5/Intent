@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 import csv
+import fcntl
 from dataclasses import dataclass, replace
 import json
 import math
@@ -66,8 +67,16 @@ def _target(provider: str, entry):
     raise ValueError(f"unknown provider: {provider}")
 
 
-def _write(path: Path, rows: list[ResultRow]) -> None:
+def _write(path: Path, rows: list[ResultRow], *, target: str | None = None,
+           changed: ResultRow | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        with path.open(newline="") as stream:
+            fields = csv.DictReader(stream).fieldnames
+        if fields and "intent_triton_status" in fields:
+            _write_target_rows(path, [changed] if changed is not None else rows,
+                               target=target)
+            return
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=FIELDS, lineterminator="\n")
@@ -89,6 +98,36 @@ def _write(path: Path, rows: list[ResultRow]) -> None:
                 }
             )
     temporary.replace(path)
+
+
+def _write_target_rows(path: Path, rows: list[ResultRow], *, target: str | None) -> None:
+    if target not in {"triton", "cutile"}:
+        raise ValueError("a cross-backend result table requires its Intent target")
+    from intent.compiler.cache import cache_root
+    lock_path = cache_root() / "benchmark-results.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with path.open(newline="") as stream:
+            reader = csv.DictReader(stream)
+            fields = reader.fieldnames
+            records = {(r["kernel"], r["case"]): r for r in reader}
+        prefix = "intent_" + target + "_"
+        for row in rows:
+            key = row.kernel, row.case
+            record = records.setdefault(key, {"kernel": row.kernel, "case": row.case})
+            record[prefix + "p50_ms"] = "" if row.generated_p50_ms is None else f"{row.generated_p50_ms:.6f}"
+            record[prefix + "ratio"] = "" if row.ratio is None else f"{row.ratio:.6f}"
+            record[prefix + "status"] = row.status
+            record[prefix + "note"] = row.note.strip()
+            if row.source_p50_ms is not None:
+                record["source_p50_ms"] = f"{row.source_p50_ms:.6f}"
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        with temporary.open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(records.values())
+        temporary.replace(path)
 
 
 def _write_stage(path: Path, stage: str) -> None:
@@ -206,9 +245,18 @@ def _run_entry(
     )
 
 
-def _read_rows(path: Path) -> list[ResultRow]:
+def _read_rows(path: Path, *, target: str | None = None) -> list[ResultRow]:
     with path.open(newline="") as stream:
         records = tuple(csv.DictReader(stream))
+    if records and "intent_triton_status" in records[0]:
+        if target not in {"triton", "cutile"}:
+            raise ValueError("a cross-backend result table requires its Intent target")
+        prefix = "intent_" + target + "_"
+        records = tuple({"kernel": r["kernel"], "case": r["case"],
+                         "generated_p50_ms": r[prefix + "p50_ms"],
+                         "source_p50_ms": r["source_p50_ms"],
+                         "ratio": r[prefix + "ratio"], "status": r[prefix + "status"],
+                         "note": r[prefix + "note"]} for r in records)
     return [_row_from_record(record) for record in records]
 
 
@@ -463,7 +511,8 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
 
     rows = {
         row.kernel: row
-        for row in (_read_rows(arguments.output) if arguments.output.exists() else ())
+        for row in (_read_rows(arguments.output, target=arguments.target)
+                    if arguments.output.exists() else ())
     }
     known = {entry.kernel for entry in BY_PROVIDER[provider]}
     if rows.keys() - known:
@@ -474,6 +523,8 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
         _write(
             arguments.output,
             [rows[entry.kernel] for entry in BY_PROVIDER[provider] if entry.kernel in rows],
+            target=arguments.target,
+            changed=row,
         )
         print(f"{provider}:{row.kernel}: saved {row.status}", flush=True)
 
