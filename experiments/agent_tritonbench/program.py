@@ -21,6 +21,7 @@ from torch.utils._python_dispatch import _disable_current_modes
 
 from experiments._common.support import benchmark
 from experiments._common.loading import load_module
+from experiments._common.measurement import CUTILE_TUNING_LAUNCH_TIMEOUT_SECONDS
 
 
 class ProgramContext:
@@ -55,6 +56,8 @@ class ProgramContext:
             search = artifact._namespace["exhaustive_search"]
 
             def record_search(configs, *args, **kwargs):
+                kwargs.setdefault("single_run_timeout_sec",
+                                  CUTILE_TUNING_LAUNCH_TIMEOUT_SECONDS)
                 result = search(configs, *args, **kwargs)
                 self.tuning.append({"kernel": name, "declared": len(configs),
                                     "measured": len(result.successes),

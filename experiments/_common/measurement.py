@@ -35,6 +35,7 @@ class NumericalComparisonError(RuntimeError):
 
 MEASUREMENT_REPETITIONS = 200
 COMPARISON_CHUNK_ELEMENTS = 1 << 20
+CUTILE_TUNING_LAUNCH_TIMEOUT_SECONDS = 3
 
 
 _stage_observer: ContextVar[Callable[[str], None] | None] = ContextVar(
@@ -127,7 +128,18 @@ def gpu_execution(path, *, providers):
                 compile_outside_window(JITFunction, "_do_compile")
             if "cutile" in providers:
                 import cuda.tile as ct
+                import cuda.tile.tune as tune
                 compile_outside_window(ct.kernel, "_compile")
+                original_search = tune.exhaustive_search
+
+                @wraps(original_search)
+                def bounded_search(*args, **kwargs):
+                    kwargs.setdefault("single_run_timeout_sec",
+                                      CUTILE_TUNING_LAUNCH_TIMEOUT_SECONDS)
+                    return original_search(*args, **kwargs)
+
+                tune.exhaustive_search = bounded_search
+                patches.callback(setattr, tune, "exhaustive_search", original_search)
             window.acquire()
             yield
         finally:
