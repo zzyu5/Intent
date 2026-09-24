@@ -80,19 +80,16 @@ The source constructs have distinct meanings:
   Collectives have no hidden communication between independent GPU programs.
   A prefix over an entire axis remains global when its consumer uses I.parallel.
 
-Choose logical group counts, domain boundaries and intermediate tensor shapes as
-part of the algorithm. They may be fixed or constexpr and need not appear in
-TASK.md or the external signature. A partition defining logical members remains
-an algorithm choice even when Triton calls it a block. Express independent pieces
-normally distinguished by program_id through those domains and subregions;
-removing physical tile parameters must preserve the logical decomposition.
-The compiler chooses physical tiles, program mapping, thread layouts and provider
-configuration within the declared kernels. It does not reconstruct missing stages.
 Free axes of tensor expressions and structured operations already express
 independent result coordinates. Do not introduce fixed logical subregions solely
-to reproduce physical BLOCK_M/BLOCK_N values. Preserve partitions that define the
-algorithm's members, partial results or stage interfaces; reduction axes do not
-become free axes when physical tile sizes are omitted.
+to reproduce physical BLOCK_M/BLOCK_N values or every use of program_id. Use the
+complete logical tensor expression when those free axes describe the independent
+work. Preserve partitions that define the algorithm's partial results, member
+selection or stage interfaces; reduction axes do not become free axes when
+physical tile sizes are omitted. Such algorithmic group counts, domain boundaries
+and intermediate shapes may be fixed or constexpr and need not appear in TASK.md
+or the external signature. The compiler chooses physical tiles, program mapping,
+thread layouts and provider configuration; it does not reconstruct missing stages.
 
 When the chosen Triton algorithm uses multiple kernels, retain those kernels and
 their host calls in Intent. Allocate cross-kernel tensors in the host callable and pass

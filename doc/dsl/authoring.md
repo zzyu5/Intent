@@ -8,7 +8,7 @@
 
 可以把 Intent 理解为 Triton 式 kernel 算法的逻辑域表达：保留算法的独立工作、逻辑分组、局部结果与阶段依赖，把物理 tile、线程布局和流水线配置交给 compiler。它不是把完整算子交给库或 compiler 自动选择算法的接口。
 
-- 先确定各阶段的输入、输出、独立逻辑组及组内参与计算的成员，再写 kernel。Triton 写法中由不同 program 分别承担的算法工作，应保留为逻辑 domains/subregions 与 `I.parallel`；去掉物理 block 参数，不意味着去掉工作分组。一个逻辑组不要求对应一个物理 CTA。
+- 先确定各阶段的输入、输出、参与计算的成员和依赖，再写 kernel。Triton 的 `program_id` 既可区分算法上的局部汇总，也可仅用于给独立结果分配物理 tiles：前者保留相应逻辑分组与中间接口，后者由 tensor 的自由轴或 `I.parallel` 表达独立坐标即可，不要求逐个 program 复刻分组。
 - Triton 的向量表达式对应逻辑 tensor 运算。核对 dtype、成员与数值合同后，`tl.sum` 对应 `I.reduce.sum`，`tl.dot` 对应 `I.matmul`/`I.contract`，`tl.associative_scan` 对应 `I.scan`；无需逐元素展开成普通循环。外层 `I.parallel` 不会使内层普通循环并行；structured operation 产生的 tensor values 可以由满足无冲突 effects 的独立逻辑点消费。
 - Tensor 运算与 structured operation 保留的自由轴本身就表达独立结果坐标；compiler 在保持 control/effects 的前提下分块和映射这些轴。无需仅为复刻 Triton 的物理 `BLOCK_M/BLOCK_N` 而额外建立固定大小的 logical subregions。算法需要的独立成员集合、局部汇总或跨 kernel 接口仍须显式保留；完整归约的 reduction axis 不因省略物理 tile 而成为自由轴。
 - 外部结果是 scalar，不意味着应把整个输入放进一个全轴归约。`I.reduce` 处理传入 value 的指定轴；全域 value 的归约仍有全局依赖。对 producer 或后续 consumer 写 `I.parallel`，不会替这项归约建立分组或跨 kernel 汇总。
