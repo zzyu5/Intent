@@ -70,6 +70,49 @@ widenedConstantReciprocal(const llvm::APFloat &divisor) {
   return inverse;
 }
 
+void combineNestedSelections(SelectOp select) {
+  if (!select)
+    return;
+  bool changed;
+  do {
+    changed = false;
+    for (unsigned arm = 0; arm < 2; ++arm) {
+      auto inner = select->getOperand(arm + 1).getDefiningOp<SelectOp>();
+      Value otherwise = select->getOperand(2 - arm);
+      if (!inner || !inner->hasOneUse())
+        continue;
+      bool inverted = inner.getTrueValue() == otherwise;
+      if (!inverted && inner.getFalseValue() != otherwise)
+        continue;
+      OpBuilder builder(select);
+      Location location = select.getLoc();
+      Type predicateType = select.getCondition().getType();
+      Value outerCondition = select.getCondition();
+      Value innerCondition = inner.getCondition();
+      if (arm)
+        outerCondition = builder.create<UnaryOp>(
+            location, predicateType, outerCondition, UnaryOperator::Not);
+      if (inverted)
+        innerCondition = builder.create<UnaryOp>(
+            location, predicateType, innerCondition, UnaryOperator::Not);
+      Value inactive = builder.create<arith::ConstantOp>(
+          location, builder.getBoolAttr(false));
+      if (auto fragment = dyn_cast<FragmentType>(predicateType))
+        inactive = builder.create<SplatOp>(location, fragment, inactive);
+      // Keep short-circuit selection: an inactive inner condition must not
+      // become observable merely because nested value selects were combined.
+      Value active = builder.create<SelectOp>(
+          location, predicateType, outerCondition, innerCondition, inactive);
+      select->setOperand(0, active);
+      select->setOperand(1, inverted ? inner.getFalseValue()
+                                     : inner.getTrueValue());
+      select->setOperand(2, otherwise);
+      changed = true;
+      break;
+    }
+  } while (changed);
+}
+
 void eliminateInBlock(Block &block) {
   llvm::DenseMap<OperationName, SmallVector<Operation *>> available;
   for (Operation &operation : llvm::make_early_inc_range(block)) {
@@ -78,6 +121,7 @@ void eliminateInBlock(Block &block) {
         eliminateInBlock(nested);
     if (foldConstantDivision(operation))
       continue;
+    combineNestedSelections(dyn_cast<SelectOp>(operation));
     if (auto reshape = dyn_cast<ReshapeOp>(operation);
         reshape && reshape.getValue().getType() == reshape.getResult().getType()) {
       reshape.getResult().replaceAllUsesWith(reshape.getValue());
