@@ -1226,6 +1226,119 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
   return true;
 }
 
+bool scalarPredicateContains(Value predicate, Value required) {
+  if (!predicate)
+    return false;
+  if (predicate == required)
+    return true;
+  auto lhs = predicate.getDefiningOp<CompareOp>();
+  auto rhs = required.getDefiningOp<CompareOp>();
+  if (lhs && rhs && lhs.getPredicate() == rhs.getPredicate() &&
+      lhs.getLhs().getType().isIndex() && rhs.getLhs().getType().isIndex() &&
+      samePhysicalScalarExpression(lhs.getLhs(), rhs.getLhs()) &&
+      samePhysicalScalarExpression(lhs.getRhs(), rhs.getRhs()))
+    return true;
+  auto binary = predicate.getDefiningOp<BinaryOp>();
+  return binary && binary.getOperatorKind() == BinaryOperator::LogicalAnd &&
+         (scalarPredicateContains(binary.getLhs(), required) ||
+          scalarPredicateContains(binary.getRhs(), required));
+}
+
+bool impliesUniformPredicate(Value predicate, Value required) {
+  if (!required)
+    return true;
+  auto constant = dyn_cast_or_null<IntegerAttr>(
+      UniformValueAnalysis(describeUniformValue).evaluate(required));
+  if (constant && constant.getType().isInteger(1) &&
+      constant.getValue().isOne())
+    return true;
+  if (auto splat = required.getDefiningOp<SplatOp>())
+    return impliesUniformPredicate(predicate, splat.getValue());
+  if (auto broadcast = required.getDefiningOp<BroadcastOp>())
+    return impliesUniformPredicate(predicate, broadcast.getValue());
+  if (auto binary = required.getDefiningOp<BinaryOp>();
+      binary && binary.getOperatorKind() == BinaryOperator::LogicalAnd)
+    return impliesUniformPredicate(predicate, binary.getLhs()) &&
+           impliesUniformPredicate(predicate, binary.getRhs());
+  // Only scalar conjuncts may be shared across retained fragment lanes.
+  return required.getType().isInteger(1) &&
+         scalarPredicateContains(predicate, required);
+}
+
+bool reuseFragmentGather(GatherOp gather) {
+  auto source = dyn_cast<FragmentType>(gather.getSource().getType());
+  if (!source || gather.getResult().getType() != source.getElementType() ||
+      gather.getSourceAxes().size() != source.getShape().size() ||
+      llvm::any_of(gather.getCoordinates(),
+                   [](Value coordinate) { return !coordinate.getType().isIndex(); }))
+    return false;
+  for (auto [axis, sourceAxis] : llvm::enumerate(gather.getSourceAxes()))
+    if (sourceAxis != static_cast<int64_t>(axis))
+      return false;
+
+  // A scalar extraction can reuse an earlier immutable slice of the same SSA
+  // tensor. Native layout/communication still belongs to the provider compiler.
+  for (Operation *user : gather.getSource().getUsers()) {
+    auto available = dyn_cast<GatherOp>(user);
+    auto sliced = available
+                      ? dyn_cast<FragmentType>(available.getResult().getType())
+                      : FragmentType();
+    if (!available || available == gather ||
+        available->getBlock() != gather->getBlock() ||
+        !available->isBeforeInBlock(gather) || !sliced ||
+        sliced.getOwner() != source.getOwner() ||
+        available.getSourceAxes().empty() ||
+        sliced.getShape().size() + available.getSourceAxes().size() !=
+            source.getShape().size() ||
+        !impliesUniformPredicate(gather.getValid(), available.getValid()))
+      continue;
+    SmallVector<bool> selected(source.getShape().size(), false);
+    bool matches = true;
+    for (auto [coordinate, axis] :
+         llvm::zip(available.getCoordinates(), available.getSourceAxes())) {
+      if (axis < 0 || axis >= static_cast<int64_t>(selected.size()) ||
+          selected[axis] || !coordinate.getType().isIndex() ||
+          !samePhysicalScalarExpression(coordinate,
+                                        gather.getCoordinates()[axis])) {
+        matches = false;
+        break;
+      }
+      selected[axis] = true;
+    }
+    if (!matches)
+      continue;
+    SmallVector<Value> coordinates;
+    SmallVector<int64_t> axes;
+    for (unsigned axis = 0; axis < selected.size(); ++axis) {
+      if (selected[axis])
+        continue;
+      unsigned retained = coordinates.size();
+      auto originalMap = cast<AxisMapAttr>(source.getAxisMaps()[axis]);
+      auto retainedMap = cast<AxisMapAttr>(sliced.getAxisMaps()[retained]);
+      if (sliced.getShape()[retained] != source.getShape()[axis] ||
+          !(sourceAxisIdentity(originalMap) == sourceAxisIdentity(retainedMap)) ||
+          originalMap.getDimensionId() != retainedMap.getDimensionId()) {
+        matches = false;
+        break;
+      }
+      coordinates.push_back(gather.getCoordinates()[axis]);
+      axes.push_back(retained);
+    }
+    if (!matches)
+      continue;
+    OpBuilder builder(gather);
+    auto replacement = builder.create<GatherOp>(
+        gather.getLoc(), gather.getResult().getType(), available.getResult(),
+        coordinates, gather.getValid(), gather.getFill(), axes);
+    replacement->setDiscardableAttrs(
+        llvm::to_vector(gather->getDiscardableAttrs()));
+    gather.getResult().replaceAllUsesWith(replacement.getResult());
+    gather.erase();
+    return true;
+  }
+  return false;
+}
+
 FailureOr<bool> composeIdentityFragmentGather(GatherOp gather) {
   auto source = dyn_cast<FragmentType>(gather.getSource().getType());
   auto result = dyn_cast<FragmentType>(gather.getResult().getType());
@@ -2851,6 +2964,10 @@ LogicalResult realizeAccessComposition(ModuleOp module) {
     for (GatherOp gather : gathers) {
       if (!gather->getBlock())
         continue;
+      if (reuseFragmentGather(gather)) {
+        changed = true;
+        continue;
+      }
       FailureOr<bool> identity = composeIdentityFragmentGather(gather);
       if (failed(identity))
         return failure();
