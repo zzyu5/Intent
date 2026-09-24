@@ -18,6 +18,7 @@
   },
   "cutile": {
     "ctas": [[1]],
+    "worker_warps": [[1], [8]],
     "access_form": [[1], [2], [3]],
     "load_policy_loop": [[11]],
     "occupancy_loop": [[2], [1]],
