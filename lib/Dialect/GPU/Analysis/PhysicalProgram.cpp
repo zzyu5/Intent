@@ -857,10 +857,10 @@ positiveExtentBounds(func::FuncOp kernel, PhysicalExprAttr extent) {
   if (!extent)
     return std::nullopt;
   auto kind = static_cast<PhysicalExprKind>(extent.getKind());
-  if (kind == PhysicalExprKind::Constant) {
-    if (extent.getValue() <= 0)
+  if (auto constant = constantPhysicalExpression(extent)) {
+    if (*constant <= 0)
       return std::nullopt;
-    return std::pair{extent.getValue(), extent.getValue()};
+    return std::pair{*constant, *constant};
   }
   if (kind == PhysicalExprKind::Parameter) {
     FailureOr<ParameterOp> parameter =

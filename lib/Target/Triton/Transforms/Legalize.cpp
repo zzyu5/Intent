@@ -3774,26 +3774,16 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
     return false;
   };
   llvm::DenseMap<Value, Value> nonOverlappingViews;
-  auto disjointLoopWrites = [&](Block &body, const Accesses &bodyAccesses) {
+  auto disjointLoopAccesses = [&](Block &body, const Accesses &bodyAccesses) {
     llvm::DenseMap<Value, Value> conditions;
     auto loop = dyn_cast<scf::ForOp>(body.getParentOp());
     if (!loop || !loop.getUpperBound().getType().isIndex())
       return conditions;
-    int64_t maximumStep = 0;
-    if (auto constant = loop.getStep().getDefiningOp<arith::ConstantIndexOp>())
-      maximumStep = constant.value();
-    else
-      kernel.walk([&](gpu::ParameterOp parameter) {
-        if (!gpu::samePhysicalScalarExpression(loop.getStep(),
-                                               parameter.getResult()))
-          return;
-        auto values = parameter.getParameter().getCandidates().asArrayRef();
-        if (!values.empty() &&
-            llvm::all_of(values, [](int64_t value) { return value > 0; }))
-          maximumStep = *llvm::max_element(values);
-      });
-    if (maximumStep <= 0)
+    auto stepBounds = gpu::queryPositiveExtentBounds(
+        gpu::queryLaunchExpression(loop.getStep()), kernel);
+    if (!stepBounds)
       return conditions;
+    int64_t maximumStep = stepBounds->second;
     bool modeledEffects = true;
     body.walk([&](Operation *operation) {
       if (!isa<gpu::LoadOp, gpu::StoreOp, scf::ForOp, scf::IfOp,
@@ -3807,7 +3797,7 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
     for (auto [resource, mode] : bodyAccesses) {
       auto argument = dyn_cast<BlockArgument>(resource);
       auto view = dyn_cast<gpu::ViewType>(resource.getType());
-      if (mode != 2 || !argument || argument.getOwner() != &kernel.front() ||
+      if (!(mode & 2) || !argument || argument.getOwner() != &kernel.front() ||
           !view || !view.getLayout().getHasStrides() ||
           view.getLayout().getStrides().size() != view.getRank())
         continue;
@@ -3821,29 +3811,44 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
       });
       if (stores != 1 || selected->getBlock() != &body)
         continue;
-      unsigned varyingAxes = 0;
-      bool disjoint = true;
-      for (Value coordinate : selected.getCoordinates()) {
-        Value root = coordinate;
-        while (true) {
-          if (auto broadcast = root.getDefiningOp<gpu::BroadcastOp>())
-            root = broadcast.getValue();
-          else if (auto reshape = root.getDefiningOp<gpu::ReshapeOp>())
-            root = reshape.getValue();
-          else
-            break;
+      auto chunkAxis = [&](ValueRange coordinates,
+                           ArrayRef<int64_t> sourceAxes) -> std::optional<int64_t> {
+        std::optional<int64_t> axis;
+        for (auto [coordinate, sourceAxis] : llvm::zip(coordinates, sourceAxes)) {
+          Value root = coordinate;
+          while (true) {
+            if (auto broadcast = root.getDefiningOp<gpu::BroadcastOp>())
+              root = broadcast.getValue();
+            else if (auto reshape = root.getDefiningOp<gpu::ReshapeOp>())
+              root = reshape.getValue();
+            else
+              break;
+          }
+          auto range = root.getDefiningOp<gpu::MakeRangeOp>();
+          if (root == loop.getInductionVar() ||
+              (range && range.getStart() == loop.getInductionVar() &&
+               gpu::isUnitStepRange(range) &&
+               gpu::samePhysicalScalarExpression(range.getExtent(),
+                                                  loop.getStep()))) {
+            if (axis)
+              return std::nullopt;
+            axis = sourceAxis;
+          } else if (gpu::variesWithIteration(root, loop, varying)) {
+            return std::nullopt;
+          }
         }
-        auto range = root.getDefiningOp<gpu::MakeRangeOp>();
-        if (root == loop.getInductionVar() ||
-            (range && range.getStart() == loop.getInductionVar() &&
-             gpu::isUnitStepRange(range) &&
-             gpu::samePhysicalScalarExpression(range.getExtent(),
-                                                loop.getStep())))
-          ++varyingAxes;
-        else if (gpu::variesWithIteration(root, loop, varying))
+        return axis;
+      };
+      auto storeAxis = chunkAxis(selected.getCoordinates(), selected.getSourceAxes());
+      if (!storeAxis)
+        continue;
+      bool disjoint = true;
+      body.walk([&](gpu::LoadOp load) {
+        if (load.getResource() == resource &&
+            chunkAxis(load.getCoordinates(), load.getSourceAxes()) != storeAxis)
           disjoint = false;
-      }
-      if (!disjoint || varyingAxes != 1)
+      });
+      if (!disjoint)
         continue;
       Value &layout = nonOverlappingViews[resource];
       if (!layout) {
@@ -3855,7 +3860,7 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
       OpBuilder builder(loop);
       if (!safeRange) {
         // Include the final padded chunk and the terminating IV update in
-        // the no-wrap proof; an arbitrary store mask can only remove writes.
+        // the no-wrap proof; access masks can only narrow each chunk.
         Value limit = builder.create<arith::ConstantIndexOp>(
             loop.getLoc(), std::numeric_limits<int64_t>::max() - maximumStep);
         safeRange = builder.create<gpu::CompareOp>(
@@ -3868,11 +3873,11 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
     }
     return conditions;
   };
-  const llvm::DenseMap<Value, Value> noDisjointWrites;
+  const llvm::DenseMap<Value, Value> noDisjointIterations;
   std::map<std::pair<unsigned, unsigned>, Value> overlapFacts;
   auto insertBarrier = [&](OpBuilder &builder, Location location,
                            Accesses &pending, const Accesses &current,
-                           const llvm::DenseMap<Value, Value> &disjointWrites) {
+                           const llvm::DenseMap<Value, Value> &disjointIterations) {
     SmallVector<std::pair<unsigned, unsigned>> pairs;
     Value condition;
     auto externalArgument = [&](Value value) -> BlockArgument {
@@ -3887,9 +3892,9 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
       for (auto [other, otherMode] : current) {
         if (!((mode | otherMode) & 2) || !viewsMayAlias(resource, other))
           continue;
-        if (resource == other && mode == 2 && otherMode == 2)
-          if (auto proof = disjointWrites.find(resource);
-              proof != disjointWrites.end()) {
+        if (resource == other)
+          if (auto proof = disjointIterations.find(resource);
+              proof != disjointIterations.end()) {
             Value zero = builder.create<arith::ConstantIntOp>(location, 0, 1);
             Value needed = builder.create<gpu::CompareOp>(
                 location, builder.getI1Type(), proof->second, zero,
@@ -3994,8 +3999,8 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
     for (Operation &operation : block)
       for (auto [resource, mode] : accesses(&operation))
         bodyAccesses[resource] |= mode;
-    auto disjointWrites = loopBody ? disjointLoopWrites(block, bodyAccesses)
-                                  : llvm::DenseMap<Value, Value>();
+    auto disjointIterations = loopBody ? disjointLoopAccesses(block, bodyAccesses)
+                                      : llvm::DenseMap<Value, Value>();
     for (Operation &operation : llvm::make_early_inc_range(block.without_terminator())) {
       if (isa<CtaBarrierOp>(operation)) {
         pending.clear();
@@ -4007,7 +4012,7 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
           return operation.emitOpError("ordered view dependency requires uniform CTA control before synchronization");
         OpBuilder builder(&operation);
         insertBarrier(builder, operation.getLoc(), pending, current,
-                      noDisjointWrites);
+                      noDisjointIterations);
       }
       if (operation.getNumRegions()) {
         bool nestedUniform = uniformControl;
@@ -4037,7 +4042,7 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
         return block.getTerminator()->emitOpError("loop-carried view dependency requires uniform CTA control before synchronization");
       OpBuilder builder(block.getTerminator());
       insertBarrier(builder, block.getTerminator()->getLoc(), pending,
-                    bodyAccesses, disjointWrites);
+                    bodyAccesses, disjointIterations);
     }
     return success();
   };
