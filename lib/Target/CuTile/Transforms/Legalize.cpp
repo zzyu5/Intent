@@ -1870,9 +1870,9 @@ LogicalResult verifyScan(gpu::ScanOp scan) {
   if (scan.getSourceCount() == 0 ||
       scan.getSourceCount() != scan.getIdentityCount() ||
       scan.getSourceCount() != scan.getNumResults() ||
-      scan.getCaptureCount() != 0 || !scan.getInclusive())
+      scan.getCaptureCount() != 0)
     return scan.emitOpError(
-        "cuTile scan lowering requires matching source/identity/result schemas, no captures, and an inclusive prefix");
+        "cuTile scan lowering requires matching source/identity/result schemas and no captures");
   auto source = dyn_cast<gpu::FragmentType>(scan.getInputs().front().getType());
   if (!source)
     return scan.emitOpError("cuTile scan source must be a tile");
@@ -2612,6 +2612,13 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
     bool native = scan.getSourceCount() == 1 && kind &&
                   *kind == BinaryOperator::Add &&
                   isNativeReductionIdentity(*kind, scan.getInputs()[1]);
+    Type element = gpu::uniformElementType(scan.getInputs().front().getType());
+    bool exclusiveSum = !scan.getInclusive() && native &&
+                        isa<IntegerType, IndexType>(element) &&
+                        !element.isInteger(1);
+    if (!scan.getInclusive() && !exclusiveSum)
+      return scan.emitOpError(
+          "cuTile exclusive scan requires an additive integer prefix");
     OpBuilder builder(scan);
     auto replacement = builder.create<ScanOp>(
         scan.getLoc(), scan.getResultTypes(),
@@ -2625,7 +2632,14 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
       return failure();
     if (Attribute origin = scan->getAttr(gpu::originAttr))
       replacement->setAttr(gpu::originAttr, origin);
-    scan.replaceAllUsesWith(replacement.getResults());
+    SmallVector<Value> results(replacement.getResults());
+    if (exclusiveSum)
+      // Modular integer addition has an exact inverse. This also preserves
+      // reverse prefixes; floating subtraction is not an equivalent rewrite.
+      results[0] = builder.create<gpu::BinaryOp>(
+          scan.getLoc(), results[0].getType(), results[0], scan.getInputs()[0],
+          BinaryOperator::Subtract);
+    scan.replaceAllUsesWith(results);
     scan.erase();
   }
 
