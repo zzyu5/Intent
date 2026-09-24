@@ -83,6 +83,14 @@ Kernel/helper 中的 Python `range` 是 domain 遍历的 shorthand，遵循正�
 
 `I.mask(value, predicate, fill)` 等价于 `I.select(predicate, value, fill)`：predicate 为真保留 value，为假使用 fill。它只选择值，不抑制写入；对写入坐标使用 `I.mask` 会把未选中成员写到 fill 指定的地址。`I.store` 和下标赋值没有 `mask` 或 `valid` 参数。条件写入使用 scalar 条件下的 structured control，或只遍历实际参与写入的 domain/subregion；普通并行写入仍须满足目标地址不冲突的合同。
 
+例如已有同 shape 的一维 tensor values `values`、`active`（bool）和 `destinations`（index）时，可以逐个独立逻辑点表达条件写入。`out` 是可写 view；所有 active 点的目标地址须在界内且互不冲突：
+
+```python
+for i in I.parallel(I.domain(0, values.shape[0])):
+    if active[i]:
+        out[destinations[i]] = values[i]
+```
+
 一个 kernel 不自动拆成多个 launches。多个 kernels 由 host 分别编译、显式调用；跨 kernel tensors 的分配与生命周期由 host 管理。Kernel 数量与算法编排由作者定义，各 kernel 内的物理分块、布局与 target 配置由 compiler 形成。
 
 算法定义的逻辑分组数量、边界和中间 tensor shape 可以显式表达，不属于硬件 block size。`I.parallel` 表达无序独立的逻辑 points，source-derived subregion 表达成员集合；两者都不指定线程块数量，也不产生额外 launch。跨 kernel 的中间 tensor 由 host 分配，作为显式 view 参数传递：使用 `Out` 表达输出、`In` 表达只读输入、`InOut` 表达对已有内容的读写。`I.buffer` 是 kernel-local 状态，不能跨 kernel 传递。
