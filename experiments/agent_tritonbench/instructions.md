@@ -64,9 +64,10 @@ The source constructs have distinct meanings:
   I.parallel declares independent, unordered iterations; it does not specify a
   GPU program or thread-block count.
 - Ordinary for/while loops declare ordered execution and loop-carried state.
-  An accumulator in the code does not by itself show that the mathematical task
-  requires this order. Reduce, scan and contraction have their own documented
-  dependence and numerical contracts; an ordinary loop does not inherit them.
+  When the algorithm permits their documented numerical contracts, express sums,
+  inner products and prefixes with reduction, contraction and scan operations.
+  Introducing a scalar accumulator loop imposes order; it does not inherit the
+  reassociation allowed by those structured operations.
   An outer I.parallel does not make an inner ordinary loop parallel. Preserve
   vector expressions as logical tensor operations; their values can be consumed
   by independent logical points when the effects are disjoint.
