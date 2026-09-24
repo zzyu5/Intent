@@ -2815,7 +2815,7 @@ bool fullReductionNeedsTraversal(ContractOp contract) {
     return false;
   auto kernel = contract->getParentOfType<func::FuncOp>();
   PhysicalProgramAnalysis analysis(kernel);
-  int64_t largestTile = *std::max_element(
+  int64_t smallestTile = *std::min_element(
       std::begin(contractionReductionCandidates),
       std::end(contractionReductionCandidates));
   SmallVector<MakeRangeOp> paired;
@@ -2827,7 +2827,7 @@ bool fullReductionNeedsTraversal(ContractOp contract) {
     auto type = cast<FragmentType>(operand.getType());
     auto physical = cast<PhysicalExprAttr>(type.getShape()[axis]);
     auto extent = constantPhysicalExpression(physical);
-    if (extent && *extent <= largestTile && *extent > 0 &&
+    if (extent && *extent <= smallestTile && *extent > 0 &&
         llvm::isPowerOf2_64(*extent))
       return false;
     PhysicalRangeFact ranges = analysis.axisRanges(operand, axis);
@@ -5126,12 +5126,12 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
   auto gather = dyn_cast<GatherOp>(*contract.getResult().getUsers().begin());
   auto resultType = contract.getResult().getType();
   if (!gather || gather.getSource() != contract.getResult() ||
-      gather.getCoordinates().size() != resultType.getShape().size() ||
+      gather.getCoordinates().size() > resultType.getShape().size() ||
       failed(scalarSource(contract.getAccumulator())) ||
       !canReplayContractionReads(contract))
     return false;
   auto gatheredType = dyn_cast<FragmentType>(gather.getResult().getType());
-  if (gatheredType && gatheredType.getShape().size() != resultType.getShape().size())
+  if (gatheredType && gatheredType.getShape().size() > resultType.getShape().size())
     return false;
   auto kernel = contract->getParentOfType<func::FuncOp>();
   DominanceInfo dominance(kernel);
@@ -5153,14 +5153,16 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
   if (!gatheredType && gather.getValid() && !canMoveCoordinate(gather.getValid()))
     return false;
   SmallVector<Value> selected(resultType.getShape().size());
-  SmallVector<unsigned> resultOrder(resultType.getShape().size());
+  SmallVector<int64_t> resultOrder(resultType.getShape().size(), -1);
   llvm::SmallDenseSet<unsigned> selectedResultAxes;
   for (auto [coordinate, axis] : llvm::zip(gather.getCoordinates(), gather.getSourceAxes())) {
+    if (auto scalar = scalarSource(coordinate); succeeded(scalar))
+      coordinate = *scalar;
     if (axis < 0 || axis >= static_cast<int64_t>(selected.size()) ||
         selected[axis] ||
         !canMoveCoordinate(coordinate))
       return false;
-    if (gatheredType) {
+    if (gatheredType && isa<FragmentType>(coordinate.getType())) {
       auto range = coordinate.getDefiningOp<MakeRangeOp>();
       if (!range || !isUnitStepRange(range))
         return false;
@@ -5176,6 +5178,21 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
     }
     selected[axis] = coordinate;
   }
+  for (unsigned axis = 0; axis < selected.size(); ++axis) {
+    if (selected[axis])
+      continue;
+    if (!gatheredType)
+      return false;
+    auto mapping = cast<AxisMapAttr>(resultType.getAxisMaps()[axis]);
+    auto retained = queryFragmentAxis(gatheredType, sourceAxisIdentity(mapping));
+    if (!retained.isExact() || retained.dimensionId != mapping.getDimensionId() ||
+        gatheredType.getShape()[retained.fragmentAxis] != resultType.getShape()[axis] ||
+        !selectedResultAxes.insert(retained.fragmentAxis).second)
+      return false;
+    resultOrder[axis] = retained.fragmentAxis;
+  }
+  if (gatheredType && selectedResultAxes.size() != gatheredType.getShape().size())
+    return false;
   auto isUnit = [](Attribute attribute) {
     auto extent = cast<PhysicalExprAttr>(attribute);
     return extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
@@ -5220,6 +5237,8 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
           (mapping.getDimensionId() <= 0 ||
            mapping.getDimensionId() != resultMapping.getDimensionId()))
         return false;
+      if (!selected[resultAxes[side][axis]])
+        continue;
       if (isUnit(type.getShape()[axis]) &&
           isIntegerConstant(selected[resultAxes[side][axis]], 0))
         continue;
@@ -5254,7 +5273,8 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
     return clone->getResult(cast<OpResult>(value).getResultNumber());
   };
   for (Value &coordinate : selected)
-    coordinate = moveCoordinate(coordinate);
+    if (coordinate)
+      coordinate = moveCoordinate(coordinate);
   Value gatherValidity = !gatheredType && gather.getValid()
                              ? moveCoordinate(gather.getValid()) : Value();
   PhysicalExprAttr unit = expression(kernel.getContext(), PhysicalExprKind::Constant, 1);
@@ -5270,6 +5290,8 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
       if (llvm::is_contained(reductions, static_cast<int64_t>(axis)))
         continue;
       Value coordinate = selected[resultAxes[side][axis]];
+      if (!coordinate)
+        continue;
       if (isUnit(originalType.getShape()[axis]) && isIntegerConstant(coordinate, 0))
         continue;
       auto roots = PhysicalProgramAnalysis(kernel).axisRanges(operand, axis);
@@ -5278,13 +5300,12 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
         return contract.emitOpError("contraction projection lost its free-axis range");
       auto mapping = cast<AxisMapAttr>(originalType.getAxisMaps()[axis]);
       unsigned resultAxis = resultAxes[side][axis];
-      auto selectedRange = gatheredType ? coordinate.getDefiningOp<MakeRangeOp>()
-                                       : MakeRangeOp();
-      auto projectedExtent = gatheredType
+      auto selectedRange = coordinate.getDefiningOp<MakeRangeOp>();
+      auto projectedExtent = selectedRange
                                  ? cast<PhysicalExprAttr>(
                                        gatheredType.getShape()[resultOrder[resultAxis]])
                                  : unit;
-      auto projectedMapping = gatheredType
+      auto projectedMapping = selectedRange
                                   ? cast<AxisMapAttr>(
                                         gatheredType.getAxisMaps()[resultOrder[resultAxis]])
                                   : mapping;
@@ -5305,7 +5326,7 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
       ReplayMaterializationOptions options;
       options.fragmentAxis = axis;
       options.traversalRanges = roots.roots;
-      if (gatheredType)
+      if (selectedRange)
         options.segmentMapping = projectedMapping;
       auto tail = buildRangeTailPredicate(builder, contract.getLoc(), range, *authority);
       if (failed(tail))
@@ -5336,8 +5357,10 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
   if (gatheredType) {
     SmallVector<Attribute> projectedShape, projectedMaps;
     for (auto [axis, gatheredAxis] : llvm::enumerate(resultOrder)) {
-      projectedShape.push_back(gatheredType.getShape()[gatheredAxis]);
-      auto mapping = cast<AxisMapAttr>(gatheredType.getAxisMaps()[gatheredAxis]);
+      projectedShape.push_back(gatheredAxis >= 0
+                                   ? gatheredType.getShape()[gatheredAxis] : unit);
+      auto mapping = cast<AxisMapAttr>(gatheredAxis >= 0
+          ? gatheredType.getAxisMaps()[gatheredAxis] : resultType.getAxisMaps()[axis]);
       projectedMaps.push_back(AxisMapAttr::get(
           kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
           mapping.getDimensionId(), axis, mapping.getDerived()));
@@ -5358,9 +5381,30 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
   builder.setInsertionPoint(gather);
   if (gatheredType) {
     Value result = projected.getResult();
-    SmallVector<int64_t> permutation(resultOrder.size());
-    for (auto [axis, gatheredAxis] : llvm::enumerate(resultOrder))
-      permutation[gatheredAxis] = axis;
+    SmallVector<Attribute> retainedShape, retainedMaps;
+    SmallVector<int64_t> permutation(gatheredType.getShape().size());
+    for (auto [axis, gatheredAxis] : llvm::enumerate(resultOrder)) {
+      if (gatheredAxis < 0)
+        continue;
+      unsigned retainedAxis = retainedShape.size();
+      permutation[gatheredAxis] = retainedAxis;
+      retainedShape.push_back(projectedType.getShape()[axis]);
+      auto mapping = cast<AxisMapAttr>(projectedType.getAxisMaps()[axis]);
+      retainedMaps.push_back(AxisMapAttr::get(
+          kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+          mapping.getDimensionId(), retainedAxis, mapping.getDerived()));
+    }
+    if (retainedShape.size() != resultOrder.size()) {
+      auto retainedType = FragmentType::get(
+          kernel.getContext(), gatheredType.getElementType(),
+          builder.getArrayAttr(retainedShape), builder.getArrayAttr(retainedMaps),
+          gatheredType.getValidity(), gatheredType.getOwner());
+      auto reassociation = inferReshapeReassociation(projectedType, retainedType);
+      if (failed(reassociation))
+        return contract.emitOpError("contraction projection cannot drop its selected singleton axes");
+      result = builder.create<ReshapeOp>(gather.getLoc(), retainedType, result,
+                                        *reassociation);
+    }
     if (llvm::any_of(llvm::enumerate(permutation), [](auto entry) {
           return entry.index() != static_cast<unsigned>(entry.value());
         }))
