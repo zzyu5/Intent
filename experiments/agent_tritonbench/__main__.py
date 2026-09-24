@@ -114,6 +114,8 @@ def generate_trial(arguments, row, language) -> dict:
             "Choose a Triton-style algorithm, including independent logical work and explicit kernel stages, "
             "then express it with Intent domains. Read the public language and kernel/host contracts before choosing "
             "the organization; the compiler chooses physical mapping within the declared kernels. "
+            "Preserve logical groups, partial-result interfaces and all kernel stages from that algorithm; "
+            "removing physical tile details must not turn them into a single full-domain collective. "
             "Use @intent.kernel and context.compile(); do not import or call Triton.\n"
         )
     prompt += "\nComplete task and fixed invocation (identical to TASK.md):\n\n" + task_text + "\n"

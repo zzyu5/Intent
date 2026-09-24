@@ -4,6 +4,15 @@
 
 完整 callable 的算法组织由作者选择。在满足任务的数值、effects 与外部接口合同的前提下，作者可以自行设计内部 kernel interfaces、逻辑分组和中间 tensor shape；这些内容无须出现在任务签名中。内部 kernel 之间实际传递的 tensor interface 同样是可观察语义，由 compiler 保持。Compiler 为每个已声明的 kernel 形成物理执行程序。
 
+## 从 Triton 算法到逻辑域
+
+可以把 Intent 理解为 Triton 式 kernel 算法的逻辑域表达：保留算法的独立工作、逻辑分组、局部结果与阶段依赖，把物理 tile、线程布局和流水线配置交给 compiler。它不是把完整算子交给库或 compiler 自动选择算法的接口。
+
+- 先确定各阶段的输入、输出、独立逻辑组及组内参与计算的成员，再写 kernel。Triton 写法中由不同 program 分别承担的算法工作，应保留为逻辑 domains/subregions 与 `I.parallel`；去掉物理 block 参数，不意味着去掉工作分组。一个逻辑组不要求对应一个物理 CTA。
+- 外部结果是 scalar，不意味着应把整个输入放进一个全轴归约。`I.reduce` 处理传入 value 的指定轴；全域 value 的归约仍有全局依赖。对 producer 或后续 consumer 写 `I.parallel`，不会替这项归约建立分组或跨 kernel 汇总。
+- 若所选 Triton 算法包含多个 kernels，翻译到 Intent 时保留阶段、跨 kernel tensors 和 host 调用顺序。Kernel 内的多个表达式、helper 或 `I.buffer` 都不能替代这些阶段。分组大小、局部结果接口可以由作者选择；compiler 不会补出源程序缺失的阶段。
+- 以完整 callable 的并行工作量、数据读写和所有 launches 的总成本选择组织，不以源码最短或 kernel 最少为目标。归约、prefix 和 ordered loop 各自的成员、顺序、dtype 与数值合同必须保持。
+
 ## 类型、literal 与 shape
 
 程序使用 `import intent` 和 `import intent.language as I`；kernel/helper 分别用 `@intent.kernel`、`@intent.fn` 声明，装饰器不在 `I` 命名空间。`I.In/I.Out/I.InOut` 描述外部 views，必须同时给出 dtype 和 shape，例如 `I.In[I.f32, ("M", "N")]`；rank-0 view 的 shape 写 `()`。`I.f32` 等描述 scalar dtype；Python literal 可按上下文实例化，但两个不同 dtype 的 runtime values 必须显式 `I.cast`。例如先把 bf16 输入 cast 到 f32，再和 f32 累加器计算，最后 cast 回输出 dtype。

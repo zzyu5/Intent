@@ -51,11 +51,13 @@ still be present after translation. Check each ordinary loop against the
 dependency it expresses, including loops introduced while writing the code.
 Do this review on candidate.py; no separate planning or review file is needed.
 
-Intent is a programmable operator/kernel DSL with Triton-like algorithm
-organization: express the algorithm over logical domains instead of hardware
-tiles. Choose stages, intermediate tensors and dependencies using your knowledge
-of Triton algorithms, then retain that structure when expressing it in Intent.
-Intent's type, numerical and effect rules govern the resulting program.
+Intent expresses Triton-style kernel algorithms over logical domains. Retain the
+algorithm's independent work, logical groups, partial results, kernel stages and
+host orchestration; leave physical tiles, threads, layouts and pipelines to the
+compiler. Follow the organization guidance at the start of the authoring manual.
+A scalar external result does not imply one full-domain reduction. Do not erase
+the chosen work decomposition merely because Intent can express the mathematical
+result in one expression. Intent's type, numerical and effect rules still apply.
 
 The source constructs have distinct meanings:
 - Domains, subregions and index relations describe logical members and values.
@@ -67,7 +69,8 @@ The source constructs have distinct meanings:
   dependence and numerical contracts; an ordinary loop does not inherit them.
 - I.reduce and I.arg_reduce operate on logical tensor axes in the current kernel.
   Reducing every axis yields scalar result(s); it does not call a library
-  reduction or create an implicit cross-kernel reduction tree.
+  reduction or create an implicit cross-kernel reduction tree. I.parallel around
+  a producer or consumer does not partition a full-domain collective for you.
 - Each @intent.kernel produces one GPU launch. Separate expressions or named
   intermediates inside it do not create additional launches or independent work.
   Collectives have no hidden communication between independent GPU programs.
@@ -82,8 +85,8 @@ removing physical tile parameters must preserve the logical decomposition.
 The compiler chooses physical tiles, program mapping, thread layouts and provider
 configuration within the declared kernels. It does not reconstruct missing stages.
 
-Define multiple kernels and their host calls explicitly when the chosen algorithm
-has multiple stages. Allocate cross-kernel tensors in the host callable and pass
+When the chosen Triton algorithm uses multiple kernels, retain those kernels and
+their host calls in Intent. Allocate cross-kernel tensors in the host callable and pass
 them as views: Out for outputs, In for read-only inputs, and InOut for reading and
 updating existing contents. Kernel-local I.buffer state cannot cross kernels.
 Host Python control flow may repeatedly call an already compiled artifact with
