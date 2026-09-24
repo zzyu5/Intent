@@ -177,6 +177,12 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
   while (names.contains(name))
     name += "_";
   Type element = original.getElementType();
+  auto integer = dyn_cast<IntegerType>(element);
+  auto identity = match.identity.getDefiningOp<arith::ConstantOp>();
+  auto zero = identity ? dyn_cast<IntegerAttr>(identity.getValue()) : IntegerAttr();
+  bool invertIntegerSum = integer && integer.getWidth() > 1 && zero &&
+      zero.getValue().isZero() &&
+      queryBinaryCombineKind(scan.getCombine()) == BinaryOperator::Add;
   auto chunk = getOrCreatePhysicalParameter(
       kernel, name, ParameterRole::ScanChunk, ParameterCategory::Scan,
       element.isIndex() ? 64 : element.getIntOrFloatBitWidth(),
@@ -250,7 +256,13 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
         Value prefix = combine.lookup(
             cast<YieldOp>(body.getTerminator()).getValues().front());
         Value consumerPrefix = prefix;
-        if (!scan.getInclusive()) {
+        if (!scan.getInclusive() && invertIntegerSum) {
+          // Integer addition/subtraction are modular. Remove this lane's input
+          // exactly, including the previous chunk's carry, without a lane shift.
+          consumerPrefix = nested.create<BinaryOp>(
+              location, prefix.getType(), prefix, sourceSlice,
+              BinaryOperator::Subtract);
+        } else if (!scan.getInclusive()) {
           Value ordinal = nested.create<BinaryOp>(
               location, fragment(nested.getIndexType()), range, lift(offset),
               BinaryOperator::Subtract);
