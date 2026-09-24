@@ -3549,7 +3549,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
             ScatterStoreOp, AtomicRMWOp, ExtractOp, MMAOp, ScaledMMAOp,
             ReduceOp, ScanOp, gpu::ParameterOp,
             gpu::PhysicalExprOp, gpu::ProgramIdOp, gpu::WorksetCoordinateOp,
-            gpu::DelinearizeOp,
+            gpu::DelinearizeOp, gpu::ViewOverlapOp,
             gpu::DimOp, gpu::RangeOp, gpu::RangeBoundOp, gpu::MakeRangeOp,
             gpu::SplatOp, gpu::BroadcastOp, gpu::UnaryOp, gpu::BinaryOp,
             gpu::CompareOp, gpu::SelectOp, gpu::CastOp, gpu::BitcastOp,

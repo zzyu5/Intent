@@ -192,6 +192,27 @@ private:
           dimensionBindings[metadata.dimension] = metadata;
       }
     }
+    llvm::StringSet<> occupied;
+    for (const auto &entry : values)
+      occupied.insert(entry.second);
+    kernel.walk([&](gpu::ParameterOp parameter) {
+      occupied.insert(parameter.getParameter().getName().getValue());
+    });
+    auto fresh = [&](StringRef stem) {
+      std::string name = stem.str();
+      while (!occupied.insert(name).second)
+        name += "_";
+      return name;
+    };
+    overlapFunction = fresh("_intent_byte_spans_overlap");
+    overlapSpanFunction = fresh("_intent_view_byte_span");
+    kernel.walk([&](gpu::ViewOverlapOp overlap) {
+      values[overlap.getResult()] = fresh("_intent_overlap");
+      overlapFacts.push_back(overlap);
+      for (Value view : overlap.getOperands())
+        if (!overlapSpans.count(view))
+          overlapSpans[view] = fresh("_intent_view_span");
+    });
   }
 
   void collectConfiguration() {
@@ -273,6 +294,9 @@ private:
   void emitPreamble() {
     output << "import torch\nimport tilelang\nimport tilelang.language as T\n"
               "from intent.runtime.tilelang import tune_kernel\n\n";
+    if (!overlapFacts.empty())
+      output << "from intent.runtime.tuning import byte_spans_overlap as "
+             << overlapFunction << ", view_byte_span as " << overlapSpanFunction << "\n\n";
     std::map<std::string, std::pair<std::string, bool>> primitives;
     auto add = [&](StringRef mnemonic, bool flush, bool binary) {
       std::string suffix = flush ? "_ftz" : "";
@@ -332,6 +356,8 @@ private:
     };
     for (const MetadataABI &metadata : metadataArguments)
       argument(metadata.name);
+    for (gpu::ViewOverlapOp overlap : overlapFacts)
+      argument(valueString(overlap.getResult()));
     for (const ScalarABI &scalar : scalars)
       if (scalar.kind == "constexpr")
         argument(scalar.name);
@@ -385,6 +411,16 @@ private:
 
   void emitLaunch() {
     output << "_KERNEL_CACHE = {}\n\ndef launch(" << joinLaunchArguments() << "):\n";
+    llvm::DenseSet<Value> boundSpans;
+    for (gpu::ViewOverlapOp overlap : overlapFacts) {
+      for (Value view : overlap.getOperands())
+        if (boundSpans.insert(view).second)
+          line(overlapSpans.lookup(view) + " = " + overlapSpanFunction + "(" +
+                   valueString(view) + ")", 1);
+      line(valueString(overlap.getResult()) + " = " + overlapFunction + "(" +
+               overlapSpans.lookup(overlap.getLhs()) + ", " +
+               overlapSpans.lookup(overlap.getRhs()) + ")", 1);
+    }
     for (const MetadataABI &metadata : metadataArguments) {
       const ViewABI &source = viewByABI(metadata.sourceABI);
       line(metadata.name + " = " + source.name +
@@ -413,6 +449,8 @@ private:
     for (const ScalarABI &scalar : scalars)
       if (scalar.kind != "constexpr")
         key += scalar.name + ", ";
+    for (gpu::ViewOverlapOp overlap : overlapFacts)
+      key += valueString(overlap.getResult()) + ", ";
     line(key + ")", 1);
     line("if key not in _KERNEL_CACHE:", 1);
     std::string compile = "_KERNEL_CACHE[key] = tune_kernel(_intent_kernel, _CONFIGS, {";
@@ -420,6 +458,12 @@ private:
       if (index)
         compile += ", ";
       compile += "\"" + metadata.name + "\": " + metadata.name;
+    }
+    for (gpu::ViewOverlapOp overlap : overlapFacts) {
+      if (compile.back() != '{')
+        compile += ", ";
+      std::string name = valueString(overlap.getResult());
+      compile += "\"" + name + "\": " + name;
     }
     for (const auto &[parameter, coverage] : fullCoverageParameters) {
       if (!metadataArguments.empty() || compile.back() != '{')
@@ -473,7 +517,9 @@ private:
   }
 
   void emitOperation(Operation &operation) {
-    if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
+    if (isa<gpu::ViewOverlapOp>(operation)) {
+      return;
+    } else if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
       values[constant.getResult()] = literal(constant.getValue());
     } else if (auto parameter = dyn_cast<gpu::ParameterOp>(operation)) {
       values[parameter.getResult()] =
@@ -956,6 +1002,10 @@ private:
   SmallVector<ViewABI> views;
   SmallVector<ScalarABI> scalars;
   SmallVector<MetadataABI> metadataArguments;
+  SmallVector<gpu::ViewOverlapOp> overlapFacts;
+  llvm::DenseMap<Value, std::string> overlapSpans;
+  std::string overlapFunction;
+  std::string overlapSpanFunction;
   llvm::DenseMap<int64_t, MetadataABI> dimensionBindings;
   SmallVector<std::string> parameterNames;
   SmallVector<std::map<std::string, int64_t>> configurations;

@@ -29,7 +29,7 @@ bool isAllowed(Operation *operation) {
              BufferStoreOp,
              ViewLoadOp, ViewStoreOp, ReduceOp, ScanOp, GemmOp, SparseGemmOp,
              gpu::ParameterOp, gpu::PhysicalExprOp, gpu::ProgramIdOp,
-             gpu::WorksetCoordinateOp, gpu::DelinearizeOp, gpu::DimOp,
+             gpu::WorksetCoordinateOp, gpu::DelinearizeOp, gpu::DimOp, gpu::ViewOverlapOp,
              gpu::RangeOp,
              gpu::RangeBoundOp, gpu::UnaryOp, gpu::BinaryOp, gpu::CompareOp,
              gpu::SelectOp, gpu::CastOp, gpu::BitcastOp, gpu::MakeRecordOp,

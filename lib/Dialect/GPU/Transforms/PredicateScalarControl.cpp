@@ -603,6 +603,24 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
           coordinates(load.getCoordinates()),
           maskedValidity(load.getValid(), load.getType()),
           fill(load.getFill(), load.getType()), load.getSourceAxes());
+  } else if (auto reshape = dyn_cast<ReshapeOp>(operation);
+             reshape && hasIterationAxes(mapped(reshape.getValue()).getType())) {
+    // Reassociation describes the original suffix. The independent iteration
+    // prefix is preserved on both sides of the reshape.
+    clone = builder.create<ReshapeOp>(
+        location, resultType(reshape.getType()), mapped(reshape.getValue()),
+        reshape.getReassociation());
+  } else if (auto transpose = dyn_cast<TransposeOp>(operation);
+             transpose && hasIterationAxes(mapped(transpose.getValue()).getType())) {
+    SmallVector<int64_t> permutation;
+    unsigned prefix = shape.getShape().size();
+    for (unsigned axis = 0; axis < prefix; ++axis)
+      permutation.push_back(axis);
+    for (int64_t axis : transpose.getPermutation())
+      permutation.push_back(axis + prefix);
+    clone = builder.create<TransposeOp>(
+        location, resultType(transpose.getType()), mapped(transpose.getValue()),
+        permutation);
   } else if (auto conversion = dyn_cast<CastOp>(operation);
              conversion && isFloatToIntegerCast(conversion)) {
     // Inactive branches may contain NaN or out-of-range floating values.

@@ -3702,7 +3702,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
       }
     }
 
-    if (isa<CtaBarrierOp, ViewOverlapOp, TensorDescriptorChoiceOp, TensorDescriptorAllocatorOp,
+    if (isa<CtaBarrierOp, gpu::ViewOverlapOp, TensorDescriptorChoiceOp, TensorDescriptorAllocatorOp,
             TensorDescriptorOp, BlockLoadOp, BlockStoreOp, DescriptorLoadOp,
             DescriptorStoreOp, SplitOp, ReduceOp, ScanOp, MapElementwiseOp, gpu::ParameterOp,
             gpu::PhysicalExprOp,
@@ -3917,7 +3917,7 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
       Value &overlap = overlapFacts[pair];
       if (!overlap) {
         OpBuilder entry(&kernel.front(), kernel.front().begin());
-        overlap = entry.create<ViewOverlapOp>(
+        overlap = entry.create<gpu::ViewOverlapOp>(
             location, entry.getI1Type(), kernel.getArgument(pair.first),
             kernel.getArgument(pair.second));
       }
@@ -3975,7 +3975,7 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
                  uniform(branch.thenBlock()->getTerminator()->getOperand(index)) &&
                  uniform(branch.elseBlock()->getTerminator()->getOperand(index));
       } else if (isa<gpu::ReduceOp, gpu::GatherOp, gpu::DimOp, gpu::ParameterOp,
-              gpu::PhysicalExprOp, gpu::ProgramIdOp, ViewOverlapOp,
+              gpu::PhysicalExprOp, gpu::ProgramIdOp, gpu::ViewOverlapOp,
               arith::ConstantOp>(producer)) {
         result = true;
       } else if (isa<gpu::LoadOp, gpu::UnaryOp, gpu::BinaryOp, gpu::CompareOp,

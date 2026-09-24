@@ -348,6 +348,15 @@ private:
         arrayViews.push_back(std::move(binding));
       }
     });
+    overlapFunction = fresh("_intent_byte_spans_overlap_");
+    overlapSpanFunction = fresh("_intent_view_byte_span_");
+    kernel.walk([&](gpu::ViewOverlapOp overlap) {
+      values[overlap.getResult()] = fresh("_intent_overlap_");
+      overlapFacts.push_back(overlap);
+      for (Value view : overlap.getOperands())
+        if (!overlapSpans.count(view))
+          overlapSpans[view] = fresh("_intent_view_span_");
+    });
   }
 
   void emitPreamble() {
@@ -361,6 +370,9 @@ private:
     });
     if (libraryMath)
       output << "from intent.runtime import cutile_math\n";
+    if (!overlapFacts.empty())
+      output << "from intent.runtime.tuning import byte_spans_overlap as "
+             << overlapFunction << ", view_byte_span as " << overlapSpanFunction << "\n";
     output << "from types import SimpleNamespace\n"
               "from typing import Annotated\n"
               "import torch\n"
@@ -453,6 +465,8 @@ private:
     }
     for (const MetadataABI &metadata : metadataArguments)
       argument(metadata.name + ": ConstInt");
+    for (gpu::ViewOverlapOp overlap : overlapFacts)
+      argument(valueString(overlap.getResult()) + ": ct.Constant[bool]");
     kernel.walk([&](gpu::ParameterOp parameter) {
       if (!providerHint(parameter).empty())
         return;
@@ -653,6 +667,16 @@ private:
     emitArgumentBindings();
     emitWorkspaceBindings();
     emitArrayBindings("", 1);
+    llvm::DenseSet<Value> boundSpans;
+    for (gpu::ViewOverlapOp overlap : overlapFacts) {
+      for (Value view : overlap.getOperands())
+        if (boundSpans.insert(view).second)
+          line(overlapSpans.lookup(view) + " = " + overlapSpanFunction + "(" +
+                   valueString(view) + ")", 1);
+      line(valueString(overlap.getResult()) + " = " + overlapFunction + "(" +
+               overlapSpans.lookup(overlap.getLhs()) + ", " +
+               overlapSpans.lookup(overlap.getRhs()) + ")", 1);
+    }
 
     llvm::StringSet<> occupiedNames;
     for (const ViewABI &view : views)
@@ -661,6 +685,10 @@ private:
       occupiedNames.insert(scalar.name);
     for (const MetadataABI &metadata : metadataArguments)
       occupiedNames.insert(metadata.name);
+    for (gpu::ViewOverlapOp overlap : overlapFacts)
+      occupiedNames.insert(valueString(overlap.getResult()));
+    for (const auto &span : overlapSpans)
+      occupiedNames.insert(span.second);
     for (const ArrayViewABI &view : arrayViews) {
       occupiedNames.insert(view.name);
       occupiedNames.insert(view.eligible);
@@ -695,6 +723,8 @@ private:
              view.name + ".device), ";
     for (const ScalarABI &scalar : scalars)
       key += scalar.name + ", ";
+    for (gpu::ViewOverlapOp overlap : overlapFacts)
+      key += valueString(overlap.getResult()) + ", ";
     line(key + ")", 1);
     line(streamName + " = torch.cuda.current_stream()", 1);
     line("if " + tuneKeyName + " not in _TUNE_CACHE:", 1);
@@ -851,7 +881,7 @@ private:
   }
 
   void emitOperation(Operation &operation) {
-    if (isa<ArrayViewOp>(operation)) {
+    if (isa<ArrayViewOp, gpu::ViewOverlapOp>(operation)) {
       return;
     } else if (auto assertion = dyn_cast<cf::AssertOp>(operation)) {
       std::string message;
@@ -1482,6 +1512,8 @@ private:
     }
     for (const MetadataABI &metadata : metadataArguments)
       result += ", " + metadata.name;
+    for (gpu::ViewOverlapOp overlap : overlapFacts)
+      result += ", " + valueString(overlap.getResult());
     SmallVector<std::string> parameters;
     kernel.walk([&](gpu::ParameterOp parameter) {
       if (!providerHint(parameter).empty())
@@ -1566,6 +1598,10 @@ private:
   SmallVector<ArrayViewABI> arrayViews;
   SmallVector<ScalarABI> scalars;
   SmallVector<MetadataABI> metadataArguments;
+  SmallVector<gpu::ViewOverlapOp> overlapFacts;
+  llvm::DenseMap<Value, std::string> overlapSpans;
+  std::string overlapFunction;
+  std::string overlapSpanFunction;
   llvm::DenseMap<int64_t, MetadataABI> dimensionBindings;
   std::map<std::string, CoverageParameter> fullCoverageParameters;
   llvm::StringSet<> fullCoverageParameterNames;

@@ -54,6 +54,8 @@ bool canVectorizeIterations(Block &block, scf::ForOp loop,
             return data(value.getType());
           }))
         return false;
+    } else if (isa<ReshapeOp, TransposeOp>(operation)) {
+      continue;
     } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
       if (!llvm::all_of(reduce.getCombine().front().without_terminator(),
                         [](Operation &nested) {
@@ -108,6 +110,7 @@ bool isOutsideIterationRange(Value coordinate, scf::ForOp loop) {
 
 bool hasIndependentUpdates(scf::ForOp loop, func::FuncOp kernel,
                            SmallVectorImpl<Value> &guardedViews,
+                           SmallVectorImpl<std::pair<Value, Value>> &disjointViews,
                            llvm::DenseMap<Value, bool> &varying) {
   llvm::DenseMap<Value, unsigned> writtenAxes;
   bool independent = true;
@@ -145,16 +148,30 @@ bool hasIndependentUpdates(scf::ForOp loop, func::FuncOp kernel,
   if (!independent || writtenAxes.empty())
     return false;
 
-  // Layout injectivity says nothing about two external views aliasing. Keep
-  // this proof to one external resource and fresh, disjoint local buffers.
-  if (guardedViews.size() > 1)
-    return false;
-  if (!guardedViews.empty())
-    loop.walk([&](LoadOp load) {
-      if (isa<ViewType>(load.getResource().getType()) &&
-          load.getResource() != guardedViews.front())
-        independent = false;
-    });
+  // Distinct external resources may alias even when each layout is injective.
+  // Guard every write/read and write/write pair using the actual launch views.
+  SmallVector<Value> accessedViews(guardedViews.begin(), guardedViews.end());
+  loop.walk([&](LoadOp load) {
+    if (isa<ViewType>(load.getResource().getType()) &&
+        !llvm::is_contained(accessedViews, load.getResource()))
+      accessedViews.push_back(load.getResource());
+  });
+  for (Value view : accessedViews) {
+    auto argument = dyn_cast<BlockArgument>(view);
+    if (!argument || argument.getOwner() != &kernel.front())
+      return false;
+  }
+  for (Value written : guardedViews)
+    for (Value other : accessedViews) {
+      if (written == other)
+        continue;
+      auto pair = std::pair{written, other};
+      if (cast<BlockArgument>(written).getArgNumber() >
+          cast<BlockArgument>(other).getArgNumber())
+        std::swap(pair.first, pair.second);
+      if (!llvm::is_contained(disjointViews, pair))
+        disjointViews.push_back(pair);
+    }
 
   // Fresh buffers are disjoint, and external views need the layout guard below.
   // Each iteration owns one slice. Reads must stay in that slice or outside
@@ -184,10 +201,11 @@ LogicalResult vectorizeIterations(func::FuncOp kernel,
     auto step = loop.getStep().getDefiningOp<arith::ConstantIndexOp>();
     llvm::DenseMap<Value, bool> varying;
     SmallVector<Value> guardedViews;
+    SmallVector<std::pair<Value, Value>> disjointViews;
     if (loop.getNumResults() || !step || step.value() != 1 ||
         !canVectorizeIterations(*loop.getBody(), loop, varying) ||
         (!loop->hasAttr(independentIterationAttr) &&
-         !hasIndependentUpdates(loop, kernel, guardedViews, varying)))
+         !hasIndependentUpdates(loop, kernel, guardedViews, disjointViews, varying)))
       continue;
     uint32_t elementBitWidth = 0;
     loop.walk([&](StoreOp store) {
@@ -200,12 +218,41 @@ LogicalResult vectorizeIterations(func::FuncOp kernel,
     if (!elementBitWidth)
       continue;
     if (!guardedViews.empty()) {
-      FailureOr<Value> injective =
-          materializeNonOverlappingView(kernel, guardedViews.front());
-      if (failed(injective))
+      SmallVector<Value> injective;
+      for (Value view : guardedViews) {
+        auto condition = materializeNonOverlappingView(kernel, view);
+        if (failed(condition))
+          break;
+        injective.push_back(*condition);
+      }
+      if (injective.size() != guardedViews.size())
         continue;
       OpBuilder builder(loop);
-      auto branch = builder.create<scf::IfOp>(loop.getLoc(), *injective, true);
+      Value safe = injective.front();
+      auto require = [&](Value condition) {
+        safe = builder.create<BinaryOp>(loop.getLoc(), builder.getI1Type(),
+                                        safe, condition, BinaryOperator::LogicalAnd);
+      };
+      for (Value condition : ArrayRef<Value>(injective).drop_front())
+        require(condition);
+      for (auto [lhs, rhs] : disjointViews) {
+        Value overlap;
+        for (ViewOverlapOp fact : kernel.getOps<ViewOverlapOp>())
+          if ((fact.getLhs() == lhs && fact.getRhs() == rhs) ||
+              (fact.getLhs() == rhs && fact.getRhs() == lhs)) {
+            overlap = fact.getResult();
+            break;
+          }
+        if (!overlap) {
+          OpBuilder entry(&kernel.front(), kernel.front().begin());
+          overlap = entry.create<ViewOverlapOp>(loop.getLoc(), entry.getI1Type(),
+                                               lhs, rhs);
+        }
+        Value zero = builder.create<arith::ConstantIntOp>(loop.getLoc(), 0, 1);
+        require(builder.create<CompareOp>(loop.getLoc(), builder.getI1Type(),
+                                          overlap, zero, ComparePredicate::Eq));
+      }
+      auto branch = builder.create<scf::IfOp>(loop.getLoc(), safe, true);
       builder.setInsertionPointToStart(branch.thenBlock());
       auto selected = cast<scf::ForOp>(builder.clone(*loop));
       loop->moveBefore(branch.elseBlock()->getTerminator());

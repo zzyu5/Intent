@@ -56,6 +56,13 @@ def IntentGPU_DimOp : IntentGPU_Op<"dim", [Pure]> {
   let hasVerifier = 1;
 }
 
+def IntentGPU_ViewOverlapOp : IntentGPU_Op<"view_overlap", [Pure]> {
+  let summary = "Launch-time overlap of external view byte-span bounds";
+  let arguments = (ins IntentGPU_ViewValue:$lhs, IntentGPU_ViewValue:$rhs);
+  let results = (outs I1:$result);
+  let hasVerifier = 1;
+}
+
 def IntentGPU_RangeOp : IntentGPU_Op<"range", [Pure]> {
   let arguments = (ins Index:$start, Index:$stop, Index:$step);
   let results = (outs IntentGPU_RangeValue:$result);

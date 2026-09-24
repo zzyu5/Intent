@@ -316,7 +316,7 @@ private:
       overlapSpanFunction += "_";
     while (!argumentNames.insert(overlapArgument).second)
       overlapArgument += "_";
-    kernel.walk([&](ViewOverlapOp overlap) {
+    kernel.walk([&](gpu::ViewOverlapOp overlap) {
       values[overlap.getResult()] = overlapArgument + "[" +
                                    std::to_string(overlapFacts.size()) + "]";
       overlapFacts.push_back(overlap);
@@ -773,7 +773,7 @@ private:
     }
     llvm::DenseMap<Value, std::string> overlapSpans;
     SmallVector<std::string> overlapChecks;
-    for (ViewOverlapOp overlap : overlapFacts) {
+    for (gpu::ViewOverlapOp overlap : overlapFacts) {
       for (Value view : overlap.getOperands()) {
         if (overlapSpans.count(view))
           continue;
@@ -939,7 +939,7 @@ private:
       line("tl.debug_barrier()");
       return;
     }
-    if (isa<ViewOverlapOp, TensorDescriptorChoiceOp, TensorDescriptorAllocatorOp,
+    if (isa<gpu::ViewOverlapOp, TensorDescriptorChoiceOp, TensorDescriptorAllocatorOp,
             TensorDescriptorOp>(operation))
       return;
     if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
@@ -2076,7 +2076,7 @@ private:
   SmallVector<ScalarABI> scalars;
   SmallVector<MetadataABI> metadataArguments;
   std::string metadataArgument = "_intent_metadata";
-  SmallVector<ViewOverlapOp> overlapFacts;
+  SmallVector<gpu::ViewOverlapOp> overlapFacts;
   std::string overlapArgument = "_intent_overlaps";
   std::string overlapFunction = "_intent_byte_spans_overlap";
   std::string overlapSpanFunction = "_intent_view_byte_span";
