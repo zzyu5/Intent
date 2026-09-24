@@ -2597,7 +2597,8 @@ LogicalResult alignAccessResultRelations(func::FuncOp kernel) {
         continue;
       retargetSourceExtent(
           result, sourceAxisIdentity(cast<AxisMapAttr>(mapping)),
-          cast<PhysicalExprAttr>((*refined).getShape()[axis]));
+          cast<PhysicalExprAttr>((*refined).getShape()[axis]),
+          cast<AxisMapAttr>(mapping).getDimensionId());
     }
     result.setType(*refined);
     return WalkResult::advance();
@@ -2843,7 +2844,8 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
       retargetSourceExtent(
           operation->getResult(0),
           sourceAxisIdentity(cast<AxisMapAttr>(target.getAxisMaps()[axis])),
-          cast<PhysicalExprAttr>((*refined).getShape()[axis]));
+          cast<PhysicalExprAttr>((*refined).getShape()[axis]),
+          cast<AxisMapAttr>(target.getAxisMaps()[axis]).getDimensionId());
     }
     target = *refined;
     operation->getResult(0).setType(target);
@@ -3065,7 +3067,8 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
             projection.dimensionId != mapping.getDimensionId() ||
             coordinateType.getShape()[projection.fragmentAxis] == extent)
           continue;
-        retargetSourceExtent(coordinate, projection.source, extent);
+        retargetSourceExtent(coordinate, projection.source, extent,
+                             projection.dimensionId);
       }
     }
     currentType = cast<FragmentType>(store.getValue().getType());
@@ -3085,7 +3088,7 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
             "store coordinate refinement has no logical dimension authority");
       retargetSourceExtent(
           store.getValue(), sourceAxisIdentity(cast<AxisMapAttr>(mapping)),
-          cast<PhysicalExprAttr>((*valueType).getShape()[axis]));
+          cast<PhysicalExprAttr>((*valueType).getShape()[axis]), dimension);
     }
     FailureOr<Value> value = project(builder, store.getLoc(), store.getValue(),
                                      *valueType);
@@ -3795,13 +3798,15 @@ static void retargetExtent(Value root, AxisSelector selects,
 }
 
 void retargetSourceExtent(Value root, PhysicalSourceAxis source,
-                          PhysicalExprAttr extent) {
+                          PhysicalExprAttr extent,
+                          std::optional<int64_t> dimension) {
   retargetExtent(
       root,
       [=](AxisMapAttr mapping) {
         return mapping.getSourceId() == source.sourceId &&
                mapping.getSourceAxis() == source.sourceAxis &&
-               mapping.getDerived() == source.derived;
+               mapping.getDerived() == source.derived &&
+               (!dimension || mapping.getDimensionId() == *dimension);
       },
       extent, /*followLogicalDimension=*/false);
 }
@@ -3970,26 +3975,39 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
   bool subregion = llvm::any_of(ranges.roots, [](MakeRangeOp range) {
     return range->hasAttr(sourceSubregionAttr);
   });
+  PhysicalExprAttr rangeCapacity;
   if (subregion) {
-    if (failed(queryExactLogicalRange(ranges)))
+    FailureOr<MakeRangeOp> authority = queryExactLogicalRange(ranges);
+    if (failed(authority))
       return kernel.emitError(
           "subregion full coverage has no exact logical range authority");
+    rangeCapacity = queryLogicalRangeCapacity(*authority);
     std::optional<int64_t> parent;
     for (MakeRangeOp range : ranges.roots) {
       auto bound = range->getAttrOfType<IntegerAttr>(sourceSubregionAttr);
       if (!bound || bound.getInt() <= 0 ||
           (parent && *parent != bound.getInt()) ||
-          !queryNonNegativeIndexUpperBound(range.getLogicalStart()) ||
+          (!rangeCapacity &&
+           !queryNonNegativeIndexUpperBound(range.getLogicalStart())) ||
           !isUnitStepRange(range))
         return range.emitOpError(
             "subregion full coverage has no proven nonnegative parent-bounded traversal");
       parent = bound.getInt();
     }
-    coverageDimension = *parent;
+    if (!rangeCapacity)
+      coverageDimension = *parent;
   }
 
   Value runtimeDimension;
+  bool coverageIsRangeCapacity = static_cast<bool>(rangeCapacity);
+  if (rangeCapacity) {
+    OpBuilder builder(&kernel.front(), kernel.front().begin());
+    runtimeDimension = builder.create<PhysicalExprOp>(
+        source.getLoc(), builder.getIndexType(), rangeCapacity);
+  }
   for (BlockArgument argument : kernel.getArguments()) {
+    if (coverageIsRangeCapacity)
+      break;
     DictionaryAttr attributes = kernel.getArgAttrDict(argument.getArgNumber());
     auto kind = attributes.getAs<StringAttr>(abiKindAttr);
     auto identity = attributes.getAs<IntegerAttr>(dimensionAttr);
@@ -4004,6 +4022,8 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
 
   std::optional<int64_t> staticDimension;
   for (BlockArgument argument : kernel.getArguments()) {
+    if (coverageIsRangeCapacity)
+      break;
     auto view = dyn_cast<ViewType>(argument.getType());
     if (!view)
       continue;
@@ -4028,7 +4048,6 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
       currentExtent.getValue() == *staticDimension &&
       llvm::isPowerOf2_64(*staticDimension))
     return success();
-  bool coverageIsRangeCapacity = false;
   if (!runtimeDimension) {
     FailureOr<MakeRangeOp> authority = queryExactLogicalRange(ranges);
     PhysicalExprAttr capacity = succeeded(authority)
@@ -4091,7 +4110,8 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
       if (failed(rangeDimension))
         return range.emitOpError("full coverage has no range dimension authority");
       rangeDimensions.insert(*rangeDimension);
-      retargetSourceExtent(range.getResult(), sourceAxisIdentity(range), covered);
+      retargetSourceExtent(range.getResult(), sourceAxisIdentity(range), covered,
+                           *rangeDimension);
     }
     if (ranges.roots.empty())
       retargetDimensionExtent(source, dimension, covered);
@@ -4229,7 +4249,8 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
     if (failed(rangeDimension) || *rangeDimension != dimension)
       return range.emitOpError(
           "full-coverage range does not cover the selected logical dimension");
-    retargetSourceExtent(range.getResult(), sourceAxisIdentity(range), covered);
+    retargetSourceExtent(range.getResult(), sourceAxisIdentity(range), covered,
+                         *rangeDimension);
   }
   if (ranges.roots.empty())
     retargetDimensionExtent(source, dimension, covered);
@@ -4299,7 +4320,7 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
                       });
   for (MakeRangeOp range : ranges)
     retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
-                         parameterExtent);
+                         parameterExtent, static_cast<int64_t>(dimension));
   if (ranges.empty() || alreadyBound)
     return success();
 

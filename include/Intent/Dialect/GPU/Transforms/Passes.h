@@ -55,7 +55,8 @@ ParameterOp getOrCreatePhysicalParameter(
 mlir::FailureOr<uint64_t> blockedDimension(mlir::Attribute attribute);
 bool hasBlockedDimension(mlir::func::FuncOp kernel, uint64_t dimension);
 void retargetSourceExtent(mlir::Value root, PhysicalSourceAxis source,
-                          PhysicalExprAttr extent);
+                          PhysicalExprAttr extent,
+                          std::optional<int64_t> dimension = std::nullopt);
 void retargetDimensionExtent(mlir::Value root, int64_t dimensionId,
                              PhysicalExprAttr extent);
 mlir::LogicalResult

@@ -1863,6 +1863,31 @@ PhysicalExprAttr queryLaunchExpression(Value value) {
   return query(value, 0);
 }
 
+PhysicalExprAttr queryLaunchRangeExtent(MakeRangeOp range) {
+  MLIRContext *context = range.getContext();
+  auto expression = [&](PhysicalExprKind kind, int64_t value = 0,
+                        ArrayRef<Attribute> operands = {}) {
+    return PhysicalExprAttr::get(
+        context, static_cast<uint32_t>(kind), value, StringAttr::get(context),
+        ArrayAttr::get(context, operands));
+  };
+  if (auto count = constantLogicalRangeCardinality(range))
+    return expression(PhysicalExprKind::Constant, *count);
+  PhysicalExprAttr start = queryLaunchExpression(range.getLogicalStart());
+  PhysicalExprAttr stop = queryLaunchExpression(range.getLogicalStop());
+  PhysicalExprAttr step = queryLaunchExpression(range.getStep());
+  if (!start || !stop || !step)
+    return {};
+  if (step.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+      step.getValue() <= 0)
+    return {};
+  PhysicalExprAttr distance =
+      expression(PhysicalExprKind::Subtract, 0, {stop, start});
+  distance = expression(PhysicalExprKind::Maximum, 0,
+                        {distance, expression(PhysicalExprKind::Constant, 0)});
+  return expression(PhysicalExprKind::CeilDiv, 0, {distance, step});
+}
+
 namespace {
 struct IndexBounds {
   bool nonNegative = false;
@@ -2168,33 +2193,35 @@ PhysicalExprAttr queryLogicalRangeCapacity(MakeRangeOp range) {
                   {span, make(PhysicalExprKind::Constant, 0)});
     }
 
-  auto stop = queryLaunchExpression(range.getLogicalStop());
-  if (!stop)
-    return {};
-  auto start = queryLaunchExpression(range.getLogicalStart());
-  if (!start) {
-    Value first = stripScalarIdentity(range.getLogicalStart());
-    if (auto add = first.getDefiningOp<BinaryOp>();
+  auto loopBound = [&](Value endpoint, bool upper) -> PhysicalExprAttr {
+    Value coordinate = stripScalarIdentity(endpoint);
+    if (auto add = coordinate.getDefiningOp<BinaryOp>();
         add && add.getOperatorKind() == BinaryOperator::Add) {
       if (integerConstant(add.getRhs()) == 1)
-        first = stripScalarIdentity(add.getLhs());
+        coordinate = stripScalarIdentity(add.getLhs());
       else if (integerConstant(add.getLhs()) == 1)
-        first = stripScalarIdentity(add.getRhs());
+        coordinate = stripScalarIdentity(add.getRhs());
     }
-    auto induction = dyn_cast<BlockArgument>(first);
+    auto induction = dyn_cast<BlockArgument>(coordinate);
     auto loop = induction
                     ? dyn_cast<scf::ForOp>(induction.getOwner()->getParentOp())
                     : scf::ForOp();
     if (!loop || induction != loop.getInductionVar() ||
-        !loop->isAncestor(range) || integerConstant(loop.getStep()) != 1 ||
-        !samePhysicalScalarExpression(range.getLogicalStop(), loop.getUpperBound()))
+        !loop->isAncestor(range) || integerConstant(loop.getStep()) != 1)
       return {};
-    // In an executing [lower, upper) loop, iv and iv+1 are <= upper.
+    // Both iv and iv+1 lie within [lower, upper] in an executing unit-step loop.
     // The successor cannot overflow because iv < upper <= INDEX_MAX.
-    start = queryLaunchExpression(loop.getLowerBound());
-    if (!start)
-      return {};
-  }
+    return queryLaunchExpression(upper ? loop.getUpperBound()
+                                       : loop.getLowerBound());
+  };
+  auto stop = queryLaunchExpression(range.getLogicalStop());
+  if (!stop)
+    stop = loopBound(range.getLogicalStop(), /*upper=*/true);
+  auto start = queryLaunchExpression(range.getLogicalStart());
+  if (!start)
+    start = loopBound(range.getLogicalStart(), /*upper=*/false);
+  if (!start || !stop)
+    return {};
   auto expression = [&](PhysicalExprKind kind, ArrayRef<Attribute> operands) {
     auto context = range.getContext();
     return PhysicalExprAttr::get(context, static_cast<uint32_t>(kind), 0,

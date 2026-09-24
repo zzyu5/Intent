@@ -3593,11 +3593,11 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   auto rowBound = rowRange.getStart().getDefiningOp<RangeBoundOp>();
   auto rowSourceRange =
       rowBound ? rowBound.getRange().getDefiningOp<RangeOp>() : RangeOp();
-  auto rowCardinality = constantLogicalRangeCardinality(rowRange);
-  auto columnCardinality = constantLogicalRangeCardinality(columnRange);
+  PhysicalExprAttr rowRangeExtent = queryLaunchRangeExtent(rowRange);
+  PhysicalExprAttr columnRangeExtent = queryLaunchRangeExtent(columnRange);
   const bool runtimeRowTraversal =
       indirectRow ||
-      (!rowCardinality &&
+      (!rowRangeExtent &&
        (rowRange->hasAttr(sourceSubregionAttr) ||
         (rowSourceRange && rowSourceRange->hasAttr(sourceSubregionAttr))));
   const bool persistentRowTraversal = runtimeRowTraversal && !indirectRow;
@@ -3778,12 +3778,12 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   Value columnExtent = mapBuilder.create<DimOp>(
       location, mapBuilder.getIndexType(), rhsLoad.getResource(),
       columnResourceAxis);
-  if (rowCardinality)
-    rowExtent =
-        mapBuilder.create<arith::ConstantIndexOp>(location, *rowCardinality);
-  if (columnCardinality)
-    columnExtent =
-        mapBuilder.create<arith::ConstantIndexOp>(location, *columnCardinality);
+  if (rowRangeExtent)
+    rowExtent = mapBuilder.create<PhysicalExprOp>(
+        location, mapBuilder.getIndexType(), rowRangeExtent);
+  if (columnRangeExtent)
+    columnExtent = mapBuilder.create<PhysicalExprOp>(
+        location, mapBuilder.getIndexType(), columnRangeExtent);
   auto ceilDiv = [&](Value extent, Value divisor) {
     Value one = mapBuilder.create<arith::ConstantIndexOp>(location, 1);
     Value adjusted = binary(
@@ -3807,10 +3807,10 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       cast<ViewType>(rhsLoad.getResource().getType())
           .getLayout()
           .getExtents()[columnResourceAxis]);
-  if (rowCardinality)
-    rowExpression = queryLaunchExpression(rowExtent);
-  if (columnCardinality)
-    columnExpression = queryLaunchExpression(columnExtent);
+  if (rowRangeExtent)
+    rowExpression = rowRangeExtent;
+  if (columnRangeExtent)
+    columnExpression = columnRangeExtent;
   SmallVector<Type> mappingTypes(mapping.getResultTypes());
   SmallVector<int64_t> coordinateRoles(mapping.getNumResults(), -1);
   if (auto existing =

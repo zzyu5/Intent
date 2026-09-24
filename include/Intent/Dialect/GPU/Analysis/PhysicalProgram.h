@@ -103,6 +103,9 @@ bool isLaunchUniformScalar(mlir::Value value, mlir::func::FuncOp kernel);
 /// accesses, program coordinates and ordered carries are not launch leaves.
 PhysicalExprAttr queryLaunchExpression(mlir::Value value);
 
+/// Exact logical member count when the range bounds are launch-visible.
+PhysicalExprAttr queryLaunchRangeExtent(MakeRangeOp range);
+
 /// A compile-time inclusive upper bound for a proven non-negative scalar
 /// index, derived from current mapping, dimensions and clamps. Null means unknown.
 PhysicalExprAttr queryNonNegativeIndexUpperBound(mlir::Value value);

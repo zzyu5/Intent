@@ -24,7 +24,7 @@ softmax,6,0.0100079998,0.00771199982,0.00881600007,0.00839999970048666,reference
 logsumexp,8,0.0352560002,0.0127360001,0.010207999963313341,0.011247999966144562,reference_pass,pass,pass,pass,cuda_graph,Independent Luna high submission after public organization guidance; original candidate.py retained,,,,logsumexp/intent/performance.py
 add_mean,8,0.0194560001,0.0104,0.010799999814480543,0.010928000323474407,reference_pass,pass,pass,pass,cuda_graph,Independent Luna high submission after public organization guidance; original candidate.py retained,,,,add_mean/intent/performance.py
 exp_mean,8,0.0155200004,0.00921599986,0.009119999594986439,0.008960000239312649,reference_pass,pass,pass,pass,cuda_graph,Independent Luna high submission after public organization guidance; original candidate.py retained,,,,exp_mean/intent/performance.py
-matmul,6,0.00923199998,0.0137279998,0.010832000058144331,0.009648000355809927,reference_pass,pass,pass,pass,cuda_graph,Independent Luna high submission after public organization guidance; original candidate.py retained,,,,matmul/intent/performance.py
+matmul,6,0.00923199998,0.0137279998,0.010704000014811754,0.009568000212311745,reference_pass,pass,pass,pass,cuda_graph,Independent Luna high submission after public organization guidance; original candidate.py retained,,,,matmul/intent/performance.py
 addmm,6,0.0126720001,0.0162080005,0.011744,0.0116480002,reference_pass,pass,pass,pass,cuda_graph,,,,,addmm/intent/candidate.py
 tensordot,4,0.00640000007,0.00560000003,0.00647200015373528,0.008688000030815601,reference_pass,pass,pass,pass,cuda_graph,,,,,tensordot/intent/candidate.py
 tensordot_rsqrt,5,0.0680480003,0.0345599987,0.06271999888122082,0.11595200002193451,reference_pass,pass,pass,pass,cuda_graph,Original agent Triton uses TF32; excluded from same-precision agent comparisons,,,,tensordot_rsqrt/intent/candidate.py
@@ -62,7 +62,7 @@ fused_lu_solve,0,0.99840802,,3.6086559295654297,6.053760051727295,reference_pass
 normalize_pairwise_distance,4,0.0169839999,0.00907200016,0.009135999716818333,0.009343999903649092,reference_pass,pass,pass,pass,cuda_graph,,,,,normalize_pairwise_distance/intent/candidate.py
 log_softmax_linear,4,0.01492,0.0139680002,0.0104160001501441,0.011200000066310167,reference_pass,pass,pass,pass,cuda_graph,,,,,log_softmax_linear/intent/candidate.py
 least_squares_qr,4,0.162447996,0.0227199998,0.05778400041162968,0.0611760001629591,reference_pass,pass,pass,pass,cuda_event,Independent Luna high submission after public organization guidance; original candidate.py retained,,,,least_squares_qr/intent/performance.py
-determinant_via_qr,1,0.203079998,0.0324799996,0.049776000902056694,0.054632000625133514,reference_pass,pass,pass,pass,cuda_event,,,,,determinant_via_qr/intent/candidate.py
+determinant_via_qr,1,0.203079998,0.0324799996,0.04930399917066097,0.050807999446988106,reference_pass,pass,pass,pass,cuda_event,,,,,determinant_via_qr/intent/candidate.py
 fused_tile_exp,8,0.0106319999,0.00943200011,0.00858400017,0.00891199987,reference_pass,pass,pass,pass,cuda_graph,,,,,fused_tile_exp/intent/candidate.py
 sqrt_tanh,8,0.0150879999,,0.00777600007,0.00791999977,reference_pass,agent_program_error,pass,pass,cuda_graph,,candidate_precompile: at 5:13:,,,sqrt_tanh/intent/candidate.py
 silu_batch_norm,4,0.0419359989,0.0170080001,0.015904,0.0166239999,reference_pass,pass,pass,pass,cuda_graph,,,,,silu_batch_norm/intent/candidate.py

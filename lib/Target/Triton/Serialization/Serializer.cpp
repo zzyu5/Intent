@@ -78,7 +78,10 @@ std::string expressionString(gpu::PhysicalExprAttr expression,
   if (kind == gpu::PhysicalExprKind::Multiply)
     return "(" + operands[0] + " * " + operands[1] + ")";
   if (kind == gpu::PhysicalExprKind::CeilDiv)
-    return "triton.cdiv(" + operands[0] + ", " + operands[1] + ")";
+    return launchContext
+               ? "triton.cdiv(" + operands[0] + ", " + operands[1] + ")"
+               : "((" + operands[0] + " + " + operands[1] + " - 1) // " +
+                     operands[1] + ")";
   if (kind == gpu::PhysicalExprKind::Minimum)
     return "min(" + operands[0] + ", " + operands[1] + ")";
   if (kind == gpu::PhysicalExprKind::Maximum)
@@ -563,7 +566,15 @@ private:
     for (const ViewABI &view : views)
       if (!view.workspace)
         output << (view.type.getAccess() != 1 ? "True, " : "False, ");
-    output << "))\n\n@triton.autotune(\n    configs=[\n";
+    output << "))\n\n";
+    if (!fullCoverageParameters.empty()) {
+      output << "@triton.heuristics({\n";
+      for (const auto &[parameter, coverage] : fullCoverageParameters)
+        output << "    \"" << parameter << "\": _intent_cover_" << parameter
+               << ",\n";
+      output << "})\n";
+    }
+    output << "@triton.autotune(\n    configs=[\n";
     for (const Config &config : *configs) {
       output << "        triton.Config({";
       bool first = true;
@@ -595,7 +606,14 @@ private:
     if (descriptorChoice) {
       if (!firstKey)
         output << ", ";
+      firstKey = false;
       output << "\"" << descriptorChoice.getEligibilityArgument() << "\"";
+    }
+    for (const auto &[parameter, coverage] : fullCoverageParameters) {
+      if (!firstKey)
+        output << ", ";
+      firstKey = false;
+      output << "\"" << parameter << "\"";
     }
     output << "],\n";
     output << "    pre_hook=_intent_tuning_hooks.before,\n"
@@ -604,11 +622,8 @@ private:
       output << "    prune_configs_by={\"early_config_prune\": "
                 "_intent_prune_configs},\n";
     output << ")\n";
-    if (!fullCoverageParameters.empty() || !descriptors.empty()) {
+    if (!descriptors.empty()) {
       output << "@triton.heuristics({\n";
-      for (const auto &[parameter, coverage] : fullCoverageParameters)
-        output << "    \"" << parameter << "\": _intent_cover_" << parameter
-               << ",\n";
       for (const DescriptorABI &descriptor : descriptors)
         output << "    \"" << descriptor.name << "\": _intent_bind"
                << descriptor.name << ",\n";

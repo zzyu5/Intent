@@ -131,26 +131,6 @@ PhysicalExprAttr binaryExpression(MLIRContext *context, PhysicalExprKind kind,
       ArrayAttr::get(context, {lhs, rhs}));
 }
 
-PhysicalExprAttr launchRangeExtent(MakeRangeOp range) {
-  if (auto count = constantLogicalRangeCardinality(range))
-    return expression(range.getContext(), PhysicalExprKind::Constant, *count);
-  PhysicalExprAttr start = queryLaunchExpression(range.getLogicalStart());
-  PhysicalExprAttr stop = queryLaunchExpression(range.getLogicalStop());
-  PhysicalExprAttr step = queryLaunchExpression(range.getStep());
-  if (!start || !stop || !step)
-    return {};
-  if (step.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-      step.getValue() <= 0)
-    return {};
-  MLIRContext *context = range.getContext();
-  PhysicalExprAttr distance = binaryExpression(
-      context, PhysicalExprKind::Subtract, stop, start);
-  distance = binaryExpression(
-      context, PhysicalExprKind::Maximum, distance,
-      expression(context, PhysicalExprKind::Constant, 0));
-  return binaryExpression(context, PhysicalExprKind::CeilDiv, distance, step);
-}
-
 bool hasCompileTimeExtent(Value value) {
   return value.getDefiningOp<arith::ConstantOp>() ||
          value.getDefiningOp<ParameterOp>() ||
@@ -1861,12 +1841,36 @@ traversalDimensionsForStores(ArrayRef<StoreOp> stores, MakeRangeOp range) {
     return failure();
   PhysicalSourceAxis source = sourceAxisIdentity(range);
   SmallVector<int64_t> dimensions{*coordinateDimension};
+  auto kernel = range->getParentOfType<func::FuncOp>();
+  PhysicalProgramAnalysis analysis(kernel);
+  auto collect = [&](Value value) -> LogicalResult {
+    auto fragment = dyn_cast<FragmentType>(value.getType());
+    if (!fragment)
+      return success();
+    auto axes = queryFragmentAxes(fragment, source);
+    if (llvm::all_of(axes, [&](const PhysicalAxisProjection &axis) {
+          return axis.dimensionId == *coordinateDimension;
+        }))
+      return success();
+    PhysicalRangeAxisFact selected = analysis.rangeAxes(value, {range});
+    if (!selected.isExact())
+      return failure();
+    for (unsigned axis : selected.fragmentAxes) {
+      auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+      if (sourceAxisIdentity(mapping) == source &&
+          mapping.getDimensionId() > 0 &&
+          !llvm::is_contained(dimensions, mapping.getDimensionId()))
+        dimensions.push_back(mapping.getDimensionId());
+    }
+    return success();
+  };
   for (StoreOp store : stores) {
-    collectTraversalDimensions(store.getValue().getType(), source, dimensions);
-    if (store.getValid())
-      collectTraversalDimensions(store.getValid().getType(), source, dimensions);
+    if (failed(collect(store.getValue())) ||
+        (store.getValid() && failed(collect(store.getValid()))))
+      return failure();
     for (Value coordinate : store.getCoordinates())
-      collectTraversalDimensions(coordinate.getType(), source, dimensions);
+      if (failed(collect(coordinate)))
+        return failure();
   }
   return dimensions;
 }
@@ -2939,11 +2943,13 @@ LogicalResult alignOrdinaryContractOperandTypes(func::FuncOp kernel) {
         if (rebindLhs) {
           auto mapping = cast<AxisMapAttr>(lhsType.getAxisMaps()[lhsAxis]);
           retargetSourceExtent(lhs, sourceAxisIdentity(mapping),
-                               cast<PhysicalExprAttr>(rhsExtent));
+                               cast<PhysicalExprAttr>(rhsExtent),
+                               mapping.getDimensionId());
         } else {
           auto mapping = cast<AxisMapAttr>(rhsType.getAxisMaps()[rhsAxis]);
           retargetSourceExtent(rhs, sourceAxisIdentity(mapping),
-                               cast<PhysicalExprAttr>(lhsExtent));
+                               cast<PhysicalExprAttr>(lhsExtent),
+                               mapping.getDimensionId());
         }
       }
       return success();
@@ -5050,19 +5056,15 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                                           store.getValue(), store, source,
                                           dimension, materializationVisited);
           auto reduction = analysis.reductionDependency(store.getValue(), source, dimension);
-          // Dominating contractions outside this traversal are captured SSA,
-          // not work that a blocked writeback would recompute.
-          bool retainedContraction = replay.isReplayable() &&
-              !replay.contractions.empty() && reduction.isExact() && reduction.depends;
-          if (retainedContraction) {
+          // A bounded value that already depends on the complete traversal is
+          // retained SSA. Reblocking its writeback needlessly rebuilds that graph.
+          bool retainedReduction = replay.isReplayable() &&
+              reduction.isExact() && reduction.depends;
+          if (retainedReduction) {
             auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
-            for (Operation *contract : replay.contractions) {
-              auto footprint = estimatedFragmentRegisters(kernel, contract->getResult(0));
-              if (!footprint || *footprint >= capabilities.getRegistersPerUnit()) {
-                retainedContraction = false;
-                break;
-              }
-            }
+            auto footprint = estimatedFragmentRegisters(kernel, store.getValue());
+            retainedReduction = footprint &&
+                *footprint < capabilities.getRegistersPerUnit();
           }
           // Replaying a read of the destination also crosses its writes from
           // earlier chunks. Preserve that snapshot unless all addresses agree.
@@ -5126,7 +5128,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             continue;
           }
           useReplayTraversal &=
-              replay.isReplayable() && !materializedFork && !retainedContraction &&
+              replay.isReplayable() && !materializedFork && !retainedReduction &&
               (effectLocal == effectLocalOrigins.end() ||
                !replay.crossesStructuredProgram);
         }
@@ -5717,7 +5719,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
               // The store pairs these tensor axes by ordinal, even when the
               // address domains have different starts. Share their tile width,
               // retaining each domain's own coordinates and source identity.
-              PhysicalExprAttr length = launchRangeExtent(root);
+              PhysicalExprAttr length = queryLaunchRangeExtent(root);
               FailureOr<int64_t> extent = exactStaticTraversalExtent(
                   analysis.axisRanges(range.getResult(), 0));
               bool sameStaticCardinality = succeeded(addressExtent) &&
@@ -5730,7 +5732,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                                        *rootDimension == *rangeDimension;
               return isUnitStepRange(root) && isUnitStepRange(range) &&
                      (sameLogicalExtent || sameStaticCardinality ||
-                      (length && length == launchRangeExtent(range)));
+                      (length && length == queryLaunchRangeExtent(range)));
             }
             return sameBound(root.getLogicalStart(), range.getLogicalStart()) &&
                    sameBound(root.getLogicalStop(), range.getLogicalStop()) &&
@@ -6244,7 +6246,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       const bool launchVisibleDimension =
           succeeded(sourceDimension) &&
           succeeded(dimensionArgument(kernel, *sourceDimension));
-      PhysicalExprAttr derivedExtent = launchRangeExtent(range);
+      PhysicalExprAttr derivedExtent = queryLaunchRangeExtent(range);
       const bool launchVisibleExtent =
           worksetRange ? !logicalExtent
                        : launchVisibleDimension ||
@@ -6921,7 +6923,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       continue;
     if (!dimension) {
       for (MakeRangeOp other : ranges) {
-        auto extent = launchRangeExtent(other);
+        auto extent = queryLaunchRangeExtent(other);
         if (!extent) {
           derivedLogicalExtent = {};
           break;
