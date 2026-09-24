@@ -33,6 +33,14 @@ Tensor 和 view 有 `.shape`；scalar、tuple、record、domain 没有统一 `.s
 
 `I.zeros`、`I.full` 和 indexed read 的结果都是不可变 tensor SSA values。下标赋值和 `I.store` 的写入目标必须是可写 view 或 logical buffer，不能原地修改这些 tensor values。Tensor carry 通过计算新 tensor 并重新绑定名字更新；逐地址写入则使用显式存储。
 
+名字重绑定可以携带完整 tensor value，无须为了每次状态更新而写回存储。下面 `values` 与 `delta` 是同 dtype、同 shape 的 tensors，`active` 是同 shape 的 bool tensor，`count` 是 scalar index；每轮 `state` 的 schema 保持不变，物理存储由 compiler 决定：
+
+```python
+state = values
+for step in I.domain(0, count):
+    state = I.select(active, state + delta, state)
+```
+
 `I.buffer` 返回可变存储对象，buffer 名字本身不是 tensor value。把其中内容用于赋值右值、pointwise 或 reduce 时，先通过下标读取为 scalar/tensor；例如 `value = state[:, :]` 读取二维 buffer 的完整内容。
 
 ### Comparison operators（比较运算）
