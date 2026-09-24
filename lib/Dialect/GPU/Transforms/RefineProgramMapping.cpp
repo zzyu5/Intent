@@ -171,33 +171,13 @@ LogicalResult refineProgramMapping(ModuleOp module) {
     return failure();
   const int64_t traversalWorker =
       static_cast<int64_t>(CoordinateRole::TraversalWorker);
-  const int64_t workset = static_cast<int64_t>(CoordinateRole::Workset);
-  const int64_t ownership =
-      static_cast<int64_t>(CoordinateRole::PointwiseOwnership);
-  const int64_t contractionM =
-      static_cast<int64_t>(CoordinateRole::ContractionM);
-  const int64_t contractionN =
-      static_cast<int64_t>(CoordinateRole::ContractionN);
   SmallVector<unsigned> traversalAxes;
-  unsigned outerAxes = 0;
-  unsigned contractionMAxes = 0;
-  unsigned contractionNAxes = 0;
-  bool onlyBatchedContractionRoles = true;
   for (auto [axis, role] : llvm::enumerate(roles.asArrayRef()))
-    if (role == traversalWorker) {
+    if (role == traversalWorker)
       traversalAxes.push_back(axis);
-    } else {
-      outerAxes += role == workset || role == ownership;
-      contractionMAxes += role == contractionM;
-      contractionNAxes += role == contractionN;
-      onlyBatchedContractionRoles &=
-          role == workset || role == ownership ||
-          role == contractionM || role == contractionN;
-    }
-  bool batchedContraction = traversalAxes.empty() &&
-                            onlyBatchedContractionRoles && outerAxes > 0 &&
-                            contractionMAxes == 1 && contractionNAxes == 1;
-  if (traversalAxes.empty() && !batchedContraction)
+  // Independent tiles already have a complete launch grid. Only traversal
+  // workers need to revisit logical work through a grid-stride loop.
+  if (traversalAxes.empty())
     return success();
 
   auto program = mapping.getLinear().getDefiningOp<ProgramIdOp>();
@@ -241,11 +221,6 @@ LogicalResult refineProgramMapping(ModuleOp module) {
     return kernel.emitError(
         "persistent traversal requires a positive compute-unit capability");
   int64_t residentCount = capabilities.getComputeUnits();
-  // Independent contraction tiles need enough resident programs to occupy two
-  // workers per compute unit while the grid-stride loop preserves exact task
-  // coverage.  Ordered traversal keeps its existing one-worker policy.
-  if (batchedContraction)
-    residentCount *= 2;
   OpBuilder parameterBuilder(&kernel.getBody().front(),
                              kernel.getBody().front().begin());
   auto residentSchema = ParameterAttr::get(
