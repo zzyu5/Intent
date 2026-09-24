@@ -65,6 +65,9 @@ The source constructs have distinct meanings:
   An accumulator in the code does not by itself show that the mathematical task
   requires this order. Reduce, scan and contraction have their own documented
   dependence and numerical contracts; an ordinary loop does not inherit them.
+- I.reduce and I.arg_reduce operate on logical tensor axes in the current kernel.
+  Reducing every axis yields scalar result(s); it does not call a library
+  reduction or create an implicit cross-kernel reduction tree.
 - Each @intent.kernel produces one GPU launch. Separate expressions or named
   intermediates inside it do not create additional launches or independent work.
   Collectives have no hidden communication between independent GPU programs.
