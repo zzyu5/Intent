@@ -2944,13 +2944,26 @@ LogicalResult simplifyMaskedAccessCoordinates(ModuleOp module) {
     Value valid = load.getValid();
     if (!valid)
       return;
+    auto sameAxes = [&](Type type) {
+      auto fragment = dyn_cast<FragmentType>(type);
+      auto mask = dyn_cast<FragmentType>(valid.getType());
+      if (!fragment || !mask)
+        return !fragment && !mask;
+      return fragment.getOwner() == mask.getOwner() &&
+             fragment.getAxisMaps() == mask.getAxisMaps() &&
+             queryBroadcastProjection(fragment, mask).isExact();
+    };
     llvm::SmallDenseSet<Value, 16> conjuncts;
     SmallVector<Value> pending{valid};
     while (!pending.empty()) {
       Value value = pending.pop_back_val();
-      if (value.getType() != valid.getType() ||
-          !conjuncts.insert(value).second)
+      if (!sameAxes(value.getType()) || !conjuncts.insert(value).second)
         continue;
+      if (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
+        if (sameAxes(broadcast.getValue().getType()))
+          pending.push_back(broadcast.getValue());
+        continue;
+      }
       auto binary = value.getDefiningOp<BinaryOp>();
       if (!binary ||
           (binary.getOperatorKind() != BinaryOperator::LogicalAnd &&
@@ -2959,16 +2972,37 @@ LogicalResult simplifyMaskedAccessCoordinates(ModuleOp module) {
       pending.push_back(binary.getLhs());
       pending.push_back(binary.getRhs());
     }
+    OpBuilder builder(load);
+    IRMapping simplified;
+    std::function<Value(Value)> simplify = [&](Value value) -> Value {
+      if (Value known = simplified.lookupOrNull(value))
+        return known;
+      if (!sameAxes(value.getType()))
+        return value;
+      Value result = value;
+      if (auto select = value.getDefiningOp<SelectOp>();
+          select && conjuncts.contains(select.getCondition())) {
+        result = simplify(select.getTrueValue());
+      } else if (auto broadcast = value.getDefiningOp<BroadcastOp>();
+                 broadcast && sameAxes(broadcast.getValue().getType())) {
+        Value operand = simplify(broadcast.getValue());
+        if (operand != broadcast.getValue()) {
+          IRMapping mapping;
+          mapping.map(broadcast.getValue(), operand);
+          result = builder.clone(*broadcast, mapping)->getResult(0);
+        }
+      }
+      simplified.map(value, result);
+      return result;
+    };
     SmallVector<Value> coordinates(load.getCoordinates());
     bool changed = false;
     for (Value &coordinate : coordinates) {
-      auto select = coordinate.getDefiningOp<SelectOp>();
-      if (!select || !conjuncts.contains(select.getCondition()))
-        continue;
-      // Exact SSA predicates with the same schema describe the same lanes.
-      // Change only this masked read; other uses retain their selected value.
-      coordinate = select.getTrueValue();
-      changed = true;
+      // Singleton broadcasts with unchanged axes retain the predicate's lane
+      // relation. Other uses and the read's original mask stay unchanged.
+      Value replacement = simplify(coordinate);
+      changed |= replacement != coordinate;
+      coordinate = replacement;
     }
     if (changed)
       load.getCoordinatesMutable().assign(coordinates);
