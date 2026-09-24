@@ -4184,8 +4184,19 @@ void PhysicalProgramAnalysis::analyzeReplay(
   Region *combine = nullptr;
   if (auto reduce = dyn_cast<ReduceOp>(operation))
     combine = &reduce.getCombine();
-  else if (auto scan = dyn_cast<ScanOp>(operation))
+  else if (auto scan = dyn_cast<ScanOp>(operation)) {
+    auto fragment = cast<FragmentType>(value.getType());
+    auto axis = cast<AxisMapAttr>(fragment.getAxisMaps()[scan.getAxis()]);
+    // A prefix depends on earlier members of this axis. Replaying each tile
+    // independently would reset that state; only the other axes are pointwise.
+    if (source && sourceAxisIdentity(axis) == *source &&
+        (!sourceDimension || axis.getDimensionId() == *sourceDimension)) {
+      appendUnique(result.blockers, operation);
+      result.state = PhysicalFactState::Unknown;
+      return;
+    }
     combine = &scan.getCombine();
+  }
   if (combine) {
     WalkResult helper = combine->walk([&](Operation *nested) {
       if (isa<YieldOp, arith::ConstantOp>(nested))
