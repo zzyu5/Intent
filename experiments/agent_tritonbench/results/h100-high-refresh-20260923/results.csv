@@ -19,9 +19,9 @@ max,8,0.0131359999,0.00967199961,0.121920001,0.139984004,reference_pass,pass,pas
 mean,8,0.0115040001,,0.0334400013,0.0400799997,reference_pass,agent_program_error,pass,pass,cuda_graph,,candidate_precompile: build.<locals>.wrapper() missing 1 required positional argument: 'keepdim',,,mean/intent/candidate.py
 min,4,0.018464,,,,reference_pass,agent_program_error,numerical_failure,numerical_failure,cuda_graph,,candidate_precompile: at 35:19:,generated/source result 0 finite-value masks differ,generated/source result 0 finite-value masks differ,min/intent/candidate.py
 sum,8,0.0113599999,0.00876800017,0.0332159996,0.0410319995,reference_pass,pass,pass,pass,cuda_graph,,,,,sum/intent/candidate.py
-std,8,0.0148320002,0.00975999981,0.0279600006,0.04672,reference_pass,pass,pass,pass,cuda_graph,,,,,std/intent/candidate.py
+std,8,0.0148320002,0.00975999981,0.0279600006,0.03927999921143055,reference_pass,pass,pass,pass,cuda_graph,,,,,std/intent/candidate.py
 softmax,6,0.0100079998,0.00771199982,0.00881600007,0.00839999970048666,reference_pass,pass,pass,pass,cuda_graph,,,,,softmax/intent/candidate.py
-logsumexp,8,0.0352560002,0.0127360001,0.0876560025,0.14919999986886978,reference_pass,pass,pass,pass,cuda_graph,,,,,logsumexp/intent/candidate.py
+logsumexp,8,0.0352560002,0.0127360001,0.0876560025,0.12785600125789642,reference_pass,pass,pass,pass,cuda_graph,,,,,logsumexp/intent/candidate.py
 add_mean,8,0.0194560001,0.0104,0.069191996,0.078263998,reference_pass,pass,pass,pass,cuda_graph,,,,,add_mean/intent/candidate.py
 exp_mean,8,0.0155200004,0.00921599986,0.0643359944,0.0726880021,reference_pass,pass,pass,pass,cuda_graph,,,,,exp_mean/intent/candidate.py
 matmul,6,0.00923199998,0.0137279998,0.0329520013,0.037808001,reference_pass,pass,pass,pass,cuda_graph,,,,,matmul/intent/candidate.py
@@ -85,7 +85,7 @@ solve_symmetric_ldl,2,0.962536007,,,,reference_pass,numerical_failure,numerical_
 exp_sqrt,8,0.0101119997,0.00780800008,0.00752800005,0.00803999975,reference_pass,pass,pass,pass,cuda_graph,,,,,exp_sqrt/intent/candidate.py
 fused_masked_select_add_gelu,8,0.0496800002,0.0247839997,0.761584014,3.96397602558136,reference_pass,pass,pass,pass,cuda_event,,,,,fused_masked_select_add_gelu/intent/candidate.py
 fused_pairwise_distance_adaptive_avg_pool2d,1,0.0162400003,0.00574399997,0.0083039999,0.00684799999,reference_pass,pass,pass,pass,cuda_graph,,,,,fused_pairwise_distance_adaptive_avg_pool2d/intent/candidate.py
-fused_add_mul_groupnorm,0,0.161639996,0.114344001,0.164912,0.9772399961948395,reference_pass,pass,pass,pass,cuda_graph,,,,,fused_add_mul_groupnorm/intent/candidate.py
+fused_add_mul_groupnorm,0,0.161639996,0.114344001,0.164912,0.7297360002994537,reference_pass,pass,pass,pass,cuda_graph,,,,,fused_add_mul_groupnorm/intent/candidate.py
 relu_batch_norm_conv2d,0,0.0295679998,0.0288320007,0.0329280011,0.038048001,reference_pass,pass,pass,pass,cuda_graph,,,,,relu_batch_norm_conv2d/intent/candidate.py
 normalized_cosine_similarity,0,0.0465520006,0.00595200015,0.00609600008,0.00731200003,reference_pass,pass,pass,pass,cuda_graph,,,,,normalized_cosine_similarity/intent/candidate.py
 fused_cross_entropy_log_softmax,0,0.0228479998,0.0103039998,,,reference_pass,pass,compilation_failure,compilation_failure,cuda_graph,,,frontend_kir: /home/kingdom/.local/share/intentdsl/h100-refresh-20260923/study/intent-programs/fused_cross_entropy_log_softmax/intent/candidate.py:34:5: error: stored/scattered value cannot broadcast to indexed shape,frontend_kir: /home/kingdom/.local/share/intentdsl/h100-refresh-20260923/study/intent-programs/fused_cross_entropy_log_softmax/intent/candidate.py:34:5: error: stored/scattered value cannot broadcast to indexed shape,fused_cross_entropy_log_softmax/intent/candidate.py
