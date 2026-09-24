@@ -1141,11 +1141,10 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
       return profiles[selectedProfile];
     });
   }
-  // Independent rows and their local traversals consume different axes of the
+  // Independent rows and reduction/traversal chunks consume different axes of the
   // resource budget. Keep one correlated small-row/large-chunk tuple instead
   // of pairing both granularities solely by their profile row number.
-  if (!hasContraction && !reductionRows.empty() &&
-      !pointwiseTraversals.empty() && largestReduction > 0)
+  if (!hasContraction && !reductionRows.empty() && largestReduction > 0)
     appendTuple([&](ParameterOp parameter) -> const TuningProfile & {
       return parameterProfiles.find(parameter)->second.front();
     }, true);
