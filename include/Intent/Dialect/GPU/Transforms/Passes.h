@@ -139,6 +139,7 @@ mlir::LogicalResult replacePhysicalParameter(mlir::func::FuncOp kernel,
 mlir::LogicalResult realizeAccessComposition(mlir::ModuleOp module);
 mlir::LogicalResult simplifyMaskedAccessCoordinates(mlir::ModuleOp module);
 mlir::LogicalResult predicateScalarControl(mlir::ModuleOp module);
+mlir::LogicalResult guardInactivePredicatedLoops(mlir::ModuleOp module);
 bool canPredicateScalarBlock(mlir::Block &block);
 bool canPredicateScalarWhile(mlir::scf::WhileOp loop);
 bool canPredicateValueOperation(mlir::Operation *operation);

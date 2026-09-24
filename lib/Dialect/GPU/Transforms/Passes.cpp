@@ -66,7 +66,9 @@ LogicalResult formPointwiseBlocking(ModuleOp module, func::FuncOp kernel) {
       failed(alignAccessValueRelations(kernel)) ||
       failed(alignPointwiseValueRelations(kernel)))
     return failure();
-  return closeReductionValueRelations(kernel);
+  if (failed(closeReductionValueRelations(kernel)))
+    return failure();
+  return guardInactivePredicatedLoops(module);
 }
 
 LogicalResult coRealizeOnlineReductions(ModuleOp module, func::FuncOp kernel) {

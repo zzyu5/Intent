@@ -7,6 +7,8 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
+#include <limits>
+
 using namespace mlir;
 
 namespace intent::gpu {
@@ -218,6 +220,29 @@ Value selectScalarProduct(OpBuilder &builder, Location location, Value condition
   return builder.create<MakeRecordOp>(location, record, fields);
 }
 
+Value anyActiveLane(OpBuilder &builder, Location location, Value predicate) {
+  auto shape = dyn_cast<FragmentType>(predicate.getType());
+  if (!shape)
+    return predicate;
+  Value identity = builder.create<arith::ConstantOp>(location,
+                                                    builder.getBoolAttr(false));
+  SmallVector<int64_t> axes;
+  for (unsigned axis = 0; axis < shape.getShape().size(); ++axis)
+    axes.push_back(axis);
+  auto any = builder.create<ReduceOp>(
+      location, TypeRange{builder.getI1Type()}, ValueRange{predicate, identity},
+      axes, 1, 1, 0);
+  OpBuilder::InsertionGuard guard(builder);
+  Block *combine = builder.createBlock(
+      &any.getCombine(), {}, {builder.getI1Type(), builder.getI1Type()},
+      {location, location});
+  Value joined = builder.create<BinaryOp>(
+      location, builder.getI1Type(), combine->getArgument(0),
+      combine->getArgument(1), BinaryOperator::LogicalOr);
+  builder.create<YieldOp>(location, joined);
+  return any.getResult(0);
+}
+
 } // namespace
 
 bool canPredicateValueOperation(Operation *operation) {
@@ -418,27 +443,7 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
         location, active.getType(), active,
         project(beforeMapping.lookupOrDefault(condition.getCondition()), active.getType()),
         BinaryOperator::LogicalAnd);
-    Value anyActive = nextActive;
-    if (shape) {
-      Value identity = builder.create<arith::ConstantOp>(location, builder.getBoolAttr(false));
-      SmallVector<int64_t> axes;
-      for (unsigned axis = 0; axis < shape.getShape().size(); ++axis)
-        axes.push_back(axis);
-      auto any = builder.create<ReduceOp>(
-          location, TypeRange{builder.getI1Type()}, ValueRange{nextActive, identity},
-          axes, 1, 1, 0);
-      {
-        OpBuilder::InsertionGuard combineGuard(builder);
-        Block *combine = builder.createBlock(
-            &any.getCombine(), {}, {builder.getI1Type(), builder.getI1Type()},
-            {location, location});
-        Value joined = builder.create<BinaryOp>(
-            location, builder.getI1Type(), combine->getArgument(0),
-            combine->getArgument(1), BinaryOperator::LogicalOr);
-        builder.create<YieldOp>(location, joined);
-      }
-      anyActive = any.getResult(0);
-    }
+    Value anyActive = anyActiveLane(builder, location, nextActive);
     SmallVector<Value> forwarded(before->getArguments().take_front(loop.getNumResults()));
     if (shape)
       forwarded.push_back(nextActive);
@@ -703,6 +708,93 @@ LogicalResult predicateScalarControl(ModuleOp module) {
     conditional.erase();
   }
   eraseDeadPhysicalValues(*kernel);
+  return success();
+}
+
+LogicalResult guardInactivePredicatedLoops(ModuleOp module) {
+  FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
+  if (failed(kernel))
+    return failure();
+  SmallVector<scf::ForOp> loops;
+  kernel->walk<WalkOrder::PostOrder>([&](scf::ForOp loop) { loops.push_back(loop); });
+  for (scf::ForOp loop : loops) {
+    APInt lower, upper, step;
+    if (!loop.getNumResults() || !isMemoryEffectFree(loop) ||
+        llvm::any_of(loop.getBody()->without_terminator(), [](Operation &nested) {
+          return nested.getNumRegions() != 0;
+        }) ||
+        !matchPattern(loop.getLowerBound(), m_ConstantInt(&lower)) ||
+        !matchPattern(loop.getUpperBound(), m_ConstantInt(&upper)) ||
+        !matchPattern(loop.getStep(), m_ConstantInt(&step)) ||
+        lower.getBitWidth() > 64 || upper.getBitWidth() > 64 ||
+        step.getBitWidth() > 64 || !step.isStrictlyPositive() ||
+        static_cast<__int128>(upper.getSExtValue()) - lower.getSExtValue() <=
+            step.getSExtValue() ||
+        static_cast<__int128>(upper.getSExtValue()) + step.getSExtValue() - 1 >
+            std::numeric_limits<int64_t>::max())
+      continue;
+    // If-conversion freezes an inactive recurrence at its incoming value.
+    // Recover that loop-invariant predicate from the carry selects; when every
+    // lane is inactive, a finite effect-free loop is exactly its initial state.
+    SmallVector<SmallVector<std::pair<Value, bool>>> guards;
+    Type predicateType;
+    bool supported = true;
+    for (auto [yielded, carried] :
+         llvm::zip(loop.getBody()->getTerminator()->getOperands(),
+                   loop.getRegionIterArgs())) {
+      if (yielded == carried)
+        continue;
+      SmallVector<std::pair<Value, bool>> conjunction;
+      while (auto select = yielded.getDefiningOp<SelectOp>()) {
+        bool inverted = select.getTrueValue() == carried;
+        if ((!inverted && select.getFalseValue() != carried) ||
+            !loop.isDefinedOutsideOfLoop(select.getCondition()))
+          break;
+        Type type = select.getCondition().getType();
+        auto fragment = dyn_cast<FragmentType>(type);
+        if (!fragment || fragment.getShape().empty() ||
+            (predicateType && predicateType != type))
+          break;
+        predicateType = type;
+        conjunction.emplace_back(select.getCondition(), inverted);
+        yielded = inverted ? select.getFalseValue() : select.getTrueValue();
+      }
+      if (conjunction.empty()) {
+        supported = false;
+        break;
+      }
+      guards.push_back(std::move(conjunction));
+    }
+    if (!supported || guards.empty())
+      continue;
+    OpBuilder builder(loop);
+    Location location = loop.getLoc();
+    Value active;
+    for (auto &conjunction : guards) {
+      Value selected;
+      for (auto [condition, inverted] : conjunction) {
+        if (inverted)
+          condition = builder.create<UnaryOp>(location, predicateType, condition,
+                                               UnaryOperator::Not);
+        selected = selected ? Value(builder.create<BinaryOp>(
+                                  location, predicateType, selected, condition,
+                                  BinaryOperator::LogicalAnd)) : condition;
+      }
+      active = active ? Value(builder.create<BinaryOp>(
+                            location, predicateType, active, selected,
+                            BinaryOperator::LogicalOr)) : selected;
+    }
+    auto conditional = builder.create<scf::IfOp>(
+        location, loop.getResultTypes(), anyActiveLane(builder, location, active),
+        /*withElseRegion=*/true);
+    loop->replaceAllUsesWith(conditional.getResults());
+    Block &thenBody = conditional.getThenRegion().front();
+    loop->moveBefore(&thenBody, thenBody.begin());
+    builder.setInsertionPointToEnd(&thenBody);
+    builder.create<scf::YieldOp>(location, loop.getResults());
+    builder.setInsertionPointToStart(&conditional.getElseRegion().front());
+    builder.create<scf::YieldOp>(location, loop.getInitArgs());
+  }
   return success();
 }
 
