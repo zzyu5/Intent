@@ -4028,6 +4028,7 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
       currentExtent.getValue() == *staticDimension &&
       llvm::isPowerOf2_64(*staticDimension))
     return success();
+  bool coverageIsRangeCapacity = false;
   if (!runtimeDimension) {
     FailureOr<MakeRangeOp> authority = queryExactLogicalRange(ranges);
     PhysicalExprAttr capacity = succeeded(authority)
@@ -4037,6 +4038,7 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
       OpBuilder builder(&kernel.front(), kernel.front().begin());
       runtimeDimension = builder.create<PhysicalExprOp>(
           source.getLoc(), builder.getIndexType(), capacity);
+      coverageIsRangeCapacity = true;
     }
   }
   if (!runtimeDimension)
@@ -4047,7 +4049,9 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
   if (!coverageBound)
     return kernel.emitError(
         "full-coverage physicalization has no launch-visible extent expression");
-  if (subregion)
+  // A range capacity already bounds its member count. Unlike a parent extent,
+  // it is not an absolute coordinate against which to compare logicalStop.
+  if (subregion && !coverageIsRangeCapacity)
     for (MakeRangeOp range : ranges.roots) {
       auto end = queryNonNegativeIndexUpperBound(range.getLogicalStop());
       auto endConstant = end ? constantPhysicalExpression(end) : std::nullopt;

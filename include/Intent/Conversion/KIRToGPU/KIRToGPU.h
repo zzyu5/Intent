@@ -17,6 +17,7 @@ struct GPUCapabilities {
   bool matrixUnits;
   bool dynamicVectorWidth;
   bool nativeTupleReductions;
+  bool nativeFragmentGather;
 };
 
 /// Consumes canonical KIR and replaces it with one complete conservative

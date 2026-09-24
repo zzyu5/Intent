@@ -146,10 +146,11 @@ def IntentGPU_CapabilitiesAttr : AttrDef<IntentGPU_Dialect, "Capabilities"> {
     "int64_t":$singleToDoublePrecisionPerfRatio,
     "bool":$matrixUnits,
     "bool":$dynamicVectorWidth,
-    "bool":$nativeTupleReductions
+    "bool":$nativeTupleReductions,
+    "bool":$nativeFragmentGather
   );
   let assemblyFormat =
-      "`<` $computeUnits `,` $sharedMemoryPerUnit `,` $maxDynamicSharedMemoryPerBlock `,` $registersPerUnit `,` $maxThreadsPerBlock `,` $computeCapabilityMajor `,` $computeCapabilityMinor `,` $singleToDoublePrecisionPerfRatio `,` $matrixUnits `,` $dynamicVectorWidth `,` $nativeTupleReductions `>`";
+      "`<` $computeUnits `,` $sharedMemoryPerUnit `,` $maxDynamicSharedMemoryPerBlock `,` $registersPerUnit `,` $maxThreadsPerBlock `,` $computeCapabilityMajor `,` $computeCapabilityMinor `,` $singleToDoublePrecisionPerfRatio `,` $matrixUnits `,` $dynamicVectorWidth `,` $nativeTupleReductions `,` $nativeFragmentGather `>`";
   let genVerifyDecl = 1;
 }
 

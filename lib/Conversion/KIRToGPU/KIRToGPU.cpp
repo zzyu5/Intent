@@ -5495,7 +5495,8 @@ LogicalResult constructGPUProgram(ModuleOp module,
       capabilities.maxThreadsPerBlock, capabilities.computeCapabilityMajor,
       capabilities.computeCapabilityMinor,
       capabilities.singleToDoublePrecisionPerfRatio, capabilities.matrixUnits,
-      capabilities.dynamicVectorWidth, capabilities.nativeTupleReductions);
+      capabilities.dynamicVectorWidth, capabilities.nativeTupleReductions,
+      capabilities.nativeFragmentGather);
   SmallVector<NamedAttribute> functionAttrs{
       builder.getNamedAttr(gpu::kernelAttr, builder.getUnitAttr()),
       builder.getNamedAttr(gpu::capabilitiesAttr, capabilityAttr),

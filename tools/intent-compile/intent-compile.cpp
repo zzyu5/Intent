@@ -264,6 +264,7 @@ int main(int argc, char **argv) {
       singleToDoublePrecisionPerfRatio,
       matrixUnits,
       dynamicVectorWidth,
+      target == TargetKind::Triton,
       target == TargetKind::Triton};
   if (mlir::failed(intent::lowerCanonicalKIRToGPU(*module, capabilities))) {
     llvm::errs() << "Intent KIR-to-GPU construction failed\n";
