@@ -20,12 +20,12 @@
 
 | 来源 | Intent→Triton 通过 | Intent→cuTile 通过 | Triton 相对 source 加速 | cuTile 相对 source 加速 | 同 DSL cuTile/Triton 耗时比 |
 |---|---:|---:|---:|---:|---:|
-| Triton 库 | 54/54 | 53/54 | 1.124×，52 对 | 1.116×，51 对 | 0.988×，53 对 |
+| Triton 库 | 54/54 | 53/54 | 1.124×，52 对 | 1.131×，51 对 | 0.976×，53 对 |
 | cuTile 库 | 35/35 | 35/35 | 2.599×，35 对 | 2.451×，35 对 | 1.060×，35 对 |
 
 cuTile 库另有 2 条 H100/source 不支持的记录：block-scaled GEMM 的 SM100/E8M0 路径、NVFP4 packing 路径。保留状态，不强行运行，也不计入上表可运行分母。Triton 库有两条 source 时间不可用，但生成程序本次通过，不能把它们的 pass 清空。
 
-**整体耗时比已在 1.2 以内，不等于逐项达标。** Triton 来源中仍有 7 项 cuTile 比同 DSL Triton 慢超过 20%，其中 2 项超过 2 倍；cuTile 来源分别为 6 项和 2 项。
+**整体耗时比已在 1.2 以内，不等于逐项达标。** Triton 来源中仍有 6 项 cuTile 比同 DSL Triton 慢超过 20%，其中 2 项超过 2 倍；cuTile 来源分别为 6 项和 2 项。
 
 | 主要长尾 | cuTile/Triton 耗时比 |
 |---|---:|
@@ -82,7 +82,7 @@ cuTile 从 77 增加到 93 个 pass 后，几何加速比反而降低，主要�
 | subregion 容量过大 | 容量分析保留常量与循环下界，避免把 k+1 到 257 的最多 256 个成员补齐到 512；solve 尾部从 256×512 收紧为 256×256。静态归约候选也按容量去重。 |
 | 写回分块与默认候选过大 | 将已有归约范围约束复用于逐点写回；全覆盖处理保留 `min(parameter, shape)` 的既有分块。cuTile 依据已导出的维度绑定，在合法候选中保留填充最少的 pointwise ownership 组合。normalize 默认配置 **Triton 0.009136、cuTile 0.009336 ms，均 pass**，reference 0.016984 ms；cuTile 比原定向结果 0.063112 ms 快 6.76 倍。 |
 | 资源估算与索引证明丢失 | 广播、splat、reshape 不再独立按展开后的 tile 计寄存器；参考 Triton 的 [view lowering](../../../ref/triton/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp)。cuTile 保留复合最小值和 atomic 活跃坐标边界，使已有运行时范围检查可以选择 32 位内部数组索引；不改变外部 ABI、逻辑 index 类型或数值精度。 |
-| cuTile worker warp 配置遗漏 | 原先仅矩阵计算声明该参数，生产 profile 又只保留自动推断。归约等已有 occupancy-sensitive 计算现在也使用同一个 provider 参数；生产保留自动推断和 8 两档，且保留自动推断下原有的访问方式组合。原 BN **0.092016 → 0.063184 ms**，FP8 **7.288080 → 6.746472 ms**，均通过。这沿用 [cuTile 原生 hint](https://docs.nvidia.com/cuda/cutile-python/execution.html)，没有增加 kernel 或改变算法。 |
+| cuTile worker warp 配置遗漏 | 原先仅矩阵计算声明该参数，生产 profile 又只保留自动推断。归约等已有 occupancy-sensitive 计算现在也使用同一个 provider 参数；生产保留自动推断和 8 两档，且保留自动推断下原有的访问方式组合。原 BN **0.092016 → 0.063184 ms**，FP8 **7.288080 → 6.746472 ms**，交叉熵 **1.665752 → 0.867944 ms**，均通过原容差。交叉熵使用 worker warps=8、occupancy=2、gather，54 个候选全部成功；其完整耗时现已低于同 DSL Triton 的 0.970696 ms，与 source 0.730696 ms 的比值为 1.188。这沿用 [cuTile 原生 hint](https://docs.nvidia.com/cuda/cutile-python/execution.html)，没有增加 kernel 或改变算法。 |
 
 这些改动没有自动增加 kernel，没有修改候选算法，也没有新增另一套 form/plan。主要实现位于 [GPU shared passes](../../lib/Dialect/GPU/Transforms/)、[Triton leaf](../../lib/Target/Triton/)、[cuTile leaf](../../lib/Target/CuTile/)。
 
