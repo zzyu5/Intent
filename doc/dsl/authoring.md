@@ -10,6 +10,7 @@
 
 - 先确定各阶段的输入、输出、独立逻辑组及组内参与计算的成员，再写 kernel。Triton 写法中由不同 program 分别承担的算法工作，应保留为逻辑 domains/subregions 与 `I.parallel`；去掉物理 block 参数，不意味着去掉工作分组。一个逻辑组不要求对应一个物理 CTA。
 - Triton 的向量表达式对应逻辑 tensor 运算。核对 dtype、成员与数值合同后，`tl.sum` 对应 `I.reduce.sum`，`tl.dot` 对应 `I.matmul`/`I.contract`，`tl.associative_scan` 对应 `I.scan`；无需逐元素展开成普通循环。外层 `I.parallel` 不会使内层普通循环并行；structured operation 产生的 tensor values 可以由满足无冲突 effects 的独立逻辑点消费。
+- Tensor 运算与 structured operation 保留的自由轴本身就表达独立结果坐标；compiler 在保持 control/effects 的前提下分块和映射这些轴。无需仅为复刻 Triton 的物理 `BLOCK_M/BLOCK_N` 而额外建立固定大小的 logical subregions。算法需要的独立成员集合、局部汇总或跨 kernel 接口仍须显式保留；完整归约的 reduction axis 不因省略物理 tile 而成为自由轴。
 - 外部结果是 scalar，不意味着应把整个输入放进一个全轴归约。`I.reduce` 处理传入 value 的指定轴；全域 value 的归约仍有全局依赖。对 producer 或后续 consumer 写 `I.parallel`，不会替这项归约建立分组或跨 kernel 汇总。
 - 若所选 Triton 算法包含多个 kernels，翻译到 Intent 时保留阶段、跨 kernel tensors 和 host 调用顺序。Kernel 内的多个表达式、helper 或 `I.buffer` 都不能替代这些阶段。分组大小、局部结果接口可以由作者选择；compiler 不会补出源程序缺失的阶段。
 - 以完整 callable 的并行工作量、数据读写和所有 launches 的总成本选择组织，不以源码最短或 kernel 最少为目标。归约、prefix 和 ordered loop 各自的成员、顺序、dtype 与数值合同必须保持。

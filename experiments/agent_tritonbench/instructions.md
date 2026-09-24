@@ -88,6 +88,11 @@ normally distinguished by program_id through those domains and subregions;
 removing physical tile parameters must preserve the logical decomposition.
 The compiler chooses physical tiles, program mapping, thread layouts and provider
 configuration within the declared kernels. It does not reconstruct missing stages.
+Free axes of tensor expressions and structured operations already express
+independent result coordinates. Do not introduce fixed logical subregions solely
+to reproduce physical BLOCK_M/BLOCK_N values. Preserve partitions that define the
+algorithm's members, partial results or stage interfaces; reduction axes do not
+become free axes when physical tile sizes are omitted.
 
 When the chosen Triton algorithm uses multiple kernels, retain those kernels and
 their host calls in Intent. Allocate cross-kernel tensors in the host callable and pass
