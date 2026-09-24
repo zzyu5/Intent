@@ -16,6 +16,15 @@ bool isScalar(Type type) {
   return isa<IntegerType, IndexType, FloatType>(type);
 }
 
+bool isFloatToIntegerCast(CastOp cast) {
+  auto elementType = [](Type type) {
+    auto fragment = dyn_cast<FragmentType>(type);
+    return fragment ? fragment.getElementType() : type;
+  };
+  return isa<FloatType>(elementType(cast.getValue().getType())) &&
+         elementType(cast.getType()).isIntOrIndex();
+}
+
 bool isPredicatableProduct(Type type) {
   if (auto record = dyn_cast<RecordType>(type))
     return llvm::all_of(record.getFieldTypes(), [](Attribute field) {
@@ -98,7 +107,9 @@ bool canPredicate(Block &block, bool allowStores = false,
       return false;
     bool product = allowProducts && isa<MakeRecordOp, ExtractOp>(operation) &&
                    isSpeculatable(&operation) && isMemoryEffectFree(&operation);
-    if (!product && !canPredicateValueOperation(&operation))
+    auto conversion = dyn_cast<CastOp>(operation);
+    bool guardedConversion = conversion && isFloatToIntegerCast(conversion);
+    if (!product && !guardedConversion && !canPredicateValueOperation(&operation))
       return false;
   }
   return true;
@@ -492,6 +503,18 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
           coordinates(load.getCoordinates()),
           maskedValidity(load.getValid(), load.getType()),
           fill(load.getFill(), load.getType()), load.getSourceAxes());
+  } else if (auto conversion = dyn_cast<CastOp>(operation);
+             conversion && isFloatToIntegerCast(conversion)) {
+    // Inactive branches may contain NaN or out-of-range floating values.
+    // Select a defined operand before conversion, not its possibly poison result.
+    Value value = lift(mapped(conversion.getValue()));
+    auto fragment = dyn_cast<FragmentType>(value.getType());
+    Type element = fragment ? fragment.getElementType() : value.getType();
+    Value zero = builder.create<arith::ConstantOp>(
+        location, builder.getZeroAttr(element));
+    zero = project(zero, value.getType());
+    Value guarded = selectScalarProduct(builder, location, predicate, value, zero);
+    clone = builder.create<CastOp>(location, resultType(conversion.getType()), guarded);
   } else {
     bool vector = shape && llvm::any_of(operation->getOperands(), [&](Value value) {
       return hasIterationAxes(mapped(value).getType());

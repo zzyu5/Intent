@@ -46,7 +46,7 @@ fused_layer_norm_relu_linear,4,0.0893360041,0.0527439993,0.040959999,0.126592003
 softplus_linear,6,0.018224,,0.012416,0.0141119999,reference_pass,agent_program_error,pass,pass,cuda_graph,,candidate_precompile: at 29:15:,,,softplus_linear/intent/candidate.py
 permute_copy,2,0.00790399988,0.00781599991,0.00770399999,0.00788800023,reference_pass,pass,pass,pass,cuda_graph,,,,,permute_copy/intent/candidate.py
 ifftshift,8,0.0101600001,0.00812800042,0.00764800003,0.00801600004,reference_pass,pass,pass,pass,cuda_graph,,,,,ifftshift/intent/candidate.py
-grid_sample,0,0.0217120005,,0.495343998,0.478136003,reference_pass,agent_program_error,pass,pass,cuda_graph,,candidate_precompile: at 34:18:,,,grid_sample/intent/candidate.py
+grid_sample,0,0.0217120005,,0.021200000308454037,0.02075199969112873,reference_pass,agent_program_error,pass,pass,cuda_graph,,candidate_precompile: at 34:18:,,,grid_sample/intent/candidate.py
 fused_gather_masked_fill,5,0.0228639999,0.0184559999,0.0167760001,0.0172560001,reference_pass,pass,pass,pass,cuda_graph,,,,,fused_gather_masked_fill/intent/candidate.py
 fused_index_select_eq,1,0.00779199996,0.00616000011,0.00572800008,0.00598400016,reference_pass,pass,pass,pass,cuda_graph,,,,,fused_index_select_eq/intent/candidate.py
 div,8,0.00935200043,,0.00979200006,0.00987199973,reference_pass,no_submission,pass,pass,cuda_graph,,No original agent Triton submission exists,,,div/intent/candidate.py
