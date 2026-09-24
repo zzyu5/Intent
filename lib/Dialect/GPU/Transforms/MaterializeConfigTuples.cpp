@@ -621,7 +621,7 @@ contractionFreeExtents(func::FuncOp kernel, ArrayRef<ParameterOp> parameters) {
 void bindContractionFreeExtents(
     ArrayRef<ContractionFreeExtent> groups, NamedAttrList &bindings,
     llvm::function_ref<const TuningProfile &(ParameterOp)> profileFor,
-    Builder &builder) {
+    Builder &builder, bool splitInnerAxis) {
   for (const ContractionFreeExtent &group : groups) {
     int64_t budget = std::numeric_limits<int64_t>::max();
     for (ParameterOp parameter : group.profileParameters)
@@ -667,6 +667,26 @@ void bindContractionFreeExtents(
         if (candidate <= current && candidate > selected && fits(parameter, candidate))
           selected = candidate;
       bindings.set(schema.getName(), builder.getI64IntegerAttr(selected));
+    }
+    // A flattened free side can span adjacent logical axes. Offer the same
+    // tile budget across those axes as well as along its innermost coordinate.
+    if (splitInnerAxis && group.parameters.size() > 1) {
+      ParameterOp outerParameter = group.parameters[group.parameters.size() - 2];
+      ParameterOp innerParameter = group.parameters.back();
+      ParameterAttr outer = outerParameter.getParameter();
+      ParameterAttr inner = innerParameter.getParameter();
+      int64_t outerValue = cast<IntegerAttr>(bindings.get(outer.getName().getValue())).getInt();
+      int64_t innerValue = cast<IntegerAttr>(bindings.get(inner.getName().getValue())).getInt();
+      if (innerValue > 1 && innerValue % 2 == 0 && outerValue <= budget / 2 &&
+          llvm::is_contained(outer.getCandidates().asArrayRef(), outerValue * 2) &&
+          llvm::is_contained(inner.getCandidates().asArrayRef(), innerValue / 2)) {
+        bindings.set(outer.getName(), builder.getI64IntegerAttr(outerValue * 2));
+        bindings.set(inner.getName(), builder.getI64IntegerAttr(innerValue / 2));
+        if (!fits({}, 0)) {
+          bindings.set(outer.getName(), builder.getI64IntegerAttr(outerValue));
+          bindings.set(inner.getName(), builder.getI64IntegerAttr(innerValue));
+        }
+      }
     }
   }
 }
@@ -1087,13 +1107,16 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
         largestReduction = std::max(largestReduction, requestedValue(profile, role));
   }
   auto freeExtents = contractionFreeExtents(kernel, parameters);
+  unsigned freeAxisChoices = llvm::any_of(freeExtents, [](const auto &group) {
+    return group.parameters.size() > 1;
+  }) ? 2 : 1;
   bool invalidFootprint = false;
   auto appendTuple = [&](llvm::function_ref<const TuningProfile &(ParameterOp)> profileFor,
                          bool compactRows = false) {
-    for (unsigned choice = 0; choice < rowChoiceCount; ++choice) {
+    for (unsigned choice = 0; choice < rowChoiceCount * freeAxisChoices; ++choice) {
       llvm::SmallDenseSet<Operation *> selectedRows;
       for (const auto &group : rowGroups)
-        selectedRows.insert(group.second[choice % group.second.size()]);
+        selectedRows.insert(group.second[(choice / freeAxisChoices) % group.second.size()]);
       NamedAttrList bindings;
       for (ParameterOp parameter : parameters) {
         auto schema = parameter.getParameter();
@@ -1120,7 +1143,8 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
         int64_t selected = selectCandidate(schema.getCandidates().asArrayRef(), requested);
         bindings.set(schema.getName(), builder.getI64IntegerAttr(selected));
       }
-      bindContractionFreeExtents(freeExtents, bindings, profileFor, builder);
+      bindContractionFreeExtents(freeExtents, bindings, profileFor, builder,
+                                choice % freeAxisChoices != 0);
       if (failed(bindTraversalFragmentFootprints(kernel, parameters, bindings,
                                                  builder))) {
         invalidFootprint = true;
