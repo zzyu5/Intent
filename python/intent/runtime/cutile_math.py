@@ -56,7 +56,8 @@ def _erfc_tail(x):
     s2 = s2 * inverse_square + 4.51839523e+01
     s2 = s2 * inverse_square + 1.26884899e+01
     s2 = s2 * inverse_square + 1.0
-    rational = ct.where(x < 2.857142857142857, r1 / s1, r2 / s2)
+    first_interval = x < 2.857142857142857
+    rational = ct.where(first_interval, r1, r2) / ct.where(first_interval, s1, s2)
     high = ct.bitcast(ct.bitcast(x, ct.uint32) & 0xFFFFE000, ct.float32)
     return ct.exp(-high * high - 0.5625) * ct.exp(
         (high - x) * (high + x) + rational
@@ -146,7 +147,8 @@ def erfc(x):
         1.53672958608443695994e+03, 3.25792512996573918826e+02,
         3.03380607434824582924e+01, 1.0,
     ))
-    rational = ct.where(tail_x < 1.0 / 0.35, r1 / s1, r2 / s2)
+    first_interval = tail_x < 1.0 / 0.35
+    rational = ct.where(first_interval, r1, r2) / ct.where(first_interval, s1, s2)
     # A finite f32 input has an exactly representable square in f64 here.
     tail = ct.exp(-tail_x * tail_x - 0.5625 + rational) / tail_x
     value = ct.where(magnitude < 0.84375, small,
