@@ -169,6 +169,7 @@ mlir::LogicalResult materializeProgramBuffers(mlir::ModuleOp module);
 mlir::LogicalResult lowerInvocationWorkspaces(mlir::ModuleOp module);
 mlir::LogicalResult orientLoopContractions(mlir::ModuleOp module);
 mlir::LogicalResult realizeVectorContractions(mlir::ModuleOp module);
+mlir::LogicalResult fuseMultiplyReductions(mlir::ModuleOp module);
 mlir::LogicalResult normalizeContractionSources(mlir::ModuleOp module);
 mlir::LogicalResult decomposeMultiAxisReductions(mlir::ModuleOp module);
 mlir::LogicalResult realizeOnlineReductions(mlir::ModuleOp module);

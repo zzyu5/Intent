@@ -3192,7 +3192,8 @@ bool supportsCartesianPointwiseValueGraph(
 bool supportsStructuredFreeAxisValueGraph(
     ArrayRef<WorksetCoordinateOp> coordinates,
     llvm::SmallPtrSetImpl<Operation *> *ownedStores = nullptr,
-    llvm::DenseMap<Operation *, bool> *contractSides = nullptr) {
+    llvm::DenseMap<Operation *, bool> *contractSides = nullptr,
+    bool *containsContraction = nullptr) {
   if (coordinates.size() > 1) {
     llvm::SmallPtrSet<Operation *, 4> stores;
     for (auto [index, coordinate] : llvm::enumerate(coordinates)) {
@@ -3318,6 +3319,8 @@ bool supportsStructuredFreeAxisValueGraph(
         ownedStores->insert(store.getOperation());
     }
   }
+  if (containsContraction)
+    *containsContraction = sawContract;
   return (sawContract || sawReduction) && sawOwnedStore &&
          hasReadOnlyOrderedBodies(loops);
 }
@@ -4150,6 +4153,25 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         uncoveredCoordinates.push_back(coordinate);
       lifted = orthogonalContractCoordinates(uncoveredCoordinates);
       liftSeparately = !lifted.empty();
+      // Independent reductions may expose reuse on an outer output axis. Keep
+      // all proven free axes available for the later ownership choice instead
+      // of fixing the choice to the two innermost source loops.
+      if (lifted.empty() && uncoveredCoordinates.size() >= 2) {
+        llvm::SmallDenseSet<PhysicalSourceAxis> sources;
+        bool distinctSources =
+            llvm::all_of(uncoveredCoordinates, [&](auto coordinate) {
+              return sources.insert({coordinate.getSourceId(),
+                                     coordinate.getSourceAxis(), false}).second;
+            });
+        bool containsContraction = false;
+        if (distinctSources &&
+            supportsStructuredFreeAxisValueGraph(uncoveredCoordinates, nullptr,
+                                                nullptr, &containsContraction) &&
+            !containsContraction) {
+          lifted = uncoveredCoordinates;
+          preserveContractionOrder = true;
+        }
+      }
       // A blocked pointwise program can keep one existing local vector range
       // while tiling the two innermost independent workset axes (for example
       // sequence/head around a feature vector).  Lift only when both axes
@@ -4229,6 +4251,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                                            laneBounds)))
       return kernel.emitError(
           "failed to rank-lift a legal pointwise ownership graph");
+    // Newly explicit free axes must reach the existing contraction recognizer
+    // before ownership freezes any axis to scalar grid execution.
+    if (!lifted.empty() && failed(fuseMultiplyReductions(module)))
+      return failure();
   }
 
   SmallVector<MakeRangeOp> dynamicRanges;

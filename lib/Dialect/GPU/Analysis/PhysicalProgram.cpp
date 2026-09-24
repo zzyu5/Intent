@@ -1393,6 +1393,7 @@ std::optional<int64_t> constantLogicalRangeCardinality(MakeRangeOp range) {
       __int128 amount = 0;
       __int128 minimum = 0;
       __int128 maximum = 0;
+      __int128 scale = 1;
     };
     std::function<Offset(Value)> splitOffset = [&](Value value) -> Offset {
       value = stripScalarIdentity(value);
@@ -1401,6 +1402,27 @@ std::optional<int64_t> constantLogicalRangeCardinality(MakeRangeOp range) {
         return {value};
       Value base;
       std::optional<__int128> increment;
+      if (binary.getOperatorKind() == BinaryOperator::Multiply) {
+        auto factor = constant(binary.getRhs());
+        base = binary.getLhs();
+        if (!factor) {
+          factor = constant(binary.getLhs());
+          base = binary.getRhs();
+        }
+        if (!factor || *factor <= 0)
+          return {value};
+        Offset result = splitOffset(base);
+        const __int128 lower = std::numeric_limits<int64_t>::min();
+        const __int128 upper = std::numeric_limits<int64_t>::max();
+        if (result.scale > upper / *factor || result.minimum < lower ||
+            result.maximum > upper)
+          return {value};
+        result.scale *= *factor;
+        result.amount *= *factor;
+        result.minimum = std::min(result.minimum, result.minimum * *factor);
+        result.maximum = std::max(result.maximum, result.maximum * *factor);
+        return result;
+      }
       if (binary.getOperatorKind() == BinaryOperator::Add) {
         if (auto rhs = constant(binary.getRhs())) {
           base = binary.getLhs();
@@ -1425,15 +1447,18 @@ std::optional<int64_t> constantLogicalRangeCardinality(MakeRangeOp range) {
     };
     Offset begin = splitOffset(range.getLogicalStart());
     Offset end = splitOffset(range.getLogicalStop());
-    if (samePhysicalScalarExpression(begin.base, end.base)) {
+    if (begin.scale == end.scale &&
+        samePhysicalScalarExpression(begin.base, end.base)) {
       auto upper = queryNonNegativeIndexUpperBound(begin.base);
-      // Cancel a common affine base only when every index addition/subtraction
+      // Cancel a common affine base only when all intermediate index arithmetic
       // stays in range; signed wrap must not turn a short slice into a full one.
       if (upper && upper.getKind() ==
                        static_cast<uint32_t>(PhysicalExprKind::Constant) &&
           std::min(begin.minimum, end.minimum) >=
               std::numeric_limits<int64_t>::min() &&
-          static_cast<__int128>(upper.getValue()) +
+          std::max(begin.maximum, end.maximum) <=
+              std::numeric_limits<int64_t>::max() &&
+          static_cast<__int128>(upper.getValue()) * begin.scale +
                   std::max(begin.maximum, end.maximum) <=
               std::numeric_limits<int64_t>::max())
         distance = end.amount - begin.amount;

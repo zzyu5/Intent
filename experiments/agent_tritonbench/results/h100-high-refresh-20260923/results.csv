@@ -24,7 +24,7 @@ softmax,6,0.0100079998,0.00771199982,0.00881600007,0.00839999970048666,reference
 logsumexp,8,0.0352560002,0.0127360001,0.0876560025,0.12785600125789642,reference_pass,pass,pass,pass,cuda_graph,,,,,logsumexp/intent/candidate.py
 add_mean,8,0.0194560001,0.0104,0.06708800047636032,0.0562559999525547,reference_pass,pass,pass,pass,cuda_graph,Independent Luna high development submission; original candidate.py retained,,,,add_mean/intent/performance.py
 exp_mean,8,0.0155200004,0.00921599986,0.0643359944,0.0726880021,reference_pass,pass,pass,pass,cuda_graph,,,,,exp_mean/intent/candidate.py
-matmul,6,0.00923199998,0.0137279998,0.0329520013,0.037808001,reference_pass,pass,pass,pass,cuda_graph,,,,,matmul/intent/candidate.py
+matmul,6,0.00923199998,0.0137279998,0.015831999480724335,0.014096000231802464,reference_pass,pass,pass,pass,cuda_graph,cuTile uses one CTA and inferred worker warps/load latency; physical tiles and access forms tuned. Full provider search exceeded preparation budget.,,,,matmul/intent/candidate.py
 addmm,6,0.0126720001,0.0162080005,0.011744,0.0116480002,reference_pass,pass,pass,pass,cuda_graph,,,,,addmm/intent/candidate.py
 tensordot,4,0.00640000007,0.00560000003,0.00820000004,0.00804799981,reference_pass,pass,pass,pass,cuda_graph,,,,,tensordot/intent/candidate.py
 tensordot_rsqrt,5,0.0680480003,0.0345599987,0.06271999888122082,0.11595200002193451,reference_pass,pass,pass,pass,cuda_graph,Original agent Triton uses TF32; excluded from same-precision agent comparisons,,,,tensordot_rsqrt/intent/candidate.py
@@ -50,7 +50,7 @@ grid_sample,0,0.0217120005,,0.021200000308454037,0.02075199969112873,reference_p
 fused_gather_masked_fill,5,0.0228639999,0.0184559999,0.0167760001,0.0172560001,reference_pass,pass,pass,pass,cuda_graph,,,,,fused_gather_masked_fill/intent/candidate.py
 fused_index_select_eq,1,0.00779199996,0.00616000011,0.00572800008,0.00598400016,reference_pass,pass,pass,pass,cuda_graph,,,,,fused_index_select_eq/intent/candidate.py
 div,8,0.00935200043,,0.00979200006,0.00987199973,reference_pass,no_submission,pass,pass,cuda_graph,,No original agent Triton submission exists,,,div/intent/candidate.py
-sigmoid_conv2d,2,0.0368160009,0.0363120008,0.0751999989,0.185152002,reference_pass,pass,pass,pass,cuda_graph,,,,,sigmoid_conv2d/intent/candidate.py
+sigmoid_conv2d,2,0.0368160009,0.0363120008,0.07269600033760071,0.08961600065231323,reference_pass,pass,pass,pass,cuda_graph,,,,,sigmoid_conv2d/intent/candidate.py
 solve_multiple_lu,1,0.166167997,,0.260487989,,reference_pass,no_submission,pass,numerical_failure,cuda_event,,No original agent Triton submission exists,,"generated/source floating result 0 differs: max_abs=1087.275390625, atol=0.0001, rtol=0.0001; first_failure=0; largest tolerance excess has generated=-1086.7645263671875, source=0.5108150839805603, abs_error=1087.275390625, limit=0.00015108150546438992",solve_multiple_lu/intent/candidate.py
 relu_sqrt,8,0.010272,,0.00780800008,0.00800000038,reference_pass,no_submission,pass,pass,cuda_graph,,No original agent Triton submission exists,,,relu_sqrt/intent/candidate.py
 sigmoid_argmax,8,0.0144160003,,0.00846400019,0.00801600004,reference_pass,no_submission,pass,pass,cuda_graph,,No original agent Triton submission exists,,,sigmoid_argmax/intent/candidate.py

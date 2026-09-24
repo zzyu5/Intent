@@ -3525,9 +3525,13 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   auto rowBound = rowRange.getStart().getDefiningOp<RangeBoundOp>();
   auto rowSourceRange =
       rowBound ? rowBound.getRange().getDefiningOp<RangeOp>() : RangeOp();
+  auto rowCardinality = constantLogicalRangeCardinality(rowRange);
+  auto columnCardinality = constantLogicalRangeCardinality(columnRange);
   const bool runtimeRowTraversal =
-      indirectRow || rowRange->hasAttr(sourceSubregionAttr) ||
-      (rowSourceRange && rowSourceRange->hasAttr(sourceSubregionAttr));
+      indirectRow ||
+      (!rowCardinality &&
+       (rowRange->hasAttr(sourceSubregionAttr) ||
+        (rowSourceRange && rowSourceRange->hasAttr(sourceSubregionAttr))));
   const bool persistentRowTraversal = runtimeRowTraversal && !indirectRow;
   const ParameterCategory contractionCategory =
       persistentRowTraversal ? ParameterCategory::PersistentContraction
@@ -3706,6 +3710,12 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   Value columnExtent = mapBuilder.create<DimOp>(
       location, mapBuilder.getIndexType(), rhsLoad.getResource(),
       columnResourceAxis);
+  if (rowCardinality)
+    rowExtent =
+        mapBuilder.create<arith::ConstantIndexOp>(location, *rowCardinality);
+  if (columnCardinality)
+    columnExtent =
+        mapBuilder.create<arith::ConstantIndexOp>(location, *columnCardinality);
   auto ceilDiv = [&](Value extent, Value divisor) {
     Value one = mapBuilder.create<arith::ConstantIndexOp>(location, 1);
     Value adjusted = binary(
@@ -3729,6 +3739,10 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       cast<ViewType>(rhsLoad.getResource().getType())
           .getLayout()
           .getExtents()[columnResourceAxis]);
+  if (rowCardinality)
+    rowExpression = queryLaunchExpression(rowExtent);
+  if (columnCardinality)
+    columnExpression = queryLaunchExpression(columnExtent);
   SmallVector<Type> mappingTypes(mapping.getResultTypes());
   SmallVector<int64_t> coordinateRoles(mapping.getNumResults(), -1);
   if (auto existing =
@@ -6009,7 +6023,7 @@ static void orientContractionOutputs(func::FuncOp kernel) {
   }
 }
 
-static LogicalResult fuseMultiplyReductions(ModuleOp module) {
+LogicalResult fuseMultiplyReductions(ModuleOp module) {
   auto kernel = getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
@@ -6108,7 +6122,12 @@ static LogicalResult fuseMultiplyReductions(ModuleOp module) {
       // Drop only introduced units or ranges proven logically singleton.
       auto ranges = analysis.axisRanges(value, *axis);
       return ranges.isExact() &&
-             llvm::all_of(ranges.roots, isProvablySingletonLogicalRange);
+             llvm::all_of(ranges.roots, [](MakeRangeOp range) {
+               // A lifted workset coordinate starts as one logical iteration;
+               // ownership may subsequently pack several iterations together.
+               return !range.getStart().getDefiningOp<WorksetCoordinateOp>() &&
+                      isProvablySingletonLogicalRange(range);
+             });
     };
     SmallVector<int64_t> lhsKept, rhsKept, lhsReduced, rhsReduced;
     SmallVector<int64_t> lhsBatch, rhsBatch, lhsOutput, rhsOutput;
