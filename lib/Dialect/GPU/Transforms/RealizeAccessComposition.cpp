@@ -1672,6 +1672,20 @@ bool hasNonUnitAxisSplit(ReshapeOp reshape) {
 bool composeReshapedPointwise(ReshapeOp reshape) {
   auto source = cast<FragmentType>(reshape.getValue().getType());
   auto result = cast<FragmentType>(reshape.getResult().getType());
+  if (auto inner = reshape.getValue().getDefiningOp<ReshapeOp>();
+      inner && inner.getValue().getType() == result &&
+      inner.getReassociation().size() == reshape.getReassociation().size() &&
+      llvm::all_of(llvm::zip(inner.getReassociation(), reshape.getReassociation()),
+                   [](auto pair) {
+                     auto first = cast<ReshapeGroupAttr>(std::get<0>(pair));
+                     auto second = cast<ReshapeGroupAttr>(std::get<1>(pair));
+                     return first.getSourceAxes() == second.getResultAxes() &&
+                            first.getResultAxes() == second.getSourceAxes();
+                   })) {
+    reshape.getResult().replaceAllUsesWith(inner.getValue());
+    reshape.erase();
+    return true;
+  }
   if (!hasNonUnitAxisSplit(reshape) &&
       source.getShape().size() <= result.getShape().size())
     return false;

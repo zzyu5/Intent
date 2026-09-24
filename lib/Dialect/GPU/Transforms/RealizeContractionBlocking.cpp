@@ -200,7 +200,7 @@ bool hasUnrealizedPhysicalAxis(Value value) {
   return false;
 }
 
-bool fullStaticReductionNeedsTraversal(ContractOp contract);
+bool fullReductionNeedsTraversal(ContractOp contract);
 
 bool requiresPhysicalRealization(ContractOp contract) {
   for (FragmentType type : {contract.getLhs().getType(),
@@ -216,7 +216,7 @@ bool requiresPhysicalRealization(ContractOp contract) {
       reductionUsesOwnershipExtent(contract, contract.getRhs(),
                                    contract.getRhsReductionAxes()))
     return true;
-  return fullStaticReductionNeedsTraversal(contract) ||
+  return fullReductionNeedsTraversal(contract) ||
          hasUnrealizedPhysicalAxis(contract.getLhs()) ||
          hasUnrealizedPhysicalAxis(contract.getRhs());
 }
@@ -1868,7 +1868,7 @@ bool reductionAxesNeedTraversal(ContractOp contract, func::FuncOp kernel) {
                                contract.getLhsReductionAxes()) ||
          operandNeedsTraversal(contract.getRhs(),
                                contract.getRhsReductionAxes()) ||
-         fullStaticReductionNeedsTraversal(contract);
+         fullReductionNeedsTraversal(contract);
 }
 
 bool hasCompleteStorePath(ContractOp contract) {
@@ -1948,7 +1948,7 @@ SmallVector<int64_t> eraseAxis(ArrayRef<int64_t> axes, unsigned erasedAxis) {
   return result;
 }
 
-bool collapseMultiReductionContract(ContractOp contract) {
+FailureOr<bool> collapseMultiReductionContract(ContractOp contract) {
   SmallVector<int64_t> lhsAxes(contract.getLhsReductionAxes());
   SmallVector<int64_t> rhsAxes(contract.getRhsReductionAxes());
   if (lhsAxes.size() <= 1 || lhsAxes.size() != rhsAxes.size() ||
@@ -1993,14 +1993,35 @@ bool collapseMultiReductionContract(ContractOp contract) {
       PhysicalRangeFact ranges = analysis.axisRanges(operand, axis);
       if (failed(queryExactLogicalRange(ranges)))
         return false;
+      auto projection = analysis.rangeAxes(operand, ranges.roots);
+      if (!projection.isExact() ||
+          projection.fragmentAxes != ArrayRef<unsigned>{static_cast<unsigned>(axis)})
+        return false;
+      auto dimension = queryRangeDimension(ranges.roots.front());
+      if (failed(dimension))
+        return false;
+      auto source = sourceAxisIdentity(ranges.roots.front());
+      auto replay = analysis.replayability(
+          operand, source, PhysicalReplayScope::ValueGraph,
+          /*allowAccesses=*/true, /*insertionAnchor=*/nullptr, *dimension);
+      if (!replay.isReplayable() ||
+          llvm::any_of(replay.accesses, [&](Operation *access) {
+            auto read = dyn_cast<LoadOp>(access);
+            return read && !canReplayReadAt(read, contract);
+          }))
+        return false;
       for (MakeRangeOp range : ranges.roots) {
         auto realization = analysis.axisRealization(range.getResult(), 0);
+        auto currentDimension = queryRangeDimension(range);
         if (!isZeroScalar(range.getStart()) ||
             !isZeroScalar(range.getLogicalStart()) || !isUnitStepRange(range) ||
+            range->hasAttr(sourceSubregionAttr) ||
             !queryLaunchExpression(range.getLogicalStop()) ||
-            realization.constructionScalarSeed ||
-            !samePhysicalScalarExpression(range.getExtent(),
-                                          range.getLogicalStop()))
+            !(sourceAxisIdentity(range) == source) || failed(currentDimension) ||
+            *currentDimension != *dimension ||
+            (!realization.constructionScalarSeed &&
+             !samePhysicalScalarExpression(range.getExtent(),
+                                           range.getLogicalStop())))
           return false;
         paired.push_back(range);
       }
@@ -2037,6 +2058,43 @@ bool collapseMultiReductionContract(ContractOp contract) {
 
   auto [sourceId, dimensionId] = nextPhysicalAxisIdentities(kernel);
   OpBuilder builder(contract);
+  // Expand only the contraction's replayable operands, using logical extents
+  // before flattening. Padding each source axis would change the flattened
+  // coordinate relation; the eventual K tile owns the single tail instead.
+  auto complete = [&](Value value, ArrayRef<int64_t> axes) -> FailureOr<Value> {
+    for (int64_t axis : axes) {
+      auto ranges = PhysicalProgramAnalysis(kernel).axisRanges(value, axis);
+      MakeRangeOp root = ranges.roots.front();
+      if (llvm::all_of(ranges.roots, [](MakeRangeOp range) {
+            return samePhysicalScalarExpression(range.getExtent(),
+                                                range.getLogicalStop());
+          }))
+        continue;
+      auto extent = queryLaunchExpression(root.getLogicalStop());
+      auto original = root.getResult().getType();
+      auto type = FragmentType::get(
+          kernel.getContext(), original.getElementType(),
+          builder.getArrayAttr({extent}), original.getAxisMaps(),
+          original.getValidity(), original.getOwner());
+      Value full = builder.create<MakeRangeOp>(
+          contract.getLoc(), type, root.getStart(), root.getLogicalStop(),
+          root.getStep(), root.getLogicalStart(), root.getLogicalStop(),
+          root.getSourceId(), root.getSourceAxis(), root.getDerived());
+      inheritRangeAuthority(full, root);
+      IRMapping mapping;
+      auto replayed = replaySourceValue(builder, contract.getLoc(), value,
+                                       extent, ranges.roots, full, mapping,
+                                       contract.getOperation());
+      if (failed(replayed))
+        return failure();
+      value = *replayed;
+    }
+    return value;
+  };
+  auto completeLhs = complete(contract.getLhs(), lhsAxes);
+  auto completeRhs = complete(contract.getRhs(), rhsAxes);
+  if (failed(completeLhs) || failed(completeRhs))
+    return contract.emitOpError("cannot replay complete paired reduction ranges");
   auto collapse = [&](Value value, ArrayRef<int64_t> reductionAxes)
       -> std::pair<Value, int64_t> {
     SmallVector<int64_t> reductions(reductionAxes);
@@ -2112,8 +2170,8 @@ bool collapseMultiReductionContract(ContractOp contract) {
                                       builder.getArrayAttr(groups)),
             reductions.front()};
   };
-  auto [lhs, lhsAxis] = collapse(contract.getLhs(), lhsAxes);
-  auto [rhs, rhsAxis] = collapse(contract.getRhs(), rhsAxes);
+  auto [lhs, lhsAxis] = collapse(*completeLhs, lhsAxes);
+  auto [rhs, rhsAxis] = collapse(*completeRhs, rhsAxes);
   auto replacement = builder.create<ContractOp>(
       contract.getLoc(), contract.getResult().getType(), lhs, rhs,
       contract.getAccumulator(), ArrayRef<int64_t>{lhsAxis},
@@ -2747,49 +2805,47 @@ bool canReplayContractionReads(ContractOp contract) {
   return true;
 }
 
-bool fullStaticReductionNeedsTraversal(ContractOp contract) {
+bool fullReductionNeedsTraversal(ContractOp contract) {
   if (contract.getLhsReductionAxes().size() != 1 ||
       contract.getRhsReductionAxes().size() != 1)
     return false;
-  UniformValueAnalysis constants(describeUniformValue);
-  auto integer = [&](Value value) -> std::optional<int64_t> {
-    if (auto literal = dyn_cast_or_null<IntegerAttr>(constants.evaluate(value)))
-      return literal.getInt();
-    return std::nullopt;
-  };
   auto kernel = contract->getParentOfType<func::FuncOp>();
   PhysicalProgramAnalysis analysis(kernel);
   int64_t largestTile = *std::max_element(
       std::begin(contractionReductionCandidates),
       std::end(contractionReductionCandidates));
-  std::optional<int64_t> cardinality;
+  SmallVector<MakeRangeOp> paired;
   for (auto [operand, axis] :
        {std::pair<Value, int64_t>{contract.getLhs(),
                                   contract.getLhsReductionAxes().front()},
         std::pair<Value, int64_t>{contract.getRhs(),
                                   contract.getRhsReductionAxes().front()}}) {
     auto type = cast<FragmentType>(operand.getType());
-    auto extent = constantPhysicalExpression(
-        cast<PhysicalExprAttr>(type.getShape()[axis]));
-    if (!extent || *extent <= largestTile)
+    auto physical = cast<PhysicalExprAttr>(type.getShape()[axis]);
+    auto extent = constantPhysicalExpression(physical);
+    if (extent && *extent <= largestTile && *extent > 0 &&
+        llvm::isPowerOf2_64(*extent))
       return false;
     PhysicalRangeFact ranges = analysis.axisRanges(operand, axis);
     if (!ranges.unitStep || failed(queryExactLogicalRange(ranges)))
       return false;
     for (MakeRangeOp range : ranges.roots) {
       auto size = constantLogicalRangeCardinality(range);
-      if (!size || *size <= 0 || *size > *extent ||
-          (cardinality && *cardinality != *size) ||
-          integer(range.getExtent()) != *extent ||
+      bool complete = size && extent && *size > 0 && *size <= *extent;
+      complete |= isZeroScalar(range.getLogicalStart()) &&
+                  samePhysicalScalarExpression(range.getExtent(),
+                                               range.getLogicalStop());
+      if (!complete || queryLaunchExpression(range.getExtent()) != physical ||
           !samePhysicalScalarExpression(range.getStart(),
                                         range.getLogicalStart()))
         return false;
-      cardinality = *size;
+      paired.push_back(range);
     }
   }
-  // A static logical extent does not select a hardware reduction tile.
+  // A complete logical extent does not select a hardware reduction tile.
   // Only retile a complete range here; an existing segment retains its bounds.
-  return canReplayContractionReads(contract);
+  return analysis.lockstepRanges(paired).isExact() &&
+         canReplayContractionReads(contract);
 }
 
 FailureOr<bool> realizeFullResultTraversal(
@@ -6298,8 +6354,12 @@ LogicalResult normalizeContractionSources(ModuleOp module) {
   // Collapse complete logical reduction ranges before ownership introduces
   // physical padding or scalar tiles that no longer admit this reassociation.
   bool collapsed = false;
-  for (ContractOp contract : contracts)
-    collapsed |= collapseMultiReductionContract(contract);
+  for (ContractOp contract : contracts) {
+    auto result = collapseMultiReductionContract(contract);
+    if (failed(result))
+      return failure();
+    collapsed |= *result;
+  }
   if (collapsed && failed(realizeAccessComposition(module)))
     return failure();
   contracts.clear();
@@ -6464,8 +6524,12 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
   contracts.clear();
   kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
   bool collapsed = false;
-  for (ContractOp contract : contracts)
-    collapsed |= collapseMultiReductionContract(contract);
+  for (ContractOp contract : contracts) {
+    auto result = collapseMultiReductionContract(contract);
+    if (failed(result))
+      return failure();
+    collapsed |= *result;
+  }
   if (collapsed && failed(realizeAccessComposition(module)))
     return failure();
   contracts.clear();
