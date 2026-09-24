@@ -2013,13 +2013,17 @@ FailureOr<bool> collapseMultiReductionContract(ContractOp contract) {
       for (MakeRangeOp range : ranges.roots) {
         auto realization = analysis.axisRealization(range.getResult(), 0);
         auto currentDimension = queryRangeDimension(range);
+        auto cardinality = constantLogicalRangeCardinality(range);
+        auto physical = constantPhysicalExpression(
+            cast<PhysicalExprAttr>(range.getResult().getType().getShape()[0]));
+        bool complete = cardinality && physical && *physical >= *cardinality;
         if (!isZeroScalar(range.getStart()) ||
             !isZeroScalar(range.getLogicalStart()) || !isUnitStepRange(range) ||
             range->hasAttr(sourceSubregionAttr) ||
             !queryLaunchExpression(range.getLogicalStop()) ||
             !(sourceAxisIdentity(range) == source) || failed(currentDimension) ||
             *currentDimension != *dimension ||
-            (!realization.constructionScalarSeed &&
+            (!complete && !realization.constructionScalarSeed &&
              !samePhysicalScalarExpression(range.getExtent(),
                                            range.getLogicalStop())))
           return false;
@@ -6521,6 +6525,8 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
     if (failed(projectContractResult(contract)))
       return failure();
   eraseDeadPhysicalValues(kernel);
+  if (failed(realizeAccessComposition(module)))
+    return failure();
   contracts.clear();
   kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
   bool collapsed = false;
