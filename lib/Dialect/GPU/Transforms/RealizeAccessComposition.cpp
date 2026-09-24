@@ -182,6 +182,41 @@ FailureOr<Value> combinePredicates(OpBuilder &builder, Location location,
 
 bool foldIndexRecompositions(func::FuncOp kernel) {
   bool changed = false;
+  SmallVector<BinaryOp> quotients;
+  kernel.walk([&](BinaryOp binary) {
+    if (binary.getOperatorKind() == BinaryOperator::FloorDivide &&
+        uniformElementType(binary.getResult().getType()).isIndex())
+      quotients.push_back(binary);
+  });
+  auto unproject = [](Value value) {
+    while (true) {
+      if (auto broadcast = value.getDefiningOp<BroadcastOp>())
+        value = broadcast.getValue();
+      else if (auto reshape = value.getDefiningOp<ReshapeOp>())
+        value = reshape.getValue();
+      else
+        return value;
+    }
+  };
+  for (BinaryOp quotient : quotients) {
+    auto range = unproject(quotient.getLhs()).getDefiningOp<MakeRangeOp>();
+    Value divisor = unproject(quotient.getRhs());
+    if (!range || !isUnitStepRange(range) ||
+        !isZero(range.getLogicalStart()) ||
+        !samePhysicalScalarExpression(range.getStart(),
+                                      range.getLogicalStart()) ||
+        !samePhysicalScalarExpression(range.getLogicalStop(), divisor))
+      continue;
+    // Every active logical member of [0, end) has quotient zero. An empty
+    // range has no active members; physical padding retains its existing mask.
+    OpBuilder builder(quotient);
+    Value zero = builder.create<arith::ConstantIndexOp>(quotient.getLoc(), 0);
+    if (auto fragment = dyn_cast<FragmentType>(quotient.getResult().getType()))
+      zero = builder.create<SplatOp>(quotient.getLoc(), fragment, zero);
+    quotient.getResult().replaceAllUsesWith(zero);
+    quotient.erase();
+    changed = true;
+  }
   SmallVector<BinaryOp> sums;
   kernel.walk([&](BinaryOp op) {
     if (op.getOperatorKind() == BinaryOperator::Add ||
