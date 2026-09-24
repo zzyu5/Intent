@@ -2394,12 +2394,14 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
             kernel.getContext(), map.getSourceId(), map.getSourceAxis(),
             map.getDimensionId(), resultAxis, map.getDerived()));
       }
-      if (builder.getArrayAttr(shape) != result.getShape())
-        return gather.emitOpError(
-            "cuTile extraction must retain result axes in source order");
       extractedType = gpu::FragmentType::get(
           kernel.getContext(), result.getElementType(), builder.getArrayAttr(shape),
           builder.getArrayAttr(maps), result.getValidity(), result.getOwner());
+      if (builder.getArrayAttr(shape) != result.getShape() &&
+          !gpu::queryBroadcastProjection(
+               cast<gpu::FragmentType>(extractedType), result).isExact())
+        return gather.emitOpError(
+            "cuTile extraction requires an exact retained-axis broadcast");
     }
     auto replacement = builder.create<ExtractOp>(
         gather.getLoc(), extractedType, tile,
@@ -2409,13 +2411,17 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
       replacement->setAttr(gpu::originAttr, origin);
     Value value = replacement.getResult();
     if (extractedType != gather.getResult().getType()) {
-      auto reassociation = gpu::inferReshapeReassociation(
-          cast<gpu::FragmentType>(extractedType), result);
-      if (failed(reassociation))
-        return gather.emitOpError(
-            "cuTile extraction has no row-major result domain projection");
-      value = builder.create<gpu::ReshapeOp>(
-          gather.getLoc(), result, value, *reassociation);
+      auto extracted = cast<gpu::FragmentType>(extractedType);
+      if (gpu::queryBroadcastProjection(extracted, result).isExact()) {
+        value = builder.create<gpu::BroadcastOp>(gather.getLoc(), result, value);
+      } else {
+        auto reassociation = gpu::inferReshapeReassociation(extracted, result);
+        if (failed(reassociation))
+          return gather.emitOpError(
+              "cuTile extraction has no row-major result domain projection");
+        value = builder.create<gpu::ReshapeOp>(
+            gather.getLoc(), result, value, *reassociation);
+      }
     }
     if (gather.getValid()) {
       auto selected = builder.create<gpu::SelectOp>(
