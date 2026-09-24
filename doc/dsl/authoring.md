@@ -111,13 +111,13 @@ Host callable 可以用普通 Python `for/while/if` 编排已经编译的 artifa
 
 编译与 launch 分开。`intent.generate` 只生成 source/IR；target 在 host 选择，例如 `intent.targets.TritonTarget()`，不能在 kernel 查询设备或选择 warp/tile。
 
-标量 constexpr 使用 Python 类型注解，例如 `STEP: I.Constexpr[int]`、`EPS: I.Constexpr[float]`、`ENABLED: I.Constexpr[bool]`。`I.f32` 等是 runtime scalar dtype 描述符。
+标量 constexpr 使用 Python 类型注解，例如 `STEP: I.Constexpr[int]`、`EPS: I.Constexpr[float]`、`ENABLED: I.Constexpr[bool]`。`I.f32` 等是 runtime scalar dtype 描述符。Host 已确定、用于选择硬件无关算法变体或成员关系的参数可以在编译时绑定；runtime 参数不会因为调用时恰好取固定值，就自动成为 Intent 编译期常量。需要支持不同变体时，由 host 选择相应 specialization。
 
 `constexprs` 绑定 kernel 签名中声明的 `I.Constexpr[...]` 参数。View shape 的静态 extent 使用非负整数，如 `1`；字符串必须是合法符号名，如 `"M"`、`"K"`，`"1"` 不是整数 extent。注解中的符号名不会绑定 Python 局部变量；使用前写 `M, K = input.shape` 读取这些 extents，这也不会声明同名 constexpr 参数。只有动态 shape 的 kernel 无需把本次输入尺寸传入 `constexprs`。
 
 同一 kernel 的 view shape 注解中，相同符号名表示同一 logical extent，调用时这些维度必须相等；不同符号名不声明相等关系。需要表达相等维度时复用符号名，不能依赖本次输入碰巧具有相同大小。
 
-评测中的 `build(context)` 只是上述调用的薄适配：在 build 内分别 `context.compile("name", kernel)`，返回一个 host callable，在 callable 中分配中间 tensors 并调用 artifacts。它不改变 DSL，也不要求整个任务只能写一个 kernel。
+评测中的 `build(context)` 只是上述调用的薄适配：在 build 内分别 `context.compile("name", kernel)`，返回一个 host callable，在 callable 中分配中间 tensors 并调用 artifacts。它同样接受 `constexprs`，例如签名中的 `ENABLED: I.Constexpr[bool]` 可以通过 `context.compile("name", kernel, constexprs={"ENABLED": True})` 绑定，launch 时不再传入该参数。它不改变 DSL，也不要求整个任务只能写一个 kernel。
 
 ## 诊断的含义
 
