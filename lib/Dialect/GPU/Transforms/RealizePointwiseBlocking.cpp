@@ -1230,17 +1230,29 @@ bool containsSource(Value value, PhysicalSourceAxis source) {
   return queryFragmentAxis(value.getType(), source).isExact();
 }
 
-std::optional<int64_t> minimumFragmentRegisters(func::FuncOp kernel,
-                                               FragmentType fragment) {
+std::optional<int64_t> estimatedFragmentRegisters(func::FuncOp kernel, Value value) {
+  auto fragment = dyn_cast<FragmentType>(value.getType());
   if (!fragment || !isa<IntegerType, FloatType>(fragment.getElementType()))
     return std::nullopt;
+  PhysicalProgramAnalysis analysis(kernel);
   int64_t limit = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr).getRegistersPerUnit();
   int64_t footprint = std::max(1u,
       (fragment.getElementType().getIntOrFloatBitWidth() + 31) / 32);
-  for (Attribute attribute : fragment.getShape()) {
+  for (auto [axis, attribute] : llvm::enumerate(fragment.getShape())) {
     auto extent = cast<PhysicalExprAttr>(attribute);
     int64_t minimum;
-    if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant)) {
+    if (analysis.axisRealization(value, axis).constructionScalarSeed) {
+      auto range = queryExactLogicalRange(analysis.axisRanges(value, axis));
+      auto capacity = succeeded(range) ? queryLogicalRangeCapacity(*range)
+                                       : PhysicalExprAttr();
+      auto count = capacity ? constantPhysicalExpression(capacity) : std::nullopt;
+      if (!count || *count <= 0)
+        return std::nullopt;
+      // Construction starts runtime subregions with extent one. Their eventual
+      // complete fragments must cover the logical capacity, not that seed.
+      minimum = *count > limit ? limit + 1
+                              : llvm::PowerOf2Ceil(static_cast<uint64_t>(*count));
+    } else if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant)) {
       minimum = extent.getValue();
     } else if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
       auto parameter = queryParameterBySymbol(kernel, extent.getSymbol());
@@ -2152,7 +2164,8 @@ LogicalResult separateReductionOutputOccurrences(func::FuncOp kernel) {
 LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
                                              MakeRangeOp range,
                                              ArrayRef<StoreOp> stores,
-                                             bool effectLocal) {
+                                             bool effectLocal,
+                                             ArrayRef<LoadOp> retainedReads) {
   if (stores.empty())
     return range.emitOpError(
         "reuse-sensitive pointwise traversal has no write effect");
@@ -2261,6 +2274,11 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
   SmallVector<SmallVector<StoreOp>> storeGroups;
   PhysicalProgramAnalysis replayAnalysis(kernel);
   auto canReplayAt = [&](StoreOp store, Operation *anchor) {
+    DominanceInfo dominance(kernel);
+    for (LoadOp read : retainedReads)
+      if (dominance.dominates(read.getResult(), store) &&
+          !dominance.dominates(read.getResult(), anchor))
+        return false;
     auto replayable = [&](Value value, ArrayRef<int64_t> dimensions) {
       if (!value)
         return true;
@@ -2330,6 +2348,19 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
         Value tail = tailComparison.getResult();
         IRMapping mapping;
         mapping.map(range.getResult(), blocked);
+        for (LoadOp read : retainedReads) {
+          if (!DominanceInfo(kernel).dominates(read.getResult(), loopInsertionAnchor))
+            continue;
+          auto slice = materializeRetainedSlice(
+              nested, location, read.getResult(), 0, chunkExtent, blocked,
+              loopInsertionAnchor);
+          if (failed(slice)) {
+            bodyFailed = true;
+            failureReason = "retained input cannot be sliced in the writeback loop";
+            return;
+          }
+          mapping.map(read.getResult(), *slice);
+        }
         for (StoreOp store : group) {
           FailureOr<Value> payload = replayPointwiseValue(
               nested, store.getValue(), logicalSource,
@@ -4726,10 +4757,11 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             llvm::any_of(writeCoordinates, [&](ArrayRef<Value> coordinates) {
               return !coordinatesUseRange(coordinates, range);
             })) {
-          auto fragment = dyn_cast<FragmentType>(store.getValue().getType());
           auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
-          auto footprint = minimumFragmentRegisters(kernel, fragment);
-          boundedWriteback = footprint && *footprint > capabilities.getRegistersPerUnit();
+          auto footprint = estimatedFragmentRegisters(kernel, store.getValue());
+          // A value filling the entire register file leaves no registers for
+          // the write address or other live state. Keep a tunable traversal.
+          boundedWriteback = footprint && *footprint >= capabilities.getRegistersPerUnit();
         }
         if (boundedWriteback)
           boundedWritebackRanges.insert(range.getOperation());
@@ -4949,6 +4981,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         continue;
       bool useReplayTraversal = true;
       SmallVector<StoreOp> currentStores;
+      SmallVector<LoadOp> retainedReads;
       FailureOr<Attribute> effectKey = effectLocalKey(range);
       auto effectLocal = succeeded(effectKey)
                              ? effectLocalOrigins.find(*effectKey)
@@ -5011,8 +5044,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           if (retainedContraction) {
             auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
             for (Operation *contract : replay.contractions) {
-              auto fragment = dyn_cast<FragmentType>(contract->getResult(0).getType());
-              auto footprint = minimumFragmentRegisters(kernel, fragment);
+              auto footprint = estimatedFragmentRegisters(kernel, contract->getResult(0));
               if (!footprint || *footprint >= capabilities.getRegistersPerUnit()) {
                 retainedContraction = false;
                 break;
@@ -5033,14 +5065,42 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                     queryCoordinateIndex(store.getCoordinates(), source);
                 if (!coordinate.isExact() || coordinate.dimensionId != dimension)
                   return true;
-                return llvm::any_of(llvm::enumerate(store.getSourceAxes()),
+                bool sameCoordinates = llvm::all_of(llvm::enumerate(store.getSourceAxes()),
                     [&](auto axis) {
                       auto readAxis = llvm::find(load.getSourceAxes(), axis.value());
-                      return readAxis == load.getSourceAxes().end() ||
-                             !samePhysicalScalarExpression(
-                                 load.getCoordinates()[readAxis - load.getSourceAxes().begin()],
-                                 store.getCoordinates()[axis.index()]);
+                      if (readAxis == load.getSourceAxes().end())
+                        return false;
+                      Value lhs = load.getCoordinates()[readAxis - load.getSourceAxes().begin()];
+                      Value rhs = store.getCoordinates()[axis.index()];
+                      if (samePhysicalScalarExpression(lhs, rhs))
+                        return true;
+                      auto left = lhs.getDefiningOp<MakeRangeOp>();
+                      auto right = rhs.getDefiningOp<MakeRangeOp>();
+                      return left && right && sameLogicalRange(left, right) &&
+                          samePhysicalScalarExpression(left.getStart(), right.getStart()) &&
+                          samePhysicalScalarExpression(left.getExtent(), right.getExtent());
                     });
+                if (sameCoordinates)
+                  return false;
+                // Keep a small captured row/column as its original SSA snapshot.
+                // Re-reading it after an earlier chunk writes could observe a
+                // different value, including through an overlapping view layout.
+                auto type = dyn_cast<FragmentType>(load.getType());
+                auto selected = type ? queryFragmentAxis(type, source)
+                                     : PhysicalAxisProjection{};
+                auto footprint = estimatedFragmentRegisters(kernel, load.getResult());
+                auto authority = selected.isExact()
+                    ? queryExactLogicalRange(analysis.axisRanges(load.getResult(), selected.fragmentAxis))
+                    : FailureOr<MakeRangeOp>(failure());
+                if (type && type.getShape().size() == 1 && selected.isExact() &&
+                    selected.dimensionId == dimension && succeeded(authority) &&
+                    isUnitStepRange(*authority) && sameLogicalRange(*authority, range) &&
+                    footprint && *footprint < kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr).getRegistersPerUnit()) {
+                  if (!llvm::is_contained(retainedReads, load))
+                    retainedReads.push_back(load);
+                  return false;
+                }
+                return true;
               });
           if (clobbersLaterChunk) {
             for (PhysicalAxisProjection projection :
@@ -5065,9 +5125,13 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         retainedFragments.push_back(range);
         continue;
       }
+      // Close snapshots before constructing slices with the same axis identity.
+      for (LoadOp read : retainedReads)
+        if (failed(realizeFullCoverageDimension(kernel, read.getResult(), 0)))
+          return failure();
       if (failed(realizeReusePointwiseTraversal(
               kernel, range, currentStores,
-              effectLocal != effectLocalOrigins.end())))
+              effectLocal != effectLocalOrigins.end(), retainedReads)))
         return failure();
       realized.push_back(range);
     }

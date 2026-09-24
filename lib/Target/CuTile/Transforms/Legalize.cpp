@@ -197,9 +197,24 @@ FailureOr<Value> tileIndex(OpBuilder &builder, Location location, Value start,
       if (isProvably(binary.getRhs(), 0))
         return tileIndex(builder, location, binary.getLhs(), extent);
     }
-    if (binary.getOperatorKind() == BinaryOperator::Subtract &&
-        isProvably(binary.getRhs(), 0))
-      return tileIndex(builder, location, binary.getLhs(), extent);
+    if (binary.getOperatorKind() == BinaryOperator::Subtract) {
+      if (isProvably(binary.getRhs(), 0))
+        return tileIndex(builder, location, binary.getLhs(), extent);
+      auto induction = dyn_cast<BlockArgument>(binary.getLhs());
+      auto loop = induction
+                      ? dyn_cast_or_null<scf::ForOp>(
+                            induction.getOwner()->getParentOp())
+                      : scf::ForOp();
+      // An iteration's offset from its lower bound is tile aligned even when
+      // the lower bound itself is not (for example a dynamic retained slice).
+      if (loop && induction == loop.getInductionVar() &&
+          gpu::samePhysicalScalarExpression(loop.getLowerBound(),
+                                            binary.getRhs()) &&
+          gpu::samePhysicalScalarExpression(loop.getStep(), extent))
+        return Value(builder.create<gpu::BinaryOp>(
+            location, builder.getIndexType(), start, extent,
+            BinaryOperator::FloorDivide));
+    }
   }
   auto argument = dyn_cast<BlockArgument>(start);
   auto loop =
@@ -607,6 +622,17 @@ extractionTileIndex(OpBuilder &builder, Location location, Value coordinate,
   if (!binary || (binary.getOperatorKind() != BinaryOperator::Add &&
                   binary.getOperatorKind() != BinaryOperator::Subtract))
     return failure();
+  if (binary.getOperatorKind() == BinaryOperator::Subtract &&
+      binary.getLhs() == range.getResult()) {
+    if (Value offset = uniformScalarFill(binary.getRhs())) {
+      Value start = builder.create<gpu::BinaryOp>(
+          location, builder.getIndexType(), range.getStart(), offset,
+          BinaryOperator::Subtract);
+      if (auto index = tileIndex(builder, location, start, range.getExtent());
+          succeeded(index))
+        return std::pair{*index, true};
+    }
+  }
   auto lhs = extractionTileIndex(builder, location, binary.getLhs(), range,
                                  sourceExtent);
   auto rhs = extractionTileIndex(builder, location, binary.getRhs(), range,
