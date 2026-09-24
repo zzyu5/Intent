@@ -166,6 +166,8 @@ BroadcastProjection queryAxisProjection(FragmentType source,
           return cast<AxisMapAttr>(item.value()).getDimensionId() ==
                  sourceAxis.getDimensionId();
         });
+    if (targetOccurrences == 0)
+      continue;
     if (sourceOccurrences > 1 || targetOccurrences > 1) {
       result.state = BroadcastProjectionState::Ambiguous;
       return result;

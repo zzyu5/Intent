@@ -1389,14 +1389,14 @@ FragmentType fragmentType(MLIRContext *context, Type element,
 }
 
 FailureOr<Value> scalarSource(Value value) {
-  if (!isa<FragmentType>(value.getType()))
-    return value;
-  if (auto broadcast = value.getDefiningOp<BroadcastOp>())
-    if (!isa<FragmentType>(broadcast.getValue().getType()))
-      return broadcast.getValue();
-  if (auto splat = value.getDefiningOp<SplatOp>())
-    return splat.getValue();
-  return failure();
+  while (isa<FragmentType>(value.getType())) {
+    UniformExpression expression = describeUniformValue(value);
+    if (expression.kind != UniformKind::Forward ||
+        expression.operands.size() != 1)
+      return failure();
+    value = expression.operands.front();
+  }
+  return value;
 }
 
 bool isZeroScalar(Value value) {

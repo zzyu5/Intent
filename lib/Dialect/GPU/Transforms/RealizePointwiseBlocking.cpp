@@ -5563,6 +5563,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         // remain separate until contraction blocking binds each side.
         for (MakeRangeOp range : address.roots)
           contractionOwnedRanges.insert(range.getOperation());
+        // Epilogue reads can materialize the same output coordinates through
+        // separate ranges. Their tile must follow the contraction as well.
+        for (MakeRangeOp range : payload.roots)
+          contractionOwnedRanges.insert(range.getOperation());
         continue;
       }
       auto sameBound = [](Value lhs, Value rhs) {

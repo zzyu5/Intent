@@ -1,113 +1,65 @@
-from __future__ import annotations
-
+import torch
 import intent
 import intent.language as I
-import torch
 
 
 @intent.kernel
-def _symmetric_product(
-    A: I.In[I.f32, ("M", "K")],
-    P: I.Out[I.f32, ("M", "M")],
-    TILE: I.Constexpr[int],
-    GROUPS: I.Constexpr[int],
-):
-    M, K = A.shape
-    rows = I.domain(0, M)
-    cols = I.domain(0, M)
-    k_axis = I.domain(0, K)
-    tile_ids = I.domain(0, GROUPS)
-
-    for tile_row in I.parallel(tile_ids):
-        row_region = rows[tile_row * TILE : (tile_row + 1) * TILE]
-        for tile_col in I.parallel(tile_ids):
-            col_region = cols[tile_col * TILE : (tile_col + 1) * TILE]
-            lhs = A[row_region, k_axis]
-            rhs = A[col_region, k_axis]
-            P[row_region, col_region] = I.matmul(
-                lhs,
-                rhs,
-                acc_dtype=I.f32,
-                transpose_rhs=True,
-            )
-
-
-@intent.kernel
-def _scaled_tiles_and_partial_abs_sum(
-    P: I.In[I.f32, ("M", "M")],
-    C: I.In[I.f32, ("M", "M")],
-    partials: I.Out[I.f32, ("G", "G")],
+def _symmetric_update(
+    A: I.In[I.f32, (1024, 1024)],
+    C: I.In[I.f32, (1024, 1024)],
+    D: I.Out[I.f32, (1024, 1024)],
     alpha: I.f32,
     beta: I.f32,
-    TILE: I.Constexpr[int],
-    GROUPS: I.Constexpr[int],
 ):
-    M, N = P.shape
-    rows = I.domain(0, M)
-    cols = I.domain(0, N)
-    tile_ids = I.domain(0, GROUPS)
-
-    for tile_row in I.parallel(tile_ids):
-        row_region = rows[tile_row * TILE : (tile_row + 1) * TILE]
-        for tile_col in I.parallel(tile_ids):
-            col_region = cols[tile_col * TILE : (tile_col + 1) * TILE]
-            value = alpha * P[row_region, col_region] + beta * C[row_region, col_region]
-            partials[tile_row, tile_col] = I.reduce.sum(
-                I.abs(value),
-                axis=(0, 1),
-                acc_dtype=I.f32,
-            )
+    rows = I.domain(0, 1024)
+    cols = I.domain(0, 1024)
+    product = I.matmul(A, A, transpose_rhs=True, acc_dtype=I.f32)
+    D[rows, cols] = product * alpha + C[rows, cols] * beta
 
 
 @intent.kernel
-def _reduce_partials(
-    partials: I.In[I.f32, ("G", "G")],
-    result: I.Out[I.f32, ()],
-    GROUPS: I.Constexpr[int],
+def _group_abs_sums(
+    D: I.In[I.f32, (1024, 1024)],
+    partials: I.Out[I.f32, (16,)],
 ):
-    tiles = I.domain(0, GROUPS)
-    result[()] = I.reduce.sum(
-        partials[tiles, tiles],
-        axis=(0, 1),
-        acc_dtype=I.f32,
-    )
+    groups = I.domain(0, 16)
+    cols = I.domain(0, 1024)
+    for group in I.parallel(groups):
+        begin = group * 64
+        rows = I.domain(begin, begin + 64)
+        block = D[rows, cols]
+        partials[group] = I.reduce.sum(
+            I.abs(block), axis=(0, 1), acc_dtype=I.f32
+        )
+
+
+@intent.kernel
+def _finish_abs_sum(
+    partials: I.In[I.f32, (16,)],
+    result: I.Out[I.f32, ()],
+):
+    groups = I.domain(0, 16)
+    result[()] = I.reduce.sum(partials[groups], axis=0, acc_dtype=I.f32)
 
 
 def build(context):
-    tile = 128
-    groups = 8
-    product = context.compile(
-        "symmetric_product_tiles",
-        _symmetric_product,
-        constexprs={"TILE": tile, "GROUPS": groups},
-    )
-    scaled = context.compile(
-        "scaled_tiles_partial_abs_sum",
-        _scaled_tiles_and_partial_abs_sum,
-        constexprs={"TILE": tile, "GROUPS": groups},
-    )
-    reduction = context.compile(
-        "reduce_partial_abs_sums",
-        _reduce_partials,
-        constexprs={"GROUPS": groups},
-    )
+    update = context.compile("symmetric_update", _symmetric_update)
+    group_abs = context.compile("group_abs_sums", _group_abs_sums)
+    finish = context.compile("finish_abs_sum", _finish_abs_sum)
 
-    def symmetric_mm_and_abs_sum(A: torch.Tensor, C: torch.Tensor, alpha: float = 1.0, beta: float = 0.5) -> torch.Tensor:
-        product_values = torch.empty(
-            (A.shape[0], A.shape[0]),
-            device=A.device,
-            dtype=torch.float32,
-        )
-        partials = torch.empty(
-            (groups, groups),
-            device=A.device,
-            dtype=torch.float32,
-        )
+    def symmetric_mm_and_abs_sum(
+        A: "torch.Tensor",
+        C: "torch.Tensor",
+        alpha: "float" = 1.0,
+        beta: "float" = 0.5,
+    ) -> "torch.Tensor":
+        D = torch.empty_like(C)
+        partials = torch.empty((16,), device=A.device, dtype=torch.float32)
         result = torch.empty((), device=A.device, dtype=torch.float32)
 
-        product(A, product_values)
-        scaled(product_values, C, partials, alpha, beta)
-        reduction(partials, result)
+        update(A, C, D, alpha, beta)
+        group_abs(D, partials)
+        finish(partials, result)
         return result
 
     return symmetric_mm_and_abs_sum
