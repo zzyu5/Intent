@@ -46,7 +46,7 @@ DenseI64ArrayAttr dimensionIDs(RankedTensorType tensor) {
 
 LogicalResult collectDomainValues(Value source,
                                   SmallVectorImpl<Value> &domains) {
-  if (isa_and_nonnull<DomainOp>(source.getDefiningOp())) {
+  if (isa_and_nonnull<DomainOp, SubregionOp>(source.getDefiningOp())) {
     domains.push_back(source);
     return success();
   }

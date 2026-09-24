@@ -584,6 +584,9 @@ FailureOr<Value> replaySourceValueImpl(OpBuilder &builder, Location location,
   }
   if (isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp, LoadOp>(producer)) {
     for (Value operand : producer->getOperands()) {
+      if (auto load = dyn_cast<LoadOp>(producer);
+          load && operand != load.getValid() && operand != load.getFill())
+        continue;
       Value current = cloneMapping.lookupOrDefault(operand);
       auto fragment = dyn_cast<FragmentType>(current.getType());
       if (!fragment)
@@ -1694,20 +1697,25 @@ LoadOp matrixOperandLoad(Value value) {
 }
 
 FailureOr<unsigned> accessCoordinatePosition(LoadOp load,
-                                             AxisMapAttr mapping) {
-  if (FailureOr<unsigned> direct = queryCoordinatePosition(
-          load.getCoordinates(), sourceAxisIdentity(mapping));
-      succeeded(direct))
-    return direct;
+                                             AxisMapAttr mapping,
+                                             Value operand) {
+  if (PhysicalAxisProjection direct = queryCoordinateIndex(
+          load.getCoordinates(), sourceAxisIdentity(mapping), mapping.getDimensionId());
+      direct.isExact())
+    return direct.fragmentAxis;
   auto kernel = load->getParentOfType<func::FuncOp>();
   if (kernel) {
     PhysicalProgramAnalysis analysis(kernel);
+    FailureOr<MakeRangeOp> selected = queryExactLogicalRange(
+        analysis.axisRanges(operand, mapping.getFragmentAxis()));
     std::optional<unsigned> replayed;
     for (auto [position, coordinate] :
          llvm::enumerate(load.getCoordinates())) {
       PhysicalRangeFact fact =
           analysis.sourceRanges(coordinate, sourceAxisIdentity(mapping));
-      if (failed(queryExactLogicalRange(fact)))
+      FailureOr<MakeRangeOp> coordinateRange = queryExactLogicalRange(fact);
+      if (failed(coordinateRange) ||
+          (succeeded(selected) && !sameLogicalRange(*selected, *coordinateRange)))
         continue;
       if (replayed)
         return failure();
@@ -1780,23 +1788,23 @@ bool hasRangeContractForm(ContractOp contract) {
       rhs, contract.getRhsReductionAxes(), contract.getRhsBatchAxes());
   if (failed(lhsFree) || failed(rhsFree))
     return false;
-  SmallVector<std::pair<LoadOp, AxisMapAttr>> axes;
-  for (auto [load, fragment, axis] :
-       {std::tuple<LoadOp, FragmentType, unsigned>{lhsLoad, lhs, *lhsFree},
-        std::tuple<LoadOp, FragmentType, unsigned>{
-            lhsLoad, lhs,
+  SmallVector<std::tuple<LoadOp, AxisMapAttr, Value>> axes;
+  for (auto [load, operand, axis] :
+       {std::tuple<LoadOp, Value, unsigned>{lhsLoad, contract.getLhs(), *lhsFree},
+        std::tuple<LoadOp, Value, unsigned>{
+            lhsLoad, contract.getLhs(),
             static_cast<unsigned>(contract.getLhsReductionAxes().front())},
-        std::tuple<LoadOp, FragmentType, unsigned>{
-            rhsLoad, rhs,
+        std::tuple<LoadOp, Value, unsigned>{
+            rhsLoad, contract.getRhs(),
             static_cast<unsigned>(contract.getRhsReductionAxes().front())},
-        std::tuple<LoadOp, FragmentType, unsigned>{rhsLoad, rhs, *rhsFree}}) {
-    FailureOr<AxisMapAttr> mapping = queryAxisMap(fragment, axis);
+        std::tuple<LoadOp, Value, unsigned>{rhsLoad, contract.getRhs(), *rhsFree}}) {
+    FailureOr<AxisMapAttr> mapping = queryAxisMap(operand.getType(), axis);
     if (failed(mapping))
       return false;
-    axes.emplace_back(load, *mapping);
+    axes.emplace_back(load, *mapping, operand);
   }
-  for (auto [load, mapping] : axes) {
-    FailureOr<unsigned> coordinate = accessCoordinatePosition(load, mapping);
+  for (auto [load, mapping, operand] : axes) {
+    FailureOr<unsigned> coordinate = accessCoordinatePosition(load, mapping, operand);
     if (failed(coordinate))
       return false;
     Value value = load.getCoordinates()[*coordinate];
@@ -3502,8 +3510,8 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       auto load = dyn_cast<LoadOp>(access);
       if (!load)
         continue;
-      auto freeCoordinate = accessCoordinatePosition(load, free);
-      auto reductionCoordinate = accessCoordinatePosition(load, reduction);
+      auto freeCoordinate = accessCoordinatePosition(load, free, operand);
+      auto reductionCoordinate = accessCoordinatePosition(load, reduction, operand);
       if (succeeded(freeCoordinate) && succeeded(reductionCoordinate) &&
           *freeCoordinate != *reductionCoordinate)
         return load;
@@ -3516,13 +3524,13 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
     return unhandled("operands have no replayable matrix coordinate accesses");
 
   FailureOr<unsigned> lhsRowCoordinate =
-      accessCoordinatePosition(lhsLoad, *rowMap);
+      accessCoordinatePosition(lhsLoad, *rowMap, contract.getLhs());
   FailureOr<unsigned> lhsReductionCoordinate =
-      accessCoordinatePosition(lhsLoad, *lhsReductionMap);
+      accessCoordinatePosition(lhsLoad, *lhsReductionMap, contract.getLhs());
   FailureOr<unsigned> rhsReductionCoordinate =
-      accessCoordinatePosition(rhsLoad, *rhsReductionMap);
+      accessCoordinatePosition(rhsLoad, *rhsReductionMap, contract.getRhs());
   FailureOr<unsigned> rhsColumnCoordinate =
-      accessCoordinatePosition(rhsLoad, *columnMap);
+      accessCoordinatePosition(rhsLoad, *columnMap, contract.getRhs());
   if (failed(lhsRowCoordinate) || failed(lhsReductionCoordinate) ||
       failed(rhsReductionCoordinate) || failed(rhsColumnCoordinate)) {
     std::string details;

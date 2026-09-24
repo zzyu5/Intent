@@ -61,10 +61,18 @@ std::optional<int64_t> integerConstant(Value value, unsigned depth = 0) {
     return integerConstant(broadcast.getValue(), depth + 1);
   if (auto splat = value.getDefiningOp<SplatOp>())
     return integerConstant(splat.getValue(), depth + 1);
-  if (auto cast = value.getDefiningOp<CastOp>())
-    return cast.getValue().getType() == cast.getResult().getType()
-               ? integerConstant(cast.getValue(), depth + 1)
+  if (auto cast = value.getDefiningOp<CastOp>()) {
+    if (cast.getValue().getType() == cast.getResult().getType())
+      return integerConstant(cast.getValue(), depth + 1);
+    if (!cast.getResult().getType().isIndex() ||
+        !isa<IntegerType, IndexType>(cast.getValue().getType()))
+      return std::nullopt;
+    auto constant = dyn_cast_or_null<IntegerAttr>(
+        UniformValueAnalysis(describeUniformValue).evaluate(value));
+    return constant && constant.getType().isIndex()
+               ? std::optional<int64_t>(constant.getInt())
                : std::nullopt;
+  }
   if (auto bound = value.getDefiningOp<RangeBoundOp>()) {
     auto range = bound.getRange().getDefiningOp<RangeOp>();
     if (!range)
@@ -1638,7 +1646,8 @@ PhysicalSourceAxis sourceAxisIdentity(MakeRangeOp range) {
 }
 
 PhysicalAxisProjection queryFragmentAxis(Type type,
-                                         PhysicalSourceAxis source) {
+                                         PhysicalSourceAxis source,
+                                         std::optional<int64_t> expectedDimension) {
   PhysicalAxisProjection result;
   result.source = source;
   auto fragment = dyn_cast<FragmentType>(type);
@@ -1650,7 +1659,8 @@ PhysicalAxisProjection queryFragmentAxis(Type type,
     auto mapping = cast<AxisMapAttr>(attribute);
     if (mapping.getSourceId() != source.sourceId ||
         mapping.getSourceAxis() != source.sourceAxis ||
-        mapping.getDerived() != source.derived)
+        mapping.getDerived() != source.derived ||
+        (expectedDimension && mapping.getDimensionId() != *expectedDimension))
       continue;
     if ((axis && *axis != mapping.getFragmentAxis()) ||
         (dimension && *dimension != mapping.getDimensionId())) {
@@ -2397,13 +2407,14 @@ FailureOr<int64_t> querySourceDimension(Type type, PhysicalSourceAxis source) {
 }
 
 PhysicalAxisProjection
-queryCoordinateIndex(ValueRange coordinates, PhysicalSourceAxis source) {
+queryCoordinateIndex(ValueRange coordinates, PhysicalSourceAxis source,
+                     std::optional<int64_t> dimension) {
   PhysicalAxisProjection result;
   result.source = source;
   std::optional<unsigned> coordinateIndex;
   for (auto [index, coordinate] : llvm::enumerate(coordinates)) {
     PhysicalAxisProjection projection =
-        queryFragmentAxis(coordinate.getType(), source);
+        queryFragmentAxis(coordinate.getType(), source, dimension);
     if (projection.state == PhysicalFactState::Ambiguous) {
       result.state = PhysicalFactState::Ambiguous;
       return result;
@@ -2420,7 +2431,7 @@ queryCoordinateIndex(ValueRange coordinates, PhysicalSourceAxis source) {
     return result;
   result.state = PhysicalFactState::Exact;
   PhysicalAxisProjection projection =
-      queryFragmentAxis(coordinates[*coordinateIndex].getType(), source);
+      queryFragmentAxis(coordinates[*coordinateIndex].getType(), source, dimension);
   result.dimensionId = projection.dimensionId;
   result.fragmentAxis = *coordinateIndex;
   return result;
@@ -2980,9 +2991,12 @@ void PhysicalProgramAnalysis::collectAxisRanges(
   if (auto gather = dyn_cast<GatherOp>(operation)) {
     auto input = dyn_cast<FragmentType>(gather.getSource().getType());
     auto expected = cast<AxisMapAttr>(fragment.getAxisMaps()[fragmentAxis]);
-    auto retained = input ? queryFragmentAxis(input, sourceAxisIdentity(expected))
-                          : PhysicalAxisProjection{};
-    auto output = queryFragmentAxis(fragment, sourceAxisIdentity(expected));
+    auto occurrence = [&](FragmentType type) {
+      return queryFragmentAxis(type, sourceAxisIdentity(expected),
+                               expected.getDimensionId());
+    };
+    auto retained = input ? occurrence(input) : PhysicalAxisProjection{};
+    auto output = occurrence(fragment);
     if (retained.isExact() && retained.dimensionId == expected.getDimensionId() &&
         output.isExact() && output.fragmentAxis == fragmentAxis &&
         !llvm::is_contained(gather.getSourceAxes(), retained.fragmentAxis) &&
@@ -2993,7 +3007,7 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     bool followed = false;
     for (Value coordinate : gather.getCoordinates()) {
       auto type = dyn_cast<FragmentType>(coordinate.getType());
-      auto projection = type ? queryFragmentAxis(type, sourceAxisIdentity(expected))
+      auto projection = type ? occurrence(type)
                              : PhysicalAxisProjection{};
       if (!projection.isExact() || projection.dimensionId != expected.getDimensionId() ||
           type.getShape()[projection.fragmentAxis] != fragment.getShape()[fragmentAxis])

@@ -5075,7 +5075,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                 if (load.getSourceAxes().size() != store.getSourceAxes().size())
                   return true;
                 auto coordinate =
-                    queryCoordinateIndex(store.getCoordinates(), source);
+                    queryCoordinateIndex(store.getCoordinates(), source, dimension);
                 if (!coordinate.isExact() || coordinate.dimensionId != dimension)
                   return true;
                 bool sameCoordinates = llvm::all_of(llvm::enumerate(store.getSourceAxes()),

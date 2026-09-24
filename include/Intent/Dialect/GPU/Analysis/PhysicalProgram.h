@@ -72,7 +72,8 @@ struct PhysicalDimensionProjection {
 };
 
 PhysicalAxisProjection queryFragmentAxis(mlir::Type type,
-                                         PhysicalSourceAxis source);
+                                         PhysicalSourceAxis source,
+                                         std::optional<int64_t> dimension = std::nullopt);
 llvm::SmallVector<PhysicalAxisProjection, 2>
 queryFragmentAxes(mlir::Type type, PhysicalSourceAxis source);
 llvm::SmallVector<PhysicalAxisProjection, 2>
@@ -84,7 +85,8 @@ queryFragmentDimensions(mlir::Type type, int64_t dimensionId);
 mlir::FailureOr<int64_t>
 querySourceDimension(mlir::Type type, PhysicalSourceAxis source);
 PhysicalAxisProjection
-queryCoordinateIndex(mlir::ValueRange coordinates, PhysicalSourceAxis source);
+queryCoordinateIndex(mlir::ValueRange coordinates, PhysicalSourceAxis source,
+                     std::optional<int64_t> dimension = std::nullopt);
 mlir::FailureOr<unsigned>
 queryCoordinatePosition(mlir::ValueRange coordinates,
                         PhysicalSourceAxis source);

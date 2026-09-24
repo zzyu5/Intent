@@ -634,7 +634,8 @@ FailureOr<bool> composeReshapedGather(GatherOp gather) {
     if (coordinates[axis])
       continue;
     auto mapping = cast<AxisMapAttr>(shaped.getAxisMaps()[axis]);
-    auto projection = queryFragmentAxis(result, sourceAxisIdentity(mapping));
+    auto projection = queryFragmentAxis(result, sourceAxisIdentity(mapping),
+                                        mapping.getDimensionId());
     if (!projection.isExact() || projection.dimensionId != mapping.getDimensionId() ||
         result.getShape()[projection.fragmentAxis] != shaped.getShape()[axis])
       return false;
@@ -1015,7 +1016,7 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
       return failure();
     }
     PhysicalAxisProjection target = queryCoordinateIndex(
-        originalCoordinates, sourceAxisIdentity(*mapping));
+        originalCoordinates, sourceAxisIdentity(*mapping), mapping->getDimensionId());
     if (!target.isExact() || target.dimensionId != mapping->getDimensionId()) {
       gather.emitOpError(
           "loaded source coordinate cannot be composed with gather indexing");
@@ -1127,15 +1128,19 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
       for (MakeRangeOp range : roots.roots) {
         if (replay.lookupOrNull(range.getResult()))
           continue;
-        auto sourceAxis = queryFragmentAxis(sourceType, sourceAxisIdentity(range));
+        FailureOr<int64_t> dimension = queryRangeDimension(range);
+        if (failed(dimension))
+          continue;
+        auto sourceAxis = queryFragmentAxis(sourceType, sourceAxisIdentity(range),
+                                            *dimension);
         if (!sourceAxis.isExact() ||
             llvm::is_contained(gather.getSourceAxes(),
                                static_cast<int64_t>(sourceAxis.fragmentAxis)))
           continue;
-        auto axis = queryFragmentAxis(resultType, sourceAxisIdentity(range));
-        FailureOr<int64_t> dimension = queryRangeDimension(range);
+        auto axis = queryFragmentAxis(resultType, sourceAxisIdentity(range),
+                                      *dimension);
         auto rangeType = range.getResult().getType();
-        if (!axis.isExact() || failed(dimension) ||
+        if (!axis.isExact() ||
             sourceAxis.dimensionId != *dimension ||
             axis.dimensionId != *dimension ||
             resultType.getShape()[axis.fragmentAxis] != rangeType.getShape()[0])
@@ -1416,13 +1421,14 @@ FailureOr<bool> composeIdentityFragmentGather(GatherOp gather) {
     auto expected = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
     PhysicalSourceAxis physicalSource = sourceAxisIdentity(expected);
     PhysicalAxisProjection resultAxis =
-        queryFragmentAxis(result, physicalSource);
+        queryFragmentAxis(result, physicalSource, expected.getDimensionId());
     // Coordinate broadcasting does not change the ordinal of a full slice.
     // Inspect the range before its singleton axes were inserted.
     while (auto broadcast = coordinate.getDefiningOp<BroadcastOp>())
       coordinate = broadcast.getValue();
     PhysicalAxisProjection coordinateAxis =
-        queryCoordinateIndex(ValueRange{coordinate}, physicalSource);
+        queryCoordinateIndex(ValueRange{coordinate}, physicalSource,
+                             expected.getDimensionId());
     auto resultMapping =
         resultAxis.isExact()
             ? dyn_cast<AxisMapAttr>(result.getAxisMaps()[resultAxis.fragmentAxis])
@@ -1652,7 +1658,7 @@ FailureOr<bool> projectFragmentGather(GatherOp gather) {
     auto expected = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
     PhysicalSourceAxis physicalSource = sourceAxisIdentity(expected);
     PhysicalAxisProjection resultAxis =
-        queryFragmentAxis(result, physicalSource);
+        queryFragmentAxis(result, physicalSource, expected.getDimensionId());
     if (resultAxis.state == PhysicalFactState::Ambiguous)
       return false;
     if (!resultAxis.isExact()) {
@@ -1661,7 +1667,8 @@ FailureOr<bool> projectFragmentGather(GatherOp gather) {
       continue;
     }
     PhysicalAxisProjection coordinateAxis =
-        queryCoordinateIndex(ValueRange{coordinate}, physicalSource);
+        queryCoordinateIndex(ValueRange{coordinate}, physicalSource,
+                             expected.getDimensionId());
     auto resultMapping =
         dyn_cast<AxisMapAttr>(result.getAxisMaps()[resultAxis.fragmentAxis]);
     auto coordinateType = dyn_cast<FragmentType>(coordinate.getType());

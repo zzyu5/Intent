@@ -1396,15 +1396,16 @@ FailureOr<Type> convertContractResultType(
       left.getOwner()));
 }
 
-struct OrderedIterationAxis {
+struct IterationAxis {
   Value start;
   Value stop;
   Value step;
   Value coordinatePrototype;
+  Value source;
 };
 
-LogicalResult collectOrderedIterationAxes(
-    Value source, SmallVectorImpl<OrderedIterationAxis> &axes);
+LogicalResult collectIterationAxes(
+    Value source, SmallVectorImpl<IterationAxis> &axes);
 
 class ScalarRegionLowering {
 public:
@@ -1457,6 +1458,11 @@ public:
 
   llvm::DenseMap<Value, Value> &mapping() { return values; }
   FailureOr<Value> lowerValue(Value source) { return get(source); }
+  FailureOr<Value> lowerIndexValue(Value source) {
+    FailureOr<Value> value = get(source);
+    return succeeded(value) ? asIndex(source.getLoc(), *value)
+                            : FailureOr<Value>(failure());
+  }
 
 private:
   FailureOr<Value> get(Value source) {
@@ -2860,9 +2866,58 @@ private:
         return failure();
     }
 
+    // Basic index terms have an explicit Cartesian result position.  Preserve
+    // that occurrence when equal-length regions share one source identity;
+    // broadcasting by the coordinate type alone would select the trailing axis.
+    SmallVector<std::optional<unsigned>> coordinateAxes(coordinates.size());
+    auto relation = operation->getAttrOfType<IndexRelationAttr>("index");
+    if (payloadFragment && relation &&
+        relation.getResultDimensions().size() == payloadFragment.getShape().size()) {
+      unsigned coordinateIndex = 0;
+      unsigned resultAxis = 0;
+      bool cartesian = true;
+      for (Attribute attribute : relation.getTerms()) {
+        auto term = cast<IndexTermAttr>(attribute);
+        if (term.getKind() == 1) {
+          ++resultAxis;
+          continue;
+        }
+        if (coordinateIndex >= coordinates.size()) {
+          cartesian = false;
+          break;
+        }
+        auto type = dyn_cast<gpu::FragmentType>(coordinates[coordinateIndex].getType());
+        if (term.getKind() == 0 || term.getKind() == 4 || term.getKind() == 5) {
+          if (!type || type.getShape().size() != 1 ||
+              resultAxis >= payloadFragment.getShape().size()) {
+            cartesian = false;
+            break;
+          }
+          auto source = cast<gpu::AxisMapAttr>(type.getAxisMaps()[0]);
+          auto target = cast<gpu::AxisMapAttr>(payloadFragment.getAxisMaps()[resultAxis]);
+          if (!(gpu::sourceAxisIdentity(source) == gpu::sourceAxisIdentity(target)) ||
+              source.getDimensionId() != target.getDimensionId() ||
+              target.getDimensionId() != relation.getResultDimensions()[resultAxis] ||
+              type.getShape()[0] != payloadFragment.getShape()[resultAxis] ||
+              type.getOwner() != payloadFragment.getOwner()) {
+            cartesian = false;
+            break;
+          }
+          coordinateAxes[coordinateIndex] = resultAxis++;
+        } else if (type) {
+          cartesian = false;
+          break;
+        }
+        ++coordinateIndex;
+      }
+      if (!cartesian || coordinateIndex != coordinates.size() ||
+          resultAxis != payloadFragment.getShape().size())
+        std::fill(coordinateAxes.begin(), coordinateAxes.end(), std::nullopt);
+    }
+
     Value valid = existing;
-    for (auto [coordinate, sourceAxis] :
-         llvm::zip(coordinates, sourceAxes)) {
+    for (auto [coordinateIndex, coordinate] : llvm::enumerate(coordinates)) {
+      int64_t sourceAxis = sourceAxes[coordinateIndex];
       if (sourceAxis < 0 ||
           sourceAxis >= static_cast<int64_t>(proven.size()))
         return failure();
@@ -2918,8 +2973,11 @@ private:
                                  BinaryOperator::LogicalAnd);
       }
       if (payloadFragment) {
-        FailureOr<Value> projected = projectAccessOperand(
-            operation->getLoc(), axisValid, payloadFragment);
+        auto axis = coordinateAxes[coordinateIndex];
+        FailureOr<Value> projected = axis
+            ? gpu::projectPredicateToFragmentAxis(builder, operation->getLoc(),
+                                                  axisValid, payloadFragment, *axis)
+            : projectAccessOperand(operation->getLoc(), axisValid, payloadFragment);
         if (failed(projected)) {
           operation->emitOpError("index bounds have no payload projection")
               << "; index=" << index << "; payload=" << payloadFragment;
@@ -5066,13 +5124,13 @@ private:
       ValueRange inputs = operation->getOperands();
       if (inputs.empty())
         return operation->emitOpError("iteration lacks its logical domain");
-      SmallVector<OrderedIterationAxis> axes;
-      if (failed(collectOrderedIterationAxes(inputs.front(), axes)) ||
+      SmallVector<IterationAxis> axes;
+      if (failed(collectIterationAxes(inputs.front(), axes)) ||
           axes.empty())
         return operation->emitOpError(
             "iteration source has no exact domain/subregion relation");
       SmallVector<Value> lowers, uppers, steps;
-      for (OrderedIterationAxis axis : axes) {
+      for (IterationAxis axis : axes) {
         FailureOr<Value> lower = get(axis.start);
         FailureOr<Value> upper = get(axis.stop);
         FailureOr<Value> prototype = get(axis.coordinatePrototype);
@@ -5322,32 +5380,32 @@ struct ParallelWorkset {
   intent::ParallelOp operation;
   Block *body = nullptr;
   bool singleton = false;
-  SmallVector<intent::DomainOp> axes;
+  SmallVector<IterationAxis> axes;
   SmallVector<BlockArgument> coordinateArguments;
   SmallVector<PhysicalExprAttr> launchExtents;
   PhysicalExprAttr launchLength;
 };
 
-LogicalResult collectOrderedIterationAxes(
-    Value source, SmallVectorImpl<OrderedIterationAxis> &axes) {
+LogicalResult collectIterationAxes(
+    Value source, SmallVectorImpl<IterationAxis> &axes) {
   if (auto domain = source.getDefiningOp<intent::DomainOp>()) {
     axes.push_back({domain.getBounds()[0], domain.getBounds()[1],
                     domain.getBounds().size() == 3 ? domain.getBounds()[2]
                                                    : Value(),
-                    domain.getBounds()[0]});
+                    domain.getBounds()[0], source});
     return success();
   }
   if (auto product = source.getDefiningOp<intent::DomainProductOp>()) {
     for (Value component : product.getDomains())
-      if (failed(collectOrderedIterationAxes(component, axes)))
+      if (failed(collectIterationAxes(component, axes)))
         return failure();
     return success();
   }
   auto subregion = source.getDefiningOp<intent::SubregionOp>();
   if (!subregion || subregion.getInputs().empty())
     return failure();
-  SmallVector<OrderedIterationAxis> parent;
-  if (failed(collectOrderedIterationAxes(subregion.getInputs().front(), parent)) ||
+  SmallVector<IterationAxis> parent;
+  if (failed(collectIterationAxes(subregion.getInputs().front(), parent)) ||
       parent.size() != 1)
     return failure();
   unsigned operand = 1;
@@ -5357,6 +5415,7 @@ LogicalResult collectOrderedIterationAxes(
     parent.front().stop = subregion.getInputs()[operand++];
   if (operand != subregion.getInputs().size())
     return failure();
+  parent.front().source = source;
   axes.append(parent.begin(), parent.end());
   return success();
 }
@@ -5364,18 +5423,18 @@ LogicalResult collectOrderedIterationAxes(
 LogicalResult finalizeParallelWorkset(ParallelWorkset &workset,
                                       func::FuncOp function) {
   MLIRContext *context = workset.operation.getContext();
-  for (intent::DomainOp domain : workset.axes) {
+  for (const IterationAxis &axis : workset.axes) {
     FailureOr<PhysicalExprAttr> start =
-        launchExpression(domain.getBounds()[0], function);
+        launchExpression(axis.start, function);
     FailureOr<PhysicalExprAttr> stop =
-        launchExpression(domain.getBounds()[1], function);
+        launchExpression(axis.stop, function);
     FailureOr<PhysicalExprAttr> step =
-        domain.getBounds().size() == 3
-            ? launchExpression(domain.getBounds()[2], function)
+        axis.step
+            ? launchExpression(axis.step, function)
             : FailureOr<PhysicalExprAttr>(
                   expression(context, PhysicalExprKind::Constant, 1));
     if (failed(start) || failed(stop) || failed(step))
-      return domain.emitOpError(
+      return axis.source.getDefiningOp()->emitOpError(
           "parallel workset bound is not a launch-visible typed expression");
     PhysicalExprAttr distance = binaryExpression(
         context, PhysicalExprKind::Subtract, *stop, *start);
@@ -5463,11 +5522,9 @@ LogicalResult constructGPUProgram(ModuleOp module,
     workset.coordinateArguments.append(fact.coordinates.begin(),
                                        fact.coordinates.end());
     for (Value domainValue : fact.domains) {
-      auto domain = domainValue.getDefiningOp<intent::DomainOp>();
-      if (!domain)
+      if (failed(collectIterationAxes(domainValue, workset.axes)))
         return function.emitError(
-            "canonical workset axis is not a typed domain value");
-      workset.axes.push_back(domain);
+            "canonical workset axis has no typed domain/subregion bounds");
     }
     if (workset.singleton) {
       workset.launchExtents.push_back(
@@ -5564,20 +5621,23 @@ LogicalResult constructGPUProgram(ModuleOp module,
                                     dimensionValues, parameterValues,
                                     canonicalAnalysis, physical);
   auto formWorksetCoordinate = [&](OpBuilder &nested, Location location,
-                                   intent::DomainOp domain, Value coordinate,
+                                   Value source, Value coordinate,
                                    Value step,
                                    unsigned worksetAxis) -> Value {
-    auto domainType = cast<intent::DomainType>(domain.getResult().getType());
+    auto domainType = dyn_cast<intent::DomainType>(source.getType());
+    auto regionType = dyn_cast<intent::RegionType>(source.getType());
+    uint64_t sourceId = domainType ? domainType.getOriginId()
+                                  : regionType.getSourceId();
     std::optional<int64_t> dimension =
-        sourceExtentDimension(domain.getResult());
+        sourceExtentDimension(source);
     if (!dimension || *dimension <= 0) {
-      domain.emitOpError(
+      source.getDefiningOp()->emitOpError(
           "parallel workset coordinate has no logical dimension identity");
       return {};
     }
     auto mapped = nested.create<gpu::WorksetCoordinateOp>(
         location, nested.getIndexType(), coordinate, step,
-        domainType.getOriginId(),
+        sourceId,
         /*sourceAxis=*/0, /*sourceRank=*/1, *dimension);
     mapped->setAttr(gpu::worksetAxisAttr,
                     nested.getI64IntegerAttr(worksetAxis));
@@ -5589,31 +5649,32 @@ LogicalResult constructGPUProgram(ModuleOp module,
     SmallVector<Value> starts;
     SmallVector<Value> steps;
     Value runtimeLength = one;
-    for (intent::DomainOp domain : workset.axes) {
-      FailureOr<Value> start = rootLowering.lowerValue(domain.getBounds()[0]);
-      FailureOr<Value> stop = rootLowering.lowerValue(domain.getBounds()[1]);
+    for (const IterationAxis &axis : workset.axes) {
+      Location location = axis.source.getLoc();
+      FailureOr<Value> start = rootLowering.lowerIndexValue(axis.start);
+      FailureOr<Value> stop = rootLowering.lowerIndexValue(axis.stop);
       FailureOr<Value> step =
-          domain.getBounds().size() == 3
-              ? rootLowering.lowerValue(domain.getBounds()[2])
+          axis.step
+              ? rootLowering.lowerIndexValue(axis.step)
               : FailureOr<Value>(one);
       if (failed(start) || failed(stop) || failed(step))
-        return domain.emitOpError(
+        return axis.source.getDefiningOp()->emitOpError(
             "parallel workset runtime bounds are unavailable");
-      Value distance = createBinary(builder, domain.getLoc(),
+      Value distance = createBinary(builder, location,
                                     builder.getIndexType(), *stop, *start,
                                     BinaryOperator::Subtract);
       Value adjusted = createBinary(
-          builder, domain.getLoc(), builder.getIndexType(), distance,
-          createBinary(builder, domain.getLoc(), builder.getIndexType(), *step,
+          builder, location, builder.getIndexType(), distance,
+          createBinary(builder, location, builder.getIndexType(), *step,
                        one, BinaryOperator::Subtract),
           BinaryOperator::Add);
-      Value extent = createBinary(builder, domain.getLoc(),
+      Value extent = createBinary(builder, location,
                                   builder.getIndexType(), adjusted, *step,
                                   BinaryOperator::FloorDivide);
       runtimeExtents.push_back(extent);
       starts.push_back(*start);
       steps.push_back(*step);
-      runtimeLength = createBinary(builder, domain.getLoc(),
+      runtimeLength = createBinary(builder, location,
                                    builder.getIndexType(), runtimeLength, extent,
                                    BinaryOperator::Multiply);
     }
@@ -5656,7 +5717,7 @@ LogicalResult constructGPUProgram(ModuleOp module,
                                         builder.getIndexType(), starts[axis],
                                         scaled, BinaryOperator::Add);
         childValues[workset.coordinateArguments[axis]] = formWorksetCoordinate(
-            builder, worksetLocation, workset.axes[axis], coordinate, steps[axis],
+            builder, worksetLocation, workset.axes[axis].source, coordinate, steps[axis],
             axis);
       }
       ScalarRegionLowering lowering(builder, std::move(childValues),
@@ -5712,7 +5773,7 @@ LogicalResult constructGPUProgram(ModuleOp module,
                                             starts[axis], scaled,
                                             BinaryOperator::Add);
             childValues[workset.coordinateArguments[axis]] =
-                formWorksetCoordinate(nested, location, workset.axes[axis],
+                formWorksetCoordinate(nested, location, workset.axes[axis].source,
                                       coordinate, steps[axis], axis);
           }
           ScalarRegionLowering lowering(nested, std::move(childValues),
