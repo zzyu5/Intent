@@ -109,6 +109,8 @@ class CompiledArtifact:
                     f"{index} is on {argument.device}"
                 )
         if expected.type == "cuda":
-            with torch.cuda.device(expected):
+            if torch.cuda.current_device() == self.device:
+                return function(*arguments)
+            with torch.cuda.device(self.device):
                 return function(*arguments)
         raise NotImplementedError(f"artifact invocation for {expected.type}")
