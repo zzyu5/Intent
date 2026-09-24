@@ -1,206 +1,172 @@
+from __future__ import annotations
+
 import torch
 import intent
 import intent.language as I
 
 
 @intent.kernel
-def _conv_with_bias(
+def conv2d_kernel(
     x: I.In[I.f32, (2, 16, 64, 64)],
     conv_weight: I.In[I.f32, (64, 16, 3, 3)],
     conv_bias: I.In[I.f32, (64,)],
-    conv_out: I.Out[I.f32, (2, 64, 62, 62)],
-    conv_stride: I.i64,
-    conv_padding: I.i64,
-    conv_dilation: I.i64,
-    conv_groups: I.i64,
+    out: I.Out[I.f32, (2, 64, 62, 62)],
 ):
-    n = I.domain(0, 2)
-    co = I.domain(0, 64)
-    oh = I.domain(0, 62)
-    ow = I.domain(0, 62)
-    ci = I.domain(0, 16)
-    kh = I.domain(0, 3)
-    kw = I.domain(0, 3)
+    batch = I.domain(0, 2)
+    channels = I.domain(0, 64)
+    height = I.domain(0, 62)
+    width = I.domain(0, 62)
 
-    # The seven-axis value keeps output coordinates free and the convolution
-    # window axes explicit until the final reduction.
-    ni = I.reshape(I.indices(n), (2, 1, 1, 1, 1, 1, 1))
-    coi = I.reshape(I.indices(co), (1, 64, 1, 1, 1, 1, 1))
-    ohi = I.reshape(I.indices(oh), (1, 1, 62, 1, 1, 1, 1))
-    owi = I.reshape(I.indices(ow), (1, 1, 1, 62, 1, 1, 1))
-    cii = I.reshape(I.indices(ci), (1, 1, 1, 1, 16, 1, 1))
-    khi = I.reshape(I.indices(kh), (1, 1, 1, 1, 1, 3, 1))
-    kwi = I.reshape(I.indices(kw), (1, 1, 1, 1, 1, 1, 3))
+    height_index = I.reshape(I.indices(height), (62, 1))
+    width_index = I.reshape(I.indices(width), (1, 62))
+    acc = I.full((2, 64, 62, 62), 0.0, dtype=I.f32)
 
-    stride = I.cast(conv_stride, I.index)
-    padding = I.cast(conv_padding, I.index)
-    dilation = I.cast(conv_dilation, I.index)
-    groups = I.cast(conv_groups, I.index)
-    out_channels_per_group = I.cast(64, I.index) // groups
-    input_channel = (coi // out_channels_per_group) * I.cast(16, I.index) + cii
-    input_y = ohi * stride - padding + khi * dilation
-    input_x = owi * stride - padding + kwi * dilation
-    valid = (
-        (input_channel >= 0)
-        & (input_channel < 16)
-        & (input_y >= 0)
-        & (input_y < 64)
-        & (input_x >= 0)
-        & (input_x < 64)
-    )
+    for input_channel in range(16):
+        for kernel_row in range(3):
+            for kernel_col in range(3):
+                row = height_index + I.cast(kernel_row, I.index)
+                col = width_index + I.cast(kernel_col, I.index)
+                values = x[batch, input_channel, row, col]
+                values = I.reshape(values, (2, 1, 62, 62))
+                kernel_value = conv_weight[channels, input_channel, kernel_row, kernel_col]
+                kernel_value = I.reshape(kernel_value, (1, 64, 1, 1))
+                acc = acc + values * kernel_value
 
-    samples = I.gather(
-        x,
-        (ni, input_channel, input_y, input_x),
-        valid=valid,
-        fill=I.cast(0.0, I.f32),
-    )
-    kernel = conv_weight[coi, cii, khi, kwi]
-    products = samples * kernel
-    conv = I.reduce.sum(products, axis=(4, 5, 6), acc_dtype=I.f32)
-    bias = I.reshape(conv_bias, (1, 64, 1, 1))
-    conv_out[n, co, oh, ow] = conv + bias
+    bias = I.reshape(conv_bias[channels], (1, 64, 1, 1))
+    out[batch, channels, height, width] = acc + bias
 
 
 @intent.kernel
-def _conv_without_bias(
+def conv2d_no_bias_kernel(
     x: I.In[I.f32, (2, 16, 64, 64)],
     conv_weight: I.In[I.f32, (64, 16, 3, 3)],
-    conv_out: I.Out[I.f32, (2, 64, 62, 62)],
-    conv_stride: I.i64,
-    conv_padding: I.i64,
-    conv_dilation: I.i64,
-    conv_groups: I.i64,
+    out: I.Out[I.f32, (2, 64, 62, 62)],
 ):
-    n = I.domain(0, 2)
-    co = I.domain(0, 64)
-    oh = I.domain(0, 62)
-    ow = I.domain(0, 62)
-    ci = I.domain(0, 16)
-    kh = I.domain(0, 3)
-    kw = I.domain(0, 3)
+    batch = I.domain(0, 2)
+    channels = I.domain(0, 64)
+    height = I.domain(0, 62)
+    width = I.domain(0, 62)
 
-    ni = I.reshape(I.indices(n), (2, 1, 1, 1, 1, 1, 1))
-    coi = I.reshape(I.indices(co), (1, 64, 1, 1, 1, 1, 1))
-    ohi = I.reshape(I.indices(oh), (1, 1, 62, 1, 1, 1, 1))
-    owi = I.reshape(I.indices(ow), (1, 1, 1, 62, 1, 1, 1))
-    cii = I.reshape(I.indices(ci), (1, 1, 1, 1, 16, 1, 1))
-    khi = I.reshape(I.indices(kh), (1, 1, 1, 1, 1, 3, 1))
-    kwi = I.reshape(I.indices(kw), (1, 1, 1, 1, 1, 1, 3))
+    height_index = I.reshape(I.indices(height), (62, 1))
+    width_index = I.reshape(I.indices(width), (1, 62))
+    acc = I.full((2, 64, 62, 62), 0.0, dtype=I.f32)
 
-    stride = I.cast(conv_stride, I.index)
-    padding = I.cast(conv_padding, I.index)
-    dilation = I.cast(conv_dilation, I.index)
-    groups = I.cast(conv_groups, I.index)
-    out_channels_per_group = I.cast(64, I.index) // groups
-    input_channel = (coi // out_channels_per_group) * I.cast(16, I.index) + cii
-    input_y = ohi * stride - padding + khi * dilation
-    input_x = owi * stride - padding + kwi * dilation
-    valid = (
-        (input_channel >= 0)
-        & (input_channel < 16)
-        & (input_y >= 0)
-        & (input_y < 64)
-        & (input_x >= 0)
-        & (input_x < 64)
-    )
-    samples = I.gather(
-        x,
-        (ni, input_channel, input_y, input_x),
-        valid=valid,
-        fill=I.cast(0.0, I.f32),
-    )
-    kernel = conv_weight[coi, cii, khi, kwi]
-    conv_out[n, co, oh, ow] = I.reduce.sum(
-        samples * kernel, axis=(4, 5, 6), acc_dtype=I.f32
-    )
+    for input_channel in range(16):
+        for kernel_row in range(3):
+            for kernel_col in range(3):
+                row = height_index + I.cast(kernel_row, I.index)
+                col = width_index + I.cast(kernel_col, I.index)
+                values = x[batch, input_channel, row, col]
+                values = I.reshape(values, (2, 1, 62, 62))
+                kernel_value = conv_weight[channels, input_channel, kernel_row, kernel_col]
+                kernel_value = I.reshape(kernel_value, (1, 64, 1, 1))
+                acc = acc + values * kernel_value
+
+    out[batch, channels, height, width] = acc
 
 
 @intent.kernel
-def _batch_stats(
-    conv: I.In[I.f32, (2, 64, 62, 62)],
+def layer_norm_partial_stats_kernel(
+    values: I.In[I.f32, (2, 64, 62, 62)],
+    partial_sum: I.Out[I.f32, (2, 8)],
+    partial_square_sum: I.Out[I.f32, (2, 8)],
+):
+    batch = I.domain(0, 2)
+    group = I.domain(0, 8)
+    group_channel = I.domain(0, 8)
+    height = I.domain(0, 62)
+    width = I.domain(0, 62)
+
+    group_index = I.reshape(I.indices(group), (8, 1, 1, 1))
+    channel_index = I.reshape(I.indices(group_channel), (1, 8, 1, 1))
+    height_index = I.reshape(I.indices(height), (1, 1, 62, 1))
+    width_index = I.reshape(I.indices(width), (1, 1, 1, 62))
+    channel = group_index * 8 + channel_index
+    members = values[batch, channel, height_index, width_index]
+
+    sums = I.reduce.sum(members, axis=(2, 3, 4), acc_dtype=I.f32)
+    squares = I.reduce.sum(members * members, axis=(2, 3, 4), acc_dtype=I.f32)
+    partial_sum[batch, group] = sums
+    partial_square_sum[batch, group] = squares
+
+
+@intent.kernel
+def layer_norm_finalize_stats_kernel(
+    partial_sum: I.In[I.f32, (2, 8)],
+    partial_square_sum: I.In[I.f32, (2, 8)],
     mean: I.Out[I.f32, (2,)],
     variance: I.Out[I.f32, (2,)],
 ):
-    n = I.domain(0, 2)
-    c = I.domain(0, 64)
-    h = I.domain(0, 62)
-    w = I.domain(0, 62)
-    values = conv[n, c, h, w]
-    count = I.cast(64 * 62 * 62, I.f32)
-    means = I.fdiv(I.reduce.sum(values, axis=(1, 2, 3), acc_dtype=I.f32), count)
-    centered = values - I.reshape(means, (2, 1, 1, 1))
-    variances = I.fdiv(
-        I.reduce.sum(centered * centered, axis=(1, 2, 3), acc_dtype=I.f32),
-        count,
-    )
-    mean[n] = means
-    variance[n] = variances
+    batch = I.domain(0, 2)
+    group = I.domain(0, 8)
+    total_count = I.cast(246016.0, I.f32)
+
+    sums = partial_sum[batch, group]
+    squares = partial_square_sum[batch, group]
+    mean_value = I.fdiv(I.reduce.sum(sums, axis=1, acc_dtype=I.f32), total_count)
+    second_moment = I.fdiv(I.reduce.sum(squares, axis=1, acc_dtype=I.f32), total_count)
+    variance_value = I.maximum(second_moment - mean_value * mean_value, I.cast(0.0, I.f32))
+    mean[batch] = mean_value
+    variance[batch] = variance_value
 
 
 @intent.kernel
-def _normalize_silu(
-    conv: I.In[I.f32, (2, 64, 62, 62)],
+def normalized_silu_kernel(
+    values: I.In[I.f32, (2, 64, 62, 62)],
     mean: I.In[I.f32, (2,)],
     variance: I.In[I.f32, (2,)],
     out: I.Out[I.f32, (2, 64, 62, 62)],
     ln_eps: I.f32,
 ):
-    n = I.domain(0, 2)
-    c = I.domain(0, 64)
-    h = I.domain(0, 62)
-    w = I.domain(0, 62)
-    values = conv[n, c, h, w]
-    means = I.reshape(mean[n], (2, 1, 1, 1))
-    variances = I.reshape(variance[n], (2, 1, 1, 1))
-    normalized = I.fdiv(values - means, I.sqrt(variances + ln_eps))
-    out[n, c, h, w] = normalized * I.sigmoid(normalized)
+    batch = I.domain(0, 2)
+    channels = I.domain(0, 64)
+    height = I.domain(0, 62)
+    width = I.domain(0, 62)
+
+    input_value = values[batch, channels, height, width]
+    mean_value = I.reshape(mean[batch], (2, 1, 1, 1))
+    variance_value = I.reshape(variance[batch], (2, 1, 1, 1))
+    centered = input_value - mean_value
+    normalized = centered / I.sqrt(variance_value + ln_eps)
+    out[batch, channels, height, width] = normalized * I.sigmoid(normalized)
 
 
 def build(context):
-    conv_with_bias = context.compile("fused_conv_with_bias", _conv_with_bias)
-    conv_without_bias = context.compile("fused_conv_without_bias", _conv_without_bias)
-    stats = context.compile("fused_batch_stats", _batch_stats)
-    normalize_silu = context.compile("fused_normalize_silu", _normalize_silu)
+    conv = context.compile("conv2d", conv2d_kernel)
+    conv_no_bias = context.compile("conv2d_no_bias", conv2d_no_bias_kernel)
+    partial_stats = context.compile("layer_norm_partial_stats", layer_norm_partial_stats_kernel)
+    finalize_stats = context.compile("layer_norm_finalize_stats", layer_norm_finalize_stats_kernel)
+    normalized_silu = context.compile("normalized_silu", normalized_silu_kernel)
 
     def fused_silu_layer_norm_conv2d(
-        x: "torch.Tensor",
-        weight: "torch.Tensor",
-        conv_weight: "torch.Tensor",
-        conv_bias: "torch.Tensor" = None,
-        conv_stride: "int" = 1,
-        conv_padding: "int" = 0,
-        conv_dilation: "int" = 1,
-        conv_groups: "int" = 1,
-        ln_eps: "float" = 1e-05,
-    ) -> "torch.Tensor":
-        conv = torch.empty((2, 64, 62, 62), dtype=x.dtype, device=x.device)
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        conv_weight: torch.Tensor,
+        conv_bias: torch.Tensor = None,
+        conv_stride: int = 1,
+        conv_padding: int = 0,
+        conv_dilation: int = 1,
+        conv_groups: int = 1,
+        ln_eps: float = 1e-5,
+    ) -> torch.Tensor:
+        del weight, conv_stride, conv_padding, conv_dilation, conv_groups
+
+        convolution = torch.empty((2, 64, 62, 62), device=x.device, dtype=x.dtype)
         if conv_bias is None:
-            conv_without_bias(
-                x,
-                conv_weight,
-                conv,
-                conv_stride,
-                conv_padding,
-                conv_dilation,
-                conv_groups,
-            )
+            conv_no_bias(x, conv_weight, convolution)
         else:
-            conv_with_bias(
-                x,
-                conv_weight,
-                conv_bias,
-                conv,
-                conv_stride,
-                conv_padding,
-                conv_dilation,
-                conv_groups,
-            )
-        mean = torch.empty((2,), dtype=x.dtype, device=x.device)
-        variance = torch.empty((2,), dtype=x.dtype, device=x.device)
-        stats(conv, mean, variance)
-        out = torch.empty((2, 64, 62, 62), dtype=x.dtype, device=x.device)
-        normalize_silu(conv, mean, variance, out, ln_eps)
-        return out
+            conv(x, conv_weight, conv_bias, convolution)
+
+        partial_sum = torch.empty((2, 8), device=x.device, dtype=x.dtype)
+        partial_square_sum = torch.empty((2, 8), device=x.device, dtype=x.dtype)
+        partial_stats(convolution, partial_sum, partial_square_sum)
+
+        mean = torch.empty((2,), device=x.device, dtype=x.dtype)
+        variance = torch.empty((2,), device=x.device, dtype=x.dtype)
+        finalize_stats(partial_sum, partial_square_sum, mean, variance)
+
+        output = torch.empty((2, 64, 62, 62), device=x.device, dtype=x.dtype)
+        normalized_silu(convolution, mean, variance, output, ln_eps)
+        return output
 
     return fused_silu_layer_norm_conv2d
