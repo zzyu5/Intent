@@ -88,6 +88,28 @@ bool collectStateRegions(BufferOp buffer, StoreOp initial,
   return true;
 }
 
+bool hasNestedScalarIndexedReads(BufferOp buffer) {
+  bool nestedScalarRead = false;
+  for (Operation *user : buffer.getResult().getUsers()) {
+    auto loop = user->getParentOfType<scf::ForOp>();
+    if (!loop)
+      continue;
+    Value coordinate;
+    if (auto load = dyn_cast<LoadOp>(user)) {
+      if (isa<FragmentType>(load.getType()))
+        return false;
+      coordinate = load.getCoordinates().front();
+      if (loop->getParentOfType<scf::ForOp>() &&
+          !coordinate.getDefiningOp<arith::ConstantOp>())
+        nestedScalarRead = true;
+    } else if (auto store = dyn_cast<StoreOp>(user)) {
+      if (isa<FragmentType>(store.getValue().getType()))
+        return false;
+    }
+  }
+  return nestedScalarRead;
+}
+
 class BufferStatePromotion {
 public:
   BufferStatePromotion(BufferOp buffer, StoreOp initial,
@@ -293,6 +315,11 @@ LogicalResult promoteBufferValues(ModuleOp module) {
     StoreOp initial = fullInitialization(buffer, *kernel);
     llvm::DenseSet<Operation *> writtenRegions;
     if (initial && collectStateRegions(buffer, initial, writtenRegions)) {
+      // A scalar recurrence repeatedly indexing its state has no vector reuse.
+      // Promoting it would carry and dynamically extract a complete tile through
+      // every inner iteration. Keep the existing buffer accesses in that case.
+      if (*extent > 1 && hasNestedScalarIndexedReads(buffer))
+        continue;
       for (Operation *user : buffer.getResult().getUsers())
         if (isa<StoreOp>(user))
           if (auto origin = user->getAttrOfType<IntegerAttr>(originAttr))
