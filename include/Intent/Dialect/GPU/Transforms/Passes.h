@@ -140,6 +140,7 @@ mlir::LogicalResult realizeAccessComposition(mlir::ModuleOp module);
 mlir::LogicalResult simplifyMaskedAccessCoordinates(mlir::ModuleOp module);
 mlir::LogicalResult predicateScalarControl(mlir::ModuleOp module);
 bool canPredicateScalarBlock(mlir::Block &block);
+bool canPredicateScalarWhile(mlir::scf::WhileOp loop);
 bool canPredicateValueOperation(mlir::Operation *operation);
 void clonePredicatedScalarOperation(mlir::OpBuilder &builder,
                                    mlir::Operation *operation,

@@ -69,6 +69,11 @@ bool canPredicate(Block &block, bool allowStores = false,
         return false;
       continue;
     }
+    if (auto loop = dyn_cast<scf::WhileOp>(operation)) {
+      if (!allowLoops || !canPredicateScalarWhile(loop))
+        return false;
+      continue;
+    }
     if (auto store = dyn_cast<StoreOp>(operation)) {
       if (!allowStores || !isScalar(store.getValue().getType()) ||
           !llvm::all_of(store.getCoordinates(), [&](Value coordinate) {
@@ -260,6 +265,28 @@ bool canPredicateScalarBlock(Block &block) {
   return canPredicate(block, /*allowStores=*/true);
 }
 
+bool canPredicateScalarWhile(scf::WhileOp loop) {
+  if (!loop.getNumResults() || !llvm::hasSingleElement(loop.getBefore()) ||
+      !llvm::hasSingleElement(loop.getAfter()) ||
+      !llvm::all_of(loop.getResultTypes(), isScalar))
+    return false;
+  Block &before = loop.getBefore().front();
+  Block &after = loop.getAfter().front();
+  auto condition = dyn_cast<scf::ConditionOp>(before.getTerminator());
+  if (!condition || before.getArgumentTypes() != loop.getResultTypes() ||
+      after.getArgumentTypes() != loop.getResultTypes() ||
+      !llvm::equal(condition.getArgs(), before.getArguments()))
+    return false;
+  // Only pure per-element recurrences are coarsened here. Cross-lane effects,
+  // nested regions and changes to the state in the condition need other proofs.
+  return llvm::all_of(ArrayRef<Block *>{&before, &after}, [&](Block *block) {
+    return canPredicate(*block) &&
+           llvm::all_of(block->without_terminator(), [](Operation &operation) {
+             return isMemoryEffectFree(&operation);
+           });
+  });
+}
+
 void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
                                    IRMapping &mapping, Value predicate,
                                    FragmentType shape,
@@ -365,6 +392,74 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
             carried));
       builder.create<scf::YieldOp>(location, yielded);
     }
+    clone = result;
+  } else if (auto loop = dyn_cast<scf::WhileOp>(operation)) {
+    SmallVector<Value> initial = coordinates(loop.getInits());
+    for (Value &value : initial)
+      value = lift(value);
+    if (shape)
+      initial.push_back(lift(predicate));
+    SmallVector<Type> types;
+    for (Value value : initial)
+      types.push_back(value.getType());
+    auto result = builder.create<scf::WhileOp>(location, types, initial);
+    result->setAttrs(loop->getAttrs());
+    OpBuilder::InsertionGuard guard(builder);
+    Block *before = builder.createBlock(
+        &result.getBefore(), {}, types, SmallVector<Location>(types.size(), location));
+    IRMapping beforeMapping(mapping);
+    beforeMapping.map(loop.getBeforeArguments(),
+                      before->getArguments().take_front(loop.getNumResults()));
+    Value active = shape ? Value(before->getArguments().back()) : predicate;
+    for (Operation &nested : loop.getBefore().front().without_terminator())
+      clonePredicatedScalarOperation(builder, &nested, beforeMapping, active, shape);
+    auto condition = cast<scf::ConditionOp>(loop.getBefore().front().getTerminator());
+    Value nextActive = builder.create<BinaryOp>(
+        location, active.getType(), active,
+        project(beforeMapping.lookupOrDefault(condition.getCondition()), active.getType()),
+        BinaryOperator::LogicalAnd);
+    Value anyActive = nextActive;
+    if (shape) {
+      Value identity = builder.create<arith::ConstantOp>(location, builder.getBoolAttr(false));
+      SmallVector<int64_t> axes;
+      for (unsigned axis = 0; axis < shape.getShape().size(); ++axis)
+        axes.push_back(axis);
+      auto any = builder.create<ReduceOp>(
+          location, TypeRange{builder.getI1Type()}, ValueRange{nextActive, identity},
+          axes, 1, 1, 0);
+      {
+        OpBuilder::InsertionGuard combineGuard(builder);
+        Block *combine = builder.createBlock(
+            &any.getCombine(), {}, {builder.getI1Type(), builder.getI1Type()},
+            {location, location});
+        Value joined = builder.create<BinaryOp>(
+            location, builder.getI1Type(), combine->getArgument(0),
+            combine->getArgument(1), BinaryOperator::LogicalOr);
+        builder.create<YieldOp>(location, joined);
+      }
+      anyActive = any.getResult(0);
+    }
+    SmallVector<Value> forwarded(before->getArguments().take_front(loop.getNumResults()));
+    if (shape)
+      forwarded.push_back(nextActive);
+    builder.create<scf::ConditionOp>(location, anyActive, forwarded);
+    Block *after = builder.createBlock(
+        &result.getAfter(), {}, types, SmallVector<Location>(types.size(), location));
+    IRMapping afterMapping(mapping);
+    afterMapping.map(loop.getAfterArguments(),
+                     after->getArguments().take_front(loop.getNumResults()));
+    active = shape ? Value(after->getArguments().back()) : predicate;
+    for (Operation &nested : loop.getAfter().front().without_terminator())
+      clonePredicatedScalarOperation(builder, &nested, afterMapping, active, shape);
+    SmallVector<Value> yielded;
+    for (auto [value, carried] :
+         llvm::zip(loop.getAfter().front().getTerminator()->getOperands(),
+                   after->getArguments().take_front(loop.getNumResults())))
+      yielded.push_back(selectScalarProduct(
+          builder, location, active, lift(afterMapping.lookupOrDefault(value)), carried));
+    if (shape)
+      yielded.push_back(active);
+    builder.create<scf::YieldOp>(location, yielded);
     clone = result;
   } else if (auto branch = dyn_cast<scf::IfOp>(operation)) {
     // An iteration-invariant condition remains scalar after remapping. Keep

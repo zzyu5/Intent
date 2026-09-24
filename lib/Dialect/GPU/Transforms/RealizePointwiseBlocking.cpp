@@ -3058,7 +3058,26 @@ bool analyzeStructuredRegionFold(
 FailureOr<bool> propagateOrderedCarryDependency(
     Value value, Operation *user, llvm::function_ref<void(Value)> enqueue,
     llvm::SmallPtrSetImpl<Operation *> &loops) {
+  auto propagateWhile = [&](scf::WhileOp loop) -> FailureOr<bool> {
+    if (!canPredicateScalarWhile(loop))
+      return failure();
+    loops.insert(loop);
+    // A varying trip count makes even an initially uniform recurrence vary.
+    for (Value argument : loop.getBeforeArguments())
+      enqueue(argument);
+    for (Value argument : loop.getAfterArguments())
+      enqueue(argument);
+    for (Value result : loop.getResults())
+      enqueue(result);
+    return true;
+  };
+  if (auto loop = dyn_cast<scf::WhileOp>(user))
+    return propagateWhile(loop);
+  if (auto condition = dyn_cast<scf::ConditionOp>(user))
+    return propagateWhile(cast<scf::WhileOp>(condition->getParentOp()));
   if (auto yield = dyn_cast<scf::YieldOp>(user)) {
+    if (auto loop = dyn_cast<scf::WhileOp>(yield->getParentOp()))
+      return propagateWhile(loop);
     auto loop = dyn_cast<scf::ForOp>(yield->getParentOp());
     if (!loop)
       return failure();
@@ -3090,9 +3109,12 @@ bool hasReadOnlyOrderedBodies(const llvm::SmallPtrSetImpl<Operation *> &loops) {
     WalkResult effects = loop->walk([&](Operation *operation) {
       if (isa<scf::ForOp, ReduceOp>(operation))
         return WalkResult::advance();
+      if (auto whileLoop = dyn_cast<scf::WhileOp>(operation))
+        return canPredicateScalarWhile(whileLoop) ? WalkResult::advance()
+                                                 : WalkResult::interrupt();
       if (operation->getNumRegions() != 0)
         return WalkResult::interrupt();
-      return isa<scf::YieldOp, LoadOp>(operation) ||
+      return isa<scf::YieldOp, scf::ConditionOp, LoadOp>(operation) ||
                      isMemoryEffectFree(operation)
                  ? WalkResult::advance()
                  : WalkResult::interrupt();
@@ -3352,7 +3374,9 @@ SmallVector<WorksetCoordinateOp> orthogonalContractCoordinates(
 }
 
 LogicalResult rankLiftPointwiseValueGraph(
-    func::FuncOp kernel, ArrayRef<MakeRangeOp> liftedRanges) {
+    func::FuncOp kernel, ArrayRef<MakeRangeOp> liftedRanges,
+    llvm::SmallPtrSetImpl<Operation *> &laneReductions,
+    llvm::DenseMap<Value, SmallVector<BroadcastOp>> &laneBounds) {
   if (liftedRanges.empty())
     return success();
 
@@ -3476,8 +3500,61 @@ LogicalResult rankLiftPointwiseValueGraph(
   };
   std::function<WalkResult(Operation *)> liftOperation;
   liftOperation = [&](Operation *operation) {
-    if (isa<MakeRangeOp>(operation))
+    if (isa<MakeRangeOp>(operation) || liftedOperations.contains(operation) ||
+        operation->getParentOfType<scf::WhileOp>())
       return WalkResult::advance();
+    if (auto loop = dyn_cast<scf::WhileOp>(operation)) {
+      bool dependent = false;
+      loop->walk([&](Operation *nested) {
+        dependent |= llvm::any_of(nested->getOperands(), dependsOnLiftedAxis);
+      });
+      if (!dependent)
+        return WalkResult::advance();
+      if (!canPredicateScalarWhile(loop)) {
+        loop.emitOpError("cannot predicate the lifted ordered recurrence");
+        return WalkResult::interrupt();
+      }
+      OpBuilder builder(loop);
+      Location location = loop.getLoc();
+      auto shape = scalarLiftedType(builder.getI1Type());
+      Value active;
+      for (MakeRangeOp range : liftedRanges) {
+        auto indexType = scalarLiftedType(builder.getIndexType());
+        auto project = [&](Value value, Type type) -> Value {
+          return builder.create<BroadcastOp>(location, type, value);
+        };
+        Value coordinate = project(range.getResult(), indexType);
+        Value lower = builder.create<CompareOp>(
+            location, shape, coordinate, project(range.getLogicalStart(), indexType),
+            ComparePredicate::Ge);
+        auto stop = builder.create<BroadcastOp>(location, indexType, range.getLogicalStop());
+        laneBounds[range.getResult()].push_back(stop);
+        Value upper = builder.create<CompareOp>(
+            location, shape, coordinate, stop, ComparePredicate::Lt);
+        Value bounded = builder.create<BinaryOp>(
+            location, shape, lower, upper, BinaryOperator::LogicalAnd);
+        active = active ? Value(builder.create<BinaryOp>(
+                              location, shape, active, bounded, BinaryOperator::LogicalAnd))
+                        : bounded;
+      }
+      IRMapping mapping;
+      clonePredicatedScalarOperation(builder, loop, mapping, active, shape);
+      Operation *replacement = mapping.lookup(loop.getResult(0)).getDefiningOp();
+      // The cloned any reduction consumes the new lanes; they are not free
+      // reduction axes to be lifted again in the next fixed-point iteration.
+      replacement->walk([&](Operation *nested) {
+        liftedOperations.insert(nested);
+        if (isa<ReduceOp>(nested))
+          laneReductions.insert(nested);
+        for (Value result : nested->getResults())
+          if (carriesLiftedAxis(result.getType()))
+            liftedValues.insert(result);
+      });
+      for (Value result : loop.getResults())
+        result.replaceAllUsesWith(mapping.lookup(result));
+      loop.erase();
+      return WalkResult::advance();
+    }
     bool dependsOnLiftedRange =
         llvm::any_of(operation->getOperands(), [&](Value operand) {
           return dependsOnLiftedAxis(operand);
@@ -3963,6 +4040,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   if (failed(physicalKernel))
     return failure();
   func::FuncOp kernel = *physicalKernel;
+  llvm::SmallPtrSet<Operation *, 4> laneReductions;
+  llvm::DenseMap<Value, SmallVector<BroadcastOp>> laneBounds;
   if (ownershipOnly && failed(separateReductionOutputOccurrences(kernel)))
     return failure();
   auto finalizeValueRelations = [&]() -> LogicalResult {
@@ -4134,7 +4213,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           });
       liftedRanges.push_back(range);
       if (liftSeparately) {
-        if (failed(rankLiftPointwiseValueGraph(kernel, {range})))
+        if (failed(rankLiftPointwiseValueGraph(kernel, {range}, laneReductions,
+                                               laneBounds)))
           return kernel.emitError(
               "failed to rank-lift an independent contraction axis");
         liftedRanges.clear();
@@ -4145,7 +4225,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     // rather than an outer independent axis, occupies that matrix dimension.
     if (preserveContractionOrder)
       std::reverse(liftedRanges.begin(), liftedRanges.end());
-    if (failed(rankLiftPointwiseValueGraph(kernel, liftedRanges)))
+    if (failed(rankLiftPointwiseValueGraph(kernel, liftedRanges, laneReductions,
+                                           laneBounds)))
       return kernel.emitError(
           "failed to rank-lift a legal pointwise ownership graph");
   }
@@ -4301,6 +4382,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     }
   };
   kernel.walk([&](ReduceOp reduce) {
+    // A newly formed loop guard reduces the physical ownership tile, not an
+    // author traversal. Its cardinality follows the tile selected by this pass.
+    if (laneReductions.contains(reduce))
+      return;
     for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
       auto fragment = dyn_cast<FragmentType>(source.getType());
       if (!fragment)
@@ -4332,6 +4417,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         "dynamic scan axis has no launch-visible full-coverage realization");
   SmallVector<std::pair<Value, uint64_t>> structuredReductionSources;
   kernel.walk([&](ReduceOp reduce) {
+    if (laneReductions.contains(reduce))
+      return;
     for (Value source :
          reduce.getInputs().take_front(reduce.getSourceCount())) {
       auto fragment = dyn_cast<FragmentType>(source.getType());
@@ -7009,6 +7096,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         range->hasAttr(worksetCoordinateRangeAttr) ? end : range.getLogicalStop(),
         range.getSourceId(), range.getSourceAxis(), range.getDerived());
     inheritRangeAuthority(blocked.getDefiningOp(), range);
+    for (BroadcastOp bound : laneBounds.lookup(range.getResult()))
+      bound.getValueMutable().assign(end);
     Value endFragment = builder.create<BroadcastOp>(range.getLoc(), blockedType, end);
     auto validComparison = builder.create<CompareOp>(
         range.getLoc(), predicateType(blockedType), blocked, endFragment,

@@ -3591,6 +3591,17 @@ static void retargetExtent(Value root, AxisSelector selects,
             worklist.push_back(loop.getInitArgs()[index]);
             worklist.push_back(loop.getResult(index));
           }
+      if (auto whileLoop = dyn_cast<scf::WhileOp>(argument.getOwner()->getParentOp())) {
+        unsigned index = argument.getArgNumber();
+        if (argument.getOwner() == &whileLoop.getBefore().front()) {
+          worklist.push_back(whileLoop.getInits()[index]);
+          worklist.push_back(whileLoop.getAfter().front().getTerminator()->getOperand(index));
+        } else {
+          auto condition = cast<scf::ConditionOp>(whileLoop.getBefore().front().getTerminator());
+          worklist.push_back(condition.getArgs()[index]);
+          worklist.push_back(whileLoop.getResult(index));
+        }
+      }
     }
     if (auto loop = value.getDefiningOp<scf::ForOp>())
       for (auto [index, result] : llvm::enumerate(loop.getResults()))
@@ -3599,6 +3610,12 @@ static void retargetExtent(Value root, AxisSelector selects,
           worklist.push_back(loop.getRegionIterArgs()[index]);
           worklist.push_back(loop.getBody()->getTerminator()->getOperand(index));
         }
+    if (auto loop = value.getDefiningOp<scf::WhileOp>()) {
+      unsigned index = cast<OpResult>(value).getResultNumber();
+      auto condition = cast<scf::ConditionOp>(loop.getBefore().front().getTerminator());
+      worklist.push_back(condition.getArgs()[index]);
+      worklist.push_back(loop.getAfterArguments()[index]);
+    }
     if (auto branch = value.getDefiningOp<scf::IfOp>())
       for (auto [index, result] : llvm::enumerate(branch.getResults())) {
         if (value != result)
@@ -3717,7 +3734,25 @@ static void retargetExtent(Value root, AxisSelector selects,
             worklist.push_back(loop.getRegionIterArgs()[index]);
             worklist.push_back(loop.getResult(index));
           }
+      if (auto loop = dyn_cast<scf::WhileOp>(user))
+        for (auto [index, init] : llvm::enumerate(loop.getInits()))
+          if (value == init)
+            worklist.push_back(loop.getBeforeArguments()[index]);
+      if (auto condition = dyn_cast<scf::ConditionOp>(user)) {
+        auto loop = cast<scf::WhileOp>(condition->getParentOp());
+        for (auto [index, argument] : llvm::enumerate(condition.getArgs()))
+          if (value == argument) {
+            worklist.push_back(loop.getAfterArguments()[index]);
+            worklist.push_back(loop.getResult(index));
+          }
+      }
       if (auto yield = dyn_cast<scf::YieldOp>(user)) {
+        if (auto loop = dyn_cast<scf::WhileOp>(yield->getParentOp()))
+          for (auto [index, yielded] : llvm::enumerate(yield.getOperands()))
+            if (value == yielded) {
+              worklist.push_back(loop.getInits()[index]);
+              worklist.push_back(loop.getBeforeArguments()[index]);
+            }
         if (auto loop = dyn_cast_or_null<scf::ForOp>(yield->getParentOp()))
           for (auto [index, yielded] : llvm::enumerate(yield.getOperands()))
             if (value == yielded) {
