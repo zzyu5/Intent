@@ -3135,7 +3135,9 @@ FailureOr<bool> propagateOrderedCarryDependency(
   return false;
 }
 
-bool hasReadOnlyOrderedBodies(const llvm::SmallPtrSetImpl<Operation *> &loops) {
+bool hasSupportedOrderedBodies(
+    const llvm::SmallPtrSetImpl<Operation *> &loops,
+    llvm::function_ref<bool(Value)> ownsCoordinate) {
   for (Operation *loop : loops) {
     WalkResult effects = loop->walk([&](Operation *operation) {
       if (isa<scf::ForOp, ReduceOp>(operation))
@@ -3145,6 +3147,15 @@ bool hasReadOnlyOrderedBodies(const llvm::SmallPtrSetImpl<Operation *> &loops) {
                                                  : WalkResult::interrupt();
       if (operation->getNumRegions() != 0)
         return WalkResult::interrupt();
+      if (auto store = dyn_cast<StoreOp>(operation)) {
+        if (llvm::none_of(store.getCoordinates(), ownsCoordinate))
+          return WalkResult::interrupt();
+        if (auto buffer = dyn_cast<BufferType>(store.getResource().getType());
+            buffer && buffer.getScope().getValue() !=
+                          BufferScope::InvocationWorkspace)
+          return WalkResult::interrupt();
+        return WalkResult::advance();
+      }
       return isa<scf::YieldOp, scf::ConditionOp, LoadOp>(operation) ||
                      isMemoryEffectFree(operation)
                  ? WalkResult::advance()
@@ -3208,7 +3219,9 @@ bool supportsCartesianPointwiseValueGraph(
       }
     }
   }
-  return hasReadOnlyOrderedBodies(loops);
+  return hasSupportedOrderedBodies(loops, [&](Value value) {
+    return dependent.contains(value);
+  });
 }
 
 /// A structured free workset axis is still lane-wise: it may flow through
@@ -3217,9 +3230,9 @@ bool supportsCartesianPointwiseValueGraph(
 /// needed to group independent rows/columns while keeping invariant matrix
 /// operands shared by the group.  A region fold may carry the axis through
 /// immutable captures and summaries, but its source traversal remains
-/// independent. Read-only ordered loops may carry the free axis without
-/// changing their scalar bounds. Paired/batched dependence and non-store
-/// effects remain excluded.
+/// independent. Ordered loops may carry the free axis and its owned stores
+/// without changing scalar bounds. Paired/batched dependence, local allocation
+/// replication and non-store effects remain excluded.
 bool supportsStructuredFreeAxisValueGraph(
     ArrayRef<WorksetCoordinateOp> coordinates,
     llvm::SmallPtrSetImpl<Operation *> *ownedStores = nullptr,
@@ -3353,7 +3366,7 @@ bool supportsStructuredFreeAxisValueGraph(
   if (containsContraction)
     *containsContraction = sawContract;
   return (sawContract || sawReduction) && sawOwnedStore &&
-         hasReadOnlyOrderedBodies(loops);
+         hasSupportedOrderedBodies(loops, depends);
 }
 
 SmallVector<WorksetCoordinateOp> orthogonalContractCoordinates(

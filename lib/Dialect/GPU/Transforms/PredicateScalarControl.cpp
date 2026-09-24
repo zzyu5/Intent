@@ -695,9 +695,15 @@ LogicalResult predicateScalarControl(ModuleOp module) {
       continue;
     }
     if (conditional.getElseRegion().empty() ||
-        !llvm::all_of(conditional.getResultTypes(), isPredicatableProduct) ||
-        !canPredicate(conditional.getThenRegion().front(), false, true, true) ||
-        !canPredicate(conditional.getElseRegion().front(), false, true, true))
+        !llvm::all_of(conditional.getResultTypes(), isPredicatableProduct))
+      continue;
+    bool scalarEffects =
+        llvm::all_of(conditional.getResultTypes(), isScalar) &&
+        canPredicate(conditional.getThenRegion().front(), true, false, false, true) &&
+        canPredicate(conditional.getElseRegion().front(), true, false, false, true);
+    if (!scalarEffects &&
+        (!canPredicate(conditional.getThenRegion().front(), false, true, true) ||
+         !canPredicate(conditional.getElseRegion().front(), false, true, true)))
       continue;
     bool hasFragment = false;
     for (Type type : conditional.getResultTypes())
@@ -707,6 +713,10 @@ LogicalResult predicateScalarControl(ModuleOp module) {
     if (isLaunchUniformScalar(conditional.getCondition(), *kernel) ||
         (hasFragment && !dependsOnWorksetCoordinate(conditional.getCondition())))
       continue;
+    if (scalarEffects) {
+      dischargeScalarAssumptions(conditional.getThenRegion().front());
+      dischargeScalarAssumptions(conditional.getElseRegion().front());
+    }
     OpBuilder builder(conditional);
     Value otherwise = builder.create<UnaryOp>(
         conditional.getLoc(), builder.getI1Type(), conditional.getCondition(),
