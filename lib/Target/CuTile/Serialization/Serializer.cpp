@@ -368,7 +368,7 @@ private:
               "from cuda.tile.tune import exhaustive_search\n"
               "from intent.runtime.artifact import ParameterRole, TuningConfiguration, TuningParameter\n"
               "from intent.runtime.cutile import array_index_kernels, bind_array_view, can_use_i32_array_indices\n"
-              "from intent.runtime.tuning import TuningState, prune_padded_ownership\n\n"
+              "from intent.runtime.tuning import TuningState\n\n"
               "ConstInt = ct.Constant[int]\n\n"
               "@ct.function(host=True)\n"
               "def _intent_next_power_of_2(value):\n"
@@ -625,12 +625,9 @@ private:
       line("if not " + candidates.str() + ":", level);
       line("raise ValueError(\"no cuTile configuration satisfies the physical resource bounds\")",
            level + 1);
+    } else {
+      line(candidates.str() + " = _CONFIGS", level);
     }
-    std::string arguments = joinLaunchArguments();
-    line(candidates.str() + " = prune_padded_ownership(" +
-             (condition.empty() ? "_CONFIGS" : candidates.str()) +
-             ", _TUNING_PARAMETERS, (" + arguments +
-             (arguments.empty() ? "" : ",") + "))", level);
   }
 
   void emitLaunch() {
