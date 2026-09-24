@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ast
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import contextmanager
+import linecache
+import multiprocessing
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,6 +26,35 @@ from experiments._common.loading import load_module
 from experiments._common.measurement import CUTILE_TUNING_LAUNCH_TIMEOUT_SECONDS
 
 
+def _initialize_cutile_compiler(sources):
+    global _cutile_compile_namespaces
+    _cutile_compile_namespaces = {}
+    for module_name, filename, source in sources:
+        linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
+        namespace = {"__name__": module_name}
+        exec(compile(source, filename, "exec", dont_inherit=True), namespace)
+        _cutile_compile_namespaces[module_name] = namespace
+
+
+def _compile_cutile_configuration(module_name, function_name, parameters, static_arrays,
+                                  symbol, options, architecture, timeout):
+    import cuda.tile as ct
+    from cuda.tile._compile import compile_tile
+    from cuda.tile.compilation import CallingConvention, KernelSignature
+
+    kernel = _cutile_compile_namespaces[module_name][function_name]
+    convention = (CallingConvention.cutile_python_v2() if static_arrays
+                  else CallingConvention.cutile_python_v1())
+    signature = KernelSignature(parameters, convention, symbol)
+    try:
+        with ct.compiler_timeout(timeout):
+            compiled = compile_tile(kernel._annotated_function, (signature,),
+                                    architecture, options)
+    except ct.TileError as error:
+        return None, f"{type(error).__name__}: {error}"
+    return (compiled.cubin, compiled.kernel_signatures[0].symbol, None, []), None
+
+
 class ProgramContext:
     def __init__(self, compiler: Path, directory: Path, *, language: str,
                  target: str = "triton", tuning_config: Path | None = None):
@@ -37,6 +68,7 @@ class ProgramContext:
         self.tuning: list[dict] = []
         self.precompile_failures: list[dict] = []
         self.native_compile_reuses = 0
+        self._native_compilations = []
 
     def compile(self, name: str, definition, *, constexprs=None):
         if self.language != "intent":
@@ -89,7 +121,8 @@ class ProgramContext:
         from cuda.tile._compile import get_sm_arch
 
         original_compile = ct.kernel._compile
-        compiled = []
+        compiled = self._native_compilations
+        compiled.clear()
 
         def compile_kernel(kernel, signature, context):
             # Native signatures contain unhashable constraints. Value equality
@@ -119,10 +152,11 @@ class ProgramContext:
     @contextmanager
     def compilation_only(self):
         import cuda.tile as ct
+        from cuda.tile._compile import get_sm_arch
         from cuda.tile.compilation import CallingConvention, KernelSignature
         from cuda.tile._cext import default_tile_context
 
-        def compile_kernel(stream, grid, kernel, arguments):
+        def signature_for(kernel, arguments):
             # Generated kernels have the view/scalar ABI. Match cuTile's JIT
             # convention for static array dimensions, including rank-zero views.
             static_arrays = any(annotation.array is not None and annotation.array.static_shape_dims
@@ -130,16 +164,32 @@ class ProgramContext:
             convention = (CallingConvention.cutile_python_v2() if static_arrays
                           else CallingConvention.cutile_python_v1())
             signature = KernelSignature.from_kernel_args(kernel, arguments, convention)
+            return signature, static_arrays
+
+        def compile_kernel(stream, grid, kernel, arguments):
+            signature, _ = signature_for(kernel, arguments)
             kernel._compile(signature, default_tile_context)
 
         def compile_search(configs, stream, grid_fn, kernel, args_fn, hints_fn=None, **kwargs):
             first = None
             last_error = None
+            pending = []
+            architecture = get_sm_arch()
             for config in configs:
                 candidate = kernel.replace_hints(**(hints_fn(config) if hints_fn else {}))
-                try:
-                    compile_kernel(stream, grid_fn(config), candidate, args_fn(config))
-                except ct.TileError as error:
+                signature, static_arrays = signature_for(candidate, args_fn(config))
+                pending.append((config, candidate, signature, executor.submit(
+                    _compile_cutile_configuration, candidate._pyfunc.__module__,
+                    candidate._pyfunc.__name__, signature.parameters, static_arrays,
+                    signature.symbol, candidate._compiler_options, architecture,
+                    default_tile_context.config.compiler_timeout_sec)))
+            for config, candidate, signature, future in pending:
+                result, diagnostic = future.result()
+                error = ct.TileError(diagnostic) if diagnostic is not None else None
+                key = (candidate._pyfunc, candidate._compiler_options,
+                       signature.with_symbol(None), architecture, default_tile_context)
+                self._native_compilations.append((key, result, error))
+                if error is not None:
                     last_error = error
                     self.precompile_failures.append({"kernel": kernel._pyfunc.__name__,
                                                      "config": str(config), "error": str(error)})
@@ -161,14 +211,24 @@ class ProgramContext:
 
         original_launch = ct.launch
         saved = []
+        sources = []
         for artifact in self.generated.values():
             namespace = artifact._namespace
+            kernel = namespace["_intent_kernel"]
+            sources.append((kernel._pyfunc.__module__, kernel._pyfunc.__code__.co_filename,
+                            artifact.source))
             saved.append((namespace, namespace["TuningState"], namespace["exhaustive_search"]))
             namespace["TuningState"] = CompilationState
             namespace["exhaustive_search"] = compile_search
         ct.launch = compile_kernel
         try:
-            yield
+            # Each process owns the SDK's compiler lock. Only native compilation
+            # runs here; device execution and numerical comparison stay in the parent.
+            with ProcessPoolExecutor(max_workers=4,
+                                     mp_context=multiprocessing.get_context("spawn"),
+                                     initializer=_initialize_cutile_compiler,
+                                     initargs=(sources,)) as executor:
+                yield
         finally:
             ct.launch = original_launch
             for namespace, state, search in saved:
