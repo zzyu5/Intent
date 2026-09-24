@@ -116,6 +116,7 @@ def generate_trial(arguments, row, language) -> dict:
             "the organization; the compiler chooses physical mapping within the declared kernels. "
             "Use @intent.kernel and context.compile(); do not import or call Triton.\n"
         )
+    prompt += "\nComplete task and fixed invocation (identical to TASK.md):\n\n" + task_text + "\n"
     agent = execute(directory, arguments.suite, prompt,
                     executable=arguments.codex, state_root=arguments.state_root, language=language, stop=arguments.stop)
     destination = arguments.output / row["task"] / language
