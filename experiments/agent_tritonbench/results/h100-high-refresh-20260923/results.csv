@@ -32,7 +32,7 @@ conv2d,2,0.0342560001,,0.0197040001,0.0434559993,reference_pass,agent_program_er
 symmetric_mm_and_abs_sum,6,0.0877440013,0.0580960009,0.07998400181531906,0.18028799444437027,reference_pass,pass,pass,pass,cuda_graph,Independent Luna high submission after public organization guidance; original candidate.py retained,,,,symmetric_mm_and_abs_sum/intent/performance.py
 fused_mv_sigmoid_sub,4,0.0111839999,0.00864000013,0.00755200023,0.00740800006,reference_pass,pass,pass,pass,cuda_graph,,,,,fused_mv_sigmoid_sub/intent/candidate.py
 solve,4,0.522767991,10.2776084,2.4362239837646484,2.167304039001465,reference_pass,pass,pass,pass,cuda_event,"Intent cuTile uses fixed reduction=256, access_form=3, occupancy=1, native compiler budget=60s.",,,,solve/intent/candidate.py
-fused_cholesky_solve,6,1.18564802,,3.4053601,5.23769617,reference_pass,agent_program_error,pass,pass,cuda_event,,candidate_precompile: at 21:14:,,,fused_cholesky_solve/intent/candidate.py
+fused_cholesky_solve,6,1.18564802,,3.37773597240448,5.23769617,reference_pass,agent_program_error,pass,pass,cuda_event,,candidate_precompile: at 21:14:,,,fused_cholesky_solve/intent/candidate.py
 fused_qr_solve,4,1.52596802,15.3106403,4.241024017333984,5.004112005233765,reference_pass,pass,pass,pass,cuda_event,Independent Luna high submission after public organization guidance; original candidate.py retained,,,,fused_qr_solve/intent/performance.py
 add_gelu,8,0.0128400004,0.00798399979,0.00763199991,0.01284,reference_pass,pass,pass,pass,cuda_graph,,,,,add_gelu/intent/candidate.py
 mul_relu,8,0.0115200002,0.00931200013,0.00944000017,0.00923199998,reference_pass,pass,pass,pass,cuda_graph,,,,,mul_relu/intent/candidate.py

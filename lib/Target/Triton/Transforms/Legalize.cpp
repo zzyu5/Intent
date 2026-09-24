@@ -4090,7 +4090,7 @@ void selectOrderedLoadUnrolling(func::FuncOp kernel) {
                    isa<FloatType>(
                        gpu::uniformElementType(binary.getResult().getType()));
     }
-    if (loads != 2 || !product)
+    if (loads == 0 || loads > 2 || !product)
       return;
     // Native unrolling preserves the accumulator chain and handles the tail;
     // independent reads from later iterations can overlap the current update.
