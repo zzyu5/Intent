@@ -4185,15 +4185,24 @@ void PhysicalProgramAnalysis::analyzeReplay(
   if (auto reduce = dyn_cast<ReduceOp>(operation))
     combine = &reduce.getCombine();
   else if (auto scan = dyn_cast<ScanOp>(operation)) {
-    auto fragment = cast<FragmentType>(value.getType());
-    auto axis = cast<AxisMapAttr>(fragment.getAxisMaps()[scan.getAxis()]);
     // A prefix depends on earlier members of this axis. Replaying each tile
     // independently would reset that state; only the other axes are pointwise.
-    if (source && sourceAxisIdentity(axis) == *source &&
-        (!sourceDimension || axis.getDimensionId() == *sourceDimension)) {
-      appendUnique(result.blockers, operation);
-      result.state = PhysicalFactState::Unknown;
-      return;
+    SmallVector<Type> schemas{value.getType()};
+    while (source && !schemas.empty()) {
+      Type schema = schemas.pop_back_val();
+      if (auto record = dyn_cast<RecordType>(schema)) {
+        for (Attribute field : record.getFieldTypes())
+          schemas.push_back(cast<TypeAttr>(field).getValue());
+        continue;
+      }
+      auto fragment = cast<FragmentType>(schema);
+      auto axis = cast<AxisMapAttr>(fragment.getAxisMaps()[scan.getAxis()]);
+      if (sourceAxisIdentity(axis) == *source &&
+          (!sourceDimension || axis.getDimensionId() == *sourceDimension)) {
+        appendUnique(result.blockers, operation);
+        result.state = PhysicalFactState::Unknown;
+        return;
+      }
     }
     combine = &scan.getCombine();
   }
