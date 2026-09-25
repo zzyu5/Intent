@@ -1155,7 +1155,7 @@ void collectProducerRanges(Value value, PhysicalSourceAxis source,
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel)
     return;
-  if (!queryFragmentAxis(value.getType(), source).isExact())
+  if (queryFragmentAxes(value.getType(), source).empty())
     return;
   PhysicalProgramAnalysis analysis(kernel);
   PhysicalRangeFact fact = analysis.sourceRanges(value, source);
@@ -1207,7 +1207,7 @@ Type replaceTraversalExtent(Type type, PhysicalSourceAxis source,
 }
 
 bool containsSource(Value value, PhysicalSourceAxis source) {
-  return queryFragmentAxis(value.getType(), source).isExact();
+  return !queryFragmentAxes(value.getType(), source).empty();
 }
 
 std::optional<int64_t> estimatedFragmentRegisters(func::FuncOp kernel, Value value) {
@@ -4533,6 +4533,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                                     histogramRanges.end());
   });
   llvm::SmallPtrSet<Operation *, 32> contractionTraversalRanges;
+  llvm::SmallPtrSet<Operation *, 8> contractionOwnedRanges;
   kernel.walk([&](ContractOp contract) {
     auto collectConsumedAxes = [&](Value operand, ArrayRef<int64_t> axes) {
       auto type = cast<FragmentType>(operand.getType());
@@ -4549,20 +4550,41 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     collectConsumedAxes(contract.getRhs(), contract.getRhsReductionAxes());
     collectAllAxesInto(contract.getLhs(), contractionTraversalRanges);
     collectAllAxesInto(contract.getRhs(), contractionTraversalRanges);
-    PhysicalContractFreeAxisFact freeAxes =
-        PhysicalProgramAnalysis(kernel).contractFreeAxes(contract);
-    bool directFreeCoordinates = freeAxes.isExact() &&
+    PhysicalProgramAnalysis analysis(kernel);
+    PhysicalContractFreeAxisFact freeAxes = analysis.contractFreeAxes(contract);
+    bool replayableFreeCoordinates = freeAxes.isExact() &&
         llvm::all_of(freeAxes.axes, [&](const auto &axis) {
-          auto load = axis.operand.template getDefiningOp<LoadOp>();
           FailureOr<AxisMapAttr> mapping =
               queryAxisMap(axis.operand.getType(), axis.operandAxis);
-          return load && succeeded(mapping) &&
-                 succeeded(queryCoordinatePosition(
-                     load.getCoordinates(), sourceAxisIdentity(*mapping)));
+          if (failed(mapping))
+            return false;
+          auto source = sourceAxisIdentity(*mapping);
+          auto replay = analysis.replayability(
+              axis.operand, source, PhysicalReplayScope::Coordinate,
+              /*allowAccesses=*/true, contract.getOperation(),
+              mapping->getDimensionId());
+          return replay.isReplayable() &&
+                 llvm::any_of(replay.accesses, [&](Operation *access) {
+                   auto load = dyn_cast<LoadOp>(access);
+                   return load && queryCoordinateIndex(
+                       load.getCoordinates(), source,
+                       mapping->getDimensionId()).isExact();
+                 });
         });
-    if (directFreeCoordinates) {
+    if (replayableFreeCoordinates) {
       llvm::SmallPtrSet<Operation *, 16> visited;
       collectStoreRanges(contract.getResult(), internalTraversalRanges, visited);
+      SmallVector<StoreOp> stores;
+      if (hasRangeContractForm(contract, &stores)) {
+        for (const auto &axis : freeAxes.axes)
+          for (MakeRangeOp range : axis.ranges.roots)
+            contractionOwnedRanges.insert(range.getOperation());
+        for (StoreOp store : stores) {
+          collectCoordinateRanges(store.getValue(), contractionOwnedRanges);
+          for (Value coordinate : store.getCoordinates())
+            collectCoordinateRanges(coordinate, contractionOwnedRanges);
+        }
+      }
     }
   });
   kernel.walk([&](ScaledContractOp contract) {
@@ -5344,7 +5366,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             nonUniqueContractionDimensions.insert(mapping->getDimensionId());
         }
   });
-  llvm::SmallPtrSet<Operation *, 8> contractionOwnedRanges;
   llvm::SmallPtrSet<Operation *, 8> retainedCartesianRanges;
   llvm::SmallPtrSet<Operation *, 8> independentContractionRanges;
   for (MakeRangeOp range : allRanges) {

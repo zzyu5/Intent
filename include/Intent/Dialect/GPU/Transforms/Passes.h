@@ -165,6 +165,8 @@ mlir::FailureOr<mlir::Value> materializeRetainedSlice(
 mlir::LogicalResult realizeRegionFolds(mlir::ModuleOp module);
 mlir::LogicalResult realizeRegionScans(mlir::ModuleOp module);
 mlir::LogicalResult realizeContractionBlocking(mlir::ModuleOp module);
+bool hasRangeContractForm(ContractOp contract,
+                         llvm::SmallVectorImpl<StoreOp> *stores = nullptr);
 mlir::LogicalResult normalizeMatrixContractShapes(mlir::func::FuncOp kernel);
 void foldExactConstantDivisions(mlir::func::FuncOp kernel);
 mlir::LogicalResult materializeProgramBuffers(mlir::ModuleOp module);

@@ -1772,52 +1772,6 @@ FailureOr<unsigned> directRankOneAccessPosition(ValueRange coordinates,
   return valueAxis;
 }
 
-bool hasRangeContractForm(ContractOp contract) {
-  auto lhsLoad = matrixOperandLoad(contract.getLhs());
-  auto rhsLoad = matrixOperandLoad(contract.getRhs());
-  if (!lhsLoad || !rhsLoad || contract.getLhsReductionAxes().size() != 1 ||
-      contract.getRhsReductionAxes().size() != 1 ||
-      !contract.getLhsBatchAxes().empty() ||
-      !contract.getRhsBatchAxes().empty())
-    return false;
-  FragmentType lhs = contract.getLhs().getType();
-  FragmentType rhs = contract.getRhs().getType();
-  FailureOr<unsigned> lhsFree = uniqueFreeAxis(
-      lhs, contract.getLhsReductionAxes(), contract.getLhsBatchAxes());
-  FailureOr<unsigned> rhsFree = uniqueFreeAxis(
-      rhs, contract.getRhsReductionAxes(), contract.getRhsBatchAxes());
-  if (failed(lhsFree) || failed(rhsFree))
-    return false;
-  SmallVector<std::tuple<LoadOp, AxisMapAttr, Value>> axes;
-  for (auto [load, operand, axis] :
-       {std::tuple<LoadOp, Value, unsigned>{lhsLoad, contract.getLhs(), *lhsFree},
-        std::tuple<LoadOp, Value, unsigned>{
-            lhsLoad, contract.getLhs(),
-            static_cast<unsigned>(contract.getLhsReductionAxes().front())},
-        std::tuple<LoadOp, Value, unsigned>{
-            rhsLoad, contract.getRhs(),
-            static_cast<unsigned>(contract.getRhsReductionAxes().front())},
-        std::tuple<LoadOp, Value, unsigned>{rhsLoad, contract.getRhs(), *rhsFree}}) {
-    FailureOr<AxisMapAttr> mapping = queryAxisMap(operand.getType(), axis);
-    if (failed(mapping))
-      return false;
-    axes.emplace_back(load, *mapping, operand);
-  }
-  for (auto [load, mapping, operand] : axes) {
-    FailureOr<unsigned> coordinate = accessCoordinatePosition(load, mapping, operand);
-    if (failed(coordinate))
-      return false;
-    Value value = load.getCoordinates()[*coordinate];
-    if (!sourceRange(value) &&
-        failed(producerRange(
-            value, sourceAxisIdentity(mapping))))
-      return false;
-  }
-  SmallVector<StorePath> paths;
-  llvm::SmallPtrSet<Operation *, 8> visited;
-  return collectStorePaths(contract.getResult(), {}, paths, visited);
-}
-
 bool freeAxesNeedRealization(ContractOp contract, func::FuncOp kernel) {
   return PhysicalProgramAnalysis(kernel)
       .contractFreeAxes(contract.getOperation())
@@ -4212,17 +4166,12 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
         }
       } else {
         Value originalValidity = path.store.getValid();
-        // A proven bounds-only mask is replaced by the newly constructed
-        // row/column mask. Replaying it by source identity would conflate two
-        // occurrences of that source in a Cartesian result (for example A.T A).
+        // The new row/column mask covers proven tails. Other predicates are
+        // replayed through each exact range occurrence below.
         if (originalValidity &&
             PhysicalProgramAnalysis(kernel).isTailPredicate(originalValidity, storeTailRanges))
           originalValidity = Value();
         if (originalValidity) {
-          if (isa<FragmentType>(originalValidity.getType()) &&
-              sourceAxisIdentity(*rowMap) == sourceAxisIdentity(*columnMap))
-            return path.store.emitOpError(
-                "contraction output mask needs distinct Cartesian occurrence authority");
           IRMapping replay;
           replay.map(rowRange.getResult(), rows);
           FailureOr<Value> replayed = replaySourceValue(
@@ -5438,6 +5387,58 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
 }
 
 } // namespace
+
+bool hasRangeContractForm(ContractOp contract,
+                         SmallVectorImpl<StoreOp> *stores) {
+  auto lhsLoad = matrixOperandLoad(contract.getLhs());
+  auto rhsLoad = matrixOperandLoad(contract.getRhs());
+  if (!lhsLoad || !rhsLoad || contract.getLhsReductionAxes().size() != 1 ||
+      contract.getRhsReductionAxes().size() != 1 ||
+      !contract.getLhsBatchAxes().empty() ||
+      !contract.getRhsBatchAxes().empty())
+    return false;
+  FragmentType lhs = contract.getLhs().getType();
+  FragmentType rhs = contract.getRhs().getType();
+  FailureOr<unsigned> lhsFree = uniqueFreeAxis(
+      lhs, contract.getLhsReductionAxes(), contract.getLhsBatchAxes());
+  FailureOr<unsigned> rhsFree = uniqueFreeAxis(
+      rhs, contract.getRhsReductionAxes(), contract.getRhsBatchAxes());
+  if (failed(lhsFree) || failed(rhsFree))
+    return false;
+  SmallVector<std::tuple<LoadOp, AxisMapAttr, Value>> axes;
+  for (auto [load, operand, axis] :
+       {std::tuple<LoadOp, Value, unsigned>{lhsLoad, contract.getLhs(), *lhsFree},
+        std::tuple<LoadOp, Value, unsigned>{
+            lhsLoad, contract.getLhs(),
+            static_cast<unsigned>(contract.getLhsReductionAxes().front())},
+        std::tuple<LoadOp, Value, unsigned>{
+            rhsLoad, contract.getRhs(),
+            static_cast<unsigned>(contract.getRhsReductionAxes().front())},
+        std::tuple<LoadOp, Value, unsigned>{rhsLoad, contract.getRhs(), *rhsFree}}) {
+    FailureOr<AxisMapAttr> mapping = queryAxisMap(operand.getType(), axis);
+    if (failed(mapping))
+      return false;
+    axes.emplace_back(load, *mapping, operand);
+  }
+  for (auto [load, mapping, operand] : axes) {
+    FailureOr<unsigned> coordinate = accessCoordinatePosition(load, mapping, operand);
+    if (failed(coordinate))
+      return false;
+    Value value = load.getCoordinates()[*coordinate];
+    if (!sourceRange(value) &&
+        failed(producerRange(
+            value, sourceAxisIdentity(mapping))))
+      return false;
+  }
+  SmallVector<StorePath> paths;
+  llvm::SmallPtrSet<Operation *, 8> visited;
+  if (!collectStorePaths(contract.getResult(), {}, paths, visited))
+    return false;
+  if (stores)
+    for (const StorePath &path : paths)
+      stores->push_back(path.store);
+  return true;
+}
 
 LogicalResult normalizeMatrixContractShapes(func::FuncOp kernel) {
   llvm::DenseSet<StringAttr> units;
