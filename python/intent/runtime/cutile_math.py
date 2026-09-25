@@ -13,20 +13,25 @@ import cuda.tile as ct
 
 
 @ct.function
-def _erf_small(x):
+def _erf_small_ratio(x):
     square = x * x
     numerator = square * -1.86260219e-03 - 3.36030394e-01
     numerator = numerator * square + 1.28379166e-01
     denominator = square * -1.98859419e-03 + 2.16070302e-02
     denominator = denominator * square + 3.12324286e-01
     denominator = denominator * square + 1.0
-    value = x + x * (numerator / denominator)
+    return numerator / denominator
+
+
+@ct.function
+def _erf_small(x):
+    value = x + x * _erf_small_ratio(x)
     tiny = (8.0 * x + 1.0270333290 * x) / 8.0
     return ct.where(x < 2.0 ** -119, tiny, value)
 
 
 @ct.function
-def _erf_near_one(x):
+def _erf_near_one_ratio(x):
     shifted = x - 1.0
     numerator = shifted * 1.10914491e-01 - 1.65179938e-01
     numerator = numerator * shifted + 4.15109694e-01
@@ -35,7 +40,12 @@ def _erf_near_one(x):
     denominator = denominator * shifted + 5.35934687e-01
     denominator = denominator * shifted + 6.02074385e-01
     denominator = denominator * shifted + 1.0
-    return 8.42697144e-01 + numerator / denominator
+    return numerator / denominator
+
+
+@ct.function
+def _erf_near_one(x):
+    return 8.42697144e-01 + _erf_near_one_ratio(x)
 
 
 @ct.function
@@ -82,79 +92,27 @@ def erf(x):
 
 
 @ct.function
-def _polynomial(x, coefficients: ct.Constant):
-    value = ct.full(x.shape, coefficients[0], dtype=x.dtype)
-    for coefficient in ct.static_iter(coefficients[1:]):
-        value = value * x + coefficient
-    return value
-
-
-@ct.function
 def erfc(x):
-    # Double evaluation leaves ample error margin before the required f32
-    # rounding. The positive tail is evaluated directly, without cancellation.
-    wide = ct.astype(x, ct.float64)
+    wide = ct.astype(x, ct.float32)
     magnitude = ct.abs(wide)
-    small_x = ct.minimum(magnitude, 0.84375)
-    square = small_x * small_x
-    numerator = _polynomial(square, (
-        -2.37630166566501626084e-05, -5.77027029648944159157e-03,
-        -2.84817495755985104766e-02, -3.25042107247001499370e-01,
-        1.28379167095512558561e-01,
-    ))
-    denominator = _polynomial(square, (
-        -3.96022827877536812320e-06, 1.32494738004321644526e-04,
-        5.08130628187576562776e-03, 6.50222499887672944485e-02,
-        3.97917223959155352819e-01, 1.0,
-    ))
-    small = 0.5 - ((small_x - 0.5) + small_x * (numerator / denominator))
-    shifted = ct.minimum(ct.maximum(magnitude, 0.84375), 1.25) - 1.0
-    numerator = _polynomial(shifted, (
-        -2.16637559486879084300e-03, 3.54783043256182359371e-02,
-        -1.10894694282396677476e-01, 3.18346619901161753674e-01,
-        -3.72207876035701323847e-01, 4.14856118683748331666e-01,
-        -2.36211856075265944077e-03,
-    ))
-    denominator = _polynomial(shifted, (
-        1.19844998467991074170e-02, 1.36370839120290507362e-02,
-        1.26171219808761642112e-01, 7.18286544141962662868e-02,
-        5.40397917702171048937e-01, 1.06420880400844228286e-01, 1.0,
-    ))
-    near = (1.0 - 8.45062911510467529297e-01) - numerator / denominator
-    tail_x = ct.minimum(ct.maximum(magnitude, 1.25), 28.0)
-    inverse_square = 1.0 / (tail_x * tail_x)
-    r1 = _polynomial(inverse_square, (
-        -9.81432934416914548592e+00, -8.12874355063065934246e+01,
-        -1.84605092906711035994e+02, -1.62396669462573470355e+02,
-        -6.23753324503260060396e+01, -1.05586262253232909814e+01,
-        -6.93858572707181764372e-01, -9.86494403484714822705e-03,
-    ))
-    s1 = _polynomial(inverse_square, (
-        -6.04244152148580987438e-02, 6.57024977031928170135e+00,
-        1.08635005541779435134e+02, 4.29008140027567833386e+02,
-        6.45387271733267880336e+02, 4.34565877475229228821e+02,
-        1.37657754143519042600e+02, 1.96512716674392571292e+01, 1.0,
-    ))
-    r2 = _polynomial(inverse_square, (
-        -4.83519191608651397019e+02, -1.02509513161107724954e+03,
-        -6.37566443368389627722e+02, -1.60636384855821916062e+02,
-        -1.77579549177547519889e+01, -7.99283237680523006574e-01,
-        -9.86494292470009928597e-03,
-    ))
-    s2 = _polynomial(inverse_square, (
-        -2.24409524465858183362e+01, 4.74528541206955367215e+02,
-        2.55305040643316442583e+03, 3.19985821950859553908e+03,
-        1.53672958608443695994e+03, 3.25792512996573918826e+02,
-        3.03380607434824582924e+01, 1.0,
-    ))
-    first_interval = tail_x < 1.0 / 0.35
-    rational = ct.where(first_interval, r1, r2) / ct.where(first_interval, s1, s2)
-    # A finite f32 input has an exactly representable square in f64 here.
-    tail = ct.exp(-tail_x * tail_x - 0.5625 + rational) / tail_x
+    small_x = ct.minimum(ct.maximum(wide, -0.84375), 0.84375)
+    correction = small_x * _erf_small_ratio(small_x)
+    small = ct.where(small_x < 0.25,
+                     1.0 - (small_x + correction),
+                     0.5 - ((small_x - 0.5) + correction))
+    small = ct.where(magnitude < 2.0 ** -24, 1.0 - wide, small)
+    near_ratio = _erf_near_one_ratio(
+        ct.minimum(ct.maximum(magnitude, 0.84375), 1.25))
+    near = ct.where(wide < 0.0,
+                    1.0 + (8.42697144e-01 + near_ratio),
+                    (1.0 - 8.42697144e-01) - near_ratio)
+    # erfc evaluates the positive tail directly. Unlike erf, it must retain
+    # subnormal results beyond x=4; fdlibm's f32 tail interval extends to 11.
+    tail = _erfc_tail(ct.minimum(ct.maximum(magnitude, 1.25), 11.0))
+    tail = ct.where(magnitude >= 11.0, 0.0, tail)
+    tail = ct.where(wide < 0.0, 2.0 - tail, tail)
     value = ct.where(magnitude < 0.84375, small,
                      ct.where(magnitude < 1.25, near, tail))
-    value = ct.where(magnitude >= 28.0, 0.0, value)
-    value = ct.where(wide < 0.0, 2.0 - value, value)
     value = ct.where(ct.isnan(wide), wide, value)
     return ct.astype(ct.astype(value, ct.float32), x.dtype)
 
@@ -176,16 +134,13 @@ def i0(x):
     # Cephes Chebyshev coefficients, also used by ATen's CUDA i0:
     # https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/cuda/Math.cuh
     # f64 evaluation avoids exp(f32) overflowing before the f32 I0 result.
+    # On the reduced [-2, 2] intervals, omitted leading coefficients bound
+    # the series error below 1e-9 (small) and 2e-12 (large), below f32 precision.
     wide = ct.astype(x, ct.float64)
     magnitude = ct.abs(wide)
     small_x = ct.minimum(magnitude, 8.0)
     small = ct.exp(small_x) * _chebyshev(0.5 * small_x - 2.0, (
-        -4.41534164647933937950e-18, 3.33079451882223809783e-17,
-        -2.43127984654795469359e-16, 1.71539128555513303061e-15,
-        -1.16853328779934516808e-14, 7.67618549860493561688e-14,
-        -4.85644678311192946090e-13, 2.95505266312963983461e-12,
-        -1.72682629144155570723e-11, 9.67580903537323691224e-11,
-        -5.18979560163526290666e-10, 2.65982372468238665035e-09,
+        2.65982372468238665035e-09,
         -1.30002500998624804212e-08, 6.04699502254191894932e-08,
         -2.67079385394061173391e-07, 1.11738753912010371815e-06,
         -4.41673835845875056359e-06, 1.64484480707288970893e-05,
@@ -200,13 +155,7 @@ def i0(x):
     if ct.max(ct.astype(magnitude > 8.0, ct.int32)) != 0:
         large_x = ct.maximum(magnitude, 8.0)
         large = ct.exp(large_x) * _chebyshev(32.0 / large_x - 2.0, (
-            -7.23318048787475395456e-18, -4.83050448594418207126e-18,
-            4.46562142029675999901e-17, 3.46122286769746109310e-17,
-            -2.82762398051658348494e-16, -3.42548561967721913462e-16,
-            1.77256013305652638360e-15, 3.81168066935262242075e-15,
-            -9.55484669882830764870e-15, -4.15056934728722208663e-14,
-            1.54008621752140982691e-14, 3.85277838274214270114e-13,
-            7.18012445138366623367e-13, -1.79417853150680611778e-12,
+            -1.79417853150680611778e-12,
             -1.32158118404477131188e-11, -3.14991652796324136454e-11,
             1.18891471078464383424e-11, 4.94060238822496958910e-10,
             3.39623202570838634515e-09, 2.26666899049817806459e-08,
