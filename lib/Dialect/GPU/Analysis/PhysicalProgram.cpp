@@ -4710,6 +4710,84 @@ PhysicalProgramAnalysis::footprint(Operation *access) {
   return result;
 }
 
+bool haveDisjointPrivateBufferAccesses(Operation *lhs, Operation *rhs) {
+  if (!isa<LoadOp, StoreOp>(lhs) || !isa<LoadOp, StoreOp>(rhs))
+    return false;
+  PhysicalProgramAnalysis analysis(lhs->getParentOfType<func::FuncOp>());
+  auto left = analysis.footprint(lhs);
+  auto right = analysis.footprint(rhs);
+  if (left.state != PhysicalFactState::Exact ||
+      right.state != PhysicalFactState::Exact)
+    return false;
+  auto buffer = dyn_cast<BufferType>(left.resource.getType());
+  if (!buffer || buffer.getScope().getValue() != BufferScope::ProgramPrivate ||
+      buffer.getWorkspace() || !left.resource.getDefiningOp<BufferOp>())
+    return false;
+  if (left.resource != right.resource)
+    return true;
+
+  auto scalar = [](Value value) {
+    value = stripBroadcast(value);
+    return value.getType().isIntOrIndex() ? stripScalarIdentity(value) : Value();
+  };
+  auto excludes = [&](const PhysicalAccessFootprint &pointAccess,
+                      const PhysicalAccessFootprint &other) {
+    for (auto [index, pointCoordinate] : llvm::enumerate(pointAccess.coordinates)) {
+      Value point = scalar(pointCoordinate);
+      if (!point || !other.validity)
+        continue;
+      auto axis = llvm::find(other.sourceAxes, pointAccess.sourceAxes[index]);
+      if (axis == other.sourceAxes.end())
+        continue;
+      Value coordinate = other.coordinates[axis - other.sourceAxes.begin()];
+      auto coordinateType = dyn_cast<FragmentType>(coordinate.getType());
+      auto predicateType = dyn_cast<FragmentType>(other.validity.getType());
+      if (coordinateType) {
+        if (!predicateType || coordinateType.getOwner() != predicateType.getOwner() ||
+            !queryBroadcastProjection(coordinateType, predicateType).isExact())
+          continue;
+        // A repeated source axis could place the predicate and address on
+        // different Cartesian occurrences. Require a unique target occurrence.
+        bool unique = llvm::all_of(coordinateType.getAxisMaps(), [&](Attribute attr) {
+          auto source = cast<AxisMapAttr>(attr);
+          return llvm::count_if(predicateType.getAxisMaps(), [&](Attribute target) {
+            auto mapping = cast<AxisMapAttr>(target);
+            return sourceAxisIdentity(mapping) == sourceAxisIdentity(source) &&
+                   mapping.getDimensionId() == source.getDimensionId();
+          }) == 1;
+        });
+        if (!unique)
+          continue;
+      }
+      std::function<bool(Value)> inspect = [&](Value predicate) {
+        if (auto broadcast = predicate.getDefiningOp<BroadcastOp>()) {
+          if (auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
+              input && !queryBroadcastProjection(
+                           input, cast<FragmentType>(predicate.getType())).isExact())
+            return false;
+          return inspect(broadcast.getValue());
+        }
+        if (auto splat = predicate.getDefiningOp<SplatOp>())
+          return inspect(splat.getValue());
+        if (auto conjunction = predicate.getDefiningOp<BinaryOp>();
+            conjunction && conjunction.getOperatorKind() == BinaryOperator::LogicalAnd)
+          return inspect(conjunction.getLhs()) || inspect(conjunction.getRhs());
+        auto compare = predicate.getDefiningOp<CompareOp>();
+        if (!compare || (compare.getPredicate() != ComparePredicate::Ne &&
+                         compare.getPredicate() != ComparePredicate::Lt &&
+                         compare.getPredicate() != ComparePredicate::Gt))
+          return false;
+        return (compare.getLhs() == coordinate && scalar(compare.getRhs()) == point) ||
+               (compare.getRhs() == coordinate && scalar(compare.getLhs()) == point);
+      };
+      if (inspect(other.validity))
+        return true;
+    }
+    return false;
+  };
+  return excludes(left, right) || excludes(right, left);
+}
+
 PhysicalAccessBoundaryFact
 PhysicalProgramAnalysis::boundaryValidity(Operation *access,
                                           bool allowRangeGuards) {

@@ -185,6 +185,10 @@ LogicalResult simplifyValues(ModuleOp module, func::FuncOp) {
   return simplifyMaskedAccessCoordinates(module);
 }
 
+LogicalResult scheduleStores(ModuleOp module, func::FuncOp) {
+  return schedulePrivateStores(module);
+}
+
 LogicalResult closeSharedConfigurations(func::FuncOp kernel,
                                         const TuningProfiles &profiles) {
   eraseUnusedPhysicalParameters(kernel);
@@ -216,6 +220,7 @@ LogicalResult runTransformations(ModuleOp module, func::FuncOp kernel) {
       {"promote-buffer-values", promoteBufferGroup},
       {"refine-program-mapping", refineMapping},
       {"eliminate-common-values", simplifyValues},
+      {"schedule-private-stores", scheduleStores},
   };
   for (const TransformationGroup &group : groups) {
     if (failed(group.run(module, kernel))) {

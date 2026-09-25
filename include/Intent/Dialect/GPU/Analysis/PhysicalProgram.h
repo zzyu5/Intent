@@ -54,6 +54,12 @@ bool isPhysicalReplayNode(mlir::Operation *operation,
 /// available there; this query only establishes memory stability.
 bool canReplayReadAt(LoadOp load, mlir::Operation *insertionAnchor);
 
+/// Proves non-aliasing for private-buffer accesses, including a uniform
+/// coordinate excluded by the other access's current typed validity.
+/// The caller must preserve the evaluated SSA coordinates while moving effects.
+bool haveDisjointPrivateBufferAccesses(mlir::Operation *lhs,
+                                       mlir::Operation *rhs);
+
 struct PhysicalAxisProjection {
   PhysicalFactState state = PhysicalFactState::Unknown;
   PhysicalSourceAxis source;
