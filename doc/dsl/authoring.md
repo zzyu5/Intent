@@ -57,6 +57,8 @@ Pointwise 按尾部对齐，允许 scalar/size-one broadcast。`[M]` 与 `[M,N]`
 
 Domain 索引按资源索引顺序形成读取结果的 tensor axes，赋值仍按 positional axes 对齐，不按 domain 变量名自动换轴。例如两个等长 domains 下，`output[rows, columns] = input[columns, rows]` 不表示矩阵转置；应显式转置读取的 tensor value，或构造具有所需对应关系的坐标 tensor。不同 subregions 的动态长度也不会因本次输入碰巧等长而成为同一 extent；需要使用已成立的 shape relation，或在共同输出 domain 上表达坐标映射。
 
+`view[region]` 返回由该区域成员组成的 tensor value。随后索引这个 value 时使用从 0 开始的局部位置，范围由 value 自身的 shape 决定，不沿用原 view 的绝对坐标或完整长度。
+
 多个 tensor indices 按 broadcast 规则形成共同的索引 shape，坐标逐位置配对，不自动形成 Cartesian product。对二维 `x`，两个 `[K]` 坐标 tensor 的 `x[r, c]` 结果是 `[K]`；需要 `[M,N]` 坐标组合时，可写 `x[I.reshape(r, (M, 1)), I.reshape(c, (1, N))]`。`[M]` 与 `[1,N]` 仍在末轴比较 `M` 和 `N`，不表示 `[M,N]`。
 
 所有 tensor indices 共同贡献一份 broadcast shape，每个 domain index 另外引入一个独立 logical axis。Tensor index 的 size-one 轴也属于这份 shape，不会因旁边有 domain 而自动消失。索引赋值的右值必须能 broadcast 到该索引表达式的结果 shape，目标 view 不会替右值隐式降维。
@@ -84,6 +86,8 @@ Helper 可以没有返回值；函数体自然结束与裸 `return` 等价，都
 ## Control、effects 与多个 kernels
 
 普通 `for/while` 保持顺序与 loop carry；carry 的初值与每轮更新必须保持 dtype、rank 和逻辑 shape，循环体内的 broadcast 不会改变初始 schema。Tensor carry 可按目标 shape 初始化，例如 `state = I.full(value.shape, 0.0, I.f32)`；`I.cast(0.0, I.f32)` 初始化的是 scalar。`I.parallel(domain)` 表达独立无序点，不允许 carry。Tensor predicate 使用 `I.select`，不控制 statement `if`。`Out` 进入 kernel 时未定义，读取前必须先定义；不能用 InOut 掩盖未定义读取。
+
+`I.parallel` 可以嵌套，内层可以读取外层词法作用域的不可变 tensor values。外层各点内部产生的值分别属于各自的逻辑迭代；内层读取这些值不会把它们变成所有外层点共同更新的全局状态。
 
 Runtime `if` 之后读取的名字，必须在分支前已有定义，或在每个正常继续执行的分支中赋值。不同条件之间的逻辑蕴含不会自动建立名字的定义；先初始化共同状态，再在分支中更新。
 
