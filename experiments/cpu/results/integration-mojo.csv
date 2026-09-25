@@ -1,2 +1,0 @@
-kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
-relu,8192x4096-fp16-8cores-host,9.577134,9.440813,1.014440,pass,"既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。 CPU idle wait: OMP_WAIT_POLICY=PASSIVE, KMP_BLOCKTIME=0, GOMP_SPINCOUNT=0."
