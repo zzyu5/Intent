@@ -4,8 +4,10 @@ This is forward execution, not autograd. Do not change the task, dtype, output
 structure, numerical tolerance, or observable out/alias behavior.
 Choose the algorithm for the complete invocation before writing the kernels.
 For each stage, settle its logical inputs and outputs, independent work and
-required sequential dependencies. Assess total computation, intermediate memory
-traffic and the combined cost of all kernel invocations. Internal kernel
+required sequential dependencies. Assess the sequential critical path as well as
+total computation, intermediate memory traffic and the cost of all kernel calls.
+A dependency between stages requires their execution order to be preserved; it
+does not require putting those stages in the same kernel. Internal kernel
 interfaces and logical grouping are your choices unless TASK.md constrains them.
 
 Preserve computation stages and intermediate dtypes explicitly required by TASK.md.
