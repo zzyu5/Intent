@@ -27,9 +27,9 @@ exp_mean,8,0.0155200004,0.00921599986,0.009119999594986439,0.008960000239312649,
 matmul,6,0.00923199998,0.0137279998,0.010704000014811754,0.009568000212311745,reference_pass,pass,pass,pass,cuda_graph,Independent Luna high submission after public organization guidance; original candidate.py retained,,,,matmul/intent/performance.py
 addmm,6,0.0126720001,0.0162080005,0.011744,0.0116480002,reference_pass,pass,pass,pass,cuda_graph,,,,,addmm/intent/candidate.py
 tensordot,4,0.00640000007,0.00560000003,0.00647200015373528,0.008688000030815601,reference_pass,pass,pass,pass,cuda_graph,,,,,tensordot/intent/candidate.py
-tensordot_rsqrt,5,0.0680480003,0.0345599987,0.06271999888122082,0.11595200002193451,reference_pass,pass,pass,pass,cuda_graph,Original agent Triton uses TF32; excluded from same-precision agent comparisons,,,,tensordot_rsqrt/intent/candidate.py
+tensordot_rsqrt,5,0.0680480003,0.0345599987,0.06271999888122082,0.11600799858570099,reference_pass,pass,pass,pass,cuda_graph,Original agent Triton uses TF32; excluded from same-precision agent comparisons,,,,tensordot_rsqrt/intent/candidate.py
 conv2d,2,0.0342560001,,0.0197040001,0.0434559993,reference_pass,agent_program_error,pass,pass,cuda_graph,,candidate_precompile: at 16:17:,,,conv2d/intent/candidate.py
-symmetric_mm_and_abs_sum,6,0.0877440013,0.0580960009,0.07415999844670296,0.13490400463342667,reference_pass,pass,pass,pass,cuda_graph,Independent Luna high submission after public organization guidance; original candidate.py retained,,,,symmetric_mm_and_abs_sum/intent/performance.py
+symmetric_mm_and_abs_sum,6,0.0877440013,0.0580960009,0.07415999844670296,0.1377280056476593,reference_pass,pass,pass,pass,cuda_graph,Independent Luna high submission after public organization guidance; original candidate.py retained,,,,symmetric_mm_and_abs_sum/intent/performance.py
 fused_mv_sigmoid_sub,4,0.0111839999,0.00864000013,0.00755200023,0.00740800006,reference_pass,pass,pass,pass,cuda_graph,,,,,fused_mv_sigmoid_sub/intent/candidate.py
 solve,4,0.522767991,10.2776084,2.437287926673889,2.167304039001465,reference_pass,pass,pass,pass,cuda_event,"Intent cuTile uses fixed reduction=256, access_form=3, occupancy=1, native compiler budget=60s.",,,,solve/intent/candidate.py
 fused_cholesky_solve,6,1.18564802,,1.0587999820709229,1.7600719928741455,reference_pass,agent_program_error,pass,pass,cuda_event,,candidate_precompile: at 21:14:,,,fused_cholesky_solve/intent/performance.py
@@ -39,10 +39,10 @@ mul_relu,8,0.0115200002,0.00931200013,0.00944000017,0.00923199998,reference_pass
 mul_sub,8,0.016384,0.0113599999,0.0112960003,0.0112399999,reference_pass,pass,pass,pass,cuda_graph,,,,,mul_sub/intent/candidate.py
 sub_gelu,8,0.022624,,0.00956800021,0.0135840001,reference_pass,numerical_failure,pass,pass,cuda_graph,,"comparison: generated/source floating result 0 differs: max_abs=0.49934613704681396, atol=0.0001, rtol=1e-05; first_failure=0; largest tolerance excess has generated=-0.15876401960849762, source=0.34058213233947754, abs_error=0.49934613704681396, limit=0.00010340582230128348",,,sub_gelu/intent/candidate.py
 relu_conv2d,3,0.0279519996,0.0151120001,0.0170399994,0.0217439998,reference_pass,pass,pass,pass,cuda_graph,,,,,relu_conv2d/intent/candidate.py
-gelu_conv2d,4,0.0395999998,0.0379360002,0.04582400061190128,0.07875200361013412,reference_pass,pass,pass,pass,cuda_graph,,,,,gelu_conv2d/intent/candidate.py
+gelu_conv2d,4,0.0395999998,0.0379360002,0.04582400061190128,0.07747200131416321,reference_pass,pass,pass,pass,cuda_graph,,,,,gelu_conv2d/intent/candidate.py
 conv2d_add,0,0.0252479995,0.0234240005,0.029664000496268272,0.03858399949967861,reference_pass,pass,pass,pass,cuda_graph,Independent Luna high submission after public organization guidance; original candidate.py retained,,,,conv2d_add/intent/performance.py
 combined_activation,6,0.0265279999,0.0238880003,,,reference_pass,pass,compilation_failure,compilation_failure,cuda_graph,,,frontend_kir: /home/kingdom/.local/share/intentdsl/h100-refresh-20260923/study/intent-programs/combined_activation/intent/candidate.py:24:27: error: cannot broadcast dimensions K and N,frontend_kir: /home/kingdom/.local/share/intentdsl/h100-refresh-20260923/study/intent-programs/combined_activation/intent/candidate.py:24:27: error: cannot broadcast dimensions K and N,combined_activation/intent/candidate.py
-fused_layer_norm_relu_linear,4,0.0893360041,0.0527439993,0.04055999964475632,0.12516799569129944,reference_pass,pass,pass,pass,cuda_graph,,,,,fused_layer_norm_relu_linear/intent/candidate.py
+fused_layer_norm_relu_linear,4,0.0893360041,0.0527439993,0.04055999964475632,0.10901600122451782,reference_pass,pass,pass,pass,cuda_graph,,,,,fused_layer_norm_relu_linear/intent/candidate.py
 softplus_linear,6,0.018224,,0.012416,0.0141119999,reference_pass,agent_program_error,pass,pass,cuda_graph,,candidate_precompile: at 29:15:,,,softplus_linear/intent/candidate.py
 permute_copy,2,0.00790399988,0.00781599991,0.00770399999,0.00788800023,reference_pass,pass,pass,pass,cuda_graph,,,,,permute_copy/intent/candidate.py
 ifftshift,8,0.0101600001,0.00812800042,0.00764800003,0.00801600004,reference_pass,pass,pass,pass,cuda_graph,,,,,ifftshift/intent/candidate.py
@@ -50,8 +50,8 @@ grid_sample,0,0.0217120005,,0.021215999498963356,0.02097600046545267,reference_p
 fused_gather_masked_fill,5,0.0228639999,0.0184559999,0.0167760001,0.0172560001,reference_pass,pass,pass,pass,cuda_graph,,,,,fused_gather_masked_fill/intent/candidate.py
 fused_index_select_eq,1,0.00779199996,0.00616000011,0.00572800008,0.00598400016,reference_pass,pass,pass,pass,cuda_graph,,,,,fused_index_select_eq/intent/candidate.py
 div,8,0.00935200043,,0.00979200006,0.00987199973,reference_pass,no_submission,pass,pass,cuda_graph,,No original agent Triton submission exists,,,div/intent/candidate.py
-sigmoid_conv2d,2,0.0368160009,0.0363120008,0.03126399964094162,0.059647999703884125,reference_pass,pass,pass,pass,cuda_graph,,,,,sigmoid_conv2d/intent/candidate.py
-solve_multiple_lu,1,0.166167997,,0.2643200010061264,0.3763680011034012,reference_pass,no_submission,pass,pass,cuda_event,,No original agent Triton submission exists,,,solve_multiple_lu/intent/candidate.py
+sigmoid_conv2d,2,0.0368160009,0.0363120008,0.03126399964094162,0.0601199995726347,reference_pass,pass,pass,pass,cuda_graph,,,,,sigmoid_conv2d/intent/candidate.py
+solve_multiple_lu,1,0.166167997,,0.2643200010061264,0.3709520101547241,reference_pass,no_submission,pass,pass,cuda_event,,No original agent Triton submission exists,,,solve_multiple_lu/intent/candidate.py
 relu_sqrt,8,0.010272,,0.00780800008,0.00800000038,reference_pass,no_submission,pass,pass,cuda_graph,,No original agent Triton submission exists,,,relu_sqrt/intent/candidate.py
 sigmoid_argmax,8,0.0144160003,,0.00846400019,0.00801600004,reference_pass,no_submission,pass,pass,cuda_graph,,No original agent Triton submission exists,,,sigmoid_argmax/intent/candidate.py
 sub,8,0.0124319997,,0.00961600011,0.00953599997,reference_pass,no_submission,pass,pass,cuda_graph,,No original agent Triton submission exists,,,sub/intent/candidate.py

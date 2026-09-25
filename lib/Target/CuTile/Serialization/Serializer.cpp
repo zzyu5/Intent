@@ -443,13 +443,15 @@ private:
       output << text;
     };
     auto arrayArgument = [&](StringRef name, unsigned rank) {
-      // Shapes already specialize the metadata ABI and launch cache. Preserve
+      // Shapes and strides specialize the metadata ABI and launch cache. Preserve
       // the same facts in the provider array type used for access lowering.
-      std::string annotation = name.str() +
-          ": Annotated[ct.Array, ct.ArrayAnnotation(index_dtype=ct.int64, static_shape_dims=(";
+      std::string dimensions = "(";
       for (unsigned axis = 0; axis < rank; ++axis)
-        annotation += std::to_string(axis) + ", ";
-      argument(annotation + "))]");
+        dimensions += std::to_string(axis) + ", ";
+      dimensions += ")";
+      argument(name.str() +
+               ": Annotated[ct.Array, ct.ArrayAnnotation(index_dtype=ct.int64, static_shape_dims=" +
+               dimensions + ", static_stride_dims=" + dimensions + ")]");
     };
     for (const ViewABI &view : views)
       arrayArgument(view.name, view.type.getLayout().getExtents().size());

@@ -93,7 +93,8 @@ class ProgramContext:
                 result = search(configs, *args, **kwargs)
                 self.tuning.append({"kernel": name, "declared": len(configs),
                                     "measured": len(result.successes),
-                                    "failures": [(str(cfg), kind, message) for cfg, kind, message in result.failures],
+                                    "failures": [(str(cfg), kind.__name__, message)
+                                                 for cfg, kind, message in result.failures],
                                     "winner": str(result.best.config)})
                 return result
 
@@ -118,17 +119,19 @@ class ProgramContext:
             yield
             return
         import cuda.tile as ct
-        from cuda.tile._compile import get_sm_arch
+        from cuda.tile._compile import format_sm_arch, get_sm_arch
 
         original_compile = ct.kernel._compile
         compiled = self._native_compilations
         compiled.clear()
 
-        def compile_kernel(kernel, signature, context):
+        def compile_kernel(kernel, signature, context, compute_capability=None):
             # Native signatures contain unhashable constraints. Value equality
             # also lets the JIT's unnamed signature reuse the prepared symbol.
+            architecture = (get_sm_arch() if compute_capability is None
+                            else format_sm_arch(*compute_capability))
             key = (kernel._pyfunc, kernel._compiler_options,
-                   signature.with_symbol(None), get_sm_arch(), context)
+                   signature.with_symbol(None), architecture, context)
             for previous, result, error in compiled:
                 if key == previous:
                     self.native_compile_reuses += 1
@@ -136,7 +139,7 @@ class ProgramContext:
                         raise error
                     return result
             try:
-                result = original_compile(kernel, signature, context)
+                result = original_compile(kernel, signature, context, compute_capability)
             except ct.TileError as error:
                 compiled.append((key, None, error))
                 raise

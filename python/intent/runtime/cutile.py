@@ -32,7 +32,8 @@ def array_index_kernels(function, view_names: tuple[str, ...]):
     for name in view_names:
         array = get_args(function.__annotations__[name])[1]
         narrow.__annotations__[name] = Annotated[
-            ct.Array, ct.ArrayAnnotation(static_shape_dims=array.static_shape_dims)
+            ct.Array, ct.ArrayAnnotation(static_shape_dims=array.static_shape_dims,
+                                        static_stride_dims=array.static_stride_dims)
         ]
     return ct.kernel(narrow), ct.kernel(function)
 
