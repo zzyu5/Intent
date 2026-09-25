@@ -991,6 +991,17 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
     return failure();
   }
 
+  PhysicalProgramAnalysis analysis(gather->getParentOfType<func::FuncOp>());
+  // Earlier rewrites may have created gathers in the source mask or fill.
+  // Let the existing composition worklist normalize those producers before
+  // committing this rewrite, which must replay both at the selected positions.
+  for (Value value : {sourceLoad.getValid(), sourceLoad.getFill()})
+    if (value && isa<FragmentType>(value.getType()) &&
+        !analysis.replayability(value, std::nullopt,
+                                PhysicalReplayScope::Coordinate,
+                                /*allowAccesses=*/false).isReplayable())
+      return false;
+
   OpBuilder builder(gather);
   auto resultType = dyn_cast<FragmentType>(gather.getResult().getType());
   SmallVector<Value> originalCoordinates;
@@ -1001,7 +1012,6 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
   }
   SmallVector<Value> coordinates(originalCoordinates);
   IRMapping replay;
-  PhysicalProgramAnalysis analysis(gather->getParentOfType<func::FuncOp>());
   for (auto [coordinate, sourceAxis] :
        llvm::zip(gather.getCoordinates(), gather.getSourceAxes())) {
     if (sourceAxis < 0 ||
