@@ -4776,16 +4776,55 @@ bool haveDisjointPrivateBufferAccesses(Operation *lhs, Operation *rhs) {
     value = stripBroadcast(value);
     return value.getType().isIntOrIndex() ? stripScalarIdentity(value) : Value();
   };
+  auto laterIteration = [&](Value coordinate, Value point) {
+    auto argument = dyn_cast_or_null<BlockArgument>(coordinate);
+    auto loop = argument
+                    ? dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp())
+                    : scf::ForOp();
+    if (!loop || argument != loop.getInductionVar() ||
+        integerConstant(loop.getStep()) != 1)
+      return false;
+    auto lower = stripScalarIdentity(loop.getLowerBound()).getDefiningOp<BinaryOp>();
+    if (!lower || lower.getOperatorKind() != BinaryOperator::Add)
+      return false;
+    for (auto [base, offset] :
+         {std::pair{lower.getLhs(), lower.getRhs()},
+          std::pair{lower.getRhs(), lower.getLhs()}}) {
+      auto amount = integerConstant(offset);
+      if (stripScalarIdentity(base) != point || !amount || *amount <= 0)
+        continue;
+      IndexBounds pointBounds = queryIndexBounds(point);
+      IndexBounds iterationBounds = queryIndexBounds(coordinate);
+      auto kernel = lhs->getParentOfType<func::FuncOp>();
+      auto pointExtent = pointBounds.nonNegative && pointBounds.upper
+                             ? nonNegativeExtentBounds(kernel, pointBounds.upper)
+                             : std::nullopt;
+      auto iterationExtent = iterationBounds.nonNegative && iterationBounds.upper
+                                 ? nonNegativeExtentBounds(kernel, iterationBounds.upper)
+                                 : std::nullopt;
+      // The positive unit-step loop starts strictly after the point. Both
+      // its start expression and final increment must remain representable.
+      if (pointExtent && iterationExtent &&
+          pointExtent->second <= std::numeric_limits<int64_t>::max() - *amount &&
+          iterationExtent->second < std::numeric_limits<int64_t>::max())
+        return true;
+    }
+    return false;
+  };
   auto excludes = [&](const PhysicalAccessFootprint &pointAccess,
                       const PhysicalAccessFootprint &other) {
     for (auto [index, pointCoordinate] : llvm::enumerate(pointAccess.coordinates)) {
       Value point = scalar(pointCoordinate);
-      if (!point || !other.validity)
+      if (!point)
         continue;
       auto axis = llvm::find(other.sourceAxes, pointAccess.sourceAxes[index]);
       if (axis == other.sourceAxes.end())
         continue;
       Value coordinate = other.coordinates[axis - other.sourceAxes.begin()];
+      if (laterIteration(scalar(coordinate), point))
+        return true;
+      if (!other.validity)
+        continue;
       auto coordinateType = dyn_cast<FragmentType>(coordinate.getType());
       auto predicateType = dyn_cast<FragmentType>(other.validity.getType());
       if (coordinateType) {

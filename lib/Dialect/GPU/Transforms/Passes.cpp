@@ -216,11 +216,11 @@ LogicalResult runTransformations(ModuleOp module, func::FuncOp kernel) {
       {"realize-reductions", realizeReductionGroup},
       {"realize-contractions", realizeContractionGroup},
       {"compose-realized-accesses", composeRealizedAccesses},
+      {"schedule-private-stores", scheduleStores},
       {"vectorize-buffer-loops", vectorizeBufferGroup},
       {"promote-buffer-values", promoteBufferGroup},
       {"refine-program-mapping", refineMapping},
       {"eliminate-common-values", simplifyValues},
-      {"schedule-private-stores", scheduleStores},
   };
   for (const TransformationGroup &group : groups) {
     if (failed(group.run(module, kernel))) {

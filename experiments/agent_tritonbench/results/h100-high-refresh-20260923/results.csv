@@ -51,7 +51,7 @@ fused_gather_masked_fill,5,0.0228639999,0.0184559999,0.0167760001,0.0172560001,r
 fused_index_select_eq,1,0.00779199996,0.00616000011,0.00572800008,0.00598400016,reference_pass,pass,pass,pass,cuda_graph,,,,,fused_index_select_eq/intent/candidate.py
 div,8,0.00935200043,,0.00979200006,0.00987199973,reference_pass,no_submission,pass,pass,cuda_graph,,No original agent Triton submission exists,,,div/intent/candidate.py
 sigmoid_conv2d,2,0.0368160009,0.0363120008,0.03126399964094162,0.059647999703884125,reference_pass,pass,pass,pass,cuda_graph,,,,,sigmoid_conv2d/intent/candidate.py
-solve_multiple_lu,1,0.166167997,,0.260487989,,reference_pass,no_submission,pass,numerical_failure,cuda_event,,No original agent Triton submission exists,,"generated/source floating result 0 differs: max_abs=1087.275390625, atol=0.0001, rtol=0.0001; first_failure=0; largest tolerance excess has generated=-1086.7645263671875, source=0.5108150839805603, abs_error=1087.275390625, limit=0.00015108150546438992",solve_multiple_lu/intent/candidate.py
+solve_multiple_lu,1,0.166167997,,0.2643200010061264,0.3763680011034012,reference_pass,no_submission,pass,pass,cuda_event,,No original agent Triton submission exists,,,solve_multiple_lu/intent/candidate.py
 relu_sqrt,8,0.010272,,0.00780800008,0.00800000038,reference_pass,no_submission,pass,pass,cuda_graph,,No original agent Triton submission exists,,,relu_sqrt/intent/candidate.py
 sigmoid_argmax,8,0.0144160003,,0.00846400019,0.00801600004,reference_pass,no_submission,pass,pass,cuda_graph,,No original agent Triton submission exists,,,sigmoid_argmax/intent/candidate.py
 sub,8,0.0124319997,,0.00961600011,0.00953599997,reference_pass,no_submission,pass,pass,cuda_graph,,No original agent Triton submission exists,,,sub/intent/candidate.py
