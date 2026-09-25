@@ -5435,7 +5435,8 @@ LogicalResult finalizeParallelWorkset(ParallelWorkset &workset,
 }
 
 bool capturesScanPrefixAxis(const LogicalWorksetFact &workset,
-                            CanonicalKernelAnalysis &analysis) {
+                            CanonicalKernelAnalysis &analysis,
+                            intent::ParallelOp &scope) {
   if (workset.singleton || !workset.parallel || !workset.body)
     return false;
   SmallVector<CoordinateOrigin> worksetCoordinates;
@@ -5445,7 +5446,8 @@ bool capturesScanPrefixAxis(const LogicalWorksetFact &workset,
       worksetCoordinates.append(provenance.origins.begin(),
                                 provenance.origins.end());
   }
-  WalkResult result = workset.body->walk([&](intent::GatherOp gather) {
+  bool captured = false;
+  workset.body->walk([&](intent::GatherOp gather) {
     Value source = gather.getInputs().front();
     while (auto cast = source.getDefiningOp<intent::CastOp>())
       source = cast.getInput();
@@ -5461,12 +5463,23 @@ bool capturesScanPrefixAxis(const LogicalWorksetFact &workset,
         continue;
       if (llvm::any_of(term.coordinate.origins, [&](const auto &origin) {
             return llvm::is_contained(worksetCoordinates, origin);
-          }))
-        return WalkResult::interrupt();
+          })) {
+        auto enclosing = gather->getParentOfType<intent::ParallelOp>();
+        while (enclosing && !enclosing->isProperAncestor(scan))
+          enclosing = enclosing->getParentOfType<intent::ParallelOp>();
+        if (!captured)
+          scope = enclosing;
+        else if (!scope || !enclosing)
+          scope = {};
+        else if (enclosing->isProperAncestor(scope))
+          scope = enclosing;
+        captured = true;
+        break;
+      }
     }
     return WalkResult::advance();
   });
-  return result.wasInterrupted();
+  return captured;
 }
 
 LogicalResult constructGPUProgram(ModuleOp module,
@@ -5481,17 +5494,82 @@ LogicalResult constructGPUProgram(ModuleOp module,
       canonicalAnalysis.logicalWorksets(function);
   if (failed(logicalWorksets))
     return failure();
-  if (llvm::any_of(*logicalWorksets, [&](const auto &workset) {
-        return capturesScanPrefixAxis(workset, canonicalAnalysis);
-      })) {
-    // Keep a captured prefix and its consumers in one execution group.  The
-    // prefix axis is dependent even when the consuming iterations are unordered.
+  SmallVector<intent::ParallelOp> prefixScopes;
+  bool wholeBodyPrefix = false;
+  for (const LogicalWorksetFact &workset : *logicalWorksets) {
+    intent::ParallelOp scope;
+    if (!capturesScanPrefixAxis(workset, canonicalAnalysis, scope))
+      continue;
+    if (!scope) {
+      wholeBodyPrefix = true;
+      break;
+    }
+    SmallVector<IterationAxis> axes;
+    for (auto [domain, coordinate] :
+         llvm::zip(workset.domains, workset.coordinates)) {
+      if (failed(collectIterationAxes(domain, axes)))
+        return failure();
+      if (coordinate == scope.getBody().front().getArguments().back())
+        break;
+    }
+    if (llvm::any_of(axes, [&](const IterationAxis &axis) {
+          return failed(launchExpression(axis.start, function)) ||
+                 failed(launchExpression(axis.stop, function)) ||
+                 (axis.step && failed(launchExpression(axis.step, function)));
+        })) {
+      wholeBodyPrefix = true;
+      break;
+    }
+    if (llvm::any_of(prefixScopes, [&](intent::ParallelOp previous) {
+          return previous->isAncestor(scope);
+        }))
+      continue;
+    llvm::erase_if(prefixScopes, [&](intent::ParallelOp previous) {
+      return scope->isProperAncestor(previous);
+    });
+    prefixScopes.push_back(scope);
+  }
+  if (wholeBodyPrefix) {
     LogicalWorksetFact singleton;
     singleton.state = CanonicalFactState::Exact;
     singleton.body = &function.getBody().front();
     singleton.singleton = true;
     logicalWorksets->clear();
     logicalWorksets->push_back(std::move(singleton));
+  } else if (!prefixScopes.empty()) {
+    // The prefix and its consumers share one instance; enclosing independent
+    // coordinates remain launch axes. A scope also owns all sibling worksets.
+    SmallVector<LogicalWorksetFact, 4> grouped;
+    llvm::SmallPtrSet<Operation *, 4> emitted;
+    for (LogicalWorksetFact workset : *logicalWorksets) {
+      intent::ParallelOp scope;
+      for (intent::ParallelOp candidate : prefixScopes)
+        if (workset.parallel && candidate->isAncestor(workset.parallel)) {
+          scope = candidate;
+          break;
+        }
+      if (!scope) {
+        grouped.push_back(std::move(workset));
+        continue;
+      }
+      if (!emitted.insert(scope.getOperation()).second)
+        continue;
+      Block &body = scope.getBody().front();
+      auto first = llvm::find(workset.coordinates, body.getArgument(0));
+      size_t offset = std::distance(workset.coordinates.begin(), first);
+      size_t count = offset + body.getNumArguments();
+      if (count > workset.coordinates.size() || count > workset.domains.size() ||
+          !llvm::equal(ArrayRef<BlockArgument>(workset.coordinates).slice(
+                           offset, body.getNumArguments()), body.getArguments()))
+        return scope.emitOpError(
+            "captured prefix scope has no matching workset coordinate prefix");
+      workset.parallel = scope;
+      workset.body = &body;
+      workset.domains.resize(count);
+      workset.coordinates.resize(count);
+      grouped.push_back(std::move(workset));
+    }
+    *logicalWorksets = std::move(grouped);
   }
   SmallVector<ParallelWorkset> worksets;
   for (const LogicalWorksetFact &fact : *logicalWorksets) {

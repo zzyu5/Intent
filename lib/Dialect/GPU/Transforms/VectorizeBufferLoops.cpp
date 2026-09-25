@@ -192,12 +192,17 @@ bool hasIndependentUpdates(scf::ForOp loop, func::FuncOp kernel,
 }
 
 LogicalResult vectorizeIterations(func::FuncOp kernel,
-                                 uint64_t &source, int64_t &dimension) {
+                                 uint64_t &source, int64_t &dimension,
+                                 bool singleInstance) {
   SmallVector<scf::ForOp> loops;
   // Lift the inner independent axis first. Its fragment becomes the suffix
   // when an enclosing independent loop is subsequently widened.
   kernel.walk<WalkOrder::PostOrder>([&](scf::ForOp loop) { loops.push_back(loop); });
   for (scf::ForOp loop : loops) {
+    // Declared independent iterations remain independent within each instance.
+    // Inferred mutable-buffer updates retain the single-instance restriction.
+    if (!singleInstance && !loop->hasAttr(independentIterationAttr))
+      continue;
     auto step = loop.getStep().getDefiningOp<arith::ConstantIndexOp>();
     llvm::DenseMap<Value, bool> varying;
     SmallVector<Value> guardedViews;
@@ -418,14 +423,13 @@ LogicalResult vectorizeBufferLoops(ModuleOp module) {
     return failure();
   func::FuncOp kernel = *physical;
   auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
-  if (!llvm::all_of(space, [](Attribute attribute) {
+  bool singleInstance = llvm::all_of(space, [](Attribute attribute) {
         auto extent = cast<PhysicalExprAttr>(attribute);
         return extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
                extent.getValue() == 1;
-      }))
-    return success();
+      });
   auto [source, dimension] = nextPhysicalAxisIdentities(kernel);
-  if (failed(vectorizeIterations(kernel, source, dimension)))
+  if (failed(vectorizeIterations(kernel, source, dimension, singleInstance)))
     return failure();
   assignIterationRoles(kernel);
   eraseDeadPhysicalValues(kernel);
