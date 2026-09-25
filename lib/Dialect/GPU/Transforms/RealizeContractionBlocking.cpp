@@ -3958,16 +3958,21 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       }
     }
     Value initialAccumulator = contract.getAccumulator();
-    if (runtimeRowTraversal && failed(scalarSource(initialAccumulator))) {
-      FailureOr<Value> replayed = replaySourceValue(
-          rowBuilder, location, kernel, initialAccumulator,
-          sourceAxisIdentity(*rowMap), unitM, rowRange, rows, rowReplay,
-          contract.getOperation());
-      if (failed(replayed))
-        return contract.emitOpError(
-            "blocked contraction could not replay its row-dependent accumulator");
-      initialAccumulator = *replayed;
-    }
+    if (failed(scalarSource(initialAccumulator)))
+      for (auto [range, extent, coordinates] : {
+               std::tuple<MakeRangeOp, PhysicalExprAttr, Value>{rowRange, unitM, rows},
+               {columnRange, unitN, columns}}) {
+        IRMapping accumulatorReplay;
+        accumulatorReplay.map(range.getResult(), coordinates);
+        FailureOr<Value> replayed = replaySourceValue(
+            rowBuilder, location, initialAccumulator, extent,
+            ArrayRef<MakeRangeOp>{range}, coordinates, accumulatorReplay,
+            contract.getOperation());
+        if (failed(replayed))
+          return contract.emitOpError(
+              "blocked contraction could not replay its output-dependent accumulator");
+        initialAccumulator = *replayed;
+      }
     FailureOr<Value> accumulator = projectPhysicalValueToSchema(
         rowBuilder, location, initialAccumulator, blockedResultType);
     if (failed(accumulator))
