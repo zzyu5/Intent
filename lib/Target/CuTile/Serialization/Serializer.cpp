@@ -1229,7 +1229,11 @@ private:
       for (auto [result, initial] : llvm::zip(loop.getResults(), loop.getInitArgs())) {
         std::string name = newName();
         values[result] = name;
-        line(name + " = " + valueString(initial));
+        std::string initialValue = valueString(initial);
+        if (initial.getType().isIntOrIndex())
+          initialValue = "ct.astype(" + initialValue + ", " +
+                         pythonType(initial.getType()) + ")";
+        line(name + " = " + initialValue);
         results.push_back(name);
       }
       std::string induction = "iv" + std::to_string(counter++);

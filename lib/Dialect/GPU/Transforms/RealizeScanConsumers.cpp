@@ -177,10 +177,10 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
   while (names.contains(name))
     name += "_";
   Type element = original.getElementType();
-  auto integer = dyn_cast<IntegerType>(element);
   auto identity = match.identity.getDefiningOp<arith::ConstantOp>();
   auto zero = identity ? dyn_cast<IntegerAttr>(identity.getValue()) : IntegerAttr();
-  bool invertIntegerSum = integer && integer.getWidth() > 1 && zero &&
+  bool invertIntegerSum =
+      isa<IntegerType, IndexType>(element) && !element.isInteger(1) && zero &&
       zero.getValue().isZero() &&
       queryBinaryCombineKind(scan.getCombine()) == BinaryOperator::Add;
   auto chunk = getOrCreatePhysicalParameter(
