@@ -861,12 +861,12 @@ bool coordinateRangeWithinResource(Value coordinate, Value resource,
 bool valueMatchesExtent(Value value, PhysicalExprAttr extent);
 
 std::optional<std::pair<int64_t, int64_t>>
-positiveExtentBounds(func::FuncOp kernel, PhysicalExprAttr extent) {
+nonNegativeExtentBounds(func::FuncOp kernel, PhysicalExprAttr extent) {
   if (!extent)
     return std::nullopt;
   auto kind = static_cast<PhysicalExprKind>(extent.getKind());
   if (auto constant = constantPhysicalExpression(extent)) {
-    if (*constant <= 0)
+    if (*constant < 0)
       return std::nullopt;
     return std::pair{*constant, *constant};
   }
@@ -904,19 +904,20 @@ positiveExtentBounds(func::FuncOp kernel, PhysicalExprAttr extent) {
   }
   if (kind == PhysicalExprKind::NextPowerOfTwo &&
       extent.getOperands().size() == 1) {
-    auto bounds = positiveExtentBounds(
+    auto bounds = nonNegativeExtentBounds(
         kernel, cast<PhysicalExprAttr>(extent.getOperands()[0]));
     if (!bounds || bounds->second > (int64_t{1} << 62))
       return std::nullopt;
-    return std::pair{static_cast<int64_t>(llvm::PowerOf2Ceil(bounds->first)),
-                     static_cast<int64_t>(llvm::PowerOf2Ceil(bounds->second))};
+    return std::pair{static_cast<int64_t>(llvm::PowerOf2Ceil(
+                         std::max<int64_t>(1, bounds->first))),
+                     static_cast<int64_t>(llvm::PowerOf2Ceil(
+                         std::max<int64_t>(1, bounds->second)))};
   }
-  if ((kind != PhysicalExprKind::Multiply &&
-       kind != PhysicalExprKind::Minimum) || extent.getOperands().size() != 2)
+  if (extent.getOperands().size() != 2)
     return std::nullopt;
-  auto lhs = positiveExtentBounds(
+  auto lhs = nonNegativeExtentBounds(
       kernel, cast<PhysicalExprAttr>(extent.getOperands()[0]));
-  auto rhs = positiveExtentBounds(
+  auto rhs = nonNegativeExtentBounds(
       kernel, cast<PhysicalExprAttr>(extent.getOperands()[1]));
   if (kind == PhysicalExprKind::Minimum) {
     if (lhs && rhs)
@@ -926,16 +927,53 @@ positiveExtentBounds(func::FuncOp kernel, PhysicalExprAttr extent) {
       auto bound = known == 0 ? lhs : rhs;
       auto other = cast<PhysicalExprAttr>(extent.getOperands()[1 - known]);
       if (bound && physicalIndexSign(other, kernel) == IndexSign::Positive)
-        return std::pair{int64_t{1}, bound->second};
+        return std::pair{std::min<int64_t>(1, bound->first), bound->second};
     }
     return std::nullopt;
   }
   if (!lhs || !rhs)
     return std::nullopt;
-  __int128 maximum = static_cast<__int128>(lhs->second) * rhs->second;
-  if (maximum > std::numeric_limits<int64_t>::max())
+  __int128 minimum, maximum;
+  switch (kind) {
+  case PhysicalExprKind::Add:
+    minimum = static_cast<__int128>(lhs->first) + rhs->first;
+    maximum = static_cast<__int128>(lhs->second) + rhs->second;
+    break;
+  case PhysicalExprKind::Subtract:
+    minimum = static_cast<__int128>(lhs->first) - rhs->second;
+    maximum = static_cast<__int128>(lhs->second) - rhs->first;
+    break;
+  case PhysicalExprKind::Multiply:
+    minimum = static_cast<__int128>(lhs->first) * rhs->first;
+    maximum = static_cast<__int128>(lhs->second) * rhs->second;
+    break;
+  case PhysicalExprKind::Maximum:
+    minimum = std::max(lhs->first, rhs->first);
+    maximum = std::max(lhs->second, rhs->second);
+    break;
+  case PhysicalExprKind::FloorDiv:
+  case PhysicalExprKind::CeilDiv: {
+    if (rhs->first <= 0)
+      return std::nullopt;
+    bool ceil = kind == PhysicalExprKind::CeilDiv;
+    minimum = (static_cast<__int128>(lhs->first) +
+               (ceil ? rhs->second - 1 : 0)) / rhs->second;
+    maximum = (static_cast<__int128>(lhs->second) +
+               (ceil ? rhs->first - 1 : 0)) / rhs->first;
+    break;
+  }
+  default:
     return std::nullopt;
-  return std::pair{lhs->first * rhs->first, static_cast<int64_t>(maximum)};
+  }
+  if (minimum < 0 || maximum > std::numeric_limits<int64_t>::max())
+    return std::nullopt;
+  return std::pair{static_cast<int64_t>(minimum), static_cast<int64_t>(maximum)};
+}
+
+std::optional<std::pair<int64_t, int64_t>>
+positiveExtentBounds(func::FuncOp kernel, PhysicalExprAttr extent) {
+  auto bounds = nonNegativeExtentBounds(kernel, extent);
+  return bounds && bounds->first > 0 ? bounds : std::nullopt;
 }
 
 bool linearizedGatherWithinResource(Value coordinate, Value resource) {
@@ -2115,7 +2153,15 @@ IndexBounds queryIndexBounds(Value value) {
       if (binary.getOperatorKind() == BinaryOperator::Multiply &&
           (*rhsConstant == 0 || *lhsConstant <= maximum / *rhsConstant))
         return {true, expression(PhysicalExprKind::Constant,
-                                 *lhsConstant * *rhsConstant), lhs.lower * rhs.lower};
+                *lhsConstant * *rhsConstant), lhs.lower * rhs.lower};
+    }
+    if (binary.getOperatorKind() == BinaryOperator::Add &&
+        lhs.nonNegative && rhs.nonNegative && lhs.upper && rhs.upper) {
+      PhysicalExprAttr upper = expression(
+          PhysicalExprKind::Add, 0, {lhs.upper, rhs.upper});
+      auto kernel = binary->getParentOfType<func::FuncOp>();
+      if (nonNegativeExtentBounds(kernel, upper))
+        return {true, upper, lhs.lower + rhs.lower};
     }
     if (binary.getOperatorKind() == BinaryOperator::Minimum) {
       PhysicalExprAttr upper = lhs.upper && rhs.upper

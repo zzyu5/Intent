@@ -3587,6 +3587,12 @@ bool fitsNativeLoopBound(Value value, unsigned depth = 0) {
                ? attribute.getValue().getActiveBits() < 32
                : attribute.getValue().isSignedIntN(32);
   }
+  if (auto upper = gpu::queryNonNegativeIndexUpperBound(value)) {
+    auto bounds = gpu::queryPositiveExtentBounds(
+        upper, value.getParentRegion()->getParentOfType<func::FuncOp>());
+    if (bounds && llvm::isInt<32>(bounds->second))
+      return true;
+  }
   if (auto parameter = value.getDefiningOp<gpu::ParameterOp>())
     return llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
                         [](int64_t candidate) { return llvm::isInt<32>(candidate); });
@@ -3764,7 +3770,14 @@ void realizeWideLoops(func::FuncOp kernel) {
     };
     // Unit steps keep the terminating increment in range as well as the body IV.
     bool unitStep = maximumStep && *maximumStep == 1;
-    if (unitStep && fitsNativeLoopBound(loop.getLowerBound()) &&
+    bool boundedStep = unitStep;
+    if (!boundedStep && maximumStep)
+      if (auto upper = gpu::queryNonNegativeIndexUpperBound(loop.getUpperBound())) {
+        auto bounds = gpu::queryPositiveExtentBounds(upper, kernel);
+        boundedStep = bounds &&
+                      bounds->second <= int64_t{INT32_MAX} - *maximumStep + 1;
+      }
+    if (boundedStep && fitsNativeLoopBound(loop.getLowerBound()) &&
         fitsNativeLoopBound(loop.getUpperBound())) {
       auto replacement = nativeLoop(builder);
       loop.replaceAllUsesWith(replacement.getResults());
@@ -3861,6 +3874,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
     return failure();
   if (failed(materializeClosedConfigs(*kernel)))
     return failure();
+  gpu::foldScalarIntegerValues(*kernel);
   realizeWideLoops(*kernel);
   preserveNativeIndexValues(*kernel);
   if (failed(collapseArrayViews(module)))

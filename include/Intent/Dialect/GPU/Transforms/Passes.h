@@ -170,6 +170,7 @@ bool hasRangeContractForm(ContractOp contract,
                          llvm::SmallVectorImpl<StoreOp> *stores = nullptr);
 mlir::LogicalResult normalizeMatrixContractShapes(mlir::func::FuncOp kernel);
 void foldExactConstantDivisions(mlir::func::FuncOp kernel);
+void foldScalarIntegerValues(mlir::func::FuncOp kernel);
 mlir::LogicalResult materializeProgramBuffers(mlir::ModuleOp module);
 mlir::LogicalResult lowerInvocationWorkspaces(mlir::ModuleOp module);
 mlir::LogicalResult orientLoopContractions(mlir::ModuleOp module);

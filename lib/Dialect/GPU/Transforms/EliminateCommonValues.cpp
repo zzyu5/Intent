@@ -156,6 +156,35 @@ void eliminateInBlock(Block &block) {
 
 } // namespace
 
+void foldScalarIntegerValues(func::FuncOp kernel) {
+  UniformValueAnalysis analysis(describeUniformValue);
+  kernel.walk([&](Operation *operation) {
+    if (operation->getNumResults() != 1 || operation->getNumRegions() != 0 ||
+        !operation->getResult(0).getType().isIntOrIndex() ||
+        isa<arith::ConstantOp, ParameterOp>(operation) || !isPure(operation))
+      return;
+    Value result = operation->getResult(0);
+    if (auto select = dyn_cast<SelectOp>(operation)) {
+      if (auto condition = uniformBoolean(analysis.evaluate(select.getCondition()))) {
+        result.replaceAllUsesWith(*condition ? select.getTrueValue()
+                                              : select.getFalseValue());
+        select.erase();
+        return;
+      }
+    }
+    auto constant = dyn_cast_or_null<IntegerAttr>(analysis.evaluate(result));
+    if (!constant || constant.getType() != result.getType())
+      return;
+    OpBuilder builder(operation);
+    auto folded = builder.create<arith::ConstantOp>(
+        operation->getLoc(), result.getType(), constant);
+    folded->setDiscardableAttrs(
+        llvm::to_vector(operation->getDiscardableAttrs()));
+    result.replaceAllUsesWith(folded);
+    operation->erase();
+  });
+}
+
 void foldExactConstantDivisions(func::FuncOp kernel) {
   auto capabilities =
       kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
@@ -250,6 +279,7 @@ LogicalResult eliminateCommonValues(ModuleOp module) {
   FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
+  foldScalarIntegerValues(*kernel);
   kernel->walk<WalkOrder::PostOrder>([&](LoopLikeOpInterface loop) {
     moveLoopInvariantCode(
         loop.getLoopRegions(),

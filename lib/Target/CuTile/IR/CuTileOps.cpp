@@ -151,12 +151,12 @@ LogicalResult verifyFullTileCondition(TileLoadOp load) {
     auto remainder = equal.getLhs().getDefiningOp<gpu::BinaryOp>();
     auto size = remainder ? remainder.getLhs().getDefiningOp<gpu::DimOp>()
                           : gpu::DimOp();
-    auto width = remainder ? remainder.getRhs().getDefiningOp<gpu::PhysicalExprOp>()
-                           : gpu::PhysicalExprOp();
+    auto width = remainder ? gpu::queryLaunchExpression(remainder.getRhs())
+                           : gpu::PhysicalExprAttr();
     if (!remainder || remainder.getOperatorKind() != BinaryOperator::Remainder ||
         !size || !width || size.getView() != load.getResource() ||
         size.getAxis() >= view.getRank() ||
-        width.getExpression() != shape[size.getAxis()])
+        width != shape[size.getAxis()])
       return load.emitOpError("full-tile proof must describe this native load");
     covered[size.getAxis()] = true;
   }
