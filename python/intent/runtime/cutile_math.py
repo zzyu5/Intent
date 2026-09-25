@@ -1,8 +1,9 @@
 """Tile implementations of ordinary floating-point library operations."""
 
-# The erf/erfc rational coefficients and intervals are from fdlibm:
+# The erf/erfc/lgamma rational coefficients and intervals are from fdlibm:
 # https://github.com/JuliaMath/openlibm/blob/master/src/s_erff.c
 # https://github.com/JuliaMath/openlibm/blob/master/src/s_erf.c
+# https://github.com/JuliaMath/openlibm/blob/master/src/e_lgammaf_r.c
 # Float conversion by Ian Lance Taylor, Cygnus Support.
 # Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
 # Developed at SunPro, a Sun Microsystems, Inc. business.
@@ -179,70 +180,93 @@ def log1p(x):
     return ct.astype(ct.astype(value, ct.float32), x.dtype)
 
 
-# Lanczos13m53 coefficients from Boost.Math, copyright John Maddock 2006.
-# https://github.com/boostorg/math/blob/boost-1.85.0/include/boost/math/special_functions/lanczos.hpp
-# Boost Software License - Version 1.0 - August 17th, 2003
-# Permission is hereby granted, free of charge, to any person or organization
-# obtaining a copy of the software and accompanying documentation covered by
-# this license (the "Software") to use, reproduce, display, distribute,
-# execute, and transmit the Software, and to prepare derivative works of the
-# Software, and to permit third-parties to whom the Software is furnished to
-# do so, all subject to the following:
-# The copyright notices in the Software and this entire statement, including
-# the above license grant, this restriction and the following disclaimer,
-# must be included in all copies of the Software, in whole or in part, and
-# all derivative works of the Software, unless such copies or derivative
-# works are solely in the form of machine-executable object code generated
-# by a source language processor.
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. IN NO EVENT
-# SHALL THE COPYRIGHT HOLDERS OR ANYONE DISTRIBUTING THE SOFTWARE BE LIABLE
-# FOR ANY DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE,
-# ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-# DEALINGS IN THE SOFTWARE.
+@ct.function
+def _horner(x, coefficients: ct.Constant):
+    value = ct.full(x.shape, coefficients[0], dtype=x.dtype)
+    for coefficient in ct.static_iter(coefficients[1:]):
+        value = value * x + coefficient
+    return value
+
+
+@ct.function
+def _lgamma_positive(x):
+    small_x = ct.minimum(x, 2.0)
+    bits = ct.bitcast(small_x, ct.uint32)
+    shift = bits <= 0x3F666666
+    near_two = ct.where(shift, bits >= 0x3F3B4A20, bits >= 0x3FDDA618)
+    near_minimum = ct.where(shift, bits >= 0x3E6D3308, bits >= 0x3F9DA620)
+    y = ct.where(shift, 1.0 - small_x, 2.0 - small_x)
+    z = y * y
+    p1 = _horner(z, (2.5214456400e-05, 2.2086278477e-04, 1.1927076848e-03,
+                     7.3855509982e-03, 6.7352302372e-02, 7.7215664089e-02))
+    p2 = z * _horner(z, (4.4864096708e-05, 1.0801156895e-04, 5.1006977446e-04,
+                         2.8905137442e-03, 2.0580807701e-02, 3.2246702909e-01))
+    around_two = (y * p1 + p2) - 0.5 * y
+
+    center = ct.float32(1.4616321325)
+    y = ct.where(shift, small_x - (center - 1.0), small_x - center)
+    z = y * y
+    w = z * y
+    p1 = _horner(w, (3.1563205994e-04, -1.4034647029e-03, 6.1005386524e-03,
+                     -3.2788541168e-02, 4.8383611441e-01))
+    p2 = _horner(w, (-3.1275415677e-04, 8.8108185446e-04, -3.6845202558e-03,
+                     1.7970675603e-02, -1.4758771658e-01))
+    p3 = _horner(w, (3.3552918467e-04, -5.3859531181e-04, 2.2596477065e-03,
+                     -1.0314224288e-02, 6.4624942839e-02))
+    around_minimum = -1.2148628384e-01 + (
+        z * p1 - (6.6971006518e-09 - w * (p2 + y * p3)))
+
+    y = ct.where(shift, small_x, small_x - 1.0)
+    p1 = y * _horner(y, (1.3381091878e-02, 2.2896373272e-01, 9.7771751881e-01,
+                         1.4549225569e+00, 6.3282704353e-01, -7.7215664089e-02))
+    p2 = _horner(y, (3.2170924824e-03, 1.0422264785e-01, 7.6928514242e-01,
+                     2.1284897327e+00, 2.4559779167e+00, 1.0))
+    around_one = -0.5 * y + p1 / p2
+    small = ct.where(near_two, around_two,
+                     ct.where(near_minimum, around_minimum, around_one))
+    small_log = ct.log(small_x)
+    small = small + ct.where(shift, -small_log, 0.0)
+
+    middle_x = ct.minimum(ct.maximum(x, 2.0), 8.0)
+    y = middle_x - ct.floor(middle_x)
+    p = y * _horner(y, (3.1947532989e-05, 1.8402845599e-03, 2.6642270386e-02,
+                        1.4635047317e-01, 3.2577878237e-01, 2.1498242021e-01,
+                        -7.7215664089e-02))
+    q = _horner(y, (7.3266842264e-06, 7.7794247773e-04, 1.8645919859e-02,
+                    1.7193385959e-01, 7.2193557024e-01, 1.3920053244e+00, 1.0))
+    product = ct.full(x.shape, 1.0, dtype=x.dtype)
+    for offset in ct.static_iter((6, 5, 4, 3, 2)):
+        product = product * ct.where(middle_x >= offset + 1, y + offset, 1.0)
+    middle = 0.5 * y + p / q + ct.log(product)
+
+    large_x = ct.maximum(x, 8.0)
+    inverse = 1.0 / large_x
+    correction = 4.1893854737e-01 + inverse * _horner(inverse * inverse, (
+        -1.6309292987e-03, 8.3633989561e-04, -5.9518753551e-04,
+        7.9365057172e-04, -2.7777778450e-03, 8.3333335817e-02))
+    logarithm = ct.log(large_x) - 1.0
+    large = ct.where(large_x < 2.0 ** 58,
+                     (large_x - 0.5) * logarithm + correction,
+                     large_x * logarithm)
+    value = ct.where(x < 2.0, small, ct.where(x < 8.0, middle, large))
+    value = ct.where(x < 2.0 ** -21, -small_log, value)
+    return ct.where((x == 1.0) | (x == 2.0), 0.0, value)
 
 
 @ct.function
 def lgamma(x):
-    wide = ct.astype(x, ct.float64)
-    positive = ct.where(wide < 0.5, 1.0 - wide, wide)
-    inverse = 1.0 / positive
-    # Evaluate the reversed rational function at 1/z to avoid polynomial
-    # overflow for the full finite f32 input range.
-    numerator = inverse * 56906521.91347156388090791033559122686859 + 103794043.1163445451906271053616070238554
-    numerator = numerator * inverse + 86363131.28813859145546927288977868422342
-    numerator = numerator * inverse + 43338889.32467613834773723740590533316085
-    numerator = numerator * inverse + 14605578.08768506808414169982791359218571
-    numerator = numerator * inverse + 3481712.15498064590882071018964774556468
-    numerator = numerator * inverse + 601859.6171681098786670226533699352302507
-    numerator = numerator * inverse + 75999.29304014542649875303443598909137092
-    numerator = numerator * inverse + 6955.999602515376140356310115515198987526
-    numerator = numerator * inverse + 449.9445569063168119446858607650988409623
-    numerator = numerator * inverse + 19.51992788247617482847860966235652136208
-    numerator = numerator * inverse + 0.5098416655656676188125178644804694509993
-    numerator = numerator * inverse + 0.006061842346248906525783753964555936883222
-    denominator = inverse * 39916800.0 + 120543840.0
-    denominator = denominator * inverse + 150917976.0
-    denominator = denominator * inverse + 105258076.0
-    denominator = denominator * inverse + 45995730.0
-    denominator = denominator * inverse + 13339535.0
-    denominator = denominator * inverse + 2637558.0
-    denominator = denominator * inverse + 357423.0
-    denominator = denominator * inverse + 32670.0
-    denominator = denominator * inverse + 1925.0
-    denominator = denominator * inverse + 66.0
-    denominator = denominator * inverse + 1.0
-    shifted = positive + 5.524680040776729583740234375
-    value = (positive - 0.5) * (ct.log(shifted) - 1.0) + ct.log(numerator / denominator)
-    # Reducing around the nearest integer also preserves tiny negative inputs;
-    # reducing into [0, 1) would round their fraction to one.
-    fraction = wide - ct.floor(wide + 0.5)
-    sine = ct.abs(ct.sin(fraction * 3.141592653589793238462643383279502884))
-    reflected = 1.144729885849400174143427351353058712 - ct.log(sine) - value
-    value = ct.where(wide < 0.5, reflected, value)
-    value = ct.where((wide == 1.0) | (wide == 2.0), 0.0, value)
-    pole = (wide <= 0.0) & (wide == ct.floor(wide))
-    value = ct.where(pole | (ct.abs(wide) == float("inf")), float("inf"), value)
-    value = ct.where(ct.isnan(wide), wide, value)
+    ordinary = ct.astype(x, ct.float32)
+    magnitude = ct.abs(ordinary)
+    value = _lgamma_positive(magnitude)
+    reflected_region = (ordinary < 0.0) & (magnitude >= 2.0 ** -21)
+    if ct.max(ct.astype(reflected_region, ct.int32)) != 0:
+        # Nonintegral negative f32 arguments have magnitude below 2**23.
+        # Nearest-integer reduction keeps sin's argument within [-pi/2, pi/2].
+        fraction = ordinary - ct.floor(ordinary + 0.5)
+        sine = ct.abs(ct.sin(fraction * 3.1415927410))
+        reflected = ct.log(3.1415927410 / (sine * magnitude)) - value
+        value = ct.where(reflected_region, reflected, value)
+    pole = (ordinary <= 0.0) & (ordinary == ct.floor(ordinary))
+    value = ct.where(pole | (magnitude == float("inf")), float("inf"), value)
+    value = ct.where(ct.isnan(ordinary), ordinary, value)
     return ct.astype(ct.astype(value, ct.float32), x.dtype)

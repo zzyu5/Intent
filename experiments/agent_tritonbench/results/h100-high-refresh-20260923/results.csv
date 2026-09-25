@@ -97,5 +97,5 @@ fused_avg_pool2d_cosine_similarity,1,0.0432319995,0.0665600002,0.01168,0.0116960
 erfc_sqrt,8,0.0145439999,0.00867999997,0.00886399997,0.011775999795645475,reference_pass,pass,pass,pass,cuda_graph,,,,,erfc_sqrt/intent/candidate.py
 softmax_log,6,0.012352,0.00804000022,0.008928,0.00936000003,reference_pass,pass,pass,pass,cuda_graph,,,,,softmax_log/intent/candidate.py
 batch_norm,0,0.195992,0.116048001,0.131104,0.135360003,reference_pass,pass,pass,pass,cuda_graph,,,,,batch_norm/intent/candidate.py
-gammaln,8,0.00915199984,0.010704,0.00836000033,0.0213600006,reference_pass,pass,pass,pass,cuda_graph,,,,,gammaln/intent/candidate.py
+gammaln,8,0.00915199984,0.010704,0.00836000033,0.017151999287307262,reference_pass,pass,pass,pass,cuda_graph,,,,,gammaln/intent/candidate.py
 bitwise_and,8,0.00927999988,0.00943200011,0.00949599966,0.00935200043,reference_pass,pass,pass,pass,cuda_graph,,,,,bitwise_and/intent/candidate.py
