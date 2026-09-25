@@ -1830,23 +1830,6 @@ private:
         return rangeExtent(location, range->getLogicalStart(),
                            range->getLogicalStop(), range->getStep());
       }
-      if (auto load = resource.getDefiningOp<gpu::LoadOp>()) {
-        auto view = dyn_cast<gpu::ViewType>(load.getResource().getType());
-        auto mapping = dyn_cast<gpu::AxisMapAttr>(fragment.getAxisMaps()[axis]);
-        if (view && mapping) {
-          FailureOr<unsigned> coordinate = gpu::queryCoordinatePosition(
-              load.getCoordinates(), gpu::sourceAxisIdentity(mapping));
-          if (succeeded(coordinate) &&
-              *coordinate < load.getSourceAxes().size()) {
-            int64_t sourceAxis = load.getSourceAxes()[*coordinate];
-            if (sourceAxis >= 0 &&
-                sourceAxis < static_cast<int64_t>(view.getRank()))
-              return Value(builder.create<gpu::DimOp>(
-                  location, builder.getIndexType(), load.getResource(),
-                  sourceAxis));
-          }
-        }
-      }
       extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
     } else {
       return failure();
