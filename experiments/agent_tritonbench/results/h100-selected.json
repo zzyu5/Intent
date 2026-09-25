@@ -1,7 +1,7 @@
 {
   "measured_on": "2026-09-22",
   "measurement_kind": "development_recheck_of_selected_programs",
-  "scope_note": "已选程序的开发复测；包含编译器修复和材料改进后的独立新提交，不是一轮全新 Luna high 100 题首次生成成绩。原始单次提交程序及其旧成绩保留。",
+  "scope_note": "本 JSON 保留 2026-09-22 的历史开发复测记录和统计，不是一轮全新 Luna high 100 题首次生成成绩。h100-selected.csv 当前使用 h100-high-refresh-20260923/results.csv 的最新开发结果，不再对应本 JSON 的历史 summary/records；原始单次提交程序及其旧成绩保留。",
   "hardware": {
     "device": "NVIDIA H100 80GB HBM3",
     "compute_capability": [
@@ -24,6 +24,7 @@
   "source_artifact": "first-stage-performance-h100-current-selected-full-20260922b",
   "result_files": {
     "operator_comparison": "h100-selected.csv",
+    "operator_comparison_source": "h100-high-refresh-20260923/results.csv",
     "measurements": "原 records 保留 172 条 Intent→Triton/agent Triton 实测；cutile.records 增加相同 Intent 程序的 100 条 cuTile 开发复测。"
   },
   "units": {
