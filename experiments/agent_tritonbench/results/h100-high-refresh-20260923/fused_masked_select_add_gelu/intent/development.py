@@ -4,7 +4,7 @@ import intent.language as I
 
 
 ELEMENTS = 1048576
-GROUPS = 1024
+GROUPS = 4096
 SEGMENT = ELEMENTS // GROUPS
 
 
