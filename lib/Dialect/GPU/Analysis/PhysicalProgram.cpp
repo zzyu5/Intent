@@ -3226,6 +3226,22 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     }
     return;
   }
+  if (auto fold = dyn_cast<RegionFoldOp>(operation)) {
+    auto opResult = dyn_cast<OpResult>(value);
+    auto yield = dyn_cast<YieldOp>(fold.getSummarize().front().getTerminator());
+    if (!opResult || !yield ||
+        opResult.getResultNumber() >= fold.getIdentityCount() ||
+        opResult.getResultNumber() >= yield.getValues().size()) {
+      result.state = PhysicalFactState::Unknown;
+      appendUnique(result.blockers, operation);
+      return;
+    }
+    unsigned index = opResult.getResultNumber();
+    collectAxisRanges(fold.getInputs()[fold.getSourceCount() + index],
+                      fragmentAxis, result, visited);
+    collectAxisRanges(yield.getValues()[index], fragmentAxis, result, visited);
+    return;
+  }
   if (auto reduce = dyn_cast<ReduceOp>(operation)) {
     auto opResult = dyn_cast<OpResult>(value);
     auto yield = dyn_cast<YieldOp>(reduce.getCombine().front().getTerminator());
