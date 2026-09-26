@@ -100,6 +100,21 @@ widenedConstantReciprocal(const llvm::APFloat &divisor) {
   return inverse;
 }
 
+bool foldConstantSelection(SelectOp select) {
+  if (!select)
+    return false;
+  auto condition = uniformBoolean(
+      UniformValueAnalysis(describeUniformValue).evaluate(select.getCondition()));
+  if (!condition)
+    return false;
+  Value selected = *condition ? select.getTrueValue() : select.getFalseValue();
+  if (selected.getType() != select.getResult().getType())
+    return false;
+  select.getResult().replaceAllUsesWith(selected);
+  select.erase();
+  return true;
+}
+
 void combineNestedSelections(SelectOp select) {
   if (!select)
     return;
@@ -151,6 +166,8 @@ void eliminateInBlock(Block &block) {
         eliminateInBlock(nested);
     if (foldConstantDivision(operation))
       continue;
+    if (foldConstantSelection(dyn_cast<SelectOp>(operation)))
+      continue;
     combineNestedSelections(dyn_cast<SelectOp>(operation));
     if (auto reshape = dyn_cast<ReshapeOp>(operation);
         reshape && reshape.getValue().getType() == reshape.getResult().getType()) {
@@ -195,14 +212,8 @@ void foldScalarIntegerValues(func::FuncOp kernel) {
         !isPure(operation))
       return;
     Value result = operation->getResult(0);
-    if (auto select = dyn_cast<SelectOp>(operation)) {
-      if (auto condition = uniformBoolean(analysis.evaluate(select.getCondition()))) {
-        result.replaceAllUsesWith(*condition ? select.getTrueValue()
-                                              : select.getFalseValue());
-        select.erase();
-        return;
-      }
-    }
+    if (foldConstantSelection(dyn_cast<SelectOp>(operation)))
+      return;
     auto constant = dyn_cast_or_null<IntegerAttr>(analysis.evaluate(result));
     if (!constant || constant.getType() != result.getType())
       return;
