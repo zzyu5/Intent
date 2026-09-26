@@ -1449,6 +1449,10 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
   }
   if (!warps || !stages || !ctas)
     return kernel.emitError("Triton provider parameter domains are incomplete");
+  bool stagesInKernel = false;
+  kernel.walk([&](scf::ForOp loop) {
+    stagesInKernel |= loop->hasAttr(loopStagesAttr);
+  });
   int64_t maximumWarps = *llvm::max_element(warps->candidates);
   SmallVector<gpu::PhysicalExprAttr> collectiveFootprints;
   for (gpu::FragmentType fragment : collectiveFragments(kernel)) {
@@ -1488,6 +1492,8 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
         config.warps = options.warps;
         config.stages = options.stages;
         config.ctas = options.ctas;
+        if (stagesInKernel)
+          config.kernelParameters[stages->name.str()] = options.stages;
         if (llvm::none_of(configs, [&](const TritonConfig &existing) {
               return existing.kernelParameters == config.kernelParameters &&
                      existing.warps == config.warps &&
@@ -3474,6 +3480,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
   }
 
   llvm::SmallDenseSet<uint32_t> providerRoles;
+  gpu::ParameterAttr stageParameter;
   LogicalResult parameterSchema = success();
   kernel.walk([&](gpu::ParameterOp parameter) {
     uint32_t role = parameter.getParameter().getRole();
@@ -3491,6 +3498,8 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     }
     if (!providerRole)
       return;
+    if (role == static_cast<uint32_t>(gpu::ParameterRole::ProviderStages))
+      stageParameter = parameter.getParameter();
     if (!providerRoles.insert(role).second) {
       parameter.emitOpError("duplicates a Triton provider-parameter role");
       parameterSchema = failure();
@@ -3510,6 +3519,14 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     return failure();
 
   WalkResult result = kernel.walk([&](Operation *operation) {
+    if (operation->hasAttr(loopStagesAttr)) {
+      auto binding = operation->getAttrOfType<gpu::ParameterAttr>(loopStagesAttr);
+      if (!isa<scf::ForOp>(operation) || !binding || binding != stageParameter) {
+        operation->emitOpError(
+            "loop stages must bind the declared Triton stage parameter");
+        return WalkResult::interrupt();
+      }
+    }
     if (auto assertion = dyn_cast<cf::AssertOp>(operation)) {
       auto compare = assertion.getArg().getDefiningOp<gpu::CompareOp>();
       if (!compare || !llvm::all_of(compare->getOperands(), [&](Value operand) {
@@ -4095,13 +4112,56 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
   return synchronize(kernel.front(), false, true, pending);
 }
 
+SmallVector<scf::ForOp> findLoadPipelineLoops(func::FuncOp kernel) {
+  SmallVector<scf::ForOp> loops;
+  kernel.walk([&](scf::ForOp loop) {
+    bool vectorLoad = false;
+    for (Operation &operation : loop.getBody()->without_terminator()) {
+      if (isa<gpu::ContractOp, gpu::ScaledContractOp, gpu::SparseContractOp>(
+              operation) ||
+          (operation.getNumRegions() &&
+           !isa<gpu::ReduceOp, gpu::ScanOp>(operation)))
+        return;
+      if (auto load = dyn_cast<gpu::LoadOp>(operation)) {
+        if (!isa<gpu::ViewType>(load.getResource().getType()))
+          return;
+        for (Value carry : loop.getRegionIterArgs())
+          for (Value operand : load->getOperands()) {
+            llvm::SmallDenseSet<Value, 32> visited;
+            if (valueDependsOn(operand, carry, loop, visited))
+              return;
+          }
+        vectorLoad |= isa<gpu::FragmentType>(load.getResult().getType());
+      } else if (auto store = dyn_cast<gpu::StoreOp>(operation)) {
+        if (!isa<gpu::ViewType>(store.getResource().getType()))
+          return;
+        SmallVector<Value> addressing{store.getResource()};
+        llvm::append_range(addressing, store.getCoordinates());
+        if (store.getValid())
+          addressing.push_back(store.getValid());
+        for (Value carry : loop.getRegionIterArgs())
+          for (Value operand : addressing) {
+            llvm::SmallDenseSet<Value, 32> visited;
+            if (valueDependsOn(operand, carry, loop, visited))
+              return;
+          }
+      } else if (!isMemoryEffectFree(&operation)) {
+        return;
+      }
+    }
+    if (vectorLoad)
+      loops.push_back(loop);
+  });
+  return loops;
+}
+
 void selectOrderedLoadUnrolling(func::FuncOp kernel) {
   UniformValueAnalysis constants(gpu::describeUniformValue);
   auto integer = [&](Value value) {
     return dyn_cast_or_null<IntegerAttr>(constants.evaluate(value));
   };
   kernel.walk([&](scf::ForOp loop) {
-    if (loop.getNumResults() != 1 ||
+    if (loop->hasAttr(loopStagesAttr) || loop.getNumResults() != 1 ||
         !isa<FloatType>(gpu::uniformElementType(loop.getResult(0).getType())))
       return;
     auto lower = integer(loop.getLowerBound());
@@ -4250,6 +4310,8 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
          operation->getParentOfType<scf::ForOp>() &&
          !isMemoryEffectFree(operation));
   });
+  SmallVector<scf::ForOp> loadPipelineLoops = findLoadPipelineLoops(kernel);
+  pipelineStagesAffectProgram |= !loadPipelineLoops.empty();
   SmallVector<TritonLocalOptions> localOptions;
   SmallVector<int64_t> warpDomain, stageDomain, ctaDomain;
   auto isDeviceOption = [&](int64_t warps, int64_t stages, int64_t ctas) {
@@ -4307,6 +4369,14 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
                            stageDomain);
   declareProviderParameter("NUM_CTAS", gpu::ParameterRole::ProviderCTAs,
                            ctaDomain);
+  if (!loadPipelineLoops.empty()) {
+    auto stages =
+        gpu::queryParameterBySymbol(kernel, builder.getStringAttr("NUM_STAGES"));
+    if (failed(stages))
+      return failure();
+    for (scf::ForOp loop : loadPipelineLoops)
+      loop->setAttr(loopStagesAttr, stages->getParameter());
+  }
   if (failed(gpu::verifyGPUProgram(module)) ||
       failed(gpu::lowerInvocationWorkspaces(module)))
     return failure();

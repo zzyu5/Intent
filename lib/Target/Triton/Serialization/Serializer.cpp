@@ -672,9 +672,17 @@ private:
       auto role = static_cast<gpu::ParameterRole>(
           parameter.getParameter().getRole());
       if (role == gpu::ParameterRole::ProviderWarps ||
-          role == gpu::ParameterRole::ProviderStages ||
           role == gpu::ParameterRole::ProviderCTAs)
         return;
+      if (role == gpu::ParameterRole::ProviderStages) {
+        bool bound = false;
+        kernel.walk([&](scf::ForOp loop) {
+          bound |= loop->getAttrOfType<gpu::ParameterAttr>(loopStagesAttr) ==
+                   parameter.getParameter();
+        });
+        if (!bound)
+          return;
+      }
       std::string name = parameter.getParameter().getName().getValue().str();
       parameters.push_back(name);
       values[parameter.getResult()] = name;
@@ -1427,12 +1435,15 @@ private:
         values[argument] = name;
       auto unroll = loop->getAttrOfType<IntegerAttr>(
           "intent_gpu.triton.loop_unroll_factor");
-      std::string range = unroll ? "tl.range(" : "range(";
+      auto stages = loop->getAttrOfType<gpu::ParameterAttr>(loopStagesAttr);
+      std::string range = unroll || stages ? "tl.range(" : "range(";
       range += valueString(loop.getLowerBound()) + ", " +
                valueString(loop.getUpperBound()) + ", " +
                valueString(loop.getStep());
       if (unroll)
         range += ", loop_unroll_factor=" + std::to_string(unroll.getInt());
+      if (stages)
+        range += ", num_stages=" + stages.getName().getValue().str();
       line("for " + induction + " in " + range + "):");
       ++indent;
       emitBlock(*loop.getBody(), true, results);
