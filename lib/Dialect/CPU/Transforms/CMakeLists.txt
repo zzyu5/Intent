@@ -25,6 +25,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   MLIRArithDialect
   MLIRFuncDialect
   MLIRLinalgDialect
+  MLIRLinalgTransforms
   MLIRMathDialect
   MLIRMemRefDialect
   MLIRSCFDialect

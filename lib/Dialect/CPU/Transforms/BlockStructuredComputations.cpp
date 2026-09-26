@@ -8,8 +8,8 @@ namespace intent::cpu {
 namespace {
 
 LogicalResult block(linalg::GenericOp operation, int64_t width) {
-  if (operation.getOutputs().size() != 1 || operation.getNumResults())
-    return operation.emitError("bounded structured implementation requires one destination buffer");
+  if (operation.getOutputs().empty() || operation.getNumResults())
+    return operation.emitError("bounded structured implementation requires destination buffers");
   auto maps = operation.getIndexingMapsArray();
   if (llvm::any_of(maps, [](AffineMap map) {
         return map.getNumSymbols() || llvm::any_of(map.getResults(), [](AffineExpr expression) {

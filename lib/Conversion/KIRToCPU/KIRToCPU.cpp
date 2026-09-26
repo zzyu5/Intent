@@ -1252,6 +1252,8 @@ private:
     });
     reduction->setAttr("intent_cpu.reduction_order",
         cpu::ReductionOrderAttr::get(builder.getContext(), true));
+    // Ordinary reduce permits element permutation; region/scan order does not.
+    reduction->setAttr("intent_cpu.permutable_reduction", builder.getUnitAttr());
     if (failed(status)) return failure();
     bindSlots(operation.getResults(), outputs, loc);
     return success();

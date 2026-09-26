@@ -3,6 +3,7 @@
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 using namespace mlir;
@@ -30,26 +31,27 @@ bool materializeProductReduction(linalg::GenericOp operation) {
   auto order = operation->getAttrOfType<ReductionOrderAttr>("intent_cpu.reduction_order");
   auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
   auto widthAttr = binding ? dyn_cast_or_null<IntegerAttr>(binding.getParameters().get("vector_width")) : IntegerAttr{};
-  if (!order || !order.getAdjacentReassociation() || !widthAttr || widthAttr.getInt() <= 1)
+  int64_t width = widthAttr ? widthAttr.getInt() : 0;
+  if (!order || !order.getAdjacentReassociation() || width <= 1)
     return false;
-  int64_t width = widthAttr.getInt();
   if (width & (width - 1)) return false;
   unsigned components = operation.getOutputs().size(), inputs = operation.getInputs().size();
   // Multi-output generics retain the source/combine boundary established by
   // structured reduction construction; single-output producer fusion does not.
   if (components < 2 || inputs < components || !operation.getNumLoops()) return false;
   auto iterators = operation.getIteratorTypesArray();
-  if (iterators.back() != utils::IteratorType::reduction ||
-      !llvm::all_of(ArrayRef(iterators).drop_back(), [](utils::IteratorType iterator) {
-        return iterator == utils::IteratorType::parallel;
-      })) return false;
+  if (iterators.back() != utils::IteratorType::reduction) return false;
   auto maps = operation.getIndexingMapsArray();
   auto sourceType = dyn_cast<MemRefType>(operation.getInputs()[0].getType());
   if (!sourceType || sourceType.getRank() != operation.getNumLoops()) return false;
   auto scalarType = [](Type type) { return isa<FloatType, IntegerType, IndexType>(type); };
   SmallVector<AffineExpr> freeAxes;
+  SmallVector<int64_t> outputShape;
   for (unsigned axis = 0; axis + 1 < operation.getNumLoops(); ++axis)
-    freeAxes.push_back(getAffineDimExpr(axis, operation.getContext()));
+    if (iterators[axis] == utils::IteratorType::parallel) {
+      freeAxes.push_back(getAffineDimExpr(axis, operation.getContext()));
+      outputShape.push_back(sourceType.getDimSize(axis));
+    }
   auto outputMap = AffineMap::get(operation.getNumLoops(), 0, freeAxes, operation.getContext());
   SmallVector<bool> vectorLoads(components, false);
   for (unsigned component = 0; component < components; ++component) {
@@ -61,7 +63,7 @@ bool materializeProductReduction(linalg::GenericOp operation) {
         source.getElementType() != output.getElementType() ||
         !scalarType(source.getElementType()) ||
         !maps[component].isIdentity() || maps[inputs + component] != outputMap ||
-        output.getShape() != sourceType.getShape().drop_back() ||
+        output.getShape() != ArrayRef<int64_t>(outputShape) ||
         failed(source.getStridesAndOffset(strides, offset)))
       return false;
     vectorLoads[component] = strides.back() == 1 && !source.getElementType().isInteger(1);
@@ -83,6 +85,7 @@ bool materializeProductReduction(linalg::GenericOp operation) {
         (!isa<arith::ConstantOp>(instruction) && !instruction.hasTrait<OpTrait::Elementwise>()))
       return false;
   auto function = operation->getParentOfType<func::FuncOp>();
+  bool accumulatePartials = operation->hasAttr("intent_cpu.permutable_reduction");
   PhysicalProgramAnalysis physical(function);
   AliasAnalysis aliases(function);
   auto abi = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
@@ -150,8 +153,9 @@ bool materializeProductReduction(linalg::GenericOp operation) {
     b.setInsertionPointToStart(active.thenBlock());
     position.back() = zero;
     SmallVector<Value> initials, captures;
+    auto outputPosition = coordinates(b, loc, outputMap, position);
     for (Value output : operation.getOutputs())
-      initials.push_back(b.create<memref::LoadOp>(loc, output, ValueRange(position).drop_back()));
+      initials.push_back(b.create<memref::LoadOp>(loc, output, outputPosition));
     for (unsigned number = components; number < inputs; ++number) {
       Value value = operation.getInputs()[number];
       if (isa<MemRefType>(value.getType()))
@@ -160,11 +164,25 @@ bool materializeProductReduction(linalg::GenericOp operation) {
     }
     Value step = index(b, loc, width);
     Value completeEnd = b.create<arith::SubIOp>(loc, extent, b.create<arith::RemSIOp>(loc, extent, step));
-    auto blocks = b.create<scf::ForOp>(loc, zero, completeEnd, step, initials);
-    {
-      OpBuilder::InsertionGuard blockGuard(b);
-      b.setInsertionPointToStart(blocks.getBody());
-      position.back() = blocks.getInductionVar();
+    auto horizontal = [&](SmallVector<Value> partial) {
+      for (int64_t count = width; count > 1; count /= 2) {
+        SmallVector<int64_t> even, odd;
+        for (int64_t lane = 0; lane < count; lane += 2) {
+          even.push_back(lane);
+          odd.push_back(lane + 1);
+        }
+        SmallVector<Value> left, right;
+        for (Value value : partial) {
+          left.push_back(b.create<vector::ShuffleOp>(loc, value, value, even));
+          right.push_back(b.create<vector::ShuffleOp>(loc, value, value, odd));
+        }
+        partial = combine(left, right, captures, count / 2);
+      }
+      for (Value &value : partial) value = b.create<vector::ExtractElementOp>(loc, value, zero);
+      return partial;
+    };
+    auto loadBlock = [&](Value begin) {
+      position.back() = begin;
       SmallVector<Value> partial;
       for (auto [component, source] : llvm::enumerate(operation.getInputs().take_front(components))) {
         auto type = VectorType::get({width}, cast<MemRefType>(source.getType()).getElementType());
@@ -181,25 +199,42 @@ bool materializeProductReduction(linalg::GenericOp operation) {
         }
         partial.push_back(b.create<vector::FromElementsOp>(loc, type, lanes));
       }
-      // Reduce adjacent ranges using the entire product combine. Components
-      // cannot use independent reductions: predicates may relate value/index.
-      for (int64_t count = width; count > 1; count /= 2) {
-        SmallVector<int64_t> even, odd;
-        for (int64_t lane = 0; lane < count; lane += 2) {
-          even.push_back(lane);
-          odd.push_back(lane + 1);
+      return partial;
+    };
+    SmallVector<Value> reduced;
+    if (accumulatePartials) {
+      // Seed from members, then include the original accumulator exactly once.
+      // It need not be an identity after an enclosing reduction is blocked.
+      Value hasBlock = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, completeEnd, zero);
+      auto full = b.create<scf::IfOp>(loc, TypeRange(initials), hasBlock, true);
+      {
+        OpBuilder::InsertionGuard fullGuard(b);
+        b.setInsertionPointToStart(full.thenBlock());
+        SmallVector<Value> seeds = loadBlock(zero);
+        auto blocks = b.create<scf::ForOp>(loc, step, completeEnd, step, seeds);
+        {
+          OpBuilder::InsertionGuard blockGuard(b);
+          b.setInsertionPointToStart(blocks.getBody());
+          auto partial = loadBlock(blocks.getInductionVar());
+          b.create<scf::YieldOp>(loc, combine(blocks.getRegionIterArgs(), partial, captures, width));
         }
-        SmallVector<Value> left, right;
-        for (Value value : partial) {
-          left.push_back(b.create<vector::ShuffleOp>(loc, value, value, even));
-          right.push_back(b.create<vector::ShuffleOp>(loc, value, value, odd));
-        }
-        partial = combine(left, right, captures, count / 2);
+        auto partial = horizontal(SmallVector<Value>(blocks.getResults()));
+        b.create<scf::YieldOp>(loc, combine(initials, partial, captures, 0));
+        b.setInsertionPointToStart(full.elseBlock());
+        b.create<scf::YieldOp>(loc, initials);
       }
-      for (Value &value : partial) value = b.create<vector::ExtractElementOp>(loc, value, zero);
-      b.create<scf::YieldOp>(loc, combine(blocks.getRegionIterArgs(), partial, captures, 0));
+      reduced.assign(full.getResults().begin(), full.getResults().end());
+    } else {
+      auto blocks = b.create<scf::ForOp>(loc, zero, completeEnd, step, initials);
+      {
+        OpBuilder::InsertionGuard blockGuard(b);
+        b.setInsertionPointToStart(blocks.getBody());
+        auto partial = horizontal(loadBlock(blocks.getInductionVar()));
+        b.create<scf::YieldOp>(loc, combine(blocks.getRegionIterArgs(), partial, captures, 0));
+      }
+      reduced.assign(blocks.getResults().begin(), blocks.getResults().end());
     }
-    auto tail = b.create<scf::ForOp>(loc, completeEnd, extent, one, blocks.getResults());
+    auto tail = b.create<scf::ForOp>(loc, completeEnd, extent, one, reduced);
     {
       OpBuilder::InsertionGuard tailGuard(b);
       b.setInsertionPointToStart(tail.getBody());
@@ -210,11 +245,36 @@ bool materializeProductReduction(linalg::GenericOp operation) {
       b.create<scf::YieldOp>(loc, combine(tail.getRegionIterArgs(), values, captures, 0));
     }
     for (auto [value, output] : llvm::zip(tail.getResults(), operation.getOutputs()))
-      b.create<memref::StoreOp>(loc, value, output, ValueRange(position).drop_back());
+      b.create<memref::StoreOp>(loc, value, output, outputPosition);
   };
   traverse(0);
   operation.erase();
   return true;
+}
+
+void collapseProductReductionAxes(linalg::GenericOp operation) {
+  auto maps = operation.getIndexingMapsArray();
+  if (operation->hasAttr("intent_cpu.permutable_reduction") && operation.getOutputs().size() > 1) {
+    auto iterators = operation.getIteratorTypesArray();
+    SmallVector<ReassociationIndices> groups;
+    for (auto [axis, iterator] : llvm::enumerate(iterators)) {
+      if (iterator == utils::IteratorType::reduction && axis &&
+          iterators[axis - 1] == utils::IteratorType::reduction)
+        groups.back().push_back(axis);
+      else groups.push_back({static_cast<int64_t>(axis)});
+    }
+    if (groups.size() < iterators.size() &&
+        linalg::areDimSequencesPreserved(maps, groups)) {
+      IRRewriter rewriter(operation.getContext());
+      rewriter.setInsertionPoint(operation);
+      auto collapsed = linalg::collapseOpIterationDims(operation, groups, rewriter);
+      if (succeeded(collapsed)) {
+        auto replacement = cast<linalg::GenericOp>(collapsed->collapsedOp.getOperation());
+        replacement->setDiscardableAttrs(llvm::to_vector(operation->getDiscardableAttrs()));
+        operation.erase();
+      }
+    }
+  }
 }
 
 LogicalResult materialize(linalg::GenericOp operation) {
@@ -667,13 +727,15 @@ LogicalResult realizeHistograms(func::FuncOp function) {
 }
 
 LogicalResult materializeStructuredComputations(func::FuncOp function) {
+  function.walk([&](linalg::GenericOp operation) { collapseProductReductionAxes(operation); });
   SmallVector<Operation *> views;
   function.walk([&](Operation *operation) {
     if (isa<memref::ExpandShapeOp, memref::CollapseShapeOp>(operation)) views.push_back(operation);
   });
   for (Operation *operation : views) {
     auto axes = unitReshapeAxes(operation);
-    if (!axes) return operation->emitError("CPU shape view materialization requires unit-axis reassociation");
+    auto collapse = dyn_cast<memref::CollapseShapeOp>(operation);
+    if (!axes && !collapse) return operation->emitError("CPU shape view materialization requires unit-axis reassociation");
     OpBuilder b(operation);
     Location loc = operation->getLoc();
     auto type = cast<MemRefType>(operation->getResult(0).getType());
@@ -687,10 +749,33 @@ LogicalResult materializeStructuredComputations(func::FuncOp function) {
       if (!type.isDynamicDim(axis)) sizes[axis] = b.getIndexAttr(type.getDimSize(axis));
       strides.push_back(b.getIndexAttr(ShapedType::isDynamic(staticStrides[axis]) ? 1 : staticStrides[axis]));
     }
-    for (auto [source, result] : *axes) {
-      if (type.isDynamicDim(result)) sizes[result] = metadata.getSizes()[source];
-      if (ShapedType::isDynamic(staticStrides[result])) strides[result] = metadata.getStrides()[source];
-    }
+    if (axes)
+      for (auto [source, result] : *axes) {
+        if (type.isDynamicDim(result)) sizes[result] = metadata.getSizes()[source];
+        if (ShapedType::isDynamic(staticStrides[result])) strides[result] = metadata.getStrides()[source];
+      }
+    if (collapse)
+      for (auto [result, group] : llvm::enumerate(collapse.getReassociationIndices())) {
+        if (type.isDynamicDim(result)) {
+          Value size = index(b, loc, 1);
+          for (int64_t source : group)
+            size = b.create<arith::MulIOp>(loc, size, metadata.getSizes()[source]);
+          sizes[result] = size;
+        }
+        if (!axes && ShapedType::isDynamic(staticStrides[result])) {
+          Value stride = metadata.getStrides()[group.back()];
+          Value found = b.create<arith::ConstantIntOp>(loc, 0, 1);
+          for (int64_t source : llvm::reverse(group)) {
+            Value nonunit = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne,
+                metadata.getSizes()[source], index(b, loc, 1));
+            Value choose = b.create<arith::AndIOp>(loc, nonunit,
+                b.create<arith::XOrIOp>(loc, found, b.create<arith::ConstantIntOp>(loc, 1, 1)));
+            stride = b.create<arith::SelectOp>(loc, choose, metadata.getStrides()[source], stride);
+            found = b.create<arith::OrIOp>(loc, found, nonunit);
+          }
+          strides[result] = stride;
+        }
+      }
     if (auto expand = dyn_cast<memref::ExpandShapeOp>(operation))
       for (auto [source, group] : llvm::enumerate(expand.getReassociationIndices())) {
         Value stride = metadata.getStrides()[source];
