@@ -110,6 +110,32 @@ LogicalResult realizeVectorContract(ContractOp contract) {
     shape.push_back(lhs.getShape()[left]);
     mappings.push_back(onAxis(cast<AxisMapAttr>(lhs.getAxisMaps()[left]), resultAxis++));
   }
+  // A vector contraction need not transpose its matrix operand merely to put
+  // the reduction last. Preserve that operand's axes when removing the paired
+  // axis still produces the declared result order.
+  ArrayRef<unsigned> order = lhsFree ? ArrayRef<unsigned>(lhsAxes)
+                                    : ArrayRef<unsigned>(rhsAxes);
+  unsigned freeAxis = 0;
+  bool preservesResult = reductionAxes.size() == 1 && order.size() == shape.size();
+  for (unsigned axis : order)
+    if (!llvm::is_contained(reductionAxes, axis))
+      preservesResult &= axis == freeAxis++;
+  if (preservesResult && freeAxis == resultType.getShape().size()) {
+    SmallVector<unsigned> inverse(order.size());
+    SmallVector<Attribute> orderedShape, orderedMappings;
+    for (auto [axis, original] : llvm::enumerate(order)) {
+      inverse[original] = axis;
+      orderedShape.push_back(shape[original]);
+      orderedMappings.push_back(onAxis(cast<AxisMapAttr>(mappings[original]), axis));
+    }
+    for (unsigned &axis : lhsAxes)
+      axis = inverse[axis];
+    for (unsigned &axis : rhsAxes)
+      axis = inverse[axis];
+    reductionAxes.front() = inverse[reductionAxes.front()];
+    shape = std::move(orderedShape);
+    mappings = std::move(orderedMappings);
+  }
   auto productType = FragmentType::get(
       contract.getContext(), resultType.getElementType(), builder.getArrayAttr(shape),
       builder.getArrayAttr(mappings), resultType.getValidity(), resultType.getOwner());
