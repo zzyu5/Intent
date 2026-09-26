@@ -1,7 +1,7 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
 fused_softmax,8192x8192-fp16,0.173856,0.188184,0.923862,pass,
-dense_gemm,M4096-N14336-K4096-fp16,2.090784,2.085224,1.002666,pass,
-grouped_gemm,E8-M1024-K4096-N14336-fp16,4.395056,4.612400,0.952878,pass,
+dense_gemm,M4096-N14336-K4096-fp16,2.095920,2.085224,1.005129,pass,
+grouped_gemm,E8-M1024-K4096-N14336-fp16,4.392760,4.608792,0.953126,pass,
 flash_attention_forward,B4-H32-S4096-D128-fp16-causal,2.645672,2.767648,0.955928,pass,同算法；CUDA graph 设备执行计时；source 额外写 f32 M 辅助结果。
 layer_norm,8192x4096-fp16,0.086472,0.089888,0.961997,pass,
 flash_cross_entropy,8192x32768-bf16,0.341792,0.343040,0.996362,pass,
@@ -14,25 +14,25 @@ padded_rope_cache_update,B32-QH32-KVH8-D128-cache8192-fp16,0.005936,0.004112,1.4
 fused_add_rms_norm,8192x4096-bf16,0.174096,0.176304,0.987476,pass,
 rms_norm,8192x4096-bf16,0.085808,0.086096,0.996655,pass,
 xformers_rms_norm,8192x4096-bf16,0.080672,0.086112,0.936826,pass,
-qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,1.867240,1.983504,0.941385,pass,
+qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,1.852456,1.827840,1.013467,pass,
 index_select,source65536-selected32768-hidden4096-fp16,0.354624,0.366368,0.967945,pass,
 scaled_index_add,destination65536-routed32768-hidden4096-fp16,0.522352,0.530512,0.984619,pass,
 scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,1.670568,2.574248,0.648954,pass,
 jagged_mean,B512-T33024-D128-fp32,0.016176,0.018224,0.887621,pass,
-fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.065328,0.124704,0.523864,pass,
+fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.065328,0.124704,0.523865,pass,
 rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.232408,0.440768,0.527280,pass,
-causal_conv1d,B4-C4096-S4096-W4-bf16-silu,0.188224,0.193704,0.971709,pass,
+causal_conv1d,B4-C4096-S4096-W4-bf16-silu,0.186160,0.193704,0.961054,pass,
 varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.057344,0.057856,0.991150,pass,
-causal_conv1d_update,B32-D4096-W4-bf16,0.008600,0.006416,1.340399,pass,
+causal_conv1d_update,B32-D4096-W4-bf16,0.006144,0.006416,0.957606,pass,
 modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,0.239392,0.407272,0.587794,pass,source launch uses num_stages=1 and num_warps=4.
 mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.008192,0.008192,1.000000,pass,同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出
-flash_attention_backward,B2-H16-S2048-D128-fp16-causal,,,,generated_provider_jit_or_initial_launch_failed,Triton Error [CUDA]: out of memory
+flash_attention_backward,B2-H16-S2048-D128-fp16-causal,1.752792,0.776440,2.257473,pass,source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。
 moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.186312,2.383000,0.917462,pass,
 moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,2.189312,3.401408,0.643649,pass,
 mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,0.016176,0.016160,1.000990,pass,
 mamba_state_passing,B1-C8-H32-state8192-fp32,0.012080,0.013360,0.904192,pass,
 mamba_chunk_scan,B1-S2048-H32-G8-P64-N128-C256-bf16,0.036544,0.046880,0.779522,pass,
-mamba3_siso_forward,B1-S2048-HQK4-H16-DQK32-DV64-bf16,0.243192,0.227008,1.071293,pass,同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲
+mamba3_siso_forward,B1-S2048-HQK4-H16-DQK32-DV64-bf16,0.241680,0.227008,1.064632,pass,同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲
 paged_gqa_decode,B16-QH32-KVH8-S8192-D128-page16-fp16,0.356632,0.399856,0.891901,pass,
 splitk_paged_attention,B16-QH32-KVH8-S8192-D128-page16-split8-fp16,0.352480,0.454584,0.775390,pass,
 paged_mla_decode,B8-QH128-KVH1-S8192-C512-R64-page16-fp16,0.424944,0.380896,1.115643,pass,同算法；source 使用 packed KV/page-table ABI 并写辅助 LSE；输入布局适配在计时前完成，完整 source 调用含 scale 分配
@@ -42,7 +42,7 @@ flaggems_triangular_solve,B4096-N16-fp32-lower,0.025088,0.028824,0.870386,pass,
 flaggems_embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.173872,0.175920,0.988358,pass,
 flaggems_roll,8192x4096-fp16-shift-1-axis0,0.087872,0.087848,1.000273,pass,
 flaggems_transpose_copy,4093x8191-fp16,0.104224,0.312008,0.334043,pass,
-flaggems_batch_norm_training,B32-C64-S4096-fp16,0.036832,0.026640,1.382583,pass,
+flaggems_batch_norm_training,B32-C64-S4096-fp16,0.030688,0.026640,1.151952,pass,
 flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.040752,0.057104,0.713645,pass,
 flaggems_logsumexp,8192x8192-fp32,0.175176,0.177704,0.985774,pass,
 flaggems_softmax_backward,4096x4097-fp32,0.116512,0.161440,0.721705,pass,
