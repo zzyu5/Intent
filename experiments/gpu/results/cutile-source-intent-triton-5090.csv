@@ -33,6 +33,6 @@ splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,0.165856,0.329792,0.502911
 sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,0.301072,2.462720,0.122252,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法
 sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,0.661800,0.839920,0.787932,pass,Intent target=triton; source corpus=cutile. 同算法；source 的布局转换与辅助工作计入其调用时间
 rms_norm,8192x4096-bf16,0.087712,0.085840,1.021808,pass,Intent target=triton; source corpus=cutile. 同算法；source 额外写 Rstd
-recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,1.999336,0.811240,2.464543,pass,Intent target=triton; source corpus=cutile.
+recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,1.051712,0.811240,1.296425,pass,Intent target=triton; source corpus=cutile.
 chunk_gated_delta,B2-S2048-H8-K128-V128-C64-bf16,0.157696,1.561312,0.101002,pass,Intent target=triton; source corpus=cutile. 同算法；generated 使用 BF16 矩阵输入、FP32 累加与状态，source 使用 TF32 矩阵输入
 nvfp4_quantize,8192x4096-block16-bf16,0.059072,0.059008,1.001085,pass,Intent target=triton; source corpus=cutile. 同算法、group16；CUDA Graph 重放下的算子 GPU 执行延迟，不含编译、调优与输出分配
