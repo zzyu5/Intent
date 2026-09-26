@@ -17,6 +17,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/MathExtras.h"
 
+#include <functional>
 #include <optional>
 
 using namespace mlir;
@@ -909,6 +910,8 @@ bool isKnownPositive(Value value) {
                       [](int64_t candidate) { return candidate > 0; });
 }
 
+bool hasPowerOfTwoDomain(Value value);
+
 bool valueIsMultipleOf(Value value, Value divisor, unsigned depth) {
   if (!value || !divisor || depth >= 32 || !isKnownPositive(divisor))
     return false;
@@ -919,8 +922,43 @@ bool valueIsMultipleOf(Value value, Value divisor, unsigned depth) {
     return true;
   std::optional<int64_t> constant = constantValue(value);
   std::optional<int64_t> divisorConstant = constantValue(divisor);
-  if (constant && divisorConstant)
-    return *constant % *divisorConstant == 0;
+  auto constantIsMultiple = [&](int64_t number) {
+    if (divisorConstant)
+      return number % *divisorConstant == 0;
+    if (auto parameter = divisor.getDefiningOp<gpu::ParameterOp>())
+      return llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
+                          [&](int64_t candidate) {
+                            return number % candidate == 0;
+                          });
+    return false;
+  };
+  if (constant)
+    return constantIsMultiple(*constant);
+  if (auto physical = value.getDefiningOp<gpu::PhysicalExprOp>();
+      physical && hasPowerOfTwoDomain(divisor)) {
+    std::function<bool(gpu::PhysicalExprAttr)> multiple =
+        [&](gpu::PhysicalExprAttr expression) {
+      auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
+      if (kind == gpu::PhysicalExprKind::Constant)
+        return constantIsMultiple(expression.getValue());
+      if (expression.getOperands().size() != 2)
+        return false;
+      bool lhs = multiple(cast<gpu::PhysicalExprAttr>(expression.getOperands()[0]));
+      bool rhs = multiple(cast<gpu::PhysicalExprAttr>(expression.getOperands()[1]));
+      switch (kind) {
+      case gpu::PhysicalExprKind::Multiply:
+        return lhs || rhs;
+      case gpu::PhysicalExprKind::Add:
+      case gpu::PhysicalExprKind::Subtract:
+      case gpu::PhysicalExprKind::Minimum:
+      case gpu::PhysicalExprKind::Maximum:
+        return lhs && rhs;
+      default:
+        return false;
+      }
+    };
+    return multiple(physical.getExpression());
+  }
   auto binary = value.getDefiningOp<gpu::BinaryOp>();
   if (!binary)
     return false;
@@ -948,7 +986,7 @@ FailureOr<SmallVector<Value>> uniformAlignmentFactors(
     return failure();
   value = stripIndexIdentities(value);
   divisor = stripIndexIdentities(divisor);
-  if (gpu::samePhysicalScalarExpression(value, divisor))
+  if (valueIsMultipleOf(value, divisor))
     return SmallVector<Value>{};
   if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
     auto integer = dyn_cast<IntegerAttr>(constant.getValue());
@@ -1013,6 +1051,34 @@ bool hasPowerOfTwoDomain(Value value) {
                           : IntegerAttr();
   return integer && integer.getInt() > 0 &&
          llvm::isPowerOf2_64(integer.getInt());
+}
+
+bool isAlignedPeriodicTile(Value start, Value extent, Value period) {
+  if (!hasPowerOfTwoDomain(extent) || !isKnownPositive(period) ||
+      !valueIsMultipleOf(period, extent))
+    return false;
+  auto factors = uniformAlignmentFactors(start, extent);
+  // A power-of-two aligned origin plus extent-1 cannot cross signed index
+  // wraparound. Dividing the period into complete tiles keeps one quotient.
+  return succeeded(factors) && factors->empty();
+}
+
+scf::ForOp completeAlignedTileLoop(Value start, Value extent) {
+  auto induction = dyn_cast<BlockArgument>(stripIndexIdentities(start));
+  auto loop = induction
+                  ? dyn_cast_or_null<scf::ForOp>(
+                        induction.getOwner()->getParentOp())
+                  : scf::ForOp();
+  if (!loop || induction != loop.getInductionVar() ||
+      !hasPowerOfTwoDomain(extent) ||
+      !gpu::samePhysicalScalarExpression(loop.getStep(), extent) ||
+      !gpu::queryNonNegativeIndexUpperBound(loop.getLowerBound()) ||
+      !valueIsMultipleOf(loop.getLowerBound(), extent) ||
+      !valueIsMultipleOf(loop.getUpperBound(), extent))
+    return {};
+  // Both endpoints are tile aligned. Every executing iteration is nonnegative
+  // and complete; the final increment reaches the representable upper bound.
+  return loop;
 }
 
 bool valueUpperBoundedBy(Value value, Value bound, unsigned depth = 0) {
@@ -1344,6 +1410,26 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
           axis.divisor = divisor;
           axis.originInBounds =
               llvm::is_contained(accessBounds.assumedAxes, resourceAxis);
+          auto loop = completeAlignedTileLoop(
+              axis.scalarIndex, axis.ranges.front().first.getExtent());
+          auto upper = loop ? gpu::queryLaunchExpression(loop.getUpperBound())
+                            : gpu::PhysicalExprAttr();
+          if (upper && upper.getKind() ==
+                           static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply) &&
+              upper.getOperands().size() == 2) {
+            auto covers = [&](Attribute dimension, Attribute factor) {
+              auto dim = cast<gpu::PhysicalExprAttr>(dimension);
+              auto scale = cast<gpu::PhysicalExprAttr>(factor);
+              return dim.getKind() ==
+                         static_cast<uint32_t>(gpu::PhysicalExprKind::Dimension) &&
+                     dim.getValue() == dimensions[resourceAxis] &&
+                     scale.getKind() ==
+                         static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+                     scale.getValue() == divisor;
+            };
+            axis.originInBounds |= covers(upper.getOperands()[0], upper.getOperands()[1]) ||
+                                   covers(upper.getOperands()[1], upper.getOperands()[0]);
+          }
           continue;
         }
         if (kind == BinaryOperator::Remainder) {
@@ -1377,6 +1463,19 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
       }
       axis.originInBounds =
           llvm::is_contained(accessBounds.assumedAxes, resourceAxis);
+      if (axis.modulus && axis.ranges.size() == 1 &&
+          axis.ranges.front().second == 1 && axis.offsets.empty()) {
+        auto range = axis.ranges.front().first;
+        std::optional<int64_t> modulus;
+        if (auto value = dyn_cast<Value>(axis.modulus))
+          modulus = constantValue(value);
+        else
+          modulus = cast<IntegerAttr>(cast<Attribute>(axis.modulus)).getInt();
+        if (modulus && *modulus > 0 &&
+            completeAlignedTileLoop(range.getStart(), range.getExtent()))
+          axis.originInBounds |= constantOriginInView(
+              *modulus - 1, view, resourceAxis, kernel);
+      }
       if (!axis.modulus && axis.ranges.size() == 1 &&
           axis.ranges.front().second == 1 &&
           llvm::all_of(axis.offsets, [](auto term) { return term.second == 1; })) {
@@ -1581,6 +1680,9 @@ Value materializeFullRangeGuard(
     const gpu::PhysicalAccessBoundaryFact &boundary) {
   Value guard;
   for (auto [range, upper] : boundary.rangeBounds) {
+    if (auto loop = completeAlignedTileLoop(range.getStart(), range.getExtent()))
+      if (gpu::samePhysicalScalarExpression(loop.getUpperBound(), upper))
+        continue;
     Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
     Value origin = range.getStart();
     Value nonnegativeOrigin = builder.create<gpu::CompareOp>(
@@ -1631,12 +1733,16 @@ materializeTileIndices(OpBuilder &builder, Operation *owner,
         Value extent = range.getExtent();
         if (!isKnownPositive(extent))
           return failure();
+        Value divisor = builder.create<arith::ConstantIndexOp>(owner->getLoc(), axis.divisor);
+        if (isAlignedPeriodicTile(axis.scalarIndex, extent, divisor)) {
+          result.values.push_back(index);
+          continue;
+        }
         Value one = builder.create<arith::ConstantIndexOp>(owner->getLoc(), 1);
         Value offset = builder.create<gpu::BinaryOp>(owner->getLoc(),
             builder.getIndexType(), extent, one, BinaryOperator::Subtract);
         Value last = builder.create<gpu::BinaryOp>(owner->getLoc(),
             builder.getIndexType(), axis.scalarIndex, offset, BinaryOperator::Add);
-        Value divisor = builder.create<arith::ConstantIndexOp>(owner->getLoc(), axis.divisor);
         Value lastIndex = builder.create<gpu::BinaryOp>(owner->getLoc(),
             builder.getIndexType(), last, divisor, BinaryOperator::FloorDivide);
         // Positive extent and divisor make equal endpoint quotients sufficient;
@@ -1682,6 +1788,16 @@ materializeTileIndices(OpBuilder &builder, Operation *owner,
         return failure();
       Location location = owner->getLoc();
       Value modulus = materializeTileModulus(builder, location, axis);
+      if (isAlignedPeriodicTile(start, extent, modulus) &&
+          completeAlignedTileLoop(start, extent)) {
+        Value remainder = builder.create<gpu::BinaryOp>(
+            location, builder.getIndexType(), start, modulus,
+            BinaryOperator::Remainder);
+        result.values.push_back(builder.create<gpu::BinaryOp>(
+            location, builder.getIndexType(), remainder, extent,
+            BinaryOperator::FloorDivide));
+        continue;
+      }
       Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
       Value one = builder.create<arith::ConstantIndexOp>(location, 1);
       Value maximum = builder.create<arith::ConstantIndexOp>(
