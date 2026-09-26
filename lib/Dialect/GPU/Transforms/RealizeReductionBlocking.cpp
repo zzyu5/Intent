@@ -1635,7 +1635,7 @@ FailureOr<Value> alignToExecutionSchema(OpBuilder &builder, Location location,
 
 bool canLiftCombineOperation(Operation &operation) {
   return isa<arith::ConstantOp, UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp,
-             BitcastOp, MakeRecordOp, ExtractOp>(operation);
+             BitcastOp, SplatOp, MakeRecordOp, ExtractOp>(operation);
 }
 
 LogicalResult cloneLiftedCombineRegion(Region &source, Region &target,
@@ -1701,6 +1701,29 @@ LogicalResult cloneLiftedCombineRegion(Region &source, Region &target,
 
   for (Operation &operation : sourceBlock.without_terminator()) {
     SmallVector<Value> operands = mappedOperands(operation);
+    if (auto splat = dyn_cast<SplatOp>(operation)) {
+      FragmentType schema;
+      for (auto [index, type] : llvm::enumerate(accumulatorTypes)) {
+        auto original = dyn_cast<FragmentType>(sourceBlock.getArgument(index).getType());
+        if (!original || !sameExecutionSchema(original, splat.getResult().getType()))
+          continue;
+        auto lifted = dyn_cast<FragmentType>(type);
+        if (!lifted || (schema && !sameExecutionSchema(schema, lifted))) {
+          reason = "lifted splat has conflicting fragment execution schemas";
+          return failure();
+        }
+        schema = lifted;
+      }
+      auto lifted = schema ? alignToExecutionSchema(
+                                 builder, operation.getLoc(), operands.front(), schema)
+                           : FailureOr<Value>(failure());
+      if (failed(lifted)) {
+        reason = "lifted splat has no compatible fragment execution schema";
+        return failure();
+      }
+      mapping.map(splat.getResult(), *lifted);
+      continue;
+    }
     SmallVector<Type> resultTypes;
     bool changed = llvm::any_of(
         llvm::zip(operation.getOperands(), operands), [](auto pair) {

@@ -243,6 +243,47 @@ bool isContractionOwnership(func::FuncOp kernel, ParameterOp parameter) {
   return found;
 }
 
+bool isMultiAxisReduction(func::FuncOp kernel, ParameterOp parameter) {
+  StringAttr name = parameter.getParameter().getName();
+  SmallVector<ReduceOp> reductions;
+  kernel.walk([&](ReduceOp reduce) { reductions.push_back(reduce); });
+  for (ReduceOp inner : reductions) {
+    bool selectsAxis = llvm::any_of(
+        inner.getInputs().take_front(inner.getSourceCount()), [&](Value value) {
+          auto type = dyn_cast<FragmentType>(value.getType());
+          return type && reducedAxesReferenceParameter(type, inner.getAxes(), name);
+        });
+    if (!selectsAxis)
+      continue;
+    for (ReduceOp outer : reductions) {
+      if (outer == inner)
+        continue;
+      for (Value result : inner.getResults()) {
+        auto resultType = dyn_cast<FragmentType>(result.getType());
+        if (!resultType)
+          continue;
+        for (Value source : outer.getInputs().take_front(outer.getSourceCount())) {
+          auto sourceType = dyn_cast<FragmentType>(source.getType());
+          if (!sourceType)
+            continue;
+          bool reducesFreeAxis = llvm::any_of(outer.getAxes(), [&](int64_t axis) {
+            auto mapping = cast<AxisMapAttr>(sourceType.getAxisMaps()[axis]);
+            return llvm::any_of(resultType.getAxisMaps(), [&](Attribute attribute) {
+              auto retained = cast<AxisMapAttr>(attribute);
+              return sourceAxisIdentity(mapping) == sourceAxisIdentity(retained) &&
+                     mapping.getDimensionId() == retained.getDimensionId();
+            });
+          });
+          llvm::DenseSet<Value> visited;
+          if (reducesFreeAxis && valueDependsOn(source, result, visited))
+            return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 bool isStatefulReduction(func::FuncOp kernel, ParameterOp parameter) {
   auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());
   if (role != ParameterRole::Reduction)
@@ -269,6 +310,8 @@ TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
   ParameterAttr schema = parameter.getParameter();
   switch (static_cast<ParameterCategory>(schema.getCategory())) {
   case ParameterCategory::Reduction:
+    if (isMultiAxisReduction(kernel, parameter))
+      return TuningClass::MultiAxisReduction;
     if (isStatefulReduction(kernel, parameter))
       return TuningClass::StatefulReduction;
     return schema.getRole() ==

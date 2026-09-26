@@ -3632,6 +3632,27 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
           unsigned sourceAxis = freeAxes[fragmentAxis];
           PhysicalAxisRealizationFact input =
               axisRealization(sourceValue, sourceAxis);
+          if ((!input.hasExtentAuthority() || !input.physicalized) &&
+              !input.constructionScalarSeed && input.roots.empty() &&
+              input.blockers.empty()) {
+            for (Value peer : reduce.getInputs().take_front(
+                     reduce.getSourceCount())) {
+              auto peerType = dyn_cast<FragmentType>(peer.getType());
+              if (peer == sourceValue || !peerType ||
+                  peerType.getShape() != source.getShape() ||
+                  peerType.getAxisMaps() != source.getAxisMaps() ||
+                  peerType.getValidity() != source.getValidity() ||
+                  peerType.getOwner() != source.getOwner())
+                continue;
+              auto coverage = axisRealization(peer, sourceAxis);
+              if (coverage.hasExtentAuthority() && coverage.physicalized &&
+                  !coverage.constructionScalarSeed) {
+                coverage.roots.clear();
+                input = std::move(coverage);
+                break;
+              }
+            }
+          }
           if (input.hasExtentAuthority() &&
               source.getShape()[sourceAxis] == extent) {
             result.state = PhysicalFactState::Exact;

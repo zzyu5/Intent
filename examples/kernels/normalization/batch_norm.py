@@ -15,11 +15,12 @@ def welford_combine(left, right):
     safe_count_f32 = I.cast(safe_count, I.f32)
     left_count = I.cast(left.count, I.f32)
     right_count = I.cast(right.count, I.f32)
-    mean = left.mean + delta * right_count / safe_count_f32
+    mean_correction = delta * right_count / safe_count_f32
+    mean = left.mean + mean_correction
     m2 = (
         left.m2
         + right.m2
-        + delta * delta * left_count * right_count / safe_count_f32
+        + delta * left_count * mean_correction
     )
     return I.record(count=count, mean=mean, m2=m2)
 
