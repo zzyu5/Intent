@@ -825,6 +825,31 @@ FailureOr<SmallVector<Value>> materializeDescriptorOffsets(
   return nativeOffsets(offsets);
 }
 
+bool feedsIndirectAccessCoordinates(Value value) {
+  SmallVector<Value> pending{value};
+  llvm::SmallDenseSet<Value, 32> visited;
+  while (!pending.empty()) {
+    Value current = pending.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    for (Operation *user : current.getUsers()) {
+      if (auto load = dyn_cast<gpu::LoadOp>(user)) {
+        if (llvm::is_contained(load.getCoordinates(), current))
+          return true;
+        continue;
+      }
+      if (auto store = dyn_cast<gpu::StoreOp>(user)) {
+        if (llvm::is_contained(store.getCoordinates(), current))
+          return true;
+        continue;
+      }
+      if (user->getNumRegions() == 0 && isMemoryEffectFree(user))
+        pending.append(user->getResults().begin(), user->getResults().end());
+    }
+  }
+  return false;
+}
+
 FailureOr<TensorDescriptorChoiceOp>
 materializeTensorDescriptorForms(
     func::FuncOp kernel, ArrayRef<TritonLocalOptions> localOptions) {
@@ -843,6 +868,10 @@ materializeTensorDescriptorForms(
   SmallVector<std::pair<gpu::StoreOp, BlockAccessPlan>, 4> stores;
   gpu::PhysicalProgramAnalysis analysis(kernel);
   kernel.walk([&](gpu::LoadOp load) {
+    // Address-producing loads belong to the synchronous gather dependency
+    // chain. Keep them outside the descriptor pipeline for matrix operands.
+    if (feedsIndirectAccessCoordinates(load.getResult()))
+      return;
     auto plan = planBlockAccess(
         load.getResource(), load.getCoordinates(), load.getSourceAxes(),
         load.getResult().getType(), load.getValid(), load.getFill(),
@@ -1127,6 +1156,16 @@ bool isTritonFragmentExtent(Attribute attribute);
 SmallVector<gpu::FragmentType> collectiveFragments(func::FuncOp kernel) {
   SmallVector<gpu::FragmentType> fragments;
   kernel.walk([&](Operation *operation) {
+    auto collect = [&](Value value) {
+      if (auto fragment = dyn_cast<gpu::FragmentType>(value.getType());
+          fragment && !llvm::is_contained(fragments, fragment))
+        fragments.push_back(fragment);
+    };
+    if (isa<gpu::ContractOp, gpu::ScaledContractOp, gpu::SparseContractOp>(operation)) {
+      for (Value result : operation->getResults())
+        collect(result);
+      return;
+    }
     auto store = dyn_cast<gpu::StoreOp>(operation);
     bool workspaceStore = store && isa<gpu::BufferType>(store.getResource().getType());
     if (store)
@@ -1139,11 +1178,6 @@ SmallVector<gpu::FragmentType> collectiveFragments(func::FuncOp kernel) {
     if (!isa<gpu::ReduceOp, gpu::ScanOp, ReduceOp, ScanOp>(operation) &&
         !workspaceStore)
       return;
-    auto collect = [&](Value operand) {
-      if (auto fragment = dyn_cast<gpu::FragmentType>(operand.getType());
-          fragment && !llvm::is_contained(fragments, fragment))
-        fragments.push_back(fragment);
-    };
     if (workspaceStore)
       collect(store.getValue());
     else
