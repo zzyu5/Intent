@@ -128,7 +128,7 @@ def attention_backward_dq(
     grad_output: I.In[I.f16, ("B", "HQ", "Q", "D")],
     lse: I.In[I.f32, ("B", "HQ", "Q")],
     delta: I.In[I.f32, ("B", "HQ", "Q")],
-    grad_q: I.Out[I.f16, ("B", "HQ", "Q", "D")],
+    grad_q: I.Out[I.f16, ("B", "HQ", "Q", "D"), I.constraints(noalias=True)],
     scale: I.f32,
     HEAD_GROUP: I.Constexpr[int],
     CAUSAL: I.Constexpr[bool],

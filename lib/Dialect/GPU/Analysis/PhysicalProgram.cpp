@@ -2303,12 +2303,17 @@ bool canReplayReadAt(LoadOp load, Operation *insertionAnchor) {
       if (written && written != load.getResource()) {
         auto readBuffer = dyn_cast<BufferType>(load.getResource().getType());
         auto writtenBuffer = dyn_cast<BufferType>(written.getType());
+        auto readView = dyn_cast<ViewType>(load.getResource().getType());
+        auto writtenView = dyn_cast<ViewType>(written.getType());
         bool privateAllocation =
             (readBuffer && isa<ViewType>(written.getType())) ||
             (writtenBuffer && isa<ViewType>(load.getResource().getType())) ||
             (readBuffer && writtenBuffer &&
              readBuffer.getInstance() != writtenBuffer.getInstance());
-        if (privateAllocation && isa<StoreOp>(nested))
+        bool disjointViews = readView && writtenView &&
+            (readView.getLayout().getNoalias() ||
+             writtenView.getLayout().getNoalias());
+        if ((privateAllocation || disjointViews) && isa<StoreOp>(nested))
           return WalkResult::advance();
       }
       return WalkResult::interrupt();
