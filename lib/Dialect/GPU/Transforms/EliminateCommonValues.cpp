@@ -207,11 +207,12 @@ void foldScalarIntegerValues(func::FuncOp kernel) {
     if (!constant || constant.getType() != result.getType())
       return;
     OpBuilder builder(operation);
-    auto folded = builder.create<arith::ConstantOp>(
-        operation->getLoc(), result.getType(), constant);
-    folded->setDiscardableAttrs(
+    auto folded = materializeScalarConstant(
+        builder, operation->getLoc(), constant, result.getType());
+    assert(succeeded(folded) && "integer scalar constant must materialize");
+    folded->getDefiningOp()->setDiscardableAttrs(
         llvm::to_vector(operation->getDiscardableAttrs()));
-    result.replaceAllUsesWith(folded);
+    result.replaceAllUsesWith(*folded);
     operation->erase();
   });
 }
