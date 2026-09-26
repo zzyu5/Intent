@@ -2919,6 +2919,55 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
         (!atomic.getResult().use_empty() || view.getRank() == 0))
       return atomic.emitOpError(
           "masked cuTile array atomic requires a ranked view and an unused old value");
+    auto tileType = dyn_cast<gpu::FragmentType>(atomic.getValue().getType());
+    Type element = view.getElementType();
+    if (tileType && (element.isF16() || element.isBF16()) &&
+        atomic.getKind() == AtomicRMWKind::Add &&
+        atomic.getOrdering() == AtomicOrdering::Relaxed &&
+        atomic.getSharing() == gpu::AtomicSharingDomain::KernelInvocation &&
+        atomic.getResult().use_empty()) {
+      auto boundary = analysis.boundaryValidity(atomic);
+      auto plan = analyzeNativeTileAccess(
+          atomic, kernel, analysis, view, atomic.getCoordinates(),
+          atomic.getSourceAxes(), tileType);
+      OpBuilder builder(atomic);
+      FailureOr<MaterializedTileIndices> indices = failure();
+      FailureOr<Value> originGuard = failure();
+      if (succeeded(plan) && boundary.isExact())
+        indices = materializeTileIndices(builder, atomic, *plan,
+                                         /*allowDynamicAlignment=*/false);
+      if (succeeded(indices) && !indices->alignment)
+        originGuard = materializeTileOriginGuard(
+            builder, atomic, atomic.getResource(), *plan, boundary);
+      if (succeeded(originGuard)) {
+        auto emit = [&](OpBuilder &nested) {
+          Value value = atomic.getValue();
+          if (!isIdentityPermutation(plan->toResource))
+            value = nested.create<gpu::TransposeOp>(
+                atomic.getLoc(), plan->packedType, value, plan->toResource);
+          if (plan->packedToResource)
+            value = nested.create<gpu::ReshapeOp>(
+                atomic.getLoc(), plan->resourceType, value,
+                plan->packedToResource);
+          auto replacement = nested.create<TileAtomicAddOp>(
+              atomic.getLoc(), atomic.getResource(), indices->values, value);
+          if (Attribute origin = atomic->getAttr(gpu::originAttr))
+            replacement->setAttr(gpu::originAttr, origin);
+        };
+        if (*originGuard) {
+          auto conditional = builder.create<scf::IfOp>(
+              atomic.getLoc(), TypeRange{}, *originGuard,
+              /*withElseRegion=*/false);
+          OpBuilder body = prepareBranch(conditional.getThenRegion());
+          emit(body);
+          body.create<scf::YieldOp>(atomic.getLoc());
+        } else {
+          emit(builder);
+        }
+        atomic.erase();
+        continue;
+      }
+    }
     FailureOr<SmallVector<Value>> coordinates = orderedCoordinates(
         atomic, atomic.getResource(), atomic.getCoordinates(),
         atomic.getSourceAxes());
@@ -3472,6 +3521,9 @@ ArrayAttr arrayIndexTileBounds(func::FuncOp kernel) {
     } else if (auto store = dyn_cast<TileStoreOp>(operation)) {
       resource = store.getResource();
       tile = store.getValue().getType();
+    } else if (auto atomic = dyn_cast<TileAtomicAddOp>(operation)) {
+      resource = atomic.getResource();
+      tile = atomic.getValue().getType();
     } else if (isa<ScalarLoadOp, ScalarStoreOp, GatherLoadOp, ScatterStoreOp,
                    AtomicRMWOp>(operation)) {
       // Gather/scatter use element coordinates.  Their active coordinates must
@@ -3514,7 +3566,7 @@ ArrayAttr arrayIndexTileBounds(func::FuncOp kernel) {
 
 void preserveNativeIndexValues(func::FuncOp kernel) {
   kernel.walk([](Operation *operation) {
-    if (!isa<TileLoadOp, TileStoreOp>(operation))
+    if (!isa<TileLoadOp, TileStoreOp, TileAtomicAddOp>(operation))
       return;
     for (OpOperand &operand : operation->getOpOperands()) {
       auto cast = operand.get().getDefiningOp<gpu::CastOp>();
@@ -3729,7 +3781,8 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
       }
       return WalkResult::advance();
     }
-    if (isa<ArrayViewOp, TileLoadOp, TileStoreOp, ScalarLoadOp, ScalarStoreOp, GatherLoadOp,
+    if (isa<ArrayViewOp, TileLoadOp, TileStoreOp, TileAtomicAddOp,
+            ScalarLoadOp, ScalarStoreOp, GatherLoadOp,
             ScatterStoreOp, AtomicRMWOp, ExtractOp, MMAOp, ScaledMMAOp,
             ReduceOp, ScanOp, gpu::ParameterOp,
             gpu::PhysicalExprOp, gpu::ProgramIdOp, gpu::WorksetCoordinateOp,

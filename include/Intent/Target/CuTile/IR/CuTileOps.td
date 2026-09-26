@@ -44,6 +44,16 @@ def IntentCuTile_TileStoreOp : IntentCuTile_Op<"tile_store", [
   let hasVerifier = 1;
 }
 
+def IntentCuTile_TileAtomicAddOp : IntentCuTile_Op<"tile_atomic_add", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  ]> {
+  let summary = "Resource-ordered relaxed device atomic add without an old value";
+  let arguments = (ins IntentGPU_ViewValue:$resource,
+                       Variadic<AnyTypeOf<[Index, I32]>>:$tile_indices,
+                       IntentGPU_FragmentValue:$value);
+  let hasVerifier = 1;
+}
+
 def IntentCuTile_ScalarLoadOp : IntentCuTile_Op<"scalar_load", [
     AttrSizedOperandSegments,
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>

@@ -354,6 +354,24 @@ void TileStoreOp::getEffects(
   effects.emplace_back(MemoryEffects::Write::get());
 }
 
+LogicalResult TileAtomicAddOp::verify() {
+  auto view = getResource().getType();
+  Type element = view.getElementType();
+  if ((!element.isF16() && !element.isBF16()) ||
+      element != getValue().getType().getElementType())
+    return emitOpError("requires matching f16 or bf16 view and tile elements");
+  if (getResource().getDefiningOp<ArrayViewOp>())
+    return emitOpError("conditional array aliases are read-only");
+  return verifyResourceOrderedTile(*this, view.getRank(), getValue().getType(),
+                                   getTileIndices());
+}
+
+void TileAtomicAddOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  effects.emplace_back(MemoryEffects::Read::get());
+  effects.emplace_back(MemoryEffects::Write::get());
+}
+
 LogicalResult ScalarLoadOp::verify() {
   auto view = getResource().getType();
   if (getIndices().size() != view.getRank() ||

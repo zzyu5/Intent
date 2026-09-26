@@ -1204,6 +1204,11 @@ private:
       else
         result += ".item()";
       assign(extract.getResult(), result);
+    } else if (auto atomic = dyn_cast<TileAtomicAddOp>(operation)) {
+      line(valueString(atomic.getResource()) + ".tiled_view(" +
+           fragmentShape(atomic.getValue().getType()) +
+           ").atomic_store_add(" + tuple(atomic.getTileIndices()) + ", " +
+           valueString(atomic.getValue()) + ")");
     } else if (auto store = dyn_cast<TileStoreOp>(operation)) {
       line("ct.store(" + valueString(store.getResource()) + ", index=" +
            tuple(store.getTileIndices()) + ", tile=" +
