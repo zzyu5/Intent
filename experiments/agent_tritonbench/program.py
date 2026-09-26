@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import ast
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-import linecache
-import multiprocessing
 from pathlib import Path
-from types import SimpleNamespace
 
 import intent
 from intent.runtime.artifact import CompiledArtifact
@@ -24,35 +21,7 @@ from torch.utils._python_dispatch import _disable_current_modes
 from experiments._common.support import benchmark
 from experiments._common.loading import load_module
 from experiments._common.measurement import CUTILE_TUNING_LAUNCH_TIMEOUT_SECONDS
-
-
-def _initialize_cutile_compiler(sources):
-    global _cutile_compile_namespaces
-    _cutile_compile_namespaces = {}
-    for module_name, filename, source in sources:
-        linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
-        namespace = {"__name__": module_name}
-        exec(compile(source, filename, "exec", dont_inherit=True), namespace)
-        _cutile_compile_namespaces[module_name] = namespace
-
-
-def _compile_cutile_configuration(module_name, function_name, parameters, static_arrays,
-                                  symbol, options, architecture, timeout):
-    import cuda.tile as ct
-    from cuda.tile._compile import compile_tile
-    from cuda.tile.compilation import CallingConvention, KernelSignature
-
-    kernel = _cutile_compile_namespaces[module_name][function_name]
-    convention = (CallingConvention.cutile_python_v2() if static_arrays
-                  else CallingConvention.cutile_python_v1())
-    signature = KernelSignature(parameters, convention, symbol)
-    try:
-        with ct.compiler_timeout(timeout):
-            compiled = compile_tile(kernel._annotated_function, (signature,),
-                                    architecture, options)
-    except ct.TileError as error:
-        return None, f"{type(error).__name__}: {error}"
-    return (compiled.cubin, compiled.kernel_signatures[0].symbol, None, []), None
+from experiments._common.cutile_compilation import CuTileCompilation
 
 
 class ProgramContext:
@@ -66,9 +35,8 @@ class ProgramContext:
         self.tuning_config = tuning_config
         self.generated: dict[str, CompiledArtifact] = {}
         self.tuning: list[dict] = []
-        self.precompile_failures: list[dict] = []
-        self.native_compile_reuses = 0
-        self._native_compilations = []
+        self._cutile_compilation = CuTileCompilation()
+        self.precompile_failures = self._cutile_compilation.failures
 
     def compile(self, name: str, definition, *, constexprs=None):
         if self.language != "intent":
@@ -113,131 +81,20 @@ class ProgramContext:
         self.generated[name] = artifact
         return artifact
 
+    @property
+    def native_compile_reuses(self):
+        return self._cutile_compilation.reuses
+
     @contextmanager
     def native_compilation_cache(self):
         if self.target_name != "cutile":
             yield
             return
-        import cuda.tile as ct
-        from cuda.tile._compile import format_sm_arch, get_sm_arch
-
-        original_compile = ct.kernel._compile
-        compiled = self._native_compilations
-        compiled.clear()
-
-        def compile_kernel(kernel, signature, context, compute_capability=None):
-            # Native signatures contain unhashable constraints. Value equality
-            # also lets the JIT's unnamed signature reuse the prepared symbol.
-            architecture = (get_sm_arch() if compute_capability is None
-                            else format_sm_arch(*compute_capability))
-            key = (kernel._pyfunc, kernel._compiler_options,
-                   signature.with_symbol(None), architecture, context)
-            for previous, result, error in compiled:
-                if key == previous:
-                    self.native_compile_reuses += 1
-                    if error is not None:
-                        raise error
-                    return result
-            try:
-                result = original_compile(kernel, signature, context, compute_capability)
-            except ct.TileError as error:
-                compiled.append((key, None, error))
-                raise
-            compiled.append((key, result, None))
-            return result
-
-        ct.kernel._compile = compile_kernel
-        try:
+        with self._cutile_compilation.cache():
             yield
-        finally:
-            ct.kernel._compile = original_compile
 
-    @contextmanager
     def compilation_only(self):
-        import cuda.tile as ct
-        from cuda.tile._compile import get_sm_arch
-        from cuda.tile.compilation import CallingConvention, KernelSignature
-        from cuda.tile._cext import default_tile_context
-
-        def signature_for(kernel, arguments):
-            # Generated kernels have the view/scalar ABI. Match cuTile's JIT
-            # convention for static array dimensions, including rank-zero views.
-            static_arrays = any(annotation.array is not None and annotation.array.static_shape_dims
-                                for annotation in kernel._annotated_function.parameter_annotations)
-            convention = (CallingConvention.cutile_python_v2() if static_arrays
-                          else CallingConvention.cutile_python_v1())
-            signature = KernelSignature.from_kernel_args(kernel, arguments, convention)
-            return signature, static_arrays
-
-        def compile_kernel(stream, grid, kernel, arguments):
-            signature, _ = signature_for(kernel, arguments)
-            kernel._compile(signature, default_tile_context)
-
-        def compile_search(configs, stream, grid_fn, kernel, args_fn, hints_fn=None, **kwargs):
-            first = None
-            last_error = None
-            pending = []
-            architecture = get_sm_arch()
-            for config in configs:
-                candidate = kernel.replace_hints(**(hints_fn(config) if hints_fn else {}))
-                signature, static_arrays = signature_for(candidate, args_fn(config))
-                pending.append((config, candidate, signature, executor.submit(
-                    _compile_cutile_configuration, candidate._pyfunc.__module__,
-                    candidate._pyfunc.__name__, signature.parameters, static_arrays,
-                    signature.symbol, candidate._compiler_options, architecture,
-                    default_tile_context.config.compiler_timeout_sec)))
-            for config, candidate, signature, future in pending:
-                result, diagnostic = future.result()
-                error = ct.TileError(diagnostic) if diagnostic is not None else None
-                key = (candidate._pyfunc, candidate._compiler_options,
-                       signature.with_symbol(None), architecture, default_tile_context)
-                self._native_compilations.append((key, result, error))
-                if error is not None:
-                    last_error = error
-                    self.precompile_failures.append({"kernel": kernel._pyfunc.__name__,
-                                                     "config": str(config), "error": str(error)})
-                    continue
-                if first is None:
-                    first = config
-            if first is None:
-                raise RuntimeError("no cuTile configuration compiled for the current device") from last_error
-            # The launch dispatcher receives these native compile results from
-            # the same signature-keyed hook; no kernel executes during prepare.
-            return SimpleNamespace(best=SimpleNamespace(config=first))
-
-        class CompilationState:
-            def __init__(self, views, writable):
-                self.views = views
-
-            def arguments(self, arguments):
-                return arguments
-
-        original_launch = ct.launch
-        saved = []
-        sources = []
-        for artifact in self.generated.values():
-            namespace = artifact._namespace
-            kernel = namespace["_intent_kernel"]
-            sources.append((kernel._pyfunc.__module__, kernel._pyfunc.__code__.co_filename,
-                            artifact.source))
-            saved.append((namespace, namespace["TuningState"], namespace["exhaustive_search"]))
-            namespace["TuningState"] = CompilationState
-            namespace["exhaustive_search"] = compile_search
-        ct.launch = compile_kernel
-        try:
-            # Each process owns the SDK's compiler lock. Only native compilation
-            # runs here; device execution and numerical comparison stay in the parent.
-            with ProcessPoolExecutor(max_workers=4,
-                                     mp_context=multiprocessing.get_context("spawn"),
-                                     initializer=_initialize_cutile_compiler,
-                                     initargs=(sources,)) as executor:
-                yield
-        finally:
-            ct.launch = original_launch
-            for namespace, state, search in saved:
-                namespace["TuningState"] = state
-                namespace["exhaustive_search"] = search
-                namespace["_TUNE_CACHE"].clear()
+        return self._cutile_compilation.compilation_only(self.generated.values())
 
     def load_source(self, filename: str):
         if self.language != "triton":

@@ -12,6 +12,7 @@ import math
 import torch
 
 import intent
+from intent.targets import CuTileTarget
 from experiments._common.support import benchmark
 from experiments._common.support import prepare_kernel_call
 
@@ -21,6 +22,7 @@ from .model import PreparedLaunch
 from .model import TensorTree
 from .model import Tolerance
 from .model import IntegerTolerance, SimilarityTolerance, NumericalTolerance
+from .cutile_compilation import CuTileCompilation
 
 
 class PipelineStageError(RuntimeError):
@@ -178,7 +180,18 @@ def compile_single(
         )
     except intent.CompilationStageError as error:
         raise PipelineStageError(f"generated_{error.stage}", str(error)) from error
-    result = initial_launch(lambda: artifact.run(*arguments), side="generated")
+    if isinstance(context.target, CuTileTarget):
+        compilation = CuTileCompilation()
+        with compilation.cache():
+            report_stage("generated_native_compilation")
+            try:
+                with cpu_preparation(), compilation.compilation_only((artifact,)):
+                    artifact.run(*arguments)
+            except Exception as error:
+                raise PipelineStageError("generated_native_compilation", str(error)) from error
+            result = initial_launch(lambda: artifact.run(*arguments), side="generated")
+    else:
+        result = initial_launch(lambda: artifact.run(*arguments), side="generated")
     report_stage("generated_launcher_preparation")
     try:
         launch_outputs = () if result is None else result
