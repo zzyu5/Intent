@@ -207,6 +207,7 @@ matchOnlineSummaryStructure(MakeRecordOp record) {
   SmallVector<std::pair<unsigned, ReduceOp>> massCandidates;
   SmallVector<std::pair<unsigned, SelectOp>> maximumCandidates;
   SmallVector<std::pair<unsigned, ContractOp>> momentCandidates;
+  SmallVector<SelectOp> momentGuards;
   for (auto [index, field] : llvm::enumerate(record.getFields())) {
     field = stripProjection(field);
     if (auto reduce = field.getDefiningOp<ReduceOp>()) {
@@ -225,10 +226,17 @@ matchOnlineSummaryStructure(MakeRecordOp record) {
       if (isSingleBinaryReduction(reduce, BinaryOperator::Maximum) ||
           isSingleBinaryReduction(reduce, BinaryOperator::MaximumNum))
         maximumCandidates.emplace_back(index, select);
+      auto contract = stripProjection(select.getTrueValue()).getDefiningOp<ContractOp>();
+      if (contract && isZero(select.getFalseValue())) {
+        momentCandidates.emplace_back(index, contract);
+        momentGuards.push_back(select);
+      }
       continue;
     }
-    if (auto contract = field.getDefiningOp<ContractOp>())
+    if (auto contract = field.getDefiningOp<ContractOp>()) {
       momentCandidates.emplace_back(index, contract);
+      momentGuards.push_back({});
+    }
   }
   if (validityCandidates.size() != 1 || massCandidates.size() != 1 ||
       maximumCandidates.size() != 1 || momentCandidates.size() != 1)
@@ -238,6 +246,10 @@ matchOnlineSummaryStructure(MakeRecordOp record) {
   auto [maximumField, maximumOrEmpty] = maximumCandidates.front();
   auto [massField, mass] = massCandidates.front();
   auto [momentField, moment] = momentCandidates.front();
+  SelectOp momentOrEmpty = momentGuards.front();
+  if (momentOrEmpty &&
+      !isProjectedFrom(momentOrEmpty.getCondition(), validity.getResult(0)))
+    return failure();
   auto maximum = maximumOrEmpty.getTrueValue().getDefiningOp<ReduceOp>();
   Value memberValidity = validity.getInputs().front();
   if (maximumOrEmpty.getCondition() != validity.getResult(0) ||
@@ -321,7 +333,7 @@ matchOnlineSummaryStructure(MakeRecordOp record) {
       exponential,     memberValidity, score,
       values,          validityField,  maximumField,
       massField,       momentField,    reductionAxis,
-      valueReductionAxis, traversal};
+      valueReductionAxis, traversal, momentOrEmpty};
 }
 
 FailureOr<OnlineSummaryMerge>

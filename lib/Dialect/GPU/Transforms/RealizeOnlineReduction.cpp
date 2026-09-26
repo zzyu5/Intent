@@ -263,6 +263,16 @@ LogicalResult realizeOnlineSummary(OnlineSummaryPattern pattern,
             pattern.moment.getRhsBatchAxes());
         if (Attribute origin = pattern.moment->getAttr(originAttr))
           chunkMoment.getDefiningOp()->setAttr(originAttr, origin);
+        if (pattern.momentOrEmpty) {
+          Value rowValidity = nested.create<BroadcastOp>(
+              nestedLocation,
+              withElementType(cast<FragmentType>(chunkMoment.getType()),
+                              nested.getI1Type()),
+              chunkValidity.getResult(0));
+          chunkMoment = nested.create<SelectOp>(
+              nestedLocation, chunkMoment.getType(), rowValidity,
+              chunkMoment, momentIdentity);
+        }
 
         Value bothValid = nested.create<BinaryOp>(
             nestedLocation, carries[0].getType(), carries[0],

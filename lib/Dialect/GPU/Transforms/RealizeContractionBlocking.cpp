@@ -2985,6 +2985,31 @@ FailureOr<bool> realizeFullResultTraversal(
     inheritRangeAuthority(fullRange, *authority);
     Value coordinates = broadcastAxis(builder, location, indexType, fullRange,
                                       static_cast<unsigned>(resultAxis));
+    // A retained output that fits exactly in the selected native tile needs
+    // no slice/update traversal. This binding is launch-uniform and becomes
+    // a compile-time branch in the target DSL. Keep the original snapshot and
+    // accumulator directly in the native product.
+    scf::IfOp fullTile;
+    PhysicalProgramAnalysis nativeAnalysis(kernel);
+    bool hasReductionSeed = false;
+    for (auto [operand, axes] :
+         {std::pair{contract.getLhs(), contract.getLhsReductionAxes()},
+          std::pair{contract.getRhs(), contract.getRhsReductionAxes()}})
+      for (int64_t axis : axes)
+        hasReductionSeed |=
+            nativeAnalysis.axisRealization(operand, axis).constructionScalarSeed;
+    // A scalar construction seed is not a selected reduction tile. Retain
+    // the traversal so its reduction can be blocked before using native MMA.
+    if (!hasReductionSeed && !fullReductionNeedsTraversal(contract)) {
+      Value fits = builder.create<CompareOp>(location, builder.getI1Type(),
+          fullSize, block.getResult(), ComparePredicate::Eq);
+      fullTile = builder.create<scf::IfOp>(location, TypeRange{resultType}, fits, true);
+      builder.setInsertionPointToStart(fullTile.thenBlock());
+      auto native = cast<ContractOp>(builder.clone(*contract));
+      if (failed(markNativeCoverage(kernel, native))) return failure();
+      builder.create<scf::YieldOp>(location, native.getResult());
+      builder.setInsertionPointToStart(fullTile.elseBlock());
+    }
     // Each iteration fills one disjoint slice of an immutable full result.
     // The operand and dot fragments retain their independent, bounded tiles.
     auto loop = builder.create<scf::ForOp>(
@@ -3102,7 +3127,11 @@ FailureOr<bool> realizeFullResultTraversal(
         ArrayRef<int64_t>{static_cast<int64_t>(resultAxis)});
     yield->setOperands(ValueRange{assembled});
     loop.walk([&](ContractOp product) { pending.push_back(product); });
-    contract.getResult().replaceAllUsesWith(loop.getResult(0));
+    if (fullTile) {
+      builder.setInsertionPointAfter(loop);
+      builder.create<scf::YieldOp>(location, loop.getResult(0));
+    }
+    contract.getResult().replaceAllUsesWith(fullTile ? fullTile.getResult(0) : loop.getResult(0));
     contract.erase();
     return true;
   }
@@ -3405,9 +3434,14 @@ LogicalResult realizeSparseReductionTraversal(SparseContractOp contract,
   return success();
 }
 
-LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
+LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
+                              SmallVectorImpl<ContractOp> &pending) {
   if (!contract->getBlock())
     return success();
+  llvm::SmallPtrSet<Operation *, 16> existingProducts;
+  kernel.walk([&](ContractOp product) {
+    existingProducts.insert(product.getOperation());
+  });
   const bool required = requiresPhysicalRealization(contract) ||
                         outputCoordinatesNeedRealization(contract);
   auto unhandled = [&](const Twine &reason) -> LogicalResult {
@@ -4248,6 +4282,21 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
 
   for (StorePath &path : paths)
     path.store.erase();
+  // Retiling a pointwise epilogue can replay a sibling matrix expression.
+  // Retire the obsolete epilogue before its original products are visited,
+  // and let the new products receive their own bounded reduction traversal.
+  // Keep products themselves alive until their worklist entry is consumed.
+  llvm::SmallPtrSet<Operation *, 16> retired;
+  for (StorePath &path : paths)
+    for (Operation *operation : llvm::reverse(path.operations))
+      if (!retired.contains(operation) && operation->use_empty()) {
+        retired.insert(operation);
+        operation->erase();
+      }
+  kernel.walk([&](ContractOp product) {
+    if (!existingProducts.contains(product.getOperation()))
+      pending.push_back(product);
+  });
   for (AssumeInBoundsOp assumption : rowAssumptions)
     if (assumption->getBlock())
       assumption.erase();
@@ -6636,9 +6685,21 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
   });
   if (snapshots.wasInterrupted())
     return failure();
+  llvm::SmallPtrSet<Operation *, 16> epilogueProducts;
+  auto realizeSelectedContract = [&](ContractOp contract) -> LogicalResult {
+    size_t previousSize = contracts.size();
+    if (failed(realizeContract(contract, kernel, contracts))) return failure();
+    for (ContractOp replayed : ArrayRef<ContractOp>(contracts).drop_front(previousSize))
+      epilogueProducts.insert(replayed.getOperation());
+    return success();
+  };
   for (size_t contractIndex = 0; contractIndex < contracts.size();
        ++contractIndex) {
     ContractOp contract = contracts[contractIndex];
+    if (contract.getResult().use_empty()) {
+      contract.erase();
+      continue;
+    }
     if (!hasFragmentSchema(contract))
       return contract.emitOpError(
           "shared contraction blocking requires fragment operands and result");
@@ -6654,7 +6715,7 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
     }
     bool realizeOutput = outputCoordinatesNeedRealization(contract);
     if (realizeOutput) {
-      if (failed(realizeContract(contract, kernel)))
+      if (failed(realizeSelectedContract(contract)))
         return failure();
       continue;
     }
@@ -6672,7 +6733,7 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
       if (*nativeStructured)
         continue;
       const bool rangeSingleReduction = hasRangeContractForm(contract);
-      if (!rangeSingleReduction &&
+      if ((!rangeSingleReduction || epilogueProducts.contains(contract)) &&
           contract.getLhsReductionAxes().size() == 1 &&
           contract.getRhsReductionAxes().size() == 1 &&
           freeAxesReadyForReductionTraversal(contract, kernel) &&
@@ -6689,14 +6750,14 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
                  contract.getRhsBatchAxes().empty() &&
                  hasCompleteStorePath(contract) &&
                  freeAxesNeedRealization(contract, kernel)) {
-        if (failed(realizeContract(contract, kernel)))
+        if (failed(realizeSelectedContract(contract)))
           return failure();
       } else if (!rangeSingleReduction &&
                  contract.getLhsReductionAxes().size() == 1 &&
                  contract.getRhsReductionAxes().size() == 1) {
         if (failed(markNativeCoverage(kernel, contract)))
           return failure();
-      } else if (failed(realizeContract(contract, kernel))) {
+      } else if (failed(realizeSelectedContract(contract))) {
         return failure();
       }
     } else if (failed(markNativeCoverage(kernel, contract))) {

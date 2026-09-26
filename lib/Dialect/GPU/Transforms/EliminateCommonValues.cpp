@@ -16,6 +16,36 @@ using namespace mlir;
 namespace intent::gpu {
 namespace {
 
+bool isSingletonInsertion(ReshapeOp reshape) {
+  auto source = cast<FragmentType>(reshape.getValue().getType());
+  auto target = cast<FragmentType>(reshape.getResult().getType());
+  if (source.getShape().size() >= target.getShape().size())
+    return false;
+  for (Attribute attribute : reshape.getReassociation()) {
+    auto group = cast<ReshapeGroupAttr>(attribute);
+    if (group.getResultAxes().empty() || group.getSourceAxes().size() > 1 ||
+        (!group.getSourceAxes().empty() && group.getResultAxes().size() != 1))
+      return false;
+  }
+  auto projection = queryBroadcastProjection(source, target);
+  if (!projection.isExact())
+    return false;
+  unsigned nextSource = 0;
+  for (auto [axis, mapped] : llvm::enumerate(projection.targetToSource)) {
+    if (mapped) {
+      if (*mapped != nextSource++ ||
+          source.getShape()[*mapped] != target.getShape()[axis])
+        return false;
+    } else {
+      auto extent = cast<PhysicalExprAttr>(target.getShape()[axis]);
+      if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+          extent.getValue() != 1)
+        return false;
+    }
+  }
+  return nextSource == source.getShape().size();
+}
+
 bool foldConstantDivision(Operation &operation) {
   auto binary = dyn_cast<BinaryOp>(operation);
   if (!binary || binary.getOperatorKind() != BinaryOperator::TrueDivide ||
@@ -161,7 +191,8 @@ void foldScalarIntegerValues(func::FuncOp kernel) {
   kernel.walk([&](Operation *operation) {
     if (operation->getNumResults() != 1 || operation->getNumRegions() != 0 ||
         !operation->getResult(0).getType().isIntOrIndex() ||
-        isa<arith::ConstantOp, ParameterOp>(operation) || !isPure(operation))
+        isa<arith::ConstantOp, ParameterOp, PhysicalExprOp>(operation) ||
+        !isPure(operation))
       return;
     Value result = operation->getResult(0);
     if (auto select = dyn_cast<SelectOp>(operation)) {
@@ -280,6 +311,16 @@ LogicalResult eliminateCommonValues(ModuleOp module) {
   if (failed(kernel))
     return failure();
   foldScalarIntegerValues(*kernel);
+  kernel->walk([&](ReshapeOp reshape) {
+    if (!isSingletonInsertion(reshape))
+      return;
+    OpBuilder builder(reshape);
+    auto broadcast = builder.create<BroadcastOp>(
+        reshape.getLoc(), reshape.getResult().getType(), reshape.getValue());
+    broadcast->setDiscardableAttrs(llvm::to_vector(reshape->getDiscardableAttrs()));
+    reshape.getResult().replaceAllUsesWith(broadcast.getResult());
+    reshape.erase();
+  });
   kernel->walk<WalkOrder::PostOrder>([&](LoopLikeOpInterface loop) {
     moveLoopInvariantCode(
         loop.getLoopRegions(),

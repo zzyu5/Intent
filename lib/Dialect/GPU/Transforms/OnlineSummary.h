@@ -29,6 +29,7 @@ struct OnlineSummaryStructure {
   unsigned reductionAxis;
   unsigned valueReductionAxis;
   PhysicalSourceAxis traversal;
+  SelectOp momentOrEmpty;
 };
 
 struct OnlineSummaryMerge {

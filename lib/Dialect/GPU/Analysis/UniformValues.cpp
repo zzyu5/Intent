@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 
@@ -126,6 +127,13 @@ UniformExpression describeUniformValue(Value value) {
     result.stateCount = reduce.getIdentityCount();
     result.result = cast<OpResult>(value).getResultNumber();
     auto inputs = reduce.getInputs();
+    if (auto source = dyn_cast<FragmentType>(inputs.front().getType())) {
+      auto kernel = reduce->getParentOfType<func::FuncOp>();
+      result.nonempty = kernel && llvm::all_of(reduce.getAxes(), [&](int64_t axis) {
+        return axis >= 0 && static_cast<unsigned>(axis) < source.getShape().size() &&
+            isKnownPositiveExtent(cast<PhysicalExprAttr>(source.getShape()[axis]), kernel);
+      });
+    }
     result.operands.assign(inputs.begin() + result.stateCount, inputs.begin() + 2 * result.stateCount);
     llvm::append_range(result.operands, inputs.take_front(result.stateCount));
     llvm::append_range(result.operands, inputs.drop_front(2 * result.stateCount));

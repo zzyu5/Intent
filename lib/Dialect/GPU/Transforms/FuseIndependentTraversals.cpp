@@ -97,9 +97,18 @@ bool hoistInputsBefore(Operation *first, Operation *second,
 
 bool tryFuse(scf::ForOp first, scf::ForOp second, func::FuncOp kernel,
              ArrayAttr tuples) {
+  if (second.getNumResults()) {
+    auto directContraction = [](scf::ForOp loop) {
+      if (loop.getNumResults() != 1) return false;
+      auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+      auto contract = yield.getOperand(0).getDefiningOp<ContractOp>();
+      return contract && contract.getAccumulator() == loop.getRegionIterArgs()[0];
+    };
+    if (!directContraction(first) || !directContraction(second))
+      return false;
+  }
   if (first->getBlock() != second->getBlock() ||
       !first->isBeforeInBlock(second) ||
-      second.getNumResults() != 0 ||
       first->hasAttr(executionGroupAttr) || second->hasAttr(executionGroupAttr) ||
       !sameBound(first.getLowerBound(), second.getLowerBound(), tuples) ||
       !sameBound(first.getUpperBound(), second.getUpperBound(), tuples) ||
@@ -112,6 +121,7 @@ bool tryFuse(scf::ForOp first, scf::ForOp second, func::FuncOp kernel,
       return false;
   for (NamedAttribute attribute : second->getDiscardableAttrs())
     if (attribute.getName() != originAttr &&
+        attribute.getName() != reductionSourcesAttr &&
         attribute.getName() != independentIterationAttr)
       return false;
   llvm::DenseSet<Value> firstReads, secondReads;
@@ -135,12 +145,19 @@ bool tryFuse(scf::ForOp first, scf::ForOp second, func::FuncOp kernel,
   second.setUpperBound(first.getUpperBound());
   second.setStep(first.getStep());
   auto attributes = first->getAttrDictionary();
+  SmallVector<Attribute> sources;
+  for (scf::ForOp loop : {first, second})
+    if (auto axes = loop->getAttrOfType<ArrayAttr>(reductionSourcesAttr))
+      for (Attribute axis : axes)
+        if (!llvm::is_contained(sources, axis)) sources.push_back(axis);
   bool independent = first->hasAttr(independentIterationAttr) &&
                      second->hasAttr(independentIterationAttr);
   IRRewriter rewriter(kernel.getContext());
   second->moveBefore(first);
   scf::ForOp fused = mlir::fuseIndependentSiblingForLoops(first, second, rewriter);
   fused->setAttrs(attributes);
+  if (!sources.empty())
+    fused->setAttr(reductionSourcesAttr, rewriter.getArrayAttr(sources));
   if (!independent || !fused.getInitArgs().empty())
     fused->removeAttr(independentIterationAttr);
   return true;

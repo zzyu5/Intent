@@ -1083,13 +1083,15 @@ FailureOr<Value> coRealizeOnlineRegion(
     FailureOr<Value> massScale = projectPhysicalValueToSchema(
         builder, location, scale, oldMass.getType());
     FailureOr<Value> momentScale = projectPhysicalValueToSchema(
-        builder, location, scale, oldMoment.getType());
-    if (failed(massScale) || failed(momentScale))
+        builder, location, scale, mappedMoment.getResult().getType());
+    FailureOr<Value> nativeMoment = projectPhysicalValueToSchema(
+        builder, location, oldMoment, mappedMoment.getResult().getType());
+    if (failed(massScale) || failed(momentScale) || failed(nativeMoment))
       return failure();
     leftMassTerm = builder.create<BinaryOp>(
         location, oldMass.getType(), *massScale, oldMass, BinaryOperator::Multiply);
     leftMomentTerm = builder.create<BinaryOp>(
-        location, oldMoment.getType(), *momentScale, oldMoment,
+        location, mappedMoment.getResult().getType(), *momentScale, *nativeMoment,
         BinaryOperator::Multiply);
   }
   FailureOr<Value> projectedMaximum = projectPhysicalValueToSchema(
@@ -1153,6 +1155,25 @@ FailureOr<Value> coRealizeOnlineRegion(
       builder, location, directMoment.getResult(), momentType);
   if (failed(projectedMoment))
     return failure();
+  Value combinedMoment = *projectedMoment;
+  if (plan.summary.momentOrEmpty) {
+    Value rowValidity = summaryValue(plan.summary.validity.getResult(0));
+    if (!rowValidity)
+      return failure();
+    UniformValueAnalysis facts(describeUniformValue);
+    if (uniformBoolean(facts.evaluate(rowValidity)) != true) {
+      FailureOr<Value> condition = projectPhysicalValueToSchema(
+          builder, location, rowValidity, predicateType(cast<FragmentType>(momentType)));
+      FailureOr<Value> unchangedCarry = projectPhysicalValueToSchema(
+          builder, location, leftMomentTerm, momentType);
+      if (failed(condition) || failed(unchangedCarry))
+        return failure();
+      // Preserve the author's zero moment for fully masked rows, including
+      // when an inactive value operand contains nonfinite elements.
+      combinedMoment = builder.create<SelectOp>(
+          location, momentType, *condition, combinedMoment, *unchangedCarry);
+    }
+  }
   Value combinedMass = builder.create<BinaryOp>(
       location, massType, *projectedLeftMass, *projectedMass,
       BinaryOperator::Add);
@@ -1166,7 +1187,7 @@ FailureOr<Value> coRealizeOnlineRegion(
       continue;
     }
     if (field == plan.summary.momentField) {
-      fields.push_back(*projectedMoment);
+      fields.push_back(combinedMoment);
       continue;
     }
     if (encodedCarry && field == plan.summary.maximumField) {
