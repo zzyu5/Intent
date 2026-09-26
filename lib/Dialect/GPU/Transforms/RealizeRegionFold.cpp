@@ -1891,8 +1891,70 @@ void foldKnownRecordProjections(Operation *structured) {
     });
 }
 
+void forwardUnusedRecordFields(RegionFoldOp fold) {
+  if (fold.getNumResults() != 1 ||
+      !isa<RecordType>(fold.getResult(0).getType()))
+    return;
+  Block &combine = fold.getCombine().front();
+  if (combine.getNumArguments() != 2)
+    return;
+  auto yield = cast<YieldOp>(combine.getTerminator());
+  auto record = yield.getValues().front().getDefiningOp<MakeRecordOp>();
+  if (!record)
+    return;
+  llvm::SmallDenseSet<unsigned> live;
+  SmallVector<unsigned> pending;
+  auto require = [&](unsigned field) {
+    if (live.insert(field).second)
+      pending.push_back(field);
+  };
+  for (Operation *user : fold.getResult(0).getUsers()) {
+    auto extract = dyn_cast<ExtractOp>(user);
+    if (!extract)
+      return;
+    require(extract.getField());
+  }
+  while (!pending.empty()) {
+    unsigned field = pending.pop_back_val();
+    llvm::SmallPtrSet<Value, 16> visited;
+    std::function<bool(Value)> collect = [&](Value value) {
+      if (!visited.insert(value).second)
+        return true;
+      if (value == combine.getArgument(0) ||
+          value == combine.getArgument(1))
+        return false;
+      if (auto extract = value.getDefiningOp<ExtractOp>();
+          extract && (extract.getRecord() == combine.getArgument(0) ||
+                      extract.getRecord() == combine.getArgument(1))) {
+        require(extract.getField());
+        return true;
+      }
+      Operation *definition = value.getDefiningOp();
+      if (!definition || definition->getBlock() != &combine)
+        return true;
+      if (definition->getNumRegions())
+        return false;
+      return llvm::all_of(definition->getOperands(), collect);
+    };
+    if (!collect(record.getFields()[field]))
+      return;
+  }
+  OpBuilder builder(record);
+  for (auto [field, value] : llvm::enumerate(record.getFields())) {
+    if (live.contains(field))
+      continue;
+    // Unobserved fields cannot feed any observed combine field. Carry their
+    // existing value through, so ordinary DCE can remove their summary work
+    // without changing the record schema or the observed recurrence.
+    Value unchanged = builder.create<ExtractOp>(
+        record.getLoc(), value.getType(), combine.getArgument(0), field);
+    record->setOperand(field, unchanged);
+  }
+}
+
 LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   foldKnownRecordProjections(fold);
+  forwardUnusedRecordFields(fold);
   ParameterOp segment = findParameter(kernel, fold.getSegment());
   if (!segment)
     return fold.emitOpError("region-fold segment parameter is not declared");

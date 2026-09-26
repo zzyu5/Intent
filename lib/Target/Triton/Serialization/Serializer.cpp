@@ -1159,7 +1159,9 @@ private:
       for (auto [index, field] : llvm::enumerate(record.getFields())) {
         if (index)
           tuple += ", ";
-        tuple += valueString(field);
+        // Records can become loop carries; preserve each declared scalar dtype
+        // instead of letting Triton infer a narrower type from a literal.
+        tuple += controlValueString(field);
       }
       if (record.getFields().size() == 1)
         tuple += ",";
