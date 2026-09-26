@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import resource
 import statistics
 import sys
 
@@ -30,6 +31,9 @@ def _check_execution(profile: TargetProfile, used_extensions: frozenset[str], li
         raise NotImplementedError("Weft native loading requires little-endian RISC-V Linux")
     if ctypes.sizeof(ctypes.c_void_p) != 8:
         raise ValueError("native pointer size disagrees with RV64/lp64d")
+    stack, _ = resource.getrlimit(resource.RLIMIT_STACK)
+    if stack != resource.RLIM_INFINITY and profile.private_stack_bytes >= stack:
+        raise ValueError("artifact private stack budget exceeds the native thread's stack limit")
     cpus = os.sched_getaffinity(0)
     if not cpus.issubset(profile.cpus):
         raise ValueError("current CPU affinity exceeds the artifact execution set")
@@ -74,7 +78,12 @@ class NativeCall:
     native_arguments: tuple
     outputs: tuple[Buffer, ...]
     key: tuple
+    trial_inputs: tuple[tuple[Buffer, bytes], ...] = ()
     winner: int | None = None
+
+    def restore_trial_inputs(self) -> None:
+        for buffer, snapshot in self.trial_inputs:
+            buffer.storage[:] = snapshot
 
     def choose(self, prepare=None) -> int:
         if self.winner is not None:
@@ -84,14 +93,18 @@ class NativeCall:
             return self.winner
         if self.key not in _winners:
             timings = []
-            for measure in self.program.measurements:
-                samples = []
-                for _ in range(3):
-                    if prepare is not None:
-                        prepare()
-                    samples.append(measure(*self.native_arguments, 1))
-                timings.append(statistics.median(samples))
-            _winners[self.key] = min(range(len(timings)), key=timings.__getitem__)
+            try:
+                for measure in self.program.measurements:
+                    samples = []
+                    for _ in range(3):
+                        self.restore_trial_inputs()
+                        if prepare is not None:
+                            prepare()
+                        samples.append(measure(*self.native_arguments, 1))
+                    timings.append(statistics.median(samples))
+                _winners[self.key] = min(range(len(timings)), key=timings.__getitem__)
+            finally:
+                self.restore_trial_inputs()
         self.winner = _winners[self.key]
         return self.winner
 
@@ -104,6 +117,7 @@ class NativeCall:
         measure = self.program.measurements[self.choose(prepare)]
         values = []
         for _ in range(samples):
+            self.restore_trial_inputs()
             if prepare is not None:
                 prepare()
             values.append(measure(*self.native_arguments, 1))
@@ -122,9 +136,6 @@ class NativeProgram:
         self.profile = TargetProfile(**manifest["profile"])
         self.metadata = manifest["program"]
         self.parameters = self.metadata["parameters"]
-        if any(parameter["kind"] == "view" and parameter["access"] == 2
-               for parameter in self.parameters):
-            raise NotImplementedError("Weft InOut trial state restoration is not implemented")
         self.candidates = self.metadata["candidates"]
         kernels = {kernel["symbol"]: kernel for kernel in manifest["weft"]["kernels"]}
         self.candidate_extensions = tuple(frozenset(
@@ -188,9 +199,9 @@ class NativeProgram:
             values.append(value)
         outputs = []
         for index, parameter in enumerate(self.parameters):
-            if parameter["kind"] != "view" or parameter["access"] != 1:
+            if parameter["kind"] != "view" or parameter["access"] == 0:
                 continue
-            if not explicit_outputs:
+            if not explicit_outputs and parameter["access"] == 1:
                 shape = tuple(static if static >= 0 else dimensions[identity]
                               for static, identity in zip(parameter["shape"], parameter["dimensions"]))
                 values[index] = Buffer.empty(shape, parameter["dtype"])
@@ -216,7 +227,10 @@ class NativeProgram:
             else:
                 native.append(value)
                 facts.append((parameter["dtype"], value))
-        return NativeCall(self, tuple(values), tuple(native), tuple(outputs), (self.identity, tuple(facts)))
+        snapshots = tuple((value, bytes(value.storage)) for parameter, value in zip(self.parameters, values)
+                          if parameter["kind"] == "view" and parameter["access"] == 2)
+        return NativeCall(self, tuple(values), tuple(native), tuple(outputs),
+                          (self.identity, tuple(facts)), snapshots)
 
     def run(self, *arguments):
         call = self.prepare(arguments)

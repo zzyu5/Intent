@@ -21,6 +21,7 @@ def lower_artifact(source: str, *, compiler: str, profile: TargetProfile,
     artifact = json.loads(invoke_compiler(
         [compiler, "--emit=artifact", f"--march={profile.march}", f"--abi={profile.abi}",
          f"--vlen-bits={profile.vlen_bits}",
+         f"--private-stack-bytes={profile.private_stack_bytes}",
          *([f"--matrix-extension={profile.matrix_extension}"] if profile.matrix_extension else []),
          *(f"--meta={name}={value}" for name, value in source_bindings)], source,
     ))

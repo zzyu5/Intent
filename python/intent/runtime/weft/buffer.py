@@ -4,7 +4,7 @@ import ctypes
 from math import prod
 
 
-ELEMENT_BYTES = {"u8": 1, "i8": 1, "i32": 4, "f32": 4}
+ELEMENT_BYTES = {"u8": 1, "i8": 1, "i32": 4, "i64": 8, "f16": 2, "f32": 4}
 
 
 class Buffer:
