@@ -55,7 +55,7 @@ struct TritonLocalOptions {
 
 StringRef localOptionsFamily(ArrayRef<gpu::ParameterCategory> categories,
                              bool twoAxisPointwise,
-                             bool blackwellRecurrentContraction,
+                             StringRef recurrentContractionFamily,
                              bool fp32Contractions) {
   if (llvm::is_contained(categories,
                          gpu::ParameterCategory::RegionReduction))
@@ -65,12 +65,15 @@ StringRef localOptionsFamily(ArrayRef<gpu::ParameterCategory> categories,
     return "region_contraction";
   if (llvm::is_contained(categories,
                          gpu::ParameterCategory::PersistentContraction)) {
-    if (blackwellRecurrentContraction)
-      return "blackwell_recurrent_contraction";
-    return "persistent_contraction";
+    return recurrentContractionFamily.empty() ? "persistent_contraction"
+                                               : recurrentContractionFamily;
   }
-  if (llvm::is_contained(categories, gpu::ParameterCategory::Contraction))
-    return fp32Contractions ? "contraction_f32" : "contraction";
+  if (llvm::is_contained(categories, gpu::ParameterCategory::Contraction)) {
+    if (fp32Contractions)
+      return "contraction_f32";
+    return recurrentContractionFamily.empty() ? "contraction"
+                                               : recurrentContractionFamily;
+  }
   if (llvm::is_contained(categories, gpu::ParameterCategory::Histogram))
     return "histogram";
   if (llvm::is_contained(categories, gpu::ParameterCategory::Reduction) ||
@@ -130,13 +133,18 @@ bool valueDependsOnNestedContract(Value value, scf::ForOp owner,
   });
 }
 
-bool isDirectContractionAccumulator(Value value,
+bool isDirectContractionAccumulator(Value value, Value carry, scf::ForOp owner,
                                     llvm::SmallDenseSet<Value, 8> &visited) {
   if (!visited.insert(value).second)
     return false;
   Operation *definition = value.getDefiningOp();
-  if (isa_and_nonnull<gpu::ContractOp>(definition))
-    return true;
+  if (auto contract = dyn_cast_or_null<gpu::ContractOp>(definition)) {
+    if (contract.getAccumulator() != carry)
+      return false;
+    llvm::SmallDenseSet<Value, 32> dependencies;
+    return !valueDependsOn(contract.getLhs(), carry, owner, dependencies) &&
+           !valueDependsOn(contract.getRhs(), carry, owner, dependencies);
+  }
   auto nested = dyn_cast_or_null<scf::ForOp>(definition);
   auto result = dyn_cast<OpResult>(value);
   auto yield = nested
@@ -144,8 +152,10 @@ bool isDirectContractionAccumulator(Value value,
                    : scf::YieldOp();
   return nested && result && yield &&
          result.getResultNumber() < nested.getInitArgs().size() &&
+         nested.getInitArgs()[result.getResultNumber()] == carry &&
          isDirectContractionAccumulator(
-             yield.getOperand(result.getResultNumber()), visited);
+             yield.getOperand(result.getResultNumber()),
+             nested.getRegionIterArgs()[result.getResultNumber()], nested, visited);
 }
 
 bool hasRecurrentContraction(func::FuncOp kernel) {
@@ -158,7 +168,8 @@ bool hasRecurrentContraction(func::FuncOp kernel) {
       return;
     for (auto [index, next] : llvm::enumerate(yield.getOperands())) {
       llvm::SmallDenseSet<Value, 8> directVisited;
-      if (isDirectContractionAccumulator(next, directVisited))
+      if (isDirectContractionAccumulator(next, loop.getRegionIterArgs()[index],
+                                         loop, directVisited))
         continue;
       llvm::SmallDenseSet<Value, 32> contractionVisited;
       if (!valueDependsOnNestedContract(next, loop, contractionVisited))
@@ -4178,8 +4189,15 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   if (hasContraction &&
       !llvm::is_contained(categories, gpu::ParameterCategory::Contraction))
     categories.push_back(gpu::ParameterCategory::Contraction);
+  StringRef recurrentContractionFamily;
+  if (hasRecurrentContraction(kernel)) {
+    if (blackwell)
+      recurrentContractionFamily = "blackwell_recurrent_contraction";
+    else if (capabilities.getComputeCapabilityMajor() == 9)
+      recurrentContractionFamily = "hopper_recurrent_contraction";
+  }
   auto rows = profiles.get("triton", localOptionsFamily(
-      categories, twoAxisPointwise, blackwell && hasRecurrentContraction(kernel),
+      categories, twoAxisPointwise, recurrentContractionFamily,
       hasContraction && allFp32), kernel.getLoc());
   if (failed(rows))
     return failure();
