@@ -311,12 +311,11 @@ TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
 SmallVector<CorrelatedProfileParameters>
 correlatedReductionContractionParameters(
     func::FuncOp kernel, ArrayRef<ParameterOp> parameters,
-    bool twoAxisPointwise, bool fixedPointwiseLocal) {
+    bool fixedPointwiseLocal) {
   SmallVector<CorrelatedProfileParameters> correlated;
   auto capabilities =
       kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
-  if (!capabilities || !capabilities.getMatrixUnits() || twoAxisPointwise ||
-      fixedPointwiseLocal)
+  if (!capabilities || !capabilities.getMatrixUnits() || fixedPointwiseLocal)
     return correlated;
 
   SmallVector<ParameterOp> pointwise;
@@ -326,7 +325,9 @@ correlatedReductionContractionParameters(
   for (ParameterOp parameter : parameters) {
     ParameterAttr schema = parameter.getParameter();
     auto role = static_cast<ParameterRole>(schema.getRole());
-    if (tuningClass(kernel, parameter) == TuningClass::Pointwise &&
+    auto kind = tuningClass(kernel, parameter);
+    if ((kind == TuningClass::Pointwise ||
+         kind == TuningClass::PointwiseReduction) &&
         (role == ParameterRole::OwnershipM ||
          role == ParameterRole::OwnershipN) &&
         schema.getElementBitWidth() > 16)
@@ -368,6 +369,18 @@ correlatedReductionContractionParameters(
           auto contractResultType =
               dyn_cast<FragmentType>(contract.getResult().getType());
           if (!lhsType || !rhsType || !contractResultType ||
+              lhsType.getShape().size() != 2 ||
+              rhsType.getShape().size() != 2 ||
+              !contract.getLhsBatchAxes().empty() ||
+              !contract.getRhsBatchAxes().empty() ||
+              contract.getLhsReductionAxes().size() != 1 ||
+              contract.getRhsReductionAxes().size() != 1 ||
+              !freeAxesReferenceParameter(lhsType,
+                                          contract.getLhsReductionAxes(),
+                                          pointwiseName) ||
+              !freeAxesReferenceParameter(rhsType,
+                                          contract.getRhsReductionAxes(),
+                                          reductionName) ||
               !fragmentReferencesParameter(contractResultType,
                                            pointwiseName) ||
               !fragmentReferencesParameter(contractResultType, reductionName))
@@ -1046,8 +1059,7 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
   // profile rows instead of constructing a Cartesian product of all axes.
   SmallVector<CorrelatedProfileParameters> correlatedProfiles =
       correlatedReductionContractionParameters(
-          kernel, parameters, hasTwoAxisPointwiseOwnership,
-          hasFixedPointwiseLocal);
+          kernel, parameters, hasFixedPointwiseLocal);
   SmallVector<Attribute> indirectRowGroups;
   auto capabilities =
       kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
@@ -1173,10 +1185,25 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
       return parameterProfiles.find(parameter)->second.front();
     }, true);
   for (const CorrelatedProfileParameters &correlated : correlatedProfiles) {
-    appendTuple([&](ParameterOp parameter) -> const TuningProfile & {
-      const auto &profiles = parameterProfiles.find(parameter)->second;
-      return parameter == correlated.reduction ? profiles.back() : profiles.front();
-    });
+    const auto &matrixProfiles =
+        parameterProfiles.find(correlated.contraction)->second;
+    for (auto [index, matrix] : llvm::enumerate(matrixProfiles)) {
+      // The consumer reduces the matrix's N axis. Bind its chunk and retained
+      // M rows from that same matrix profile, regardless of their tuning class.
+      // Zipping independent profile row numbers can omit these legal tiles.
+      TuningProfile rows = matrix;
+      rows.ownershipN = matrix.ownershipM;
+      TuningProfile columns = matrix;
+      columns.reduction = matrix.ownershipN;
+      appendTuple([&](ParameterOp parameter) -> const TuningProfile & {
+        if (parameter == correlated.pointwise)
+          return rows;
+        if (parameter == correlated.reduction)
+          return columns;
+        const auto &profiles = parameterProfiles.find(parameter)->second;
+        return profiles[std::min<size_t>(index, profiles.size() - 1)];
+      });
+    }
   }
   if (!indirectRowGroups.empty()) {
     auto rows = tables.get("shared", "indirect_row", kernel.getLoc());
