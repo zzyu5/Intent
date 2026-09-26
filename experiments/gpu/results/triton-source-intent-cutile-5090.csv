@@ -17,7 +17,7 @@ xformers_rms_norm,8192x4096-bf16,0.071472,0.086112,0.829989,pass,Intent target=c
 qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,1.780472,1.827840,0.974085,pass,Intent target=cutile; source corpus=triton.
 index_select,source65536-selected32768-hidden4096-fp16,0.358144,0.366368,0.977553,pass,Intent target=cutile; source corpus=triton.
 scaled_index_add,destination65536-routed32768-hidden4096-fp16,0.522136,0.530512,0.984211,pass,Intent target=cutile; source corpus=triton.
-scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,4.792600,2.574248,1.861748,pass,Intent target=cutile; source corpus=triton.
+scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,1.109640,2.574248,0.431054,pass,Intent target=cutile; source corpus=triton.
 jagged_mean,B512-T33024-D128-fp32,0.016160,0.018224,0.886743,pass,Intent target=cutile; source corpus=triton.
 fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.065216,0.124704,0.522966,pass,Intent target=cutile; source corpus=triton.
 rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.239584,0.440768,0.543560,pass,Intent target=cutile; source corpus=triton.
@@ -42,7 +42,7 @@ flaggems_triangular_solve,B4096-N16-fp32-lower,0.020488,0.028824,0.710797,pass,I
 flaggems_embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.173872,0.175920,0.988358,pass,Intent target=cutile; source corpus=triton.
 flaggems_roll,8192x4096-fp16-shift-1-axis0,0.087808,0.087848,0.999545,pass,Intent target=cutile; source corpus=triton.
 flaggems_transpose_copy,4093x8191-fp16,0.104480,0.312008,0.334863,pass,Intent target=cutile; source corpus=triton.
-flaggems_batch_norm_training,B32-C64-S4096-fp16,0.038880,0.026640,1.459459,pass,Intent target=cutile; source corpus=triton.
+flaggems_batch_norm_training,B32-C64-S4096-fp16,0.038816,0.026640,1.457057,pass,Intent target=cutile; source corpus=triton.
 flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.042784,0.057104,0.749229,pass,Intent target=cutile; source corpus=triton.
 flaggems_logsumexp,8192x8192-fp32,0.177952,0.177704,1.001396,pass,Intent target=cutile; source corpus=triton.
 flaggems_softmax_backward,4096x4097-fp32,0.116800,0.161440,0.723489,pass,Intent target=cutile; source corpus=triton.
