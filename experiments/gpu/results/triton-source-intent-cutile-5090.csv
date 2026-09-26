@@ -1,55 +1,55 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
-fused_softmax,8192x8192-fp16,0.175712,0.188032,0.934479,pass,Intent target=cutile; source corpus=triton.
-dense_gemm,M4096-N14336-K4096-fp16,2.053824,2.110240,0.973266,pass,Intent target=cutile; source corpus=triton.
-grouped_gemm,E8-M1024-K4096-N14336-fp16,4.299344,4.573904,0.939973,pass,Intent target=cutile; source corpus=triton.
-flash_attention_forward,B4-H32-S4096-D128-fp16-causal,5.716064,2.793200,2.046421,pass,Intent target=cutile; source corpus=triton. 同算法；CUDA graph 设备执行计时；source 额外写 f32 M 辅助结果。 Reference stack Torch 2.10.0+cu130 and Triton 3.6.0; cuTile 1.5.0.
-layer_norm,8192x4096-fp16,0.089864,0.089872,0.999911,pass,Intent target=cutile; source corpus=triton.
-flash_cross_entropy,8192x32768-bf16,0.341832,0.343464,0.995248,pass,Intent target=cutile; source corpus=triton.
-flash_layer_norm,8192x4096-bf16,0.087824,0.087776,1.000547,pass,Intent target=cutile; source corpus=triton.
-rotary_embedding,B4-S4096-H32-D128-bf16,0.177920,0.179648,0.990381,pass,Intent target=cutile; source corpus=triton.
-swiglu,8192x14336-bf16,0.450304,0.450568,0.999414,pass,Intent target=cutile; source corpus=triton.
-embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.175280,0.173664,1.009305,pass,Intent target=cutile; source corpus=triton.
-cross_entropy,8192x32768-bf16,0.788280,0.903904,0.872084,pass,Intent target=cutile; source corpus=triton.
-padded_rope_cache_update,B32-QH32-KVH8-D128-cache8192-fp16,0.006128,0.005408,1.133136,pass,Intent target=cutile; source corpus=triton.
-fused_add_rms_norm,8192x4096-bf16,0.175856,0.176160,0.998274,pass,Intent target=cutile; source corpus=triton. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
-rms_norm,8192x4096-bf16,0.087776,0.085776,1.023317,pass,Intent target=cutile; source corpus=triton.
-xformers_rms_norm,8192x4096-bf16,0.080000,0.086696,0.922765,pass,Intent target=cutile; source corpus=triton.
-qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,1.769472,1.896960,0.932794,pass,Intent target=cutile; source corpus=triton.
-index_select,source65536-selected32768-hidden4096-fp16,0.357912,0.366400,0.976834,pass,Intent target=cutile; source corpus=triton.
-scaled_index_add,destination65536-routed32768-hidden4096-fp16,0.520224,0.530528,0.980578,pass,Intent target=cutile; source corpus=triton.
-scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,4.353032,2.554840,1.703837,pass,Intent target=cutile; source corpus=triton.
-jagged_mean,B512-T33024-D128-fp32,0.017512,0.018144,0.965168,pass,Intent target=cutile; source corpus=triton.
-fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.067312,0.124656,0.539982,pass,Intent target=cutile; source corpus=triton.
-rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.237568,0.439792,0.540183,pass,Intent target=cutile; source corpus=triton.
-causal_conv1d,B4-C4096-S4096-W4-bf16-silu,0.190208,0.192240,0.989430,pass,Intent target=cutile; source corpus=triton.
-varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.059392,0.056528,1.050665,pass,Intent target=cutile; source corpus=triton.
-causal_conv1d_update,B32-D4096-W4-bf16,0.010112,0.006128,1.650130,pass,Intent target=cutile; source corpus=triton.
-modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,0.388800,0.405632,0.958504,pass,Intent target=cutile; source corpus=triton. source launch uses num_stages=1 and num_warps=4.
-mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.012288,0.008192,1.500000,pass,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出 cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
-flash_attention_backward,B2-H16-S2048-D128-fp16-causal,1.741016,0.770712,2.258971,pass,Intent target=cutile; source corpus=triton. source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。 cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
-moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.247336,2.369408,0.948480,pass,Intent target=cutile; source corpus=triton.
-moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,2.258640,3.384432,0.667362,pass,Intent target=cutile; source corpus=triton.
-mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,0.028432,0.014080,2.019318,pass,Intent target=cutile; source corpus=triton. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
-mamba_state_passing,B1-C8-H32-state8192-fp32,0.012016,0.013968,0.860252,pass,Intent target=cutile; source corpus=triton.
-mamba_chunk_scan,B1-S2048-H32-G8-P64-N128-C256-bf16,0.059168,0.044800,1.320714,pass,Intent target=cutile; source corpus=triton. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
-mamba3_siso_forward,B1-S2048-HQK4-H16-DQK32-DV64-bf16,0.173912,0.227672,0.763871,pass,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲 cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
-paged_gqa_decode,B16-QH32-KVH8-S8192-D128-page16-fp16,0.357872,0.456184,0.784490,pass,Intent target=cutile; source corpus=triton.
-splitk_paged_attention,B16-QH32-KVH8-S8192-D128-page16-split8-fp16,0.355656,0.452088,0.786696,pass,Intent target=cutile; source corpus=triton.
-paged_mla_decode,B8-QH128-KVH1-S8192-C512-R64-page16-fp16,0.616592,0.381408,1.616620,pass,Intent target=cutile; source corpus=triton. 同算法；source 使用 packed KV/page-table ABI 并写辅助 LSE；输入布局适配在计时前完成，完整 source 调用含 scale 分配 cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
-block_sparse_gqa_decode,B8-QH32-KVH8-S8192-D128-blocks32x128,0.159744,0.092600,1.725097,pass,Intent target=cutile; source corpus=triton. 同算法；source 使用 packed KV/topk ABI；输入布局适配在计时前完成，完整 source 调用含 partial buffer 分配 cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
-flaggems_conv1d,B64-L16384-K5-fp16-same,0.007936,0.061152,0.129775,pass,Intent target=cutile; source corpus=triton.
-flaggems_triangular_solve,B4096-N16-fp32-lower,0.033232,0.028688,1.158394,pass,Intent target=cutile; source corpus=triton; reference stack Torch 2.10.0+cu130 and Triton 3.6.0; cuTile 1.5.0.
-flaggems_embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.175872,0.174832,1.005949,pass,Intent target=cutile; source corpus=triton.
-flaggems_roll,8192x4096-fp16-shift-1-axis0,0.087792,0.089088,0.985453,pass,Intent target=cutile; source corpus=triton.
-flaggems_transpose_copy,4093x8191-fp16,0.105216,0.308992,0.340514,pass,Intent target=cutile; source corpus=triton; reference stack Torch 2.10.0+cu130 and Triton 3.6.0; cuTile 1.5.0.
-flaggems_batch_norm_training,B32-C64-S4096-fp16,0.084704,0.028640,2.957542,pass,Intent target=cutile; source corpus=triton.
-flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.042720,0.053136,0.803975,pass,Intent target=cutile; source corpus=triton.
-flaggems_logsumexp,8192x8192-fp32,0.179968,0.176128,1.021802,pass,Intent target=cutile; source corpus=triton.
-flaggems_softmax_backward,4096x4097-fp32,,,,numerical_failed,"generated/source floating result 0 differs: max_abs=0.00012362003326416016, atol=0.0001, rtol=1e-05; first_failure=15327822; largest tolerance excess has generated=0.08494142442941666, source=0.08482552319765091, abs_error=0.00011590123176574707, limit=0.00010084825044032186"
-flaggems_fused_adamw,N8388608-fp32,0.153888,0.157664,0.976050,pass,Intent target=cutile; source corpus=triton.
-flaggems_addcmul,B64-C128-L4096-bf16,0.087776,0.087824,0.999453,pass,Intent target=cutile; source corpus=triton; reference stack Torch 2.10.0+cu130 and Triton 3.6.0; cuTile 1.5.0.
-flaggems_fp8_mqa_logits,Q256-K4096-H32-D128-e4m3,0.070824,0.087672,0.807829,pass,Intent target=cutile; source corpus=triton. cuTile correctness profile: ctas=1 worker_warps=4 load_policy_loop=11 occupancy_loop=1 occupancy_persistent=1; other search dimensions unchanged.
-flaggems_cumsum,8192x8192-fp32-axis1,0.350008,0.351960,0.994454,pass,Intent target=cutile; source corpus=triton.
-flaggems_histogram,N8388608-bins256-fp32,1.157264,1.241080,0.932465,pass,Intent target=cutile; source corpus=triton.
-flaggems_max_pool2d_with_indices,B8-C32-H128-W128-K3-S2-P1-fp16,0.018176,0.018176,1.000000,pass,Intent target=cutile; source corpus=triton.
-legacy_flash_attention_bias,B4-H32-S4096-D128-fp16-vector-bias,5.427416,7.044408,0.770457,pass,Intent target=cutile; source corpus=triton. 同算法；source 额外写 LSE 和临时数据；使用既有受限 native hints 完成调优。
+fused_softmax,8192x8192-fp16,0.175728,0.188184,0.933809,pass,Intent target=cutile; source corpus=triton.
+dense_gemm,M4096-N14336-K4096-fp16,2.052056,2.085224,0.984094,pass,Intent target=cutile; source corpus=triton.
+grouped_gemm,E8-M1024-K4096-N14336-fp16,4.625456,4.612400,1.002831,pass,Intent target=cutile; source corpus=triton.
+flash_attention_forward,B4-H32-S4096-D128-fp16-causal,2.815776,2.767648,1.017389,pass,Intent target=cutile; source corpus=triton. 同算法；CUDA graph 设备执行计时；source 额外写 f32 M 辅助结果。
+layer_norm,8192x4096-fp16,0.087752,0.089888,0.976237,pass,Intent target=cutile; source corpus=triton.
+flash_cross_entropy,8192x32768-bf16,0.342544,0.343040,0.998554,pass,Intent target=cutile; source corpus=triton.
+flash_layer_norm,8192x4096-bf16,0.087856,0.086096,1.020442,pass,Intent target=cutile; source corpus=triton.
+rotary_embedding,B4-S4096-H32-D128-bf16,0.178544,0.180016,0.991823,pass,Intent target=cutile; source corpus=triton.
+swiglu,8192x14336-bf16,0.450368,0.450304,1.000142,pass,Intent target=cutile; source corpus=triton.
+embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.173840,0.173856,0.999908,pass,Intent target=cutile; source corpus=triton.
+cross_entropy,8192x32768-bf16,0.688352,0.687632,1.001047,pass,Intent target=cutile; source corpus=triton.
+padded_rope_cache_update,B32-QH32-KVH8-D128-cache8192-fp16,0.004520,0.004112,1.099222,pass,Intent target=cutile; source corpus=triton.
+fused_add_rms_norm,8192x4096-bf16,0.177896,0.176304,1.009030,pass,Intent target=cutile; source corpus=triton.
+rms_norm,8192x4096-bf16,0.085776,0.086096,0.996283,pass,Intent target=cutile; source corpus=triton.
+xformers_rms_norm,8192x4096-bf16,0.071472,0.086112,0.829989,pass,Intent target=cutile; source corpus=triton.
+qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,1.781544,1.983504,0.898180,pass,Intent target=cutile; source corpus=triton.
+index_select,source65536-selected32768-hidden4096-fp16,0.358144,0.366368,0.977553,pass,Intent target=cutile; source corpus=triton.
+scaled_index_add,destination65536-routed32768-hidden4096-fp16,0.522136,0.530512,0.984211,pass,Intent target=cutile; source corpus=triton.
+scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,7.052800,2.574248,2.739752,pass,Intent target=cutile; source corpus=triton.
+jagged_mean,B512-T33024-D128-fp32,0.016160,0.018224,0.886743,pass,Intent target=cutile; source corpus=triton.
+fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.065216,0.124704,0.522966,pass,Intent target=cutile; source corpus=triton.
+rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.239584,0.440768,0.543560,pass,Intent target=cutile; source corpus=triton.
+causal_conv1d,B4-C4096-S4096-W4-bf16-silu,0.186144,0.193704,0.960971,pass,Intent target=cutile; source corpus=triton.
+varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.057328,0.057856,0.990874,pass,Intent target=cutile; source corpus=triton.
+causal_conv1d_update,B32-D4096-W4-bf16,0.008192,0.006416,1.276808,pass,Intent target=cutile; source corpus=triton.
+modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,0.226536,0.407272,0.556228,pass,Intent target=cutile; source corpus=triton. source launch uses num_stages=1 and num_warps=4.
+mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.008192,0.008192,1.000000,pass,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出
+flash_attention_backward,B2-H16-S2048-D128-fp16-causal,35.398336,0.776440,45.590563,pass,Intent target=cutile; source corpus=triton. source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。
+moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.252688,2.383000,0.945316,pass,Intent target=cutile; source corpus=triton.
+moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,2.250528,3.401408,0.661646,pass,Intent target=cutile; source corpus=triton.
+mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,0.024304,0.016160,1.503960,pass,Intent target=cutile; source corpus=triton.
+mamba_state_passing,B1-C8-H32-state8192-fp32,0.012064,0.013360,0.902994,pass,Intent target=cutile; source corpus=triton.
+mamba_chunk_scan,B1-S2048-H32-G8-P64-N128-C256-bf16,0.046880,0.046880,1.000000,pass,Intent target=cutile; source corpus=triton.
+mamba3_siso_forward,B1-S2048-HQK4-H16-DQK32-DV64-bf16,0.182288,0.227008,0.803003,pass,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲
+paged_gqa_decode,B16-QH32-KVH8-S8192-D128-page16-fp16,0.358336,0.399856,0.896163,pass,Intent target=cutile; source corpus=triton.
+splitk_paged_attention,B16-QH32-KVH8-S8192-D128-page16-split8-fp16,0.359120,0.454584,0.789997,pass,Intent target=cutile; source corpus=triton.
+paged_mla_decode,B8-QH128-KVH1-S8192-C512-R64-page16-fp16,27.660391,0.380896,72.619274,pass,Intent target=cutile; source corpus=triton. 同算法；source 使用 packed KV/page-table ABI 并写辅助 LSE；输入布局适配在计时前完成，完整 source 调用含 scale 分配
+block_sparse_gqa_decode,B8-QH32-KVH8-S8192-D128-blocks32x128,0.114688,0.092576,1.238852,pass,Intent target=cutile; source corpus=triton. 同算法；source 使用 packed KV/topk ABI；输入布局适配在计时前完成，完整 source 调用含 partial buffer 分配
+flaggems_conv1d,B64-L16384-K5-fp16-same,0.012048,0.057120,0.210924,pass,Intent target=cutile; source corpus=triton.
+flaggems_triangular_solve,B4096-N16-fp32-lower,0.020488,0.028824,0.710797,pass,Intent target=cutile; source corpus=triton.
+flaggems_embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.173872,0.175920,0.988358,pass,Intent target=cutile; source corpus=triton.
+flaggems_roll,8192x4096-fp16-shift-1-axis0,0.087808,0.087848,0.999545,pass,Intent target=cutile; source corpus=triton.
+flaggems_transpose_copy,4093x8191-fp16,0.104480,0.312008,0.334863,pass,Intent target=cutile; source corpus=triton.
+flaggems_batch_norm_training,B32-C64-S4096-fp16,0.040960,0.026640,1.537537,pass,Intent target=cutile; source corpus=triton.
+flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.042784,0.057104,0.749229,pass,Intent target=cutile; source corpus=triton.
+flaggems_logsumexp,8192x8192-fp32,0.177952,0.177704,1.001396,pass,Intent target=cutile; source corpus=triton.
+flaggems_softmax_backward,4096x4097-fp32,0.116800,0.161440,0.723489,pass,Intent target=cutile; source corpus=triton.
+flaggems_fused_adamw,N8388608-fp32,0.153656,0.157256,0.977107,pass,Intent target=cutile; source corpus=triton.
+flaggems_addcmul,B64-C128-L4096-bf16,0.087488,0.087856,0.995811,pass,Intent target=cutile; source corpus=triton.
+flaggems_fp8_mqa_logits,Q256-K4096-H32-D128-e4m3,0.034560,0.087840,0.393443,pass,Intent target=cutile; source corpus=triton.
+flaggems_cumsum,8192x8192-fp32-axis1,0.351968,0.352048,0.999773,pass,Intent target=cutile; source corpus=triton.
+flaggems_histogram,N8388608-bins256-fp32,0.764560,1.246208,0.613509,pass,Intent target=cutile; source corpus=triton.
+flaggems_max_pool2d_with_indices,B8-C32-H128-W128-K3-S2-P1-fp16,0.018208,0.019984,0.911129,pass,Intent target=cutile; source corpus=triton.
+legacy_flash_attention_bias,B4-H32-S4096-D128-fp16-vector-bias,4.944208,7.094000,0.696956,pass,Intent target=cutile; source corpus=triton. 同算法；source 额外写 LSE 和临时数据。
