@@ -17,7 +17,7 @@ xformers_rms_norm,8192x4096-bf16,0.049856,0.048920,0.050224,0.981226,1.007381,pa
 qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,1.162536,1.250128,1.140840,1.075346,0.981337,pass,pass,,Intent target=cutile; source corpus=triton.
 index_select,source65536-selected32768-hidden4096-fp16,0.224640,0.184464,0.184000,0.821154,0.819088,pass,pass,,Intent target=cutile; source corpus=triton.
 scaled_index_add,destination65536-routed32768-hidden4096-fp16,0.304880,0.271032,0.269224,0.888979,0.883049,pass,pass,,Intent target=cutile; source corpus=triton.
-scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,3.590400,3.090304,8.747552,0.860713,2.436373,pass,pass,,Intent target=cutile; source corpus=triton.
+scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,3.590400,3.090304,6.260208,0.860713,1.743596,pass,pass,,Intent target=cutile; source corpus=triton.
 jagged_mean,B512-T33024-D128-fp32,0.014368,0.014752,0.015096,1.026726,1.050668,pass,pass,,Intent target=cutile; source corpus=triton.
 fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.163240,0.043816,0.051024,0.268415,0.312570,pass,pass,,Intent target=cutile; source corpus=triton.
 rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.483032,0.126080,0.123952,0.261018,0.256612,pass,pass,,Intent target=cutile; source corpus=triton.
@@ -26,7 +26,7 @@ varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.050560,0.052680,0
 causal_conv1d_update,B32-D4096-W4-bf16,0.005456,0.006088,0.005680,1.115836,1.041056,pass,pass,,Intent target=cutile; source corpus=triton.
 modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,0.364608,0.170216,0.164312,0.466847,0.450654,pass,pass,source launch uses num_stages=1 and num_warps=4.,Intent target=cutile; source corpus=triton. source launch uses num_stages=1 and num_warps=4.
 mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.027520,0.054520,0.009232,1.981105,0.335465,pass,pass,同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出
-flash_attention_backward,B2-H16-S2048-D128-fp16-causal,0.615656,2.034696,0.908952,3.304924,1.476396,pass,pass,source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。,Intent target=cutile; source corpus=triton. source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。
+flash_attention_backward,B2-H16-S2048-D128-fp16-causal,0.615656,0.742112,0.714576,1.205400,1.160674,pass,pass,source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。,Intent target=cutile; source corpus=triton. source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。
 moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.833440,1.982688,2.012416,0.699746,0.710238,pass,pass,,Intent target=cutile; source corpus=triton.
 moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,4.393072,2.069424,2.038880,0.471065,0.464113,pass,pass,,Intent target=cutile; source corpus=triton.
 mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,0.015024,0.016608,0.022672,1.105431,1.509052,pass,pass,,Intent target=cutile; source corpus=triton.

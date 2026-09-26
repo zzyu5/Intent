@@ -26,7 +26,7 @@ varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.057344,0.057856,0
 causal_conv1d_update,B32-D4096-W4-bf16,0.006144,0.006416,0.957606,pass,
 modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,0.239392,0.407272,0.587794,pass,source launch uses num_stages=1 and num_warps=4.
 mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.008192,0.008192,1.000000,pass,同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出
-flash_attention_backward,B2-H16-S2048-D128-fp16-causal,1.752792,0.776440,2.257473,pass,source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。
+flash_attention_backward,B2-H16-S2048-D128-fp16-causal,1.412744,0.776440,1.819515,pass,source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。
 moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.186312,2.383000,0.917462,pass,
 moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,2.189312,3.401408,0.643649,pass,
 mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,0.016176,0.016160,1.000990,pass,

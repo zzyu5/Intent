@@ -17,7 +17,7 @@ xformers_rms_norm,8192x4096-bf16,0.071472,0.086112,0.829989,pass,Intent target=c
 qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,1.780472,1.827840,0.974085,pass,Intent target=cutile; source corpus=triton.
 index_select,source65536-selected32768-hidden4096-fp16,0.358144,0.366368,0.977553,pass,Intent target=cutile; source corpus=triton.
 scaled_index_add,destination65536-routed32768-hidden4096-fp16,0.522136,0.530512,0.984211,pass,Intent target=cutile; source corpus=triton.
-scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,5.255920,2.574248,2.041730,pass,Intent target=cutile; source corpus=triton.
+scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,4.792600,2.574248,1.861748,pass,Intent target=cutile; source corpus=triton.
 jagged_mean,B512-T33024-D128-fp32,0.016160,0.018224,0.886743,pass,Intent target=cutile; source corpus=triton.
 fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.065216,0.124704,0.522966,pass,Intent target=cutile; source corpus=triton.
 rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.239584,0.440768,0.543560,pass,Intent target=cutile; source corpus=triton.
@@ -26,7 +26,7 @@ varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.057328,0.057856,0
 causal_conv1d_update,B32-D4096-W4-bf16,0.006112,0.006416,0.952618,pass,Intent target=cutile; source corpus=triton.
 modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,0.226536,0.407272,0.556228,pass,Intent target=cutile; source corpus=triton. source launch uses num_stages=1 and num_warps=4.
 mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.008192,0.008192,1.000000,pass,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出
-flash_attention_backward,B2-H16-S2048-D128-fp16-causal,1.495696,0.776440,1.926351,pass,Intent target=cutile; source corpus=triton. source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。
+flash_attention_backward,B2-H16-S2048-D128-fp16-causal,1.479264,0.776440,1.905188,pass,Intent target=cutile; source corpus=triton. source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。
 moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.252688,2.383000,0.945316,pass,Intent target=cutile; source corpus=triton.
 moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,2.250528,3.401408,0.661646,pass,Intent target=cutile; source corpus=triton.
 mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,0.024304,0.016160,1.503960,pass,Intent target=cutile; source corpus=triton.
