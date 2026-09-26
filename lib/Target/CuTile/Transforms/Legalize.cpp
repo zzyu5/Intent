@@ -534,7 +534,8 @@ FailureOr<Value> scalarFill(Operation *owner, Value fill) {
 struct NativeTileAxisPlan {
   SmallVector<unsigned> computationAxes;
   Value scalarIndex;
-  Value modulus;
+  int64_t divisor = 0;
+  OpFoldResult modulus;
   SmallVector<std::pair<gpu::MakeRangeOp, int64_t>> ranges;
   SmallVector<std::pair<Value, int64_t>> offsets;
   bool originInBounds = false;
@@ -748,8 +749,13 @@ bool collectTileCoordinates(Value value, NativeTileAxisPlan &axis,
 
 Value materializeTileOrigin(OpBuilder &builder, Location location,
                             const NativeTileAxisPlan &axis) {
-  if (axis.scalarIndex)
-    return axis.scalarIndex;
+  if (axis.scalarIndex) {
+    if (!axis.divisor)
+      return axis.scalarIndex;
+    Value divisor = builder.create<arith::ConstantIndexOp>(location, axis.divisor);
+    return builder.create<gpu::BinaryOp>(location, builder.getIndexType(),
+        axis.scalarIndex, divisor, BinaryOperator::FloorDivide);
+  }
   Value origin;
   auto add = [&](Value value, int64_t scale) {
     if (scale != 1) {
@@ -768,6 +774,14 @@ Value materializeTileOrigin(OpBuilder &builder, Location location,
   for (auto [offset, scale] : axis.offsets)
     add(offset, scale);
   return origin;
+}
+
+Value materializeTileModulus(OpBuilder &builder, Location location,
+                             const NativeTileAxisPlan &axis) {
+  if (auto value = dyn_cast<Value>(axis.modulus))
+    return value;
+  return builder.create<arith::ConstantIndexOp>(
+      location, cast<IntegerAttr>(cast<Attribute>(axis.modulus)).getInt());
 }
 
 Value stripIndexIdentities(Value value) {
@@ -1305,12 +1319,45 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
     Value coordinate = resourceCoordinates[resourceAxis];
     Value scalar = uniformScalarFill(coordinate);
     if (!scalar) {
-      if (auto remainder = coordinate.getDefiningOp<gpu::BinaryOp>();
-          remainder && remainder.getOperatorKind() == BinaryOperator::Remainder) {
-        axis.modulus = uniformScalarFill(remainder.getRhs());
-        if (!axis.modulus || !axis.modulus.getType().isIndex())
-          return failure();
-        coordinate = remainder.getLhs();
+      Value expression = coordinate;
+      while (isa_and_nonnull<gpu::BroadcastOp, gpu::ReshapeOp, gpu::TransposeOp>(
+          expression.getDefiningOp()))
+        expression = expression.getDefiningOp()->getOperand(0);
+      if (auto binary = expression.getDefiningOp<gpu::BinaryOp>()) {
+        Value rhs = uniformScalarFill(binary.getRhs());
+        auto constant = rhs ? constantValue(rhs) : std::nullopt;
+        auto kind = binary.getOperatorKind();
+        int64_t divisor = 0;
+        if (kind == BinaryOperator::FloorDivide && constant && *constant > 0)
+          divisor = *constant;
+        if (kind == BinaryOperator::RightShift && constant &&
+            *constant >= 0 && *constant < 63)
+          divisor = int64_t{1} << *constant;
+        if (divisor) {
+          if (!collectTileCoordinates(binary.getLhs(), axis) ||
+              axis.ranges.size() != 1 || axis.ranges.front().second != 1 ||
+              !axis.offsets.empty() || !gpu::isUnitStepRange(axis.ranges.front().first))
+            return failure();
+          // The quotient is a unit resource axis only under the per-tile
+          // uniformity guard emitted with its native indices.
+          axis.scalarIndex = axis.ranges.front().first.getStart();
+          axis.divisor = divisor;
+          axis.originInBounds =
+              llvm::is_contained(accessBounds.assumedAxes, resourceAxis);
+          continue;
+        }
+        if (kind == BinaryOperator::Remainder) {
+          if (!rhs || !rhs.getType().isIndex())
+            return failure();
+          axis.modulus = rhs;
+          coordinate = binary.getLhs();
+        } else if (kind == BinaryOperator::BitwiseAnd && constant &&
+                   *constant >= 0 && *constant < std::numeric_limits<int64_t>::max() &&
+                   llvm::isPowerOf2_64(static_cast<uint64_t>(*constant) + 1)) {
+          axis.modulus = IntegerAttr::get(IndexType::get(owner->getContext()),
+                                         *constant + 1);
+          coordinate = binary.getLhs();
+        }
       }
       if (!collectTileCoordinates(coordinate, axis) || axis.ranges.empty())
         return failure();
@@ -1479,7 +1526,8 @@ FailureOr<Value> materializeTileOriginGuard(
       return failure();
     if (axisPlan.modulus)
       origin = builder.create<gpu::BinaryOp>(
-          owner->getLoc(), builder.getIndexType(), origin, axisPlan.modulus,
+          owner->getLoc(), builder.getIndexType(), origin,
+          materializeTileModulus(builder, owner->getLoc(), axisPlan),
           BinaryOperator::Remainder);
     if (!zero)
       zero = builder.create<arith::ConstantIndexOp>(owner->getLoc(), 0);
@@ -1577,7 +1625,26 @@ materializeTileIndices(OpBuilder &builder, Operation *owner,
   };
   for (auto [resourceAxis, axis] : llvm::enumerate(plan.axes)) {
     if (axis.scalarIndex) {
-      result.values.push_back(axis.scalarIndex);
+      Value index = materializeTileOrigin(builder, owner->getLoc(), axis);
+      if (axis.divisor) {
+        auto range = axis.ranges.front().first;
+        Value extent = range.getExtent();
+        if (!isKnownPositive(extent))
+          return failure();
+        Value one = builder.create<arith::ConstantIndexOp>(owner->getLoc(), 1);
+        Value offset = builder.create<gpu::BinaryOp>(owner->getLoc(),
+            builder.getIndexType(), extent, one, BinaryOperator::Subtract);
+        Value last = builder.create<gpu::BinaryOp>(owner->getLoc(),
+            builder.getIndexType(), axis.scalarIndex, offset, BinaryOperator::Add);
+        Value divisor = builder.create<arith::ConstantIndexOp>(owner->getLoc(), axis.divisor);
+        Value lastIndex = builder.create<gpu::BinaryOp>(owner->getLoc(),
+            builder.getIndexType(), last, divisor, BinaryOperator::FloorDivide);
+        // Positive extent and divisor make equal endpoint quotients sufficient;
+        // signed wraparound would change the quotient's sign and fail the guard.
+        require(builder.create<gpu::CompareOp>(owner->getLoc(), builder.getI1Type(),
+                                               index, lastIndex, ComparePredicate::Eq));
+      }
+      result.values.push_back(index);
       continue;
     }
     Value start = materializeTileOrigin(builder, owner->getLoc(), axis);
@@ -1614,12 +1681,13 @@ materializeTileIndices(OpBuilder &builder, Operation *owner,
       if (!isKnownPositive(extent))
         return failure();
       Location location = owner->getLoc();
+      Value modulus = materializeTileModulus(builder, location, axis);
       Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
       Value one = builder.create<arith::ConstantIndexOp>(location, 1);
       Value maximum = builder.create<arith::ConstantIndexOp>(
           location, std::numeric_limits<int64_t>::max());
       require(builder.create<gpu::CompareOp>(
-          location, builder.getI1Type(), axis.modulus, zero, ComparePredicate::Gt));
+          location, builder.getI1Type(), modulus, zero, ComparePredicate::Gt));
       require(builder.create<gpu::CompareOp>(
           location, builder.getI1Type(), start, zero, ComparePredicate::Ge));
       Value available = builder.create<gpu::BinaryOp>(
@@ -1632,10 +1700,10 @@ materializeTileIndices(OpBuilder &builder, Operation *owner,
           location, builder.getI1Type(), available, lastOffset,
           ComparePredicate::Ge));
       start = builder.create<gpu::BinaryOp>(
-          location, builder.getIndexType(), start, axis.modulus,
+          location, builder.getIndexType(), start, modulus,
           BinaryOperator::Remainder);
       Value remaining = builder.create<gpu::BinaryOp>(
-          location, builder.getIndexType(), axis.modulus, start,
+          location, builder.getIndexType(), modulus, start,
           BinaryOperator::Subtract);
       // A tile that crosses the modulo boundary keeps its original gather.
       require(builder.create<gpu::CompareOp>(
