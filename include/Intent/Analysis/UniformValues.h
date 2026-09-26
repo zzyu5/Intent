@@ -39,6 +39,7 @@ bool equalUniformConstants(mlir::Attribute lhs, mlir::Attribute rhs);
 mlir::Attribute uniformZero(mlir::Type type);
 std::optional<bool> uniformBoolean(mlir::Attribute value);
 UniformExpression describeScalarValue(mlir::Value value);
+UniformExpression describeCanonicalUniformValue(mlir::Value value);
 
 class UniformValueAnalysis {
 public:

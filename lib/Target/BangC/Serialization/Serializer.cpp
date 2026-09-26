@@ -79,15 +79,19 @@ public:
         {"region_tile", config.getRegionTile()},
         {"local_bytes", config.getLocalBytes()},
         {"full_extent_dimensions", std::move(fullExtents)}, {"disjoint_outputs", true}};
-    out << tileImplementations << "\n__mlu_global__ void intent_device(" << llvm::join(signature, ", ") << ") {\n";
+    out << "#pragma bang walign(" << function->getAttrOfType<IntegerAttr>("bangc.wram_align").getInt() << ")\n"
+        << tileImplementations << "\n__mlu_global__ void intent_device(" << llvm::join(signature, ", ") << ") {\n";
     auto bytes = [&](StringRef name) { return function->getAttrOfType<IntegerAttr>(name).getInt(); };
     if (bytes("bangc.nram_bytes")) line("__nram__ __attribute__((aligned(128))) unsigned char local_nram[" + std::to_string(bytes("bangc.nram_bytes")) + "];", 1);
     if (bytes("bangc.wram_bytes")) line("__wram__ __attribute__((aligned(128))) unsigned char local_wram[" + std::to_string(bytes("bangc.wram_bytes")) + "];", 1);
+    if (bytes("bangc.sram_bytes")) line("__mlu_shared__ __attribute__((aligned(128))) unsigned char group_sram[" + std::to_string(bytes("bangc.sram_bytes")) + "];", 1);
     if (failed(block(function.front(), 1))) return failure();
     out << "}\n\nextern \"C\" int intent_launch(void *stream";
     if (!signature.empty()) out << ", " << llvm::join(signature, ", ");
-    out << ") {\n  cnrtDim3_t dim = {" << config.getTasks() << ", 1, 1};\n"
-        << "  intent_device<<<dim, cnrtFuncTypeBlock, static_cast<cnrtQueue_t>(stream)>>>("
+    auto group = function->getAttrOfType<IntegerAttr>("intent_dsa.group_width");
+    out << ") {\n  cnrtDim3_t dim = {" << (group ? group.getInt() : config.getTasks()) << ", "
+        << (group ? config.getTasks() / group.getInt() : 1) << ", 1};\n"
+        << "  intent_device<<<dim, " << (group ? "cnrtFuncTypeUnion1" : "cnrtFuncTypeBlock") << ", static_cast<cnrtQueue_t>(stream)>>>("
         << llvm::join(call, ", ") << ");\n  return static_cast<int>(cnrtGetLastError());\n}\n";
     return success();
   }
@@ -119,7 +123,10 @@ private:
   }
   LogicalResult operation(Operation *op, unsigned depth) {
     if (isa<func::ReturnOp, scf::YieldOp>(op)) return success();
-    if (isa<dsa::SynchronizeOp>(op)) { line("__sync();", depth); return success(); }
+    if (auto sync = dyn_cast<dsa::SynchronizeOp>(op)) {
+      line(sync.getLocalOnly() ? "intent_sync_local();" : "__sync();", depth); return success();
+    }
+    if (isa<dsa::GroupSynchronizeOp>(op)) { line("__sync(); __sync_cluster();", depth); return success(); }
     if (auto branch = dyn_cast<scf::IfOp>(op)) {
       if (branch.getNumResults()) return op->emitError("BANG C conditional results must be materialized");
       line("if (" + name(branch.getCondition()) + ") {", depth);
@@ -150,7 +157,8 @@ private:
     }
     if (auto allocation = dyn_cast<memref::AllocaOp>(op)) {
       auto type = allocation.getType();
-      std::string buffer = type.getMemorySpaceAsInt() == dsa::matrixSpace ? "local_wram" : "local_nram";
+      std::string buffer = type.getMemorySpaceAsInt() == dsa::matrixSpace ? "local_wram" :
+          type.getMemorySpaceAsInt() == dsa::sharedSpace ? "group_sram" : "local_nram";
       line(ctype(type.getElementType()) + " *" + bind(allocation.getResult()) + " = reinterpret_cast<" +
           ctype(type.getElementType()) + " *>(" + buffer + " + " +
           std::to_string(op->getAttrOfType<IntegerAttr>("bangc.offset").getInt()) + ");", depth);
@@ -162,15 +170,82 @@ private:
     }
     if (auto load = dyn_cast<dsa::LoadTileOp>(op)) {
       bool local = cast<MemRefType>(load.getSource().getType()).getMemorySpaceAsInt() == dsa::nramSpace;
-      line(std::string(local ? "intent_load_local_tile<" : "intent_load_tile<") + shape(load.getOutput()) + ">(" + name(load.getOutput()) + ", " + name(load.getSource()) +
+      bool shared = cast<MemRefType>(load.getSource().getType()).getMemorySpaceAsInt() == dsa::sharedSpace;
+      line(std::string(local ? "intent_load_local_tile<" : "intent_load_tile<") + shape(load.getOutput()) +
+          (shared ? (load.getAsynchronous() ? ", true, true" : ", false, true") : (load.getAsynchronous() ? ", true" : "")) + ">(" + name(load.getOutput()) + ", " + name(load.getSource()) +
           ", " + name(load.getOffset()) + ", " + name(load.getRowStride()) + ", " + name(load.getColumnStride()) +
           ", " + name(load.getRows()) + ", " + name(load.getColumns()) + ");", depth); return success();
+    }
+    if (auto stage = dyn_cast<dsa::StageTileOp>(op)) {
+      line("intent_stage_tile<" + shape(stage.getOutput()) + ">(" + name(stage.getOutput()) + ", " +
+          name(stage.getSource()) + ", " + name(stage.getOffset()) + ", " + name(stage.getRowStride()) + ", " +
+          name(stage.getColumnStride()) + ", " + name(stage.getRows()) + ", " + name(stage.getColumns()) + ");", depth);
+      return success();
+    }
+    if (auto plan = dyn_cast<dsa::GatherPlanOp>(op)) {
+      line("intent_prepare_gather_runs<" + count(plan.getRowOffsets()) + ">(" + name(plan.getRowOffsets()) + ", " +
+          name(plan.getRows()) + ", " + name(plan.getOutput()) + ", " + name(plan.getLaneIndices()) + ");", depth);
+      return success();
+    }
+    if (auto gather = dyn_cast<dsa::GatherRowsOp>(op)) {
+      line(std::string(gather.getPlan() ? "intent_gather_runs<" : "intent_gather_rows<") + shape(gather.getOutput()) + ">(" + name(gather.getOutput()) + ", " +
+          name(gather.getSource()) + ", " + name(gather.getRowOffsets()) + ", " + name(gather.getColumnStride()) +
+          ", " + name(gather.getRows()) + ", " + name(gather.getColumns()) +
+          (gather.getPlan() ? ", " + name(gather.getPlan()) : "") + ");", depth); return success();
+    }
+    if (auto gather = dyn_cast<dsa::GroupGatherRowsOp>(op)) {
+      line("intent_group_gather_rows<" + shape(gather.getOutput()) + ">(" + name(gather.getOutput()) + ", " +
+          name(gather.getSource()) + ", " + name(gather.getRowOffsets()) + ", " + name(gather.getPlan()) + ", " +
+          name(gather.getSharedData()) + ", " + name(gather.getSharedMetadata()) + ", " +
+          name(gather.getRows()) + ", " + name(gather.getLane()) + ");", depth);
+      return success();
     }
     if (auto store = dyn_cast<dsa::StoreTileOp>(op)) {
       bool local = cast<MemRefType>(store.getDestination().getType()).getMemorySpaceAsInt() == dsa::nramSpace;
       line(std::string(local ? "intent_store_local_tile<" : "intent_store_tile<") + shape(store.getInput()) + ">(" + name(store.getDestination()) + ", " + name(store.getInput()) +
           ", " + name(store.getOffset()) + ", " + name(store.getRowStride()) + ", " + name(store.getColumnStride()) +
           ", " + name(store.getRows()) + ", " + name(store.getColumns()) + ");", depth); return success();
+    }
+    if (auto iota = dyn_cast<dsa::IotaOp>(op)) {
+      line("intent_iota_local<" + count(iota.getOutput()) + ">(" + name(iota.getOutput()) + ");", depth);
+      return success();
+    }
+    if (auto broadcast = dyn_cast<dsa::BroadcastRowsOp>(op)) {
+      line("intent_broadcast_rows<" + shape(broadcast.getOutput()) + ">(" + name(broadcast.getOutput()) + ", " +
+          name(broadcast.getInput()) + ", " + name(broadcast.getScratch()) + ", " + name(broadcast.getOffset()) + ", " +
+          name(broadcast.getRows()) + ", " + name(broadcast.getColumns()) + ");", depth);
+      return success();
+    }
+    if (auto layout = dyn_cast<dsa::IndexLayoutOp>(op)) {
+      auto output = cast<MemRefType>(layout.getOutput().getType());
+      std::string width = std::to_string(output.getDimSize(1));
+      std::string dst = "reinterpret_cast<uint32_t *>(" + name(layout.getOutput()) + ")";
+      if (layout.getInput().getType().isInteger(64)) {
+        line("__bang_write_value(" + dst + ", " + width + ", uint32_t(" + name(layout.getInput()) + "));", depth);
+        line("__bang_write_value(" + dst + " + " + width + ", " + width + ", uint32_t(uint64_t(" + name(layout.getInput()) + ") >> 32));", depth);
+      } else {
+        bool split = cast<MemRefType>(layout.getInput().getType()).getElementType().isInteger(64);
+        line("__bang_transpose(" + dst + ", reinterpret_cast<const uint32_t *>(" + name(layout.getInput()) + "), " +
+             (split ? width + ", 2" : "2, " + width) + ");", depth);
+      }
+      return success();
+    }
+    if (auto binary = dyn_cast<dsa::IndexBinaryOp>(op)) {
+      std::string width = std::to_string(cast<MemRefType>(binary.getOutput().getType()).getDimSize(1));
+      std::string dst = "reinterpret_cast<uint32_t *>(" + name(binary.getOutput()) + ")";
+      std::string lhs = "reinterpret_cast<const uint32_t *>(" + name(binary.getLhs()) + ")";
+      bool shift = binary.getKind() == BinaryOperator::LeftShift || binary.getKind() == BinaryOperator::RightShift;
+      if (shift) {
+        std::string amount = std::to_string(binary.getRhs().getDefiningOp<arith::ConstantIntOp>().value());
+        line(std::string(binary.getKind() == BinaryOperator::LeftShift ? "intent_index_shl<" : "intent_index_sar<") +
+             width + ", " + amount + ">(" + dst + ", " + lhs + ");", depth);
+      } else {
+        StringRef kind = binary.getKind() == BinaryOperator::Add ? "add" : binary.getKind() == BinaryOperator::Subtract ? "sub" : "mul";
+        std::string rhs = isa<MemRefType>(binary.getRhs().getType()) ?
+            "reinterpret_cast<const uint32_t *>(" + name(binary.getRhs()) + ")" : name(binary.getRhs());
+        line("intent_index_" + kind.str() + "<" + width + ">(" + dst + ", " + lhs + ", " + rhs + ");", depth);
+      }
+      return success();
     }
     if (auto fill = dyn_cast<dsa::FillOp>(op)) {
       if (fill.getValue().getType().isF16() || fill.getValue().getType().isF32())
@@ -179,9 +254,66 @@ private:
       return success();
     }
     if (auto select = dyn_cast<dsa::SelectOp>(op)) {
+      if (Value scratch = select.getScratch()) {
+        line("intent_select_bits<" + count(select.getOutput()) + ", " + std::to_string(cast<MemRefType>(scratch.getType()).getDimSize(1)) + ">(" +
+            name(select.getOutput()) + ", " + name(select.getCondition()) + ", " + name(select.getTrueValue()) + ", " +
+            name(select.getFalseValue()) + ", " + name(scratch) + ");", depth);
+        return success();
+      }
       line("intent_select_local<" + ctype(cast<MemRefType>(select.getOutput().getType()).getElementType()) + ", " +
           count(select.getOutput()) + ">(" + name(select.getOutput()) + ", " + name(select.getCondition()) + ", " +
           name(select.getTrueValue()) + ", " + name(select.getFalseValue()) + ");", depth); return success();
+    }
+    if (auto prepare = dyn_cast<dsa::PrepareMatrixViewOp>(op)) {
+      auto output = cast<MemRefType>(prepare.getOutput().getType());
+      auto input = cast<MemRefType>(prepare.getInputSlice().getType());
+      line("intent_prepare_matrix_view<" + ctype(output.getElementType()) + ", " +
+          std::to_string(output.getDimSize(0)) + ", " + std::to_string(output.getDimSize(1)) + ", " +
+          std::to_string(input.getDimSize(0)) + ", " + std::to_string(input.getDimSize(1)) + ">(" + name(prepare.getOutput()) + ", " + name(prepare.getSource()) +
+          ", " + name(prepare.getInputSlice()) + ", " + name(prepare.getTransposedSlice()) + ", " +
+          name(prepare.getOffset()) + ", " + name(prepare.getRowStride()) + ", " + name(prepare.getColumnStride()) +
+          ", " + name(prepare.getColumns()) + ");", depth);
+      return success();
+    }
+    if (auto transpose = dyn_cast<dsa::TransposeOp>(op)) {
+      line("intent_transpose_tile<" + shape(transpose.getInput()) + ">(" + name(transpose.getOutput()) + ", " +
+          name(transpose.getInput()) + ", " + name(transpose.getRows()) + ", " + name(transpose.getColumns()) + ");", depth);
+      return success();
+    }
+    if (auto compare = dyn_cast<dsa::CompareRangeOp>(op)) {
+      auto type = cast<MemRefType>(compare.getOutput().getType());
+      line("intent_compare_range<" + std::to_string(type.getDimSize(0)) + ", " +
+          std::to_string(type.getDimSize(1)) + ">(" + name(compare.getOutput()) + ", " +
+          name(compare.getRowCoordinates()) + ", " + name(compare.getRows()) + ", " +
+          std::to_string(compare.getBaseAttr().getInt()) + "LL);", depth);
+      return success();
+    }
+    if (auto compare = dyn_cast<dsa::CompareRampOp>(op)) {
+      auto type = cast<MemRefType>(compare.getOutput().getType());
+      line("intent_compare_ramp<" + std::to_string(type.getDimSize(0)) + ", " +
+          std::to_string(type.getDimSize(1)) + ">(" + name(compare.getOutput()) + ", " +
+          (compare.getScratch() ? name(compare.getScratch()) : "nullptr") + ", " + name(compare.getRowBegin()) + ", " +
+          std::to_string(compare.getBaseAttr().getInt()) + "LL);", depth);
+      return success();
+    }
+    if (auto masked = dyn_cast<dsa::MaskedFillOp>(op)) {
+      line("intent_masked_fill<" + count(masked.getOutput()) + ">(" + name(masked.getOutput()) + ", " +
+          name(masked.getInput()) + ", " + name(masked.getMask()) + ", " + name(masked.getValue()) + ");", depth);
+      return success();
+    }
+    if (auto compare = dyn_cast<dsa::CompareOp>(op)) {
+      if (compare.getScratch()) {
+        auto workspace = cast<MemRefType>(compare.getScratch().getType());
+        line("intent_compare_i64<" + count(compare.getOutput()) + ", " + std::to_string(workspace.getDimSize(1)) +
+            ", " + std::to_string(static_cast<unsigned>(compare.getPredicate())) + ">(" + name(compare.getOutput()) +
+            ", " + name(compare.getLhs()) + ", " + name(compare.getRhs()) + ", " + name(compare.getScratch()) + ");", depth);
+        return success();
+      }
+      auto callee = op->getAttrOfType<StringAttr>("bangc.callee");
+      if (!callee) return op->emitError("comparison requires a selected BANG C primitive");
+      line(callee.getValue().str() + "(" + count(compare.getOutput()) + ", " + name(compare.getOutput()) + ", " +
+          name(compare.getLhs()) + ", " + name(compare.getRhs()) + ");", depth);
+      return success();
     }
     if (auto store = dyn_cast<dsa::StoreScalarOp>(op)) {
       line(name(store.getDestination()) + "[" + name(store.getOffset()) + "] = " + name(store.getValue()) + ";", depth); return success();
@@ -196,6 +328,37 @@ private:
           count(copy.getSource()) + ">(" + name(copy.getTarget()) + ", " + name(copy.getSource()) + ");", depth); return success();
     }
     if (auto binary = dyn_cast<dsa::BinaryOp>(op)) {
+      if (auto implementation = op->getAttrOfType<StringAttr>("bangc.implementation");
+          implementation && implementation.getValue() == "row_scalar") {
+        auto type = cast<MemRefType>(binary.getOutput().getType());
+        line("intent_binary_rows<" + ctype(type.getElementType()) + ", " +
+            std::to_string(type.getDimSize(0)) + ", " + std::to_string(type.getDimSize(1)) + ", " +
+            std::to_string(static_cast<int>(binary.getKind())) + ">(" + name(binary.getOutput()) + ", " +
+            name(binary.getLhs()) + ", " + name(binary.getRhs()) + ");", depth);
+        return success();
+      }
+      if (auto implementation = op->getAttrOfType<StringAttr>("bangc.implementation");
+          implementation && implementation.getValue() == "reciprocal_f32_ftz") {
+        line("intent_reciprocal_ftz<" + count(binary.getOutput()) + ", " +
+            std::to_string(cast<MemRefType>(binary.getScratch().getType()).getDimSize(1)) + ">(" +
+            name(binary.getOutput()) + ", " + name(binary.getRhs()) + ", " + name(binary.getScratch()) + ");", depth);
+        return success();
+      }
+      if (binary.getScratch()) {
+        auto workspace = cast<MemRefType>(binary.getScratch().getType());
+        line("intent_numeric_extrema<" + ctype(workspace.getElementType()) + ", " + count(binary.getOutput()) +
+            ", " + std::to_string(workspace.getNumElements()) + ", " +
+            (binary.getKind() == BinaryOperator::MaximumNum ? "true" : "false") + ">(" + name(binary.getOutput()) +
+            ", " + name(binary.getLhs()) + ", " + name(binary.getRhs()) + ", " + name(binary.getScratch()) + ");", depth);
+        return success();
+      }
+      if (cast<MemRefType>(binary.getOutput().getType()).getElementType().isInteger(64)) {
+        auto callee = op->getAttrOfType<StringAttr>("bangc.callee");
+        if (!callee) return op->emitError("unbound BANG integer tile operation");
+        line(callee.getValue().str() + "(" + count(binary.getOutput()) + ", " + name(binary.getOutput()) + ", " +
+            name(binary.getLhs()) + ", " + name(binary.getRhs()) + ");", depth);
+        return success();
+      }
       if (binary.getKind() == BinaryOperator::TrueDivide) {
         if (op->getAttrOfType<StringAttr>("bangc.implementation").getValue() == "divide_f32") {
           line("intent_divide_f32<" + count(binary.getOutput()) + ", " + (binary.getApproximate() ? "true" : "false") + ", " +
@@ -217,10 +380,25 @@ private:
       case BinaryOperator::MinimumNum: intrinsic = "__bang_minimum"; break;
       default: return op->emitError("unbound BANG binary operation");
       }
+      if (!isa<MemRefType>(binary.getRhs().getType())) intrinsic += "_scalar";
+      if (auto callee = op->getAttrOfType<StringAttr>("bangc.callee")) intrinsic = callee.getValue().str();
       line(intrinsic + "(" + name(binary.getOutput()) + ", " + name(binary.getLhs()) + ", " +
           name(binary.getRhs()) + ", " + count(binary.getOutput()) + ");", depth); return success();
     }
     if (auto unary = dyn_cast<dsa::UnaryOp>(op)) {
+      if (Value scratch = unary.getScratch()) {
+        if (cast<MemRefType>(scratch.getType()).getElementType().isF32()) {
+          line("intent_exp_f32_tile<" + count(unary.getOutput()) + ", " +
+              std::to_string(cast<MemRefType>(scratch.getType()).getDimSize(1)) +
+              (unary.getKind() == UnaryOperator::Exp2 ? ", true>(" : ">(") +
+              name(unary.getOutput()) + ", " + name(unary.getInput()) + ", " + name(scratch) + ");", depth);
+          return success();
+        }
+        line("intent_exp2_ftz_tile<" + count(unary.getOutput()) + ", " + count(scratch) +
+            (unary->hasAttr("bangc.input_non_subnormal") ? ", true>(" : ">(") +
+            name(unary.getOutput()) + ", " + name(unary.getInput()) + ", " + name(scratch) + ");", depth);
+        return success();
+      }
       if (auto callee = op->getAttrOfType<StringAttr>("bangc.callee")) {
         line(callee.getValue().str() + "(" + count(unary.getOutput()) + ", " + name(unary.getOutput()) + ", " + name(unary.getInput()) + ");", depth);
         return success();
@@ -242,10 +420,17 @@ private:
       line(intrinsic + "(" + name(unary.getOutput()) + ", " + name(unary.getInput()) + ", " + count(unary.getOutput()) + ");", depth); return success();
     }
     if (auto castOp = dyn_cast<dsa::CastOp>(op)) {
+      if (auto callee = op->getAttrOfType<StringAttr>("bangc.callee")) {
+        line(callee.getValue().str() + "(" + count(castOp.getOutput()) + ", " + name(castOp.getOutput()) + ", " + name(castOp.getInput()) + ");", depth);
+        return success();
+      }
       auto from = cast<MemRefType>(castOp.getInput().getType()).getElementType();
       auto to = cast<MemRefType>(castOp.getOutput().getType()).getElementType();
       if (from == to) line("__memcpy(" + name(castOp.getOutput()) + ", " + name(castOp.getInput()) + ", " +
           count(castOp.getOutput()) + " * sizeof(" + ctype(to) + "), NRAM2NRAM);", depth);
+      else if (from.isInteger(1) && to.isF32())
+        line("intent_bool_to_f32_tile<" + count(castOp.getOutput()) + ">(" + name(castOp.getOutput()) + ", " +
+            name(castOp.getInput()) + ");", depth);
       else if ((from.isF16() && to.isF32()) || (from.isF32() && to.isF16()))
         line(std::string(to.isF32() ? "__bang_half2float(" : "__bang_float2half_rn(") + name(castOp.getOutput()) + ", " +
             name(castOp.getInput()) + ", " + count(castOp.getOutput()) + ");", depth);
@@ -257,23 +442,74 @@ private:
       return success();
     }
     if (auto reduce = dyn_cast<dsa::ReduceOp>(op)) {
+      auto input = cast<MemRefType>(reduce.getInput().getType());
+      if (input.getElementType().isF16()) {
+        line("intent_reduce_half_extrema<" + std::to_string(input.getDimSize(0)) + ", " +
+            std::to_string(input.getDimSize(1)) + ", " + std::to_string(static_cast<int>(reduce.getKind())) + ">(" +
+            name(reduce.getOutput()) + ", " + name(reduce.getInput()) + ", " + name(reduce.getScratch()) + ", " +
+            name(reduce.getCount()) + ", " + name(reduce.getIdentity()) + ");", depth);
+        return success();
+      }
+      if (reduce.getAxis() == 0) {
+        line("intent_reduce_rows<" + std::to_string(cast<MemRefType>(reduce.getInput().getType()).getDimSize(1)) + ">(" +
+            name(reduce.getOutput()) + ", " + name(reduce.getInput()) + ", " + name(reduce.getScratch()) + ", " +
+            name(reduce.getCount()) + ", " + name(reduce.getIdentity()) + ");", depth);
+        return success();
+      }
+      if (input.getDimSize(0) > 1) {
+        auto scratch = cast<MemRefType>(reduce.getScratch().getType());
+        if (input.getDimSize(0) < 32 && input.getDimSize(1) >= 1024 && scratch.getDimSize(1) == input.getDimSize(1)) {
+          line("intent_reduce_row_tiles<" + std::to_string(input.getDimSize(0)) + ", " +
+              std::to_string(input.getDimSize(1)) + ", " + std::to_string(static_cast<int>(reduce.getKind())) + ">(" +
+              name(reduce.getOutput()) + ", " + name(reduce.getInput()) + ", " + name(reduce.getScratch()) + ", " +
+              name(reduce.getCount()) + ", " + name(reduce.getIdentity()) + ");", depth);
+          return success();
+        }
+        std::string helper = reduce.getKind() == BinaryOperator::Add ? "intent_reduce_row_sums<" : "intent_reduce_row_extrema<";
+        std::string kind = reduce.getKind() == BinaryOperator::Add ? "" : ", " + std::to_string(static_cast<int>(reduce.getKind()));
+        line(helper + std::to_string(input.getDimSize(0)) + ", " +
+            std::to_string(input.getDimSize(1)) + kind + ">(" + name(reduce.getOutput()) + ", " +
+            name(reduce.getInput()) + ", " + name(reduce.getScratch()) + ", " +
+            name(reduce.getCount()) + ", " + name(reduce.getIdentity()) + ");", depth);
+        return success();
+      }
       line("intent_reduce<" + count(reduce.getInput()) + ", " + std::to_string(static_cast<int>(reduce.getKind())) + ">(" +
           name(reduce.getOutput()) + ", " + name(reduce.getInput()) + ", " + name(reduce.getScratch()) + ", " +
           name(reduce.getCount()) + ", " + name(reduce.getIdentity()) + ");", depth); return success();
     }
+    if (auto divide = dyn_cast<dsa::DivideRNOp>(op)) {
+      line("intent_divide_rn<" + count(divide.getOutput()) + ", " +
+          std::to_string(cast<MemRefType>(divide.getScratch().getType()).getDimSize(1)) + ">(" +
+          name(divide.getOutput()) + ", " + name(divide.getLhs()) + ", " + name(divide.getRhs()) + ", " +
+          name(divide.getScratch()) + ", " + name(divide.getLaneIndices()) + ");", depth);
+      return success();
+    }
+    if (auto divide = dyn_cast<dsa::DivideCastOp>(op)) {
+      line("intent_divide_cast_f16<" + count(divide.getOutput()) + ">(" +
+          name(divide.getOutput()) + ", " + name(divide.getLhs()) + ", " + name(divide.getRhs()) + ", " +
+          name(divide.getQuotient()) + ", " + name(divide.getBounds()) + ", " + name(divide.getAccepted()) + ", " +
+          name(divide.getNarrowBounds()) + ", " + name(divide.getLaneIndices()) + ");", depth); return success();
+    }
     if (auto prepare = dyn_cast<dsa::PrepareMatrixOp>(op)) {
-      line("intent_prepare_matrix<" + shape(prepare.getInput()) + ">(" + name(prepare.getOutput()) + ", " +
-          name(prepare.getInput()) + ", " + name(prepare.getScratch()) + ");", depth); return success();
+      line("intent_prepare_matrix<" + shape(prepare.getOutput()) + ", " + (prepare.getInputTransposed() ? "true" : "false") + ">(" +
+          name(prepare.getOutput()) + ", " + name(prepare.getInput()) + ", " +
+          (prepare.getScratch() ? name(prepare.getScratch()) : "nullptr") + ", " +
+          (prepare.getReshaped() ? name(prepare.getReshaped()) : "nullptr") + ");", depth); return success();
     }
     if (auto matrix = dyn_cast<dsa::MatrixTileOp>(op)) {
       auto a = cast<MemRefType>(matrix.getLhs().getType()), c = cast<MemRefType>(matrix.getAccumulator().getType());
       line("intent_matmul<" + ctype(a.getElementType()) + ", " + std::to_string(a.getDimSize(0)) + ", " +
-          std::to_string(a.getDimSize(1)) + ", " + std::to_string(c.getDimSize(1)) + ">(" + name(matrix.getAccumulator()) + ", " +
-          name(matrix.getLhs()) + ", " + name(matrix.getRhs()) + ", " + name(matrix.getScratch()) + ");", depth); return success();
+          std::to_string(a.getDimSize(1)) + ", " + std::to_string(c.getDimSize(1)) +
+          (matrix.getAccumulate() ? "" : ", false") + ">(" + name(matrix.getAccumulator()) + ", " +
+          name(matrix.getLhs()) + ", " + name(matrix.getRhs()) + ");", depth); return success();
     }
     std::string expression;
     if (isa<dsa::TaskIdOp>(op)) expression = "taskId";
     else if (isa<dsa::TaskCountOp>(op)) expression = "taskDim";
+    else if (isa<dsa::GroupIdOp>(op)) expression = "taskIdY";
+    else if (isa<dsa::GroupCountOp>(op)) expression = "taskDimY";
+    else if (isa<dsa::LocalIdOp>(op)) expression = "taskIdX";
+    else if (isa<dsa::IsMemoryCoreOp>(op)) expression = "__is_mpu()";
     else if (auto stride = dyn_cast<dsa::StrideOp>(op)) expression = name(stride.getSource()) + "_s" + std::to_string(stride.getAxis());
     else if (auto dim = dyn_cast<memref::DimOp>(op)) {
       auto axis = dim.getConstantIndex();

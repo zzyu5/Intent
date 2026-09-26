@@ -1,4 +1,5 @@
 #include "Intent/Analysis/UniformValues.h"
+#include "Intent/Dialect/Intent/IR/IntentOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "llvm/ADT/APSInt.h"
@@ -280,6 +281,71 @@ Attribute UniformValueAnalysis::fold(const UniformExpression &expression, const 
     return equalUniformConstants(initial, result) ? initial : Attribute();
   }
   return arithmetic(expression, values);
+}
+
+UniformExpression describeCanonicalUniformValue(Value value) {
+  UniformExpression result = describeScalarValue(value);
+  if (auto tensor = dyn_cast<RankedTensorType>(value.getType()))
+    result.type = tensor.getElementType();
+  Operation *op = value.getDefiningOp();
+  if (!op) return result;
+  using K = UniformKind;
+  result.operands.assign(op->operand_begin(), op->operand_end());
+  if (auto constant = dyn_cast<ConstantOp>(op)) {
+    result.kind = K::Constant;
+    result.literal = castConstant(constant.getValue(), result.type, false);
+  } else if (isa<BroadcastOp, FullOp, ReshapeOp, TransposeOp>(op)) result.kind = K::Forward;
+  else if (isa<GatherOp>(op)) {
+    auto valid = op->getAttrOfType<IntegerAttr>("valid_operand_index");
+    auto fill = op->getAttrOfType<IntegerAttr>("fill_operand_index");
+    if (valid && fill) {
+      result.kind = K::Select;
+      result.operands = {op->getOperand(valid.getInt()), op->getOperand(0), op->getOperand(fill.getInt())};
+    } else if (!valid) result.kind = K::Forward;
+  }
+  else if (isa<MakeRecordOp, MakeTupleOp>(op)) result.kind = K::Aggregate;
+  else if (auto extract = dyn_cast<ExtractOp>(op)) {
+    result.kind = K::Extract; result.result = extract.getField();
+  } else if (isa<SelectOp>(op)) result.kind = K::Select;
+  else if (isa<CastOp>(op)) result.kind = K::Cast;
+  else if (isa<BitcastOp>(op)) result.kind = K::Bitcast;
+  else if (auto unary = dyn_cast<UnaryOp>(op)) {
+    if (unary.getApproximate() || unary.getFlushToZero()) return result;
+    switch (unary.getOperatorKind()) {
+    case UnaryOperator::Negate: result.kind = K::Negate; break;
+    case UnaryOperator::Not: result.kind = K::Not; break;
+    case UnaryOperator::Exp: case UnaryOperator::Exp2: result.kind = K::Exp; break;
+    default: break;
+    }
+  } else if (auto binary = dyn_cast<BinaryOp>(op)) {
+    if (binary.getApproximate() || binary.getFlushToZero()) return result;
+    switch (binary.getOperatorKind()) {
+    case BinaryOperator::Add: result.kind = K::Add; break;
+    case BinaryOperator::Subtract: result.kind = K::Subtract; break;
+    case BinaryOperator::Multiply: result.kind = K::Multiply; break;
+    case BinaryOperator::LogicalAnd: case BinaryOperator::BitwiseAnd: result.kind = K::And; break;
+    case BinaryOperator::LogicalOr: case BinaryOperator::BitwiseOr: result.kind = K::Or; break;
+    case BinaryOperator::BitwiseXor: result.kind = K::Xor; break;
+    case BinaryOperator::Maximum: result.kind = K::Maximum; break;
+    case BinaryOperator::Minimum: result.kind = K::Minimum; break;
+    case BinaryOperator::MaximumNum: result.kind = K::MaximumNum; break;
+    case BinaryOperator::MinimumNum: result.kind = K::MinimumNum; break;
+    default: break;
+    }
+  } else if (auto reduce = dyn_cast<ReduceOp>(op)) {
+    if (reduce.getSourceCount() != reduce.getIdentityCount()) return result;
+    result.kind = K::Fold;
+    result.stateCount = reduce.getIdentityCount();
+    result.result = cast<OpResult>(value).getResultNumber();
+    auto inputs = reduce.getInputs();
+    result.operands.assign(inputs.begin() + result.stateCount, inputs.begin() + 2 * result.stateCount);
+    llvm::append_range(result.operands, inputs.take_front(result.stateCount));
+    llvm::append_range(result.operands, inputs.drop_front(2 * result.stateCount));
+    auto &body = reduce.getCombine().front();
+    result.parameters.assign(body.args_begin(), body.args_end());
+    result.yields.assign(body.getTerminator()->operand_begin(), body.getTerminator()->operand_end());
+  }
+  return result;
 }
 
 UniformExpression describeScalarValue(Value value) {

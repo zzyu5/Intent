@@ -14,6 +14,7 @@
 namespace intent::dsa {
 constexpr int64_t nramSpace = 1;
 constexpr int64_t matrixSpace = 2;
+constexpr int64_t sharedSpace = 3;
 mlir::LogicalResult verifyProgram(mlir::ModuleOp module, bool bound = false);
 }
 #endif

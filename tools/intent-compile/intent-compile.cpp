@@ -114,6 +114,8 @@ int main(int argc, char **argv) {
   llvm::cl::opt<int64_t> dsaRegionTile("dsa-region-tile", llvm::cl::init(64));
   llvm::cl::opt<std::string> dsaShapes("dsa-shapes", llvm::cl::init("{}"),
       llvm::cl::desc("JSON parameter shapes for compile-call specialization; -1 keeps an axis dynamic"));
+  llvm::cl::opt<std::string> dsaStrides("dsa-strides", llvm::cl::init("{}"),
+      llvm::cl::desc("JSON parameter element strides for compile-call specialization"));
   llvm::cl::opt<int64_t> dsaTasks("dsa-tasks", llvm::cl::init(16));
   llvm::cl::opt<int64_t> dsaLocalBytes("dsa-local-bytes", llvm::cl::init(512 * 1024));
   llvm::cl::opt<bool> stopAfterShared(
@@ -198,7 +200,27 @@ int main(int argc, char **argv) {
       }
       bindings.append(name.str(), builder.getDenseI64ArrayAttr(extents));
     }
-    if (mlir::failed(intent::lowerCanonicalKIRToDSA(*module, configuration, bindings.getDictionary(&context))))
+    auto parsedStrides = llvm::json::parse(dsaStrides.getValue());
+    if (!parsedStrides) {
+      llvm::errs() << "invalid DSA stride bindings: " << llvm::toString(parsedStrides.takeError()) << "\n";
+      return exitCode(ExitCode::Invocation);
+    }
+    auto strideObject = parsedStrides->getAsObject();
+    if (!strideObject) { llvm::errs() << "DSA stride bindings must be a JSON object\n"; return exitCode(ExitCode::Invocation); }
+    mlir::NamedAttrList strideBindings;
+    for (auto &[name, value] : *strideObject) {
+      auto array = value.getAsArray();
+      if (!array) { llvm::errs() << "DSA parameter strides must be an integer array\n"; return exitCode(ExitCode::Invocation); }
+      llvm::SmallVector<int64_t> strides;
+      for (auto &entry : *array) {
+        auto stride = entry.getAsInteger();
+        if (!stride) { llvm::errs() << "invalid DSA bound stride\n"; return exitCode(ExitCode::Invocation); }
+        strides.push_back(*stride);
+      }
+      strideBindings.append(name.str(), builder.getDenseI64ArrayAttr(strides));
+    }
+    if (mlir::failed(intent::lowerCanonicalKIRToDSA(*module, configuration, bindings.getDictionary(&context),
+                                                 strideBindings.getDictionary(&context))))
       return exitCode(ExitCode::PhysicalProgram);
     if (stopAfterShared) return emitShared();
     if (mlir::failed(intent::bangc::legalizeProgram(*module, dsaArchitecture)))

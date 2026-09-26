@@ -3,6 +3,7 @@
 #include "Intent/Dialect/DSA/IR/DSAOps.h"
 namespace intent {
 mlir::LogicalResult lowerCanonicalKIRToDSA(mlir::ModuleOp module,
-    dsa::ConfigurationAttr configuration, mlir::DictionaryAttr shapes = {});
+    dsa::ConfigurationAttr configuration, mlir::DictionaryAttr shapes = {},
+    mlir::DictionaryAttr strides = {});
 }
 #endif

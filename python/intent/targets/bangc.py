@@ -22,6 +22,7 @@ class ResolvedBangCTarget:
     neuware: str
     compiler: str | None
     shapes: tuple[tuple[str, tuple[int, ...]], ...]
+    strides: tuple[tuple[str, tuple[int, ...]], ...]
 
     @property
     def compiler_options(self) -> tuple[str, ...]:
@@ -30,6 +31,7 @@ class ResolvedBangCTarget:
             f"--dsa-tile={self.tile}", f"--dsa-tile-m={self.tile_m}",
             f"--dsa-tile-n={self.tile_n}", f"--dsa-tile-k={self.tile_k}",
             f"--dsa-region-tile={self.region_tile}", f"--dsa-shapes={json.dumps(dict(self.shapes))}",
+            f"--dsa-strides={json.dumps(dict(self.strides))}",
             f"--dsa-tasks={self.tasks}", f"--dsa-local-bytes={self.local_bytes}",
         )
 
@@ -59,6 +61,7 @@ class BangCTarget:
     neuware: str | Path = "/usr/local/neuware"
     compiler: str | Path | None = None
     shapes: Mapping[str, tuple[int, ...]] | None = None
+    strides: Mapping[str, tuple[int, ...]] | None = None
 
     def resolve(self) -> ResolvedBangCTarget:
         if self.architecture != "mtp_372":
@@ -71,8 +74,12 @@ class BangCTarget:
         if any(not isinstance(name, str) or any(not isinstance(extent, int) or extent < -1 for extent in shape)
                for name, shape in shapes):
             raise ValueError("DSA shape bindings map parameter names to integer extents, with -1 for dynamic axes")
+        strides = tuple(sorted((name, tuple(values)) for name, values in (self.strides or {}).items()))
+        if any(not isinstance(name, str) or any(type(value) is not int or not -(1 << 63) <= value < (1 << 63)
+               for value in values) for name, values in strides):
+            raise ValueError("DSA stride bindings map parameter names to signed 64-bit element strides")
         return ResolvedBangCTarget(
             self.architecture, self.tile, self.tile_m, self.tile_n, self.tile_k,
             self.region_tile, self.tasks, self.local_bytes, self.device, str(self.neuware),
-            str(self.compiler) if self.compiler is not None else None, shapes,
+            str(self.compiler) if self.compiler is not None else None, shapes, strides,
         )
