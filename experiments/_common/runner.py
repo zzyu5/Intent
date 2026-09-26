@@ -198,7 +198,7 @@ def _run_entry(
         settings = ", ".join(f"{name}={os.environ.get(name, 'unset')}" for name in CPU_WAIT_ENVIRONMENT)
         comparison = replace(comparison, note=comparison.note + " CPU idle wait: " + settings + ".")
     if target != provider:
-        comparison = replace(comparison, note=f"Intent target={target}; source corpus={provider}. " + comparison.note)
+        comparison = replace(comparison, note=(f"Intent target={target}; source corpus={provider}. " + comparison.note).rstrip())
     try:
         generated_p50, source_p50 = evaluate(
             comparison, before_benchmark=before_benchmark,

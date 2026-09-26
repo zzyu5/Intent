@@ -63,27 +63,19 @@ def gemm_rms_scale(context: Context) -> PreparedComparison:
 
     generated = PreparedLaunch(generated_launch, finalize.outputs)
     source_module = _source(context)
-    config = {
-        "TILE_SIZE_M": 64,
-        "TILE_SIZE_N": 32,
-        "TILE_SIZE_K": 64,
-        "SPLIT_K": split_count,
-        "GROUP_SIZE_M": 8,
-    }
-    tile_m = config["TILE_SIZE_M"]
-    tile_n = config["TILE_SIZE_N"]
-    tile_k = config["TILE_SIZE_K"]
-    group_m = config["GROUP_SIZE_M"]
+    source_partial_linear, source_partial_square_sum, config = initial_launch(
+        lambda: source_module._cutile_autotune_mhc_split_gemm_rms(
+            torch.cuda.current_stream(), x, weight, tokens, width, x.shape[1],
+        ),
+        side="source",
+    )
+    tile_m = config.TILE_SIZE_M
+    tile_n = config.TILE_SIZE_N
+    tile_k = config.TILE_SIZE_K
+    group_m = config.GROUP_SIZE_M
+    source_split_count = config.SPLIT_K
     row_tiles = (tokens + tile_m - 1) // tile_m
     column_tiles = (width + tile_n - 1) // tile_n
-    source_partial_linear = torch.empty(
-        (tokens * split_count, width), device="cuda", dtype=torch.float32
-    )
-    source_partial_square_sum = torch.empty(
-        (tokens * split_count, column_tiles),
-        device="cuda",
-        dtype=torch.float32,
-    )
     source_mixed = torch.empty(
         (tokens, width), device="cuda", dtype=torch.bfloat16
     )
@@ -94,7 +86,7 @@ def gemm_rms_scale(context: Context) -> PreparedComparison:
     def source_launch():
         ct.launch(
             torch.cuda.current_stream(),
-            (row_tiles * column_tiles, split_count, 1),
+            (row_tiles * column_tiles, source_split_count, 1),
             source_module._mhc_split_gemm_rms_kernel,
             (
                 x,
@@ -107,7 +99,7 @@ def gemm_rms_scale(context: Context) -> PreparedComparison:
                 tile_m,
                 tile_n,
                 tile_k,
-                split_count,
+                source_split_count,
                 group_m,
             ),
         )
@@ -130,7 +122,7 @@ def gemm_rms_scale(context: Context) -> PreparedComparison:
                 x.shape[1],
                 tile_m,
                 tile_n,
-                split_count,
+                source_split_count,
             ),
         )
 

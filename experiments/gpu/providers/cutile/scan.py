@@ -1,25 +1,20 @@
 from __future__ import annotations
 
 import math
-from types import SimpleNamespace
 
 import torch
 
-from intent.runtime.artifact import ParameterRole
 from kernels.streaming.gated_delta import chunk_gated_delta_prepare
 from kernels.streaming.gated_delta import chunk_gated_delta_recurrence
 from kernels.streaming.gated_delta import recurrent_gated_delta_fwd
 
 from experiments._common.measurement import compile_single
 from experiments._common.measurement import functional_launch
-from experiments._common.measurement import PipelineStageError
-from experiments._common.measurement import report_stage
 from experiments._common.model import Context
 from experiments._common.model import PreparedComparison
 from experiments._common.model import PreparedLaunch
 from experiments._common.model import Tolerance
 from .common import tilegym_source
-from .common import source_tuning_artifact
 
 
 def recurrent_gated_delta(context: Context) -> PreparedComparison:
@@ -40,46 +35,12 @@ def recurrent_gated_delta(context: Context) -> PreparedComparison:
     ) * 0.5
     beta = torch.sigmoid(torch.randn_like(gate))
     scale = 1.0 / math.sqrt(key_dimension)
-    artifact, generated = compile_single(
+    _, generated = compile_single(
         context,
         recurrent_gated_delta_fwd,
         (query, key, value, gate, beta, scale),
         constexprs={"HEAD_GROUP": 1},
     )
-    artifact = source_tuning_artifact(context, artifact, recurrent_gated_delta_fwd,
-                                    constexprs={"HEAD_GROUP": 1})
-    report_stage("generated_tuning_metadata")
-    try:
-        configurations = artifact.tuning_configurations(
-            query, key, value, gate, beta, *generated.outputs(), scale,
-        )
-    except NotImplementedError as error:
-        raise PipelineStageError("generated_tuning_metadata", str(error)) from error
-    report_stage("source_candidate_binding")
-    configs = []
-    for configuration in configurations:
-        values = {}
-        for parameter, parameter_value in zip(configuration.parameters, configuration.values, strict=True):
-            role, axis = parameter.role, parameter.view_axis
-            if role == ParameterRole.PROVIDER_ACCESS_FORM:
-                field = "ACCESS_FORM"
-            elif role == ParameterRole.PROVIDER_OCCUPANCY:
-                field = "occupancy"
-            elif role == ParameterRole.FULL_COVERAGE and axis == (0, 3):
-                field = "BLOCK_K"
-            elif role in (ParameterRole.OWNERSHIP_M, ParameterRole.OWNERSHIP_N) and axis == (2, 3):
-                field = "BLOCK_V"
-            else:
-                raise PipelineStageError("source_candidate_binding",
-                                         f"source cannot bind recurrent parameter {parameter}")
-            if field in values:
-                raise PipelineStageError("source_candidate_binding", f"duplicate recurrent field {field}")
-            values[field] = parameter_value
-        if values.keys() != {"ACCESS_FORM", "occupancy", "BLOCK_K", "BLOCK_V"}:
-            raise PipelineStageError("source_candidate_binding", "incomplete recurrent candidate")
-        configs.append(SimpleNamespace(**values))
-    configs = tuple(configs)
-    report_stage("adapter_preparation")
     source_module = tilegym_source(
         context,
         "experiments/gpu/baselines/cutile/tilegym/scan/gated_delta_recurrent/recurrent_gated_delta_rule.py",
@@ -95,7 +56,6 @@ def recurrent_gated_delta(context: Context) -> PreparedComparison:
             beta,
             initial_state=None,
             output_final_state=True,
-            tuning_configs=configs,
             compiler_timeout=context.compiler_timeout_seconds,
         )
     )

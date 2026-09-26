@@ -18,26 +18,6 @@ from experiments._common.model import PreparedLaunch
 from experiments._common.model import Tolerance
 
 
-_QKV_PROJECTION_CONFIGS = (
-    {
-        (32, 64, block_k, 2, num_stages)
-        for block_k in (32, 64)
-        for num_stages in range(2, 7)
-    }
-    | {
-        (32, 128, block_k, 4, num_stages)
-        for block_k in (32, 64)
-        for num_stages in range(2, 7)
-    }
-    | {(64, 128, block_k, 4, 4) for block_k in (32, 64)}
-)
-
-_GROUPED_GEMM_CONFIGS = {
-    (128, 128, 64),
-    (64, 128, 64),
-}
-
-
 def _runtime(context: Context, path: str, name: str):
     return load_module(context.project_root / path, name)
 
@@ -77,7 +57,6 @@ def grouped_gemm(context: Context) -> PreparedComparison:
         device="cuda",
         dtype=torch.int32,
     )
-    resident_workers = torch.cuda.get_device_properties("cuda").multi_processor_count
     _, generated = compile_single(
         context,
         ragged_grouped_gemm,
@@ -90,29 +69,6 @@ def grouped_gemm(context: Context) -> PreparedComparison:
     )
     source_function = runtime.load_grouped_gemm()
     source_autotuner = source_function.__globals__["grouped_matmul_kernel"]
-    source_configs = [
-        config
-        for config in source_autotuner.configs
-        if (
-            config.kwargs["BLOCK_SIZE_M"],
-            config.kwargs["BLOCK_SIZE_N"],
-            config.kwargs["BLOCK_SIZE_K"],
-        )
-        in _GROUPED_GEMM_CONFIGS
-        and config.kwargs["NUM_SM"] == resident_workers
-        and config.num_warps == 4
-        and config.num_stages == 3
-        and config.num_ctas == 1
-    ]
-    if len(source_configs) != len(_GROUPED_GEMM_CONFIGS):
-        raise RuntimeError(
-            "grouped GEMM source does not expose the generated/source common "
-            "persistent candidate set"
-        )
-    source_autotuner.configs = source_configs
-    source_autotuner.early_config_prune = None
-    source_autotuner.perf_model = None
-    source_autotuner.configs_top_k = 1.0
     group_x = list(x.view(experts, rows, hidden).unbind(0))
     group_weight = list(weight.unbind(0))
     source_outputs = [
@@ -142,7 +98,7 @@ def grouped_gemm(context: Context) -> PreparedComparison:
     )
 
     def launch():
-        source_autotuner[(resident_workers,)](
+        source_autotuner[lambda meta: (meta["NUM_SM"],)](
             source_a_ptrs,
             source_b_ptrs,
             source_c_ptrs,
@@ -187,30 +143,6 @@ def qkv_projection(context: Context) -> PreparedComparison:
         "intent_v2_triton_qkv_projection",
     )
     source_module = runtime.load_source()
-    source_autotuner = source_module._xformers_tiled_matmul_kernel
-    source_configs = [
-        config
-        for config in source_autotuner.configs
-        if (
-            config.kwargs["BLOCK_M"],
-            config.kwargs["BLOCK_N"],
-            config.kwargs["BLOCK_K"],
-            config.num_warps,
-            config.num_stages,
-        )
-        in _QKV_PROJECTION_CONFIGS
-        and config.kwargs["SPLIT_K"] == 1
-        and config.kwargs["GROUP_M"] == 8
-        and config.num_ctas == 1
-    ]
-    if len(source_configs) != len(_QKV_PROJECTION_CONFIGS):
-        raise RuntimeError(
-            "QKV source does not expose the generated/source common candidate set"
-        )
-    source_autotuner.configs = source_configs
-    source_autotuner.early_config_prune = None
-    source_autotuner.perf_model = None
-    source_autotuner.configs_top_k = 1.0
     source_outputs = tuple(
         torch.empty((tokens, projection), device="cuda", dtype=torch.float16)
         for _ in range(3)

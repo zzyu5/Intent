@@ -61,6 +61,16 @@ def official_fmha(context: Context) -> PreparedComparison:
         "experiments/gpu/baselines/cutile/cutile-python/attention/fmha/AttentionFMHA_runtime.py",
         "intent_v2_cutile_official_fmha",
     )
+    config = initial_launch(
+        lambda: source_module["tune_cutile_fmha"](
+            q, k, v, scale, query_group_size=query_heads // key_heads,
+            causal=True,
+        ),
+        side="source",
+    )
+    kernel = source_module["fmha_kernel"].replace_hints(
+        num_ctas=config.num_ctas, occupancy=config.occupancy,
+    )
     source = functional_launch(
         lambda: source_module["cutile_fmha"](
             q,
@@ -69,6 +79,9 @@ def official_fmha(context: Context) -> PreparedComparison:
             qk_scale=scale,
             query_group_size=query_heads // key_heads,
             causal=True,
+            tile_m=config.TILE_M,
+            tile_n=config.TILE_N,
+            kernel=kernel,
         )
     )
     return PreparedComparison(
@@ -524,7 +537,6 @@ def sparse_mla_prefill(context: Context) -> PreparedComparison:
             kpe_source,
             is_causal=True,
             scaling=scale,
-            kernel_configs={"TILE_H": 1, "TILE_N": 64},
         )
         return output[0].permute(1, 0, 2)
 
