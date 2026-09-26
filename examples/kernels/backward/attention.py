@@ -120,6 +120,34 @@ def attention_backward_dkdv(
             )
 
 
+@intent.fn
+def summarize_query_gradients(
+    keys, values, key_coordinates,
+    queries, grad_outputs, lse, delta, query_coordinates, scale, causal,
+):
+    scores = I.matmul(queries, keys, transpose_rhs=True, acc_dtype=I.f32)
+    probability = I.exp2(
+        scores * (scale * I.LOG2E) - lse[:, None] * I.LOG2E,
+        approximate=True, flush_to_zero=True,
+    )
+    if causal:
+        probability = I.mask(
+            probability,
+            valid=query_coordinates[:, None] >= key_coordinates[None, :],
+            fill=0.0,
+        )
+    grad_probability = I.matmul(
+        grad_outputs, values, transpose_rhs=True, acc_dtype=I.f32
+    )
+    grad_scores = probability * (grad_probability - delta[:, None])
+    return I.matmul(I.cast(grad_scores, I.f16), keys, acc_dtype=I.f32)
+
+
+@intent.fn
+def merge_query_gradients(lhs, rhs):
+    return lhs + rhs
+
+
 @intent.kernel
 def attention_backward_dq(
     q: I.In[I.f16, ("B", "HQ", "Q", "D")],
@@ -144,39 +172,20 @@ def attention_backward_dq(
             grad_output_block = grad_output[
                 batch, query_head, query_axis, :
             ]
-            query_lse = lse[batch, query_head, query_axis][:, None]
-            query_delta = delta[batch, query_head, query_axis][:, None]
+            query_lse = lse[batch, query_head, query_axis]
+            query_delta = delta[batch, query_head, query_axis]
             key_block = k[batch, key_head, key_axis, :]
             value_block = v[batch, key_head, key_axis, :]
-            scores = I.matmul(
-                query_block,
-                key_block,
-                transpose_rhs=True,
-                acc_dtype=I.f32,
-            )
-            probability = I.exp2(
-                scores * (scale * I.LOG2E) - query_lse * I.LOG2E,
-                approximate=True, flush_to_zero=True,
-            )
-            if CAUSAL:
-                q_index = I.indices(query_axis)
-                k_index = I.indices(key_axis)
-                probability = I.mask(
-                    probability,
-                    valid=q_index[:, None] >= k_index[None, :],
-                    fill=0.0,
-                )
-            grad_probability = I.matmul(
-                grad_output_block,
-                value_block,
-                transpose_rhs=True,
-                acc_dtype=I.f32,
-            )
-            grad_scores = probability * (grad_probability - query_delta)
-            grad_q_value = I.matmul(
-                I.cast(grad_scores, I.f16),
-                key_block,
-                acc_dtype=I.f32,
+            grad_q_value = I.region_fold(
+                source=(key_block, value_block, I.indices(key_axis)),
+                axis=0,
+                summarize=summarize_query_gradients,
+                combine=merge_query_gradients,
+                identity=I.zeros((Q, D), dtype=I.f32),
+                operands=(
+                    query_block, grad_output_block, query_lse, query_delta,
+                    I.indices(query_axis), scale, CAUSAL,
+                ),
             )
             grad_q[batch, query_head, query_axis, :] = I.cast(
                 grad_q_value * scale, I.f16
