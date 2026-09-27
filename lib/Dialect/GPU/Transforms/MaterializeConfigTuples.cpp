@@ -231,16 +231,33 @@ bool isOnlineMomentOwnership(func::FuncOp kernel, ParameterOp parameter) {
   return found;
 }
 
-bool isContractionOwnership(func::FuncOp kernel, ParameterOp parameter) {
+unsigned contractionOwnershipBitWidth(func::FuncOp kernel,
+                                      ParameterOp parameter) {
   auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());
   if (role != ParameterRole::OwnershipM && role != ParameterRole::OwnershipN)
-    return false;
+    return 0;
   StringAttr name = parameter.getParameter().getName();
-  bool found = false;
+  unsigned width = 0;
+  auto include = [&](FragmentType result, FragmentType lhs, FragmentType rhs) {
+    if (fragmentReferencesParameter(result, name))
+      width = std::max({width, lhs.getElementType().getIntOrFloatBitWidth(),
+                        rhs.getElementType().getIntOrFloatBitWidth()});
+  };
   kernel.walk([&](ContractOp contract) {
-    found |= fragmentReferencesParameter(contract.getResult().getType(), name);
+    include(contract.getResult().getType(), contract.getLhs().getType(),
+            contract.getRhs().getType());
   });
-  return found;
+  if (!width)
+    return 0;
+  kernel.walk([&](ScaledContractOp contract) {
+    include(contract.getResult().getType(), contract.getLhs().getType(),
+            contract.getRhs().getType());
+  });
+  kernel.walk([&](SparseContractOp contract) {
+    include(contract.getResult().getType(), contract.getCompressed().getType(),
+            contract.getRhs().getType());
+  });
+  return width;
 }
 
 bool isMultiAxisReduction(func::FuncOp kernel, ParameterOp parameter) {
@@ -341,7 +358,7 @@ TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
     // when a contraction produces its input. Keep the smaller row candidates.
     if (isBlockedReductionFreeAxis(kernel, parameter))
       return TuningClass::PointwiseReduction;
-    if (isContractionOwnership(kernel, parameter))
+    if (contractionOwnershipBitWidth(kernel, parameter))
       return TuningClass::Contraction;
     return TuningClass::Pointwise;
   case ParameterCategory::Coverage:
@@ -1126,8 +1143,14 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
   llvm::DenseMap<Operation *, SmallVector<TuningProfile, 5>> parameterProfiles;
   for (ParameterOp parameter : parameters) {
     ParameterAttr schema = parameter.getParameter();
+    auto kind = tuningClass(kernel, parameter);
+    unsigned width = schema.getElementBitWidth();
+    if (kind == TuningClass::Contraction ||
+        kind == TuningClass::PersistentContraction)
+      if (unsigned inputs = contractionOwnershipBitWidth(kernel, parameter))
+        width = inputs;
     auto profiles = profilesFor(
-        kernel, tuningClass(kernel, parameter), schema.getElementBitWidth(),
+        kernel, kind, width,
         hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal,
         pointwiseOnlyProgram, smallRegionRows,
         multipleRegionMatrixAccumulators, tables);
