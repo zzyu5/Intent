@@ -96,41 +96,45 @@ def summarize_mla_chunk(
 ):
     scores = (
         I.matmul(
-            latent_query,
             latent_chunk,
+            latent_query,
             transpose_rhs=True,
             acc_dtype=I.f32,
         )
         + I.matmul(
-            rope_query,
             rope_chunk,
+            rope_query,
             transpose_rhs=True,
             acc_dtype=I.f32,
         )
     ) * (scale * I.LOG2E)
     valid = I.full(scores.shape, fill=True, dtype=I.bool)
     if causal:
-        valid = query_coordinates[:, None] >= key_coordinates[None, :]
+        valid = query_coordinates[None, :] >= key_coordinates[:, None]
     scores = I.select(valid, scores, -I.inf)
-    chunk_valid = I.reduce.any(valid, axis=1)
+    chunk_valid = I.reduce.any(valid, axis=0)
     maximum = I.select(
         chunk_valid,
-        reduce_score_maximum(scores, axis=1),
+        reduce_score_maximum(scores, axis=0),
         0.0,
     )
     probability = I.select(
         valid,
-        I.exp2(scores - maximum[:, None], approximate=True, flush_to_zero=True),
+        I.exp2(scores - maximum[None, :], approximate=True, flush_to_zero=True),
         0.0,
     )
     return I.record(
         valid=chunk_valid,
         maximum=maximum,
-        denominator=I.reduce.sum(probability, axis=1),
-        accumulator=I.matmul(
-            I.cast(probability, I.f16),
-            value_chunk,
-            acc_dtype=I.f32,
+        denominator=I.reduce.sum(probability, axis=0),
+        accumulator=I.transpose(
+            I.matmul(
+                value_chunk,
+                I.cast(probability, I.f16),
+                transpose_lhs=True,
+                acc_dtype=I.f32,
+            ),
+            (1, 0),
         ),
     )
 
@@ -149,39 +153,43 @@ def summarize_masked_mla_chunk(
 ):
     scores = (
         I.matmul(
-            latent_query,
             latent_chunk,
+            latent_query,
             transpose_rhs=True,
             acc_dtype=I.f32,
         )
         + I.matmul(
-            rope_query,
             rope_chunk,
+            rope_query,
             transpose_rhs=True,
             acc_dtype=I.f32,
         )
     ) * (scale * I.LOG2E)
-    valid = I.full(scores.shape, fill=True, dtype=I.bool) & active[None, :]
+    valid = I.full(scores.shape, fill=True, dtype=I.bool) & active[:, None]
     scores = I.select(valid, scores, -I.inf)
-    chunk_valid = I.reduce.any(valid, axis=1)
+    chunk_valid = I.reduce.any(valid, axis=0)
     maximum = I.select(
         chunk_valid,
-        reduce_score_maximum(scores, axis=1),
+        reduce_score_maximum(scores, axis=0),
         0.0,
     )
     probability = I.select(
         valid,
-        I.exp2(scores - maximum[:, None], approximate=True, flush_to_zero=True),
+        I.exp2(scores - maximum[None, :], approximate=True, flush_to_zero=True),
         0.0,
     )
     return I.record(
         valid=chunk_valid,
         maximum=maximum,
-        denominator=I.reduce.sum(probability, axis=1),
-        accumulator=I.matmul(
-            I.cast(probability, I.f16),
-            value_chunk,
-            acc_dtype=I.f32,
+        denominator=I.reduce.sum(probability, axis=0),
+        accumulator=I.transpose(
+            I.matmul(
+                value_chunk,
+                I.cast(probability, I.f16),
+                transpose_lhs=True,
+                acc_dtype=I.f32,
+            ),
+            (1, 0),
         ),
     )
 
