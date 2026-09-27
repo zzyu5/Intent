@@ -2936,7 +2936,7 @@ FailureOr<bool> realizeFullResultTraversal(
         lhsAxis ? ParameterRole::OwnershipM : ParameterRole::OwnershipN,
         ParameterCategory::Contraction,
         inputElement.isIndex() ? 64 : inputElement.getIntOrFloatBitWidth(),
-        {32, 64, 128, 256});
+        {32, 64, 128, 256, 512});
     if (!block)
       return failure();
     if (FailureOr<int64_t> dimension = queryRangeDimension(*authority);

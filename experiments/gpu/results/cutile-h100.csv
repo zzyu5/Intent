@@ -28,8 +28,8 @@ mhc_apply_residual,T2048-H4096-streams4-bf16,0.058112,0.055096,0.055328,0.948100
 gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,0.469928,0.571848,0.668592,1.216884,1.422754,pass,pass,Intent target=triton; source corpus=cutile. 同算法；中间精度和舍入不同,同算法；中间精度和舍入不同
 gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,0.379696,0.080456,0.110448,0.211896,0.290885,pass,pass,Intent target=triton; source corpus=cutile. 同算法；中间精度和舍入不同,同算法；中间精度和舍入不同
 mhc_sinkhorn,T8192-streams4-fp32,0.030496,0.009024,0.009256,0.295908,0.303515,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 用 exp2(x * log2(e)) 实现 exp,同算法；source 用 exp2(x * log2(e)) 实现 exp
-absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,0.268752,0.504160,0.427312,1.875930,1.589986,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用近似除法并额外输出 LSE,同算法；source 使用近似除法并额外输出 LSE
-splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,0.110408,0.166608,0.119776,1.509021,1.084849,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法,同算法；source 使用 FTZ 与近似除法
+absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,0.268752,0.244728,0.426568,0.910609,1.587218,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用近似除法并额外输出 LSE,同算法；source 使用近似除法并额外输出 LSE
+splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,0.110408,0.104864,0.123416,0.949786,1.117818,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法,同算法；source 使用 FTZ 与近似除法
 sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,5.229184,0.224408,0.678512,0.042915,0.129755,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法,同算法；source 使用 FTZ 与近似除法
 sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,0.729584,0.575752,0.650808,0.789151,0.892026,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 的布局转换与辅助工作计入其调用时间,同算法；source 的布局转换与辅助工作计入其调用时间
 rms_norm,8192x4096-bf16,0.050608,0.049992,0.050064,0.987828,0.989251,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 额外写 Rstd,同算法；source 额外写 Rstd

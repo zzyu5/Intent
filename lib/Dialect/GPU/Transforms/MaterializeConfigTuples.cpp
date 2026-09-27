@@ -323,6 +323,46 @@ bool isStatefulReduction(func::FuncOp kernel, ParameterOp parameter) {
   return found;
 }
 
+bool isRegionContractionParameter(func::FuncOp kernel, ParameterOp parameter) {
+  SmallVector<StringAttr> segments;
+  kernel.walk([&](ParameterOp candidate) {
+    auto schema = candidate.getParameter();
+    if (schema.getCategory() ==
+            static_cast<uint32_t>(ParameterCategory::RegionContraction) &&
+        schema.getRole() == static_cast<uint32_t>(ParameterRole::ScanChunk))
+      segments.push_back(schema.getName());
+  });
+  if (segments.empty())
+    return false;
+  bool found = false;
+  bool allRegion = true;
+  kernel.walk([&](Operation *operation) {
+    if (!isa<ContractOp, ScaledContractOp, SparseContractOp>(operation))
+      return;
+    auto references = [&](Type type) {
+      auto fragment = dyn_cast<FragmentType>(type);
+      return fragment && fragmentReferencesParameter(
+                             fragment, parameter.getParameter().getName());
+    };
+    if (!llvm::any_of(operation->getOperandTypes(), references) &&
+        !llvm::any_of(operation->getResultTypes(), references))
+      return;
+    found = true;
+    bool inRegion = false;
+    for (Operation *parent = operation->getParentOp();
+         parent && parent != kernel.getOperation(); parent = parent->getParentOp())
+      if (auto loop = dyn_cast<scf::ForOp>(parent))
+        for (Value bound : {loop.getLowerBound(), loop.getUpperBound(),
+                            loop.getStep()})
+          if (auto expression = queryLaunchExpression(bound))
+            inRegion |= llvm::any_of(segments, [&](StringAttr segment) {
+              return expressionReferencesParameter(expression, segment);
+            });
+    allRegion &= inRegion;
+  });
+  return found && allRegion;
+}
+
 TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
   ParameterAttr schema = parameter.getParameter();
   switch (static_cast<ParameterCategory>(schema.getCategory())) {
@@ -340,7 +380,9 @@ TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
   case ParameterCategory::Scan:
     return TuningClass::Scan;
   case ParameterCategory::Contraction:
-    return TuningClass::Contraction;
+    return isRegionContractionParameter(kernel, parameter)
+               ? TuningClass::RegionContraction
+               : TuningClass::Contraction;
   case ParameterCategory::PersistentContraction:
     return TuningClass::PersistentContraction;
   case ParameterCategory::Histogram:
