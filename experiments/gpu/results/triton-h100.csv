@@ -29,7 +29,7 @@ mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.027520,0.054520,0.009232,1.98110
 flash_attention_backward,B2-H16-S2048-D128-fp16-causal,0.615656,0.742112,0.714576,1.205400,1.160674,pass,pass,source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。,Intent target=cutile; source corpus=triton. source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。
 moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.833440,1.982688,2.012416,0.699746,0.710238,pass,pass,,Intent target=cutile; source corpus=triton.
 moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,4.393072,2.069424,2.038880,0.471065,0.464113,pass,pass,,Intent target=cutile; source corpus=triton.
-mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,0.015024,0.014960,0.021248,0.995740,1.414270,pass,pass,,Intent target=cutile; source corpus=triton.
+mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,0.015024,0.014688,0.021288,0.977636,1.416933,pass,pass,,Intent target=cutile; source corpus=triton.
 mamba_state_passing,B1-C8-H32-state8192-fp32,0.013736,0.013152,0.011232,0.957484,0.817705,pass,pass,,Intent target=cutile; source corpus=triton.
 mamba_chunk_scan,B1-S2048-H32-G8-P64-N128-C256-bf16,0.045328,0.035768,0.049648,0.789093,1.095305,pass,pass,,Intent target=cutile; source corpus=triton.
 mamba3_siso_forward,B1-S2048-HQK4-H16-DQK32-DV64-bf16,0.181024,0.293248,0.250944,1.619940,1.386247,pass,pass,同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲
