@@ -333,6 +333,8 @@ public:
   mlir::FailureOr<unsigned>
   coordinateIndex(mlir::ValueRange coordinates,
                   PhysicalSourceAxis source) const;
+  mlir::FailureOr<unsigned> accessCoordinatePosition(
+      LoadOp load, AxisMapAttr mapping, mlir::Value operand);
   PhysicalRangeFact sourceRanges(
       mlir::Value value,
       std::optional<PhysicalSourceAxis> source = std::nullopt);

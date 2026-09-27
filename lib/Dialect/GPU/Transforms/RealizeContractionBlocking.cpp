@@ -1699,63 +1699,8 @@ LoadOp matrixOperandLoad(Value value) {
 FailureOr<unsigned> accessCoordinatePosition(LoadOp load,
                                              AxisMapAttr mapping,
                                              Value operand) {
-  if (PhysicalAxisProjection direct = queryCoordinateIndex(
-          load.getCoordinates(), sourceAxisIdentity(mapping), mapping.getDimensionId());
-      direct.isExact())
-    return direct.fragmentAxis;
-  auto kernel = load->getParentOfType<func::FuncOp>();
-  if (kernel) {
-    PhysicalProgramAnalysis analysis(kernel);
-    FailureOr<MakeRangeOp> selected = queryExactLogicalRange(
-        analysis.axisRanges(operand, mapping.getFragmentAxis()));
-    std::optional<unsigned> replayed;
-    for (auto [position, coordinate] :
-         llvm::enumerate(load.getCoordinates())) {
-      PhysicalRangeFact fact =
-          analysis.sourceRanges(coordinate, sourceAxisIdentity(mapping));
-      FailureOr<MakeRangeOp> coordinateRange = queryExactLogicalRange(fact);
-      if (failed(coordinateRange) ||
-          (succeeded(selected) && !sameLogicalRange(*selected, *coordinateRange)))
-        continue;
-      if (replayed)
-        return failure();
-      replayed = position;
-    }
-    if (replayed)
-      return *replayed;
-  }
-  auto result = dyn_cast<FragmentType>(load.getResult().getType());
-  if (result && result.getShape().size() == load.getCoordinates().size() &&
-      llvm::all_of(load.getCoordinates(), [](Value coordinate) {
-        auto fragment = dyn_cast<FragmentType>(coordinate.getType());
-        return fragment && fragment.getShape().size() == 1;
-      }) &&
-      mapping.getFragmentAxis() < load.getCoordinates().size())
-    return mapping.getFragmentAxis();
-  auto view = dyn_cast<ViewType>(load.getResource().getType());
-  if (!view || mapping.getDimensionId() <= 0)
-    return failure();
-  std::optional<unsigned> resourceAxis;
-  for (auto [axis, dimension] :
-       llvm::enumerate(view.getLayout().getDimensionIds().asArrayRef())) {
-    if (dimension != mapping.getDimensionId())
-      continue;
-    if (resourceAxis)
-      return failure();
-    resourceAxis = axis;
-  }
-  if (!resourceAxis)
-    return failure();
-  std::optional<unsigned> coordinate;
-  for (auto [position, axis] : llvm::enumerate(load.getSourceAxes())) {
-    if (axis != *resourceAxis)
-      continue;
-    if (coordinate)
-      return failure();
-    coordinate = position;
-  }
-  return coordinate ? FailureOr<unsigned>(*coordinate)
-                    : FailureOr<unsigned>(failure());
+  return PhysicalProgramAnalysis(load->getParentOfType<func::FuncOp>())
+      .accessCoordinatePosition(load, mapping, operand);
 }
 
 FailureOr<unsigned> directRankOneAccessPosition(ValueRange coordinates,

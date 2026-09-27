@@ -1029,33 +1029,40 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
       gather.emitOpError("gather source axis lost coordinate provenance");
       return failure();
     }
-    PhysicalAxisProjection target = queryCoordinateIndex(
-        originalCoordinates, sourceAxisIdentity(*mapping), mapping->getDimensionId());
-    if (!target.isExact() || target.dimensionId != mapping->getDimensionId()) {
+    FailureOr<unsigned> target =
+        analysis.accessCoordinatePosition(sourceLoad, *mapping, loaded);
+    if (failed(target)) {
       gather.emitOpError(
           "loaded source coordinate cannot be composed with gather indexing");
       return failure();
     }
-    Value original = originalCoordinates[target.fragmentAxis];
+    Value original = originalCoordinates[*target];
     auto range = original.getDefiningOp<MakeRangeOp>();
     if (!range) {
       auto coordinateType = dyn_cast<FragmentType>(original.getType());
-      if (!coordinateType || coordinateType.getShape().size() != 1)
+      PhysicalAxisProjection axis = queryFragmentAxis(
+          original.getType(), sourceAxisIdentity(*mapping),
+          mapping->getDimensionId());
+      if (!coordinateType || !axis.isExact())
         return false;
-      PhysicalRangeFact roots = analysis.axisRanges(original, 0);
+      PhysicalRangeFact roots = analysis.axisRanges(original, axis.fragmentAxis);
       if (!roots.isUnique() ||
           !analysis.replayability(original, std::nullopt,
                                   PhysicalReplayScope::Coordinate,
                                   /*allowAccesses=*/false).isReplayable())
         return false;
       range = roots.roots.front();
-      auto dimension = queryRangeDimension(range);
-      auto axis = queryAxisMap(coordinateType, 0);
-      if (coordinateType.getShape()[0] !=
-              range.getResult().getType().getShape()[0] ||
-          failed(dimension) || failed(axis) ||
-          *dimension != axis->getDimensionId())
+      if (coordinateType.getShape()[axis.fragmentAxis] !=
+          range.getResult().getType().getShape()[0])
         return false;
+      for (auto [position, extent] : llvm::enumerate(coordinateType.getShape())) {
+        auto expression = cast<PhysicalExprAttr>(extent);
+        if (position != axis.fragmentAxis &&
+            (expression.getKind() !=
+                 static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+             expression.getValue() != 1))
+          return false;
+      }
     }
     // The ordinal of a retained slice often subtracts its original base.
     // Compose the inverse translation before rebuilding the access: keeping
@@ -1113,7 +1120,7 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
       coordinate = *selected;
     }
     replay.map(original, coordinate);
-    coordinates[target.fragmentAxis] = coordinate;
+    coordinates[*target] = coordinate;
   }
 
   if (resultType) {

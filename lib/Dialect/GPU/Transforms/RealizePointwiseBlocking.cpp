@@ -2912,6 +2912,39 @@ LogicalResult alignOrdinaryContractOperandTypes(func::FuncOp kernel) {
     auto ranges = PhysicalProgramAnalysis(kernel).axisRanges(value, axis);
     return ranges.isExact() && ranges.roots.empty() && ranges.blockers.empty();
   };
+  auto batchExtentAuthority = [&](Value value, AxisMapAttr mapping) {
+    Value authority = value;
+    while (Operation *operation = authority.getDefiningOp()) {
+      if (!isa<ReshapeOp, TransposeOp>(operation))
+        break;
+      Value source = operation->getOperand(0);
+      if (!queryFragmentAxis(source.getType(), sourceAxisIdentity(mapping),
+                             mapping.getDimensionId()).isExact())
+        return value;
+      authority = source;
+    }
+    auto load = authority.getDefiningOp<LoadOp>();
+    if (!load)
+      return value;
+    PhysicalProgramAnalysis analysis(kernel);
+    for (Value dependency : load->getOperands()) {
+      if (dependency == load.getResource() ||
+          !isa<FragmentType>(dependency.getType()))
+        continue;
+      if (queryFragmentAxes(dependency.getType(),
+                            sourceAxisIdentity(mapping)).empty())
+        continue;
+      auto axis = queryFragmentAxis(dependency.getType(),
+                                    sourceAxisIdentity(mapping),
+                                    mapping.getDimensionId());
+      if (!axis.isExact())
+        return value;
+      auto ranges = analysis.axisRanges(dependency, axis.fragmentAxis);
+      if (!ranges.isExact() || !ranges.roots.empty() || !ranges.blockers.empty())
+        return value;
+    }
+    return authority;
+  };
   WalkResult result = kernel.walk([&](ContractOp contract) {
     auto alignPairs = [&](Value lhs, Value rhs, ArrayRef<int64_t> lhsAxes,
                           ArrayRef<int64_t> rhsAxes, bool batch) -> LogicalResult {
@@ -2942,12 +2975,14 @@ LogicalResult alignOrdinaryContractOperandTypes(func::FuncOp kernel) {
           rebindLhs = lhsUniform;
         if (rebindLhs) {
           auto mapping = cast<AxisMapAttr>(lhsType.getAxisMaps()[lhsAxis]);
-          retargetSourceExtent(lhs, sourceAxisIdentity(mapping),
+          Value authority = batch ? batchExtentAuthority(lhs, mapping) : lhs;
+          retargetSourceExtent(authority, sourceAxisIdentity(mapping),
                                cast<PhysicalExprAttr>(rhsExtent),
                                mapping.getDimensionId());
         } else {
           auto mapping = cast<AxisMapAttr>(rhsType.getAxisMaps()[rhsAxis]);
-          retargetSourceExtent(rhs, sourceAxisIdentity(mapping),
+          Value authority = batch ? batchExtentAuthority(rhs, mapping) : rhs;
+          retargetSourceExtent(authority, sourceAxisIdentity(mapping),
                                cast<PhysicalExprAttr>(lhsExtent),
                                mapping.getDimensionId());
         }

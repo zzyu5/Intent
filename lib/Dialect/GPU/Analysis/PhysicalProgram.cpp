@@ -2533,6 +2533,66 @@ PhysicalProgramAnalysis::fragmentAxis(Type type,
                           : FailureOr<unsigned>(failure());
 }
 
+FailureOr<unsigned> PhysicalProgramAnalysis::accessCoordinatePosition(
+    LoadOp load, AxisMapAttr mapping, Value operand) {
+  if (PhysicalAxisProjection direct = queryCoordinateIndex(
+          load.getCoordinates(), sourceAxisIdentity(mapping),
+          mapping.getDimensionId());
+      direct.isExact())
+    return direct.fragmentAxis;
+  FailureOr<MakeRangeOp> selected = queryExactLogicalRange(
+      axisRanges(operand, mapping.getFragmentAxis()));
+  std::optional<unsigned> replayed;
+  for (auto [position, coordinate] : llvm::enumerate(load.getCoordinates())) {
+    PhysicalAxisProjection axis = queryFragmentAxis(
+        coordinate.getType(), sourceAxisIdentity(mapping),
+        mapping.getDimensionId());
+    FailureOr<MakeRangeOp> coordinateRange = queryExactLogicalRange(
+        axis.isExact() ? axisRanges(coordinate, axis.fragmentAxis)
+                       : sourceRanges(coordinate, sourceAxisIdentity(mapping)));
+    if (failed(coordinateRange) ||
+        (succeeded(selected) && !sameLogicalRange(*selected, *coordinateRange)))
+      continue;
+    if (replayed)
+      return failure();
+    replayed = position;
+  }
+  if (replayed)
+    return *replayed;
+  auto result = dyn_cast<FragmentType>(load.getResult().getType());
+  if (result && result.getShape().size() == load.getCoordinates().size() &&
+      llvm::all_of(load.getCoordinates(), [](Value coordinate) {
+        auto fragment = dyn_cast<FragmentType>(coordinate.getType());
+        return fragment && fragment.getShape().size() == 1;
+      }) &&
+      mapping.getFragmentAxis() < load.getCoordinates().size())
+    return mapping.getFragmentAxis();
+  auto view = dyn_cast<ViewType>(load.getResource().getType());
+  if (!view || mapping.getDimensionId() <= 0)
+    return failure();
+  std::optional<unsigned> resourceAxis;
+  for (auto [axis, dimension] :
+       llvm::enumerate(view.getLayout().getDimensionIds().asArrayRef())) {
+    if (dimension != mapping.getDimensionId())
+      continue;
+    if (resourceAxis)
+      return failure();
+    resourceAxis = axis;
+  }
+  if (!resourceAxis)
+    return failure();
+  std::optional<unsigned> coordinate;
+  for (auto [position, axis] : llvm::enumerate(load.getSourceAxes())) {
+    if (axis != *resourceAxis)
+      continue;
+    if (coordinate)
+      return failure();
+    coordinate = position;
+  }
+  return coordinate ? FailureOr<unsigned>(*coordinate)
+                    : FailureOr<unsigned>(failure());
+}
+
 FailureOr<unsigned> PhysicalProgramAnalysis::coordinateIndex(
     ValueRange coordinates, PhysicalSourceAxis source) const {
   PhysicalAxisProjection result = queryCoordinateIndex(coordinates, source);
