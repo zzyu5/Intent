@@ -20,7 +20,7 @@ import torch
 import triton
 
 from experiments import PROJECT_ROOT
-from .agent import execute, materialize_language
+from .agent import execute, instructions, materialize_language
 from .tasks import SUITE_PATH, catalog, description, invocation, read_suite, reference, return_contract
 
 
@@ -202,7 +202,7 @@ def main() -> None:
                    "tasks": rows, "submission_policy": "one complete program; documentation tools; no benchmark feedback",
                    "timing": "complete operator; per-task paired CUDA Graph or CUDA event timing; compilation/tuning excluded",
                    "isolation": "dedicated Codex state/provider; workspace-only shell, no network; read-only public manual MCP; no reference/history/agents",
-                   "instructions": Path(__file__).with_name("instructions.md").read_text()}
+                   "instructions": {language: instructions(language) for language in arguments.arms}}
     (arguments.output / "environment.json").write_text(json.dumps(environment, indent=2) + "\n")
     fields = ("task", "profile", "language", "status", "candidate_ms", "reference_ms", "ratio", "timing", "failure_stage", "error", "program")
     with ((arguments.output / "results.csv").open("w", newline="") as output,

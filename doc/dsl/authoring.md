@@ -53,6 +53,8 @@ Scalar/tensor 比较使用 Python 运算符 `==`、`!=`、`<`、`<=`、`>`、`>=
 
 Pointwise 按尾部对齐，允许 scalar/size-one broadcast。`[M]` 与 `[M,N]` 相加不会自动按行匹配：先 `I.reshape(row_value, (M, 1))`；`[N]` 可以直接广播到 `[M,N]`。两个未知 extent 不是因为都 dynamic 就兼容。
 
+Kernel annotation 使用符号维度时，`reshape`、`full` 等 shape 表达继续引用该符号或对应的 `value.shape`；固定输入本次恰为某个尺寸，不使这个符号等同于该尺寸的字面量。
+
 `I.transpose(value, permutation)` 显式重排；permutation 的长度必须等于输入 rank，包含 `0..rank-1` 的每个轴且仅一次。省略 permutation 时反转全部轴顺序。`I.reshape` 保持 row-major element order，不是任意 data permutation。Domain/subregion 与 integer coordinate tensor 不可互换；索引关系、有效范围和 fill 必须来自作者实际表达。
 
 Domain 索引按资源索引顺序形成读取结果的 tensor axes，赋值仍按 positional axes 对齐，不按 domain 变量名自动换轴。例如两个等长 domains 下，`output[rows, columns] = input[columns, rows]` 不表示矩阵转置；应显式转置读取的 tensor value，或构造具有所需对应关系的坐标 tensor。不同 subregions 的动态长度也不会因本次输入碰巧等长而成为同一 extent；需要使用已成立的 shape relation，或在共同输出 domain 上表达坐标映射。

@@ -21,7 +21,9 @@ Choose among documented exact and explicit approximate operations according to
 TASK.md's accuracy and input-domain requirements. Approximate modes must respect
 their documented error bounds, range and special-value rules.
 
-Read TASK.md and the provided language materials. For Intent, first call
+Read TASK.md and the provided language materials.
+<!-- intent -->
+For Intent, first call
 intent_manual.read(id="doc/dsl/authoring.md") for the language and host interface
 rules, then read(id="doc/programming-model/kernel-and-host.md") for kernel,
 specialization and multi-kernel composition semantics. Use the public contracts
@@ -29,7 +31,9 @@ to express the independent logical work and dependencies of your algorithm.
 Use api for declarations and signatures, then read the returned rule IDs
 for return shapes, dtypes and semantics; api does not infer your program's result
 schema. Consult the manual before writing code; it does not execute programs or
-provide task answers. Write candidate.py containing
+provide task answers.
+<!-- /intent -->
+Write candidate.py containing
 build(context), which returns a callable with the task's original wrapper
 signature. The evaluator calls build once outside timing, then calls that wrapper
 with the documented inputs. Multiple kernels and explicit host composition are
@@ -47,12 +51,14 @@ rules. Check the returned callable and its defaults, the result tree, runtime
 argument order, and the dtype and shape of loop state and helper results.
 Check that build(context) itself returns the host callable on the supplied
 profile, rather than only defining or returning from that inner callable.
+Derive shape-dependent counts from the actual input or intermediate dimensions.
 Compare the actual source with the algorithm you chose: its kernel calls,
 independent logical work, intermediate values and sequential dependencies must
 still be present after translation. Check each ordinary loop against the
 dependency it expresses, including loops introduced while writing the code.
 Do this review on candidate.py; no separate planning or review file is needed.
 
+<!-- intent -->
 Intent expresses Triton-style kernel algorithms over logical domains. Retain the
 algorithm's independent work, logical groups, partial results, kernel stages and
 host orchestration; leave physical tiles, threads, layouts and pipelines to the
@@ -117,9 +123,15 @@ use documented DSL intrinsics and syntax shorthands. Reduction removes its axes,
 and broadcasting aligns trailing axes; add explicit size-one axes when needed.
 A name read after a runtime if must already be defined or be assigned in every
 normally continuing branch; implications between conditions do not define it.
+<!-- /intent -->
 
+<!-- triton -->
 For direct Triton generation, define @triton.jit kernels and an ordinary wrapper;
 context need not be used.
+Read materials/__init__.py for names exported by triton.language; core.py,
+standard.py, math.py and extra/cuda/libdevice.py provide their public definitions.
+Use the namespace that actually exports an operation.
+<!-- /triton -->
 
 The submission is the complete candidate.py. Use only torch, triton, intent, math, functools,
 typing, collections, dataclasses and __future__ imports. File/network access,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -26,6 +27,16 @@ def _toml(value) -> str:
     return json.dumps(value)
 
 
+def instructions(language: str) -> str:
+    text = Path(__file__).with_name("instructions.md").read_text()
+    return re.sub(
+        r"<!-- (intent|triton) -->\n(.*?)<!-- /\1 -->\n",
+        lambda section: section[2] if section[1] == language else "",
+        text,
+        flags=re.DOTALL,
+    )
+
+
 def materialize_language(project: Path, triton_ref: Path, directory: Path, language: str) -> list[str]:
     directory.mkdir(parents=True)
     if language == "intent":
@@ -34,7 +45,7 @@ def materialize_language(project: Path, triton_ref: Path, directory: Path, langu
         return sorted({entry["source"] for entry in corpus["documents"].values()})
     language_path = Path(triton.language.__file__).parent
     sources = []
-    for name in ("core.py", "standard.py", "math.py", "extra/cuda/libdevice.py"):
+    for name in ("__init__.py", "core.py", "standard.py", "math.py", "extra/cuda/libdevice.py"):
         destination = directory / name
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(language_path / name, destination)
@@ -68,7 +79,7 @@ def command(directory: Path, suite: dict, response: Path, schema: Path, executab
                                          str(executable): "read", str(state_root / "codex/tmp/arg0"): "read"},
         "permissions.study.network.enabled": False,
         "project_doc_max_bytes": 0,
-        "developer_instructions": Path(__file__).with_name("instructions.md").read_text(),
+        "developer_instructions": instructions(language),
         "memories.generate_memories": False, "memories.use_memories": False,
         "agents.enabled": False, "web_search": "disabled",
         "shell_environment_policy.inherit": "none",
