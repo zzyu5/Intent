@@ -53,9 +53,9 @@ LogicalResult materializeProgramBuffers(ModuleOp module) {
   for (BufferOp buffer : buffers) {
     auto type = buffer.getResult().getType();
     if (type.getScope().getValue() != BufferScope::ProgramPrivate ||
-        type.getLifetime().getValue() != BufferLifetime::Program ||
-        buffer->getBlock() != &kernel.front())
-      return buffer.emitOpError("mutable buffer requires an entry program allocation");
+        type.getLifetime().getValue() != BufferLifetime::Program)
+      return buffer.emitOpError(
+          "mutable buffer requires program-private storage with program lifetime");
     if (buffer.getInitialValue())
       return buffer.emitOpError("buffer initialization must be lowered to explicit writes");
     for (Operation *user : buffer.getResult().getUsers())
@@ -74,6 +74,8 @@ LogicalResult materializeProgramBuffers(ModuleOp module) {
     if (!singleton)
       llvm::append_range(shape, space);
     llvm::append_range(shape, type.getShape());
+    // Only storage is allocated at entry; lexical initialization and accesses
+    // retain their original control and order, including across iterations.
     Value workspace = createInvocationWorkspace(
         kernel, buffer.getLoc(), type.getElementType(),
         ArrayAttr::get(kernel.getContext(), shape), type.getOwner());
