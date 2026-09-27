@@ -3150,6 +3150,16 @@ FailureOr<bool> propagateOrderedCarryDependency(
   if (auto yield = dyn_cast<scf::YieldOp>(user)) {
     if (auto loop = dyn_cast<scf::WhileOp>(yield->getParentOp()))
       return propagateWhile(loop);
+    if (auto branch = dyn_cast<scf::IfOp>(yield->getParentOp())) {
+      if (!isLaunchUniformScalar(branch.getCondition(),
+                                 branch->getParentOfType<func::FuncOp>()))
+        return failure();
+      loops.insert(branch);
+      for (auto [index, operand] : llvm::enumerate(yield.getResults()))
+        if (operand == value)
+          enqueue(branch.getResult(index));
+      return true;
+    }
     auto loop = dyn_cast<scf::ForOp>(yield->getParentOp());
     if (!loop)
       return failure();
@@ -3183,6 +3193,11 @@ bool hasSupportedOrderedBodies(
     WalkResult effects = loop->walk([&](Operation *operation) {
       if (isa<scf::ForOp, ReduceOp>(operation))
         return WalkResult::advance();
+      if (auto branch = dyn_cast<scf::IfOp>(operation))
+        return isLaunchUniformScalar(branch.getCondition(),
+                                     branch->getParentOfType<func::FuncOp>())
+                   ? WalkResult::advance()
+                   : WalkResult::interrupt();
       if (auto whileLoop = dyn_cast<scf::WhileOp>(operation))
         return canPredicateScalarWhile(whileLoop) ? WalkResult::advance()
                                                  : WalkResult::interrupt();
@@ -3650,6 +3665,27 @@ LogicalResult rankLiftPointwiseValueGraph(
     if (!dependsOnLiftedRange)
       return WalkResult::advance();
     if (auto yield = dyn_cast<scf::YieldOp>(operation)) {
+      if (auto branch = dyn_cast<scf::IfOp>(yield->getParentOp())) {
+        for (auto [index, value] : llvm::enumerate(yield.getResults())) {
+          if (!dependsOnLiftedAxis(value))
+            continue;
+          Type target = value.getType();
+          for (Region &region : branch->getRegions()) {
+            auto terminator = cast<scf::YieldOp>(region.front().getTerminator());
+            OpBuilder builder(terminator);
+            FailureOr<Value> projected = projectPhysicalValueToSchema(
+                builder, branch.getLoc(), terminator.getOperand(index), target);
+            if (failed(projected)) {
+              branch.emitOpError("uniform branch result cannot adopt the lifted output axis");
+              return WalkResult::interrupt();
+            }
+            terminator->setOperand(index, *projected);
+          }
+          branch.getResult(index).setType(target);
+          liftedValues.insert(branch.getResult(index));
+        }
+        return WalkResult::advance();
+      }
       auto loop = dyn_cast<scf::ForOp>(yield->getParentOp());
       if (!loop)
         return WalkResult::interrupt();
