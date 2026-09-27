@@ -51,5 +51,5 @@ flaggems_addcmul,B64-C128-L4096-bf16,0.087488,0.087856,0.995811,pass,Intent targ
 flaggems_fp8_mqa_logits,Q256-K4096-H32-D128-e4m3,0.034560,0.087840,0.393443,pass,Intent target=cutile; source corpus=triton.
 flaggems_cumsum,8192x8192-fp32-axis1,0.351968,0.352048,0.999773,pass,Intent target=cutile; source corpus=triton.
 flaggems_histogram,N8388608-bins256-fp32,0.764560,1.246208,0.613509,pass,Intent target=cutile; source corpus=triton.
-flaggems_max_pool2d_with_indices,B8-C32-H128-W128-K3-S2-P1-fp16,0.018208,0.019984,0.911129,pass,Intent target=cutile; source corpus=triton.
+flaggems_max_pool2d_with_indices,B8-C32-H128-W128-K3-S2-P1-fp16,0.016160,0.019984,0.808647,pass,Intent target=cutile; source corpus=triton.
 legacy_flash_attention_bias,B4-H32-S4096-D128-fp16-vector-bias,4.944208,7.094000,0.696956,pass,Intent target=cutile; source corpus=triton. 同算法；source 额外写 LSE 和临时数据。

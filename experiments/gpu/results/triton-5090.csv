@@ -51,5 +51,5 @@ flaggems_addcmul,B64-C128-L4096-bf16,0.087856,0.087856,1.000000,pass,
 flaggems_fp8_mqa_logits,Q256-K4096-H32-D128-e4m3,0.049712,0.087840,0.565938,pass,
 flaggems_cumsum,8192x8192-fp32-axis1,0.350016,0.352048,0.994228,pass,
 flaggems_histogram,N8388608-bins256-fp32,1.099776,1.246208,0.882498,pass,
-flaggems_max_pool2d_with_indices,B8-C32-H128-W128-K3-S2-P1-fp16,0.012096,0.019984,0.605284,pass,
+flaggems_max_pool2d_with_indices,B8-C32-H128-W128-K3-S2-P1-fp16,0.012080,0.019984,0.604484,pass,
 legacy_flash_attention_bias,B4-H32-S4096-D128-fp16-vector-bias,5.199392,7.094000,0.732928,pass,同算法；source 额外写 LSE 和临时数据。

@@ -512,7 +512,7 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
     return false;
   Value fill = *projectedFill;
   if (load.getValid()) {
-    if (!load.getFill() || !sameUniformValue(load.getFill(), fill))
+    if (!load.getFill())
       return false;
   } else if (load.getFill()) {
     return false;
@@ -537,6 +537,16 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
       return failure();
     }
     fill = *projected;
+  }
+  if (load.getValid() && !sameUniformValue(load.getFill(), fill)) {
+    auto sourceFill = materializeBroadcastToFragment(
+        builder, select.getLoc(), load.getFill(), loadedType);
+    auto predicate = combinePredicates(
+        builder, select.getLoc(), loadedType, Value(), *condition);
+    if (failed(sourceFill) || failed(predicate))
+      return false;
+    fill = builder.create<SelectOp>(select.getLoc(), loadedType, *predicate,
+                                    *sourceFill, fill);
   }
   auto replacement = builder.create<LoadOp>(
       select.getLoc(), loadedType, load.getResource(), load.getCoordinates(),
