@@ -165,6 +165,12 @@ LogicalResult buildStoreTraversal(OpBuilder &builder, Location location,
     for (auto [root, rootAxis] : roots) {
       if (rootAxis != axis)
         continue;
+      // A Cartesian value can use one range in more than one occurrence.
+      // Producer replay binds the selected occurrence to the bounded traversal.
+      if (axis != chunkAxis && llvm::any_of(roots, [&](auto entry) {
+            return entry.first == root && entry.second == chunkAxis;
+          }))
+        continue;
       if (sameLogicalRange(root, range) &&
           root.getResult().getType().getAxisMaps() == type.getAxisMaps()) {
         mapping.map(root.getResult(), current.getResult());
@@ -179,7 +185,10 @@ LogicalResult buildStoreTraversal(OpBuilder &builder, Location location,
           root.getLogicalStop(), root.getSourceId(), root.getSourceAxis(), root.getDerived());
       mapping.map(root.getResult(), equivalent);
     }
-    if (!mapping.contains(range.getResult()))
+    if (!mapping.contains(range.getResult()) &&
+        (axis == chunkAxis || !llvm::any_of(roots, [&](auto entry) {
+          return entry.first == range && entry.second == chunkAxis;
+        })))
       mapping.map(range.getResult(), current.getResult());
     coordinates.push_back(current);
     auto boolean = FragmentType::get(
@@ -193,9 +202,9 @@ LogicalResult buildStoreTraversal(OpBuilder &builder, Location location,
       builder.getContext(), builder.getI1Type(), payload.getShape(),
       payload.getAxisMaps(), payload.getValidity(), payload.getOwner());
   Value valid;
-  for (Value predicate : predicates) {
+  for (auto [axis, predicate] : llvm::enumerate(predicates)) {
     FailureOr<Value> projected =
-        materializeBroadcastToFragment(builder, location, predicate, boolean);
+        projectPredicateToFragmentAxis(builder, location, predicate, boolean, axis);
     if (failed(projected))
       return failure();
     valid = valid ? Value(builder.create<BinaryOp>(
