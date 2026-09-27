@@ -28,8 +28,8 @@ mhc_apply_residual,T2048-H4096-streams4-bf16,0.100080,0.108336,0.923793,pass,Int
 gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,0.668464,0.595424,1.122669,pass,Intent target=triton; source corpus=cutile. 同算法；中间精度和舍入不同
 gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,0.106464,0.698896,0.152332,pass,Intent target=triton; source corpus=cutile. 同算法；中间精度和舍入不同
 mhc_sinkhorn,T8192-streams4-fp32,0.006608,0.018432,0.358507,pass,Intent target=triton; source corpus=cutile. 同算法；source 用 exp2(x * log2(e)) 实现 exp
-absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,0.474888,2.058936,0.230647,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用近似除法并额外输出 LSE
-splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,0.143328,0.329792,0.434601,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法
+absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,0.319264,2.058936,0.155063,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用近似除法并额外输出 LSE
+splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,0.142808,0.329792,0.433024,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法
 sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,0.301072,2.462720,0.122252,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法
 sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,0.661800,0.839920,0.787932,pass,Intent target=triton; source corpus=cutile. 同算法；source 的布局转换与辅助工作计入其调用时间
 rms_norm,8192x4096-bf16,0.087712,0.085840,1.021808,pass,Intent target=triton; source corpus=cutile. 同算法；source 额外写 Rstd
