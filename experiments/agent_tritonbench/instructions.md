@@ -49,6 +49,8 @@ install/import the execution environment here; submission invokes that environme
 Before submitting, review the complete source against TASK.md and the queried
 rules. Check the returned callable and its defaults, the result tree, runtime
 argument order, and the dtype and shape of loop state and helper results.
+Check every branch against the task's formula, coefficients and explicitly
+required intermediate dtypes or stages.
 Check that build(context) itself returns the host callable on the supplied
 profile, rather than only defining or returning from that inner callable.
 Derive shape-dependent counts from the actual input or intermediate dimensions.
@@ -59,6 +61,15 @@ dependency it expresses, including loops introduced while writing the code.
 Do this review on candidate.py; no separate planning or review file is needed.
 
 <!-- intent -->
+In that source review, match every constexpr binding to an explicitly declared
+I.Constexpr parameter; a symbol in a view shape does not declare one. Derive each
+initializer, assignment and loop carry's source and destination schemas from the
+actual tensors and documented API results, and check their compatibility.
+For each indexed expression, derive its result axes before assigning it: domain
+indices introduce independent axes, while tensor indices share a broadcasted
+index shape. Mixing the two does not implicitly pair their elements; use explicit
+size-one axes where broadcasting requires them.
+
 Intent expresses Triton-style kernel algorithms over logical domains. Retain the
 algorithm's independent work, logical groups, partial results, kernel stages and
 host orchestration; leave physical tiles, threads, layouts and pipelines to the
