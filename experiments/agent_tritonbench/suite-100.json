@@ -40,7 +40,7 @@
     {"id":"tensordot","family":"contraction","input_index":4,"tolerance":"fp16"},
     {"id":"tensordot_rsqrt","family":"contraction","input_index":5,"tolerance":"fp32"},
     {"id":"conv2d","family":"contraction","input_index":2,"tolerance":"fp32"},
-    {"id":"symmetric_mm_and_abs_sum","family":"contraction","input_index":6,"tolerance":"fp32"},
+    {"id":"symmetric_mm_and_abs_sum","family":"contraction","input_index":6,"tolerance":"fp32","description":"Compute a new intermediate D = alpha * (A @ A.T) + beta * C and return sum(abs(D)) as a scalar tensor. A and C are read-only inputs: neither input tensor is modified. The name C on the left-hand side of the upstream mathematical description denotes a local intermediate, not an in-place update of the caller's C."},
     {"id":"fused_mv_sigmoid_sub","family":"contraction","input_index":4,"tolerance":"fp32"},
     {"id":"solve","family":"linear_algebra","input_index":4,"tolerance":"linear_algebra","timing":"cuda_event"},
     {"id":"fused_cholesky_solve","family":"linear_algebra","input_index":6,"tolerance":"linear_algebra","timing":"cuda_event"},
