@@ -3572,7 +3572,9 @@ LogicalResult rankLiftPointwiseValueGraph(
   for (MakeRangeOp range : liftedRanges)
     liftedValues.insert(range.getResult());
   auto dependsOnLiftedAxis = [&](Value value) {
-    return liftedValues.contains(value) || carriesLiftedAxis(value.getType());
+    // A full collective and a scalar consumer may name the same domain.
+    // Only SSA dependence on the selected occurrence makes a value lane-varying.
+    return liftedValues.contains(value);
   };
   auto shiftedAxes = [&](ArrayRef<int64_t> axes) {
     SmallVector<int64_t> shifted;
@@ -4259,7 +4261,11 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         PhysicalSourceAxis source{coordinate.getSourceId(),
                                   coordinate.getSourceAxis(), false};
         bool covered = llvm::any_of(existingRanges, [&](MakeRangeOp range) {
-          return sourceAxisIdentity(range) == source;
+          // A collective range over the same domain does not represent this
+          // scalar workset occurrence or its independent output coordinates.
+          return sourceAxisIdentity(range) == source &&
+                 range->hasAttr(worksetCoordinateRangeAttr) &&
+                 range.getStart() == coordinate.getResult();
         });
         auto worksetAxis =
             coordinate->getAttrOfType<IntegerAttr>(worksetAxisAttr);
@@ -4798,6 +4804,13 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     llvm::SmallPtrSet<Operation *, 4> capturedRanges;
     int64_t innermostSourceAxis = -1;
     for (MakeRangeOp range : allRanges) {
+      // Workset coordinates first need ownership over their complete domain.
+      // Their construction-time singleton is not a local writeback traversal.
+      if (range->hasAttr(worksetCoordinateRangeAttr) &&
+          !reductionTraversalRanges.contains(range.getOperation()) &&
+          !structuredTraversalRanges.contains(range.getOperation()) &&
+          !range->hasAttr(sourceSubregionAttr))
+        continue;
       // Matrix blocking owns these output occurrences and their operand slices.
       // A matching source in a reduction position is not a writeback dependence.
       if (contractionOwnedStores.contains(store.getOperation()) &&
