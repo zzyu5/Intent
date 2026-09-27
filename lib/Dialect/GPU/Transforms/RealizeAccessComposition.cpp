@@ -150,17 +150,19 @@ FailureOr<Value> replayScalarValue(OpBuilder &builder, Value value,
 }
 
 FailureOr<Value> combinePredicates(OpBuilder &builder, Location location,
-                                   FragmentType valueType, Value lhs,
+                                   Type valueType, Value lhs,
                                    Value rhs) {
-  auto predicate = FragmentType::get(
-      valueType.getContext(), builder.getI1Type(), valueType.getShape(),
-      valueType.getAxisMaps(), valueType.getValidity(), valueType.getOwner());
+  Type predicate = builder.getI1Type();
+  if (auto fragment = dyn_cast<FragmentType>(valueType))
+    predicate = FragmentType::get(
+        fragment.getContext(), builder.getI1Type(), fragment.getShape(),
+        fragment.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
   for (Value *value : {&lhs, &rhs}) {
     if (!*value)
       continue;
     if ((*value).getType() != predicate) {
       FailureOr<Value> projected =
-          materializeBroadcastToFragment(builder, location, *value, predicate);
+          projectPhysicalValueToSchema(builder, location, *value, predicate);
       if (failed(projected))
         return failure();
       *value = *projected;
@@ -172,6 +174,39 @@ FailureOr<Value> combinePredicates(OpBuilder &builder, Location location,
     return lhs;
   return Value(builder.create<BinaryOp>(location, predicate, lhs, rhs,
                                         BinaryOperator::LogicalAnd));
+}
+
+FailureOr<Value> gatherBounds(OpBuilder &builder, Location location,
+                              FragmentType source, ValueRange coordinates,
+                              ArrayRef<int64_t> axes, Type indexType) {
+  Type predicate = builder.getI1Type();
+  if (auto fragment = dyn_cast<FragmentType>(indexType))
+    predicate = FragmentType::get(builder.getContext(), builder.getI1Type(),
+        fragment.getShape(), fragment.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
+  Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+  auto lower = projectPhysicalValueToSchema(builder, location, zero, indexType);
+  if (failed(lower))
+    return failure();
+  Value valid;
+  for (auto [coordinate, axis] : llvm::zip(coordinates, axes)) {
+    auto projected = projectPhysicalValueToSchema(builder, location, coordinate, indexType);
+    auto extent = cast<PhysicalExprAttr>(source.getShape()[axis]);
+    Value bound = extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant)
+        ? Value(builder.create<arith::ConstantIndexOp>(location, extent.getValue()))
+        : Value(builder.create<PhysicalExprOp>(location, builder.getIndexType(), extent));
+    auto upper = projectPhysicalValueToSchema(builder, location, bound, indexType);
+    if (failed(projected) || failed(upper))
+      return failure();
+    Value nonnegative = builder.create<CompareOp>(location, predicate,
+        *projected, *lower, ComparePredicate::Ge);
+    Value below = builder.create<CompareOp>(location, predicate,
+        *projected, *upper, ComparePredicate::Lt);
+    Value bounded = builder.create<BinaryOp>(location, predicate,
+        nonnegative, below, BinaryOperator::LogicalAnd);
+    valid = valid ? Value(builder.create<BinaryOp>(location, predicate,
+        valid, bounded, BinaryOperator::LogicalAnd)) : bounded;
+  }
+  return valid;
 }
 
 bool foldIndexRecompositions(func::FuncOp kernel) {
@@ -565,13 +600,13 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
 FailureOr<bool> composeReshapedGather(GatherOp gather) {
   auto reshape = gather.getSource().getDefiningOp<ReshapeOp>();
   auto result = dyn_cast<FragmentType>(gather.getResult().getType());
-  if (!reshape || !result)
+  if (!reshape)
     return false;
   auto source = cast<FragmentType>(reshape.getValue().getType());
   auto shaped = cast<FragmentType>(reshape.getResult().getType());
   // Scalar indexing is a rectangular extraction in the reshaped layout.
   // Flattening it can turn a native split into a strided fragment gather.
-  if (!gather.getCoordinates().empty() &&
+  if (result && !gather.getCoordinates().empty() &&
       llvm::all_of(llvm::zip(gather.getCoordinates(), gather.getSourceAxes()),
                    [&](auto entry) {
         Value coordinate = std::get<0>(entry);
@@ -637,6 +672,8 @@ FailureOr<bool> composeReshapedGather(GatherOp gather) {
   for (unsigned axis = 0; axis < coordinates.size(); ++axis) {
     if (coordinates[axis])
       continue;
+    if (!result)
+      return false;
     auto mapping = cast<AxisMapAttr>(shaped.getAxisMaps()[axis]);
     auto projection = queryFragmentAxis(result, sourceAxisIdentity(mapping),
                                         mapping.getDimensionId());
@@ -647,9 +684,15 @@ FailureOr<bool> composeReshapedGather(GatherOp gather) {
   }
   OpBuilder builder(gather);
   Location location = gather.getLoc();
-  auto indexType = FragmentType::get(
-      result.getContext(), builder.getIndexType(), result.getShape(),
-      result.getAxisMaps(), result.getValidity(), result.getOwner());
+  Type indexType = builder.getIndexType();
+  if (result)
+    indexType = FragmentType::get(
+        result.getContext(), builder.getIndexType(), result.getShape(),
+        result.getAxisMaps(), result.getValidity(), result.getOwner());
+  auto indexValue = [&](Value value) -> Value {
+    return result ? Value(builder.create<SplatOp>(location, indexType, value))
+                  : value;
+  };
   auto extentValue = [&](Attribute attribute) -> Value {
     auto extent = cast<PhysicalExprAttr>(attribute);
     if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant))
@@ -680,7 +723,7 @@ FailureOr<bool> composeReshapedGather(GatherOp gather) {
     if (!element.isIndex()) {
       Type target = builder.getIndexType();
       if (auto fragment = dyn_cast<FragmentType>(coordinate.getType()))
-        target = FragmentType::get(result.getContext(), builder.getIndexType(),
+        target = FragmentType::get(builder.getContext(), builder.getIndexType(),
             fragment.getShape(), fragment.getAxisMaps(), fragment.getValidity(),
             fragment.getOwner());
       coordinate = builder.create<CastOp>(location, target, coordinate);
@@ -702,10 +745,9 @@ FailureOr<bool> composeReshapedGather(GatherOp gather) {
           coordinates[resultPrefix + group.getResultAxes()[0]];
       continue;
     }
-    Value ordinal = builder.create<SplatOp>(location, indexType, zero);
+    Value ordinal = indexValue(zero);
     for (int64_t axis : group.getResultAxes().asArrayRef()) {
-      Value extent = builder.create<SplatOp>(location, indexType,
-          extentValue(shaped.getShape()[resultPrefix + axis]));
+      Value extent = indexValue(extentValue(shaped.getShape()[resultPrefix + axis]));
       ordinal = builder.create<BinaryOp>(location, indexType, ordinal, extent,
                                         BinaryOperator::Multiply);
       ordinal = builder.create<BinaryOp>(location, indexType, ordinal,
@@ -716,8 +758,7 @@ FailureOr<bool> composeReshapedGather(GatherOp gather) {
       unsigned axis = sourcePrefix + axes[position];
       Value coordinate = ordinal;
       if (position != 0) {
-        Value extent = builder.create<SplatOp>(location, indexType,
-                                              extentValue(source.getShape()[axis]));
+        Value extent = indexValue(extentValue(source.getShape()[axis]));
         coordinate = builder.create<BinaryOp>(location, indexType, ordinal, extent,
                                               BinaryOperator::Remainder);
         ordinal = builder.create<BinaryOp>(location, indexType, ordinal, extent,
@@ -727,34 +768,40 @@ FailureOr<bool> composeReshapedGather(GatherOp gather) {
     }
   }
   SmallVector<int64_t> axes;
-  auto predicate = FragmentType::get(result.getContext(), builder.getI1Type(),
-      result.getShape(), result.getAxisMaps(), result.getValidity(), result.getOwner());
+  Type predicate = builder.getI1Type();
+  if (result)
+    predicate = FragmentType::get(result.getContext(), builder.getI1Type(),
+        result.getShape(), result.getAxisMaps(), result.getValidity(), result.getOwner());
   Value valid = gather.getValid();
-  Value lower = builder.create<SplatOp>(location, indexType, zero);
+  Value lower = indexValue(zero);
   for (unsigned axis = 0; axis < selected.size(); ++axis)
   {
     axes.push_back(axis);
-    Value upper = builder.create<SplatOp>(location, indexType,
-                                         extentValue(source.getShape()[axis]));
+    Value upper = indexValue(extentValue(source.getShape()[axis]));
     Value nonnegative = builder.create<CompareOp>(location, predicate,
         selected[axis], lower, ComparePredicate::Ge);
     Value below = builder.create<CompareOp>(location, predicate,
         selected[axis], upper, ComparePredicate::Lt);
     Value bounded = builder.create<BinaryOp>(location, predicate, nonnegative,
                                             below, BinaryOperator::LogicalAnd);
-    auto combined = combinePredicates(builder, location, result, valid, bounded);
+    auto combined = combinePredicates(builder, location, gather.getResult().getType(), valid, bounded);
     if (failed(combined))
       return failure();
     valid = *combined;
   }
   Value fill = gather.getFill();
   if (!fill) {
-    auto zeroFill = materializeZeroFragment(builder, location, result);
-    if (failed(zeroFill))
-      return failure();
-    fill = *zeroFill;
+    if (result) {
+      auto zeroFill = materializeZeroFragment(builder, location, result);
+      if (failed(zeroFill))
+        return failure();
+      fill = *zeroFill;
+    } else {
+      fill = builder.create<arith::ConstantOp>(
+          location, builder.getZeroAttr(gather.getResult().getType()));
+    }
   }
-  auto replacement = builder.create<GatherOp>(location, result, reshape.getValue(),
+  auto replacement = builder.create<GatherOp>(location, gather.getResult().getType(), reshape.getValue(),
       selected, valid, fill, axes);
   if (Attribute origin = gather->getAttr(originAttr))
     replacement->setAttr(originAttr, origin);
@@ -793,7 +840,7 @@ FailureOr<bool> composePointwiseGather(GatherOp gather) {
   auto source = dyn_cast<FragmentType>(gather.getSource().getType());
   auto result = dyn_cast<FragmentType>(gather.getResult().getType());
   Operation *producer = gather.getSource().getDefiningOp();
-  if (!source || !result || !producer ||
+  if (!source || !producer ||
       !isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp,
            BroadcastOp, SplatOp, ReshapeOp>(producer) ||
       gather.getSourceAxes().size() != source.getShape().size())
@@ -886,13 +933,17 @@ FailureOr<bool> composePointwiseGather(GatherOp gather) {
   }
   OpBuilder builder(gather);
   IRMapping mapping;
+  auto selectedTypeFor = [&](Type element) -> Type {
+    return result ? Type(FragmentType::get(
+                        result.getContext(), element, result.getShape(),
+                        result.getAxisMaps(), result.getValidity(), result.getOwner()))
+                  : element;
+  };
   for (auto [operand, axes] : llvm::zip(producer->getOperands(), operandAxes)) {
     auto input = dyn_cast<FragmentType>(operand.getType());
     if (!input || mapping.contains(operand))
       continue;
-    auto selectedType = FragmentType::get(
-        result.getContext(), input.getElementType(), result.getShape(),
-        result.getAxisMaps(), result.getValidity(), result.getOwner());
+    Type selectedType = selectedTypeFor(input.getElementType());
     SmallVector<Value> selectedCoordinates;
     SmallVector<int64_t> selectedAxes;
     for (auto [axis, sourceAxis] : llvm::enumerate(axes)) {
@@ -902,9 +953,7 @@ FailureOr<bool> composePointwiseGather(GatherOp gather) {
       Type element = coordinate.getType();
       if (auto fragment = dyn_cast<FragmentType>(element))
         element = fragment.getElementType();
-      auto indexType = FragmentType::get(
-          result.getContext(), element, result.getShape(), result.getAxisMaps(),
-          result.getValidity(), result.getOwner());
+      Type indexType = selectedTypeFor(element);
       FailureOr<Value> projected = projectPhysicalValueToSchema(
           builder, gather.getLoc(), coordinate, indexType);
       if (failed(projected))
@@ -914,10 +963,15 @@ FailureOr<bool> composePointwiseGather(GatherOp gather) {
     }
     Value fill;
     if (gather.getValid()) {
-      FailureOr<Value> zero = materializeZeroFragment(builder, gather.getLoc(), selectedType);
-      if (failed(zero))
-        return failure();
-      fill = *zero;
+      if (auto fragment = dyn_cast<FragmentType>(selectedType)) {
+        FailureOr<Value> zero = materializeZeroFragment(builder, gather.getLoc(), fragment);
+        if (failed(zero))
+          return failure();
+        fill = *zero;
+      } else {
+        fill = builder.create<arith::ConstantOp>(gather.getLoc(),
+                                                builder.getZeroAttr(selectedType));
+      }
     }
     mapping.map(operand, builder.create<GatherOp>(
         gather.getLoc(), selectedType, operand, selectedCoordinates,
@@ -928,17 +982,125 @@ FailureOr<bool> composePointwiseGather(GatherOp gather) {
   // use zero (also a valid cast input); restore the original gather fill after
   // evaluating the unchanged typed operation.
   Value value;
-  if (positionalRebind) {
-    value = mapping.lookup(producer->getOperand(0));
+  Type resultType = gather.getResult().getType();
+  if (positionalRebind || isa<BroadcastOp, SplatOp>(producer)) {
+    auto projected = projectPhysicalValueToSchema(
+        builder, gather.getLoc(), mapping.lookupOrDefault(producer->getOperand(0)),
+        resultType);
+    if (failed(projected))
+      return failure();
+    value = *projected;
   } else {
     Operation *replacement = builder.clone(*producer, mapping);
-    replacement->getResult(0).setType(result);
+    replacement->getResult(0).setType(resultType);
     value = replacement->getResult(0);
   }
   if (gather.getValid())
-    value = builder.create<SelectOp>(gather.getLoc(), result, gather.getValid(),
+    value = builder.create<SelectOp>(gather.getLoc(), resultType, gather.getValid(),
                                      value, gather.getFill());
   gather.getResult().replaceAllUsesWith(value);
+  gather.erase();
+  return true;
+}
+
+FailureOr<bool> composeReducedGather(GatherOp gather) {
+  auto reduce = gather.getSource().getDefiningOp<ReduceOp>();
+  auto output = dyn_cast<FragmentType>(gather.getSource().getType());
+  if (!reduce || !output || isa<FragmentType>(gather.getResult().getType()) ||
+      reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 ||
+      reduce.getCaptureCount() != 0 || reduce.getNumResults() != 1 ||
+      gather.getSourceAxes().size() != output.getShape().size() ||
+      !queryBinaryCombineKind(reduce.getCombine()) ||
+      std::distance(reduce.getCombine().front().begin(),
+                    reduce.getCombine().front().end()) != 2)
+    return false;
+
+  auto input = cast<FragmentType>(reduce.getInputs().front().getType());
+  auto kernel = gather->getParentOfType<func::FuncOp>();
+  PhysicalProgramAnalysis analysis(kernel);
+  SmallVector<Value> freeCoordinates(output.getShape().size());
+  for (auto [coordinate, axis] :
+       llvm::zip(gather.getCoordinates(), gather.getSourceAxes())) {
+    if (axis < 0 || axis >= static_cast<int64_t>(freeCoordinates.size()) ||
+        freeCoordinates[axis] || isa<FragmentType>(coordinate.getType()))
+      return false;
+    freeCoordinates[axis] = coordinate;
+  }
+  SmallVector<Attribute> shape;
+  for (unsigned axis = 0; axis < input.getShape().size(); ++axis) {
+    if (!llvm::is_contained(reduce.getAxes(), static_cast<int64_t>(axis)))
+      continue;
+    auto range = queryExactLogicalRange(analysis.axisRanges(reduce.getInputs()[0], axis));
+    auto extent = cast<PhysicalExprAttr>(input.getShape()[axis]);
+    if (failed(range) ||
+        extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+        extent.getValue() <= 0 ||
+        constantLogicalRangeCardinality(*range) != extent.getValue())
+      return false;
+    shape.push_back(extent);
+  }
+
+  // Select complete reduction fibers from immutable SSA. Loads remain behind
+  // gathers until composeLoadGather proves that moving each read is legal.
+  OpBuilder builder(gather);
+  Location location = gather.getLoc();
+  auto [sourceId, dimensionId] = nextPhysicalAxisIdentities(kernel);
+  SmallVector<Attribute> mappings;
+  SmallVector<Value> coordinates;
+  SmallVector<int64_t> sourceAxes;
+  SmallVector<int64_t> reductionAxes;
+  unsigned freeAxis = 0, reductionAxis = 0;
+  Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+  Value one = builder.create<arith::ConstantIndexOp>(location, 1);
+  for (unsigned axis = 0; axis < input.getShape().size(); ++axis) {
+    sourceAxes.push_back(axis);
+    if (!llvm::is_contained(reduce.getAxes(), static_cast<int64_t>(axis))) {
+      coordinates.push_back(freeCoordinates[freeAxis++]);
+      continue;
+    }
+    auto extent = cast<PhysicalExprAttr>(shape[reductionAxis]);
+    auto mapping = AxisMapAttr::get(builder.getContext(), sourceId,
+                                    reductionAxis, dimensionId++, reductionAxis, true);
+    mappings.push_back(mapping);
+    auto rangeType = FragmentType::get(builder.getContext(), builder.getIndexType(),
+        builder.getArrayAttr({extent}), builder.getArrayAttr({AxisMapAttr::get(
+            builder.getContext(), sourceId, reductionAxis, mapping.getDimensionId(), 0, true)}),
+        input.getValidity(), input.getOwner());
+    Value stop = builder.create<arith::ConstantIndexOp>(location, extent.getValue());
+    coordinates.push_back(builder.create<MakeRangeOp>(
+        location, rangeType, zero, stop, one, zero, stop, sourceId, reductionAxis, true));
+    reductionAxes.push_back(reductionAxis++);
+  }
+  auto selectedType = FragmentType::get(builder.getContext(), input.getElementType(),
+      builder.getArrayAttr(shape), builder.getArrayAttr(mappings),
+      input.getValidity(), input.getOwner());
+  auto bounded = gatherBounds(builder, location, output, gather.getCoordinates(),
+                              gather.getSourceAxes(), builder.getIndexType());
+  if (failed(bounded))
+    return failure();
+  auto predicate = FragmentType::get(builder.getContext(), builder.getI1Type(),
+      selectedType.getShape(), selectedType.getAxisMaps(),
+      selectedType.getValidity(), selectedType.getOwner());
+  Value valid = builder.create<BroadcastOp>(location, predicate, *bounded);
+  auto zeroFill = materializeZeroFragment(builder, location, selectedType);
+  if (failed(zeroFill))
+    return failure();
+  Value selected = builder.create<GatherOp>(location, selectedType,
+      reduce.getInputs()[0], coordinates, valid, *zeroFill, sourceAxes);
+  Type resultType = gather.getResult().getType();
+  Value identityFill = builder.create<arith::ConstantOp>(location, builder.getZeroAttr(resultType));
+  Value identity = builder.create<GatherOp>(location, resultType,
+      reduce.getInputs()[1], gather.getCoordinates(), *bounded,
+      identityFill, gather.getSourceAxes());
+  auto projected = builder.create<ReduceOp>(location, TypeRange{resultType},
+      ValueRange{selected, identity}, reductionAxes, 1, 1, 0);
+  if (failed(scalarizeElementwiseCallback(reduce.getCombine(), projected.getCombine())))
+    return failure();
+  Value replacement = projected.getResult(0);
+  if (gather.getValid())
+    replacement = builder.create<SelectOp>(location, resultType, gather.getValid(),
+                                           replacement, gather.getFill());
+  gather.getResult().replaceAllUsesWith(replacement);
   gather.erase();
   return true;
 }
@@ -999,7 +1161,9 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
   // Earlier rewrites may have created gathers in the source mask or fill.
   // Let the existing composition worklist normalize those producers before
   // committing this rewrite, which must replay both at the selected positions.
-  for (Value value : {sourceLoad.getValid(), sourceLoad.getFill()})
+  SmallVector<Value> replayInputs(sourceLoad.getCoordinates());
+  replayInputs.append({sourceLoad.getValid(), sourceLoad.getFill()});
+  for (Value value : replayInputs)
     if (value && isa<FragmentType>(value.getType()) &&
         !analysis.replayability(value, std::nullopt,
                                 PhysicalReplayScope::Coordinate,
@@ -1016,54 +1180,21 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
   }
   SmallVector<Value> coordinates(originalCoordinates);
   IRMapping replay;
-  for (auto [coordinate, sourceAxis] :
-       llvm::zip(gather.getCoordinates(), gather.getSourceAxes())) {
-    if (sourceAxis < 0 ||
-        sourceAxis >= static_cast<int64_t>(sourceType.getShape().size())) {
-      gather.emitOpError("gather source axis is outside its loaded value");
-      return failure();
-    }
-    FailureOr<AxisMapAttr> mapping =
-        queryAxisMap(sourceType, static_cast<unsigned>(sourceAxis));
-    if (failed(mapping)) {
-      gather.emitOpError("gather source axis lost coordinate provenance");
-      return failure();
-    }
-    FailureOr<unsigned> target =
-        analysis.accessCoordinatePosition(sourceLoad, *mapping, loaded);
-    if (failed(target)) {
-      gather.emitOpError(
-          "loaded source coordinate cannot be composed with gather indexing");
-      return failure();
-    }
-    Value original = originalCoordinates[*target];
-    auto range = original.getDefiningOp<MakeRangeOp>();
-    if (!range) {
-      auto coordinateType = dyn_cast<FragmentType>(original.getType());
-      PhysicalAxisProjection axis = queryFragmentAxis(
-          original.getType(), sourceAxisIdentity(*mapping),
-          mapping->getDimensionId());
-      if (!coordinateType || !axis.isExact())
-        return false;
-      PhysicalRangeFact roots = analysis.axisRanges(original, axis.fragmentAxis);
-      if (!roots.isUnique() ||
-          !analysis.replayability(original, std::nullopt,
-                                  PhysicalReplayScope::Coordinate,
-                                  /*allowAccesses=*/false).isReplayable())
-        return false;
-      range = roots.roots.front();
-      if (coordinateType.getShape()[axis.fragmentAxis] !=
-          range.getResult().getType().getShape()[0])
-        return false;
-      for (auto [position, extent] : llvm::enumerate(coordinateType.getShape())) {
-        auto expression = cast<PhysicalExprAttr>(extent);
-        if (position != axis.fragmentAxis &&
-            (expression.getKind() !=
-                 static_cast<uint32_t>(PhysicalExprKind::Constant) ||
-             expression.getValue() != 1))
-          return false;
-      }
-    }
+  SmallVector<MakeRangeOp> selectedRanges;
+  llvm::SmallDenseSet<Value> selectedRoots;
+  for (int64_t sourceAxis : gather.getSourceAxes()) {
+    if (sourceAxis < 0 || sourceAxis >= static_cast<int64_t>(sourceType.getShape().size()))
+      return gather.emitOpError("gather source axis is outside its loaded value");
+    auto root = queryExactLogicalRange(analysis.axisRanges(
+        gather.getSource(), static_cast<unsigned>(sourceAxis)));
+    if (failed(root) ||
+        (*root).getResult().getType().getShape()[0] != sourceType.getShape()[sourceAxis] ||
+        !selectedRoots.insert((*root).getResult()).second)
+      return false;
+    selectedRanges.push_back(*root);
+  }
+  for (auto [coordinate, range] :
+       llvm::zip(gather.getCoordinates(), selectedRanges)) {
     // The ordinal of a retained slice often subtracts its original base.
     // Compose the inverse translation before rebuilding the access: keeping
     // start + (coordinate - start) would hide the original range's bounds.
@@ -1111,36 +1242,10 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
             BinaryOperator::Add);
     }
     replay.map(range.getResult(), coordinate);
-    if (original != range.getResult()) {
-      FailureOr<Value> selected = resultType
-          ? replayFragmentValue(builder, original, resultType, replay, analysis)
-          : replayScalarValue(builder, original, replay, analysis);
-      if (failed(selected))
-        return gather.emitOpError("indexed load coordinate cannot follow its source range");
-      coordinate = *selected;
-    }
-    replay.map(original, coordinate);
-    coordinates[*target] = coordinate;
   }
 
   if (resultType) {
-    for (auto [slot, original] : llvm::enumerate(originalCoordinates)) {
-      if (replay.lookupOrNull(original) || !isa<FragmentType>(original.getType()))
-        continue;
-      auto coordinateType = cast<FragmentType>(original.getType());
-      auto indexType = FragmentType::get(
-          resultType.getContext(), coordinateType.getElementType(),
-          resultType.getShape(), resultType.getAxisMaps(),
-          resultType.getValidity(), resultType.getOwner());
-      FailureOr<Value> projected = projectPhysicalValueToSchema(
-          builder, gather.getLoc(), original, indexType);
-      if (failed(projected))
-        return gather.emitOpError(
-            "retained load coordinate cannot adopt the gather result relation");
-      coordinates[slot] = *projected;
-      replay.map(original, *projected);
-    }
-    for (Value predicateOrFill : {sourceLoad.getValid(), sourceLoad.getFill()}) {
+    for (Value predicateOrFill : replayInputs) {
       if (!predicateOrFill)
         continue;
       PhysicalRangeFact roots = analysis.sourceRanges(predicateOrFill);
@@ -1178,6 +1283,17 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
         replay.map(range.getResult(), *projectedRange);
       }
     }
+  }
+
+  // A storage coordinate may combine several logical axes (for example a
+  // reshaped row and column). Bind every selected range before replaying it.
+  for (auto [slot, original] : llvm::enumerate(originalCoordinates)) {
+    FailureOr<Value> selected = resultType
+        ? replayFragmentValue(builder, original, resultType, replay, analysis)
+        : replayScalarValue(builder, original, replay, analysis);
+    if (failed(selected))
+      return gather.emitOpError("indexed load coordinate cannot follow its source ranges");
+    coordinates[slot] = *selected;
   }
 
   if (!resultType) {
@@ -1732,76 +1848,70 @@ FailureOr<bool> composeBroadcastGather(GatherOp gather) {
   for (Value coordinate : gather.getCoordinates()) {
     if (!uniformElementType(coordinate.getType()).isIndex())
       return false;
+    Value scalar = coordinate;
+    while (isa<FragmentType>(scalar.getType())) {
+      UniformExpression expression = describeUniformValue(scalar);
+      if (expression.kind != UniformKind::Forward || expression.operands.size() != 1)
+        break;
+      scalar = expression.operands.front();
+    }
+    if (!isa<FragmentType>(scalar.getType()))
+      coordinate = scalar;
     if (auto fragment = dyn_cast<FragmentType>(coordinate.getType());
         fragment && (!indexSchema || fragment.getShape().size() >
                                        indexSchema.getShape().size()))
       indexSchema = fragment;
     coordinates.push_back(coordinate);
   }
-  if (!indexSchema || indexSchema.getOwner() != result.getOwner() ||
-      indexSchema.getShape().size() >= result.getShape().size())
-    return false;
-  auto expansion = queryBroadcastProjection(indexSchema, result);
-  if (!expansion.isExact())
-    return false;
-  for (Value coordinate : coordinates) {
-    auto fragment = dyn_cast<FragmentType>(coordinate.getType());
-    if (!fragment)
-      continue;
-    auto projection = queryBroadcastProjection(fragment, indexSchema);
-    auto original = queryBroadcastProjection(fragment, result);
-    if (!projection.isExact() || !original.isExact())
+  if (indexSchema) {
+    if (indexSchema.getOwner() != result.getOwner() ||
+        indexSchema.getShape().size() >= result.getShape().size())
       return false;
-    for (auto [axis, indexAxis] : llvm::enumerate(expansion.targetToSource))
-      if ((indexAxis ? projection.targetToSource[*indexAxis] : std::nullopt) !=
-          original.targetToSource[axis])
+    auto expansion = queryBroadcastProjection(indexSchema, result);
+    if (!expansion.isExact())
+      return false;
+    for (Value coordinate : coordinates) {
+      auto fragment = dyn_cast<FragmentType>(coordinate.getType());
+      if (!fragment)
+        continue;
+      auto projection = queryBroadcastProjection(fragment, indexSchema);
+      auto original = queryBroadcastProjection(fragment, result);
+      if (!projection.isExact() || !original.isExact())
         return false;
+      for (auto [axis, indexAxis] : llvm::enumerate(expansion.targetToSource))
+        if ((indexAxis ? projection.targetToSource[*indexAxis] : std::nullopt) !=
+            original.targetToSource[axis])
+          return false;
+    }
   }
 
   OpBuilder builder(gather);
   Location location = gather.getLoc();
-  auto selectedType = FragmentType::get(
-      result.getContext(), result.getElementType(), indexSchema.getShape(),
-      indexSchema.getAxisMaps(), indexSchema.getValidity(), result.getOwner());
-  auto predicateType = FragmentType::get(
-      result.getContext(), builder.getI1Type(), indexSchema.getShape(),
-      indexSchema.getAxisMaps(), indexSchema.getValidity(), result.getOwner());
-  Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
-  Value lower = builder.create<SplatOp>(location, indexSchema, zero);
-  Value valid;
-  for (auto [coordinate, axis] :
-       llvm::zip(coordinates, gather.getSourceAxes())) {
-    auto projected = projectPhysicalValueToSchema(
-        builder, location, coordinate, indexSchema);
-    if (failed(projected))
-      return gather.emitOpError("gather lost its exact index broadcast relation");
-    coordinate = *projected;
-    auto extent = cast<PhysicalExprAttr>(source.getShape()[axis]);
-    Value upper = extent.getKind() ==
-                          static_cast<uint32_t>(PhysicalExprKind::Constant)
-                      ? Value(builder.create<arith::ConstantIndexOp>(
-                            location, extent.getValue()))
-                      : Value(builder.create<PhysicalExprOp>(
-                            location, builder.getIndexType(), extent));
-    upper = builder.create<SplatOp>(location, indexSchema, upper);
-    Value nonnegative = builder.create<CompareOp>(
-        location, predicateType, coordinate, lower, ComparePredicate::Ge);
-    Value below = builder.create<CompareOp>(
-        location, predicateType, coordinate, upper, ComparePredicate::Lt);
-    Value bounded = builder.create<BinaryOp>(
-        location, predicateType, nonnegative, below, BinaryOperator::LogicalAnd);
-    valid = valid ? Value(builder.create<BinaryOp>(
-                        location, predicateType, valid, bounded,
-                        BinaryOperator::LogicalAnd))
-                  : bounded;
+  auto selectedTypeFor = [&](Type element) -> Type {
+    return indexSchema ? Type(FragmentType::get(
+        result.getContext(), element, indexSchema.getShape(),
+        indexSchema.getAxisMaps(), indexSchema.getValidity(), result.getOwner()))
+        : element;
+  };
+  Type selectedType = selectedTypeFor(result.getElementType());
+  Type indexType = selectedTypeFor(builder.getIndexType());
+  auto valid = gatherBounds(builder, location, source, coordinates,
+                            gather.getSourceAxes(), indexType);
+  if (failed(valid))
+    return gather.emitOpError("gather lost its exact index broadcast relation");
+  Value fill;
+  if (auto fragment = dyn_cast<FragmentType>(selectedType)) {
+    auto zeroFill = materializeZeroFragment(builder, location, fragment);
+    if (failed(zeroFill))
+      return failure();
+    fill = *zeroFill;
+  } else {
+    fill = builder.create<arith::ConstantOp>(location, builder.getZeroAttr(selectedType));
   }
-  auto fill = materializeZeroFragment(builder, location, selectedType);
-  if (failed(fill))
-    return failure();
   // Only indices determine the immutable SSA read. Keep its own bounds before
   // broadcasting; the original lane-dependent predicate and fill remain below.
   Value selected = builder.create<GatherOp>(
-      location, selectedType, gather.getSource(), coordinates, valid, *fill,
+      location, selectedType, gather.getSource(), coordinates, *valid, fill,
       gather.getSourceAxes());
   Value expanded = builder.create<BroadcastOp>(location, result, selected);
   auto replacement = builder.create<SelectOp>(
@@ -3056,6 +3166,13 @@ LogicalResult realizeAccessComposition(ModuleOp module) {
       if (failed(pointwise))
         return failure();
       if (*pointwise) {
+        changed = true;
+        continue;
+      }
+      FailureOr<bool> reduced = composeReducedGather(gather);
+      if (failed(reduced))
+        return failure();
+      if (*reduced) {
         changed = true;
         continue;
       }

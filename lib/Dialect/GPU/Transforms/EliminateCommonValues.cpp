@@ -103,11 +103,18 @@ widenedConstantReciprocal(const llvm::APFloat &divisor) {
 bool foldConstantSelection(SelectOp select) {
   if (!select)
     return false;
-  auto condition = uniformBoolean(
-      UniformValueAnalysis(describeUniformValue).evaluate(select.getCondition()));
-  if (!condition)
-    return false;
-  Value selected = *condition ? select.getTrueValue() : select.getFalseValue();
+  UniformValueAnalysis analysis(describeUniformValue);
+  Value selected;
+  Attribute trueValue = analysis.evaluate(select.getTrueValue());
+  if (select.getTrueValue() == select.getFalseValue() ||
+      (trueValue && trueValue == analysis.evaluate(select.getFalseValue())))
+    selected = select.getTrueValue();
+  else {
+    auto condition = uniformBoolean(analysis.evaluate(select.getCondition()));
+    if (!condition)
+      return false;
+    selected = *condition ? select.getTrueValue() : select.getFalseValue();
+  }
   if (selected.getType() != select.getResult().getType())
     return false;
   select.getResult().replaceAllUsesWith(selected);
