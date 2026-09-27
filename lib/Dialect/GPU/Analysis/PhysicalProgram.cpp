@@ -3247,9 +3247,20 @@ void PhysicalProgramAnalysis::collectAxisRanges(
         // Address coordinates do not vary along this introduced unit axis.
         // Validity or fill may still carry a traversal, so retain their roots
         // instead of mistaking an unexpanded range for a uniform value.
-        for (Value dependency : {load.getValid(), load.getFill()})
-          if (dependency)
-            collectAxisRanges(dependency, fragmentAxis, result, visited);
+        for (Value dependency : {load.getValid(), load.getFill()}) {
+          auto type = dependency ? dyn_cast<FragmentType>(dependency.getType())
+                                 : FragmentType();
+          if (!type)
+            continue;
+          auto projection = queryAxisProjection(type, fragment);
+          if (!projection.isExact()) {
+            result.state = PhysicalFactState::Unknown;
+            appendUnique(result.blockers, operation);
+            continue;
+          }
+          if (auto axis = projection.targetToSource[fragmentAxis])
+            collectAxisRanges(dependency, *axis, result, visited);
+        }
         return;
       }
       result.state = PhysicalFactState::Unknown;
