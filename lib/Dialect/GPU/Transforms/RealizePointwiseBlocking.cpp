@@ -4605,6 +4605,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   });
   llvm::SmallPtrSet<Operation *, 32> contractionTraversalRanges;
   llvm::SmallPtrSet<Operation *, 8> contractionOwnedRanges;
+  llvm::SmallPtrSet<Operation *, 8> contractionOwnedStores;
   kernel.walk([&](ContractOp contract) {
     auto collectConsumedAxes = [&](Value operand, ArrayRef<int64_t> axes) {
       auto type = cast<FragmentType>(operand.getType());
@@ -4651,6 +4652,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           for (MakeRangeOp range : axis.ranges.roots)
             contractionOwnedRanges.insert(range.getOperation());
         for (StoreOp store : stores) {
+          contractionOwnedStores.insert(store.getOperation());
           collectCoordinateRanges(store.getValue(), contractionOwnedRanges);
           for (Value coordinate : store.getCoordinates())
             collectCoordinateRanges(coordinate, contractionOwnedRanges);
@@ -4796,6 +4798,11 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     llvm::SmallPtrSet<Operation *, 4> capturedRanges;
     int64_t innermostSourceAxis = -1;
     for (MakeRangeOp range : allRanges) {
+      // Matrix blocking owns these output occurrences and their operand slices.
+      // A matching source in a reduction position is not a writeback dependence.
+      if (contractionOwnedStores.contains(store.getOperation()) &&
+          contractionOwnedRanges.contains(range.getOperation()))
+        continue;
       bool structuredFreeAxis =
           structuredTraversalRanges.contains(range.getOperation()) &&
           !reductionTraversalRanges.contains(range.getOperation());
