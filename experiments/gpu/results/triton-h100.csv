@@ -8,9 +8,9 @@ flash_cross_entropy,8192x32768-bf16,0.248640,0.279936,0.309712,1.125869,1.245624
 flash_layer_norm,8192x4096-bf16,0.051392,0.050720,0.054752,0.986924,1.065380,pass,pass,,Intent target=cutile; source corpus=triton.
 rotary_embedding,B4-S4096-H32-D128-bf16,0.098352,0.097248,0.100032,0.988775,1.017082,pass,pass,,Intent target=cutile; source corpus=triton.
 swiglu,8192x14336-bf16,0.239104,0.243528,0.242568,1.018502,1.014487,pass,pass,,Intent target=cutile; source corpus=triton.
-embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.089520,0.094096,0.094752,1.051117,1.058445,pass,pass,,Intent target=cutile; source corpus=triton.
+embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.089520,0.095152,0.094752,1.062913,1.058445,pass,pass,,Intent target=cutile; source corpus=triton.
 cross_entropy,8192x32768-bf16,0.732592,1.033336,0.856400,1.410520,1.169000,pass,pass,,Intent target=cutile; source corpus=triton.
-padded_rope_cache_update,B32-QH32-KVH8-D128-cache8192-fp16,0.005952,0.008368,0.008288,1.405914,1.392473,pass,pass,,Intent target=cutile; source corpus=triton.
+padded_rope_cache_update,B32-QH32-KVH8-D128-cache8192-fp16,0.005952,0.006208,0.008288,1.043011,1.392473,pass,pass,,Intent target=cutile; source corpus=triton.
 fused_add_rms_norm,8192x4096-bf16,0.094384,0.094352,0.094104,0.999661,0.997033,pass,pass,,Intent target=cutile; source corpus=triton.
 rms_norm,8192x4096-bf16,0.050296,0.050128,0.050496,0.996660,1.003976,pass,pass,,Intent target=cutile; source corpus=triton.
 xformers_rms_norm,8192x4096-bf16,0.049856,0.048920,0.050224,0.981226,1.007381,pass,pass,,Intent target=cutile; source corpus=triton.
