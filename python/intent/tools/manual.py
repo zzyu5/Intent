@@ -175,7 +175,7 @@ class Manual:
                 "total": len(results)}
 
     def api(self, name: str) -> dict:
-        """Call api(name=...) for an exact declaration and rule IDs; use read(id=...) for rule text."""
+        """Get an exact declaration and its language rules; read(id=...) includes nested sections."""
         name = name.removeprefix("intent.language.").removeprefix("I.")
         entry = self.corpus["symbols"].get(name)
         if entry is None:
@@ -183,11 +183,12 @@ class Manual:
         return {"status": "declared", "revision": self.corpus["revision"],
                 **{key: value for key, value in entry.items() if key != "sections"},
                 "signature_note": None if entry["signature"] else "No inspectable signature is declared; consult the linked rules, not a guessed signature.",
-                "rules": [{field: self.corpus["documents"][key][field]
-                           for field in ("id", "title", "source", "line")}
+                "rules": [{**{field: self.corpus["documents"][key][field]
+                              for field in ("id", "title", "source", "line")},
+                           "text": self._section_bodies[key]}
                           for key in entry["sections"]
                           if self.corpus["documents"][key]["kind"] == "concept"],
-                "read_note": "Read the relevant rule IDs for return shapes, dtypes and semantics. Implementation diagnostics are available through search(kind='diagnostic').",
+                "read_note": "Rules include each section's own text. Use read on the rule IDs for nested sections and full context. These contracts do not infer your program's result schema. Implementation diagnostics are available through search(kind='diagnostic').",
                 "verification": "not evaluated by this read-only service; diagnostics do not redefine doc semantics"}
 
     def read(self, id: str, section: str | None = None) -> dict:
