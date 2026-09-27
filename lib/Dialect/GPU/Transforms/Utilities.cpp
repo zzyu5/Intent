@@ -2731,8 +2731,25 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
           bool derivedOccurrence =
               targetMap.getDerived() && sourceMap.getDimensionId() > 0 &&
               sourceMap.getDimensionId() == targetMap.getDimensionId();
-          if (analysis.axisRealization(broadcast.getResult(), targetAxis)
-                  .constructionScalarSeed || derivedOccurrence) {
+          auto realization =
+              analysis.axisRealization(broadcast.getResult(), targetAxis);
+          auto ranges = analysis.programRanges(sourceAxisIdentity(targetMap));
+          bool selectedProgramExtent =
+              !realization.hasExtentAuthority() && ranges.isExact() &&
+              !ranges.roots.empty() && sourceMap.getDimensionId() > 0 &&
+              sourceMap.getDimensionId() == targetMap.getDimensionId() &&
+              queryFragmentAxis(target, sourceAxisIdentity(targetMap),
+                                targetMap.getDimensionId()).isExact() &&
+              analysis.lockstepRanges(ranges.roots).isExact() &&
+              llvm::all_of(ranges.roots, [&](MakeRangeOp range) {
+                auto dimension = queryRangeDimension(range);
+                return analysis.isProgramOwnedRange(range) &&
+                       succeeded(dimension) &&
+                       *dimension == targetMap.getDimensionId() &&
+                       queryLaunchExpression(range.getExtent()) == sourceExtent;
+              });
+          if (realization.constructionScalarSeed || derivedOccurrence ||
+              selectedProgramExtent) {
             retargetSourceExtent(broadcast.getResult(),
                                  sourceAxisIdentity(targetMap), sourceExtent);
             target = cast<FragmentType>(broadcast.getResult().getType());
