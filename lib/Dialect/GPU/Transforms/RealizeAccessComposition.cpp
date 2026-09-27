@@ -117,16 +117,10 @@ FailureOr<Value> replayScalarValue(OpBuilder &builder, Value value,
   auto fragment = dyn_cast<FragmentType>(value.getType());
   if (!fragment)
     return value;
-  if (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
+  if (Operation *projection = value.getDefiningOp();
+      projection && isa<BroadcastOp, ReshapeOp, TransposeOp, SplatOp>(projection)) {
     FailureOr<Value> scalar =
-        replayScalarValue(builder, broadcast.getValue(), mapping, analysis);
-    if (succeeded(scalar))
-      mapping.map(value, *scalar);
-    return scalar;
-  }
-  if (auto splat = value.getDefiningOp<SplatOp>()) {
-    FailureOr<Value> scalar =
-        replayScalarValue(builder, splat.getValue(), mapping, analysis);
+        replayScalarValue(builder, projection->getOperand(0), mapping, analysis);
     if (succeeded(scalar))
       mapping.map(value, *scalar);
     return scalar;
