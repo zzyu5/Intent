@@ -812,6 +812,7 @@ LogicalResult bindTraversalFragmentFootprints(
   auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   if (!capabilities || capabilities.getRegistersPerUnit() <= 0)
     return success();
+  SmallVector<std::function<bool()>> fragmentBudgetChecks;
   for (ParameterOp parameter : parameters) {
     auto schema = parameter.getParameter();
     auto category = static_cast<ParameterCategory>(schema.getCategory());
@@ -839,7 +840,7 @@ LogicalResult bindTraversalFragmentFootprints(
             }))
           fragments.insert(type);
     });
-    auto fits = [&](int64_t candidate) {
+    auto fits = [&, schema, fragments](int64_t candidate) {
       AttrTypeReplacer replacer;
       replacer.addReplacement(
           [&](PhysicalExprAttr expression) -> std::optional<Attribute> {
@@ -889,11 +890,18 @@ LogicalResult bindTraversalFragmentFootprints(
       if (candidate <= requested && (!selected || candidate > *selected) &&
           fits(candidate))
         selected = candidate;
+    // Other traversal axes may still exceed their budget. Reach this axis's
+    // legal minimum before binding those axes, then validate the complete tuple.
     if (!selected)
-      return failure();
+      selected = *llvm::min_element(schema.getCandidates().asArrayRef());
     bindings.set(schema.getName(), builder.getI64IntegerAttr(*selected));
+    fragmentBudgetChecks.push_back([&, schema, fits] {
+      return fits(cast<IntegerAttr>(
+          bindings.get(schema.getName().getValue())).getInt());
+    });
   }
-  return success();
+  return success(llvm::all_of(fragmentBudgetChecks,
+                              [](const auto &check) { return check(); }));
 }
 
 void appendFullResultContractionTuples(
