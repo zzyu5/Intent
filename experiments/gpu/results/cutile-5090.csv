@@ -23,7 +23,7 @@ geglu,4096x28672-fp16-tanh,0.227104,0.225344,1.007810,pass,同算法；source �
 relu,8192x4096-fp16,0.088056,0.087824,1.002642,pass,同算法；NaN 传播方式不同
 dropout,8192x4096-fp16-p0.1,0.088096,0.087848,1.002823,pass,
 attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,0.761056,0.801296,0.949781,pass,同算法；source 的布局转换与辅助工作计入其调用时间
-attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,0.849064,2.081848,0.407841,pass,同算法；source 使用 bf16 LSE 与近似除法
+attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,0.679008,2.081848,0.326156,pass,同算法；source 使用 bf16 LSE 与近似除法
 mhc_apply_residual,T2048-H4096-streams4-bf16,0.097504,0.108336,0.900015,pass,同算法；source 保留 bf16 中间累加
 gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,0.713408,0.595424,1.198151,pass,同算法；中间精度和舍入不同
 gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,0.108528,0.698896,0.155285,pass,同算法；中间精度和舍入不同

@@ -23,7 +23,7 @@ geglu,4096x28672-fp16-tanh,0.227360,0.225344,1.008946,pass,Intent target=triton;
 relu,8192x4096-fp16,0.087840,0.087824,1.000182,pass,Intent target=triton; source corpus=cutile. 同算法；NaN 传播方式不同
 dropout,8192x4096-fp16-p0.1,0.087840,0.087848,0.999909,pass,Intent target=triton; source corpus=cutile.
 attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,0.757032,0.801296,0.944759,pass,Intent target=triton; source corpus=cutile. 同算法；source 的布局转换与辅助工作计入其调用时间
-attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,0.687104,2.084608,0.329608,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 bf16 LSE 与近似除法
+attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,0.694936,2.084608,0.333365,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 bf16 LSE 与近似除法
 mhc_apply_residual,T2048-H4096-streams4-bf16,0.100080,0.108336,0.923793,pass,Intent target=triton; source corpus=cutile. 同算法；source 保留 bf16 中间累加
 gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,0.668464,0.595424,1.122669,pass,Intent target=triton; source corpus=cutile. 同算法；中间精度和舍入不同
 gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,0.106464,0.698896,0.152332,pass,Intent target=triton; source corpus=cutile. 同算法；中间精度和舍入不同

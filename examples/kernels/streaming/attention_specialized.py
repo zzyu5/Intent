@@ -338,16 +338,24 @@ def attention_sink_decode_partials(
                     begin = I.maximum(begin, query_coordinate - WINDOW + 1)
                 begin = I.minimum(begin, end)
                 keys = key_axis[begin:end]
-                summary = summarize_window_attention_bf16(
-                    k[batch, keys, key_head, :],
-                    v[batch, keys, key_head, :],
-                    I.indices(keys),
-                    query,
-                    I.full((HEAD_GROUP,), fill=query_coordinate, dtype=I.index),
-                    scale,
-                    WINDOW,
-                    False,
-                    0.0,
+                summary = I.region_fold(
+                    source=(
+                        k[batch, keys, key_head, :],
+                        v[batch, keys, key_head, :],
+                        I.indices(keys),
+                    ),
+                    axis=0,
+                    summarize=summarize_window_attention_bf16,
+                    combine=merge_attention_summaries,
+                    identity=empty_attention_summary(local_heads, DV),
+                    operands=(
+                        query,
+                        I.full((HEAD_GROUP,), fill=query_coordinate, dtype=I.index),
+                        scale,
+                        WINDOW,
+                        False,
+                        0.0,
+                    ),
                 )
                 if part == 0:
                     summary = add_sink_to_summary(summary, sink_log2)
