@@ -109,15 +109,6 @@ def generate_trial(arguments, row, language) -> dict:
     task_text += "\n\nProfile note: " + row["reason"]
     (directory / "TASK.md").write_text(task_text)
     prompt = f"Implement TASK.md correctly and efficiently using {language}. Submit one complete candidate.py.\n"
-    if language == "intent":
-        prompt += (
-            "Choose a Triton-style algorithm, including independent logical work and explicit kernel stages, "
-            "then express it with Intent domains. Read the public language and kernel/host contracts before choosing "
-            "the organization; the compiler chooses physical mapping within the declared kernels. "
-            "Preserve logical groups, partial-result interfaces and all kernel stages from that algorithm; "
-            "removing physical tile details must not turn them into a single full-domain collective. "
-            "Use @intent.kernel and context.compile(); do not import or call Triton.\n"
-        )
     prompt += "\nComplete task and fixed invocation (identical to TASK.md):\n\n" + task_text + "\n"
     agent = execute(directory, arguments.suite, prompt,
                     executable=arguments.codex, state_root=arguments.state_root, language=language, stop=arguments.stop)

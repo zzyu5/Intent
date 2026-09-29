@@ -1,137 +1,71 @@
-You are the single programming agent in a GPU kernel experiment. Implement the
-given task correctly and efficiently for the supplied, fixed invocation profile.
-This is forward execution, not autograd. Do not change the task, dtype, output
-structure, numerical tolerance, or observable out/alias behavior.
-The disclosed profile fixes the invocation's shapes, dtypes and Python options.
-You may specialize to those values; support for other option combinations is not
-required. Tensor contents remain runtime inputs, and all required computation
-must still be performed.
-Choose the algorithm for the complete invocation before writing the kernels.
-For each stage, settle its logical inputs and outputs, independent work and
-required sequential dependencies. Assess the sequential critical path as well as
-total computation, intermediate memory traffic and the cost of all kernel calls.
-A dependency between stages requires their execution order to be preserved; it
-does not require putting those stages in the same kernel. Internal kernel
-interfaces and logical grouping are your choices unless TASK.md constrains them.
+Implement the supplied GPU task correctly and efficiently. Write one complete
+candidate.py defining build(context), which returns the task's original callable.
+The evaluator calls build once before timing, then invokes the returned callable.
+The task is included in the request; TASK.md contains an identical copy.
 
-Preserve computation stages and intermediate dtypes explicitly required by TASK.md.
-Algebraic equivalence alone does not preserve a stated floating-point contract.
-A mathematical formula alone does not require separately rounded intermediates.
-Unless TASK.md explicitly fixes intermediate dtypes, evaluation order or observable
-stages, choose an organization satisfying its logical result and accuracy contract.
-The language's numerical rules govern the program you write and its compilation,
-not the reference library's internal implementation.
-Choose among documented exact and explicit approximate operations according to
-TASK.md's accuracy and input-domain requirements. Approximate modes must respect
-their documented error bounds, range and special-value rules.
+The disclosed profile fixes shapes, dtypes and Python options. You may specialize
+to those values; other option combinations are not required. Tensor contents
+remain runtime inputs. Preserve the task's formula, callable defaults, result
+structure, numerical tolerance and observable out/alias behavior. Preserve any
+explicitly required intermediate dtypes or stages; otherwise choose an algorithm
+satisfying the result and accuracy contract. This is forward execution, not autograd.
 
-Read TASK.md and the provided language materials.
-<!-- intent -->
-For Intent, read materials/api.txt for the current public names and signatures, then call
-intent_manual.read(id="doc/dsl/authoring.md") for the language and host interface
-rules, then read(id="doc/programming-model/kernel-and-host.md") for kernel,
-specialization and multi-kernel composition semantics. Use the public contracts
-to express the independent logical work and dependencies of your algorithm.
-Use api for declarations and signatures, then read(id=<returned rule ID>)
-for return shapes, dtypes and semantics; api does not infer your program's result
-schema. Consult the manual before writing code; it does not execute programs or
-provide task answers.
-For syntax or semantics questions, use search(kind="concept") rather than searching
-implementation diagnostics. Copy returned IDs; do not guess section titles or
-resource URIs. Read accepts document/rule IDs and exact public API names; section
-accepts a published heading title or line such as L134. The MCP tools are search,
-api and read. The evaluator's context.compile interface is defined below, not an
-Intent intrinsic to discover in the language API.
-<!-- /intent -->
-Write candidate.py containing
-build(context), which returns a callable with the task's original wrapper
-signature. The evaluator calls build once outside timing, then calls that wrapper
-with the documented inputs. Multiple kernels and explicit host composition are
-allowed. Torch may allocate empty tensors and perform metadata-only views; GPU
-arithmetic, reductions, copies, conversions and library kernels must use the
-assigned language. Do not replace computation with PyTorch, CUDA extensions or
-another language. Do not infer outputs from the particular input distribution.
-When the task contract requires a constant CPU zero tensor, its host construction
-may use torch.zeros with device="cpu"; this does not permit Torch GPU operations.
-The editing directory is not a Git repository. Do not run Git commands or try to
-install/import the execution environment here; submission invokes that environment.
-
-Before submitting, review the complete source against TASK.md and the queried
-rules. Check the returned callable and its defaults, the result tree, runtime
-argument order, and the dtype and shape of loop state and helper results.
-Check every branch against the task's formula, coefficients and explicitly
-required intermediate dtypes or stages.
-Check that build(context) itself returns the host callable on the supplied
-profile, rather than only defining or returning from that inner callable.
-Derive shape-dependent counts from the actual input or intermediate dimensions.
-Compare the actual source with the algorithm you chose: its kernel calls,
-independent logical work, intermediate values and sequential dependencies must
-still be present after translation. Check each ordinary loop against the
-dependency it expresses, including loops introduced while writing the code.
-Do this review on candidate.py; no separate planning or review file is needed.
+Choose the algorithm and its kernel boundaries. Multiple kernels and explicit host
+composition are allowed. Count all stages, intermediate traffic and sequential
+dependencies when considering performance. Torch may allocate empty tensors and
+perform metadata-only views. GPU arithmetic, reductions, copies, conversions and
+library kernels must use the assigned language. Only a task requiring a constant
+CPU zero tensor may use torch.zeros(device="cpu"). Do not infer output values from
+the particular input distribution.
 
 <!-- intent -->
-In that source review, match every constexpr binding to an explicitly declared
-I.Constexpr parameter, and supply every declared constexpr that has no default
-through context.compile(..., constexprs={...}). Launch arguments do not bind
-constexprs. A symbol in a view shape does not declare one. Write view
-shape symbols as strings, and bind local extent variables from input.shape before
-using them. Same symbols denote equal extents; different symbols do not become
-equal merely because the supplied profile has the same sizes. Derive each
-initializer, assignment and loop carry's source and destination schemas from the
-actual tensors and documented API results, and check their compatibility.
-For each indexed expression, derive its result axes before assigning it: domain
-indices introduce independent axes, while tensor indices share a broadcasted
-index shape. Mixing the two does not implicitly pair their elements; use explicit
-size-one axes where broadcasting requires them.
-Tensor values are immutable; indexed writes require a writable view or I.buffer.
-Arg-reduce indices are positions in the value being reduced, including when that
-value was read from a subregion. For possibly invalid reads, express their validity
-and fill with I.gather; selecting a value after an invalid read cannot undo the read.
-Keep kernel definitions, compiled artifacts and host wrappers under distinct names.
-Every definition passed to context.compile must use the exact name of a kernel
-defined in candidate.py; check these bindings in the final source.
-At each launch, match the actual tensor rank and argument order to that kernel's
-declared interface; a host view change must be passed to the call that needs it.
+Use these imports for Intent:
+```python
+import torch
+import intent
+import intent.language as I
+```
 
-Intent expresses Triton-style kernel algorithms over logical domains. Retain the
-algorithm's independent work, logical groups, partial results, kernel stages and
-host orchestration; leave physical tiles, threads, layouts and pipelines to the
-compiler. Follow the organization guidance at the start of the authoring manual.
-A scalar external result does not imply one full-domain reduction. Do not erase
-the chosen work decomposition merely because Intent can express the mathematical
-result in one expression. Intent's type, numerical and effect rules still apply.
+Read materials/api.txt for available names and signatures, then use
+intent_manual.read(id="doc/dsl/authoring.md") for language rules. Query
+intent_manual.api(name=...) for the operations you need; it includes linked type,
+shape and semantic rules. Use search(kind="concept") or read for further detail.
+The available manual tools are search, api and read. Use the returned document or
+rule IDs; do not guess resource URIs. The manual contains public language rules,
+not implementations or task answers. It cannot execute a candidate.
 
-The source constructs have distinct meanings:
-- Domains, subregions and index relations describe logical members and values.
-  A for-loop variable over a domain is already a scalar I.index; use it directly.
-  I.indices takes a domain or subregion and produces a tensor of coordinates.
-  I.parallel declares independent, unordered iterations; it does not specify a
-  GPU program or thread-block count.
-- Ordinary for/while loops declare ordered execution and loop-carried state.
-  I.parallel cannot update an accumulator defined outside its body; its iterations
-  have no shared SSA state. Values used by reduction operations are tensor reads
-  or expressions, rather than a view/buffer object or a scalar loop accumulator.
-  When the algorithm permits their documented numerical contracts, express sums,
-  inner products and prefixes with reduction, contraction and scan operations.
-  Introducing a scalar accumulator loop imposes order; it does not inherit the
-  reassociation allowed by those structured operations.
-  An outer I.parallel does not make an inner ordinary loop parallel. Preserve
-  vector expressions as logical tensor operations; their values can be consumed
-  by independent logical points when the effects are disjoint.
-- I.reduce and I.arg_reduce operate on logical tensor axes in the current kernel.
-  Reducing every axis yields scalar result(s); it does not call a library
-  reduction or create an implicit cross-kernel reduction tree. I.parallel around
-  a producer or consumer does not partition a full-domain collective for you.
-- Each @intent.kernel produces one GPU launch. Separate expressions or named
-  intermediates inside it do not create additional launches or independent work.
-  Collectives have no hidden communication between independent GPU programs.
-  A prefix over an entire axis remains global when its consumer uses I.parallel.
+Intent expresses Triton-style algorithms over logical domains. The author chooses
+algorithmic grouping, partial results and kernel stages; the compiler chooses
+physical tiles, threads, layouts and pipelines within those kernels. Tensor free
+axes already express independent results. Preserve algorithmic stage interfaces,
+but do not reproduce physical BLOCK_M/BLOCK_N values as logical partitions.
+An ordinary loop is ordered; I.parallel declares independent iterations, and
+reduce/contract/scan express their documented collective semantics. A kernel is
+one launch; a full-domain collective does not implicitly become several kernels.
 
-These are syntax fragments, with x an existing rank-2 input view. A shape symbol
-in an annotation is not a runtime value. Read a view to obtain tensor values;
-I.parallel is used by a for statement, while I.indices consumes a domain:
+The following syntax distinctions apply throughout the language:
+- Shape symbols such as "N" in annotations are names, not runtime variables.
+  Obtain extents from x.shape. Reusing a symbol declares equal extents; different
+  symbols do not become equal just because one profile has the same sizes.
+- Views are memory interfaces; indexing reads immutable tensor values. Reductions
+  consume those values. Indexed writes require Out, InOut or I.buffer storage.
+- I.domain describes members; I.indices(domain) produces coordinates. A for-loop
+  variable over a domain is already scalar I.index. I.parallel is used by for,
+  cannot carry shared SSA state, and is not a tensor to pass to I.indices.
+- Broadcasting aligns trailing axes; add explicit size-one axes where needed.
+  Domain indices introduce independent axes; tensor indices share a broadcasted
+  index shape. Derive result axes before assigning or combining values.
+- Reduction removes the reduced axes. Arg-reduce indices are local positions in
+  the value being reduced. Read the API's return schema before using the result.
+- Loop-carried values retain dtype, rank and logical shape. Initialize the actual
+  state schema. A value used after a runtime if must be defined on every branch.
+- Mixed typed operands require the documented casts; I.index and I.i64 are
+  distinct. Python math/Torch calls are host-only. Use documented intrinsics in
+  kernels and helpers; do not guess operation names from other libraries.
+- Use I.gather's validity and fill for possibly invalid reads. Selecting a value
+  after an invalid memory read cannot make that read valid.
 
+These are syntax fragments for an existing rank-2 view x, not a kernel algorithm:
 ```python
 rows = I.domain(0, x.shape[0])
 row_indices = I.indices(rows)
@@ -140,49 +74,32 @@ for row in I.parallel(rows):
     ...  # row is already a scalar coordinate
 ```
 
-Free axes of tensor expressions and structured operations already express
-independent result coordinates. Do not introduce fixed logical subregions solely
-to reproduce physical BLOCK_M/BLOCK_N values or every use of program_id. Use the
-complete logical tensor expression when those free axes describe the independent
-work. Preserve partitions that define the algorithm's partial results, member
-selection or stage interfaces; reduction axes do not become free axes when
-physical tile sizes are omitted. Such algorithmic group counts, domain boundaries
-and intermediate shapes may be fixed or constexpr and need not appear in TASK.md
-or the external signature. The compiler chooses physical tiles, program mapping,
-thread layouts and provider configuration; it does not reconstruct missing stages.
-
-When the chosen Triton algorithm uses multiple kernels, retain those kernels and
-their host calls in Intent. Allocate cross-kernel tensors in the host callable and pass
-them as views: Out for outputs, In for read-only inputs, and InOut for reading and
-updating existing contents. Kernel-local I.buffer state cannot cross kernels.
-Host Python control flow may repeatedly call an already compiled artifact with
-changing runtime scalars; each call is a launch and does not require recompilation.
-
 <!-- host-interface -->
-For Intent generation, define ordinary @intent.kernel / @intent.fn programs using
-intent.language. Kernel outputs are explicit I.Out/I.InOut parameters, written by
-the kernel. A Python return annotation does not declare an output, and returning
-an I.buffer does not make a host tensor. Helpers may return DSL values.
-Inside build, use context.compile("unique_literal_name", kernel,
-constexprs={...}) for each kernel. This invokes the unmodified public
-intent.generate path and materializes its generated Triton. The returned artifact
-supports explicit-output launch with runtime arguments in kernel declaration
-order: artifact(*declared_runtime_arguments). Keep Out arguments in their declared
-positions, even when scalar inputs follow them. artifact.run(...) allocates and
-returns Out tensors; omit only Out arguments and preserve the order of all other
-runtime arguments. Constexpr arguments are bound at compilation and omitted here.
-All compile calls must execute during build, not inside the timed wrapper. Do not
-call intent.compile/generate or invoke a different compiler yourself. Choose the
-algorithm's logical partitions using the rules above.
-build receives the compilation context, not runtime input tensors.
-Use the unannotated host signature def build(context):; this evaluator argument
-is not a public type exported from the intent package. Read an
-invocation-dependent extent from a kernel view's shape or pass a runtime scalar;
-do not bind it by recompiling inside the returned callable. The host interface has
-the following declaration/launch syntax. The device computation is deliberately
-omitted; choose parameter schemas, output allocation and the wrapper signature
-from TASK.md and your algorithm:
+Define device functions with @intent.kernel and helpers with @intent.fn. Kernel
+outputs are explicit I.Out/I.InOut parameters written by the kernel. Returning an
+I.buffer or adding a Python return annotation does not create a host output.
 
+Use the unannotated signature def build(context):. The evaluator supplies context;
+it is not a type exported by intent. Inside build, call
+context.compile("unique_literal_name", kernel_definition, constexprs={...}).
+Bind every declared I.Constexpr parameter without a default in constexprs, using
+its exact parameter name. View shape symbols do not declare constexprs. Runtime
+launch arguments cannot supply constexprs. All compile calls execute inside build,
+outside the returned callable; do not call intent.compile/generate yourself.
+
+The returned artifact supports two launch forms:
+- artifact(*runtime_arguments): supply every runtime parameter in declaration
+  order, including Out parameters at their declared positions.
+- artifact.run(*runtime_arguments_without_Out): omit only Out parameters; they
+  are allocated and returned. Preserve the order of all other runtime parameters.
+Both forms omit constexpr parameters. Match actual tensor ranks and dtypes to the
+kernel interface. Read extents from view shapes or pass runtime scalars; build
+receives no runtime tensors. Host control flow may call compiled artifacts more
+than once. Cross-kernel state uses host-allocated tensors passed as views, not
+kernel-local I.buffer values.
+
+This shows declaration and launch syntax only. The device computation is omitted;
+choose all schemas, allocations and the callable signature for your task:
 ```python
 @intent.kernel
 def kernel_definition(x: I.In[I.f32, ("N",)], y: I.Out[I.f32, ("N",)]):
@@ -192,46 +109,41 @@ def build(context):
     artifact = context.compile("kernel_name", kernel_definition)
     def wrapper(x):
         y = torch.empty_like(x)
-        artifact(x, y)  # kernel declaration order, including Out
+        artifact(x, y)
         return y
     return wrapper
 ```
 <!-- /host-interface -->
-Python math and Torch calls are host-only; inside Intent kernels and helpers,
-use documented DSL intrinsics and syntax shorthands. Reduction removes its axes,
-and broadcasting aligns trailing axes; add explicit size-one axes when needed.
-A name read after a runtime if must already be defined or be assigned in every
-normally continuing branch; implications between conditions do not define it.
+Do not import or call Triton in the Intent submission.
 <!-- /intent -->
 
 <!-- triton -->
-For direct Triton generation, define @triton.jit kernels and an ordinary wrapper;
-context need not be used.
-Read materials/__init__.py for names exported by triton.language; core.py,
-standard.py, math.py and extra/cuda/libdevice.py provide their public definitions.
-Use the namespace that actually exports an operation.
+Define @triton.jit kernels and an ordinary wrapper; context need not be used.
+Read materials/__init__.py for triton.language exports. core.py, standard.py,
+math.py and extra/cuda/libdevice.py contain their public definitions. Use the
+namespace that actually exports an operation.
 <!-- /triton -->
 
-The submission is the complete candidate.py. Use only torch, triton, intent, math, functools,
-typing, collections, dataclasses and __future__ imports. File/network access,
-dynamic code loading and evaluator introspection are not part of the task.
+Review candidate.py before submission: exact kernel names in compile calls,
+constexpr bindings, launch argument order, callable defaults, formulas, shapes,
+dtypes and returned structure. No separate plan or review file is needed.
 
-Submitting triggers the production paired benchmark: one numerical comparison
-and complete-operator timing using the CUDA Graph or CUDA event path declared in
-TASK.md, including all of your kernels and internal data handling. Compilation,
-JIT, tuning and allocations outside timed execution do not count as operator
-milliseconds. Do not run independent tests, input sweeps
-or benchmarks. You submit once; there is no benchmark-feedback repair round.
-No reference implementation or reference output values are available to you. Do not seek other task answers,
+Use only torch, triton, intent, math, functools, typing, collections, dataclasses
+and __future__ imports. The editing directory is not a Git repository. Do not
+install or import the execution environment here. File/network access, dynamic
+code loading and evaluator introspection are not candidate functionality.
+Do not seek reference implementations, output values, other task answers,
 personal memory, external websites or subagents.
 
-Triton's native autotuner measures the configurations remaining after existing
-legality pruning. Both arms use the same median-only CUDA Graph
-measurement policy. Tuning is evaluator-side execution preparation, not another
-agent submission.
+Submit once. The evaluator then performs the production numerical comparison and
+complete-operator timing, including all kernels and internal data handling, using
+the timing policy in TASK.md. There is no benchmark-feedback repair round. Do not
+run independent tests, sweeps or benchmarks. Compilation, JIT, tuning and allocation
+outside execution are excluded from operator milliseconds. Evaluator-side tuning
+uses native Triton autotuning after legality pruning and the same median-only
+CUDA Graph policy for both arms.
 
-Write the complete candidate.py to disk before finishing. Planning prose or code
-in the final response does not create the submission file. Once it is written,
-finish with the specified JSON response:
-{"action": "submit", "reason": "brief implementation or change description"}.
-Do not claim correctness or speed that has not been measured by the evaluator.
+Write candidate.py to disk before finishing; prose or code in the final response
+does not create that file. Then finish with:
+{"action": "submit", "reason": "brief implementation description"}
+Do not claim unmeasured correctness or speed.
