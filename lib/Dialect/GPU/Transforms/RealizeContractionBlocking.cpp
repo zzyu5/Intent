@@ -1539,6 +1539,88 @@ bool collectStorePaths(Value value, SmallVector<Operation *> operations,
   return !paths.empty();
 }
 
+FailureOr<Value> materializeResultCapture(
+    OpBuilder &builder, func::FuncOp kernel, Value value, FragmentType tile,
+    Value rows, Value columns, Operation *insertionAnchor) {
+  Location location = insertionAnchor->getLoc();
+  auto fragment = dyn_cast<FragmentType>(value.getType());
+  if (!fragment)
+    return value;
+  auto target = FragmentType::get(
+      kernel.getContext(), fragment.getElementType(), tile.getShape(),
+      tile.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
+  if (value.getType() == target &&
+      DominanceInfo(kernel).dominates(value, insertionAnchor))
+    return value;
+  if (auto scalar = scalarSource(value); succeeded(scalar))
+    return projectPhysicalValueToSchema(builder, location, *scalar, target);
+  if (fragment.getShape().size() != 2)
+    return failure();
+  Value captured = value;
+  SmallVector<Value, 2> coordinates{rows, columns};
+  for (auto [axis, coordinate] : llvm::enumerate(coordinates)) {
+    auto replacement = coordinate.getDefiningOp<MakeRangeOp>();
+    PhysicalProgramAnalysis analysis(kernel);
+    PhysicalRangeFact ranges = analysis.axisRanges(captured, axis);
+    if (ranges.isExact() && ranges.roots.empty() && ranges.blockers.empty())
+      continue;
+    auto root = queryExactLogicalRange(ranges);
+    if (!replacement || failed(root) || !isUnitStepRange(*root) ||
+        !samePhysicalScalarExpression(root->getLogicalStart(),
+                                      replacement.getLogicalStart()) ||
+        !samePhysicalScalarExpression(root->getLogicalStop(),
+                                      replacement.getLogicalStop())) {
+      insertionAnchor->emitError("result capture has no matching result-axis range")
+          << "; axis=" << axis << "; value=" << value
+          << "; root=" << (succeeded(root) ? root->getResult() : Value())
+          << "; replacement=" << coordinate;
+      return failure();
+    }
+    auto source = sourceAxisIdentity(cast<AxisMapAttr>(
+        cast<FragmentType>(value.getType()).getAxisMaps()[axis]));
+    if (!analysis.replayability(value, source, PhysicalReplayScope::ValueGraph,
+                               /*allowAccesses=*/true, insertionAnchor)
+             .isReplayable()) {
+      insertionAnchor->emitError("result capture cannot be replayed at its use")
+          << "; axis=" << axis << "; value=" << value;
+      return failure();
+    }
+    auto indexType = root->getResult().getType();
+    auto extent = cast<PhysicalExprAttr>(tile.getShape()[axis]);
+    indexType = FragmentType::get(
+        kernel.getContext(), indexType.getElementType(),
+        builder.getArrayAttr({extent}), indexType.getAxisMaps(),
+        indexType.getValidity(), indexType.getOwner());
+    Value range = builder.create<MakeRangeOp>(
+        location, indexType, replacement.getStart(), replacement.getExtent(),
+        root->getStep(), root->getLogicalStart(),
+        root->getLogicalStop(), root->getSourceId(), root->getSourceAxis(),
+        root->getDerived());
+    inheritRangeAuthority(range, *root);
+    auto predicateType = FragmentType::get(
+        kernel.getContext(), builder.getI1Type(), indexType.getShape(),
+        indexType.getAxisMaps(), indexType.getValidity(), indexType.getOwner());
+    Value tail = rangeBoundsValidity(builder, location, indexType, predicateType,
+                                    range, root->getLogicalStop());
+    IRMapping mapping;
+    for (MakeRangeOp sourceRange : ranges.roots)
+      mapping.map(sourceRange.getResult(), range);
+    ReplayMaterializationOptions options;
+    options.fragmentAxis = axis;
+    options.segmentTail = tail;
+    options.materializeZeroFill = true;
+    auto replayed = materializeReplayedValue(
+        builder, location, value, source, extent, mapping, options);
+    if (failed(replayed)) {
+      insertionAnchor->emitError("result capture axis could not be materialized")
+          << "; axis=" << axis << "; value=" << value;
+      return failure();
+    }
+    value = *replayed;
+  }
+  return projectPhysicalValueToSchema(builder, location, value, target);
+}
+
 FailureOr<Value> materializeStorePath(
     OpBuilder &builder, func::FuncOp kernel, StorePath &path, Value original,
     Value blocked, Value rows, Value columns, Operation *insertionAnchor) {
@@ -1549,91 +1631,14 @@ FailureOr<Value> materializeStorePath(
         kernel.getContext(), fragment.getElementType(), tile.getShape(),
         tile.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
   };
-  auto capture = [&](Value value) -> FailureOr<Value> {
-    auto fragment = dyn_cast<FragmentType>(value.getType());
-    if (!fragment)
-      return value;
-    FragmentType target = schema(fragment);
-    if (value.getType() == target &&
-        DominanceInfo(kernel).dominates(value, insertionAnchor))
-      return value;
-    if (auto scalar = scalarSource(value); succeeded(scalar))
-      return projectPhysicalValueToSchema(builder, path.store.getLoc(), *scalar,
-                                           target);
-    if (fragment.getShape().size() != 2)
-      return failure();
-    Value captured = value;
-    SmallVector<Value, 2> coordinates{rows, columns};
-    for (auto [axis, coordinate] : llvm::enumerate(coordinates)) {
-      auto replacement = coordinate.getDefiningOp<MakeRangeOp>();
-      PhysicalProgramAnalysis analysis(kernel);
-      PhysicalRangeFact ranges = analysis.axisRanges(captured, axis);
-      if (ranges.isExact() && ranges.roots.empty() && ranges.blockers.empty())
-        continue;
-      auto root = queryExactLogicalRange(ranges);
-      if (!replacement || failed(root) || !isUnitStepRange(*root) ||
-          !samePhysicalScalarExpression(root->getLogicalStart(),
-                                        replacement.getLogicalStart()) ||
-          !samePhysicalScalarExpression(root->getLogicalStop(),
-                                        replacement.getLogicalStop())) {
-        path.store.emitOpError("epilogue capture has no matching result-axis range")
-            << "; axis=" << axis << "; value=" << value
-            << "; root=" << (succeeded(root) ? root->getResult() : Value())
-            << "; replacement=" << coordinate;
-        return failure();
-      }
-      auto source = sourceAxisIdentity(cast<AxisMapAttr>(
-          cast<FragmentType>(value.getType()).getAxisMaps()[axis]));
-      if (!analysis.replayability(value, source, PhysicalReplayScope::ValueGraph,
-                                 /*allowAccesses=*/true, insertionAnchor)
-               .isReplayable()) {
-        path.store.emitOpError("epilogue capture cannot be replayed at its write")
-            << "; axis=" << axis << "; value=" << value;
-        return failure();
-      }
-      auto indexType = root->getResult().getType();
-      auto extent = cast<PhysicalExprAttr>(tile.getShape()[axis]);
-      indexType = FragmentType::get(
-          kernel.getContext(), indexType.getElementType(),
-          builder.getArrayAttr({extent}), indexType.getAxisMaps(),
-          indexType.getValidity(), indexType.getOwner());
-      Value range = builder.create<MakeRangeOp>(
-          path.store.getLoc(), indexType, replacement.getStart(),
-          replacement.getExtent(), root->getStep(), root->getLogicalStart(),
-          root->getLogicalStop(), root->getSourceId(), root->getSourceAxis(),
-          root->getDerived());
-      inheritRangeAuthority(range, *root);
-      auto predicateType = FragmentType::get(
-          kernel.getContext(), builder.getI1Type(), indexType.getShape(),
-          indexType.getAxisMaps(), indexType.getValidity(), indexType.getOwner());
-      Value tail = rangeBoundsValidity(builder, path.store.getLoc(), indexType,
-                                       predicateType, range, root->getLogicalStop());
-      IRMapping mapping;
-      for (MakeRangeOp sourceRange : ranges.roots)
-        mapping.map(sourceRange.getResult(), range);
-      ReplayMaterializationOptions options;
-      options.fragmentAxis = axis;
-      options.segmentTail = tail;
-      options.materializeZeroFill = true;
-      auto replayed = materializeReplayedValue(
-          builder, path.store.getLoc(), value, source, extent, mapping, options);
-      if (failed(replayed)) {
-        path.store.emitOpError("epilogue capture axis could not be materialized")
-            << "; axis=" << axis << "; value=" << value;
-        return failure();
-      }
-      value = *replayed;
-    }
-    return projectPhysicalValueToSchema(builder, path.store.getLoc(), value,
-                                         target);
-  };
   IRMapping mapping;
   mapping.map(original, blocked);
   for (Operation *operation : path.operations) {
     for (Value operand : operation->getOperands()) {
       if (mapping.contains(operand))
         continue;
-      auto replayed = capture(operand);
+      auto replayed = materializeResultCapture(
+          builder, kernel, operand, tile, rows, columns, insertionAnchor);
       if (failed(replayed)) {
         operation->emitOpError("contraction epilogue operand cannot be tiled")
             << "; operand=" << operand;
@@ -3943,24 +3948,9 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
         replayedStoreValidities.push_back(validity);
       }
     }
-    Value initialAccumulator = contract.getAccumulator();
-    if (failed(scalarSource(initialAccumulator)))
-      for (auto [range, extent, coordinates] : {
-               std::tuple<MakeRangeOp, PhysicalExprAttr, Value>{rowRange, unitM, rows},
-               {columnRange, unitN, columns}}) {
-        IRMapping accumulatorReplay;
-        accumulatorReplay.map(range.getResult(), coordinates);
-        FailureOr<Value> replayed = replaySourceValue(
-            rowBuilder, location, initialAccumulator, extent,
-            ArrayRef<MakeRangeOp>{range}, coordinates, accumulatorReplay,
-            contract.getOperation());
-        if (failed(replayed))
-          return contract.emitOpError(
-              "blocked contraction could not replay its output-dependent accumulator");
-        initialAccumulator = *replayed;
-      }
-    FailureOr<Value> accumulator = projectPhysicalValueToSchema(
-        rowBuilder, location, initialAccumulator, blockedResultType);
+    FailureOr<Value> accumulator = materializeResultCapture(
+        rowBuilder, kernel, contract.getAccumulator(), blockedResultType,
+        rows, columns, contract.getOperation());
     if (failed(accumulator))
       return contract.emitOpError(
           "blocked contraction accumulator has no exact result projection");
