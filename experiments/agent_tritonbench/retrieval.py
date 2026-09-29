@@ -19,6 +19,7 @@ class _StreamError(RuntimeError):
         super().__init__(str(error))
         self.retryable = isinstance(error, dict) and str(error.get("code")) in {
             "408", "429", "500", "502", "503", "504", "INTERNAL_ERROR",
+            "gateway_concurrency_limit",
         }
 
 
