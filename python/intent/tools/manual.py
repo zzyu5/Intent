@@ -119,6 +119,10 @@ def snapshot(project: Path) -> dict:
             kind = "dtype token"
         elif inspect.isclass(value):
             kind = "annotation" if hasattr(value, "__class_getitem__") else "Python type"
+            if value is language.Constexpr:
+                signature = "[value_type]"
+            elif value in (language.In, language.Out, language.InOut):
+                signature = "[dtype, shape]"
         elif get_origin(value) is not None:
             kind = "type alias"
         elif inspect.isfunction(value):

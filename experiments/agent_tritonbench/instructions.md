@@ -47,8 +47,10 @@ The following syntax distinctions apply throughout the language:
 - Shape symbols such as "N" in annotations are names, not runtime variables.
   Obtain extents from x.shape. Reusing a symbol declares equal extents; different
   symbols do not become equal just because one profile has the same sizes.
-- Views are memory interfaces; indexing reads immutable tensor values. Reductions
-  consume those values. Indexed writes require Out, InOut or I.buffer storage.
+- External input view parameters used as value expressions are read over their
+  full logical shape; explicit indexing selects a region. I.buffer is mutable
+  storage and must be read explicitly before numeric use. Tensor values are
+  immutable; indexed writes require Out, InOut or I.buffer storage.
 - I.domain describes members; I.indices(domain) produces coordinates. A for-loop
   variable over a domain is already scalar I.index. I.parallel is used by for,
   cannot carry shared SSA state, and is not a tensor to pass to I.indices.
@@ -83,7 +85,9 @@ Use the unannotated signature def build(context):. The evaluator supplies contex
 it is not a type exported by intent. Inside build, call
 context.compile("unique_literal_name", kernel_definition, constexprs={...}).
 Bind every declared I.Constexpr parameter without a default in constexprs, using
-its exact parameter name. View shape symbols do not declare constexprs. Runtime
+its exact parameter name. The annotation is I.Constexpr[value_type], for example
+I.Constexpr[bool] or I.Constexpr[str], not bare I.Constexpr. View shape symbols do
+not declare constexprs. Runtime
 launch arguments cannot supply constexprs. All compile calls execute inside build,
 outside the returned callable; do not call intent.compile/generate yourself.
 
