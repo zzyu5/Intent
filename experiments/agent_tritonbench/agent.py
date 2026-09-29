@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 from pathlib import Path
@@ -41,6 +42,26 @@ def materialize_language(project: Path, triton_ref: Path, directory: Path, langu
     directory.mkdir(parents=True)
     if language == "intent":
         corpus = snapshot(project)
+        from .program import ProgramContext
+
+        source = Path(__file__).with_name("instructions.md")
+        text = source.read_text()
+        contract = re.search(r"<!-- host-interface -->\n(.*?)<!-- /host-interface -->", text, re.DOTALL)
+        line = text[:contract.start(1)].count("\n") + 1
+        identifier = f"{source.relative_to(project)}#L{line}"
+        corpus["documents"][identifier] = {
+            "id": identifier, "title": "context.compile and artifact launch interface",
+            "kind": "concept", "source": str(source.relative_to(project)),
+            "line": line, "text": contract[1],
+        }
+        signature = inspect.signature(ProgramContext.compile)
+        signature = signature.replace(parameters=list(signature.parameters.values())[1:])
+        corpus["symbols"]["context.compile"] = {
+            "name": "context.compile", "signature": str(signature),
+            "declaration": "evaluator-provided ProgramContext.compile",
+            "sections": [identifier], "canonical": "context.compile", "members": [],
+            "availability": "provided by this evaluator inside build(context)",
+        }
         (directory / "manual.json").write_text(json.dumps(corpus, ensure_ascii=False))
         return sorted({entry["source"] for entry in corpus["documents"].values()})
     language_path = Path(triton.language.__file__).parent

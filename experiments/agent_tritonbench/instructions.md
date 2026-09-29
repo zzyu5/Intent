@@ -133,6 +133,7 @@ updating existing contents. Kernel-local I.buffer state cannot cross kernels.
 Host Python control flow may repeatedly call an already compiled artifact with
 changing runtime scalars; each call is a launch and does not require recompilation.
 
+<!-- host-interface -->
 For Intent generation, define ordinary @intent.kernel / @intent.fn programs using
 intent.language. Inside build, use context.compile("unique_literal_name", kernel,
 constexprs={...}) for each kernel. This invokes the unmodified public
@@ -145,6 +146,7 @@ runtime arguments. Constexpr arguments are bound at compilation and omitted here
 All compile calls must execute during build, not inside the timed wrapper. Do not
 call intent.compile/generate or invoke a different compiler yourself. Choose the
 algorithm's logical partitions using the rules above.
+<!-- /host-interface -->
 Python math and Torch calls are host-only; inside Intent kernels and helpers,
 use documented DSL intrinsics and syntax shorthands. Reduction removes its axes,
 and broadcasting aligns trailing axes; add explicit size-one axes when needed.
