@@ -146,6 +146,20 @@ runtime arguments. Constexpr arguments are bound at compilation and omitted here
 All compile calls must execute during build, not inside the timed wrapper. Do not
 call intent.compile/generate or invoke a different compiler yourself. Choose the
 algorithm's logical partitions using the rules above.
+build receives the compilation context, not runtime input tensors. Read an
+invocation-dependent extent from a kernel view's shape or pass a runtime scalar;
+do not bind it by recompiling inside the returned callable. The host interface has
+this structure, with the kernel and task-specific runtime values defined by you:
+
+```python
+def build(context):
+    artifact = context.compile("kernel_name", kernel_definition)
+    def wrapper(*args, **kwargs):
+        ...  # prepare runtime_arguments and task_result
+        artifact(*runtime_arguments)  # kernel declaration order, including Out
+        return task_result
+    return wrapper
+```
 <!-- /host-interface -->
 Python math and Torch calls are host-only; inside Intent kernels and helpers,
 use documented DSL intrinsics and syntax shorthands. Reduction removes its axes,

@@ -71,7 +71,7 @@ Domain 索引按资源索引顺序形成读取结果的 tensor axes，赋值仍�
 
 普通 `I.reduce` 声明 combine 可结合、可交换，允许并行重结合与重排；不承诺输入顺序或逐 bit 重现。`I.scan` 保留各个 logical prefix 的成员顺序，只允许保序重结合；严格顺序累加使用普通 loop。这些是不同的 operation 合同。
 
-`I.reduce.sum/max/any/all` 返回归约后的 values，没有 `keepdim`；非空 axis tuple 可同时归约多轴。若所有轴都被归约，结果是 scalar，而非零维 tensor。补 size-one 轴时，tensor value 使用 `I.reshape`；scalar 不能 reshape，可用 `I.full` 构造 tensor，或按赋值的广播规则直接写出。
+`I.reduce.sum/max/any/all` 返回归约后的 values，没有 `keepdim`；axis 是编译期确定的整数或非空整数 tuple，tuple 可同时归约多轴。若所有轴都被归约，结果是 scalar，而非零维 tensor。补 size-one 轴时，tensor value 使用 `I.reshape`；scalar 不能 reshape，可用 `I.full` 构造 tensor，或按赋值的广播规则直接写出。
 
 `I.cumsum(value, axis=1)` 对 shape 为 `[M,N]` 的 value 分别计算每一行的前缀，返回同 shape 的 tensor；未选中的轴保持独立，不在不同行之间传递状态。它不会先 flatten 输入。Scan 的成员来自传入的 tensor；读取 subregion 后再 scan，只包含该 subregion 的成员。`I.scan` 与 `I.cummax` 使用相同的 axis 规则。
 

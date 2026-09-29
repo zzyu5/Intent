@@ -132,7 +132,7 @@ def require_axes(lowerer: FunctionLowerer, node: ast.AST) -> tuple[int, ...]:
             axes.append(value)
         if axes:
             return tuple(axes)
-    lowerer.error(node, "axis must be an integer or non-empty integer tuple")
+    lowerer.error(node, "axis must be a compile-time integer or non-empty tuple of compile-time integers")
 
 
 def normalize_axes(
