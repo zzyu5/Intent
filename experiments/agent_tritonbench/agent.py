@@ -60,7 +60,7 @@ def materialize_language(project: Path, triton_ref: Path, directory: Path, langu
         signature = "(" + ast.unparse(compile_method.args).removeprefix("self, ") + ")"
         corpus["symbols"]["context.compile"] = {
             "name": "context.compile", "kind": "host function", "signature": str(signature),
-            "declaration": "evaluator-provided ProgramContext.compile",
+            "declaration": "method of the evaluator-provided build(context) argument",
             "sections": [identifier], "canonical": "context.compile", "members": [],
             "availability": "provided by this evaluator inside build(context)",
         }

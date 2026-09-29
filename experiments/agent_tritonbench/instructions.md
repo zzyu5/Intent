@@ -68,7 +68,9 @@ Do this review on candidate.py; no separate planning or review file is needed.
 
 <!-- intent -->
 In that source review, match every constexpr binding to an explicitly declared
-I.Constexpr parameter; a symbol in a view shape does not declare one. Write view
+I.Constexpr parameter, and supply every declared constexpr that has no default
+through context.compile(..., constexprs={...}). Launch arguments do not bind
+constexprs. A symbol in a view shape does not declare one. Write view
 shape symbols as strings, and bind local extent variables from input.shape before
 using them. Same symbols denote equal extents; different symbols do not become
 equal merely because the supplied profile has the same sizes. Derive each
@@ -156,7 +158,9 @@ runtime arguments. Constexpr arguments are bound at compilation and omitted here
 All compile calls must execute during build, not inside the timed wrapper. Do not
 call intent.compile/generate or invoke a different compiler yourself. Choose the
 algorithm's logical partitions using the rules above.
-build receives the compilation context, not runtime input tensors. Read an
+build receives the compilation context, not runtime input tensors.
+Use the unannotated host signature def build(context):; this evaluator argument
+is not a public type exported from the intent package. Read an
 invocation-dependent extent from a kernel view's shape or pass a runtime scalar;
 do not bind it by recompiling inside the returned callable. The host interface has
 this structure, with the kernel and task-specific runtime values defined by you:
