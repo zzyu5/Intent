@@ -9,7 +9,7 @@ import math
 from pathlib import Path
 import re
 import subprocess
-from typing import Literal
+from typing import Literal, get_origin
 
 
 def _sections(text: str) -> list[tuple[int, int, int, str]]:
@@ -46,6 +46,7 @@ def snapshot(project: Path) -> dict:
     import intent
     import intent.language as language
     from intent.language.builtins import INTRINSICS, Intrinsic, IntrinsicNamespace, QuantFormats
+    from intent.language.dtypes import DType
     from intent.language.signatures import INTRINSIC_SIGNATURES
 
     documents = {}
@@ -110,12 +111,28 @@ def snapshot(project: Path) -> dict:
             source = str(Path(inspect.getfile(value)).resolve().relative_to(project))
         else:
             signature, source = None, "python/intent/language/__init__.py"
+        if isinstance(value, Intrinsic):
+            kind = "kernel intrinsic"
+        elif isinstance(value, IntrinsicNamespace):
+            kind = "kernel intrinsic and namespace" if signature else "namespace"
+        elif isinstance(value, DType):
+            kind = "dtype token"
+        elif inspect.isclass(value):
+            kind = "annotation" if hasattr(value, "__class_getitem__") else "Python type"
+        elif get_origin(value) is not None:
+            kind = "type alias"
+        elif inspect.isfunction(value):
+            kind = "host function"
+        elif isinstance(value, QuantFormats):
+            kind = "namespace"
+        else:
+            kind = "constant"
         pattern = re.compile(r"(?<![\w.])(?:I\.)?" + re.escape(name) + r"(?![\w.])")
         references = [d["id"] for d in documents.values()
                       if ("#L" in d["id"] or d["kind"] != "concept")
                       and pattern.search(section_bodies[d["id"]])]
         symbols[name] = {
-            "name": name, "signature": str(signature) if signature else None,
+            "name": name, "kind": kind, "signature": str(signature) if signature else None,
             "declaration": source, "sections": references,
             "canonical": name,
             "members": list(value.members) if isinstance(value, IntrinsicNamespace) else [],
