@@ -14,6 +14,14 @@ from intent.tools.manual import Manual, _section_body
 from .agent import instructions
 
 
+class _StreamError(RuntimeError):
+    def __init__(self, error):
+        super().__init__(str(error))
+        self.retryable = isinstance(error, dict) and str(error.get("code")) in {
+            "408", "429", "500", "502", "503", "504", "INTERNAL_ERROR",
+        }
+
+
 async def _stream(url: str, body: dict, headers: dict, chunks: list[str],
                   stop: threading.Event, deadline: float, *, reasoning: list[str]) -> str | None:
     async def receive():
@@ -22,7 +30,9 @@ async def _stream(url: str, body: dict, headers: dict, chunks: list[str],
             async with client.stream("POST", url, json=body, headers=headers) as response:
                 if response.is_error:
                     detail = (await response.aread()).decode(errors="replace")
-                    raise RuntimeError(f"HTTP {response.status_code}: {detail[:4096]}")
+                    raise httpx.HTTPStatusError(
+                        f"HTTP {response.status_code}: {detail[:4096]}",
+                        request=response.request, response=response)
                 async for line in response.aiter_lines():
                     line = line.strip()
                     if line == "data: [DONE]":
@@ -31,7 +41,7 @@ async def _stream(url: str, body: dict, headers: dict, chunks: list[str],
                         continue
                     event = json.loads(line[5:])
                     if event.get("error"):
-                        raise RuntimeError(str(event["error"]))
+                        raise _StreamError(event["error"])
                     for part in event.get("choices", []):
                         chunks.append(part.get("delta", {}).get("content") or "")
                         reasoning.append(part.get("delta", {}).get("reasoning_content") or "")
@@ -128,7 +138,7 @@ def execute(directory: Path, suite: dict, prompt: str, *,
     result = {"task_directory": str(directory), "model": suite["model"],
               "reasoning_effort": suite["reasoning_effort"], "generation_method": "public-manual-rag",
               "manual_revision": corpus["revision"], "documents": documents,
-              "delivery_continuations": 0, "manual_queries": []}
+              "delivery_continuations": 0, "request_retries": 0, "manual_queries": []}
     response_count = 0
     deadline = time.monotonic() + suite["agent_seconds"]
     while not stop.is_set() and time.monotonic() < deadline:
@@ -139,6 +149,7 @@ def execute(directory: Path, suite: dict, prompt: str, *,
         headers = {"Content-Type": "application/json", **provider.get("http_headers", {}),
                    "Authorization": "Bearer " + key}
         chunks, reasoning_chunks, finish, error = [], [], None, None
+        retryable = False
         try:
             finish = asyncio.run(_stream(
                 provider["base_url"].rstrip("/") + "/chat/completions",
@@ -146,6 +157,11 @@ def execute(directory: Path, suite: dict, prompt: str, *,
                 reasoning=reasoning_chunks))
         except (httpx.HTTPError, OSError, ValueError, RuntimeError, KeyError, TypeError) as failure:
             error = str(failure)
+            retryable = (
+                isinstance(failure, (httpx.TransportError, OSError))
+                or isinstance(failure, httpx.HTTPStatusError)
+                and failure.response.status_code in {408, 429, 500, 502, 503, 504}
+                or isinstance(failure, _StreamError) and failure.retryable)
         content = "".join(chunks)
         reasoning = "".join(reasoning_chunks)
         turn = response_count
@@ -211,6 +227,12 @@ def execute(directory: Path, suite: dict, prompt: str, *,
         if stop.is_set() or time.monotonic() >= deadline:
             break
         if not content and not reasoning:
+            if retryable:
+                result.setdefault("interrupted_stream_errors", []).append(error.replace(key, "<redacted>"))
+                result["request_retries"] += 1
+                stop.wait(min(2 ** min(result["request_retries"], 4),
+                              max(0, deadline - time.monotonic())))
+                continue
             return {**result, "action": "unavailable",
                     "status": "agent_program_error" if finish == "length" else "agent_environment_failure",
                     "error": (error or "Empty incomplete response").replace(key, "<redacted>")}
