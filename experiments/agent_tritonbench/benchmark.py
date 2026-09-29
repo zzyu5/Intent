@@ -28,7 +28,8 @@ class CandidateTorchPolicy(TorchDispatchMode):
     def __torch_dispatch__(self, function, types, args=(), kwargs=None):
         allowed = {"aten.empty", "aten.empty_strided", "aten.empty_like", "aten.new_empty", "aten.view", "aten._unsafe_view",
                    "aten.as_strided", "aten.detach", "aten.alias", "aten.permute", "aten.transpose",
-                   "aten.squeeze", "aten.unsqueeze", "aten.slice", "aten.select", "aten.expand"}
+                   "aten.squeeze", "aten.unsqueeze", "aten.slice", "aten.select", "aten.expand",
+                   "aten.view_as_real", "aten.view_as_complex"}
         name = str(function).rsplit(".", 1)[0]
         if name in allowed:
             return function(*args, **(kwargs or {}))
