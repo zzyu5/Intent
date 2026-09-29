@@ -98,9 +98,14 @@ result in one expression. Intent's type, numerical and effect rules still apply.
 
 The source constructs have distinct meanings:
 - Domains, subregions and index relations describe logical members and values.
+  A for-loop variable over a domain is already a scalar I.index; use it directly.
+  I.indices takes a domain or subregion and produces a tensor of coordinates.
   I.parallel declares independent, unordered iterations; it does not specify a
   GPU program or thread-block count.
 - Ordinary for/while loops declare ordered execution and loop-carried state.
+  I.parallel cannot update an accumulator defined outside its body; its iterations
+  have no shared SSA state. Values used by reduction operations are tensor reads
+  or expressions, rather than a view/buffer object or a scalar loop accumulator.
   When the algorithm permits their documented numerical contracts, express sums,
   inner products and prefixes with reduction, contraction and scan operations.
   Introducing a scalar accumulator loop imposes order; it does not inherit the
@@ -137,7 +142,10 @@ changing runtime scalars; each call is a launch and does not require recompilati
 
 <!-- host-interface -->
 For Intent generation, define ordinary @intent.kernel / @intent.fn programs using
-intent.language. Inside build, use context.compile("unique_literal_name", kernel,
+intent.language. Kernel outputs are explicit I.Out/I.InOut parameters, written by
+the kernel. A Python return annotation does not declare an output, and returning
+an I.buffer does not make a host tensor. Helpers may return DSL values.
+Inside build, use context.compile("unique_literal_name", kernel,
 constexprs={...}) for each kernel. This invokes the unmodified public
 intent.generate path and materializes its generated Triton. The returned artifact
 supports explicit-output launch with runtime arguments in kernel declaration
