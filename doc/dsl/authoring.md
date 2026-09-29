@@ -57,6 +57,8 @@ Scalar/tensor 比较使用 Python 运算符 `==`、`!=`、`<`、`<=`、`>`、`>=
 
 Pointwise 按尾部对齐，允许 scalar/size-one broadcast。`[M]` 与 `[M,N]` 相加不会自动按行匹配：先 `I.reshape(row_value, (M, 1))`；`[N]` 可以直接广播到 `[M,N]`。两个未知 extent 不是因为都 dynamic 就兼容。
 
+同样，`[C]` value 要对应 `[B,C,H,W]` 的第二个轴时，先变成 `[1,C,1,1]`；直接使用 `[C]` 仍只会与最后的 `W` 轴对齐。Broadcast 不依据变量名或数学用途选择轴。
+
 Kernel annotation 使用符号维度时，`reshape`、`full` 等 shape 表达继续引用该符号或对应的 `value.shape`；固定输入本次恰为某个尺寸，不使这个符号等同于该尺寸的字面量。
 
 `I.transpose(value, permutation)` 显式重排；permutation 的长度必须等于输入 rank，包含 `0..rank-1` 的每个轴且仅一次。省略 permutation 时反转全部轴顺序。`I.reshape` 保持 row-major element order，不是任意 data permutation。Domain/subregion 与 integer coordinate tensor 不可互换；索引关系、有效范围和 fill 必须来自作者实际表达。
@@ -76,6 +78,13 @@ Domain 索引按资源索引顺序形成读取结果的 tensor axes，赋值仍�
 普通 `I.reduce` 声明 combine 可结合、可交换，允许并行重结合与重排；不承诺输入顺序或逐 bit 重现。`I.scan` 保留各个 logical prefix 的成员顺序，只允许保序重结合；严格顺序累加使用普通 loop。这些是不同的 operation 合同。
 
 `I.reduce.sum/max/any/all` 返回归约后的 values，没有 `keepdim`；axis 是编译期确定的整数或非空整数 tuple，tuple 可同时归约多轴。若所有轴都被归约，结果是 scalar，而非零维 tensor。补 size-one 轴时，tensor value 使用 `I.reshape`；scalar 不能 reshape，可用 `I.full` 构造 tensor，或按赋值的广播规则直接写出。
+
+例如已有 rank-2 tensor `value` 时，下面只展示归约后的 shape 恢复；第二行把 `[M]` 变为 `[M,1]`，以便后续按行 broadcast 到 `[M,N]`：
+
+```python
+reduced = I.reduce.sum(value, axis=1)
+expanded = I.reshape(reduced, (value.shape[0], 1))
+```
 
 `I.cumsum(value, axis=1)` 对 shape 为 `[M,N]` 的 value 分别计算每一行的前缀，返回同 shape 的 tensor；未选中的轴保持独立，不在不同行之间传递状态。它不会先 flatten 输入。Scan 的成员来自传入的 tensor；读取 subregion 后再 scan，只包含该 subregion 的成员。`I.scan` 与 `I.cummax` 使用相同的 axis 规则。
 
