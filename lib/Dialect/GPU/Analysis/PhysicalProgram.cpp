@@ -3381,6 +3381,18 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     }
     collectAxisRanges(resultSources[fragmentAxis].first,
                       resultSources[fragmentAxis].second, result, visited);
+    if (resultSources[fragmentAxis].first == contract.getLhs()) {
+      auto paired = llvm::find(
+          contract.getLhsBatchAxes(),
+          static_cast<int64_t>(resultSources[fragmentAxis].second));
+      if (paired != contract.getLhsBatchAxes().end()) {
+        unsigned batch = std::distance(contract.getLhsBatchAxes().begin(), paired);
+        // A batch result depends on both paired operands. The left operand
+        // may broadcast along this axis and have no coordinate range at all.
+        collectAxisRanges(contract.getRhs(), contract.getRhsBatchAxes()[batch],
+                          result, visited);
+      }
+    }
     return;
   }
   if (auto branch = dyn_cast<scf::IfOp>(operation)) {
