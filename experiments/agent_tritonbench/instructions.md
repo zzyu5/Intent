@@ -23,7 +23,7 @@ their documented error bounds, range and special-value rules.
 
 Read TASK.md and the provided language materials.
 <!-- intent -->
-For Intent, first call
+For Intent, read materials/api.txt for the current public names and signatures, then call
 intent_manual.read(id="doc/dsl/authoring.md") for the language and host interface
 rules, then read(id="doc/programming-model/kernel-and-host.md") for kernel,
 specialization and multi-kernel composition semantics. Use the public contracts
@@ -83,6 +83,8 @@ Arg-reduce indices are positions in the value being reduced, including when that
 value was read from a subregion. For possibly invalid reads, express their validity
 and fill with I.gather; selecting a value after an invalid read cannot undo the read.
 Keep kernel definitions, compiled artifacts and host wrappers under distinct names.
+Every definition passed to context.compile must use the exact name of a kernel
+defined in candidate.py; check these bindings in the final source.
 At each launch, match the actual tensor rank and argument order to that kernel's
 declared interface; a host view change must be passed to the call that needs it.
 

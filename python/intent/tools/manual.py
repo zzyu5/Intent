@@ -5,6 +5,7 @@ import ast
 from dataclasses import fields
 import inspect
 import json
+import math
 from pathlib import Path
 import re
 import subprocess
@@ -192,14 +193,26 @@ class Manual:
                         score += 1 / (1 + api_terms.index(name.lower()))
                     results.append((score, {"id": name, "kind": "api", "title": name,
                                                   "signature": entry["signature"]}))
-        for entry in self.corpus["documents"].values():
-            if kind not in {"all", entry["kind"]}:
-                continue
-            if "#L" not in entry["id"] and entry["kind"] == "concept":
-                continue
-            body = self._section_bodies[entry["id"]].lower()
-            title = entry["title"].lower()
-            score = sum(8 * (term in title) + (term in body) for term in terms)
+        documents = [entry for entry in self.corpus["documents"].values()
+                     if kind in {"all", entry["kind"]}
+                     and ("#L" in entry["id"] or entry["kind"] != "concept")]
+        patterns = [re.compile(r"(?<![a-z0-9_])" + re.escape(term) +
+                               r"(?![a-z0-9_])") if term.isascii()
+                    else re.compile(re.escape(term)) for term in terms]
+        occurrences = {
+            entry["id"]: [(bool(pattern.search(entry["title"].lower())),
+                           bool(pattern.search(self._section_bodies[entry["id"]].lower())))
+                          for pattern in patterns]
+            for entry in documents
+        }
+        frequencies = [sum(any(matches[index]) for matches in occurrences.values())
+                       for index in range(len(terms))]
+        weights = [math.log1p(len(documents) / (1 + frequency))
+                   for frequency in frequencies]
+        for entry in documents:
+            score = sum(weight * (8 * title + text)
+                        for weight, (title, text) in
+                        zip(weights, occurrences[entry["id"]]))
             if kind == "all" and entry["kind"] == "diagnostic":
                 score /= 4
             if score:
@@ -207,7 +220,7 @@ class Manual:
                 lines = self._section_bodies[entry["id"]].splitlines()
                 match["excerpt"] = next((line.strip()[:400] for line in lines
                                          if not line.startswith("#") and
-                                         any(term in line.lower() for term in terms)), "")
+                                         any(pattern.search(line.lower()) for pattern in patterns)), "")
                 results.append((score, match))
         results.sort(key=lambda row: (-row[0], row[1]["id"]))
         selected = results[:12]

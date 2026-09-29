@@ -65,6 +65,16 @@ def materialize_language(project: Path, triton_ref: Path, directory: Path, langu
             "availability": "provided by this evaluator inside build(context)",
         }
         (directory / "manual.json").write_text(json.dumps(corpus, ensure_ascii=False))
+        declarations = [
+            "Public author API declarations. Consult intent_manual.api for type and result rules.",
+            "Use context.compile inside build for this evaluator's host interface.",
+        ]
+        for name, symbol in sorted(corpus["symbols"].items()):
+            if name.startswith("intent.") and name not in {"intent.kernel", "intent.fn"}:
+                continue
+            qualified = name if name.startswith(("intent.", "context.")) else "I." + name
+            declarations.append(qualified + (symbol["signature"] or ""))
+        (directory / "api.txt").write_text("\n".join(declarations) + "\n")
         return sorted({entry["source"] for entry in corpus["documents"].values()})
     language_path = Path(triton.language.__file__).parent
     sources = []
