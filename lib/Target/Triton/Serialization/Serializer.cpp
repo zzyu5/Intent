@@ -1118,9 +1118,14 @@ private:
       return;
     }
     if (auto map = dyn_cast<MapElementwiseOp>(operation)) {
-      std::string call = "tl.map_elementwise(" + helperNames[&operation].front();
-      for (Value input : map.getInputs())
-        call += ", " + controlValueString(input);
+      bool scalar = map.getResult().getType().getShape().empty();
+      std::string call = scalar ? helperNames[&operation].front() + "("
+                                : "tl.map_elementwise(" + helperNames[&operation].front();
+      for (auto [index, input] : llvm::enumerate(map.getInputs())) {
+        if (!scalar || index)
+          call += ", ";
+        call += controlValueString(input);
+      }
       assign(map.getResult(), call + ")");
       return;
     }
