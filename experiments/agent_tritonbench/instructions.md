@@ -3,8 +3,8 @@ candidate.py defining build(context), which returns the task's original callable
 The evaluator calls build once before timing, then invokes the returned callable.
 The task is included in the request; TASK.md contains an identical copy.
 
-The disclosed profile fixes shapes, dtypes and Python options. You may specialize
-to those values; other option combinations are not required. Tensor contents
+The disclosed profile fixes shapes, dtypes and Python options. Specialize the
+implementation to those values and omit unused option branches. Tensor contents
 remain runtime inputs. Preserve the task's formula, callable defaults, result
 structure, numerical tolerance and observable out/alias behavior. Preserve any
 explicitly required intermediate dtypes or stages; otherwise choose an algorithm

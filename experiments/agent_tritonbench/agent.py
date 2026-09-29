@@ -186,7 +186,7 @@ def execute(directory: Path, suite: dict, prompt: str, *, executable: Path,
     session = None
     continuation_count = 0
     unfinished_reasoning = False
-    for delivery_turn in range(3):
+    while True:
         response.unlink(missing_ok=True)
         process = subprocess.Popen(
             command(directory, suite, response, executable, state_root, language, session),
@@ -215,7 +215,7 @@ def execute(directory: Path, suite: dict, prompt: str, *, executable: Path,
         unfinished_reasoning = reply.count("<think>") > reply.count("</think>")
         delivered = (directory / "candidate.py").exists() and not unfinished_reasoning
         if (timed_out or stop.is_set() or process.returncode or not response.exists()
-                or delivered or not threads or delivery_turn == 2):
+                or delivered or not threads):
             break
         # A draft file does not finish a response that stopped inside reasoning.
         # The original deadline and isolation apply to the same persisted session.
