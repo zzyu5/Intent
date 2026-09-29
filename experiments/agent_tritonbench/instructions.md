@@ -110,7 +110,9 @@ The returned artifact supports two launch forms:
   are allocated and returned. Preserve the order of all other runtime parameters.
 Both forms omit constexpr parameters. Match actual tensor ranks and dtypes to the
 kernel interface. A parameter annotated I.f32 receives a Python floating scalar;
-I.In[I.f32, ()] receives a rank-zero torch.Tensor, not a Python scalar. Read extents
+I.bool receives a Python bool. I.In[I.f32, ()] receives a rank-zero torch.Tensor,
+not a Python scalar. Pass Python scalars directly; constructing a CUDA tensor from
+them with torch.tensor is a host data transfer outside the allowed policy. Read extents
 from view shapes or pass runtime scalars; build
 receives no runtime tensors. Host control flow may call compiled artifacts more
 than once. Cross-kernel state uses host-allocated tensors passed as views, not

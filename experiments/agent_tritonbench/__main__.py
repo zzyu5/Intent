@@ -113,8 +113,10 @@ def generate_trial(arguments, row, language, *, generation_method="codex") -> di
                       "When passing a tensor unchanged to a kernel, use these components in "
                       "I.In[dtype, shape], I.Out[dtype, shape] or I.InOut[dtype, shape] according "
                       "to its access direction. Choose your own internal interfaces and kernel stages:\n")
-        task_text += json.dumps(intent_tensor_types({"arguments": row["invocation"],
-                                                    "result": row["return_contract"]}), indent=2)
+        task_text += "\nTensor | dtype expression | shape expression\n--- | --- | ---\n"
+        for name, components in intent_tensor_types({"arguments": row["invocation"],
+                                                     "result": row["return_contract"]}).items():
+            task_text += f"{name} | `{components['dtype']}` | `{components['shape']}`\n"
     task_text += "\n\nTolerance: " + json.dumps(arguments.suite["tolerances"][row["tolerance"]])
     task_text += "\n\nTiming: " + row["timing"]
     task_text += "\n\nProfile note: " + row["reason"]
