@@ -45,6 +45,7 @@ one launch; a full-domain collective does not implicitly become several kernels.
 
 The following syntax distinctions apply throughout the language:
 - Shape symbols such as "N" in annotations are names, not runtime variables.
+  Static dimensions are integers such as 1 or 2, not strings "1" or "2".
   Obtain extents from x.shape. Reusing a symbol declares equal extents; different
   symbols do not become equal just because one profile has the same sizes.
 - External input view parameters used as value expressions are read over their
@@ -76,6 +77,10 @@ values = x[:, :]
 for row in I.parallel(rows):
     ...  # row is already a scalar coordinate
 ```
+For a rank-2 output view, out[:, :] = values writes a compatible tensor.
+Rebinding out = values does not write the output. Domain indices select a
+Cartesian region, as in x[rows, columns]; coordinate tensors follow ordinary
+broadcasting, as in x[row_indices[:, None], column_indices[None, :]].
 
 <!-- host-interface -->
 Define device functions with @intent.kernel and helpers with @intent.fn. Kernel

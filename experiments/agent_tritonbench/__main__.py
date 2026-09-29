@@ -214,7 +214,7 @@ def main() -> None:
     environment["generation_method"] = arguments.generation_method
     if arguments.generation_method == "rag":
         from .retrieval import generation_instructions
-        environment["isolation"] = "task and frozen public manual only; no model tools, execution, reference code or history"
+        environment["isolation"] = "task and frozen public manual tools only; no execution, filesystem, reference code or history"
         environment["instructions"] = {"intent": generation_instructions()}
     (arguments.output / "environment.json").write_text(json.dumps(environment, indent=2) + "\n")
     fields = ("task", "profile", "language", "status", "candidate_ms", "reference_ms", "ratio", "timing", "failure_stage", "error", "program")

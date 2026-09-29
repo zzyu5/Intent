@@ -14,8 +14,27 @@ from intent.tools.manual import Manual, _section_body
 from .agent import instructions
 
 
+_TOOLS = [
+    {"type": "function", "function": {
+        "name": name, "description": description,
+        "parameters": {"type": "object", "properties": properties,
+                       "required": required, "additionalProperties": False},
+    }}
+    for name, description, properties, required in (
+        ("api", "Read an exact public Intent declaration and its type, shape and semantic rules.",
+         {"name": {"type": "string"}}, ["name"]),
+        ("read", "Read a published manual document/rule ID or exact API name. No filesystem access.",
+         {"id": {"type": "string"}, "section": {"type": ["string", "null"]}}, ["id"]),
+        ("search", "Find public API names or language rules; read returned IDs for details.",
+         {"query": {"type": "string"},
+          "kind": {"type": "string", "enum": ["all", "api", "concept", "diagnostic"]}}, ["query"]),
+    )
+]
+
+
 async def _stream(url: str, body: dict, headers: dict, chunks: list[str],
-                  stop: threading.Event, deadline: float, *, reasoning: list[str]) -> str | None:
+                  stop: threading.Event, deadline: float, *, reasoning: list[str],
+                  tool_calls: dict[int, dict]) -> str | None:
     async def receive():
         finish = None
         async with httpx.AsyncClient(timeout=min(180, deadline - time.monotonic())) as client:
@@ -35,6 +54,17 @@ async def _stream(url: str, body: dict, headers: dict, chunks: list[str],
                     for part in event.get("choices", []):
                         chunks.append(part.get("delta", {}).get("content") or "")
                         reasoning.append(part.get("delta", {}).get("reasoning_content") or "")
+                        for update in part.get("delta", {}).get("tool_calls", []):
+                            call = tool_calls.setdefault(update["index"], {
+                                "id": "", "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            })
+                            if update.get("id"):
+                                call["id"] = update["id"]
+                            if update.get("type", "function") != "function":
+                                raise ValueError("Unsupported upstream tool call type")
+                            for field in ("name", "arguments"):
+                                call["function"][field] += update.get("function", {}).get(field) or ""
                         if part.get("finish_reason"):
                             finish = part["finish_reason"]
         return finish
@@ -61,8 +91,9 @@ def generation_instructions() -> str:
     end = text.index("Intent expresses", begin)
     text = text[:begin] + (
         "Use the attached public API declarations and language contracts. "
-        "No tools are available in this request. The material contains public "
-        "syntax and semantics, not a task implementation.\n\n"
+        "Use api, read and search to query the frozen manual when an operation's "
+        "syntax, result type or shape rules are unclear. These tools only return "
+        "public documentation; they cannot execute or validate a program.\n\n"
     ) + text[end:]
     begin = text.index("Write candidate.py to disk before finishing")
     return text[:begin] + (
@@ -91,14 +122,20 @@ def execute(directory: Path, suite: dict, prompt: str, *,
     material = directory / "materials"
     corpus = json.loads((material / "manual.json").read_text())
     manual = Manual(corpus)
-    documents = ["doc/dsl/authoring.md", manual.api("context.compile")["rules"][0]["id"]]
+    documents = [
+        entry["id"] for entry in sorted(corpus["documents"].values(), key=lambda entry: entry["line"])
+        if entry["source"] == "doc/dsl/authoring.md" and "#L" in entry["id"]
+        and entry["title"] != "Host 编译与调用"
+    ]
+    documents.append(manual.api("context.compile")["rules"][0]["id"])
+    bootstrap_count = len(documents)
     query = (directory / "TASK.md").read_text().split("Callable parameter signature", 1)[0]
     for hit in manual.search(query, kind="concept")["matches"]:
         if hit["source"] in {"doc/dsl/authoring.md", "doc/programming-model/kernel-and-host.md"}:
             continue
         if hit["id"] not in documents:
             documents.append(hit["id"])
-        if len(documents) == 5:
+        if len(documents) == bootstrap_count + 3:
             break
     excerpts = []
     for identifier in documents:
@@ -113,29 +150,64 @@ def execute(directory: Path, suite: dict, prompt: str, *,
     result = {"task_directory": str(directory), "model": suite["model"],
               "reasoning_effort": suite["reasoning_effort"], "generation_method": "public-manual-rag",
               "manual_revision": corpus["revision"], "documents": documents,
-              "delivery_continuations": 0}
+              "delivery_continuations": 0, "manual_queries": []}
+    response_count = 0
     deadline = time.monotonic() + suite["agent_seconds"]
     while not stop.is_set() and time.monotonic() < deadline:
         body = {"model": suite["model"], "messages": messages,
                 "reasoning_effort": suite["reasoning_effort"],
                 "thinking": {"type": "enabled", "clear_thinking": False},
-                "max_tokens": 32768, "response_format": {"type": "json_object"}, "stream": True}
+                "max_tokens": 32768, "response_format": {"type": "json_object"}, "stream": True,
+                "tools": _TOOLS, "tool_choice": "auto"}
         headers = {"Content-Type": "application/json", **provider.get("http_headers", {}),
                    "Authorization": "Bearer " + key}
         chunks, reasoning_chunks, finish, error = [], [], None, None
+        tool_calls = {}
         try:
             finish = asyncio.run(_stream(
                 provider["base_url"].rstrip("/") + "/chat/completions",
-                body, headers, chunks, stop, deadline, reasoning=reasoning_chunks))
-        except (httpx.HTTPError, OSError, ValueError, RuntimeError) as failure:
+                body, headers, chunks, stop, deadline,
+                reasoning=reasoning_chunks, tool_calls=tool_calls))
+        except (httpx.HTTPError, OSError, ValueError, RuntimeError, KeyError, TypeError) as failure:
             error = str(failure)
         content = "".join(chunks)
         reasoning = "".join(reasoning_chunks)
-        turn = result["delivery_continuations"]
+        turn = response_count
+        response_count += 1
         (directory / f"response-{turn}.txt").write_text(content.replace(key, "<redacted>"))
         if reasoning:
             (directory / f"reasoning-{turn}.txt").write_text(reasoning.replace(key, "<redacted>"))
         result["finish_reason"] = finish
+        previous = {"role": "assistant", "content": content}
+        if reasoning:
+            previous["reasoning_content"] = reasoning
+        if tool_calls:
+            calls = [tool_calls[index] for index in sorted(tool_calls)]
+            if any(not call["id"] or not call["function"]["name"] for call in calls):
+                return {**result, "action": "unavailable", "status": "agent_environment_failure",
+                        "error": "Upstream tool call lacks its ID or function name"}
+            previous["tool_calls"] = calls
+            messages.append(previous)
+            methods = {"api": manual.api, "read": manual.read, "search": manual.search}
+            for call in calls:
+                name, arguments = call["function"]["name"], call["function"]["arguments"]
+                query = {"tool": name, "arguments": arguments}
+                try:
+                    arguments = json.loads(arguments)
+                    if not isinstance(arguments, dict):
+                        raise ValueError("Tool arguments must be a JSON object")
+                    if any(not isinstance(value, str) and not (key == "section" and value is None)
+                           for key, value in arguments.items()):
+                        raise TypeError("Manual arguments must be strings; section may also be null")
+                    response = methods[name](**arguments)
+                    query["status"] = "returned"
+                except (KeyError, TypeError, ValueError) as failure:
+                    response = {"error": str(failure)}
+                    query["status"] = "error"
+                result["manual_queries"].append(query)
+                messages.append({"role": "tool", "tool_call_id": call["id"],
+                                 "content": json.dumps(response, ensure_ascii=False)})
+            continue
         unfinished = content.count("<think>") > content.count("</think>")
         if finish == "stop" and not unfinished:
             source = content.strip()
@@ -164,9 +236,6 @@ def execute(directory: Path, suite: dict, prompt: str, *,
         if error:
             result.setdefault("interrupted_stream_errors", []).append(error.replace(key, "<redacted>"))
         result.setdefault("interrupted_finish_reasons", []).append(finish)
-        previous = {"role": "assistant", "content": content}
-        if reasoning:
-            previous["reasoning_content"] = reasoning
         messages.extend((
             previous,
             {"role": "user", "content":
