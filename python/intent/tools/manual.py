@@ -249,17 +249,19 @@ class Manual:
                 "verification": "not evaluated by this read-only service; diagnostics do not redefine doc semantics"}
 
     def read(self, id: str, section: str | None = None) -> dict:
-        """Read a published document/rule ID or an exact API name such as I.matmul. No filesystem paths accepted."""
+        """Read a published document/rule ID or exact API name. section accepts a heading title or its published line (for example L134)."""
         name = id.removeprefix("intent.language.").removeprefix("I.")
         if name in self.corpus["symbols"] and section is None:
             return self.api(name)
         if section is not None:
+            anchor = re.fullmatch(r"#?L?(\d+)", section)
             entries = [d for d in self.corpus["documents"].values()
-                       if d["source"] == id and d["title"] == section and "#L" in d["id"]]
+                       if d["source"] == id and "#L" in d["id"] and
+                       (d["line"] == int(anchor[1]) if anchor else d["title"] == section)]
             if len(entries) != 1:
                 titles = [d["title"] for d in self.corpus["documents"].values()
                           if d["source"] == id and "#L" in d["id"]]
-                raise ValueError(f"Use an exact section title from this document: {titles}; "
+                raise ValueError(f"Use a published heading line or an exact section title from this document: {titles}; "
                                  "omit section to read the whole document, or use api(name=...) for an API.")
             entry = entries[0]
         else:
@@ -281,7 +283,7 @@ def main() -> None:
     server = FastMCP("intent_manual", instructions=(
         "Intent language and GPU execution contracts. Call api(name='I.domain') for exact declarations and rule IDs; "
         "read(id=...) for syntax, types, semantics and callable interface rules. "
-        "read(id=..., section=...) accepts an exact section title. "
+        "read(id=..., section=...) accepts an exact section title or its published heading line. "
         "Use search(query=..., kind=...) to find names and IDs. "
         "No execution or task answers."
     ))

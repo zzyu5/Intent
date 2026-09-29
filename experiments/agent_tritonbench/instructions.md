@@ -34,7 +34,7 @@ schema. Consult the manual before writing code; it does not execute programs or
 provide task answers.
 For syntax or semantics questions, use search(kind="concept") rather than searching
 implementation diagnostics. Read accepts the returned document/rule IDs and exact
-public API names; section titles must be copied from the document, not guessed.
+public API names; section accepts a published heading title or line such as L134.
 <!-- /intent -->
 Write candidate.py containing
 build(context), which returns a callable with the task's original wrapper
