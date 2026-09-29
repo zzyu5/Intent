@@ -3829,6 +3829,55 @@ bool hoistNestedReduction(scf::ForOp outer, func::FuncOp kernel) {
   return true;
 }
 
+bool sinkReductionIntoSourceIf(ReduceOp reduce, func::FuncOp kernel) {
+  auto sources = reduce.getInputs().take_front(reduce.getSourceCount());
+  auto branch = sources.empty() ? scf::IfOp()
+                               : sources.front().getDefiningOp<scf::IfOp>();
+  if (!branch || branch.getElseRegion().empty() ||
+      branch->getBlock() != reduce->getBlock() ||
+      branch.getNumResults() != reduce.getNumResults() ||
+      !llvm::equal(sources, branch.getResults()) ||
+      !llvm::all_of(branch.getResults(), [&](Value result) {
+        return result.hasOneUse() && *result.getUsers().begin() == reduce.getOperation();
+      }))
+    return false;
+  DominanceInfo dominance(kernel);
+  SmallVector<Operation *> identities;
+  for (Value value : reduce.getInputs().drop_front(reduce.getSourceCount())) {
+    if (dominance.dominates(value, branch.getOperation()))
+      continue;
+    Operation *producer = value.getDefiningOp();
+    if (!producer || !isa<arith::ConstantOp, SplatOp>(producer) ||
+        !llvm::all_of(producer->getOperands(), [&](Value operand) {
+          return dominance.dominates(operand, branch.getOperation());
+        }))
+      return false;
+    if (!llvm::is_contained(identities, producer))
+      identities.push_back(producer);
+  }
+  OpBuilder builder(branch);
+  IRMapping captures;
+  for (Operation *identity : identities)
+    builder.clone(*identity, captures);
+  // Keep conditionally executed reads in their original branch. The pure
+  // reduction consumes exactly that branch's yielded values before its exit.
+  for (Region *region : {&branch.getThenRegion(), &branch.getElseRegion()}) {
+    auto yield = cast<scf::YieldOp>(region->front().getTerminator());
+    IRMapping mapping(captures);
+    for (auto [source, value] : llvm::zip(sources, yield.getOperands()))
+      mapping.map(source, value);
+    builder.setInsertionPoint(yield);
+    auto reduced = cast<ReduceOp>(builder.clone(*reduce.getOperation(), mapping));
+    yield->setOperands(reduced.getResults());
+  }
+  for (auto [result, reduced] : llvm::zip(branch.getResults(), reduce.getResults())) {
+    result.setType(reduced.getType());
+    reduced.replaceAllUsesWith(result);
+  }
+  reduce.erase();
+  return true;
+}
+
 } // namespace
 
 LogicalResult decomposeMultiAxisReductions(ModuleOp module) {
@@ -3888,6 +3937,10 @@ LogicalResult realizeReductionBlocking(ModuleOp module) {
     kernel.walk([&](ReduceOp reduce) { candidates.push_back(reduce); });
     bool changed = false;
     for (ReduceOp reduce : candidates) {
+      if (sinkReductionIntoSourceIf(reduce, kernel)) {
+        changed = true;
+        break;
+      }
       if (hasSelectedSegmentExtent(reduce, kernel))
         continue;
       FailureOr<bool> padded = realizeStaticPaddingReduce(reduce, kernel);
