@@ -65,6 +65,15 @@ def intent_tensor_types(metadata: dict) -> dict[str, dict[str, str]]:
     return result
 
 
+def intent_constexpr_options(invocation: dict) -> dict[str, dict[str, str]]:
+    return {
+        name: {"annotation": f"I.Constexpr[{type(value).__name__}]",
+               "binding": repr(name) + ": " + repr(value)}
+        for name, value in invocation.items()
+        if type(value) in (bool, int, float)
+    }
+
+
 def materialize_language(project: Path, triton_ref: Path, directory: Path, language: str) -> list[str]:
     directory.mkdir(parents=True)
     if language == "intent":

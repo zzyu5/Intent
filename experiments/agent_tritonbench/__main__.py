@@ -20,7 +20,7 @@ import torch
 import triton
 
 from experiments import PROJECT_ROOT
-from .agent import execute, instructions, intent_tensor_types, materialize_language
+from .agent import execute, instructions, intent_constexpr_options, intent_tensor_types, materialize_language
 from .tasks import SUITE_PATH, catalog, description, invocation, read_suite, reference, return_contract
 
 
@@ -117,6 +117,15 @@ def generate_trial(arguments, row, language, *, generation_method="codex") -> di
         for name, components in intent_tensor_types({"arguments": row["invocation"],
                                                      "result": row["return_contract"]}).items():
             task_text += f"{name} | `{components['dtype']}` | `{components['shape']}`\n"
+        options = intent_constexpr_options(row["invocation"])
+        if options:
+            task_text += ("\nOptional compile-time spellings for the already disclosed Python profile options. "
+                          "If an option is declared as a kernel constexpr, bind it in context.compile "
+                          "inside build and omit it from artifact launch arguments. These options do "
+                          "not describe tensor contents or view-shape symbols.\n\n"
+                          "Option | parameter annotation | entry in constexprs\n--- | --- | ---\n")
+            for name, option in options.items():
+                task_text += f"{name} | `{option['annotation']}` | `{option['binding']}`\n"
     task_text += "\n\nTolerance: " + json.dumps(arguments.suite["tolerances"][row["tolerance"]])
     task_text += "\n\nTiming: " + row["timing"]
     task_text += "\n\nProfile note: " + row["reason"]
