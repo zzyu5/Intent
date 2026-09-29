@@ -28,13 +28,16 @@ intent_manual.read(id="doc/dsl/authoring.md") for the language and host interfac
 rules, then read(id="doc/programming-model/kernel-and-host.md") for kernel,
 specialization and multi-kernel composition semantics. Use the public contracts
 to express the independent logical work and dependencies of your algorithm.
-Use api for declarations and signatures, then read the returned rule IDs
+Use api for declarations and signatures, then read(id=<returned rule ID>)
 for return shapes, dtypes and semantics; api does not infer your program's result
 schema. Consult the manual before writing code; it does not execute programs or
 provide task answers.
 For syntax or semantics questions, use search(kind="concept") rather than searching
-implementation diagnostics. Read accepts the returned document/rule IDs and exact
-public API names; section accepts a published heading title or line such as L134.
+implementation diagnostics. Copy returned IDs; do not guess section titles or
+resource URIs. Read accepts document/rule IDs and exact public API names; section
+accepts a published heading title or line such as L134. The MCP tools are search,
+api and read. The evaluator's context.compile interface is defined below, not an
+Intent intrinsic to discover in the language API.
 <!-- /intent -->
 Write candidate.py containing
 build(context), which returns a callable with the task's original wrapper
@@ -175,6 +178,8 @@ legality pruning. Both arms use the same median-only CUDA Graph
 measurement policy. Tuning is evaluator-side execution preparation, not another
 agent submission.
 
-When candidate.py is ready, finish with the specified JSON response:
+Write the complete candidate.py to disk before finishing. Planning prose or code
+in the final response does not create the submission file. Once it is written,
+finish with the specified JSON response:
 {"action": "submit", "reason": "brief implementation or change description"}.
 Do not claim correctness or speed that has not been measured by the evaluator.
