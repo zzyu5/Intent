@@ -53,7 +53,7 @@
     {"id":"gelu_conv2d","family":"fusion","input_index":4,"tolerance":"fp32"},
     {"id":"conv2d_add","family":"fusion","input_index":0,"tolerance":"fp32","note":"Original smallest spatial profile; no additional input matrix."},
     {"id":"combined_activation","family":"fusion","input_index":6,"tolerance":"fp32","note":"Fixed 2D upstream profile; not the broader rank range described by the prompt."},
-    {"id":"fused_layer_norm_relu_linear","family":"fusion","input_index":4,"tolerance":"fp32"},
+    {"id":"fused_layer_norm_relu_linear","family":"fusion","input_index":4,"tolerance":"fp32","description":"Apply a linear transformation with input, weight and optional bias, followed by ReLU, then layer normalization over normalized_shape using population variance and eps. The linear weight has shape (out_features, in_features), and its optional bias has shape (out_features). The reference applies no affine weight or bias in layer normalization: elementwise_affine is accepted but ignored. Preserve the output shape, dtype and device."},
     {"id":"softplus_linear","family":"fusion","input_index":6,"tolerance":"fp32","description":"For input shape (M,K), weight has shape (N,K), and optional bias has shape (N). Let z[m,n] = sum_k input[m,k] * weight[n,k], plus bias[n] when supplied. Return z[m,n] when z[m,n] > threshold; otherwise return log(1 + exp(beta * z[m,n])) / beta. The threshold comparison uses z before scaling by beta. Return shape (M,N), preserving the reference floating dtype and device."},
     {"id":"permute_copy","family":"indexing_layout","input_index":2,"tolerance":"exact","note":"Return a fresh allocation; a permuted alias is not the requested copy."},
     {"id":"ifftshift","family":"indexing_layout","input_index":8,"tolerance":"exact"},
