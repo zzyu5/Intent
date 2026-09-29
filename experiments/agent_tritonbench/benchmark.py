@@ -31,9 +31,9 @@ class CandidateTorchPolicy(TorchDispatchMode):
                    "aten.squeeze", "aten.unsqueeze", "aten.slice", "aten.select", "aten.expand",
                    "aten.view_as_real", "aten.view_as_complex", "aten.result_type"}
         name = str(function).rsplit(".", 1)[0]
-        # These helpers may occur in unused host branches; executing their fills is forbidden.
-        if name in {"aten.ones", "aten.ones_like", "aten.zeros_like"}:
-            raise ValueError(f"Tensor initialization must use the submitted language, not PyTorch {function}")
+        # These calls may occur in unused host branches; execution is forbidden.
+        if name in {"aten.ones", "aten.ones_like", "aten.zeros_like", "aten.std", "aten.std_mean"}:
+            raise ValueError(f"Tensor computation must use the submitted language, not PyTorch {function}")
         if name in allowed:
             return function(*args, **(kwargs or {}))
         tensors = [value for value in tree_flatten((args, kwargs))[0] if isinstance(value, torch.Tensor)]
