@@ -1300,6 +1300,42 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
     appendTuple([&](ParameterOp parameter) -> const TuningProfile & {
       return parameterProfiles.find(parameter)->second.front();
     }, true);
+  if (!hasContraction)
+    kernel.walk([&](ReduceOp reduce) {
+      if (reduce.getSourceCount() != 1 || reduce.getAxes().size() != 1)
+        return;
+      auto source = dyn_cast<FragmentType>(reduce.getInputs().front().getType());
+      if (!source)
+        return;
+      ParameterOp chunk;
+      SmallVector<ParameterOp> rows;
+      for (ParameterOp parameter : parameters) {
+        auto schema = parameter.getParameter();
+        auto role = static_cast<ParameterRole>(schema.getRole());
+        if (role == ParameterRole::Reduction &&
+            reducedAxesReferenceParameter(source, reduce.getAxes(), schema.getName())) {
+          if (chunk || tuningClass(kernel, parameter) != TuningClass::Reduction)
+            return;
+          chunk = parameter;
+        } else if ((role == ParameterRole::OwnershipM ||
+                    role == ParameterRole::OwnershipN) &&
+                   freeAxesReferenceParameter(source, reduce.getAxes(), schema.getName())) {
+          rows.push_back(parameter);
+        }
+      }
+      if (!chunk || rows.empty())
+        return;
+      // Keep the row/chunk preferences of one reduction profile together.
+      // Unrelated parameters retain their own family's profile selection.
+      for (auto [index, profile] :
+           llvm::enumerate(parameterProfiles.find(chunk)->second))
+        appendTuple([&](ParameterOp parameter) -> const TuningProfile & {
+          if (parameter == chunk || llvm::is_contained(rows, parameter))
+            return profile;
+          const auto &profiles = parameterProfiles.find(parameter)->second;
+          return profiles[std::min<size_t>(index, profiles.size() - 1)];
+        });
+    });
   for (const CorrelatedProfileParameters &correlated : correlatedProfiles) {
     const auto &matrixProfiles =
         parameterProfiles.find(correlated.contraction)->second;
