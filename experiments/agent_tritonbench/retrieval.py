@@ -4,6 +4,7 @@ import ast
 import asyncio
 import json
 from pathlib import Path
+import re
 import threading
 import time
 
@@ -72,8 +73,8 @@ def generation_instructions() -> str:
     end = text.index("Intent expresses", begin)
     text = text[:begin] + (
         "Use the attached public API declarations and language contracts. "
-        "Before drafting the program, query the API contracts you intend to use "
-        "with api, read or search. Request documentation by returning a JSON object "
+        "Query API contracts with api, read or search as needed. "
+        "Request documentation by returning a JSON object "
         'of the form {"queries": [{"tool": "api", "arguments": {"name": "I.full"}}]}. '
         "Available queries are api(name), read(id, section=null), and "
         "search(query, kind='all'); search kinds are all, api, concept and diagnostic. "
@@ -84,10 +85,15 @@ def generation_instructions() -> str:
     ) + text[end:]
     begin = text.index("Write candidate.py to disk before finishing")
     return text[:begin] + (
-        "Each response must be either a documentation queries JSON object as "
-        "described above, or a final JSON object with one key, program, whose "
-        "string value is the complete Python source for candidate.py. "
-        "The caller saves the final program verbatim. "
+        "Before final submission, return a JSON object with one key, draft, whose "
+        "string value is your complete proposed Python source. The caller only "
+        "looks up public documentation for the API names appearing in the draft; "
+        "it does not compile, execute or check the program. Read those declarations "
+        "and type/shape rules and review your own source against them. You may "
+        "request more documentation with queries. When ready, return a final JSON "
+        "object with one key, program, whose string value is the complete Python "
+        "source for candidate.py. Only that final program is submitted and saved "
+        "verbatim. "
         "Do not claim unmeasured correctness or speed."
     )
 
@@ -139,7 +145,8 @@ def execute(directory: Path, suite: dict, prompt: str, *,
     result = {"task_directory": str(directory), "model": suite["model"],
               "reasoning_effort": suite["reasoning_effort"], "generation_method": "public-manual-rag",
               "manual_revision": corpus["revision"], "documents": documents,
-              "delivery_continuations": 0, "request_retries": 0, "manual_queries": []}
+              "delivery_continuations": 0, "request_retries": 0,
+              "draft_documentation_rounds": 0, "manual_queries": []}
     response_count = 0
     deadline = time.monotonic() + suite["agent_seconds"]
     while not stop.is_set() and time.monotonic() < deadline:
@@ -183,6 +190,32 @@ def execute(directory: Path, suite: dict, prompt: str, *,
                 reply = json.loads(source)
                 if not isinstance(reply, dict):
                     raise ValueError("Response must be a JSON object")
+                if set(reply) == {"draft"}:
+                    if not isinstance(reply["draft"], str) or not reply["draft"].strip():
+                        raise ValueError("draft must be a nonempty source string")
+                    names = set(re.findall(
+                        r"\b(?:I|intent)\.[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", reply["draft"]))
+                    names.add("context.compile")
+                    declarations, rules = [], {}
+                    for name in sorted(names):
+                        declaration = manual.api(name)
+                        if declaration["status"] == "declared":
+                            for rule in declaration["rules"]:
+                                rules[rule["id"]] = rule
+                            declaration["rules"] = [rule["id"] for rule in declaration["rules"]]
+                        declarations.append(declaration)
+                        result["manual_queries"].append({
+                            "tool": "api", "arguments": {"name": name},
+                            "source": "draft", "status": "returned"})
+                    result["draft_documentation_rounds"] += 1
+                    messages.extend((previous, {"role": "user", "content":
+                        "Public declarations for names appearing in your draft, with shared rules "
+                        "listed once. This is documentation retrieval only; the draft has not been "
+                        "compiled, executed or validated. Review the source against these contracts, "
+                        "the task and the original host constraints before your final submission.\n" +
+                        json.dumps({"declarations": declarations, "rules": list(rules.values())},
+                                   ensure_ascii=False)}))
+                    continue
                 if set(reply) == {"queries"}:
                     calls = reply["queries"]
                     if not isinstance(calls, list) or not calls:
@@ -211,7 +244,7 @@ def execute(directory: Path, suite: dict, prompt: str, *,
                         "Public manual query results:\n" + json.dumps(responses, ensure_ascii=False)}))
                     continue
                 if set(reply) != {"program"}:
-                    raise ValueError("Response must contain only queries or only program")
+                    raise ValueError("Response must contain only queries, draft or program")
                 program = reply["program"]
                 if not isinstance(program, str):
                     raise ValueError("program must be a source string")
@@ -244,7 +277,7 @@ def execute(directory: Path, suite: dict, prompt: str, *,
             previous,
             {"role": "user", "content":
              "The response stream was interrupted. Continue the original task from the retained "
-             "context and return a complete documentation query JSON or final program JSON. "
+             "context and return a complete documentation query, draft or final program JSON. "
              "No compiler, execution or benchmark feedback is available."},
         ))
         result["delivery_continuations"] += 1
