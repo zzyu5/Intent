@@ -96,7 +96,11 @@ def finish_trial(arguments, result, measured) -> dict:
     return result
 
 
-def generate_trial(arguments, row, language) -> dict:
+def generate_trial(arguments, row, language, *, generation_method="codex") -> dict:
+    if generation_method not in {"codex", "rag"}:
+        raise ValueError("generation_method must be codex or rag")
+    if generation_method == "rag" and language != "intent":
+        raise NotImplementedError("public-manual RAG generation currently supports Intent only")
     directory = Path(tempfile.mkdtemp(prefix=f"{row['task']}-{language}-", dir=arguments.state_root / "candidates")).resolve()
     materials = materialize_language(arguments.project, arguments.triton_ref, directory / "materials", language)
     task_text = description(arguments.reference, row)
@@ -110,8 +114,13 @@ def generate_trial(arguments, row, language) -> dict:
     (directory / "TASK.md").write_text(task_text)
     prompt = f"Implement TASK.md correctly and efficiently using {language}. Submit one complete candidate.py.\n"
     prompt += "\nComplete task and fixed invocation (identical to TASK.md):\n\n" + task_text + "\n"
-    agent = execute(directory, arguments.suite, prompt,
-                    executable=arguments.codex, state_root=arguments.state_root, language=language, stop=arguments.stop)
+    if generation_method == "rag":
+        from .retrieval import execute as execute_retrieval
+        agent = execute_retrieval(directory, arguments.suite, prompt,
+                                  state_root=arguments.state_root, stop=arguments.stop)
+    else:
+        agent = execute(directory, arguments.suite, prompt,
+                        executable=arguments.codex, state_root=arguments.state_root, language=language, stop=arguments.stop)
     destination = arguments.output / row["task"] / language
     destination.mkdir(parents=True)
     agent["language_materials"] = materials
@@ -139,7 +148,7 @@ def main() -> None:
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--triton-ref", type=Path, required=True)
     parser.add_argument("--compiler", type=Path, required=True)
-    parser.add_argument("--codex", type=Path, required=True, help="Native Codex executable")
+    parser.add_argument("--codex", type=Path, help="Native executable required for --generation-method codex")
     parser.add_argument("--state-root", type=Path, required=True, help="Dedicated external config.toml, provider.key and Codex state")
     parser.add_argument("--output", type=Path, required=True, help="New result directory; previous batches are never resumed")
     parser.add_argument("--suite", dest="suite_path", type=Path, default=SUITE_PATH,
@@ -151,13 +160,21 @@ def main() -> None:
                         help="Concurrent compiler/JIT processes; GPU execution uses the shared lock")
     parser.add_argument("--generate-only", action="store_true",
                         help="Submit programs without compiling or evaluating them")
+    parser.add_argument("--generation-method", choices=("codex", "rag"), default="codex",
+                        help="Isolated Codex with manual MCP, or Intent-only public-manual RAG over Chat Completions")
     parser.add_argument("--gpu-lock", type=Path)
     arguments = parser.parse_args()
+    if arguments.generation_method == "rag" and set(arguments.arms) != {"intent"}:
+        parser.error("--generation-method rag requires --arms intent")
+    if arguments.generation_method == "codex" and arguments.codex is None:
+        parser.error("--generation-method codex requires --codex")
     arguments.project = PROJECT_ROOT
     arguments.suite_path = arguments.suite_path.resolve(strict=True)
     arguments.suite, arguments.stop = read_suite(arguments.suite_path), threading.Event()
-    for name in ("reference", "triton_ref", "compiler", "codex", "state_root"):
+    for name in ("reference", "triton_ref", "compiler", "state_root"):
         setattr(arguments, name, getattr(arguments, name).resolve(strict=True))
+    if arguments.codex is not None:
+        arguments.codex = arguments.codex.resolve(strict=True)
     if arguments.state_root.is_relative_to(arguments.project):
         parser.error("dedicated state/candidates must live outside the project")
     if not 1 <= arguments.workers <= 8:
@@ -194,6 +211,11 @@ def main() -> None:
                    "timing": "complete operator; per-task paired CUDA Graph or CUDA event timing; compilation/tuning excluded",
                    "isolation": "dedicated Codex state/provider; workspace-only shell, no network; read-only public manual MCP; no reference/history/agents",
                    "instructions": {language: instructions(language) for language in arguments.arms}}
+    environment["generation_method"] = arguments.generation_method
+    if arguments.generation_method == "rag":
+        from .retrieval import generation_instructions
+        environment["isolation"] = "task and frozen public manual only; no model tools, execution, reference code or history"
+        environment["instructions"] = {"intent": generation_instructions()}
     (arguments.output / "environment.json").write_text(json.dumps(environment, indent=2) + "\n")
     fields = ("task", "profile", "language", "status", "candidate_ms", "reference_ms", "ratio", "timing", "failure_stage", "error", "program")
     with ((arguments.output / "results.csv").open("w", newline="") as output,
@@ -201,7 +223,8 @@ def main() -> None:
           ThreadPoolExecutor(max_workers=arguments.benchmark_workers) as evaluation):
         writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
-        futures = {generation.submit(generate_trial, arguments, row, language): True
+        futures = {generation.submit(generate_trial, arguments, row, language,
+                                     generation_method=arguments.generation_method): True
                    for row in rows for language in arguments.arms}
         try:
             while futures:

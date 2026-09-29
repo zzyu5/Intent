@@ -90,6 +90,8 @@ I.Constexpr[bool] or I.Constexpr[str], not bare I.Constexpr. View shape symbols 
 not declare constexprs. Runtime
 launch arguments cannot supply constexprs. All compile calls execute inside build,
 outside the returned callable; do not call intent.compile/generate yourself.
+For a parameter flag: I.Constexpr[bool], pass constexprs={"flag": True} to
+context.compile and omit flag from the artifact launch arguments.
 
 The returned artifact supports two launch forms:
 - artifact(*runtime_arguments): supply every runtime parameter in declaration

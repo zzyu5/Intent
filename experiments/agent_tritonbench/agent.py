@@ -69,6 +69,7 @@ def materialize_language(project: Path, triton_ref: Path, directory: Path, langu
             "Public author API declarations. Consult intent_manual.api for type and result rules.",
             "Kernel intrinsics are DSL operations; dtype tokens and type aliases are not operations.",
             "Annotations describe parameters. Namespaces expose members; a namespace is callable only if a signature is shown.",
+            "Quoted return annotations describe result kinds, not exported Python types.",
             "Use context.compile inside build for this evaluator's host interface.",
         ]
         for name, symbol in sorted(corpus["symbols"].items()):

@@ -9,6 +9,7 @@ def _signature(
     optional_positional: tuple[tuple[str, object], ...] = (),
     required: tuple[str, ...] = (),
     defaults: tuple[tuple[str, object], ...] = (),
+    return_annotation: object = Signature.empty,
 ) -> Signature:
     return Signature(
         [Parameter(name, Parameter.POSITIONAL_OR_KEYWORD) for name in positional]
@@ -18,22 +19,25 @@ def _signature(
         + [
             Parameter(name, Parameter.KEYWORD_ONLY, default=value)
             for name, value in defaults
-        ]
+        ],
+        return_annotation=return_annotation,
     )
 
 
 INTRINSIC_SIGNATURES = {
-    "domain": _signature(("start", "stop"), optional_positional=(("step", 1),)),
-    "parallel": _signature(("source",)),
-    "indices": _signature(("region",)),
+    "domain": _signature(("start", "stop"), optional_positional=(("step", 1),),
+                         return_annotation="logical domain"),
+    "parallel": _signature(("source",), return_annotation="parallel iteration"),
+    "indices": _signature(("region",), return_annotation="index tensor or tuple of index tensors"),
     "end": _signature(("region",)),
     "assume_in_bounds": _signature(("index", "view", "axis")),
     "reshape": _signature(("value", "shape")),
     "join": _signature(("lhs", "rhs")),
     "transpose": _signature(("value",), optional_positional=(("permutation", None),)),
-    "full": _signature(("shape", "fill", "dtype")),
-    "zeros": _signature(("shape", "dtype")),
-    "buffer": _signature(("shape", "dtype"), optional_positional=(("init", None),)),
+    "full": _signature(("shape", "fill", "dtype"), return_annotation="immutable tensor"),
+    "zeros": _signature(("shape", "dtype"), return_annotation="immutable tensor"),
+    "buffer": _signature(("shape", "dtype"), optional_positional=(("init", None),),
+                         return_annotation="mutable buffer"),
     "record": Signature([Parameter("fields", Parameter.VAR_KEYWORD)]),
     "cast": _signature(("value", "dtype")),
     "bitcast": _signature(("value", "dtype")),
@@ -45,7 +49,10 @@ INTRINSIC_SIGNATURES = {
        ("add", "maximum", "minimum", "maximum_num", "minimum_num")},
     "reduce": _signature(("value", "axis", "identity", "combine"),
                          optional_positional=(("combine_operands", ()), ("acc_dtype", None))),
-    "arg_reduce.max": _signature(("value", "axis"), optional_positional=(("acc_dtype", None),)),
+    "arg_reduce.max": _signature(
+        ("value", "axis"), optional_positional=(("acc_dtype", None),),
+        return_annotation="(value, I.index indices); reduced axes removed; full reduction gives scalars",
+    ),
     "contract": _signature(("lhs", "rhs", "reduce", "acc_dtype"), optional_positional=(("batch", ()),)),
     "region_fold": _signature(("source", "axis", "summarize", "combine", "identity"),
                               optional_positional=(("operands", ()),)),
