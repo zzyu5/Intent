@@ -5484,6 +5484,19 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           return sameLogicalRange(root, range);
         });
       }) > 1;
+      // A free producer can feed one operand while its source identity is
+      // repeated in the result. Contraction replay owns those Cartesian
+      // occurrences; a source-wide pointwise tile would conflate them.
+      reduced |= contract.getLhsBatchAxes().empty() &&
+                 llvm::any_of(freeAxes.axes, [&](const auto &axis) {
+        auto mapping = queryAxisMap(axis.operand.getType(), axis.operandAxis);
+        return succeeded(mapping) &&
+               queryFragmentAxes(contract.getResult().getType(),
+                                 sourceAxisIdentity(*mapping)).size() > 1 &&
+               llvm::any_of(axis.ranges.roots, [&](MakeRangeOp root) {
+                 return sameLogicalRange(root, range);
+               });
+      });
       for (auto [operand, axes] :
            {std::pair{contract.getLhs(), contract.getLhsReductionAxes()},
             std::pair{contract.getRhs(), contract.getRhsReductionAxes()}})
@@ -5539,7 +5552,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   uint64_t nextOccurrenceSource = nextPhysicalAxisIdentities(kernel).first;
   for (MakeRangeOp range : allRanges) {
     if (!independentContractionRanges.contains(range.getOperation()) ||
-        !ownershipSources.contains(sourceAxisIdentity(range)))
+        !hasPointwiseOwnership(range))
       continue;
     MakeRangeOp root = range;
     for (const auto &entry : occurrenceRoots)
