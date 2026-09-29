@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import inspect
+import ast
 import json
 import os
 from pathlib import Path
@@ -42,8 +42,6 @@ def materialize_language(project: Path, triton_ref: Path, directory: Path, langu
     directory.mkdir(parents=True)
     if language == "intent":
         corpus = snapshot(project)
-        from .program import ProgramContext
-
         source = Path(__file__).with_name("instructions.md")
         text = source.read_text()
         contract = re.search(r"<!-- host-interface -->\n(.*?)<!-- /host-interface -->", text, re.DOTALL)
@@ -54,8 +52,12 @@ def materialize_language(project: Path, triton_ref: Path, directory: Path, langu
             "kind": "concept", "source": str(source.relative_to(project)),
             "line": line, "text": contract[1],
         }
-        signature = inspect.signature(ProgramContext.compile)
-        signature = signature.replace(parameters=list(signature.parameters.values())[1:])
+        program = ast.parse(Path(__file__).with_name("program.py").read_text())
+        context = next(node for node in program.body
+                       if isinstance(node, ast.ClassDef) and node.name == "ProgramContext")
+        compile_method = next(node for node in context.body
+                              if isinstance(node, ast.FunctionDef) and node.name == "compile")
+        signature = "(" + ast.unparse(compile_method.args).removeprefix("self, ") + ")"
         corpus["symbols"]["context.compile"] = {
             "name": "context.compile", "signature": str(signature),
             "declaration": "evaluator-provided ProgramContext.compile",
