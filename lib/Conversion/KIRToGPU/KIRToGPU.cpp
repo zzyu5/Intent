@@ -5448,33 +5448,54 @@ bool capturesScanPrefixAxis(const LogicalWorksetFact &workset,
   }
   bool captured = false;
   workset.body->walk([&](intent::GatherOp gather) {
-    Value source = gather.getInputs().front();
-    while (auto cast = source.getDefiningOp<intent::CastOp>())
-      source = cast.getInput();
-    auto scan = source.getDefiningOp<intent::ScanOp>();
-    if (!scan || workset.parallel->isProperAncestor(scan))
-      return WalkResult::advance();
+    SmallVector<Value> pending{gather.getInputs().front()};
+    llvm::DenseSet<Value> visited;
+    SmallVector<intent::ScanOp> scans;
+    while (!pending.empty()) {
+      Value value = pending.pop_back_val();
+      if (!visited.insert(value).second)
+        continue;
+      if (auto scan = value.getDefiningOp<intent::ScanOp>()) {
+        if (!workset.parallel->isProperAncestor(scan))
+          scans.push_back(scan);
+        continue;
+      }
+      Operation *producer = value.getDefiningOp();
+      auto tensor = dyn_cast<RankedTensorType>(value.getType());
+      if (!producer || !tensor ||
+          !isa<intent::UnaryOp, intent::BinaryOp, intent::CompareOp,
+               intent::SelectOp, intent::CastOp, intent::BitcastOp>(producer))
+        continue;
+      for (Value input : producer->getOperands()) {
+        auto operand = dyn_cast<RankedTensorType>(input.getType());
+        if (operand && operand.getShape() == tensor.getShape() &&
+            dimensionIds(operand) == dimensionIds(tensor))
+          pending.push_back(input);
+      }
+    }
     FailureOr<IndexRelationFact> relation = analysis.indexRelation(gather);
     if (failed(relation))
       return WalkResult::advance();
-    for (const IndexTermFact &term : relation->terms) {
-      if (!term.sourceAxis || *term.sourceAxis != scan.getAxis() ||
-          !term.coordinate.known)
-        continue;
-      if (llvm::any_of(term.coordinate.origins, [&](const auto &origin) {
-            return llvm::is_contained(worksetCoordinates, origin);
-          })) {
-        auto enclosing = gather->getParentOfType<intent::ParallelOp>();
-        while (enclosing && !enclosing->isProperAncestor(scan))
-          enclosing = enclosing->getParentOfType<intent::ParallelOp>();
-        if (!captured)
-          scope = enclosing;
-        else if (!scope || !enclosing)
-          scope = {};
-        else if (enclosing->isProperAncestor(scope))
-          scope = enclosing;
-        captured = true;
-        break;
+    for (intent::ScanOp scan : scans) {
+      for (const IndexTermFact &term : relation->terms) {
+        if (!term.sourceAxis || *term.sourceAxis != scan.getAxis() ||
+            !term.coordinate.known)
+          continue;
+        if (llvm::any_of(term.coordinate.origins, [&](const auto &origin) {
+              return llvm::is_contained(worksetCoordinates, origin);
+            })) {
+          auto enclosing = gather->getParentOfType<intent::ParallelOp>();
+          while (enclosing && !enclosing->isProperAncestor(scan))
+            enclosing = enclosing->getParentOfType<intent::ParallelOp>();
+          if (!captured)
+            scope = enclosing;
+          else if (!scope || !enclosing)
+            scope = {};
+          else if (enclosing->isProperAncestor(scope))
+            scope = enclosing;
+          captured = true;
+          break;
+        }
       }
     }
     return WalkResult::advance();
