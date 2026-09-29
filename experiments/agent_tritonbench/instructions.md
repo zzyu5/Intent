@@ -128,6 +128,18 @@ The source constructs have distinct meanings:
   Collectives have no hidden communication between independent GPU programs.
   A prefix over an entire axis remains global when its consumer uses I.parallel.
 
+These are syntax fragments, with x an existing rank-2 input view. A shape symbol
+in an annotation is not a runtime value. Read a view to obtain tensor values;
+I.parallel is used by a for statement, while I.indices consumes a domain:
+
+```python
+rows = I.domain(0, x.shape[0])
+row_indices = I.indices(rows)
+values = x[:, :]
+for row in I.parallel(rows):
+    ...  # row is already a scalar coordinate
+```
+
 Free axes of tensor expressions and structured operations already express
 independent result coordinates. Do not introduce fixed logical subregions solely
 to reproduce physical BLOCK_M/BLOCK_N values or every use of program_id. Use the
@@ -167,15 +179,21 @@ Use the unannotated host signature def build(context):; this evaluator argument
 is not a public type exported from the intent package. Read an
 invocation-dependent extent from a kernel view's shape or pass a runtime scalar;
 do not bind it by recompiling inside the returned callable. The host interface has
-this structure, with the kernel and task-specific runtime values defined by you:
+the following declaration/launch syntax. The device computation is deliberately
+omitted; choose parameter schemas, output allocation and the wrapper signature
+from TASK.md and your algorithm:
 
 ```python
+@intent.kernel
+def kernel_definition(x: I.In[I.f32, ("N",)], y: I.Out[I.f32, ("N",)]):
+    ...  # implement the device computation and write y
+
 def build(context):
     artifact = context.compile("kernel_name", kernel_definition)
-    def wrapper(*args, **kwargs):
-        ...  # prepare runtime_arguments and task_result
-        artifact(*runtime_arguments)  # kernel declaration order, including Out
-        return task_result
+    def wrapper(x):
+        y = torch.empty_like(x)
+        artifact(x, y)  # kernel declaration order, including Out
+        return y
     return wrapper
 ```
 <!-- /host-interface -->
