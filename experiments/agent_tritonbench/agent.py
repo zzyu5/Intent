@@ -70,6 +70,7 @@ def materialize_language(project: Path, triton_ref: Path, directory: Path, langu
             "Kernel intrinsics are DSL operations; dtype tokens and type aliases are not operations.",
             "Annotations describe parameters. Namespaces expose members; a namespace is callable only if a signature is shown.",
             "Quoted return annotations describe result kinds, not exported Python types.",
+            "Arithmetic uses Python +, -, * and floating /; integer division/remainder use // and %. Comparisons use Python operators.",
             "Use context.compile inside build for this evaluator's host interface.",
         ]
         for name, symbol in sorted(corpus["symbols"].items()):

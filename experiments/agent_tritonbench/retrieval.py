@@ -15,7 +15,7 @@ from .agent import instructions
 
 
 async def _stream(url: str, body: dict, headers: dict, chunks: list[str],
-                  stop: threading.Event, deadline: float) -> str | None:
+                  stop: threading.Event, deadline: float, *, reasoning: list[str]) -> str | None:
     async def receive():
         finish = None
         async with httpx.AsyncClient(timeout=min(180, deadline - time.monotonic())) as client:
@@ -34,6 +34,7 @@ async def _stream(url: str, body: dict, headers: dict, chunks: list[str],
                         raise RuntimeError(str(event["error"]))
                     for part in event.get("choices", []):
                         chunks.append(part.get("delta", {}).get("content") or "")
+                        reasoning.append(part.get("delta", {}).get("reasoning_content") or "")
                         if part.get("finish_reason"):
                             finish = part["finish_reason"]
         return finish
@@ -121,16 +122,19 @@ def execute(directory: Path, suite: dict, prompt: str, *,
                 "max_tokens": 32768, "response_format": {"type": "json_object"}, "stream": True}
         headers = {"Content-Type": "application/json", **provider.get("http_headers", {}),
                    "Authorization": "Bearer " + key}
-        chunks, finish, error = [], None, None
+        chunks, reasoning_chunks, finish, error = [], [], None, None
         try:
             finish = asyncio.run(_stream(
                 provider["base_url"].rstrip("/") + "/chat/completions",
-                body, headers, chunks, stop, deadline))
+                body, headers, chunks, stop, deadline, reasoning=reasoning_chunks))
         except (httpx.HTTPError, OSError, ValueError, RuntimeError) as failure:
             error = str(failure)
         content = "".join(chunks)
+        reasoning = "".join(reasoning_chunks)
         turn = result["delivery_continuations"]
         (directory / f"response-{turn}.txt").write_text(content.replace(key, "<redacted>"))
+        if reasoning:
+            (directory / f"reasoning-{turn}.txt").write_text(reasoning.replace(key, "<redacted>"))
         result["finish_reason"] = finish
         unfinished = content.count("<think>") > content.count("</think>")
         if finish == "stop" and not unfinished:
@@ -153,15 +157,18 @@ def execute(directory: Path, suite: dict, prompt: str, *,
                     "reason": "Complete final source; no compiler or benchmark feedback"}
         if stop.is_set() or time.monotonic() >= deadline:
             break
-        if not content:
+        if not content and not reasoning:
             return {**result, "action": "unavailable",
                     "status": "agent_program_error" if finish == "length" else "agent_environment_failure",
                     "error": (error or "Empty incomplete response").replace(key, "<redacted>")}
         if error:
             result.setdefault("interrupted_stream_errors", []).append(error.replace(key, "<redacted>"))
         result.setdefault("interrupted_finish_reasons", []).append(finish)
+        previous = {"role": "assistant", "content": content}
+        if reasoning:
+            previous["reasoning_content"] = reasoning
         messages.extend((
-            {"role": "assistant", "content": content},
+            previous,
             {"role": "user", "content":
              "The response stream was interrupted before your final source. Continue the original "
              "task from the retained context and return the complete program JSON. "

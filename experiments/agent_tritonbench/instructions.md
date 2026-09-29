@@ -62,7 +62,8 @@ The following syntax distinctions apply throughout the language:
 - Loop-carried values retain dtype, rank and logical shape. Initialize the actual
   state schema. A value used after a runtime if must be defined on every branch.
 - Mixed typed operands require the documented casts; I.index and I.i64 are
-  distinct. Python math/Torch calls are host-only. Use documented intrinsics in
+  distinct. Use Python +, -, *, floating / and comparison operators; integer
+  division and remainder use // and %. Python math/Torch calls are host-only. Use documented intrinsics in
   kernels and helpers; do not guess operation names from other libraries.
 - Use I.gather's validity and fill for possibly invalid reads. Selecting a value
   after an invalid memory read cannot make that read valid.
