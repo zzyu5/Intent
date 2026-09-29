@@ -46,8 +46,9 @@ one launch; a full-domain collective does not implicitly become several kernels.
 The following syntax distinctions apply throughout the language:
 - Shape symbols such as "N" in annotations are names, not runtime variables.
   Static dimensions are integers such as 1 or 2, not strings "1" or "2".
-  Fixed profile dimensions may be written directly as integer extents in kernel
-  annotations; symbolic dimensions are optional.
+  For this fixed profile, prefer the disclosed integer extents in kernel view
+  annotations. Use symbolic extents when the interface needs them, and preserve
+  the declared equality relations across views.
   Obtain extents from x.shape. Reusing a symbol declares equal extents; different
   symbols do not become equal just because one profile has the same sizes.
 - External input view parameters used as value expressions are read over their
