@@ -126,14 +126,16 @@ choose all schemas, allocations and the callable signature for your task:
 ```python
 @intent.kernel
 def kernel_definition(x: I.In[I.f32, ("N",)], scale: I.f32,
+                      enabled: I.Constexpr[bool],
                       y: I.Out[I.f32, ("N",)]):
     ...  # implement the device computation and write y
 
 def build(context):
-    artifact = context.compile("kernel_name", kernel_definition)
+    artifact = context.compile("kernel_name", kernel_definition,
+                               constexprs={"enabled": True})
     def wrapper(x, scale):
         y = torch.empty_like(x)
-        artifact(x, scale, y)
+        artifact(x, scale, y)  # enabled was bound at compile time
         return y
     return wrapper
 ```
