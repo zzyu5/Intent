@@ -55,6 +55,8 @@ The following syntax distinctions apply throughout the language:
   full logical shape; explicit indexing selects a region. I.buffer is mutable
   storage and must be read explicitly before numeric use. Tensor values are
   immutable; indexed writes require Out, InOut or I.buffer storage.
+  Full slicing uses one colon per existing axis: vector[:] for rank one,
+  matrix[:, :] for rank two. A colon does not create an extra axis.
 - I.domain describes members; I.indices(domain) produces coordinates. A for-loop
   variable over a domain is already scalar I.index. I.parallel is used by for,
   cannot carry shared SSA state, and is not a tensor to pass to I.indices.
@@ -76,7 +78,6 @@ These are syntax fragments for an existing rank-2 view x, not a kernel algorithm
 ```python
 rows = I.domain(0, x.shape[0])
 row_indices = I.indices(rows)
-values = x[:, :]
 for row in I.parallel(rows):
     ...  # row is already a scalar coordinate
 ```
