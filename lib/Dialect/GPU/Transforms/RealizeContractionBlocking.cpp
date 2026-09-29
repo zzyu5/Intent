@@ -1563,6 +1563,8 @@ FailureOr<Value> materializeStorePath(
       auto replacement = coordinate.getDefiningOp<MakeRangeOp>();
       PhysicalProgramAnalysis analysis(kernel);
       PhysicalRangeFact ranges = analysis.axisRanges(captured, axis);
+      if (ranges.isExact() && ranges.roots.empty() && ranges.blockers.empty())
+        continue;
       auto root = queryExactLogicalRange(ranges);
       if (!replacement || failed(root) || !isUnitStepRange(*root) ||
           !samePhysicalScalarExpression(root->getLogicalStart(),

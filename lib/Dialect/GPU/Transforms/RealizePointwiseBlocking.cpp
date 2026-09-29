@@ -4659,7 +4659,16 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             contractionOwnedRanges.insert(range.getOperation());
         for (StoreOp store : stores) {
           contractionOwnedStores.insert(store.getOperation());
-          collectCoordinateRanges(store.getValue(), contractionOwnedRanges);
+          auto payload = cast<FragmentType>(store.getValue().getType());
+          for (unsigned axis = 0; axis < payload.getShape().size(); ++axis) {
+            PhysicalRangeFact ranges = analysis.axisRanges(store.getValue(), axis);
+            // An epilogue axis may read several independent sources. Defer
+            // each known range to contraction tiling without equating them.
+            if (ranges.state == PhysicalFactState::Unknown || !ranges.blockers.empty())
+              continue;
+            for (MakeRangeOp range : ranges.roots)
+              contractionOwnedRanges.insert(range.getOperation());
+          }
           for (Value coordinate : store.getCoordinates())
             collectCoordinateRanges(coordinate, contractionOwnedRanges);
         }
