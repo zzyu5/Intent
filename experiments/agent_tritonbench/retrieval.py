@@ -225,7 +225,8 @@ def execute(directory: Path, suite: dict, prompt: str, *,
                         "compiled, executed or validated. Review the source against these contracts, "
                         "the task and the original host constraints before your final submission.\n" +
                         json.dumps({"declarations": declarations, "rules": list(rules.values())},
-                                   ensure_ascii=False)}))
+                                   ensure_ascii=False) +
+                        "\n\nORIGINAL TASK AND FIXED INVOCATION\n" + prompt}))
                     continue
                 if set(reply) == {"queries"}:
                     calls = reply["queries"]
@@ -252,7 +253,8 @@ def execute(directory: Path, suite: dict, prompt: str, *,
                         result["manual_queries"].append(query)
                         responses.append({**query, "response": response})
                     messages.extend((previous, {"role": "user", "content":
-                        "Public manual query results:\n" + json.dumps(responses, ensure_ascii=False)}))
+                        "Public manual query results:\n" + json.dumps(responses, ensure_ascii=False) +
+                        "\n\nORIGINAL TASK AND FIXED INVOCATION\n" + prompt}))
                     continue
                 if set(reply) != {"program"}:
                     raise ValueError("Response must contain only queries, draft or program")
