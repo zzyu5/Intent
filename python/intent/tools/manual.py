@@ -116,6 +116,7 @@ def snapshot(project: Path) -> dict:
         symbols[name] = {
             "name": name, "signature": str(signature) if signature else None,
             "declaration": source, "sections": references,
+            "canonical": name,
             "members": list(value.members) if isinstance(value, IntrinsicNamespace) else [],
             "availability": "public declaration; backend support and performance are not implied",
         }
@@ -130,6 +131,7 @@ def snapshot(project: Path) -> dict:
         rules = [identifier for identifier in symbols[canonical]["sections"]
                  if documents[identifier]["kind"] == "concept"]
         for name in shorthands:
+            symbols[name]["canonical"] = canonical
             symbols[name]["sections"] = list(dict.fromkeys((*symbols[name]["sections"], *rules)))
     return {
         "revision": subprocess.check_output(["git", "-C", str(project), "rev-parse", "HEAD"], text=True).strip(),
@@ -143,12 +145,38 @@ class Manual:
         self._section_bodies = {identifier: _section_body(entry["text"])
                                 for identifier, entry in corpus["documents"].items()}
 
+    def _rules(self, name: str) -> list[dict]:
+        symbol = self.corpus["symbols"][name]
+        names = {name.lower(), symbol["canonical"].lower()}
+        pattern = re.compile(r"(?<![\w.])(?:i\.)?(?:" +
+                             "|".join(re.escape(name) for name in sorted(names)) + r")(?![\w.])")
+        exact = re.compile(r"(?<![\w.])(?:i\.)?" + re.escape(name.lower()) + r"(?![\w.])")
+        qualified = re.compile(r"(?<![\w.])i\." + re.escape(name.lower()) + r"(?![\w.])")
+        canonical = re.compile(r"(?<![\w.])i\." + re.escape(symbol["canonical"].lower()) + r"(?![\w.])")
+
+        def relevance(entry):
+            text = self._section_bodies[entry["id"]]
+            source = entry["source"]
+            if not any(line.strip() and not line.startswith("#") for line in text.splitlines()):
+                return (0, 0, entry["id"])
+            score = 16 * bool(exact.search(entry["title"].lower()))
+            score += 32 * bool(qualified.search(text.lower()))
+            score += 16 * bool(canonical.search(text.lower()))
+            score += 8 * bool(pattern.search(entry["title"].lower()))
+            score += bool(pattern.search(text.lower()))
+            score += 20 * (source == "doc/dsl/core.md")
+            score += 3 * (source == "doc/dsl/authoring.md")
+            return (-score, len(text), entry["id"])
+
+        return sorted((self.corpus["documents"][key] for key in symbol["sections"]
+                       if self.corpus["documents"][key]["kind"] == "concept"), key=relevance)
+
     def search(self, query: str,
                kind: Literal["all", "api", "concept", "diagnostic"] = "all") -> dict:
         """Find API names, language rules and diagnostics. Read returned IDs for full context."""
         if kind not in {"all", "api", "concept", "diagnostic"}:
             raise ValueError("kind must be all, api, concept or diagnostic")
-        terms = re.findall(r"[\w.]+", query.lower())
+        terms = list(dict.fromkeys(re.findall(r"[\w.]+", query.lower())))
         if not terms:
             raise ValueError("query must contain a name or search term")
         results = []
@@ -156,9 +184,13 @@ class Manual:
             api_terms = [term.removeprefix("intent.language.").removeprefix("i.")
                          for term in terms]
             for name, entry in self.corpus["symbols"].items():
-                score = sum(bool(term) and term in name.lower() for term in api_terms)
+                score = sum(16 if term == name.lower() else
+                            4 if len(term) > 2 and term in name.lower() else 0
+                            for term in api_terms)
                 if score:
-                    results.append((100 * score, {"id": name, "kind": "api", "title": name,
+                    if name.lower() in api_terms:
+                        score += 1 / (1 + api_terms.index(name.lower()))
+                    results.append((score, {"id": name, "kind": "api", "title": name,
                                                   "signature": entry["signature"]}))
         for entry in self.corpus["documents"].values():
             if kind not in {"all", entry["kind"]}:
@@ -167,11 +199,34 @@ class Manual:
                 continue
             body = self._section_bodies[entry["id"]].lower()
             title = entry["title"].lower()
-            score = sum(5 * (term in title) + (term in body) for term in terms)
+            score = sum(8 * (term in title) + (term in body) for term in terms)
+            if kind == "all" and entry["kind"] == "diagnostic":
+                score /= 4
             if score:
-                results.append((score, {key: entry[key] for key in ("id", "title", "kind", "source", "line")}))
+                match = {key: entry[key] for key in ("id", "title", "kind", "source", "line")}
+                lines = self._section_bodies[entry["id"]].splitlines()
+                match["excerpt"] = next((line.strip()[:400] for line in lines
+                                         if not line.startswith("#") and
+                                         any(term in line.lower() for term in terms)), "")
+                results.append((score, match))
         results.sort(key=lambda row: (-row[0], row[1]["id"]))
-        return {"revision": self.corpus["revision"], "matches": [r[1] for r in results[:12]],
+        selected = results[:12]
+        if kind == "all":
+            # Preserve room for language rules when the query also names APIs.
+            limits = {"api": 3, "concept": 7, "diagnostic": 2}
+            selected = []
+            for result in results:
+                category = result[1]["kind"]
+                if limits[category]:
+                    selected.append(result)
+                    limits[category] -= 1
+            for result in results:
+                if len(selected) == 12:
+                    break
+                if result not in selected:
+                    selected.append(result)
+            selected.sort(key=lambda row: (-row[0], row[1]["id"]))
+        return {"revision": self.corpus["revision"], "matches": [r[1] for r in selected],
                 "total": len(results)}
 
     def api(self, name: str) -> dict:
@@ -180,28 +235,37 @@ class Manual:
         entry = self.corpus["symbols"].get(name)
         if entry is None:
             return {"status": "not-found", "name": name, "message": "Not a current public declaration; no replacement is inferred."}
+        rules = self._rules(name)
         return {"status": "declared", "revision": self.corpus["revision"],
                 **{key: value for key, value in entry.items() if key != "sections"},
                 "signature_note": None if entry["signature"] else "No inspectable signature is declared; consult the linked rules, not a guessed signature.",
-                "rules": [{**{field: self.corpus["documents"][key][field]
+                "rules": [{**{field: rule[field]
                               for field in ("id", "title", "source", "line")},
-                           "text": self._section_bodies[key]}
-                          for key in entry["sections"]
-                          if self.corpus["documents"][key]["kind"] == "concept"],
-                "read_note": "Rules include each section's own text. Use read on the rule IDs for nested sections and full context. These contracts do not infer your program's result schema. Implementation diagnostics are available through search(kind='diagnostic').",
+                           "text": self._section_bodies[rule["id"]]}
+                          for rule in rules[:4]],
+                "additional_rules": [{field: rule[field] for field in ("id", "title", "source", "line")}
+                                     for rule in rules[4:]],
+                "read_note": "The four closest rules include their own text. Use read on any rule ID for nested sections or additional rules. These contracts do not infer your program's result schema. Implementation diagnostics are available through search(kind='diagnostic').",
                 "verification": "not evaluated by this read-only service; diagnostics do not redefine doc semantics"}
 
     def read(self, id: str, section: str | None = None) -> dict:
-        """Read a published rule ID, optionally an exact section title. No filesystem paths accepted."""
+        """Read a published document/rule ID or an exact API name such as I.matmul. No filesystem paths accepted."""
+        name = id.removeprefix("intent.language.").removeprefix("I.")
+        if name in self.corpus["symbols"] and section is None:
+            return self.api(name)
         if section is not None:
             entries = [d for d in self.corpus["documents"].values()
                        if d["source"] == id and d["title"] == section and "#L" in d["id"]]
             if len(entries) != 1:
-                raise ValueError("section title must match exactly one section in this document")
+                titles = [d["title"] for d in self.corpus["documents"].values()
+                          if d["source"] == id and "#L" in d["id"]]
+                raise ValueError(f"Use an exact section title from this document: {titles}; "
+                                 "omit section to read the whole document, or use api(name=...) for an API.")
             entry = entries[0]
         else:
             if id not in self.corpus["documents"]:
-                raise ValueError("unknown published document ID; use search")
+                raise ValueError("Unknown document/rule ID or API name. Use search(query=...) and copy a returned id; "
+                                 "api(name='I.matmul') reads an exact public declaration. Do not invent api/ paths.")
             entry = self.corpus["documents"][id]
         return {"revision": self.corpus["revision"], **entry}
 

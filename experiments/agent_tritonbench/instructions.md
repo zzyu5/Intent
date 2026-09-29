@@ -32,6 +32,9 @@ Use api for declarations and signatures, then read the returned rule IDs
 for return shapes, dtypes and semantics; api does not infer your program's result
 schema. Consult the manual before writing code; it does not execute programs or
 provide task answers.
+For syntax or semantics questions, use search(kind="concept") rather than searching
+implementation diagnostics. Read accepts the returned document/rule IDs and exact
+public API names; section titles must be copied from the document, not guessed.
 <!-- /intent -->
 Write candidate.py containing
 build(context), which returns a callable with the task's original wrapper
@@ -62,13 +65,23 @@ Do this review on candidate.py; no separate planning or review file is needed.
 
 <!-- intent -->
 In that source review, match every constexpr binding to an explicitly declared
-I.Constexpr parameter; a symbol in a view shape does not declare one. Derive each
+I.Constexpr parameter; a symbol in a view shape does not declare one. Write view
+shape symbols as strings, and bind local extent variables from input.shape before
+using them. Same symbols denote equal extents; different symbols do not become
+equal merely because the supplied profile has the same sizes. Derive each
 initializer, assignment and loop carry's source and destination schemas from the
 actual tensors and documented API results, and check their compatibility.
 For each indexed expression, derive its result axes before assigning it: domain
 indices introduce independent axes, while tensor indices share a broadcasted
 index shape. Mixing the two does not implicitly pair their elements; use explicit
 size-one axes where broadcasting requires them.
+Tensor values are immutable; indexed writes require a writable view or I.buffer.
+Arg-reduce indices are positions in the value being reduced, including when that
+value was read from a subregion. For possibly invalid reads, express their validity
+and fill with I.gather; selecting a value after an invalid read cannot undo the read.
+Keep kernel definitions, compiled artifacts and host wrappers under distinct names.
+At each launch, match the actual tensor rank and argument order to that kernel's
+declared interface; a host view change must be passed to the call that needs it.
 
 Intent expresses Triton-style kernel algorithms over logical domains. Retain the
 algorithm's independent work, logical groups, partial results, kernel stages and
