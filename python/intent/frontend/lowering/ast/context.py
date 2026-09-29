@@ -275,6 +275,39 @@ class FunctionLowerer:
                         constant * scale,
                     )
                     break
+                if result not in self._integer_shape_terms and all(
+                    operand.type == result.type for operand in operands
+                ):
+                    # Retain multiplication factors for shape equality without
+                    # rewriting integer SSA or crossing a dtype conversion.
+                    factors = {}
+                    coefficient = 1
+                    for operand in operands:
+                        terms = self._integer_shape_terms.get(operand)
+                        if terms is None:
+                            break
+                        atoms, constant = terms
+                        if not atoms:
+                            coefficient *= constant
+                            continue
+                        if constant or len(atoms) != 1:
+                            break
+                        (atom, scale), = atoms
+                        coefficient *= scale
+                        product = atom[1] if atom[0] == "product" else ((atom, 1),)
+                        for factor, power in product:
+                            factors[factor] = factors.get(factor, 0) + power
+                    else:
+                        if not factors or coefficient == 0:
+                            terms = (frozenset(), coefficient)
+                        else:
+                            atom = ("product", frozenset(factors.items()))
+                            if len(factors) == 1:
+                                factor, power = next(iter(factors.items()))
+                                if power == 1:
+                                    atom = factor
+                            terms = (frozenset({(atom, coefficient)}), 0)
+                        self._integer_shape_terms[result] = terms
         self.operation_blocks[operation.id] = self.current_block
         for result in operation.results:
             self.value_blocks[result] = self.current_block
