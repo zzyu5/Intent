@@ -46,6 +46,8 @@ one launch; a full-domain collective does not implicitly become several kernels.
 The following syntax distinctions apply throughout the language:
 - Shape symbols such as "N" in annotations are names, not runtime variables.
   Static dimensions are integers such as 1 or 2, not strings "1" or "2".
+  Fixed profile dimensions may be written directly as integer extents in kernel
+  annotations; symbolic dimensions are optional.
   Obtain extents from x.shape. Reusing a symbol declares equal extents; different
   symbols do not become equal just because one profile has the same sizes.
 - External input view parameters used as value expressions are read over their
@@ -105,7 +107,9 @@ The returned artifact supports two launch forms:
 - artifact.run(*runtime_arguments_without_Out): omit only Out parameters; they
   are allocated and returned. Preserve the order of all other runtime parameters.
 Both forms omit constexpr parameters. Match actual tensor ranks and dtypes to the
-kernel interface. Read extents from view shapes or pass runtime scalars; build
+kernel interface. A parameter annotated I.f32 receives a Python floating scalar;
+I.In[I.f32, ()] receives a rank-zero torch.Tensor, not a Python scalar. Read extents
+from view shapes or pass runtime scalars; build
 receives no runtime tensors. Host control flow may call compiled artifacts more
 than once. Cross-kernel state uses host-allocated tensors passed as views, not
 kernel-local I.buffer values.
@@ -114,14 +118,15 @@ This shows declaration and launch syntax only. The device computation is omitted
 choose all schemas, allocations and the callable signature for your task:
 ```python
 @intent.kernel
-def kernel_definition(x: I.In[I.f32, ("N",)], y: I.Out[I.f32, ("N",)]):
+def kernel_definition(x: I.In[I.f32, ("N",)], scale: I.f32,
+                      y: I.Out[I.f32, ("N",)]):
     ...  # implement the device computation and write y
 
 def build(context):
     artifact = context.compile("kernel_name", kernel_definition)
-    def wrapper(x):
+    def wrapper(x, scale):
         y = torch.empty_like(x)
-        artifact(x, y)
+        artifact(x, scale, y)
         return y
     return wrapper
 ```

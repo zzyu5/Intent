@@ -91,8 +91,9 @@ def generation_instructions() -> str:
     end = text.index("Intent expresses", begin)
     text = text[:begin] + (
         "Use the attached public API declarations and language contracts. "
-        "Use api, read and search to query the frozen manual when an operation's "
-        "syntax, result type or shape rules are unclear. These tools only return "
+        "Before drafting the program, query the API contracts you intend to use "
+        "with api, read or search. Consult the frozen manual for an operation's "
+        "syntax, result type and shape rules. These tools only return "
         "public documentation; they cannot execute or validate a program.\n\n"
     ) + text[end:]
     begin = text.index("Write candidate.py to disk before finishing")
@@ -158,7 +159,7 @@ def execute(directory: Path, suite: dict, prompt: str, *,
                 "reasoning_effort": suite["reasoning_effort"],
                 "thinking": {"type": "enabled", "clear_thinking": False},
                 "max_tokens": 32768, "response_format": {"type": "json_object"}, "stream": True,
-                "tools": _TOOLS, "tool_choice": "auto"}
+                "tools": _TOOLS, "tool_choice": "auto" if result["manual_queries"] else "required"}
         headers = {"Content-Type": "application/json", **provider.get("http_headers", {}),
                    "Authorization": "Bearer " + key}
         chunks, reasoning_chunks, finish, error = [], [], None, None
