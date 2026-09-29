@@ -14,27 +14,8 @@ from intent.tools.manual import Manual, _section_body
 from .agent import instructions
 
 
-_TOOLS = [
-    {"type": "function", "function": {
-        "name": name, "description": description,
-        "parameters": {"type": "object", "properties": properties,
-                       "required": required, "additionalProperties": False},
-    }}
-    for name, description, properties, required in (
-        ("api", "Read an exact public Intent declaration and its type, shape and semantic rules.",
-         {"name": {"type": "string"}}, ["name"]),
-        ("read", "Read a published manual document/rule ID or exact API name. No filesystem access.",
-         {"id": {"type": "string"}, "section": {"type": ["string", "null"]}}, ["id"]),
-        ("search", "Find public API names or language rules; read returned IDs for details.",
-         {"query": {"type": "string"},
-          "kind": {"type": "string", "enum": ["all", "api", "concept", "diagnostic"]}}, ["query"]),
-    )
-]
-
-
 async def _stream(url: str, body: dict, headers: dict, chunks: list[str],
-                  stop: threading.Event, deadline: float, *, reasoning: list[str],
-                  tool_calls: dict[int, dict]) -> str | None:
+                  stop: threading.Event, deadline: float, *, reasoning: list[str]) -> str | None:
     async def receive():
         finish = None
         async with httpx.AsyncClient(timeout=min(180, deadline - time.monotonic())) as client:
@@ -54,17 +35,6 @@ async def _stream(url: str, body: dict, headers: dict, chunks: list[str],
                     for part in event.get("choices", []):
                         chunks.append(part.get("delta", {}).get("content") or "")
                         reasoning.append(part.get("delta", {}).get("reasoning_content") or "")
-                        for update in part.get("delta", {}).get("tool_calls", []):
-                            call = tool_calls.setdefault(update["index"], {
-                                "id": "", "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            })
-                            if update.get("id"):
-                                call["id"] = update["id"]
-                            if update.get("type", "function") != "function":
-                                raise ValueError("Unsupported upstream tool call type")
-                            for field in ("name", "arguments"):
-                                call["function"][field] += update.get("function", {}).get(field) or ""
                         if part.get("finish_reason"):
                             finish = part["finish_reason"]
         return finish
@@ -92,14 +62,21 @@ def generation_instructions() -> str:
     text = text[:begin] + (
         "Use the attached public API declarations and language contracts. "
         "Before drafting the program, query the API contracts you intend to use "
-        "with api, read or search. Consult the frozen manual for an operation's "
-        "syntax, result type and shape rules. These tools only return "
-        "public documentation; they cannot execute or validate a program.\n\n"
+        "with api, read or search. Request documentation by returning a JSON object "
+        'of the form {"queries": [{"tool": "api", "arguments": {"name": "I.full"}}]}. '
+        "Available queries are api(name), read(id, section=null), and "
+        "search(query, kind='all'); search kinds are all, api, concept and diagnostic. "
+        "Use exact API names or document/section IDs returned by search. Multiple "
+        "queries may be requested together. The caller returns only their public "
+        "documentation; it cannot execute or validate a program. Continue the "
+        "same task after reading those results.\n\n"
     ) + text[end:]
     begin = text.index("Write candidate.py to disk before finishing")
     return text[:begin] + (
-        "Return a JSON object with one key, program, whose string value is the "
-        "complete Python source for candidate.py. The caller saves it verbatim. "
+        "Each response must be either a documentation queries JSON object as "
+        "described above, or a final JSON object with one key, program, whose "
+        "string value is the complete Python source for candidate.py. "
+        "The caller saves the final program verbatim. "
         "Do not claim unmeasured correctness or speed."
     )
 
@@ -158,17 +135,15 @@ def execute(directory: Path, suite: dict, prompt: str, *,
         body = {"model": suite["model"], "messages": messages,
                 "reasoning_effort": suite["reasoning_effort"],
                 "thinking": {"type": "enabled", "clear_thinking": False},
-                "max_tokens": 32768, "response_format": {"type": "json_object"}, "stream": True,
-                "tools": _TOOLS, "tool_choice": "auto" if result["manual_queries"] else "required"}
+                "max_tokens": 32768, "response_format": {"type": "json_object"}, "stream": True}
         headers = {"Content-Type": "application/json", **provider.get("http_headers", {}),
                    "Authorization": "Bearer " + key}
         chunks, reasoning_chunks, finish, error = [], [], None, None
-        tool_calls = {}
         try:
             finish = asyncio.run(_stream(
                 provider["base_url"].rstrip("/") + "/chat/completions",
                 body, headers, chunks, stop, deadline,
-                reasoning=reasoning_chunks, tool_calls=tool_calls))
+                reasoning=reasoning_chunks))
         except (httpx.HTTPError, OSError, ValueError, RuntimeError, KeyError, TypeError) as failure:
             error = str(failure)
         content = "".join(chunks)
@@ -182,40 +157,45 @@ def execute(directory: Path, suite: dict, prompt: str, *,
         previous = {"role": "assistant", "content": content}
         if reasoning:
             previous["reasoning_content"] = reasoning
-        if tool_calls:
-            calls = [tool_calls[index] for index in sorted(tool_calls)]
-            if any(not call["id"] or not call["function"]["name"] for call in calls):
-                return {**result, "action": "unavailable", "status": "agent_environment_failure",
-                        "error": "Upstream tool call lacks its ID or function name"}
-            previous["tool_calls"] = calls
-            messages.append(previous)
-            methods = {"api": manual.api, "read": manual.read, "search": manual.search}
-            for call in calls:
-                name, arguments = call["function"]["name"], call["function"]["arguments"]
-                query = {"tool": name, "arguments": arguments}
-                try:
-                    arguments = json.loads(arguments)
-                    if not isinstance(arguments, dict):
-                        raise ValueError("Tool arguments must be a JSON object")
-                    if any(not isinstance(value, str) and not (key == "section" and value is None)
-                           for key, value in arguments.items()):
-                        raise TypeError("Manual arguments must be strings; section may also be null")
-                    response = methods[name](**arguments)
-                    query["status"] = "returned"
-                except (KeyError, TypeError, ValueError) as failure:
-                    response = {"error": str(failure)}
-                    query["status"] = "error"
-                result["manual_queries"].append(query)
-                messages.append({"role": "tool", "tool_call_id": call["id"],
-                                 "content": json.dumps(response, ensure_ascii=False)})
-            continue
         unfinished = content.count("<think>") > content.count("</think>")
         if finish == "stop" and not unfinished:
             source = content.strip()
             if source.startswith("<think>"):
                 source = source.split("</think>", 1)[1].strip()
             try:
-                program = json.loads(source)["program"]
+                reply = json.loads(source)
+                if not isinstance(reply, dict):
+                    raise ValueError("Response must be a JSON object")
+                if set(reply) == {"queries"}:
+                    calls = reply["queries"]
+                    if not isinstance(calls, list) or not calls:
+                        raise ValueError("queries must be a nonempty list")
+                    responses = []
+                    methods = {"api": manual.api, "read": manual.read, "search": manual.search}
+                    for call in calls:
+                        if not isinstance(call, dict) or set(call) != {"tool", "arguments"}:
+                            raise ValueError("Each query must contain tool and arguments")
+                        name, arguments = call["tool"], call["arguments"]
+                        query = {"tool": name, "arguments": arguments}
+                        try:
+                            if not isinstance(name, str) or not isinstance(arguments, dict):
+                                raise TypeError("Query tool must be a string and arguments an object")
+                            if any(not isinstance(value, str) and not (key == "section" and value is None)
+                                   for key, value in arguments.items()):
+                                raise TypeError("Manual arguments must be strings; section may also be null")
+                            response = methods[name](**arguments)
+                            query["status"] = "returned"
+                        except (KeyError, TypeError, ValueError) as failure:
+                            response = {"error": str(failure)}
+                            query["status"] = "error"
+                        result["manual_queries"].append(query)
+                        responses.append({**query, "response": response})
+                    messages.extend((previous, {"role": "user", "content":
+                        "Public manual query results:\n" + json.dumps(responses, ensure_ascii=False)}))
+                    continue
+                if set(reply) != {"program"}:
+                    raise ValueError("Response must contain only queries or only program")
+                program = reply["program"]
                 if not isinstance(program, str):
                     raise ValueError("program must be a source string")
                 tree = ast.parse(program)
@@ -240,8 +220,8 @@ def execute(directory: Path, suite: dict, prompt: str, *,
         messages.extend((
             previous,
             {"role": "user", "content":
-             "The response stream was interrupted before your final source. Continue the original "
-             "task from the retained context and return the complete program JSON. "
+             "The response stream was interrupted. Continue the original task from the retained "
+             "context and return a complete documentation query JSON or final program JSON. "
              "No compiler, execution or benchmark feedback is available."},
         ))
         result["delivery_continuations"] += 1
