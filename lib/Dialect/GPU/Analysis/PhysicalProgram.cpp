@@ -438,8 +438,26 @@ bool sameBroadcastCoordinateExpression(Value lhs, Value rhs) {
     return false;
   FragmentType common = leftType.getShape().size() > rightType.getShape().size()
                             ? leftType : rightType;
-  auto leftProjection = queryBroadcastProjection(leftType, common);
-  auto rightProjection = queryBroadcastProjection(rightType, common);
+  auto project = [&](FragmentType source) {
+    auto projection = queryBroadcastProjection(source, common);
+    if (projection.isExact())
+      return projection;
+    auto permutation = queryAxisPermutation(source, common);
+    if (!permutation)
+      return projection;
+    for (auto [targetAxis, sourceAxis] : llvm::enumerate(*permutation))
+      if (source.getShape()[sourceAxis] != common.getShape()[targetAxis] &&
+          constantPhysicalExpression(
+              cast<PhysicalExprAttr>(source.getShape()[sourceAxis])) != 1)
+        return projection;
+    projection.targetToSource.clear();
+    for (int64_t sourceAxis : *permutation)
+      projection.targetToSource.push_back(sourceAxis);
+    projection.state = BroadcastProjectionState::Exact;
+    return projection;
+  };
+  auto leftProjection = project(leftType);
+  auto rightProjection = project(rightType);
   if (!leftProjection.isExact() || !rightProjection.isExact())
     return false;
   using Axes = SmallVector<std::optional<unsigned>, 4>;
@@ -498,7 +516,12 @@ bool sameBroadcastCoordinateExpression(Value lhs, Value rhs) {
         input = broadcast.getValue();
       else if (auto splat = current.getDefiningOp<SplatOp>())
         input = splat.getValue();
-      else if (auto reshape = current.getDefiningOp<ReshapeOp>()) {
+      else if (auto transpose = current.getDefiningOp<TransposeOp>()) {
+        for (std::optional<unsigned> &axis : axes)
+          if (axis)
+            axis = transpose.getPermutation()[*axis];
+        return std::make_pair(transpose.getValue(), std::move(axes));
+      } else if (auto reshape = current.getDefiningOp<ReshapeOp>()) {
         auto source = cast<FragmentType>(reshape.getValue().getType());
         auto target = cast<FragmentType>(current.getType());
         if (source.getShape() == target.getShape())

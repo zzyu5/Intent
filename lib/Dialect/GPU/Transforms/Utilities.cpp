@@ -9,6 +9,7 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/MathExtras.h"
@@ -16,6 +17,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Transforms/RegionUtils.h"
 
 #include <algorithm>
 #include <functional>
@@ -1046,6 +1048,29 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
       Value scalar = builder.create<arith::ConstantOp>(location, element, constant);
       return Value(builder.create<SplatOp>(location, target, scalar));
     }
+  if (source && source.getAxisMaps() != target.getAxisMaps()) {
+    auto permutation = queryAxisPermutation(source, target);
+    // An exact coordinate permutation is a transpose, not a broadcast. Match
+    // source occurrences so equal-sized axes stay distinct.
+    if (permutation &&
+        llvm::any_of(llvm::enumerate(*permutation), [](auto item) {
+          return item.value() != static_cast<int64_t>(item.index());
+        })) {
+      SmallVector<Attribute> shape;
+      for (int64_t axis : *permutation)
+        shape.push_back(source.getShape()[axis]);
+      auto reordered = FragmentType::get(
+          target.getContext(), element, builder.getArrayAttr(shape),
+          target.getAxisMaps(), source.getValidity(), source.getOwner());
+      auto transpose = builder.create<TransposeOp>(location, reordered, value,
+                                                  *permutation);
+      if (Operation *definition = value.getDefiningOp())
+        if (Attribute origin = definition->getAttr(originAttr))
+          transpose->setAttr(originAttr, origin);
+      return projectFragmentValue(builder, location, transpose.getResult(),
+                                  target);
+    }
+  }
   Operation *projection = nullptr;
   if (!source) {
     projection = builder.create<SplatOp>(location, target, value);
@@ -1522,8 +1547,20 @@ FailureOr<Value> materializeReplayedValue(
   if (!kernel)
     return failure();
   PhysicalProgramAnalysis analysis(kernel);
+  auto replayDimension = [&](PhysicalSourceAxis occurrence)
+      -> std::optional<int64_t> {
+    auto projections = queryFragmentAxes(value.getType(), occurrence);
+    if (options.fragmentAxis)
+      llvm::erase_if(projections, [&](PhysicalAxisProjection projection) {
+        return projection.fragmentAxis != *options.fragmentAxis;
+      });
+    return projections.size() == 1
+               ? std::optional<int64_t>(projections.front().dimensionId)
+               : std::nullopt;
+  };
   PhysicalReplayFact replay = analysis.replayability(
-      value, source, options.scope, options.allowAccesses);
+      value, source, options.scope, options.allowAccesses, nullptr,
+      replayDimension(source));
   if (!replay.isReplayable())
     return failure();
 
@@ -1533,7 +1570,8 @@ FailureOr<Value> materializeReplayedValue(
     if (!llvm::is_contained(replaySources, occurrence))
       replaySources.push_back(occurrence);
     if (!analysis.replayability(value, occurrence, options.scope,
-                               options.allowAccesses).isReplayable())
+                               options.allowAccesses, nullptr,
+                               replayDimension(occurrence)).isReplayable())
       return failure();
   }
   bool projectionFailed = false;
@@ -1542,10 +1580,11 @@ FailureOr<Value> materializeReplayedValue(
     PhysicalAxisProjection result;
     for (PhysicalSourceAxis occurrence : replaySources) {
       auto projections = queryFragmentAxes(type, occurrence);
-      if (axis)
-        llvm::erase_if(projections, [&](PhysicalAxisProjection projection) {
-          return projection.fragmentAxis != *axis;
-        });
+      auto dimension = replayDimension(occurrence);
+      llvm::erase_if(projections, [&](PhysicalAxisProjection projection) {
+        return (axis && projection.fragmentAxis != *axis) ||
+               (dimension && projection.dimensionId != *dimension);
+      });
       PhysicalAxisProjection current;
       if (projections.size() == 1)
         current = projections.front();
@@ -1696,7 +1735,7 @@ FailureOr<Value> materializeReplayedValue(
     auto retarget = [&](Value current) {
       auto fragment = dyn_cast<FragmentType>(current.getType());
       PhysicalAxisProjection projection =
-          fragment ? queryFragmentAxis(fragment, source)
+          fragment ? queryFragmentAxis(fragment, source, replayDimension(source))
                    : PhysicalAxisProjection{};
       if (!fragment || !projection.isExact() ||
           fragment.getShape()[projection.fragmentAxis] != logicalExtent)
@@ -2120,11 +2159,19 @@ FailureOr<Value> materializeReplayedValue(
       remember(current, clone.getResult(), projection);
       return clone.getResult();
     }
-    if (!isPhysicalReplayNode(producer, options.scope,
-                              /*allowAccesses=*/false))
+    bool pureBranch = isa<scf::IfOp>(producer) &&
+                      options.scope == PhysicalReplayScope::ValueGraph &&
+                      isMemoryEffectFree(producer);
+    if (!pureBranch && !isPhysicalReplayNode(producer, options.scope,
+                                            /*allowAccesses=*/false))
       return failure();
     IRMapping cloneMapping(mapping);
-    for (Value operand : producer->getOperands()) {
+    llvm::SetVector<Value> replayOperands(producer->operand_begin(),
+                                         producer->operand_end());
+    if (pureBranch)
+      for (Region &region : producer->getRegions())
+        getUsedValuesDefinedAbove(region, replayOperands);
+    for (Value operand : replayOperands) {
       FailureOr<Value> replayed = replayOperand(operand);
       if (failed(replayed))
         return failure();
@@ -2156,7 +2203,7 @@ FailureOr<Value> materializeReplayedValue(
       }
     }
     Operation *clone = builder.clone(*producer, cloneMapping);
-    bool structuredResults = isa<ReduceOp, ScanOp>(clone);
+    bool structuredResults = pureBranch || isa<ReduceOp, ScanOp>(clone);
     for (auto [original, cloned] :
          llvm::zip(producer->getResults(), clone->getResults())) {
       if (structuredResults)
@@ -2168,6 +2215,10 @@ FailureOr<Value> materializeReplayedValue(
     if (!result || result.getResultNumber() >= clone->getNumResults())
       return failure();
     Value clonedValue = clone->getResult(result.getResultNumber());
+    if (pureBranch)
+      for (Region &region : clone->getRegions())
+        retargetHelperSourceExtent(
+            region, cast<PhysicalExprAttr>(fragment.getShape()[axis]));
     if (auto clonedReduce = dyn_cast<ReduceOp>(clone))
       retargetHelperSourceExtent(
           clonedReduce.getCombine(),
@@ -2928,15 +2979,23 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
         shape[axis] = payload.getShape()[projection.fragmentAxis];
         changed = true;
       }
-      if (!changed)
+      auto permutation = queryAxisPermutation(type, payload);
+      bool permuted = permutation &&
+          llvm::any_of(llvm::enumerate(*permutation), [](auto item) {
+            return item.value() != static_cast<int64_t>(item.index());
+          });
+      if (!changed && !permuted)
         continue;
       auto target = FragmentType::get(
-          kernel.getContext(), type.getElementType(), ArrayAttr::get(kernel.getContext(), shape),
-          type.getAxisMaps(), type.getValidity(), type.getOwner());
+          kernel.getContext(), type.getElementType(),
+          permuted ? payload.getShape()
+                   : ArrayAttr::get(kernel.getContext(), shape),
+          permuted ? payload.getAxisMaps() : type.getAxisMaps(),
+          type.getValidity(), type.getOwner());
       OpBuilder builder(access);
       FailureOr<Value> aligned = project(builder, access.getLoc(), coordinate, target);
       if (failed(aligned))
-        return access.emitOpError("cannot align broadcast coordinate with its access schema")
+        return access.emitOpError("cannot align coordinate with its access schema")
                << "; coordinate=" << coordinate;
       access.getCoordinatesMutable().slice(slot, 1).assign(*aligned);
     }

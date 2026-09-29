@@ -39,6 +39,34 @@ bool isCompileTimePhysicalExpr(PhysicalExprAttr expression) {
   });
 }
 
+std::optional<SmallVector<int64_t>>
+queryAxisPermutation(FragmentType source, FragmentType target) {
+  if (source.getOwner() != target.getOwner() ||
+      source.getValidity() != target.getValidity() ||
+      source.getShape().size() != target.getShape().size())
+    return std::nullopt;
+  SmallVector<int64_t> permutation;
+  for (Attribute attribute : target.getAxisMaps()) {
+    auto targetAxis = cast<AxisMapAttr>(attribute);
+    std::optional<int64_t> matched;
+    for (auto [axis, mapping] : llvm::enumerate(source.getAxisMaps())) {
+      auto sourceAxis = cast<AxisMapAttr>(mapping);
+      if (sourceAxis.getSourceId() != targetAxis.getSourceId() ||
+          sourceAxis.getSourceAxis() != targetAxis.getSourceAxis() ||
+          sourceAxis.getDerived() != targetAxis.getDerived() ||
+          sourceAxis.getDimensionId() != targetAxis.getDimensionId())
+        continue;
+      if (matched)
+        return std::nullopt;
+      matched = axis;
+    }
+    if (!matched || llvm::is_contained(permutation, *matched))
+      return std::nullopt;
+    permutation.push_back(*matched);
+  }
+  return permutation;
+}
+
 BroadcastProjection queryAxisProjection(FragmentType source,
                                         FragmentType target) {
   BroadcastProjection result;

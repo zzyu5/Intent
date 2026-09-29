@@ -26,6 +26,8 @@ BroadcastProjection queryAxisProjection(FragmentType source,
                                         FragmentType target);
 BroadcastProjection queryBroadcastProjection(FragmentType source,
                                               FragmentType target);
+std::optional<llvm::SmallVector<int64_t>>
+queryAxisPermutation(FragmentType source, FragmentType target);
 
 } // namespace intent::gpu
 

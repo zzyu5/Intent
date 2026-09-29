@@ -6983,9 +6983,21 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       worksetPosition = position;
       auto existingCoordinate = coordinateAxes.find(position);
       if (existingCoordinate != coordinateAxes.end() &&
-          existingCoordinate->second != axisKey)
-        return range.emitOpError(
-            "workset ownership conflicts with the existing program coordinate relation");
+          existingCoordinate->second != axisKey) {
+        auto dimension = axisDimension(existingCoordinate->second);
+        auto worksetDimension = queryRangeDimension(range);
+        if (!isSourceAxisKey(axisKey) || failed(dimension) ||
+            failed(worksetDimension) ||
+            *dimension != coordinate.getDimensionId() ||
+            *dimension != *worksetDimension ||
+            ownershipAxes.contains(existingCoordinate->second))
+          return range.emitOpError(
+              "workset ownership conflicts with the existing program coordinate relation");
+        // The initial launch names the dimension; the workset range names its
+        // exact source occurrence at this same coordinate position.
+        mappedAxes.erase(existingCoordinate->second);
+        tileCoordinates.erase(existingCoordinate->second);
+      }
       auto existingAxis = mappedAxes.find(axisKey);
       if (existingAxis != mappedAxes.end() && existingAxis->second != position)
         return range.emitOpError(
