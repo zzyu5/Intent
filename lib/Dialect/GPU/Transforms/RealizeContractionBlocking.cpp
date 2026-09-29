@@ -854,6 +854,11 @@ LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
     if (failed(parameter)) {
       PhysicalAxisRealizationFact coverage =
           PhysicalProgramAnalysis(kernel).axisRealization(source, axis);
+      if (extent.getKind() ==
+              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          extent.getValue() == 1 && coverage.isExact() &&
+          !coverage.constructionScalarSeed && coverage.roots.empty())
+        continue;
       if (!coverage.isExact() || !coverage.physicalized ||
           coverage.constructionScalarSeed) {
         if (!coverage.roots.empty() &&
