@@ -114,6 +114,9 @@ from view shapes or pass runtime scalars; build
 receives no runtime tensors. Host control flow may call compiled artifacts more
 than once. Cross-kernel state uses host-allocated tensors passed as views, not
 kernel-local I.buffer values.
+Kernel view annotations declare concrete tensor parameters; I.In[...] | None is
+not a supported annotation. Preserve optional Python arguments in the host callable
+and specialize the device signature to the disclosed invocation.
 
 This shows declaration and launch syntax only. The device computation is omitted;
 choose all schemas, allocations and the callable signature for your task:

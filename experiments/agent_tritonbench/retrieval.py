@@ -92,8 +92,9 @@ def generation_instructions() -> str:
     ) + text[end:]
     begin = text.index("Write candidate.py to disk before finishing")
     return text[:begin] + (
-        "Before final submission, return a JSON object with one key, draft, whose "
-        "string value is your complete proposed Python source. The caller only "
+        "Your first complete source is a draft, not a submission. Return it as a "
+        "JSON object with one key, draft, whose string value is your proposed Python "
+        "source. The first source is also treated as a draft if labelled program. The caller only "
         "looks up public documentation for the API names appearing in the draft; "
         "it does not compile, execute or check the program. Read those declarations "
         "and type/shape rules and review your own source against them. You may "
@@ -197,11 +198,13 @@ def execute(directory: Path, suite: dict, prompt: str, *,
                 reply = json.loads(source)
                 if not isinstance(reply, dict):
                     raise ValueError("Response must be a JSON object")
-                if set(reply) == {"draft"}:
-                    if not isinstance(reply["draft"], str) or not reply["draft"].strip():
+                if set(reply) == {"draft"} or (set(reply) == {"program"}
+                                               and result["draft_documentation_rounds"] == 0):
+                    draft = reply["draft"] if "draft" in reply else reply["program"]
+                    if not isinstance(draft, str) or not draft.strip():
                         raise ValueError("draft must be a nonempty source string")
                     names = set(re.findall(
-                        r"\b(?:I|intent)\.[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", reply["draft"]))
+                        r"\b(?:I|intent)\.[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", draft))
                     names.add("context.compile")
                     declarations, rules = [], {}
                     for name in sorted(names):
