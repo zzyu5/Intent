@@ -58,7 +58,7 @@ def materialize_language(project: Path, triton_ref: Path, directory: Path, langu
     return sources + [str(example.relative_to(project))]
 
 
-def command(directory: Path, suite: dict, response: Path, schema: Path, executable: Path,
+def command(directory: Path, suite: dict, response: Path, executable: Path,
             state_root: Path, language: str) -> list[str]:
     config = tomli.loads((state_root / "config.toml").read_text())
     if (config["model"], config["model_reasoning_effort"]) != (suite["model"], suite["reasoning_effort"]):
@@ -98,7 +98,7 @@ def command(directory: Path, suite: dict, response: Path, schema: Path, executab
     result = [str(executable), "exec", "--ignore-user-config", "--ignore-rules", "--strict-config",
               "--ephemeral", "--skip-git-repo-check", "--json", "--color", "never",
               "--model", suite["model"], "--cd", str(directory),
-              "--output-last-message", str(response), "--output-schema", str(schema)]
+              "--output-last-message", str(response)]
     for feature in ("multi_agent", "multi_agent_v2", "memories", "hooks", "plugins", "apps",
                     "browser_use", "computer_use", "image_generation", "shell_snapshot", "skill_search",
                     "unbounded_connection_retries", "view_image"):
@@ -110,11 +110,7 @@ def command(directory: Path, suite: dict, response: Path, schema: Path, executab
 
 def execute(directory: Path, suite: dict, prompt: str, *, executable: Path,
             state_root: Path, language: str, stop: threading.Event) -> dict:
-    response, schema = directory / "response.json", directory / "response-schema.json"
-    schema.write_text(json.dumps({"type": "object", "additionalProperties": False,
-                                  "properties": {"action": {"type": "string", "enum": ["submit"]},
-                                                 "reason": {"type": "string"}},
-                                  "required": ["action", "reason"]}))
+    response = directory / "response.txt"
     secret_path = state_root / "provider.key"
     if secret_path.stat().st_mode & 0o077:
         raise PermissionError("dedicated provider.key must only be accessible to its owner")
@@ -124,7 +120,7 @@ def execute(directory: Path, suite: dict, prompt: str, *, executable: Path,
     environment = {name: os.environ[name] for name in ("PATH", "HOME", "USER", "LANG", "TMPDIR") if name in os.environ}
     environment.update(CODEX_HOME=str(state_root / "codex"), INTENT_STUDY_API_KEY=key)
     started = time.monotonic()
-    process = subprocess.Popen(command(directory, suite, response, schema, executable, state_root, language),
+    process = subprocess.Popen(command(directory, suite, response, executable, state_root, language),
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                cwd=directory, env=environment, start_new_session=True)
     threads, errors, mcp_calls, stderr, completed_turns = [], [], [], [], []
@@ -177,5 +173,5 @@ def execute(directory: Path, suite: dict, prompt: str, *, executable: Path,
         result.update(action="unavailable", status="agent_timeout" if timed_out else "agent_environment_failure",
                       errors=errors, error="".join(stderr)[-6000:] or "Agent stopped without a submission")
     else:
-        result.update(json.loads(response.read_text().replace(key, "<redacted>")))
+        result.update(action="submit", reason=response.read_text().replace(key, "<redacted>"))
     return result
