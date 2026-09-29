@@ -24,6 +24,13 @@ class _StreamError(RuntimeError):
         }
 
 
+def _program_text(value) -> str:
+    if not isinstance(value, str):
+        raise ValueError("program must be a source string")
+    fenced = re.fullmatch(r"```(?:python)?[ \t]*\r?\n(.*?)\r?\n```", value.strip(), flags=re.DOTALL)
+    return fenced[1] if fenced else value
+
+
 async def _stream(url: str, body: dict, headers: dict, chunks: list[str],
                   stop: threading.Event, deadline: float, *, reasoning: list[str]) -> str | None:
     async def receive():
@@ -245,13 +252,19 @@ def execute(directory: Path, suite: dict, prompt: str, *,
                     continue
                 if set(reply) != {"program"}:
                     raise ValueError("Response must contain only queries, draft or program")
-                program = reply["program"]
-                if not isinstance(program, str):
-                    raise ValueError("program must be a source string")
+                program = _program_text(reply["program"])
                 tree = ast.parse(program)
                 if not any(isinstance(node, ast.FunctionDef) and node.name == "build"
                            for node in tree.body):
                     raise ValueError("Final source does not define build(context)")
+            except json.JSONDecodeError as failure:
+                result.setdefault("interrupted_message_errors", []).append(str(failure))
+                messages.extend((previous, {"role": "user", "content":
+                    "The response was not a single complete JSON message. Resend your documentation "
+                    "query, draft or final program in the specified JSON format, preserving the "
+                    "original task. No compiler, execution or benchmark feedback is available."}))
+                result["delivery_continuations"] += 1
+                continue
             except (ValueError, KeyError, SyntaxError, TypeError) as failure:
                 return {**result, "action": "unavailable", "status": "agent_program_error",
                         "error": str(failure).replace(key, "<redacted>")}
