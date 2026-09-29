@@ -6431,7 +6431,6 @@ LogicalResult normalizeContractionSources(ModuleOp module) {
         !contract.getLhsBatchAxes().empty() ||
         !contract.getRhsBatchAxes().empty())
       continue;
-    auto input = contract.getLhs().getDefiningOp<ReshapeOp>();
     auto output = dyn_cast<ReshapeOp>(*contract.getResult().getUsers().begin());
     auto identity = contract.getAccumulator().getDefiningOp<SplatOp>();
     if (!identity)
@@ -6443,37 +6442,54 @@ LogicalResult normalizeContractionSources(ModuleOp module) {
     if (!output || !identity || output.getReassociation().size() != 2)
       continue;
     auto target = cast<FragmentType>(output.getResult().getType());
-    auto outputFree = cast<ReshapeGroupAttr>(output.getReassociation()[0]);
-    auto outputColumn = cast<ReshapeGroupAttr>(output.getReassociation()[1]);
+    auto outputLeft = cast<ReshapeGroupAttr>(output.getReassociation()[0]);
+    auto outputRight = cast<ReshapeGroupAttr>(output.getReassociation()[1]);
+    bool splitLeft = outputLeft.getResultAxes().size() > 1;
+    auto outputFree = splitLeft ? outputLeft : outputRight;
+    auto outputOther = splitLeft ? outputRight : outputLeft;
     unsigned freeRank = outputFree.getResultAxes().size();
+    unsigned outputFreeAxis = splitLeft ? 0 : 1;
+    unsigned outputOffset = splitLeft ? 0 : 1;
     if (freeRank < 2 || target.getShape().size() != freeRank + 1 ||
-        outputFree.getSourceAxes().asArrayRef() != ArrayRef<int64_t>{0} ||
-        outputColumn.getSourceAxes().asArrayRef() != ArrayRef<int64_t>{1} ||
-        outputColumn.getResultAxes().asArrayRef() !=
-            ArrayRef<int64_t>{static_cast<int64_t>(freeRank)} ||
+        outputFree.getSourceAxes().asArrayRef() !=
+            ArrayRef<int64_t>{static_cast<int64_t>(outputFreeAxis)} ||
+        outputOther.getSourceAxes().asArrayRef() !=
+            ArrayRef<int64_t>{static_cast<int64_t>(1 - outputFreeAxis)} ||
+        outputOther.getResultAxes().asArrayRef() !=
+            ArrayRef<int64_t>{splitLeft ? static_cast<int64_t>(freeRank) : 0} ||
         llvm::any_of(llvm::enumerate(outputFree.getResultAxes().asArrayRef()),
-                     [](auto item) {
-                       return item.value() != static_cast<int64_t>(item.index());
+                     [&](auto item) {
+                       return item.value() !=
+                              static_cast<int64_t>(outputOffset + item.index());
                      }))
       continue;
-    Value sourceValue = contract.getLhs();
-    auto source = contract.getLhs().getType();
+    Value sourceValue = splitLeft ? contract.getLhs() : contract.getRhs();
+    auto matrix = cast<FragmentType>(sourceValue.getType());
+    auto source = matrix;
+    unsigned reductionAxis = splitLeft ? 1 : contract.getRhsReductionAxes()[0];
+    unsigned operandFreeAxis = 1 - reductionAxis;
+    auto input = sourceValue.getDefiningOp<ReshapeOp>();
     ReshapeGroupAttr inputReduction;
+    ReshapeGroupAttr inputFree;
     bool cancelsInput = false;
     if (input && input.getReassociation().size() == 2) {
       auto inputType = cast<FragmentType>(input.getValue().getType());
-      auto inputFree = cast<ReshapeGroupAttr>(input.getReassociation()[0]);
-      inputReduction = cast<ReshapeGroupAttr>(input.getReassociation()[1]);
+      inputFree = cast<ReshapeGroupAttr>(input.getReassociation()[operandFreeAxis]);
+      inputReduction = cast<ReshapeGroupAttr>(input.getReassociation()[reductionAxis]);
       cancelsInput =
-          inputFree.getResultAxes().asArrayRef() == ArrayRef<int64_t>{0} &&
-          inputReduction.getResultAxes().asArrayRef() == ArrayRef<int64_t>{1} &&
-          inputFree.getSourceAxes() == outputFree.getResultAxes();
+          inputFree.getResultAxes().asArrayRef() ==
+              ArrayRef<int64_t>{static_cast<int64_t>(operandFreeAxis)} &&
+          inputReduction.getResultAxes().asArrayRef() ==
+              ArrayRef<int64_t>{static_cast<int64_t>(reductionAxis)} &&
+          inputFree.getSourceAxes().size() == freeRank;
       for (unsigned axis = 0; cancelsInput && axis < freeRank; ++axis) {
-        auto original = cast<AxisMapAttr>(inputType.getAxisMaps()[axis]);
-        auto restored = cast<AxisMapAttr>(target.getAxisMaps()[axis]);
+        unsigned inputAxis = inputFree.getSourceAxes()[axis];
+        unsigned outputAxis = outputOffset + axis;
+        auto original = cast<AxisMapAttr>(inputType.getAxisMaps()[inputAxis]);
+        auto restored = cast<AxisMapAttr>(target.getAxisMaps()[outputAxis]);
         cancelsInput = original.getDimensionId() > 0 &&
                        original.getDimensionId() == restored.getDimensionId() &&
-                       inputType.getShape()[axis] == target.getShape()[axis];
+                       inputType.getShape()[inputAxis] == target.getShape()[outputAxis];
       }
       if (cancelsInput) {
         sourceValue = input.getValue();
@@ -6482,10 +6498,10 @@ LogicalResult normalizeContractionSources(ModuleOp module) {
     }
 
     // Move the declared row-major free-axis split through the contraction.
-    // An inverse input reshape can be cancelled while retaining its original
-    // coordinate roots; otherwise the same split applies to the flat lhs.
+    // Either operand can carry the split free axis. Cancel an inverse input
+    // reshape while retaining its coordinate roots, or split the flat operand.
     OpBuilder builder(contract);
-    if (contract.getRhsReductionAxes() == ArrayRef<int64_t>{1}) {
+    if (splitLeft && contract.getRhsReductionAxes() == ArrayRef<int64_t>{1}) {
       Value rhs = contract.getRhs();
       contract.getRhsMutable().assign(builder.create<TransposeOp>(
           contract.getLoc(), transposeLastTwo(cast<FragmentType>(rhs.getType())),
@@ -6493,27 +6509,43 @@ LogicalResult normalizeContractionSources(ModuleOp module) {
       contract->setAttr("rhs_reduction_axes", builder.getDenseI64ArrayAttr({0}));
     }
     SmallVector<Attribute> shape, mappings, groups;
-    for (unsigned axis = 0; axis < freeRank; ++axis) {
-      shape.push_back(target.getShape()[axis]);
-      mappings.push_back(cancelsInput ? source.getAxisMaps()[axis]
-                                     : target.getAxisMaps()[axis]);
-      if (cancelsInput)
+    SmallVector<Attribute> freeMappings;
+    unsigned expandedReductionAxis = reductionAxis == 0 ? 0 : freeRank;
+    auto appendAxis = [&](Attribute extent, Attribute attribute) {
+      auto axis = cast<AxisMapAttr>(attribute);
+      mappings.push_back(AxisMapAttr::get(
+          module.getContext(), axis.getSourceId(), axis.getSourceAxis(),
+          axis.getDimensionId(), shape.size(), axis.getDerived()));
+      shape.push_back(extent);
+    };
+    for (unsigned matrixAxis = 0; matrixAxis < 2; ++matrixAxis) {
+      if (matrixAxis == reductionAxis) {
+        appendAxis(matrix.getShape()[matrixAxis], matrix.getAxisMaps()[matrixAxis]);
         groups.push_back(ReshapeGroupAttr::get(
-            module.getContext(), builder.getDenseI64ArrayAttr({axis}),
-            builder.getDenseI64ArrayAttr({axis})));
+            module.getContext(), cancelsInput ? inputReduction.getSourceAxes()
+                : builder.getDenseI64ArrayAttr({static_cast<int64_t>(matrixAxis)}),
+            builder.getDenseI64ArrayAttr({static_cast<int64_t>(expandedReductionAxis)})));
+        continue;
+      }
+      SmallVector<int64_t> expandedFreeAxes;
+      for (unsigned axis = 0; axis < freeRank; ++axis) {
+        unsigned outputAxis = outputOffset + axis;
+        unsigned inputAxis = cancelsInput ? inputFree.getSourceAxes()[axis] : matrixAxis;
+        expandedFreeAxes.push_back(shape.size());
+        appendAxis(target.getShape()[outputAxis],
+                   cancelsInput ? source.getAxisMaps()[inputAxis]
+                                : target.getAxisMaps()[outputAxis]);
+        freeMappings.push_back(mappings.back());
+        if (cancelsInput)
+          groups.push_back(ReshapeGroupAttr::get(
+              module.getContext(), builder.getDenseI64ArrayAttr({inputAxis}),
+              builder.getDenseI64ArrayAttr({expandedFreeAxes.back()})));
+      }
+      if (!cancelsInput)
+        groups.push_back(ReshapeGroupAttr::get(
+            module.getContext(), builder.getDenseI64ArrayAttr({static_cast<int64_t>(matrixAxis)}),
+            builder.getDenseI64ArrayAttr(expandedFreeAxes)));
     }
-    if (!cancelsInput)
-      groups.push_back(outputFree);
-    auto matrix = contract.getLhs().getType();
-    auto reduction = cast<AxisMapAttr>(matrix.getAxisMaps()[1]);
-    shape.push_back(matrix.getShape()[1]);
-    mappings.push_back(AxisMapAttr::get(
-        module.getContext(), reduction.getSourceId(), reduction.getSourceAxis(),
-        reduction.getDimensionId(), freeRank, reduction.getDerived()));
-    groups.push_back(ReshapeGroupAttr::get(
-        module.getContext(), cancelsInput ? inputReduction.getSourceAxes()
-                                         : builder.getDenseI64ArrayAttr({1}),
-        builder.getDenseI64ArrayAttr({freeRank})));
     auto operandType = FragmentType::get(
         module.getContext(), matrix.getElementType(), builder.getArrayAttr(shape),
         builder.getArrayAttr(mappings), matrix.getValidity(), matrix.getOwner());
@@ -6524,22 +6556,26 @@ LogicalResult normalizeContractionSources(ModuleOp module) {
     }
     Value operand = builder.create<ReshapeOp>(
         contract.getLoc(), operandType, sourceValue, builder.getArrayAttr(groups));
-    SmallVector<Attribute> resultMappings(mappings.begin(),
-                                          mappings.begin() + freeRank);
-    auto column = cast<AxisMapAttr>(contract.getRhs().getType().getAxisMaps()[1]);
-    resultMappings.push_back(AxisMapAttr::get(
-        module.getContext(), column.getSourceId(), column.getSourceAxis(),
-        column.getDimensionId(), freeRank, column.getDerived()));
+    Attribute other = splitLeft ? contract.getRhs().getType().getAxisMaps()[1]
+                               : contract.getLhs().getType().getAxisMaps()[0];
+    SmallVector<Attribute> resultMappings;
+    for (unsigned axis = 0; axis <= freeRank; ++axis) {
+      bool isOther = splitLeft ? axis == freeRank : axis == 0;
+      auto mapping = cast<AxisMapAttr>(isOther ? other : freeMappings[axis - outputOffset]);
+      resultMappings.push_back(AxisMapAttr::get(
+          module.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+          mapping.getDimensionId(), axis, mapping.getDerived()));
+    }
     auto resultType = FragmentType::get(
         module.getContext(), target.getElementType(), target.getShape(),
         builder.getArrayAttr(resultMappings), target.getValidity(),
         target.getOwner());
     Value accumulator = builder.create<SplatOp>(output.getLoc(), resultType,
                                                identity.getValue());
-    contract.getLhsMutable().assign(operand);
+    (splitLeft ? contract.getLhsMutable() : contract.getRhsMutable()).assign(operand);
     contract.getAccumulatorMutable().assign(accumulator);
-    contract->setAttr("lhs_reduction_axes",
-                      builder.getDenseI64ArrayAttr({freeRank}));
+    contract->setAttr(splitLeft ? "lhs_reduction_axes" : "rhs_reduction_axes",
+                      builder.getDenseI64ArrayAttr({static_cast<int64_t>(expandedReductionAxis)}));
     contract.getResult().setType(resultType);
     builder.setInsertionPointAfter(contract);
     Value projected = builder.create<BroadcastOp>(output.getLoc(), target,
