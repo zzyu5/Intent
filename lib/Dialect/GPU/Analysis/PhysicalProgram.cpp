@@ -1956,6 +1956,32 @@ struct IndexBounds {
   int64_t lower = 0;
 };
 
+Value clampedIncrementLimit(Value value, Value base) {
+  auto add = stripScalarIdentity(value).getDefiningOp<BinaryOp>();
+  if (!add || !value.getType().isIndex() ||
+      add.getOperatorKind() != BinaryOperator::Add)
+    return {};
+  for (auto [start, increment] :
+       {std::pair{add.getLhs(), add.getRhs()},
+        std::pair{add.getRhs(), add.getLhs()}}) {
+    if (!sameScalarExpression(start, base))
+      continue;
+    auto minimum = stripScalarIdentity(increment).getDefiningOp<BinaryOp>();
+    if (!minimum || minimum.getOperatorKind() != BinaryOperator::Minimum)
+      continue;
+    for (auto [remaining, step] :
+         {std::pair{minimum.getLhs(), minimum.getRhs()},
+          std::pair{minimum.getRhs(), minimum.getLhs()}}) {
+      auto difference = stripScalarIdentity(remaining).getDefiningOp<BinaryOp>();
+      auto amount = integerConstant(step);
+      if (difference && difference.getOperatorKind() == BinaryOperator::Subtract &&
+          sameScalarExpression(difference.getRhs(), base) && amount && *amount >= 0)
+        return difference.getLhs();
+    }
+  }
+  return {};
+}
+
 IndexBounds queryIndexBounds(Value value) {
   using Bounds = IndexBounds;
   auto constantUpper = [](Bounds bounds) -> std::optional<int64_t> {
@@ -2035,6 +2061,31 @@ IndexBounds queryIndexBounds(Value value) {
                     lower.lower};
         }
       }
+      auto whileLoop = dyn_cast<scf::WhileOp>(argument.getOwner()->getParentOp());
+      if (whileLoop && argument.getOwner() == &whileLoop.getAfter().front()) {
+        auto condition = cast<scf::ConditionOp>(
+            whileLoop.getBefore().front().getTerminator());
+        auto carried = dyn_cast<BlockArgument>(stripScalarIdentity(
+            condition.getArgs()[argument.getArgNumber()]));
+        auto compare = condition.getCondition().getDefiningOp<CompareOp>();
+        if (carried && carried.getOwner() == &whileLoop.getBefore().front() &&
+            compare && compare.getPredicate() == ComparePredicate::Lt &&
+            sameScalarExpression(compare.getLhs(), carried)) {
+          auto yield = cast<scf::YieldOp>(whileLoop.getAfter().front().getTerminator());
+          Value limit = clampedIncrementLimit(
+              yield.getResults()[carried.getArgNumber()], argument);
+          PhysicalExprAttr end = limit ? queryLaunchExpression(limit) : PhysicalExprAttr();
+          Bounds initial = bound(whileLoop.getInits()[carried.getArgNumber()], depth + 1);
+          if (end && queryLaunchExpression(compare.getRhs()) == end &&
+              initial.nonNegative && bound(limit, depth + 1).nonNegative) {
+            // With 0 <= p < end, p + min(step, end-p) remains in [p,end]
+            // without signed overflow. The guard bounds each executing iteration.
+            return {true, expression(PhysicalExprKind::Subtract, 0,
+                                    {end, expression(PhysicalExprKind::Constant, 1)}),
+                    initial.lower};
+          }
+        }
+      }
     }
     if (auto parameter = current.getDefiningOp<ParameterOp>()) {
       auto schema = parameter.getParameter();
@@ -2088,6 +2139,13 @@ IndexBounds queryIndexBounds(Value value) {
          (rhsConstant && *rhsConstant == 0)))
       return {true, expression(PhysicalExprKind::Constant, 0)};
     if (binary.getOperatorKind() == BinaryOperator::Subtract) {
+      PhysicalExprAttr exactLhs = queryLaunchExpression(binary.getLhs());
+      if (lhs.nonNegative && rhs.nonNegative && exactLhs && rhs.upper) {
+        auto preceding = expression(PhysicalExprKind::Subtract, 0,
+                                    {exactLhs, expression(PhysicalExprKind::Constant, 1)});
+        if (rhs.upper == exactLhs || rhs.upper == preceding)
+          return {true, exactLhs, rhs.upper == preceding ? 1 : 0};
+      }
       if (auto constant = integerConstant(binary.getLhs());
           constant && *constant >= 0 && rhsConstant &&
           *rhsConstant <= *constant)
@@ -2125,6 +2183,16 @@ IndexBounds queryIndexBounds(Value value) {
                 lhs.lower - *amount};
     }
     if (binary.getOperatorKind() == BinaryOperator::Add) {
+      for (Value start : {binary.getLhs(), binary.getRhs()}) {
+        Value limit = clampedIncrementLimit(current, start);
+        if (!limit)
+          continue;
+        Bounds lower = bound(start, depth + 1);
+        Bounds upper = bound(limit, depth + 1);
+        PhysicalExprAttr end = queryLaunchExpression(limit);
+        if (lower.nonNegative && upper.nonNegative && end)
+          return {true, end, std::min(lower.lower, upper.lower)};
+      }
       for (auto [difference, increment] :
            {std::pair{binary.getLhs(), binary.getRhs()},
             std::pair{binary.getRhs(), binary.getLhs()}}) {
