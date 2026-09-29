@@ -148,7 +148,8 @@ def execute(directory: Path, suite: dict, prompt: str, *,
     public_text = (material / "api.txt").read_text() + "\n\n" + "\n\n".join(excerpts)
     messages = [
         {"role": "system", "content": generation_instructions()},
-        {"role": "user", "content": prompt + "\n\nPUBLIC LANGUAGE CONTRACTS\n" + public_text},
+        {"role": "user", "content": "PUBLIC LANGUAGE CONTRACTS\n" + public_text +
+         "\n\nTASK AND FIXED INVOCATION\n" + prompt},
     ]
     result = {"task_directory": str(directory), "model": suite["model"],
               "reasoning_effort": suite["reasoning_effort"], "generation_method": "public-manual-rag",

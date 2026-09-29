@@ -20,7 +20,7 @@ import torch
 import triton
 
 from experiments import PROJECT_ROOT
-from .agent import execute, instructions, materialize_language
+from .agent import execute, instructions, intent_tensor_types, materialize_language
 from .tasks import SUITE_PATH, catalog, description, invocation, read_suite, reference, return_contract
 
 
@@ -108,6 +108,13 @@ def generate_trial(arguments, row, language, *, generation_method="codex") -> di
     task_text += "\n\nFixed profile parameters (reference defaults included; tensor values are not disclosed):\n" + json.dumps(row["invocation"], indent=2)
     task_text += "\nParameters at their defaults may be omitted by the caller. Preserve optional parameter defaults in the returned callable."
     task_text += "\n\nExpected return structure, shape and dtype:\n" + json.dumps(row["return_contract"], indent=2)
+    if language == "intent":
+        task_text += ("\n\nIntent dtype/shape syntax for the same disclosed external tensors. "
+                      "When passing a tensor unchanged to a kernel, use these components in "
+                      "I.In[dtype, shape], I.Out[dtype, shape] or I.InOut[dtype, shape] according "
+                      "to its access direction. Choose your own internal interfaces and kernel stages:\n")
+        task_text += json.dumps(intent_tensor_types({"arguments": row["invocation"],
+                                                    "result": row["return_contract"]}), indent=2)
     task_text += "\n\nTolerance: " + json.dumps(arguments.suite["tolerances"][row["tolerance"]])
     task_text += "\n\nTiming: " + row["timing"]
     task_text += "\n\nProfile note: " + row["reason"]

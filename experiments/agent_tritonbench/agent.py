@@ -38,6 +38,33 @@ def instructions(language: str) -> str:
     )
 
 
+def intent_tensor_types(metadata: dict) -> dict[str, dict[str, str]]:
+    names = {
+        "bool": "bool", "int8": "i8", "int16": "i16", "int32": "i32", "int64": "i64",
+        "uint8": "u8", "uint16": "u16", "uint32": "u32", "uint64": "u64",
+        "float16": "f16", "bfloat16": "bf16", "float32": "f32", "float64": "f64",
+        "float8_e4m3fn": "f8e4m3fn", "float8_e5m2": "f8e5m2",
+    }
+    result = {}
+
+    def collect(value, path):
+        if isinstance(value, dict):
+            if "shape" in value and "dtype" in value:
+                name = value["dtype"].removeprefix("torch.")
+                if name not in names:
+                    raise NotImplementedError(f"No public Intent storage dtype spelling for {value['dtype']}")
+                result[path] = {"dtype": "I." + names[name], "shape": repr(tuple(value["shape"]))}
+            else:
+                for key, item in value.items():
+                    collect(item, f"{path}.{key}" if path else key)
+        elif isinstance(value, (tuple, list)):
+            for index, item in enumerate(value):
+                collect(item, f"{path}[{index}]")
+
+    collect(metadata, "")
+    return result
+
+
 def materialize_language(project: Path, triton_ref: Path, directory: Path, language: str) -> list[str]:
     directory.mkdir(parents=True)
     if language == "intent":
