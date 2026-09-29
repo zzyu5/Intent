@@ -222,7 +222,7 @@ loc(""<stdin>"":63:13): error: 'intent_gpu.contract' op native contraction reduc
 loc(""<stdin>"":1:1): error: shared GPU transformation failed: realize-contractions
 
 Compiler artifacts: /home/kingdom/.cache/intentdsl/compiler/f1e32473e3134ee98daffcc9b55e878f",/home/kingdom/.local/share/intentdsl/agent-evaluation/glm-remaining-20260929/least_squares_qr/triton/candidate.py,/home/kingdom/.local/share/intentdsl/agent-evaluation/glm-provider-recovery-20260929/least_squares_qr/intent/candidate.py,submitted,submitted,,,,
-determinant_via_qr,0.202224001288,pass,0.0160959996283,numerical_failure,,12.5636186604,,,,,generated/source result 0 finite-value masks differ,/home/kingdom/.local/share/intentdsl/agent-evaluation/glm-provider-recovery-20260929/determinant_via_qr/triton/candidate.py,/home/kingdom/.local/share/intentdsl/agent-evaluation/glm-remaining-20260929/determinant_via_qr/intent/candidate.py,submitted,submitted,,,,
+determinant_via_qr,0.202224001288,pass,0.0160959996283,numerical_failure,,12.5636186604,,,,,generated/source result 0 finite-value masks differ,/home/kingdom/.local/share/intentdsl/agent-evaluation/glm-provider-recovery-20260929/determinant_via_qr/triton/candidate.py,/home/kingdom/.local/share/intentdsl/agent-evaluation/glm-remaining-20260929/determinant_via_qr/intent/candidate.py,submitted,submitted,,,,"Source inspection identifies author formula errors: the reflector subtracts the target from every element, and the reflection scale is inconsistent with the intended Householder vector. Generated Triton preserves the same f64 expressions; no new benchmark was run."
 fused_tile_exp,0.0107840001583,numerical_failure,,compilation_failure,,,,,,"generated/source result 0 shape differs: (2097152,) != (2, 1048576)","Intent Triton compiler failed with exit code 4:
 loc(""<stdin>"":11:7): error: 'intent_gpu.make_range' op workset ownership conflicts with the existing program coordinate relation
 loc(""<stdin>"":1:1): error: shared GPU transformation failed: form-pointwise-ownership
@@ -253,7 +253,7 @@ fused_svd_reconstruct,1.07102400064,numerical_failure,,compilation_failure,,,,,E
             v109 = (v108 > v107)
             v110 = (-v23)
             v111 = tl.map_elementwise(_intent_map_1, v109, v102, v100, v36, v104, v37, tl.cast(v110, tl.float32), v38, v39, v40)
-                   ^",/home/kingdom/.local/share/intentdsl/agent-evaluation/glm-remaining-20260929/fused_svd_reconstruct/triton/candidate.py,/home/kingdom/.local/share/intentdsl/agent-evaluation/glm-remaining-20260929/fused_svd_reconstruct/intent/candidate.py,submitted,submitted,,,,
+                   ^",/home/kingdom/.local/share/intentdsl/agent-evaluation/glm-remaining-20260929/fused_svd_reconstruct/triton/candidate.py,/home/kingdom/.local/share/intentdsl/agent-evaluation/glm-remaining-20260929/fused_svd_reconstruct/intent/candidate.py,submitted,submitted,numerical_failure,,/home/kingdom/.local/share/intentdsl/agent-evaluation/glm-remaining-20260929/fused_svd_reconstruct/intent/candidate.py,Rank-zero Triton map serialization is fixed; the original program now compiles and runs but fails the unchanged numerical comparison. Its final kernel returns normalized columns without the singular-value and right-vector factors required for reconstruction.
 selu,0.0261599998921,agent_program_error,,pass,0.00780800008215,,3.350409787,,,"at 6:15:
 def _selu_kernel(input_ptr, output_ptr, n_elements, BLOCK: tl.constexpr):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
