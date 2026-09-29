@@ -92,7 +92,7 @@ def materialize_language(project: Path, triton_ref: Path, directory: Path, langu
 
 
 def command(directory: Path, suite: dict, response: Path, executable: Path,
-            state_root: Path, language: str) -> list[str]:
+            state_root: Path, language: str, session: str | None = None) -> list[str]:
     config = tomli.loads((state_root / "config.toml").read_text())
     if (config["model"], config["model_reasoning_effort"]) != (suite["model"], suite["reasoning_effort"]):
         raise ValueError("dedicated configuration must retain the agreed model and reasoning effort")
@@ -128,10 +128,14 @@ def command(directory: Path, suite: dict, response: Path, executable: Path,
             "required": True, "enabled_tools": ["search", "api", "read"],
             "default_tools_approval_mode": "approve",
         }
-    result = [str(executable), "exec", "--ignore-user-config", "--ignore-rules", "--strict-config",
-              "--ephemeral", "--skip-git-repo-check", "--json", "--color", "never",
-              "--model", suite["model"], "--cd", str(directory),
-              "--output-last-message", str(response)]
+    result = [str(executable), "exec"]
+    if session:
+        result += ["resume", session]
+    else:
+        result += ["--cd", str(directory), "--color", "never"]
+    result += ["--ignore-user-config", "--ignore-rules", "--strict-config",
+               "--skip-git-repo-check", "--json", "--model", suite["model"],
+               "--output-last-message", str(response)]
     for feature in ("multi_agent", "multi_agent_v2", "memories", "hooks", "plugins", "apps",
                     "browser_use", "computer_use", "image_generation", "shell_snapshot", "skill_search",
                     "unbounded_connection_retries", "view_image"):
@@ -153,9 +157,6 @@ def execute(directory: Path, suite: dict, prompt: str, *, executable: Path,
     environment = {name: os.environ[name] for name in ("PATH", "HOME", "USER", "LANG", "TMPDIR") if name in os.environ}
     environment.update(CODEX_HOME=str(state_root / "codex"), INTENT_STUDY_API_KEY=key)
     started = time.monotonic()
-    process = subprocess.Popen(command(directory, suite, response, executable, state_root, language),
-                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                               cwd=directory, env=environment, start_new_session=True)
     threads, errors, mcp_calls, stderr, completed_turns = [], [], [], [], []
 
     def collect_stdout():
@@ -179,27 +180,47 @@ def execute(directory: Path, suite: dict, prompt: str, *, executable: Path,
         for line in process.stderr:
             stderr.append(line.replace(key, "<redacted>"))
 
-    readers = [threading.Thread(target=collect_stdout), threading.Thread(target=collect_stderr)]
-    for reader in readers:
-        reader.start()
-    process.stdin.write(prompt)
-    process.stdin.close()
     timed_out = False
-    while process.poll() is None:
-        timed_out = time.monotonic() - started >= suite["agent_seconds"]
-        if timed_out or stop.is_set():
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+    session = None
+    continuation_count = 0
+    for delivery_turn in range(3):
+        response.unlink(missing_ok=True)
+        process = subprocess.Popen(
+            command(directory, suite, response, executable, state_root, language, session),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cwd=directory, env=environment, start_new_session=True)
+        readers = [threading.Thread(target=collect_stdout), threading.Thread(target=collect_stderr)]
+        for reader in readers:
+            reader.start()
+        process.stdin.write(prompt)
+        process.stdin.close()
+        while process.poll() is None:
+            timed_out = time.monotonic() - started >= suite["agent_seconds"]
+            if timed_out or stop.is_set():
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+                break
+            stop.wait(1)
+        for reader in readers:
+            reader.join()
+        timed_out |= time.monotonic() - started >= suite["agent_seconds"]
+        if (timed_out or stop.is_set() or process.returncode or not response.exists()
+                or (directory / "candidate.py").exists() or not threads or delivery_turn == 2):
             break
-        stop.wait(1)
-    for reader in readers:
-        reader.join()
+        # Continue only an empty delivery, before any program has been submitted.
+        # The original deadline and isolation apply to the same persisted session.
+        session = threads[-1]
+        continuation_count += 1
+        prompt = ("The previous turn ended without creating candidate.py. Continue the original task "
+                  "in this session and write one complete candidate.py before finishing. "
+                  "No compiler or benchmark feedback is provided.")
     result = {"task_directory": str(directory), "model": suite["model"], "reasoning_effort": suite["reasoning_effort"],
               "threads": threads, "exit_code": process.returncode, "manual_calls": mcp_calls,
+              "empty_delivery_continuations": continuation_count,
               "generation_seconds": time.monotonic() - started,
               "completed_turns": completed_turns}
     if timed_out or stop.is_set() or process.returncode or not response.exists():
