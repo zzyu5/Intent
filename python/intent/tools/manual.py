@@ -277,11 +277,18 @@ class Manual:
                 raise ValueError(f"Use a published heading line or an exact section title from this document: {titles}; "
                                  "omit section to read the whole document, or use api(name=...) for an API.")
             entry = entries[0]
+        elif id in self.corpus["documents"]:
+            entry = self.corpus["documents"][id]
         else:
-            if id not in self.corpus["documents"]:
+            entries = [d for d in self.corpus["documents"].values()
+                       if d["source"] == id and "#L" in d["id"]]
+            if len(entries) > 1:
+                raise ValueError(f"Only these sections are published; read one of their IDs: "
+                                 f"{[d['id'] for d in entries]}")
+            if not entries:
                 raise ValueError("Unknown document/rule ID or API name. Use search(query=...) and copy a returned id; "
                                  "api(name='I.matmul') reads an exact public declaration. Do not invent api/ paths.")
-            entry = self.corpus["documents"][id]
+            entry = entries[0]
         return {"revision": self.corpus["revision"], **entry}
 
 
