@@ -29,7 +29,7 @@ class CandidateTorchPolicy(TorchDispatchMode):
         allowed = {"aten.empty", "aten.empty_strided", "aten.empty_like", "aten.new_empty", "aten.view", "aten._unsafe_view",
                    "aten.as_strided", "aten.detach", "aten.alias", "aten.permute", "aten.transpose",
                    "aten.squeeze", "aten.unsqueeze", "aten.slice", "aten.select", "aten.expand",
-                   "aten.view_as_real", "aten.view_as_complex"}
+                   "aten.view_as_real", "aten.view_as_complex", "aten.result_type"}
         name = str(function).rsplit(".", 1)[0]
         if name in allowed:
             return function(*args, **(kwargs or {}))
