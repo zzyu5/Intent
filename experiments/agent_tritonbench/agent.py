@@ -185,6 +185,7 @@ def execute(directory: Path, suite: dict, prompt: str, *, executable: Path,
     timed_out = False
     session = None
     continuation_count = 0
+    unfinished_reasoning = False
     for delivery_turn in range(3):
         response.unlink(missing_ok=True)
         process = subprocess.Popen(
@@ -210,24 +211,29 @@ def execute(directory: Path, suite: dict, prompt: str, *, executable: Path,
         for reader in readers:
             reader.join()
         timed_out |= time.monotonic() - started >= suite["agent_seconds"]
+        reply = response.read_text() if response.exists() else ""
+        unfinished_reasoning = reply.count("<think>") > reply.count("</think>")
+        delivered = (directory / "candidate.py").exists() and not unfinished_reasoning
         if (timed_out or stop.is_set() or process.returncode or not response.exists()
-                or (directory / "candidate.py").exists() or not threads or delivery_turn == 2):
+                or delivered or not threads or delivery_turn == 2):
             break
-        # Continue only an empty delivery, before any program has been submitted.
+        # A draft file does not finish a response that stopped inside reasoning.
         # The original deadline and isolation apply to the same persisted session.
         session = threads[-1]
         continuation_count += 1
-        prompt = ("The previous turn ended without creating candidate.py. Continue the original task "
+        prompt = ("The previous response ended before a final submission. Continue the original task "
                   "in this session and write one complete candidate.py before finishing. "
                   "No compiler or benchmark feedback is provided.")
     result = {"task_directory": str(directory), "model": suite["model"], "reasoning_effort": suite["reasoning_effort"],
               "threads": threads, "exit_code": process.returncode, "manual_calls": mcp_calls,
-              "empty_delivery_continuations": continuation_count,
+              "delivery_continuations": continuation_count,
               "generation_seconds": time.monotonic() - started,
               "completed_turns": completed_turns}
-    if timed_out or stop.is_set() or process.returncode or not response.exists():
+    if timed_out or stop.is_set() or process.returncode or not response.exists() or unfinished_reasoning:
         result.update(action="unavailable", status="agent_timeout" if timed_out else "agent_environment_failure",
-                      errors=errors, error="".join(stderr)[-6000:] or "Agent stopped without a submission")
+                      errors=errors, error=("Provider response ended inside an unfinished reasoning block"
+                                           if unfinished_reasoning else "".join(stderr)[-6000:]
+                                           or "Agent stopped without a submission"))
     else:
         result.update(action="submit", reason=response.read_text().replace(key, "<redacted>"))
     return result
