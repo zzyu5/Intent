@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="520" viewBox="680 0 688 372" role="img" aria-labelledby="title description" font-family="'Liberation Serif', Georgia, 'Times New Roman', serif">
+  <title id="title">IntentDSL workflow</title>
+  <desc id="description">Developers and agents write an IntentDSL program describing tensor and region computation, accesses, state, and composition rules. The compiler maps and optimizes this program into inspectable Triton and cuTile source for GPUs, Mojo source for x86 CPUs, Weft source for RISC-V CPUs, and BANG C source for Cambricon MLUs.</desc>
+  <rect x="680" y="0" width="688" height="372" fill="white"/>
+  <g fill="#202020">
+    <text x="690" y="26.52" font-size="28" font-weight="bold">IntentDSL workflow</text>
+    <text x="1176" y="63.48" font-size="22" text-anchor="middle">Target code</text>
+    <text x="1304" y="63.48" font-size="22" text-anchor="middle">Hardware</text>
+    <rect x="691" y="78" width="188" height="187" rx="7" fill="#C6E2F3" stroke="#202020" stroke-width="1.7"/>
+    <text x="785" y="107.5" font-size="25" font-weight="bold" text-anchor="middle">IntentDSL</text>
+    <text x="785" y="135.5" font-size="25" font-weight="bold" text-anchor="middle">program</text>
+    <path d="M706,145 L864,145" fill="none" stroke="#306A91" stroke-width="1"/>
+    <text x="785" y="169.16" font-size="22" text-anchor="middle">Tensor / region</text>
+    <text x="785" y="193.8" font-size="22" text-anchor="middle">computation</text>
+    <text x="785" y="225.48" font-size="22" text-anchor="middle">Accesses &amp; state</text>
+    <text x="785" y="256.48" font-size="22" text-anchor="middle">Composition rules</text>
+    <path d="M880,171 L897,171" fill="none" stroke="#202020" stroke-width="1.8"/>
+    <polygon points="897,171 888.90,174.91 888.90,167.09"/>
+    <rect x="901" y="119" width="183" height="105" rx="7" fill="#D6D0E3" stroke="#202020" stroke-width="1.7"/>
+    <text x="992.5" y="148.28" font-size="26" font-weight="bold" text-anchor="middle">IntentDSL</text>
+    <text x="992.5" y="177.4" font-size="26" font-weight="bold" text-anchor="middle">compiler</text>
+    <text x="992.5" y="211.48" font-size="22" text-anchor="middle">Map · optimize</text>
+    <path d="M1085,171 L1110,171 M1110,92 L1110,272" fill="none" stroke="#202020" stroke-width="1.8"/>
+    <path d="M1110,92 L1121,92" fill="none" stroke="#202020" stroke-width="1.8"/>
+    <polygon points="1121,92 1112.90,95.91 1112.90,88.09"/>
+    <rect x="1123" y="76" width="110" height="32" rx="4" fill="#BFE6E4" stroke="#287F83" stroke-width="1.7"/>
+    <text x="1178" y="99.48" font-size="22" text-anchor="middle">Triton</text>
+    <path d="M1110,133 L1121,133" fill="none" stroke="#202020" stroke-width="1.8"/>
+    <polygon points="1121,133 1112.90,136.91 1112.90,129.09"/>
+    <rect x="1123" y="117" width="110" height="32" rx="4" fill="#BFE6E4" stroke="#287F83" stroke-width="1.7"/>
+    <text x="1178" y="140.48" font-size="22" text-anchor="middle">cuTile</text>
+    <path d="M1110,190 L1121,190" fill="none" stroke="#202020" stroke-width="1.8"/>
+    <polygon points="1121,190 1112.90,193.91 1112.90,186.09"/>
+    <rect x="1123" y="174" width="110" height="32" rx="4" fill="#BFE6E4" stroke="#287F83" stroke-width="1.7"/>
+    <text x="1178" y="197.48" font-size="22" text-anchor="middle">Mojo</text>
+    <path d="M1110,231 L1121,231" fill="none" stroke="#202020" stroke-width="1.8"/>
+    <polygon points="1121,231 1112.90,234.91 1112.90,227.09"/>
+    <rect x="1123" y="215" width="110" height="32" rx="4" fill="#BFE6E4" stroke="#287F83" stroke-width="1.7"/>
+    <text x="1178" y="238.48" font-size="22" text-anchor="middle">Weft</text>
+    <path d="M1110,272 L1121,272" fill="none" stroke="#202020" stroke-width="1.8"/>
+    <polygon points="1121,272 1112.90,275.91 1112.90,268.09"/>
+    <rect x="1123" y="256" width="110" height="32" rx="4" fill="#BFE6E4" stroke="#287F83" stroke-width="1.7"/>
+    <text x="1178" y="279.48" font-size="22" text-anchor="middle">BANG C</text>
+    <path d="M1235,92 L1242,92 M1235,133 L1242,133 M1242,92 L1242,133 M1242,108 L1250,108" fill="none" stroke="#202020" stroke-width="1.8"/>
+    <polygon points="1250,108 1241.90,111.91 1241.90,104.09"/>
+    <text x="1305.5" y="101.82" font-size="23" font-weight="bold" text-anchor="middle">GPUs</text>
+    <text x="1304" y="130.16" font-size="22" text-anchor="middle">H100 /</text>
+    <text x="1304" y="154.8" font-size="22" text-anchor="middle">RTX 5090D</text>
+    <path d="M1235,190 L1250,190" fill="none" stroke="#202020" stroke-width="1.8"/>
+    <polygon points="1250,190 1241.90,193.91 1241.90,186.09"/>
+    <text x="1306.5" y="197.48" font-size="22" text-anchor="middle">x86 CPU</text>
+    <path d="M1235,231 L1250,231" fill="none" stroke="#202020" stroke-width="1.8"/>
+    <polygon points="1250,231 1241.90,234.91 1241.90,227.09"/>
+    <text x="1306.5" y="226.16" font-size="22" text-anchor="middle">RISC-V</text>
+    <text x="1306.5" y="250.8" font-size="22" text-anchor="middle">CPU</text>
+    <path d="M1235,277 L1250,277" fill="none" stroke="#202020" stroke-width="1.8"/>
+    <polygon points="1250,277 1241.90,280.91 1241.90,273.09"/>
+    <text x="1306.5" y="272.16" font-size="22" text-anchor="middle">Cambricon</text>
+    <text x="1306.5" y="296.8" font-size="22" text-anchor="middle">MLU</text>
+    <circle cx="734" cy="322.5" r="6.5" fill="white" stroke="#202020" stroke-width="1.8"/>
+    <polygon points="721,347.2 721,341.35 721.25,339.19 721.99,337.12 723.19,335.21 724.81,333.54 726.78,332.16 729.03,331.14 731.46,330.51 734,330.3 736.54,330.51 738.97,331.14 741.22,332.16 743.19,333.54 744.81,335.21 746.01,337.12 746.75,339.19 747,341.35 747,347.2" fill="white" stroke="#202020" stroke-width="1.8"/>
+    <text x="763" y="331.94" font-size="23" font-weight="bold">Developers</text>
+    <text x="763" y="357.7" font-size="23" font-weight="bold">&amp; agents</text>
+    <path d="M749,309 L749,269" fill="none" stroke="#202020" stroke-width="1.8"/>
+    <polygon points="749,269 752.91,277.10 745.09,277.10"/>
+    <path d="M971,338 L1110,338 L1110,275" fill="none" stroke="#287F83" stroke-width="1.8"/>
+    <polygon points="1110,338 1101.90,341.91 1101.90,334.09" fill="#287F83"/>
+    <polygon points="971,338 979.10,334.09 979.10,341.91" fill="#287F83"/>
+    <text x="1123" y="333.16" font-size="22">Inspectable</text>
+    <text x="1123" y="357.8" font-size="22">source</text>
+  </g>
+</svg>
