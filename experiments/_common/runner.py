@@ -117,11 +117,19 @@ def _write_target_rows(path: Path, rows: list[ResultRow], *, target: str | None)
             key = row.kernel, row.case
             record = records.setdefault(key, {"kernel": row.kernel, "case": row.case})
             record[prefix + "p50_ms"] = "" if row.generated_p50_ms is None else f"{row.generated_p50_ms:.6f}"
-            record[prefix + "ratio"] = "" if row.ratio is None else f"{row.ratio:.6f}"
             record[prefix + "status"] = row.status
             record[prefix + "note"] = row.note.strip()
             if row.source_p50_ms is not None:
                 record["source_p50_ms"] = f"{row.source_p50_ms:.6f}"
+            source_time = record.get("source_p50_ms", "")
+            for backend in ("triton", "cutile"):
+                backend_prefix = "intent_" + backend + "_"
+                generated_time = record.get(backend_prefix + "p50_ms", "")
+                record[backend_prefix + "ratio"] = (
+                    f"{float(generated_time) / float(source_time):.6f}"
+                    if generated_time and source_time and record.get(backend_prefix + "status") == "pass"
+                    else ""
+                )
         temporary = path.with_suffix(path.suffix + ".tmp")
         with temporary.open("w", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
