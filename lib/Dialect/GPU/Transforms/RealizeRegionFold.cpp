@@ -4,6 +4,7 @@
 #include "Intent/Analysis/RegionSemantics.h"
 
 #include "OnlineSummary.h"
+#include "Utilities.h"
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
@@ -2758,7 +2759,9 @@ LogicalResult realizeRegionFolds(ModuleOp module) {
   for (RegionFoldOp fold : folds)
     if (fold->getBlock() && failed(realizeFold(fold, kernel)))
       return failure();
-  return folds.empty() ? success() : alignInlinedRegionValues(kernel);
+  if (!folds.empty() && failed(alignInlinedRegionValues(kernel)))
+    return failure();
+  return closeValueAccessRelations(kernel);
 }
 
 LogicalResult realizeRegionScans(ModuleOp module) {
@@ -2771,7 +2774,9 @@ LogicalResult realizeRegionScans(ModuleOp module) {
   for (RegionScanOp scan : scans)
     if (scan->getBlock() && failed(realizeScan(scan, kernel)))
       return failure();
-  return alignInlinedRegionValues(kernel);
+  if (failed(alignInlinedRegionValues(kernel)))
+    return failure();
+  return closeValueAccessRelations(kernel);
 }
 
 } // namespace intent::gpu

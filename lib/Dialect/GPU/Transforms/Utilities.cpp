@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Utilities.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
@@ -3299,6 +3300,16 @@ LogicalResult refreshReshapeRelations(func::FuncOp kernel) {
                                                   : WalkResult::advance();
   });
   return result.wasInterrupted() ? failure() : success();
+}
+
+LogicalResult closeValueAccessRelations(func::FuncOp kernel) {
+  if (failed(alignAccessResultRelations(kernel)) ||
+      failed(alignPointwiseValueRelations(kernel)) ||
+      failed(alignAccessValueRelations(kernel)) ||
+      failed(refreshReshapeRelations(kernel)) ||
+      failed(alignContractValueRelations(kernel)))
+    return failure();
+  return success();
 }
 
 LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {

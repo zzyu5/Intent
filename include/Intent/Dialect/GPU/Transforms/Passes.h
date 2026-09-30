@@ -163,6 +163,8 @@ mlir::FailureOr<mlir::Value> materializeRetainedSlice(
     mlir::OpBuilder &builder, mlir::Location location, mlir::Value value,
     unsigned axis, PhysicalExprAttr blockedExtent, mlir::Value coordinates,
     mlir::Operation *insertionAnchor);
+/// Realizes region operations and closes their inlined value/access relations
+/// before returning to the pipeline's executable-program verification boundary.
 mlir::LogicalResult realizeRegionFolds(mlir::ModuleOp module);
 mlir::LogicalResult realizeRegionScans(mlir::ModuleOp module);
 mlir::LogicalResult realizeContractionBlocking(mlir::ModuleOp module);

@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Utilities.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -87,26 +88,12 @@ LogicalResult coRealizeOnlineReductions(ModuleOp module, func::FuncOp kernel) {
   return success();
 }
 
-LogicalResult closeValueAccessRelations(func::FuncOp kernel) {
-  if (failed(alignAccessResultRelations(kernel)) ||
-      failed(alignPointwiseValueRelations(kernel)) ||
-      failed(alignAccessValueRelations(kernel)) ||
-      failed(refreshReshapeRelations(kernel)) ||
-      failed(alignContractValueRelations(kernel)))
-    return failure();
-  return success();
+LogicalResult realizeRegionFoldGroup(ModuleOp module, func::FuncOp) {
+  return realizeRegionFolds(module);
 }
 
-LogicalResult realizeRegionFoldGroup(ModuleOp module, func::FuncOp kernel) {
-  if (failed(realizeRegionFolds(module)))
-    return failure();
-  return closeValueAccessRelations(kernel);
-}
-
-LogicalResult realizeRegionScanGroup(ModuleOp module, func::FuncOp kernel) {
-  if (failed(realizeRegionScans(module)))
-    return failure();
-  return closeValueAccessRelations(kernel);
+LogicalResult realizeRegionScanGroup(ModuleOp module, func::FuncOp) {
+  return realizeRegionScans(module);
 }
 
 LogicalResult realizeScanConsumerGroup(ModuleOp module, func::FuncOp kernel) {
