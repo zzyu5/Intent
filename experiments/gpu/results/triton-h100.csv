@@ -17,7 +17,7 @@ xformers_rms_norm,8192x4096-bf16,0.049856,0.048920,0.050224,0.981226,1.007381,pa
 qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,1.162536,1.250128,1.140840,1.075346,0.981337,pass,pass,,Intent target=cutile; source corpus=triton.
 index_select,source65536-selected32768-hidden4096-fp16,0.224640,0.184464,0.184000,0.821154,0.819088,pass,pass,,Intent target=cutile; source corpus=triton.
 scaled_index_add,destination65536-routed32768-hidden4096-fp16,0.304880,0.271032,0.269224,0.888979,0.883049,pass,pass,,Intent target=cutile; source corpus=triton.
-scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,3.590400,3.090304,1.793848,0.860713,0.499623,pass,pass,,Intent target=cutile; source corpus=triton.
+scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,3.541576,4.138904,1.829048,1.168662,0.516450,pass,pass,,Intent target=cutile; source corpus=triton.
 jagged_mean,B512-T33024-D128-fp32,0.014368,0.014752,0.015096,1.026726,1.050668,pass,pass,,Intent target=cutile; source corpus=triton.
 fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.163240,0.043816,0.051024,0.268415,0.312570,pass,pass,,Intent target=cutile; source corpus=triton.
 rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.483032,0.126080,0.123952,0.261018,0.256612,pass,pass,,Intent target=cutile; source corpus=triton.

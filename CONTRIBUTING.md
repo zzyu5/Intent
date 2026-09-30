@@ -74,6 +74,8 @@ DSA 的 [MatrixSupply.cpp](lib/Dialect/DSA/Transforms/MatrixSupply.cpp) 消费�
 
 [Canonical matcher](lib/Analysis/OnlineSummary.cpp) 的 `matchOnlineSummary` 和 [GPU matcher](lib/Dialect/GPU/Transforms/OnlineSummary.cpp) 的 `matchOnlineSummaryMerge` 共用这个核心，同时保留各自的四字段 summary 识别、axis/shape/cast 检查、候选枚举及 GPU physical schema 检查。扩展共同 combine 规则时从共享核心开始；调整 fragment 投影时改 GPU 适配层。CPU 当前没有接入这个 matcher，不能把这项复用描述成所有 family 已共用。
 
+[ContractionAxes.h](include/Intent/Analysis/ContractionAxes.h) 统一 contraction 的 reduction/batch 配对、free axes 与操作数轴到结果轴的位置关系。CPU construction 和 GPU 当前 IR 查询共用这份纯轴关系；GPU 的 projection、vector realization 与 provider 原生矩阵检查消费相同结果。结果位置按正式 operand axis 推导，同一 source 或 dimension 在两边出现不代表同一个结果轴。该分析不读取 SSA、不选择 packing/tile，也不替各 provider 扩大原生 rank 或 dtype 支持。
+
 [IntegerRelations.h](include/Intent/Analysis/IntegerRelations.h) 的 `foldIntegerDifference` 复用 `UniformExpression` 描述，只读折叠加减、常数乘法及等宽整数/index cast 的变化系数。[CPU VectorizeLoops](lib/Dialect/CPU/Transforms/VectorizeLoops.cpp) 用它判断循环坐标差值，再检查连续 stride、别名与依赖；[DSA CollectiveGather](lib/Dialect/DSA/Transforms/CollectiveGather.cpp) 用它判断四个参与者之间的地址差值，保留自己的 task 商余关系、只读视图、局部 buffer 写入和控制一致性证明。CPU 的这个 vectorizer 当前由 Mojo legalization 调用，共享 CPU family 不意味着所有 provider 都调用它。
 
 该核心只接受 i64 或调用方明确绑定为 64 位的 index；两个适配层依据 Intent 的逻辑 index 合同传入位宽，不假定任意 MLIR index 都是 64 位。值运算仍遵守模整数语义，系数的加减乘另外检查是否能用 `int64_t` 表示；失败返回 `Unknown`，不能当作系数零。窄整数回绕后的扩宽需要独立范围证明，地址有效性、memory effects 与拓扑也不由系数证明。GPU 的按位宽模运算规范化和 source-axis 关系分析有不同合同，不应仅因都有 Add/Mul 就接到这一接口。
@@ -130,10 +132,12 @@ CPU 的候选绑定、存储证明与执行变换有各自的入口。[共享 pi
 | 有限 profile 数据 | [TuningProfiles.cpp](lib/Dialect/CPU/Transforms/TuningProfiles.cpp) | 读取后形成 typed rows；family 与 local 参数由 provider registry 声明，未知或缺失参数明确诊断，override 整族替换 |
 | 完整候选形成 | [Configurations.cpp](lib/Dialect/CPU/Transforms/Configurations.cpp) | 从当前 computations 枚举有限 implementation portfolio；保留合法性筛选、顺序与去重，候选成为独立的完整函数 |
 | 实现绑定与展开接口 | [Implementation.h](include/Intent/Dialect/CPU/Transforms/Implementation.h)、[Implementation.cpp](lib/Dialect/CPU/Transforms/Implementation.cpp) | `bind` 一次提交 operation binding、函数配置与实现摘要；供数与展开消费同一个选择 |
-| 存储别名与生命周期 | [Analysis/Storage.h](include/Intent/Dialect/CPU/Analysis/Storage.h) | `queryStorageAliases`、`queryStorageLifetime` 只读当前 views、captures、uses 和 lexical end；不移动 allocation 或决定 packing |
+| 存储别名、生命周期与读快照 | [Analysis/Storage.h](include/Intent/Dialect/CPU/Analysis/Storage.h) | `queryStorageAliases`、`queryStorageLifetime` 查询 views、captures、uses 与 lexical end；`areDisjointStorage`、`preservesStorage`、`isStorageReadStable` 结合当前 effects、alias analysis 与显式 ABI 证明能否重放读取，不移动 allocation 或决定 packing |
 | 供数与私有计算复用 | [ReusePreparedInputs.cpp](lib/Dialect/CPU/Transforms/ReusePreparedInputs.cpp)、[FuseIntermediateBuffers.cpp](lib/Dialect/CPU/Transforms/FuseIntermediateBuffers.cpp) | 在共同存储证明之外，分别检查坐标、effect、读取稳定性与计算可重放性，实际改写 current IR |
 
 别名集合的 `complete=false` 表示仍有未知的内存值传播。验证器可以检查已知 uses 是否越过 lifetime end，但改变存储或重放读取的优化还必须证明其需要的完整性与 effect 条件。查询结果只服务当前图，移动、替换或删除相关 operations 后重算；不能把某次查询结果跨变换保存为另一份存储计划。
+
+[IntegerSources.cpp](lib/Dialect/CPU/Transforms/IntegerSources.cpp) 在破坏性存储复用之前，将完整 pointwise 整数 producer 的读取替换为当前位置上的标量计算，保留位宽并证明输入快照稳定。[ContiguousAccesses.cpp](lib/Dialect/CPU/Transforms/ContiguousAccesses.cpp) 随后组合实际坐标与静态 strides：完整遍历的地址若等于同形状连续成员加固定基址，就形成标准 memref view/copy，交给既有输出转发与扫描实现。仿射证明同时检查原表达式及重排后算术的范围；未知 stride、无法证明的溢出或读写干扰保留原程序。两者是 `fuseStructuredComputations` 的相邻私有机制，不是新 scan 算法，也不让调用方手工拼装 pass 次序。
 
 输出转发也使用这份存储查询，并保留目标的 disjoint、dominance 和 effect 检查。identity layout 与显式静态 strides 若具有相同 shape、元素类型、memory space、offset 和 strides，可通过标准 `memref.cast` 保持派生 view 的输入类型；两个未知动态 strides 不构成等价证明。这样，unit-axis 视图等正常 lowering 结构不会仅因类型拼写不同而强制保留中间结果拷贝。
 
@@ -150,6 +154,8 @@ Mojo 的 [Passes.cpp](lib/Target/Mojo/Transforms/Passes.cpp) 调度实现展开�
 - `python/intent/runtime/` 绑定目标要求并执行；无法兑现的能力应明确报错，不改变算法或隐藏失败。
 
 CPU 的 implementation registry 是明确的局部扩展点。GPU provider 通常复用下层 compiler 的 primitives 与布局机制，不需要为了目录形式对称再建一套同名 leaf 系统。
+
+CPU host ABI 的共同绑定在 [runtime/cpu.py](python/intent/runtime/cpu.py)。`CPUInterface` 在 artifact 初始化时解析参数角色、静态形状、维度身份和需要检查的别名关系；每次调用仍重新观察实参并校验 shape、stride、pointer、allocation 与 offset。Mojo 的 Torch 对象规则和 Weft 的 Buffer/alignment 规则留在各自 `program.py`，各自的 tuning key 与计时范围也由适配层保持。Weft 的 `_ExecutionContract` 持有稳定硬件描述与 native 函数绑定，每次执行继续检查当前线程的 affinity、stack、RVV 状态和 VLEN。不要把一次实参观察或线程状态存入不可变 ABI schema。
 
 Triton 的 [Passes.cpp](lib/Target/Triton/Transforms/Passes.cpp) 调度 grid、prepare-memory、native-forms 和 finalize；[Legalize.cpp](lib/Target/Triton/Transforms/Legalize.cpp) 通过私有 [Legalization.h](lib/Target/Triton/Transforms/Legalization.h) 组合完整阶段。cuTile 的 [Passes.cpp](lib/Target/CuTile/Transforms/Passes.cpp) 调度 prepare、native-program 和 finalize，私有入口在 [Legalize.h](lib/Target/CuTile/Transforms/Legalize.h)。按实际职责选择相邻模块，不把新增规则继续堆入 driver：
 
