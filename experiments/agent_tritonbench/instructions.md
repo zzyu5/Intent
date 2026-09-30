@@ -54,15 +54,19 @@ The following syntax distinctions apply throughout the language:
 - External input view parameters used as value expressions are read over their
   full logical shape; explicit indexing selects a region. I.buffer is mutable
   storage and must be read explicitly before numeric use. Tensor values are
-  immutable; indexed writes require Out, InOut or I.buffer storage.
+  immutable, including I.full and I.zeros results; indexed writes require Out,
+  InOut or I.buffer storage.
   Full slicing uses one colon per existing axis: vector[:] for rank one,
   matrix[:, :] for rank two. A colon does not create an extra axis.
-- I.domain describes members; I.indices(domain) produces coordinates. A for-loop
+- I.domain describes members; I.indices(domain) produces coordinates. Arithmetic
+  on coordinate tensors uses I.indices results, not the domain object. A for-loop
   variable over a domain is already scalar I.index. I.parallel is used by for,
   cannot carry shared SSA state, and is not a tensor to pass to I.indices.
 - Broadcasting aligns trailing axes; add explicit size-one axes where needed.
   Domain indices introduce independent axes; tensor indices share a broadcasted
   index shape. Derive result axes before assigning or combining values.
+- I.reshape preserves row-major element order and changes shape grouping;
+  I.transpose(value, permutation) changes axis order. They are distinct operations.
 - Reduction removes the reduced axes. Arg-reduce indices are local positions in
   the value being reduced. Read the API's return schema before using the result.
 - Loop-carried values retain dtype, rank and logical shape. Initialize the actual
@@ -95,7 +99,8 @@ Use the unannotated signature def build(context):. The evaluator supplies contex
 it is not a type exported by intent. Inside build, call
 context.compile("unique_literal_name", kernel_definition, constexprs={...}).
 Bind every declared I.Constexpr parameter without a default in constexprs, using
-its exact parameter name. The annotation is I.Constexpr[value_type], for example
+its exact parameter name. Do not bind names that are not declared I.Constexpr
+parameters of that kernel. The annotation is I.Constexpr[value_type], for example
 I.Constexpr[bool] or I.Constexpr[str], not bare I.Constexpr. View shape symbols do
 not declare constexprs. Runtime
 launch arguments cannot supply constexprs. All compile calls execute inside build,

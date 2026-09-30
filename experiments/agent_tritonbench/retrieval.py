@@ -98,7 +98,9 @@ def generation_instructions() -> str:
         "looks up public documentation for the API names appearing in the draft; "
         "it does not compile, execute or check the program. Read those declarations "
         "and type/shape rules and review your own source against them. You may "
-        "request more documentation with queries. When ready, return a final JSON "
+        "request more documentation with queries. If revised source introduces "
+        "additional API names, their public contracts are returned before submission; "
+        "review them as part of the same draft process. When ready, return a final JSON "
         "object with one key, program, whose string value is the complete Python "
         "source for candidate.py. Only that final program is submitted and saved "
         "verbatim. "
@@ -157,6 +159,7 @@ def execute(directory: Path, suite: dict, prompt: str, *,
               "delivery_continuations": 0, "request_retries": 0,
               "draft_documentation_rounds": 0, "manual_queries": []}
     response_count = 0
+    documented_names = set()
     deadline = time.monotonic() + suite["agent_seconds"]
     while not stop.is_set() and time.monotonic() < deadline:
         body = {"model": suite["model"], "messages": messages,
@@ -199,16 +202,18 @@ def execute(directory: Path, suite: dict, prompt: str, *,
                 reply = json.loads(source)
                 if not isinstance(reply, dict):
                     raise ValueError("Response must be a JSON object")
-                if set(reply) == {"draft"} or (set(reply) == {"program"}
-                                               and result["draft_documentation_rounds"] == 0):
+                names = set()
+                if set(reply) in ({"draft"}, {"program"}):
                     draft = reply["draft"] if "draft" in reply else reply["program"]
                     if not isinstance(draft, str) or not draft.strip():
                         raise ValueError("draft must be a nonempty source string")
                     names = set(re.findall(
                         r"\b(?:I|intent)\.[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", draft))
                     names.add("context.compile")
+                if set(reply) == {"draft"} or (set(reply) == {"program"} and (
+                        result["draft_documentation_rounds"] == 0 or names - documented_names)):
                     declarations, rules = [], {}
-                    for name in sorted(names):
+                    for name in sorted(names - documented_names):
                         declaration = manual.api(name)
                         if declaration["status"] == "declared":
                             for rule in declaration["rules"]:
@@ -218,6 +223,7 @@ def execute(directory: Path, suite: dict, prompt: str, *,
                         result["manual_queries"].append({
                             "tool": "api", "arguments": {"name": name},
                             "source": "draft", "status": "returned"})
+                    documented_names.update(names)
                     result["draft_documentation_rounds"] += 1
                     messages.extend((previous, {"role": "user", "content":
                         "Public declarations for names appearing in your draft, with shared rules "
@@ -247,6 +253,8 @@ def execute(directory: Path, suite: dict, prompt: str, *,
                                 raise TypeError("Manual arguments must be strings; section may also be null")
                             response = methods[name](**arguments)
                             query["status"] = "returned"
+                            if name == "api":
+                                documented_names.add(arguments["name"])
                         except (KeyError, TypeError, ValueError) as failure:
                             response = {"error": str(failure)}
                             query["status"] = "error"
