@@ -10,6 +10,10 @@ add_mlir_library(MLIRIntentGPUTransforms
   RealizeAccessComposition.cpp
   PredicateScalarControl.cpp
   RealizePointwiseBlocking.cpp
+  PointwiseAnalysis.cpp
+  PointwiseCoverage.cpp
+  PointwiseTraversal.cpp
+  PointwiseOwnership.cpp
   RealizeScanConsumers.cpp
   MaterializeRetainedValues.cpp
   VectorizeBufferLoops.cpp
