@@ -423,7 +423,7 @@ void assignIterationRoles(func::FuncOp kernel) {
 
 } // namespace
 
-LogicalResult vectorizeBufferLoops(ModuleOp module) {
+static LogicalResult vectorizeBufferLoopsImpl(ModuleOp module) {
   auto physical = getPhysicalKernel(module);
   if (failed(physical))
     return failure();
@@ -440,6 +440,12 @@ LogicalResult vectorizeBufferLoops(ModuleOp module) {
   assignIterationRoles(kernel);
   eraseDeadPhysicalValues(kernel);
   return success();
+}
+
+LogicalResult vectorizeBufferLoops(ModuleOp module) {
+  if (failed(vectorizeBufferLoopsImpl(module))) return failure();
+  auto kernel = getPhysicalKernel(module);
+  return failed(kernel) ? failure() : closeValueRelations(*kernel);
 }
 
 } // namespace intent::gpu

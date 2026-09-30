@@ -3,26 +3,30 @@
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 
 namespace intent::gpu {
+
+using ValueTypeChangeCallback =
+    llvm::function_ref<void(mlir::Value, mlir::Type)>;
+
+// Intermediate rewrites sometimes need only the relations they have made
+// authoritative. Complete transformation entries close every relation.
+enum class ValueRelationScope {
+  Complete, Pointwise, Contracts, AccessResults, ReductionInputs
+};
 
 // Relation maintenance belongs inside a complete transformation, before verify.
 void retargetSourceExtent(mlir::Value root, PhysicalSourceAxis source,
                           PhysicalExprAttr extent,
-                          std::optional<int64_t> dimension = std::nullopt);
+                          std::optional<int64_t> dimension = std::nullopt,
+                          ValueTypeChangeCallback changed = {});
 void retargetDimensionExtent(mlir::Value root, int64_t dimensionId,
-                             PhysicalExprAttr extent);
-mlir::LogicalResult alignStructuredCaptureRelations(mlir::func::FuncOp kernel);
-mlir::LogicalResult alignPointwiseValueRelations(mlir::func::FuncOp kernel);
-mlir::LogicalResult alignAccessResultRelations(mlir::func::FuncOp kernel);
-mlir::LogicalResult alignAggregateValueRelations(mlir::func::FuncOp kernel);
-mlir::LogicalResult alignContractValueRelations(mlir::func::FuncOp kernel);
-mlir::LogicalResult alignAccessValueRelations(mlir::func::FuncOp kernel);
-mlir::LogicalResult refreshReshapeRelations(mlir::func::FuncOp kernel);
-mlir::LogicalResult alignReductionResultRelations(mlir::func::FuncOp kernel);
-mlir::LogicalResult alignReductionIdentityRelations(mlir::func::FuncOp kernel);
-mlir::LogicalResult alignReductionYieldRelations(mlir::func::FuncOp kernel);
-mlir::LogicalResult closeValueAccessRelations(mlir::func::FuncOp kernel);
+                             PhysicalExprAttr extent,
+                             ValueTypeChangeCallback changed = {});
+mlir::LogicalResult closeValueRelations(
+    mlir::func::FuncOp kernel,
+    ValueRelationScope scope = ValueRelationScope::Complete);
 void eraseDeadPhysicalValues(mlir::func::FuncOp kernel);
 
 } // namespace intent::gpu

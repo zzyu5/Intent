@@ -10,6 +10,7 @@
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Transforms/Resources.h"
 #include "Intent/Dialect/GPU/Transforms/Contraction.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"

@@ -3,6 +3,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include <string>
 namespace intent::bangc {
+void registerBangCPasses();
 mlir::LogicalResult legalizeProgram(mlir::ModuleOp module, llvm::StringRef architecture);
 mlir::LogicalResult verifyProgram(mlir::ModuleOp module);
 mlir::LogicalResult serializeProgram(mlir::ModuleOp module, std::string &source, std::string &metadata);

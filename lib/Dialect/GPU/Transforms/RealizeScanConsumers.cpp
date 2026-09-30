@@ -544,7 +544,7 @@ FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
 }
 } // namespace
 
-LogicalResult realizeScanConsumerTraversals(ModuleOp module) {
+static LogicalResult realizeScanConsumerTraversalsImpl(ModuleOp module) {
   FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
@@ -577,4 +577,10 @@ LogicalResult realizeScanConsumerTraversals(ModuleOp module) {
   }
   return success();
 }
+LogicalResult realizeScanConsumerTraversals(ModuleOp module) {
+  if (failed(realizeScanConsumerTraversalsImpl(module))) return failure();
+  auto kernel = getPhysicalKernel(module);
+  return failed(kernel) ? failure() : closeValueRelations(*kernel);
+}
+
 } // namespace intent::gpu

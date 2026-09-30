@@ -4008,7 +4008,7 @@ LogicalResult rankLiftPointwiseValueGraph(
   }
   // Ownership queries consume operand relations, not just the lifted result
   // types. Make scalar and coordinate broadcasts explicit before those queries.
-  return alignPointwiseValueRelations(kernel);
+  return closeValueRelations(kernel, ValueRelationScope::Pointwise);
 }
 
 enum ContractFreeAxisSide : unsigned {
@@ -4096,18 +4096,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     eraseDeadPhysicalValues(kernel);
     if (failed(bindStructurallyRequiredStaticFragments(kernel)))
       return failure();
-    if (failed(alignStructuredCaptureRelations(kernel)) ||
-        failed(alignReductionResultRelations(kernel)) ||
-        failed(alignReductionIdentityRelations(kernel)) ||
-        failed(alignAggregateValueRelations(kernel)) ||
-        failed(alignPointwiseValueRelations(kernel)) ||
-        failed(alignReductionYieldRelations(kernel)) ||
-        failed(alignAccessValueRelations(kernel)) ||
-        failed(alignAggregateValueRelations(kernel)) ||
-        failed(alignContractValueRelations(kernel)) ||
-        failed(alignAggregateValueRelations(kernel)) ||
-        failed(alignAccessValueRelations(kernel)) ||
-        failed(alignPointwiseValueRelations(kernel)))
+    if (failed(closeValueRelations(kernel)))
       return failure();
     PhysicalProgramAnalysis analysis(kernel);
     WalkResult localized = kernel.walk([&](GatherOp gather) {
@@ -5022,7 +5011,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     // Keeping the predicate only in a side map across later rewrites leaves it
     // without an IR use and lets dead-value cleanup invalidate the fact.
     if (!fixedRangePredicates.empty()) {
-      if (failed(alignAccessResultRelations(kernel)) ||
+      if (failed(closeValueRelations(kernel, ValueRelationScope::AccessResults)) ||
           failed(addTailValidity(kernel, fixedRangePredicates,
                                  /*includeStores=*/true)))
         return failure();
@@ -5214,7 +5203,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     if (!ownershipOnly && failed(realizeOwnedHistograms(kernel)))
       return failure();
     if (!ownershipOnly &&
-        (failed(alignAccessResultRelations(kernel)) ||
+        (failed(closeValueRelations(kernel, ValueRelationScope::AccessResults)) ||
          failed(addTailValidity(kernel, fixedRangePredicates,
                                 /*includeStores=*/true))))
       return failure();
@@ -7299,7 +7288,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   // accesses.  Materialize those SSA uses before histogram realization, whose
   // dead-value cleanup would otherwise erase the unused comparisons and leave
   // dangling Values in rangePredicates.
-  if (failed(alignAccessResultRelations(kernel)) ||
+  if (failed(closeValueRelations(kernel, ValueRelationScope::AccessResults)) ||
       failed(addTailValidity(kernel, rangePredicates,
                              /*includeStores=*/true)))
     return failure();
@@ -7309,8 +7298,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   } else if (failed(realizeOwnedHistograms(kernel))) {
     return failure();
   }
-  if (failed(alignContractValueRelations(kernel)))
-    return failure();
   return finalizeValueRelations();
 }
 
@@ -7319,7 +7306,13 @@ LogicalResult realizePointwiseOwnership(ModuleOp module) {
 }
 
 LogicalResult realizePointwiseBlocking(ModuleOp module) {
-  return realizePointwiseBlockingImpl(module, /*ownershipOnly=*/false);
+  if (failed(realizePointwiseBlockingImpl(module, /*ownershipOnly=*/false)) ||
+      failed(realizeVectorContractions(module)))
+    return failure();
+  auto kernel = getPhysicalKernel(module);
+  if (failed(kernel) || failed(closeValueRelations(*kernel)))
+    return failure();
+  return guardInactivePredicatedLoops(module);
 }
 
 } // namespace intent::gpu

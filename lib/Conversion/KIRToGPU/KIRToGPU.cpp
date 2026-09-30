@@ -5882,10 +5882,10 @@ LogicalResult constructGPUProgram(ModuleOp module,
   if (dispatchLoweringFailed)
     return failure();
   builder.create<func::ReturnOp>(function.getLoc());
-  if (failed(gpu::alignPointwiseValueRelations(physical)))
+  if (failed(gpu::closeValueRelations(physical, gpu::ValueRelationScope::Pointwise)))
     return physical.emitError(
         "initial physical value relations are incomplete");
-  if (failed(gpu::alignContractValueRelations(physical)))
+  if (failed(gpu::closeValueRelations(physical, gpu::ValueRelationScope::Contracts)))
     return physical.emitError(
         "initial physical contract relations are incomplete");
   function.erase();

@@ -3171,7 +3171,7 @@ LogicalResult materializeIndexedFragments(func::FuncOp kernel) {
 
 } // namespace
 
-LogicalResult realizeAccessComposition(ModuleOp module) {
+static LogicalResult realizeAccessCompositionImpl(ModuleOp module) {
   FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);
   if (failed(physicalKernel))
     return failure();
@@ -3363,6 +3363,12 @@ LogicalResult simplifyMaskedAccessCoordinates(ModuleOp module) {
   });
   eraseDeadPhysicalValues(*kernel);
   return success();
+}
+
+LogicalResult realizeAccessComposition(ModuleOp module) {
+  if (failed(realizeAccessCompositionImpl(module))) return failure();
+  auto kernel = getPhysicalKernel(module);
+  return failed(kernel) ? failure() : closeValueRelations(*kernel);
 }
 
 } // namespace intent::gpu

@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Analysis/Resources.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
@@ -812,6 +813,7 @@ void bindContractionFreeExtents(
 
 LogicalResult bindTraversalFragmentFootprints(
     func::FuncOp kernel, ArrayRef<ParameterOp> parameters,
+    const FragmentResourceAnalysis &resources,
     NamedAttrList &bindings, Builder &builder) {
   auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   if (!capabilities || capabilities.getRegistersPerUnit() <= 0)
@@ -830,24 +832,9 @@ LogicalResult bindTraversalFragmentFootprints(
         (role == ParameterRole::OwnershipM || role == ParameterRole::OwnershipN);
     if (!parameter->hasAttr(pointwiseChunkAttr) && !reduction && !pointwise)
       continue;
-    llvm::SmallDenseSet<FragmentType> fragments;
-    kernel.walk([&](Operation *operation) {
-      // Shape views do not materialize one register per expanded lane. Their
-      // producers and arithmetic/access consumers carry the actual payloads.
-      if (isa<BroadcastOp, SplatOp, ReshapeOp>(operation))
-        return;
-      for (Value value : operation->getResults())
-        if (auto type = dyn_cast<FragmentType>(value.getType());
-            type && llvm::any_of(type.getShape(), [&](Attribute extent) {
-              return expressionReferencesParameter(cast<PhysicalExprAttr>(extent),
-                                                   schema.getName());
-            }))
-          fragments.insert(type);
-    });
+    auto fragments = resources.materializedTypesUsing(schema.getName());
     auto fits = [&, schema, fragments](int64_t candidate) {
-      AttrTypeReplacer replacer;
-      replacer.addReplacement(
-          [&](PhysicalExprAttr expression) -> std::optional<Attribute> {
+      auto resolve = [&](PhysicalExprAttr expression) -> std::optional<int64_t> {
         if (expression.getKind() !=
             static_cast<uint32_t>(PhysicalExprKind::Parameter))
           return std::nullopt;
@@ -855,34 +842,18 @@ LogicalResult bindTraversalFragmentFootprints(
             bindings.get(expression.getSymbol().getValue()));
         if (!binding)
           return std::nullopt;
-        int64_t value = expression.getSymbol() == schema.getName()
-                            ? candidate : binding.getInt();
-        return PhysicalExprAttr::get(kernel.getContext(),
-            static_cast<uint32_t>(PhysicalExprKind::Constant), value,
-            builder.getStringAttr(""), builder.getArrayAttr({}));
-      });
-      auto footprint = [&](FragmentType fragment) -> std::optional<int64_t> {
-        Type element = fragment.getElementType();
-        unsigned bits = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
-        __int128 registers = std::max(1u, (bits + 31) / 32);
-        bool known = true;
-        for (Attribute attribute : fragment.getShape()) {
-          auto extent = constantPhysicalExpression(
-              cast<PhysicalExprAttr>(replacer.replace(attribute)));
-          if (!extent || *extent <= 0) {
-            known = false;
-            break;
-          }
-          registers = std::min<__int128>(capabilities.getRegistersPerUnit(),
-                                         registers * *extent);
-        }
-        return known ? std::optional<int64_t>(registers) : std::nullopt;
+        return expression.getSymbol() == schema.getName()
+                   ? candidate : binding.getInt();
       };
       // Bound individual fragments. Logical SSA liveness does not model the
       // provider's broadcast/layout reuse or machine-register scheduling.
       for (FragmentType fragment : fragments) {
-        auto registers = footprint(fragment);
-        if (registers && *registers >= capabilities.getRegistersPerUnit())
+        Type element = fragment.getElementType();
+        unsigned bits = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
+        auto bound = checkFragmentFootprint(
+            fragment, capabilities.getRegistersPerUnit() - 1,
+            std::max(1u, (bits + 31) / 32), resolve);
+        if (bound == FootprintBound::Exceeds || bound == FootprintBound::Invalid)
           return false;
       }
       return true;
@@ -910,6 +881,7 @@ LogicalResult bindTraversalFragmentFootprints(
 
 void appendFullResultContractionTuples(
     func::FuncOp kernel, const NamedAttrList &bindings,
+    ArrayRef<ParameterOp> parameters, const FragmentResourceAnalysis &resources,
     llvm::function_ref<const TuningProfile &(ParameterOp)> profileFor,
     Builder &builder, SmallVectorImpl<Attribute> &tuples) {
   kernel.walk([&](scf::ForOp loop) {
@@ -974,6 +946,35 @@ void appendFullResultContractionTuples(
       return;
     NamedAttrList widened(bindings);
     widened.set(schema.getName(), builder.getI64IntegerAttr(selected));
+    // Widened producer tiles are candidates of the same current program. They
+    // must pass the same budget binding as the ordinary profile projection.
+    if (failed(bindTraversalFragmentFootprints(kernel, parameters, resources,
+                                               widened, builder)))
+      return;
+    auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+    if (capabilities && capabilities.getRegistersPerUnit() > 0) {
+      auto resolve = [&](PhysicalExprAttr expression) -> std::optional<int64_t> {
+        if (expression.getKind() !=
+            static_cast<uint32_t>(PhysicalExprKind::Parameter))
+          return std::nullopt;
+        auto value = dyn_cast_or_null<IntegerAttr>(
+            widened.get(expression.getSymbol().getValue()));
+        return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
+      };
+      // Contraction parameters are not resized by the traversal policy above.
+      // Check the actual payloads affected by this widening as well, retaining
+      // ABI-dependent requirements for provider specialization to decide.
+      for (FragmentType fragment :
+           resources.materializedTypesUsing(schema.getName())) {
+        Type element = fragment.getElementType();
+        unsigned bits = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
+        auto bound = checkFragmentFootprint(
+            fragment, capabilities.getRegistersPerUnit() - 1,
+            std::max(1u, (bits + 31) / 32), resolve);
+        if (bound == FootprintBound::Exceeds || bound == FootprintBound::Invalid)
+          return;
+      }
+    }
     DictionaryAttr tuple = widened.getDictionary(kernel.getContext());
     if (!llvm::is_contained(tuples, Attribute(tuple)))
       tuples.push_back(tuple);
@@ -1060,6 +1061,7 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
   if (invalidParameter)
     return failure();
   Builder builder(kernel.getContext());
+  const FragmentResourceAnalysis resources(kernel);
   SmallVector<Attribute> tuples;
   bool hasTwoAxisPointwiseOwnership = llvm::any_of(
       parameters, [](ParameterOp parameter) {
@@ -1091,38 +1093,31 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
       if (schema.getCategory() != static_cast<uint32_t>(ParameterCategory::Pointwise) ||
           schema.getRole() != static_cast<uint32_t>(ParameterRole::OwnershipN))
         continue;
-      AttrTypeReplacer localShape;
-      localShape.addReplacement(
-          [&](PhysicalExprAttr extent) -> std::optional<Attribute> {
+      auto localExtent = [&](PhysicalExprAttr extent) -> std::optional<int64_t> {
         if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter) ||
             extent.getSymbol() != schema.getName())
           return std::nullopt;
-        return PhysicalExprAttr::get(kernel.getContext(),
-            static_cast<uint32_t>(PhysicalExprKind::Constant), 1,
-            builder.getStringAttr(""), builder.getArrayAttr({}));
-      });
+        return 1;
+      };
       int64_t multiplicity = 1;
-      kernel.walk([&](Operation *operation) {
-        for (Type type : operation->getResultTypes()) {
-          auto fragment = dyn_cast<FragmentType>(type);
-          if (!fragment || !fragmentReferencesParameter(fragment, schema.getName()))
+      for (FragmentType fragment : resources.valueTypes()) {
+        if (!fragmentReferencesParameter(fragment, schema.getName()))
+          continue;
+        int64_t elements = 1;
+        for (Attribute dimension : fragment.getShape()) {
+          auto extent = evaluatePhysicalExpression(
+              cast<PhysicalExprAttr>(dimension), localExtent);
+          if (!extent)
             continue;
-          int64_t elements = 1;
-          for (Attribute dimension : fragment.getShape()) {
-            auto extent = constantPhysicalExpression(
-                cast<PhysicalExprAttr>(localShape.replace(dimension)));
-            if (!extent)
-              continue;
-            if (*extent <= 0 ||
-                elements > std::numeric_limits<int64_t>::max() / *extent) {
-              elements = 1;
-              break;
-            }
-            elements *= *extent;
+          if (*extent <= 0 ||
+              elements > std::numeric_limits<int64_t>::max() / *extent) {
+            elements = 1;
+            break;
           }
-          multiplicity = std::max(multiplicity, elements);
+          elements *= *extent;
         }
-      });
+        multiplicity = std::max(multiplicity, elements);
+      }
       pointwiseLocalMultiplicity[parameter] = multiplicity;
     }
   SmallVector<ParameterOp> pointwiseRowAxes;
@@ -1277,15 +1272,15 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
       }
       bindContractionFreeExtents(freeExtents, bindings, profileFor, builder,
                                 choice % freeAxisChoices != 0);
-      if (failed(bindTraversalFragmentFootprints(kernel, parameters, bindings,
-                                                 builder))) {
+      if (failed(bindTraversalFragmentFootprints(kernel, parameters, resources,
+                                                 bindings, builder))) {
         invalidFootprint = true;
         continue;
       }
       DictionaryAttr tuple = bindings.getDictionary(kernel.getContext());
       if (!llvm::is_contained(tuples, Attribute(tuple))) tuples.push_back(tuple);
-      appendFullResultContractionTuples(kernel, bindings, profileFor, builder,
-                                       tuples);
+      appendFullResultContractionTuples(kernel, bindings, parameters, resources,
+                                       profileFor, builder, tuples);
     }
   };
   for (unsigned profileIndex = 0; profileIndex < profileCount;
@@ -1387,49 +1382,6 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
     tuples.push_back(builder.getDictionaryAttr({}));
   kernel->setAttr(sharedConfigTuplesAttr, builder.getArrayAttr(tuples));
   return success();
-}
-
-void materializeDeferredReductionBounds(
-    func::FuncOp kernel, ArrayRef<ValueRange> sourceGroups) {
-  auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
-  if (!capabilities || capabilities.getRegistersPerUnit() <= 0)
-    return;
-  AttrTypeReplacer knownParameters;
-  knownParameters.addReplacement(
-      [&](PhysicalExprAttr expression) -> std::optional<Attribute> {
-    if (expression.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter))
-      return std::nullopt;
-    auto parameter = queryParameterBySymbol(kernel, expression.getSymbol());
-    if (failed(parameter) || (*parameter)->hasAttr(coverageDimensionAttr) ||
-        parameter->getParameter().getCategory() ==
-            static_cast<uint32_t>(ParameterCategory::Coverage))
-      return std::nullopt;
-    return PhysicalExprAttr::get(
-        kernel.getContext(), static_cast<uint32_t>(PhysicalExprKind::Constant),
-        parameter->getParameter().getCandidates().asArrayRef().front(),
-        StringAttr::get(kernel.getContext(), ""), ArrayAttr::get(kernel.getContext(), {}));
-  });
-  SmallVector<PhysicalExprAttr> bounds;
-  for (ValueRange sources : sourceGroups) {
-    auto footprint = reductionRegisterFootprint(sources, kernel);
-    if (footprint &&
-        !constantPhysicalExpression(cast<PhysicalExprAttr>(
-            knownParameters.replace(footprint))) &&
-        !llvm::is_contained(bounds, footprint))
-      bounds.push_back(footprint);
-  }
-  kernel.getContext()->getOrLoadDialect<cf::ControlFlowDialect>();
-  OpBuilder builder = OpBuilder::atBlockBegin(&kernel.front());
-  for (PhysicalExprAttr footprint : bounds) {
-    Value count = builder.create<PhysicalExprOp>(
-        kernel.getLoc(), builder.getIndexType(), footprint);
-    Value maximum = builder.create<arith::ConstantIndexOp>(
-        kernel.getLoc(), capabilities.getRegistersPerUnit());
-    Value valid = builder.create<CompareOp>(kernel.getLoc(), builder.getI1Type(),
-                                           count, maximum, ComparePredicate::Le);
-    builder.create<cf::AssertOp>(
-        kernel.getLoc(), valid, "reduction source exceeds the candidate register budget");
-  }
 }
 
 LogicalResult verifySharedConfigTuples(func::FuncOp kernel) {

@@ -1127,7 +1127,7 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
 
 } // namespace
 
-LogicalResult materializeRetainedValues(ModuleOp module) {
+static LogicalResult materializeRetainedValuesImpl(ModuleOp module) {
   FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);
   if (failed(physicalKernel))
     return failure();
@@ -1177,6 +1177,12 @@ LogicalResult materializeRetainedValues(ModuleOp module) {
     if (!changed)
       return success();
   }
+}
+
+LogicalResult materializeRetainedValues(ModuleOp module) {
+  if (failed(materializeRetainedValuesImpl(module))) return failure();
+  auto kernel = getPhysicalKernel(module);
+  return failed(kernel) ? failure() : closeValueRelations(*kernel);
 }
 
 } // namespace intent::gpu

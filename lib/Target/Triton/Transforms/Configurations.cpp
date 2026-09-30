@@ -1,6 +1,7 @@
 #include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
 #include "Configurations.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Analysis/Resources.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
@@ -9,6 +10,7 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Transforms/Resources.h"
 #include "Intent/Target/Triton/IR/TritonOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -228,32 +230,13 @@ std::optional<int64_t> descriptorElementBytes(Type type) {
 
 bool fragmentFitsTritonTensor(gpu::FragmentType fragment,
                               const TritonConfig &config) {
-  __int128 elements = 1;
-  for (Attribute extent : fragment.getShape()) {
-    std::optional<int64_t> value = evaluateCompileTimeExpression(
-        cast<gpu::PhysicalExprAttr>(extent), config);
-    // Runtime dimensions and full-coverage heuristics are checked by Triton at
-    // specialization time.  This pass rejects only candidates whose typed
-    // compile-time shape is already known to be illegal.
-    if (!value)
-      return true;
-    if (*value <= 0)
-      return false;
-    elements *= *value;
-    if (elements > maxTritonTensorElements)
-      return false;
-  }
-  return true;
-}
-
-bool typeFitsTritonTensor(Type type, const TritonConfig &config) {
-  if (auto fragment = dyn_cast<gpu::FragmentType>(type))
-    return fragmentFitsTritonTensor(fragment, config);
-  if (auto record = dyn_cast<gpu::RecordType>(type))
-    return llvm::all_of(record.getFieldTypes(), [&](Attribute field) {
-      return typeFitsTritonTensor(cast<TypeAttr>(field).getValue(), config);
-    });
-  return true;
+  auto bound = gpu::checkFragmentFootprint(
+      fragment, maxTritonTensorElements, 1, [&](gpu::PhysicalExprAttr leaf) {
+        return evaluateCompileTimeExpression(leaf, config);
+      });
+  // ABI-dependent extents retain the specialization assertions below.
+  return bound != gpu::FootprintBound::Exceeds &&
+         bound != gpu::FootprintBound::Invalid;
 }
 
 SmallVector<gpu::FragmentType> collectiveFragments(func::FuncOp kernel) {
@@ -304,24 +287,9 @@ LogicalResult materializeDeferredResourceBounds(func::FuncOp kernel) {
       known.kernelParameters[schema.getName().getValue().str()] =
           schema.getCandidates().asArrayRef().front();
   });
-  SmallVector<gpu::FragmentType> fragments;
-  std::function<void(Type)> collect = [&](Type type) {
-    if (auto fragment = dyn_cast<gpu::FragmentType>(type)) {
-      if (!llvm::is_contained(fragments, fragment))
-        fragments.push_back(fragment);
-    } else if (auto record = dyn_cast<gpu::RecordType>(type)) {
-      for (Attribute field : record.getFieldTypes())
-        collect(cast<TypeAttr>(field).getValue());
-    }
-  };
-  kernel.walk([&](Operation *operation) {
-    for (Type type : operation->getOperandTypes())
-      collect(type);
-    for (Type type : operation->getResultTypes())
-      collect(type);
-  });
+  const gpu::FragmentResourceAnalysis resources(kernel);
   SmallVector<gpu::PhysicalExprAttr> bounds;
-  for (gpu::FragmentType fragment : fragments) {
+  for (gpu::FragmentType fragment : resources.valueTypes()) {
     gpu::PhysicalExprAttr elements;
     for (Attribute attribute : fragment.getShape()) {
       auto extent = cast<gpu::PhysicalExprAttr>(attribute);
@@ -538,7 +506,7 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
     }
   }
 
-  SmallVector<Type> tensorTypes;
+  const gpu::FragmentResourceAnalysis resources(kernel);
   SmallVector<gpu::PhysicalExprAttr> rangeExtents;
   SmallVector<SmallVector<gpu::PhysicalExprAttr>> reductionFootprints;
   struct DescriptorConstraint {
@@ -548,10 +516,6 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
   SmallVector<DescriptorConstraint> descriptors;
   auto capabilities = kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
   bool validRanges = true;
-  auto collectType = [&](Type type) {
-    if (!llvm::is_contained(tensorTypes, type))
-      tensorTypes.push_back(type);
-  };
   kernel.walk([&](Operation *operation) {
     if (auto range = dyn_cast<gpu::MakeRangeOp>(operation)) {
       auto fragment = dyn_cast<gpu::FragmentType>(range.getResult().getType());
@@ -579,12 +543,6 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
       descriptorConstraint(load.getDescriptor(), load.getResult().getType());
     else if (auto store = dyn_cast<DescriptorStoreOp>(operation))
       descriptorConstraint(store.getDescriptor(), store.getValue().getType());
-    for (Type type : operation->getResultTypes())
-      collectType(type);
-    for (Region &region : operation->getRegions())
-      for (Block &block : region)
-        for (BlockArgument argument : block.getArguments())
-          collectType(argument.getType());
   });
   if (!validRanges)
     return kernel.emitError("Triton ranges require one-dimensional fragments");
@@ -620,8 +578,8 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
         }) || llvm::any_of(rangeExtents, [&](gpu::PhysicalExprAttr expression) {
           auto extent = evaluateCompileTimeExpression(expression, config);
           return extent && (*extent <= 0 || !llvm::isPowerOf2_64(*extent));
-        }) || llvm::any_of(tensorTypes, [&](Type type) {
-          return !typeFitsTritonTensor(type, config);
+        }) || llvm::any_of(resources.valueTypes(), [&](gpu::FragmentType fragment) {
+          return !fragmentFitsTritonTensor(fragment, config);
         }))
       continue;
     bool descriptorConfig = descriptorChoice &&

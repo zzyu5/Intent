@@ -32,8 +32,12 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/DialectRegistry.h"
+#include "mlir/IR/AsmState.h"
 #include "mlir/InitAllDialects.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Parser/Parser.h"
+#include "mlir/Support/Timing.h"
+#include "mlir/Transforms/Passes.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/FileSystem.h"
@@ -63,6 +67,17 @@ int exitCode(ExitCode code) { return static_cast<int>(code); }
 
 int main(int argc, char **argv) {
   llvm::InitLLVM initialization(argc, argv);
+  mlir::registerTransformsPasses();
+  intent::registerIntentPasses();
+  intent::gpu::registerGPUPasses();
+  intent::dsa::registerDSAPasses();
+  intent::bangc::registerBangCPasses();
+  // MLIR's pass-name option parsers enumerate the registry at construction.
+  // Populate it before constructing --mlir-print-ir-before/after options.
+  mlir::registerMLIRContextCLOptions();
+  mlir::registerAsmPrinterCLOptions();
+  mlir::registerPassManagerCLOptions();
+  mlir::registerDefaultTimingManagerCLOptions();
   llvm::cl::opt<std::string> inputFilename(
       llvm::cl::Positional, llvm::cl::desc("<input canonical Intent KIR>"),
       llvm::cl::init("-"));

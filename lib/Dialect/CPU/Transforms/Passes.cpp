@@ -1,5 +1,6 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Dialect/CPU/Transforms/Implementation.h"
+#include "Intent/Transforms/PassManager.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -63,13 +64,6 @@ FailureOr<llvm::json::Object> readProfiles(Location loc, llvm::StringRef path) {
   return std::move(*profiles);
 }
 
-LogicalResult normalize(ModuleOp module) {
-  PassManager manager(module.getContext());
-  manager.addPass(createCanonicalizerPass());
-  manager.addPass(createCSEPass());
-  return manager.run(module);
-}
-
 }
 
 LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
@@ -79,6 +73,11 @@ LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
       module.getContext(), vectorBits, workers, int64_t{262144}, matrixI8I32);
   if (!capabilities) return failure();
   module->setAttr("intent_cpu.capabilities", capabilities);
+  PassManager normalization(module.getContext(), ModuleOp::getOperationName());
+  normalization.addPass(createCanonicalizerPass());
+  normalization.addPass(createCSEPass());
+  if (failed(intent::configurePassManager(normalization))) return failure();
+  auto normalize = [&](ModuleOp current) { return normalization.run(current); };
   if (failed(verifyCPUProgram(module, false)) || failed(normalize(module))) return failure();
   auto profiles = readProfiles(module.getLoc(), defaults);
   if (failed(profiles)) return failure();

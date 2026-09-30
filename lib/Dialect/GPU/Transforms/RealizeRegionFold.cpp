@@ -2731,18 +2731,6 @@ LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
   return success();
 }
 
-LogicalResult alignInlinedRegionValues(func::FuncOp kernel) {
-  // Helper inlining substitutes physical extents throughout the cloned graph.
-  // Close the affected value relations before verifying this transformation.
-  if (failed(alignReductionResultRelations(kernel)) ||
-      failed(alignReductionIdentityRelations(kernel)) ||
-      failed(alignAggregateValueRelations(kernel)) ||
-      failed(alignPointwiseValueRelations(kernel)) ||
-      failed(alignReductionYieldRelations(kernel)))
-    return failure();
-  return success();
-}
-
 } // namespace
 
 LogicalResult realizeRegionFolds(ModuleOp module) {
@@ -2755,9 +2743,7 @@ LogicalResult realizeRegionFolds(ModuleOp module) {
   for (RegionFoldOp fold : folds)
     if (fold->getBlock() && failed(realizeFold(fold, kernel)))
       return failure();
-  if (!folds.empty() && failed(alignInlinedRegionValues(kernel)))
-    return failure();
-  return closeValueAccessRelations(kernel);
+  return closeValueRelations(kernel);
 }
 
 LogicalResult realizeRegionScans(ModuleOp module) {
@@ -2770,9 +2756,7 @@ LogicalResult realizeRegionScans(ModuleOp module) {
   for (RegionScanOp scan : scans)
     if (scan->getBlock() && failed(realizeScan(scan, kernel)))
       return failure();
-  if (failed(alignInlinedRegionValues(kernel)))
-    return failure();
-  return closeValueAccessRelations(kernel);
+  return closeValueRelations(kernel);
 }
 
 } // namespace intent::gpu

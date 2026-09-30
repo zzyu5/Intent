@@ -884,7 +884,7 @@ LogicalResult fuseMultiplyReductions(ModuleOp module) {
 namespace intent::gpu {
 using namespace contraction;
 
-LogicalResult normalizeContractionSources(ModuleOp module) {
+static LogicalResult normalizeContractionSourcesImpl(ModuleOp module) {
   FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
@@ -1086,6 +1086,12 @@ LogicalResult normalizeContractionSources(ModuleOp module) {
       return failure();
   }
   return success();
+}
+
+LogicalResult normalizeContractionSources(ModuleOp module) {
+  if (failed(normalizeContractionSourcesImpl(module))) return failure();
+  auto kernel = getPhysicalKernel(module);
+  return failed(kernel) ? failure() : closeValueRelations(*kernel);
 }
 
 } // namespace intent::gpu

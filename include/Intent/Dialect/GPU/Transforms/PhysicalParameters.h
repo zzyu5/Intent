@@ -16,8 +16,6 @@ void eraseUnusedPhysicalParameters(mlir::func::FuncOp kernel);
 mlir::LogicalResult replacePhysicalParameter(mlir::func::FuncOp kernel,
                                              ParameterOp previous,
                                              ParameterOp replacement);
-void materializeDeferredReductionBounds(
-    mlir::func::FuncOp kernel, llvm::ArrayRef<mlir::ValueRange> sourceGroups);
 mlir::LogicalResult materializeSharedConfigTuples(mlir::func::FuncOp kernel,
                                                  const TuningProfiles &profiles);
 mlir::LogicalResult verifySharedConfigTuples(mlir::func::FuncOp kernel);

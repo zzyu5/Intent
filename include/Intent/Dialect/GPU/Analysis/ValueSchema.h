@@ -31,9 +31,6 @@ mlir::FailureOr<FragmentType> queryAccessResultSchema(
     mlir::ValueRange coordinates);
 mlir::FailureOr<uint64_t> blockedDimension(mlir::Attribute attribute);
 bool hasBlockedDimension(mlir::func::FuncOp kernel, uint64_t dimension);
-PhysicalExprAttr fragmentRegisterFootprint(FragmentType fragment);
-PhysicalExprAttr reductionRegisterFootprint(mlir::ValueRange sources,
-                                            mlir::func::FuncOp kernel);
 
 } // namespace intent::gpu
 

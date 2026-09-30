@@ -7,6 +7,7 @@
 namespace intent::gpu {
 
 class TuningProfiles;
+void registerGPUPasses();
 
 mlir::LogicalResult verifyGPUProgram(mlir::ModuleOp module);
 mlir::LogicalResult realizeAccessComposition(mlir::ModuleOp module);

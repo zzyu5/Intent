@@ -30,6 +30,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   ValueRelations.cpp
   Traversal.cpp
   PhysicalParameters.cpp
+  Resources.cpp
   VerifyGPUProgram.cpp
 
   LINK_LIBS PUBLIC
@@ -38,6 +39,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   MLIRControlFlowDialect
   MLIRFuncDialect
   MLIRIR
+  MLIRPass
   MLIRSCFDialect
   MLIRSCFUtils
   MLIRSideEffectInterfaces

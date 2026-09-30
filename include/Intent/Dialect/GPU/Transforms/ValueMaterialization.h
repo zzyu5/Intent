@@ -3,6 +3,7 @@
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
+#include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
 #include "mlir/IR/IRMapping.h"
 
 namespace intent::gpu {
@@ -29,7 +30,8 @@ materializeScalarConstant(mlir::OpBuilder &builder, mlir::Location location,
                           mlir::Attribute value, mlir::Type resultType);
 mlir::FailureOr<mlir::Value>
 projectPhysicalValueToSchema(mlir::OpBuilder &builder, mlir::Location location,
-                             mlir::Value value, mlir::Type target);
+                             mlir::Value value, mlir::Type target,
+                             ValueTypeChangeCallback changed = {});
 mlir::FailureOr<mlir::Value>
 materializeZeroValue(mlir::OpBuilder &builder, mlir::Location location,
                      mlir::Type target);

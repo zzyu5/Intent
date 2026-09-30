@@ -1142,7 +1142,7 @@ LogicalResult normalizeMatrixContractShapes(func::FuncOp kernel) {
 namespace intent::gpu {
 using namespace contraction;
 
-LogicalResult orientLoopContractions(ModuleOp module) {
+static LogicalResult orientLoopContractionsImpl(ModuleOp module) {
   auto kernel = getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
@@ -1280,6 +1280,12 @@ LogicalResult orientLoopContractions(ModuleOp module) {
   }
   eraseDeadPhysicalValues(*kernel);
   return success();
+}
+
+LogicalResult orientLoopContractions(ModuleOp module) {
+  if (failed(orientLoopContractionsImpl(module))) return failure();
+  auto kernel = getPhysicalKernel(module);
+  return failed(kernel) ? failure() : closeValueRelations(*kernel);
 }
 
 } // namespace intent::gpu

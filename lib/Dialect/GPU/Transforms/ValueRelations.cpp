@@ -21,6 +21,9 @@
 #include <algorithm>
 #include <functional>
 #include <optional>
+#include <array>
+#include <deque>
+#include "mlir/IR/PatternMatch.h"
 
 using namespace mlir;
 
@@ -28,13 +31,171 @@ namespace intent::gpu {
 
 namespace {
 
-LogicalResult alignContractAccumulatorTypes(func::FuncOp kernel) {
-  auto align = [](Operation *owner, OpOperand &accumulatorOperand, Value result,
-                  bool &changed) -> LogicalResult {
+// One queue owns relation invalidation while a transformation closes its IR.
+// Rules never select a new ownership policy: they propagate an extent already
+// selected by a range, operand, structured boundary or exact projection.
+class RelationWorklist : public RewriterBase::Listener {
+public:
+  enum Rule : unsigned {
+    Captures, ReductionResult, ReductionIdentity, Aggregate, AccessResult,
+    Pointwise, ReductionYield, AccessValue, Reshape, ContractOperands,
+    ContractAccumulator, RuleCount
+  };
+
+  RelationWorklist(func::FuncOp kernel, ValueRelationScope scope)
+      : kernel(kernel), scope(scope), callback([this](Value value, Type previous) {
+          typeChanged(value, previous);
+        }) {}
+
+  ValueTypeChangeCallback typeChanged() { return callback; }
+
+  void setType(Value value, Type type) {
+    Type previous = value.getType();
+    if (previous == type) return;
+    value.setType(type);
+    typeChanged(value, previous);
+  }
+
+  void notifyOperationInserted(Operation *operation,
+                               OpBuilder::InsertPoint) override {
+    operation->walk<WalkOrder::PreOrder>([&](Operation *nested) {
+      live.insert(nested);
+      enqueue(nested);
+    });
+  }
+
+  void notifyOperationErased(Operation *operation) override {
+    // Removing a use can change projection/authority queries on its producers.
+    for (Value operand : operation->getOperands()) affected(operand);
+    enqueue(operation->getParentOp());
+    operation->walk([&](Operation *nested) {
+      live.erase(nested);
+      for (auto &pending : queued) pending.erase(nested);
+      for (Value result : nested->getResults()) transitions.erase(result);
+      for (Region &region : nested->getRegions())
+        for (Block &block : region)
+          for (BlockArgument argument : block.getArguments())
+            transitions.erase(argument);
+    });
+  }
+
+  void notifyOperationReplaced(Operation *operation,
+                               ValueRange replacements) override {
+    // Rewriter notifications precede RAUW, so the original result users are
+    // still available here. They will observe the new edges when dequeued.
+    for (Value result : operation->getResults()) affected(result);
+    for (Value value : replacements) affected(value);
+  }
+
+  void notifyOperationModified(Operation *operation) override {
+    enqueue(operation);
+    for (Value operand : operation->getOperands()) affected(operand);
+    for (Value result : operation->getResults()) affected(result);
+    for (Region &region : operation->getRegions())
+      for (Block &block : region)
+        for (BlockArgument argument : block.getArguments()) affected(argument);
+  }
+
+  LogicalResult run();
+
+private:
+  bool enabled(Rule rule) const {
+    switch (scope) {
+    case ValueRelationScope::Complete: return true;
+    case ValueRelationScope::Pointwise:
+      return rule == Pointwise || rule == Reshape ||
+             rule == ReductionResult || rule == ReductionIdentity;
+    case ValueRelationScope::Contracts:
+      return rule == ContractOperands || rule == ContractAccumulator;
+    case ValueRelationScope::AccessResults: return rule == AccessResult;
+    case ValueRelationScope::ReductionInputs:
+      return rule == ReductionResult || rule == ReductionIdentity;
+    }
+    llvm_unreachable("unknown value relation scope");
+  }
+
+  void push(Operation *operation, Rule rule) {
+    if (enabled(rule) && queued[rule].insert(operation).second)
+      worklists[priority(rule)].emplace_back(operation, rule);
+  }
+
+  static unsigned priority(Rule rule) {
+    // Access results, reshapes and elementwise values share the same SSA queue:
+    // a reshape must run between its producer and its consumers, not in a
+    // separate whole-program sweep after those consumers have been visited.
+    if (rule == AccessResult || rule == Pointwise || rule == Reshape)
+      return AccessResult;
+    return rule;
+  }
+
+  void enqueue(Operation *operation) {
+    if (!operation || !live.contains(operation)) return;
+    if (isa<RegionFoldOp, RegionScanOp>(operation)) push(operation, Captures);
+    if (isa<ReduceOp, ScanOp>(operation)) {
+      push(operation, ReductionResult);
+      push(operation, ReductionIdentity);
+      push(operation, ReductionYield);
+    }
+    if (isa<MakeRecordOp, ExtractOp, scf::IfOp, scf::ForOp, RegionFoldOp>(operation))
+      push(operation, Aggregate);
+    if (isa<LoadOp, GatherOp>(operation)) push(operation, AccessResult);
+    if (isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp,
+            BroadcastOp, TransposeOp>(operation)) push(operation, Pointwise);
+    if (isa<LoadOp, GatherOp, StoreOp>(operation)) push(operation, AccessValue);
+    if (isa<ReshapeOp>(operation)) push(operation, Reshape);
+    if (isa<ContractOp>(operation)) push(operation, ContractOperands);
+    if (isa<ContractOp, ScaledContractOp, SparseContractOp>(operation))
+      push(operation, ContractAccumulator);
+    // A yield/capture change affects its structured owner even though those
+    // schema edges are not ordinary SSA result uses.
+    Operation *parent = operation->getParentOp();
+    if (parent && parent != kernel) enqueue(parent);
+  }
+
+  void affected(Value value) {
+    if (auto argument = dyn_cast<BlockArgument>(value))
+      enqueue(argument.getOwner()->getParentOp());
+    else
+      enqueue(value.getDefiningOp());
+    for (Operation *user : value.getUsers()) enqueue(user);
+  }
+
+  void typeChanged(Value value, Type previous) {
+    if (previous == value.getType()) return;
+    auto transition = std::make_pair(previous, value.getType());
+    auto &history = transitions[value];
+    // Detect an actual repeated conflicting refinement, rather than silently
+    // stopping after an arbitrary number of iterations.
+    if (llvm::is_contained(history, transition)) {
+      if (!conflict) {
+        Operation *owner = value.getDefiningOp();
+        if (!owner) owner = cast<BlockArgument>(value).getOwner()->getParentOp();
+        owner->emitOpError("physical relation closure repeated a conflicting type refinement")
+            << "; previous=" << previous << "; selected=" << value.getType();
+      }
+      conflict = true;
+    } else {
+      history.push_back(transition);
+    }
+    affected(value);
+  }
+
+  func::FuncOp kernel;
+  ValueRelationScope scope;
+  std::function<void(Value, Type)> callback;
+  std::array<std::deque<std::pair<Operation *, Rule>>, RuleCount> worklists;
+  std::array<DenseSet<Operation *>, RuleCount> queued;
+  DenseSet<Operation *> live;
+  DenseMap<Value, SmallVector<std::pair<Type, Type>>> transitions;
+  bool conflict = false;
+};
+
+LogicalResult alignContractAccumulator(Operation *operation, RelationWorklist &changes) {
+  auto align = [&](Operation *owner, OpOperand &accumulatorOperand,
+                   Value result) -> LogicalResult {
     Value accumulator = accumulatorOperand.get();
     if (accumulator.getType() == result.getType())
       return success();
-    changed = true;
     auto source = dyn_cast<FragmentType>(accumulator.getType());
     auto target = dyn_cast<FragmentType>(result.getType());
     if (!source || !target || source.getElementType() != target.getElementType() ||
@@ -43,8 +204,9 @@ LogicalResult alignContractAccumulatorTypes(func::FuncOp kernel) {
           "pointwise ownership cannot preserve the contract accumulator relation");
     if (isLiteralZeroProjection(accumulator)) {
       OpBuilder builder(owner);
+      builder.setListener(&changes);
       auto projected = projectPhysicalValueToSchema(
-          builder, owner->getLoc(), accumulator, target);
+          builder, owner->getLoc(), accumulator, target, changes.typeChanged());
       if (failed(projected))
         return owner->emitOpError("contract zero accumulator cannot adopt its result schema");
       accumulatorOperand.set(*projected);
@@ -86,19 +248,15 @@ LogicalResult alignContractAccumulatorTypes(func::FuncOp kernel) {
             "contract accumulator alignment has no dimension authority");
       retargetDimensionExtent(
           result, dimension,
-          cast<PhysicalExprAttr>(aligned.getShape()[axis]));
+          cast<PhysicalExprAttr>(aligned.getShape()[axis]), changes.typeChanged());
       retargetDimensionExtent(
           accumulator, dimension,
-          cast<PhysicalExprAttr>(aligned.getShape()[axis]));
+          cast<PhysicalExprAttr>(aligned.getShape()[axis]), changes.typeChanged());
     }
-    accumulator.setType(aligned);
-    result.setType(aligned);
+    changes.setType(accumulator, aligned);
+    changes.setType(result, aligned);
     return success();
   };
-  bool changed;
-  do {
-    changed = false;
-    WalkResult result = kernel.walk([&](Operation *operation) {
       OpOperand *accumulator;
       Value output;
       if (auto contract = dyn_cast<ContractOp>(operation)) {
@@ -111,19 +269,16 @@ LogicalResult alignContractAccumulatorTypes(func::FuncOp kernel) {
         accumulator = &contract.getAccumulatorMutable();
         output = contract.getResult();
       } else {
-        return WalkResult::advance();
+        return success();
       }
-      return failed(align(operation, *accumulator, output, changed))
-                 ? WalkResult::interrupt()
-                 : WalkResult::advance();
-    });
-    if (result.wasInterrupted())
-      return failure();
-  } while (changed);
-  return success();
+      return align(operation, *accumulator, output);
+
 }
 
-LogicalResult alignOrdinaryContractOperandTypes(func::FuncOp kernel) {
+WalkResult alignContractOperands(Operation *operation, RelationWorklist &changes) {
+  auto contract = dyn_cast<ContractOp>(operation);
+  if (!contract) return WalkResult::advance();
+  auto kernel = operation->getParentOfType<func::FuncOp>();
   auto isUnit = [](Attribute attribute) {
     auto extent = cast<PhysicalExprAttr>(attribute);
     return extent.getKind() ==
@@ -179,7 +334,7 @@ LogicalResult alignOrdinaryContractOperandTypes(func::FuncOp kernel) {
     }
     return authority;
   };
-  WalkResult result = kernel.walk([&](ContractOp contract) {
+
     auto alignPairs = [&](Value lhs, Value rhs, ArrayRef<int64_t> lhsAxes,
                           ArrayRef<int64_t> rhsAxes, bool batch) -> LogicalResult {
       if (lhsAxes.size() != rhsAxes.size())
@@ -212,13 +367,13 @@ LogicalResult alignOrdinaryContractOperandTypes(func::FuncOp kernel) {
           Value authority = batch ? batchExtentAuthority(lhs, mapping) : lhs;
           retargetSourceExtent(authority, sourceAxisIdentity(mapping),
                                cast<PhysicalExprAttr>(rhsExtent),
-                               mapping.getDimensionId());
+                               mapping.getDimensionId(), changes.typeChanged());
         } else {
           auto mapping = cast<AxisMapAttr>(rhsType.getAxisMaps()[rhsAxis]);
           Value authority = batch ? batchExtentAuthority(rhs, mapping) : rhs;
           retargetSourceExtent(authority, sourceAxisIdentity(mapping),
                                cast<PhysicalExprAttr>(lhsExtent),
-                               mapping.getDimensionId());
+                               mapping.getDimensionId(), changes.typeChanged());
         }
       }
       return success();
@@ -231,8 +386,7 @@ LogicalResult alignOrdinaryContractOperandTypes(func::FuncOp kernel) {
                           contract.getRhsBatchAxes(), true)))
       return WalkResult::interrupt();
     return WalkResult::advance();
-  });
-  return result.wasInterrupted() ? failure() : success();
+
 }
 
 using AxisSelector = llvm::function_ref<bool(AxisMapAttr)>;
@@ -600,10 +754,9 @@ void appendStructuredResultRelations(Value value,
       cast<YieldOp>(scan.getApply().front().getTerminator()).getValues()[state]);
 }
 
-
 } // namespace
 
-static WalkResult alignReductionResultRelation(Operation *operation) {
+static WalkResult alignReductionResultRelation(Operation *operation, RelationWorklist &changes) {
     auto kernel = operation->getParentOfType<func::FuncOp>();
     SmallVector<Value> sources;
     SmallVector<Value> results;
@@ -650,8 +803,9 @@ static WalkResult alignReductionResultRelation(Operation *operation) {
           kernel.getContext(), sourceType.getElementType(), (*refined).getShape(),
           sourceType.getAxisMaps(), sourceType.getValidity(), sourceType.getOwner());
       OpBuilder builder(operation);
+      builder.setListener(&changes);
       FailureOr<Value> projected = projectPhysicalValueToSchema(
-          builder, operation->getLoc(), source, target);
+          builder, operation->getLoc(), source, target, changes.typeChanged());
       if (failed(projected)) {
         operation->emitOpError(
             "tuple reduction source cannot adopt its physical extent relation");
@@ -662,7 +816,7 @@ static WalkResult alignReductionResultRelation(Operation *operation) {
     }
     for (auto [source, currentResult] : llvm::zip_equal(sources, results)) {
       if (scan) {
-        currentResult.setType(source.getType());
+        changes.setType(currentResult, source.getType());
         continue;
       }
       auto sourceType = dyn_cast<FragmentType>(source.getType());
@@ -688,10 +842,10 @@ static WalkResult alignReductionResultRelation(Operation *operation) {
       if (auto current = dyn_cast<FragmentType>(element))
         element = current.getElementType();
       if (shape.empty()) {
-        currentResult.setType(element);
+        changes.setType(currentResult, element);
         continue;
       }
-      currentResult.setType(FragmentType::get(
+      changes.setType(currentResult, FragmentType::get(
           kernel.getContext(), element,
           ArrayAttr::get(kernel.getContext(), shape),
           ArrayAttr::get(kernel.getContext(), mappings),
@@ -700,23 +854,20 @@ static WalkResult alignReductionResultRelation(Operation *operation) {
     return WalkResult::advance();
 }
 
-LogicalResult alignReductionResultRelations(func::FuncOp kernel) {
-  WalkResult result = kernel.walk(alignReductionResultRelation);
-  return result.wasInterrupted() ? failure() : success();
-}
 
-static WalkResult alignReductionIdentityRelation(Operation *operation) {
+static WalkResult alignReductionIdentityRelation(Operation *operation, RelationWorklist &changes) {
     auto align = [&](ValueRange inputs, ValueRange results, Region &combine,
                      uint64_t sourceCount,
                      uint64_t identityCount) -> LogicalResult {
       if (identityCount != results.size())
         return failure();
       OpBuilder builder(operation);
+      builder.setListener(&changes);
       for (unsigned index = 0; index < identityCount; ++index) {
         unsigned operand = sourceCount + index;
         FailureOr<Value> projected = projectPhysicalValueToSchema(
             builder, operation->getLoc(), inputs[operand],
-            results[index].getType());
+            results[index].getType(), changes.typeChanged());
         if (failed(projected))
           return operation->emitOpError(
               "physical reduction identity cannot adopt its result relation");
@@ -728,8 +879,8 @@ static WalkResult alignReductionIdentityRelation(Operation *operation) {
             "physical reduction helper has no complete accumulator schema");
       for (unsigned index = 0; index < identityCount; ++index) {
         Type target = results[index].getType();
-        combine.front().getArgument(index).setType(target);
-        combine.front().getArgument(identityCount + index).setType(target);
+        changes.setType(combine.front().getArgument(index), target);
+        changes.setType(combine.front().getArgument(identityCount + index), target);
       }
       return success();
     };
@@ -747,13 +898,8 @@ static WalkResult alignReductionIdentityRelation(Operation *operation) {
     return WalkResult::advance();
 }
 
-LogicalResult alignReductionIdentityRelations(func::FuncOp kernel) {
-  WalkResult result = kernel.walk(alignReductionIdentityRelation);
-  return result.wasInterrupted() ? failure() : success();
-}
 
-LogicalResult alignReductionYieldRelations(func::FuncOp kernel) {
-  WalkResult result = kernel.walk([&](Operation *operation) {
+WalkResult alignReductionYield(Operation *operation, RelationWorklist &changes) {
     Region *combine = nullptr;
     ValueRange results;
     if (auto reduce = dyn_cast<ReduceOp>(operation)) {
@@ -771,10 +917,11 @@ LogicalResult alignReductionYieldRelations(func::FuncOp kernel) {
     if (!yield || yield.getValues().size() != results.size())
       return WalkResult::interrupt();
     OpBuilder builder(yield);
+      builder.setListener(&changes);
     for (auto [index, target] : llvm::enumerate(results)) {
       FailureOr<Value> projected = projectPhysicalValueToSchema(
           builder, operation->getLoc(), yield.getValues()[index],
-          target.getType());
+          target.getType(), changes.typeChanged());
       if (failed(projected)) {
         operation->emitOpError(
             "physical reduction yield cannot adopt its result relation")
@@ -786,12 +933,11 @@ LogicalResult alignReductionYieldRelations(func::FuncOp kernel) {
       yield->setOperand(index, *projected);
     }
     return WalkResult::advance();
-  });
-  return result.wasInterrupted() ? failure() : success();
+
 }
 
-LogicalResult alignAccessResultRelations(func::FuncOp kernel) {
-  WalkResult result = kernel.walk([&](Operation *operation) {
+WalkResult alignAccessResult(Operation *operation, RelationWorklist &changes) {
+  auto kernel = operation->getParentOfType<func::FuncOp>();
     ValueRange coordinates;
     Value result;
     if (auto load = dyn_cast<LoadOp>(operation)) {
@@ -823,17 +969,17 @@ LogicalResult alignAccessResultRelations(func::FuncOp kernel) {
       retargetSourceExtent(
           result, sourceAxisIdentity(cast<AxisMapAttr>(mapping)),
           cast<PhysicalExprAttr>((*refined).getShape()[axis]),
-          cast<AxisMapAttr>(mapping).getDimensionId());
+          cast<AxisMapAttr>(mapping).getDimensionId(), changes.typeChanged());
     }
-    result.setType(*refined);
+    changes.setType(result, *refined);
     return WalkResult::advance();
-  });
-  return result.wasInterrupted() ? failure() : success();
+
 }
 
-static LogicalResult refreshReshapeRelation(ReshapeOp reshape);
+static LogicalResult refreshReshapeRelation(ReshapeOp reshape, RelationWorklist &changes);
 
-LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
+WalkResult alignPointwiseValue(Operation *operation, RelationWorklist &changes) {
+  auto kernel = operation->getParentOfType<func::FuncOp>();
   auto isParameterExtent = [](Attribute attribute) {
     auto extent = dyn_cast<PhysicalExprAttr>(attribute);
     return extent &&
@@ -857,31 +1003,22 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
         targetShape.getShape(), targetShape.getAxisMaps(), targetShape.getValidity(),
         targetShape.getOwner());
     OpBuilder builder(operation);
+      builder.setListener(&changes);
     FailureOr<Value> replacement =
-        projectPhysicalValueToSchema(builder, operation->getLoc(), value, target);
+        projectPhysicalValueToSchema(builder, operation->getLoc(), value, target, changes.typeChanged());
     if (failed(replacement))
       return failure();
     operation->setOperand(operandIndex, *replacement);
     return success();
   };
 
-  WalkResult result = kernel.walk<WalkOrder::PreOrder>([&](Operation *operation) {
-    if (isa<ReduceOp, ScanOp>(operation)) {
-      if (alignReductionResultRelation(operation).wasInterrupted() ||
-          alignReductionIdentityRelation(operation).wasInterrupted())
-        return WalkResult::interrupt();
-      return WalkResult::advance();
-    }
-    if (auto reshape = dyn_cast<ReshapeOp>(operation))
-      return failed(refreshReshapeRelation(reshape)) ? WalkResult::interrupt()
-                                                     : WalkResult::advance();
     if (auto transpose = dyn_cast<TransposeOp>(operation)) {
       auto source = cast<FragmentType>(transpose.getValue().getType());
       auto target = cast<FragmentType>(transpose.getResult().getType());
       SmallVector<Attribute> shape;
       for (int64_t input : transpose.getPermutation())
         shape.push_back(source.getShape()[input]);
-      transpose.getResult().setType(FragmentType::get(
+      changes.setType(transpose.getResult(), FragmentType::get(
           kernel.getContext(), target.getElementType(),
           ArrayAttr::get(kernel.getContext(), shape), target.getAxisMaps(),
           target.getValidity(), target.getOwner()));
@@ -894,8 +1031,9 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
         return WalkResult::advance();
       if (!queryBroadcastProjection(source, target).isExact()) {
         OpBuilder builder(broadcast);
+      builder.setListener(&changes);
         FailureOr<Value> projected = projectPhysicalValueToSchema(
-            builder, broadcast.getLoc(), broadcast.getValue(), target);
+            builder, broadcast.getLoc(), broadcast.getValue(), target, changes.typeChanged());
         if (succeeded(projected)) {
           broadcast->setOperand(0, *projected);
           source = cast<FragmentType>(projected->getType());
@@ -964,7 +1102,7 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
           if (realization.constructionScalarSeed || derivedOccurrence ||
               selectedProgramExtent) {
             retargetSourceExtent(broadcast.getResult(),
-                                 sourceAxisIdentity(targetMap), sourceExtent);
+                                 sourceAxisIdentity(targetMap), sourceExtent, std::nullopt, changes.typeChanged());
             target = cast<FragmentType>(broadcast.getResult().getType());
             continue;
           }
@@ -984,7 +1122,7 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
               !output.hasExtentAuthority()) {
             auto targetMap = cast<AxisMapAttr>(target.getAxisMaps()[targetAxis]);
             retargetSourceExtent(broadcast.getResult(),
-                                 sourceAxisIdentity(targetMap), sourceExtent);
+                                 sourceAxisIdentity(targetMap), sourceExtent, std::nullopt, changes.typeChanged());
             target = cast<FragmentType>(broadcast.getResult().getType());
             continue;
           }
@@ -1006,10 +1144,10 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
         if (targetParameter)
           retargetSourceExtent(
               broadcast.getValue(), sourceAxisIdentity(sourceMap),
-              cast<PhysicalExprAttr>(target.getShape()[targetAxis]));
+              cast<PhysicalExprAttr>(target.getShape()[targetAxis]), std::nullopt, changes.typeChanged());
         else
           retargetSourceExtent(broadcast.getResult(),
-                               sourceAxisIdentity(targetMap), sourceExtent);
+                               sourceAxisIdentity(targetMap), sourceExtent, std::nullopt, changes.typeChanged());
         source = cast<FragmentType>(broadcast.getValue().getType());
         target = cast<FragmentType>(broadcast.getResult().getType());
       }
@@ -1025,7 +1163,7 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
       // seen by consumers.  Adopting the input's AxisMap would erase an explicit
       // output/index relation (for example a reshaped value stored into a view)
       // and force a later access pass to reconstruct it.
-      broadcast.getResult().setType(FragmentType::get(
+      changes.setType(broadcast.getResult(), FragmentType::get(
           kernel.getContext(), target.getElementType(), (*refined).getShape(),
           target.getAxisMaps(), target.getValidity(), target.getOwner()));
       return WalkResult::advance();
@@ -1048,7 +1186,7 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
             kernel.getContext(), operation->getResult(0).getType(),
             prototype.getShape(), prototype.getAxisMaps(),
             prototype.getValidity(), prototype.getOwner());
-        operation->getResult(0).setType(target);
+        changes.setType(operation->getResult(0), target);
       }
     }
     if (!target)
@@ -1057,7 +1195,7 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
         operation->getNumOperands() == 1) {
       auto source = dyn_cast<FragmentType>(operation->getOperand(0).getType());
       if (source) {
-        operation->getResult(0).setType(FragmentType::get(
+        changes.setType(operation->getResult(0), FragmentType::get(
             kernel.getContext(), target.getElementType(), source.getShape(),
             source.getAxisMaps(), source.getValidity(), source.getOwner()));
         return WalkResult::advance();
@@ -1087,10 +1225,10 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
           operation->getResult(0),
           sourceAxisIdentity(cast<AxisMapAttr>(target.getAxisMaps()[axis])),
           cast<PhysicalExprAttr>((*refined).getShape()[axis]),
-          cast<AxisMapAttr>(target.getAxisMaps()[axis]).getDimensionId());
+          cast<AxisMapAttr>(target.getAxisMaps()[axis]).getDimensionId(), changes.typeChanged());
     }
     target = *refined;
-    operation->getResult(0).setType(target);
+    changes.setType(operation->getResult(0), target);
     for (unsigned index = 0; index < operation->getNumOperands(); ++index)
       if (failed(align(operation, index, target))) {
         operation->emitOpError(
@@ -1101,11 +1239,11 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
         return WalkResult::interrupt();
       }
     return WalkResult::advance();
-  });
-  return result.wasInterrupted() ? failure() : success();
+
 }
 
-LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
+LogicalResult alignAccessValue(Operation *operation, RelationWorklist &changes) {
+  auto kernel = operation->getParentOfType<func::FuncOp>();
   auto predicateType = [&](FragmentType value) {
     return FragmentType::get(
         kernel.getContext(), IntegerType::get(kernel.getContext(), 1),
@@ -1116,7 +1254,7 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
                      Type target) -> FailureOr<Value> {
     if (!value)
       return failure();
-    return projectPhysicalValueToSchema(builder, location, value, target);
+    return projectPhysicalValueToSchema(builder, location, value, target, changes.typeChanged());
   };
   auto alignCoordinates = [&](auto access, Type valueType) -> LogicalResult {
     auto payload = dyn_cast<FragmentType>(valueType);
@@ -1155,6 +1293,7 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
           permuted ? payload.getAxisMaps() : type.getAxisMaps(),
           type.getValidity(), type.getOwner());
       OpBuilder builder(access);
+      builder.setListener(&changes);
       FailureOr<Value> aligned = project(builder, access.getLoc(), coordinate, target);
       if (failed(aligned))
         return access.emitOpError("cannot align coordinate with its access schema")
@@ -1164,13 +1303,6 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
     return success();
   };
 
-  SmallVector<LoadOp> loads;
-  SmallVector<GatherOp> gathers;
-  SmallVector<StoreOp> stores;
-  kernel.walk([&](LoadOp load) { loads.push_back(load); });
-  kernel.walk([&](GatherOp gather) { gathers.push_back(gather); });
-  kernel.walk([&](StoreOp store) { stores.push_back(store); });
-
   auto alignRead = [&](auto read, StringRef kind) -> LogicalResult {
     if (failed(alignCoordinates(read, read.getResult().getType())))
       return failure();
@@ -1179,6 +1311,7 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
     if (!read.getValid())
       return read.emitOpError() << kind << " fill has no validity authority";
     OpBuilder builder(read);
+      builder.setListener(&changes);
     Type valueType = read.getResult().getType();
     auto fragment = dyn_cast<FragmentType>(valueType);
     if (isa<GatherOp>(read.getOperation()) && !fragment) {
@@ -1203,31 +1336,28 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
     read.getFillMutable().assign(ValueRange{*fill});
     return success();
   };
-  for (LoadOp load : loads)
-    if (failed(alignRead(load, "load")))
-      return failure();
-  for (GatherOp gather : gathers)
-    if (failed(alignRead(gather, "gather")))
-      return failure();
-
-  for (StoreOp store : stores) {
+  if (auto load = dyn_cast<LoadOp>(operation)) return alignRead(load, "load");
+  if (auto gather = dyn_cast<GatherOp>(operation)) return alignRead(gather, "gather");
+  auto store = dyn_cast<StoreOp>(operation);
+  if (!store) return success();
     if (failed(alignCoordinates(store, store.getValue().getType())))
       return failure();
     if (!store.getValid())
-      continue;
+      return success();
     auto currentType = dyn_cast<FragmentType>(store.getValue().getType());
     if (!currentType) {
       auto validity = dyn_cast<FragmentType>(store.getValid().getType());
       if (!validity || !llvm::all_of(validity.getShape(), [](Attribute extent) {
             return constantPhysicalExpression(cast<PhysicalExprAttr>(extent)) == 1;
           }))
-        continue;
+        return success();
       // Ownership can retain a one-lane predicate for a scalar write.  Adopt
       // that schema without widening the write into additional lanes.
       currentType = FragmentType::get(
           kernel.getContext(), store.getValue().getType(), validity.getShape(),
           validity.getAxisMaps(), validity.getValidity(), validity.getOwner());
       OpBuilder builder(store);
+      builder.setListener(&changes);
       FailureOr<Value> value = project(builder, store.getLoc(), store.getValue(),
                                        currentType);
       if (failed(value))
@@ -1274,11 +1404,12 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
             coordinateType.getShape()[projection.fragmentAxis] == extent)
           continue;
         retargetSourceExtent(coordinate, projection.source, extent,
-                             projection.dimensionId);
+                             projection.dimensionId, changes.typeChanged());
       }
     }
     currentType = cast<FragmentType>(store.getValue().getType());
     OpBuilder builder(store);
+      builder.setListener(&changes);
     FailureOr<FragmentType> valueType =
         queryAccessResultSchema(kernel, currentType, store.getCoordinates());
     if (failed(valueType))
@@ -1294,7 +1425,7 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
             "store coordinate refinement has no logical dimension authority");
       retargetSourceExtent(
           store.getValue(), sourceAxisIdentity(cast<AxisMapAttr>(mapping)),
-          cast<PhysicalExprAttr>((*valueType).getShape()[axis]), dimension);
+          cast<PhysicalExprAttr>((*valueType).getShape()[axis]), dimension, changes.typeChanged());
     }
     FailureOr<Value> value = project(builder, store.getLoc(), store.getValue(),
                                      *valueType);
@@ -1318,19 +1449,14 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
         diagnostic << "; value_producer=" << producer->getName();
       return failure();
     }
-    if (*value == store.getValue() && *valid == store.getValid())
-      continue;
-    auto replacement = builder.create<StoreOp>(
-        store.getLoc(), store.getResource(), store.getCoordinates(),
-        *value, *valid, store.getSourceAxes());
-    if (Attribute origin = store->getAttr(originAttr))
-      replacement->setAttr(originAttr, origin);
-    store.erase();
-  }
+    // Preserve the access identity and every effect/attribute while closing
+    // only its payload and predicate schemas.
+    store.getValueMutable().assign(*value);
+    store.getValidMutable().assign(*valid);
   return success();
 }
 
-static LogicalResult refreshReshapeRelation(ReshapeOp reshape) {
+static LogicalResult refreshReshapeRelation(ReshapeOp reshape, RelationWorklist &changes) {
     auto kernel = reshape->getParentOfType<func::FuncOp>();
     // Reassociation is the typed row-major relation selected from canonical
     // KIR.  Refinement passes may change physical extents, but they may not
@@ -1405,42 +1531,28 @@ static LogicalResult refreshReshapeRelation(ReshapeOp reshape) {
             cast<PhysicalExprAttr>(
                 source.getShape()[sourcePrefix + sourceAxes.front()]);
     }
-    reshape.getResult().setType(FragmentType::get(
+    changes.setType(reshape.getResult(), FragmentType::get(
         kernel.getContext(), target.getElementType(),
         ArrayAttr::get(kernel.getContext(), resultShape), target.getAxisMaps(),
         target.getValidity(), target.getOwner()));
     return reshape.verify();
 }
 
-LogicalResult refreshReshapeRelations(func::FuncOp kernel) {
-  WalkResult result = kernel.walk([&](ReshapeOp reshape) {
-    return failed(refreshReshapeRelation(reshape)) ? WalkResult::interrupt()
-                                                  : WalkResult::advance();
-  });
-  return result.wasInterrupted() ? failure() : success();
-}
 
-LogicalResult closeValueAccessRelations(func::FuncOp kernel) {
-  if (failed(alignAccessResultRelations(kernel)) ||
-      failed(alignPointwiseValueRelations(kernel)) ||
-      failed(alignAccessValueRelations(kernel)) ||
-      failed(refreshReshapeRelations(kernel)) ||
-      failed(alignContractValueRelations(kernel)))
-    return failure();
-  return success();
-}
 
-LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
-  kernel.walk([&](MakeRecordOp record) {
+WalkResult alignAggregateValue(Operation *operation, RelationWorklist &changes) {
+  auto kernel = operation->getParentOfType<func::FuncOp>();
+  if (auto record = dyn_cast<MakeRecordOp>(operation)) {
     RecordType current = record.getResult().getType();
     SmallVector<Attribute> fields;
     fields.reserve(record.getFields().size());
     for (Value field : record.getFields())
       fields.push_back(TypeAttr::get(field.getType()));
-    record.getResult().setType(RecordType::get(
+    changes.setType(record.getResult(), RecordType::get(
         kernel.getContext(), current.getFieldNames(),
         ArrayAttr::get(kernel.getContext(), fields), current.getOwner()));
-  });
+    return WalkResult::advance();
+  }
   std::function<FailureOr<Type>(Type, Type, Type)> joinTypes =
       [&](Type current, Type lhs, Type rhs) -> FailureOr<Type> {
     if (auto lhsFragment = dyn_cast<FragmentType>(lhs)) {
@@ -1511,7 +1623,7 @@ LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
     return current == lhs && lhs == rhs ? FailureOr<Type>(current)
                                         : FailureOr<Type>(failure());
   };
-  WalkResult branches = kernel.walk([&](scf::IfOp branch) {
+  if (auto branch = dyn_cast<scf::IfOp>(operation)) {
     if (branch.getNumResults() == 0)
       return WalkResult::advance();
     auto thenYield = dyn_cast<scf::YieldOp>(branch.thenBlock()->getTerminator());
@@ -1554,11 +1666,13 @@ LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
         return WalkResult::interrupt();
       }
       OpBuilder thenBuilder(thenYield);
+      thenBuilder.setListener(&changes);
       FailureOr<Value> projectedThen = projectPhysicalValueToSchema(
-          thenBuilder, branch.getLoc(), thenYield.getResults()[index], *target);
+          thenBuilder, branch.getLoc(), thenYield.getResults()[index], *target, changes.typeChanged());
       OpBuilder elseBuilder(elseYield);
+      elseBuilder.setListener(&changes);
       FailureOr<Value> projectedElse = projectPhysicalValueToSchema(
-          elseBuilder, branch.getLoc(), elseYield.getResults()[index], *target);
+          elseBuilder, branch.getLoc(), elseYield.getResults()[index], *target, changes.typeChanged());
       if (failed(projectedThen) || failed(projectedElse)) {
         branch.emitOpError(
             "control-flow branch cannot adopt its joined physical relation")
@@ -1567,13 +1681,11 @@ LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
       }
       thenYield->setOperand(index, *projectedThen);
       elseYield->setOperand(index, *projectedElse);
-      branch.getResult(index).setType(*target);
+      changes.setType(branch.getResult(index), *target);
     }
     return WalkResult::advance();
-  });
-  if (branches.wasInterrupted())
-    return failure();
-  WalkResult result = kernel.walk([&](RegionFoldOp fold) {
+  }
+  if (auto fold = dyn_cast<RegionFoldOp>(operation)) {
     if (!llvm::hasSingleElement(fold.getSummarize()) ||
         !llvm::hasSingleElement(fold.getCombine()))
       return WalkResult::interrupt();
@@ -1586,6 +1698,7 @@ LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
     if (combine.getNumArguments() != 2 * fold.getIdentityCount())
       return WalkResult::interrupt();
     OpBuilder builder(fold);
+      builder.setListener(&changes);
     for (unsigned index = 0; index < fold.getIdentityCount(); ++index) {
       Type target = summarizeYield.getValues()[index].getType();
       SmallVector<std::pair<int64_t, PhysicalExprAttr>> dimensions;
@@ -1623,25 +1736,23 @@ LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
         return WalkResult::interrupt();
       }
       for (auto [dimension, extent] : dimensions)
-        retargetDimensionExtent(fold.getResult(index), dimension, extent);
+        retargetDimensionExtent(fold.getResult(index), dimension, extent, changes.typeChanged());
       unsigned identity = fold.getSourceCount() + index;
       FailureOr<Value> projected = projectPhysicalValueToSchema(
-          builder, fold.getLoc(), fold.getInputs()[identity], target);
+          builder, fold.getLoc(), fold.getInputs()[identity], target, changes.typeChanged());
       if (failed(projected)) {
         fold.emitOpError(
             "region-fold identity cannot adopt its summary relation");
         return WalkResult::interrupt();
       }
       fold->setOperand(identity, *projected);
-      fold.getResult(index).setType(target);
-      combine.getArgument(index).setType(target);
-      combine.getArgument(fold.getIdentityCount() + index).setType(target);
+      changes.setType(fold.getResult(index), target);
+      changes.setType(combine.getArgument(index), target);
+      changes.setType(combine.getArgument(fold.getIdentityCount() + index), target);
     }
     return WalkResult::advance();
-  });
-  if (result.wasInterrupted())
-    return failure();
-  WalkResult loops = kernel.walk([&](scf::ForOp loop) {
+  }
+  if (auto loop = dyn_cast<scf::ForOp>(operation)) {
     auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
     if (!yield || yield.getResults().size() != loop.getInitArgs().size())
       return WalkResult::interrupt();
@@ -1654,11 +1765,13 @@ LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
       // boundary must not rank shapes or independently choose a competing one.
       Type target = yielded.getType();
       OpBuilder initBuilder(loop);
+      initBuilder.setListener(&changes);
       FailureOr<Value> projectedInit = projectPhysicalValueToSchema(
-          initBuilder, loop.getLoc(), init, target);
+          initBuilder, loop.getLoc(), init, target, changes.typeChanged());
       OpBuilder yieldBuilder(yield);
+      yieldBuilder.setListener(&changes);
       FailureOr<Value> projectedYield = projectPhysicalValueToSchema(
-          yieldBuilder, loop.getLoc(), yielded, target);
+          yieldBuilder, loop.getLoc(), yielded, target, changes.typeChanged());
       if (failed(projectedInit) || failed(projectedYield)) {
         loop.emitOpError(
             "loop-carried value cannot adopt its unique physical relation")
@@ -1668,28 +1781,27 @@ LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
       }
       loop.getInitArgsMutable()[index].assign(*projectedInit);
       yield->setOperand(index, *projectedYield);
-      loop.getRegionIterArgs()[index].setType(target);
-      loop.getResult(index).setType(target);
+      changes.setType(loop.getRegionIterArgs()[index], target);
+      changes.setType(loop.getResult(index), target);
     }
     return WalkResult::advance();
-  });
-  if (loops.wasInterrupted())
-    return failure();
+  }
   // Structured arguments/results are the record-schema authority.  Refresh
   // projections only after those schemas have been aligned; doing this before
   // the region owner leaves combine-body fields one refinement behind.
-  kernel.walk([&](ExtractOp extract) {
+  if (auto extract = dyn_cast<ExtractOp>(operation)) {
     RecordType record = extract.getRecord().getType();
     if (extract.getField() < record.getFieldTypes().size())
-      extract.getResult().setType(
+      changes.setType(extract.getResult(),
           cast<TypeAttr>(record.getFieldTypes()[extract.getField()]).getValue());
-  });
-  return success();
+  }
+  return WalkResult::advance();
 }
 
 static void retargetExtent(Value root, AxisSelector selects,
                            PhysicalExprAttr extent,
-                           bool followLogicalDimension) {
+                           bool followLogicalDimension,
+                           ValueTypeChangeCallback changed) {
   SmallVector<Attribute> previousExtents;
   collectSelectedExtents(root.getType(), selects, previousExtents);
   if (previousExtents.empty())
@@ -1765,7 +1877,9 @@ static void retargetExtent(Value root, AxisSelector selects,
       Type replacement = replaceExtent(value.getType(), replaceableAxis,
                                        replaceableExtents, extent);
       if (replacement != value.getType()) {
+        Type previous = value.getType();
         value.setType(replacement);
+        if (changed) changed(value, previous);
         // A make_range owns both the fragment schema and the SSA extent used
         // to materialize that schema.  Retarget them from the same physical
         // decision; leaving the operand behind creates two executable
@@ -1863,12 +1977,16 @@ static void retargetExtent(Value root, AxisSelector selects,
                        static_cast<uint64_t>(newExtent.getValue()) ==
                            llvm::PowerOf2Ceil(static_cast<uint64_t>(oldExtent.getValue()));
               });
-          if (padding)
+          if (padding) {
+            Type previous = buffer.getResult().getType();
             buffer.getResult().setType(BufferType::get(
                 storage.getContext(), storage.getElementType(), initial.getShape(),
                 storage.getScope(), storage.getInstance(), storage.getOwner(),
                 storage.getInitialization(), storage.getLifetime(),
                 storage.getVisibility(), storage.getWorkspace()));
+            if (changed && previous != buffer.getResult().getType())
+              changed(buffer.getResult(), previous);
+          }
         }
       }
       if (auto broadcast = dyn_cast<BroadcastOp>(user)) {
@@ -2003,13 +2121,14 @@ static void retargetExtent(Value root, AxisSelector selects,
           return sourceAxisIdentity(mapping) == sourceAxisIdentity(axis) &&
                  mapping.getDimensionId() == axis.getDimensionId();
         },
-        extent, /*followLogicalDimension=*/false);
+        extent, /*followLogicalDimension=*/false, changed);
   }
 }
 
 void retargetSourceExtent(Value root, PhysicalSourceAxis source,
                           PhysicalExprAttr extent,
-                          std::optional<int64_t> dimension) {
+                          std::optional<int64_t> dimension,
+                          ValueTypeChangeCallback changed) {
   retargetExtent(
       root,
       [=](AxisMapAttr mapping) {
@@ -2018,21 +2137,22 @@ void retargetSourceExtent(Value root, PhysicalSourceAxis source,
                mapping.getDerived() == source.derived &&
                (!dimension || mapping.getDimensionId() == *dimension);
       },
-      extent, /*followLogicalDimension=*/false);
+      extent, /*followLogicalDimension=*/false, changed);
 }
 
 void retargetDimensionExtent(Value root, int64_t dimensionId,
-                             PhysicalExprAttr extent) {
+                             PhysicalExprAttr extent,
+                             ValueTypeChangeCallback changed) {
   if (dimensionId <= 0)
     return;
   retargetExtent(root,
                  [=](AxisMapAttr mapping) {
                    return mapping.getDimensionId() == dimensionId;
                  },
-                 extent, /*followLogicalDimension=*/true);
+                 extent, /*followLogicalDimension=*/true, changed);
 }
 
-LogicalResult alignStructuredCaptureRelations(func::FuncOp kernel) {
+WalkResult alignStructuredCaptures(Operation *operation, RelationWorklist &changes) {
   auto sinkUniformCapture = [&](Operation *owner, unsigned operand,
                                 ArrayRef<BlockArgument> arguments) {
     Value capture = owner->getOperand(operand);
@@ -2054,8 +2174,9 @@ LogicalResult alignStructuredCaptureRelations(func::FuncOp kernel) {
     // physical extent through the ordinary splat projection rule.
     for (BlockArgument argument : arguments) {
       auto type = cast<FragmentType>(argument.getType());
-      argument.setType(scalar.getType());
+      changes.setType(argument, scalar.getType());
       OpBuilder builder(argument.getOwner(), argument.getOwner()->begin());
+      builder.setListener(&changes);
       auto splat = builder.create<SplatOp>(owner->getLoc(), type, argument);
       argument.replaceAllUsesExcept(splat.getResult(), splat.getOperation());
     }
@@ -2081,7 +2202,7 @@ LogicalResult alignStructuredCaptureRelations(func::FuncOp kernel) {
       if (mapping.getDimensionId() <= 0)
         continue;
       retargetDimensionExtent(argument, mapping.getDimensionId(),
-                              cast<PhysicalExprAttr>(authority.getShape()[axis]));
+                              cast<PhysicalExprAttr>(authority.getShape()[axis]), changes.typeChanged());
     }
     return capture.getType() == argument.getType()
                ? success()
@@ -2089,7 +2210,6 @@ LogicalResult alignStructuredCaptureRelations(func::FuncOp kernel) {
                      "physical structured capture extent is inconsistent");
   };
 
-  WalkResult result = kernel.walk([&](Operation *operation) {
     if (auto fold = dyn_cast<RegionFoldOp>(operation)) {
       unsigned sourceCount = fold.getSourceCount();
       unsigned captureOffset = sourceCount + fold.getIdentityCount();
@@ -2126,8 +2246,7 @@ LogicalResult alignStructuredCaptureRelations(func::FuncOp kernel) {
         return WalkResult::interrupt();
     }
     return WalkResult::advance();
-  });
-  return result.wasInterrupted() ? failure() : success();
+
 }
 
 void eraseDeadPhysicalValues(func::FuncOp kernel) {
@@ -2158,11 +2277,62 @@ void eraseDeadPhysicalValues(func::FuncOp kernel) {
 
 }
 
-LogicalResult alignContractValueRelations(func::FuncOp kernel) {
-  if (failed(alignOrdinaryContractOperandTypes(kernel)) ||
-      failed(alignContractAccumulatorTypes(kernel)))
-    return failure();
-  return success();
+
+LogicalResult RelationWorklist::run() {
+  kernel.walk<WalkOrder::PreOrder>([&](Operation *operation) {
+    live.insert(operation);
+    enqueue(operation);
+  });
+  while (true) {
+    unsigned selected = 0;
+    while (selected != RuleCount && worklists[selected].empty()) ++selected;
+    if (selected == RuleCount) return success();
+    auto [operation, rule] = worklists[selected].front();
+    worklists[selected].pop_front();
+    if (!queued[rule].erase(operation) || !live.contains(operation)) continue;
+
+    // Rules can replace operands on an owner or its region terminators. Track
+    // these edges in addition to explicit type notifications, so a new
+    // projection or a reverse refinement requeues every affected relation.
+    SmallVector<std::pair<Operation *, SmallVector<Value>>> boundaries;
+    auto remember = [&](Operation *boundary) {
+      boundaries.emplace_back(boundary, llvm::to_vector(boundary->getOperands()));
+    };
+    remember(operation);
+    for (Region &region : operation->getRegions())
+      for (Block &block : region)
+        if (!block.empty()) remember(block.getTerminator());
+
+    LogicalResult status = success();
+    auto checked = [](WalkResult result) { return failure(result.wasInterrupted()); };
+    switch (rule) {
+    case Captures: status = checked(alignStructuredCaptures(operation, *this)); break;
+    case ReductionResult: status = checked(alignReductionResultRelation(operation, *this)); break;
+    case ReductionIdentity: status = checked(alignReductionIdentityRelation(operation, *this)); break;
+    case Aggregate: status = checked(alignAggregateValue(operation, *this)); break;
+    case AccessResult: status = checked(alignAccessResult(operation, *this)); break;
+    case Pointwise: status = checked(alignPointwiseValue(operation, *this)); break;
+    case ReductionYield: status = checked(alignReductionYield(operation, *this)); break;
+    case AccessValue: status = alignAccessValue(operation, *this); break;
+    case Reshape: status = refreshReshapeRelation(cast<ReshapeOp>(operation), *this); break;
+    case ContractOperands: status = checked(alignContractOperands(operation, *this)); break;
+    case ContractAccumulator: status = alignContractAccumulator(operation, *this); break;
+    case RuleCount: llvm_unreachable("invalid relation rule");
+    }
+    if (failed(status))
+      return operation->emitOpError("failed to close its physical value relation");
+    if (conflict) return failure();
+    for (auto &[boundary, before] : boundaries) {
+      if (!live.contains(boundary) || llvm::equal(before, boundary->getOperands())) continue;
+      enqueue(boundary);
+      for (Value value : before) affected(value);
+      for (Value value : boundary->getOperands()) affected(value);
+    }
+  }
+}
+
+LogicalResult closeValueRelations(func::FuncOp kernel, ValueRelationScope scope) {
+  return RelationWorklist(kernel, scope).run();
 }
 
 } // namespace intent::gpu

@@ -360,7 +360,7 @@ LogicalResult realizeOnlineSummary(OnlineSummaryPattern pattern,
 
 } // namespace
 
-LogicalResult realizeOnlineReductions(ModuleOp module) {
+static LogicalResult realizeOnlineReductionsImpl(ModuleOp module) {
   FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);
   if (failed(physicalKernel))
     return failure();
@@ -378,6 +378,12 @@ LogicalResult realizeOnlineReductions(ModuleOp module) {
       return failure();
   }
   return success();
+}
+
+LogicalResult realizeOnlineReductions(ModuleOp module) {
+  if (failed(realizeOnlineReductionsImpl(module))) return failure();
+  auto kernel = getPhysicalKernel(module);
+  return failed(kernel) ? failure() : closeValueRelations(*kernel);
 }
 
 } // namespace intent::gpu

@@ -8,5 +8,6 @@ add_mlir_library(MLIRIntentDSATransforms
   LINK_LIBS PUBLIC
   MLIRIntentDSAAnalysis
   MLIRIntentDSADialect
+  MLIRPass
   MLIRTransforms
 )

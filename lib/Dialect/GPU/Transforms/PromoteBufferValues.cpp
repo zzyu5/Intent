@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
@@ -357,7 +358,7 @@ private:
 
 } // namespace
 
-LogicalResult promoteBufferValues(ModuleOp module) {
+static LogicalResult promoteBufferValuesImpl(ModuleOp module) {
   auto kernel = getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
@@ -429,6 +430,12 @@ LogicalResult promoteBufferValues(ModuleOp module) {
   (*kernel)->setAttr(effectOriginsAttr,
                      ArrayAttr::get(module.getContext(), effects));
   return realizeAccessComposition(module);
+}
+
+LogicalResult promoteBufferValues(ModuleOp module) {
+  if (failed(promoteBufferValuesImpl(module))) return failure();
+  auto kernel = getPhysicalKernel(module);
+  return failed(kernel) ? failure() : closeValueRelations(*kernel);
 }
 
 } // namespace intent::gpu

@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 
 namespace intent::dsa {
+void registerDSAPasses();
 mlir::LogicalResult runProgramTransforms(mlir::ModuleOp module);
 mlir::LogicalResult realizeCollectiveGatherSupply(mlir::func::FuncOp function);
 mlir::LogicalResult realizeMatrixSupply(mlir::func::FuncOp function);

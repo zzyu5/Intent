@@ -5,10 +5,14 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
+#include "Intent/Transforms/PassManager.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassRegistry.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
 #include <functional>
@@ -18,166 +22,30 @@ using namespace mlir;
 namespace intent::gpu {
 namespace {
 
-// Each group owns its relation repairs. Analyses are recreated by its rewrites;
-// the executable-program verifier runs only after the complete group.
-LogicalResult closeReductionValueRelations(func::FuncOp kernel) {
-  if (failed(alignReductionResultRelations(kernel)) ||
-      failed(alignReductionIdentityRelations(kernel)) ||
-      failed(alignPointwiseValueRelations(kernel)) ||
-      failed(alignReductionYieldRelations(kernel)) ||
-      failed(alignAggregateValueRelations(kernel)))
-    return failure();
-  return success();
+// Complete transformation entries own relation closure; the pipeline schedules
+// their semantic dependencies and verifies each finished group.
+LogicalResult normalizeStructuredSources(ModuleOp module) {
+  if (failed(eliminateCommonValues(module))) return failure();
+  return normalizeContractionSources(module);
 }
 
-LogicalResult normalizeStructuredSources(ModuleOp module, func::FuncOp kernel) {
-  if (failed(eliminateCommonValues(module)) ||
-      failed(normalizeContractionSources(module)) ||
-      failed(refreshReshapeRelations(kernel)))
-    return failure();
-  return success();
+LogicalResult realizeReductionGroup(ModuleOp module) {
+  if (failed(fuseIndependentReductions(module))) return failure();
+  return realizeReductionBlocking(module);
 }
 
-LogicalResult formPointwiseOwnership(ModuleOp module, func::FuncOp kernel) {
-  if (failed(realizePointwiseOwnership(module)) ||
-      failed(refreshReshapeRelations(kernel)) ||
-      failed(alignPointwiseValueRelations(kernel)) ||
-      failed(alignContractValueRelations(kernel)) ||
-      failed(closeReductionValueRelations(kernel)) ||
-      failed(alignAccessValueRelations(kernel)))
-    return failure();
-  return alignPointwiseValueRelations(kernel);
-}
-
-LogicalResult predicateScalarControlGroup(ModuleOp module, func::FuncOp) {
-  return predicateScalarControl(module);
-}
-
-LogicalResult formPointwiseBlocking(ModuleOp module, func::FuncOp kernel) {
-  if (failed(realizePointwiseBlocking(module)) ||
-      failed(alignAccessResultRelations(kernel)) ||
-      failed(alignPointwiseValueRelations(kernel)) ||
-      failed(alignAccessValueRelations(kernel)) ||
-      failed(alignAggregateValueRelations(kernel)) ||
-      failed(alignPointwiseValueRelations(kernel)) ||
-      failed(alignAggregateValueRelations(kernel)) ||
-      failed(alignAccessValueRelations(kernel)) ||
-      failed(refreshReshapeRelations(kernel)) ||
-      failed(alignContractValueRelations(kernel)))
-    return failure();
-  // Independent workset axes can lift a vector dot into a matrix contraction.
-  if (failed(realizeVectorContractions(module)) ||
-      failed(refreshReshapeRelations(kernel)) ||
-      failed(alignAccessValueRelations(kernel)) ||
-      failed(alignPointwiseValueRelations(kernel)))
-    return failure();
-  if (failed(closeReductionValueRelations(kernel)))
-    return failure();
-  return guardInactivePredicatedLoops(module);
-}
-
-LogicalResult coRealizeOnlineReductions(ModuleOp module, func::FuncOp kernel) {
-  if (failed(realizeOnlineReductions(module)) ||
-      failed(alignAggregateValueRelations(kernel)) ||
-      failed(alignAccessResultRelations(kernel)) ||
-      failed(alignReductionResultRelations(kernel)) ||
-      failed(alignReductionIdentityRelations(kernel)) ||
-      failed(alignPointwiseValueRelations(kernel)) ||
-      failed(alignReductionYieldRelations(kernel)) ||
-      failed(alignAccessValueRelations(kernel)) ||
-      failed(refreshReshapeRelations(kernel)) ||
-      failed(alignContractValueRelations(kernel)))
-    return failure();
-  return success();
-}
-
-LogicalResult realizeRegionFoldGroup(ModuleOp module, func::FuncOp) {
-  return realizeRegionFolds(module);
-}
-
-LogicalResult realizeRegionScanGroup(ModuleOp module, func::FuncOp) {
-  return realizeRegionScans(module);
-}
-
-LogicalResult realizeScanConsumerGroup(ModuleOp module, func::FuncOp kernel) {
-  if (failed(realizeScanConsumerTraversals(module)))
-    return failure();
-  return closeValueAccessRelations(kernel);
-}
-
-LogicalResult materializeRetainedValueGroup(ModuleOp module, func::FuncOp kernel) {
-  if (failed(materializeRetainedValues(module)))
-    return failure();
-  return closeValueAccessRelations(kernel);
-}
-
-LogicalResult realizeReductionGroup(ModuleOp module, func::FuncOp kernel) {
-  if (failed(fuseIndependentReductions(module)) ||
-      failed(realizeReductionBlocking(module)) ||
-      failed(alignAggregateValueRelations(kernel)) ||
-      failed(alignAccessResultRelations(kernel)) ||
-      failed(alignReductionResultRelations(kernel)) ||
-      failed(alignReductionIdentityRelations(kernel)) ||
-      failed(alignPointwiseValueRelations(kernel)) ||
-      failed(alignReductionYieldRelations(kernel)) ||
-      failed(alignAccessValueRelations(kernel)) ||
-      failed(alignAggregateValueRelations(kernel)) ||
-      failed(alignPointwiseValueRelations(kernel)) ||
-      failed(refreshReshapeRelations(kernel)) ||
-      failed(alignContractValueRelations(kernel)))
-    return failure();
-  return success();
-}
-
-LogicalResult realizeContractionGroup(ModuleOp module, func::FuncOp kernel) {
-  if (failed(realizeContractionBlocking(module)) ||
-      failed(alignAggregateValueRelations(kernel)) ||
-      failed(alignAccessResultRelations(kernel)) ||
-      failed(alignPointwiseValueRelations(kernel)) ||
-      failed(alignAccessValueRelations(kernel)) ||
-      failed(refreshReshapeRelations(kernel)) ||
-      failed(alignPointwiseValueRelations(kernel)) ||
-      failed(alignContractValueRelations(kernel)) ||
-      failed(alignAccessValueRelations(kernel)) ||
-      failed(alignPointwiseValueRelations(kernel)))
-    return failure();
-  return success();
-}
-
-LogicalResult composeRealizedAccesses(ModuleOp module, func::FuncOp kernel) {
+LogicalResult composeRealizedAccesses(ModuleOp module) {
   if (failed(realizeAccessComposition(module)) ||
       failed(materializeRetainedValues(module)) ||
-      failed(realizeAccessComposition(module)) ||
-      failed(orientLoopContractions(module)) ||
-      failed(alignAggregateValueRelations(kernel)))
+      failed(realizeAccessComposition(module)))
     return failure();
-  return closeValueAccessRelations(kernel);
+  return orientLoopContractions(module);
 }
 
-LogicalResult refineMapping(ModuleOp module, func::FuncOp) {
-  return refineProgramMapping(module);
-}
-
-LogicalResult vectorizeBufferGroup(ModuleOp module, func::FuncOp kernel) {
-  if (failed(vectorizeBufferLoops(module)))
-    return failure();
-  return closeValueAccessRelations(kernel);
-}
-
-LogicalResult promoteBufferGroup(ModuleOp module, func::FuncOp kernel) {
-  if (failed(promoteBufferValues(module)))
-    return failure();
-  return closeValueAccessRelations(kernel);
-}
-
-LogicalResult simplifyValues(ModuleOp module, func::FuncOp) {
+LogicalResult simplifyValues(ModuleOp module) {
   if (failed(eliminateCommonValues(module)))
     return failure();
   return simplifyMaskedAccessCoordinates(module);
-}
-
-LogicalResult scheduleStores(ModuleOp module, func::FuncOp) {
-  return schedulePrivateStores(module);
 }
 
 LogicalResult closeSharedConfigurations(func::FuncOp kernel,
@@ -188,42 +56,237 @@ LogicalResult closeSharedConfigurations(func::FuncOp kernel,
   return verifySharedConfigTuples(kernel);
 }
 
-struct TransformationGroup {
-  StringRef name;
-  LogicalResult (*run)(ModuleOp, func::FuncOp);
+LogicalResult finishTransformation(ModuleOp module, StringRef name,
+                                   LogicalResult result) {
+  if (failed(result))
+    return module.emitError() << "shared GPU transformation failed: " << name;
+  if (failed(verifyGPUProgram(module)))
+    return module.emitError() << "shared GPU postcondition failed: " << name;
+  return success();
+}
+
+class NormalizeStructuredSourcesPass : public PassWrapper<NormalizeStructuredSourcesPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NormalizeStructuredSourcesPass)
+  StringRef getArgument() const final { return "intent-gpu-normalize-structured-sources"; }
+  StringRef getDescription() const final { return "Normalize structured GPU sources"; }
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(finishTransformation(module, getArgument(), normalizeStructuredSources(module))))
+      signalPassFailure();
+  }
 };
 
-LogicalResult runTransformations(ModuleOp module, func::FuncOp kernel) {
-  const TransformationGroup groups[] = {
-      {"normalize-structured-sources", normalizeStructuredSources},
-      {"predicate-scalar-control", predicateScalarControlGroup},
-      {"form-pointwise-ownership", formPointwiseOwnership},
-      {"form-pointwise-blocking", formPointwiseBlocking},
-      {"realize-scan-consumers", realizeScanConsumerGroup},
-      {"materialize-retained-values", materializeRetainedValueGroup},
-      {"co-realize-online-reductions", coRealizeOnlineReductions},
-      {"realize-region-folds", realizeRegionFoldGroup},
-      {"realize-region-scans", realizeRegionScanGroup},
-      {"realize-reductions", realizeReductionGroup},
-      {"realize-contractions", realizeContractionGroup},
-      {"compose-realized-accesses", composeRealizedAccesses},
-      {"schedule-private-stores", scheduleStores},
-      {"vectorize-buffer-loops", vectorizeBufferGroup},
-      {"promote-buffer-values", promoteBufferGroup},
-      {"refine-program-mapping", refineMapping},
-      {"eliminate-common-values", simplifyValues},
-  };
-  for (const TransformationGroup &group : groups) {
-    if (failed(group.run(module, kernel))) {
-      return module.emitError()
-             << "shared GPU transformation failed: " << group.name;
-    }
-    if (failed(verifyGPUProgram(module))) {
-      return module.emitError()
-             << "shared GPU postcondition failed: " << group.name;
-    }
+class PredicateScalarControlPass : public PassWrapper<PredicateScalarControlPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PredicateScalarControlPass)
+  StringRef getArgument() const final { return "intent-gpu-predicate-scalar-control"; }
+  StringRef getDescription() const final { return "Predicate scalar control in the GPU program"; }
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(finishTransformation(module, getArgument(), predicateScalarControl(module))))
+      signalPassFailure();
   }
-  return success();
+};
+
+class PointwiseOwnershipPass : public PassWrapper<PointwiseOwnershipPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PointwiseOwnershipPass)
+  StringRef getArgument() const final { return "intent-gpu-form-pointwise-ownership"; }
+  StringRef getDescription() const final { return "Form pointwise GPU ownership"; }
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(finishTransformation(module, getArgument(), realizePointwiseOwnership(module))))
+      signalPassFailure();
+  }
+};
+
+class PointwiseBlockingPass : public PassWrapper<PointwiseBlockingPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PointwiseBlockingPass)
+  StringRef getArgument() const final { return "intent-gpu-form-pointwise-blocking"; }
+  StringRef getDescription() const final { return "Form pointwise GPU blocking and its dependent value graph"; }
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(finishTransformation(module, getArgument(), realizePointwiseBlocking(module))))
+      signalPassFailure();
+  }
+};
+
+class ScanConsumersPass : public PassWrapper<ScanConsumersPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ScanConsumersPass)
+  StringRef getArgument() const final { return "intent-gpu-realize-scan-consumers"; }
+  StringRef getDescription() const final { return "Realize GPU scan consumer traversals"; }
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(finishTransformation(module, getArgument(), realizeScanConsumerTraversals(module))))
+      signalPassFailure();
+  }
+};
+
+class RetainedValuesPass : public PassWrapper<RetainedValuesPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RetainedValuesPass)
+  StringRef getArgument() const final { return "intent-gpu-materialize-retained-values"; }
+  StringRef getDescription() const final { return "Materialize retained GPU values"; }
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(finishTransformation(module, getArgument(), materializeRetainedValues(module))))
+      signalPassFailure();
+  }
+};
+
+class OnlineReductionsPass : public PassWrapper<OnlineReductionsPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(OnlineReductionsPass)
+  StringRef getArgument() const final { return "intent-gpu-co-realize-online-reductions"; }
+  StringRef getDescription() const final { return "Co-realize GPU online reductions"; }
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(finishTransformation(module, getArgument(), realizeOnlineReductions(module))))
+      signalPassFailure();
+  }
+};
+
+class RegionFoldsPass : public PassWrapper<RegionFoldsPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RegionFoldsPass)
+  StringRef getArgument() const final { return "intent-gpu-realize-region-folds"; }
+  StringRef getDescription() const final { return "Realize GPU region folds"; }
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(finishTransformation(module, getArgument(), realizeRegionFolds(module))))
+      signalPassFailure();
+  }
+};
+
+class RegionScansPass : public PassWrapper<RegionScansPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RegionScansPass)
+  StringRef getArgument() const final { return "intent-gpu-realize-region-scans"; }
+  StringRef getDescription() const final { return "Realize GPU region scans"; }
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(finishTransformation(module, getArgument(), realizeRegionScans(module))))
+      signalPassFailure();
+  }
+};
+
+class ReductionsPass : public PassWrapper<ReductionsPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ReductionsPass)
+  StringRef getArgument() const final { return "intent-gpu-realize-reductions"; }
+  StringRef getDescription() const final { return "Realize GPU reduction programs"; }
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(finishTransformation(module, getArgument(), realizeReductionGroup(module))))
+      signalPassFailure();
+  }
+};
+
+class ContractionsPass : public PassWrapper<ContractionsPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ContractionsPass)
+  StringRef getArgument() const final { return "intent-gpu-realize-contractions"; }
+  StringRef getDescription() const final { return "Realize GPU contraction programs"; }
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(finishTransformation(module, getArgument(), realizeContractionBlocking(module))))
+      signalPassFailure();
+  }
+};
+
+class AccessCompositionPass : public PassWrapper<AccessCompositionPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AccessCompositionPass)
+  StringRef getArgument() const final { return "intent-gpu-compose-realized-accesses"; }
+  StringRef getDescription() const final { return "Compose realized GPU accesses and values"; }
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(finishTransformation(module, getArgument(), composeRealizedAccesses(module))))
+      signalPassFailure();
+  }
+};
+
+class PrivateStoresPass : public PassWrapper<PrivateStoresPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PrivateStoresPass)
+  StringRef getArgument() const final { return "intent-gpu-schedule-private-stores"; }
+  StringRef getDescription() const final { return "Schedule private GPU stores"; }
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(finishTransformation(module, getArgument(), schedulePrivateStores(module))))
+      signalPassFailure();
+  }
+};
+
+class BufferVectorizationPass : public PassWrapper<BufferVectorizationPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BufferVectorizationPass)
+  StringRef getArgument() const final { return "intent-gpu-vectorize-buffer-loops"; }
+  StringRef getDescription() const final { return "Vectorize GPU buffer loops"; }
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(finishTransformation(module, getArgument(), vectorizeBufferLoops(module))))
+      signalPassFailure();
+  }
+};
+
+class BufferPromotionPass : public PassWrapper<BufferPromotionPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BufferPromotionPass)
+  StringRef getArgument() const final { return "intent-gpu-promote-buffer-values"; }
+  StringRef getDescription() const final { return "Promote GPU buffer values"; }
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(finishTransformation(module, getArgument(), promoteBufferValues(module))))
+      signalPassFailure();
+  }
+};
+
+class ProgramMappingPass : public PassWrapper<ProgramMappingPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ProgramMappingPass)
+  StringRef getArgument() const final { return "intent-gpu-refine-program-mapping"; }
+  StringRef getDescription() const final { return "Refine GPU program mapping"; }
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(finishTransformation(module, getArgument(), refineProgramMapping(module))))
+      signalPassFailure();
+  }
+};
+
+class CommonValuesPass : public PassWrapper<CommonValuesPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CommonValuesPass)
+  StringRef getArgument() const final { return "intent-gpu-eliminate-common-values"; }
+  StringRef getDescription() const final { return "Eliminate common GPU values and simplify masked coordinates"; }
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(finishTransformation(module, getArgument(), simplifyValues(module))))
+      signalPassFailure();
+  }
+};
+
+void populateTransformations(OpPassManager &manager) {
+  manager.addPass(std::make_unique<NormalizeStructuredSourcesPass>());
+  manager.addPass(std::make_unique<PredicateScalarControlPass>());
+  manager.addPass(std::make_unique<PointwiseOwnershipPass>());
+  manager.addPass(std::make_unique<PointwiseBlockingPass>());
+  manager.addPass(std::make_unique<ScanConsumersPass>());
+  manager.addPass(std::make_unique<RetainedValuesPass>());
+  manager.addPass(std::make_unique<OnlineReductionsPass>());
+  manager.addPass(std::make_unique<RegionFoldsPass>());
+  manager.addPass(std::make_unique<RegionScansPass>());
+  manager.addPass(std::make_unique<ReductionsPass>());
+  manager.addPass(std::make_unique<ContractionsPass>());
+  manager.addPass(std::make_unique<AccessCompositionPass>());
+  manager.addPass(std::make_unique<PrivateStoresPass>());
+  manager.addPass(std::make_unique<BufferVectorizationPass>());
+  manager.addPass(std::make_unique<BufferPromotionPass>());
+  manager.addPass(std::make_unique<ProgramMappingPass>());
+  manager.addPass(std::make_unique<CommonValuesPass>());
 }
 
 scf::IfOp independentUniformBranches(func::FuncOp kernel) {
@@ -312,13 +375,17 @@ scf::IfOp independentUniformBranches(func::FuncOp kernel) {
 }
 
 FailureOr<bool> realizeUniformBranches(ModuleOp module, func::FuncOp kernel,
-                                       scf::IfOp conditional) {
+                                       scf::IfOp conditional, PassManager &manager) {
   // Optimize each mutually exclusive region with the existing kernel passes,
   // then rejoin their physical programs under one launch and the original ABI.
   SmallVector<OwningOpRef<ModuleOp>> branches;
   for (unsigned index = 0; index < 2; ++index) {
     IRMapping mapping;
     OwningOpRef<ModuleOp> branch(cast<ModuleOp>(module->clone(mapping)));
+    // These temporary modules are separate pass-manager runs. A diagnostic
+    // symbol keeps MLIR's native print-tree files distinct for each branch.
+    (*branch)->setAttr(SymbolTable::getSymbolAttrName(),
+        StringAttr::get(module.getContext(), "intent_uniform_branch_" + std::to_string(index)));
     auto function = cast<func::FuncOp>(mapping.lookup(kernel.getOperation()));
     auto choice = cast<scf::IfOp>(mapping.lookup(conditional.getOperation()));
     Block &body = choice->getRegion(index).front();
@@ -333,7 +400,7 @@ FailureOr<bool> realizeUniformBranches(ModuleOp module, func::FuncOp kernel,
     function->setAttr(effectOriginsAttr,
                       ArrayAttr::get(module.getContext(), effects));
     eraseDeadPhysicalValues(function);
-    if (failed(runTransformations(*branch, function)))
+    if (failed(manager.run(*branch)))
       return failure();
     eraseUnusedPhysicalParameters(function);
     auto space = function->getAttrOfType<ArrayAttr>(programSpaceAttr);
@@ -470,16 +537,30 @@ FailureOr<bool> realizeUniformBranches(ModuleOp module, func::FuncOp kernel,
 
 } // namespace
 
+void registerGPUPasses() {
+  PassRegistration<NormalizeStructuredSourcesPass>();
+  PassRegistration<PredicateScalarControlPass>();
+  PassRegistration<PointwiseOwnershipPass>();
+  PassRegistration<PointwiseBlockingPass>();
+  PassRegistration<ScanConsumersPass>();
+  PassRegistration<RetainedValuesPass>();
+  PassRegistration<OnlineReductionsPass>();
+  PassRegistration<RegionFoldsPass>();
+  PassRegistration<RegionScansPass>();
+  PassRegistration<ReductionsPass>();
+  PassRegistration<ContractionsPass>();
+  PassRegistration<AccessCompositionPass>();
+  PassRegistration<PrivateStoresPass>();
+  PassRegistration<BufferVectorizationPass>();
+  PassRegistration<BufferPromotionPass>();
+  PassRegistration<ProgramMappingPass>();
+  PassRegistration<CommonValuesPass>();
+}
+
 LogicalResult completeGPUProgramConstruction(ModuleOp module) {
   // Construction closes the initial indexed access graph. Ownership/blocking
   // and structured realization are subsequent transformations of this program.
   if (failed(realizeAccessComposition(module)))
-    return failure();
-  FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
-  if (failed(kernel) || failed(alignContractValueRelations(*kernel)) ||
-      failed(alignAggregateValueRelations(*kernel)) ||
-      failed(alignPointwiseValueRelations(*kernel)) ||
-      failed(alignAccessValueRelations(*kernel)))
     return failure();
   return verifyGPUProgram(module);
 }
@@ -490,15 +571,18 @@ LogicalResult runSharedGPUPasses(ModuleOp module, const TuningProfiles &profiles
   FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
+  PassManager manager(module.getContext(), ModuleOp::getOperationName());
+  populateTransformations(manager);
+  if (failed(intent::configurePassManager(manager))) return failure();
   bool realizedBranches = false;
   if (scf::IfOp conditional = independentUniformBranches(*kernel)) {
-    auto realized = realizeUniformBranches(module, *kernel, conditional);
+    auto realized = realizeUniformBranches(module, *kernel, conditional, manager);
     if (failed(realized))
       return failure();
     realizedBranches = *realized;
     kernel = getPhysicalKernel(module);
   }
-  if (!realizedBranches && failed(runTransformations(module, *kernel))) {
+  if (!realizedBranches && failed(manager.run(module))) {
     return failure();
   }
   if (failed(closeSharedConfigurations(*kernel, profiles)) ||

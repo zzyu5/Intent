@@ -1540,9 +1540,7 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
       }
     }
   }
-  if (failed(alignReductionResultRelations(kernel)))
-    return failure();
-  return alignReductionIdentityRelations(kernel);
+  return closeValueRelations(kernel, ValueRelationScope::ReductionInputs);
 }
 
 FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &region,
@@ -3985,7 +3983,7 @@ LogicalResult realizeReductionBlocking(ModuleOp module) {
     changed |= hoistNestedReduction(loop, kernel);
   if (changed)
     eraseDeadPhysicalValues(kernel);
-  return success();
+  return closeValueRelations(kernel);
 }
 
 } // namespace intent::gpu

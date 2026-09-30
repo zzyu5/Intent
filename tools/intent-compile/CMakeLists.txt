@@ -47,6 +47,8 @@ target_link_libraries(intent-compile PRIVATE
   MLIRIntentTritonSerialization
   MLIRIntentTransforms
   MLIRParser
+  MLIRPass
+  MLIRTransforms
   MLIRIR
   MLIRSupport
 )

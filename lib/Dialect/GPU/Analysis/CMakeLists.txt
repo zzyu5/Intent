@@ -1,6 +1,7 @@
 add_mlir_library(MLIRIntentGPUAnalysis
   PhysicalProgram.cpp
   PhysicalParameters.cpp
+  Resources.cpp
   ValueSchema.cpp
   UniformValues.cpp
 

@@ -238,7 +238,7 @@ FailureOr<Value> materializeScalarConstant(OpBuilder &builder,
 
 static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
                                              Location location, Value value,
-                                             FragmentType target) {
+                                             FragmentType target, ValueTypeChangeCallback changed) {
   if (value.getType() == target)
     return value;
   Type element = value.getType();
@@ -251,7 +251,7 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
   if (auto extract = value.getDefiningOp<ExtractOp>())
     if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>())
       return projectFragmentValue(builder, location,
-                                  record.getFields()[extract.getField()], target);
+                                  record.getFields()[extract.getField()], target, changed);
   Value scalar = value;
   while (isa<FragmentType>(scalar.getType())) {
     UniformExpression expression = describeUniformValue(scalar);
@@ -288,7 +288,7 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
         if (Attribute origin = definition->getAttr(originAttr))
           transpose->setAttr(originAttr, origin);
       return projectFragmentValue(builder, location, transpose.getResult(),
-                                  target);
+                                  target, changed);
     }
   }
   Operation *projection = nullptr;
@@ -321,14 +321,14 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
             builder.getArrayAttr(shape), input.getAxisMaps(),
             input.getValidity(), input.getOwner());
         FailureOr<Value> projected = projectFragmentValue(
-            builder, location, broadcast.getValue(), inputTarget);
+            builder, location, broadcast.getValue(), inputTarget, changed);
         if (succeeded(projected) &&
             queryBroadcastProjection(inputTarget, target).isExact())
           projection = builder.create<BroadcastOp>(location, target, *projected);
       }
     } else {
       FailureOr<Value> projected =
-          projectFragmentValue(builder, location, broadcast.getValue(), target);
+          projectFragmentValue(builder, location, broadcast.getValue(), target, changed);
       if (succeeded(projected))
         return *projected;
     }
@@ -380,7 +380,7 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
           target.getContext(), input.getElementType(), builder.getArrayAttr(inputShape),
           input.getAxisMaps(), target.getValidity(), target.getOwner());
       FailureOr<Value> projected =
-          projectFragmentValue(builder, location, reshape.getValue(), inputTarget);
+          projectFragmentValue(builder, location, reshape.getValue(), inputTarget, changed);
       if (succeeded(projected))
         projection = builder.create<ReshapeOp>(
             location, target, *projected, reshape.getReassociation());
@@ -417,9 +417,9 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
           target.getContext(), target.getElementType(), target.getShape(),
           source.getAxisMaps(), target.getValidity(), target.getOwner());
       auto projectedSource = projectFragmentValue(
-          builder, location, reduce.getInputs().front(), inputTarget);
+          builder, location, reduce.getInputs().front(), inputTarget, changed);
       auto projectedIdentity = projectFragmentValue(
-          builder, location, reduce.getInputs()[1], resultTarget);
+          builder, location, reduce.getInputs()[1], resultTarget, changed);
       if (succeeded(projectedSource) && succeeded(projectedIdentity)) {
         IRMapping mapping;
         mapping.map(reduce.getInputs().front(), *projectedSource);
@@ -432,7 +432,7 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
                   argument,
                   sourceAxisIdentity(
                       cast<AxisMapAttr>(source.getAxisMaps()[axis])),
-                  cast<PhysicalExprAttr>(target.getShape()[axis]));
+                  cast<PhysicalExprAttr>(target.getShape()[axis]), std::nullopt, changed);
         clone.getResult(0).setType(resultTarget);
         projection = clone.getOperation();
         if (resultTarget != target)
@@ -456,7 +456,7 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
           target.getContext(), element, target.getShape(), target.getAxisMaps(),
           target.getValidity(), target.getOwner());
       FailureOr<Value> projected =
-          projectFragmentValue(builder, location, operand, operandTarget);
+          projectFragmentValue(builder, location, operand, operandTarget, changed);
       if (failed(projected))
         return failure();
       mapping.map(operand, *projected);
@@ -474,11 +474,11 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
 
 FailureOr<Value> projectPhysicalValueToSchema(OpBuilder &builder,
                                               Location location, Value value,
-                                              Type target) {
+                                              Type target, ValueTypeChangeCallback changed) {
   if (value.getType() == target)
     return value;
   if (auto fragment = dyn_cast<FragmentType>(target))
-    return projectFragmentValue(builder, location, value, fragment);
+    return projectFragmentValue(builder, location, value, fragment, changed);
   auto targetRecord = dyn_cast<RecordType>(target);
   auto sourceRecord = dyn_cast<RecordType>(value.getType());
   if (!targetRecord || !sourceRecord ||
@@ -497,7 +497,7 @@ FailureOr<Value> projectPhysicalValueToSchema(OpBuilder &builder,
                       : Value(builder.create<ExtractOp>(location, sourceType,
                                                         value, index));
     FailureOr<Value> projected = projectPhysicalValueToSchema(
-        builder, location, field, cast<TypeAttr>(targetField).getValue());
+        builder, location, field, cast<TypeAttr>(targetField).getValue(), changed);
     if (failed(projected))
       return failure();
     projectedFields.push_back(*projected);

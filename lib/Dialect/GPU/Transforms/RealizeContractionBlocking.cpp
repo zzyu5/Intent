@@ -74,7 +74,7 @@ private:
 namespace intent::gpu {
 using namespace contraction;
 
-LogicalResult realizeContractionBlocking(ModuleOp module) {
+static LogicalResult realizeContractionBlockingImpl(ModuleOp module) {
   FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);
   if (failed(physicalKernel))
     return failure();
@@ -224,6 +224,12 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
   pruneContractionProgramCoordinates(kernel);
   eraseDeadPhysicalValues(kernel);
   return success();
+}
+
+LogicalResult realizeContractionBlocking(ModuleOp module) {
+  if (failed(realizeContractionBlockingImpl(module))) return failure();
+  auto kernel = getPhysicalKernel(module);
+  return failed(kernel) ? failure() : closeValueRelations(*kernel);
 }
 
 } // namespace intent::gpu
