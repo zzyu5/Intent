@@ -26,14 +26,16 @@ def _signature(
 
 INTRINSIC_SIGNATURES = {
     "domain": _signature(("start", "stop"), optional_positional=(("step", 1),),
-                         return_annotation="logical domain"),
+                         return_annotation="logical domain descriptor, not a tensor"),
     "parallel": _signature(("source",), return_annotation="parallel iteration"),
     "indices": _signature(("region",), return_annotation="index tensor or tuple of index tensors"),
     "end": _signature(("region",)),
     "assume_in_bounds": _signature(("index", "view", "axis")),
-    "reshape": _signature(("value", "shape")),
+    "reshape": _signature(("value", "shape"),
+                          return_annotation="tensor of requested shape; tensor input required; row-major element order preserved"),
     "join": _signature(("lhs", "rhs")),
-    "transpose": _signature(("value",), optional_positional=(("permutation", None),)),
+    "transpose": _signature(("value",), optional_positional=(("permutation", None),),
+                            return_annotation="tensor with permuted axes; omitted permutation reverses all axes"),
     "full": _signature(("shape", "fill", "dtype"), return_annotation="immutable tensor"),
     "zeros": _signature(("shape", "dtype"), return_annotation="immutable tensor"),
     "buffer": _signature(("shape", "dtype"), optional_positional=(("init", None),),
@@ -89,10 +91,12 @@ INTRINSIC_SIGNATURES = {
     ),
     "outer": _signature(("lhs", "rhs")),
     "reduce.sum": _signature(
-        ("value",), required=("axis",), defaults=(("acc_dtype", None),)
+        ("value",), required=("axis",), defaults=(("acc_dtype", None),),
+        return_annotation="scalar when all axes are reduced; otherwise tensor with reduced axes removed",
     ),
     "reduce.max": _signature(
-        ("value",), required=("axis",), defaults=(("acc_dtype", None),)
+        ("value",), required=("axis",), defaults=(("acc_dtype", None),),
+        return_annotation="scalar when all axes are reduced; otherwise tensor with reduced axes removed",
     ),
     "reduce.any": _signature(("value",), required=("axis",)),
     "reduce.all": _signature(("value",), required=("axis",)),
