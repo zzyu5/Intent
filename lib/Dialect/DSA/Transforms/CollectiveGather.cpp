@@ -1,4 +1,5 @@
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
+#include "Intent/Analysis/IntegerRelations.h"
 #include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -100,26 +101,11 @@ public:
             ? std::optional<int64_t>(0) : std::nullopt;
       if (auto load = dyn_cast<LoadScalarOp>(definition))
         return readonlyView(load.getSource()) && uniformValue(load.getOffset()) ? std::optional<int64_t>(0) : std::nullopt;
-      if (isa<arith::IndexCastOp, arith::ExtSIOp>(definition)) {
-        Type from = definition->getOperand(0).getType(), to = value.getType();
-        unsigned fromWidth = from.isIndex() ? 64 : cast<IntegerType>(from).getWidth();
-        unsigned toWidth = to.isIndex() ? 64 : cast<IntegerType>(to).getWidth();
-        if (toWidth >= fromWidth) return laneCoefficient(definition->getOperand(0));
-      }
       if (!isa<arith::ArithDialect>(definition->getDialect()) || definition->getNumRegions()) return std::nullopt;
       if (llvm::all_of(definition->getOperands(), [&](Value input) { return uniformValue(input); })) return 0;
-      if (definition->getNumOperands() != 2) return std::nullopt;
-      auto lhs = laneCoefficient(definition->getOperand(0)), rhs = laneCoefficient(definition->getOperand(1));
-      if (!lhs || !rhs) return std::nullopt;
-      APInt coefficient(128, *lhs, true);
-      if (isa<arith::AddIOp>(definition)) coefficient += APInt(128, *rhs, true);
-      else if (isa<arith::SubIOp>(definition)) coefficient -= APInt(128, *rhs, true);
-      else if (isa<arith::MulIOp>(definition)) {
-        if (auto scale = integer(definition->getOperand(0))) coefficient = APInt(128, *rhs, true) * APInt(128, *scale, true);
-        else if (auto scale = integer(definition->getOperand(1))) coefficient *= APInt(128, *scale, true);
-        else return std::nullopt;
-      } else return std::nullopt;
-      return coefficient.isSignedIntN(64) ? std::optional<int64_t>(coefficient.getSExtValue()) : std::nullopt;
+      // DSA address indices implement Intent's signed 64-bit logical index.
+      return foldIntegerDifference(describeScalarValue(value),
+          [&](Value input) { return laneCoefficient(input); }, integer, /*indexBitWidth=*/64);
     };
     auto result = infer();
     // Nonzero address differences are only propagated in the DSA address

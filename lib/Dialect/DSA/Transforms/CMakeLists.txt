@@ -6,6 +6,7 @@ add_mlir_library(MLIRIntentDSATransforms
   LocalValues.cpp
 
   LINK_LIBS PUBLIC
+  MLIRIntentAnalysis
   MLIRIntentDSAAnalysis
   MLIRIntentDSADialect
   MLIRPass

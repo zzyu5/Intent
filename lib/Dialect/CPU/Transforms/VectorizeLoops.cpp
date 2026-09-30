@@ -1,4 +1,5 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
+#include "Intent/Analysis/IntegerRelations.h"
 #include "Utilities.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -24,20 +25,12 @@ std::optional<int64_t> coefficient(Value value, scf::ForOp loop) {
   if (value == loop.getInductionVar()) return 1;
   Operation *op = value.getDefiningOp();
   if (!op || !loop->isAncestor(op)) return 0;
-  if (auto add = dyn_cast<arith::AddIOp>(op)) {
-    auto lhs = coefficient(add.getLhs(), loop), rhs = coefficient(add.getRhs(), loop);
-    if (lhs && rhs) return *lhs + *rhs;
-  } else if (auto sub = dyn_cast<arith::SubIOp>(op)) {
-    auto lhs = coefficient(sub.getLhs(), loop), rhs = coefficient(sub.getRhs(), loop);
-    if (lhs && rhs) return *lhs - *rhs;
-  } else if (auto mul = dyn_cast<arith::MulIOp>(op)) {
-    if (auto lhs = getConstantIntValue(mul.getLhs())) {
-      if (auto rhs = coefficient(mul.getRhs(), loop)) return *lhs * *rhs;
-    }
-    if (auto rhs = getConstantIntValue(mul.getRhs())) {
-      if (auto lhs = coefficient(mul.getLhs(), loop)) return *lhs * *rhs;
-    }
-  }
+  // Intent CPU logical coordinates use the DSL's signed 64-bit index contract;
+  // the shared query does not assume a width for arbitrary MLIR index values.
+  auto folded = foldIntegerDifference(describeScalarValue(value),
+      [&](Value input) { return coefficient(input, loop); },
+      [](Value input) { return getConstantIntValue(input); }, /*indexBitWidth=*/64);
+  if (folded) return folded;
   if (llvm::all_of(op->getOperands(), [&](Value input) {
         auto c = coefficient(input, loop); return c && *c == 0;
       })) return 0;
