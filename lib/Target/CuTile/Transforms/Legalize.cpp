@@ -3238,10 +3238,11 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
     configurations.push_back(std::move(bindings));
   }
 
-  SmallVector<SmallVector<NamedAttribute>> providerConfigurations(1);
+  SmallVector<NamedAttribute> launchBaseline;
+  SmallVector<NamedAttribute> launchEndpoint;
+  SmallVector<gpu::ParameterOp> launchOptions;
   gpu::ParameterOp accessForm;
   gpu::ParameterOp loadPolicy;
-  gpu::ParameterOp inferredWarps;
   for (Domain &domain : domains) {
     if (!domain.provider)
       continue;
@@ -3256,73 +3257,59 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
       loadPolicy = domain.parameter;
       continue;
     }
-    bool addInferredDefault =
-        definition.getRole() ==
-            static_cast<uint32_t>(gpu::ParameterRole::ProviderWarps) &&
-        llvm::is_contained(definition.getCandidates().asArrayRef(),
-                           inferredWorkerWarps) &&
-        definition.getCandidates().size() > 1;
-    if (addInferredDefault)
-      inferredWarps = domain.parameter;
-    SmallVector<SmallVector<NamedAttribute>> expanded;
-    for (const auto &base : providerConfigurations)
-      for (int64_t candidate : definition.getCandidates().asArrayRef()) {
-        if (addInferredDefault && candidate == inferredWorkerWarps)
-          continue;
-        SmallVector<NamedAttribute> bindings(base);
-        bindings.push_back(builder.getNamedAttr(
-            definition.getName(), builder.getI64IntegerAttr(candidate)));
-        expanded.push_back(std::move(bindings));
-      }
-    providerConfigurations = std::move(expanded);
+    auto candidates = definition.getCandidates().asArrayRef();
+    launchOptions.push_back(domain.parameter);
+    launchBaseline.push_back(builder.getNamedAttr(
+        definition.getName(), builder.getI64IntegerAttr(candidates.front())));
+    launchEndpoint.push_back(builder.getNamedAttr(
+        definition.getName(), builder.getI64IntegerAttr(candidates.back())));
   }
+
+  // Launch hints are correlated candidates, not another Cartesian search over
+  // every shared tile. Retain each declared value and the joint endpoint,
+  // including the lower compiler's inferred worker count.
+  SmallVector<SmallVector<NamedAttribute>> launchConfigurations{launchBaseline};
+  for (gpu::ParameterOp option : launchOptions) {
+    auto definition = option.getParameter();
+    for (int64_t candidate : definition.getCandidates().asArrayRef().drop_front()) {
+      auto bindings = launchBaseline;
+      for (NamedAttribute &binding : bindings)
+        if (binding.getName() == definition.getName())
+          binding = builder.getNamedAttr(
+              definition.getName(), builder.getI64IntegerAttr(candidate));
+      launchConfigurations.push_back(std::move(bindings));
+    }
+  }
+  if (!llvm::is_contained(launchConfigurations, launchEndpoint))
+    launchConfigurations.push_back(std::move(launchEndpoint));
+
+  SmallVector<SmallVector<NamedAttribute>> memoryConfigurations(1);
   for (gpu::ParameterOp option : {loadPolicy, accessForm}) {
     if (!option)
       continue;
     auto definition = option.getParameter();
     auto forms = definition.getCandidates().asArrayRef();
-    // Access form and load latency interact. Preserve their combinations and
-    // each occupancy setting at both core anchors without multiplying all
-    // worker/CTA settings by every memory option.
-    auto matchesCore = [&](ArrayRef<NamedAttribute> candidate,
-                           ArrayRef<NamedAttribute> anchor) {
-      NamedAttrList bindings(anchor);
-      return llvm::all_of(candidate, [&](NamedAttribute attribute) {
-        return attribute.getName().getValue() == occupancyParameter ||
-               (loadPolicy && attribute.getName() ==
-                                  loadPolicy.getParameter().getName()) ||
-               bindings.get(attribute.getName()) == attribute.getValue();
-      });
-    };
-    SmallVector<SmallVector<NamedAttribute>> anchors;
-    for (const auto &configuration : providerConfigurations)
-      if (matchesCore(configuration, providerConfigurations.front()) ||
-          matchesCore(configuration, providerConfigurations.back()))
-        anchors.push_back(configuration);
-    for (auto &configuration : providerConfigurations)
-      configuration.push_back(builder.getNamedAttr(
-          definition.getName(), builder.getI64IntegerAttr(forms.front())));
-    for (int64_t form : forms.drop_front())
-      for (const auto &anchor : anchors) {
-        auto configuration = anchor;
+    SmallVector<SmallVector<NamedAttribute>> expanded;
+    for (const auto &base : memoryConfigurations)
+      for (int64_t form : forms) {
+        auto configuration = base;
         configuration.push_back(builder.getNamedAttr(
             definition.getName(), builder.getI64IntegerAttr(form)));
-        if (!llvm::is_contained(providerConfigurations, configuration))
-          providerConfigurations.push_back(std::move(configuration));
+        expanded.push_back(std::move(configuration));
       }
+    memoryConfigurations = std::move(expanded);
   }
-  if (inferredWarps) {
-    // Preserve the lower compiler's default for the same memory options as
-    // explicit worker counts, including previously available gather forms.
-    auto inferredConfigurations = providerConfigurations;
-    for (auto configuration : inferredConfigurations) {
-      for (NamedAttribute &binding : configuration)
-        if (binding.getName() == inferredWarps.getParameter().getName())
-          binding = builder.getNamedAttr(
-              binding.getName(), builder.getI64IntegerAttr(inferredWorkerWarps));
-      if (!llvm::is_contained(providerConfigurations, configuration))
-        providerConfigurations.push_back(std::move(configuration));
-    }
+
+  SmallVector<SmallVector<NamedAttribute>> providerConfigurations;
+  for (auto configuration : launchConfigurations) {
+    configuration.append(memoryConfigurations.front());
+    providerConfigurations.push_back(std::move(configuration));
+  }
+  // Preserve access-form/load-latency interactions at the launch baseline.
+  for (const auto &memory : llvm::drop_begin(memoryConfigurations)) {
+    auto configuration = launchBaseline;
+    configuration.append(memory);
+    providerConfigurations.push_back(std::move(configuration));
   }
   SmallVector<SmallVector<NamedAttribute>> expanded;
   for (const auto &base : configurations)
