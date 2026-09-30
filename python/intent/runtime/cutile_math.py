@@ -110,10 +110,12 @@ def erf(x):
     wide = ct.astype(x, ct.float32)
     magnitude = ct.abs(wide)
     small = _erf_small(ct.minimum(magnitude, 0.84375))
-    near = _erf_near_one(ct.minimum(ct.maximum(magnitude, 0.84375), 1.25))
-    tail = _erfc_tail(ct.minimum(ct.maximum(magnitude, 1.25), 4.0))
-    value = ct.where(magnitude < 0.84375, small,
-                     ct.where(magnitude < 1.25, near, 1.0 - tail))
+    value = small
+    if ct.max(ct.astype(magnitude >= 0.84375, ct.int32)) != 0:
+        near = _erf_near_one(ct.minimum(ct.maximum(magnitude, 0.84375), 1.25))
+        tail = _erfc_tail(ct.minimum(ct.maximum(magnitude, 1.25), 4.0))
+        value = ct.where(magnitude < 0.84375, small,
+                         ct.where(magnitude < 1.25, near, 1.0 - tail))
     value = ct.where(magnitude >= 4.0, 1.0, value)
     value = ct.where(wide < 0.0, -value, value)
     value = ct.where((wide == 0.0) | ct.isnan(wide), wide, value)
@@ -255,28 +257,30 @@ def _lgamma_positive(x):
     small_log = ct.log(small_x)
     small = small + ct.where(shift, -small_log, 0.0)
 
-    middle_x = ct.minimum(ct.maximum(x, 2.0), 8.0)
-    y = middle_x - ct.floor(middle_x)
-    p = y * _horner(y, (3.1947532989e-05, 1.8402845599e-03, 2.6642270386e-02,
-                        1.4635047317e-01, 3.2577878237e-01, 2.1498242021e-01,
-                        -7.7215664089e-02))
-    q = _horner(y, (7.3266842264e-06, 7.7794247773e-04, 1.8645919859e-02,
-                    1.7193385959e-01, 7.2193557024e-01, 1.3920053244e+00, 1.0))
-    product = ct.full(x.shape, 1.0, dtype=x.dtype)
-    for offset in ct.static_iter((6, 5, 4, 3, 2)):
-        product = product * ct.where(middle_x >= offset + 1, y + offset, 1.0)
-    middle = 0.5 * y + p / q + ct.log(product)
+    value = small
+    if ct.max(ct.astype(x >= 2.0, ct.int32)) != 0:
+        middle_x = ct.minimum(ct.maximum(x, 2.0), 8.0)
+        y = middle_x - ct.floor(middle_x)
+        p = y * _horner(y, (3.1947532989e-05, 1.8402845599e-03, 2.6642270386e-02,
+                            1.4635047317e-01, 3.2577878237e-01, 2.1498242021e-01,
+                            -7.7215664089e-02))
+        q = _horner(y, (7.3266842264e-06, 7.7794247773e-04, 1.8645919859e-02,
+                        1.7193385959e-01, 7.2193557024e-01, 1.3920053244e+00, 1.0))
+        product = ct.full(x.shape, 1.0, dtype=x.dtype)
+        for offset in ct.static_iter((6, 5, 4, 3, 2)):
+            product = product * ct.where(middle_x >= offset + 1, y + offset, 1.0)
+        middle = 0.5 * y + p / q + ct.log(product)
 
-    large_x = ct.maximum(x, 8.0)
-    inverse = 1.0 / large_x
-    correction = 4.1893854737e-01 + inverse * _horner(inverse * inverse, (
-        -1.6309292987e-03, 8.3633989561e-04, -5.9518753551e-04,
-        7.9365057172e-04, -2.7777778450e-03, 8.3333335817e-02))
-    logarithm = ct.log(large_x) - 1.0
-    large = ct.where(large_x < 2.0 ** 58,
-                     (large_x - 0.5) * logarithm + correction,
-                     large_x * logarithm)
-    value = ct.where(x < 2.0, small, ct.where(x < 8.0, middle, large))
+        large_x = ct.maximum(x, 8.0)
+        inverse = 1.0 / large_x
+        correction = 4.1893854737e-01 + inverse * _horner(inverse * inverse, (
+            -1.6309292987e-03, 8.3633989561e-04, -5.9518753551e-04,
+            7.9365057172e-04, -2.7777778450e-03, 8.3333335817e-02))
+        logarithm = ct.log(large_x) - 1.0
+        large = ct.where(large_x < 2.0 ** 58,
+                         (large_x - 0.5) * logarithm + correction,
+                         large_x * logarithm)
+        value = ct.where(x < 2.0, small, ct.where(x < 8.0, middle, large))
     value = ct.where(x < 2.0 ** -21, -small_log, value)
     return ct.where((x == 1.0) | (x == 2.0), 0.0, value)
 
