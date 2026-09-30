@@ -74,6 +74,10 @@ DSA 的 [MatrixSupply.cpp](lib/Dialect/DSA/Transforms/MatrixSupply.cpp) 消费�
 
 [Canonical matcher](lib/Analysis/OnlineSummary.cpp) 的 `matchOnlineSummary` 和 [GPU matcher](lib/Dialect/GPU/Transforms/OnlineSummary.cpp) 的 `matchOnlineSummaryMerge` 共用这个核心，同时保留各自的四字段 summary 识别、axis/shape/cast 检查、候选枚举及 GPU physical schema 检查。扩展共同 combine 规则时从共享核心开始；调整 fragment 投影时改 GPU 适配层。CPU 当前没有接入这个 matcher，不能把这项复用描述成所有 family 已共用。
 
+[IntegerRelations.h](include/Intent/Analysis/IntegerRelations.h) 的 `foldIntegerDifference` 复用 `UniformExpression` 描述，只读折叠加减、常数乘法及等宽整数/index cast 的变化系数。[CPU VectorizeLoops](lib/Dialect/CPU/Transforms/VectorizeLoops.cpp) 用它判断循环坐标差值，再检查连续 stride、别名与依赖；[DSA CollectiveGather](lib/Dialect/DSA/Transforms/CollectiveGather.cpp) 用它判断四个参与者之间的地址差值，保留自己的 task 商余关系、只读视图、局部 buffer 写入和控制一致性证明。CPU 的这个 vectorizer 当前由 Mojo legalization 调用，共享 CPU family 不意味着所有 provider 都调用它。
+
+该核心只接受 i64 或调用方明确绑定为 64 位的 index；两个适配层依据 Intent 的逻辑 index 合同传入位宽，不假定任意 MLIR index 都是 64 位。值运算仍遵守模整数语义，系数的加减乘另外检查是否能用 `int64_t` 表示；失败返回 `Unknown`，不能当作系数零。窄整数回绕后的扩宽需要独立范围证明，地址有效性、memory effects 与拓扑也不由系数证明。GPU 的按位宽模运算规范化和 source-axis 关系分析有不同合同，不应仅因都有 Add/Mul 就接到这一接口。
+
 公开的 transformation 入口必须完成自身改写所需的 relation closure，使调用方得到满足 postcondition 的 current program。中间 repair helper 不因可以被调用就成为独立 pass；pipeline 负责次序，不应成为调用者必须记忆的隐式修复配方。
 
 例如，[realizeRegionFolds / realizeRegionScans](lib/Dialect/GPU/Transforms/RealizeRegionFold.cpp) 在完成 region 改写后，自身调用 [closeValueRelations](lib/Dialect/GPU/Transforms/ValueRelations.cpp)，通过工作队列闭合受影响的 value/access/aggregate 关系。这两个 region 阶段在 [GPU pipeline](lib/Dialect/GPU/Transforms/Passes.cpp) 中只调度完整入口，随后验证 postcondition。调用者不需要再附加一串 repair 调用；这也不要求 CPU 使用相同的关系维护方式。
@@ -87,6 +91,7 @@ DSA 的 [MatrixSupply.cpp](lib/Dialect/DSA/Transforms/MatrixSupply.cpp) 消费�
 | 当前 value/access 的坐标、范围和复用事实 | [Analysis/PhysicalProgram.h](include/Intent/Dialect/GPU/Analysis/PhysicalProgram.h) | 只读 current IR；相关 def-use、类型或范围改变后重算 |
 | scalar/fragment schema与投影轴 | [Analysis/ValueSchema.h](include/Intent/Dialect/GPU/Analysis/ValueSchema.h) | 只读查询当前类型与轴关系，不创建值、不选择 blocking |
 | 物理整数表达式求值 | [Analysis/UniformValues.h](include/Intent/Dialect/GPU/Analysis/UniformValues.h) | `evaluatePhysicalExpression` 接受 symbolic-leaf binding；算术和溢出检查共用一份实现 |
+| range/loop 中的整数比较与完整 tile 界限 | [Analysis/IndexPredicates.h](include/Intent/Dialect/GPU/Analysis/IndexPredicates.h) | `proveRangeComparison`、`queryCompleteTileLimit` 与 `queryIndexComparisonBound` 只读当前范围；区分已证明的真值、条件蕴含和未知 |
 | 参数声明与完整候选绑定检查 | [Analysis/PhysicalParameters.h](include/Intent/Dialect/GPU/Analysis/PhysicalParameters.h) | `PhysicalParameterSpace::read` 建只读快照；改变声明后重读；候选仍保存在 IR |
 | fragment 结构资源估计 | [Analysis/Resources.h](include/Intent/Dialect/GPU/Analysis/Resources.h) | `FragmentResourceAnalysis` 缓存稳定 IR 的类型与参数使用关系；类型或 IR 改写后重建。估计不代替下层布局、寄存器分配和 occupancy |
 | specialization 后才能判定的资源约束 | [Transforms/Resources.h](include/Intent/Dialect/GPU/Transforms/Resources.h) | 将 deferred reduction bounds 写成当前 IR 的断言，供 Triton/cuTile 兑现；不是 analysis 中的隐藏改写 |
@@ -98,6 +103,19 @@ DSA 的 [MatrixSupply.cpp](lib/Dialect/DSA/Transforms/MatrixSupply.cpp) 消费�
 收缩计算的完整入口在 [RealizeContractionBlocking.cpp](lib/Dialect/GPU/Transforms/RealizeContractionBlocking.cpp)。同目录下 `ContractionSources` 负责合法的 source 规范化，`ContractionAnalysis` 负责轴与范围查询，`ContractionValues` 负责 replay，`ContractionProjection` 负责结果关系，`ContractionTraversal` 与 `ContractionBlocking` 形成具体循环与 ownership。普通与 scaled contraction 共用能成立的判定和构造机制，各自的 dtype、scale 与 packing 条件留在相应实现。Provider 只通过 [Contraction.h](include/Intent/Dialect/GPU/Transforms/Contraction.h) 调用必要的形状规范化与查询，不接管 shared blocking。
 
 [ContractionTraversal](lib/Dialect/GPU/Transforms/ContractionTraversal.cpp) 保留完整 retained result 的原始 contraction：完整物理 extent 属于已有 tile 候选域且不超过所选 tile，reduction 也已具备原生执行条件时，直接使用原 shape、读快照和 accumulator，避免分片与拼回；其它情况保留分片与 padding 路径。这是 current IR 的完整分支，不由 serializer 根据运行时 shape 猜测。
+
+Pointwise 的两个完整入口也在同一 driver 文件 [RealizePointwiseBlocking.cpp](lib/Dialect/GPU/Transforms/RealizePointwiseBlocking.cpp)：`realizePointwiseOwnership` 形成 ownership 与 program mapping；`realizePointwiseBlocking` 在已有 mapping 上形成局部 blocking、写回和复用 traversal。两者有各自明确的依赖次序，通过相邻私有头 [Pointwise.h](lib/Dialect/GPU/Transforms/Pointwise.h) 使用以下机制：
+
+| 私有模块 | 修改入口与职责 |
+|---|---|
+| [PointwiseAnalysis.cpp](lib/Dialect/GPU/Transforms/PointwiseAnalysis.cpp) | 查询 source-axis、结构化范围用途、写入 effect 与现有 mapping 坐标；同一个 dimension 不自动代表同一个 Cartesian occurrence |
+| [PointwiseCoverage.cpp](lib/Dialect/GPU/Transforms/PointwiseCoverage.cpp) | 兑现 scan/reduction 的完整 coverage，形成固定或局部范围、tail validity，保留不能安全 replay 的 gather source，并完成值关系闭合 |
+| [PointwiseOwnership.cpp](lib/Dialect/GPU/Transforms/PointwiseOwnership.cpp) | 提升 workset，处理 axis occurrence 与 ownership 依赖，选择 ownership 并写入 program mapping |
+| [PointwiseTraversal.cpp](lib/Dialect/GPU/Transforms/PointwiseTraversal.cpp) | 重放合法 value graph，选择并形成写回/复用 traversal，兑现已确定 ownership 的 histogram |
+
+`PointwiseRewrite` 只保存一次完整变换期间的工作状态；driver 在相关改写后重新读取 current-IR facts，执行决定写入当前 IR，不跨两个入口保留第二份 plan。新增局部机制放入对应私有模块；需要多个 GPU 变换复用的只读关系才进入公开 Analysis。
+
+[SimplifyRangePredicates.cpp](lib/Dialect/GPU/Transforms/SimplifyRangePredicates.cpp) 是 `IndexPredicates` 的改写消费者：全体物理 lane 上已证明的比较可替换为布尔常量；只有条件蕴含时，写入 specialization guard 与原谓词的逻辑或，未满足 guard 时仍保留原判定。它不把未证明的 shape 关系变成输入要求，也不负责 provider 的 native-load 分支或 MMA 循环组织。
 
 新增一个 physical rewrite 时，先确定它读取的 current-IR facts，从上表选择查询或 materialization 接口；将 rewrite 和必要 relation closure 放进一个完整入口；在 family pipeline 中安排依赖位置与 postcondition 验证。新增只读查询应放 Analysis，只有本模块用的算法细节留在相邻私有实现，不扩大 Passes.h。CPU 或 DSA 的类似优化先复用它们自己的 analysis 和 storage/control 合同，只有与执行拓扑无关的规则才上提到公共 Analysis。
 
