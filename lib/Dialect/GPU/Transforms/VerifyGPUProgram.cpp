@@ -188,18 +188,6 @@ LogicalResult verifyBufferResources(func::FuncOp kernel,
 
 } // namespace
 
-FailureOr<func::FuncOp> getPhysicalKernel(ModuleOp module) {
-  SmallVector<func::FuncOp> kernels;
-  for (func::FuncOp function : module.getOps<func::FuncOp>())
-    if (function->hasAttr(kernelAttr))
-      kernels.push_back(function);
-  if (kernels.size() != 1) {
-    module.emitError("shared GPU module requires exactly one physical kernel");
-    return failure();
-  }
-  return kernels.front();
-}
-
 LogicalResult verifyGPUProgram(ModuleOp module) {
   if (failed(mlir::verify(module.getOperation())))
     return failure();

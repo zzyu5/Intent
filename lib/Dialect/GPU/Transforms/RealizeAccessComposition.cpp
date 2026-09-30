@@ -1,3 +1,7 @@
+#include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
+#include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
+#include "Intent/Dialect/GPU/Transforms/Traversal.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
@@ -500,7 +504,7 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
         auto resultSchema = FragmentType::get(
             result.getContext(), element, result.getShape(), result.getAxisMaps(),
             result.getValidity(), result.getOwner());
-        auto projected = materializeBroadcastToFragment(
+        auto projected = projectPhysicalValueToSchema(
             builder, select.getLoc(), value, resultSchema);
         if (failed(projected))
           return failure();
@@ -513,7 +517,7 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
         auto resultSchema = FragmentType::get(
             result.getContext(), element, result.getShape(), result.getAxisMaps(),
             result.getValidity(), result.getOwner());
-        auto projected = materializeBroadcastToFragment(
+        auto projected = projectPhysicalValueToSchema(
             builder, select.getLoc(), value, resultSchema);
         if (failed(projected))
           return failure();
@@ -526,7 +530,7 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
         value = builder.create<ReshapeOp>(
             select.getLoc(), sourceSchema, *projected, builder.getArrayAttr(inverse));
       } else {
-        auto projected = materializeBroadcastToFragment(
+        auto projected = projectPhysicalValueToSchema(
             builder, select.getLoc(), value, sourceSchema);
         if (failed(projected))
           return failure();
@@ -558,7 +562,7 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
     return failure();
   }
   if (fill.getType() != loadedType) {
-    FailureOr<Value> projected = materializeBroadcastToFragment(
+    FailureOr<Value> projected = projectPhysicalValueToSchema(
         builder, select.getLoc(), fill, loadedType);
     if (failed(projected)) {
       select.emitOpError(
@@ -568,7 +572,7 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
     fill = *projected;
   }
   if (load.getValid() && !sameUniformValue(load.getFill(), fill)) {
-    auto sourceFill = materializeBroadcastToFragment(
+    auto sourceFill = projectPhysicalValueToSchema(
         builder, select.getLoc(), load.getFill(), loadedType);
     auto predicate = combinePredicates(
         builder, select.getLoc(), loadedType, Value(), *condition);
@@ -2300,7 +2304,7 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
       auto expandedType = FragmentType::get(
           source.getContext(), fragment.getElementType(), source.getShape(),
           source.getAxisMaps(), source.getValidity(), source.getOwner());
-      auto expanded = materializeBroadcastToFragment(
+      auto expanded = projectPhysicalValueToSchema(
           builder, reshape.getLoc(), value, expandedType);
       if (failed(expanded))
         return failure();

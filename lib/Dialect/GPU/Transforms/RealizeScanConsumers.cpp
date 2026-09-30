@@ -1,3 +1,10 @@
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
+#include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
+#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Transforms/Predication.h"
+#include "Intent/Dialect/GPU/Transforms/Storage.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"

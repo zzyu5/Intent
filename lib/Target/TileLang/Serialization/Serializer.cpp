@@ -1,3 +1,4 @@
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Target/TileLang/Serialization/Serializer.h"
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"

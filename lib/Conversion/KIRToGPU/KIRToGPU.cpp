@@ -1,3 +1,6 @@
+#include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
+#include "Intent/Dialect/GPU/Transforms/Traversal.h"
 #include "Intent/Conversion/KIRToGPU/KIRToGPU.h"
 
 #include "Intent/Analysis/CanonicalKernel.h"

@@ -1,3 +1,5 @@
+#include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"

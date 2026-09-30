@@ -1,5 +1,6 @@
 add_mlir_library(MLIRIntentCuTileTransforms
   Legalize.cpp
+  Configurations.cpp
   CollapseArrayViews.cpp
   RefineMMALoops.cpp
 

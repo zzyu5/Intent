@@ -1,3 +1,9 @@
+#include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
+#include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
+#include "Intent/Dialect/GPU/Transforms/Traversal.h"
+#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Transforms/Storage.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
@@ -2677,10 +2683,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
             "runtime reduction result still has an unphysicalized free axis");
 
   MakeRangeOp firstRange = traversalRanges.front();
-  FailureOr<Value> firstEnd = resolveLogicalRangeEnd(kernel, firstRange);
-  if (failed(firstEnd))
-    return reduce.emitOpError(
-        "runtime reduction source range has no exact logical end");
+  Value firstEnd = firstRange.getLogicalStop();
   // Components are paired by the reduce axes, not by allocation provenance.
   // Keep each source identity while proving their actual traversals coincide.
   if (!PhysicalProgramAnalysis(kernel).lockstepRanges(traversalRanges).isExact()) {
@@ -2692,9 +2695,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
     return failure();
   }
   for (MakeRangeOp range : traversalRanges) {
-    FailureOr<Value> end = resolveLogicalRangeEnd(kernel, range);
-    if (failed(end) ||
-        !samePhysicalScalarExpression(*firstEnd, *end))
+    Value end = range.getLogicalStop();
+    if (!samePhysicalScalarExpression(firstEnd, end))
       return reduce.emitOpError(
           "runtime reduction components require one lockstep logical range");
   }
@@ -2778,7 +2780,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
       static_cast<uint32_t>(PhysicalExprKind::Parameter))
     chunkSize = builder.create<PhysicalExprOp>(
         location, builder.getIndexType(), chunkExtent);
-  Value stop = *firstEnd;
+  Value stop = firstEnd;
   SmallVector<Value> identities(
       reduce.getInputs()
           .slice(reduce.getSourceCount(), reduce.getIdentityCount())
@@ -3051,7 +3053,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
               auto coordinateType =
                   dyn_cast<FragmentType>(coordinate.getType());
               if (coordinateType && coordinateAxis) {
-                FailureOr<Value> projected = materializeBroadcastToFragment(
+                FailureOr<Value> projected = projectPhysicalValueToSchema(
                     nested, nestedLocation, coordinate,
                     replaceExtent(coordinateType, *coordinateAxis,
                                   chunkExtent));

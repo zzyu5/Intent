@@ -1,3 +1,7 @@
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
+#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -1385,57 +1389,6 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
   return success();
 }
 
-PhysicalExprAttr fragmentRegisterFootprint(FragmentType fragment) {
-  Type element = fragment.getElementType();
-  unsigned bits = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
-  MLIRContext *context = fragment.getContext();
-  auto footprint = PhysicalExprAttr::get(
-      context, static_cast<uint32_t>(PhysicalExprKind::Constant),
-      std::max(1u, (bits + 31) / 32), StringAttr::get(context, ""),
-      ArrayAttr::get(context, {}));
-  for (Attribute extent : fragment.getShape())
-    footprint = PhysicalExprAttr::get(
-        context, static_cast<uint32_t>(PhysicalExprKind::Multiply), 0,
-        StringAttr::get(context, ""), ArrayAttr::get(context, {footprint, extent}));
-  return footprint;
-}
-
-PhysicalExprAttr reductionRegisterFootprint(ValueRange sources,
-                                           func::FuncOp kernel) {
-  std::function<bool(PhysicalExprAttr)> isTunableExtent =
-      [&](PhysicalExprAttr extent) {
-    if (static_cast<PhysicalExprKind>(extent.getKind()) ==
-        PhysicalExprKind::Parameter) {
-      auto parameter = queryParameterBySymbol(kernel, extent.getSymbol());
-      if (failed(parameter))
-        return false;
-      auto role = static_cast<ParameterRole>(parameter->getParameter().getRole());
-      return role == ParameterRole::OwnershipM ||
-             role == ParameterRole::OwnershipN ||
-             role == ParameterRole::Reduction ||
-             role == ParameterRole::ReductionOuter ||
-             role == ParameterRole::ReductionInner;
-    }
-    return llvm::any_of(extent.getOperands(), [&](Attribute operand) {
-      return isTunableExtent(cast<PhysicalExprAttr>(operand));
-    });
-  };
-  PhysicalExprAttr registers;
-  for (Value source : sources) {
-    auto fragment = dyn_cast<FragmentType>(source.getType());
-    if (!fragment || !llvm::any_of(fragment.getShape(), [&](Attribute extent) {
-          return isTunableExtent(cast<PhysicalExprAttr>(extent));
-        }))
-      continue;
-    auto footprint = fragmentRegisterFootprint(fragment);
-    registers = !registers ? footprint : PhysicalExprAttr::get(
-        kernel.getContext(), static_cast<uint32_t>(PhysicalExprKind::Add), 0,
-        StringAttr::get(kernel.getContext(), ""),
-        ArrayAttr::get(kernel.getContext(), {registers, footprint}));
-  }
-  return registers;
-}
-
 void materializeDeferredReductionBounds(
     func::FuncOp kernel, ArrayRef<ValueRange> sourceGroups) {
   auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
@@ -1484,41 +1437,23 @@ LogicalResult verifySharedConfigTuples(func::FuncOp kernel) {
   if (!tuples || tuples.empty())
     return kernel.emitError(
         "shared physical program requires complete config tuples");
-  llvm::StringMap<ParameterOp> parameters;
-  bool missingCoverageBound = false;
-  kernel.walk([&](ParameterOp parameter) {
-    if (parameter->hasAttr(coverageDimensionAttr) &&
-        !parameter->getAttrOfType<PhysicalExprAttr>(coverageBoundAttr)) {
-      parameter.emitOpError(
-          "full-coverage parameter requires a typed bound expression");
-      missingCoverageBound = true;
-    }
-    if (isSharedStaticParameter(parameter))
-      parameters.try_emplace(parameter.getParameter().getName().getValue(),
-                             parameter);
-  });
-  if (missingCoverageBound)
+  auto space = PhysicalParameterSpace::read(kernel);
+  if (failed(space))
     return failure();
+  for (const PhysicalParameterDomain &domain : space->domains()) {
+    ParameterOp parameter = domain.operation;
+    if (parameter->hasAttr(coverageDimensionAttr) &&
+        !parameter->getAttrOfType<PhysicalExprAttr>(coverageBoundAttr))
+      return parameter.emitOpError(
+          "full-coverage parameter requires a typed bound expression");
+  }
   llvm::SmallDenseSet<Attribute, 8> unique;
   for (Attribute attribute : tuples) {
     auto tuple = dyn_cast<DictionaryAttr>(attribute);
-    if (!tuple || tuple.size() != parameters.size())
-      return kernel.emitError(
-          "shared config tuple does not bind every static physical parameter");
+    if (failed(space->verifyBindings(tuple, ParameterBindingScope::Shared)))
+      return failure();
     if (!unique.insert(attribute).second)
       return kernel.emitError("shared config tuple is duplicated");
-    for (NamedAttribute binding : tuple) {
-      auto found = parameters.find(binding.getName().getValue());
-      auto value = dyn_cast<IntegerAttr>(binding.getValue());
-      if (found == parameters.end() || !value || value.getInt() <= 0)
-        return kernel.emitError(
-            "shared config tuple has an unknown or invalid binding");
-      ArrayRef<int64_t> candidates =
-          found->second.getParameter().getCandidates().asArrayRef();
-      if (!llvm::is_contained(candidates, value.getInt()))
-        return found->second.emitOpError(
-            "shared config tuple value is outside the typed domain");
-    }
   }
   return success();
 }

@@ -1,3 +1,11 @@
+#include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
+#include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
+#include "Intent/Dialect/GPU/Transforms/Traversal.h"
+#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Transforms/Predication.h"
+#include "Intent/Dialect/GPU/Transforms/Storage.h"
+#include "Intent/Dialect/GPU/Transforms/Contraction.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
@@ -742,7 +750,7 @@ FailureOr<Value> accessValidity(OpBuilder &builder, Location location,
   Value result;
   if (existing) {
     FailureOr<Value> broadcast =
-        materializeBroadcastToFragment(builder, location, existing, target);
+        projectPhysicalValueToSchema(builder, location, existing, target);
     if (failed(broadcast))
       return emitError(location, "pointwise access existing validity has incompatible schema")
              << "; predicate=" << existing.getType() << "; target=" << target;
@@ -920,7 +928,7 @@ LogicalResult addTailValidity(func::FuncOp kernel,
     Value fill;
     if (load.getFill()) {
       FailureOr<Value> broadcast =
-          materializeBroadcastToFragment(builder, load.getLoc(), load.getFill(), valueType);
+          projectPhysicalValueToSchema(builder, load.getLoc(), load.getFill(), valueType);
       if (failed(broadcast))
         return load.emitOpError("could not broadcast the existing load fill");
       fill = *broadcast;
@@ -946,7 +954,7 @@ LogicalResult addTailValidity(func::FuncOp kernel,
           "pointwise blocked histogram must consume a physical fragment");
     FragmentType validType = predicateType(valueType);
     OpBuilder builder(histogram);
-    FailureOr<Value> existing = materializeBroadcastToFragment(
+    FailureOr<Value> existing = projectPhysicalValueToSchema(
         builder, histogram.getLoc(), histogram.getValid(), validType);
     if (failed(existing))
       return histogram.emitOpError(
@@ -966,7 +974,7 @@ LogicalResult addTailValidity(func::FuncOp kernel,
       if (!ranges.contains(range.getOperation()))
         continue;
       FailureOr<Value> broadcast =
-          materializeBroadcastToFragment(builder, histogram.getLoc(), predicate, validType);
+          projectPhysicalValueToSchema(builder, histogram.getLoc(), predicate, validType);
       if (failed(broadcast))
         return histogram.emitOpError(
             "could not project pointwise tail validity onto histogram values");
@@ -1697,14 +1705,14 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
         ? projectPredicateToFragmentAxis(builder, producer->getLoc(),
                                          blockedValidity, resultType,
                                          axes.front().fragmentAxis)
-        : materializeBroadcastToFragment(builder, producer->getLoc(),
+        : projectPhysicalValueToSchema(builder, producer->getLoc(),
                                           blockedValidity, predicateType(resultType));
     if (failed(projected))
       return producer->emitOpError("pointwise tile validity lost its access-axis projection");
     if (!valid)
       return *projected;
     FailureOr<Value> original =
-        materializeBroadcastToFragment(builder, producer->getLoc(), valid, predicateType(resultType));
+        projectPhysicalValueToSchema(builder, producer->getLoc(), valid, predicateType(resultType));
     if (failed(original))
       return failure();
     return Value(builder.create<BinaryOp>(producer->getLoc(),
@@ -1762,7 +1770,7 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
              mapped(reshape.getValue()) == reshape.getValue()) {
     if (!resultType)
       return failure();
-    FailureOr<Value> projected = materializeBroadcastToFragment(
+    FailureOr<Value> projected = projectPhysicalValueToSchema(
         builder, producer->getLoc(), value, resultType);
     if (failed(projected))
       return producer->emitOpError("retained reshape cannot adopt the pointwise tile")
@@ -2477,7 +2485,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
             payload = *projected;
             payloadType = *schema;
           }
-          FailureOr<Value> valid = materializeBroadcastToFragment(nested, location, tail,
+          FailureOr<Value> valid = projectPhysicalValueToSchema(nested, location, tail,
                                                predicateType(payloadType));
           if (failed(valid)) {
             bodyFailed = true;
@@ -2495,7 +2503,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
               failureReason = "write validity cannot be replayed in the tile loop";
               return;
             }
-            FailureOr<Value> projected = materializeBroadcastToFragment(
+            FailureOr<Value> projected = projectPhysicalValueToSchema(
                 nested, location, *existing, predicateType(payloadType));
             if (failed(projected)) {
               bodyFailed = true;
@@ -2791,10 +2799,10 @@ LogicalResult realizeOwnedHistograms(func::FuncOp kernel) {
             return;
           }
           FragmentType predicate = predicateType(blockedValuesType);
-          FailureOr<Value> projectedValid = materializeBroadcastToFragment(
+          FailureOr<Value> projectedValid = projectPhysicalValueToSchema(
               nested, location, *valid, predicate);
           FailureOr<Value> projectedTail =
-              materializeBroadcastToFragment(nested, location, tail, predicate);
+              projectPhysicalValueToSchema(nested, location, tail, predicate);
           if (failed(projectedValid) || failed(projectedTail)) {
             bodyFailed = true;
             failureReason =
@@ -2813,9 +2821,9 @@ LogicalResult realizeOwnedHistograms(func::FuncOp kernel) {
               location, inputElement, outputOffset);
           Value typedEnd =
               nested.create<CastOp>(location, inputElement, outputEnd);
-          FailureOr<Value> start = materializeBroadcastToFragment(
+          FailureOr<Value> start = projectPhysicalValueToSchema(
               nested, location, typedStart, blockedValuesType);
-          FailureOr<Value> end = materializeBroadcastToFragment(
+          FailureOr<Value> end = projectPhysicalValueToSchema(
               nested, location, typedEnd, blockedValuesType);
           if (failed(start) || failed(end)) {
             bodyFailed = true;
@@ -2858,213 +2866,6 @@ LogicalResult realizeOwnedHistograms(func::FuncOp kernel) {
   }
   eraseDeadPhysicalValues(kernel);
   return success();
-}
-
-LogicalResult alignContractAccumulatorTypes(func::FuncOp kernel) {
-  auto align = [](Operation *owner, OpOperand &accumulatorOperand, Value result,
-                  bool &changed) -> LogicalResult {
-    Value accumulator = accumulatorOperand.get();
-    if (accumulator.getType() == result.getType())
-      return success();
-    changed = true;
-    auto source = dyn_cast<FragmentType>(accumulator.getType());
-    auto target = dyn_cast<FragmentType>(result.getType());
-    if (!source || !target || source.getElementType() != target.getElementType() ||
-        source.getOwner() != target.getOwner())
-      return owner->emitOpError(
-          "pointwise ownership cannot preserve the contract accumulator relation");
-    if (isLiteralZeroProjection(accumulator)) {
-      OpBuilder builder(owner);
-      auto projected = projectPhysicalValueToSchema(
-          builder, owner->getLoc(), accumulator, target);
-      if (failed(projected))
-        return owner->emitOpError("contract zero accumulator cannot adopt its result schema");
-      accumulatorOperand.set(*projected);
-      return success();
-    }
-    if (source.getAxisMaps() != target.getAxisMaps())
-      return owner->emitOpError(
-          "pointwise ownership cannot preserve the contract accumulator relation");
-    auto isUnit = [](Attribute attribute) {
-      auto expression = cast<PhysicalExprAttr>(attribute);
-      return expression.getKind() ==
-                 static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-             expression.getValue() == 1;
-    };
-    SmallVector<Attribute> shape(target.getShape().begin(),
-                                 target.getShape().end());
-    for (unsigned axis = 0; axis < shape.size(); ++axis) {
-      if (source.getShape()[axis] == target.getShape()[axis])
-        continue;
-      bool sourceUnit = isUnit(source.getShape()[axis]);
-      bool targetUnit = isUnit(target.getShape()[axis]);
-      if (sourceUnit == targetUnit)
-        return owner->emitOpError(
-            "pointwise ownership found two non-equivalent contract extents");
-      if (targetUnit)
-        shape[axis] = source.getShape()[axis];
-    }
-    auto aligned = FragmentType::get(
-        target.getContext(), target.getElementType(),
-        ArrayAttr::get(target.getContext(), shape), target.getAxisMaps(),
-        target.getValidity(), target.getOwner());
-    for (auto [axis, mapping] : llvm::enumerate(aligned.getAxisMaps())) {
-      if (source.getShape()[axis] == aligned.getShape()[axis] &&
-          target.getShape()[axis] == aligned.getShape()[axis])
-        continue;
-      int64_t dimension = cast<AxisMapAttr>(mapping).getDimensionId();
-      if (dimension <= 0)
-        return owner->emitOpError(
-            "contract accumulator alignment has no dimension authority");
-      retargetDimensionExtent(
-          result, dimension,
-          cast<PhysicalExprAttr>(aligned.getShape()[axis]));
-      retargetDimensionExtent(
-          accumulator, dimension,
-          cast<PhysicalExprAttr>(aligned.getShape()[axis]));
-    }
-    accumulator.setType(aligned);
-    result.setType(aligned);
-    return success();
-  };
-  bool changed;
-  do {
-    changed = false;
-    WalkResult result = kernel.walk([&](Operation *operation) {
-      OpOperand *accumulator;
-      Value output;
-      if (auto contract = dyn_cast<ContractOp>(operation)) {
-        accumulator = &contract.getAccumulatorMutable();
-        output = contract.getResult();
-      } else if (auto contract = dyn_cast<ScaledContractOp>(operation)) {
-        accumulator = &contract.getAccumulatorMutable();
-        output = contract.getResult();
-      } else if (auto contract = dyn_cast<SparseContractOp>(operation)) {
-        accumulator = &contract.getAccumulatorMutable();
-        output = contract.getResult();
-      } else {
-        return WalkResult::advance();
-      }
-      return failed(align(operation, *accumulator, output, changed))
-                 ? WalkResult::interrupt()
-                 : WalkResult::advance();
-    });
-    if (result.wasInterrupted())
-      return failure();
-  } while (changed);
-  return success();
-}
-
-LogicalResult alignOrdinaryContractOperandTypes(func::FuncOp kernel) {
-  auto isUnit = [](Attribute attribute) {
-    auto extent = cast<PhysicalExprAttr>(attribute);
-    return extent.getKind() ==
-               static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-           extent.getValue() == 1;
-  };
-  auto isUniformBatch = [&](Value value, unsigned axis) {
-    auto broadcast = value.getDefiningOp<BroadcastOp>();
-    auto source = broadcast
-                      ? dyn_cast<FragmentType>(broadcast.getValue().getType())
-                      : FragmentType();
-    auto target = cast<FragmentType>(value.getType());
-    if (!source)
-      return false;
-    auto projection = queryBroadcastProjection(source, target);
-    auto mapping = cast<AxisMapAttr>(target.getAxisMaps()[axis]);
-    if (!projection.isExact() || projection.targetToSource[axis] ||
-        queryFragmentAxes(target, sourceAxisIdentity(mapping)).size() != 1)
-      return false;
-    auto ranges = PhysicalProgramAnalysis(kernel).axisRanges(value, axis);
-    return ranges.isExact() && ranges.roots.empty() && ranges.blockers.empty();
-  };
-  auto batchExtentAuthority = [&](Value value, AxisMapAttr mapping) {
-    Value authority = value;
-    while (Operation *operation = authority.getDefiningOp()) {
-      if (!isa<ReshapeOp, TransposeOp>(operation))
-        break;
-      Value source = operation->getOperand(0);
-      if (!queryFragmentAxis(source.getType(), sourceAxisIdentity(mapping),
-                             mapping.getDimensionId()).isExact())
-        return value;
-      authority = source;
-    }
-    auto load = authority.getDefiningOp<LoadOp>();
-    if (!load)
-      return value;
-    PhysicalProgramAnalysis analysis(kernel);
-    for (Value dependency : load->getOperands()) {
-      if (dependency == load.getResource() ||
-          !isa<FragmentType>(dependency.getType()))
-        continue;
-      if (queryFragmentAxes(dependency.getType(),
-                            sourceAxisIdentity(mapping)).empty())
-        continue;
-      auto axis = queryFragmentAxis(dependency.getType(),
-                                    sourceAxisIdentity(mapping),
-                                    mapping.getDimensionId());
-      if (!axis.isExact())
-        return value;
-      auto ranges = analysis.axisRanges(dependency, axis.fragmentAxis);
-      if (!ranges.isExact() || !ranges.roots.empty() || !ranges.blockers.empty())
-        return value;
-    }
-    return authority;
-  };
-  WalkResult result = kernel.walk([&](ContractOp contract) {
-    auto alignPairs = [&](Value lhs, Value rhs, ArrayRef<int64_t> lhsAxes,
-                          ArrayRef<int64_t> rhsAxes, bool batch) -> LogicalResult {
-      if (lhsAxes.size() != rhsAxes.size())
-        return failure();
-      for (auto [lhsAxis, rhsAxis] : llvm::zip(lhsAxes, rhsAxes)) {
-        auto lhsType = cast<FragmentType>(lhs.getType());
-        auto rhsType = cast<FragmentType>(rhs.getType());
-        if (lhsAxis < 0 || rhsAxis < 0 ||
-            lhsAxis >= static_cast<int64_t>(lhsType.getShape().size()) ||
-            rhsAxis >= static_cast<int64_t>(rhsType.getShape().size()))
-          return failure();
-        Attribute lhsExtent = lhsType.getShape()[lhsAxis];
-        Attribute rhsExtent = rhsType.getShape()[rhsAxis];
-        if (lhsExtent == rhsExtent)
-          continue;
-        bool lhsUnit = isUnit(lhsExtent);
-        bool rhsUnit = isUnit(rhsExtent);
-        bool rebindLhs = lhsUnit;
-        bool lhsUniform = batch && isUniformBatch(lhs, lhsAxis);
-        bool rhsUniform = batch && isUniformBatch(rhs, rhsAxis);
-        if (lhsUnit == rhsUnit && lhsUniform == rhsUniform)
-          return contract.emitOpError(
-                     "ordinary contract paired axes have conflicting physical extents")
-                 << "; lhs_axis=" << lhsAxis << "; lhs_extent=" << lhsExtent
-                 << "; rhs_axis=" << rhsAxis << "; rhs_extent=" << rhsExtent;
-        if (lhsUnit == rhsUnit)
-          rebindLhs = lhsUniform;
-        if (rebindLhs) {
-          auto mapping = cast<AxisMapAttr>(lhsType.getAxisMaps()[lhsAxis]);
-          Value authority = batch ? batchExtentAuthority(lhs, mapping) : lhs;
-          retargetSourceExtent(authority, sourceAxisIdentity(mapping),
-                               cast<PhysicalExprAttr>(rhsExtent),
-                               mapping.getDimensionId());
-        } else {
-          auto mapping = cast<AxisMapAttr>(rhsType.getAxisMaps()[rhsAxis]);
-          Value authority = batch ? batchExtentAuthority(rhs, mapping) : rhs;
-          retargetSourceExtent(authority, sourceAxisIdentity(mapping),
-                               cast<PhysicalExprAttr>(lhsExtent),
-                               mapping.getDimensionId());
-        }
-      }
-      return success();
-    };
-    if (failed(alignPairs(contract.getLhs(), contract.getRhs(),
-                          contract.getLhsReductionAxes(),
-                          contract.getRhsReductionAxes(), false)) ||
-        failed(alignPairs(contract.getLhs(), contract.getRhs(),
-                          contract.getLhsBatchAxes(),
-                          contract.getRhsBatchAxes(), true)))
-      return WalkResult::interrupt();
-    return WalkResult::advance();
-  });
-  return result.wasInterrupted() ? failure() : success();
 }
 
 bool isCartesianPointwiseValueOp(Operation *operation) {
@@ -4281,13 +4082,6 @@ unsigned contractFreeAxisSides(func::FuncOp kernel, MakeRangeOp range) {
 
 } // namespace
 
-LogicalResult alignContractValueRelations(func::FuncOp kernel) {
-  if (failed(alignOrdinaryContractOperandTypes(kernel)) ||
-      failed(alignContractAccumulatorTypes(kernel)))
-    return failure();
-  return success();
-}
-
 static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                                                    bool ownershipOnly) {
   FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);
@@ -4344,7 +4138,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           continue;
         OpBuilder builder(gather);
         auto type = cast<FragmentType>(coordinate.getType());
-        auto start = materializeBroadcastToFragment(builder, gather.getLoc(),
+        auto start = projectPhysicalValueToSchema(builder, gather.getLoc(),
                                                     range.getStart(), type);
         if (failed(start))
           return WalkResult::interrupt();
@@ -4508,7 +4302,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           "failed to rank-lift a legal pointwise ownership graph");
     // Newly explicit free axes must reach the existing contraction recognizer
     // before ownership freezes any axis to scalar grid execution.
-    if (!lifted.empty() && failed(fuseMultiplyReductions(module)))
+    if (!lifted.empty() && failed(contraction::fuseMultiplyReductions(module)))
       return failure();
   }
 
@@ -4781,7 +4575,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       llvm::SmallPtrSet<Operation *, 16> visited;
       collectStoreRanges(contract.getResult(), internalTraversalRanges, visited);
       SmallVector<StoreOp> stores;
-      if (hasRangeContractForm(contract, &stores)) {
+      if (contraction::hasRangeContractForm(contract, &stores)) {
         for (const auto &axis : freeAxes.axes)
           for (MakeRangeOp range : axis.ranges.roots)
             contractionOwnedRanges.insert(range.getOperation());

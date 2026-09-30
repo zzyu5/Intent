@@ -1,5 +1,11 @@
 add_mlir_library(MLIRIntentGPUTransforms
   RealizeContractionBlocking.cpp
+  ContractionAnalysis.cpp
+  ContractionValues.cpp
+  ContractionSources.cpp
+  ContractionProjection.cpp
+  ContractionTraversal.cpp
+  ContractionBlocking.cpp
   RealizeVectorContractions.cpp
   RealizeAccessComposition.cpp
   PredicateScalarControl.cpp
@@ -20,7 +26,10 @@ add_mlir_library(MLIRIntentGPUTransforms
   TuningProfiles.cpp
   OnlineSummary.cpp
   Passes.cpp
-  Utilities.cpp
+  ValueMaterialization.cpp
+  ValueRelations.cpp
+  Traversal.cpp
+  PhysicalParameters.cpp
   VerifyGPUProgram.cpp
 
   LINK_LIBS PUBLIC

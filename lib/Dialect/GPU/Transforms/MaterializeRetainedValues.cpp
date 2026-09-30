@@ -1,3 +1,9 @@
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
+#include "Intent/Dialect/GPU/Transforms/Traversal.h"
+#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Transforms/Storage.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 
@@ -772,7 +778,7 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
         if (indirect) {
           destinations[0] = restored[1];
           if (store.getValid()) {
-            auto predicate = materializeBroadcastToFragment(nested, store.getLoc(),
+            auto predicate = projectPhysicalValueToSchema(nested, store.getLoc(),
                 restored[2], cast<FragmentType>(valid.getType()));
             if (failed(predicate))
               return failure();

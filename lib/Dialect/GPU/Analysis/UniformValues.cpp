@@ -8,16 +8,21 @@
 using namespace mlir;
 namespace intent::gpu {
 
-std::optional<int64_t> constantPhysicalExpression(PhysicalExprAttr expression) {
+std::optional<int64_t> evaluatePhysicalExpression(
+    PhysicalExprAttr expression,
+    llvm::function_ref<std::optional<int64_t>(PhysicalExprAttr)> resolveLeaf) {
+  if (!expression)
+    return std::nullopt;
   auto kind = static_cast<PhysicalExprKind>(expression.getKind());
   if (kind == PhysicalExprKind::Constant)
     return expression.getValue();
   if (kind == PhysicalExprKind::Parameter || kind == PhysicalExprKind::Dimension ||
       kind == PhysicalExprKind::ScalarABI)
-    return std::nullopt;
+    return resolveLeaf(expression);
   SmallVector<int64_t> operands;
   for (Attribute attribute : expression.getOperands()) {
-    auto value = constantPhysicalExpression(cast<PhysicalExprAttr>(attribute));
+    auto value = evaluatePhysicalExpression(cast<PhysicalExprAttr>(attribute),
+                                            resolveLeaf);
     if (!value)
       return std::nullopt;
     operands.push_back(*value);
@@ -54,6 +59,12 @@ std::optional<int64_t> constantPhysicalExpression(PhysicalExprAttr expression) {
       result > std::numeric_limits<int64_t>::max())
     return std::nullopt;
   return static_cast<int64_t>(result);
+}
+
+std::optional<int64_t> constantPhysicalExpression(PhysicalExprAttr expression) {
+  return evaluatePhysicalExpression(expression, [](PhysicalExprAttr) {
+    return std::optional<int64_t>();
+  });
 }
 Type uniformElementType(Type type) {
   if (auto fragment = dyn_cast<FragmentType>(type)) return fragment.getElementType();

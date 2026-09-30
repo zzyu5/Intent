@@ -1,3 +1,7 @@
+#include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
+#include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
+#include "Intent/Dialect/GPU/Transforms/Predication.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 
@@ -244,47 +248,6 @@ Value anyActiveLane(OpBuilder &builder, Location location, Value predicate) {
 }
 
 } // namespace
-
-bool canPredicateValueOperation(Operation *operation) {
-  if (isa<LoadOp, GatherOp>(operation))
-    return true;
-  if (auto binary = dyn_cast<BinaryOp>(operation)) {
-    auto kind = binary.getOperatorKind();
-    if (kind == BinaryOperator::FloorDivide ||
-        kind == BinaryOperator::Remainder) {
-      // Physical chunk counts divide by a positive compile-time width. Such
-      // scalar arithmetic remains defined in an inactive predicated branch.
-      APInt divisor;
-      bool positive = matchPattern(binary.getRhs(), m_ConstantInt(&divisor)) &&
-                      divisor.isStrictlyPositive();
-      if (auto parameter = binary.getRhs().getDefiningOp<ParameterOp>()) {
-        auto candidates = parameter.getParameter().getCandidates().asArrayRef();
-        positive = !candidates.empty() && llvm::all_of(
-            candidates, [](int64_t value) { return value > 0; });
-      }
-      if (!positive)
-        return false;
-    }
-    if (kind == BinaryOperator::LeftShift ||
-        kind == BinaryOperator::RightShift)
-      return false;
-  }
-  auto elementType = [](Type type) {
-    auto fragment = dyn_cast<FragmentType>(type);
-    return fragment ? fragment.getElementType() : type;
-  };
-  if (auto cast = dyn_cast<CastOp>(operation)) {
-    Type source = elementType(cast.getValue().getType());
-    Type result = elementType(cast.getType());
-    if ((isa<FloatType>(source) && !isa<FloatType>(result)) ||
-        isa<Float8E4M3FNType>(result))
-      return false;
-  }
-  return isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp,
-             SplatOp, BroadcastOp, MakeRangeOp, DimOp, PhysicalExprOp,
-             arith::ConstantOp>(operation) &&
-         isSpeculatable(operation) && isMemoryEffectFree(operation);
-}
 
 bool canPredicateScalarBlock(Block &block) {
   return canPredicate(block, /*allowStores=*/true);

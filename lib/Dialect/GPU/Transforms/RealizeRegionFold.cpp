@@ -1,10 +1,12 @@
+#include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
+#include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Analysis/RegionSemantics.h"
 
 #include "OnlineSummary.h"
-#include "Utilities.h"
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
@@ -2042,12 +2044,9 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   OpBuilder builder(fold);
   Location location = fold.getLoc();
   Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
-  FailureOr<Value> logicalEnd = resolveLogicalRangeEnd(kernel, master);
-  if (failed(logicalEnd))
-    return fold.emitOpError(
-        "region-fold traversal has no exact logical upper bound");
+  Value logicalEnd = master.getLogicalStop();
   Value stop = builder.create<BinaryOp>(
-      location, builder.getIndexType(), *logicalEnd, master.getStart(),
+      location, builder.getIndexType(), logicalEnd, master.getStart(),
       BinaryOperator::Subtract);
   PhysicalExprAttr sliceExtent = parameterExtent(fold.getSegment());
   SmallVector<Value> identities(
@@ -2635,12 +2634,9 @@ LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
   OpBuilder builder(scan);
   Location location = scan.getLoc();
   Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
-  FailureOr<Value> logicalEnd = resolveLogicalRangeEnd(kernel, master);
-  if (failed(logicalEnd))
-    return scan.emitOpError(
-        "region-scan traversal has no exact logical upper bound");
+  Value logicalEnd = master.getLogicalStop();
   Value traversalExtent = builder.create<BinaryOp>(
-      location, builder.getIndexType(), *logicalEnd, master.getStart(),
+      location, builder.getIndexType(), logicalEnd, master.getStart(),
       BinaryOperator::Subtract);
   PhysicalExprAttr sliceExtent = parameterExtent(scan.getSegment());
   bool bodyFailed = false;

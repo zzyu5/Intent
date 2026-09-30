@@ -1,3 +1,4 @@
+#include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
 #include "PassDetail.h"
 
 #include "Intent/Dialect/GPU/IR/Program.h"

@@ -1,3 +1,4 @@
+#include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 

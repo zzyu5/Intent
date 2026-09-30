@@ -1,3 +1,7 @@
+#include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
+#include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
+#include "Intent/Dialect/GPU/Transforms/Storage.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "llvm/ADT/StringSet.h"

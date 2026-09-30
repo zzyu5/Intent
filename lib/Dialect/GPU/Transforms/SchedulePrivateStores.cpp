@@ -1,3 +1,5 @@
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 
 #include "mlir/Interfaces/SideEffectInterfaces.h"

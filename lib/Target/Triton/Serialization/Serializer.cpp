@@ -12,6 +12,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/raw_ostream.h"
@@ -55,22 +56,20 @@ std::string pythonType(Type type, bool torch = false) {
   return {};
 }
 
-std::string expressionString(gpu::PhysicalExprAttr expression,
-                             bool launchContext) {
+std::string expressionString(
+    gpu::PhysicalExprAttr expression, bool launchContext,
+    llvm::function_ref<std::string(gpu::PhysicalExprAttr)> spellLeaf) {
   auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
   if (kind == gpu::PhysicalExprKind::Constant)
     return std::to_string(expression.getValue());
-  if (kind == gpu::PhysicalExprKind::Parameter)
-    return launchContext
-               ? ("META[\"" + expression.getSymbol().getValue() + "\"]").str()
-               : expression.getSymbol().getValue().str();
-  if (kind == gpu::PhysicalExprKind::Dimension ||
+  if (kind == gpu::PhysicalExprKind::Parameter ||
+      kind == gpu::PhysicalExprKind::Dimension ||
       kind == gpu::PhysicalExprKind::ScalarABI)
-    return expression.getSymbol().getValue().str();
+    return spellLeaf(expression);
   SmallVector<std::string> operands;
   for (Attribute operand : expression.getOperands())
     operands.push_back(
-        expressionString(cast<gpu::PhysicalExprAttr>(operand), launchContext));
+        expressionString(cast<gpu::PhysicalExprAttr>(operand), launchContext, spellLeaf));
   if (kind == gpu::PhysicalExprKind::Add)
     return "(" + operands[0] + " + " + operands[1] + ")";
   if (kind == gpu::PhysicalExprKind::Subtract)
@@ -92,8 +91,18 @@ std::string expressionString(gpu::PhysicalExprAttr expression,
     return "(" + operands[1] + " if " + operands[0] + " else " +
            operands[2] + ")";
   if (kind == gpu::PhysicalExprKind::NextPowerOfTwo)
-    return "triton.next_power_of_2(" + operands[0] + ")";
+    return "triton.next_power_of_2(max(" + operands[0] + ", 1))";
   return {};
+}
+
+std::string expressionString(gpu::PhysicalExprAttr expression,
+                             bool launchContext) {
+  return expressionString(expression, launchContext, [&](gpu::PhysicalExprAttr leaf) {
+    if (launchContext && leaf.getKind() ==
+        static_cast<uint32_t>(gpu::PhysicalExprKind::Parameter))
+      return ("META[\"" + leaf.getSymbol().getValue() + "\"]").str();
+    return leaf.getSymbol().getValue().str();
+  });
 }
 
 std::string fragmentShape(gpu::FragmentType fragment) {
@@ -1765,42 +1774,15 @@ private:
 
   std::string descriptorArgumentExpression(
       gpu::PhysicalExprAttr expression) const {
-    auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
-    if (kind == gpu::PhysicalExprKind::Constant)
-      return std::to_string(expression.getValue());
-    if (kind == gpu::PhysicalExprKind::Parameter) {
-      std::string name = expression.getSymbol().getValue().str();
-      if (fullCoverageParameters.count(name))
-        return "_intent_cover_" + name + "(args)";
-      return "args[\"" + name + "\"]";
-    }
-    if (kind == gpu::PhysicalExprKind::Dimension ||
-        kind == gpu::PhysicalExprKind::ScalarABI)
-      return hostArgument(expression.getSymbol().getValue());
-    SmallVector<std::string> operands;
-    for (Attribute operand : expression.getOperands())
-      operands.push_back(descriptorArgumentExpression(
-          cast<gpu::PhysicalExprAttr>(operand)));
-    if (kind == gpu::PhysicalExprKind::Add)
-      return "(" + operands[0] + " + " + operands[1] + ")";
-    if (kind == gpu::PhysicalExprKind::Subtract)
-      return "(" + operands[0] + " - " + operands[1] + ")";
-    if (kind == gpu::PhysicalExprKind::Multiply)
-      return "(" + operands[0] + " * " + operands[1] + ")";
-    if (kind == gpu::PhysicalExprKind::CeilDiv)
-      return "triton.cdiv(" + operands[0] + ", " + operands[1] + ")";
-    if (kind == gpu::PhysicalExprKind::Minimum)
-      return "min(" + operands[0] + ", " + operands[1] + ")";
-    if (kind == gpu::PhysicalExprKind::Maximum)
-      return "max(" + operands[0] + ", " + operands[1] + ")";
-    if (kind == gpu::PhysicalExprKind::FloorDiv)
-      return "(" + operands[0] + " // " + operands[1] + ")";
-    if (kind == gpu::PhysicalExprKind::Select)
-      return "(" + operands[1] + " if " + operands[0] + " else " +
-             operands[2] + ")";
-    if (kind == gpu::PhysicalExprKind::NextPowerOfTwo)
-      return "triton.next_power_of_2(" + operands[0] + ")";
-    return {};
+    return expressionString(expression, true, [&](gpu::PhysicalExprAttr leaf) {
+      if (leaf.getKind() == static_cast<uint32_t>(gpu::PhysicalExprKind::Parameter)) {
+        std::string name = leaf.getSymbol().getValue().str();
+        if (fullCoverageParameters.count(name))
+          return "_intent_cover_" + name + "(args)";
+        return "args[\"" + name + "\"]";
+      }
+      return hostArgument(leaf.getSymbol().getValue());
+    });
   }
 
   std::string descriptorHostValue(Value value, bool argumentMap) {

@@ -1,3 +1,6 @@
+#include "Intent/Dialect/GPU/IR/Program.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 

@@ -4,6 +4,7 @@
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/DenseMap.h"
@@ -17,6 +18,8 @@
 #include <utility>
 
 namespace intent::gpu {
+
+mlir::FailureOr<mlir::func::FuncOp> getPhysicalKernel(mlir::ModuleOp module);
 
 /// A logical source axis carried by the current executable GPU program.
 struct PhysicalSourceAxis {

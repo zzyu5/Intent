@@ -1,4 +1,7 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "llvm/ADT/STLExtras.h"
@@ -73,7 +76,7 @@ FailureOr<Value> projectOperand(OpBuilder &builder, ContractOp contract,
   if (expanded != source)
     operand = builder.create<ReshapeOp>(contract.getLoc(), expanded, operand,
                                         builder.getArrayAttr(groups));
-  return materializeBroadcastToFragment(builder, contract.getLoc(), operand, productType);
+  return projectPhysicalValueToSchema(builder, contract.getLoc(), operand, productType);
 }
 
 LogicalResult realizeVectorContract(ContractOp contract) {
