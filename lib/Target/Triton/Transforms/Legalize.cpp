@@ -4315,13 +4315,16 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   pipelineStagesAffectProgram |= !loadPipelineLoops.empty();
   SmallVector<TritonLocalOptions> localOptions;
   SmallVector<int64_t> warpDomain, stageDomain, ctaDomain;
+  // Consumer Blackwell (SM12x) does not support CTA cluster operations.
+  bool supportsCtaClusters = capabilities.getComputeCapabilityMajor() >= 9 &&
+                             capabilities.getComputeCapabilityMajor() != 12;
   auto isDeviceOption = [&](int64_t warps, int64_t stages, int64_t ctas) {
     return (!requiresCtaSynchronization || ctas == 1) &&
            (warps & (warps - 1)) == 0 &&
            warps <= capabilities.getMaxThreadsPerBlock() / 32 &&
            stages <= std::numeric_limits<int32_t>::max() &&
            (ctas & (ctas - 1)) == 0 && ctas <= 16 &&
-           (ctas == 1 || capabilities.getComputeCapabilityMajor() >= 9);
+           (ctas == 1 || supportsCtaClusters);
   };
   for (const auto &row : *rows) {
     int64_t warps = row[0], stages = row[1], ctas = row[2];
