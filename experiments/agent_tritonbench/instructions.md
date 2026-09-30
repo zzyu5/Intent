@@ -96,8 +96,6 @@ broadcasting, as in x[row_indices[:, None], column_indices[None, :]].
 Define device functions with @intent.kernel and helpers with @intent.fn. Kernel
 outputs are explicit I.Out/I.InOut parameters written by the kernel. Returning an
 I.buffer or adding a Python return annotation does not create a host output.
-Kernel views do not support Optional or a union with None. Optional host arguments
-must be handled by the author in the host callable and the chosen kernel interface.
 
 Use the unannotated signature def build(context):. The evaluator supplies context;
 it is not a type exported by intent. Inside build, call
