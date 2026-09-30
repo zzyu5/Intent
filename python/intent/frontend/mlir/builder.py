@@ -389,4 +389,4 @@ def canonicalize_mlir(assembly: str, builder: MlirBuilder) -> str:
         context.allow_unregistered_dialects = True
         module = Module.parse(assembly)
         canonicalize_regions(module, builder)
-        return str(module) + "\n"
+        return module.operation.get_asm(enable_debug_info=True) + "\n"

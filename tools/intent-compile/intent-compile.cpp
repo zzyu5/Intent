@@ -72,6 +72,8 @@ int main(int argc, char **argv) {
   intent::gpu::registerGPUPasses();
   intent::dsa::registerDSAPasses();
   intent::bangc::registerBangCPasses();
+  intent::triton::registerTritonPasses();
+  intent::cutile::registerCuTilePasses();
   // MLIR's pass-name option parsers enumerate the registry at construction.
   // Populate it before constructing --mlir-print-ir-before/after options.
   mlir::registerMLIRContextCLOptions();
@@ -182,7 +184,7 @@ int main(int argc, char **argv) {
       llvm::errs() << "cannot open physical IR output: " << error.message() << "\n";
       return exitCode(ExitCode::CompilerOutput);
     }
-    module->print(irOutput);
+    module->print(irOutput, mlir::OpPrintingFlags().enableDebugInfo());
     irOutput << "\n";
     return exitCode(ExitCode::Success);
   };
@@ -352,7 +354,7 @@ int main(int argc, char **argv) {
     llvm::errs() << "cannot open physical IR output: " << error.message() << "\n";
     return exitCode(ExitCode::CompilerOutput);
   }
-  module->print(irOutput);
+  module->print(irOutput, mlir::OpPrintingFlags().enableDebugInfo());
   irOutput << "\n";
   irOutput.close();
   llvm::raw_fd_ostream sourceOutput(sourceOutputFilename, error,

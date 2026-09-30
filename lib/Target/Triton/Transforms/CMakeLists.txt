@@ -1,5 +1,11 @@
 add_mlir_library(MLIRIntentTritonTransforms
   Legalize.cpp
+  Passes.cpp
+  AccessForms.cpp
+  Collectives.cpp
+  Supply.cpp
+  Values.cpp
+  Verify.cpp
   Configurations.cpp
   ProgramGrid.cpp
 
@@ -9,6 +15,7 @@ add_mlir_library(MLIRIntentTritonTransforms
   MLIRFuncDialect
   MLIRIR
   MLIRSCFDialect
+  MLIRIntentGPUAnalysis
   MLIRIntentGPUDialect
   MLIRIntentGPUTransforms
   MLIRIntentTritonDialect

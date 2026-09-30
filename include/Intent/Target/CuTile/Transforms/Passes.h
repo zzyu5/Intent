@@ -7,6 +7,8 @@
 
 namespace intent::cutile {
 
+void registerCuTilePasses();
+
 mlir::LogicalResult legalizeGPUProgram(mlir::ModuleOp module,
                                      const gpu::TuningProfiles &profiles);
 mlir::LogicalResult verifyCuTileProgram(mlir::ModuleOp module);

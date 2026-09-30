@@ -1,0 +1,802 @@
+#include "Legalization.h"
+#include "llvm/ADT/DenseSet.h"
+#include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
+#include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
+#include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/IRMapping.h"
+#include <algorithm>
+#include <limits>
+#include <optional>
+
+using namespace mlir;
+
+namespace intent::triton::detail {
+constexpr llvm::StringLiteral tensorDescriptorChoice =
+    "USE_TENSOR_DESCRIPTOR";
+constexpr llvm::StringLiteral tensorDescriptorEligibility =
+    "TENSOR_DESCRIPTOR_ELIGIBLE";
+struct BlockAccessPlan {
+  SmallVector<Value> offsets;
+  SmallVector<int64_t> blockAxes;
+  SmallVector<int64_t> order;
+  SmallVector<int64_t> boundaryAxes;
+};
+
+bool isUnitStep(Value value) {
+  auto constant = value.getDefiningOp<arith::ConstantIndexOp>();
+  return constant && constant.value() == 1;
+}
+
+bool isZeroValue(Value value) {
+  Attribute constant =
+      UniformValueAnalysis(gpu::describeUniformValue).evaluate(value);
+  if (!constant)
+    return false;
+  if (auto integer = dyn_cast<IntegerAttr>(constant))
+    return integer.getValue().isZero();
+  // Native zero padding produces positive floating zero.
+  if (auto floating = dyn_cast<FloatAttr>(constant))
+    return floating.getValue().isZero() && !floating.getValue().isNegative();
+  return false;
+}
+
+std::optional<BlockAccessPlan>
+planBlockAccess(Value resource, ValueRange coordinates,
+                ArrayRef<int64_t> sourceAxes, Type valueType, Value valid,
+                Value fill,
+                const gpu::PhysicalAccessBoundaryFact &boundaryFact) {
+  auto view = dyn_cast<gpu::ViewType>(resource.getType());
+  auto fragment = dyn_cast<gpu::FragmentType>(valueType);
+  if (!view || !fragment || fragment.getShape().empty() || !isa<BlockArgument>(resource) ||
+      coordinates.size() != view.getRank() ||
+      sourceAxes.size() != view.getRank() ||
+      !view.getLayout().getHasStrides() ||
+      view.getLayout().getStrides().size() != view.getRank())
+    return std::nullopt;
+
+  BlockAccessPlan plan;
+  plan.offsets.resize(view.getRank());
+  plan.blockAxes.assign(fragment.getShape().size(), -1);
+  llvm::SmallBitVector seenViewAxes(view.getRank());
+  llvm::SmallBitVector seenFragmentAxes(fragment.getShape().size());
+  for (auto [coordinateIndex, coordinate] : llvm::enumerate(coordinates)) {
+    int64_t viewAxis = sourceAxes[coordinateIndex];
+    if (viewAxis < 0 || viewAxis >= static_cast<int64_t>(view.getRank()) ||
+        seenViewAxes.test(viewAxis))
+      return std::nullopt;
+    seenViewAxes.set(viewAxis);
+    if (coordinate.getType().isIndex()) {
+      plan.offsets[viewAxis] = coordinate;
+      continue;
+    }
+    auto coordinateType = dyn_cast<gpu::FragmentType>(coordinate.getType());
+    if (!coordinateType)
+      return std::nullopt;
+    auto projection = gpu::queryBroadcastProjection(coordinateType, fragment);
+    if (!projection.isExact())
+      return std::nullopt;
+    // Broadcasting a Cartesian range does not make the access indirect.
+    // Compose the actual projections rather than matching equal extents or
+    // dropping a reshape that might change the coordinate's varying axis.
+    while (auto broadcast = coordinate.getDefiningOp<gpu::BroadcastOp>()) {
+      auto source = dyn_cast<gpu::FragmentType>(broadcast.getValue().getType());
+      if (!source)
+        return std::nullopt;
+      auto step = gpu::queryBroadcastProjection(source, coordinateType);
+      if (!step.isExact())
+        return std::nullopt;
+      for (std::optional<unsigned> &axis : projection.targetToSource)
+        if (axis)
+          axis = step.targetToSource[*axis];
+      coordinate = broadcast.getValue();
+      coordinateType = source;
+    }
+    auto range = coordinate.getDefiningOp<gpu::MakeRangeOp>();
+    if (coordinateType.getShape().size() != 1 ||
+        !coordinateType.getElementType().isIndex() || !range ||
+        !isUnitStep(range.getStep()))
+      return std::nullopt;
+    std::optional<unsigned> selected;
+    for (auto [fragmentAxis, sourceAxis] :
+         llvm::enumerate(projection.targetToSource)) {
+      if (sourceAxis) {
+        if (selected)
+          return std::nullopt;
+        selected = fragmentAxis;
+      }
+    }
+    if (!selected || seenFragmentAxes.test(*selected) ||
+        coordinateType.getShape()[0] != fragment.getShape()[*selected])
+      return std::nullopt;
+    auto extent = cast<gpu::PhysicalExprAttr>(fragment.getShape()[*selected]);
+    if (!isTritonFragmentExtent(extent))
+      return std::nullopt;
+    seenFragmentAxes.set(*selected);
+    plan.blockAxes[*selected] = viewAxis;
+    plan.offsets[viewAxis] = range.getStart();
+  }
+  if (seenViewAxes.count() != view.getRank() ||
+      seenFragmentAxes.count() != fragment.getShape().size() ||
+      llvm::any_of(plan.offsets, [](Value value) { return !value; }))
+    return std::nullopt;
+  for (Attribute stride : view.getLayout().getStrides())
+    if (!isa<IntegerAttr, StringAttr>(stride))
+      return std::nullopt;
+
+  if (!boundaryFact.isExact())
+    return std::nullopt;
+  if (valid) {
+    if (fill && !isZeroValue(fill))
+      return std::nullopt;
+  } else if (fill) {
+    return std::nullopt;
+  }
+  llvm::append_range(plan.boundaryAxes, boundaryFact.boundaryAxes);
+  llvm::sort(plan.boundaryAxes);
+  for (int64_t axis = 0;
+       axis < static_cast<int64_t>(fragment.getShape().size()); ++axis)
+    plan.order.push_back(axis);
+  llvm::sort(plan.order, [&](int64_t lhs, int64_t rhs) {
+    return plan.blockAxes[lhs] > plan.blockAxes[rhs];
+  });
+  return plan;
+}
+
+struct BlockAccessCandidates {
+  SmallVector<std::pair<gpu::LoadOp, BlockAccessPlan>, 4> loads;
+  SmallVector<std::pair<gpu::StoreOp, BlockAccessPlan>, 4> stores;
+};
+
+// A stable read phase. No analysis or boundary cache survives the returned
+// candidate list: rewrites only consume the already-proved access operands.
+BlockAccessCandidates readBlockAccesses(
+    func::FuncOp kernel,
+    llvm::function_ref<bool(Operation *, BlockAccessPlan &)> accept) {
+  BlockAccessCandidates candidates;
+  gpu::PhysicalProgramAnalysis analysis(kernel);
+  kernel.walk([&](Operation *operation) {
+    if (auto load = dyn_cast<gpu::LoadOp>(operation)) {
+      auto plan = planBlockAccess(
+          load.getResource(), load.getCoordinates(), load.getSourceAxes(),
+          load.getResult().getType(), load.getValid(), load.getFill(),
+          analysis.boundaryValidity(load));
+      if (plan && accept(load, *plan))
+        candidates.loads.emplace_back(load, std::move(*plan));
+    } else if (auto store = dyn_cast<gpu::StoreOp>(operation)) {
+      auto plan = planBlockAccess(
+          store.getResource(), store.getCoordinates(), store.getSourceAxes(),
+          store.getValue().getType(), store.getValid(), Value(),
+          analysis.boundaryValidity(store));
+      if (plan && accept(store, *plan))
+        candidates.stores.emplace_back(store, std::move(*plan));
+    }
+  });
+  return candidates;
+}
+
+LogicalResult materializeBlockPointerForms(func::FuncOp kernel) {
+  auto candidates = readBlockAccesses(kernel,
+      [](Operation *, BlockAccessPlan &plan) {
+        for (int64_t &axis : plan.boundaryAxes) {
+          auto found = llvm::find(plan.blockAxes, axis);
+          if (found == plan.blockAxes.end())
+            return false;
+          axis = std::distance(plan.blockAxes.begin(), found);
+        }
+        llvm::sort(plan.boundaryAxes);
+        return true;
+      });
+  auto &[loads, stores] = candidates;
+  if (loads.empty() && stores.empty())
+    return success();
+
+  for (auto &[load, plan] : loads) {
+    OpBuilder builder(load);
+    auto block = builder.create<BlockLoadOp>(
+        load.getLoc(), load.getResult().getType(), load.getResource(),
+        plan.offsets,
+        DenseI64ArrayAttr::get(kernel.getContext(), plan.blockAxes),
+        DenseI64ArrayAttr::get(kernel.getContext(), plan.order),
+        DenseI64ArrayAttr::get(kernel.getContext(), plan.boundaryAxes),
+        builder.getStringAttr("zero"));
+    if (Attribute origin = load->getAttr(gpu::originAttr))
+      block->setAttr(gpu::originAttr, origin);
+    load.getResult().replaceAllUsesWith(block.getResult());
+    load.erase();
+  }
+  for (auto &[store, plan] : stores) {
+    OpBuilder builder(store);
+    auto block = builder.create<BlockStoreOp>(
+        store.getLoc(), store.getResource(), plan.offsets, store.getValue(),
+        DenseI64ArrayAttr::get(kernel.getContext(), plan.blockAxes),
+        DenseI64ArrayAttr::get(kernel.getContext(), plan.order),
+        DenseI64ArrayAttr::get(kernel.getContext(), plan.boundaryAxes));
+    if (Attribute origin = store->getAttr(gpu::originAttr))
+      block->setAttr(gpu::originAttr, origin);
+    store.erase();
+  }
+  return success();
+}
+
+void orientPointerLoads(func::FuncOp kernel) {
+  llvm::DenseMap<Operation *, SmallVector<gpu::ContractOp>> simtRhsConsumers;
+  kernel.walk([&](gpu::ContractOp contract) {
+    if (!gpu::uniformElementType(contract.getLhs().getType()).isF32() ||
+        !gpu::uniformElementType(contract.getRhs().getType()).isF32())
+      return;
+    SmallVector<Value> pending{contract.getRhs()};
+    llvm::DenseSet<Operation *> visited;
+    while (!pending.empty()) {
+      Operation *producer = pending.pop_back_val().getDefiningOp();
+      if (!producer || !visited.insert(producer).second)
+        continue;
+      if (auto load = dyn_cast<gpu::LoadOp>(producer)) {
+        simtRhsConsumers[load].push_back(contract);
+        continue;
+      }
+      if (isa<gpu::BroadcastOp, gpu::ReshapeOp, gpu::TransposeOp, gpu::CastOp,
+              gpu::UnaryOp, gpu::BinaryOp, gpu::SelectOp>(producer))
+        llvm::append_range(pending, producer->getOperands());
+    }
+  });
+  SmallVector<gpu::LoadOp> loads;
+  kernel.walk([&](gpu::LoadOp load) {
+    if (isa<gpu::ViewType>(load.getResource().getType()) &&
+        isa<gpu::FragmentType>(load.getResult().getType()))
+      loads.push_back(load);
+  });
+  for (gpu::LoadOp load : loads) {
+    auto result = cast<gpu::FragmentType>(load.getResult().getType());
+    unsigned rank = result.getShape().size();
+    if (rank < 2)
+      continue;
+    gpu::PhysicalProgramAnalysis analysis(kernel);
+    SmallVector<int64_t> viewAxes(rank, -1);
+    Value innermostCoordinate;
+    int64_t innermostViewAxis = -1;
+    bool exact = true;
+    for (auto [position, coordinate] : llvm::enumerate(load.getCoordinates())) {
+      auto type = dyn_cast<gpu::FragmentType>(coordinate.getType());
+      if (!type)
+        continue;
+      auto projection = gpu::queryAxisProjection(type, result);
+      if (!projection.isExact()) {
+        exact = false;
+        break;
+      }
+      unsigned varying = 0;
+      for (auto [axis, source] : llvm::enumerate(projection.targetToSource)) {
+        if (!source)
+          continue;
+        auto extent = cast<gpu::PhysicalExprAttr>(type.getShape()[*source]);
+        if (extent.getKind() == static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+            extent.getValue() == 1)
+          continue;
+        auto ranges = analysis.axisRanges(coordinate, *source);
+        if (!ranges.isExact() || !ranges.blockers.empty() ||
+            !ranges.accesses.empty()) {
+          exact = false;
+          break;
+        }
+        if (ranges.roots.empty())
+          continue;
+        if (++varying != 1) {
+          exact = false;
+          break;
+        }
+        // A broadcast axis does not vary. Reshape-derived coordinates may
+        // share one varying fragment axis across several resource axes.
+        viewAxes[axis] = std::max(viewAxes[axis], load.getSourceAxes()[position]);
+        if (viewAxes[axis] > innermostViewAxis) {
+          innermostViewAxis = viewAxes[axis];
+          innermostCoordinate = coordinate;
+        }
+      }
+      if (!exact)
+        break;
+    }
+    // Leave a unit-step innermost view coordinate to native coalescing. A
+    // unit-step coordinate on an outer view axis can still be strided.
+    auto view = cast<gpu::ViewType>(load.getResource().getType());
+    if (innermostCoordinate && innermostViewAxis + 1 == view.getRank()) {
+      auto range = gpu::stripAdditiveProjection(innermostCoordinate)
+                       .getDefiningOp<gpu::MakeRangeOp>();
+      if (range && gpu::isUnitStepRange(range))
+        continue;
+    }
+    auto sameSchema = [&](Type element) {
+      return gpu::FragmentType::get(kernel.getContext(), element,
+          result.getShape(), result.getAxisMaps(), result.getValidity(),
+          result.getOwner());
+    };
+    for (Value operand : load->getOperands())
+      if (auto fragment = dyn_cast<gpu::FragmentType>(operand.getType()))
+        exact &= gpu::queryBroadcastProjection(
+            fragment, sameSchema(fragment.getElementType())).isExact();
+    if (!exact)
+      continue;
+    SmallVector<int64_t> permutation;
+    for (unsigned axis = 0; axis < rank; ++axis)
+      permutation.push_back(axis);
+    llvm::stable_sort(permutation, [&](int64_t lhs, int64_t rhs) {
+      return viewAxes[lhs] > viewAxes[rhs];
+    });
+    if (llvm::all_of(llvm::enumerate(permutation), [](auto entry) {
+          return static_cast<int64_t>(entry.index()) == entry.value();
+        }))
+      continue;
+    // IEEE f32 dot uses SIMT FMA. Its RHS shared tile has no native swizzle;
+    // making K the leading load axis can serialize the free-axis reads.
+    auto leadingRanges = analysis.axisRanges(load.getResult(), permutation.front());
+    bool reductionLeading = llvm::any_of(simtRhsConsumers.lookup(load),
+        [&](gpu::ContractOp contract) {
+          if (!leadingRanges.isExact() || leadingRanges.roots.empty())
+            return false;
+          auto axes = analysis.rangeAxes(contract.getRhs(), leadingRanges.roots);
+          return axes.isExact() &&
+                 llvm::any_of(axes.fragmentAxes, [&](unsigned axis) {
+                   return llvm::is_contained(contract.getRhsReductionAxes(), axis);
+                 });
+        });
+    if (reductionLeading)
+      continue;
+    OpBuilder builder(load);
+    auto permutedType = [&](gpu::FragmentType type, ArrayRef<int64_t> order) {
+      SmallVector<Attribute> shape, mappings;
+      for (auto [position, axis] : llvm::enumerate(order)) {
+        shape.push_back(type.getShape()[axis]);
+        auto mapping = cast<gpu::AxisMapAttr>(type.getAxisMaps()[axis]);
+        mappings.push_back(gpu::AxisMapAttr::get(kernel.getContext(),
+            mapping.getSourceId(), mapping.getSourceAxis(),
+            mapping.getDimensionId(), position, mapping.getDerived()));
+      }
+      return gpu::FragmentType::get(kernel.getContext(),
+          type.getElementType(), builder.getArrayAttr(shape),
+          builder.getArrayAttr(mappings), type.getValidity(), type.getOwner());
+    };
+    auto transpose = [&](Value value, ArrayRef<int64_t> order) -> Value {
+      auto target = permutedType(cast<gpu::FragmentType>(value.getType()), order);
+      return builder.create<gpu::TransposeOp>(load.getLoc(), target, value, order);
+    };
+    IRMapping mapping;
+    for (Value operand : load->getOperands()) {
+      auto type = dyn_cast<gpu::FragmentType>(operand.getType());
+      if (!type || mapping.contains(operand))
+        continue;
+      auto target = sameSchema(type.getElementType());
+      Value expanded = operand;
+      if (type != target)
+        expanded = builder.create<gpu::BroadcastOp>(load.getLoc(), target, operand);
+      mapping.map(operand, transpose(expanded, permutation));
+    }
+    auto oriented = cast<gpu::LoadOp>(builder.clone(*load, mapping));
+    oriented.getResult().setType(permutedType(result, permutation));
+    SmallVector<int64_t> inverse(rank);
+    for (auto [position, axis] : llvm::enumerate(permutation))
+      inverse[axis] = position;
+    Value restored = transpose(oriented.getResult(), inverse);
+    load.getResult().replaceAllUsesWith(restored);
+    load.erase();
+  }
+}
+
+bool descriptorStrideAvailable(func::FuncOp kernel, gpu::ViewType view,
+                               unsigned axis) {
+  Attribute stride = view.getLayout().getStrides()[axis];
+  if (auto constant = dyn_cast<IntegerAttr>(stride))
+    return constant.getInt() > 0;
+  auto symbol = dyn_cast<StringAttr>(stride);
+  if (!symbol)
+    return false;
+  unsigned matches = 0;
+  for (auto [index, argument] : llvm::enumerate(kernel.getArguments())) {
+    auto name = kernel.getArgAttrOfType<StringAttr>(index, gpu::abiNameAttr);
+    auto kind = kernel.getArgAttrOfType<StringAttr>(index, gpu::abiKindAttr);
+    auto source =
+        kernel.getArgAttrOfType<IntegerAttr>(index, gpu::sourceABIAttr);
+    auto sourceAxis =
+        kernel.getArgAttrOfType<IntegerAttr>(index, gpu::sourceAxisAttr);
+    if (name == symbol && kind && kind.getValue() == "stride" && source &&
+        source.getInt() == view.getAbiIndex() && sourceAxis &&
+        sourceAxis.getInt() == axis && argument.getType().isIndex())
+      ++matches;
+  }
+  return matches == 1;
+}
+
+
+
+bool descriptorAccessEligible(func::FuncOp kernel, Value viewValue,
+                              ValueRange offsets,
+                              ArrayRef<int64_t> blockAxes,
+                              gpu::FragmentType fragment) {
+  auto view = cast<gpu::ViewType>(viewValue.getType());
+  unsigned blockRank = fragment.getShape().size();
+  if (view.getRank() < 1 || view.getRank() > 5 || blockRank == 0 ||
+      !llvm::is_contained(blockAxes, static_cast<int64_t>(view.getRank()) - 1))
+    return false;
+  std::optional<int64_t> elementBytes =
+      descriptorElementBytes(view.getElementType());
+  auto layout = view.getLayout();
+  if (!elementBytes || 16 % *elementBytes != 0 || !layout.getHasStrides() ||
+      layout.getStrides().size() != view.getRank())
+    return false;
+  auto strides = layout.getStrides();
+  for (unsigned axis = 0; axis < view.getRank(); ++axis)
+    if (!descriptorStrideAvailable(kernel, view, axis))
+      return false;
+  if (auto last = dyn_cast<IntegerAttr>(strides[strides.size() - 1]);
+      last && last.getInt() != 1)
+    return false;
+  for (unsigned axis = 0; axis + 1 < view.getRank(); ++axis) {
+    auto stride = dyn_cast<IntegerAttr>(strides[axis]);
+    if (stride && stride.getInt() % (16 / *elementBytes) != 0)
+      return false;
+  }
+  // TMA requires aligned coordinates, not constant coordinates. Tile starts
+  // and reduction-loop induction values preserve power-of-two divisibility,
+  // including under fixed-width index arithmetic.
+  // Descriptor configs already require a power-of-two contiguous block of
+  // at least 16 bytes. Its extent parameter is aligned in this branch even
+  // when the shared parameter domain also includes smaller pointer tiles.
+  unsigned contiguousAxis = std::distance(
+      blockAxes.begin(), llvm::find(blockAxes, view.getRank() - 1));
+  auto extent =
+      cast<gpu::PhysicalExprAttr>(fragment.getShape()[contiguousAxis]);
+  StringAttr alignedBlockParameter;
+  if (extent.getKind() ==
+      static_cast<uint32_t>(gpu::PhysicalExprKind::Parameter))
+    alignedBlockParameter = extent.getSymbol();
+  gpu::IndexRelations relations;
+  return relations.multipleOf(offsets.back(), 16 / *elementBytes,
+      [&](gpu::ParameterOp parameter) {
+        return parameter.getParameter().getName() == alignedBlockParameter;
+      });
+}
+
+void copyOrigin(Operation *source, Operation *target) {
+  if (Attribute origin = source->getAttr(gpu::originAttr))
+    target->setAttr(gpu::originAttr, origin);
+}
+
+FailureOr<Value> descriptorStrideValue(OpBuilder &builder, func::FuncOp kernel,
+                                       Location location, gpu::ViewType view,
+                                       unsigned axis) {
+  Attribute stride = view.getLayout().getStrides()[axis];
+  if (auto constant = dyn_cast<IntegerAttr>(stride))
+    return Value(builder.create<arith::ConstantIndexOp>(location,
+                                                        constant.getInt()));
+  auto symbol = dyn_cast<StringAttr>(stride);
+  if (!symbol)
+    return failure();
+  for (auto [index, argument] : llvm::enumerate(kernel.getArguments())) {
+    auto name = kernel.getArgAttrOfType<StringAttr>(index, gpu::abiNameAttr);
+    auto kind = kernel.getArgAttrOfType<StringAttr>(index, gpu::abiKindAttr);
+    auto source =
+        kernel.getArgAttrOfType<IntegerAttr>(index, gpu::sourceABIAttr);
+    auto sourceAxis =
+        kernel.getArgAttrOfType<IntegerAttr>(index, gpu::sourceAxisAttr);
+    if (name == symbol && kind && kind.getValue() == "stride" && source &&
+        source.getInt() == view.getAbiIndex() && sourceAxis &&
+        sourceAxis.getInt() == axis && argument.getType().isIndex())
+      return argument;
+  }
+  return failure();
+}
+
+FailureOr<SmallVector<Value>> materializeDescriptorOffsets(
+    OpBuilder &builder, Location location, ValueRange offsets) {
+  auto nativeOffsets = [&](ValueRange coordinates) {
+    // Descriptor shapes are at most INT32_MAX and blocks at most 2^20
+    // elements. A start outside signed i32 therefore denotes an entirely
+    // padded block; preserve that fact instead of wrapping it into the view.
+    Value minimum = builder.create<arith::ConstantIndexOp>(
+        location, std::numeric_limits<int32_t>::min());
+    Value maximum = builder.create<arith::ConstantIndexOp>(
+        location, std::numeric_limits<int32_t>::max());
+    SmallVector<Value> result;
+    for (Value offset : coordinates) {
+      Value lower = builder.create<gpu::CompareOp>(
+          location, builder.getI1Type(), offset, minimum, ComparePredicate::Ge);
+      Value upper = builder.create<gpu::CompareOp>(
+          location, builder.getI1Type(), offset, maximum, ComparePredicate::Le);
+      Value inside = builder.create<gpu::BinaryOp>(
+          location, builder.getI1Type(), lower, upper, BinaryOperator::LogicalAnd);
+      result.push_back(builder.create<gpu::SelectOp>(
+          location, builder.getIndexType(), inside, offset, minimum));
+    }
+    return result;
+  };
+  return nativeOffsets(offsets);
+}
+
+bool feedsIndirectAccessCoordinates(Value value) {
+  SmallVector<Value> pending{value};
+  llvm::SmallDenseSet<Value, 32> visited;
+  while (!pending.empty()) {
+    Value current = pending.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    for (Operation *user : current.getUsers()) {
+      if (auto load = dyn_cast<gpu::LoadOp>(user)) {
+        if (llvm::is_contained(load.getCoordinates(), current))
+          return true;
+        continue;
+      }
+      if (auto store = dyn_cast<gpu::StoreOp>(user)) {
+        if (llvm::is_contained(store.getCoordinates(), current))
+          return true;
+        continue;
+      }
+      if (user->getNumRegions() == 0 && isMemoryEffectFree(user))
+        pending.append(user->getResults().begin(), user->getResults().end());
+    }
+  }
+  return false;
+}
+
+FailureOr<TensorDescriptorChoiceOp>
+materializeTensorDescriptorForms(
+    func::FuncOp kernel, ArrayRef<TritonLocalOptions> localOptions) {
+  auto capabilities =
+      kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+  if (!capabilities || capabilities.getComputeCapabilityMajor() < 9)
+    return TensorDescriptorChoiceOp();
+  bool hasContraction = false;
+  kernel.walk([&](Operation *operation) {
+    hasContraction |= isa<gpu::ContractOp, gpu::ScaledContractOp>(operation);
+  });
+  if (!hasContraction)
+    return TensorDescriptorChoiceOp();
+
+  auto candidates = readBlockAccesses(kernel,
+      [&](Operation *operation, BlockAccessPlan &plan) {
+        if (auto load = dyn_cast<gpu::LoadOp>(operation)) {
+          // Address-producing reads stay in their synchronous dependency chain.
+          if (feedsIndirectAccessCoordinates(load.getResult()))
+            return false;
+          return descriptorAccessEligible(kernel, load.getResource(),
+              plan.offsets, plan.blockAxes,
+              cast<gpu::FragmentType>(load.getResult().getType()));
+        }
+        auto store = cast<gpu::StoreOp>(operation);
+        return descriptorAccessEligible(kernel, store.getResource(),
+            plan.offsets, plan.blockAxes,
+            cast<gpu::FragmentType>(store.getValue().getType()));
+      });
+  auto &[loads, stores] = candidates;
+  if (loads.empty() && stores.empty())
+    return TensorDescriptorChoiceOp();
+
+  OpBuilder entry(&kernel.getBody().front(), kernel.getBody().front().begin());
+  entry.create<TensorDescriptorAllocatorOp>(
+      kernel.getLoc(), entry.getI64IntegerAttr(0), entry.getI64IntegerAttr(1),
+      entry.getI64IntegerAttr(2), entry.getStringAttr("launch"),
+      entry.getStringAttr("torch_cuda_current_device"));
+  struct DescriptorPlan {
+    Value view;
+    gpu::FragmentType fragment;
+    gpu::FragmentType orderedFragment;
+    gpu::FragmentType nativeFragment;
+    SmallVector<int64_t> blockAxes;
+    SmallVector<int64_t> permutation;
+    TensorDescriptorOp descriptor;
+  };
+  SmallVector<DescriptorPlan> descriptors;
+  auto [nextSource, nextDimension] = gpu::nextPhysicalAxisIdentities(kernel);
+  auto descriptorFor = [&](Value viewValue, gpu::FragmentType fragment,
+                           ArrayRef<int64_t> blockAxes)
+      -> FailureOr<DescriptorPlan> {
+    for (const DescriptorPlan &plan : descriptors)
+      if (plan.view == viewValue && plan.fragment == fragment &&
+          ArrayRef<int64_t>(plan.blockAxes) == blockAxes)
+        return plan;
+    auto view = cast<gpu::ViewType>(viewValue.getType());
+    SmallVector<Value> dimensions;
+    for (unsigned axis = 0; axis < view.getRank(); ++axis)
+      dimensions.push_back(entry.create<gpu::DimOp>(
+          kernel.getLoc(), entry.getIndexType(), viewValue, axis));
+    SmallVector<Value> strides;
+    SmallVector<int64_t> alignedAxes;
+    for (unsigned axis = 0; axis + 1 < view.getRank(); ++axis) {
+      auto stride = descriptorStrideValue(entry, kernel, kernel.getLoc(), view,
+                                          axis);
+      if (failed(stride))
+        return failure();
+      strides.push_back(*stride);
+      alignedAxes.push_back(axis);
+    }
+    strides.push_back(entry.create<arith::ConstantIndexOp>(kernel.getLoc(), 1));
+    SmallVector<Attribute> shape, mappings, orderedShape, orderedMappings;
+    SmallVector<int64_t> permutation;
+    for (unsigned axis = 0; axis < view.getRank(); ++axis) {
+      auto found = llvm::find(blockAxes, axis);
+      if (found != blockAxes.end()) {
+        unsigned fragmentAxis = std::distance(blockAxes.begin(), found);
+        shape.push_back(fragment.getShape()[fragmentAxis]);
+        auto mapping = cast<gpu::AxisMapAttr>(fragment.getAxisMaps()[fragmentAxis]);
+        mappings.push_back(gpu::AxisMapAttr::get(
+            kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+            mapping.getDimensionId(), axis, mapping.getDerived()));
+        orderedShape.push_back(fragment.getShape()[fragmentAxis]);
+        orderedMappings.push_back(gpu::AxisMapAttr::get(
+            kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+            mapping.getDimensionId(), permutation.size(), mapping.getDerived()));
+        permutation.push_back(fragmentAxis);
+      } else {
+        shape.push_back(gpu::PhysicalExprAttr::get(
+            kernel.getContext(),
+            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), 1,
+            entry.getStringAttr(""), entry.getArrayAttr({})));
+        mappings.push_back(gpu::AxisMapAttr::get(
+            kernel.getContext(), nextSource++, 0, nextDimension++, axis, true));
+      }
+    }
+    auto nativeFragment = gpu::FragmentType::get(
+        kernel.getContext(), fragment.getElementType(), entry.getArrayAttr(shape),
+        entry.getArrayAttr(mappings), fragment.getValidity(), fragment.getOwner());
+    auto orderedFragment = gpu::FragmentType::get(
+        kernel.getContext(), fragment.getElementType(),
+        entry.getArrayAttr(orderedShape), entry.getArrayAttr(orderedMappings),
+        fragment.getValidity(), fragment.getOwner());
+    SmallVector<Value> descriptorBlockShape;
+    for (Attribute extent : nativeFragment.getShape())
+      descriptorBlockShape.push_back(entry.create<gpu::PhysicalExprOp>(
+          kernel.getLoc(), entry.getIndexType(),
+          cast<gpu::PhysicalExprAttr>(extent)));
+    std::optional<int64_t> elementBytes =
+        descriptorElementBytes(view.getElementType());
+    if (!elementBytes || 16 % *elementBytes != 0)
+      return failure();
+    int64_t maximumBlockElements = maxTritonTensorElements;
+    if (llvm::all_of(localOptions, [](const TritonLocalOptions &options) {
+          return options.ctas == 1;
+        })) {
+      // Single-CTA TMA materializes the entire descriptor block in shared
+      // memory. Other buffers and barriers remain the provider's responsibility.
+      maximumBlockElements = std::min(
+          maximumBlockElements,
+          capabilities.getMaxDynamicSharedMemoryPerBlock() / *elementBytes);
+    }
+    SmallVector<int64_t> initialBlockShape(view.getRank(), 1);
+    initialBlockShape.back() = 16 / *elementBytes;
+    auto descriptor = entry.create<TensorDescriptorOp>(
+        kernel.getLoc(), viewValue.getType(), viewValue, dimensions, strides,
+        descriptorBlockShape, blockAxes,
+        initialBlockShape, "strided", "zero", alignedAxes,
+        ArrayRef<int64_t>{static_cast<int64_t>(view.getRank()) - 1},
+        /*requirePositiveShape=*/true,
+        /*requirePositiveStrides=*/true,
+        /*requirePowerOfTwoBlockShape=*/true, /*alignment=*/16,
+        /*minimumContiguousBytes=*/16,
+        /*pipelineBlockAlignment=*/1,
+        /*maximumShapeExtent=*/std::numeric_limits<int32_t>::max(),
+        maximumBlockElements);
+    descriptors.push_back(
+        {viewValue, fragment, orderedFragment, nativeFragment,
+         SmallVector<int64_t>(blockAxes.begin(), blockAxes.end()),
+         permutation, descriptor});
+    return descriptors.back();
+  };
+  for (auto &[load, plan] : loads)
+    if (failed(descriptorFor(load.getResource(),
+                            cast<gpu::FragmentType>(load.getResult().getType()),
+                            plan.blockAxes)))
+      return load.emitOpError(
+          "could not declare its tensor-descriptor runtime contract");
+  for (auto &[store, plan] : stores)
+    if (failed(descriptorFor(store.getResource(),
+                            cast<gpu::FragmentType>(store.getValue().getType()),
+                            plan.blockAxes)))
+      return store.emitOpError(
+          "could not declare its tensor-descriptor runtime contract");
+  SmallVector<Value> descriptorValues;
+  for (DescriptorPlan &plan : descriptors)
+    descriptorValues.push_back(plan.descriptor.getResult());
+  auto choice = entry.create<TensorDescriptorChoiceOp>(
+      kernel.getLoc(), entry.getI1Type(), descriptorValues,
+      entry.getStringAttr("host"), entry.getStringAttr("all_eligible"),
+      entry.getStringAttr(tensorDescriptorChoice),
+      entry.getStringAttr(tensorDescriptorEligibility));
+  auto prepareBranch = [](Region &region) {
+    Block &block = region.front();
+    if (!block.empty() && isa<scf::YieldOp>(block.back()))
+      block.back().erase();
+    return OpBuilder(&block, block.end());
+  };
+
+  auto reshape = [&](OpBuilder &builder, Location location, Value value,
+                     gpu::FragmentType target) -> FailureOr<Value> {
+    if (value.getType() == target)
+      return value;
+    auto reassociation = gpu::inferReshapeReassociation(
+        cast<gpu::FragmentType>(value.getType()), target);
+    if (failed(reassociation))
+      return failure();
+    return Value(builder.create<gpu::ReshapeOp>(location, target, value,
+                                               *reassociation));
+  };
+  for (auto &[load, plan] : loads) {
+    OpBuilder builder(load);
+    auto fragment = cast<gpu::FragmentType>(load.getResult().getType());
+    auto descriptor = descriptorFor(load.getResource(), fragment, plan.blockAxes);
+    FailureOr<SmallVector<Value>> descriptorOffsets =
+        materializeDescriptorOffsets(builder, load.getLoc(), plan.offsets);
+    if (failed(descriptor) || failed(descriptorOffsets))
+      return load.emitOpError(
+          "could not materialize the declared tensor-descriptor ABI");
+    if (load->getParentOfType<scf::ForOp>())
+      descriptor->descriptor.setPipelineBlockAlignmentAttr(
+          builder.getI64IntegerAttr(128));
+    auto conditional = builder.create<scf::IfOp>(
+        load.getLoc(), TypeRange{load.getResult().getType()}, choice.getResult(),
+        /*withElseRegion=*/true);
+    OpBuilder descriptorBuilder = prepareBranch(conditional.getThenRegion());
+    auto descriptorLoad = descriptorBuilder.create<DescriptorLoadOp>(
+        load.getLoc(), descriptor->nativeFragment,
+        descriptor->descriptor.getResult(), *descriptorOffsets,
+        descriptorBuilder.getDenseI64ArrayAttr(plan.boundaryAxes));
+    copyOrigin(load, descriptorLoad);
+    auto result = reshape(descriptorBuilder, load.getLoc(),
+                          descriptorLoad.getResult(), descriptor->orderedFragment);
+    if (failed(result))
+      return load.emitOpError("cannot remove descriptor unit axes");
+    if (!llvm::is_sorted(descriptor->permutation)) {
+      SmallVector<int64_t> inverse(descriptor->permutation.size());
+      for (auto [axis, original] : llvm::enumerate(descriptor->permutation))
+        inverse[original] = axis;
+      result = Value(descriptorBuilder.create<gpu::TransposeOp>(
+          load.getLoc(), fragment, *result,
+          descriptorBuilder.getDenseI64ArrayAttr(inverse)));
+    }
+    descriptorBuilder.create<scf::YieldOp>(load.getLoc(), *result);
+
+    OpBuilder blockBuilder = prepareBranch(conditional.getElseRegion());
+    auto block = cast<gpu::LoadOp>(blockBuilder.clone(*load));
+    blockBuilder.create<scf::YieldOp>(load.getLoc(), block.getResult());
+    load.getResult().replaceAllUsesWith(conditional.getResult(0));
+    load.erase();
+  }
+
+  for (auto &[store, plan] : stores) {
+    OpBuilder builder(store);
+    auto descriptor = descriptorFor(
+        store.getResource(), cast<gpu::FragmentType>(store.getValue().getType()),
+        plan.blockAxes);
+    FailureOr<SmallVector<Value>> descriptorOffsets =
+        materializeDescriptorOffsets(builder, store.getLoc(), plan.offsets);
+    if (failed(descriptor) || failed(descriptorOffsets))
+      return store.emitOpError(
+          "could not materialize the declared tensor-descriptor ABI");
+    auto conditional = builder.create<scf::IfOp>(
+        store.getLoc(), TypeRange{}, choice.getResult(),
+        /*withElseRegion=*/true);
+    OpBuilder descriptorBuilder = prepareBranch(conditional.getThenRegion());
+    Value ordered = store.getValue();
+    if (!llvm::is_sorted(descriptor->permutation))
+      ordered = descriptorBuilder.create<gpu::TransposeOp>(
+          store.getLoc(), descriptor->orderedFragment, ordered,
+          descriptorBuilder.getDenseI64ArrayAttr(descriptor->permutation));
+    auto value = reshape(descriptorBuilder, store.getLoc(), ordered,
+                         descriptor->nativeFragment);
+    if (failed(value))
+      return store.emitOpError("cannot insert descriptor unit axes");
+    auto descriptorStore = descriptorBuilder.create<DescriptorStoreOp>(
+        store.getLoc(), descriptor->descriptor.getResult(), *descriptorOffsets,
+        *value, descriptorBuilder.getDenseI64ArrayAttr(plan.boundaryAxes));
+    copyOrigin(store, descriptorStore);
+    descriptorBuilder.create<scf::YieldOp>(store.getLoc());
+
+    OpBuilder blockBuilder = prepareBranch(conditional.getElseRegion());
+    blockBuilder.clone(*store);
+    blockBuilder.create<scf::YieldOp>(store.getLoc());
+    store.erase();
+  }
+  return choice;
+}
+
+
+} // namespace intent::triton::detail

@@ -6,6 +6,8 @@
 #include "mlir/Support/LogicalResult.h"
 namespace intent::triton {
 
+void registerTritonPasses();
+
 mlir::LogicalResult legalizeProgramGrid(mlir::ModuleOp module);
 mlir::LogicalResult legalizeGPUProgram(mlir::ModuleOp module,
                                      const gpu::TuningProfiles &profiles);
