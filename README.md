@@ -105,4 +105,4 @@ Start with `read(id="doc/dsl/authoring.md")`, then use `api(name="intent.compile
 - `artifact.source` contains the generated provider program; `artifact.mlir` contains the target IR. `artifact.cache_directory` locates compiler inputs, outputs, and diagnostics. `intent.generate(...)` emits source and IR without creating a callable.
 - `intent.CompilationStageError.stage` identifies the failed compilation stage. Its `cache_directory`, when available, points to the diagnostic artifacts.
 - The compiler is discovered from an explicit `compiler=`, then `INTENT_COMPILER`, the installed package, or `PATH`. A supplied invalid path is an error.
-- [Author guide](doc/dsl/authoring.md) · [Language and compiler specification](doc/index.md) · [Algorithm examples](examples/README.md) · [Existing experiments and results](experiments/README.md)
+- [Author guide](doc/dsl/authoring.md) · [Language and compiler specification](doc/index.md) · [Algorithm examples](examples/README.md) · [Existing experiments and results](experiments/README.md) · [Developer guide](CONTRIBUTING.md)
