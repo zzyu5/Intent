@@ -1339,6 +1339,27 @@ private:
         });
   }
 
+  Value insertUnitMatrixAxis(Value value, bool row, Location loc) {
+    auto type = cast<MemRefType>(value.getType());
+    int64_t rank = type.getRank();
+    SmallVector<int64_t> shape(type.getShape());
+    shape.insert(shape.begin() + rank - (row ? 1 : 0), 1);
+    SmallVector<ReassociationIndices> groups;
+    SmallVector<OpFoldResult> sizes;
+    for (int64_t axis = 0; axis + 1 < rank; ++axis)
+      groups.push_back({axis});
+    groups.push_back({rank - 1, rank});
+    for (int64_t axis = 0; axis < rank; ++axis) {
+      if (row && axis + 1 == rank)
+        sizes.push_back(builder.getIndexAttr(1));
+      sizes.push_back(type.isDynamicDim(axis)
+          ? OpFoldResult(builder.create<memref::DimOp>(loc, value, axis).getResult())
+          : OpFoldResult(builder.getIndexAttr(type.getDimSize(axis))));
+    }
+    if (!row) sizes.push_back(builder.getIndexAttr(1));
+    return builder.create<memref::ExpandShapeOp>(loc, shape, value, groups, sizes);
+  }
+
   LogicalResult contract(ContractOp operation) {
     auto lhsType = cast<RankedTensorType>(operation.getLhs().getType());
     auto rhsType = cast<RankedTensorType>(operation.getRhs().getType());
@@ -1415,11 +1436,16 @@ private:
       values.map(operation.getResult(), output);
       return success();
     }
-    if (lhsType.getRank() != batchRank + 2 || rhsType.getRank() != batchRank + 2 || pairs.size() != 1 ||
-        cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[0]).getInt() != batchRank + 1 ||
+    bool lhsVector = lhsType.getRank() == batchRank + 1;
+    bool rhsVector = rhsType.getRank() == batchRank + 1;
+    if ((!lhsVector && lhsType.getRank() != batchRank + 2) ||
+        (!rhsVector && rhsType.getRank() != batchRank + 2) ||
+        (lhsVector && rhsVector) || pairs.size() != 1 ||
+        resultType.getRank() != batchRank + 2 - lhsVector - rhsVector ||
+        cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[0]).getInt() != batchRank + (lhsVector ? 0 : 1) ||
         cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[1]).getInt() != batchRank ||
         (!floating && !integer))
-      return operation.emitError("CPU construction requires a floating vector dot or a matrix contraction with lossless floating widening or i8 to i32 accumulation");
+      return operation.emitError("CPU construction requires a floating vector dot or a leading-batch matrix/vector contraction with lossless floating widening or i8 to i32 accumulation");
     for (auto [axis, pair] : llvm::enumerate(operation.getBatch())) {
       auto relation = cast<ArrayAttr>(pair);
       if (cast<IntegerAttr>(relation[0]).getInt() != static_cast<int64_t>(axis) ||
@@ -1431,7 +1457,17 @@ private:
     if (failed(sizes)) return failure();
     Value output = allocate(resultType, *sizes, loc);
     Value lhs = values.lookup(operation.getLhs()), rhs = values.lookup(operation.getRhs());
-    if (!batchRank) matrix(lhs, rhs, output, loc);
+    Value matrixOutput = output;
+    // A missing free axis is a unit physical view, not a different algorithm
+    // or a copy. Preserve batch axes, source strides and the original result ABI.
+    if (lhsVector) {
+      lhs = insertUnitMatrixAxis(lhs, /*row=*/true, loc);
+      matrixOutput = insertUnitMatrixAxis(output, /*row=*/true, loc);
+    } else if (rhsVector) {
+      rhs = insertUnitMatrixAxis(rhs, /*row=*/false, loc);
+      matrixOutput = insertUnitMatrixAxis(output, /*row=*/false, loc);
+    }
+    if (!batchRank) matrix(lhs, rhs, matrixOutput, loc);
     else {
       SmallVector<Value> begins(batchRank, constant(loc, 0)), steps(batchRank, constant(loc, 1)), ends;
       for (int64_t axis = 0; axis < batchRank; ++axis)
@@ -1456,7 +1492,7 @@ private:
             type.getShape().take_back(2), type, offsets, extents, strides));
         return builder.create<memref::SubViewOp>(loc, result, source, offsets, extents, strides);
       };
-      matrix(slice(lhs), slice(rhs), slice(output), loc);
+      matrix(slice(lhs), slice(rhs), slice(matrixOutput), loc);
     }
     values.map(operation.getResult(), output);
     return success();
