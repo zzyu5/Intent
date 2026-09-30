@@ -33,5 +33,16 @@ struct StorageLifetime {
 std::optional<StorageLifetime>
 queryStorageLifetime(mlir::memref::AllocOp allocation);
 
+// Prove that all effects in scope preserve the observed storage. Distinct SSA
+// roots alone are not disjoint: use alias analysis or the explicit CPU ABI.
+bool preservesStorage(mlir::Operation *scope, mlir::Value memory);
+bool areDisjointStorage(mlir::Value first, mlir::Value second,
+                         mlir::Operation *scope);
+
+// A read performed in 'from' may be replayed at 'to' only while its allocation
+// remains live and no intervening or enclosing-consumer effect can change it.
+bool isStorageReadStable(mlir::Value memory, mlir::Operation *from,
+                         mlir::Operation *to);
+
 } // namespace intent::cpu
 #endif

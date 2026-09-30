@@ -1,5 +1,7 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
+#include "IntegerSources.h"
+#include "ContiguousAccesses.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -455,6 +457,8 @@ void forwardPointwiseCopies(func::FuncOp function) {
 }
 
 LogicalResult fuseStructuredComputations(func::FuncOp function) {
+  foldIntegerSources(function);
+  foldContiguousAccesses(function);
   forwardCPUOutputs(function);
   bool changed;
   do {

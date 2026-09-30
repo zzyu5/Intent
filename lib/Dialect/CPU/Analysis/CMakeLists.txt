@@ -8,6 +8,7 @@ add_mlir_library(MLIRIntentCPUAnalysis
   LINK_LIBS PUBLIC
   MLIRIntentCPUDialect
   MLIRIntentAnalysis
+  MLIRAnalysis
   MLIRFuncDialect
   MLIRLinalgDialect
   MLIRMathDialect

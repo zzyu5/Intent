@@ -1,5 +1,9 @@
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
+#include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
+#include "mlir/Analysis/AliasAnalysis.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
 #include "llvm/ADT/DenseSet.h"
 
@@ -76,6 +80,66 @@ queryStorageLifetime(memref::AllocOp allocation) {
     if (user != lifetime.end && !lifetime.contains(user))
       return std::nullopt;
   return lifetime;
+}
+
+namespace {
+bool disjoint(Value first, Value second, PhysicalProgramAnalysis &physical,
+              AliasAnalysis &aliases, InterfaceAttr interface) {
+  Value root = physical.storageRoot(first), other = physical.storageRoot(second);
+  if (root == other) return false;
+  if (aliases.alias(root, other).isNo()) return true;
+  auto source = physical.externalView(root), destination = physical.externalView(other);
+  if (!source || !destination) return false;
+  return source.getNoalias() || destination.getNoalias() ||
+      (interface && interface.getDisjointOutputs() &&
+       (source.getAccess() != 0 || destination.getAccess() != 0));
+}
+} // namespace
+
+bool areDisjointStorage(Value first, Value second, Operation *scope) {
+  auto function = dyn_cast<func::FuncOp>(scope);
+  if (!function) function = scope->getParentOfType<func::FuncOp>();
+  if (!function) return false;
+  PhysicalProgramAnalysis physical(function);
+  AliasAnalysis aliases(function);
+  return disjoint(first, second, physical, aliases,
+      function->getAttrOfType<InterfaceAttr>("intent_cpu.interface"));
+}
+
+bool preservesStorage(Operation *scope, Value memory) {
+  auto function = dyn_cast<func::FuncOp>(scope);
+  if (!function) function = scope->getParentOfType<func::FuncOp>();
+  if (!function) return false;
+  auto effects = getEffectsRecursively(scope);
+  if (!effects) return false;
+  PhysicalProgramAnalysis physical(function);
+  AliasAnalysis aliases(function);
+  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  return llvm::all_of(*effects, [&](const MemoryEffects::EffectInstance &effect) {
+    if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect())) return true;
+    Value affected = effect.getValue();
+    if (!affected || !isa<BaseMemRefType>(affected.getType())) return false;
+    return disjoint(memory, affected, physical, aliases, interface);
+  });
+}
+
+bool isStorageReadStable(Value memory, Operation *from, Operation *to) {
+  auto function = from->getParentOfType<func::FuncOp>();
+  if (!function || function != to->getParentOfType<func::FuncOp>() ||
+      !DominanceInfo(function).dominates(memory, to)) return false;
+  Operation *consumer = from->getBlock()->findAncestorOpInBlock(*to);
+  if (!consumer || consumer == from || !from->isBeforeInBlock(consumer)) return false;
+  PhysicalProgramAnalysis physical(function);
+  Value root = physical.storageRoot(memory);
+  if (auto allocation = root.getDefiningOp<memref::AllocOp>()) {
+    auto lifetime = queryStorageLifetime(allocation);
+    if (!lifetime || !lifetime->aliases.complete || !lifetime->contains(to)) return false;
+  }
+  for (Operation *operation = from; ; operation = operation->getNextNode()) {
+    if (!preservesStorage(operation, memory)) return false;
+    if (operation == consumer) break;
+  }
+  return true;
 }
 
 } // namespace intent::cpu
