@@ -920,6 +920,8 @@ bool valueKnownNonNegative(Value value, unsigned depth = 0) {
 }
 
 bool coordinateKnownNonNegative(Value coordinate) {
+  if (queryNonNegativeIndexUpperBound(coordinate))
+    return true;
   return valueKnownNonNegative(coordinate);
 }
 
@@ -941,6 +943,12 @@ nonNegativeExtentBounds(func::FuncOp kernel, PhysicalExprAttr extent) {
     FailureOr<ParameterOp> parameter =
         queryParameterBySymbol(kernel, extent.getSymbol());
     if (failed(parameter))
+      return std::nullopt;
+    // Provider configuration formation may rebind resident capacity. Its
+    // positive sign is stable, but placeholder candidates and shared tuples
+    // cannot prove a numeric upper bound or absence of index overflow.
+    if (parameter->getParameter().getRole() ==
+        static_cast<uint32_t>(ParameterRole::ResidentWorkers))
       return std::nullopt;
     auto candidates = parameter->getParameter().getCandidates().asArrayRef();
     if (candidates.empty() ||
@@ -2095,7 +2103,9 @@ IndexBounds queryIndexBounds(Value value) {
         std::optional<int64_t> step = integerConstant(loop.getStep());
         if (auto parameter = loop.getStep().getDefiningOp<ParameterOp>()) {
           auto candidates = parameter.getParameter().getCandidates().asArrayRef();
-          if (!candidates.empty() && llvm::all_of(candidates, [](int64_t value) {
+          if (parameter.getParameter().getRole() !=
+                  static_cast<uint32_t>(ParameterRole::ResidentWorkers) &&
+              !candidates.empty() && llvm::all_of(candidates, [](int64_t value) {
                 return value > 0;
               }))
             step = *llvm::max_element(candidates);

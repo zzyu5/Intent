@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Analysis/IndexPredicates.h"
+#include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
@@ -27,108 +28,6 @@ std::optional<int64_t> integer(Value value) {
   return constant && constant.getType().isIndex()
              ? std::optional<int64_t>(constant.getInt()) : std::nullopt;
 }
-
-class IndexRelations {
-public:
-  bool same(Value lhs, Value rhs) {
-    if (samePhysicalScalarExpression(lhs, rhs))
-      return true;
-    auto left = queryLaunchExpression(lhs), right = queryLaunchExpression(rhs);
-    return left && right && left == right;
-  }
-
-  bool nonnegative(Value value) {
-    return bool(queryNonNegativeIndexUpperBound(value));
-  }
-
-  bool positive(Value value) {
-    if (auto literal = integer(value))
-      return *literal > 0;
-    auto expression = queryLaunchExpression(value);
-    auto owner = value.getDefiningOp();
-    auto kernel = owner ? owner->getParentOfType<func::FuncOp>() : func::FuncOp();
-    return expression && kernel && isKnownPositiveExtent(expression, kernel);
-  }
-
-  bool atMost(Value lhs, Value rhs) {
-    if (!lhs.getType().isIndex() || !rhs.getType().isIndex())
-      return false;
-    if (same(lhs, rhs))
-      return true;
-    auto key = std::make_pair(lhs, rhs);
-    auto inserted = comparisons.try_emplace(key, false);
-    if (!inserted.second)
-      return inserted.first->second;
-    bool result = proveAtMost(lhs, rhs);
-    comparisons[key] = result;
-    return result;
-  }
-
-  // Return an equal, aligned bound. min(aligned, other) is aligned only when
-  // the aligned operand is proven to be the selected minimum.
-  Value alignedBound(Value value, Value step) {
-    if (auto literal = integer(value); literal && *literal == 0)
-      return value;
-    if (same(value, step))
-      return value;
-    auto operation = value.getDefiningOp<BinaryOp>();
-    if (!operation)
-      return {};
-    if (operation.getOperatorKind() == BinaryOperator::Multiply) {
-      for (auto [quotient, factor] :
-           {std::pair{operation.getLhs(), operation.getRhs()},
-            std::pair{operation.getRhs(), operation.getLhs()}}) {
-        auto divide = quotient.getDefiningOp<BinaryOp>();
-        if (divide && divide.getOperatorKind() == BinaryOperator::FloorDivide &&
-            same(factor, step) && same(divide.getRhs(), step) &&
-            positive(step) && nonnegative(divide.getLhs()))
-          return value;
-      }
-    }
-    if (operation.getOperatorKind() == BinaryOperator::Minimum)
-      for (auto [candidate, other] :
-           {std::pair{operation.getLhs(), operation.getRhs()},
-            std::pair{operation.getRhs(), operation.getLhs()}})
-        if (Value aligned = alignedBound(candidate, step);
-            aligned && atMost(candidate, other))
-          return aligned;
-    return {};
-  }
-
-private:
-  bool proveAtMost(Value lhs, Value rhs) {
-    auto left = integer(lhs), right = integer(rhs);
-    if (left && right)
-      return *left <= *right;
-    if (left && *left == 0 && nonnegative(rhs))
-      return true;
-    if (auto binary = lhs.getDefiningOp<BinaryOp>()) {
-      if (binary.getOperatorKind() == BinaryOperator::Minimum)
-        return atMost(binary.getLhs(), rhs) || atMost(binary.getRhs(), rhs);
-      if (binary.getOperatorKind() == BinaryOperator::Maximum)
-        return atMost(binary.getLhs(), rhs) && atMost(binary.getRhs(), rhs);
-      if (binary.getOperatorKind() == BinaryOperator::Multiply)
-        for (auto [quotient, factor] :
-             {std::pair{binary.getLhs(), binary.getRhs()},
-              std::pair{binary.getRhs(), binary.getLhs()}}) {
-          auto divide = quotient.getDefiningOp<BinaryOp>();
-          if (divide && divide.getOperatorKind() == BinaryOperator::FloorDivide &&
-              same(divide.getRhs(), factor) && positive(factor) &&
-              nonnegative(divide.getLhs()) && atMost(divide.getLhs(), rhs))
-            return true;
-        }
-    }
-    if (auto binary = rhs.getDefiningOp<BinaryOp>()) {
-      if (binary.getOperatorKind() == BinaryOperator::Maximum)
-        return atMost(lhs, binary.getLhs()) || atMost(lhs, binary.getRhs());
-      if (binary.getOperatorKind() == BinaryOperator::Minimum)
-        return atMost(lhs, binary.getLhs()) && atMost(lhs, binary.getRhs());
-    }
-    return false;
-  }
-
-  DenseMap<std::pair<Value, Value>, bool> comparisons;
-};
 
 Value completeTileLimit(MakeRangeOp range, IndexRelations &relations) {
   auto type = cast<FragmentType>(range.getResult().getType());
