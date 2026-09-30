@@ -1,5 +1,6 @@
 #include "OnlineSummary.h"
 
+#include "Intent/Analysis/OnlineSummaryCombine.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -119,81 +120,6 @@ bool isRecordField(Value value, BlockArgument record, unsigned field) {
   value = stripProjection(value);
   auto extract = value.getDefiningOp<ExtractOp>();
   return extract && extract.getRecord() == record && extract.getField() == field;
-}
-
-bool isCommutativeRecordFieldBinary(Value value, BinaryOperator kind,
-                                    BlockArgument left, BlockArgument right,
-                                    unsigned field) {
-  auto binary = stripProjection(value).getDefiningOp<BinaryOp>();
-  if (!binary || binary.getOperatorKind() != kind)
-    return false;
-  return (isRecordField(binary.getLhs(), left, field) &&
-          isRecordField(binary.getRhs(), right, field)) ||
-         (isRecordField(binary.getLhs(), right, field) &&
-          isRecordField(binary.getRhs(), left, field));
-}
-
-FailureOr<Value> matchScale(Value value, BlockArgument record,
-                            unsigned validityField, unsigned maximumField,
-                            Value combinedMaximum,
-                            UnaryOp summaryExponential) {
-  auto scale = stripProjection(value).getDefiningOp<SelectOp>();
-  if (!scale ||
-      !isRecordField(scale.getCondition(), record, validityField) ||
-      !isZero(scale.getFalseValue()))
-    return failure();
-  auto exponential = scale.getTrueValue().getDefiningOp<UnaryOp>();
-  if (!exponential ||
-      exponential.getOperatorKind() != summaryExponential.getOperatorKind() ||
-      exponential.getApproximate() != summaryExponential.getApproximate() ||
-      exponential.getFlushToZero() != summaryExponential.getFlushToZero())
-    return failure();
-  auto delta = exponential.getInput().getDefiningOp<BinaryOp>();
-  if (!delta || delta.getOperatorKind() != BinaryOperator::Subtract ||
-      !isProjectedFrom(delta.getRhs(), combinedMaximum))
-    return failure();
-  auto normalized = stripProjection(delta.getLhs()).getDefiningOp<SelectOp>();
-  if (!normalized ||
-      !isRecordField(normalized.getCondition(), record, validityField) ||
-      !isRecordField(normalized.getTrueValue(), record, maximumField) ||
-      !isProjectedFrom(normalized.getFalseValue(), combinedMaximum))
-    return failure();
-  return scale.getResult();
-}
-
-bool matchScaledField(Value value, Value scale, BlockArgument record,
-                      unsigned field, Value &term) {
-  auto multiply = stripProjection(value).getDefiningOp<BinaryOp>();
-  if (!multiply || multiply.getOperatorKind() != BinaryOperator::Multiply)
-    return false;
-  bool matched =
-      (isProjectedFrom(multiply.getLhs(), scale) &&
-       isRecordField(multiply.getRhs(), record, field)) ||
-      (isProjectedFrom(multiply.getRhs(), scale) &&
-       isRecordField(multiply.getLhs(), record, field));
-  if (matched)
-    term = value;
-  return matched;
-}
-
-bool matchScaledSum(Value value, Value leftScale, BlockArgument left,
-                    Value rightScale, BlockArgument right, unsigned field,
-                    Value &leftTerm) {
-  auto add = stripProjection(value).getDefiningOp<BinaryOp>();
-  if (!add || add.getOperatorKind() != BinaryOperator::Add)
-    return false;
-  Value candidate;
-  if (matchScaledField(add.getLhs(), leftScale, left, field, candidate) &&
-      matchScaledField(add.getRhs(), rightScale, right, field, leftTerm)) {
-    leftTerm = candidate;
-    return true;
-  }
-  if (matchScaledField(add.getRhs(), leftScale, left, field, candidate) &&
-      matchScaledField(add.getLhs(), rightScale, right, field, leftTerm)) {
-    leftTerm = candidate;
-    return true;
-  }
-  return false;
 }
 
 } // namespace
@@ -350,49 +276,6 @@ matchOnlineSummaryMerge(Region &region,
     return failure();
   BlockArgument left = region.front().getArgument(0);
   BlockArgument right = region.front().getArgument(1);
-  UnaryOp summaryExponential = summary.exponential;
-
-  bool mergedValidity =
-      isCommutativeRecordFieldBinary(
-          record.getFields()[summary.validityField],
-          BinaryOperator::LogicalOr, left, right, summary.validityField) ||
-      isCommutativeRecordFieldBinary(
-          record.getFields()[summary.validityField],
-          BinaryOperator::BitwiseOr, left, right, summary.validityField);
-  if (!mergedValidity)
-    return failure();
-
-  Value combinedMaximum = record.getFields()[summary.maximumField];
-  auto finalMaximum =
-      stripProjection(combinedMaximum).getDefiningOp<SelectOp>();
-  if (!finalMaximum ||
-      !isRecordField(finalMaximum.getCondition(), right,
-                     summary.validityField))
-    return failure();
-  auto initialMaximum =
-      stripProjection(finalMaximum.getFalseValue()).getDefiningOp<SelectOp>();
-  if (!initialMaximum ||
-      !isRecordField(initialMaximum.getCondition(), left,
-                     summary.validityField) ||
-      !isRecordField(initialMaximum.getTrueValue(), left,
-                     summary.maximumField) ||
-      !isRecordField(initialMaximum.getFalseValue(), right,
-                     summary.maximumField))
-    return failure();
-  auto maximumOfBoth =
-      stripProjection(finalMaximum.getTrueValue()).getDefiningOp<BinaryOp>();
-  ReduceOp summaryMaximum = summary.maximum;
-  if (!maximumOfBoth ||
-      maximumOfBoth.getOperatorKind() !=
-          queryBinaryCombineKind(summaryMaximum.getCombine()) ||
-      !((isProjectedFrom(maximumOfBoth.getLhs(), initialMaximum.getResult()) &&
-         isRecordField(maximumOfBoth.getRhs(), right,
-                       summary.maximumField)) ||
-        (isProjectedFrom(maximumOfBoth.getRhs(), initialMaximum.getResult()) &&
-         isRecordField(maximumOfBoth.getLhs(), right,
-                       summary.maximumField))))
-    return failure();
-
   auto massAdd = stripProjection(record.getFields()[summary.massField])
                      .getDefiningOp<BinaryOp>();
   if (!massAdd || massAdd.getOperatorKind() != BinaryOperator::Add)
@@ -406,32 +289,19 @@ matchOnlineSummaryMerge(Region &region,
       if (stripProjection(operand).getDefiningOp<SelectOp>())
         candidates.push_back(stripProjection(operand));
   }
-  FailureOr<Value> leftScale = failure();
-  FailureOr<Value> rightScale = failure();
-  for (Value candidate : candidates) {
-    if (failed(leftScale))
-      leftScale = matchScale(candidate, left, summary.validityField,
-                             summary.maximumField, combinedMaximum,
-                             summaryExponential);
-    if (failed(rightScale))
-      rightScale = matchScale(candidate, right, summary.validityField,
-                              summary.maximumField, combinedMaximum,
-                              summaryExponential);
-  }
-  if (failed(leftScale) || failed(rightScale))
-    return failure();
-
-  Value leftMassTerm;
-  Value leftMomentTerm;
-  if (!matchScaledSum(record.getFields()[summary.massField], *leftScale, left,
-                      *rightScale, right, summary.massField, leftMassTerm) ||
-      !matchScaledSum(record.getFields()[summary.momentField], *leftScale, left,
-                      *rightScale, right, summary.momentField,
-                      leftMomentTerm))
-    return failure();
-
-  return OnlineSummaryMerge{record, combinedMaximum, *leftScale, *rightScale,
-                            leftMassTerm, leftMomentTerm};
+  // Keep the original first-match order among the mass expression's factors.
+  ReduceOp summaryMaximum = summary.maximum;
+  auto relations = matchOnlineSummaryCombine<BinaryOp, UnaryOp, SelectOp>(
+      record.getFields(), left, right,
+      {summary.validityField, summary.maximumField, summary.massField, summary.momentField},
+      queryBinaryCombineKind(summaryMaximum.getCombine()), summary.exponential,
+      candidates, stripProjection,
+      [](Value value, Value source) { return isProjectedFrom(value, source); },
+      isRecordField, isZero);
+  if (!relations) return failure();
+  return OnlineSummaryMerge{record, relations->combinedMaximum,
+                            relations->leftScale, relations->rightScale,
+                            relations->leftMassTerm, relations->leftMomentTerm};
 }
 
 ReduceOp cloneReductionWithSource(OpBuilder &builder, Location location,

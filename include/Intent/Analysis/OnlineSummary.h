@@ -20,6 +20,5 @@ struct OnlineSummary {
 // The descriptor refers only to current canonical helper computations. Target
 // construction supplies source slicing, storage and accumulator realization.
 std::optional<OnlineSummary> matchOnlineSummary(RegionFoldOp fold);
-void buildOnlineSummaryUpdate(RegionFoldOp fold, OnlineSummary plan, mlir::Region &region);
 }
 #endif

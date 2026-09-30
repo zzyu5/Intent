@@ -1,7 +1,7 @@
 #include "Intent/Analysis/OnlineSummary.h"
+#include "Intent/Analysis/OnlineSummaryCombine.h"
 #include "Intent/Analysis/UniformValues.h"
-#include "mlir/IR/IRMapping.h"
-#include <functional>
+#include <algorithm>
 
 using namespace mlir;
 namespace intent {
@@ -56,40 +56,6 @@ std::optional<BinaryOperator> reductionKind(ReduceOp reduce) {
 bool field(Value value, Value record, unsigned index) {
   auto extract = projected(value).getDefiningOp<ExtractOp>();
   return extract && extract.getProduct() == record && extract.getField() == index;
-}
-bool fieldPair(Value value, BinaryOperator kind, Value left, Value right, unsigned index) {
-  auto op = projected(value).getDefiningOp<BinaryOp>();
-  return op && op.getOperatorKind() == kind &&
-      ((field(op.getLhs(), left, index) && field(op.getRhs(), right, index)) ||
-       (field(op.getRhs(), left, index) && field(op.getLhs(), right, index)));
-}
-bool scale(Value value, Value record, OnlineSummary plan) {
-  auto select = projected(value).getDefiningOp<SelectOp>();
-  if (!select || !field(select.getCondition(), record, plan.validField) || !zero(select.getFalseValue())) return false;
-  auto exponential = select.getTrueValue().getDefiningOp<UnaryOp>();
-  if (!exponential || exponential.getOperatorKind() != plan.exponential.getOperatorKind() ||
-      exponential.getApproximate() != plan.exponential.getApproximate() ||
-      exponential.getFlushToZero() != plan.exponential.getFlushToZero()) return false;
-  auto subtract = exponential.getInput().getDefiningOp<BinaryOp>();
-  if (!subtract || subtract.getOperatorKind() != BinaryOperator::Subtract ||
-      projected(subtract.getRhs()) != projected(plan.combinedMaximum)) return false;
-  auto valid = projected(subtract.getLhs()).getDefiningOp<SelectOp>();
-  return valid && field(valid.getCondition(), record, plan.validField) &&
-      field(valid.getTrueValue(), record, plan.maxField) &&
-      projected(valid.getFalseValue()) == projected(plan.combinedMaximum);
-}
-bool scaled(Value value, Value factor, Value record, unsigned index) {
-  auto multiply = projected(value).getDefiningOp<BinaryOp>();
-  return multiply && multiply.getOperatorKind() == BinaryOperator::Multiply &&
-      ((projected(multiply.getLhs()) == factor && field(multiply.getRhs(), record, index)) ||
-       (projected(multiply.getRhs()) == factor && field(multiply.getLhs(), record, index)));
-}
-Value scaledSum(Value value, Value left, Value right, unsigned index, const OnlineSummary &plan) {
-  auto add = projected(value).getDefiningOp<BinaryOp>();
-  if (!add || add.getOperatorKind() != BinaryOperator::Add) return {};
-  if (scaled(add.getLhs(), plan.leftScale, left, index) && scaled(add.getRhs(), plan.rightScale, right, index)) return add.getLhs();
-  if (scaled(add.getRhs(), plan.leftScale, left, index) && scaled(add.getLhs(), plan.rightScale, right, index)) return add.getRhs();
-  return {};
 }
 }
 
@@ -150,76 +116,23 @@ std::optional<OnlineSummary> matchOnlineSummary(RegionFoldOp fold) {
   if (!scoreAxes || !valueAxes || scoreAxes.getDimensions()[cast<IntegerAttr>(pair[0]).getInt()] !=
       valueAxes.getDimensions()[cast<IntegerAttr>(pair[1]).getInt()]) return std::nullopt;
 
-  Value left = merge.getArgument(0), right = merge.getArgument(1);
-  if (!fieldPair(plan.merged.getFields()[plan.validField], BinaryOperator::LogicalOr, left, right, plan.validField) &&
-      !fieldPair(plan.merged.getFields()[plan.validField], BinaryOperator::BitwiseOr, left, right, plan.validField)) return std::nullopt;
-  plan.combinedMaximum = plan.merged.getFields()[plan.maxField];
-  auto finalMax = projected(plan.combinedMaximum).getDefiningOp<SelectOp>();
-  if (!finalMax || !field(finalMax.getCondition(), right, plan.validField)) return std::nullopt;
-  auto firstMax = projected(finalMax.getFalseValue()).getDefiningOp<SelectOp>();
-  auto maximum = projected(finalMax.getTrueValue()).getDefiningOp<BinaryOp>();
-  if (!firstMax || !field(firstMax.getCondition(), left, plan.validField) ||
-      !field(firstMax.getTrueValue(), left, plan.maxField) || !field(firstMax.getFalseValue(), right, plan.maxField) ||
-      !maximum || maximum.getOperatorKind() != reductionKind(plan.maximum) ||
-      !((projected(maximum.getLhs()) == firstMax.getResult() && field(maximum.getRhs(), right, plan.maxField)) ||
-        (projected(maximum.getRhs()) == firstMax.getResult() && field(maximum.getLhs(), right, plan.maxField)))) return std::nullopt;
-  merge.walk([&](SelectOp select) {
-    if (scale(select.getResult(), left, plan)) plan.leftScale = select.getResult();
-    if (scale(select.getResult(), right, plan)) plan.rightScale = select.getResult();
-  });
-  if (!plan.leftScale || !plan.rightScale) return std::nullopt;
-  plan.leftMassTerm = scaledSum(plan.merged.getFields()[plan.massField], left, right, plan.massField, plan);
-  plan.leftMomentTerm = scaledSum(plan.merged.getFields()[plan.momentField], left, right, plan.momentField, plan);
-  if (!plan.leftMassTerm || !plan.leftMomentTerm) return std::nullopt;
+  SmallVector<Value> candidates;
+  merge.walk([&](SelectOp select) { candidates.push_back(select.getResult()); });
+  // Canonical matching historically selects the last matching scale in walk
+  // order. The shared matcher selects the first candidate, so reverse here.
+  std::reverse(candidates.begin(), candidates.end());
+  auto relations = matchOnlineSummaryCombine<BinaryOp, UnaryOp, SelectOp>(
+      plan.merged.getFields(), merge.getArgument(0), merge.getArgument(1),
+      {plan.validField, plan.maxField, plan.massField, plan.momentField},
+      reductionKind(plan.maximum), plan.exponential, candidates, projected,
+      [](Value value, Value source) { return projected(value) == projected(source); },
+      field, zero);
+  if (!relations) return std::nullopt;
+  plan.combinedMaximum = relations->combinedMaximum;
+  plan.leftScale = relations->leftScale;
+  plan.rightScale = relations->rightScale;
+  plan.leftMassTerm = relations->leftMassTerm;
+  plan.leftMomentTerm = relations->leftMomentTerm;
   return plan;
-}
-
-void buildOnlineSummaryUpdate(RegionFoldOp fold, OnlineSummary plan, Region &region) {
-  auto &summary = fold.getSummarize().front();
-  auto &merge = fold.getCombine().front();
-  auto *body = new Block;
-  region.push_back(body);
-  OpBuilder b(fold.getContext());
-  IRMapping mapping;
-  for (BlockArgument argument : summary.getArguments())
-    mapping.map(argument, body->addArgument(argument.getType(), argument.getLoc()));
-  mapping.map(merge.getArgument(0), body->addArgument(merge.getArgument(0).getType(), fold.getLoc()));
-  b.setInsertionPointToStart(body);
-  SmallVector<Value> right(4);
-  std::function<Value(Value)> clone = [&](Value value) -> Value {
-    if (Value mapped = mapping.lookupOrNull(value)) return mapped;
-    Operation *op = value.getDefiningOp();
-    if (!op || (op->getBlock() != &summary && op->getBlock() != &merge)) return value;
-    if (auto extract = dyn_cast<ExtractOp>(op); extract && extract.getProduct() == merge.getArgument(1)) {
-      Value mapped = right[extract.getField()];
-      assert(mapped && "only the available region maximum and validity may be read before normalization");
-      mapping.map(value, mapped);
-      return mapped;
-    }
-    for (Value operand : op->getOperands()) mapping.map(operand, clone(operand));
-    return b.clone(*op, mapping)->getResult(cast<OpResult>(value).getResultNumber());
-  };
-  right[plan.validField] = clone(plan.validity.getResult(0));
-  right[plan.maxField] = clone(plan.maximumOrEmpty.getResult());
-  Value maximum = clone(plan.combinedMaximum);
-  Value massSeed = clone(plan.leftMassTerm), momentSeed = clone(plan.leftMomentTerm);
-  mapping.map(plan.maximumOrEmpty.getResult(), maximum);
-  Value mass = clone(plan.mass.getResult(0));
-  Value moment = clone(plan.moment.getResult());
-  auto add = [&](Value lhs, Value rhs) -> Value {
-    return b.create<BinaryOp>(fold.getLoc(), lhs.getType(), lhs, rhs,
-        BinaryOperatorAttr::get(b.getContext(), BinaryOperator::Add), b.getBoolAttr(false), b.getBoolAttr(false));
-  };
-  Value accumulator = add(momentSeed, moment);
-  if (plan.momentOrEmpty)
-    accumulator = b.create<SelectOp>(fold.getLoc(), accumulator.getType(),
-        clone(plan.momentOrEmpty.getCondition()), accumulator, momentSeed);
-  SmallVector<Value> fields(4);
-  fields[plan.validField] = clone(plan.merged.getFields()[plan.validField]);
-  fields[plan.maxField] = maximum;
-  fields[plan.massField] = add(massSeed, mass);
-  fields[plan.momentField] = accumulator;
-  Value result = b.create<MakeRecordOp>(fold.getLoc(), plan.merged.getResult().getType(), fields);
-  b.create<YieldOp>(fold.getLoc(), result);
 }
 }
