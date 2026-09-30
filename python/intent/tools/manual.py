@@ -40,21 +40,27 @@ def _section_body(text: str) -> str:
     return text[:sections[1][0]] if len(sections) > 1 else text
 
 
-def snapshot(project: Path) -> dict:
-    """Freeze public language and kernel/host contracts, without algorithm examples."""
-    project = project.resolve()
+def _corpus(documents_root: Path, package: Path, revision: str) -> dict:
+    """Collect public contracts and declarations, without algorithm examples."""
     import intent
     import intent.language as language
+    import intent.targets as targets
     from intent.language.builtins import INTRINSICS, Intrinsic, IntrinsicNamespace, QuantFormats
     from intent.language.dtypes import DType
     from intent.language.signatures import INTRINSIC_SIGNATURES
 
     documents = {}
-    paths = [path for directory in (project / "doc/dsl", project / "doc/programming-model")
-             for path in directory.glob("*.md")]
+    paths = []
+    for name in ("dsl", "programming-model"):
+        directory = documents_root / name
+        if not directory.is_dir():
+            raise FileNotFoundError(
+                f"Intent manual resources are missing: {directory}; reinstall IntentDSL with its manual resources"
+            )
+        paths.extend(directory.glob("*.md"))
     for path in sorted(paths):
-        identifier = str(path.relative_to(project))
-        text = path.read_text()
+        identifier = "doc/" + path.relative_to(documents_root).as_posix()
+        text = path.read_text(encoding="utf-8")
         sections = _sections(text)
         documents[identifier] = {
             "id": identifier, "title": sections[0][3] if sections else path.stem,
@@ -74,6 +80,12 @@ def snapshot(project: Path) -> dict:
     exports = {name: getattr(language, name) for name in language.__all__}
     exports.update(INTRINSICS)
     exports.update({f"intent.{name}": getattr(intent, name) for name in intent.__all__})
+    target_aliases = {
+        f"intent.targets.{name}": f"intent.{name}"
+        for name in targets.__all__ if name in intent.__all__
+        and getattr(targets, name) is getattr(intent, name)
+    }
+    exports.update({alias: exports[canonical] for alias, canonical in target_aliases.items()})
     for name, value in list(exports.items()):
         if inspect.isclass(value):
             exports.update({f"{name}.{member}": method for member, method in vars(value).items()
@@ -81,8 +93,8 @@ def snapshot(project: Path) -> dict:
         elif isinstance(value, QuantFormats):
             exports.update({f"{name}.{field.name}": getattr(value, field.name)
                             for field in fields(value) if not field.name.startswith("_")})
-    for path in sorted((project / "python/intent/frontend/lowering").rglob("*.py")):
-        for node in ast.walk(ast.parse(path.read_text())):
+    for path in sorted((package / "frontend/lowering").rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if not isinstance(node, ast.Call) or not node.args:
                 continue
             is_diagnostic = isinstance(node.func, ast.Attribute) and node.func.attr == "error"
@@ -92,7 +104,7 @@ def snapshot(project: Path) -> dict:
             message = node.args[-1]
             if not isinstance(message, ast.Constant) or not isinstance(message.value, str):
                 continue
-            source = str(path.relative_to(project))
+            source = "python/intent/" + path.relative_to(package).as_posix()
             identifier = f"diagnostic:{source}:L{node.lineno}"
             documents[identifier] = {
                 "id": identifier, "title": message.value, "kind": "diagnostic",
@@ -108,7 +120,7 @@ def snapshot(project: Path) -> dict:
             source = "python/intent/language/signatures.py" if signature else "python/intent/language/builtins.py"
         elif inspect.isfunction(value) or inspect.isclass(value):
             signature = inspect.signature(value) if inspect.isfunction(value) or inspect.isfunction(vars(value).get("__init__")) else None
-            source = str(Path(inspect.getfile(value)).resolve().relative_to(project))
+            source = "python/intent/" + Path(inspect.getfile(value)).resolve().relative_to(package).as_posix()
         else:
             signature, source = None, "python/intent/language/__init__.py"
         if isinstance(value, Intrinsic):
@@ -142,6 +154,11 @@ def snapshot(project: Path) -> dict:
             "members": list(value.members) if isinstance(value, IntrinsicNamespace) else [],
             "availability": "public declaration; backend support and performance are not implied",
         }
+    for alias, canonical in target_aliases.items():
+        rules = list(dict.fromkeys((*symbols[canonical]["sections"], *symbols[alias]["sections"])))
+        symbols[canonical]["sections"] = rules
+        symbols[alias]["sections"] = rules
+        symbols[alias]["canonical"] = canonical
     # Core surface shorthands keep their own signatures and share canonical rules.
     for canonical, shorthands in {
         "reduce": ("reduce.sum", "reduce.max", "reduce.any", "reduce.all", "arg_reduce.max"),
@@ -156,9 +173,22 @@ def snapshot(project: Path) -> dict:
             symbols[name]["canonical"] = canonical
             symbols[name]["sections"] = list(dict.fromkeys((*symbols[name]["sections"], *rules)))
     return {
-        "revision": subprocess.check_output(["git", "-C", str(project), "rev-parse", "HEAD"], text=True).strip(),
+        "revision": revision,
         "documents": documents, "symbols": symbols,
     }
+
+
+def snapshot(project: Path) -> dict:
+    """Freeze repository contracts for an explicitly prepared evaluation corpus."""
+    project = project.resolve()
+    revision = subprocess.check_output(["git", "-C", str(project), "rev-parse", "HEAD"], text=True).strip()
+    return _corpus(project / "doc", project / "python/intent", revision)
+
+
+def installed_corpus() -> dict:
+    """Read the installed manual and the declarations from the same package."""
+    package = Path(__file__).resolve().parents[1]
+    return _corpus(package / "_manual/doc", package, "installed public API")
 
 
 class Manual:
@@ -315,14 +345,30 @@ class Manual:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Read-only Intent author manual MCP (requires mcp>=1.28,<2)")
-    parser.add_argument("--corpus", type=Path, required=True, help="Frozen public material JSON, not a repository root")
+    parser.add_argument("--corpus", type=Path,
+                        help="Use an explicit frozen public material JSON instead of the installed manual")
     arguments = parser.parse_args()
-    from mcp.server.fastmcp import FastMCP
-    from mcp.types import ToolAnnotations
+    try:
+        from mcp.server.fastmcp import FastMCP
+        from mcp.types import ToolAnnotations
+    except ModuleNotFoundError as error:
+        if error.name != "mcp":
+            raise
+        parser.error("Install IntentDSL with its 'manual' extra (from a checkout: pip install '.[manual]').")
 
-    manual = Manual(json.loads(arguments.corpus.read_text()))
+    manual = Manual(json.loads(arguments.corpus.read_text(encoding="utf-8"))
+                    if arguments.corpus is not None else installed_corpus())
+    host_instructions = (
+        "Call api(name='intent.compile') or api(name='intent.generate') for the current public host interfaces, "
+        "and search(query='Target', kind='api') for target declarations. "
+        if arguments.corpus is None else
+        "Use api(name=...) for the host interface declared by this explicit corpus. "
+    )
     server = FastMCP("intent_manual", instructions=(
-        "Intent language and GPU execution contracts. Call api(name='I.domain') for exact declarations and rule IDs; "
+        "Read-only Intent language and kernel/host contracts. "
+        "Start with read(id='doc/dsl/authoring.md'). "
+        + host_instructions +
+        "Call api(name='I.domain') for exact DSL declarations and rule IDs; "
         "read(id=...) for syntax, types, semantics and callable interface rules. "
         "read(id=..., section=...) accepts an exact section title or its published heading line. "
         "Use search(query=..., kind=...) to find names and IDs. "
