@@ -1,4 +1,6 @@
 #include "ImplementationInputs.h"
+#include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Utilities.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
@@ -194,7 +196,11 @@ FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepare(linalg::Generi
         operation.getRegion().front().getArgument(requirement.operand), requirement))) return failure();
     if (requirement.reuse == InputReuse::Group) continue;
     if (auto supply = prepareWindow(source, requirement, operation)) supplies.push_back(*supply);
-    else supplies.push_back(materialize(source, requirement, consumerScope(source, operation, requirement, implementation)));
+    else {
+      Operation *scope = consumerScope(source, operation, requirement, implementation);
+      if (auto loop = dyn_cast<scf::ForOp>(scope)) guardLoop(loop);
+      supplies.push_back(materialize(source, requirement, scope));
+    }
   }
   return supplies;
 }
@@ -362,7 +368,6 @@ Operation *ImplementationInputs::consumerScope(Value source, linalg::GenericOp o
     Value root = physical.storageRoot(memory);
     if (root == sourceRoot || (!fresh(root) && !fresh(sourceRoot))) return operation;
   }
-  guardLoop(loop);
   return loop;
 }
 
@@ -395,8 +400,10 @@ InputSupply ImplementationInputs::materialize(Value source, const InputRequireme
         !previous.allocation->isBeforeInBlock(consumer) ||
         (previous.allocation->getBlock() != scope->getBlock() && !analysis.isReadOnly(source)) ||
         !analysis.mayReadAt(source, previous.allocation, consumer)) continue;
+    auto lifetime = queryStorageLifetime(previous.allocation);
+    if (!lifetime || !lifetime->aliases.complete) continue;
     storage = previous.allocation;
-    if (previous.end->isBeforeInBlock(consumer)) previous.end->moveAfter(consumer);
+    if (lifetime->end->isBeforeInBlock(consumer)) lifetime->end->moveAfter(consumer);
     break;
   }
   if (!storage) {
@@ -453,8 +460,8 @@ InputSupply ImplementationInputs::materialize(Value source, const InputRequireme
       copyPanel(full, tail);
     }
     b.setInsertionPointAfter(scope);
-    auto end = b.create<memref::DeallocOp>(loc, storage);
-    prepared.push_back({source, requirement, storage, end});
+    b.create<memref::DeallocOp>(loc, storage);
+    prepared.push_back({source, requirement, storage});
   }
   OpBuilder b(scope);
   SmallVector<Value> begins(type.getRank(), index(b, scope->getLoc(), 0));

@@ -1,5 +1,6 @@
 add_mlir_library(MLIRIntentCPUAnalysis
   PhysicalProgram.cpp
+  Storage.cpp
   AxisRelations.cpp
   RegionPartition.cpp
   RegionPredicates.cpp
@@ -14,4 +15,5 @@ add_mlir_library(MLIRIntentCPUAnalysis
   MLIRSCFDialect
   MLIRIR
   MLIRSideEffectInterfaces
+  MLIRViewLikeInterface
 )

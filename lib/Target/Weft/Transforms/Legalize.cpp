@@ -3,6 +3,7 @@
 #include "Intent/Target/Weft/Serialization/Serializer.h"
 #include "Intent/Dialect/CPU/Analysis/AxisRelations.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 #include "Weft/Dialect/Kernel/IR/SubviewBounds.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"

@@ -1,4 +1,5 @@
 #include "Intent/Target/Mojo/Transforms/Passes.h"
+#include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "../../../Dialect/CPU/Transforms/Utilities.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -156,6 +157,11 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
 
 cpu::ImplementationRegistry implementations() {
   ImplementationRegistry result;
+  for (StringRef family : {"mojo.region_contraction", "mojo.register_contraction"})
+    result.addProfile(family, {"vector_width", "micro_m", "micro_n",
+                               "register_replicas", "reduction_replicas"});
+  for (StringRef family : {"mojo.region_vector", "mojo.vector"})
+    result.addProfile(family, {"vector_width", "register_replicas", "reduction_replicas"});
   result.profile = [](func::FuncOp function) -> StringRef {
     bool contraction = false, region = false;
     function.walk([&](linalg::GenericOp op) { contraction |= isMatrixContraction(op); });

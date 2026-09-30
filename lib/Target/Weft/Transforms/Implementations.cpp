@@ -1,4 +1,5 @@
 #include "Intent/Target/Weft/Transforms/Passes.h"
+#include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Quantization.h"
 #include "../../../Dialect/CPU/Transforms/Utilities.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -159,6 +160,11 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
 
 cpu::ImplementationRegistry implementations() {
   ImplementationRegistry result;
+  result.addProfile("weft.contract_i8_i32", {"micro_m", "micro_n", "micro_k"});
+  result.addProfile("weft.q8_k", {"chunk"});
+  for (StringRef family : {"weft.region_contract_f32", "weft.region_structured",
+                          "weft.contract_f32", "weft.structured"})
+    result.addProfile(family, {});
   result.profile = [](func::FuncOp function) -> StringRef {
     bool quantize = false, contraction = false, integer = false, region = false;
     function.walk([&](cpu::QuantizeOp) { quantize = true; });

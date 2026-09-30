@@ -1,4 +1,6 @@
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
+#include "mlir/Interfaces/ViewLikeInterface.h"
 #include "Intent/Dialect/CPU/IR/RegionProgram.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -83,11 +85,8 @@ bool isMatrixContraction(linalg::GenericOp operation) {
 
 Value PhysicalProgramAnalysis::storageRoot(Value memory) {
   while (true) {
-    if (auto view = memory.getDefiningOp<memref::SubViewOp>()) memory = view.getSource();
-    else if (auto view = memory.getDefiningOp<memref::ExpandShapeOp>()) memory = view.getSrc();
-    else if (auto view = memory.getDefiningOp<memref::CollapseShapeOp>()) memory = view.getSrc();
+    if (auto view = dyn_cast_or_null<ViewLikeOpInterface>(memory.getDefiningOp())) memory = view.getViewSource();
     else if (auto cast = memory.getDefiningOp<memref::CastOp>()) memory = cast.getSource();
-    else if (auto cast = memory.getDefiningOp<memref::ReinterpretCastOp>()) memory = cast.getSource();
     else if (auto metadata = memory.getDefiningOp<memref::ExtractStridedMetadataOp>()) memory = metadata.getSource();
     else if (auto argument = dyn_cast<BlockArgument>(memory)) {
       auto tasks = dyn_cast<TasksOp>(argument.getOwner()->getParentOp());
@@ -256,19 +255,9 @@ LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
     if (facts.stack && capabilities && (!facts.bytes || *facts.bytes > capabilities.getPrivateBytes()))
       return facts.value.getDefiningOp()->emitError("CPU stack allocation exceeds its declared budget");
     if (!facts.stack) {
-      memref::DeallocOp deallocation;
-      for (Operation *user : facts.value.getUsers())
-        if (auto dealloc = dyn_cast<memref::DeallocOp>(user)) {
-          if (deallocation) return dealloc.emitError("CPU allocation has more than one lifetime end");
-          deallocation = dealloc;
-        }
-      if (!deallocation || deallocation->getBlock() != facts.value.getDefiningOp()->getBlock())
-        return facts.value.getDefiningOp()->emitError("CPU heap allocation requires an explicit lexical lifetime end");
-      for (Operation *user : facts.value.getUsers()) {
-        Operation *ancestor = deallocation->getBlock()->findAncestorOpInBlock(*user);
-        if (!ancestor || (ancestor != deallocation && !ancestor->isBeforeInBlock(deallocation)))
-          return user->emitError("CPU buffer use escapes its declared lifetime");
-      }
+      if (!queryStorageLifetime(cast<memref::AllocOp>(facts.value.getDefiningOp())))
+        return facts.value.getDefiningOp()->emitError(
+            "CPU heap allocation requires one lexical lifetime end covering every known alias use");
     }
   }
   bool invalid = false;

@@ -1,8 +1,13 @@
 #ifndef INTENT_DIALECT_CPU_TRANSFORMS_IMPLEMENTATION_H
 #define INTENT_DIALECT_CPU_TRANSFORMS_IMPLEMENTATION_H
 
-#include "Intent/Dialect/CPU/Transforms/Passes.h"
+#include "Intent/Dialect/CPU/IR/CPUAttrs.h"
+#include "Intent/Dialect/CPU/Transforms/Configuration.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/IR/Builders.h"
 #include <functional>
+#include <optional>
 
 namespace intent::cpu {
 
@@ -62,6 +67,10 @@ struct Implementation {
 class ImplementationRegistry {
 public:
   std::function<llvm::StringRef(mlir::func::FuncOp)> profile;
+  void addProfile(llvm::StringRef name,
+                  llvm::ArrayRef<llvm::StringRef> localParameters);
+  std::optional<llvm::ArrayRef<llvm::StringRef>>
+  profileParameters(llvm::StringRef name) const;
   void add(Implementation implementation) { implementations.push_back(std::move(implementation)); }
   mlir::FailureOr<const Implementation *> lookup(mlir::Operation *operation) const;
   llvm::SmallVector<llvm::SmallVector<ImplementationAttr>> candidates(
@@ -72,6 +81,11 @@ public:
                            llvm::ArrayRef<ImplementationAttr> bindings) const;
 
 private:
+  struct ProfileSchema {
+    llvm::StringRef name;
+    llvm::SmallVector<llvm::StringRef> localParameters;
+  };
+  llvm::SmallVector<ProfileSchema> profiles;
   llvm::SmallVector<Implementation, 0> implementations;
 };
 

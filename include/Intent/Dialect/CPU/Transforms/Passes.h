@@ -3,6 +3,7 @@
 
 #include "Intent/Dialect/CPU/IR/CPUAttrs.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/Transforms/Configuration.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "llvm/ADT/StringRef.h"
@@ -11,18 +12,10 @@ namespace intent::cpu {
 
 class ImplementationRegistry;
 
-struct Configuration {
-  int64_t taskGrain;
-  int64_t tileM;
-  int64_t tileN;
-  int64_t tileK;
-  int64_t regionSize;
-  mlir::DictionaryAttr local;
-
-  int64_t parameter(llvm::StringRef name) const {
-    return mlir::cast<mlir::IntegerAttr>(local.get(name)).getInt();
-  }
-};
+void registerCPUPasses();
+mlir::LogicalResult materializeCPUConfigurations(
+    mlir::ModuleOp module, const ImplementationRegistry &implementations,
+    llvm::StringRef defaults, llvm::StringRef overrides);
 
 mlir::LogicalResult fuseStructuredComputations(mlir::func::FuncOp function);
 void eraseDeadPrivateBuffers(mlir::func::FuncOp function);

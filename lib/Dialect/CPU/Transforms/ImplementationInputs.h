@@ -40,7 +40,6 @@ private:
     mlir::Value source;
     InputRequirement requirement;
     mlir::memref::AllocOp allocation;
-    mlir::memref::DeallocOp end;
   };
   struct PreparedWindow {
     mlir::Value source;

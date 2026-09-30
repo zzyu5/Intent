@@ -1,4 +1,5 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -273,47 +274,21 @@ bool reusePrivateInput(linalg::GenericOp consumer, Value buffer,
   if (!readsSource) return false;
 
   auto lifetime = [&](memref::AllocOp allocation, bool oldValues) -> memref::DeallocOp {
-    Block *owner = allocation->getBlock();
-    SmallVector<Value> views{allocation.getResult()};
-    SmallVector<Operation *> users, accesses;
-    memref::DeallocOp end;
-    for (unsigned i = 0; i < views.size(); ++i)
-      for (Operation *user : views[i].getUsers()) {
-        users.push_back(user);
-        if (auto view = dyn_cast<memref::SubViewOp>(user)) {
-          views.push_back(view.getResult());
-          continue;
-        }
-        if (auto cast = dyn_cast<memref::CastOp>(user)) {
-          views.push_back(cast.getResult());
-          continue;
-        }
-        if (isa<memref::DimOp>(user)) continue;
-        if (auto release = dyn_cast<memref::DeallocOp>(user)) {
-          if (end || release.getMemref() != allocation.getResult() || release->getBlock() != owner) return {};
-          end = release;
-          continue;
-        }
-        if (auto computation = dyn_cast<linalg::LinalgOp>(user)) {
-          if (computation->getNumResults() || computation->getNumRegions() != 1 ||
-              !pure(computation->getRegion(0).front())) return {};
-        } else if (auto reduction = dyn_cast<ReduceOp>(user)) {
-          if (!pure(reduction.getCombine().front())) return {};
-        } else if (!isa<memref::LoadOp, memref::StoreOp, memref::CopyOp>(user)) return {};
-        accesses.push_back(user);
-      }
-    if (!end) return {};
-    for (Operation *user : users) {
-      if (user == end) continue;
-      Operation *stage = owner->findAncestorOpInBlock(*user);
-      if (!stage || !stage->isBeforeInBlock(end)) return {};
-    }
-    for (Operation *access : accesses) {
-      if (access == consumer) continue;
-      Operation *stage = owner->findAncestorOpInBlock(*access);
+    auto lifetime = queryStorageLifetime(allocation);
+    if (!lifetime || !lifetime->aliases.complete) return {};
+    for (Operation *user : lifetime->aliases.users) {
+      if (user == lifetime->end || isStorageAliasOperation(user) || isa<memref::DimOp>(user)) continue;
+      if (auto computation = dyn_cast<linalg::LinalgOp>(user)) {
+        if (computation->getNumResults() || computation->getNumRegions() != 1 ||
+            !pure(computation->getRegion(0).front())) return {};
+      } else if (auto reduction = dyn_cast<ReduceOp>(user)) {
+        if (!pure(reduction.getCombine().front())) return {};
+      } else if (!isa<memref::LoadOp, memref::StoreOp, memref::CopyOp>(user)) return {};
+      if (user == consumer) continue;
+      Operation *stage = allocation->getBlock()->findAncestorOpInBlock(*user);
       if (oldValues ? !stage->isBeforeInBlock(consumer) : !consumer->isBeforeInBlock(stage)) return {};
     }
-    return end;
+    return lifetime->end;
   };
   auto sourceEnd = lifetime(source, true), outputEnd = lifetime(output, false);
   if (!sourceEnd || !outputEnd) return false;
@@ -361,14 +336,10 @@ bool reuseOutput(linalg::GenericOp consumer, Value buffer,
     } else if (getConstantIntValue(extent) != allocation.getType().getDimSize(axis)) return false;
   }
   Value root = analysis.storageRoot(output);
-  SmallVector<Value> aliases{root};
-  for (unsigned i = 0; i < aliases.size(); ++i)
-    for (Operation *user : aliases[i].getUsers()) {
-      if (user == consumer || isa<memref::DimOp>(user)) continue;
-      if (auto alias = dyn_cast<memref::SubViewOp>(user)) aliases.push_back(alias.getResult());
-      else if (auto alias = dyn_cast<memref::CastOp>(user)) aliases.push_back(alias.getResult());
-      else return false;
-    }
+  auto aliases = queryStorageAliases(root);
+  if (!aliases.complete || llvm::any_of(aliases.users, [&](Operation *user) {
+        return user != consumer && !isa<memref::DimOp>(user) && !isStorageAliasOperation(user);
+      })) return false;
   linalg::GenericOp producer;
   llvm::SmallPtrSet<Operation *, 4> readers;
   SmallVector<memref::DeallocOp> deallocations;

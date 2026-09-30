@@ -1,4 +1,5 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Utilities.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -16,6 +17,20 @@ using namespace mlir;
 
 namespace intent::cpu {
 namespace {
+
+bool sameStaticLayout(MemRefType source, MemRefType destination) {
+  if (source.getShape() != destination.getShape() ||
+      source.getElementType() != destination.getElementType() ||
+      source.getMemorySpace() != destination.getMemorySpace()) return false;
+  SmallVector<int64_t> sourceStrides, destinationStrides;
+  int64_t sourceOffset, destinationOffset;
+  if (failed(source.getStridesAndOffset(sourceStrides, sourceOffset)) ||
+      failed(destination.getStridesAndOffset(destinationStrides, destinationOffset)) ||
+      ShapedType::isDynamic(sourceOffset) || ShapedType::isDynamic(destinationOffset) ||
+      sourceOffset != destinationOffset || sourceStrides != destinationStrides ||
+      llvm::any_of(sourceStrides, ShapedType::isDynamic)) return false;
+  return memref::CastOp::areCastCompatible(TypeRange{source}, TypeRange{destination});
+}
 
 void forwardDestinations(func::FuncOp function) {
   SmallVector<memref::CopyOp> copies;
@@ -46,6 +61,8 @@ void forwardDestinations(func::FuncOp function) {
     if (allocation.getType().getRank() != replacementType.getRank()) continue;
     if (reshape && (replacementType.getShape() != allocation.getType().getShape() ||
                     replacementType.getMemorySpace() != allocation.getType().getMemorySpace())) continue;
+    bool castReplacement = replacementType != allocation.getType() &&
+        sameStaticLayout(replacementType, allocation.getType());
     PhysicalProgramAnalysis analysis(function);
     AliasAnalysis aliasAnalysis(function);
     Value targetRoot = analysis.storageRoot(target);
@@ -68,32 +85,31 @@ void forwardDestinations(func::FuncOp function) {
             return !dominance.dominates(value, allocation);
           })) continue;
     }
+    auto lifetime = queryStorageLifetime(allocation);
+    if (!lifetime || !lifetime->aliases.complete) continue;
     bool legal = true;
     Operation *lastUse = copy;
-    SmallVector<memref::DeallocOp> deallocations;
-    SmallVector<Value> aliases{allocation.getResult()};
-    for (unsigned i = 0; i < aliases.size(); ++i) {
-      for (Operation *user : aliases[i].getUsers()) {
-        if (user == reshape) continue;
-        if (auto dealloc = dyn_cast<memref::DeallocOp>(user)) {
-          if (aliases[i] != allocation.getResult()) legal = false;
-          else deallocations.push_back(dealloc);
-          continue;
-        }
-        // Existing derived views encode the private allocation's layout. Keep
-        // them only when the inverse output view has exactly that same type.
-        if (reshape && replacementType != allocation.getType() &&
-            isa<memref::SubViewOp, memref::CastOp>(user)) { legal = false; continue; }
-        if (auto view = dyn_cast<memref::SubViewOp>(user)) aliases.push_back(view.getResult());
-        else if (auto cast = dyn_cast<memref::CastOp>(user)) aliases.push_back(cast.getResult());
-        else if (!isa<memref::CopyOp, memref::DimOp, memref::LoadOp, memref::StoreOp,
-                      linalg::LinalgOp, ReduceOp, ScanOp, HistogramOp, QuantizedDotOp>(user)) legal = false;
-        Operation *ancestor = copy->getBlock()->findAncestorOpInBlock(*user);
-        if (!ancestor) { legal = false; continue; }
-        if (ancestor != copy && copy->isBeforeInBlock(ancestor)) {
-          if (!isa<memref::LoadOp, memref::DimOp, memref::SubViewOp, memref::CastOp>(user)) legal = false;
-          if (lastUse->isBeforeInBlock(ancestor)) lastUse = ancestor;
-        }
+    for (Operation *user : lifetime->aliases.users) {
+      if (user == reshape || user == lifetime->end) continue;
+      bool view = isStorageAliasOperation(user);
+      // Retained views encode the private allocation's representation, including
+      // reassociation and extracted metadata. Preserve their input type with a
+      // proven static-layout cast; unknown strides cannot establish equivalence.
+      // The copy-source reshape is removed separately.
+      if (view && replacementType != allocation.getType() && !castReplacement) {
+        legal = false;
+        break;
+      }
+      if (!view && !isa<memref::CopyOp, memref::DimOp, memref::LoadOp, memref::StoreOp,
+                       linalg::LinalgOp, ReduceOp, ScanOp, HistogramOp, QuantizedDotOp>(user)) {
+        legal = false;
+        break;
+      }
+      Operation *ancestor = copy->getBlock()->findAncestorOpInBlock(*user);
+      if (!ancestor) { legal = false; break; }
+      if (ancestor != copy && copy->isBeforeInBlock(ancestor)) {
+        if (!view && !isa<memref::LoadOp, memref::DimOp>(user)) { legal = false; break; }
+        if (lastUse->isBeforeInBlock(ancestor)) lastUse = ancestor;
       }
     }
     // Forwarding moves the destination writes earlier. Its previous contents
@@ -135,7 +151,11 @@ void forwardDestinations(func::FuncOp function) {
             target, reassociation);
       }
     }
-    for (memref::DeallocOp dealloc : deallocations) dealloc.erase();
+    if (castReplacement) {
+      OpBuilder builder(allocation);
+      target = builder.create<memref::CastOp>(allocation.getLoc(), allocation.getType(), target);
+    }
+    lifetime->end.erase();
     copy.erase();
     if (reshape) reshape->erase();
     allocation.getResult().replaceAllUsesWith(target);
@@ -154,68 +174,46 @@ bool canReplay(Value value, Operation *root, llvm::SmallPtrSetImpl<Operation *> 
 
 bool stableRead(memref::LoadOp load, Operation *producer, func::FuncOp function,
                 ArrayRef<Operation *> consumers) {
-  Value base = load.getMemref();
-  while (true) {
-    if (auto view = base.getDefiningOp<memref::SubViewOp>()) base = view.getSource();
-    else if (auto cast = base.getDefiningOp<memref::CastOp>()) base = cast.getSource();
-    else break;
-  }
+  PhysicalProgramAnalysis physical(function);
+  Value base = physical.storageRoot(load.getMemref());
+  if (physical.isReadOnly(base)) return true;
   if (auto argument = dyn_cast<BlockArgument>(base)) {
     if (argument.getOwner() != &function.front()) return false;
     auto abi = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
-    auto field = dyn_cast<ViewArgumentAttr>(abi.getArguments()[argument.getArgNumber()]);
-    if (!field) return false;
-    if (field.getAccess() == 0) return true;
-    SmallVector<Value> aliases{base};
-    for (unsigned i = 0; i < aliases.size(); ++i)
-      for (Operation *user : aliases[i].getUsers()) {
-        if (isa<memref::LoadOp, memref::DimOp>(user)) continue;
-        if (auto view = dyn_cast<memref::SubViewOp>(user)) { aliases.push_back(view.getResult()); continue; }
-        if (auto cast = dyn_cast<memref::CastOp>(user)) { aliases.push_back(cast.getResult()); continue; }
-        if (!isa<memref::StoreOp>(user)) return false;
-        Operation *write = producer->getBlock()->findAncestorOpInBlock(*user);
-        if (!write || write == producer || !write->isBeforeInBlock(producer)) return false;
-      }
+    if (!dyn_cast<ViewArgumentAttr>(abi.getArguments()[argument.getArgNumber()])) return false;
+    auto aliases = queryStorageAliases(base);
+    if (!aliases.complete) return false;
+    for (Operation *user : aliases.users) {
+      if (isStorageAliasOperation(user) || isa<memref::LoadOp, memref::DimOp>(user)) continue;
+      if (!isa<memref::StoreOp>(user)) return false;
+      Operation *write = producer->getBlock()->findAncestorOpInBlock(*user);
+      if (!write || write == producer || !write->isBeforeInBlock(producer)) return false;
+    }
     return true;
   }
   auto allocation = base.getDefiningOp<memref::AllocOp>();
   if (!allocation) return false;
+  auto lifetime = queryStorageLifetime(allocation);
+  if (!lifetime || !lifetime->aliases.complete) return false;
   Block *owner = allocation->getBlock();
   Operation *preparation = owner->findAncestorOpInBlock(*producer);
   if (!preparation) return false;
-  memref::DeallocOp end;
-  SmallVector<Operation *> overwrites;
-  SmallVector<Value> aliases{base};
-  for (unsigned i = 0; i < aliases.size(); ++i)
-    for (Operation *user : aliases[i].getUsers()) {
-      if (isa<memref::LoadOp, vector::LoadOp, memref::DimOp>(user)) continue;
-      if (auto view = dyn_cast<memref::SubViewOp>(user)) { aliases.push_back(view.getResult()); continue; }
-      if (auto cast = dyn_cast<memref::CastOp>(user)) { aliases.push_back(cast.getResult()); continue; }
-      if (auto release = dyn_cast<memref::DeallocOp>(user)) {
-        if (release.getMemref() != base || end || release->getBlock() != owner) return false;
-        end = release;
-        continue;
-      }
-      if (!isa<memref::StoreOp, vector::StoreOp>(user)) return false;
-      Operation *write = owner->findAncestorOpInBlock(*user);
-      if (!write || write == preparation) return false;
-      // A later overwrite cannot change a replayed read that has already
-      // completed. Same-loop writes stay excluded by the owner-block order.
-      if (write->isBeforeInBlock(preparation)) continue;
-      if (!llvm::all_of(consumers, [&](Operation *consumer) {
-            Operation *use = owner->findAncestorOpInBlock(*consumer);
-            return use && use->isBeforeInBlock(write);
-          })) return false;
-      overwrites.push_back(write);
-    }
-  // Replaying a read also extends its use of the backing storage. A snapshot
-  // may outlive its source, in which case it must keep its own materialization.
-  if (!end) return false;
-  for (Operation *consumer : consumers) {
-    Operation *use = owner->findAncestorOpInBlock(*consumer);
-    if (!use || !use->isBeforeInBlock(end)) return false;
+  for (Operation *user : lifetime->aliases.users) {
+    if (user == lifetime->end || isStorageAliasOperation(user) ||
+        isa<memref::LoadOp, vector::LoadOp, memref::DimOp>(user)) continue;
+    if (!isa<memref::StoreOp, vector::StoreOp>(user)) return false;
+    Operation *write = owner->findAncestorOpInBlock(*user);
+    if (!write || write == preparation) return false;
+    if (write->isBeforeInBlock(preparation)) continue;
+    if (!llvm::all_of(consumers, [&](Operation *consumer) {
+          Operation *use = owner->findAncestorOpInBlock(*consumer);
+          return use && use->isBeforeInBlock(write);
+        })) return false;
   }
-  return llvm::all_of(overwrites, [&](Operation *write) { return write->isBeforeInBlock(end); });
+  // Replay extends the backing allocation's observation to every consumer.
+  return llvm::all_of(consumers, [&](Operation *consumer) {
+    return lifetime->contains(consumer);
+  });
 }
 
 Value replay(Value value, Operation *root, OpBuilder &builder, IRMapping &mapping) {

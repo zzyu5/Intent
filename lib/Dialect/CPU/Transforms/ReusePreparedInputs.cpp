@@ -1,5 +1,6 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "ImplementationInputs.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Utilities.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -54,40 +55,26 @@ std::optional<PreparedInput> scopedInput(linalg::LinalgOp producer, Operation *l
     } else if (!isMemoryEffectFree(&operation)) return std::nullopt;
   }
 
-  PreparedInput result{producer, allocation, {}, {}};
-  SmallVector<Value> aliases{allocation.getResult()};
-  llvm::SmallDenseSet<Value> seen;
+  auto lifetime = queryStorageLifetime(allocation);
+  if (!lifetime || !lifetime->aliases.complete) return std::nullopt;
+  PreparedInput result{producer, allocation, lifetime->end, {}};
   SmallVector<Operation *> reads;
-  for (unsigned i = 0; i < aliases.size(); ++i) {
-    Value value = aliases[i];
-    if (!seen.insert(value).second) continue;
-    for (Operation *user : value.getUsers()) {
-      if (user == producer) continue;
-      if (!loop->isAncestor(user)) return std::nullopt;
-      if (auto view = dyn_cast<memref::SubViewOp>(user)) aliases.push_back(view.getResult());
-      else if (auto cast = dyn_cast<memref::CastOp>(user)) aliases.push_back(cast.getResult());
-      else if (auto view = dyn_cast<memref::ReinterpretCastOp>(user)) aliases.push_back(view.getResult());
-      else if (isa<memref::DimOp>(user)) continue;
-      else if (auto end = dyn_cast<memref::DeallocOp>(user)) {
-        if (value != allocation.getResult() || result.end || end->getBlock() != producer->getBlock())
-          return std::nullopt;
-        result.end = end;
-      } else {
-        if (auto copy = dyn_cast<memref::CopyOp>(user)) {
-          if (physical.storageRoot(copy.getTarget()) == allocation.getResult()) return std::nullopt;
-        } else if (auto generic = dyn_cast<linalg::LinalgOp>(user)) {
-          for (Value output : generic.getDpsInits())
-            if (physical.storageRoot(output) == allocation.getResult()) return std::nullopt;
-        } else if (!isa<memref::LoadOp>(user)) return std::nullopt;
-        reads.push_back(user);
-      }
-    }
+  for (Operation *user : lifetime->aliases.users) {
+    if (user == producer) continue;
+    if (!loop->isAncestor(user)) return std::nullopt;
+    if (user == result.end || isStorageAliasOperation(user) || isa<memref::DimOp>(user)) continue;
+    if (auto copy = dyn_cast<memref::CopyOp>(user)) {
+      if (physical.storageRoot(copy.getTarget()) == allocation.getResult()) return std::nullopt;
+    } else if (auto generic = dyn_cast<linalg::LinalgOp>(user)) {
+      for (Value output : generic.getDpsInits())
+        if (physical.storageRoot(output) == allocation.getResult()) return std::nullopt;
+    } else if (!isa<memref::LoadOp>(user)) return std::nullopt;
+    reads.push_back(user);
   }
-  if (!result.end || reads.empty() || !producer->isBeforeInBlock(result.end)) return std::nullopt;
+  if (reads.empty() || !producer->isBeforeInBlock(result.end)) return std::nullopt;
   for (Operation *read : reads) {
     Operation *ancestor = producer->getBlock()->findAncestorOpInBlock(*read);
-    if (!ancestor || !producer->isBeforeInBlock(ancestor) || !ancestor->isBeforeInBlock(result.end))
-      return std::nullopt;
+    if (!ancestor || !producer->isBeforeInBlock(ancestor)) return std::nullopt;
   }
   return result;
 }
@@ -318,39 +305,28 @@ std::optional<PreparedInput> preparedInput(linalg::GenericOp producer) {
   auto allocation = output.getDefiningOp<memref::AllocOp>();
   if (!allocation || allocation->getBlock() != producer->getBlock() ||
       !allocation->isBeforeInBlock(producer)) return std::nullopt;
-  PreparedInput result{cast<linalg::LinalgOp>(producer.getOperation()), allocation, {}, {}};
-  SmallVector<Value> aliases{output};
-  llvm::SmallDenseSet<Value> seen;
-  SmallVector<Operation *> users;
-  for (unsigned i = 0; i < aliases.size(); ++i) {
-    Value value = aliases[i];
-    if (!seen.insert(value).second) continue;
-    for (Operation *user : value.getUsers()) {
-      if (user == producer) continue;
-      if (auto cast = dyn_cast<memref::CastOp>(user)) aliases.push_back(cast.getResult());
-      else if (auto view = dyn_cast<memref::SubViewOp>(user)) aliases.push_back(view.getResult());
-      else if (auto end = dyn_cast<memref::DeallocOp>(user)) {
-        if (value != output || result.end || end->getBlock() != producer->getBlock()) return std::nullopt;
-        result.end = end;
-        continue;
-      } else if (auto generic = dyn_cast<linalg::GenericOp>(user)) {
-        if (llvm::is_contained(generic.getOutputs(), value)) return std::nullopt;
-        for (Operation &operation : generic.getRegion().front().without_terminator())
-          if (operation.getNumRegions() || !isMemoryEffectFree(&operation)) return std::nullopt;
-        if (isMatrixContraction(generic)) {
-          auto binding = generic->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
-          if (!binding || (result.consumer && result.consumer != binding)) return std::nullopt;
-          result.consumer = binding;
-        }
-      } else if (!isa<memref::DimOp, memref::LoadOp>(user)) return std::nullopt;
-      users.push_back(user);
-    }
-  }
-  if (!result.end || !result.consumer) return std::nullopt;
-  for (Operation *user : users) {
+  auto lifetime = queryStorageLifetime(allocation);
+  if (!lifetime || !lifetime->aliases.complete) return std::nullopt;
+  PreparedInput result{cast<linalg::LinalgOp>(producer.getOperation()), allocation, lifetime->end, {}};
+  for (Operation *user : lifetime->aliases.users) {
+    if (user == producer || user == result.end) continue;
+    if (auto generic = dyn_cast<linalg::GenericOp>(user)) {
+      if (llvm::any_of(generic.getOutputs(), [&](Value memory) {
+            return llvm::is_contained(lifetime->aliases.values, memory);
+          })) return std::nullopt;
+      for (Operation &operation : generic.getRegion().front().without_terminator())
+        if (operation.getNumRegions() || !isMemoryEffectFree(&operation)) return std::nullopt;
+      if (isMatrixContraction(generic)) {
+        auto binding = generic->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
+        if (!binding || (result.consumer && result.consumer != binding)) return std::nullopt;
+        result.consumer = binding;
+      }
+    } else if (!isStorageAliasOperation(user) && !isa<memref::DimOp, memref::LoadOp>(user))
+      return std::nullopt;
     Operation *ancestor = producer->getBlock()->findAncestorOpInBlock(*user);
-    if (!ancestor || !producer->isBeforeInBlock(ancestor) || !ancestor->isBeforeInBlock(result.end)) return std::nullopt;
+    if (!ancestor || !producer->isBeforeInBlock(ancestor)) return std::nullopt;
   }
+  if (!result.consumer) return std::nullopt;
   return result;
 }
 

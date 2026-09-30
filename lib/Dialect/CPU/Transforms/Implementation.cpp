@@ -1,7 +1,27 @@
 #include "Intent/Dialect/CPU/Transforms/Implementation.h"
+#include "Intent/Dialect/CPU/IR/CPUOps.h"
 
 using namespace mlir;
 namespace intent::cpu {
+
+void ImplementationRegistry::addProfile(StringRef name,
+                                         ArrayRef<StringRef> localParameters) {
+  profiles.push_back({name, llvm::to_vector(localParameters)});
+}
+
+std::optional<ArrayRef<StringRef>>
+ImplementationRegistry::profileParameters(StringRef name) const {
+  const ProfileSchema *selected = nullptr;
+  for (const ProfileSchema &schema : profiles) {
+    if (schema.name != name)
+      continue;
+    if (selected)
+      return std::nullopt;
+    selected = &schema;
+  }
+  return selected ? std::optional<ArrayRef<StringRef>>(selected->localParameters)
+                  : std::nullopt;
+}
 
 bool needsImplementation(Operation *operation) {
   if (auto function = dyn_cast<func::FuncOp>(operation)) {
@@ -66,6 +86,8 @@ LogicalResult ImplementationRegistry::bind(func::FuncOp function, CapabilitiesAt
   bool invalid = false;
   unsigned ordinal = 0;
   bool matrix = false;
+  SmallVector<std::pair<Operation *, ImplementationAttr>> selected;
+  SmallVector<Attribute> distinctBindings;
   function.walk([&](Operation *operation) {
     if (!needsImplementation(operation)) return;
     if (ordinal == bindings.size()) {
@@ -73,17 +95,31 @@ LogicalResult ImplementationRegistry::bind(func::FuncOp function, CapabilitiesAt
       return;
     }
     auto binding = bindings[ordinal++];
-    operation->setAttr("intent_cpu.implementation", binding);
-    auto implementation = lookup(operation);
-    if (failed(implementation) || !(*implementation)->legal(operation, capabilities, configuration) ||
-        (*implementation)->parameters(builder, configuration) != binding.getParameters()) {
+    auto implementation = llvm::find_if(implementations, [&](const Implementation &candidate) {
+      return candidate.name == binding.getName().getValue() && candidate.applicable(operation);
+    });
+    if (implementation == implementations.end() ||
+        !implementation->legal(operation, capabilities, configuration) ||
+        implementation->parameters(builder, configuration) != binding.getParameters()) {
       invalid = true;
       return;
     }
-    matrix |= (*implementation)->requiresMatrixI8I32;
+    selected.emplace_back(operation, binding);
+    if (!llvm::is_contained(distinctBindings, Attribute(binding)))
+      distinctBindings.push_back(binding);
+    matrix |= implementation->requiresMatrixI8I32;
   });
   if (invalid || ordinal != bindings.size())
     return function.emitError("CPU candidate implementation bindings do not match its current computations");
+  for (auto [operation, binding] : selected)
+    operation->setAttr("intent_cpu.implementation", binding);
+  function->setAttr("intent_cpu.configuration", ConfigurationAttr::get(
+      function.getContext(), configuration.taskGrain, configuration.tileM,
+      configuration.tileN, configuration.tileK, configuration.regionSize));
+  // This preserves the selected implementation/parameter identity after local
+  // expansion. Mojo's coordinated vector materialization and provider artifact
+  // metadata consume it; it is not a reclassification of the expanded graph.
+  function->setAttr("intent_cpu.implementations", builder.getArrayAttr(distinctBindings));
   function->setAttr("intent_cpu.requires_matrix_i8_i32", builder.getBoolAttr(matrix));
   return success();
 }

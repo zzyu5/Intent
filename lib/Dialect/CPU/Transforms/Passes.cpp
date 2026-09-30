@@ -1,176 +1,239 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Dialect/CPU/Transforms/Implementation.h"
+#include "Intent/Dialect/CPU/IR/CPUDialect.h"
 #include "Intent/Transforms/PassManager.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/IR/Verifier.h"
-#include "mlir/Pass/PassManager.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassRegistry.h"
 #include "mlir/Transforms/Passes.h"
-#include "llvm/Support/JSON.h"
-#include "llvm/Support/MemoryBuffer.h"
 
 using namespace mlir;
 
 namespace intent::cpu {
 namespace {
 
-FailureOr<llvm::json::Object> readProfiles(Location loc, llvm::StringRef path) {
-  auto content = llvm::MemoryBuffer::getFile(path);
-  if (!content) {
-    emitError(loc, "cannot read CPU tuning profiles: ") << path;
-    return failure();
-  }
-  auto value = llvm::json::parse((*content)->getBuffer());
-  if (!value) {
-    emitError(loc, "invalid CPU tuning JSON: ") << llvm::toString(value.takeError());
-    return failure();
-  }
-  auto root = value->getAsObject();
-  if (!root || root->size() != 1 || !root->getObject("cpu")) {
-    emitError(loc, "CPU tuning profiles require only the cpu namespace");
-    return failure();
-  }
-  auto profiles = root->getObject("cpu");
-  for (auto &item : *profiles) {
-    auto rows = item.second.getAsArray();
-    if (!rows || rows->empty()) {
-      emitError(loc, "CPU tuning family must contain a non-empty row array");
-      return failure();
-    }
-    for (const llvm::json::Value &entry : *rows) {
-      auto candidate = entry.getAsObject();
-      if (!candidate || candidate->size() != 2 || !candidate->getObject("local")) {
-        emitError(loc, "CPU candidate requires shared and local parameter bindings");
-        return failure();
-      }
-      auto row = candidate->getArray("shared");
-      if (!row || row->size() != 5) {
-        emitError(loc, "CPU shared binding requires task grain, M/N/K outer blocks and region size");
-        return failure();
-      }
-      for (const llvm::json::Value &column : *row) {
-        auto value = column.getAsInteger();
-        if (!value || *value <= 0) {
-          emitError(loc, "CPU tuning columns must be positive integers");
-          return failure();
-        }
-      }
-      for (auto &parameter : *candidate->getObject("local"))
-        if (!parameter.second.getAsInteger() || *parameter.second.getAsInteger() <= 0)
-          return emitError(loc, "implementation parameter values must be positive integers"), failure();
-    }
-  }
-  return std::move(*profiles);
+void programDialects(DialectRegistry &registry) {
+  registry.insert<IntentCPUDialect, arith::ArithDialect, func::FuncDialect,
+                  linalg::LinalgDialect, math::MathDialect, memref::MemRefDialect,
+                  scf::SCFDialect, vector::VectorDialect>();
 }
 
+OpPassManager normalizationPipeline() {
+  OpPassManager manager(ModuleOp::getOperationName());
+  manager.addPass(createCanonicalizerPass());
+  manager.addPass(createCSEPass());
+  return manager;
+}
+
+LogicalResult finishGroup(ModuleOp module, StringRef name, LogicalResult result) {
+  if (failed(result))
+    return module.emitError() << "CPU transformation failed: " << name;
+  if (failed(verifyCPUProgram(module, false)))
+    return module.emitError() << "CPU postcondition failed: " << name;
+  return success();
+}
+
+FailureOr<Configuration> currentConfiguration(func::FuncOp function) {
+  auto binding = function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration");
+  if (!binding)
+    return function.emitError("CPU physical transformation requires a bound configuration"), failure();
+  return Configuration{binding.getTaskGrain(), binding.getTileM(), binding.getTileN(),
+                       binding.getTileK(), binding.getRegionSize(), {}};
+}
+
+class NormalizeSourcePass
+    : public PassWrapper<NormalizeSourcePass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NormalizeSourcePass)
+  void getDependentDialects(DialectRegistry &registry) const final { programDialects(registry); }
+  StringRef getArgument() const final { return "intent-cpu-normalize-source"; }
+  StringRef getDescription() const final {
+    return "Normalize source computations before CPU implementation selection";
+  }
+  void runOnOperation() final {
+    auto module = getOperation();
+    auto transform = [&]() -> LogicalResult {
+      auto cleanup = normalizationPipeline();
+      if (failed(runPipeline(cleanup, module))) return failure();
+      auto functions = module.getOps<func::FuncOp>();
+      if (!llvm::hasSingleElement(functions) || (*functions.begin()).isExternal())
+        return module.emitError("CPU source normalization requires one executable source function");
+      auto function = *functions.begin();
+      if (failed(realizeSliceScans(function)) || failed(foldUniformComputations(function)) ||
+          failed(fuseStructuredComputations(function))) return failure();
+      return runPipeline(cleanup, module);
+    };
+    if (failed(finishGroup(module, getArgument(), transform()))) signalPassFailure();
+  }
+};
+
+class MaterializeConfigurationsPass
+    : public PassWrapper<MaterializeConfigurationsPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MaterializeConfigurationsPass)
+  MaterializeConfigurationsPass() = default;
+  MaterializeConfigurationsPass(const ImplementationRegistry &implementations,
+                                StringRef defaults, StringRef overrides)
+      : implementations(&implementations), defaults(defaults.str()), overrides(overrides.str()) {}
+  void getDependentDialects(DialectRegistry &registry) const final { programDialects(registry); }
+  StringRef getArgument() const final { return "intent-cpu-materialize-configurations"; }
+  StringRef getDescription() const final {
+    return "Bind complete CPU implementation candidates into the current program";
+  }
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (!implementations) {
+      module.emitError("CPU configuration materialization requires a provider implementation registry");
+      return signalPassFailure();
+    }
+    // The complete entry verifies its bound clones. No candidate portfolio is
+    // retained by the pass or reused after subsequent program transformations.
+    if (failed(materializeCPUConfigurations(module, *implementations, defaults, overrides))) {
+      module.emitError() << "CPU transformation failed: " << getArgument();
+      signalPassFailure();
+    }
+  }
+private:
+  const ImplementationRegistry *implementations = nullptr;
+  std::string defaults, overrides;
+};
+
+class RealizeRegionsPass
+    : public PassWrapper<RealizeRegionsPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RealizeRegionsPass)
+  RealizeRegionsPass() = default;
+  explicit RealizeRegionsPass(const ImplementationRegistry &implementations)
+      : implementations(&implementations) {}
+  void getDependentDialects(DialectRegistry &registry) const final { programDialects(registry); }
+  StringRef getArgument() const final { return "intent-cpu-realize-regions"; }
+  StringRef getDescription() const final {
+    return "Realize configured CPU regions and close newly exposed structured computations";
+  }
+  void runOnOperation() final {
+    auto module = getOperation();
+    auto transform = [&]() -> LogicalResult {
+      if (!implementations)
+        return module.emitError("CPU region realization requires a provider implementation registry");
+      for (auto function : module.getOps<func::FuncOp>()) {
+        auto config = currentConfiguration(function);
+        if (failed(config) || failed(groupRegionComputations(function, *config)) ||
+            failed(realizeRegions(function, *config, *implementations))) return failure();
+      }
+      auto cleanup = normalizationPipeline();
+      if (failed(runPipeline(cleanup, module))) return failure();
+      for (auto function : module.getOps<func::FuncOp>())
+        if (failed(realizeHistograms(function)) || failed(foldUniformComputations(function)) ||
+            failed(fuseStructuredComputations(function))) return failure();
+      return runPipeline(cleanup, module);
+    };
+    if (failed(finishGroup(module, getArgument(), transform()))) signalPassFailure();
+  }
+private:
+  const ImplementationRegistry *implementations = nullptr;
+};
+
+class FormInputSupplyPass
+    : public PassWrapper<FormInputSupplyPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FormInputSupplyPass)
+  FormInputSupplyPass() = default;
+  explicit FormInputSupplyPass(const ImplementationRegistry &implementations)
+      : implementations(&implementations) {}
+  void getDependentDialects(DialectRegistry &registry) const final { programDialects(registry); }
+  StringRef getArgument() const final { return "intent-cpu-form-input-supply"; }
+  StringRef getDescription() const final {
+    return "Form shared input representations, reuse storage and block configured CPU worksets";
+  }
+  void runOnOperation() final {
+    auto module = getOperation();
+    auto transform = [&]() -> LogicalResult {
+      if (!implementations)
+        return module.emitError("CPU input supply requires a provider implementation registry");
+      for (auto function : module.getOps<func::FuncOp>()) {
+        if (failed(reusePrivateStorage(function)) ||
+            failed(reusePreparedInputs(function, *implementations)) ||
+            failed(groupQuantizedDots(function, *implementations))) return failure();
+        auto config = currentConfiguration(function);
+        if (failed(config) || failed(groupWorksetComputations(function, *implementations)) ||
+            failed(blockContractions(function, *config, *implementations)) ||
+            failed(blockStructuredComputations(function, *implementations))) return failure();
+      }
+      return success();
+    };
+    if (failed(finishGroup(module, getArgument(), transform()))) signalPassFailure();
+  }
+private:
+  const ImplementationRegistry *implementations = nullptr;
+};
+
+class FormTasksPass
+    : public PassWrapper<FormTasksPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FormTasksPass)
+  FormTasksPass() = default;
+  explicit FormTasksPass(const ImplementationRegistry &implementations)
+      : implementations(&implementations) {}
+  void getDependentDialects(DialectRegistry &registry) const final { programDialects(registry); }
+  StringRef getArgument() const final { return "intent-cpu-form-tasks"; }
+  StringRef getDescription() const final {
+    return "Partition configured CPU work and isolate complete task captures";
+  }
+  void runOnOperation() final {
+    auto module = getOperation();
+    auto transform = [&]() -> LogicalResult {
+      if (!implementations)
+        return module.emitError("CPU task formation requires a provider implementation registry");
+      for (auto function : module.getOps<func::FuncOp>()) {
+        auto config = currentConfiguration(function);
+        if (failed(config) || failed(partitionTasks(function, config->taskGrain, *implementations)))
+          return failure();
+      }
+      auto cleanup = normalizationPipeline();
+      if (failed(runPipeline(cleanup, module))) return failure();
+      for (auto function : module.getOps<func::FuncOp>())
+        if (failed(isolateTasks(function))) return failure();
+      return success();
+    };
+    if (failed(finishGroup(module, getArgument(), transform()))) signalPassFailure();
+  }
+private:
+  const ImplementationRegistry *implementations = nullptr;
+};
+
+} // namespace
+
+void registerCPUPasses() {
+  PassRegistration<NormalizeSourcePass>();
+  PassRegistration<MaterializeConfigurationsPass>();
+  PassRegistration<RealizeRegionsPass>();
+  PassRegistration<FormInputSupplyPass>();
+  PassRegistration<FormTasksPass>();
 }
 
 LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
-                          bool matrixI8I32, llvm::StringRef defaults, llvm::StringRef overrides,
+                          bool matrixI8I32, StringRef defaults, StringRef overrides,
                           const ImplementationRegistry &implementations) {
   auto capabilities = CapabilitiesAttr::getChecked([&]() { return module.emitError(); },
       module.getContext(), vectorBits, workers, int64_t{262144}, matrixI8I32);
   if (!capabilities) return failure();
   module->setAttr("intent_cpu.capabilities", capabilities);
-  PassManager normalization(module.getContext(), ModuleOp::getOperationName());
-  normalization.addPass(createCanonicalizerPass());
-  normalization.addPass(createCSEPass());
-  if (failed(intent::configurePassManager(normalization))) return failure();
-  auto normalize = [&](ModuleOp current) { return normalization.run(current); };
-  if (failed(verifyCPUProgram(module, false)) || failed(normalize(module))) return failure();
-  auto profiles = readProfiles(module.getLoc(), defaults);
-  if (failed(profiles)) return failure();
-  if (!overrides.empty()) {
-    auto replacement = readProfiles(module.getLoc(), overrides);
-    if (failed(replacement)) return failure();
-    for (auto &item : *replacement) (*profiles)[item.first] = std::move(item.second);
-  }
-  auto original = *module.getOps<func::FuncOp>().begin();
-  if (failed(realizeSliceScans(original)) || failed(foldUniformComputations(original)) ||
-      failed(fuseStructuredComputations(original)) || failed(normalize(module)) ||
-      failed(verifyCPUProgram(module, false))) return failure();
-  llvm::StringRef family = implementations.profile(original);
-  auto rows = profiles->getArray(family);
-  if (!rows || rows->empty()) return module.emitError("CPU candidate family is empty or missing");
-  struct Candidate {
-    Configuration configuration;
-    SmallVector<ImplementationAttr> bindings;
-  };
-  SmallVector<Candidate> configurations;
-  bool hasContraction = false, hasRegion = false;
-  original.walk([&](linalg::GenericOp operation) { hasContraction |= isMatrixContraction(operation); });
-  original.walk([&](Operation *op) { hasRegion |= isa<RegionFoldOp, RegionScanOp>(op); });
-  for (const llvm::json::Value &value : *rows) {
-    auto candidate = value.getAsObject();
-    auto row = candidate->getArray("shared");
-    Builder builder(module.getContext());
-    SmallVector<NamedAttribute> local;
-    for (auto &parameter : *candidate->getObject("local"))
-      local.push_back(builder.getNamedAttr(parameter.first, builder.getI64IntegerAttr(*parameter.second.getAsInteger())));
-    Configuration config{*(*row)[0].getAsInteger(), *(*row)[1].getAsInteger(),
-        *(*row)[2].getAsInteger(), *(*row)[3].getAsInteger(), *(*row)[4].getAsInteger(), builder.getDictionaryAttr(local)};
-    if (!hasContraction && (config.tileM != 1 || config.tileN != 1 || config.tileK != 1))
-      return original.emitError("M/N/K block parameters require a matrix contraction consumer; otherwise they must be 1");
-    if (!hasRegion && config.regionSize != 1)
-      return original.emitError("region size requires a region consumer; otherwise it must be 1");
-    for (auto bindings : implementations.candidates(original, capabilities, config)) {
-      if (llvm::any_of(configurations, [&](const Candidate &previous) {
-            const auto &other = previous.configuration;
-            return other.taskGrain == config.taskGrain && other.tileM == config.tileM &&
-                other.tileN == config.tileN && other.tileK == config.tileK &&
-                other.regionSize == config.regionSize && previous.bindings == bindings;
-          })) continue;
-      configurations.push_back({config, std::move(bindings)});
-    }
-  }
-  if (configurations.empty()) return module.emitError("no legal CPU candidates remain");
-  SmallVector<func::FuncOp> functions;
-  for (auto [number, candidate] : llvm::enumerate(configurations)) {
-    const auto &config = candidate.configuration;
-    auto function = cast<func::FuncOp>(original->clone());
-    function.setName(original.getName().str() + "_config_" + std::to_string(number));
-    module.push_back(function);
-    Builder b(module.getContext());
-    function->setAttr("intent_cpu.configuration", ConfigurationAttr::get(module.getContext(),
-        config.taskGrain, config.tileM, config.tileN, config.tileK, config.regionSize));
-    if (failed(implementations.bind(function, capabilities, config, candidate.bindings))) return failure();
-    SmallVector<Attribute> bindings;
-    function.walk([&](Operation *operation) {
-      if (auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation"))
-        if (!llvm::is_contained(bindings, binding)) bindings.push_back(binding);
-    });
-    function->setAttr("intent_cpu.implementations", b.getArrayAttr(bindings));
-    functions.push_back(function);
-  }
-  original.erase();
-  for (auto function : functions) {
-    auto binding = function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration");
-    Configuration config{binding.getTaskGrain(), binding.getTileM(), binding.getTileN(),
-        binding.getTileK(), binding.getRegionSize(), {}};
-    if (failed(groupRegionComputations(function, config)) ||
-        failed(realizeRegions(function, config, implementations))) return failure();
-  }
-  if (failed(normalize(module))) return failure();
-  for (auto function : functions)
-    if (failed(realizeHistograms(function)) || failed(foldUniformComputations(function)) ||
-        failed(fuseStructuredComputations(function))) return failure();
-  if (failed(normalize(module))) return failure();
-  for (auto function : functions) {
-    if (failed(reusePrivateStorage(function)) || failed(reusePreparedInputs(function, implementations)) ||
-        failed(groupQuantizedDots(function, implementations))) return failure();
-    auto binding = function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration");
-    Configuration config{binding.getTaskGrain(), binding.getTileM(), binding.getTileN(),
-        binding.getTileK(), binding.getRegionSize(), {}};
-    if (failed(groupWorksetComputations(function, implementations)) ||
-        failed(blockContractions(function, config, implementations)) ||
-        failed(blockStructuredComputations(function, implementations)) || failed(verifyCPUProgram(module, false)) ||
-        failed(partitionTasks(function, config.taskGrain, implementations))) return failure();
-  }
-  if (failed(normalize(module))) return failure();
-  for (func::FuncOp function : functions)
-    if (failed(isolateTasks(function))) return failure();
-  return verifyCPUProgram(module, false);
+  if (failed(verifyCPUProgram(module, false))) return failure();
+  // The registry is immutable and alive for this synchronous manager run.
+  // Every execution decision that survives a group is carried by current IR.
+  PassManager manager(module.getContext(), ModuleOp::getOperationName());
+  manager.addPass(std::make_unique<NormalizeSourcePass>());
+  manager.addPass(std::make_unique<MaterializeConfigurationsPass>(implementations, defaults, overrides));
+  manager.addPass(std::make_unique<RealizeRegionsPass>(implementations));
+  manager.addPass(std::make_unique<FormInputSupplyPass>(implementations));
+  manager.addPass(std::make_unique<FormTasksPass>(implementations));
+  if (failed(intent::configurePassManager(manager))) return failure();
+  return manager.run(module);
 }
 
-}
+} // namespace intent::cpu
