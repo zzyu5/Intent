@@ -1,5 +1,6 @@
 #include "Intent/Conversion/KIRToCPU/KIRToCPU.h"
 #include "Intent/Analysis/CanonicalKernel.h"
+#include "Intent/Analysis/ContractionAxes.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "Intent/Dialect/CPU/IR/RegionProgram.h"
 #include "Intent/Dialect/Intent/IR/IntentDialect.h"
@@ -1364,18 +1365,33 @@ private:
     auto lhsType = cast<RankedTensorType>(operation.getLhs().getType());
     auto rhsType = cast<RankedTensorType>(operation.getRhs().getType());
     auto resultType = cast<RankedTensorType>(operation.getResult().getType());
-    auto pairs = operation.getReduce();
+    SmallVector<int64_t> lhsReduction, rhsReduction, lhsBatch, rhsBatch;
+    auto appendPairs = [](ArrayAttr pairs, SmallVectorImpl<int64_t> &left,
+                          SmallVectorImpl<int64_t> &right) {
+      for (Attribute attribute : pairs) {
+        auto pair = cast<ArrayAttr>(attribute);
+        left.push_back(cast<IntegerAttr>(pair[0]).getInt());
+        right.push_back(cast<IntegerAttr>(pair[1]).getInt());
+      }
+    };
+    appendPairs(operation.getReduce(), lhsReduction, rhsReduction);
+    appendPairs(operation.getBatch(), lhsBatch, rhsBatch);
+    std::string reason;
+    auto axes = ContractionAxes::get(lhsType.getRank(), rhsType.getRank(),
+        lhsReduction, rhsReduction, lhsBatch, rhsBatch, &reason);
+    if (!axes)
+      return operation.emitError("CPU contraction axis schema: ") << reason;
+    if (axes->results.size() != static_cast<size_t>(resultType.getRank()))
+      return operation.emitError("CPU contraction result rank disagrees with its axis schema");
     Type inputElement = lhsType.getElementType(), accumulator = resultType.getElementType();
     bool floating = isa<FloatType>(inputElement) && inputElement == rhsType.getElementType() &&
         (accumulator.isF32() || accumulator.isF64()) &&
         inputElement.getIntOrFloatBitWidth() <= accumulator.getIntOrFloatBitWidth();
     bool integer = lhsType.getElementType().isSignlessInteger(8) && rhsType.getElementType().isSignlessInteger(8) &&
         resultType.getElementType().isSignlessInteger(32);
-    int64_t batchRank = operation.getBatch().size();
+    int64_t batchRank = axes->batch.size();
     if (floating && !batchRank && lhsType.getRank() == 1 && rhsType.getRank() == 1 &&
-        resultType.getRank() == 0 && pairs.size() == 1 &&
-        cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[0]).getInt() == 0 &&
-        cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[1]).getInt() == 0) {
+        resultType.getRank() == 0 && axes->reduction.size() == 1) {
       Location loc = operation.getLoc();
       Value lhs = values.lookup(operation.getLhs()), rhs = values.lookup(operation.getRhs());
       Value extent = builder.create<memref::DimOp>(loc, lhs, 0);
@@ -1383,26 +1399,22 @@ private:
       values.map(operation.getResult(), dotProduct(lhs, rhs, extent, accumulator, {map, map}, loc));
       return success();
     }
-    if (!batchRank && pairs.size() > 1 && resultType.getRank() == 2 &&
-        lhsType.getRank() == static_cast<int64_t>(pairs.size()) + 1 &&
-        rhsType.getRank() == static_cast<int64_t>(pairs.size()) + 1 && (floating || integer)) {
+    if (!batchRank && axes->reduction.size() > 1 &&
+        axes->lhsFree.size() == 1 && axes->rhsFree.size() == 1 && (floating || integer)) {
       Location loc = operation.getLoc();
       Value lhs = values.lookup(operation.getLhs()), rhs = values.lookup(operation.getRhs());
       SmallVector<unsigned> leftAxes, rightAxes;
       SmallVector<Value> reductionSizes;
       Value depth = constant(loc, 1);
-      for (Attribute pair : pairs) {
-        auto axes = cast<ArrayAttr>(pair);
-        leftAxes.push_back(cast<IntegerAttr>(axes[0]).getInt());
-        rightAxes.push_back(cast<IntegerAttr>(axes[1]).getInt());
+      for (ContractionAxisPair pair : axes->reduction) {
+        leftAxes.push_back(pair.lhs);
+        rightAxes.push_back(pair.rhs);
         Value size = builder.create<memref::DimOp>(loc, lhs, leftAxes.back());
         reductionSizes.push_back(size);
         depth = builder.create<arith::MulIOp>(loc, depth, size);
       }
-      auto pack = [&](Value source, ArrayRef<unsigned> axes, bool left) {
+      auto pack = [&](Value source, ArrayRef<unsigned> axes, unsigned freeAxis, bool left) {
         auto type = cast<MemRefType>(source.getType());
-        unsigned freeAxis = 0;
-        while (llvm::is_contained(axes, freeAxis)) ++freeAxis;
         Value freeSize = builder.create<memref::DimOp>(loc, source, freeAxis);
         SmallVector<int64_t> shape = left
             ? SmallVector<int64_t>{type.getDimSize(freeAxis), ShapedType::kDynamic}
@@ -1428,7 +1440,8 @@ private:
             });
         return packed;
       };
-      Value left = pack(lhs, leftAxes, true), right = pack(rhs, rightAxes, false);
+      Value left = pack(lhs, leftAxes, axes->lhsFree.front(), true);
+      Value right = pack(rhs, rightAxes, axes->rhsFree.front(), false);
       auto sizes = extents(resultType, loc);
       if (failed(sizes)) return failure();
       Value output = allocate(resultType, *sizes, loc);
@@ -1436,20 +1449,18 @@ private:
       values.map(operation.getResult(), output);
       return success();
     }
-    bool lhsVector = lhsType.getRank() == batchRank + 1;
-    bool rhsVector = rhsType.getRank() == batchRank + 1;
+    bool lhsVector = axes->lhsFree.empty();
+    bool rhsVector = axes->rhsFree.empty();
     if ((!lhsVector && lhsType.getRank() != batchRank + 2) ||
         (!rhsVector && rhsType.getRank() != batchRank + 2) ||
-        (lhsVector && rhsVector) || pairs.size() != 1 ||
+        (lhsVector && rhsVector) || axes->reduction.size() != 1 ||
         resultType.getRank() != batchRank + 2 - lhsVector - rhsVector ||
-        cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[0]).getInt() != batchRank + (lhsVector ? 0 : 1) ||
-        cast<IntegerAttr>(cast<ArrayAttr>(pairs[0])[1]).getInt() != batchRank ||
+        axes->reduction.front().lhs != batchRank + (lhsVector ? 0 : 1) ||
+        axes->reduction.front().rhs != batchRank ||
         (!floating && !integer))
       return operation.emitError("CPU construction requires a floating vector dot or a leading-batch matrix/vector contraction with lossless floating widening or i8 to i32 accumulation");
-    for (auto [axis, pair] : llvm::enumerate(operation.getBatch())) {
-      auto relation = cast<ArrayAttr>(pair);
-      if (cast<IntegerAttr>(relation[0]).getInt() != static_cast<int64_t>(axis) ||
-          cast<IntegerAttr>(relation[1]).getInt() != static_cast<int64_t>(axis))
+    for (auto [axis, pair] : llvm::enumerate(axes->batch)) {
+      if (pair.lhs != axis || pair.rhs != axis)
         return operation.emitError("CPU contraction batch axes must form a shared leading domain");
     }
     Location loc = operation.getLoc();

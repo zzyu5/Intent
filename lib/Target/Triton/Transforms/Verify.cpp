@@ -1,4 +1,5 @@
 #include "Legalization.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "llvm/ADT/DenseSet.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -220,21 +221,13 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
         return WalkResult::interrupt();
     }
     if (auto contract = dyn_cast<gpu::ContractOp>(operation)) {
-      unsigned lhsRank = contract.getLhs().getType().getShape().size();
-      unsigned rhsRank = contract.getRhs().getType().getShape().size();
-      SmallVector<int64_t> lhsBatch;
-      SmallVector<int64_t> rhsBatch;
-      for (unsigned axis = 0; axis + 2 < lhsRank; ++axis) {
-        lhsBatch.push_back(axis);
-        rhsBatch.push_back(axis);
+      std::string reason;
+      auto axes = gpu::queryContractionAxes(contract, &reason);
+      if (!axes) {
+        contract.emitOpError("invalid Triton contraction axis schema: ") << reason;
+        return WalkResult::interrupt();
       }
-      if (lhsRank < 2 || rhsRank != lhsRank ||
-          contract.getLhsReductionAxes() !=
-              ArrayRef<int64_t>{static_cast<int64_t>(lhsRank - 1)} ||
-          contract.getRhsReductionAxes() !=
-              ArrayRef<int64_t>{static_cast<int64_t>(rhsRank - 2)} ||
-          contract.getLhsBatchAxes() != ArrayRef<int64_t>(lhsBatch) ||
-          contract.getRhsBatchAxes() != ArrayRef<int64_t>(rhsBatch)) {
+      if (!axes->hasCanonicalMatrixAxes()) {
         contract.emitOpError(
             "requires provider legalization to [...,M,K] x [...,K,N] tl.dot form");
         return WalkResult::interrupt();

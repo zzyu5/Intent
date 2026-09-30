@@ -82,11 +82,11 @@ FailureOr<Value> projectOperand(OpBuilder &builder, ContractOp contract,
 LogicalResult realizeVectorContract(ContractOp contract) {
   auto lhs = contract.getLhs().getType();
   auto rhs = contract.getRhs().getType();
-  unsigned lhsFree = lhs.getShape().size() - contract.getLhsReductionAxes().size() -
-                     contract.getLhsBatchAxes().size();
-  unsigned rhsFree = rhs.getShape().size() - contract.getRhsReductionAxes().size() -
-                     contract.getRhsBatchAxes().size();
-  if (lhsFree != 0 && rhsFree != 0)
+  std::string reason;
+  auto axes = queryContractionAxes(contract, &reason);
+  if (!axes)
+    return contract.emitOpError("invalid vector-contraction axis schema: ") << reason;
+  if (!axes->lhsFree.empty() && !axes->rhsFree.empty())
     return success();
 
   OpBuilder builder(contract);
@@ -96,18 +96,13 @@ LogicalResult realizeVectorContract(ContractOp contract) {
   SmallVector<Attribute> mappings(resultType.getAxisMaps().begin(), resultType.getAxisMaps().end());
   SmallVector<unsigned> lhsAxes(lhs.getShape().size());
   SmallVector<unsigned> rhsAxes(rhs.getShape().size());
-  unsigned resultAxis = 0;
-  for (unsigned axis = 0; axis < lhsAxes.size(); ++axis)
-    if (!llvm::is_contained(contract.getLhsReductionAxes(), axis))
-      lhsAxes[axis] = resultAxis++;
-  for (auto [left, right] : llvm::zip(contract.getLhsBatchAxes(), contract.getRhsBatchAxes()))
-    rhsAxes[right] = lhsAxes[left];
-  for (unsigned axis = 0; axis < rhsAxes.size(); ++axis)
-    if (!llvm::is_contained(contract.getRhsReductionAxes(), axis) &&
-        !llvm::is_contained(contract.getRhsBatchAxes(), axis))
-      rhsAxes[axis] = resultAxis++;
+  for (auto [axis, result] : llvm::enumerate(axes->lhsResultAxes))
+    if (result) lhsAxes[axis] = *result;
+  for (auto [axis, result] : llvm::enumerate(axes->rhsResultAxes))
+    if (result) rhsAxes[axis] = *result;
+  unsigned resultAxis = axes->results.size();
   SmallVector<int64_t> reductionAxes;
-  for (auto [left, right] : llvm::zip(contract.getLhsReductionAxes(), contract.getRhsReductionAxes())) {
+  for (const auto &[left, right] : axes->reduction) {
     lhsAxes[left] = rhsAxes[right] = resultAxis;
     reductionAxes.push_back(resultAxis);
     shape.push_back(lhs.getShape()[left]);
@@ -116,8 +111,8 @@ LogicalResult realizeVectorContract(ContractOp contract) {
   // A vector contraction need not transpose its matrix operand merely to put
   // the reduction last. Preserve that operand's axes when removing the paired
   // axis still produces the declared result order.
-  ArrayRef<unsigned> order = lhsFree ? ArrayRef<unsigned>(lhsAxes)
-                                    : ArrayRef<unsigned>(rhsAxes);
+  ArrayRef<unsigned> order = !axes->lhsFree.empty() ? ArrayRef<unsigned>(lhsAxes)
+                                                  : ArrayRef<unsigned>(rhsAxes);
   unsigned freeAxis = 0;
   bool preservesResult = reductionAxes.size() == 1 && order.size() == shape.size();
   for (unsigned axis : order)

@@ -50,27 +50,6 @@ std::optional<BinaryOperator> nativeCombineKind(Region &region) {
   return std::nullopt;
 }
 
-bool hasNativeMMAAxes(gpu::ContractOp contract) {
-  auto lhs = contract.getLhs().getType();
-  auto rhs = contract.getRhs().getType();
-  auto result = contract.getResult().getType();
-  const unsigned rank = lhs.getShape().size();
-  if (rank < 2 || rank > 3 || rhs.getShape().size() != rank ||
-      result.getShape().size() != rank)
-    return false;
-  const int64_t matrixAxis = rank - 2;
-  const bool canonicalBatch =
-      rank == 2 ? contract.getLhsBatchAxes().empty() &&
-                      contract.getRhsBatchAxes().empty()
-                : contract.getLhsBatchAxes() == ArrayRef<int64_t>{0} &&
-                      contract.getRhsBatchAxes() == ArrayRef<int64_t>{0};
-  return contract.getLhsReductionAxes() ==
-             ArrayRef<int64_t>{matrixAxis + 1} &&
-         contract.getRhsReductionAxes() ==
-             ArrayRef<int64_t>{matrixAxis} &&
-         canonicalBatch;
-}
-
 bool isNativeReductionIdentity(BinaryOperator kind, Value identity) {
   Attribute constant = getCompileTimeScalar(identity);
   if (!constant)
@@ -338,7 +317,11 @@ LogicalResult formComputePrimitives(func::FuncOp kernel,
   }
 
   for (gpu::ContractOp contract : inputs.contracts) {
-    if (!hasNativeMMAAxes(contract))
+    std::string reason;
+    auto axes = gpu::queryContractionAxes(contract, &reason);
+    if (!axes)
+      return contract.emitOpError("invalid cuTile contraction axis schema: ") << reason;
+    if (!axes->hasCanonicalMatrixAxes() || axes->lhsResultAxes.size() > 3)
       return contract.emitOpError(
           "cuTile native MMA requires [M,K] x [K,N] or [B,M,K] x [B,K,N] "
           "physical axes");

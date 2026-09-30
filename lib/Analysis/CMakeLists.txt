@@ -1,5 +1,6 @@
 add_mlir_library(MLIRIntentAnalysis
   CanonicalKernel.cpp
+  ContractionAxes.cpp
   UniformValues.cpp
   IntegerRelations.cpp
   RegionSemantics.cpp

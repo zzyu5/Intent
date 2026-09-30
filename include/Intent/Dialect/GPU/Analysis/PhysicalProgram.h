@@ -1,6 +1,7 @@
 #ifndef INTENT_DIALECT_GPU_ANALYSIS_PHYSICALPROGRAM_H
 #define INTENT_DIALECT_GPU_ANALYSIS_PHYSICALPROGRAM_H
 
+#include "Intent/Analysis/ContractionAxes.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -20,6 +21,12 @@
 namespace intent::gpu {
 
 mlir::FailureOr<mlir::func::FuncOp> getPhysicalKernel(mlir::ModuleOp module);
+
+// Read the common axis schema from the current ordinary/scaled/sparse op.
+// This adapter checks ranks only; format-specific extent rules stay in the IR.
+std::optional<ContractionAxes>
+queryContractionAxes(mlir::Operation *operation,
+                     std::string *failureReason = nullptr);
 
 /// A logical source axis carried by the current executable GPU program.
 struct PhysicalSourceAxis {

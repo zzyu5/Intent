@@ -17,6 +17,38 @@
 using namespace mlir;
 
 namespace intent::gpu {
+
+std::optional<ContractionAxes>
+queryContractionAxes(Operation *operation, std::string *failureReason) {
+  auto read = [&](auto contract, Value lhs, Value rhs)
+      -> std::optional<ContractionAxes> {
+    auto left = dyn_cast<FragmentType>(lhs.getType());
+    auto right = dyn_cast<FragmentType>(rhs.getType());
+    auto result = dyn_cast<FragmentType>(contract.getResult().getType());
+    if (!left || !right || !result) {
+      if (failureReason) *failureReason = "requires fragment operands and result";
+      return std::nullopt;
+    }
+    auto axes = ContractionAxes::get(
+        left.getShape().size(), right.getShape().size(),
+        contract.getLhsReductionAxes(), contract.getRhsReductionAxes(),
+        contract.getLhsBatchAxes(), contract.getRhsBatchAxes(), failureReason);
+    if (axes && axes->results.size() != result.getShape().size()) {
+      if (failureReason) *failureReason = "result rank disagrees with batch/free axes";
+      return std::nullopt;
+    }
+    return axes;
+  };
+  if (auto contract = dyn_cast_or_null<ContractOp>(operation))
+    return read(contract, contract.getLhs(), contract.getRhs());
+  if (auto contract = dyn_cast_or_null<ScaledContractOp>(operation))
+    return read(contract, contract.getLhs(), contract.getRhs());
+  if (auto contract = dyn_cast_or_null<SparseContractOp>(operation))
+    return read(contract, contract.getCompressed(), contract.getRhs());
+  if (failureReason) *failureReason = "expected a contraction operation";
+  return std::nullopt;
+}
+
 namespace {
 
 bool isCoordinateReplayNode(Operation *operation) {
@@ -3496,45 +3528,23 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     return;
   }
   if (auto contract = dyn_cast<ContractOp>(operation)) {
-    llvm::SmallDenseSet<int64_t> lhsReduced(
-        contract.getLhsReductionAxes().begin(),
-        contract.getLhsReductionAxes().end());
-    llvm::SmallDenseSet<int64_t> rhsReduced(
-        contract.getRhsReductionAxes().begin(),
-        contract.getRhsReductionAxes().end());
-    llvm::SmallDenseSet<int64_t> rhsBatched(
-        contract.getRhsBatchAxes().begin(), contract.getRhsBatchAxes().end());
-    SmallVector<std::pair<Value, unsigned>> resultSources;
-    auto lhs = dyn_cast<FragmentType>(contract.getLhs().getType());
-    auto rhs = dyn_cast<FragmentType>(contract.getRhs().getType());
-    if (!lhs || !rhs) {
+    auto axes = queryContractionAxes(contract);
+    if (!axes || fragmentAxis >= axes->results.size()) {
       result.state = PhysicalFactState::Unknown;
       appendUnique(result.blockers, operation);
       return;
     }
-    for (unsigned axis = 0; axis < lhs.getShape().size(); ++axis)
-      if (!lhsReduced.contains(axis))
-        resultSources.emplace_back(contract.getLhs(), axis);
-    for (unsigned axis = 0; axis < rhs.getShape().size(); ++axis)
-      if (!rhsReduced.contains(axis) && !rhsBatched.contains(axis))
-        resultSources.emplace_back(contract.getRhs(), axis);
-    if (fragmentAxis >= resultSources.size()) {
-      result.state = PhysicalFactState::Unknown;
-      appendUnique(result.blockers, operation);
-      return;
-    }
-    collectAxisRanges(resultSources[fragmentAxis].first,
-                      resultSources[fragmentAxis].second, result, visited);
-    if (resultSources[fragmentAxis].first == contract.getLhs()) {
-      auto paired = llvm::find(
-          contract.getLhsBatchAxes(),
-          static_cast<int64_t>(resultSources[fragmentAxis].second));
-      if (paired != contract.getLhsBatchAxes().end()) {
-        unsigned batch = std::distance(contract.getLhsBatchAxes().begin(), paired);
+    auto source = axes->results[fragmentAxis];
+    Value operand = source.operand == ContractionOperand::Lhs
+                        ? Value(contract.getLhs()) : Value(contract.getRhs());
+    collectAxisRanges(operand, source.axis, result, visited);
+    if (source.operand == ContractionOperand::Lhs) {
+      for (const auto &pair : axes->batch) {
+        if (pair.lhs != source.axis) continue;
         // A batch result depends on both paired operands. The left operand
         // may broadcast along this axis and have no coordinate range at all.
-        collectAxisRanges(contract.getRhs(), contract.getRhsBatchAxes()[batch],
-                          result, visited);
+        collectAxisRanges(contract.getRhs(), pair.rhs, result, visited);
+        break;
       }
     }
     return;
@@ -4064,19 +4074,14 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
 PhysicalContractFreeAxisFact
 PhysicalProgramAnalysis::contractFreeAxes(Operation *operation) {
   PhysicalContractFreeAxisFact result;
-  bool recognized = false;
-  auto appendOperand = [&](Value value, ArrayRef<int64_t> reduction,
-                           ArrayRef<int64_t> batch) {
-    auto fragment = dyn_cast<FragmentType>(value.getType());
-    if (!fragment) {
-      appendUnique(result.blockers, operation);
-      return false;
-    }
+  auto axes = queryContractionAxes(operation);
+  if (!axes) {
+    appendUnique(result.blockers, operation);
+    return result;
+  }
+  auto appendOperand = [&](Value value, ArrayRef<unsigned> freeAxes) {
     bool exact = true;
-    for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
-      if (llvm::is_contained(reduction, static_cast<int64_t>(axis)) ||
-          llvm::is_contained(batch, static_cast<int64_t>(axis)))
-        continue;
+    for (unsigned axis : freeAxes) {
       PhysicalContractFreeAxis fact;
       fact.operand = value;
       fact.operandAxis = axis;
@@ -4094,40 +4099,24 @@ PhysicalProgramAnalysis::contractFreeAxes(Operation *operation) {
     }
     return exact;
   };
-  bool exact = false;
+  Value lhs, rhs;
   if (auto contract = dyn_cast_or_null<ContractOp>(operation)) {
-    recognized = true;
-    bool lhsExact = appendOperand(contract.getLhs(),
-                                  contract.getLhsReductionAxes(),
-                                  contract.getLhsBatchAxes());
-    bool rhsExact = appendOperand(contract.getRhs(),
-                                  contract.getRhsReductionAxes(),
-                                  contract.getRhsBatchAxes());
-    exact = lhsExact && rhsExact;
+    lhs = contract.getLhs();
+    rhs = contract.getRhs();
   } else if (auto contract = dyn_cast_or_null<ScaledContractOp>(operation)) {
-    recognized = true;
-    bool lhsExact = appendOperand(contract.getLhs(),
-                                  contract.getLhsReductionAxes(),
-                                  contract.getLhsBatchAxes());
-    bool rhsExact = appendOperand(contract.getRhs(),
-                                  contract.getRhsReductionAxes(),
-                                  contract.getRhsBatchAxes());
-    exact = lhsExact && rhsExact;
+    lhs = contract.getLhs();
+    rhs = contract.getRhs();
   } else if (auto contract = dyn_cast_or_null<SparseContractOp>(operation)) {
-    recognized = true;
-    bool lhsExact = appendOperand(contract.getCompressed(),
-                                  contract.getLhsReductionAxes(),
-                                  contract.getLhsBatchAxes());
-    bool rhsExact = appendOperand(contract.getRhs(),
-                                  contract.getRhsReductionAxes(),
-                                  contract.getRhsBatchAxes());
-    exact = lhsExact && rhsExact;
+    lhs = contract.getCompressed();
+    rhs = contract.getRhs();
   }
-  if (!recognized || result.axes.empty()) {
+  bool lhsExact = appendOperand(lhs, axes->lhsFree);
+  bool rhsExact = appendOperand(rhs, axes->rhsFree);
+  if (result.axes.empty()) {
     appendUnique(result.blockers, operation);
     return result;
   }
-  if (exact)
+  if (lhsExact && rhsExact)
     result.state = PhysicalFactState::Exact;
   return result;
 }

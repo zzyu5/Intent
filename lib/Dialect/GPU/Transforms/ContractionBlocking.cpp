@@ -72,26 +72,25 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
            << "; selected_free_axes="
            << freeAxesReadyForReductionTraversal(contract, kernel);
   };
-  if (contract.getLhsReductionAxes().size() != 1 ||
-      contract.getRhsReductionAxes().size() != 1 ||
-      !contract.getLhsBatchAxes().empty() ||
-      !contract.getRhsBatchAxes().empty())
+  std::string reason;
+  auto axes = queryContractionAxes(contract, &reason);
+  if (!axes)
+    return contract.emitOpError("invalid contraction blocking axis schema: ") << reason;
+  if (axes->reduction.size() != 1 || !axes->batch.empty())
     return unhandled("requires one reduction pair and no batch axes");
 
   auto lhsType = contract.getLhs().getType();
   auto rhsType = contract.getRhs().getType();
-  FailureOr<unsigned> lhsFree = uniqueFreeAxis(
-      lhsType, contract.getLhsReductionAxes(), contract.getLhsBatchAxes());
-  FailureOr<unsigned> rhsFree = uniqueFreeAxis(
-      rhsType, contract.getRhsReductionAxes(), contract.getRhsBatchAxes());
-  if (failed(lhsFree) || failed(rhsFree))
+  if (axes->lhsFree.size() != 1 || axes->rhsFree.size() != 1)
     return unhandled("each operand must have one physical free axis");
+  unsigned lhsFree = axes->lhsFree.front();
+  unsigned rhsFree = axes->rhsFree.front();
   unsigned lhsReduction = contract.getLhsReductionAxes().front();
   unsigned rhsReduction = contract.getRhsReductionAxes().front();
-  FailureOr<AxisMapAttr> rowMap = queryAxisMap(lhsType, *lhsFree);
+  FailureOr<AxisMapAttr> rowMap = queryAxisMap(lhsType, lhsFree);
   FailureOr<AxisMapAttr> lhsReductionMap = queryAxisMap(lhsType, lhsReduction);
   FailureOr<AxisMapAttr> rhsReductionMap = queryAxisMap(rhsType, rhsReduction);
-  FailureOr<AxisMapAttr> columnMap = queryAxisMap(rhsType, *rhsFree);
+  FailureOr<AxisMapAttr> columnMap = queryAxisMap(rhsType, rhsFree);
   if (failed(rowMap) || failed(lhsReductionMap) || failed(rhsReductionMap) ||
       failed(columnMap) ||
       lhsReductionMap->getDimensionId() <= 0 ||
@@ -172,11 +171,11 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
            .lockstepRanges({lhsReductionRange, rhsReductionRange}).isExact())
     return unhandled("physical coordinates are not explicit compatible ranges");
   for (auto [operand, axis, range] : {
-           std::tuple<Value, unsigned, MakeRangeOp>{contract.getLhs(), *lhsFree,
+           std::tuple<Value, unsigned, MakeRangeOp>{contract.getLhs(), lhsFree,
                                                    rowRange},
            {contract.getLhs(), lhsReduction, lhsReductionRange},
            {contract.getRhs(), rhsReduction, rhsReductionRange},
-           {contract.getRhs(), *rhsFree, columnRange}}) {
+           {contract.getRhs(), rhsFree, columnRange}}) {
     auto selected = PhysicalProgramAnalysis(kernel).rangeAxes(operand, {range});
     if (!selected.isExact() || selected.fragmentAxes != ArrayRef<unsigned>{axis})
       return unhandled("matrix coordinates do not select independent operand axes");

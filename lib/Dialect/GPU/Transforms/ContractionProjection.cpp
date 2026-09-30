@@ -142,8 +142,11 @@ LogicalResult normalizeMatrixContractForms(func::FuncOp kernel) {
   SmallVector<ContractOp> contracts;
   kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
   for (ContractOp contract : contracts) {
-    if (contract.getLhsReductionAxes().size() != 1 ||
-        contract.getRhsReductionAxes().size() != 1)
+    std::string reason;
+    auto axes = queryContractionAxes(contract, &reason);
+    if (!axes)
+      return contract.emitOpError("invalid contraction axis schema: ") << reason;
+    if (axes->reduction.size() != 1)
       continue;
     // A rank-lifted outer ownership axis can sit beside a logical unit free
     // axis introduced by reshape (for example [H, 1, K]).  The unit carries no
@@ -152,10 +155,10 @@ LogicalResult normalizeMatrixContractForms(func::FuncOp kernel) {
     // keeps the outer axis as M/N rather than degrading it into a batch of
     // one-row contractions.
     {
-      auto freeAxes = [](FragmentType type, ArrayRef<int64_t> reduction) {
+      auto retainedAxes = [](ArrayRef<std::optional<unsigned>> resultPositions) {
         SmallVector<unsigned> result;
-        for (unsigned axis = 0; axis < type.getShape().size(); ++axis)
-          if (!llvm::is_contained(reduction, static_cast<int64_t>(axis)))
+        for (auto [axis, position] : llvm::enumerate(resultPositions))
+          if (position)
             result.push_back(axis);
         return result;
       };
@@ -173,10 +176,8 @@ LogicalResult normalizeMatrixContractForms(func::FuncOp kernel) {
       };
       auto lhs = contract.getLhs().getType();
       auto rhs = contract.getRhs().getType();
-      SmallVector<unsigned> lhsFree =
-          freeAxes(lhs, contract.getLhsReductionAxes());
-      SmallVector<unsigned> rhsFree =
-          freeAxes(rhs, contract.getRhsReductionAxes());
+      SmallVector<unsigned> lhsFree = retainedAxes(axes->lhsResultAxes);
+      SmallVector<unsigned> rhsFree = retainedAxes(axes->rhsResultAxes);
       SmallVector<unsigned> lhsErased;
       SmallVector<unsigned> rhsErased;
       if (lhsFree.size() > 1)
@@ -229,24 +230,22 @@ LogicalResult normalizeMatrixContractForms(func::FuncOp kernel) {
         };
         SmallVector<unsigned> resultErased;
         FragmentType originalResult = contract.getResult().getType();
-        auto appendResultAxes = [&](FragmentType operand,
+        auto appendResultAxes = [&](ArrayRef<std::optional<unsigned>> positions,
                                     ArrayRef<unsigned> erased,
                                     ArrayRef<int64_t> pairedBatch) {
           for (unsigned axis : erased) {
             if (llvm::is_contained(pairedBatch, axis))
               continue;
-            auto mapping = cast<AxisMapAttr>(operand.getAxisMaps()[axis]);
-            auto projection = queryFragmentDimension(
-                originalResult, mapping.getDimensionId());
-            if (!projection.isExact() ||
-                llvm::is_contained(resultErased, projection.fragmentAxis))
+            auto position = positions[axis];
+            if (!position || llvm::is_contained(resultErased, *position))
               return failure();
-            resultErased.push_back(projection.fragmentAxis);
+            resultErased.push_back(*position);
           }
           return success();
         };
-        if (failed(appendResultAxes(lhs, lhsErased, {})) ||
-            failed(appendResultAxes(rhs, rhsErased, contract.getRhsBatchAxes())))
+        if (failed(appendResultAxes(axes->lhsResultAxes, lhsErased, {})) ||
+            failed(appendResultAxes(axes->rhsResultAxes, rhsErased,
+                                    contract.getRhsBatchAxes())))
           return contract.emitOpError(
               "singleton matrix axes have no exact result projection");
         FragmentType squeezedLhs = eraseAxes(lhs, lhsErased);
@@ -868,8 +867,11 @@ LogicalResult normalizeMatrixContractShapes(func::FuncOp kernel) {
   for (ContractOp contract : contracts) {
     auto lhs = contract.getLhs().getType();
     auto rhs = contract.getRhs().getType();
-    if (contract.getLhsReductionAxes().size() != 1 ||
-        contract.getRhsReductionAxes().size() != 1 ||
+    std::string reason;
+    auto axes = queryContractionAxes(contract, &reason);
+    if (!axes)
+      return contract.emitOpError("invalid matrix-contraction axis schema: ") << reason;
+    if (axes->reduction.size() != 1 ||
         (lhs.getShape().size() <= 2 && rhs.getShape().size() <= 2))
       continue;
     ArrayRef<int64_t> lhsBatch = contract.getLhsBatchAxes();
@@ -877,27 +879,10 @@ LogicalResult normalizeMatrixContractShapes(func::FuncOp kernel) {
     unsigned batchRank = lhsBatch.size();
     if (batchRank > 1)
       continue;
-    auto canonicalBatch = [&](ArrayRef<int64_t> axes) {
-      return llvm::all_of(llvm::enumerate(axes), [](auto entry) {
-        return static_cast<int64_t>(entry.index()) == entry.value();
-      });
-    };
-    if (batchRank && lhs.getShape().size() == batchRank + 2 &&
-        rhs.getShape().size() == batchRank + 2 &&
-        canonicalBatch(lhsBatch) && canonicalBatch(rhsBatch) &&
-        contract.getLhsReductionAxes().front() == batchRank + 1 &&
-        contract.getRhsReductionAxes().front() == batchRank)
+    if (batchRank && axes->hasCanonicalMatrixAxes())
       continue;
-    auto freeAxes = [](FragmentType type, int64_t reduction,
-                       ArrayRef<int64_t> batch) {
-      SmallVector<int64_t> axes;
-      for (int64_t axis = 0; axis < static_cast<int64_t>(type.getShape().size()); ++axis)
-        if (axis != reduction && !llvm::is_contained(batch, axis))
-          axes.push_back(axis);
-      return axes;
-    };
-    auto lhsFree = freeAxes(lhs, contract.getLhsReductionAxes().front(), lhsBatch);
-    auto rhsFree = freeAxes(rhs, contract.getRhsReductionAxes().front(), rhsBatch);
+    SmallVector<int64_t> lhsFree(axes->lhsFree.begin(), axes->lhsFree.end());
+    SmallVector<int64_t> rhsFree(axes->rhsFree.begin(), axes->rhsFree.end());
     if (lhsFree.empty() || rhsFree.empty())
       return contract.emitOpError("matrix normalization requires free axes on both operands");
     OpBuilder builder(contract);
@@ -951,25 +936,14 @@ LogicalResult normalizeMatrixContractShapes(func::FuncOp kernel) {
     };
     auto originalResult = contract.getResult().getType();
     SmallVector<int64_t> resultPermutation;
-    auto appendResultAxes = [&](FragmentType operand, ArrayRef<int64_t> axes) {
-      for (int64_t axis : axes) {
-        auto mapping = cast<AxisMapAttr>(operand.getAxisMaps()[axis]);
-        auto source = queryFragmentAxis(originalResult, sourceAxisIdentity(mapping));
-        auto dimension = queryFragmentDimension(originalResult, mapping.getDimensionId());
-        std::optional<int64_t> position;
-        if (source.isExact()) position = source.fragmentAxis;
-        else if (dimension.isExact()) position = dimension.fragmentAxis;
-        if (!position || llvm::is_contained(resultPermutation, *position))
-          return failure();
-        resultPermutation.push_back(*position);
-      }
-      return success();
+    auto appendResultAxes = [&](ArrayRef<std::optional<unsigned>> positions,
+                                ArrayRef<int64_t> selected) {
+      for (int64_t axis : selected)
+        resultPermutation.push_back(*positions[axis]);
     };
-    if (failed(appendResultAxes(lhs, lhsBatch)) ||
-        failed(appendResultAxes(lhs, lhsFree)) ||
-        failed(appendResultAxes(rhs, rhsFree)) ||
-        resultPermutation.size() != originalResult.getShape().size())
-      return contract.emitOpError("matrix free axes have no bijective result projection");
+    appendResultAxes(axes->lhsResultAxes, lhsBatch);
+    appendResultAxes(axes->lhsResultAxes, lhsFree);
+    appendResultAxes(axes->rhsResultAxes, rhsFree);
     auto m = product(lhs, lhsFree);
     auto n = product(rhs, rhsFree);
     auto mAxis = collapsedAxis(lhs, lhsFree, batchRank);

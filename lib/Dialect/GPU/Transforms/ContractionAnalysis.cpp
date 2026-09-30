@@ -198,21 +198,6 @@ bool requiresPhysicalRealization(ScaledContractOp contract) {
                  contract.getRhs(), contract.getRhsScale()});
 }
 
-FailureOr<unsigned> uniqueFreeAxis(FragmentType fragment,
-                                   ArrayRef<int64_t> reduction,
-                                   ArrayRef<int64_t> batch) {
-  std::optional<unsigned> result;
-  for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
-    if (llvm::is_contained(reduction, static_cast<int64_t>(axis)) ||
-        llvm::is_contained(batch, static_cast<int64_t>(axis)))
-      continue;
-    if (result)
-      return failure();
-    result = axis;
-  }
-  return result ? FailureOr<unsigned>(*result) : FailureOr<unsigned>(failure());
-}
-
 MakeRangeOp sourceRange(Value value) {
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel)
@@ -631,31 +616,25 @@ bool fullReductionNeedsTraversal(ContractOp contract) {
 
 bool hasRangeContractForm(ContractOp contract,
                          SmallVectorImpl<StoreOp> *stores) {
+  auto schema = queryContractionAxes(contract);
   auto lhsLoad = matrixOperandLoad(contract.getLhs());
   auto rhsLoad = matrixOperandLoad(contract.getRhs());
-  if (!lhsLoad || !rhsLoad || contract.getLhsReductionAxes().size() != 1 ||
-      contract.getRhsReductionAxes().size() != 1 ||
-      !contract.getLhsBatchAxes().empty() ||
-      !contract.getRhsBatchAxes().empty())
-    return false;
-  FragmentType lhs = contract.getLhs().getType();
-  FragmentType rhs = contract.getRhs().getType();
-  FailureOr<unsigned> lhsFree = uniqueFreeAxis(
-      lhs, contract.getLhsReductionAxes(), contract.getLhsBatchAxes());
-  FailureOr<unsigned> rhsFree = uniqueFreeAxis(
-      rhs, contract.getRhsReductionAxes(), contract.getRhsBatchAxes());
-  if (failed(lhsFree) || failed(rhsFree))
+  if (!schema || !lhsLoad || !rhsLoad || schema->reduction.size() != 1 ||
+      !schema->batch.empty() || schema->lhsFree.size() != 1 ||
+      schema->rhsFree.size() != 1)
     return false;
   SmallVector<std::tuple<LoadOp, AxisMapAttr, Value>> axes;
   for (auto [load, operand, axis] :
-       {std::tuple<LoadOp, Value, unsigned>{lhsLoad, contract.getLhs(), *lhsFree},
+       {std::tuple<LoadOp, Value, unsigned>{lhsLoad, contract.getLhs(),
+                                          schema->lhsFree.front()},
         std::tuple<LoadOp, Value, unsigned>{
             lhsLoad, contract.getLhs(),
             static_cast<unsigned>(contract.getLhsReductionAxes().front())},
         std::tuple<LoadOp, Value, unsigned>{
             rhsLoad, contract.getRhs(),
             static_cast<unsigned>(contract.getRhsReductionAxes().front())},
-        std::tuple<LoadOp, Value, unsigned>{rhsLoad, contract.getRhs(), *rhsFree}}) {
+        std::tuple<LoadOp, Value, unsigned>{rhsLoad, contract.getRhs(),
+                                          schema->rhsFree.front()}}) {
     FailureOr<AxisMapAttr> mapping = queryAxisMap(operand.getType(), axis);
     if (failed(mapping))
       return false;

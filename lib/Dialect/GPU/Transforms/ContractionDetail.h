@@ -85,10 +85,6 @@ Value compare(OpBuilder &builder, Location location, Type result, Value lhs,
 
 void inheritRangeAuthority(Value derived, MakeRangeOp source);
 
-FailureOr<unsigned> uniqueFreeAxis(FragmentType fragment,
-                                   ArrayRef<int64_t> reduction,
-                                   ArrayRef<int64_t> batch);
-
 MakeRangeOp sourceRange(Value value);
 
 bool containsSource(Value value, PhysicalSourceAxis source);

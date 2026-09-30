@@ -598,8 +598,12 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
 FailureOr<bool> realizeFullResultTraversal(
     ContractOp contract, func::FuncOp kernel,
     SmallVectorImpl<ContractOp> &pending) {
-  if (!contract.getLhsBatchAxes().empty() ||
-      !contract.getRhsBatchAxes().empty())
+  std::string reason;
+  auto axes = queryContractionAxes(contract, &reason);
+  if (!axes)
+    return contract.emitOpError("invalid full-result contraction axis schema: ")
+               << reason, failure();
+  if (!axes->batch.empty())
     return false;
   FragmentType resultType = contract.getResult().getType();
   auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
@@ -643,29 +647,15 @@ FailureOr<bool> realizeFullResultTraversal(
       }))
     return false;
   SmallVector<std::pair<OpOperand *, unsigned>> freeAxes(resultType.getShape().size());
-  unsigned freeAxisCount = 0;
-  for (auto [operand, reductions] :
-       {std::pair<OpOperand *, ArrayRef<int64_t>>{&contract.getLhsMutable(),
-                                          contract.getLhsReductionAxes()},
-        std::pair<OpOperand *, ArrayRef<int64_t>>{&contract.getRhsMutable(),
-                                          contract.getRhsReductionAxes()}}) {
+  for (auto [resultAxis, source] : llvm::enumerate(axes->results)) {
+    OpOperand *operand = source.operand == ContractionOperand::Lhs
+                            ? &contract.getLhsMutable()
+                            : &contract.getRhsMutable();
     auto type = cast<FragmentType>(operand->get().getType());
-    for (unsigned axis = 0; axis < type.getShape().size(); ++axis) {
-      if (llvm::is_contained(reductions, static_cast<int64_t>(axis)))
-        continue;
-      // Contract results concatenate lhs and rhs free axes. Source identities
-      // may repeat, including when the same matrix supplies both operands.
-      unsigned resultAxis = freeAxisCount;
-      if (resultAxis >= freeAxes.size() ||
-          resultType.getShape()[resultAxis] != type.getShape()[axis])
-        return false;
-      freeAxes[resultAxis] = {operand, axis};
-      ++freeAxisCount;
-    }
+    if (resultType.getShape()[resultAxis] != type.getShape()[source.axis])
+      return false;
+    freeAxes[resultAxis] = {operand, source.axis};
   }
-  if (freeAxisCount != resultType.getShape().size())
-    return contract.emitOpError(
-        "full-result traversal lost its free-axis relation");
   // Slicing may replay loads at the contraction.  External views can alias,
   // so retain their original snapshots across every intervening write.
   if (!canReplayContractionReads(contract))
