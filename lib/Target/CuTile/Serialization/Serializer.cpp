@@ -719,18 +719,20 @@ private:
     std::string boundArgumentsName = freshName("_intent_bound_arguments");
     std::string boundLaunchName = freshName("_intent_bound_launch");
     std::string candidatesName = freshName("_intent_candidates");
+    std::string cachedName = freshName("_intent_cached");
 
     std::string key = tuneKeyName + " = (";
     for (const ViewABI &view : views)
-      key += "tuple(" + view.name + ".shape), tuple(" + view.name + ".stride()), " + view.name + ".dtype, str(" +
-             view.name + ".device), ";
+      key += view.name + ".shape, " + view.name + ".stride(), " +
+             view.name + ".dtype, " + view.name + ".device, ";
     for (const ScalarABI &scalar : scalars)
       key += scalar.name + ", ";
     for (gpu::ViewOverlapOp overlap : overlapFacts)
       key += valueString(overlap.getResult()) + ", ";
     line(key + ")", 1);
-    line(streamName + " = torch.cuda.current_stream()", 1);
-    line("if " + tuneKeyName + " not in _TUNE_CACHE:", 1);
+    line(cachedName + " = _TUNE_CACHE.get(" + tuneKeyName + ")", 1);
+    line("if " + cachedName + " is None:", 1);
+    line(streamName + " = torch.cuda.current_stream()", 2);
     emitConfigurationSelection(candidatesName, configName, 2);
     if (kernel->hasAttr(arrayIndexTileBoundsAttr)) {
       std::string boundArguments = "(";
@@ -775,12 +777,11 @@ private:
     std::string tunedKernel = selectedKernelName;
     if (!providerHintParameters.empty())
       tunedKernel += ".replace_hints(**" + compilerHints(searchResultName + ".best.config") + ")";
-    line("_TUNE_CACHE[" + tuneKeyName + "] = (" + searchResultName +
+    line(cachedName + " = (" + searchResultName +
              ".best.config, " + tunedKernel + ")",
          2);
-    line(configName + ", " + tunedKernelName + " = _TUNE_CACHE[" +
-             tuneKeyName + "]",
-         1);
+    line("_TUNE_CACHE[" + tuneKeyName + "] = " + cachedName, 2);
+    line(configName + ", " + tunedKernelName + " = " + cachedName, 1);
     std::string launchGrid = "(";
     for (Attribute extent : space)
       launchGrid += expressionString(cast<gpu::PhysicalExprAttr>(extent), true,
