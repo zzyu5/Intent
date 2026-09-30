@@ -5228,8 +5228,6 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
   for (Value &coordinate : selected)
     if (coordinate)
       coordinate = moveCoordinate(coordinate);
-  Value gatherValidity = !gatheredType && gather.getValid()
-                             ? moveCoordinate(gather.getValid()) : Value();
   PhysicalExprAttr unit = expression(kernel.getContext(), PhysicalExprKind::Constant, 1);
   Value one = builder.create<arith::ConstantIndexOp>(contract.getLoc(), 1);
   side = 0;
@@ -5265,33 +5263,34 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
       auto coordinateType = fragmentType(kernel.getContext(), builder.getIndexType(),
                                           {projectedExtent}, {projectedMapping},
                                           originalType.getOwner());
-      auto range = builder.create<MakeRangeOp>(
-          contract.getLoc(), coordinateType,
-          selectedRange ? selectedRange.getStart() : coordinate,
-          selectedRange ? selectedRange.getExtent() : one, one,
-          (*authority).getLogicalStart(), (*authority).getLogicalStop(),
-          projectedMapping.getSourceId(), projectedMapping.getSourceAxis(),
-          projectedMapping.getDerived());
-      inheritRangeAuthority(range, *authority);
+      Value range;
+      if (selectedRange) {
+        range = builder.create<MakeRangeOp>(
+            contract.getLoc(), coordinateType, selectedRange.getStart(),
+            selectedRange.getExtent(), one, (*authority).getLogicalStart(),
+            (*authority).getLogicalStop(), projectedMapping.getSourceId(),
+            projectedMapping.getSourceAxis(), projectedMapping.getDerived());
+        inheritRangeAuthority(range, *authority);
+      } else {
+        range = builder.create<SplatOp>(contract.getLoc(), coordinateType,
+                                       coordinate);
+      }
       IRMapping replay;
       for (MakeRangeOp root : roots.roots)
-        replay.map(root.getResult(), range.getResult());
+        replay.map(root.getResult(), range);
       ReplayMaterializationOptions options;
       options.fragmentAxis = axis;
       options.traversalRanges = roots.roots;
       if (selectedRange)
         options.segmentMapping = projectedMapping;
-      auto tail = buildRangeTailPredicate(builder, contract.getLoc(), range, *authority);
-      if (failed(tail))
-        return contract.emitOpError("contraction projection has no range validity");
-      options.segmentTail = *tail;
-      if (gatherValidity) {
-        auto valid = materializeValidityConjunction(
-            builder, contract.getLoc(), *tail, gatherValidity, coordinateType);
-        if (failed(valid))
-          return contract.emitOpError("scalar contraction cannot preserve gather validity");
-        options.segmentTail = *valid;
-      }
+      auto predicateType = fragmentType(
+          kernel.getContext(), builder.getI1Type(), {projectedExtent},
+          {projectedMapping}, originalType.getOwner());
+      // Keep each input bounded by its own free axis. The original gather
+      // predicate and fill still guard the projected result below.
+      options.segmentTail = rangeBoundsValidity(
+          builder, contract.getLoc(), coordinateType, predicateType, range,
+          (*authority).getLogicalStop());
       options.materializeZeroFill = true;
       auto projected = materializeReplayedValue(
           builder, contract.getLoc(), operand, sourceAxisIdentity(mapping),
@@ -6417,6 +6416,21 @@ LogicalResult normalizeContractionSources(ModuleOp module) {
     return failure();
   contracts.clear();
   kernel->walk([&](ContractOp contract) { contracts.push_back(contract); });
+  // Project the producer before ownership turns scalar indices into fragments.
+  bool projected = false;
+  for (ContractOp contract : contracts) {
+    auto result = projectContractResult(contract);
+    if (failed(result))
+      return failure();
+    projected |= *result;
+  }
+  if (projected) {
+    eraseDeadPhysicalValues(*kernel);
+    if (failed(realizeAccessComposition(module)))
+      return failure();
+  }
+  contracts.clear();
+  kernel->walk([&](ContractOp contract) { contracts.push_back(contract); });
   bool changed = false;
   for (ContractOp contract : contracts) {
     if (!contract.getResult().hasOneUse() ||
@@ -6604,15 +6618,9 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
     return failure();
   func::FuncOp kernel = *physicalKernel;
   fuseContractionAdds(kernel);
-  SmallVector<ContractOp> contracts;
-  kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
-  for (ContractOp contract : contracts)
-    if (failed(projectContractResult(contract)))
-      return failure();
-  eraseDeadPhysicalValues(kernel);
   if (failed(realizeAccessComposition(module)))
     return failure();
-  contracts.clear();
+  SmallVector<ContractOp> contracts;
   kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
   bool collapsed = false;
   for (ContractOp contract : contracts) {

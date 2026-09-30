@@ -1698,6 +1698,9 @@ FailureOr<Value> materializeReplayedValue(
     if (fact.roots.empty()) {
       Operation *producer = current.getDefiningOp();
       bool neutralSchemaCarrier = isa_and_nonnull<SplatOp>(producer);
+      neutralSchemaCarrier |= fact.isExact() && fact.blockers.empty() &&
+          isa_and_nonnull<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp,
+                         BitcastOp>(producer);
       if (auto broadcast = dyn_cast_or_null<BroadcastOp>(producer)) {
         auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
         neutralSchemaCarrier |=

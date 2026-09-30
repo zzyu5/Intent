@@ -4042,11 +4042,9 @@ LogicalResult rankLiftPointwiseValueGraph(
   for (GatherOp gather : rankLiftedUnitGathers) {
     auto source = dyn_cast<FragmentType>(gather.getSource().getType());
     auto target = dyn_cast<FragmentType>(gather.getResult().getType());
-    if (!source || !target ||
-        (gather.getValid() &&
-         !scalarIntegerConstant(gather.getValid(), 1))) {
+    if (!source || !target) {
       InFlightDiagnostic diagnostic = gather.emitOpError(
-          "rank-lifted unit gather has no unconditional squeeze relation");
+          "rank-lifted unit gather has no fragment squeeze relation");
       diagnostic << "; source=" << gather.getSource().getType()
                  << "; result=" << gather.getResult().getType();
       if (gather.getValid()) {
@@ -4070,11 +4068,16 @@ LogicalResult rankLiftPointwiseValueGraph(
       return gather.emitOpError(
           "rank-lifted unit gather has no exact reshape projection");
     OpBuilder builder(gather);
-    auto replacement = builder.create<ReshapeOp>(
+    Value replacement = builder.create<ReshapeOp>(
         gather.getLoc(), target, gather.getSource(), *reassociation);
+    if (gather.getValid() &&
+        !scalarIntegerConstant(gather.getValid(), 1))
+      replacement = builder.create<SelectOp>(
+          gather.getLoc(), target, gather.getValid(), replacement,
+          gather.getFill());
     if (Attribute origin = gather->getAttr(originAttr))
-      replacement->setAttr(originAttr, origin);
-    gather.getResult().replaceAllUsesWith(replacement.getResult());
+      replacement.getDefiningOp()->setAttr(originAttr, origin);
+    gather.getResult().replaceAllUsesWith(replacement);
     gather.erase();
   }
   // Ownership queries consume operand relations, not just the lifted result
