@@ -13,6 +13,14 @@ foreach(provider Triton CuTile TileLang Mojo Weft)
   configure_file("${PROJECT_SOURCE_DIR}/lib/Target/${provider}/Transforms/TuningProfiles.json"
                  "${CMAKE_CURRENT_BINARY_DIR}/profiles/${provider_name}.json" COPYONLY)
 endforeach()
+set_target_properties(intent-compile PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
+install(TARGETS intent-compile
+  RUNTIME DESTINATION "${INTENT_RUNTIME_INSTALL_DIR}"
+  COMPONENT IntentRuntime)
+install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/profiles/"
+  DESTINATION "${INTENT_RUNTIME_INSTALL_DIR}/profiles"
+  COMPONENT IntentRuntime
+  FILES_MATCHING PATTERN "*.json")
 target_link_libraries(intent-compile PRIVATE
   ${dialect_libs}
   MLIRIntentDialect

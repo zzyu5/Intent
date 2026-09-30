@@ -2,6 +2,22 @@ cmake_minimum_required(VERSION 3.20)
 project(IntentDSL LANGUAGES CXX C)
 
 find_package(MLIR REQUIRED CONFIG)
+if(NOT LLVM_VERSION_MAJOR EQUAL 20)
+  message(FATAL_ERROR "IntentDSL currently requires the LLVM/MLIR 20 SDK")
+endif()
+
+include(GNUInstallDirs)
+if(SKBUILD)
+  set(INTENT_RUNTIME_INSTALL_DIR "intent/_bin")
+  foreach(section dsl programming-model)
+    file(GLOB manual_documents "${PROJECT_SOURCE_DIR}/doc/${section}/*.md")
+    install(FILES ${manual_documents}
+      DESTINATION "intent/_manual/doc/${section}"
+      COMPONENT IntentRuntime)
+  endforeach()
+else()
+  set(INTENT_RUNTIME_INSTALL_DIR "${CMAKE_INSTALL_BINDIR}")
+endif()
 
 list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}" "${LLVM_CMAKE_DIR}")
 include(TableGen)
