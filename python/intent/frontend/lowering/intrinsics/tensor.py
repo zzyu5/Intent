@@ -53,6 +53,7 @@ def lower_tensor_intrinsic(
         "log1p": lambda context, call: _unary(context, call, UnaryOperator.LOG1P),
         "lgamma": lambda context, call: _unary(context, call, UnaryOperator.LGAMMA),
         "sin": lambda context, call: _unary(context, call, UnaryOperator.SIN),
+        "asin": lambda context, call: _unary(context, call, UnaryOperator.ASIN),
         "cos": lambda context, call: _unary(context, call, UnaryOperator.COS),
         "floor": lambda context, call: _unary(context, call, UnaryOperator.FLOOR),
         "erf": lambda context, call: _unary(context, call, UnaryOperator.ERF),

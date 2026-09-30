@@ -1399,6 +1399,10 @@ private:
     case UnaryOperator::Lgamma: return call("cutile_math.lgamma");
     case UnaryOperator::Erfc: return call("cutile_math.erfc");
     case UnaryOperator::I0: return call("cutile_math.i0");
+    case UnaryOperator::Asin:
+      unary.emitOpError("asin is unsupported by the cuTile provider");
+      failed = true;
+      return "<unsupported-asin>";
     }
     llvm_unreachable("unhandled Intent unary operator");
   }

@@ -78,6 +78,7 @@ from .builtins import sqrt
 from .builtins import sigmoid
 from .builtins import tanh
 from .builtins import sin
+from .builtins import asin
 from .builtins import scan
 from .builtins import scatter_reduce
 from .builtins import scatter_unique
@@ -202,6 +203,7 @@ __all__ = [
     "sigmoid",
     "tanh",
     "sin",
+    "asin",
     "scan",
     "scatter_reduce",
     "scatter_unique",

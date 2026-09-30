@@ -83,6 +83,8 @@ fixed-width integers使用二进制补码与modulo arithmetic：
 在非正整数极点（包括正负零）和正负无穷处返回 `+inf`；NaN 输入返回 NaN。
 结果使用原浮点 dtype，仍受该格式的表示范围与普通转换规则约束。
 
+`I.asin(x)` 计算反正弦主值，结果位于 `[-pi/2, pi/2]`，保留 signed zero；`abs(x) > 1`（包括无穷）或 NaN 输入返回 NaN。它保持输入的浮点 dtype 与 shape，采用数学库精度，不承诺 correctly-rounded 或内部近似式的逐步舍入结果。低于 f32 精度的输入按 f32 求值后遵循普通 cast 规则返回原 dtype；f32/f64 使用对应精度求值。特殊值规则对齐 [libdevice asin](https://docs.nvidia.com/cuda/libdevice-users-guide/__nv_asinf.html)。
+
 `I.log1p(x)`、`I.erfc(x)`、`I.i0(x)` 是 pure 逐元素数学库函数，保持输入的浮点 dtype 与 shape：
 
 - `log1p` 计算 `log(1+x)`，不按先舍入 `1+x` 再取对数的普通运算组合定义；保留 signed zero，`-1` 返回 `-inf`，小于 `-1` 返回 NaN，`+inf` 返回 `+inf`。

@@ -92,6 +92,7 @@ log = Intrinsic("log")
 log1p = Intrinsic("log1p")
 lgamma = Intrinsic("lgamma")
 sin = Intrinsic("sin")
+asin = Intrinsic("asin")
 cos = Intrinsic("cos")
 floor = Intrinsic("floor")
 erf = Intrinsic("erf")
@@ -189,6 +190,7 @@ INTRINSICS = {
         log1p,
         lgamma,
         sin,
+        asin,
         cos,
         floor,
         erf,

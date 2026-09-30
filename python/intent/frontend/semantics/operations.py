@@ -134,6 +134,7 @@ class UnaryOperator(IntEnum):
     LOG1P = 15
     ERFC = 16
     I0 = 17
+    ASIN = 18
 
 
 class BinaryOperator(IntEnum):

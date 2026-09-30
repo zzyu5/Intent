@@ -1626,6 +1626,8 @@ private:
       return libraryCall("libdevice.lgamma");
     case UnaryOperator::Sin:
       return libraryCall("libdevice.sin");
+    case UnaryOperator::Asin:
+      return libraryCall("libdevice.asin");
     case UnaryOperator::Cos:
       return libraryCall("libdevice.cos");
     case UnaryOperator::Floor:

@@ -836,6 +836,7 @@ private:
     case UnaryOperator::Log: return call("T.log");
     case UnaryOperator::Log1p: return libraryCall("T.log1p", /*external=*/false);
     case UnaryOperator::Sin: return call("T.sin");
+    case UnaryOperator::Asin: return libraryCall("T.asin", /*external=*/false);
     case UnaryOperator::Cos: return call("T.cos");
     case UnaryOperator::Floor: return call("T.floor");
     case UnaryOperator::Erf: return call("T.erf");
