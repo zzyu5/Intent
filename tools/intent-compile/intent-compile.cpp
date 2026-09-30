@@ -74,6 +74,8 @@ int main(int argc, char **argv) {
   intent::bangc::registerBangCPasses();
   intent::triton::registerTritonPasses();
   intent::cutile::registerCuTilePasses();
+  intent::mojo::registerMojoPasses();
+  intent::cpu::registerCPUPasses();
   // MLIR's pass-name option parsers enumerate the registry at construction.
   // Populate it before constructing --mlir-print-ir-before/after options.
   mlir::registerMLIRContextCLOptions();

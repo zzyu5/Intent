@@ -1,5 +1,7 @@
 #include "Intent/Target/Mojo/Transforms/Passes.h"
+#include "Legalize.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -9,8 +11,7 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/TypeUtilities.h"
-#include "mlir/Pass/PassManager.h"
-#include "mlir/Transforms/Passes.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/DenseSet.h"
 
@@ -77,42 +78,17 @@ void promotePrivateScratch(func::FuncOp function, int64_t budget) {
         !allocation.getType().getLayout().isIdentity()) continue;
     int64_t alignment = alignmentOf(allocation);
     if (!fits(*facts.bytes, alignment)) continue;
-    SmallVector<Value> aliases{facts.value};
-    llvm::SmallDenseSet<Value> seen;
-    SmallVector<Operation *> users;
-    memref::DeallocOp end;
-    bool closed = true;
-    for (unsigned i = 0; i < aliases.size() && closed; ++i) {
-      Value value = aliases[i];
-      if (!seen.insert(value).second) continue;
-      for (Operation *user : value.getUsers()) {
-        if (auto deallocation = dyn_cast<memref::DeallocOp>(user)) {
-          if (value != facts.value || end || user->getBlock() != allocation->getBlock()) {
-            closed = false; break;
-          }
-          end = deallocation;
-          continue;
-        }
-        if (isa<memref::SubViewOp, memref::CastOp, memref::ReinterpretCastOp,
-                memref::ExtractStridedMetadataOp>(user)) {
-          for (Value result : user->getResults())
-            if (isa<MemRefType>(result.getType())) aliases.push_back(result);
-        } else if (!isa<memref::LoadOp, memref::StoreOp, memref::DimOp,
-                       vector::LoadOp, vector::StoreOp, memref::PrefetchOp>(user)) {
-          closed = false; break;
-        }
-        users.push_back(user);
-      }
-    }
-    if (!closed || !end || !allocation->isBeforeInBlock(end)) continue;
-    if (!llvm::all_of(users, [&](Operation *user) {
-          Operation *ancestor = allocation->getBlock()->findAncestorOpInBlock(*user);
-          return ancestor && allocation->isBeforeInBlock(ancestor) && ancestor->isBeforeInBlock(end);
+    auto lifetime = cpu::queryStorageLifetime(allocation);
+    if (!lifetime || !lifetime->aliases.complete) continue;
+    if (!llvm::all_of(lifetime->aliases.users, [&](Operation *user) {
+          return user == lifetime->end || cpu::isStorageAliasOperation(user) ||
+                 isa<memref::LoadOp, memref::StoreOp, memref::DimOp,
+                     vector::LoadOp, vector::StoreOp, memref::PrefetchOp>(user);
         })) continue;
     OpBuilder builder(allocation);
     auto stack = builder.create<memref::AllocaOp>(allocation.getLoc(), allocation.getType(),
         ValueRange{}, allocation.getAlignmentAttr());
-    end.erase();
+    lifetime->end.erase();
     allocation.replaceAllUsesWith(stack.getResult());
     allocation.erase();
     budget -= *facts.bytes + alignment - 1;
@@ -152,6 +128,14 @@ LogicalResult checkSurface(ModuleOp module) {
       supported &= !prefetch.getIsWrite() && prefetch.getLocalityHint() == 3 && prefetch.getIsDataCache();
     if (auto conditional = dyn_cast<scf::IfOp>(operation))
       supported &= llvm::none_of(conditional.getResultTypes(), [](Type type) { return isa<MemRefType>(type); });
+    if (auto call = dyn_cast<func::CallOp>(operation)) {
+      auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+          call, call.getCalleeAttr());
+      supported = callee && callee.isExternal() &&
+                  callee->hasAttr("cpu.external_runtime") &&
+                  llvm::all_of(call->getOperandTypes(), supportedType) &&
+                  llvm::all_of(call->getResultTypes(), supportedType);
+    }
     if (auto loop = dyn_cast<scf::WhileOp>(operation))
       supported &= llvm::none_of(loop.getResultTypes(), [](Type type) { return isa<MemRefType>(type); });
     if (isa<cpu::AtomicLoadOp, cpu::AtomicStoreOp, cpu::AtomicRMWOp, cpu::AtomicCompareExchangeOp>(operation)) {
@@ -255,7 +239,7 @@ LogicalResult expandAtomicUpdates(ModuleOp module) {
 
 }
 
-LogicalResult legalizeProgram(ModuleOp module) {
+LogicalResult prepareNativeProgram(ModuleOp module) {
   auto capabilities = module->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities");
   if (!capabilities || (capabilities.getVectorBits() != 256 && capabilities.getVectorBits() != 512))
     return module.emitError("Mojo native currently requires an AVX2 or AVX512 CPU capability");
@@ -268,16 +252,16 @@ LogicalResult legalizeProgram(ModuleOp module) {
     if (failed(cpu::isolateTasks(function)) ||
         failed(cpu::materializeTaskDispatches(function))) return failure();
   }
-  auto normalize = [&]() {
-    PassManager manager(module.getContext());
-    manager.addPass(createCanonicalizerPass());
-    manager.addPass(createCSEPass());
-    return manager.run(module);
-  };
-  if (failed(normalize())) return failure();
+  return success();
+}
+
+LogicalResult fusePrivateComputations(ModuleOp module) {
   for (func::FuncOp function : module.getOps<func::FuncOp>())
     if (failed(cpu::fuseIntermediateBuffers(function))) return failure();
-  if (failed(normalize())) return failure();
+  return success();
+}
+
+LogicalResult vectorizeNativeProgram(ModuleOp module) {
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
     auto bindings = function->getAttrOfType<ArrayAttr>("intent_cpu.implementations");
     if (!bindings || bindings.empty()) return function.emitError("Mojo lowering requires selected implementations");
@@ -292,7 +276,13 @@ LogicalResult legalizeProgram(ModuleOp module) {
             cpu::implementationParameter(binding, "register_replicas"),
             cpu::implementationParameter(binding, "reduction_replicas")))) return failure();
   }
-  if (failed(normalize())) return failure();
+  return success();
+}
+
+LogicalResult finalizeNativeProgram(ModuleOp module) {
+  auto capabilities = module->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities");
+  if (!capabilities)
+    return module.emitError("Mojo finalization requires CPU capabilities");
   SmallVector<math::RsqrtOp> roots;
   module.walk([&](math::RsqrtOp operation) { roots.push_back(operation); });
   for (auto operation : roots) {
@@ -314,7 +304,6 @@ LogicalResult legalizeProgram(ModuleOp module) {
   if (failed(expandAtomicUpdates(module))) return failure();
   for (func::FuncOp function : module.getOps<func::FuncOp>())
     promotePrivateScratch(function, capabilities.getPrivateBytes());
-  if (failed(cpu::verifyCPUProgram(module, true)) || failed(checkSurface(module))) return failure();
   SmallVector<Block *> scopes;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
     if (function.isExternal()) continue;
@@ -323,7 +312,7 @@ LogicalResult legalizeProgram(ModuleOp module) {
       if (needsFloatingPointEnvironment(dispatch)) scopes.push_back(&dispatch.getBody().front());
     });
   }
-  if (scopes.empty()) return success();
+  if (scopes.empty()) return checkSurface(module);
   OpBuilder builder(module.getContext());
   builder.setInsertionPointToStart(module.getBody());
   auto enter = builder.create<func::FuncOp>(module.getLoc(), "intent_cpu_enter_ieee",
@@ -339,7 +328,7 @@ LogicalResult legalizeProgram(ModuleOp module) {
     builder.setInsertionPoint(scope->getTerminator());
     builder.create<func::CallOp>(module.getLoc(), leave, ValueRange{previous});
   }
-  return cpu::verifyCPUProgram(module, true);
+  return checkSurface(module);
 }
 
 }

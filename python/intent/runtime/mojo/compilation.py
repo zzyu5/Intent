@@ -1,19 +1,31 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import ctypes
 import json
 from pathlib import Path
+import shlex
+import shutil
 import subprocess
 import tempfile
 from threading import Lock
+import weakref
+
+from intent.compiler.cache import cache_root
 
 
 @dataclass
 class NativeLibrary:
-    directory: tempfile.TemporaryDirectory
+    directory: Path
     library: ctypes.CDLL
+    _cleanup: weakref.finalize = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._cleanup = weakref.finalize(self, shutil.rmtree, self.directory)
+
+    def close(self) -> None:
+        self._cleanup()
 
 
 @dataclass
@@ -106,27 +118,59 @@ def benchmark_exports(metadata: dict[str, object]) -> str:
     return "".join(sections)
 
 
-def _compile_unit(source: str, metadata: dict[str, object], target) -> NativeLibrary:
-    complete_source = source + benchmark_exports(metadata)
-    fp_source = Path(__file__).with_name("fp_environment.c")
-    directory = tempfile.TemporaryDirectory(prefix="intentdsl-mojo-artifact-")
-    root = Path(directory.name)
-    source_path = root / "kernel.mojo"
-    library_path = root / "kernel.so"
-    source_path.write_text(complete_source, encoding="utf-8")
-    fp_object = root / "fp_environment.o"
-    subprocess.run(
-        ["cc", "-O2", "-fPIC", "-c", str(fp_source), "-o", str(fp_object)],
-        capture_output=True, text=True, check=True,
-    )
-    completed = subprocess.run(
-        [target.executable, "build", str(source_path), "--emit", "shared-lib", "-o", str(library_path),
-         *target.native_options, "-Xlinker", str(fp_object)],
-        capture_output=True, text=True, check=False,
-    )
+def _invoke_compiler(command: list[str], directory: Path, stage: str) -> None:
+    (directory / f"{stage}.command").write_text(shlex.join(command) + "\n", encoding="utf-8")
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    except OSError as error:
+        (directory / f"{stage}.stdout").write_text("", encoding="utf-8")
+        (directory / f"{stage}.stderr").write_text(str(error) + "\n", encoding="utf-8")
+        (directory / f"{stage}.status").write_text("process not started\n", encoding="utf-8")
+        raise
+    (directory / f"{stage}.stdout").write_text(completed.stdout, encoding="utf-8")
+    (directory / f"{stage}.stderr").write_text(completed.stderr, encoding="utf-8")
+    (directory / f"{stage}.status").write_text(str(completed.returncode) + "\n", encoding="utf-8")
     if completed.returncode:
-        raise RuntimeError(f"Mojo native compilation failed:\n{completed.stderr}{completed.stdout}")
-    return NativeLibrary(directory, ctypes.CDLL(str(library_path)))
+        raise RuntimeError(
+            f"compiler exited with code {completed.returncode}:\n{completed.stderr}{completed.stdout}"
+        )
+
+
+def _compile_unit(source: str, metadata: dict[str, object], target) -> NativeLibrary:
+    candidate, = metadata["candidates"]
+    entry = candidate["entry"]
+    root = cache_root() / "mojo"
+    stage = "artifact_setup"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix="native-", dir=root))
+        (root / "artifact.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+        stage = "source_materialization"
+        source_path = root / "kernel.mojo"
+        source_path.write_text(source, encoding="utf-8")
+        with source_path.open("a", encoding="utf-8") as output:
+            output.write(benchmark_exports(metadata))
+        fp_source = root / "fp_environment.c"
+        fp_source.write_text(Path(__file__).with_name("fp_environment.c").read_text(encoding="utf-8"),
+                             encoding="utf-8")
+        fp_object = root / "fp_environment.o"
+        library_path = root / "kernel.so"
+        stage = "fp_environment_compilation"
+        _invoke_compiler(
+            ["cc", "-O2", "-fPIC", "-c", str(fp_source), "-o", str(fp_object)], root, stage,
+        )
+        stage = "native_compilation"
+        _invoke_compiler(
+            [target.executable, "build", str(source_path), "--emit", "shared-lib", "-o", str(library_path),
+             *target.native_options, "-Xlinker", str(fp_object)], root, stage,
+        )
+        stage = "native_loading"
+        library = ctypes.CDLL(str(library_path))
+    except Exception as error:
+        raise RuntimeError(
+            f"Mojo {stage} failed for candidate {entry}:\n{error}\nNative compiler artifacts: {root}"
+        ) from error
+    return NativeLibrary(root, library)
 
 
 def compile_library(source: str, metadata: dict[str, object], target) -> NativeCompilation:
@@ -158,7 +202,7 @@ def compile_library(source: str, metadata: dict[str, object], target) -> NativeC
         wait(futures)
         for future in futures:
             if not future.cancelled() and future.exception() is None:
-                future.result().directory.cleanup()
+                future.result().close()
         with _compilation_lock:
             del _compilations[key]
         pending.set_exception(error)

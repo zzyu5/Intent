@@ -3,6 +3,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "Intent/Dialect/CPU/Transforms/Implementation.h"
 namespace intent::mojo {
+void registerMojoPasses();
 cpu::ImplementationRegistry implementations();
 int64_t registerContractionRows(mlir::linalg::GenericOp operation);
 mlir::LogicalResult materializeRegisterContractions(mlir::func::FuncOp function);

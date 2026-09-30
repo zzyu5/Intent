@@ -1,9 +1,11 @@
 add_mlir_library(MLIRIntentMojoTransforms
   Legalize.cpp
+  Passes.cpp
   Implementations.cpp
   MaterializeRegisterContractions.cpp
   LINK_LIBS PUBLIC
   MLIRIntentCPUTransforms
+  MLIRPass
   MLIRArithDialect
   MLIRArithTransforms
   MLIRFuncDialect
