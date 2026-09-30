@@ -1260,105 +1260,42 @@ private:
     return success();
   }
 
-  Value dotProduct(Value lhs, Value rhs, Value extent, Type accumulator,
-                   ArrayRef<AffineMap> maps, Location loc) {
-    Type element = cast<MemRefType>(lhs.getType()).getElementType();
-    Value initial = builder.create<arith::ConstantOp>(loc, builder.getZeroAttr(accumulator));
-    auto reduction = builder.create<cpu::ReduceOp>(loc, accumulator, extent, initial,
-        ValueRange{lhs, rhs}, builder.getAffineMapArrayAttr(maps),
-        cpu::ReductionOrderAttr::get(builder.getContext(), true));
-    Block *body = &reduction.getCombine().emplaceBlock();
-    body->addArguments(TypeRange{accumulator, element, element}, {loc, loc, loc});
-    {
-      OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToStart(body);
-      Value left = body->getArgument(1), right = body->getArgument(2);
-      if (element != accumulator) {
-        left = builder.create<arith::ExtFOp>(loc, accumulator, left);
-        right = builder.create<arith::ExtFOp>(loc, accumulator, right);
-      }
-      Value product = builder.create<arith::MulFOp>(loc, left, right);
-      Value sum = builder.create<arith::AddFOp>(loc, body->getArgument(0), product);
-      builder.create<cpu::YieldOp>(loc, sum);
-    }
-    return reduction.getResult();
+  void emitContraction(Value lhs, Value rhs, Value destination,
+                       ArrayRef<AffineMap> maps, unsigned parallelRank,
+                       unsigned reductionRank, Location loc) {
+    Type accumulator = cast<MemRefType>(destination.getType()).getElementType();
+    Value zero = builder.create<arith::ConstantOp>(loc, builder.getZeroAttr(accumulator));
+    builder.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{destination});
+    SmallVector<utils::IteratorType> iterators(parallelRank, utils::IteratorType::parallel);
+    iterators.append(reductionRank, utils::IteratorType::reduction);
+    builder.create<linalg::GenericOp>(loc, ValueRange{lhs, rhs}, ValueRange{destination},
+        maps, iterators, [](OpBuilder &b, Location loc, ValueRange arguments) {
+          Value value;
+          if (isa<FloatType>(arguments[2].getType())) {
+            Value lhs = arguments[0], rhs = arguments[1];
+            if (lhs.getType() != arguments[2].getType())
+              lhs = b.create<arith::ExtFOp>(loc, arguments[2].getType(), lhs);
+            if (rhs.getType() != arguments[2].getType())
+              rhs = b.create<arith::ExtFOp>(loc, arguments[2].getType(), rhs);
+            value = b.create<math::FmaOp>(loc, lhs, rhs, arguments[2]);
+          } else {
+            Value lhs = b.create<arith::ExtSIOp>(loc, arguments[2].getType(), arguments[0]);
+            Value rhs = b.create<arith::ExtSIOp>(loc, arguments[2].getType(), arguments[1]);
+            value = b.create<arith::AddIOp>(loc,
+                b.create<arith::MulIOp>(loc, lhs, rhs), arguments[2]);
+          }
+          b.create<linalg::YieldOp>(loc, value);
+        });
   }
 
   void matrix(Value lhs, Value rhs, Value destination, Location loc) {
-    Type accumulator = cast<MemRefType>(destination.getType()).getElementType();
-    if (isa<FloatType>(accumulator) && cast<MemRefType>(rhs.getType()).getDimSize(1) == 1) {
-      Value rows = builder.create<memref::DimOp>(loc, lhs, 0);
-      Value extent = builder.create<memref::DimOp>(loc, lhs, 1);
-      Value zero = constant(loc, 0), one = constant(loc, 1);
-      auto vectorSlice = [&](Value source, int64_t reductionAxis,
-                             ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes) -> Value {
-        auto type = cast<MemRefType>(source.getType());
-        SmallVector<OpFoldResult> strides(2, builder.getIndexAttr(1));
-        SmallVector<OpFoldResult> sliceSizes(sizes);
-        if (!type.isDynamicDim(reductionAxis))
-          sliceSizes[reductionAxis] = builder.getIndexAttr(type.getDimSize(reductionAxis));
-        auto sliced = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
-            ArrayRef<int64_t>{type.getDimSize(reductionAxis)}, type, offsets, sliceSizes, strides));
-        return builder.create<memref::SubViewOp>(loc, sliced, source, offsets, sliceSizes, strides);
-      };
-      Value right = vectorSlice(rhs, 0, {builder.getIndexAttr(0), builder.getIndexAttr(0)},
-          {extent, builder.getIndexAttr(1)});
-      auto parallel = builder.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{rows}, ValueRange{one});
-      OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToStart(parallel.getBody());
-      Value row = parallel.getInductionVars()[0];
-      Value source = vectorSlice(lhs, 1, {row, builder.getIndexAttr(0)}, {builder.getIndexAttr(1), extent});
-      auto map = builder.getMultiDimIdentityMap(1);
-      Value value = dotProduct(source, right, extent, accumulator, {map, map}, loc);
-      builder.create<memref::StoreOp>(loc, value, destination, ValueRange{row, zero});
-      return;
-    }
-    Value zero = builder.create<arith::ConstantOp>(loc, builder.getZeroAttr(accumulator));
     AffineExpr m, n, k;
     bindDims(builder.getContext(), m, n, k);
     SmallVector<AffineMap> maps = {
         AffineMap::get(3, 0, {m, k}, builder.getContext()),
         AffineMap::get(3, 0, {k, n}, builder.getContext()),
         AffineMap::get(3, 0, {m, n}, builder.getContext())};
-    builder.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{destination});
-    builder.create<linalg::GenericOp>(loc, ValueRange{lhs, rhs}, ValueRange{destination}, maps,
-        SmallVector<utils::IteratorType>{utils::IteratorType::parallel, utils::IteratorType::parallel,
-                                        utils::IteratorType::reduction},
-        [](OpBuilder &b, Location loc, ValueRange arguments) {
-          Value value;
-          if (isa<FloatType>(arguments[2].getType())) {
-            Value lhs = arguments[0], rhs = arguments[1];
-            if (lhs.getType() != arguments[2].getType()) lhs = b.create<arith::ExtFOp>(loc, arguments[2].getType(), lhs);
-            if (rhs.getType() != arguments[2].getType()) rhs = b.create<arith::ExtFOp>(loc, arguments[2].getType(), rhs);
-            value = b.create<math::FmaOp>(loc, lhs, rhs, arguments[2]);
-          } else {
-            Value lhs = b.create<arith::ExtSIOp>(loc, arguments[2].getType(), arguments[0]);
-            Value rhs = b.create<arith::ExtSIOp>(loc, arguments[2].getType(), arguments[1]);
-            value = b.create<arith::AddIOp>(loc, b.create<arith::MulIOp>(loc, lhs, rhs), arguments[2]);
-          }
-          b.create<linalg::YieldOp>(loc, value);
-        });
-  }
-
-  Value insertUnitMatrixAxis(Value value, bool row, Location loc) {
-    auto type = cast<MemRefType>(value.getType());
-    int64_t rank = type.getRank();
-    SmallVector<int64_t> shape(type.getShape());
-    shape.insert(shape.begin() + rank - (row ? 1 : 0), 1);
-    SmallVector<ReassociationIndices> groups;
-    SmallVector<OpFoldResult> sizes;
-    for (int64_t axis = 0; axis + 1 < rank; ++axis)
-      groups.push_back({axis});
-    groups.push_back({rank - 1, rank});
-    for (int64_t axis = 0; axis < rank; ++axis) {
-      if (row && axis + 1 == rank)
-        sizes.push_back(builder.getIndexAttr(1));
-      sizes.push_back(type.isDynamicDim(axis)
-          ? OpFoldResult(builder.create<memref::DimOp>(loc, value, axis).getResult())
-          : OpFoldResult(builder.getIndexAttr(type.getDimSize(axis))));
-    }
-    if (!row) sizes.push_back(builder.getIndexAttr(1));
-    return builder.create<memref::ExpandShapeOp>(loc, shape, value, groups, sizes);
+    emitContraction(lhs, rhs, destination, maps, 2, 1, loc);
   }
 
   LogicalResult contract(ContractOp operation) {
@@ -1387,125 +1324,41 @@ private:
     bool floating = isa<FloatType>(inputElement) && inputElement == rhsType.getElementType() &&
         (accumulator.isF32() || accumulator.isF64()) &&
         inputElement.getIntOrFloatBitWidth() <= accumulator.getIntOrFloatBitWidth();
-    bool integer = lhsType.getElementType().isSignlessInteger(8) && rhsType.getElementType().isSignlessInteger(8) &&
-        resultType.getElementType().isSignlessInteger(32);
-    int64_t batchRank = axes->batch.size();
-    if (floating && !batchRank && lhsType.getRank() == 1 && rhsType.getRank() == 1 &&
-        resultType.getRank() == 0 && axes->reduction.size() == 1) {
-      Location loc = operation.getLoc();
-      Value lhs = values.lookup(operation.getLhs()), rhs = values.lookup(operation.getRhs());
-      Value extent = builder.create<memref::DimOp>(loc, lhs, 0);
-      auto map = builder.getMultiDimIdentityMap(1);
-      values.map(operation.getResult(), dotProduct(lhs, rhs, extent, accumulator, {map, map}, loc));
-      return success();
+    bool integer = inputElement.isSignlessInteger(8) &&
+        rhsType.getElementType().isSignlessInteger(8) && accumulator.isSignlessInteger(32);
+    if (!floating && !integer)
+      return operation.emitError(
+          "CPU contraction requires lossless floating widening to f32/f64 or i8 to i32 accumulation");
+
+    unsigned parallelRank = resultType.getRank();
+    unsigned reductionRank = axes->reduction.size();
+    unsigned loopRank = parallelRank + reductionRank;
+    SmallVector<AffineExpr> lhsMap(lhsType.getRank()), rhsMap(rhsType.getRank()), resultMap;
+    for (auto [axis, result] : llvm::enumerate(axes->lhsResultAxes))
+      if (result) lhsMap[axis] = builder.getAffineDimExpr(*result);
+    for (auto [axis, result] : llvm::enumerate(axes->rhsResultAxes))
+      if (result) rhsMap[axis] = builder.getAffineDimExpr(*result);
+    for (auto [number, pair] : llvm::enumerate(axes->reduction)) {
+      AffineExpr reduction = builder.getAffineDimExpr(parallelRank + number);
+      lhsMap[pair.lhs] = reduction;
+      rhsMap[pair.rhs] = reduction;
     }
-    if (!batchRank && axes->reduction.size() > 1 &&
-        axes->lhsFree.size() == 1 && axes->rhsFree.size() == 1 && (floating || integer)) {
-      Location loc = operation.getLoc();
-      Value lhs = values.lookup(operation.getLhs()), rhs = values.lookup(operation.getRhs());
-      SmallVector<unsigned> leftAxes, rightAxes;
-      SmallVector<Value> reductionSizes;
-      Value depth = constant(loc, 1);
-      for (ContractionAxisPair pair : axes->reduction) {
-        leftAxes.push_back(pair.lhs);
-        rightAxes.push_back(pair.rhs);
-        Value size = builder.create<memref::DimOp>(loc, lhs, leftAxes.back());
-        reductionSizes.push_back(size);
-        depth = builder.create<arith::MulIOp>(loc, depth, size);
-      }
-      auto pack = [&](Value source, ArrayRef<unsigned> axes, unsigned freeAxis, bool left) {
-        auto type = cast<MemRefType>(source.getType());
-        Value freeSize = builder.create<memref::DimOp>(loc, source, freeAxis);
-        SmallVector<int64_t> shape = left
-            ? SmallVector<int64_t>{type.getDimSize(freeAxis), ShapedType::kDynamic}
-            : SmallVector<int64_t>{ShapedType::kDynamic, type.getDimSize(freeAxis)};
-        SmallVector<Value> sizes = left ? SmallVector<Value>{freeSize, depth}
-                                       : SmallVector<Value>{depth, freeSize};
-        Value packed = allocate(RankedTensorType::get(shape, inputElement), sizes, loc);
-        // Sliced paired axes need not be physically contiguous. Materialize
-        // their logical coordinates before exposing the rank-two contraction.
-        builder.create<linalg::GenericOp>(loc, ValueRange{}, ValueRange{packed},
-            SmallVector<AffineMap>{builder.getMultiDimIdentityMap(2)},
-            SmallVector<utils::IteratorType>(2, utils::IteratorType::parallel),
-            [&](OpBuilder &b, Location loc, ValueRange) {
-              SmallVector<Value> coordinates(type.getRank());
-              coordinates[freeAxis] = b.create<linalg::IndexOp>(loc, left ? 0 : 1);
-              Value linear = b.create<linalg::IndexOp>(loc, left ? 1 : 0);
-              for (int64_t position = axes.size() - 1; position > 0; --position) {
-                coordinates[axes[position]] = b.create<arith::RemSIOp>(loc, linear, reductionSizes[position]);
-                linear = b.create<arith::DivSIOp>(loc, linear, reductionSizes[position]);
-              }
-              coordinates[axes[0]] = linear;
-              b.create<linalg::YieldOp>(loc, ValueRange{b.create<memref::LoadOp>(loc, source, coordinates)});
-            });
-        return packed;
-      };
-      Value left = pack(lhs, leftAxes, axes->lhsFree.front(), true);
-      Value right = pack(rhs, rightAxes, axes->rhsFree.front(), false);
-      auto sizes = extents(resultType, loc);
-      if (failed(sizes)) return failure();
-      Value output = allocate(resultType, *sizes, loc);
-      matrix(left, right, output, loc);
-      values.map(operation.getResult(), output);
-      return success();
-    }
-    bool lhsVector = axes->lhsFree.empty();
-    bool rhsVector = axes->rhsFree.empty();
-    if ((!lhsVector && lhsType.getRank() != batchRank + 2) ||
-        (!rhsVector && rhsType.getRank() != batchRank + 2) ||
-        (lhsVector && rhsVector) || axes->reduction.size() != 1 ||
-        resultType.getRank() != batchRank + 2 - lhsVector - rhsVector ||
-        axes->reduction.front().lhs != batchRank + (lhsVector ? 0 : 1) ||
-        axes->reduction.front().rhs != batchRank ||
-        (!floating && !integer))
-      return operation.emitError("CPU construction requires a floating vector dot or a leading-batch matrix/vector contraction with lossless floating widening or i8 to i32 accumulation");
-    for (auto [axis, pair] : llvm::enumerate(axes->batch)) {
-      if (pair.lhs != axis || pair.rhs != axis)
-        return operation.emitError("CPU contraction batch axes must form a shared leading domain");
-    }
+    for (unsigned axis = 0; axis < parallelRank; ++axis)
+      resultMap.push_back(builder.getAffineDimExpr(axis));
+    SmallVector<AffineMap> maps = {
+        AffineMap::get(loopRank, 0, lhsMap, builder.getContext()),
+        AffineMap::get(loopRank, 0, rhsMap, builder.getContext()),
+        AffineMap::get(loopRank, 0, resultMap, builder.getContext())};
     Location loc = operation.getLoc();
     auto sizes = extents(resultType, loc);
     if (failed(sizes)) return failure();
     Value output = allocate(resultType, *sizes, loc);
-    Value lhs = values.lookup(operation.getLhs()), rhs = values.lookup(operation.getRhs());
-    Value matrixOutput = output;
-    // A missing free axis is a unit physical view, not a different algorithm
-    // or a copy. Preserve batch axes, source strides and the original result ABI.
-    if (lhsVector) {
-      lhs = insertUnitMatrixAxis(lhs, /*row=*/true, loc);
-      matrixOutput = insertUnitMatrixAxis(output, /*row=*/true, loc);
-    } else if (rhsVector) {
-      rhs = insertUnitMatrixAxis(rhs, /*row=*/false, loc);
-      matrixOutput = insertUnitMatrixAxis(output, /*row=*/false, loc);
-    }
-    if (!batchRank) matrix(lhs, rhs, matrixOutput, loc);
-    else {
-      SmallVector<Value> begins(batchRank, constant(loc, 0)), steps(batchRank, constant(loc, 1)), ends;
-      for (int64_t axis = 0; axis < batchRank; ++axis)
-        ends.push_back(builder.create<memref::DimOp>(loc, lhs, axis));
-      auto batches = builder.create<scf::ParallelOp>(loc, begins, ends, steps);
-      OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToStart(batches.getBody());
-      auto slice = [&](Value source) -> Value {
-        auto type = cast<MemRefType>(source.getType());
-        SmallVector<OpFoldResult> offsets, extents, strides(type.getRank(), builder.getIndexAttr(1));
-        for (Value coordinate : batches.getInductionVars()) {
-          offsets.push_back(coordinate);
-          extents.push_back(builder.getIndexAttr(1));
-        }
-        for (int64_t axis = batchRank; axis < type.getRank(); ++axis) {
-          offsets.push_back(builder.getIndexAttr(0));
-          extents.push_back(type.isDynamicDim(axis)
-              ? OpFoldResult(builder.create<memref::DimOp>(loc, source, axis).getResult())
-              : builder.getIndexAttr(type.getDimSize(axis)));
-        }
-        auto result = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
-            type.getShape().take_back(2), type, offsets, extents, strides));
-        return builder.create<memref::SubViewOp>(loc, result, source, offsets, extents, strides);
-      };
-      matrix(slice(lhs), slice(rhs), slice(matrixOutput), loc);
-    }
-    values.map(operation.getResult(), output);
+    emitContraction(values.lookup(operation.getLhs()), values.lookup(operation.getRhs()),
+                    output, maps, parallelRank, reductionRank, loc);
+    // Rank-zero logical tensors use the scalar representation in this construction.
+    Value result = parallelRank ? output
+        : Value(builder.create<memref::LoadOp>(loc, output, ValueRange{}));
+    values.map(operation.getResult(), result);
     return success();
   }
 

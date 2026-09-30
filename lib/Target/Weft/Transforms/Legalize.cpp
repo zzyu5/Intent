@@ -1,4 +1,5 @@
 #include "Intent/Target/Weft/Transforms/Passes.h"
+#include "Views.h"
 #include "Quantization.h"
 #include "Intent/Target/Weft/Serialization/Serializer.h"
 #include "Intent/Dialect/CPU/Analysis/AxisRelations.h"
@@ -15,6 +16,7 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/Support/JSON.h"
 
 using namespace mlir;
@@ -138,7 +140,7 @@ public:
 
   LogicalResult lower(cpu::TasksOp tasks, StringRef name, ArrayRef<unsigned> argumentPositions,
                       llvm::json::Object &abi) {
-    values.clear(); locals.clear(); readOnlySupplies.clear();
+    values.clear(); locals.clear(); readOnlySupplies.clear(); viewAxes.clear();
     Location loc = tasks.getLoc();
     SmallVector<Attribute> names, accesses, symbols;
     SmallVector<int64_t> aliases;
@@ -290,6 +292,12 @@ private:
     while (true) {
       if (auto view = memory.getDefiningOp<memref::SubViewOp>()) memory = view.getSource();
       else if (auto cast = memory.getDefiningOp<memref::CastOp>()) memory = cast.getSource();
+      else if (auto view = memory.getDefiningOp<memref::ReinterpretCastOp>()) {
+        auto metadata = view.getSource().getDefiningOp<memref::ExtractStridedMetadataOp>();
+        if (!metadata || view.getSource() != metadata.getBaseBuffer()) return memory;
+        memory = metadata.getSource();
+      } else if (auto view = memory.getDefiningOp<memref::ExpandShapeOp>()) memory = view.getSrc();
+      else if (auto view = memory.getDefiningOp<memref::CollapseShapeOp>()) memory = view.getSrc();
       else return memory;
     }
   }
@@ -319,6 +327,11 @@ private:
 
   std::optional<int64_t> dimensionSymbol(Value memory, unsigned axis) {
     if (auto cast = memory.getDefiningOp<memref::CastOp>()) return dimensionSymbol(cast.getSource(), axis);
+    if (memory.getDefiningOp() && isAxisView(memory.getDefiningOp())) {
+      auto projection = queryAxisView(memory);
+      if (failed(projection) || !projection->sourceAxes[axis]) return std::nullopt;
+      return dimensionSymbol(projection->source, *projection->sourceAxes[axis]);
+    }
     if (auto argument = dyn_cast<BlockArgument>(memory)) {
       if (auto tasks = dyn_cast<cpu::TasksOp>(argument.getOwner()->getParentOp()))
         return dimensionSymbol(tasks.getCaptures()[argument.getArgNumber() - 1], axis);
@@ -346,12 +359,59 @@ private:
   }
 
   FailureOr<Value> view(Value memory) {
-    if (values.contains(memory)) return values.lookup(memory);
-    if (auto cast = memory.getDefiningOp<memref::CastOp>()) return view(cast.getSource());
+    if (values.contains(memory)) {
+      if (!viewAxes.count(memory)) {
+        auto &mapping = viewAxes[memory];
+        for (int64_t axis = 0; axis < cast<MemRefType>(memory.getType()).getRank(); ++axis) mapping.push_back(axis);
+      }
+      return values.lookup(memory);
+    }
+    if (auto cast = memory.getDefiningOp<memref::CastOp>()) {
+      auto source = view(cast.getSource());
+      if (failed(source)) return failure();
+      viewAxes[memory] = viewAxes.at(cast.getSource());
+      values.map(memory, *source);
+      return source;
+    }
+    if (memory.getDefiningOp() && isAxisView(memory.getDefiningOp())) {
+      auto projection = queryAxisView(memory);
+      if (failed(projection)) return failure();
+      auto source = view(projection->source);
+      if (failed(source)) return failure();
+      auto &mapping = viewAxes[memory];
+      for (auto axis : projection->sourceAxes)
+        mapping.push_back(axis ? viewAxes.at(projection->source)[*axis] : -1);
+      values.map(memory, *source);
+      return source;
+    }
     auto operation = memory.getDefiningOp<memref::SubViewOp>();
     if (!operation) return emitError(memory.getLoc(), "CPU memory has no explicit Weft view relation: ") << memory, failure();
     auto base = view(operation.getSource());
     if (failed(base)) return failure();
+    auto sourceAxes = viewAxes.at(operation.getSource());
+    auto baseShape = shape((*base).getType());
+    SmallVector<OpFoldResult> nativeOffsets(baseShape.size(), b.getIndexAttr(0));
+    SmallVector<OpFoldResult> nativeSizes(baseShape.size(), b.getIndexAttr(1));
+    llvm::SmallBitVector dropped(baseShape.size());
+    auto logicalDropped = operation.getDroppedDims();
+    for (auto [axis, native] : llvm::enumerate(sourceAxes)) {
+      if (native < 0) {
+        if (!sameBound(operation.getMixedOffsets()[axis], b.getIndexAttr(0)) ||
+            !sameBound(operation.getMixedSizes()[axis], b.getIndexAttr(1)))
+          return operation.emitError("Weft inserted unit-axis subview must retain its single element"), failure();
+        continue;
+      }
+      nativeOffsets[native] = operation.getMixedOffsets()[axis];
+      nativeSizes[native] = operation.getMixedSizes()[axis];
+      if (logicalDropped.test(axis)) dropped.set(native);
+    }
+    SmallVector<int64_t> mapping;
+    for (auto [axis, native] : llvm::enumerate(sourceAxes))
+      if (!logicalDropped.test(axis)) {
+        int64_t shifted = native;
+        for (int64_t before = 0; before < native; ++before) shifted -= dropped.test(before);
+        mapping.push_back(shifted);
+      }
     SmallVector<int64_t> offsets, extents, dimensions;
     SmallVector<Value> dynamic;
     auto append = [&](ArrayRef<OpFoldResult> bounds, SmallVectorImpl<int64_t> &statics) {
@@ -367,14 +427,12 @@ private:
     for (OpFoldResult stride : operation.getMixedStrides())
       if (!sameBound(stride, b.getIndexAttr(1))) return operation.emitError("Weft subview requires unit coordinate steps"), failure();
     bool projectionOnly = true;
-    auto dropped = operation.getDroppedDims();
-    auto baseShape = shape((*base).getType());
     for (unsigned axis = 0; axis < baseShape.size(); ++axis) {
       if (dropped.test(axis)) continue;
-      auto size = operation.getMixedSizes()[axis];
+      auto size = nativeSizes[axis];
       bool full = baseShape[axis] >= 0 ? sameBound(size, b.getIndexAttr(baseShape[axis]))
           : isa<Value>(size) && extentSymbol(cast<Value>(size)) == -baseShape[axis];
-      projectionOnly &= sameBound(operation.getMixedOffsets()[axis], b.getIndexAttr(0)) && full;
+      projectionOnly &= sameBound(nativeOffsets[axis], b.getIndexAttr(0)) && full;
     }
     if (projectionOnly) {
       SmallVector<Attribute> selectors;
@@ -384,7 +442,7 @@ private:
       for (unsigned axis = 0; axis < baseShape.size(); ++axis) {
         selectors.push_back(b.getStringAttr(dropped.test(axis) ? "index" : "all"));
         if (dropped.test(axis)) {
-          auto offset = operation.getMixedOffsets()[axis];
+          auto offset = nativeOffsets[axis];
           indices.push_back(isa<Attribute>(offset) ? index(operation.getLoc(), cast<IntegerAttr>(cast<Attribute>(offset)).getInt())
                                                    : values.lookup(cast<Value>(offset)));
         } else { keptShape.push_back(baseShape[axis]); keptAxes.push_back(baseAxes[axis]); }
@@ -393,10 +451,11 @@ private:
           wk::SliceType::get(b.getContext(), encoding(memory), array(keptShape), array(keptAxes)),
           *base, indices, b.getArrayAttr(selectors));
       values.map(memory, selected);
+      viewAxes[memory] = std::move(mapping);
       return selected;
     }
-    append(operation.getMixedOffsets(), offsets);
-    append(operation.getMixedSizes(), extents);
+    append(nativeOffsets, offsets);
+    append(nativeSizes, extents);
     auto format = formats.find(analysis.storageRoot(memory));
     if (format != formats.end()) {
       int64_t bytes = format->second == intent::QuantFormat::Q4K ? 144 : 292;
@@ -408,7 +467,7 @@ private:
     for (auto [axis, extent] : llvm::enumerate(extents)) {
       if (extent >= 0) dimensions.push_back(extent);
       else {
-        auto size = dyn_cast<Value>(operation.getMixedSizes()[axis]);
+        auto size = dyn_cast<Value>(nativeSizes[axis]);
         auto symbol = size ? extentSymbol(size) : std::nullopt;
         if (!symbol) return operation.emitError("dynamic Weft subview extent has no shape binding"), failure();
         dimensions.push_back(-*symbol);
@@ -435,10 +494,96 @@ private:
           selected, indices, b.getArrayAttr(selectors));
     }
     values.map(memory, selected);
+    viewAxes[memory] = std::move(mapping);
     return selected;
   }
 
-  FailureOr<Value> read(Value memory) {
+  FailureOr<Value> reshapeViewValue(Value memory, Value value, Type target, SmallVector<int64_t> order) {
+    auto sourceAxes = axes(value.getType());
+    for (int64_t axis : sourceAxes) if (!llvm::is_contained(order, axis)) order.push_back(axis);
+    SmallVector<int64_t> sourceDomain, reorderedDomain;
+    auto sourceShape = shape(value.getType());
+    for (auto [axis, extent] : llvm::zip(sourceAxes, sourceShape))
+      if (extent != 1) sourceDomain.push_back(axis);
+    for (int64_t axis : order)
+      if (sourceShape[llvm::find(sourceAxes, axis) - sourceAxes.begin()] != 1) reorderedDomain.push_back(axis);
+    // Moving a unit axis does not change the linear element sequence. Keep
+    // the original order so the target need not realize a physical transpose.
+    if (sourceDomain == reorderedDomain) order = sourceAxes;
+    if (value.getType() == target && order == sourceAxes) return value;
+    if (!isa<wk::ValueType>(value.getType()))
+      return Value(b.create<wk::NewOp>(memory.getLoc(), target, value, true));
+    if (!isa<wk::ValueType>(target)) {
+      if (llvm::any_of(shape(value.getType()), [](int64_t size) { return size != 1; }))
+        return emitError(memory.getLoc(), "Weft scalar view projection must contain one element"), failure();
+      return Value(b.create<wk::ExtractOp>(memory.getLoc(), target, value,
+          SmallVector<Value>(sourceAxes.size(), index(memory.getLoc(), 0)),
+          b.getArrayAttr(SmallVector<Attribute>(sourceAxes.size(), b.getStringAttr("index")))));
+    }
+    bool dynamic = llvm::any_of(shape(value.getType()), [](int64_t size) { return size < 0; }) ||
+                   llvm::any_of(shape(target), [](int64_t size) { return size < 0; });
+    if (dynamic && (shape(value.getType()) != shape(target) || order != sourceAxes))
+      return emitError(memory.getLoc(), "Weft axis permutation requires a statically shaped admitted tile"), failure();
+    return Value(b.create<wk::ReshapeOp>(memory.getLoc(), target, value, array(order)));
+  }
+
+  // Positional memory consumers need the descriptor's logical axis order.
+  // A contraction instead consumes named axes and can retain storage order.
+  FailureOr<Value> projectViewValue(Value memory, Value value, Type nativeType, bool inverse = false) {
+    auto logicalType = resultType(memory);
+    if (failed(logicalType)) return failure();
+    auto nativeAxes = axes(nativeType), logicalAxes = axes(*logicalType);
+    auto &mapping = viewAxes.at(memory);
+    SmallVector<int64_t> order;
+    if (inverse) {
+      for (unsigned native = 0; native < nativeAxes.size(); ++native)
+        for (auto [logical, position] : llvm::enumerate(mapping))
+          if (position == static_cast<int64_t>(native)) order.push_back(logicalAxes[logical]);
+    } else {
+      for (int64_t native : mapping) if (native >= 0) order.push_back(nativeAxes[native]);
+    }
+    return reshapeViewValue(memory, value, inverse ? nativeType : *logicalType, std::move(order));
+  }
+
+  SmallVector<Value> projectIndices(Value memory, ValueRange indices, unsigned nativeRank) {
+    SmallVector<Value> projected(nativeRank, index(memory.getLoc(), 0));
+    for (auto [logical, native] : llvm::enumerate(viewAxes.at(memory)))
+      if (native >= 0) projected[native] = values.lookup(indices[logical]);
+    return projected;
+  }
+
+  FailureOr<Value> dimension(Value memory, unsigned axis) {
+    auto type = cast<MemRefType>(memory.getType());
+    if (!type.isDynamicDim(axis)) return index(memory.getLoc(), type.getDimSize(axis));
+    if (auto cast = memory.getDefiningOp<memref::CastOp>()) return dimension(cast.getSource(), axis);
+    if (isAxisView(memory.getDefiningOp())) {
+      auto projection = queryAxisView(memory);
+      if (failed(projection)) return failure();
+      return projection->sourceAxes[axis] ? dimension(projection->source, *projection->sourceAxes[axis])
+                                          : FailureOr<Value>(index(memory.getLoc(), 1));
+    }
+    if (isLocal(memory)) {
+      OpFoldResult size;
+      if (auto projection = memory.getDefiningOp<memref::SubViewOp>()) {
+        unsigned retained = 0;
+        for (unsigned original = 0; original < projection.getSourceType().getRank(); ++original)
+          if (!projection.getDroppedDims().test(original) && retained++ == axis)
+            size = projection.getMixedSizes()[original];
+      } else if (isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(memory.getDefiningOp())) {
+        size = memory.getDefiningOp()->getOperand(type.getDynamicDimIndex(axis));
+      }
+      if (!size) return emitError(memory.getLoc(), "private view dimension has no explicit extent"), failure();
+      return isa<Attribute>(size) ? index(memory.getLoc(), cast<IntegerAttr>(cast<Attribute>(size)).getInt())
+                                  : values.lookup(cast<Value>(size));
+    }
+    auto region = view(memory);
+    if (failed(region)) return failure();
+    int64_t native = viewAxes.at(memory)[axis];
+    if (native < 0) return index(memory.getLoc(), 1);
+    return Value(b.create<wk::ExtentOp>(memory.getLoc(), b.getIndexType(), *region, native));
+  }
+
+  FailureOr<Value> readNative(Value memory) {
     if (!isa<MemRefType>(memory.getType())) return values.lookup(memory);
     if (!isLocal(memory)) {
       auto supply = readOnlySupplies.find(memory);
@@ -451,6 +596,8 @@ private:
       if (element.isIndex()) element = IntegerType::get(b.getContext(), 64, IntegerType::Signed);
       Value loaded = b.create<wk::AdmitOp>(memory.getLoc(),
           valueType(element, shape((*region).getType()), axes((*region).getType())), *region);
+      // Cache only the admitted snapshot. A positional read and a named-axis
+      // contraction may consume this same value in different axis orders.
       operandReads[memory] = loaded;
       if (analysis.isReadOnly(memory)) readOnlySupplies[memory] = loaded;
       return loaded;
@@ -471,13 +618,71 @@ private:
         if (!sameBound(found->second.sizes[axis], full))
           return emitError(memory.getLoc(), "Weft local root read requires a complete initialized region"), failure();
       }
+      auto &mapping = viewAxes[memory];
+      mapping.clear();
+      for (int64_t axis = 0; axis < type.getRank(); ++axis) mapping.push_back(axis);
       return found->second.value;
     }
-    if (auto cast = memory.getDefiningOp<memref::CastOp>()) return read(cast.getSource());
+    if (auto cast = memory.getDefiningOp<memref::CastOp>()) {
+      auto source = readNative(cast.getSource());
+      if (failed(source)) return failure();
+      viewAxes[memory] = viewAxes.at(cast.getSource());
+      return source;
+    }
     auto projection = localProjection(memory, found->second);
     if (failed(projection)) return failure();
-    return Value(b.create<wk::ExtractOp>(memory.getLoc(), projection->type, found->second.value,
-                                        projection->indices, b.getArrayAttr(projection->selectors)));
+    Value selected = b.create<wk::ExtractOp>(memory.getLoc(), projection->type, found->second.value,
+                                            projection->indices, b.getArrayAttr(projection->selectors));
+    return selected;
+  }
+
+  FailureOr<Value> read(Value memory) {
+    auto native = readNative(memory);
+    if (failed(native) || !isa<MemRefType>(memory.getType())) return native;
+    return projectViewValue(memory, *native, (*native).getType());
+  }
+
+  FailureOr<Value> readNamedAxes(Value memory) {
+    auto native = readNative(memory);
+    if (failed(native) || !isa<MemRefType>(memory.getType())) return native;
+    auto logical = resultType(memory);
+    if (failed(logical)) return failure();
+    auto logicalAxes = axes(*logical), logicalShape = shape(*logical);
+    auto nativeShape = shape((*native).getType());
+    auto mapping = viewAxes.at(memory);
+    // Unit dimensions carry only coordinate zero. Reuse an existing unused
+    // native unit before inserting one: [1,K] must stay [1,K], because even
+    // an element-preserving [1,K] -> [K,1] can change the target partition.
+    // This choice is local to the named-value representation; the descriptor
+    // projection used by positional reads and writes remains unchanged.
+    for (auto [logicalPosition, position] : llvm::enumerate(mapping)) {
+      if (position >= 0 || logicalShape[logicalPosition] != 1) continue;
+      for (unsigned candidate = 0; candidate < nativeShape.size(); ++candidate)
+        if (nativeShape[candidate] == 1 && !llvm::is_contained(mapping, candidate)) {
+          mapping[logicalPosition] = candidate;
+          break;
+        }
+    }
+    SmallVector<int64_t> dimensions, ids;
+    for (unsigned position = 0; position < nativeShape.size(); ++position) {
+      auto found = llvm::find(mapping, position);
+      if (found == mapping.end()) {
+        if (nativeShape[position] != 1)
+          return emitError(memory.getLoc(), "named-axis supply lost a non-unit storage dimension"), failure();
+        continue;
+      }
+      unsigned logicalPosition = found - mapping.begin();
+      dimensions.push_back(nativeShape[position]);
+      ids.push_back(logicalAxes[logicalPosition]);
+    }
+    for (auto [logicalPosition, position] : llvm::enumerate(mapping))
+      if (position < 0) {
+        if (logicalShape[logicalPosition] != 1)
+          return emitError(memory.getLoc(), "named-axis supply can only insert unit dimensions"), failure();
+        dimensions.push_back(1); ids.push_back(logicalAxes[logicalPosition]);
+      }
+    return reshapeViewValue(memory, *native,
+        valueType(element((*native).getType()), dimensions, ids), axes((*native).getType()));
   }
 
   struct LocalProjection {
@@ -493,21 +698,40 @@ private:
     SmallVector<bool> zeroOrigins(rootType.getRank(), true);
     for (Value &origin : origins) origin = index(memory.getLoc(), 0);
     SmallVector<OpFoldResult> sizes(state.sizes);
-    SmallVector<unsigned> kept;
+    SmallVector<int64_t> kept;
     for (unsigned axis = 0; axis < rootType.getRank(); ++axis) kept.push_back(axis);
-    SmallVector<memref::SubViewOp> chain;
+    SmallVector<Value> chain;
     for (Value current = memory; current != root;) {
       if (auto cast = current.getDefiningOp<memref::CastOp>()) current = cast.getSource();
-      else if (auto view = current.getDefiningOp<memref::SubViewOp>()) { chain.push_back(view); current = view.getSource(); }
+      else if (auto view = current.getDefiningOp<memref::SubViewOp>()) { chain.push_back(current); current = view.getSource(); }
+      else if (current.getDefiningOp() && isAxisView(current.getDefiningOp())) {
+        auto projection = queryAxisView(current);
+        if (failed(projection)) return failure();
+        chain.push_back(current); current = projection->source;
+      }
       else return emitError(memory.getLoc(), "local window has no composed subview relation"), failure();
     }
-    for (auto view : llvm::reverse(chain)) {
-      SmallVector<unsigned> next;
+    for (Value current : llvm::reverse(chain)) {
+      SmallVector<int64_t> next;
+      if (isAxisView(current.getDefiningOp())) {
+        auto projection = queryAxisView(current);
+        if (failed(projection)) return failure();
+        for (auto source : projection->sourceAxes) next.push_back(source ? kept[*source] : -1);
+        kept = std::move(next);
+        continue;
+      }
+      auto view = current.getDefiningOp<memref::SubViewOp>();
       for (unsigned axis = 0; axis < kept.size(); ++axis) {
-        unsigned original = kept[axis];
+        int64_t original = kept[axis];
         if (!sameBound(view.getMixedStrides()[axis], b.getIndexAttr(1)))
           return view.emitError("private windows require unit coordinate steps"), failure();
         OpFoldResult offset = view.getMixedOffsets()[axis];
+        if (original < 0) {
+          if (!sameBound(offset, b.getIndexAttr(0)) || !sameBound(view.getMixedSizes()[axis], b.getIndexAttr(1)))
+            return view.emitError("private inserted unit-axis window must retain its single element"), failure();
+          if (!view.getDroppedDims().test(axis)) next.push_back(-1);
+          continue;
+        }
         zeroOrigins[original] = zeroOrigins[original] && sameBound(offset, b.getIndexAttr(0));
         Value value = isa<Attribute>(offset) ? index(memory.getLoc(), cast<IntegerAttr>(cast<Attribute>(offset)).getInt())
                                             : values.lookup(cast<Value>(offset));
@@ -522,6 +746,7 @@ private:
     auto rootAxes = memoryAxes(root);
     auto sourceAxes = axes(state.value.getType());
     auto sourceShape = shape(state.value.getType());
+    SmallVector<int64_t> selectedRoots;
     for (auto [position, axis] : llvm::enumerate(sourceAxes)) {
       auto found = llvm::find(rootAxes, axis);
       if (found == rootAxes.end()) return emitError(memory.getLoc(), "private state axis lost its destination relation"), failure();
@@ -530,6 +755,7 @@ private:
         result.selectors.push_back(b.getStringAttr("index")); result.indices.push_back(origins[original]);
         continue;
       }
+      selectedRoots.push_back(original);
       if (sameBound(sizes[original], state.sizes[original]) && zeroOrigins[original]) {
         result.selectors.push_back(b.getStringAttr("all"));
         dimensions.push_back(sourceShape[position]); ids.push_back(axis);
@@ -549,6 +775,12 @@ private:
       dimensions.push_back(*size); ids.push_back(axis);
     }
     result.type = valueType(element(state.value.getType()), dimensions, ids);
+    auto &mapping = viewAxes[memory];
+    mapping.clear();
+    for (int64_t original : kept) {
+      auto found = llvm::find(selectedRoots, original);
+      mapping.push_back(original < 0 ? -1 : found - selectedRoots.begin());
+    }
     return result;
   }
 
@@ -594,7 +826,12 @@ private:
     if (!isLocal(memory)) {
       auto region = view(memory);
       if (failed(region)) return failure();
-      auto aligned = alignValue(value, valueType(element(value.getType()), shape((*region).getType()), axes((*region).getType())), memory.getLoc());
+      auto logicalType = resultType(memory);
+      if (failed(logicalType)) return failure();
+      auto logical = alignValue(value, *logicalType, memory.getLoc());
+      if (failed(logical)) return failure();
+      auto aligned = projectViewValue(memory, *logical,
+          valueType(element((*logical).getType()), shape((*region).getType()), axes((*region).getType())), true);
       if (failed(aligned)) return failure();
       auto dimensions = shape((*region).getType()), ids = axes((*region).getType());
       if (wk::hasDynamicSubviewExtent<wk::SubviewOp, wk::SliceOp, wk::FieldOp>(*region) &&
@@ -643,11 +880,28 @@ private:
       if (found != locals.end()) {
         auto projected = localProjection(memory, found->second);
         if (failed(projected)) return failure();
-        auto aligned = alignValue(value, projected->type, memory.getLoc());
+        auto logicalType = resultType(memory);
+        if (failed(logicalType)) return failure();
+        auto logical = alignValue(value, *logicalType, memory.getLoc());
+        if (failed(logical)) return failure();
+        auto aligned = projectViewValue(memory, *logical, projected->type, true);
         if (failed(aligned)) return failure();
         found->second.value = b.create<wk::UpdateOp>(memory.getLoc(), found->second.value.getType(),
             found->second.value, *aligned, projected->indices, b.getArrayAttr(projected->selectors));
         return success();
+      }
+      if (isAxisView(memory.getDefiningOp())) {
+        auto axisView = queryAxisView(memory);
+        if (failed(axisView)) return failure();
+        auto sourceType = resultType(axisView->source), logicalType = resultType(memory);
+        if (failed(sourceType) || failed(logicalType)) return failure();
+        auto &mapping = viewAxes[memory];
+        mapping.clear();
+        for (auto axis : axisView->sourceAxes) mapping.push_back(axis ? *axis : -1);
+        auto logical = alignValue(value, *logicalType, memory.getLoc());
+        if (failed(logical)) return failure();
+        auto supplied = projectViewValue(memory, *logical, *sourceType, true);
+        return failed(supplied) ? failure() : write(axisView->source, *supplied);
       }
       if (!projection || projection.getSource() != root || projection.getDroppedDims().any() ||
           llvm::any_of(projection.getMixedOffsets(), [&](OpFoldResult offset) { return !sameBound(offset, b.getIndexAttr(0)); }))
@@ -791,8 +1045,8 @@ private:
     return failure();
   }
 
-  FailureOr<Value> mappedInput(Value input, AffineMap map, ArrayRef<int64_t> loopAxes) {
-    auto loaded = read(input);
+  FailureOr<Value> mappedInput(Value input, AffineMap map, ArrayRef<int64_t> loopAxes, bool namedAxes = false) {
+    auto loaded = namedAxes ? readNamedAxes(input) : read(input);
     if (failed(loaded)) return failure();
     if (!isa<MemRefType>(input.getType())) return *loaded;
     auto dimensions = shape((*loaded).getType()), ids = axes((*loaded).getType());
@@ -869,8 +1123,8 @@ private:
     }
     for (int64_t &axis : loopAxes) if (!axis) axis = nextAxis++;
     if (cpu::isMatrixContraction(operation)) {
-      auto lhs = mappedInput(operation.getInputs()[0], maps[0], loopAxes);
-      auto rhs = mappedInput(operation.getInputs()[1], maps[1], loopAxes);
+      auto lhs = mappedInput(operation.getInputs()[0], maps[0], loopAxes, true);
+      auto rhs = mappedInput(operation.getInputs()[1], maps[1], loopAxes, true);
       auto initial = read(destination);
       if (failed(lhs) || failed(rhs) || failed(initial)) return failure();
       auto definition = (*initial).getDefiningOp<wk::NewOp>();
@@ -1030,39 +1284,34 @@ private:
     operandReads.clear();
     Location loc = operation->getLoc();
     if (isa<memref::AllocOp, memref::AllocaOp>(operation)) return success();
-    if (isa<memref::SubViewOp, memref::CastOp>(operation)) {
+    if (isa<memref::SubViewOp, memref::CastOp>(operation) || isAxisView(operation)) {
       Value result = operation->getResult(0);
+      if (isAxisView(operation) && failed(queryAxisView(result))) return failure();
       if (!isLocal(result) && failed(view(result))) return failure();
       return success();
     }
-    if (auto dealloc = dyn_cast<memref::DeallocOp>(operation)) { locals.erase(localRoot(dealloc.getMemref())); return success(); }
-    if (auto dimension = dyn_cast<memref::DimOp>(operation)) {
-      auto axis = dimension.getConstantIndex();
-      if (!axis) return dimension.emitError("Weft dimension requires a static axis position");
-      if (isLocal(dimension.getSource())) {
-        Value memory = dimension.getSource();
-        while (auto cast = memory.getDefiningOp<memref::CastOp>()) memory = cast.getSource();
-        OpFoldResult extent;
-        if (auto subview = memory.getDefiningOp<memref::SubViewOp>()) {
-          unsigned projected = 0;
-          for (unsigned original = 0; original < subview.getSourceType().getRank(); ++original)
-            if (!subview.getDroppedDims().test(original) && projected++ == *axis)
-              extent = subview.getMixedSizes()[original];
-        } else {
-          auto type = cast<MemRefType>(memory.getType());
-          extent = type.isDynamicDim(*axis)
-              ? OpFoldResult(memory.getDefiningOp()->getOperand(type.getDynamicDimIndex(*axis)))
-              : OpFoldResult(b.getIndexAttr(type.getDimSize(*axis)));
-        }
-        if (!extent) return dimension.emitError("local dimension has no explicit allocation or subview extent");
-        values.map(dimension.getResult(), isa<Attribute>(extent)
-            ? index(loc, cast<IntegerAttr>(cast<Attribute>(extent)).getInt())
-            : values.lookup(cast<Value>(extent)));
-        return success();
+    if (auto metadata = dyn_cast<memref::ExtractStridedMetadataOp>(operation)) {
+      SmallVector<Value> descriptors{metadata.getBaseBuffer(), metadata.getOffset()};
+      llvm::append_range(descriptors, metadata.getStrides());
+      for (Value descriptor : descriptors)
+        for (Operation *user : descriptor.getUsers())
+          if (!isa<memref::ReinterpretCastOp>(user))
+            return metadata.emitError("Weft strided metadata may only supply a proved axis view; arbitrary address arithmetic is unsupported");
+      for (auto [axis, size] : llvm::enumerate(metadata.getSizes())) {
+        if (size.use_empty()) continue;
+        auto extent = dimension(metadata.getSource(), axis);
+        if (failed(extent)) return failure();
+        values.map(size, *extent);
       }
-      auto region = view(dimension.getSource());
-      if (failed(region)) return failure();
-      values.map(dimension.getResult(), b.create<wk::ExtentOp>(loc, b.getIndexType(), *region, *axis));
+      return success();
+    }
+    if (auto dealloc = dyn_cast<memref::DeallocOp>(operation)) { locals.erase(localRoot(dealloc.getMemref())); return success(); }
+    if (auto dim = dyn_cast<memref::DimOp>(operation)) {
+      auto axis = dim.getConstantIndex();
+      if (!axis) return dim.emitError("Weft dimension requires a static axis position");
+      auto extent = dimension(dim.getSource(), *axis);
+      if (failed(extent)) return failure();
+      values.map(dim.getResult(), *extent);
       return success();
     }
     if (auto copy = dyn_cast<memref::CopyOp>(operation)) {
@@ -1131,6 +1380,11 @@ private:
       for (Value operand : operands) {
         auto supplied = view(operand);
         if (failed(supplied)) return operation->emitError("implementation requires supplied operand views");
+        if (viewAxes.at(operand).size() != shape((*supplied).getType()).size())
+          return operation->emitError("encoded implementation requires its declared storage rank");
+        for (auto [axis, native] : llvm::enumerate(viewAxes.at(operand)))
+          if (native != static_cast<int64_t>(axis))
+            return operation->emitError("encoded implementation requires its declared storage-axis order");
         arguments.push_back(*supplied);
       }
       auto results = (*implementation)->expand(b, operation, arguments, nextAxis);
@@ -1149,8 +1403,7 @@ private:
         return write(store.getMemref(), values.lookup(store.getValue()));
       auto region = view(store.getMemref());
       if (failed(region)) return failure();
-      SmallVector<Value> indices;
-      for (Value value : store.getIndices()) indices.push_back(values.lookup(value));
+      auto indices = projectIndices(store.getMemref(), store.getIndices(), shape((*region).getType()).size());
       Value selected = b.create<wk::SliceOp>(loc,
           wk::SliceType::get(b.getContext(), encoding(store.getMemref()), array({}), array({})),
           *region, indices, b.getArrayAttr(SmallVector<Attribute>(indices.size(), b.getStringAttr("index"))));
@@ -1239,10 +1492,9 @@ private:
       }
       auto region = view(load.getMemref());
       if (failed(region)) return failure();
-      SmallVector<Value> indices;
-      SmallVector<Attribute> selectors(load.getIndices().size(), b.getStringAttr("index"));
-      for (Value value : load.getIndices()) indices.push_back(values.lookup(value));
-      Value selected = b.create<wk::SliceOp>(loc, wk::SliceType::get(b.getContext(), encoding(), array({}), array({})),
+      auto indices = projectIndices(load.getMemref(), load.getIndices(), shape((*region).getType()).size());
+      SmallVector<Attribute> selectors(indices.size(), b.getStringAttr("index"));
+      Value selected = b.create<wk::SliceOp>(loc, wk::SliceType::get(b.getContext(), encoding(load.getMemref()), array({}), array({})),
           *region, indices, b.getArrayAttr(selectors));
       values.map(load.getResult(), b.create<wk::AdmitOp>(loc, load.getType(), selected));
       return success();
@@ -1259,6 +1511,7 @@ private:
   ModuleOp output;
   OpBuilder b;
   IRMapping values;
+  llvm::DenseMap<Value, SmallVector<int64_t>> viewAxes;
   llvm::DenseMap<Value, LocalValue> locals;
   llvm::DenseMap<Value, Value> operandReads;
   llvm::DenseMap<Value, Value> readOnlySupplies;
@@ -1283,6 +1536,8 @@ FailureOr<OwningOpRef<ModuleOp>> legalizeProgram(ModuleOp cpuProgram, std::strin
   auto registry = implementations();
   llvm::json::Array parameters, candidates;
   SmallVector<func::FuncOp> functions(cpuProgram.getOps<func::FuncOp>());
+  for (auto function : functions)
+    if (failed(reifyTaskViewCaptures(function))) return failure();
   auto interface = functions.front()->getAttrOfType<cpu::InterfaceAttr>("intent_cpu.interface");
   cpu::PhysicalProgramAnalysis rootAnalysis(functions.front());
   llvm::DenseMap<Value, int64_t> alignments;

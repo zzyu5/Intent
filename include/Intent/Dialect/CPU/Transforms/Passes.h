@@ -13,6 +13,7 @@ namespace intent::cpu {
 class ImplementationRegistry;
 
 void registerCPUPasses();
+mlir::LogicalResult normalizeContractions(mlir::func::FuncOp function);
 mlir::LogicalResult materializeCPUConfigurations(
     mlir::ModuleOp module, const ImplementationRegistry &implementations,
     llvm::StringRef defaults, llvm::StringRef overrides);

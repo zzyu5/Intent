@@ -231,17 +231,13 @@ cpu::ImplementationRegistry implementations() {
   result.add(contraction);
   addInteger("mojo.register_integer_shared", "mojo.register_integer_f32_shared");
   contraction.name = "mojo.register_float_direct";
-  contraction.legal = [directLegal](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
-    SmallVector<int64_t> strides;
-    int64_t offset;
-    auto rhs = cast<MemRefType>(cast<linalg::GenericOp>(op).getInputs()[1].getType());
-    return directLegal(op, capabilities, config) &&
-        succeeded(rhs.getStridesAndOffset(strides, offset)) && strides.back() == 1;
-  };
+  contraction.legal = directLegal;
+  contraction.contraction.unitInnerStride[1] = true;
   contraction.inputs = {};
   result.add(contraction);
   addInteger("mojo.register_integer_direct", "mojo.register_integer_f32_direct");
   contraction.name = "mojo.register_float_widened";
+  contraction.contraction.unitInnerStride[1] = false;
   contraction.legal = [directLegal](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
     if (!directLegal(op, capabilities, config) ||
         config.tileN % (config.parameter("vector_width") * config.parameter("micro_n")) != 0) return false;

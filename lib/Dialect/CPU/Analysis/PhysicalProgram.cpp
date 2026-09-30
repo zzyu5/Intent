@@ -1,4 +1,5 @@
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/Analysis/Contractions.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
 #include "Intent/Dialect/CPU/IR/RegionProgram.h"
@@ -56,31 +57,7 @@ bool isMatrixContraction(linalg::GenericOp operation) {
       operation.getIteratorTypesArray() != SmallVector<utils::IteratorType>{
           utils::IteratorType::parallel, utils::IteratorType::parallel,
           utils::IteratorType::reduction}) return false;
-  Block &body = operation.getRegion().front();
-  auto fma = body.getTerminator()->getOperand(0).getDefiningOp<math::FmaOp>();
-  if (fma) {
-    if (fma.getC() != body.getArgument(2)) return false;
-    llvm::SmallPtrSet<Operation *, 4> computation{fma};
-    auto input = [&](Value value, Value argument) {
-      if (value == argument) return true;
-      auto widen = value.getDefiningOp<arith::ExtFOp>();
-      if (!widen || widen.getIn() != argument || widen.getType() != fma.getType()) return false;
-      computation.insert(widen);
-      return true;
-    };
-    return input(fma.getA(), body.getArgument(0)) && input(fma.getB(), body.getArgument(1)) &&
-        computation.size() == static_cast<size_t>(std::distance(body.begin(), body.end()) - 1);
-  }
-  auto add = body.getTerminator()->getOperand(0).getDefiningOp<arith::AddIOp>();
-  if (!add || !body.getArgument(0).getType().isSignlessInteger(8) ||
-      !body.getArgument(1).getType().isSignlessInteger(8) ||
-      !body.getArgument(2).getType().isSignlessInteger(32) ||
-      std::distance(body.begin(), body.end()) != 5 || add.getRhs() != body.getArgument(2)) return false;
-  auto product = add.getLhs().getDefiningOp<arith::MulIOp>();
-  if (!product) return false;
-  auto lhs = product.getLhs().getDefiningOp<arith::ExtSIOp>();
-  auto rhs = product.getRhs().getDefiningOp<arith::ExtSIOp>();
-  return lhs && rhs && lhs.getIn() == body.getArgument(0) && rhs.getIn() == body.getArgument(1);
+  return queryContractionAxes(operation).has_value();
 }
 
 Value PhysicalProgramAnalysis::storageRoot(Value memory) {

@@ -1,4 +1,5 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
+#include "Contractions.h"
 #include "Intent/Dialect/CPU/Transforms/Implementation.h"
 #include "Intent/Dialect/CPU/IR/CPUDialect.h"
 #include "Intent/Transforms/PassManager.h"
@@ -64,7 +65,7 @@ public:
       if (!llvm::hasSingleElement(functions) || (*functions.begin()).isExternal())
         return module.emitError("CPU source normalization requires one executable source function");
       auto function = *functions.begin();
-      if (failed(realizeSliceScans(function)) || failed(foldUniformComputations(function)) ||
+      if (failed(normalizeContractions(function)) || failed(realizeSliceScans(function)) || failed(foldUniformComputations(function)) ||
           failed(fuseStructuredComputations(function))) return failure();
       return runPipeline(cleanup, module);
     };
@@ -128,7 +129,8 @@ public:
       auto cleanup = normalizationPipeline();
       if (failed(runPipeline(cleanup, module))) return failure();
       for (auto function : module.getOps<func::FuncOp>())
-        if (failed(realizeHistograms(function)) || failed(foldUniformComputations(function)) ||
+        if (failed(foldContractionInputs(function, *implementations)) ||
+            failed(realizeHistograms(function)) || failed(foldUniformComputations(function)) ||
             failed(fuseStructuredComputations(function))) return failure();
       return runPipeline(cleanup, module);
     };

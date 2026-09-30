@@ -4,6 +4,27 @@
 using namespace mlir;
 namespace intent::cpu {
 
+bool ContractionRequirements::acceptsInputLayout(unsigned operand, MemRefType type) const {
+  if (operand >= unitInnerStride.size()) return false;
+  if (!unitInnerStride[operand]) return true;
+  SmallVector<int64_t> strides;
+  int64_t offset;
+  return type.getRank() && succeeded(type.getStridesAndOffset(strides, offset)) && strides.back() == 1;
+}
+
+namespace {
+bool acceptsInputLayouts(Operation *operation, const ContractionRequirements &requirements) {
+  if (llvm::none_of(requirements.unitInnerStride, [](bool required) { return required; })) return true;
+  auto generic = dyn_cast<linalg::GenericOp>(operation);
+  if (!generic || generic.getInputs().size() != requirements.unitInnerStride.size()) return false;
+  for (auto [operand, input] : llvm::enumerate(generic.getInputs())) {
+    auto type = dyn_cast<MemRefType>(input.getType());
+    if (!type || !requirements.acceptsInputLayout(operand, type)) return false;
+  }
+  return true;
+}
+} // namespace
+
 void ImplementationRegistry::addProfile(StringRef name,
                                          ArrayRef<StringRef> localParameters) {
   profiles.push_back({name, llvm::to_vector(localParameters)});
@@ -38,7 +59,8 @@ FailureOr<const Implementation *> ImplementationRegistry::lookup(Operation *oper
   auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
   if (binding)
     for (const auto &implementation : implementations)
-      if (implementation.name == binding.getName().getValue() && implementation.applicable(operation))
+      if (implementation.name == binding.getName().getValue() && implementation.applicable(operation) &&
+          acceptsInputLayouts(operation, implementation.contraction))
         return &implementation;
   operation->emitError("CPU computation has lost its selected implementation binding");
   return failure();
@@ -52,7 +74,8 @@ SmallVector<SmallVector<ImplementationAttr>> ImplementationRegistry::candidates(
     if (!needsImplementation(operation)) return;
     auto &choices = legal.emplace_back();
     for (const auto &implementation : implementations)
-      if (implementation.applicable(operation) && implementation.legal(operation, capabilities, configuration))
+      if (implementation.applicable(operation) && acceptsInputLayouts(operation, implementation.contraction) &&
+          implementation.legal(operation, capabilities, configuration))
         choices.push_back(&implementation);
   });
   SmallVector<SmallVector<ImplementationAttr>> result;
@@ -99,6 +122,7 @@ LogicalResult ImplementationRegistry::bind(func::FuncOp function, CapabilitiesAt
       return candidate.name == binding.getName().getValue() && candidate.applicable(operation);
     });
     if (implementation == implementations.end() ||
+        !acceptsInputLayouts(operation, implementation->contraction) ||
         !implementation->legal(operation, capabilities, configuration) ||
         implementation->parameters(builder, configuration) != binding.getParameters()) {
       invalid = true;

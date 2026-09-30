@@ -1,5 +1,6 @@
 add_mlir_library(MLIRIntentCPUAnalysis
   PhysicalProgram.cpp
+  Contractions.cpp
   Storage.cpp
   AxisRelations.cpp
   RegionPartition.cpp

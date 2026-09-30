@@ -6,6 +6,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/Builders.h"
+#include <array>
 #include <functional>
 #include <optional>
 
@@ -44,6 +45,9 @@ struct ContractionRequirements {
   bool completePrivateInitialization = false;
   bool staticReductionExtent = false;
   bool staticParallelExtent = false;
+  std::array<bool, 2> unitInnerStride{false, false};
+
+  bool acceptsInputLayout(unsigned operand, mlir::MemRefType type) const;
 };
 
 struct Implementation {

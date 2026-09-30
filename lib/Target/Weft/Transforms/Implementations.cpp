@@ -229,7 +229,9 @@ cpu::ImplementationRegistry implementations() {
   result.add({"weft.contract_f32", [](Operation *op) {
       auto generic = dyn_cast<linalg::GenericOp>(op);
       return generic && isMatrixContraction(generic) &&
-          cast<MemRefType>(generic.getInputs()[0].getType()).getElementType().isF32();
+          cast<MemRefType>(generic.getInputs()[0].getType()).getElementType().isF32() &&
+          cast<MemRefType>(generic.getInputs()[1].getType()).getElementType().isF32() &&
+          cast<MemRefType>(generic.getOutputs()[0].getType()).getElementType().isF32();
     }, legal, [](Builder &b, const Configuration &config) {
       // A 4x4 reduction-lane stream needs 16 accumulator groups plus its
       // stationary input panel and one streamed input, within RVV's 32 groups.
