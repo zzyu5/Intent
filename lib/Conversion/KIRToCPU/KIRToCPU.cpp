@@ -1164,7 +1164,7 @@ private:
     auto reduction = builder.create<cpu::ReduceOp>(loc, initial.getType(),
         extent, initial, ValueRange{input},
         builder.getArrayAttr({AffineMapAttr::get(builder.getMultiDimIdentityMap(1))}),
-        cpu::ReductionOrderAttr::get(builder.getContext(), false));
+        cpu::ReductionOrderAttr::get(builder.getContext(), true, true));
     Block *body = &reduction.getCombine().emplaceBlock();
     body->addArgument(initial.getType(), loc);
     body->addArgument(type.getElementType(), loc);
@@ -1178,11 +1178,6 @@ private:
         if (failed(lowerOperation(&nested))) return failure();
       Value result = values.lookup(combine.getTerminator()->getOperand(0));
       builder.create<cpu::YieldOp>(loc, result);
-      auto *combineOp = result.getDefiningOp();
-      if (combineOp && isa<arith::AddFOp, arith::MaxNumFOp, arith::MaximumFOp>(combineOp) &&
-          body->getArgument(0).hasOneUse() &&
-          llvm::is_contained(combineOp->getOperands(), body->getArgument(0)))
-        reduction.setOrderAttr(cpu::ReductionOrderAttr::get(builder.getContext(), true));
     }
     values.map(operation.getResults()[0], reduction.getResult());
     return success();
@@ -1252,9 +1247,7 @@ private:
       if (succeeded(status)) builder.create<linalg::YieldOp>(loc, flattened(combine.getTerminator()->getOperands()));
     });
     reduction->setAttr("intent_cpu.reduction_order",
-        cpu::ReductionOrderAttr::get(builder.getContext(), true));
-    // Ordinary reduce permits element permutation; region/scan order does not.
-    reduction->setAttr("intent_cpu.permutable_reduction", builder.getUnitAttr());
+        cpu::ReductionOrderAttr::get(builder.getContext(), true, true));
     if (failed(status)) return failure();
     bindSlots(operation.getResults(), outputs, loc);
     return success();
@@ -1268,7 +1261,7 @@ private:
     builder.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{destination});
     SmallVector<utils::IteratorType> iterators(parallelRank, utils::IteratorType::parallel);
     iterators.append(reductionRank, utils::IteratorType::reduction);
-    builder.create<linalg::GenericOp>(loc, ValueRange{lhs, rhs}, ValueRange{destination},
+    auto contraction = builder.create<linalg::GenericOp>(loc, ValueRange{lhs, rhs}, ValueRange{destination},
         maps, iterators, [](OpBuilder &b, Location loc, ValueRange arguments) {
           Value value;
           if (isa<FloatType>(arguments[2].getType())) {
@@ -1286,6 +1279,8 @@ private:
           }
           b.create<linalg::YieldOp>(loc, value);
         });
+    contraction->setAttr("intent_cpu.reduction_order",
+        cpu::ReductionOrderAttr::get(builder.getContext(), true, true));
   }
 
   void matrix(Value lhs, Value rhs, Value destination, Location loc) {

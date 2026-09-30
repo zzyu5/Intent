@@ -83,7 +83,12 @@ bool fuse(scf::ForOp first, scf::ForOp second, DominanceInfo &dominance) {
   llvm::append_range(initial, second.getInitArgs());
   auto joined = b.create<scf::ForOp>(first.getLoc(), first.getLowerBound(),
       first.getUpperBound(), first.getStep(), initial);
-  joined->setAttr("intent_cpu.reduction_order", second->getAttr("intent_cpu.reduction_order"));
+  auto order = second->getAttrOfType<ReductionOrderAttr>("intent_cpu.reduction_order");
+  if (auto firstOrder = first->getAttrOfType<ReductionOrderAttr>("intent_cpu.reduction_order"))
+    order = ReductionOrderAttr::get(first.getContext(),
+        order.getAdjacentReassociation() && firstOrder.getAdjacentReassociation(),
+        order.getElementPermutation() && firstOrder.getElementPermutation());
+  joined->setAttr("intent_cpu.reduction_order", order);
   b.setInsertionPointToStart(joined.getBody());
   SmallVector<Value> yields;
   auto append = [&](scf::ForOp source, unsigned begin) {

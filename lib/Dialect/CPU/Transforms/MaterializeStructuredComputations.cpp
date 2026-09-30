@@ -1,5 +1,6 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Utilities.h"
+#include "VectorReductions.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -85,7 +86,7 @@ bool materializeProductReduction(linalg::GenericOp operation) {
         (!isa<arith::ConstantOp>(instruction) && !instruction.hasTrait<OpTrait::Elementwise>()))
       return false;
   auto function = operation->getParentOfType<func::FuncOp>();
-  bool accumulatePartials = operation->hasAttr("intent_cpu.permutable_reduction");
+  bool accumulatePartials = order.getElementPermutation();
   PhysicalProgramAnalysis physical(function);
   AliasAnalysis aliases(function);
   auto abi = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
@@ -164,22 +165,10 @@ bool materializeProductReduction(linalg::GenericOp operation) {
     }
     Value step = index(b, loc, width);
     Value completeEnd = b.create<arith::SubIOp>(loc, extent, b.create<arith::RemSIOp>(loc, extent, step));
-    auto horizontal = [&](SmallVector<Value> partial) {
-      for (int64_t count = width; count > 1; count /= 2) {
-        SmallVector<int64_t> even, odd;
-        for (int64_t lane = 0; lane < count; lane += 2) {
-          even.push_back(lane);
-          odd.push_back(lane + 1);
-        }
-        SmallVector<Value> left, right;
-        for (Value value : partial) {
-          left.push_back(b.create<vector::ShuffleOp>(loc, value, value, even));
-          right.push_back(b.create<vector::ShuffleOp>(loc, value, value, odd));
-        }
-        partial = combine(left, right, captures, count / 2);
-      }
-      for (Value &value : partial) value = b.create<vector::ExtractElementOp>(loc, value, zero);
-      return partial;
+    auto horizontal = [&](ValueRange partial) {
+      return horizontalReduce(b, loc, partial, [&](ValueRange left, ValueRange right, int64_t lanes) {
+        return combine(left, right, captures, lanes);
+      });
     };
     auto loadBlock = [&](Value begin) {
       position.back() = begin;
@@ -254,7 +243,8 @@ bool materializeProductReduction(linalg::GenericOp operation) {
 
 void collapseProductReductionAxes(linalg::GenericOp operation) {
   auto maps = operation.getIndexingMapsArray();
-  if (operation->hasAttr("intent_cpu.permutable_reduction") && operation.getOutputs().size() > 1) {
+  auto order = operation->getAttrOfType<ReductionOrderAttr>("intent_cpu.reduction_order");
+  if (order && order.getElementPermutation() && operation.getOutputs().size() > 1) {
     auto iterators = operation.getIteratorTypesArray();
     SmallVector<ReassociationIndices> groups;
     for (auto [axis, iterator] : llvm::enumerate(iterators)) {

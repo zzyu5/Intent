@@ -140,7 +140,11 @@ LogicalResult ImplementationAttr::verify(
 }
 
 LogicalResult ReductionOrderAttr::verify(
-    llvm::function_ref<InFlightDiagnostic()>, bool) { return success(); }
+    llvm::function_ref<InFlightDiagnostic()> error, bool adjacentReassociation, bool elementPermutation) {
+  if (elementPermutation && !adjacentReassociation)
+    return error() << "CPU reduction element permutation requires reassociation permission";
+  return success();
+}
 
 LogicalResult MicrotileAttr::verify(
     llvm::function_ref<InFlightDiagnostic()> error, int64_t rows,

@@ -338,7 +338,7 @@ private:
     Value initial = b.create<arith::ConstantOp>(loc, b.getZeroAttr(accumulator));
     auto reduction = b.create<ReduceOp>(loc, accumulator, count, initial, ValueRange{lhs, rhs},
         b.getAffineMapArrayAttr(SmallVector<AffineMap>(2, b.getMultiDimIdentityMap(1))),
-        ReductionOrderAttr::get(b.getContext(), true));
+        operation->getAttrOfType<ReductionOrderAttr>("intent_cpu.reduction_order"));
     Type element = cast<MemRefType>(lhs.getType()).getElementType();
     Block &body = reduction.getCombine().emplaceBlock();
     body.addArguments(TypeRange{accumulator, element, element}, {loc, loc, loc});
@@ -412,7 +412,7 @@ private:
         b.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{destination.value});
         AffineExpr m, n, k;
         bindDims(b.getContext(), m, n, k);
-        b.create<linalg::GenericOp>(loc, ValueRange{left.value, right.value}, ValueRange{destination.value},
+        auto contraction = b.create<linalg::GenericOp>(loc, ValueRange{left.value, right.value}, ValueRange{destination.value},
             ArrayRef<AffineMap>{AffineMap::get(3, 0, {m, k}, b.getContext()),
                 AffineMap::get(3, 0, {k, n}, b.getContext()), AffineMap::get(3, 0, {m, n}, b.getContext())},
             SmallVector<utils::IteratorType>{utils::IteratorType::parallel, utils::IteratorType::parallel,
@@ -424,6 +424,7 @@ private:
               for (Operation &nested : body.without_terminator()) builder.clone(nested, mapping);
               builder.create<linalg::YieldOp>(loc, mapping.lookup(body.getTerminator()->getOperand(0)));
             });
+        contraction->setAttr("intent_cpu.reduction_order", operation->getAttr("intent_cpu.reduction_order"));
       }
       copyBack(destination);
       if (destination.allocation) b.create<memref::DeallocOp>(loc, destination.allocation);
@@ -466,8 +467,11 @@ LogicalResult normalizeContractions(func::FuncOp function) {
     if (!operation->hasAttr("intent_cpu.implementation") && queryContractionAxes(operation))
       operations.push_back(operation);
   });
-  for (auto operation : operations)
+  for (auto operation : operations) {
+    if (!operation->getAttrOfType<ReductionOrderAttr>("intent_cpu.reduction_order"))
+      return operation.emitError("CPU contraction normalization requires explicit numerical ordering permissions");
     if (failed(verifyStaticExtents(operation, *queryContractionAxes(operation)))) return failure();
+  }
   for (auto operation : operations) {
     auto axes = queryContractionAxes(operation);
     for (unsigned operand = 0; operand != 2; ++operand)

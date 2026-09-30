@@ -26,7 +26,8 @@ void partitionScalarSums(func::FuncOp function, int64_t grain) {
         !matchPattern(operation.getInitial(), m_PosZeroFloat())) continue;
     Block &body = operation.getCombine().front();
     auto combine = body.getTerminator()->getOperand(0).getDefiningOp<arith::AddFOp>();
-    if (!combine || !body.getArgument(0).hasOneUse()) continue;
+    if (!combine || !body.getArgument(0).hasOneUse() ||
+        !llvm::is_contained(combine->getOperands(), body.getArgument(0))) continue;
     OpBuilder b(operation);
     Location loc = operation.getLoc();
     Value zero = index(b, loc, 0), one = index(b, loc, 1);

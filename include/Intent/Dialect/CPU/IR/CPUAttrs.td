@@ -50,8 +50,8 @@ def IntentCPU_ImplementationAttr : IntentCPU_Attr<"Implementation", "implementat
 }
 
 def IntentCPU_ReductionOrderAttr : IntentCPU_Attr<"ReductionOrder", "reduction_order"> {
-  let parameters = (ins "bool":$adjacentReassociation);
-  let assemblyFormat = "`<` $adjacentReassociation `>`";
+  let parameters = (ins "bool":$adjacentReassociation, "bool":$elementPermutation);
+  let assemblyFormat = "`<` $adjacentReassociation `,` $elementPermutation `>`";
 }
 
 def IntentCPU_MicrotileAttr : IntentCPU_Attr<"Microtile", "microtile"> {

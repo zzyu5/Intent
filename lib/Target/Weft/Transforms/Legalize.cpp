@@ -1173,6 +1173,13 @@ private:
       else if (isa<arith::OrIOp>(combine) && accumulator.getType().isInteger(1)) kind = "or";
       else if (isa<arith::AndIOp>(combine) && accumulator.getType().isInteger(1)) kind = "and";
       else return operation.emitError("Weft reduction combine is not implemented");
+      if (kind == "add" && isa<FloatType>(accumulator.getType())) {
+        auto order = operation->getAttrOfType<cpu::ReductionOrderAttr>("intent_cpu.reduction_order");
+        // The selected Weft reduction may combine vector streams lane-wise
+        // before vfredusum; adjacent reassociation alone does not permit it.
+        if (!order || !order.getElementPermutation())
+          return operation.emitError("Weft native floating-add reduction requires element-permutation permission");
+      }
       for (Operation &nested : body.without_terminator()) {
         if (&nested == combine) continue;
         auto value = expression(&nested, mapping);
@@ -1215,6 +1222,8 @@ private:
         (additive && !identity.getValue().isZero()) ||
         (maximum && !(identity.getValue().isInfinity() && identity.getValue().isNegative())))
       return operation.emitError("Weft reduction requires a closed additive/maximumNumber identity and accumulator combine");
+    if (additive && !operation.getOrder().getElementPermutation())
+      return operation.emitError("Weft native floating-add reduction requires element-permutation permission");
     IRMapping mapping;
     SmallVector<int64_t> loopAxes(cast<AffineMapAttr>(operation.getIndexingMaps()[0]).getValue().getNumDims());
     for (int64_t &axis : loopAxes) axis = nextAxis++;

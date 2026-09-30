@@ -31,7 +31,7 @@ def IntentCPU_TaskYieldOp : IntentCPU_Op<"task_yield", [Pure, Terminator]> {
 
 def IntentCPU_ReduceOp : IntentCPU_Op<"reduce", [SingleBlock,
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
-  let summary = "Ordered one-axis reduction with an explicit scalar combine region";
+  let summary = "One-axis reduction with explicit scalar combine and numerical ordering permissions";
   let arguments = (ins Index:$extent, AnyFloat:$initial,
     Variadic<AnyType>:$inputs, ArrayAttr:$indexingMaps,
     IntentCPU_ReductionOrderAttr:$order);

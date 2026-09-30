@@ -15,6 +15,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   BlockStructuredComputations.cpp
   RealizeRegions.cpp
   VectorizeLoops.cpp
+  VectorReductions.cpp
   PartitionTasks.cpp
   Implementation.cpp
   ImplementationInputs.cpp

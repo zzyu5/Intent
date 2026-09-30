@@ -1,6 +1,7 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Analysis/IntegerRelations.h"
 #include "Utilities.h"
+#include "VectorReductions.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -252,12 +253,69 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonemp
     }
     return;
   }
-  // One local tree spans adjacent register replicas. Keeping the leaves in
-  // coordinate order permits reassociation without striped accumulators, and
-  // amortizes the narrow horizontal stages across the bound register replicas.
   int64_t logicalWidth = replicas * width;
   Value step = index(b, loc, logicalWidth);
   Value length = b.create<arith::SubIOp>(loc, original.getUpperBound(), original.getLowerBound());
+  auto merge = [&](Operation *combine, Value lhs, Value rhs) {
+    IRMapping mapping;
+    mapping.map(combine->getOperand(0), lhs);
+    mapping.map(combine->getOperand(1), rhs);
+    Operation *result = b.clone(*combine, mapping);
+    result->getResult(0).setType(lhs.getType());
+    return result->getResult(0);
+  };
+  auto combineValues = [&](ValueRange lhs, ValueRange rhs, int64_t) {
+    SmallVector<Value> results;
+    for (auto [number, combine] : llvm::enumerate(combines))
+      results.push_back(merge(combine, lhs[number], rhs[number]));
+    return results;
+  };
+  auto vectorBody = [&](Value coordinate, OpBuilder &invariants) {
+    VectorBody body(original, b, invariants, coordinate, logicalWidth);
+    for (Operation &operation : original.getBody()->without_terminator()) {
+      if (auto load = dyn_cast<memref::LoadOp>(&operation)) body.vector(load.getResult());
+      else if (auto store = dyn_cast<memref::StoreOp>(&operation))
+        b.create<vector::StoreOp>(loc, body.vector(store.getValue()), store.getMemref(), body.indices(store.getIndices()));
+    }
+    SmallVector<Value> inputs;
+    for (Value input : reductionInputs) inputs.push_back(body.vector(input));
+    return inputs;
+  };
+  auto order = original->getAttrOfType<ReductionOrderAttr>("intent_cpu.reduction_order");
+  if (!combines.empty() && order.getElementPermutation()) {
+    Value full = add(b, loc, original.getLowerBound(),
+        multiply(b, loc, b.create<arith::DivSIOp>(loc, length, step), step));
+    Value hasBlock = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt,
+                                          full, original.getLowerBound());
+    auto active = b.create<scf::IfOp>(loc, original.getResultTypes(), hasBlock, true);
+    {
+      OpBuilder::InsertionGuard guard(b);
+      b.setInsertionPointToStart(active.thenBlock());
+      Value begin = add(b, loc, original.getLowerBound(), step);
+      OpBuilder invariants(begin.getDefiningOp());
+      // Seed each lane from an actual member. The original accumulator may be
+      // a non-identity partial from an enclosing block and is included once.
+      auto seeds = vectorBody(original.getLowerBound(), invariants);
+      auto blocks = b.create<scf::ForOp>(loc, begin, full, step, seeds);
+      {
+        OpBuilder::InsertionGuard blockGuard(b);
+        b.setInsertionPointToStart(blocks.getBody());
+        auto values = vectorBody(blocks.getInductionVar(), invariants);
+        b.create<scf::YieldOp>(loc, combineValues(blocks.getRegionIterArgs(), values, logicalWidth));
+      }
+      auto partial = horizontalReduce(b, loc, blocks.getResults(), combineValues);
+      b.create<scf::YieldOp>(loc, combineValues(original.getInitArgs(), partial, 0));
+      b.setInsertionPointToStart(active.elseBlock());
+      b.create<scf::YieldOp>(loc, original.getInitArgs());
+    }
+    original.setLowerBound(full);
+    original.getInitArgsMutable().assign(active.getResults());
+    if (replicas > 1) vectorize(original, width, 1);
+    original->removeAttr("intent_cpu.reduction_order");
+    return;
+  }
+  // Adjacent-only reductions keep every chunk and partial in coordinate order.
+  // Register replicas widen a local tree without introducing striped carries.
   // Shorten the scalar carry chains with contiguous sums, then combine their
   // results in coordinate order. Splitting requires the closed +0 identity.
   int64_t partitions = stores.empty() && !combines.empty() &&
@@ -274,42 +332,18 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonemp
   auto vectorLoop = b.create<scf::ForOp>(loc, original.getLowerBound(),
       add(b, loc, original.getLowerBound(), span), step, initial);
   OpBuilder invariantBuilder(vectorLoop);
-  auto merge = [&](Operation *combine, Value lhs, Value rhs) {
-    IRMapping mapping;
-    mapping.map(combine->getOperand(0), lhs);
-    mapping.map(combine->getOperand(1), rhs);
-    Operation *result = b.clone(*combine, mapping);
-    result->getResult(0).setType(lhs.getType());
-    return result->getResult(0);
-  };
   {
     OpBuilder::InsertionGuard guard(b);
     b.setInsertionPointToStart(vectorLoop.getBody());
     SmallVector<Value> results;
     for (int64_t part = 0; part < partitions; ++part) {
       Value coordinate = add(b, loc, vectorLoop.getInductionVar(), multiply(b, loc, span, index(b, loc, part)));
-      VectorBody body(original, b, invariantBuilder, coordinate, logicalWidth);
-      for (Operation &operation : original.getBody()->without_terminator()) {
-        if (auto load = dyn_cast<memref::LoadOp>(&operation)) body.vector(load.getResult());
-        else if (auto store = dyn_cast<memref::StoreOp>(&operation))
-          b.create<vector::StoreOp>(loc, body.vector(store.getValue()), store.getMemref(), body.indices(store.getIndices()));
-      }
-      for (auto [number, reductionInput] : llvm::enumerate(reductionInputs)) {
-        Operation *combine = combines[number];
-        Value value = body.vector(reductionInput);
-        for (int64_t count = logicalWidth; count > 1; count /= 2) {
-          SmallVector<int64_t> even, odd;
-          for (int64_t lane = 0; lane < count; lane += 2) {
-            even.push_back(lane);
-            odd.push_back(lane + 1);
-          }
-          Value lhs = b.create<vector::ShuffleOp>(loc, value, value, even);
-          Value rhs = b.create<vector::ShuffleOp>(loc, value, value, odd);
-          value = merge(combine, lhs, rhs);
-        }
-        Value sum = b.create<vector::ExtractElementOp>(loc, value, index(b, loc, 0));
-        results.push_back(merge(combine,
-            vectorLoop.getRegionIterArgs()[part * reductionInputs.size() + number], sum));
+      auto inputs = vectorBody(coordinate, invariantBuilder);
+      if (!inputs.empty()) {
+        auto partial = horizontalReduce(b, loc, inputs, combineValues);
+        auto accumulated = combineValues(
+            vectorLoop.getRegionIterArgs().slice(part * combines.size(), combines.size()), partial, 0);
+        llvm::append_range(results, accumulated);
       }
     }
     if (!results.empty()) b.create<scf::YieldOp>(loc, results);
