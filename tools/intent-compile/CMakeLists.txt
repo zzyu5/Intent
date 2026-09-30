@@ -28,6 +28,7 @@ target_link_libraries(intent-compile PRIVATE
   MLIRIntentKIRToCPU
   MLIRIntentKIRToDSA
   MLIRIntentDSADialect
+  MLIRIntentDSATransforms
   MLIRIntentBangC
   MLIRIntentCPUTransforms
   MLIRIntentCPUDialect

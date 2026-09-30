@@ -1,0 +1,49 @@
+#ifndef INTENT_TARGET_BANGC_TRANSFORMS_PASSDETAIL_H
+#define INTENT_TARGET_BANGC_TRANSFORMS_PASSDETAIL_H
+#include "Intent/Target/BangC/Passes.h"
+#include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/DSA/Transforms/Passes.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Transforms/Passes.h"
+#include "llvm/Support/MathExtras.h"
+#include <functional>
+#include <limits>
+
+namespace intent::bangc {
+using namespace mlir;
+using dsa::integerInterval;
+using dsa::uniformFillBefore;
+struct StorageUsage { int64_t nram = 0, wram = 0, sram = 0; };
+StorageUsage measureStorage(func::FuncOp function);
+void measureStorage(func::FuncOp function, int64_t &nram, int64_t &wram);
+StorageUsage bindStorage(func::FuncOp function);
+LogicalResult realizeMatMul(dsa::MatMulOp matrix, dsa::ConfigurationAttr config);
+bool supportedScalarBinary(BinaryOperator kind);
+bool specializeZeroMatrixTiles(func::FuncOp function);
+bool retainNarrowExtremaInputs(func::FuncOp function, dsa::ConfigurationAttr config);
+bool bindRowScalarOperands(func::FuncOp function);
+bool realizeAffineRanges(func::FuncOp function, dsa::ConfigurationAttr config);
+bool realizeFullWidthMasks(func::FuncOp function, dsa::ConfigurationAttr config);
+bool vectorizeIndexLoops(func::FuncOp function, dsa::ConfigurationAttr config);
+bool batchIndependentRowPrograms(func::FuncOp function, dsa::ConfigurationAttr config);
+Value allocate(OpBuilder &b, Location loc, Type element, ArrayRef<int64_t> shape, int64_t space);
+bool reuseConsumedBinaryInputs(func::FuncOp function, dsa::ConfigurationAttr config);
+bool reuseConsumedExp2Inputs(func::FuncOp function, dsa::ConfigurationAttr config);
+void hoistInvariantFills(func::FuncOp function, dsa::ConfigurationAttr config);
+LogicalResult realizeNativeComputations(ModuleOp module);
+LogicalResult realizeNativeWorkspace(ModuleOp module);
+LogicalResult selectNativeImplementations(ModuleOp module);
+LogicalResult composeLocalProgram(ModuleOp module);
+LogicalResult scheduleProgramSupply(ModuleOp module);
+LogicalResult bindProgramStorage(ModuleOp module);
+LogicalResult verifySurfaceOperations(func::FuncOp function);
+} // namespace intent::bangc
+#endif

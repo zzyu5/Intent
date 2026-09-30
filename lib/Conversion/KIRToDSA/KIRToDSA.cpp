@@ -181,7 +181,6 @@ public:
       }
     }
     b.create<func::ReturnOp>(source.getLoc());
-    realizeCooperativeWorkset();
     function->setAttr("intent_dsa.full_extent_dimensions", b.getDenseI64ArrayAttr(fullExtents));
     return success();
   }
@@ -1147,8 +1146,7 @@ private:
           b.create<memref::StoreOp>(loc, stored, offsets, ValueRange{index(loc, 0), i});
           return success();
         }))) return failure();
-        auto gather = b.create<dsa::GatherRowsOp>(loc, source, offsets, data, columnStride, shape[0].count, shape[1].count, Value(), false);
-        if (cooperativeAxis && cooperativeSource(*relation, source, shape)) cooperativeGathers.push_back(gather);
+        b.create<dsa::GatherRowsOp>(loc, source, offsets, data, columnStride, shape[0].count, shape[1].count, Value(), false);
       }
       values.map(original, data); return success();
     }
@@ -2810,20 +2808,10 @@ private:
       }
     }
     if (matchPattern(total, m_Zero())) return success();
-    APInt lastCount;
-    if (intervals.size() > 1 && config.getTasks() % 4 == 0 &&
-        (!query || matchPattern(queryTiles, m_One())) &&
-        matchPattern(counts.back(), m_ConstantInt(&lastCount)) && lastCount.isStrictlyPositive() &&
-        lastCount.getSExtValue() % 4 == 0 && matchPattern(intervals.back().begin, m_Zero()) &&
-        matchPattern(intervals.back().step, m_One())) {
-      cooperativeAxis = workset.coordinates.back();
-      cooperativeAxisExtent = lastCount.getSExtValue();
-    }
     auto savedValues = values; auto savedProducts = products; auto savedDimensions = dimensions;
     auto savedAxes = axisBindings;
     ++parallelDepth;
     LogicalResult status = loop(loc, taskId, total, taskCount, [&](Value task) {
-      if (cooperativeAxis) cooperativeLoop = cast<scf::ForOp>(cast<BlockArgument>(task).getOwner()->getParentOp());
       Value remaining = task;
       if (query) {
         Value tile = b.create<arith::RemSIOp>(loc, remaining, queryTiles);
@@ -2849,145 +2837,6 @@ private:
     values = std::move(savedValues); products = std::move(savedProducts); dimensions = std::move(savedDimensions);
     axisBindings = std::move(savedAxes);
     return status;
-  }
-  bool cooperativeSource(const IndexRelationFact &relation, Value source, const LocalShape &shape) {
-    auto argument = dyn_cast<BlockArgument>(source);
-    auto type = dyn_cast<MemRefType>(source.getType());
-    if (!argument || argument.getOwner() != &function.front() || !type || type.getRank() < 2 ||
-        shape.size() != 2 || shape[0].capacity < 64 || shape[0].capacity % 64 ||
-        shape[0].capacity > 65536 || !matchPattern(shape[1].begin, m_Zero())) return false;
-    unsigned headAxis = type.getRank() - 2, columnAxis = type.getRank() - 1;
-    int64_t columns = type.getDimSize(columnAxis);
-    if (columns <= 0 || type.getDimSize(headAxis) != cooperativeAxisExtent || shape[1].capacity != columns ||
-        !sameIndex(shape[1].count, index(function.getLoc(), columns))) return false;
-    auto interface = function->getAttrOfType<dsa::InterfaceAttr>("intent_dsa.interface");
-    auto view = cast<dsa::ViewArgumentAttr>(interface.getArguments()[argument.getArgNumber()]);
-    if (view.getAccess() != 0 || !view.getConstraints().getHasStrides()) return false;
-    auto headStride = dyn_cast<IntegerAttr>(view.getConstraints().getStrides()[headAxis]);
-    auto columnStride = dyn_cast<IntegerAttr>(view.getConstraints().getStrides()[columnAxis]);
-    if (!headStride || !columnStride || headStride.getInt() != columns || columnStride.getInt() != 1) return false;
-    DenseSet<Value> visited;
-    std::function<bool(Value)> dependent = [&](Value value) {
-      if (value == cooperativeAxis) return true;
-      if (llvm::is_contained(distributedWorkset->coordinates, value)) return false;
-      if (!visited.insert(value).second) return false;
-      if (auto argument = dyn_cast<BlockArgument>(value))
-        return !isa<func::FuncOp>(argument.getOwner()->getParentOp());
-      auto definition = value.getDefiningOp();
-      return !definition || llvm::any_of(definition->getOperands(), dependent);
-    };
-    bool head = false, column = false;
-    for (const auto &term : relation.terms) {
-      if (term.sourceAxis == headAxis) {
-        head = term.kind == 3 && term.operands.size() == 1 && term.operands.front() == cooperativeAxis;
-        if (!head) return false;
-      } else if (term.sourceAxis == columnAxis) {
-        column = term.kind == 0 && term.operands.empty();
-        if (!column) return false;
-      } else if (llvm::any_of(term.operands, dependent)) return false;
-    }
-    int64_t bytes = shape[0].capacity * (4 * columns * type.getElementType().getIntOrFloatBitWidth() / 8 + 32);
-    return head && column && bytes <= 3968 * 1024;
-  }
-  void realizeCooperativeWorkset() {
-    if (!cooperativeLoop || cooperativeGathers.empty()) return;
-    Value originalTask = cooperativeLoop.getInductionVar();
-    auto integer = [](Value value) -> std::optional<int64_t> {
-      APInt bits;
-      if (matchPattern(value, m_ConstantInt(&bits))) return bits.getSExtValue();
-      return std::nullopt;
-    };
-    auto taskIdentity = [&](Value value) {
-      while (auto divide = value.getDefiningOp<arith::DivSIOp>()) {
-        if (!matchPattern(divide.getRhs(), m_One())) break;
-        value = divide.getLhs();
-      }
-      return value == originalTask;
-    };
-    auto interface = function->getAttrOfType<dsa::InterfaceAttr>("intent_dsa.interface");
-    std::function<bool(Value)> uniform = [&](Value value) {
-      if (auto argument = dyn_cast<BlockArgument>(value)) {
-        if (argument.getOwner() == &function.front()) return true;
-        auto loop = dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
-        return loop && loop != cooperativeLoop && argument == loop.getInductionVar() &&
-            uniform(loop.getLowerBound()) && uniform(loop.getUpperBound()) && uniform(loop.getStep());
-      }
-      Operation *definition = value.getDefiningOp();
-      if (!definition) return false;
-      if (isa<arith::ConstantOp>(definition)) return true;
-      if (auto divide = dyn_cast<arith::DivSIOp>(definition)) {
-        auto divisor = integer(divide.getRhs());
-        if (taskIdentity(divide.getLhs()) && divisor && *divisor > 0 && *divisor % 4 == 0) return true;
-      }
-      if (auto load = dyn_cast<dsa::LoadScalarOp>(definition)) {
-        auto source = dyn_cast<BlockArgument>(load.getSource());
-        auto view = source && source.getOwner() == &function.front()
-            ? dyn_cast<dsa::ViewArgumentAttr>(interface.getArguments()[source.getArgNumber()]) : dsa::ViewArgumentAttr();
-        return view && view.getAccess() == 0 && uniform(load.getOffset());
-      }
-      return (isa<memref::DimOp, dsa::StrideOp>(definition) || definition->getName().getDialectNamespace() == "arith") &&
-          llvm::all_of(definition->getOperands(), uniform);
-    };
-    SmallVector<dsa::GatherRowsOp> selected;
-    for (auto gather : cooperativeGathers) {
-      bool legal = uniform(gather.getRows()) && uniform(gather.getColumns());
-      for (Operation *parent = gather->getParentOp(); parent && parent != cooperativeLoop; parent = parent->getParentOp()) {
-        if (auto loop = dyn_cast<scf::ForOp>(parent))
-          legal &= uniform(loop.getLowerBound()) && uniform(loop.getUpperBound()) && uniform(loop.getStep());
-        else if (auto branch = dyn_cast<scf::IfOp>(parent)) legal &= uniform(branch.getCondition());
-        else legal = false;
-      }
-      if (legal) selected.push_back(gather);
-    }
-    if (selected.empty()) return;
-    OpBuilder::InsertionGuard insertion(b);
-    Location loc = cooperativeLoop.getLoc();
-    b.setInsertionPoint(cooperativeLoop);
-    Value group = b.create<dsa::GroupIdOp>(loc, b.getIndexType());
-    Value groups = b.create<dsa::GroupCountOp>(loc, b.getIndexType());
-    Value local = b.create<dsa::LocalIdOp>(loc, b.getIndexType());
-    Value memory = b.create<dsa::IsMemoryCoreOp>(loc, b.getI1Type());
-    Value lane = b.create<arith::SelectOp>(loc, memory, index(loc, 0), local);
-    Value total = b.create<arith::DivSIOp>(loc, cooperativeLoop.getUpperBound(), index(loc, 4));
-    cooperativeLoop.setLowerBound(group); cooperativeLoop.setUpperBound(total); cooperativeLoop.setStep(groups);
-    SmallVector<arith::DivSIOp> quotients;
-    cooperativeLoop.walk([&](arith::DivSIOp divide) {
-      auto divisor = integer(divide.getRhs());
-      if (taskIdentity(divide.getLhs()) && divisor && *divisor > 0 && *divisor % 4 == 0) quotients.push_back(divide);
-    });
-    DenseSet<Operation *> groupOperations;
-    for (auto quotient : quotients) {
-      b.setInsertionPoint(quotient);
-      auto grouped = b.create<arith::DivSIOp>(loc, originalTask, index(loc, *integer(quotient.getRhs()) / 4));
-      groupOperations.insert(grouped);
-      quotient.replaceAllUsesWith(grouped.getResult()); quotient.erase();
-    }
-    b.setInsertionPointToStart(cooperativeLoop.getBody());
-    Value first = mul(loc, originalTask, index(loc, 4));
-    groupOperations.insert(first.getDefiningOp());
-    Value task = add(loc, first, lane);
-    originalTask.replaceUsesWithIf(task, [&](OpOperand &use) { return !groupOperations.contains(use.getOwner()); });
-    function->setAttr("intent_dsa.group_width", b.getI64IntegerAttr(4));
-    DenseMap<int64_t, Value> indices;
-    for (auto gather : selected) {
-      auto type = cast<MemRefType>(gather.getOutput().getType());
-      int64_t rows = type.getDimSize(0), columns = type.getDimSize(1);
-      Value ramp = indices.lookup(rows);
-      if (!ramp) {
-        b.setInsertionPointToStart(&function.front());
-        ramp = allocate(loc, b.getF32Type(), 1, rows);
-        b.create<dsa::IotaOp>(loc, ramp);
-        indices[rows] = ramp;
-      }
-      b.setInsertionPoint(gather);
-      Value plan = allocate(loc, b.getI64Type(), 3, rows);
-      b.create<dsa::GatherPlanOp>(loc, gather.getRowOffsets(), gather.getRows(), ramp, plan);
-      Value data = allocate(loc, type.getElementType(), rows, 4 * columns, dsa::sharedSpace);
-      Value metadata = allocate(loc, b.getI64Type(), 4, rows, dsa::sharedSpace);
-      b.create<dsa::GroupGatherRowsOp>(loc, gather.getSource(), gather.getRowOffsets(), plan,
-          gather.getOutput(), data, metadata, gather.getRows(), lane);
-      gather.erase();
-    }
   }
   Value scalarCast(Location loc, Value value, Type type) {
     if (!value) return {};
@@ -3863,228 +3712,6 @@ private:
                           ValueRange(accumulators).drop_front());
       });
     }
-    if (aType.hasStaticShape() && bType.hasStaticShape() && aType.getDimSize(1) == config.getTileK() &&
-        (matrixElement.isF16() || matrixElement.isBF16() || matrixElement.isF32()) && config.getLocalBytes() >= 8192 &&
-        config.getTileN() % 64 == 0 && config.getTileK() * elementBytes % 64 == 0 &&
-        config.getTileK() * config.getTileN() * elementBytes <= 1024 * 1024 &&
-        config.getTileM() * (config.getTileK() * elementBytes + config.getTileN() * 4) <= config.getLocalBytes() &&
-        config.getTasks() >= 4 && config.getTasks() % 4 == 0 &&
-        bType.getDimSize(1) / config.getTileN() >= config.getTasks()) {
-      // A resident RHS panel is reused across output-row blocks. The group's
-      // four column programs consume the same streamed LHS row block.
-      function->setAttr("intent_dsa.group_width", b.getI64IntegerAttr(4));
-      Value groupId = b.create<dsa::GroupIdOp>(loc, b.getIndexType());
-      Value groupCount = b.create<dsa::GroupCountOp>(loc, b.getIndexType());
-      Value localId = b.create<dsa::LocalIdOp>(loc, b.getIndexType());
-      Value memoryCore = b.create<dsa::IsMemoryCoreOp>(loc, b.getI1Type());
-      Value computeCore = b.create<arith::XOrIOp>(loc, memoryCore, b.create<arith::ConstantIntOp>(loc, 1, 1));
-      Value groupsN = b.create<arith::CeilDivSIOp>(loc, gridN, index(loc, 4));
-      auto sharedType = MemRefType::get({config.getTileM(), config.getTileK()}, matrixElement,
-          MemRefLayoutAttrInterface{}, b.getI64IntegerAttr(dsa::sharedSpace));
-      auto shared = b.create<memref::AllocaOp>(loc, sharedType);
-      shared.setAlignment(128);
-      auto alternate = b.create<memref::AllocaOp>(loc, sharedType);
-      alternate.setAlignment(128);
-      auto when = [&](Value condition, const std::function<LogicalResult()> &body) -> LogicalResult {
-        auto branch = b.create<scf::IfOp>(loc, condition, false);
-        OpBuilder::InsertionGuard guard(b);
-        b.setInsertionPointToStart(branch.thenBlock());
-        return body();
-      };
-      int64_t sliceN = 256;
-      while (config.getTileN() % sliceN) sliceN /= 2;
-      int64_t sliceK = 2048;
-      while (sliceK > config.getTileK() || config.getTileK() % sliceK ||
-             2 * sliceK * sliceN * elementBytes > config.getLocalBytes()) sliceK /= 2;
-      return loop(loc, groupId, groupsN, groupCount, [&](Value group) -> LogicalResult {
-        Value ni = add(loc, mul(loc, group, index(loc, 4)), localId);
-        Value n0 = mul(loc, ni, tn);
-        Value cols = b.create<arith::MaxSIOp>(loc, index(loc, 0), b.create<arith::MinSIOp>(loc, sub(loc, N, n0), tn));
-        Value active = b.create<arith::AndIOp>(loc, computeCore,
-            b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, ni, gridN));
-        auto packedType = MemRefType::get({config.getTileK(), config.getTileN()}, matrixElement,
-            MemRefLayoutAttrInterface{}, b.getI64IntegerAttr(dsa::matrixSpace));
-        auto packed = b.create<memref::AllocaOp>(loc, packedType);
-        packed.setAlignment(128);
-        packed->setAttr("bangc.layout", b.getStringAttr("matrix_filter_interleaved64"));
-        if (failed(when(active, [&]() -> LogicalResult {
-          Value raw = allocate(loc, matrixElement, sliceK, sliceN);
-          Value transposed = allocate(loc, matrixElement, sliceN, sliceK);
-          Value br = stride(loc, *c, 0), bc = stride(loc, *c, 1);
-          b.create<dsa::PrepareMatrixViewOp>(loc, *c, packed, raw, transposed, mul(loc, n0, bc), br, bc, cols);
-          return success();
-        }))) return failure();
-        auto supply = [&](Value m0, Value slot) -> LogicalResult {
-          return when(memoryCore, [&]() -> LogicalResult {
-            Value rows = b.create<arith::MinSIOp>(loc, sub(loc, M, m0), tm);
-            Value ar = stride(loc, *a, 0), ac = stride(loc, *a, 1);
-            b.create<dsa::StageTileOp>(loc, *a, slot, mul(loc, m0, ar), ar, ac, rows, K);
-            return success();
-          });
-        };
-        const bool pipelineLocal = config.getTileM() *
-            (2 * config.getTileK() * elementBytes + config.getTileN() * 4) <= config.getLocalBytes();
-        Value local0, local1;
-        if (pipelineLocal) {
-          local0 = allocate(loc, matrixElement, config.getTileM(), config.getTileK());
-          local1 = allocate(loc, matrixElement, config.getTileM(), config.getTileK());
-        }
-        auto compute = [&](Value m0, Value slot, Value nextShared = Value{}, Value nextLocal = Value{}, Value nextRow = Value{}) -> LogicalResult {
-          return when(active, [&]() -> LogicalResult {
-            Value rows = b.create<arith::MinSIOp>(loc, sub(loc, M, m0), tm);
-            Value lhs = slot;
-            if (!pipelineLocal) {
-              lhs = allocate(loc, matrixElement, config.getTileM(), config.getTileK());
-              b.create<dsa::LoadTileOp>(loc, slot, lhs, index(loc, 0), tk, index(loc, 1), rows, K);
-            }
-            Value accumulator = allocate(loc, b.getF32Type(), config.getTileM(), config.getTileN());
-            b.create<dsa::FillOp>(loc, accumulator, b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(0)));
-            if (nextShared && failed(when(b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, nextRow, M), [&]() {
-              Value nextRows = b.create<arith::MinSIOp>(loc, sub(loc, M, nextRow), tm);
-              b.create<dsa::LoadTileOp>(loc, nextShared, nextLocal, index(loc, 0), tk, index(loc, 1), nextRows, K, b.getBoolAttr(true));
-              return success();
-            }))) return failure();
-            auto tile = b.create<dsa::MatrixTileOp>(loc, lhs, packed, accumulator);
-            tile->setAttr("bangc.implementation", b.getStringAttr("matmul_local_f32_accumulator"));
-            return emitOutput(accumulator, m0, n0, rows, cols);
-          });
-        };
-        if (failed(supply(index(loc, 0), shared))) return failure();
-        if (pipelineLocal) {
-          Value second = tm;
-          if (failed(when(b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, second, M),
-                          [&]() { return supply(second, alternate); }))) return failure();
-          b.create<dsa::GroupSynchronizeOp>(loc);
-          if (failed(when(active, [&]() {
-            Value rows = b.create<arith::MinSIOp>(loc, M, tm);
-            b.create<dsa::LoadTileOp>(loc, shared, local0, index(loc, 0), tk, index(loc, 1), rows, K);
-            return success();
-          }))) return failure();
-          b.create<dsa::GroupSynchronizeOp>(loc);
-          return loop(loc, index(loc, 0), M, index(loc, 2 * config.getTileM()), [&](Value m0) -> LogicalResult {
-            Value next = add(loc, m0, tm), following = add(loc, next, tm);
-            Value hasNext = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, next, M);
-            Value hasFollowing = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, following, M);
-            if (failed(when(hasFollowing, [&]() { return supply(following, shared); }))) return failure();
-            if (failed(compute(m0, local0, alternate, local1, next))) return failure();
-            b.create<dsa::GroupSynchronizeOp>(loc);
-            return when(hasNext, [&]() -> LogicalResult {
-              Value third = add(loc, following, tm);
-              if (failed(when(b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, third, M),
-                              [&]() { return supply(third, alternate); }))) return failure();
-              if (failed(compute(next, local1, shared, local0, following))) return failure();
-              b.create<dsa::GroupSynchronizeOp>(loc);
-              return success();
-            });
-          });
-        }
-        b.create<dsa::GroupSynchronizeOp>(loc);
-        return loop(loc, index(loc, 0), M, index(loc, 2 * config.getTileM()), [&](Value m0) -> LogicalResult {
-          Value next = add(loc, m0, tm);
-          Value hasNext = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, next, M);
-          if (failed(when(hasNext, [&]() { return supply(next, alternate); }))) return failure();
-          if (failed(compute(m0, shared))) return failure();
-          b.create<dsa::GroupSynchronizeOp>(loc);
-          return when(hasNext, [&]() -> LogicalResult {
-            Value following = add(loc, next, tm);
-            Value hasFollowing = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, following, M);
-            if (failed(when(hasFollowing, [&]() { return supply(following, shared); }))) return failure();
-            if (failed(compute(next, alternate))) return failure();
-            b.create<dsa::GroupSynchronizeOp>(loc);
-            return success();
-          });
-        });
-      });
-    }
-    if (config.getTasks() >= 4 && config.getTasks() % 4 == 0 &&
-        aType.getDimSize(0) / config.getTileM() >= 4) {
-      // Four independent M tiles reuse one RHS panel supplied by the group's
-      // memory participant. Local matrix computation remains explicit below.
-      function->setAttr("intent_dsa.group_width", b.getI64IntegerAttr(4));
-      Value groupId = b.create<dsa::GroupIdOp>(loc, b.getIndexType());
-      Value groupCount = b.create<dsa::GroupCountOp>(loc, b.getIndexType());
-      Value localId = b.create<dsa::LocalIdOp>(loc, b.getIndexType());
-      Value memoryCore = b.create<dsa::IsMemoryCoreOp>(loc, b.getI1Type());
-      Value computeCore = b.create<arith::XOrIOp>(loc, memoryCore, b.create<arith::ConstantIntOp>(loc, 1, 1));
-      Value groupsM = b.create<arith::CeilDivSIOp>(loc, gridM, index(loc, 4));
-      Type element = aType.getElementType();
-      int64_t panelBytes = config.getTileK() * config.getTileN() * (element.getIntOrFloatBitWidth() / 8);
-      int64_t stageTiles = std::min<int64_t>(8, (3968 * 1024) / (2 * panelBytes));
-      if (!stageTiles) return matrix.emitError("matrix panel exceeds execution-group shared storage");
-      int64_t stageRows = stageTiles * config.getTileK();
-      auto sharedType = MemRefType::get({stageRows, config.getTileN()}, element,
-          MemRefLayoutAttrInterface{}, b.getI64IntegerAttr(dsa::sharedSpace));
-      auto shared = b.create<memref::AllocaOp>(loc, sharedType);
-      shared.setAlignment(128);
-      auto alternate = b.create<memref::AllocaOp>(loc, sharedType);
-      alternate.setAlignment(128);
-      auto when = [&](Value condition, const std::function<LogicalResult()> &body) -> LogicalResult {
-        auto branch = b.create<scf::IfOp>(loc, condition, false);
-        OpBuilder::InsertionGuard guard(b);
-        b.setInsertionPointToStart(branch.thenBlock());
-        return body();
-      };
-      return loop(loc, groupId, mul(loc, groupsM, gridN), groupCount, [&](Value group) -> LogicalResult {
-        Value mi = add(loc, mul(loc, b.create<arith::DivSIOp>(loc, group, gridN), index(loc, 4)), localId);
-        Value ni = b.create<arith::RemSIOp>(loc, group, gridN);
-        Value m0 = mul(loc, mi, tm), n0 = mul(loc, ni, tn);
-        Value rows = b.create<arith::MaxSIOp>(loc, index(loc, 0),
-            b.create<arith::MinSIOp>(loc, sub(loc, M, m0), tm));
-        Value cols = b.create<arith::MinSIOp>(loc, sub(loc, N, n0), tn);
-        Value active = b.create<arith::AndIOp>(loc, computeCore,
-            b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, mi, gridM));
-        Value accumulator = allocate(loc, b.getF32Type(), config.getTileM(), config.getTileN());
-        if (failed(when(active, [&]() {
-          b.create<dsa::FillOp>(loc, accumulator, b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(0)));
-          return success();
-        }))) return failure();
-        auto supply = [&](Value stage, Value slot) -> LogicalResult {
-          return when(memoryCore, [&]() {
-            Value stageDepth = b.create<arith::MinSIOp>(loc, sub(loc, K, stage), index(loc, stageRows));
-            Value br = stride(loc, *c, 0), bc = stride(loc, *c, 1);
-            b.create<dsa::StageTileOp>(loc, *c, slot, add(loc, mul(loc, stage, br), mul(loc, n0, bc)),
-                br, bc, stageDepth, cols);
-            return success();
-          });
-        };
-        auto compute = [&](Value stage, Value slot) -> LogicalResult {
-          return when(active, [&]() {
-            Value stageDepth = b.create<arith::MinSIOp>(loc, sub(loc, K, stage), index(loc, stageRows));
-            Value lhs = allocate(loc, element, config.getTileM(), config.getTileK());
-            Value rhs = allocate(loc, element, config.getTileK(), config.getTileN());
-            return loop(loc, index(loc, 0), stageDepth, tk, [&](Value within) -> LogicalResult {
-              Value depth = b.create<arith::MaxSIOp>(loc, index(loc, 0),
-                  b.create<arith::MinSIOp>(loc, sub(loc, stageDepth, within), tk));
-              Value k0 = add(loc, stage, within);
-              Value ar = stride(loc, *a, 0), ac = stride(loc, *a, 1);
-              b.create<dsa::LoadTileOp>(loc, *a, lhs, add(loc, mul(loc, m0, ar), mul(loc, k0, ac)), ar, ac, rows, depth);
-              b.create<dsa::LoadTileOp>(loc, slot, rhs, mul(loc, within, tn), tn, index(loc, 1), depth, cols);
-              b.create<dsa::MatMulOp>(loc, lhs, rhs, accumulator, rows, depth, cols);
-              return success();
-            });
-          });
-        };
-        if (failed(supply(index(loc, 0), shared))) return failure();
-        b.create<dsa::GroupSynchronizeOp>(loc);
-        if (failed(loop(loc, index(loc, 0), K, index(loc, 2 * stageRows), [&](Value stage) -> LogicalResult {
-          Value next = add(loc, stage, index(loc, stageRows));
-          Value hasNext = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, next, K);
-          if (failed(when(hasNext, [&]() { return supply(next, alternate); }))) return failure();
-          if (failed(compute(stage, shared))) return failure();
-          b.create<dsa::GroupSynchronizeOp>(loc);
-          return when(hasNext, [&]() -> LogicalResult {
-            Value following = add(loc, next, index(loc, stageRows));
-            Value hasFollowing = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, following, K);
-            if (failed(when(hasFollowing, [&]() { return supply(following, shared); }))) return failure();
-            if (failed(compute(next, alternate))) return failure();
-            // Inactive compute participants also reach both group barriers.
-            b.create<dsa::GroupSynchronizeOp>(loc);
-            return success();
-          });
-        }))) return failure();
-        return when(active, [&]() { return emitOutput(accumulator, m0, n0, rows, cols); });
-      });
-    }
     return loop(loc, taskId, mul(loc, gridM, gridN), taskCount, [&](Value task) -> LogicalResult {
       Value mi = b.create<arith::DivSIOp>(loc, task, gridN), ni = b.create<arith::RemSIOp>(loc, task, gridN);
       Value m0 = mul(loc, mi, tm), n0 = mul(loc, ni, tn);
@@ -4135,10 +3762,6 @@ private:
   std::optional<LogicalWorksetFact> distributedWorkset;
   ParallelOp distributedRoot;
   SmallVector<Operation *> distributedPrefix;
-  Value cooperativeAxis;
-  int64_t cooperativeAxisExtent = 0;
-  scf::ForOp cooperativeLoop;
-  SmallVector<dsa::GatherRowsOp> cooperativeGathers;
 };
 }
 LogicalResult lowerCanonicalKIRToDSA(ModuleOp module, dsa::ConfigurationAttr configuration,

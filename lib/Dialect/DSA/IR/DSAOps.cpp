@@ -70,10 +70,7 @@ LogicalResult GatherPlanOp::verify() {
       !plan.getElementType().isInteger(64) || plan.getShape() != ArrayRef<int64_t>({3, rows}) ||
       rows < 64 || rows % 64 || rows > 65536)
     return emitOpError("run preparation needs i64[1,R], f32[1,R] and i64[3,R], R a multiple of 64 up to 65536");
-  auto owner = [](Value value) {
-    while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-    return value;
-  };
+  auto owner = dsa::storageRoot;
   if (owner(getRowOffsets()) == owner(getOutput()) || owner(getLaneIndices()) == owner(getOutput()))
     return emitOpError("run workspace must be independent of its inputs");
   return success();
@@ -84,10 +81,7 @@ LogicalResult GatherRowsOp::verify() {
   auto source = cast<MemRefType>(getSource().getType());
   auto output = cast<MemRefType>(getOutput().getType());
   auto offsets = cast<MemRefType>(getRowOffsets().getType());
-  auto owner = [](Value value) {
-    while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-    return value;
-  };
+  auto owner = dsa::storageRoot;
   if (getAsynchronous() && !getPlan()) return emitOpError("asynchronous gathers require an explicit run plan");
   if (getPlan()) {
     if (!tile(getPlan())) return emitOpError("run descriptor must use local storage");
@@ -166,10 +160,7 @@ LogicalResult BroadcastRowsOp::verify() {
   auto input = cast<MemRefType>(getInput().getType());
   auto output = cast<MemRefType>(getOutput().getType());
   auto scratch = cast<MemRefType>(getScratch().getType());
-  auto owner = [](Value value) {
-    while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-    return value;
-  };
+  auto owner = dsa::storageRoot;
   return input.getLayout().isIdentity() && output.getLayout().isIdentity() && scratch.getLayout().isIdentity() &&
       input.getElementType() == output.getElementType() && scratch.getElementType() == output.getElementType() &&
       scratch.getDimSize(0) == output.getDimSize(1) && scratch.getDimSize(1) == output.getDimSize(0) &&
@@ -182,10 +173,7 @@ LogicalResult IndexBinaryOp::verify() {
   bool scalar = getRhs().getType().isInteger(64);
   if (!type.getLayout().isIdentity() || !type.getElementType().isInteger(32) || type.getDimSize(0) != 2 ||
       (!scalar && !same(getRhs(), getLhs()))) return emitOpError("index arithmetic requires i32[2,N] and a matching tile or i64 scalar");
-  auto owner = [](Value value) {
-    while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-    return value;
-  };
+  auto owner = dsa::storageRoot;
   if (owner(getOutput()) == owner(getLhs()) || (!scalar && owner(getOutput()) == owner(getRhs())))
     return emitOpError("index arithmetic output must have independent storage");
   if (getKind() == intent::BinaryOperator::LeftShift || getKind() == intent::BinaryOperator::RightShift) {
@@ -224,10 +212,7 @@ LogicalResult CompareRampOp::verify() {
     return !getScratch() ? success() : emitOpError("full-width ramp masks need no conversion workspace");
   if (!getScratch() || !tile(getScratch())) return emitOpError("i1 ramp mask requires local conversion workspace");
   auto scratch = cast<MemRefType>(getScratch().getType());
-  auto owner = [](Value value) {
-    while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-    return value;
-  };
+  auto owner = dsa::storageRoot;
   return output.getLayout().isIdentity() && scratch.getLayout().isIdentity() &&
       output.getElementType().isInteger(1) && scratch.getElementType().isF32() &&
       columns >= 64 && (columns & (columns - 1)) == 0 && count <= 65536 &&
@@ -242,10 +227,7 @@ LogicalResult FillOp::verify() {
 LogicalResult TransposeOp::verify() {
   if (!tile(getInput()) || !tile(getOutput())) return emitOpError("transpose requires local tiles");
   auto input = cast<MemRefType>(getInput().getType()), output = cast<MemRefType>(getOutput().getType());
-  auto owner = [](Value value) {
-    while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-    return value;
-  };
+  auto owner = dsa::storageRoot;
   return input.getElementType() == output.getElementType() && input.getLayout().isIdentity() &&
       output.getLayout().isIdentity() && input.getDimSize(0) == output.getDimSize(1) &&
       input.getDimSize(1) == output.getDimSize(0) && owner(getInput()) != owner(getOutput())
@@ -264,10 +246,7 @@ LogicalResult SelectOp::verify() {
     if (!type.getElementType().isInteger(32) || type.getDimSize(0) != rows || type.getDimSize(1) % 64 ||
         type.getDimSize(1) > data.getNumElements())
       return emitOpError("selection workspace requires bounded 64-lane i32 groups for the selected operand form");
-    auto owner = [](Value value) {
-      while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-      return value;
-    };
+    auto owner = dsa::storageRoot;
     Value inputs[] = {getCondition(), getTrueValue(), getFalseValue(), getOutput()};
     for (Value input : inputs)
       if (owner(input) == owner(scratch)) return emitOpError("selection workspace must be independent of data and predicate");
@@ -280,10 +259,7 @@ LogicalResult SelectOp::verify() {
 LogicalResult MaskedFillOp::verify() {
   if (!tile(getMask()) || !same(getInput(), getOutput())) return emitOpError("masked fill requires matching local data tiles");
   auto mask = cast<MemRefType>(getMask().getType()), data = cast<MemRefType>(getOutput().getType());
-  auto owner = [](Value value) {
-    while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-    return value;
-  };
+  auto owner = dsa::storageRoot;
   return mask.getElementType().isInteger(32) && data.getElementType().isF32() &&
       mask.getShape() == data.getShape() && mask.getLayout().isIdentity() && data.getLayout().isIdentity() &&
       data.getNumElements() % 64 == 0 && owner(getMask()) != owner(getOutput()) && owner(getMask()) != owner(getInput())
@@ -297,10 +273,7 @@ LogicalResult UnaryOp::verify() {
         (getKind() == UnaryOperator::Exp2 && getApproximate() && getFlushToZero() &&
          cast<MemRefType>(scratch.getType()).getElementType().isF32())) {
       auto workspace = cast<MemRefType>(scratch.getType());
-      auto owner = [](Value value) {
-        while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-        return value;
-      };
+      auto owner = dsa::storageRoot;
       return tile(scratch) && input.getElementType().isF32() && workspace.getElementType().isF32() &&
           workspace.getLayout().isIdentity() && workspace.getDimSize(0) == 4 && workspace.getDimSize(1) >= 4 &&
           workspace.getDimSize(1) <= input.getNumElements() && owner(scratch) != owner(getInput()) &&
@@ -310,10 +283,7 @@ LogicalResult UnaryOp::verify() {
     if (!tile(scratch) || !input.getElementType().isF32() || getKind() != UnaryOperator::Exp2 ||
         !getApproximate() || !getFlushToZero()) return emitOpError("unary workspace requires f32 exp2 with explicit FTZ");
     auto type = cast<MemRefType>(scratch.getType());
-    auto owner = [](Value value) {
-      while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-      return value;
-    };
+    auto owner = dsa::storageRoot;
     if (!type.getElementType().isInteger(32) || type.getDimSize(0) != 1 ||
         type.getNumElements() > input.getNumElements() || owner(scratch) == owner(getInput()) ||
         owner(scratch) == owner(getOutput())) return emitOpError("FTZ workspace requires an independent bounded i32 row");
@@ -328,10 +298,7 @@ LogicalResult BinaryOp::verify() {
         return emitOpError("reciprocal workspace requires matching f32 input tiles");
       auto input = cast<MemRefType>(getLhs().getType());
       auto workspace = cast<MemRefType>(scratch.getType());
-      auto owner = [](Value value) {
-        while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-        return value;
-      };
+      auto owner = dsa::storageRoot;
       return input.getElementType().isF32() && workspace.getLayout().isIdentity() &&
           workspace.getElementType().isInteger(32) && workspace.getDimSize(0) == 2 &&
           workspace.getDimSize(1) >= 1 && workspace.getDimSize(1) <= input.getNumElements() &&
@@ -344,10 +311,7 @@ LogicalResult BinaryOp::verify() {
       return emitOpError("destructive extrema workspace requires matching input tiles");
     auto input = cast<MemRefType>(getLhs().getType());
     auto workspace = cast<MemRefType>(scratch.getType());
-    auto owner = [](Value value) {
-      while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-      return value;
-    };
+    auto owner = dsa::storageRoot;
     if ((!input.getElementType().isF16() && !input.getElementType().isF32()) ||
         workspace.getElementType() != input.getElementType() || !workspace.getLayout().isIdentity() ||
         workspace.getDimSize(0) != 1 || workspace.getNumElements() > input.getNumElements() ||
@@ -377,10 +341,7 @@ LogicalResult CompareOp::verify() {
         workspace.getDimSize(0) != 6 || workspace.getDimSize(1) < 32 ||
         workspace.getDimSize(1) > 65536 || workspace.getDimSize(1) % 32)
       return emitOpError("split-word comparison needs dense i64 operands and i32[6,W] workspace, W a multiple of 32 up to 65536");
-    auto owner = [](Value value) {
-      while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-      return value;
-    };
+    auto owner = dsa::storageRoot;
     if (owner(scratch) == owner(getLhs()) || owner(scratch) == owner(getRhs()) ||
         owner(scratch) == owner(getOutput()))
       return emitOpError("comparison workspace must be independent of operands and output");
@@ -454,10 +415,7 @@ LogicalResult ReduceOp::verify() {
   auto output = cast<MemRefType>(getOutput().getType());
   if (input.getElementType().isF16() && output.getElementType().isF32()) {
     auto scratch = cast<MemRefType>(getScratch().getType());
-    auto owner = [](Value value) {
-      while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-      return value;
-    };
+    auto owner = dsa::storageRoot;
     return tile(getInput()) && tile(getOutput()) && tile(getScratch()) && getAxis() == 1 &&
         (getKind() == intent::BinaryOperator::MaximumNum || getKind() == intent::BinaryOperator::MinimumNum) &&
         input.getDimSize(0) < 32 && input.getDimSize(1) >= 4 &&
@@ -470,10 +428,7 @@ LogicalResult ReduceOp::verify() {
   bool shape = getAxis() == 1 && same(getInput(), getScratch()) && input.getDimSize(0) == 1 &&
       output.getNumElements() == 1;
   if (getAxis() == 0 || (getAxis() == 1 && input.getDimSize(0) > 1)) {
-    auto owner = [](Value value) {
-      while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-      return value;
-    };
+    auto owner = dsa::storageRoot;
     auto scratch = cast<MemRefType>(getScratch().getType());
     bool workspace = same(getOutput(), getScratch());
     if (getAxis() == 1 && getKind() != intent::BinaryOperator::Add)
@@ -499,10 +454,7 @@ LogicalResult PrepareMatrixViewOp::verify() {
   auto output = cast<MemRefType>(getOutput().getType());
   auto input = cast<MemRefType>(getInputSlice().getType());
   auto transpose = cast<MemRefType>(getTransposedSlice().getType());
-  auto owner = [](Value value) {
-    while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-    return value;
-  };
+  auto owner = dsa::storageRoot;
   return source.getMemorySpaceAsInt() == 0 && output.getMemorySpaceAsInt() == matrixSpace &&
       output.hasStaticShape() && output.getRank() == 2 && output.getLayout().isIdentity() &&
       output.getDimSize(0) > 0 && output.getDimSize(1) > 0 && output.getDimSize(1) % 64 == 0 &&
@@ -518,10 +470,7 @@ LogicalResult PrepareMatrixViewOp::verify() {
 LogicalResult PrepareMatrixOp::verify() {
   auto input = cast<MemRefType>(getInput().getType());
   auto output = cast<MemRefType>(getOutput().getType());
-  auto owner = [](Value value) {
-    while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-    return value;
-  };
+  auto owner = dsa::storageRoot;
   if (!tile(getInput()) || !input.getLayout().isIdentity() || !output.hasStaticShape() ||
       output.getRank() != 2 || output.getMemorySpaceAsInt() != matrixSpace ||
       input.getElementType() != output.getElementType())
@@ -559,17 +508,19 @@ LogicalResult MatMulOp::verify() {
 LogicalResult MatrixTileOp::verify() {
   auto a = cast<MemRefType>(getLhs().getType()), b = cast<MemRefType>(getRhs().getType());
   auto c = cast<MemRefType>(getAccumulator().getType());
-  auto owner = [](Value value) {
-    while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-    return value;
-  };
+  auto owner = dsa::storageRoot;
   return tile(getLhs()) && tile(getAccumulator()) && b.hasStaticShape() && b.getRank() == 2 &&
       b.getMemorySpaceAsInt() == matrixSpace && a.getElementType() == b.getElementType() && c.getElementType().isF32() &&
       a.getDimSize(1) == b.getDimSize(0) && a.getDimSize(0) == c.getDimSize(0) &&
       b.getDimSize(1) == c.getDimSize(1) && owner(getAccumulator()) != owner(getLhs())
       ? success() : emitOpError("matrix tile requires prepared storage, matching M/K/N shapes and an f32 accumulator");
 }
-LogicalResult intent::dsa::verifyProgram(ModuleOp module, bool bound) {
+Value intent::dsa::storageRoot(Value value) {
+  while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
+  return value;
+}
+
+LogicalResult intent::dsa::verifyProgram(ModuleOp module) {
   if (failed(mlir::verify(module))) return failure();
   auto functions = llvm::to_vector(module.getOps<func::FuncOp>());
   if (functions.size() != 1) return module.emitError("DSA artifact requires one physical kernel");
@@ -653,9 +604,8 @@ LogicalResult intent::dsa::verifyProgram(ModuleOp module, bool bound) {
       }
       if (!type.hasStaticShape() || type.getRank() != 2 ||
           (type.getMemorySpaceAsInt() != nramSpace && type.getMemorySpaceAsInt() != matrixSpace &&
-           type.getMemorySpaceAsInt() != sharedSpace) ||
-          (bound && !op->hasAttr("bangc.offset"))) {
-        op->emitError("local allocation requires bounded shape, storage ownership and a bound offset");
+           type.getMemorySpaceAsInt() != sharedSpace)) {
+        op->emitError("local allocation requires bounded shape and storage ownership");
         return WalkResult::interrupt();
       }
     }

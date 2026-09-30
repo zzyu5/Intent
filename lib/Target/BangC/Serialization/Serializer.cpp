@@ -609,7 +609,7 @@ private:
 };
 }
 LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string &metadata) {
-  if (failed(dsa::verifyProgram(module, true))) return failure();
+  if (failed(verifyProgram(module))) return failure();
   llvm::raw_string_ostream output(source);
   llvm::json::Object interface;
   Serializer serializer(*module.getOps<func::FuncOp>().begin(), output);

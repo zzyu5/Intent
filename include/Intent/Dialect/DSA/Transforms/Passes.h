@@ -1,0 +1,24 @@
+#ifndef INTENT_DIALECT_DSA_TRANSFORMS_PASSES_H
+#define INTENT_DIALECT_DSA_TRANSFORMS_PASSES_H
+
+#include "Intent/Dialect/DSA/IR/DSAOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+
+namespace intent::dsa {
+mlir::LogicalResult runProgramTransforms(mlir::ModuleOp module);
+mlir::LogicalResult realizeCollectiveGatherSupply(mlir::func::FuncOp function);
+mlir::LogicalResult realizeMatrixSupply(mlir::func::FuncOp function);
+bool normalizeLinearIndices(mlir::func::FuncOp function);
+void bindUniformOperands(mlir::func::FuncOp function);
+void eliminateOverwrittenFills(mlir::func::FuncOp function);
+bool eliminateUnreadLocalWrites(mlir::func::FuncOp function);
+bool forwardFullLocalCopies(mlir::func::FuncOp function);
+bool forwardUniformScalarLoads(mlir::func::FuncOp function);
+bool forwardIndexExpressions(mlir::func::FuncOp function);
+bool realizeRangeComparisons(mlir::func::FuncOp function);
+bool foldRangeCounts(mlir::func::FuncOp function);
+bool foldUniformBooleanTiles(mlir::func::FuncOp function);
+bool reuseGatherOffsets(mlir::func::FuncOp function);
+bool batchPointwiseTasks(mlir::func::FuncOp function);
+} // namespace intent::dsa
+#endif

@@ -1,0 +1,77 @@
+#include "PassDetail.h"
+
+using namespace mlir;
+namespace intent::bangc {
+
+LogicalResult verifyProgram(ModuleOp module) {
+  if (failed(dsa::verifyProgram(module))) return failure();
+  auto architecture = module->getAttrOfType<StringAttr>("bangc.architecture");
+  if (!architecture || architecture.getValue() != "mtp_372")
+    return module.emitError("BANG C program requires the selected mtp_372 implementation profile");
+  auto function = *module.getOps<func::FuncOp>().begin();
+  if (failed(verifySurfaceOperations(function))) return failure();
+  auto nram = function->getAttrOfType<IntegerAttr>("bangc.nram_bytes");
+  auto wram = function->getAttrOfType<IntegerAttr>("bangc.wram_bytes");
+  auto sram = function->getAttrOfType<IntegerAttr>("bangc.sram_bytes");
+  if (!nram || !wram || !sram || nram.getInt() < 0 || wram.getInt() < 0 || sram.getInt() < 0)
+    return function.emitError("BANG C program requires completed storage binding");
+  auto walk = function.walk([&](Operation *operation) {
+    if (auto allocation = dyn_cast<memref::AllocaOp>(operation)) {
+      auto offset = operation->getAttrOfType<IntegerAttr>("bangc.offset");
+      auto bytes = operation->getAttrOfType<IntegerAttr>("bangc.allocation_bytes");
+      auto space = allocation.getType().getMemorySpaceAsInt();
+      int64_t banks = space == dsa::matrixSpace ? 16 : 1;
+      int64_t capacity = space == dsa::matrixSpace ? wram.getInt()
+          : space == dsa::sharedSpace ? sram.getInt() : nram.getInt();
+      if (!offset || !bytes || offset.getInt() < 0 || bytes.getInt() < 0 ||
+          bytes.getInt() > capacity || offset.getInt() > (capacity - bytes.getInt()) / banks) {
+        operation->emitError("BANG C allocation is missing or exceeds its bound storage interval");
+        return WalkResult::interrupt();
+      }
+      if (space == dsa::matrixSpace) {
+        auto layout = operation->getAttrOfType<StringAttr>("bangc.layout");
+        if (!layout || layout.getValue() != "matrix_filter_interleaved64") {
+          operation->emitError("BANG C matrix storage requires its selected filter layout");
+          return WalkResult::interrupt();
+        }
+      }
+    }
+    if (isa<dsa::MatrixTileOp>(operation)) {
+      auto implementation = operation->getAttrOfType<StringAttr>("bangc.implementation");
+      if (!implementation || implementation.getValue() != "matmul_local_f32_accumulator") {
+        operation->emitError("BANG C matrix tile has no selected accumulator implementation");
+        return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
+  });
+  return failure(walk.wasInterrupted());
+}
+
+
+LogicalResult verifySurfaceOperations(func::FuncOp function) {
+  auto walk = function.walk([&](Operation *op) {
+    if (!isa<dsa::SynchronizeOp, dsa::GroupSynchronizeOp, dsa::GroupIdOp, dsa::GroupCountOp, dsa::LocalIdOp,
+             dsa::IsMemoryCoreOp, dsa::StageTileOp, dsa::TaskIdOp, dsa::TaskCountOp, dsa::StrideOp, dsa::LoadScalarOp, dsa::StoreScalarOp,
+             dsa::LoadTileOp, dsa::GatherPlanOp, dsa::GatherRowsOp, dsa::GroupGatherRowsOp, dsa::StoreTileOp, dsa::FillOp, dsa::IotaOp,
+             dsa::IndexLayoutOp, dsa::IndexBinaryOp, dsa::BroadcastRowsOp, dsa::TransposeOp, dsa::SelectOp, dsa::MaskedFillOp, dsa::UnaryOp, dsa::BinaryOp,
+             dsa::CastOp, dsa::CompareOp, dsa::CompareRangeOp, dsa::CompareRampOp, dsa::DivideCastOp, dsa::DivideRNOp, dsa::ReduceOp,
+             dsa::PrepareMatrixOp, dsa::PrepareMatrixViewOp, dsa::MatrixTileOp,
+             arith::ConstantOp, arith::AddIOp, arith::SubIOp, arith::MulIOp,
+             arith::DivSIOp, arith::RemSIOp, arith::CeilDivSIOp, arith::FloorDivSIOp, arith::MinSIOp, arith::MaxSIOp,
+             arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp,
+             arith::ExtFOp, arith::TruncFOp, arith::IndexCastOp, arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp,
+             arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::CmpIOp, arith::CmpFOp, arith::SelectOp,
+             arith::AndIOp, arith::OrIOp, arith::XOrIOp, arith::ShLIOp, arith::ShRSIOp,
+             arith::MaximumFOp, arith::MinimumFOp, arith::MaxNumFOp, arith::MinNumFOp,
+             arith::NegFOp, math::ExpOp, math::Exp2Op, math::LogOp, math::SqrtOp, math::RsqrtOp, math::TanhOp, math::AbsFOp,
+             math::SinOp, math::CosOp, math::FloorOp,
+             memref::DimOp, memref::AllocaOp, memref::ReinterpretCastOp, memref::LoadOp, memref::StoreOp, memref::CopyOp,
+             scf::ForOp, scf::WhileOp, scf::IfOp, scf::ConditionOp, scf::YieldOp, func::FuncOp, func::ReturnOp>(op)) {
+      op->emitError("operation is outside the bound BANG C surface"); return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return failure(walk.wasInterrupted());
+}
+} // namespace intent::bangc

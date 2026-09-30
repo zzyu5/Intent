@@ -1,0 +1,586 @@
+#include "Intent/Dialect/DSA/Transforms/Passes.h"
+#include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Transforms/Passes.h"
+#include "llvm/Support/MathExtras.h"
+#include <functional>
+#include <limits>
+
+using namespace mlir;
+namespace intent::dsa {
+bool forwardIndexExpressions(func::FuncOp function) {
+  SmallVector<memref::StoreOp> stores;
+  function.walk([&](memref::StoreOp store) { stores.push_back(store); });
+  auto integer = [](Type type) { return isa<IndexType, IntegerType>(type); };
+  bool changed = false;
+  for (auto store : stores) {
+    Value buffer = store.getMemref();
+    auto allocation = buffer.getDefiningOp<memref::AllocaOp>();
+    auto producer = dyn_cast<scf::ForOp>(store->getParentOp());
+    auto type = store.getMemRefType();
+    if (!allocation || !producer || allocation->getBlock() != producer->getBlock() ||
+        !producer.getInitArgs().empty() || type.getRank() != 2 || type.getDimSize(0) != 1 ||
+        !type.getLayout().isIdentity() || type.getMemorySpaceAsInt() != dsa::nramSpace ||
+        (!type.getElementType().isInteger(32) && !type.getElementType().isInteger(64)) ||
+        !matchPattern(producer.getLowerBound(), m_Zero()) || !matchPattern(producer.getStep(), m_One()) ||
+        store.getIndices().size() != 2 || !matchPattern(store.getIndices()[0], m_Zero()) ||
+        store.getIndices()[1] != producer.getInductionVar()) continue;
+    // Replaying only integer arithmetic and immutable view strides avoids
+    // moving data reads across intervening writes or duplicating FP work.
+    bool pure = llvm::all_of(*producer.getBody(), [&](Operation &operation) {
+      if (&operation == store.getOperation() || isa<scf::YieldOp>(operation)) return true;
+      if (isa<dsa::StrideOp>(operation)) return true;
+      return operation.getName().getDialectNamespace() == "arith" && !operation.getNumRegions() &&
+          isMemoryEffectFree(&operation) && llvm::all_of(operation.getOperandTypes(), integer) &&
+          llvm::all_of(operation.getResultTypes(), integer);
+    });
+    if (!pure) continue;
+    SmallVector<memref::LoadOp> loads;
+    bool uniqueWrite = true;
+    for (Operation *user : buffer.getUsers()) {
+      if (user == store.getOperation()) continue;
+      if (auto fill = dyn_cast<dsa::FillOp>(user)) {
+        if (fill->getBlock() != producer->getBlock() || !fill->isBeforeInBlock(producer)) uniqueWrite = false;
+        continue;
+      }
+      if (auto load = dyn_cast<memref::LoadOp>(user)) { loads.push_back(load); continue; }
+      if (llvm::any_of(user->getResultTypes(), [](Type result) { return isa<MemRefType>(result); })) {
+        uniqueWrite = false; break;
+      }
+      if (auto effects = dyn_cast<MemoryEffectOpInterface>(user)) {
+        SmallVector<MemoryEffects::EffectInstance> instances;
+        effects.getEffects(instances);
+        for (const auto &effect : instances)
+          if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) &&
+              (!effect.getValue() || effect.getValue() == buffer)) uniqueWrite = false;
+      } else if (!isMemoryEffectFree(user)) uniqueWrite = false;
+      if (!uniqueWrite) break;
+    }
+    if (!uniqueWrite || loads.empty()) continue;
+    for (auto load : loads) {
+      auto consumer = dyn_cast<scf::ForOp>(load->getParentOp());
+      if (!consumer || consumer->getBlock() != producer->getBlock() || !producer->isBeforeInBlock(consumer) ||
+          !consumer.getInitArgs().empty() || consumer.getUpperBound() != producer.getUpperBound() ||
+          !matchPattern(consumer.getLowerBound(), m_Zero()) || !matchPattern(consumer.getStep(), m_One()) ||
+          load.getIndices().size() != 2 || !matchPattern(load.getIndices()[0], m_Zero()) ||
+          load.getIndices()[1] != consumer.getInductionVar()) continue;
+      IRMapping mapping;
+      mapping.map(producer.getInductionVar(), consumer.getInductionVar());
+      OpBuilder builder(load);
+      for (Operation &operation : *producer.getBody())
+        if (&operation != store.getOperation() && !isa<scf::YieldOp>(operation)) builder.clone(operation, mapping);
+      load.getResult().replaceAllUsesWith(mapping.lookupOrDefault(store.getValue()));
+      load.erase();
+      changed = true;
+    }
+    if (llvm::all_of(buffer.getUsers(), [&](Operation *user) {
+          return user == store.getOperation() || isa<dsa::FillOp>(user);
+        })) {
+      producer.erase();
+      SmallVector<Operation *> fills(buffer.getUsers());
+      for (Operation *fill : fills) fill->erase();
+      allocation.erase();
+    }
+  }
+  return changed;
+}
+
+bool realizeRangeComparisons(func::FuncOp function) {
+  DominanceInfo dominance(function);
+  auto integer = [](Value value) -> std::optional<int64_t> {
+    APInt bits;
+    if (matchPattern(value, m_ConstantInt(&bits))) return bits.getSExtValue();
+    return std::nullopt;
+  };
+  auto uniqueCopy = [&](Value buffer, Operation *consumer) -> Operation * {
+    if (!buffer.getDefiningOp<memref::AllocaOp>()) return {};
+    Operation *copy = nullptr;
+    for (Operation *user : buffer.getUsers()) {
+      if (llvm::any_of(user->getResultTypes(), [](Type t) { return isa<MemRefType>(t); })) return {};
+      if (auto effects = dyn_cast<MemoryEffectOpInterface>(user)) {
+        SmallVector<MemoryEffects::EffectInstance> instances;
+        effects.getEffects(instances);
+        for (const auto &effect : instances) {
+          if (!isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) ||
+              (effect.getValue() && effect.getValue() != buffer)) continue;
+          auto load = dyn_cast<dsa::LoadTileOp>(user);
+          auto transfer = dyn_cast<memref::CopyOp>(user);
+          bool known = (load && load.getOutput() == buffer && load.getSource() != buffer) ||
+              (transfer && transfer.getTarget() == buffer && transfer.getSource() != buffer);
+          if (!known || copy || !dominance.dominates(user, consumer)) return {};
+          copy = user;
+        }
+      } else if (!isMemoryEffectFree(user)) return {};
+    }
+    return copy;
+  };
+  auto rampBase = [&](Value buffer, int64_t columns, Operation *consumer) -> std::optional<int64_t> {
+    // Peel complete local copies; the remaining owned row must be initialized
+    // by exactly one unit-step integer ramp, with no subsequent writers.
+    while (Operation *copy = uniqueCopy(buffer, consumer)) {
+      Value input;
+      if (auto load = dyn_cast<dsa::LoadTileOp>(copy)) {
+        if (!matchPattern(load.getOffset(), m_Zero()) || !matchPattern(load.getColumnStride(), m_One()) ||
+            !matchPattern(load.getRows(), m_One()) || integer(load.getColumns()) != columns) return std::nullopt;
+        input = load.getSource();
+      } else input = cast<memref::CopyOp>(copy).getSource();
+      auto source = cast<MemRefType>(input.getType());
+      if (source.getMemorySpaceAsInt() != dsa::nramSpace || !source.getLayout().isIdentity() ||
+          source.getShape() != ArrayRef<int64_t>({1, columns})) return std::nullopt;
+      buffer = input;
+      consumer = copy;
+    }
+    if (!buffer.getDefiningOp<memref::AllocaOp>()) return std::nullopt;
+    memref::StoreOp store;
+    SmallVector<dsa::FillOp> fills;
+    for (Operation *user : buffer.getUsers()) {
+      if (llvm::any_of(user->getResultTypes(), [](Type t) { return isa<MemRefType>(t); })) return std::nullopt;
+      if (auto write = dyn_cast<memref::StoreOp>(user); write && write.getMemref() == buffer) {
+        if (store) return std::nullopt;
+        store = write; continue;
+      }
+      if (auto fill = dyn_cast<dsa::FillOp>(user); fill && fill.getOutput() == buffer) { fills.push_back(fill); continue; }
+      if (auto effects = dyn_cast<MemoryEffectOpInterface>(user)) {
+        SmallVector<MemoryEffects::EffectInstance> instances;
+        effects.getEffects(instances);
+        for (const auto &effect : instances)
+          if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) &&
+              (!effect.getValue() || effect.getValue() == buffer)) return std::nullopt;
+      } else if (!isMemoryEffectFree(user)) return std::nullopt;
+    }
+    auto loop = store ? dyn_cast<scf::ForOp>(store->getParentOp()) : scf::ForOp();
+    if (!loop || !loop.getInitArgs().empty() || !dominance.dominates(loop, consumer) ||
+        !matchPattern(loop.getLowerBound(), m_Zero()) || !matchPattern(loop.getStep(), m_One()) ||
+        integer(loop.getUpperBound()) != columns || store.getIndices().size() != 2 ||
+        !matchPattern(store.getIndices()[0], m_Zero()) || store.getIndices()[1] != loop.getInductionVar() ||
+        llvm::any_of(fills, [&](dsa::FillOp fill) { return !dominance.dominates(fill, loop); })) return std::nullopt;
+    Value value = store.getValue();
+    while (auto cast = value.getDefiningOp<arith::IndexCastOp>()) value = cast.getIn();
+    if (value == loop.getInductionVar()) return 0;
+    if (auto sum = value.getDefiningOp<arith::AddIOp>()) {
+      if (sum.getLhs() == loop.getInductionVar()) return integer(sum.getRhs());
+      if (sum.getRhs() == loop.getInductionVar()) return integer(sum.getLhs());
+    }
+    return std::nullopt;
+  };
+  SmallVector<dsa::CompareOp> comparisons;
+  function.walk([&](dsa::CompareOp compare) { comparisons.push_back(compare); });
+  bool changed = false;
+  for (auto compare : comparisons) {
+    if (compare.getPredicate() != ComparePredicate::Ge) continue;
+    auto type = cast<MemRefType>(compare.getLhs().getType());
+    if (!type.getElementType().isInteger(64)) continue;
+    int64_t rows = type.getDimSize(0), columns = type.getDimSize(1);
+    auto lhs = dyn_cast_or_null<dsa::LoadTileOp>(uniqueCopy(compare.getLhs(), compare));
+    auto rhs = dyn_cast_or_null<dsa::LoadTileOp>(uniqueCopy(compare.getRhs(), compare));
+    if (!lhs || !rhs || !matchPattern(lhs.getOffset(), m_Zero()) || !matchPattern(rhs.getOffset(), m_Zero()) ||
+        !matchPattern(lhs.getRowStride(), m_One()) || !matchPattern(lhs.getColumnStride(), m_Zero()) ||
+        !matchPattern(rhs.getRowStride(), m_Zero()) || !matchPattern(rhs.getColumnStride(), m_One()) ||
+        lhs.getRows() != rhs.getRows() || integer(lhs.getColumns()) != columns || integer(rhs.getColumns()) != columns ||
+        cast<MemRefType>(lhs.getSource().getType()).getShape() != ArrayRef<int64_t>({rows, 1}) ||
+        cast<MemRefType>(rhs.getSource().getType()).getShape() != ArrayRef<int64_t>({1, columns})) continue;
+    if (!uniqueCopy(lhs.getSource(), lhs)) continue;
+    auto base = rampBase(rhs.getSource(), columns, rhs);
+    if (!base || columns <= 0 || *base > std::numeric_limits<int64_t>::max() - (columns - 1)) continue;
+    OpBuilder b(compare);
+    Location loc = compare.getLoc();
+    // Both broadcasts pad with zero: GE is true in their inactive rows too.
+    b.create<dsa::CompareRangeOp>(loc, lhs.getSource(), compare.getOutput(), lhs.getRows(), b.getI64IntegerAttr(*base));
+    compare.erase();
+    for (auto copy : {lhs, rhs})
+      if (llvm::all_of(copy.getOutput().getUsers(), [&](Operation *user) { return user == copy; })) copy.erase();
+    changed = true;
+  }
+  return changed;
+}
+
+bool foldPresentRange(dsa::ReduceOp reduce, dsa::CompareRangeOp range, dsa::LoadTileOp copy,
+                      func::FuncOp function, DominanceInfo &dominance) {
+  auto exact = [&](Value value, int64_t expected) {
+    auto interval = integerInterval(value, function);
+    return interval && interval->first == expected && interval->second == expected;
+  };
+  int64_t rows = cast<MemRefType>(range.getOutput().getType()).getDimSize(0);
+  if (!copy || !exact(range.getRows(), rows) || !exact(copy.getRows(), rows) ||
+      !exact(copy.getColumns(), 1) || !exact(copy.getOffset(), 0) ||
+      !exact(copy.getRowStride(), 1) || !exact(copy.getColumnStride(), 1)) return false;
+  Value source = copy.getSource();
+  while (auto view = source.getDefiningOp<memref::ReinterpretCastOp>()) source = view.getSource();
+  if (!source.getDefiningOp<memref::AllocaOp>() || cast<MemRefType>(source.getType()).getNumElements() != rows) return false;
+  SmallVector<Value> aliases{source};
+  SmallVector<dsa::FillOp> fills;
+  memref::StoreOp initialization;
+  for (unsigned i = 0; i < aliases.size(); ++i) for (Operation *user : aliases[i].getUsers()) {
+    if (auto view = dyn_cast<memref::ReinterpretCastOp>(user)) { aliases.push_back(view.getResult()); continue; }
+    if (auto store = dyn_cast<memref::StoreOp>(user); store && llvm::is_contained(aliases, store.getMemref())) {
+      if (initialization) return false;
+      initialization = store; continue;
+    }
+    if (auto fill = dyn_cast<dsa::FillOp>(user); fill && llvm::is_contained(aliases, fill.getOutput())) { fills.push_back(fill); continue; }
+    if (llvm::any_of(user->getResultTypes(), [](Type type) { return isa<MemRefType>(type); })) return false;
+    if (auto effects = dyn_cast<MemoryEffectOpInterface>(user)) {
+      SmallVector<MemoryEffects::EffectInstance> instances; effects.getEffects(instances);
+      for (const auto &effect : instances)
+        if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) &&
+            (!effect.getValue() || llvm::is_contained(aliases, effect.getValue()))) return false;
+    } else if (!isMemoryEffectFree(user)) return false;
+  }
+  auto ramp = initialization ? dyn_cast<scf::ForOp>(initialization->getParentOp()) : scf::ForOp();
+  if (!ramp || !ramp.getInitArgs().empty() || ramp->isProperAncestor(copy) ||
+      !dominance.dominates(ramp, copy) || !exact(ramp.getLowerBound(), 0) ||
+      !exact(ramp.getUpperBound(), rows) || !exact(ramp.getStep(), 1) ||
+      llvm::any_of(fills, [&](dsa::FillOp fill) { return !dominance.dominates(fill, ramp); })) return false;
+  auto indices = initialization.getIndices();
+  auto initialized = initialization.getMemRefType();
+  bool complete = indices.size() == 2 &&
+      ((initialized.getShape() == ArrayRef<int64_t>({1, rows}) && exact(indices[0], 0) && indices[1] == ramp.getInductionVar()) ||
+       (initialized.getShape() == ArrayRef<int64_t>({rows, 1}) && indices[0] == ramp.getInductionVar() && exact(indices[1], 0)));
+  auto coordinates = integerInterval(initialization.getValue(), function);
+  if (!complete || !coordinates || coordinates->first < range.getBaseAttr().getInt()) return false;
+  memref::LoadOp count;
+  for (Operation *user : reduce.getOutput().getUsers()) {
+    if (user == reduce) continue;
+    auto load = dyn_cast<memref::LoadOp>(user);
+    if (!load || load.getMemref() != reduce.getOutput() || count) return false;
+    count = load;
+  }
+  if (!count || !count.getResult().hasOneUse()) return false;
+  auto compare = dyn_cast<arith::CmpFOp>(*count.getResult().getUsers().begin());
+  if (!compare || !compare.getResult().hasOneUse() ||
+      (compare.getPredicate() != arith::CmpFPredicate::UNE && compare.getPredicate() != arith::CmpFPredicate::ONE)) return false;
+  Value other = compare.getLhs() == count.getResult() ? compare.getRhs() : compare.getLhs();
+  FloatAttr zero;
+  if (!matchPattern(other, m_Constant(&zero)) || !zero.getValue().isZero()) return false;
+  auto store = dyn_cast<memref::StoreOp>(*compare.getResult().getUsers().begin());
+  auto loop = store ? dyn_cast<scf::ForOp>(store->getParentOp()) : scf::ForOp();
+  if (!loop || !loop.getInitArgs().empty() || count->getBlock() != loop.getBody() || compare->getBlock() != loop.getBody() ||
+      !exact(loop.getLowerBound(), 0) || !exact(loop.getUpperBound(), rows) || !exact(loop.getStep(), 1) ||
+      store.getMemRefType().getShape() != ArrayRef<int64_t>({1, rows}) || !store.getMemRefType().getElementType().isInteger(1) ||
+      store.getMemRefType().getMemorySpaceAsInt() != dsa::nramSpace || !store.getMemRefType().getLayout().isIdentity() ||
+      store.getIndices().size() != 2 || !exact(store.getIndices()[0], 0) || store.getIndices()[1] != loop.getInductionVar() ||
+      count.getIndices().size() != 2 || !exact(count.getIndices()[0], 0) || count.getIndices()[1] != loop.getInductionVar()) return false;
+  for (Operation &operation : loop.getBody()->without_terminator())
+    if (&operation != count && &operation != store && (operation.getNumRegions() || !isMemoryEffectFree(&operation))) return false;
+  OpBuilder b(loop);
+  b.create<dsa::FillOp>(loop.getLoc(), store.getMemref(), b.create<arith::ConstantIntOp>(loop.getLoc(), 1, 1));
+  loop.erase();
+  return true;
+}
+
+bool foldUniformBooleanTiles(func::FuncOp function) {
+  SmallVector<Operation *> operations;
+  function.walk([&](Operation *operation) {
+    if (isa<dsa::LoadTileOp, memref::CopyOp, dsa::SelectOp>(operation)) operations.push_back(operation);
+  });
+  bool changed = false;
+  for (Operation *operation : operations) {
+    OpBuilder b(operation);
+    Location loc = operation->getLoc();
+    if (auto select = dyn_cast<dsa::SelectOp>(operation)) {
+      Value condition = select.getCondition();
+      if (isa<MemRefType>(condition.getType())) {
+        auto fill = uniformFillBefore(condition, select);
+        if (!fill) continue;
+        condition = fill.getValue();
+      }
+      APInt value;
+      if (!matchPattern(condition, m_ConstantInt(&value))) continue;
+      Value source = value.isZero() ? select.getFalseValue() : select.getTrueValue();
+      if (!isa<MemRefType>(source.getType())) b.create<dsa::FillOp>(loc, select.getOutput(), source);
+      else if (source != select.getOutput()) b.create<memref::CopyOp>(loc, source, select.getOutput());
+      select.erase(); changed = true; continue;
+    }
+    Value input, output;
+    if (auto copy = dyn_cast<memref::CopyOp>(operation)) { input = copy.getSource(); output = copy.getTarget(); }
+    else { auto load = cast<dsa::LoadTileOp>(operation); input = load.getSource(); output = load.getOutput(); }
+    auto type = cast<MemRefType>(output.getType());
+    if (!type.getElementType().isInteger(1) || type.getRank() != 2 || !type.hasStaticShape() ||
+        type.getNumElements() <= 0 || type.getMemorySpaceAsInt() != dsa::nramSpace || !type.getLayout().isIdentity()) continue;
+    auto fill = uniformFillBefore(input, operation);
+    if (!fill) continue;
+    if (auto load = dyn_cast<dsa::LoadTileOp>(operation)) {
+      auto rows = integerInterval(load.getRows(), function), columns = integerInterval(load.getColumns(), function);
+      if (!rows || !columns || rows->first != type.getDimSize(0) || rows->second != type.getDimSize(0) ||
+          columns->first != type.getDimSize(1) || columns->second != type.getDimSize(1)) continue;
+    }
+    b.create<dsa::FillOp>(loc, output, fill.getValue());
+    operation->erase(); changed = true;
+  }
+  return changed;
+}
+
+bool foldRangeCounts(func::FuncOp function) {
+  DominanceInfo dominance(function);
+  auto soleWriter = [&](Value buffer, Operation *consumer) -> Operation * {
+    if (!buffer.getDefiningOp<memref::AllocaOp>()) return nullptr;
+    Operation *writer = nullptr;
+    for (Operation *user : buffer.getUsers()) {
+      if (user->getNumRegions() || llvm::any_of(user->getResultTypes(), [](Type t) { return isa<MemRefType>(t); }))
+        return nullptr;
+      if (auto effects = dyn_cast<MemoryEffectOpInterface>(user)) {
+        SmallVector<MemoryEffects::EffectInstance> instances;
+        effects.getEffects(instances);
+        for (const auto &effect : instances) {
+          if (!isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect())) continue;
+          if (!effect.getValue()) return nullptr;
+          if (effect.getValue() != buffer) continue;
+          if (writer || !isa<MemoryEffects::Write>(effect.getEffect()) || !dominance.dominates(user, consumer)) return nullptr;
+          writer = user;
+        }
+      } else if (!isMemoryEffectFree(user)) return nullptr;
+    }
+    return writer;
+  };
+  SmallVector<dsa::ReduceOp> reductions;
+  function.walk([&](dsa::ReduceOp reduce) { reductions.push_back(reduce); });
+  bool changed = false;
+  for (auto reduce : reductions) {
+    FloatAttr identity;
+    if (reduce.getKind() != BinaryOperator::Add || !matchPattern(reduce.getIdentity(), m_Constant(&identity)) ||
+        !identity.getValue().isZero() ||
+        llvm::any_of(reduce.getScratch().getUsers(), [&](Operation *user) { return user != reduce; })) continue;
+    Value converted = reduce.getInput();
+    Operation *consumer = reduce;
+    dsa::TransposeOp transpose;
+    if (reduce.getAxis() == 0) {
+      transpose = dyn_cast_or_null<dsa::TransposeOp>(soleWriter(converted, consumer));
+      if (!transpose) continue;
+      converted = transpose.getInput(); consumer = transpose;
+    } else if (reduce.getAxis() != 1) continue;
+    auto conversion = dyn_cast_or_null<dsa::CastOp>(soleWriter(converted, consumer));
+    if (!conversion) continue;
+    auto mask = cast<MemRefType>(conversion.getInput().getType());
+    auto type = cast<MemRefType>(converted.getType());
+    if (!mask.getElementType().isInteger(1) || !type.getElementType().isF32() || mask.getShape() != type.getShape()) continue;
+    auto range = dyn_cast_or_null<dsa::CompareRangeOp>(soleWriter(conversion.getInput(), conversion));
+    if (!range || !soleWriter(range.getRowCoordinates(), range)) continue;
+    int64_t rows = mask.getDimSize(0), columns = mask.getDimSize(1);
+    auto constant = [](Value value, int64_t expected) {
+      auto op = value.getDefiningOp<arith::ConstantIndexOp>();
+      return op && op.value() == expected;
+    };
+    if (columns > (1 << 24) || !constant(reduce.getCount(), columns) ||
+        (transpose && (!constant(transpose.getRows(), rows) || !constant(transpose.getColumns(), columns)))) continue;
+    auto output = cast<MemRefType>(reduce.getOutput().getType());
+    if (!output.getLayout().isIdentity() || output.getNumElements() != rows ||
+        (output.getDimSize(0) != 1 && output.getDimSize(1) != 1)) continue;
+    if (foldPresentRange(reduce, range, dyn_cast_or_null<dsa::LoadTileOp>(soleWriter(range.getRowCoordinates(), range)), function, dominance)) {
+      reduce.erase();
+      if (transpose && llvm::all_of(transpose.getOutput().getUsers(), [&](Operation *user) { return user == transpose; })) transpose.erase();
+      if (llvm::all_of(conversion.getOutput().getUsers(), [&](Operation *user) { return user == conversion; })) conversion.erase();
+      changed = true;
+      continue;
+    }
+    OpBuilder b(reduce);
+    Location loc = reduce.getLoc();
+    Value zero = b.create<arith::ConstantIndexOp>(loc, 0), one = b.create<arith::ConstantIndexOp>(loc, 1);
+    Value extent = b.create<arith::ConstantIndexOp>(loc, rows);
+    Value base = b.create<arith::ConstantIntOp>(loc, range.getBase(), 64);
+    Value last = b.create<arith::ConstantIntOp>(loc, range.getBase() + columns - 1, 64);
+    Value width = b.create<arith::ConstantIntOp>(loc, columns, 64);
+    Value empty = b.create<arith::ConstantIntOp>(loc, 0, 64);
+    Value unit = b.create<arith::ConstantIntOp>(loc, 1, 64);
+    b.create<scf::ForOp>(loc, zero, extent, one, ValueRange{}, [&](OpBuilder &nested, Location loc, Value row, ValueRange) {
+      Value query = nested.create<memref::LoadOp>(loc, range.getRowCoordinates(), ValueRange{row, zero});
+      Value below = nested.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, query, base);
+      Value full = nested.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge, query, last);
+      Value count = nested.create<arith::SubIOp>(loc, query, base);
+      count = nested.create<arith::AddIOp>(loc, count, unit);
+      count = nested.create<arith::SelectOp>(loc, full, width, count);
+      count = nested.create<arith::SelectOp>(loc, below, empty, count);
+      Value active = nested.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, row, range.getRows());
+      count = nested.create<arith::SelectOp>(loc, active, count, width);
+      Value result = nested.create<arith::SIToFPOp>(loc, nested.getF32Type(), count);
+      SmallVector<Value> indices = output.getDimSize(0) == 1 ? SmallVector<Value>{zero, row} : SmallVector<Value>{row, zero};
+      nested.create<memref::StoreOp>(loc, result, reduce.getOutput(), indices);
+      nested.create<scf::YieldOp>(loc);
+    });
+    reduce.erase();
+    auto eraseDeadWriter = [](Operation *op, Value buffer) {
+      if (llvm::all_of(buffer.getUsers(), [&](Operation *user) { return user == op; })) op->erase();
+    };
+    if (transpose) eraseDeadWriter(transpose, transpose.getOutput());
+    eraseDeadWriter(conversion, conversion.getOutput());
+    changed = true;
+  }
+  return changed;
+}
+
+bool reuseGatherOffsets(func::FuncOp function) {
+  DominanceInfo dominance(function);
+  struct Candidate { scf::ForOp loop; memref::StoreOp store; };
+  SmallVector<scf::ForOp> loops;
+  SmallVector<Candidate> candidates;
+  function.walk([&](scf::ForOp loop) { loops.push_back(loop); });
+  bool changed = false;
+  for (auto loop : loops) {
+    if (!loop.getInitArgs().empty() || !matchPattern(loop.getLowerBound(), m_Zero()) ||
+        !matchPattern(loop.getStep(), m_One())) continue;
+    memref::StoreOp store;
+    SmallVector<Value> sources;
+    bool eligible = true;
+    for (Operation &op : loop.getBody()->without_terminator()) {
+      if (auto write = dyn_cast<memref::StoreOp>(op)) {
+        if (store) { eligible = false; break; }
+        store = write;
+      } else if (auto read = dyn_cast<memref::LoadOp>(op)) sources.push_back(read.getMemref());
+      else if (op.getNumRegions() || !isMemoryEffectFree(&op) ||
+          (op.getName().getDialectNamespace() != "arith" && !isa<dsa::StrideOp>(op))) {
+        eligible = false; break;
+      }
+    }
+    if (!eligible || !store) continue;
+    Value output = store.getMemref();
+    auto type = store.getMemRefType();
+    auto allocation = output.getDefiningOp<memref::AllocaOp>();
+    if (!allocation || type.getRank() != 2 || type.getDimSize(0) != 1 || !type.getElementType().isInteger(64) ||
+        type.getMemorySpaceAsInt() != dsa::nramSpace || store.getIndices().size() != 2 ||
+        !matchPattern(store.getIndices()[0], m_Zero()) || store.getIndices()[1] != loop.getInductionVar()) continue;
+    SmallVector<OpOperand *> consumers;
+    SmallVector<dsa::FillOp> fills;
+    for (Operation *user : output.getUsers()) {
+      if (user == store.getOperation()) continue;
+      if (auto fill = dyn_cast<dsa::FillOp>(user); fill && dominance.dominates(fill, loop)) {
+        fills.push_back(fill); continue;
+      }
+      if (auto gather = dyn_cast<dsa::GatherRowsOp>(user); gather && gather.getRowOffsets() == output &&
+          gather.getRows() == loop.getUpperBound() && dominance.dominates(loop, gather)) {
+        consumers.push_back(&gather->getOpOperand(1)); continue;
+      }
+      if (auto gather = dyn_cast<dsa::GroupGatherRowsOp>(user); gather && gather.getRowOffsets() == output &&
+          gather.getRows() == loop.getUpperBound() && dominance.dominates(loop, gather)) {
+        consumers.push_back(&gather->getOpOperand(1)); continue;
+      }
+      if (auto plan = dyn_cast<dsa::GatherPlanOp>(user); plan && plan.getRowOffsets() == output &&
+          plan.getRows() == loop.getUpperBound() && dominance.dominates(loop, plan)) {
+        consumers.push_back(&plan->getOpOperand(0)); continue;
+      }
+      eligible = false; break;
+    }
+    if (!eligible || consumers.empty()) continue;
+    bool reused = false;
+    for (auto previous : candidates) {
+      if (previous.loop->getBlock() != loop->getBlock() || previous.store.getMemref().getType() != type ||
+          previous.loop.getUpperBound() != loop.getUpperBound()) continue;
+      // A local coordinate tensor may be read by both expressions, but no
+      // intervening mutation or escaping alias may change its contents.
+      bool stable = llvm::all_of(sources, [&](Value source) {
+        if (!source.getDefiningOp<memref::AllocaOp>()) return false;
+        for (Operation *user : source.getUsers()) {
+          if (llvm::any_of(user->getResultTypes(), [](Type t) { return isa<MemRefType>(t); })) return false;
+          if (auto effects = dyn_cast<MemoryEffectOpInterface>(user)) {
+            SmallVector<MemoryEffects::EffectInstance> instances;
+            effects.getEffects(instances);
+            for (const auto &effect : instances)
+              if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) &&
+                  (!effect.getValue() || effect.getValue() == source) && !dominance.dominates(user, previous.loop))
+                return false;
+          } else if (!isMemoryEffectFree(user)) return false;
+        }
+        return true;
+      });
+      if (!stable || previous.loop.getBody()->getOperations().size() != loop.getBody()->getOperations().size()) continue;
+      IRMapping mapping;
+      mapping.map(previous.loop.getInductionVar(), loop.getInductionVar());
+      mapping.map(previous.store.getMemref(), output);
+      bool equivalent = true;
+      for (auto [a, c] : llvm::zip(*previous.loop.getBody(), *loop.getBody())) {
+        if (a.getName() != c.getName() || a.getAttrs() != c.getAttrs() || a.getResultTypes() != c.getResultTypes() ||
+            a.getNumOperands() != c.getNumOperands() || a.getNumRegions() || c.getNumRegions()) {
+          equivalent = false; break;
+        }
+        for (auto [lhs, rhs] : llvm::zip(a.getOperands(), c.getOperands()))
+          if (mapping.lookupOrDefault(lhs) != rhs) { equivalent = false; break; }
+        if (!equivalent) break;
+        mapping.map(a.getResults(), c.getResults());
+      }
+      if (!equivalent) continue;
+      for (OpOperand *consumer : consumers) consumer->set(previous.store.getMemref());
+      loop.erase();
+      for (auto fill : fills) fill.erase();
+      allocation.erase();
+      reused = changed = true;
+      break;
+    }
+    if (!reused) candidates.push_back({loop, store});
+  }
+  return changed;
+}
+
+bool normalizeLinearIndices(func::FuncOp function) {
+  bool changed = false;
+  function.walk([&](memref::StoreOp store) {
+    Value root = store.getValue();
+    if (auto cast = root.getDefiningOp<arith::IndexCastOp>()) root = cast.getIn();
+    Type type = root.getType();
+    if (!type.isIndex() && !type.isInteger(64)) return;
+    auto definition = root.getDefiningOp();
+    if (!definition || !isa<arith::AddIOp, arith::SubIOp, arith::MulIOp>(definition)) return;
+    // Integer add/sub/mul are modular. Divisions and reads remain opaque SSA
+    // leaves; cancellation never depends on overflow or runtime index bounds.
+    SmallVector<std::pair<Value, APInt>> terms;
+    APInt constant(64, 0);
+    llvm::SmallPtrSet<Operation *, 16> arithmetic;
+    std::function<void(Value, APInt)> collect = [&](Value value, APInt factor) {
+      if (factor.isZero()) return;
+      IntegerAttr literal;
+      if (matchPattern(value, m_Constant(&literal))) {
+        constant += literal.getValue().sextOrTrunc(64) * factor;
+        return;
+      }
+      Operation *op = value.getDefiningOp();
+      if (op && value.getType() == type) {
+        if (auto add = dyn_cast<arith::AddIOp>(op)) {
+          arithmetic.insert(op); collect(add.getLhs(), factor); collect(add.getRhs(), factor); return;
+        }
+        if (auto sub = dyn_cast<arith::SubIOp>(op)) {
+          arithmetic.insert(op); collect(sub.getLhs(), factor); collect(sub.getRhs(), -factor); return;
+        }
+        if (auto mul = dyn_cast<arith::MulIOp>(op)) {
+          if (matchPattern(mul.getRhs(), m_Constant(&literal))) {
+            arithmetic.insert(op); collect(mul.getLhs(), factor * literal.getValue().sextOrTrunc(64)); return;
+          }
+          if (matchPattern(mul.getLhs(), m_Constant(&literal))) {
+            arithmetic.insert(op); collect(mul.getRhs(), factor * literal.getValue().sextOrTrunc(64)); return;
+          }
+        }
+      }
+      for (auto &term : terms)
+        if (term.first == value) { term.second += factor; return; }
+      terms.emplace_back(value, factor);
+    };
+    collect(root, APInt(64, 1));
+    int64_t count = constant.isZero() ? 0 : 1, multiplies = 0;
+    for (const auto &term : terms) {
+      if (term.second.isZero()) continue;
+      ++count;
+      multiplies += !term.second.isOne();
+    }
+    if (std::max<int64_t>(0, count - 1) + multiplies >= int64_t(arithmetic.size())) return;
+    OpBuilder b(definition);
+    auto literal = [&](const APInt &value) -> Value {
+      return b.create<arith::ConstantOp>(store.getLoc(), type, b.getIntegerAttr(type, value));
+    };
+    Value result;
+    for (const auto &term : terms) {
+      if (term.second.isZero()) continue;
+      Value value = term.first;
+      if (!term.second.isOne()) value = b.create<arith::MulIOp>(store.getLoc(), value, literal(term.second));
+      result = result ? b.create<arith::AddIOp>(store.getLoc(), result, value) : value;
+    }
+    if (!constant.isZero()) result = result ? b.create<arith::AddIOp>(store.getLoc(), result, literal(constant)) : literal(constant);
+    if (!result) result = literal(APInt(64, 0));
+    root.replaceAllUsesWith(result);
+    changed = true;
+  });
+  return changed;
+}
+} // namespace intent::dsa

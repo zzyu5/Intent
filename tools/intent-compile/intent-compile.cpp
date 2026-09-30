@@ -1,6 +1,7 @@
 #include "Intent/Conversion/KIRToGPU/KIRToGPU.h"
 #include "Intent/Conversion/KIRToCPU/KIRToCPU.h"
 #include "Intent/Conversion/KIRToDSA/KIRToDSA.h"
+#include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Target/BangC/Passes.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Target/Mojo/Serialization/Serializer.h"
@@ -222,6 +223,8 @@ int main(int argc, char **argv) {
     if (mlir::failed(intent::lowerCanonicalKIRToDSA(*module, configuration, bindings.getDictionary(&context),
                                                  strideBindings.getDictionary(&context))))
       return exitCode(ExitCode::PhysicalProgram);
+    if (mlir::failed(intent::dsa::runProgramTransforms(*module)))
+      return exitCode(ExitCode::PhysicalProgramVerification);
     if (stopAfterShared) return emitShared();
     if (mlir::failed(intent::bangc::legalizeProgram(*module, dsaArchitecture)))
       return exitCode(ExitCode::ProviderProgramVerification);
