@@ -147,6 +147,8 @@ Region 展开后，模板参数变成具体 views，可以用同一存储证明�
 
 Mojo 的 [Passes.cpp](lib/Target/Mojo/Transforms/Passes.cpp) 调度实现展开、私有计算融合、向量化和最终原生合法化，具体阶段在相邻 [Legalize.cpp](lib/Target/Mojo/Transforms/Legalize.cpp)。向量宽度来自已绑定 implementation；scratch 提升复用 CPU 的存储证明；算术、原子更新和浮点环境在最终 surface 验证前闭合。Weft 保留 Canonical Weft IR 的 structured 输入边界，不经过 Mojo 的 SIMD 展开。
 
+CPU 归约的相邻重结合与元素重排许可统一保存于 `ReductionOrderAttr`。Construction 从源操作合同建立许可，fusion 取参与计算的许可交集，partition 与 materialization 保留它；不能由末尾恰好有一个 add 推断整个计算可重排。[VectorizeLoops.cpp](lib/Dialect/CPU/Transforms/VectorizeLoops.cpp) 在访问独立且允许重排时跨块保留向量累加器，最后才做横向归约；初始 accumulator 只合入一次。私有 [VectorReductions.h](lib/Dialect/CPU/Transforms/VectorReductions.h) 为该路径和多输出归约提供同一套 tuple 横向树，调用者负责初始化、captures 与顺序合法性。Weft 直接消费自己的原生归约能力，不经过这一 SIMD 展开。
+
 Weft 的私有 [Views.h](lib/Target/Weft/Transforms/Views.h) 证明标准 memref 描述符是否仅做轴置换或 unit 轴插删，并将纯 view capture 的定义链显式放回 task 内。原存储及所需标量进入 task ABI；[Legalize.cpp](lib/Target/Weft/Transforms/Legalize.cpp) 将逻辑访问反投影到原 Slice/Subview，缓存原存储顺序的 Admit 快照。矩阵消费者保留该顺序，将轴重命名为当前循环轴，直接交给按命名轴归约的 OuterContract；位置相关的普通读写则显式投影到对应逻辑顺序。不能把非连续 capture 直接标成连续，也不能只改 shape 冒充转置。当前 Weft RISC-V 不能实现一般置换 Reshape；动态轴合并、非矩形 flatten 和任意 strided reinterpretation 也不在该桥接能力内，失败明确报告，不插入隐藏 copy。
 
 ## Provider 与 runtime 扩展
@@ -161,7 +163,7 @@ Weft 的私有 [Views.h](lib/Target/Weft/Transforms/Views.h) 证明标准 memref
 
 CPU 的 implementation registry 是明确的局部扩展点。GPU provider 通常复用下层 compiler 的 primitives 与布局机制，不需要为了目录形式对称再建一套同名 leaf 系统。
 
-CPU host ABI 的共同绑定在 [runtime/cpu.py](python/intent/runtime/cpu.py)。`CPUInterface` 在 artifact 初始化时解析参数角色、静态形状、维度身份和需要检查的别名关系；每次调用仍重新观察实参并校验 shape、stride、pointer、allocation 与 offset。Mojo 的 Torch 对象规则和 Weft 的 Buffer/alignment 规则留在各自 `program.py`，各自的 tuning key 与计时范围也由适配层保持。Weft 的 `_ExecutionContract` 持有稳定硬件描述与 native 函数绑定，每次执行继续检查当前线程的 affinity、stack、RVV 状态和 VLEN。不要把一次实参观察或线程状态存入不可变 ABI schema。
+CPU host ABI 的共同绑定在 [runtime/cpu.py](python/intent/runtime/cpu.py)。`CPUInterface` 在 artifact 初始化时解析参数角色、静态形状、维度身份和需要检查的别名关系，并为隐式分配输出与显式传入输出生成各自的绑定函数。参数位置、维度 owner/相等关系、输出形状与 ABI 排列固定在函数中；每次调用仍重新观察实参并校验 shape、stride、pointer、allocation 与 offset。受控 allocator 可以同时返回本次新分配的输出及其 `ViewFacts`，显式输出仍走完整观察。Mojo 的 Torch 对象规则和 Weft 的 Buffer/alignment 规则留在各自 `program.py`，各自的 tuning key 与计时范围也由适配层保持。Weft 的 `_ExecutionContract` 持有稳定硬件描述与 native 函数绑定，每次执行继续检查当前线程的 affinity、stack、RVV 状态和 VLEN。不要把一次实参观察或线程状态存入不可变 ABI schema，也不要在绑定函数中重建算法或 task 调度。
 
 Triton 的 [Passes.cpp](lib/Target/Triton/Transforms/Passes.cpp) 调度 grid、prepare-memory、native-forms 和 finalize；[Legalize.cpp](lib/Target/Triton/Transforms/Legalize.cpp) 通过私有 [Legalization.h](lib/Target/Triton/Transforms/Legalization.h) 组合完整阶段。cuTile 的 [Passes.cpp](lib/Target/CuTile/Transforms/Passes.cpp) 调度 prepare、native-program 和 finalize，私有入口在 [Legalize.h](lib/Target/CuTile/Transforms/Legalize.h)。按实际职责选择相邻模块，不把新增规则继续堆入 driver：
 

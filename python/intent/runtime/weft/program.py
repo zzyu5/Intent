@@ -167,6 +167,10 @@ class NativeProgram:
         self._alignments = tuple(self.parameters[parameter.position]["alignment"]
                                  if isinstance(parameter, ViewParameter) else None
                                  for parameter in self.interface.parameters)
+        self._binders = self.interface.binders(
+            observe_view=type(self)._view, allocate_output=type(self)._allocate_output,
+            scalar_key_values=True, view_dtype_before_offset=True,
+        )
         self.candidates = self.metadata["candidates"]
         kernels = {kernel["symbol"]: kernel for kernel in manifest["weft"]["kernels"]}
         self.candidate_extensions = tuple(frozenset(
@@ -212,15 +216,17 @@ class NativeProgram:
                          value.pointer - value.allocation, value.dtype,
                          value.pointer, value.pointer + value.nbytes)
 
-    def _allocate_output(self, parameter: ViewParameter, shape: tuple[int, ...]) -> Buffer:
-        return Buffer.empty(shape, parameter.dtype)
+    def _allocate_output(self, parameter: ViewParameter, shape: tuple[int, ...]) -> tuple[Buffer, ViewFacts]:
+        value = Buffer.empty(shape, parameter.dtype)
+        if value.pointer % self._alignments[parameter.position]:
+            raise ValueError("native view does not meet the compiler alignment requirement")
+        facts = ViewFacts(value.shape, value.strides, value.pointer, value.allocation,
+                          value.pointer - value.allocation, value.dtype,
+                          value.pointer, value.pointer + value.nbytes)
+        return value, facts
 
     def prepare(self, arguments: tuple, *, explicit_outputs: bool = False) -> NativeCall:
-        bound = self.interface.bind(
-            arguments, explicit_outputs=explicit_outputs, observe_view=self._view,
-            allocate_output=self._allocate_output, scalar_key_values=True,
-            view_dtype_before_offset=True,
-        )
+        bound = self._binders[bool(explicit_outputs)](self, arguments)
         snapshots = tuple((bound.arguments[parameter.position],
                            bytes(bound.arguments[parameter.position].storage))
                           for parameter in self.interface.mutable_inputs)

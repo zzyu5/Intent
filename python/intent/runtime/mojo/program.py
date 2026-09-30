@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
+from math import prod
 import statistics
 
 import torch
@@ -88,6 +89,10 @@ class NativeProgram:
         self.contiguous_views = metadata["contiguous_views"]
         if not metadata["disjoint_outputs"]:
             raise NotImplementedError("Mojo runtime requires declared disjoint-output entry legality")
+        self._binders = self.interface.binders(
+            observe_view=type(self)._view, allocate_output=type(self)._allocate_output,
+            scalar_key_values=False, view_dtype_before_offset=False,
+        )
         self.compilation = compile_library(source, metadata, target)
         argument_types = []
         for parameter in self.parameters:
@@ -138,16 +143,25 @@ class NativeProgram:
                          tensor.storage_offset(), dtype, pointer + lower * element_size,
                          pointer + upper * element_size)
 
-    def _allocate_output(self, parameter: ViewParameter, shape: tuple[int, ...]):
-        dtype, _ = self._view_types[parameter.position]
-        return torch.empty(shape, dtype=dtype, device="cpu")
+    def _allocate_output(self, parameter: ViewParameter, shape: tuple[int, ...]) -> tuple[torch.Tensor, ViewFacts]:
+        dtype, stride_constraints = self._view_types[parameter.position]
+        tensor = torch.empty(shape, dtype=dtype, device="cpu")
+        elements = prod(shape)
+        if elements == 0:
+            raise NotImplementedError("Mojo CPU empty-storage pointer ABI is not implemented")
+        strides = tensor.stride()
+        for constraint, stride in zip(stride_constraints, strides):
+            if constraint is not None and constraint != stride:
+                raise ValueError(f"{parameter.name} violates an author stride constraint")
+        pointer = tensor.data_ptr()
+        # This invocation owns the new contiguous allocation. Shape, dtype,
+        # zero offset and storage identity follow from the factory contract.
+        facts = ViewFacts(shape, strides, pointer, pointer, 0, dtype,
+                          pointer, pointer + elements * tensor.element_size())
+        return tensor, facts
 
     def prepare(self, arguments: tuple[object, ...], *, explicit_outputs: bool = False) -> NativeCall:
-        bound = self.interface.bind(
-            arguments, explicit_outputs=explicit_outputs, observe_view=self._view,
-            allocate_output=self._allocate_output, scalar_key_values=False,
-            view_dtype_before_offset=False,
-        )
+        bound = self._binders[bool(explicit_outputs)](self, arguments)
         return NativeCall(self, bound.arguments, bound.native_arguments, bound.outputs, bound.key)
 
     def run(self, *arguments):
