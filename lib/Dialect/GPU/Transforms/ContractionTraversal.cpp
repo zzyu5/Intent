@@ -766,10 +766,11 @@ FailureOr<bool> realizeFullResultTraversal(
     inheritRangeAuthority(fullRange, *authority);
     Value coordinates = broadcastAxis(builder, location, indexType, fullRange,
                                       static_cast<unsigned>(resultAxis));
-    // A retained output that fits exactly in the selected native tile needs
-    // no slice/update traversal. This binding is launch-uniform and becomes
-    // a compile-time branch in the target DSL. Keep the original snapshot and
-    // accumulator directly in the native product.
+    // A tile that covers the retained output needs no slice/update traversal.
+    // The native branch keeps the original full shape, so an oversized tile
+    // does not pad the product or assemble a redundant partial result. This
+    // launch-uniform binding becomes a compile-time branch in the target DSL;
+    // its original snapshots and accumulator still define the entire product.
     scf::IfOp fullTile;
     PhysicalProgramAnalysis nativeAnalysis(kernel);
     bool hasReductionSeed = false;
@@ -782,8 +783,29 @@ FailureOr<bool> realizeFullResultTraversal(
     // A scalar construction seed is not a selected reduction tile. Retain
     // the traversal so its reduction can be blocked before using native MMA.
     if (!hasReductionSeed && !fullReductionNeedsTraversal(contract)) {
-      Value fits = builder.create<CompareOp>(location, builder.getI1Type(),
-          fullSize, block.getResult(), ComparePredicate::Eq);
+      Value covers = builder.create<CompareOp>(location, builder.getI1Type(),
+          fullSize, block.getResult(), ComparePredicate::Le);
+      // Keep the full shapes reachable by the old equality branch. Domain
+      // membership also preserves padding for undersized or non-native full
+      // extents, without assuming a contiguous power-of-two candidate domain.
+      auto candidates = block.getParameter().getCandidates().asArrayRef();
+      Value nativeExtent;
+      if (auto fixed = constantPhysicalExpression(fullExtent)) {
+        nativeExtent = builder.create<arith::ConstantIntOp>(
+            location, llvm::is_contained(candidates, *fixed), 1);
+      } else {
+        for (int64_t candidate : candidates) {
+          Value width = builder.create<arith::ConstantIndexOp>(location, candidate);
+          Value equal = builder.create<CompareOp>(location, builder.getI1Type(),
+              fullSize, width, ComparePredicate::Eq);
+          nativeExtent = nativeExtent
+              ? builder.create<BinaryOp>(location, builder.getI1Type(),
+                    nativeExtent, equal, BinaryOperator::LogicalOr).getResult()
+              : equal;
+        }
+      }
+      Value fits = builder.create<BinaryOp>(location, builder.getI1Type(),
+          covers, nativeExtent, BinaryOperator::LogicalAnd);
       fullTile = builder.create<scf::IfOp>(location, TypeRange{resultType}, fits, true);
       builder.setInsertionPointToStart(fullTile.thenBlock());
       auto native = cast<ContractOp>(builder.clone(*contract));
