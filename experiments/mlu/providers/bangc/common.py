@@ -42,8 +42,10 @@ class RemoteSequence:
         self.allocated_outputs = set()
 
     def add(self, definition, arguments, *, constexprs=None, target=None):
+        views = {name: value for name, value in arguments.items() if isinstance(value, torch.Tensor)}
         target = replace(target or self.context.target,
-            shapes={name: tuple(value.shape) for name, value in arguments.items() if isinstance(value, torch.Tensor)})
+            shapes={name: tuple(value.shape) for name, value in views.items()},
+            strides={name: tuple(value.stride()) for name, value in views.items()})
         report_stage("generated_compilation")
         program = intent.generate(definition, target=target, compiler=self.context.compiler,
             constexprs=constexprs, tuning_config=self.context.tuning_config)
@@ -148,4 +150,5 @@ class RemoteSequence:
 
         return PreparedComparison(None, None, tolerance, cuda_graph=False, device_type="cpu",
             native_comparison=measure,
-            note="MLU CNRT notifier timing; original native source is a numerical reference; no cross-device latency ratio")
+            note="MLU CNRT notifier timing; supplied tensor shapes and element strides specialize the compiled variant; "
+                 "original native source is a numerical reference; no cross-device latency ratio")
