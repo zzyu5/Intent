@@ -131,9 +131,11 @@ def erf(x):
     value = small
     if ct.max(ct.astype(magnitude >= 0.84375, ct.int32)) != 0:
         near = _erf_near_one(ct.minimum(ct.maximum(magnitude, 0.84375), 1.25))
-        tail = _erfc_tail(ct.minimum(ct.maximum(magnitude, 1.25), 4.0))
-        value = ct.where(magnitude < 0.84375, small,
-                         ct.where(magnitude < 1.25, near, 1.0 - tail))
+        value = ct.where(magnitude < 0.84375, small, near)
+        needs_tail = (magnitude >= 1.25) & (magnitude < 4.0)
+        if ct.max(ct.astype(needs_tail, ct.int32)) != 0:
+            tail = _erfc_tail(ct.minimum(ct.maximum(magnitude, 1.25), 4.0))
+            value = ct.where(needs_tail, 1.0 - tail, value)
     value = ct.where(magnitude >= 4.0, 1.0, value)
     value = ct.where(wide < 0.0, -value, value)
     value = ct.where((wide == 0.0) | ct.isnan(wide), wide, value)
@@ -150,18 +152,22 @@ def erfc(x):
                      1.0 - (small_x + correction),
                      0.5 - ((small_x - 0.5) + correction))
     small = ct.where(magnitude < 2.0 ** -24, 1.0 - wide, small)
-    near_ratio = _erf_near_one_ratio(
-        ct.minimum(ct.maximum(magnitude, 0.84375), 1.25))
-    near = ct.where(wide < 0.0,
-                    1.0 + (8.42697144e-01 + near_ratio),
-                    (1.0 - 8.42697144e-01) - near_ratio)
-    # erfc evaluates the positive tail directly. Unlike erf, it must retain
-    # subnormal results beyond x=4; fdlibm's f32 tail interval extends to 11.
-    tail = _erfc_tail(ct.minimum(ct.maximum(magnitude, 1.25), 11.0))
-    tail = ct.where(magnitude >= 11.0, 0.0, tail)
-    tail = ct.where(wide < 0.0, 2.0 - tail, tail)
-    value = ct.where(magnitude < 0.84375, small,
-                     ct.where(magnitude < 1.25, near, tail))
+    value = small
+    if ct.max(ct.astype(magnitude >= 0.84375, ct.int32)) != 0:
+        near_ratio = _erf_near_one_ratio(
+            ct.minimum(ct.maximum(magnitude, 0.84375), 1.25))
+        near = ct.where(wide < 0.0,
+                        1.0 + (8.42697144e-01 + near_ratio),
+                        (1.0 - 8.42697144e-01) - near_ratio)
+        value = ct.where(magnitude < 0.84375, small, near)
+        # Evaluate the tail directly to retain erfc's subnormal results.
+        needs_tail = (magnitude >= 1.25) & (magnitude < 11.0)
+        if ct.max(ct.astype(needs_tail, ct.int32)) != 0:
+            tail = _erfc_tail(ct.minimum(ct.maximum(magnitude, 1.25), 11.0))
+            tail = ct.where(wide < 0.0, 2.0 - tail, tail)
+            value = ct.where(needs_tail, tail, value)
+    limit = ct.where(wide < 0.0, ct.float32(2.0), ct.float32(0.0))
+    value = ct.where(magnitude >= 11.0, limit, value)
     value = ct.where(ct.isnan(wide), wide, value)
     return ct.astype(ct.astype(value, ct.float32), x.dtype)
 
