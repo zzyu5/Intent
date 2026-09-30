@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import subprocess
 import json
+import os
 from pathlib import Path
+import shutil
 import tempfile
 
 from .cache import _compilation_key, compilation_directory
@@ -27,6 +29,25 @@ _STAGE_BY_EXIT_CODE = {
 }
 
 
+def _resolve_compiler(executable_path: str | Path | None, role: str) -> Path:
+    selected = executable_path if executable_path is not None else os.environ.get("INTENT_COMPILER")
+    if selected is None:
+        bundled = Path(__file__).resolve().parents[1] / "_bin" / "intent-compile"
+        selected = bundled if bundled.exists() else shutil.which("intent-compile")
+    if selected is None:
+        raise CompilationStageError(
+            "compiler_invocation",
+            "intent-compile was not found. Install the IntentDSL package with its compiler, "
+            "or set INTENT_COMPILER / pass compiler= to a built intent-compile executable.",
+        )
+    executable = Path(selected).expanduser().resolve()
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise CompilationStageError(
+            "compiler_invocation", f"{role} is not an executable file: {executable}"
+        )
+    return executable
+
+
 def _outputs(directory: Path, *, shared: bool, role: str):
     paths = (directory / "kernel.mlir",) if shared else (
         directory / "kernel.source", directory / "kernel.mlir", directory / "artifact.json")
@@ -46,13 +67,9 @@ def _outputs(directory: Path, *, shared: bool, role: str):
                                     cache_directory=directory) from error
 
 
-def _compile(executable_path: str | Path, module_text: str,
+def _compile(executable_path: str | Path | None, module_text: str,
              options: tuple[str, ...], role: str, *, shared: bool):
-    executable = Path(executable_path).resolve()
-    if not executable.is_file():
-        raise CompilationStageError(
-            "compiler_invocation", f"{role} does not exist: {executable}"
-        )
+    executable = _resolve_compiler(executable_path, role)
     if shared:
         options = (*options, "--stop-after-shared")
     with compilation_directory(executable, module_text, options) as (directory, key):
@@ -100,13 +117,13 @@ def _compile(executable_path: str | Path, module_text: str,
         return result
 
 
-def run_compiler(executable_path: str | Path, module_text: str,
+def run_compiler(executable_path: str | Path | None, module_text: str,
                  options: tuple[str, ...], role: str) -> tuple[str, str, dict[str, object], Path]:
     return _compile(executable_path, module_text, options, role, shared=False)
 
 
 def run_shared_compiler(
-    executable_path: str | Path,
+    executable_path: str | Path | None,
     module_text: str,
     options: tuple[str, ...],
     role: str,

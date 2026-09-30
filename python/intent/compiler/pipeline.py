@@ -17,7 +17,7 @@ def compile(
     definition: KernelDefinition[object, object],
     *,
     target: Target,
-    compiler: str | Path,
+    compiler: str | Path | None = None,
     constexprs: dict[str, object] | None = None,
     tuning_config: str | Path | None = None,
 ) -> CompiledArtifact:
@@ -38,7 +38,7 @@ def generate(
     definition: KernelDefinition[object, object],
     *,
     target: SourceTarget,
-    compiler: str | Path,
+    compiler: str | Path | None = None,
     constexprs: dict[str, object] | None = None,
     tuning_config: str | Path | None = None,
 ) -> GeneratedProgram:
@@ -75,7 +75,7 @@ def compile_shared_gpu(
     definition: KernelDefinition[object, object],
     *,
     target: Target,
-    compiler: str | Path,
+    compiler: str | Path | None = None,
     constexprs: dict[str, object] | None = None,
     tuning_config: str | Path | None = None,
 ) -> str:

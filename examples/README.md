@@ -2,6 +2,8 @@
 
 `examples/kernels/` 只保存作者编写的目标无关算法，按 activation、contraction、normalization、streaming 等算法职责分类。编译器保持这些程序的类型、shape、数值和 effects；target 在编译调用中选择。
 
+安装后可运行 `python examples/softmax.py`，通过普通 `intent.compile` 与 PyTorch tensor 调用已有 softmax 算法。这个 host 示例直接复用 `kernels/` 中的定义；安装说明见 [README](../README.md)。
+
 执行、reference baseline、生产 registry、实验结果和 pass 对照在 [experiments/](../experiments/README.md)：
 
 - [GPU：Triton / cuTile，保留 TileLang](../experiments/gpu/README.md)

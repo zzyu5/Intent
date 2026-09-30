@@ -1,5 +1,5 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
-fused_softmax,8192x8192-fp16,0.173856,0.188184,0.923862,pass,
+fused_softmax,8192x8192-fp16,0.174792,0.186448,0.937484,pass,Installed wheel validation; default reduction_scan candidates plus num_ctas=2; SM12x filtering retained num_ctas=1 only.
 dense_gemm,M4096-N14336-K4096-fp16,2.095920,2.085224,1.005129,pass,
 grouped_gemm,E8-M1024-K4096-N14336-fp16,4.392760,4.608792,0.953126,pass,
 flash_attention_forward,B4-H32-S4096-D128-fp16-causal,2.645672,2.767648,0.955928,pass,同算法；CUDA graph 设备执行计时；source 额外写 f32 M 辅助结果。
