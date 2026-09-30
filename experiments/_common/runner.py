@@ -514,7 +514,7 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
                     target=arguments.target,
                     source_time_ms=saved_source_time(entry),
                     measure_source=source_rows is None,
-                )])
+                )], target=arguments.target)
         return
 
     rows = {
