@@ -7,6 +7,7 @@ import statistics
 import torch
 
 from .compilation import SCALAR_CTYPES, compile_library
+from ..cpu import CPUInterface, ViewFacts, ViewParameter
 
 
 _winners: dict[tuple[object, ...], dict[tuple[object, ...], int]] = {}
@@ -18,18 +19,6 @@ _DTYPES = {
     "ui8": torch.uint8, "ui16": torch.uint16, "ui32": torch.uint32, "ui64": torch.uint64,
     "f8e4m3fn": torch.float8_e4m3fn, "f8e5m2": torch.float8_e5m2,
 }
-
-
-@dataclass(slots=True)
-class _View:
-    shape: tuple[int, ...]
-    strides: tuple[int, ...]
-    pointer: int
-    allocation: int
-    offset: int
-    dtype: torch.dtype
-    begin: int
-    end: int
 
 
 def _timing_samples(measure, arguments: tuple[object, ...], *, samples: int) -> float:
@@ -89,6 +78,12 @@ class NativeCall:
 class NativeProgram:
     def __init__(self, source: str, metadata: dict[str, object], target) -> None:
         self.parameters = metadata["parameters"]
+        self.interface = CPUInterface.read(self.parameters)
+        self._view_types = tuple(
+            (_DTYPES[parameter.dtype], tuple(self.parameters[parameter.position]["strides"]))
+            if isinstance(parameter, ViewParameter) else None
+            for parameter in self.interface.parameters
+        )
         self.candidates = metadata["candidates"]
         self.contiguous_views = metadata["contiguous_views"]
         if not metadata["disjoint_outputs"]:
@@ -114,31 +109,24 @@ class NativeProgram:
         self.winners = _winners.setdefault(self.compilation.identity, {})
         self.timings = _candidate_timings.setdefault(self.compilation.identity, {})
 
-    def _view(self, parameter, tensor, dimensions: dict[int, int]) -> _View:
-        dtype = _DTYPES[parameter["dtype"]]
+    def _view(self, parameter: ViewParameter, tensor) -> ViewFacts:
+        dtype, stride_constraints = self._view_types[parameter.position]
         if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu" or tensor.dtype != dtype:
-            raise ValueError(f"{parameter['name']} must be a CPU {parameter['dtype']} tensor")
+            raise ValueError(f"{parameter.name} must be a CPU {parameter.dtype} tensor")
         if tensor.numel() == 0:
             raise NotImplementedError("Mojo CPU empty-storage pointer ABI is not implemented")
         shape, strides = tuple(tensor.shape), tuple(tensor.stride())
-        if len(shape) != len(parameter["shape"]):
-            raise ValueError(f"{parameter['name']} has an incompatible rank")
-        if self.contiguous_views or parameter["access"] != 0:
+        if len(shape) != len(parameter.shape):
+            raise ValueError(f"{parameter.name} has an incompatible rank")
+        if self.contiguous_views or parameter.access != 0:
             expected_stride = 1
             for extent, stride in zip(reversed(shape), reversed(strides)):
                 if stride != expected_stride:
                     raise NotImplementedError("Mojo CPU writable views require canonical contiguous strides")
                 expected_stride *= extent
-        for constraint, stride in zip(parameter["strides"], strides):
+        for constraint, stride in zip(stride_constraints, strides):
             if constraint is not None and constraint != stride:
-                raise ValueError(f"{parameter['name']} violates an author stride constraint")
-        for static, identity, extent in zip(parameter["shape"], parameter["dimensions"], shape):
-            if static >= 0 and static != extent:
-                raise ValueError(f"{parameter['name']} has an incompatible static extent")
-            if identity > 0 and identity in dimensions and dimensions[identity] != extent:
-                raise ValueError("CPU views disagree on a canonical dimension identity")
-            if identity > 0:
-                dimensions[identity] = extent
+                raise ValueError(f"{parameter.name} violates an author stride constraint")
         pointer = tensor.data_ptr()
         element_size = tensor.element_size()
         lower, upper = 0, 1
@@ -146,62 +134,21 @@ class NativeProgram:
             offset = (extent - 1) * stride
             lower += min(0, offset)
             upper += max(0, offset)
-        return _View(shape, strides, pointer, tensor.untyped_storage().data_ptr(),
-                     tensor.storage_offset(), dtype, pointer + lower * element_size,
-                     pointer + upper * element_size)
+        return ViewFacts(shape, strides, pointer, tensor.untyped_storage().data_ptr(),
+                         tensor.storage_offset(), dtype, pointer + lower * element_size,
+                         pointer + upper * element_size)
+
+    def _allocate_output(self, parameter: ViewParameter, shape: tuple[int, ...]):
+        dtype, _ = self._view_types[parameter.position]
+        return torch.empty(shape, dtype=dtype, device="cpu")
 
     def prepare(self, arguments: tuple[object, ...], *, explicit_outputs: bool = False) -> NativeCall:
-        expected = len(self.parameters) if explicit_outputs else sum(
-            parameter["kind"] != "view" or parameter["access"] != 1 for parameter in self.parameters)
-        if len(arguments) != expected:
-            raise TypeError(f"expected {expected} CPU artifact arguments, got {len(arguments)}")
-        dimensions: dict[int, int] = {}
-        supplied = iter(arguments)
-        all_arguments: list[object] = []
-        bindings: list[_View | None] = []
-        for parameter in self.parameters:
-            if parameter["kind"] == "view" and parameter["access"] == 1 and not explicit_outputs:
-                all_arguments.append(None)
-                bindings.append(None)
-                continue
-            value = next(supplied)
-            bindings.append(self._view(parameter, value, dimensions)
-                            if parameter["kind"] == "view" else None)
-            all_arguments.append(value)
-        outputs = []
-        for index, parameter in enumerate(self.parameters):
-            if parameter["kind"] != "view" or parameter["access"] == 0:
-                continue
-            if parameter["access"] == 1 and not explicit_outputs:
-                shape = tuple(static if static >= 0 else dimensions[identity]
-                              for static, identity in zip(parameter["shape"], parameter["dimensions"]))
-                all_arguments[index] = torch.empty(shape, dtype=_DTYPES[parameter["dtype"]], device="cpu")
-                bindings[index] = self._view(parameter, all_arguments[index], dimensions)
-            outputs.append(all_arguments[index])
-        views = [(parameter, view) for parameter, view in zip(self.parameters, bindings)
-                 if view is not None]
-        for index, (parameter, view) in enumerate(views):
-            for other_parameter, other in views[index + 1:]:
-                same_allocation = view.allocation == other.allocation
-                overlap = view.begin < other.end and other.begin < view.end
-                if overlap and (parameter["access"] != 0 or other_parameter["access"] != 0):
-                    raise NotImplementedError("Mojo CPU overlapping writable views are not implemented")
-                if same_allocation and (parameter["noalias"] or other_parameter["noalias"]):
-                    raise ValueError("CPU invocation violates an author noalias constraint")
-                if parameter["alias"] and parameter["alias"] == other_parameter["alias"] and not same_allocation:
-                    raise ValueError("CPU invocation violates an author allocation-alias constraint")
-        native: list[object] = []
-        key: list[object] = []
-        allocation_groups: dict[int, int] = {}
-        for parameter, value, view in zip(self.parameters, all_arguments, bindings):
-            if view is not None:
-                native.extend([view.pointer, *view.shape, *view.strides])
-                group = allocation_groups.setdefault(view.allocation, len(allocation_groups))
-                key.append((view.shape, view.strides, view.offset, view.dtype, group))
-            else:
-                native.append(value)
-                key.append(parameter["dtype"])
-        return NativeCall(self, tuple(all_arguments), tuple(native), tuple(outputs), tuple(key))
+        bound = self.interface.bind(
+            arguments, explicit_outputs=explicit_outputs, observe_view=self._view,
+            allocate_output=self._allocate_output, scalar_key_values=False,
+            view_dtype_before_offset=False,
+        )
+        return NativeCall(self, bound.arguments, bound.native_arguments, bound.outputs, bound.key)
 
     def run(self, *arguments):
         call = self.prepare(arguments)

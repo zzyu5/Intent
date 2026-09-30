@@ -13,6 +13,7 @@ import sys
 from .buffer import Buffer
 from .compilation import validate_artifact
 from .target import TargetProfile, matrix_capability
+from ..cpu import CPUInterface, ViewFacts, ViewParameter
 
 
 def _isa_extensions(isa: str) -> set[str]:
@@ -26,45 +27,71 @@ def _isa_extensions(isa: str) -> set[str]:
     return result
 
 
-def _check_execution(profile: TargetProfile, used_extensions: frozenset[str], library=None) -> None:
-    if sys.platform != "linux" or platform.machine() != "riscv64" or sys.byteorder != "little":
-        raise NotImplementedError("Weft native loading requires little-endian RISC-V Linux")
-    if ctypes.sizeof(ctypes.c_void_p) != 8:
-        raise ValueError("native pointer size disagrees with RV64/lp64d")
-    stack, _ = resource.getrlimit(resource.RLIMIT_STACK)
-    if stack != resource.RLIM_INFINITY and profile.private_stack_bytes >= stack:
-        raise ValueError("artifact private stack budget exceeds the native thread's stack limit")
-    cpus = os.sched_getaffinity(0)
-    if not cpus.issubset(profile.cpus):
-        raise ValueError("current CPU affinity exceeds the artifact execution set")
-    required = _isa_extensions(profile.march)
+def _cpu_facts() -> dict[int, dict[str, str]]:
     facts = {}
     for paragraph in Path("/proc/cpuinfo").read_text().split("\n\n"):
         fields = dict(line.split(":", 1) for line in paragraph.splitlines() if ":" in line)
         fields = {key.strip(): value.strip() for key, value in fields.items()}
         if "processor" in fields:
             facts[int(fields["processor"])] = fields
-    for cpu in cpus:
-        extensions = _isa_extensions(facts[cpu]["isa"])
-        missing = required - extensions
-        if missing:
-            raise ValueError(f"CPU {cpu} lacks requested ISA extensions: {sorted(missing)}")
-        for extension in used_extensions:
-            capability = matrix_capability(extension, profile.vlen_bits)
-            if (capability.isa_feature not in extensions or
-                    int(facts[cpu]["mvendorid"], 0) != capability.vendor_id or
-                    int(facts[cpu]["marchid"], 0) != capability.architecture_id):
-                raise ValueError(f"CPU {cpu} does not support the artifact's {extension} instructions")
-    libc = ctypes.CDLL(None, use_errno=True)
-    control = libc.prctl(ctypes.c_int(70), *(ctypes.c_ulong(0) for _ in range(4)))
-    if control < 0:
-        raise OSError(ctypes.get_errno(), "cannot query the calling thread's RVV state")
-    if control & 3 == 1:
-        raise ValueError("RVV is disabled for the calling thread")
-    if library is not None:
-        probe = library.intent_weft_vlen_bits
-        probe.restype = ctypes.c_int64
-        if probe() != profile.vlen_bits:
+    return facts
+
+
+class _ExecutionContract:
+    """Artifact-local hardware facts, with calling-thread state checked on use."""
+
+    def __init__(self, profile: TargetProfile, used_extensions: frozenset[str]) -> None:
+        if sys.platform != "linux" or platform.machine() != "riscv64" or sys.byteorder != "little":
+            raise NotImplementedError("Weft native loading requires little-endian RISC-V Linux")
+        if ctypes.sizeof(ctypes.c_void_p) != 8:
+            raise ValueError("native pointer size disagrees with RV64/lp64d")
+        self.profile = profile
+        self.required = _isa_extensions(profile.march)
+        self.capabilities = tuple((extension, matrix_capability(extension, profile.vlen_bits))
+                                  for extension in used_extensions)
+        self.facts = _cpu_facts()
+        self.validated_cpus: set[int] = set()
+        self.libc = ctypes.CDLL(None, use_errno=True)
+        self.prctl = self.libc.prctl
+        self.prctl.argtypes = [ctypes.c_int, *([ctypes.c_ulong] * 4)]
+        self.prctl.restype = ctypes.c_int
+        self.vlen_probe = None
+
+    def bind_library(self, library) -> None:
+        self.vlen_probe = library.intent_weft_vlen_bits
+        self.vlen_probe.argtypes = []
+        self.vlen_probe.restype = ctypes.c_int64
+
+    def check(self) -> None:
+        stack, _ = resource.getrlimit(resource.RLIMIT_STACK)
+        if stack != resource.RLIM_INFINITY and self.profile.private_stack_bytes >= stack:
+            raise ValueError("artifact private stack budget exceeds the native thread's stack limit")
+        cpus = os.sched_getaffinity(0)
+        if not cpus.issubset(self.profile.cpus):
+            raise ValueError("current CPU affinity exceeds the artifact execution set")
+        for cpu in cpus - self.validated_cpus:
+            # ISA and vendor identity belong to the CPU. A newly online CPU may
+            # be absent from the artifact's initial /proc/cpuinfo snapshot.
+            if cpu not in self.facts:
+                self.facts = _cpu_facts()
+            facts = self.facts[cpu]
+            extensions = _isa_extensions(facts["isa"])
+            missing = self.required - extensions
+            if missing:
+                raise ValueError(f"CPU {cpu} lacks requested ISA extensions: {sorted(missing)}")
+            for extension, capability in self.capabilities:
+                if (capability.isa_feature not in extensions or
+                        int(facts["mvendorid"], 0) != capability.vendor_id or
+                        int(facts["marchid"], 0) != capability.architecture_id):
+                    raise ValueError(f"CPU {cpu} does not support the artifact's {extension} instructions")
+            self.validated_cpus.add(cpu)
+        control = self.prctl(70, 0, 0, 0, 0)
+        if control < 0:
+            raise OSError(ctypes.get_errno(), "cannot query the calling thread's RVV state")
+        if control & 3 == 1:
+            raise ValueError("RVV is disabled for the calling thread")
+        # The calling thread may have migrated, so VLEN remains a live check.
+        if self.vlen_probe is not None and self.vlen_probe() != self.profile.vlen_bits:
             raise ValueError("native VLEN disagrees with the artifact")
 
 
@@ -136,6 +163,10 @@ class NativeProgram:
         self.profile = TargetProfile(**manifest["profile"])
         self.metadata = manifest["program"]
         self.parameters = self.metadata["parameters"]
+        self.interface = CPUInterface.read(self.parameters)
+        self._alignments = tuple(self.parameters[parameter.position]["alignment"]
+                                 if isinstance(parameter, ViewParameter) else None
+                                 for parameter in self.interface.parameters)
         self.candidates = self.metadata["candidates"]
         kernels = {kernel["symbol"]: kernel for kernel in manifest["weft"]["kernels"]}
         self.candidate_extensions = tuple(frozenset(
@@ -144,8 +175,10 @@ class NativeProgram:
             for candidate in self.candidates)
         self.used_extensions = frozenset(extension for kernel in manifest["weft"]["kernels"]
                                          for extension in kernel["used_extensions"])
-        _check_execution(self.profile, self.used_extensions)
+        self._execution = _ExecutionContract(self.profile, self.used_extensions)
+        self._execution.check()
         self.library = ctypes.CDLL(str(self.directory / "kernel.so"))
+        self._execution.bind_library(self.library)
         self.check_execution()
         self.identity = (manifest_text, (self.directory / "kernel.so").stat().st_mtime_ns)
         types = []
@@ -166,71 +199,33 @@ class NativeProgram:
     def check_execution(self) -> None:
         if self.library is None:
             raise RuntimeError("native artifact is closed")
-        _check_execution(self.profile, self.used_extensions, self.library)
+        self._execution.check()
 
-    def _view(self, parameter, value, dimensions: dict[int, int]) -> None:
-        if not isinstance(value, Buffer) or value.dtype != parameter["dtype"]:
-            raise TypeError(f"{parameter['name']} requires a native {parameter['dtype']} Buffer")
-        if len(value.shape) != len(parameter["shape"]):
+    def _view(self, parameter: ViewParameter, value) -> ViewFacts:
+        if not isinstance(value, Buffer) or value.dtype != parameter.dtype:
+            raise TypeError(f"{parameter.name} requires a native {parameter.dtype} Buffer")
+        if len(value.shape) != len(parameter.shape):
             raise ValueError("native view rank disagrees with the compiler ABI")
-        if value.pointer % parameter["alignment"]:
+        if value.pointer % self._alignments[parameter.position]:
             raise ValueError("native view does not meet the compiler alignment requirement")
-        for extent, static, identity in zip(value.shape, parameter["shape"], parameter["dimensions"]):
-            if static >= 0 and static != extent:
-                raise ValueError("native view has an incompatible static extent")
-            if identity > 0:
-                if identity in dimensions and dimensions[identity] != extent:
-                    raise ValueError("native views disagree on a canonical dimension identity")
-                dimensions[identity] = extent
+        return ViewFacts(value.shape, value.strides, value.pointer, value.allocation,
+                         value.pointer - value.allocation, value.dtype,
+                         value.pointer, value.pointer + value.nbytes)
+
+    def _allocate_output(self, parameter: ViewParameter, shape: tuple[int, ...]) -> Buffer:
+        return Buffer.empty(shape, parameter.dtype)
 
     def prepare(self, arguments: tuple, *, explicit_outputs: bool = False) -> NativeCall:
-        expected = len(self.parameters) if explicit_outputs else sum(
-            p["kind"] != "view" or p["access"] != 1 for p in self.parameters)
-        if len(arguments) != expected:
-            raise TypeError(f"expected {expected} native arguments, got {len(arguments)}")
-        supplied, dimensions, values = iter(arguments), {}, []
-        for parameter in self.parameters:
-            if not explicit_outputs and parameter["kind"] == "view" and parameter["access"] == 1:
-                values.append(None)
-                continue
-            value = next(supplied)
-            if parameter["kind"] == "view":
-                self._view(parameter, value, dimensions)
-            values.append(value)
-        outputs = []
-        for index, parameter in enumerate(self.parameters):
-            if parameter["kind"] != "view" or parameter["access"] == 0:
-                continue
-            if not explicit_outputs and parameter["access"] == 1:
-                shape = tuple(static if static >= 0 else dimensions[identity]
-                              for static, identity in zip(parameter["shape"], parameter["dimensions"]))
-                values[index] = Buffer.empty(shape, parameter["dtype"])
-                self._view(parameter, values[index], dimensions)
-            outputs.append(values[index])
-        views = [(p, v) for p, v in zip(self.parameters, values) if p["kind"] == "view"]
-        for i, (parameter, value) in enumerate(views):
-            for other_parameter, other in views[i + 1:]:
-                overlap = value.pointer < other.pointer + other.nbytes and other.pointer < value.pointer + value.nbytes
-                same_allocation = value.allocation == other.allocation
-                if overlap and (parameter["access"] != 0 or other_parameter["access"] != 0):
-                    raise NotImplementedError("overlapping writable native views are not implemented")
-                if same_allocation and (parameter["noalias"] or other_parameter["noalias"]):
-                    raise ValueError("native invocation violates an author noalias constraint")
-                if parameter["alias"] and parameter["alias"] == other_parameter["alias"] and not same_allocation:
-                    raise ValueError("native invocation violates an author allocation-alias constraint")
-        native, facts, groups = [], [], {}
-        for parameter, value in zip(self.parameters, values):
-            if parameter["kind"] == "view":
-                native.extend((value.pointer, *value.shape, *value.strides))
-                group = groups.setdefault(value.allocation, len(groups))
-                facts.append((value.shape, value.strides, value.dtype, value.pointer - value.allocation, group))
-            else:
-                native.append(value)
-                facts.append((parameter["dtype"], value))
-        snapshots = tuple((value, bytes(value.storage)) for parameter, value in zip(self.parameters, values)
-                          if parameter["kind"] == "view" and parameter["access"] == 2)
-        return NativeCall(self, tuple(values), tuple(native), tuple(outputs),
-                          (self.identity, tuple(facts)), snapshots)
+        bound = self.interface.bind(
+            arguments, explicit_outputs=explicit_outputs, observe_view=self._view,
+            allocate_output=self._allocate_output, scalar_key_values=True,
+            view_dtype_before_offset=True,
+        )
+        snapshots = tuple((bound.arguments[parameter.position],
+                           bytes(bound.arguments[parameter.position].storage))
+                          for parameter in self.interface.mutable_inputs)
+        return NativeCall(self, bound.arguments, bound.native_arguments, bound.outputs,
+                          (self.identity, bound.key), snapshots)
 
     def run(self, *arguments):
         call = self.prepare(arguments)
@@ -245,5 +240,6 @@ class NativeProgram:
         if self.library is not None:
             self.functions.clear()
             self.measurements.clear()
+            self._execution.vlen_probe = None
             _ctypes.dlclose(self.library._handle)
             self.library = None
