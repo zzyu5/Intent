@@ -3705,12 +3705,8 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
   };
   WalkResult result = kernel.walk([&](Operation *operation) {
     if (auto unary = dyn_cast<gpu::UnaryOp>(operation);
-        unary && unary.getOperatorKind() == UnaryOperator::Asin) {
-      unary.emitOpError("asin is unsupported by the cuTile provider");
-      return WalkResult::interrupt();
-    }
-    if (auto unary = dyn_cast<gpu::UnaryOp>(operation);
-        unary && (unary.getOperatorKind() == UnaryOperator::Erf ||
+        unary && (unary.getOperatorKind() == UnaryOperator::Asin ||
+                  unary.getOperatorKind() == UnaryOperator::Erf ||
                   unary.getOperatorKind() == UnaryOperator::Erfc ||
                   unary.getOperatorKind() == UnaryOperator::I0 ||
                   unary.getOperatorKind() == UnaryOperator::Lgamma ||

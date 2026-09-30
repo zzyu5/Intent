@@ -1,6 +1,7 @@
 """Tile implementations of ordinary floating-point library operations."""
 
-# The erf/erfc/lgamma rational coefficients and intervals are from fdlibm:
+# The asin/erf/erfc/lgamma rational coefficients and intervals are from fdlibm:
+# https://github.com/JuliaMath/openlibm/blob/master/src/e_asinf.c
 # https://github.com/JuliaMath/openlibm/blob/master/src/s_erff.c
 # https://github.com/JuliaMath/openlibm/blob/master/src/s_erf.c
 # https://github.com/JuliaMath/openlibm/blob/master/src/e_lgammaf_r.c
@@ -11,6 +12,33 @@
 # granted, provided that this notice is preserved.
 
 import cuda.tile as ct
+
+
+@ct.function
+def asin(x):
+    ordinary = ct.astype(x, ct.float32)
+    magnitude = ct.abs(ordinary)
+    small = magnitude < 0.5
+    reduced = ct.where(small, ordinary * ordinary,
+                       (1.0 - ct.minimum(magnitude, 1.0)) * 0.5)
+    numerator = reduced * (1.6666586697e-01 + reduced * (
+        -4.2743422091e-02 + reduced * -8.6563630030e-03))
+    denominator = 1.0 + reduced * -7.0662963390e-01
+    correction = ct.truediv(numerator, denominator,
+                            rounding_mode=ct.RoundingMode.RN)
+    near_zero = ordinary + ordinary * correction
+    # fdlibm evaluates the square root and endpoint subtraction in double.
+    root = ct.sqrt(ct.astype(reduced, ct.float64),
+                   rounding_mode=ct.RoundingMode.RN)
+    near_one = ct.astype(ct.float64(1.570796326794896558) -
+                         2.0 * (root + root * ct.astype(correction, ct.float64)),
+                         ct.float32)
+    near_one = ct.where(ordinary < 0.0, -near_one, near_one)
+    value = ct.where(small, near_zero, near_one)
+    value = ct.where(magnitude > 1.0, float("nan"), value)
+    value = ct.where((magnitude < 2.0 ** -12) | ct.isnan(ordinary),
+                     ordinary, value)
+    return ct.astype(value, x.dtype)
 
 
 @ct.function

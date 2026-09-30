@@ -362,7 +362,8 @@ private:
   void emitPreamble() {
     bool libraryMath = false;
     kernel.walk([&](gpu::UnaryOp unary) {
-      libraryMath |= unary.getOperatorKind() == UnaryOperator::Erf ||
+      libraryMath |= unary.getOperatorKind() == UnaryOperator::Asin ||
+                     unary.getOperatorKind() == UnaryOperator::Erf ||
                      unary.getOperatorKind() == UnaryOperator::Erfc ||
                      unary.getOperatorKind() == UnaryOperator::I0 ||
                      unary.getOperatorKind() == UnaryOperator::Lgamma ||
@@ -1399,10 +1400,7 @@ private:
     case UnaryOperator::Lgamma: return call("cutile_math.lgamma");
     case UnaryOperator::Erfc: return call("cutile_math.erfc");
     case UnaryOperator::I0: return call("cutile_math.i0");
-    case UnaryOperator::Asin:
-      unary.emitOpError("asin is unsupported by the cuTile provider");
-      failed = true;
-      return "<unsupported-asin>";
+    case UnaryOperator::Asin: return call("cutile_math.asin");
     }
     llvm_unreachable("unhandled Intent unary operator");
   }
