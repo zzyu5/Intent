@@ -5,6 +5,7 @@
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Target/CuTile/Analysis/Tuning.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -728,8 +729,14 @@ private:
     for (const ViewABI &view : views)
       key += view.name + ".shape, " + view.name + ".stride(), " +
              view.name + ".dtype, " + view.name + ".device, ";
+    llvm::SmallBitVector scalarKeyArguments = getTuningKeyScalarArguments(kernel);
     for (const ScalarABI &scalar : scalars)
-      key += scalar.name + ", ";
+      if (scalarKeyArguments.test(scalar.argument))
+        key += scalar.name + ", ";
+    for (const auto &[parameter, coverage] : fullCoverageParameters)
+      key += parameter + ", ";
+    for (const ArrayViewABI &view : arrayViews)
+      key += view.eligible + ", ";
     for (gpu::ViewOverlapOp overlap : overlapFacts)
       key += valueString(overlap.getResult()) + ", ";
     line(key + ")", 1);

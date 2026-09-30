@@ -8,5 +8,6 @@ add_mlir_library(MLIRIntentCuTileSerialization
   MLIRIR
   MLIRSCFDialect
   MLIRIntentCuTileDialect
+  MLIRIntentCuTileAnalysis
   MLIRIntentGPUDialect
 )
