@@ -1507,6 +1507,71 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
       return failure();
     }
   }
+  if (auto contract = dyn_cast<ContractOp>(producer)) {
+    auto requested = queryFragmentAxis(value.getType(), source);
+    std::optional<unsigned> pairedAxis;
+    unsigned resultAxis = 0;
+    for (unsigned axis = 0;
+         requested.isExact() &&
+         axis < contract.getLhs().getType().getShape().size(); ++axis) {
+      if (llvm::is_contained(contract.getLhsReductionAxes(),
+                             static_cast<int64_t>(axis)))
+        continue;
+      if (resultAxis++ != requested.fragmentAxis)
+        continue;
+      auto pair = llvm::find(contract.getLhsBatchAxes(),
+                             static_cast<int64_t>(axis));
+      if (pair != contract.getLhsBatchAxes().end())
+        pairedAxis = std::distance(contract.getLhsBatchAxes().begin(), pair);
+      break;
+    }
+    if (requested.isExact() &&
+        llvm::is_contained(traversalDimensions, requested.dimensionId) &&
+        pairedAxis) {
+      // A batch result selects the same ordinal from both operand axes, even
+      // when their source identities differ. Preserve the selected tile's
+      // coordinates and validity through each operand's existing replay path.
+      unsigned batch = *pairedAxis;
+      SmallVector<unsigned> axes{
+          static_cast<unsigned>(contract.getLhsBatchAxes()[batch]),
+          static_cast<unsigned>(contract.getRhsBatchAxes()[batch]),
+          requested.fragmentAxis};
+      SmallVector<Value> operands;
+      for (auto [operand, axis] :
+           llvm::zip(contract->getOperands(), axes)) {
+        auto type = cast<FragmentType>(operand.getType());
+        auto relation = cast<AxisMapAttr>(type.getAxisMaps()[axis]);
+        auto inputSource = sourceAxisIdentity(relation);
+        auto inputAxis = queryFragmentAxis(type, inputSource,
+                                           relation.getDimensionId());
+        if (!inputAxis.isExact() || inputAxis.fragmentAxis != axis)
+          return contract.emitOpError(
+              "batch replay has no unique operand-axis relation");
+        SmallVector<int64_t> dimensions{relation.getDimensionId()};
+        // The same SSA value can occupy different paired roles. A replacement
+        // computed for one operand must not become the other operand's input.
+        IRMapping operandMapping;
+        auto replayed = replayPointwiseValue(
+            builder, operand, inputSource, dimensions, blockedExtent,
+            blockedRange, blockedValidity, insertionAnchor, operandMapping);
+        if (failed(replayed))
+          return failure();
+        auto expected = replaceTraversalExtent(
+            type, inputSource, dimensions, blockedExtent);
+        if ((*replayed).getType() != expected)
+          return contract.emitOpError(
+              "batch replay did not preserve the paired tile schema");
+        operands.push_back(*replayed);
+      }
+      IRMapping cloneMapping;
+      auto clone = cast<ContractOp>(builder.clone(*producer, cloneMapping));
+      clone->setOperands(operands);
+      clone.getResult().setType(cast<FragmentType>(replaceTraversalExtent(
+          value.getType(), source, traversalDimensions, blockedExtent)));
+      mapping.map(value, clone.getResult());
+      return clone.getResult();
+    }
+  }
   SmallVector<Value> replayOperands(producer->getOperands());
   if (isa<scf::IfOp, scf::ForOp>(producer)) {
     llvm::SetVector<Value> captures;
@@ -3435,12 +3500,12 @@ SmallVector<WorksetCoordinateOp> orthogonalContractCoordinates(
         firstSides.empty() ||
         !llvm::all_of(firstSides, [](const auto &entry) {
           auto contract = cast<ContractOp>(entry.first);
-          return contract.getLhs().getType().getShape().size() == 1 &&
-                 contract.getRhs().getType().getShape().size() == 1 &&
-                 contract.getResult().getType().getShape().empty() &&
+          return llvm::all_of(contract.getResult().getType().getShape(),
+                              isStaticUnitExtent) &&
                  contract.getLhsReductionAxes().size() == 1 &&
                  contract.getRhsReductionAxes().size() == 1 &&
-                 contract.getLhsBatchAxes().empty();
+                 contract.getLhsBatchAxes().empty() &&
+                 contract.getRhsBatchAxes().empty();
         }))
       continue;
     bool firstIsLhs = firstSides.begin()->second;
@@ -3818,14 +3883,55 @@ LogicalResult rankLiftPointwiseValueGraph(
             builder.getDenseI64ArrayAttr(
                 shiftedAxes(contract.getRhsBatchAxes())));
       }
-      Type target = liftedValueType(contract.getResult().getType());
+      auto prefixed = cast<FragmentType>(
+          liftedValueType(contract.getResult().getType()));
+      auto target = prefixed;
+      SmallVector<int64_t> permutation;
+      unsigned lhsFree = contract.getLhs().getType().getShape().size() -
+                         contract.getLhsReductionAxes().size();
+      if (rhs && lhsFree) {
+        // New RHS free axes follow existing LHS axes in a contract result.
+        // Other value nodes still consume the lifted execution prefix.
+        for (unsigned axis = 0; axis < lhsFree; ++axis)
+          permutation.push_back(liftedAxes.size() + axis);
+        for (unsigned axis = 0; axis < liftedAxes.size(); ++axis)
+          permutation.push_back(axis);
+        for (unsigned axis = lhsFree + liftedAxes.size();
+             axis < prefixed.getShape().size(); ++axis)
+          permutation.push_back(axis);
+        SmallVector<Attribute> shape, mappings;
+        for (auto [axis, original] : llvm::enumerate(permutation)) {
+          shape.push_back(prefixed.getShape()[original]);
+          auto mapping = cast<AxisMapAttr>(prefixed.getAxisMaps()[original]);
+          mappings.push_back(AxisMapAttr::get(
+              kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+              mapping.getDimensionId(), axis, mapping.getDerived()));
+        }
+        target = FragmentType::get(
+            kernel.getContext(), prefixed.getElementType(),
+            builder.getArrayAttr(shape), builder.getArrayAttr(mappings),
+            prefixed.getValidity(), prefixed.getOwner());
+      }
       FailureOr<Value> accumulator = projectPhysicalValueToSchema(
           builder, contract.getLoc(), contract.getAccumulator(), target);
       if (failed(accumulator))
         return WalkResult::interrupt();
       contract->setOperand(2, *accumulator);
-      contract.getResult().setType(cast<FragmentType>(target));
+      contract.getResult().setType(target);
       liftedValues.insert(contract.getResult());
+      if (!permutation.empty()) {
+        SmallVector<int64_t> inverse(permutation.size());
+        for (auto [axis, original] : llvm::enumerate(permutation))
+          inverse[original] = axis;
+        builder.setInsertionPointAfter(contract);
+        auto restored = builder.create<TransposeOp>(
+            contract.getLoc(), prefixed, contract.getResult(), inverse);
+        contract.getResult().replaceUsesWithIf(restored, [&](OpOperand &use) {
+          return use.getOwner() != restored.getOperation();
+        });
+        liftedOperations.insert(restored);
+        liftedValues.insert(restored.getResult());
+      }
       return WalkResult::advance();
     }
     if (auto reduce = dyn_cast<ReduceOp>(operation)) {
@@ -4062,14 +4168,32 @@ LogicalResult rankLiftPointwiseValueGraph(
           !scalarIntegerConstant(coordinate, 0))
         return gather.emitOpError(
             "rank-lifted unit gather selects a non-unit source axis");
-    FailureOr<ArrayAttr> reassociation =
-        inferReshapeReassociation(source, target);
-    if (failed(reassociation))
-      return gather.emitOpError(
-          "rank-lifted unit gather has no exact reshape projection");
     OpBuilder builder(gather);
+    SmallVector<Attribute> groups;
+    unsigned resultAxis = 0;
+    for (unsigned axis = 0; axis < source.getShape().size(); ++axis) {
+      SmallVector<int64_t> retained;
+      if (!llvm::is_contained(gather.getSourceAxes(),
+                             static_cast<int64_t>(axis))) {
+        auto sourceMap = cast<AxisMapAttr>(source.getAxisMaps()[axis]);
+        if (resultAxis >= target.getShape().size())
+          return gather.emitOpError("unit gather has too many retained axes");
+        auto targetMap = cast<AxisMapAttr>(target.getAxisMaps()[resultAxis]);
+        if (source.getShape()[axis] != target.getShape()[resultAxis] ||
+            !(sourceAxisIdentity(sourceMap) == sourceAxisIdentity(targetMap)) ||
+            sourceMap.getDimensionId() != targetMap.getDimensionId())
+          return gather.emitOpError(
+              "unit gather lost its retained-axis relation");
+        retained.push_back(resultAxis++);
+      }
+      groups.push_back(ReshapeGroupAttr::get(
+          kernel.getContext(), builder.getDenseI64ArrayAttr({axis}),
+          builder.getDenseI64ArrayAttr(retained)));
+    }
+    if (resultAxis != target.getShape().size())
+      return gather.emitOpError("unit gather has too few retained axes");
     Value replacement = builder.create<ReshapeOp>(
-        gather.getLoc(), target, gather.getSource(), *reassociation);
+        gather.getLoc(), target, gather.getSource(), builder.getArrayAttr(groups));
     if (gather.getValid() &&
         !scalarIntegerConstant(gather.getValid(), 1))
       replacement = builder.create<SelectOp>(

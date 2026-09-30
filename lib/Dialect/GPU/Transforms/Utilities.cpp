@@ -2032,13 +2032,9 @@ FailureOr<Value> materializeReplayedValue(
       SmallVector<std::pair<unsigned, unsigned>> freeAxes;
       auto lhsType = cast<FragmentType>(contract.getLhs().getType());
       auto rhsType = cast<FragmentType>(contract.getRhs().getType());
-      for (int64_t inputAxis : contract.getLhsBatchAxes())
-        freeAxes.emplace_back(0, inputAxis);
       for (unsigned inputAxis = 0; inputAxis < lhsType.getShape().size();
            ++inputAxis)
         if (!llvm::is_contained(contract.getLhsReductionAxes(),
-                               static_cast<int64_t>(inputAxis)) &&
-            !llvm::is_contained(contract.getLhsBatchAxes(),
                                static_cast<int64_t>(inputAxis)))
           freeAxes.emplace_back(0, inputAxis);
       for (unsigned inputAxis = 0; inputAxis < rhsType.getShape().size();

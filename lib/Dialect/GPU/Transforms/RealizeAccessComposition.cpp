@@ -1259,24 +1259,77 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
           continue;
         auto sourceAxis = queryFragmentAxis(sourceType, sourceAxisIdentity(range),
                                             *dimension);
+        if (!sourceAxis.isExact()) {
+          std::optional<unsigned> retainedAxis;
+          bool ambiguous = false;
+          for (unsigned axis = 0; axis < sourceType.getShape().size(); ++axis) {
+            if (llvm::is_contained(gather.getSourceAxes(),
+                                   static_cast<int64_t>(axis)))
+              continue;
+            auto retained = analysis.axisRanges(gather.getSource(), axis);
+            if (!retained.isExact() || !retained.blockers.empty() ||
+                !llvm::any_of(retained.roots, [&](MakeRangeOp root) {
+                  auto rootDimension = queryRangeDimension(root);
+                  return succeeded(rootDimension) && *rootDimension == *dimension &&
+                         sameLogicalRange(root, range) &&
+                         samePhysicalScalarExpression(root.getStart(),
+                                                      range.getStart()) &&
+                         samePhysicalScalarExpression(root.getExtent(),
+                                                      range.getExtent());
+                }))
+              continue;
+            if (retainedAxis) {
+              ambiguous = true;
+              break;
+            }
+            retainedAxis = axis;
+          }
+          if (retainedAxis && !ambiguous) {
+            auto retained =
+                cast<AxisMapAttr>(sourceType.getAxisMaps()[*retainedAxis]);
+            sourceAxis = queryFragmentAxis(
+                sourceType, sourceAxisIdentity(retained),
+                retained.getDimensionId());
+          }
+        }
         if (!sourceAxis.isExact() ||
             llvm::is_contained(gather.getSourceAxes(),
                                static_cast<int64_t>(sourceAxis.fragmentAxis)))
           continue;
-        auto axis = queryFragmentAxis(resultType, sourceAxisIdentity(range),
-                                      *dimension);
+        auto retainedMapping =
+            cast<AxisMapAttr>(sourceType.getAxisMaps()[sourceAxis.fragmentAxis]);
+        auto axis = queryFragmentAxis(resultType, sourceAxisIdentity(retainedMapping),
+                                      sourceAxis.dimensionId);
         auto rangeType = range.getResult().getType();
         if (!axis.isExact() ||
-            sourceAxis.dimensionId != *dimension ||
-            axis.dimensionId != *dimension ||
+            axis.dimensionId != sourceAxis.dimensionId ||
             resultType.getShape()[axis.fragmentAxis] != rangeType.getShape()[0])
           continue;
+        // Reshape can rename a retained coordinate axis. The exact range
+        // dependency above supplies its result position without changing the
+        // range's values or inventing an equality between unrelated axes.
+        auto namedType = FragmentType::get(
+            rangeType.getContext(), rangeType.getElementType(), rangeType.getShape(),
+            builder.getArrayAttr({AxisMapAttr::get(
+                rangeType.getContext(), retainedMapping.getSourceId(),
+                retainedMapping.getSourceAxis(), retainedMapping.getDimensionId(),
+                0, retainedMapping.getDerived())}),
+            rangeType.getValidity(), rangeType.getOwner());
+        Value retainedRange = range.getResult();
+        if (namedType != rangeType) {
+          auto relation = inferReshapeReassociation(rangeType, namedType);
+          if (failed(relation))
+            return gather.emitOpError(
+                "retained coordinate has no exact renamed-axis relation");
+          retainedRange = builder.create<ReshapeOp>(
+              gather.getLoc(), namedType, retainedRange, *relation);
+        }
         auto rangeTarget = FragmentType::get(
             resultType.getContext(), rangeType.getElementType(),
             resultType.getShape(), resultType.getAxisMaps(),
             resultType.getValidity(), resultType.getOwner());
         FailureOr<Value> projectedRange = projectPhysicalValueToSchema(
-            builder, gather.getLoc(), range.getResult(), rangeTarget);
+            builder, gather.getLoc(), retainedRange, rangeTarget);
         if (failed(projectedRange))
           return gather.emitOpError(
               "retained coordinate range cannot adopt the gather result relation");
