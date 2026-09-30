@@ -35,6 +35,7 @@ mlir::LogicalResult realizePointwiseOwnership(mlir::ModuleOp module);
 mlir::LogicalResult realizePointwiseBlocking(mlir::ModuleOp module);
 mlir::LogicalResult refineProgramMapping(mlir::ModuleOp module);
 mlir::LogicalResult eliminateCommonValues(mlir::ModuleOp module);
+mlir::LogicalResult simplifyRangePredicates(mlir::ModuleOp module);
 mlir::LogicalResult fuseIndependentReductions(mlir::ModuleOp module);
 mlir::LogicalResult fuseIndependentTraversals(mlir::ModuleOp module);
 mlir::LogicalResult completeGPUProgramConstruction(mlir::ModuleOp module);

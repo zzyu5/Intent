@@ -24,6 +24,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   RealizeReductionBlocking.cpp
   RefineProgramMapping.cpp
   EliminateCommonValues.cpp
+  SimplifyRangePredicates.cpp
   LowerWorkspace.cpp
   FuseIndependentTraversals.cpp
   MaterializeConfigTuples.cpp

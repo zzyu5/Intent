@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/IndexPredicates.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -353,6 +354,39 @@ bool capacityCoversResourceExtent(Value value, Value resource, unsigned axis) {
   return covered && covered == resourceExtentExpression(resource, axis);
 }
 
+bool expressionAtMost(PhysicalExprAttr lhs, PhysicalExprAttr rhs,
+                      unsigned depth = 0) {
+  if (!lhs || !rhs || depth >= 32)
+    return false;
+  if (lhs == rhs)
+    return true;
+  auto left = constantPhysicalExpression(lhs);
+  auto right = constantPhysicalExpression(rhs);
+  if (left && right)
+    return *left <= *right;
+  if (lhs.getOperands().size() == 2) {
+    auto first = cast<PhysicalExprAttr>(lhs.getOperands()[0]);
+    auto second = cast<PhysicalExprAttr>(lhs.getOperands()[1]);
+    if (lhs.getKind() == static_cast<uint32_t>(PhysicalExprKind::Minimum))
+      return expressionAtMost(first, rhs, depth + 1) ||
+             expressionAtMost(second, rhs, depth + 1);
+    if (lhs.getKind() == static_cast<uint32_t>(PhysicalExprKind::Maximum))
+      return expressionAtMost(first, rhs, depth + 1) &&
+             expressionAtMost(second, rhs, depth + 1);
+  }
+  if (rhs.getOperands().size() == 2) {
+    auto first = cast<PhysicalExprAttr>(rhs.getOperands()[0]);
+    auto second = cast<PhysicalExprAttr>(rhs.getOperands()[1]);
+    if (rhs.getKind() == static_cast<uint32_t>(PhysicalExprKind::Maximum))
+      return expressionAtMost(lhs, first, depth + 1) ||
+             expressionAtMost(lhs, second, depth + 1);
+    if (rhs.getKind() == static_cast<uint32_t>(PhysicalExprKind::Minimum))
+      return expressionAtMost(lhs, first, depth + 1) &&
+             expressionAtMost(lhs, second, depth + 1);
+  }
+  return false;
+}
+
 bool upperBoundWithinResource(Value value, Value resource, unsigned axis) {
   if (matchesResourceExtent(value, resource, axis))
     return true;
@@ -365,6 +399,8 @@ bool upperBoundWithinResource(Value value, Value resource, unsigned axis) {
   PhysicalExprAttr extent = resourceExtentExpression(resource, axis);
   if (!extent)
     return false;
+  if (provenBound && expressionAtMost(provenBound, extent))
+    return true;
   auto kind = static_cast<PhysicalExprKind>(extent.getKind());
   if (kind == PhysicalExprKind::Constant)
     return bound && *bound >= 0 && *bound <= extent.getValue();
@@ -631,6 +667,14 @@ bool derivesFromAccessCoordinate(Value value, Value coordinate) {
          sameScalarExpression(valueRange.getExtent(),
                               coordinateRange.getExtent()) &&
          sameScalarExpression(valueRange.getStep(), coordinateRange.getStep());
+}
+
+bool isInclusiveCoordinateUpperBound(Value value, Value coordinate) {
+  coordinate = stripBroadcast(coordinate);
+  if (!value.getType().isIndex() || !coordinate.getType().isIndex())
+    return false;
+  PhysicalExprAttr upper = queryNonNegativeIndexUpperBound(coordinate);
+  return upper && queryLaunchExpression(value) == upper;
 }
 
 bool valueKnownPositive(Value value, unsigned depth);
@@ -1132,6 +1176,15 @@ bool coordinateRangeWithinResource(Value coordinate, Value resource,
     return coordinateRangeWithinResource(reshape.getValue(), resource, axis);
   if (auto transpose = coordinate.getDefiningOp<TransposeOp>())
     return coordinateRangeWithinResource(transpose.getValue(), resource, axis);
+  if (PhysicalExprAttr upper = queryNonNegativeIndexUpperBound(coordinate)) {
+    auto maximum = constantPhysicalExpression(upper);
+    auto extent = constantPhysicalExpression(
+        resourceExtentExpression(resource, axis));
+    // Scalar loop coordinates remain bounded after a proven mask folds away.
+    // The query's bound is inclusive; the resource extent is exclusive.
+    if (maximum && extent && *maximum >= 0 && *maximum < *extent)
+      return true;
+  }
   if (auto subtract = coordinate.getDefiningOp<BinaryOp>();
       subtract && subtract.getOperatorKind() == BinaryOperator::Subtract) {
     auto range = stripIntegerIndexCasts(subtract.getLhs()).getDefiningOp<MakeRangeOp>();
@@ -1222,6 +1275,9 @@ bool coordinateRangeWithinResource(Value coordinate, Value resource,
     return false;
   if (integerConstant(range.getStart()) == 0 &&
       matchesResourceExtent(range.getExtent(), resource, axis))
+    return true;
+  if (Value limit = queryCompleteTileLimit(range);
+      limit && upperBoundWithinResource(limit, resource, axis))
     return true;
   PhysicalExprAttr resourceExtent = resourceExtentExpression(resource, axis);
   if (!resourceExtent ||
@@ -2276,8 +2332,18 @@ IndexBounds queryIndexBounds(Value value) {
           return bound(divisor, depth + 1).upper;
       return {};
     };
-    if (binary.getOperatorKind() == BinaryOperator::FloorDivide) {
-      PhysicalExprAttr divisor = positiveDivisor(binary.getRhs());
+    if (binary.getOperatorKind() == BinaryOperator::FloorDivide ||
+        binary.getOperatorKind() == BinaryOperator::RightShift) {
+      PhysicalExprAttr divisor;
+      if (binary.getOperatorKind() == BinaryOperator::FloorDivide) {
+        divisor = positiveDivisor(binary.getRhs());
+      } else if (auto shift = integerConstant(binary.getRhs());
+                 shift && *shift >= 0 && *shift < 63) {
+        // Power-of-two division canonicalization must preserve bounds used by
+        // native access forms. For a nonnegative index, arithmetic right shift
+        // has exactly the same inclusive upper bound as floor division.
+        divisor = expression(PhysicalExprKind::Constant, int64_t{1} << *shift);
+      }
       return {lhs.nonNegative && bool(divisor),
               lhs.upper && divisor
                   ? expression(PhysicalExprKind::FloorDiv, 0, {lhs.upper, divisor})
@@ -5137,6 +5203,36 @@ PhysicalProgramAnalysis::boundaryValidity(Operation *access,
       bool bitwiseI1 =
           conjunction.getOperatorKind() == BinaryOperator::BitwiseAnd &&
           element.isInteger(1);
+      bool disjunction =
+          conjunction.getOperatorKind() == BinaryOperator::LogicalOr ||
+          (conjunction.getOperatorKind() == BinaryOperator::BitwiseOr &&
+           element.isInteger(1));
+      if (disjunction) {
+        // Only this implication preserves the exact native boundary mask:
+        // (upper(coordinate) < bound) OR (coordinate < bound). Merely proving
+        // each arm safe would not make an arbitrary OR a conjunction of axes.
+        for (auto [directValue, proofValue] :
+             {std::pair{conjunction.getLhs(), conjunction.getRhs()},
+              std::pair{conjunction.getRhs(), conjunction.getLhs()}}) {
+          auto direct = directValue.getDefiningOp<CompareOp>();
+          auto proof = proofValue.getDefiningOp<CompareOp>();
+          if (!direct || !proof ||
+              direct.getPredicate() != ComparePredicate::Lt ||
+              proof.getPredicate() != ComparePredicate::Lt)
+            continue;
+          auto directLimit = queryLaunchExpression(direct.getRhs());
+          auto proofLimit = queryLaunchExpression(proof.getRhs());
+          if (!samePhysicalScalarExpression(direct.getRhs(), proof.getRhs()) &&
+              !(directLimit && proofLimit && directLimit == proofLimit))
+            continue;
+          for (Value coordinate : accessFact.coordinates)
+            if (derivesFromAccessCoordinate(direct.getLhs(), coordinate) &&
+                isInclusiveCoordinateUpperBound(proof.getLhs(), coordinate))
+              return analyze(directValue);
+        }
+        appendUnique(result.blockers, conjunction);
+        return PhysicalFactState::Unknown;
+      }
       if (!logical && !bitwiseI1) {
         appendUnique(result.blockers, conjunction);
         return PhysicalFactState::Unknown;
@@ -5359,6 +5455,28 @@ PhysicalProgramAnalysis::accessBounds(Operation *access) {
         bool rhsInactive = analyze(conjunction.getRhs());
         return lhsInactive || rhsInactive;
       }
+      bool disjunction =
+          conjunction.getOperatorKind() == BinaryOperator::LogicalOr ||
+          (conjunction.getOperatorKind() == BinaryOperator::BitwiseOr &&
+           element.isInteger(1));
+      if (disjunction) {
+        // Each active arm must establish a bound. Facts from an enclosing
+        // conjunction apply to both arms; facts discovered in one arm do not.
+        auto before = bounds;
+        bool lhsInactive = analyze(conjunction.getLhs());
+        auto left = bounds;
+        bounds = before;
+        bool rhsInactive = analyze(conjunction.getRhs());
+        for (unsigned axis = 0; axis < rank; ++axis) {
+          bounds[axis].lower = before[axis].lower ||
+              ((lhsInactive || left[axis].lower) &&
+               (rhsInactive || bounds[axis].lower));
+          bounds[axis].upper = before[axis].upper ||
+              ((lhsInactive || left[axis].upper) &&
+               (rhsInactive || bounds[axis].upper));
+        }
+        return lhsInactive && rhsInactive;
+      }
       return false;
     }
     auto comparison = value.getDefiningOp<CompareOp>();
@@ -5378,11 +5496,15 @@ PhysicalProgramAnalysis::accessBounds(Operation *access) {
            rhsCoordinate && integerConstant(comparison.getLhs()) == 0))
         bounds[sourceAxis].lower = true;
       if ((comparison.getPredicate() == ComparePredicate::Lt &&
-           lhsCoordinate && upperBoundWithinResource(
+           (lhsCoordinate || isInclusiveCoordinateUpperBound(
+                                 comparison.getLhs(), coordinate)) &&
+           upperBoundWithinResource(
                                 comparison.getRhs(), accessFact.resource,
                                 sourceAxis)) ||
           (comparison.getPredicate() == ComparePredicate::Gt &&
-           rhsCoordinate && upperBoundWithinResource(
+           (rhsCoordinate || isInclusiveCoordinateUpperBound(
+                                 comparison.getRhs(), coordinate)) &&
+           upperBoundWithinResource(
                                 comparison.getLhs(), accessFact.resource,
                                 sourceAxis)))
         bounds[sourceAxis].upper = true;

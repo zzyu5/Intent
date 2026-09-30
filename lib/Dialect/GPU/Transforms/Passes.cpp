@@ -257,6 +257,18 @@ public:
   }
 };
 
+class RangePredicatesPass : public PassWrapper<RangePredicatesPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RangePredicatesPass)
+  StringRef getArgument() const final { return "intent-gpu-simplify-range-predicates"; }
+  StringRef getDescription() const final { return "Remove predicates proven by complete physical tiles"; }
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(finishTransformation(module, getArgument(), simplifyRangePredicates(module))))
+      signalPassFailure();
+  }
+};
+
 class CommonValuesPass : public PassWrapper<CommonValuesPass, OperationPass<ModuleOp>> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CommonValuesPass)
@@ -286,6 +298,7 @@ void populateTransformations(OpPassManager &manager) {
   manager.addPass(std::make_unique<BufferVectorizationPass>());
   manager.addPass(std::make_unique<BufferPromotionPass>());
   manager.addPass(std::make_unique<ProgramMappingPass>());
+  manager.addPass(std::make_unique<RangePredicatesPass>());
   manager.addPass(std::make_unique<CommonValuesPass>());
 }
 
@@ -554,6 +567,7 @@ void registerGPUPasses() {
   PassRegistration<BufferVectorizationPass>();
   PassRegistration<BufferPromotionPass>();
   PassRegistration<ProgramMappingPass>();
+  PassRegistration<RangePredicatesPass>();
   PassRegistration<CommonValuesPass>();
 }
 
