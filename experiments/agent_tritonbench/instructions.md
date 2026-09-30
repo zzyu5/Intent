@@ -67,7 +67,9 @@ The following syntax distinctions apply throughout the language:
   index shape. Derive result axes before assigning or combining values.
 - I.reshape preserves row-major element order and changes shape grouping;
   I.transpose(value, permutation) changes axis order. They are distinct operations.
-- Reduction removes the reduced axes. Arg-reduce indices are local positions in
+- Reduction removes the reduced axes; reducing all axes returns a scalar, which
+  broadcasts directly. I.reshape requires a tensor input, not a scalar.
+  Arg-reduce indices are local positions in
   the value being reduced. Read the API's return schema before using the result.
 - Loop-carried values retain dtype, rank and logical shape. Initialize the actual
   state schema. A value used after a runtime if must be defined on every branch.
@@ -94,6 +96,8 @@ broadcasting, as in x[row_indices[:, None], column_indices[None, :]].
 Define device functions with @intent.kernel and helpers with @intent.fn. Kernel
 outputs are explicit I.Out/I.InOut parameters written by the kernel. Returning an
 I.buffer or adding a Python return annotation does not create a host output.
+Kernel views do not support Optional or a union with None. Optional host arguments
+must be handled by the author in the host callable and the chosen kernel interface.
 
 Use the unannotated signature def build(context):. The evaluator supplies context;
 it is not a type exported by intent. Inside build, call
