@@ -530,6 +530,20 @@ LogicalResult MMAOp::verify() {
   auto rhs = getRhs().getType();
   auto accumulator = getAccumulator().getType();
   auto result = getResult().getType();
+  if (auto chunkAttribute = getReductionChunkAttr()) {
+    int64_t chunk = chunkAttribute.getInt();
+    if (chunk <= 0 || (chunk & (chunk - 1)) != 0 ||
+        !lhs.getElementType().isF32() || !rhs.getElementType().isF32() ||
+        !accumulator.getElementType().isF32())
+      return emitOpError("chunked MMA requires f32 operands and a positive power-of-two reduction chunk");
+    if (!lhs.getShape().empty()) {
+      auto reduction = cast<gpu::PhysicalExprAttr>(lhs.getShape().getValue().back());
+      if (reduction.getKind() ==
+              static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+          (reduction.getValue() < chunk || reduction.getValue() % chunk != 0))
+        return emitOpError("MMA reduction extent must contain complete chunks");
+    }
+  }
   const unsigned rank = lhs.getShape().size();
   bool valid = rank >= 2 && rank <= 3 && rhs.getShape().size() == rank &&
                accumulator.getShape().size() == rank &&

@@ -369,6 +369,9 @@ private:
                      unary.getOperatorKind() == UnaryOperator::Lgamma ||
                      unary.getOperatorKind() == UnaryOperator::Log1p;
     });
+    kernel.walk([&](MMAOp mma) {
+      libraryMath |= mma.getReductionChunk().has_value();
+    });
     if (libraryMath)
       output << "from intent.runtime import cutile_math\n";
     if (!overlapFacts.empty())
@@ -1051,9 +1054,12 @@ private:
                                    : ", check_bounds=True)";
       assign(gather.getResult(), call);
     } else if (auto mma = dyn_cast<MMAOp>(operation)) {
-      assign(mma.getResult(), "ct.mma(" + valueString(mma.getLhs()) + ", " +
-                                   valueString(mma.getRhs()) + ", " +
-                                   valueString(mma.getAccumulator()) + ")");
+      std::string call = mma.getReductionChunk() ? "cutile_math.mma_chunks(" : "ct.mma(";
+      call += valueString(mma.getLhs()) + ", " + valueString(mma.getRhs()) +
+              ", " + valueString(mma.getAccumulator());
+      if (auto chunk = mma.getReductionChunk())
+        call += ", " + std::to_string(*chunk);
+      assign(mma.getResult(), call + ")");
     } else if (auto mma = dyn_cast<ScaledMMAOp>(operation)) {
       auto lhs = mma.getLhs().getType();
       auto rhs = mma.getRhs().getType();

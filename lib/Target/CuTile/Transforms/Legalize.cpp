@@ -2872,7 +2872,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
     };
     auto replacement = builder.create<MMAOp>(
         contract.getLoc(), contract.getResult().getType(), contract.getLhs(),
-        contract.getRhs(), contract.getAccumulator());
+        contract.getRhs(), contract.getAccumulator(), IntegerAttr());
     inheritOrigin(replacement);
     contract.getResult().replaceAllUsesWith(replacement.getResult());
     contract.erase();

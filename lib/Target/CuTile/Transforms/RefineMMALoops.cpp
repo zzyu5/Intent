@@ -164,6 +164,72 @@ void unswitchNativeAccessGuard(scf::ForOp loop) {
   loop.erase();
 }
 
+void boundNativeReductionWidth(MMAOp mma) {
+  constexpr int64_t nativeReductionLimit = 32;
+  constexpr int64_t reductionChunk = 16;
+  auto lhs = mma.getLhs().getType();
+  auto rhs = mma.getRhs().getType();
+  if (mma.getReductionChunk() || !lhs.getElementType().isF32() ||
+      !rhs.getElementType().isF32() ||
+      !mma.getResult().getType().getElementType().isF32())
+    return;
+  auto reduction = cast<gpu::PhysicalExprAttr>(lhs.getShape().getValue().back());
+  if (reduction.getKind() ==
+          static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+      (reduction.getValue() <= nativeReductionLimit ||
+       reduction.getValue() % reductionChunk != 0))
+    return;
+  OpBuilder builder(mma);
+  auto extent = [&](gpu::FragmentType type, unsigned axis) -> Value {
+    return builder.create<gpu::PhysicalExprOp>(
+        mma.getLoc(), builder.getIndexType(),
+        cast<gpu::PhysicalExprAttr>(type.getShape()[axis]));
+  };
+  unsigned matrixAxis = lhs.getShape().size() - 2;
+  Value m = extent(lhs, matrixAxis);
+  Value n = extent(rhs, matrixAxis + 1);
+  Value k = extent(lhs, matrixAxis + 1);
+  Value one = builder.create<arith::ConstantIndexOp>(mma.getLoc(), 1);
+  Value chunk = builder.create<arith::ConstantIndexOp>(mma.getLoc(), reductionChunk);
+  Value nativeWidth = builder.create<arith::ConstantIndexOp>(mma.getLoc(), nativeReductionLimit);
+  Value zero = builder.create<arith::ConstantIndexOp>(mma.getLoc(), 0);
+  Value minimum = builder.create<arith::ConstantIndexOp>(mma.getLoc(), 256);
+  auto compare = [&](Value left, Value right, ComparePredicate predicate) -> Value {
+    return builder.create<gpu::CompareOp>(mma.getLoc(), builder.getI1Type(),
+                                         left, right, predicate);
+  };
+  Value split = compare(k, nativeWidth, ComparePredicate::Gt);
+  auto require = [&](Value condition) {
+    split = builder.create<gpu::BinaryOp>(mma.getLoc(), builder.getI1Type(),
+        split, condition, BinaryOperator::LogicalAnd);
+  };
+  require(compare(m, one, ComparePredicate::Gt));
+  require(compare(n, one, ComparePredicate::Gt));
+  Value elements = builder.create<gpu::BinaryOp>(mma.getLoc(),
+      builder.getIndexType(), m, n, BinaryOperator::Multiply);
+  require(compare(elements, minimum, ComparePredicate::Ge));
+  Value remainder = builder.create<gpu::BinaryOp>(mma.getLoc(),
+      builder.getIndexType(), k, chunk, BinaryOperator::Remainder);
+  require(compare(remainder, zero, ComparePredicate::Eq));
+
+  // Keep the coalesced load tile while bounding live f32 MMA intermediates.
+  // Unit free axes and short K fragments retain the native reduction.
+  auto choice = builder.create<scf::IfOp>(
+      mma.getLoc(), TypeRange{mma.getResult().getType()}, split, true);
+  if (Attribute origin = mma->getAttr(gpu::originAttr))
+    choice->setAttr(gpu::originAttr, origin);
+  for (bool useChunks : {true, false}) {
+    Region &region = useChunks ? choice.getThenRegion() : choice.getElseRegion();
+    builder.setInsertionPointToStart(&region.front());
+    auto copy = cast<MMAOp>(builder.clone(*mma));
+    if (useChunks)
+      copy.setReductionChunkAttr(builder.getI64IntegerAttr(reductionChunk));
+    builder.create<scf::YieldOp>(mma.getLoc(), copy.getResult());
+  }
+  mma.getResult().replaceAllUsesWith(choice.getResult(0));
+  mma.erase();
+}
+
 } // namespace
 
 LogicalResult refineMMALoops(ModuleOp module) {
@@ -226,6 +292,10 @@ LogicalResult refineMMALoops(ModuleOp module) {
     if (hasMMA)
       unswitchNativeAccessGuard(loop);
   }
+  SmallVector<MMAOp> mmas;
+  physicalKernel->walk([&](MMAOp mma) { mmas.push_back(mma); });
+  for (MMAOp mma : mmas)
+    boundNativeReductionWidth(mma);
   gpu::eraseDeadPhysicalValues(*physicalKernel);
   return success();
 }

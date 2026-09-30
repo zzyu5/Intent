@@ -15,6 +15,24 @@ import cuda.tile as ct
 
 
 @ct.function
+def mma_chunks(lhs, rhs, accumulator, chunk: ct.Constant[int]):
+    ct.static_assert(chunk > 0 and lhs.shape[-1] >= chunk
+                     and lhs.shape[-1] % chunk == 0,
+                     "MMA reduction extent must contain complete chunks")
+    if len(lhs.shape) == 2:
+        for part in ct.static_iter(range(lhs.shape[-1] // chunk)):
+            left = ct.extract(lhs, (0, part), (lhs.shape[0], chunk))
+            right = ct.extract(rhs, (part, 0), (chunk, rhs.shape[1]))
+            accumulator = ct.mma(left, right, accumulator)
+    else:
+        for part in ct.static_iter(range(lhs.shape[-1] // chunk)):
+            left = ct.extract(lhs, (0, 0, part), (lhs.shape[0], lhs.shape[1], chunk))
+            right = ct.extract(rhs, (0, part, 0), (rhs.shape[0], chunk, rhs.shape[2]))
+            accumulator = ct.mma(left, right, accumulator)
+    return accumulator
+
+
+@ct.function
 def asin(x):
     ordinary = ct.astype(x, ct.float32)
     magnitude = ct.abs(ordinary)

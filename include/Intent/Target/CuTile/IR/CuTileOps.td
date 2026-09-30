@@ -137,7 +137,8 @@ def IntentCuTile_ExtractOp : IntentCuTile_Op<"extract", [Pure]> {
 def IntentCuTile_MMAOp : IntentCuTile_Op<"mma", [Pure]> {
   let arguments = (ins IntentGPU_FragmentValue:$lhs,
                        IntentGPU_FragmentValue:$rhs,
-                       IntentGPU_FragmentValue:$accumulator);
+                       IntentGPU_FragmentValue:$accumulator,
+                       OptionalAttr<I64Attr>:$reduction_chunk);
   let results = (outs IntentGPU_FragmentValue:$result);
   let hasVerifier = 1;
 }
