@@ -3835,12 +3835,17 @@ bool sinkReductionIntoSourceIf(ReduceOp reduce, func::FuncOp kernel) {
                                : sources.front().getDefiningOp<scf::IfOp>();
   if (!branch || branch.getElseRegion().empty() ||
       branch->getBlock() != reduce->getBlock() ||
-      branch.getNumResults() != reduce.getNumResults() ||
-      !llvm::equal(sources, branch.getResults()) ||
-      !llvm::all_of(branch.getResults(), [&](Value result) {
-        return result.hasOneUse() && *result.getUsers().begin() == reduce.getOperation();
-      }))
+      sources.size() != reduce.getNumResults())
     return false;
+  SmallVector<unsigned> resultIndices;
+  for (Value source : sources) {
+    auto result = dyn_cast<OpResult>(source);
+    if (!result || result.getOwner() != branch.getOperation() ||
+        !result.hasOneUse() ||
+        llvm::is_contained(resultIndices, result.getResultNumber()))
+      return false;
+    resultIndices.push_back(result.getResultNumber());
+  }
   DominanceInfo dominance(kernel);
   SmallVector<Operation *> identities;
   for (Value value : reduce.getInputs().drop_front(reduce.getSourceCount())) {
@@ -3863,14 +3868,18 @@ bool sinkReductionIntoSourceIf(ReduceOp reduce, func::FuncOp kernel) {
   // reduction consumes exactly that branch's yielded values before its exit.
   for (Region *region : {&branch.getThenRegion(), &branch.getElseRegion()}) {
     auto yield = cast<scf::YieldOp>(region->front().getTerminator());
+    SmallVector<Value> yielded(yield.getOperands());
     IRMapping mapping(captures);
-    for (auto [source, value] : llvm::zip(sources, yield.getOperands()))
-      mapping.map(source, value);
+    for (auto [source, index] : llvm::zip(sources, resultIndices))
+      mapping.map(source, yielded[index]);
     builder.setInsertionPoint(yield);
     auto reduced = cast<ReduceOp>(builder.clone(*reduce.getOperation(), mapping));
-    yield->setOperands(reduced.getResults());
+    for (auto [index, result] : llvm::zip(resultIndices, reduced.getResults()))
+      yielded[index] = result;
+    yield->setOperands(yielded);
   }
-  for (auto [result, reduced] : llvm::zip(branch.getResults(), reduce.getResults())) {
+  for (auto [index, reduced] : llvm::zip(resultIndices, reduce.getResults())) {
+    Value result = branch.getResult(index);
     result.setType(reduced.getType());
     reduced.replaceAllUsesWith(result);
   }
