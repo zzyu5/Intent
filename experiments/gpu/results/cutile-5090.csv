@@ -14,7 +14,7 @@ mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,0.919552,0.940328,0.977906,pass,�
 batched_gemm,B32-M512-N512-K1024-bf16,0.096032,0.091936,1.044553,pass,
 tilegym_dense_gemm,M8192-N11008-K4096-bf16,3.117816,3.205416,0.972671,pass,
 grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.783936,0.641248,1.222516,pass,同算法；source 使用 host group shapes
-moe_alignment,T4096-top2-E64,0.018400,0.036848,0.499349,pass,同算法计数/前缀和/散射；初始化与辅助输出计入调用
+moe_alignment,T4096-top2-E64,0.017872,0.036864,0.484809,pass,同算法计数/前缀和/散射；初始化与辅助输出计入调用
 mhc_gemm_rms_scale,T2048-H4096-streams4-bf16,0.063056,0.071680,0.879688,pass,同算法；source 用乘倒数实现归一化
 chunked_softmax,8192x32768-bf16,0.700224,0.849200,0.824569,pass,
 rope_qk,B2-S4096-QH32-KVH8-D128-bf16,0.113984,0.123120,0.925796,pass,同算法；source 保留 bf16 中间舍入
