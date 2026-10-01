@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
-from dataclasses import fields
+from dataclasses import fields, is_dataclass
 import inspect
 import json
 import math
@@ -86,10 +86,20 @@ def _corpus(documents_root: Path, package: Path, revision: str) -> dict:
         and getattr(targets, name) is getattr(intent, name)
     }
     exports.update({alias: exports[canonical] for alias, canonical in target_aliases.items()})
+    attribute_owners = {}
     for name, value in list(exports.items()):
         if inspect.isclass(value):
-            exports.update({f"{name}.{member}": method for member, method in vars(value).items()
-                            if inspect.isfunction(method) and (not member.startswith("_") or member == "__call__")})
+            members = {member: method for base in reversed(value.__mro__)
+                       for member, method in vars(base).items()}
+            exports.update({f"{name}.{member}": method for member, method in members.items()
+                            if (inspect.isfunction(method) or isinstance(method, property))
+                            and (not member.startswith("_") or member == "__call__")})
+            if is_dataclass(value):
+                for declaration in fields(value):
+                    if not declaration.name.startswith("_"):
+                        qualified = f"{name}.{declaration.name}"
+                        exports[qualified] = declaration
+                        attribute_owners[qualified] = value
         elif isinstance(value, QuantFormats):
             exports.update({f"{name}.{field.name}": getattr(value, field.name)
                             for field in fields(value) if not field.name.startswith("_")})
@@ -115,15 +125,32 @@ def _corpus(documents_root: Path, package: Path, revision: str) -> dict:
                       for identifier, entry in documents.items()}
     symbols = {}
     for name, value in exports.items():
+        declaration = value.fget if isinstance(value, property) else attribute_owners.get(name, value)
+        docstring = None
         if isinstance(value, (Intrinsic, IntrinsicNamespace)):
             signature = INTRINSIC_SIGNATURES.get(name)
             source = "python/intent/language/signatures.py" if signature else "python/intent/language/builtins.py"
+        elif name in attribute_owners:
+            signature = f"{name}: {value.type}"
+            source = "python/intent/" + Path(inspect.getfile(declaration)).resolve().relative_to(package).as_posix()
+            docstring = value.metadata.get("doc")
+        elif isinstance(value, property):
+            annotation = inspect.signature(declaration).return_annotation
+            signature = name if annotation is inspect.Signature.empty else f"{name}: {annotation}"
+            source = "python/intent/" + Path(inspect.getfile(declaration)).resolve().relative_to(package).as_posix()
+            docstring = inspect.getdoc(value)
         elif inspect.isfunction(value) or inspect.isclass(value):
             signature = inspect.signature(value) if inspect.isfunction(value) or inspect.isfunction(vars(value).get("__init__")) else None
             source = "python/intent/" + Path(inspect.getfile(value)).resolve().relative_to(package).as_posix()
+            if name.startswith("intent."):
+                docstring = inspect.getdoc(value)
         else:
             signature, source = None, "python/intent/language/__init__.py"
-        if isinstance(value, Intrinsic):
+        if name in attribute_owners:
+            kind = "host attribute"
+        elif isinstance(value, property):
+            kind = "host property"
+        elif isinstance(value, Intrinsic):
             kind = "kernel intrinsic"
         elif isinstance(value, IntrinsicNamespace):
             kind = "kernel intrinsic and namespace" if signature else "namespace"
@@ -152,6 +179,7 @@ def _corpus(documents_root: Path, package: Path, revision: str) -> dict:
             "declaration": source, "sections": references,
             "canonical": name,
             "members": list(value.members) if isinstance(value, IntrinsicNamespace) else [],
+            "docstring": docstring,
             "availability": "public declaration; backend support and performance are not implied",
         }
     for alias, canonical in target_aliases.items():
@@ -239,6 +267,8 @@ class Manual:
                 score = sum(16 if term == name.lower() else
                             4 if len(term) > 2 and term in name.lower() else 0
                             for term in api_terms)
+                documentation = (entry.get("docstring") or "").lower()
+                score += sum(1 for term in api_terms if len(term) > 2 and term in documentation)
                 if score:
                     if name.lower() in api_terms:
                         score += 1 / (1 + api_terms.index(name.lower()))
@@ -302,7 +332,8 @@ class Manual:
         rules = self._rules(name)
         return {"status": "declared", "revision": self.corpus["revision"],
                 **{key: value for key, value in entry.items() if key != "sections"},
-                "signature_note": None if entry["signature"] else "No inspectable signature is declared; consult the linked rules, not a guessed signature.",
+                "signature_note": "Instance attribute; read it without calling it." if entry["kind"] in {"host property", "host attribute"}
+                else None if entry["signature"] else "No inspectable signature is declared; consult the linked rules, not a guessed signature.",
                 "rules": [{**{field: rule[field]
                               for field in ("id", "title", "source", "line")},
                            "text": self._section_bodies[rule["id"]]}

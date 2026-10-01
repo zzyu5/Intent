@@ -17,14 +17,15 @@ The first public setup path is **Linux + NVIDIA + Triton**, using Python 3.10–
 From this checkout, with an LLVM build containing the completed `MLIRPythonModules` target:
 
 ```bash
-python3 environment/install_triton.py \
-  --venv .venv \
+python3 environment/install.py --backend triton \
+  --venv .venv-triton \
   --mlir-build /path/to/llvm-build
-source .venv/bin/activate
+source .venv-triton/bin/activate
+intent doctor --target triton
 python examples/softmax.py
 ```
 
-The installer installs the MLIR bindings, CUDA PyTorch, Triton, Intent's compiler and profiles, and the optional manual MCP. It does not require a project `PYTHONPATH`. Override `--mlir-dir` and `--llvm-dir` when the SDK is outside `/usr/lib/llvm-20`; use `--help` for the other installation options.
+The installer installs the MLIR bindings, CUDA PyTorch, Triton, Intent's compiler and profiles, and MCP dependencies. It does not require a project `PYTHONPATH`. The same installer provides a separate `--backend cutile` environment and explicit external-toolchain setup for Mojo, Weft, and BANG C. See the [backend setup table](environment/README.md#choose-a-backend). Override `--mlir-dir` and `--llvm-dir` when the SDK is outside `/usr/lib/llvm-20`.
 
 If the SDK, MLIR Python bindings, and backend dependencies are already installed in your environment:
 
@@ -79,9 +80,11 @@ print(y.shape, y.dtype, y.device)
 
 `intent.compile` creates a callable artifact. On first use, the provider compiles or loads its native specialization and selects a configuration. Calls with the same specialization reuse it; new shapes or other specialization inputs can trigger compilation or tuning again. Keep the artifact and call it from your ordinary Python wrapper. `artifact.run(...)` allocates declared `Out` tensors; `artifact(...)` accepts all runtime arguments, including outputs, in declaration order.
 
-The target is selected on the host. Changing it does not require a device branch in the kernel, but the selected backend must support the program's operations, types, and effects. cuTile, CPU, and MLU setup and existing execution coverage are described under [GPU](experiments/gpu/README.md), [CPU](experiments/cpu/README.md), and [MLU](experiments/mlu/README.md). TileLang retains its source corpus and previous results.
+The target is selected on the host. Changing it does not require a device branch in the kernel, but the selected backend must support the program's operations, types, and effects. In the cuTile environment, run `python examples/softmax.py --target cutile` to use the same definition. [Public host examples](examples/README.md) also show explicit forward/backward composition; [GPU](experiments/gpu/README.md), [CPU](experiments/cpu/README.md), and [MLU](experiments/mlu/README.md) retain the existing measured coverage. TileLang retains its source corpus and previous results.
 
-Current PyTorch support is eager tensor interoperability. A general `torch.compile`, FakeTensor, or autograd adapter is not provided; backward kernels and multi-kernel call order remain explicit author code.
+For GPU kernels with read-only `In` tensors, scalar inputs, and fresh `Out` tensors, `artifact.as_torch_op("your_project::name")` returns an opaque PyTorch custom operator with a FakeTensor implementation derived from its declared interface. The fake path does not run a provider or access tensor data. `InOut` and returned aliases are not supported by this adapter. Authors can register their own backward with the returned operator's `register_autograd`; Intent does not infer it.
+
+Run `python examples/softmax.py --target triton --torch-compile` for a complete `torch.compile(fullgraph=True)` call. The example first calls the same operator normally to complete provider compilation/tuning before graph capture. The operator remains opaque to PyTorch; its implementation is not fused into surrounding PyTorch operations.
 
 ## Use with an agent
 
@@ -100,7 +103,18 @@ The installed `intent-manual` command starts a read-only stdio MCP server. For c
 
 Start with `read(id="doc/dsl/authoring.md")`, then use `api(name="intent.compile")`, `api(name="I.matmul")`, or `search(query="region_fold")`. The manual ships with the package and needs neither a checkout nor an experiment-generated corpus. It provides declarations, language contracts, and small syntax fragments; complete algorithms live in the public examples. It does not execute code or certify numerical correctness.
 
+For an agent that should compile a user-supplied program, explicitly add a second server using `/absolute/path/to/.venv/bin/intent-compiler-mcp`. Its `compile` tool requires an existing `program_path`, `kernel`, and `target`. It uses the same public compiler pipeline as the CLI below; importing the file executes ordinary module-level Python. Kernel execution and numerical checks remain separate.
+
 ## Inspect and learn
+
+Generate compiler artifacts for an existing definition:
+
+```bash
+intent compile examples/kernels/normalization/softmax.py:stable_softmax_f16 \
+  --target triton --json
+```
+
+The result reports generated artifacts or the actual failure stage and diagnostic. `--materialize` additionally creates the callable; provider JIT or tuning may still be deferred until invocation. The tool does not launch the selected kernel, while module-level Python code executes normally. Use `--constexpr NAME=JSON` and `--target-option NAME=JSON` for existing public parameters. `intent doctor --target cutile --json` checks only the selected environment and target facts, without validating a kernel's results.
 
 - `artifact.source` contains the generated provider program; `artifact.mlir` contains the target IR. `artifact.cache_directory` locates compiler inputs, outputs, and diagnostics. `intent.generate(...)` emits source and IR without creating a callable.
 - `intent.CompilationStageError.stage` identifies the failed compilation stage. Its `cache_directory`, when available, points to the diagnostic artifacts.
