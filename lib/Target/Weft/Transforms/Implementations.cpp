@@ -6,6 +6,8 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/IRMapping.h"
+#include <optional>
+#include <string>
 
 using namespace mlir;
 namespace intent::weft_provider {
@@ -179,13 +181,19 @@ cpu::ImplementationRegistry implementations() {
     return quantize ? "weft.q8_k" : contraction ? "weft.contract_f32" : "weft.structured";
   };
   auto noParameters = [](Builder &b, const Configuration &) { return b.getDictionaryAttr({}); };
-  auto legal = [](Operation *, CapabilitiesAttr, const Configuration &) { return true; };
+  auto check = [](Operation *, CapabilitiesAttr, const Configuration &) -> std::optional<std::string> {
+    return std::nullopt;
+  };
   result.add({"weft.scalar_program", [](Operation *op) { return isa<func::FuncOp>(op); },
-      legal, noParameters, {}, {}});
+      check, noParameters, {}, {}});
   result.add({"weft.q8_k", [](Operation *op) { return isa<cpu::QuantizeOp>(op); },
-      [](Operation *, CapabilitiesAttr, const Configuration &config) {
-        return config.local.size() == 1 && config.local.get("chunk") &&
-            (config.parameter("chunk") == 32 || config.parameter("chunk") == 64);
+      [](Operation *, CapabilitiesAttr, const Configuration &config) -> std::optional<std::string> {
+        if (!config.local.get("chunk")) return "missing local parameter 'chunk'";
+        if (config.local.size() != 1) return "Q8_K quantization accepts only the local parameter 'chunk'";
+        int64_t chunk = config.parameter("chunk");
+        if (chunk != 32 && chunk != 64)
+          return "Q8_K quantization chunk must be 32 or 64, got " + std::to_string(chunk);
+        return std::nullopt;
       }, [](Builder &b, const Configuration &config) {
         return config.local;
       }, {}, [](OpBuilder &b, Operation *operation, ValueRange args, int64_t &nextAxis)
@@ -200,30 +208,42 @@ cpu::ImplementationRegistry implementations() {
         if (failed(value)) return failure();
         return SmallVector<Value>{*value};
       };
-  result.add({"weft.q4_k_q8_k_matrix", [](Operation *op) {
-        if (!isa<cpu::QuantizedDotOp>(op)) return false;
-        auto capabilities = op->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities");
-        return capabilities && capabilities.getMatrixI8I32();
-      }, [](Operation *, CapabilitiesAttr capabilities, const Configuration &) {
-        return capabilities.getMatrixI8I32() && capabilities.getVectorBits() == 256;
-      }, [](Builder &b, const Configuration &) {
+  auto checkMatrix = [](Operation *, CapabilitiesAttr capabilities, const Configuration &) -> std::optional<std::string> {
+    if (!capabilities.getMatrixI8I32()) return "target does not provide signed i8-to-i32 matrix operations";
+    if (capabilities.getVectorBits() != 256)
+      return "matrix implementation requires vector_bits=256, got " + std::to_string(capabilities.getVectorBits());
+    return std::nullopt;
+  };
+  result.add({"weft.q4_k_q8_k_matrix", [](Operation *op) { return isa<cpu::QuantizedDotOp>(op); },
+      checkMatrix, [](Builder &b, const Configuration &) {
         return b.getDictionaryAttr({b.getNamedAttr("columns", b.getI64IntegerAttr(4))});
       }, {}, quantizedDot, {}, [](ImplementationAttr binding) {
         return implementationParameter(binding, "columns");
       }, true});
   result.add({"weft.q4_k_q8_k", [](Operation *op) { return isa<cpu::QuantizedDotOp>(op); },
-      legal, noParameters, {}, quantizedDot});
+      check, noParameters, {}, quantizedDot});
   result.add({"weft.matrix_i8_i32", [](Operation *op) {
       auto generic = dyn_cast<linalg::GenericOp>(op);
       return generic && isMatrixContraction(generic) &&
           cast<MemRefType>(generic.getInputs()[0].getType()).getElementType().isSignlessInteger(8);
-    }, [](Operation *, CapabilitiesAttr capabilities, const Configuration &config) {
-      if (!capabilities.getMatrixI8I32() || capabilities.getVectorBits() != 256 ||
-          config.local.size() != 3 || !config.local.get("micro_m") ||
-          !config.local.get("micro_n") || !config.local.get("micro_k")) return false;
+    }, [checkMatrix](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) -> std::optional<std::string> {
+      if (auto reason = checkMatrix(op, capabilities, config)) return reason;
+      for (StringRef name : {"micro_m", "micro_n", "micro_k"})
+        if (!config.local.get(name)) return "missing local parameter '" + name.str() + "'";
+      if (config.local.size() != 3)
+        return "integer matrix implementation accepts only micro_m, micro_n and micro_k";
       int64_t m = config.parameter("micro_m"), n = config.parameter("micro_n");
-      return (m == 1 || m == 4) && (n == 4 || n == 16) && config.parameter("micro_k") == 8 &&
-          config.tileM % m == 0 && config.tileN % n == 0 && config.tileK % 8 == 0;
+      if (m != 1 && m != 4) return "micro_m must be 1 or 4, got " + std::to_string(m);
+      if (n != 4 && n != 16) return "micro_n must be 4 or 16, got " + std::to_string(n);
+      if (config.parameter("micro_k") != 8)
+        return "micro_k must be 8, got " + std::to_string(config.parameter("micro_k"));
+      if (config.tileM % m != 0)
+        return "tile_m " + std::to_string(config.tileM) + " must be divisible by micro_m " + std::to_string(m);
+      if (config.tileN % n != 0)
+        return "tile_n " + std::to_string(config.tileN) + " must be divisible by micro_n " + std::to_string(n);
+      if (config.tileK % 8 != 0)
+        return "tile_k " + std::to_string(config.tileK) + " must be divisible by micro_k 8";
+      return std::nullopt;
     }, [](Builder &, const Configuration &config) { return config.local; },
     formIntegerTile, {}, {true, true, true}, {}, true});
   result.add({"weft.contract_f32", [](Operation *op) {
@@ -232,7 +252,7 @@ cpu::ImplementationRegistry implementations() {
           cast<MemRefType>(generic.getInputs()[0].getType()).getElementType().isF32() &&
           cast<MemRefType>(generic.getInputs()[1].getType()).getElementType().isF32() &&
           cast<MemRefType>(generic.getOutputs()[0].getType()).getElementType().isF32();
-    }, legal, [](Builder &b, const Configuration &config) {
+    }, check, [](Builder &b, const Configuration &config) {
       // A 4x4 reduction-lane stream needs 16 accumulator groups plus its
       // stationary input panel and one streamed input, within RVV's 32 groups.
       return b.getDictionaryAttr({b.getNamedAttr("panel", b.getI64IntegerAttr(
@@ -241,7 +261,7 @@ cpu::ImplementationRegistry implementations() {
   result.add({"weft.structured", [](Operation *op) {
       if (auto generic = dyn_cast<linalg::GenericOp>(op)) return !isMatrixContraction(generic);
       return isa<cpu::ReduceOp, cpu::ScanOp, cpu::HistogramOp>(op);
-    }, legal, [](Builder &b, const Configuration &config) {
+    }, check, [](Builder &b, const Configuration &config) {
       return b.getDictionaryAttr({b.getNamedAttr("panel", b.getI64IntegerAttr(std::min<int64_t>(4, config.tileN)))});
     }, {}, {}, {}, [](ImplementationAttr binding) {
       return implementationParameter(binding, "panel");

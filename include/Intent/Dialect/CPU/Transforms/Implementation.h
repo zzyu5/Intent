@@ -6,9 +6,11 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include <array>
 #include <functional>
 #include <optional>
+#include <string>
 
 namespace intent::cpu {
 
@@ -25,6 +27,11 @@ struct InputRequirement {
   InputReuse reuse;
   int64_t windowAlignment; // Required panel-axis origin multiple for non-singleton windows.
 };
+
+std::optional<std::string> checkInputRequirement(
+    mlir::Value source, mlir::Value element, const InputRequirement &requirement);
+std::optional<std::string> checkInputRequirements(
+    mlir::linalg::GenericOp operation, llvm::ArrayRef<InputRequirement> requirements);
 
 struct InputSupply {
   unsigned operand;
@@ -53,7 +60,8 @@ struct ContractionRequirements {
 struct Implementation {
   llvm::StringRef name;
   std::function<bool(mlir::Operation *)> applicable;
-  std::function<bool(mlir::Operation *, CapabilitiesAttr, const Configuration &)> legal;
+  std::function<std::optional<std::string>(mlir::Operation *, CapabilitiesAttr,
+                                         const Configuration &)> check;
   std::function<mlir::DictionaryAttr(mlir::Builder &, const Configuration &)> parameters;
   std::function<mlir::LogicalResult(mlir::OpBuilder &, mlir::linalg::GenericOp,
       const ContractionTile &, ConfigurationAttr, ImplementationAttr)> formTile;
@@ -66,6 +74,12 @@ struct Implementation {
       ConfigurationAttr, ImplementationAttr)> inputs;
   // Leading parallel rows retained together inside one independent work item.
   std::function<int64_t(mlir::linalg::GenericOp, ImplementationAttr)> worksetRows;
+
+  // A read-only query of the selected implementation's surrounding supply.
+  // An empty result requires no preparation; it is not a performance estimate.
+  llvm::SmallVector<InputRequirement> inputRequirements(
+      mlir::linalg::GenericOp operation, ConfigurationAttr configuration,
+      ImplementationAttr binding) const;
 };
 
 class ImplementationRegistry {
@@ -79,7 +93,8 @@ public:
   mlir::FailureOr<const Implementation *> lookup(mlir::Operation *operation) const;
   llvm::SmallVector<llvm::SmallVector<ImplementationAttr>> candidates(
       mlir::func::FuncOp function, CapabilitiesAttr capabilities,
-      const Configuration &configuration) const;
+      const Configuration &configuration,
+      llvm::function_ref<void(mlir::Operation *, llvm::StringRef, llvm::StringRef)> rejected) const;
   mlir::LogicalResult bind(mlir::func::FuncOp function, CapabilitiesAttr capabilities,
                            const Configuration &configuration,
                            llvm::ArrayRef<ImplementationAttr> bindings) const;

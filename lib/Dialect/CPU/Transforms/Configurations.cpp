@@ -36,14 +36,28 @@ LogicalResult materializeCPUConfigurations(
     Configuration configuration;
     SmallVector<ImplementationAttr> bindings;
   };
+  struct Rejection {
+    Location location;
+    size_t row;
+    std::string operation, implementation, reason;
+  };
   SmallVector<Candidate> candidates;
-  for (const Configuration &configuration : rows) {
+  SmallVector<Rejection> rejections;
+  for (auto [row, configuration] : llvm::enumerate(rows)) {
+    auto rejected = [&](Operation *operation, StringRef implementation, StringRef reason) {
+      rejections.push_back({operation->getLoc(), row, operation->getName().getStringRef().str(),
+                            implementation.str(), reason.str()});
+    };
     if (!hasContraction && (configuration.tileM != 1 || configuration.tileN != 1 ||
-                            configuration.tileK != 1))
-      return original.emitError("M/N/K block parameters require a matrix contraction consumer; otherwise they must be 1");
-    if (!hasRegion && configuration.regionSize != 1)
-      return original.emitError("region size requires a region consumer; otherwise it must be 1");
-    for (auto bindings : implementations.candidates(original, capabilities, configuration)) {
+                            configuration.tileK != 1)) {
+      return original.emitError("M/N/K block parameters require a matrix contraction consumer; otherwise they must be 1")
+          << "; profile '" << family << "' row " << row + 1;
+    }
+    if (!hasRegion && configuration.regionSize != 1) {
+      return original.emitError("region size requires a region consumer; otherwise it must be 1")
+          << "; profile '" << family << "' row " << row + 1;
+    }
+    for (auto bindings : implementations.candidates(original, capabilities, configuration, rejected)) {
       if (llvm::any_of(candidates, [&](const Candidate &previous) {
             const auto &other = previous.configuration;
             return other.taskGrain == configuration.taskGrain &&
@@ -55,8 +69,22 @@ LogicalResult materializeCPUConfigurations(
       candidates.push_back({configuration, std::move(bindings)});
     }
   }
-  if (candidates.empty())
-    return original.emitError("no legal CPU candidates remain for family '") << family << "'";
+  if (candidates.empty()) {
+    auto diagnostic = original.emitError("no legal CPU candidates remain for family '");
+    diagnostic << family << "'";
+    for (const auto &rejection : rejections) {
+      const auto &configuration = rows[rejection.row];
+      auto &note = diagnostic.attachNote(rejection.location);
+      note << "profile '" << family << "' row " << rejection.row + 1 << " shared=["
+           << configuration.taskGrain << ", " << configuration.tileM << ", "
+           << configuration.tileN << ", " << configuration.tileK << ", "
+           << configuration.regionSize << "] local=" << configuration.local
+           << ", computation " << rejection.operation;
+      if (!rejection.implementation.empty()) note << ", implementation '" << rejection.implementation << "'";
+      note << ": " << rejection.reason;
+    }
+    return failure();
+  }
 
   // Keep profile order and the registry's correlated finite portfolio. Each
   // clone receives its complete executable binding before another group runs.

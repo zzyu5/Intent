@@ -13,28 +13,6 @@ using namespace mlir;
 namespace intent::cpu {
 namespace {
 
-LogicalResult validateRepresentation(Operation *operation, Value source, Value element,
-                                     const InputRequirement &requirement) {
-  auto type = dyn_cast<MemRefType>(source.getType());
-  if (!type || requirement.panelSize <= 0 || requirement.alignment <= 0 ||
-      requirement.windowAlignment <= 0 || requirement.panelSize % requirement.windowAlignment != 0 ||
-      !llvm::isPowerOf2_64(requirement.alignment))
-    return operation->emitError("implementation has an invalid input representation requirement");
-  if (!requirement.elementType || !requirement.elementType.isIntOrIndexOrFloat())
-    return operation->emitError("implementation input requires an explicit scalar representation type");
-  if (requirement.elementType != type.getElementType()) {
-    if (element.use_empty() || !llvm::all_of(element.getUsers(), [&](Operation *user) {
-          auto widen = dyn_cast<arith::ExtFOp>(user);
-          return widen && widen.getType() == requirement.elementType;
-        }))
-      return operation->emitError("input representation must preserve the consumer's explicit floating extension");
-  }
-  int64_t bits = requirement.elementType.isIndex() ? 64 : requirement.elementType.getIntOrFloatBitWidth();
-  if (requirement.panelAxis >= static_cast<unsigned>(type.getRank()) || requirement.alignment < (bits + 7) / 8)
-    return operation->emitError("implementation input panel does not match its typed source");
-  return success();
-}
-
 bool sameRepresentation(const InputRequirement &first, const InputRequirement &second) {
   return first.elementType == second.elementType && first.panelAxis == second.panelAxis &&
       first.panelSize == second.panelSize && first.alignment == second.alignment && first.reuse == second.reuse;
@@ -184,16 +162,11 @@ bool hasIndependentWindowCoordinates(memref::SubViewOp window, Operation *scope,
 
 FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepare(linalg::GenericOp operation,
     ArrayRef<InputRequirement> requirements, const Implementation &implementation) {
+  if (auto reason = checkInputRequirements(operation, requirements))
+    return operation.emitError(*reason), failure();
   SmallVector<InputSupply> supplies;
-  SmallVector<unsigned> operands;
   for (auto requirement : requirements) {
-    if (requirement.operand >= operation.getInputs().size() ||
-        llvm::is_contained(operands, requirement.operand))
-      return operation.emitError("implementation has an invalid or repeated input representation requirement"), failure();
-    operands.push_back(requirement.operand);
     Value source = operation.getInputs()[requirement.operand];
-    if (failed(validateRepresentation(operation, source,
-        operation.getRegion().front().getArgument(requirement.operand), requirement))) return failure();
     if (requirement.reuse == InputReuse::Group) continue;
     if (auto supply = prepareWindow(source, requirement, operation)) supplies.push_back(*supply);
     else {
@@ -337,7 +310,7 @@ Operation *ImplementationInputs::consumerScope(Value source, linalg::GenericOp o
       for (auto candidate : other->getOps<linalg::GenericOp>()) {
         if (!isMatrixContraction(candidate) || candidate->hasAttr("intent_cpu.microtile") ||
             candidate->getAttrOfType<ImplementationAttr>("intent_cpu.implementation") != binding) continue;
-        for (auto requested : implementation.inputs(candidate, configuration, binding))
+        for (auto requested : implementation.inputRequirements(candidate, configuration, binding))
           if (requested.operand < candidate.getInputs().size() &&
               candidate.getInputs()[requested.operand] == source && sameRepresentation(requirement, requested)) return branch;
       }
@@ -381,7 +354,8 @@ FailureOr<InputSupply> ImplementationInputs::prepareCaptured(linalg::GenericOp o
   PhysicalProgramAnalysis analysis(function);
   if (!dominance.dominates(source, scope) || (scope != operation && !analysis.isReadOnly(source)))
     return operation.emitError("captured input supply cannot preserve its scoped read snapshot"), failure();
-  if (failed(validateRepresentation(operation, source, input.getResult(), requirement))) return failure();
+  if (auto reason = checkInputRequirement(source, input.getResult(), requirement))
+    return operation.emitError(*reason), failure();
   return materialize(source, requirement, scope);
 }
 

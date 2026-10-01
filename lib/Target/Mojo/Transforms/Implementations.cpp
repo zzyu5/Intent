@@ -3,22 +3,34 @@
 #include "../../../Dialect/CPU/Transforms/Utilities.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include <optional>
+#include <string>
 
 using namespace mlir;
 namespace intent::mojo {
 using namespace intent::cpu;
 namespace {
 
-bool vectorLegal(Operation *, CapabilitiesAttr capabilities, const Configuration &config) {
+std::optional<std::string> checkVector(Operation *, CapabilitiesAttr capabilities,
+                                       const Configuration &config) {
   auto power = [](int64_t value) { return value > 0 && !(value & (value - 1)); };
-  if (!config.local.get("vector_width") || !config.local.get("register_replicas") ||
-      !config.local.get("reduction_replicas")) return false;
+  for (StringRef name : {"vector_width", "register_replicas", "reduction_replicas"})
+    if (!config.local.get(name)) return "missing local parameter '" + name.str() + "'";
   for (NamedAttribute value : config.local)
     if (value.getName() != "vector_width" && value.getName() != "register_replicas" &&
-        value.getName() != "reduction_replicas" && value.getName() != "micro_m" && value.getName() != "micro_n") return false;
-  return power(config.parameter("vector_width")) && config.parameter("vector_width") <= capabilities.getVectorBits() / 32 &&
-      power(config.parameter("register_replicas")) && config.parameter("register_replicas") <= 16 &&
-      power(config.parameter("reduction_replicas")) && config.parameter("reduction_replicas") <= 16;
+        value.getName() != "reduction_replicas" && value.getName() != "micro_m" && value.getName() != "micro_n")
+      return "unsupported local parameter '" + value.getName().getValue().str() + "'";
+  int64_t width = config.parameter("vector_width");
+  if (!power(width)) return "vector_width must be a positive power of two, got " + std::to_string(width);
+  if (width > capabilities.getVectorBits() / 32)
+    return "vector_width " + std::to_string(width) + " exceeds the target's " +
+        std::to_string(capabilities.getVectorBits() / 32) + " f32 lanes";
+  for (StringRef name : {"register_replicas", "reduction_replicas"}) {
+    int64_t count = config.parameter(name);
+    if (!power(count)) return name.str() + " must be a positive power of two, got " + std::to_string(count);
+    if (count > 16) return name.str() + " exceeds the supported maximum of 16, got " + std::to_string(count);
+  }
+  return std::nullopt;
 }
 
 DictionaryAttr parameters(Builder &b, const Configuration &config) {
@@ -174,13 +186,26 @@ cpu::ImplementationRegistry implementations() {
       auto generic = dyn_cast<linalg::GenericOp>(op);
       return generic && isMatrixContraction(generic) &&
           isa<FloatType>(cast<MemRefType>(generic.getOutputs()[0].getType()).getElementType());
-    }, [](Operation *operation, CapabilitiesAttr capabilities, const Configuration &config) {
-      if (!vectorLegal(operation, capabilities, config) || !config.local.get("micro_m") || !config.local.get("micro_n")) return false;
+    }, [](Operation *operation, CapabilitiesAttr capabilities, const Configuration &config) -> std::optional<std::string> {
+      if (auto reason = checkVector(operation, capabilities, config)) return reason;
+      for (StringRef name : {"micro_m", "micro_n"})
+        if (!config.local.get(name)) return "missing local parameter '" + name.str() + "'";
       int64_t width = config.parameter("vector_width"), m = config.parameter("micro_m"), n = config.parameter("micro_n");
       int64_t bytes = cast<MemRefType>(cast<linalg::GenericOp>(operation).getOutputs()[0].getType()).getElementTypeBitWidth() / 8;
-      return config.tileN % width == 0 && m <= 8 && n <= 4 && m * n <= 24 &&
-          width * bytes * 8 <= capabilities.getVectorBits() &&
-          m * n * width <= capabilities.getPrivateBytes() / bytes;
+      if (config.tileN % width != 0)
+        return "tile_n " + std::to_string(config.tileN) + " must be divisible by vector_width " + std::to_string(width);
+      if (m > 8) return "micro_m exceeds the supported maximum of 8, got " + std::to_string(m);
+      if (n > 4) return "micro_n exceeds the supported maximum of 4, got " + std::to_string(n);
+      if (m * n > 24)
+        return "micro_m * micro_n requires " + std::to_string(m * n) + " accumulators, exceeding the limit of 24";
+      if (width * bytes * 8 > capabilities.getVectorBits())
+        return "accumulator vector requires " + std::to_string(width * bytes * 8) +
+            " bits, exceeding target vector_bits " + std::to_string(capabilities.getVectorBits());
+      if (m * n * width > capabilities.getPrivateBytes() / bytes)
+        return "microtile requires " + std::to_string(m * n * width) +
+            " accumulator elements, exceeding private storage capacity " +
+            std::to_string(capabilities.getPrivateBytes() / bytes);
+      return std::nullopt;
     }, [](Builder &, const Configuration &config) { return config.local; }, formTile, {}};
   auto inputRequirements = [](InputReuse reuse) {
     return [reuse](linalg::GenericOp operation, ConfigurationAttr, ImplementationAttr binding) {
@@ -190,7 +215,7 @@ cpu::ImplementationRegistry implementations() {
       return SmallVector<InputRequirement>{{1, element, 1, width * implementationParameter(binding, "micro_n"), width * bytes, reuse, 1}};
     };
   };
-  auto directLegal = contraction.legal;
+  auto directCheck = contraction.check;
   auto addInteger = [&](StringRef name, StringRef exactFloatName) {
     Implementation integer = contraction;
     integer.name = name;
@@ -201,12 +226,17 @@ cpu::ImplementationRegistry implementations() {
     };
     result.add(integer);
     integer.name = exactFloatName;
-    auto integerLegal = integer.legal;
-    integer.legal = [integerLegal](Operation *operation, CapabilitiesAttr capabilities, const Configuration &config) {
+    auto integerCheck = integer.check;
+    integer.check = [integerCheck](Operation *operation, CapabilitiesAttr capabilities, const Configuration &config)
+        -> std::optional<std::string> {
+      if (auto reason = integerCheck(operation, capabilities, config)) return reason;
       // Integer partials remain live across each local floating reduction.
-      return integerLegal(operation, capabilities, config) &&
-          config.parameter("micro_m") * config.parameter("micro_n") * config.parameter("vector_width") <=
-              capabilities.getPrivateBytes() / 8;
+      int64_t elements = config.parameter("micro_m") * config.parameter("micro_n") * config.parameter("vector_width");
+      if (elements > capabilities.getPrivateBytes() / 8)
+        return "simultaneous i32 and exact-f32 accumulator states require " + std::to_string(elements) +
+            " elements each, exceeding private storage capacity " +
+            std::to_string(capabilities.getPrivateBytes() / 8);
+      return std::nullopt;
     };
     integer.parameters = [](Builder &b, const Configuration &config) {
       NamedAttrList fields(config.local);
@@ -216,37 +246,49 @@ cpu::ImplementationRegistry implementations() {
     result.add(std::move(integer));
   };
   contraction.inputs = inputRequirements(InputReuse::Group);
-  contraction.legal = [directLegal](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
+  contraction.check = [directCheck](Operation *op, CapabilitiesAttr capabilities, const Configuration &config)
+      -> std::optional<std::string> {
+    if (auto reason = directCheck(op, capabilities, config)) return reason;
     int64_t bytes = cast<MemRefType>(cast<linalg::GenericOp>(op).getInputs()[1].getType()).getElementTypeBitWidth() / 8;
-    return directLegal(op, capabilities, config) && config.tileK <= capabilities.getPrivateBytes() / bytes /
-        config.parameter("vector_width") / config.parameter("micro_n");
+    int64_t limit = capabilities.getPrivateBytes() / bytes / config.parameter("vector_width") / config.parameter("micro_n");
+    if (config.tileK > limit)
+      return "tile_k " + std::to_string(config.tileK) + " exceeds the group input panel's private storage limit of " +
+          std::to_string(limit) + " reduction elements";
+    return std::nullopt;
   };
   result.add(contraction);
   addInteger("mojo.register_integer", "mojo.register_integer_f32");
   contraction.name = "mojo.register_float_shared";
   contraction.inputs = inputRequirements(InputReuse::Consumers);
-  contraction.legal = [directLegal](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
-    return directLegal(op, capabilities, config) &&
-        config.tileN % (config.parameter("vector_width") * config.parameter("micro_n")) == 0;
+  auto sharedCheck = [directCheck](Operation *op, CapabilitiesAttr capabilities, const Configuration &config)
+      -> std::optional<std::string> {
+    if (auto reason = directCheck(op, capabilities, config)) return reason;
+    int64_t panel = config.parameter("vector_width") * config.parameter("micro_n");
+    if (config.tileN % panel != 0)
+      return "tile_n " + std::to_string(config.tileN) + " must be divisible by the shared input panel width " +
+          std::to_string(panel);
+    return std::nullopt;
   };
+  contraction.check = sharedCheck;
   result.add(contraction);
   addInteger("mojo.register_integer_shared", "mojo.register_integer_f32_shared");
   contraction.name = "mojo.register_float_direct";
-  contraction.legal = directLegal;
+  contraction.check = directCheck;
   contraction.contraction.unitInnerStride[1] = true;
   contraction.inputs = {};
   result.add(contraction);
   addInteger("mojo.register_integer_direct", "mojo.register_integer_f32_direct");
   contraction.name = "mojo.register_float_widened";
   contraction.contraction.unitInnerStride[1] = false;
-  contraction.legal = [directLegal](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
-    if (!directLegal(op, capabilities, config) ||
-        config.tileN % (config.parameter("vector_width") * config.parameter("micro_n")) != 0) return false;
+  contraction.check = [sharedCheck](Operation *op, CapabilitiesAttr capabilities, const Configuration &config)
+      -> std::optional<std::string> {
+    if (auto reason = sharedCheck(op, capabilities, config)) return reason;
     auto operation = cast<linalg::GenericOp>(op);
     Type accumulator = cast<MemRefType>(operation.getOutputs()[0].getType()).getElementType();
-    return llvm::any_of(operation.getInputs(), [&](Value input) {
+    if (!llvm::any_of(operation.getInputs(), [&](Value input) {
       return cast<MemRefType>(input.getType()).getElementType() != accumulator;
-    });
+    })) return "widened input supply requires an input element type different from the accumulator type";
+    return std::nullopt;
   };
   contraction.inputs = [](linalg::GenericOp operation, ConfigurationAttr config, ImplementationAttr binding) {
     int64_t width = implementationParameter(binding, "vector_width");
@@ -260,7 +302,7 @@ cpu::ImplementationRegistry implementations() {
   Implementation vector{"mojo.vector", [](Operation *op) {
       if (auto generic = dyn_cast<linalg::GenericOp>(op)) return !isMatrixContraction(generic);
       return isa<cpu::ReduceOp, cpu::HistogramOp, func::FuncOp>(op);
-    }, vectorLegal, parameters, {}, {}};
+    }, checkVector, parameters, {}, {}};
   vector.worksetRows = [](linalg::GenericOp operation, ImplementationAttr) {
     return registerContractionRows(operation);
   };
@@ -273,10 +315,13 @@ cpu::ImplementationRegistry implementations() {
     };
   };
   result.add({"mojo.scan_scalar", [](Operation *op) { return isa<cpu::ScanOp>(op); },
-      vectorLegal, scanParameters(false), {}, {}});
+      checkVector, scanParameters(false), {}, {}});
   result.add({"mojo.scan_vector", [](Operation *op) { return isa<cpu::ScanOp>(op); },
-      [](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) {
-        return vectorLegal(op, capabilities, config) && supportsVectorScan(cast<cpu::ScanOp>(op));
+      [](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) -> std::optional<std::string> {
+        if (auto reason = checkVector(op, capabilities, config)) return reason;
+        if (!supportsVectorScan(cast<cpu::ScanOp>(op)))
+          return "vector scan requires a source-form innermost scan with supported storage and an elementwise combine";
+        return std::nullopt;
       }, scanParameters(true), {}, {}});
   return result;
 }

@@ -122,10 +122,13 @@ LogicalResult groupScopedInputs(func::FuncOp function, const ImplementationRegis
     if (!isMatrixContraction(operation) || operation->hasAttr("intent_cpu.microtile")) return WalkResult::advance();
     auto implementation = implementations.lookup(operation);
     if (failed(implementation)) return WalkResult::interrupt();
-    if (!(*implementation)->inputs) return WalkResult::advance();
     auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
-    for (auto requirement : (*implementation)->inputs(operation, configuration, binding)) {
-      if (requirement.operand >= operation.getInputs().size()) continue;
+    auto requirements = (*implementation)->inputRequirements(operation, configuration, binding);
+    if (auto reason = checkInputRequirements(operation, requirements)) {
+      operation.emitError(*reason);
+      return WalkResult::interrupt();
+    }
+    for (auto requirement : requirements) {
       Value source = operation.getInputs()[requirement.operand];
       auto window = consumerWindow(source, requirement, operation);
       if (!window) continue;
