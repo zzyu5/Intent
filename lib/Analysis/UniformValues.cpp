@@ -296,13 +296,16 @@ UniformExpression describeCanonicalUniformValue(Value value) {
     result.kind = K::Constant;
     result.literal = castConstant(constant.getValue(), result.type, false);
   } else if (isa<BroadcastOp, FullOp, ReshapeOp, TransposeOp>(op)) result.kind = K::Forward;
-  else if (isa<GatherOp>(op)) {
-    auto valid = op->getAttrOfType<IntegerAttr>("valid_operand_index");
-    auto fill = op->getAttrOfType<IntegerAttr>("fill_operand_index");
+  else if (auto gather = dyn_cast<GatherOp>(op)) {
+    auto valid = gather.getValid();
+    auto fill = gather.getFill();
     if (valid && fill) {
       result.kind = K::Select;
-      result.operands = {op->getOperand(valid.getInt()), op->getOperand(0), op->getOperand(fill.getInt())};
-    } else if (!valid) result.kind = K::Forward;
+      result.operands = {valid, gather.getSource(), fill};
+    } else if (!valid) {
+      result.kind = K::Forward;
+      result.operands = {gather.getSource()};
+    }
   }
   else if (isa<MakeRecordOp, MakeTupleOp>(op)) result.kind = K::Aggregate;
   else if (auto extract = dyn_cast<ExtractOp>(op)) {

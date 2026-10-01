@@ -70,10 +70,8 @@ struct NativeTileAccessPlan {
 // Only coordinate decomposition and legality live here. Layout packing, tile
 // indices and runtime guards remain cuTile constructs and are not shared facts.
 mlir::FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
-    mlir::Operation *owner, mlir::func::FuncOp kernel,
-    const gpu::PhysicalAccessBoundsFact &accessBounds, gpu::ViewType view,
-    mlir::ValueRange coordinates, llvm::ArrayRef<int64_t> sourceAxes,
-    gpu::FragmentType computationType);
+    gpu::AccessOpInterface access, mlir::func::FuncOp kernel,
+    const gpu::PhysicalAccessBoundsFact &accessBounds);
 mlir::Value uniformScalarFill(mlir::Value fill);
 bool isUnitExtent(mlir::Attribute attribute);
 bool isProvably(mlir::Value value, int64_t expected);

@@ -566,30 +566,29 @@ private:
       return;
     }
     if (auto load = dyn_cast<gpu::LoadOp>(operation)) {
-      std::string call = "tl.load(" + pointer(load.getResource(),
-                                               load.getCoordinates(),
-                                               load.getSourceAxes(),
-                                               load.getResult().getType());
-      if (load.getValid())
-        call += ", mask=" + valueString(load.getValid()) +
-                ", other=" + valueString(load.getFill());
-      assign(load.getResult(), call + ")");
+      auto access = cast<gpu::AccessOpInterface>(load.getOperation());
+      std::string call = "tl.load(" + pointer(access);
+      if (access.getAccessValidity())
+        call += ", mask=" + valueString(access.getAccessValidity()) +
+                ", other=" + valueString(access.getAccessFill());
+      assign(access.getAccessResult(), call + ")");
       return;
     }
     if (auto gather = dyn_cast<gpu::GatherOp>(operation)) {
-      Value coordinate = gather.getCoordinates().front();
+      auto access = cast<gpu::AccessOpInterface>(gather.getOperation());
+      Value coordinate = access.getAccessCoordinates().front();
       std::string indices = valueString(coordinate);
-      bool scalar = !isa<gpu::FragmentType>(gather.getResult().getType());
+      bool scalar = !isa<gpu::FragmentType>(access.getAccessValueType());
       if (scalar)
         indices = "tl.full((1,), " + indices + ", " +
                   pythonType(coordinate.getType()) + ")";
-      std::string call = "tl.gather(" + valueString(gather.getSource()) + ", " +
+      std::string call = "tl.gather(" + valueString(access.getAccessResource()) + ", " +
                          indices +
                          ", axis=" +
-                         std::to_string(gather.getSourceAxes().front()) + ")";
+                         std::to_string(access.getAccessSourceAxes().front()) + ")";
       if (scalar)
         call = "tl.reshape(" + call + ", ())";
-      assign(gather.getResult(), call);
+      assign(access.getAccessResult(), call);
       return;
     }
     if (auto contract = dyn_cast<gpu::ContractOp>(operation)) {
@@ -698,19 +697,18 @@ private:
       return;
     }
     if (auto atomic = dyn_cast<gpu::AtomicStoreOp>(operation)) {
+      auto access = cast<gpu::AccessOpInterface>(atomic.getOperation());
       std::string call = "tl.atomic_xchg(" +
-                         pointer(atomic.getResource(), atomic.getCoordinates(),
-                                 atomic.getSourceAxes(),
-                                 atomic.getValue().getType()) +
-                         ", " + valueString(atomic.getValue());
-      if (atomic.getValid())
-        call += ", mask=" + valueString(atomic.getValid());
+                         pointer(access) + ", " + valueString(access.getAccessPayloads().front());
+      if (access.getAccessValidity())
+        call += ", mask=" + valueString(access.getAccessValidity());
       call += ", sem=\"" + atomicSemantics(atomic.getOrdering()) +
               "\", scope=\"" + atomicScope(atomic.getSharing()) + "\")";
       line(call);
       return;
     }
     if (auto atomic = dyn_cast<gpu::AtomicRMWOp>(operation)) {
+      auto access = cast<gpu::AccessOpInterface>(atomic.getOperation());
       auto operationName = [](AtomicRMWKind kind) -> StringRef {
         switch (kind) {
         case AtomicRMWKind::Exchange: return "xchg";
@@ -725,29 +723,25 @@ private:
       };
       std::string call = "tl.atomic_" + operationName(atomic.getKind()).str() +
                          "(" +
-                         pointer(atomic.getResource(), atomic.getCoordinates(),
-                                 atomic.getSourceAxes(),
-                                 atomic.getValue().getType()) +
-                         ", " + valueString(atomic.getValue());
-      if (atomic.getValid())
-        call += ", mask=" + valueString(atomic.getValid());
+                         pointer(access) + ", " + valueString(access.getAccessPayloads().front());
+      if (access.getAccessValidity())
+        call += ", mask=" + valueString(access.getAccessValidity());
       call += ", sem=\"" + atomicSemantics(atomic.getOrdering()) +
               "\", scope=\"" + atomicScope(atomic.getSharing()) + "\")";
       assign(atomic.getResult(), call);
       return;
     }
     if (auto atomic = dyn_cast<gpu::AtomicCompareExchangeOp>(operation)) {
+      auto access = cast<gpu::AccessOpInterface>(atomic.getOperation());
+      auto payloads = access.getAccessPayloads();
       std::string old = newName();
       line(old + " = tl.atomic_cas(" +
-           pointer(atomic.getResource(), atomic.getCoordinates(),
-                   atomic.getSourceAxes(),
-                   atomic.getExpected().getType()) +
-           ", " + valueString(atomic.getExpected()) + ", " +
-           valueString(atomic.getDesired()) + ", sem=\"" +
+           pointer(access) + ", " + valueString(payloads[0]) + ", " +
+           valueString(payloads[1]) + ", sem=\"" +
            atomicSemantics(atomic.getOrdering()) + "\", scope=\"" +
            atomicScope(atomic.getSharing()) + "\")");
       assign(atomic.getResult(), "(" + old + ", (" + old + " == " +
-                                     valueString(atomic.getExpected()) + "))");
+                                     valueString(payloads[0]) + "))");
       return;
     }
     if (auto store = dyn_cast<DescriptorStoreOp>(operation)) {
@@ -775,13 +769,11 @@ private:
       return;
     }
     if (auto store = dyn_cast<gpu::StoreOp>(operation)) {
+      auto access = cast<gpu::AccessOpInterface>(store.getOperation());
       std::string call = "tl.store(" +
-                         pointer(store.getResource(), store.getCoordinates(),
-                                 store.getSourceAxes(),
-                                 store.getValue().getType()) +
-                         ", " + valueString(store.getValue());
-      if (store.getValid())
-        call += ", mask=" + valueString(store.getValid());
+                         pointer(access) + ", " + valueString(access.getAccessPayloads().front());
+      if (access.getAccessValidity())
+        call += ", mask=" + valueString(access.getAccessValidity());
       line(call + ")");
       return;
     }
@@ -1177,8 +1169,11 @@ private:
            ", order=" + axisTuple(order) + ")";
   }
 
-  std::string pointer(Value resource, ValueRange coordinates,
-                      ArrayRef<int64_t> sourceAxes, Type valueType) {
+  std::string pointer(gpu::AccessOpInterface access) {
+    Value resource = access.getAccessResource();
+    auto coordinates = access.getAccessCoordinates();
+    auto sourceAxes = access.getAccessSourceAxes();
+    Type valueType = access.getAccessValueType();
     auto argument = dyn_cast<BlockArgument>(resource);
     if (!argument) {
       failed = true;

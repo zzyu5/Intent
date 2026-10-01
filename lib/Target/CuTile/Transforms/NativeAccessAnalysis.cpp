@@ -469,10 +469,14 @@ bool scalarCoordinatesInView(ValueRange coordinates, gpu::ViewType view,
 }
 
 FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
-    Operation *owner, func::FuncOp kernel,
-    const gpu::PhysicalAccessBoundsFact &accessBounds, gpu::ViewType view,
-    ValueRange coordinates, ArrayRef<int64_t> sourceAxes,
-    gpu::FragmentType computationType) {
+    gpu::AccessOpInterface access, func::FuncOp kernel,
+    const gpu::PhysicalAccessBoundsFact &accessBounds) {
+  Operation *owner = access.getOperation();
+  auto view = dyn_cast<gpu::ViewType>(access.getAccessResource().getType());
+  auto computationType = dyn_cast<gpu::FragmentType>(access.getAccessValueType());
+  if (!view || !computationType) return failure();
+  auto coordinates = access.getAccessCoordinates();
+  auto sourceAxes = access.getAccessSourceAxes();
   const unsigned resourceRank = view.getRank();
   const unsigned computationRank = computationType.getShape().size();
   if (coordinates.size() != resourceRank ||

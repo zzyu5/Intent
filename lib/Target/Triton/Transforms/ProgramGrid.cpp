@@ -33,22 +33,27 @@ writeEffectProgramOrder(func::FuncOp kernel, gpu::DelinearizeOp mapping) {
   SmallVector<std::optional<int64_t>> resourceAxes(rank);
   bool sawStore = false;
   bool ambiguous = false;
+  bool hasOtherWrites = false;
 
-  kernel.walk([&](gpu::StoreOp store) {
+  kernel.walk([&](gpu::AccessOpInterface access) {
+    if (access.getAccessKind() != gpu::AccessKind::Store) {
+      hasOtherWrites |= access.writesMemory();
+      return;
+    }
     sawStore = true;
-    if (!isa<gpu::ViewType>(store.getResource().getType())) {
+    if (!isa<gpu::ViewType>(access.getAccessResource().getType())) {
       ambiguous = true;
       return;
     }
     for (unsigned programAxis = 0; programAxis < rank; ++programAxis) {
       std::optional<int64_t> storeAxis;
       for (auto [coordinateIndex, coordinate] :
-           llvm::enumerate(store.getCoordinates())) {
+           llvm::enumerate(access.getAccessCoordinates())) {
         llvm::SmallPtrSet<Operation *, 16> visited;
         if (!dependsOn(coordinate, mapping.getCoordinates()[programAxis],
                        visited))
           continue;
-        int64_t sourceAxis = store.getSourceAxes()[coordinateIndex];
+        int64_t sourceAxis = access.getAccessSourceAxes()[coordinateIndex];
         if (storeAxis && *storeAxis != sourceAxis) {
           ambiguous = true;
           return;
@@ -68,12 +73,6 @@ writeEffectProgramOrder(func::FuncOp kernel, gpu::DelinearizeOp mapping) {
     }
   });
 
-  bool hasOtherWrites = false;
-  kernel.walk([&](Operation *operation) {
-    hasOtherWrites |= isa<gpu::ScatterReduceOp, gpu::AtomicStoreOp,
-                          gpu::AtomicRMWOp, gpu::AtomicCompareExchangeOp>(
-        operation);
-  });
   if (!sawStore || ambiguous || hasOtherWrites ||
       llvm::any_of(resourceAxes, [](const std::optional<int64_t> &axis) {
         return !axis.has_value();

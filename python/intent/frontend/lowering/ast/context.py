@@ -380,7 +380,7 @@ class FunctionLowerer:
         operation = self.emit(
             OperationKind.VIEW_LOAD,
             self.location(node),
-            operands=(value,),
+            operand_groups=((value,), (), (), ()),
             result_types=(value.type,),
             attributes={"index": relation},
             effects=(Effect(EffectKind.READ, ResourceKind.EXTERNAL_VIEW, value),),

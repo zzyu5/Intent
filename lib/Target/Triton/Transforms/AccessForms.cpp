@@ -44,10 +44,14 @@ bool isZeroValue(Value value) {
 }
 
 std::optional<BlockAccessPlan>
-planBlockAccess(Value resource, ValueRange coordinates,
-                ArrayRef<int64_t> sourceAxes, Type valueType, Value valid,
-                Value fill,
+planBlockAccess(gpu::AccessOpInterface access,
                 const gpu::PhysicalAccessBoundaryFact &boundaryFact) {
+  Value resource = access.getAccessResource();
+  auto coordinates = access.getAccessCoordinates();
+  auto sourceAxes = access.getAccessSourceAxes();
+  Type valueType = access.getAccessValueType();
+  Value valid = access.getAccessValidity();
+  Value fill = access.getAccessFill();
   auto view = dyn_cast<gpu::ViewType>(resource.getType());
   auto fragment = dyn_cast<gpu::FragmentType>(valueType);
   if (!view || !fragment || fragment.getShape().empty() || !isa<BlockArgument>(resource) ||
@@ -154,32 +158,27 @@ struct BlockAccessCandidates {
 // candidate list: rewrites only consume the already-proved access operands.
 BlockAccessCandidates readBlockAccesses(
     func::FuncOp kernel,
-    llvm::function_ref<bool(Operation *, BlockAccessPlan &)> accept) {
+    llvm::function_ref<bool(gpu::AccessOpInterface, BlockAccessPlan &)> accept) {
   BlockAccessCandidates candidates;
   gpu::PhysicalProgramAnalysis analysis(kernel);
   kernel.walk([&](Operation *operation) {
-    if (auto load = dyn_cast<gpu::LoadOp>(operation)) {
-      auto plan = planBlockAccess(
-          load.getResource(), load.getCoordinates(), load.getSourceAxes(),
-          load.getResult().getType(), load.getValid(), load.getFill(),
-          analysis.boundaryValidity(load));
-      if (plan && accept(load, *plan))
-        candidates.loads.emplace_back(load, std::move(*plan));
-    } else if (auto store = dyn_cast<gpu::StoreOp>(operation)) {
-      auto plan = planBlockAccess(
-          store.getResource(), store.getCoordinates(), store.getSourceAxes(),
-          store.getValue().getType(), store.getValid(), Value(),
-          analysis.boundaryValidity(store));
-      if (plan && accept(store, *plan))
-        candidates.stores.emplace_back(store, std::move(*plan));
-    }
+    auto access = dyn_cast<gpu::AccessOpInterface>(operation);
+    if (!access || (access.getAccessKind() != gpu::AccessKind::Load &&
+                    access.getAccessKind() != gpu::AccessKind::Store))
+      return;
+    auto plan = planBlockAccess(access, analysis.boundaryValidity(operation));
+    if (!plan || !accept(access, *plan)) return;
+    if (access.getAccessKind() == gpu::AccessKind::Load)
+      candidates.loads.emplace_back(cast<gpu::LoadOp>(operation), std::move(*plan));
+    else
+      candidates.stores.emplace_back(cast<gpu::StoreOp>(operation), std::move(*plan));
   });
   return candidates;
 }
 
 LogicalResult materializeBlockPointerForms(func::FuncOp kernel) {
   auto candidates = readBlockAccesses(kernel,
-      [](Operation *, BlockAccessPlan &plan) {
+      [](gpu::AccessOpInterface, BlockAccessPlan &plan) {
         for (int64_t &axis : plan.boundaryAxes) {
           auto found = llvm::find(plan.blockAxes, axis);
           if (found == plan.blockAxes.end())
@@ -194,9 +193,10 @@ LogicalResult materializeBlockPointerForms(func::FuncOp kernel) {
     return success();
 
   for (auto &[load, plan] : loads) {
+    auto access = cast<gpu::AccessOpInterface>(load.getOperation());
     OpBuilder builder(load);
     auto block = builder.create<BlockLoadOp>(
-        load.getLoc(), load.getResult().getType(), load.getResource(),
+        load.getLoc(), load.getResult().getType(), access.getAccessResource(),
         plan.offsets,
         DenseI64ArrayAttr::get(kernel.getContext(), plan.blockAxes),
         DenseI64ArrayAttr::get(kernel.getContext(), plan.order),
@@ -208,9 +208,10 @@ LogicalResult materializeBlockPointerForms(func::FuncOp kernel) {
     load.erase();
   }
   for (auto &[store, plan] : stores) {
+    auto access = cast<gpu::AccessOpInterface>(store.getOperation());
     OpBuilder builder(store);
     auto block = builder.create<BlockStoreOp>(
-        store.getLoc(), store.getResource(), plan.offsets, store.getValue(),
+        store.getLoc(), access.getAccessResource(), plan.offsets, access.getAccessPayloads().front(),
         DenseI64ArrayAttr::get(kernel.getContext(), plan.blockAxes),
         DenseI64ArrayAttr::get(kernel.getContext(), plan.order),
         DenseI64ArrayAttr::get(kernel.getContext(), plan.boundaryAxes));
@@ -244,11 +245,13 @@ void orientPointerLoads(func::FuncOp kernel) {
   });
   SmallVector<gpu::LoadOp> loads;
   kernel.walk([&](gpu::LoadOp load) {
-    if (isa<gpu::ViewType>(load.getResource().getType()) &&
+    auto access = cast<gpu::AccessOpInterface>(load.getOperation());
+    if (isa<gpu::ViewType>(access.getAccessResource().getType()) &&
         isa<gpu::FragmentType>(load.getResult().getType()))
       loads.push_back(load);
   });
   for (gpu::LoadOp load : loads) {
+    auto access = cast<gpu::AccessOpInterface>(load.getOperation());
     auto result = cast<gpu::FragmentType>(load.getResult().getType());
     unsigned rank = result.getShape().size();
     if (rank < 2)
@@ -258,7 +261,7 @@ void orientPointerLoads(func::FuncOp kernel) {
     Value innermostCoordinate;
     int64_t innermostViewAxis = -1;
     bool exact = true;
-    for (auto [position, coordinate] : llvm::enumerate(load.getCoordinates())) {
+    for (auto [position, coordinate] : llvm::enumerate(access.getAccessCoordinates())) {
       auto type = dyn_cast<gpu::FragmentType>(coordinate.getType());
       if (!type)
         continue;
@@ -289,7 +292,7 @@ void orientPointerLoads(func::FuncOp kernel) {
         }
         // A broadcast axis does not vary. Reshape-derived coordinates may
         // share one varying fragment axis across several resource axes.
-        viewAxes[axis] = std::max(viewAxes[axis], load.getSourceAxes()[position]);
+        viewAxes[axis] = std::max(viewAxes[axis], access.getAccessSourceAxes()[position]);
         if (viewAxes[axis] > innermostViewAxis) {
           innermostViewAxis = viewAxes[axis];
           innermostCoordinate = coordinate;
@@ -300,7 +303,7 @@ void orientPointerLoads(func::FuncOp kernel) {
     }
     // Leave a unit-step innermost view coordinate to native coalescing. A
     // unit-step coordinate on an outer view axis can still be strided.
-    auto view = cast<gpu::ViewType>(load.getResource().getType());
+    auto view = cast<gpu::ViewType>(access.getAccessResource().getType());
     if (innermostCoordinate && innermostViewAxis + 1 == view.getRank()) {
       auto range = gpu::stripAdditiveProjection(innermostCoordinate)
                        .getDefiningOp<gpu::MakeRangeOp>();
@@ -521,13 +524,10 @@ bool feedsIndirectAccessCoordinates(Value value) {
     if (!visited.insert(current).second)
       continue;
     for (Operation *user : current.getUsers()) {
-      if (auto load = dyn_cast<gpu::LoadOp>(user)) {
-        if (llvm::is_contained(load.getCoordinates(), current))
-          return true;
-        continue;
-      }
-      if (auto store = dyn_cast<gpu::StoreOp>(user)) {
-        if (llvm::is_contained(store.getCoordinates(), current))
+      if (auto access = dyn_cast<gpu::AccessOpInterface>(user);
+          access && (access.getAccessKind() == gpu::AccessKind::Load ||
+                     access.getAccessKind() == gpu::AccessKind::Store)) {
+        if (llvm::is_contained(access.getAccessCoordinates(), current))
           return true;
         continue;
       }
@@ -553,19 +553,14 @@ materializeTensorDescriptorForms(
     return TensorDescriptorChoiceOp();
 
   auto candidates = readBlockAccesses(kernel,
-      [&](Operation *operation, BlockAccessPlan &plan) {
-        if (auto load = dyn_cast<gpu::LoadOp>(operation)) {
-          // Address-producing reads stay in their synchronous dependency chain.
-          if (feedsIndirectAccessCoordinates(load.getResult()))
-            return false;
-          return descriptorAccessEligible(kernel, load.getResource(),
-              plan.offsets, plan.blockAxes,
-              cast<gpu::FragmentType>(load.getResult().getType()));
-        }
-        auto store = cast<gpu::StoreOp>(operation);
-        return descriptorAccessEligible(kernel, store.getResource(),
+      [&](gpu::AccessOpInterface access, BlockAccessPlan &plan) {
+        // Address-producing reads stay in their synchronous dependency chain.
+        if (access.getAccessKind() == gpu::AccessKind::Load &&
+            feedsIndirectAccessCoordinates(access.getAccessResult()))
+          return false;
+        return descriptorAccessEligible(kernel, access.getAccessResource(),
             plan.offsets, plan.blockAxes,
-            cast<gpu::FragmentType>(store.getValue().getType()));
+            cast<gpu::FragmentType>(access.getAccessValueType()));
       });
   auto &[loads, stores] = candidates;
   if (loads.empty() && stores.empty())
@@ -681,18 +676,22 @@ materializeTensorDescriptorForms(
          permutation, descriptor});
     return descriptors.back();
   };
-  for (auto &[load, plan] : loads)
-    if (failed(descriptorFor(load.getResource(),
-                            cast<gpu::FragmentType>(load.getResult().getType()),
+  for (auto &[load, plan] : loads) {
+    auto access = cast<gpu::AccessOpInterface>(load.getOperation());
+    if (failed(descriptorFor(access.getAccessResource(),
+                            cast<gpu::FragmentType>(access.getAccessValueType()),
                             plan.blockAxes)))
       return load.emitOpError(
           "could not declare its tensor-descriptor runtime contract");
-  for (auto &[store, plan] : stores)
-    if (failed(descriptorFor(store.getResource(),
-                            cast<gpu::FragmentType>(store.getValue().getType()),
+  }
+  for (auto &[store, plan] : stores) {
+    auto access = cast<gpu::AccessOpInterface>(store.getOperation());
+    if (failed(descriptorFor(access.getAccessResource(),
+                            cast<gpu::FragmentType>(access.getAccessValueType()),
                             plan.blockAxes)))
       return store.emitOpError(
           "could not declare its tensor-descriptor runtime contract");
+  }
   SmallVector<Value> descriptorValues;
   for (DescriptorPlan &plan : descriptors)
     descriptorValues.push_back(plan.descriptor.getResult());
@@ -720,9 +719,10 @@ materializeTensorDescriptorForms(
                                                *reassociation));
   };
   for (auto &[load, plan] : loads) {
+    auto access = cast<gpu::AccessOpInterface>(load.getOperation());
     OpBuilder builder(load);
     auto fragment = cast<gpu::FragmentType>(load.getResult().getType());
-    auto descriptor = descriptorFor(load.getResource(), fragment, plan.blockAxes);
+    auto descriptor = descriptorFor(access.getAccessResource(), fragment, plan.blockAxes);
     FailureOr<SmallVector<Value>> descriptorOffsets =
         materializeDescriptorOffsets(builder, load.getLoc(), plan.offsets);
     if (failed(descriptor) || failed(descriptorOffsets))
@@ -762,9 +762,10 @@ materializeTensorDescriptorForms(
   }
 
   for (auto &[store, plan] : stores) {
+    auto access = cast<gpu::AccessOpInterface>(store.getOperation());
     OpBuilder builder(store);
     auto descriptor = descriptorFor(
-        store.getResource(), cast<gpu::FragmentType>(store.getValue().getType()),
+        access.getAccessResource(), cast<gpu::FragmentType>(access.getAccessPayloads().front().getType()),
         plan.blockAxes);
     FailureOr<SmallVector<Value>> descriptorOffsets =
         materializeDescriptorOffsets(builder, store.getLoc(), plan.offsets);
@@ -775,7 +776,7 @@ materializeTensorDescriptorForms(
         store.getLoc(), TypeRange{}, choice.getResult(),
         /*withElseRegion=*/true);
     OpBuilder descriptorBuilder = prepareBranch(conditional.getThenRegion());
-    Value ordered = store.getValue();
+    Value ordered = access.getAccessPayloads().front();
     if (!llvm::is_sorted(descriptor->permutation))
       ordered = descriptorBuilder.create<gpu::TransposeOp>(
           store.getLoc(), descriptor->orderedFragment, ordered,

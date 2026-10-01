@@ -24,38 +24,35 @@ bool viewsMayAlias(Value lhs, Value rhs) {
   return !left.getLayout().getNoalias() && !right.getLayout().getNoalias();
 }
 
+using ViewAccessModes = llvm::DenseMap<Value, unsigned>;
+
+ViewAccessModes readViewAccessModes(Operation *owner) {
+  ViewAccessModes modes;
+  owner->walk([&](gpu::AccessOpInterface access) {
+    Value resource = access.getAccessResource();
+    if (!isa<gpu::ViewType>(resource.getType())) return;
+    // This transformation realizes ordered ordinary loads/stores. An access
+    // schema does not authorize treating an atomic or pure gather as either.
+    if (access.getAccessKind() == gpu::AccessKind::Load) modes[resource] |= 1;
+    else if (access.getAccessKind() == gpu::AccessKind::Store) modes[resource] |= 2;
+  });
+  return modes;
+}
+
 bool hasOrderedViewDependencies(func::FuncOp kernel) {
-  llvm::DenseSet<Value> reads, writes;
-  kernel.walk([&](gpu::LoadOp load) {
-    if (isa<gpu::ViewType>(load.getResource().getType()))
-      reads.insert(load.getResource());
-  });
-  kernel.walk([&](gpu::StoreOp store) {
-    if (isa<gpu::ViewType>(store.getResource().getType()))
-      writes.insert(store.getResource());
-  });
-  return llvm::any_of(reads, [&](Value resource) {
-    return llvm::any_of(writes, [&](Value other) { return viewsMayAlias(resource, other); });
+  auto modes = readViewAccessModes(kernel);
+  return llvm::any_of(modes, [&](auto read) {
+    return (read.second & 1) && llvm::any_of(modes, [&](auto write) {
+      return (write.second & 2) && viewsMayAlias(read.first, write.first);
+    });
   });
 }
 
 LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
   if (!hasOrderedViewDependencies(kernel))
     return success();
-  using Accesses = llvm::DenseMap<Value, unsigned>;
-  auto accesses = [](Operation *operation) {
-    Accesses modes;
-    operation->walk([&](Operation *nested) {
-      if (auto load = dyn_cast<gpu::LoadOp>(nested)) {
-        if (isa<gpu::ViewType>(load.getResource().getType()))
-          modes[load.getResource()] |= 1;
-      } else if (auto store = dyn_cast<gpu::StoreOp>(nested)) {
-        if (isa<gpu::ViewType>(store.getResource().getType()))
-          modes[store.getResource()] |= 2;
-      }
-    });
-    return modes;
-  };
+  using Accesses = ViewAccessModes;
+  auto accesses = readViewAccessModes;
   auto conflicts = [](const Accesses &pending, const Accesses &current) {
     for (auto [resource, mode] : pending)
       for (auto [other, otherMode] : current)
@@ -101,10 +98,10 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
       });
       if (stores != 1 || selected->getBlock() != &body)
         continue;
-      auto chunkAxis = [&](ValueRange coordinates,
-                           ArrayRef<int64_t> sourceAxes) -> std::optional<int64_t> {
+      auto chunkAxis = [&](gpu::AccessOpInterface access) -> std::optional<int64_t> {
         std::optional<int64_t> axis;
-        for (auto [coordinate, sourceAxis] : llvm::zip(coordinates, sourceAxes)) {
+        for (auto [coordinate, sourceAxis] :
+             llvm::zip(access.getAccessCoordinates(), access.getAccessSourceAxes())) {
           Value root = coordinate;
           while (true) {
             if (auto broadcast = root.getDefiningOp<gpu::BroadcastOp>())
@@ -129,13 +126,13 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
         }
         return axis;
       };
-      auto storeAxis = chunkAxis(selected.getCoordinates(), selected.getSourceAxes());
+      auto storeAxis = chunkAxis(cast<gpu::AccessOpInterface>(selected.getOperation()));
       if (!storeAxis)
         continue;
       bool disjoint = true;
       body.walk([&](gpu::LoadOp load) {
-        if (load.getResource() == resource &&
-            chunkAxis(load.getCoordinates(), load.getSourceAxes()) != storeAxis)
+        auto access = cast<gpu::AccessOpInterface>(load.getOperation());
+        if (access.getAccessResource() == resource && chunkAxis(access) != storeAxis)
           disjoint = false;
       });
       if (!disjoint)
@@ -378,21 +375,18 @@ SmallVector<scf::ForOp> findLoadPipelineLoops(func::FuncOp kernel) {
           (operation.getNumRegions() &&
            !isa<gpu::ReduceOp, gpu::ScanOp>(operation)))
         return;
-      if (auto load = dyn_cast<gpu::LoadOp>(operation)) {
-        if (!isa<gpu::ViewType>(load.getResource().getType()))
-          return;
-        if (addressDependsOnLoopCarry(load->getOperands(), loop))
-          return;
-        vectorLoad |= isa<gpu::FragmentType>(load.getResult().getType());
-      } else if (auto store = dyn_cast<gpu::StoreOp>(operation)) {
-        if (!isa<gpu::ViewType>(store.getResource().getType()))
-          return;
-        SmallVector<Value> addressing{store.getResource()};
-        llvm::append_range(addressing, store.getCoordinates());
-        if (store.getValid())
-          addressing.push_back(store.getValid());
+      if (auto access = dyn_cast<gpu::AccessOpInterface>(&operation);
+          access && (access.getAccessKind() == gpu::AccessKind::Load ||
+                     access.getAccessKind() == gpu::AccessKind::Store)) {
+        if (!isa<gpu::ViewType>(access.getAccessResource().getType())) return;
+        SmallVector<Value> addressing{access.getAccessResource()};
+        llvm::append_range(addressing, access.getAccessCoordinates());
+        if (access.getAccessValidity()) addressing.push_back(access.getAccessValidity());
+        if (access.getAccessFill()) addressing.push_back(access.getAccessFill());
         if (addressDependsOnLoopCarry(addressing, loop))
           return;
+        vectorLoad |= access.getAccessKind() == gpu::AccessKind::Load &&
+                      isa<gpu::FragmentType>(access.getAccessValueType());
       } else if (!isMemoryEffectFree(&operation)) {
         return;
       }
@@ -432,8 +426,13 @@ void selectOrderedLoadUnrolling(func::FuncOp kernel) {
           isa<gpu::ContractOp, gpu::ScaledContractOp, gpu::SparseContractOp,
               gpu::HistogramOp>(operation))
         return;
-      if (auto load = dyn_cast<gpu::LoadOp>(operation)) {
-        if (addressDependsOnLoopCarry(load->getOperands(), loop))
+      if (auto access = dyn_cast<gpu::AccessOpInterface>(&operation);
+          access && access.getAccessKind() == gpu::AccessKind::Load) {
+        SmallVector<Value> dependencies{access.getAccessResource()};
+        llvm::append_range(dependencies, access.getAccessCoordinates());
+        if (access.getAccessValidity()) dependencies.push_back(access.getAccessValidity());
+        if (access.getAccessFill()) dependencies.push_back(access.getAccessFill());
+        if (addressDependsOnLoopCarry(dependencies, loop))
           return;
         ++loads;
       } else if (!isMemoryEffectFree(&operation)) {

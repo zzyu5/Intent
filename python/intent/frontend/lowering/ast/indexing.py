@@ -97,7 +97,7 @@ def lower_subscript(
         return _subscript_region(lowerer, source, node)
     if not isinstance(source.type, (TensorType, BufferType)):
         lowerer.error(node, "only tensor/view/buffer values support positional indexing")
-    lowered = lower_index(lowerer, source, node.slice, first_operand_position=1)
+    lowered = lower_index(lowerer, source, node.slice)
     result_type = lowerer.value_result_type(source.type.dtype, lowered.result_shape)
     if isinstance(source.type, BufferType):
         operation = lowerer.emit(
@@ -114,7 +114,7 @@ def lower_subscript(
         operation = lowerer.emit(
             OperationKind.VIEW_LOAD,
             lowerer.location(node),
-            operands=(source, *lowered.operands),
+            operand_groups=((source,), lowered.operands, (), ()),
             result_types=(result_type,),
             attributes={"index": lowered.relation},
             effects=(Effect(EffectKind.READ, ResourceKind.EXTERNAL_VIEW, source),),
@@ -124,17 +124,12 @@ def lower_subscript(
     fill = lowerer.emit_literal(False if source.type.dtype == intent_bool else 0, node, ScalarType(source.type.dtype))
     valid = lowerer.broadcast_value(valid, tuple(lowered.result_shape), node)
     fill = lowerer.broadcast_value(fill, tuple(lowered.result_shape), node)
-    operands = (source, *lowered.operands, valid, fill)
     operation = lowerer.emit(
         OperationKind.GATHER,
         lowerer.location(node),
-        operands=operands,
+        operand_groups=((source,), lowered.operands, (valid,), (fill,)),
         result_types=(result_type,),
-        attributes={
-            "index": lowered.relation,
-            "valid_operand_index": len(operands) - 2,
-            "fill_operand_index": len(operands) - 1,
-        },
+        attributes={"index": lowered.relation},
     )
     return operation.results[0]
 
@@ -152,8 +147,6 @@ def lower_index(
     lowerer: FunctionLowerer,
     source: MlirValue,
     slice_node: ast.AST,
-    *,
-    first_operand_position: int,
 ) -> LoweredIndex:
     from .expressions import compile_time_value
 
@@ -213,7 +206,7 @@ def lower_index(
                             value = lowerer.materialize(expression, component)
                             if not is_integer(value.type):
                                 lowerer.error(component, "dynamic slice bound must be scalar integer/index")
-                            positions.append(first_operand_position + len(operands))
+                            positions.append(len(operands))
                             static_values.append(None)
                             operands.append(value)
                 terms.append(
@@ -230,7 +223,7 @@ def lower_index(
                         position = positions[component]
                         static = static_values[component]
                         if position is not None:
-                            bound = operands[position - first_operand_position]
+                            bound = operands[position]
                         elif static is not None:
                             bound = lowerer.emit_literal(static, raw_term, ScalarType(intent_index))
                         elif component == 0:
@@ -271,7 +264,7 @@ def lower_index(
             source_axis += 1
             continue
         value = lowerer.read_value(lowerer.lower_expression(raw_term), raw_term)
-        position = first_operand_position + len(operands)
+        position = len(operands)
         operands.append(value)
         if isinstance(value.type, (DomainType, RegionType)):
             terms.append(IndexTerm(IndexTermKind.REGION_INDEX, (position,)))
@@ -420,12 +413,12 @@ def _subscript_ragged(
             1,
             0,
             (),
-            (IndexTerm(IndexTermKind.VALUE_INDEX, (1,)),),
+            (IndexTerm(IndexTermKind.VALUE_INDEX, (0,)),),
         )
         return lowerer.emit(
             OperationKind.GATHER,
             lowerer.location(node),
-            operands=(ragged.offsets, index),
+            operand_groups=((ragged.offsets,), (index,), (), ()),
             result_types=(ScalarType(ragged.offsets.type.dtype),),
             attributes={"index": relation},
         ).results[0]

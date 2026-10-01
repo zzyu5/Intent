@@ -831,59 +831,36 @@ LogicalResult ExtractOp::verify() {
   return success();
 }
 
-LogicalResult LoadOp::verify() {
-  unsigned coordinateCount = getCoordinates().size();
-  if (coordinateCount != rankOf(getResource().getType()) ||
-      getSourceAxes().size() != coordinateCount)
-    return emitOpError("load coordinate partition/rank is inconsistent");
-  bool hasValid = static_cast<bool>(getValid());
-  bool hasFill = static_cast<bool>(getFill());
-  if (hasValid != hasFill)
-    return emitOpError("load requires validity and fill together");
-  if (hasValid && (!elementType(getValid().getType()).isInteger(1) ||
-                   !sameShape(getValid().getType(), getResult().getType()) ||
-                   !sameShape(getFill().getType(), getResult().getType())))
-    return emitOpError("load validity/fill physical schema is invalid: result=")
-           << getResult().getType() << ", valid=" << getValid().getType()
-           << ", fill=" << getFill().getType();
+LogicalResult verifyAccessSchema(AccessOpInterface access) {
+  Type resource = access.getAccessResource().getType();
+  Type payload = access.getAccessValueType();
+  Value valid = access.getAccessValidity(), fill = access.getAccessFill();
+  unsigned coordinateCount = access.getAccessCoordinates().size();
+  bool gather = access.getAccessKind() == AccessKind::Gather;
+  if ((gather && (!isa<FragmentType>(resource) || !coordinateCount)) ||
+      (!gather && coordinateCount != rankOf(resource)) ||
+      access.getAccessSourceAxes().size() != coordinateCount)
+    return access.emitOpError("access coordinate partition/rank is inconsistent");
+  if (access.getAccessFillMutable() && bool(valid) != bool(fill))
+    return access.emitOpError("read requires validity and fill together");
+  if (valid && (!elementType(valid.getType()).isInteger(1) ||
+                !sameShape(valid.getType(), payload)))
+    return access.emitOpError("access validity must match its value schema")
+           << "; value=" << payload << "; valid=" << valid.getType();
+  if (fill && !sameShape(fill.getType(), payload))
+    return access.emitOpError("read fill must match its value schema")
+           << "; value=" << payload << "; fill=" << fill.getType();
   llvm::DenseSet<int64_t> axes;
-  for (int64_t axis : getSourceAxes())
-    if (axis < 0 || axis >= static_cast<int64_t>(coordinateCount) ||
+  for (int64_t axis : access.getAccessSourceAxes())
+    if (axis < 0 || axis >= static_cast<int64_t>(rankOf(resource)) ||
         !axes.insert(axis).second)
-      return emitOpError("load source-axis mapping is not a bijection");
-  Type resourceElement = dyn_cast<ViewType>(getResource().getType())
-                             ? cast<ViewType>(getResource().getType()).getElementType()
-                             : cast<BufferType>(getResource().getType()).getElementType();
-  if (resourceElement != elementType(getResult().getType()))
-    return emitOpError("load resource/result element types disagree");
-  // Out denotes the external ABI's initial state.  Canonical KIR verifies
-  // prior definitions before lowering the ordered reads and writes here.
-  return verifyAccessAxisExtents(getOperation(), getResult().getType(),
-                                 getCoordinates());
-}
-
-LogicalResult GatherOp::verify() {
-  auto source = dyn_cast<FragmentType>(getSource().getType());
-  if (!source || getCoordinates().empty() ||
-      getSourceAxes().size() != getCoordinates().size())
-    return emitOpError("gather source/coordinate relation is inconsistent");
-  llvm::DenseSet<int64_t> axes;
-  for (int64_t axis : getSourceAxes())
-    if (axis < 0 || axis >= static_cast<int64_t>(source.getShape().size()) ||
-        !axes.insert(axis).second)
-      return emitOpError("gather source-axis relation is not a unique subset");
-  bool hasValid = static_cast<bool>(getValid());
-  bool hasFill = static_cast<bool>(getFill());
-  if (hasValid != hasFill)
-    return emitOpError("gather requires validity and fill together");
-  if (hasValid && (!elementType(getValid().getType()).isInteger(1) ||
-                   !sameShape(getValid().getType(), getResult().getType()) ||
-                   !sameShape(getFill().getType(), getResult().getType())))
-    return emitOpError("gather validity/fill physical schema is invalid");
-  if (source.getElementType() != elementType(getResult().getType()))
-    return emitOpError("gather source/result element types disagree");
-  return verifyAccessAxisExtents(getOperation(), getResult().getType(),
-                                 getCoordinates());
+      return access.emitOpError(gather ? "gather source axes must be a unique subset"
+                                       : "memory source axes must be a bijection");
+  Type resourceElement = gather ? cast<FragmentType>(resource).getElementType()
+                                : resourceElementType(resource);
+  if (resourceElement != elementType(payload))
+    return access.emitOpError("access resource/value element types disagree");
+  return verifyAccessAxisExtents(access, payload, access.getAccessCoordinates());
 }
 
 LogicalResult AssumeInBoundsOp::verify() {
@@ -899,29 +876,7 @@ void LoadOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects)
 }
 
 LogicalResult StoreOp::verify() {
-  unsigned coordinateCount = getCoordinates().size();
-  if (coordinateCount != rankOf(getResource().getType()) ||
-      getSourceAxes().size() != coordinateCount)
-    return emitOpError("store coordinate/effect schema is inconsistent");
-  if (getValid() && (!elementType(getValid().getType()).isInteger(1) ||
-                     !sameShape(getValid().getType(), getValue().getType())))
-    return emitOpError("store validity must match its value fragment")
-           << "; validity=" << getValid().getType()
-           << "; value=" << getValue().getType();
-  llvm::DenseSet<int64_t> axes;
-  for (int64_t axis : getSourceAxes())
-    if (axis < 0 || axis >= static_cast<int64_t>(coordinateCount) ||
-        !axes.insert(axis).second)
-      return emitOpError("store source-axis mapping is not a bijection");
-  Type resourceElement = dyn_cast<ViewType>(getResource().getType())
-                             ? cast<ViewType>(getResource().getType()).getElementType()
-                             : cast<BufferType>(getResource().getType()).getElementType();
-  if (resourceElement != elementType(getValue().getType()))
-    return emitOpError("store resource/value element types disagree");
-  if (failed(verifyWritableResource(getOperation(), getResource().getType())))
-    return failure();
-  return verifyAccessAxisExtents(getOperation(), getValue().getType(),
-                                 getCoordinates());
+  return verifyWritableResource(getOperation(), getResource().getType());
 }
 
 void StoreOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
@@ -1382,25 +1337,6 @@ LogicalResult HistogramOp::verify() {
 }
 
 LogicalResult ScatterReduceOp::verify() {
-  if (getCoordinates().size() != rankOf(getResource().getType()) ||
-      getSourceAxes().size() != getCoordinates().size())
-    return emitOpError("scatter-reduce address rank is invalid");
-  if (resourceElementType(getResource().getType()) !=
-          elementType(getValue().getType()) ||
-      (getValid() &&
-       (!elementType(getValid().getType()).isInteger(1) ||
-        !sameShape(getValid().getType(), getValue().getType()))))
-    return emitOpError("scatter-reduce value/validity schema is invalid");
-  llvm::DenseSet<int64_t> axes;
-  for (int64_t axis : getSourceAxes())
-    if (axis < 0 ||
-        axis >= static_cast<int64_t>(rankOf(getResource().getType())) ||
-        !axes.insert(axis).second)
-      return emitOpError(
-          "scatter-reduce source-axis mapping is not a bijection");
-  if (failed(verifyAccessAxisExtents(getOperation(), getValue().getType(),
-                                     getCoordinates())))
-    return failure();
   if (failed(verifyWritableResource(getOperation(), getResource().getType())) ||
       failed(verifyResourceSharing(getOperation(), getResource().getType(),
                                    getSharing())))
@@ -1417,22 +1353,20 @@ void ScatterReduceOp::getEffects(
 
 namespace {
 
-LogicalResult verifyAtomicAddress(Operation *owner, Type resource,
-                                  ValueRange coordinates, Value valid,
-                                  ArrayRef<int64_t> sourceAxes,
-                                  AtomicOrdering ordering,
-                                  AtomicSharingDomain sharing) {
-  if (coordinates.size() != rankOf(resource) ||
-      sourceAxes.size() != coordinates.size())
-    return owner->emitOpError("atomic physical address/order schema is invalid");
+LogicalResult verifyAtomicSemantics(AccessOpInterface access,
+                                    AtomicOrdering ordering,
+                                    AtomicSharingDomain sharing) {
+  Operation *owner = access;
+  Type resource = access.getAccessResource().getType();
   bool orderingLegal =
-      (isa<AtomicLoadOp>(owner) &&
+      (access.getAccessKind() == AccessKind::AtomicLoad &&
        (ordering == AtomicOrdering::Relaxed ||
         ordering == AtomicOrdering::Acquire)) ||
-      (isa<AtomicStoreOp>(owner) &&
+      (access.getAccessKind() == AccessKind::AtomicStore &&
        (ordering == AtomicOrdering::Relaxed ||
         ordering == AtomicOrdering::Release)) ||
-      isa<AtomicRMWOp, AtomicCompareExchangeOp>(owner);
+      access.getAccessKind() == AccessKind::AtomicRMW ||
+      access.getAccessKind() == AccessKind::AtomicCompareExchange;
   if (!orderingLegal)
     return owner->emitOpError(
         "atomic ordering is illegal for this physical operation");
@@ -1441,82 +1375,44 @@ LogicalResult verifyAtomicAddress(Operation *owner, Type resource,
   if (auto view = dyn_cast<ViewType>(resource); view && view.getAccess() != 2)
     return owner->emitOpError(
         "external atomic target must use InOut access semantics");
-  if (valid && !elementType(valid.getType()).isInteger(1))
-    return owner->emitOpError("atomic validity must be a predicate");
-  llvm::DenseSet<int64_t> axes;
-  for (int64_t axis : sourceAxes)
-    if (axis < 0 || axis >= static_cast<int64_t>(rankOf(resource)) ||
-        !axes.insert(axis).second)
-      return owner->emitOpError(
-          "atomic source-axis mapping is not a bijection");
   return success();
 }
 
 } // namespace
 
 LogicalResult AtomicLoadOp::verify() {
-  if (resourceElementType(getResource().getType()) !=
-          elementType(getResult().getType()) ||
-      (getValid() && !sameShape(getValid().getType(), getResult().getType())))
-    return emitOpError("atomic-load resource/result element types disagree");
-  if (failed(verifyAtomicAddress(getOperation(), getResource().getType(),
-                                 getCoordinates(), getValid(), getSourceAxes(),
-                                 getOrdering(), getSharing())))
-    return failure();
-  return verifyAccessAxisExtents(getOperation(), getResult().getType(),
-                                 getCoordinates());
+  return verifyAtomicSemantics(cast<AccessOpInterface>(getOperation()),
+                               getOrdering(), getSharing());
 }
 
 LogicalResult AtomicStoreOp::verify() {
-  if (resourceElementType(getResource().getType()) !=
-          elementType(getValue().getType()) ||
-      (getValid() && !sameShape(getValid().getType(), getValue().getType())))
-    return emitOpError("atomic-store resource/value element types disagree");
-  if (failed(verifyAtomicAddress(getOperation(), getResource().getType(),
-                                 getCoordinates(), getValid(), getSourceAxes(),
-                                 getOrdering(), getSharing())))
-    return failure();
-  return verifyAccessAxisExtents(getOperation(), getValue().getType(),
-                                 getCoordinates());
+  return verifyAtomicSemantics(cast<AccessOpInterface>(getOperation()),
+                               getOrdering(), getSharing());
 }
 
 LogicalResult AtomicRMWOp::verify() {
-  if (getResult().getType() != getValue().getType() ||
-      resourceElementType(getResource().getType()) !=
-          elementType(getValue().getType()) ||
-      (getValid() && !sameShape(getValid().getType(), getValue().getType())))
+  if (getResult().getType() != getValue().getType())
     return emitOpError("atomic RMW physical value/kind schema is invalid")
            << "; resource element="
            << resourceElementType(getResource().getType())
            << ", value=" << getValue().getType()
            << ", result=" << getResult().getType()
            << ", kind=" << stringifyAtomicRMWKind(getKind());
-  if (failed(verifyAtomicAddress(getOperation(), getResource().getType(),
-                                 getCoordinates(), getValid(), getSourceAxes(),
-                                 getOrdering(), getSharing())))
-    return failure();
-  return verifyAccessAxisExtents(getOperation(), getValue().getType(),
-                                 getCoordinates());
+  return verifyAtomicSemantics(cast<AccessOpInterface>(getOperation()),
+                               getOrdering(), getSharing());
 }
 
 LogicalResult AtomicCompareExchangeOp::verify() {
   auto result = getResult().getType();
   if (getExpected().getType() != getDesired().getType() ||
-      resourceElementType(getResource().getType()) !=
-          elementType(getExpected().getType()) ||
-      (getValid() && !sameShape(getValid().getType(), getExpected().getType())) ||
       result.getFieldTypes().size() != 2 ||
       cast<TypeAttr>(result.getFieldTypes()[0]).getValue() !=
           getExpected().getType() ||
       !elementType(cast<TypeAttr>(result.getFieldTypes()[1]).getValue())
            .isInteger(1))
     return emitOpError("compare-exchange physical result schema is invalid");
-  if (failed(verifyAtomicAddress(getOperation(), getResource().getType(),
-                                 getCoordinates(), getValid(), getSourceAxes(),
-                                 getOrdering(), getSharing())))
-    return failure();
-  return verifyAccessAxisExtents(getOperation(), getExpected().getType(),
-                                 getCoordinates());
+  return verifyAtomicSemantics(cast<AccessOpInterface>(getOperation()),
+                               getOrdering(), getSharing());
 }
 
 LogicalResult RandomBitsOp::verify() {

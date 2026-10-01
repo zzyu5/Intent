@@ -86,22 +86,20 @@ LogicalResult materializeProgramBuffers(ModuleOp module) {
     // Program-private storage stays disjoint when the launch has many programs.
     // The grid coordinates are explicit prefix indices of the existing workspace.
     unsigned prefixRank = programCoordinates.size();
-    auto prefixAccess = [&](auto access) {
+    auto prefixAccess = [&](AccessOpInterface access) {
       SmallVector<Value> coordinates(programCoordinates);
-      llvm::append_range(coordinates, access.getCoordinates());
+      llvm::append_range(coordinates, access.getAccessCoordinates());
       SmallVector<int64_t> axes;
       for (unsigned axis = 0; axis < prefixRank; ++axis)
         axes.push_back(axis);
-      for (int64_t axis : access.getSourceAxes())
+      for (int64_t axis : access.getAccessSourceAxes())
         axes.push_back(axis + prefixRank);
-      access.getCoordinatesMutable().assign(coordinates);
-      access.setSourceAxes(axes);
+      access.getAccessCoordinatesMutable().assign(coordinates);
+      access.setAccessSourceAxes(axes);
     };
     for (Operation *user : llvm::make_early_inc_range(buffer.getResult().getUsers())) {
-      if (auto load = dyn_cast<LoadOp>(user))
-        prefixAccess(load);
-      else if (auto store = dyn_cast<StoreOp>(user))
-        prefixAccess(store);
+      if (auto access = dyn_cast<AccessOpInterface>(user))
+        prefixAccess(access);
       else if (auto bounds = dyn_cast<AssumeInBoundsOp>(user))
         bounds.setAxis(bounds.getAxis() + prefixRank);
     }

@@ -4,6 +4,7 @@
 include "Intent/Dialect/Intent/IR/IntentDialect.td"
 include "Intent/Dialect/Intent/IR/IntentAttrs.td"
 include "Intent/Dialect/Intent/IR/IntentTypes.td"
+include "Intent/Dialect/Intent/IR/IndexedAccessOpInterface.td"
 include "Intent/Interfaces/StructuredOpInterface.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
@@ -144,15 +145,18 @@ def Intent_ConditionOp : Intent_Op<"condition", [Terminator,
   }];
 }
 
-def Intent_ViewLoadOp : Intent_Op<"view_load", [MemoryEffects<[MemRead]>]> {
-  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
-                       OptionalAttr<I64Attr>:$valid_operand_index,
-                       OptionalAttr<I64Attr>:$fill_operand_index);
+def Intent_ViewLoadOp : Intent_Op<"view_load", [MemoryEffects<[MemRead]>,
+    AttrSizedOperandSegments, DeclareOpInterfaceMethods<Intent_IndexedAccessOpInterface,
+      ["getAccessValidity", "getAccessFill"]>]> {
+  let arguments = (ins Intent_Value:$source, Variadic<Intent_Value>:$indices,
+                       Optional<Intent_DataValue>:$valid, Optional<Intent_DataValue>:$fill,
+                       Intent_IndexRelation:$index);
   let results = (outs Intent_DataValue:$result);
 }
-def Intent_ViewStoreOp : Intent_Op<"view_store", [MemoryEffects<[MemWrite]>]> {
-  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
-                       I64Attr:$value_operand_index);
+def Intent_ViewStoreOp : Intent_Op<"view_store", [MemoryEffects<[MemWrite]>,
+    DeclareOpInterfaceMethods<Intent_IndexedAccessOpInterface, ["getStoredValue"]>]> {
+  let arguments = (ins Intent_Value:$source, Variadic<Intent_Value>:$indices,
+                       Intent_DataValue:$value, Intent_IndexRelation:$index);
   let results = (outs);
 }
 def Intent_ReshapeOp : Intent_Op<"reshape", [Pure]> {
@@ -391,61 +395,75 @@ def Intent_HistogramOp : Intent_Op<"histogram", [Pure]> {
   let results = (outs AnyRankedTensor:$result);
 }
 
-def Intent_GatherOp : Intent_Op<"gather", [Pure]> {
-  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
-                       OptionalAttr<I64Attr>:$valid_operand_index,
-                       OptionalAttr<I64Attr>:$fill_operand_index);
+def Intent_GatherOp : Intent_Op<"gather", [Pure, AttrSizedOperandSegments,
+    DeclareOpInterfaceMethods<Intent_IndexedAccessOpInterface,
+      ["getAccessValidity", "getAccessFill"]>]> {
+  let arguments = (ins Intent_Value:$source, Variadic<Intent_Value>:$indices,
+                       Optional<Intent_DataValue>:$valid, Optional<Intent_DataValue>:$fill,
+                       Intent_IndexRelation:$index);
   let results = (outs Intent_DataValue:$result);
 }
-def Intent_ScatterUniqueOp : Intent_Op<"scatter_unique", [MemoryEffects<[MemWrite]>]> {
-  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
-                       I64Attr:$value_operand_index);
+def Intent_ScatterUniqueOp : Intent_Op<"scatter_unique", [MemoryEffects<[MemWrite]>,
+    DeclareOpInterfaceMethods<Intent_IndexedAccessOpInterface, ["getStoredValue"]>]> {
+  let arguments = (ins Intent_Value:$source, Variadic<Intent_Value>:$indices,
+                       Intent_DataValue:$value, Intent_IndexRelation:$index);
   let results = (outs);
 }
-def Intent_ScatterReduceOp : Intent_Op<"scatter_reduce", [MemoryEffects<[MemWrite]>]> {
-  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
-                       I64Attr:$value_operand_index);
+def Intent_ScatterReduceOp : Intent_Op<"scatter_reduce", [MemoryEffects<[MemWrite]>,
+    DeclareOpInterfaceMethods<Intent_IndexedAccessOpInterface, ["getStoredValue"]>]> {
+  let arguments = (ins Intent_Value:$source, Variadic<Intent_Value>:$indices,
+                       Intent_DataValue:$value, Intent_IndexRelation:$index);
   let results = (outs);
   let regions = (region SizedRegion<1>:$combine);
 }
 
-def Intent_BufferOp : Intent_Op<"buffer"> {
-  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_ShapeRelation:$shape,
-                       OptionalAttr<I64Attr>:$initial_operand);
+def Intent_BufferOp : Intent_Op<"buffer", [AttrSizedOperandSegments]> {
+  let arguments = (ins Variadic<Intent_Value>:$extents, Optional<Intent_DataValue>:$initial,
+                       Intent_ShapeRelation:$shape);
   let results = (outs Intent_BufferValue:$result);
 }
-def Intent_BufferLoadOp : Intent_Op<"buffer_load", [MemoryEffects<[MemRead]>]> {
-  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index);
+def Intent_BufferLoadOp : Intent_Op<"buffer_load", [MemoryEffects<[MemRead]>,
+    Intent_IndexedAccessOpInterface]> {
+  let arguments = (ins Intent_Value:$source, Variadic<Intent_Value>:$indices,
+                       Intent_IndexRelation:$index);
   let results = (outs Intent_DataValue:$result);
 }
-def Intent_BufferStoreOp : Intent_Op<"buffer_store", [MemoryEffects<[MemWrite]>]> {
-  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
-                       I64Attr:$value_operand_index);
+def Intent_BufferStoreOp : Intent_Op<"buffer_store", [MemoryEffects<[MemWrite]>,
+    DeclareOpInterfaceMethods<Intent_IndexedAccessOpInterface, ["getStoredValue"]>]> {
+  let arguments = (ins Intent_Value:$source, Variadic<Intent_Value>:$indices,
+                       Intent_DataValue:$value, Intent_IndexRelation:$index);
   let results = (outs);
 }
 // Atomic observations and synchronization cannot be folded as ordinary reads.
-def Intent_AtomicLoadOp : Intent_Op<"atomic_load", [MemoryEffects<[MemRead, MemWrite]>]> {
-  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
+def Intent_AtomicLoadOp : Intent_Op<"atomic_load", [MemoryEffects<[MemRead, MemWrite]>,
+    Intent_IndexedAccessOpInterface]> {
+  let arguments = (ins Intent_Value:$source, Variadic<Intent_Value>:$indices,
+                       Intent_IndexRelation:$index,
                        Intent_AtomicOrderingAttr:$ordering);
   let results = (outs Intent_DataValue:$result);
 }
-def Intent_AtomicStoreOp : Intent_Op<"atomic_store", [MemoryEffects<[MemRead, MemWrite]>]> {
-  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
-                       I64Attr:$value_operand,
+def Intent_AtomicStoreOp : Intent_Op<"atomic_store", [MemoryEffects<[MemRead, MemWrite]>,
+    DeclareOpInterfaceMethods<Intent_IndexedAccessOpInterface, ["getStoredValue"]>]> {
+  let arguments = (ins Intent_Value:$source, Variadic<Intent_Value>:$indices,
+                       Intent_DataValue:$value, Intent_IndexRelation:$index,
                        Intent_AtomicOrderingAttr:$ordering);
   let results = (outs);
 }
-def Intent_AtomicRMWOp : Intent_Op<"atomic_rmw", [MemoryEffects<[MemRead, MemWrite]>]> {
-  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
-                       I64Attr:$value_operand,
+def Intent_AtomicRMWOp : Intent_Op<"atomic_rmw", [MemoryEffects<[MemRead, MemWrite]>,
+    DeclareOpInterfaceMethods<Intent_IndexedAccessOpInterface, ["getStoredValue"]>]> {
+  let arguments = (ins Intent_Value:$source, Variadic<Intent_Value>:$indices,
+                       Intent_DataValue:$value, Intent_IndexRelation:$index,
                        Intent_AtomicOrderingAttr:$ordering,
                        Intent_AtomicRMWKindAttr:$kind);
   let results = (outs Intent_DataValue:$result);
 }
 def Intent_AtomicCompareExchangeOp : Intent_Op<"atomic_compare_exchange",
-    [MemoryEffects<[MemRead, MemWrite]>]> {
-  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
-                       I64Attr:$expected_operand, I64Attr:$desired_operand,
+    [MemoryEffects<[MemRead, MemWrite]>,
+     DeclareOpInterfaceMethods<Intent_IndexedAccessOpInterface,
+       ["getCompareValue", "getReplacementValue"]>]> {
+  let arguments = (ins Intent_Value:$source, Variadic<Intent_Value>:$indices,
+                       Intent_DataValue:$expected, Intent_DataValue:$desired,
+                       Intent_IndexRelation:$index,
                        Intent_AtomicOrderingAttr:$ordering);
   let results = (outs Intent_RecordValue:$result);
 }

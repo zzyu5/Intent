@@ -482,7 +482,7 @@ private:
     });
     if (!aggregate) return false;
     if (auto load = dyn_cast<ViewLoadOp>(op)) {
-      auto view = dyn_cast<ViewType>(load.getInputs().front().getType());
+      auto view = dyn_cast<ViewType>(load.getSource().getType());
       return view && view.getAccess() == 0;
     }
     return isMemoryEffectFree(op);
@@ -825,8 +825,7 @@ private:
       return result;
     }
     if (auto gather = dyn_cast<GatherOp>(op)) {
-      if (auto valid = op->getAttrOfType<IntegerAttr>("valid_operand_index"))
-        if (!constantTrue(op->getOperand(valid.getInt()))) return failure();
+      if (gather.getValid() && !constantTrue(gather.getValid())) return failure();
       auto relation = analysis.indexRelation(gather);
       if (failed(relation)) return failure();
       auto source = affineIndex(relation->source);
@@ -906,7 +905,8 @@ private:
     bool external = isa<ViewType>(relation->source.getType());
     Value source = get(relation->source);
     if (!source) return op->emitError("DSA indexed source is unavailable");
-    Value original = store ? op->getOperand(op->getAttrOfType<IntegerAttr>("value_operand_index").getInt()) : op->getResult(0);
+    auto access = cast<IndexedAccessOpInterface>(op);
+    Value original = store ? access.getStoredValue() : op->getResult(0);
     auto tensor = dyn_cast<RankedTensorType>(original.getType());
     LocalShape shape;
     if (tensor) {
@@ -916,9 +916,8 @@ private:
     }
     Value data = store ? get(original) : tensor ? allocateTensor(loc, tensor.getElementType(), shape) : Value();
     if (store && !data) return op->emitError("DSA store data is unavailable");
-    auto validIndex = op->getAttrOfType<IntegerAttr>("valid_operand_index");
-    auto fillIndex = op->getAttrOfType<IntegerAttr>("fill_operand_index");
-    bool allValid = !validIndex || constantTrue(op->getOperand(validIndex.getInt()));
+    Value validity = access.getAccessValidity(), fallback = access.getAccessFill();
+    bool allValid = !validity || constantTrue(validity);
     auto axes = accessAxes(*relation);
     unsigned advancedRank = axes.advancedRank;
     auto advancedStart = axes.advancedStart;
@@ -960,9 +959,9 @@ private:
         return success();
       }
     }
-    Value valid = !allValid && validIndex ? get(op->getOperand(validIndex.getInt())) : Value();
-    Value fill = !allValid && fillIndex ? get(op->getOperand(fillIndex.getInt())) : Value();
-    if (!allValid && ((validIndex && !valid) || (fillIndex && !fill)))
+    Value valid = !allValid && validity ? get(validity) : Value();
+    Value fill = !allValid && fallback ? get(fallback) : Value();
+    if (!allValid && ((validity && !valid) || (fallback && !fill)))
       return op->emitError("DSA access predicate or fill is unavailable");
     auto sourceExtent = [&](unsigned axis) -> Value {
       if (!external) return localShapes.lookup(source)[axis].extent;
@@ -1799,11 +1798,11 @@ private:
     for (Operation &op : block.without_terminator()) {
       if (&op == scan) { after = true; continue; }
       if (auto store = dyn_cast<ViewStoreOp>(op)) {
-        if (!after || !dependent.contains(&op) || llvm::count(ids(store.getInputs()[store.getValueOperandIndex()]), dimension) != 1)
+        if (!after || !dependent.contains(&op) || llvm::count(ids(store.getValue()), dimension) != 1)
           return false;
         hasOutput = true;
       } else if (auto load = dyn_cast<ViewLoadOp>(op)) {
-        if (cast<ViewType>(load.getInputs().front().getType()).getAccess() != 0) return false;
+        if (cast<ViewType>(load.getSource().getType()).getAccess() != 0) return false;
       } else if (!isMemoryEffectFree(&op)) return false;
       if (isa<ScanOp, RegionFoldOp, RegionScanOp, ForOp, WhileOp, IfOp, ParallelOp, ReshapeOp, JoinOp>(op)) return false;
       for (Type type : op.getResultTypes()) {
@@ -1939,7 +1938,7 @@ private:
       if (op.getNumRegions()) return std::nullopt;
       if (isa<ViewStoreOp, ScatterUniqueOp>(op)) {
         auto relation = analysis.indexRelation(&op);
-        Value data = op.getOperand(op.getAttrOfType<IntegerAttr>("value_operand_index").getInt());
+        Value data = cast<IndexedAccessOpInterface>(&op).getStoredValue();
         auto type = dyn_cast<RankedTensorType>(data.getType());
         // Distinct writable views are disjoint in this target's launch ABI.
         // Reordering separate writes to one view needs an effect-footprint proof.
@@ -1948,7 +1947,7 @@ private:
         if (!outputType) outputType = type;
         plan.writes.push_back(&op);
       } else if (auto load = dyn_cast<ViewLoadOp>(op)) {
-        if (cast<ViewType>(load.getInputs().front().getType()).getAccess() != 0) return std::nullopt;
+        if (cast<ViewType>(load.getSource().getType()).getAccess() != 0) return std::nullopt;
       } else if (!isMemoryEffectFree(&op) && !isa<AssumeInBoundsOp>(op)) return std::nullopt;
     }
     if (sources.empty() && (plan.writes.empty() || singletonAxis(outputType, selectedAxis))) return std::nullopt;
@@ -1964,7 +1963,7 @@ private:
       if (!op || isa<DimOp>(op)) return true;
       if (op->getNumRegions()) return false;
       if (auto load = dyn_cast<ViewLoadOp>(op)) {
-        if (cast<ViewType>(load.getInputs().front().getType()).getAccess() != 0) return false;
+        if (cast<ViewType>(load.getSource().getType()).getAccess() != 0) return false;
       } else if (!isMemoryEffectFree(op) && !isa<DomainOp, SubregionOp>(op)) return false;
       return llvm::all_of(op->getOperands(), scalar);
     };
@@ -1989,14 +1988,14 @@ private:
             }
           }
           if (!require(indices, indexAxes)) return false;
-        } else for (Value operand : term.operands) if (!scalar(operand)) return false;
+        } else for (Value operand : term.operands) if (operand && !scalar(operand)) return false;
       }
       // Nonlocal gathers retain the complete indexed source axis. Full slices
       // project one result axis directly; inserted axes never consume a source axis.
       if (local && !require(relation->source, sourceAxes)) return false;
-      for (StringRef attribute : {"valid_operand_index", "fill_operand_index"})
-        if (auto operand = op->getAttrOfType<IntegerAttr>(attribute)) {
-          Value value = op->getOperand(operand.getInt());
+      auto indexed = cast<IndexedAccessOpInterface>(op);
+      for (Value value : {indexed.getAccessValidity(), indexed.getAccessFill()})
+        if (value) {
           if (isa<RankedTensorType>(value.getType())) {
             if (!require(value, requested)) return false;
           } else if (!scalar(value)) return false;
@@ -2016,7 +2015,7 @@ private:
       if (!op || op->getNumRegions()) return false;
       if (isa<ViewLoadOp, GatherOp>(op)) {
         if (auto load = dyn_cast<ViewLoadOp>(op))
-          if (cast<ViewType>(load.getInputs().front().getType()).getAccess() != 0) return false;
+          if (cast<ViewType>(load.getSource().getType()).getAccess() != 0) return false;
         return access(op, type, requested);
       }
       if (!isMemoryEffectFree(op)) return false;
@@ -2072,7 +2071,7 @@ private:
       return true;
     };
     for (Operation *write : plan.writes) {
-      Value data = write->getOperand(write->getAttrOfType<IntegerAttr>("value_operand_index").getInt());
+      Value data = cast<IndexedAccessOpInterface>(write).getStoredValue();
       auto type = cast<RankedTensorType>(data.getType());
       AxisRequirements requested(type.getRank(), false); requested[selectedAxis] = true;
       if (!require(data, requested) || !access(write, type, requested)) return std::nullopt;
@@ -2144,7 +2143,7 @@ private:
     auto sourceIds = cast<TensorShapeAttr>(sourceType.getEncoding()).getDimensions();
     int64_t query = 0;
     for (Operation &op : block.without_terminator()) if (auto store = dyn_cast<ViewStoreOp>(op)) {
-      auto type = dyn_cast<RankedTensorType>(store.getInputs()[store.getValueOperandIndex()].getType());
+      auto type = dyn_cast<RankedTensorType>(store.getValue().getType());
       if (!type || !type.getRank()) continue;
       int64_t candidate = cast<TensorShapeAttr>(type.getEncoding()).getDimensions()[0];
       if (candidate > 0 && !llvm::is_contained(sourceIds.asArrayRef(), candidate)) {
@@ -2171,10 +2170,10 @@ private:
           if (llvm::count(cast<TensorShapeAttr>(tensor.getEncoding()).getDimensions().asArrayRef(), query) > 1) independent = false;
       }
       if (auto store = dyn_cast<ViewStoreOp>(op))
-        if (llvm::count(ids(store.getInputs()[store.getValueOperandIndex()]), query) != 1) independent = false;
+        if (llvm::count(ids(store.getValue()), query) != 1) independent = false;
       if (isa<RegionFoldOp, RegionScanOp>(op) && analysis.regionSegment(op).dimensionIdentity == query) independent = false;
       if (auto load = dyn_cast<ViewLoadOp>(op))
-        if (cast<ViewType>(load.getInputs().front().getType()).getAccess() != 0) independent = false;
+        if (cast<ViewType>(load.getSource().getType()).getAccess() != 0) independent = false;
       if (auto reduce = dyn_cast<ReduceOp>(op))
         for (Value source : reduce.getSources()) {
           SmallVector<Type> fields; leaves(source.getType(), fields);
@@ -2194,7 +2193,7 @@ private:
         auto fact = analysis.indexRelation(op);
         if (failed(fact)) { independent = false; return; }
         if (auto store = dyn_cast<ViewStoreOp>(op)) {
-          auto outputIds = ids(store.getInputs()[store.getValueOperandIndex()]);
+          auto outputIds = ids(store.getValue());
           auto axes = accessAxes(*fact);
           if (ArrayRef<int64_t>(fact->resultDimensionIdentities) != outputIds || axes.rank != outputIds.size()) {
             independent = false;
@@ -2266,7 +2265,7 @@ private:
     Operation *op = value.getDefiningOp();
     if (!op) return false;
     if (auto load = dyn_cast<ViewLoadOp>(op)) {
-      if (cast<ViewType>(load.getInputs().front().getType()).getAccess() != 0) return false;
+      if (cast<ViewType>(load.getSource().getType()).getAccess() != 0) return false;
     } else if (!isMemoryEffectFree(op)) return false;
     if (isa<RegionFoldOp, RegionScanOp, ScanOp, ReshapeOp, JoinOp>(op)) return false;
     auto containsAxis = [&](Value input, unsigned axis) {
@@ -2342,7 +2341,7 @@ private:
               return user->emitError("DSA streamed region consumer performs a nonlocal lookup"), failure();
         }
         if (write) {
-          auto data = user->getOperand(user->getAttrOfType<IntegerAttr>("value_operand_index").getInt());
+          Value data = cast<IndexedAccessOpInterface>(user).getStoredValue();
           auto type = dyn_cast<RankedTensorType>(data.getType());
           if (!type || llvm::count(cast<TensorShapeAttr>(type.getEncoding()).getDimensions().asArrayRef(), dimension) != 1)
             return user->emitError("DSA streamed region output must preserve one source-position axis"), failure();
@@ -2378,7 +2377,7 @@ private:
       for (Operation *between = region->getNextNode(); between != ordered.back(); between = between->getNextNode()) {
         if (consumers.contains(between) || isMemoryEffectFree(between)) continue;
         if (auto load = dyn_cast<ViewLoadOp>(between))
-          if (cast<ViewType>(load.getInputs().front().getType()).getAccess() == 0) continue;
+          if (cast<ViewType>(load.getSource().getType()).getAccess() == 0) continue;
         return between->emitError("DSA streaming output cannot cross an observable access"), failure();
       }
     }
@@ -2410,8 +2409,8 @@ private:
         }
         if (auto gather = dyn_cast_or_null<GatherOp>(definition)) {
           auto relation = analysis.indexRelation(gather);
-          auto valid = gather->getAttrOfType<IntegerAttr>("valid_operand_index");
-          if (failed(relation) || (valid && !constantTrue(gather->getOperand(valid.getInt()))) ||
+          Value valid = gather.getValid();
+          if (failed(relation) || (valid && !constantTrue(valid)) ||
               llvm::any_of(relation->terms, [](const IndexTermFact &term) {
                 return !term.operands.empty() || (term.kind != 0 && term.kind != 1);
               })) return {};
@@ -2736,7 +2735,7 @@ private:
       for (Operation &op : cast<ParallelOp>(parent).getBody().front().without_terminator()) {
         if (&op == child) break;
         if (auto load = dyn_cast<ViewLoadOp>(op)) {
-          if (cast<ViewType>(load.getInputs().front().getType()).getAccess() == 0) continue;
+          if (cast<ViewType>(load.getSource().getType()).getAccess() == 0) continue;
         }
         if (!isMemoryEffectFree(&op) && !isa<AssumeInBoundsOp>(op)) return false;
       }
@@ -3206,7 +3205,7 @@ private:
     if (failed(fact)) return failure();
     Value resource = get(fact->source);
     if (!resource || !isa<MemRefType>(resource.getType())) return operation->emitError("DSA access needs an external view");
-    if (!store && cast<ViewLoadOp>(operation).getValidOperandIndex())
+    if (!store && cast<ViewLoadOp>(operation).getValid())
       return operation->emitError("DSA predicated source access is not implemented");
     Location loc = operation->getLoc();
     Value offset = index(loc, 0), columnStride = index(loc, 0);
@@ -3228,7 +3227,7 @@ private:
     }
     if (store) {
       auto write = cast<ViewStoreOp>(operation);
-      Value value = get(write.getInputs()[write.getValueOperandIndex()]);
+      Value value = get(write.getValue());
       if (value && !row && !isa<MemRefType>(value.getType())) {
         b.create<dsa::StoreScalarOp>(loc, value, resource, offset);
         return success();
@@ -3257,7 +3256,7 @@ private:
     Location loc = operation->getLoc();
     if (structured) {
       if (auto store = dyn_cast<ViewStoreOp>(operation); store && valueSlices.empty()) {
-        Value data = store.getInputs()[store.getValueOperandIndex()];
+        Value data = store.getValue();
         auto type = dyn_cast<RankedTensorType>(data.getType());
         if (type && type.getRank() > 0) {
           auto shape = localShape(data, loc);
@@ -3556,7 +3555,7 @@ private:
 
   FailureOr<Value> matrixView(Value tensor) {
     auto load = tensor.getDefiningOp<ViewLoadOp>();
-    if (!load || load.getValidOperandIndex()) return failure();
+    if (!load || load.getValid()) return failure();
     auto fact = analysis.indexRelation(load);
     if (failed(fact) || fact->sourceRank != 2 || fact->terms.size() != 2) return failure();
     for (auto [axis, term] : llvm::enumerate(fact->terms)) {
@@ -3656,7 +3655,7 @@ private:
       for (Operation *op : epilogue) {
         if (!isa<ViewStoreOp>(op)) { if (failed(lowerOperation(op))) return failure(); }
         else {
-          Value result = get(output.getInputs()[output.getValueOperandIndex()]);
+          Value result = get(output.getValue());
           if (!result) return output.emitError("DSA matrix result is unavailable");
           Value rowStride = stride(loc, destination, 0), colStride = stride(loc, destination, 1);
           b.create<dsa::StoreTileOp>(loc, result, destination,

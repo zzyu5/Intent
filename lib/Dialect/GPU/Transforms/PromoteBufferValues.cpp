@@ -418,8 +418,8 @@ static LogicalResult promoteBufferValuesImpl(ModuleOp module) {
   // These private writes now exist as SSA state transitions. Other observable
   // effects, including another physical slice of the same origin, stay required.
   (*kernel).walk([&](Operation *operation) {
-    if (isa<StoreOp, ScatterReduceOp, AtomicStoreOp, AtomicRMWOp,
-            AtomicCompareExchangeOp>(operation))
+    if (auto access = dyn_cast<AccessOpInterface>(operation);
+        access && access.writesMemory())
       if (auto origin = operation->getAttrOfType<IntegerAttr>(originAttr))
         removedEffects.erase(origin.getInt());
   });

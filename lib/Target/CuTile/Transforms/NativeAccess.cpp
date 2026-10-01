@@ -75,10 +75,11 @@ FailureOr<Value> tileIndex(OpBuilder &builder, Location location, Value start,
   return failure();
 }
 
-FailureOr<SmallVector<Value>> orderedCoordinates(Operation *owner, Value resource,
-                                                 ValueRange coordinates,
-                                                 ArrayRef<int64_t> sourceAxes) {
-  auto view = cast<gpu::ViewType>(resource.getType());
+FailureOr<SmallVector<Value>> orderedCoordinates(gpu::AccessOpInterface access) {
+  Operation *owner = access.getOperation();
+  auto view = cast<gpu::ViewType>(access.getAccessResource().getType());
+  auto coordinates = access.getAccessCoordinates();
+  auto sourceAxes = access.getAccessSourceAxes();
   SmallVector<Value> result(view.getRank());
   for (auto [coordinate, sourceAxis] : llvm::zip(coordinates, sourceAxes))
     result[sourceAxis] = coordinate;
@@ -851,25 +852,25 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
   };
 
   for (gpu::LoadOp load : inputs.loads) {
+    auto access = cast<gpu::AccessOpInterface>(load.getOperation());
     gpu::PhysicalProgramAnalysis analysis(kernel);
-    auto view = dyn_cast<gpu::ViewType>(load.getResource().getType());
+    auto view = dyn_cast<gpu::ViewType>(access.getAccessResource().getType());
     if (!view)
       return load.emitOpError(
           "cuTile native load requires an external view resource");
     OpBuilder builder(load);
-    if (!isa<gpu::FragmentType>(load.getResult().getType())) {
-      FailureOr<SmallVector<Value>> indices = orderedCoordinates(
-          load, load.getResource(), load.getCoordinates(), load.getSourceAxes());
-      FailureOr<Value> fill = scalarFill(load, load.getFill());
+    if (!isa<gpu::FragmentType>(access.getAccessResult().getType())) {
+      FailureOr<SmallVector<Value>> indices = orderedCoordinates(access);
+      FailureOr<Value> fill = scalarFill(load, access.getAccessFill());
       if (failed(indices) || failed(fill) ||
           llvm::any_of(*indices, [](Value value) {
             return isa<gpu::FragmentType>(value.getType());
           }) ||
-          (load.getValid() && isa<gpu::FragmentType>(load.getValid().getType())))
+          (access.getAccessValidity() && isa<gpu::FragmentType>(access.getAccessValidity().getType())))
         return load.emitOpError(
             "cuTile scalar load requires scalar indices and validity");
       bool inBounds = scalarCoordinatesInView(*indices, view, kernel);
-      Value validity = load.getValid();
+      Value validity = access.getAccessValidity();
       Value padding = *fill;
       gpu::PhysicalAccessBoundaryFact boundary =
           analysis.boundaryValidity(load);
@@ -878,7 +879,7 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
         padding = {};
       }
       auto replacement = builder.create<ScalarLoadOp>(
-          load.getLoc(), load.getResult().getType(), load.getResource(), *indices,
+          load.getLoc(), access.getAccessResult().getType(), access.getAccessResource(), *indices,
           validity, padding,
           inBounds ? builder.getUnitAttr() : UnitAttr());
       if (Attribute origin = load->getAttr(gpu::originAttr))
@@ -886,25 +887,23 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
       rewriter.replace(load, ValueRange{replacement.getResult()});
       continue;
     }
-    auto result = cast<gpu::FragmentType>(load.getResult().getType());
+    auto result = cast<gpu::FragmentType>(access.getAccessResult().getType());
     const auto accessBounds = analysis.accessBounds(load);
     bool activeInBounds = accessBounds.isExact();
     // Vector inputs stay register loads, not cluster TMA payloads.
     bool vectorInput = matrixCompute && result.getShape().size() == 1;
     gpu::PhysicalAccessBoundaryFact boundary =
         analysis.boundaryValidity(load, /*allowRangeGuards=*/true);
-    FailureOr<NativeTileAccessPlan> plan = analyzeNativeTileAccess(
-        load, kernel, accessBounds, view, load.getCoordinates(),
-        load.getSourceAxes(), result);
+    FailureOr<NativeTileAccessPlan> plan = analyzeNativeTileAccess(access, kernel, accessBounds);
     FailureOr<MaterializedTileIndices> indices = failure();
     FailureOr<Value> originGuard = failure();
     if (!vectorInput && succeeded(plan) && boundary.isExact() &&
-        (!load.getFill() || isZeroFill(load.getFill())))
+        (!access.getAccessFill() || isZeroFill(access.getAccessFill())))
       indices = materializeTileIndices(builder, load, *plan,
                                        /*allowDynamicAlignment=*/true);
     if (succeeded(indices))
       originGuard = materializeTileOriginGuard(
-          builder, load, load.getResource(), *plan, boundary);
+          builder, load, access.getAccessResource(), *plan, boundary);
     Value rangeGuard = succeeded(indices)
                            ? materializeFullRangeGuard(builder, load.getLoc(),
                                                        boundary)
@@ -912,7 +911,7 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
     bool guardedNative = succeeded(originGuard) && *originGuard;
     bool native = succeeded(indices) && succeeded(originGuard) &&
                   (!guardedNative ||
-                   (load.getFill() && load.getFill().getType() == result));
+                   (access.getAccessFill() && access.getAccessFill().getType() == result));
     if (rangeGuard && guardedNative)
       rangeGuard = builder.create<gpu::BinaryOp>(
           load.getLoc(), builder.getI1Type(), rangeGuard, *originGuard,
@@ -947,7 +946,7 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
             extent.getValue() == 1)
           continue;
         Value size = nested.create<gpu::DimOp>(
-            load.getLoc(), nested.getIndexType(), load.getResource(), axis);
+            load.getLoc(), nested.getIndexType(), access.getAccessResource(), axis);
         Value width = nested.create<gpu::PhysicalExprOp>(
             load.getLoc(), nested.getIndexType(), extent);
         Value remainder = nested.create<gpu::BinaryOp>(
@@ -961,7 +960,7 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
             BinaryOperator::LogicalAnd);
       }
       auto tile = nested.create<TileLoadOp>(
-          load.getLoc(), plan->resourceType, load.getResource(), *allowTMA,
+          load.getLoc(), plan->resourceType, access.getAccessResource(), *allowTMA,
           indices->values, loopLatency, fullTiles);
       Value value = tile.getResult();
       createdOperations.push_back(tile);
@@ -981,14 +980,13 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
       return value;
     };
     auto emitGatherLoad = [&](OpBuilder &nested) -> FailureOr<Value> {
-      FailureOr<SmallVector<Value>> coordinates = orderedCoordinates(
-          load, load.getResource(), load.getCoordinates(), load.getSourceAxes());
+      FailureOr<SmallVector<Value>> coordinates = orderedCoordinates(access);
       if (failed(coordinates))
         return failure();
-      Value fill = uniformScalarFill(load.getFill());
-      bool fragmentFill = load.getFill() && !fill;
+      Value fill = uniformScalarFill(access.getAccessFill());
+      bool fragmentFill = access.getAccessFill() && !fill;
       if (fragmentFill) {
-        if (!load.getValid())
+        if (!access.getAccessValidity())
           return load.emitOpError(
               "fragment padding requires an explicit access validity");
         FailureOr<Value> zero = gpu::materializeScalarConstant(
@@ -1003,14 +1001,14 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
       if (failed(materialized))
         return failure();
       auto replacement = nested.create<GatherLoadOp>(
-          load.getLoc(), result, load.getResource(), *materialized,
-          load.getValid(), fill, loopLatency, identityAxes(view.getRank()),
+          load.getLoc(), result, access.getAccessResource(), *materialized,
+          access.getAccessValidity(), fill, loopLatency, identityAxes(view.getRank()),
           activeInBounds ? nested.getUnitAttr() : UnitAttr());
       createdOperations.push_back(replacement);
       if (fragmentFill) {
         auto selected = nested.create<gpu::SelectOp>(
-            load.getLoc(), result, load.getValid(), replacement.getResult(),
-            load.getFill());
+            load.getLoc(), result, access.getAccessValidity(), replacement.getResult(),
+            access.getAccessFill());
         createdOperations.push_back(selected);
         return selected.getResult();
       }
@@ -1027,7 +1025,7 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
       Value value = emitNativeLoad(inBounds);
       inBounds.create<scf::YieldOp>(load.getLoc(), value);
       OpBuilder outOfBounds = prepareBranch(conditional.getElseRegion());
-      outOfBounds.create<scf::YieldOp>(load.getLoc(), load.getFill());
+      outOfBounds.create<scf::YieldOp>(load.getLoc(), access.getAccessFill());
       return conditional.getResult(0);
     };
     auto emitGuardedNative = [&](OpBuilder &nested) -> FailureOr<Value> {
@@ -1086,12 +1084,13 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
   }
 
   for (gpu::GatherOp gather : inputs.gathers) {
+    auto access = cast<gpu::AccessOpInterface>(gather.getOperation());
     gpu::PhysicalProgramAnalysis analysis(kernel);
-    auto source = dyn_cast<gpu::FragmentType>(gather.getSource().getType());
-    auto result = dyn_cast<gpu::FragmentType>(gather.getResult().getType());
+    auto source = dyn_cast<gpu::FragmentType>(access.getAccessResource().getType());
+    auto result = dyn_cast<gpu::FragmentType>(access.getAccessResult().getType());
     if (!source)
       return gather.emitOpError("cuTile tile extraction requires a source fragment");
-    if (gather.getCoordinates().size() != gather.getSourceAxes().size())
+    if (access.getAccessCoordinates().size() != access.getAccessSourceAxes().size())
       return gather.emitOpError("cuTile tile extraction source axes are incomplete");
     SmallVector<Value> coordinates(source.getShape().size());
     OpBuilder builder(gather);
@@ -1101,7 +1100,7 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
     SmallVector<Attribute> extractionShape(source.getShape().size(), unit);
     SmallVector<bool> slicedAxes(source.getShape().size(), false);
     for (auto [coordinate, sourceAxis] :
-         llvm::zip(gather.getCoordinates(), gather.getSourceAxes())) {
+         llvm::zip(access.getAccessCoordinates(), access.getAccessSourceAxes())) {
       if (sourceAxis < 0 ||
           sourceAxis >= static_cast<int64_t>(coordinates.size()) ||
           coordinates[sourceAxis])
@@ -1216,12 +1215,12 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
       } else {
         if (isa<gpu::FragmentType>(coordinate.getType()))
           return gather.emitOpError("cuTile scalar extraction requires scalar coordinates");
-        if (gather.getValid()) {
+        if (access.getAccessValidity()) {
           Value zero = builder.create<arith::ConstantOp>(
               gather.getLoc(), coordinate.getType(),
               builder.getIntegerAttr(coordinate.getType(), 0));
           coordinate = builder.create<gpu::SelectOp>(
-              gather.getLoc(), coordinate.getType(), gather.getValid(), coordinate, zero);
+              gather.getLoc(), coordinate.getType(), access.getAccessValidity(), coordinate, zero);
         }
       }
       coordinates[sourceAxis] = coordinate;
@@ -1245,13 +1244,13 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
       if (!coordinate.getType().isInteger(32))
         coordinate = builder.create<gpu::CastOp>(
             gather.getLoc(), builder.getI32Type(), coordinate);
-    Value tile = gather.getSource();
+    Value tile = access.getAccessResource();
     for (unsigned axis = 0; axis < slicedAxes.size(); ++axis)
       if (slicedAxes[axis])
         tile = repeatTileForExtraction(
             builder, gather.getLoc(), tile, axis,
             cast<gpu::PhysicalExprAttr>(extractionShape[axis]));
-    Type extractedType = gather.getResult().getType();
+    Type extractedType = access.getAccessResult().getType();
     if (result) {
       SmallVector<Attribute> shape, maps;
       auto tileType = cast<gpu::FragmentType>(tile.getType());
@@ -1278,7 +1277,7 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
     if (Attribute origin = gather->getAttr(gpu::originAttr))
       replacement->setAttr(gpu::originAttr, origin);
     Value value = replacement.getResult();
-    if (extractedType != gather.getResult().getType()) {
+    if (extractedType != access.getAccessResult().getType()) {
       auto extracted = cast<gpu::FragmentType>(extractedType);
       if (gpu::queryBroadcastProjection(extracted, result).isExact()) {
         value = builder.create<gpu::BroadcastOp>(gather.getLoc(), result, value);
@@ -1291,10 +1290,10 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
             gather.getLoc(), result, value, *reassociation);
       }
     }
-    if (gather.getValid()) {
+    if (access.getAccessValidity()) {
       auto selected = builder.create<gpu::SelectOp>(
-          gather.getLoc(), gather.getResult().getType(), gather.getValid(),
-          value, gather.getFill());
+          gather.getLoc(), access.getAccessResult().getType(), access.getAccessValidity(),
+          value, access.getAccessFill());
       if (Attribute origin = gather->getAttr(gpu::originAttr))
         selected->setAttr(gpu::originAttr, origin);
       value = selected.getResult();
@@ -1303,28 +1302,27 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
   }
 
   for (gpu::AtomicRMWOp atomic : inputs.atomics) {
+    auto access = cast<gpu::AccessOpInterface>(atomic.getOperation());
     gpu::PhysicalProgramAnalysis analysis(kernel);
     const auto accessBounds = analysis.accessBounds(atomic);
     bool activeInBounds = accessBounds.isExact();
-    auto view = dyn_cast<gpu::ViewType>(atomic.getResource().getType());
+    auto view = dyn_cast<gpu::ViewType>(access.getAccessResource().getType());
     if (!view)
       return atomic.emitOpError(
           "cuTile atomic RMW requires an external view resource");
-    if (atomic.getValid() &&
-        (!atomic.getResult().use_empty() || view.getRank() == 0))
+    if (access.getAccessValidity() &&
+        (!access.getAccessResult().use_empty() || view.getRank() == 0))
       return atomic.emitOpError(
           "masked cuTile array atomic requires a ranked view and an unused old value");
-    auto tileType = dyn_cast<gpu::FragmentType>(atomic.getValue().getType());
+    auto tileType = dyn_cast<gpu::FragmentType>(access.getAccessPayloads().front().getType());
     Type element = view.getElementType();
     if (tileType && (element.isF16() || element.isBF16()) &&
         atomic.getKind() == AtomicRMWKind::Add &&
         atomic.getOrdering() == AtomicOrdering::Relaxed &&
         atomic.getSharing() == gpu::AtomicSharingDomain::KernelInvocation &&
-        atomic.getResult().use_empty()) {
+        access.getAccessResult().use_empty()) {
       auto boundary = analysis.boundaryValidity(atomic);
-      auto plan = analyzeNativeTileAccess(
-          atomic, kernel, accessBounds, view, atomic.getCoordinates(),
-          atomic.getSourceAxes(), tileType);
+      auto plan = analyzeNativeTileAccess(access, kernel, accessBounds);
       OpBuilder builder(atomic);
       FailureOr<MaterializedTileIndices> indices = failure();
       FailureOr<Value> originGuard = failure();
@@ -1333,10 +1331,10 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
                                          /*allowDynamicAlignment=*/false);
       if (succeeded(indices) && !indices->alignment)
         originGuard = materializeTileOriginGuard(
-            builder, atomic, atomic.getResource(), *plan, boundary);
+            builder, atomic, access.getAccessResource(), *plan, boundary);
       if (succeeded(originGuard)) {
         auto emit = [&](OpBuilder &nested) {
-          Value value = atomic.getValue();
+          Value value = access.getAccessPayloads().front();
           if (!isIdentityPermutation(plan->toResource))
             value = nested.create<gpu::TransposeOp>(
                 atomic.getLoc(), plan->packedType, value, plan->toResource);
@@ -1345,7 +1343,7 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
                 atomic.getLoc(), plan->resourceType, value,
                 plan->packedToResource);
           auto replacement = nested.create<TileAtomicAddOp>(
-              atomic.getLoc(), atomic.getResource(), indices->values, value);
+              atomic.getLoc(), access.getAccessResource(), indices->values, value);
           if (Attribute origin = atomic->getAttr(gpu::originAttr))
             replacement->setAttr(gpu::originAttr, origin);
         };
@@ -1363,28 +1361,26 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
         continue;
       }
     }
-    FailureOr<SmallVector<Value>> coordinates = orderedCoordinates(
-        atomic, atomic.getResource(), atomic.getCoordinates(),
-        atomic.getSourceAxes());
+    FailureOr<SmallVector<Value>> coordinates = orderedCoordinates(access);
     if (failed(coordinates))
       return failure();
     OpBuilder builder(atomic);
-    if (auto target = dyn_cast<gpu::FragmentType>(atomic.getValue().getType())) {
+    if (auto target = dyn_cast<gpu::FragmentType>(access.getAccessPayloads().front().getType())) {
       FailureOr<SmallVector<Value>> materialized =
           materializeCoordinateDomains(builder, atomic, *coordinates, target);
       if (failed(materialized))
         return failure();
       coordinates = std::move(*materialized);
     }
-    if (atomic.getValid()) {
+    if (access.getAccessValidity()) {
       // Native array atomics suppress out-of-bounds lanes but leave their
       // returned old values unspecified. The old value is unused here, so
       // encode the validity in the existing native bounds predicate.
-      Type coordinateType = withElementType(atomic.getValue().getType(),
+      Type coordinateType = withElementType(access.getAccessPayloads().front().getType(),
                                             builder.getIndexType());
       Value zero = builder.create<arith::ConstantIndexOp>(atomic.getLoc(), 0);
       Value end = builder.create<gpu::DimOp>(
-          atomic.getLoc(), builder.getIndexType(), atomic.getResource(), 0);
+          atomic.getLoc(), builder.getIndexType(), access.getAccessResource(), 0);
       for (auto [axis, coordinate] : llvm::enumerate(*coordinates)) {
         Type indexed = withElementType(coordinate.getType(),
                                        builder.getIndexType());
@@ -1399,13 +1395,13 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
           return atomic.emitOpError(
               "masked atomic coordinate cannot adopt its value domain");
         (*coordinates)[axis] = builder.create<gpu::SelectOp>(
-            atomic.getLoc(), coordinateType, atomic.getValid(), *active,
+            atomic.getLoc(), coordinateType, access.getAccessValidity(), *active,
             *inactive);
       }
     }
     auto replacement = builder.create<AtomicRMWOp>(
-        atomic.getLoc(), atomic.getResult().getType(), atomic.getResource(),
-        *coordinates, atomic.getValue(), atomic.getKind(), atomic.getOrdering(),
+        atomic.getLoc(), access.getAccessResult().getType(), access.getAccessResource(),
+        *coordinates, access.getAccessPayloads().front(), atomic.getKind(), atomic.getOrdering(),
         atomic.getSharing(), activeInBounds ? builder.getUnitAttr() : UnitAttr());
     if (Attribute origin = atomic->getAttr(gpu::originAttr))
       replacement->setAttr(gpu::originAttr, origin);
@@ -1413,30 +1409,30 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
   }
 
   for (gpu::StoreOp store : inputs.stores) {
+    auto access = cast<gpu::AccessOpInterface>(store.getOperation());
     gpu::PhysicalProgramAnalysis analysis(kernel);
-    auto view = dyn_cast<gpu::ViewType>(store.getResource().getType());
+    auto view = dyn_cast<gpu::ViewType>(access.getAccessResource().getType());
     if (!view)
       return store.emitOpError(
           "cuTile native store requires an external unique-write view");
     OpBuilder builder(store);
-    if (!isa<gpu::FragmentType>(store.getValue().getType())) {
-      FailureOr<SmallVector<Value>> indices = orderedCoordinates(
-          store, store.getResource(), store.getCoordinates(), store.getSourceAxes());
+    if (!isa<gpu::FragmentType>(access.getAccessPayloads().front().getType())) {
+      FailureOr<SmallVector<Value>> indices = orderedCoordinates(access);
       if (failed(indices) ||
           llvm::any_of(*indices, [](Value value) {
             return isa<gpu::FragmentType>(value.getType());
           }) ||
-          (store.getValid() && isa<gpu::FragmentType>(store.getValid().getType())))
+          (access.getAccessValidity() && isa<gpu::FragmentType>(access.getAccessValidity().getType())))
         return store.emitOpError(
             "cuTile scalar store requires scalar indices and validity");
       bool inBounds = scalarCoordinatesInView(*indices, view, kernel);
-      Value validity = store.getValid();
+      Value validity = access.getAccessValidity();
       gpu::PhysicalAccessBoundaryFact boundary =
           analysis.boundaryValidity(store);
       if (inBounds && boundary.isExact())
         validity = {};
       auto replacement = builder.create<ScalarStoreOp>(
-          store.getLoc(), store.getResource(), *indices, store.getValue(),
+          store.getLoc(), access.getAccessResource(), *indices, access.getAccessPayloads().front(),
           validity, inBounds ? builder.getUnitAttr() : UnitAttr());
       if (Attribute origin = store->getAttr(gpu::originAttr))
         replacement->setAttr(gpu::originAttr, origin);
@@ -1448,10 +1444,8 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
     const auto accessBounds = analysis.accessBounds(store);
     bool activeInBounds = accessBounds.isExact();
     auto computationType =
-        cast<gpu::FragmentType>(store.getValue().getType());
-    FailureOr<NativeTileAccessPlan> plan = analyzeNativeTileAccess(
-        store, kernel, accessBounds, view, store.getCoordinates(),
-        store.getSourceAxes(), computationType);
+        cast<gpu::FragmentType>(access.getAccessPayloads().front().getType());
+    FailureOr<NativeTileAccessPlan> plan = analyzeNativeTileAccess(access, kernel, accessBounds);
     FailureOr<MaterializedTileIndices> indices = failure();
     FailureOr<Value> originGuard = failure();
     if (succeeded(plan) && boundary.isExact())
@@ -1459,7 +1453,7 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
                                        /*allowDynamicAlignment=*/true);
     if (succeeded(indices))
       originGuard = materializeTileOriginGuard(
-          builder, store, store.getResource(), *plan, boundary);
+          builder, store, access.getAccessResource(), *plan, boundary);
     bool native = succeeded(indices) && succeeded(originGuard);
     bool guardedNative = native && *originGuard;
     Value nativeCondition;
@@ -1483,7 +1477,7 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
     }
     SmallVector<Operation *> createdOperations;
     auto emitNativeStore = [&](OpBuilder &nested) {
-      Value nativeValue = store.getValue();
+      Value nativeValue = access.getAccessPayloads().front();
       if (!isIdentityPermutation(plan->toResource)) {
         auto transpose = nested.create<gpu::TransposeOp>(
             store.getLoc(), plan->packedType, nativeValue,
@@ -1499,7 +1493,7 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
         createdOperations.push_back(reshape);
       }
       auto tile = nested.create<TileStoreOp>(
-          store.getLoc(), store.getResource(), *allowTMA, indices->values,
+          store.getLoc(), access.getAccessResource(), *allowTMA, indices->values,
           nativeValue);
       createdOperations.push_back(tile);
     };
@@ -1519,18 +1513,17 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
       outOfBounds.create<scf::YieldOp>(store.getLoc());
     };
     auto emitScatterStore = [&](OpBuilder &nested) -> LogicalResult {
-      FailureOr<SmallVector<Value>> coordinates = orderedCoordinates(
-          store, store.getResource(), store.getCoordinates(), store.getSourceAxes());
+      FailureOr<SmallVector<Value>> coordinates = orderedCoordinates(access);
       if (failed(coordinates))
         return failure();
-      auto target = cast<gpu::FragmentType>(store.getValue().getType());
+      auto target = cast<gpu::FragmentType>(access.getAccessPayloads().front().getType());
       FailureOr<SmallVector<Value>> materialized =
           materializeCoordinateDomains(nested, store, *coordinates, target);
       if (failed(materialized))
         return failure();
       auto replacement = nested.create<ScatterStoreOp>(
-          store.getLoc(), store.getResource(), *materialized, store.getValue(),
-          store.getValid(), identityAxes(view.getRank()),
+          store.getLoc(), access.getAccessResource(), *materialized, access.getAccessPayloads().front(),
+          access.getAccessValidity(), identityAxes(view.getRank()),
           activeInBounds ? nested.getUnitAttr() : UnitAttr());
       createdOperations.push_back(replacement);
       return success();

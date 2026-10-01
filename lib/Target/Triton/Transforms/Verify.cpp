@@ -41,21 +41,12 @@ bool isTritonDataType(Type type) {
 }
 
 
-LogicalResult verifyAccess(Operation *operation, Value resource,
-                           ValueRange coordinates,
-                           ArrayRef<int64_t> sourceAxes) {
-  auto view = dyn_cast<gpu::ViewType>(resource.getType());
+LogicalResult verifyAccess(gpu::AccessOpInterface access) {
+  Operation *operation = access.getOperation();
+  auto view = dyn_cast<gpu::ViewType>(access.getAccessResource().getType());
   if (!view)
     return operation->emitOpError(
         "Triton pointer access requires a legalized external-view resource");
-  if (coordinates.size() != sourceAxes.size())
-    return operation->emitOpError(
-        "Triton access coordinates and source axes are not bijective");
-  llvm::SmallDenseSet<int64_t> seen;
-  for (int64_t axis : sourceAxes)
-    if (axis < 0 || axis >= view.getRank() || !seen.insert(axis).second)
-      return operation->emitOpError(
-          "Triton access contains an invalid or duplicate source axis");
   return success();
 }
 
@@ -192,33 +183,26 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
         return WalkResult::interrupt();
       }
     }
-    if (auto load = dyn_cast<gpu::LoadOp>(operation)) {
-      if (failed(verifyAccess(operation, load.getResource(),
-                              load.getCoordinates(), load.getSourceAxes())))
-        return WalkResult::interrupt();
-    } else if (auto store = dyn_cast<gpu::StoreOp>(operation)) {
-      if (failed(verifyAccess(operation, store.getResource(),
-                              store.getCoordinates(), store.getSourceAxes()))) {
-        return WalkResult::interrupt();
+    if (auto access = dyn_cast<gpu::AccessOpInterface>(operation)) {
+      switch (access.getAccessKind()) {
+      case gpu::AccessKind::AtomicCompareExchange:
+        if (access.getAccessValidity()) {
+          operation->emitOpError(
+              "Triton tl.atomic_cas has no mask and cannot preserve physical validity");
+          return WalkResult::interrupt();
+        }
+        [[fallthrough]];
+      case gpu::AccessKind::Load:
+      case gpu::AccessKind::Store:
+      case gpu::AccessKind::AtomicStore:
+      case gpu::AccessKind::AtomicRMW:
+        if (failed(verifyAccess(access))) return WalkResult::interrupt();
+        break;
+      default:
+        // Pure fragment gathers and unsupported atomic/scatter kinds retain
+        // their provider-specific legality checks.
+        break;
       }
-    } else if (auto atomic = dyn_cast<gpu::AtomicStoreOp>(operation)) {
-      if (failed(verifyAccess(operation, atomic.getResource(),
-                              atomic.getCoordinates(), atomic.getSourceAxes())))
-        return WalkResult::interrupt();
-    } else if (auto atomic = dyn_cast<gpu::AtomicRMWOp>(operation)) {
-      if (failed(verifyAccess(operation, atomic.getResource(),
-                              atomic.getCoordinates(), atomic.getSourceAxes())))
-        return WalkResult::interrupt();
-    } else if (auto atomic =
-                   dyn_cast<gpu::AtomicCompareExchangeOp>(operation)) {
-      if (atomic.getValid()) {
-        atomic.emitOpError(
-            "Triton tl.atomic_cas has no mask and cannot preserve physical validity");
-        return WalkResult::interrupt();
-      }
-      if (failed(verifyAccess(operation, atomic.getResource(),
-                              atomic.getCoordinates(), atomic.getSourceAxes())))
-        return WalkResult::interrupt();
     }
     if (auto contract = dyn_cast<gpu::ContractOp>(operation)) {
       std::string reason;

@@ -4,6 +4,7 @@
 include "Intent/Dialect/GPU/IR/GPUDialect.td"
 include "Intent/Dialect/GPU/IR/GPUAttrs.td"
 include "Intent/Dialect/GPU/IR/GPUTypes.td"
+include "Intent/Dialect/GPU/IR/AccessOpInterface.td"
 include "Intent/Dialect/Intent/IR/IntentAttrs.td"
 include "Intent/Interfaces/StructuredOpInterface.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
@@ -12,6 +13,31 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 
 class IntentGPU_Op<string mnemonic, list<Trait> traits = []> :
     Op<IntentGPU_Dialect, mnemonic, traits>;
+
+class IntentGPU_AccessOp<string mnemonic, string kind, string resource,
+                         string payloads, string valueType, int payloadCount,
+                         list<Trait> traits = [], string extra = ""> :
+    IntentGPU_Op<mnemonic, !listconcat(traits, [IntentGPU_AccessOpInterface])> {
+  let extraClassDeclaration =
+    "::intent::gpu::AccessKind getAccessKind() { return ::intent::gpu::AccessKind::" # kind # "; }\n" #
+    "::mlir::OpOperand &getAccessResourceOperand() { return " # resource # "; }\n" #
+    "::mlir::MutableOperandRange getAccessPayloadsMutable() { return " # payloads # "; }\n" #
+    "::mlir::Type getAccessValueType() { return " # valueType # "; }\n" #
+    "::mlir::LogicalResult verifyAccessOperandGroups() {\n" #
+    "  if (getODSOperands(0).size() != 1) return emitOpError(\"requires one access resource/source operand\");\n" #
+    "  for (int slot = 0; slot < " # !cast<string>(payloadCount) # "; ++slot)\n" #
+    "    if (getODSOperands(2 + slot).size() != 1) return emitOpError(\"requires one operand per access payload group\");\n" #
+    "  return ::mlir::success();\n" #
+    "}\n" # extra;
+}
+
+class IntentGPU_ReadOp<string mnemonic, string kind, string resource,
+                       list<Trait> traits = []> :
+    IntentGPU_AccessOp<mnemonic, kind, resource,
+      "::mlir::MutableOperandRange(getOperation(), 0, 0)",
+      "getResult().getType()", 0, traits,
+    "::mlir::Value getAccessFill() { return getFill(); }\n" #
+    "std::optional<::mlir::MutableOperandRange> getAccessFillMutable() { return getFillMutable(); }\n">;
 
 def IntentGPU_ParameterOp : IntentGPU_Op<"parameter", [Pure]> {
   let arguments = (ins IntentGPU_Parameter:$parameter);
@@ -178,7 +204,7 @@ def IntentGPU_ExtractOp : IntentGPU_Op<"extract", [Pure]> {
   let hasVerifier = 1;
 }
 
-def IntentGPU_LoadOp : IntentGPU_Op<"load", [
+def IntentGPU_LoadOp : IntentGPU_ReadOp<"load", "Load", "getResourceMutable()", [
     AttrSizedOperandSegments,
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
   ]> {
@@ -188,17 +214,15 @@ def IntentGPU_LoadOp : IntentGPU_Op<"load", [
                        Optional<IntentGPU_DataValue>:$fill,
                        DenseI64ArrayAttr:$source_axes);
   let results = (outs IntentGPU_DataValue:$result);
-  let hasVerifier = 1;
 }
 
-def IntentGPU_GatherOp : IntentGPU_Op<"gather", [Pure, AttrSizedOperandSegments]> {
+def IntentGPU_GatherOp : IntentGPU_ReadOp<"gather", "Gather", "getSourceMutable()", [Pure, AttrSizedOperandSegments]> {
   let arguments = (ins IntentGPU_DataValue:$source,
                        Variadic<IntentGPU_DataValue>:$coordinates,
                        Optional<IntentGPU_DataValue>:$valid,
                        Optional<IntentGPU_DataValue>:$fill,
                        DenseI64ArrayAttr:$source_axes);
   let results = (outs IntentGPU_DataValue:$result);
-  let hasVerifier = 1;
 }
 
 def IntentGPU_AssumeInBoundsOp : IntentGPU_Op<"assume_in_bounds", [Pure]> {
@@ -208,7 +232,8 @@ def IntentGPU_AssumeInBoundsOp : IntentGPU_Op<"assume_in_bounds", [Pure]> {
   let hasVerifier = 1;
 }
 
-def IntentGPU_StoreOp : IntentGPU_Op<"store", [
+def IntentGPU_StoreOp : IntentGPU_AccessOp<"store", "Store", "getResourceMutable()",
+    "::mlir::MutableOperandRange(getValueMutable())", "getValue().getType()", 1, [
     AttrSizedOperandSegments,
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
   ]> {
@@ -401,7 +426,8 @@ def IntentGPU_HistogramOp : IntentGPU_Op<"histogram", [Pure]> {
   let hasVerifier = 1;
 }
 
-def IntentGPU_ScatterReduceOp : IntentGPU_Op<"scatter_reduce", [
+def IntentGPU_ScatterReduceOp : IntentGPU_AccessOp<"scatter_reduce", "ScatterReduce", "getResourceMutable()",
+    "::mlir::MutableOperandRange(getValueMutable())", "getValue().getType()", 1, [
     AttrSizedOperandSegments,
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
   ]> {
@@ -415,7 +441,8 @@ def IntentGPU_ScatterReduceOp : IntentGPU_Op<"scatter_reduce", [
   let hasVerifier = 1;
 }
 
-def IntentGPU_AtomicLoadOp : IntentGPU_Op<"atomic_load", [
+def IntentGPU_AtomicLoadOp : IntentGPU_AccessOp<"atomic_load", "AtomicLoad", "getResourceMutable()",
+    "::mlir::MutableOperandRange(getOperation(), 0, 0)", "getResult().getType()", 0, [
     AttrSizedOperandSegments, MemoryEffects<[MemRead]>
   ]> {
   let arguments = (ins IntentGPU_ResourceValue:$resource,
@@ -428,7 +455,8 @@ def IntentGPU_AtomicLoadOp : IntentGPU_Op<"atomic_load", [
   let hasVerifier = 1;
 }
 
-def IntentGPU_AtomicStoreOp : IntentGPU_Op<"atomic_store", [
+def IntentGPU_AtomicStoreOp : IntentGPU_AccessOp<"atomic_store", "AtomicStore", "getResourceMutable()",
+    "::mlir::MutableOperandRange(getValueMutable())", "getValue().getType()", 1, [
     AttrSizedOperandSegments, MemoryEffects<[MemWrite]>
   ]> {
   let arguments = (ins IntentGPU_ResourceValue:$resource,
@@ -441,7 +469,8 @@ def IntentGPU_AtomicStoreOp : IntentGPU_Op<"atomic_store", [
   let hasVerifier = 1;
 }
 
-def IntentGPU_AtomicRMWOp : IntentGPU_Op<"atomic_rmw", [
+def IntentGPU_AtomicRMWOp : IntentGPU_AccessOp<"atomic_rmw", "AtomicRMW", "getResourceMutable()",
+    "::mlir::MutableOperandRange(getValueMutable())", "getValue().getType()", 1, [
     AttrSizedOperandSegments, MemoryEffects<[MemRead, MemWrite]>
   ]> {
   let arguments = (ins IntentGPU_ResourceValue:$resource,
@@ -456,7 +485,8 @@ def IntentGPU_AtomicRMWOp : IntentGPU_Op<"atomic_rmw", [
   let hasVerifier = 1;
 }
 
-def IntentGPU_AtomicCompareExchangeOp : IntentGPU_Op<"atomic_compare_exchange", [
+def IntentGPU_AtomicCompareExchangeOp : IntentGPU_AccessOp<"atomic_compare_exchange", "AtomicCompareExchange", "getResourceMutable()",
+    "::mlir::MutableOperandRange(getOperation(), getExpectedMutable().getOperandNumber(), 2)", "getExpected().getType()", 2, [
     AttrSizedOperandSegments, MemoryEffects<[MemRead, MemWrite]>
   ]> {
   let arguments = (ins IntentGPU_ResourceValue:$resource,

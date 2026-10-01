@@ -238,13 +238,14 @@ CanonicalKernelAnalysis::resultProvenance(OpResult result) {
 
 FailureOr<IndexRelationFact>
 CanonicalKernelAnalysis::indexRelation(Operation *operation) {
-  auto relation = operation->getAttrOfType<IndexRelationAttr>("index");
+  auto access = dyn_cast<IndexedAccessOpInterface>(operation);
+  if (!access) return failure();
+  auto relation = access.getIndexRelation();
   auto terms = relation ? relation.getTerms() : ArrayAttr();
-  if (!relation || !terms ||
-      operation->getNumOperands() == 0)
+  if (!relation || !terms)
     return failure();
   IndexRelationFact result;
-  result.source = operation->getOperand(0);
+  result.source = access.getAccessSource();
   result.sourceRank = relation.getSourceRank();
   result.resultDimensionIdentities.append(
       relation.getResultDimensions().asArrayRef().begin(),
@@ -259,15 +260,17 @@ CanonicalKernelAnalysis::indexRelation(Operation *operation) {
     if (fact.kind != 1)
       fact.sourceAxis = sourceAxis++;
     for (int64_t operand : term.getOperandPositions().asArrayRef()) {
-      if (operand == -1)
+      if (operand == -1) {
+        fact.operands.push_back({});
         continue;
-      if (operand < 0 || operand >= operation->getNumOperands())
+      }
+      if (operand < 0 || operand >= access.getIndexOperands().size())
         return failure();
-      fact.operands.push_back(operation->getOperand(operand));
+      fact.operands.push_back(access.getIndexOperands()[operand]);
     }
     for (int64_t value : term.getStaticValues().asArrayRef())
       fact.staticValues.push_back(
-          value == std::numeric_limits<int64_t>::min()
+          fact.kind == 5 && value == std::numeric_limits<int64_t>::min()
               ? std::nullopt
               : std::optional<int64_t>(value));
     fact.coordinate = knownWithoutCoordinates();
@@ -324,7 +327,7 @@ CanonicalKernelAnalysis::logicalBuffer(Operation *operation) const {
     return fact;
   fact.state = CanonicalFactState::Exact;
   fact.instanceIdentity = type.getOriginId();
-  fact.hasFullInitialValue = static_cast<bool>(buffer.getInitialOperand());
+  fact.hasFullInitialValue = static_cast<bool>(buffer.getInitial());
   for (Operation *parent = operation->getParentOp(); parent;
        parent = parent->getParentOp()) {
     if (isa<ForOp, WhileOp>(parent)) {
@@ -401,7 +404,7 @@ LogicalResult CanonicalKernelAnalysis::verify() {
         return WalkResult::interrupt();
       }
     }
-    if (operation->hasAttr("index") && failed(indexRelation(operation))) {
+    if (isa<IndexedAccessOpInterface>(operation) && failed(indexRelation(operation))) {
       operation->emitOpError(
           "canonical index relation analysis could not consume the typed relation");
       result = failure();

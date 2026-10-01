@@ -105,10 +105,10 @@ bool canPredicate(Block &block, bool allowStores = false,
         }))
       return false;
     ValueRange coordinates;
-    if (auto load = dyn_cast<LoadOp>(operation))
-      coordinates = load.getCoordinates();
-    else if (auto gather = dyn_cast<GatherOp>(operation))
-      coordinates = gather.getCoordinates();
+    if (auto access = dyn_cast<AccessOpInterface>(operation);
+        access && (access.getAccessKind() == AccessKind::Load ||
+                   access.getAccessKind() == AccessKind::Gather))
+      coordinates = access.getAccessCoordinates();
     if (!llvm::all_of(coordinates, [&](Value coordinate) {
           if (allowAssumptions && !coordinate.getType().isIntOrIndex())
             return false;
@@ -137,17 +137,16 @@ void dischargeScalarAssumptions(Block &block) {
   // Close the accesses with explicit validity before removing that lexical fact.
   // These guards are true for every active access of a legal source program.
   for (Operation &operation : llvm::make_early_inc_range(block.without_terminator())) {
-    auto load = dyn_cast<LoadOp>(operation);
-    auto store = dyn_cast<StoreOp>(operation);
-    if (!load && !store)
+    auto access = dyn_cast<AccessOpInterface>(operation);
+    if (!access || (access.getAccessKind() != AccessKind::Load &&
+                    access.getAccessKind() != AccessKind::Store))
       continue;
-    Value resource = load ? load.getResource() : store.getResource();
-    SmallVector<Value> coordinates = llvm::to_vector(
-        load ? load.getCoordinates() : store.getCoordinates());
+    Value resource = access.getAccessResource();
+    SmallVector<Value> coordinates(access.getAccessCoordinates());
     if (coordinates.empty())
       continue;
-    ArrayRef<int64_t> axes = load ? load.getSourceAxes() : store.getSourceAxes();
-    Value valid = load ? load.getValid() : store.getValid();
+    ArrayRef<int64_t> axes = access.getAccessSourceAxes();
+    Value valid = access.getAccessValidity();
     OpBuilder builder(&operation);
     Location location = operation.getLoc();
     Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
@@ -171,16 +170,11 @@ void dischargeScalarAssumptions(Block &block) {
       valid = valid ? Value(builder.create<BinaryOp>(location, builder.getI1Type(),
           valid, bounded, BinaryOperator::LogicalAnd)) : bounded;
     }
-    if (load) {
-      load.getCoordinatesMutable().assign(coordinates);
-      load.getValidMutable().assign(valid);
-      if (!load.getFill())
-        load.getFillMutable().assign(builder.create<arith::ConstantOp>(
-            location, builder.getZeroAttr(load.getType())).getResult());
-    } else {
-      store.getCoordinatesMutable().assign(coordinates);
-      store.getValidMutable().assign(valid);
-    }
+    access.getAccessCoordinatesMutable().assign(coordinates);
+    access.getAccessValidityMutable().assign(valid);
+    if (auto fill = access.getAccessFillMutable(); fill && !access.getAccessFill())
+      fill->assign(builder.create<arith::ConstantOp>(
+          location, builder.getZeroAttr(access.getAccessValueType())).getResult());
   }
   for (AssumeInBoundsOp assumption : assumptions)
     assumption.erase();
@@ -535,44 +529,49 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
       builder.create<YieldOp>(location, yielded);
     }
     clone = result;
-  } else if (auto store = dyn_cast<StoreOp>(operation)) {
-    clone = builder.create<StoreOp>(
-        location, mapped(store.getResource()), coordinates(store.getCoordinates()),
-        project(mapped(store.getValue()), resultType(store.getValue().getType())),
-        maskedValidity(store.getValid(), store.getValue().getType()),
-        store.getSourceAxes());
-  } else if (auto gather = dyn_cast<GatherOp>(operation)) {
-    clone = builder.create<GatherOp>(
-        location, resultType(gather.getType()), mapped(gather.getSource()),
-        coordinates(gather.getCoordinates()),
-        maskedValidity(gather.getValid(), gather.getType()),
-        fill(gather.getFill(), gather.getType()), gather.getSourceAxes());
-  } else if (auto load = dyn_cast<LoadOp>(operation)) {
+  } else if (auto access = dyn_cast<AccessOpInterface>(operation);
+             access && (access.getAccessKind() == AccessKind::Load ||
+                        access.getAccessKind() == AccessKind::Gather ||
+                        access.getAccessKind() == AccessKind::Store)) {
     // An executing independent chunk has at least one original iteration.
     // If every read operand is invariant across those iterations, the original
     // read (including its mask/fill) is already required. Keep its own axes and
     // let its consumers broadcast, rather than issuing one copy per new lane.
-    bool safeRead = shape && nonemptyIterations &&
+    bool plainLoad = access.getAccessKind() == AccessKind::Load;
+    bool safeRead = plainLoad && shape && nonemptyIterations &&
         llvm::none_of(operation->getOperands(), [&](Value value) {
           return hasIterationAxes(mapped(value).getType());
         });
-    auto view = dyn_cast<ViewType>(load.getResource().getType());
-    if (!shape && isa<FragmentType>(load.getType()) && view &&
+    auto view = dyn_cast<ViewType>(access.getAccessResource().getType());
+    if (plainLoad && !shape && isa<FragmentType>(access.getAccessValueType()) && view &&
         view.getAccess() == 0) {
-      PhysicalProgramAnalysis analysis(load->getParentOfType<func::FuncOp>());
-      auto bounds = analysis.accessBounds(load);
+      PhysicalProgramAnalysis analysis(operation->getParentOfType<func::FuncOp>());
+      auto bounds = analysis.accessBounds(operation);
       safeRead = bounds.isExact() && bounds.assumedAxes.empty();
     }
     // Value branches contain no writes. An independently bounded input read
     // can keep its original mask without acquiring unrelated lane dependence.
     if (safeRead)
       clone = builder.clone(*operation, mapping);
-    else
-      clone = builder.create<LoadOp>(
-          location, resultType(load.getType()), mapped(load.getResource()),
-          coordinates(load.getCoordinates()),
-          maskedValidity(load.getValid(), load.getType()),
-          fill(load.getFill(), load.getType()), load.getSourceAxes());
+    else {
+      SmallVector<Value> projectedCoordinates = coordinates(access.getAccessCoordinates());
+      SmallVector<Value> payloads;
+      for (Value payload : access.getAccessPayloads())
+        payloads.push_back(project(mapped(payload), resultType(payload.getType())));
+      Value validity = maskedValidity(access.getAccessValidity(), access.getAccessValueType());
+      Value inactive;
+      if (access.getAccessFillMutable())
+        inactive = fill(access.getAccessFill(), access.getAccessValueType());
+      clone = builder.clone(*operation, mapping);
+      auto replacement = cast<AccessOpInterface>(clone);
+      replacement.getAccessCoordinatesMutable().assign(projectedCoordinates);
+      replacement.getAccessPayloadsMutable().assign(payloads);
+      replacement.getAccessValidityMutable().assign(validity);
+      if (auto fillGroup = replacement.getAccessFillMutable())
+        fillGroup->assign(inactive);
+      for (Value result : clone->getResults())
+        result.setType(resultType(result.getType()));
+    }
   } else if (auto reshape = dyn_cast<ReshapeOp>(operation);
              reshape && hasIterationAxes(mapped(reshape.getValue()).getType())) {
     // Reassociation describes the original suffix. The independent iteration

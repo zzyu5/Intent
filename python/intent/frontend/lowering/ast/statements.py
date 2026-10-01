@@ -162,7 +162,7 @@ def _store_subscript(lowerer: object, target_node: ast.Subscript, expression: Ex
         lowerer.error(target_node, "pure tensor SSA cannot be mutated")
     if isinstance(target.type, TensorType):
         lowerer.require_writable_view(target, target_node)
-    lowered = lower_index(lowerer, target, target_node.slice, first_operand_position=2)
+    lowered = lower_index(lowerer, target, target_node.slice)
     value = lowerer.materialize(
         expression,
         target_node,
@@ -175,8 +175,8 @@ def _store_subscript(lowerer: object, target_node: ast.Subscript, expression: Ex
         target_node,
         expected_dtype=target.type.dtype,
     )
-    operands = (target, value, *lowered.operands)
-    attributes = {"index": lowered.relation, "value_operand_index": 1}
+    operands = (target, *lowered.operands, value)
+    attributes = {"index": lowered.relation}
     if isinstance(target.type, BufferType):
         opcode = OperationKind.BUFFER_STORE
         resource = ResourceKind.LOGICAL_BUFFER

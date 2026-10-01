@@ -221,7 +221,9 @@ private:
       if (expression.getKind() == 0) {
         size = constant(loc, expression.getPayload());
       } else {
-        Value operand = operation->getOperand(expression.getPayload());
+        Value operand = isa<BufferOp>(operation)
+            ? cast<BufferOp>(operation).getExtents()[expression.getPayload()]
+            : operation->getOperand(expression.getPayload());
         auto extent = indexValue(values.lookup(operand), operand.getType(), loc);
         if (failed(extent)) return failure();
         size = *extent;
@@ -561,8 +563,8 @@ private:
     if (failed(fact)) return failure();
     auto rank = advancedIndexRank(operation, *fact);
     if (failed(rank)) return failure();
-    unsigned position = operation->getAttrOfType<IntegerAttr>("value_operand_index").getInt();
-    Value input = values.lookup(operation->getOperand(position)), destination = values.lookup(fact->source);
+    auto access = cast<IndexedAccessOpInterface>(operation);
+    Value input = values.lookup(access.getStoredValue()), destination = values.lookup(fact->source);
     Location loc = operation->getLoc();
     SmallVector<Value> sizes, members;
     if (auto type = dyn_cast<MemRefType>(input.getType()))
@@ -587,6 +589,7 @@ private:
   }
 
   FailureOr<Value> indexedRead(Operation *operation, const IndexRelationFact &fact, Value source) {
+    auto access = cast<IndexedAccessOpInterface>(operation);
     Type resultType = operation->getResult(0).getType();
     auto tensor = dyn_cast<RankedTensorType>(resultType);
     auto rank = advancedIndexRank(operation, fact);
@@ -597,16 +600,14 @@ private:
         return nested.create<memref::LoadOp>(loc, source, coordinates);
       };
       if (alwaysValid(operation)) return load();
-      unsigned validPosition = operation->getAttrOfType<IntegerAttr>("valid_operand_index").getInt();
-      unsigned fillPosition = operation->getAttrOfType<IntegerAttr>("fill_operand_index").getInt();
-      Value active = elementAt(values.lookup(operation->getOperand(validPosition)), members, nested, loc);
+      Value active = elementAt(values.lookup(access.getAccessValidity()), members, nested, loc);
       auto conditional = nested.create<scf::IfOp>(loc, TypeRange{getElementTypeOrSelf(resultType)}, active, true);
       {
         OpBuilder::InsertionGuard guard(nested);
         nested.setInsertionPointToStart(conditional.thenBlock());
         nested.create<scf::YieldOp>(loc, load());
         nested.setInsertionPointToStart(conditional.elseBlock());
-        Value fill = elementAt(values.lookup(operation->getOperand(fillPosition)), members, nested, loc);
+        Value fill = elementAt(values.lookup(access.getAccessFill()), members, nested, loc);
         nested.create<scf::YieldOp>(loc, fill);
       }
       return conditional.getResult(0);
@@ -628,6 +629,7 @@ private:
   }
 
   LogicalResult atomicAccess(Operation *operation) {
+    auto access = cast<IndexedAccessOpInterface>(operation);
     auto fact = analysis.indexRelation(operation);
     if (failed(fact)) return failure();
     auto rank = advancedIndexRank(operation, *fact);
@@ -639,7 +641,7 @@ private:
     SmallVector<Type> resultTypes;
     for (Type type : operation->getResultTypes()) flattenTypes(type, resultTypes);
     Type accessType = resultTypes.empty()
-        ? operation->getOperand(cast<AtomicStoreOp>(operation).getValueOperand()).getType()
+        ? access.getStoredValue().getType()
         : resultTypes.front();
     auto tensor = dyn_cast<RankedTensorType>(accessType);
     SmallVector<Value> sizes, members, outputs;
@@ -650,9 +652,8 @@ private:
       sizes = *extentsOr;
       if (used) outputs = makeSlots(operation->getResultTypes(), loc);
     }
-    auto operand = [&](StringRef attribute) {
-      auto position = operation->getAttrOfType<IntegerAttr>(attribute).getInt();
-      return elementAt(values.lookup(operation->getOperand(position)), members, builder, loc);
+    auto operand = [&](Value value) {
+      return elementAt(values.lookup(value), members, builder, loc);
     };
     std::function<void(unsigned)> traverse = [&](unsigned axis) {
       if (axis < sizes.size()) {
@@ -669,14 +670,14 @@ private:
       if (isa<AtomicLoadOp>(operation)) {
         results.push_back(builder.create<cpu::AtomicLoadOp>(loc, element, target, coordinates, ordering));
       } else if (isa<AtomicStoreOp>(operation)) {
-        builder.create<cpu::AtomicStoreOp>(loc, target, operand("value_operand"), coordinates, ordering);
+        builder.create<cpu::AtomicStoreOp>(loc, target, operand(access.getStoredValue()), coordinates, ordering);
       } else if (isa<AtomicRMWOp>(operation)) {
-        results.push_back(builder.create<cpu::AtomicRMWOp>(loc, element, target, operand("value_operand"),
+        results.push_back(builder.create<cpu::AtomicRMWOp>(loc, element, target, operand(access.getStoredValue()),
             coordinates, ordering, operation->getAttrOfType<AtomicRMWKindAttr>("kind"),
             builder.getBoolAttr(isa<IntegerType>(element) && cast<IntegerType>(element).isUnsigned())));
       } else {
         auto exchange = builder.create<cpu::AtomicCompareExchangeOp>(loc, element, builder.getI1Type(),
-            target, operand("expected_operand"), operand("desired_operand"), coordinates, ordering);
+            target, operand(access.getCompareValue()), operand(access.getReplacementValue()), coordinates, ordering);
         llvm::append_range(results, exchange.getResults());
       }
       if (!used) return;
@@ -696,7 +697,7 @@ private:
     if (failed(rank)) return failure();
     Location loc = operation.getLoc();
     Value target = values.lookup(fact->source);
-    Value input = values.lookup(operation->getOperand(operation.getValueOperandIndex()));
+    Value input = values.lookup(operation.getValue());
     SmallVector<Value> sizes, members;
     if (auto memory = dyn_cast<MemRefType>(input.getType()))
       for (int64_t axis = 0; axis < memory.getRank(); ++axis)
@@ -1634,9 +1635,8 @@ private:
   }
 
   bool alwaysValid(Operation *operation) {
-    auto position = operation->getAttrOfType<IntegerAttr>("valid_operand_index");
-    if (!position) return true;
-    Value predicate = operation->getOperand(position.getInt());
+    Value predicate = cast<IndexedAccessOpInterface>(operation).getAccessValidity();
+    if (!predicate) return true;
     while (auto producer = predicate.getDefiningOp()) {
       if (auto literal = dyn_cast<ConstantOp>(producer)) {
         auto value = dyn_cast<IntegerAttr>(literal.getValue());
@@ -1728,8 +1728,8 @@ private:
       auto sizes = extents(tensor, loc);
       if (failed(sizes)) return failure();
       Value storage = allocate(tensor, *sizes, loc);
-      if (op.getInitialOperand())
-        copyToSlot(values.lookup(op.getInputs()[*op.getInitialOperand()]), storage, loc);
+      if (op.getInitial())
+        copyToSlot(values.lookup(op.getInitial()), storage, loc);
       values.map(op.getResult(), storage);
       bindDimensions(tensor, storage, loc);
     } else if (isa<AssumeInBoundsOp>(operation)) {
@@ -1753,9 +1753,7 @@ private:
           })) return indexedWrite(operation);
       auto destination = indexed(operation);
       if (failed(destination)) return failure();
-      unsigned position = isa<ViewStoreOp>(operation) ? cast<ViewStoreOp>(operation).getValueOperandIndex()
-                                                     : cast<BufferStoreOp>(operation).getValueOperandIndex();
-      Value input = values.lookup(operation->getOperand(position));
+      Value input = values.lookup(cast<IndexedAccessOpInterface>(operation).getStoredValue());
       if (isa<MemRefType>(input.getType()))
         builder.create<memref::CopyOp>(loc, input, *destination);
       else

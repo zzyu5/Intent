@@ -276,7 +276,7 @@ def _members(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     return lowerer.emit(
         OperationKind.GATHER,
         lowerer.location(node),
-        operands=(mapping, coordinates),
+        operand_groups=((mapping,), (coordinates,), (), ()),
         result_types=(TensorType(mapping.type.dtype, coordinates.type.shape),),
         attributes={
             "index": IndexRelation(
@@ -286,7 +286,7 @@ def _members(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
                     lowerer.compiler.builder.dimension_id(dimension)
                     for dimension in coordinates.type.shape
                 ),
-                (IndexTerm(IndexTermKind.VALUE_INDEX, (1,)),),
+                (IndexTerm(IndexTermKind.VALUE_INDEX, (0,)),),
             )
         },
     ).results[0]

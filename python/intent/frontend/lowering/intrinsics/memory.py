@@ -79,7 +79,7 @@ def _gather(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     source = lowerer.materialize(lowerer.lower_expression(bound["source"]), bound["source"])
     if not isinstance(source.type, TensorType):
         lowerer.error(node, "I.gather source must be a tensor/view")
-    lowered = lower_index(lowerer, source, bound["index"], first_operand_position=1)
+    lowered = lower_index(lowerer, source, bound["index"])
     if "valid" in bound:
         valid = lowerer.materialize(lowerer.lower_expression(bound["valid"]), bound["valid"])
     else:
@@ -116,20 +116,15 @@ def _gather(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
             lowerer.error(node, f"gather {subject} cannot broadcast to indexed shape")
     valid = lowerer.broadcast_value(valid, result_shape, node)
     fill = lowerer.broadcast_value(fill, result_shape, node)
-    operands = (source, *lowered.operands, valid, fill)
     effects = ()
     if source.view_kind is not None:
         lowerer.require_readable_view(source, node)
         effects = (Effect(EffectKind.READ, ResourceKind.EXTERNAL_VIEW, source),)
-    attributes: dict[str, object] = {
-        "index": lowered.relation,
-        "valid_operand_index": len(operands) - 2,
-        "fill_operand_index": len(operands) - 1,
-    }
+    attributes: dict[str, object] = {"index": lowered.relation}
     operation = lowerer.emit(
         OperationKind.VIEW_LOAD if source.view_kind is not None else OperationKind.GATHER,
         lowerer.location(node),
-        operands=operands,
+        operand_groups=((source,), lowered.operands, (valid,), (fill,)),
         result_types=(lowerer.value_result_type(source.type.dtype, result_shape),),
         attributes=attributes,
         effects=effects,
@@ -151,7 +146,7 @@ def _scatter(lowerer: FunctionLowerer, node: ast.Call, *, reduce: bool) -> Stati
     if not isinstance(destination.type, TensorType) or destination.view_kind is None:
         lowerer.error(node, "scatter destination must be an external output/InOut view")
     lowerer.require_writable_view(destination, node)
-    lowered = lower_index(lowerer, destination, bound["index"], first_operand_position=1)
+    lowered = lower_index(lowerer, destination, bound["index"])
     value_expression = lowerer.lower_expression(bound["value"])
     value = lowerer.materialize(
         value_expression,
@@ -162,10 +157,7 @@ def _scatter(lowerer: FunctionLowerer, node: ast.Call, *, reduce: bool) -> Stati
         lowerer, value, lowered.result_shape, node, expected_dtype=destination.type.dtype
     )
     operands = (destination, *lowered.operands, value)
-    attributes: dict[str, object] = {
-        "index": lowered.relation,
-        "value_operand_index": len(operands) - 1,
-    }
+    attributes: dict[str, object] = {"index": lowered.relation}
     regions = ()
     if reduce:
         combine = lowerer.lower_expression(bound["combine"])
@@ -209,14 +201,11 @@ def _buffer(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
             )
             initializer = lowerer.read_value(initializer, bound["init"])
     shape = lower_shape(lowerer, bound["shape"], first_operand_position=0)
-    operands = shape.operands + ((initializer,) if initializer is not None else ())
     attributes: dict[str, object] = {"shape": shape.relation}
-    if initializer is not None:
-        attributes["initial_operand"] = len(shape.operands)
     operation = lowerer.emit(
         OperationKind.BUFFER,
         lowerer.location(node),
-        operands=operands,
+        operand_groups=(shape.operands, (initializer,) if initializer is not None else ()),
         result_types=(BufferType(dtype, shape.dimensions),),
         attributes=attributes,
     )
@@ -233,7 +222,7 @@ def _store(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
     target = lowerer.materialize(lowerer.lower_expression(bound["target"]), bound["target"])
     if not isinstance(target.type, (TensorType, BufferType)):
         lowerer.error(node, "I.store target must be a view or logical buffer")
-    lowered = lower_index(lowerer, target, bound["index"], first_operand_position=2)
+    lowered = lower_index(lowerer, target, bound["index"])
     value_expression = lowerer.lower_expression(bound["value"])
     value = lowerer.materialize(
         value_expression,
@@ -243,11 +232,8 @@ def _store(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
     value = validate_indexed_value(
         lowerer, value, lowered.result_shape, node, expected_dtype=target.type.dtype
     )
-    operands = (target, value, *lowered.operands)
-    attributes: dict[str, object] = {
-        "index": lowered.relation,
-        "value_operand_index": 1,
-    }
+    operands = (target, *lowered.operands, value)
+    attributes: dict[str, object] = {"index": lowered.relation}
     if isinstance(target.type, BufferType):
         opcode = OperationKind.BUFFER_STORE
         effect = Effect(EffectKind.WRITE, ResourceKind.LOGICAL_BUFFER, target)
@@ -277,7 +263,7 @@ def _mutable_load(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     target = lowerer.materialize(lowerer.lower_expression(bound["target"]), bound["target"])
     if not isinstance(target.type, (TensorType, BufferType)):
         lowerer.error(node, "I.mutable_load target must be a view or logical buffer")
-    lowered = lower_index(lowerer, target, bound["index"], first_operand_position=1)
+    lowered = lower_index(lowerer, target, bound["index"])
     attributes: dict[str, object] = {"index": lowered.relation}
     if isinstance(target.type, BufferType):
         opcode = OperationKind.BUFFER_LOAD
@@ -288,10 +274,15 @@ def _mutable_load(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         lowerer.require_readable_view(target, node)
         opcode = OperationKind.VIEW_LOAD
         resource = ResourceKind.EXTERNAL_VIEW
+    layout = (
+        {"operands": (target, *lowered.operands)}
+        if isinstance(target.type, BufferType)
+        else {"operand_groups": ((target,), lowered.operands, (), ())}
+    )
     operation = lowerer.emit(
         opcode,
         lowerer.location(node),
-        operands=(target, *lowered.operands),
+        **layout,
         result_types=(lowerer.value_result_type(target.type.dtype, lowered.result_shape),),
         attributes=attributes,
         effects=(Effect(EffectKind.READ, resource, target),),
@@ -337,7 +328,6 @@ def _atomic_store(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
         operands=(target, *lowered.operands, value),
         attributes={
             "index": lowered.relation,
-            "value_operand": 1 + len(lowered.operands),
             "ordering": order,
         },
         effects=(_atomic_effect(target),),
@@ -364,7 +354,6 @@ def _atomic_rmw(
         result_types=(value.type,),
         attributes={
             "index": lowered.relation,
-            "value_operand": 1 + len(lowered.operands),
             "ordering": _ordering(lowerer, bound["order"]),
             "kind": kind,
         },
@@ -411,8 +400,6 @@ def _atomic_compare_exchange(lowerer: FunctionLowerer, node: ast.Call) -> MlirVa
         result_types=(result_type,),
         attributes={
             "index": lowered.relation,
-            "expected_operand": 1 + len(lowered.operands),
-            "desired_operand": 2 + len(lowered.operands),
             "ordering": _ordering(lowerer, bound["order"]),
         },
         effects=(_atomic_effect(target),),
@@ -500,7 +487,7 @@ def _atomic_address(lowerer: FunctionLowerer, bound: dict[str, ast.AST], node: a
         lowerer.error(node, "atomic target must be an external view or logical buffer")
     if isinstance(target.type, TensorType):
         lowerer.require_atomic_view(target, node)
-    lowered = lower_index(lowerer, target, bound["index"], first_operand_position=1)
+    lowered = lower_index(lowerer, target, bound["index"])
     return target, lowered
 
 

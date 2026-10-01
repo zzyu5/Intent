@@ -210,12 +210,12 @@ bool sameProvableValue(Value lhs, Value rhs) {
   return false;
 }
 
-FailureOr<SmallVector<Value>> accessOffsets(Operation *owner,
-                                            ValueRange coordinates,
-                                            ArrayRef<int64_t> sourceAxes) {
-  auto view = cast<gpu::ViewType>(owner->getOperand(0).getType());
+FailureOr<SmallVector<Value>> accessOffsets(gpu::AccessOpInterface access) {
+  Operation *owner = access.getOperation();
+  auto view = cast<gpu::ViewType>(access.getAccessResource().getType());
   SmallVector<Value> offsets(view.getRank());
-  for (auto [coordinate, sourceAxis] : llvm::zip(coordinates, sourceAxes)) {
+  for (auto [coordinate, sourceAxis] :
+       llvm::zip(access.getAccessCoordinates(), access.getAccessSourceAxes())) {
     if (sourceAxis < 0 || sourceAxis >= static_cast<int64_t>(view.getRank()))
       return owner->emitOpError(
           "TileLang access source-axis mapping is outside the external view");
@@ -1143,21 +1143,20 @@ private:
     return result;
   }
 
-  FailureOr<Value> externalLoadElement(gpu::LoadOp load,
-                                       gpu::FragmentType target,
-                                       ValueRange targetIndices,
-                                       OpBuilder &builder, Operation *owner) {
-    auto view = dyn_cast<gpu::ViewType>(load.getResource().getType());
+  FailureOr<SmallVector<Value>> accessElementCoordinates(
+      gpu::AccessOpInterface access, gpu::FragmentType target,
+      ValueRange targetIndices, OpBuilder &builder, Operation *owner,
+      DenseMap<Value, Value> &memo) {
+    auto view = dyn_cast<gpu::ViewType>(access.getAccessResource().getType());
     if (!view || targetIndices.size() != target.getShape().size())
       return owner->emitOpError(
-          "TileLang scaled load has no complete external-view index schema");
-    DenseMap<Value, Value> memo;
+          "TileLang access has no complete external-view index schema");
     SmallVector<Value> indices(view.getRank());
     for (auto [coordinate, sourceAxis] :
-         llvm::zip(load.getCoordinates(), load.getSourceAxes())) {
+         llvm::zip(access.getAccessCoordinates(), access.getAccessSourceAxes())) {
       if (sourceAxis < 0 || sourceAxis >= static_cast<int64_t>(view.getRank()))
         return owner->emitOpError(
-            "TileLang scaled load source axis is outside its external view");
+            "TileLang access source axis is outside its external view");
       FailureOr<Value> scalar = scalarize(coordinate, target, targetIndices,
                                           builder, owner, memo);
       if (failed(scalar))
@@ -1166,15 +1165,28 @@ private:
     }
     if (llvm::any_of(indices, [](Value value) { return !value; }))
       return owner->emitOpError(
-          "TileLang scaled load source-axis mapping is incomplete");
+          "TileLang access source-axis mapping is incomplete");
+    return indices;
+  }
+
+  FailureOr<Value> externalLoadElement(gpu::LoadOp load,
+                                       gpu::FragmentType target,
+                                       ValueRange targetIndices,
+                                       OpBuilder &builder, Operation *owner) {
+    auto access = cast<gpu::AccessOpInterface>(load.getOperation());
+    DenseMap<Value, Value> memo;
+    auto indices = accessElementCoordinates(access, target, targetIndices,
+                                             builder, owner, memo);
+    if (failed(indices)) return failure();
+    auto view = cast<gpu::ViewType>(access.getAccessResource().getType());
 
     Value valid;
     Value fill;
-    if (load.getValid()) {
+    if (access.getAccessValidity()) {
       FailureOr<Value> scalarValid = scalarize(
-          load.getValid(), target, targetIndices, builder, owner, memo);
+          access.getAccessValidity(), target, targetIndices, builder, owner, memo);
       FailureOr<Value> scalarFill = scalarize(
-          load.getFill(), target, targetIndices, builder, owner, memo);
+          access.getAccessFill(), target, targetIndices, builder, owner, memo);
       if (failed(scalarValid) || failed(scalarFill))
         return failure();
       valid = *scalarValid;
@@ -1182,7 +1194,7 @@ private:
     }
     return builder
         .create<ViewLoadOp>(load.getLoc(), view.getElementType(),
-                            load.getResource(), indices, valid, fill)
+                            access.getAccessResource(), *indices, valid, fill)
         .getResult();
   }
 
@@ -1234,26 +1246,27 @@ private:
   }
 
   LogicalResult lowerLoad(gpu::LoadOp load, BufferSpace space) {
+    auto access = cast<gpu::AccessOpInterface>(load.getOperation());
     auto fragment = dyn_cast<gpu::FragmentType>(load.getResult().getType());
-    auto view = dyn_cast<gpu::ViewType>(load.getResource().getType());
+    auto view = dyn_cast<gpu::ViewType>(access.getAccessResource().getType());
     if (!view)
       return load.emitOpError(
           "TileLang load bufferization requires an external view resource");
     if (!fragment) {
       FailureOr<SmallVector<Value>> indices =
-          accessOffsets(load, load.getCoordinates(), load.getSourceAxes());
+          accessOffsets(access);
       if (failed(indices) ||
           llvm::any_of(*indices, [](Value value) {
             return isa<gpu::FragmentType>(value.getType());
           }) ||
-          (load.getValid() && isa<gpu::FragmentType>(load.getValid().getType())) ||
-          (load.getFill() && isa<gpu::FragmentType>(load.getFill().getType())))
+          (access.getAccessValidity() && isa<gpu::FragmentType>(access.getAccessValidity().getType())) ||
+          (access.getAccessFill() && isa<gpu::FragmentType>(access.getAccessFill().getType())))
         return load.emitOpError(
             "TileLang scalar view load requires scalar indices, validity and fill");
       OpBuilder builder(load);
       Value replacement = builder.create<ViewLoadOp>(
-          load.getLoc(), load.getResult().getType(), load.getResource(), *indices,
-          load.getValid(), load.getFill());
+          load.getLoc(), load.getResult().getType(), access.getAccessResource(), *indices,
+          access.getAccessValidity(), access.getAccessFill());
       load.getResult().replaceAllUsesWith(replacement);
       lowered.insert(load);
       return success();
@@ -1265,10 +1278,10 @@ private:
     // materialize those data-dependent fragments once, then make the terminal
     // view access consume their lane values.  Affine ranges and ordinary tail
     // predicates remain direct expressions.
-    SmallVector<Value> accessFragments(load.getCoordinates().begin(),
-                                       load.getCoordinates().end());
-    if (load.getValid())
-      accessFragments.push_back(load.getValid());
+    SmallVector<Value> accessFragments(access.getAccessCoordinates().begin(),
+                                       access.getAccessCoordinates().end());
+    if (access.getAccessValidity())
+      accessFragments.push_back(access.getAccessValidity());
     for (Value value : accessFragments)
       if (isa<gpu::FragmentType>(value.getType()) && !findBuffer(value) &&
           dependsOnBufferedFragment(value))
@@ -1276,16 +1289,16 @@ private:
           return load.emitOpError(
               "TileLang indirect access fragment cannot be materialized");
     FailureOr<SmallVector<Value>> offsets =
-        accessOffsets(load, load.getCoordinates(), load.getSourceAxes());
+        accessOffsets(access);
     FailureOr<CopyLayout> layout =
-        copyLayout(load.getCoordinates(), load.getSourceAxes(), view.getRank(),
+        copyLayout(access.getAccessCoordinates(), access.getAccessSourceAxes(), view.getRank(),
                    fragment);
     gpu::PhysicalAccessBoundaryFact boundary =
         gpu::PhysicalProgramAnalysis(kernel).boundaryValidity(load);
     bool directCopy = succeeded(offsets) && succeeded(layout) &&
                       boundary.isExact() &&
                       copyPreservesBoundaryAxes(boundary, *layout, fragment) &&
-                      (!load.getFill() || isZero(load.getFill()));
+                      (!access.getAccessFill() || isZero(access.getAccessFill()));
     SmallVector<Attribute> allocationShape;
     if (directCopy)
       for (unsigned fragmentAxis : layout->bufferToFragment)
@@ -1300,7 +1313,7 @@ private:
     Value destination = *allocation;
     if (directCopy) {
       OpBuilder builder(load);
-      builder.create<CopyInOp>(load.getLoc(), load.getResource(), *offsets,
+      builder.create<CopyInOp>(load.getLoc(), access.getAccessResource(), *offsets,
                                destination,
                                DenseI64ArrayAttr::get(kernel.getContext(),
                                                       layout->viewAxes),
@@ -1314,36 +1327,10 @@ private:
         return failure();
       Block &body = parallel->getBody().front();
       OpBuilder builder = OpBuilder::atBlockBegin(&body);
-      DenseMap<Value, Value> memo;
-      SmallVector<Value> indices(view.getRank());
-      for (auto [coordinate, sourceAxis] :
-           llvm::zip(load.getCoordinates(), load.getSourceAxes())) {
-        FailureOr<Value> scalar = scalarize(
-            coordinate, fragment, body.getArguments(), builder, load, memo);
-        if (failed(scalar))
-          return failure();
-        indices[sourceAxis] = *scalar;
-      }
-      if (llvm::any_of(indices, [](Value value) { return !value; }))
-        return load.emitOpError(
-            "TileLang view load source-axis mapping is incomplete");
-      Value valid;
-      Value padding;
-      if (load.getValid()) {
-        FailureOr<Value> scalar = scalarize(
-            load.getValid(), fragment, body.getArguments(), builder, load, memo);
-        FailureOr<Value> scalarFill = scalarize(
-            load.getFill(), fragment, body.getArguments(), builder, load, memo);
-        if (failed(scalar) || failed(scalarFill))
-          return failure();
-        valid = *scalar;
-        padding = *scalarFill;
-      }
-      Value loaded = builder.create<ViewLoadOp>(
-          load.getLoc(), fragment.getElementType(), load.getResource(), indices,
-          valid, padding);
+      auto loaded = externalLoadElement(load, fragment, body.getArguments(), builder, load);
+      if (failed(loaded)) return failure();
       builder.create<BufferStoreOp>(load.getLoc(), destination,
-                                    body.getArguments(), loaded);
+                                    body.getArguments(), *loaded);
       builder.create<YieldOp>(load.getLoc());
       if (space == BufferSpace::Shared) {
         sharedBufferAxes[load.getResult()] =
@@ -2344,31 +2331,32 @@ private:
   }
 
   LogicalResult lowerStore(gpu::StoreOp store) {
-    auto fragment = dyn_cast<gpu::FragmentType>(store.getValue().getType());
-    auto view = dyn_cast<gpu::ViewType>(store.getResource().getType());
+    auto access = cast<gpu::AccessOpInterface>(store.getOperation());
+    auto fragment = dyn_cast<gpu::FragmentType>(access.getAccessPayloads().front().getType());
+    auto view = dyn_cast<gpu::ViewType>(access.getAccessResource().getType());
     if (!view)
       return store.emitOpError(
           "TileLang store bufferization requires an external view");
     if (!fragment) {
       FailureOr<SmallVector<Value>> indices =
-          accessOffsets(store, store.getCoordinates(), store.getSourceAxes());
+          accessOffsets(access);
       if (failed(indices) ||
           llvm::any_of(*indices, [](Value value) {
             return isa<gpu::FragmentType>(value.getType());
           }) ||
-          (store.getValid() && isa<gpu::FragmentType>(store.getValid().getType())))
+          (access.getAccessValidity() && isa<gpu::FragmentType>(access.getAccessValidity().getType())))
         return store.emitOpError(
             "TileLang scalar view store requires scalar indices and validity");
       OpBuilder builder(store);
-      builder.create<ViewStoreOp>(store.getLoc(), store.getResource(), *indices,
-                                  store.getValue(), store.getValid());
+      builder.create<ViewStoreOp>(store.getLoc(), access.getAccessResource(), *indices,
+                                  access.getAccessPayloads().front(), access.getAccessValidity());
       lowered.insert(store);
       return success();
     }
     FailureOr<SmallVector<Value>> offsets =
-        accessOffsets(store, store.getCoordinates(), store.getSourceAxes());
+        accessOffsets(access);
     FailureOr<CopyLayout> layout =
-        copyLayout(store.getCoordinates(), store.getSourceAxes(), view.getRank(),
+        copyLayout(access.getAccessCoordinates(), access.getAccessSourceAxes(), view.getRank(),
                    fragment);
     SmallVector<unsigned> identity =
         identityAxisOrder(fragment.getShape().size());
@@ -2383,7 +2371,7 @@ private:
           DenseI64ArrayAttr::get(kernel.getContext(), layout->viewAxes);
       DenseI64ArrayAttr boundaryAxes =
           DenseI64ArrayAttr::get(kernel.getContext(), boundary.boundaryAxes);
-      if (auto cast = store.getValue().getDefiningOp<gpu::CastOp>()) {
+      if (auto cast = access.getAccessPayloads().front().getDefiningOp<gpu::CastOp>()) {
         auto input = dyn_cast<gpu::FragmentType>(cast.getValue().getType());
         auto result = dyn_cast<gpu::FragmentType>(cast.getResult().getType());
         Value source = findBuffer(cast.getValue());
@@ -2392,7 +2380,7 @@ private:
             input.getValidity() == result.getValidity() &&
             input.getOwner() == result.getOwner()) {
           builder.create<CastCopyOutOp>(store.getLoc(), source,
-                                        store.getResource(), *offsets,
+                                        access.getAccessResource(), *offsets,
                                         destinationAxes, boundaryAxes);
           lowered.insert(cast);
           lowered.insert(store);
@@ -2400,14 +2388,14 @@ private:
         }
       }
       FailureOr<Value> source =
-          materialize(store.getValue(), BufferSpace::Fragment, store);
+          materialize(access.getAccessPayloads().front(), BufferSpace::Fragment, store);
       if (failed(source))
         return failure();
-      builder.create<CopyOutOp>(store.getLoc(), *source, store.getResource(),
+      builder.create<CopyOutOp>(store.getLoc(), *source, access.getAccessResource(),
                                 *offsets, destinationAxes, boundaryAxes);
     } else {
       FailureOr<Value> source =
-          materialize(store.getValue(), BufferSpace::Fragment, store);
+          materialize(access.getAccessPayloads().front(), BufferSpace::Fragment, store);
       if (failed(source))
         return failure();
       FailureOr<ParallelOp> parallel = createParallel(store, fragment);
@@ -2420,28 +2408,19 @@ private:
           builder, *source, fragment, fragment, body.getArguments(), store);
       if (failed(value))
         return failure();
-      SmallVector<Value> indices(view.getRank());
-      for (auto [coordinate, sourceAxis] :
-           llvm::zip(store.getCoordinates(), store.getSourceAxes())) {
-        FailureOr<Value> scalar = scalarize(
-            coordinate, fragment, body.getArguments(), builder, store, memo);
-        if (failed(scalar))
-          return failure();
-        indices[sourceAxis] = *scalar;
-      }
-      if (llvm::any_of(indices, [](Value value) { return !value; }))
-        return store.emitOpError(
-            "TileLang view store source-axis mapping is incomplete");
+      auto indices = accessElementCoordinates(access, fragment, body.getArguments(),
+                                               builder, store, memo);
+      if (failed(indices)) return failure();
       Value valid;
-      if (store.getValid()) {
+      if (access.getAccessValidity()) {
         FailureOr<Value> scalar = scalarize(
-            store.getValid(), fragment, body.getArguments(), builder, store,
+            access.getAccessValidity(), fragment, body.getArguments(), builder, store,
             memo);
         if (failed(scalar))
           return failure();
         valid = *scalar;
       }
-      builder.create<ViewStoreOp>(store.getLoc(), store.getResource(), indices,
+      builder.create<ViewStoreOp>(store.getLoc(), access.getAccessResource(), *indices,
                                    *value, valid);
       builder.create<YieldOp>(store.getLoc());
     }

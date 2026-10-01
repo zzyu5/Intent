@@ -64,8 +64,8 @@ bool hasObservableEffect(Operation *operation) {
     if (auto buffer = dyn_cast<BufferType>(store.getResource().getType());
         buffer && buffer.getWorkspace() && !store->hasAttr(originAttr))
       return false;
-  return isa<StoreOp, ScatterReduceOp, AtomicStoreOp, AtomicRMWOp,
-             AtomicCompareExchangeOp>(operation);
+  auto access = dyn_cast<AccessOpInterface>(operation);
+  return access && access.writesMemory();
 }
 
 bool mutuallyExclusiveEffects(Operation *lhs, Operation *rhs) {
@@ -82,11 +82,6 @@ bool mutuallyExclusiveEffects(Operation *lhs, Operation *rhs) {
       return true;
   }
   return false;
-}
-
-bool isPhysicalAccess(Operation *operation) {
-  return isa<LoadOp, GatherOp, StoreOp, ScatterReduceOp, AtomicLoadOp,
-             AtomicStoreOp, AtomicRMWOp, AtomicCompareExchangeOp>(operation);
 }
 
 bool requiresRangeProvenance(Value coordinate) {
@@ -123,9 +118,9 @@ LogicalResult verifyBufferResources(func::FuncOp kernel,
       Operation *user = use.getOwner();
       if (isa<AssumeInBoundsOp, DimOp>(user))
         continue;
-      bool resourceUse = isa<LoadOp, StoreOp, ScatterReduceOp, AtomicLoadOp,
-                             AtomicStoreOp, AtomicRMWOp, AtomicCompareExchangeOp>(user);
-      if (!resourceUse || use.getOperandNumber() != 0)
+      auto access = dyn_cast<AccessOpInterface>(user);
+      if (!access || !access.isMemoryAccess() ||
+          &use != &access.getAccessResourceOperand())
         return user->emitOpError("physical buffer use is not an explicit resource access");
     }
     return success();
@@ -405,7 +400,7 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
         return WalkResult::interrupt();
       }
     }
-    if (isPhysicalAccess(operation)) {
+    if (isa<AccessOpInterface>(operation)) {
       PhysicalAccessFootprint footprint = physicalAnalysis.footprint(operation);
       if (footprint.state != PhysicalFactState::Exact) {
         operation->emitOpError(

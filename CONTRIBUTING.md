@@ -185,6 +185,44 @@ Intent 同样让运算提供自身结构，但保留显式 identity/capture、�
 
 ### 分析与改写的职责
 
+访问操作的 operand schema 也由 IR 自己提供。KIR 的
+[IndexedAccessOpInterface](include/Intent/Dialect/Intent/IR/IndexedAccessOpInterface.h)
+区分 source、indices、写入值、读的 validity/fill，以及 CAS 的 expected/desired。
+`IndexRelation` 的 operand positions 只引用 indices 分组，不是整个 operation 的位置。
+新增或修改访问时，用 ODS 的命名 operands；不要再添加 `value_operand_index` 一类旁路字段。
+逻辑 buffer 的动态 extents 与 optional initializer 同样独立，shape relation 只引用 extents。
+
+[CanonicalKernelAnalysis::indexRelation](lib/Analysis/CanonicalKernel.cpp) 将当前分组解析成
+SSA values 和源轴关系，GPU、CPU、DSA construction 共用这份结果。
+Slice 的 start/stop/step 保留三个位置：静态或缺省位置的 Value 为空，不能压缩后改变槽位。
+这个分析不选择物理 tile、内存布局或读取实现；这些仍由各 family 完成。
+
+GPU 的 [AccessOpInterface](include/Intent/Dialect/GPU/IR/AccessOpInterface.h) 独立描述
+物理 resource、coordinates/source axes、payload、结果及 validity/fill。
+Footprint、关系闭合、predication、workspace 与 provider 的访问分析读取这份合同。
+`updateAccessOperands` 保留 operation 和结果 SSA 身份，维护 ODS operand segments；
+修改 source axes 时须显式更新轴映射，不能在 serializer 中补修。
+CAS 的两个 payload 依次是 expected、desired，谓词 shape 取 payload schema，
+不能把 `{old_value, success}` record 当作单个数据值。
+
+访问接口不是优化许可：Gather 仍是纯 SSA 读取；atomic 的 ordering、sharing 和目标能力
+独立验证；普通 store 的 payload 投影也不自动适用于 atomic 或 scatter。
+读取共同字段以后，消费者仍需保留自己原有的别名、effect、重放与 predication 资格。
+这种边界对应 Triton `TritonOpInterfaces.td:130–173` 中分别声明 predicate 和 atomic
+语义的做法；Intent 的 KIR 逻辑索引与 GPU 物理访问继续使用各自的接口。
+
+KIR 的验证入口直接属于 operation，按合同分布在
+[Access.cpp](lib/Dialect/Intent/IR/Access.cpp)、
+[ValueOps.cpp](lib/Dialect/Intent/IR/ValueOps.cpp)、
+[ShapeOps.cpp](lib/Dialect/Intent/IR/ShapeOps.cpp) 和
+[StructuredOps.cpp](lib/Dialect/Intent/IR/StructuredOps.cpp)。修改某类运算时，在其
+`Op::verify()` 及所属模块完成验证，不追加全局 operation-name 分派。
+相邻私有 [TypeSchema.h](lib/Dialect/Intent/IR/TypeSchema.h) 共用元素类型、shape 与
+维度关系查询；[RegionVerification.h](lib/Dialect/Intent/IR/RegionVerification.h)
+共用 helper 参数、yield 与纯度检查。它们验证当前 IR，不提供 lowering policy。
+这与 Triton `lib/Dialect/Triton/IR/Ops.cpp:273,647–650,701–704` 中由 Dot、Reduce、Scan
+各自实现 verifier 并复用 helper 的边界一致。
+
 分析回答当前程序满足什么条件；变换根据这些条件改变程序。不要为了共享代码，让 analysis 创建新 operation、替换 uses，或者替某个 family 决定具体循环与存储结构。
 
 选择共享位置时，可以依次问：

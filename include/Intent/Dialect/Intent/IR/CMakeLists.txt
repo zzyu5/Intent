@@ -12,6 +12,10 @@ mlir_tablegen(IntentAttrsEnums.cpp.inc -gen-enum-defs)
 mlir_tablegen(IntentAttrs.h.inc -gen-attrdef-decls)
 mlir_tablegen(IntentAttrs.cpp.inc -gen-attrdef-defs)
 
+set(LLVM_TARGET_DEFINITIONS IndexedAccessOpInterface.td)
+mlir_tablegen(IndexedAccessOpInterface.h.inc -gen-op-interface-decls)
+mlir_tablegen(IndexedAccessOpInterface.cpp.inc -gen-op-interface-defs)
+
 set(LLVM_TARGET_DEFINITIONS IntentOps.td)
 mlir_tablegen(IntentOps.h.inc -gen-op-decls)
 mlir_tablegen(IntentOps.cpp.inc -gen-op-defs)

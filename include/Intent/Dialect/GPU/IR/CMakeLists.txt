@@ -12,6 +12,10 @@ set(LLVM_TARGET_DEFINITIONS GPUTypes.td)
 mlir_tablegen(GPUTypes.h.inc -gen-typedef-decls)
 mlir_tablegen(GPUTypes.cpp.inc -gen-typedef-defs)
 
+set(LLVM_TARGET_DEFINITIONS AccessOpInterface.td)
+mlir_tablegen(AccessOpInterface.h.inc -gen-op-interface-decls)
+mlir_tablegen(AccessOpInterface.cpp.inc -gen-op-interface-defs)
+
 set(LLVM_TARGET_DEFINITIONS GPUOps.td)
 mlir_tablegen(GPUOps.h.inc -gen-op-decls)
 mlir_tablegen(GPUOps.cpp.inc -gen-op-defs)

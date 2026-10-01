@@ -138,10 +138,16 @@ private:
     }
     if (isa<MakeRecordOp, ExtractOp, scf::IfOp, scf::ForOp, RegionFoldOp>(operation))
       push(operation, Aggregate);
-    if (isa<LoadOp, GatherOp>(operation)) push(operation, AccessResult);
+    if (auto access = dyn_cast<AccessOpInterface>(operation)) {
+      AccessKind kind = access.getAccessKind();
+      if (kind == AccessKind::Load || kind == AccessKind::Gather)
+        push(operation, AccessResult);
+      if (kind == AccessKind::Load || kind == AccessKind::Gather ||
+          kind == AccessKind::Store)
+        push(operation, AccessValue);
+    }
     if (isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp,
             BroadcastOp, TransposeOp>(operation)) push(operation, Pointwise);
-    if (isa<LoadOp, GatherOp, StoreOp>(operation)) push(operation, AccessValue);
     if (isa<ReshapeOp>(operation)) push(operation, Reshape);
     if (isa<ContractOp>(operation)) push(operation, ContractOperands);
     if (isa<ContractOp, ScaledContractOp, SparseContractOp>(operation))
@@ -761,17 +767,9 @@ WalkResult alignReductionYield(Operation *operation, RelationWorklist &changes) 
 
 WalkResult alignAccessResult(Operation *operation, RelationWorklist &changes) {
   auto kernel = operation->getParentOfType<func::FuncOp>();
-    ValueRange coordinates;
-    Value result;
-    if (auto load = dyn_cast<LoadOp>(operation)) {
-      coordinates = load.getCoordinates();
-      result = load.getResult();
-    } else if (auto gather = dyn_cast<GatherOp>(operation)) {
-      coordinates = gather.getCoordinates();
-      result = gather.getResult();
-    } else {
-      return WalkResult::advance();
-    }
+    auto access = cast<AccessOpInterface>(operation);
+    ValueRange coordinates = access.getAccessCoordinates();
+    Value result = access.getAccessResult();
     auto current = dyn_cast<FragmentType>(result.getType());
     if (!current)
       return WalkResult::advance();
@@ -1079,12 +1077,12 @@ LogicalResult alignAccessValue(Operation *operation, RelationWorklist &changes) 
       return failure();
     return projectPhysicalValueToSchema(builder, location, value, target, changes.typeChanged());
   };
-  auto alignCoordinates = [&](auto access, Type valueType) -> LogicalResult {
+  auto alignCoordinates = [&](AccessOpInterface access, Type valueType) -> LogicalResult {
     auto payload = dyn_cast<FragmentType>(valueType);
     if (!payload)
       return success();
     PhysicalProgramAnalysis analysis(kernel);
-    for (auto [slot, coordinate] : llvm::enumerate(access.getCoordinates())) {
+    for (auto [slot, coordinate] : llvm::enumerate(access.getAccessCoordinates())) {
       auto type = dyn_cast<FragmentType>(coordinate.getType());
       if (!type)
         continue;
@@ -1121,49 +1119,48 @@ LogicalResult alignAccessValue(Operation *operation, RelationWorklist &changes) 
       if (failed(aligned))
         return access.emitOpError("cannot align coordinate with its access schema")
                << "; coordinate=" << coordinate;
-      access.getCoordinatesMutable().slice(slot, 1).assign(*aligned);
+      access.getAccessCoordinatesMutable().slice(slot, 1).assign(*aligned);
     }
     return success();
   };
 
-  auto alignRead = [&](auto read, StringRef kind) -> LogicalResult {
-    if (failed(alignCoordinates(read, read.getResult().getType())))
+  auto access = cast<AccessOpInterface>(operation);
+  auto alignRead = [&]() -> LogicalResult {
+    if (failed(alignCoordinates(access, access.getAccessValueType())))
       return failure();
-    if (!read.getValid() && !read.getFill())
+    if (!access.getAccessValidity() && !access.getAccessFill())
       return success();
-    if (!read.getValid())
-      return read.emitOpError() << kind << " fill has no validity authority";
-    OpBuilder builder(read);
+    if (!access.getAccessValidity())
+      return access.emitOpError("fill has no validity authority");
+    OpBuilder builder(access);
       builder.setListener(&changes);
-    Type valueType = read.getResult().getType();
+    Type valueType = access.getAccessValueType();
     auto fragment = dyn_cast<FragmentType>(valueType);
-    if (isa<GatherOp>(read.getOperation()) && !fragment) {
-      if (read.getFill())
+    if (access.getAccessKind() == AccessKind::Gather && !fragment) {
+      if (access.getAccessFill())
         return success();
-      return read.emitOpError("scalar gather validity and fill must remain paired");
+      return access.emitOpError("scalar gather validity and fill must remain paired");
     }
     Type validType = fragment ? Type(predicateType(fragment)) : builder.getI1Type();
-    auto valid = project(builder, read.getLoc(), read.getValid(), validType);
+    auto valid = project(builder, access.getLoc(), access.getAccessValidity(), validType);
     if (failed(valid))
-      return read.emitOpError() << "cannot align " << kind
-                               << " validity with its value schema";
-    auto fill = read.getFill()
-                    ? project(builder, read.getLoc(), read.getFill(), valueType)
-                    : materializeZeroValue(builder, read.getLoc(), valueType);
+      return access.emitOpError("cannot align read validity with its value schema");
+    auto fill = access.getAccessFill()
+                    ? project(builder, access.getLoc(), access.getAccessFill(), valueType)
+                    : materializeZeroValue(builder, access.getLoc(), valueType);
     if (failed(fill))
-      return read.emitOpError() << "cannot align " << kind
-                               << " fill with its value schema";
+      return access.emitOpError("cannot align read fill with its value schema");
     // Keep the access identity, coordinates, effects and all attributes intact;
     // only its already-established validity/fill relation changes here.
-    read.getValidMutable().assign(ValueRange{*valid});
-    read.getFillMutable().assign(ValueRange{*fill});
-    return success();
+    return access.updateAccessOperands(access.getAccessCoordinates(),
+                                       access.getAccessPayloads(), *valid, *fill);
   };
-  if (auto load = dyn_cast<LoadOp>(operation)) return alignRead(load, "load");
-  if (auto gather = dyn_cast<GatherOp>(operation)) return alignRead(gather, "gather");
+  if (access.getAccessKind() == AccessKind::Load ||
+      access.getAccessKind() == AccessKind::Gather)
+    return alignRead();
   auto store = dyn_cast<StoreOp>(operation);
   if (!store) return success();
-    if (failed(alignCoordinates(store, store.getValue().getType())))
+    if (failed(alignCoordinates(access, store.getValue().getType())))
       return failure();
     if (!store.getValid())
       return success();

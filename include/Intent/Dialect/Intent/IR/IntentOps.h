@@ -4,6 +4,7 @@
 #include "Intent/Dialect/Intent/IR/IntentDialect.h"
 #include "Intent/Dialect/Intent/IR/IntentAttrs.h"
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
+#include "Intent/Dialect/Intent/IR/IndexedAccessOpInterface.h"
 #include "Intent/Interfaces/StructuredOpInterface.h"
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Builders.h"

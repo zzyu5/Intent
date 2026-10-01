@@ -48,7 +48,7 @@ RankedTensorType viewTensor(Value value) {
 
 bool isCanonicalEffect(Operation *operation) {
   if (auto buffer = dyn_cast<BufferOp>(operation))
-    return buffer.getInitialOperand().has_value();
+    return static_cast<bool>(buffer.getInitial());
   return isa<ViewStoreOp, BufferStoreOp, ScatterUniqueOp, ScatterReduceOp,
              AtomicStoreOp, AtomicRMWOp, AtomicCompareExchangeOp>(operation);
 }
@@ -1823,29 +1823,25 @@ private:
   }
 
   FailureOr<SmallVector<Value>> accessCoordinates(Operation *operation) {
-    auto relation = operation->getAttrOfType<IndexRelationAttr>("index");
-    if (!relation)
+    auto relation = canonicalAnalysis.indexRelation(operation);
+    if (failed(relation))
       return failure();
     SmallVector<Value> coordinates;
-    FailureOr<Value> resource = get(operation->getOperand(0));
+    FailureOr<Value> resource = get(relation->source);
     if (failed(resource))
       return failure();
+    Value stored = cast<IndexedAccessOpInterface>(operation).getStoredValue();
     gpu::FragmentType valuePrototype;
-    if (operation->getNumResults() == 0)
-      if (auto valueIndex =
-              operation->getAttrOfType<IntegerAttr>("value_operand_index")) {
-        int64_t index = valueIndex.getInt();
-        if (index >= 0 && index < operation->getNumOperands()) {
-          FailureOr<Value> value = get(operation->getOperand(index));
-          if (succeeded(value))
-            valuePrototype = dyn_cast<gpu::FragmentType>((*value).getType());
-        }
-      }
+    if (isa<ViewStoreOp, BufferStoreOp, ScatterUniqueOp, ScatterReduceOp>(operation)) {
+      FailureOr<Value> value = get(stored);
+      if (succeeded(value))
+        valuePrototype = dyn_cast<gpu::FragmentType>((*value).getType());
+    }
     auto resultExtent = [&](size_t axis,
                             PhysicalExprAttr fallback)
         -> FailureOr<PhysicalExprAttr> {
       if (valuePrototype) {
-        size_t resultRank = relation.getResultDimensions().size();
+        size_t resultRank = relation->resultDimensionIdentities.size();
         if (valuePrototype.getShape().size() < resultRank)
           return failure();
         // A scalar logical index may already have been promoted to a physical
@@ -1897,27 +1893,26 @@ private:
     unsigned sourceAxis = 0;
     unsigned resultAxis = 0;
     unsigned basicResultAxes = 0;
-    for (Attribute attribute : relation.getTerms()) {
-      uint32_t kind = cast<IndexTermAttr>(attribute).getKind();
+    for (const IndexTermFact &term : relation->terms) {
+      int64_t kind = term.kind;
       if (kind == 0 || kind == 1 || kind == 4 || kind == 5)
         ++basicResultAxes;
     }
-    if (basicResultAxes > relation.getResultDimensions().size())
+    if (basicResultAxes > relation->resultDimensionIdentities.size())
       return failure();
     unsigned advancedRank =
-        relation.getResultDimensions().size() - basicResultAxes;
+        relation->resultDimensionIdentities.size() - basicResultAxes;
     std::optional<unsigned> advancedStart;
-    for (Attribute attribute : relation.getTerms()) {
-      auto term = cast<IndexTermAttr>(attribute);
-      if (term.getKind() == 1) {
+    for (const IndexTermFact &term : relation->terms) {
+      if (term.kind == 1) {
         ++resultAxis;
         continue;
       }
       FailureOr<unsigned> physicalSourceAxis = physicalResourceAxis(
-          operation->getOperand(0).getType(), (*resource).getType(), sourceAxis);
+          relation->source.getType(), (*resource).getType(), sourceAxis);
       if (failed(physicalSourceAxis))
         return failure();
-      if (term.getKind() == 0) {
+      if (term.kind == 0) {
         auto view = dyn_cast<gpu::ViewType>((*resource).getType());
         auto buffer = dyn_cast<gpu::BufferType>((*resource).getType());
         auto fragment = dyn_cast<gpu::FragmentType>((*resource).getType());
@@ -1982,7 +1977,7 @@ private:
             return failure();
           dimension = dimensions[*physicalSourceAxis];
         } else if (buffer) {
-          dimension = relation.getResultDimensions()[resultAxis];
+          dimension = relation->resultDimensionIdentities[resultAxis];
         } else {
           dimension = cast<gpu::AxisMapAttr>(
                           fragment.getAxisMaps()[*physicalSourceAxis])
@@ -2011,8 +2006,8 @@ private:
         ++resultAxis;
         continue;
       }
-      if (term.getKind() == 2) {
-        int64_t literal = term.getStaticValues()[0];
+      if (term.kind == 2) {
+        int64_t literal = *term.staticValues[0];
         Value coordinate = builder.create<arith::ConstantIndexOp>(
             operation->getLoc(), literal);
         if (literal < 0) {
@@ -2029,17 +2024,15 @@ private:
         ++sourceAxis;
         continue;
       }
-      if (term.getKind() == 3) {
-        int64_t position = term.getOperandPositions()[0];
-        if (position < 0 || position >= operation->getNumOperands())
-          return failure();
-        FailureOr<Value> coordinate = get(operation->getOperand(position));
+      if (term.kind == 3) {
+        Value index = term.operands[0];
+        FailureOr<Value> coordinate = get(index);
         if (failed(coordinate))
           return failure();
         Value physicalCoordinate = *coordinate;
         if (auto fragment = dyn_cast<gpu::FragmentType>(physicalCoordinate.getType())) {
           auto logicalCoordinate =
-              dyn_cast<RankedTensorType>(operation->getOperand(position).getType());
+              dyn_cast<RankedTensorType>(index.getType());
           if (logicalCoordinate) {
             if (fragment.getShape().size() > advancedRank)
               return failure();
@@ -2053,7 +2046,7 @@ private:
             auto mapping = cast<gpu::AxisMapAttr>(attribute);
             int64_t dimension = mapping.getDimensionId();
             if (logicalCoordinate)
-              dimension = relation.getResultDimensions()[
+              dimension = relation->resultDimensionIdentities[
                   *advancedStart + advancedRank - fragment.getShape().size() + axis];
             mappings.push_back(gpu::AxisMapAttr::get(
                 operation->getContext(), mapping.getSourceId(),
@@ -2080,9 +2073,8 @@ private:
         ++sourceAxis;
         continue;
       }
-      if (term.getKind() == 4) {
-        int64_t position = term.getOperandPositions()[0];
-        FailureOr<Value> range = get(operation->getOperand(position));
+      if (term.kind == 4) {
+        FailureOr<Value> range = get(term.operands[0]);
         if (failed(range) || !isa<gpu::RangeType>((*range).getType()))
           return failure();
         Value start = rangeBound(operation->getLoc(), *range, 0);
@@ -2101,18 +2093,14 @@ private:
         bool derived = rangeType.getDerived();
         auto fragment = dyn_cast<gpu::FragmentType>((*resource).getType());
         auto logical =
-            dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
+            dyn_cast<RankedTensorType>(relation->source.getType());
         const bool fragmentIndex = static_cast<bool>(fragment);
         unsigned logicalAxis = sourceAxis;
         unsigned fragmentAxis = *physicalSourceAxis;
         if (!fragment && valuePrototype) {
-          auto valueIndex =
-              operation->getAttrOfType<IntegerAttr>("value_operand_index");
-          auto valueType = valueIndex ? dyn_cast<RankedTensorType>(
-                                           operation->getOperand(valueIndex.getInt()).getType())
-                                     : RankedTensorType();
+          auto valueType = dyn_cast<RankedTensorType>(stored.getType());
           if (valueType &&
-              valueType.getRank() == relation.getResultDimensions().size()) {
+              valueType.getRank() == relation->resultDimensionIdentities.size()) {
             fragment = valuePrototype;
             logical = valueType;
             logicalAxis = resultAxis;
@@ -2168,20 +2156,19 @@ private:
         ++resultAxis;
         continue;
       }
-      if (term.getKind() == 5) {
-        constexpr int64_t absent = std::numeric_limits<int64_t>::min();
+      if (term.kind == 5) {
         SmallVector<Value> bounds;
         for (unsigned component = 0; component < 3; ++component) {
-          int64_t position = term.getOperandPositions()[component];
-          int64_t literal = term.getStaticValues()[component];
-          if (position >= 0) {
-            FailureOr<Value> value = get(operation->getOperand(position));
+          Value dynamic = term.operands[component];
+          std::optional<int64_t> literal = term.staticValues[component];
+          if (dynamic) {
+            FailureOr<Value> value = get(dynamic);
             if (failed(value))
               return failure();
             bounds.push_back(*value);
-          } else if (literal != absent) {
+          } else if (literal) {
             bounds.push_back(builder.create<arith::ConstantIndexOp>(
-                operation->getLoc(), literal));
+                operation->getLoc(), *literal));
           } else {
             auto view = dyn_cast<gpu::ViewType>((*resource).getType());
             auto buffer = dyn_cast<gpu::BufferType>((*resource).getType());
@@ -2259,7 +2246,7 @@ private:
           dimension = mapping.getDimensionId();
           derived = mapping.getDerived();
         }
-        dimension = relation.getResultDimensions()[resultAxis];
+        dimension = relation->resultDimensionIdentities[resultAxis];
         if (dimension <= 0)
           return failure();
         FailureOr<Value> coordinate = makeRange(
@@ -2278,18 +2265,19 @@ private:
   }
 
   FailureOr<SmallVector<int64_t>> sourceAxes(Operation *operation) {
-    auto relation = operation->getAttrOfType<IndexRelationAttr>("index");
-    FailureOr<Value> resource = get(operation->getOperand(0));
-    if (!relation || failed(resource))
+    auto relation = canonicalAnalysis.indexRelation(operation);
+    if (failed(relation))
+      return failure();
+    FailureOr<Value> resource = get(relation->source);
+    if (failed(resource))
       return failure();
     SmallVector<int64_t> axes;
     unsigned sourceAxis = 0;
-    for (Attribute attribute : relation.getTerms()) {
-      auto term = cast<IndexTermAttr>(attribute);
-      if (term.getKind() == 1)
+    for (const IndexTermFact &term : relation->terms) {
+      if (term.kind == 1)
         continue;
       FailureOr<unsigned> physicalSourceAxis = physicalResourceAxis(
-          operation->getOperand(0).getType(), (*resource).getType(), sourceAxis++);
+          relation->source.getType(), (*resource).getType(), sourceAxis++);
       if (failed(physicalSourceAxis))
         return failure();
       axes.push_back(*physicalSourceAxis);
@@ -2300,15 +2288,15 @@ private:
   FailureOr<Type> accessResultType(Operation *operation, Type logical,
                                    ArrayRef<Value> coordinates,
                                    std::optional<Type> prototype = std::nullopt) {
-    auto relation = operation->getAttrOfType<IndexRelationAttr>("index");
-    if (!relation)
+    auto relation = canonicalAnalysis.indexRelation(operation);
+    if (failed(relation))
       return failure();
     SmallVector<Attribute> liftedShape;
     SmallVector<Attribute> liftedMappings;
     uint64_t liftedOwner = 1;
     if (prototype) {
       auto fragment = dyn_cast<gpu::FragmentType>(*prototype);
-      size_t logicalRank = relation.getResultDimensions().size();
+      size_t logicalRank = relation->resultDimensionIdentities.size();
       if (fragment && fragment.getShape().size() >= logicalRank) {
         size_t prefixRank = fragment.getShape().size() - logicalRank;
         liftedOwner = fragment.getOwner();
@@ -2323,18 +2311,15 @@ private:
       }
     }
     unsigned coordinateIndex = 0;
-    for (Attribute attribute : relation.getTerms()) {
-      auto term = cast<IndexTermAttr>(attribute);
-      if (term.getKind() == 1)
+    for (const IndexTermFact &term : relation->terms) {
+      if (term.kind == 1)
         continue;
       if (coordinateIndex >= coordinates.size())
         return failure();
       Value current = coordinates[coordinateIndex++];
-      if (term.getKind() != 3)
+      if (term.kind != 3)
         continue;
-      int64_t position = term.getOperandPositions()[0];
-      if (position < 0 || position >= operation->getNumOperands() ||
-          isa<RankedTensorType>(operation->getOperand(position).getType()))
+      if (isa<RankedTensorType>(term.operands[0].getType()))
         continue;
       auto fragment = dyn_cast<gpu::FragmentType>(current.getType());
       if (!fragment)
@@ -2368,7 +2353,7 @@ private:
       // tail.  Split that tail from the prototype before combining it with the
       // lifted prefix below; using the complete prototype here would append the
       // ownership axes twice.
-      size_t resultRank = relation.getResultDimensions().size();
+      size_t resultRank = relation->resultDimensionIdentities.size();
       if (prototypeFragment.getShape().size() < resultRank)
         return failure();
       size_t tailStart = prototypeFragment.getShape().size() - resultRank;
@@ -2389,7 +2374,7 @@ private:
           builder.getArrayAttr(tailShape), builder.getArrayAttr(tailMappings),
           prototypeFragment.getValidity(), prototypeFragment.getOwner()));
     } else if (logicalTensor) {
-      ArrayRef<int64_t> dimensions = relation.getResultDimensions();
+      ArrayRef<int64_t> dimensions = relation->resultDimensionIdentities;
       if (dimensions.size() != static_cast<size_t>(logicalTensor.getRank()))
         return failure();
       SmallVector<Attribute> shape;
@@ -2470,18 +2455,18 @@ private:
     unsigned resultAxis = liftedMappings.size();
     const unsigned liftedRank = resultAxis;
     unsigned basicResultAxes = 0;
-    for (Attribute attribute : relation.getTerms()) {
-      uint32_t kind = cast<IndexTermAttr>(attribute).getKind();
+    for (const IndexTermFact &term : relation->terms) {
+      int64_t kind = term.kind;
       if (kind == 0 || kind == 1 || kind == 4 || kind == 5)
         ++basicResultAxes;
     }
-    if (basicResultAxes > relation.getResultDimensions().size())
+    if (basicResultAxes > relation->resultDimensionIdentities.size())
       return failure();
     unsigned advancedRank =
-        relation.getResultDimensions().size() - basicResultAxes;
+        relation->resultDimensionIdentities.size() - basicResultAxes;
     bool advancedMapped = false;
     auto resultDimension = [&](size_t axis) -> FailureOr<int64_t> {
-      ArrayRef<int64_t> dimensions = relation.getResultDimensions();
+      ArrayRef<int64_t> dimensions = relation->resultDimensionIdentities;
       if (axis < liftedRank || axis - liftedRank >= dimensions.size())
         return failure();
       return dimensions[axis - liftedRank];
@@ -2516,26 +2501,23 @@ private:
     };
     auto advancedAxisMapping = [&](unsigned advancedAxis)
         -> gpu::AxisMapAttr {
-      ArrayRef<int64_t> resultDimensions = relation.getResultDimensions();
+      ArrayRef<int64_t> resultDimensions = relation->resultDimensionIdentities;
       if (advancedAxis >= resultDimensions.size())
         return {};
       gpu::AxisMapAttr selected;
       unsigned coordinateIndex = 0;
-      for (Attribute attribute : relation.getTerms()) {
-        auto term = cast<IndexTermAttr>(attribute);
-        if (term.getKind() == 1)
+      for (const IndexTermFact &term : relation->terms) {
+        if (term.kind == 1)
           continue;
         if (coordinateIndex >= coordinates.size())
           return {};
         Value current = coordinates[coordinateIndex++];
-        if (term.getKind() != 3)
+        if (term.kind != 3)
           continue;
-        int64_t position = term.getOperandPositions()[0];
-        if (position < 0 || position >= operation->getNumOperands() ||
-            !isa<RankedTensorType>(operation->getOperand(position).getType()))
+        if (!isa<RankedTensorType>(term.operands[0].getType()))
           continue;
         auto logical =
-            cast<RankedTensorType>(operation->getOperand(position).getType());
+            cast<RankedTensorType>(term.operands[0].getType());
         auto source = dyn_cast<gpu::FragmentType>(current.getType());
         DenseI64ArrayAttr logicalDimensions = dimensionIds(logical);
         if (!source || !logicalDimensions ||
@@ -2574,9 +2556,8 @@ private:
       }
       return selected;
     };
-    for (Attribute attribute : relation.getTerms()) {
-      auto term = cast<IndexTermAttr>(attribute);
-      if (term.getKind() == 1) {
+    for (const IndexTermFact &term : relation->terms) {
+      if (term.kind == 1) {
         FailureOr<int64_t> dimension = resultDimension(resultAxis);
         FailureOr<PhysicalAxisIdentity> identity = resultIdentity(resultAxis);
         if (failed(dimension) || *dimension <= 0 || failed(identity))
@@ -2590,8 +2571,8 @@ private:
       if (coordinate >= coordinates.size())
         return failure();
       Value current = coordinates[coordinate++];
-      if (term.getKind() == 0 || term.getKind() == 4 ||
-          term.getKind() == 5) {
+      if (term.kind == 0 || term.kind == 4 ||
+          term.kind == 5) {
         if (failed(appendCoordinate(current))) {
           operation->emitOpError(
               "access range coordinate cannot map a result axis");
@@ -2599,11 +2580,8 @@ private:
         }
         continue;
       }
-      if (term.getKind() == 3 && isa<gpu::FragmentType>(current.getType())) {
-        int64_t position = term.getOperandPositions()[0];
-        if (position < 0 || position >= operation->getNumOperands())
-          return failure();
-        if (!isa<RankedTensorType>(operation->getOperand(position).getType()))
+      if (term.kind == 3 && isa<gpu::FragmentType>(current.getType())) {
+        if (!isa<RankedTensorType>(term.operands[0].getType()))
           continue;
         if (!advancedMapped) {
           for (unsigned axis = 0; axis < advancedRank; ++axis) {
@@ -2631,7 +2609,7 @@ private:
         }
         continue;
       }
-      if (term.getKind() != 2 && term.getKind() != 3)
+      if (term.kind != 2 && term.kind != 3)
         return failure();
     }
     if (coordinate != coordinates.size() ||
@@ -2719,8 +2697,8 @@ private:
 
   SmallVector<bool> canonicalAccessAxisProofs(Operation *operation,
                                               Value resource) {
-    auto relation = operation->getAttrOfType<IndexRelationAttr>("index");
-    if (!relation || operation->getNumOperands() == 0 || !resource)
+    auto relation = canonicalAnalysis.indexRelation(operation);
+    if (failed(relation) || !resource)
       return {};
 
     unsigned physicalRank = 0;
@@ -2735,7 +2713,7 @@ private:
     SmallVector<bool> proven(physicalRank, false);
 
     RankedTensorType source;
-    Type sourceType = operation->getOperand(0).getType();
+    Type sourceType = relation->source.getType();
     if (auto view = dyn_cast<intent::ViewType>(sourceType))
       source = dyn_cast<RankedTensorType>(view.getTensor());
     else if (auto buffer = dyn_cast<intent::BufferType>(sourceType))
@@ -2745,36 +2723,32 @@ private:
 
     SmallVector<Value> indexedValues(proven.size());
     unsigned sourceAxis = 0;
-    for (Attribute attribute : relation.getTerms()) {
-      auto term = cast<IndexTermAttr>(attribute);
-      if (term.getKind() == 1)
+    for (const IndexTermFact &term : relation->terms) {
+      if (term.kind == 1)
         continue;
       FailureOr<unsigned> physicalSourceAxis = physicalResourceAxis(
-          operation->getOperand(0).getType(), resource.getType(), sourceAxis);
+          relation->source.getType(), resource.getType(), sourceAxis);
       if (failed(physicalSourceAxis) || *physicalSourceAxis >= proven.size())
         return {};
-      if (term.getKind() == 0 && isa<gpu::FragmentType>(resource.getType())) {
+      if (term.kind == 0 && isa<gpu::FragmentType>(resource.getType())) {
         // A full slice of an already materialized fragment addresses its
         // complete physical value. Any logical tail was resolved when that
         // value was produced; rebuilding a resource bound from its
         // construction-time extent creates a competing validity relation when
         // pointwise ownership later widens the fragment.
         proven[*physicalSourceAxis] = true;
-      } else if (term.getKind() == 2 && source &&
+      } else if (term.kind == 2 && source &&
                  sourceAxis < static_cast<unsigned>(source.getRank()) &&
                  !source.isDynamicDim(sourceAxis)) {
-        int64_t index = term.getStaticValues()[0];
+        int64_t index = *term.staticValues[0];
         int64_t extent = source.getDimSize(sourceAxis);
         proven[*physicalSourceAxis] = -extent <= index && index < extent;
-      } else if (term.getKind() == 3 &&
-                 term.getOperandPositions().size() == 1) {
-        int64_t position = term.getOperandPositions()[0];
-        if (position >= 0 && position < operation->getNumOperands())
-          indexedValues[*physicalSourceAxis] = operation->getOperand(position);
+      } else if (term.kind == 3) {
+        indexedValues[*physicalSourceAxis] = term.operands[0];
       }
       ++sourceAxis;
     }
-    if (sourceAxis != relation.getSourceRank())
+    if (sourceAxis != relation->sourceRank)
       return {};
 
     func::FuncOp function = operation->getParentOfType<func::FuncOp>();
@@ -2782,7 +2756,7 @@ private:
       return proven;
     DominanceInfo dominance(function);
     function.walk([&](intent::AssumeInBoundsOp assumption) {
-      if (assumption.getView() != operation->getOperand(0))
+      if (assumption.getView() != relation->source)
         return;
       FailureOr<unsigned> axis = physicalResourceAxis(
           assumption.getView().getType(), resource.getType(),
@@ -2830,15 +2804,14 @@ private:
     // that occurrence when equal-length regions share one source identity;
     // broadcasting by the coordinate type alone would select the trailing axis.
     SmallVector<std::optional<unsigned>> coordinateAxes(coordinates.size());
-    auto relation = operation->getAttrOfType<IndexRelationAttr>("index");
-    if (payloadFragment && relation &&
-        relation.getResultDimensions().size() == payloadFragment.getShape().size()) {
+    auto relation = canonicalAnalysis.indexRelation(operation);
+    if (payloadFragment && succeeded(relation) &&
+        relation->resultDimensionIdentities.size() == payloadFragment.getShape().size()) {
       unsigned coordinateIndex = 0;
       unsigned resultAxis = 0;
       bool cartesian = true;
-      for (Attribute attribute : relation.getTerms()) {
-        auto term = cast<IndexTermAttr>(attribute);
-        if (term.getKind() == 1) {
+      for (const IndexTermFact &term : relation->terms) {
+        if (term.kind == 1) {
           ++resultAxis;
           continue;
         }
@@ -2847,7 +2820,7 @@ private:
           break;
         }
         auto type = dyn_cast<gpu::FragmentType>(coordinates[coordinateIndex].getType());
-        if (term.getKind() == 0 || term.getKind() == 4 || term.getKind() == 5) {
+        if (term.kind == 0 || term.kind == 4 || term.kind == 5) {
           if (!type || type.getShape().size() != 1 ||
               resultAxis >= payloadFragment.getShape().size()) {
             cartesian = false;
@@ -2857,7 +2830,7 @@ private:
           auto target = cast<gpu::AxisMapAttr>(payloadFragment.getAxisMaps()[resultAxis]);
           if (!(gpu::sourceAxisIdentity(source) == gpu::sourceAxisIdentity(target)) ||
               source.getDimensionId() != target.getDimensionId() ||
-              target.getDimensionId() != relation.getResultDimensions()[resultAxis] ||
+              target.getDimensionId() != relation->resultDimensionIdentities[resultAxis] ||
               type.getShape()[0] != payloadFragment.getShape()[resultAxis] ||
               type.getOwner() != payloadFragment.getOwner()) {
             cartesian = false;
@@ -4254,7 +4227,7 @@ private:
           extent = expression(operation->getContext(),
                               PhysicalExprKind::Constant, axis.getPayload());
         else if (axis.getKind() == 1)
-          extent = launchExpression(buffer.getInputs()[axis.getPayload()],
+          extent = launchExpression(buffer.getExtents()[axis.getPayload()],
                                     operation->getParentOfType<func::FuncOp>());
         if (failed(extent))
           return buffer.emitOpError(
@@ -4283,9 +4256,9 @@ private:
           gpu::BufferLifetimeAttr::get(operation->getContext(), lifetime),
           /*visibility=*/0, /*workspace=*/false);
       Value initial;
-      if (buffer.getInitialOperand()) {
+      if (buffer.getInitial()) {
         FailureOr<Value> lowered =
-            get(buffer.getInputs()[*buffer.getInitialOperand()]);
+            get(buffer.getInitial());
         if (failed(lowered))
           return buffer.emitOpError("logical buffer initializer is unavailable");
         initial = *lowered;
@@ -4356,7 +4329,7 @@ private:
       return success();
     }
     if (auto gather = dyn_cast<intent::GatherOp>(operation)) {
-      FailureOr<Value> source = get(gather.getInputs().front());
+      FailureOr<Value> source = get(gather.getSource());
       FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
       FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
       FailureOr<Type> result = failed(coordinates)
@@ -4377,16 +4350,16 @@ private:
             "gather result cannot preserve the physical coordinate relation");
       Value valid;
       Value fill;
-      if (gather.getValidOperandIndex()) {
+      if (gather.getValid()) {
         FailureOr<Value> lowered =
-            get(gather.getInputs()[*gather.getValidOperandIndex()]);
+            get(gather.getValid());
         if (failed(lowered))
           return failure();
         valid = *lowered;
       }
-      if (gather.getFillOperandIndex()) {
+      if (gather.getFill()) {
         FailureOr<Value> lowered =
-            get(gather.getInputs()[*gather.getFillOperandIndex()]);
+            get(gather.getFill());
         if (failed(lowered))
           return failure();
         fill = *lowered;
@@ -4450,7 +4423,7 @@ private:
       return success();
     }
     if (auto load = dyn_cast<intent::ViewLoadOp>(operation)) {
-      FailureOr<Value> resource = get(load.getInputs().front());
+      FailureOr<Value> resource = get(load.getSource());
       FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
       FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
       FailureOr<Type> result = failed(coordinates)
@@ -4471,16 +4444,16 @@ private:
             "view-load result cannot preserve the physical coordinate relation");
       Value valid;
       Value fill;
-      if (load.getValidOperandIndex()) {
+      if (load.getValid()) {
         FailureOr<Value> lowered =
-            get(load.getInputs()[*load.getValidOperandIndex()]);
+            get(load.getValid());
         if (failed(lowered))
           return failure();
         valid = *lowered;
       }
-      if (load.getFillOperandIndex()) {
+      if (load.getFill()) {
         FailureOr<Value> lowered =
-            get(load.getInputs()[*load.getFillOperandIndex()]);
+            get(load.getFill());
         if (failed(lowered))
           return failure();
         fill = *lowered;
@@ -4517,7 +4490,7 @@ private:
       return success();
     }
     if (auto load = dyn_cast<intent::BufferLoadOp>(operation)) {
-      FailureOr<Value> resource = get(load.getInputs().front());
+      FailureOr<Value> resource = get(load.getSource());
       FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
       FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
       FailureOr<Type> result = failed(coordinates)
@@ -4547,14 +4520,14 @@ private:
       return success();
     }
     if (auto store = dyn_cast<intent::ViewStoreOp>(operation)) {
-      FailureOr<Value> resource = get(store.getInputs().front());
+      FailureOr<Value> resource = get(store.getSource());
       FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
       FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
       FailureOr<Value> value =
           failed(coordinates)
               ? FailureOr<Value>(failure())
               : accessValue(operation,
-                            store.getInputs()[store.getValueOperandIndex()],
+                            store.getValue(),
                             *coordinates);
       if (failed(resource))
         return store.emitOpError("view-store physical resource is unavailable");
@@ -4579,14 +4552,14 @@ private:
       return success();
     }
     if (auto store = dyn_cast<intent::BufferStoreOp>(operation)) {
-      FailureOr<Value> resource = get(store.getInputs().front());
+      FailureOr<Value> resource = get(store.getSource());
       FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
       FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
       FailureOr<Value> value =
           failed(coordinates)
               ? FailureOr<Value>(failure())
               : accessValue(operation,
-                            store.getInputs()[store.getValueOperandIndex()],
+                            store.getValue(),
                             *coordinates);
       if (failed(resource) || failed(coordinates) || failed(axes) ||
           failed(value))
@@ -4602,14 +4575,14 @@ private:
       return success();
     }
     if (auto store = dyn_cast<intent::ScatterUniqueOp>(operation)) {
-      FailureOr<Value> resource = get(store.getInputs().front());
+      FailureOr<Value> resource = get(store.getSource());
       FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
       FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
       FailureOr<Value> value =
           failed(coordinates)
               ? FailureOr<Value>(failure())
               : accessValue(operation,
-                            store.getInputs()[store.getValueOperandIndex()],
+                            store.getValue(),
                             *coordinates);
       if (failed(resource) || failed(coordinates) || failed(axes) ||
           failed(value))
@@ -4626,14 +4599,14 @@ private:
       return success();
     }
     if (auto scatter = dyn_cast<intent::ScatterReduceOp>(operation)) {
-      FailureOr<Value> resource = get(scatter.getInputs().front());
+      FailureOr<Value> resource = get(scatter.getSource());
       FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
       FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
       FailureOr<Value> value =
           failed(coordinates)
               ? FailureOr<Value>(failure())
               : accessValue(operation,
-                            scatter.getInputs()[scatter.getValueOperandIndex()],
+                            scatter.getValue(),
                             *coordinates);
       if (failed(resource) || failed(coordinates) || failed(axes) ||
           failed(value))
@@ -4672,7 +4645,7 @@ private:
       return success();
     }
     if (auto atomic = dyn_cast<intent::AtomicLoadOp>(operation)) {
-      FailureOr<Value> resource = get(atomic.getInputs().front());
+      FailureOr<Value> resource = get(atomic.getSource());
       FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
       FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
       FailureOr<Type> result =
@@ -4699,14 +4672,14 @@ private:
       return success();
     }
     if (auto atomic = dyn_cast<intent::AtomicStoreOp>(operation)) {
-      FailureOr<Value> resource = get(atomic.getInputs().front());
+      FailureOr<Value> resource = get(atomic.getSource());
       FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
       FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
       FailureOr<Value> value =
           failed(coordinates)
               ? FailureOr<Value>(failure())
               : accessValue(operation,
-                            atomic.getInputs()[atomic.getValueOperand()],
+                            atomic.getValue(),
                             *coordinates);
       if (failed(resource) || failed(coordinates) || failed(axes) ||
           failed(value))
@@ -4728,14 +4701,14 @@ private:
       return success();
     }
     if (auto atomic = dyn_cast<intent::AtomicRMWOp>(operation)) {
-      FailureOr<Value> resource = get(atomic.getInputs().front());
+      FailureOr<Value> resource = get(atomic.getSource());
       FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
       FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
       FailureOr<Value> value =
           failed(coordinates)
               ? FailureOr<Value>(failure())
               : accessValue(operation,
-                            atomic.getInputs()[atomic.getValueOperand()],
+                            atomic.getValue(),
                             *coordinates);
       FailureOr<Type> result = failed(value)
                                    ? FailureOr<Type>(failure())
@@ -4759,20 +4732,20 @@ private:
       return success();
     }
     if (auto atomic = dyn_cast<intent::AtomicCompareExchangeOp>(operation)) {
-      FailureOr<Value> resource = get(atomic.getInputs().front());
+      FailureOr<Value> resource = get(atomic.getSource());
       FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
       FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
       FailureOr<Value> expected =
           failed(coordinates)
               ? FailureOr<Value>(failure())
               : accessValue(operation,
-                            atomic.getInputs()[atomic.getExpectedOperand()],
+                            atomic.getExpected(),
                             *coordinates);
       FailureOr<Value> desired =
           failed(coordinates)
               ? FailureOr<Value>(failure())
               : accessValue(operation,
-                            atomic.getInputs()[atomic.getDesiredOperand()],
+                            atomic.getDesired(),
                             *coordinates);
       FailureOr<Type> result =
           convertDataType(atomic.getResult().getType(), operation);
@@ -5252,7 +5225,7 @@ bool capturesScanPrefixAxis(const LogicalWorksetFact &workset,
   }
   bool captured = false;
   workset.body->walk([&](intent::GatherOp gather) {
-    SmallVector<Value> pending{gather.getInputs().front()};
+    SmallVector<Value> pending{gather.getSource()};
     llvm::DenseSet<Value> visited;
     SmallVector<intent::ScanOp> scans;
     while (!pending.empty()) {

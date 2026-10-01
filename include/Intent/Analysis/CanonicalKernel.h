@@ -29,6 +29,7 @@ struct CoordinateProvenance {
 struct IndexTermFact {
   int64_t kind = 0;
   std::optional<unsigned> sourceAxis;
+  // Preserve start/stop/step slots: a static or absent slot has an empty Value.
   llvm::SmallVector<mlir::Value, 3> operands;
   llvm::SmallVector<std::optional<int64_t>, 3> staticValues;
   CoordinateProvenance coordinate;

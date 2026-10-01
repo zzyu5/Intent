@@ -432,23 +432,14 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
   for (MakeRangeOp range : ranges)
     rangeSet.insert(range.getOperation());
 
-  SmallVector<LoadOp> loads;
-  SmallVector<GatherOp> gathers;
-  SmallVector<StoreOp> stores;
-  SmallVector<ScatterReduceOp> scatters;
-  SmallVector<AtomicLoadOp> atomicLoads;
-  SmallVector<AtomicStoreOp> atomicStores;
-  SmallVector<AtomicRMWOp> atomicRMWs;
-  SmallVector<AtomicCompareExchangeOp> atomicCAS;
-  kernel.walk([&](LoadOp load) { loads.push_back(load); });
-  kernel.walk([&](GatherOp gather) { gathers.push_back(gather); });
-  kernel.walk([&](StoreOp store) { stores.push_back(store); });
-  kernel.walk([&](ScatterReduceOp scatter) { scatters.push_back(scatter); });
-  kernel.walk([&](AtomicLoadOp atomic) { atomicLoads.push_back(atomic); });
-  kernel.walk([&](AtomicStoreOp atomic) { atomicStores.push_back(atomic); });
-  kernel.walk([&](AtomicRMWOp atomic) { atomicRMWs.push_back(atomic); });
-  kernel.walk(
-      [&](AtomicCompareExchangeOp atomic) { atomicCAS.push_back(atomic); });
+  SmallVector<AccessOpInterface> accesses;
+  kernel.walk([&](AccessOpInterface access) { accesses.push_back(access); });
+  // Preserve the existing read-before-write schema update order, including
+  // operation order within each semantic kind. All footprints are read before
+  // any range or access operand is changed below.
+  llvm::stable_sort(accesses, [](AccessOpInterface lhs, AccessOpInterface rhs) {
+    return lhs.getAccessKind() < rhs.getAccessKind();
+  });
   llvm::DenseMap<Operation *, SmallVector<MakeRangeOp>> accessRanges;
   PhysicalProgramAnalysis accessAnalysis(kernel);
   auto recordAccessRanges = [&](Operation *access) -> LogicalResult {
@@ -464,29 +455,8 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
         relevant.push_back(range);
     return success();
   };
-  for (LoadOp load : loads)
-    if (failed(recordAccessRanges(load)))
-      return failure();
-  for (GatherOp gather : gathers)
-    if (failed(recordAccessRanges(gather)))
-      return failure();
-  for (StoreOp store : stores)
-    if (failed(recordAccessRanges(store)))
-      return failure();
-  for (ScatterReduceOp scatter : scatters)
-    if (failed(recordAccessRanges(scatter)))
-      return failure();
-  for (AtomicLoadOp atomic : atomicLoads)
-    if (failed(recordAccessRanges(atomic)))
-      return failure();
-  for (AtomicStoreOp atomic : atomicStores)
-    if (failed(recordAccessRanges(atomic)))
-      return failure();
-  for (AtomicRMWOp atomic : atomicRMWs)
-    if (failed(recordAccessRanges(atomic)))
-      return failure();
-  for (AtomicCompareExchangeOp atomic : atomicCAS)
-    if (failed(recordAccessRanges(atomic)))
+  for (AccessOpInterface access : accesses)
+    if (failed(recordAccessRanges(access)))
       return failure();
 
   llvm::DenseMap<Operation *, Value> predicates;
@@ -578,197 +548,62 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
     return result ? FailureOr<Value>(result) : FailureOr<Value>(failure());
   };
 
-  auto combineValidity = [&](OpBuilder &builder, Location location,
-                             FragmentType type, ArrayRef<MakeRangeOp> sources,
-                             Value existing) -> FailureOr<Value> {
-    FailureOr<Value> tail = materializeTail(builder, location, type, sources);
-    if (failed(tail))
-      return failure();
-    Value valid = *tail;
-    auto predicate = cast<FragmentType>(valid.getType());
-    if (!existing)
-      return valid;
-    Type element = existing.getType();
-    if (auto fragment = dyn_cast<FragmentType>(element))
-      element = fragment.getElementType();
-    if (!element.isInteger(1))
-      return failure();
-    if (existing.getType() != predicate) {
-      FailureOr<Value> projected = projectPhysicalValueToSchema(
-          builder, location, existing, predicate);
-      if (failed(projected))
-        return failure();
-      existing = *projected;
-    }
-    return Value(builder.create<BinaryOp>(location, predicate, existing, valid,
-                                          BinaryOperator::LogicalAnd));
-  };
-
-  for (LoadOp load : loads) {
-    auto sources = accessRanges.lookup(load.getOperation());
-    auto type = dyn_cast<FragmentType>(load.getResult().getType());
-    if (!load->getBlock() || !type || sources.empty())
+  for (AccessOpInterface access : accesses) {
+    auto sources = accessRanges.lookup(access.getOperation());
+    auto type = dyn_cast<FragmentType>(access.getAccessValueType());
+    if (!access->getBlock() || !type || sources.empty())
       continue;
-    OpBuilder builder(load);
-    FailureOr<Value> tail =
-        materializeTail(builder, load.getLoc(), type, sources, load.getResult());
+    OpBuilder builder(access);
+    SmallVector<Value> payloads(access.getAccessPayloads());
+    if (access.getAccessKind() == AccessKind::Store) {
+      SmallVector<Attribute> shape(type.getShape().begin(), type.getShape().end());
+      for (MakeRangeOp range : sources) {
+        auto coordinate = cast<FragmentType>(range.getResult().getType());
+        for (PhysicalAxisProjection projection : queryRangeProjections(type, range))
+          shape[projection.fragmentAxis] = coordinate.getShape()[0];
+      }
+      type = FragmentType::get(kernel.getContext(), type.getElementType(),
+                               builder.getArrayAttr(shape), type.getAxisMaps(),
+                               type.getValidity(), type.getOwner());
+      // Only ordinary stores project their payload to the address-owned extent.
+      // Atomic and scatter payloads retain their original schemas and semantics.
+      auto value = projectPhysicalValueToSchema(builder, access.getLoc(), payloads.front(), type);
+      if (failed(value))
+        return access.emitOpError("full-coverage stored value has no exact physical projection");
+      payloads.front() = *value;
+    }
+    Value data = access.getAccessKind() == AccessKind::Load ? access.getAccessResult() : Value();
+    auto tail = materializeTail(builder, access.getLoc(), type, sources, data);
     if (failed(tail))
-      return load.emitOpError(
-          "cannot project full-coverage dimension to load validity")
-             << "; dimension=" << dimension << "; result=" << type
+      return access.emitOpError("cannot project full-coverage dimension to access validity")
+             << "; dimension=" << dimension << "; value=" << type
              << "; range_count=" << sources.size();
     Value valid = *tail;
     auto predicate = cast<FragmentType>(valid.getType());
-    if (load.getValid()) {
-      Value existing = load.getValid();
-      Type element = existing.getType();
-      if (auto fragment = dyn_cast<FragmentType>(element))
-        element = fragment.getElementType();
-      if (!element.isInteger(1))
-        return load.emitOpError(
-            "full-coverage load carried non-predicate validity");
+    if (Value existing = access.getAccessValidity()) {
       if (existing.getType() != predicate) {
-        FailureOr<Value> projected = projectPhysicalValueToSchema(
-            builder, load.getLoc(), existing, predicate);
+        auto projected = projectPhysicalValueToSchema(builder, access.getLoc(), existing, predicate);
         if (failed(projected))
-          return load.emitOpError(
-              "full-coverage validity has no exact physical projection")
-                 << "; existing=" << existing.getType()
-                 << "; required=" << predicate;
+          return access.emitOpError("full-coverage validity has no exact physical projection")
+                 << "; existing=" << existing.getType() << "; required=" << predicate;
         existing = *projected;
       }
-      valid = builder.create<BinaryOp>(load.getLoc(), predicate, existing, valid,
+      valid = builder.create<BinaryOp>(access.getLoc(), predicate, existing, valid,
                                        BinaryOperator::LogicalAnd);
     }
-    Value fill = load.getFill();
-    if (!fill) {
-      FailureOr<Value> zero = materializeZeroFragment(builder, load.getLoc(), type);
-      if (failed(zero))
-        return load.emitOpError("full-coverage load has no neutral fill");
-      fill = *zero;
-    } else if (fill.getType() != type) {
-      FailureOr<Value> projected =
-          projectPhysicalValueToSchema(builder, load.getLoc(), fill, type);
+    Value fill = access.getAccessFill();
+    if (access.getAccessFillMutable()) {
+      auto projected = fill ? projectPhysicalValueToSchema(builder, access.getLoc(), fill, type)
+                            : materializeZeroFragment(builder, access.getLoc(), type);
       if (failed(projected))
-        return load.emitOpError(
-            "full-coverage fill has no exact physical projection");
+        return access.emitOpError("full-coverage fill has no exact physical projection");
       fill = *projected;
     }
-    // Callers may be realizing coverage for this exact SSA result.  Updating
-    // its access operands keeps that value live across physicalization.
-    load.getValidMutable().assign(ValueRange{valid});
-    load.getFillMutable().assign(ValueRange{fill});
+    // Preserve the access result identity: callers may be realizing coverage
+    // for this exact SSA value. No operation or effect is cloned here.
+    if (failed(access.updateAccessOperands(access.getAccessCoordinates(), payloads, valid, fill)))
+      return failure();
   }
-
-  for (GatherOp gather : gathers) {
-    auto sources = accessRanges.lookup(gather.getOperation());
-    auto type = dyn_cast<FragmentType>(gather.getResult().getType());
-    if (!gather->getBlock() || !type || sources.empty())
-      continue;
-    OpBuilder builder(gather);
-    FailureOr<Value> valid = combineValidity(
-        builder, gather.getLoc(), type, sources, gather.getValid());
-    if (failed(valid))
-      return gather.emitOpError(
-          "cannot project full-coverage dimension to gather validity");
-    Value fill = gather.getFill();
-    if (!fill) {
-      FailureOr<Value> zero = materializeZeroFragment(builder, gather.getLoc(), type);
-      if (failed(zero))
-        return gather.emitOpError("full-coverage gather has no neutral fill");
-      fill = *zero;
-    } else if (fill.getType() != type) {
-      FailureOr<Value> projected =
-          projectPhysicalValueToSchema(builder, gather.getLoc(), fill, type);
-      if (failed(projected))
-        return gather.emitOpError(
-            "full-coverage fill has no exact physical projection");
-      fill = *projected;
-    }
-    gather.getValidMutable().assign(ValueRange{*valid});
-    gather.getFillMutable().assign(ValueRange{fill});
-  }
-
-  for (StoreOp store : stores) {
-    auto sources = accessRanges.lookup(store.getOperation());
-    auto type = dyn_cast<FragmentType>(store.getValue().getType());
-    if (!store->getBlock() || !type || sources.empty())
-      continue;
-    OpBuilder builder(store);
-    SmallVector<Attribute> shape(type.getShape().begin(), type.getShape().end());
-    for (MakeRangeOp range : sources) {
-      auto coordinate = cast<FragmentType>(range.getResult().getType());
-      for (PhysicalAxisProjection projection : queryRangeProjections(type, range))
-        shape[projection.fragmentAxis] = coordinate.getShape()[0];
-    }
-    type = FragmentType::get(kernel.getContext(), type.getElementType(),
-                             builder.getArrayAttr(shape), type.getAxisMaps(),
-                             type.getValidity(), type.getOwner());
-    // The access coordinates own the physical extent.  Project a uniform
-    // payload to that schema without retargeting its independent value graph.
-    FailureOr<Value> value = projectPhysicalValueToSchema(
-        builder, store.getLoc(), store.getValue(), type);
-    if (failed(value))
-      return store.emitOpError(
-          "full-coverage stored value has no exact physical projection");
-    FailureOr<Value> tail =
-        materializeTail(builder, store.getLoc(), type, sources);
-    if (failed(tail))
-      return store.emitOpError(
-          "cannot project full-coverage dimension to store validity");
-    Value valid = *tail;
-    auto predicate = cast<FragmentType>(valid.getType());
-    if (store.getValid()) {
-      Value existing = store.getValid();
-      if (existing.getType() != predicate) {
-        FailureOr<Value> projected = projectPhysicalValueToSchema(
-            builder, store.getLoc(), existing, predicate);
-        if (failed(projected))
-          return store.emitOpError(
-              "full-coverage validity has no exact physical projection")
-                 << "; existing=" << existing.getType()
-                 << "; required=" << predicate;
-        existing = *projected;
-      }
-      valid = builder.create<BinaryOp>(store.getLoc(), predicate, existing,
-                                       valid, BinaryOperator::LogicalAnd);
-    }
-    store.getValueMutable().assign(*value);
-    store.getValidMutable().assign(ValueRange{valid});
-  }
-
-  auto updateValidity = [&](auto access, Type payload,
-                            StringRef kind) -> LogicalResult {
-    auto sources = accessRanges.lookup(access.getOperation());
-    auto type = dyn_cast<FragmentType>(payload);
-    if (!access->getBlock() || !type || sources.empty())
-      return success();
-    OpBuilder builder(access);
-    auto valid = combineValidity(builder, access.getLoc(), type, sources,
-                                 access.getValid());
-    if (failed(valid))
-      return access.emitOpError()
-             << "cannot project full-coverage dimension to " << kind << " validity";
-    // The operand-segment interface updates only validity. Atomic ordering,
-    // sharing, returned old values and scatter combine regions stay attached.
-    access.getValidMutable().assign(ValueRange{*valid});
-    return success();
-  };
-  for (ScatterReduceOp scatter : scatters)
-    if (failed(updateValidity(scatter, scatter.getValue().getType(), "scatter")))
-      return failure();
-  for (AtomicLoadOp atomic : atomicLoads)
-    if (failed(updateValidity(atomic, atomic.getResult().getType(), "atomic-load")))
-      return failure();
-  for (AtomicStoreOp atomic : atomicStores)
-    if (failed(updateValidity(atomic, atomic.getValue().getType(), "atomic-store")))
-      return failure();
-  for (AtomicRMWOp atomic : atomicRMWs)
-    if (failed(updateValidity(atomic, atomic.getValue().getType(), "atomic-RMW")))
-      return failure();
-  for (AtomicCompareExchangeOp atomic : atomicCAS)
-    if (failed(updateValidity(atomic, atomic.getExpected().getType(), "compare-exchange")))
-      return failure();
   return success();
 }
 

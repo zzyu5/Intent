@@ -1131,16 +1131,9 @@ SmallVector<WriteEffectFacts> readWriteEffects(func::FuncOp kernel) {
     effects.push_back({operation, llvm::to_vector(coordinates), llvm::to_vector(payloads)});
   };
   kernel.walk([&](Operation *operation) {
-    if (auto store = dyn_cast<StoreOp>(operation))
-      append(operation, store.getCoordinates(), ValueRange{store.getValue()});
-    else if (auto store = dyn_cast<AtomicStoreOp>(operation))
-      append(operation, store.getCoordinates(), ValueRange{store.getValue()});
-    else if (auto store = dyn_cast<AtomicRMWOp>(operation))
-      append(operation, store.getCoordinates(), ValueRange{store.getValue()});
-    else if (auto store = dyn_cast<AtomicCompareExchangeOp>(operation))
-      append(operation, store.getCoordinates(), ValueRange{store.getExpected(), store.getDesired()});
-    else if (auto scatter = dyn_cast<ScatterReduceOp>(operation))
-      append(operation, scatter.getCoordinates(), ValueRange{scatter.getValue()});
+    if (auto access = dyn_cast<AccessOpInterface>(operation);
+        access && access.writesMemory())
+      append(operation, access.getAccessCoordinates(), access.getAccessPayloads());
   });
   return effects;
 }

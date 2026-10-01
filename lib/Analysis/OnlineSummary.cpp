@@ -28,8 +28,7 @@ Value projected(Value value) {
   while (Operation *op = value.getDefiningOp()) {
     if (isa<BroadcastOp>(op)) { value = op->getOperand(0); continue; }
     if (auto gather = dyn_cast<GatherOp>(op)) {
-      bool insertion = gather.getValidOperandIndex() &&
-          truth(gather.getInputs()[*gather.getValidOperandIndex()], true);
+      bool insertion = gather.getValid() && truth(gather.getValid(), true);
       unsigned retained = 0;
       for (Attribute attr : gather.getIndex().getTerms()) {
         auto term = cast<IndexTermAttr>(attr);
@@ -37,7 +36,7 @@ Value projected(Value value) {
         retained += term.getKind() == 0;
       }
       insertion &= retained == gather.getIndex().getSourceRank();
-      if (insertion) { value = gather.getInputs()[0]; continue; }
+      if (insertion) { value = gather.getSource(); continue; }
     }
     break;
   }

@@ -1370,20 +1370,9 @@ bool reductionTypeConsumesSource(Type type, ArrayRef<int64_t> axes,
 }
 
 Value accessResource(Operation *operation) {
-  if (auto load = dyn_cast<LoadOp>(operation))
-    return load.getResource();
-  if (auto store = dyn_cast<StoreOp>(operation))
-    return store.getResource();
-  if (auto scatter = dyn_cast<ScatterReduceOp>(operation))
-    return scatter.getResource();
-  if (auto atomic = dyn_cast<AtomicLoadOp>(operation))
-    return atomic.getResource();
-  if (auto atomic = dyn_cast<AtomicStoreOp>(operation))
-    return atomic.getResource();
-  if (auto atomic = dyn_cast<AtomicRMWOp>(operation))
-    return atomic.getResource();
-  if (auto atomic = dyn_cast<AtomicCompareExchangeOp>(operation))
-    return atomic.getResource();
+  if (auto access = dyn_cast<AccessOpInterface>(operation);
+      access && access.isMemoryAccess())
+    return access.getAccessResource();
   return {};
 }
 
@@ -5001,30 +4990,10 @@ PhysicalProgramAnalysis::footprint(Operation *access) {
         appendUnique(result.ranges, range);
     }
   };
-  if (auto load = dyn_cast<LoadOp>(access))
-    collect(load.getResource(), load.getCoordinates(), load.getSourceAxes(),
-            load.getValid(), load.getFill());
-  else if (auto gather = dyn_cast<GatherOp>(access))
-    collect(gather.getSource(), gather.getCoordinates(), gather.getSourceAxes(),
-            gather.getValid(), gather.getFill());
-  else if (auto store = dyn_cast<StoreOp>(access))
-    collect(store.getResource(), store.getCoordinates(), store.getSourceAxes(),
-            store.getValid(), {});
-  else if (auto scatter = dyn_cast<ScatterReduceOp>(access))
-    collect(scatter.getResource(), scatter.getCoordinates(),
-            scatter.getSourceAxes(), scatter.getValid(), {});
-  else if (auto atomic = dyn_cast<AtomicLoadOp>(access))
-    collect(atomic.getResource(), atomic.getCoordinates(), atomic.getSourceAxes(),
-            atomic.getValid(), {});
-  else if (auto atomic = dyn_cast<AtomicStoreOp>(access))
-    collect(atomic.getResource(), atomic.getCoordinates(), atomic.getSourceAxes(),
-            atomic.getValid(), {});
-  else if (auto atomic = dyn_cast<AtomicRMWOp>(access))
-    collect(atomic.getResource(), atomic.getCoordinates(), atomic.getSourceAxes(),
-            atomic.getValid(), {});
-  else if (auto atomic = dyn_cast<AtomicCompareExchangeOp>(access))
-    collect(atomic.getResource(), atomic.getCoordinates(), atomic.getSourceAxes(),
-            atomic.getValid(), {});
+  if (auto relation = dyn_cast<AccessOpInterface>(access))
+    collect(relation.getAccessResource(), relation.getAccessCoordinates(),
+            relation.getAccessSourceAxes(), relation.getAccessValidity(),
+            relation.getAccessFill());
   else
     result.state = PhysicalFactState::Unknown;
   return result;
@@ -5533,59 +5502,43 @@ bool PhysicalProgramAnalysis::hasDisjointWorkspaceSlices(Value buffer) const {
   auto type = dyn_cast<BufferType>(buffer.getType());
   if (!type)
     return false;
+  SmallVector<AccessOpInterface> accesses;
+  for (Operation *user : buffer.getUsers()) {
+    if (isa<DimOp, AssumeInBoundsOp>(user))
+      continue;
+    auto access = dyn_cast<AccessOpInterface>(user);
+    if (!access || (access.getAccessKind() != AccessKind::Load &&
+                    access.getAccessKind() != AccessKind::Store))
+      return false;
+    accesses.push_back(access);
+  }
   auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
   // Every access must identify the whole program, including all grid axes.
   bool programPrefix = space && !space.empty() &&
                        type.getShape().size() >= space.size();
-  bool hasAccess = false;
-  for (Operation *user : buffer.getUsers()) {
+  for (AccessOpInterface access : accesses) {
     if (!programPrefix)
       break;
-    ValueRange coordinates;
-    ArrayRef<int64_t> sourceAxes;
-    if (auto load = dyn_cast<LoadOp>(user)) {
-      coordinates = load.getCoordinates();
-      sourceAxes = load.getSourceAxes();
-    } else if (auto store = dyn_cast<StoreOp>(user)) {
-      coordinates = store.getCoordinates();
-      sourceAxes = store.getSourceAxes();
-    } else if (isa<DimOp, AssumeInBoundsOp>(user)) {
-      continue;
-    } else {
-      programPrefix = false;
-      break;
-    }
-    hasAccess = true;
+    ValueRange coordinates = access.getAccessCoordinates();
+    ArrayRef<int64_t> sourceAxes = access.getAccessSourceAxes();
     for (unsigned axis = 0; axis < space.size(); ++axis) {
       auto position = llvm::find(sourceAxes, axis);
       if (position == sourceAxes.end() ||
           !isPrivateWorkspaceProgramIndex(
-              coordinates[position - sourceAxes.begin()], buffer, user, axis)) {
+              coordinates[position - sourceAxes.begin()], buffer, access, axis)) {
         programPrefix = false;
         break;
       }
     }
   }
-  if (programPrefix && hasAccess)
+  if (programPrefix && !accesses.empty())
     return true;
   for (unsigned axis = 0; axis < type.getShape().size(); ++axis) {
     MakeRangeOp owner;
     bool consistent = true;
-    for (Operation *user : buffer.getUsers()) {
-      ValueRange coordinates;
-      ArrayRef<int64_t> sourceAxes;
-      if (auto load = dyn_cast<LoadOp>(user)) {
-        coordinates = load.getCoordinates();
-        sourceAxes = load.getSourceAxes();
-      } else if (auto store = dyn_cast<StoreOp>(user)) {
-        coordinates = store.getCoordinates();
-        sourceAxes = store.getSourceAxes();
-      } else if (isa<DimOp, AssumeInBoundsOp>(user)) {
-        continue;
-      } else {
-        consistent = false;
-        break;
-      }
+    for (AccessOpInterface access : accesses) {
+      ValueRange coordinates = access.getAccessCoordinates();
+      ArrayRef<int64_t> sourceAxes = access.getAccessSourceAxes();
       auto position = llvm::find(sourceAxes, axis);
       auto range = position == sourceAxes.end() ? MakeRangeOp() :
           stripRangeProjection(coordinates[position - sourceAxes.begin()])
