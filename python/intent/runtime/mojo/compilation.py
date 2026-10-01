@@ -36,6 +36,8 @@ _compilations: dict[tuple[object, ...], Future[NativeCompilation]] = {}
 _compilation_lock = Lock()
 _compilers = ThreadPoolExecutor(max_workers=2)
 _BUILD_OPTIONS = ("--emit", "shared-lib")
+_loaded_libraries: dict[tuple[object, ...], ctypes.CDLL] = {}
+_loading_lock = Lock()
 
 ELEMENT_TYPES = {
     "f16": "Float16", "bf16": "BFloat16", "f32": "Float32", "f64": "Float64",
@@ -228,15 +230,25 @@ def _unchanged(dependency) -> bool:
 
 
 def _load_library(path: Path, entry: str):
-    library = ctypes.CDLL(str(path))
-    try:
-        getattr(library, entry)
-        getattr(library, entry + "_benchmark")
-    except BaseException:
-        import _ctypes
-        _ctypes.dlclose(library._handle)
-        raise
-    return library
+    identity = file_identity(path)
+    # Dependency checks precede this lookup. Keep one process-lifetime handle
+    # per immutable artifact, not one dlopen reference per materialization.
+    with _loading_lock:
+        library = _loaded_libraries.get(identity)
+        owner = library is None
+        if owner:
+            library = ctypes.CDLL(str(path))
+        try:
+            getattr(library, entry)
+            getattr(library, entry + "_benchmark")
+        except BaseException:
+            if owner:
+                import _ctypes
+                _ctypes.dlclose(library._handle)
+            raise
+        if owner:
+            _loaded_libraries[identity] = library
+        return library
 
 
 def _compile_unit(source: str, metadata: dict[str, object], key: str, target,
