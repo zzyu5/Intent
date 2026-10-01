@@ -1,5 +1,5 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
-fused_softmax,8192x8192-fp16,0.175704,0.188096,0.934119,pass,Intent target=cutile; source corpus=triton.
+fused_softmax,8192x8192-fp16,0.174576,0.187584,0.930655,pass,Intent target=cutile; source corpus=triton.
 dense_gemm,M4096-N14336-K4096-fp16,2.086664,2.084944,1.000825,pass,Intent target=cutile; source corpus=triton.
 grouped_gemm,E8-M1024-K4096-N14336-fp16,4.610752,4.608792,1.000425,pass,Intent target=cutile; source corpus=triton.
 flash_attention_forward,B4-H32-S4096-D128-fp16-causal,2.815776,2.767648,1.017389,pass,Intent target=cutile; source corpus=triton. 同算法；CUDA graph 设备执行计时；source 额外写 f32 M 辅助结果。
@@ -23,8 +23,8 @@ fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.065216,0.124704,0.522966,p
 rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.239584,0.440768,0.543560,pass,Intent target=cutile; source corpus=triton.
 causal_conv1d,B4-C4096-S4096-W4-bf16-silu,0.186144,0.193704,0.960971,pass,Intent target=cutile; source corpus=triton.
 varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.057328,0.057856,0.990874,pass,Intent target=cutile; source corpus=triton.
-causal_conv1d_update,B32-D4096-W4-bf16,0.006128,0.006768,0.905437,pass,Intent target=cutile; source corpus=triton.
-modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,0.223016,0.405120,0.550494,pass,Intent target=cutile; source corpus=triton. source launch uses num_stages=1 and num_warps=4.
+causal_conv1d_update,B32-D4096-W4-bf16,0.005840,0.006128,0.953003,pass,Intent target=cutile; source corpus=triton.
+modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,0.224000,0.405200,0.552813,pass,Intent target=cutile; source corpus=triton. source launch uses num_stages=1 and num_warps=4.
 mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.008192,0.008192,1.000000,pass,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出
 flash_attention_backward,B2-H16-S2048-D128-fp16-causal,1.479264,0.776440,1.905188,pass,Intent target=cutile; source corpus=triton. source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。
 moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.252688,2.383000,0.945316,pass,Intent target=cutile; source corpus=triton.
