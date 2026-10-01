@@ -184,6 +184,10 @@ CPU 的 implementation registry 是明确的局部扩展点。GPU provider 通�
 
 CPU host ABI 的共同绑定在 [runtime/cpu.py](python/intent/runtime/cpu.py)。`CPUInterface` 在 artifact 初始化时解析参数角色、静态形状、维度身份和需要检查的别名关系，并为隐式分配输出与显式传入输出生成各自的绑定函数。参数位置、维度 owner/相等关系、输出形状与 ABI 排列固定在函数中；每次调用仍重新观察实参并校验 shape、stride、pointer、allocation 与 offset。受控 allocator 可以同时返回本次新分配的输出及其 `ViewFacts`，显式输出仍走完整观察。Mojo 的 Torch 对象规则和 Weft 的 Buffer/alignment 规则留在各自 `program.py`，各自的 tuning key 与计时范围也由适配层保持。Weft 的 `_ExecutionContract` 持有稳定硬件描述与 native 函数绑定，每次执行继续检查当前线程的 affinity、stack、RVV 状态和 VLEN。不要把一次实参观察或线程状态存入不可变 ABI schema，也不要在绑定函数中重建算法或 task 调度。
 
+Mojo 原生编译复用分成三个职责。公共 [compiler/cache.py](python/intent/compiler/cache.py) 只提供完整输入比较、命名空间、逐 entry 锁和独立 attempt 的原子发布；[runtime/mojo/toolchain.py](python/intent/runtime/mojo/toolchain.py) 查询官方安装及当前依赖身份；[runtime/mojo/compilation.py](python/intent/runtime/mojo/compilation.py) 组织候选、编译和加载。Mojo serializer 用 `native_dependencies` 声明自己发出的 SDK imports；新增 import 时应同步这份声明。Resolver 只对它能闭合的官方安装提供复用身份：实际 launcher/解释器、SDK、共享库、环境和配置，以及实际 loader 查询中的成功与缺失路径均参与检查。未知 wrapper、配置、导入或搜索路径只禁用直接二进制复用，并保存具体原因，仍使用同一 Mojo build 路线及 Mojo 自己的编译缓存；手写 source 不自动继承生成程序的依赖声明。
+
+一次 materialization 先编译一个 FP environment 对象供所有候选共享，用实际对象内容作为链接输入，因此 C 编译器继续负责头文件和代码生成依赖。每个 native entry 的身份包含真正编译的源码及 benchmark wrapper、ABI、选项和已证明的工具链身份；实际 linker depfile 与最终动态库的加载依赖在发布时记录、命中时复核。编译器产生的临时链接对象归本次 attempt 所有，不能作为外部稳定依赖。只有加载成功且 entry 与 benchmark 导出均存在才发布 ready；失败保留诊断，不发布，重试使用新路径。已发布 `.so` 不覆写，也不由 Python 对象析构删除。进程内 Future 只合并同时发生的请求，后续 materialization 重新核对磁盘依赖；winner 身份还包含实际加载的 native 产物，不沿用永久成功 Future 掩盖变更。
+
 Triton 的 [Passes.cpp](lib/Target/Triton/Transforms/Passes.cpp) 调度 grid、prepare-memory、native-forms 和 finalize；[Legalize.cpp](lib/Target/Triton/Transforms/Legalize.cpp) 通过私有 [Legalization.h](lib/Target/Triton/Transforms/Legalization.h) 组合完整阶段。cuTile 的 [Passes.cpp](lib/Target/CuTile/Transforms/Passes.cpp) 调度 prepare、native-program 和 finalize，私有入口在 [Legalize.h](lib/Target/CuTile/Transforms/Legalize.h)。按实际职责选择相邻模块，不把新增规则继续堆入 driver：
 
 | Provider | 模块 | 职责 |
@@ -230,7 +234,7 @@ INTENT_COMPILER=/path/to/intent-build/tools/intent-compile/intent-compile \
 
 作者位置沿 [SourceUnit.location](python/intent/frontend/source/unit.py)、[canonical KIR 打印](python/intent/frontend/mlir/builder.py) 和 [compiler IR 输出](tools/intent-compile/intent-compile.cpp) 保存在标准 MLIR location 中。缓存的 `input.mlir`、`kernel.mlir` 与 operation 诊断使用这条位置链；新增 rewrite 创建或克隆 operation 时保留相应 source location，不用旁表替代。编译日志位于同一 `cache_directory` 的 `compiler.log`。
 
-Mojo 的 [native compilation](python/intent/runtime/mojo/compilation.py) 失败会指出具体 candidate、native 阶段和保留目录，目录中包含实际 source、bindings、命令及编译器 stdout/stderr；成功的 native library 仍按原生命周期清理。Weft 的 [Canonical IR serializer](lib/Target/Weft/Serialization/Serializer.cpp) 同样保留标准 location，使下层编译诊断可以追到作者源码。
+Mojo 的 [native compilation](python/intent/runtime/mojo/compilation.py) 失败会指出具体 candidate、native 阶段和保留目录，目录中包含 bindings、命令、编译器 stdout/stderr 和阶段耗时，`request.json` 指向实际 source 与 FP object。`NativeLibrary.directory/cache_hit/cache_reason` 提供本次加载的产物及复用状态；既有 CPU runner 在准备阶段记录物化耗时和命中数量，二者不计为算子执行时间。Weft 的 [Canonical IR serializer](lib/Target/Weft/Serialization/Serializer.cpp) 同样保留标准 location，使下层编译诊断可以追到作者源码。
 
 ### 查看完整 transformation group 的 IR 与编译时间
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import time
 
 import intent
 import torch
@@ -35,10 +36,22 @@ def configure_cpu_budget(workers: int = 8) -> None:
     raise RuntimeError(f"CPU benchmark needs {workers} available physical cores on one NUMA node")
 
 
-def prepare_comparison(context, definition, arguments, runtime_path, tolerance, note=""):
+def _compile(context, definition, *, constexprs=None):
     report_stage("generated_compilation")
+    started = time.monotonic()
     artifact = intent.compile(definition, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config)
+                              tuning_config=context.tuning_config, constexprs=constexprs)
+    elapsed = time.monotonic() - started
+    libraries = artifact._namespace["native_program"].compilation.libraries
+    reasons = sorted({library.cache_reason for library in libraries if library.cache_reason})
+    print(f"mojo: generated_materialization_s={elapsed:.6f}; "
+          f"native_cache_hits={sum(library.cache_hit for library in libraries)}/{len(libraries)}; "
+          f"cache_unavailable={reasons}", flush=True)
+    return artifact
+
+
+def prepare_comparison(context, definition, arguments, runtime_path, tolerance, note=""):
+    artifact = _compile(context, definition)
     generated = artifact._namespace["native_program"].prepare(arguments)
     report_stage("source_compilation")
     runtime = load_module(context.project_root / runtime_path, "intent_mojo_" + definition.__name__)
@@ -58,9 +71,7 @@ def prepare_comparison(context, definition, arguments, runtime_path, tolerance, 
 
 
 def prepare_host_comparison(context, definition, arguments, reference, tolerance, *, constexprs=None, note=""):
-    report_stage("generated_compilation")
-    artifact = intent.compile(definition, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config, constexprs=constexprs)
+    artifact = _compile(context, definition, constexprs=constexprs)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
     def side(function, program=None):
@@ -86,9 +97,7 @@ def prepare_host_comparison(context, definition, arguments, reference, tolerance
 
 
 def prepare_host_run_only(context, definition, arguments, *, constexprs=None, note):
-    report_stage("generated_compilation")
-    artifact = intent.compile(definition, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config, constexprs=constexprs)
+    artifact = _compile(context, definition, constexprs=constexprs)
     state = {}
 
     def launch():

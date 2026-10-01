@@ -631,6 +631,7 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string
             "from max.algorithm import parallelize\n\n";
   Serializer serializer(output);
   llvm::json::Object interface;
+  interface["native_dependencies"] = llvm::json::Array{"std", "max"};
   interface["source_prelude_end"] = static_cast<int64_t>(output.tell());
   llvm::json::Array candidates;
   bool first = true;
