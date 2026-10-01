@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from ..scope import lowering_scope
+from ..products import map_product_type, product_components, project_product
+
 import ast
 from typing import cast
 
@@ -11,7 +14,6 @@ from intent.frontend.semantics import Effect
 from intent.frontend.semantics import EffectKind
 from intent.frontend.semantics import LogicalIndexType
 from intent.frontend.semantics import OperationKind
-from intent.frontend.semantics import RecordType
 from intent.frontend.semantics import RegionType
 from intent.frontend.semantics import ResourceKind
 from intent.frontend.semantics import ScalarType
@@ -148,16 +150,7 @@ def _destructure(lowerer: object, expression: Expression, node: ast.AST) -> tupl
     if isinstance(expression, ShapeValue):
         return tuple(expression.dimensions)
     if isinstance(expression, MlirValue) and isinstance(expression.type, TupleType):
-        return tuple(
-            lowerer.emit(
-                OperationKind.EXTRACT,
-                lowerer.location(node),
-                operands=(expression,),
-                result_types=(component_type,),
-                attributes={"field": index},
-            ).results[0]
-            for index, component_type in enumerate(expression.type.components)
-        )
+        return product_components(lowerer, expression, node)
     lowerer.error(node, "value is not destructurable")
 
 
@@ -165,7 +158,7 @@ def _store_subscript(lowerer: object, target_node: ast.Subscript, expression: Ex
     target = lowerer.materialize(lowerer.lower_expression(target_node.value), target_node.value)
     if not isinstance(target.type, (TensorType, BufferType)):
         lowerer.error(target_node, "subscript assignment target must be a view or logical buffer")
-    if isinstance(target.type, TensorType) and target not in lowerer.view_kinds:
+    if isinstance(target.type, TensorType) and target.view_kind is None:
         lowerer.error(target_node, "pure tensor SSA cannot be mutated")
     if isinstance(target.type, TensorType):
         lowerer.require_writable_view(target, target_node)
@@ -276,15 +269,9 @@ def normalize_helper_returns(lowerer: object, function: ast.FunctionDef) -> list
 
 
 def _control_value_type(value_type: object) -> object:
-    if isinstance(value_type, LogicalIndexType):
-        return ScalarType(intent_index)
-    if isinstance(value_type, TupleType):
-        return TupleType(tuple(_control_value_type(item) for item in value_type.components))
-    if isinstance(value_type, RecordType):
-        return RecordType(tuple(
-            (name, _control_value_type(item)) for name, item in value_type.fields
-        ))
-    return value_type
+    return map_product_type(
+        value_type, lambda leaf: ScalarType(intent_index) if isinstance(leaf, LogicalIndexType) else leaf,
+    )
 
 
 def _control_value(
@@ -314,25 +301,10 @@ def _control_value(
                 operands=(expression,), result_types=(result_type,),
             ).results[0]
         elif result_type != expression.type:
-            components = (
-                expression.type.components
-                if isinstance(expression.type, TupleType)
-                else tuple(item for _, item in expression.type.fields)
+            expression = project_product(
+                lowerer, expression, result_type, node,
+                lambda component, target: _control_value(lowerer, component, node),
             )
-            values = []
-            for index, component_type in enumerate(components):
-                component = lowerer.emit(
-                    OperationKind.EXTRACT, lowerer.location(node),
-                    operands=(expression,), result_types=(component_type,),
-                    attributes={"field": index},
-                ).results[0]
-                values.append(_control_value(lowerer, component, node))
-            expression = lowerer.emit(
-                OperationKind.MAKE_TUPLE if isinstance(result_type, TupleType)
-                else OperationKind.MAKE_RECORD,
-                lowerer.location(node), operands=tuple(values),
-                result_types=(result_type,),
-            ).results[0]
     return lowerer.materialize(expression, node, expected_type)
 
 
@@ -348,12 +320,11 @@ def _lower_if(lowerer: object, node: ast.If) -> None:
         ScalarType(intent_bool),
     )
     snapshot = dict(lowerer.environment)
-    loop_snapshot = _copy_loop_stack(lowerer.loop_stack)
-    then_region, then_environment, then_terminated, then_loops = _lower_branch(
-        lowerer, node.body, snapshot, loop_snapshot, node
+    then_region, then_environment, then_terminated = _lower_branch(
+        lowerer, node.body, snapshot, node
     )
-    else_region, else_environment, else_terminated, else_loops = _lower_branch(
-        lowerer, node.orelse, snapshot, loop_snapshot, node
+    else_region, else_environment, else_terminated = _lower_branch(
+        lowerer, node.orelse, snapshot, node
     )
     assigned = _assigned_names(node.body) | _assigned_names(node.orelse)
     normal_environments = [
@@ -366,14 +337,6 @@ def _lower_if(lowerer: object, node: ast.If) -> None:
     ]
     if not normal_environments:
         lowerer.error(node, "runtime if with both branches terminating is not representable")
-    normal_loop_stacks = [
-        loops
-        for loops, terminated in (
-            (then_loops, then_terminated),
-            (else_loops, else_terminated),
-        )
-        if not terminated
-    ]
     merge_names: list[str] = []
     merged_static: dict[str, Expression] = {}
     merge_types: dict[str, object] = {}
@@ -428,18 +391,16 @@ def _lower_if(lowerer: object, node: ast.If) -> None:
         if terminated:
             branch_yields.append(None)
             continue
-        saved_block = lowerer.current_block
-        lowerer.current_block = region.blocks[0]
-        values: list[MlirValue] = []
-        for name in merge_names:
-            expression = environment[name]
-            expected = merge_types.get(name)
-            value_result = _control_value(lowerer, expression, node, expected)
-            if expected is not None:
-                value_result = lowerer.project_value_schema(value_result, expected, node)
-            values.append(value_result)
-        lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=tuple(values))
-        lowerer.current_block = saved_block
+        with lowering_scope(lowerer, current_block=region.blocks[0]):
+            values: list[MlirValue] = []
+            for name in merge_names:
+                expression = environment[name]
+                expected = merge_types.get(name)
+                value_result = _control_value(lowerer, expression, node, expected)
+                if expected is not None:
+                    value_result = lowerer.project_value_schema(value_result, expected, node)
+                values.append(value_result)
+            lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=tuple(values))
         branch_yields.append(tuple(values))
 
     result_types: tuple[object, ...] = ()
@@ -472,24 +433,17 @@ def _lower_branch(
     lowerer: object,
     statements: list[ast.stmt],
     environment: dict[str, Expression],
-    loop_stack: list[LoopContext],
     node: ast.AST,
-) -> tuple[object, dict[str, Expression], bool, list[LoopContext]]:
+) -> tuple[object, dict[str, Expression], bool]:
     region = lowerer.make_region(lowerer.location(node))
-    saved_block = lowerer.current_block
-    saved_environment = lowerer.environment
-    saved_loop_stack = lowerer.loop_stack
-    lowerer.current_block = region.blocks[0]
-    lowerer.environment = dict(environment)
-    lowerer.loop_stack = _copy_loop_stack(loop_stack)
-    lowerer.lower_statements(statements)
-    result_environment = dict(lowerer.environment)
-    result_loop_stack = _copy_loop_stack(lowerer.loop_stack)
-    terminated = lowerer.is_terminated(lowerer.current_block)
-    lowerer.current_block = saved_block
-    lowerer.environment = saved_environment
-    lowerer.loop_stack = saved_loop_stack
-    return region, result_environment, terminated, result_loop_stack
+    with lowering_scope(
+        lowerer, current_block=region.blocks[0],
+        environment=dict(environment), loop_stack=list(lowerer.loop_stack),
+    ):
+        lowerer.lower_statements(statements)
+        result_environment = dict(lowerer.environment)
+        terminated = lowerer.is_terminated(lowerer.current_block)
+    return region, result_environment, terminated
 
 
 def _lower_for(lowerer: object, node: ast.For) -> None:
@@ -555,26 +509,24 @@ def _lower_for(lowerer: object, node: ast.For) -> None:
     block = region.blocks[0]
     iteration_arguments = tuple(block.arguments[: len(iteration_types)])
     state_arguments = tuple(block.arguments[len(iteration_types) :])
-    saved_block = lowerer.current_block
-    lowerer.current_block = block
-    lowerer.environment = dict(snapshot)
-    _assign_iteration_target(lowerer, node.target, iteration_arguments)
-    for name, value in zip(carried_names, state_arguments):
-        lowerer.environment[name] = value
-    lowerer.loop_stack.append(LoopContext(opcode, carried_names))
-    lowerer.lower_statements(body)
-    if not lowerer.is_terminated(block):
-        yielded = tuple(
-            lowerer.project_value_schema(
-                _control_value(lowerer, lowerer.environment[name], node, initial.type),
-                initial.type,
-                node,
+    with lowering_scope(
+        lowerer, current_block=block, environment=dict(snapshot),
+        loop_stack=[*lowerer.loop_stack, LoopContext(opcode, carried_names)],
+    ):
+        _assign_iteration_target(lowerer, node.target, iteration_arguments)
+        for name, value in zip(carried_names, state_arguments):
+            lowerer.environment[name] = value
+        lowerer.lower_statements(body)
+        if not lowerer.is_terminated(block):
+            yielded = tuple(
+                lowerer.project_value_schema(
+                    _control_value(lowerer, lowerer.environment[name], node, initial.type),
+                    initial.type,
+                    node,
+                )
+                for name, initial in zip(carried_names, initial_values)
             )
-            for name, initial in zip(carried_names, initial_values)
-        )
-        lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=yielded)
-    lowerer.loop_stack.pop()
-    lowerer.current_block = saved_block
+            lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=yielded)
     lowerer.environment = snapshot
     operation = lowerer.emit(
         opcode,
@@ -644,39 +596,35 @@ def _lower_while(lowerer: object, node: ast.While) -> None:
     state_types = tuple(value.type for value in initial_values)
     before = lowerer.make_region(lowerer.location(node), state_types)
     after = lowerer.make_region(lowerer.location(node), state_types)
-    saved_block = lowerer.current_block
-
-    lowerer.current_block = before.blocks[0]
-    lowerer.environment = dict(snapshot)
-    for name, value in zip(carried_names, before.blocks[0].arguments):
-        lowerer.environment[name] = value
-    condition_expression = lowerer.lower_expression(condition_node)
-    condition = lowerer.materialize(condition_expression, node.test, ScalarType(intent_bool))
-    lowerer.emit(
-        OperationKind.CONDITION,
-        lowerer.location(node.test),
-        operands=(condition, *before.blocks[0].arguments),
-    )
-
-    lowerer.current_block = after.blocks[0]
-    lowerer.environment = dict(snapshot)
-    for name, value in zip(carried_names, after.blocks[0].arguments):
-        lowerer.environment[name] = value
-    lowerer.loop_stack.append(LoopContext(OperationKind.WHILE, carried_names))
-    lowerer.lower_statements(body)
-    if not lowerer.is_terminated(after.blocks[0]):
-        yielded = tuple(
-            lowerer.project_value_schema(
-                _control_value(lowerer, lowerer.environment[name], node, initial.type),
-                initial.type,
-                node,
-            )
-            for name, initial in zip(carried_names, initial_values)
+    with lowering_scope(lowerer, current_block=before.blocks[0], environment=dict(snapshot)):
+        for name, value in zip(carried_names, before.blocks[0].arguments):
+            lowerer.environment[name] = value
+        condition_expression = lowerer.lower_expression(condition_node)
+        condition = lowerer.materialize(condition_expression, node.test, ScalarType(intent_bool))
+        lowerer.emit(
+            OperationKind.CONDITION,
+            lowerer.location(node.test),
+            operands=(condition, *before.blocks[0].arguments),
         )
-        lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=yielded)
-    lowerer.loop_stack.pop()
 
-    lowerer.current_block = saved_block
+    with lowering_scope(
+        lowerer, current_block=after.blocks[0], environment=dict(snapshot),
+        loop_stack=[*lowerer.loop_stack, LoopContext(OperationKind.WHILE, carried_names)],
+    ):
+        for name, value in zip(carried_names, after.blocks[0].arguments):
+            lowerer.environment[name] = value
+        lowerer.lower_statements(body)
+        if not lowerer.is_terminated(after.blocks[0]):
+            yielded = tuple(
+                lowerer.project_value_schema(
+                    _control_value(lowerer, lowerer.environment[name], node, initial.type),
+                    initial.type,
+                    node,
+                )
+                for name, initial in zip(carried_names, initial_values)
+            )
+            lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=yielded)
+
     lowerer.environment = snapshot
     operation = lowerer.emit(
         OperationKind.WHILE,
@@ -878,16 +826,6 @@ def _normalize_guarded_block(
             normalized.append(guarded)
         break
     return normalized
-
-
-def _copy_loop_stack(stack: list[LoopContext]) -> list[LoopContext]:
-    return [
-        LoopContext(
-            context.opcode,
-            context.carried_names,
-        )
-        for context in stack
-    ]
 
 
 def _same_expression(lhs: Expression, rhs: Expression) -> bool:

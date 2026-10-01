@@ -13,7 +13,8 @@ import sys
 from .buffer import Buffer
 from .compilation import validate_artifact
 from .target import TargetProfile, matrix_capability
-from ..cpu import CPUInterface, ViewFacts, ViewParameter
+from ..cpu import check_alias
+from ..native import NativeInterface, NativePreparedRuntime, ViewFacts, ViewParameter
 
 
 def _isa_extensions(isa: str) -> set[str]:
@@ -154,7 +155,7 @@ class NativeCall:
         return self.outputs[0] if len(self.outputs) == 1 else self.outputs
 
 
-class NativeProgram:
+class NativeProgram(NativePreparedRuntime):
     def __init__(self, directory: Path) -> None:
         self.directory = Path(directory)
         manifest_text = (self.directory / "artifact.json").read_text()
@@ -163,13 +164,15 @@ class NativeProgram:
         self.profile = TargetProfile(**manifest["profile"])
         self.metadata = manifest["program"]
         self.parameters = self.metadata["parameters"]
-        self.interface = CPUInterface.read(self.parameters)
+        self.interface = NativeInterface.read(self.parameters)
         self._alignments = tuple(self.parameters[parameter.position]["alignment"]
                                  if isinstance(parameter, ViewParameter) else None
                                  for parameter in self.interface.parameters)
         self._binders = self.interface.binders(
             observe_view=type(self)._view, allocate_output=type(self)._allocate_output,
-            scalar_key_values=True, view_dtype_before_offset=True,
+            check_alias=check_alias,
+            view_key=lambda facts, group: (facts.shape, facts.strides, facts.dtype, facts.offset, group),
+            scalar_key=lambda parameter, value: (parameter.dtype, value),
         )
         self.candidates = self.metadata["candidates"]
         kernels = {kernel["symbol"]: kernel for kernel in manifest["weft"]["kernels"]}
@@ -185,12 +188,7 @@ class NativeProgram:
         self._execution.bind_library(self.library)
         self.check_execution()
         self.identity = (manifest_text, (self.directory / "kernel.so").stat().st_mtime_ns)
-        types = []
-        for parameter in self.parameters:
-            if parameter["kind"] == "view":
-                types.extend([ctypes.c_void_p, *([ctypes.c_int64] * (2 * len(parameter["shape"])))])
-            else:
-                types.append(ctypes.c_float if parameter["dtype"] == "f32" else ctypes.c_int64)
+        types = self.interface.argument_types(lambda dtype: ctypes.c_float if dtype == "f32" else ctypes.c_int64)
         self.functions, self.measurements = [], []
         for candidate in self.candidates:
             function = getattr(self.library, candidate["entry"] + "_invoke")

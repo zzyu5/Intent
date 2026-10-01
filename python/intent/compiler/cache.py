@@ -120,13 +120,15 @@ def locked_cache_entry(namespace: str, fullkey: str):
 def _compilation_key(executable: Path, module_text: str,
                      options: tuple[str, ...]) -> str:
     resolved, identity = file_identity(executable)
-    profiles = executable.parent / "profiles"
-    dependencies = [(str(path), path.read_text(encoding="utf-8"))
-                    for path in sorted(profiles.glob("*.json"))]
-    for option in options:
-        if option.startswith("--tuning-config="):
-            path = Path(option.split("=", 1)[1]).resolve()
-            dependencies.append((str(path), path.read_text(encoding="utf-8")))
+    dependencies = []
+    if "--stop-after-kir" not in options:
+        profiles = executable.parent / "profiles"
+        dependencies.extend((str(path), path.read_text(encoding="utf-8"))
+                            for path in sorted(profiles.glob("*.json")))
+        for option in options:
+            if option.startswith("--tuning-config="):
+                path = Path(option.split("=", 1)[1]).resolve()
+                dependencies.append((str(path), path.read_text(encoding="utf-8")))
     # Compare the complete compile inputs. File identity invalidates entries
     # when the compiler is rebuilt or replaced, without checksumming artifacts.
     return json.dumps((resolved, identity,

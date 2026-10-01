@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from ..shapes import iteration_bounds
+from ..products import extract_product
+
 import ast
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -89,13 +92,7 @@ def lower_subscript(
             index += len(source.type.components)
         if not 0 <= index < len(source.type.components):
             lowerer.error(node, "tuple index is outside value length")
-        return lowerer.emit(
-            OperationKind.EXTRACT,
-            lowerer.location(node),
-            operands=(source,),
-            result_types=(source.type.components[index],),
-            attributes={"field": index},
-        ).results[0]
+        return extract_product(lowerer, source, index, node)
     if isinstance(source.type, (DomainType, RegionType)):
         return _subscript_region(lowerer, source, node)
     if not isinstance(source.type, (TensorType, BufferType)):
@@ -112,7 +109,7 @@ def lower_subscript(
             effects=(Effect(EffectKind.READ, ResourceKind.LOGICAL_BUFFER, source),),
         )
         return operation.results[0]
-    if source in lowerer.view_kinds:
+    if source.view_kind is not None:
         lowerer.require_readable_view(source, node)
         operation = lowerer.emit(
             OperationKind.VIEW_LOAD,
@@ -360,8 +357,7 @@ def _subscript_region(
         if isinstance(source.type, DomainType)
         else source.type.source_id
     )
-    known_bounds = lowerer.iteration_bounds.get(source)
-    result_bounds = known_bounds
+    known_bounds = iteration_bounds(source)
     if not has_start and not has_stop:
         extent_shape = lowerer.dynamic_shape_for_region(source)
     else:
@@ -374,7 +370,6 @@ def _subscript_region(
             stop, start = lowerer.coerce_pair(
                 stop_expression, start_expression, node
             )
-            result_bounds = (start, stop)
             if (
                 isinstance(start.type, (ScalarType, LogicalIndexType))
                 and isinstance(stop.type, (ScalarType, LogicalIndexType))
@@ -408,9 +403,6 @@ def _subscript_region(
         },
     )
     result = operation.results[0]
-    lowerer.iteration_shapes[result] = extent_shape
-    if result_bounds is not None:
-        lowerer.iteration_bounds[result] = result_bounds
     return result
 
 
@@ -464,7 +456,6 @@ def _subscript_ragged(
             ),
         },
     ).results[0]
-    lowerer.iteration_shapes[region] = extent_shape
     if ragged.mapping is not None:
         lowerer.ragged_mappings[region] = ragged.mapping
     return region

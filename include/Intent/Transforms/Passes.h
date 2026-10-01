@@ -8,8 +8,11 @@
 
 namespace intent {
 
+mlir::LogicalResult verifyKernelStructure(mlir::ModuleOp module);
 mlir::LogicalResult verifyKernelModule(mlir::ModuleOp module);
 std::unique_ptr<mlir::Pass> createVerifyKernelIRPass();
+std::unique_ptr<mlir::Pass> createNormalizeKernelIRPass();
+mlir::LogicalResult normalizeKernelModule(mlir::ModuleOp module);
 void registerIntentPasses();
 
 } // namespace intent

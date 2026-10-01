@@ -7,12 +7,8 @@ from ..diagnostics.locations import Location
 from ..semantics.effects import Effect
 from ..semantics.operations import OperationKind
 from ..semantics.operations import REGION_OPS
-from ..semantics.operations import ShapeRelation
 from ..semantics.operations import TERMINATORS
 from ..semantics.types import ValueType
-from .attributes import emit_dictionary
-from .attributes import ParameterAttribute
-from .attributes import FunctionKindAttribute
 from .state import BlockState
 from .state import EmittedOperation
 from .state import FunctionKind
@@ -22,30 +18,27 @@ from .state import ParameterKind
 from .state import ParameterSpec
 from .state import ParameterState
 from .state import RegionState
-from .types import emit_type
-from .types import emit_view_type
-from .types import quote
+from .serialization import AssemblyPrinter
 
 
 class MlirBuilder:
+    """Construct typed operations; spelling and native normalization are separate."""
     def __init__(self, module_name: str, location: Location) -> None:
         self.module_name = module_name
         self.location = location
         self.functions: list[FunctionState] = []
-        self._values: list[MlirValue] = []
         self._next_value_id = 0
         self._next_operation_id = 0
         self._dimension_ids: dict[object, int] = {}
-        self._next_dimension_id = 1
-        self._shape_relations: dict[int, ShapeRelation] = {}
+        self._dimensions: list[object] = []
 
     def _value(
         self,
         value_type: ValueType,
         location: Location,
         *,
+        owner: BlockState | EmittedOperation,
         name_hint: str | None = None,
-        view_access: str | None = None,
     ) -> MlirValue:
         from ..semantics.types import BufferType
         from ..semantics.types import DomainType
@@ -60,11 +53,10 @@ class MlirBuilder:
             id=value_id,
             type=value_type,
             location=location,
+            owner=owner,
             name_hint=name_hint,
-            view_access=view_access,
         )
         self._next_value_id += 1
-        self._values.append(value)
         return value
 
     def region(
@@ -72,6 +64,8 @@ class MlirBuilder:
         location: Location,
         argument_types: Iterable[ValueType] = (),
         argument_names: Iterable[str | None] = (),
+        *,
+        parent_block: BlockState | None = None,
     ) -> RegionState:
         types = tuple(argument_types)
         names = tuple(argument_names)
@@ -79,11 +73,11 @@ class MlirBuilder:
             raise ValueError("region argument names and types must have equal length")
         if not names:
             names = (None,) * len(types)
-        region = RegionState(location)
+        region = RegionState(location, _parent_block=parent_block)
         block = BlockState(location, owner=region)
         region.blocks.append(block)
         block.arguments.extend(
-            self._value(value_type, location, name_hint=name)
+            self._value(value_type, location, owner=block, name_hint=name)
             for value_type, name in zip(types, names)
         )
         return region
@@ -109,7 +103,7 @@ class MlirBuilder:
         values = body.blocks[0].arguments
         for spec, value in zip(parameter_specs, values):
             if spec.kind is ParameterKind.VIEW:
-                value.view_access = spec.view_kind.name.lower()
+                value.view_kind = spec.view_kind
                 value.view_constraints = spec.constraints
         function = FunctionState(
             name=name,
@@ -183,210 +177,35 @@ class MlirBuilder:
 
         operation_id = self._next_operation_id
         self._next_operation_id += 1
-        results = tuple(
-            self._value(value_type, location, name_hint=name)
+        operation = EmittedOperation(
+            operation_id, operation_kind, location, block, operands, (),
+            dict(attributes or {}), regions, effects,
+        )
+        operation.results = tuple(
+            self._value(value_type, location, owner=operation, name_hint=name)
             for value_type, name in zip(result_types, names)
         )
-        result_types = tuple(value.type for value in results)
-        operation_attributes = dict(attributes or {})
-        if "shape" in operation_attributes:
-            self._shape_relations[operation_id] = operation_attributes["shape"]
-        operation_attributes["intent.node"] = operation_id
-        operation_attributes["intent.result_nodes"] = [value.id for value in results]
-        operation_attributes["intent.result_names"] = [
-            self._name_marker(value) for value in results
-        ]
-        if regions:
-            operation_attributes["intent.region_argument_nodes"] = [
-                [[value.id for value in nested.arguments] for nested in region.blocks]
-                for region in regions
-            ]
-            operation_attributes["intent.region_argument_names"] = [
-                [
-                    [self._name_marker(value) for value in nested.arguments]
-                    for nested in region.blocks
-                ]
-                for region in regions
-            ]
-        text = self._operation_text(
-            operation_kind,
-            location,
-            operands,
-            results,
-            result_types,
-            operation_attributes,
-            regions,
-        )
-        nested_effects = tuple(effect for region in regions for effect in region.effects)
-        block.lines.append(text)
-        block.effects.extend(effects)
-        block.effects.extend(nested_effects)
-        block.effect_markers.append(bool(effects or nested_effects))
-        block.last_operation = operation_kind
         for region in regions:
-            region.owner_operation = operation_id
-        return EmittedOperation(operation_id, results)
+            region.attach(operation)
+        block.operations.append(operation)
+        return operation
 
     def emit_module(self) -> str:
-        attributes = emit_dictionary({"intent.source_module": self.module_name})
-        lines = [f"module attributes {attributes} {{"]
-        for function in self.functions:
-            lines.extend(self._function_lines(function, 1))
-        lines.append("}")
-        assembly = "\n".join(lines) + "\n"
-        for value in self._values:
-            assembly = assembly.replace(
-                quote(self._name_marker(value)),
-                quote(value.name_hint or f"v{value.id}"),
-            )
-        return assembly
+        return AssemblyPrinter(self.dimension_id).module(self.module_name, self.functions)
 
-    def _function_lines(self, function: FunctionState, indent: int) -> list[str]:
-        prefix = "  " * indent
-        arguments = ", ".join(
-            f"{self._value_name(parameter.value)}: {self._value_type(parameter.value)}"
-            for parameter in function.parameters
-        )
-        attributes = {
-            "intent.kind": FunctionKindAttribute(
-                0 if function.kind is FunctionKind.KERNEL else 1
-            ),
-            "intent.parameters": [
-                ParameterAttribute(
-                    parameter.spec.name,
-                    list(ParameterKind).index(parameter.spec.kind),
-                )
-                for parameter in function.parameters
-            ],
-            "intent.parameter_nodes": [parameter.value.id for parameter in function.parameters],
-            "intent.source": function.location.format(),
-        }
-        attributes.update({f"intent.{key}": value for key, value in function.attributes.items()})
-        result_types = self._function_result_types(function.result_types)
-        lines = [
-            f"{prefix}func.func @{function.name}({arguments}){result_types} "
-            f"attributes {emit_dictionary(attributes)} {{"
-        ]
-        if len(function.body.blocks) != 1:
-            raise NotImplementedError("Intent functions require one entry block")
-        for operation in function.body.blocks[0].lines:
-            lines.extend(self._indent_text(operation, indent + 1))
-        lines.append(f"{prefix}}}")
-        return lines
-
-    def _operation_text(
-        self,
-        operation_kind: OperationKind,
-        location: Location,
-        operands: tuple[MlirValue, ...],
-        results: tuple[MlirValue, ...],
-        result_types: tuple[ValueType, ...],
-        attributes: dict[str, object],
-        regions: tuple[RegionState, ...],
-    ) -> str:
-        result_prefix = ""
-        if results:
-            result_prefix = ", ".join(self._value_name(value) for value in results) + " = "
-        operand_names = ", ".join(self._value_name(value) for value in operands)
-        lines = [f'{result_prefix}"intent.{operation_kind.value}"({operand_names})']
-        if regions:
-            lines[0] += " ("
-            for index, region in enumerate(regions):
-                if index:
-                    lines[-1] += ","
-                lines.extend(self._region_lines(region, 1))
-            lines.append(")")
-        if attributes:
-            lines[-1] += " " + emit_dictionary(attributes)
-        operand_types = ", ".join(self._value_type(value) for value in operands)
-        lines[-1] += (
-            f" : ({operand_types}) -> {self._result_types(result_types)} "
-            f"{self._location(location)}"
-        )
-        return "\n".join(lines)
-
-    def _region_lines(self, region: RegionState, indent: int) -> list[str]:
-        prefix = "  " * indent
-        lines = [f"{prefix}{{"]
-        for block_index, block in enumerate(region.blocks):
-            arguments = ", ".join(
-                f"{self._value_name(value)}: {self._value_type(value)}"
-                for value in block.arguments
-            )
-            signature = f"({arguments})" if arguments else ""
-            lines.append(f"{prefix}  ^bb{block_index}{signature}:")
-            for operation in block.lines:
-                lines.extend(self._indent_text(operation, indent + 2))
-        lines.append(f"{prefix}}}")
-        return lines
-
-    def _value_type(self, value: MlirValue) -> str:
-        if value.view_access is not None:
-            return emit_view_type(
-                value.type,
-                value.view_access,
-                value.view_constraints,
-                self._dimension_id,
-            )
-        return emit_type(value.type, self._dimension_id)
-
-    def _value_name(self, value: MlirValue) -> str:
-        return f"%v{value.id}"
-
-    def _name_marker(self, value: MlirValue) -> str:
-        return f"__intent_value_name_{value.id}__"
-
-    def _result_types(self, result_types: tuple[ValueType, ...]) -> str:
-        if not result_types:
-            return "()"
-        if len(result_types) == 1:
-            return emit_type(result_types[0], self._dimension_id)
-        return "(" + ", ".join(
-            emit_type(value, self._dimension_id) for value in result_types
-        ) + ")"
-
-    def _function_result_types(self, result_types: tuple[ValueType, ...]) -> str:
-        if not result_types:
-            return ""
-        if len(result_types) == 1:
-            return " -> " + emit_type(result_types[0], self._dimension_id)
-        return " -> (" + ", ".join(
-            emit_type(value, self._dimension_id) for value in result_types
-        ) + ")"
-
-    def _dimension_id(self, dimension: object) -> int:
+    def dimension_id(self, dimension: object) -> int:
         from ..semantics.types import StaticDim
 
         key = (StaticDim, id(dimension)) if isinstance(dimension, StaticDim) else dimension
         existing = self._dimension_ids.get(key)
         if existing is not None:
             return existing
-        identity = self._next_dimension_id
-        self._next_dimension_id += 1
+        identity = len(self._dimensions) + 1
+        self._dimensions.append(dimension)
         self._dimension_ids[key] = identity
         return identity
 
-    def dimension_id(self, dimension: object) -> int:
-        return self._dimension_id(dimension)
-
-    def _location(self, location: Location) -> str:
-        span = location.primary
-        return f"loc({quote(span.filename)}:{span.start_line}:{span.start_column + 1})"
-
-    def _indent_text(self, text: str, indent: int) -> list[str]:
-        prefix = "  " * indent
-        return [prefix + line for line in text.splitlines()]
-
-
-def canonicalize_mlir(assembly: str, builder: MlirBuilder) -> str:
-    from mlir.dialects import func as _func
-    from mlir.ir import Context
-    from mlir.ir import Module
-    from .canonicalization import canonicalize_regions
-
-    del _func
-    with Context() as context:
-        context.allow_unregistered_dialects = True
-        module = Module.parse(assembly)
-        canonicalize_regions(module, builder)
-        return module.operation.get_asm(enable_debug_info=True) + "\n"
+    def dimension(self, identity: int) -> object:
+        if identity < 1 or identity > len(self._dimensions):
+            raise ValueError(f"unknown logical dimension identity {identity}")
+        return self._dimensions[identity - 1]

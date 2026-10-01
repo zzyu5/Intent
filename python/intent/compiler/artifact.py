@@ -10,6 +10,15 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True, slots=True)
+class CompiledIR:
+    """Verified KIR or shared physical IR, without provider source or a runtime."""
+
+    stage: str
+    ir: str
+    cache_directory: Path
+
+
+@dataclass(frozen=True, slots=True)
 class GeneratedProgram:
     """Provider source, compiler IR and interface; no native callable or runtime."""
 

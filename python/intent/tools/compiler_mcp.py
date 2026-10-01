@@ -22,11 +22,16 @@ def main() -> None:
     ))
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True))
-    async def compile(program_path: str, kernel: str, target: str,
+    async def compile(program_path: str, kernel: str, target: str | None = None,
                       target_options: dict | None = None, constexprs: dict | None = None,
                       compiler: str | None = None, tuning_config: str | None = None,
-                      materialize: bool = False) -> dict:
-        """Compile an existing .py file and report stages/artifacts. Its top-level host code executes normally."""
+                      materialize: bool = False, stage: str = "provider") -> dict:
+        """Compile an existing .py file and report stages/artifacts.
+
+        stage='kir' needs no target, provider SDK or device. 'shared' and
+        'provider' need a target; only 'provider' permits materialize=True.
+        The file's ordinary top-level Python host code executes normally.
+        """
         path = Path(program_path).expanduser().resolve(strict=True)
         if not path.is_file() or path.suffix != ".py":
             raise ValueError("program_path must name an existing Python file supplied by the user")
@@ -34,7 +39,7 @@ def main() -> None:
         # owns sys.path/stdout, so concurrent compilation requests must not overlap.
         return compile_request(str(path), kernel, target, target_options=target_options,
                                constexprs=constexprs, compiler=compiler,
-                               tuning_config=tuning_config, materialize=materialize)
+                               tuning_config=tuning_config, materialize=materialize, stage=stage)
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
     async def environment(target: str, target_options: dict | None = None,

@@ -91,10 +91,9 @@ def _domain(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         extent = expressions[1].dimension
     elif start_known and start_value == 0 and isinstance(expressions[1], MlirValue):
         stop = operands[1]
-        extent = lowerer.zero_based_domain_extents.get(stop)
-        if extent is None:
-            extent = lowerer.fresh_dynamic_dimension("domain_extent")
-            lowerer.zero_based_domain_extents[stop] = extent
+        extent = lowerer.integer_shape_dimension(
+            stop, lowerer.fresh_dynamic_dimension("domain_extent")
+        )
     else:
         extent = lowerer.fresh_dynamic_dimension("domain_extent")
         if all(lowerer.dtype_and_shape(value.type, node)[0] == intent_index
@@ -121,8 +120,6 @@ def _domain(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         },
     )
     result = operation.results[0]
-    lowerer.iteration_shapes[result] = (extent,)
-    lowerer.iteration_bounds[result] = operands[:2]
     return result
 
 
@@ -163,7 +160,6 @@ def _iteration_source(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
             },
         )
         result = operation.results[0]
-        lowerer.iteration_shapes[result] = extent_shape
         return result
     source = lowerer.materialize(expression, bound["source"])
     if not isinstance(source.type, (DomainType, RegionType)):
@@ -222,7 +218,7 @@ def _assume_in_bounds(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
     )
     if not scalar_index and not tensor_index:
         lowerer.error(bound["index"], "assumed index must be an integer scalar or tensor")
-    if view in lowerer.view_kinds and isinstance(view.type, TensorType):
+    if view.view_kind is not None and isinstance(view.type, TensorType):
         shape = view.type.shape
     elif isinstance(view.type, BufferType):
         shape = view.type.shape

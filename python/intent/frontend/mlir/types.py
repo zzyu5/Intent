@@ -4,6 +4,7 @@ from collections.abc import Callable
 
 from intent.language import DType
 from intent.language.annotations import ViewConstraints
+from intent.language.annotations import ViewKind
 
 from ..semantics.types import BufferType
 from ..semantics.types import ConstexprType
@@ -118,13 +119,13 @@ def emit_dtype(dtype: DType) -> str:
 
 def emit_view_type(
     value_type: TensorType,
-    access: str,
+    kind: ViewKind,
     constraints: ViewConstraints | None,
     dimension_id: DimensionID,
 ) -> str:
     if constraints is None:
         raise ValueError("view type emission requires canonical constraints")
-    access_code = {"in": 0, "out": 1, "inout": 2}[access]
+    access_code = int(kind)
     stride_values = constraints.strides or ()
     stride_text = "[" + ", ".join(
         "unit"

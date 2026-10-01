@@ -1,32 +1,31 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from intent.api import HelperDefinition
-from intent.frontend.mlir import MlirValue
+from intent.frontend.mlir import MlirValue, RegionState
 from intent.frontend.mlir.attributes import SparseFormatAttribute
 from intent.frontend.semantics import BinaryOperator
 from intent.frontend.semantics import ComparePredicate
 from intent.frontend.semantics import OperationKind
-from intent.frontend.semantics import RecordType
 from intent.frontend.semantics import ScaledFormatKind
 from intent.frontend.semantics import ScalarType
 from intent.frontend.semantics import StaticDim
 from intent.frontend.semantics import TensorType
-from intent.frontend.semantics import TupleType
 from intent.frontend.semantics import ValueType
 from intent.frontend.semantics.types import dims_compatible
 from intent.language import DTypeCategory
 from intent.language import bool as intent_bool
 from intent.language import i32
-from intent.language import i64
 from intent.language import index as intent_index
 from intent.language import u32
 from intent.language.builtins import Intrinsic
 from intent.language.builtins import ScaledFormat
 
+from ..regions import pure_region
+from ..products import ProductSchema, build_product, map_product_type, product_components, project_product
 from ..ast.expressions import compile_time_value
 from ..ast.model import ConstexprBinding
 from ..ast.model import Expression
@@ -87,133 +86,101 @@ def lower_structured_intrinsic(
     return NotImplemented
 
 
-def _reduce(lowerer: FunctionLowerer, name: str, node: ast.Call) -> MlirValue:
-    bound = (
-        bind_call(
-            lowerer,
-            node,
-            ("value", "axis", "identity", "combine", "combine_operands", "acc_dtype"),
-            required=("value", "axis", "identity", "combine"),
-        )
-        if name == "reduce"
-        else bind_declared_call(lowerer, node, name)
-    )
-    source = lowerer.read_value(
-        lowerer.lower_expression(bound["value"]), bound["value"]
-    )
-    axes = require_axes(lowerer, bound["axis"])
-    source_components, component_names = _source_components(lowerer, source, node)
-    if not source_components or any(
-        not isinstance(value.type, TensorType) for value in source_components
-    ):
-        lowerer.error(node, "I.reduce source components must be tensors")
-    rank = source_components[0].type.rank
-    axes = normalize_axes(lowerer, axes, rank, node)
-    if any(value.type.rank != rank for value in source_components):
+@dataclass(frozen=True, slots=True)
+class ReductionInputs:
+    sources: tuple[MlirValue, ...]
+    schema: ProductSchema
+    axes: tuple[int, ...]
+    identities: tuple[MlirValue, ...]
+    captures: tuple[MlirValue, ...]
+    combine: RegionState
+    reduced_types: tuple[ValueType, ...]
+
+
+def _prepare_reduction(lowerer: FunctionLowerer, name: str, node: ast.Call, bound, *, scan: bool) -> ReductionInputs:
+    purpose = "scan" if scan else "reduce"
+    generic = name == purpose
+    source = lowerer.read_value(lowerer.lower_expression(bound["value"]), bound["value"])
+    components, schema = _source_components(lowerer, source, node)
+    if not components or any(not isinstance(value.type, TensorType) for value in components):
+        lowerer.error(node, f"I.{purpose} source components must be tensors")
+    rank = components[0].type.rank
+    axes = normalize_axes(lowerer, require_axes(lowerer, bound["axis"]), rank, node)
+    if scan:
+        if len(axes) != 1:
+            lowerer.error(node, "I.scan requires exactly one axis")
+    elif any(value.type.rank != rank for value in components):
         lowerer.error(node, "I.reduce source components must have equal rank")
-    if name != "reduce":
-        if component_names != ("value",):
-            lowerer.error(node, f"I.{name} requires one tensor; use I.reduce for products")
-        dtype = source_components[0].type.dtype
-        if name in ("reduce.any", "reduce.all"):
-            if dtype != intent_bool:
-                lowerer.error(node, f"I.{name} requires a bool tensor")
+    if not generic and schema.kind != "scalar":
+        lowerer.error(node, f"I.{name} requires one tensor")
+    if name in ("reduce.any", "reduce.all") and components[0].type.dtype != intent_bool:
+        lowerer.error(node, f"I.{name} requires a bool tensor")
 
     acc_dtype = optional_dtype(lowerer, bound.get("acc_dtype"))
-    if acc_dtype is not None:
-        if len(source_components) != 1:
-            lowerer.error(node, "record reduce uses explicit field dtypes")
-    elif name == "reduce.sum":
-        acc_dtype = _sum_accumulator_dtype(source_components[0].type.dtype)
-    if acc_dtype is not None and source_components[0].type.dtype != acc_dtype:
-        source_components = (
-            lowerer.emit(
-                OperationKind.CAST,
-                lowerer.location(node),
-                operands=(source_components[0],),
-                result_types=(
-                    TensorType(acc_dtype, source_components[0].type.shape),
-                ),
-            ).results[0],
-        )
-    if name in ("reduce.sum", "reduce.max") and source_components[0].type.dtype == intent_bool:
+    if acc_dtype is not None and len(components) != 1:
+        lowerer.error(node, f"record {purpose} uses explicit field dtypes")
+    if acc_dtype is None and name in ("reduce.sum", "cumsum"):
+        acc_dtype = _sum_accumulator_dtype(components[0].type.dtype)
+    if acc_dtype is not None and components[0].type.dtype != acc_dtype:
+        component = components[0]
+        components = (lowerer.emit(
+            OperationKind.CAST, lowerer.location(node), operands=(component,),
+            result_types=(TensorType(acc_dtype, component.type.shape),),
+        ).results[0],)
+    if name in ("reduce.sum", "reduce.max", "cumsum", "cummax") and components[0].type.dtype == intent_bool:
         lowerer.error(node, f"I.{name} requires a numeric accumulator dtype")
-
     reduced = set(axes)
-    result_components = tuple(
-        lowerer.value_result_type(
-            source_component.type.dtype,
-            tuple(
-                dimension
-                for axis, dimension in enumerate(source_component.type.shape)
-                if axis not in reduced
-            ),
-        )
-        for source_component in source_components
-    )
-    builtin_operator = {
-        "reduce.max": BinaryOperator.MAXIMUM,
-        "reduce.sum": BinaryOperator.ADD,
-        "reduce.any": BinaryOperator.LOGICAL_OR,
-        "reduce.all": BinaryOperator.LOGICAL_AND,
+    reduced_types = tuple(lowerer.value_result_type(
+        component.type.dtype,
+        tuple(dimension for axis, dimension in enumerate(component.type.shape) if axis not in reduced),
+    ) for component in components)
+    operator = {
+        "reduce.max": BinaryOperator.MAXIMUM, "reduce.sum": BinaryOperator.ADD,
+        "reduce.any": BinaryOperator.LOGICAL_OR, "reduce.all": BinaryOperator.LOGICAL_AND,
+        "cumsum": BinaryOperator.ADD, "cummax": BinaryOperator.MAXIMUM,
     }.get(name)
-    identity = (
-        _builtin_identity(lowerer, source_components[0].type.dtype, builtin_operator, node)
-        if builtin_operator is not None
-        else _lower_component_identity(
-            lowerer, bound["identity"], source_components, component_names, node
-        )
-    )
-    identity_components, identity_names = _identity_components(lowerer, identity, node)
-    if component_names != identity_names or len(source_components) != len(identity_components):
-        lowerer.error(node, "reduce source and identity schemas must match")
-    for source_component, expected, identity_component in zip(
-        source_components, result_components, identity_components
-    ):
-        scalar_identity = ScalarType(source_component.type.dtype)
-        if identity_component.type not in (scalar_identity, expected):
-            lowerer.error(
-                node,
-                "reduce identity must be an element scalar or the complete accumulator result",
-            )
-
-    captures, capture_bindings = _combine_captures(
-        lowerer, bound.get("combine_operands"), node
-    )
-    accumulator_types = tuple(value.type for value in identity_components)
-    if builtin_operator is not None:
-        combine_region = _builtin_combine_region(
-            lowerer, accumulator_types, builtin_operator, node
-        )
+    identity = (_builtin_identity(lowerer, components[0].type.dtype, operator, node)
+                if operator is not None else
+                _lower_component_identity(lowerer, bound["identity"], components, schema, node))
+    identities, identity_schema = _source_components(lowerer, identity, node)
+    if schema != identity_schema or len(components) != len(identities):
+        lowerer.error(node, f"{purpose} source and identity schemas must match")
+    for component, expected, identity in zip(components, reduced_types, identities):
+        if identity.type not in (ScalarType(component.type.dtype), expected):
+            lowerer.error(node, f"{purpose} identity must be an element scalar or the complete axis slice")
+    captures, capture_bindings = _region_captures(lowerer, bound.get("combine_operands"), node)
+    accumulator_types = tuple(value.type for value in identities)
+    if operator is not None:
+        combine = _builtin_combine_region(lowerer, accumulator_types, operator, node)
     else:
-        combine_region, combine_results = _combine_region(
-            lowerer,
-            bound["combine"],
-            accumulator_types,
-            captures,
-            capture_bindings,
-            component_names,
-            node,
+        combine, results = _combine_region(
+            lowerer, bound["combine"], accumulator_types, captures, capture_bindings, schema, node,
         )
-        if combine_results != accumulator_types:
-            lowerer.error(node, "reduce combine result schema must match identity")
+        if results != accumulator_types:
+            lowerer.error(node, f"{purpose} combine result schema must match identity")
+    return ReductionInputs(components, schema, axes, identities, captures, combine, reduced_types)
 
+
+def _emit_collective(lowerer, node, inputs: ReductionInputs, kind, result_types, attributes):
     operation = lowerer.emit(
-        OperationKind.REDUCE,
-        lowerer.location(node),
-        operands=source_components + identity_components + captures,
-        result_types=result_components,
-        attributes={
-            "axes": axes,
-            "source_count": len(source_components),
-            "identity_count": len(identity_components),
-            "capture_count": len(captures),
-        },
-        regions=(combine_region,),
+        kind, lowerer.location(node),
+        operands=inputs.sources + inputs.identities + inputs.captures,
+        result_types=result_types,
+        attributes={**attributes, "source_count": len(inputs.sources),
+                    "identity_count": len(inputs.identities), "capture_count": len(inputs.captures)},
+        regions=(inputs.combine,),
     )
-    return _rebuild_components(
-        lowerer, operation.results, component_names, node
-    )
+    return _rebuild_components(lowerer, operation.results, inputs.schema, node)
+
+
+def _reduce(lowerer: FunctionLowerer, name: str, node: ast.Call) -> MlirValue:
+    bound = (bind_call(
+        lowerer, node, ("value", "axis", "identity", "combine", "combine_operands", "acc_dtype"),
+        required=("value", "axis", "identity", "combine"),
+    ) if name == "reduce" else bind_declared_call(lowerer, node, name))
+    inputs = _prepare_reduction(lowerer, name, node, bound, scan=False)
+    return _emit_collective(lowerer, node, inputs, OperationKind.REDUCE,
+                            inputs.reduced_types, {"axes": inputs.axes})
 
 
 def _arg_reduce_max(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
@@ -279,279 +246,111 @@ def _arg_reduce_max(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
 
 
 def _scan(lowerer: FunctionLowerer, node: ast.Call, name: str) -> MlirValue:
-    bound = (
-        bind_call(
-            lowerer,
-            node,
-            (
-                "value", "axis", "identity", "combine", "combine_operands",
-                "inclusive", "reverse", "acc_dtype",
-            ),
-            required=("value", "axis", "identity", "combine", "inclusive"),
-        )
-        if name == "scan"
-        else bind_declared_call(lowerer, node, name)
+    bound = (bind_call(
+        lowerer, node,
+        ("value", "axis", "identity", "combine", "combine_operands", "inclusive", "reverse", "acc_dtype"),
+        required=("value", "axis", "identity", "combine", "inclusive"),
+    ) if name == "scan" else bind_declared_call(lowerer, node, name))
+    inputs = _prepare_reduction(lowerer, name, node, bound, scan=True)
+    return _emit_collective(
+        lowerer, node, inputs, OperationKind.SCAN, tuple(value.type for value in inputs.sources),
+        {"axis": inputs.axes[0], "inclusive": require_static_bool(lowerer, bound["inclusive"]),
+         "reverse": require_static_bool(lowerer, bound["reverse"]) if "reverse" in bound else False},
     )
-    source = lowerer.read_value(
-        lowerer.lower_expression(bound["value"]), bound["value"]
+
+
+@dataclass(frozen=True, slots=True)
+class RegionSummary:
+    sources: tuple[MlirValue, ...]
+    axis: int
+    captures: tuple[MlirValue, ...]
+    capture_bindings: tuple[ConstexprBinding | None, ...]
+    slice_types: tuple[TensorType, ...]
+    summarize: RegionState
+    summary_types: tuple[ValueType, ...]
+    identity: tuple[MlirValue, ...]
+    combine: RegionState
+
+
+def _prepare_region_summary(lowerer, bound, node, purpose: str) -> RegionSummary:
+    sources = _tensor_sources(lowerer, bound["source"], node)
+    axis = _shared_source_axis(lowerer, sources, bound["axis"], node)
+    captures, capture_bindings = _region_captures(lowerer, bound.get("operands"), node)
+    slice_types = _slice_types(lowerer, sources, axis, purpose)
+    summarize, summary_types = _helper_region(
+        lowerer, bound["summarize"], slice_types + tuple(value.type for value in captures),
+        (None,) * len(slice_types) + capture_bindings, node,
     )
-    source_components, component_names = _source_components(lowerer, source, node)
-    if not source_components or any(
-        not isinstance(value.type, TensorType) for value in source_components
-    ):
-        lowerer.error(node, "I.scan source components must be tensors")
-    if name != "scan" and component_names != ("value",):
-        lowerer.error(node, f"I.{name} requires one tensor")
-    axes = normalize_axes(
-        lowerer,
-        require_axes(lowerer, bound["axis"]),
-        source_components[0].type.rank,
-        node,
+    values = _values(lowerer, bound["identity"], node)
+    if len(values) != len(summary_types):
+        lowerer.error(node, f"{purpose} identity arity must match summary schema")
+    identity = tuple(_align_value_schema(lowerer, value, target, bound["identity"])
+                     for value, target in zip(values, summary_types))
+    identity_types = tuple(value.type for value in identity)
+    if identity_types != summary_types:
+        lowerer.error(node, f"{purpose} summarize result {summary_types} must match identity schema {identity_types}")
+    combine, combine_types = _helper_region(
+        lowerer, bound["combine"], summary_types + summary_types,
+        (None,) * (2 * len(summary_types)), node,
     )
-    if len(axes) != 1:
-        lowerer.error(node, "I.scan requires exactly one axis")
-    acc_dtype = optional_dtype(lowerer, bound.get("acc_dtype"))
-    if acc_dtype is None and name == "cumsum":
-        acc_dtype = _sum_accumulator_dtype(source_components[0].type.dtype)
-    if acc_dtype is not None:
-        if len(source_components) != 1:
-            lowerer.error(node, "record scan uses explicit field dtypes")
-        if source_components[0].type.dtype != acc_dtype:
-            source_components = (
-                lowerer.emit(
-                    OperationKind.CAST,
-                    lowerer.location(node),
-                    operands=(source_components[0],),
-                    result_types=(
-                        TensorType(acc_dtype, source_components[0].type.shape),
-                    ),
-                ).results[0],
-            )
-    if name != "scan" and source_components[0].type.dtype == intent_bool:
-        lowerer.error(node, f"I.{name} requires a numeric accumulator dtype")
-    builtin_operator = {
-        "cumsum": BinaryOperator.ADD,
-        "cummax": BinaryOperator.MAXIMUM,
-    }.get(name)
-    identity = (
-        _builtin_identity(lowerer, source_components[0].type.dtype, builtin_operator, node)
-        if builtin_operator is not None
-        else _lower_component_identity(
-            lowerer, bound["identity"], source_components, component_names, node
-        )
-    )
-    identity_components, identity_names = _identity_components(lowerer, identity, node)
-    if component_names != identity_names or len(source_components) != len(identity_components):
-        lowerer.error(node, "scan source and identity schemas must match")
-    for source_component, identity_component in zip(source_components, identity_components):
-        scalar_identity = ScalarType(source_component.type.dtype)
-        slice_identity = lowerer.value_result_type(
-            source_component.type.dtype,
-            tuple(
-                dimension
-                for source_axis, dimension in enumerate(source_component.type.shape)
-                if source_axis != axes[0]
-            ),
-        )
-        if identity_component.type not in (scalar_identity, slice_identity):
-            lowerer.error(
-                node,
-                "scan identity must be an element scalar or one source-axis slice",
-            )
-    captures, capture_bindings = _combine_captures(
-        lowerer, bound.get("combine_operands"), node
-    )
-    accumulator_types = tuple(value.type for value in identity_components)
-    if builtin_operator is not None:
-        combine_region = _builtin_combine_region(
-            lowerer, accumulator_types, builtin_operator, node
-        )
-    else:
-        combine_region, combine_results = _combine_region(
-            lowerer, bound["combine"], accumulator_types, captures,
-            capture_bindings, component_names, node,
-        )
-        if combine_results != accumulator_types:
-            lowerer.error(node, "scan combine result schema must match identity")
-    operation = lowerer.emit(
-        OperationKind.SCAN,
-        lowerer.location(node),
-        operands=source_components + identity_components + captures,
-        result_types=tuple(value.type for value in source_components),
-        attributes={
-            "axis": axes[0],
-            "inclusive": require_static_bool(lowerer, bound["inclusive"]),
-            "reverse": (
-                require_static_bool(lowerer, bound["reverse"])
-                if "reverse" in bound
-                else False
-            ),
-            "source_count": len(source_components),
-            "identity_count": len(identity_components),
-            "capture_count": len(captures),
-        },
-        regions=(combine_region,),
-    )
-    return _rebuild_components(lowerer, operation.results, component_names, node)
+    if combine_types != summary_types:
+        lowerer.error(node, f"{purpose} combine result must match summary schema")
+    return RegionSummary(sources, axis, captures, capture_bindings, slice_types,
+                         summarize, summary_types, identity, combine)
 
 
 def _region_fold(lowerer: FunctionLowerer, node: ast.Call) -> object:
     bound = bind_call(
-        lowerer,
-        node,
-        ("source", "axis", "summarize", "combine", "identity", "operands"),
+        lowerer, node, ("source", "axis", "summarize", "combine", "identity", "operands"),
         required=("source", "axis", "summarize", "combine", "identity"),
     )
-    sources = _tensor_sources(lowerer, bound["source"], node)
-    axis = _shared_source_axis(lowerer, sources, bound["axis"], node)
-    captures, capture_bindings = _region_captures(
-        lowerer, bound.get("operands"), node
-    )
-    slice_types = _slice_types(lowerer, sources, axis, "region_fold")
-    summarize, summary_types = _helper_region(
-        lowerer,
-        bound["summarize"],
-        slice_types + tuple(value.type for value in captures),
-        (None,) * len(slice_types) + capture_bindings,
-        node,
-    )
-    identity_values = _values(lowerer, bound["identity"], node)
-    if len(identity_values) != len(summary_types):
-        lowerer.error(node, "region_fold identity arity must match summary schema")
-    identity = tuple(
-        _align_value_schema(lowerer, value, target, bound["identity"])
-        for value, target in zip(identity_values, summary_types)
-    )
-    identity_types = tuple(value.type for value in identity)
-    if summary_types != identity_types:
-        lowerer.error(
-            node,
-            f"region_fold summarize result {summary_types} must match identity schema {identity_types}",
-        )
-    combine, combine_types = _helper_region(
-        lowerer,
-        bound["combine"],
-        summary_types + summary_types,
-        (None,) * (2 * len(summary_types)),
-        node,
-    )
-    if combine_types != summary_types:
-        lowerer.error(node, "region_fold combine result must match summary schema")
+    summary = _prepare_region_summary(lowerer, bound, node, "region_fold")
     operation = lowerer.emit(
-        OperationKind.REGION_FOLD,
-        lowerer.location(node),
-        operands=sources + identity + captures,
-        result_types=summary_types,
-        attributes={
-            "axis": axis,
-            "source_count": len(sources),
-            "identity_count": len(identity),
-            "capture_count": len(captures),
-        },
-        regions=(summarize, combine),
+        OperationKind.REGION_FOLD, lowerer.location(node),
+        operands=summary.sources + summary.identity + summary.captures,
+        result_types=summary.summary_types,
+        attributes={"axis": summary.axis, "source_count": len(summary.sources),
+                    "identity_count": len(summary.identity), "capture_count": len(summary.captures)},
+        regions=(summary.summarize, summary.combine),
     )
     return operation.results[0] if len(operation.results) == 1 else StaticTuple(operation.results)
 
 
 def _region_scan(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
     bound = bind_call(
-        lowerer,
-        node,
-        (
-            "source",
-            "axis",
-            "summarize",
-            "combine",
-            "identity",
-            "initial_state",
-            "apply",
-            "emit",
-            "operands",
-        ),
-        required=(
-            "source",
-            "axis",
-            "summarize",
-            "combine",
-            "identity",
-            "initial_state",
-            "apply",
-            "emit",
-        ),
+        lowerer, node,
+        ("source", "axis", "summarize", "combine", "identity", "initial_state", "apply", "emit", "operands"),
+        required=("source", "axis", "summarize", "combine", "identity", "initial_state", "apply", "emit"),
     )
-    sources = _tensor_sources(lowerer, bound["source"], node)
-    axis = _shared_source_axis(lowerer, sources, bound["axis"], node)
-    captures, capture_bindings = _region_captures(
-        lowerer, bound.get("operands"), node
-    )
-    slice_types = _slice_types(lowerer, sources, axis, "region_scan")
-    summarize, transition_types = _helper_region(
-        lowerer,
-        bound["summarize"],
-        slice_types + tuple(value.type for value in captures),
-        (None,) * len(slice_types) + capture_bindings,
-        node,
-    )
-    identity_values = _values(lowerer, bound["identity"], node)
-    if len(identity_values) != len(transition_types):
-        lowerer.error(node, "region_scan identity arity must match transition schema")
-    identity = tuple(
-        _align_value_schema(lowerer, value, target, bound["identity"])
-        for value, target in zip(identity_values, transition_types)
-    )
-    if tuple(value.type for value in identity) != transition_types:
-        lowerer.error(node, "region_scan summarize result must match identity schema")
-    combine, combine_types = _helper_region(
-        lowerer,
-        bound["combine"],
-        transition_types + transition_types,
-        (None,) * (2 * len(transition_types)),
-        node,
-    )
-    if combine_types != transition_types:
-        lowerer.error(node, "region_scan combine result must match transition schema")
+    summary = _prepare_region_summary(lowerer, bound, node, "region_scan")
     initial = _values(lowerer, bound["initial_state"], node)
     initial_types = tuple(value.type for value in initial)
     apply, state_types = _helper_region(
-        lowerer,
-        bound["apply"],
-        transition_types + initial_types,
-        (None,) * (len(transition_types) + len(initial_types)),
-        node,
+        lowerer, bound["apply"], summary.summary_types + initial_types,
+        (None,) * (len(summary.summary_types) + len(initial_types)), node,
     )
     if state_types != initial_types:
         lowerer.error(node, "region_scan apply result must match initial-state schema")
     emit, slice_output_types = _helper_region(
-        lowerer,
-        bound["emit"],
-        slice_types + state_types + tuple(value.type for value in captures),
-        (None,) * (len(slice_types) + len(state_types)) + capture_bindings,
-        node,
+        lowerer, bound["emit"], summary.slice_types + state_types + tuple(value.type for value in summary.captures),
+        (None,) * (len(summary.slice_types) + len(state_types)) + summary.capture_bindings, node,
     )
-    source_extent = sources[0].type.shape[axis]
-    output_types = tuple(
-        _replace_slice_extent(value_type, slice_types[0].shape[axis], source_extent)
-        for value_type in slice_output_types
-    )
+    source_extent = summary.sources[0].type.shape[summary.axis]
+    output_types = tuple(_replace_slice_extent(value_type, summary.slice_types[0].shape[summary.axis], source_extent)
+                         for value_type in slice_output_types)
     operation = lowerer.emit(
-        OperationKind.REGION_SCAN,
-        lowerer.location(node),
-        operands=sources + identity + initial + captures,
+        OperationKind.REGION_SCAN, lowerer.location(node),
+        operands=summary.sources + summary.identity + initial + summary.captures,
         result_types=output_types + state_types,
-        attributes={
-            "axis": axis,
-            "source_count": len(sources),
-            "identity_count": len(identity),
-            "state_count": len(initial),
-            "capture_count": len(captures),
-            "output_count": len(output_types),
-        },
-        regions=(summarize, combine, apply, emit),
+        attributes={"axis": summary.axis, "source_count": len(summary.sources),
+                    "identity_count": len(summary.identity), "state_count": len(initial),
+                    "capture_count": len(summary.captures), "output_count": len(output_types)},
+        regions=(summary.summarize, summary.combine, apply, emit),
     )
-    outputs = operation.results[: len(output_types)]
-    states = operation.results[len(output_types) :]
-    output: object = outputs[0] if len(outputs) == 1 else StaticTuple(outputs)
-    state: object = states[0] if len(states) == 1 else StaticTuple(states)
+    outputs = operation.results[:len(output_types)]
+    states = operation.results[len(output_types):]
+    output = outputs[0] if len(outputs) == 1 else StaticTuple(outputs)
+    state = states[0] if len(states) == 1 else StaticTuple(states)
     return StaticTuple((output, state))
 
 
@@ -880,27 +679,11 @@ def _helper_region(
         lowerer.error(helper_node, "structured callable must be an @intent.fn")
     if len(static_bindings) != len(argument_types):
         raise ValueError("helper static-binding schema mismatch")
-    region = lowerer.make_region(lowerer.location(call_node), argument_types)
-    arguments: list[Expression] = []
-    for value, binding in zip(region.blocks[0].arguments, static_bindings):
-        arguments.append(
-            ConstexprBinding(binding.python_value, value)
-            if binding is not None
-            else value
-        )
-    saved_block = lowerer.current_block
-    lowerer.current_block = region.blocks[0]
-    results = lowerer.compiler.lower_helper_inline(
-        lowerer,
-        helper,
-        tuple(arguments),
-        lowerer.location(call_node),
-    )
-    if region.effects:
-        lowerer.error(call_node, "structured callable regions must be pure")
-    lowerer.emit(OperationKind.YIELD, lowerer.location(call_node), operands=results)
-    lowerer.current_block = saved_block
-    return region, tuple(value.type for value in results)
+    def invoke(arguments):
+        bound = tuple(ConstexprBinding(binding.python_value, value) if binding is not None else value
+                      for value, binding in zip(arguments, static_bindings))
+        return lowerer.compiler.lower_helper_inline(lowerer, helper, bound, lowerer.location(call_node))
+    return pure_region(lowerer, argument_types, call_node, invoke)
 
 
 def _combine_region(
@@ -909,7 +692,7 @@ def _combine_region(
     accumulator_types: tuple[ValueType, ...],
     captures: tuple[MlirValue, ...],
     capture_bindings: tuple[ConstexprBinding | None, ...],
-    component_names: tuple[str, ...],
+    component_names: ProductSchema,
     node: ast.AST,
 ) -> tuple[object, tuple[ValueType, ...]]:
     expression = lowerer.lower_expression(helper_node)
@@ -929,71 +712,57 @@ def _combine_region(
         )
     if not isinstance(expression, HelperDefinition):
         lowerer.error(helper_node, "combine must be an Intent intrinsic or @intent.fn")
-    region = lowerer.make_region(
-        lowerer.location(node),
-        accumulator_types + accumulator_types + tuple(value.type for value in captures),
-    )
-    saved_block = lowerer.current_block
-    lowerer.current_block = region.blocks[0]
-    block_arguments = region.blocks[0].arguments
-    arguments: list[Expression]
-    product_kind = _component_product_kind(component_names)
-    if product_kind == "scalar":
-        arguments = list(block_arguments)
-    else:
-        count = len(accumulator_types)
-        lhs = _make_product_value(
-            lowerer, block_arguments[:count], component_names, product_kind, node
-        )
-        rhs = _make_product_value(
+    def combine_body(block_arguments):
+        arguments: list[Expression]
+        product_kind = component_names.kind
+        if product_kind == "scalar":
+            arguments = list(block_arguments)
+        else:
+            count = len(accumulator_types)
+            lhs = _rebuild_components(lowerer, tuple(block_arguments[:count]), component_names, node)
+            rhs = _rebuild_components(lowerer, tuple(block_arguments[count:2 * count]), component_names, node)
+            arguments = [lhs, rhs, *block_arguments[2 * count :]]
+        capture_offset = 2 * len(accumulator_types)
+        for index, binding in enumerate(capture_bindings):
+            if binding is not None:
+                argument_index = (
+                    capture_offset + index
+                    if product_kind == "scalar"
+                    else 2 + index
+                )
+                arguments[argument_index] = ConstexprBinding(
+                    binding.python_value,
+                    block_arguments[capture_offset + index],
+                )
+        helper_results = lowerer.compiler.lower_helper_inline(
             lowerer,
-            block_arguments[count : 2 * count],
-            component_names,
-            product_kind,
-            node,
+            expression,
+            tuple(arguments),
+            lowerer.location(node),
         )
-        arguments = [lhs, rhs, *block_arguments[2 * count :]]
-    capture_offset = 2 * len(accumulator_types)
-    for index, binding in enumerate(capture_bindings):
-        if binding is not None:
-            argument_index = (
-                capture_offset + index
-                if product_kind == "scalar"
-                else 2 + index
-            )
-            arguments[argument_index] = ConstexprBinding(
-                binding.python_value,
-                region.blocks[0].arguments[capture_offset + index],
-            )
-    helper_results = lowerer.compiler.lower_helper_inline(
-        lowerer,
-        expression,
-        tuple(arguments),
-        lowerer.location(node),
+        if product_kind == "scalar":
+            results = helper_results
+        else:
+            if len(helper_results) != 1:
+                lowerer.error(node, "product combine must return one typed product")
+            results, result_names = _source_components(lowerer, helper_results[0], node)
+            if result_names != component_names:
+                lowerer.error(node, "product combine result schema does not match accumulator")
+        return results
+    return pure_region(
+        lowerer, accumulator_types + accumulator_types + tuple(value.type for value in captures),
+        node, combine_body, purpose="combine",
     )
-    if product_kind == "scalar":
-        results = helper_results
-    else:
-        if len(helper_results) != 1:
-            lowerer.error(node, "product combine must return one typed product")
-        results, result_names = _source_components(lowerer, helper_results[0], node)
-        if result_names != component_names:
-            lowerer.error(node, "product combine result schema does not match accumulator")
-    if region.effects:
-        lowerer.error(node, "combine region must be pure")
-    lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=results)
-    lowerer.current_block = saved_block
-    return region, tuple(value.type for value in results)
 
 
 def _lower_component_identity(
     lowerer: FunctionLowerer,
     identity_node: ast.AST,
     source_components: tuple[MlirValue, ...],
-    component_names: tuple[str, ...],
+    component_names: ProductSchema,
     call_node: ast.AST,
 ) -> MlirValue:
-    if component_names != ("value",) and isinstance(identity_node, ast.Call):
+    if component_names.kind == "record" and isinstance(identity_node, ast.Call):
         callee = lowerer.lower_expression(identity_node.func)
         if isinstance(callee, Intrinsic) and callee.name == "record":
             if identity_node.args or any(
@@ -1001,7 +770,7 @@ def _lower_component_identity(
             ):
                 lowerer.error(identity_node, "record identity requires named fields")
             names = tuple(keyword.arg for keyword in identity_node.keywords)
-            if names != component_names:
+            if names != component_names.names:
                 lowerer.error(
                     identity_node,
                     "record identity fields must match source record order",
@@ -1020,7 +789,7 @@ def _lower_component_identity(
                 values.append(
                     lowerer.materialize(expression, keyword.value, expected)
                 )
-            return _make_record_value(lowerer, tuple(values), component_names, call_node)
+            return _rebuild_components(lowerer, tuple(values), component_names, call_node)
     expression = lowerer.lower_expression(identity_node)
     expected = (
         ScalarType(source_components[0].type.dtype)
@@ -1032,77 +801,16 @@ def _lower_component_identity(
     return lowerer.materialize(expression, identity_node, expected)
 
 
-def _make_record_value(
-    lowerer: FunctionLowerer,
-    values: tuple[MlirValue, ...] | list[MlirValue],
-    names: tuple[str, ...],
-    node: ast.AST,
-) -> MlirValue:
-    value_tuple = tuple(values)
-    result_type = RecordType(
-        tuple((name, value.type) for name, value in zip(names, value_tuple))
-    )
-    return lowerer.emit(
-        OperationKind.MAKE_RECORD,
-        lowerer.location(node),
-        operands=value_tuple,
-        result_types=(result_type,),
-    ).results[0]
-
-
-def _make_tuple_value(
-    lowerer: FunctionLowerer,
-    values: tuple[MlirValue, ...] | list[MlirValue],
-    node: ast.AST,
-) -> MlirValue:
-    value_tuple = tuple(values)
-    return lowerer.emit(
-        OperationKind.MAKE_TUPLE,
-        lowerer.location(node),
-        operands=value_tuple,
-        result_types=(TupleType(tuple(value.type for value in value_tuple)),),
-    ).results[0]
-
-
-def _make_product_value(
-    lowerer: FunctionLowerer,
-    values: tuple[MlirValue, ...] | list[MlirValue],
-    names: tuple[str, ...],
-    product_kind: str,
-    node: ast.AST,
-) -> MlirValue:
-    if product_kind == "tuple":
-        return _make_tuple_value(lowerer, values, node)
-    if product_kind == "record":
-        return _make_record_value(lowerer, values, names, node)
-    raise ValueError("scalar components do not form a product value")
-
-
-def _builtin_combine_region(
-    lowerer: FunctionLowerer,
-    accumulator_types: tuple[ValueType, ...],
-    operator: BinaryOperator,
-    node: ast.AST,
-):
-    region = lowerer.make_region(
-        lowerer.location(node), accumulator_types + accumulator_types
-    )
-    saved_block = lowerer.current_block
-    lowerer.current_block = region.blocks[0]
-    count = len(accumulator_types)
-    results = tuple(
-        lowerer.emit(
-            OperationKind.BINARY,
-            lowerer.location(node),
-            operands=(region.blocks[0].arguments[index], region.blocks[0].arguments[count + index]),
-            result_types=(accumulator_types[index],),
-            attributes={"operator_kind": operator},
-        ).results[0]
-        for index in range(count)
-    )
-    lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=results)
-    lowerer.current_block = saved_block
-    return region
+def _builtin_combine_region(lowerer: FunctionLowerer, accumulator_types: tuple[ValueType, ...],
+                            operator: BinaryOperator, node: ast.AST):
+    def combine(arguments):
+        count = len(accumulator_types)
+        return tuple(lowerer.emit(
+            OperationKind.BINARY, lowerer.location(node),
+            operands=(arguments[index], arguments[count + index]),
+            result_types=(accumulator_types[index],), attributes={"operator_kind": operator},
+        ).results[0] for index in range(count))
+    return pure_region(lowerer, accumulator_types + accumulator_types, node, combine, purpose="combine")[0]
 
 
 def _argmax_combine_region(
@@ -1111,149 +819,88 @@ def _argmax_combine_region(
     node: ast.AST,
 ):
     types = (value_type, ScalarType(intent_index))
-    region = lowerer.make_region(lowerer.location(node), types + types)
-    saved = lowerer.current_block
-    lowerer.current_block = region.blocks[0]
-    lhs_value, lhs_index, rhs_value, rhs_index = region.blocks[0].arguments
-    greater = lowerer.emit(
-        OperationKind.COMPARE,
-        lowerer.location(node),
-        operands=(lhs_value, rhs_value),
-        result_types=(ScalarType(intent_bool),),
-        attributes={"predicate": ComparePredicate.GT},
-    ).results[0]
-    equal = lowerer.emit(
-        OperationKind.COMPARE,
-        lowerer.location(node),
-        operands=(lhs_value, rhs_value),
-        result_types=(ScalarType(intent_bool),),
-        attributes={"predicate": ComparePredicate.EQ},
-    ).results[0]
-    lower = lowerer.emit(
-        OperationKind.COMPARE,
-        lowerer.location(node),
-        operands=(lhs_index, rhs_index),
-        result_types=(ScalarType(intent_bool),),
-        attributes={"predicate": ComparePredicate.LE},
-    ).results[0]
-    tied = lowerer.emit(
-        OperationKind.BINARY,
-        lowerer.location(node),
-        operands=(equal, lower),
-        result_types=(ScalarType(intent_bool),),
-        attributes={"operator_kind": BinaryOperator.LOGICAL_AND},
-    ).results[0]
-    choose = lowerer.emit(
-        OperationKind.BINARY,
-        lowerer.location(node),
-        operands=(greater, tied),
-        result_types=(ScalarType(intent_bool),),
-        attributes={"operator_kind": BinaryOperator.LOGICAL_OR},
-    ).results[0]
-    if value_type.dtype.category in (DTypeCategory.FLOAT, DTypeCategory.BFLOAT):
-        lhs_nan, rhs_nan = (
-            lowerer.emit(
-                OperationKind.COMPARE,
-                lowerer.location(node),
-                operands=(value, value),
-                result_types=(ScalarType(intent_bool),),
-                attributes={"predicate": ComparePredicate.NE},
-            ).results[0]
-            for value in (lhs_value, rhs_value)
-        )
-        nan_choice = lowerer.emit(
-            OperationKind.SELECT,
+    def combine(arguments):
+        lhs_value, lhs_index, rhs_value, rhs_index = arguments
+        greater = lowerer.emit(
+            OperationKind.COMPARE,
             lowerer.location(node),
-            operands=(rhs_nan, lower, lowerer.emit_literal(True, node)),
+            operands=(lhs_value, rhs_value),
             result_types=(ScalarType(intent_bool),),
+            attributes={"predicate": ComparePredicate.GT},
+        ).results[0]
+        equal = lowerer.emit(
+            OperationKind.COMPARE,
+            lowerer.location(node),
+            operands=(lhs_value, rhs_value),
+            result_types=(ScalarType(intent_bool),),
+            attributes={"predicate": ComparePredicate.EQ},
+        ).results[0]
+        lower = lowerer.emit(
+            OperationKind.COMPARE,
+            lowerer.location(node),
+            operands=(lhs_index, rhs_index),
+            result_types=(ScalarType(intent_bool),),
+            attributes={"predicate": ComparePredicate.LE},
+        ).results[0]
+        tied = lowerer.emit(
+            OperationKind.BINARY,
+            lowerer.location(node),
+            operands=(equal, lower),
+            result_types=(ScalarType(intent_bool),),
+            attributes={"operator_kind": BinaryOperator.LOGICAL_AND},
         ).results[0]
         choose = lowerer.emit(
-            OperationKind.SELECT,
+            OperationKind.BINARY,
             lowerer.location(node),
-            operands=(lhs_nan, nan_choice, choose),
+            operands=(greater, tied),
             result_types=(ScalarType(intent_bool),),
+            attributes={"operator_kind": BinaryOperator.LOGICAL_OR},
         ).results[0]
-    selected = tuple(
-        lowerer.emit(
-            OperationKind.SELECT,
-            lowerer.location(node),
-            operands=(choose, lhs, rhs),
-            result_types=(result_type,),
-        ).results[0]
-        for lhs, rhs, result_type in zip(
-            (lhs_value, lhs_index), (rhs_value, rhs_index), types
-        )
-    )
-    lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=selected)
-    lowerer.current_block = saved
-    return region
-
-
-def _source_components(
-    lowerer: FunctionLowerer,
-    source: MlirValue,
-    node: ast.AST,
-) -> tuple[tuple[MlirValue, ...], tuple[str, ...]]:
-    if isinstance(source.type, TupleType):
-        values = tuple(
-            lowerer.emit(
-                OperationKind.EXTRACT,
+        if value_type.dtype.category in (DTypeCategory.FLOAT, DTypeCategory.BFLOAT):
+            lhs_nan, rhs_nan = (
+                lowerer.emit(
+                    OperationKind.COMPARE,
+                    lowerer.location(node),
+                    operands=(value, value),
+                    result_types=(ScalarType(intent_bool),),
+                    attributes={"predicate": ComparePredicate.NE},
+                ).results[0]
+                for value in (lhs_value, rhs_value)
+            )
+            nan_choice = lowerer.emit(
+                OperationKind.SELECT,
                 lowerer.location(node),
-                operands=(source,),
-                result_types=(component_type,),
-                attributes={"field": index},
+                operands=(rhs_nan, lower, lowerer.emit_literal(True, node)),
+                result_types=(ScalarType(intent_bool),),
             ).results[0]
-            for index, component_type in enumerate(source.type.components)
+            choose = lowerer.emit(
+                OperationKind.SELECT,
+                lowerer.location(node),
+                operands=(lhs_nan, nan_choice, choose),
+                result_types=(ScalarType(intent_bool),),
+            ).results[0]
+        selected = tuple(
+            lowerer.emit(
+                OperationKind.SELECT,
+                lowerer.location(node),
+                operands=(choose, lhs, rhs),
+                result_types=(result_type,),
+            ).results[0]
+            for lhs, rhs, result_type in zip(
+                (lhs_value, lhs_index), (rhs_value, rhs_index), types
+            )
         )
-        return values, tuple(f"#{index}" for index in range(len(values)))
-    if not isinstance(source.type, RecordType):
-        return (source,), ("value",)
-    values = tuple(
-        lowerer.emit(
-            OperationKind.EXTRACT,
-            lowerer.location(node),
-            operands=(source,),
-            result_types=(field_type,),
-            attributes={"field": index},
-        ).results[0]
-        for index, (_, field_type) in enumerate(source.type.fields)
-    )
-    return values, tuple(name for name, _ in source.type.fields)
+        return selected
+    return pure_region(lowerer, types + types, node, combine, purpose="argmax combine")[0]
 
 
-def _identity_components(
-    lowerer: FunctionLowerer,
-    identity: MlirValue,
-    node: ast.AST,
-) -> tuple[tuple[MlirValue, ...], tuple[str, ...]]:
-    return _source_components(lowerer, identity, node)
+def _source_components(lowerer: FunctionLowerer, source: MlirValue, node: ast.AST):
+    return product_components(lowerer, source, node), ProductSchema.of(source.type)
 
 
-def _rebuild_components(
-    lowerer: FunctionLowerer,
-    values: tuple[MlirValue, ...],
-    names: tuple[str, ...],
-    node: ast.AST,
-) -> MlirValue:
-    if names == ("value",):
-        return values[0]
-    if _component_product_kind(names) == "tuple":
-        return _make_tuple_value(lowerer, values, node)
-    result_type = RecordType(tuple(zip(names, (value.type for value in values))))
-    return lowerer.emit(
-        OperationKind.MAKE_RECORD,
-        lowerer.location(node),
-        operands=values,
-        result_types=(result_type,),
-    ).results[0]
-
-
-def _component_product_kind(names: tuple[str, ...]) -> str:
-    if names == ("value",):
-        return "scalar"
-    if names == tuple(f"#{index}" for index in range(len(names))):
-        return "tuple"
-    return "record"
+def _rebuild_components(lowerer: FunctionLowerer, values: tuple[MlirValue, ...],
+                        schema: ProductSchema, node: ast.AST) -> MlirValue:
+    return build_product(lowerer, values, schema.type(tuple(value.type for value in values)), node)
 
 
 def _values(
@@ -1266,50 +913,19 @@ def _values(
     return tuple(lowerer.materialize(element, call_node) for element in elements)
 
 
-def _align_value_schema(
-    lowerer: FunctionLowerer,
-    value: MlirValue,
-    target: ValueType,
-    node: ast.AST,
-) -> MlirValue:
-    if isinstance(value.type, TensorType) and isinstance(target, TensorType):
-        if (
-            value.type.dtype != target.dtype
-            or value.type.rank != target.rank
-            or any(
-                not dims_compatible(source, destination)
-                for source, destination in zip(value.type.shape, target.shape)
-            )
-        ):
-            lowerer.error(node, "structured identity tensor does not match its summary schema")
-        return lowerer.broadcast_value(value, target.shape, node)
-    if isinstance(value.type, RecordType) and isinstance(target, RecordType):
-        source_names = tuple(name for name, _ in value.type.fields)
-        target_names = tuple(name for name, _ in target.fields)
-        if source_names != target_names:
-            lowerer.error(node, "structured identity record fields do not match its summary schema")
-        components, _ = _source_components(lowerer, value, node)
-        aligned = tuple(
-            _align_value_schema(lowerer, component, field_type, node)
-            for component, (_, field_type) in zip(components, target.fields)
-        )
-        return _make_record_value(lowerer, aligned, target_names, node)
-    if isinstance(value.type, TupleType) and isinstance(target, TupleType):
-        if len(value.type.components) != len(target.components):
-            lowerer.error(node, "structured identity tuple arity does not match its summary schema")
-        components, _ = _source_components(lowerer, value, node)
-        aligned = tuple(
-            _align_value_schema(lowerer, component, component_type, node)
-            for component, component_type in zip(components, target.components)
-        )
-        return _make_tuple_value(lowerer, aligned, node)
-    if value.type == target:
-        return value
-    lowerer.error(
-        node,
-        f"structured identity value {value.type} does not match summary schema {target}",
-    )
-    raise AssertionError("unreachable after frontend diagnostic")
+def _align_value_schema(lowerer: FunctionLowerer, value: MlirValue,
+                        target: ValueType, node: ast.AST) -> MlirValue:
+    def align_leaf(component, expected):
+        if isinstance(component.type, TensorType) and isinstance(expected, TensorType):
+            if (component.type.dtype != expected.dtype or component.type.rank != expected.rank
+                    or any(not dims_compatible(source, destination)
+                           for source, destination in zip(component.type.shape, expected.shape))):
+                lowerer.error(node, "structured identity tensor does not match its summary schema")
+            return lowerer.broadcast_value(component, expected.shape, node)
+        if component.type == expected:
+            return component
+        lowerer.error(node, f"structured identity value {component.type} does not match summary schema {expected}")
+    return project_product(lowerer, value, target, node, align_leaf)
 
 
 def _tensor_sources(
@@ -1362,43 +978,17 @@ def _slice_types(
     )
 
 
-def _replace_slice_extent(
-    value_type: ValueType,
-    slice_extent: object,
-    full_extent: object,
-) -> ValueType:
-    if isinstance(value_type, TensorType):
-        matches = [axis for axis, dim in enumerate(value_type.shape) if dim == slice_extent]
+def _replace_slice_extent(value_type: ValueType, slice_extent: object, full_extent: object) -> ValueType:
+    def replace_leaf(leaf):
+        if not isinstance(leaf, TensorType):
+            raise ValueError("region_scan emit result must be a tensor or tensor record")
+        matches = [axis for axis, dim in enumerate(leaf.shape) if dim == slice_extent]
         if len(matches) != 1:
-            raise ValueError(
-                "region_scan emit result must contain its source slice extent exactly once"
-            )
-        shape = list(value_type.shape)
+            raise ValueError("region_scan emit result must contain its source slice extent exactly once")
+        shape = list(leaf.shape)
         shape[matches[0]] = full_extent
-        return TensorType(value_type.dtype, tuple(shape))
-    if isinstance(value_type, RecordType):
-        return RecordType(
-            tuple(
-                (name, _replace_slice_extent(field_type, slice_extent, full_extent))
-                for name, field_type in value_type.fields
-            )
-        )
-    if isinstance(value_type, TupleType):
-        return TupleType(
-            tuple(
-                _replace_slice_extent(component, slice_extent, full_extent)
-                for component in value_type.components
-            )
-        )
-    raise ValueError("region_scan emit result must be a tensor or tensor record")
-
-
-def _combine_captures(
-    lowerer: FunctionLowerer,
-    node: ast.AST | None,
-    call_node: ast.AST,
-) -> tuple[tuple[MlirValue, ...], tuple[ConstexprBinding | None, ...]]:
-    return _region_captures(lowerer, node, call_node)
+        return TensorType(leaf.dtype, tuple(shape))
+    return map_product_type(value_type, replace_leaf)
 
 
 def _region_captures(

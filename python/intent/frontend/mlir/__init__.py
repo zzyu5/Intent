@@ -1,5 +1,4 @@
 from .builder import MlirBuilder
-from .builder import canonicalize_mlir
 from .state import BlockState
 from .state import EmittedOperation
 from .state import FunctionKind
@@ -19,5 +18,4 @@ __all__ = [
     "ParameterKind",
     "ParameterSpec",
     "RegionState",
-    "canonicalize_mlir",
 ]

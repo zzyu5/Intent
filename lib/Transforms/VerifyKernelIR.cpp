@@ -368,7 +368,7 @@ public:
 
 } // namespace
 
-LogicalResult verifyKernelModule(ModuleOp module) {
+LogicalResult verifyKernelStructure(ModuleOp module) {
   if (failed(mlir::verify(module)))
     return failure();
   DenseSet<int64_t> operationIDs;
@@ -379,6 +379,12 @@ LogicalResult verifyKernelModule(ModuleOp module) {
       return failure();
   if (!sawKernel)
     return module.emitError("Intent module requires exactly one kernel entry");
+  return success();
+}
+
+LogicalResult verifyKernelModule(ModuleOp module) {
+  if (failed(verifyKernelStructure(module)))
+    return failure();
   CanonicalKernelAnalysis analysis(module);
   return analysis.verify();
 }
@@ -387,6 +393,9 @@ std::unique_ptr<Pass> createVerifyKernelIRPass() {
   return std::make_unique<VerifyKernelIRPass>();
 }
 
-void registerIntentPasses() { PassRegistration<VerifyKernelIRPass>(); }
+void registerIntentPasses() {
+  PassRegistration<VerifyKernelIRPass>();
+  registerPass([] { return createNormalizeKernelIRPass(); });
+}
 
 } // namespace intent

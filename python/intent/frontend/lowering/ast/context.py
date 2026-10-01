@@ -5,13 +5,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from intent.api import Definition
-from intent.api import DefinitionKind
 from intent.frontend.mlir import BlockState
 from intent.frontend.semantics import ConstexprType
-from intent.frontend.semantics import BufferType
-from intent.frontend.semantics import BinaryOperator
 from intent.frontend.semantics import DynamicDim
-from intent.frontend.semantics import DomainType
 from intent.frontend.semantics import Effect
 from intent.frontend.mlir import FunctionState
 from intent.frontend.semantics import ValueType
@@ -21,9 +17,6 @@ from intent.frontend.semantics import IndexRelation
 from intent.frontend.semantics import IndexTerm
 from intent.frontend.semantics import IndexTermKind
 from intent.frontend.semantics import OperationKind
-from intent.frontend.semantics import ShapeExpr
-from intent.frontend.semantics import ShapeExprKind
-from intent.frontend.semantics import ShapeRelation
 from intent.frontend.mlir import EmittedOperation
 from intent.frontend.mlir import RegionState
 from intent.frontend.semantics import ScalarType
@@ -43,7 +36,6 @@ from intent.language import index as intent_index
 from intent.frontend.semantics import EffectKind
 from intent.frontend.semantics import ResourceKind
 from intent.frontend.semantics import RegionType
-from intent.frontend.semantics import RecordType
 
 from ...diagnostics.errors import FrontendError
 from .model import ConstexprBinding
@@ -54,6 +46,10 @@ from .model import ShapeDimension
 from .model import ShapeValue
 from .model import StaticTuple
 from ...source.unit import SourceUnit
+from ..scope import lowering_scope
+from ..shape_construction import ShapeBuilder
+from ..products import build_product, project_product, same_product_type
+from ..shapes import ShapeAnalysis
 
 if TYPE_CHECKING:
     from ...compilation.compiler import FrontendCompiler
@@ -83,21 +79,9 @@ class FunctionLowerer:
         self.call_arguments: dict[ast.AST, Expression] = {}
         self.current_block = function.body.blocks[0]
         self.loop_stack: list[LoopContext] = []
-        self.view_kinds: dict[MlirValue, ViewKind] = {}
         self.inline_helpers: list[InlineHelperFrame] = []
         self.ragged_mappings: dict[MlirValue, MlirValue] = {}
-        self.iteration_shapes: dict[MlirValue, tuple[object, ...]] = {}
-        self.iteration_bounds: dict[MlirValue, tuple[MlirValue, MlirValue]] = {}
-        self.dimension_values: dict[MlirValue, object] = {}
-        self.zero_based_domain_extents: dict[MlirValue, object] = {}
-        self.dimension_origins: dict[object, list[ShapeDimension]] = {}
-        self.value_blocks: dict[MlirValue, BlockState] = {}
-        self.operation_blocks: dict[int, BlockState] = {}
-        self.region_parent_blocks: dict[RegionState, BlockState] = {}
-        self._integer_operations: dict[tuple[object, ...], EmittedOperation] = {}
-        self._integer_shape_terms: dict[MlirValue, tuple[frozenset, int]] = {}
-        self._integer_shape_dimensions: dict[tuple, object] = {}
-        self._dynamic_dimension_counter = 0
+        self.shapes = ShapeAnalysis(compiler.builder)
         self._initialize_parameters(constexpr_values)
 
     def _initialize_parameters(self, constexpr_values: dict[str, object]) -> None:
@@ -108,9 +92,6 @@ class FunctionLowerer:
                 self.environment[name] = ConstexprBinding(constexpr_values[name], value)
             else:
                 self.environment[name] = value
-            if parameter.spec.view_kind is not None:
-                self.view_kinds[value] = parameter.spec.view_kind
-            self.register_value_shape(value)
 
     def lower(self) -> None:
         self.lower_statements(self.source.function.body)
@@ -127,40 +108,24 @@ class FunctionLowerer:
     ) -> tuple[MlirValue, ...]:
         if len(parameters) != len(arguments):
             self.error(source.function, "helper argument count does not match call")
-        saved_definition = self.definition
-        saved_source = self.source
-        saved_environment = self.environment
-        saved_loop_stack = self.loop_stack
-        entry_block = self.current_block
-        frame = InlineHelperFrame(entry_block)
-        self.definition = definition
-        self.source = source
-        self.environment = {
-            parameter.name: argument
-            for parameter, argument in zip(parameters, arguments)
-        }
-        self.loop_stack = []
-        self.inline_helpers.append(frame)
-        from .statements import normalize_helper_returns
+        frame = InlineHelperFrame(self.current_block)
+        with lowering_scope(
+            self, definition=definition, source=source,
+            environment={parameter.name: argument for parameter, argument in zip(parameters, arguments)},
+            loop_stack=[], inline_helpers=[*self.inline_helpers, frame],
+            current_block=self.current_block,
+        ):
+            from .statements import normalize_helper_returns
 
-        body = normalize_helper_returns(self, source.function)
-        if body is source.function.body:
-            self.lower_statements(body)
-        else:
-            self.lower_statements(body[:-1])
-            if body[-1].value.id not in self.environment:
-                self.error(source.function, "@intent.fn must return a value on every runtime branch")
-            self.lower_statements(body[-1:])
-        if frame.returned is None:
-            frame.returned = ()
-        results = frame.returned
-        self.inline_helpers.pop()
-        self.definition = saved_definition
-        self.source = saved_source
-        self.environment = saved_environment
-        self.loop_stack = saved_loop_stack
-        self.current_block = entry_block
-        return results
+            body = normalize_helper_returns(self, source.function)
+            if body is source.function.body:
+                self.lower_statements(body)
+            else:
+                self.lower_statements(body[:-1])
+                if body[-1].value.id not in self.environment:
+                    self.error(source.function, "@intent.fn must return a value on every runtime branch")
+                self.lower_statements(body[-1:])
+            return frame.returned if frame.returned is not None else ()
 
     def lower_statements(self, statements: list[ast.stmt]) -> None:
         from .statements import lower_statement
@@ -191,27 +156,12 @@ class FunctionLowerer:
         effects: tuple[Effect, ...] = (),
         result_names: tuple[str | None, ...] = (),
     ) -> EmittedOperation:
-        key = None
-        if (
-            opcode in (OperationKind.CONSTANT, OperationKind.DIM, OperationKind.BINARY)
-            and len(result_types) == 1
-            and isinstance(result_types[0], ScalarType)
-            and result_types[0].dtype.category in (
-                DTypeCategory.INDEX,
-                DTypeCategory.SIGNED_INTEGER,
-                DTypeCategory.UNSIGNED_INTEGER,
-            )
-            and not effects
-            and not regions
-            and not self.is_terminated(self.current_block)
-        ):
-            # Share exact integer expressions within their defining block.
-            # This preserves shape SSA identity without algebraic reassociation
-            # or commoning memory reads and ordered effects.
-            key = (self.current_block, opcode, operands, result_types,
-                   tuple(sorted((attributes or {}).items())))
-            if key in self._integer_operations:
-                return self._integer_operations[key]
+        key = self.shapes.integer_key(
+            self.current_block, opcode, operands, result_types, attributes, regions, effects,
+        )
+        existing = self.shapes.existing_operation(key)
+        if existing is not None:
+            return existing
         operation = self.compiler.builder.emit(
             self.current_block,
             opcode,
@@ -223,95 +173,7 @@ class FunctionLowerer:
             effects=effects,
             result_names=result_names,
         )
-        if key is not None:
-            self._integer_operations[key] = operation
-            result = operation.results[0]
-            properties = attributes or {}
-            if opcode is OperationKind.CONSTANT:
-                self._integer_shape_terms[result] = (frozenset(), properties["value"])
-            elif opcode is OperationKind.DIM:
-                self._integer_shape_terms[result] = (
-                    frozenset({(("dimension", properties["dimension"]), 1)}), 0
-                )
-            elif properties.get("operator_kind") in (
-                BinaryOperator.ADD, BinaryOperator.SUBTRACT
-            ):
-                terms = {}
-                constant = 0
-                for index, operand in enumerate(operands):
-                    sign = -1 if index == 1 and properties["operator_kind"] is BinaryOperator.SUBTRACT else 1
-                    nested, value = (frozenset({(("value", operand), 1)}), 0)
-                    if operand.type == result.type:
-                        nested, value = self._integer_shape_terms.get(operand, (nested, value))
-                    constant += sign * value
-                    for atom, coefficient in nested:
-                        terms[atom] = terms.get(atom, 0) + sign * coefficient
-                self._integer_shape_terms[result] = (
-                    frozenset((atom, coefficient) for atom, coefficient in terms.items() if coefficient),
-                    constant,
-                )
-            elif properties.get("operator_kind") is BinaryOperator.MULTIPLY:
-                for factor, value in (operands, tuple(reversed(operands))):
-                    factor_terms = self._integer_shape_terms.get(factor)
-                    if factor.type != result.type or factor_terms is None or factor_terms[0]:
-                        continue
-                    bounds = self.integer_expression_bounds(value)
-                    if bounds is None:
-                        continue
-                    scale = factor_terms[1]
-                    lower, upper = sorted(bound * scale for bound in bounds)
-                    dtype = result.type.dtype
-                    signed = dtype.category in (DTypeCategory.SIGNED_INTEGER, DTypeCategory.INDEX)
-                    minimum = -(1 << (dtype.bits - 1)) if signed else 0
-                    maximum = (1 << (dtype.bits - int(signed))) - 1
-                    if not minimum <= lower <= upper <= maximum:
-                        continue
-                    nested, constant = (frozenset({(("value", value), 1)}), 0)
-                    if value.type == result.type:
-                        nested, constant = self._integer_shape_terms.get(value, (nested, constant))
-                    self._integer_shape_terms[result] = (
-                        frozenset((atom, coefficient * scale) for atom, coefficient in nested
-                                  if coefficient * scale),
-                        constant * scale,
-                    )
-                    break
-                if result not in self._integer_shape_terms and all(
-                    operand.type == result.type for operand in operands
-                ):
-                    # Retain multiplication factors for shape equality without
-                    # rewriting integer SSA or crossing a dtype conversion.
-                    factors = {}
-                    coefficient = 1
-                    for operand in operands:
-                        terms = self._integer_shape_terms.get(operand)
-                        if terms is None:
-                            break
-                        atoms, constant = terms
-                        if not atoms:
-                            coefficient *= constant
-                            continue
-                        if constant or len(atoms) != 1:
-                            break
-                        (atom, scale), = atoms
-                        coefficient *= scale
-                        product = atom[1] if atom[0] == "product" else ((atom, 1),)
-                        for factor, power in product:
-                            factors[factor] = factors.get(factor, 0) + power
-                    else:
-                        if not factors or coefficient == 0:
-                            terms = (frozenset(), coefficient)
-                        else:
-                            atom = ("product", frozenset(factors.items()))
-                            if len(factors) == 1:
-                                factor, power = next(iter(factors.items()))
-                                if power == 1:
-                                    atom = factor
-                            terms = (frozenset({(atom, coefficient)}), 0)
-                        self._integer_shape_terms[result] = terms
-        self.operation_blocks[operation.id] = self.current_block
-        for result in operation.results:
-            self.value_blocks[result] = self.current_block
-            self.register_value_shape(result)
+        self.shapes.record_operation(key, operation)
         return operation
 
     def make_region(
@@ -321,11 +183,8 @@ class FunctionLowerer:
         argument_names: tuple[str | None, ...] = (),
     ) -> RegionState:
         region = self.compiler.builder.region(
-            location, argument_types, argument_names
+            location, argument_types, argument_names, parent_block=self.current_block
         )
-        self.region_parent_blocks[region] = self.current_block
-        for argument in region.blocks[0].arguments:
-            self.register_value_shape(argument, region.blocks[0])
         return region
 
     def materialize(
@@ -375,92 +234,30 @@ class FunctionLowerer:
                 for index, element in enumerate(expression.elements)
             )
             result_type = TupleType(tuple(component.type for component in components))
-            return self.emit(
-                OperationKind.MAKE_TUPLE,
-                self.location(node),
-                operands=components,
-                result_types=(result_type,),
-            ).results[0]
+            return build_product(self, components, result_type, node)
         self.error(node, "expression is compile-time metadata, not an SSA value")
 
     def project_value_schema(
-        self,
-        value: MlirValue,
-        expected_type: ValueType,
-        node: ast.AST,
+        self, value: MlirValue, expected_type: ValueType, node: ast.AST,
     ) -> MlirValue:
         if self._same_emitted_type(value.type, expected_type):
             return value
         if not self.types_compatible_for_literal(value.type, expected_type):
             self.error(node, f"value type {value.type} does not match {expected_type}")
-        if isinstance(value.type, TensorType) and isinstance(expected_type, TensorType):
-            return self.broadcast_value(value, expected_type.shape, node)
-        if isinstance(value.type, TupleType) and isinstance(expected_type, TupleType):
-            components = []
-            for index, (actual, expected) in enumerate(
-                zip(value.type.components, expected_type.components)
-            ):
-                component = self.emit(
-                    OperationKind.EXTRACT,
-                    self.location(node),
-                    operands=(value,),
-                    result_types=(actual,),
-                    attributes={"field": index},
-                ).results[0]
-                components.append(self.project_value_schema(component, expected, node))
-            return self.emit(
-                OperationKind.MAKE_TUPLE,
-                self.location(node),
-                operands=tuple(components),
-                result_types=(expected_type,),
-            ).results[0]
-        if isinstance(value.type, RecordType) and isinstance(expected_type, RecordType):
-            fields = []
-            for index, ((_, actual), (_, expected)) in enumerate(
-                zip(value.type.fields, expected_type.fields)
-            ):
-                field = self.emit(
-                    OperationKind.EXTRACT,
-                    self.location(node),
-                    operands=(value,),
-                    result_types=(actual,),
-                    attributes={"field": index},
-                ).results[0]
-                fields.append(self.project_value_schema(field, expected, node))
-            return self.emit(
-                OperationKind.MAKE_RECORD,
-                self.location(node),
-                operands=tuple(fields),
-                result_types=(expected_type,),
-            ).results[0]
-        return value
+        return project_product(
+            self, value, expected_type, node,
+            lambda component, target: self.broadcast_value(component, target.shape, node)
+            if isinstance(target, TensorType) else component,
+        )
 
     def _same_emitted_type(self, actual: ValueType, expected: ValueType) -> bool:
-        if isinstance(actual, TensorType) and isinstance(expected, TensorType):
-            return (
-                actual.dtype == expected.dtype
-                and len(actual.shape) == len(expected.shape)
-                and all(
-                    self.compiler.builder.dimension_id(lhs)
-                    == self.compiler.builder.dimension_id(rhs)
-                    for lhs, rhs in zip(actual.shape, expected.shape)
-                )
-            )
-        if isinstance(actual, TupleType) and isinstance(expected, TupleType):
-            return len(actual.components) == len(expected.components) and all(
-                self._same_emitted_type(lhs, rhs)
-                for lhs, rhs in zip(actual.components, expected.components)
-            )
-        if isinstance(actual, RecordType) and isinstance(expected, RecordType):
-            return (
-                tuple(name for name, _ in actual.fields)
-                == tuple(name for name, _ in expected.fields)
-                and all(
-                    self._same_emitted_type(lhs, rhs)
-                    for (_, lhs), (_, rhs) in zip(actual.fields, expected.fields)
-                )
-            )
-        return actual == expected
+        def same_leaf(left, right):
+            if isinstance(left, TensorType) and isinstance(right, TensorType):
+                return (left.dtype == right.dtype and len(left.shape) == len(right.shape)
+                        and all(self.compiler.builder.dimension_id(a) == self.compiler.builder.dimension_id(b)
+                                for a, b in zip(left.shape, right.shape)))
+            return left == right
+        return same_product_type(actual, expected, same_leaf)
 
     def emit_literal(
         self,
@@ -520,98 +317,31 @@ class FunctionLowerer:
             },
         )
         result = operation.results[0]
-        self.dimension_values[result] = dimension.dimension
-        self._integer_shape_dimensions[(result.type, self._integer_shape_terms[result])] = dimension.dimension
-        self._remember_dimension_origin(dimension)
+        self.shapes.remember_dimension(result, dimension.dimension)
         return result
 
     def materialize_shape_extent(self, dimension: object, node: ast.AST) -> MlirValue:
-        candidates = self.dimension_origins.get(dimension, [])
-        origin = next(
-            (
-                candidate
-                for candidate in candidates
-                if self._block_dominates(
-                    self.value_blocks.get(candidate.source), self.current_block
-                )
-            ),
-            None,
-        )
-        if origin is not None:
-            return self.materialize_dimension(origin, node)
-        for value, known in self.dimension_values.items():
-            if known != dimension or not self._block_dominates(
-                self.value_blocks.get(value), self.current_block
-            ):
-                continue
-            if value.type == ScalarType(intent_index):
-                return value
+        source = self.shapes.dimension_source(dimension, self.current_block)
+        if isinstance(source, ShapeDimension):
+            return self.materialize_dimension(source, node)
+        if isinstance(source, MlirValue):
+            if source.type == ScalarType(intent_index):
+                return source
             return self.emit(
-                OperationKind.CAST, self.location(node), operands=(value,),
+                OperationKind.CAST, self.location(node), operands=(source,),
                 result_types=(ScalarType(intent_index),),
             ).results[0]
         self.error(node, f"dynamic shape extent {dimension} has no SSA source")
 
     def integer_shape_dimension(self, value: MlirValue, preferred: object = None) -> object:
-        dimension = self.dimension_values.get(value)
-        if dimension is not None:
-            return dimension
-        terms = self._integer_shape_terms.get(
-            value, (frozenset({(("value", value), 1)}), 0)
-        )
-        key = (value.type, terms)
-        dimension = self._integer_shape_dimensions.get(key)
-        if dimension is None and not terms[0] and isinstance(value.type, ScalarType):
-            dtype = value.type.dtype
-            modulus = 1 << dtype.bits
-            constant_extent = terms[1] % modulus
-            if dtype.category in (DTypeCategory.SIGNED_INTEGER, DTypeCategory.INDEX):
-                if constant_extent >= modulus // 2:
-                    constant_extent -= modulus
-            if constant_extent >= 0:
-                dimension = StaticDim(constant_extent)
-        if dimension is None:
-            dimension = self.zero_based_domain_extents.get(value)
-        if dimension is None:
-            dimension = preferred if preferred is not None else DynamicDim(f"value_{value.id}")
-        self._integer_shape_dimensions[key] = dimension
-        self.dimension_values[value] = dimension
-        return dimension
+        return self.shapes.shape_dimension(value, preferred)
 
     def integer_expression_bounds(self, value: MlirValue) -> tuple[int, int] | None:
-        if not isinstance(value.type, (ScalarType, LogicalIndexType)):
-            return None
-        dtype = value.type.dtype if isinstance(value.type, ScalarType) else intent_index
-        terms, constant = self._integer_shape_terms.get(
-            value, (frozenset({(("value", value), 1)}), 0)
-        )
-        lower = upper = constant
-        for (kind, atom), coefficient in terms:
-            if kind != "value" or not isinstance(atom.type, LogicalIndexType):
-                return None
-            domain = next((domain for domain in self.iteration_bounds
-                           if isinstance(domain.type, DomainType)
-                           and domain.type.origin_id == atom.type.source_id), None)
-            if domain is None:
-                return None
-            start, stop = self.iteration_bounds[domain]
-            start_bounds = self.integer_expression_bounds(start)
-            stop_bounds = self.integer_expression_bounds(stop)
-            if start_bounds is None or stop_bounds is None:
-                return None
-            begin, end = start_bounds[0], stop_bounds[1] - 1
-            if begin > end:
-                return None
-            lower += coefficient * (begin if coefficient > 0 else end)
-            upper += coefficient * (end if coefficient > 0 else begin)
-        signed = dtype.category in (DTypeCategory.SIGNED_INTEGER, DTypeCategory.INDEX)
-        minimum = -(1 << (dtype.bits - 1)) if signed else 0
-        maximum = (1 << (dtype.bits - int(signed))) - 1
-        return (lower, upper) if minimum <= lower <= upper <= maximum else None
+        return self.shapes.integer_bounds(value)
 
     def read_value(self, expression: Expression, node: ast.AST) -> MlirValue:
         value = self.materialize(expression, node)
-        if value not in self.view_kinds:
+        if value.view_kind is None:
             return value
         self.require_readable_view(value, node)
         if not isinstance(value.type, TensorType):
@@ -636,17 +366,17 @@ class FunctionLowerer:
         return operation.results[0]
 
     def require_readable_view(self, value: MlirValue, node: ast.AST) -> None:
-        kind = self.view_kinds.get(value)
+        kind = value.view_kind
         if kind not in (ViewKind.IN, ViewKind.INOUT, ViewKind.OUT):
             self.error(node, "view read requires an external-view ABI")
 
     def require_writable_view(self, value: MlirValue, node: ast.AST) -> None:
-        kind = self.view_kinds.get(value)
+        kind = value.view_kind
         if kind not in (ViewKind.OUT, ViewKind.INOUT):
             self.error(node, "view write requires Out or InOut ABI")
 
     def require_atomic_view(self, value: MlirValue, node: ast.AST) -> None:
-        if self.view_kinds.get(value) is not ViewKind.INOUT:
+        if value.view_kind is not ViewKind.INOUT:
             self.error(node, "external atomic target requires InOut ABI")
 
     def shape_value(self, value: MlirValue, node: ast.AST) -> ShapeValue:
@@ -708,32 +438,19 @@ class FunctionLowerer:
             for source, destination in zip(broadcasted, target_shape)
         ):
             self.error(node, "value cannot broadcast to the required result shape")
-        shape_operands: list[MlirValue] = []
-        shape_relation: list[ShapeExpr] = []
+        shape = ShapeBuilder(self.compiler.builder.dimension_id, first_operand_position=1)
         for dimension in target_shape:
-            if isinstance(dimension, StaticDim):
-                shape_relation.append(
-                    ShapeExpr(
-                        ShapeExprKind.STATIC,
-                        self.compiler.builder.dimension_id(dimension),
-                        dimension.value,
-                    )
-                )
-            else:
-                shape_relation.append(
-                    ShapeExpr(
-                        ShapeExprKind.SSA_EXTENT,
-                        self.compiler.builder.dimension_id(dimension),
-                        1 + len(shape_operands),
-                    )
-                )
-                shape_operands.append(self.materialize_shape_extent(dimension, node))
+            shape.append_extent(
+                dimension,
+                None if isinstance(dimension, StaticDim) else self.materialize_shape_extent(dimension, node),
+            )
+        lowered = shape.finish()
         operation = self.emit(
             OperationKind.BROADCAST,
             self.location(node),
-            operands=(value, *shape_operands),
-            result_types=(TensorType(dtype, target_shape),),
-            attributes={"shape": ShapeRelation(tuple(shape_relation))},
+            operands=(value, *lowered.operands),
+            result_types=(TensorType(dtype, lowered.dimensions),),
+            attributes={"shape": lowered.relation},
         )
         return operation.results[0]
 
@@ -790,23 +507,11 @@ class FunctionLowerer:
     def error(self, node: ast.AST, message: str) -> None:
         raise FrontendError(message, self.location(node))
 
-    def dynamic_shape_for_region(self, value: MlirValue) -> tuple[DynamicDim, ...]:
-        known = self.iteration_shapes.get(value)
-        if known is not None:
-            dimensions = tuple(known)
-        else:
-            rank = getattr(value.type, "rank", 1)
-            dimensions = tuple(
-                DynamicDim(f"region_{value.id}_{axis}") for axis in range(rank)
-            )
-        for axis, dimension in enumerate(dimensions):
-            self._remember_dimension_origin(ShapeDimension(dimension, value, axis))
-        return dimensions
+    def dynamic_shape_for_region(self, value: MlirValue) -> tuple[object, ...]:
+        return self.shapes.shape(value)
 
     def fresh_dynamic_dimension(self, role: str) -> DynamicDim:
-        identity = self._dynamic_dimension_counter
-        self._dynamic_dimension_counter += 1
-        return DynamicDim(f"{role}_{identity}")
+        return self.shapes.fresh_dimension(role)
 
     def logical_index_type(self, source: MlirValue, axis: int) -> LogicalIndexType:
         source_id = (
@@ -817,44 +522,3 @@ class FunctionLowerer:
         if source_id is None:
             raise TypeError("logical index source requires stable domain provenance")
         return LogicalIndexType(source_id, axis)
-
-    def register_value_shape(
-        self, value: MlirValue, block: BlockState | None = None
-    ) -> None:
-        self.value_blocks.setdefault(value, block or self.current_block)
-        value_type = value.type
-        if isinstance(value_type, TensorType):
-            shape = value_type.shape
-        elif isinstance(value_type, BufferType):
-            shape = value_type.shape
-        else:
-            return
-        for axis, dimension in enumerate(shape):
-            if not isinstance(dimension, StaticDim):
-                self._remember_dimension_origin(
-                    ShapeDimension(dimension, value, axis)
-                )
-
-    def _remember_dimension_origin(self, origin: ShapeDimension) -> None:
-        candidates = self.dimension_origins.setdefault(origin.dimension, [])
-        if all(candidate.source is not origin.source or candidate.axis != origin.axis
-               for candidate in candidates):
-            candidates.append(origin)
-
-    def _block_dominates(
-        self, candidate: BlockState | None, current: BlockState
-    ) -> bool:
-        block: BlockState | None = current
-        while block is not None:
-            if block is candidate:
-                return True
-            region = block.owner
-            owner = region.owner_operation if region is not None else None
-            block = (
-                self.operation_blocks.get(owner)
-                if owner is not None
-                else self.region_parent_blocks.get(region)
-                if region is not None
-                else None
-            )
-        return False

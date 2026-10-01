@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from ..scope import lowering_scope
+from ..products import extract_product
+
 import ast
 import operator
 from enum import Enum
@@ -121,15 +124,7 @@ def _lower_attribute(lowerer: object, node: ast.Attribute) -> Expression:
             if node.attr not in field_names:
                 lowerer.error(node, f"record has no field {node.attr!r}")
             field = field_names.index(node.attr)
-            field_type = base.type.fields[field][1]
-            operation = lowerer.emit(
-                OperationKind.EXTRACT,
-                lowerer.location(node),
-                operands=(base,),
-                result_types=(field_type,),
-                attributes={"field": field},
-            )
-            return operation.results[0]
+            return extract_product(lowerer, base, field, node)
         lowerer.error(node, f"SSA value has no source attribute {node.attr!r}")
     if isinstance(base, RaggedSpec):
         if node.attr == "outer":
@@ -364,12 +359,8 @@ def _lower_call(lowerer: object, node: ast.Call) -> Expression:
                 for argument in (*node.args, *(keyword.value for keyword in node.keywords))
                 for expression in (index_expressions(argument) if argument is index_argument else (argument,))
             }
-            previous = lowerer.call_arguments
-            lowerer.call_arguments = {**previous, **evaluated}
-            try:
+            with lowering_scope(lowerer, call_arguments={**lowerer.call_arguments, **evaluated}):
                 return lower_intrinsic(lowerer, callee.name, node)
-            finally:
-                lowerer.call_arguments = previous
         return lower_intrinsic(lowerer, callee.name, node)
     if isinstance(callee, HelperDefinition):
         keywords = {}

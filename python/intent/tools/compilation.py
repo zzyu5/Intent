@@ -64,36 +64,55 @@ def _files(directory: Path | None) -> dict[str, str]:
             if (directory / name).is_file()}
 
 
-def compile_request(program: str, kernel: str, target: str, *,
+def compile_request(program: str, kernel: str, target: str | None = None, *,
                     target_options: dict | None = None, constexprs: dict | None = None,
                     compiler: str | None = None, tuning_config: str | None = None,
-                    materialize: bool = False) -> dict:
+                    materialize: bool = False, stage: str = "provider") -> dict:
     """Compile an existing definition without invoking its kernel.
 
     Loading the Python module executes its ordinary top-level host code. Native
     JIT/tuning may remain deferred after materialization, depending on provider.
     """
     import intent
+    from intent.compiler.toolchain import CompilerStage
 
-    stage = "program_loading"
+    current_stage = "request"
     transcript = io.StringIO()
-    result = {"program": program, "kernel": kernel, "target": target}
+    result = {"program": program, "kernel": kernel, "target": target, "requested_stage": stage}
     try:
+        selected_stage = CompilerStage(stage)
+        if selected_stage is CompilerStage.KIR:
+            if target is not None or target_options or tuning_config is not None or materialize:
+                raise ValueError("KIR compilation does not accept target, target options, tuning or materialization")
+        elif target is None:
+            raise ValueError("shared/provider compilation requires a target")
+        if materialize and selected_stage is not CompilerStage.PROVIDER:
+            raise ValueError("materialization requires provider compilation")
+        current_stage = "program_loading"
         # User module prints must not corrupt JSON output or the MCP transport.
         with redirect_stdout(transcript), _definition(program, kernel) as definition:
             result["definition"] = asdict(definition.source)
-            stage = "target_options"
-            selected = make_target(target, dict(target_options or {}))
-            stage = "compilation"
-            generated = intent.generate(definition, target=selected, compiler=compiler,
-                                        constexprs=constexprs, tuning_config=tuning_config)
-            result.update(cache_directory=str(generated.cache_directory),
-                          files=_files(generated.cache_directory), metadata=generated.metadata)
-            if materialize:
-                stage = "generated_source_materialization"
-                generated.materialize()
-            result.update(status="materialized" if materialize else "generated",
-                          tool_invoked_kernel=False)
+            selected = None
+            if target is not None:
+                current_stage = "target_options"
+                selected = make_target(target, dict(target_options or {}))
+            current_stage = "compilation"
+            if selected_stage is CompilerStage.PROVIDER:
+                generated = intent.generate(definition, target=selected, compiler=compiler,
+                                            constexprs=constexprs, tuning_config=tuning_config)
+                result.update(cache_directory=str(generated.cache_directory),
+                              files=_files(generated.cache_directory), metadata=generated.metadata)
+                if materialize:
+                    current_stage = "generated_source_materialization"
+                    generated.materialize()
+                result.update(status="materialized" if materialize else "generated")
+            else:
+                lowered = intent.compile_ir(definition, stage=selected_stage.value,
+                                            target=selected, compiler=compiler,
+                                            constexprs=constexprs, tuning_config=tuning_config)
+                result.update(status="lowered", cache_directory=str(lowered.cache_directory),
+                              files=_files(lowered.cache_directory))
+            result["tool_invoked_kernel"] = False
     except (Exception, SystemExit) as error:
         directory = getattr(error, "cache_directory", None)
         if directory is not None:
@@ -110,7 +129,7 @@ def compile_request(program: str, kernel: str, target: str, *,
                 diagnostic["frontend"] = asdict(detail)
                 break
             cause = cause.__cause__
-        result.update(status="error", stage=getattr(error, "stage", stage),
+        result.update(status="error", stage=getattr(error, "stage", current_stage),
                       diagnostic=diagnostic, tool_invoked_kernel=False)
     if transcript.getvalue():
         result["program_stdout"] = transcript.getvalue()
@@ -118,7 +137,7 @@ def compile_request(program: str, kernel: str, target: str, *,
 
 
 def doctor(target: str, *, target_options: dict | None = None, compiler: str | None = None) -> dict:
-    from intent.compiler.toolchain import _resolve_compiler
+    from intent.compiler.toolchain import compiler_info
     from intent.targets.base import ResolvedTarget
 
     description = backend(target)
@@ -143,7 +162,17 @@ def doctor(target: str, *, target_options: dict | None = None, compiler: str | N
         module = importlib.import_module(name)
         return {"path": getattr(module, "__file__", None), "version": str(getattr(module, "__version__", "not declared"))}
 
-    executable = check("intent compiler", lambda: str(_resolve_compiler(compiler, "Intent compiler")))
+    def inspect_compiler():
+        facts = compiler_info(compiler)
+        if target not in facts["providers"]:
+            raise NotImplementedError(
+                f"The selected Intent compiler does not contain {target!r}; "
+                f"built providers: {', '.join(facts['providers'])}"
+            )
+        return facts
+
+    information = check("intent compiler", inspect_compiler)
+    executable = information["executable"] if information is not None else None
     if executable is not None and target != "bangc":
         def profiles():
             names = ("shared", target) if target in {"triton", "cutile"} else (target,)
@@ -153,7 +182,6 @@ def doctor(target: str, *, target_options: dict | None = None, compiler: str | N
                     raise FileNotFoundError(f"Compiler profile is missing: {path}")
             return [str(path) for path in paths]
         check("compiler profiles", profiles)
-    check("MLIR Python bindings", lambda: python_module("mlir.ir"))
     for name in description["modules"]:
         check(name, lambda name=name: python_module(name))
     if target == "cutile":

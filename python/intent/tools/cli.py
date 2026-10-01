@@ -27,7 +27,7 @@ def main() -> None:
     for name, help_text in (("doctor", "Check selected backend dependencies and target facts"),
                             ("compile", "Compile a Python file:kernel or importable.module:kernel")):
         command = commands.add_parser(name, help=help_text)
-        command.add_argument("--target", choices=BACKENDS, required=True)
+        command.add_argument("--target", choices=BACKENDS, required=name == "doctor")
         command.add_argument("--target-option", action="append", default=[], metavar="NAME=JSON")
         command.add_argument("--compiler", help="Intent compiler override")
         command.add_argument("--json", action="store_true", help="Write a structured result")
@@ -35,6 +35,8 @@ def main() -> None:
     compile_parser.add_argument("program", metavar="PROGRAM:KERNEL")
     compile_parser.add_argument("--constexpr", action="append", default=[], metavar="NAME=JSON")
     compile_parser.add_argument("--tuning-config")
+    compile_parser.add_argument("--stage", choices=("kir", "shared", "provider"), default="provider",
+                                help="Stop at verified KIR, shared physical IR, or generated provider source")
     compile_parser.add_argument("--materialize", action="store_true", help="Also create the callable; never launch the kernel")
     arguments = parser.parse_args()
     options = _assignments(parser, arguments.target_option)
@@ -47,7 +49,7 @@ def main() -> None:
         result = compile_request(program, kernel, arguments.target, target_options=options,
                                  constexprs=_assignments(parser, arguments.constexpr),
                                  compiler=arguments.compiler, tuning_config=arguments.tuning_config,
-                                 materialize=arguments.materialize)
+                                 materialize=arguments.materialize, stage=arguments.stage)
     if arguments.json:
         print(json.dumps(result, indent=2))
     elif arguments.command == "doctor":
@@ -56,7 +58,8 @@ def main() -> None:
             print(f"  {check['name']}: {check['status']} — {check.get('message', check.get('detail'))}")
         print(result["scope"])
     else:
-        print(f"{arguments.program}: {result['status']} for {arguments.target}")
+        scope = arguments.target or arguments.stage
+        print(f"{arguments.program}: {result['status']} for {scope}")
         if "diagnostic" in result:
             print(f"Stage: {result['stage']}\n{result['diagnostic']['message']}", file=sys.stderr)
         for name, path in result.get("files", {}).items():

@@ -6,14 +6,15 @@ from .api import fn
 from .api import kernel
 from .compiler import CompilationStageError
 from .compiler import compile
+from .compiler import compile_ir
 from .compiler import compile_shared_gpu
-from .compiler import generate, GeneratedProgram
+from .compiler import generate, CompiledIR, GeneratedProgram
 from .diagnostics import DefinitionError
 from .diagnostics import IntentError
 from .diagnostics import LanguageUseError
 from .frontend import FrontendError
 from .frontend import lower_to_mlir
-from .runtime import CompiledArtifact
+from .runtime import CompiledArtifact, PreparedCall
 from .targets import CuTileTarget
 from .targets import TileLangTarget
 from .targets import TritonTarget
@@ -34,10 +35,13 @@ __all__ = [
     "fn",
     "kernel",
     "compile",
+    "compile_ir",
     "compile_shared_gpu",
     "generate",
     "GeneratedProgram",
+    "CompiledIR",
     "CompiledArtifact",
+    "PreparedCall",
     "CuTileTarget",
     "TileLangTarget",
     "TritonTarget",

@@ -276,7 +276,7 @@ def validate_program(path: Path, *, language: str, generated_source: bool = Fals
                     item.name in torch_result_types for item in node.names)
                 if not result_types and (node.module != "torch" or any(item.name not in torch_api for item in node.names)):
                     raise ValueError("Torch imports are limited to allocation, tensor metadata and dtype APIs")
-            if node.module == "intent" and any(item.name in {"compile", "generate", "compile_shared_gpu"} for item in node.names):
+            if node.module == "intent" and any(item.name in {"compile", "compile_ir", "generate", "compile_shared_gpu"} for item in node.names):
                 raise ValueError("compiler calls belong to context.compile(), not the candidate host")
         else:
             names = []
@@ -300,7 +300,7 @@ def validate_program(path: Path, *, language: str, generated_source: bool = Fals
         }:
             raise ValueError(f"candidate may not use {node.func.id}()")
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if isinstance(node.func.value, ast.Name) and node.func.value.id in intent_names and node.func.attr in {"compile", "generate", "compile_shared_gpu"}:
+            if isinstance(node.func.value, ast.Name) and node.func.value.id in intent_names and node.func.attr in {"compile", "compile_ir", "generate", "compile_shared_gpu"}:
                 raise ValueError("compiler calls belong to context.compile(), not the candidate host")
 
 

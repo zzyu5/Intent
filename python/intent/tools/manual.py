@@ -9,7 +9,7 @@ import math
 from pathlib import Path
 import re
 import subprocess
-from typing import Literal, get_origin
+from typing import Literal, Protocol, get_origin
 
 
 def _sections(text: str) -> list[tuple[int, int, int, str]]:
@@ -87,19 +87,24 @@ def _corpus(documents_root: Path, package: Path, revision: str) -> dict:
     }
     exports.update({alias: exports[canonical] for alias, canonical in target_aliases.items()})
     attribute_owners = {}
+    class_members = {}
     for name, value in list(exports.items()):
         if inspect.isclass(value):
             members = {member: method for base in reversed(value.__mro__)
                        for member, method in vars(base).items()}
-            exports.update({f"{name}.{member}": method for member, method in members.items()
-                            if (inspect.isfunction(method) or isinstance(method, property))
-                            and (not member.startswith("_") or member == "__call__")})
+            declared = {member: method for member, method in members.items()
+                        if (inspect.isfunction(method) or isinstance(method, property))
+                        and (not member.startswith("_") or member == "__call__")}
+            exports.update({f"{name}.{member}": method for member, method in declared.items()})
+            class_members[name] = list(declared)
             if is_dataclass(value):
                 for declaration in fields(value):
                     if not declaration.name.startswith("_"):
                         qualified = f"{name}.{declaration.name}"
                         exports[qualified] = declaration
                         attribute_owners[qualified] = value
+                        if declaration.name not in class_members[name]:
+                            class_members[name].append(declaration.name)
         elif isinstance(value, QuantFormats):
             exports.update({f"{name}.{field.name}": getattr(value, field.name)
                             for field in fields(value) if not field.name.startswith("_")})
@@ -157,7 +162,10 @@ def _corpus(documents_root: Path, package: Path, revision: str) -> dict:
         elif isinstance(value, DType):
             kind = "dtype token"
         elif inspect.isclass(value):
-            kind = "annotation" if hasattr(value, "__class_getitem__") else "Python type"
+            if name.startswith("intent.") and Protocol in value.__mro__:
+                kind, signature = "host protocol", None
+            else:
+                kind = "annotation" if hasattr(value, "__class_getitem__") else "Python type"
             if value is language.Constexpr:
                 signature = "[value_type]"
             elif value in (language.In, language.Out, language.InOut):
@@ -178,7 +186,7 @@ def _corpus(documents_root: Path, package: Path, revision: str) -> dict:
             "name": name, "kind": kind, "signature": str(signature) if signature else None,
             "declaration": source, "sections": references,
             "canonical": name,
-            "members": list(value.members) if isinstance(value, IntrinsicNamespace) else [],
+            "members": list(value.members) if isinstance(value, IntrinsicNamespace) else class_members.get(name, []),
             "docstring": docstring,
             "availability": "public declaration; backend support and performance are not implied",
         }
@@ -333,6 +341,7 @@ class Manual:
         return {"status": "declared", "revision": self.corpus["revision"],
                 **{key: value for key, value in entry.items() if key != "sections"},
                 "signature_note": "Instance attribute; read it without calling it." if entry["kind"] in {"host property", "host attribute"}
+                else "Returned interface, not a constructor. Query its listed methods with api(name=...)." if entry["kind"] == "host protocol"
                 else None if entry["signature"] else "No inspectable signature is declared; consult the linked rules, not a guessed signature.",
                 "rules": [{**{field: rule[field]
                               for field in ("id", "title", "source", "line")},

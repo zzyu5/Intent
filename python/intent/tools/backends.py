@@ -1,9 +1,5 @@
 """Public setup descriptions; compilation still uses the existing Target API."""
 
-# Runtime requirements of the LLVM 20 Python bindings; build-only nanobind,
-# pybind11 and PyYAML remain with the upstream SDK build instructions.
-FRONTEND_REQUIREMENTS = ("numpy>=1.19.5,<=2.1.2", "ml_dtypes>=0.1.0,<=0.6.0")
-
 BACKENDS = {
     "triton": {
         "target": "TritonTarget", "modules": ("torch", "triton"),
@@ -26,7 +22,7 @@ BACKENDS = {
     "weft": {
         "target": "WeftTarget", "modules": (),
         "requirements": None, "torch": None, "torch_index": None,
-        "python_max": (3, 12), "toolchain": "Matching Weft source/build; public generation requires explicit vector_bits and workers",
+        "python_max": (3, 12), "toolchain": "An Intent compiler built with Weft; public generation requires explicit vector_bits and workers",
     },
     "bangc": {
         "target": "BangCTarget", "modules": (),

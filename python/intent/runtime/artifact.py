@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 
 BackendIRCollector = Callable[[object], dict[str, str]]
@@ -15,6 +15,27 @@ class ArtifactRuntime(Protocol):
     def run(self, *arguments: Any) -> object: ...
 
     def launch(self, *arguments: Any) -> object: ...
+
+
+@runtime_checkable
+class PreparedCall(Protocol):
+    """Invocation-owned arguments and outputs, using the provider's launch semantics.
+
+    result() returns output containers; it does not perform synchronization.
+    """
+
+    def launch(self) -> object:
+        """Execute with the bound arguments and the provider's synchronization semantics."""
+        ...
+
+    def result(self) -> object:
+        """Return the runtime's output containers without launching or synchronizing."""
+        ...
+
+
+@runtime_checkable
+class PreparedRuntime(Protocol):
+    def prepare_call(self, arguments: tuple, *, outputs: tuple | None = None) -> PreparedCall: ...
 
 
 class ParameterRole(IntEnum):
@@ -89,17 +110,19 @@ class CompiledArtifact:
             raise NotImplementedError("this runtime does not expose a typed invocation interface")
         return self.runtime.interface
 
-    def prepare(self, *arguments: Any, outputs: tuple | None = None):
-        """Bind GPU arguments and allocate invocation-owned outputs/workspace without launching the kernel.
+    def prepare(self, *arguments: Any, outputs: tuple | None = None) -> PreparedCall:
+        """Bind arguments and allocate invocation-owned outputs/workspace without executing.
 
         The returned call's launch performs any first-use JIT/tuning and execution.
-        Prepare again when arguments or their shape/stride metadata change.
+        GPU calls use the provider's current stream; CPU calls complete their join;
+        BANG C calls synchronize their queue. result() only returns output containers.
+        Explicit outputs replace declared Out buffers, in declaration order.
+        Prepare again when arguments or their shape/stride metadata change, and keep
+        their allocations alive while using the prepared call.
         """
-        from .gpu.program import GPUProgram
-
-        if not isinstance(self.runtime, GPUProgram):
-            raise NotImplementedError("prepared tensor calls require the GPU runtime interface")
-        return self._invoke(lambda *args: self.runtime.prepare(*args, outputs=outputs), arguments)
+        if not isinstance(self.runtime, PreparedRuntime):
+            raise NotImplementedError("this runtime does not expose prepared calls")
+        return self._invoke(lambda *args: self.runtime.prepare_call(args, outputs=outputs), arguments)
 
     def as_torch_op(self, name: str):
         """Return a PyTorch CustomOpDef for this allocating GPU call.

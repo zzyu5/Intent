@@ -10,6 +10,7 @@ from intent.language.annotations import ViewKind
 from ..diagnostics.locations import Location
 from ..semantics.effects import Effect
 from ..semantics.operations import OperationKind
+from ..semantics.operations import TERMINATORS
 from ..semantics.types import ValueType
 
 
@@ -57,8 +58,9 @@ class MlirValue:
     id: int
     type: ValueType
     location: Location
+    owner: BlockState | EmittedOperation
     name_hint: str | None = None
-    view_access: str | None = None
+    view_kind: ViewKind | None = None
     view_constraints: ViewConstraints | None = None
 
     def __post_init__(self) -> None:
@@ -68,6 +70,8 @@ class MlirValue:
             raise TypeError("MLIR value requires a frontend ValueType")
         if not isinstance(self.location, Location):
             raise TypeError("MLIR value location must be a Location")
+        if self.view_kind is not None and not isinstance(self.view_kind, ViewKind):
+            raise TypeError("view kind must be a ViewKind value")
         if self.view_constraints is not None and not isinstance(
             self.view_constraints, ViewConstraints
         ):
@@ -75,6 +79,10 @@ class MlirValue:
 
     def __hash__(self) -> int:
         return self.id
+
+    @property
+    def block(self) -> BlockState:
+        return self.owner if isinstance(self.owner, BlockState) else self.owner.block
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,7 +95,22 @@ class ParameterState:
 class RegionState:
     location: Location
     blocks: list[BlockState] = field(default_factory=list)
-    owner_operation: int | None = None
+    owner_operation: EmittedOperation | None = None
+    _parent_block: BlockState | None = None
+
+    @property
+    def parent_block(self) -> BlockState | None:
+        if self.owner_operation is not None:
+            return self.owner_operation.block
+        return self._parent_block
+
+    def attach(self, operation: EmittedOperation) -> None:
+        if self.owner_operation is not None:
+            raise ValueError("region is already attached to an operation")
+        if self._parent_block is not None and self._parent_block is not operation.block:
+            raise ValueError("region must be attached in its construction scope")
+        self.owner_operation = operation
+        self._parent_block = None
 
     @property
     def effects(self) -> tuple[Effect, ...]:
@@ -98,18 +121,35 @@ class RegionState:
 class BlockState:
     location: Location
     arguments: list[MlirValue] = field(default_factory=list)
-    lines: list[str] = field(default_factory=list)
-    effects: list[Effect] = field(default_factory=list)
-    effect_markers: list[bool] = field(default_factory=list)
-    last_operation: OperationKind | None = None
+    operations: list[EmittedOperation] = field(default_factory=list)
     owner: RegionState | None = None
 
     @property
     def operation_count(self) -> int:
-        return len(self.effect_markers)
+        return len(self.operations)
+
+    @property
+    def last_operation(self) -> OperationKind | None:
+        return self.operations[-1].kind if self.operations else None
+
+    @property
+    def terminated(self) -> bool:
+        return self.last_operation in TERMINATORS
+
+    @property
+    def effects(self) -> tuple[Effect, ...]:
+        return tuple(effect for op in self.operations for effect in op.all_effects)
 
     def has_effect_since(self, operation_count: int) -> bool:
-        return any(self.effect_markers[operation_count:])
+        return any(operation.has_effects for operation in self.operations[operation_count:])
+
+    def dominates(self, block: BlockState) -> bool:
+        """Lexical visibility, including regions still under construction."""
+        while block is not self:
+            block = block.owner.parent_block if block.owner is not None else None
+            if block is None:
+                return False
+        return True
 
 
 @dataclass(eq=False, slots=True)
@@ -123,7 +163,27 @@ class FunctionState:
     attributes: dict[str, object] = field(default_factory=dict)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(eq=False, slots=True)
 class EmittedOperation:
     id: int
+    kind: OperationKind
+    location: Location
+    block: BlockState
+    operands: tuple[MlirValue, ...]
     results: tuple[MlirValue, ...]
+    attributes: dict[str, object]
+    regions: tuple[RegionState, ...]
+    effects: tuple[Effect, ...]
+
+    @property
+    def all_effects(self) -> tuple[Effect, ...]:
+        return self.effects + tuple(effect for region in self.regions for effect in region.effects)
+
+    @property
+    def has_effects(self) -> bool:
+        return bool(self.effects) or any(
+            operation.has_effects
+            for region in self.regions
+            for block in region.blocks
+            for operation in block.operations
+        )

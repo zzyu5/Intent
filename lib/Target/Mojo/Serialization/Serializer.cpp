@@ -482,7 +482,9 @@ private:
         lanes.push_back(name(lane < lhsSize ? op.getV1() : op.getV2()) + "[" + std::to_string(lane < lhsSize ? lane : lane - lhsSize) + "]");
       assign(op.getResult(), valueType(op.getType()) + "(" + join(lanes) + ")");
     } else if (auto op = dyn_cast<vector::ExtractElementOp>(operation)) {
-      assign(op.getResult(), name(op.getVector()) + "[" + name(op.getPosition()) + "]");
+      std::string expression = name(op.getVector()) + "[" + name(op.getPosition()) + "]";
+      if (op.getResult().getType().isIndex()) expression = "Int(" + expression + ")";
+      assign(op.getResult(), expression);
     } else if (auto op = dyn_cast<memref::AllocaOp>(operation)) {
       return allocation(operation, op.getResult(), op.getDynamicSizes(), true);
     } else if (auto op = dyn_cast<memref::AllocOp>(operation)) {

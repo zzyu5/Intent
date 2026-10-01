@@ -8,7 +8,8 @@ import statistics
 import torch
 
 from .compilation import SCALAR_CTYPES, compile_library
-from ..cpu import CPUInterface, ViewFacts, ViewParameter
+from ..cpu import check_alias
+from ..native import NativeInterface, NativePreparedRuntime, ViewFacts, ViewParameter
 
 
 _winners: dict[tuple[object, ...], dict[tuple[object, ...], int]] = {}
@@ -76,12 +77,12 @@ class NativeCall:
         return self.outputs[0] if len(self.outputs) == 1 else self.outputs
 
 
-class NativeProgram:
+class NativeProgram(NativePreparedRuntime):
     def __init__(self, source: str, metadata: dict[str, object], target) -> None:
         self.parameters = metadata["parameters"]
-        self.interface = CPUInterface.read(self.parameters)
-        self._view_types = tuple(
-            (_DTYPES[parameter.dtype], tuple(self.parameters[parameter.position]["strides"]))
+        self.interface = NativeInterface.read(self.parameters)
+        self._view_dtypes = tuple(
+            _DTYPES[parameter.dtype]
             if isinstance(parameter, ViewParameter) else None
             for parameter in self.interface.parameters
         )
@@ -91,15 +92,12 @@ class NativeProgram:
             raise NotImplementedError("Mojo runtime requires declared disjoint-output entry legality")
         self._binders = self.interface.binders(
             observe_view=type(self)._view, allocate_output=type(self)._allocate_output,
-            scalar_key_values=False, view_dtype_before_offset=False,
+            check_alias=check_alias,
+            view_key=lambda facts, group: (facts.shape, facts.strides, facts.offset, facts.dtype, group),
+            scalar_key=lambda parameter, value: parameter.dtype,
         )
         self.compilation = compile_library(source, metadata, target)
-        argument_types = []
-        for parameter in self.parameters:
-            if parameter["kind"] == "view":
-                argument_types.extend([ctypes.c_void_p, *([ctypes.c_int64] * (2 * len(parameter["shape"])))])
-            else:
-                argument_types.append(SCALAR_CTYPES[parameter["dtype"]])
+        argument_types = self.interface.argument_types(SCALAR_CTYPES.__getitem__)
         self.functions = []
         self.measurements = []
         for candidate, compilation in zip(self.candidates, self.compilation.libraries):
@@ -115,7 +113,7 @@ class NativeProgram:
         self.timings = _candidate_timings.setdefault(self.compilation.identity, {})
 
     def _view(self, parameter: ViewParameter, tensor) -> ViewFacts:
-        dtype, stride_constraints = self._view_types[parameter.position]
+        dtype = self._view_dtypes[parameter.position]
         if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu" or tensor.dtype != dtype:
             raise ValueError(f"{parameter.name} must be a CPU {parameter.dtype} tensor")
         if tensor.numel() == 0:
@@ -129,9 +127,6 @@ class NativeProgram:
                 if stride != expected_stride:
                     raise NotImplementedError("Mojo CPU writable views require canonical contiguous strides")
                 expected_stride *= extent
-        for constraint, stride in zip(stride_constraints, strides):
-            if constraint is not None and constraint != stride:
-                raise ValueError(f"{parameter.name} violates an author stride constraint")
         pointer = tensor.data_ptr()
         element_size = tensor.element_size()
         lower, upper = 0, 1
@@ -144,15 +139,14 @@ class NativeProgram:
                          pointer + upper * element_size)
 
     def _allocate_output(self, parameter: ViewParameter, shape: tuple[int, ...]) -> tuple[torch.Tensor, ViewFacts]:
-        dtype, stride_constraints = self._view_types[parameter.position]
+        dtype = self._view_dtypes[parameter.position]
         tensor = torch.empty(shape, dtype=dtype, device="cpu")
         elements = prod(shape)
         if elements == 0:
             raise NotImplementedError("Mojo CPU empty-storage pointer ABI is not implemented")
         strides = tensor.stride()
-        for constraint, stride in zip(stride_constraints, strides):
-            if constraint is not None and constraint != stride:
-                raise ValueError(f"{parameter.name} violates an author stride constraint")
+        if parameter.stride_mismatch(strides):
+            raise ValueError(f"{parameter.name} violates an author stride constraint")
         pointer = tensor.data_ptr()
         # This invocation owns the new contiguous allocation. Shape, dtype,
         # zero offset and storage identity follow from the factory contract.

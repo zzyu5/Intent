@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ..products import build_product
+
 import ast
 from typing import TYPE_CHECKING
 
@@ -199,13 +201,7 @@ def _record(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         names.append(keyword.arg)
         values.append(lowerer.read_value(lowerer.lower_expression(keyword.value), keyword.value))
     result_type = RecordType(tuple((name, value.type) for name, value in zip(names, values)))
-    operation = lowerer.emit(
-        OperationKind.MAKE_RECORD,
-        lowerer.location(node),
-        operands=tuple(values),
-        result_types=(result_type,),
-    )
-    return operation.results[0]
+    return build_product(lowerer, values, result_type, node)
 
 
 def _cast(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:

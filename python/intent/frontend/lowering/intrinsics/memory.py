@@ -118,7 +118,7 @@ def _gather(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     fill = lowerer.broadcast_value(fill, result_shape, node)
     operands = (source, *lowered.operands, valid, fill)
     effects = ()
-    if source in lowerer.view_kinds:
+    if source.view_kind is not None:
         lowerer.require_readable_view(source, node)
         effects = (Effect(EffectKind.READ, ResourceKind.EXTERNAL_VIEW, source),)
     attributes: dict[str, object] = {
@@ -127,7 +127,7 @@ def _gather(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         "fill_operand_index": len(operands) - 1,
     }
     operation = lowerer.emit(
-        OperationKind.VIEW_LOAD if source in lowerer.view_kinds else OperationKind.GATHER,
+        OperationKind.VIEW_LOAD if source.view_kind is not None else OperationKind.GATHER,
         lowerer.location(node),
         operands=operands,
         result_types=(lowerer.value_result_type(source.type.dtype, result_shape),),
@@ -148,7 +148,7 @@ def _scatter(lowerer: FunctionLowerer, node: ast.Call, *, reduce: bool) -> Stati
     destination = lowerer.materialize(
         lowerer.lower_expression(bound["destination"]), bound["destination"]
     )
-    if not isinstance(destination.type, TensorType) or destination not in lowerer.view_kinds:
+    if not isinstance(destination.type, TensorType) or destination.view_kind is None:
         lowerer.error(node, "scatter destination must be an external output/InOut view")
     lowerer.require_writable_view(destination, node)
     lowered = lower_index(lowerer, destination, bound["index"], first_operand_position=1)
@@ -252,7 +252,7 @@ def _store(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
         opcode = OperationKind.BUFFER_STORE
         effect = Effect(EffectKind.WRITE, ResourceKind.LOGICAL_BUFFER, target)
     else:
-        if target not in lowerer.view_kinds:
+        if target.view_kind is None:
             lowerer.error(node, "pure tensor SSA cannot be mutated")
         lowerer.require_writable_view(target, node)
         opcode = OperationKind.VIEW_STORE
@@ -283,7 +283,7 @@ def _mutable_load(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         opcode = OperationKind.BUFFER_LOAD
         resource = ResourceKind.LOGICAL_BUFFER
     else:
-        if target not in lowerer.view_kinds:
+        if target.view_kind is None:
             lowerer.error(node, "mutable_load tensor target must be an external view")
         lowerer.require_readable_view(target, node)
         opcode = OperationKind.VIEW_LOAD

@@ -71,6 +71,9 @@ class GPUProgram:
             invocation = self.interface.bind(arguments, outputs=outputs, explicit_outputs=explicit_outputs)
         return PreparedCall(self, invocation)
 
+    def prepare_call(self, arguments: tuple, *, outputs: tuple | None = None) -> PreparedCall:
+        return self.prepare(*arguments, outputs=outputs)
+
     def run(self, *arguments):
         call = self.prepare(*arguments)
         call.launch()

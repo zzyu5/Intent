@@ -3,11 +3,11 @@ from __future__ import annotations
 import ast
 
 from intent.frontend.semantics import BinaryOperator, OperationKind
-from intent.frontend.semantics import ScalarType, ShapeExpr, ShapeExprKind, ShapeRelation
 from intent.frontend.semantics import StaticDim, TensorType, broadcast_shape
 from intent.language import DTypeCategory
 
 from ..ast.model import ShapeDimension, SparseFormatSpec
+from ..shape_construction import ShapeBuilder
 from .common import bind_declared_call, require_dtype, require_static_bool, require_static_int
 from .structured import _scaled_format, emit_contract, emit_scaled_contract, emit_sparse_contract
 
@@ -95,19 +95,17 @@ def _transpose_matrix(lowerer, value, node):
 
 def _outer(lowerer, lhs, rhs, node):
     dimension = lhs.type.shape[0]
-    dimension_id = lowerer.compiler.builder.dimension_id(dimension)
-    if isinstance(dimension, StaticDim):
-        operands = (lhs,)
-        first_axis = ShapeExpr(ShapeExprKind.STATIC, dimension_id, dimension.value)
-    else:
-        operands = (lhs, lowerer.materialize_dimension(ShapeDimension(dimension, lhs, 0), node))
-        first_axis = ShapeExpr(ShapeExprKind.SSA_EXTENT, dimension_id, 1)
+    shape = ShapeBuilder(lowerer.compiler.builder.dimension_id, first_operand_position=1)
+    shape.append_extent(
+        dimension,
+        None if isinstance(dimension, StaticDim) else lowerer.materialize_dimension(ShapeDimension(dimension, lhs, 0), node),
+    )
+    shape.append_extent(StaticDim(1))
+    lowered = shape.finish()
     column = lowerer.emit(
-        OperationKind.RESHAPE, lowerer.location(node), operands=operands,
-        result_types=(TensorType(lhs.type.dtype, (dimension, StaticDim(1))),),
-        attributes={"shape": ShapeRelation((
-            first_axis, ShapeExpr(ShapeExprKind.STATIC, lowerer.compiler.builder.dimension_id(StaticDim(1)), 1)
-        ))},
+        OperationKind.RESHAPE, lowerer.location(node), operands=(lhs, *lowered.operands),
+        result_types=(TensorType(lhs.type.dtype, lowered.dimensions),),
+        attributes={"shape": lowered.relation},
     ).results[0]
     result_shape = (dimension, rhs.type.shape[0])
     return lowerer.emit(

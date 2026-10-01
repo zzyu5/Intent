@@ -1,4 +1,4 @@
-from .artifact import CompiledArtifact
+from .artifact import CompiledArtifact, PreparedCall
 
 
-__all__ = ["CompiledArtifact"]
+__all__ = ["CompiledArtifact", "PreparedCall"]

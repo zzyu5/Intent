@@ -86,7 +86,7 @@ int main(int argc, char **argv) {
       llvm::cl::Positional, llvm::cl::desc("<input canonical Intent KIR>"),
       llvm::cl::init("-"));
   llvm::cl::opt<TargetKind> target(
-      "target", llvm::cl::desc("eventual target backend"), llvm::cl::Required,
+      "target", llvm::cl::desc("eventual target backend"),
       llvm::cl::values(
           clEnumValN(TargetKind::Triton, "triton", "Triton DSL"),
           clEnumValN(TargetKind::CuTile, "cutile", "cuTile DSL"),
@@ -142,8 +142,41 @@ int main(int argc, char **argv) {
       "stop-after-shared",
       llvm::cl::desc("stop after the selected execution family's shared verifier"),
       llvm::cl::init(false));
+  llvm::cl::opt<bool> stopAfterKIR(
+      "stop-after-kir",
+      llvm::cl::desc("normalize and verify Kernel IR without selecting a target"),
+      llvm::cl::init(false));
+  llvm::cl::opt<bool> compilerInfo(
+      "compiler-info",
+      llvm::cl::desc("print built-in source providers and compilation stages as JSON"),
+      llvm::cl::init(false));
   llvm::cl::ParseCommandLineOptions(argc, argv,
                                     "Intent canonical KIR compiler boundary\n");
+
+  if (compilerInfo) {
+    llvm::json::Array providers{"triton", "cutile", "tilelang", "mojo"};
+#ifdef INTENT_HAS_WEFT_CANONICAL
+    providers.push_back("weft");
+#endif
+    providers.push_back("bangc");
+    llvm::json::Object information{
+        {"providers", std::move(providers)},
+        {"stages", llvm::json::Array{"kir", "shared", "provider"}},
+        {"outputs", llvm::json::Object{
+            {"kir", llvm::json::Array{"ir"}},
+            {"shared", llvm::json::Array{"ir"}},
+            {"provider", llvm::json::Array{"ir", "source", "metadata"}}}}};
+    llvm::outs() << llvm::json::Value(std::move(information)) << "\n";
+    return exitCode(ExitCode::Success);
+  }
+  if (stopAfterKIR && stopAfterShared) {
+    llvm::errs() << "--stop-after-kir and --stop-after-shared are mutually exclusive\n";
+    return exitCode(ExitCode::Invocation);
+  }
+  if (!stopAfterKIR && target.getNumOccurrences() == 0) {
+    llvm::errs() << "--target is required unless --stop-after-kir is selected\n";
+    return exitCode(ExitCode::Invocation);
+  }
 
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
@@ -162,8 +195,25 @@ int main(int argc, char **argv) {
                       mlir::scf::SCFDialect>();
 
   auto module = mlir::parseSourceFile<mlir::ModuleOp>(inputFilename, &context);
-  if (!module || mlir::failed(intent::verifyKernelModule(*module)))
+  if (!module || mlir::failed(intent::normalizeKernelModule(*module)))
     return exitCode(ExitCode::KernelIR);
+  auto emitIR = [&](llvm::StringRef stage) {
+    if (irOutputFilename.empty()) {
+      llvm::errs() << "--ir-output is required with --stop-after-" << stage << "\n";
+      return exitCode(ExitCode::CompilerOutput);
+    }
+    std::error_code error;
+    llvm::raw_fd_ostream irOutput(irOutputFilename, error, llvm::sys::fs::OF_Text);
+    if (error) {
+      llvm::errs() << "cannot open IR output: " << error.message() << "\n";
+      return exitCode(ExitCode::CompilerOutput);
+    }
+    module->print(irOutput, mlir::OpPrintingFlags().enableDebugInfo());
+    irOutput << "\n";
+    return exitCode(ExitCode::Success);
+  };
+  if (stopAfterKIR)
+    return emitIR("kir");
   llvm::SmallString<256> profilesDirectory(
       llvm::sys::fs::getMainExecutable(argv[0], reinterpret_cast<void *>(&main)));
   llvm::sys::path::remove_filename(profilesDirectory);
@@ -175,21 +225,6 @@ int main(int argc, char **argv) {
   };
   std::string source;
   std::string metadata;
-  auto emitShared = [&]() {
-    if (irOutputFilename.empty()) {
-      llvm::errs() << "--ir-output is required with --stop-after-shared\n";
-      return exitCode(ExitCode::CompilerOutput);
-    }
-    std::error_code error;
-    llvm::raw_fd_ostream irOutput(irOutputFilename, error, llvm::sys::fs::OF_Text);
-    if (error) {
-      llvm::errs() << "cannot open physical IR output: " << error.message() << "\n";
-      return exitCode(ExitCode::CompilerOutput);
-    }
-    module->print(irOutput, mlir::OpPrintingFlags().enableDebugInfo());
-    irOutput << "\n";
-    return exitCode(ExitCode::Success);
-  };
   if (target == TargetKind::BangC) {
     context.loadDialect<mlir::memref::MemRefDialect, mlir::math::MathDialect>();
     if (!tuningConfigFilename.empty()) {
@@ -244,7 +279,7 @@ int main(int argc, char **argv) {
       return exitCode(ExitCode::PhysicalProgram);
     if (mlir::failed(intent::dsa::runProgramTransforms(*module)))
       return exitCode(ExitCode::PhysicalProgramVerification);
-    if (stopAfterShared) return emitShared();
+    if (stopAfterShared) return emitIR("shared");
     if (mlir::failed(intent::bangc::legalizeProgram(*module, dsaArchitecture)))
       return exitCode(ExitCode::ProviderProgramVerification);
     metadata.clear();
@@ -264,7 +299,7 @@ int main(int argc, char **argv) {
     if (mlir::failed(intent::cpu::runCPUPasses(*module, cpuVectorBits, cpuWorkers, cpuMatrixI8I32,
             profilePath(target == TargetKind::Mojo ? "mojo.json" : "weft.json"), tuningConfigFilename, implementations)))
       return exitCode(ExitCode::PhysicalProgramVerification);
-    if (stopAfterShared) return emitShared();
+    if (stopAfterShared) return emitIR("shared");
     metadata.clear();
     if (target == TargetKind::Mojo) {
       if (mlir::failed(intent::mojo::legalizeProgram(*module)))
@@ -316,7 +351,7 @@ int main(int argc, char **argv) {
   }
   if (mlir::failed(intent::gpu::runSharedGPUPasses(*module, *profiles)))
     return exitCode(ExitCode::PhysicalProgramVerification);
-  if (stopAfterShared) return emitShared();
+  if (stopAfterShared) return emitIR("shared");
   mlir::LogicalResult provider = mlir::failure();
   mlir::LogicalResult serialized = mlir::failure();
   switch (target) {

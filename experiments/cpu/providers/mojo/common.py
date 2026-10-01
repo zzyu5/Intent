@@ -52,7 +52,7 @@ def _compile(context, definition, *, constexprs=None):
 
 def prepare_comparison(context, definition, arguments, runtime_path, tolerance, note=""):
     artifact = _compile(context, definition)
-    generated = artifact.runtime.prepare(arguments)
+    generated = artifact.prepare(*arguments)
     report_stage("source_compilation")
     runtime = load_module(context.project_root / runtime_path, "intent_mojo_" + definition.__name__)
     source = runtime.prepare(context.target.resolve(), *arguments)
@@ -63,7 +63,7 @@ def prepare_comparison(context, definition, arguments, runtime_path, tolerance, 
               f"candidate_ms={generated.program.timings[generated.key]}", flush=True)
         return elapsed
     return PreparedComparison(
-        PreparedLaunch(lambda: artifact(*generated.arguments), generated.result, native_benchmark=benchmark_generated),
+        PreparedLaunch(generated.launch, generated.result, native_benchmark=benchmark_generated),
         PreparedLaunch(source.launch, source.result, native_benchmark=source.benchmark),
         tolerance, cuda_graph=False, device_type="cpu",
         note="同算法、f32、单 NUMA 8 核；native 执行计时含 packing/任务同步，不含输出分配。" + note,

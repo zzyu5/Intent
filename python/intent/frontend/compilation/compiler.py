@@ -7,9 +7,6 @@ from intent.api import KernelDefinition
 from intent.frontend.mlir import FunctionKind
 from intent.frontend.mlir import MlirBuilder
 from intent.frontend.mlir import MlirValue
-from intent.frontend.mlir import ParameterKind
-from intent.frontend.mlir import ParameterSpec
-from intent.frontend.mlir import canonicalize_mlir
 from intent.frontend.semantics import ValueType
 
 from ..diagnostics.errors import FrontendError
@@ -54,7 +51,7 @@ class FrontendCompiler:
             constexpr_values=self.signature.constexpr_values,
         )
         lowerer.lower()
-        return canonicalize_mlir(self.builder.emit_module(), self.builder)
+        return self.builder.emit_module()
 
     def lower_helper_inline(
         self,
@@ -78,20 +75,26 @@ class FrontendCompiler:
         source = SourceUnit.from_definition(definition)
         parameters = lower_helper_parameters(source, argument_types)
         self.active_helpers.add(key)
-        results = caller.lower_inline_helper(
-            definition=definition,
-            source=source,
-            parameters=parameters,
-            arguments=arguments,
-        )
-        self.active_helpers.remove(key)
-        return results
+        try:
+            return caller.lower_inline_helper(
+                definition=definition,
+                source=source,
+                parameters=parameters,
+                arguments=arguments,
+            )
+        finally:
+            self.active_helpers.remove(key)
 
 def lower_to_mlir(
     definition: KernelDefinition[object, object],
     *,
     constexprs: dict[str, object] | None = None,
 ) -> str:
+    """Capture a typed kernel as Intent MLIR without native Python bindings.
+
+    The compiler's KIR stage verifies and normalizes this module before any
+    target analysis or lowering. This function does not require a device.
+    """
     if not isinstance(definition, KernelDefinition):
         raise TypeError("lower_to_mlir expects an @intent.kernel definition")
     return FrontendCompiler(definition, dict(constexprs or {})).lower()
