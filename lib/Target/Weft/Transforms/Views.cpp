@@ -4,7 +4,6 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 using namespace mlir;
 
@@ -145,10 +144,13 @@ private:
   FailureOr<Value> materialize(Value value) {
     if (auto found = mapping.lookupOrNull(value)) return found;
     Operation *definition = value.getDefiningOp();
+    // These values belong to the host descriptor being reified. Capturing an
+    // already computed size/stride keeps metadata-only storage out of the task
+    // ABI and does not replay its scalar dependencies inside each task.
+    if (!isa<MemRefType>(value.getType()) &&
+        !isa_and_nonnull<arith::ConstantOp>(definition)) return capture(value);
     bool clone = isViewDefinition(definition) ||
-        (definition && isa<memref::DimOp, arith::ConstantOp>(definition)) ||
-        (definition && definition->getName().getDialectNamespace() == "arith" &&
-         definition->getNumRegions() == 0 && isMemoryEffectFree(definition));
+        isa_and_nonnull<arith::ConstantOp>(definition);
     if (!clone) {
       if (isa<MemRefType>(value.getType())) {
         auto argument = dyn_cast<BlockArgument>(value);

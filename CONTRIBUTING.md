@@ -143,6 +143,12 @@ Region 展开后，模板参数变成具体 views，可以用同一存储证明�
 | 存储别名、生命周期与读快照 | [Analysis/Storage.h](include/Intent/Dialect/CPU/Analysis/Storage.h) | `queryStorageAliases`、`queryStorageLifetime` 查询 views、captures、uses 与 lexical end；`areDisjointStorage`、`preservesStorage`、`isStorageReadStable` 结合当前 effects、alias analysis 与显式 ABI 证明能否重放读取，不移动 allocation 或决定 packing |
 | 供数与私有计算复用 | [ReusePreparedInputs.cpp](lib/Dialect/CPU/Transforms/ReusePreparedInputs.cpp)、[FuseIntermediateBuffers.cpp](lib/Dialect/CPU/Transforms/FuseIntermediateBuffers.cpp) | 在共同存储证明之外，分别检查坐标、effect、读取稳定性与计算可重放性，实际改写 current IR |
 
+扩展 CPU implementation 时，`applicable` 描述它承接的计算语义，`check` 查询当前 capability 与 configuration，合法时返回 `std::nullopt`，否则返回具体拒绝原因。`candidates` 与 `bind` 共用布局、provider 条件、参数和供数检查；无合法候选时，诊断定位阻断的 computation，并列出 profile 行的实际参数与原因。`lookup` 服务于已绑定且经过变换的程序，只核对实现身份及当前计算和输入布局，不重新选择实现或用原始配置要求检查已经缩小的微块。
+
+`inputRequirements` 是只读查询，候选期与后续供数变换都可以调用。`checkInputRequirement` / `checkInputRequirements` 共享 operand、panel、alignment 与显式 widening 的证明，实际物化时依据当前 IR 重查。跨阶段只传递正式 binding，不缓存另一份供数计划。输入已经满足实现要求、无需额外准备时可以返回空需求；空需求只表示不需要外围 preparation，不说明它一定更快。
+
+候选组合先为每个 contraction 找到合法且无需外围 preparation 的基准，再将每种注册实现应用于它能服务的计算，其余计算保持各自基准，按完整 bindings 去重。这样同一函数中的低精度 contraction 可以选择 widened 供数，另一个连续 f32 contraction 同时选择直接读取；不会因二者实现名不同而把后者改回默认 packing。需要准备供数的实现仍参与有限 portfolio，最终 winner 由实际调优决定，不展开每个 computation 的笛卡尔积，也不把这个基准当成布局或复用代价模型。
+
 别名集合的 `complete=false` 表示仍有未知的内存值传播。验证器可以检查已知 uses 是否越过 lifetime end，但改变存储或重放读取的优化还必须证明其需要的完整性与 effect 条件。查询结果只服务当前图，移动、替换或删除相关 operations 后重算；不能把某次查询结果跨变换保存为另一份存储计划。
 
 [IntegerSources.cpp](lib/Dialect/CPU/Transforms/IntegerSources.cpp) 在破坏性存储复用之前，将完整 pointwise 整数 producer 的读取替换为当前位置上的标量计算，保留位宽并证明输入快照稳定。[ContiguousAccesses.cpp](lib/Dialect/CPU/Transforms/ContiguousAccesses.cpp) 随后组合实际坐标与静态 strides：完整遍历的地址若等于同形状连续成员加固定基址，就形成标准 memref view/copy，交给既有输出转发与扫描实现。仿射证明同时检查原表达式及重排后算术的范围；未知 stride、无法证明的溢出或读写干扰保留原程序。两者是 `fuseStructuredComputations` 的相邻私有机制，不是新 scan 算法，也不让调用方手工拼装 pass 次序。
@@ -156,6 +162,8 @@ CPU 归约的相邻重结合与元素重排许可统一保存于 `ReductionOrder
 Mojo 的矩阵 `formTile` 同样把该许可传给微块，后续实现不能仅因识别到 FMA 就扩大重排许可。矩阵寄存器组织属于 Mojo 原生实现，CPU source 识别和 GPU provider 不承担该 SIMD 决策。
 
 Weft 的私有 [Views.h](lib/Target/Weft/Transforms/Views.h) 证明标准 memref 描述符是否仅做轴置换或 unit 轴插删，并将纯 view capture 的定义链显式放回 task 内。原存储及所需标量进入 task ABI；[Legalize.cpp](lib/Target/Weft/Transforms/Legalize.cpp) 将逻辑访问反投影到原 Slice/Subview，缓存原存储顺序的 Admit 快照。矩阵消费者保留该顺序，将轴重命名为当前循环轴，直接交给按命名轴归约的 OuterContract；位置相关的普通读写则显式投影到对应逻辑顺序。不能把非连续 capture 直接标成连续，也不能只改 shape 冒充转置。当前 Weft RISC-V 不能实现一般置换 Reshape；动态轴合并、非矩形 flatten 和任意 strided reinterpretation 也不在该桥接能力内，失败明确报告，不插入隐藏 copy。
+
+Host 已计算的 size、stride 等标量直接作为 capture，不为取得一个 shape 值将整块无数据用途的 storage 带入 task。生成完整 Weft body 后，[TaskInterface.h](lib/Target/Weft/Transforms/TaskInterface.h) 的 `finalizeTaskInterface` 统一清理可删除的无用值、收缩 kernel 参数及其属性、验证并导出 ABI；host 调用与 scalar box 只根据该入口返回的参数位置生成。形状符号和 domain 还绑定类型中的身份，不能只按 SSA use 数删除。修改 task capture 或目标 lowering 时复用这一完整入口，不能只裁剪 kernel 签名而保留旧 host 参数或另让 serializer 修补接口。
 
 ## Provider 与 runtime 扩展
 

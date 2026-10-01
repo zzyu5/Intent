@@ -1,5 +1,6 @@
 #include "Intent/Target/Weft/Transforms/Passes.h"
 #include "Views.h"
+#include "TaskInterface.h"
 #include "Quantization.h"
 #include "Intent/Target/Weft/Serialization/Serializer.h"
 #include "Intent/Dialect/CPU/Analysis/AxisRelations.h"
@@ -49,51 +50,6 @@ struct LocalValue {
   SmallVector<OpFoldResult> sizes;
 };
 
-FailureOr<llvm::json::Object> taskABI(wk::KernelOp kernel) {
-  llvm::json::Array arguments, symbols;
-  for (Attribute symbol : kernel.getShapeSymbols())
-    symbols.push_back(cast<StringAttr>(symbol).getValue().str());
-  for (auto [index, argument] : llvm::enumerate(kernel.getBody().front().getArguments())) {
-    auto view = cast<wk::ViewType>(argument.getType());
-    auto encoding = cast<wk::EncodingType>(view.getEncoding());
-    int64_t bytes, elements, alignment;
-    std::string scalar;
-    if (encoding.getKind() == "dense") {
-      if (encoding.getFamily() == "f32") { scalar = "float"; bytes = 4; }
-      else if (encoding.getFamily() == "i32") { scalar = "int32_t"; bytes = 4; }
-      else if (encoding.getFamily() == "i64") { scalar = "int64_t"; bytes = 8; }
-      else if (encoding.getFamily() == "u8" || encoding.getFamily() == "i8") {
-        scalar = encoding.getFamily() == "u8" ? "uint8_t" : "int8_t"; bytes = 1;
-      } else return kernel.emitError("CPU task ABI has no native dense element representation"), failure();
-      elements = 1; alignment = bytes;
-    } else {
-      wk::EncodingDeclOp declaration;
-      for (auto candidate : kernel->getParentOfType<ModuleOp>().getOps<wk::EncodingDeclOp>())
-        if (candidate.getSymName() == encoding.getFamily()) declaration = candidate;
-      if (encoding.getKind() != "base" || !declaration)
-        return kernel.emitError("CPU task ABI requires a declared base encoding"), failure();
-      scalar = "uint8_t"; bytes = declaration.getStorageBits() / 8;
-      elements = declaration.getElements(); alignment = declaration.getAlignment();
-    }
-    StringRef access = cast<StringAttr>(kernel.getArgAccess()[index]).getValue();
-    bool writable = access == "write" || access == "readwrite";
-    int64_t alias = kernel.getArgAliasSets()[index];
-    bool restricted = alias >= 0 && llvm::count(kernel.getArgAliasSets(), alias) == 1;
-    llvm::json::Array dimensions;
-    for (int64_t extent : view.getShape().asArrayRef())
-      dimensions.push_back(extent >= 0 ? std::to_string(extent)
-          : cast<StringAttr>(kernel.getShapeSymbols()[-extent - 1]).getValue().str());
-    arguments.push_back(llvm::json::Object{
-        {"name", cast<StringAttr>(kernel.getArgNames()[index]).getValue().str()},
-        {"c_type", (writable ? "" : "const ") + scalar + (restricted ? " *restrict" : " *")},
-        {"encoding", encoding.getLayoutIdentity().str()}, {"shape", std::move(dimensions)},
-        {"storage_bytes", bytes}, {"record_elements", elements}, {"alignment", alignment},
-        {"interleave_rows", 0}, {"alias_set", alias}, {"writable", writable}});
-  }
-  return llvm::json::Object{{"symbol", kernel.getSymName().str()},
-      {"arguments", std::move(arguments)}, {"shape_parameters", std::move(symbols)}};
-}
-
 class TaskLowering {
 public:
   TaskLowering(func::FuncOp function, ModuleOp output,
@@ -138,7 +94,7 @@ public:
     return result;
   }
 
-  LogicalResult lower(cpu::TasksOp tasks, StringRef name, ArrayRef<unsigned> argumentPositions,
+  LogicalResult lower(cpu::TasksOp tasks, StringRef name, SmallVectorImpl<unsigned> &argumentPositions,
                       llvm::json::Object &abi) {
     values.clear(); locals.clear(); readOnlySupplies.clear(); viewAxes.clear();
     Location loc = tasks.getLoc();
@@ -216,8 +172,7 @@ public:
     }
     if (failed(block(tasks.getBody().front()))) return failure();
     b.create<wk::ReturnOp>(loc, ValueRange{});
-    if (failed(verify(kernel))) return failure();
-    auto interface = taskABI(kernel);
+    auto interface = finalizeTaskInterface(kernel, argumentPositions);
     if (failed(interface)) return failure();
     abi = std::move(*interface);
     return success();
