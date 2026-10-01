@@ -661,7 +661,8 @@ LogicalResult realizeNativeComputations(ModuleOp module) {
   return success();
 }
 
-LogicalResult realizeNativeWorkspace(ModuleOp module) {
+LogicalResult realizeNativeWorkspace(ModuleOp module,
+    llvm::function_ref<LogicalResult()> cleanup) {
   auto function = *module.getOps<func::FuncOp>().begin();
   auto config = function->getAttrOfType<dsa::ConfigurationAttr>("intent_dsa.configuration");
   dsa::bindUniformOperands(function);
@@ -679,17 +680,12 @@ LogicalResult realizeNativeWorkspace(ModuleOp module) {
       Value value = b.create<arith::ConstantOp>(op->getLoc(), b.getIntegerAttr(op->getResult(0).getType(), interval->first));
       op->getResult(0).replaceAllUsesWith(value); op->erase();
     }
-    PassManager cleanup(module.getContext());
-    cleanup.addPass(createCanonicalizerPass()); cleanup.addPass(createCSEPass());
-    if (failed(cleanup.run(module))) return failure();
+    if (failed(cleanup())) return failure();
   }
   reuseConsumedBinaryInputs(function, config);
   reuseConsumedExp2Inputs(function, config);
-  if (batchIndependentRowPrograms(function, config)) {
-    PassManager cleanup(module.getContext());
-    cleanup.addPass(createCanonicalizerPass()); cleanup.addPass(createCSEPass());
-    if (failed(cleanup.run(module))) return failure();
-  }
+  if (batchIndependentRowPrograms(function, config) && failed(cleanup()))
+    return failure();
   fuseNarrowDivisions(function, config);
   realizeRoundedDivisions(function, config);
   realizeApproximateReciprocals(function, config);

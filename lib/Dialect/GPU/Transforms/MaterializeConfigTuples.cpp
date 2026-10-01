@@ -24,6 +24,13 @@
 using namespace mlir;
 
 namespace intent::gpu {
+const TuningProfileSchema &sharedTuningProfileSchema() {
+  static const StringRef columns[] = {"ownership_m", "ownership_n", "reduction",
+      "reduction_outer", "scan", "traversal_workers", "traversal_group"};
+  static const TuningProfileSchema schema{"shared", columns};
+  return schema;
+}
+
 namespace {
 
 struct TuningProfile {
@@ -591,7 +598,7 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
   if (multipleRegionMatrixAccumulators &&
       (kind == TuningClass::Contraction || kind == TuningClass::RegionContraction))
     family = "region_contraction_multi_accumulator";
-  auto rows = tables.get("shared", family, kernel.getLoc());
+  auto rows = tables.get(sharedTuningProfileSchema(), family, kernel.getLoc());
   if (failed(rows))
     return failure();
   SmallVector<TuningProfile, 5> profiles;
@@ -1010,7 +1017,10 @@ bool hasSmallRegionRows(func::FuncOp kernel, ArrayRef<ParameterOp> parameters) {
 
 } // namespace
 
-LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningProfiles &tables) {
+LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
+  auto resolved = TuningProfiles::from(kernel->getParentOfType<ModuleOp>());
+  if (failed(resolved)) return failure();
+  const TuningProfiles &tables = *resolved;
   SmallVector<ParameterOp> parameters;
   bool invalidParameter = false;
   kernel.walk([&](ParameterOp parameter) {
@@ -1357,7 +1367,7 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
     }
   }
   if (!indirectRowGroups.empty()) {
-    auto rows = tables.get("shared", "indirect_row", kernel.getLoc());
+    auto rows = tables.get(sharedTuningProfileSchema(), "indirect_row", kernel.getLoc());
     if (failed(rows))
       return failure();
     for (const TuningProfiles::Row &row : *rows) {

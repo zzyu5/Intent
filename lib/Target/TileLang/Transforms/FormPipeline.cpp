@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
+#include "Intent/Target/TileLang/Transforms/Passes.h"
 #include "PassDetail.h"
 
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -25,7 +26,7 @@ gpu::ParameterOp getOrCreateStages(func::FuncOp kernel,
     else
       existing = parameter;
   });
-  auto rows = profiles.get("tilelang", "stages", kernel.getLoc());
+  auto rows = profiles.get(tuningProfileSchema(), "stages", kernel.getLoc());
   if (failed(rows))
     return {};
   SmallVector<int64_t> values;

@@ -133,7 +133,7 @@ LogicalResult ImplementationAttr::verify(
     return error() << "CPU implementation requires a registered identity and explicit bindings";
   for (NamedAttribute parameter : parameters) {
     auto integer = mlir::dyn_cast<IntegerAttr>(parameter.getValue());
-    if (!integer || integer.getInt() <= 0)
+    if (!integer || !integer.getValue().isSignedIntN(64) || integer.getInt() <= 0)
       return error() << "CPU implementation parameter must be a positive integer";
   }
   return success();

@@ -1,5 +1,3 @@
-get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
-
 add_llvm_executable(intent-compile
   intent-compile.cpp
 )
@@ -27,49 +25,9 @@ install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/profiles/"
   DESTINATION "${INTENT_RUNTIME_INSTALL_DIR}/profiles"
   COMPONENT IntentRuntime
   FILES_MATCHING PATTERN "*.json")
-if(SKBUILD)
-  configure_file("${PROJECT_SOURCE_DIR}/cmake/BundleRuntime.cmake.in"
-                 "${CMAKE_CURRENT_BINARY_DIR}/BundleRuntime.cmake.in" @ONLY)
-  file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/BundleRuntime-$<CONFIG>.cmake"
-       INPUT "${CMAKE_CURRENT_BINARY_DIR}/BundleRuntime.cmake.in")
-  install(SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/BundleRuntime-$<CONFIG>.cmake"
-          COMPONENT IntentRuntime)
-endif()
 target_link_libraries(intent-compile PRIVATE
-  ${dialect_libs}
-  MLIRIntentDialect
-  MLIRIntentKIRToGPU
-  MLIRIntentKIRToCPU
-  MLIRIntentKIRToDSA
-  MLIRIntentDSADialect
-  MLIRIntentDSATransforms
-  MLIRIntentBangC
-  MLIRIntentCPUTransforms
-  MLIRIntentCPUDialect
-  MLIRIntentMojoSerialization
-  MLIRIntentMojoTransforms
-  MLIRIntentCuTileDialect
-  MLIRIntentCuTileTransforms
-  MLIRIntentCuTileSerialization
-  MLIRIntentGPUDialect
-  MLIRIntentGPUTransforms
-  MLIRIntentTileLangDialect
-  MLIRIntentTileLangTransforms
-  MLIRIntentTileLangSerialization
-  MLIRIntentTritonDialect
-  MLIRIntentTritonTransforms
-  MLIRIntentTritonSerialization
-  MLIRIntentTransforms
+  MLIRIntentCompiler
   MLIRParser
-  MLIRPass
-  MLIRTransforms
-  MLIRIR
-  MLIRSupport
 )
-
-if(TARGET MLIRIntentWeftTransforms)
-  target_link_libraries(intent-compile PRIVATE MLIRIntentWeftTransforms MLIRIntentWeftSerialization)
-  target_compile_definitions(intent-compile PRIVATE INTENT_HAS_WEFT_CANONICAL=1)
-endif()
 
 mlir_check_all_link_libraries(intent-compile)

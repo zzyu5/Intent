@@ -304,6 +304,47 @@ LogicalResult PhysicalExprAttr::verify(
   return success();
 }
 
+LogicalResult TuningProfileTableAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, ArrayAttr columns,
+    DictionaryAttr families) {
+  if (!columns || columns.empty() || !families || families.empty())
+    return emitError() << "tuning profile table requires columns and families";
+  llvm::DenseSet<Attribute> columnNames;
+  for (Attribute attribute : columns) {
+    auto name = mlir::dyn_cast<StringAttr>(attribute);
+    if (!name || name.empty() || !columnNames.insert(name).second)
+      return emitError() << "tuning profile columns must be distinct nonempty names";
+  }
+  for (NamedAttribute family : families) {
+    auto rows = mlir::dyn_cast<ArrayAttr>(family.getValue());
+    if (family.getName().empty() || !rows || rows.empty())
+      return emitError() << "tuning family requires a name and nonempty rows";
+    llvm::DenseSet<Attribute> unique;
+    for (Attribute attribute : rows) {
+      auto row = mlir::dyn_cast<DenseI64ArrayAttr>(attribute);
+      if (!row || row.size() != columns.size() ||
+          llvm::any_of(row.asArrayRef(), [](int64_t value) { return value <= 0; }))
+        return emitError() << "tuning family '" << family.getName()
+                           << "' requires " << columns.size()
+                           << " positive integers per row";
+      if (!unique.insert(row).second)
+        return emitError() << "tuning family contains duplicate rows";
+    }
+  }
+  return success();
+}
+
+LogicalResult TuningProfilesAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, DictionaryAttr spaces) {
+  if (!spaces || spaces.empty())
+    return emitError() << "tuning profiles require resolved namespace tables";
+  for (NamedAttribute space : spaces)
+    if (space.getName().empty() ||
+        !mlir::isa<TuningProfileTableAttr>(space.getValue()))
+      return emitError() << "tuning namespace requires a name and typed profile table";
+  return success();
+}
+
 LogicalResult ParameterAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, StringAttr name,
     uint32_t role, uint32_t category, uint32_t elementBitWidth,

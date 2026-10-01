@@ -1,4 +1,4 @@
-"""Install the selected compiler's Linux runtime closure into its wheel.
+"""Install the compiler tools' shared Linux runtime closure into their wheel.
 
 CMake supplies resolved ELF dependencies. This script preserves their SONAMEs,
 collects notices from the owning Debian packages or an explicit notice map, and
@@ -111,7 +111,12 @@ def complete_notices(paths: tuple[Path, ...]) -> tuple[Path, ...]:
     return tuple(sorted(contents))
 
 
-def bundle(compiler: Path, dependencies: Path, patchelf: str, notices: str) -> None:
+def bundle(executables: tuple[Path, ...], dependencies: Path, patchelf: str, notices: str) -> None:
+    executables = tuple(path.resolve(strict=True) for path in executables)
+    directories = {path.parent for path in executables}
+    if len(directories) != 1 or any(not path.is_file() for path in executables):
+        raise ValueError("Compiler tools must be installed as files in one shared runtime directory")
+    runtime_directory = executables[0].parent
     supplied = read_notice_map(notices)
     libraries = {}
     platform = set()
@@ -137,13 +142,13 @@ def bundle(compiler: Path, dependencies: Path, patchelf: str, notices: str) -> N
 
     # Check the actual needed names before copying. Absolute dependencies and
     # unresolved aliases must not silently fall back to the SDK at runtime.
-    for source in (compiler, *(item.source for item in libraries.values())):
+    for source in (*executables, *(item.source for item in libraries.values())):
         for needed in command(patchelf, "--print-needed", source).splitlines():
             if needed not in libraries and not _PLATFORM_LIBRARIES.fullmatch(needed):
                 raise ValueError(f"Runtime closure does not provide {needed!r}, needed by {source}")
 
-    destination = compiler.parent / "lib"
-    notice_root = compiler.parent / "third-party"
+    destination = runtime_directory / "lib"
+    notice_root = runtime_directory / "third-party"
     destination.mkdir(exist_ok=True)
     notice_root.mkdir(exist_ok=True)
     records = []
@@ -158,10 +163,11 @@ def bundle(compiler: Path, dependencies: Path, patchelf: str, notices: str) -> N
         for index, source in enumerate(library.notices):
             target_notice = directory / f"{index + 1:02d}-{source.name}"
             shutil.copyfile(source, target_notice)
-            installed.append(str(target_notice.relative_to(compiler.parent)))
+            installed.append(str(target_notice.relative_to(runtime_directory)))
         records.append({"soname": soname, "source": str(library.source),
                         "package": library.package, "notices": installed})
-    subprocess.run([patchelf, "--set-rpath", "$ORIGIN/lib", str(compiler)], check=True)
+    for executable in executables:
+        subprocess.run([patchelf, "--set-rpath", "$ORIGIN/lib", str(executable)], check=True)
     (notice_root / "libraries.json").write_text(
         json.dumps({"libraries": records, "platform_libraries": sorted(platform)}, indent=2) + "\n",
         encoding="utf-8")
@@ -169,12 +175,12 @@ def bundle(compiler: Path, dependencies: Path, patchelf: str, notices: str) -> N
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--compiler", type=Path, required=True)
+    parser.add_argument("--executable", type=Path, action="append", required=True)
     parser.add_argument("--dependencies", type=Path, required=True)
     parser.add_argument("--patchelf", required=True)
     parser.add_argument("--notices", default="")
     args = parser.parse_args()
-    bundle(args.compiler, args.dependencies, args.patchelf, args.notices)
+    bundle(tuple(args.executable), args.dependencies, args.patchelf, args.notices)
 
 
 if __name__ == "__main__":

@@ -9,11 +9,15 @@ add_mlir_library(MLIRIntentTritonTransforms
   Configurations.cpp
   ProgramGrid.cpp
 
+  DEPENDS
+  IntentTritonTransformsIncGen
+
   LINK_LIBS PUBLIC
   MLIRArithDialect
   MLIRControlFlowDialect
   MLIRFuncDialect
   MLIRIR
+  MLIRPass
   MLIRSCFDialect
   MLIRIntentGPUAnalysis
   MLIRIntentGPUDialect

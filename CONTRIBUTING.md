@@ -37,7 +37,7 @@ Python definition
 | Kernel/helper 定义 | [python/intent/api/](python/intent/api/) | `@intent.kernel`、`@intent.fn` 及 source definition |
 | Python frontend | [frontend/compilation/compiler.py](python/intent/frontend/compilation/compiler.py)、[frontend/lowering/](python/intent/frontend/lowering/) | 类型化捕获、helper、控制与 intrinsic lowering |
 | 编译调用 | [compiler/pipeline.py](python/intent/compiler/pipeline.py)、[compiler/artifact.py](python/intent/compiler/artifact.py)、[compiler/toolchain.py](python/intent/compiler/toolchain.py) | `generate` 返回 source/IR/metadata；无参 `materialize` 沿用同一目标；`compile` 组合这两步 |
-| C++ 编译入口 | [intent-compile.cpp](tools/intent-compile/intent-compile.cpp)、[NormalizeKernelIR.cpp](lib/Transforms/NormalizeKernelIR.cpp) | 先完成无设备的 KIR 规范化与验证，再选择 execution family 与 provider pipeline |
+| C++ 编译入口 | [Compiler.cpp](lib/Compiler/Compiler.cpp)、[Backend.h](include/Intent/Compiler/Backend.h)、[intent-compile.cpp](tools/intent-compile/intent-compile.cpp) | 库拥有请求、阶段调度与当前模块；CLI 只解析参数和读写文件；backend 声明 family 与 provider 的连接 |
 | 公共产物与调用 | [runtime/artifact.py](python/intent/runtime/artifact.py)、[GPU program](python/intent/runtime/gpu/program.py)、[native ABI](python/intent/runtime/native.py) | `ArtifactRuntime.run/launch` 是显式调用接口；`prepare` 通过能力协议绑定一次调用，provider 完成自身的 JIT/tuning/launch |
 | 用户与 agent 工具 | [tools/compilation.py](python/intent/tools/compilation.py)、[tools/cli.py](python/intent/tools/cli.py)、[tools/compiler_mcp.py](python/intent/tools/compiler_mcp.py) | CLI 与显式启用的 compiler MCP 共用公开编译 API 和错误阶段，不建立第二条 compiler 路径 |
 
@@ -69,6 +69,57 @@ Lowering 的共同构造能力有明确入口：
 Native `intent-normalize-kernel` 是 KIR 规范化的完整入口：输入结构验证、合法 region 归一、输出 canonical 验证在同一 pass 中闭合，之后才建立 canonical analyses。它同时服务 `intent-compile` 和 `intent-opt`。新的跨目标 KIR 规范化放在 [lib/Transforms/](lib/Transforms/)，需要满足相应语言合同；GPU/CPU 的物理变换继续留在各自 family。
 
 只检查既有作者程序时，可用 `intent.compile_ir(definition)` 或 `intent compile path/to/program.py:kernel --stage kir --json`；这个阶段无需 target、后端 SDK 或设备。`--stage shared --target …` 输出共享物理 IR，默认 `provider` 阶段输出 provider IR、source 和 metadata。`intent-compile --compiler-info` 查询当前二进制实际编入的 providers；它不证明外部 provider 编译器或设备可用。
+
+### 编译调度与独立 IR 工具
+
+[Compiler.h](include/Intent/Compiler/Compiler.h) 的请求和结果是原生编译入口。
+[Backend.cpp](lib/Compiler/Backend.cpp) 汇集编入的 adapter；
+[GPUBackends.cpp](lib/Compiler/GPUBackends.cpp)、[CPUBackends.cpp](lib/Compiler/CPUBackends.cpp)
+与 [DSABackends.cpp](lib/Compiler/DSABackends.cpp) 分别连接自己的 construction、shared pipeline
+和 provider。新增 provider 时，在所属 family 声明注册、pipeline 和 serialization，
+不要在 CLI、错误映射和 profile reader 中各加一套分派。
+
+Pipeline 用 `OpPassManager` 构造；pass 的名字、options 和 dependent dialects 在相邻
+`Passes.td` 声明。组内需要标准 cleanup 或对子模块运行变换时，用当前 pass 的
+`runPipeline`，使诊断、IR 打印和计时保留在同一次编译中。内部修复函数不因此成为
+独立 pass。GPU 的分支 realization、候选绑定与 traversal 合并也属于具名的完整组，
+不在 compiler driver 中追加另一条变换路径。
+
+CPU 通过 [ImplementationProviderInterface](include/Intent/Dialect/CPU/IR/ImplementationProvider.h)
+从当前 MLIR context 取得已编入 provider 的 registry。需要 implementation 的 pass
+使用显式 `provider` option，不捕获进程外或调用栈上的 registry 指针。
+GPU 的 resolved profiles 则存于当前模块的 typed attributes：每张表携带列声明和完整候选，
+消费者使用自己唯一的 schema 校验查询。默认 JSON 和 override 只在 profile 解析阶段读取，
+后续 pass 不再依赖最初调用者持有的对象。CPU 与 GPU 不共用不相同的候选组织方式。
+
+安装产物同时提供 `intent-compile` 和 `intent-opt`。后者注册同一套 dialect、provider
+接口和 pass，可使用标准 MLIR pipeline 语法：
+
+```bash
+intent optimize /path/to/current.mlir \
+  --pipeline 'builtin.module(canonicalize,cse)' --json
+```
+
+Python 对应 `intent.optimize_ir(ir, pipeline=...) -> OptimizedIR`；显式 compiler MCP
+也提供 `optimize`。每次请求都实际执行并保留输入、工作目录、命令、输出和诊断。
+任意 pipeline 可能读取外部文件，因此优化工具不猜测其依赖并复用旧输出。
+这些入口处理调用者明确提供的 IR，不导入算法模块，也不启动 kernel。
+
+Shared IR 优化后，用 `intent.generate_from_ir(optimized.ir, input_stage="shared",
+name=..., target=...)` 继续生成 `GeneratedProgram`，再按需调用 `materialize()`。
+命令行对应 `intent generate-ir current.mlir --name NAME --target PROVIDER --json`；
+原生入口为 `intent-compile --input-stage=shared`，继续传入原调用的目标能力参数。
+续编译只验证当前 shared program 并运行 provider pipeline，不重复 construction、
+family passes 或 profile 导入，也不接受新的 tuning override。GPU/CPU 的硬件能力
+必须与 IR 已绑定的事实一致；实现、候选和 ABI 都读取当前 IR。
+`input_stage="kir"` 则走完整编译。输入阶段由调用者明确给出；`name` 只是生成程序的
+诊断标识，实际入口和候选由当前 IR 决定，不按名称筛选 kernel，也不从文本猜测。
+
+职责参考：Triton 的 `third_party/nvidia/backend/compiler.py:273–369` 用 pass manager
+构造配置明确的 lowering 阶段，`:638–647` 声明各阶段；
+`python/triton/compiler/compiler.py:289–350` 顺序传递各阶段的实际产物。
+Intent 由同一个编译库连接 GPU、CPU 和 DSA 的不同 IR，保留各 family 的物理决策边界。
+标准工具可重放这些阶段；只有相应输入合同成立，单个 pass 才可独立使用。
 
 ## 按贡献类型选择模块
 
@@ -217,7 +268,13 @@ Region 展开后，模板参数变成具体 views，可以用同一存储证明�
 | 当前描述符的维度上界 | [Analysis/Storage.h](include/Intent/Dialect/CPU/Analysis/Storage.h) | `constantDimensionUpperBound` 通过 MLIR ValueBounds 查询闭合常数上界；未知界不作为收缩依据，不使用观察到的运行时尺寸，也不将未经溢出证明的 index 算术当作数学整数等式 |
 | 供数与私有计算复用 | [ReusePreparedInputs.cpp](lib/Dialect/CPU/Transforms/ReusePreparedInputs.cpp)、[FuseIntermediateBuffers.cpp](lib/Dialect/CPU/Transforms/FuseIntermediateBuffers.cpp) | 在共同存储证明之外，分别检查坐标、effect、读取稳定性与计算可重放性，实际改写 current IR |
 
-扩展 CPU implementation 时，`applicable` 描述它承接的计算语义，`check` 查询当前 capability 与 configuration，合法时返回 `std::nullopt`，否则返回具体拒绝原因。`candidates` 与 `bind` 共用布局、provider 条件、参数和供数检查；无合法候选时，诊断定位阻断的 computation，并列出 profile 行的实际参数与原因。`lookup` 服务于已绑定且经过变换的程序，只核对实现身份及当前计算和输入布局，不重新选择实现或用原始配置要求检查已经缩小的微块。
+扩展 CPU implementation 时，`applicable` 描述它承接的计算语义，`check` 查询当前 capability 与 configuration，合法时返回 `std::nullopt`，否则返回具体拒绝原因。`candidates` 与 `bind` 共用布局、provider 条件、参数和供数检查；无合法候选时，诊断定位阻断的 computation，并列出 profile 行的实际参数与原因。`lookup` 服务于已绑定且经过变换的程序，核对实现身份、绑定参数及当前计算和输入布局，不重新选择实现或用原始配置要求检查已经缩小的微块。
+
+绑定参数使用同一 `ImplementationParameter` 声明生成与验证：本地 profile 参数、别名、
+常量和已有 shared extent 的有限派生分别声明来源，合法域也放在该声明中。
+不再写一份生成字典的 callback，再在后续 pass 中假定所有键存在。
+`verifyBinding` / `verifyBindings` 在继续编译当前 IR 或独立运行 CPU/provider pass 时
+检查完整绑定；它们不重放依赖原始计算形状的候选筛选，也不重新选择实现。
 
 `inputRequirements` 是只读查询，候选期与后续供数变换都可以调用。`checkInputRequirement` / `checkInputRequirements` 共享 operand、panel、alignment 与显式 widening 的证明，实际物化时依据当前 IR 重查。跨阶段只传递正式 binding，不缓存另一份供数计划。输入已经满足实现要求、无需额外准备时可以返回空需求；空需求只表示不需要外围 preparation，不说明它一定更快。
 
@@ -239,9 +296,27 @@ CPU 归约的相邻重结合与元素重排许可统一保存于 `ReductionOrder
 
 Mojo 的矩阵 `formTile` 同样把该许可传给微块，后续实现不能仅因识别到 FMA 就扩大重排许可。矩阵寄存器组织属于 Mojo 原生实现，CPU source 识别和 GPU provider 不承担该 SIMD 决策。
 
-Weft 的私有 [Views.h](lib/Target/Weft/Transforms/Views.h) 证明标准 memref 描述符是否仅做轴置换或 unit 轴插删，并将纯 view capture 的定义链显式放回 task 内。原存储及所需标量进入 task ABI；[Legalize.cpp](lib/Target/Weft/Transforms/Legalize.cpp) 将逻辑访问反投影到原 Slice/Subview，缓存原存储顺序的 Admit 快照。矩阵消费者保留该顺序，将轴重命名为当前循环轴，直接交给按命名轴归约的 OuterContract；位置相关的普通读写则显式投影到对应逻辑顺序。不能把非连续 capture 直接标成连续，也不能只改 shape 冒充转置。当前 Weft RISC-V 不能实现一般置换 Reshape；动态轴合并、非矩形 flatten 和任意 strided reinterpretation 也不在该桥接能力内，失败明确报告，不插入隐藏 copy。
+Weft 的私有 [Views.h](lib/Target/Weft/Transforms/Views.h) 证明标准 memref 描述符是否仅做轴置换或 unit 轴插删，并将纯 view capture 的定义链显式放回 task 内。原存储及所需标量进入 task ABI；[TaskLowering.cpp](lib/Target/Weft/Transforms/TaskLowering.cpp) 将逻辑访问反投影到原 Slice/Subview，缓存原存储顺序的 Admit 快照。矩阵消费者保留该顺序，将轴重命名为当前循环轴，直接交给按命名轴归约的 OuterContract；位置相关的普通读写则显式投影到对应逻辑顺序。不能把非连续 capture 直接标成连续，也不能只改 shape 冒充转置。当前 Weft RISC-V 不能实现一般置换 Reshape；动态轴合并、非矩形 flatten 和任意 strided reinterpretation 也不在该桥接能力内，失败明确报告，不插入隐藏 copy。
 
-Host 已计算的 size、stride 等标量直接作为 capture，不为取得一个 shape 值将整块无数据用途的 storage 带入 task。生成完整 Weft body 后，[TaskInterface.h](lib/Target/Weft/Transforms/TaskInterface.h) 的 `finalizeTaskInterface` 统一清理可删除的无用值、收缩 kernel 参数及其属性、验证并导出 ABI；host 调用与 scalar box 只根据该入口返回的参数位置生成。形状符号和 domain 还绑定类型中的身份，不能只按 SSA use 数删除。修改 task capture 或目标 lowering 时复用这一完整入口，不能只裁剪 kernel 签名而保留旧 host 参数或另让 serializer 修补接口。
+Host 已计算的 size、stride 等标量直接作为 capture，不为取得一个 shape 值将整块无数据用途的 storage 带入 task。生成完整 Weft body 后，[TaskInterface.h](lib/Target/Weft/Transforms/TaskInterface.h) 的 `finalizeTaskInterface` 统一清理可删除的无用值、收缩 kernel 参数及其属性并验证；host 调用与 scalar box 只根据该入口返回的参数位置生成。形状符号和 domain 还绑定类型中的身份，不能只按 SSA use 数删除。修改 task capture 或目标 lowering 时复用这一完整入口，不能只裁剪 kernel 签名而保留旧 host 参数或另让 serializer 修补接口。
+
+Weft 的完整 provider pass 保留一个包含 `@host`、`@device` 子模块的当前程序。
+前者是已形成调用与同步的 CPU host IR，后者是 Canonical Weft kernels；
+[Program.h](include/Intent/Target/Weft/IR/Program.h) 提供共同查询与验证入口。
+跨模块 task binding 使用 typed symbol references，公共参数对齐也保留于 IR。
+编译 driver 不再换出并丢弃 host 模块。终端 [Serializer.cpp](lib/Target/Weft/Serialization/Serializer.cpp)
+导出 host source、device source 和原有 runtime metadata；
+[TaskABI.cpp](lib/Target/Weft/Serialization/TaskABI.cpp) 只读最终 kernel 的参数、encoding、
+access、alias 和 shape symbols，生成 native ABI，不保存一份需与 IR 同步的 JSON 配方。
+
+这个容器边界对应 MLIR `GPUOps.td:607–638,1390–1407` 中独立 kernel module 与
+跨模块 symbol reference 的职责：保存可单独编译的程序及其真实调用连接。
+Intent 的 Weft 路径继续使用 CPU tasks、普通 host 调用和原有同步合同，不采用 GPU launch/grid。
+
+修改 Weft host 的 task 派发、capture 装箱或跨模块连接时，进入
+[Legalize.cpp](lib/Target/Weft/Transforms/Legalize.cpp)；修改 task 内部的原生操作转换时，
+进入相邻 `TaskLowering`。后者的只读分析和转换状态以单个 CPU function 为生命周期，
+不由 serializer 重建，也不跨程序保留。
 
 ## Provider 与 runtime 扩展
 
@@ -294,7 +369,7 @@ Triton 的 [Passes.cpp](lib/Target/Triton/Transforms/Passes.cpp) 调度 grid、p
 | cuTile | [ComputeForms.cpp](lib/Target/CuTile/Transforms/ComputeForms.cpp) | 构造 reduce、scan、histogram 和 MMA primitives |
 | cuTile | [Legalize.cpp](lib/Target/CuTile/Transforms/Legalize.cpp) | 共享输入准备、宽索引与循环收尾、完整 surface 验证 |
 
-这些私有 facts 和待提交 replacements 只服务一次变换；阶段之间传递当前 IR 与不可变 profiles，不保留另一份执行计划。Triton 的局部候选在 native-forms 阶段内闭合为 IR configs；cuTile 提交替换后才进入后续循环与配置变换。
+这些私有 facts 和待提交 replacements 只服务一次变换；阶段之间传递当前 IR 与其携带的 resolved profiles，不保留另一份执行计划。Triton 的局部候选在 native-forms 阶段内闭合为 IR configs；cuTile 提交替换后才进入后续循环与配置变换。
 
 对齐推断中的参数域必须是当前证明可依赖的域。`ResidentWorkers` 会由 provider 配置重绑定，公共关系查询不把它的临时候选当作常量或整除事实；coverage capacity 也不等于 logical extent。分支内额外对齐条件由调用方提供局部叶证明，不能传播成其它分支的全局性质。新增整数规则先核对位宽、回绕与除法合同，再接入共同查询，避免在各 provider 重写递归证明。
 
@@ -313,7 +388,7 @@ DSA 的 `isSumOfIntegerProducts` 使用 MLIR 的整数表达式规范化证明�
 使用 [安装说明](environment/README.md) 中已配置的工具链。C++ 构建目录放在仓库外，例如：
 
 ```bash
-cmake --build /path/to/intent-build --target intent-compile --parallel 4
+cmake --build /path/to/intent-build --target intent-compile intent-opt --parallel 4
 INTENT_COMPILER=/path/to/intent-build/tools/intent-compile/intent-compile \
   python examples/softmax.py
 ```
@@ -364,7 +439,7 @@ dsa_input=/path/to/existing-dsa-production-cache/input.mlir
 
 去掉 `--mlir-print-ir-tree-dir` 会把快照写到 stderr；`--mlir-print-ir-before-all` / `--mlir-print-ir-after-all` 可查看已接入 instrumentation 的所有阶段。若增加 `--mlir-print-ir-module-scope`，同时传 `--mlir-disable-threading`。`--mlir-timing` 是编译 pass 时间，不能当作 kernel 执行时间。
 
-CPU 同样复用已有生产 input 与原 target/capability/profile 参数。共享阶段名为 `intent-cpu-normalize-source`、`intent-cpu-materialize-configurations`、`intent-cpu-realize-regions`、`intent-cpu-form-input-supply`、`intent-cpu-form-tasks`；例如对 `intent-cpu-materialize-configurations` 打印前后 IR，可看到单个未绑定函数变为具有完整 binding 的候选函数。Mojo 阶段名为 `intent-mojo-materialize-program`、`intent-mojo-fuse-private-computations`、`intent-mojo-vectorize-program`、`intent-mojo-finalize-program`。这些名字用于完整 pipeline 的观察，不取消前置阶段或外部 registry 的依赖。
+CPU 同样复用已有生产 input 与原 target/capability/profile 参数。共享阶段名为 `intent-cpu-normalize-source`、`intent-cpu-materialize-configurations`、`intent-cpu-realize-regions`、`intent-cpu-form-input-supply`、`intent-cpu-form-tasks`；例如对 `intent-cpu-materialize-configurations` 打印前后 IR，可看到单个未绑定函数变为具有完整 binding 的候选函数。Mojo 阶段名为 `intent-mojo-materialize-program`、`intent-mojo-fuse-private-computations`、`intent-mojo-vectorize-program`、`intent-mojo-finalize-program`。独立使用时须传入所需 pass options，并由相同 dialect registration 安装 context 内的 provider interface；前置 IR 合同仍需成立。
 
 查看 provider 阶段时，沿用同一输入、目标 options 和 tuning profile 的完整编译命令，去掉 `--stop-after-shared`，同时指定 `--ir-output` 与 `--source-output`。例如既有 [cuTile official_fmha](experiments/gpu/providers/cutile/attention.py) 编译 [flash_gqa_attention_fwd](examples/kernels/streaming/attention.py) 时，在原命令追加 `--mlir-print-ir-before=intent-cutile-native-program --mlir-print-ir-after=intent-cutile-native-program --mlir-print-debuginfo`，即可对照原生 form 形成前后的 IR 并显示作者位置；对应 Triton 阶段名是 `intent-triton-native-forms`。最终合法化分别看 `intent-cutile-finalize-program` 与 `intent-triton-finalize-program`。这些阶段名用于同一完整 pipeline 的诊断，不表示可以跳过其输入依赖和 tuning profiles 单独调用。
 

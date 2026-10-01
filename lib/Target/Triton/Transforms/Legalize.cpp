@@ -25,8 +25,9 @@ LogicalResult prepareTritonMemory(ModuleOp module) {
   return gpu::verifyGPUProgram(module);
 }
 
-LogicalResult formTritonProgram(ModuleOp module,
-                               const gpu::TuningProfiles &profiles) {
+LogicalResult formTritonProgram(ModuleOp module) {
+  auto profiles = gpu::TuningProfiles::from(module);
+  if (failed(profiles)) return failure();
   auto kernel = gpu::getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
@@ -35,7 +36,7 @@ LogicalResult formTritonProgram(ModuleOp module,
         return isa<gpu::BufferType>(type);
       }) || detail::hasOrderedViewDependencies(*kernel);
   auto localOptions = declareProviderOptions(
-      *kernel, profiles, requiresCtaSynchronization,
+      *kernel, *profiles, requiresCtaSynchronization,
       detail::findLoadPipelineLoops(*kernel));
   if (failed(localOptions) || failed(gpu::verifyGPUProgram(module)) ||
       failed(gpu::lowerInvocationWorkspaces(module)))

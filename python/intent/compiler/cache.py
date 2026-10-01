@@ -121,7 +121,7 @@ def _compilation_key(executable: Path, module_text: str,
                      options: tuple[str, ...]) -> str:
     resolved, identity = file_identity(executable)
     dependencies = []
-    if "--stop-after-kir" not in options:
+    if "--stop-after-kir" not in options and "--input-stage=shared" not in options:
         profiles = executable.parent / "profiles"
         dependencies.extend((str(path), path.read_text(encoding="utf-8"))
                             for path in sorted(profiles.glob("*.json")))

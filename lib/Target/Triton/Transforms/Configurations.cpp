@@ -12,6 +12,7 @@
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/Resources.h"
 #include "Intent/Target/Triton/IR/TritonOps.h"
+#include "Intent/Target/Triton/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -26,6 +27,12 @@
 
 using namespace mlir;
 namespace intent::triton {
+const gpu::TuningProfileSchema &tuningProfileSchema() {
+  static const StringRef columns[] = {"warps", "stages", "ctas"};
+  static const gpu::TuningProfileSchema schema{"triton", columns};
+  return schema;
+}
+
 namespace {
 StringRef localOptionsFamily(ArrayRef<gpu::ParameterCategory> categories,
                              bool twoAxisPointwise,
@@ -650,7 +657,7 @@ FailureOr<SmallVector<TritonLocalOptions>> declareProviderOptions(
     else if (capabilities.getComputeCapabilityMajor() == 9)
       recurrentContractionFamily = "hopper_recurrent_contraction";
   }
-  auto rows = profiles.get("triton", localOptionsFamily(
+  auto rows = profiles.get(tuningProfileSchema(), localOptionsFamily(
       categories, twoAxisPointwise, recurrentContractionFamily,
       hasContraction && allFp32), kernel.getLoc());
   if (failed(rows))

@@ -3,9 +3,11 @@
 #include "Intent/Dialect/GPU/Transforms/Predication.h"
 #include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
-#include "Intent/Transforms/PassManager.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/IRMapping.h"
@@ -20,6 +22,29 @@
 using namespace mlir;
 
 namespace intent::gpu {
+#define GEN_PASS_DEF_NORMALIZESTRUCTUREDSOURCESPASS
+#define GEN_PASS_DEF_PREDICATESCALARCONTROLPASS
+#define GEN_PASS_DEF_POINTWISEOWNERSHIPPASS
+#define GEN_PASS_DEF_POINTWISEBLOCKINGPASS
+#define GEN_PASS_DEF_SCANCONSUMERSPASS
+#define GEN_PASS_DEF_RETAINEDVALUESPASS
+#define GEN_PASS_DEF_ONLINEREDUCTIONSPASS
+#define GEN_PASS_DEF_REGIONFOLDSPASS
+#define GEN_PASS_DEF_REGIONSCANSPASS
+#define GEN_PASS_DEF_REDUCTIONSPASS
+#define GEN_PASS_DEF_CONTRACTIONSPASS
+#define GEN_PASS_DEF_ACCESSCOMPOSITIONPASS
+#define GEN_PASS_DEF_PRIVATESTORESPASS
+#define GEN_PASS_DEF_BUFFERVECTORIZATIONPASS
+#define GEN_PASS_DEF_BUFFERPROMOTIONPASS
+#define GEN_PASS_DEF_PROGRAMMAPPINGPASS
+#define GEN_PASS_DEF_RANGEPREDICATESPASS
+#define GEN_PASS_DEF_COMMONVALUESPASS
+#define GEN_PASS_DEF_REALIZESHAREDPROGRAMPASS
+#define GEN_PASS_DEF_MATERIALIZECONFIGURATIONSPASS
+#define GEN_PASS_DEF_FUSEINDEPENDENTTRAVERSALSPASS
+#include "Intent/Dialect/GPU/Transforms/Passes.h.inc"
+
 namespace {
 
 // Complete transformation entries own relation closure; the pipeline schedules
@@ -48,10 +73,9 @@ LogicalResult simplifyValues(ModuleOp module) {
   return simplifyMaskedAccessCoordinates(module);
 }
 
-LogicalResult closeSharedConfigurations(func::FuncOp kernel,
-                                        const TuningProfiles &profiles) {
+LogicalResult closeSharedConfigurations(func::FuncOp kernel) {
   eraseUnusedPhysicalParameters(kernel);
-  if (failed(materializeSharedConfigTuples(kernel, profiles)))
+  if (failed(materializeSharedConfigTuples(kernel)))
     return failure();
   return verifySharedConfigTuples(kernel);
 }
@@ -65,11 +89,8 @@ LogicalResult finishTransformation(ModuleOp module, StringRef name,
   return success();
 }
 
-class NormalizeStructuredSourcesPass : public PassWrapper<NormalizeStructuredSourcesPass, OperationPass<ModuleOp>> {
+class NormalizeStructuredSourcesPass : public impl::NormalizeStructuredSourcesPassBase<NormalizeStructuredSourcesPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NormalizeStructuredSourcesPass)
-  StringRef getArgument() const final { return "intent-gpu-normalize-structured-sources"; }
-  StringRef getDescription() const final { return "Normalize structured GPU sources"; }
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(finishTransformation(module, getArgument(), normalizeStructuredSources(module))))
@@ -77,11 +98,8 @@ public:
   }
 };
 
-class PredicateScalarControlPass : public PassWrapper<PredicateScalarControlPass, OperationPass<ModuleOp>> {
+class PredicateScalarControlPass : public impl::PredicateScalarControlPassBase<PredicateScalarControlPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PredicateScalarControlPass)
-  StringRef getArgument() const final { return "intent-gpu-predicate-scalar-control"; }
-  StringRef getDescription() const final { return "Predicate scalar control in the GPU program"; }
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(finishTransformation(module, getArgument(), predicateScalarControl(module))))
@@ -89,11 +107,8 @@ public:
   }
 };
 
-class PointwiseOwnershipPass : public PassWrapper<PointwiseOwnershipPass, OperationPass<ModuleOp>> {
+class PointwiseOwnershipPass : public impl::PointwiseOwnershipPassBase<PointwiseOwnershipPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PointwiseOwnershipPass)
-  StringRef getArgument() const final { return "intent-gpu-form-pointwise-ownership"; }
-  StringRef getDescription() const final { return "Form pointwise GPU ownership"; }
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(finishTransformation(module, getArgument(), realizePointwiseOwnership(module))))
@@ -101,11 +116,8 @@ public:
   }
 };
 
-class PointwiseBlockingPass : public PassWrapper<PointwiseBlockingPass, OperationPass<ModuleOp>> {
+class PointwiseBlockingPass : public impl::PointwiseBlockingPassBase<PointwiseBlockingPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PointwiseBlockingPass)
-  StringRef getArgument() const final { return "intent-gpu-form-pointwise-blocking"; }
-  StringRef getDescription() const final { return "Form pointwise GPU blocking and its dependent value graph"; }
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(finishTransformation(module, getArgument(), realizePointwiseBlocking(module))))
@@ -113,11 +125,8 @@ public:
   }
 };
 
-class ScanConsumersPass : public PassWrapper<ScanConsumersPass, OperationPass<ModuleOp>> {
+class ScanConsumersPass : public impl::ScanConsumersPassBase<ScanConsumersPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ScanConsumersPass)
-  StringRef getArgument() const final { return "intent-gpu-realize-scan-consumers"; }
-  StringRef getDescription() const final { return "Realize GPU scan consumer traversals"; }
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(finishTransformation(module, getArgument(), realizeScanConsumerTraversals(module))))
@@ -125,11 +134,8 @@ public:
   }
 };
 
-class RetainedValuesPass : public PassWrapper<RetainedValuesPass, OperationPass<ModuleOp>> {
+class RetainedValuesPass : public impl::RetainedValuesPassBase<RetainedValuesPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RetainedValuesPass)
-  StringRef getArgument() const final { return "intent-gpu-materialize-retained-values"; }
-  StringRef getDescription() const final { return "Materialize retained GPU values"; }
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(finishTransformation(module, getArgument(), materializeRetainedValues(module))))
@@ -137,11 +143,8 @@ public:
   }
 };
 
-class OnlineReductionsPass : public PassWrapper<OnlineReductionsPass, OperationPass<ModuleOp>> {
+class OnlineReductionsPass : public impl::OnlineReductionsPassBase<OnlineReductionsPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(OnlineReductionsPass)
-  StringRef getArgument() const final { return "intent-gpu-co-realize-online-reductions"; }
-  StringRef getDescription() const final { return "Co-realize GPU online reductions"; }
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(finishTransformation(module, getArgument(), realizeOnlineReductions(module))))
@@ -149,11 +152,8 @@ public:
   }
 };
 
-class RegionFoldsPass : public PassWrapper<RegionFoldsPass, OperationPass<ModuleOp>> {
+class RegionFoldsPass : public impl::RegionFoldsPassBase<RegionFoldsPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RegionFoldsPass)
-  StringRef getArgument() const final { return "intent-gpu-realize-region-folds"; }
-  StringRef getDescription() const final { return "Realize GPU region folds"; }
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(finishTransformation(module, getArgument(), realizeRegionFolds(module))))
@@ -161,11 +161,8 @@ public:
   }
 };
 
-class RegionScansPass : public PassWrapper<RegionScansPass, OperationPass<ModuleOp>> {
+class RegionScansPass : public impl::RegionScansPassBase<RegionScansPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RegionScansPass)
-  StringRef getArgument() const final { return "intent-gpu-realize-region-scans"; }
-  StringRef getDescription() const final { return "Realize GPU region scans"; }
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(finishTransformation(module, getArgument(), realizeRegionScans(module))))
@@ -173,11 +170,8 @@ public:
   }
 };
 
-class ReductionsPass : public PassWrapper<ReductionsPass, OperationPass<ModuleOp>> {
+class ReductionsPass : public impl::ReductionsPassBase<ReductionsPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ReductionsPass)
-  StringRef getArgument() const final { return "intent-gpu-realize-reductions"; }
-  StringRef getDescription() const final { return "Realize GPU reduction programs"; }
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(finishTransformation(module, getArgument(), realizeReductionGroup(module))))
@@ -185,11 +179,8 @@ public:
   }
 };
 
-class ContractionsPass : public PassWrapper<ContractionsPass, OperationPass<ModuleOp>> {
+class ContractionsPass : public impl::ContractionsPassBase<ContractionsPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ContractionsPass)
-  StringRef getArgument() const final { return "intent-gpu-realize-contractions"; }
-  StringRef getDescription() const final { return "Realize GPU contraction programs"; }
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(finishTransformation(module, getArgument(), realizeContractionBlocking(module))))
@@ -197,11 +188,8 @@ public:
   }
 };
 
-class AccessCompositionPass : public PassWrapper<AccessCompositionPass, OperationPass<ModuleOp>> {
+class AccessCompositionPass : public impl::AccessCompositionPassBase<AccessCompositionPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AccessCompositionPass)
-  StringRef getArgument() const final { return "intent-gpu-compose-realized-accesses"; }
-  StringRef getDescription() const final { return "Compose realized GPU accesses and values"; }
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(finishTransformation(module, getArgument(), composeRealizedAccesses(module))))
@@ -209,11 +197,8 @@ public:
   }
 };
 
-class PrivateStoresPass : public PassWrapper<PrivateStoresPass, OperationPass<ModuleOp>> {
+class PrivateStoresPass : public impl::PrivateStoresPassBase<PrivateStoresPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PrivateStoresPass)
-  StringRef getArgument() const final { return "intent-gpu-schedule-private-stores"; }
-  StringRef getDescription() const final { return "Schedule private GPU stores"; }
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(finishTransformation(module, getArgument(), schedulePrivateStores(module))))
@@ -221,11 +206,8 @@ public:
   }
 };
 
-class BufferVectorizationPass : public PassWrapper<BufferVectorizationPass, OperationPass<ModuleOp>> {
+class BufferVectorizationPass : public impl::BufferVectorizationPassBase<BufferVectorizationPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BufferVectorizationPass)
-  StringRef getArgument() const final { return "intent-gpu-vectorize-buffer-loops"; }
-  StringRef getDescription() const final { return "Vectorize GPU buffer loops"; }
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(finishTransformation(module, getArgument(), vectorizeBufferLoops(module))))
@@ -233,11 +215,8 @@ public:
   }
 };
 
-class BufferPromotionPass : public PassWrapper<BufferPromotionPass, OperationPass<ModuleOp>> {
+class BufferPromotionPass : public impl::BufferPromotionPassBase<BufferPromotionPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BufferPromotionPass)
-  StringRef getArgument() const final { return "intent-gpu-promote-buffer-values"; }
-  StringRef getDescription() const final { return "Promote GPU buffer values"; }
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(finishTransformation(module, getArgument(), promoteBufferValues(module))))
@@ -245,11 +224,8 @@ public:
   }
 };
 
-class ProgramMappingPass : public PassWrapper<ProgramMappingPass, OperationPass<ModuleOp>> {
+class ProgramMappingPass : public impl::ProgramMappingPassBase<ProgramMappingPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ProgramMappingPass)
-  StringRef getArgument() const final { return "intent-gpu-refine-program-mapping"; }
-  StringRef getDescription() const final { return "Refine GPU program mapping"; }
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(finishTransformation(module, getArgument(), refineProgramMapping(module))))
@@ -257,11 +233,8 @@ public:
   }
 };
 
-class RangePredicatesPass : public PassWrapper<RangePredicatesPass, OperationPass<ModuleOp>> {
+class RangePredicatesPass : public impl::RangePredicatesPassBase<RangePredicatesPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RangePredicatesPass)
-  StringRef getArgument() const final { return "intent-gpu-simplify-range-predicates"; }
-  StringRef getDescription() const final { return "Remove predicates proven by complete physical tiles"; }
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(finishTransformation(module, getArgument(), simplifyRangePredicates(module))))
@@ -269,11 +242,8 @@ public:
   }
 };
 
-class CommonValuesPass : public PassWrapper<CommonValuesPass, OperationPass<ModuleOp>> {
+class CommonValuesPass : public impl::CommonValuesPassBase<CommonValuesPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CommonValuesPass)
-  StringRef getArgument() const final { return "intent-gpu-eliminate-common-values"; }
-  StringRef getDescription() const final { return "Eliminate common GPU values and simplify masked coordinates"; }
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(finishTransformation(module, getArgument(), simplifyValues(module))))
@@ -282,24 +252,24 @@ public:
 };
 
 void populateTransformations(OpPassManager &manager) {
-  manager.addPass(std::make_unique<NormalizeStructuredSourcesPass>());
-  manager.addPass(std::make_unique<PredicateScalarControlPass>());
-  manager.addPass(std::make_unique<PointwiseOwnershipPass>());
-  manager.addPass(std::make_unique<PointwiseBlockingPass>());
-  manager.addPass(std::make_unique<ScanConsumersPass>());
-  manager.addPass(std::make_unique<RetainedValuesPass>());
-  manager.addPass(std::make_unique<OnlineReductionsPass>());
-  manager.addPass(std::make_unique<RegionFoldsPass>());
-  manager.addPass(std::make_unique<RegionScansPass>());
-  manager.addPass(std::make_unique<ReductionsPass>());
-  manager.addPass(std::make_unique<ContractionsPass>());
-  manager.addPass(std::make_unique<AccessCompositionPass>());
-  manager.addPass(std::make_unique<PrivateStoresPass>());
-  manager.addPass(std::make_unique<BufferVectorizationPass>());
-  manager.addPass(std::make_unique<BufferPromotionPass>());
-  manager.addPass(std::make_unique<ProgramMappingPass>());
-  manager.addPass(std::make_unique<RangePredicatesPass>());
-  manager.addPass(std::make_unique<CommonValuesPass>());
+  manager.addPass(createNormalizeStructuredSourcesPass());
+  manager.addPass(createPredicateScalarControlPass());
+  manager.addPass(createPointwiseOwnershipPass());
+  manager.addPass(createPointwiseBlockingPass());
+  manager.addPass(createScanConsumersPass());
+  manager.addPass(createRetainedValuesPass());
+  manager.addPass(createOnlineReductionsPass());
+  manager.addPass(createRegionFoldsPass());
+  manager.addPass(createRegionScansPass());
+  manager.addPass(createReductionsPass());
+  manager.addPass(createContractionsPass());
+  manager.addPass(createAccessCompositionPass());
+  manager.addPass(createPrivateStoresPass());
+  manager.addPass(createBufferVectorizationPass());
+  manager.addPass(createBufferPromotionPass());
+  manager.addPass(createProgramMappingPass());
+  manager.addPass(createRangePredicatesPass());
+  manager.addPass(createCommonValuesPass());
 }
 
 scf::IfOp independentUniformBranches(func::FuncOp kernel) {
@@ -388,19 +358,29 @@ scf::IfOp independentUniformBranches(func::FuncOp kernel) {
 }
 
 FailureOr<bool> realizeUniformBranches(ModuleOp module, func::FuncOp kernel,
-                                       scf::IfOp conditional, PassManager &manager) {
+    scf::IfOp conditional, function_ref<LogicalResult(ModuleOp)> runTransforms) {
   // Optimize each mutually exclusive region with the existing kernel passes,
   // then rejoin their physical programs under one launch and the original ABI.
   SmallVector<OwningOpRef<ModuleOp>> branches;
+  // Clone before attaching either temporary module so a later branch never
+  // captures the earlier branch's transient program. OwningOpRef erases each
+  // attached module on success, rejection, or pass failure.
+  SmallVector<func::FuncOp> functions;
+  SmallVector<scf::IfOp> choices;
   for (unsigned index = 0; index < 2; ++index) {
     IRMapping mapping;
     OwningOpRef<ModuleOp> branch(cast<ModuleOp>(module->clone(mapping)));
-    // These temporary modules are separate pass-manager runs. A diagnostic
-    // symbol keeps MLIR's native print-tree files distinct for each branch.
     (*branch)->setAttr(SymbolTable::getSymbolAttrName(),
         StringAttr::get(module.getContext(), "intent_uniform_branch_" + std::to_string(index)));
-    auto function = cast<func::FuncOp>(mapping.lookup(kernel.getOperation()));
-    auto choice = cast<scf::IfOp>(mapping.lookup(conditional.getOperation()));
+    functions.push_back(cast<func::FuncOp>(mapping.lookup(kernel.getOperation())));
+    choices.push_back(cast<scf::IfOp>(mapping.lookup(conditional.getOperation())));
+    branches.push_back(std::move(branch));
+  }
+  for (unsigned index = 0; index < 2; ++index) {
+    auto &branch = branches[index];
+    module.getBody()->push_back(branch->getOperation());
+    func::FuncOp function = functions[index];
+    scf::IfOp choice = choices[index];
     Block &body = choice->getRegion(index).front();
     for (Operation &operation :
          llvm::make_early_inc_range(body.without_terminator()))
@@ -413,7 +393,7 @@ FailureOr<bool> realizeUniformBranches(ModuleOp module, func::FuncOp kernel,
     function->setAttr(effectOriginsAttr,
                       ArrayAttr::get(module.getContext(), effects));
     eraseDeadPhysicalValues(function);
-    if (failed(manager.run(*branch)))
+    if (failed(runTransforms(*branch)))
       return failure();
     eraseUnusedPhysicalParameters(function);
     auto space = function->getAttrOfType<ArrayAttr>(programSpaceAttr);
@@ -453,7 +433,6 @@ FailureOr<bool> realizeUniformBranches(ModuleOp module, func::FuncOp kernel,
           qualify(expression.getSymbol()), expression.getOperands());
     });
     replacer.recursivelyReplaceElementsIn(function, true, true, true);
-    branches.push_back(std::move(branch));
   }
 
   auto combined = cast<func::FuncOp>(kernel->cloneWithoutRegions());
@@ -543,32 +522,73 @@ FailureOr<bool> realizeUniformBranches(ModuleOp module, func::FuncOp kernel,
   combined->setAttr(programSpaceAttr, builder.getArrayAttr({offset}));
   combined->setAttr(gridRankAttr, builder.getI64IntegerAttr(1));
   kernel.erase();
+  branches.clear();
   if (failed(verifyGPUProgram(module)))
     return failure();
   return true;
 }
 
+class RealizeSharedProgramPass
+    : public impl::RealizeSharedProgramPassBase<RealizeSharedProgramPass> {
+public:
+  void runOnOperation() final {
+    ModuleOp module = getOperation();
+    auto transform = [&]() -> LogicalResult {
+      if (failed(verifyGPUProgram(module))) return failure();
+      auto kernel = getPhysicalKernel(module);
+      if (failed(kernel)) return failure();
+      OpPassManager pipeline(ModuleOp::getOperationName());
+      populateTransformations(pipeline);
+      if (scf::IfOp conditional = independentUniformBranches(*kernel)) {
+        auto realized = realizeUniformBranches(module, *kernel, conditional,
+            [&](ModuleOp branch) { return runPipeline(pipeline, branch); });
+        if (failed(realized)) return failure();
+        if (*realized) return success();
+      }
+      return runPipeline(pipeline, module);
+    };
+    if (failed(finishTransformation(module, getArgument(), transform())))
+      signalPassFailure();
+  }
+};
+
+class MaterializeConfigurationsPass
+    : public impl::MaterializeConfigurationsPassBase<MaterializeConfigurationsPass> {
+public:
+  void runOnOperation() final {
+    ModuleOp module = getOperation();
+    auto kernel = getPhysicalKernel(module);
+    if (failed(kernel) || failed(finishTransformation(module, getArgument(),
+                                        closeSharedConfigurations(*kernel))))
+      signalPassFailure();
+  }
+};
+
+class FuseIndependentTraversalsPass
+    : public impl::FuseIndependentTraversalsPassBase<FuseIndependentTraversalsPass> {
+public:
+  void runOnOperation() final {
+    ModuleOp module = getOperation();
+    auto transform = [&]() -> LogicalResult {
+      if (failed(fuseIndependentTraversals(module))) return failure();
+      auto kernel = getPhysicalKernel(module);
+      return succeeded(kernel) ? verifySharedConfigTuples(*kernel) : failure();
+    };
+    if (failed(finishTransformation(module, getArgument(), transform())))
+      signalPassFailure();
+  }
+};
+
 } // namespace
 
+#define GEN_PASS_REGISTRATION
+#include "Intent/Dialect/GPU/Transforms/Passes.h.inc"
+
 void registerGPUPasses() {
-  PassRegistration<NormalizeStructuredSourcesPass>();
-  PassRegistration<PredicateScalarControlPass>();
-  PassRegistration<PointwiseOwnershipPass>();
-  PassRegistration<PointwiseBlockingPass>();
-  PassRegistration<ScanConsumersPass>();
-  PassRegistration<RetainedValuesPass>();
-  PassRegistration<OnlineReductionsPass>();
-  PassRegistration<RegionFoldsPass>();
-  PassRegistration<RegionScansPass>();
-  PassRegistration<ReductionsPass>();
-  PassRegistration<ContractionsPass>();
-  PassRegistration<AccessCompositionPass>();
-  PassRegistration<PrivateStoresPass>();
-  PassRegistration<BufferVectorizationPass>();
-  PassRegistration<BufferPromotionPass>();
-  PassRegistration<ProgramMappingPass>();
-  PassRegistration<RangePredicatesPass>();
-  PassRegistration<CommonValuesPass>();
+  registerIntentGPUTransformPasses();
+  PassPipelineRegistration<>("intent-gpu-shared",
+      "Realize and close the shared executable GPU program",
+      buildSharedGPUPipeline);
 }
 
 LogicalResult completeGPUProgramConstruction(ModuleOp module) {
@@ -579,31 +599,10 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
   return verifyGPUProgram(module);
 }
 
-LogicalResult runSharedGPUPasses(ModuleOp module, const TuningProfiles &profiles) {
-  if (failed(verifyGPUProgram(module)))
-    return failure();
-  FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
-  if (failed(kernel))
-    return failure();
-  PassManager manager(module.getContext(), ModuleOp::getOperationName());
-  populateTransformations(manager);
-  if (failed(intent::configurePassManager(manager))) return failure();
-  bool realizedBranches = false;
-  if (scf::IfOp conditional = independentUniformBranches(*kernel)) {
-    auto realized = realizeUniformBranches(module, *kernel, conditional, manager);
-    if (failed(realized))
-      return failure();
-    realizedBranches = *realized;
-    kernel = getPhysicalKernel(module);
-  }
-  if (!realizedBranches && failed(manager.run(module))) {
-    return failure();
-  }
-  if (failed(closeSharedConfigurations(*kernel, profiles)) ||
-      failed(fuseIndependentTraversals(module)) ||
-      failed(verifySharedConfigTuples(*kernel)))
-    return failure();
-  return verifyGPUProgram(module);
+void buildSharedGPUPipeline(OpPassManager &manager) {
+  manager.addPass(createRealizeSharedProgramPass());
+  manager.addPass(createMaterializeConfigurationsPass());
+  manager.addPass(createFuseIndependentTraversalsPass());
 }
 
 } // namespace intent::gpu

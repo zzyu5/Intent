@@ -8,7 +8,7 @@ from .compiler import CompilationStageError
 from .compiler import compile
 from .compiler import compile_ir
 from .compiler import compile_shared_gpu
-from .compiler import generate, CompiledIR, GeneratedProgram
+from .compiler import generate, generate_from_ir, optimize_ir, CompiledIR, GeneratedProgram, OptimizedIR
 from .diagnostics import DefinitionError
 from .diagnostics import IntentError
 from .diagnostics import LanguageUseError
@@ -38,8 +38,11 @@ __all__ = [
     "compile_ir",
     "compile_shared_gpu",
     "generate",
+    "generate_from_ir",
+    "optimize_ir",
     "GeneratedProgram",
     "CompiledIR",
+    "OptimizedIR",
     "CompiledArtifact",
     "PreparedCall",
     "CuTileTarget",

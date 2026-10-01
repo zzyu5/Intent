@@ -1,10 +1,101 @@
 #include "Intent/Dialect/CPU/Transforms/Implementation.h"
+#include "Intent/Dialect/CPU/IR/CPUDialect.h"
+#include "Intent/Dialect/CPU/IR/ImplementationProvider.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
 namespace intent::cpu {
+
+ImplementationParameter ImplementationParameter::local(StringRef name, ImplementationParameterDomain domain) {
+  return {name, Local{name}, std::move(domain)};
+}
+ImplementationParameter ImplementationParameter::alias(StringRef name, StringRef source) {
+  return {name, Local{source}, {}};
+}
+ImplementationParameter ImplementationParameter::constant(StringRef name, int64_t value) {
+  return {name, Constant{value}, {}};
+}
+ImplementationParameter ImplementationParameter::minimum(StringRef name, int64_t limit, ArrayRef<Axis> axes) {
+  return {name, Minimum{limit, llvm::to_vector(axes)}, {}};
+}
+
+namespace {
+int64_t minimumParameter(const ImplementationParameter::Minimum &source, ConfigurationAttr config) {
+  int64_t value = source.limit;
+  for (auto axis : source.axes)
+    value = std::min(value, axis == ImplementationParameter::Axis::TileM
+                               ? config.getTileM() : config.getTileN());
+  return value;
+}
+
+std::optional<std::string> checkParameters(const Implementation &implementation,
+    DictionaryAttr values, CapabilitiesAttr capabilities, ConfigurationAttr configuration) {
+  if (values.size() != implementation.parameters.size())
+    return "parameter keys do not match the implementation schema";
+  for (const auto &parameter : implementation.parameters) {
+    auto integer = values.getAs<IntegerAttr>(parameter.name);
+    if (!integer || !integer.getValue().isSignedIntN(64) || integer.getInt() <= 0)
+      return "parameter '" + parameter.name.str() + "' requires a positive signed-64-bit representable integer";
+    int64_t value = integer.getInt();
+    const auto &domain = parameter.domain;
+    if ((domain.powerOfTwo && !llvm::isPowerOf2_64(value)) ||
+        (domain.maximum && value > *domain.maximum) ||
+        (domain.laneBits && value > capabilities.getVectorBits() / domain.laneBits) ||
+        (!domain.values.empty() && !llvm::is_contained(domain.values, value)))
+      return "parameter '" + parameter.name.str() + "' is outside its declared implementation domain";
+    if (auto local = std::get_if<ImplementationParameter::Local>(&parameter.source)) {
+      if (local->name != parameter.name) {
+        auto source = values.getAs<IntegerAttr>(local->name);
+        if (!source || !source.getValue().isSignedIntN(64) || source.getInt() != value)
+          return "parameter '" + parameter.name.str() + "' must equal '" + local->name.str() + "'";
+      }
+    } else if (auto fixed = std::get_if<ImplementationParameter::Constant>(&parameter.source)) {
+      if (value != fixed->value)
+        return "parameter '" + parameter.name.str() + "' must equal " + std::to_string(fixed->value);
+    } else if (value != minimumParameter(std::get<ImplementationParameter::Minimum>(parameter.source), configuration)) {
+      return "parameter '" + parameter.name.str() + "' disagrees with its declared shared-extent derivation";
+    }
+  }
+  return implementation.parameterRelations ? implementation.parameterRelations(values, capabilities) : std::nullopt;
+}
+
+std::optional<std::string> bindParameters(const Implementation &implementation,
+    Builder &builder, CapabilitiesAttr capabilities, const Configuration &configuration,
+    ConfigurationAttr shared, DictionaryAttr &bound) {
+  NamedAttrList values;
+  for (const auto &parameter : implementation.parameters) {
+    Attribute value;
+    if (auto local = std::get_if<ImplementationParameter::Local>(&parameter.source)) {
+      value = configuration.local.get(local->name);
+      if (!value) return "missing local parameter '" + local->name.str() + "'";
+    } else if (auto fixed = std::get_if<ImplementationParameter::Constant>(&parameter.source)) {
+      value = builder.getI64IntegerAttr(fixed->value);
+    } else {
+      value = builder.getI64IntegerAttr(minimumParameter(
+          std::get<ImplementationParameter::Minimum>(parameter.source), shared));
+    }
+    values.append(parameter.name, value);
+  }
+  bound = values.getDictionary(builder.getContext());
+  return checkParameters(implementation, bound, capabilities, shared);
+}
+} // namespace
+
+FailureOr<const ImplementationRegistry *>
+lookupImplementationProvider(Operation *operation, StringRef provider) {
+  if (provider.empty())
+    return operation->emitError("CPU transformation requires an explicit provider option"), failure();
+  auto dialect = operation->getContext()->getOrLoadDialect<IntentCPUDialect>();
+  auto interface = dialect->getRegisteredInterface<ImplementationProviderInterface>();
+  if (!interface)
+    return operation->emitError("CPU implementation providers were not installed in this compiler context"), failure();
+  auto registry = interface->lookup(provider);
+  if (failed(registry))
+    return operation->emitError("CPU implementation provider is unavailable: ") << provider, failure();
+  return *registry;
+}
 
 std::optional<std::string> checkInputRequirement(
     Value source, Value element, const InputRequirement &requirement) {
@@ -87,10 +178,13 @@ std::optional<std::string> matchImplementation(
     ImplementationMatch &match) {
   if (!implementation.applicable(operation)) return "implementation does not match this computation";
   if (auto reason = checkInputLayouts(operation, implementation.contraction)) return reason;
-  if (auto reason = implementation.check(operation, capabilities, configuration)) return reason;
   Builder builder(operation->getContext());
+  DictionaryAttr parameters;
+  if (auto reason = bindParameters(implementation, builder, capabilities, configuration,
+          sharedConfiguration(builder.getContext(), configuration), parameters)) return reason;
+  if (auto reason = implementation.check(operation, capabilities, configuration)) return reason;
   auto binding = ImplementationAttr::get(builder.getContext(), builder.getStringAttr(implementation.name),
-      implementation.parameters(builder, configuration));
+      parameters);
   bool supplyFree = true;
   if (auto generic = dyn_cast<linalg::GenericOp>(operation)) {
     auto requirements = implementation.inputRequirements(
@@ -137,13 +231,66 @@ bool needsImplementation(Operation *operation) {
 
 FailureOr<const Implementation *> ImplementationRegistry::lookup(Operation *operation) const {
   auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
-  if (binding)
-    for (const auto &implementation : implementations)
-      if (implementation.name == binding.getName().getValue() && implementation.applicable(operation) &&
-          !checkInputLayouts(operation, implementation.contraction))
-        return &implementation;
+  auto function = dyn_cast<func::FuncOp>(operation);
+  if (!function) function = operation->getParentOfType<func::FuncOp>();
+  auto module = operation->getParentOfType<ModuleOp>();
+  auto implementation = verifyBinding(binding,
+      module ? module->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities") : CapabilitiesAttr(),
+      function ? function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration") : ConfigurationAttr(), operation);
+  if (failed(implementation)) return failure();
+  if ((*implementation)->applicable(operation) && !checkInputLayouts(operation, (*implementation)->contraction))
+    return *implementation;
   operation->emitError("CPU computation has lost its selected implementation binding");
   return failure();
+}
+
+FailureOr<const Implementation *> ImplementationRegistry::verifyBinding(
+    ImplementationAttr binding, CapabilitiesAttr capabilities,
+    ConfigurationAttr configuration, Operation *diagnostic) const {
+  if (!binding || !capabilities || !configuration)
+    return diagnostic->emitError("CPU implementation validation requires a typed binding, capabilities and configuration"), failure();
+  for (const auto &implementation : implementations) {
+    if (implementation.name != binding.getName().getValue()) continue;
+    if (auto reason = checkParameters(implementation, binding.getParameters(), capabilities, configuration))
+      return diagnostic->emitError("invalid CPU implementation '") << implementation.name << "': " << *reason, failure();
+    if (implementation.requiresMatrixI8I32 && !capabilities.getMatrixI8I32())
+      return diagnostic->emitError("CPU implementation requires the matrix_i8_i32 capability"), failure();
+    return &implementation;
+  }
+  return diagnostic->emitError("CPU binding names an implementation outside the selected provider: ") << binding.getName(), failure();
+}
+
+LogicalResult ImplementationRegistry::verifyBindings(ModuleOp module) const {
+  auto capabilities = module->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities");
+  for (auto function : module.getOps<func::FuncOp>()) {
+    if (function.isExternal() && function->hasAttr("cpu.external_runtime")) continue;
+    auto configuration = function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration");
+    auto summary = function->getAttrOfType<ArrayAttr>("intent_cpu.implementations");
+    auto requiresMatrix = function->getAttrOfType<BoolAttr>("intent_cpu.requires_matrix_i8_i32");
+    if (!capabilities || !configuration || !summary || summary.empty() || !requiresMatrix)
+      return function.emitError("CPU provider requires complete retained implementation bindings");
+    bool matrix = false;
+    for (Attribute attribute : summary) {
+      auto implementation = verifyBinding(dyn_cast<ImplementationAttr>(attribute), capabilities, configuration, function);
+      if (failed(implementation)) return failure();
+      matrix |= (*implementation)->requiresMatrixI8I32;
+    }
+    if (matrix != requiresMatrix.getValue())
+      return function.emitError("CPU matrix requirement disagrees with retained implementation bindings");
+    auto status = function.walk([&](Operation *operation) -> WalkResult {
+      if (!operation->hasAttr("intent_cpu.implementation")) return WalkResult::advance();
+      auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
+      return succeeded(verifyBinding(binding, capabilities, configuration, operation))
+          ? WalkResult::advance() : WalkResult::interrupt();
+    });
+    if (status.wasInterrupted()) return failure();
+  }
+  return success();
+}
+
+LogicalResult verifyImplementationBindings(ModuleOp module, StringRef provider) {
+  auto registry = lookupImplementationProvider(module, provider);
+  return failed(registry) ? failure() : (**registry).verifyBindings(module);
 }
 
 SmallVector<SmallVector<ImplementationAttr>> ImplementationRegistry::candidates(

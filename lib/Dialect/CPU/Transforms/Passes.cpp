@@ -2,7 +2,6 @@
 #include "Contractions.h"
 #include "Intent/Dialect/CPU/Transforms/Implementation.h"
 #include "Intent/Dialect/CPU/IR/CPUDialect.h"
-#include "Intent/Transforms/PassManager.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -16,13 +15,19 @@
 using namespace mlir;
 
 namespace intent::cpu {
-namespace {
 
-void programDialects(DialectRegistry &registry) {
-  registry.insert<IntentCPUDialect, arith::ArithDialect, func::FuncDialect,
-                  linalg::LinalgDialect, math::MathDialect, memref::MemRefDialect,
-                  scf::SCFDialect, vector::VectorDialect>();
-}
+#define GEN_PASS_DEF_CPUCONFIGURETARGET
+#define GEN_PASS_DEF_CPUNORMALIZESOURCE
+#define GEN_PASS_DEF_CPUMATERIALIZECONFIGURATIONS
+#define GEN_PASS_DEF_CPUREALIZEREGIONS
+#define GEN_PASS_DEF_CPUFORMINPUTSUPPLY
+#define GEN_PASS_DEF_CPUFORMTASKS
+#include "Intent/Dialect/CPU/Transforms/Passes.h.inc"
+
+#define GEN_PASS_REGISTRATION
+#include "Intent/Dialect/CPU/Transforms/Passes.h.inc"
+
+namespace {
 
 OpPassManager normalizationPipeline() {
   OpPassManager manager(ModuleOp::getOperationName());
@@ -47,15 +52,23 @@ FailureOr<Configuration> currentConfiguration(func::FuncOp function) {
                        binding.getTileK(), binding.getRegionSize(), {}};
 }
 
-class NormalizeSourcePass
-    : public PassWrapper<NormalizeSourcePass, OperationPass<ModuleOp>> {
+class ConfigureTargetPass : public impl::CPUConfigureTargetBase<ConfigureTargetPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NormalizeSourcePass)
-  void getDependentDialects(DialectRegistry &registry) const final { programDialects(registry); }
-  StringRef getArgument() const final { return "intent-cpu-normalize-source"; }
-  StringRef getDescription() const final {
-    return "Normalize source computations before CPU implementation selection";
+  using CPUConfigureTargetBase::CPUConfigureTargetBase;
+  void runOnOperation() final {
+    auto module = getOperation();
+    auto capabilities = CapabilitiesAttr::getChecked([&]() { return module.emitError(); },
+        module.getContext(), vectorBits.getValue(), workers.getValue(),
+        privateBytes.getValue(), matrixI8I32.getValue());
+    if (!capabilities) return signalPassFailure();
+    module->setAttr("intent_cpu.capabilities", capabilities);
+    if (failed(finishGroup(module, getArgument(), success()))) signalPassFailure();
   }
+};
+
+class NormalizeSourcePass : public impl::CPUNormalizeSourceBase<NormalizeSourcePass> {
+public:
+  using CPUNormalizeSourceBase::CPUNormalizeSourceBase;
   void runOnOperation() final {
     auto module = getOperation();
     auto transform = [&]() -> LogicalResult {
@@ -74,127 +87,84 @@ public:
   }
 };
 
-class MaterializeConfigurationsPass
-    : public PassWrapper<MaterializeConfigurationsPass, OperationPass<ModuleOp>> {
+class MaterializeConfigurationsPass : public impl::CPUMaterializeConfigurationsBase<MaterializeConfigurationsPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MaterializeConfigurationsPass)
-  MaterializeConfigurationsPass() = default;
-  MaterializeConfigurationsPass(const ImplementationRegistry &implementations,
-                                StringRef defaults, StringRef overrides)
-      : implementations(&implementations), defaults(defaults.str()), overrides(overrides.str()) {}
-  void getDependentDialects(DialectRegistry &registry) const final { programDialects(registry); }
-  StringRef getArgument() const final { return "intent-cpu-materialize-configurations"; }
-  StringRef getDescription() const final {
-    return "Bind complete CPU implementation candidates into the current program";
-  }
+  using CPUMaterializeConfigurationsBase::CPUMaterializeConfigurationsBase;
   void runOnOperation() final {
     auto module = getOperation();
-    if (!implementations) {
-      module.emitError("CPU configuration materialization requires a provider implementation registry");
-      return signalPassFailure();
-    }
+    auto implementations = lookupImplementationProvider(module, provider.getValue());
+    if (failed(implementations)) return signalPassFailure();
     // The complete entry verifies its bound clones. No candidate portfolio is
     // retained by the pass or reused after subsequent program transformations.
-    if (failed(materializeCPUConfigurations(module, *implementations, defaults, overrides))) {
+    if (failed(materializeCPUConfigurations(module, **implementations, defaults.getValue(), overrides.getValue()))) {
       module.emitError() << "CPU transformation failed: " << getArgument();
       signalPassFailure();
     }
   }
-private:
-  const ImplementationRegistry *implementations = nullptr;
-  std::string defaults, overrides;
 };
 
-class RealizeRegionsPass
-    : public PassWrapper<RealizeRegionsPass, OperationPass<ModuleOp>> {
+class RealizeRegionsPass : public impl::CPURealizeRegionsBase<RealizeRegionsPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RealizeRegionsPass)
-  RealizeRegionsPass() = default;
-  explicit RealizeRegionsPass(const ImplementationRegistry &implementations)
-      : implementations(&implementations) {}
-  void getDependentDialects(DialectRegistry &registry) const final { programDialects(registry); }
-  StringRef getArgument() const final { return "intent-cpu-realize-regions"; }
-  StringRef getDescription() const final {
-    return "Realize configured CPU regions and close newly exposed structured computations";
-  }
+  using CPURealizeRegionsBase::CPURealizeRegionsBase;
   void runOnOperation() final {
     auto module = getOperation();
     auto transform = [&]() -> LogicalResult {
-      if (!implementations)
-        return module.emitError("CPU region realization requires a provider implementation registry");
+      auto implementations = lookupImplementationProvider(module, provider.getValue());
+      if (failed(implementations)) return failure();
+      if (failed((**implementations).verifyBindings(module))) return failure();
       for (auto function : module.getOps<func::FuncOp>()) {
         auto config = currentConfiguration(function);
         if (failed(config) || failed(groupRegionComputations(function, *config)) ||
-            failed(realizeRegions(function, *config, *implementations))) return failure();
+            failed(realizeRegions(function, *config, **implementations))) return failure();
       }
       auto cleanup = normalizationPipeline();
       if (failed(runPipeline(cleanup, module))) return failure();
       for (auto function : module.getOps<func::FuncOp>())
-        if (failed(foldContractionInputs(function, *implementations)) ||
+        if (failed(foldContractionInputs(function, **implementations)) ||
             failed(realizeHistograms(function)) || failed(foldUniformComputations(function)) ||
             failed(fuseStructuredComputations(function))) return failure();
       return runPipeline(cleanup, module);
     };
     if (failed(finishGroup(module, getArgument(), transform()))) signalPassFailure();
   }
-private:
-  const ImplementationRegistry *implementations = nullptr;
 };
 
-class FormInputSupplyPass
-    : public PassWrapper<FormInputSupplyPass, OperationPass<ModuleOp>> {
+class FormInputSupplyPass : public impl::CPUFormInputSupplyBase<FormInputSupplyPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FormInputSupplyPass)
-  FormInputSupplyPass() = default;
-  explicit FormInputSupplyPass(const ImplementationRegistry &implementations)
-      : implementations(&implementations) {}
-  void getDependentDialects(DialectRegistry &registry) const final { programDialects(registry); }
-  StringRef getArgument() const final { return "intent-cpu-form-input-supply"; }
-  StringRef getDescription() const final {
-    return "Form shared input representations, reuse storage and block configured CPU worksets";
-  }
+  using CPUFormInputSupplyBase::CPUFormInputSupplyBase;
   void runOnOperation() final {
     auto module = getOperation();
     auto transform = [&]() -> LogicalResult {
-      if (!implementations)
-        return module.emitError("CPU input supply requires a provider implementation registry");
+      auto implementations = lookupImplementationProvider(module, provider.getValue());
+      if (failed(implementations)) return failure();
+      if (failed((**implementations).verifyBindings(module))) return failure();
       for (auto function : module.getOps<func::FuncOp>()) {
         if (failed(reusePrivateStorage(function)) ||
-            failed(reusePreparedInputs(function, *implementations)) ||
-            failed(groupQuantizedDots(function, *implementations))) return failure();
+            failed(reusePreparedInputs(function, **implementations)) ||
+            failed(groupQuantizedDots(function, **implementations))) return failure();
         auto config = currentConfiguration(function);
-        if (failed(config) || failed(groupWorksetComputations(function, *implementations)) ||
-            failed(blockContractions(function, *config, *implementations)) ||
-            failed(blockStructuredComputations(function, *implementations))) return failure();
+        if (failed(config) || failed(groupWorksetComputations(function, **implementations)) ||
+            failed(blockContractions(function, *config, **implementations)) ||
+            failed(blockStructuredComputations(function, **implementations))) return failure();
       }
       return success();
     };
     if (failed(finishGroup(module, getArgument(), transform()))) signalPassFailure();
   }
-private:
-  const ImplementationRegistry *implementations = nullptr;
 };
 
-class FormTasksPass
-    : public PassWrapper<FormTasksPass, OperationPass<ModuleOp>> {
+class FormTasksPass : public impl::CPUFormTasksBase<FormTasksPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FormTasksPass)
-  FormTasksPass() = default;
-  explicit FormTasksPass(const ImplementationRegistry &implementations)
-      : implementations(&implementations) {}
-  void getDependentDialects(DialectRegistry &registry) const final { programDialects(registry); }
-  StringRef getArgument() const final { return "intent-cpu-form-tasks"; }
-  StringRef getDescription() const final {
-    return "Partition configured CPU work and isolate complete task captures";
-  }
+  using CPUFormTasksBase::CPUFormTasksBase;
   void runOnOperation() final {
     auto module = getOperation();
     auto transform = [&]() -> LogicalResult {
-      if (!implementations)
-        return module.emitError("CPU task formation requires a provider implementation registry");
+      auto implementations = lookupImplementationProvider(module, provider.getValue());
+      if (failed(implementations)) return failure();
+      if (failed((**implementations).verifyBindings(module))) return failure();
       for (auto function : module.getOps<func::FuncOp>()) {
         auto config = currentConfiguration(function);
-        if (failed(config) || failed(partitionTasks(function, config->taskGrain, *implementations)))
+        if (failed(config) || failed(partitionTasks(function, config->taskGrain, **implementations)))
           return failure();
       }
       auto cleanup = normalizationPipeline();
@@ -205,38 +175,38 @@ public:
     };
     if (failed(finishGroup(module, getArgument(), transform()))) signalPassFailure();
   }
-private:
-  const ImplementationRegistry *implementations = nullptr;
 };
 
 } // namespace
 
 void registerCPUPasses() {
-  PassRegistration<NormalizeSourcePass>();
-  PassRegistration<MaterializeConfigurationsPass>();
-  PassRegistration<RealizeRegionsPass>();
-  PassRegistration<FormInputSupplyPass>();
-  PassRegistration<FormTasksPass>();
+  registerCPUTransformPasses();
+  PassPipelineRegistration<CPUCompilationOptions>("intent-cpu-pipeline",
+      "Construct configured CPU tasks with the selected compiled provider", buildCPUPipeline);
 }
 
-LogicalResult runCPUPasses(ModuleOp module, int64_t vectorBits, int64_t workers,
-                          bool matrixI8I32, StringRef defaults, StringRef overrides,
-                          const ImplementationRegistry &implementations) {
-  auto capabilities = CapabilitiesAttr::getChecked([&]() { return module.emitError(); },
-      module.getContext(), vectorBits, workers, int64_t{262144}, matrixI8I32);
-  if (!capabilities) return failure();
-  module->setAttr("intent_cpu.capabilities", capabilities);
-  if (failed(verifyCPUProgram(module, false))) return failure();
-  // The registry is immutable and alive for this synchronous manager run.
-  // Every execution decision that survives a group is carried by current IR.
-  PassManager manager(module.getContext(), ModuleOp::getOperationName());
-  manager.addPass(std::make_unique<NormalizeSourcePass>());
-  manager.addPass(std::make_unique<MaterializeConfigurationsPass>(implementations, defaults, overrides));
-  manager.addPass(std::make_unique<RealizeRegionsPass>(implementations));
-  manager.addPass(std::make_unique<FormInputSupplyPass>(implementations));
-  manager.addPass(std::make_unique<FormTasksPass>(implementations));
-  if (failed(intent::configurePassManager(manager))) return failure();
-  return manager.run(module);
+void buildCPUPipeline(OpPassManager &manager, const CPUCompilationOptions &options) {
+  CPUConfigureTargetOptions target;
+  target.vectorBits = options.vectorBits;
+  target.workers = options.workers;
+  target.privateBytes = options.privateBytes;
+  target.matrixI8I32 = options.matrixI8I32;
+  manager.addPass(createCPUConfigureTarget(target));
+  manager.addPass(createCPUNormalizeSource());
+  CPUMaterializeConfigurationsOptions configurations;
+  configurations.provider = options.provider;
+  configurations.defaults = options.defaults;
+  configurations.overrides = options.overrides;
+  manager.addPass(createCPUMaterializeConfigurations(configurations));
+  CPURealizeRegionsOptions regions;
+  regions.provider = options.provider;
+  manager.addPass(createCPURealizeRegions(regions));
+  CPUFormInputSupplyOptions supply;
+  supply.provider = options.provider;
+  manager.addPass(createCPUFormInputSupply(supply));
+  CPUFormTasksOptions tasks;
+  tasks.provider = options.provider;
+  manager.addPass(createCPUFormTasks(tasks));
 }
 
 } // namespace intent::cpu

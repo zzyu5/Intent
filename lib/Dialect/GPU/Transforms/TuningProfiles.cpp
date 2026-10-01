@@ -1,5 +1,7 @@
 #include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
+#include "Intent/Dialect/GPU/IR/Program.h"
 
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -25,38 +27,44 @@ FailureOr<llvm::json::Value> readJSON(Location location, StringRef filename) {
   return std::move(*value);
 }
 
-FailureOr<TuningProfiles::Table> readTable(Location location,
-                                          const llvm::json::Value &value,
-                                          size_t width, StringRef family) {
+FailureOr<ArrayAttr> readTable(Location location,
+                              const llvm::json::Value &value, StringRef family) {
   auto array = value.getAsArray();
-  if (!array || array->empty()) {
-    emitError(location) << "tuning profile '" << family << "' needs a non-empty row array";
+  if (!array) {
+    emitError(location) << "tuning profile '" << family << "' needs a row array";
     return failure();
   }
-  TuningProfiles::Table table;
+  Builder builder(location.getContext());
+  SmallVector<Attribute> rows;
   for (const llvm::json::Value &value : *array) {
     auto columns = value.getAsArray();
-    if (!columns || columns->size() != width) {
-      emitError(location) << "tuning profile '" << family << "' requires " << width
-                          << " integer columns per row";
+    if (!columns) {
+      emitError(location) << "tuning profile '" << family << "' requires integer row arrays";
       return failure();
     }
-    TuningProfiles::Row row;
+    SmallVector<int64_t> row;
     for (const llvm::json::Value &column : *columns) {
       auto number = column.getAsInteger();
-      if (!number || *number <= 0) {
-        emitError(location) << "tuning profile '" << family << "' values must be positive integers";
+      if (!number) {
+        emitError(location) << "tuning profile '" << family << "' values must be integers";
         return failure();
       }
       row.push_back(*number);
     }
-    if (llvm::is_contained(table, row)) {
-      emitError(location) << "tuning profile '" << family << "' contains duplicate rows";
-      return failure();
-    }
-    table.push_back(std::move(row));
+    rows.push_back(builder.getDenseI64ArrayAttr(row));
   }
-  return table;
+  return builder.getArrayAttr(rows);
+}
+
+LogicalResult checkColumns(const TuningProfileSchema &schema, ArrayAttr columns,
+                           Location location) {
+  if (columns.size() != schema.columns.size() ||
+      !llvm::equal(columns, schema.columns, [](Attribute column, StringRef expected) {
+        auto name = dyn_cast<StringAttr>(column);
+        return name && name.getValue() == expected;
+      }))
+    return emitError(location) << "tuning column name/order disagrees for " << schema.space;
+  return success();
 }
 
 } // namespace
@@ -64,7 +72,8 @@ FailureOr<TuningProfiles::Table> readTable(Location location,
 FailureOr<TuningProfiles> TuningProfiles::read(
     Location location, ArrayRef<TuningProfileSource> defaults,
     StringRef overrideFilename) {
-  TuningProfiles profiles;
+  Builder builder(location.getContext());
+  NamedAttrList spaces;
   for (const TuningProfileSource &source : defaults) {
     auto parsed = readJSON(location, source.filename);
     if (failed(parsed))
@@ -76,72 +85,104 @@ FailureOr<TuningProfiles> TuningProfiles::read(
                           << source.filename;
       return failure();
     }
-    auto columns = root->getArray("columns");
-    if (columns->size() != source.columns.size()) {
-      emitError(location) << "tuning column schema disagrees for " << source.name;
-      return failure();
-    }
-    for (size_t index = 0; index < source.columns.size(); ++index)
-      if ((*columns)[index].getAsString() != source.columns[index]) {
-        emitError(location) << "tuning column name/order disagrees for " << source.name;
+    SmallVector<Attribute> columns;
+    for (const llvm::json::Value &column : *root->getArray("columns")) {
+      auto name = column.getAsString();
+      if (!name) {
+        emitError(location) << "tuning column names must be strings: " << source.filename;
         return failure();
       }
-    Namespace space{source.columns.size(), {}};
+      columns.push_back(builder.getStringAttr(*name));
+    }
+    auto encodedColumns = builder.getArrayAttr(columns);
+    if (failed(checkColumns(source.schema, encodedColumns, location)))
+      return failure();
+    NamedAttrList encodedFamilies;
     auto families = root->getObject("families");
-    if (families->empty()) {
-      emitError(location) << "default tuning namespace is empty: " << source.name;
-      return failure();
-    }
     for (const auto &entry : *families) {
-      auto table = readTable(location, entry.second, space.width, entry.first);
+      auto table = readTable(location, entry.second, entry.first);
       if (failed(table))
         return failure();
-      space.families.try_emplace(entry.first, std::move(*table));
+      encodedFamilies.append(StringRef(entry.first), *table);
     }
-    profiles.spaces.try_emplace(source.name, std::move(space));
-  }
-  if (overrideFilename.empty())
-    return profiles;
-  auto parsed = readJSON(location, overrideFilename);
-  if (failed(parsed))
-    return failure();
-  auto root = parsed->getAsObject();
-  if (!root) {
-    emitError(location) << "tuning override requires a namespace object";
-    return failure();
-  }
-  for (const auto &entry : *root) {
-    auto found = profiles.spaces.find(entry.first);
-    auto families = entry.second.getAsObject();
-    if (found == profiles.spaces.end() || !families) {
-      emitError(location) << "unknown or malformed tuning namespace '" << StringRef(entry.first) << "'";
+    auto table = TuningProfileTableAttr::getChecked(location, builder.getContext(),
+        encodedColumns, encodedFamilies.getDictionary(builder.getContext()));
+    if (!table) return failure();
+    if (spaces.get(source.schema.space)) {
+      emitError(location) << "duplicate tuning namespace source '" << source.schema.space << "'";
       return failure();
     }
-    Namespace &space = found->second;
-    for (const auto &family : *families) {
-      auto existing = space.families.find(family.first);
-      if (existing == space.families.end()) {
-        emitError(location) << "unknown tuning family '" << StringRef(entry.first) << "." << StringRef(family.first) << "'";
+    spaces.append(source.schema.space, table);
+  }
+  if (!overrideFilename.empty()) {
+    auto parsed = readJSON(location, overrideFilename);
+    if (failed(parsed))
+      return failure();
+    auto root = parsed->getAsObject();
+    if (!root) {
+      emitError(location) << "tuning override requires a namespace object";
+      return failure();
+    }
+    for (const auto &entry : *root) {
+      StringRef name = entry.first;
+      auto current = dyn_cast_or_null<TuningProfileTableAttr>(spaces.get(name));
+      auto families = entry.second.getAsObject();
+      if (!current || !families) {
+        emitError(location) << "unknown or malformed tuning namespace '" << name << "'";
         return failure();
       }
-      auto table = readTable(location, family.second, space.width, family.first);
-      if (failed(table))
-        return failure();
-      existing->second = std::move(*table);
+      NamedAttrList updated(current.getFamilies());
+      for (const auto &family : *families) {
+        StringRef familyName = family.first;
+        auto existing = current.getFamilies().get(familyName);
+        if (!existing) {
+          emitError(location) << "unknown tuning family '" << name << "." << familyName << "'";
+          return failure();
+        }
+        auto table = readTable(location, family.second, familyName);
+        if (failed(table))
+          return failure();
+        updated.set(familyName, *table);
+      }
+      auto table = TuningProfileTableAttr::getChecked(location, builder.getContext(),
+          current.getColumns(), updated.getDictionary(builder.getContext()));
+      if (!table) return failure();
+      spaces.set(name, table);
     }
   }
-  return profiles;
+  auto resolved = TuningProfilesAttr::getChecked(location,
+      builder.getContext(), spaces.getDictionary(builder.getContext()));
+  if (!resolved) return failure();
+  return TuningProfiles(resolved);
 }
 
-FailureOr<ArrayRef<TuningProfiles::Row>>
-TuningProfiles::get(StringRef name, StringRef family, Location location) const {
-  auto space = spaces.find(name);
-  if (space != spaces.end()) {
-    auto table = space->second.families.find(family);
-    if (table != space->second.families.end())
-      return ArrayRef<Row>(table->second);
+FailureOr<TuningProfiles> TuningProfiles::from(ModuleOp module) {
+  auto resolved = module->getAttrOfType<TuningProfilesAttr>(tuningProfilesAttr);
+  if (!resolved)
+    return module.emitError("GPU compilation requires resolved tuning profiles on the current module");
+  return TuningProfiles(resolved);
+}
+
+void TuningProfiles::attach(ModuleOp module) const {
+  module->setAttr(tuningProfilesAttr, profiles);
+}
+
+FailureOr<TuningProfiles::Table>
+TuningProfiles::get(const TuningProfileSchema &schema, StringRef family,
+                    Location location) const {
+  auto space = profiles.getSpaces().getAs<TuningProfileTableAttr>(schema.space);
+  if (space && failed(checkColumns(schema, space.getColumns(), location)))
+    return failure();
+  auto rows = space ? space.getFamilies().getAs<ArrayAttr>(family) : ArrayAttr();
+  if (rows) {
+    Table table;
+    for (Attribute row : rows) {
+      auto values = cast<DenseI64ArrayAttr>(row).asArrayRef();
+      table.emplace_back(values.begin(), values.end());
+    }
+    return table;
   }
-  emitError(location) << "missing declared tuning family '" << name << "." << family << "'";
+  emitError(location) << "missing declared tuning family '" << schema.space << "." << family << "'";
   return failure();
 }
 

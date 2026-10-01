@@ -12,33 +12,10 @@ namespace intent::mojo {
 using namespace intent::cpu;
 namespace {
 
-std::optional<std::string> checkVector(Operation *, CapabilitiesAttr capabilities,
-                                       const Configuration &config) {
-  auto power = [](int64_t value) { return value > 0 && !(value & (value - 1)); };
-  for (StringRef name : {"vector_width", "register_replicas", "reduction_replicas"})
-    if (!config.local.get(name)) return "missing local parameter '" + name.str() + "'";
-  for (NamedAttribute value : config.local)
-    if (value.getName() != "vector_width" && value.getName() != "register_replicas" &&
-        value.getName() != "reduction_replicas" && value.getName() != "micro_m" && value.getName() != "micro_n")
-      return "unsupported local parameter '" + value.getName().getValue().str() + "'";
-  int64_t width = config.parameter("vector_width");
-  if (!power(width)) return "vector_width must be a positive power of two, got " + std::to_string(width);
-  if (width > capabilities.getVectorBits() / 32)
-    return "vector_width " + std::to_string(width) + " exceeds the target's " +
-        std::to_string(capabilities.getVectorBits() / 32) + " f32 lanes";
-  for (StringRef name : {"register_replicas", "reduction_replicas"}) {
-    int64_t count = config.parameter(name);
-    if (!power(count)) return name.str() + " must be a positive power of two, got " + std::to_string(count);
-    if (count > 16) return name.str() + " exceeds the supported maximum of 16, got " + std::to_string(count);
-  }
-  return std::nullopt;
-}
-
-DictionaryAttr parameters(Builder &b, const Configuration &config) {
-  return b.getDictionaryAttr({
-      b.getNamedAttr("vector_width", config.local.get("vector_width")),
-      b.getNamedAttr("register_replicas", config.local.get("register_replicas")),
-      b.getNamedAttr("reduction_replicas", config.local.get("reduction_replicas"))});
+SmallVector<ImplementationParameter, 5> vectorParameters() {
+  return {ImplementationParameter::local("vector_width", {true, {}, 32, {}}),
+      ImplementationParameter::local("register_replicas", {true, 16, 0, {}}),
+      ImplementationParameter::local("reduction_replicas", {true, 16, 0, {}})};
 }
 
 Value subview(OpBuilder &b, Location loc, Value source,
@@ -183,22 +160,18 @@ cpu::ImplementationRegistry implementations() {
     if (region) return contraction ? "mojo.region_contraction" : "mojo.region_vector";
     return contraction ? "mojo.register_contraction" : "mojo.vector";
   };
+  auto contractionParameters = vectorParameters();
+  contractionParameters.push_back(ImplementationParameter::local("micro_m", {false, 8, 0, {}}));
+  contractionParameters.push_back(ImplementationParameter::local("micro_n", {false, 4, 0, {}}));
   Implementation contraction{"mojo.register_float", [](Operation *op) {
       auto generic = dyn_cast<linalg::GenericOp>(op);
       return generic && isMatrixContraction(generic) &&
           isa<FloatType>(cast<MemRefType>(generic.getOutputs()[0].getType()).getElementType());
     }, [](Operation *operation, CapabilitiesAttr capabilities, const Configuration &config) -> std::optional<std::string> {
-      if (auto reason = checkVector(operation, capabilities, config)) return reason;
-      for (StringRef name : {"micro_m", "micro_n"})
-        if (!config.local.get(name)) return "missing local parameter '" + name.str() + "'";
       int64_t width = config.parameter("vector_width"), m = config.parameter("micro_m"), n = config.parameter("micro_n");
       int64_t bytes = cast<MemRefType>(cast<linalg::GenericOp>(operation).getOutputs()[0].getType()).getElementTypeBitWidth() / 8;
       if (config.tileN % width != 0)
         return "tile_n " + std::to_string(config.tileN) + " must be divisible by vector_width " + std::to_string(width);
-      if (m > 8) return "micro_m exceeds the supported maximum of 8, got " + std::to_string(m);
-      if (n > 4) return "micro_n exceeds the supported maximum of 4, got " + std::to_string(n);
-      if (m * n > 24)
-        return "micro_m * micro_n requires " + std::to_string(m * n) + " accumulators, exceeding the limit of 24";
       if (width * bytes * 8 > capabilities.getVectorBits())
         return "accumulator vector requires " + std::to_string(width * bytes * 8) +
             " bits, exceeding target vector_bits " + std::to_string(capabilities.getVectorBits());
@@ -207,7 +180,13 @@ cpu::ImplementationRegistry implementations() {
             " accumulator elements, exceeding private storage capacity " +
             std::to_string(capabilities.getPrivateBytes() / bytes);
       return std::nullopt;
-    }, [](Builder &, const Configuration &config) { return config.local; }, formTile, {}};
+    }, std::move(contractionParameters), formTile, {}};
+  contraction.parameterRelations = [](DictionaryAttr values, CapabilitiesAttr) -> std::optional<std::string> {
+    int64_t count = cast<IntegerAttr>(values.get("micro_m")).getInt() *
+                    cast<IntegerAttr>(values.get("micro_n")).getInt();
+    if (count > 24) return "micro_m * micro_n requires more than 24 accumulator groups";
+    return std::nullopt;
+  };
   auto inputRequirements = [](InputReuse reuse) {
     return [reuse](linalg::GenericOp operation, ConfigurationAttr, ImplementationAttr binding) {
       int64_t width = implementationParameter(binding, "vector_width");
@@ -239,11 +218,7 @@ cpu::ImplementationRegistry implementations() {
             std::to_string(capabilities.getPrivateBytes() / 8);
       return std::nullopt;
     };
-    integer.parameters = [](Builder &b, const Configuration &config) {
-      NamedAttrList fields(config.local);
-      fields.append("exact_f32_chunk", b.getI64IntegerAttr(1024));
-      return fields.getDictionary(b.getContext());
-    };
+    integer.parameters.push_back(ImplementationParameter::constant("exact_f32_chunk", 1024));
     result.add(std::move(integer));
   };
   contraction.inputs = inputRequirements(InputReuse::Group);
@@ -304,26 +279,27 @@ cpu::ImplementationRegistry implementations() {
         {1, element, 1, width * implementationParameter(binding, "micro_n"), alignment, InputReuse::Consumers, 1}};
   };
   result.add(std::move(contraction));
+  auto check = [](Operation *, CapabilitiesAttr, const Configuration &) -> std::optional<std::string> {
+    return std::nullopt;
+  };
   Implementation vector{"mojo.vector", [](Operation *op) {
       if (auto generic = dyn_cast<linalg::GenericOp>(op)) return !isMatrixContraction(generic);
       return isa<cpu::ReduceOp, cpu::HistogramOp, func::FuncOp>(op);
-    }, checkVector, parameters, {}, {}};
+    }, check, vectorParameters(), {}, {}};
   vector.worksetRows = [](linalg::GenericOp operation, ImplementationAttr) {
     return registerContractionRows(operation);
   };
   result.add(std::move(vector));
   auto scanParameters = [](bool vectorized) {
-    return [vectorized](Builder &b, const Configuration &config) {
-      NamedAttrList fields(parameters(b, config));
-      fields.append("scan_width", b.getI64IntegerAttr(vectorized ? config.parameter("vector_width") : 1));
-      return fields.getDictionary(b.getContext());
-    };
+    auto fields = vectorParameters();
+    fields.push_back(vectorized ? ImplementationParameter::alias("scan_width", "vector_width")
+                               : ImplementationParameter::constant("scan_width", 1));
+    return fields;
   };
   result.add({"mojo.scan_scalar", [](Operation *op) { return isa<cpu::ScanOp>(op); },
-      checkVector, scanParameters(false), {}, {}});
+      check, scanParameters(false), {}, {}});
   result.add({"mojo.scan_vector", [](Operation *op) { return isa<cpu::ScanOp>(op); },
-      [](Operation *op, CapabilitiesAttr capabilities, const Configuration &config) -> std::optional<std::string> {
-        if (auto reason = checkVector(op, capabilities, config)) return reason;
+      [](Operation *op, CapabilitiesAttr, const Configuration &) -> std::optional<std::string> {
         if (!supportsVectorScan(cast<cpu::ScanOp>(op)))
           return "vector scan requires a source-form innermost scan with supported storage and an elementwise combine";
         return std::nullopt;

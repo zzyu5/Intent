@@ -1,128 +1,62 @@
-#include "Intent/Conversion/KIRToGPU/KIRToGPU.h"
-#include "Intent/Conversion/KIRToCPU/KIRToCPU.h"
-#include "Intent/Conversion/KIRToDSA/KIRToDSA.h"
-#include "Intent/Dialect/DSA/Transforms/Passes.h"
-#include "Intent/Target/BangC/Passes.h"
-#include "Intent/Dialect/CPU/Transforms/Passes.h"
-#include "Intent/Target/Mojo/Serialization/Serializer.h"
-#include "Intent/Target/Mojo/Transforms/Passes.h"
-#ifdef INTENT_HAS_WEFT_CANONICAL
-#include "Intent/Target/Weft/Transforms/Passes.h"
-#include "Intent/Target/Weft/Serialization/Serializer.h"
-#endif
-#include "Intent/Dialect/GPU/IR/GPUDialect.h"
-#include "Intent/Dialect/GPU/Transforms/Passes.h"
-#include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
-#include "Intent/Dialect/Intent/IR/IntentDialect.h"
-#include "Intent/Target/CuTile/IR/CuTileDialect.h"
-#include "Intent/Target/CuTile/Serialization/Serializer.h"
-#include "Intent/Target/CuTile/Transforms/Passes.h"
-#include "Intent/Target/TileLang/IR/TileLangDialect.h"
-#include "Intent/Target/TileLang/Serialization/Serializer.h"
-#include "Intent/Target/TileLang/Transforms/Passes.h"
-#include "Intent/Target/Triton/IR/TritonDialect.h"
-#include "Intent/Target/Triton/Serialization/Serializer.h"
-#include "Intent/Target/Triton/Transforms/Passes.h"
-#include "Intent/Transforms/Passes.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/Math/IR/Math.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/Vector/IR/VectorOps.h"
-#include "mlir/IR/DialectRegistry.h"
+#include "Intent/Compiler/Compiler.h"
+#include "Intent/Compiler/Registration.h"
 #include "mlir/IR/AsmState.h"
-#include "mlir/InitAllDialects.h"
-#include "mlir/Pass/PassManager.h"
 #include "mlir/Parser/Parser.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Support/Timing.h"
-#include "mlir/Transforms/Passes.h"
 #include "llvm/Support/CommandLine.h"
-#include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/Path.h"
-#include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace {
+using intent::compiler::Failure;
+int exitCode(Failure failure) { return static_cast<int>(failure); }
 
-enum class TargetKind { Triton, CuTile, TileLang, Mojo, Weft, BangC };
-
-enum class ExitCode : int {
-  Success = 0,
-  Invocation = 1,
-  KernelIR = 2,
-  PhysicalProgram = 3,
-  PhysicalProgramVerification = 4,
-  ProviderProgram = 5,
-  ProviderProgramVerification = 6,
-  TerminalTranslation = 7,
-  CompilerOutput = 8,
-};
-
-int exitCode(ExitCode code) { return static_cast<int>(code); }
-
+bool writeFile(llvm::StringRef path,
+               llvm::function_ref<void(llvm::raw_ostream &)> write) {
+  std::error_code error;
+  llvm::raw_fd_ostream output(path, error, llvm::sys::fs::OF_Text);
+  if (error) { llvm::errs() << "cannot open " << path << ": " << error.message() << "\n"; return false; }
+  write(output);
+  output.close();
+  if (output.has_error()) {
+    llvm::errs() << "cannot write " << path << ": " << output.error().message() << "\n";
+    output.clear_error();
+    return false;
+  }
+  return true;
+}
 } // namespace
 
 int main(int argc, char **argv) {
   llvm::InitLLVM initialization(argc, argv);
-  mlir::registerTransformsPasses();
-  intent::registerIntentPasses();
-  intent::gpu::registerGPUPasses();
-  intent::dsa::registerDSAPasses();
-  intent::bangc::registerBangCPasses();
-  intent::triton::registerTritonPasses();
-  intent::cutile::registerCuTilePasses();
-  intent::mojo::registerMojoPasses();
-  intent::cpu::registerCPUPasses();
-  // MLIR's pass-name option parsers enumerate the registry at construction.
-  // Populate it before constructing --mlir-print-ir-before/after options.
+  intent::compiler::registerPasses();
   mlir::registerMLIRContextCLOptions();
   mlir::registerAsmPrinterCLOptions();
   mlir::registerPassManagerCLOptions();
   mlir::registerDefaultTimingManagerCLOptions();
   llvm::cl::opt<std::string> inputFilename(
-      llvm::cl::Positional, llvm::cl::desc("<input canonical Intent KIR>"),
-      llvm::cl::init("-"));
-  llvm::cl::opt<TargetKind> target(
-      "target", llvm::cl::desc("eventual target backend"),
-      llvm::cl::values(
-          clEnumValN(TargetKind::Triton, "triton", "Triton DSL"),
-          clEnumValN(TargetKind::CuTile, "cutile", "cuTile DSL"),
-          clEnumValN(TargetKind::TileLang, "tilelang", "TileLang DSL"),
-          clEnumValN(TargetKind::Mojo, "mojo", "Mojo CPU native"),
-          clEnumValN(TargetKind::Weft, "weft", "Canonical Weft generation only"),
-          clEnumValN(TargetKind::BangC, "bangc", "BANG C local-memory DSA")));
-
-  // Compile-call inputs are parsed but not interpreted before the shared
-  // executable GPU Program exists.
+      llvm::cl::Positional, llvm::cl::desc("<input Intent KIR>"), llvm::cl::init("-"));
+  llvm::cl::opt<std::string> target("target", llvm::cl::desc("source provider"));
+  llvm::cl::opt<std::string> inputStage("input-stage", llvm::cl::init("kir"),
+      llvm::cl::desc("Input IR stage: kir or shared; shared input requires the original target resources"));
   llvm::cl::opt<int64_t> computeUnits("compute-units", llvm::cl::init(0));
-  llvm::cl::opt<int64_t> sharedMemoryPerUnit("shared-memory-per-unit",
-                                             llvm::cl::init(0));
-  llvm::cl::opt<int64_t> maxDynamicSharedMemoryPerBlock(
-      "max-dynamic-shared-memory-per-block", llvm::cl::init(0));
-  llvm::cl::opt<int64_t> registersPerUnit("registers-per-unit",
-                                          llvm::cl::init(0));
-  llvm::cl::opt<int64_t> maxThreadsPerBlock("max-threads-per-block",
-                                            llvm::cl::init(0));
-  llvm::cl::opt<int64_t> computeCapabilityMajor("compute-capability-major",
-                                                llvm::cl::init(0));
-  llvm::cl::opt<int64_t> computeCapabilityMinor("compute-capability-minor",
-                                                llvm::cl::init(-1));
-  llvm::cl::opt<int64_t> singleToDoublePrecisionPerfRatio(
-      "single-to-double-precision-perf-ratio", llvm::cl::init(0));
+  llvm::cl::opt<int64_t> sharedMemoryPerUnit("shared-memory-per-unit", llvm::cl::init(0));
+  llvm::cl::opt<int64_t> maxDynamicSharedMemoryPerBlock("max-dynamic-shared-memory-per-block", llvm::cl::init(0));
+  llvm::cl::opt<int64_t> registersPerUnit("registers-per-unit", llvm::cl::init(0));
+  llvm::cl::opt<int64_t> maxThreadsPerBlock("max-threads-per-block", llvm::cl::init(0));
+  llvm::cl::opt<int64_t> computeCapabilityMajor("compute-capability-major", llvm::cl::init(0));
+  llvm::cl::opt<int64_t> computeCapabilityMinor("compute-capability-minor", llvm::cl::init(-1));
+  llvm::cl::opt<int64_t> singleToDoublePrecisionPerfRatio("single-to-double-precision-perf-ratio", llvm::cl::init(0));
   llvm::cl::opt<bool> matrixUnits("matrix-units", llvm::cl::init(false));
-  llvm::cl::opt<bool> dynamicVectorWidth("dynamic-vector-width",
-                                         llvm::cl::init(false));
-  llvm::cl::opt<std::string> irOutputFilename("ir-output",
-                                              llvm::cl::init(""));
-  llvm::cl::opt<std::string> tuningConfigFilename(
-      "tuning-config", llvm::cl::desc("JSON overrides of declared shared/provider profile families"),
-      llvm::cl::init(""));
-  llvm::cl::opt<std::string> sourceOutputFilename("source-output",
-                                                  llvm::cl::init(""));
+  llvm::cl::opt<bool> dynamicVectorWidth("dynamic-vector-width", llvm::cl::init(false));
+  llvm::cl::opt<std::string> irOutputFilename("ir-output", llvm::cl::init(""));
+  llvm::cl::opt<std::string> sourceOutputFilename("source-output", llvm::cl::init(""));
   llvm::cl::opt<std::string> metadataOutputFilename("metadata-output", llvm::cl::init(""));
+  llvm::cl::opt<std::string> tuningConfigFilename("tuning-config", llvm::cl::init(""),
+      llvm::cl::desc("JSON overrides of declared shared/provider profile families"));
   llvm::cl::opt<int64_t> cpuVectorBits("cpu-vector-bits", llvm::cl::init(0));
   llvm::cl::opt<int64_t> cpuWorkers("cpu-workers", llvm::cl::init(0));
   llvm::cl::opt<bool> cpuMatrixI8I32("cpu-matrix-i8-i32", llvm::cl::init(false));
@@ -133,283 +67,80 @@ int main(int argc, char **argv) {
   llvm::cl::opt<int64_t> dsaTileK("dsa-tile-k", llvm::cl::init(64));
   llvm::cl::opt<int64_t> dsaRegionTile("dsa-region-tile", llvm::cl::init(64));
   llvm::cl::opt<std::string> dsaShapes("dsa-shapes", llvm::cl::init("{}"),
-      llvm::cl::desc("JSON parameter shapes for compile-call specialization; -1 keeps an axis dynamic"));
+      llvm::cl::desc("JSON parameter shapes; -1 keeps an axis dynamic"));
   llvm::cl::opt<std::string> dsaStrides("dsa-strides", llvm::cl::init("{}"),
-      llvm::cl::desc("JSON parameter element strides for compile-call specialization"));
+      llvm::cl::desc("JSON parameter element strides"));
   llvm::cl::opt<int64_t> dsaTasks("dsa-tasks", llvm::cl::init(16));
   llvm::cl::opt<int64_t> dsaLocalBytes("dsa-local-bytes", llvm::cl::init(512 * 1024));
-  llvm::cl::opt<bool> stopAfterShared(
-      "stop-after-shared",
-      llvm::cl::desc("stop after the selected execution family's shared verifier"),
-      llvm::cl::init(false));
-  llvm::cl::opt<bool> stopAfterKIR(
-      "stop-after-kir",
-      llvm::cl::desc("normalize and verify Kernel IR without selecting a target"),
-      llvm::cl::init(false));
-  llvm::cl::opt<bool> compilerInfo(
-      "compiler-info",
-      llvm::cl::desc("print built-in source providers and compilation stages as JSON"),
-      llvm::cl::init(false));
-  llvm::cl::ParseCommandLineOptions(argc, argv,
-                                    "Intent canonical KIR compiler boundary\n");
+  llvm::cl::opt<bool> stopAfterShared("stop-after-shared", llvm::cl::init(false),
+      llvm::cl::desc("Stop after the selected family's complete shared pipeline"));
+  llvm::cl::opt<bool> stopAfterKIR("stop-after-kir", llvm::cl::init(false),
+      llvm::cl::desc("Normalize and verify KIR without selecting a target"));
+  llvm::cl::opt<bool> compilerInfo("compiler-info", llvm::cl::init(false),
+      llvm::cl::desc("Print compiled providers, stages, outputs and failure categories"));
+  llvm::cl::ParseCommandLineOptions(argc, argv, "Intent compiler\n");
 
   if (compilerInfo) {
-    llvm::json::Array providers{"triton", "cutile", "tilelang", "mojo"};
-#ifdef INTENT_HAS_WEFT_CANONICAL
-    providers.push_back("weft");
-#endif
-    providers.push_back("bangc");
-    llvm::json::Object information{
-        {"providers", std::move(providers)},
-        {"stages", llvm::json::Array{"kir", "shared", "provider"}},
-        {"outputs", llvm::json::Object{
-            {"kir", llvm::json::Array{"ir"}},
-            {"shared", llvm::json::Array{"ir"}},
-            {"provider", llvm::json::Array{"ir", "source", "metadata"}}}}};
-    llvm::outs() << llvm::json::Value(std::move(information)) << "\n";
-    return exitCode(ExitCode::Success);
+    llvm::outs() << llvm::json::Value(intent::compiler::information()) << "\n";
+    return 0;
   }
   if (stopAfterKIR && stopAfterShared) {
     llvm::errs() << "--stop-after-kir and --stop-after-shared are mutually exclusive\n";
-    return exitCode(ExitCode::Invocation);
+    return exitCode(Failure::Invocation);
   }
-  if (!stopAfterKIR && target.getNumOccurrences() == 0) {
+  intent::compiler::Request request;
+  if (inputStage == "shared") request.inputStage = intent::compiler::InputStage::Shared;
+  else if (inputStage != "kir") {
+    llvm::errs() << "--input-stage must be kir or shared\n";
+    return exitCode(Failure::Invocation);
+  }
+  if (!target.empty()) {
+    request.provider = intent::compiler::parseProvider(target);
+    if (!request.provider) {
+      llvm::errs() << "unknown source provider: " << target << "\n";
+      return exitCode(Failure::Invocation);
+    }
+  }
+  request.stopAfter = stopAfterKIR ? intent::compiler::Stage::Kernel
+      : stopAfterShared ? intent::compiler::Stage::Shared : intent::compiler::Stage::Provider;
+  if (!stopAfterKIR && !request.provider) {
     llvm::errs() << "--target is required unless --stop-after-kir is selected\n";
-    return exitCode(ExitCode::Invocation);
+    return exitCode(Failure::Invocation);
+  }
+  if (irOutputFilename.empty() ||
+      (request.stopAfter == intent::compiler::Stage::Provider && sourceOutputFilename.empty())) {
+    llvm::errs() << "--ir-output is required; provider compilation also requires --source-output\n";
+    return exitCode(Failure::Output);
+  }
+  request.gpu = {computeUnits, sharedMemoryPerUnit, maxDynamicSharedMemoryPerBlock,
+      registersPerUnit, maxThreadsPerBlock, computeCapabilityMajor, computeCapabilityMinor,
+      singleToDoublePrecisionPerfRatio, matrixUnits, dynamicVectorWidth, false, false};
+  request.cpu = {cpuVectorBits, cpuWorkers, cpuMatrixI8I32};
+  request.dsa = {dsaArchitecture, dsaTile, dsaTileM, dsaTileN, dsaTileK,
+      dsaRegionTile, dsaTasks, dsaLocalBytes, dsaShapes, dsaStrides};
+  request.tuningConfig = tuningConfigFilename;
+  {
+    llvm::SmallString<256> directory(llvm::sys::fs::getMainExecutable(argv[0], reinterpret_cast<void *>(&main)));
+    llvm::sys::path::remove_filename(directory);
+    llvm::sys::path::append(directory, "profiles");
+    request.profileDirectory = std::string(directory);
   }
 
   mlir::DialectRegistry registry;
-  mlir::registerAllDialects(registry);
-  registry.insert<intent::IntentDialect, intent::gpu::IntentGPUDialect,
-                  intent::cpu::IntentCPUDialect, intent::dsa::IntentDSADialect,
-                  intent::cutile::IntentCuTileDialect,
-                  intent::tilelang::IntentTileLangDialect,
-                  intent::triton::IntentTritonDialect>();
+  intent::compiler::registerDialects(registry);
   mlir::MLIRContext context(registry);
-  context.loadDialect<intent::IntentDialect, intent::gpu::IntentGPUDialect,
-                      intent::cpu::IntentCPUDialect, intent::dsa::IntentDSADialect,
-                      intent::cutile::IntentCuTileDialect,
-                      intent::tilelang::IntentTileLangDialect,
-                      intent::triton::IntentTritonDialect,
-                      mlir::arith::ArithDialect, mlir::func::FuncDialect,
-                      mlir::scf::SCFDialect>();
-
   auto module = mlir::parseSourceFile<mlir::ModuleOp>(inputFilename, &context);
-  if (!module || mlir::failed(intent::normalizeKernelModule(*module)))
-    return exitCode(ExitCode::KernelIR);
-  auto emitIR = [&](llvm::StringRef stage) {
-    if (irOutputFilename.empty()) {
-      llvm::errs() << "--ir-output is required with --stop-after-" << stage << "\n";
-      return exitCode(ExitCode::CompilerOutput);
-    }
-    std::error_code error;
-    llvm::raw_fd_ostream irOutput(irOutputFilename, error, llvm::sys::fs::OF_Text);
-    if (error) {
-      llvm::errs() << "cannot open IR output: " << error.message() << "\n";
-      return exitCode(ExitCode::CompilerOutput);
-    }
-    module->print(irOutput, mlir::OpPrintingFlags().enableDebugInfo());
-    irOutput << "\n";
-    return exitCode(ExitCode::Success);
-  };
-  if (stopAfterKIR)
-    return emitIR("kir");
-  llvm::SmallString<256> profilesDirectory(
-      llvm::sys::fs::getMainExecutable(argv[0], reinterpret_cast<void *>(&main)));
-  llvm::sys::path::remove_filename(profilesDirectory);
-  llvm::sys::path::append(profilesDirectory, "profiles");
-  auto profilePath = [&](llvm::StringRef name) {
-    llvm::SmallString<256> path(profilesDirectory);
-    llvm::sys::path::append(path, name);
-    return path.str().str();
-  };
-  std::string source;
-  std::string metadata;
-  if (target == TargetKind::BangC) {
-    context.loadDialect<mlir::memref::MemRefDialect, mlir::math::MathDialect>();
-    if (!tuningConfigFilename.empty()) {
-      llvm::errs() << "BANG C currently takes explicit DSA block bindings, not a tuning profile\n";
-      return exitCode(ExitCode::Invocation);
-    }
-    auto configuration = intent::dsa::ConfigurationAttr::getChecked(
-        [&]() { return module->emitError(); }, &context, dsaTile.getValue(), dsaTileM.getValue(), dsaTileN.getValue(),
-        dsaTileK.getValue(), dsaRegionTile.getValue(), dsaTasks.getValue(), dsaLocalBytes.getValue());
-    if (!configuration) return exitCode(ExitCode::Invocation);
-    auto parsedShapes = llvm::json::parse(dsaShapes.getValue());
-    if (!parsedShapes) {
-      llvm::errs() << "invalid DSA shape bindings: " << llvm::toString(parsedShapes.takeError()) << "\n";
-      return exitCode(ExitCode::Invocation);
-    }
-    auto object = parsedShapes->getAsObject();
-    if (!object) { llvm::errs() << "DSA shape bindings must be a JSON object\n"; return exitCode(ExitCode::Invocation); }
-    mlir::NamedAttrList bindings;
-    mlir::Builder builder(&context);
-    for (auto &[name, value] : *object) {
-      auto dimensions = value.getAsArray();
-      if (!dimensions) { llvm::errs() << "DSA parameter shape must be an integer array\n"; return exitCode(ExitCode::Invocation); }
-      llvm::SmallVector<int64_t> extents;
-      for (auto &dimension : *dimensions) {
-        auto extent = dimension.getAsInteger();
-        if (!extent || *extent < -1) { llvm::errs() << "invalid DSA bound extent\n"; return exitCode(ExitCode::Invocation); }
-        extents.push_back(*extent);
-      }
-      bindings.append(name.str(), builder.getDenseI64ArrayAttr(extents));
-    }
-    auto parsedStrides = llvm::json::parse(dsaStrides.getValue());
-    if (!parsedStrides) {
-      llvm::errs() << "invalid DSA stride bindings: " << llvm::toString(parsedStrides.takeError()) << "\n";
-      return exitCode(ExitCode::Invocation);
-    }
-    auto strideObject = parsedStrides->getAsObject();
-    if (!strideObject) { llvm::errs() << "DSA stride bindings must be a JSON object\n"; return exitCode(ExitCode::Invocation); }
-    mlir::NamedAttrList strideBindings;
-    for (auto &[name, value] : *strideObject) {
-      auto array = value.getAsArray();
-      if (!array) { llvm::errs() << "DSA parameter strides must be an integer array\n"; return exitCode(ExitCode::Invocation); }
-      llvm::SmallVector<int64_t> strides;
-      for (auto &entry : *array) {
-        auto stride = entry.getAsInteger();
-        if (!stride) { llvm::errs() << "invalid DSA bound stride\n"; return exitCode(ExitCode::Invocation); }
-        strides.push_back(*stride);
-      }
-      strideBindings.append(name.str(), builder.getDenseI64ArrayAttr(strides));
-    }
-    if (mlir::failed(intent::lowerCanonicalKIRToDSA(*module, configuration, bindings.getDictionary(&context),
-                                                 strideBindings.getDictionary(&context))))
-      return exitCode(ExitCode::PhysicalProgram);
-    if (mlir::failed(intent::dsa::runProgramTransforms(*module)))
-      return exitCode(ExitCode::PhysicalProgramVerification);
-    if (stopAfterShared) return emitIR("shared");
-    if (mlir::failed(intent::bangc::legalizeProgram(*module, dsaArchitecture)))
-      return exitCode(ExitCode::ProviderProgramVerification);
-    metadata.clear();
-    if (mlir::failed(intent::bangc::serializeProgram(*module, source, metadata)))
-      return exitCode(ExitCode::TerminalTranslation);
-  } else if (target == TargetKind::Mojo || target == TargetKind::Weft) {
-    context.loadDialect<mlir::linalg::LinalgDialect, mlir::math::MathDialect,
-                        mlir::memref::MemRefDialect, mlir::vector::VectorDialect>();
-    if (mlir::failed(intent::lowerCanonicalKIRToCPU(*module,
-            target == TargetKind::Mojo ? intent::CPUEntryLayout::StridedInputs : intent::CPUEntryLayout::Contiguous)))
-      return exitCode(ExitCode::PhysicalProgram);
-    intent::cpu::ImplementationRegistry implementations;
-    if (target == TargetKind::Mojo) implementations = intent::mojo::implementations();
-#ifdef INTENT_HAS_WEFT_CANONICAL
-    else implementations = intent::weft_provider::implementations();
-#endif
-    if (mlir::failed(intent::cpu::runCPUPasses(*module, cpuVectorBits, cpuWorkers, cpuMatrixI8I32,
-            profilePath(target == TargetKind::Mojo ? "mojo.json" : "weft.json"), tuningConfigFilename, implementations)))
-      return exitCode(ExitCode::PhysicalProgramVerification);
-    if (stopAfterShared) return emitIR("shared");
-    metadata.clear();
-    if (target == TargetKind::Mojo) {
-      if (mlir::failed(intent::mojo::legalizeProgram(*module)))
-        return exitCode(ExitCode::ProviderProgramVerification);
-      if (mlir::failed(intent::mojo::serializeProgram(*module, source, metadata)))
-        return exitCode(ExitCode::TerminalTranslation);
-    } else {
-#ifdef INTENT_HAS_WEFT_CANONICAL
-      auto program = intent::weft_provider::legalizeProgram(*module, metadata);
-      if (mlir::failed(program)) return exitCode(ExitCode::ProviderProgramVerification);
-      if (mlir::failed(intent::weft_provider::serializeProgram(**program, source)))
-        return exitCode(ExitCode::TerminalTranslation);
-#else
-      llvm::errs() << "Weft generation requires the external canonical IR library at compiler build time\n";
-      return exitCode(ExitCode::ProviderProgram);
-#endif
-    }
-  } else {
-  const llvm::StringRef sharedColumns[] = {
-      "ownership_m", "ownership_n", "reduction", "reduction_outer", "scan",
-      "traversal_workers", "traversal_group"};
-  const llvm::StringRef tritonColumns[] = {"warps", "stages", "ctas"};
-  const llvm::StringRef valueColumn[] = {"value"};
-  const intent::gpu::TuningProfileSource profileSources[] = {
-      {"shared", profilePath("shared.json"), sharedColumns},
-      {"triton", profilePath("triton.json"), tritonColumns},
-      {"cutile", profilePath("cutile.json"), valueColumn},
-      {"tilelang", profilePath("tilelang.json"), valueColumn}};
-  auto profiles = intent::gpu::TuningProfiles::read(
-      module->getLoc(), profileSources, tuningConfigFilename);
-  if (mlir::failed(profiles))
-    return exitCode(ExitCode::Invocation);
-  intent::GPUCapabilities capabilities{
-      computeUnits,
-      sharedMemoryPerUnit,
-      maxDynamicSharedMemoryPerBlock,
-      registersPerUnit,
-      maxThreadsPerBlock,
-      computeCapabilityMajor,
-      computeCapabilityMinor,
-      singleToDoublePrecisionPerfRatio,
-      matrixUnits,
-      dynamicVectorWidth,
-      target == TargetKind::Triton,
-      target == TargetKind::Triton};
-  if (mlir::failed(intent::lowerCanonicalKIRToGPU(*module, capabilities))) {
-    llvm::errs() << "Intent KIR-to-GPU construction failed\n";
-    return exitCode(ExitCode::PhysicalProgram);
-  }
-  if (mlir::failed(intent::gpu::runSharedGPUPasses(*module, *profiles)))
-    return exitCode(ExitCode::PhysicalProgramVerification);
-  if (stopAfterShared) return emitIR("shared");
-  mlir::LogicalResult provider = mlir::failure();
-  mlir::LogicalResult serialized = mlir::failure();
-  switch (target) {
-  case TargetKind::Triton:
-    provider = intent::triton::legalizeGPUProgram(*module, *profiles);
-    if (mlir::succeeded(provider))
-      serialized = intent::triton::serializeProgram(*module, source, metadata);
-    break;
-  case TargetKind::CuTile:
-    provider = intent::cutile::legalizeGPUProgram(*module, *profiles);
-    if (mlir::succeeded(provider))
-      serialized = intent::cutile::serializeProgram(*module, source, metadata);
-    break;
-  case TargetKind::TileLang:
-    provider = intent::tilelang::legalizeGPUProgram(*module, *profiles);
-    if (mlir::succeeded(provider))
-      serialized = intent::tilelang::serializeProgram(*module, source, metadata);
-    break;
-  case TargetKind::Mojo:
-  case TargetKind::Weft:
-  case TargetKind::BangC:
-    llvm_unreachable("CPU construction is selected before GPU construction");
-  }
-  if (mlir::failed(provider))
-    return exitCode(ExitCode::ProviderProgramVerification);
-  if (mlir::failed(serialized))
-    return exitCode(ExitCode::TerminalTranslation);
-  }
-  if (irOutputFilename.empty() || sourceOutputFilename.empty()) {
-    llvm::errs() << "both --ir-output and --source-output are required\n";
-    return exitCode(ExitCode::CompilerOutput);
-  }
-  std::error_code error;
-  llvm::raw_fd_ostream irOutput(irOutputFilename, error,
-                               llvm::sys::fs::OF_Text);
-  if (error) {
-    llvm::errs() << "cannot open physical IR output: " << error.message() << "\n";
-    return exitCode(ExitCode::CompilerOutput);
-  }
-  module->print(irOutput, mlir::OpPrintingFlags().enableDebugInfo());
-  irOutput << "\n";
-  irOutput.close();
-  llvm::raw_fd_ostream sourceOutput(sourceOutputFilename, error,
-                                   llvm::sys::fs::OF_Text);
-  if (error) {
-    llvm::errs() << "cannot open provider source output: " << error.message()
-                 << "\n";
-    return exitCode(ExitCode::CompilerOutput);
-  }
-  sourceOutput << source;
-  sourceOutput.close();
-  if (!metadataOutputFilename.empty()) {
-    llvm::raw_fd_ostream metadataOutput(metadataOutputFilename, error, llvm::sys::fs::OF_Text);
-    if (error) {
-      llvm::errs() << "cannot open artifact metadata output: " << error.message() << "\n";
-      return exitCode(ExitCode::CompilerOutput);
-    }
-    metadataOutput << metadata << "\n";
-  }
-  return exitCode(ExitCode::Success);
+  auto result = intent::compiler::compile(std::move(module), request);
+  if (result.failure != Failure::None) return exitCode(result.failure);
+  if (!writeFile(irOutputFilename, [&](llvm::raw_ostream &output) {
+        result.module->print(output, mlir::OpPrintingFlags().enableDebugInfo());
+        output << "\n";
+      })) return exitCode(Failure::Output);
+  if (request.stopAfter != intent::compiler::Stage::Provider) return 0;
+  if (!writeFile(sourceOutputFilename, [&](llvm::raw_ostream &output) { output << result.source; }))
+    return exitCode(Failure::Output);
+  if (!metadataOutputFilename.empty() &&
+      !writeFile(metadataOutputFilename, [&](llvm::raw_ostream &output) { output << result.metadata << "\n"; }))
+    return exitCode(Failure::Output);
+  return 0;
 }

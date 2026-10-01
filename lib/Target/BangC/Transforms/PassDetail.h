@@ -10,9 +10,8 @@
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
-#include "mlir/Pass/PassManager.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
-#include "mlir/Transforms/Passes.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/Support/MathExtras.h"
 #include <functional>
 #include <limits>
@@ -39,9 +38,11 @@ bool reuseConsumedBinaryInputs(func::FuncOp function, dsa::ConfigurationAttr con
 bool reuseConsumedExp2Inputs(func::FuncOp function, dsa::ConfigurationAttr config);
 void hoistInvariantFills(func::FuncOp function, dsa::ConfigurationAttr config);
 LogicalResult realizeNativeComputations(ModuleOp module);
-LogicalResult realizeNativeWorkspace(ModuleOp module);
+LogicalResult realizeNativeWorkspace(ModuleOp module,
+    llvm::function_ref<LogicalResult()> cleanup);
 LogicalResult selectNativeImplementations(ModuleOp module);
-LogicalResult composeLocalProgram(ModuleOp module);
+LogicalResult composeLocalProgram(ModuleOp module,
+    llvm::function_ref<LogicalResult()> cleanup);
 LogicalResult scheduleProgramSupply(ModuleOp module);
 LogicalResult bindProgramStorage(ModuleOp module);
 LogicalResult verifySurfaceOperations(func::FuncOp function);

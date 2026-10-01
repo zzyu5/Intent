@@ -85,6 +85,8 @@ inline constexpr llvm::StringLiteral tileLangConfigsAttr =
     "intent_gpu.tilelang.configs";
 inline constexpr llvm::StringLiteral sharedConfigTuplesAttr =
     "intent_gpu.shared.config_tuples";
+inline constexpr llvm::StringLiteral tuningProfilesAttr =
+    "intent_gpu.tuning_profiles";
 
 enum class PhysicalExprKind : uint32_t {
   Constant = 0,

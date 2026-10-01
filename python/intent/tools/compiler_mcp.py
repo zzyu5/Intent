@@ -1,7 +1,7 @@
 """Explicitly enabled compilation tools, separate from the read-only manual."""
 from pathlib import Path
 
-from .compilation import compile_request, doctor
+from .compilation import compile_request, doctor, generate_ir_request, optimize_request
 
 
 def main() -> None:
@@ -14,7 +14,7 @@ def main() -> None:
         raise SystemExit("Install IntentDSL with its 'manual' extra to use the MCP servers.") from error
 
     server = FastMCP("intent_compiler", instructions=(
-        "Compile only an existing Python program path explicitly supplied by the user. "
+        "Compile only an existing Python program path, or transform/resume an existing IR path explicitly supplied by the user. "
         "Loading that module executes its top-level Python host code. "
         "These tools use the public Intent pipeline and do not themselves launch the selected kernel. "
         "Generated/materialized does not mean numerical or performance validation. "
@@ -40,6 +40,32 @@ def main() -> None:
         return compile_request(str(path), kernel, target, target_options=target_options,
                                constexprs=constexprs, compiler=compiler,
                                tuning_config=tuning_config, materialize=materialize, stage=stage)
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True))
+    async def generate_from_ir(ir_file: str, name: str, target: str,
+                               input_stage: str = "shared", target_options: dict | None = None,
+                               compiler: str | None = None, materialize: bool = False) -> dict:
+        """Generate provider source from explicit existing KIR or shared IR.
+
+        Supply the input stage, target and diagnostic program name explicitly.
+        The whole module is compiled; name does not select a kernel. Callable
+        entries and candidates are determined by the IR and its metadata.
+        Shared input retains its physical program/configuration and must agree
+        with the selected target's capabilities. This does not launch a kernel.
+        """
+        return generate_ir_request(ir_file, name, target, input_stage=input_stage,
+                                   target_options=target_options, compiler=compiler,
+                                   materialize=materialize)
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True))
+    async def optimize(ir_file: str, pipeline: str, optimizer: str | None = None) -> dict:
+        """Run a standard MLIR pipeline on an existing IR file supplied by the user.
+
+        The installed intent-opt applies the requested passes and reports output
+        and diagnostic paths. Pass prerequisites belong to the input/current IR;
+        this does not materialize or launch a kernel or establish correctness.
+        """
+        return optimize_request(ir_file, pipeline, optimizer=optimizer)
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
     async def environment(target: str, target_options: dict | None = None,

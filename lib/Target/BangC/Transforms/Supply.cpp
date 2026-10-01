@@ -826,33 +826,31 @@ LogicalResult realizeGroupParticipants(func::FuncOp function) {
   return partition(function.front());
 }
 
-LogicalResult composeLocalProgram(ModuleOp module) {
+LogicalResult composeLocalProgram(ModuleOp module,
+    llvm::function_ref<LogicalResult()> cleanup) {
   auto function = *module.getOps<func::FuncOp>().begin();
   auto config = function->getAttrOfType<dsa::ConfigurationAttr>("intent_dsa.configuration");
-  PassManager pm(module.getContext());
-  pm.addPass(createCanonicalizerPass());
-  pm.addPass(createCSEPass());
-  if (failed(pm.run(module))) return failure();
+  if (failed(cleanup())) return failure();
   dsa::eliminateOverwrittenFills(function);
-  if (dsa::realizeRangeComparisons(function) && failed(pm.run(module))) return failure();
-  if (dsa::foldRangeCounts(function) && failed(pm.run(module))) return failure();
-  while (dsa::foldUniformBooleanTiles(function)) if (failed(pm.run(module))) return failure();
-  if (realizeAffineRanges(function, config) && failed(pm.run(module))) return failure();
-  if (realizeFullWidthMasks(function, config) && failed(pm.run(module))) return failure();
-  while (dsa::eliminateUnreadLocalWrites(function)) if (failed(pm.run(module))) return failure();
-  if (realizeRowBroadcasts(function, config) && failed(pm.run(module))) return failure();
-  if (bindRowScalarOperands(function) && failed(pm.run(module))) return failure();
-  if (dsa::forwardUniformScalarLoads(function) && failed(pm.run(module))) return failure();
-  while (dsa::forwardFullLocalCopies(function)) if (failed(pm.run(module))) return failure();
-  if (specializeZeroMatrixTiles(function) && failed(pm.run(module))) return failure();
-  if (retainNarrowExtremaInputs(function, config) && failed(pm.run(module))) return failure();
+  if (dsa::realizeRangeComparisons(function) && failed(cleanup())) return failure();
+  if (dsa::foldRangeCounts(function) && failed(cleanup())) return failure();
+  while (dsa::foldUniformBooleanTiles(function)) if (failed(cleanup())) return failure();
+  if (realizeAffineRanges(function, config) && failed(cleanup())) return failure();
+  if (realizeFullWidthMasks(function, config) && failed(cleanup())) return failure();
+  while (dsa::eliminateUnreadLocalWrites(function)) if (failed(cleanup())) return failure();
+  if (realizeRowBroadcasts(function, config) && failed(cleanup())) return failure();
+  if (bindRowScalarOperands(function) && failed(cleanup())) return failure();
+  if (dsa::forwardUniformScalarLoads(function) && failed(cleanup())) return failure();
+  while (dsa::forwardFullLocalCopies(function)) if (failed(cleanup())) return failure();
+  if (specializeZeroMatrixTiles(function) && failed(cleanup())) return failure();
+  if (retainNarrowExtremaInputs(function, config) && failed(cleanup())) return failure();
   dsa::eliminateOverwrittenFills(function);
-  if (dsa::forwardIndexExpressions(function) && failed(pm.run(module))) return failure();
-  if (dsa::reuseGatherOffsets(function) && failed(pm.run(module))) return failure();
-  if (vectorizeIndexLoops(function, config) && failed(pm.run(module))) return failure();
+  if (dsa::forwardIndexExpressions(function) && failed(cleanup())) return failure();
+  if (dsa::reuseGatherOffsets(function) && failed(cleanup())) return failure();
+  if (vectorizeIndexLoops(function, config) && failed(cleanup())) return failure();
   realizeGatherWorkspace(function, config);
-  if (dsa::batchPointwiseTasks(function) && failed(pm.run(module))) return failure();
-  if (reuseConsumedBinaryInputs(function, config) && failed(pm.run(module))) return failure();
+  if (dsa::batchPointwiseTasks(function) && failed(cleanup())) return failure();
+  if (reuseConsumedBinaryInputs(function, config) && failed(cleanup())) return failure();
   hoistInvariantFills(function, config);
   coalesceTileLoads(function, config);
   return success();

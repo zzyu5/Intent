@@ -5,7 +5,7 @@ import json
 import sys
 
 from .backends import BACKENDS
-from .compilation import compile_request, doctor
+from .compilation import compile_request, doctor, generate_ir_request, optimize_request
 
 
 def _assignments(parser, values: list[str]) -> dict:
@@ -22,12 +22,13 @@ def _assignments(parser, values: list[str]) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Inspect an Intent environment or compile an existing Python kernel")
+    parser = argparse.ArgumentParser(description="Inspect an Intent environment, compile a kernel or transform existing IR")
     commands = parser.add_subparsers(dest="command", required=True)
     for name, help_text in (("doctor", "Check selected backend dependencies and target facts"),
-                            ("compile", "Compile a Python file:kernel or importable.module:kernel")):
+                            ("compile", "Compile a Python file:kernel or importable.module:kernel"),
+                            ("generate-ir", "Generate provider source from existing KIR or shared IR")):
         command = commands.add_parser(name, help=help_text)
-        command.add_argument("--target", choices=BACKENDS, required=name == "doctor")
+        command.add_argument("--target", choices=BACKENDS, required=name in {"doctor", "generate-ir"})
         command.add_argument("--target-option", action="append", default=[], metavar="NAME=JSON")
         command.add_argument("--compiler", help="Intent compiler override")
         command.add_argument("--json", action="store_true", help="Write a structured result")
@@ -38,18 +39,35 @@ def main() -> None:
     compile_parser.add_argument("--stage", choices=("kir", "shared", "provider"), default="provider",
                                 help="Stop at verified KIR, shared physical IR, or generated provider source")
     compile_parser.add_argument("--materialize", action="store_true", help="Also create the callable; never launch the kernel")
+    generate_parser = commands.choices["generate-ir"]
+    generate_parser.add_argument("ir_file", metavar="INPUT.mlir")
+    generate_parser.add_argument("--input-stage", choices=("kir", "shared"), default="shared")
+    generate_parser.add_argument("--name", required=True, help="Diagnostic program identifier; does not select a kernel")
+    generate_parser.add_argument("--materialize", action="store_true", help="Also create the callable without launching")
+    optimize_parser = commands.add_parser("optimize", help="Run a standard MLIR pass pipeline on existing IR")
+    optimize_parser.add_argument("ir_file", metavar="INPUT.mlir")
+    optimize_parser.add_argument("--pipeline", required=True, help="Standard MLIR pass pipeline")
+    optimize_parser.add_argument("--optimizer", help="intent-opt executable override")
+    optimize_parser.add_argument("--json", action="store_true", help="Write a structured result")
     arguments = parser.parse_args()
-    options = _assignments(parser, arguments.target_option)
-    if arguments.command == "doctor":
-        result = doctor(arguments.target, target_options=options, compiler=arguments.compiler)
+    if arguments.command == "optimize":
+        result = optimize_request(arguments.ir_file, arguments.pipeline, optimizer=arguments.optimizer)
     else:
-        program, separator, kernel = arguments.program.rpartition(":")
-        if not separator or not program:
-            parser.error("program must be a Python file:kernel or importable.module:kernel")
-        result = compile_request(program, kernel, arguments.target, target_options=options,
-                                 constexprs=_assignments(parser, arguments.constexpr),
-                                 compiler=arguments.compiler, tuning_config=arguments.tuning_config,
-                                 materialize=arguments.materialize, stage=arguments.stage)
+        options = _assignments(parser, arguments.target_option)
+        if arguments.command == "doctor":
+            result = doctor(arguments.target, target_options=options, compiler=arguments.compiler)
+        elif arguments.command == "generate-ir":
+            result = generate_ir_request(arguments.ir_file, arguments.name, arguments.target,
+                                         input_stage=arguments.input_stage, target_options=options,
+                                         compiler=arguments.compiler, materialize=arguments.materialize)
+        else:
+            program, separator, kernel = arguments.program.rpartition(":")
+            if not separator or not program:
+                parser.error("program must be a Python file:kernel or importable.module:kernel")
+            result = compile_request(program, kernel, arguments.target, target_options=options,
+                                     constexprs=_assignments(parser, arguments.constexpr),
+                                     compiler=arguments.compiler, tuning_config=arguments.tuning_config,
+                                     materialize=arguments.materialize, stage=arguments.stage)
     if arguments.json:
         print(json.dumps(result, indent=2))
     elif arguments.command == "doctor":
@@ -58,15 +76,23 @@ def main() -> None:
             print(f"  {check['name']}: {check['status']} — {check.get('message', check.get('detail'))}")
         print(result["scope"])
     else:
-        scope = arguments.target or arguments.stage
-        print(f"{arguments.program}: {result['status']} for {scope}")
+        if arguments.command == "optimize":
+            print(f"{arguments.ir_file}: {result['status']} with {arguments.pipeline}")
+        elif arguments.command == "generate-ir":
+            print(f"{arguments.ir_file}: {result['status']} for {arguments.target}")
+        else:
+            scope = arguments.target or arguments.stage
+            print(f"{arguments.program}: {result['status']} for {scope}")
         if "diagnostic" in result:
             print(f"Stage: {result['stage']}\n{result['diagnostic']['message']}", file=sys.stderr)
         for name, path in result.get("files", {}).items():
             print(f"  {name}: {path}")
         if result.get("program_stdout"):
             print(result["program_stdout"], file=sys.stderr, end="")
-        print("The tool did not launch the selected kernel; module-level Python code executes normally.")
+        if arguments.command == "compile":
+            print("The tool did not launch the selected kernel; module-level Python code executes normally.")
+        else:
+            print("The tool did not launch a kernel.")
         print("Compilation does not establish numerical correctness.")
     if result["status"] in {"error", "unavailable"}:
         raise SystemExit(1)

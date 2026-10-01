@@ -1,6 +1,7 @@
 add_mlir_library(MLIRIntentWeftSerialization
   Serializer.cpp
   HostSerializer.cpp
-  LINK_LIBS PUBLIC IntentWeftCanonical MLIRIntentCPUDialect MLIRArithDialect
+  TaskABI.cpp
+  LINK_LIBS PUBLIC IntentWeftCanonical MLIRIntentWeftDialect MLIRIntentCPUDialect MLIRArithDialect
   MLIRFuncDialect MLIRMemRefDialect MLIRSCFDialect MLIRIR
 )

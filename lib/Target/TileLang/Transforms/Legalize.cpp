@@ -20,6 +20,12 @@ using namespace mlir;
 
 namespace intent::tilelang {
 
+const gpu::TuningProfileSchema &tuningProfileSchema() {
+  static const StringRef columns[] = {"value"};
+  static const gpu::TuningProfileSchema schema{"tilelang", columns};
+  return schema;
+}
+
 bool isLegalMmaWarpPartition(int64_t m, int64_t n, int64_t threads) {
   if (threads <= 0 || threads % 32 != 0 || m % 16 != 0 || n % 8 != 0)
     return false;
@@ -523,7 +529,7 @@ LogicalResult materializeLaunchConfiguration(
            supportsThreads(kernel, threads);
   };
   bool smallPartition = !legalThreads(128) && !legalThreads(256);
-  auto rows = profiles.get("tilelang", smallPartition ? "small_threads" : "threads",
+  auto rows = profiles.get(tuningProfileSchema(), smallPartition ? "small_threads" : "threads",
                            kernel.getLoc());
   if (failed(rows))
     return failure();
@@ -561,15 +567,26 @@ LogicalResult verifyTileLangProgram(ModuleOp module) {
              : verifyTileLangKernel(*kernel);
 }
 
-LogicalResult legalizeGPUProgram(ModuleOp module,
-                                const gpu::TuningProfiles &profiles) {
+LogicalResult formNativeMemory(ModuleOp module) {
   if (failed(gpu::verifyGPUProgram(module)))
     return failure();
   FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
-  if (failed(kernel) || failed(bufferizeGPUProgram(*kernel)) ||
-      failed(materializeLaunchConfiguration(*kernel, profiles)) ||
-      failed(formPipelines(*kernel, profiles)) ||
-      failed(materializeLegalConfigurations(*kernel)))
+  return failed(kernel) ? failure() : bufferizeGPUProgram(*kernel);
+}
+
+LogicalResult configureNativeProgram(ModuleOp module) {
+  auto profiles = gpu::TuningProfiles::from(module);
+  FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
+  if (failed(profiles) || failed(kernel) ||
+      failed(materializeLaunchConfiguration(*kernel, *profiles)) ||
+      failed(formPipelines(*kernel, *profiles)))
+    return failure();
+  return materializeLegalConfigurations(*kernel);
+}
+
+LogicalResult finalizeNativeProgram(ModuleOp module) {
+  FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
+  if (failed(kernel))
     return failure();
   (*kernel)->setAttr(lowerPredicatedLoadStoreAttr,
                      BoolAttr::get(module.getContext(), true));

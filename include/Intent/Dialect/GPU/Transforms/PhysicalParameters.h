@@ -16,8 +16,7 @@ void eraseUnusedPhysicalParameters(mlir::func::FuncOp kernel);
 mlir::LogicalResult replacePhysicalParameter(mlir::func::FuncOp kernel,
                                              ParameterOp previous,
                                              ParameterOp replacement);
-mlir::LogicalResult materializeSharedConfigTuples(mlir::func::FuncOp kernel,
-                                                 const TuningProfiles &profiles);
+mlir::LogicalResult materializeSharedConfigTuples(mlir::func::FuncOp kernel);
 mlir::LogicalResult verifySharedConfigTuples(mlir::func::FuncOp kernel);
 
 } // namespace intent::gpu

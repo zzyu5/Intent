@@ -9,11 +9,15 @@ add_mlir_library(MLIRIntentCuTileTransforms
   CollapseArrayViews.cpp
   RefineMMALoops.cpp
 
+  DEPENDS
+  IntentCuTileTransformsIncGen
+
   LINK_LIBS PUBLIC
   MLIRArithDialect
   MLIRControlFlowDialect
   MLIRFuncDialect
   MLIRIR
+  MLIRPass
   MLIRSCFDialect
   MLIRIntentCuTileDialect
   MLIRIntentGPUDialect

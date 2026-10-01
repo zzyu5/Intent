@@ -1,12 +1,21 @@
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
-#include "Intent/Transforms/PassManager.h"
-#include "mlir/Pass/Pass.h"
+#include "Intent/Dialect/Intent/IR/IntentDialect.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Transforms/Passes.h"
 
 using namespace mlir;
 namespace intent::dsa {
+
+#define GEN_PASS_DEF_DSACOLLECTIVEGATHERSUPPLY
+#define GEN_PASS_DEF_DSAMATRIXSUPPLY
+#define GEN_PASS_DEF_DSANORMALIZEINDICES
+#include "Intent/Dialect/DSA/Transforms/Passes.h.inc"
+
 namespace {
 
 LogicalResult finishGroup(ModuleOp module, StringRef name, LogicalResult result) {
@@ -15,38 +24,29 @@ LogicalResult finishGroup(ModuleOp module, StringRef name, LogicalResult result)
   return success();
 }
 
-class CollectiveGatherSupplyPass
-    : public PassWrapper<CollectiveGatherSupplyPass, OperationPass<ModuleOp>> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CollectiveGatherSupplyPass)
-  StringRef getArgument() const final { return "intent-dsa-collective-gather-supply"; }
-  StringRef getDescription() const final { return "Form collective row supply from current DSA address relations"; }
+struct CollectiveGatherSupplyPass
+    : impl::DSACollectiveGatherSupplyBase<CollectiveGatherSupplyPass> {
   void runOnOperation() final {
     auto module = getOperation();
+    if (failed(verifyProgram(module))) return signalPassFailure();
     auto function = *module.getOps<func::FuncOp>().begin();
     if (failed(finishGroup(module, getArgument(), realizeCollectiveGatherSupply(function)))) signalPassFailure();
   }
 };
 
-class MatrixSupplyPass : public PassWrapper<MatrixSupplyPass, OperationPass<ModuleOp>> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MatrixSupplyPass)
-  StringRef getArgument() const final { return "intent-dsa-matrix-supply"; }
-  StringRef getDescription() const final { return "Form resident or shared supply for a complete DSA matrix traversal"; }
+struct MatrixSupplyPass : impl::DSAMatrixSupplyBase<MatrixSupplyPass> {
   void runOnOperation() final {
     auto module = getOperation();
+    if (failed(verifyProgram(module))) return signalPassFailure();
     auto function = *module.getOps<func::FuncOp>().begin();
     if (failed(finishGroup(module, getArgument(), realizeMatrixSupply(function)))) signalPassFailure();
   }
 };
 
-class NormalizeIndicesPass : public PassWrapper<NormalizeIndicesPass, OperationPass<ModuleOp>> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NormalizeIndicesPass)
-  StringRef getArgument() const final { return "intent-dsa-normalize-indices"; }
-  StringRef getDescription() const final { return "Normalize exact DSA index programs and canonicalize the result"; }
+struct NormalizeIndicesPass : impl::DSANormalizeIndicesBase<NormalizeIndicesPass> {
   void runOnOperation() final {
     auto module = getOperation();
+    if (failed(verifyProgram(module))) return signalPassFailure();
     auto function = *module.getOps<func::FuncOp>().begin();
     LogicalResult result = success();
     if (normalizeLinearIndices(function)) {
@@ -60,20 +60,15 @@ public:
 };
 } // namespace
 
-void registerDSAPasses() {
-  PassRegistration<CollectiveGatherSupplyPass>();
-  PassRegistration<MatrixSupplyPass>();
-  PassRegistration<NormalizeIndicesPass>();
+void buildDSAPipeline(OpPassManager &manager) {
+  manager.addPass(createDSACollectiveGatherSupply());
+  manager.addPass(createDSAMatrixSupply());
+  manager.addPass(createDSANormalizeIndices());
 }
 
-LogicalResult runProgramTransforms(ModuleOp module) {
-  if (failed(verifyProgram(module))) return failure();
-  PassManager manager(module.getContext(), ModuleOp::getOperationName());
-  manager.addPass(std::make_unique<CollectiveGatherSupplyPass>());
-  manager.addPass(std::make_unique<MatrixSupplyPass>());
-  manager.addPass(std::make_unique<NormalizeIndicesPass>());
-  if (failed(intent::configurePassManager(manager))) return failure();
-  return manager.run(module);
+void registerDSAPipelines() {
+  PassPipelineRegistration<>("intent-dsa", "Form a complete shared DSA program",
+      [](OpPassManager &manager) { buildDSAPipeline(manager); });
 }
 
 } // namespace intent::dsa

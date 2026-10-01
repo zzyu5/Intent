@@ -38,6 +38,9 @@ add_mlir_library(MLIRIntentGPUTransforms
   Resources.cpp
   VerifyGPUProgram.cpp
 
+  DEPENDS
+  IntentGPUTransformsIncGen
+
   LINK_LIBS PUBLIC
   MLIRAnalysis
   MLIRArithDialect

@@ -3,7 +3,6 @@
 #include "Intent/Dialect/CPU/IR/CPUDialect.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Transforms/FinalizedCandidates.h"
-#include "Intent/Transforms/PassManager.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -18,13 +17,17 @@
 using namespace mlir;
 
 namespace intent::mojo {
-namespace {
 
-void programDialects(DialectRegistry &registry) {
-  registry.insert<cpu::IntentCPUDialect, arith::ArithDialect, func::FuncDialect,
-                  linalg::LinalgDialect, math::MathDialect, memref::MemRefDialect,
-                  scf::SCFDialect, vector::VectorDialect>();
-}
+#define GEN_PASS_DEF_MOJOMATERIALIZEPROGRAM
+#define GEN_PASS_DEF_MOJOFUSEPRIVATECOMPUTATIONS
+#define GEN_PASS_DEF_MOJOVECTORIZEPROGRAM
+#define GEN_PASS_DEF_MOJOFINALIZEPROGRAM
+#include "Intent/Target/Mojo/Transforms/Passes.h.inc"
+
+#define GEN_PASS_REGISTRATION
+#include "Intent/Target/Mojo/Transforms/Passes.h.inc"
+
+namespace {
 
 LogicalResult finishGroup(ModuleOp module, StringRef name, LogicalResult result,
                           bool realized = false) {
@@ -35,73 +38,46 @@ LogicalResult finishGroup(ModuleOp module, StringRef name, LogicalResult result,
   return success();
 }
 
-class MaterializeProgramPass
-    : public PassWrapper<MaterializeProgramPass, OperationPass<ModuleOp>> {
+class MaterializeProgramPass : public impl::MojoMaterializeProgramBase<MaterializeProgramPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MaterializeProgramPass)
-  void getDependentDialects(DialectRegistry &registry) const final {
-    programDialects(registry);
-  }
-  StringRef getArgument() const final { return "intent-mojo-materialize-program"; }
-  StringRef getDescription() const final {
-    return "Expand selected CPU implementations and materialize native task dispatch";
-  }
+  using MojoMaterializeProgramBase::MojoMaterializeProgramBase;
   void runOnOperation() final {
     auto module = getOperation();
+    if (failed(cpu::verifyImplementationBindings(module, "mojo"))) return signalPassFailure();
+    if (failed(cpu::verifyCPUProgram(module, false))) return signalPassFailure();
     if (failed(finishGroup(module, getArgument(), prepareNativeProgram(module))))
       signalPassFailure();
   }
 };
 
-class FusePrivateComputationsPass
-    : public PassWrapper<FusePrivateComputationsPass, OperationPass<ModuleOp>> {
+class FusePrivateComputationsPass : public impl::MojoFusePrivateComputationsBase<FusePrivateComputationsPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FusePrivateComputationsPass)
-  void getDependentDialects(DialectRegistry &registry) const final {
-    programDialects(registry);
-  }
-  StringRef getArgument() const final { return "intent-mojo-fuse-private-computations"; }
-  StringRef getDescription() const final {
-    return "Replay private computations under coordinate and storage lifetime proofs";
-  }
+  using MojoFusePrivateComputationsBase::MojoFusePrivateComputationsBase;
   void runOnOperation() final {
     auto module = getOperation();
+    if (failed(cpu::verifyImplementationBindings(module, "mojo"))) return signalPassFailure();
     if (failed(finishGroup(module, getArgument(), fusePrivateComputations(module))))
       signalPassFailure();
   }
 };
 
-class VectorizeProgramPass
-    : public PassWrapper<VectorizeProgramPass, OperationPass<ModuleOp>> {
+class VectorizeProgramPass : public impl::MojoVectorizeProgramBase<VectorizeProgramPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VectorizeProgramPass)
-  void getDependentDialects(DialectRegistry &registry) const final {
-    programDialects(registry);
-  }
-  StringRef getArgument() const final { return "intent-mojo-vectorize-program"; }
-  StringRef getDescription() const final {
-    return "Materialize vector traversals using coordinated implementation bindings";
-  }
+  using MojoVectorizeProgramBase::MojoVectorizeProgramBase;
   void runOnOperation() final {
     auto module = getOperation();
+    if (failed(cpu::verifyImplementationBindings(module, "mojo"))) return signalPassFailure();
     if (failed(finishGroup(module, getArgument(), vectorizeNativeProgram(module))))
       signalPassFailure();
   }
 };
 
-class FinalizeProgramPass
-    : public PassWrapper<FinalizeProgramPass, OperationPass<ModuleOp>> {
+class FinalizeProgramPass : public impl::MojoFinalizeProgramBase<FinalizeProgramPass> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FinalizeProgramPass)
-  void getDependentDialects(DialectRegistry &registry) const final {
-    programDialects(registry);
-  }
-  StringRef getArgument() const final { return "intent-mojo-finalize-program"; }
-  StringRef getDescription() const final {
-    return "Legalize the Mojo surface and remove equivalent finalized candidates";
-  }
+  using MojoFinalizeProgramBase::MojoFinalizeProgramBase;
   void runOnOperation() final {
     auto module = getOperation();
+    if (failed(cpu::verifyImplementationBindings(module, "mojo"))) return signalPassFailure();
     auto result = finalizeNativeProgram(module);
     if (succeeded(result)) cpu::deduplicateFinalizedCandidates(module);
     if (failed(finishGroup(module, getArgument(), result, true))) signalPassFailure();
@@ -111,28 +87,23 @@ public:
 } // namespace
 
 void registerMojoPasses() {
-  PassRegistration<MaterializeProgramPass>();
-  PassRegistration<FusePrivateComputationsPass>();
-  PassRegistration<VectorizeProgramPass>();
-  PassRegistration<FinalizeProgramPass>();
+  registerMojoTransformPasses();
+  PassPipelineRegistration<>("intent-mojo-pipeline", "Legalize a configured CPU program for Mojo",
+      buildMojoPipeline);
 }
 
-LogicalResult legalizeProgram(ModuleOp module) {
-  if (failed(cpu::verifyCPUProgram(module, false))) return failure();
-  PassManager manager(module.getContext(), ModuleOp::getOperationName());
+void buildMojoPipeline(OpPassManager &manager) {
   auto normalize = [&]() {
     manager.addPass(createCanonicalizerPass());
     manager.addPass(createCSEPass());
   };
-  manager.addPass(std::make_unique<MaterializeProgramPass>());
+  manager.addPass(createMojoMaterializeProgram());
   normalize();
-  manager.addPass(std::make_unique<FusePrivateComputationsPass>());
+  manager.addPass(createMojoFusePrivateComputations());
   normalize();
-  manager.addPass(std::make_unique<VectorizeProgramPass>());
+  manager.addPass(createMojoVectorizeProgram());
   normalize();
-  manager.addPass(std::make_unique<FinalizeProgramPass>());
-  if (failed(intent::configurePassManager(manager))) return failure();
-  return manager.run(module);
+  manager.addPass(createMojoFinalizeProgram());
 }
 
 } // namespace intent::mojo

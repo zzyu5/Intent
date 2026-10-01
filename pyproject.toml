@@ -20,7 +20,7 @@ intent-compiler-mcp = "intent.tools.compiler_mcp:main"
 [tool.scikit-build]
 minimum-version = "build-system.requires"
 cmake.build-type = "Release"
-build.targets = ["intent-compile"]
+build.targets = ["intent-compile", "intent-opt"]
 install.components = ["IntentRuntime"]
 wheel.packages = ["python/intent"]
 wheel.py-api = "py3"

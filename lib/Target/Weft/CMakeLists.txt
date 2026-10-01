@@ -8,5 +8,6 @@ add_library(IntentWeftCanonical STATIC IMPORTED)
 set_target_properties(IntentWeftCanonical PROPERTIES
   IMPORTED_LOCATION "${WEFT_KERNEL_LIBRARY}"
   INTERFACE_INCLUDE_DIRECTORIES "${WEFT_KERNEL_INCLUDE_DIR};${WEFT_KERNEL_GENERATED_INCLUDE_DIR}")
+add_subdirectory(IR)
 add_subdirectory(Transforms)
 add_subdirectory(Serialization)

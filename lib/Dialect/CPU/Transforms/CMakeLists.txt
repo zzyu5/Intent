@@ -25,6 +25,8 @@ add_mlir_library(MLIRIntentCPUTransforms
   FinalizedCandidates.cpp
   Passes.cpp
 
+  DEPENDS IntentCPUTransformsIncGen
+
   LINK_LIBS PUBLIC
   MLIRIntentCPUAnalysis
   MLIRIntentAnalysis

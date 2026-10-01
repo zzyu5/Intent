@@ -60,8 +60,43 @@ def _files(directory: Path | None) -> dict[str, str]:
     if directory is None:
         return {}
     return {name: str(directory / name) for name in
-            ("input.mlir", "kernel.mlir", "kernel.source", "artifact.json", "compiler.log")
+            ("input.mlir", "kernel.mlir", "kernel.source", "artifact.json", "request.json", "compiler.log")
             if (directory / name).is_file()}
+
+
+def _failure(result: dict, error: BaseException, stage: str) -> None:
+    directory = getattr(error, "cache_directory", None)
+    if directory is not None:
+        result.update(cache_directory=str(directory), files=_files(directory))
+    diagnostic = {"type": type(error).__name__, "message": str(error)}
+    cause = error
+    while cause is not None:
+        for name in ("stdout", "stderr"):
+            value = getattr(cause, name, None)
+            if isinstance(value, str) and value:
+                diagnostic.setdefault(name, value)
+        detail = getattr(cause, "diagnostic", None)
+        if detail is not None and is_dataclass(detail):
+            diagnostic["frontend"] = asdict(detail)
+            break
+        cause = cause.__cause__
+    result.update(status="error", stage=getattr(error, "stage", stage),
+                  diagnostic=diagnostic, tool_invoked_kernel=False)
+
+
+def _ir_text(ir_file: str) -> str:
+    path = Path(ir_file).expanduser().resolve(strict=True)
+    if not path.is_file():
+        raise ValueError("ir_file must name an existing MLIR file")
+    return path.read_text(encoding="utf-8")
+
+
+def _generated_result(result: dict, generated, materialize: bool) -> None:
+    result.update(cache_directory=str(generated.cache_directory),
+                  files=_files(generated.cache_directory), metadata=generated.metadata)
+    if materialize:
+        generated.materialize()
+    result.update(status="materialized" if materialize else "generated")
 
 
 def compile_request(program: str, kernel: str, target: str | None = None, *,
@@ -100,12 +135,9 @@ def compile_request(program: str, kernel: str, target: str | None = None, *,
             if selected_stage is CompilerStage.PROVIDER:
                 generated = intent.generate(definition, target=selected, compiler=compiler,
                                             constexprs=constexprs, tuning_config=tuning_config)
-                result.update(cache_directory=str(generated.cache_directory),
-                              files=_files(generated.cache_directory), metadata=generated.metadata)
                 if materialize:
                     current_stage = "generated_source_materialization"
-                    generated.materialize()
-                result.update(status="materialized" if materialize else "generated")
+                _generated_result(result, generated, materialize)
             else:
                 lowered = intent.compile_ir(definition, stage=selected_stage.value,
                                             target=selected, compiler=compiler,
@@ -114,25 +146,54 @@ def compile_request(program: str, kernel: str, target: str | None = None, *,
                               files=_files(lowered.cache_directory))
             result["tool_invoked_kernel"] = False
     except (Exception, SystemExit) as error:
-        directory = getattr(error, "cache_directory", None)
-        if directory is not None:
-            result.update(cache_directory=str(directory), files=_files(directory))
-        diagnostic = {"type": type(error).__name__, "message": str(error)}
-        cause = error
-        while cause is not None:
-            for name in ("stdout", "stderr"):
-                value = getattr(cause, name, None)
-                if isinstance(value, str) and value:
-                    diagnostic.setdefault(name, value)
-            detail = getattr(cause, "diagnostic", None)
-            if detail is not None and is_dataclass(detail):
-                diagnostic["frontend"] = asdict(detail)
-                break
-            cause = cause.__cause__
-        result.update(status="error", stage=getattr(error, "stage", current_stage),
-                      diagnostic=diagnostic, tool_invoked_kernel=False)
+        _failure(result, error, current_stage)
     if transcript.getvalue():
         result["program_stdout"] = transcript.getvalue()
+    return result
+
+
+def generate_ir_request(ir_file: str, name: str, target: str, *,
+                        input_stage: str = "shared", target_options: dict | None = None,
+                        compiler: str | None = None, materialize: bool = False) -> dict:
+    """Resume compilation from explicit existing IR through the public API."""
+    import intent
+
+    result = {"ir_file": ir_file, "name": name, "target": target,
+              "input_stage": input_stage, "tool_invoked_kernel": False}
+    current_stage = "ir_loading"
+    transcript = io.StringIO()
+    try:
+        text = _ir_text(ir_file)
+        with redirect_stdout(transcript):
+            current_stage = "target_options"
+            selected = make_target(target, dict(target_options or {}))
+            current_stage = "compilation"
+            generated = intent.generate_from_ir(text, input_stage=input_stage,
+                name=name, target=selected, compiler=compiler)
+            if materialize:
+                current_stage = "generated_source_materialization"
+            _generated_result(result, generated, materialize)
+    except (Exception, SystemExit) as error:
+        _failure(result, error, current_stage)
+    if transcript.getvalue():
+        result["program_stdout"] = transcript.getvalue()
+    return result
+
+
+def optimize_request(ir_file: str, pipeline: str, *, optimizer: str | None = None) -> dict:
+    """Apply a standard pass pipeline to an explicitly selected existing IR file."""
+    import intent
+
+    result = {"ir_file": ir_file, "pipeline": pipeline, "tool_invoked_kernel": False}
+    current_stage = "ir_loading"
+    try:
+        text = _ir_text(ir_file)
+        current_stage = "ir_optimization"
+        optimized = intent.optimize_ir(text, pipeline=pipeline, optimizer=optimizer)
+        result.update(status="optimized", cache_directory=str(optimized.cache_directory),
+                      files=_files(optimized.cache_directory))
+    except (Exception, SystemExit) as error:
+        _failure(result, error, current_stage)
     return result
 
 

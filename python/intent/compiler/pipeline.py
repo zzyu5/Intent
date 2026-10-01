@@ -7,10 +7,11 @@ from intent.frontend import lower_to_mlir
 from intent.runtime import CompiledArtifact
 from intent.targets.base import Target, SourceTarget, ResolvedSourceTarget, ResolvedTarget
 
-from .artifact import CompiledIR, GeneratedProgram
+from .artifact import CompiledIR, GeneratedProgram, OptimizedIR
 from .toolchain import CompilationStageError
 from .toolchain import CompilerStage
 from .toolchain import run_compiler
+from .toolchain import run_optimizer
 
 
 def compile(
@@ -40,6 +41,34 @@ def generate(
     kernel_mlir = _capture(definition, constexprs)
     resolved = _resolve(target)
     return _generate_source(kernel_mlir, resolved, compiler, tuning_config, definition.__name__)
+
+
+def generate_from_ir(
+    ir: str,
+    *,
+    input_stage: str = "shared",
+    name: str,
+    target: SourceTarget,
+    compiler: str | Path | None = None,
+) -> GeneratedProgram:
+    """Generate provider source from existing KIR or shared physical IR.
+
+    The caller supplies the IR stage, a diagnostic name and target; none is
+    inferred from the text. This compiles the whole module: callable entries and
+    candidates come from its IR and metadata, and name does not select a kernel.
+    Shared input retains its existing physical
+    program and configuration. The native compiler checks that its capabilities
+    agree with the selected target, without reconstructing or retuning that IR.
+    The returned program uses the usual materialize() path and does not launch.
+    """
+    if not isinstance(ir, str) or not ir.strip():
+        raise ValueError("ir must contain nonempty MLIR text")
+    if input_stage not in ("kir", "shared"):
+        raise ValueError("input_stage must be 'kir' or 'shared'")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("name must provide a nonempty diagnostic identifier for the generated program")
+    resolved = _resolve(target)
+    return _generate_source(ir, resolved, compiler, None, name, input_stage=input_stage)
 
 
 def compile_ir(
@@ -99,11 +128,15 @@ def _options(resolved: ResolvedSourceTarget, tuning_config: str | Path | None) -
     )
 
 
-def _generate_source(kernel_mlir, resolved, compiler, tuning_config, entry_name) -> GeneratedProgram:
+def _generate_source(kernel_mlir, resolved, compiler, tuning_config, entry_name,
+                     *, input_stage: str | None = None) -> GeneratedProgram:
+    options = _options(resolved, tuning_config)
+    if input_stage is not None:
+        options += (f"--input-stage={input_stage}",)
     output = run_compiler(
         compiler,
         kernel_mlir,
-        _options(resolved, tuning_config),
+        options,
         resolved.compiler_role,
     )
     return GeneratedProgram(output.source, output.ir, output.metadata, output.directory, entry_name, resolved)
@@ -121,3 +154,24 @@ def compile_shared_gpu(
         definition, stage="shared", target=target, compiler=compiler,
         constexprs=constexprs, tuning_config=tuning_config,
     ).ir
+
+
+def optimize_ir(
+    ir: str,
+    *,
+    pipeline: str,
+    optimizer: str | Path | None = None,
+) -> OptimizedIR:
+    """Run a standard MLIR pass pipeline on existing IR with intent-opt.
+
+    ir is MLIR text, and pipeline uses standard MLIR pipeline syntax, such as
+    ``builtin.module(canonicalize,cse)``. Pass prerequisites must be present in
+    the input IR or established by earlier passes in the same pipeline. Every
+    request executes the optimizer and archives its input, command, output and
+    diagnostics. This neither generates a runtime nor launches a kernel.
+    """
+    if not isinstance(ir, str) or not ir.strip():
+        raise ValueError("ir must contain nonempty MLIR text")
+    if not isinstance(pipeline, str) or not pipeline.strip():
+        raise ValueError("pipeline must contain a standard MLIR pass pipeline")
+    return run_optimizer(optimizer, ir, pipeline)

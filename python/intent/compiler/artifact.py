@@ -19,6 +19,20 @@ class CompiledIR:
 
 
 @dataclass(frozen=True, slots=True)
+class OptimizedIR:
+    """IR produced by the requested standard pass pipeline, without execution.
+
+    cache_directory archives this invocation's input, command, output and
+    diagnostics. Optimization results are not reused across requests: a textual
+    pipeline may read external resources whose dependencies belong to its passes.
+    """
+
+    ir: str
+    pipeline: str
+    cache_directory: Path
+
+
+@dataclass(frozen=True, slots=True)
 class GeneratedProgram:
     """Provider source, compiler IR and interface; no native callable or runtime."""
 

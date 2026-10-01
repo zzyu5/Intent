@@ -3,10 +3,17 @@
 #include "Configurations.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
+#include "Intent/Target/CuTile/Transforms/Passes.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/MathExtras.h"
 using namespace mlir;
 namespace intent::cutile {
+const gpu::TuningProfileSchema &tuningProfileSchema() {
+  static const StringRef columns[] = {"value"};
+  static const gpu::TuningProfileSchema schema{"cutile", columns};
+  return schema;
+}
+
 bool isLegalAccessForm(int64_t value) {
   return value == nativeAccessForm || value == gatherAccessForm ||
          value == nativeNoTMAForm;
@@ -33,7 +40,7 @@ bool isCuTileProviderRole(gpu::ParameterRole role) {
 FailureOr<gpu::ParameterOp> declareProviderParameter(
     func::FuncOp kernel, const gpu::TuningProfiles &profiles, StringRef family,
     StringRef name, gpu::ParameterRole role, bool (*isLegal)(int64_t)) {
-  auto rows = profiles.get("cutile", family, kernel.getLoc());
+  auto rows = profiles.get(tuningProfileSchema(), family, kernel.getLoc());
   if (failed(rows))
     return failure();
   SmallVector<int64_t> candidates;

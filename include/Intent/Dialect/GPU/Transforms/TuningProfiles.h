@@ -1,21 +1,27 @@
 #ifndef INTENT_DIALECT_GPU_TRANSFORMS_TUNINGPROFILES_H
 #define INTENT_DIALECT_GPU_TRANSFORMS_TUNINGPROFILES_H
 
-#include "mlir/IR/Location.h"
+#include "Intent/Dialect/GPU/IR/GPUAttrs.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/StringMap.h"
 
 #include <string>
 
 namespace intent::gpu {
 
-struct TuningProfileSource {
-  llvm::StringRef name;
-  std::string filename;
+struct TuningProfileSchema {
+  llvm::StringRef space;
   llvm::ArrayRef<llvm::StringRef> columns;
 };
+
+struct TuningProfileSource {
+  TuningProfileSchema schema;
+  std::string filename;
+};
+
+const TuningProfileSchema &sharedTuningProfileSchema();
 
 class TuningProfiles {
 public:
@@ -26,16 +32,16 @@ public:
   read(mlir::Location location, llvm::ArrayRef<TuningProfileSource> defaults,
        llvm::StringRef overrideFilename);
 
-  mlir::FailureOr<llvm::ArrayRef<Row>>
-  get(llvm::StringRef space, llvm::StringRef family,
+  static mlir::FailureOr<TuningProfiles> from(mlir::ModuleOp module);
+  void attach(mlir::ModuleOp module) const;
+
+  mlir::FailureOr<Table>
+  get(const TuningProfileSchema &schema, llvm::StringRef family,
       mlir::Location location) const;
 
 private:
-  struct Namespace {
-    size_t width;
-    llvm::StringMap<Table> families;
-  };
-  llvm::StringMap<Namespace> spaces;
+  explicit TuningProfiles(TuningProfilesAttr profiles) : profiles(profiles) {}
+  TuningProfilesAttr profiles;
 };
 
 } // namespace intent::gpu

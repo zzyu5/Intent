@@ -1,24 +1,59 @@
 #include "PassDetail.h"
-#include "Intent/Transforms/PassManager.h"
-#include "mlir/Pass/Pass.h"
-#include "mlir/Pass/PassRegistry.h"
+#include "Intent/Dialect/Intent/IR/IntentDialect.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/Passes.h"
 
 using namespace mlir;
 namespace intent::bangc {
+
+#define GEN_PASS_DEF_BANGCPREPAREPROGRAM
+#define GEN_PASS_DEF_BANGCNATIVECOMPUTATIONS
+#define GEN_PASS_DEF_BANGCNATIVEWORKSPACE
+#define GEN_PASS_DEF_BANGCNATIVEIMPLEMENTATIONS
+#define GEN_PASS_DEF_BANGCLOCALCOMPOSITION
+#define GEN_PASS_DEF_BANGCSUPPLYSYNCHRONIZATION
+#define GEN_PASS_DEF_BANGCSTORAGEBINDING
+#include "Intent/Target/BangC/Passes.h.inc"
+
 namespace {
+LogicalResult checkProgram(ModuleOp module) {
+  if (failed(dsa::verifyProgram(module))) return failure();
+  auto architecture = module->getAttrOfType<StringAttr>("bangc.architecture");
+  if (!architecture || architecture.getValue() != "mtp_372")
+    return module.emitError("BANG C transformations require the selected mtp_372 implementation profile");
+  return success();
+}
+
+OpPassManager cleanupPipeline() {
+  OpPassManager manager(ModuleOp::getOperationName());
+  manager.addPass(createCanonicalizerPass());
+  manager.addPass(createCSEPass());
+  return manager;
+}
+
 LogicalResult finishGroup(ModuleOp module, StringRef name, LogicalResult result) {
   if (failed(result)) return module.emitError() << "BANG C transformation failed: " << name;
   if (failed(dsa::verifyProgram(module))) return module.emitError() << "BANG C postcondition failed: " << name;
   return success();
 }
 
-class NativeComputationsPass : public PassWrapper<NativeComputationsPass, OperationPass<ModuleOp>> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NativeComputationsPass)
-  StringRef getArgument() const final { return "intent-bangc-native-computations"; }
-  StringRef getDescription() const final { return "Realize BANG C numerical and matrix computations"; }
+struct PrepareProgramPass : impl::BangCPrepareProgramBase<PrepareProgramPass> {
+  using Base::Base;
   void runOnOperation() final {
     auto module = getOperation();
+    if (architecture.getValue() != "mtp_372") {
+      module.emitError("BANG C requires an explicit mtp_372 implementation profile");
+      return signalPassFailure();
+    }
+    if (failed(dsa::verifyProgram(module))) return signalPassFailure();
+    module->setAttr("bangc.architecture", StringAttr::get(module.getContext(), architecture.getValue()));
+  }
+};
+
+struct NativeComputationsPass : impl::BangCNativeComputationsBase<NativeComputationsPass> {
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(checkProgram(module))) return signalPassFailure();
     if (failed(finishGroup(module, getArgument(), realizeNativeComputations(module)))) {
       signalPassFailure();
       return;
@@ -26,27 +61,23 @@ public:
   }
 };
 
-class NativeWorkspacePass : public PassWrapper<NativeWorkspacePass, OperationPass<ModuleOp>> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NativeWorkspacePass)
-  StringRef getArgument() const final { return "intent-bangc-native-workspace"; }
-  StringRef getDescription() const final { return "Realize workspace required by selected BANG C computations"; }
+struct NativeWorkspacePass : impl::BangCNativeWorkspaceBase<NativeWorkspacePass> {
   void runOnOperation() final {
     auto module = getOperation();
-    if (failed(finishGroup(module, getArgument(), realizeNativeWorkspace(module)))) {
+    if (failed(checkProgram(module))) return signalPassFailure();
+    auto cleanup = cleanupPipeline();
+    auto result = realizeNativeWorkspace(module, [&] { return runPipeline(cleanup, module); });
+    if (failed(finishGroup(module, getArgument(), result))) {
       signalPassFailure();
       return;
     }
   }
 };
 
-class NativeImplementationsPass : public PassWrapper<NativeImplementationsPass, OperationPass<ModuleOp>> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NativeImplementationsPass)
-  StringRef getArgument() const final { return "intent-bangc-native-implementations"; }
-  StringRef getDescription() const final { return "Select BANG C native implementations and matrix layouts"; }
+struct NativeImplementationsPass : impl::BangCNativeImplementationsBase<NativeImplementationsPass> {
   void runOnOperation() final {
     auto module = getOperation();
+    if (failed(checkProgram(module))) return signalPassFailure();
     if (failed(finishGroup(module, getArgument(), selectNativeImplementations(module)))) {
       signalPassFailure();
       return;
@@ -54,27 +85,23 @@ public:
   }
 };
 
-class LocalCompositionPass : public PassWrapper<LocalCompositionPass, OperationPass<ModuleOp>> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LocalCompositionPass)
-  StringRef getArgument() const final { return "intent-bangc-local-composition"; }
-  StringRef getDescription() const final { return "Compose local values and accesses in the BANG C program"; }
+struct LocalCompositionPass : impl::BangCLocalCompositionBase<LocalCompositionPass> {
   void runOnOperation() final {
     auto module = getOperation();
-    if (failed(finishGroup(module, getArgument(), composeLocalProgram(module)))) {
+    if (failed(checkProgram(module))) return signalPassFailure();
+    auto cleanup = cleanupPipeline();
+    auto result = composeLocalProgram(module, [&] { return runPipeline(cleanup, module); });
+    if (failed(finishGroup(module, getArgument(), result))) {
       signalPassFailure();
       return;
     }
   }
 };
 
-class SupplySynchronizationPass : public PassWrapper<SupplySynchronizationPass, OperationPass<ModuleOp>> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SupplySynchronizationPass)
-  StringRef getArgument() const final { return "intent-bangc-supply-synchronization"; }
-  StringRef getDescription() const final { return "Schedule BANG C supply, participants and synchronization"; }
+struct SupplySynchronizationPass : impl::BangCSupplySynchronizationBase<SupplySynchronizationPass> {
   void runOnOperation() final {
     auto module = getOperation();
+    if (failed(checkProgram(module))) return signalPassFailure();
     if (failed(finishGroup(module, getArgument(), scheduleProgramSupply(module)))) {
       signalPassFailure();
       return;
@@ -82,13 +109,10 @@ public:
   }
 };
 
-class StorageBindingPass : public PassWrapper<StorageBindingPass, OperationPass<ModuleOp>> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(StorageBindingPass)
-  StringRef getArgument() const final { return "intent-bangc-storage-binding"; }
-  StringRef getDescription() const final { return "Bind final BANG C physical storage and verify target legality"; }
+struct StorageBindingPass : impl::BangCStorageBindingBase<StorageBindingPass> {
   void runOnOperation() final {
     auto module = getOperation();
+    if (failed(checkProgram(module))) return signalPassFailure();
     if (failed(finishGroup(module, getArgument(), bindProgramStorage(module)))) {
       signalPassFailure();
       return;
@@ -102,29 +126,27 @@ public:
 
 } // namespace
 
-void registerBangCPasses() {
-  PassRegistration<NativeComputationsPass>();
-  PassRegistration<NativeWorkspacePass>();
-  PassRegistration<NativeImplementationsPass>();
-  PassRegistration<LocalCompositionPass>();
-  PassRegistration<SupplySynchronizationPass>();
-  PassRegistration<StorageBindingPass>();
+void buildBangCPipeline(OpPassManager &manager, StringRef architecture) {
+  BangCPrepareProgramOptions options;
+  options.architecture = architecture.str();
+  manager.addPass(createBangCPrepareProgram(options));
+  manager.addPass(createBangCNativeComputations());
+  manager.addPass(createBangCNativeWorkspace());
+  manager.addPass(createBangCNativeImplementations());
+  manager.addPass(createBangCLocalComposition());
+  manager.addPass(createBangCSupplySynchronization());
+  manager.addPass(createBangCStorageBinding());
 }
 
-LogicalResult legalizeProgram(ModuleOp module, StringRef architecture) {
-  if (architecture != "mtp_372")
-    return module.emitError("BANG C currently has a bound implementation profile for mtp_372");
-  if (failed(dsa::verifyProgram(module))) return failure();
-  module->setAttr("bangc.architecture", StringAttr::get(module.getContext(), architecture));
-  PassManager manager(module.getContext(), ModuleOp::getOperationName());
-  manager.addPass(std::make_unique<NativeComputationsPass>());
-  manager.addPass(std::make_unique<NativeWorkspacePass>());
-  manager.addPass(std::make_unique<NativeImplementationsPass>());
-  manager.addPass(std::make_unique<LocalCompositionPass>());
-  manager.addPass(std::make_unique<SupplySynchronizationPass>());
-  manager.addPass(std::make_unique<StorageBindingPass>());
-  if (failed(intent::configurePassManager(manager))) return failure();
-  return manager.run(module);
+void registerBangCPipelines() {
+  struct Options : PassPipelineOptions<Options> {
+    Option<std::string> architecture{*this, "architecture",
+        llvm::cl::desc("Explicit BANG C implementation architecture"), llvm::cl::init("")};
+  };
+  PassPipelineRegistration<Options>("intent-bangc", "Legalize a complete DSA program to BANG C",
+      [](OpPassManager &manager, const Options &options) {
+        buildBangCPipeline(manager, options.architecture.getValue());
+      });
 }
 
 } // namespace intent::bangc

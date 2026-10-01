@@ -9,7 +9,8 @@ import tempfile
 from dataclasses import dataclass
 from enum import Enum
 
-from .cache import _compilation_key, compilation_directory
+from .artifact import OptimizedIR
+from .cache import _compilation_key, compilation_directory, locked_cache_entry
 
 
 class CompilationStageError(RuntimeError):
@@ -19,35 +20,28 @@ class CompilationStageError(RuntimeError):
         self.cache_directory = cache_directory
 
 
-_STAGE_BY_EXIT_CODE = {
-    1: "compiler_invocation",
-    2: "kernel_ir",
-    3: "physical_program",
-    4: "physical_program_verification",
-    5: "provider_program",
-    6: "provider_program_verification",
-    7: "terminal_translation",
-    8: "compiler_output",
-}
-
-
-def _resolve_compiler(executable_path: str | Path | None, role: str) -> Path:
-    selected = executable_path if executable_path is not None else os.environ.get("INTENT_COMPILER")
+def _resolve_executable(executable_path: str | Path | None, name: str,
+                        environment_variable: str, stage: str, role: str) -> Path:
+    selected = executable_path if executable_path is not None else os.environ.get(environment_variable)
     if selected is None:
-        bundled = Path(__file__).resolve().parents[1] / "_bin" / "intent-compile"
-        selected = bundled if bundled.exists() else shutil.which("intent-compile")
+        bundled = Path(__file__).resolve().parents[1] / "_bin" / name
+        selected = bundled if bundled.exists() else shutil.which(name)
     if selected is None:
         raise CompilationStageError(
-            "compiler_invocation",
-            "intent-compile was not found. Install the IntentDSL package with its compiler, "
-            "or set INTENT_COMPILER / pass compiler= to a built intent-compile executable.",
+            stage, f"{name} was not found. Install IntentDSL with its compiler tools, "
+            f"or set {environment_variable} / select an explicit {name} executable.",
         )
     executable = Path(selected).expanduser().resolve()
     if not executable.is_file() or not os.access(executable, os.X_OK):
         raise CompilationStageError(
-            "compiler_invocation", f"{role} is not an executable file: {executable}"
+            stage, f"{role} is not an executable file: {executable}"
         )
     return executable
+
+
+def _resolve_compiler(executable_path: str | Path | None, role: str) -> Path:
+    return _resolve_executable(executable_path, "intent-compile", "INTENT_COMPILER",
+                               "compiler_invocation", role)
 
 
 class CompilerStage(str, Enum):
@@ -99,6 +93,14 @@ def compiler_info(executable_path: str | Path | None = None) -> dict[str, object
             for stage in info["stages"]
         ):
             raise ValueError("compiler info must describe outputs for every stage")
+        failures = info.get("failure_stages")
+        if not isinstance(failures, dict) or not failures:
+            raise ValueError("compiler info must describe failure stages by exit code")
+        for code, stage in failures.items():
+            if not code.isascii() or not code.isdecimal() or int(code) <= 0 or str(int(code)) != code:
+                raise ValueError("compiler failure stage keys must be positive decimal exit codes")
+            if not isinstance(stage, str) or not stage.strip():
+                raise ValueError("compiler failure stages must have nonempty names")
     except (ValueError, TypeError) as error:
         raise CompilationStageError("compiler_output", f"Invalid compiler info from {executable}: {error}") from error
     return {**info, "executable": str(executable)}
@@ -140,6 +142,11 @@ def run_compiler(executable_path: str | Path | None, module_text: str,
                 # output below still has to pass the same validation.
                 complete.unlink()
         (directory / "input.mlir").write_text(module_text, encoding="utf-8")
+        try:
+            description = compiler_info(executable)
+        except CompilationStageError as error:
+            (directory / "compiler.log").write_text(str(error), encoding="utf-8")
+            raise CompilationStageError(error.stage, str(error), cache_directory=directory) from error
         with tempfile.TemporaryDirectory(prefix=".building-", dir=directory) as temporary:
             staging = Path(temporary)
             command = [str(executable), *options, f"--ir-output={staging / 'kernel.mlir'}"]
@@ -156,7 +163,7 @@ def run_compiler(executable_path: str | Path | None, module_text: str,
             (directory / "compiler.log").write_text(completed.stderr + completed.stdout, encoding="utf-8")
             if completed.returncode:
                 raise CompilationStageError(
-                    _STAGE_BY_EXIT_CODE.get(completed.returncode, "compiler_process"),
+                    description["failure_stages"].get(str(completed.returncode), "compiler_process"),
                     f"{role} failed with exit code {completed.returncode}:\n"
                     f"{completed.stderr}{completed.stdout}\nCompiler artifacts: {directory}",
                     cache_directory=directory,
@@ -173,3 +180,51 @@ def run_compiler(executable_path: str | Path | None, module_text: str,
             )
         complete.touch()
         return result
+
+
+def run_optimizer(executable_path: str | Path | None, module_text: str,
+                  pipeline: str) -> OptimizedIR:
+    executable = _resolve_executable(executable_path, "intent-opt", "INTENT_OPTIMIZER",
+                                     "optimizer_invocation", "Intent optimizer")
+    options = (f"--pass-pipeline={pipeline}", "--mlir-print-debuginfo")
+    key = _compilation_key(executable, module_text, options)
+    # The existing identity/locking mechanism organizes diagnostic attempts.
+    # A pass may read explicitly selected files, so no attempt is reused here.
+    with locked_cache_entry("optimizer", key) as entry:
+        directory = entry.create_attempt()
+        (directory / "input.mlir").write_text(module_text, encoding="utf-8")
+        command = [str(executable), *options, "-o", str(directory / "kernel.mlir"), "-"]
+        (directory / "request.json").write_text(
+            json.dumps({"tool_inputs": json.loads(key), "command": command,
+                        "working_directory": os.getcwd(),
+                        "pipeline": pipeline}, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        try:
+            completed = subprocess.run(command, input=module_text, text=True,
+                                       capture_output=True, check=False)
+        except OSError as error:
+            (directory / "compiler.log").write_text(str(error), encoding="utf-8")
+            raise CompilationStageError("optimizer_invocation", str(error),
+                                        cache_directory=directory) from error
+        (directory / "compiler.log").write_text(completed.stderr + completed.stdout, encoding="utf-8")
+        if completed.returncode:
+            raise CompilationStageError(
+                "optimizer_process" if completed.returncode < 0 else "ir_optimization",
+                f"Intent optimizer failed with exit code {completed.returncode}:\n"
+                f"{completed.stderr}{completed.stdout}\nOptimizer artifacts: {directory}",
+                cache_directory=directory,
+            )
+        path = directory / "kernel.mlir"
+        if not path.is_file() or path.stat().st_size == 0:
+            raise CompilationStageError("optimizer_output", "Intent optimizer produced no IR",
+                                        cache_directory=directory)
+        try:
+            result = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as error:
+            raise CompilationStageError("optimizer_output", str(error),
+                                        cache_directory=directory) from error
+        if _compilation_key(executable, module_text, options) != key:
+            raise CompilationStageError("optimizer_invocation", "optimizer or profiles changed during optimization",
+                                        cache_directory=directory)
+        return OptimizedIR(result, pipeline, directory)

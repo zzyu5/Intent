@@ -6,11 +6,10 @@
 
 namespace intent::triton {
 
-// Complete provider phases. Only current IR and the immutable tuning profile
-// cross these boundaries; local form candidates are closed within one phase.
+// Complete provider phases consume only current IR; local form candidates are
+// closed within one phase.
 mlir::LogicalResult prepareTritonMemory(mlir::ModuleOp module);
-mlir::LogicalResult formTritonProgram(mlir::ModuleOp module,
-                                    const gpu::TuningProfiles &profiles);
+mlir::LogicalResult formTritonProgram(mlir::ModuleOp module);
 mlir::LogicalResult finalizeTritonProgram(mlir::ModuleOp module);
 
 namespace detail {

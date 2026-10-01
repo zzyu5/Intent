@@ -3,10 +3,19 @@
 
 #include "Intent/Dialect/DSA/IR/DSAOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassRegistry.h"
+
+namespace mlir { class OpPassManager; }
 
 namespace intent::dsa {
-void registerDSAPasses();
-mlir::LogicalResult runProgramTransforms(mlir::ModuleOp module);
+#define GEN_PASS_DECL
+#include "Intent/Dialect/DSA/Transforms/Passes.h.inc"
+#define GEN_PASS_REGISTRATION
+#include "Intent/Dialect/DSA/Transforms/Passes.h.inc"
+
+void buildDSAPipeline(mlir::OpPassManager &manager);
+void registerDSAPipelines();
 mlir::LogicalResult realizeCollectiveGatherSupply(mlir::func::FuncOp function);
 mlir::LogicalResult realizeMatrixSupply(mlir::func::FuncOp function);
 bool normalizeLinearIndices(mlir::func::FuncOp function);

@@ -1,3 +1,6 @@
 add_subdirectory(CuTile)
+add_subdirectory(BangC)
+add_subdirectory(Mojo)
 add_subdirectory(TileLang)
 add_subdirectory(Triton)
+add_subdirectory(Weft)

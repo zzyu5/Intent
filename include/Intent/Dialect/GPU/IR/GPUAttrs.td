@@ -79,6 +79,23 @@ def IntentGPU_ParameterAttr : AttrDef<IntentGPU_Dialect, "Parameter"> {
   let genVerifyDecl = 1;
 }
 
+def IntentGPU_TuningProfileTableAttr : AttrDef<IntentGPU_Dialect, "TuningProfileTable"> {
+  let mnemonic = "tuning_profile_table";
+  let summary = "Ordered column schema and finite candidate rows by family";
+  let parameters = (ins "::mlir::ArrayAttr":$columns,
+                        "::mlir::DictionaryAttr":$families);
+  let assemblyFormat = "`<` $columns `,` $families `>`";
+  let genVerifyDecl = 1;
+}
+
+def IntentGPU_TuningProfilesAttr : AttrDef<IntentGPU_Dialect, "TuningProfiles"> {
+  let mnemonic = "tuning_profiles";
+  let summary = "Resolved, ordered shared and provider candidate profile tables";
+  let parameters = (ins "::mlir::DictionaryAttr":$spaces);
+  let assemblyFormat = "`<` $spaces `>`";
+  let genVerifyDecl = 1;
+}
+
 def IntentGPU_AxisMapAttr : AttrDef<IntentGPU_Dialect, "AxisMap"> {
   let mnemonic = "axis_map";
   let summary = "Fragment axis to immutable logical source-axis mapping";

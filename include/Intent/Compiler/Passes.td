@@ -1,0 +1,54 @@
+#ifndef INTENT_COMPILER_PASSES_TD
+#define INTENT_COMPILER_PASSES_TD
+include "mlir/Pass/PassBase.td"
+
+def ConstructGPU : Pass<"intent-construct-gpu", "mlir::ModuleOp"> {
+  let summary = "Construct the executable GPU program from canonical KIR";
+  let options = [
+    Option<"computeUnits", "compute-units", "int64_t", "0", "Compute units">,
+    Option<"sharedMemoryPerUnit", "shared-memory-per-unit", "int64_t", "0", "Shared bytes per unit">,
+    Option<"maxDynamicSharedMemoryPerBlock", "max-dynamic-shared-memory-per-block", "int64_t", "0", "Dynamic shared limit">,
+    Option<"registersPerUnit", "registers-per-unit", "int64_t", "0", "Registers per unit">,
+    Option<"maxThreadsPerBlock", "max-threads-per-block", "int64_t", "0", "Threads per block">,
+    Option<"computeCapabilityMajor", "compute-capability-major", "int64_t", "0", "Architecture major">,
+    Option<"computeCapabilityMinor", "compute-capability-minor", "int64_t", "-1", "Architecture minor">,
+    Option<"singleToDoublePrecisionPerfRatio", "single-to-double-precision-perf-ratio", "int64_t", "0", "FP32/FP64 throughput ratio">,
+    Option<"matrixUnits", "matrix-units", "bool", "false", "Matrix capability">,
+    Option<"dynamicVectorWidth", "dynamic-vector-width", "bool", "false", "Dynamic vector width">,
+    Option<"nativeTupleReductions", "native-tuple-reductions", "bool", "false", "Provider tuple reductions">,
+    Option<"nativeFragmentGather", "native-fragment-gather", "bool", "false", "Provider fragment gather">
+  ];
+  let dependentDialects = ["intent::gpu::IntentGPUDialect", "mlir::arith::ArithDialect", "mlir::func::FuncDialect", "mlir::scf::SCFDialect"];
+}
+
+def ConstructCPU : Pass<"intent-construct-cpu", "mlir::ModuleOp"> {
+  let summary = "Construct the executable CPU program from canonical KIR";
+  let options = [Option<"stridedInputs", "strided-inputs", "bool", "false", "Preserve external input strides">];
+  let dependentDialects = ["intent::cpu::IntentCPUDialect", "mlir::arith::ArithDialect", "mlir::func::FuncDialect", "mlir::linalg::LinalgDialect", "mlir::math::MathDialect", "mlir::memref::MemRefDialect", "mlir::scf::SCFDialect", "mlir::vector::VectorDialect"];
+}
+
+def ConstructDSA : Pass<"intent-construct-dsa", "mlir::ModuleOp"> {
+  let summary = "Construct the executable local-memory DSA program";
+  let options = [
+    Option<"tile", "tile", "int64_t", "1024", "Element tile">,
+    Option<"tileM", "tile-m", "int64_t", "16", "M tile">,
+    Option<"tileN", "tile-n", "int64_t", "64", "N tile">,
+    Option<"tileK", "tile-k", "int64_t", "64", "K tile">,
+    Option<"regionTile", "region-tile", "int64_t", "64", "Region tile">,
+    Option<"tasks", "tasks", "int64_t", "16", "Task count">,
+    Option<"localBytes", "local-bytes", "int64_t", "524288", "Local storage bytes">,
+    Option<"shapes", "shapes", "std::string", [{"{}"}], "JSON parameter shapes">,
+    Option<"strides", "strides", "std::string", [{"{}"}], "JSON parameter strides">
+  ];
+  let dependentDialects = ["intent::dsa::IntentDSADialect", "mlir::arith::ArithDialect", "mlir::func::FuncDialect", "mlir::math::MathDialect", "mlir::memref::MemRefDialect", "mlir::scf::SCFDialect"];
+}
+
+def ResolveGPUProfiles : Pass<"intent-resolve-gpu-profiles", "mlir::ModuleOp"> {
+  let summary = "Resolve finite profile inputs into the current GPU module";
+  let options = [
+    Option<"directory", "directory", "std::string", [{""}], "Directory of compiler profile resources">,
+    Option<"overrides", "overrides", "std::string", [{""}], "Explicit profile overrides">
+  ];
+  let dependentDialects = ["intent::gpu::IntentGPUDialect"];
+}
+#endif

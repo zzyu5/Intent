@@ -2,12 +2,17 @@
 #define INTENT_DIALECT_GPU_TRANSFORMS_PASSES_H
 
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Support/LogicalResult.h"
 
 namespace intent::gpu {
 
-class TuningProfiles;
+#define GEN_PASS_DECL
+#include "Intent/Dialect/GPU/Transforms/Passes.h.inc"
+
 void registerGPUPasses();
+void buildSharedGPUPipeline(mlir::OpPassManager &manager);
 
 mlir::LogicalResult verifyGPUProgram(mlir::ModuleOp module);
 mlir::LogicalResult realizeAccessComposition(mlir::ModuleOp module);
@@ -39,8 +44,6 @@ mlir::LogicalResult simplifyRangePredicates(mlir::ModuleOp module);
 mlir::LogicalResult fuseIndependentReductions(mlir::ModuleOp module);
 mlir::LogicalResult fuseIndependentTraversals(mlir::ModuleOp module);
 mlir::LogicalResult completeGPUProgramConstruction(mlir::ModuleOp module);
-mlir::LogicalResult runSharedGPUPasses(mlir::ModuleOp module,
-                                      const TuningProfiles &profiles);
 
 } // namespace intent::gpu
 

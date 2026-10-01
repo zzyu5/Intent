@@ -107,7 +107,9 @@ NativeProgramFeatures queryNativeProgramFeatures(func::FuncOp kernel) {
   return features;
 }
 
-LogicalResult formNativeProgram(ModuleOp module, const gpu::TuningProfiles &profiles) {
+LogicalResult formNativeProgram(ModuleOp module) {
+  auto profiles = gpu::TuningProfiles::from(module);
+  if (failed(profiles)) return failure();
   auto physicalKernel = gpu::getPhysicalKernel(module);
   if (failed(physicalKernel)) return failure();
   func::FuncOp kernel = *physicalKernel;
@@ -133,23 +135,23 @@ LogicalResult formNativeProgram(ModuleOp module, const gpu::TuningProfiles &prof
         "cuTile E8M0 scaled MMA requires compute capability 10.0 or newer");
   if (features.occupancySensitive &&
       failed(declareProviderParameter(
-          kernel, profiles, occupancyProfileFamily(kernel, capabilities),
+          kernel, *profiles, occupancyProfileFamily(kernel, capabilities),
           occupancyParameter, gpu::ParameterRole::ProviderOccupancy,
           isLegalOccupancy)))
     return failure();
   if (features.matrixCompute &&
       failed(declareProviderParameter(
-          kernel, profiles, "ctas", ctasParameter,
+          kernel, *profiles, "ctas", ctasParameter,
           gpu::ParameterRole::ProviderCTAs, isLegalCTAs)))
     return failure();
   if (features.occupancySensitive &&
       failed(declareProviderParameter(
-          kernel, profiles, "worker_warps", workerWarpsParameter,
+          kernel, *profiles, "worker_warps", workerWarpsParameter,
           gpu::ParameterRole::ProviderWarps, isLegalWorkerWarps)))
     return failure();
 
   NativeFormRewriter rewriter;
-  if (failed(formNativeAccesses(kernel, profiles, inputs, features.matrixCompute,
+  if (failed(formNativeAccesses(kernel, *profiles, inputs, features.matrixCompute,
                                 rewriter)) ||
       failed(formComputePrimitives(kernel, inputs, rewriter)))
     return failure();
