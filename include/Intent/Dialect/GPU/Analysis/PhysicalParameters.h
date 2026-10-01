@@ -22,8 +22,6 @@ struct PhysicalParameterDomain {
   }
 };
 
-enum class ParameterBindingScope { Shared, Complete };
-
 // A read-only snapshot of declarations in the current physical kernel. Rebuild
 // after changing a declaration or its candidate domain. Configs remain IR
 // attributes; this analysis neither chooses candidates nor owns execution data.
@@ -32,8 +30,6 @@ public:
   static mlir::FailureOr<PhysicalParameterSpace> read(mlir::func::FuncOp kernel);
   llvm::ArrayRef<PhysicalParameterDomain> domains() const { return parameters; }
   const PhysicalParameterDomain *find(ParameterRole role) const;
-  mlir::LogicalResult verifyBindings(mlir::DictionaryAttr bindings,
-                                    ParameterBindingScope scope) const;
   mlir::FailureOr<llvm::SmallVector<mlir::DictionaryAttr>>
   sharedConfigurations() const;
 

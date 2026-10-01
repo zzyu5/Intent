@@ -77,14 +77,8 @@ inline constexpr llvm::StringLiteral physicalTailAttr =
     "intent_gpu.physical_tail";
 inline constexpr llvm::StringLiteral programBoundedOriginAttr =
     "intent_gpu.program_bounded_origin";
-inline constexpr llvm::StringLiteral tritonConfigsAttr =
-    "intent_gpu.triton.configs";
-inline constexpr llvm::StringLiteral cuTileConfigsAttr =
-    "intent_gpu.cutile.configs";
-inline constexpr llvm::StringLiteral tileLangConfigsAttr =
-    "intent_gpu.tilelang.configs";
-inline constexpr llvm::StringLiteral sharedConfigTuplesAttr =
-    "intent_gpu.shared.config_tuples";
+inline constexpr llvm::StringLiteral configurationsAttr =
+    "intent_gpu.configurations";
 inline constexpr llvm::StringLiteral tuningProfilesAttr =
     "intent_gpu.tuning_profiles";
 

@@ -6,6 +6,7 @@
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Serialization/Interface.h"
 #include "Intent/Dialect/GPU/Serialization/Python.h"
+#include "Intent/Target/Triton/IR/Configuration.h"
 #include "Intent/Target/Triton/IR/TritonOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -83,6 +84,12 @@ private:
   };
 
   void bindArguments() {
+    auto configurationSchema = ConfigurationSchema::read(kernel);
+    if (mlir::failed(configurationSchema)) {
+      failed = true;
+      return;
+    }
+    configuration = std::move(*configurationSchema);
     auto interface = gpu::readInterface(kernel);
     if (mlir::failed(interface)) {
       failed = true;
@@ -239,30 +246,9 @@ private:
         output << ", ";
       first = false;
       output << descriptorChoice.getEligibilityArgument() << ": tl.constexpr";
-      output << ", " << descriptorChoice.getConfigParameter()
-             << ": tl.constexpr";
     }
-    kernel.walk([&](gpu::ParameterOp parameter) {
-      auto role = static_cast<gpu::ParameterRole>(
-          parameter.getParameter().getRole());
-      if (role == gpu::ParameterRole::ProviderWarps ||
-          role == gpu::ParameterRole::ProviderCTAs)
-        return;
-      if (role == gpu::ParameterRole::ProviderStages) {
-        bool bound = false;
-        kernel.walk([&](scf::ForOp loop) {
-          bound |= loop->getAttrOfType<gpu::ParameterAttr>(loopStagesAttr) ==
-                   parameter.getParameter();
-        });
-        if (!bound)
-          return;
-      }
-      std::string name = parameter.getParameter().getName().getValue().str();
-      parameterNames.push_back(name);
-      values[parameter.getResult()] = name;
-    });
-    for (StringRef parameter : parameterNames)
-      output << ", " << parameter << ": tl.constexpr";
+    for (StringAttr parameter : configuration.kernelParameters)
+      output << ", " << parameter.getValue() << ": tl.constexpr";
     for (const DescriptorABI &descriptor : descriptors)
       output << ", " << descriptor.name;
     output << "):\n";
@@ -270,12 +256,8 @@ private:
     for (auto [index, metadata] : llvm::enumerate(metadataArguments))
       line(metadata.name + ": tl.constexpr = " + metadataArgument + "[" +
            std::to_string(index) + "]");
-    kernel.walk([&](gpu::ParameterOp parameter) {
-      if (parameter.getParameter().getRole() ==
-          static_cast<uint32_t>(gpu::ParameterRole::ProviderWarps))
-        line(parameter.getParameter().getName().getValue().str() +
-             ": tl.constexpr = tl.extra.cuda.num_warps()");
-    });
+    line(configuration.warps.getValue().str() +
+         ": tl.constexpr = tl.extra.cuda.num_warps()");
     emitBlock(kernel.getBody().front(), /*isLoop=*/false, {});
     output << "\n";
   }
@@ -1336,37 +1318,17 @@ private:
 
   LogicalResult emitMetadata(std::string &metadata) {
     auto artifact = gpu::serializeInterface(
-        kernel, "triton", [&](Value value) { return valueString(value); },
-        [&](DictionaryAttr local) -> LogicalResult {
-          if (!descriptorChoice) {
-            if (!local.empty())
-              return kernel.emitError(
-                  "Triton configuration has undeclared provider bindings");
-            return success();
-          }
-          auto choice = local.getAs<IntegerAttr>(descriptorChoice.getConfigParameter());
-          if (local.size() != 1 || !choice ||
-              (choice.getInt() != 0 && choice.getInt() != 1))
-            return kernel.emitError(
-                "Triton configuration must bind its descriptor choice to 0 or 1");
-          return success();
-        });
+        kernel, "triton", [&](Value value) { return valueString(value); });
     if (mlir::failed(artifact)) return failure();
     llvm::json::Object details{{"kernel", "_intent_kernel"}};
-    llvm::json::Array configs;
-    for (Attribute attribute : kernel->getAttrOfType<ArrayAttr>(gpu::tritonConfigsAttr)) {
-      auto config = cast<DictionaryAttr>(attribute);
-      llvm::json::Object parameters;
-      for (NamedAttribute parameter : config.getAs<DictionaryAttr>("parameters"))
-        parameters[parameter.getName().getValue()] =
-            cast<IntegerAttr>(parameter.getValue()).getInt();
-      configs.push_back(llvm::json::Object{
-          {"parameters", std::move(parameters)},
-          {"num_warps", config.getAs<IntegerAttr>("num_warps").getInt()},
-          {"num_stages", config.getAs<IntegerAttr>("num_stages").getInt()},
-          {"num_ctas", config.getAs<IntegerAttr>("num_ctas").getInt()}});
-    }
-    details["configs"] = std::move(configs);
+    llvm::json::Array kernelParameters;
+    for (StringAttr parameter : configuration.kernelParameters)
+      kernelParameters.push_back(parameter.getValue());
+    details["kernel_parameters"] = std::move(kernelParameters);
+    details["native_options"] = llvm::json::Object{
+        {"num_warps", configuration.warps.getValue()},
+        {"num_stages", configuration.stages.getValue()},
+        {"num_ctas", configuration.ctas.getValue()}};
     llvm::json::Array arguments, key;
     for (const ViewABI &view : views) arguments.push_back(view.name);
     for (const ScalarABI &scalar : scalars) arguments.push_back(scalar.name);
@@ -1391,19 +1353,6 @@ private:
       key.push_back(descriptorChoice.getEligibilityArgument());
     }
     for (const std::string &name : coverageNames) key.push_back(name);
-    llvm::json::Object configOptions;
-    kernel.walk([&](gpu::ParameterOp parameter) {
-      StringRef field;
-      switch (static_cast<gpu::ParameterRole>(parameter.getParameter().getRole())) {
-      case gpu::ParameterRole::ProviderWarps: field = "num_warps"; break;
-      case gpu::ParameterRole::ProviderStages: field = "num_stages"; break;
-      case gpu::ParameterRole::ProviderCTAs: field = "num_ctas"; break;
-      default: break;
-      }
-      if (!field.empty())
-        configOptions[parameter.getParameter().getName().getValue()] = field;
-    });
-    details["config_options"] = std::move(configOptions);
     llvm::json::Array encodedDescriptors;
     for (const DescriptorABI &descriptor : descriptors) {
       TensorDescriptorOp operation = descriptor.operation;
@@ -1467,7 +1416,7 @@ private:
   SmallVector<gpu::ViewOverlapOp> overlapFacts;
   std::string overlapArgument = "_intent_overlaps";
   std::set<std::string> coverageNames;
-  SmallVector<std::string> parameterNames;
+  ConfigurationSchema configuration;
   llvm::DenseMap<Operation *, SmallVector<std::string>> helperNames;
   TensorDescriptorChoiceOp descriptorChoice;
   TensorDescriptorAllocatorOp descriptorAllocator;

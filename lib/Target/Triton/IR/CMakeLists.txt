@@ -1,6 +1,7 @@
 add_mlir_dialect_library(MLIRIntentTritonDialect
   TritonDialect.cpp
   TritonOps.cpp
+  Configuration.cpp
 
   DEPENDS
   IntentTritonIncGen
@@ -10,5 +11,6 @@ add_mlir_dialect_library(MLIRIntentTritonDialect
   MLIRIntentGPUDialect
   MLIRSideEffectInterfaces
   MLIRInferTypeOpInterface
+  MLIRSCFDialect
   MLIRSupport
 )

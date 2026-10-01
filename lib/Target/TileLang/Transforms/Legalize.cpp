@@ -1,4 +1,8 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Analysis/Configurations.h"
+#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
+#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
 #include "Intent/Target/TileLang/Transforms/Passes.h"
 
@@ -9,11 +13,9 @@
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/StringSet.h"
 
 #include <cstdint>
 #include <limits>
-#include <map>
 #include <optional>
 
 using namespace mlir;
@@ -24,6 +26,10 @@ const gpu::TuningProfileSchema &tuningProfileSchema() {
   static const StringRef columns[] = {"value"};
   static const gpu::TuningProfileSchema schema{"tilelang", columns};
   return schema;
+}
+
+bool isLegalPipelineStageCount(int64_t stages) {
+  return stages > 0 && stages <= std::numeric_limits<int32_t>::max();
 }
 
 bool isLegalMmaWarpPartition(int64_t m, int64_t n, int64_t threads) {
@@ -44,59 +50,59 @@ namespace {
 
 constexpr llvm::StringLiteral legalizedAttr = "intent_tilelang.legalized";
 
-struct ParameterDomain {
-  std::string name;
-  gpu::ParameterRole role;
-  SmallVector<int64_t> candidates;
-  bool provider = false;
-  bool coverage = false;
-};
+bool isLegalThreadCount(int64_t threads, gpu::CapabilitiesAttr capabilities) {
+  return threads > 0 && threads % 32 == 0 &&
+         threads <= capabilities.getMaxThreadsPerBlock();
+}
 
-using TileLangConfig = std::map<std::string, int64_t>;
+FailureOr<gpu::PhysicalParameterSpace> readConfigurationDomains(func::FuncOp kernel) {
+  auto capabilities = kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+  if (!capabilities)
+    return kernel.emitError("TileLang configuration requires GPU capabilities"), failure();
+  auto space = gpu::PhysicalParameterSpace::read(kernel);
+  if (failed(space)) return failure();
+  bool sawThreads = false;
+  for (const auto &domain : space->domains()) {
+    if (!domain.provider) continue;
+    auto role = domain.role();
+    if (role != gpu::ParameterRole::ProviderThreads &&
+        role != gpu::ParameterRole::ProviderStages)
+      return domain.operation->emitOpError("TileLang program contains a foreign provider parameter"), failure();
+    sawThreads |= role == gpu::ParameterRole::ProviderThreads;
+    for (int64_t value : domain.candidates())
+      if (role == gpu::ParameterRole::ProviderThreads
+              ? !isLegalThreadCount(value, capabilities)
+              : !isLegalPipelineStageCount(value))
+        return domain.operation->emitOpError("TileLang parameter is outside the native option domain")
+                   << "; parameter=" << domain.name() << "; value=" << value,
+               failure();
+  }
+  if (!sawThreads)
+    return kernel.emitError("TileLang provider parameter domains have no thread binding"), failure();
+  return *space;
+}
 
 std::optional<int64_t>
-evaluate(gpu::PhysicalExprAttr expression, const TileLangConfig &config) {
-  auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
-  if (kind == gpu::PhysicalExprKind::Constant)
-    return expression.getValue();
-  if (kind == gpu::PhysicalExprKind::Parameter) {
-    auto found = config.find(expression.getSymbol().getValue().str());
-    return found == config.end() ? std::nullopt
-                                 : std::optional<int64_t>(found->second);
-  }
-  SmallVector<int64_t> operands;
-  for (Attribute operand : expression.getOperands()) {
-    std::optional<int64_t> value =
-        evaluate(cast<gpu::PhysicalExprAttr>(operand), config);
-    if (!value)
-      return std::nullopt;
-    operands.push_back(*value);
-  }
-  int64_t result = 0;
-  if (kind == gpu::PhysicalExprKind::Add)
-    return __builtin_add_overflow(operands[0], operands[1], &result)
-               ? std::nullopt
-               : std::optional<int64_t>(result);
-  if (kind == gpu::PhysicalExprKind::Subtract)
-    return __builtin_sub_overflow(operands[0], operands[1], &result)
-               ? std::nullopt
-               : std::optional<int64_t>(result);
-  if (kind == gpu::PhysicalExprKind::Multiply)
-    return __builtin_mul_overflow(operands[0], operands[1], &result)
-               ? std::nullopt
-               : std::optional<int64_t>(result);
-  if (kind == gpu::PhysicalExprKind::CeilDiv && operands[0] >= 0 &&
-      operands[1] > 0)
-    return operands[0] / operands[1] +
-           static_cast<int64_t>(operands[0] % operands[1] != 0);
-  if (kind == gpu::PhysicalExprKind::FloorDiv && operands[0] >= 0 &&
-      operands[1] > 0)
-    return operands[0] / operands[1];
-  if (kind == gpu::PhysicalExprKind::Minimum)
-    return std::min(operands[0], operands[1]);
-  if (kind == gpu::PhysicalExprKind::Maximum)
-    return std::max(operands[0], operands[1]);
-  return std::nullopt;
+evaluate(gpu::PhysicalExprAttr expression, DictionaryAttr config) {
+  return gpu::evaluatePhysicalExpression(expression,
+      [&](gpu::PhysicalExprAttr leaf) -> std::optional<int64_t> {
+        if (leaf.getKind() != static_cast<uint32_t>(gpu::PhysicalExprKind::Parameter))
+          return std::nullopt;
+        auto value = config.getAs<IntegerAttr>(leaf.getSymbol());
+        return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
+      }, [](gpu::PhysicalExprAttr operation, ArrayRef<int64_t> operands) {
+        switch (static_cast<gpu::PhysicalExprKind>(operation.getKind())) {
+        case gpu::PhysicalExprKind::Add:
+        case gpu::PhysicalExprKind::Subtract:
+        case gpu::PhysicalExprKind::Multiply:
+        case gpu::PhysicalExprKind::Minimum:
+        case gpu::PhysicalExprKind::Maximum: return true;
+        case gpu::PhysicalExprKind::CeilDiv:
+        case gpu::PhysicalExprKind::FloorDiv:
+          return operands.size() == 2 && operands[0] >= 0 && operands[1] > 0;
+        default: return false;
+        }
+      });
 }
 
 enum CandidateFailure : unsigned {
@@ -115,7 +121,7 @@ struct FlatSharedLifetime {
 };
 
 std::optional<uint64_t> allocationStorageBytes(
-    AllocOp allocation, const TileLangConfig &config) {
+    AllocOp allocation, DictionaryAttr config) {
   BufferType buffer = allocation.getResult().getType();
   unsigned bitWidth = 0;
   if (auto integer = dyn_cast<IntegerType>(buffer.getElementType()))
@@ -170,7 +176,7 @@ bool isLiveAt(const FlatSharedLifetime &lifetime, Operation *operation) {
 }
 
 bool exactSharedMemoryIsLegal(func::FuncOp kernel,
-                              const TileLangConfig &config,
+                              DictionaryAttr config,
                               uint64_t capacity) {
   SmallVector<FlatSharedLifetime> exactLifetimes;
   bool legal = true;
@@ -212,21 +218,20 @@ bool exactSharedMemoryIsLegal(func::FuncOp kernel,
 }
 
 unsigned configurationFailures(func::FuncOp kernel,
-                               ArrayRef<ParameterDomain> domains,
-                               const TileLangConfig &config,
+                               ArrayRef<gpu::PhysicalParameterDomain> domains,
+                               DictionaryAttr config,
                                gpu::CapabilitiesAttr capabilities) {
   std::optional<int64_t> threads;
-  for (const ParameterDomain &domain : domains) {
-    if (domain.role != gpu::ParameterRole::ProviderThreads)
+  for (const auto &domain : domains) {
+    if (domain.role() != gpu::ParameterRole::ProviderThreads)
       continue;
-    auto found = config.find(domain.name);
-    if (found != config.end())
-      threads = found->second;
+    if (auto value = config.getAs<IntegerAttr>(domain.name()))
+      threads = value.getInt();
   }
   if (!threads)
     return MissingThreads;
   unsigned failures = 0;
-  if (*threads <= 0 || *threads > capabilities.getMaxThreadsPerBlock())
+  if (!isLegalThreadCount(*threads, capabilities))
     failures |= ThreadLimit;
   kernel.walk([&](GemmOp gemm) {
     auto lhs = gemm.getLhs().getType();
@@ -281,43 +286,23 @@ unsigned configurationFailures(func::FuncOp kernel,
   return failures;
 }
 
-gpu::ParameterOp getOrCreateParameter(func::FuncOp kernel, StringRef name,
-                                      gpu::ParameterRole role,
-                                      ArrayRef<int64_t> candidates) {
-  gpu::ParameterOp existing;
-  bool duplicate = false;
-  kernel.walk([&](gpu::ParameterOp parameter) {
-    if (parameter.getParameter().getName().getValue() != name)
-      return;
-    if (existing)
-      duplicate = true;
-    else
-      existing = parameter;
-  });
-  if (duplicate) {
-    kernel.emitError("duplicates a TileLang physical parameter name");
-    return {};
-  }
-  auto expectedCandidates =
-      DenseI64ArrayAttr::get(kernel.getContext(), candidates);
-  if (existing) {
-    gpu::ParameterAttr schema = existing.getParameter();
-    if (schema.getRole() != static_cast<uint32_t>(role) ||
-        schema.getCandidates() != expectedCandidates) {
-      existing.emitOpError(
-          "physical parameter name is reused with a different role or candidate domain");
-      return {};
-    }
-    return existing;
-  }
-  OpBuilder builder(&kernel.getBody().front(), kernel.getBody().front().begin());
-  auto schema = gpu::ParameterAttr::get(
-      kernel.getContext(), builder.getStringAttr(name),
-      static_cast<uint32_t>(role),
-      static_cast<uint32_t>(gpu::ParameterCategory::Provider),
-      /*elementBitWidth=*/0, expectedCandidates);
-  return builder.create<gpu::ParameterOp>(kernel.getLoc(), builder.getIndexType(),
-                                          schema);
+LogicalResult diagnoseConfigurationFailures(func::FuncOp kernel, unsigned failures,
+                                             StringRef message, DictionaryAttr row = {}) {
+  auto diagnostic = kernel.emitError(message);
+  if (row) diagnostic << "; configuration=" << row;
+  diagnostic << "; typed reasons=";
+  bool first = true;
+  auto append = [&](StringRef reason) {
+    if (!first) diagnostic << ",";
+    diagnostic << reason;
+    first = false;
+  };
+  if (failures & MissingThreads) append("missing_threads");
+  if (failures & ThreadLimit) append("threads_per_block");
+  if (failures & MmaPartition) append("mma_warp_partition");
+  if (failures & SharedMemory) append("exact_shared_memory");
+  if (failures & SparseShape) append("two_of_four_tile_shape");
+  return failure();
 }
 
 SmallVector<int64_t> extentCandidates(func::FuncOp kernel, Attribute attribute) {
@@ -346,125 +331,43 @@ LogicalResult materializeLegalConfigurations(func::FuncOp kernel) {
   if (!capabilities)
     return kernel.emitError(
         "TileLang legalization requires typed GPU capabilities");
-  SmallVector<ParameterDomain> domains;
-  llvm::StringSet<> names;
-  bool invalid = false;
-  bool sawThreads = false;
-  kernel.walk([&](gpu::ParameterOp parameter) {
-    gpu::ParameterAttr schema = parameter.getParameter();
-    StringRef name = schema.getName().getValue();
-    if (!names.insert(name).second) {
-      parameter.emitOpError("duplicates a TileLang physical parameter name");
-      invalid = true;
-      return;
-    }
-    auto role = static_cast<gpu::ParameterRole>(schema.getRole());
-    auto category = static_cast<gpu::ParameterCategory>(schema.getCategory());
-    bool provider = category == gpu::ParameterCategory::Provider;
-    bool coverage = parameter->hasAttr(gpu::coverageDimensionAttr);
-    if (provider && role != gpu::ParameterRole::ProviderThreads &&
-        role != gpu::ParameterRole::ProviderStages) {
-      parameter.emitOpError(
-          "TileLang program contains a foreign provider parameter");
-      invalid = true;
-      return;
-    }
-    sawThreads |= role == gpu::ParameterRole::ProviderThreads;
-    domains.push_back({name.str(), role,
-                       SmallVector<int64_t>(
-                           schema.getCandidates().asArrayRef()),
-                       provider, coverage});
-  });
-  if (invalid)
-    return failure();
-  if (!sawThreads)
-    return kernel.emitError(
-        "TileLang provider parameter domains have no thread binding");
+  auto space = readConfigurationDomains(kernel);
+  if (failed(space)) return failure();
 
-  auto shared =
-      kernel->getAttrOfType<ArrayAttr>(gpu::sharedConfigTuplesAttr);
-  if (!shared || shared.empty())
-    return kernel.emitError(
-        "TileLang legalization requires shared config tuples");
-  SmallVector<TileLangConfig> configs;
-  for (Attribute attribute : shared) {
-    auto tuple = dyn_cast<DictionaryAttr>(attribute);
-    if (!tuple)
-      return kernel.emitError("shared config tuple is malformed");
-    TileLangConfig config;
-    unsigned sharedParameters = 0;
-    for (const ParameterDomain &domain : domains) {
-      if (domain.provider || domain.coverage)
-        continue;
-      ++sharedParameters;
-      auto value = tuple.getAs<IntegerAttr>(domain.name);
-      if (!value ||
-          !llvm::is_contained(domain.candidates, value.getInt()))
-        return kernel.emitError(
-                   "shared config tuple does not bind a TileLang kernel parameter: ")
-               << domain.name;
-      config[domain.name] = value.getInt();
-    }
-    if (tuple.size() != sharedParameters)
-      return kernel.emitError(
-          "shared config tuple contains a non-kernel binding");
-    configs.push_back(std::move(config));
-  }
-  for (const ParameterDomain &domain : domains) {
+  auto shared = space->sharedConfigurations();
+  if (failed(shared)) return failure();
+  SmallVector<DictionaryAttr> configs = std::move(*shared);
+  Builder builder(kernel.getContext());
+  for (const auto &domain : space->domains()) {
     if (!domain.provider)
       continue;
-    SmallVector<TileLangConfig> expanded;
-    for (const TileLangConfig &base : configs)
-      for (int64_t candidate : domain.candidates) {
-        TileLangConfig config = base;
-        config[domain.name] = candidate;
+    SmallVector<DictionaryAttr> expanded;
+    for (DictionaryAttr base : configs)
+      for (int64_t candidate : domain.candidates()) {
+        NamedAttrList bindings(base);
+        bindings.set(domain.name(), builder.getI64IntegerAttr(candidate));
+        DictionaryAttr config = bindings.getDictionary(kernel.getContext());
         if (!llvm::is_contained(expanded, config))
-          expanded.push_back(std::move(config));
+          expanded.push_back(config);
       }
     configs = std::move(expanded);
   }
 
-  Builder builder(kernel.getContext());
-  SmallVector<Attribute> encoded;
+  SmallVector<DictionaryAttr> accepted;
   unsigned rejected = 0;
-  for (const TileLangConfig &config : configs) {
+  for (DictionaryAttr config : configs) {
     unsigned failures =
-        configurationFailures(kernel, domains, config, capabilities);
+        configurationFailures(kernel, space->domains(), config, capabilities);
     if (failures) {
       rejected |= failures;
       continue;
     }
-    SmallVector<NamedAttribute> bindings;
-    for (const auto &[name, value] : config)
-      bindings.push_back(
-          builder.getNamedAttr(name, builder.getI64IntegerAttr(value)));
-    encoded.push_back(builder.getDictionaryAttr(bindings));
+    accepted.push_back(config);
   }
-  if (encoded.empty()) {
-    InFlightDiagnostic diagnostic =
-        kernel.emitError("all TileLang parameter candidates are provably illegal");
-    diagnostic << "; typed reasons=";
-    bool first = true;
-    auto appendReason = [&](StringRef reason) {
-      if (!first)
-        diagnostic << ",";
-      first = false;
-      diagnostic << reason;
-    };
-    if (rejected & MissingThreads)
-      appendReason("missing_threads");
-    if (rejected & ThreadLimit)
-      appendReason("threads_per_block");
-    if (rejected & MmaPartition)
-      appendReason("mma_warp_partition");
-    if (rejected & SharedMemory)
-      appendReason("exact_shared_memory");
-    if (rejected & SparseShape)
-      appendReason("two_of_four_tile_shape");
-    return failure();
-  }
-  kernel->setAttr(gpu::tileLangConfigsAttr, builder.getArrayAttr(encoded));
-  return success();
+  if (accepted.empty())
+    return diagnoseConfigurationFailures(kernel, rejected,
+        "all TileLang parameter candidates are provably illegal");
+  return gpu::writeConfigurations(kernel, accepted, gpu::ConfigurationStage::Complete);
 }
 
 bool supportsThreads(func::FuncOp kernel, int64_t threads) {
@@ -524,8 +427,7 @@ LogicalResult materializeLaunchConfiguration(
         "TileLang launch configuration requires typed GPU capabilities");
   SmallVector<int64_t> candidates;
   auto legalThreads = [&](int64_t threads) {
-    return threads % 32 == 0 &&
-           threads <= capabilities.getMaxThreadsPerBlock() &&
+    return isLegalThreadCount(threads, capabilities) &&
            supportsThreads(kernel, threads);
   };
   bool smallPartition = !legalThreads(128) && !legalThreads(256);
@@ -539,8 +441,9 @@ LogicalResult materializeLaunchConfiguration(
   if (candidates.empty())
     return kernel.emitError(
         "TileLang provider found no legal thread count for every native GEMM shape");
-  gpu::ParameterOp threads = getOrCreateParameter(
-      kernel, "THREADS", gpu::ParameterRole::ProviderThreads, candidates);
+  gpu::ParameterOp threads = gpu::getOrCreatePhysicalParameter(
+      kernel, "THREADS", gpu::ParameterRole::ProviderThreads,
+      gpu::ParameterCategory::Provider, 0, candidates);
   if (!threads)
     return failure();
   SmallVector<LaunchConfigOp> configs;
@@ -562,9 +465,18 @@ LogicalResult materializeLaunchConfiguration(
 
 LogicalResult verifyTileLangProgram(ModuleOp module) {
   FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
-  return failed(kernel) || failed(mlir::verify(module))
-             ? failure()
-             : verifyTileLangKernel(*kernel);
+  if (failed(kernel) || failed(mlir::verify(module))) return failure();
+  auto domains = readConfigurationDomains(*kernel);
+  auto configurations = gpu::ConfigurationSpace::read(*kernel);
+  if (failed(domains) || failed(configurations)) return failure();
+  auto rows = configurations->configurations(gpu::ConfigurationStage::Complete);
+  if (failed(rows) || failed(verifyTileLangKernel(*kernel))) return failure();
+  auto capabilities = (*kernel)->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+  for (DictionaryAttr row : *rows)
+    if (unsigned failures = configurationFailures(*kernel, domains->domains(), row, capabilities))
+      return diagnoseConfigurationFailures(*kernel, failures,
+          "final TileLang candidate violates the current native program", row);
+  return success();
 }
 
 LogicalResult formNativeMemory(ModuleOp module) {

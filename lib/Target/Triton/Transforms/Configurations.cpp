@@ -1,6 +1,9 @@
 #include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
 #include "Configurations.h"
+#include "ConfigurationFacts.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Analysis/Configurations.h"
+#include "Intent/Target/Triton/IR/Configuration.h"
 #include "Intent/Dialect/GPU/Analysis/Resources.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
@@ -67,120 +70,14 @@ StringRef localOptionsFamily(ArrayRef<gpu::ParameterCategory> categories,
 
 } // namespace
 
-bool valueDependsOn(Value value, Value root, scf::ForOp owner,
-                    llvm::SmallDenseSet<Value, 32> &visited) {
-  if (value == root)
-    return true;
-  if (!visited.insert(value).second)
-    return false;
-  Operation *definition = value.getDefiningOp();
-  if (!definition || !owner->isProperAncestor(definition))
-    return false;
-  if (auto nested = dyn_cast<scf::ForOp>(definition)) {
-    auto result = dyn_cast<OpResult>(value);
-    auto yield = dyn_cast<scf::YieldOp>(nested.getBody()->getTerminator());
-    if (result && yield && result.getResultNumber() < nested.getInitArgs().size()) {
-      unsigned index = result.getResultNumber();
-      if (valueDependsOn(nested.getInitArgs()[index], root, owner, visited) ||
-          valueDependsOn(yield.getOperand(index), root, owner, visited))
-        return true;
-    }
-  }
-  return llvm::any_of(definition->getOperands(), [&](Value operand) {
-    return valueDependsOn(operand, root, owner, visited);
-  });
-}
-
-namespace {
-
-bool valueDependsOnNestedContract(Value value, scf::ForOp owner,
-                                  llvm::SmallDenseSet<Value, 32> &visited) {
-  if (!visited.insert(value).second)
-    return false;
-  Operation *definition = value.getDefiningOp();
-  if (!definition || !owner->isProperAncestor(definition))
-    return false;
-  if (isa<gpu::ContractOp>(definition))
-    return true;
-  if (auto nested = dyn_cast<scf::ForOp>(definition)) {
-    auto result = dyn_cast<OpResult>(value);
-    auto yield = dyn_cast<scf::YieldOp>(nested.getBody()->getTerminator());
-    if (result && yield && result.getResultNumber() < nested.getInitArgs().size()) {
-      unsigned index = result.getResultNumber();
-      if (valueDependsOnNestedContract(nested.getInitArgs()[index], owner,
-                                       visited) ||
-          valueDependsOnNestedContract(yield.getOperand(index), owner, visited))
-        return true;
-    }
-  }
-  return llvm::any_of(definition->getOperands(), [&](Value operand) {
-    return valueDependsOnNestedContract(operand, owner, visited);
-  });
-}
-
-bool isDirectContractionAccumulator(Value value, Value carry, scf::ForOp owner,
-                                    llvm::SmallDenseSet<Value, 8> &visited) {
-  if (!visited.insert(value).second)
-    return false;
-  Operation *definition = value.getDefiningOp();
-  if (auto contract = dyn_cast_or_null<gpu::ContractOp>(definition)) {
-    if (contract.getAccumulator() != carry)
-      return false;
-    llvm::SmallDenseSet<Value, 32> dependencies;
-    return !valueDependsOn(contract.getLhs(), carry, owner, dependencies) &&
-           !valueDependsOn(contract.getRhs(), carry, owner, dependencies);
-  }
-  auto nested = dyn_cast_or_null<scf::ForOp>(definition);
-  auto result = dyn_cast<OpResult>(value);
-  auto yield = nested
-                   ? dyn_cast<scf::YieldOp>(nested.getBody()->getTerminator())
-                   : scf::YieldOp();
-  return nested && result && yield &&
-         result.getResultNumber() < nested.getInitArgs().size() &&
-         nested.getInitArgs()[result.getResultNumber()] == carry &&
-         isDirectContractionAccumulator(
-             yield.getOperand(result.getResultNumber()),
-             nested.getRegionIterArgs()[result.getResultNumber()], nested, visited);
-}
-
-bool hasRecurrentContraction(func::FuncOp kernel) {
-  bool found = false;
-  kernel.walk([&](scf::ForOp loop) {
-    if (found || loop.getInitArgs().empty())
-      return;
-    auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
-    if (!yield || yield.getNumOperands() != loop.getRegionIterArgs().size())
-      return;
-    for (auto [index, next] : llvm::enumerate(yield.getOperands())) {
-      llvm::SmallDenseSet<Value, 8> directVisited;
-      if (isDirectContractionAccumulator(next, loop.getRegionIterArgs()[index],
-                                         loop, directVisited))
-        continue;
-      llvm::SmallDenseSet<Value, 32> contractionVisited;
-      if (!valueDependsOnNestedContract(next, loop, contractionVisited))
-        continue;
-      llvm::SmallDenseSet<Value, 32> carryVisited;
-      if (valueDependsOn(next, loop.getRegionIterArgs()[index], loop,
-                         carryVisited)) {
-        found = true;
-        return;
-      }
-    }
-  });
-  return found;
-}
-
-} // namespace
-
 std::optional<int64_t> evaluateCompileTimeExpression(
-    gpu::PhysicalExprAttr expression, const TritonConfig &config) {
+    gpu::PhysicalExprAttr expression, DictionaryAttr bindings) {
   return gpu::evaluatePhysicalExpression(expression, [&](gpu::PhysicalExprAttr leaf)
       -> std::optional<int64_t> {
     if (leaf.getKind() != static_cast<uint32_t>(gpu::PhysicalExprKind::Parameter))
       return std::nullopt;
-    auto found = config.kernelParameters.find(leaf.getSymbol().getValue().str());
-    return found == config.kernelParameters.end() ? std::nullopt
-        : std::optional<int64_t>(found->second);
+    auto value = bindings ? bindings.getAs<IntegerAttr>(leaf.getSymbol()) : IntegerAttr();
+    return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
   });
 }
 
@@ -236,7 +133,7 @@ std::optional<int64_t> descriptorElementBytes(Type type) {
 }
 
 bool fragmentFitsTritonTensor(gpu::FragmentType fragment,
-                              const TritonConfig &config) {
+                              DictionaryAttr config) {
   auto bound = gpu::checkFragmentFootprint(
       fragment, maxTritonTensorElements, 1, [&](gpu::PhysicalExprAttr leaf) {
         return evaluateCompileTimeExpression(leaf, config);
@@ -281,7 +178,8 @@ SmallVector<gpu::FragmentType> collectiveFragments(func::FuncOp kernel) {
 }
 
 LogicalResult materializeDeferredResourceBounds(func::FuncOp kernel) {
-  TritonConfig known;
+  NamedAttrList knownBindings;
+  Builder attributes(kernel.getContext());
   gpu::ParameterAttr warpParameter;
   kernel.walk([&](gpu::ParameterOp parameter) {
     auto schema = parameter.getParameter();
@@ -291,9 +189,10 @@ LogicalResult materializeDeferredResourceBounds(func::FuncOp kernel) {
     if (schema.getCategory() !=
             static_cast<uint32_t>(gpu::ParameterCategory::Coverage) &&
         !parameter->hasAttr(gpu::coverageDimensionAttr))
-      known.kernelParameters[schema.getName().getValue().str()] =
-          schema.getCandidates().asArrayRef().front();
+      knownBindings.set(schema.getName(),
+          attributes.getI64IntegerAttr(schema.getCandidates().asArrayRef().front()));
   });
+  DictionaryAttr known = knownBindings.getDictionary(kernel.getContext());
   const gpu::FragmentResourceAnalysis resources(kernel);
   SmallVector<gpu::PhysicalExprAttr> bounds;
   for (gpu::FragmentType fragment : resources.valueTypes()) {
@@ -366,7 +265,7 @@ LogicalResult materializeDeferredResourceBounds(func::FuncOp kernel) {
                                 constant(std::numeric_limits<int64_t>::max())});
       for (gpu::FragmentType fragment : collectiveFragments(kernel)) {
         auto footprint = gpu::fragmentRegisterFootprint(fragment);
-        if (evaluateCompileTimeExpression(footprint, TritonConfig{}))
+        if (evaluateCompileTimeExpression(footprint))
           continue;
         Value count = builder.create<gpu::PhysicalExprOp>(
             kernel.getLoc(), builder.getIndexType(), footprint);
@@ -385,7 +284,7 @@ LogicalResult materializeDeferredResourceBounds(func::FuncOp kernel) {
 }
 
 bool descriptorFragmentFits(gpu::FragmentType fragment,
-                            const TritonConfig &config,
+                            DictionaryAttr config, int64_t stages,
                             int64_t pipelineBlockAlignment,
                             const llvm::StringMap<SmallVector<int64_t>>
                                 &parameterDomains,
@@ -439,7 +338,7 @@ bool descriptorFragmentFits(gpu::FragmentType fragment,
   // Triton's canPipelineTMALoad requires each shared stage to begin at a
   // 128-byte boundary. Small legal descriptor tiles can otherwise produce a
   // misaligned second buffer in a multistage pipeline.
-  if (config.stages > 1 && concrete &&
+  if (stages > 1 && concrete &&
       (concreteElements * *elementBytes) % pipelineBlockAlignment != 0)
     return false;
   return minimumLastExtent != std::numeric_limits<int64_t>::max() &&
@@ -453,6 +352,8 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
   auto space = gpu::PhysicalParameterSpace::read(kernel);
   if (failed(space))
     return failure();
+  auto schema = ConfigurationSchema::read(kernel);
+  if (failed(schema)) return failure();
   auto shared = space->sharedConfigurations();
   if (failed(shared))
     return failure();
@@ -463,21 +364,14 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
         SmallVector<int64_t>(domain.candidates());
     if (domain.coverage)
       coverageParameters.insert(domain.name().getValue());
-    if (domain.provider && domain.role() != gpu::ParameterRole::ProviderWarps &&
-        domain.role() != gpu::ParameterRole::ProviderStages &&
-        domain.role() != gpu::ParameterRole::ProviderCTAs)
-      return kernel.emitError("Triton program contains a foreign provider parameter");
   }
   const auto *warps = space->find(gpu::ParameterRole::ProviderWarps);
   const auto *stages = space->find(gpu::ParameterRole::ProviderStages);
   const auto *ctas = space->find(gpu::ParameterRole::ProviderCTAs);
   if (!warps || !stages || !ctas)
     return kernel.emitError("Triton provider parameter domains are incomplete");
-  SmallVector<TritonConfig> configs;
-  bool stagesInKernel = false;
-  kernel.walk([&](scf::ForOp loop) {
-    stagesInKernel |= loop->hasAttr(loopStagesAttr);
-  });
+  SmallVector<DictionaryAttr> configs;
+  Builder builder(kernel.getContext());
   int64_t maximumWarps = *llvm::max_element(warps->candidates());
   SmallVector<gpu::PhysicalExprAttr> collectiveFootprints;
   for (gpu::FragmentType fragment : collectiveFragments(kernel)) {
@@ -486,29 +380,17 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
       collectiveFootprints.push_back(footprint);
   }
   for (DictionaryAttr tuple : *shared) {
-    TritonConfig sharedConfig;
-    for (NamedAttribute binding : tuple)
-      sharedConfig.kernelParameters[binding.getName().getValue().str()] =
-          cast<IntegerAttr>(binding.getValue()).getInt();
     for (const TritonLocalOptions &options : localOptions) {
       int64_t formCount = descriptorChoice ? 2 : 1;
       for (int64_t form = 0; form < formCount; ++form) {
-        TritonConfig config = sharedConfig;
+        NamedAttrList bindings(tuple);
         if (descriptorChoice)
-          config.kernelParameters[descriptorChoice.getConfigParameter().str()] =
-              form;
-        config.warps = options.warps;
-        config.stages = options.stages;
-        config.ctas = options.ctas;
-        if (stagesInKernel)
-          config.kernelParameters[stages->name().getValue().str()] = options.stages;
-        if (llvm::none_of(configs, [&](const TritonConfig &existing) {
-              return existing.kernelParameters == config.kernelParameters &&
-                     existing.warps == config.warps &&
-                     existing.stages == config.stages &&
-                     existing.ctas == config.ctas;
-            }))
-          configs.push_back(std::move(config));
+          bindings.set(descriptorChoice.getConfigParameter(), builder.getI64IntegerAttr(form));
+        bindings.set(schema->warps, builder.getI64IntegerAttr(options.warps));
+        bindings.set(schema->stages, builder.getI64IntegerAttr(options.stages));
+        bindings.set(schema->ctas, builder.getI64IntegerAttr(options.ctas));
+        DictionaryAttr config = bindings.getDictionary(kernel.getContext());
+        if (!llvm::is_contained(configs, config)) configs.push_back(config);
       }
     }
   }
@@ -554,7 +436,7 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
   if (!validRanges)
     return kernel.emitError("Triton ranges require one-dimensional fragments");
   auto fitsReductionBudget = [&](ArrayRef<gpu::PhysicalExprAttr> footprints,
-                                const TritonConfig &config) {
+                                DictionaryAttr config) {
     __int128 registers = 0;
     for (auto footprint : footprints) {
       auto size = evaluateCompileTimeExpression(footprint, config);
@@ -567,17 +449,19 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
     return true;
   };
 
-  SmallVector<Attribute> encoded;
-  Builder builder(kernel.getContext());
-  for (const TritonConfig &config : configs) {
-    if (config.warps <= 0 || config.stages <= 0 || config.ctas <= 0)
+  SmallVector<DictionaryAttr> accepted;
+  for (DictionaryAttr config : configs) {
+    int64_t configWarps = config.getAs<IntegerAttr>(schema->warps).getInt();
+    int64_t configStages = config.getAs<IntegerAttr>(schema->stages).getInt();
+    int64_t configCTAs = config.getAs<IntegerAttr>(schema->ctas).getInt();
+    if (configWarps <= 0 || configStages <= 0 || configCTAs <= 0)
       return kernel.emitError("Triton provider parameter domains are incomplete");
     // Apply the existing per-fragment policy after binding the shared tuple.
     // ABI-dependent extents retain their deferred specialization assertion.
-    if (config.warps < maximumWarps &&
+    if (configWarps < maximumWarps &&
         llvm::any_of(collectiveFootprints, [&](gpu::PhysicalExprAttr footprint) {
           auto words = evaluateCompileTimeExpression(footprint, config);
-          return words && *words > config.warps * 32 * 255;
+          return words && *words > configWarps * 32 * 255;
         }))
       continue;
     if (llvm::any_of(reductionFootprints, [&](const auto &footprints) {
@@ -590,110 +474,53 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
         }))
       continue;
     bool descriptorConfig = descriptorChoice &&
-        config.kernelParameters.at(descriptorChoice.getConfigParameter().str()) != 0;
+        config.getAs<IntegerAttr>(descriptorChoice.getConfigParameter()).getInt() != 0;
     if (descriptorConfig && llvm::any_of(descriptors, [&](const auto &constraint) {
-          return !descriptorFragmentFits(constraint.fragment, config,
+          return !descriptorFragmentFits(constraint.fragment, config, configStages,
               constraint.alignment, parameterDomains, coverageParameters);
         }))
       continue;
-    SmallVector<NamedAttribute> parameters;
-    for (const auto &[name, value] : config.kernelParameters)
-      parameters.push_back(builder.getNamedAttr(name, builder.getI64IntegerAttr(value)));
-    encoded.push_back(builder.getDictionaryAttr({
-        builder.getNamedAttr("parameters", builder.getDictionaryAttr(parameters)),
-        builder.getNamedAttr("num_warps", builder.getI64IntegerAttr(config.warps)),
-        builder.getNamedAttr("num_stages", builder.getI64IntegerAttr(config.stages)),
-        builder.getNamedAttr("num_ctas", builder.getI64IntegerAttr(config.ctas)),
-    }));
+    accepted.push_back(config);
   }
-  if (encoded.empty())
+  if (accepted.empty())
     return kernel.emitError(
         "all Triton parameter candidates violate typed fragment legality or the reduction register budget");
-  kernel->setAttr(gpu::tritonConfigsAttr, builder.getArrayAttr(encoded));
-  return success();
+  return gpu::writeConfigurations(kernel, accepted, gpu::ConfigurationStage::Complete);
 }
 
 FailureOr<SmallVector<TritonLocalOptions>> declareProviderOptions(
     func::FuncOp kernel, const gpu::TuningProfiles &profiles,
     bool requiresCtaSynchronization, ArrayRef<scf::ForOp> loadPipelineLoops) {
-  SmallVector<gpu::ParameterCategory> categories;
-  bool twoAxisPointwise = false;
-  kernel.walk([&](gpu::ParameterOp parameter) {
-    auto schema = parameter.getParameter();
-    auto category = static_cast<gpu::ParameterCategory>(schema.getCategory());
-    twoAxisPointwise |= category == gpu::ParameterCategory::Pointwise &&
-                       schema.getRole() == static_cast<uint32_t>(gpu::ParameterRole::OwnershipM);
-    if (category != gpu::ParameterCategory::Coverage &&
-        category != gpu::ParameterCategory::Provider &&
-        !llvm::is_contained(categories, category))
-      categories.push_back(category);
-  });
+  const ProgramConfigurationFacts facts(kernel);
   auto capabilities = kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
-  bool mayFormDot = false;
-  kernel.walk([&](Operation *operation) {
-    // Triton can combine a broadcast-multiply-reduce into a dot later.
-    mayFormDot |= isa<gpu::ReduceOp, ReduceOp>(operation);
-    if (isa<gpu::ReduceOp, gpu::ScanOp>(operation) &&
-        !llvm::is_contained(categories, gpu::ParameterCategory::Reduction))
-      categories.push_back(gpu::ParameterCategory::Reduction);
-  });
   bool blackwell = capabilities.getComputeCapabilityMajor() == 10 ||
                    capabilities.getComputeCapabilityMajor() == 12;
-  bool hasContraction = false;
-  bool allFp32 = true;
-  kernel.walk([&](gpu::ContractOp contract) {
-    hasContraction = true;
-    allFp32 &= contract.getLhs().getType().getElementType().isF32() &&
-               contract.getRhs().getType().getElementType().isF32() &&
-               contract.getResult().getType().getElementType().isF32();
-  });
-  if (hasContraction &&
-      !llvm::is_contained(categories, gpu::ParameterCategory::Contraction))
-    categories.push_back(gpu::ParameterCategory::Contraction);
   StringRef recurrentContractionFamily;
-  if (hasRecurrentContraction(kernel)) {
+  if (facts.recurrentContraction) {
     if (blackwell)
       recurrentContractionFamily = "blackwell_recurrent_contraction";
     else if (capabilities.getComputeCapabilityMajor() == 9)
       recurrentContractionFamily = "hopper_recurrent_contraction";
   }
   auto rows = profiles.get(tuningProfileSchema(), localOptionsFamily(
-      categories, twoAxisPointwise, recurrentContractionFamily,
-      hasContraction && allFp32), kernel.getLoc());
+      facts.categories, facts.twoAxisPointwise, recurrentContractionFamily,
+      facts.hasContraction && facts.allContractionsF32), kernel.getLoc());
   if (failed(rows))
     return failure();
-  bool straightLinePointwise =
-      llvm::is_contained(categories, gpu::ParameterCategory::Pointwise) &&
-      llvm::all_of(categories, [](gpu::ParameterCategory category) {
-        return category == gpu::ParameterCategory::Pointwise;
-      }) && llvm::all_of(kernel.front(), [](Operation &operation) {
-        return operation.getNumRegions() == 0;
-      });
-  bool pipelineStagesAffectProgram = hasContraction && !allFp32;
-  kernel.walk([&](Operation *operation) {
-    pipelineStagesAffectProgram |=
-        isa<gpu::ScaledContractOp, gpu::SparseContractOp>(operation) ||
-        ((hasContraction || mayFormDot) &&
-         operation->getParentOfType<scf::ForOp>() &&
-         !isMemoryEffectFree(operation));
-  });
-  pipelineStagesAffectProgram |= !loadPipelineLoops.empty();
+  bool pipelineStagesAffectProgram = facts.pipelineStagesAffectProgram || !loadPipelineLoops.empty();
   SmallVector<TritonLocalOptions> localOptions;
   SmallVector<int64_t> warpDomain, stageDomain, ctaDomain;
-  // Consumer Blackwell (SM12x) does not support CTA cluster operations.
-  bool supportsCtaClusters = capabilities.getComputeCapabilityMajor() >= 9 &&
-                             capabilities.getComputeCapabilityMajor() != 12;
   auto isDeviceOption = [&](int64_t warps, int64_t stages, int64_t ctas) {
-    return (!requiresCtaSynchronization || ctas == 1) &&
-           (warps & (warps - 1)) == 0 &&
-           warps <= capabilities.getMaxThreadsPerBlock() / 32 &&
-           stages <= std::numeric_limits<int32_t>::max() &&
-           (ctas & (ctas - 1)) == 0 && ctas <= 16 &&
-           (ctas == 1 || supportsCtaClusters);
+    return isLegalDeviceOption(gpu::ParameterRole::ProviderWarps, warps,
+                               capabilities, requiresCtaSynchronization) &&
+           isLegalDeviceOption(gpu::ParameterRole::ProviderStages, stages,
+                               capabilities, requiresCtaSynchronization) &&
+           isLegalDeviceOption(gpu::ParameterRole::ProviderCTAs, ctas,
+                               capabilities, requiresCtaSynchronization);
   };
   for (const auto &row : *rows) {
     int64_t warps = row[0], stages = row[1], ctas = row[2];
-    if (straightLinePointwise)
+    if (facts.straightLinePointwise)
       stages = 1;
     if (!isDeviceOption(warps, stages, ctas))
       continue;

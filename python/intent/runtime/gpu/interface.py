@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..artifact import ParameterRole, TuningConfiguration, TuningParameter
 from ..tuning import byte_spans_overlap, view_byte_span
+from .configurations import ConfigurationSpace
 from .expressions import Expression, evaluate_shape, read_expressions
 
 
@@ -100,18 +100,7 @@ class GPUInterface:
                          for entry in interface["views"] if entry["has_strides"]}
         self.grid = read_expressions(interface["grid"])
         self.overlaps = tuple(interface["overlaps"])
-        self.configurations = tuple(interface["configurations"])
-        self.resource_bounds = tuple((Expression.read(bound["lhs"]), Expression.read(bound["rhs"]))
-                                     for bound in interface["resource_bounds"])
-        self.coverage = tuple((entry["name"], Expression.read(entry["coverage"]),
-                               tuple(entry["candidates"]))
-                              for entry in interface["parameters"] if entry.get("coverage") is not None)
-        self.tuning_parameters = tuple(TuningParameter(
-            entry["name"], ParameterRole(entry["role"]), entry["category"],
-            tuple(entry["candidates"]), entry.get("dimension"),
-            tuple(entry["source"]) if entry.get("source") is not None else None,
-            tuple(entry["argument_axis"]) if entry.get("argument_axis") is not None else None,
-        ) for entry in interface["parameters"])
+        self.configuration_space = ConfigurationSpace(interface)
         self._noalias_pairs = tuple((left, right)
                                    for index, left in enumerate(self.public_views)
                                    for right in self.public_views[index + 1:]
@@ -214,12 +203,7 @@ class GPUInterface:
             if byte_spans_overlap((lhs_base, lhs_base + lhs_storage.nbytes()),
                                   (rhs_base, rhs_base + rhs_storage.nbytes())):
                 raise ValueError(f"{left.name} and {right.name} violate the declared noalias allocation contract")
-        for name, bound, candidates in self.coverage:
-            required = bound(values)
-            selected = next((candidate for candidate in candidates if candidate >= required), None)
-            if selected is None:
-                raise ValueError(f"no legal full-coverage extent for {name}: required {required}")
-            values[name] = selected
+        self.configuration_space.bind_coverage(values)
         for workspace in self.workspaces:
             values[workspace.kernel_name] = torch.empty(evaluate_shape(workspace.shape, values),
                                                        dtype=torch_dtype(workspace.dtype),
@@ -235,17 +219,3 @@ class GPUInterface:
             values[overlap["name"]] = byte_spans_overlap(*pair)
         return BoundInvocation(self, tuple(values[entry.kernel_name] for entry in self.parameters),
                                tuple(values[entry.kernel_name] for entry in self.outputs), values)
-
-    def candidates(self, values: dict) -> tuple[dict, ...]:
-        result = tuple(config for config in self.configurations
-                       if all(lhs({**values, **config}) <= rhs({**values, **config})
-                              for lhs, rhs in self.resource_bounds))
-        if not result:
-            raise ValueError("no configuration satisfies the physical resource bounds")
-        return result
-
-    def tuning_configurations(self, bound: BoundInvocation) -> tuple[TuningConfiguration, ...]:
-        return tuple(TuningConfiguration(self.tuning_parameters,
-                                         tuple(({**bound.values, **config})[parameter.name]
-                                               for parameter in self.tuning_parameters))
-                     for config in self.candidates(bound.values))

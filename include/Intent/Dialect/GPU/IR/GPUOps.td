@@ -5,6 +5,7 @@ include "Intent/Dialect/GPU/IR/GPUDialect.td"
 include "Intent/Dialect/GPU/IR/GPUAttrs.td"
 include "Intent/Dialect/GPU/IR/GPUTypes.td"
 include "Intent/Dialect/GPU/IR/AccessOpInterface.td"
+include "Intent/Dialect/GPU/IR/ConfigurationParameterOpInterface.td"
 include "Intent/Dialect/Intent/IR/IntentAttrs.td"
 include "Intent/Interfaces/StructuredOpInterface.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
@@ -39,7 +40,8 @@ class IntentGPU_ReadOp<string mnemonic, string kind, string resource,
     "::mlir::Value getAccessFill() { return getFill(); }\n" #
     "std::optional<::mlir::MutableOperandRange> getAccessFillMutable() { return getFillMutable(); }\n">;
 
-def IntentGPU_ParameterOp : IntentGPU_Op<"parameter", [Pure]> {
+def IntentGPU_ParameterOp : IntentGPU_Op<"parameter", [Pure,
+    DeclareOpInterfaceMethods<IntentGPU_ConfigurationParameterOpInterface>]> {
   let arguments = (ins IntentGPU_Parameter:$parameter);
   let results = (outs Index:$result);
   let hasVerifier = 1;

@@ -49,6 +49,7 @@ def tune_kernel(jit, configs: list[dict], parameters: dict,
 class TileLangProgram:
     def __init__(self, interface, namespace: dict, facts: dict) -> None:
         self.interface = interface
+        self.configurations = interface.configuration_space
         self.facts = facts
         self.kernel = namespace[facts["kernel"]]
         self._winners = {}
@@ -61,11 +62,9 @@ class TileLangProgram:
                tuple(values[entry["name"]] for entry in self.interface.overlaps))
         arguments = tuple(values[name] for name in self.facts["kernel_arguments"])
         if key not in self._winners:
-            parameter_names = {parameter.name for parameter in self.interface.tuning_parameters
-                               if parameter.name not in {name for name, _, _ in self.interface.coverage}}
             bindings = {name: values[name] for name in self.facts["builder_arguments"]
-                        if name not in parameter_names}
-            self._winners[key] = tune_kernel(self.kernel, list(self.interface.candidates(values)), bindings,
+                        if name not in self.configurations.bound_names}
+            self._winners[key] = tune_kernel(self.kernel, list(self.configurations.candidates(values)), bindings,
                                              arguments, tuple(view.writable for view in self.interface.views))
         compiled = self._winners[key]
 
@@ -76,7 +75,8 @@ class TileLangProgram:
         return LaunchResult(invoke, compiled)
 
     def tuning_configurations(self, invocation):
-        return self.interface.tuning_configurations(invocation)
+        return self.configurations.enumerate(invocation.values,
+                                             self.configurations.candidates(invocation.values))
 
 
 def materialize_tilelang_artifact(

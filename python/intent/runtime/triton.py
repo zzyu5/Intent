@@ -60,6 +60,7 @@ class TritonProgram:
         import triton
 
         self.interface = interface
+        self.configurations = interface.configuration_space
         self.facts = facts
         self.descriptors = tuple({**entry,
                                   "shape": read_expressions(entry["shape"]),
@@ -69,22 +70,27 @@ class TritonProgram:
         self.hooks = TuningHooks(tuple(view.kernel_name for view in interface.public_views),
                                  tuple(view.writable for view in interface.public_views),
                                  tuple(view.access != 1 for view in interface.public_views))
-        configs = [triton.Config(entry["parameters"], num_warps=entry["num_warps"],
-                                 num_stages=entry["num_stages"], num_ctas=entry["num_ctas"])
-                   for entry in facts["configs"]]
+        kernel_parameters = tuple(name for name in facts["kernel_parameters"]
+                                  if name not in self.configurations.coverage_names)
+        native_options = facts["native_options"]
+        configs = [triton.Config(
+            {name: row[name] for name in kernel_parameters},
+            num_warps=row[native_options["num_warps"]],
+            num_stages=row[native_options["num_stages"]],
+            num_ctas=row[native_options["num_ctas"]],
+        ) for row in self.configurations.rows]
+        self._config_rows = {id(config): row for config, row in
+                             zip(configs, self.configurations.rows, strict=True)}
         kernel = namespace[facts["kernel"]]
         if self.descriptors:
             kernel = triton.heuristics({entry["name"]: self._descriptor_hook(entry)
                                         for entry in self.descriptors})(kernel)
         options = {}
-        if facts["descriptor_choice"] is not None or interface.resource_bounds:
+        if facts["descriptor_choice"] is not None or self.configurations.resource_bounds:
             options["prune_configs_by"] = {"early_config_prune": self._prune}
         kernel = triton.autotune(configs=configs, key=facts["autotune_key"],
                                 pre_hook=self.hooks.before, post_hook=self.hooks.after,
                                 **options)(kernel)
-        if interface.coverage:
-            kernel = triton.heuristics({name: self._coverage_hook(name, expression, candidates)
-                                        for name, expression, candidates in interface.coverage})(kernel)
         self.kernel = kernel
 
     def _context(self, arguments: dict) -> dict:
@@ -95,15 +101,6 @@ class TritonProgram:
                 values[entry["name"]] = value
                 values[entry["kernel_name"]] = value
         return values
-
-    def _coverage_hook(self, name, expression, candidates):
-        def bind(arguments):
-            required = expression(self._context(arguments))
-            for candidate in candidates:
-                if candidate >= required:
-                    return candidate
-            raise ValueError(f"no legal full-coverage extent for {name}")
-        return bind
 
     def _descriptor_hook(self, entry):
         def bind(arguments):
@@ -152,15 +149,14 @@ class TritonProgram:
     def _prune(self, configs, named_args, **kwargs):
         retained = []
         for config in configs:
-            values = self._context({**named_args, **kwargs, **config.kwargs})
-            values.update((name, getattr(config, field)) for name, field in self.facts["config_options"].items())
+            values = {**self._context({**named_args, **kwargs}), **self._config_rows[id(config)]}
             choice = self.facts["descriptor_choice"]
             if choice is not None and values[choice["config"]]:
                 if not values[choice["eligibility"]] or not all(
                     self._block_legal(entry, values, config.num_stages) for entry in self.descriptors
                 ):
                     continue
-            if all(lhs(values) <= rhs(values) for lhs, rhs in self.interface.resource_bounds):
+            if self.configurations.within_resources(values):
                 retained.append(config)
         return retained
 
@@ -178,6 +174,7 @@ class TritonProgram:
         if choice is not None:
             values[choice["eligibility"]] = all(self._eligible(entry, values) for entry in self.descriptors)
         arguments = tuple(values[name] for name in self.facts["kernel_arguments"])
+        coverage = {name: values[name] for name in self.configurations.coverage_names}
 
         def grid(config):
             return evaluate_shape(self.interface.grid, {**values, **config})
@@ -186,18 +183,14 @@ class TritonProgram:
             if self.facts["allocator"] is not None:
                 triton.set_allocator(_descriptor_allocator)
             with self.hooks:
-                return self.kernel[grid](*arguments, enable_fp_fusion=True, enable_reflect_ftz=False)
+                return self.kernel[grid](*arguments, **coverage,
+                                         enable_fp_fusion=True, enable_reflect_ftz=False)
 
         compiled = invoke()
         return LaunchResult(invoke, compiled)
 
     def tuning_configurations(self, invocation):
-        from .artifact import TuningConfiguration
-
-        parameters = self.interface.tuning_parameters
-        return tuple(TuningConfiguration(parameters, tuple(({**invocation.values, **config})[p.name]
-                                                           for p in parameters))
-                     for config in self.interface.configurations)
+        return self.configurations.enumerate(invocation.values, self.configurations.rows)
 
 def _collect_triton_ir(compiled_kernel: object) -> dict[str, str]:
     asm = getattr(compiled_kernel, "asm", None)

@@ -3,6 +3,7 @@ add_mlir_library(MLIRIntentGPUAnalysis
   IndexPredicates.cpp
   IndexRelations.cpp
   PhysicalParameters.cpp
+  Configurations.cpp
   Resources.cpp
   ValueSchema.cpp
   UniformValues.cpp

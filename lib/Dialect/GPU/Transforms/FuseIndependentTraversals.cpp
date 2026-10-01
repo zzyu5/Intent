@@ -266,7 +266,9 @@ LogicalResult fuseIndependentTraversals(ModuleOp module) {
   if (failed(physicalKernel))
     return failure();
   func::FuncOp kernel = *physicalKernel;
-  auto tuples = kernel->getAttrOfType<ArrayAttr>(sharedConfigTuplesAttr);
+  auto configurations =
+      kernel->getAttrOfType<ConfigurationSetAttr>(configurationsAttr);
+  auto tuples = configurations ? configurations.getRows() : ArrayAttr();
   bool changed;
   do {
     changed = false;

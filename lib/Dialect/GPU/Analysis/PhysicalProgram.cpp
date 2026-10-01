@@ -986,12 +986,13 @@ nonNegativeExtentBounds(func::FuncOp kernel, PhysicalExprAttr extent) {
     if (candidates.empty() ||
         llvm::any_of(candidates, [](int64_t value) { return value <= 0; }))
       return std::nullopt;
-    if (auto tuples = kernel->getAttrOfType<ArrayAttr>(sharedConfigTuplesAttr);
-        tuples && !tuples.empty()) {
+    if (auto configurations =
+            kernel->getAttrOfType<ConfigurationSetAttr>(configurationsAttr);
+        configurations && !configurations.getRows().empty()) {
       int64_t minimum = std::numeric_limits<int64_t>::max();
       int64_t maximum = 0;
       bool bound = true;
-      for (Attribute attribute : tuples) {
+      for (Attribute attribute : configurations.getRows()) {
         auto tuple = dyn_cast<DictionaryAttr>(attribute);
         auto selected = tuple ? tuple.getAs<IntegerAttr>(extent.getSymbol())
                               : IntegerAttr();

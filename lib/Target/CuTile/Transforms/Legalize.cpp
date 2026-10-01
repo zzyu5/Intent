@@ -58,11 +58,11 @@ gpu::PhysicalExprAttr arrayIndexTileBound(gpu::PhysicalExprAttr expression,
       return {};
     if ((*parameter)->hasAttr(gpu::coverageDimensionAttr))
       return expression;
-    auto configurations = kernel->getAttrOfType<ArrayAttr>(gpu::cuTileConfigsAttr);
-    if (!configurations || configurations.empty())
+    auto configurations = kernel->getAttrOfType<gpu::ConfigurationSetAttr>(gpu::configurationsAttr);
+    if (!configurations || configurations.getStage() != gpu::ConfigurationStage::Complete)
       return {};
     int64_t maximum = 0;
-    for (Attribute configuration : configurations) {
+    for (Attribute configuration : configurations.getRows()) {
       auto tuple = dyn_cast<DictionaryAttr>(configuration);
       auto value = tuple ? tuple.getAs<IntegerAttr>(expression.getSymbol()) : IntegerAttr();
       if (!value || value.getInt() <= 0)

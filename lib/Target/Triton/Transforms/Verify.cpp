@@ -1,5 +1,7 @@
 #include "Legalization.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/Configurations.h"
+#include "Intent/Target/Triton/IR/Configuration.h"
 #include "llvm/ADT/DenseSet.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -71,54 +73,13 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
       return kernel.emitError("Triton physical ABI type is unsupported");
   }
 
-  llvm::SmallDenseSet<uint32_t> providerRoles;
-  gpu::ParameterAttr stageParameter;
-  LogicalResult parameterSchema = success();
-  kernel.walk([&](gpu::ParameterOp parameter) {
-    uint32_t role = parameter.getParameter().getRole();
-    auto category = static_cast<gpu::ParameterCategory>(
-        parameter.getParameter().getCategory());
-    bool providerRole =
-        role == static_cast<uint32_t>(gpu::ParameterRole::ProviderWarps) ||
-        role == static_cast<uint32_t>(gpu::ParameterRole::ProviderStages) ||
-        role == static_cast<uint32_t>(gpu::ParameterRole::ProviderCTAs);
-    if ((category == gpu::ParameterCategory::Provider) != providerRole) {
-      parameter.emitOpError(
-          "Triton program contains a foreign provider parameter");
-      parameterSchema = failure();
-      return;
-    }
-    if (!providerRole)
-      return;
-    if (role == static_cast<uint32_t>(gpu::ParameterRole::ProviderStages))
-      stageParameter = parameter.getParameter();
-    if (!providerRoles.insert(role).second) {
-      parameter.emitOpError("duplicates a Triton provider-parameter role");
-      parameterSchema = failure();
-      return;
-    }
-    if (role == static_cast<uint32_t>(gpu::ParameterRole::ProviderWarps))
-      for (int64_t candidate :
-           parameter.getParameter().getCandidates().asArrayRef())
-        if (!llvm::isPowerOf2_64(candidate)) {
-          parameter.emitOpError(
-              "declares a non-power-of-two Triton num_warps candidate");
-          parameterSchema = failure();
-          return;
-        }
-  });
-  if (failed(parameterSchema))
+  auto schema = ConfigurationSchema::read(kernel);
+  auto configurations = gpu::ConfigurationSpace::read(kernel);
+  if (failed(schema) || failed(configurations) ||
+      failed(configurations->configurations(gpu::ConfigurationStage::Complete)))
     return failure();
 
   WalkResult result = kernel.walk([&](Operation *operation) {
-    if (operation->hasAttr(loopStagesAttr)) {
-      auto binding = operation->getAttrOfType<gpu::ParameterAttr>(loopStagesAttr);
-      if (!isa<scf::ForOp>(operation) || !binding || binding != stageParameter) {
-        operation->emitOpError(
-            "loop stages must bind the declared Triton stage parameter");
-        return WalkResult::interrupt();
-      }
-    }
     if (auto assertion = dyn_cast<cf::AssertOp>(operation)) {
       auto compare = assertion.getArg().getDefiningOp<gpu::CompareOp>();
       if (!compare || !llvm::all_of(compare->getOperands(), [&](Value operand) {

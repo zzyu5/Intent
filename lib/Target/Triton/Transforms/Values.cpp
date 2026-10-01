@@ -217,7 +217,7 @@ void selectContractForms(func::FuncOp kernel) {
         shape.take_back(std::min<size_t>(2, shape.size()));
     if (llvm::any_of(matrixAxes, [&](Attribute dimension) {
           auto extent = evaluateCompileTimeExpression(
-              cast<gpu::PhysicalExprAttr>(dimension), TritonConfig{});
+              cast<gpu::PhysicalExprAttr>(dimension));
           return extent && *extent == 1;
         }))
       continue;
@@ -229,7 +229,7 @@ void selectContractForms(func::FuncOp kernel) {
           builder.getStringAttr(""), builder.getArrayAttr({elements, extent}));
     auto fmaForm = builder.getStringAttr("fma");
     // Serial K accumulation needs enough independent output elements.
-    if (auto count = evaluateCompileTimeExpression(elements, TritonConfig{})) {
+    if (auto count = evaluateCompileTimeExpression(elements)) {
       if (*count >= 256)
         contract->setAttr(contractFormAttr, fmaForm);
       continue;
@@ -242,7 +242,7 @@ void selectContractForms(func::FuncOp kernel) {
         ComparePredicate::Ge);
     for (Attribute dimension : matrixAxes) {
       auto extent = cast<gpu::PhysicalExprAttr>(dimension);
-      if (evaluateCompileTimeExpression(extent, TritonConfig{}))
+      if (evaluateCompileTimeExpression(extent))
         continue;
       Value width = builder.create<gpu::PhysicalExprOp>(
           contract.getLoc(), builder.getIndexType(), extent);

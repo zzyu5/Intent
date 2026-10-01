@@ -345,6 +345,27 @@ LogicalResult TuningProfilesAttr::verify(
   return success();
 }
 
+LogicalResult ConfigurationSetAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, ConfigurationStage stage,
+    ArrayAttr rows) {
+  if ((stage != ConfigurationStage::Shared &&
+       stage != ConfigurationStage::Complete) || !rows || rows.empty())
+    return emitError() << "configuration set requires a binding stage and nonempty rows";
+  llvm::DenseSet<Attribute> unique;
+  for (Attribute attribute : rows) {
+    auto row = mlir::dyn_cast<DictionaryAttr>(attribute);
+    if (!row || !unique.insert(row).second)
+      return emitError() << "configuration rows must be distinct binding dictionaries";
+    for (NamedAttribute binding : row) {
+      auto value = mlir::dyn_cast<IntegerAttr>(binding.getValue());
+      if (binding.getName().empty() || !value ||
+          !value.getType().isSignlessInteger(64))
+        return emitError() << "configuration bindings require named i64 values";
+    }
+  }
+  return success();
+}
+
 LogicalResult ParameterAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, StringAttr name,
     uint32_t role, uint32_t category, uint32_t elementBitWidth,

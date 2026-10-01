@@ -79,6 +79,21 @@ def IntentGPU_ParameterAttr : AttrDef<IntentGPU_Dialect, "Parameter"> {
   let genVerifyDecl = 1;
 }
 
+def IntentGPU_ConfigurationStage : IntentGPU_I32Enum<
+    "ConfigurationStage", "Binding completeness of the current candidate set", [
+      I32EnumAttrCase<"Shared", 0, "shared">,
+      I32EnumAttrCase<"Complete", 1, "complete">
+    ]>;
+
+def IntentGPU_ConfigurationSetAttr : AttrDef<IntentGPU_Dialect, "ConfigurationSet"> {
+  let mnemonic = "configurations";
+  let summary = "Ordered candidate bindings for the current physical program";
+  let parameters = (ins EnumParameter<IntentGPU_ConfigurationStage>:$stage,
+                        "::mlir::ArrayAttr":$rows);
+  let assemblyFormat = "`<` $stage `,` $rows `>`";
+  let genVerifyDecl = 1;
+}
+
 def IntentGPU_TuningProfileTableAttr : AttrDef<IntentGPU_Dialect, "TuningProfileTable"> {
   let mnemonic = "tuning_profile_table";
   let summary = "Ordered column schema and finite candidate rows by family";

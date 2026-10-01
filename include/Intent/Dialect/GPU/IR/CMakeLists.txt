@@ -16,6 +16,10 @@ set(LLVM_TARGET_DEFINITIONS AccessOpInterface.td)
 mlir_tablegen(AccessOpInterface.h.inc -gen-op-interface-decls)
 mlir_tablegen(AccessOpInterface.cpp.inc -gen-op-interface-defs)
 
+set(LLVM_TARGET_DEFINITIONS ConfigurationParameterOpInterface.td)
+mlir_tablegen(ConfigurationParameterOpInterface.h.inc -gen-op-interface-decls)
+mlir_tablegen(ConfigurationParameterOpInterface.cpp.inc -gen-op-interface-defs)
+
 set(LLVM_TARGET_DEFINITIONS GPUOps.td)
 mlir_tablegen(GPUOps.h.inc -gen-op-decls)
 mlir_tablegen(GPUOps.cpp.inc -gen-op-defs)

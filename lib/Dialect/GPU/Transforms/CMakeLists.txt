@@ -28,6 +28,9 @@ add_mlir_library(MLIRIntentGPUTransforms
   LowerWorkspace.cpp
   FuseIndependentTraversals.cpp
   MaterializeConfigTuples.cpp
+  ConfigurationAnalysis.cpp
+  ConfigurationProfiles.cpp
+  ConfigurationConstraints.cpp
   TuningProfiles.cpp
   OnlineSummary.cpp
   Passes.cpp

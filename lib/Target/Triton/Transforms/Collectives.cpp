@@ -2,6 +2,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/Configurations.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
@@ -300,7 +301,7 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
           coordinate = builder.create<gpu::BinaryOp>(
               location, indexType, coordinate, value, BinaryOperator::Add);
         }
-        if (auto count = evaluateCompileTimeExpression(elements, TritonConfig{}))
+        if (auto count = evaluateCompileTimeExpression(elements))
           elements = gpu::PhysicalExprAttr::get(
               kernel.getContext(),
               static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), *count,
@@ -1168,24 +1169,25 @@ LogicalResult legalizeLargeScalarGathers(func::FuncOp kernel) {
 
 LogicalResult materializeOversizedGathers(func::FuncOp kernel) {
   auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
-  auto tuples = kernel->getAttrOfType<ArrayAttr>(gpu::sharedConfigTuplesAttr);
-  if (!space || space.size() != 1 || !tuples || tuples.empty())
+  if (!space || space.size() != 1)
     return success();
+  auto configurations = gpu::ConfigurationSpace::read(kernel);
+  if (failed(configurations)) return failure();
+  auto tuples = configurations->configurations(gpu::ConfigurationStage::Shared);
+  if (failed(tuples)) return failure();
   int64_t maximumPrograms = 0;
-  for (Attribute attribute : tuples) {
-    auto tuple = cast<DictionaryAttr>(attribute);
-    TritonConfig config;
+  for (DictionaryAttr tuple : *tuples) {
+    NamedAttrList bindings;
+    Builder attributes(kernel.getContext());
     kernel.walk([&](gpu::ParameterOp parameter) {
       auto schema = parameter.getParameter();
       if (schema.getCandidates().size() == 1)
-        config.kernelParameters[schema.getName().getValue().str()] =
-            schema.getCandidates()[0];
+        bindings.set(schema.getName(), attributes.getI64IntegerAttr(schema.getCandidates()[0]));
     });
     for (NamedAttribute entry : tuple)
-      config.kernelParameters[entry.getName().getValue().str()] =
-          cast<IntegerAttr>(entry.getValue()).getInt();
+      bindings.set(entry.getName(), entry.getValue());
     auto count = evaluateCompileTimeExpression(
-        cast<gpu::PhysicalExprAttr>(space[0]), config);
+        cast<gpu::PhysicalExprAttr>(space[0]), bindings.getDictionary(kernel.getContext()));
     if (!count || *count <= 0)
       return success();
     maximumPrograms = std::max(maximumPrograms, *count);

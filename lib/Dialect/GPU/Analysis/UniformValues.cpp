@@ -10,7 +10,8 @@ namespace intent::gpu {
 
 std::optional<int64_t> evaluatePhysicalExpression(
     PhysicalExprAttr expression,
-    llvm::function_ref<std::optional<int64_t>(PhysicalExprAttr)> resolveLeaf) {
+    llvm::function_ref<std::optional<int64_t>(PhysicalExprAttr)> resolveLeaf,
+    llvm::function_ref<bool(PhysicalExprAttr, llvm::ArrayRef<int64_t>)> supportsOperation) {
   if (!expression)
     return std::nullopt;
   auto kind = static_cast<PhysicalExprKind>(expression.getKind());
@@ -22,11 +23,13 @@ std::optional<int64_t> evaluatePhysicalExpression(
   SmallVector<int64_t> operands;
   for (Attribute attribute : expression.getOperands()) {
     auto value = evaluatePhysicalExpression(cast<PhysicalExprAttr>(attribute),
-                                            resolveLeaf);
+                                            resolveLeaf, supportsOperation);
     if (!value)
       return std::nullopt;
     operands.push_back(*value);
   }
+  if (supportsOperation && !supportsOperation(expression, operands))
+    return std::nullopt;
   __int128 result;
   if (kind == PhysicalExprKind::NextPowerOfTwo && operands.size() == 1) {
     result = 1;

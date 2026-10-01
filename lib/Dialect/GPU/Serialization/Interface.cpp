@@ -1,12 +1,11 @@
 #include "Intent/Dialect/GPU/Serialization/Interface.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
-#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Analysis/Configurations.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
@@ -67,112 +66,16 @@ std::optional<llvm::json::Value> resourceExpression(Value value) {
   return std::nullopt;
 }
 
-FailureOr<llvm::json::Array> configurations(func::FuncOp kernel,
-    StringRef provider,
-    llvm::function_ref<LogicalResult(DictionaryAttr)> verifyProviderBindings) {
-  auto parameters = PhysicalParameterSpace::read(kernel);
-  if (failed(parameters))
+FailureOr<llvm::json::Array> configurations(const ConfigurationSpace &space) {
+  auto rows = space.configurations(ConfigurationStage::Complete);
+  if (failed(rows))
     return failure();
-  llvm::StringSet<> declaredNames;
-  for (const auto &parameter : parameters->domains())
-    declaredNames.insert(parameter.name().getValue());
-  StringRef attribute;
-  if (provider == "triton")
-    attribute = tritonConfigsAttr;
-  else if (provider == "cutile")
-    attribute = cuTileConfigsAttr;
-  else if (provider == "tilelang")
-    attribute = tileLangConfigsAttr;
-  else {
-    kernel.emitError("unknown GPU provider for interface serialization: ")
-        << provider;
-    return failure();
-  }
-  auto configurations = kernel->getAttrOfType<ArrayAttr>(attribute);
-  if (!configurations || configurations.empty()) {
-    kernel.emitError("final GPU program has no provider configurations");
-    return failure();
-  }
   llvm::json::Array result;
-  for (Attribute attribute : configurations) {
-    auto configuration = dyn_cast<DictionaryAttr>(attribute);
-    if (!configuration) {
-      kernel.emitError("GPU provider configuration is not a dictionary");
-      return failure();
-    }
-    auto bindings = provider == "triton"
-                        ? configuration.getAs<DictionaryAttr>("parameters")
-                        : configuration;
-    if (!bindings) {
-      kernel.emitError("Triton configuration has no parameter bindings");
-      return failure();
-    }
-    NamedAttrList completeBindings(bindings);
+  for (DictionaryAttr bindings : *rows) {
     llvm::json::Object encoded;
-    for (NamedAttribute binding : bindings) {
-      auto value = dyn_cast<IntegerAttr>(binding.getValue());
-      if (!value) {
-        kernel.emitError("GPU configuration binding is not an integer: ")
-            << binding.getName();
-        return failure();
-      }
-      encoded[binding.getName().getValue()] = value.getInt();
-    }
-    bool valid = true;
-    if (provider == "triton") {
-      for (StringRef field : {"num_warps", "num_stages", "num_ctas"})
-        if (!configuration.getAs<IntegerAttr>(field)) {
-          kernel.emitError("Triton configuration has no native option ") << field;
-          return failure();
-        }
-      kernel.walk([&](ParameterOp parameter) {
-        StringRef field;
-        switch (static_cast<ParameterRole>(parameter.getParameter().getRole())) {
-        case ParameterRole::ProviderWarps: field = "num_warps"; break;
-        case ParameterRole::ProviderStages: field = "num_stages"; break;
-        case ParameterRole::ProviderCTAs: field = "num_ctas"; break;
-        default: return;
-        }
-        auto value = configuration.getAs<IntegerAttr>(field);
-        if (!value) {
-          parameter.emitError("Triton configuration has no native option ")
-              << field;
-          valid = false;
-          return;
-        }
-        StringAttr name = parameter.getParameter().getName();
-        if (Attribute previous = completeBindings.get(name))
-          if (previous != value) {
-            parameter.emitError("Triton native option conflicts with its parameter binding");
-            valid = false;
-            return;
-          }
-        completeBindings.set(name, value);
-        encoded[parameter.getParameter().getName().getValue()] = value.getInt();
-      });
-    }
-    if (!valid)
-      return failure();
-    NamedAttrList declaredBindings, providerBindings;
-    for (NamedAttribute binding : completeBindings) {
-      if (declaredNames.contains(binding.getName().getValue()))
-        declaredBindings.append(binding);
-      else
-        providerBindings.append(binding);
-    }
-    if (verifyProviderBindings) {
-      if (failed(verifyProviderBindings(
-              providerBindings.getDictionary(kernel.getContext()))))
-        return failure();
-    } else if (!providerBindings.empty()) {
-      kernel.emitError("GPU configuration has an undeclared provider binding: ")
-          << providerBindings.begin()->getName();
-      return failure();
-    }
-    if (failed(parameters->verifyBindings(
-            declaredBindings.getDictionary(kernel.getContext()),
-            ParameterBindingScope::Complete)))
-      return failure();
+    for (NamedAttribute binding : bindings)
+      encoded[binding.getName().getValue()] =
+          cast<IntegerAttr>(binding.getValue()).getInt();
     result.push_back(std::move(encoded));
   }
   return result;
@@ -273,10 +176,12 @@ llvm::json::Value serializeExpression(PhysicalExprAttr expression) {
 
 FailureOr<llvm::json::Object> serializeInterface(
     func::FuncOp kernel, StringRef provider,
-    llvm::function_ref<std::string(Value)> kernelName,
-    llvm::function_ref<LogicalResult(DictionaryAttr)> verifyProviderBindings) {
+    llvm::function_ref<std::string(Value)> kernelName) {
   auto facts = readInterface(kernel);
   if (failed(facts))
+    return failure();
+  auto configurationSpace = ConfigurationSpace::read(kernel);
+  if (failed(configurationSpace))
     return failure();
   llvm::json::Array views, scalars, metadata, publicArguments, parameters;
   for (const auto &view : facts->views) {
@@ -310,26 +215,30 @@ FailureOr<llvm::json::Object> serializeInterface(
   for (unsigned abi : facts->publicArguments)
     publicArguments.push_back(abi);
 
-  bool valid = true;
-  kernel.walk([&](ParameterOp parameter) {
-    auto schema = parameter.getParameter();
-    auto binding = queryParameterBinding(parameter);
-    if (binding.state == PhysicalFactState::Ambiguous) {
-      parameter.emitError("has contradictory physical parameter bindings");
-      valid = false;
-      return;
+  for (ConfigurationParameterOpInterface declaration :
+       configurationSpace->parameters()) {
+    auto parameter = dyn_cast<ParameterOp>(declaration.getOperation());
+    PhysicalParameterBinding binding;
+    if (parameter) {
+      binding = queryParameterBinding(parameter);
+      if (binding.state == PhysicalFactState::Ambiguous) {
+        parameter.emitError("has contradictory physical parameter bindings");
+        return failure();
+      }
     }
     llvm::json::Object entry{
-        {"name", schema.getName().getValue()}, {"role", schema.getRole()},
-        {"category", schema.getCategory()},
-        {"element_bits", schema.getElementBitWidth()},
-        {"candidates", integers(schema.getCandidates().asArrayRef())}};
-    if (auto bound = parameter->getAttrOfType<PhysicalExprAttr>(coverageBoundAttr))
-      entry["coverage"] = serializeExpression(bound);
-    else if (parameter->hasAttr(coverageDimensionAttr)) {
-      parameter.emitError("full-coverage parameter has no typed bound expression");
-      valid = false;
-      return;
+        {"name", declaration.getConfigurationName().getValue()},
+        {"role", static_cast<uint32_t>(declaration.getConfigurationRole())},
+        {"category", static_cast<uint32_t>(declaration.getConfigurationCategory())},
+        {"element_bits", parameter ? parameter.getParameter().getElementBitWidth() : 0},
+        {"candidates", integers(declaration.getConfigurationCandidates())}};
+    if (parameter) {
+      if (auto bound = parameter->getAttrOfType<PhysicalExprAttr>(coverageBoundAttr))
+        entry["coverage"] = serializeExpression(bound);
+      else if (parameter->hasAttr(coverageDimensionAttr)) {
+        parameter.emitError("full-coverage parameter has no typed bound expression");
+        return failure();
+      }
     }
     if (binding.dimension) {
       entry["dimension"] = *binding.dimension;
@@ -351,9 +260,7 @@ FailureOr<llvm::json::Object> serializeInterface(
                                          binding.source->sourceAxis,
                                          binding.source->derived};
     parameters.push_back(std::move(entry));
-  });
-  if (!valid)
-    return failure();
+  }
 
   auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
   if (!space) {
@@ -361,6 +268,7 @@ FailureOr<llvm::json::Object> serializeInterface(
     return failure();
   }
   llvm::json::Array overlaps;
+  bool valid = true;
   kernel.walk([&](ViewOverlapOp overlap) {
     auto lhs = dyn_cast<BlockArgument>(overlap.getLhs());
     auto rhs = dyn_cast<BlockArgument>(overlap.getRhs());
@@ -388,7 +296,7 @@ FailureOr<llvm::json::Object> serializeInterface(
       bounds.push_back(llvm::json::Object{{"lhs", std::move(*lhs)},
                                          {"rhs", std::move(*rhs)}});
   }
-  auto configs = configurations(kernel, provider, verifyProviderBindings);
+  auto configs = configurations(*configurationSpace);
   if (failed(configs))
     return failure();
   llvm::json::Object interface{

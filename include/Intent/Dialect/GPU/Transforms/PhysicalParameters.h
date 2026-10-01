@@ -18,6 +18,9 @@ mlir::LogicalResult replacePhysicalParameter(mlir::func::FuncOp kernel,
                                              ParameterOp replacement);
 mlir::LogicalResult materializeSharedConfigTuples(mlir::func::FuncOp kernel);
 mlir::LogicalResult verifySharedConfigTuples(mlir::func::FuncOp kernel);
+mlir::LogicalResult writeConfigurations(
+    mlir::func::FuncOp kernel, llvm::ArrayRef<mlir::DictionaryAttr> rows,
+    ConfigurationStage stage);
 
 } // namespace intent::gpu
 

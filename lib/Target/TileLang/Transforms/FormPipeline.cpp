@@ -31,7 +31,7 @@ gpu::ParameterOp getOrCreateStages(func::FuncOp kernel,
     return {};
   SmallVector<int64_t> values;
   for (const auto &row : *rows)
-    if (row[0] <= std::numeric_limits<int32_t>::max())
+    if (isLegalPipelineStageCount(row[0]))
       values.push_back(row[0]);
   if (values.empty()) {
     kernel.emitError("TileLang tuning profile has no legal pipeline stage counts");

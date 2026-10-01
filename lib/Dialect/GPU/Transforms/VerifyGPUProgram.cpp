@@ -2,6 +2,7 @@
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
+#include "Intent/Dialect/GPU/Analysis/Configurations.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -195,6 +196,15 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
       !kernel->getAttrOfType<IntegerAttr>(gridRankAttr))
     return kernel.emitError("physical kernel is missing capabilities or launch schema");
   auto programSpace = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
+  if (Attribute attribute = kernel->getAttr(configurationsAttr)) {
+    auto configurations = dyn_cast<ConfigurationSetAttr>(attribute);
+    if (!configurations)
+      return kernel.emitError("candidate bindings require a typed configuration set");
+    auto space = ConfigurationSpace::read(kernel);
+    if (failed(space) ||
+        failed(space->configurations(configurations.getStage())))
+      return failure();
+  }
   auto expectedEffects = kernel->getAttrOfType<ArrayAttr>(effectOriginsAttr);
   int64_t gridRank = kernel->getAttrOfType<IntegerAttr>(gridRankAttr).getInt();
   if (gridRank <= 0 || programSpace.size() != static_cast<size_t>(gridRank) ||

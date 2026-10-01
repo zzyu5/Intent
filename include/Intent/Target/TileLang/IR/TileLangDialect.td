@@ -7,6 +7,7 @@ def IntentTileLang_Dialect : Dialect {
   let name = "intent_tilelang";
   let cppNamespace = "::intent::tilelang";
   let summary = "TileLang-local storage, transfer and native-compute forms";
+  let useDefaultAttributePrinterParser = 1;
   let useDefaultTypePrinterParser = 1;
 }
 

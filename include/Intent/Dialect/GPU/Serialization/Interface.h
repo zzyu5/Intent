@@ -53,13 +53,9 @@ llvm::json::Value serializeExpression(PhysicalExprAttr expression);
 // Returns {provider, interface}; the provider appends its own named object for
 // native launch details. The callback reports the names actually serialized,
 // including packed-argument projections when those are part of the native ABI.
-// Bindings outside gpu.parameter declarations require the provider's verifier;
-// its callback sees exactly those bindings, including an empty dictionary.
 mlir::FailureOr<llvm::json::Object> serializeInterface(
     mlir::func::FuncOp kernel, llvm::StringRef provider,
-    llvm::function_ref<std::string(mlir::Value)> kernelName,
-    llvm::function_ref<mlir::LogicalResult(mlir::DictionaryAttr)>
-        verifyProviderBindings = {});
+    llvm::function_ref<std::string(mlir::Value)> kernelName);
 
 } // namespace intent::gpu
 #endif

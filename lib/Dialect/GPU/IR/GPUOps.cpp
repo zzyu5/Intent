@@ -11,7 +11,29 @@
 
 using namespace mlir;
 
+#include "Intent/Dialect/GPU/IR/ConfigurationParameterOpInterface.cpp.inc"
+
 namespace intent::gpu {
+
+StringAttr ParameterOp::getConfigurationName() { return getParameter().getName(); }
+ArrayRef<int64_t> ParameterOp::getConfigurationCandidates() {
+  return getParameter().getCandidates().asArrayRef();
+}
+ConfigurationBindingPhase ParameterOp::getConfigurationBindingPhase() {
+  if (getOperation()->hasAttr(coverageDimensionAttr) ||
+      getConfigurationCategory() == ParameterCategory::Coverage)
+    return ConfigurationBindingPhase::Deferred;
+  return getConfigurationCategory() == ParameterCategory::Provider
+             ? ConfigurationBindingPhase::Provider
+             : ConfigurationBindingPhase::Shared;
+}
+ParameterRole ParameterOp::getConfigurationRole() {
+  return static_cast<ParameterRole>(getParameter().getRole());
+}
+ParameterCategory ParameterOp::getConfigurationCategory() {
+  return static_cast<ParameterCategory>(getParameter().getCategory());
+}
+
 namespace {
 
 Type elementType(Type type) {

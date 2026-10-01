@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Analysis/Configurations.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
@@ -24,6 +25,25 @@
 using namespace mlir;
 
 namespace intent::gpu {
+
+LogicalResult writeConfigurations(func::FuncOp kernel,
+                                  ArrayRef<DictionaryAttr> rows,
+                                  ConfigurationStage stage) {
+  auto space = ConfigurationSpace::read(kernel);
+  if (failed(space))
+    return failure();
+  for (DictionaryAttr row : rows)
+    if (failed(space->verifyBindings(row, stage)))
+      return failure();
+  SmallVector<Attribute> encoded(rows.begin(), rows.end());
+  auto set = ConfigurationSetAttr::getChecked(
+      [&] { return kernel.emitError(); }, kernel.getContext(), stage,
+      ArrayAttr::get(kernel.getContext(), encoded));
+  if (!set)
+    return failure();
+  kernel->setAttr(configurationsAttr, set);
+  return success();
+}
 
 ParameterOp getOrCreatePhysicalParameter(
     func::FuncOp kernel, StringRef name, ParameterRole role,
@@ -114,6 +134,8 @@ void eraseUnusedPhysicalParameters(func::FuncOp kernel) {
   });
   for (ParameterOp parameter : llvm::reverse(unused))
     parameter.erase();
+  if (!unused.empty())
+    kernel->removeAttr(configurationsAttr);
 }
 
 LogicalResult replacePhysicalParameter(func::FuncOp kernel,
@@ -121,6 +143,10 @@ LogicalResult replacePhysicalParameter(func::FuncOp kernel,
                                        ParameterOp replacement) {
   if (!previous || !replacement || previous == replacement)
     return success();
+  // This changes the executable parameter domain. A completed candidate set is
+  // not a declaration and cannot survive as bindings to the old program. The
+  // enclosing transformation must materialize configurations for its result.
+  kernel->removeAttr(configurationsAttr);
   StringAttr previousName = previous.getParameter().getName();
   StringAttr replacementName = replacement.getParameter().getName();
   previous.getResult().replaceAllUsesWith(replacement.getResult());

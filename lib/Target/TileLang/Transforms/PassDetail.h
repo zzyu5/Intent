@@ -18,6 +18,7 @@ mlir::LogicalResult bufferizeGPUProgram(mlir::func::FuncOp kernel);
 mlir::LogicalResult formPipelines(mlir::func::FuncOp kernel,
                                 const gpu::TuningProfiles &profiles);
 mlir::LogicalResult verifyTileLangKernel(mlir::func::FuncOp kernel);
+bool isLegalPipelineStageCount(int64_t stages);
 
 } // namespace intent::tilelang
 

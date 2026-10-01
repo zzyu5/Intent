@@ -7,6 +7,7 @@ add_mlir_library(MLIRIntentTritonTransforms
   Values.cpp
   Verify.cpp
   Configurations.cpp
+  ConfigurationFacts.cpp
   ProgramGrid.cpp
 
   DEPENDS

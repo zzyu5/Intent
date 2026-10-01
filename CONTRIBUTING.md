@@ -286,6 +286,44 @@ Pointwise 的两个完整入口也在同一 driver 文件 [RealizePointwiseBlock
 
 新增一个 physical rewrite 时，先确定它读取的 current-IR facts，从上表选择查询或 materialization 接口；将 rewrite 和必要 relation closure 放进一个完整入口；在 family pipeline 中安排依赖位置与 postcondition 验证。新增只读查询应放 Analysis，只有本模块用的算法细节留在相邻私有实现，不扩大 Passes.h。CPU 或 DSA 的类似优化先复用它们自己的 analysis 和 storage/control 合同，只有与执行拓扑无关的规则才上提到公共 Analysis。
 
+### GPU 候选声明、形成与消费
+
+当前函数只有一份 `intent_gpu.configurations`，类型为 `ConfigurationSetAttr`。
+`shared` 阶段绑定共同的静态参数；provider 完成合法性筛选后，以 `complete` 表替换它。
+每行给出该阶段全部必要符号的具体值，顺序是候选枚举顺序。Coverage 的运行期 extent
+通过独立的 deferred 声明绑定，不写成静态候选值；没有候选时直接失败。
+
+[ConfigurationParameterOpInterface](include/Intent/Dialect/GPU/IR/ConfigurationParameterOpInterface.h)
+由 operation 提供符号、有限 domain、语义角色与绑定阶段。
+普通 `ParameterOp` 保留正整数 extent 合同；Triton `DescriptorChoiceOp` 仍是独立的
+`i1` 选择，domain 为 `{0, 1}`。新增 provider 选择时声明真实 domain，不能为了共享表格
+把 bool 当成正整数 tile，也不能让 serializer 额外接受一个未声明的名字。
+
+| 需要修改的职责 | 入口 |
+|---|---|
+| 当前声明、完整绑定与阶段验证 | [Analysis/Configurations.h](include/Intent/Dialect/GPU/Analysis/Configurations.h) 的只读 `ConfigurationSpace` |
+| 校验并发布候选表 | [Transforms/PhysicalParameters.h](include/Intent/Dialect/GPU/Transforms/PhysicalParameters.h) 的 `writeConfigurations` |
+| 当前图的分类、关联参数及完整结果机会 | [ConfigurationAnalysis.cpp](lib/Dialect/GPU/Transforms/ConfigurationAnalysis.cpp) |
+| 有限 profile 解码、family 选择与 role 投影 | [ConfigurationProfiles.cpp](lib/Dialect/GPU/Transforms/ConfigurationProfiles.cpp) |
+| 候选 extent 与资源约束 | [ConfigurationConstraints.cpp](lib/Dialect/GPU/Transforms/ConfigurationConstraints.cpp) |
+| 共同候选形成的完整入口 | [MaterializeConfigTuples.cpp](lib/Dialect/GPU/Transforms/MaterializeConfigTuples.cpp) |
+
+这些私有 policy facts 只在一次不变的 current program 上使用，不跨改写缓存，不拥有
+第二张执行表。改变声明或参数关系后，完整变换重新形成并验证候选；不能让旧表继续
+解释新程序。Provider 可以进一步过滤、绑定或形成 local form，最终表仍通过同一入口发布。
+
+Triton 的 [ConfigurationSchema](include/Intent/Target/Triton/IR/Configuration.h)
+统一查询 kernel constexpr 顺序以及 `num_warps/stages/ctas` 对应的参数符号，
+不保存候选值。Serializer 机械导出最终表与符号映射；
+[gpu/configurations.py](python/intent/runtime/gpu/configurations.py) 负责一次解析、deferred
+绑定和已声明资源条件的求值。Triton 的真实 `Config` 从这张表投影，pruning 读取原行；
+cuTile/TileLang 保留自己的 JIT 与调优入口。CPU 仍使用独立函数候选和 implementation
+binding，不套用 GPU 的 block/config 表。
+
+职责参考：Triton `python/triton/runtime/autotuner.py:140–147,276–279` 在试跑与最终调用中
+消费同一 `Config.all_kwargs()`；`:328–380` 区分 kernel kwargs 与 native 编译选项。
+Intent 先由 IR 验证完整绑定，再在 provider adapter 中投影这两类参数；runtime 不补默认候选。
+
 ### CPU 中直接可复用的接口
 
 CPU 的候选绑定、存储证明与执行变换有各自的入口。[共享 pipeline](lib/Dialect/CPU/Transforms/Passes.cpp) 依次完成 source 规范化、候选形成、region 实现、供数与分块、task 形成；每个完整组包含所需规范化并验证当前 CPU program。Mojo 和 Weft 共用这些 family 机制，provider 的微程序及机器表示仍各自实现。
@@ -376,6 +414,7 @@ CPU 的 implementation registry 是明确的局部扩展点。GPU provider 通�
 |---|---|---|
 | GPU 公共参数绑定、输出与 workspace | [gpu/interface.py](python/intent/runtime/gpu/interface.py) | `GPUInterface` 解析一次声明，每次 `bind` 读取真实实参并检查 dtype/shape/stride/alias；不缓存可变 tensor facts |
 | 已导出的整数表达式 | [gpu/expressions.py](python/intent/runtime/gpu/expressions.py) | 只求值 compiler 已声明的表达式，不按算法名或观察到的 shape 发明策略 |
+| 候选、deferred coverage 与资源条件 | [gpu/configurations.py](python/intent/runtime/gpu/configurations.py) | 唯一解析已导出的候选表；provider 明确选择用于执行或展示的现有行，不再重建第二份配置 |
 | 调用生命周期与原生结果 | [gpu/program.py](python/intent/runtime/gpu/program.py) | `GPUProgram` 共用 run/launch/prepare；`PreparedCall` 属于已绑定的实参和 workspace，改变参数或元数据时重新 prepare |
 | Provider 的 JIT、调优和发射 | [runtime/triton.py](python/intent/runtime/triton.py)、[runtime/cutile.py](python/intent/runtime/cutile.py)、[runtime/tilelang.py](python/intent/runtime/tilelang.py) | 消费 `BoundInvocation`，返回 `LaunchResult`；保留各下层 compiler/tuner 的职责，复用公共 trial-state 规则 |
 | PyTorch operator 注册 | [runtime/torch.py](python/intent/runtime/torch.py) | `as_torch_op` 注册 opaque 调用；fake 只消费相同接口。当前限 GPU 只读 In/scalar 和 fresh Out，拒绝 InOut，backward 由作者注册 |

@@ -71,6 +71,7 @@ def _search(*arguments, **keywords):
 class CuTileProgram:
     def __init__(self, interface, namespace: dict, facts: dict) -> None:
         self.interface = interface
+        self.configurations = interface.configuration_space
         self.facts = facts
         self.kernel = namespace[facts["kernel"]]
         self.narrow_kernel = None if facts["narrow_kernel"] is None else namespace[facts["narrow_kernel"]]
@@ -107,7 +108,7 @@ class CuTileProgram:
         return (tuple((tuple(view.shape), tuple(view.stride()), view.dtype, view.device)
                       for view in invocation.views),
                 tuple(values[name] for name in self.facts["tuning_key_scalars"]),
-                tuple(values[name] for name, _, _ in self.interface.coverage),
+                tuple(values[name] for name in self.configurations.coverage_names),
                 tuple(values[entry["eligible"]] for entry in self.facts["array_views"]),
                 tuple(values[entry["name"]] for entry in self.interface.overlaps))
 
@@ -120,7 +121,7 @@ class CuTileProgram:
         key = self._key(invocation, values)
         cached = self._winners.get(key)
         if cached is None:
-            configurations = tuple(SimpleNamespace(**config) for config in self.interface.candidates(values))
+            configurations = tuple(SimpleNamespace(**config) for config in self.configurations.candidates(values))
             kernel = self.kernel
             if self.tile_bounds is not None:
                 bounds = tuple(evaluate_shape(bound, values) for bound in self.tile_bounds)
@@ -155,7 +156,8 @@ class CuTileProgram:
         return LaunchResult(None if self._compiling else invoke, selected)
 
     def tuning_configurations(self, invocation):
-        return self.interface.tuning_configurations(invocation)
+        return self.configurations.enumerate(invocation.values,
+                                             self.configurations.candidates(invocation.values))
 
     @contextmanager
     def compilation_only(self, search, trial_state):

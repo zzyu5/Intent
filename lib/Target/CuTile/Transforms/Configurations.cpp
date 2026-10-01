@@ -2,9 +2,10 @@
 
 #include "Configurations.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Analysis/Configurations.h"
+#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "Intent/Target/CuTile/Transforms/Passes.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/MathExtras.h"
 using namespace mlir;
 namespace intent::cutile {
@@ -77,11 +78,6 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
   SmallVector<SmallVector<NamedAttribute>> configurations;
   for (DictionaryAttr tuple : *shared)
     configurations.emplace_back(tuple.getValue());
-  SmallVector<StringAttr> sharedNames;
-  for (const auto &domain : space->domains())
-    if (!domain.provider && !domain.coverage)
-      sharedNames.push_back(domain.name());
-
   SmallVector<NamedAttribute> launchBaseline;
   SmallVector<NamedAttribute> launchEndpoint;
   SmallVector<gpu::ParameterOp> launchOptions;
@@ -204,48 +200,22 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
         DenseI64ArrayAttr::get(kernel.getContext(), counts)));
   }
 
-  SmallVector<Attribute> encoded;
+  SmallVector<DictionaryAttr> encoded;
   for (const auto &bindings : configurations) {
     DictionaryAttr candidate = builder.getDictionaryAttr(bindings);
-    if (!llvm::is_contained(encoded, Attribute(candidate)))
+    if (!llvm::is_contained(encoded, candidate))
       encoded.push_back(candidate);
   }
   if (encoded.empty())
     return kernel.emitError("cuTile legalization produced no provider config");
-  kernel->setAttr(gpu::cuTileConfigsAttr, builder.getArrayAttr(encoded));
-  if (bindResidentCapacity) {
-    SmallVector<Attribute> projected;
-    for (Attribute attribute : encoded) {
-      auto candidate = cast<DictionaryAttr>(attribute);
-      SmallVector<NamedAttribute> bindings;
-      for (StringAttr name : sharedNames)
-        bindings.push_back(builder.getNamedAttr(name, candidate.get(name)));
-      auto tuple = builder.getDictionaryAttr(bindings);
-      if (!llvm::is_contained(projected, Attribute(tuple)))
-        projected.push_back(tuple);
-    }
-    kernel->setAttr(gpu::sharedConfigTuplesAttr, builder.getArrayAttr(projected));
-  }
-  return success();
+  return gpu::writeConfigurations(kernel, encoded, gpu::ConfigurationStage::Complete);
 }
 
 LogicalResult verifyClosedConfigs(func::FuncOp kernel) {
-  auto space = gpu::PhysicalParameterSpace::read(kernel);
+  auto space = gpu::ConfigurationSpace::read(kernel);
   if (failed(space))
     return failure();
-  auto encoded = kernel->getAttrOfType<ArrayAttr>(gpu::cuTileConfigsAttr);
-  if (!encoded || encoded.empty())
-    return kernel.emitError(
-        "cuTile legalization did not materialize closed provider configs");
-  llvm::SmallDenseSet<Attribute, 8> unique;
-  for (Attribute attribute : encoded) {
-    auto tuple = dyn_cast<DictionaryAttr>(attribute);
-    if (failed(space->verifyBindings(tuple, gpu::ParameterBindingScope::Complete)))
-      return failure();
-    if (!unique.insert(attribute).second)
-      return kernel.emitError("contains a duplicate cuTile provider config");
-  }
-  return success();
+  return success(succeeded(space->configurations(gpu::ConfigurationStage::Complete)));
 }
 
 } // namespace intent::cutile
