@@ -328,7 +328,7 @@ LogicalResult materializeDeferredResourceBounds(func::FuncOp kernel) {
       kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
   SmallVector<ValueRange> reductionSources;
   kernel.walk([&](ReduceOp reduce) {
-    reductionSources.push_back(reduce.getInputs().take_front(reduce.getSourceCount()));
+    reductionSources.push_back(reduce.getSources());
   });
   gpu::materializeDeferredReductionBounds(kernel, reductionSources);
   if (capabilities && capabilities.getRegistersPerUnit() > 0) {
@@ -530,7 +530,7 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
     if (auto reduce = dyn_cast<gpu::ReduceOp>(operation);
         reduce && capabilities && capabilities.getRegistersPerUnit() > 0) {
       SmallVector<gpu::PhysicalExprAttr> footprints;
-      for (Value source : reduce.getInputs().take_front(reduce.getSourceCount()))
+      for (Value source : reduce.getSources())
         if (auto footprint = gpu::reductionRegisterFootprint(ValueRange{source}, kernel))
           footprints.push_back(footprint);
       reductionFootprints.push_back(std::move(footprints));

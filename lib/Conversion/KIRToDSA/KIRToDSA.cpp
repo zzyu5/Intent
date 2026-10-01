@@ -1,5 +1,6 @@
 #include "Intent/Conversion/KIRToDSA/KIRToDSA.h"
 #include "Intent/Analysis/CanonicalKernel.h"
+#include "Intent/Interfaces/StructuredOpInterface.h"
 #include "Intent/Analysis/RegionSemantics.h"
 #include "Intent/Analysis/OnlineSummary.h"
 #include "Intent/Dialect/Intent/IR/IntentOps.h"
@@ -1235,9 +1236,9 @@ private:
   }
   LogicalResult streamReduction(ReduceOp reduce, unsigned axis, int64_t dimension, const LocalShape &shape) {
     Location loc = reduce.getLoc();
-    ValueRange sources = reduce.getInputs().take_front(reduce.getSourceCount());
-    ValueRange identities = reduce.getInputs().slice(reduce.getSourceCount(), reduce.getIdentityCount());
-    ValueRange captures = reduce.getInputs().take_back(reduce.getCaptureCount());
+    ValueRange sources = reduce.getSources();
+    ValueRange identities = reduce.getIdentities();
+    ValueRange captures = reduce.getCaptures();
     SmallVector<Value> initial = flatten(identities), outputs;
     SmallVector<Type> elementTypes, resultTypes;
     for (Type type : identities.getTypes()) leaves(type, elementTypes);
@@ -1359,9 +1360,9 @@ private:
   }
 
   std::optional<LogicalResult> productReduction(ReduceOp reduce) {
-    auto sources = reduce.getInputs().take_front(reduce.getSourceCount());
-    auto identities = reduce.getInputs().slice(reduce.getSourceCount(), reduce.getIdentityCount());
-    auto captures = reduce.getInputs().take_back(reduce.getCaptureCount());
+    auto sources = reduce.getSources();
+    auto identities = reduce.getIdentities();
+    auto captures = reduce.getCaptures();
     SmallVector<Value> sourceFields;
     std::function<bool(Value)> collect = [&](Value source) {
       while (auto extract = source.getDefiningOp<ExtractOp>()) {
@@ -1497,9 +1498,9 @@ private:
     if (auto product = productReduction(reduce)) return *product;
     if (reduce.getAxes().size() != 1) return reduce.emitError("DSA local reduction currently requires one selected axis");
     unsigned axis = cast<IntegerAttr>(reduce.getAxes()[0]).getInt();
-    ValueRange sources = reduce.getInputs().take_front(reduce.getSourceCount());
-    ValueRange identities = reduce.getInputs().slice(reduce.getSourceCount(), reduce.getIdentityCount());
-    ValueRange captures = reduce.getInputs().take_back(reduce.getCaptureCount());
+    ValueRange sources = reduce.getSources();
+    ValueRange identities = reduce.getIdentities();
+    ValueRange captures = reduce.getCaptures();
     SmallVector<Type> sourceTypes;
     for (Type type : sources.getTypes()) leaves(type, sourceTypes);
     if (!sourceTypes.empty() && valueSlices.empty()) {
@@ -1551,10 +1552,10 @@ private:
     }
     auto combineOps = reduce.getCombine().front().without_terminator();
     auto binary = llvm::hasSingleElement(combineOps) ? dyn_cast<BinaryOp>(&*combineOps.begin()) : BinaryOp();
-    bool simple = inputs.size() == 1 && reduce.getIdentityCount() == 1 && captures.empty() && binary &&
+    bool simple = inputs.size() == 1 && reduce.getIdentities().size() == 1 && captures.empty() && binary &&
         !binary.getApproximate() && !binary.getFlushToZero() &&
-        binary.getLhs() == reduce.getCombine().front().getArgument(0) &&
-        binary.getRhs() == reduce.getCombine().front().getArgument(1) &&
+        binary.getLhs() == cast<StructuredOpInterface>(reduce.getOperation()).getCombineLhs().front() &&
+        binary.getRhs() == cast<StructuredOpInterface>(reduce.getOperation()).getCombineRhs().front() &&
         reduce.getCombine().front().getTerminator()->getOperand(0) == binary.getResult();
     Type inputElement = cast<MemRefType>(inputs.front().getType()).getElementType();
     BinaryOperator kind = binary ? binary.getOperatorKind() : BinaryOperator::Add;
@@ -1672,7 +1673,7 @@ private:
 
   LogicalResult advanceScan(ScanOp scan, ValueRange slots, ValueRange next,
                            ValueRange elements, ArrayRef<SmallVector<Value>> captures) {
-    ValueRange identities = scan.getInputs().slice(scan.getSourceCount(), scan.getIdentityCount());
+    ValueRange identities = scan.getIdentities();
     auto arguments = splitFields(identities.getTypes(), slots);
     llvm::append_range(arguments, splitFields(identities.getTypes(), elements));
     llvm::append_range(arguments, captures);
@@ -1687,8 +1688,8 @@ private:
   LogicalResult scanTensor(ScanOp scan) {
     Location loc = scan.getLoc();
     unsigned axis = scan.getAxis();
-    ValueRange sources = scan.getInputs().take_front(scan.getSourceCount());
-    ValueRange identities = scan.getInputs().slice(scan.getSourceCount(), scan.getIdentityCount());
+    ValueRange sources = scan.getSources();
+    ValueRange identities = scan.getIdentities();
     auto inputs = flatten(sources), initial = flatten(identities);
     SmallVector<Type> schema;
     for (Type type : identities.getTypes()) leaves(type, schema);
@@ -1729,7 +1730,7 @@ private:
     for (Value input : inputs)
       outputs.push_back(allocateTensor(loc, cast<MemRefType>(input.getType()).getElementType(), localShapes.lookup(input)));
     SmallVector<SmallVector<Value>> captures;
-    for (Value capture : scan.getInputs().take_back(scan.getCaptureCount())) {
+    for (Value capture : scan.getCaptures()) {
       auto fields = flatten(ValueRange{capture});
       if (fields.empty() || llvm::is_contained(fields, Value())) return failure();
       captures.push_back(std::move(fields));
@@ -1764,8 +1765,8 @@ private:
 
   bool canStreamScan(ScanOp scan, Block &block) {
     unsigned axis = scan.getAxis();
-    auto sources = scan.getInputs().take_front(scan.getSourceCount());
-    auto identities = scan.getInputs().slice(scan.getSourceCount(), scan.getIdentityCount());
+    auto sources = scan.getSources();
+    auto identities = scan.getIdentities();
     auto first = cast<RankedTensorType>(sources.front().getType());
     int64_t dimension = cast<TensorShapeAttr>(first.getEncoding()).getDimensions()[axis];
     if (dimension <= 0 || axisBindings.count(dimension) ||
@@ -1811,7 +1812,7 @@ private:
           if (llvm::count(cast<TensorShapeAttr>(tensor.getEncoding()).getDimensions().asArrayRef(), dimension) > 1) return false;
       }
       if (auto reduce = dyn_cast<ReduceOp>(op))
-        for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+        for (Value source : reduce.getSources()) {
           SmallVector<Type> fields; leaves(source.getType(), fields);
           for (Type field : fields) if (auto tensor = dyn_cast<RankedTensorType>(field))
             for (Attribute reduced : reduce.getAxes())
@@ -1837,8 +1838,8 @@ private:
   LogicalResult streamScan(ScanOp scan, Block &block) {
     Location loc = scan.getLoc();
     unsigned axis = scan.getAxis();
-    auto sources = scan.getInputs().take_front(scan.getSourceCount());
-    auto identities = scan.getInputs().slice(scan.getSourceCount(), scan.getIdentityCount());
+    auto sources = scan.getSources();
+    auto identities = scan.getIdentities();
     auto first = cast<RankedTensorType>(sources.front().getType());
     int64_t dimension = cast<TensorShapeAttr>(first.getEncoding()).getDimensions()[axis];
     for (Operation &op : block.without_terminator()) {
@@ -1853,7 +1854,7 @@ private:
     if (failed(slots) || failed(next) || failed(items) || initial.size() != slots->size()) return failure();
     for (auto [value, slot] : llvm::zip(initial, *slots)) if (failed(copyTo(value, slot, loc))) return failure();
     SmallVector<SmallVector<Value>> captures;
-    for (Value capture : scan.getInputs().take_back(scan.getCaptureCount())) {
+    for (Value capture : scan.getCaptures()) {
       auto fields = flatten(ValueRange{capture});
       if (fields.empty() || llvm::is_contained(fields, Value())) return failure();
       captures.push_back(std::move(fields));
@@ -2139,7 +2140,7 @@ private:
   }
 
   FailureOr<int64_t> partitionQueryAxis(Block &block, RegionFoldOp fold) {
-    auto sourceType = cast<RankedTensorType>(fold.getInputs().front().getType());
+    auto sourceType = cast<RankedTensorType>(fold.getOperands().front().getType());
     auto sourceIds = cast<TensorShapeAttr>(sourceType.getEncoding()).getDimensions();
     int64_t query = 0;
     for (Operation &op : block.without_terminator()) if (auto store = dyn_cast<ViewStoreOp>(op)) {
@@ -2175,7 +2176,7 @@ private:
       if (auto load = dyn_cast<ViewLoadOp>(op))
         if (cast<ViewType>(load.getInputs().front().getType()).getAccess() != 0) independent = false;
       if (auto reduce = dyn_cast<ReduceOp>(op))
-        for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+        for (Value source : reduce.getSources()) {
           SmallVector<Type> fields; leaves(source.getType(), fields);
           for (Type field : fields) if (auto tensor = dyn_cast<RankedTensorType>(field))
             for (Attribute axis : reduce.getAxes())
@@ -2275,7 +2276,7 @@ private:
       return false;
     };
     if (auto reduce = dyn_cast<ReduceOp>(op))
-      for (Value input : reduce.getInputs().take_front(reduce.getSourceCount()))
+      for (Value input : reduce.getSources())
         for (Attribute axis : reduce.getAxes()) if (containsAxis(input, cast<IntegerAttr>(axis).getInt())) return false;
     if (auto matrix = dyn_cast<ContractOp>(op)) {
       if (!matrix.getBatch().empty()) return false;
@@ -2385,15 +2386,22 @@ private:
   }
   Value regionTraversalEnd(RegionFoldOp fold, Value size, int64_t sourceDimension) {
     Block &body = fold.getSummarize().front();
-    unsigned sourceCount = fold.getSourceCount();
-    auto captures = fold.getInputs().take_back(fold.getCaptureCount());
+    auto schema = cast<StructuredOpInterface>(fold.getOperation());
     auto coordinate = [&](Value value) -> std::optional<Domain> {
       DenseSet<Value> visited;
       while (value && visited.insert(value).second) {
         if (auto argument = dyn_cast<BlockArgument>(value)) {
           if (argument.getOwner() != &body) return {};
-          unsigned number = argument.getArgNumber();
-          value = number < sourceCount ? fold.getInputs()[number] : captures[number - sourceCount];
+          Value source;
+          for (const auto &relation : schema.getValueRelations())
+            if (relation.to == argument &&
+                (relation.kind == StructuredRelationKind::Capture ||
+                 relation.kind == StructuredRelationKind::SourceSlice)) {
+              source = relation.from;
+              break;
+            }
+          if (!source) return std::nullopt;
+          value = source;
           continue;
         }
         Operation *definition = value.getDefiningOp();
@@ -2437,7 +2445,7 @@ private:
       if (owner == axisBindings.end()) return;
       UniformBindings bindings;
       bindings[comparison.getResult()] = b.getBoolAttr(false);
-      auto identities = fold.getInputs().slice(sourceCount, fold.getIdentityCount());
+      auto identities = fold.getIdentities();
       auto yields = body.getTerminator()->getOperands();
       if (yields.size() != identities.size()) return;
       for (auto [part, identity] : llvm::zip(yields, identities))
@@ -2481,16 +2489,16 @@ private:
     });
     Location loc = fold.getLoc();
     auto &summary = fold.getSummarize().front();
-    auto &merge = fold.getCombine().front();
+    auto schema = cast<StructuredOpInterface>(fold.getOperation());
     for (auto [i, formal] : llvm::enumerate(summary.getArguments()))
-      bindHelperValue(formal, arguments[i], i < fold.getSourceCount(), fold.getAxis());
+      bindHelperValue(formal, arguments[i], llvm::is_contained(schema.getSummarizeSources(), formal), fold.getAxis());
     Value valid = get(plan.validity.getResult(0));
     Value maximum = get(plan.maximumOrEmpty.getResult());
     if (!valid || !maximum) return failure();
-    bindHelperValue(merge.getArgument(0), state, false, -1);
+    bindHelperValue(schema.getCombineLhs().front(), state, false, -1);
     SmallVector<Value> part(state);
     part[plan.validField] = valid; part[plan.maxField] = maximum;
-    bindHelperValue(merge.getArgument(1), part, false, -1);
+    bindHelperValue(schema.getCombineRhs().front(), part, false, -1);
     Value combinedMaximum = get(plan.combinedMaximum);
     Value massSeed = get(plan.leftMassTerm), momentSeed = get(plan.leftMomentTerm);
     if (!combinedMaximum || !massSeed || !momentSeed) return failure();
@@ -2523,17 +2531,13 @@ private:
   }
   LogicalResult lowerRegion(Operation *op) {
     Location loc = op->getLoc();
-    bool scan = isa<RegionScanOp>(op);
-    unsigned sourceCount = op->getAttrOfType<IntegerAttr>("source_count").getInt();
-    unsigned identityCount = op->getAttrOfType<IntegerAttr>("identity_count").getInt();
-    unsigned stateCount = scan ? op->getAttrOfType<IntegerAttr>("state_count").getInt() : 0;
-    unsigned captureCount = op->getAttrOfType<IntegerAttr>("capture_count").getInt();
-    unsigned outputCount = scan ? op->getAttrOfType<IntegerAttr>("output_count").getInt() : 0;
-    int64_t axis = op->getAttrOfType<IntegerAttr>("axis").getInt();
-    ValueRange sources = op->getOperands().take_front(sourceCount);
-    ValueRange identities = op->getOperands().slice(sourceCount, identityCount);
-    ValueRange states = op->getOperands().slice(sourceCount + identityCount, stateCount);
-    ValueRange captures = op->getOperands().take_back(captureCount);
+    auto schema = cast<StructuredOpInterface>(op);
+    bool scan = schema.getStructuredKind() == StructuredOpKind::RegionScan;
+    ValueRange sources = schema.getSources(), identities = schema.getIdentities();
+    ValueRange states = schema.getInitialStates(), captures = schema.getCaptures();
+    unsigned sourceCount = sources.size();
+    unsigned outputCount = schema.getEmittedResults().size();
+    int64_t axis = schema.getIterationAxes().front();
     auto fact = analysis.regionSegment(op);
     if (!fact.isExact()) return op->emitError("DSA region source has no exact canonical segment relation");
     auto sourceType = cast<RankedTensorType>(sources.front().getType());
@@ -2571,7 +2575,7 @@ private:
         arguments.push_back(std::move(fields));
       }
       llvm::append_range(arguments, captureFields);
-      auto part = helper(op->getRegion(0).front(), arguments, sourceCount, axis);
+      auto part = helper(schema.getSummarizeRegion()->front(), arguments, sourceCount, axis);
       SmallVector<Type> resultFields;
       for (Type type : op->getResultTypes()) leaves(type, resultFields);
       if (failed(part) || part->size() != resultFields.size()) return failure();
@@ -2611,19 +2615,19 @@ private:
         for (auto [value, slot] : llvm::zip(*next, *slots)) if (failed(copyTo(value, slot, loc))) return failure();
         return success();
       }
-      auto part = helper(op->getRegion(0).front(), arguments, sourceCount, axis);
+      auto part = helper(schema.getSummarizeRegion()->front(), arguments, sourceCount, axis);
       if (failed(part) || part->size() != slots->size()) return failure();
       if (scan) {
         auto applied = splitFields(identities.getTypes(), *slots);
         llvm::append_range(applied, splitFields(states.getTypes(), initialState));
-        auto incoming = helper(op->getRegion(2).front(), applied);
+        auto incoming = helper(schema.getApplyRegion()->front(), applied);
         if (failed(incoming)) return failure();
         auto emittedArgs = slices;
         llvm::append_range(emittedArgs, splitFields(states.getTypes(), *incoming));
         llvm::append_range(emittedArgs, captureFields);
-        auto emitted = helper(op->getRegion(3).front(), emittedArgs, sourceCount, axis);
+        auto emitted = helper(schema.getEmitRegion()->front(), emittedArgs, sourceCount, axis);
         SmallVector<Type> outputTypes;
-        ValueRange outputValues = op->getResults().take_front(outputCount);
+        ValueRange outputValues = schema.getEmittedResults();
         for (Type type : outputValues.getTypes()) leaves(type, outputTypes);
         if (failed(emitted) || emitted->size() != outputTypes.size()) return op->emitError("DSA scan output schema is unavailable");
         for (unsigned i = 0; i < outputTypes.size(); ++i) {
@@ -2653,7 +2657,7 @@ private:
         b.setInsertionPointToStart(update.elseBlock());
         auto combinedArgs = splitFields(identities.getTypes(), *slots);
         llvm::append_range(combinedArgs, splitFields(identities.getTypes(), *part));
-        auto updated = helper(op->getRegion(1).front(), combinedArgs);
+        auto updated = helper(schema.getCombine().front(), combinedArgs);
         if (failed(updated) || updated->size() != slots->size()) return failure();
         for (auto [value, slot] : llvm::zip(*updated, *next)) if (failed(copyTo(value, slot, loc))) return failure();
         for (auto [value, slot] : llvm::zip(*next, *slots)) if (failed(copyTo(value, slot, loc))) return failure();
@@ -2664,10 +2668,10 @@ private:
     if (!scan) { bindSlots(op->getResults(), *slots, loc); return success(); }
     auto applied = splitFields(identities.getTypes(), *slots);
     llvm::append_range(applied, splitFields(states.getTypes(), initialState));
-    auto finalState = helper(op->getRegion(2).front(), applied);
+    auto finalState = helper(schema.getApplyRegion()->front(), applied);
     if (failed(finalState)) return failure();
     auto grouped = splitFields(states.getTypes(), *finalState);
-    for (auto [result, fields] : llvm::zip(op->getResults().drop_front(outputCount), grouped)) bindProduct(result, fields);
+    for (auto [result, fields] : llvm::zip(schema.getFinalStates(), grouped)) bindProduct(result, fields);
     for (Operation *consumer : *consumers) streamedOperations.insert(consumer);
     return success();
   }
@@ -2973,11 +2977,12 @@ private:
       bindProduct(original, fields);
     }
   }
-  FailureOr<Value> lowerResults(Block &block, ValueRange slots, bool condition = false) {
+  FailureOr<Value> lowerResults(Block &block, ValueRange slots) {
     if (failed(lowerOperations(block))) return failure();
-    ValueRange yielded = block.getTerminator()->getOperands();
-    Value predicate = condition ? get(yielded.front()) : Value();
-    auto fields = flatten(condition ? yielded.drop_front() : yielded);
+    auto condition = dyn_cast<ConditionOp>(block.getTerminator());
+    Value predicate = condition ? get(condition.getCondition()) : Value();
+    auto fields = flatten(condition ? condition.getArgs()
+                                   : cast<YieldOp>(block.getTerminator()).getInputs());
     if (fields.size() != slots.size()) return block.getParentOp()->emitError("DSA control state schema mismatch"), failure();
     for (auto [field, slot] : llvm::zip(fields, slots))
       if (failed(copyTo(field, slot, block.getParentOp()->getLoc()))) return failure();
@@ -3007,7 +3012,8 @@ private:
       }
     } else {
       auto forLoop = dyn_cast<ForOp>(operation);
-      auto initial = flatten(forLoop ? operation->getOperands().drop_front() : operation->getOperands());
+      auto whileLoop = dyn_cast<WhileOp>(operation);
+      auto initial = flatten(forLoop ? forLoop.getInitArgs() : whileLoop.getInitArgs());
       if (initial.size() != slots->size()) return operation->emitError("DSA initial and result state schemas differ");
       auto next = makeSlots(operation->getResultTypes(), loc);
       if (failed(next)) return failure();
@@ -3018,12 +3024,12 @@ private:
         return success();
       };
       if (forLoop) {
-        if (!domains.count(forLoop.getInputs().front())) return operation->emitError("DSA ordered for requires a bound interval");
-        Domain domain = domains.lookup(forLoop.getInputs().front());
+        if (!domains.count(forLoop.getSource())) return operation->emitError("DSA ordered for requires a bound interval");
+        Domain domain = domains.lookup(forLoop.getSource());
         if (failed(loop(loc, domain.begin, domain.end, domain.step, [&](Value iv) {
           Block &body = forLoop.getBody().front();
-          values.map(body.getArgument(0), iv);
-          bindSlots(body.getArguments().drop_front(), *slots, loc);
+          values.map(forLoop.getInductionVars().front(), iv);
+          bindSlots(forLoop.getRegionIterArgs(), *slots, loc);
           if (failed(lowerResults(body, *next))) return failure();
           return advance();
         }))) return failure();
@@ -3033,9 +3039,9 @@ private:
         {
           OpBuilder::InsertionGuard guard(b);
           b.setInsertionPointToStart(&target.getBefore().front());
-          Block &before = operation->getRegion(0).front();
-          bindSlots(before.getArguments(), *slots, loc);
-          auto predicate = lowerResults(before, *next, true);
+          Block &before = whileLoop.getBefore().front();
+          bindSlots(whileLoop.getBeforeArguments(), *slots, loc);
+          auto predicate = lowerResults(before, *next);
           if (failed(predicate) || !*predicate || failed(advance())) return failure();
           b.create<scf::ConditionOp>(loc, *predicate, ValueRange{});
         }
@@ -3043,8 +3049,8 @@ private:
         {
           OpBuilder::InsertionGuard guard(b);
           b.setInsertionPointToStart(&target.getAfter().front());
-          Block &after = operation->getRegion(1).front();
-          bindSlots(after.getArguments(), *slots, loc);
+          Block &after = whileLoop.getAfter().front();
+          bindSlots(whileLoop.getAfterArguments(), *slots, loc);
           if (failed(lowerResults(after, *next)) || failed(advance())) return failure();
           b.create<scf::YieldOp>(loc);
         }
@@ -3058,10 +3064,8 @@ private:
     Location loc = reduce.getLoc();
     if (!activeCount || reduce.getAxes().size() != 1 || cast<IntegerAttr>(reduce.getAxes()[0]).getInt() != 0)
       return reduce.emitError("DSA product reduction requires a bound row axis");
-    ValueRange inputs = reduce.getInputs();
-    ValueRange sources = inputs.take_front(reduce.getSourceCount());
-    ValueRange identities = inputs.drop_front(reduce.getSourceCount()).take_front(reduce.getIdentityCount());
-    ValueRange captures = inputs.drop_front(reduce.getSourceCount() + reduce.getIdentityCount());
+    auto schema = cast<StructuredOpInterface>(reduce.getOperation());
+    ValueRange sources = schema.getSources(), identities = schema.getIdentities(), captures = schema.getCaptures();
     auto sourceFields = flatten(sources), initial = flatten(identities);
     auto slots = makeSlots(reduce->getResultTypes(), loc), next = makeSlots(reduce->getResultTypes(), loc);
     if (failed(slots) || failed(next)) return failure();
@@ -3075,16 +3079,16 @@ private:
     }
     if (failed(loop(loc, index(loc, 0), activeCount, index(loc, 1), [&](Value i) {
       Block &combine = reduce.getCombine().front();
-      bindSlots(combine.getArguments().take_front(identities.size()), *slots, loc);
+      bindSlots(schema.getCombineLhs(), *slots, loc);
       unsigned offset = 0;
-      for (Value argument : combine.getArguments().drop_front(identities.size()).take_front(sources.size())) {
+      for (Value argument : schema.getCombineRhs()) {
         SmallVector<Type> types; leaves(argument.getType(), types);
         SmallVector<Value> fields;
         for (unsigned field = 0; field < types.size(); ++field)
           fields.push_back(b.create<memref::LoadOp>(loc, sourceFields[offset++], ValueRange{index(loc, 0), i}));
         bindProduct(argument, fields);
       }
-      for (auto [capture, argument] : llvm::zip(captures, combine.getArguments().take_back(captures.size())))
+      for (auto [capture, argument] : llvm::zip(captures, schema.getCombineCaptures()))
         bindProduct(argument, flatten(ValueRange{capture}));
       if (failed(lowerResults(combine, *next))) return failure();
       for (auto [value, slot] : llvm::zip(*next, *slots)) if (failed(copyTo(value, slot, loc))) return failure();
@@ -3096,10 +3100,8 @@ private:
   LogicalResult scanRow(ScanOp scan) {
     Location loc = scan.getLoc();
     if (!activeCount || scan.getAxis() != 0) return scan.emitError("DSA scan requires a bound row axis");
-    ValueRange inputs = scan.getInputs();
-    ValueRange sources = inputs.take_front(scan.getSourceCount());
-    ValueRange identities = inputs.drop_front(scan.getSourceCount()).take_front(scan.getIdentityCount());
-    ValueRange captures = inputs.drop_front(scan.getSourceCount() + scan.getIdentityCount());
+    auto schema = cast<StructuredOpInterface>(scan.getOperation());
+    ValueRange sources = schema.getSources(), identities = schema.getIdentities(), captures = schema.getCaptures();
     auto sourceFields = flatten(sources), initial = flatten(identities);
     auto slots = makeSlots(identities.getTypes(), loc), next = makeSlots(identities.getTypes(), loc);
     if (failed(slots) || failed(next)) return failure();
@@ -3125,16 +3127,16 @@ private:
       if (!scan.getInclusive()) write(*slots);
       // Reverse scans traverse the reversed sequence while keeping the same
       // combine(accumulator, current) argument order.
-      bindSlots(combine.getArguments().take_front(identities.size()), *slots, loc);
+      bindSlots(schema.getCombineLhs(), *slots, loc);
       unsigned offset = 0;
-      for (Value argument : combine.getArguments().slice(identities.size(), sources.size())) {
+      for (Value argument : schema.getCombineRhs()) {
         SmallVector<Type> types; leaves(argument.getType(), types);
         SmallVector<Value> fields;
         for (unsigned field = 0; field < types.size(); ++field)
           fields.push_back(b.create<memref::LoadOp>(loc, sourceFields[offset++], ValueRange{index(loc, 0), i}));
         bindProduct(argument, fields);
       }
-      for (auto [capture, argument] : llvm::zip(captures, combine.getArguments().take_back(captures.size())))
+      for (auto [capture, argument] : llvm::zip(captures, schema.getCombineCaptures()))
         bindProduct(argument, flatten(ValueRange{capture}));
       if (failed(lowerResults(combine, *next))) return failure();
       for (auto [value, slot] : llvm::zip(*next, *slots)) if (failed(copyTo(value, slot, loc))) return failure();
@@ -3527,7 +3529,7 @@ private:
       values.map(unary.getResult(), output); return success();
     }
     if (auto reduce = dyn_cast<ReduceOp>(operation)) {
-      if (reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 || reduce.getCaptureCount() ||
+      if (reduce.getSources().size() != 1 || reduce.getIdentities().size() != 1 || reduce.getCaptures().size() ||
           reduce.getAxes().size() != 1 || cast<IntegerAttr>(reduce.getAxes()[0]).getInt() != 0 ||
           reduce->getNumResults() != 1 || !reduce->getResult(0).getType().isF32())
         return reduceProduct(reduce);
@@ -3540,7 +3542,7 @@ private:
       if (kind != BinaryOperator::Add && kind != BinaryOperator::Maximum && kind != BinaryOperator::Minimum &&
           kind != BinaryOperator::MaximumNum && kind != BinaryOperator::MinimumNum)
         return reduceProduct(reduce);
-      Value input = get(reduce.getInputs()[0]), identity = get(reduce.getInputs()[1]);
+      Value input = get(reduce.getSources().front()), identity = get(reduce.getIdentities().front());
       if (!input || !identity || !activeCount) return reduce.emitError("DSA reduction input is unavailable");
       Value output = allocate(loc, reduce->getResult(0).getType(), 1, 1);
       Value scratch = allocateLike(loc, input);

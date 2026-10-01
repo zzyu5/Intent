@@ -664,13 +664,14 @@ private:
     if (isa<ReduceOp, ScanOp>(operation)) {
       auto reduce = dyn_cast<ReduceOp>(operation);
       auto scan = dyn_cast<ScanOp>(operation);
-      unsigned count = reduce ? reduce.getSourceCount() : scan.getSourceCount();
+      ValueRange sourceValues = reduce ? reduce.getSources() : scan.getSources();
+      unsigned count = sourceValues.size();
       int64_t axis = reduce ? reduce.getAxis() : scan.getAxis();
-      std::string sources = count == 1 ? valueString(operation.getOperand(0)) : "(";
+      std::string sources = count == 1 ? valueString(sourceValues.front()) : "(";
       if (count != 1) {
         for (unsigned i = 0; i < count; ++i) {
           if (i) sources += ", ";
-          sources += valueString(operation.getOperand(i));
+          sources += valueString(sourceValues[i]);
         }
         sources += ")";
       }

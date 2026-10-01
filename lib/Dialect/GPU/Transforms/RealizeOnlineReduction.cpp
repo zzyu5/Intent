@@ -145,12 +145,12 @@ LogicalResult realizeOnlineSummary(OnlineSummaryPattern pattern,
 
   OpBuilder builder(pattern.record);
   Location location = pattern.record.getLoc();
-  Value validIdentity = pattern.validity.getInputs()[1];
+  Value validIdentity = pattern.validity.getIdentities().front();
   Value maximumIdentity = builder.create<SplatOp>(
       location, pattern.maximum.getResult(0).getType(),
       scalarValue(pattern.maximumOrEmpty.getFalseValue()));
-  Value maximumReductionIdentity = pattern.maximum.getInputs()[1];
-  Value massIdentity = pattern.mass.getInputs()[1];
+  Value maximumReductionIdentity = pattern.maximum.getIdentities().front();
+  Value massIdentity = pattern.mass.getIdentities().front();
   Value momentIdentity = pattern.moment.getAccumulator();
   SmallVector<Value> initials{validIdentity, maximumReductionIdentity,
                               massIdentity, momentIdentity};

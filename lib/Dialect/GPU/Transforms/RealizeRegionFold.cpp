@@ -755,7 +755,7 @@ Value physicalTailMembershipPredicate(RegionFoldOp fold, ValueRange identities,
   Value candidate;
   UniformValueAnalysis facts(describeUniformValue);
   UniformBindings tailValues;
-  for (auto [argument, plan] : llvm::zip(fold.getSummarize().front().getArguments().take_front(fold.getSourceCount()), plans))
+  for (auto [argument, plan] : llvm::zip(fold.getSummarize().front().getArguments().take_front(fold.getSources().size()), plans))
     if (plan.tailConstant) tailValues[argument] = plan.tailConstant;
   for (Operation &operation : fold.getSummarize().front().without_terminator()) {
     for (Value result : operation.getResults()) {
@@ -800,16 +800,15 @@ bool isMembershipReduction(Value value, Value membershipPredicate) {
     value = broadcast.getValue();
   auto reduce = value.getDefiningOp<ReduceOp>();
   auto result = dyn_cast<OpResult>(value);
-  if (!reduce || !result || reduce.getSourceCount() != 1 ||
-      reduce.getIdentityCount() != 1 || reduce.getCaptureCount() != 0 ||
+  if (!reduce || !result || reduce.getSources().size() != 1 ||
+      reduce.getIdentities().size() != 1 || reduce.getCaptures().size() != 0 ||
       reduce.getNumResults() != 1 || result.getResultNumber() != 0 ||
-      reduce.getInputs().size() != 2 ||
-      reduce.getInputs().front() != membershipPredicate ||
+      reduce.getSources().front() != membershipPredicate ||
       !llvm::hasSingleElement(reduce.getCombine()))
     return false;
   llvm::SmallPtrSet<Operation *, 16> visiting;
   std::optional<bool> identity =
-      booleanConstant(reduce.getInputs().back(), Value(), visiting);
+      booleanConstant(reduce.getIdentities().front(), Value(), visiting);
   auto yield = dyn_cast<YieldOp>(reduce.getCombine().front().getTerminator());
   if (!identity || *identity || !yield || yield.getValues().size() != 1 ||
       reduce.getCombine().front().getNumArguments() != 2)
@@ -1377,7 +1376,7 @@ bool scanTailIsIdentity(RegionScanOp scan, ArrayRef<SourcePlan> plans,
   UniformBindings bindings;
   for (auto [index, argument] : llvm::enumerate(
            scan.getSummarize().front().getArguments().take_front(
-               scan.getSourceCount()))) {
+               scan.getSources().size()))) {
     if (plans[index].tailConstant) bindings[argument] = plans[index].tailConstant;
   }
   UniformValueAnalysis facts(describeUniformValue);
@@ -1451,7 +1450,7 @@ LogicalResult collectScanOutputConsumers(RegionScanOp scan,
                                          std::string &reason) {
   llvm::SetVector<Operation *> closure;
   SmallVector<Operation *> worklist;
-  for (Value output : scan.getResults().take_front(scan.getOutputCount()))
+  for (Value output : scan.getEmittedResults())
     llvm::append_range(worklist, output.getUsers());
   while (!worklist.empty()) {
     Operation *operation = worklist.pop_back_val();
@@ -1677,28 +1676,29 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
     FailureOr<MakeRangeOp> range = queryExactLogicalRange(fact);
     return succeeded(range) ? *range : MakeRangeOp();
   };
-  unsigned sourceCount = fold.getSourceCount();
-  ValueRange captures = fold.getInputs().drop_front(
-      fold.getSourceCount() + fold.getIdentityCount());
+  auto structured = cast<StructuredOpInterface>(fold.getOperation());
+  ValueRange sourceArguments = structured.getSummarizeSources();
+  ValueRange captureArguments = structured.getSummarizeCaptures();
+  ValueRange captures = fold.getCaptures();
   auto boundRanges = [&](BlockArgument source,
                          BlockArgument capture)
       -> std::optional<std::pair<MakeRangeOp, MakeRangeOp>> {
-    if (!source || !capture || source.getArgNumber() >= sourceCount ||
-        capture.getArgNumber() < sourceCount ||
-        source.getArgNumber() >= plans.size())
+    auto sourcePosition = llvm::find(sourceArguments, source);
+    auto capturePosition = llvm::find(captureArguments, capture);
+    if (!source || !capture || sourcePosition == sourceArguments.end() ||
+        capturePosition == captureArguments.end())
       return std::nullopt;
-    unsigned captureIndex = capture.getArgNumber() - sourceCount;
-    if (captureIndex >= captures.size())
-      return std::nullopt;
-    Value sourceCoordinate =
-        stripHelperForwarding(plans[source.getArgNumber()].source);
+    unsigned sourceIndex = std::distance(sourceArguments.begin(), sourcePosition);
+    unsigned captureIndex = std::distance(captureArguments.begin(), capturePosition);
+    if (sourceIndex >= plans.size()) return std::nullopt;
+    Value sourceCoordinate = stripHelperForwarding(plans[sourceIndex].source);
     Value captureCoordinate = stripHelperForwarding(captures[captureIndex]);
     if (!sourceCoordinate.getDefiningOp<MakeRangeOp>() ||
         !captureCoordinate.getDefiningOp<MakeRangeOp>())
       return std::nullopt;
     MakeRangeOp captureRange = uniqueRange(captures[captureIndex]);
     MakeRangeOp comparedSource =
-        uniqueRange(plans[source.getArgNumber()].source);
+        uniqueRange(plans[sourceIndex].source);
     auto comparedType = comparedSource
                             ? dyn_cast<FragmentType>(
                                   comparedSource.getResult().getType())
@@ -1718,11 +1718,9 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
       return failure();
     Value scalar;
     if (auto argument = dyn_cast<BlockArgument>(helperScalar)) {
-      if (argument.getArgNumber() < sourceCount)
-        return failure();
-      unsigned captureIndex = argument.getArgNumber() - sourceCount;
-      if (captureIndex >= captures.size())
-        return failure();
+      auto position = llvm::find(captureArguments, argument);
+      if (position == captureArguments.end()) return failure();
+      unsigned captureIndex = std::distance(captureArguments.begin(), position);
       scalar = captures[captureIndex];
     } else if (auto constant =
                    helperScalar.getDefiningOp<arith::ConstantOp>()) {
@@ -1986,7 +1984,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   SmallVector<SourcePlan> plans;
   SmallVector<Value> sources;
   SmallVector<unsigned> sourceAxes;
-  for (Value source : fold.getInputs().take_front(fold.getSourceCount())) {
+  for (Value source : fold.getSources()) {
     FailureOr<SourcePlan> plan =
         analyzeSource(source, fold.getAxis(), physicalAnalysis);
     if (failed(plan))
@@ -2010,7 +2008,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   SmallVector<FragmentType> sliceTypes;
   for (BlockArgument argument :
        fold.getSummarize().front().getArguments().take_front(
-           fold.getSourceCount())) {
+           fold.getSources().size())) {
     auto fragment = dyn_cast<FragmentType>(argument.getType());
     if (!fragment)
       return fold.emitOpError(
@@ -2050,14 +2048,11 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
       BinaryOperator::Subtract);
   PhysicalExprAttr sliceExtent = parameterExtent(fold.getSegment());
   SmallVector<Value> identities(
-      fold.getInputs()
-          .slice(fold.getSourceCount(), fold.getIdentityCount())
+      fold.getIdentities()
           .begin(),
-      fold.getInputs()
-          .slice(fold.getSourceCount(), fold.getIdentityCount())
+      fold.getIdentities()
           .end());
-  ValueRange captures = fold.getInputs().drop_front(
-      fold.getSourceCount() + fold.getIdentityCount());
+  ValueRange captures = fold.getCaptures();
   FailureOr<PredicatePartition> partition = predicatePartition(
       builder, fold, plans, master, stop, identities, segment.getResult());
   bool specializePredicatePrefix =
@@ -2090,7 +2085,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
         identity &&
         isLiteralZeroProjection(
             identity.getFields()[online->summary.massField]) &&
-        isLiteralZeroProjection(online->summary.mass.getInputs()[1]);
+        isLiteralZeroProjection(online->summary.mass.getIdentities().front());
     encodeEmptyMaximum = massRepresentsValidity &&
         queryBinaryCombineKind(online->summary.maximum.getCombine()) ==
             BinaryOperator::MaximumNum &&
@@ -2566,7 +2561,7 @@ LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
   SmallVector<SourcePlan> plans;
   SmallVector<Value> sources;
   SmallVector<unsigned> sourceAxes;
-  for (Value source : scan.getInputs().take_front(scan.getSourceCount())) {
+  for (Value source : scan.getSources()) {
     FailureOr<SourcePlan> plan =
         analyzeSource(source, scan.getAxis(), physicalAnalysis);
     if (failed(plan))
@@ -2590,7 +2585,7 @@ LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
   SmallVector<FragmentType> sliceTypes;
   for (BlockArgument argument :
        scan.getSummarize().front().getArguments().take_front(
-           scan.getSourceCount())) {
+           scan.getSources().size())) {
     auto fragment = dyn_cast<FragmentType>(argument.getType());
     if (!fragment)
       return scan.emitOpError(
@@ -2614,8 +2609,7 @@ LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
           "region-scan source has inconsistent helper-local slice relations");
   }
   MakeRangeOp master = traversal.authority;
-  ValueRange identities = scan.getInputs().slice(scan.getSourceCount(),
-                                                 scan.getIdentityCount());
+  ValueRange identities = scan.getIdentities();
   if (!scanTailIsIdentity(scan, plans, identities))
     return scan.emitOpError(
         "region-scan summarizer does not prove that zero-filled physical tail members produce its transition identity");
@@ -2626,11 +2620,8 @@ LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
     return scan.emitOpError("region-scan physicalization failed: ")
            << failureReason;
 
-  unsigned stateOffset = scan.getSourceCount() + scan.getIdentityCount();
-  ValueRange initialStates =
-      scan.getInputs().slice(stateOffset, scan.getStateCount());
-  ValueRange captures = scan.getInputs().drop_front(stateOffset +
-                                                    scan.getStateCount());
+  ValueRange initialStates = scan.getInitialStates();
+  ValueRange captures = scan.getCaptures();
   OpBuilder builder(scan);
   Location location = scan.getLoc();
   Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
@@ -2683,7 +2674,7 @@ LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
           return;
         }
         for (auto [output, slice] : llvm::zip(
-                 scan.getResults().take_front(scan.getOutputCount()), *emitted))
+                 scan.getEmittedResults(), *emitted))
           sliceMapping.map(output, slice);
         if (failed(cloneScanOutputConsumers(
                 nested, nestedLocation, outputConsumers, sliceMapping,
@@ -2722,7 +2713,7 @@ LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
            << failureReason;
   }
   for (auto [oldResult, newResult] : llvm::zip(
-           scan.getResults().drop_front(scan.getOutputCount()), *finalStates))
+           scan.getFinalStates(), *finalStates))
     oldResult.replaceAllUsesWith(newResult);
   for (Operation *consumer : llvm::reverse(outputConsumers))
     consumer->erase();

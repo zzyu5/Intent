@@ -91,7 +91,7 @@ bool isBlockedReductionFreeAxis(func::FuncOp kernel, ParameterOp parameter) {
     // Every component contributes a live free-axis footprint. Its tuning
     // preference does not require the other components to share its schema.
     for (Value source :
-         reduce.getInputs().take_front(reduce.getSourceCount())) {
+         reduce.getSources()) {
       auto fragment = dyn_cast<FragmentType>(source.getType());
       if (!fragment)
         continue;
@@ -271,7 +271,7 @@ bool isMultiAxisReduction(func::FuncOp kernel, ParameterOp parameter) {
   kernel.walk([&](ReduceOp reduce) { reductions.push_back(reduce); });
   for (ReduceOp inner : reductions) {
     bool selectsAxis = llvm::any_of(
-        inner.getInputs().take_front(inner.getSourceCount()), [&](Value value) {
+        inner.getSources(), [&](Value value) {
           auto type = dyn_cast<FragmentType>(value.getType());
           return type && reducedAxesReferenceParameter(type, inner.getAxes(), name);
         });
@@ -284,7 +284,7 @@ bool isMultiAxisReduction(func::FuncOp kernel, ParameterOp parameter) {
         auto resultType = dyn_cast<FragmentType>(result.getType());
         if (!resultType)
           continue;
-        for (Value source : outer.getInputs().take_front(outer.getSourceCount())) {
+        for (Value source : outer.getSources()) {
           auto sourceType = dyn_cast<FragmentType>(source.getType());
           if (!sourceType)
             continue;
@@ -321,7 +321,7 @@ bool isStatefulReduction(func::FuncOp kernel, ParameterOp parameter) {
         !loop->hasAttr(reductionSourcesAttr) || loop.getNumResults() < 2)
       return;
     loop.getBody()->walk([&](ReduceOp reduce) {
-      found |= reduce.getSourceCount() > 1 &&
+      found |= reduce.getSources().size() > 1 &&
                reduce.getNumResults() == loop.getNumResults();
     });
   });
@@ -450,10 +450,10 @@ correlatedReductionContractionParameters(
   kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
 
   kernel.walk([&](ReduceOp reduce) {
-    if (reduce.getSourceCount() != 1 || reduce.getNumResults() != 1 ||
+    if (reduce.getSources().size() != 1 || reduce.getNumResults() != 1 ||
         reduce.getAxes().empty())
       return;
-    Value source = reduce.getInputs().front();
+    Value source = reduce.getSources().front();
     auto sourceType = dyn_cast<FragmentType>(source.getType());
     auto resultType = dyn_cast<FragmentType>(reduce.getResult(0).getType());
     if (!sourceType || !resultType)
@@ -1301,9 +1301,9 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningPro
     }, true);
   if (!hasContraction)
     kernel.walk([&](ReduceOp reduce) {
-      if (reduce.getSourceCount() != 1 || reduce.getAxes().size() != 1)
+      if (reduce.getSources().size() != 1 || reduce.getAxes().size() != 1)
         return;
-      auto source = dyn_cast<FragmentType>(reduce.getInputs().front().getType());
+      auto source = dyn_cast<FragmentType>(reduce.getSources().front().getType());
       if (!source)
         return;
       ParameterOp chunk;

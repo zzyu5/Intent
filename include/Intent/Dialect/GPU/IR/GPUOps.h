@@ -5,10 +5,12 @@
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/Intent/IR/IntentAttrs.h"
+#include "Intent/Interfaces/StructuredOpInterface.h"
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Interfaces/InferTypeOpInterface.h"
 
 #define GET_OP_CLASSES
 #include "Intent/Dialect/GPU/IR/GPUOps.h.inc"

@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseSet.h"
 
@@ -976,15 +977,6 @@ LogicalResult verifyHelperRegion(Operation *owner, Region &region,
     return failure();
   }
   WalkResult effects = region.walk([&](Operation *nested) {
-    for (Value operand : nested->getOperands())
-      if (!region.isAncestor(operand.getParentRegion())) {
-        nested->emitOpError(
-            "physical helper captures must use explicit region arguments")
-            << "; captured value=" << operand
-            << "; defining region owner="
-            << operand.getParentRegion()->getParentOp()->getName();
-        return WalkResult::interrupt();
-      }
     if (isa<YieldOp>(nested))
       return WalkResult::advance();
     if (!isMemoryEffectFree(nested)) {
@@ -1059,26 +1051,15 @@ bool preservesSliceAssembly(Type slice, Type result) {
       });
 }
 
-LogicalResult verifyReduceLike(Operation *owner, ValueRange inputs,
-                               ResultRange results, Region &combine,
-                               uint64_t sourceCount, uint64_t identityCount,
-                               uint64_t captureCount) {
-  if (sourceCount == 0 || sourceCount != identityCount ||
-      inputs.size() != sourceCount + identityCount + captureCount ||
-      results.size() != identityCount)
-    return owner->emitOpError("physical reduce/scan component partition is invalid");
+LogicalResult verifyReduceLike(StructuredOpInterface operation) {
   SmallVector<Type> accumulators;
-  for (unsigned index = 0; index < identityCount; ++index) {
-    Type identity = inputs[sourceCount + index].getType();
-    if (identity != results[index].getType())
-      return owner->emitOpError("physical identity/result type disagrees");
-    accumulators.push_back(identity);
+  for (auto [identity, result] : llvm::zip_equal(operation.getIdentities(), operation->getResults())) {
+    if (identity.getType() != result.getType())
+      return operation->emitOpError("physical identity/result type disagrees");
+    accumulators.push_back(identity.getType());
   }
-  SmallVector<Type> arguments(accumulators);
-  arguments.append(accumulators);
-  for (Value capture : inputs.drop_front(sourceCount + identityCount))
-    arguments.push_back(capture.getType());
-  return verifyHelperRegion(owner, combine, arguments, accumulators);
+  return verifyHelperRegion(operation, operation.getCombine(),
+                            operation.getCombineArgumentTypes(), accumulators);
 }
 
 bool typeCarriesAxis(Type type, int64_t axis) {
@@ -1096,59 +1077,73 @@ LogicalResult verifyReductionResultRelations(Operation *owner,
                                               ResultRange results,
                                               ArrayRef<int64_t> axes) {
   if (sources.size() != results.size())
-    return owner->emitOpError(
-        "physical reduction needs one result relation per source component");
-  llvm::SmallDenseSet<int64_t> reducedAxes(axes.begin(), axes.end());
+    return owner->emitOpError("physical reduction needs one result relation per source component");
   for (auto [source, result] : llvm::zip_equal(sources, results)) {
-    auto sourceType = dyn_cast<FragmentType>(source.getType());
-    if (!sourceType)
-      return owner->emitOpError(
-                 "physical reduction source has no fragment result relation")
-             << "; source=" << source.getType();
-    SmallVector<Attribute> shape;
-    SmallVector<Attribute> mappings;
-    for (auto [axis, extent] : llvm::enumerate(sourceType.getShape())) {
-      if (reducedAxes.contains(static_cast<int64_t>(axis)))
-        continue;
-      shape.push_back(extent);
-      auto mapping = cast<AxisMapAttr>(sourceType.getAxisMaps()[axis]);
-      mappings.push_back(AxisMapAttr::get(
-          owner->getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-          mapping.getDimensionId(), static_cast<uint32_t>(mappings.size()),
-          mapping.getDerived()));
-    }
-    auto resultType = dyn_cast<FragmentType>(result.getType());
-    if (shape.empty()) {
-      if (resultType)
-        return owner->emitOpError(
-            "fully reduced result must be a scalar physical value");
-      continue;
-    }
-    if (!resultType || resultType.getShape() !=
-                           ArrayAttr::get(owner->getContext(), shape) ||
-        resultType.getAxisMaps() !=
-            ArrayAttr::get(owner->getContext(), mappings) ||
-        resultType.getValidity() != sourceType.getValidity() ||
-        resultType.getOwner() != sourceType.getOwner())
-      return owner->emitOpError(
-                 "physical reduction result does not preserve source free axes")
-             << "; source=" << sourceType << "; result=" << result.getType();
+    auto expected = inferCollectiveResultType(source.getType(), axes,
+                                               elementType(result.getType()));
+    if (failed(expected) || result.getType() != *expected)
+      return owner->emitOpError("physical reduction result does not preserve source free axes")
+             << "; source=" << source.getType() << "; result=" << result.getType();
   }
   return success();
 }
 
 } // namespace
 
-LogicalResult verifyScalarCollective(Operation *owner, ValueRange inputs,
-                                     ResultRange results, Region &combine,
-                                     unsigned count, int64_t axis, bool scan) {
-  if (!count || inputs.size() != 2 * count || results.size() != count ||
+FailureOr<Type> inferCollectiveResultType(Type source, ArrayRef<int64_t> reducedAxes,
+                                         Type resultElement) {
+  auto fragment = dyn_cast<FragmentType>(source);
+  if (!fragment) return failure();
+  llvm::SmallDenseSet<int64_t> reduced;
+  for (int64_t axis : reducedAxes)
+    if (axis < 0 || axis >= static_cast<int64_t>(fragment.getShape().size()) ||
+        !reduced.insert(axis).second)
+      return failure();
+  SmallVector<Attribute> shape, mappings;
+  for (auto [axis, extent] : llvm::enumerate(fragment.getShape())) {
+    if (reduced.contains(axis)) continue;
+    shape.push_back(extent);
+    auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+    mappings.push_back(AxisMapAttr::get(source.getContext(), mapping.getSourceId(),
+        mapping.getSourceAxis(), mapping.getDimensionId(), mappings.size(),
+        mapping.getDerived()));
+  }
+  if (shape.empty()) return resultElement;
+  return Type(FragmentType::get(source.getContext(), resultElement,
+      ArrayAttr::get(source.getContext(), shape), ArrayAttr::get(source.getContext(), mappings),
+      fragment.getValidity(), fragment.getOwner()));
+}
+
+LogicalResult inferScalarCollectiveResultTypes(std::optional<Location> location,
+    ValueRange sources, int64_t axis, bool scan, SmallVectorImpl<Type> &results) {
+  if (sources.empty()) return emitOptionalError(location, "native collective requires a source");
+  auto first = dyn_cast<FragmentType>(sources.front().getType());
+  if (!first || axis < 0 || axis >= static_cast<int64_t>(first.getShape().size()))
+    return emitOptionalError(location, "collective axis is outside its source fragment");
+  SmallVector<int64_t, 1> axes;
+  if (!scan) axes.push_back(axis);
+  for (Value value : sources) {
+    auto source = dyn_cast<FragmentType>(value.getType());
+    if (!source || source.getShape() != first.getShape())
+      return emitOptionalError(location, "native collective requires equal source fragment shapes");
+    auto expected = inferCollectiveResultType(source, axes, source.getElementType());
+    if (failed(expected)) return failure();
+    results.push_back(*expected);
+  }
+  return success();
+}
+
+LogicalResult verifyScalarCollective(Operation *owner, ValueRange sources,
+                                     ValueRange identities, ResultRange results,
+                                     Region &combine, int64_t axis, bool scan) {
+  unsigned count = sources.size();
+  if (!count || identities.size() != count || results.size() != count ||
       !llvm::hasSingleElement(combine))
     return owner->emitOpError(
         "requires paired sources/identities and one scalar combine block");
-  auto first = dyn_cast<FragmentType>(inputs.front().getType());
-  if (!first || axis < 0 || axis >= static_cast<int64_t>(first.getShape().size()))
-    return owner->emitOpError("collective axis is outside its source fragment");
+  SmallVector<Type> expected;
+  if (failed(inferScalarCollectiveResultTypes(owner->getLoc(), sources, axis, scan, expected)))
+    return failure();
   Block &block = combine.front();
   if (block.empty())
     return owner->emitOpError("scalar combine block must yield its results");
@@ -1157,9 +1152,8 @@ LogicalResult verifyScalarCollective(Operation *owner, ValueRange inputs,
       yield.getValues().size() != count)
     return owner->emitOpError("scalar combine arity disagrees with sources");
   for (unsigned i = 0; i < count; ++i) {
-    auto source = dyn_cast<FragmentType>(inputs[i].getType());
-    if (!source || source.getShape() != first.getShape() ||
-        inputs[count + i].getType() != results[i].getType())
+    auto source = dyn_cast<FragmentType>(sources[i].getType());
+    if (identities[i].getType() != results[i].getType())
       return owner->emitOpError(
           "native collective requires equal source shapes and exact identity/result types");
     Type element = source.getElementType();
@@ -1168,24 +1162,7 @@ LogicalResult verifyScalarCollective(Operation *owner, ValueRange inputs,
         yield.getValues()[i].getType() != element)
       return owner->emitOpError(
           "callback arguments and yields must be source element types");
-    SmallVector<Attribute> shape, mappings;
-    for (auto [position, extent] : llvm::enumerate(source.getShape())) {
-      if (!scan && position == static_cast<unsigned>(axis))
-        continue;
-      shape.push_back(extent);
-      auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[position]);
-      mappings.push_back(AxisMapAttr::get(
-          owner->getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-          mapping.getDimensionId(), mappings.size(), mapping.getDerived()));
-    }
-    Type expected = shape.empty()
-                       ? element
-                       : Type(FragmentType::get(
-                             owner->getContext(), element,
-                             ArrayAttr::get(owner->getContext(), shape),
-                             ArrayAttr::get(owner->getContext(), mappings),
-                             source.getValidity(), source.getOwner()));
-    if (results[i].getType() != expected)
+    if (results[i].getType() != expected[i])
       return owner->emitOpError(
           "collective result must preserve its source free-axis relation");
   }
@@ -1193,10 +1170,6 @@ LogicalResult verifyScalarCollective(Operation *owner, ValueRange inputs,
     if (operation.getNumRegions())
       return owner->emitOpError(
           "native callback must be a closed elementwise block");
-    for (Value operand : operation.getOperands())
-      if (operand.getParentBlock() != &block)
-        return owner->emitOpError(
-            "native callback cannot capture enclosing values");
     for (Value result : operation.getResults())
       if (isa<FragmentType>(result.getType()))
         return owner->emitOpError(
@@ -1205,169 +1178,108 @@ LogicalResult verifyScalarCollective(Operation *owner, ValueRange inputs,
   return success();
 }
 
+LogicalResult ReduceOp::inferReturnTypes(MLIRContext *context,
+    std::optional<Location> location, ValueRange operands, DictionaryAttr attributes,
+    OpaqueProperties properties, RegionRange regions, SmallVectorImpl<Type> &results) {
+  Adaptor adaptor(operands, attributes, properties, regions);
+  if (adaptor.getSources().empty() || adaptor.getSources().size() != adaptor.getIdentities().size())
+    return failure();
+  for (auto [source, identity] : llvm::zip_equal(adaptor.getSources(), adaptor.getIdentities())) {
+    auto type = inferCollectiveResultType(source.getType(), adaptor.getAxes(), elementType(identity.getType()));
+    if (failed(type)) return failure();
+    results.push_back(*type);
+  }
+  return success();
+}
+
+LogicalResult ScanOp::inferReturnTypes(MLIRContext *context,
+    std::optional<Location> location, ValueRange operands, DictionaryAttr attributes,
+    OpaqueProperties properties, RegionRange regions, SmallVectorImpl<Type> &results) {
+  Adaptor adaptor(operands, attributes, properties, regions);
+  if (adaptor.getSources().empty() || adaptor.getSources().size() != adaptor.getIdentities().size())
+    return failure();
+  llvm::append_range(results, adaptor.getSources().getTypes());
+  return success();
+}
+
 LogicalResult ReduceOp::verify() {
-  if (getAxes().empty())
-    return emitOpError("physical reduce requires at least one axis");
+  auto structured = cast<StructuredOpInterface>(getOperation());
+  if (failed(verifyStructuredArity(structured))) return failure();
+  if (getAxes().empty()) return emitOpError("physical reduce requires at least one axis");
   llvm::DenseSet<int64_t> axes;
   for (int64_t axis : getAxes()) {
-    if (!axes.insert(axis).second)
-      return emitOpError("physical reduce axes must be unique");
-    for (Value source : getInputs().take_front(getSourceCount()))
+    if (!axes.insert(axis).second) return emitOpError("physical reduce axes must be unique");
+    for (Value source : getSources())
       if (!typeCarriesAxis(source.getType(), axis))
         return emitOpError("physical reduce axis is outside a source schema");
   }
-  if (failed(verifyReductionResultRelations(
-          getOperation(), getInputs().take_front(getSourceCount()),
-          getResults(), getAxes())))
+  if (failed(verifyReductionResultRelations(getOperation(), getSources(), getResults(), getAxes())))
     return failure();
-  return verifyReduceLike(getOperation(), getInputs(), getResults(), getCombine(),
-                          getSourceCount(), getIdentityCount(), getCaptureCount());
+  return verifyReduceLike(structured);
 }
 
 LogicalResult ScanOp::verify() {
-  if (getSourceCount() > getInputs().size() ||
-      getSourceCount() != getNumResults())
-    return emitOpError("physical scan requires one result per source component");
-  for (auto [source, result] :
-       llvm::zip(getInputs().take_front(getSourceCount()), getResults()))
+  auto structured = cast<StructuredOpInterface>(getOperation());
+  if (failed(verifyStructuredArity(structured))) return failure();
+  for (auto [source, result] : llvm::zip_equal(getSources(), getResults())) {
     if (source.getType() != result.getType())
       return emitOpError("physical scan result must preserve its source type");
-  for (Value source : getInputs().take_front(getSourceCount()))
     if (!typeCarriesAxis(source.getType(), getAxis()))
       return emitOpError("physical scan axis is outside a source schema");
-  return verifyReduceLike(getOperation(), getInputs(), getResults(), getCombine(),
-                          getSourceCount(), getIdentityCount(), getCaptureCount());
+  }
+  return verifyReduceLike(structured);
 }
 
 LogicalResult RegionFoldOp::verify() {
-  uint64_t sourceCount = getSourceCount();
-  uint64_t identityCount = getIdentityCount();
-  uint64_t captureCount = getCaptureCount();
-  if (sourceCount == 0 || identityCount == 0 ||
-      getInputs().size() != sourceCount + identityCount + captureCount ||
-      getResults().size() != identityCount || !getSegment())
-    return emitOpError("physical region-fold component partition is invalid");
+  auto structured = cast<StructuredOpInterface>(getOperation());
+  if (failed(verifyStructuredArity(structured))) return failure();
   SmallVector<Type> summaries;
-  for (unsigned index = 0; index < identityCount; ++index) {
-    Type identity = getInputs()[sourceCount + index].getType();
-    if (identity != getResults()[index].getType())
+  for (auto [identity, result] : llvm::zip_equal(getIdentities(), getResults())) {
+    if (identity.getType() != result.getType())
       return emitOpError("region-fold identity/result type disagrees: identity=")
-             << identity << ", result=" << getResults()[index].getType();
-    summaries.push_back(identity);
+             << identity.getType() << ", result=" << result.getType();
+    summaries.push_back(identity.getType());
   }
-  if (!llvm::hasSingleElement(getSummarize()) ||
-      getSummarize().front().getNumArguments() != sourceCount + captureCount)
-    return emitOpError("region-fold summarizer argument partition is invalid");
-  SmallVector<Type> summarizeArguments;
-  for (unsigned index = 0; index < sourceCount; ++index) {
-    Type slice = getSummarize().front().getArgument(index).getType();
-    if (failed(verifySegmentSlice(getOperation(), getInputs()[index].getType(),
-                                  slice, getAxis(), getSegment())))
+  SmallVector<Type> slices;
+  for (auto [source, slice] : llvm::zip_equal(getSources(), structured.getSummarizeSources())) {
+    if (failed(verifySegmentSlice(getOperation(), source.getType(), slice.getType(), getAxis(), getSegment())))
       return failure();
-    summarizeArguments.push_back(slice);
+    slices.push_back(slice.getType());
   }
-  for (Value capture : getInputs().drop_front(sourceCount + identityCount))
-    summarizeArguments.push_back(capture.getType());
-  auto summarizeYield = dyn_cast<YieldOp>(getSummarize().front().back());
-  if (!summarizeYield ||
-      !llvm::equal(summarizeYield.getOperandTypes(), summaries))
-    return emitOpError(
-        "region-fold summarizer yield disagrees with its summary schema");
-  if (failed(verifyHelperRegion(getOperation(), getSummarize(), summarizeArguments,
-                                summaries)))
-    return failure();
-  SmallVector<Type> combineArguments(summaries);
-  combineArguments.append(summaries);
-  auto combineYield = dyn_cast<YieldOp>(getCombine().front().back());
-  if (!combineYield || !llvm::equal(combineYield.getOperandTypes(), summaries)) {
-    InFlightDiagnostic diagnostic = emitOpError(
-        "region-fold combine yield disagrees with its summary schema");
-    diagnostic << "; expected=[";
-    for (Type type : summaries)
-      diagnostic << type << ", ";
-    diagnostic << "]";
-    if (combineYield) {
-      diagnostic << "; actual=[";
-      for (Type type : combineYield.getOperandTypes())
-        diagnostic << type << ", ";
-      diagnostic << "]";
-    }
-    return failure();
-  }
-  return verifyHelperRegion(getOperation(), getCombine(), combineArguments,
-                            summaries);
+  if (failed(verifyHelperRegion(getOperation(), getSummarize(),
+                                structured.getSummarizeArgumentTypes(slices), summaries))) return failure();
+  return verifyHelperRegion(getOperation(), getCombine(),
+                            structured.getCombineArgumentTypes(), summaries);
 }
 
 LogicalResult RegionScanOp::verify() {
-  uint64_t sourceCount = getSourceCount();
-  uint64_t identityCount = getIdentityCount();
-  uint64_t stateCount = getStateCount();
-  uint64_t captureCount = getCaptureCount();
-  uint64_t outputCount = getOutputCount();
-  if (sourceCount == 0 || identityCount == 0 || stateCount == 0 ||
-      outputCount == 0 ||
-      getInputs().size() != sourceCount + identityCount + stateCount + captureCount ||
-      getResults().size() != outputCount + stateCount || !getSegment())
-    return emitOpError("physical region-scan component partition is invalid");
-  if (!llvm::hasSingleElement(getSummarize()) ||
-      getSummarize().front().getNumArguments() != sourceCount + captureCount)
-    return emitOpError("region-scan summarizer argument partition is invalid");
-  SmallVector<Type> slices;
-  for (unsigned index = 0; index < sourceCount; ++index) {
-    Type slice = getSummarize().front().getArgument(index).getType();
-    if (failed(verifySegmentSlice(getOperation(), getInputs()[index].getType(),
-                                  slice, getAxis(), getSegment())))
+  auto structured = cast<StructuredOpInterface>(getOperation());
+  if (failed(verifyStructuredArity(structured))) return failure();
+  SmallVector<Type> slices, transitions, states;
+  for (auto [source, slice] : llvm::zip_equal(getSources(), structured.getSummarizeSources())) {
+    if (failed(verifySegmentSlice(getOperation(), source.getType(), slice.getType(), getAxis(), getSegment())))
       return failure();
-    slices.push_back(slice);
+    slices.push_back(slice.getType());
   }
-  SmallVector<Type> transitions;
-  for (unsigned index = 0; index < identityCount; ++index)
-    transitions.push_back(getInputs()[sourceCount + index].getType());
-  SmallVector<Type> states;
-  unsigned stateOffset = sourceCount + identityCount;
-  for (unsigned index = 0; index < stateCount; ++index) {
-    Type state = getInputs()[stateOffset + index].getType();
-    if (state != getResults()[outputCount + index].getType())
+  for (Value identity : getIdentities()) transitions.push_back(identity.getType());
+  for (auto [initial, result] : llvm::zip_equal(getInitialStates(), getFinalStates())) {
+    if (initial.getType() != result.getType())
       return emitOpError("region-scan final-state type disagrees: input=")
-             << state << ", result="
-             << getResults()[outputCount + index].getType();
-    states.push_back(state);
+             << initial.getType() << ", result=" << result.getType();
+    states.push_back(initial.getType());
   }
-  SmallVector<Type> captures;
-  unsigned captureOffset = stateOffset + stateCount;
-  for (Value capture : getInputs().drop_front(captureOffset))
-    captures.push_back(capture.getType());
-  SmallVector<Type> summarizeArguments(slices);
-  summarizeArguments.append(captures);
   if (failed(verifyHelperRegion(getOperation(), getSummarize(),
-                                summarizeArguments, transitions)))
-    return failure();
-  SmallVector<Type> combineArguments(transitions);
-  combineArguments.append(transitions);
-  if (failed(verifyHelperRegion(getOperation(), getCombine(), combineArguments,
-                                transitions)))
-    return failure();
-  SmallVector<Type> applyArguments(transitions);
-  applyArguments.append(states);
-  if (failed(verifyHelperRegion(getOperation(), getApply(), applyArguments,
-                                states)))
-    return failure();
-  SmallVector<Type> emitArguments(slices);
-  emitArguments.append(states);
-  emitArguments.append(captures);
-  if (!llvm::hasSingleElement(getEmit()) || getEmit().front().empty())
-    return emitOpError("region-scan emitter is empty");
-  auto yield = dyn_cast<YieldOp>(getEmit().front().back());
-  if (!yield || yield.getValues().size() != outputCount)
-    return emitOpError("region-scan emitter output count disagrees");
-  SmallVector<Type> emitted(yield.getOperandTypes());
-  if (failed(verifyHelperRegion(getOperation(), getEmit(), emitArguments,
-                                emitted)))
-    return failure();
-  for (auto [slice, result] : llvm::zip(emitted, getResults().take_front(outputCount))) {
+                                structured.getSummarizeArgumentTypes(slices), transitions))) return failure();
+  if (failed(verifyHelperRegion(getOperation(), getCombine(),
+                                structured.getCombineArgumentTypes(), transitions))) return failure();
+  if (failed(verifyHelperRegion(getOperation(), getApply(),
+                                structured.getApplyArgumentTypes(), states))) return failure();
+  SmallVector<Type> emitted(structured.getEmitYields().getTypes());
+  if (failed(verifyHelperRegion(getOperation(), getEmit(),
+                                structured.getEmitArgumentTypes(slices), emitted))) return failure();
+  for (auto [slice, result] : llvm::zip_equal(emitted, getEmittedResults()))
     if (!preservesSliceAssembly(slice, result.getType()))
       return emitOpError("region-scan output assembly relation is invalid");
-  }
   return success();
 }
 

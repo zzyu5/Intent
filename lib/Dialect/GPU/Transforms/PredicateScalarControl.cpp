@@ -234,8 +234,8 @@ Value anyActiveLane(OpBuilder &builder, Location location, Value predicate) {
   for (unsigned axis = 0; axis < shape.getShape().size(); ++axis)
     axes.push_back(axis);
   auto any = builder.create<ReduceOp>(
-      location, TypeRange{builder.getI1Type()}, ValueRange{predicate, identity},
-      axes, 1, 1, 0);
+      location, ValueRange{predicate},
+      ValueRange{identity}, ValueRange{}, axes);
   OpBuilder::InsertionGuard guard(builder);
   Block *combine = builder.createBlock(
       &any.getCombine(), {}, {builder.getI1Type(), builder.getI1Type()},
@@ -498,17 +498,24 @@ void clonePredicatedScalarOperation(OpBuilder &builder, Operation *operation,
     return;
   } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
     // New independent iteration axes are free axes of the original reduction.
-    SmallVector<Value> inputs;
-    SmallVector<Type> types;
-    for (Value value : reduce.getInputs())
-      inputs.push_back(lift(mapped(value)));
-    for (Type type : reduce.getResultTypes())
-      types.push_back(resultType(type));
+    auto liftGroup = [&](ValueRange values) {
+      SmallVector<Value> lifted;
+      for (Value value : values) lifted.push_back(lift(mapped(value)));
+      return lifted;
+    };
+    auto sources = liftGroup(reduce.getSources());
+    auto identities = liftGroup(reduce.getIdentities());
+    auto captures = liftGroup(reduce.getCaptures());
     SmallVector<int64_t> axes(reduce.getAxes());
     for (int64_t &axis : axes)
       axis += shape ? shape.getShape().size() : 0;
-    auto result = builder.create<ReduceOp>(location, types, inputs, axes,
-        reduce.getSourceCount(), reduce.getIdentityCount(), reduce.getCaptureCount());
+    // The recursive clone lifts the declared result and helper schemas together;
+    // source relations close after the complete predicated graph is built.
+    SmallVector<Type> types;
+    for (Type type : reduce.getResultTypes())
+      types.push_back(resultType(type));
+    auto result = builder.create<ReduceOp>(location, types, sources, identities,
+                                           captures, axes);
     for (NamedAttribute attribute : reduce->getDiscardableAttrs())
       result->setAttr(attribute.getName(), attribute.getValue());
     {

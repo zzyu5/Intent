@@ -510,7 +510,7 @@ static void transposeClonedLoop(scf::ForOp loop) {
       contract.setRhsReductionAxesAttr(
           DenseI64ArrayAttr::get(loop.getContext(), rhsAxes));
     } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
-      auto source = dyn_cast<FragmentType>(reduce.getInputs().front().getType());
+      auto source = dyn_cast<FragmentType>(reduce.getSources().front().getType());
       if (source && source.getShape().size() == 2)
         reduce.setAxesAttr(DenseI64ArrayAttr::get(
             loop.getContext(), remapAxes(reduce.getAxes(), {1, 0})));

@@ -386,8 +386,8 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
             location, target, *projected, reshape.getReassociation());
     }
   } else if (auto reduce = value.getDefiningOp<ReduceOp>();
-             reduce && reduce.getSourceCount() == 1 &&
-             reduce.getIdentityCount() == 1 && reduce.getCaptureCount() == 0 &&
+             reduce && reduce.getSources().size() == 1 &&
+             reduce.getIdentities().size() == 1 && reduce.getCaptures().size() == 0 &&
              reduce.getNumResults() == 1 &&
              source.getOwner() == target.getOwner() &&
              queryBinaryCombineKind(reduce.getCombine())) {
@@ -402,7 +402,7 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
               return item.value() && *item.value() == item.index();
             });
     if (projects) {
-      auto input = cast<FragmentType>(reduce.getInputs().front().getType());
+      auto input = cast<FragmentType>(reduce.getSources().front().getType());
       llvm::SmallDenseSet<int64_t> axes(reduce.getAxes().begin(),
                                        reduce.getAxes().end());
       SmallVector<Attribute> shape(input.getShape().getValue());
@@ -417,13 +417,13 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
           target.getContext(), target.getElementType(), target.getShape(),
           source.getAxisMaps(), target.getValidity(), target.getOwner());
       auto projectedSource = projectFragmentValue(
-          builder, location, reduce.getInputs().front(), inputTarget, changed);
+          builder, location, reduce.getSources().front(), inputTarget, changed);
       auto projectedIdentity = projectFragmentValue(
-          builder, location, reduce.getInputs()[1], resultTarget, changed);
+          builder, location, reduce.getIdentities().front(), resultTarget, changed);
       if (succeeded(projectedSource) && succeeded(projectedIdentity)) {
         IRMapping mapping;
-        mapping.map(reduce.getInputs().front(), *projectedSource);
-        mapping.map(reduce.getInputs()[1], *projectedIdentity);
+        mapping.map(reduce.getSources().front(), *projectedSource);
+        mapping.map(reduce.getIdentities().front(), *projectedIdentity);
         auto clone = cast<ReduceOp>(builder.clone(*reduce, mapping));
         for (BlockArgument argument : clone.getCombine().front().getArguments())
           for (unsigned axis = 0; axis < target.getShape().size(); ++axis)
@@ -876,7 +876,7 @@ FailureOr<Value> materializeReplayedValue(
                     hasMultipleReplayAxes(fragment))) {
         auto reduction = dyn_cast<ReduceOp>(producer);
         bool reductionSource = reduction && llvm::is_contained(
-            reduction.getInputs().take_front(reduction.getSourceCount()), operand);
+            reduction.getSources(), operand);
         if (isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp,
                 BroadcastOp, SplatOp>(producer) ||
             (reduction && !reductionSource)) {

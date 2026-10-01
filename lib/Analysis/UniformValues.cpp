@@ -1,4 +1,5 @@
 #include "Intent/Analysis/UniformValues.h"
+#include "Intent/Interfaces/StructuredOpInterface.h"
 #include "Intent/Dialect/Intent/IR/IntentOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -332,19 +333,30 @@ UniformExpression describeCanonicalUniformValue(Value value) {
     case BinaryOperator::MinimumNum: result.kind = K::MinimumNum; break;
     default: break;
     }
-  } else if (auto reduce = dyn_cast<ReduceOp>(op)) {
-    if (reduce.getSourceCount() != reduce.getIdentityCount()) return result;
-    result.kind = K::Fold;
-    result.stateCount = reduce.getIdentityCount();
-    result.result = cast<OpResult>(value).getResultNumber();
-    auto inputs = reduce.getInputs();
-    result.operands.assign(inputs.begin() + result.stateCount, inputs.begin() + 2 * result.stateCount);
-    llvm::append_range(result.operands, inputs.take_front(result.stateCount));
-    llvm::append_range(result.operands, inputs.drop_front(2 * result.stateCount));
-    auto &body = reduce.getCombine().front();
-    result.parameters.assign(body.args_begin(), body.args_end());
-    result.yields.assign(body.getTerminator()->operand_begin(), body.getTerminator()->operand_end());
-  }
+  } else if (isa<ReduceOp>(op))
+    return describeStructuredReduction(cast<OpResult>(value), result.type);
+  return result;
+}
+
+UniformExpression describeStructuredReduction(OpResult value, Type elementType,
+                                              bool nonempty) {
+  UniformExpression result;
+  result.type = elementType;
+  auto operation = dyn_cast<StructuredOpInterface>(value.getOwner());
+  if (!operation || operation.getStructuredKind() != StructuredOpKind::Reduce ||
+      operation.getSources().size() != operation.getIdentities().size())
+    return result;
+  result.kind = UniformKind::Fold;
+  result.stateCount = operation.getIdentities().size();
+  result.result = value.getResultNumber();
+  result.nonempty = nonempty;
+  llvm::append_range(result.operands, operation.getIdentities());
+  llvm::append_range(result.operands, operation.getSources());
+  llvm::append_range(result.operands, operation.getCaptures());
+  llvm::append_range(result.parameters, operation.getCombineLhs());
+  llvm::append_range(result.parameters, operation.getCombineRhs());
+  llvm::append_range(result.parameters, operation.getCombineCaptures());
+  llvm::append_range(result.yields, operation.getCombineYields());
   return result;
 }
 

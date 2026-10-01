@@ -6,6 +6,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Interfaces/InferTypeOpInterface.h"
 
 namespace intent::triton {
 inline constexpr llvm::StringLiteral loopStagesAttr = "intent_triton.loop_stages";

@@ -6,6 +6,7 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SmallBitVector.h"
@@ -619,25 +620,64 @@ LogicalResult ScaledMMAOp::verify() {
   return success();
 }
 
+namespace {
+
+template <typename CollectiveOp>
+LogicalResult inferCollectiveTypes(MLIRContext *context,
+    std::optional<Location> location, ValueRange operands, DictionaryAttr attributes,
+    OpaqueProperties properties, RegionRange regions, bool scan,
+    SmallVectorImpl<Type> &results) {
+  typename CollectiveOp::Adaptor operation(operands, attributes, properties, regions);
+  if (failed(operation.verify(location.value_or(UnknownLoc::get(context)))))
+    return failure();
+  return gpu::inferScalarCollectiveResultTypes(
+      location, operation.getSources(), operation.getAxis(), scan, results);
+}
+
+LogicalResult verifyLiteralIdentities(Operation *owner, ValueRange identities) {
+  for (Value identity : identities)
+    if (!getCompileTimeScalar(identity)) {
+      InFlightDiagnostic diagnostic = owner->emitOpError(
+          "custom collective identity must be a compile-time scalar");
+      diagnostic << "; identity type=" << identity.getType();
+      if (Operation *producer = identity.getDefiningOp())
+        diagnostic << ", producer=" << producer->getName();
+      return failure();
+    }
+  return success();
+}
+
+} // namespace
+
+LogicalResult ReduceOp::inferReturnTypes(MLIRContext *context,
+    std::optional<Location> location, ValueRange operands, DictionaryAttr attributes,
+    OpaqueProperties properties, RegionRange regions, SmallVectorImpl<Type> &results) {
+  return inferCollectiveTypes<ReduceOp>(context, location, operands, attributes,
+                                      properties, regions, false, results);
+}
+
+LogicalResult ScanOp::inferReturnTypes(MLIRContext *context,
+    std::optional<Location> location, ValueRange operands, DictionaryAttr attributes,
+    OpaqueProperties properties, RegionRange regions, SmallVectorImpl<Type> &results) {
+  return inferCollectiveTypes<ScanOp>(context, location, operands, attributes,
+                                    properties, regions, true, results);
+}
+
 LogicalResult ReduceOp::verify() {
   if (getReverse())
     return emitOpError("native reduction does not reverse logical order");
   if (!getKind()) {
     if (failed(gpu::verifyScalarCollective(
-            getOperation(), getInputs(), getResults(), getCombine(),
-            getSourceCount(), getAxis(), false)))
+            getOperation(), getSources(), getIdentities(), getResults(),
+            getCombine(), getAxis(), false)))
       return failure();
-    for (Value identity : getInputs().slice(getSourceCount(), getSourceCount()))
-      if (!getCompileTimeScalar(identity))
-        return emitOpError(
-            "custom reduction identity must be a compile-time scalar");
-    return success();
+    return verifyLiteralIdentities(getOperation(), getIdentities());
   }
-  auto source = getInputs().size() == 1
-                    ? dyn_cast<gpu::FragmentType>(getInputs().front().getType())
+  auto source = getSources().size() == 1
+                    ? dyn_cast<gpu::FragmentType>(getSources().front().getType())
                     : gpu::FragmentType();
-  if (getSourceCount() != 1 || getNumResults() != 1 || !source ||
-      !getCombine().empty() ||
+  if (getSources().size() != 1 || getNumResults() != 1 || !source ||
+      !getIdentities().empty() || !getCombine().empty() ||
       static_cast<size_t>(getAxis()) >= source.getShape().size())
     return emitOpError("has an invalid cuTile native reduction axis/kind");
   switch (*getKind()) {
@@ -656,15 +696,17 @@ LogicalResult ReduceOp::verify() {
 }
 
 LogicalResult ScanOp::verify() {
-  if (!getKind())
-    return gpu::verifyScalarCollective(getOperation(), getInputs(), getResults(),
-                                      getCombine(), getSourceCount(), getAxis(),
-                                      true);
-  auto source = getInputs().size() == 1
-                    ? dyn_cast<gpu::FragmentType>(getInputs().front().getType())
+  if (!getKind()) {
+    if (failed(gpu::verifyScalarCollective(getOperation(), getSources(), getIdentities(),
+                                         getResults(), getCombine(), getAxis(), true)))
+      return failure();
+    return verifyLiteralIdentities(getOperation(), getIdentities());
+  }
+  auto source = getSources().size() == 1
+                    ? dyn_cast<gpu::FragmentType>(getSources().front().getType())
                     : gpu::FragmentType();
-  if (getSourceCount() != 1 || getNumResults() != 1 || !source ||
-      !getCombine().empty() ||
+  if (getSources().size() != 1 || getNumResults() != 1 || !source ||
+      !getIdentities().empty() || !getCombine().empty() ||
       static_cast<size_t>(getAxis()) >= source.getShape().size() ||
       *getKind() != BinaryOperator::Add)
     return emitOpError("cuTile native scan currently requires additive cumsum");

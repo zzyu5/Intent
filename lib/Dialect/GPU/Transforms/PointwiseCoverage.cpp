@@ -266,11 +266,11 @@ LogicalResult requireScanFullCoverage(func::FuncOp kernel, ScanOp scan,
     return range->hasAttr(sourceSubregionAttr);
   });
   if (subregion) {
-    if (scan.getSourceCount() != 1 || scan.getIdentityCount() != 1 ||
-        scan.getCaptureCount() != 0 ||
+    if (scan.getSources().size() != 1 || scan.getIdentities().size() != 1 ||
+        scan.getCaptures().size() != 0 ||
         queryBinaryCombineKind(scan.getCombine()) != BinaryOperator::Add ||
         !isZeroScanIdentity(
-            scan.getInputs()[scan.getSourceCount()]))
+            scan.getIdentities().front()))
       return scan.emitOpError(
           "dynamic subregion scan has no proven tail-neutral combine");
     auto chunkExtent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
@@ -734,7 +734,7 @@ LogicalResult addTailValidity(func::FuncOp kernel,
 LogicalResult PointwiseRewrite::prepareCoverage() {
   bool scanCoverageFailed = false;
   kernel.walk([&](ScanOp scan) {
-    for (Value source : scan.getInputs().take_front(scan.getSourceCount()))
+    for (Value source : scan.getSources())
       scanCoverageFailed |=
           failed(requireScanFullCoverage(kernel, scan, source, scan.getAxis()));
   });
@@ -746,7 +746,7 @@ LogicalResult PointwiseRewrite::prepareCoverage() {
     if (laneReductions.contains(reduce))
       return;
     for (Value source :
-         reduce.getInputs().take_front(reduce.getSourceCount())) {
+         reduce.getSources()) {
       auto fragment = dyn_cast<FragmentType>(source.getType());
       if (!fragment)
         continue;

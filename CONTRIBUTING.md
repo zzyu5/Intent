@@ -49,6 +49,11 @@ Python definition
 
 [serialization.py](python/intent/frontend/mlir/serialization.py) 在构造结束后一次遍历图，输出类型、属性、最终 source names 与 source locations。不要在这里匹配算法、选择目标或做 region 改写；也不要在 AST lowering 中先输出嵌套文本再重新解析来获得语义关系。
 
+Pure helper 的隔离边界在构造 region 时就存在：`RegionState.isolated_from_above`
+不移除结构 parent，但 `BlockState.visible_parent` 在该边界停止 SSA 可见性。
+Shape 查询与 builder operand 校验使用相同边界；helper 的动态维度从自己的参数取得，
+不能为了取得相同 dimension ID 而引用外层 kernel view。普通控制 region 保留合法祖先访问。
+
 Lowering 的共同构造能力有明确入口：
 
 | 需要的能力 | 模块 | 责任边界 |
@@ -85,6 +90,49 @@ Native `intent-normalize-kernel` 是 KIR 规范化的完整入口：输入结构
 DSA 的 [MatrixSupply.cpp](lib/Dialect/DSA/Transforms/MatrixSupply.cpp) 消费已有 LoadTile、MatMul、Store 和循环关系，形成协作或常驻供数；[CollectiveGather.cpp](lib/Dialect/DSA/Transforms/CollectiveGather.cpp) 从当前 offsets 写入、task 坐标、只读视图与 stride 关系证明相邻参与者可以共享 gather 供数。两个变换都消费完整的普通 DSA program，不通过 construction 候选侧表选择路径。[BANG C driver](lib/Target/BangC/Transforms/Legalize.cpp) 再依次完成原生计算、workspace、实现选择、局部组合、同步和最终存储绑定。当前 DSA 的矩阵与 group 合同、BANG C 实现仍以 MLU370 为已实现边界，目录分层不代表已经支持其他 DSA 设备。
 
 ## 共享分析与完整变换
+
+### 运算自身提供结构关系
+
+KIR 和共享 GPU 的 reduce、scan、region fold/scan 通过
+[StructuredOpInterface](include/Intent/Interfaces/StructuredOpInterface.h)
+提供 sources、identities、captures、initial states，以及各 helper 的参数和 yield。
+ODS 的命名 operand/result segments 是分组的唯一来源；创建或更换一组操作数时使用
+typed builder 与 `get…Mutable()`，不要另外存 count 属性、计算跨组偏移或修改分组长度副本。
+Region scan 的 emitted results 与 final states 也有独立的 result segments。
+
+构造 helper 时，用 `getCombineArgumentTypes` 等查询取得参数 schema。
+Source slice 的类型由当前 KIR 或 GPU lowering 决定，再传给
+`getSummarizeArgumentTypes` / `getEmitArgumentTypes`；接口不决定分段大小。
+已有 helper 的 formal 参数查询返回真实的 `BlockArgument` ranges，
+可以直接用于 `IRMapping`，不需要重新拼接参数顺序。
+
+`getValueRelations()` 描述当前 SSA 上的关系，不证明两值相等。
+Capture 是直接转发；SourceSlice 保留切片关系；Reduction、Prefix、Emission
+分别保留归约、前缀和输出拼接语义。Accumulator 允许该 IR 层规定的
+scalar/slice 到完整结果的提升，不能在 KIR 中误作类型完全相同。
+同一个 identity 或 capture 可以占多个 formal 位置，查询某一组件时保留它的位置，
+不能仅按 SSA value 反查组件。
+
+GPU 的 collective 结果推导在 [Program.h](include/Intent/Dialect/GPU/IR/Program.h)：
+shared/native 的 `InferTypeOpInterface`、verifier 和关系维护复用相同轴规则。
+保留的 source 轴决定结果 shape/coordinate，声明的 accumulator/result 决定元素类型。
+CPU 的 [RegionOpInterface](include/Intent/Dialect/CPU/IR/CPUOpInterfaces.h)
+独立表达目标缓冲区、只读输入及 helper 参数角色；分区分析、验证和展开共用这份 schema，
+不把这些缓冲区冒充 GPU 的 SSA fragment。
+
+KIR 普通控制在 [ControlFlow.cpp](lib/Dialect/Intent/IR/ControlFlow.cpp)
+实现标准 MLIR `RegionBranchOpInterface`：For 的 source coordinates 与 carries 分组，
+While 的 condition 与 forwarded arguments 分组，MLIR 检查 region 间类型传递。
+共同接口处理结构关系，各 family 继续选择自己的物理循环与存储。
+显式 capture 的 helper 使用 `IsolatedFromAbove`，不可从外层暗捕获 SSA 常量或 runtime 值。
+
+职责对照：Triton 的 `include/triton/Dialect/Triton/IR/TritonOps.td:761–818`
+在 reduce/scan 运算上声明 `InferTypeOpInterface` 与 region 验证；
+MLIR SCF 的 `SCFOps.td:136–148,953–958` 在循环上声明 region branch 接口。
+Intent 同样让运算提供自身结构，但保留显式 identity/capture、逻辑坐标与 region segmentation 合同；
+没有将这些语义交给 provider serializer 或框架名称推断。
+
+### 分析与改写的职责
 
 分析回答当前程序满足什么条件；变换根据这些条件改变程序。不要为了共享代码，让 analysis 创建新 operation、替换 uses，或者替某个 family 决定具体循环与存储结构。
 

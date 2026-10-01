@@ -642,7 +642,7 @@ bool reachesReduction(Value value, PhysicalSourceAxis source,
   for (Operation *user : value.getUsers()) {
     if (auto reduce = dyn_cast<ReduceOp>(user)) {
       for (Value input :
-           reduce.getInputs().take_front(reduce.getSourceCount())) {
+           reduce.getSources()) {
         if (input != value)
           continue;
         auto fragment = dyn_cast<FragmentType>(input.getType());
@@ -736,11 +736,11 @@ bool hasMaterializedReductionStoreFork(
 std::optional<unsigned> repeatedReductionOutputAxis(
     Value value, MakeRangeOp range) {
   auto reduce = value.getDefiningOp<ReduceOp>();
-  if (!reduce || reduce.getSourceCount() != 1 || reduce->getNumResults() != 1 ||
+  if (!reduce || reduce.getSources().size() != 1 || reduce->getNumResults() != 1 ||
       !isUnitStepRange(range))
     return std::nullopt;
   PhysicalSourceAxis source = sourceAxisIdentity(range);
-  auto input = dyn_cast<FragmentType>(reduce.getInputs().front().getType());
+  auto input = dyn_cast<FragmentType>(reduce.getSources().front().getType());
   auto output = queryFragmentAxis(value.getType(), source);
   if (!input || !output.isExact())
     return std::nullopt;
@@ -759,7 +759,7 @@ std::optional<unsigned> repeatedReductionOutputAxis(
     return std::nullopt;
   auto kernel = reduce->getParentOfType<func::FuncOp>();
   PhysicalProgramAnalysis analysis(kernel);
-  auto ranges = analysis.axisRanges(reduce.getInputs().front(),
+  auto ranges = analysis.axisRanges(reduce.getSources().front(),
                                     freeAxes[output.fragmentAxis]);
   if (!ranges.isExact() || !ranges.blockers.empty() || ranges.roots.empty())
     return std::nullopt;
@@ -941,7 +941,7 @@ StructuredRangeUses classifyStructuredRanges(
       });
   };
   kernel.walk([&](RegionFoldOp fold) {
-    ValueRange sources = fold.getInputs().take_front(fold.getSourceCount());
+    ValueRange sources = fold.getSources();
     for (Value source : sources)
       collectAxisInto(source, fold.getAxis(), structuredTraversalRanges);
     collectStructuredRegionRanges(fold, sources, fold.getAxis());
@@ -959,7 +959,7 @@ StructuredRangeUses classifyStructuredRanges(
                                mapping.getDerived()});
   };
   kernel.walk([&](RegionScanOp scan) {
-    ValueRange sources = scan.getInputs().take_front(scan.getSourceCount());
+    ValueRange sources = scan.getSources();
     for (Value source : sources)
       recordScanTraversal(source, scan.getAxis());
     collectStructuredRegionRanges(scan, sources, scan.getAxis());
@@ -986,7 +986,7 @@ StructuredRangeUses classifyStructuredRanges(
     // author traversal. Its cardinality follows the tile selected by this pass.
     if (laneReductions.contains(reduce))
       return;
-    for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+    for (Value source : reduce.getSources()) {
       auto fragment = dyn_cast<FragmentType>(source.getType());
       if (!fragment)
         continue;
@@ -1005,7 +1005,7 @@ StructuredRangeUses classifyStructuredRanges(
     }
   });
   kernel.walk([&](ScanOp scan) {
-    for (Value source : scan.getInputs().take_front(scan.getSourceCount()))
+    for (Value source : scan.getSources())
       recordScanTraversal(source, scan.getAxis());
   });
   kernel.walk([&](HistogramOp histogram) {

@@ -73,8 +73,8 @@ bool sameExecutionSchema(Type lhs, Type rhs) {
 
 bool isSingleBinaryReduction(ReduceOp reduce, BinaryOperator kind) {
   return reduce && reduce.getNumResults() == 1 &&
-         reduce.getAxes().size() == 1 && reduce.getSourceCount() == 1 &&
-         reduce.getIdentityCount() == 1 && reduce.getCaptureCount() == 0 &&
+         reduce.getAxes().size() == 1 && reduce.getSources().size() == 1 &&
+         reduce.getIdentities().size() == 1 && reduce.getCaptures().size() == 0 &&
          queryBinaryCombineKind(reduce.getCombine()) == kind;
 }
 
@@ -177,20 +177,20 @@ matchOnlineSummaryStructure(MakeRecordOp record) {
       !isProjectedFrom(momentOrEmpty.getCondition(), validity.getResult(0)))
     return failure();
   auto maximum = maximumOrEmpty.getTrueValue().getDefiningOp<ReduceOp>();
-  Value memberValidity = validity.getInputs().front();
+  Value memberValidity = validity.getSources().front();
   if (maximumOrEmpty.getCondition() != validity.getResult(0) ||
       !isZero(maximumOrEmpty.getFalseValue()) ||
-      !isBooleanConstant(validity.getInputs()[1], false) ||
-      !isNegativeInfinity(maximum.getInputs()[1]))
+      !isBooleanConstant(validity.getIdentities().front(), false) ||
+      !isNegativeInfinity(maximum.getIdentities().front()))
     return failure();
 
-  auto maskedScore = maximum.getInputs().front().getDefiningOp<SelectOp>();
+  auto maskedScore = maximum.getSources().front().getDefiningOp<SelectOp>();
   if (!maskedScore || maskedScore.getCondition() != memberValidity ||
       !isNegativeInfinity(maskedScore.getFalseValue()))
     return failure();
   Value score = maskedScore.getTrueValue();
 
-  Value probabilityValue = mass.getInputs().front();
+  Value probabilityValue = mass.getSources().front();
   auto probability = probabilityValue.getDefiningOp<SelectOp>();
   if (!probability || probability.getCondition() != memberValidity ||
       !isZero(probability.getFalseValue()))
@@ -306,18 +306,8 @@ matchOnlineSummaryMerge(Region &region,
 
 ReduceOp cloneReductionWithSource(OpBuilder &builder, Location location,
                                   ReduceOp source, Value value) {
-  SmallVector<Value> inputs{value};
-  inputs.append(source.getInputs().drop_front(source.getSourceCount()).begin(),
-                source.getInputs().drop_front(source.getSourceCount()).end());
-  OperationState state(location, ReduceOp::getOperationName());
-  state.addOperands(inputs);
-  state.addTypes(source.getResultTypes());
-  state.addAttribute("axes", source->getAttr("axes"));
-  state.addAttribute("source_count", source->getAttr("source_count"));
-  state.addAttribute("identity_count", source->getAttr("identity_count"));
-  state.addAttribute("capture_count", source->getAttr("capture_count"));
-  state.addRegion();
-  auto result = cast<ReduceOp>(builder.create(state));
+  auto result = builder.create<ReduceOp>(location, ValueRange{value},
+      source.getIdentities(), source.getCaptures(), source.getAxes());
   IRMapping mapping;
   source.getCombine().cloneInto(&result.getCombine(), mapping);
   if (Attribute origin = source->getAttr(originAttr))

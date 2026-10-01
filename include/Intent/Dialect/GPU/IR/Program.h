@@ -2,16 +2,29 @@
 #define INTENT_DIALECT_GPU_IR_PROGRAM_H
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/SmallVector.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Region.h"
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Support/LogicalResult.h"
 
+#include <optional>
+
 namespace intent::gpu {
 
+// The source supplies the physical axis relation; the caller owns the declared
+// accumulator element type. An empty reduction-axis set preserves every axis.
+mlir::FailureOr<mlir::Type> inferCollectiveResultType(
+    mlir::Type source, llvm::ArrayRef<int64_t> reducedAxes,
+    mlir::Type resultElement);
+
+mlir::LogicalResult inferScalarCollectiveResultTypes(
+    std::optional<mlir::Location> location, mlir::ValueRange sources,
+    int64_t axis, bool scan, llvm::SmallVectorImpl<mlir::Type> &results);
+
 mlir::LogicalResult verifyScalarCollective(
-    mlir::Operation *owner, mlir::ValueRange inputs,
-    mlir::ResultRange results, mlir::Region &combine, unsigned count,
+    mlir::Operation *owner, mlir::ValueRange sources,
+    mlir::ValueRange identities, mlir::ResultRange results, mlir::Region &combine,
     int64_t axis, bool scan);
 
 inline constexpr llvm::StringLiteral kernelAttr = "intent_gpu.kernel";

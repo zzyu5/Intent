@@ -133,25 +133,15 @@ UniformExpression describeUniformValue(Value value) {
     default: result.kind = K::Unknown; break;
     }
   } else if (auto reduce = dyn_cast<ReduceOp>(op)) {
-    if (reduce.getSourceCount() != reduce.getIdentityCount()) return result;
-    result.kind = K::Fold;
-    result.stateCount = reduce.getIdentityCount();
-    result.result = cast<OpResult>(value).getResultNumber();
-    auto inputs = reduce.getInputs();
-    if (auto source = dyn_cast<FragmentType>(inputs.front().getType())) {
+    bool nonempty = false;
+    if (auto source = dyn_cast<FragmentType>(reduce.getSources().front().getType())) {
       auto kernel = reduce->getParentOfType<func::FuncOp>();
-      result.nonempty = kernel && llvm::all_of(reduce.getAxes(), [&](int64_t axis) {
+      nonempty = kernel && llvm::all_of(reduce.getAxes(), [&](int64_t axis) {
         return axis >= 0 && static_cast<unsigned>(axis) < source.getShape().size() &&
             isKnownPositiveExtent(cast<PhysicalExprAttr>(source.getShape()[axis]), kernel);
       });
     }
-    result.operands.assign(inputs.begin() + result.stateCount, inputs.begin() + 2 * result.stateCount);
-    llvm::append_range(result.operands, inputs.take_front(result.stateCount));
-    llvm::append_range(result.operands, inputs.drop_front(2 * result.stateCount));
-    result.parameters.assign(reduce.getCombine().front().args_begin(), reduce.getCombine().front().args_end());
-    auto yield = cast<YieldOp>(reduce.getCombine().front().getTerminator());
-    result.yields.assign(yield.getValues().begin(), yield.getValues().end());
-    return result;
+    return describeStructuredReduction(cast<OpResult>(value), result.type, nonempty);
   } else if (isa<ContractOp>(op)) result.kind = K::Contract;
   result.operands.assign(op->operand_begin(), op->operand_end());
   return result;

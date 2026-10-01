@@ -773,29 +773,45 @@ LogicalResult legalizeCollectiveCallbacks(func::FuncOp kernel) {
   for (Operation *operation : collectives) {
     auto reduce = dyn_cast<gpu::ReduceOp>(operation);
     auto scan = dyn_cast<gpu::ScanOp>(operation);
-    unsigned count = reduce ? reduce.getSourceCount() : scan.getSourceCount();
-    if ((reduce && (reduce.getAxes().size() != 1 || reduce.getCaptureCount())) ||
-        (scan && scan.getCaptureCount()))
+    ValueRange sources = reduce ? reduce.getSources() : scan.getSources();
+    ValueRange identities = reduce ? reduce.getIdentities() : scan.getIdentities();
+    if ((reduce && (reduce.getAxes().size() != 1 || reduce.getCaptures().size())) ||
+        (scan && scan.getCaptures().size()))
       return operation->emitOpError("native collective requires one axis and a capture-free callback");
+    // ODS inferred builders treat failure as a construction error. Diagnose
+    // unsupported native schemas before invoking that builder, and retain the
+    // result contract of the shared operation being replaced.
+    SmallVector<Type> resultTypes;
+    int64_t axis = reduce ? reduce.getAxes().front() : scan.getAxis();
+    if (failed(gpu::inferScalarCollectiveResultTypes(
+            operation->getLoc(), sources, axis, bool(scan), resultTypes)))
+      return failure();
+    if (!llvm::equal(resultTypes, operation->getResultTypes()))
+      return operation->emitOpError(
+          "native collective cannot preserve the shared result schema");
     Region &region = reduce ? reduce.getCombine() : scan.getCombine();
     OpBuilder builder(operation);
-    OperationState state(operation->getLoc(), reduce ? ReduceOp::getOperationName()
-                                                    : ScanOp::getOperationName());
-    state.addOperands(operation->getOperands());
-    state.addTypes(operation->getResultTypes());
-    state.addAttribute("source_count", builder.getI64IntegerAttr(count));
-    state.addAttribute("axis", builder.getI64IntegerAttr(reduce ? reduce.getAxes().front() : scan.getAxis()));
-    state.addAttribute("reverse", builder.getBoolAttr(scan && scan.getReverse()));
-    if (Attribute origin = operation->getAttr(gpu::originAttr)) state.addAttribute(gpu::originAttr, origin);
-    state.addRegion();
-    Operation *native = builder.create(state);
-    if (failed(gpu::scalarizeElementwiseCallback(region, native->getRegion(0))))
+    Operation *native;
+    Region *combine;
+    if (reduce) {
+      auto replacement = builder.create<ReduceOp>(operation->getLoc(),
+          sources, identities, axis, false);
+      native = replacement;
+      combine = &replacement.getCombine();
+    } else {
+      auto replacement = builder.create<ScanOp>(operation->getLoc(),
+          sources, identities, axis, scan.getReverse());
+      native = replacement;
+      combine = &replacement.getCombine();
+    }
+    if (Attribute origin = operation->getAttr(gpu::originAttr)) native->setAttr(gpu::originAttr, origin);
+    if (failed(gpu::scalarizeElementwiseCallback(region, *combine)))
       return failure();
     SmallVector<Value> results(native->getResults());
     if (scan && !scan.getInclusive()) {
       builder.setInsertionPointAfter(native);
       Location location = scan.getLoc();
-      for (unsigned component = 0; component < count; ++component) {
+      for (unsigned component = 0; component < sources.size(); ++component) {
         auto type = dyn_cast<gpu::FragmentType>(results[component].getType());
         if (!type || scan.getAxis() >= type.getShape().size())
           return scan.emitOpError("exclusive scan requires a ranked physical result");
@@ -839,7 +855,7 @@ LogicalResult legalizeCollectiveCallbacks(func::FuncOp kernel) {
             location, type, results[component], ValueRange{safeIndex},
             Value(), Value(), ArrayRef<int64_t>{static_cast<int64_t>(scan.getAxis())});
         Value identity = builder.create<gpu::BroadcastOp>(
-            location, type, scan.getInputs()[count + component]);
+            location, type, scan.getIdentities()[component]);
         results[component] = builder.create<gpu::SelectOp>(
             location, type, valid, prefix, identity);
       }
@@ -913,19 +929,17 @@ void foldIntegerScanTails(func::FuncOp kernel) {
         source = addition.getLhs();
     }
     auto scan = source.getDefiningOp<gpu::ScanOp>();
-    if (!scan || scan.getSourceCount() != 1 || scan.getIdentityCount() != 1 ||
-        scan.getCaptureCount() || scan.getAxis() != 0 || !scan.getInclusive() ||
+    if (!scan || scan.getSources().size() != 1 || scan.getIdentities().size() != 1 ||
+        scan.getCaptures().size() || scan.getAxis() != 0 || !scan.getInclusive() ||
         scan.getReverse() || source.getType() != type ||
-        !gpu::isLiteralZeroProjection(scan.getInputs()[1]))
+        !gpu::isLiteralZeroProjection(scan.getIdentities().front()))
       continue;
     Block &body = scan.getCombine().front();
     auto combine = dyn_cast<gpu::BinaryOp>(body.front());
-    auto yield = cast<gpu::YieldOp>(body.getTerminator());
+    auto structured = cast<StructuredOpInterface>(scan.getOperation());
     if (!llvm::hasSingleElement(body.without_terminator()) || !combine ||
-        combine.getOperatorKind() != BinaryOperator::Add ||
-        combine.getLhs() != body.getArgument(0) ||
-        combine.getRhs() != body.getArgument(1) ||
-        yield.getValues().front() != combine.getResult())
+        combine.getLhs() != structured.getCombineLhs().front() ||
+        gpu::queryBinaryCombineKind(scan.getCombine()) != BinaryOperator::Add)
       continue;
 
     // A scalar cross-warp gather materializes the whole prefix in shared memory.
@@ -933,17 +947,11 @@ void foldIntegerScanTails(func::FuncOp kernel) {
     OpBuilder builder(gather);
     Value zero = builder.create<arith::ConstantOp>(
         gather.getLoc(), builder.getZeroAttr(type.getElementType()));
-    OperationState state(gather.getLoc(), gpu::ReduceOp::getOperationName());
-    state.addOperands({scan.getInputs().front(), zero});
-    state.addTypes(type.getElementType());
-    state.addAttribute("source_count", builder.getI64IntegerAttr(1));
-    state.addAttribute("identity_count", builder.getI64IntegerAttr(1));
-    state.addAttribute("capture_count", builder.getI64IntegerAttr(0));
-    state.addAttribute("axes", builder.getDenseI64ArrayAttr({0}));
+    auto reduced = builder.create<gpu::ReduceOp>(gather.getLoc(),
+        TypeRange{type.getElementType()}, scan.getSources(), ValueRange{zero},
+        ValueRange{}, ArrayRef<int64_t>{0});
     if (Attribute origin = gather->getAttr(gpu::originAttr))
-      state.addAttribute(gpu::originAttr, origin);
-    state.addRegion();
-    auto reduced = cast<gpu::ReduceOp>(builder.create(state));
+      reduced->setAttr(gpu::originAttr, origin);
     {
       OpBuilder::InsertionGuard guard(builder);
       Block *scalarBody = new Block();
@@ -1095,33 +1103,17 @@ LogicalResult legalizeLargeScalarGathers(func::FuncOp kernel) {
       if (failed(emptyBits))
         return failure();
       value = builder.create<gpu::SelectOp>(location, input, *expanded, value, *emptyBits);
-      SmallVector<Attribute> shape, mappings;
-      for (unsigned sourceAxis = 0; sourceAxis < input.getShape().size(); ++sourceAxis) {
-        if (sourceAxis == axis)
-          continue;
-        auto mapping = cast<gpu::AxisMapAttr>(input.getAxisMaps()[sourceAxis]);
-        mappings.push_back(gpu::AxisMapAttr::get(
-            kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-            mapping.getDimensionId(), shape.size(), mapping.getDerived()));
-        shape.push_back(input.getShape()[sourceAxis]);
-      }
-      Type reducedType = bits;
-      if (!shape.empty())
-        reducedType = gpu::FragmentType::get(
-            kernel.getContext(), bits, builder.getArrayAttr(shape),
-            builder.getArrayAttr(mappings), input.getValidity(), input.getOwner());
+      auto inferred = gpu::inferCollectiveResultType(input,
+          ArrayRef<int64_t>{static_cast<int64_t>(axis)}, bits);
+      if (failed(inferred))
+        return gather.emitOpError("scalar selection has an invalid reduction schema");
+      Type reducedType = *inferred;
       auto identity = zeroLike(builder, location, reducedType);
       if (failed(identity))
         return failure();
-      OperationState state(location, gpu::ReduceOp::getOperationName());
-      state.addOperands({value, *identity});
-      state.addTypes(reducedType);
-      state.addAttribute("axes", builder.getDenseI64ArrayAttr({axis}));
-      state.addAttribute("source_count", builder.getI64IntegerAttr(1));
-      state.addAttribute("identity_count", builder.getI64IntegerAttr(1));
-      state.addAttribute("capture_count", builder.getI64IntegerAttr(0));
-      state.addRegion();
-      auto reduction = cast<gpu::ReduceOp>(builder.create(state));
+      auto reduction = builder.create<gpu::ReduceOp>(location, TypeRange{reducedType},
+          ValueRange{value}, ValueRange{*identity}, ValueRange{},
+          ArrayRef<int64_t>{static_cast<int64_t>(axis)});
       {
         OpBuilder::InsertionGuard guard(builder);
         Block *body = builder.createBlock(&reduction.getCombine(), {},

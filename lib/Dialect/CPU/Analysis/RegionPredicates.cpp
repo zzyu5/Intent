@@ -231,14 +231,14 @@ bool initializedFalse(Value value, Operation *before) {
   return fill && uniformBoolean(UniformValueAnalysis(describeScalarValue).evaluate(fill.getInputs()[0])) == false;
 }
 
-std::optional<unsigned> validityField(RegionProgram program, linalg::GenericOp membership,
+std::optional<unsigned> validityField(RegionOpInterface program, linalg::GenericOp membership,
                                       unsigned memberAxis) {
   UniformValueAnalysis values(describeScalarValue);
-  unsigned count = program.count("identity_count");
-  auto &summary = program.summarize().front();
-  auto &combine = program.combine().front();
-  for (unsigned field = 0; field < count; ++field) {
-    Value slot = summary.getArguments().take_back(count)[field];
+  auto summaryOutputs = program.getRegionArguments(program.getSummarize(), RegionArgumentKind::Destinations);
+  auto combinedOutputs = program.getRegionArguments(program.getCombine(), RegionArgumentKind::Destinations);
+  auto left = program.getRegionArguments(program.getCombine(), RegionArgumentKind::LeftSummary);
+  auto right = program.getRegionArguments(program.getCombine(), RegionArgumentKind::RightSummary);
+  for (auto [field, slot] : llvm::enumerate(summaryOutputs)) {
     auto type = cast<MemRefType>(slot.getType());
     if (!type.getElementType().isInteger(1)) continue;
     auto reduction = producer(slot);
@@ -250,16 +250,16 @@ std::optional<unsigned> validityField(RegionProgram program, linalg::GenericOp m
     if (!coordinate || reduction.getIteratorTypesArray()[coordinate.getPosition()] != utils::IteratorType::reduction) continue;
     Block &body = reduction.getRegion().front();
     if (!isBooleanUnion(values, body.getTerminator()->getOperand(0), body.getArgument(0), body.getArgument(1))) continue;
-    Value identity = stripIdentityViews(program.identities()[field]);
+    Value identity = stripIdentityViews(program.getIdentities()[field]);
     if (!initializedFalse(identity, program.getOperation())) continue;
-    auto combined = producer(combine.getArguments().take_back(count)[field]);
+    auto combined = producer(combinedOutputs[field]);
     if (!combined || combined.getNumReductionLoops() || combined.getNumDpsInits() != 1 ||
         !combined.getIndexingMapsArray().back().isIdentity()) continue;
     Value lhs, rhs;
     for (auto [index, input] : llvm::enumerate(combined.getInputs())) {
       if (!combined.getIndexingMapsArray()[index].isIdentity()) continue;
-      if (stripIdentityViews(input) == combine.getArgument(field)) lhs = combined.getRegion().front().getArgument(index);
-      if (stripIdentityViews(input) == combine.getArgument(count + field)) rhs = combined.getRegion().front().getArgument(index);
+      if (stripIdentityViews(input) == left[field]) lhs = combined.getRegion().front().getArgument(index);
+      if (stripIdentityViews(input) == right[field]) rhs = combined.getRegion().front().getArgument(index);
     }
     Value result = combined.getRegion().front().getTerminator()->getOperand(0);
     if (lhs && rhs && isBooleanUnion(values, result, lhs, rhs) && hasTrueStateInvariant(values, result, lhs)) return field;
@@ -323,10 +323,10 @@ private:
   UniformBindings facts;
 };
 
-bool summaryIsIdentityWhenFalse(RegionProgram program, Value predicate) {
+bool summaryIsIdentityWhenFalse(RegionOpInterface program, Value predicate) {
   PhysicalProgramAnalysis physical(program.getOperation()->getParentOfType<func::FuncOp>());
   for (Region &region : program.getOperation()->getRegions()) {
-    unsigned firstDestination = region.front().getNumArguments() - program.count("identity_count");
+    auto destinations = program.getRegionArguments(region, RegionArgumentKind::Destinations);
     for (Operation &operation : region.front().without_terminator()) {
       auto effects = getEffectsRecursively(&operation);
       if (!effects) return false;
@@ -335,7 +335,7 @@ bool summaryIsIdentityWhenFalse(RegionProgram program, Value predicate) {
         if (!effect.getValue()) return false;
         Value root = physical.storageRoot(effect.getValue());
         if (auto argument = dyn_cast<BlockArgument>(root)) {
-          if (argument.getOwner() != &region.front() || argument.getArgNumber() < firstDestination ||
+          if (!llvm::is_contained(destinations, argument) ||
               !isa<MemoryEffects::Write>(effect.getEffect())) return false;
         } else {
           auto allocation = root.getDefiningOp();
@@ -350,15 +350,18 @@ bool summaryIsIdentityWhenFalse(RegionProgram program, Value predicate) {
     if (&operation == program.getOperation()) break;
     outer.visit(&operation);
   }
-  Block &helper = program.summarize().front();
-  SmallVector<Value> inputs(program.sources());
-  llvm::append_range(inputs, program.captures());
-  for (auto [argument, input] : llvm::zip(helper.getArguments().take_front(inputs.size()), inputs))
-    summary.write(argument, outer.read(input));
+  Block &helper = program.getSummarize().front();
+  auto schema = program.getRegionSchema(program.getSummarize());
+  if (failed(schema)) return false;
+  for (const auto &relation : *schema)
+    if (relation.kind != RegionArgumentKind::Destinations)
+      summary.write(relation.argument, outer.read(relation.prototype));
   UniformBindings scalars;
   scalars[predicate] = IntegerAttr::get(IntegerType::get(predicate.getContext(), 1), 0);
   for (Operation &operation : helper.without_terminator()) summary.visit(&operation, scalars);
-  for (auto [result, identity] : llvm::zip(helper.getArguments().take_back(program.count("identity_count")), program.identities()))
+  for (auto [result, identity] : llvm::zip(
+           program.getRegionArguments(program.getSummarize(), RegionArgumentKind::Destinations),
+           program.getIdentities()))
     if (!equalUniformConstants(summary.read(result), outer.read(identity))) return false;
   return true;
 }
@@ -409,7 +412,7 @@ std::optional<CoordinateSequence> coordinateSequence(Value memory, Operation *at
       else if (auto tasks = dyn_cast<TasksOp>(user)) {
         if (use.getOperandNumber() >= 1) aliases.push_back(tasks.getBody().front().getArgument(use.getOperandNumber()));
       } else if (isa<RegionFoldOp, RegionScanOp>(user)) {
-        if (llvm::is_contained(RegionProgram(user).outputs(), alias)) return std::nullopt;
+        if (llvm::is_contained(mlir::cast<RegionOpInterface>(user).getDestinations(), alias)) return std::nullopt;
       } else if (auto copy = dyn_cast<memref::CopyOp>(user)) {
         if (copy.getTarget() == alias) return std::nullopt;
       } else if (!isa<memref::LoadOp, memref::DimOp, memref::DeallocOp>(user)) return std::nullopt;
@@ -451,9 +454,9 @@ std::optional<CoordinateSequence> coordinateSequence(Value memory, Operation *at
   return result;
 }
 
-std::optional<RegionPredicatePlan> analyzeRegionPredicate(RegionProgram program) {
+std::optional<RegionPredicatePlan> analyzeRegionPredicate(RegionOpInterface program) {
   if (program.isScan() || !getEffectsRecursively(program.getOperation())) return std::nullopt;
-  Block &helper = program.summarize().front();
+  Block &helper = program.getSummarize().front();
   for (auto generic : helper.getOps<linalg::GenericOp>()) {
     if (generic.getNumReductionLoops() || generic.getOutputs().size() != 1) continue;
     auto compare = generic.getRegion().front().getTerminator()->getOperand(0).getDefiningOp<arith::CmpIOp>();
@@ -490,11 +493,12 @@ std::optional<RegionPredicatePlan> analyzeRegionPredicate(RegionProgram program)
     };
     auto left = operand(compare.getLhs()), right = operand(compare.getRhs());
     if (!left || !right || left->second == right->second) continue;
-    bool reverse = left->first.getArgNumber() >= program.count("source_count");
+    auto sourceArguments = program.getRegionArguments(program.getSummarize(), RegionArgumentKind::Sources);
+    auto captureArguments = program.getRegionArguments(program.getSummarize(), RegionArgumentKind::Captures);
+    bool reverse = !llvm::is_contained(sourceArguments, left->first);
     auto source = reverse ? *right : *left, capture = reverse ? *left : *right;
-    unsigned sourceCount = program.count("source_count");
-    if (source.first.getArgNumber() >= sourceCount || capture.first.getArgNumber() < sourceCount ||
-        capture.first.getArgNumber() >= sourceCount + program.count("capture_count")) continue;
+    if (!llvm::is_contained(sourceArguments, source.first) ||
+        !llvm::is_contained(captureArguments, capture.first)) continue;
     UniformPredicate predicate;
     switch (compare.getPredicate()) {
     case arith::CmpIPredicate::slt: predicate = reverse ? UniformPredicate::Greater : UniformPredicate::Less; break;
@@ -508,9 +512,12 @@ std::optional<RegionPredicatePlan> analyzeRegionPredicate(RegionProgram program)
       if (auto dimension = dyn_cast<AffineDimExpr>(expression); dimension && dimension.getPosition() == source.second) memberAxis = axis;
     if (memberAxis == generic.getIndexingMapsArray().back().getNumResults()) continue;
     auto validity = validityField(program, generic, memberAxis);
-    auto reduction = validity ? producer(helper.getArguments().take_back(program.count("identity_count"))[*validity])
+    auto reduction = validity ? producer(program.getRegionArguments(
+        program.getSummarize(), RegionArgumentKind::Destinations)[*validity])
                               : linalg::GenericOp();
-    return RegionPredicatePlan{compare, source.first.getArgNumber(), capture.first.getArgNumber() - sourceCount,
+    return RegionPredicatePlan{compare,
+        static_cast<unsigned>(llvm::find(sourceArguments, source.first) - sourceArguments.begin()),
+        static_cast<unsigned>(llvm::find(captureArguments, capture.first) - captureArguments.begin()),
         predicate, validity, reduction, summaryIsIdentityWhenFalse(program, compare)};
   }
   return std::nullopt;

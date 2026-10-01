@@ -145,19 +145,12 @@ LogicalResult realizeVectorContract(ContractOp contract) {
   FailureOr<Value> zero = materializeZeroFragment(builder, location, resultType);
   if (failed(zero))
     return contract.emitOpError("cannot form vector-contraction additive identity");
-  Type reducedType = resultType.getShape().empty() ? resultType.getElementType() : Type(resultType);
   Value identity = *zero;
   if (resultType.getShape().empty())
     identity = identity.getDefiningOp<BroadcastOp>().getValue();
-  OperationState state(location, ReduceOp::getOperationName());
-  state.addOperands({product.getResult(), identity});
-  state.addTypes(reducedType);
-  state.addAttribute("axes", builder.getDenseI64ArrayAttr(reductionAxes));
-  state.addAttribute("source_count", builder.getI64IntegerAttr(1));
-  state.addAttribute("identity_count", builder.getI64IntegerAttr(1));
-  state.addAttribute("capture_count", builder.getI64IntegerAttr(0));
-  state.addRegion();
-  auto reduction = cast<ReduceOp>(builder.create(state));
+  auto reduction = builder.create<ReduceOp>(location,
+      ValueRange{product.getResult()}, ValueRange{identity}, ValueRange{}, reductionAxes);
+  Type reducedType = reduction.getResult(0).getType();
   Block *combine = builder.createBlock(&reduction.getCombine(), {},
                                       {reducedType, reducedType}, {location, location});
   Value combined = builder.create<BinaryOp>(location, reducedType,

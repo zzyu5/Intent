@@ -1,4 +1,5 @@
 #include "Intent/Analysis/OnlineSummary.h"
+#include "Intent/Interfaces/StructuredOpInterface.h"
 #include "Intent/Analysis/OnlineSummaryCombine.h"
 #include "Intent/Analysis/UniformValues.h"
 #include <algorithm>
@@ -44,13 +45,13 @@ Value projected(Value value) {
 }
 std::optional<BinaryOperator> reductionKind(ReduceOp reduce) {
   if (!reduce || reduce.getNumResults() != 1 || reduce.getAxes().size() != 1 ||
-      reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 || reduce.getCaptureCount())
+      reduce.getSources().size() != 1 || reduce.getIdentities().size() != 1 || reduce.getCaptures().size())
     return std::nullopt;
-  auto &body = reduce.getCombine().front();
-  auto combine = body.getTerminator()->getOperand(0).getDefiningOp<BinaryOp>();
-  if (!combine || body.getNumArguments() != 2 ||
-      !((combine.getLhs() == body.getArgument(0) && combine.getRhs() == body.getArgument(1)) ||
-        (combine.getLhs() == body.getArgument(1) && combine.getRhs() == body.getArgument(0)))) return std::nullopt;
+  auto schema = cast<StructuredOpInterface>(reduce.getOperation());
+  auto combine = schema.getCombineYields().front().getDefiningOp<BinaryOp>();
+  Value lhs = schema.getCombineLhs().front(), rhs = schema.getCombineRhs().front();
+  if (!combine || !((combine.getLhs() == lhs && combine.getRhs() == rhs) ||
+                    (combine.getLhs() == rhs && combine.getRhs() == lhs))) return std::nullopt;
   return combine.getOperatorKind();
 }
 bool field(Value value, Value record, unsigned index) {
@@ -60,12 +61,12 @@ bool field(Value value, Value record, unsigned index) {
 }
 
 std::optional<OnlineSummary> matchOnlineSummary(RegionFoldOp fold) {
-  if (fold.getIdentityCount() != 1 || fold.getNumResults() != 1) return std::nullopt;
-  auto &summary = fold.getSummarize().front();
+  if (fold.getIdentities().size() != 1 || fold.getNumResults() != 1) return std::nullopt;
+  auto schema = cast<StructuredOpInterface>(fold.getOperation());
   auto &merge = fold.getCombine().front();
   OnlineSummary plan{};
-  plan.summary = summary.getTerminator()->getOperand(0).getDefiningOp<MakeRecordOp>();
-  plan.merged = merge.getTerminator()->getOperand(0).getDefiningOp<MakeRecordOp>();
+  plan.summary = schema.getSummarizeYields().front().getDefiningOp<MakeRecordOp>();
+  plan.merged = schema.getCombineYields().front().getDefiningOp<MakeRecordOp>();
   if (!plan.summary || !plan.merged || plan.summary.getFields().size() != 4 ||
       plan.merged.getFields().size() != 4 || merge.getNumArguments() != 2) return std::nullopt;
   unsigned validCount = 0, maxCount = 0, massCount = 0, momentCount = 0;
@@ -89,12 +90,12 @@ std::optional<OnlineSummary> matchOnlineSummary(RegionFoldOp fold) {
     }
   }
   if (validCount != 1 || maxCount != 1 || massCount != 1 || momentCount != 1 ||
-      !truth(plan.validity.getInputs()[1], false) || !negativeInfinity(plan.maximum.getInputs()[1]) ||
-      !zero(plan.mass.getInputs()[1]) || plan.maximumOrEmpty.getCondition() != plan.validity.getResult(0) ||
+      !truth(plan.validity.getIdentities().front(), false) || !negativeInfinity(plan.maximum.getIdentities().front()) ||
+      !zero(plan.mass.getIdentities().front()) || plan.maximumOrEmpty.getCondition() != plan.validity.getResult(0) ||
       (plan.momentOrEmpty && projected(plan.momentOrEmpty.getCondition()) != plan.validity.getResult(0))) return std::nullopt;
-  auto masked = plan.maximum.getInputs()[0].getDefiningOp<SelectOp>();
-  plan.probability = plan.mass.getInputs()[0].getDefiningOp<SelectOp>();
-  if (!masked || !plan.probability || masked.getCondition() != plan.validity.getInputs()[0] ||
+  auto masked = plan.maximum.getSources().front().getDefiningOp<SelectOp>();
+  plan.probability = plan.mass.getSources().front().getDefiningOp<SelectOp>();
+  if (!masked || !plan.probability || masked.getCondition() != plan.validity.getSources().front() ||
       !negativeInfinity(masked.getFalseValue()) || plan.probability.getCondition() != masked.getCondition() ||
       !zero(plan.probability.getFalseValue())) return std::nullopt;
   plan.exponential = plan.probability.getTrueValue().getDefiningOp<UnaryOp>();
@@ -122,7 +123,7 @@ std::optional<OnlineSummary> matchOnlineSummary(RegionFoldOp fold) {
   // order. The shared matcher selects the first candidate, so reverse here.
   std::reverse(candidates.begin(), candidates.end());
   auto relations = matchOnlineSummaryCombine<BinaryOp, UnaryOp, SelectOp>(
-      plan.merged.getFields(), merge.getArgument(0), merge.getArgument(1),
+      plan.merged.getFields(), schema.getCombineLhs().front(), schema.getCombineRhs().front(),
       {plan.validField, plan.maxField, plan.massField, plan.momentField},
       reductionKind(plan.maximum), plan.exponential, candidates, projected,
       [](Value value, Value source) { return projected(value) == projected(source); },

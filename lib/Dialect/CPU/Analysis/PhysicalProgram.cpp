@@ -2,7 +2,7 @@
 #include "Intent/Dialect/CPU/Analysis/Contractions.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
-#include "Intent/Dialect/CPU/IR/RegionProgram.h"
+#include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -139,12 +139,12 @@ SmallVector<MemoryAccess> PhysicalProgramAnalysis::accesses(Operation *scope) {
     } else if (auto update = dyn_cast<memref::GenericAtomicRMWOp>(operation)) {
       add(update.getMemref(), true, true);
     } else if (isa<RegionFoldOp, RegionScanOp>(operation)) {
-      RegionProgram program(operation);
-      for (Value input : program.sources()) add(input, true, false);
-      for (Value input : program.identities()) add(input, true, false);
-      for (Value input : program.initialState()) add(input, true, false);
-      for (Value input : program.captures()) add(input, true, false);
-      for (Value output : program.outputs()) add(output, false, true);
+      auto program = cast<RegionOpInterface>(operation);
+      for (Value input : program.getSources()) add(input, true, false);
+      for (Value input : program.getIdentities()) add(input, true, false);
+      for (Value input : program.getInitialStates()) add(input, true, false);
+      for (Value input : program.getCaptures()) add(input, true, false);
+      for (Value output : program.getDestinations()) add(output, false, true);
     } else if (auto quantize = dyn_cast<QuantizeOp>(operation)) {
       add(quantize.getInput(), true, false);
       add(quantize.getOutput(), false, true);

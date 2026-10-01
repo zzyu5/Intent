@@ -77,16 +77,6 @@ std::optional<uint64_t> getCoordinateSource(Type type) {
   return std::nullopt;
 }
 
-FailureOr<int64_t> getCount(Operation *operation, StringRef name) {
-  auto attribute = operation->getAttrOfType<IntegerAttr>(name);
-  if (!attribute || attribute.getInt() < 0) {
-    operation->emitOpError() << "requires non-negative integer attribute '"
-                             << name << "'";
-    return failure();
-  }
-  return attribute.getInt();
-}
-
 std::optional<int64_t> getConstantInteger(Value value) {
   Operation *definition = value.getDefiningOp();
   if (!definition || definition->getName().getStringRef() != "intent.constant")
@@ -374,24 +364,6 @@ LogicalResult verifyShapeOperands(Operation *operation,
       return operation->emitOpError(
           "shape extent operands must be canonical and position ordered");
   return success();
-}
-
-SmallVector<Type> getOperandTypes(Operation *operation, unsigned offset = 0,
-                                  std::optional<unsigned> count = std::nullopt) {
-  SmallVector<Type> types;
-  unsigned end = count ? offset + *count : operation->getNumOperands();
-  for (unsigned index = offset; index < end; ++index)
-    types.push_back(operation->getOperand(index).getType());
-  return types;
-}
-
-SmallVector<Type> getResultTypes(Operation *operation, unsigned offset = 0,
-                                 std::optional<unsigned> count = std::nullopt) {
-  SmallVector<Type> types;
-  unsigned end = count ? offset + *count : operation->getNumResults();
-  for (unsigned index = offset; index < end; ++index)
-    types.push_back(operation->getResult(index).getType());
-  return types;
 }
 
 LogicalResult verifyOneBlock(Operation *owner, Region &region,
@@ -851,99 +823,10 @@ LogicalResult verifyDataOperation(Operation *operation) {
   return success();
 }
 
-LogicalResult verifyControlOperation(Operation *operation) {
-  StringRef name = operation->getName().getStringRef();
-  if (name == "intent.parallel" || name == "intent.for") {
-    bool parallel = name == "intent.parallel";
-    if (operation->getNumOperands() < 1 || operation->getNumRegions() != 1)
-      return operation->emitOpError("iteration requires a source and one body");
-    Type sourceType = operation->getOperand(0).getType();
-    auto rank = getLogicalRank(sourceType);
-    auto source = getCoordinateSource(sourceType);
-    if (!rank || !source || failed(verifyOneBlock(operation, operation->getRegion(0),
-                                                   "intent.yield")))
-      return failure();
-    Block &body = operation->getRegion(0).front();
-    unsigned carryCount = operation->getNumOperands() - 1;
-    if (parallel && (carryCount != 0 || operation->getNumResults() != 0))
-      return operation->emitOpError("parallel iteration cannot carry SSA values");
-    if (!parallel && operation->getNumResults() != carryCount)
-      return operation->emitOpError("for-loop carry/result arity is inconsistent");
-    if (body.getNumArguments() != *rank + carryCount)
-      return operation->emitOpError("iteration body argument schema is inconsistent");
-    for (unsigned axis = 0; axis < *rank; ++axis) {
-      auto index = dyn_cast<LogicalIndexType>(body.getArgument(axis).getType());
-      if (!index || index.getSourceId() != *source || index.getAxis() != axis)
-        return operation->emitOpError(
-            "iteration coordinate lost its source/axis provenance");
-    }
-    for (unsigned index = 0; index < carryCount; ++index) {
-      Type initial = operation->getOperand(index + 1).getType();
-      if (body.getArgument(*rank + index).getType() != initial ||
-          operation->getResult(index).getType() != initial)
-        return operation->emitOpError("for-loop carry type is not stable");
-    }
-    Operation &yield = body.back();
-    if (yield.getNumOperands() != carryCount ||
-        !llvm::equal(yield.getOperandTypes(), operation->getResultTypes()))
-      return operation->emitOpError("iteration yield schema is inconsistent");
-    return success();
-  }
-  if (name == "intent.if") {
-    if (operation->getNumRegions() != 2 ||
-        !operation->getOperand(0).getType().isInteger(1))
-      return operation->emitOpError("if requires i1 condition and two branches");
-    for (Region &region : operation->getRegions()) {
-      if (failed(verifyOneBlock(operation, region, "intent.yield")))
-        return failure();
-      Block &block = region.front();
-      if (block.getNumArguments() != 0 ||
-          !llvm::equal(block.back().getOperandTypes(), operation->getResultTypes()))
-        return operation->emitOpError("if branch yield schema is inconsistent");
-    }
-    return success();
-  }
-  if (name == "intent.while") {
-    if (operation->getNumRegions() != 2 ||
-        operation->getNumOperands() != operation->getNumResults())
-      return operation->emitOpError("while carry/result schema is inconsistent");
-    if (!llvm::equal(operation->getOperandTypes(), operation->getResultTypes()))
-      return operation->emitOpError("while carry types are not stable");
-    Region &before = operation->getRegion(0);
-    Region &after = operation->getRegion(1);
-    if (failed(verifyOneBlock(operation, before, "intent.condition")) ||
-        failed(verifyOneBlock(operation, after, "intent.yield")))
-      return failure();
-    if (!llvm::equal(before.front().getArgumentTypes(), operation->getOperandTypes()) ||
-        !llvm::equal(after.front().getArgumentTypes(), operation->getOperandTypes()))
-      return operation->emitOpError("while region argument schema is inconsistent");
-    Operation &condition = before.front().back();
-    SmallVector<Type> conditionTypes;
-    for (Value value : condition.getOperands().drop_front())
-      conditionTypes.push_back(value.getType());
-    if (condition.getNumOperands() != operation->getNumOperands() + 1 ||
-        !condition.getOperand(0).getType().isInteger(1) ||
-        !llvm::equal(conditionTypes, operation->getOperandTypes()))
-      return operation->emitOpError("while condition does not forward its carries");
-    if (!llvm::equal(after.front().back().getOperandTypes(),
-                     operation->getResultTypes()))
-      return operation->emitOpError("while yield schema is inconsistent");
-    return success();
-  }
-  return success();
-}
-
-LogicalResult verifyReduceOrScan(Operation *operation, bool scan) {
-  FailureOr<int64_t> sourceCount = getCount(operation, "source_count");
-  FailureOr<int64_t> identityCount = getCount(operation, "identity_count");
-  FailureOr<int64_t> captureCount = getCount(operation, "capture_count");
-  if (failed(sourceCount) || failed(identityCount) || failed(captureCount) ||
-      *sourceCount <= 0 || *sourceCount != *identityCount ||
-      operation->getNumOperands() !=
-          static_cast<unsigned>(*sourceCount + *identityCount + *captureCount) ||
-      operation->getNumResults() != static_cast<unsigned>(*identityCount) ||
-      operation->getNumRegions() != 1)
-    return operation->emitOpError("reduce/scan component partition is inconsistent");
+LogicalResult verifyReduceOrScan(StructuredOpInterface structured, bool scan) {
+  Operation *operation = structured.getOperation();
+  if (failed(verifyStructuredArity(structured)))
+    return failure();
 
   SmallVector<int64_t> axes;
   if (scan) {
@@ -963,16 +846,17 @@ LogicalResult verifyReduceOrScan(Operation *operation, bool scan) {
   for (int64_t axis : axes)
     if (axis < 0 || !uniqueAxes.insert(axis).second)
       return operation->emitOpError("reduce/scan axes must be unique and non-negative");
-  for (int64_t index = 0; index < *sourceCount; ++index) {
-    auto source = dyn_cast<RankedTensorType>(operation->getOperand(index).getType());
-    Type identity = operation->getOperand(*sourceCount + index).getType();
+  for (auto [sourceValue, identityValue, resultValue] : llvm::zip_equal(
+           structured.getSources(), structured.getIdentities(), operation->getResults())) {
+    auto source = dyn_cast<RankedTensorType>(sourceValue.getType());
+    Type identity = identityValue.getType();
     if (!source || getElementType(identity) != source.getElementType())
       return operation->emitOpError(
           "reduce/scan source and identity component types disagree");
     for (int64_t axis : axes)
       if (axis >= source.getRank())
         return operation->emitOpError("reduce/scan axis is outside source rank");
-    Type result = operation->getResult(index).getType();
+    Type result = resultValue.getType();
     if (scan) {
       auto identityTensor = dyn_cast<RankedTensorType>(identity);
       bool scalarIdentity = identity == source.getElementType();
@@ -1014,178 +898,89 @@ LogicalResult verifyReduceOrScan(Operation *operation, bool scan) {
     }
     accumulatorTypes.push_back(identity);
   }
-  SmallVector<Type> arguments(accumulatorTypes);
-  arguments.append(accumulatorTypes);
-  SmallVector<Type> captures = getOperandTypes(
-      operation, static_cast<unsigned>(*sourceCount + *identityCount));
-  arguments.append(captures);
-  return verifyYieldSchema(operation, operation->getRegion(0), arguments,
+  return verifyYieldSchema(operation, structured.getCombine(),
+                           structured.getCombineArgumentTypes(),
                            accumulatorTypes, true);
 }
 
-LogicalResult verifyRegionFold(Operation *operation) {
-  FailureOr<int64_t> sourceCount = getCount(operation, "source_count");
-  FailureOr<int64_t> identityCount = getCount(operation, "identity_count");
-  FailureOr<int64_t> captureCount = getCount(operation, "capture_count");
-  auto axis = operation->getAttrOfType<IntegerAttr>("axis");
-  if (failed(sourceCount) || failed(identityCount) || failed(captureCount) ||
-      *sourceCount <= 0 || *identityCount <= 0 || !axis || axis.getInt() < 0 ||
-      operation->getNumOperands() !=
-          static_cast<unsigned>(*sourceCount + *identityCount + *captureCount) ||
-      operation->getNumResults() != static_cast<unsigned>(*identityCount) ||
-      operation->getNumRegions() != 2)
-    return operation->emitOpError("region-fold component partition is inconsistent");
-  if (failed(verifyOneBlock(operation, operation->getRegion(0), "intent.yield")) ||
-      failed(verifyOneBlock(operation, operation->getRegion(1), "intent.yield")))
+LogicalResult verifySegmentedOperation(StructuredOpInterface structured) {
+  Operation *operation = structured.getOperation();
+  if (failed(verifyStructuredArity(structured)))
     return failure();
+  int64_t axis = structured.getIterationAxes().front();
+  if (axis < 0)
+    return operation->emitOpError("source axis must be non-negative");
   SmallVector<Type> sliceTypes;
   RankedTensorType first;
-  for (int64_t index = 0; index < *sourceCount; ++index) {
-    auto source = dyn_cast<RankedTensorType>(operation->getOperand(index).getType());
-    if (!source || axis.getInt() >= source.getRank())
-      return operation->emitOpError("region-fold source axis is invalid");
+  for (auto [sourceValue, sliceValue] : llvm::zip_equal(
+           structured.getSources(), structured.getSummarizeSources())) {
+    auto source = dyn_cast<RankedTensorType>(sourceValue.getType());
+    if (!source || axis >= source.getRank())
+      return operation->emitOpError("source axis is invalid");
     if (!first)
       first = source;
-    else if (!sameDimension(first, axis.getInt(), source, axis.getInt()))
+    else if (!sameDimension(first, axis, source, axis))
       return operation->emitOpError(
-          "region-fold sources do not share one logical source extent");
-    sliceTypes.push_back(operation->getRegion(0).front().getArgument(index).getType());
+          "sources do not share one logical source extent");
+    sliceTypes.push_back(sliceValue.getType());
     auto slice = dyn_cast<RankedTensorType>(sliceTypes.back());
     if (!slice || slice.getRank() != source.getRank() ||
         slice.getElementType() != source.getElementType())
-      return operation->emitOpError("region-fold summarize slice type is invalid");
+      return operation->emitOpError("summarize slice type is invalid");
     for (unsigned dimension = 0; dimension < source.getRank(); ++dimension)
-      if (dimension != static_cast<unsigned>(axis.getInt()) &&
+      if (dimension != static_cast<unsigned>(axis) &&
           !sameDimension(source, dimension, slice, dimension))
         return operation->emitOpError(
-            "region-fold summarize slice changed a non-source dimension");
+            "summarize slice changed a non-source dimension");
     if (sliceTypes.size() > 1) {
       auto firstSlice = cast<RankedTensorType>(sliceTypes.front());
-      if (getDimensionID(firstSlice, axis.getInt()) !=
-          getDimensionID(slice, axis.getInt()))
+      if (getDimensionID(firstSlice, axis) != getDimensionID(slice, axis))
         return operation->emitOpError(
-            "region-fold source components are not sliced in lockstep");
+            "source components are not sliced in lockstep");
     }
   }
-  SmallVector<Type> identities = getOperandTypes(
-      operation, static_cast<unsigned>(*sourceCount),
-      static_cast<unsigned>(*identityCount));
-  if (!llvm::equal(identities, operation->getResultTypes()))
-    return operation->emitOpError("region-fold identity/result schema disagrees");
-  SmallVector<Type> captures = getOperandTypes(
-      operation, static_cast<unsigned>(*sourceCount + *identityCount));
-  SmallVector<Type> summarizeArguments(sliceTypes);
-  summarizeArguments.append(captures);
-  if (failed(verifyYieldSchema(operation, operation->getRegion(0),
-                               summarizeArguments, identities, true)))
+  auto types = [](ValueRange values) {
+    return llvm::to_vector(llvm::map_range(values, [](Value value) {
+      return value.getType();
+    }));
+  };
+  SmallVector<Type> identities = types(structured.getIdentities());
+  if (failed(verifyYieldSchema(operation, *structured.getSummarizeRegion(),
+                               structured.getSummarizeArgumentTypes(sliceTypes),
+                               identities, true)))
     return failure();
-  SmallVector<Type> combineArguments(identities);
-  combineArguments.append(identities);
-  return verifyYieldSchema(operation, operation->getRegion(1), combineArguments,
-                           identities, true);
-}
-
-LogicalResult verifyRegionScan(Operation *operation) {
-  FailureOr<int64_t> sourceCount = getCount(operation, "source_count");
-  FailureOr<int64_t> identityCount = getCount(operation, "identity_count");
-  FailureOr<int64_t> stateCount = getCount(operation, "state_count");
-  FailureOr<int64_t> captureCount = getCount(operation, "capture_count");
-  FailureOr<int64_t> outputCount = getCount(operation, "output_count");
-  auto axis = operation->getAttrOfType<IntegerAttr>("axis");
-  if (failed(sourceCount) || failed(identityCount) || failed(stateCount) ||
-      failed(captureCount) || failed(outputCount) || *sourceCount <= 0 ||
-      *identityCount <= 0 || *stateCount <= 0 || *outputCount <= 0 || !axis ||
-      axis.getInt() < 0 ||
-      operation->getNumOperands() != static_cast<unsigned>(
-          *sourceCount + *identityCount + *stateCount + *captureCount) ||
-      operation->getNumResults() !=
-          static_cast<unsigned>(*outputCount + *stateCount) ||
-      operation->getNumRegions() != 4)
-    return operation->emitOpError("region-scan component partition is inconsistent");
-  for (Region &region : operation->getRegions())
-    if (failed(verifyOneBlock(operation, region, "intent.yield")))
-      return failure();
-
-  SmallVector<Type> slices;
-  RankedTensorType first;
-  for (int64_t index = 0; index < *sourceCount; ++index) {
-    auto source = dyn_cast<RankedTensorType>(operation->getOperand(index).getType());
-    if (!source || axis.getInt() >= source.getRank())
-      return operation->emitOpError("region-scan source axis is invalid");
-    if (!first)
-      first = source;
-    else if (!sameDimension(first, axis.getInt(), source, axis.getInt()))
-      return operation->emitOpError(
-          "region-scan sources do not share one logical source extent");
-    Type sliceType = operation->getRegion(0).front().getArgument(index).getType();
-    auto slice = dyn_cast<RankedTensorType>(sliceType);
-    if (!slice || slice.getRank() != source.getRank() ||
-        slice.getElementType() != source.getElementType())
-      return operation->emitOpError("region-scan summarize slice type is invalid");
-    for (unsigned dimension = 0; dimension < source.getRank(); ++dimension)
-      if (dimension != static_cast<unsigned>(axis.getInt()) &&
-          !sameDimension(source, dimension, slice, dimension))
-        return operation->emitOpError(
-            "region-scan summarize slice changed a non-source dimension");
-    if (!slices.empty()) {
-      auto firstSlice = cast<RankedTensorType>(slices.front());
-      if (getDimensionID(firstSlice, axis.getInt()) !=
-          getDimensionID(slice, axis.getInt()))
-        return operation->emitOpError(
-            "region-scan source components are not sliced in lockstep");
-    }
-    slices.push_back(sliceType);
+  if (failed(verifyYieldSchema(operation, structured.getCombine(),
+                              structured.getCombineArgumentTypes(),
+                              identities, true)))
+    return failure();
+  if (structured.getStructuredKind() == StructuredOpKind::RegionFold) {
+    if (!llvm::equal(identities, operation->getResultTypes()))
+      return operation->emitOpError("identity/result schema disagrees");
+    return success();
   }
-  SmallVector<Type> transitions = getOperandTypes(
-      operation, static_cast<unsigned>(*sourceCount),
-      static_cast<unsigned>(*identityCount));
-  SmallVector<Type> states = getOperandTypes(
-      operation, static_cast<unsigned>(*sourceCount + *identityCount),
-      static_cast<unsigned>(*stateCount));
-  SmallVector<Type> captures = getOperandTypes(
-      operation,
-      static_cast<unsigned>(*sourceCount + *identityCount + *stateCount));
-  SmallVector<Type> finalStates = getResultTypes(
-      operation, static_cast<unsigned>(*outputCount),
-      static_cast<unsigned>(*stateCount));
+  SmallVector<Type> states = types(structured.getInitialStates());
+  SmallVector<Type> finalStates = types(structured.getFinalStates());
   if (!llvm::equal(states, finalStates))
-    return operation->emitOpError("region-scan final-state schema is inconsistent");
-  SmallVector<Type> summarizeArguments(slices);
-  summarizeArguments.append(captures);
-  if (failed(verifyYieldSchema(operation, operation->getRegion(0),
-                               summarizeArguments, transitions, true)))
+    return operation->emitOpError("final-state schema is inconsistent");
+  if (failed(verifyYieldSchema(operation, *structured.getApplyRegion(),
+                              structured.getApplyArgumentTypes(), states, true)))
     return failure();
-  SmallVector<Type> combineArguments(transitions);
-  combineArguments.append(transitions);
-  if (failed(verifyYieldSchema(operation, operation->getRegion(1),
-                               combineArguments, transitions, true)))
-    return failure();
-  SmallVector<Type> applyArguments(transitions);
-  applyArguments.append(states);
-  if (failed(verifyYieldSchema(operation, operation->getRegion(2), applyArguments,
-                               states, true)))
-    return failure();
-  SmallVector<Type> emitArguments(slices);
-  emitArguments.append(states);
-  emitArguments.append(captures);
-  Region &emit = operation->getRegion(3);
-  if (!llvm::equal(emit.front().getArgumentTypes(), emitArguments) ||
-      emit.front().back().getNumOperands() != *outputCount)
-    return operation->emitOpError("region-scan emit schema is inconsistent");
-  if (failed(verifyYieldSchema(operation, emit, emitArguments,
+  Region &emit = *structured.getEmitRegion();
+  if (failed(verifyYieldSchema(operation, emit,
+                               structured.getEmitArgumentTypes(sliceTypes),
                                emit.front().back().getOperandTypes(), true)))
     return failure();
-  auto firstSlice = cast<RankedTensorType>(slices.front());
+  auto firstSlice = cast<RankedTensorType>(sliceTypes.front());
   std::optional<int64_t> sliceDimensionID =
-      getDimensionID(firstSlice, axis.getInt());
+      getDimensionID(firstSlice, axis);
   if (!sliceDimensionID)
     return operation->emitOpError(
         "region-scan slice axis requires a stable dynamic extent identity");
-  for (unsigned index = 0; index < static_cast<unsigned>(*outputCount); ++index)
+  for (auto [emitted, output] : llvm::zip_equal(
+           structured.getEmitYields(), structured.getEmittedResults()))
     if (failed(verifySliceAssembly(
-            operation, emit.front().back().getOperand(index).getType(),
-            operation->getResult(index).getType(), *sliceDimensionID, first,
-            axis.getInt())))
+            operation, emitted.getType(), output.getType(),
+            *sliceDimensionID, first, axis)))
       return failure();
   return success();
 }
@@ -1559,9 +1354,6 @@ LogicalResult verifyAtomic(Operation *operation) {
 
 LogicalResult verifyCanonicalOperation(Operation *operation) {
   StringRef name = operation->getName().getStringRef();
-  if (name == "intent.parallel" || name == "intent.if" ||
-      name == "intent.for" || name == "intent.while")
-    return verifyControlOperation(operation);
   if (name == "intent.make_tuple" || name == "intent.make_record" ||
       name == "intent.extract")
     return verifyProductOperation(operation);
@@ -1572,13 +1364,13 @@ LogicalResult verifyCanonicalOperation(Operation *operation) {
       name == "intent.broadcast" || name == "intent.full")
     return verifyDataOperation(operation);
   if (name == "intent.reduce")
-    return verifyReduceOrScan(operation, false);
+    return verifyReduceOrScan(cast<StructuredOpInterface>(operation), false);
   if (name == "intent.scan")
-    return verifyReduceOrScan(operation, true);
+    return verifyReduceOrScan(cast<StructuredOpInterface>(operation), true);
   if (name == "intent.region_fold")
-    return verifyRegionFold(operation);
+    return verifySegmentedOperation(cast<StructuredOpInterface>(operation));
   if (name == "intent.region_scan")
-    return verifyRegionScan(operation);
+    return verifySegmentedOperation(cast<StructuredOpInterface>(operation));
   if (name == "intent.quantize" || name == "intent.quantized_dot")
     return verifyQuantization(operation);
   if (name == "intent.contract" || name == "intent.scaled_contract" ||
@@ -1873,7 +1665,6 @@ INTENT_DEFINE_VERIFY(BufferOp)
 INTENT_DEFINE_VERIFY(BufferStoreOp)
 INTENT_DEFINE_VERIFY(CastOp)
 INTENT_DEFINE_VERIFY(CompareOp)
-INTENT_DEFINE_VERIFY(ConditionOp)
 INTENT_DEFINE_VERIFY(ConstantOp)
 INTENT_DEFINE_VERIFY(ContractOp)
 INTENT_DEFINE_VERIFY(QuantizeOp)
@@ -1882,17 +1673,14 @@ INTENT_DEFINE_VERIFY(DimOp)
 INTENT_DEFINE_VERIFY(DomainOp)
 INTENT_DEFINE_VERIFY(DomainProductOp)
 INTENT_DEFINE_VERIFY(ExtractOp)
-INTENT_DEFINE_VERIFY(ForOp)
 INTENT_DEFINE_VERIFY(FullOp)
 INTENT_DEFINE_VERIFY(GatherOp)
 INTENT_DEFINE_VERIFY(HistogramOp)
-INTENT_DEFINE_VERIFY(IfOp)
 INTENT_DEFINE_VERIFY(IndicesOp)
 INTENT_DEFINE_VERIFY(JoinOp)
 INTENT_DEFINE_VERIFY(MakeRecordOp)
 INTENT_DEFINE_VERIFY(MakeTupleOp)
 INTENT_DEFINE_VERIFY(MaskOp)
-INTENT_DEFINE_VERIFY(ParallelOp)
 INTENT_DEFINE_VERIFY(RandomBitsOp)
 INTENT_DEFINE_VERIFY(ReduceOp)
 INTENT_DEFINE_VERIFY(RegionEndOp)
@@ -1911,7 +1699,6 @@ INTENT_DEFINE_VERIFY(TransposeOp)
 INTENT_DEFINE_VERIFY(UnaryOp)
 INTENT_DEFINE_VERIFY(ViewLoadOp)
 INTENT_DEFINE_VERIFY(ViewStoreOp)
-INTENT_DEFINE_VERIFY(WhileOp)
 INTENT_DEFINE_VERIFY(YieldOp)
 
 #undef INTENT_DEFINE_VERIFY

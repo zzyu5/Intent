@@ -1,4 +1,5 @@
 #include "Intent/Analysis/CanonicalKernel.h"
+#include "Intent/Interfaces/StructuredOpInterface.h"
 
 #include "Intent/Dialect/Intent/IR/IntentOps.h"
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
@@ -154,28 +155,32 @@ CoordinateProvenance CanonicalKernelAnalysis::blockArgumentProvenance(
   Operation *owner = argument.getOwner()->getParentOp();
   if (!owner)
     return knownWithoutCoordinates();
-  if (isa<ParallelOp, ForOp>(owner)) {
-    auto domain = dyn_cast<DomainType>(owner->getOperand(0).getType());
-    auto region = dyn_cast<RegionType>(owner->getOperand(0).getType());
-    unsigned rank = domain ? domain.getRank() : region ? region.getRank() : 0;
-    if (argument.getArgNumber() < rank) {
+  if (auto loop = dyn_cast<ForOp>(owner)) {
+    auto induction = loop.getInductionVars();
+    auto coordinate = llvm::find(induction, argument);
+    if (coordinate != induction.end()) {
       CoordinateProvenance result = knownWithoutCoordinates();
-      result.origins.push_back(
-          {absoluteCoordinateSource(owner->getOperand(0)),
-           argument.getArgNumber()});
+      result.origins.push_back({absoluteCoordinateSource(loop.getSource()),
+                               static_cast<unsigned>(coordinate - induction.begin())});
       return result;
     }
-    unsigned carry = argument.getArgNumber() - rank + 1;
-    return carry < owner->getNumOperands()
-               ? coordinateProvenance(owner->getOperand(carry))
+    auto carries = loop.getRegionIterArgs();
+    auto carry = llvm::find(carries, argument);
+    return carry != carries.end()
+               ? coordinateProvenance(loop.getInitArgs()[carry - carries.begin()])
                : CoordinateProvenance();
   }
-  if (isa<RegionFoldOp, RegionScanOp>(owner)) {
-    auto sourceCount = owner->getAttrOfType<IntegerAttr>("source_count");
-    if (sourceCount && argument.getArgNumber() < sourceCount.getInt())
-      return coordinateProvenance(
-          owner->getOperand(argument.getArgNumber()));
+  if (auto parallel = dyn_cast<ParallelOp>(owner)) {
+    CoordinateProvenance result = knownWithoutCoordinates();
+    result.origins.push_back({absoluteCoordinateSource(parallel.getSource()), argument.getArgNumber()});
+    return result;
   }
+  if (auto structured = dyn_cast<StructuredOpInterface>(owner))
+    for (const auto &relation : structured.getValueRelations())
+      if (relation.to == argument &&
+          (relation.kind == StructuredRelationKind::Capture ||
+           relation.kind == StructuredRelationKind::SourceSlice))
+        return coordinateProvenance(relation.from);
   return knownWithoutCoordinates();
 }
 
@@ -335,17 +340,13 @@ CanonicalKernelAnalysis::logicalBuffer(Operation *operation) const {
 RegionSegmentFact
 CanonicalKernelAnalysis::regionSegment(Operation *operation) const {
   RegionSegmentFact fact;
-  uint64_t axis = 0;
-  ValueRange sources;
-  if (auto fold = dyn_cast_or_null<RegionFoldOp>(operation)) {
-    axis = fold.getAxis();
-    sources = fold.getInputs().take_front(fold.getSourceCount());
-  } else if (auto scan = dyn_cast_or_null<RegionScanOp>(operation)) {
-    axis = scan.getAxis();
-    sources = scan.getInputs().take_front(scan.getSourceCount());
-  } else {
+  auto structured = dyn_cast_or_null<StructuredOpInterface>(operation);
+  if (!structured || !structured.getSummarizeRegion())
     return fact;
-  }
+  auto axes = structured.getIterationAxes();
+  if (axes.size() != 1) return fact;
+  uint64_t axis = axes.front();
+  ValueRange sources = structured.getSources();
   int64_t dimension = 0;
   for (Value source : sources) {
     auto tensor = dyn_cast<RankedTensorType>(source.getType());

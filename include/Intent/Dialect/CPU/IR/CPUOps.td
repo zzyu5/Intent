@@ -2,6 +2,7 @@
 #define INTENT_DIALECT_CPU_IR_CPUOPS_TD
 
 include "Intent/Dialect/CPU/IR/CPUAttrs.td"
+include "Intent/Dialect/CPU/IR/CPUOpInterfaces.td"
 include "Intent/Dialect/Intent/IR/IntentAttrs.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
@@ -122,24 +123,31 @@ def IntentCPU_QuantizedDotOp : IntentCPU_Op<"quantized_dot"> {
 }
 
 class IntentCPU_RegionOp<string name> : IntentCPU_Op<name,
-    [RecursiveMemoryEffects]> {
-  let arguments = (ins Variadic<AnyType>:$inputs, I64Attr:$axis,
-      I64Attr:$source_count, I64Attr:$identity_count, I64Attr:$capture_count,
-      I64Attr:$state_count, I64Attr:$output_count,
-      ArrayAttr:$summary_fields, ArrayAttr:$state_fields, DenseI64ArrayAttr:$output_axes,
-      OptionalAttr<I64Attr>:$segment_size);
+    [RecursiveMemoryEffects, AttrSizedOperandSegments, IntentCPU_RegionOpInterface]> {
   let hasVerifier = 1;
 }
 
 def IntentCPU_RegionFoldOp : IntentCPU_RegionOp<"region_fold"> {
   let summary = "Ordered source slices and destination-passing summary helpers";
+  let arguments = (ins Variadic<AnyMemRef>:$sources, Variadic<AnyType>:$identities,
+      Variadic<AnyType>:$captures, Variadic<AnyMemRef>:$summary_outputs,
+      I64Attr:$axis, ArrayAttr:$summary_fields, OptionalAttr<I64Attr>:$segment_size);
   let regions = (region SizedRegion<1>:$summarize, SizedRegion<1>:$combine);
 }
 
 def IntentCPU_RegionScanOp : IntentCPU_RegionOp<"region_scan"> {
   let summary = "Region transitions, incoming state, slice outputs and final state";
+  let arguments = (ins Variadic<AnyMemRef>:$sources, Variadic<AnyType>:$identities,
+      Variadic<AnyType>:$initial_states, Variadic<AnyType>:$captures,
+      Variadic<AnyMemRef>:$emitted_outputs, Variadic<AnyMemRef>:$final_state_outputs,
+      I64Attr:$axis, ArrayAttr:$summary_fields, ArrayAttr:$state_fields,
+      DenseI64ArrayAttr:$output_axes, OptionalAttr<I64Attr>:$segment_size);
   let regions = (region SizedRegion<1>:$summarize, SizedRegion<1>:$combine,
       SizedRegion<1>:$apply, SizedRegion<1>:$emit);
+  let extraClassDeclaration = [{
+    ::mlir::Region *getApplyRegion() { return &getApply(); }
+    ::mlir::Region *getEmitRegion() { return &getEmit(); }
+  }];
 }
 
 def IntentCPU_RegionYieldOp : IntentCPU_Op<"region_yield", [Pure, Terminator]>;

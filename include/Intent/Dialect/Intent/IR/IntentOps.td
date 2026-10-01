@@ -4,6 +4,7 @@
 include "Intent/Dialect/Intent/IR/IntentDialect.td"
 include "Intent/Dialect/Intent/IR/IntentAttrs.td"
 include "Intent/Dialect/Intent/IR/IntentTypes.td"
+include "Intent/Interfaces/StructuredOpInterface.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
@@ -70,30 +71,77 @@ def Intent_ParallelOp : Intent_Op<"parallel", [RecursiveMemoryEffects]> {
   let arguments = (ins Intent_IterationValue:$source);
   let results = (outs);
   let regions = (region SizedRegion<1>:$body);
+  let assemblyFormat = [{
+    $source `:` type($source) $body attr-dict
+  }];
 }
-def Intent_IfOp : Intent_Op<"if", [RecursiveMemoryEffects]> {
+def Intent_IfOp : Intent_Op<"if", [RecursiveMemoryEffects,
+    DeclareOpInterfaceMethods<RegionBranchOpInterface>]> {
   let arguments = (ins I1:$condition);
   let results = (outs Variadic<Intent_Value>:$results);
   let regions = (region SizedRegion<1>:$then_region,
                          SizedRegion<1>:$else_region);
+  let assemblyFormat = [{
+    $condition `then` $then_region `else` $else_region
+    `->` `(` type($results) `)` attr-dict
+  }];
 }
-def Intent_ForOp : Intent_Op<"for", [RecursiveMemoryEffects]> {
-  let arguments = (ins Variadic<Intent_Value>:$inputs);
+def Intent_ForOp : Intent_Op<"for", [RecursiveMemoryEffects,
+    DeclareOpInterfaceMethods<RegionBranchOpInterface,
+                              ["getEntrySuccessorOperands"]>]> {
+  let arguments = (ins Intent_IterationValue:$source,
+                       Variadic<Intent_Value>:$init_args);
   let results = (outs Variadic<Intent_Value>:$results);
   let regions = (region SizedRegion<1>:$body);
+  let extraClassDeclaration = [{
+    ::mlir::Block::BlockArgListType getInductionVars() {
+      return getBody().front().getArguments().drop_back(getInitArgs().size());
+    }
+    ::mlir::Block::BlockArgListType getRegionIterArgs() {
+      return getBody().front().getArguments().take_back(getInitArgs().size());
+    }
+  }];
+  let assemblyFormat = [{
+    $source `:` type($source)
+    `init` `(` ($init_args^ `:` type($init_args))? `)`
+    $body `->` `(` type($results) `)` attr-dict
+  }];
 }
-def Intent_WhileOp : Intent_Op<"while", [RecursiveMemoryEffects]> {
-  let arguments = (ins Variadic<Intent_Value>:$inputs);
+def Intent_WhileOp : Intent_Op<"while", [RecursiveMemoryEffects,
+    DeclareOpInterfaceMethods<RegionBranchOpInterface,
+                              ["getEntrySuccessorOperands"]>]> {
+  let arguments = (ins Variadic<Intent_Value>:$init_args);
   let results = (outs Variadic<Intent_Value>:$results);
   let regions = (region SizedRegion<1>:$before, SizedRegion<1>:$after);
+  let extraClassDeclaration = [{
+    ::mlir::Block::BlockArgListType getBeforeArguments() {
+      return getBefore().front().getArguments();
+    }
+    ::mlir::Block::BlockArgListType getAfterArguments() {
+      return getAfter().front().getArguments();
+    }
+  }];
+  let assemblyFormat = [{
+    `init` `(` ($init_args^ `:` type($init_args))? `)`
+    `before` $before `after` $after
+    `->` `(` type($results) `)` attr-dict
+  }];
 }
-def Intent_YieldOp : Intent_Op<"yield", [Terminator]> {
+def Intent_YieldOp : Intent_Op<"yield", [Terminator, ReturnLike]> {
   let arguments = (ins Variadic<Intent_Value>:$inputs);
   let results = (outs);
+  let assemblyFormat = [{
+    ($inputs^ `:` type($inputs))? attr-dict
+  }];
 }
-def Intent_ConditionOp : Intent_Op<"condition", [Terminator]> {
-  let arguments = (ins Variadic<Intent_Value>:$inputs);
+def Intent_ConditionOp : Intent_Op<"condition", [Terminator,
+    HasParent<"WhileOp">,
+    DeclareOpInterfaceMethods<RegionBranchTerminatorOpInterface>]> {
+  let arguments = (ins I1:$condition, Variadic<Intent_Value>:$args);
   let results = (outs);
+  let assemblyFormat = [{
+    $condition `forward` `(` ($args^ `:` type($args))? `)` attr-dict
+  }];
 }
 
 def Intent_ViewLoadOp : Intent_Op<"view_load", [MemoryEffects<[MemRead]>]> {
@@ -172,49 +220,129 @@ def Intent_MaskOp : Intent_Op<"mask", [Pure]> {
   let results = (outs Intent_DataValue:$result);
 }
 
-def Intent_ReduceOp : Intent_Op<"reduce", [Pure]> {
-  let arguments = (ins Variadic<Intent_Value>:$inputs,
-                       ArrayAttr:$axes,
-                       I64Attr:$source_count,
-                       I64Attr:$identity_count,
-                       I64Attr:$capture_count);
+def Intent_ReduceOp : Intent_Op<"reduce", [Pure, IsolatedFromAbove, AttrSizedOperandSegments, Intent_StructuredOpInterface]> {
+  let arguments = (ins Variadic<Intent_Value>:$sources,
+                       Variadic<Intent_Value>:$identities,
+                       Variadic<Intent_Value>:$captures,
+                       ArrayAttr:$axes);
   let results = (outs Variadic<Intent_Value>:$results);
   let regions = (region SizedRegion<1>:$combine);
+  let assemblyFormat = [{
+    `sources` `(` $sources `:` type($sources) `)`
+    `identities` `(` $identities `:` type($identities) `)`
+    `captures` `(` ($captures^ `:` type($captures))? `)`
+    `axes` $axes
+    `combine` $combine
+    `->` `(` type($results) `)`
+    attr-dict
+  }];
+  let extraClassDeclaration = [{
+    ::intent::StructuredOpKind getStructuredKind() {
+      return ::intent::StructuredOpKind::Reduce;
+    }
+    ::llvm::SmallVector<int64_t> getIterationAxes() {
+      ::llvm::SmallVector<int64_t> axes;
+      for (auto axis : getAxes())
+        axes.push_back(::mlir::cast<::mlir::IntegerAttr>(axis).getInt());
+      return axes;
+    }
+  }];
 }
-def Intent_ScanOp : Intent_Op<"scan", [Pure]> {
-  let arguments = (ins Variadic<Intent_Value>:$inputs,
+
+def Intent_ScanOp : Intent_Op<"scan", [Pure, IsolatedFromAbove, AttrSizedOperandSegments, Intent_StructuredOpInterface]> {
+  let arguments = (ins Variadic<Intent_Value>:$sources,
+                       Variadic<Intent_Value>:$identities,
+                       Variadic<Intent_Value>:$captures,
                        I64Attr:$axis,
                        BoolAttr:$inclusive,
-                       BoolAttr:$reverse,
-                       I64Attr:$source_count,
-                       I64Attr:$identity_count,
-                       I64Attr:$capture_count);
+                       BoolAttr:$reverse);
   let results = (outs Variadic<Intent_Value>:$results);
   let regions = (region SizedRegion<1>:$combine);
+  let assemblyFormat = [{
+    `sources` `(` $sources `:` type($sources) `)`
+    `identities` `(` $identities `:` type($identities) `)`
+    `captures` `(` ($captures^ `:` type($captures))? `)`
+    `axis` $axis
+    `inclusive` $inclusive `reverse` $reverse
+    `combine` $combine
+    `->` `(` type($results) `)`
+    attr-dict
+  }];
+  let extraClassDeclaration = [{
+    ::intent::StructuredOpKind getStructuredKind() {
+      return ::intent::StructuredOpKind::Scan;
+    }
+    ::llvm::SmallVector<int64_t> getIterationAxes() {
+      return {static_cast<int64_t>(getAxis())};
+    }
+  }];
 }
-def Intent_RegionFoldOp : Intent_Op<"region_fold", [Pure]> {
-  let arguments = (ins Variadic<Intent_Value>:$inputs,
-                       I64Attr:$axis,
-                       I64Attr:$source_count,
-                       I64Attr:$identity_count,
-                       I64Attr:$capture_count);
+
+def Intent_RegionFoldOp : Intent_Op<"region_fold", [Pure, IsolatedFromAbove, AttrSizedOperandSegments, Intent_StructuredOpInterface]> {
+  let arguments = (ins Variadic<Intent_Value>:$sources,
+                       Variadic<Intent_Value>:$identities,
+                       Variadic<Intent_Value>:$captures,
+                       I64Attr:$axis);
   let results = (outs Variadic<Intent_Value>:$results);
   let regions = (region SizedRegion<1>:$summarize,
                          SizedRegion<1>:$combine);
+  let assemblyFormat = [{
+    `sources` `(` $sources `:` type($sources) `)`
+    `identities` `(` $identities `:` type($identities) `)`
+    `captures` `(` ($captures^ `:` type($captures))? `)`
+    `axis` $axis
+    `summarize` $summarize
+    `combine` $combine
+    `->` `(` type($results) `)`
+    attr-dict
+  }];
+  let extraClassDeclaration = [{
+    ::intent::StructuredOpKind getStructuredKind() {
+      return ::intent::StructuredOpKind::RegionFold;
+    }
+    ::llvm::SmallVector<int64_t> getIterationAxes() {
+      return {static_cast<int64_t>(getAxis())};
+    }
+    ::mlir::Region *getSummarizeRegion() { return &getSummarize(); }
+  }];
 }
-def Intent_RegionScanOp : Intent_Op<"region_scan", [Pure]> {
-  let arguments = (ins Variadic<Intent_Value>:$inputs,
-                       I64Attr:$axis,
-                       I64Attr:$source_count,
-                       I64Attr:$identity_count,
-                       I64Attr:$state_count,
-                       I64Attr:$capture_count,
-                       I64Attr:$output_count);
-  let results = (outs Variadic<Intent_Value>:$results);
+
+def Intent_RegionScanOp : Intent_Op<"region_scan", [Pure, IsolatedFromAbove, AttrSizedOperandSegments, Intent_StructuredOpInterface, AttrSizedResultSegments]> {
+  let arguments = (ins Variadic<Intent_Value>:$sources,
+                       Variadic<Intent_Value>:$identities,
+                       Variadic<Intent_Value>:$initial_states,
+                       Variadic<Intent_Value>:$captures,
+                       I64Attr:$axis);
+  let results = (outs Variadic<Intent_Value>:$emitted_results,
+                      Variadic<Intent_Value>:$final_states);
   let regions = (region SizedRegion<1>:$summarize,
                          SizedRegion<1>:$combine,
                          SizedRegion<1>:$apply,
                          SizedRegion<1>:$emit);
+  let assemblyFormat = [{
+    `sources` `(` $sources `:` type($sources) `)`
+    `identities` `(` $identities `:` type($identities) `)`
+    `initial_states` `(` $initial_states `:` type($initial_states) `)`
+    `captures` `(` ($captures^ `:` type($captures))? `)`
+    `axis` $axis
+    `summarize` $summarize
+    `combine` $combine
+    `apply` $apply
+    `emit` $emit
+    `->` `(` type($emitted_results) `)` `final_states` `(` type($final_states) `)`
+    attr-dict
+  }];
+  let extraClassDeclaration = [{
+    ::intent::StructuredOpKind getStructuredKind() {
+      return ::intent::StructuredOpKind::RegionScan;
+    }
+    ::llvm::SmallVector<int64_t> getIterationAxes() {
+      return {static_cast<int64_t>(getAxis())};
+    }
+    ::mlir::Region *getSummarizeRegion() { return &getSummarize(); }
+    ::mlir::Region *getApplyRegion() { return &getApply(); }
+    ::mlir::Region *getEmitRegion() { return &getEmit(); }
+  }];
 }
 
 def Intent_ContractOp : Intent_Op<"contract", [Pure]> {

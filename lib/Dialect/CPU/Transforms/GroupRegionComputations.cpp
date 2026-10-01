@@ -1,4 +1,4 @@
-#include "Intent/Dialect/CPU/IR/RegionProgram.h"
+#include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Utilities.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -79,28 +79,22 @@ struct RegionGroup {
     }
     width = std::min(rows, divisor);
     if (width <= 1 || divisor % width || headViews.empty()) return false;
-    RegionProgram program(fold);
-    for (Value value : program.identities()) {
+    auto program = cast<RegionOpInterface>(fold.getOperation());
+    for (Value value : program.getIdentities()) {
       auto type = dyn_cast<MemRefType>(value.getType());
       if (!type || !type.getRank() || type.getDimSize(0) != 1) return false;
       mark(value);
     }
-    for (Value value : program.outputs()) mark(value);
+    for (Value value : program.getDestinations()) mark(value);
     bool changed = true;
     while (changed) {
       changed = false;
-      auto arguments = [&](Block &body, ValueRange operands) {
-        for (auto [argument, operand] : llvm::zip(body.getArguments(), operands))
-          if (lifted.contains(operand)) changed |= mark(argument);
-      };
-      SmallVector<Value> summarize(program.sources());
-      llvm::append_range(summarize, program.captures());
-      llvm::append_range(summarize, program.outputs());
-      arguments(program.summarize().front(), summarize);
-      SmallVector<Value> combine(program.identities());
-      llvm::append_range(combine, program.identities());
-      llvm::append_range(combine, program.outputs());
-      arguments(program.combine().front(), combine);
+      for (Region &helper : program->getRegions()) {
+        auto schema = program.getRegionSchema(helper);
+        if (failed(schema)) return false;
+        for (const auto &relation : *schema)
+          if (lifted.contains(relation.prototype)) changed |= mark(relation.argument);
+      }
       parallel->walk([&](Operation *operation) {
         if (auto generic = dyn_cast<linalg::GenericOp>(operation)) {
           if (batched(generic))
@@ -116,8 +110,8 @@ struct RegionGroup {
         }
       });
     }
-    if (llvm::any_of(program.sources(), [&](Value value) { return lifted.contains(value); }) ||
-        llvm::none_of(program.captures(), [&](Value value) { return lifted.contains(value); })) return false;
+    if (llvm::any_of(program.getSources(), [&](Value value) { return lifted.contains(value); }) ||
+        llvm::none_of(program.getCaptures(), [&](Value value) { return lifted.contains(value); })) return false;
     bool valid = true;
     parallel->walk([&](Operation *operation) {
       if (operation == parallel || operation == fold ||
@@ -211,17 +205,17 @@ struct RegionGroup {
     // ABI disjointness separates input/output buffers. Each writable buffer
     // must additionally use one injective head-row projection; private and
     // helper destinations may not escape the original parallel iteration.
-    SmallVector<Value> summarize(program.sources());
-    llvm::append_range(summarize, program.captures());
-    llvm::append_range(summarize, program.outputs());
-    SmallVector<Value> combine(program.identities());
-    llvm::append_range(combine, program.identities());
-    llvm::append_range(combine, program.outputs());
+    SmallVector<Value> summarize(program.getSources());
+    llvm::append_range(summarize, program.getCaptures());
+    llvm::append_range(summarize, program.getDestinations());
+    SmallVector<Value> combine(program.getIdentities());
+    llvm::append_range(combine, program.getIdentities());
+    llvm::append_range(combine, program.getDestinations());
     auto root = [&](Value memory) {
       Value value = physical.storageRoot(memory);
       while (auto argument = dyn_cast<BlockArgument>(value)) {
         if (argument.getOwner()->getParentOp() != fold) break;
-        value = argument.getOwner() == &program.summarize().front()
+        value = argument.getOwner() == &program.getSummarize().front()
             ? summarize[argument.getArgNumber()] : combine[argument.getArgNumber()];
         value = physical.storageRoot(value);
       }
@@ -418,20 +412,17 @@ struct GroupRewriter {
         loops = translatedLoops;
       } else loops = {};
     }
-    for (auto [number, regions] : llvm::enumerate(llvm::zip(operation->getRegions(), replacement->getRegions()))) {
-      auto &[source, destination] = regions;
+    for (auto [source, destination] : llvm::zip(operation->getRegions(), replacement->getRegions())) {
       if (source.empty()) continue;
       SmallVector<Type> arguments;
       if (operation == group.fold) {
-        RegionProgram program(replacement);
-        if (number == 0) {
-          for (BlockArgument argument : source.front().getArguments().take_front(program.sources().size()))
-            arguments.push_back(argument.getType());
-          llvm::append_range(arguments, program.captures().getTypes());
-          llvm::append_range(arguments, program.outputs().getTypes());
-        } else {
-          for (unsigned i = 0; i < 3; ++i) llvm::append_range(arguments, program.identities().getTypes());
-        }
+        auto program = cast<RegionOpInterface>(operation);
+        auto schema = program.getRegionSchema(source);
+        assert(succeeded(schema) && "grouping requires a verified region schema");
+        for (const auto &relation : *schema)
+          arguments.push_back(relation.kind == RegionArgumentKind::Sources
+              ? relation.argument.getType()
+              : mapping.lookupOrDefault(relation.prototype).getType());
       } else llvm::append_range(arguments, source.front().getArgumentTypes());
       auto *body = new Block;
       destination.push_back(body);

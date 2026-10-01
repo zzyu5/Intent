@@ -4,6 +4,7 @@
 #include "Intent/Conversion/KIRToGPU/KIRToGPU.h"
 
 #include "Intent/Analysis/CanonicalKernel.h"
+#include "Intent/Interfaces/StructuredOpInterface.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
@@ -1306,38 +1307,11 @@ FailureOr<Type> convertReductionResultType(Type logical, Operation *origin,
     return convertDataType(logical, origin, std::nullopt, 1, resultIndex);
   if (sourceType.getShape().size() < reducedAxes.size())
     return failure();
-
-  SmallVector<bool> reduced(sourceType.getShape().size(), false);
-  for (int64_t axis : reducedAxes) {
-    if (axis < 0 || axis >= static_cast<int64_t>(reduced.size()) ||
-        reduced[axis])
-      return failure();
-    reduced[axis] = true;
-  }
   if (logicalType.getRank() !=
       static_cast<int64_t>(sourceType.getShape().size() - reducedAxes.size()))
     return failure();
-
-  SmallVector<Attribute> shape;
-  SmallVector<Attribute> mappings;
-  unsigned resultAxis = 0;
-  for (auto [axis, extent] : llvm::enumerate(sourceType.getShape())) {
-    if (reduced[axis])
-      continue;
-    shape.push_back(extent);
-    auto sourceMapping = cast<AxisMapAttr>(sourceType.getAxisMaps()[axis]);
-    mappings.push_back(AxisMapAttr::get(
-        logical.getContext(), sourceMapping.getSourceId(),
-        sourceMapping.getSourceAxis(), sourceMapping.getDimensionId(), resultAxis,
-        sourceMapping.getDerived()));
-    ++resultAxis;
-  }
-  auto prototype = FragmentType::get(
-      logical.getContext(), logicalType.getElementType(),
-      ArrayAttr::get(logical.getContext(), shape),
-      ArrayAttr::get(logical.getContext(), mappings), sourceType.getValidity(),
-      sourceType.getOwner());
-  return Type(prototype);
+  return gpu::inferCollectiveResultType(sourceType, reducedAxes,
+                                        logicalType.getElementType());
 }
 
 FailureOr<Type> convertContractResultType(
@@ -3962,314 +3936,138 @@ private:
       mapResults(operation, target);
       return success();
     }
-    if (auto reduce = dyn_cast<intent::ReduceOp>(operation)) {
-      SmallVector<Value> inputs;
-      for (Value input : reduce.getInputs()) {
-        FailureOr<Value> lowered = get(input);
-        if (failed(lowered))
-          return reduce.emitOpError("reduce physical operand is unavailable");
-        inputs.push_back(*lowered);
-      }
-      SmallVector<int64_t> axes;
-      for (Attribute axis : reduce.getAxes())
-        axes.push_back(cast<IntegerAttr>(axis).getInt());
-      SmallVector<Type> results;
-      for (auto [index, logical] : llvm::enumerate(reduce.getResultTypes())) {
-        if (index >= reduce.getSourceCount())
-          return reduce.emitOpError(
-              "reduce result has no corresponding physical source");
-        FailureOr<Type> converted = convertReductionResultType(
-            logical, operation, inputs[index], axes, index);
-        if (failed(converted))
-          return reduce.emitOpError("reduce result has no physical schema")
-                 << "; logical_result=" << logical
-                 << ", physical_source=" << inputs[index].getType()
-                 << ", reduced_axes=" << reduce.getAxes();
-        results.push_back(*converted);
-      }
-      for (unsigned index = 0; index < reduce.getIdentityCount(); ++index) {
-        unsigned operand = reduce.getSourceCount() + index;
-        FailureOr<Value> identity = projectPositionalValue(
-            builder, location, inputs[operand], results[index]);
-        if (failed(identity))
-          return reduce.emitOpError(
-              "reduce identity cannot adopt its physical accumulator schema");
-        inputs[operand] = *identity;
-      }
-      OperationState state(location, gpu::ReduceOp::getOperationName());
-      state.addOperands(inputs);
-      state.addTypes(results);
-      state.addAttribute("axes", builder.getDenseI64ArrayAttr(axes));
-      state.addAttribute("source_count",
-                         builder.getI64IntegerAttr(reduce.getSourceCount()));
-      state.addAttribute("identity_count",
-                         builder.getI64IntegerAttr(reduce.getIdentityCount()));
-      state.addAttribute("capture_count",
-                         builder.getI64IntegerAttr(reduce.getCaptureCount()));
-      state.addRegion();
-      Operation *raw = builder.create(state);
-      auto target = cast<gpu::ReduceOp>(raw);
-      SmallVector<Type> arguments(results);
-      arguments.append(results);
-      for (Value capture : llvm::drop_begin(
-               inputs, reduce.getSourceCount() + reduce.getIdentityCount()))
-        arguments.push_back(capture.getType());
-      if (failed(lowerPureRegion(reduce.getCombine(), target.getCombine(),
-                                 arguments, results)))
-        return failure();
-      mapResults(operation, raw);
-      return success();
-    }
-    if (auto scan = dyn_cast<intent::ScanOp>(operation)) {
-      SmallVector<Value> inputs;
-      for (Value input : scan.getInputs()) {
-        FailureOr<Value> lowered = get(input);
-        if (failed(lowered))
-          return scan.emitOpError("scan physical operand is unavailable");
-        inputs.push_back(*lowered);
-      }
-      SmallVector<Type> results;
-      for (auto [index, logical] : llvm::enumerate(scan.getResultTypes())) {
-        if (index >= scan.getSourceCount())
-          return scan.emitOpError(
-              "scan result has no corresponding physical source");
-        std::optional<Type> prototype = inputs[index].getType();
-        FailureOr<Type> converted =
-            convertDataType(logical, operation, prototype, /*owner=*/1, index);
-        if (failed(converted))
-          return scan.emitOpError("scan result has no physical schema");
-        results.push_back(*converted);
-      }
-      for (unsigned index = 0; index < scan.getIdentityCount(); ++index) {
-        unsigned operand = scan.getSourceCount() + index;
-        FailureOr<Value> identity = projectPositionalValue(
-            builder, location, inputs[operand], results[index]);
-        if (failed(identity))
-          return scan.emitOpError(
-              "scan identity cannot adopt its physical accumulator schema");
-        inputs[operand] = *identity;
-      }
-      OperationState state(location, gpu::ScanOp::getOperationName());
-      state.addOperands(inputs);
-      state.addTypes(results);
-      state.addAttribute("axis", builder.getI64IntegerAttr(scan.getAxis()));
-      state.addAttribute("inclusive", builder.getBoolAttr(scan.getInclusive()));
-      state.addAttribute("reverse", builder.getBoolAttr(scan.getReverse()));
-      state.addAttribute("source_count",
-                         builder.getI64IntegerAttr(scan.getSourceCount()));
-      state.addAttribute("identity_count",
-                         builder.getI64IntegerAttr(scan.getIdentityCount()));
-      state.addAttribute("capture_count",
-                         builder.getI64IntegerAttr(scan.getCaptureCount()));
-      state.addRegion();
-      Operation *raw = builder.create(state);
-      auto target = cast<gpu::ScanOp>(raw);
-      SmallVector<Type> arguments(results);
-      arguments.append(results);
-      for (Value capture : llvm::drop_begin(
-               inputs, scan.getSourceCount() + scan.getIdentityCount()))
-        arguments.push_back(capture.getType());
-      if (failed(lowerPureRegion(scan.getCombine(), target.getCombine(),
-                                 arguments, results)))
-        return failure();
-      mapResults(operation, raw);
-      return success();
-    }
-    if (auto fold = dyn_cast<intent::RegionFoldOp>(operation)) {
-      SmallVector<Value> inputs;
-      for (Value input : fold.getInputs()) {
-        FailureOr<Value> lowered = get(input);
-        if (failed(lowered))
-          return fold.emitOpError("region-fold physical operand is unavailable");
-        inputs.push_back(*lowered);
-      }
-      SmallVector<Type> results;
-      for (auto [index, logical] : llvm::enumerate(fold.getResultTypes())) {
-        std::optional<Type> prototype =
-            inputs[fold.getSourceCount() + index].getType();
-        FailureOr<Type> converted =
-            convertDataType(logical, operation, prototype, /*owner=*/1, index);
-        if (failed(converted))
-          return fold.emitOpError("region-fold result has no physical schema");
-        results.push_back(*converted);
-      }
-      for (unsigned index = 0; index < fold.getIdentityCount(); ++index) {
-        unsigned operand = fold.getSourceCount() + index;
-        FailureOr<Value> identity = projectPositionalValue(
-            builder, location, inputs[operand], results[index]);
-        if (failed(identity))
-          return fold.emitOpError(
-              "region-fold identity cannot adopt its physical summary schema");
-        inputs[operand] = *identity;
-      }
-      Block &sourceSummary = fold.getSummarize().front();
-      FailureOr<gpu::ParameterAttr> segment =
-          getOrCreateRegionSegment(operation);
-      if (failed(segment))
-        return failure();
-      OperationState state(location, gpu::RegionFoldOp::getOperationName());
-      state.addOperands(inputs);
-      state.addTypes(results);
-      state.addAttribute("axis", builder.getI64IntegerAttr(fold.getAxis()));
-      state.addAttribute("source_count",
-                         builder.getI64IntegerAttr(fold.getSourceCount()));
-      state.addAttribute("identity_count",
-                         builder.getI64IntegerAttr(fold.getIdentityCount()));
-      state.addAttribute("capture_count",
-                         builder.getI64IntegerAttr(fold.getCaptureCount()));
-      state.addAttribute("segment", *segment);
-      state.addRegion();
-      state.addRegion();
-      Operation *raw = builder.create(state);
-      auto target = cast<gpu::RegionFoldOp>(raw);
-      SmallVector<Type> summarizeArguments;
-      for (unsigned index = 0; index < fold.getSourceCount(); ++index) {
-        auto tensor = dyn_cast<RankedTensorType>(
-            sourceSummary.getArgument(index).getType());
-        auto prototype = dyn_cast<FragmentType>(inputs[index].getType());
-        FailureOr<FragmentType> converted =
-            tensor && prototype
-                ? convertSegmentSliceType(
-                      tensor, prototype, fold.getAxis(),
-                      (*segment).getName().getValue())
-                : FailureOr<FragmentType>(failure());
-        if (failed(converted))
-          return fold.emitOpError(
-              "region-fold source slice has no physical fragment schema");
-        summarizeArguments.push_back(*converted);
-      }
-      for (Value capture : llvm::drop_begin(
-               inputs, fold.getSourceCount() + fold.getIdentityCount()))
-        summarizeArguments.push_back(capture.getType());
-      if (failed(lowerPureRegion(fold.getSummarize(), target.getSummarize(),
-                                 summarizeArguments, results)))
-        return failure();
-      SmallVector<Type> combineArguments(results);
-      combineArguments.append(results);
-      if (failed(lowerPureRegion(fold.getCombine(), target.getCombine(),
-                                 combineArguments, results)))
-        return failure();
-      mapResults(operation, raw);
-      return success();
-    }
-    if (auto scan = dyn_cast<intent::RegionScanOp>(operation)) {
-      SmallVector<Value> inputs;
-      for (Value input : scan.getInputs()) {
-        FailureOr<Value> lowered = get(input);
-        if (failed(lowered))
-          return scan.emitOpError("region-scan physical operand is unavailable");
-        inputs.push_back(*lowered);
-      }
-      SmallVector<Type> results;
-      for (auto [index, logical] : llvm::enumerate(scan.getResultTypes())) {
-        std::optional<Type> prototype;
-        if (index >= scan.getOutputCount()) {
-          unsigned stateIndex = index - scan.getOutputCount();
-          unsigned stateOffset =
-              scan.getSourceCount() + scan.getIdentityCount();
-          if (stateIndex >= scan.getStateCount() ||
-              stateOffset + stateIndex >= inputs.size())
-            return scan.emitOpError(
-                "region-scan final-state result has no matching state operand");
-          prototype = inputs[stateOffset + stateIndex].getType();
+    if (auto schema = dyn_cast<StructuredOpInterface>(operation)) {
+      auto lowerOperands = [&](ValueRange operands) -> FailureOr<SmallVector<Value>> {
+        SmallVector<Value> values;
+        for (Value operand : operands) {
+          auto value = get(operand);
+          if (failed(value))
+            return operation->emitOpError("structured physical operand is unavailable"), failure();
+          values.push_back(*value);
         }
-        FailureOr<Type> converted =
-            convertDataType(logical, operation, prototype, /*owner=*/1,
-                            index);
+        return values;
+      };
+      auto sources = lowerOperands(schema.getSources());
+      auto identities = lowerOperands(schema.getIdentities());
+      auto initialStates = lowerOperands(schema.getInitialStates());
+      auto captures = lowerOperands(schema.getCaptures());
+      if (failed(sources) || failed(identities) || failed(initialStates) || failed(captures))
+        return failure();
+      auto kind = schema.getStructuredKind();
+      auto axes = schema.getIterationAxes();
+      const bool region = schema.getSummarizeRegion() != nullptr;
+      const bool scan = kind == StructuredOpKind::RegionScan;
+      SmallVector<Type> results;
+      for (auto [index, logical] : llvm::enumerate(operation->getResultTypes())) {
+        FailureOr<Type> converted = failure();
+        if (kind == StructuredOpKind::Reduce) {
+          if (index >= sources->size())
+            return operation->emitOpError("reduce result has no corresponding physical source");
+          converted = convertReductionResultType(logical, operation, (*sources)[index], axes, index);
+        } else {
+          std::optional<Type> prototype;
+          if (kind == StructuredOpKind::Scan) {
+            if (index >= sources->size())
+              return operation->emitOpError("scan result has no corresponding physical source");
+            prototype = (*sources)[index].getType();
+          } else if (kind == StructuredOpKind::RegionFold) {
+            prototype = (*identities)[index].getType();
+          } else if (index >= schema.getEmittedResults().size()) {
+            unsigned state = index - schema.getEmittedResults().size();
+            if (state >= initialStates->size())
+              return operation->emitOpError("region-scan final-state result has no matching state operand");
+            prototype = (*initialStates)[state].getType();
+          }
+          converted = convertDataType(logical, operation, prototype, /*owner=*/1, index);
+        }
         if (failed(converted))
-          return scan.emitOpError("region-scan result has no physical schema");
+          return operation->emitOpError("structured result has no physical schema")
+              << "; result=" << index << "; logical_type=" << logical;
         results.push_back(*converted);
       }
-      Block &sourceSummary = scan.getSummarize().front();
-      FailureOr<gpu::ParameterAttr> segment =
-          getOrCreateRegionSegment(operation);
-      if (failed(segment))
-        return failure();
-      OperationState state(location, gpu::RegionScanOp::getOperationName());
-      state.addOperands(inputs);
-      state.addTypes(results);
-      state.addAttribute("axis", builder.getI64IntegerAttr(scan.getAxis()));
-      state.addAttribute("source_count",
-                         builder.getI64IntegerAttr(scan.getSourceCount()));
-      state.addAttribute("identity_count",
-                         builder.getI64IntegerAttr(scan.getIdentityCount()));
-      state.addAttribute("state_count",
-                         builder.getI64IntegerAttr(scan.getStateCount()));
-      state.addAttribute("capture_count",
-                         builder.getI64IntegerAttr(scan.getCaptureCount()));
-      state.addAttribute("output_count",
-                         builder.getI64IntegerAttr(scan.getOutputCount()));
-      state.addAttribute("segment", *segment);
-      for (unsigned region = 0; region < 4; ++region)
-        state.addRegion();
-      Operation *raw = builder.create(state);
-      auto target = cast<gpu::RegionScanOp>(raw);
-      SmallVector<Type> sliceTypes;
-      for (unsigned index = 0; index < scan.getSourceCount(); ++index) {
-        auto tensor = dyn_cast<RankedTensorType>(
-            sourceSummary.getArgument(index).getType());
-        auto prototype = dyn_cast<FragmentType>(inputs[index].getType());
-        FailureOr<FragmentType> converted =
-            tensor && prototype
-                ? convertSegmentSliceType(
-                      tensor, prototype, scan.getAxis(),
-                      (*segment).getName().getValue())
-                : FailureOr<FragmentType>(failure());
-        if (failed(converted))
-          return scan.emitOpError(
-              "region-scan source slice has no physical fragment schema");
-        sliceTypes.push_back(*converted);
+      if (!scan) {
+        for (auto [index, identity] : llvm::enumerate(*identities)) {
+          auto projected = projectPositionalValue(builder, location, identity, results[index]);
+          if (failed(projected))
+            return operation->emitOpError("structured identity cannot adopt its physical accumulator schema");
+          (*identities)[index] = *projected;
+        }
       }
-      SmallVector<Type> transitionTypes;
-      for (unsigned index = 0; index < scan.getIdentityCount(); ++index)
-        transitionTypes.push_back(
-            inputs[scan.getSourceCount() + index].getType());
-      SmallVector<Type> stateTypes;
-      unsigned stateOffset = scan.getSourceCount() + scan.getIdentityCount();
-      for (unsigned index = 0; index < scan.getStateCount(); ++index)
-        stateTypes.push_back(inputs[stateOffset + index].getType());
-      SmallVector<Type> captureTypes;
-      unsigned captureOffset = stateOffset + scan.getStateCount();
-      for (Value capture : llvm::drop_begin(inputs, captureOffset))
-        captureTypes.push_back(capture.getType());
-      SmallVector<Type> summarizeArguments(sliceTypes);
-      summarizeArguments.append(captureTypes);
-      if (failed(lowerPureRegion(scan.getSummarize(), target.getSummarize(),
-                                 summarizeArguments, transitionTypes)))
-        return failure();
-      SmallVector<Type> combineArguments(transitionTypes);
-      combineArguments.append(transitionTypes);
-      if (failed(lowerPureRegion(scan.getCombine(), target.getCombine(),
-                                 combineArguments, transitionTypes)))
-        return failure();
-      SmallVector<Type> applyArguments(transitionTypes);
-      applyArguments.append(stateTypes);
-      if (failed(lowerPureRegion(scan.getApply(), target.getApply(),
-                                 applyArguments, stateTypes)))
-        return failure();
-      SmallVector<Type> emitArguments(sliceTypes);
-      emitArguments.append(stateTypes);
-      emitArguments.append(captureTypes);
-      if (failed(lowerPureRegion(scan.getEmit(), target.getEmit(),
-                                 emitArguments)))
-        return failure();
-      auto emitted = dyn_cast<gpu::YieldOp>(target.getEmit().front().back());
-      if (!emitted || emitted.getValues().size() != scan.getOutputCount())
-        return scan.emitOpError(
-            "region-scan emitter has no complete physical output schema");
-      for (unsigned index = 0; index < scan.getOutputCount(); ++index) {
-        FailureOr<Type> assembled = regionAssemblyType(
-            results[index], emitted.getValues()[index].getType());
-        if (failed(assembled))
-          return scan.emitOpError(
-                     "region-scan emitted slice cannot define its assembled output relation")
-                 << "; result_index=" << index
-                 << "; slice=" << emitted.getValues()[index].getType()
-                 << "; result=" << results[index];
-        results[index] = *assembled;
-        target.getResult(index).setType(*assembled);
+      gpu::ParameterAttr segment;
+      if (region) {
+        auto parameter = getOrCreateRegionSegment(operation);
+        if (failed(parameter)) return failure();
+        segment = *parameter;
       }
-      mapResults(operation, raw);
+      auto created = [&]() -> FailureOr<Operation *> {
+        switch (kind) {
+        case StructuredOpKind::Reduce:
+          return builder.create<gpu::ReduceOp>(location, *sources, *identities,
+              *captures, axes).getOperation();
+        case StructuredOpKind::Scan: {
+          auto logical = cast<intent::ScanOp>(operation);
+          return builder.create<gpu::ScanOp>(location, *sources, *identities, *captures,
+              logical.getAxis(), logical.getInclusive(), logical.getReverse()).getOperation();
+        }
+        case StructuredOpKind::RegionFold:
+          return builder.create<gpu::RegionFoldOp>(location, results, *sources, *identities,
+              *captures, axes.front(), segment).getOperation();
+        case StructuredOpKind::RegionScan:
+          return builder.create<gpu::RegionScanOp>(location,
+              TypeRange(results).take_front(schema.getEmittedResults().size()),
+              TypeRange(results).drop_front(schema.getEmittedResults().size()),
+              *sources, *identities, *initialStates, *captures, axes.front(), segment).getOperation();
+        }
+        return operation->emitOpError("unknown structured operation kind"), failure();
+      }();
+      if (failed(created)) return failure();
+      Operation *target = *created;
+      auto physical = cast<StructuredOpInterface>(target);
+      if (!region) {
+        if (failed(lowerPureRegion(schema.getCombine(), physical.getCombine(),
+                physical.getCombineArgumentTypes(), results)))
+          return failure();
+      } else {
+        SmallVector<Type> slices;
+        for (auto [formal, value] : llvm::zip(schema.getSummarizeSources(), *sources)) {
+          auto tensor = dyn_cast<RankedTensorType>(formal.getType());
+          auto prototype = dyn_cast<FragmentType>(value.getType());
+          auto converted = tensor && prototype
+              ? convertSegmentSliceType(tensor, prototype, axes.front(), segment.getName().getValue())
+              : FailureOr<FragmentType>(failure());
+          if (failed(converted))
+            return operation->emitOpError("region source slice has no physical fragment schema");
+          slices.push_back(*converted);
+        }
+        SmallVector<Type> summaryTypes;
+        if (scan) llvm::append_range(summaryTypes, TypeRange(*identities));
+        else summaryTypes = results;
+        if (failed(lowerPureRegion(*schema.getSummarizeRegion(), *physical.getSummarizeRegion(),
+                physical.getSummarizeArgumentTypes(slices), summaryTypes))) return failure();
+        if (failed(lowerPureRegion(schema.getCombine(), physical.getCombine(),
+                physical.getCombineArgumentTypes(), summaryTypes))) return failure();
+        if (scan) {
+          SmallVector<Type> stateTypes;
+          llvm::append_range(stateTypes, TypeRange(*initialStates));
+          if (failed(lowerPureRegion(*schema.getApplyRegion(), *physical.getApplyRegion(),
+                  physical.getApplyArgumentTypes(), stateTypes))) return failure();
+          if (failed(lowerPureRegion(*schema.getEmitRegion(), *physical.getEmitRegion(),
+                  physical.getEmitArgumentTypes(slices))))
+            return failure();
+          auto emitted = physical.getEmitYields();
+          if (emitted.size() != physical.getEmittedResults().size())
+            return operation->emitOpError("region-scan emitter has no complete physical output schema");
+          for (auto [index, result, slice] : llvm::enumerate(physical.getEmittedResults(), emitted)) {
+            auto assembled = regionAssemblyType(result.getType(), slice.getType());
+            if (failed(assembled))
+              return operation->emitOpError("region-scan emitted slice cannot define its assembled output relation")
+                  << "; result_index=" << index << "; slice=" << slice.getType()
+                  << "; result=" << result.getType();
+            result.setType(*assembled);
+          }
+        }
+      }
+      mapResults(operation, target);
       return success();
     }
     auto axisPairs = [&](ArrayAttr pairs, SmallVectorImpl<int64_t> &lhs,
@@ -5107,11 +4905,15 @@ private:
     if (isa<intent::ForOp, intent::ParallelOp>(operation)) {
       // Parallel regions remaining inside an execution group may be serialized.
       // Keep their enclosing ordered control and resource environment intact.
-      ValueRange inputs = operation->getOperands();
-      if (inputs.empty())
-        return operation->emitOpError("iteration lacks its logical domain");
+      auto forOperation = dyn_cast<intent::ForOp>(operation);
+      auto parallel = dyn_cast<intent::ParallelOp>(operation);
+      Value sourceDomain = forOperation ? forOperation.getSource() : parallel.getSource();
+      Region &sourceRegion = forOperation ? forOperation.getBody() : parallel.getBody();
+      ValueRange inductionVariables = forOperation ? ValueRange(forOperation.getInductionVars())
+                                                  : ValueRange(sourceRegion.front().getArguments());
+      ValueRange iterArguments = forOperation ? ValueRange(forOperation.getRegionIterArgs()) : ValueRange{};
       SmallVector<IterationAxis> axes;
-      if (failed(collectIterationAxes(inputs.front(), axes)) ||
+      if (failed(collectIterationAxes(sourceDomain, axes)) ||
           axes.empty())
         return operation->emitOpError(
             "iteration source has no exact domain/subregion relation");
@@ -5164,7 +4966,8 @@ private:
         steps.push_back(step);
       }
       SmallVector<Value> initial;
-      for (Value input : inputs.drop_front()) {
+      ValueRange initArgs = forOperation ? ValueRange(forOperation.getInitArgs()) : ValueRange{};
+      for (Value input : initArgs) {
         FailureOr<Value> lowered = get(input);
         if (failed(lowered))
           return failure();
@@ -5179,13 +4982,11 @@ private:
                       ValueRange carries) -> SmallVector<Value> {
         if (axis == axes.size()) {
           auto childValues = values;
-          Block &source = operation->getRegion(0).front();
+          Block &source = sourceRegion.front();
           for (auto [argument, coordinate] :
-               llvm::zip(source.getArguments().take_front(axes.size()),
-                         coordinates))
+               llvm::zip(inductionVariables, coordinates))
             childValues[argument] = coordinate;
-          for (auto [argument, carry] : llvm::zip(
-                   source.getArguments().drop_front(axes.size()), carries))
+          for (auto [argument, carry] : llvm::zip(iterArguments, carries))
             childValues[argument] = carry;
           ScalarRegionLowering child(nested, std::move(childValues), views,
                                      dimensions, parameters, canonicalAnalysis,
@@ -5266,7 +5067,7 @@ private:
     if (auto whileOperation = dyn_cast<intent::WhileOp>(operation)) {
       SmallVector<Value> initial;
       SmallVector<Type> resultTypes;
-      for (Value input : whileOperation.getInputs()) {
+      for (Value input : whileOperation.getInitArgs()) {
         FailureOr<Value> lowered = get(input);
         if (failed(lowered))
           return failure();
@@ -5281,7 +5082,7 @@ private:
             SmallVector<Location>(resultTypes.size(), location));
         auto childValues = values;
         for (auto [source, targetArgument] : llvm::zip(
-                 whileOperation.getBefore().front().getArguments(),
+                 whileOperation.getBeforeArguments(),
                  before->getArguments()))
           childValues[source] = targetArgument;
         builder.setInsertionPointToStart(before);
@@ -5293,9 +5094,9 @@ private:
           if (failed(child.lower(&nested)))
             return failure();
         auto condition = cast<intent::ConditionOp>(source.getTerminator());
-        FailureOr<Value> predicate = child.get(condition.getInputs().front());
+        FailureOr<Value> predicate = child.get(condition.getCondition());
         SmallVector<Value> forwarded;
-        for (Value value : condition.getInputs().drop_front()) {
+        for (Value value : condition.getArgs()) {
           FailureOr<Value> lowered = child.get(value);
           if (failed(lowered))
             return failure();
@@ -5312,7 +5113,7 @@ private:
             SmallVector<Location>(resultTypes.size(), location));
         auto childValues = values;
         for (auto [source, targetArgument] : llvm::zip(
-                 whileOperation.getAfter().front().getArguments(),
+                 whileOperation.getAfterArguments(),
                  after->getArguments()))
           childValues[source] = targetArgument;
         builder.setInsertionPointToStart(after);

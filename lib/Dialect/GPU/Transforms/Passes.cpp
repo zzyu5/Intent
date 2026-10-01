@@ -369,7 +369,7 @@ scf::IfOp independentUniformBranches(func::FuncOp kernel) {
   for (unsigned index = 0; index < 2; ++index)
     conditional->getRegion(index).walk([&](ReduceOp reduction) {
       for (Value source :
-           reduction.getInputs().take_front(reduction.getSourceCount())) {
+           reduction.getSources()) {
         auto type = cast<FragmentType>(source.getType());
         for (int64_t axis : reduction.getAxes()) {
           auto sourceAxis =

@@ -4,9 +4,12 @@ add_mlir_dialect_library(MLIRIntentGPUDialect
 
   DEPENDS
   IntentGPUIncGen
+  IntentStructuredOpInterfaceIncGen
 
   LINK_LIBS PUBLIC
   MLIRIntentDialect
+  MLIRIntentStructuredOpInterface
+  MLIRInferTypeOpInterface
   MLIRFuncDialect
   MLIRIR
   MLIRSideEffectInterfaces

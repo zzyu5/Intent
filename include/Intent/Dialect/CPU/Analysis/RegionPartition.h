@@ -1,7 +1,7 @@
 #ifndef INTENT_DIALECT_CPU_ANALYSIS_REGIONPARTITION_H
 #define INTENT_DIALECT_CPU_ANALYSIS_REGIONPARTITION_H
 
-#include "Intent/Dialect/CPU/IR/RegionProgram.h"
+#include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "llvm/ADT/DenseMap.h"
 #include <optional>
 
@@ -14,7 +14,7 @@ struct RegionPartition {
   int64_t width;
 };
 
-std::optional<RegionPartition> analyzeRegionPartition(RegionProgram program,
+std::optional<RegionPartition> analyzeRegionPartition(RegionOpInterface program,
                                                      int64_t tileM, int64_t tileN);
 
 }

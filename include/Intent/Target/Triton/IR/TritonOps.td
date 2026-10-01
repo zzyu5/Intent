@@ -5,6 +5,7 @@ include "Intent/Dialect/GPU/IR/GPUTypes.td"
 include "Intent/Target/Triton/IR/TritonDialect.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/Interfaces/InferTypeOpInterface.td"
 
 class IntentTriton_Op<string mnemonic, list<Trait> traits = []> :
     Op<IntentTriton_Dialect, mnemonic, traits>;
@@ -113,13 +114,20 @@ def IntentTriton_SplitOp : IntentTriton_Op<"split", [Pure]> {
 }
 
 class IntentTriton_ElementwiseCollective<string mnemonic> :
-    IntentTriton_Op<mnemonic, [Pure]> {
-  let arguments = (ins Variadic<AnyType>:$inputs,
-                       I64Attr:$source_count,
+    IntentTriton_Op<mnemonic, [Pure, IsolatedFromAbove, AttrSizedOperandSegments,
+        DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let arguments = (ins Variadic<IntentGPU_DataValue>:$sources,
+                       Variadic<IntentGPU_DataValue>:$identities,
                        I64Attr:$axis,
                        BoolAttr:$reverse);
   let results = (outs Variadic<AnyType>:$outputs);
   let regions = (region AnyRegion:$combine);
+  let assemblyFormat = [{
+    `sources` `(` $sources `:` type($sources) `)`
+    `identities` `(` ($identities^ `:` type($identities))? `)`
+    `axis` $axis `reverse` $reverse
+    `combine` $combine `->` `(` type($outputs) `)` attr-dict
+  }];
   let hasVerifier = 1;
 }
 

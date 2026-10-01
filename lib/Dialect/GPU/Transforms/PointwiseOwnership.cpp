@@ -198,9 +198,8 @@ bool analyzeStructuredFreeBlock(Block &block,
       sawContract = true;
     } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
       ValueRange sources =
-          reduce.getInputs().take_front(reduce.getSourceCount());
-      ValueRange boundaries =
-          reduce.getInputs().drop_front(reduce.getSourceCount());
+          reduce.getSources();
+      auto boundaries = llvm::concat<const Value>(reduce.getIdentities(), reduce.getCaptures());
       if (!llvm::any_of(sources, [&](Value value) {
             return dependent.contains(value);
           }) ||
@@ -238,19 +237,15 @@ bool analyzeStructuredRegionFold(
   if (!llvm::hasSingleElement(fold.getSummarize()) ||
       !llvm::hasSingleElement(fold.getCombine()))
     return false;
-  unsigned sourceCount = fold.getSourceCount();
-  unsigned identityCount = fold.getIdentityCount();
-  unsigned captureCount = fold.getCaptureCount();
-  ValueRange inputs = fold.getInputs();
-  if (inputs.size() != sourceCount + identityCount + captureCount)
-    return false;
-  if (llvm::any_of(inputs.take_front(sourceCount + identityCount), depends))
+  auto structured = cast<StructuredOpInterface>(fold.getOperation());
+  unsigned identityCount = fold.getIdentities().size();
+  if (llvm::any_of(fold.getSources(), depends) || llvm::any_of(fold.getIdentities(), depends))
     return false;
 
   SmallVector<unsigned> summarizeArguments;
-  for (unsigned capture = 0; capture < captureCount; ++capture)
-    if (depends(inputs[sourceCount + identityCount + capture]))
-      summarizeArguments.push_back(sourceCount + capture);
+  for (auto [capture, argument] : llvm::zip_equal(fold.getCaptures(), structured.getSummarizeCaptures()))
+    if (depends(capture))
+      summarizeArguments.push_back(cast<BlockArgument>(argument).getArgNumber());
   if (summarizeArguments.empty())
     return false;
   if (!analyzeStructuredFreeBlock(fold.getSummarize().front(),
@@ -528,9 +523,8 @@ bool supportsStructuredFreeAxisValueGraph(
     }
     if (auto reduce = dyn_cast<ReduceOp>(operation)) {
       ValueRange sources =
-          reduce.getInputs().take_front(reduce.getSourceCount());
-      ValueRange boundaries =
-          reduce.getInputs().drop_front(reduce.getSourceCount());
+          reduce.getSources();
+      auto boundaries = llvm::concat<const Value>(reduce.getIdentities(), reduce.getCaptures());
       if (!llvm::any_of(sources, depends) || llvm::any_of(boundaries, depends))
         return false;
       sawReduction = true;
@@ -855,26 +849,21 @@ LogicalResult rankLiftPointwiseValueGraph(
       if (!llvm::hasSingleElement(fold.getSummarize()) ||
           !llvm::hasSingleElement(fold.getCombine()))
         return WalkResult::interrupt();
-      unsigned sourceCount = fold.getSourceCount();
-      unsigned identityCount = fold.getIdentityCount();
-      unsigned captureCount = fold.getCaptureCount();
-      ValueRange inputs = fold.getInputs();
-      if (inputs.size() != sourceCount + identityCount + captureCount ||
-          llvm::any_of(inputs.take_front(sourceCount + identityCount),
-                       dependsOnLiftedAxis)) {
+      auto structured = cast<StructuredOpInterface>(fold.getOperation());
+      unsigned identityCount = fold.getIdentities().size();
+      if (llvm::any_of(fold.getSources(), dependsOnLiftedAxis) ||
+          llvm::any_of(fold.getIdentities(), dependsOnLiftedAxis)) {
         fold.emitOpError("rank lifting requires independent sources and identities");
         return WalkResult::interrupt();
       }
 
       Block &summarize = fold.getSummarize().front();
       bool dependentCapture = false;
-      for (unsigned capture = 0; capture < captureCount; ++capture) {
-        unsigned operand = sourceCount + identityCount + capture;
-        if (!dependsOnLiftedAxis(inputs[operand]))
-          continue;
+      for (auto [capture, formal] : llvm::zip_equal(fold.getCaptures(), structured.getSummarizeCaptures())) {
+        if (!dependsOnLiftedAxis(capture)) continue;
         dependentCapture = true;
-        BlockArgument argument = summarize.getArgument(sourceCount + capture);
-        argument.setType(inputs[operand].getType());
+        auto argument = cast<BlockArgument>(formal);
+        argument.setType(capture.getType());
         liftedValues.insert(argument);
       }
       if (!dependentCapture)
@@ -888,8 +877,7 @@ LogicalResult rankLiftPointwiseValueGraph(
         return WalkResult::interrupt();
 
       Block &combine = fold.getCombine().front();
-      if (combine.getNumArguments() != 2 * identityCount)
-        return WalkResult::interrupt();
+      if (failed(verifyStructuredArity(structured))) return WalkResult::interrupt();
       SmallVector<Type> resultTypes;
       SmallVector<bool> dependentResults;
       OpBuilder builder(fold);
@@ -902,15 +890,15 @@ LogicalResult rankLiftPointwiseValueGraph(
         if (!dependent)
           continue;
         FailureOr<Value> identity = projectPhysicalValueToSchema(
-            builder, fold.getLoc(), inputs[sourceCount + index], target);
+            builder, fold.getLoc(), fold.getIdentities()[index], target);
         if (failed(identity))
           return WalkResult::interrupt();
-        fold->setOperand(sourceCount + index, *identity);
+        fold.getIdentitiesMutable().slice(index, 1).assign(*identity);
         fold.getResult(index).setType(target);
-        combine.getArgument(index).setType(target);
-        combine.getArgument(identityCount + index).setType(target);
-        liftedValues.insert(combine.getArgument(index));
-        liftedValues.insert(combine.getArgument(identityCount + index));
+        structured.getCombineLhs()[index].setType(target);
+        structured.getCombineRhs()[index].setType(target);
+        liftedValues.insert(structured.getCombineLhs()[index]);
+        liftedValues.insert(structured.getCombineRhs()[index]);
         liftedValues.insert(fold.getResult(index));
       }
       if (!llvm::any_of(dependentResults, [](bool value) { return value; }))
@@ -1009,13 +997,13 @@ LogicalResult rankLiftPointwiseValueGraph(
     }
     if (auto reduce = dyn_cast<ReduceOp>(operation)) {
       bool sourceDepends = llvm::any_of(
-          reduce.getInputs().take_front(reduce.getSourceCount()),
+          reduce.getSources(),
           dependsOnLiftedAxis);
       if (!sourceDepends)
         return WalkResult::interrupt();
       OpBuilder builder(reduce);
-      for (unsigned index = 0; index < reduce.getSourceCount(); ++index) {
-        Value source = reduce.getInputs()[index];
+      for (unsigned index = 0; index < reduce.getSources().size(); ++index) {
+        Value source = reduce.getSources()[index];
         FailureOr<Value> projected = projectPhysicalValueToSchema(
             builder, reduce.getLoc(), source, liftedValueType(source.getType()));
         if (failed(projected)) {
@@ -1027,19 +1015,15 @@ LogicalResult rankLiftPointwiseValueGraph(
       reduce->setAttr("axes", DenseI64ArrayAttr::get(
                                   kernel.getContext(),
                                   shiftedAxes(reduce.getAxes())));
-      if (!llvm::hasSingleElement(reduce.getCombine()) ||
-          reduce.getCombine().front().getNumArguments() <
-              2 * reduce.getIdentityCount())
-        return WalkResult::interrupt();
+      auto structured = cast<StructuredOpInterface>(reduce.getOperation());
+      if (failed(verifyStructuredArity(structured))) return WalkResult::interrupt();
       Block &combine = reduce.getCombine().front();
       for (auto [index, value] : llvm::enumerate(reduce.getResults())) {
         value.setType(liftedValueType(value.getType()));
-        combine.getArgument(index).setType(value.getType());
-        combine.getArgument(reduce.getIdentityCount() + index)
-            .setType(value.getType());
-        liftedValues.insert(combine.getArgument(index));
-        liftedValues.insert(
-            combine.getArgument(reduce.getIdentityCount() + index));
+        structured.getCombineLhs()[index].setType(value.getType());
+        structured.getCombineRhs()[index].setType(value.getType());
+        liftedValues.insert(structured.getCombineLhs()[index]);
+        liftedValues.insert(structured.getCombineRhs()[index]);
         liftedValues.insert(value);
       }
       for (Operation &nested : combine.without_terminator())

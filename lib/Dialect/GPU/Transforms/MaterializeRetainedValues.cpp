@@ -507,7 +507,7 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
     if (!reduce)
       return true;
     return llvm::all_of(
-        reduce.getInputs().take_front(reduce.getSourceCount()), [&](Value input) {
+        reduce.getSources(), [&](Value input) {
           auto axes = analysis.rangeAxes(input, chunkRoots);
           return axes.isExact() && llvm::none_of(axes.fragmentAxes, [&](unsigned axis) {
             return llvm::is_contained(reduce.getAxes(), axis);

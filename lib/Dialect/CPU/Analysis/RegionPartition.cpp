@@ -103,7 +103,7 @@ public:
     if (!isMemoryEffectFree(operation)) effectsKnown = false;
   }
 
-  std::optional<RegionPartition> select(RegionProgram program, unsigned selected, int64_t width) {
+  std::optional<RegionPartition> select(RegionOpInterface program, unsigned selected, int64_t width) {
     selected = root(selected);
     if (width <= 1 || llvm::any_of(forbidden, [&](unsigned axis) { return root(axis) == selected; })) return std::nullopt;
     RegionPartition result;
@@ -113,11 +113,11 @@ public:
         if (root(id) != selected) continue;
         if (!result.axes.try_emplace(item.first, axis).second) return std::nullopt;
       }
-    for (Value value : program.identities()) if (!result.axes.count(value)) return std::nullopt;
-    for (Value value : program.initialState()) if (!result.axes.count(value)) return std::nullopt;
-    for (Value value : program.outputs()) if (!result.axes.count(value)) return std::nullopt;
-    for (Value value : program.sources())
-      if (auto found = result.axes.find(value); found != result.axes.end() && found->second == program.count("axis"))
+    for (Value value : program.getIdentities()) if (!result.axes.count(value)) return std::nullopt;
+    for (Value value : program.getInitialStates()) if (!result.axes.count(value)) return std::nullopt;
+    for (Value value : program.getDestinations()) if (!result.axes.count(value)) return std::nullopt;
+    for (Value value : program.getSources())
+      if (auto found = result.axes.find(value); found != result.axes.end() && found->second == program.getAxis())
         return std::nullopt;
     bool legal = true;
     for (Region &helper : program.getOperation()->getRegions()) {
@@ -168,34 +168,21 @@ public:
 
 }
 
-std::optional<RegionPartition> analyzeRegionPartition(RegionProgram program,
+std::optional<RegionPartition> analyzeRegionPartition(RegionOpInterface program,
                                                      int64_t tileM, int64_t tileN) {
   Axes axes;
   // Nested control needs its own block-argument/loop-carried coordinate proof.
   for (Region &helper : program.getOperation()->getRegions())
     for (Operation &operation : helper.front().without_terminator())
       if (operation.getNumRegions() && !isa<linalg::LinalgOp>(operation)) return std::nullopt;
-  auto bind = [&](Region &helper, ValueRange inputs) {
-    for (auto [argument, value] : llvm::zip(helper.front().getArguments(), inputs)) axes.bind(argument, value);
+  for (Region &helper : program->getRegions()) {
+    auto schema = program.getRegionSchema(helper);
+    if (failed(schema)) return std::nullopt;
+    for (const auto &relation : *schema) axes.bind(relation.argument, relation.prototype);
     helper.walk([&](Operation *operation) { axes.inspect(operation); });
-  };
-  SmallVector<Value> arguments(program.sources());
-  llvm::append_range(arguments, program.captures()); llvm::append_range(arguments, program.identities());
-  bind(program.summarize(), arguments);
-  arguments.clear();
-  for (unsigned i = 0; i < 3; ++i) llvm::append_range(arguments, program.identities());
-  bind(program.combine(), arguments);
-  if (program.isScan()) {
-    arguments.assign(program.identities().begin(), program.identities().end());
-    llvm::append_range(arguments, program.initialState()); llvm::append_range(arguments, program.initialState());
-    bind(program.apply(), arguments);
-    arguments.assign(program.sources().begin(), program.sources().end());
-    llvm::append_range(arguments, program.initialState()); llvm::append_range(arguments, program.captures());
-    llvm::append_range(arguments, program.outputs().take_front(program.count("output_count")));
-    bind(program.emit(), arguments);
   }
-  auto initial = program.isScan() ? program.initialState() : program.identities();
-  for (auto [value, output] : llvm::zip(initial, program.outputs().take_back(initial.size()))) axes.bind(value, output);
+  for (auto [value, output] : llvm::zip(program.getInitialValues(), program.getFinalDestinations()))
+    axes.bind(value, output);
   if (!axes.effectsKnown) return std::nullopt;
   const int64_t widths[] = {tileM, tileN};
   for (auto contraction : axes.contractions) {

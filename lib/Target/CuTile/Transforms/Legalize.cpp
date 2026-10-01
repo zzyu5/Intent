@@ -729,7 +729,7 @@ LogicalResult finalizeProgram(ModuleOp module) {
     (*kernel)->setAttr(arrayIndexTileBoundsAttr, bounds);
   SmallVector<ValueRange> reductionSources;
   kernel->walk([&](ReduceOp reduce) {
-    reductionSources.push_back(reduce.getInputs().take_front(reduce.getSourceCount()));
+    reductionSources.push_back(reduce.getSources());
   });
   gpu::materializeDeferredReductionBounds(*kernel, reductionSources);
   if (failed(verifyCuTileProgram(module)))

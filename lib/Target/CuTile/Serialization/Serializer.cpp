@@ -554,9 +554,9 @@ private:
                !operation.getRegion(0).empty()) {
       auto reduce = dyn_cast<ReduceOp>(operation);
       auto scan = dyn_cast<ScanOp>(operation);
-      unsigned count = reduce ? reduce.getSourceCount() : scan.getSourceCount();
-      ValueRange sources = operation.getOperands().take_front(count);
-      ValueRange identities = operation.getOperands().slice(count, count);
+      ValueRange sources = reduce ? reduce.getSources() : scan.getSources();
+      ValueRange identities = reduce ? reduce.getIdentities() : scan.getIdentities();
+      unsigned count = sources.size();
       std::string source = count == 1 ? valueString(sources.front())
                                       : tuple(sources);
       std::string identity;
@@ -607,13 +607,13 @@ private:
       };
       std::string expression =
           nativeReduction(*reduce.getKind()).str() + "(" +
-          valueString(reduce.getInputs().front()) + ", axis=" +
+          valueString(reduce.getSources().front()) + ", axis=" +
           std::to_string(reduce.getAxis()) + ")";
       if (elementType(reduce.getResult(0).getType()).isInteger(1))
         expression = "ct.astype(" + expression + ", ct.bool_)";
       assign(reduce.getResult(0), expression);
     } else if (auto scan = dyn_cast<ScanOp>(operation)) {
-      assign(scan.getResult(0), "ct.cumsum(" + valueString(scan.getInputs().front()) +
+      assign(scan.getResult(0), "ct.cumsum(" + valueString(scan.getSources().front()) +
                                    ", axis=" + std::to_string(scan.getAxis()) +
                                    ", reverse=" +
                                    (scan.getReverse() ? "True" : "False") + ")");

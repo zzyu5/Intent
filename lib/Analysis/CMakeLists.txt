@@ -12,4 +12,5 @@ add_mlir_library(MLIRIntentAnalysis
   MLIRMathDialect
   MLIRIR
   MLIRIntentDialect
+  MLIRIntentStructuredOpInterface
 )

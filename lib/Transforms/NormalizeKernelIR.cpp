@@ -1,4 +1,5 @@
 #include "Intent/Transforms/Passes.h"
+#include "Intent/Interfaces/StructuredOpInterface.h"
 #include "Intent/Transforms/PassManager.h"
 #include "Intent/Dialect/Intent/IR/IntentAttrs.h"
 #include "Intent/Dialect/Intent/IR/IntentDialect.h"
@@ -236,12 +237,9 @@ bool isElementwiseBody(Block &body) {
   return true;
 }
 
-int64_t attributeInteger(Operation *operation, StringRef name) {
-  return operation->getAttrOfType<IntegerAttr>(name).getInt();
-}
-
 ReduceOp summaryReduction(Operation *operation) {
-  Block &body = operation->getRegion(0).front();
+  auto schema = cast<StructuredOpInterface>(operation);
+  Block &body = schema.getSummarizeRegion()->front();
   auto reductions = body.getOps<ReduceOp>();
   if (!llvm::hasSingleElement(reductions) ||
       !isElementwiseBody<ReduceOp>(body))
@@ -251,22 +249,17 @@ ReduceOp summaryReduction(Operation *operation) {
       flatten(reduction.getResults()))
     return {};
   ArrayAttr axes = reduction.getAxes();
-  if (axes.size() != 1 || cast<IntegerAttr>(axes[0]).getInt() != attributeInteger(operation, "axis") ||
-      !sameCombine(operation->getRegion(1), reduction.getCombine()))
+  if (axes.size() != 1 || cast<IntegerAttr>(axes[0]).getInt() != schema.getIterationAxes().front() ||
+      !sameCombine(schema.getCombine(), reduction.getCombine()))
     return {};
-  unsigned sources = attributeInteger(operation, "source_count");
-  unsigned identities = attributeInteger(operation, "identity_count");
-  unsigned capturesStart = sources + identities;
-  if (isa<RegionScanOp>(operation))
-    capturesStart += attributeInteger(operation, "state_count");
-  SmallVector<Value> arguments(operation->getOperands().take_front(sources));
-  llvm::append_range(arguments, operation->getOperands().drop_front(capturesStart));
   ReferenceMapping mapping;
-  for (auto [argument, value] : llvm::zip(body.getArguments(), arguments))
-    mapping.push_back({{argument, {}}, {value, {}}});
-  auto lhs = flatten(reduction.getInputs().slice(reduction.getSourceCount(),
-                                               reduction.getIdentityCount()));
-  auto rhs = flatten(operation->getOperands().slice(sources, identities));
+  for (const auto &relation : schema.getValueRelations())
+    if (auto argument = dyn_cast<BlockArgument>(relation.to); argument && argument.getOwner() == &body &&
+        (relation.kind == StructuredRelationKind::SourceSlice ||
+         relation.kind == StructuredRelationKind::Capture))
+      mapping.push_back({{relation.to, {}}, {relation.from, {}}});
+  auto lhs = flatten(reduction.getIdentities());
+  auto rhs = flatten(schema.getIdentities());
   if (lhs.size() != rhs.size())
     return {};
   for (auto [a, b] : llvm::zip(lhs, rhs))
@@ -284,17 +277,15 @@ bool hasElementScan(RegionScanOp operation, ReduceOp reduction) {
   if (scan.getAxis() != operation.getAxis() || !scan.getInclusive() ||
       scan.getReverse() || !sameCombine(operation.getCombine(), scan.getCombine()))
     return false;
-  unsigned sources = operation.getSourceCount();
-  unsigned states = operation.getStateCount();
-  SmallVector<Value> arguments(body.getArguments().take_front(sources));
-  llvm::append_range(arguments, body.getArguments().drop_front(sources + states));
+  auto schema = cast<StructuredOpInterface>(operation.getOperation());
   ReferenceMapping mapping;
-  for (auto [argument, value] :
-       llvm::zip(operation.getSummarize().front().getArguments(), arguments))
+  for (auto [argument, value] : llvm::zip(schema.getSummarizeSources(), schema.getEmitSources()))
+    mapping.push_back({{argument, {}}, {value, {}}});
+  for (auto [argument, value] : llvm::zip(schema.getSummarizeCaptures(), schema.getEmitCaptures()))
     mapping.push_back({{argument, {}}, {value, {}}});
   if (reduction->getNumOperands() != scan->getNumOperands())
     return false;
-  for (auto [a, b] : llvm::zip(reduction.getInputs(), scan.getInputs()))
+  for (auto [a, b] : llvm::zip(reduction.getOperands(), scan.getOperands()))
     if (!sameReference({a, {}}, {b, {}}, mapping))
       return false;
   return llvm::all_of(operation.getApply().front(),
@@ -361,12 +352,10 @@ struct DimensionSubstitution {
   }
 };
 
-SmallVector<Value> cloneBody(Region &region, ValueRange arguments,
+SmallVector<Value> cloneBody(Region &region, IRMapping &mapping,
                              Operation *owner,
                              const DimensionSubstitution &dimensions) {
   Block &body = region.front();
-  IRMapping mapping;
-  mapping.map(body.getArguments(), arguments);
   OpBuilder builder(owner);
   for (Operation &original : body.without_terminator()) {
     Operation *cloned = builder.clone(original, mapping);
@@ -399,34 +388,34 @@ void normalizeRegions(ModuleOp module) {
     auto scan = dyn_cast<RegionScanOp>(operation);
     if (scan && !hasElementScan(scan, reduction))
       continue;
-    unsigned sources = attributeInteger(operation, "source_count");
-    unsigned identities = attributeInteger(operation, "identity_count");
-    unsigned states = scan ? scan.getStateCount() : 0;
-    auto inputs = operation->getOperands().take_front(sources);
-    auto initial = operation->getOperands().slice(sources + identities, states);
-    auto captures = operation->getOperands().drop_front(sources + identities + states);
-    int64_t axis = attributeInteger(operation, "axis");
+    auto schema = cast<StructuredOpInterface>(operation);
+    auto inputs = schema.getSources();
+    auto initial = schema.getInitialStates();
+    auto captures = schema.getCaptures();
+    int64_t axis = schema.getIterationAxes().front();
     auto sourceType = cast<RankedTensorType>(inputs.front().getType());
-    auto sliceType = cast<RankedTensorType>(
-        operation->getRegion(0).front().getArgument(0).getType());
+    auto sliceType = cast<RankedTensorType>(schema.getSummarizeSources().front().getType());
     DimensionSubstitution dimensions{
         cast<TensorShapeAttr>(sliceType.getEncoding()).getDimensions()[axis],
         cast<TensorShapeAttr>(sourceType.getEncoding()).getDimensions()[axis],
         sourceType.getDimSize(axis)};
-    SmallVector<Value> arguments(inputs);
-    llvm::append_range(arguments, captures);
-    SmallVector<Value> summary = cloneBody(operation->getRegion(0), arguments,
-                                           operation, dimensions);
+    IRMapping summarizeMapping;
+    summarizeMapping.map(schema.getSummarizeSources(), inputs);
+    summarizeMapping.map(schema.getSummarizeCaptures(), captures);
+    SmallVector<Value> summary = cloneBody(*schema.getSummarizeRegion(),
+                                           summarizeMapping, operation, dimensions);
     SmallVector<Value> replacement;
     if (scan) {
-      arguments.assign(inputs.begin(), inputs.end());
-      llvm::append_range(arguments, initial);
-      llvm::append_range(arguments, captures);
-      replacement = cloneBody(scan.getEmit(), arguments, operation, dimensions);
-      arguments.assign(summary.begin(), summary.end());
-      llvm::append_range(arguments, initial);
+      IRMapping emitMapping;
+      emitMapping.map(schema.getEmitSources(), inputs);
+      emitMapping.map(schema.getEmitStates(), initial);
+      emitMapping.map(schema.getEmitCaptures(), captures);
+      replacement = cloneBody(scan.getEmit(), emitMapping, operation, dimensions);
+      IRMapping applyMapping;
+      applyMapping.map(schema.getApplySummaries(), summary);
+      applyMapping.map(schema.getApplyStates(), initial);
       llvm::append_range(replacement,
-                         cloneBody(scan.getApply(), arguments, operation, dimensions));
+                         cloneBody(scan.getApply(), applyMapping, operation, dimensions));
     } else {
       replacement = std::move(summary);
     }

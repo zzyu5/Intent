@@ -40,6 +40,9 @@ mlir::Attribute uniformZero(mlir::Type type);
 std::optional<bool> uniformBoolean(mlir::Attribute value);
 UniformExpression describeScalarValue(mlir::Value value);
 UniformExpression describeCanonicalUniformValue(mlir::Value value);
+UniformExpression describeStructuredReduction(mlir::OpResult result,
+                                              mlir::Type elementType,
+                                              bool nonempty = false);
 
 class UniformValueAnalysis {
 public:

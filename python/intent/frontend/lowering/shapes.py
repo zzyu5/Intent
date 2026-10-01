@@ -14,7 +14,7 @@ def visible_values(block: BlockState):
     blocks = []
     while block is not None:
         blocks.append(block)
-        block = block.owner.parent_block if block.owner is not None else None
+        block = block.visible_parent
     for scope in reversed(blocks):
         yield from scope.arguments
         for operation in scope.operations:

@@ -38,14 +38,14 @@ bool isScanProjection(CastOp cast) {
 
 std::optional<ScanConsumerMatch>
 matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
-  if (scan.getSourceCount() != 1 || scan.getIdentityCount() != 1 ||
-      scan.getCaptureCount() || scan.getAxis() != 0 ||
+  if (scan.getSources().size() != 1 || scan.getIdentities().size() != 1 ||
+      scan.getCaptures().size() || scan.getAxis() != 0 ||
       scan.getReverse())
     return std::nullopt;
   auto type = dyn_cast<FragmentType>(scan.getResult(0).getType());
   if (!type || type.getShape().size() != 1)
     return std::nullopt;
-  ScanConsumerMatch match{scan, {}, scan.getInputs()[1], {}};
+  ScanConsumerMatch match{scan, {}, scan.getIdentities().front(), {}};
   while (true) {
     if (auto splat = match.identity.getDefiningOp<SplatOp>())
       match.identity = splat.getValue();
@@ -92,7 +92,7 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
   if (!isConstant(match.loop.getLowerBound(), 0) ||
       !isConstant(match.loop.getStep(), 1))
     return std::nullopt;
-  PhysicalRangeFact ranges = analysis.axisRanges(scan.getInputs()[0], 0);
+  PhysicalRangeFact ranges = analysis.axisRanges(scan.getSources().front(), 0);
   if (failed(queryExactLogicalRange(ranges)) || ranges.roots.empty() ||
       !analysis.lockstepRanges(ranges.roots).isExact())
     return std::nullopt;
@@ -163,7 +163,7 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
       return false;
     return llvm::all_of(producer->getOperands(), safeSource);
   };
-  if (!safeSource(scan.getInputs()[0]))
+  if (!safeSource(scan.getSources().front()))
     return std::nullopt;
   return match;
 }
@@ -230,7 +230,7 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
             lift(match.loop.getUpperBound()), ComparePredicate::Lt);
         Value identity = lift(match.identity);
         IRMapping replay;
-        replay.map(scan.getInputs()[1], identity);
+        replay.map(scan.getIdentities().front(), identity);
         for (MakeRangeOp root : match.ranges)
           replay.map(root.getResult(), range.getResult());
         ReplayMaterializationOptions options;
@@ -241,14 +241,14 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
         options.segmentMapping = mapping;
         options.materializeZeroFill = true;
         FailureOr<Value> replayed = materializeReplayedValue(
-            nested, location, scan.getInputs()[0], source, extent, replay, options);
+            nested, location, scan.getSources().front(), source, extent, replay, options);
         if (failed(replayed)) {
           failedBody = true;
           return;
         }
         Value sourceSlice = nested.create<SelectOp>(
             location, (*replayed).getType(), tail, *replayed, identity);
-        replay.map(scan.getInputs()[0], sourceSlice);
+        replay.map(scan.getSources().front(), sourceSlice);
         auto local = cast<ScanOp>(nested.clone(*scan, replay));
         local.setInclusive(true);
         retargetSourceExtent(local.getResult(0), source, extent);
@@ -358,8 +358,8 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
 FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
                                        PhysicalProgramAnalysis &analysis) {
   auto type = dyn_cast<FragmentType>(scan.getResult(0).getType());
-  if (scan.getSourceCount() != 1 || scan.getIdentityCount() != 1 ||
-      scan.getCaptureCount() || scan.getAxis() != 0 || scan.getReverse() ||
+  if (scan.getSources().size() != 1 || scan.getIdentities().size() != 1 ||
+      scan.getCaptures().size() || scan.getAxis() != 0 || scan.getReverse() ||
       scan->getBlock() != &kernel.front() || !type || type.getShape().size() != 1)
     return false;
   auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
@@ -395,7 +395,7 @@ FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
   }
   if (readers.empty() && stores.empty() && pointwiseUsers.empty())
     return false;
-  PhysicalRangeFact ranges = analysis.axisRanges(scan.getInputs()[0], 0);
+  PhysicalRangeFact ranges = analysis.axisRanges(scan.getSources().front(), 0);
   FailureOr<MakeRangeOp> root = queryExactLogicalRange(ranges);
   if (failed(root))
     return false;

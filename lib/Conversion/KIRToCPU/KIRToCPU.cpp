@@ -2,7 +2,7 @@
 #include "Intent/Analysis/CanonicalKernel.h"
 #include "Intent/Analysis/ContractionAxes.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
-#include "Intent/Dialect/CPU/IR/RegionProgram.h"
+#include "Intent/Interfaces/StructuredOpInterface.h"
 #include "Intent/Dialect/Intent/IR/IntentDialect.h"
 #include "Intent/Dialect/Intent/IR/IntentOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -393,31 +393,29 @@ private:
   }
 
   LogicalResult region(Operation *operation) {
-    const bool scan = isa<RegionScanOp>(operation);
-    auto count = [&](StringRef name) { return operation->getAttrOfType<IntegerAttr>(name).getInt(); };
-    int64_t sourceCount = count("source_count"), identityCount = count("identity_count");
-    int64_t stateCount = scan ? count("state_count") : 0, outputCount = scan ? count("output_count") : 0;
-    int64_t axis = count("axis");
-    auto original = operation->getOperands();
-    auto sources = flattened(original.take_front(sourceCount));
-    auto identityValues = flattened(original.slice(sourceCount, identityCount));
-    auto stateValues = flattened(original.slice(sourceCount + identityCount, stateCount));
-    auto captures = flattened(original.drop_front(sourceCount + identityCount + stateCount));
+    auto schema = cast<StructuredOpInterface>(operation);
+    const bool scan = schema.getStructuredKind() == StructuredOpKind::RegionScan;
+    int64_t axis = schema.getIterationAxes().front();
+    auto sources = flattened(schema.getSources());
+    auto identityValues = flattened(schema.getIdentities());
+    auto stateValues = flattened(schema.getInitialStates());
+    auto captures = flattened(schema.getCaptures());
     Location loc = operation->getLoc();
     auto destinations = makeSlots(operation->getResultTypes(), loc);
     if (destinations.empty()) return failure();
     SmallVector<Type> identityTypes;
-    for (Type type : original.slice(sourceCount, identityCount).getTypes()) flattenTypes(type, identityTypes);
+    for (Type type : schema.getIdentities().getTypes()) flattenTypes(type, identityTypes);
     SmallVector<Type> summarySlots;
     for (Type type : identityTypes) {
       auto tensor = dyn_cast<RankedTensorType>(type);
       summarySlots.push_back(tensor ? MemRefType::get(tensor.getShape(), tensor.getElementType()) : MemRefType::get({}, type));
     }
-    auto outputFields = fieldPaths(TypeRange(operation->getResultTypes()).take_front(outputCount));
+    auto outputFields = fieldPaths(schema.getEmittedResults().getTypes());
     SmallVector<int64_t> outputAxes;
     if (scan) {
-      Block &emit = operation->getRegion(3).front();
-      SmallVector<Type> sourceLeaves; flattenTypes(emit.getArgument(0).getType(), sourceLeaves);
+      Block &emit = schema.getEmitRegion()->front();
+      SmallVector<Type> sourceLeaves;
+      flattenTypes(schema.getEmitSources().front().getType(), sourceLeaves);
       auto sourceType = cast<RankedTensorType>(sourceLeaves.front());
       int64_t member = cast<TensorShapeAttr>(sourceType.getEncoding()).getDimensions()[axis];
       for (Type type : emit.getTerminator()->getOperandTypes()) {
@@ -433,22 +431,17 @@ private:
     }
     SmallVector<Type> stateSlots;
     if (scan) llvm::append_range(stateSlots, TypeRange(destinations).drop_front(outputFields.size()));
-    SmallVector<Value> inputs(sources);
-    llvm::append_range(inputs, identityValues); llvm::append_range(inputs, stateValues);
-    llvm::append_range(inputs, captures); llvm::append_range(inputs, destinations);
-    OperationState state(loc, scan ? cpu::RegionScanOp::getOperationName() : cpu::RegionFoldOp::getOperationName());
-    state.addOperands(inputs);
-    state.addAttribute("axis", builder.getI64IntegerAttr(axis));
-    state.addAttribute("source_count", builder.getI64IntegerAttr(sources.size()));
-    state.addAttribute("identity_count", builder.getI64IntegerAttr(identityValues.size()));
-    state.addAttribute("state_count", builder.getI64IntegerAttr(stateValues.size()));
-    state.addAttribute("capture_count", builder.getI64IntegerAttr(captures.size()));
-    state.addAttribute("output_count", builder.getI64IntegerAttr(outputFields.size()));
-    state.addAttribute("summary_fields", fieldPaths(original.slice(sourceCount, identityCount).getTypes()));
-    state.addAttribute("state_fields", fieldPaths(original.slice(sourceCount + identityCount, stateCount).getTypes()));
-    state.addAttribute("output_axes", builder.getDenseI64ArrayAttr(outputAxes));
-    for (unsigned i = 0; i < operation->getNumRegions(); ++i) state.addRegion();
-    Operation *target = builder.create(state);
+    Operation *target;
+    if (scan)
+      target = builder.create<cpu::RegionScanOp>(loc, sources, identityValues, stateValues,
+          captures, ValueRange(destinations).take_front(outputFields.size()),
+          ValueRange(destinations).drop_front(outputFields.size()), axis,
+          fieldPaths(schema.getIdentities().getTypes()), fieldPaths(schema.getInitialStates().getTypes()),
+          builder.getDenseI64ArrayAttr(outputAxes), IntegerAttr());
+    else
+      target = builder.create<cpu::RegionFoldOp>(loc, sources, identityValues, captures,
+          destinations, axis, fieldPaths(schema.getIdentities().getTypes()), IntegerAttr());
+    auto targetSchema = cast<cpu::RegionOpInterface>(target);
     SmallVector<Type> sliceTypes;
     for (Value source : sources) {
       auto type = cast<MemRefType>(source.getType());
@@ -460,14 +453,14 @@ private:
     }
     SmallVector<Type> summarizeInputs(sliceTypes);
     llvm::append_range(summarizeInputs, TypeRange(captures));
-    if (failed(helper(operation->getRegion(0), target->getRegion(0), summarizeInputs, summarySlots))) return failure();
+    if (failed(helper(*schema.getSummarizeRegion(), targetSchema.getSummarize(), summarizeInputs, summarySlots))) return failure();
     SmallVector<Type> combineInputs(summarySlots);
     llvm::append_range(combineInputs, summarySlots);
-    if (failed(helper(operation->getRegion(1), target->getRegion(1), combineInputs, summarySlots))) return failure();
+    if (failed(helper(schema.getCombine(), targetSchema.getCombine(), combineInputs, summarySlots))) return failure();
     if (scan) {
       SmallVector<Type> applyInputs(summarySlots);
       llvm::append_range(applyInputs, stateSlots);
-      if (failed(helper(operation->getRegion(2), target->getRegion(2), applyInputs, stateSlots))) return failure();
+      if (failed(helper(*schema.getApplyRegion(), *targetSchema.getApplyRegion(), applyInputs, stateSlots))) return failure();
       SmallVector<Type> emitInputs(sliceTypes), emitSlots;
       llvm::append_range(emitInputs, stateSlots); llvm::append_range(emitInputs, TypeRange(captures));
       for (auto [output, outputAxis] : llvm::zip(ValueRange(destinations).take_front(outputFields.size()), outputAxes)) {
@@ -477,7 +470,7 @@ private:
             StridedLayoutAttr::get(builder.getContext(), ShapedType::kDynamic,
                 SmallVector<int64_t>(type.getRank(), ShapedType::kDynamic))));
       }
-      if (failed(helper(operation->getRegion(3), target->getRegion(3), emitInputs, emitSlots))) return failure();
+      if (failed(helper(*schema.getEmitRegion(), *targetSchema.getEmitRegion(), emitInputs, emitSlots))) return failure();
     }
     bindSlots(operation->getResults(), destinations, loc);
     return success();
@@ -1083,24 +1076,22 @@ private:
   }
 
   LogicalResult scan(ScanOp operation) {
-    int64_t count = operation.getSourceCount();
-    auto inputs = operation.getInputs();
-    auto first = cast<RankedTensorType>(inputs[0].getType());
+    auto first = cast<RankedTensorType>(operation.getSources().front().getType());
     SmallVector<Value> sources, initials, captures, outputs;
     bool scalar = true;
-    for (int64_t component = 0; component < count; ++component) {
-      auto type = cast<RankedTensorType>(inputs[component].getType());
+    for (auto [source, identity] : llvm::zip(operation.getSources(), operation.getIdentities())) {
+      auto type = cast<RankedTensorType>(source.getType());
       if (static_cast<uint64_t>(operation.getAxis()) >= static_cast<uint64_t>(type.getRank()))
         return operation.emitError("CPU scan axis is outside a source component rank");
       scalar &= type.getShape() == first.getShape() && type.getEncoding() == first.getEncoding() &&
-          inputs[count + component].getType() == type.getElementType();
-      sources.push_back(values.lookup(inputs[component]));
-      initials.push_back(values.lookup(inputs[count + component]));
+          identity.getType() == type.getElementType();
+      sources.push_back(values.lookup(source));
+      initials.push_back(values.lookup(identity));
       auto sizes = extents(type, operation.getLoc());
       if (failed(sizes)) return failure();
       outputs.push_back(allocate(type, *sizes, operation.getLoc()));
     }
-    for (Value input : inputs.drop_front(count * 2)) {
+    for (Value input : operation.getCaptures()) {
       Value capture = values.lookup(input);
       scalar &= isa<IntegerType, IndexType, FloatType>(capture.getType());
       captures.push_back(capture);
@@ -1148,17 +1139,17 @@ private:
   }
 
   LogicalResult reduce(ReduceOp operation) {
-    auto first = dyn_cast<MemRefType>(flattened(operation.getInputs()[0]).front().getType());
-    if (operation.getSourceCount() != 1 || operation.getIdentityCount() != 1 ||
-        operation.getCaptureCount() != 0 || operation.getAxes().size() != 1 ||
+    auto first = dyn_cast<MemRefType>(flattened(operation.getSources().front()).front().getType());
+    if (operation.getSources().size() != 1 || operation.getIdentities().size() != 1 ||
+        operation.getCaptures().size() != 0 || operation.getAxes().size() != 1 ||
         cast<IntegerAttr>(operation.getAxes()[0]).getInt() != 0 ||
         !first || first.getRank() != 1 || !first.getElementType().isF32())
       return structuredReduction(operation);
-    Value input = values.lookup(operation.getInputs()[0]);
+    Value input = values.lookup(operation.getSources().front());
     auto type = dyn_cast<MemRefType>(input.getType());
     if (!type || type.getRank() != 1)
       return operation.emitError("CPU reduction currently requires a rank-one source");
-    Value initial = values.lookup(operation.getInputs()[1]);
+    Value initial = values.lookup(operation.getIdentities().front());
     Location loc = operation.getLoc();
     Value extent = builder.create<memref::DimOp>(loc, input, 0);
     auto reduction = builder.create<cpu::ReduceOp>(loc, initial.getType(),
@@ -1172,8 +1163,9 @@ private:
       OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPointToStart(body);
       Block &combine = operation.getCombine().front();
-      values.map(combine.getArgument(0), body->getArgument(0));
-      values.map(combine.getArgument(1), body->getArgument(1));
+      auto schema = cast<StructuredOpInterface>(operation.getOperation());
+      values.map(schema.getCombineLhs().front(), body->getArgument(0));
+      values.map(schema.getCombineRhs().front(), body->getArgument(1));
       for (Operation &nested : combine.without_terminator())
         if (failed(lowerOperation(&nested))) return failure();
       Value result = values.lookup(combine.getTerminator()->getOperand(0));
@@ -1189,9 +1181,9 @@ private:
       if (!isa<ConstantOp, BinaryOp, UnaryOp, CompareOp, SelectOp, MaskOp, CastOp,
                MakeRecordOp, MakeTupleOp, ExtractOp>(nested))
         return nested.emitError("CPU tensor reduction requires a pointwise combine; non-pointwise summary reduction is not implemented");
-    auto sources = flattened(operation.getInputs().take_front(operation.getSourceCount()));
-    auto identities = flattened(operation.getInputs().slice(operation.getSourceCount(), operation.getIdentityCount()));
-    auto captures = flattened(operation.getInputs().drop_front(operation.getSourceCount() + operation.getIdentityCount()));
+    auto sources = flattened(operation.getSources());
+    auto identities = flattened(operation.getIdentities());
+    auto captures = flattened(operation.getCaptures());
     if (sources.size() != identities.size()) return operation.emitError("CPU reduction source and state leaves differ");
     auto type = cast<MemRefType>(sources.front().getType());
     for (Value value : sources)
@@ -1515,13 +1507,14 @@ private:
     return success();
   }
 
-  FailureOr<Value> lowerResults(Block &block, ValueRange destinations, bool condition = false) {
+  FailureOr<Value> lowerResults(Block &block, ValueRange destinations) {
     allocations.emplace_back();
     for (Operation &operation : block.without_terminator())
       if (failed(lowerOperation(&operation))) return failure();
-    auto operands = block.getTerminator()->getOperands();
-    Value predicate = condition ? values.lookup(operands.front()) : Value();
-    auto results = flattened(condition ? operands.drop_front() : operands);
+    auto condition = dyn_cast<ConditionOp>(block.getTerminator());
+    Value predicate = condition ? values.lookup(condition.getCondition()) : Value();
+    auto results = flattened(condition ? condition.getArgs()
+                                      : cast<YieldOp>(block.getTerminator()).getInputs());
     if (results.size() != destinations.size())
       return block.getParentOp()->emitError("CPU ordered control result partition mismatch"), failure();
     for (auto [result, destination] : llvm::zip(results, destinations)) copyToSlot(result, destination, block.getParentOp()->getLoc());
@@ -1560,13 +1553,13 @@ private:
       return success();
     }
     auto loop = cast<ForOp>(operation);
-    if (!domains.count(loop.getInputs().front())) return operation->emitError("CPU ordered for requires a realized domain");
-    Domain domain = domains.lookup(loop.getInputs().front());
+    if (!domains.count(loop.getSource())) return operation->emitError("CPU ordered for requires a realized domain");
+    Domain domain = domains.lookup(loop.getSource());
     auto target = builder.create<scf::ForOp>(loc, domain.begin, domain.end, domain.step,
-                                            flattened(loop.getInputs().drop_front()));
+                                            flattened(loop.getInitArgs()));
     Block &source = loop.getBody().front();
-    values.map(source.getArgument(0), target.getInductionVar());
-    bindScalars(source.getArguments().drop_front(), target.getRegionIterArgs());
+    values.map(loop.getInductionVars().front(), target.getInductionVar());
+    bindScalars(loop.getRegionIterArgs(), target.getRegionIterArgs());
     if (failed(body(source, target.getBody()))) return failure();
     bindScalars(operation->getResults(), target.getResults());
     return success();
@@ -1592,7 +1585,8 @@ private:
       }
     } else {
       auto loop = dyn_cast<ForOp>(operation);
-      auto initial = flattened(loop ? operation->getOperands().drop_front() : operation->getOperands());
+      auto whileLoop = dyn_cast<WhileOp>(operation);
+      auto initial = flattened(loop ? loop.getInitArgs() : whileLoop.getInitArgs());
       if (initial.size() != destinations.size()) return operation->emitError("CPU loop initial and result schemas differ");
       auto next = makeSlots(operation->getResultTypes(), loc);
       for (auto [value, destination] : llvm::zip(initial, destinations)) copyToSlot(value, destination, loc);
@@ -1600,14 +1594,14 @@ private:
         for (auto [source, destination] : llvm::zip(next, destinations)) copyToSlot(source, destination, loc);
       };
       if (loop) {
-        if (!domains.count(loop.getInputs().front())) return operation->emitError("CPU ordered for requires a supported domain");
-        Domain domain = domains.lookup(loop.getInputs().front());
+        if (!domains.count(loop.getSource())) return operation->emitError("CPU ordered for requires a supported domain");
+        Domain domain = domains.lookup(loop.getSource());
         auto target = builder.create<scf::ForOp>(loc, domain.begin, domain.end, domain.step);
         OpBuilder::InsertionGuard guard(builder);
         builder.setInsertionPointToStart(target.getBody());
         Block &body = loop.getBody().front();
-        values.map(body.getArgument(0), target.getInductionVar());
-        bindSlots(body.getArguments().drop_front(), destinations, loc);
+        values.map(loop.getInductionVars().front(), target.getInductionVar());
+        bindSlots(loop.getRegionIterArgs(), destinations, loc);
         if (failed(lowerResults(body, next))) return failure();
         advance();
       } else {
@@ -1616,9 +1610,9 @@ private:
         {
           OpBuilder::InsertionGuard guard(builder);
           builder.setInsertionPointToStart(&target.getBefore().front());
-          Block &before = operation->getRegion(0).front();
-          bindSlots(before.getArguments(), destinations, loc);
-          auto condition = lowerResults(before, next, true);
+          Block &before = whileLoop.getBefore().front();
+          bindSlots(whileLoop.getBeforeArguments(), destinations, loc);
+          auto condition = lowerResults(before, next);
           if (failed(condition)) return failure();
           advance();
           builder.create<scf::ConditionOp>(loc, *condition, ValueRange{});
@@ -1626,8 +1620,8 @@ private:
         {
           OpBuilder::InsertionGuard guard(builder);
           builder.setInsertionPointToStart(&target.getAfter().front());
-          Block &after = operation->getRegion(1).front();
-          bindSlots(after.getArguments(), destinations, loc);
+          Block &after = whileLoop.getAfter().front();
+          bindSlots(whileLoop.getAfterArguments(), destinations, loc);
           if (failed(lowerResults(after, next))) return failure();
           advance();
           builder.create<scf::YieldOp>(loc);

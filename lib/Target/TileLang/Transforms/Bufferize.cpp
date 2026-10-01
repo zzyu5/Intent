@@ -2234,19 +2234,19 @@ private:
 
   LogicalResult lowerReduce(gpu::ReduceOp reduce) {
     std::optional<BinaryOperator> kind = nativeCombineKind(reduce.getCombine());
-    if (reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 ||
-        reduce.getCaptureCount() != 0 || reduce.getAxes().size() != 1 ||
+    if (reduce.getSources().size() != 1 || reduce.getIdentities().size() != 1 ||
+        reduce.getCaptures().size() != 0 || reduce.getAxes().size() != 1 ||
         reduce.getNumResults() != 1 || !kind)
       return reduce.emitOpError(
           "TileLang native reduce requires one source/identity/axis and builtin add/max/min/bitwise combine");
     auto sourceType =
-        dyn_cast<gpu::FragmentType>(reduce.getInputs().front().getType());
+        dyn_cast<gpu::FragmentType>(reduce.getSources().front().getType());
     if (!sourceType)
       return reduce.emitOpError("TileLang native reduce source must be a fragment");
     FailureOr<Value> source =
-        materialize(reduce.getInputs().front(), BufferSpace::Fragment, reduce);
+        materialize(reduce.getSources().front(), BufferSpace::Fragment, reduce);
     FailureOr<Value> identity =
-        scalarSplat(reduce.getInputs()[reduce.getSourceCount()]);
+        scalarSplat(reduce.getIdentities().front());
     if (failed(source) || failed(identity))
       return reduce.emitOpError(
           "TileLang native reduce identity must be an explicit scalar/splat");
@@ -2254,7 +2254,7 @@ private:
     unsigned reductionAxis = reduce.getAxes().front();
     if (sourceBuffer.getShape()[reductionAxis] !=
         sourceType.getShape()[reductionAxis]) {
-      source = materializePadded(reduce.getInputs().front(),
+      source = materializePadded(reduce.getSources().front(),
                                  BufferSpace::Fragment, reduce,
                                  sourceType.getShape());
       if (failed(source))
@@ -2301,25 +2301,25 @@ private:
 
   LogicalResult lowerScan(gpu::ScanOp scan) {
     std::optional<BinaryOperator> kind = nativeCombineKind(scan.getCombine());
-    if (scan.getSourceCount() != 1 || scan.getIdentityCount() != 1 ||
-        scan.getCaptureCount() != 0 || scan.getNumResults() != 1 || !kind ||
+    if (scan.getSources().size() != 1 || scan.getIdentities().size() != 1 ||
+        scan.getCaptures().size() != 0 || scan.getNumResults() != 1 || !kind ||
         (*kind != BinaryOperator::Add &&
          *kind != BinaryOperator::MaximumNum) ||
         !scan.getInclusive())
       return scan.emitOpError(
           "TileLang native scan requires one inclusive builtin add/max component");
     auto sourceType =
-        dyn_cast<gpu::FragmentType>(scan.getInputs().front().getType());
+        dyn_cast<gpu::FragmentType>(scan.getSources().front().getType());
     if (!sourceType)
       return scan.emitOpError("TileLang native scan source must be a fragment");
     FailureOr<Value> source =
-        materialize(scan.getInputs().front(), BufferSpace::Fragment, scan);
+        materialize(scan.getSources().front(), BufferSpace::Fragment, scan);
     if (failed(source))
       return failure();
     auto sourceBuffer = cast<BufferType>((*source).getType());
     if (sourceBuffer.getShape()[scan.getAxis()] !=
         sourceType.getShape()[scan.getAxis()]) {
-      source = materializePadded(scan.getInputs().front(), BufferSpace::Fragment,
+      source = materializePadded(scan.getSources().front(), BufferSpace::Fragment,
                                  scan,
                                  sourceType.getShape());
       if (failed(source))

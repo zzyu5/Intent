@@ -1,6 +1,7 @@
 #ifndef INTENT_DIALECT_CPU_IR_CPUOPS_H
 #define INTENT_DIALECT_CPU_IR_CPUOPS_H
 #include "Intent/Dialect/CPU/IR/CPUAttrs.h"
+#include "Intent/Dialect/CPU/IR/CPUOpInterfaces.h"
 #include "Intent/Dialect/Intent/IR/IntentAttrs.h"
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Builders.h"

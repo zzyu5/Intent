@@ -112,7 +112,7 @@ bool requiresPhysicalRealization(ReduceOp reduce) {
   if (!kernel)
     return true;
   PhysicalProgramAnalysis analysis(kernel);
-  for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+  for (Value source : reduce.getSources()) {
     auto fragment = dyn_cast<FragmentType>(source.getType());
     if (!fragment)
       continue;
@@ -126,7 +126,7 @@ bool requiresPhysicalRealization(ReduceOp reduce) {
         auto extent = constantPhysicalExpression(
             cast<PhysicalExprAttr>(fragment.getShape()[axis]));
         bool pairedComplete = extent && succeeded(scalarSource(source)) &&
-            llvm::any_of(reduce.getInputs().take_front(reduce.getSourceCount()),
+            llvm::any_of(reduce.getSources(),
                          [&](Value peer) {
           auto peerType = dyn_cast<FragmentType>(peer.getType());
           if (!peerType || peerType.getShape() != fragment.getShape() ||
@@ -154,7 +154,7 @@ bool requiresPhysicalRealization(ReduceOp reduce) {
 
 ArrayAttr reductionSources(ReduceOp reduce) {
   SmallVector<Attribute> sources;
-  for (Value input : reduce.getInputs().take_front(reduce.getSourceCount())) {
+  for (Value input : reduce.getSources()) {
     auto fragment = dyn_cast<FragmentType>(input.getType());
     if (!fragment)
       continue;
@@ -923,7 +923,7 @@ FailureOr<ParameterOp> fullCoverageParameterForDimension(func::FuncOp kernel,
 }
 
 bool hasNonUnitFreeAxis(ReduceOp reduce) {
-  for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+  for (Value source : reduce.getSources()) {
     auto fragment = dyn_cast<FragmentType>(source.getType());
     if (!fragment)
       continue;
@@ -943,7 +943,7 @@ bool hasNonUnitFreeAxis(ReduceOp reduce) {
 
 bool hasSelectedSegmentExtent(ReduceOp reduce, func::FuncOp kernel) {
   ParameterOp segment;
-  for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+  for (Value source : reduce.getSources()) {
     auto fragment = dyn_cast<FragmentType>(source.getType());
     int64_t axis = reduce.getAxes().empty() ? -1 : reduce.getAxes().front();
     if (!fragment || axis < 0 ||
@@ -976,14 +976,14 @@ FailureOr<Value> dimensionArgument(func::FuncOp kernel, int64_t dimension) {
 
 FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
                                            func::FuncOp kernel) {
-  if (reduce.getAxes().size() != 1 || reduce.getSourceCount() == 0)
+  if (reduce.getAxes().size() != 1 || reduce.getSources().size() == 0)
     return false;
   int64_t reductionAxis = reduce.getAxes().front();
   if (reductionAxis < 0)
     return false;
 
   PhysicalExprAttr logicalExtent;
-  for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+  for (Value source : reduce.getSources()) {
     auto fragment = dyn_cast<FragmentType>(source.getType());
     if (!fragment ||
         reductionAxis >= static_cast<int64_t>(fragment.getShape().size()))
@@ -1004,7 +1004,7 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
     return false;
 
   SmallVector<SmallVector<MakeRangeOp>> componentRanges;
-  for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+  for (Value source : reduce.getSources()) {
     auto fragment = cast<FragmentType>(source.getType());
     PhysicalProgramAnalysis analysis(kernel);
     PhysicalRangeFact reductionRanges =
@@ -1088,16 +1088,16 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
   OpBuilder builder(reduce);
   Value physicalExtentValue = builder.create<arith::ConstantIndexOp>(
       reduce.getLoc(), physicalExtent.getValue());
-  for (unsigned component = 0; component < reduce.getSourceCount(); ++component) {
+  for (unsigned component = 0; component < reduce.getSources().size(); ++component) {
     auto originalType =
-        cast<FragmentType>(reduce.getInputs()[component].getType());
+        cast<FragmentType>(reduce.getSources()[component].getType());
     auto sourceMap = cast<AxisMapAttr>(
         originalType.getAxisMaps()[static_cast<unsigned>(reductionAxis)]);
     PhysicalSourceAxis reductionSource{sourceMap.getSourceId(),
                                        sourceMap.getSourceAxis(),
                                        sourceMap.getDerived()};
     PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
-        reduce.getInputs()[component], reductionSource,
+        reduce.getSources()[component], reductionSource,
         PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true, reduce);
     if (!replay.isReplayable()) {
       InFlightDiagnostic diagnostic = reduce.emitOpError(
@@ -1109,7 +1109,7 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
     IRMapping mapping;
     SmallVector<Value> tailPredicates;
     FailureOr<Value> source = clonePaddedProducer(
-        builder, reduce.getLoc(), reduce.getInputs()[component],
+        builder, reduce.getLoc(), reduce.getSources()[component],
         static_cast<unsigned>(reductionAxis), reductionSource,
         componentRanges[component], logicalExtent, physicalExtent,
         physicalExtentValue, mapping,
@@ -1117,7 +1117,7 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
     if (failed(source) || tailPredicates.empty()) {
       PhysicalRangeAxisFact selected =
           PhysicalProgramAnalysis(kernel).rangeAxes(
-              reduce.getInputs()[component], componentRanges[component]);
+              reduce.getSources()[component], componentRanges[component]);
       InFlightDiagnostic diagnostic = reduce.emitOpError(
           "static reduction producer cannot be replayed over its padded extent");
       diagnostic << "; selected_state=" << static_cast<unsigned>(selected.state)
@@ -1152,8 +1152,8 @@ LogicalResult neutralizeReductionTails(ReduceOp reduce, func::FuncOp kernel) {
     return success();
   unsigned axis = reduce.getAxes().front();
   DominanceInfo dominance(kernel);
-  for (unsigned component = 0; component < reduce.getSourceCount(); ++component) {
-    Value source = reduce.getInputs()[component];
+  for (unsigned component = 0; component < reduce.getSources().size(); ++component) {
+    Value source = reduce.getSources()[component];
     auto type = dyn_cast<FragmentType>(source.getType());
     if (!type || axis >= type.getShape().size())
       continue;
@@ -1167,12 +1167,12 @@ LogicalResult neutralizeReductionTails(ReduceOp reduce, func::FuncOp kernel) {
       // Reduction blocking pads each chunk with its identity before updating
       // this carry. Its completed lanes no longer share an inner chunk's tail.
       if (traversals &&
-          llvm::equal(reduce.getInputs().take_front(reduce.getSourceCount()),
+          llvm::equal(reduce.getSources(),
                       loop.getResults()) &&
           llvm::is_contained(traversals, Attribute(traversal)) &&
           queryLaunchExpression(loop.getStep()) == type.getShape()[axis] &&
           sameScalarValue(loop.getInitArgs()[result],
-                          reduce.getInputs()[reduce.getSourceCount() + component]))
+                          reduce.getIdentities()[component]))
         continue;
     }
     PhysicalProgramAnalysis analysis(kernel);
@@ -1236,7 +1236,7 @@ LogicalResult neutralizeReductionTails(ReduceOp reduce, func::FuncOp kernel) {
     }
     if (!tail)
       continue;
-    Value identity = reduce.getInputs()[reduce.getSourceCount() + component];
+    Value identity = reduce.getIdentities()[component];
     auto projected = projectPhysicalValueToSchema(builder, reduce.getLoc(), identity, type);
     if (failed(projected))
       return reduce.emitOpError("reduction identity cannot neutralize physical padding");
@@ -1248,7 +1248,7 @@ LogicalResult neutralizeReductionTails(ReduceOp reduce, func::FuncOp kernel) {
 
 FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
                                           func::FuncOp kernel) {
-  if (reduce.getAxes().size() != 1 || reduce.getSourceCount() == 0)
+  if (reduce.getAxes().size() != 1 || reduce.getSources().size() == 0)
     return false;
   int64_t reductionAxis = reduce.getAxes().front();
   if (reductionAxis < 0)
@@ -1256,7 +1256,7 @@ FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
 
   PhysicalExprAttr extent;
   SmallVector<PhysicalSourceAxis> sourceAxes;
-  for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+  for (Value source : reduce.getSources()) {
     auto fragment = dyn_cast<FragmentType>(source.getType());
     if (!fragment ||
         reductionAxis >= static_cast<int64_t>(fragment.getShape().size()))
@@ -1277,7 +1277,7 @@ FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
   llvm::DenseMap<PhysicalSourceAxis, MakeRangeOp> ranges;
   PhysicalProgramAnalysis analysis(kernel);
   for (auto [source, sourceAxis] : llvm::zip(
-           reduce.getInputs().take_front(reduce.getSourceCount()), sourceAxes)) {
+           reduce.getSources(), sourceAxes)) {
     PhysicalRangeFact fact = analysis.axisRanges(source, reductionAxis);
     for (MakeRangeOp candidate : fact.roots) {
       auto found = ranges.find(sourceAxis);
@@ -1325,8 +1325,8 @@ FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
     return failure();
 
   OpBuilder builder(reduce);
-  for (unsigned component = 0; component < reduce.getSourceCount(); ++component) {
-    Value source = reduce.getInputs()[component];
+  for (unsigned component = 0; component < reduce.getSources().size(); ++component) {
+    Value source = reduce.getSources()[component];
     auto found = ranges.find(sourceAxes[component]);
     if (found == ranges.end())
       return false;
@@ -1352,7 +1352,7 @@ FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
     Value valid = coordinateValid;
     if (valid.getType() != predicateType)
       valid = builder.create<BroadcastOp>(reduce.getLoc(), predicateType, valid);
-    Value identity = reduce.getInputs()[reduce.getSourceCount() + component];
+    Value identity = reduce.getIdentities()[component];
     if (identity.getType() != sourceType)
       identity = builder.create<BroadcastOp>(reduce.getLoc(), sourceType, identity);
     Value selected = builder.create<SelectOp>(reduce.getLoc(), sourceType, valid,
@@ -1365,7 +1365,7 @@ FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
 
 LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
   SmallVector<std::tuple<Value, PhysicalSourceAxis, int64_t>> pending;
-  for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+  for (Value source : reduce.getSources()) {
     auto fragment = dyn_cast<FragmentType>(source.getType());
     if (!fragment)
       continue;
@@ -1497,7 +1497,7 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
 
   auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   if (capabilities && capabilities.getRegistersPerUnit() > 0) {
-    for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+    for (Value source : reduce.getSources()) {
       auto fragment = dyn_cast<FragmentType>(source.getType());
       if (!fragment)
         continue;
@@ -1834,10 +1834,8 @@ LogicalResult cloneLiftedCombineRegion(Region &source, Region &target,
 bool prepareVectorAccumulation(ReduceOp reduce,
                                ArrayRef<FragmentType> accumulatorTypes,
                                Region &combine) {
-  ValueRange identities = reduce.getInputs().slice(
-      reduce.getSourceCount(), reduce.getIdentityCount());
-  ValueRange captures = reduce.getInputs().drop_front(
-      reduce.getSourceCount() + reduce.getIdentityCount());
+  ValueRange identities = reduce.getIdentities();
+  ValueRange captures = reduce.getCaptures();
   if (!llvm::all_of(captures, [](Value capture) {
         return isa<IntegerType, FloatType, IndexType>(capture.getType());
       }) ||
@@ -1884,7 +1882,7 @@ FailureOr<bool> decomposeFullCoverageMultiAxisReduce(
       return false;
 
   auto firstSource =
-      dyn_cast<FragmentType>(reduce.getInputs().front().getType());
+      dyn_cast<FragmentType>(reduce.getSources().front().getType());
   if (!firstSource || outerAxis >= firstSource.getShape().size())
     return false;
   auto outerExtent =
@@ -1903,7 +1901,7 @@ FailureOr<bool> decomposeFullCoverageMultiAxisReduce(
     auto extent = outerExtent ? constantPhysicalExpression(outerExtent) : std::nullopt;
     if (!extent || *extent <= 0)
       return false;
-    for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+    for (Value source : reduce.getSources()) {
       auto ranges = PhysicalProgramAnalysis(kernel).axisRanges(source, outerAxis);
       if (!ranges.blockers.empty() || !sameFullOrdinalTraversal(ranges.roots) ||
           exceedsRegisterFile(source, kernel))
@@ -1917,7 +1915,7 @@ FailureOr<bool> decomposeFullCoverageMultiAxisReduce(
     // logical reduction extent is static; retained/pure sources stay native.
     SmallVector<MakeRangeOp> chunkRanges;
     bool canChunk = hasNonUnitFreeAxis(reduce);
-    for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+    for (Value source : reduce.getSources()) {
       auto plan = analyzeSource(source, outerAxis);
       if (failed(plan) || plan->roots.empty()) {
         canChunk = false;
@@ -1954,30 +1952,31 @@ FailureOr<bool> decomposeFullCoverageMultiAxisReduce(
     return false;
 
   SmallVector<Value> identities(
-      reduce.getInputs()
-          .slice(reduce.getSourceCount(), reduce.getIdentityCount())
+      reduce.getIdentities()
           .begin(),
-      reduce.getInputs()
-          .slice(reduce.getSourceCount(), reduce.getIdentityCount())
+      reduce.getIdentities()
           .end());
-  ValueRange captures = reduce.getInputs().drop_front(
-      reduce.getSourceCount() + reduce.getIdentityCount());
-  SmallVector<Type> innerResultTypes;
+  ValueRange captures = reduce.getCaptures();
   SmallVector<Value> innerIdentities;
   OpBuilder builder(reduce);
   for (auto [component, source] : llvm::enumerate(
-           reduce.getInputs().take_front(reduce.getSourceCount()))) {
+           reduce.getSources())) {
     auto fragment = dyn_cast<FragmentType>(source.getType());
     if (!fragment || outerAxis >= fragment.getShape().size())
       return reduce.emitOpError(
                  "multi-axis full-coverage source lost its fragment schema"),
              failure();
-    FragmentType result = eraseFragmentAxes(fragment, innerAxes);
-    if (result.getShape().empty())
+    auto inferred = inferCollectiveResultType(
+        fragment, innerAxes, dataElementType(identities[component].getType()));
+    if (failed(inferred))
+      return reduce.emitOpError(
+                 "multi-axis inner reduction axes do not match its source schema"),
+             failure();
+    auto result = dyn_cast<FragmentType>(*inferred);
+    if (!result)
       return reduce.emitOpError(
                  "multi-axis inner reduction did not retain its outer axis"),
              failure();
-    innerResultTypes.push_back(result);
     FailureOr<Value> identity = alignToExecutionSchema(
         builder, reduce.getLoc(), identities[component], result);
     if (failed(identity))
@@ -1987,27 +1986,14 @@ FailureOr<bool> decomposeFullCoverageMultiAxisReduce(
     innerIdentities.push_back(*identity);
   }
 
-  SmallVector<Value> innerInputs(
-      reduce.getInputs().take_front(reduce.getSourceCount()).begin(),
-      reduce.getInputs().take_front(reduce.getSourceCount()).end());
-  innerInputs.append(innerIdentities.begin(), innerIdentities.end());
-  innerInputs.append(captures.begin(), captures.end());
-  OperationState innerState(reduce.getLoc(), ReduceOp::getOperationName());
-  innerState.addOperands(innerInputs);
-  innerState.addTypes(innerResultTypes);
-  innerState.addAttribute(
-      "axes", DenseI64ArrayAttr::get(reduce.getContext(), innerAxes));
-  innerState.addAttribute("source_count", reduce->getAttr("source_count"));
-  innerState.addAttribute("identity_count", reduce->getAttr("identity_count"));
-  innerState.addAttribute("capture_count", reduce->getAttr("capture_count"));
-  innerState.addRegion();
-  auto innerReduce = cast<ReduceOp>(builder.create(innerState));
+  auto innerReduce = builder.create<ReduceOp>(reduce.getLoc(),
+      reduce.getSources(), innerIdentities, captures, innerAxes);
   if (Attribute origin = reduce->getAttr(originAttr))
     innerReduce->setAttr(originAttr, origin);
   std::string reason;
   if (failed(cloneLiftedCombineRegion(reduce.getCombine(),
                                       innerReduce.getCombine(),
-                                      innerResultTypes, reason)))
+                                      innerReduce.getResultTypes(), reason)))
     return reduce.emitOpError(
                "multi-axis combine cannot execute over its retained fragment: ")
            << reason;
@@ -2016,22 +2002,9 @@ FailureOr<bool> decomposeFullCoverageMultiAxisReduce(
   for (unsigned axis = 0; axis < outerAxis; ++axis)
     if (!llvm::is_contained(innerAxes, static_cast<int64_t>(axis)))
       ++outerResultAxis;
-  SmallVector<Value> outerInputs(innerReduce.getResults().begin(),
-                                 innerReduce.getResults().end());
-  outerInputs.append(identities.begin(), identities.end());
-  outerInputs.append(captures.begin(), captures.end());
-  OperationState outerState(reduce.getLoc(), ReduceOp::getOperationName());
-  outerState.addOperands(outerInputs);
-  outerState.addTypes(reduce.getResultTypes());
-  outerState.addAttribute(
-      "axes", DenseI64ArrayAttr::get(
-                  reduce.getContext(),
-                  ArrayRef<int64_t>{static_cast<int64_t>(outerResultAxis)}));
-  outerState.addAttribute("source_count", reduce->getAttr("source_count"));
-  outerState.addAttribute("identity_count", reduce->getAttr("identity_count"));
-  outerState.addAttribute("capture_count", reduce->getAttr("capture_count"));
-  outerState.addRegion();
-  auto outerReduce = cast<ReduceOp>(builder.create(outerState));
+  auto outerReduce = builder.create<ReduceOp>(reduce.getLoc(),
+      innerReduce.getResults(), identities, captures,
+      ArrayRef<int64_t>{static_cast<int64_t>(outerResultAxis)});
   if (Attribute origin = reduce->getAttr(originAttr))
     outerReduce->setAttr(originAttr, origin);
   IRMapping regionMapping;
@@ -2048,7 +2021,7 @@ FailureOr<bool> decomposeFullCoverageMultiAxisReduce(
 LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
   if (!reduce->getBlock() || reduce.getAxes().size() <= 1)
     return success();
-  if (reduce.getSourceCount() == 0)
+  if (reduce.getSources().size() == 0)
     return reduce.emitOpError(
         "multi-axis reduction decomposition requires at least one source");
 
@@ -2061,7 +2034,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
     return success();
   SmallVector<SourcePlan> plans;
   SmallVector<SmallVector<RootAccess>> accesses;
-  for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+  for (Value source : reduce.getSources()) {
     FailureOr<SourcePlan> plan = analyzeSource(source, outerAxis);
     if (failed(plan)) {
       auto fragment = dyn_cast<FragmentType>(source.getType());
@@ -2136,14 +2109,11 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
         "multi-axis reduction decomposition lost every inner axis");
 
   SmallVector<Value> identities(
-      reduce.getInputs()
-          .slice(reduce.getSourceCount(), reduce.getIdentityCount())
+      reduce.getIdentities()
           .begin(),
-      reduce.getInputs()
-          .slice(reduce.getSourceCount(), reduce.getIdentityCount())
+      reduce.getIdentities()
           .end());
-  ValueRange captures = reduce.getInputs().drop_front(
-      reduce.getSourceCount() + reduce.getIdentityCount());
+  ValueRange captures = reduce.getCaptures();
   PhysicalExprAttr unitExtent =
       expression(reduce.getContext(), PhysicalExprKind::Constant, 1);
   bool outerHasSubregion = llvm::any_of(
@@ -2182,7 +2152,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
       name += ("_E" + Twine(padded)).str();
     }
     auto firstSource =
-        cast<FragmentType>(reduce.getInputs().front().getType());
+        cast<FragmentType>(reduce.getSources().front().getType());
     if (queryFragmentAxes(firstSource, plans.front().sourceIdentity).size() > 1)
       name += ("_F" + Twine(outerAxis)).str();
     outerChunk = getOrCreatePhysicalParameter(
@@ -2230,20 +2200,8 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
       ++outerResultAxis;
   auto reduceOuterAxis = [&](OpBuilder &at, Location loc,
                              ValueRange sources) {
-    SmallVector<Value> inputs(sources);
-    inputs.append(identities.begin(), identities.end());
-    inputs.append(captures.begin(), captures.end());
-    OperationState state(loc, ReduceOp::getOperationName());
-    state.addOperands(inputs);
-    state.addTypes(reduce.getResultTypes());
-    state.addAttribute("axes", DenseI64ArrayAttr::get(
-                                   reduce.getContext(),
-                                   {static_cast<int64_t>(outerResultAxis)}));
-    state.addAttribute("source_count", reduce->getAttr("source_count"));
-    state.addAttribute("identity_count", reduce->getAttr("identity_count"));
-    state.addAttribute("capture_count", reduce->getAttr("capture_count"));
-    state.addRegion();
-    auto outerReduce = cast<ReduceOp>(at.create(state));
+    auto outerReduce = at.create<ReduceOp>(loc, sources,
+        identities, captures, ArrayRef<int64_t>{static_cast<int64_t>(outerResultAxis)});
     if (Attribute origin = reduce->getAttr(originAttr))
       outerReduce->setAttr(originAttr, origin);
     IRMapping mapping;
@@ -2518,51 +2476,46 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
         if (bodyFailed)
           return;
 
-        SmallVector<Type> innerResultTypes(reduce.getResultTypes().begin(),
-                                           reduce.getResultTypes().end());
         SmallVector<Value> innerIdentities(identities);
-        ArrayRef<int64_t> selectedInnerAxes = innerAxes;
-        if (blockOuterAxis) {
-          innerResultTypes.clear();
+        ArrayRef<int64_t> selectedInnerAxes =
+            blockOuterAxis ? retainedInnerAxes : innerAxes;
+        if (blockOuterAxis)
           innerIdentities.clear();
-          selectedInnerAxes = retainedInnerAxes;
-          for (auto [component, source] : llvm::enumerate(innerSources)) {
-            auto fragment = cast<FragmentType>(source.getType());
-            FragmentType result =
-                eraseFragmentAxes(fragment, retainedInnerAxes);
-            innerResultTypes.push_back(result);
-            FailureOr<Value> identity = alignToExecutionSchema(
-                nested, nestedLocation, identities[component], result);
-            if (failed(identity)) {
-              bodyFailed = true;
-              failureReason =
-                  "outer-block identity could not retain its fragment axis";
-              return;
-            }
-            innerIdentities.push_back(*identity);
+        for (auto [component, source] : llvm::enumerate(innerSources)) {
+          auto inferred = inferCollectiveResultType(source.getType(),
+              selectedInnerAxes, dataElementType(identities[component].getType()));
+          if (failed(inferred)) {
+            bodyFailed = true;
+            failureReason = "replayed inner reduction axes do not match its source schema";
+            return;
           }
+          if (!blockOuterAxis)
+            continue;
+          auto result = dyn_cast<FragmentType>(*inferred);
+          if (!result) {
+            bodyFailed = true;
+            failureReason = "outer-block inner reduction did not retain its fragment axis";
+            return;
+          }
+          FailureOr<Value> identity = alignToExecutionSchema(
+              nested, nestedLocation, identities[component], result);
+          if (failed(identity)) {
+            bodyFailed = true;
+            failureReason =
+                "outer-block identity could not retain its fragment axis";
+            return;
+          }
+          innerIdentities.push_back(*identity);
         }
 
-        SmallVector<Value> innerInputs(innerSources);
-        innerInputs.append(innerIdentities.begin(), innerIdentities.end());
-        innerInputs.append(captures.begin(), captures.end());
-        OperationState state(nestedLocation, ReduceOp::getOperationName());
-        state.addOperands(innerInputs);
-        state.addTypes(innerResultTypes);
-        state.addAttribute(
-            "axes",
-            DenseI64ArrayAttr::get(reduce.getContext(), selectedInnerAxes));
-        state.addAttribute("source_count", reduce->getAttr("source_count"));
-        state.addAttribute("identity_count", reduce->getAttr("identity_count"));
-        state.addAttribute("capture_count", reduce->getAttr("capture_count"));
-        state.addRegion();
-        auto innerReduce = cast<ReduceOp>(nested.create(state));
+        auto innerReduce = nested.create<ReduceOp>(nestedLocation, innerSources,
+            innerIdentities, captures, selectedInnerAxes);
         if (Attribute origin = reduce->getAttr(originAttr))
           innerReduce->setAttr(originAttr, origin);
         if (blockOuterAxis) {
           if (failed(cloneLiftedCombineRegion(
                   reduce.getCombine(), innerReduce.getCombine(),
-                  innerResultTypes, failureReason))) {
+                  innerReduce.getResultTypes(), failureReason))) {
             bodyFailed = true;
             return;
           }
@@ -2715,7 +2668,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                      static_cast<uint32_t>(ParameterRole::ReductionOuter))
       reductionRole = ParameterRole::ReductionInner;
   ParameterOp chunk;
-  if (reduce.getSourceCount() == 1 &&
+  if (reduce.getSources().size() == 1 &&
       !firstRange->hasAttr(sourceSubregionAttr) && succeeded(fullCoverage)) {
     chunk = *fullCoverage;
   } else if (succeeded(selectedChunk) &&
@@ -2780,14 +2733,11 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
         location, builder.getIndexType(), chunkExtent);
   Value stop = firstEnd;
   SmallVector<Value> identities(
-      reduce.getInputs()
-          .slice(reduce.getSourceCount(), reduce.getIdentityCount())
+      reduce.getIdentities()
           .begin(),
-      reduce.getInputs()
-          .slice(reduce.getSourceCount(), reduce.getIdentityCount())
+      reduce.getIdentities()
           .end());
-  ValueRange captures = reduce.getInputs().drop_front(
-      reduce.getSourceCount() + reduce.getIdentityCount());
+  ValueRange captures = reduce.getCaptures();
 
   Region vectorCombine;
   bool vectorAccumulation =
@@ -3145,19 +3095,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
           return;
         }
 
-        SmallVector<Value> chunkInputs(blockedSources);
-        chunkInputs.append(identities.begin(), identities.end());
-        chunkInputs.append(captures.begin(), captures.end());
-        OperationState state(nestedLocation, ReduceOp::getOperationName());
-        state.addOperands(chunkInputs);
-        state.addTypes(reduce.getResultTypes());
-        state.addAttribute("axes", reduce->getAttr("axes"));
-        state.addAttribute("source_count", reduce->getAttr("source_count"));
-        state.addAttribute("identity_count", reduce->getAttr("identity_count"));
-        state.addAttribute("capture_count", reduce->getAttr("capture_count"));
-        state.addRegion();
-        Operation *raw = nested.create(state);
-        auto chunkReduce = cast<ReduceOp>(raw);
+        auto chunkReduce = nested.create<ReduceOp>(nestedLocation, blockedSources,
+            identities, captures, reduce.getAxes());
         if (Attribute origin = reduce->getAttr(originAttr))
           chunkReduce->setAttr(originAttr, origin);
         IRMapping regionMapping;
@@ -3190,18 +3129,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
   SmallVector<Value> realizedResults(loop.getResults().begin(),
                                      loop.getResults().end());
   if (vectorAccumulation) {
-    SmallVector<Value> finalInputs(realizedResults);
-    finalInputs.append(identities.begin(), identities.end());
-    finalInputs.append(captures.begin(), captures.end());
-    OperationState state(location, ReduceOp::getOperationName());
-    state.addOperands(finalInputs);
-    state.addTypes(reduce.getResultTypes());
-    state.addAttribute("axes", reduce->getAttr("axes"));
-    state.addAttribute("source_count", reduce->getAttr("source_count"));
-    state.addAttribute("identity_count", reduce->getAttr("identity_count"));
-    state.addAttribute("capture_count", reduce->getAttr("capture_count"));
-    state.addRegion();
-    auto finalReduce = cast<ReduceOp>(builder.create(state));
+    auto finalReduce = builder.create<ReduceOp>(location, realizedResults,
+        identities, captures, reduce.getAxes());
     if (Attribute origin = reduce->getAttr(originAttr))
       finalReduce->setAttr(originAttr, origin);
     IRMapping regionMapping;
@@ -3221,20 +3150,20 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
   if (failed(bindReductionFreeAxes(reduce, kernel)))
     return failure();
   const bool oversized = llvm::any_of(
-      reduce.getInputs().take_front(reduce.getSourceCount()),
+      reduce.getSources(),
       [&](Value source) { return exceedsRegisterFile(source, kernel); });
   const bool needsRealization = requiresPhysicalRealization(reduce);
   if (!needsRealization && oversized && reduce.getAxes().size() == 1) {
     PhysicalProgramAnalysis analysis(kernel);
     const unsigned axis = reduce.getAxes().front();
     bool complete = llvm::all_of(
-        reduce.getInputs().take_front(reduce.getSourceCount()),
+        reduce.getSources(),
         [&](Value source) {
           auto fact = analysis.axisRealization(source, axis);
           return fact.isExact() && fact.physicalized;
         });
     if (complete && llvm::any_of(
-            reduce.getInputs().take_front(reduce.getSourceCount()),
+            reduce.getSources(),
             [&](Value source) {
               auto type = cast<FragmentType>(source.getType());
               auto mapping = cast<AxisMapAttr>(type.getAxisMaps()[axis]);
@@ -3254,14 +3183,14 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
                           << reason
                     : success();
   };
-  if (reduce.getAxes().size() != 1 || reduce.getSourceCount() == 0)
+  if (reduce.getAxes().size() != 1 || reduce.getSources().size() == 0)
     return unhandled("requires one reduction axis and at least one source");
   if (hasSelectedSegmentExtent(reduce, kernel))
     return success();
   // A full-coverage fragment grows every component with the runtime axis.
   // Its padding still needs the reduction identity after physicalization.
   // Keep coupled record/tuple accumulators bounded by a real chunk loop.
-  if (reduce.getSourceCount() == 1) {
+  if (reduce.getSources().size() == 1) {
     FailureOr<bool> fullCoverage = realizeFullCoverageReduce(reduce, kernel);
     if (failed(fullCoverage))
       return failure();
@@ -3282,7 +3211,7 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
   bool hasDerivedSource = false;
   bool hasRuntimeSourceRange = false;
   bool hasConstructionScalarSource = false;
-  for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+  for (Value source : reduce.getSources()) {
     auto fragment = dyn_cast<FragmentType>(source.getType());
     if (!fragment || reductionAxis < 0 ||
         reductionAxis >= static_cast<int64_t>(fragment.getShape().size()))
@@ -3366,8 +3295,7 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
             auto axes = analysis.rangeAxes(coordinate, {access.range});
             return !axes.fragmentAxes.empty();
           }) > 1;
-      Value identity = reduce.getInputs()[reduce.getSourceCount() +
-                                          sourcePlans.size()];
+      Value identity = reduce.getIdentities()[sourcePlans.size()];
       if (access.load.getValid() &&
           (!sameScalarValue(access.load.getFill(), identity) ||
            failed(scalarSource(access.load.getValid()))))
@@ -3417,7 +3345,7 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
         reduce.getLoc(), builder.getIndexType(), blockExtent);
 
   SmallVector<Value> blockedSources;
-  for (unsigned component = 0; component < reduce.getSourceCount(); ++component) {
+  for (unsigned component = 0; component < reduce.getSources().size(); ++component) {
     LoadOp load = sourceLoads[component];
     MakeRangeOp range = sourceRanges[component];
     auto sourceType = cast<FragmentType>(load.getResult().getType());
@@ -3463,7 +3391,7 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
                                        original, BinaryOperator::LogicalAnd);
     }
     Value identity =
-        reduce.getInputs()[reduce.getSourceCount() + component];
+        reduce.getIdentities()[component];
     Value fill = identity;
     if (identity.getType() != blockedSource)
       fill = builder.create<BroadcastOp>(reduce.getLoc(), blockedSource, identity);
@@ -3483,19 +3411,8 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
         fill, load.getSourceAxes()));
   }
 
-  SmallVector<Value> inputs(blockedSources);
-  inputs.append(reduce.getInputs().drop_front(reduce.getSourceCount()).begin(),
-                reduce.getInputs().drop_front(reduce.getSourceCount()).end());
-  OperationState state(reduce.getLoc(), ReduceOp::getOperationName());
-  state.addOperands(inputs);
-  state.addTypes(reduce.getResultTypes());
-  state.addAttribute("axes", reduce->getAttr("axes"));
-  state.addAttribute("source_count", reduce->getAttr("source_count"));
-  state.addAttribute("identity_count", reduce->getAttr("identity_count"));
-  state.addAttribute("capture_count", reduce->getAttr("capture_count"));
-  state.addRegion();
-  Operation *raw = builder.create(state);
-  auto replacement = cast<ReduceOp>(raw);
+  auto replacement = builder.create<ReduceOp>(reduce.getLoc(), blockedSources,
+      reduce.getIdentities(), reduce.getCaptures(), reduce.getAxes());
   replacement.getCombine().takeBody(reduce.getCombine());
   if (Attribute origin = reduce->getAttr(originAttr))
     replacement->setAttr(originAttr, origin);
@@ -3512,10 +3429,10 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
 FailureOr<SourcePlan> nestedScalarReductionSource(ReduceOp reduce,
                                                 func::FuncOp kernel) {
   if (reduce.getAxes() != ArrayRef<int64_t>{0} ||
-      reduce.getSourceCount() != 1 || reduce.getNumResults() != 1 ||
+      reduce.getSources().size() != 1 || reduce.getNumResults() != 1 ||
       isa<FragmentType, RecordType>(reduce.getResult(0).getType()))
     return failure();
-  Value source = reduce.getInputs().front();
+  Value source = reduce.getSources().front();
   auto type = dyn_cast<FragmentType>(source.getType());
   if (!type || type.getShape().size() != 1)
     return failure();
@@ -3628,17 +3545,17 @@ bool sameCombineType(Type lhs, Type rhs) {
 bool matchReductionCombine(ReduceOp reference, Block *body, ValueRange left,
                            SmallVectorImpl<Value> &right, ValueRange results,
                            llvm::SmallPtrSetImpl<Operation *> &matched) {
-  unsigned count = reference.getSourceCount();
+  unsigned count = reference.getSources().size();
   Block &combine = reference.getCombine().front();
-  if (reference.getCaptureCount() != 0 || left.size() != count ||
+  if (reference.getCaptures().size() != 0 || left.size() != count ||
       right.size() != count || results.size() != count ||
       combine.getNumArguments() != count * 2)
     return false;
   IRMapping mapping;
   for (unsigned i = 0; i < count; ++i) {
-    mapping.map(combine.getArgument(i), left[i]);
+    mapping.map(cast<StructuredOpInterface>(reference.getOperation()).getCombineLhs()[i], left[i]);
     if (right[i])
-      mapping.map(combine.getArgument(count + i), right[i]);
+      mapping.map(cast<StructuredOpInterface>(reference.getOperation()).getCombineRhs()[i], right[i]);
   }
   std::function<bool(Value, Value)> match = [&](Value pattern, Value value) {
     if (!sameCombineType(pattern.getType(), value.getType()))
@@ -3686,7 +3603,7 @@ bool isolatedReductionUpdate(scf::ForOp loop, ReduceOp reference,
                              SmallVectorImpl<Value> &right,
                              llvm::SmallPtrSetImpl<Operation *> &matched) {
   if (!loop || !loop->hasAttr(reductionSourcesAttr) ||
-      loop.getNumRegionIterArgs() != reference.getSourceCount())
+      loop.getNumRegionIterArgs() != reference.getSources().size())
     return false;
   auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
   if (!matchReductionCombine(reference, loop.getBody(),
@@ -3737,8 +3654,8 @@ bool hoistNestedReduction(scf::ForOp outer, func::FuncOp kernel) {
   SmallVector<Value> sources(reference.getResults());
   while (auto reduce = sources.front().getDefiningOp<ReduceOp>()) {
     if (reduce->getBlock() != outer.getBody() ||
-        reduce.getSourceCount() != count || reduce.getIdentityCount() != count ||
-        reduce.getCaptureCount() != 0 || reduce.getNumResults() != count ||
+        reduce.getSources().size() != count || reduce.getIdentities().size() != count ||
+        reduce.getCaptures().size() != 0 || reduce.getNumResults() != count ||
         !llvm::equal(sources, reduce.getResults()))
       return false;
     Block &combine = reduce.getCombine().front();
@@ -3750,7 +3667,7 @@ bool hoistNestedReduction(scf::ForOp outer, func::FuncOp kernel) {
                                matched))
       return false;
     for (unsigned i = 0; i < count; ++i) {
-      if (!sameScalarValue(reduce.getInputs()[count + i], identities[i]))
+      if (!sameScalarValue(reduce.getIdentities()[i], identities[i]))
         return false;
       for (Operation *user : reduce.getResult(i).getUsers())
         if (!updates.contains(user) &&
@@ -3758,7 +3675,7 @@ bool hoistNestedReduction(scf::ForOp outer, func::FuncOp kernel) {
           return false;
     }
     reductions.push_back(reduce);
-    sources.assign(reduce.getInputs().begin(), reduce.getInputs().begin() + count);
+    sources.assign(reduce.getSources().begin(), reduce.getSources().end());
   }
   SmallVector<Type> accumulatorTypes;
   for (unsigned i = 0; i < count; ++i) {
@@ -3813,9 +3730,9 @@ bool hoistNestedReduction(scf::ForOp outer, func::FuncOp kernel) {
   for (ReduceOp reduce : llvm::reverse(reductions)) {
     IRMapping reduceMapping;
     for (unsigned i = 0; i < count; ++i) {
-      reduceMapping.map(reduce.getInputs()[i], results[i]);
+      reduceMapping.map(reduce.getSources()[i], results[i]);
       Value projectedIdentity = identities[i];
-      Value originalIdentity = reduce.getInputs()[count + i];
+      Value originalIdentity = reduce.getIdentities()[i];
       if (auto fragment = dyn_cast<FragmentType>(originalIdentity.getType()))
         projectedIdentity = builder.create<SplatOp>(
             reduce.getLoc(), fragment, projectedIdentity);
@@ -3830,7 +3747,7 @@ bool hoistNestedReduction(scf::ForOp outer, func::FuncOp kernel) {
 }
 
 bool sinkReductionIntoSourceIf(ReduceOp reduce, func::FuncOp kernel) {
-  auto sources = reduce.getInputs().take_front(reduce.getSourceCount());
+  auto sources = reduce.getSources();
   auto branch = sources.empty() ? scf::IfOp()
                                : sources.front().getDefiningOp<scf::IfOp>();
   if (!branch || branch.getElseRegion().empty() ||
@@ -3848,7 +3765,7 @@ bool sinkReductionIntoSourceIf(ReduceOp reduce, func::FuncOp kernel) {
   }
   DominanceInfo dominance(kernel);
   SmallVector<Operation *> identities;
-  for (Value value : reduce.getInputs().drop_front(reduce.getSourceCount())) {
+  for (Value value : llvm::concat<const Value>(reduce.getIdentities(), reduce.getCaptures())) {
     if (dominance.dominates(value, branch.getOperation()))
       continue;
     Operation *producer = value.getDefiningOp();

@@ -1,4 +1,4 @@
-#include "Intent/Dialect/CPU/IR/RegionProgram.h"
+#include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "Intent/Dialect/CPU/Analysis/RegionPartition.h"
 #include "Intent/Dialect/CPU/Analysis/RegionPredicates.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
@@ -166,21 +166,21 @@ SmallVector<Value> slices(OpBuilder &b, Location loc, ValueRange sources,
 
 LogicalResult realize(Operation *operation, const Configuration &configuration,
                       const ImplementationRegistry &implementations) {
-  RegionProgram program(operation);
+  auto program = cast<RegionOpInterface>(operation);
   OpBuilder b(operation);
   Location loc = operation->getLoc();
   auto zero = b.create<arith::ConstantIndexOp>(loc, 0);
-  Value count = b.create<memref::DimOp>(loc, program.sources().front(), program.count("axis"));
+  Value count = b.create<memref::DimOp>(loc, program.getSources().front(), program.getAxis());
   int64_t segmentSize = configuration.regionSize;
   auto step = b.create<arith::ConstantIndexOp>(loc, segmentSize);
   operation->setAttr("segment_size", b.getI64IntegerAttr(segmentSize));
-  ValueRange state = program.isScan() ? program.outputs().take_back(program.count("state_count")) : program.outputs();
-  ValueRange initial = program.isScan() ? program.initialState() : program.identities();
+  ValueRange state = program.getFinalDestinations();
+  ValueRange initial = program.getInitialValues();
   for (auto [input, output] : llvm::zip(initial, state)) copy(b, loc, input, output);
   auto partition = analyzeRegionPartition(program, configuration.tileM, configuration.tileN);
   auto predicate = partition ? analyzeRegionPredicate(program) : std::nullopt;
-  if (predicate && (!partition->axes.count(program.captures()[predicate->capture]) ||
-                    partition->axes.lookup(program.captures()[predicate->capture]) != 0)) predicate.reset();
+  if (predicate && (!partition->axes.count(program.getCaptures()[predicate->capture]) ||
+                    partition->axes.lookup(program.getCaptures()[predicate->capture]) != 0)) predicate.reset();
   bool staticPanel = false;
   if (partition)
     for (auto [consumer, axis] : partition->loops) {
@@ -205,9 +205,9 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
     }
     return projected;
   };
-  auto sources = project(program.sources()), identities = project(program.identities());
-  auto captures = project(program.captures()), outputs = project(program.outputs());
-  auto panelState = ArrayRef(outputs).take_back(state.size());
+  auto sources = project(program.getSources()), identities = project(program.getIdentities());
+  auto captures = project(program.getCaptures()), outputs = project(program.getEmittedOutputs());
+  auto panelState = project(program.getFinalDestinations());
   SmallVector<Value> summary, next;
   auto allocate = [&]() { summary = scratch(b, loc, identities); next = scratch(b, loc, panelState); };
   auto release = [&]() {
@@ -253,32 +253,40 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
       }
     }
   }
-  auto expand = [&](Region &helper, ValueRange arguments, std::optional<bool> knownPredicate = std::nullopt,
+  using K = RegionArgumentKind;
+  using Binding = std::pair<K, ValueRange>;
+  auto expand = [&](Region &helper, std::initializer_list<Binding> bindings,
+                    std::optional<bool> knownPredicate = std::nullopt,
                     bool summaryIsNonempty = false) {
-    return instantiate(b, helper, arguments, partition ? &*partition : nullptr, beginPanel, panelWidth,
+    auto arguments = program.bindRegionArguments(helper, [&](K kind) -> ValueRange {
+      for (const auto &[role, values] : bindings) if (role == kind) return values;
+      return {};
+    });
+    if (failed(arguments)) return failure();
+    return instantiate(b, helper, *arguments, partition ? &*partition : nullptr, beginPanel, panelWidth,
         knownPredicate ? predicate->predicate : Value(), knownPredicate.value_or(false),
         summaryIsNonempty ? predicate->validityReduction : nullptr);
   };
   auto visitOne = [&](Value begin, int64_t width, std::optional<bool> knownPredicate,
                       bool summaryIsNonempty, bool omitValidity) -> LogicalResult {
     OpFoldResult extent = b.getIndexAttr(width);
-    auto inputs = slices(b, loc, sources, program.count("axis"), begin, extent);
-    SmallVector<Value> arguments(inputs);
-    llvm::append_range(arguments, captures); llvm::append_range(arguments, summary);
-    if (failed(expand(program.summarize(), arguments, knownPredicate, summaryIsNonempty))) return failure();
+    auto inputs = slices(b, loc, sources, program.getAxis(), begin, extent);
+    if (failed(expand(program.getSummarize(), {{K::Sources, inputs}, {K::Captures, captures},
+        {K::Destinations, summary}}, knownPredicate, summaryIsNonempty))) return failure();
     if (program.isScan()) {
-      arguments = inputs; llvm::append_range(arguments, panelState); llvm::append_range(arguments, captures);
+      SmallVector<Value> emitted;
       auto outputAxes = operation->getAttrOfType<DenseI64ArrayAttr>("output_axes").asArrayRef();
-      for (auto [output, axis] : llvm::zip(ArrayRef(outputs).take_front(program.count("output_count")), outputAxes))
-        llvm::append_range(arguments, slices(b, loc, ValueRange{output}, axis, begin, extent));
-      if (failed(expand(program.emit(), arguments))) return failure();
-      arguments = summary; llvm::append_range(arguments, panelState); llvm::append_range(arguments, next);
-      if (failed(expand(program.apply(), arguments))) return failure();
+      for (auto [output, axis] : llvm::zip(outputs, outputAxes))
+        llvm::append_range(emitted, slices(b, loc, ValueRange{output}, axis, begin, extent));
+      if (failed(expand(*program.getEmitRegion(), {{K::Sources, inputs}, {K::State, panelState},
+          {K::Captures, captures}, {K::Destinations, emitted}}))) return failure();
+      if (failed(expand(*program.getApplyRegion(), {{K::Summary, summary},
+          {K::State, panelState}, {K::Destinations, next}}))) return failure();
     } else {
-      arguments.assign(panelState.begin(), panelState.end());
-      if (omitValidity) arguments[*predicate->validityField] = truthSlot;
-      llvm::append_range(arguments, summary); llvm::append_range(arguments, next);
-      if (failed(expand(program.combine(), arguments))) return failure();
+      SmallVector<Value> current(panelState);
+      if (omitValidity) current[*predicate->validityField] = truthSlot;
+      if (failed(expand(program.getCombine(), {{K::LeftSummary, current},
+          {K::RightSummary, summary}, {K::Destinations, next}}))) return failure();
     }
     for (auto [index, source, target] : llvm::enumerate(next, panelState))
       if (!omitValidity || index != *predicate->validityField) copy(b, loc, source, target);
@@ -287,7 +295,7 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
   auto visit = [&](Value lower, Value upper, int64_t width, std::optional<bool> knownPredicate,
                    bool omitValidity) -> LogicalResult {
     auto loop = b.create<scf::ForOp>(loc, lower, upper, b.create<arith::ConstantIndexOp>(loc, width));
-    loop->setAttr("intent_cpu.region_axis", b.getI64IntegerAttr(program.count("axis")));
+    loop->setAttr("intent_cpu.region_axis", b.getI64IntegerAttr(program.getAxis()));
     OpBuilder::InsertionGuard guard(b);
     b.setInsertionPointToStart(loop.getBody());
     return visitOne(loop.getInductionVar(), width, knownPredicate, knownPredicate == true, omitValidity);
@@ -363,7 +371,7 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
   return success();
   };
   if (partition) {
-    Value output = program.outputs().front();
+    Value output = program.getDestinations().front();
     Value extent = b.create<memref::DimOp>(loc, output, partition->axes.lookup(output));
     Value width = b.create<arith::ConstantIndexOp>(loc, partition->width);
     Value end = staticPanel ? Value(b.create<arith::SubIOp>(loc, extent, b.create<arith::RemSIOp>(loc, extent, width))) : extent;

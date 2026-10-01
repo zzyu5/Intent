@@ -23,6 +23,11 @@ from .types import quote
 
 
 @dataclass(frozen=True, slots=True)
+class DenseI32Array:
+    values: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class SymbolRef:
     name: str
 
@@ -49,6 +54,11 @@ class SparseFormatAttribute:
 
 
 def emit_attribute(value: object) -> str:
+    if isinstance(value, DenseI32Array):
+        return "array<i32" + (
+            ": " + ", ".join(str(element) for element in value.values)
+            if value.values else ""
+        ) + ">"
     if isinstance(value, SymbolRef):
         return f"@{value.name}"
     if isinstance(value, bool):

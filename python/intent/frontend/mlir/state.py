@@ -97,6 +97,7 @@ class RegionState:
     blocks: list[BlockState] = field(default_factory=list)
     owner_operation: EmittedOperation | None = None
     _parent_block: BlockState | None = None
+    isolated_from_above: bool = False
 
     @property
     def parent_block(self) -> BlockState | None:
@@ -143,10 +144,17 @@ class BlockState:
     def has_effect_since(self, operation_count: int) -> bool:
         return any(operation.has_effects for operation in self.operations[operation_count:])
 
-    def dominates(self, block: BlockState) -> bool:
-        """Lexical visibility, including regions still under construction."""
+    @property
+    def visible_parent(self) -> BlockState | None:
+        """Enclosing SSA scope, stopping at an isolated region's arguments."""
+        if self.owner is None or self.owner.isolated_from_above:
+            return None
+        return self.owner.parent_block
+
+    def is_visible_from(self, block: BlockState) -> bool:
+        """Whether this block's values may be used in the construction scope."""
         while block is not self:
-            block = block.owner.parent_block if block.owner is not None else None
+            block = block.visible_parent
             if block is None:
                 return False
         return True

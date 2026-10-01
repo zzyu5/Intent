@@ -289,7 +289,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
                       if (auto reduction = dyn_cast<gpu::ReduceOp>(nextUser))
                         diagnostic << "(axes=[" << reduction.getAxes()
                                    << "],sources="
-                                   << reduction.getSourceCount() << ")";
+                                   << reduction.getSources().size() << ")";
                     }
                 }
             }

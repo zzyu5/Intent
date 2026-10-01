@@ -2820,36 +2820,26 @@ SmallVector<Value, 2> PhysicalProgramAnalysis::structuredSourcesForArgument(
   SmallVector<Value, 2> sources;
   Block *block = argument.getOwner();
   Operation *owner = block ? block->getParentOp() : nullptr;
-  if (auto fold = dyn_cast_or_null<RegionFoldOp>(owner)) {
-    unsigned index = argument.getArgNumber();
-    if (block == &fold.getSummarize().front()) {
-      if (index < fold.getSourceCount())
-        sources.push_back(fold.getInputs()[index]);
-      else {
-        unsigned capture = index - fold.getSourceCount();
-        unsigned input = fold.getSourceCount() + fold.getIdentityCount() +
-                         capture;
-        if (input < fold.getInputs().size())
-          sources.push_back(fold.getInputs()[input]);
+  if (auto structured = dyn_cast_or_null<StructuredOpInterface>(owner)) {
+    bool fold = structured.getStructuredKind() == StructuredOpKind::RegionFold;
+    bool scan = structured.getStructuredKind() == StructuredOpKind::RegionScan;
+    if (!fold && !scan) return sources;
+    for (const auto &relation : structured.getValueRelations()) {
+      if (relation.to != argument) continue;
+      if (block->getParent() == structured.getSummarizeRegion() &&
+          (relation.kind == StructuredRelationKind::SourceSlice ||
+           (fold && relation.kind == StructuredRelationKind::Capture)))
+        sources.push_back(relation.from);
+    }
+    if (fold && block->getParent() == &structured.getCombine()) {
+      for (auto [identity, lhs, rhs, summary] : llvm::zip_equal(
+               structured.getIdentities(), structured.getCombineLhs(),
+               structured.getCombineRhs(), structured.getSummarizeYields())) {
+        if (argument != lhs && argument != rhs) continue;
+        sources.push_back(identity);
+        sources.push_back(summary);
       }
-      return sources;
     }
-    if (block == &fold.getCombine().front() && fold.getIdentityCount() > 0) {
-      unsigned component = index % fold.getIdentityCount();
-      unsigned identity = fold.getSourceCount() + component;
-      if (identity < fold.getInputs().size())
-        sources.push_back(fold.getInputs()[identity]);
-      if (auto yield =
-              dyn_cast<YieldOp>(fold.getSummarize().front().getTerminator());
-          yield && component < yield.getValues().size())
-        sources.push_back(yield.getValues()[component]);
-    }
-    return sources;
-  }
-  if (auto scan = dyn_cast_or_null<RegionScanOp>(owner)) {
-    if (block == &scan.getSummarize().front() &&
-        argument.getArgNumber() < scan.getSourceCount())
-      sources.push_back(scan.getInputs()[argument.getArgNumber()]);
     return sources;
   }
   if (auto loop = dyn_cast_or_null<scf::ForOp>(owner)) {
@@ -2956,7 +2946,7 @@ void PhysicalProgramAnalysis::collectRanges(
     return;
   if (auto scan = dyn_cast<ScanOp>(operation)) {
     bool followed = false;
-    for (Value scanSource : scan.getInputs().take_front(scan.getSourceCount())) {
+    for (Value scanSource : scan.getSources()) {
       if (source && !carriesSource(scanSource.getType(), *source))
         continue;
       followed = true;
@@ -3046,15 +3036,21 @@ void PhysicalProgramAnalysis::collectAxisRanges(
   }
   if (auto argument = dyn_cast<BlockArgument>(value)) {
     if (auto reduce = dyn_cast<ReduceOp>(argument.getOwner()->getParentOp())) {
-      unsigned index = argument.getArgNumber();
-      unsigned count = reduce.getIdentityCount();
-      if (index >= 2 * count) {
-        Value capture = reduce.getInputs()[reduce.getSourceCount() + count +
-                                          index - 2 * count];
-        collectAxisRanges(capture, fragmentAxis, result, visited);
+      auto structured = cast<StructuredOpInterface>(reduce.getOperation());
+      for (auto [capture, formal] : llvm::zip_equal(reduce.getCaptures(), structured.getCombineCaptures()))
+        if (formal == argument) {
+          collectAxisRanges(capture, fragmentAxis, result, visited);
+          return;
+        }
+      Value source;
+      for (auto [input, lhs, rhs] : llvm::zip_equal(reduce.getSources(),
+               structured.getCombineLhs(), structured.getCombineRhs()))
+        if (argument == lhs || argument == rhs) source = input;
+      if (!source) {
+        result.state = PhysicalFactState::Unknown;
+        appendUnique(result.blockers, reduce);
         return;
       }
-      Value source = reduce.getInputs()[index % count];
       auto sourceType = dyn_cast<FragmentType>(source.getType());
       if (!sourceType) {
         result.state = PhysicalFactState::Unknown;
@@ -3193,7 +3189,7 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     auto expected =
         cast<AxisMapAttr>(fragment.getAxisMaps()[fragmentAxis]);
     bool followed = false;
-    for (Value scanSource : scan.getInputs().take_front(scan.getSourceCount())) {
+    for (Value scanSource : scan.getSources()) {
       auto sourceType = dyn_cast<FragmentType>(scanSource.getType());
       if (!sourceType || fragmentAxis >= sourceType.getShape().size())
         continue;
@@ -3246,11 +3242,9 @@ void PhysicalProgramAnalysis::collectAxisRanges(
         return;
       if (auto fold = dyn_cast<RegionFoldOp>(opResult.getOwner())) {
         unsigned component = opResult.getResultNumber();
-        if (component >= fold.getIdentityCount())
+        if (component >= fold.getIdentities().size())
           return;
-        unsigned identity = fold.getSourceCount() + component;
-        if (identity < fold.getInputs().size())
-          collectRecordField(fold.getInputs()[identity]);
+        collectRecordField(fold.getIdentities()[component]);
         if (auto yield =
                 dyn_cast<YieldOp>(fold.getSummarize().front().getTerminator());
             yield && component < yield.getValues().size())
@@ -3500,14 +3494,14 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     auto opResult = dyn_cast<OpResult>(value);
     auto yield = dyn_cast<YieldOp>(fold.getSummarize().front().getTerminator());
     if (!opResult || !yield ||
-        opResult.getResultNumber() >= fold.getIdentityCount() ||
+        opResult.getResultNumber() >= fold.getIdentities().size() ||
         opResult.getResultNumber() >= yield.getValues().size()) {
       result.state = PhysicalFactState::Unknown;
       appendUnique(result.blockers, operation);
       return;
     }
     unsigned index = opResult.getResultNumber();
-    collectAxisRanges(fold.getInputs()[fold.getSourceCount() + index],
+    collectAxisRanges(fold.getIdentities()[index],
                       fragmentAxis, result, visited);
     collectAxisRanges(yield.getValues()[index], fragmentAxis, result, visited);
     return;
@@ -3685,13 +3679,13 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
     };
     bool segmentSource = false;
     if (auto fold = dyn_cast_or_null<RegionFoldOp>(owner))
-      segmentSource = isSegmentSource(fold.getSourceCount(), fold.getAxis(),
+      segmentSource = isSegmentSource(fold.getSources().size(), fold.getAxis(),
                                       fold.getSummarize().front());
     else if (auto scan = dyn_cast_or_null<RegionScanOp>(owner))
       segmentSource =
-          isSegmentSource(scan.getSourceCount(), scan.getAxis(),
+          isSegmentSource(scan.getSources().size(), scan.getAxis(),
                           scan.getSummarize().front()) ||
-          isSegmentSource(scan.getSourceCount(), scan.getAxis(),
+          isSegmentSource(scan.getSources().size(), scan.getAxis(),
                           scan.getEmit().front());
     if (segmentSource) {
       // RegionFoldOp/RegionScanOp verification binds this exact block argument
@@ -3894,8 +3888,8 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
 
   if (auto reduce = value.getDefiningOp<ReduceOp>()) {
     auto opResult = dyn_cast<OpResult>(value);
-    if (opResult && opResult.getResultNumber() < reduce.getSourceCount()) {
-      Value sourceValue = reduce.getInputs()[opResult.getResultNumber()];
+    if (opResult && opResult.getResultNumber() < reduce.getSources().size()) {
+      Value sourceValue = reduce.getSources()[opResult.getResultNumber()];
       auto source = dyn_cast<FragmentType>(sourceValue.getType());
       if (source) {
         llvm::SmallDenseSet<int64_t> reduced(reduce.getAxes().begin(),
@@ -3911,8 +3905,7 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
           if ((!input.hasExtentAuthority() || !input.physicalized) &&
               !input.constructionScalarSeed && input.roots.empty() &&
               input.blockers.empty()) {
-            for (Value peer : reduce.getInputs().take_front(
-                     reduce.getSourceCount())) {
+            for (Value peer : reduce.getSources()) {
               auto peerType = dyn_cast<FragmentType>(peer.getType());
               if (peer == sourceValue || !peerType ||
                   peerType.getShape() != source.getShape() ||
@@ -4493,7 +4486,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
       return;
     }
     for (Value segmentSource :
-         fold.getInputs().take_front(fold.getSourceCount())) {
+         fold.getSources()) {
       auto fragment = dyn_cast<FragmentType>(segmentSource.getType());
       if (!fragment || fold.getAxis() >= fragment.getAxisMaps().size()) {
         appendUnique(result.blockers, operation);
@@ -4509,7 +4502,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
         return;
       }
     }
-    for (Value operand : fold.getInputs())
+    for (Value operand : fold.getOperands())
       if (typeCarriesTraversal(operand.getType(), *source, *sourceDimension))
         analyzeReplay(operand, source, scope, allowAccesses, insertionAnchor,
                       sourceDimension, dominance, result, visited);
@@ -4523,7 +4516,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
       return;
     }
     for (Value segmentSource :
-         scan.getInputs().take_front(scan.getSourceCount())) {
+         scan.getSources()) {
       auto fragment = dyn_cast<FragmentType>(segmentSource.getType());
       if (!fragment || scan.getAxis() >= fragment.getAxisMaps().size()) {
         appendUnique(result.blockers, operation);
@@ -4539,7 +4532,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
         return;
       }
     }
-    for (Value operand : scan.getInputs())
+    for (Value operand : scan.getOperands())
       if (typeCarriesTraversal(operand.getType(), *source, *sourceDimension))
         analyzeReplay(operand, source, scope, allowAccesses, insertionAnchor,
                       sourceDimension, dominance, result, visited);
@@ -4669,7 +4662,7 @@ PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
     }
     if (auto reduce = dyn_cast<ReduceOp>(operation)) {
       for (Value input :
-           reduce.getInputs().take_front(reduce.getSourceCount())) {
+           reduce.getSources()) {
         if (reductionTypeConsumesSource(input.getType(), reduce.getAxes(),
                                         source, sourceDimension)) {
           exact.depends = true;
@@ -4712,7 +4705,7 @@ PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
         return exact;
     }
     if (auto scan = dyn_cast<ScanOp>(operation)) {
-      for (Value input : scan.getInputs().take_front(scan.getSourceCount()))
+      for (Value input : scan.getSources())
         if (reductionTypeConsumesSource(
                 input.getType(),
                 ArrayRef<int64_t>{static_cast<int64_t>(scan.getAxis())},
@@ -4768,7 +4761,7 @@ PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
             if (!loop->isProperAncestor(user))
               continue;
             if (auto reduce = dyn_cast<ReduceOp>(user)) {
-              if (use.getOperandNumber() < reduce.getSourceCount() &&
+              if (use.getOperandNumber() < reduce.getSources().size() &&
                   llvm::is_contained(reduce.getAxes(), static_cast<int64_t>(axis)))
                 return true;
               continue;

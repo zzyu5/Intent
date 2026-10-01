@@ -168,14 +168,14 @@ ReduceOp tryFuse(ReduceOp first, ReduceOp second, func::FuncOp kernel) {
   if (first->getBlock() != second->getBlock() ||
       !first->isBeforeInBlock(second) || first.getAxes() != second.getAxes())
     return {};
-  auto shape = dyn_cast<FragmentType>(first.getInputs().front().getType());
+  auto shape = dyn_cast<FragmentType>(first.getSources().front().getType());
   if (!shape)
     return {};
   for (ReduceOp reduce : {first, second}) {
     for (NamedAttribute attribute : reduce->getDiscardableAttrs())
       if (attribute.getName() != originAttr)
         return {};
-    for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+    for (Value source : reduce.getSources()) {
       auto type = dyn_cast<FragmentType>(source.getType());
       if (!type || type.getShape() != shape.getShape() ||
           type.getAxisMaps() != shape.getAxisMaps() ||
@@ -187,63 +187,42 @@ ReduceOp tryFuse(ReduceOp first, ReduceOp second, func::FuncOp kernel) {
   if (!hoistInputsBefore(first, second, kernel))
     return {};
 
-  unsigned count = first.getSourceCount() + second.getSourceCount();
   SmallVector<Value> sources, identities, captures;
-  SmallVector<Type> results;
   for (ReduceOp reduce : {first, second}) {
     llvm::append_range(sources,
-                       reduce.getInputs().take_front(reduce.getSourceCount()));
-    llvm::append_range(identities, reduce.getInputs().slice(
-                                      reduce.getSourceCount(),
-                                      reduce.getIdentityCount()));
-    llvm::append_range(captures, reduce.getInputs().take_back(
-                                    reduce.getCaptureCount()));
-    llvm::append_range(results, reduce.getResultTypes());
+                       reduce.getSources());
+    llvm::append_range(identities, reduce.getIdentities());
+    llvm::append_range(captures, reduce.getCaptures());
   }
   OpBuilder builder(first);
   Location location = builder.getFusedLoc({first.getLoc(), second.getLoc()});
-  OperationState state(location, ReduceOp::getOperationName());
-  state.addOperands(sources);
-  state.addOperands(identities);
-  state.addOperands(captures);
-  state.addTypes(results);
-  state.addAttribute("axes", first.getAxesAttr());
-  state.addAttribute("source_count", builder.getI64IntegerAttr(count));
-  state.addAttribute("identity_count", builder.getI64IntegerAttr(count));
-  state.addAttribute("capture_count",
-                     builder.getI64IntegerAttr(captures.size()));
+  auto fused = builder.create<ReduceOp>(location, sources, identities,
+                                        captures, first.getAxes());
   if (Attribute origin = first->getAttr(originAttr))
-    state.addAttribute(originAttr, origin);
-  state.addRegion();
-  auto fused = cast<ReduceOp>(builder.create(state));
-  SmallVector<Type> arguments(results);
-  llvm::append_range(arguments, results);
-  for (Value capture : captures)
-    arguments.push_back(capture.getType());
-  Block *body = builder.createBlock(&fused.getCombine(), {}, arguments,
-                                    SmallVector<Location>(arguments.size(),
-                                                          location));
+    fused->setAttr(originAttr, origin);
+  auto target = cast<StructuredOpInterface>(fused.getOperation());
+  auto arguments = target.getCombineArgumentTypes();
+  builder.createBlock(&fused.getCombine(), {}, arguments,
+                      SmallVector<Location>(arguments.size(), location));
   SmallVector<Value> yields;
   unsigned componentOffset = 0, captureOffset = 0;
   for (ReduceOp reduce : {first, second}) {
     Block &combine = reduce.getCombine().front();
-    unsigned size = reduce.getSourceCount();
+    auto source = cast<StructuredOpInterface>(reduce.getOperation());
+    unsigned size = reduce.getSources().size();
     IRMapping mapping;
     for (unsigned index = 0; index < size; ++index) {
-      mapping.map(combine.getArgument(index),
-                  body->getArgument(componentOffset + index));
-      mapping.map(combine.getArgument(size + index),
-                  body->getArgument(count + componentOffset + index));
+      mapping.map(source.getCombineLhs()[index], target.getCombineLhs()[componentOffset + index]);
+      mapping.map(source.getCombineRhs()[index], target.getCombineRhs()[componentOffset + index]);
     }
-    for (unsigned index = 0; index < reduce.getCaptureCount(); ++index)
-      mapping.map(combine.getArgument(2 * size + index),
-                  body->getArgument(2 * count + captureOffset + index));
+    for (unsigned index = 0; index < reduce.getCaptures().size(); ++index)
+      mapping.map(source.getCombineCaptures()[index], target.getCombineCaptures()[captureOffset + index]);
     for (Operation &operation : combine.without_terminator())
       builder.clone(operation, mapping);
     for (Value value : combine.getTerminator()->getOperands())
       yields.push_back(mapping.lookupOrDefault(value));
     componentOffset += size;
-    captureOffset += reduce.getCaptureCount();
+    captureOffset += reduce.getCaptures().size();
   }
   builder.create<YieldOp>(location, yields);
   first->replaceAllUsesWith(fused.getResults().take_front(first.getNumResults()));

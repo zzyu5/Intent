@@ -5,6 +5,8 @@ include "Intent/Dialect/GPU/IR/GPUDialect.td"
 include "Intent/Dialect/GPU/IR/GPUAttrs.td"
 include "Intent/Dialect/GPU/IR/GPUTypes.td"
 include "Intent/Dialect/Intent/IR/IntentAttrs.td"
+include "Intent/Interfaces/StructuredOpInterface.td"
+include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
@@ -230,50 +232,134 @@ def IntentGPU_ContractOp : IntentGPU_Op<"contract", [Pure]> {
   let hasVerifier = 1;
 }
 
-def IntentGPU_ReduceOp : IntentGPU_Op<"reduce", [Pure]> {
-  let arguments = (ins Variadic<IntentGPU_DataValue>:$inputs,
-                       DenseI64ArrayAttr:$axes,
-                       I64Attr:$source_count,
-                       I64Attr:$identity_count,
-                       I64Attr:$capture_count);
+def IntentGPU_ReduceOp : IntentGPU_Op<"reduce", [Pure, IsolatedFromAbove, AttrSizedOperandSegments, Intent_StructuredOpInterface, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let arguments = (ins Variadic<IntentGPU_DataValue>:$sources,
+                       Variadic<IntentGPU_DataValue>:$identities,
+                       Variadic<IntentGPU_DataValue>:$captures,
+                       DenseI64ArrayAttr:$axes);
   let results = (outs Variadic<IntentGPU_DataValue>:$results);
   let regions = (region SizedRegion<1>:$combine);
   let hasVerifier = 1;
+  let assemblyFormat = [{
+    `sources` `(` $sources `:` type($sources) `)`
+    `identities` `(` $identities `:` type($identities) `)`
+    `captures` `(` ($captures^ `:` type($captures))? `)`
+    `axes` $axes
+    `combine` $combine
+    `->` `(` type($results) `)`
+    attr-dict
+  }];
+  let extraClassDeclaration = [{
+    ::intent::StructuredOpKind getStructuredKind() {
+      return ::intent::StructuredOpKind::Reduce;
+    }
+    ::llvm::SmallVector<int64_t> getIterationAxes() {
+      return ::llvm::to_vector(getAxes());
+    }
+  }];
 }
 
-def IntentGPU_ScanOp : IntentGPU_Op<"scan", [Pure]> {
-  let arguments = (ins Variadic<IntentGPU_DataValue>:$inputs,
-                       I64Attr:$axis, BoolAttr:$inclusive, BoolAttr:$reverse,
-                       I64Attr:$source_count, I64Attr:$identity_count,
-                       I64Attr:$capture_count);
+def IntentGPU_ScanOp : IntentGPU_Op<"scan", [Pure, IsolatedFromAbove, AttrSizedOperandSegments, Intent_StructuredOpInterface, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let arguments = (ins Variadic<IntentGPU_DataValue>:$sources,
+                       Variadic<IntentGPU_DataValue>:$identities,
+                       Variadic<IntentGPU_DataValue>:$captures,
+                       I64Attr:$axis,
+                       BoolAttr:$inclusive,
+                       BoolAttr:$reverse);
   let results = (outs Variadic<IntentGPU_DataValue>:$results);
   let regions = (region SizedRegion<1>:$combine);
   let hasVerifier = 1;
+  let assemblyFormat = [{
+    `sources` `(` $sources `:` type($sources) `)`
+    `identities` `(` $identities `:` type($identities) `)`
+    `captures` `(` ($captures^ `:` type($captures))? `)`
+    `axis` $axis
+    `inclusive` $inclusive `reverse` $reverse
+    `combine` $combine
+    `->` `(` type($results) `)`
+    attr-dict
+  }];
+  let extraClassDeclaration = [{
+    ::intent::StructuredOpKind getStructuredKind() {
+      return ::intent::StructuredOpKind::Scan;
+    }
+    ::llvm::SmallVector<int64_t> getIterationAxes() {
+      return {static_cast<int64_t>(getAxis())};
+    }
+  }];
 }
 
-def IntentGPU_RegionFoldOp : IntentGPU_Op<"region_fold", [Pure]> {
-  let arguments = (ins Variadic<IntentGPU_DataValue>:$inputs,
-                       I64Attr:$axis, I64Attr:$source_count,
-                       I64Attr:$identity_count, I64Attr:$capture_count,
+def IntentGPU_RegionFoldOp : IntentGPU_Op<"region_fold", [Pure, IsolatedFromAbove, AttrSizedOperandSegments, Intent_StructuredOpInterface]> {
+  let arguments = (ins Variadic<IntentGPU_DataValue>:$sources,
+                       Variadic<IntentGPU_DataValue>:$identities,
+                       Variadic<IntentGPU_DataValue>:$captures,
+                       I64Attr:$axis,
                        IntentGPU_Parameter:$segment);
   let results = (outs Variadic<IntentGPU_DataValue>:$results);
   let regions = (region SizedRegion<1>:$summarize,
                          SizedRegion<1>:$combine);
   let hasVerifier = 1;
+  let assemblyFormat = [{
+    `sources` `(` $sources `:` type($sources) `)`
+    `identities` `(` $identities `:` type($identities) `)`
+    `captures` `(` ($captures^ `:` type($captures))? `)`
+    `axis` $axis
+    `segment` $segment
+    `summarize` $summarize
+    `combine` $combine
+    `->` `(` type($results) `)`
+    attr-dict
+  }];
+  let extraClassDeclaration = [{
+    ::intent::StructuredOpKind getStructuredKind() {
+      return ::intent::StructuredOpKind::RegionFold;
+    }
+    ::llvm::SmallVector<int64_t> getIterationAxes() {
+      return {static_cast<int64_t>(getAxis())};
+    }
+    ::mlir::Region *getSummarizeRegion() { return &getSummarize(); }
+  }];
 }
 
-def IntentGPU_RegionScanOp : IntentGPU_Op<"region_scan", [Pure]> {
-  let arguments = (ins Variadic<IntentGPU_DataValue>:$inputs,
-                       I64Attr:$axis, I64Attr:$source_count,
-                       I64Attr:$identity_count, I64Attr:$state_count,
-                       I64Attr:$capture_count, I64Attr:$output_count,
+def IntentGPU_RegionScanOp : IntentGPU_Op<"region_scan", [Pure, IsolatedFromAbove, AttrSizedOperandSegments, Intent_StructuredOpInterface, AttrSizedResultSegments]> {
+  let arguments = (ins Variadic<IntentGPU_DataValue>:$sources,
+                       Variadic<IntentGPU_DataValue>:$identities,
+                       Variadic<IntentGPU_DataValue>:$initial_states,
+                       Variadic<IntentGPU_DataValue>:$captures,
+                       I64Attr:$axis,
                        IntentGPU_Parameter:$segment);
-  let results = (outs Variadic<IntentGPU_DataValue>:$results);
+  let results = (outs Variadic<IntentGPU_DataValue>:$emitted_results,
+                      Variadic<IntentGPU_DataValue>:$final_states);
   let regions = (region SizedRegion<1>:$summarize,
                          SizedRegion<1>:$combine,
                          SizedRegion<1>:$apply,
                          SizedRegion<1>:$emit);
   let hasVerifier = 1;
+  let assemblyFormat = [{
+    `sources` `(` $sources `:` type($sources) `)`
+    `identities` `(` $identities `:` type($identities) `)`
+    `initial_states` `(` $initial_states `:` type($initial_states) `)`
+    `captures` `(` ($captures^ `:` type($captures))? `)`
+    `axis` $axis
+    `segment` $segment
+    `summarize` $summarize
+    `combine` $combine
+    `apply` $apply
+    `emit` $emit
+    `->` `(` type($emitted_results) `)` `final_states` `(` type($final_states) `)`
+    attr-dict
+  }];
+  let extraClassDeclaration = [{
+    ::intent::StructuredOpKind getStructuredKind() {
+      return ::intent::StructuredOpKind::RegionScan;
+    }
+    ::llvm::SmallVector<int64_t> getIterationAxes() {
+      return {static_cast<int64_t>(getAxis())};
+    }
+    ::mlir::Region *getSummarizeRegion() { return &getSummarize(); }
+    ::mlir::Region *getApplyRegion() { return &getApply(); }
+    ::mlir::Region *getEmitRegion() { return &getEmit(); }
+  }];
 }
 
 def IntentGPU_ScaledContractOp : IntentGPU_Op<"scaled_contract", [Pure]> {

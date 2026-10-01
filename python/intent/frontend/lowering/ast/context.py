@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from intent.api import Definition
 from intent.frontend.mlir import BlockState
+from intent.frontend.mlir.attributes import DenseI32Array
 from intent.frontend.semantics import ConstexprType
 from intent.frontend.semantics import DynamicDim
 from intent.frontend.semantics import Effect
@@ -151,11 +152,29 @@ class FunctionLowerer:
         *,
         operands: tuple[MlirValue, ...] = (),
         result_types: tuple[ValueType, ...] = (),
+        operand_groups: tuple[tuple[MlirValue, ...], ...] | None = None,
+        result_type_groups: tuple[tuple[ValueType, ...], ...] | None = None,
         attributes: dict[str, object] | None = None,
         regions: tuple[RegionState, ...] = (),
         effects: tuple[Effect, ...] = (),
         result_names: tuple[str | None, ...] = (),
     ) -> EmittedOperation:
+        if operand_groups is not None:
+            if operands:
+                raise ValueError("provide operand groups or flat operands, not both")
+            operands = tuple(value for group in operand_groups for value in group)
+            attributes = {
+                **(attributes or {}),
+                "operandSegmentSizes": DenseI32Array(tuple(len(group) for group in operand_groups)),
+            }
+        if result_type_groups is not None:
+            if result_types:
+                raise ValueError("provide result groups or flat result types, not both")
+            result_types = tuple(value_type for group in result_type_groups for value_type in group)
+            attributes = {
+                **(attributes or {}),
+                "resultSegmentSizes": DenseI32Array(tuple(len(group) for group in result_type_groups)),
+            }
         key = self.shapes.integer_key(
             self.current_block, opcode, operands, result_types, attributes, regions, effects,
         )
@@ -181,9 +200,12 @@ class FunctionLowerer:
         location: Location,
         argument_types: tuple[ValueType, ...] = (),
         argument_names: tuple[str | None, ...] = (),
+        *,
+        isolated_from_above: bool = False,
     ) -> RegionState:
         region = self.compiler.builder.region(
-            location, argument_types, argument_names, parent_block=self.current_block
+            location, argument_types, argument_names, parent_block=self.current_block,
+            isolated_from_above=isolated_from_above,
         )
         return region
 

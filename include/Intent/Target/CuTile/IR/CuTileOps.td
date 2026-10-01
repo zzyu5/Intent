@@ -6,6 +6,7 @@ include "Intent/Dialect/Intent/IR/IntentAttrs.td"
 include "Intent/Target/CuTile/IR/CuTileDialect.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/Interfaces/InferTypeOpInterface.td"
 
 class IntentCuTile_Op<string mnemonic, list<Trait> traits = []> :
     Op<IntentCuTile_Dialect, mnemonic, traits>;
@@ -158,14 +159,21 @@ def IntentCuTile_ScaledMMAOp : IntentCuTile_Op<"scaled_mma", [Pure]> {
 }
 
 class IntentCuTile_Collective<string mnemonic> :
-    IntentCuTile_Op<mnemonic, [Pure]> {
-  let arguments = (ins Variadic<IntentGPU_DataValue>:$inputs,
-                       I64Attr:$source_count,
+    IntentCuTile_Op<mnemonic, [Pure, IsolatedFromAbove, AttrSizedOperandSegments,
+        DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let arguments = (ins Variadic<IntentGPU_DataValue>:$sources,
+                       Variadic<IntentGPU_DataValue>:$identities,
                        I64Attr:$axis,
                        BoolAttr:$reverse,
                        OptionalAttr<Intent_BinaryOperatorAttr>:$kind);
   let results = (outs Variadic<IntentGPU_DataValue>:$outputs);
   let regions = (region AnyRegion:$combine);
+  let assemblyFormat = [{
+    `sources` `(` $sources `:` type($sources) `)`
+    `identities` `(` ($identities^ `:` type($identities))? `)`
+    `axis` $axis `reverse` $reverse (`kind` $kind^)?
+    `combine` $combine `->` `(` type($outputs) `)` attr-dict
+  }];
   let hasVerifier = 1;
 }
 

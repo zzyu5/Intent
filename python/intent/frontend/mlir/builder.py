@@ -66,6 +66,7 @@ class MlirBuilder:
         argument_names: Iterable[str | None] = (),
         *,
         parent_block: BlockState | None = None,
+        isolated_from_above: bool = False,
     ) -> RegionState:
         types = tuple(argument_types)
         names = tuple(argument_names)
@@ -73,7 +74,10 @@ class MlirBuilder:
             raise ValueError("region argument names and types must have equal length")
         if not names:
             names = (None,) * len(types)
-        region = RegionState(location, _parent_block=parent_block)
+        region = RegionState(
+            location, _parent_block=parent_block,
+            isolated_from_above=isolated_from_above,
+        )
         block = BlockState(location, owner=region)
         region.blocks.append(block)
         block.arguments.extend(
@@ -145,6 +149,12 @@ class MlirBuilder:
         names = tuple(result_names)
         if any(not isinstance(value, MlirValue) for value in operands):
             raise TypeError("operation operands must be MLIR values")
+        for value in operands:
+            if not value.block.is_visible_from(block):
+                raise ValueError(
+                    f"intent.{operation_kind.value} operand %{value.id} is outside "
+                    "its SSA scope; structured helpers require explicit arguments"
+                )
         if any(not isinstance(value_type, ValueType) for value_type in result_types):
             raise TypeError("operation result types must be frontend ValueType values")
         if any(not isinstance(effect, Effect) for effect in effects):

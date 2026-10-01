@@ -1011,15 +1011,15 @@ FailureOr<bool> composeReducedGather(GatherOp gather) {
   auto reduce = gather.getSource().getDefiningOp<ReduceOp>();
   auto output = dyn_cast<FragmentType>(gather.getSource().getType());
   if (!reduce || !output || isa<FragmentType>(gather.getResult().getType()) ||
-      reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 ||
-      reduce.getCaptureCount() != 0 || reduce.getNumResults() != 1 ||
+      reduce.getSources().size() != 1 || reduce.getIdentities().size() != 1 ||
+      reduce.getCaptures().size() != 0 || reduce.getNumResults() != 1 ||
       gather.getSourceAxes().size() != output.getShape().size() ||
       !queryBinaryCombineKind(reduce.getCombine()) ||
       std::distance(reduce.getCombine().front().begin(),
                     reduce.getCombine().front().end()) != 2)
     return false;
 
-  auto input = cast<FragmentType>(reduce.getInputs().front().getType());
+  auto input = cast<FragmentType>(reduce.getSources().front().getType());
   auto kernel = gather->getParentOfType<func::FuncOp>();
   PhysicalProgramAnalysis analysis(kernel);
   SmallVector<Value> freeCoordinates(output.getShape().size());
@@ -1034,7 +1034,7 @@ FailureOr<bool> composeReducedGather(GatherOp gather) {
   for (unsigned axis = 0; axis < input.getShape().size(); ++axis) {
     if (!llvm::is_contained(reduce.getAxes(), static_cast<int64_t>(axis)))
       continue;
-    auto range = queryExactLogicalRange(analysis.axisRanges(reduce.getInputs()[0], axis));
+    auto range = queryExactLogicalRange(analysis.axisRanges(reduce.getSources().front(), axis));
     auto extent = cast<PhysicalExprAttr>(input.getShape()[axis]);
     if (failed(range) ||
         extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
@@ -1090,14 +1090,14 @@ FailureOr<bool> composeReducedGather(GatherOp gather) {
   if (failed(zeroFill))
     return failure();
   Value selected = builder.create<GatherOp>(location, selectedType,
-      reduce.getInputs()[0], coordinates, valid, *zeroFill, sourceAxes);
+      reduce.getSources().front(), coordinates, valid, *zeroFill, sourceAxes);
   Type resultType = gather.getResult().getType();
   Value identityFill = builder.create<arith::ConstantOp>(location, builder.getZeroAttr(resultType));
   Value identity = builder.create<GatherOp>(location, resultType,
-      reduce.getInputs()[1], gather.getCoordinates(), *bounded,
+      reduce.getIdentities().front(), gather.getCoordinates(), *bounded,
       identityFill, gather.getSourceAxes());
-  auto projected = builder.create<ReduceOp>(location, TypeRange{resultType},
-      ValueRange{selected, identity}, reductionAxes, 1, 1, 0);
+  auto projected = builder.create<ReduceOp>(location, ValueRange{selected},
+      ValueRange{identity}, ValueRange{}, reductionAxes);
   if (failed(scalarizeElementwiseCallback(reduce.getCombine(), projected.getCombine())))
     return failure();
   Value replacement = projected.getResult(0);
@@ -1668,11 +1668,11 @@ FailureOr<bool> composeIdentityFragmentGather(GatherOp gather) {
 }
 
 FailureOr<bool> composeReductionGathers(ReduceOp reduce) {
-  if (reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 ||
-      reduce.getCaptureCount() != 0 || reduce.getNumResults() != 1 ||
+  if (reduce.getSources().size() != 1 || reduce.getIdentities().size() != 1 ||
+      reduce.getCaptures().size() != 0 || reduce.getNumResults() != 1 ||
       reduce.getAxes() != ArrayRef<int64_t>{0})
     return false;
-  Value input = reduce.getInputs().front();
+  Value input = reduce.getSources().front();
   auto schema = dyn_cast<FragmentType>(input.getType());
   auto result = dyn_cast<FragmentType>(reduce.getResult(0).getType());
   if (!schema || schema.getShape().size() != 1 ||

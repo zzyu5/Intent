@@ -625,9 +625,9 @@ LogicalResult fuseMultiplyReductions(ModuleOp module) {
   SmallVector<ReduceOp> reductions;
   kernel->walk([&](ReduceOp reduce) { reductions.push_back(reduce); });
   for (ReduceOp reduce : reductions) {
-    if (reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 ||
-        reduce.getCaptureCount() != 0 || reduce.getNumResults() != 1 ||
-        !isLiteralZeroProjection(reduce.getInputs()[1]))
+    if (reduce.getSources().size() != 1 || reduce.getIdentities().size() != 1 ||
+        reduce.getCaptures().size() != 0 || reduce.getNumResults() != 1 ||
+        !isLiteralZeroProjection(reduce.getIdentities().front()))
       continue;
     auto resultType = dyn_cast<FragmentType>(reduce.getResult(0).getType());
     // The existing matrix path provides full-precision f32 accumulation.
@@ -638,7 +638,7 @@ LogicalResult fuseMultiplyReductions(ModuleOp module) {
     if (queryBinaryCombineKind(reduce.getCombine()) != BinaryOperator::Add)
       continue;
 
-    Value product = reduce.getInputs().front();
+    Value product = reduce.getSources().front();
     // Builtin sum may retain an identity cast. A numeric conversion, including
     // default accumulator widening, is a rounding boundary and cannot fuse.
     while (product.hasOneUse()) {
@@ -819,7 +819,7 @@ LogicalResult fuseMultiplyReductions(ModuleOp module) {
         builder.getArrayAttr(shape), builder.getArrayAttr(mappings),
         resultType.getValidity(), resultType.getOwner());
     auto zero = projectPhysicalValueToSchema(
-        builder, reduce.getLoc(), reduce.getInputs()[1], contractedType);
+        builder, reduce.getLoc(), reduce.getIdentities().front(), contractedType);
     if (failed(zero))
       return reduce.emitOpError("cannot form the multiply-reduction identity");
     SmallVector<int64_t> lhsReduced, rhsReduced, lhsBatch, rhsBatch;

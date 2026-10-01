@@ -1,7 +1,7 @@
 add_mlir_dialect_library(MLIRIntentCPUDialect
   CPUDialect.cpp
   CPUOps.cpp
-  RegionProgram.cpp
+  CPUOpInterfaces.cpp
   DEPENDS IntentCPUIncGen
   LINK_LIBS PUBLIC
   MLIRArithDialect

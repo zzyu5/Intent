@@ -164,10 +164,9 @@ def _prepare_reduction(lowerer: FunctionLowerer, name: str, node: ast.Call, boun
 def _emit_collective(lowerer, node, inputs: ReductionInputs, kind, result_types, attributes):
     operation = lowerer.emit(
         kind, lowerer.location(node),
-        operands=inputs.sources + inputs.identities + inputs.captures,
+        operand_groups=(inputs.sources, inputs.identities, inputs.captures),
         result_types=result_types,
-        attributes={**attributes, "source_count": len(inputs.sources),
-                    "identity_count": len(inputs.identities), "capture_count": len(inputs.captures)},
+        attributes=attributes,
         regions=(inputs.combine,),
     )
     return _rebuild_components(lowerer, operation.results, inputs.schema, node)
@@ -229,16 +228,13 @@ def _arg_reduce_max(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
     operation = lowerer.emit(
         OperationKind.REDUCE,
         lowerer.location(node),
-        operands=(source, indices, identity, index_identity),
+        operand_groups=((source, indices), (identity, index_identity), ()),
         result_types=(
             lowerer.value_result_type(acc_dtype, result_shape),
             lowerer.value_result_type(intent_index, result_shape),
         ),
         attributes={
             "axes": axes,
-            "source_count": 2,
-            "identity_count": 2,
-            "capture_count": 0,
         },
         regions=(combine,),
     )
@@ -307,10 +303,9 @@ def _region_fold(lowerer: FunctionLowerer, node: ast.Call) -> object:
     summary = _prepare_region_summary(lowerer, bound, node, "region_fold")
     operation = lowerer.emit(
         OperationKind.REGION_FOLD, lowerer.location(node),
-        operands=summary.sources + summary.identity + summary.captures,
+        operand_groups=(summary.sources, summary.identity, summary.captures),
         result_types=summary.summary_types,
-        attributes={"axis": summary.axis, "source_count": len(summary.sources),
-                    "identity_count": len(summary.identity), "capture_count": len(summary.captures)},
+        attributes={"axis": summary.axis},
         regions=(summary.summarize, summary.combine),
     )
     return operation.results[0] if len(operation.results) == 1 else StaticTuple(operation.results)
@@ -340,11 +335,9 @@ def _region_scan(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
                          for value_type in slice_output_types)
     operation = lowerer.emit(
         OperationKind.REGION_SCAN, lowerer.location(node),
-        operands=summary.sources + summary.identity + initial + summary.captures,
-        result_types=output_types + state_types,
-        attributes={"axis": summary.axis, "source_count": len(summary.sources),
-                    "identity_count": len(summary.identity), "state_count": len(initial),
-                    "capture_count": len(summary.captures), "output_count": len(output_types)},
+        operand_groups=(summary.sources, summary.identity, initial, summary.captures),
+        result_type_groups=(output_types, state_types),
+        attributes={"axis": summary.axis},
         regions=(summary.summarize, summary.combine, apply, emit),
     )
     outputs = operation.results[:len(output_types)]

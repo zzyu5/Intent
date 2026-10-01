@@ -4,6 +4,7 @@
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SmallBitVector.h"
@@ -16,6 +17,18 @@ using namespace mlir;
 
 namespace intent::triton {
 namespace {
+
+template <typename CollectiveOp>
+LogicalResult inferCollectiveTypes(MLIRContext *context,
+    std::optional<Location> location, ValueRange operands, DictionaryAttr attributes,
+    OpaqueProperties properties, RegionRange regions, bool scan,
+    SmallVectorImpl<Type> &results) {
+  typename CollectiveOp::Adaptor operation(operands, attributes, properties, regions);
+  if (failed(operation.verify(location.value_or(UnknownLoc::get(context)))))
+    return failure();
+  return gpu::inferScalarCollectiveResultTypes(
+      location, operation.getSources(), operation.getAxis(), scan, results);
+}
 
 LogicalResult verifyBlockAccess(Operation *owner, Value viewValue,
                                 gpu::FragmentType fragment,
@@ -174,16 +187,30 @@ bool hasDescriptorLayout(func::FuncOp kernel, gpu::ViewType view) {
 
 } // namespace
 
+LogicalResult ReduceOp::inferReturnTypes(MLIRContext *context,
+    std::optional<Location> location, ValueRange operands, DictionaryAttr attributes,
+    OpaqueProperties properties, RegionRange regions, SmallVectorImpl<Type> &results) {
+  return inferCollectiveTypes<ReduceOp>(context, location, operands, attributes,
+                                      properties, regions, false, results);
+}
+
+LogicalResult ScanOp::inferReturnTypes(MLIRContext *context,
+    std::optional<Location> location, ValueRange operands, DictionaryAttr attributes,
+    OpaqueProperties properties, RegionRange regions, SmallVectorImpl<Type> &results) {
+  return inferCollectiveTypes<ScanOp>(context, location, operands, attributes,
+                                    properties, regions, true, results);
+}
+
 LogicalResult ReduceOp::verify() {
   if (getReverse())
     return emitOpError("native reduction does not reverse logical order");
-  return gpu::verifyScalarCollective(getOperation(), getInputs(), getResults(),
-                                     getCombine(), getSourceCount(), getAxis(), false);
+  return gpu::verifyScalarCollective(getOperation(), getSources(), getIdentities(),
+                                     getResults(), getCombine(), getAxis(), false);
 }
 
 LogicalResult ScanOp::verify() {
-  return gpu::verifyScalarCollective(getOperation(), getInputs(), getResults(),
-                                     getCombine(), getSourceCount(), getAxis(), true);
+  return gpu::verifyScalarCollective(getOperation(), getSources(), getIdentities(),
+                                     getResults(), getCombine(), getAxis(), true);
 }
 
 LogicalResult TensorDescriptorChoiceOp::verify() {
