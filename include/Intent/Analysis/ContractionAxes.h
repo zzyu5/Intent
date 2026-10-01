@@ -44,6 +44,29 @@ struct ContractionAxes {
   bool hasCanonicalMatrixAxes() const;
 };
 
+// Relate two operands broadcast into one product domain to a contraction.
+// Each projection maps a product axis to an operand axis, or to no axis for
+// an introduced broadcast. Unit facts are indexed by operand axis and must
+// describe logical singleton domains, not one-element physical tiles.
+// This query neither proves fusion legality nor chooses a physical orientation.
+struct ProductContractionAxes {
+  static std::optional<ProductContractionAxes> get(
+      llvm::ArrayRef<std::optional<unsigned>> lhsProjection,
+      llvm::ArrayRef<bool> lhsUnitAxes,
+      llvm::ArrayRef<std::optional<unsigned>> rhsProjection,
+      llvm::ArrayRef<bool> rhsUnitAxes,
+      llvm::ArrayRef<int64_t> reductionAxes,
+      std::string *failureReason = nullptr);
+
+  // Operand axes retained in their original source order. The contraction
+  // axis positions below refer to these compressed operands.
+  llvm::SmallVector<int64_t> lhsKept, rhsKept;
+  ContractionAxes axes;
+  // Formal contraction result -> product axis, and reduced product result
+  // -> formal contraction result. The latter restores the original output.
+  llvm::SmallVector<int64_t> resultProductAxes, resultPermutation;
+};
+
 } // namespace intent
 
 #endif

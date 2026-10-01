@@ -1,4 +1,5 @@
 #include "ContractionDetail.h"
+#include "Intent/Analysis/ContractionAxes.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
@@ -705,16 +706,14 @@ LogicalResult fuseMultiplyReductions(ModuleOp module) {
     if (!lhsProjection.isExact() || !rhsProjection.isExact())
       continue;
     PhysicalProgramAnalysis analysis(*kernel);
-    auto broadcastsAxis = [&](Value value, std::optional<unsigned> axis) {
-      if (!axis)
-        return true;
+    auto isLogicalUnitAxis = [&](Value value, unsigned axis) {
       auto type = cast<FragmentType>(value.getType());
       if (constantPhysicalExpression(
-              cast<PhysicalExprAttr>(type.getShape()[*axis])) != 1)
+              cast<PhysicalExprAttr>(type.getShape()[axis])) != 1)
         return false;
       // A one-element physical tile can still carry a non-unit logical axis.
       // Drop only introduced units or ranges proven logically singleton.
-      auto ranges = analysis.axisRanges(value, *axis);
+      auto ranges = analysis.axisRanges(value, axis);
       return ranges.isExact() &&
              llvm::all_of(ranges.roots, [](MakeRangeOp range) {
                // A lifted workset coordinate starts as one logical iteration;
@@ -723,56 +722,59 @@ LogicalResult fuseMultiplyReductions(ModuleOp module) {
                       isProvablySingletonLogicalRange(range);
              });
     };
-    SmallVector<int64_t> lhsKept, rhsKept, lhsReduced, rhsReduced;
-    SmallVector<int64_t> lhsBatch, rhsBatch, lhsOutput, rhsOutput;
+    SmallVector<bool> lhsUnits, rhsUnits;
+    for (unsigned axis = 0; axis < lhsType.getShape().size(); ++axis)
+      lhsUnits.push_back(isLogicalUnitAxis(lhs, axis));
+    for (unsigned axis = 0; axis < rhsType.getShape().size(); ++axis)
+      rhsUnits.push_back(isLogicalUnitAxis(rhs, axis));
+    auto lhsAxes = lhsProjection.targetToSource;
+    auto rhsAxes = rhsProjection.targetToSource;
     bool compatible = true;
-    unsigned lhsFree = 0, rhsFree = 0;
     for (unsigned axis = 0; axis < productType.getShape().size(); ++axis) {
-      auto left = lhsProjection.targetToSource[axis];
-      auto right = rhsProjection.targetToSource[axis];
-      bool leftBroadcast = broadcastsAxis(lhs, left);
-      bool rightBroadcast = broadcastsAxis(rhs, right);
-      bool reduced = llvm::is_contained(reduce.getAxes(), axis);
-      if (reduced && (!left || !right || leftBroadcast || rightBroadcast)) {
-        compatible = false;
-        break;
-      }
-      // Retain a common unit result axis once, just like a batch axis. Other
-      // singleton broadcasts introduce no independent contraction work.
-      if (!reduced && leftBroadcast && rightBroadcast) {
+      if (llvm::is_contained(reduce.getAxes(), axis))
+        continue;
+      auto left = lhsAxes[axis];
+      auto right = rhsAxes[axis];
+      // Keep the existing GPU eligibility boundary for a common unit result:
+      // its representative must already be present on the original lhs.
+      if ((!left || lhsUnits[*left]) && (!right || rhsUnits[*right])) {
         if (!left) {
           compatible = false;
           break;
         }
-        leftBroadcast = false;
-      }
-      int64_t leftAxis = lhsKept.size(), rightAxis = rhsKept.size();
-      if (!leftBroadcast)
-        lhsKept.push_back(*left);
-      if (!rightBroadcast)
-        rhsKept.push_back(*right);
-      if (reduced) {
-        lhsReduced.push_back(leftAxis);
-        rhsReduced.push_back(rightAxis);
-      } else {
-        if (!leftBroadcast)
-          lhsOutput.push_back(axis);
-        if (!leftBroadcast && !rightBroadcast) {
-          lhsBatch.push_back(leftAxis);
-          rhsBatch.push_back(rightAxis);
-        } else if (!rightBroadcast) {
-          rhsOutput.push_back(axis);
-          ++rhsFree;
-        } else {
-          ++lhsFree;
-        }
+        // The old GPU rewrite discarded this rhs unit before orientation.
+        // Keep that representative choice when the shared query is rerun with
+        // swapped operands; an omitted source axis is proven singleton here.
+        rhsAxes[axis] = std::nullopt;
       }
     }
+    if (!compatible)
+      continue;
+    SmallVector<int64_t> reductionAxes(reduce.getAxes());
+    llvm::sort(reductionAxes);
+    auto axes = ProductContractionAxes::get(
+        lhsAxes, lhsUnits, rhsAxes, rhsUnits, reductionAxes);
     // Preserve matrix-vector reuse before ownership can lift an independent
     // workset axis onto the other operand. Remaining vector contractions are
     // realized as native reductions after blocking.
-    if (!compatible || (!lhsFree && !rhsFree))
+    if (!axes || (axes->axes.lhsFree.empty() && axes->axes.rhsFree.empty()))
       continue;
+    // Preserve the innermost result coordinates as the matrix column axes.
+    // Operand orientation is GPU policy; recompute the shared relation for
+    // the selected orientation instead of exchanging partial axis lists.
+    std::optional<int64_t> lhsOutput, rhsOutput;
+    for (auto [position, result] : llvm::enumerate(axes->axes.results))
+      (result.operand == ContractionOperand::Lhs ? lhsOutput : rhsOutput) =
+          axes->resultProductAxes[position];
+    if (axes->axes.batch.empty() && lhsOutput && rhsOutput &&
+        *lhsOutput > *rhsOutput) {
+      auto oriented = ProductContractionAxes::get(
+          rhsAxes, rhsUnits, lhsAxes, lhsUnits, reductionAxes);
+      if (!oriented)
+        return reduce.emitOpError("cannot preserve the multiply-reduction axis relation when orienting operands");
+      std::swap(lhs, rhs);
+      axes = std::move(oriented);
+    }
     OpBuilder builder(reduce);
     auto squeeze = [&](Value value, ArrayRef<int64_t> kept) -> Value {
       auto source = cast<FragmentType>(value.getType());
@@ -800,36 +802,18 @@ LogicalResult fuseMultiplyReductions(ModuleOp module) {
       return builder.create<ReshapeOp>(reduce.getLoc(), target, value,
                                        builder.getArrayAttr(groups));
     };
-    lhs = squeeze(lhs, lhsKept);
-    rhs = squeeze(rhs, rhsKept);
-    // Preserve the innermost result coordinates as the matrix column axes.
-    // The multiplication's operand order does not define matrix orientation.
-    if (lhsBatch.empty() && rhsBatch.empty() && !lhsOutput.empty() &&
-        !rhsOutput.empty() &&
-        lhsOutput.back() > rhsOutput.back()) {
-      std::swap(lhs, rhs);
-      std::swap(lhsReduced, rhsReduced);
-      std::swap(lhsOutput, rhsOutput);
-    }
-    SmallVector<int64_t> outputAxes(lhsOutput);
-    llvm::append_range(outputAxes, rhsOutput);
+    lhs = squeeze(lhs, axes->lhsKept);
+    rhs = squeeze(rhs, axes->rhsKept);
     SmallVector<Attribute> shape, mappings;
-    auto appendOutput = [&](Value value, ArrayRef<int64_t> reduced,
-                            ArrayRef<int64_t> batched) {
+    for (ContractionResultAxis result : axes->axes.results) {
+      Value value = result.operand == ContractionOperand::Lhs ? lhs : rhs;
       auto type = cast<FragmentType>(value.getType());
-      for (unsigned axis = 0; axis < type.getShape().size(); ++axis) {
-        if (llvm::is_contained(reduced, axis) ||
-            llvm::is_contained(batched, axis))
-          continue;
-        shape.push_back(type.getShape()[axis]);
-        auto map = cast<AxisMapAttr>(type.getAxisMaps()[axis]);
-        mappings.push_back(AxisMapAttr::get(
-            module.getContext(), map.getSourceId(), map.getSourceAxis(),
-            map.getDimensionId(), mappings.size(), map.getDerived()));
-      }
-    };
-    appendOutput(lhs, lhsReduced, {});
-    appendOutput(rhs, rhsReduced, rhsBatch);
+      shape.push_back(type.getShape()[result.axis]);
+      auto map = cast<AxisMapAttr>(type.getAxisMaps()[result.axis]);
+      mappings.push_back(AxisMapAttr::get(
+          module.getContext(), map.getSourceId(), map.getSourceAxis(),
+          map.getDimensionId(), mappings.size(), map.getDerived()));
+    }
     auto contractedType = FragmentType::get(
         module.getContext(), resultType.getElementType(),
         builder.getArrayAttr(shape), builder.getArrayAttr(mappings),
@@ -838,17 +822,21 @@ LogicalResult fuseMultiplyReductions(ModuleOp module) {
         builder, reduce.getLoc(), reduce.getInputs()[1], contractedType);
     if (failed(zero))
       return reduce.emitOpError("cannot form the multiply-reduction identity");
+    SmallVector<int64_t> lhsReduced, rhsReduced, lhsBatch, rhsBatch;
+    for (ContractionAxisPair pair : axes->axes.reduction) {
+      lhsReduced.push_back(pair.lhs);
+      rhsReduced.push_back(pair.rhs);
+    }
+    for (ContractionAxisPair pair : axes->axes.batch) {
+      lhsBatch.push_back(pair.lhs);
+      rhsBatch.push_back(pair.rhs);
+    }
     auto contract = builder.create<ContractOp>(
         reduce.getLoc(), contractedType, lhs, rhs, *zero, lhsReduced, rhsReduced,
         lhsBatch, rhsBatch);
     if (Attribute origin = reduce->getAttr(originAttr))
       contract->setAttr(originAttr, origin);
-    SmallVector<int64_t> permutation;
-    for (unsigned axis = 0; axis < productType.getShape().size(); ++axis) {
-      if (llvm::is_contained(reduce.getAxes(), axis))
-        continue;
-      permutation.push_back(llvm::find(outputAxes, axis) - outputAxes.begin());
-    }
+    ArrayRef<int64_t> permutation = axes->resultPermutation;
     Value replacement = contract.getResult();
     if (!llvm::all_of(llvm::enumerate(permutation), [](auto item) {
           return item.index() == static_cast<unsigned>(item.value());
