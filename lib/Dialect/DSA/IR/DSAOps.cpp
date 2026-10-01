@@ -525,10 +525,33 @@ LogicalResult intent::dsa::verifyProgram(ModuleOp module) {
   auto functions = llvm::to_vector(module.getOps<func::FuncOp>());
   if (functions.size() != 1) return module.emitError("DSA artifact requires one physical kernel");
   auto function = functions.front();
-  auto interface = function->getAttrOfType<InterfaceAttr>("intent_dsa.interface");
+  auto interface = intent::getPublicInterface(function);
   auto config = function->getAttrOfType<ConfigurationAttr>("intent_dsa.configuration");
-  if (!interface || !config || interface.getArguments().size() != function.getNumArguments())
+  auto requirements = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
+  if (failed(intent::verifyPublicInterface(function, interface))) return failure();
+  if (!config || !requirements || !requirements.getDisjointOutputs() ||
+      interface.getArguments().size() != function.getNumArguments())
     return function.emitError("DSA kernel requires a complete interface and configuration");
+  for (auto [argument, attribute] : llvm::zip(function.getArguments(), interface.getArguments())) {
+    Type logical = cast<intent::PublicParameterAttr>(attribute).getType();
+    if (auto view = dyn_cast<intent::ViewType>(logical)) {
+      auto tensor = intent::publicViewTensor(view);
+      Type element = tensor.getElementType();
+      if (!element.isF16() && !element.isBF16() && !element.isF32() &&
+          !element.isInteger(32) && !element.isInteger(64) && !element.isInteger(1))
+        return function.emitError("DSA view has unsupported numeric storage");
+      auto physical = dyn_cast<MemRefType>(argument.getType());
+      if (!physical || physical.getElementType() != element || physical.getShape() != tensor.getShape() ||
+          physical.getMemorySpaceAsInt() != 0)
+        return function.emitError("DSA view disagrees with its physical entry ABI");
+    } else {
+      if (!logical.isF32() && !logical.isIndex() && !logical.isInteger(64) &&
+          !logical.isInteger(32) && !logical.isInteger(1))
+        return function.emitError("DSA scalar has unsupported native ABI type");
+      if (logical != argument.getType())
+        return function.emitError("DSA scalar disagrees with its physical entry ABI");
+    }
+  }
   auto groupWidth = function->getAttrOfType<IntegerAttr>("intent_dsa.group_width");
   if (groupWidth && (groupWidth.getInt() != 4 || config.getTasks() < 4 || config.getTasks() % 4))
     return function.emitError("MLU370 cooperative execution requires four compute participants per group");
@@ -545,7 +568,7 @@ LogicalResult intent::dsa::verifyProgram(ModuleOp module) {
     if (auto load = dyn_cast<LoadScalarOp>(definition)) {
       auto source = dyn_cast<BlockArgument>(load.getSource());
       auto view = source && source.getOwner() == &function.front()
-          ? dyn_cast<ViewArgumentAttr>(interface.getArguments()[source.getArgNumber()]) : ViewArgumentAttr();
+          ? intent::getPublicView(interface, source.getArgNumber()) : intent::ViewType();
       return view && view.getAccess() == 0 && uniform(load.getOffset());
     }
     if (isa<memref::DimOp, StrideOp>(definition) || definition->getName().getDialectNamespace() == "arith")

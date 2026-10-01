@@ -2,6 +2,8 @@
 
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
+#include "Intent/Dialect/GPU/Analysis/ProgramInterface.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Diagnostics.h"
@@ -39,10 +41,6 @@ LogicalResult verifyBlockAccess(Operation *owner, Value viewValue,
   if (!isa<BlockArgument>(viewValue))
     return owner->emitOpError(
         "requires an external-view kernel argument as its pointer base");
-  if (!view.getLayout().getHasStrides() ||
-      view.getLayout().getStrides().size() != view.getRank())
-    return owner->emitOpError(
-        "requires one explicit stride per external-view axis");
   if (offsets.size() != view.getRank())
     return owner->emitOpError(
         "requires one source-ordered offset per external-view axis");
@@ -120,66 +118,34 @@ LogicalResult verifyDescriptorAccess(Operation *owner, Value descriptorValue,
 }
 
 bool hasStrideBinding(func::FuncOp kernel, gpu::ViewType view, unsigned axis) {
-  Attribute stride = view.getLayout().getStrides()[axis];
-  if (auto constant = dyn_cast<IntegerAttr>(stride))
-    return constant.getInt() > 0;
-  auto symbol = dyn_cast<StringAttr>(stride);
-  if (!symbol)
-    return false;
-  unsigned matches = 0;
-  for (auto [index, argument] : llvm::enumerate(kernel.getArguments())) {
-    auto name = kernel.getArgAttrOfType<StringAttr>(index, gpu::abiNameAttr);
-    auto kind = kernel.getArgAttrOfType<StringAttr>(index, gpu::abiKindAttr);
-    auto source =
-        kernel.getArgAttrOfType<IntegerAttr>(index, gpu::sourceABIAttr);
-    auto sourceAxis =
-        kernel.getArgAttrOfType<IntegerAttr>(index, gpu::sourceAxisAttr);
-    if (name == symbol && kind && kind.getValue() == "stride" && source &&
-        source.getInt() == view.getAbiIndex() && sourceAxis &&
-        sourceAxis.getInt() == axis && argument.getType().isIndex())
-      ++matches;
-  }
-  return matches == 1;
+  auto stride = cast<gpu::PhysicalExprAttr>(view.getLayout().getStrides()[axis]);
+  if (stride.getKind() == gpu::PhysicalExprKind::Constant)
+    return stride.getValue() > 0;
+  return bool(gpu::resolveArgument(kernel, stride.getArgumentReference()));
 }
 
 bool matchesStrideBinding(func::FuncOp kernel, gpu::ViewType view, unsigned axis,
                           Value value) {
-  Attribute stride = view.getLayout().getStrides()[axis];
-  if (auto constant = dyn_cast<IntegerAttr>(stride)) {
-    auto operation = value.getDefiningOp<arith::ConstantIndexOp>();
-    return operation && operation.value() == constant.getInt();
-  }
-  auto symbol = dyn_cast<StringAttr>(stride);
-  auto argument = dyn_cast<BlockArgument>(value);
-  if (!symbol || !argument || argument.getOwner() != &kernel.getBody().front())
-    return false;
-  unsigned index = argument.getArgNumber();
-  auto name = kernel.getArgAttrOfType<StringAttr>(index, gpu::abiNameAttr);
-  auto kind = kernel.getArgAttrOfType<StringAttr>(index, gpu::abiKindAttr);
-  auto source = kernel.getArgAttrOfType<IntegerAttr>(index, gpu::sourceABIAttr);
-  auto sourceAxis =
-      kernel.getArgAttrOfType<IntegerAttr>(index, gpu::sourceAxisAttr);
-  return name == symbol && kind && kind.getValue() == "stride" && source &&
-         source.getInt() == view.getAbiIndex() && sourceAxis &&
-         sourceAxis.getInt() == axis && argument.getType().isIndex();
+  return gpu::queryLaunchExpression(value) ==
+      cast<gpu::PhysicalExprAttr>(view.getLayout().getStrides()[axis]);
 }
 
 bool hasDescriptorLayout(func::FuncOp kernel, gpu::ViewType view) {
   auto layout = view.getLayout();
-  if (!layout.getHasStrides() || layout.getStrides().size() != view.getRank())
-    return false;
   for (unsigned axis = 0; axis < view.getRank(); ++axis)
     if (!hasStrideBinding(kernel, view, axis))
       return false;
 
-  auto lastStride = dyn_cast<IntegerAttr>(
+  auto lastStride = cast<gpu::PhysicalExprAttr>(
       layout.getStrides()[layout.getStrides().size() - 1]);
-  if (lastStride && lastStride.getInt() != 1)
+  if (lastStride.getKind() == gpu::PhysicalExprKind::Constant &&
+      lastStride.getValue() != 1)
     return false;
   unsigned elementBytes = view.getElementType().getIntOrFloatBitWidth() / 8;
   for (unsigned axis = 0; axis + 1 < view.getRank(); ++axis) {
-    auto stride = dyn_cast<IntegerAttr>(layout.getStrides()[axis]);
-    if (stride && (stride.getInt() * elementBytes) % 16 != 0)
+    auto stride = cast<gpu::PhysicalExprAttr>(layout.getStrides()[axis]);
+    if (stride.getKind() == gpu::PhysicalExprKind::Constant &&
+        (stride.getValue() * elementBytes) % 16 != 0)
       return false;
   }
   return true;
@@ -252,13 +218,6 @@ LogicalResult TensorDescriptorChoiceOp::verify() {
   if (!completeDescriptorSet || descriptors != declared.size())
     return emitOpError(
         "descriptor operands must enumerate every descriptor declaration exactly once");
-  for (unsigned index = 0; index < kernel.getNumArguments(); ++index) {
-    auto name = kernel.getArgAttrOfType<StringAttr>(index, gpu::abiNameAttr);
-    if (name && (name.getValue() == configName ||
-                 name.getValue() == getEligibilityArgument()))
-      return emitOpError(
-          "descriptor config and eligibility names must not collide with the physical ABI");
-  }
   auto declaration = gpu::lookupParameterDeclaration(getOperation(), getConfigParameter());
   const int64_t domain[] = {0, 1};
   if (!declaration || !declaration.getValueType().isSignlessInteger(1) ||

@@ -1,3 +1,4 @@
+#include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "Intent/Dialect/GPU/Transforms/Traversal.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
@@ -112,20 +113,8 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
     runtimeDimension = builder.create<PhysicalExprOp>(
         source.getLoc(), builder.getIndexType(), rangeCapacity);
   }
-  for (BlockArgument argument : kernel.getArguments()) {
-    if (coverageIsRangeCapacity)
-      break;
-    DictionaryAttr attributes = kernel.getArgAttrDict(argument.getArgNumber());
-    auto kind = attributes.getAs<StringAttr>(abiKindAttr);
-    auto identity = attributes.getAs<IntegerAttr>(dimensionAttr);
-    if (kind && kind.getValue() == "dimension" && identity &&
-        identity.getInt() == coverageDimension) {
-      if (runtimeDimension && runtimeDimension != argument)
-        return kernel.emitError(
-            "logical dimension has multiple runtime ABI authorities");
-      runtimeDimension = argument;
-    }
-  }
+  if (!coverageIsRangeCapacity)
+    runtimeDimension = resolveDimension(kernel, coverageDimension);
 
   std::optional<int64_t> staticDimension;
   for (BlockArgument argument : kernel.getArguments()) {
@@ -234,7 +223,7 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
   if (currentExtent.getKind() ==
       PhysicalExprKind::Parameter) {
     FailureOr<ParameterAttr> declaration =
-        queryParameterBySymbol(kernel, currentExtent.getSymbolName());
+        queryParameterBySymbol(kernel, currentExtent.getParameterReference().getName());
     if (succeeded(declaration)) {
       auto covered = declaration->getBinding().getDimension();
       if (declaration->isDeferred() && covered && covered.getInt() == coverageDimension &&
@@ -261,7 +250,7 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
   if (parameter &&
       currentExtent.getKind() ==
           PhysicalExprKind::Parameter &&
-      currentExtent.getSymbolName() == parameter.getName() &&
+      currentExtent.getParameterReference().getName() == parameter.getName() &&
       parameter.getRole() ==
           ParameterRole::FullCoverage) {
     parameter = parameter.withBinding(parameter.getBinding().withCoverageBound(coverageBound));
@@ -364,7 +353,7 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
   std::function<bool(PhysicalExprAttr)> hasBlockedExtent =
       [&](PhysicalExprAttr extent) {
     if (extent.getKind() == PhysicalExprKind::Parameter) {
-      auto declaration = queryParameterBySymbol(kernel, extent.getSymbolName());
+      auto declaration = queryParameterBySymbol(kernel, extent.getParameterReference().getName());
       return succeeded(declaration) && *declaration != parameter &&
              declaration->getRole() !=
                  ParameterRole::FullCoverage;

@@ -94,12 +94,11 @@ class TritonProgram:
         self.kernel = kernel
 
     def _context(self, arguments: dict) -> dict:
-        values = dict(arguments)
+        values = self.interface.callback_values(arguments)
         packed = self.facts["metadata_argument"]
         if packed is not None:
             for entry, value in zip(self.interface.metadata, values[packed], strict=True):
-                values[entry["name"]] = value
-                values[entry["kernel_name"]] = value
+                values[entry.id] = value
         return values
 
     def _descriptor_hook(self, entry):
@@ -107,9 +106,9 @@ class TritonProgram:
             from triton.tools.tensor_descriptor import TensorDescriptor
 
             choice = self.facts["descriptor_choice"]
-            if not arguments[choice["config"]]:
-                return arguments[entry["base"]]
             values = self._context(arguments)
+            if not arguments[choice["config"]]:
+                return values[entry["base"]]
             return TensorDescriptor(values[entry["base"]],
                                     shape=list(evaluate_shape(entry["shape"], values)),
                                     strides=list(evaluate_shape(entry["strides"], values)),
@@ -166,14 +165,14 @@ class TritonProgram:
         values = dict(invocation.values)
         packed = self.facts["metadata_argument"]
         if packed is not None:
-            values[packed] = tuple(values[entry["name"]] for entry in self.interface.metadata)
+            values[packed] = tuple(values[entry.id] for entry in self.interface.metadata)
         packed = self.facts["overlap_argument"]
         if packed is not None:
             values[packed] = tuple(values[entry["name"]] for entry in self.interface.overlaps)
         choice = self.facts["descriptor_choice"]
         if choice is not None:
             values[choice["eligibility"]] = all(self._eligible(entry, values) for entry in self.descriptors)
-        arguments = tuple(values[name] for name in self.facts["kernel_arguments"])
+        arguments = tuple(self.interface.native_value(name, values) for name in self.facts["kernel_arguments"])
         coverage = {name: values[name] for name in self.configurations.coverage_names}
 
         def grid(config):

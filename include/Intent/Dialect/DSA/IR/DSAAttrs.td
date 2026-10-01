@@ -3,24 +3,10 @@
 include "Intent/Dialect/DSA/IR/DSADialect.td"
 include "Intent/Dialect/Intent/IR/IntentAttrs.td"
 include "mlir/IR/AttrTypeBase.td"
-def IntentDSA_ViewArgument : AttrDef<IntentDSA_Dialect, "ViewArgument"> {
-  let mnemonic = "view_argument";
-  let parameters = (ins "::mlir::StringAttr":$name, "::mlir::Type":$element,
-    "::mlir::DenseI64ArrayAttr":$shape, "::mlir::DenseI64ArrayAttr":$dimensions,
-    "uint32_t":$access, "::intent::ViewConstraintsAttr":$constraints);
-  let assemblyFormat = "`<` $name `,` $element `,` $shape `,` $dimensions `,` $access `,` $constraints `>`";
-  let genVerifyDecl = 1;
-}
-def IntentDSA_ScalarArgument : AttrDef<IntentDSA_Dialect, "ScalarArgument"> {
-  let mnemonic = "scalar_argument";
-  let parameters = (ins "::mlir::StringAttr":$name, "::mlir::Type":$type);
-  let assemblyFormat = "`<` $name `,` $type `>`";
-  let genVerifyDecl = 1;
-}
-def IntentDSA_Interface : AttrDef<IntentDSA_Dialect, "Interface"> {
-  let mnemonic = "interface";
-  let parameters = (ins "::mlir::ArrayAttr":$arguments);
-  let assemblyFormat = "`<` $arguments `>`";
+def IntentDSA_EntryRequirements : AttrDef<IntentDSA_Dialect, "EntryRequirements"> {
+  let mnemonic = "entry_requirements";
+  let parameters = (ins "bool":$disjointOutputs);
+  let assemblyFormat = "`<` $disjointOutputs `>`";
   let genVerifyDecl = 1;
 }
 def IntentDSA_Configuration : AttrDef<IntentDSA_Dialect, "Configuration"> {

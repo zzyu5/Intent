@@ -1147,7 +1147,7 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
           Value full;
           if (fullExtent.getKind() ==
               gpu::PhysicalExprKind::Parameter) {
-            auto parameter = gpu::queryParameterBySymbol(kernel, fullExtent.getSymbolName());
+            auto parameter = gpu::queryParameterBySymbol(kernel, fullExtent.getParameterReference().getName());
             if (failed(parameter))
               return gather.emitOpError("tile extraction source extent has no parameter");
             full = gpu::materializeParameter(builder, gather.getLoc(), parameter->getReference());

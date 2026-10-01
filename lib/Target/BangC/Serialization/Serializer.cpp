@@ -1,5 +1,6 @@
 #include "Intent/Target/BangC/Passes.h"
 #include "Intent/Dialect/DSA/IR/DSAOps.h"
+#include "Intent/Serialization/NativeABI.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -22,63 +23,44 @@ std::string ctype(Type type) {
   if (type.isInteger(32)) return "int32_t";
   return "int64_t";
 }
-std::string dtype(Type type) {
-  if (type.isF16()) return "f16";
-  if (type.isBF16()) return "bf16";
-  if (type.isF32()) return "f32";
-  if (type.isInteger(1)) return "bool";
-  if (type.isInteger(32)) return "i32";
-  return "i64";
-}
 class Serializer {
 public:
   Serializer(func::FuncOp function, llvm::raw_ostream &output) : function(function), out(output) {}
   LogicalResult emit(llvm::json::Object &metadata) {
-    auto interface = function->getAttrOfType<dsa::InterfaceAttr>("intent_dsa.interface");
+    auto interface = getPublicInterface(function);
+    auto publicMetadata = serializePublicInterface(function, interface);
+    if (failed(publicMetadata)) return failure();
+    auto nativeABI = queryNativeABI(function, interface, [](Type type) -> FailureOr<Type> {
+      if (type.isIndex()) return IntegerType::get(type.getContext(), 64);
+      if (type.isInteger(1) || type.isInteger(32) || type.isInteger(64))
+        return IntegerType::get(type.getContext(), cast<IntegerType>(type).getWidth());
+      if (type.isF32()) return type;
+      return failure();
+    });
+    if (failed(nativeABI)) return failure();
     auto config = function->getAttrOfType<dsa::ConfigurationAttr>("intent_dsa.configuration");
-    llvm::json::Array parameters;
-    for (auto [i, attribute] : llvm::enumerate(interface.getArguments())) {
-      Value argument = function.getArgument(i);
-      std::string name = "a" + std::to_string(i);
-      names[argument] = name;
-      if (auto view = dyn_cast<dsa::ViewArgumentAttr>(attribute)) {
-        signature.push_back((view.getAccess() == 0 ? "const " : "") + ctype(view.getElement()) + " *" + name);
-        call.push_back(name);
-        llvm::json::Array shape, dimensions, constraints;
-        for (int64_t value : view.getShape().asArrayRef()) shape.push_back(value);
-        for (int64_t value : view.getDimensions().asArrayRef()) dimensions.push_back(value);
-        for (Attribute value : view.getConstraints().getStrides()) {
-          if (auto fixed = dyn_cast<IntegerAttr>(value)) constraints.push_back(fixed.getInt());
-          else constraints.push_back(nullptr);
-        }
-        parameters.push_back(llvm::json::Object{{"kind", "view"}, {"name", view.getName().getValue()},
-            {"dtype", dtype(view.getElement())}, {"shape", std::move(shape)}, {"dimensions", std::move(dimensions)},
-            {"access", static_cast<int64_t>(view.getAccess())}, {"alias", view.getConstraints().getAlias().getValue()},
-            {"noalias", view.getConstraints().getNoalias()}, {"strides", std::move(constraints)}});
-        for (int64_t axis = 0; axis < cast<MemRefType>(argument.getType()).getRank(); ++axis) {
-          std::string dimension = name + "_d" + std::to_string(axis);
-          signature.push_back("int64_t " + dimension); call.push_back(dimension);
-        }
-        for (int64_t axis = 0; axis < cast<MemRefType>(argument.getType()).getRank(); ++axis) {
-          std::string stride = name + "_s" + std::to_string(axis);
-          signature.push_back("int64_t " + stride); call.push_back(stride);
-        }
-      } else {
-        auto scalar = cast<dsa::ScalarArgumentAttr>(attribute);
-        signature.push_back(ctype(scalar.getType()) + " " + name); call.push_back(name);
-        parameters.push_back(llvm::json::Object{{"kind", "scalar"}, {"name", scalar.getName().getValue()}, {"dtype", dtype(scalar.getType())}});
-      }
+    for (const NativeSlot &slot : nativeABI->slots) {
+      std::string name = slot.name();
+      call.push_back(name);
+      if (slot.role == NativeSlotRole::Pointer) {
+        auto view = getPublicView(interface, slot.parameter);
+        signature.push_back((view.getAccess() == 0 ? "const " : "") + ctype(slot.element) + " *" + name);
+      } else signature.push_back(ctype(slot.carrier) + " " + name);
+      if (!slot.axis) names[function.getArgument(slot.parameter)] = name;
     }
     llvm::json::Array fullExtents;
     for (int64_t value : function->getAttrOfType<DenseI64ArrayAttr>("intent_dsa.full_extent_dimensions").asArrayRef())
       fullExtents.push_back(value);
     metadata = llvm::json::Object{{"provider", "bangc"}, {"entry_name", function.getName()},
-        {"parameters", std::move(parameters)}, {"entry", "intent_launch"},
+        {"interface", std::move(*publicMetadata)}, {"entry", "intent_launch"},
         {"target", llvm::json::Object{{"family", "dsa"}, {"architecture", "mtp_372"},
             {"tile", config.getTile()}, {"tasks", config.getTasks()},
             {"tile_m", config.getTileM()}, {"tile_n", config.getTileN()}, {"tile_k", config.getTileK()},
             {"region_tile", config.getRegionTile()}, {"local_bytes", config.getLocalBytes()}}},
-        {"full_extent_dimensions", std::move(fullExtents)}, {"disjoint_outputs", true}};
+        {"full_extent_dimensions", std::move(fullExtents)},
+        {"native", llvm::json::Object{{"disjoint_outputs",
+            function->getAttrOfType<dsa::EntryRequirementsAttr>(dsa::entryRequirementsAttr).getDisjointOutputs()},
+            {"slots", nativeABI->serialize()}}}};
     out << "#pragma bang walign(" << function->getAttrOfType<IntegerAttr>("bangc.wram_align").getInt() << ")\n"
         << tileImplementations << "\n__mlu_global__ void intent_device(" << llvm::join(signature, ", ") << ") {\n";
     auto bytes = [&](StringRef name) { return function->getAttrOfType<IntegerAttr>(name).getInt(); };

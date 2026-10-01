@@ -300,12 +300,12 @@ bool forwardUniformScalarLoads(func::FuncOp function) {
 }
 
 bool batchPointwiseTasks(func::FuncOp function) {
-  auto interface = function->getAttrOfType<dsa::InterfaceAttr>("intent_dsa.interface");
+  auto interface = intent::getPublicInterface(function);
   auto config = function->getAttrOfType<dsa::ConfigurationAttr>("intent_dsa.configuration");
   auto argumentWithAccess = [&](Value value, unsigned access) {
     auto argument = dyn_cast<BlockArgument>(value);
     if (!argument || argument.getOwner() != &function.front()) return false;
-    auto view = dyn_cast<dsa::ViewArgumentAttr>(interface.getArguments()[argument.getArgNumber()]);
+    auto view = intent::getPublicView(interface, argument.getArgNumber());
     return view && view.getAccess() == access;
   };
   auto constant = [](Value value) -> int64_t {
@@ -380,7 +380,7 @@ bool batchPointwiseTasks(func::FuncOp function) {
         return stride.getSource() == resource && stride.getAxis() == uint64_t(axis);
       auto argument = dyn_cast<BlockArgument>(resource);
       if (!argument || argument.getOwner() != &function.front()) return false;
-      auto view = dyn_cast<dsa::ViewArgumentAttr>(interface.getArguments()[argument.getArgNumber()]);
+      auto view = intent::getPublicView(interface, argument.getArgNumber());
       if (!view || !view.getConstraints().getHasStrides()) return false;
       auto fixed = dyn_cast<IntegerAttr>(view.getConstraints().getStrides()[axis]);
       APInt bits;

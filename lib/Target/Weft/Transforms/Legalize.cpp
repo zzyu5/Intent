@@ -39,7 +39,7 @@ LogicalResult legalizeProgram(ModuleOp program) {
   SmallVector<Attribute> taskBindings;
   SmallVector<func::FuncOp> functions(cpuProgram.getOps<func::FuncOp>());
   if (functions.empty()) return cpuProgram.emitError("Weft conversion requires CPU candidates");
-  auto interface = functions.front()->getAttrOfType<cpu::InterfaceAttr>("intent_cpu.interface");
+  auto interface = getPublicInterface(functions.front());
   cpu::PhysicalProgramAnalysis rootAnalysis(functions.front());
   llvm::DenseMap<Value, int64_t> alignments;
   functions.front().walk([&](cpu::QuantizedDotOp op) {
@@ -48,8 +48,8 @@ LogicalResult legalizeProgram(ModuleOp program) {
   });
   SmallVector<ArgumentAlignmentAttr> publicAlignments(interface.getArguments().size());
   for (auto [index, parameter] : llvm::enumerate(interface.getArguments())) {
-    if (auto view = dyn_cast<cpu::ViewArgumentAttr>(parameter)) {
-      Type element = view.getElementType();
+    if (auto view = getPublicView(interface, index)) {
+      Type element = publicViewTensor(view).getElementType();
       if (!element.isF32() && !isa<IntegerType>(element))
         return cpuProgram.emitError("CPU view has no Weft native dtype");
       int64_t alignment = std::max(int64_t(element.getIntOrFloatBitWidth() / 8),

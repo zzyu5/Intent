@@ -8,5 +8,5 @@ add_mlir_library(MLIRIntentBangC
   Transforms/Verifier.cpp
   Serialization/Serializer.cpp
   DEPENDS IntentBangCPassesIncGen
-  LINK_LIBS PUBLIC MLIRIntentDialect MLIRIntentDSADialect MLIRIntentDSAAnalysis MLIRIntentDSATransforms MLIRArithDialect MLIRFuncDialect
+  LINK_LIBS PUBLIC MLIRIntentDialect MLIRIntentNativeABI MLIRIntentDSADialect MLIRIntentDSAAnalysis MLIRIntentDSATransforms MLIRArithDialect MLIRFuncDialect
     MLIRMathDialect MLIRMemRefDialect MLIRSCFDialect MLIRTransforms MLIRPass MLIRIR MLIRSupport)

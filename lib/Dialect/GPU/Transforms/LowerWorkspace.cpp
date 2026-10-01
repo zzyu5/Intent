@@ -1,10 +1,10 @@
+#include "Intent/Dialect/GPU/Transforms/ProgramInterface.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/Storage.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
-#include "llvm/ADT/StringSet.h"
 
 using namespace mlir;
 
@@ -120,10 +120,7 @@ LogicalResult lowerInvocationWorkspaces(ModuleOp module) {
     return failure();
   func::FuncOp kernel = *physicalKernel;
   SmallVector<BlockArgument> workspaces;
-  llvm::StringSet<> argumentNames;
   for (BlockArgument argument : kernel.getArguments()) {
-    argumentNames.insert(kernel.getArgAttrDict(argument.getArgNumber())
-                             .getAs<StringAttr>(abiNameAttr).getValue());
     if (isa<BufferType>(argument.getType()))
       workspaces.push_back(argument);
   }
@@ -148,10 +145,8 @@ LogicalResult lowerInvocationWorkspaces(ModuleOp module) {
         return user->emitOpError(
             "workspace supports explicit loads and stores");
     }
-    unsigned argumentIndex = workspace.getArgNumber();
     SmallVector<int64_t> dimensions;
     SmallVector<Attribute> strides;
-    uint32_t abi = argumentIndex;
     for (auto [axis, attribute] : llvm::enumerate(buffer.getShape())) {
       auto extent = cast<PhysicalExprAttr>(attribute);
       auto kind = extent.getKind();
@@ -162,34 +157,21 @@ LogicalResult lowerInvocationWorkspaces(ModuleOp module) {
       dimensions.push_back(kind == PhysicalExprKind::Dimension
                                ? extent.getValue()
                                : 0);
-      std::string name = ("WS" + Twine(abi) + "_" + Twine(axis)).str();
-      while (!argumentNames.insert(name).second)
-        name += "_";
-      strides.push_back(builder.getStringAttr(name));
-      kernel.insertArgument(
-          kernel.getNumArguments(), builder.getIndexType(),
-          builder.getDictionaryAttr({
-              builder.getNamedAttr(abiKindAttr,
-                                   builder.getStringAttr("stride")),
-              builder.getNamedAttr(abiNameAttr, builder.getStringAttr(name)),
-              builder.getNamedAttr(sourceABIAttr,
-                                   builder.getI64IntegerAttr(abi)),
-              builder.getNamedAttr(sourceAxisAttr,
-                                   builder.getI64IntegerAttr(axis)),
-          }),
-          kernel.getLoc());
+      auto binding = ArgumentBindingAttr::get(kernel.getContext(),
+          nextArgumentReference(kernel), ArgumentKind::Stride, IntegerAttr{},
+          getArgumentReference(workspace), builder.getI64IntegerAttr(axis), IntegerAttr{});
+      auto argument = appendArgument(kernel, builder.getIndexType(), binding);
+      if (failed(argument)) return failure();
+      strides.push_back(queryArgumentExpression(*argument));
     }
     auto layout = ViewLayoutAttr::get(
         kernel.getContext(), buffer.getShape(),
-        builder.getDenseI64ArrayAttr(dimensions), true,
-        builder.getArrayAttr(strides), builder.getStringAttr(""), true);
-    workspace.setType(ViewType::get(
-        kernel.getContext(), buffer.getElementType(), buffer.getShape().size(),
-        /*access=*/2, abi, nextSource++, layout));
+        builder.getDenseI64ArrayAttr(dimensions),
+        builder.getArrayAttr(strides));
+    if (failed(setArgumentType(workspace, ViewType::get(
+        kernel.getContext(), buffer.getElementType(),
+        /*access=*/2, nextSource++, layout)))) return failure();
   }
-  kernel.setType(FunctionType::get(kernel.getContext(),
-                                   kernel.front().getArgumentTypes(),
-                                   kernel.getResultTypes()));
   return success();
 }
 

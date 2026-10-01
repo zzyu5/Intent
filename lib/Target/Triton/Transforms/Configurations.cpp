@@ -2,6 +2,7 @@
 #include "Configurations.h"
 #include "ConfigurationFacts.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Analysis/ProgramInterface.h"
 #include "Intent/Target/Triton/IR/Configuration.h"
 #include "Intent/Dialect/GPU/Analysis/Resources.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
@@ -75,7 +76,7 @@ std::optional<int64_t> evaluateCompileTimeExpression(
       -> std::optional<int64_t> {
     if (leaf.getKind() != gpu::PhysicalExprKind::Parameter)
       return std::nullopt;
-    auto value = bindings ? bindings.getAs<IntegerAttr>(leaf.getSymbolName()) : IntegerAttr();
+    auto value = bindings ? bindings.getAs<IntegerAttr>(leaf.getParameterReference().getName()) : IntegerAttr();
     return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
   });
 }
@@ -160,9 +161,8 @@ SmallVector<gpu::FragmentType> collectiveFragments(func::FuncOp kernel) {
     if (store)
       if (auto argument = dyn_cast<BlockArgument>(store.getResource());
           argument && argument.getOwner() == &kernel.front()) {
-        auto kind = kernel.getArgAttrOfType<StringAttr>(
-            argument.getArgNumber(), gpu::abiKindAttr);
-        workspaceStore |= kind && kind.getValue() == "workspace";
+        auto binding = gpu::getArgumentBinding(argument);
+        workspaceStore |= binding && binding.getKind() == gpu::ArgumentKind::Workspace;
       }
     if (!isa<gpu::ReduceOp, gpu::ScanOp, ReduceOp, ScanOp>(operation) &&
         !workspaceStore)
@@ -306,16 +306,16 @@ bool descriptorFragmentFits(gpu::FragmentType fragment,
       concreteElements *= *value;
     } else if (expression.getKind() ==
                gpu::PhysicalExprKind::Parameter) {
-      auto domain = parameterDomains.find(expression.getSymbolName().getValue());
+      auto domain = parameterDomains.find(expression.getParameterReference().getName().getValue());
       if (domain == parameterDomains.end())
         return false;
       concrete = false;
       values.append(domain->second.begin(), domain->second.end());
       if (axis + 1 == fragment.getShape().size())
         runtimeGuardsLastExtent =
-            coverageParameters.contains(expression.getSymbolName().getValue());
+            coverageParameters.contains(expression.getParameterReference().getName().getValue());
       runtimeGuardsElementCount |=
-          coverageParameters.contains(expression.getSymbolName().getValue());
+          coverageParameters.contains(expression.getParameterReference().getName().getValue());
     } else {
       return false;
     }

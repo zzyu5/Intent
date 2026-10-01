@@ -1,13 +1,13 @@
 #include "Intent/Target/CuTile/Analysis/Tuning.h"
 
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
+#include "Intent/Dialect/GPU/Analysis/ProgramInterface.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/StringMap.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AttrTypeSubElements.h"
@@ -22,9 +22,9 @@ bool isRuntimeScalar(BlockArgument argument) {
   auto kernel = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
   if (!kernel)
     return false;
-  auto kind = kernel.getArgAttrOfType<StringAttr>(argument.getArgNumber(),
-                                                gpu::abiKindAttr);
-  return kind && (kind.getValue() == "scalar" || kind.getValue() == "value");
+  auto binding = gpu::getArgumentBinding(argument);
+  return binding && binding.getKind() == gpu::ArgumentKind::Public &&
+         !isa<gpu::ViewType>(argument.getType());
 }
 
 // Payload stores may feed later loads, including through another external
@@ -136,15 +136,6 @@ bool hasOnlyDataUses(Value argument, const MemoryReads &reads) {
 
 llvm::SmallBitVector getTuningKeyScalarArguments(func::FuncOp kernel) {
   llvm::SmallBitVector retained(kernel.getNumArguments());
-  llvm::StringMap<unsigned> arguments;
-  for (BlockArgument argument : kernel.getArguments()) {
-    if (!isRuntimeScalar(argument))
-      continue;
-    auto name = kernel.getArgAttrOfType<StringAttr>(argument.getArgNumber(),
-                                                  gpu::abiNameAttr);
-    arguments[name.getValue()] = argument.getArgNumber();
-  }
-
   // Scalar ABI dependencies can survive only in parameter, type or launch
   // attributes. Walking SSA alone would miss them after canonicalization.
   AttrTypeWalker expressions;
@@ -153,9 +144,9 @@ llvm::SmallBitVector getTuningKeyScalarArguments(func::FuncOp kernel) {
         expression.getKind() !=
             gpu::PhysicalExprKind::ScalarABI)
       return;
-    auto argument = arguments.find(expression.getSymbolName().getValue());
-    if (argument != arguments.end())
-      retained.set(argument->second);
+    auto argument = gpu::resolveArgument(kernel, expression.getArgumentReference());
+    if (argument && isRuntimeScalar(argument))
+      retained.set(argument.getArgNumber());
   });
   kernel.walk([&](Operation *operation) {
     expressions.walk(operation->getAttrDictionary());

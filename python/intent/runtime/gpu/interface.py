@@ -1,54 +1,52 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from heapq import heappop, heappush
 
-from ..tuning import byte_spans_overlap, view_byte_span
-from .configurations import ConfigurationSpace
+from ...language.dtypes import DType, dtype
+from ..interface import PublicInterface, ScalarParameter, ViewAxis, ViewBinding, ViewParameter, byte_spans_overlap
+from ..torch import torch_dtype
+from ..tuning import view_byte_span
+from .configurations import ConfigurationSpace, CoverageBinding
 from .expressions import Expression, evaluate_shape, read_expressions
 
 
-def torch_dtype(name: str):
-    import torch
-
-    names = {
-        "index": "int64", "i1": "bool", "bool": "bool",
-        "i8": "int8", "i16": "int16", "i32": "int32", "i64": "int64",
-        "ui8": "uint8", "ui16": "uint16", "ui32": "uint32", "ui64": "uint64",
-        "u8": "uint8", "u16": "uint16", "u32": "uint32", "u64": "uint64",
-        "f16": "float16", "bf16": "bfloat16", "f32": "float32", "f64": "float64",
-        "f8e4m3fn": "float8_e4m3fn", "f8e5m2": "float8_e5m2",
-    }
-    return getattr(torch, names[name.lower()])
+@dataclass(frozen=True, slots=True)
+class Argument:
+    abi: int
+    id: int
+    kernel_name: str
 
 
 @dataclass(frozen=True, slots=True)
-class View:
-    abi: int
-    name: str
-    kernel_name: str
-    dtype: str
-    access: int
-    workspace: bool
-    shape: tuple[Expression, ...]
-    dimensions: tuple[int, ...]
-    alias: str
-    noalias: bool
-
-    @property
-    def output(self) -> bool:
-        return self.access == 1 and not self.workspace
+class PublicArgument(Argument):
+    parameter: ScalarParameter | ViewParameter
 
     @property
     def writable(self) -> bool:
-        return self.access != 0
+        return isinstance(self.parameter, ViewParameter) and self.parameter.writable
+
+    @property
+    def access(self):
+        return self.parameter.access
 
 
 @dataclass(frozen=True, slots=True)
-class Scalar:
-    abi: int
-    name: str
-    kernel_name: str
-    dtype: str
+class MetadataArgument(Argument):
+    kind: str
+    source: int
+    axis: int
+    dimension: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceArgument(Argument):
+    dtype: DType
+    shape: tuple[Expression, ...]
+
+    @property
+    def writable(self) -> bool:
+        return True
 
 
 @dataclass(slots=True)
@@ -56,15 +54,15 @@ class BoundInvocation:
     interface: GPUInterface
     arguments: tuple
     outputs: tuple
-    values: dict[str, object]
+    values: dict[int | str, object]
 
     @property
     def views(self) -> tuple:
-        return tuple(self.values[view.kernel_name] for view in self.interface.views)
+        return tuple(self.values[view.id] for view in self.interface.views)
 
     @property
     def public_views(self) -> tuple:
-        return tuple(self.values[view.kernel_name] for view in self.interface.public_views)
+        return tuple(self.values[view.id] for view in self.interface.public_views)
 
     def result(self):
         if not self.outputs:
@@ -73,149 +71,229 @@ class BoundInvocation:
 
 
 class GPUInterface:
-    """Invocation facts exported from the final GPU program, with no scheduling policy."""
+    """Bind public parameters to the final GPU program's physical arguments."""
 
-    def __init__(self, metadata: dict, device: int) -> None:
-        self.device = device
-        interface = metadata["interface"]
-        self.views = tuple(View(
-            entry["abi"], entry["name"], entry["kernel_name"], entry["dtype"],
-            entry["access"], entry["workspace"], read_expressions(entry["shape"]),
-            tuple(entry["dimensions"]), entry["alias"], entry["noalias"],
-        ) for entry in interface["views"])
-        self.scalars = tuple(Scalar(entry["abi"], entry["name"], entry["kernel_name"],
-                                    entry["dtype"]) for entry in interface["scalars"])
-        by_abi = {entry.abi: entry for entry in (*self.views, *self.scalars)}
-        self.parameters = tuple(by_abi[abi] for abi in interface["public_arguments"])
-        self.inputs = tuple(entry for entry in self.parameters
-                            if not isinstance(entry, View) or not entry.output)
-        self.outputs = tuple(entry for entry in self.parameters
-                             if isinstance(entry, View) and entry.output)
-        self.public_views = tuple(entry for entry in self.views if not entry.workspace)
-        self.workspaces = tuple(entry for entry in self.views if entry.workspace)
-        self.metadata = tuple(interface["metadata"])
-        self._by_abi = by_abi
-        self._raw_views = {entry["abi"]: entry for entry in interface["views"]}
-        self._strides = {entry["abi"]: read_expressions(entry["strides"])
-                         for entry in interface["views"] if entry["has_strides"]}
-        self.grid = read_expressions(interface["grid"])
-        self.overlaps = tuple(interface["overlaps"])
-        self.configuration_space = ConfigurationSpace(interface)
-        self._noalias_pairs = tuple((left, right)
-                                   for index, left in enumerate(self.public_views)
-                                   for right in self.public_views[index + 1:]
-                                   if left.noalias or right.noalias)
+    def __init__(self, metadata: dict) -> None:
+        self.public = PublicInterface.read(metadata["interface"])
+        physical = metadata["gpu"]
+        arguments = []
+        for entry in physical["arguments"]:
+            common = entry["abi"], entry["id"], entry["kernel_name"]
+            if type(common[0]) is not int or common[0] < 0:
+                raise ValueError("GPU argument slots must be nonnegative integers")
+            if type(common[1]) is not int or not 0 < common[1] < 1 << 64:
+                raise ValueError("GPU argument identities must be positive unsigned 64-bit integers")
+            if not isinstance(common[2], str) or not common[2]:
+                raise ValueError("GPU native argument names must be nonempty strings")
+            if entry["kind"] == "public":
+                position = entry["parameter"]
+                if type(position) is not int or not 0 <= position < len(self.public.parameters):
+                    raise ValueError("GPU binding references an unknown public parameter")
+                arguments.append(PublicArgument(*common, self.public.parameters[position]))
+            elif entry["kind"] in {"dimension", "stride"}:
+                if type(entry["source"]) is not int or not 0 < entry["source"] < 1 << 64:
+                    raise ValueError("GPU metadata source must be a stable argument identity")
+                dimension = entry["dimension"] if entry["kind"] == "dimension" else None
+                if entry["kind"] == "dimension" and (type(dimension) is not int or dimension <= 0):
+                    raise ValueError("GPU logical dimension identity must be a positive integer")
+                arguments.append(MetadataArgument(*common, entry["kind"], entry["source"], entry["axis"], dimension))
+            elif entry["kind"] == "workspace":
+                arguments.append(WorkspaceArgument(*common, dtype(entry["dtype"]), read_expressions(entry["shape"])))
+            else:
+                raise ValueError("unknown GPU argument binding kind")
+        self.arguments = tuple(arguments)
+        self.by_name = {entry.kernel_name: entry for entry in arguments}
+        self.by_id = {entry.id: entry for entry in arguments}
+        if len(self.by_id) != len(arguments) or len(self.by_name) != len(arguments):
+            raise ValueError("GPU argument ids and native names must be unique")
+        if tuple(entry.abi for entry in arguments) != tuple(range(len(arguments))):
+            raise ValueError("GPU arguments must be ordered by current ABI slot")
+        self._public_bindings = {entry.parameter.position: entry for entry in arguments if isinstance(entry, PublicArgument)}
+        if (len(self._public_bindings) != len(self.public.parameters) or
+                sum(isinstance(entry, PublicArgument) for entry in arguments) != len(self.public.parameters)):
+            raise ValueError("GPU physical arguments must bind each public parameter exactly once")
+        self.public_views = tuple(entry for entry in arguments
+                                  if isinstance(entry, PublicArgument) and isinstance(entry.parameter, ViewParameter))
+        self.scalars = tuple(entry for entry in arguments
+                             if isinstance(entry, PublicArgument) and isinstance(entry.parameter, ScalarParameter))
+        self.workspaces = tuple(entry for entry in arguments if isinstance(entry, WorkspaceArgument))
+        self.views = tuple(entry for entry in arguments if isinstance(entry, WorkspaceArgument) or entry in self.public_views)
+        self.metadata = tuple(entry for entry in arguments if isinstance(entry, MetadataArgument))
+        self.grid = read_expressions(physical["grid"])
+        self.overlaps = tuple(physical["overlaps"])
+        self.configuration_space = ConfigurationSpace(physical)
+        self._relations = tuple(self.public.binding_relations(explicit_outputs=mode) for mode in (False, True))
+        self._noalias_pairs = tuple(check for check in self.public.alias_checks if check.noalias)
+        self._host_order = self._host_bindings()
 
-    def _metadata_values(self, values: dict[str, object]) -> None:
-        for entry in self.metadata:
-            view = self._by_abi[entry["source_abi"]]
-            value = values.get(view.kernel_name)
-            if value is None:
-                continue
-            axis = entry["source_axis"]
-            observed = value.shape[axis] if entry["kind"] == "dimension" else value.stride(axis)
-            values[entry["name"]] = observed
-            values[entry["kernel_name"]] = observed
+    def _host_bindings(self) -> tuple[MetadataArgument | CoverageBinding | WorkspaceArgument, ...]:
+        """Order existing producers; ABI slot order is not a host dependency."""
+        nodes = (*self.metadata, *self.configuration_space.coverage, *self.workspaces)
+        roots = {entry.id for entry in self._public_bindings.values()}
+        positions, dependencies = {}, []
+        dimensions, strides = set(), set()
+        for index, entry in enumerate(nodes):
+            key = entry.name if isinstance(entry, CoverageBinding) else entry.id
+            if key in positions or key in roots:
+                raise ValueError(f"duplicate GPU host binding {key!r}")
+            positions[key] = index
+            if isinstance(entry, MetadataArgument):
+                source = self.by_id.get(entry.source)
+                if entry.kind == "dimension" and not (
+                    isinstance(source, PublicArgument) and isinstance(source.parameter, ViewParameter)
+                ):
+                    raise ValueError("logical dimensions must be bound from public views")
+                if isinstance(source, PublicArgument) and isinstance(source.parameter, ViewParameter):
+                    rank = len(source.parameter.shape)
+                elif isinstance(source, WorkspaceArgument):
+                    rank = len(source.shape)
+                else:
+                    raise ValueError("GPU metadata must refer to a declared view or workspace")
+                if type(entry.axis) is not int or not 0 <= entry.axis < rank:
+                    raise ValueError("GPU metadata must refer to a valid resource axis")
+                if entry.kind == "dimension":
+                    if source.parameter.dimensions[entry.axis] != entry.dimension or entry.dimension in dimensions:
+                        raise ValueError("GPU dimension metadata must uniquely bind its declared logical dimension")
+                    dimensions.add(entry.dimension)
+                else:
+                    identity = entry.source, entry.axis
+                    if identity in strides:
+                        raise ValueError("GPU stride metadata must uniquely bind a resource axis")
+                    strides.add(identity)
+                dependencies.append(frozenset((entry.source,)))
+            elif isinstance(entry, CoverageBinding):
+                if any(isinstance(reference, str) for reference in entry.bound.references):
+                    raise ValueError("full-coverage bounds cannot depend on physical parameters")
+                dependencies.append(entry.bound.references)
+            else:
+                dependencies.append(frozenset(reference for extent in entry.shape for reference in extent.references))
+        incoming, followers = [0] * len(nodes), [[] for _ in nodes]
+        for index, references in enumerate(dependencies):
+            for reference in references:
+                if reference in roots:
+                    continue
+                producer = positions.get(reference)
+                if producer is None:
+                    if reference in self.configuration_space.bound_names:
+                        raise ValueError("GPU host allocation cannot depend on an unselected candidate parameter")
+                    raise ValueError(f"GPU host binding references an unavailable argument or parameter: {reference!r}")
+                incoming[index] += 1
+                followers[producer].append(index)
+        ready = []
+        for index, count in enumerate(incoming):
+            if count == 0:
+                heappush(ready, index)
+        ordered = []
+        while ready:
+            index = heappop(ready)
+            ordered.append(nodes[index])
+            for consumer in followers[index]:
+                incoming[consumer] -= 1
+                if incoming[consumer] == 0:
+                    heappush(ready, consumer)
+        if len(ordered) != len(nodes):
+            raise ValueError("GPU host bindings contain a cycle between metadata, coverage or workspace producers")
+        return tuple(ordered)
 
-    def _check_view(self, entry: View, value, dimensions: dict, *, abstract: bool) -> None:
+    def native_value(self, name: str, values: dict):
+        """Resolve spelling only at the provider's native call boundary."""
+        argument = self.by_name.get(name)
+        return values[argument.id if argument is not None else name]
+
+    def callback_values(self, arguments: dict) -> dict:
+        values = dict(arguments)
+        for name, argument in self.by_name.items():
+            if name in arguments:
+                values[argument.id] = values.pop(name)
+        return values
+
+    @staticmethod
+    def _reference(reference: int | ViewAxis, views: dict, field: str):
+        if not isinstance(reference, ViewAxis):
+            return reference
+        value = views[reference.parameter]
+        return value.shape[reference.axis] if field == "shape" else value.stride(reference.axis)
+
+    def _check_view(self, binding: ViewBinding, value, views: dict, *, device: int, abstract: bool) -> None:
         import torch
 
+        parameter = binding.parameter
         if not isinstance(value, torch.Tensor):
-            raise TypeError(f"{entry.name} must be a torch.Tensor")
-        expected = torch_dtype(entry.dtype)
+            raise TypeError(f"{parameter.name} must be a torch.Tensor")
+        expected = torch_dtype(parameter.dtype)
         if value.dtype != expected:
-            raise TypeError(f"{entry.name} must have dtype {expected}, got {value.dtype}")
-        if value.ndim != len(entry.shape):
-            raise ValueError(f"{entry.name} must have rank {len(entry.shape)}, got {value.ndim}")
-        if value.device != torch.device("cuda", self.device):
-            raise ValueError(f"{entry.name} must be on cuda:{self.device}, got {value.device}")
-        raw_shape = self._raw_views[entry.abi]["shape"]
-        for axis, (dimension, expression) in enumerate(zip(entry.dimensions, raw_shape)):
-            actual = value.shape[axis]
-            label = f"{entry.name}.shape[{axis}]"
-            checks = []
-            if expression["kind"] == "constant":
-                checks.append((expression["value"], str(expression["value"])))
-            if dimension > 0:
-                if dimension in dimensions:
-                    checks.append(dimensions[dimension])
-                else:
-                    dimensions[dimension] = (actual, label)
-            for required, source in checks:
-                message = f"{label} must equal {source}"
+            raise TypeError(f"{parameter.name} must have dtype {expected}, got {value.dtype}")
+        if value.ndim != len(parameter.shape):
+            raise ValueError(f"{parameter.name} must have rank {len(parameter.shape)}, got {value.ndim}")
+        if value.device != torch.device("cuda", device):
+            raise ValueError(f"{parameter.name} must be on cuda:{device}, got {value.device}")
+        for field, checks in (("shape", binding.shape_checks), ("strides", binding.stride_checks)):
+            for axis, reference in checks:
+                actual = value.shape[axis] if field == "shape" else value.stride(axis)
+                required = self._reference(reference, views, field)
+                message = f"{parameter.name}.{field}[{axis}] violates the declared interface relation"
                 if abstract:
                     torch._check(actual == required, lambda message=message: message)
                 elif actual != required:
-                    raise ValueError(f"{message}, got {actual} and {required}")
+                    raise ValueError(message)
 
-    def bind(self, arguments: tuple, *, outputs: tuple | None = None,
+    def bind(self, arguments: tuple, *, device: int, outputs: tuple | None = None,
              explicit_outputs: bool = False, abstract: bool = False) -> BoundInvocation:
         import torch
 
-        parameters = self.parameters if explicit_outputs else self.inputs
-        if len(arguments) != len(parameters):
-            names = ", ".join(parameter.name for parameter in parameters)
-            raise TypeError(f"expected {len(parameters)} runtime arguments ({names}), got {len(arguments)}")
+        relations = self._relations[bool(explicit_outputs)]
+        if len(arguments) != len(relations.supplied):
+            names = ", ".join(parameter.name for parameter in relations.supplied)
+            raise TypeError(f"expected {len(relations.supplied)} runtime arguments ({names}), got {len(arguments)}")
         if explicit_outputs and outputs is not None:
             raise TypeError("explicit arguments already contain the output buffers")
-        if outputs is not None and len(outputs) != len(self.outputs):
-            raise TypeError(f"expected {len(self.outputs)} output buffers, got {len(outputs)}")
-        values = {parameter.kernel_name: argument for parameter, argument in zip(parameters, arguments)}
-        values.update((parameter.name, argument) for parameter, argument in zip(parameters, arguments)
-                      if isinstance(parameter, Scalar))
-        dimensions = {}
-        for parameter, argument in zip(parameters, arguments):
-            if isinstance(parameter, View):
-                self._check_view(parameter, argument, dimensions, abstract=abstract)
-        self._metadata_values(values)
+        if outputs is not None and len(outputs) != len(self.public.outputs):
+            raise TypeError(f"expected {len(self.public.outputs)} output buffers, got {len(outputs)}")
+        public_values = {parameter.position: value for parameter, value in zip(relations.supplied, arguments)}
+        values = {self._public_bindings[position].id: value for position, value in public_values.items()}
+        bindings = {binding.parameter.position: binding for binding in relations.views}
+        for parameter in relations.supplied:
+            if isinstance(parameter, ViewParameter):
+                self._check_view(bindings[parameter.position], public_values[parameter.position], public_values,
+                                 device=device, abstract=abstract)
         if not explicit_outputs:
-            for index, parameter in enumerate(self.outputs):
+            for index, parameter in enumerate(self.public.outputs):
+                binding = bindings[parameter.position]
                 if outputs is None:
-                    shape = []
-                    for dimension, expression in zip(parameter.dimensions, parameter.shape):
-                        shape.append(dimensions[dimension][0] if dimension > 0 and dimension in dimensions
-                                     else expression(values))
-                    output = torch.empty(tuple(shape), dtype=torch_dtype(parameter.dtype),
-                                         device=torch.device("cuda", self.device))
+                    if any(extent is None for extent in binding.output_shape):
+                        raise ValueError(f"cannot infer {parameter.name} output shape from supplied inputs; provide explicit output buffers")
+                    shape = tuple(self._reference(extent, public_values, "shape") for extent in binding.output_shape)
+                    output = torch.empty(shape, dtype=torch_dtype(parameter.dtype), device=torch.device("cuda", device))
                 else:
                     output = outputs[index]
-                self._check_view(parameter, output, dimensions, abstract=abstract)
-                values[parameter.kernel_name] = output
-                self._metadata_values(values)
-        for view in self.public_views:
-            if view.abi not in self._strides:
-                continue
-            actual = values[view.kernel_name]
-            for axis, expression in enumerate(self._strides[view.abi]):
-                expected = expression(values)
-                message = f"{view.name}.stride({axis}) violates the compiled stride requirement"
-                if abstract:
-                    torch._check(actual.stride(axis) == expected, lambda message=message: message)
-                elif actual.stride(axis) != expected:
-                    raise ValueError(message)
+                public_values[parameter.position] = output
+                self._check_view(binding, output, public_values, device=device, abstract=abstract)
+                values[self._public_bindings[parameter.position].id] = output
+        result = BoundInvocation(self, tuple(public_values[parameter.position] for parameter in self.public.parameters),
+                                 tuple(public_values[parameter.position] for parameter in self.public.outputs), values)
         if abstract:
-            return BoundInvocation(self, tuple(values[entry.kernel_name] for entry in self.parameters),
-                                   tuple(values[entry.kernel_name] for entry in self.outputs), values)
-        for left, right in self._noalias_pairs:
-            lhs, rhs = values[left.kernel_name], values[right.kernel_name]
-            lhs_storage, rhs_storage = lhs.untyped_storage(), rhs.untyped_storage()
-            lhs_base, rhs_base = lhs_storage.data_ptr(), rhs_storage.data_ptr()
-            if byte_spans_overlap((lhs_base, lhs_base + lhs_storage.nbytes()),
-                                  (rhs_base, rhs_base + rhs_storage.nbytes())):
-                raise ValueError(f"{left.name} and {right.name} violate the declared noalias allocation contract")
-        self.configuration_space.bind_coverage(values)
-        for workspace in self.workspaces:
-            values[workspace.kernel_name] = torch.empty(evaluate_shape(workspace.shape, values),
-                                                       dtype=torch_dtype(workspace.dtype),
-                                                       device=torch.device("cuda", self.device))
-            self._metadata_values(values)
+            return result
+        for check in self._noalias_pairs:
+            left, right = self._public_bindings[check.left], self._public_bindings[check.right]
+            lhs, rhs = values[left.id].untyped_storage(), values[right.id].untyped_storage()
+            if check.noalias_violation((lhs.data_ptr(), lhs.data_ptr() + lhs.nbytes()),
+                                       (rhs.data_ptr(), rhs.data_ptr() + rhs.nbytes())):
+                raise ValueError(f"{left.parameter.name} and {right.parameter.name} violate the declared noalias allocation contract")
+        for entry in self._host_order:
+            if isinstance(entry, MetadataArgument):
+                source = values[entry.source]
+                values[entry.id] = source.shape[entry.axis] if entry.kind == "dimension" else source.stride(entry.axis)
+            elif isinstance(entry, CoverageBinding):
+                values[entry.name] = entry.select(values)
+            else:
+                values[entry.id] = torch.empty(evaluate_shape(entry.shape, values), dtype=torch_dtype(entry.dtype),
+                                               device=torch.device("cuda", device))
         spans = {}
         for overlap in self.overlaps:
             pair = []
-            for abi in (overlap["lhs"], overlap["rhs"]):
-                if abi not in spans:
-                    spans[abi] = view_byte_span(values[self._by_abi[abi].kernel_name])
-                pair.append(spans[abi])
+            for identity in (overlap["lhs"], overlap["rhs"]):
+                if identity not in spans:
+                    spans[identity] = view_byte_span(values[identity])
+                pair.append(spans[identity])
             values[overlap["name"]] = byte_spans_overlap(*pair)
-        return BoundInvocation(self, tuple(values[entry.kernel_name] for entry in self.parameters),
-                               tuple(values[entry.kernel_name] for entry in self.outputs), values)
+        return result

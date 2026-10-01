@@ -89,7 +89,7 @@ bool materializeProductReduction(linalg::GenericOp operation) {
   bool accumulatePartials = order.getElementPermutation();
   PhysicalProgramAnalysis physical(function);
   AliasAnalysis aliases(function);
-  auto abi = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  auto abi = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
   auto disjoint = [&](Value first, Value second) {
     first = physical.storageRoot(first);
     second = physical.storageRoot(second);
@@ -305,7 +305,7 @@ LogicalResult materialize(linalg::GenericOp operation) {
     auto function = operation->getParentOfType<func::FuncOp>();
     PhysicalProgramAnalysis physical(function);
     AliasAnalysis aliases(function);
-    auto abi = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+    auto abi = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
     Value output = physical.storageRoot(operation.getOutputs()[0]);
     for (Value input : operation.getInputs()) {
       if (!isa<MemRefType>(input.getType())) continue;

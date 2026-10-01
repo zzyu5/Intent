@@ -14,6 +14,7 @@ import torch
 import intent
 from intent.runtime.weft import TargetProfile, export_artifact
 from intent.runtime.weft.compilation import flattened_signature, lower_artifact
+from intent.runtime.native import NativeABI
 from kernels.streaming.attention_f32 import causal_attention_f32, causal_linear_attention_f32
 
 from experiments._common.loading import load_module
@@ -36,7 +37,7 @@ def compile_source(context, profile, compiler, linear):
 
 def source_artifact(directory, profile, metadata, linear, canonical, artifact):
     kernel, = artifact["kernels"]
-    signature, _ = flattened_signature(metadata["parameters"])
+    signature, _ = flattened_signature(NativeABI.read(metadata))
     dimensions = {"B": "a0_d0", "S": "a0_d1", "TQ": "a0_d1", "TK": "a1_d1",
                   "D": "a0_d2", "DV": "a2_d2"}
     shape_arguments = [dimensions[name] for name in kernel["shape_parameters"]]

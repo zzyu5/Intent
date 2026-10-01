@@ -184,7 +184,7 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonemp
     if (lhs == rhs && lhsIndices == rhsIndices) return true;
     if (aliases.alias(lhs, rhs).isNo()) return true;
     auto left = physical.externalView(lhs), right = physical.externalView(rhs);
-    auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+    auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
     return left && right && physical.storageRoot(lhs) != physical.storageRoot(rhs) &&
         interface.getDisjointOutputs() && (left.getAccess() != 0 || right.getAccess() != 0);
   };

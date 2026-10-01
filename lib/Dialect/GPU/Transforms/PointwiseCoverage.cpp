@@ -44,9 +44,9 @@ bool collectProductConstraint(PhysicalExprAttr extent,
   }
   if (kind == PhysicalExprKind::Parameter) {
     ++constraint.parameterCount;
-    if (constraint.parameter && constraint.parameter != extent.getSymbolName())
+    if (constraint.parameter && constraint.parameter != extent.getParameterReference().getName())
       return false;
-    constraint.parameter = extent.getSymbolName();
+    constraint.parameter = extent.getParameterReference().getName();
     return true;
   }
   if (kind != PhysicalExprKind::Multiply || extent.getOperands().size() != 2)
@@ -172,7 +172,7 @@ LogicalResult bindStructurallyRequiredStaticFragments(func::FuncOp kernel) {
                              bool mayBroadcast = false) -> LogicalResult {
           if (expression.getKind() ==
               PhysicalExprKind::Parameter)
-            return requireExtent(user, expression.getSymbolName(), extent);
+            return requireExtent(user, expression.getParameterReference().getName(), extent);
           if (expression.getKind() ==
                   PhysicalExprKind::Constant &&
               expression.getValue() != extent &&
@@ -211,7 +211,7 @@ LogicalResult bindStructurallyRequiredStaticFragments(func::FuncOp kernel) {
         [&](PhysicalExprAttr current) -> std::optional<Attribute> {
           if (current.getKind() ==
                   PhysicalExprKind::Parameter &&
-              current.getSymbolName() == parameterName)
+              current.getParameterReference().getName() == parameterName)
             return fixedExtent;
           return std::nullopt;
         });

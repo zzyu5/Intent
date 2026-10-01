@@ -1,3 +1,4 @@
+#include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "ContractionDetail.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
@@ -610,14 +611,7 @@ LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
       return kernel.emitOpError(
           "native contraction coverage parameter has no logical dimension");
     uint64_t dimension = *binding.dimension;
-    bool launchVisible = false;
-    for (BlockArgument argument : kernel.getArguments()) {
-      DictionaryAttr attributes = kernel.getArgAttrDict(argument.getArgNumber());
-      auto kind = attributes.getAs<StringAttr>(abiKindAttr);
-      auto identity = attributes.getAs<IntegerAttr>(dimensionAttr);
-      launchVisible |= kind && kind.getValue() == "dimension" && identity &&
-                       identity.getInt() == static_cast<int64_t>(dimension);
-    }
+    bool launchVisible = bool(resolveDimension(kernel, dimension));
     if (!launchVisible)
       return kernel.emitOpError(
           "native contraction cannot fully cover a data-dependent dimension");

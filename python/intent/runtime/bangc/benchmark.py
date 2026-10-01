@@ -38,9 +38,9 @@ def run(manifest: Path, output: Path, *, device: int, neuware: str) -> None:
             program = generated.materialize(target=target).runtime
             programs.append(program)
             calls.append(program.prepare(tuple(argument(value) for value in step["arguments"]), explicit_outputs=True))
-            for parameter, specification in zip(program.parameters, step["arguments"]):
-                if parameter["kind"] == "view" and parameter["access"] == 2:
-                    reset.add(specification["buffer"])
+            for parameter in program.interface.mutable_inputs:
+                specification = step["arguments"][parameter.position]
+                reset.add(specification["buffer"])
         sequence = tuple(calls)
         launch_calls(sequence)
         output.mkdir(parents=True, exist_ok=True)

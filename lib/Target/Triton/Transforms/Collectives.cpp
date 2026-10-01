@@ -885,7 +885,7 @@ void foldIntegerScanTails(func::FuncOp kernel) {
                     extent.getValue() > 0;
     if (extent.getKind() ==
         gpu::PhysicalExprKind::Parameter) {
-      auto parameter = gpu::queryParameterBySymbol(kernel, extent.getSymbolName());
+      auto parameter = gpu::queryParameterBySymbol(kernel, extent.getParameterReference().getName());
       positive = succeeded(parameter) && llvm::all_of(
           parameter->getCandidates().asArrayRef(),
           [](int64_t candidate) { return candidate > 0; });

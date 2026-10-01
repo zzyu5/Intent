@@ -3,6 +3,7 @@
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -30,14 +31,12 @@ using namespace intent::gpu;
 
 namespace intent::gpu {
 
-StringAttr PhysicalExprAttr::getSymbolName() const {
-  if (auto reference = mlir::dyn_cast<ParameterRefAttr>(getSymbol()))
-    return reference.getName();
-  return mlir::dyn_cast<StringAttr>(getSymbol());
-}
-
 ParameterRefAttr PhysicalExprAttr::getParameterReference() const {
   return mlir::dyn_cast<ParameterRefAttr>(getSymbol());
+}
+
+ArgumentRefAttr PhysicalExprAttr::getArgumentReference() const {
+  return mlir::dyn_cast<ArgumentRefAttr>(getSymbol());
 }
 
 ParameterRefAttr ParameterAttr::getReference() const {
@@ -161,8 +160,10 @@ LogicalResult verifyParameterDeclarations(Operation *kernel) {
 
 LogicalResult IntentGPUDialect::verifyOperationAttribute(Operation *operation,
                                                         NamedAttribute attribute) {
-  if (attribute.getName() == kernelAttr)
-    return verifyParameterDeclarations(operation);
+  if (attribute.getName() == kernelAttr) {
+    if (failed(verifyParameterDeclarations(operation))) return failure();
+    return verifyProgramInterface(cast<func::FuncOp>(operation));
+  }
   if (attribute.getName() == parametersAttr &&
       (!mlir::isa<func::FuncOp>(operation) || !operation->getAttrOfType<UnitAttr>(kernelAttr)))
     return operation->emitOpError("parameter declarations require a physical GPU kernel owner");
@@ -430,6 +431,34 @@ LogicalResult ParameterBindingAttr::verify(
   return success();
 }
 
+LogicalResult ArgumentRefAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                                      uint64_t id) {
+  return id ? success() : emitError() << "physical argument identity must be nonzero";
+}
+
+LogicalResult ArgumentBindingAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, ArgumentRefAttr reference,
+    ArgumentKind kind, IntegerAttr publicOrdinal, ArgumentRefAttr source,
+    IntegerAttr axis, IntegerAttr dimension) {
+  if (!reference || reference.getId() == 0 || kind > ArgumentKind::Workspace)
+    return emitError() << "physical argument binding requires a valid identity and kind";
+  auto nonnegative = [](IntegerAttr value) {
+    return value && value.getType().isSignlessInteger(64) && value.getInt() >= 0;
+  };
+  if (kind == ArgumentKind::Public)
+    return nonnegative(publicOrdinal) && !source && !axis && !dimension
+      ? success() : emitError() << "public binding requires only its public ordinal";
+  if (kind == ArgumentKind::Workspace)
+    return !publicOrdinal && !source && !axis && !dimension
+      ? success() : emitError() << "workspace binding cannot carry public or metadata fields";
+  if (publicOrdinal || !source || !nonnegative(axis))
+    return emitError() << "metadata binding requires only a source argument and source axis";
+  if (kind == ArgumentKind::Dimension)
+    return nonnegative(dimension) && dimension.getInt() > 0
+      ? success() : emitError() << "dimension binding requires a positive logical identity";
+  return !dimension ? success() : emitError() << "stride binding cannot carry a dimension identity";
+}
+
 LogicalResult PhysicalExprAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, PhysicalExprKind kind,
     int64_t value, Attribute symbol, ArrayAttr operands) {
@@ -448,9 +477,10 @@ LogicalResult PhysicalExprAttr::verify(
                ? success()
                : emitError() << "parameter expression requires a typed declaration reference";
   if (kind == PhysicalExprKind::Dimension || kind == PhysicalExprKind::ScalarABI)
-    return name && !name.empty() && operands.empty()
+    return mlir::isa<ArgumentRefAttr>(symbol) && operands.empty() &&
+                   (kind == PhysicalExprKind::Dimension ? value > 0 : value == 0)
                ? success()
-               : emitError() << "symbolic physical expression requires one name and no operands";
+               : emitError() << "runtime physical expression requires a typed argument reference";
   if (!name || !name.empty() || value != 0)
     return emitError() << "composed physical expression cannot carry a symbol or literal payload";
   unsigned expected = kind == PhysicalExprKind::Select ? 3
@@ -629,24 +659,21 @@ LogicalResult ReshapeGroupAttr::verify(
 
 LogicalResult ViewLayoutAttr::verify(
     function_ref<InFlightDiagnostic()> emitError,
-    ArrayAttr extents, DenseI64ArrayAttr dimensionIds, bool hasStrides,
-    ArrayAttr strides, StringAttr alias, bool noalias) {
-  if (!extents || !dimensionIds || !strides || !alias ||
-      static_cast<int64_t>(extents.size()) != dimensionIds.size())
-    return emitError() << "view layout requires dimensions, strides and alias facts";
+    ArrayAttr extents, DenseI64ArrayAttr dimensionIds,
+    ArrayAttr strides) {
+  if (!extents || !dimensionIds || !strides ||
+      static_cast<int64_t>(extents.size()) != dimensionIds.size() ||
+      strides.size() != extents.size())
+    return emitError() << "view layout requires dimensions and strides";
   for (Attribute extent : extents)
     if (!mlir::isa<PhysicalExprAttr>(extent))
       return emitError() << "view extents must be typed physical expressions";
-  if (!hasStrides && !strides.empty())
-    return emitError() << "absent stride schema must use an empty array";
-  if (!alias.empty() && noalias)
-    return emitError() << "alias and noalias are mutually exclusive";
   for (int64_t dimension : dimensionIds.asArrayRef())
     if (dimension < 0)
       return emitError() << "view dimension identity cannot be negative";
   for (Attribute stride : strides)
-    if (!mlir::isa<IntegerAttr, StringAttr>(stride))
-      return emitError() << "view stride must be static or an ABI symbol";
+    if (!mlir::isa<PhysicalExprAttr>(stride))
+      return emitError() << "view stride must be a typed physical expression";
   return success();
 }
 
@@ -671,19 +698,12 @@ LogicalResult CapabilitiesAttr::verify(
 }
 
 LogicalResult ViewType::verify(function_ref<InFlightDiagnostic()> emitError,
-                               Type elementType, uint32_t rank,
-                               uint32_t access, uint32_t abiIndex,
+                               Type elementType,
+                               uint32_t access,
                                uint64_t sourceId,
                                ViewLayoutAttr layout) {
-  (void)abiIndex;
   if (!elementType || access > 2 || sourceId == 0 || !layout)
     return emitError() << "physical view schema is incomplete";
-  if (layout.getDimensionIds().size() != rank)
-    return emitError() << "physical view dimensions must match its rank";
-  if (layout.getExtents().size() != rank)
-    return emitError() << "physical view extents must match its rank";
-  if (layout.getHasStrides() && layout.getStrides().size() != rank)
-    return emitError() << "physical view strides must match its rank";
   return success();
 }
 

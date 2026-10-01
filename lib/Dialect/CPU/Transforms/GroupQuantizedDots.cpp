@@ -65,7 +65,7 @@ LogicalResult group(scf::ParallelOp parallel, const ImplementationRegistry &impl
   for (Value source : {lhs.getSource(), dot.getRhs(), output.getSource()})
     if (!dominance.dominates(source, parallel)) return success();
   PhysicalProgramAnalysis analysis(function);
-  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
   auto destination = analysis.externalView(output.getSource());
   // Group only the existing independent external writes. Captured preparation
   // remains outside the workset and is read once per record by the local group.

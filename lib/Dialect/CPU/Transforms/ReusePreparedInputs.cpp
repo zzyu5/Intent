@@ -114,7 +114,7 @@ Value inputGroupSize(OpBuilder &builder, scf::ParallelOp parallel, int64_t divis
 }
 
 LogicalResult groupScopedInputs(func::FuncOp function, const ImplementationRegistry &implementations) {
-  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
   if (!interface || !interface.getDisjointOutputs()) return success();
   auto configuration = function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration");
   llvm::DenseMap<Value, SmallVector<memref::SubViewOp>> requestedWindows;

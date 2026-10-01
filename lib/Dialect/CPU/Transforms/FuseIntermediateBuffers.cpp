@@ -179,8 +179,8 @@ bool stableRead(memref::LoadOp load, Operation *producer, func::FuncOp function,
   if (physical.isReadOnly(base)) return true;
   if (auto argument = dyn_cast<BlockArgument>(base)) {
     if (argument.getOwner() != &function.front()) return false;
-    auto abi = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
-    if (!dyn_cast<ViewArgumentAttr>(abi.getArguments()[argument.getArgNumber()])) return false;
+    auto abi = getPublicInterface(function);
+    if (!getPublicView(abi, argument.getArgNumber())) return false;
     auto aliases = queryStorageAliases(base);
     if (!aliases.complete) return false;
     for (Operation *user : aliases.users) {
@@ -443,7 +443,7 @@ bool fuse(memref::AllocOp allocation) {
 }
 
 LogicalResult fuseIntermediateBuffers(func::FuncOp function) {
-  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
   if (!interface || !interface.getDisjointOutputs())
     return function.emitError("CPU buffer fusion requires established external alias legality");
   forwardDestinations(function);

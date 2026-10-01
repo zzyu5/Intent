@@ -1,3 +1,4 @@
+#include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/Intent/IR/IntentOps.h"
@@ -556,8 +557,7 @@ LogicalResult ViewOverlapOp::verify() {
     auto argument = dyn_cast<BlockArgument>(value);
     if (!argument || argument.getOwner() != &kernel.front())
       return emitOpError("requires external view ABI arguments");
-    auto kind = kernel.getArgAttrOfType<StringAttr>(argument.getArgNumber(), abiKindAttr);
-    if (!kind || kind.getValue() != "view")
+    if (!getPublicView(argument))
       return emitOpError("requires external view ABI arguments");
   }
   return success();

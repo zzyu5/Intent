@@ -330,7 +330,7 @@ FailureOr<ParameterAttr> parameterForExtent(func::FuncOp kernel,
   if (!extent || extent.getKind() !=
                      PhysicalExprKind::Parameter)
     return failure();
-  return queryParameterBySymbol(kernel, extent.getSymbolName());
+  return queryParameterBySymbol(kernel, extent.getParameterReference().getName());
 }
 
 static bool isTransparentMatrixReshape(ReshapeOp reshape) {
@@ -430,7 +430,7 @@ bool freeAxesReadyForReductionTraversal(ContractOp contract,
     if (extent.getKind() ==
         PhysicalExprKind::Parameter) {
       FailureOr<ParameterAttr> parameter =
-          queryParameterBySymbol(kernel, extent.getSymbolName());
+          queryParameterBySymbol(kernel, extent.getParameterReference().getName());
       if (failed(parameter))
         return false;
       auto role =
@@ -543,7 +543,7 @@ regionContractionParameter(func::FuncOp kernel, PhysicalExprAttr extent) {
           PhysicalExprKind::Parameter)
     return failure();
   FailureOr<ParameterAttr> parameter =
-      queryParameterBySymbol(kernel, extent.getSymbolName());
+      queryParameterBySymbol(kernel, extent.getParameterReference().getName());
   if (failed(parameter) ||
       (*parameter).getRole() !=
           ParameterRole::ScanChunk ||

@@ -14,7 +14,8 @@ from .buffer import Buffer
 from .compilation import validate_artifact
 from .target import TargetProfile, matrix_capability
 from ..cpu import check_alias
-from ..native import NativeInterface, NativePreparedRuntime, ViewFacts, ViewParameter
+from ..interface import ViewParameter
+from ..native import NativeABI, NativePreparedRuntime, ViewFacts
 
 
 def _isa_extensions(isa: str) -> set[str]:
@@ -163,16 +164,14 @@ class NativeProgram(NativePreparedRuntime):
         validate_artifact(manifest)
         self.profile = TargetProfile(**manifest["profile"])
         self.metadata = manifest["program"]
-        self.parameters = self.metadata["parameters"]
-        self.interface = NativeInterface.read(self.parameters)
-        self._alignments = tuple(self.parameters[parameter.position]["alignment"]
-                                 if isinstance(parameter, ViewParameter) else None
-                                 for parameter in self.interface.parameters)
-        self._binders = self.interface.binders(
+        abi = NativeABI.read(self.metadata)
+        self.interface = abi.interface
+        self._alignments = tuple(self.metadata["native"]["alignments"])
+        self._binders = abi.binders(
             observe_view=type(self)._view, allocate_output=type(self)._allocate_output,
             check_alias=check_alias,
             view_key=lambda facts, group: (facts.shape, facts.strides, facts.dtype, facts.offset, group),
-            scalar_key=lambda parameter, value: (parameter.dtype, value),
+            scalar_key=lambda parameter, value: (parameter.dtype.name, value),
         )
         self.candidates = self.metadata["candidates"]
         kernels = {kernel["symbol"]: kernel for kernel in manifest["weft"]["kernels"]}
@@ -188,7 +187,7 @@ class NativeProgram(NativePreparedRuntime):
         self._execution.bind_library(self.library)
         self.check_execution()
         self.identity = (manifest_text, (self.directory / "kernel.so").stat().st_mtime_ns)
-        types = self.interface.argument_types(lambda dtype: ctypes.c_float if dtype == "f32" else ctypes.c_int64)
+        types = abi.argument_types()
         self.functions, self.measurements = [], []
         for candidate in self.candidates:
             function = getattr(self.library, candidate["entry"] + "_invoke")
@@ -204,21 +203,21 @@ class NativeProgram(NativePreparedRuntime):
         self._execution.check()
 
     def _view(self, parameter: ViewParameter, value) -> ViewFacts:
-        if not isinstance(value, Buffer) or value.dtype != parameter.dtype:
+        if not isinstance(value, Buffer) or value.dtype != parameter.dtype.name:
             raise TypeError(f"{parameter.name} requires a native {parameter.dtype} Buffer")
         if len(value.shape) != len(parameter.shape):
             raise ValueError("native view rank disagrees with the compiler ABI")
         if value.pointer % self._alignments[parameter.position]:
             raise ValueError("native view does not meet the compiler alignment requirement")
-        return ViewFacts(value.shape, value.strides, value.pointer, value.allocation,
+        return ViewFacts(value.shape, value.strides, value.pointer, value.allocation, value.allocation_end,
                          value.pointer - value.allocation, value.dtype,
                          value.pointer, value.pointer + value.nbytes)
 
     def _allocate_output(self, parameter: ViewParameter, shape: tuple[int, ...]) -> tuple[Buffer, ViewFacts]:
-        value = Buffer.empty(shape, parameter.dtype)
+        value = Buffer.empty(shape, parameter.dtype.name)
         if value.pointer % self._alignments[parameter.position]:
             raise ValueError("native view does not meet the compiler alignment requirement")
-        facts = ViewFacts(value.shape, value.strides, value.pointer, value.allocation,
+        facts = ViewFacts(value.shape, value.strides, value.pointer, value.allocation, value.allocation_end,
                           value.pointer - value.allocation, value.dtype,
                           value.pointer, value.pointer + value.nbytes)
         return value, facts

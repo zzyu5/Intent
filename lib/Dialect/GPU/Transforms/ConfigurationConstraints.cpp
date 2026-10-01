@@ -16,9 +16,9 @@ bool fitsFragmentFootprints(
     if (expression.getKind() != PhysicalExprKind::Parameter)
       return std::nullopt;
     auto binding = dyn_cast_or_null<IntegerAttr>(
-        bindings.get(expression.getSymbolName().getValue()));
+        bindings.get(expression.getParameterReference().getName().getValue()));
     if (!binding) return std::nullopt;
-    return expression.getSymbolName() == selected ? candidate : binding.getInt();
+    return expression.getParameterReference().getName() == selected ? candidate : binding.getInt();
   };
   // This bounds individual payloads, not provider register allocation or
   // machine occupancy. ABI-dependent Unknown bounds remain for specialization.
@@ -51,9 +51,9 @@ void bindContractionFreeExtents(
           return extent.getValue() <= budget
                      ? std::optional<int64_t>(extent.getValue()) : std::nullopt;
         if (kind == PhysicalExprKind::Parameter) {
-          int64_t value = selected && extent.getSymbolName() == selected.getName()
+          int64_t value = selected && extent.getParameterReference().getName() == selected.getName()
                               ? candidate
-                              : cast<IntegerAttr>(bindings.get(extent.getSymbolName().getValue())).getInt();
+                              : cast<IntegerAttr>(bindings.get(extent.getParameterReference().getName().getValue())).getInt();
           return value <= budget ? std::optional<int64_t>(value) : std::nullopt;
         }
         int64_t product = 1;
@@ -170,7 +170,7 @@ void appendFullResultContractionTuples(
     else if (other.getKind() ==
              PhysicalExprKind::Parameter) {
       auto binding = dyn_cast_or_null<IntegerAttr>(
-          bindings.get(other.getSymbolName().getValue()));
+          bindings.get(other.getParameterReference().getName().getValue()));
       if (!binding)
         continue;
       otherExtent = binding.getInt();

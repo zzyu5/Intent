@@ -195,7 +195,7 @@ std::optional<InputSupply> ImplementationInputs::prepareWindow(Value source,
   auto view = window->view;
   Value base = view.getSource();
   PhysicalProgramAnalysis physical(function);
-  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
   if (!interface || !interface.getDisjointOutputs() || !physical.isReadOnly(base)) return std::nullopt;
   unsigned axis = window->axis;
   unsigned logicalAxis = window->transposed ? 1 - axis : axis;

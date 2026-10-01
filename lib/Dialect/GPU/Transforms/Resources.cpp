@@ -25,7 +25,7 @@ void materializeDeferredReductionBounds(
   auto resolve = [&](PhysicalExprAttr expression) -> std::optional<int64_t> {
     if (expression.getKind() != PhysicalExprKind::Parameter)
       return std::nullopt;
-    auto found = knownParameters.find(expression.getSymbolName());
+    auto found = knownParameters.find(expression.getParameterReference().getName());
     return found == knownParameters.end() ? std::nullopt
                                           : std::optional<int64_t>(found->second);
   };

@@ -59,6 +59,37 @@ def IntentGPU_ParameterRefAttr : AttrDef<IntentGPU_Dialect, "ParameterRef"> {
   let genVerifyDecl = 1;
 }
 
+def IntentGPU_ArgumentKind : IntentGPU_I32Enum<
+    "ArgumentKind", "Binding of one physical function argument", [
+      I32EnumAttrCase<"Public", 0, "public">,
+      I32EnumAttrCase<"Dimension", 1, "dimension">,
+      I32EnumAttrCase<"Stride", 2, "stride">,
+      I32EnumAttrCase<"Workspace", 3, "workspace">
+    ]>;
+
+def IntentGPU_ArgumentRefAttr : AttrDef<IntentGPU_Dialect, "ArgumentRef"> {
+  let mnemonic = "argument_ref";
+  let summary = "Stable identity of a kernel-owned physical argument";
+  let parameters = (ins "uint64_t":$id);
+  let assemblyFormat = "`<` $id `>`";
+  let genVerifyDecl = 1;
+}
+
+def IntentGPU_ArgumentBindingAttr : AttrDef<IntentGPU_Dialect, "ArgumentBinding"> {
+  let mnemonic = "argument_binding";
+  let summary = "Public or private origin of a physical function argument";
+  let parameters = (ins
+    "::intent::gpu::ArgumentRefAttr":$reference,
+    EnumParameter<IntentGPU_ArgumentKind>:$kind,
+    OptionalParameter<"::mlir::IntegerAttr">:$publicOrdinal,
+    OptionalParameter<"::intent::gpu::ArgumentRefAttr">:$source,
+    OptionalParameter<"::mlir::IntegerAttr">:$axis,
+    OptionalParameter<"::mlir::IntegerAttr">:$dimension
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+  let genVerifyDecl = 1;
+}
+
 def IntentGPU_PhysicalExprKind : IntentGPU_I32Enum<
     "PhysicalExprKind", "Typed physical integer expression kind", [
       I32EnumAttrCase<"Constant", 0, "constant">,
@@ -124,8 +155,8 @@ def IntentGPU_PhysicalExprAttr : AttrDef<IntentGPU_Dialect, "PhysicalExpr"> {
   let assemblyFormat = "`<` $kind `,` $value `,` $symbol `,` $operands `>`";
   let genVerifyDecl = 1;
   let extraClassDeclaration = [{
-    ::mlir::StringAttr getSymbolName() const;
     ::intent::gpu::ParameterRefAttr getParameterReference() const;
+    ::intent::gpu::ArgumentRefAttr getArgumentReference() const;
   }];
 }
 
@@ -257,17 +288,14 @@ def IntentGPU_ReshapeGroupAttr : AttrDef<IntentGPU_Dialect, "ReshapeGroup"> {
 
 def IntentGPU_ViewLayoutAttr : AttrDef<IntentGPU_Dialect, "ViewLayout"> {
   let mnemonic = "view_layout";
-  let summary = "Host-visible physical view shape, stride and alias contract";
+  let summary = "Host-visible physical view shape and stride expressions";
   let parameters = (ins
     "::mlir::ArrayAttr":$extents,
     "::mlir::DenseI64ArrayAttr":$dimensionIds,
-    "bool":$hasStrides,
-    "::mlir::ArrayAttr":$strides,
-    "::mlir::StringAttr":$alias,
-    "bool":$noalias
+    "::mlir::ArrayAttr":$strides
   );
   let assemblyFormat =
-      "`<` $extents `,` $dimensionIds `,` $hasStrides `,` $strides `,` $alias `,` $noalias `>`";
+      "`<` $extents `,` $dimensionIds `,` $strides `>`";
   let genVerifyDecl = 1;
 }
 

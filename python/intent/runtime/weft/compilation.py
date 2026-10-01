@@ -7,6 +7,7 @@ import subprocess
 
 
 from .target import TargetProfile
+from ..native import NativeABI
 
 
 def invoke_compiler(command: list[str], source: str | None = None) -> str:
@@ -93,26 +94,23 @@ def export_artifact(program, directory: Path, *, compiler: str, profile: TargetP
     (directory / "artifact.json").write_text(json.dumps(manifest), encoding="utf-8")
 
 
-def flattened_signature(parameters: list[dict]) -> tuple[list[str], list[str]]:
+def flattened_signature(abi: NativeABI) -> tuple[list[str], list[str]]:
     signature, arguments = [], []
-    for index, parameter in enumerate(parameters):
-        name = f"a{index}"
-        if parameter["kind"] == "view":
+    carriers = {"bool": "_Bool", "i8": "int8_t", "i16": "int16_t", "i32": "int32_t",
+                "i64": "int64_t", "f32": "float", "f64": "double"}
+    for slot in abi.slots:
+        name = slot.name
+        if slot.role == "pointer":
             signature.append(f"void *{name}")
             arguments.append(name)
-            for role in ("d", "s"):
-                for axis in range(len(parameter["shape"])):
-                    field = f"{name}_{role}{axis}"
-                    signature.append(f"int64_t {field}")
-                    arguments.append(field)
         else:
-            signature.append(f"{'float' if parameter['dtype'] == 'f32' else 'int64_t'} {name}")
+            signature.append(f"{carriers[slot.carrier]} {name}")
             arguments.append(name)
     return signature, arguments
 
 
 def native_exports(metadata: dict) -> str:
-    signature, arguments = flattened_signature(metadata["parameters"])
+    signature, arguments = flattened_signature(NativeABI.read(metadata))
     sections = ["#include <stdint.h>\n#include <time.h>\n#include <fenv.h>\n"]
     for candidate in metadata["candidates"]:
         entry = candidate["entry"]

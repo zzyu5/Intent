@@ -39,11 +39,8 @@ inline constexpr llvm::StringLiteral coordinateRolesAttr =
 inline constexpr llvm::StringLiteral originAttr = "intent_gpu.origin";
 inline constexpr llvm::StringLiteral effectOriginsAttr =
     "intent_gpu.effect_origins";
-inline constexpr llvm::StringLiteral abiKindAttr = "intent_gpu.abi_kind";
-inline constexpr llvm::StringLiteral abiNameAttr = "intent_gpu.abi_name";
+inline constexpr llvm::StringLiteral argumentBindingAttr = "intent_gpu.argument_binding";
 inline constexpr llvm::StringLiteral dimensionAttr = "intent_gpu.dimension";
-inline constexpr llvm::StringLiteral sourceABIAttr = "intent_gpu.source_abi";
-inline constexpr llvm::StringLiteral sourceAxisAttr = "intent_gpu.source_axis";
 inline constexpr llvm::StringLiteral sourceSubregionAttr =
     "intent_gpu.source_subregion";
 inline constexpr llvm::StringLiteral sourceSubregionBoundAttr =

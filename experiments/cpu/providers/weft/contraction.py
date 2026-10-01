@@ -12,6 +12,7 @@ import torch
 import intent
 from intent.runtime.weft import TargetProfile, export_artifact
 from intent.runtime.weft.compilation import flattened_signature, lower_artifact
+from intent.runtime.native import NativeABI
 from kernels.quantization.quantized_projection import quantized_projection
 
 from experiments._common.loading import load_module
@@ -29,7 +30,7 @@ def _source_artifact(context, directory: Path, profile: TargetProfile, compiler:
     artifact = lower_artifact(canonical, compiler=compiler, profile=profile)
     kernel, = artifact["kernels"]
     symbol = kernel["symbol"]
-    signature, _ = flattened_signature(metadata["parameters"])
+    signature, _ = flattened_signature(NativeABI.read(metadata))
     dimensions = {"N": "a0_d0", "K": "a1_d0 * 256", "M": "1"}
     shape_arguments = [dimensions[name] for name in kernel["shape_parameters"]]
     pointer_types = [argument["c_type"] for argument in kernel["arguments"]]

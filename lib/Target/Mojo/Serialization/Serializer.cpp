@@ -1,5 +1,6 @@
 #include "Intent/Target/Mojo/Serialization/Serializer.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
+#include "Intent/Serialization/NativeABI.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -61,16 +62,6 @@ std::string ordering(AtomicOrdering order) {
   llvm_unreachable("unknown atomic ordering");
 }
 
-std::string abiDType(Type type) {
-  if (type.isIndex()) return "i64";
-  if (isa<Float8E4M3FNType>(type)) return "f8e4m3fn";
-  if (isa<Float8E5M2Type>(type)) return "f8e5m2";
-  std::string result;
-  llvm::raw_string_ostream out(result);
-  type.print(out);
-  return result;
-}
-
 std::string floatingLiteral(Type element, const llvm::APFloat &value) {
   std::string type = valueType(element);
   if (!value.isFinite())
@@ -81,72 +72,45 @@ std::string floatingLiteral(Type element, const llvm::APFloat &value) {
   return type + "(" + literal.str().str() + ")";
 }
 
-llvm::json::Array json(DenseI64ArrayAttr attribute) {
-  llvm::json::Array result;
-  for (int64_t value : attribute.asArrayRef()) result.push_back(value);
-  return result;
-}
-
-llvm::json::Array parameters(cpu::InterfaceAttr interface) {
-  llvm::json::Array result;
-  for (Attribute argument : interface.getArguments()) {
-    if (auto view = dyn_cast<cpu::ViewArgumentAttr>(argument)) {
-      llvm::json::Array strides;
-      for (Attribute constraint : view.getStrides()) {
-        if (auto fixed = dyn_cast<IntegerAttr>(constraint)) strides.push_back(fixed.getInt());
-        else strides.push_back(nullptr);
-      }
-      result.push_back(llvm::json::Object{
-          {"name", view.getName().getValue().str()}, {"kind", "view"},
-          {"dtype", abiDType(view.getElementType())},
-          {"access", static_cast<int64_t>(view.getAccess())}, {"shape", json(view.getShape())},
-          {"dimensions", json(view.getDimensions())}, {"strides", std::move(strides)},
-          {"alias", view.getAlias().getValue().str()},
-          {"noalias", view.getNoalias()}});
-    } else {
-      auto scalar = cast<cpu::ScalarArgumentAttr>(argument);
-      result.push_back(llvm::json::Object{{"name", scalar.getName().getValue().str()},
-          {"kind", "scalar"}, {"dtype", abiDType(scalar.getType())}});
-    }
-  }
-  return result;
-}
-
 class Serializer {
 public:
   explicit Serializer(llvm::raw_ostream &out) : out(out) {}
 
-  LogicalResult function(func::FuncOp function) {
+  LogicalResult function(func::FuncOp function, const NativeABI &abi) {
     names.clear(); memories.clear(); allocations.clear(); scope.clear(); next = 0;
     SmallVector<std::string> signature;
     for (auto [number, argument] : llvm::enumerate(function.getArguments())) {
       std::string name = "a" + std::to_string(number);
-      bind(argument, name);
+      names[argument] = name;
       if (auto type = dyn_cast<MemRefType>(argument.getType())) {
-        signature.push_back(name + ": Pointer[" + memoryElement(type.getElementType()) + ", MutUntrackedOrigin]");
-        Memory memory{name, {}, {}, name, "0"};
+        Memory memory{name, SmallVector<std::string>(type.getRank()),
+                      SmallVector<std::string>(type.getRank()), name, "0"};
         SmallVector<int64_t> staticStrides;
         int64_t staticOffset;
         if (failed(type.getStridesAndOffset(staticStrides, staticOffset)))
           return function.emitError("Mojo entry requires a strided memory descriptor");
-        for (int64_t axis = 0; axis < type.getRank(); ++axis) {
-          std::string dimension = name + "_d" + std::to_string(axis);
-          signature.push_back(dimension + ": Int64");
-          scope.push_back(dimension);
-          memory.sizes.push_back(type.isDynamicDim(axis) ? "Int(" + dimension + ")"
-                                                        : std::to_string(type.getDimSize(axis)));
-        }
-        for (int64_t axis = 0; axis < type.getRank(); ++axis) {
-          std::string stride = name + "_s" + std::to_string(axis);
-          signature.push_back(stride + ": Int64");
-          scope.push_back(stride);
-          memory.strides.push_back(ShapedType::isDynamic(staticStrides[axis])
-                                       ? "Int(" + stride + ")" : std::to_string(staticStrides[axis]));
+        for (unsigned axis = 0; axis < type.getRank(); ++axis) {
+          if (!type.isDynamicDim(axis)) memory.sizes[axis] = std::to_string(type.getDimSize(axis));
+          if (!ShapedType::isDynamic(staticStrides[axis])) memory.strides[axis] = std::to_string(staticStrides[axis]);
         }
         memories[argument] = std::move(memory);
       } else {
-        signature.push_back(name + ": " + valueType(argument.getType().isIndex() ? IntegerType::get(function.getContext(), 64) : argument.getType()));
         if (argument.getType().isIndex()) names[argument] = "Int(" + name + ")";
+      }
+    }
+    for (const NativeSlot &slot : abi.slots) {
+      Value argument = function.getArgument(slot.parameter);
+      std::string name = slot.name();
+      scope.push_back(name);
+      if (slot.role == NativeSlotRole::Pointer) {
+        signature.push_back(name + ": Pointer[" + memoryElement(slot.element) + ", MutUntrackedOrigin]");
+      } else if (slot.role == NativeSlotRole::Scalar) {
+        signature.push_back(name + ": " + valueType(slot.carrier));
+      } else {
+        signature.push_back(name + ": Int64");
+        auto &memory = memories.find(argument)->second;
+        auto &entry = slot.role == NativeSlotRole::Extent ? memory.sizes[*slot.axis] : memory.strides[*slot.axis];
+        if (entry.empty()) entry = "Int(" + name + ")";
       }
     }
     line("@export(\"" + function.getName().str() + "\")");
@@ -646,15 +610,25 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string
   bool first = true;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
     if (function.isExternal()) continue;
+    auto nativeABI = queryNativeABI(function, getPublicInterface(function), [](Type type) -> FailureOr<Type> {
+      if (type.isIndex()) return IntegerType::get(type.getContext(), 64);
+      if (auto integer = dyn_cast<IntegerType>(type))
+        return IntegerType::get(type.getContext(), integer.getWidth());
+      if (type.isF32() || type.isF64()) return type;
+      return failure();
+    });
+    if (failed(nativeABI)) return failure();
     int64_t sourceBegin = output.tell();
-    if (failed(serializer.function(function))) return failure();
+    if (failed(serializer.function(function, *nativeABI))) return failure();
     int64_t sourceEnd = output.tell();
     if (first) {
-      auto abi = function->getAttrOfType<cpu::InterfaceAttr>("intent_cpu.interface");
+      auto abi = serializePublicInterface(function, getPublicInterface(function));
+      if (failed(abi)) return failure();
+      auto requirements = function->getAttrOfType<cpu::EntryRequirementsAttr>(cpu::entryRequirementsAttr);
       interface["entry_name"] = function.getName();
-      interface["parameters"] = parameters(abi);
-      interface["contiguous_views"] = abi.getContiguousViews();
-      interface["disjoint_outputs"] = abi.getDisjointOutputs();
+      interface["interface"] = std::move(*abi);
+      interface["native"] = llvm::json::Object{{"contiguous_views", requirements.getContiguousViews()},
+          {"disjoint_outputs", requirements.getDisjointOutputs()}, {"slots", nativeABI->serialize()}};
       first = false;
     }
     auto configuration = function->getAttrOfType<cpu::ConfigurationAttr>("intent_cpu.configuration");

@@ -1,5 +1,6 @@
 #include "NativeAccess.h"
 #include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
+#include "Intent/Dialect/GPU/Analysis/ProgramInterface.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -149,13 +150,10 @@ std::optional<int64_t> dimensionIdentity(BlockArgument argument) {
   auto kernel = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
   if (!kernel || argument.getOwner() != &kernel.getBody().front())
     return std::nullopt;
-  DictionaryAttr attributes =
-      kernel.getArgAttrDict(argument.getArgNumber());
-  auto kind = attributes.getAs<StringAttr>(gpu::abiKindAttr);
-  auto identity = attributes.getAs<IntegerAttr>(gpu::dimensionAttr);
-  if (!kind || kind.getValue() != "dimension" || !identity)
+  auto binding = gpu::getArgumentBinding(argument);
+  if (!binding || binding.getKind() != gpu::ArgumentKind::Dimension)
     return std::nullopt;
-  return identity.getInt();
+  return binding.getDimension().getInt();
 }
 
 FailureOr<SmallVector<Value>> uniformAlignmentFactors(

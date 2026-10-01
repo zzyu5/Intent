@@ -108,7 +108,7 @@ bool fuse(scf::ParallelOp first, scf::ParallelOp second, ArrayRef<Operation *> b
   AliasAnalysis aliases(function);
   auto lhs = accesses(first, physical), rhs = accesses(second, physical);
   if (failed(lhs) || failed(rhs)) return false;
-  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
   for (const auto &left : *lhs)
     for (const auto &right : *rhs) {
       if (!left.write && !right.write) continue;
@@ -306,7 +306,7 @@ LogicalResult groupWorksetComputations(func::FuncOp function, const Implementati
   if (failed(exposeStructuredWorksets(function, implementations, extents))) return failure();
   PhysicalProgramAnalysis physical(function);
   AliasAnalysis aliases(function);
-  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
   auto disjoint = [&](Value first, Value second) {
     first = physical.storageRoot(first); second = physical.storageRoot(second);
     if (aliases.alias(first, second).isNo()) return true;

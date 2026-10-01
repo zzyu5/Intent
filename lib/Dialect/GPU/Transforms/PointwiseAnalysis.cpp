@@ -1,3 +1,4 @@
+#include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "Pointwise.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
@@ -114,14 +115,7 @@ bool hasCompileTimeExtent(Value value) {
 }
 
 FailureOr<Value> dimensionArgument(func::FuncOp kernel, uint64_t dimension) {
-  for (BlockArgument argument : kernel.getArguments()) {
-    auto attributes = kernel.getArgAttrDict(argument.getArgNumber());
-    auto kind = attributes.getAs<StringAttr>(abiKindAttr);
-    auto identity = attributes.getAs<IntegerAttr>(dimensionAttr);
-    if (kind && kind.getValue() == "dimension" && identity &&
-        identity.getInt() == static_cast<int64_t>(dimension))
-      return Value(argument);
-  }
+  if (auto argument = resolveDimension(kernel, dimension)) return Value(argument);
   return failure();
 }
 
@@ -435,7 +429,7 @@ std::optional<int64_t> estimatedFragmentRegisters(func::FuncOp kernel, Value val
     } else if (extent.getKind() == PhysicalExprKind::Constant) {
       minimum = extent.getValue();
     } else if (extent.getKind() == PhysicalExprKind::Parameter) {
-      auto parameter = queryParameterBySymbol(kernel, extent.getSymbolName());
+      auto parameter = queryParameterBySymbol(kernel, extent.getParameterReference().getName());
       if (failed(parameter))
         return std::nullopt;
       minimum = *llvm::min_element(parameter->getCandidates().asArrayRef());
@@ -1150,7 +1144,7 @@ FailureOr<Attribute> mappingAxis(func::FuncOp kernel, Attribute attribute) {
     auto divisor = dyn_cast<PhysicalExprAttr>(expression.getOperands()[1]);
     if (divisor && divisor.getKind() ==
                        PhysicalExprKind::Parameter) {
-      FailureOr<ParameterAttr> parameter = queryParameterBySymbol(kernel, divisor.getSymbolName());
+      FailureOr<ParameterAttr> parameter = queryParameterBySymbol(kernel, divisor.getParameterReference().getName());
       if (succeeded(parameter))
         return parameterAxis(*parameter);
     }

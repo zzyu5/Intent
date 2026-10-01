@@ -7,7 +7,7 @@ import tempfile
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from intent.runtime import CompiledArtifact
+    from intent.runtime import CompiledArtifact, PublicInterface
     from intent.targets.base import ResolvedTarget, Target
     from intent.targets.specification import CompilationTarget
 
@@ -50,7 +50,7 @@ class GeneratedProgram:
     _binding: ResolvedTarget | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        self.target
+        self.interface
 
     @property
     def target(self) -> CompilationTarget:
@@ -58,6 +58,24 @@ class GeneratedProgram:
         from intent.targets.specification import read_compilation_target
 
         return read_compilation_target(self.metadata["provider"], self.metadata["target"])
+
+    @property
+    def interface(self) -> PublicInterface:
+        """Read the compiler's public parameter contract without a device or SDK.
+
+        This also validates the serialized native slots or GPU host dependencies.
+        The returned declaration excludes native slots and compiler-private
+        resources; materialization consumes the same authoritative metadata.
+        """
+        from intent.targets.specification import GPUCompilationTarget
+
+        if isinstance(self.target, GPUCompilationTarget):
+            from intent.runtime.gpu.interface import GPUInterface
+
+            return GPUInterface(self.metadata).public
+        from intent.runtime.native import NativeABI
+
+        return NativeABI.read(self.metadata).interface
 
     def save(self, directory: str | Path) -> Path:
         """Save source, final IR and compiler metadata into a new directory.
@@ -70,7 +88,7 @@ class GeneratedProgram:
 
         path = Path(directory).expanduser().absolute()
         try:
-            self.target
+            self.interface
             if path.exists():
                 raise FileExistsError(f"generated program destination already exists: {path}")
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -124,6 +142,7 @@ class GeneratedProgram:
         from .toolchain import CompilationStageError
 
         try:
+            self.interface
             binding = target.resolve() if target is not None else self._binding
             if binding is None:
                 raise ValueError("materialize requires an explicit runtime target for this generated program")

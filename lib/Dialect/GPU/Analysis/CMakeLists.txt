@@ -1,5 +1,6 @@
 add_mlir_library(MLIRIntentGPUAnalysis
   PhysicalProgram.cpp
+  ProgramInterface.cpp
   IndexPredicates.cpp
   IndexRelations.cpp
   PhysicalParameters.cpp

@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
@@ -19,28 +20,14 @@ namespace {
 
 LogicalResult verifyExpressionSymbols(Operation *owner,
                                       PhysicalExprAttr expression,
-                                      const llvm::StringSet<> &parameters,
-                                      const llvm::StringSet<> &launchABI,
-                                      const llvm::DenseSet<int64_t> &dimensions) {
+                                      const llvm::StringSet<> &parameters) {
   auto kind = expression.getKind();
   if (kind == PhysicalExprKind::Parameter &&
-      !parameters.contains(expression.getSymbolName().getValue()))
+      !parameters.contains(expression.getParameterReference().getName().getValue()))
     return owner->emitOpError("launch expression references an undeclared physical parameter");
-  if (kind == PhysicalExprKind::Dimension &&
-      (expression.getValue() <= 0 ||
-       !dimensions.contains(expression.getValue())))
-    return owner->emitOpError(
-               "physical dimension expression has no matching ABI identity: ")
-           << expression.getValue();
-  if ((kind == PhysicalExprKind::Dimension ||
-       kind == PhysicalExprKind::ScalarABI) &&
-      !launchABI.contains(expression.getSymbolName().getValue()))
-    return owner->emitOpError(
-               "launch expression references unavailable host metadata: ")
-           << expression.getSymbolName();
   for (Attribute operand : expression.getOperands())
     if (failed(verifyExpressionSymbols(owner, cast<PhysicalExprAttr>(operand),
-                                       parameters, launchABI, dimensions)))
+                                       parameters)))
       return failure();
   return success();
 }
@@ -215,60 +202,7 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
       return kernel.emitError("program-space extents must be typed physical expressions");
 
   llvm::StringSet<> parameterNames;
-  llvm::StringSet<> launchABI;
-  llvm::StringSet<> abiNames;
-  llvm::DenseSet<int64_t> launchDimensions;
-  for (auto [index, type] : llvm::enumerate(kernel.getArgumentTypes())) {
-    DictionaryAttr attrs = kernel.getArgAttrDict(index);
-    auto kind = attrs.getAs<StringAttr>(abiKindAttr);
-    auto name = attrs.getAs<StringAttr>(abiNameAttr);
-    if (!kind || !name || name.empty())
-      return kernel.emitError("every physical ABI argument requires a typed role and name");
-    if (!abiNames.insert(name.getValue()).second)
-      return kernel.emitError("physical ABI argument names must be unique");
-    if (kind.getValue() == "view") {
-      auto view = dyn_cast<ViewType>(type);
-      if (!view || view.getAbiIndex() != index || view.getSourceId() == 0)
-        return kernel.emitError("view ABI argument has a non-view physical type");
-    } else if (kind.getValue() == "dimension" ||
-               kind.getValue() == "stride") {
-      auto sourceABI = attrs.getAs<IntegerAttr>(sourceABIAttr);
-      auto sourceAxis = attrs.getAs<IntegerAttr>(sourceAxisAttr);
-      if (!type.isIndex() || !sourceABI || !sourceAxis)
-        return kernel.emitError("metadata ABI argument lacks its source binding");
-      int64_t source = sourceABI.getInt();
-      int64_t axis = sourceAxis.getInt();
-      if (source < 0 || source >= static_cast<int64_t>(kernel.getNumArguments()))
-        return kernel.emitError("metadata ABI source is outside the physical signature");
-      auto sourceView = dyn_cast<ViewType>(kernel.getArgumentTypes()[source]);
-      if (!sourceView || sourceView.getAbiIndex() != source || axis < 0 ||
-          axis >= static_cast<int64_t>(sourceView.getRank()))
-        return kernel.emitError(
-            "metadata ABI source binding does not name an axis of its physical view");
-      launchABI.insert(name.getValue());
-      if (kind.getValue() == "dimension") {
-        auto dimension = attrs.getAs<IntegerAttr>(dimensionAttr);
-        if (!dimension || dimension.getInt() <= 0 ||
-            !launchDimensions.insert(dimension.getInt()).second)
-          return kernel.emitError(
-              "dimension ABI identities must be unique positive integers");
-      }
-    } else if (kind.getValue() == "scalar" ||
-               kind.getValue() == "constexpr" ||
-               kind.getValue() == "value") {
-      if (!isa<IntegerType, IndexType, FloatType>(type))
-        return kernel.emitError("physical scalar ABI has a non-scalar type");
-      if (isa<IntegerType, IndexType>(type))
-        launchABI.insert(name.getValue());
-    } else if (kind.getValue() == "workspace") {
-      auto buffer = dyn_cast<BufferType>(type);
-      if (!buffer || !buffer.getWorkspace() ||
-          buffer.getScope().getValue() != BufferScope::InvocationWorkspace)
-        return kernel.emitError("workspace ABI argument has a non-workspace type");
-    } else {
-      return kernel.emitError("unknown physical ABI argument kind");
-    }
-  }
+  if (failed(verifyProgramInterface(kernel))) return failure();
   SmallVector<PhysicalExprAttr> abiExpressions;
   for (Type type : kernel.getArgumentTypes())
     collectTypeExpressions(type, abiExpressions);
@@ -277,21 +211,13 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
     return failure();
   for (ParameterAttr parameter : declarations->declarations()) {
     parameterNames.insert(parameter.getName().getValue());
-    if (auto bound = parameter.getBinding().getCoverageBound()) {
-      const llvm::StringSet<> noParameters;
-      if (failed(verifyExpressionSymbols(kernel, bound, noParameters,
-                                         launchABI, launchDimensions)))
-        return failure();
-    }
   }
   for (Attribute extent : programSpace)
     if (failed(verifyExpressionSymbols(kernel, cast<PhysicalExprAttr>(extent),
-                                       parameterNames, launchABI,
-                                       launchDimensions)))
+                                       parameterNames)))
       return failure();
   for (PhysicalExprAttr expression : abiExpressions)
-    if (failed(verifyExpressionSymbols(kernel, expression, parameterNames,
-                                       launchABI, launchDimensions)))
+    if (failed(verifyExpressionSymbols(kernel, expression, parameterNames)))
       return failure();
 
   bool hasProgramId = false;
@@ -322,8 +248,7 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
     }
     if (auto physical = dyn_cast<PhysicalExprOp>(operation))
       if (failed(verifyExpressionSymbols(operation, physical.getExpression(),
-                                         parameterNames, launchABI,
-                                         launchDimensions)))
+                                         parameterNames)))
         return WalkResult::interrupt();
     if (operation->hasAttr(sourceSubregionAttr)) {
       auto parent =
@@ -365,10 +290,8 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
             "physical execution segment requires typed group, offset and length together");
         return WalkResult::interrupt();
       }
-      if (failed(verifyExpressionSymbols(operation, offset, parameterNames,
-                                         launchABI, launchDimensions)) ||
-          failed(verifyExpressionSymbols(operation, length, parameterNames,
-                                         launchABI, launchDimensions)))
+      if (failed(verifyExpressionSymbols(operation, offset, parameterNames)) ||
+          failed(verifyExpressionSymbols(operation, length, parameterNames)))
         return WalkResult::interrupt();
       auto [entry, inserted] = executionGroups.try_emplace(
           group.getInt(), std::make_pair(offset, length));
@@ -456,8 +379,7 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
         for (BlockArgument argument : block.getArguments())
           collectTypeExpressions(argument.getType(), expressions);
     for (PhysicalExprAttr expression : expressions)
-      if (failed(verifyExpressionSymbols(operation, expression, parameterNames,
-                                         launchABI, launchDimensions)))
+      if (failed(verifyExpressionSymbols(operation, expression, parameterNames)))
         return WalkResult::interrupt();
     return WalkResult::advance();
   });

@@ -152,6 +152,65 @@ NeuWare 编译、CNRT queue 与实际设备绑定继续属于其 runtime。
 Intent 的显式目标描述对应其 `python/triton/backends/compiler.py:8–14` 的 `GPUTarget`，
 同时保留 GPU、CPU、DSA 各自实际需要的构造能力。
 
+### 公共接口与物理调用绑定
+
+公共参数的唯一声明是 [InterfaceAttr](include/Intent/Dialect/Intent/IR/IntentAttrs.td)：
+按作者 runtime 参数顺序保存 `PublicParameterAttr(name, type)`。View 直接使用 canonical
+`intent::ViewType`，因此 dtype、shape identity、访问方向和约束不再复制成各 family 的
+另一套 ViewArgument。`buildPublicInterface` 在 construction 时移除已完成 specialization
+的 constexpr 参数；它们不占 runtime 槽位。
+
+进入 physical construction 之前，KIR 把作者名字与 source origin 保存在对应函数参数的
+`intent.parameter` 属性中；类型角色直接读取当前 signature。不维护平行的参数名、role
+或 provenance 位置表。标准函数参数改写会携带自己的属性，source interface verifier
+检查其完整性；module provenance 和坐标来源仍由 KIR 验证阶段闭合。
+
+| 需要修改的事实 | Owner 与复用入口 |
+|---|---|
+| 公共 scalar/view 合同及 metadata | [Intent/IR/Interface](include/Intent/Dialect/Intent/IR/Interface.h)：构造、验证和 `serializePublicInterface` |
+| GPU 参数身份、metadata producer 与公共参数对应关系 | [GPU/IR/ProgramInterface](include/Intent/Dialect/GPU/IR/ProgramInterface.h)：typed binding、轻量查询和 intrinsic verifier |
+| 一次 GPU analysis 中的参数查询 | [GPU/Analysis/ProgramInterface](include/Intent/Dialect/GPU/Analysis/ProgramInterface.h)：读取当前 signature；改动后重建 snapshot |
+| 追加 workspace/metadata 或转换 workspace 类型 | [GPU/Transforms/ProgramInterface](include/Intent/Dialect/GPU/Transforms/ProgramInterface.h)：同步维护 function type 与参数属性 |
+| CPU/DSA 的外部原生参数槽 | [Serialization/NativeABI](include/Intent/Serialization/NativeABI.h)：从最终 physical entry 展开参数，供源码签名和 metadata 共用 |
+| Python 公共参数与调用关系 | [runtime/interface.py](python/intent/runtime/interface.py)：唯一声明解析及 shape/stride 关系；不观察或缓存实际 tensor |
+| 原生调用绑定 | [runtime/native.py](python/intent/runtime/native.py)：消费编译器导出的 native slots，生成绑定函数；observer 与设备调用留在各 runtime |
+
+GPU 的每个物理参数携带 `ArgumentBindingAttr`。其稳定 `ArgumentRefAttr` 与当前
+`BlockArgument` 位置、作者参数名、生成源码名相互独立。Public binding 指向公共参数
+序号；Dimension/Stride binding 指向当前 view 的 reference 和 axis；Workspace
+binding 表示 compiler-private allocation，不进入作者接口。Launch expressions
+直接引用这些 bindings。Verifier 同时检查 reference、类型、逻辑 dimension 和 stride
+所属 view/axis，不能只验证一个字符串存在。
+
+Host 求值也依据这些引用。Public 参数绑定完成后，metadata 读取、deferred coverage
+选择和 workspace 分配按实际依赖执行，不按函数参数槽位或声明顺序推断先后。
+Intrinsic verifier 拒绝依赖环、缺失 producer 和 allocation 对尚未选择的 candidate
+参数的依赖；canonical Dimension 的 owner 必须是公共 view。Coverage bound 保留
+不依赖 physical parameter 的已有边界。Python 在加载接口时从相同声明计算一次执行
+顺序，调用时读取本次实参；不输出另一张有独立语义的计划表。
+
+Pass 查询 `getArgumentBinding`、`queryArgumentExpression`、`getPublicView` 等入口，
+不要扫描 generated names 或把槽位再存回 view type。新的参数通过 mutation owner
+进入 signature；不能只修改 entry block 而遗漏 function type。Provider 的附加参数事实
+应依附参数本身或 typed reference，例如 cuTile 的索引范围保存在相应 argument attr，
+不另建按旧 slot 排列的平行数组。
+
+Metadata 的 `interface.parameters` 只保存公共合同；`gpu.arguments` 保存最终 GPU
+bindings，`native.slots` 保存 CPU/DSA 实际调用参数。Native pointer 的 `element`
+描述物理 pointee，scalar 的 `carrier` 描述调用载体，它们可能与公共 dtype 的 signedness
+或 bool 表示不同。Runtime 不再根据公共 dtype 猜测 native carrier。Family 的
+contiguous、alignment、disjoint-output 等执行要求仍由 family 声明和检查。
+
+GPU source serializer 用 [PythonSignature](include/Intent/Dialect/GPU/Serialization/Python.h)
+为已验证参数分组并分配源码名字。这个投影不解释公共语义；runtime 仅在 provider
+调用边界把这些名字转换为稳定 argument IDs。Physical parameter 使用独立命名空间，
+作者 scalar 名称不会覆盖 shape metadata 或 tuning 参数。
+
+职责参考：Triton `lib/Conversion/TritonGPUToLLVM/FuncOpToLLVM.cpp:12–25,106–143`
+在 lowering 中形成额外 scratch/descriptor ABI；
+`third_party/nvidia/backend/driver.py:274–298` 消费 signature 和 metadata 构造 launcher。
+Intent 另外保留 logical view 的公共合同，但同样由编译结果决定目标调用结构。
+
 ## 按贡献类型选择模块
 
 | 要做的修改 | 首先看哪里 | 复用与边界 |
@@ -468,7 +527,7 @@ GPU 的纯编译事实位于 [targets/specification.py](python/intent/targets/sp
 
 实验适配若需要准备候选、观察调优或绑定调用，使用 `artifact.runtime` 的明确对象与 provider 扩展点。Compiler 生成的 source 不再承担 host `launch/run` 协议；只有显式作者提供的 Python source 由 [runtime/source.py](python/intent/runtime/source.py) 的独立 source loader 承接其已有 host callable。不要通过生成模块的私有字典改写编译器产物的执行语义。
 
-Mojo、Weft、BANG C 的共同 native ABI 绑定在 [runtime/native.py](python/intent/runtime/native.py)。`NativeInterface` 解析参数角色、静态形状、维度身份、已声明的 strides 和别名关系，为隐式分配与显式传入输出生成绑定函数，并统一 pointer/shape/stride/scalar 的原生参数排列。每次调用重新观察实参；allocator 返回新输出和本次 `ViewFacts`。CPU 的别名拒绝规则位于 [cpu.py](python/intent/runtime/cpu.py)，BANG C 的设备、队列、tile 资格与分配规则留在自己的 `program.py`；Mojo 的 Torch 规则、Weft 的 Buffer/alignment 规则和各自 tuning key 也留在 provider。Weft 的 `_ExecutionContract` 每次执行继续检查当前线程的 affinity、stack、RVV 状态和 VLEN。不要把一次实参观察或线程状态存入不可变 ABI schema，也不要在绑定函数中重建算法或 task 调度。
+Mojo、Weft、BANG C 的共同 native ABI 绑定在 [runtime/native.py](python/intent/runtime/native.py)。`NativeABI.read` 消费公共 `PublicInterface` 和编译器导出的 `native.slots`，为隐式分配与显式传入输出生成绑定函数；原生参数顺序、scalar carrier 和 pointer pointee 不在 Python 中重新推导。每次调用重新观察实参；allocator 返回新输出和本次 `ViewFacts`。CPU 的别名拒绝规则位于 [cpu.py](python/intent/runtime/cpu.py)，BANG C 的设备、队列、tile 资格与分配规则留在自己的 `program.py`；Mojo 的 Torch 规则、Weft 的 Buffer/alignment 规则和各自 tuning key 也留在 provider。Weft 的 `_ExecutionContract` 每次执行继续检查当前线程的 affinity、stack、RVV 状态和 VLEN。不要把一次实参观察或线程状态存入不可变 ABI schema，也不要在绑定函数中重建算法或 task 调度。
 
 公共 `artifact.prepare(*inputs, outputs=...)` 通过 `PreparedRuntime.prepare_call` 接入这些能力，返回 `intent.PreparedCall`，仅共同保证 `launch()` 和 `result()`。GPU launch 使用当前 stream，CPU launch 等待本次任务，BANG C launch 同步自己的 CNRT queue；`result()` 只返回输出容器，不隐含同步。CPU 既有返回值包含 InOut，GPU/BANG C 仅返回 Out，这个差异没有被 ABI 复用改写。Provider 特有的 enqueue、benchmark 或调优观察仍属于其具体调用对象。
 

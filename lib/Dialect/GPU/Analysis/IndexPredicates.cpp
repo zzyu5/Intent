@@ -75,7 +75,7 @@ private:
     if (kind == PhysicalExprKind::Dimension)
       return Interval{0, std::numeric_limits<int64_t>::max()};
     if (kind == PhysicalExprKind::Parameter) {
-      auto parameter = queryParameterBySymbol(kernel, expression.getSymbolName());
+      auto parameter = queryParameterBySymbol(kernel, expression.getParameterReference().getName());
       if (failed(parameter)) return std::nullopt;
       if (parameter->isDeferred() ||
           parameter->getCategory() ==

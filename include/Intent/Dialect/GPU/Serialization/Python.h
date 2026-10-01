@@ -2,11 +2,32 @@
 #define INTENT_DIALECT_GPU_SERIALIZATION_PYTHON_H
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
+#include "Intent/Dialect/GPU/IR/GPUTypes.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include <string>
 
 namespace intent::gpu {
+
+// A terminal source projection, not another interface schema. Parameter
+// identity and legality are owned by ProgramInterface; this only groups the
+// current arguments and assigns names in the generated Python scope.
+struct PythonArgument {
+  mlir::BlockArgument value;
+  std::string name;
+
+  ViewType viewType() const { return mlir::cast<ViewType>(value.getType()); }
+};
+
+struct PythonSignature {
+  llvm::SmallVector<PythonArgument> views;
+  llvm::SmallVector<PythonArgument> scalars;
+  llvm::SmallVector<PythonArgument> metadata;
+
+  static mlir::FailureOr<PythonSignature> read(mlir::func::FuncOp kernel);
+};
 
 struct PythonScalarSyntax {
   llvm::StringRef prefix;

@@ -4,6 +4,7 @@
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/ProgramInterface.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -57,9 +58,7 @@ planBlockAccess(gpu::AccessOpInterface access,
   auto fragment = dyn_cast<gpu::FragmentType>(valueType);
   if (!view || !fragment || fragment.getShape().empty() || !isa<BlockArgument>(resource) ||
       coordinates.size() != view.getRank() ||
-      sourceAxes.size() != view.getRank() ||
-      !view.getLayout().getHasStrides() ||
-      view.getLayout().getStrides().size() != view.getRank())
+      sourceAxes.size() != view.getRank())
     return std::nullopt;
 
   BlockAccessPlan plan;
@@ -127,10 +126,6 @@ planBlockAccess(gpu::AccessOpInterface access,
       seenFragmentAxes.count() != fragment.getShape().size() ||
       llvm::any_of(plan.offsets, [](Value value) { return !value; }))
     return std::nullopt;
-  for (Attribute stride : view.getLayout().getStrides())
-    if (!isa<IntegerAttr, StringAttr>(stride))
-      return std::nullopt;
-
   if (!boundaryFact.isExact())
     return std::nullopt;
   if (valid) {
@@ -389,26 +384,10 @@ void orientPointerLoads(func::FuncOp kernel) {
 
 bool descriptorStrideAvailable(func::FuncOp kernel, gpu::ViewType view,
                                unsigned axis) {
-  Attribute stride = view.getLayout().getStrides()[axis];
-  if (auto constant = dyn_cast<IntegerAttr>(stride))
-    return constant.getInt() > 0;
-  auto symbol = dyn_cast<StringAttr>(stride);
-  if (!symbol)
-    return false;
-  unsigned matches = 0;
-  for (auto [index, argument] : llvm::enumerate(kernel.getArguments())) {
-    auto name = kernel.getArgAttrOfType<StringAttr>(index, gpu::abiNameAttr);
-    auto kind = kernel.getArgAttrOfType<StringAttr>(index, gpu::abiKindAttr);
-    auto source =
-        kernel.getArgAttrOfType<IntegerAttr>(index, gpu::sourceABIAttr);
-    auto sourceAxis =
-        kernel.getArgAttrOfType<IntegerAttr>(index, gpu::sourceAxisAttr);
-    if (name == symbol && kind && kind.getValue() == "stride" && source &&
-        source.getInt() == view.getAbiIndex() && sourceAxis &&
-        sourceAxis.getInt() == axis && argument.getType().isIndex())
-      ++matches;
-  }
-  return matches == 1;
+  auto stride = cast<gpu::PhysicalExprAttr>(view.getLayout().getStrides()[axis]);
+  if (stride.getKind() == gpu::PhysicalExprKind::Constant)
+    return stride.getValue() > 0;
+  return bool(gpu::resolveArgument(kernel, stride.getArgumentReference()));
 }
 
 
@@ -425,19 +404,19 @@ bool descriptorAccessEligible(func::FuncOp kernel, Value viewValue,
   std::optional<int64_t> elementBytes =
       descriptorElementBytes(view.getElementType());
   auto layout = view.getLayout();
-  if (!elementBytes || 16 % *elementBytes != 0 || !layout.getHasStrides() ||
-      layout.getStrides().size() != view.getRank())
+  if (!elementBytes || 16 % *elementBytes != 0)
     return false;
   auto strides = layout.getStrides();
   for (unsigned axis = 0; axis < view.getRank(); ++axis)
     if (!descriptorStrideAvailable(kernel, view, axis))
       return false;
-  if (auto last = dyn_cast<IntegerAttr>(strides[strides.size() - 1]);
-      last && last.getInt() != 1)
+  auto last = cast<gpu::PhysicalExprAttr>(strides[strides.size() - 1]);
+  if (last.getKind() == gpu::PhysicalExprKind::Constant && last.getValue() != 1)
     return false;
   for (unsigned axis = 0; axis + 1 < view.getRank(); ++axis) {
-    auto stride = dyn_cast<IntegerAttr>(strides[axis]);
-    if (stride && stride.getInt() % (16 / *elementBytes) != 0)
+    auto stride = cast<gpu::PhysicalExprAttr>(strides[axis]);
+    if (stride.getKind() == gpu::PhysicalExprKind::Constant &&
+        stride.getValue() % (16 / *elementBytes) != 0)
       return false;
   }
   // TMA requires aligned coordinates, not constant coordinates. Tile starts
@@ -469,25 +448,12 @@ void copyOrigin(Operation *source, Operation *target) {
 FailureOr<Value> descriptorStrideValue(OpBuilder &builder, func::FuncOp kernel,
                                        Location location, gpu::ViewType view,
                                        unsigned axis) {
-  Attribute stride = view.getLayout().getStrides()[axis];
-  if (auto constant = dyn_cast<IntegerAttr>(stride))
+  auto stride = cast<gpu::PhysicalExprAttr>(view.getLayout().getStrides()[axis]);
+  if (stride.getKind() == gpu::PhysicalExprKind::Constant)
     return Value(builder.create<arith::ConstantIndexOp>(location,
-                                                        constant.getInt()));
-  auto symbol = dyn_cast<StringAttr>(stride);
-  if (!symbol)
-    return failure();
-  for (auto [index, argument] : llvm::enumerate(kernel.getArguments())) {
-    auto name = kernel.getArgAttrOfType<StringAttr>(index, gpu::abiNameAttr);
-    auto kind = kernel.getArgAttrOfType<StringAttr>(index, gpu::abiKindAttr);
-    auto source =
-        kernel.getArgAttrOfType<IntegerAttr>(index, gpu::sourceABIAttr);
-    auto sourceAxis =
-        kernel.getArgAttrOfType<IntegerAttr>(index, gpu::sourceAxisAttr);
-    if (name == symbol && kind && kind.getValue() == "stride" && source &&
-        source.getInt() == view.getAbiIndex() && sourceAxis &&
-        sourceAxis.getInt() == axis && argument.getType().isIndex())
-      return argument;
-  }
+                                                        stride.getValue()));
+  if (auto argument = gpu::resolveArgument(kernel, stride.getArgumentReference()))
+    return Value(argument);
   return failure();
 }
 

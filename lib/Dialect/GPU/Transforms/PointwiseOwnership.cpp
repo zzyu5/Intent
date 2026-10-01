@@ -1,3 +1,4 @@
+#include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "Pointwise.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Contraction.h"
@@ -2805,9 +2806,9 @@ LogicalResult PointwiseRewrite::mapOwnership() {
       if (logicalDimension == 0)
         return range.emitOpError(
             "range-local ownership axis lost its logical dimension extent");
-      logical = expression(module.getContext(), PhysicalExprKind::Dimension,
-                           logicalDimension,
-                           ("D" + Twine(logicalDimension)).str());
+      logical = queryArgumentExpression(resolveDimension(kernel, logicalDimension));
+      if (!logical)
+        return range.emitOpError("range-local ownership dimension has no runtime binding");
     }
     PhysicalExprAttr tile = expression(
         module.getContext(), PhysicalExprKind::Parameter, 0,

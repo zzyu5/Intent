@@ -89,7 +89,7 @@ evaluate(gpu::PhysicalExprAttr expression, DictionaryAttr config) {
       [&](gpu::PhysicalExprAttr leaf) -> std::optional<int64_t> {
         if (leaf.getKind() != gpu::PhysicalExprKind::Parameter)
           return std::nullopt;
-        auto value = config.getAs<IntegerAttr>(leaf.getSymbolName());
+        auto value = config.getAs<IntegerAttr>(leaf.getParameterReference().getName());
         return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
       }, [](gpu::PhysicalExprAttr operation, ArrayRef<int64_t> operands) {
         switch (operation.getKind()) {

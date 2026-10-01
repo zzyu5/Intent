@@ -2,6 +2,7 @@
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Analysis/ProgramInterface.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -32,32 +33,6 @@ std::string pythonType(Type type) {
   return gpu::pythonScalarType(type, syntax);
 }
 
-std::string expressionString(gpu::PhysicalExprAttr expression) {
-  static const gpu::PythonExpressionSyntax syntax{
-      "ct.cdiv", "min", "max", "", "_intent_next_power_of_2", false};
-  return gpu::pythonExpression(expression, syntax, [](gpu::PhysicalExprAttr leaf) {
-    return leaf.getSymbolName().getValue().str();
-  });
-}
-
-std::string fragmentShape(gpu::FragmentType fragment) {
-  std::string result = "(";
-  for (auto [index, extent] : llvm::enumerate(fragment.getShape())) {
-    if (index)
-      result += ", ";
-    result += expressionString(cast<gpu::PhysicalExprAttr>(extent));
-  }
-  if (fragment.getShape().size() == 1)
-    result += ",";
-  return result + ")";
-}
-
-std::string literal(Attribute value) {
-  if (auto expression = dyn_cast<gpu::PhysicalExprAttr>(value))
-    return expressionString(expression);
-  return gpu::pythonLiteral(value);
-}
-
 StringRef providerHint(gpu::ParameterAttr parameter) {
   auto role = parameter.getRole();
   if (role == gpu::ParameterRole::ProviderOccupancy)
@@ -84,9 +59,35 @@ public:
   }
 
 private:
-  using ViewABI = gpu::ViewArgument;
-  using ScalarABI = gpu::ScalarArgument;
-  using MetadataABI = gpu::MetadataArgument;
+  std::string expressionString(gpu::PhysicalExprAttr expression) {
+    static const gpu::PythonExpressionSyntax syntax{
+        "ct.cdiv", "min", "max", "", "_intent_next_power_of_2", false};
+    return gpu::pythonExpression(expression, syntax, [&](gpu::PhysicalExprAttr leaf) {
+      if (leaf.getKind() == gpu::PhysicalExprKind::Parameter)
+        return leaf.getParameterReference().getName().getValue().str();
+      return valueString(gpu::resolveArgument(kernel, leaf.getArgumentReference()));
+    });
+  }
+
+  std::string fragmentShape(gpu::FragmentType fragment) {
+    std::string result = "(";
+    for (auto [index, extent] : llvm::enumerate(fragment.getShape())) {
+      if (index) result += ", ";
+      result += expressionString(cast<gpu::PhysicalExprAttr>(extent));
+    }
+    if (fragment.getShape().size() == 1) result += ",";
+    return result + ")";
+  }
+
+  std::string literal(Attribute value) {
+    if (auto expression = dyn_cast<gpu::PhysicalExprAttr>(value))
+      return expressionString(expression);
+    return gpu::pythonLiteral(value);
+  }
+
+  using ViewABI = gpu::PythonArgument;
+  using ScalarABI = gpu::PythonArgument;
+  using MetadataABI = gpu::PythonArgument;
   struct ArrayViewABI {
     ArrayViewOp operation;
     unsigned sourceView;
@@ -95,7 +96,7 @@ private:
   };
 
   void bindArguments() {
-    auto interface = gpu::readInterface(kernel);
+    auto interface = gpu::PythonSignature::read(kernel);
     if (mlir::failed(interface)) {
       failed = true;
       return;
@@ -104,11 +105,11 @@ private:
     scalars = std::move(interface->scalars);
     metadataArguments = std::move(interface->metadata);
     for (const ScalarABI &scalar : scalars)
-      values[kernel.getArgument(scalar.abi)] = scalar.name;
+      values[scalar.value] = scalar.name;
     for (const MetadataABI &metadata : metadataArguments)
-      values[kernel.getArgument(metadata.abi)] = metadata.name;
+      values[metadata.value] = metadata.name;
     for (const ViewABI &view : views)
-      values[kernel.getArgument(view.abi)] = view.name;
+      values[view.value] = view.name;
     for (Attribute attribute : gpu::getParameterDeclarations(kernel)) {
       auto parameter = cast<gpu::ParameterAttr>(attribute);
       if (StringRef hint = providerHint(parameter); !hint.empty()) {
@@ -136,7 +137,7 @@ private:
     kernel.walk([&](ArrayViewOp array) {
       unsigned argument = cast<BlockArgument>(array.getBase()).getArgNumber();
       for (auto [index, view] : llvm::enumerate(views)) {
-        if (view.abi != argument)
+        if (view.value.getArgNumber() != argument)
           continue;
         ArrayViewABI binding{
             array, static_cast<unsigned>(index), fresh("_intent_array_view_"),
@@ -243,14 +244,14 @@ private:
                dimensions + ", static_stride_dims=" + dimensions + ")]");
     };
     for (const ViewABI &view : views)
-      arrayArgument(view.name, view.type.getLayout().getExtents().size());
+      arrayArgument(view.name, view.viewType().getLayout().getExtents().size());
     for (ArrayViewABI view : arrayViews) {
       arrayArgument(view.name, view.operation.getGroupEnds().size());
       argument(view.eligible + ": ct.Constant[bool]");
     }
     for (const ScalarABI &scalar : scalars) {
-      auto integer = dyn_cast<IntegerType>(scalar.type);
-      bool wide = scalar.type.isIndex() ||
+      auto integer = dyn_cast<IntegerType>(scalar.value.getType());
+      bool wide = scalar.value.getType().isIndex() ||
                   (integer && integer.getWidth() == 64);
       argument(scalar.name + (wide ? ": ct.ScalarInt64" : ""));
     }
@@ -983,7 +984,8 @@ private:
       for (int64_t end : operation.getGroupEnds()) groups.push_back(end);
       arrays.push_back(llvm::json::Object{
           {"name", view.name}, {"eligible", view.eligible},
-          {"base", views[view.sourceView].name}, {"group_ends", std::move(groups)}});
+          {"base", gpu::getArgumentReference(views[view.sourceView].value).getId()},
+          {"group_ends", std::move(groups)}});
       arguments.push_back(view.name);
       arguments.push_back(view.eligible);
     }
@@ -1000,11 +1002,13 @@ private:
     details["array_views"] = std::move(arrays);
     details["index_tile_bounds"] = nullptr;
     details["narrow_kernel"] = nullptr;
-    if (auto bounds = kernel->getAttrOfType<ArrayAttr>(arrayIndexTileBoundsAttr)) {
+    if (kernel->hasAttr(arrayIndexTileBoundsAttr)) {
       llvm::json::Array encoded;
       for (const ViewABI &view : views) {
         llvm::json::Array axes;
-        for (Attribute bound : cast<ArrayAttr>(bounds[view.abi]))
+        auto bounds = kernel.getArgAttrOfType<ArrayAttr>(
+            view.value.getArgNumber(), arrayIndexTileBoundsAttr);
+        for (Attribute bound : bounds)
           axes.push_back(gpu::serializeExpression(cast<gpu::PhysicalExprAttr>(bound)));
         encoded.push_back(std::move(axes));
       }
@@ -1019,7 +1023,7 @@ private:
     llvm::json::Array scalarKeys;
     llvm::SmallBitVector keyArguments = getTuningKeyScalarArguments(kernel);
     for (const ScalarABI &scalar : scalars)
-      if (keyArguments.test(scalar.abi)) scalarKeys.push_back(scalar.name);
+      if (keyArguments.test(scalar.value.getArgNumber())) scalarKeys.push_back(scalar.name);
     details["tuning_key_scalars"] = std::move(scalarKeys);
     (*artifact)["cutile"] = std::move(details);
     llvm::raw_string_ostream(metadata) << llvm::json::Value(std::move(*artifact));

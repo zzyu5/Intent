@@ -58,13 +58,13 @@ public:
                const cpu::ImplementationRegistry &implementations)
       : analysis(function), relations(function), output(output), b(output.getContext()),
         formats(formats), implementations(implementations) {
-    auto interface = function->getAttrOfType<cpu::InterfaceAttr>("intent_cpu.interface");
+    auto interface = getPublicInterface(function);
     for (auto [argument, schema] : llvm::zip(function.getArguments(), interface.getArguments())) {
-      auto view = dyn_cast<cpu::ViewArgumentAttr>(schema);
+      auto view = dyn_cast<intent::ViewType>(cast<PublicParameterAttr>(schema).getType());
       if (!view) continue;
       auto memory = cast<MemRefType>(argument.getType());
       for (unsigned axis = 0; axis < memory.getRank(); ++axis)
-        if (memory.isDynamicDim(axis)) extentIds.try_emplace(view.getDimensions()[axis], extentIds.size() + 1);
+        if (memory.isDynamicDim(axis)) extentIds.try_emplace(publicViewDimensions(view)[axis], extentIds.size() + 1);
     }
     auto join = [&](Value lhs, Value rhs) {
       int64_t a = physicalAxis(relations.axes(lhs).back());
@@ -83,11 +83,11 @@ public:
 
   SmallVector<Value> shapeArguments(func::FuncOp function, OpBuilder &builder) {
     SmallVector<Value> result(extentIds.size());
-    auto interface = function->getAttrOfType<cpu::InterfaceAttr>("intent_cpu.interface");
+    auto interface = getPublicInterface(function);
     for (BlockArgument argument : function.getArguments()) {
       auto memory = dyn_cast<MemRefType>(argument.getType());
       if (!memory) continue;
-      auto ids = cast<cpu::ViewArgumentAttr>(interface.getArguments()[argument.getArgNumber()]).getDimensions();
+      auto ids = publicViewDimensions(getPublicView(interface, argument.getArgNumber()));
       for (auto [axis, extent] : llvm::enumerate(memory.getShape()))
         if (ShapedType::isDynamic(extent))
           result[extentIds.at(ids[axis]) - 1] = builder.create<memref::DimOp>(function.getLoc(), argument, axis);
@@ -290,8 +290,8 @@ private:
         return dimensionSymbol(tasks.getCaptures()[argument.getArgNumber() - 1], axis);
       if (isa<func::FuncOp>(argument.getOwner()->getParentOp()) &&
           cast<MemRefType>(memory.getType()).isDynamicDim(axis)) {
-        auto interface = argument.getOwner()->getParentOp()->getAttrOfType<cpu::InterfaceAttr>("intent_cpu.interface");
-        auto dimension = cast<cpu::ViewArgumentAttr>(interface.getArguments()[argument.getArgNumber()]).getDimensions()[axis];
+        auto interface = getPublicInterface(cast<func::FuncOp>(argument.getOwner()->getParentOp()));
+        auto dimension = publicViewDimensions(getPublicView(interface, argument.getArgNumber()))[axis];
         return extentIds.at(dimension);
       }
     }

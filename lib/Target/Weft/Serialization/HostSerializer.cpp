@@ -1,5 +1,6 @@
 #include "Intent/Target/Weft/Serialization/Serializer.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
+#include "TaskABI.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -10,10 +11,21 @@
 
 using namespace mlir;
 namespace intent::weft_provider {
+
+FailureOr<NativeABI> queryHostABI(func::FuncOp function) {
+  return queryNativeABI(function, getPublicInterface(function), [](Type type) -> FailureOr<Type> {
+    if (type.isIndex()) return IntegerType::get(type.getContext(), 64);
+    if (type.isInteger(1)) return IntegerType::get(type.getContext(), 32);
+    if (type.isSignlessInteger() || type.isF32() || type.isF64()) return type;
+    return failure();
+  });
+}
+
 namespace {
 
 struct Memory {
-  std::string pointer;
+  std::string base;
+  std::string offset;
   SmallVector<std::string> shape, strides;
 };
 
@@ -34,7 +46,9 @@ public:
     }
     for (auto function : module.getOps<func::FuncOp>()) {
       if (function.isExternal()) continue;
-      values.clear(); memories.clear();
+      auto abi = queryHostABI(function);
+      if (failed(abi)) return failure();
+      values.clear(); memories.clear(); allocations.clear();
       out << "void " << function.getName() << "(";
       bool first = true;
       auto parameter = [&](const std::string &type, const std::string &name) {
@@ -43,19 +57,20 @@ public:
       };
       for (auto [i, argument] : llvm::enumerate(function.getArguments())) {
         std::string name = "a" + std::to_string(i);
-        if (auto type = dyn_cast<MemRefType>(argument.getType())) {
-          parameter(scalarType(type.getElementType()) + " *", name);
-          Memory memory{name, {}, {}};
-          for (int64_t axis = 0; axis < type.getRank(); ++axis) {
-            std::string extent = name + "_d" + std::to_string(axis);
-            parameter("int64_t", extent); memory.shape.push_back(extent);
-          }
-          for (int64_t axis = 0; axis < type.getRank(); ++axis) {
-            std::string stride = name + "_s" + std::to_string(axis);
-            parameter("int64_t", stride); memory.strides.push_back(stride);
-          }
-          memories[argument] = memory;
-        } else { parameter(scalarType(argument.getType()), name); values[argument] = name; }
+        if (auto type = dyn_cast<MemRefType>(argument.getType()))
+          memories[argument] = Memory{name, "0", SmallVector<std::string>(type.getRank()),
+                                     SmallVector<std::string>(type.getRank())};
+        else values[argument] = name;
+      }
+      for (const NativeSlot &slot : abi->slots) {
+        std::string name = slot.name();
+        parameter(slot.role == NativeSlotRole::Pointer
+            ? scalarType(slot.element) + " *" : scalarType(slot.carrier), name);
+        if (slot.axis) {
+          auto &memory = memories.find(function.getArgument(slot.parameter))->second;
+          auto &entries = slot.role == NativeSlotRole::Extent ? memory.shape : memory.strides;
+          entries[*slot.axis] = name;
+        }
       }
       out << ") {\n";
       indent = 1;
@@ -85,10 +100,64 @@ private:
   }
   std::string address(Value memory, ValueRange indices) {
     auto &entry = memories.at(memory);
-    std::string result = entry.pointer;
+    std::string result = pointer(memory);
     for (auto [index, stride] : llvm::zip(indices, entry.strides))
       result += " + (" + value(index) + ") * (" + stride + ")";
     return "(" + result + ")";
+  }
+  std::string pointer(Value memory) {
+    const auto &entry = memories.at(memory);
+    return entry.offset == "0" ? entry.base : "(" + entry.base + " + (" + entry.offset + "))";
+  }
+
+  LogicalResult view(Operation *operation) {
+    if (auto cast = dyn_cast<memref::CastOp>(operation)) {
+      if (!isa<MemRefType>(cast.getSource().getType()) ||
+          !isa<MemRefType>(cast.getResult().getType()))
+        return cast.emitError("native host cast requires ranked memory descriptors");
+      Memory source = memories.at(cast.getSource());
+      memories[cast.getResult()] = std::move(source);
+      if (auto allocation = allocations.find(cast.getSource()); allocation != allocations.end()) {
+        std::string owner = allocation->second;
+        allocations[cast.getResult()] = std::move(owner);
+      }
+      return success();
+    }
+    if (auto metadata = dyn_cast<memref::ExtractStridedMetadataOp>(operation)) {
+      const Memory source = memories.at(metadata.getSource());
+      memories[metadata.getBaseBuffer()] = Memory{source.base, "0", {}, {}};
+      values[metadata.getOffset()] = source.offset;
+      for (auto [result, size] : llvm::zip(metadata.getSizes(), source.shape)) values[result] = size;
+      for (auto [result, stride] : llvm::zip(metadata.getStrides(), source.strides)) values[result] = stride;
+      return success();
+    }
+    if (auto reinterpret = dyn_cast<memref::ReinterpretCastOp>(operation)) {
+      if (!isa<MemRefType>(reinterpret.getSource().getType()))
+        return reinterpret.emitError("native host reinterpretation requires a ranked source descriptor");
+      // Reinterpretation replaces metadata relative to the storage base. It
+      // must not add the source view's offset to the replacement offset.
+      Memory target{memories.at(reinterpret.getSource()).base,
+                    bound(reinterpret.getMixedOffsets().front()), {}, {}};
+      for (OpFoldResult size : reinterpret.getMixedSizes()) target.shape.push_back(bound(size));
+      for (OpFoldResult stride : reinterpret.getMixedStrides()) target.strides.push_back(bound(stride));
+      memories[reinterpret.getResult()] = std::move(target);
+      return success();
+    }
+    auto subview = cast<memref::SubViewOp>(operation);
+    const Memory source = memories.at(subview.getSource());
+    Memory target{source.base, source.offset, {}, {}};
+    auto offsets = subview.getMixedOffsets(), sizes = subview.getMixedSizes(), steps = subview.getMixedStrides();
+    auto dropped = subview.getDroppedDims();
+    for (unsigned axis = 0; axis < offsets.size(); ++axis) {
+      target.offset += " + (" + bound(offsets[axis]) + ") * (" + source.strides[axis] + ")";
+      if (!dropped.test(axis)) {
+        target.shape.push_back(bound(sizes[axis]));
+        target.strides.push_back("(" + source.strides[axis] + ") * (" + bound(steps[axis]) + ")");
+      }
+    }
+    target.offset = "(" + target.offset + ")";
+    memories[subview.getResult()] = std::move(target);
+    return success();
   }
   void bind(Value result, const std::string &expression) {
     std::string name = fresh();
@@ -122,28 +191,14 @@ private:
       values[dim.getResult()] = memories.at(dim.getSource()).shape[*axis];
       return success();
     }
-    if (auto cast = dyn_cast<memref::CastOp>(operation)) {
-      memories[cast.getResult()] = memories.at(cast.getSource()); return success();
-    }
-    if (auto view = dyn_cast<memref::SubViewOp>(operation)) {
-      const auto source = memories.at(view.getSource());
-      Memory target{source.pointer, {}, {}};
-      auto offsets = view.getMixedOffsets(), sizes = view.getMixedSizes(), steps = view.getMixedStrides();
-      auto dropped = view.getDroppedDims();
-      for (unsigned axis = 0; axis < offsets.size(); ++axis) {
-        target.pointer += " + (" + bound(offsets[axis]) + ") * (" + source.strides[axis] + ")";
-        if (!dropped.test(axis)) {
-          target.shape.push_back(bound(sizes[axis]));
-          target.strides.push_back("(" + source.strides[axis] + ") * (" + bound(steps[axis]) + ")");
-        }
-      }
-      target.pointer = "(" + target.pointer + ")";
-      memories[view.getResult()] = target; return success();
-    }
+    if (isa<memref::CastOp, memref::ExtractStridedMetadataOp,
+            memref::ReinterpretCastOp, memref::SubViewOp>(operation)) return view(operation);
     if (isa<memref::AllocOp, memref::AllocaOp>(operation)) {
       auto type = cast<MemRefType>(operation->getResult(0).getType());
+      if (!type.getLayout().isIdentity() || type.getMemorySpaceAsInt() != 0)
+        return operation->emitError("native host allocation requires contiguous host storage");
       std::string name = fresh(), elements = "1";
-      Memory memory{name, {}, {}};
+      Memory memory{name, "0", {}, {}};
       unsigned dynamic = 0;
       for (int64_t size : type.getShape())
         memory.shape.push_back(ShapedType::isDynamic(size) ? value(operation->getOperand(dynamic++)) : std::to_string(size));
@@ -162,11 +217,15 @@ private:
         line(element + " *" + name + " = aligned_alloc(" + std::to_string(alignment) + ", ((" + bytes +
             " + " + std::to_string(alignment - 1) + ") / " + std::to_string(alignment) + ") * " + std::to_string(alignment) + ");");
         line("if (!" + name + " && (" + elements + ")) abort();");
+        allocations[operation->getResult(0)] = name;
       }
       memories[operation->getResult(0)] = memory; return success();
     }
     if (auto dealloc = dyn_cast<memref::DeallocOp>(operation)) {
-      line("free(" + memories.at(dealloc.getMemref()).pointer + ");"); return success();
+      auto allocation = allocations.find(dealloc.getMemref());
+      if (allocation == allocations.end())
+        return dealloc.emitError("native host deallocation must reference its owning heap allocation");
+      line("free(" + allocation->second + ");"); return success();
     }
     if (auto load = dyn_cast<memref::LoadOp>(operation)) {
       bind(load.getResult(), "*" + address(load.getMemref(), load.getIndices())); return success();
@@ -179,7 +238,7 @@ private:
       std::string text = call.getCallee().str() + "(";
       for (auto [i, argument] : llvm::enumerate(call.getOperands())) {
         if (i) text += ", ";
-        text += isa<MemRefType>(argument.getType()) ? memories.at(argument).pointer : value(argument);
+        text += isa<MemRefType>(argument.getType()) ? pointer(argument) : value(argument);
       }
       line(text + ");"); return success();
     }
@@ -256,6 +315,7 @@ private:
   llvm::raw_ostream &out;
   llvm::DenseMap<Value, std::string> values;
   llvm::DenseMap<Value, Memory> memories;
+  llvm::DenseMap<Value, std::string> allocations;
   unsigned counter = 0, indent = 0;
 };
 

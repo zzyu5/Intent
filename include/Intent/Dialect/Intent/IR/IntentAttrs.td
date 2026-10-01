@@ -189,9 +189,25 @@ def Intent_ViewConstraintsAttr : AttrDef<Intent_Dialect, "ViewConstraints"> {
 
 def Intent_ParameterAttr : AttrDef<Intent_Dialect, "Parameter"> {
   let mnemonic = "parameter";
-  let summary = "Typed canonical function parameter role";
-  let parameters = (ins "::mlir::StringAttr":$name, "uint32_t":$kind);
-  let assemblyFormat = "`<` $name `,` $kind `>`";
+  let summary = "Canonical function argument name and source origin";
+  let parameters = (ins "::mlir::StringAttr":$name, "int64_t":$originId);
+  let assemblyFormat = "`<` $name `,` $originId `>`";
+  let genVerifyDecl = 1;
+}
+
+def Intent_PublicParameterAttr : AttrDef<Intent_Dialect, "PublicParameter"> {
+  let mnemonic = "public_parameter";
+  let summary = "One runtime author parameter in declaration order";
+  let parameters = (ins "::mlir::StringAttr":$name, "::mlir::Type":$type);
+  let assemblyFormat = "`<` $name `,` $type `>`";
+  let genVerifyDecl = 1;
+}
+
+def Intent_InterfaceAttr : AttrDef<Intent_Dialect, "Interface"> {
+  let mnemonic = "interface";
+  let summary = "The public invocation contract, independent of physical argument packing";
+  let parameters = (ins "::mlir::ArrayAttr":$arguments);
+  let assemblyFormat = "`<` $arguments `>`";
   let genVerifyDecl = 1;
 }
 

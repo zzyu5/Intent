@@ -4,6 +4,7 @@
 #include "Intent/Dialect/Intent/IR/IntentAttrs.h"
 #include "Intent/Dialect/Intent/IR/IntentOps.h"
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
+#include "Intent/Dialect/Intent/IR/Interface.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
@@ -18,8 +19,6 @@ using namespace mlir;
 
 namespace intent {
 namespace {
-
-LogicalResult verifyCanonicalType(Operation *owner, Type type);
 
 void collectCoordinateSources(Type type,
                               llvm::DenseMap<uint64_t, unsigned> &ranks) {
@@ -61,87 +60,6 @@ LogicalResult verifyCoordinateSources(
               owner, cast<TypeAttr>(attribute).getValue(), ranks)))
         return failure();
   return success();
-}
-
-bool isCanonicalScalarType(Type type) {
-  if (isa<IndexType>(type))
-    return true;
-  if (auto integer = dyn_cast<IntegerType>(type))
-    return llvm::is_contained({1u, 8u, 16u, 32u, 64u}, integer.getWidth());
-  if (auto floating = dyn_cast<FloatType>(type))
-    return floating.isF16() || floating.isBF16() || floating.isF32() ||
-           floating.isF64() || isa<Float8E4M3FNType, Float8E5M2Type>(floating);
-  return false;
-}
-
-LogicalResult verifyTensorType(Operation *owner, RankedTensorType tensor) {
-  if (failed(verifyCanonicalType(owner, tensor.getElementType())))
-    return failure();
-  auto encoding = dyn_cast_or_null<TensorShapeAttr>(tensor.getEncoding());
-  auto dimensionIDs = encoding ? encoding.getDimensions() : DenseI64ArrayAttr();
-  if (!dimensionIDs || dimensionIDs.size() != tensor.getRank())
-    return owner->emitOpError(
-        "tensor type requires one canonical dimension identity per axis");
-  for (int64_t identity : dimensionIDs.asArrayRef())
-    if (identity <= 0)
-      return owner->emitOpError(
-          "tensor dimension identities must be positive for every logical axis");
-  return success();
-}
-
-LogicalResult verifyCanonicalType(Operation *owner, Type type) {
-  if (isCanonicalScalarType(type) ||
-      isa<LogicalIndexType, DomainType, RegionType, ConstexprType, EnumType>(type))
-    return success();
-  if (auto tensor = dyn_cast<RankedTensorType>(type))
-    return verifyTensorType(owner, tensor);
-  if (auto view = dyn_cast<ViewType>(type))
-    return verifyCanonicalType(owner, view.getTensor());
-  if (auto buffer = dyn_cast<BufferType>(type))
-    return verifyCanonicalType(owner, buffer.getTensor());
-  if (auto tuple = dyn_cast<intent::TupleType>(type)) {
-    for (Attribute attribute : tuple.getComponentTypes())
-      if (failed(verifyCanonicalType(owner,
-                                     cast<TypeAttr>(attribute).getValue())))
-        return failure();
-    return success();
-  }
-  if (auto record = dyn_cast<RecordType>(type)) {
-    for (Attribute attribute : record.getFieldTypes())
-      if (failed(verifyCanonicalType(owner,
-                                     cast<TypeAttr>(attribute).getValue())))
-        return failure();
-    return success();
-  }
-  return owner->emitOpError() << "contains non-canonical KIR type " << type;
-}
-
-LogicalResult verifyParameter(func::FuncOp function, unsigned index,
-                              ParameterAttr metadata) {
-  if (!metadata)
-    return function.emitOpError("parameter requires a typed canonical role");
-  Type type = function.getArgument(index).getType();
-  uint32_t kind = metadata.getKind();
-  if (kind == 0) {
-    auto view = dyn_cast<ViewType>(type);
-    if (!view)
-      return function.emitOpError("view parameter metadata requires ViewType");
-    auto tensor = cast<RankedTensorType>(view.getTensor());
-    ViewConstraintsAttr constraints = view.getConstraints();
-    if (constraints.getHasStrides() && constraints.getStrides().size() !=
-                                           static_cast<size_t>(tensor.getRank()))
-      return function.emitOpError(
-          "view stride-constraint rank must match its logical rank");
-  } else if (kind == 2) {
-    if (!isa<ConstexprType>(type))
-      return function.emitOpError("constexpr parameter requires ConstexprType");
-  } else if (kind == 1) {
-    if (!isa<IntegerType, IndexType, FloatType>(type))
-      return function.emitOpError("runtime scalar parameter has non-scalar type");
-  } else if (kind != 3) {
-    return function.emitOpError("parameter metadata contains an unknown kind");
-  }
-  return verifyCanonicalType(function, type);
 }
 
 LogicalResult verifyResultProvenance(Operation *operation,
@@ -253,39 +171,23 @@ LogicalResult verifyFunction(func::FuncOp function, bool &sawKernel,
                              DenseSet<int64_t> &valueIDs,
                              DenseSet<int64_t> &operationIDs) {
   auto kind = function->getAttrOfType<FunctionKindAttr>("intent.kind");
-  auto parameters = function->getAttrOfType<ArrayAttr>("intent.parameters");
-  auto parameterNodes =
-      function->getAttrOfType<ArrayAttr>("intent.parameter_nodes");
-  if (!kind || !parameters || !parameterNodes ||
-      parameters.size() != function.getNumArguments() ||
-      parameterNodes.size() != function.getNumArguments())
-    return function.emitOpError(
-        "requires typed Intent function kind and aligned parameter provenance");
-  if (kind.getKind() == 0) {
-    if (sawKernel)
-      return function.emitOpError("module contains more than one kernel entry");
-    if (function.getNumResults() != 0)
-      return function.emitOpError("kernel cannot return device values to the host");
-    sawKernel = true;
-  }
-  for (auto [index, metadata] : llvm::enumerate(parameters)) {
-    auto parameter = dyn_cast<ParameterAttr>(metadata);
-    if (!parameter || failed(verifyParameter(function, index, parameter)))
-      return failure();
-    auto node = dyn_cast<IntegerAttr>(parameterNodes[index]);
-    if (!node || node.getInt() < 0 || !valueIDs.insert(node.getInt()).second)
-      return function.emitOpError(
-          "parameter provenance IDs must be unique non-negative integers");
-  }
-  for (Type result : function.getResultTypes())
-    if (failed(verifyCanonicalType(function, result)))
-      return failure();
+  if (failed(verifySourceInterface(function))) return failure();
   if (!llvm::hasSingleElement(function.getBody()) ||
       function.getBody().front().empty() ||
       function.getBody().front().back().getName().getStringRef() !=
           "intent.return")
     return function.emitOpError(
         "requires one entry block ending in intent.return");
+  if (kind.getKind() == 0) {
+    if (sawKernel)
+      return function.emitOpError("module contains more than one kernel entry");
+    sawKernel = true;
+  }
+  for (BlockArgument argument : function.getArguments()) {
+    if (!valueIDs.insert(getSourceParameter(argument).getOriginId()).second)
+      return function.emitOpError(
+          "parameter provenance IDs must be unique non-negative integers");
+  }
   Operation &returnOp = function.getBody().front().back();
   if (!llvm::equal(returnOp.getOperandTypes(), function.getResultTypes()))
     return returnOp.emitOpError("return operands do not match function results");

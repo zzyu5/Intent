@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from intent.compiler.cache import cache_root, file_identity, locked_cache_entry
 from .toolchain import resolve_toolchain, runtime_dependencies
+from ..native import NativeABI
 
 
 @dataclass
@@ -41,45 +42,28 @@ _loading_lock = Lock()
 
 ELEMENT_TYPES = {
     "f16": "Float16", "bf16": "BFloat16", "f32": "Float32", "f64": "Float64",
-    "i1": "SIMD[DType.bool, 1]", "i8": "Int8", "i16": "Int16", "i32": "Int32", "i64": "Int64",
-    "ui8": "UInt8", "ui16": "UInt16", "ui32": "UInt32", "ui64": "UInt64",
+    "bool": "SIMD[DType.bool, 1]", "index": "Int64", "i8": "Int8", "i16": "Int16", "i32": "Int32", "i64": "Int64",
+    "u8": "UInt8", "u16": "UInt16", "u32": "UInt32", "u64": "UInt64",
     "f8e4m3fn": "SIMD[DType.float8_e4m3fn, 1]", "f8e5m2": "SIMD[DType.float8_e5m2, 1]",
 }
 
-SCALAR_CTYPES = {
-    "f32": ctypes.c_float, "f64": ctypes.c_double, "i1": ctypes.c_bool,
-    "i8": ctypes.c_int8, "i16": ctypes.c_int16, "i32": ctypes.c_int32, "i64": ctypes.c_int64,
-    "ui8": ctypes.c_uint8, "ui16": ctypes.c_uint16, "ui32": ctypes.c_uint32, "ui64": ctypes.c_uint64,
-}
-
-
-def flattened_signature(parameters: list[dict[str, object]]) -> tuple[list[str], list[str]]:
+def flattened_signature(abi: NativeABI) -> tuple[list[str], list[str]]:
     signature: list[str] = []
     arguments: list[str] = []
-    for index, parameter in enumerate(parameters):
-        name = f"a{index}"
-        if parameter["kind"] == "view":
-            signature.append(f"{name}: Pointer[{ELEMENT_TYPES[parameter['dtype']]}, MutUntrackedOrigin]")
-            arguments.append(f"{name}.unsafe_bitcast[Int{parameter['dtype'][2:]}]()"
-                             if parameter["dtype"].startswith("ui") else name)
-            rank = len(parameter["shape"])
-            for role in ("d", "s"):
-                for axis in range(rank):
-                    field = f"{name}_{role}{axis}"
-                    signature.append(f"{field}: Int64")
-                    arguments.append(field)
+    for slot in abi.slots:
+        name = slot.name
+        if slot.role == "pointer":
+            signature.append(f"{name}: Pointer[{ELEMENT_TYPES[slot.element.name]}, MutUntrackedOrigin]")
         else:
-            signature.append(f"{name}: {'Bool' if parameter['dtype'] == 'i1' else ELEMENT_TYPES[parameter['dtype']]}")
-            arguments.append(f"bitcast[DType.int{parameter['dtype'][2:]}]({name})"
-                             if parameter["dtype"].startswith("ui") else name)
+            signature.append(f"{name}: {'Bool' if slot.carrier == 'bool' else ELEMENT_TYPES[slot.carrier]}")
+        arguments.append(name)
     return signature, arguments
 
 
-def benchmark_exports(metadata: dict[str, object]) -> str:
-    signature, arguments = flattened_signature(metadata["parameters"])
+def benchmark_exports(metadata: dict[str, object], abi: NativeABI) -> str:
+    signature, arguments = flattened_signature(abi)
     sections = ["\nfrom std.time import monotonic\nfrom std.sys import size_of\n"]
-    mutable = [(index, parameter) for index, parameter in enumerate(metadata["parameters"])
-               if parameter["kind"] == "view" and parameter["access"] == 2]
+    mutable = [(parameter.position, parameter) for parameter in abi.interface.mutable_inputs]
     for candidate in metadata["candidates"]:
         entry = candidate["entry"]
         sections.append(
@@ -95,8 +79,8 @@ def benchmark_exports(metadata: dict[str, object]) -> str:
             )
             continue
         for index, parameter in mutable:
-            dimensions = " * ".join(f"Int(a{index}_d{axis})" for axis in range(len(parameter["shape"]))) or "1"
-            element = ELEMENT_TYPES[parameter["dtype"]]
+            dimensions = " * ".join(f"Int(a{index}_d{axis})" for axis in range(len(parameter.shape))) or "1"
+            element = ELEMENT_TYPES[abi.pointer_slots[index].element.name]
             sections.append(
                 f"    var bytes_a{index} = ({dimensions}) * size_of[{element}]()\n"
                 f"    var saved_a{index} = alloc(Layout[UInt8](count=bytes_a{index}))\n"
@@ -318,7 +302,7 @@ def _compile_unit(source: str, metadata: dict[str, object], key: str, target,
         ) from error
 
 
-def compile_library(source: str, metadata: dict[str, object], target) -> NativeCompilation:
+def compile_library(source: str, metadata: dict[str, object], target, *, abi: NativeABI) -> NativeCompilation:
     environment = dict(os.environ)
     snapshot = resolve_toolchain(target.executable, tuple(metadata.get("native_dependencies", ())), environment)
     fp_object, fp_bytes = _compile_fp_environment(environment)
@@ -330,7 +314,7 @@ def compile_library(source: str, metadata: dict[str, object], target) -> NativeC
         body = prelude + encoded[begin:end]
         binding = {**candidate, "source_range": [len(prelude), len(body)]}
         unit_metadata = {**metadata, "candidates": [binding]}
-        complete_source = body.decode("utf-8") + benchmark_exports(unit_metadata)
+        complete_source = body.decode("utf-8") + benchmark_exports(unit_metadata, abi)
         unit_key = json.dumps((complete_source, unit_metadata, target.executable,
                               _BUILD_OPTIONS, target.native_options, snapshot.identity,
                               base64.b64encode(fp_bytes).decode("ascii")), sort_keys=True)

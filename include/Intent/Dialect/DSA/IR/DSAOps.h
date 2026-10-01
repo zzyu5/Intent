@@ -1,6 +1,6 @@
 #ifndef INTENT_DIALECT_DSA_IR_DSAOPS_H
 #define INTENT_DIALECT_DSA_IR_DSAOPS_H
-#include "Intent/Dialect/Intent/IR/IntentAttrs.h"
+#include "Intent/Dialect/Intent/IR/Interface.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
@@ -12,6 +12,7 @@
 #define GET_OP_CLASSES
 #include "Intent/Dialect/DSA/IR/DSAOps.h.inc"
 namespace intent::dsa {
+inline constexpr llvm::StringLiteral entryRequirementsAttr = "intent_dsa.entry_requirements";
 constexpr int64_t nramSpace = 1;
 constexpr int64_t matrixSpace = 2;
 constexpr int64_t sharedSpace = 3;

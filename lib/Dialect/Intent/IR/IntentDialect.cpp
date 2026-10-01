@@ -2,6 +2,7 @@
 #include "Intent/Dialect/Intent/IR/IntentAttrs.h"
 #include "Intent/Dialect/Intent/IR/IntentOps.h"
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
+#include "Intent/Dialect/Intent/IR/Interface.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/DialectImplementation.h"
@@ -22,6 +23,25 @@ using namespace intent;
 
 #define GET_ATTRDEF_CLASSES
 #include "Intent/Dialect/Intent/IR/IntentAttrs.cpp.inc"
+
+LogicalResult IntentDialect::verifyOperationAttribute(Operation *operation, NamedAttribute attribute) {
+  if (attribute.getName() != "intent.kind") return success();
+  auto function = dyn_cast<func::FuncOp>(operation);
+  if (!function || !isa<FunctionKindAttr>(attribute.getValue()))
+    return operation->emitOpError("intent.kind requires a typed source function");
+  return verifySourceInterface(function);
+}
+
+LogicalResult IntentDialect::verifyRegionArgAttribute(
+    Operation *operation, unsigned regionIndex, unsigned argumentIndex, NamedAttribute attribute) {
+  if (attribute.getName() != sourceParameterAttr) return success();
+  auto function = dyn_cast<func::FuncOp>(operation);
+  if (!function || regionIndex != 0 || argumentIndex >= function.getNumArguments() ||
+      !function->getAttrOfType<FunctionKindAttr>("intent.kind") ||
+      !isa<ParameterAttr>(attribute.getValue()))
+    return operation->emitOpError("intent.parameter must declare a source function argument");
+  return success();
+}
 
 void IntentDialect::initialize() {
   addAttributes<
@@ -247,9 +267,9 @@ LogicalResult ViewConstraintsAttr::verify(
 
 LogicalResult ParameterAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, StringAttr name,
-    uint32_t kind) {
-  if (!name || name.getValue().empty() || kind > 3)
-    return emitError() << "parameter requires a name and canonical role";
+    int64_t originId) {
+  if (!name || name.getValue().empty() || originId < 0)
+    return emitError() << "parameter requires a name and non-negative source origin";
   return success();
 }
 

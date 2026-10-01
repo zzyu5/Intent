@@ -41,8 +41,8 @@ class PreparedCall:
         import torch
 
         with self.program.invocation_context():
-            if torch.cuda.current_device() != self.program.interface.device:
-                with torch.cuda.device(self.program.interface.device):
+            if torch.cuda.current_device() != self.program.device:
+                with torch.cuda.device(self.program.device):
                     return self._invoke()
             return self._invoke()
 
@@ -59,8 +59,10 @@ class PreparedCall:
 
 
 class GPUProgram:
-    def __init__(self, interface: GPUInterface, provider: Provider) -> None:
-        self.interface = interface
+    def __init__(self, interface: GPUInterface, provider: Provider, device: int) -> None:
+        self.interface = interface.public
+        self.binding = interface
+        self.device = device
         self.provider = provider
         self.artifact: CompiledArtifact | None = None
         self.invocation_context = nullcontext
@@ -68,7 +70,7 @@ class GPUProgram:
     def prepare(self, *arguments, outputs: tuple | None = None,
                 explicit_outputs: bool = False) -> PreparedCall:
         with self.invocation_context():
-            invocation = self.interface.bind(arguments, outputs=outputs, explicit_outputs=explicit_outputs)
+            invocation = self.binding.bind(arguments, device=self.device, outputs=outputs, explicit_outputs=explicit_outputs)
         return PreparedCall(self, invocation)
 
     def prepare_call(self, arguments: tuple, *, outputs: tuple | None = None) -> PreparedCall:
@@ -83,7 +85,7 @@ class GPUProgram:
         return self.prepare(*arguments, explicit_outputs=True).launch()
 
     def tuning_configurations(self, *arguments):
-        invocation = self.interface.bind(arguments, explicit_outputs=True)
+        invocation = self.binding.bind(arguments, device=self.device, explicit_outputs=True)
         return self.provider.tuning_configurations(invocation)
 
 
@@ -92,10 +94,10 @@ def materialize_gpu_program(*, provider_name: str, provider_type, source: str,
                             device: int, backend_ir_collector=None) -> CompiledArtifact:
     if metadata["provider"] != provider_name:
         raise ValueError(f"{provider_name} runtime cannot load {metadata['provider']} metadata")
-    interface = GPUInterface(metadata, device)
+    interface = GPUInterface(metadata)
     namespace = load_python_source(target_name=provider_name, source=source, entry_name=entry_name)
     provider = provider_type(interface, namespace, metadata[provider_name])
-    program = GPUProgram(interface, provider)
+    program = GPUProgram(interface, provider, device)
     artifact = CompiledArtifact(source=source, mlir=module_text, device=device,
                                 runtime=program,
                                 _backend_ir_collector=backend_ir_collector)

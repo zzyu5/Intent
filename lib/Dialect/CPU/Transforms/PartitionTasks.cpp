@@ -86,7 +86,7 @@ LogicalResult exposeStructuredWorksets(func::FuncOp function, const Implementati
                                       ArrayRef<Value> leadingExtents) {
   AliasAnalysis aliases(function);
   PhysicalProgramAnalysis analysis(function);
-  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
   auto disjoint = [&](Value left, Value right) {
     if (aliases.alias(left, right).isNo()) return true;
     auto lhs = analysis.externalView(left), rhs = analysis.externalView(right);
@@ -200,7 +200,7 @@ LogicalResult partition(scf::ParallelOp root, int64_t grain) {
   auto function = root->getParentOfType<func::FuncOp>();
   DominanceInfo dominance(function);
   PhysicalProgramAnalysis analysis(function);
-  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
   auto rectangular = [&](scf::ParallelOp parallel) {
     for (auto [begin, end, step] : llvm::zip(parallel.getLowerBound(), parallel.getUpperBound(), parallel.getStep()))
       if (!matchPattern(begin, m_Zero()) || !matchPattern(step, m_One()) || !dominance.dominates(end, root))
@@ -336,7 +336,7 @@ LogicalResult partition(scf::ParallelOp root, int64_t grain) {
 
 void foldDisjointCompareExchange(func::FuncOp function, scf::ParallelOp root) {
   if (root->getBlock() != &function.front() || root.getNumLoops() != 1 || root.getNumResults()) return;
-  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
   if (!interface || !interface.getDisjointOutputs()) return;
   SmallVector<AtomicCompareExchangeOp> exchanges;
   root.walk([&](AtomicCompareExchangeOp operation) { exchanges.push_back(operation); });
@@ -417,7 +417,7 @@ void foldDisjointCompareExchange(func::FuncOp function, scf::ParallelOp root) {
 scf::ParallelOp partitionAtomicRows(func::FuncOp function, scf::ParallelOp root, int64_t grain) {
   if (root->getBlock() != &function.front() || root.getNumLoops() != 1 || root.getNumResults() ||
       !matchPattern(root.getLowerBound()[0], m_Zero()) || !matchPattern(root.getStep()[0], m_One())) return {};
-  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
   if (!interface || !interface.getDisjointOutputs()) return {};
   SmallVector<AtomicRMWOp> updates;
   root.walk([&](AtomicRMWOp update) { updates.push_back(update); });

@@ -11,6 +11,8 @@
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/IR/ProgramInterface.h"
+#include "Intent/Dialect/Intent/IR/Interface.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/Intent/IR/IntentAttrs.h"
 #include "Intent/Dialect/Intent/IR/IntentOps.h"
@@ -80,9 +82,11 @@ PhysicalExprAttr parameterExpression(MLIRContext *context, StringRef name) {
   return expression(context, PhysicalExprKind::Parameter, 0, name);
 }
 
-PhysicalExprAttr dimensionExpression(MLIRContext *context, int64_t dimension) {
-  return expression(context, PhysicalExprKind::Dimension, dimension,
-                    ("D" + Twine(dimension)).str());
+PhysicalExprAttr dimensionExpression(func::FuncOp function, int64_t dimension) {
+  return PhysicalExprAttr::get(function.getContext(), PhysicalExprKind::Dimension,
+      dimension, gpu::ArgumentRefAttr::get(function.getContext(),
+          function.getNumArguments() + dimension),
+      ArrayAttr::get(function.getContext(), {}));
 }
 
 PhysicalExprAttr binaryExpression(MLIRContext *context, PhysicalExprKind kind,
@@ -554,14 +558,13 @@ struct MetadataBinding {
   int64_t dimension;
   unsigned sourceABI;
   unsigned sourceAxis;
-  std::string name;
 };
 
 struct PhysicalABI {
   SmallVector<Type> arguments;
   SmallVector<DictionaryAttr> argumentAttrs;
-  SmallVector<unsigned> physicalArgumentForSource;
-  SmallVector<unsigned> viewPhysicalArguments;
+  SmallVector<std::optional<unsigned>> physicalArgumentForSource;
+  InterfaceAttr interface;
   llvm::DenseMap<int64_t, MetadataBinding> dimensions;
   SmallVector<int64_t> dimensionOrder;
 };
@@ -571,64 +574,57 @@ FailureOr<PhysicalABI> buildPhysicalABI(func::FuncOp function,
   PhysicalABI result;
   MLIRContext *context = function.getContext();
   Block &sourceEntry = function.getBody().front();
-  auto parameterSchema =
-      function->getAttrOfType<ArrayAttr>("intent.parameters");
-  auto parameterNodes =
-      function->getAttrOfType<ArrayAttr>("intent.parameter_nodes");
-  if (!parameterSchema || !parameterNodes ||
-      parameterSchema.size() != sourceEntry.getNumArguments() ||
-      parameterNodes.size() != sourceEntry.getNumArguments())
-    return function.emitError("canonical ABI parameter schema is missing");
+
+  auto interface = buildPublicInterface(function);
+  if (failed(interface)) return failure();
+  result.interface = *interface;
+  // Source argument identities and logical dimension identities occupy disjoint
+  // ranges. Neither is a physical slot; later appends allocate fresh identities.
+  uint64_t nextReference = sourceEntry.getNumArguments() + 1;
+  for (BlockArgument argument : sourceEntry.getArguments())
+    if (auto tensor = viewTensor(argument))
+      if (auto ids = dimensionIds(tensor))
+        for (int64_t identity : ids.asArrayRef())
+          nextReference = std::max(nextReference,
+              uint64_t(sourceEntry.getNumArguments()) + identity + 1);
+  SmallVector<std::pair<Type, DictionaryAttr>> strideArguments;
+  auto bindingAttrs = [&](gpu::ArgumentBindingAttr binding) {
+    return builder.getDictionaryAttr({builder.getNamedAttr(gpu::argumentBindingAttr, binding)});
+  };
+  unsigned publicOrdinal = 0;
 
   for (auto [abi, argument] : llvm::enumerate(sourceEntry.getArguments())) {
-    auto parameter = cast<ParameterAttr>(parameterSchema[abi]);
-    std::string name = parameter.getName().getValue().str();
+    auto parameter = getSourceParameter(argument);
+    if (!parameter)
+      return function.emitError("canonical argument has no source parameter binding");
+    if (isa<ConstexprType>(argument.getType())) {
+      if (!argument.use_empty())
+        return function.emitError("constexpr parameter must be specialized before physical construction");
+      result.physicalArgumentForSource.push_back(std::nullopt);
+      continue;
+    }
     result.physicalArgumentForSource.push_back(result.arguments.size());
+    auto reference = gpu::ArgumentRefAttr::get(context, abi + 1);
+    auto binding = gpu::ArgumentBindingAttr::get(context, reference,
+        gpu::ArgumentKind::Public, builder.getI64IntegerAttr(publicOrdinal++),
+        gpu::ArgumentRefAttr{}, IntegerAttr{}, IntegerAttr{});
+    result.argumentAttrs.push_back(bindingAttrs(binding));
     auto logicalView = dyn_cast<ViewType>(argument.getType());
     if (!logicalView) {
       Type physicalType = argument.getType();
-      StringRef kind;
-      if (parameter.getKind() == 1) {
-        if (!isa<IntegerType, IndexType, FloatType>(physicalType))
-          return function.emitError(
-              "runtime scalar ABI parameter has a non-scalar type");
-        kind = "scalar";
-      } else if (parameter.getKind() == 2) {
-        auto constexprType = dyn_cast<ConstexprType>(physicalType);
-        if (!constexprType)
-          return function.emitError(
-              "constexpr ABI parameter lost its canonical wrapper type");
-        physicalType = constexprType.getValueType();
-        if (auto enumeration = dyn_cast<EnumType>(physicalType))
-          physicalType = builder.getI64Type();
-        if (!isa<IntegerType, IndexType, FloatType>(physicalType))
-          return function.emitError(
-              "constexpr ABI payload is not a scalar provider value");
-        kind = "constexpr";
-      } else if (parameter.getKind() == 3) {
-        if (!isa<IntegerType, IndexType, FloatType>(physicalType))
-          return function.emitError(
-              "kernel value ABI requires an explicit scalar value");
-        kind = "value";
-      } else {
-        return function.emitError("canonical ABI parameter kind is unsupported");
-      }
+      if (!isa<IntegerType, IndexType, FloatType>(physicalType))
+        return function.emitError("runtime scalar ABI parameter has a non-scalar type");
       result.arguments.push_back(physicalType);
-      result.argumentAttrs.push_back(builder.getDictionaryAttr({
-          builder.getNamedAttr(gpu::abiKindAttr, builder.getStringAttr(kind)),
-          builder.getNamedAttr(gpu::abiNameAttr, builder.getStringAttr(name)),
-      }));
       continue;
     }
     auto tensor = dyn_cast<RankedTensorType>(logicalView.getTensor());
-    auto parameterNode = dyn_cast<IntegerAttr>(parameterNodes[abi]);
     DenseI64ArrayAttr canonicalIds =
         tensor ? dimensionIds(tensor) : DenseI64ArrayAttr();
-    if (!tensor || !parameterNode || parameterNode.getInt() < 0 ||
+    if (!tensor || parameter.getOriginId() < 0 ||
         (canonicalIds && canonicalIds.size() != tensor.getRank()))
       return function.emitError(
           "view lost canonical source or dimension identities");
-    uint64_t sourceId = static_cast<uint64_t>(parameterNode.getInt()) + 1;
+    uint64_t sourceId = static_cast<uint64_t>(parameter.getOriginId()) + 1;
     SmallVector<int64_t> ids(tensor.getRank(), 0);
     if (canonicalIds)
       llvm::copy(canonicalIds.asArrayRef(), ids.begin());
@@ -636,23 +632,25 @@ FailureOr<PhysicalABI> buildPhysicalABI(func::FuncOp function,
       if (tensor.isDynamicDim(axis) && ids[axis] <= 0)
         return function.emitError(
             "dynamic view axis lost its canonical dimension identity");
-    result.viewPhysicalArguments.push_back(result.arguments.size());
     SmallVector<Attribute> strides;
     SmallVector<Attribute> extents;
     for (unsigned axis = 0; axis < static_cast<unsigned>(tensor.getRank()); ++axis) {
-      std::string stride = ("S" + Twine(abi) + "_" + Twine(axis)).str();
-      strides.push_back(StringAttr::get(context, stride));
+      auto strideReference = gpu::ArgumentRefAttr::get(context, nextReference++);
+      strides.push_back(PhysicalExprAttr::get(context, PhysicalExprKind::ScalarABI,
+          0, strideReference, builder.getArrayAttr({})));
+      strideArguments.emplace_back(builder.getIndexType(), bindingAttrs(
+          gpu::ArgumentBindingAttr::get(context, strideReference, gpu::ArgumentKind::Stride,
+              IntegerAttr{}, reference, builder.getI64IntegerAttr(axis), IntegerAttr{})));
       int64_t dimension = ids[axis];
       extents.push_back(
           tensor.isDynamicDim(axis)
-              ? Attribute(dimensionExpression(context, dimension))
+              ? Attribute(dimensionExpression(function, dimension))
               : Attribute(expression(context, PhysicalExprKind::Constant,
                                      tensor.getDimSize(axis))));
       if (dimension > 0) {
         auto [binding, inserted] = result.dimensions.try_emplace(
             dimension,
-            MetadataBinding{dimension, static_cast<unsigned>(abi), axis,
-                            ("D" + Twine(dimension)).str()});
+            MetadataBinding{dimension, static_cast<unsigned>(abi), axis});
         // Automatic output allocation must derive shared dimensions from an
         // input, including inputs declared after the output in the source ABI.
         if (!inserted && logicalView.getAccess() != 1 &&
@@ -663,19 +661,13 @@ FailureOr<PhysicalABI> buildPhysicalABI(func::FuncOp function,
         }
       }
     }
-    auto constraints = logicalView.getConstraints();
     auto layout = gpu::ViewLayoutAttr::get(
         context, ArrayAttr::get(context, extents),
-        DenseI64ArrayAttr::get(context, ids), true,
-        ArrayAttr::get(context, strides),
-        constraints.getAlias(), constraints.getNoalias());
+        DenseI64ArrayAttr::get(context, ids),
+        ArrayAttr::get(context, strides));
     result.arguments.push_back(gpu::ViewType::get(
-        context, tensor.getElementType(), tensor.getRank(), logicalView.getAccess(),
-        abi, sourceId, layout));
-    result.argumentAttrs.push_back(builder.getDictionaryAttr({
-        builder.getNamedAttr(gpu::abiKindAttr, builder.getStringAttr("view")),
-        builder.getNamedAttr(gpu::abiNameAttr, builder.getStringAttr(name)),
-    }));
+        context, tensor.getElementType(), logicalView.getAccess(),
+        sourceId, layout));
   }
 
   for (auto &entry : result.dimensions)
@@ -684,36 +676,15 @@ FailureOr<PhysicalABI> buildPhysicalABI(func::FuncOp function,
   for (int64_t dimension : result.dimensionOrder) {
     MetadataBinding &binding = result.dimensions.find(dimension)->second;
     result.arguments.push_back(builder.getIndexType());
-    result.argumentAttrs.push_back(builder.getDictionaryAttr({
-        builder.getNamedAttr(gpu::abiKindAttr,
-                             builder.getStringAttr("dimension")),
-        builder.getNamedAttr(gpu::abiNameAttr,
-                             builder.getStringAttr(binding.name)),
-        builder.getNamedAttr(gpu::dimensionAttr,
-                             builder.getI64IntegerAttr(dimension)),
-        builder.getNamedAttr(gpu::sourceABIAttr,
-                             builder.getI64IntegerAttr(binding.sourceABI)),
-        builder.getNamedAttr(gpu::sourceAxisAttr,
-                             builder.getI64IntegerAttr(binding.sourceAxis)),
-    }));
+    result.argumentAttrs.push_back(bindingAttrs(gpu::ArgumentBindingAttr::get(
+        context, dimensionExpression(function, dimension).getArgumentReference(),
+        gpu::ArgumentKind::Dimension, IntegerAttr{},
+        gpu::ArgumentRefAttr::get(context, binding.sourceABI + 1),
+        builder.getI64IntegerAttr(binding.sourceAxis), builder.getI64IntegerAttr(dimension))));
   }
-  for (auto [abi, argument] : llvm::enumerate(sourceEntry.getArguments())) {
-    auto tensor = viewTensor(argument);
-    if (!tensor)
-      continue;
-    for (unsigned axis = 0; axis < static_cast<unsigned>(tensor.getRank()); ++axis) {
-      result.arguments.push_back(builder.getIndexType());
-      std::string name = ("S" + Twine(abi) + "_" + Twine(axis)).str();
-      result.argumentAttrs.push_back(builder.getDictionaryAttr({
-          builder.getNamedAttr(gpu::abiKindAttr,
-                               builder.getStringAttr("stride")),
-          builder.getNamedAttr(gpu::abiNameAttr, builder.getStringAttr(name)),
-          builder.getNamedAttr(gpu::sourceABIAttr,
-                               builder.getI64IntegerAttr(abi)),
-          builder.getNamedAttr(gpu::sourceAxisAttr,
-                               builder.getI64IntegerAttr(axis)),
-      }));
-    }
+  for (auto [type, attributes] : strideArguments) {
+    result.arguments.push_back(type);
+    result.argumentAttrs.push_back(attributes);
   }
   return result;
 }
@@ -726,19 +697,13 @@ FailureOr<PhysicalExprAttr> launchExpression(Value value,
     auto argument = dyn_cast<BlockArgument>(value);
     if (!argument || !function || argument.getOwner() != &function.getBody().front())
       return failure();
-    auto schema = function->getAttrOfType<ArrayAttr>("intent.parameters");
-    if (!schema || argument.getArgNumber() >= schema.size())
-      return failure();
-    auto parameter = dyn_cast<ParameterAttr>(schema[argument.getArgNumber()]);
-    if (!parameter || (parameter.getKind() != 1 && parameter.getKind() != 2))
-      return failure();
+    if (!getSourceParameter(argument)) return failure();
     Type type = value.getType();
-    if (auto constexprType = dyn_cast<ConstexprType>(type))
-      type = constexprType.getValueType();
     if (!isa<IntegerType, IndexType>(type))
       return failure();
-    return expression(context, PhysicalExprKind::ScalarABI, 0,
-                      parameter.getName().getValue());
+    return PhysicalExprAttr::get(context, PhysicalExprKind::ScalarABI, 0,
+        gpu::ArgumentRefAttr::get(context, argument.getArgNumber() + 1),
+        ArrayAttr::get(context, {}));
   }
   if (!definition)
     return failure();
@@ -755,7 +720,7 @@ FailureOr<PhysicalExprAttr> launchExpression(Value value,
       return expression(context, PhysicalExprKind::Constant,
                         tensor.getDimSize(dim.getAxis()));
     if (tensor && dim.getDimension() > 0)
-      return dimensionExpression(context, dim.getDimension());
+      return dimensionExpression(function, dim.getDimension());
     if (auto domain = dim.getSource().getDefiningOp<intent::DomainOp>()) {
       FailureOr<PhysicalExprAttr> start =
           launchExpression(domain.getBounds()[0], function);
@@ -820,7 +785,7 @@ FailureOr<PhysicalExprAttr> launchExpression(Value value,
 FailureOr<PhysicalExprAttr> logicalDimensionExpression(func::FuncOp function,
                                                       int64_t dimension) {
   PhysicalExprAttr identity =
-      dimensionExpression(function.getContext(), dimension);
+      dimensionExpression(function, dimension);
   PhysicalExprAttr resolved;
   bool conflict = false;
   auto observe = [&](Value value) {
@@ -1624,18 +1589,14 @@ private:
                                        : FailureOr<Value>(found->second);
     }
     if (kind == PhysicalExprKind::Parameter) {
-      auto found = parameters.find(expression.getSymbolName());
+      auto found = parameters.find(expression.getParameterReference().getName());
       return found == parameters.end() ? FailureOr<Value>(failure())
                                        : FailureOr<Value>(found->second);
     }
     func::FuncOp function = physicalKernel;
     if (kind == PhysicalExprKind::ScalarABI) {
-      for (BlockArgument argument : function.getArguments()) {
-        auto name = function.getArgAttrOfType<StringAttr>(
-            argument.getArgNumber(), gpu::abiNameAttr);
-        if (name == expression.getSymbolName())
-          return Value(argument);
-      }
+      if (auto argument = gpu::resolveArgument(function, expression.getArgumentReference()))
+        return Value(argument);
       return failure();
     }
     return Value(builder.create<gpu::PhysicalExprOp>(
@@ -5401,6 +5362,7 @@ LogicalResult constructGPUProgram(ModuleOp module,
       capabilities.nativeFragmentGather);
   SmallVector<NamedAttribute> functionAttrs{
       builder.getNamedAttr(gpu::kernelAttr, builder.getUnitAttr()),
+      builder.getNamedAttr(interfaceAttr, abi->interface),
       builder.getNamedAttr(gpu::parametersAttr, builder.getArrayAttr({})),
       builder.getNamedAttr(gpu::capabilitiesAttr, capabilityAttr),
       builder.getNamedAttr(gpu::programSpaceAttr,
@@ -5420,17 +5382,17 @@ LogicalResult constructGPUProgram(ModuleOp module,
   llvm::DenseMap<StringAttr, Value> parameterValues;
   SmallVector<Value> sourceArguments;
   sourceArguments.reserve(abi->physicalArgumentForSource.size());
-  for (unsigned physicalIndex : abi->physicalArgumentForSource)
-    sourceArguments.push_back(entry->getArgument(physicalIndex));
+  for (std::optional<unsigned> physicalIndex : abi->physicalArgumentForSource)
+    sourceArguments.push_back(physicalIndex ? Value(entry->getArgument(*physicalIndex)) : Value{});
   llvm::DenseMap<int64_t, Value> dimensionValues;
-  unsigned metadataOffset = abi->physicalArgumentForSource.size();
+  unsigned metadataOffset = abi->interface.getArguments().size();
   for (auto [offset, dimension] : llvm::enumerate(abi->dimensionOrder))
     dimensionValues[dimension] = entry->getArgument(metadataOffset + offset);
 
   llvm::DenseMap<Value, Value> values;
   for (auto [logical, physicalView] : llvm::zip(
            function.getBody().front().getArguments(), sourceArguments))
-    values[logical] = physicalView;
+    if (physicalView) values[logical] = physicalView;
   for (Operation &operation : function.getBody().front()) {
     if (auto constant = dyn_cast<intent::ConstantOp>(operation)) {
       FailureOr<Value> value = gpu::materializeScalarConstant(

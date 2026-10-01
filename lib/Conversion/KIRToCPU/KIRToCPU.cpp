@@ -64,16 +64,13 @@ public:
       : analysis(original), module(physical), builder(physical.getContext()), entryLayout(entryLayout) {}
 
   LogicalResult lower(func::FuncOp source) {
-    auto parameters = source->getAttrOfType<ArrayAttr>("intent.parameters");
-    if (!parameters || parameters.size() != source.getNumArguments())
-      return source.emitError("CPU construction requires canonical parameter metadata");
     SmallVector<Type> types;
-    SmallVector<Attribute> interface;
+    auto interface = buildPublicInterface(source);
+    if (failed(interface)) return failure();
     SmallVector<Value> runtimeArguments;
-    for (auto [i, argument] : llvm::enumerate(source.getArguments())) {
-      auto parameter = cast<ParameterAttr>(parameters[i]);
-      if (parameter.getKind() == 2) {
-        if (!isa<ConstexprType>(argument.getType()) || !argument.use_empty())
+    for (BlockArgument argument : source.getArguments()) {
+      if (isa<ConstexprType>(argument.getType())) {
+        if (!argument.use_empty())
           return source.emitError("CPU physical ABI requires fully specialized constexpr parameters");
         continue;
       }
@@ -120,18 +117,11 @@ public:
         if (!shape)
           return source.emitError("CPU view is missing canonical dimension identities");
         types.push_back(memory);
-        interface.push_back(cpu::ViewArgumentAttr::get(builder.getContext(),
-            parameter.getName(), tensor.getElementType(),
-            builder.getDenseI64ArrayAttr(tensor.getShape()), shape.getDimensions(),
-            builder.getArrayAttr(constraints), view.getAccess(), view.getConstraints().getAlias(),
-            view.getConstraints().getNoalias()));
       } else if (argument.getType().isF32() || argument.getType().isF64() || argument.getType().isIndex() ||
                  argument.getType().isInteger(8) || argument.getType().isInteger(16) ||
                  argument.getType().isInteger(32) || argument.getType().isInteger(64) ||
                  argument.getType().isInteger(1)) {
         types.push_back(argument.getType());
-        interface.push_back(cpu::ScalarArgumentAttr::get(builder.getContext(),
-            parameter.getName(), argument.getType()));
       } else {
         return source.emitError("CPU construction does not implement this parameter type");
       }
@@ -139,8 +129,9 @@ public:
     builder.setInsertionPointToEnd(module.getBody());
     function = builder.create<func::FuncOp>(source.getLoc(), source.getName(),
                                            builder.getFunctionType(types, {}));
-    function->setAttr("intent_cpu.interface", cpu::InterfaceAttr::get(
-        builder.getContext(), builder.getArrayAttr(interface), entryLayout == CPUEntryLayout::Contiguous, true));
+    function->setAttr(interfaceAttr, *interface);
+    function->setAttr(cpu::entryRequirementsAttr, cpu::EntryRequirementsAttr::get(
+        builder.getContext(), entryLayout == CPUEntryLayout::Contiguous, true));
     function.addEntryBlock();
     builder.setInsertionPointToStart(&function.front());
     for (auto [oldValue, newValue] : llvm::zip(runtimeArguments, function.getArguments())) {

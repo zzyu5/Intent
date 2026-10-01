@@ -221,7 +221,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
           diagnostic << " " << user->getName();
           if (auto load = dyn_cast<gpu::LoadOp>(user)) {
             if (auto view = dyn_cast<gpu::ViewType>(load.getResource().getType()))
-              diagnostic << "(abi=" << view.getAbiIndex() << ",source_axes=["
+              diagnostic << "(source=" << view.getSourceId() << ",source_axes=["
                          << load.getSourceAxes() << "])";
             for (Operation *loadUser : load.getResult().getUsers()) {
               diagnostic << "->" << loadUser->getName();

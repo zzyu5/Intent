@@ -58,11 +58,11 @@ class TileLangProgram:
         values = invocation.values
         key = (tuple((tuple(view.shape), tuple(view.stride()), view.dtype, view.device)
                      for view in invocation.views),
-               tuple(values[scalar.kernel_name] for scalar in self.interface.scalars),
+               tuple(values[scalar.id] for scalar in self.interface.scalars),
                tuple(values[entry["name"]] for entry in self.interface.overlaps))
-        arguments = tuple(values[name] for name in self.facts["kernel_arguments"])
+        arguments = tuple(self.interface.native_value(name, values) for name in self.facts["kernel_arguments"])
         if key not in self._winners:
-            bindings = {name: values[name] for name in self.facts["builder_arguments"]
+            bindings = {name: self.interface.native_value(name, values) for name in self.facts["builder_arguments"]
                         if name not in self.configurations.bound_names}
             self._winners[key] = tune_kernel(self.kernel, list(self.configurations.candidates(values)), bindings,
                                              arguments, tuple(view.writable for view in self.interface.views))

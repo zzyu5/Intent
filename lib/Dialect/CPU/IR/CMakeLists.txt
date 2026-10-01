@@ -4,6 +4,7 @@ add_mlir_dialect_library(MLIRIntentCPUDialect
   CPUOpInterfaces.cpp
   DEPENDS IntentCPUIncGen
   LINK_LIBS PUBLIC
+  MLIRIntentDialect
   MLIRArithDialect
   MLIRFuncDialect
   MLIRLinalgDialect

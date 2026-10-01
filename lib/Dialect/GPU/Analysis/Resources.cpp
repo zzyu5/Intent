@@ -31,7 +31,7 @@ PhysicalExprAttr reductionRegisterFootprint(ValueRange sources,
       [&](PhysicalExprAttr extent) {
     if (extent.getKind() ==
         PhysicalExprKind::Parameter) {
-      auto parameter = queryParameterBySymbol(kernel, extent.getSymbolName());
+      auto parameter = queryParameterBySymbol(kernel, extent.getParameterReference().getName());
       if (failed(parameter))
         return false;
       auto role = parameter->getRole();
@@ -114,7 +114,7 @@ FragmentResourceAnalysis::FragmentResourceAnalysis(func::FuncOp kernel) {
       parameters.addWalk([&](PhysicalExprAttr expression) {
         if (expression.getKind() ==
             PhysicalExprKind::Parameter)
-          symbols.insert(expression.getSymbolName());
+          symbols.insert(expression.getParameterReference().getName());
       });
       parameters.walk(fragment.getShape());
       for (StringAttr name : symbols)

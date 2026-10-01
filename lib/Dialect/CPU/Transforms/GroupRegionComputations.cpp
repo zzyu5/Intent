@@ -36,7 +36,7 @@ struct RegionGroup {
     if (!parallel.getNumLoops() || parallel.getNumResults() ||
         getConstantIntValue(parallel.getLowerBound().back()) != 0 ||
         getConstantIntValue(parallel.getStep().back()) != 1) return false;
-    auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+    auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
     if (!interface || !interface.getDisjointOutputs()) return false;
     for (auto candidate : parallel.getBody()->getOps<RegionFoldOp>()) {
       if (fold) return false;

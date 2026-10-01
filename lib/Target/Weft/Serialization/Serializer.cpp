@@ -13,38 +13,6 @@ namespace wk = ::weft::kernel;
 namespace intent::weft_provider {
 namespace {
 
-llvm::json::Array integers(DenseI64ArrayAttr entries) {
-  llvm::json::Array result;
-  for (int64_t entry : entries.asArrayRef()) result.push_back(entry);
-  return result;
-}
-
-FailureOr<llvm::json::Array> serializeParameters(func::FuncOp function) {
-  auto interface = function->getAttrOfType<cpu::InterfaceAttr>("intent_cpu.interface");
-  llvm::json::Array parameters;
-  for (auto [index, parameter] : llvm::enumerate(interface.getArguments())) {
-    if (auto view = dyn_cast<cpu::ViewArgumentAttr>(parameter)) {
-      Type element = view.getElementType();
-      std::string dtype;
-      if (element.isF32()) dtype = "f32";
-      else if (auto integer = dyn_cast<IntegerType>(element))
-        dtype = (integer.isUnsigned() ? "u" : "i") + std::to_string(integer.getWidth());
-      else return function.emitError("CPU view has no Weft native dtype"), failure();
-      auto alignment = function.getArgAttrOfType<ArgumentAlignmentAttr>(index, argumentAlignmentAttr);
-      parameters.push_back(llvm::json::Object{{"name", view.getName().getValue().str()},
-          {"kind", "view"}, {"dtype", dtype},
-          {"shape", integers(view.getShape())}, {"dimensions", integers(view.getDimensions())},
-          {"alignment", alignment.getBytes()}, {"access", view.getAccess()},
-          {"alias", view.getAlias().getValue().str()}, {"noalias", view.getNoalias()}});
-    } else {
-      auto scalar = cast<cpu::ScalarArgumentAttr>(parameter);
-      parameters.push_back(llvm::json::Object{{"name", scalar.getName().getValue().str()},
-          {"kind", "scalar"}, {"dtype", scalar.getType().isF32() ? "f32" : "i64"}});
-    }
-  }
-  return std::move(parameters);
-}
-
 llvm::json::Object serializeCandidate(func::FuncOp function) {
   auto config = function->getAttrOfType<cpu::ConfigurationAttr>("intent_cpu.configuration");
   llvm::json::Array implementations;
@@ -88,9 +56,11 @@ LogicalResult serializeProgram(ModuleOp program, std::string &source, std::strin
   SmallVector<func::FuncOp> candidates;
   for (auto function : modules->host.getOps<func::FuncOp>())
     if (!function.isExternal()) candidates.push_back(function);
-  auto parameters = serializeParameters(candidates.front());
+  auto interface = getPublicInterface(candidates.front());
+  auto parameters = serializePublicInterface(candidates.front(), interface);
+  auto nativeABI = queryHostABI(candidates.front());
   auto tasks = serializeTasks(program);
-  if (failed(parameters) || failed(tasks)) return failure();
+  if (failed(parameters) || failed(tasks) || failed(nativeABI)) return failure();
   llvm::json::Array configurations;
   for (auto function : candidates) configurations.push_back(serializeCandidate(function));
   std::string hostSource;
@@ -99,7 +69,14 @@ LogicalResult serializeProgram(ModuleOp program, std::string &source, std::strin
   llvm::raw_string_ostream output(source);
   modules->device.print(output, OpPrintingFlags().enableDebugInfo());
   output << '\n';
-  auto interface = candidates.front()->getAttrOfType<cpu::InterfaceAttr>("intent_cpu.interface");
+  auto requirements = candidates.front()->getAttrOfType<cpu::EntryRequirementsAttr>(cpu::entryRequirementsAttr);
+  llvm::json::Array alignments;
+  for (unsigned index = 0; index < interface.getArguments().size(); ++index) {
+    if (getPublicView(interface, index))
+      alignments.push_back(candidates.front().getArgAttrOfType<ArgumentAlignmentAttr>(
+          index, argumentAlignmentAttr).getBytes());
+    else alignments.push_back(nullptr);
+  }
   auto capabilities = modules->host->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities");
   llvm::raw_string_ostream metadataStream(metadata);
   metadataStream << llvm::json::Value(llvm::json::Object{{"kind", "weft-generation"},
@@ -109,9 +86,11 @@ LogicalResult serializeProgram(ModuleOp program, std::string &source, std::strin
           {"workers", capabilities.getWorkers()},
           {"private_bytes", capabilities.getPrivateBytes()},
           {"matrix_i8_i32", capabilities.getMatrixI8I32()}}},
-      {"native", false}, {"host_source", hostSource}, {"tasks", std::move(*tasks)},
-      {"parameters", std::move(*parameters)}, {"candidates", std::move(configurations)},
-      {"contiguous_views", interface.getContiguousViews()}, {"disjoint_outputs", interface.getDisjointOutputs()}});
+      {"host_source", hostSource}, {"tasks", std::move(*tasks)},
+      {"interface", std::move(*parameters)}, {"candidates", std::move(configurations)},
+      {"native", llvm::json::Object{{"contiguous_views", requirements.getContiguousViews()},
+          {"disjoint_outputs", requirements.getDisjointOutputs()}, {"alignments", std::move(alignments)},
+          {"slots", nativeABI->serialize()}}}});
   return success();
 }
 

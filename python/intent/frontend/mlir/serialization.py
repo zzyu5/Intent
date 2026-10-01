@@ -4,7 +4,7 @@ from collections.abc import Iterable
 
 from ..semantics.types import ValueType
 from .attributes import FunctionKindAttribute, ParameterAttribute, emit_dictionary
-from .state import EmittedOperation, FunctionKind, FunctionState, MlirValue, ParameterKind, RegionState
+from .state import EmittedOperation, FunctionKind, FunctionState, MlirValue, RegionState
 from .types import DimensionID, emit_type, emit_view_type, quote
 
 
@@ -30,14 +30,14 @@ class AssemblyPrinter:
         prefix = "  " * indent
         if len(function.body.blocks) != 1:
             raise NotImplementedError("Intent functions require one entry block")
-        arguments = ", ".join(self.argument(parameter.value) for parameter in function.parameters)
+        arguments = ", ".join(
+            self.argument(parameter.value) + " " + emit_dictionary({
+                "intent.parameter": ParameterAttribute(parameter.spec.name, parameter.value.id),
+            })
+            for parameter in function.parameters
+        )
         attributes = {
             "intent.kind": FunctionKindAttribute(0 if function.kind is FunctionKind.KERNEL else 1),
-            "intent.parameters": [
-                ParameterAttribute(parameter.spec.name, list(ParameterKind).index(parameter.spec.kind))
-                for parameter in function.parameters
-            ],
-            "intent.parameter_nodes": [parameter.value.id for parameter in function.parameters],
             "intent.source": function.location.format(),
             **{f"intent.{key}": value for key, value in function.attributes.items()},
         }

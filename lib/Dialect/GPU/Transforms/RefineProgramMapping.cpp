@@ -46,7 +46,7 @@ void preserveBoundedTileOrigins(func::FuncOp kernel, DelinearizeOp mapping) {
       auto divisor = dyn_cast<PhysicalExprAttr>(extent.getOperands()[1]);
       if (!divisor || divisor.getKind() !=
                           PhysicalExprKind::Parameter ||
-          divisor.getSymbolName() != block.getDeclaration().getName())
+          divisor.getParameterReference().getName() != block.getDeclaration().getName())
         continue;
       for (Operation *user : coordinate.getUsers()) {
         auto product = dyn_cast<BinaryOp>(user);

@@ -1,3 +1,4 @@
+#include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "ConfigurationPolicy.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
@@ -25,15 +26,7 @@ LogicalResult materializeCoverageBound(func::FuncOp kernel, ParameterAttr parame
     PhysicalParameterBinding binding = queryParameterBinding(parameter);
     PhysicalExprAttr bound;
     if (binding.isExact() && binding.dimension)
-      for (BlockArgument argument : kernel.getArguments()) {
-        DictionaryAttr attributes =
-            kernel.getArgAttrDict(argument.getArgNumber());
-        auto kind = attributes.getAs<StringAttr>(abiKindAttr);
-        auto dimension = attributes.getAs<IntegerAttr>(dimensionAttr);
-        if (kind && kind.getValue() == "dimension" && dimension &&
-            dimension.getInt() == *binding.dimension)
-          bound = queryLaunchExpression(argument);
-      }
+      bound = queryArgumentExpression(resolveDimension(kernel, *binding.dimension));
     if (!bound) {
       kernel.emitOpError(
           "full-coverage parameter has no launch-visible bound expression");

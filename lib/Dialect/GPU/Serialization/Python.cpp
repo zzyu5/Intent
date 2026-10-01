@@ -1,10 +1,13 @@
 #include "Intent/Dialect/GPU/Serialization/Python.h"
+#include "Intent/Dialect/GPU/Analysis/ProgramInterface.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/ErrorHandling.h"
 #include <cmath>
 #include <iomanip>
@@ -13,6 +16,28 @@
 using namespace mlir;
 
 namespace intent::gpu {
+
+FailureOr<PythonSignature> PythonSignature::read(func::FuncOp kernel) {
+  auto interface = ProgramInterface::read(kernel);
+  if (failed(interface)) return failure();
+  llvm::StringSet<> names;
+  for (Attribute attribute : getParameterDeclarations(kernel))
+    names.insert(cast<ParameterAttr>(attribute).getName().getValue());
+  PythonSignature result;
+  for (const ProgramArgument &argument : interface->arguments()) {
+    std::string name = "_intent_argument_" +
+        std::to_string(argument.binding.getReference().getId());
+    while (!names.insert(name).second) name += "_";
+    PythonArgument projection{argument.value, std::move(name)};
+    if (isa<ViewType>(argument.value.getType()))
+      result.views.push_back(std::move(projection));
+    else if (argument.binding.getKind() == ArgumentKind::Public)
+      result.scalars.push_back(std::move(projection));
+    else
+      result.metadata.push_back(std::move(projection));
+  }
+  return result;
+}
 
 std::string pythonScalarType(Type type, const PythonScalarSyntax &syntax) {
   if (type.isIndex()) return (syntax.prefix + "int64").str();

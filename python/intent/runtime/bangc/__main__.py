@@ -6,6 +6,7 @@ from pathlib import Path
 
 from intent.targets.bangc import BangCTarget
 from intent.compiler.artifact import GeneratedProgram
+from intent.runtime.interface import ViewParameter
 from . import DeviceBuffer
 
 
@@ -43,12 +44,12 @@ def main() -> None:
         results = []
         # InOut buffers remain caller-owned, but the file interface exports
         # their post-call contents alongside explicitly produced Out values.
-        for parameter, value in zip(program.parameters, call.arguments):
-            if parameter["kind"] != "view" or parameter["access"] == 0:
+        for parameter, value in zip(program.interface.parameters, call.arguments):
+            if not isinstance(parameter, ViewParameter) or not parameter.writable:
                 continue
             filename = f"output{len(results)}.bin"
             (args.outputs / filename).write_bytes(value.to_host())
-            results.append({"name": parameter["name"], "file": filename,
+            results.append({"name": parameter.name, "file": filename,
                             "shape": value.shape, "dtype": value.dtype})
         (args.outputs / "outputs.json").write_text(json.dumps(results, indent=2))
         print(json.dumps({"status": "executed", "outputs": str(args.outputs / "outputs.json")}))

@@ -1,5 +1,6 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Analysis/ProgramInterface.h"
 #include "Intent/Target/TileLang/Serialization/Serializer.h"
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
@@ -33,26 +34,6 @@ std::string tileLangType(Type type) {
   return gpu::pythonScalarType(type, syntax);
 }
 
-std::string expressionString(gpu::PhysicalExprAttr expression) {
-  static const gpu::PythonExpressionSyntax syntax{
-      "T.ceildiv", "T.min", "T.max", "T.if_then_else", "T.next_power_of_2", false};
-  return gpu::pythonExpression(expression, syntax, [](gpu::PhysicalExprAttr leaf) {
-    return leaf.getSymbolName().getValue().str();
-  });
-}
-
-std::string shape(ArrayAttr extents) {
-  std::string result = "(";
-  for (auto [index, extent] : llvm::enumerate(extents)) {
-    if (index)
-      result += ", ";
-    result += expressionString(cast<gpu::PhysicalExprAttr>(extent));
-  }
-  if (extents.size() == 1)
-    result += ",";
-  return result + ")";
-}
-
 std::string literal(Attribute value) {
   return gpu::pythonLiteral(value, [](Type type) {
     std::string name = tileLangType(type);
@@ -75,11 +56,31 @@ public:
   }
 
 private:
-  using ViewABI = gpu::ViewArgument;
-  using ScalarABI = gpu::ScalarArgument;
-  using MetadataABI = gpu::MetadataArgument;
+  std::string expressionString(gpu::PhysicalExprAttr expression) {
+    static const gpu::PythonExpressionSyntax syntax{
+        "T.ceildiv", "T.min", "T.max", "T.if_then_else", "T.next_power_of_2", false};
+    return gpu::pythonExpression(expression, syntax, [&](gpu::PhysicalExprAttr leaf) {
+      if (leaf.getKind() == gpu::PhysicalExprKind::Parameter)
+        return leaf.getParameterReference().getName().getValue().str();
+      return valueString(gpu::resolveArgument(kernel, leaf.getArgumentReference()));
+    });
+  }
+
+  std::string shape(ArrayAttr extents) {
+    std::string result = "(";
+    for (auto [index, extent] : llvm::enumerate(extents)) {
+      if (index) result += ", ";
+      result += expressionString(cast<gpu::PhysicalExprAttr>(extent));
+    }
+    if (extents.size() == 1) result += ",";
+    return result + ")";
+  }
+
+  using ViewABI = gpu::PythonArgument;
+  using ScalarABI = gpu::PythonArgument;
+  using MetadataABI = gpu::PythonArgument;
   void bindArguments() {
-    auto interface = gpu::readInterface(kernel);
+    auto interface = gpu::PythonSignature::read(kernel);
     if (mlir::failed(interface)) {
       failed = true;
       return;
@@ -88,11 +89,11 @@ private:
     scalars = std::move(interface->scalars);
     metadataArguments = std::move(interface->metadata);
     for (const ScalarABI &scalar : scalars)
-      values[kernel.getArgument(scalar.abi)] = scalar.name;
+      values[scalar.value] = scalar.name;
     for (const MetadataABI &metadata : metadataArguments)
-      values[kernel.getArgument(metadata.abi)] = metadata.name;
+      values[metadata.value] = metadata.name;
     for (const ViewABI &view : views)
-      values[kernel.getArgument(view.abi)] = view.name;
+      values[view.value] = view.name;
     // Launch configuration is printed before the body. Parameter reads name
     // builder arguments, so their bindings are available at both positions.
     kernel.walk([&](gpu::ParameterOp read) {
@@ -190,13 +191,13 @@ private:
         output << ", ";
       first = false;
       output << view.name << ": T.Tensor(" << viewShape(view) << ", "
-             << tileLangType(view.type.getElementType()) << ")";
+             << tileLangType(view.viewType().getElementType()) << ")";
     }
     for (const ScalarABI &scalar : scalars) {
       if (!first)
         output << ", ";
       first = false;
-      output << scalar.name << ": " << tileLangType(scalar.type);
+      output << scalar.name << ": " << tileLangType(scalar.value.getType());
     }
     output << "):\n";
     auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
@@ -617,7 +618,7 @@ private:
   }
 
   std::string viewShape(const ViewABI &view) {
-    return shape(view.type.getLayout().getExtents());
+    return shape(view.viewType().getLayout().getExtents());
   }
 
   std::string valueString(Value value) {

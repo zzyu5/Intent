@@ -3,6 +3,7 @@ add_mlir_library(MLIRIntentMojoSerialization
 
   LINK_LIBS PUBLIC
   MLIRIntentCPUTransforms
+  MLIRIntentNativeABI
   MLIRArithDialect
   MLIRFuncDialect
   MLIRMathDialect

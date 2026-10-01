@@ -1,5 +1,5 @@
 from pathlib import Path
-from intent.runtime.mojo.source import prepare_source, scalar, view
+from experiments.cpu.baselines.mojo.source import prepare_source, scalar, view
 
 
 def prepare(target, x, weight, inverse_features, epsilon):

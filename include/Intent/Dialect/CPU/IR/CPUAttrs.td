@@ -10,24 +10,9 @@ class IntentCPU_Attr<string name, string mnemonicName>
   let genVerifyDecl = 1;
 }
 
-def IntentCPU_ViewArgumentAttr : IntentCPU_Attr<"ViewArgument", "view_argument"> {
-  let parameters = (ins "::mlir::StringAttr":$name,
-    "::mlir::Type":$elementType, "::mlir::DenseI64ArrayAttr":$shape,
-    "::mlir::DenseI64ArrayAttr":$dimensions, "::mlir::ArrayAttr":$strides, "uint32_t":$access,
-    "::mlir::StringAttr":$alias, "bool":$noalias);
-  let assemblyFormat =
-    "`<` $name `,` $elementType `,` $shape `,` $dimensions `,` $strides `,` $access `,` $alias `,` $noalias `>`";
-}
-
-def IntentCPU_ScalarArgumentAttr : IntentCPU_Attr<"ScalarArgument", "scalar_argument"> {
-  let parameters = (ins "::mlir::StringAttr":$name, "::mlir::Type":$type);
-  let assemblyFormat = "`<` $name `,` $type `>`";
-}
-
-def IntentCPU_InterfaceAttr : IntentCPU_Attr<"Interface", "interface"> {
-  let parameters = (ins "::mlir::ArrayAttr":$arguments,
-    "bool":$contiguousViews, "bool":$disjointOutputs);
-  let assemblyFormat = "`<` $arguments `,` $contiguousViews `,` $disjointOutputs `>`";
+def IntentCPU_EntryRequirementsAttr : IntentCPU_Attr<"EntryRequirements", "entry_requirements"> {
+  let parameters = (ins "bool":$contiguousViews, "bool":$disjointOutputs);
+  let assemblyFormat = "`<` $contiguousViews `,` $disjointOutputs `>`";
 }
 
 def IntentCPU_CapabilitiesAttr : IntentCPU_Attr<"Capabilities", "capabilities"> {

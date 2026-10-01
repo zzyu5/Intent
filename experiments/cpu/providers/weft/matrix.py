@@ -13,6 +13,7 @@ import torch
 import intent
 from intent.runtime.weft import TargetProfile, export_artifact
 from intent.runtime.weft.compilation import flattened_signature, lower_artifact
+from intent.runtime.native import NativeABI
 from kernels.contraction.gemm import gemm_i8
 
 from experiments._common.loading import load_module
@@ -33,7 +34,7 @@ def compile_source(context, profile, compiler, rows):
 
 def source_artifact(directory, profile, metadata, canonical, artifact):
     kernel, = artifact["kernels"]
-    signature, _ = flattened_signature(metadata["parameters"])
+    signature, _ = flattened_signature(NativeABI.read(metadata))
     dimensions = {"M": "a0_d0", "K": "a0_d1", "N": "a1_d1"}
     shape_arguments = [dimensions[name] for name in kernel["shape_parameters"]]
     pointer_types = [argument["c_type"] for argument in kernel["arguments"]]

@@ -11,15 +11,16 @@ def IntentGPU_ViewType : TypeDef<IntentGPU_Dialect, "View"> {
   let summary = "One physical external-view ABI resource";
   let parameters = (ins
     "::mlir::Type":$elementType,
-    "uint32_t":$rank,
     "uint32_t":$access,
-    "uint32_t":$abiIndex,
     "uint64_t":$sourceId,
     "::intent::gpu::ViewLayoutAttr":$layout
   );
   let assemblyFormat =
-      "`<` $elementType `,` $rank `,` $access `,` $abiIndex `,` $sourceId `,` $layout `>`";
+      "`<` $elementType `,` $access `,` $sourceId `,` $layout `>`";
   let genVerifyDecl = 1;
+  let extraClassDeclaration = [{
+    uint32_t getRank() const { return getLayout().getExtents().size(); }
+  }];
 }
 
 def IntentGPU_FragmentType : TypeDef<IntentGPU_Dialect, "Fragment"> {

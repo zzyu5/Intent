@@ -101,12 +101,12 @@ bool realizeRowBroadcasts(func::FuncOp function, dsa::ConfigurationAttr config) 
 }
 
 void coalesceTileLoads(func::FuncOp function, dsa::ConfigurationAttr config) {
-  auto interface = function->getAttrOfType<dsa::InterfaceAttr>("intent_dsa.interface");
+  auto interface = intent::getPublicInterface(function);
   auto eligible = [&](dsa::LoadTileOp load) {
     if (!load || load.getAsynchronous()) return false;
     auto argument = dyn_cast<BlockArgument>(load.getSource());
     if (!argument || argument.getOwner() != &function.front()) return false;
-    auto view = dyn_cast<dsa::ViewArgumentAttr>(interface.getArguments()[argument.getArgNumber()]);
+    auto view = intent::getPublicView(interface, argument.getArgNumber());
     return view && view.getAccess() == 0;
   };
   auto owner = dsa::storageRoot;
@@ -140,12 +140,12 @@ void coalesceTileLoads(func::FuncOp function, dsa::ConfigurationAttr config) {
 }
 
 bool batchIndependentRowPrograms(func::FuncOp function, dsa::ConfigurationAttr config) {
-  auto interface = function->getAttrOfType<dsa::InterfaceAttr>("intent_dsa.interface");
-  auto viewArgument = [&](Value value, unsigned access) -> dsa::ViewArgumentAttr {
+  auto interface = intent::getPublicInterface(function);
+  auto viewArgument = [&](Value value, unsigned access) -> intent::ViewType {
     auto argument = dyn_cast<BlockArgument>(value);
     if (!argument || argument.getOwner() != &function.front()) return {};
-    auto view = dyn_cast<dsa::ViewArgumentAttr>(interface.getArguments()[argument.getArgNumber()]);
-    return view && view.getAccess() == access ? view : dsa::ViewArgumentAttr{};
+    auto view = intent::getPublicView(interface, argument.getArgNumber());
+    return view && view.getAccess() == access ? view : intent::ViewType{};
   };
   auto constant = [](Value value) -> int64_t {
     APInt bits;
@@ -313,11 +313,11 @@ bool batchIndependentRowPrograms(func::FuncOp function, dsa::ConfigurationAttr c
 }
 
 void pipelinePointwiseLoads(func::FuncOp function, dsa::ConfigurationAttr config) {
-  auto interface = function->getAttrOfType<dsa::InterfaceAttr>("intent_dsa.interface");
+  auto interface = intent::getPublicInterface(function);
   auto access = [&](Value value, unsigned kind) {
     auto argument = dyn_cast<BlockArgument>(value);
     if (!argument || argument.getOwner() != &function.front()) return false;
-    auto view = dyn_cast<dsa::ViewArgumentAttr>(interface.getArguments()[argument.getArgNumber()]);
+    auto view = intent::getPublicView(interface, argument.getArgNumber());
     return view && view.getAccess() == kind;
   };
   std::function<int64_t(Value)> stepSize = [&](Value value) -> int64_t {
@@ -426,11 +426,11 @@ void pipelinePointwiseLoads(func::FuncOp function, dsa::ConfigurationAttr config
 }
 
 void pipelineRowLoads(func::FuncOp function, dsa::ConfigurationAttr config) {
-  auto interface = function->getAttrOfType<dsa::InterfaceAttr>("intent_dsa.interface");
+  auto interface = intent::getPublicInterface(function);
   auto access = [&](Value value, unsigned kind) {
     auto argument = dyn_cast<BlockArgument>(value);
     if (!argument || argument.getOwner() != &function.front()) return false;
-    auto view = dyn_cast<dsa::ViewArgumentAttr>(interface.getArguments()[argument.getArgNumber()]);
+    auto view = intent::getPublicView(interface, argument.getArgNumber());
     return view && view.getAccess() == kind;
   };
   std::function<int64_t(Value)> stepSize = [&](Value value) -> int64_t {
@@ -569,11 +569,11 @@ void pipelineRowLoads(func::FuncOp function, dsa::ConfigurationAttr config) {
 }
 
 void pipelineMatrixLoads(func::FuncOp function, dsa::ConfigurationAttr config) {
-  auto interface = function->getAttrOfType<dsa::InterfaceAttr>("intent_dsa.interface");
+  auto interface = intent::getPublicInterface(function);
   auto readOnlyArgument = [&](Value value) {
     auto argument = dyn_cast<BlockArgument>(value);
     if (!argument || argument.getOwner() != &function.front()) return false;
-    auto view = dyn_cast<dsa::ViewArgumentAttr>(interface.getArguments()[argument.getArgNumber()]);
+    auto view = intent::getPublicView(interface, argument.getArgNumber());
     return view && view.getAccess() == 0;
   };
   auto constant = [](Value value) -> int64_t {

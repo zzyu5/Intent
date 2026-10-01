@@ -31,7 +31,7 @@ std::optional<int64_t> evaluateSingletonExpression(PhysicalExprAttr expression,
     if (!kernel || leaf.getKind() !=
                        PhysicalExprKind::Parameter)
       return std::nullopt;
-    auto parameter = queryParameterBySymbol(kernel, leaf.getSymbolName());
+    auto parameter = queryParameterBySymbol(kernel, leaf.getParameterReference().getName());
     if (failed(parameter) || isCoverageParameter(*parameter) ||
         hasLateBoundDomain(*parameter))
       return std::nullopt;
@@ -233,7 +233,7 @@ bool IndexRelations::multipleOf(
           return expression.getValue() % divisor == 0;
         if (kind == PhysicalExprKind::Parameter) {
           auto parameter = queryParameterBySymbol(
-              physical->getParentOfType<func::FuncOp>(), expression.getSymbolName());
+              physical->getParentOfType<func::FuncOp>(), expression.getParameterReference().getName());
           return succeeded(parameter) && declarationAligned(*parameter);
         }
         if (expression.getOperands().size() != 2)

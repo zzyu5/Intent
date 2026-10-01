@@ -103,13 +103,13 @@ queryStorageLifetime(memref::AllocOp allocation) {
 
 namespace {
 bool disjoint(Value first, Value second, PhysicalProgramAnalysis &physical,
-              AliasAnalysis &aliases, InterfaceAttr interface) {
+              AliasAnalysis &aliases, EntryRequirementsAttr interface) {
   Value root = physical.storageRoot(first), other = physical.storageRoot(second);
   if (root == other) return false;
   if (aliases.alias(root, other).isNo()) return true;
   auto source = physical.externalView(root), destination = physical.externalView(other);
   if (!source || !destination) return false;
-  return source.getNoalias() || destination.getNoalias() ||
+  return source.getConstraints().getNoalias() || destination.getConstraints().getNoalias() ||
       (interface && interface.getDisjointOutputs() &&
        (source.getAccess() != 0 || destination.getAccess() != 0));
 }
@@ -122,7 +122,7 @@ bool areDisjointStorage(Value first, Value second, Operation *scope) {
   PhysicalProgramAnalysis physical(function);
   AliasAnalysis aliases(function);
   return disjoint(first, second, physical, aliases,
-      function->getAttrOfType<InterfaceAttr>("intent_cpu.interface"));
+      function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr));
 }
 
 bool preservesStorage(Operation *scope, Value memory) {
@@ -133,7 +133,7 @@ bool preservesStorage(Operation *scope, Value memory) {
   if (!effects) return false;
   PhysicalProgramAnalysis physical(function);
   AliasAnalysis aliases(function);
-  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
   return llvm::all_of(*effects, [&](const MemoryEffects::EffectInstance &effect) {
     if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect())) return true;
     Value affected = effect.getValue();

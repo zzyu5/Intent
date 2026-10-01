@@ -1,3 +1,4 @@
+#include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
@@ -98,7 +99,7 @@ bool exceedsRegisterFile(Value source, func::FuncOp kernel) {
     if (extent.getKind() == PhysicalExprKind::Constant) {
       minimum = extent.getValue();
     } else if (extent.getKind() == PhysicalExprKind::Parameter) {
-      auto parameter = queryParameterBySymbol(kernel, extent.getSymbolName());
+      auto parameter = queryParameterBySymbol(kernel, extent.getParameterReference().getName());
       if (failed(parameter))
         return false;
       minimum = *llvm::min_element(parameter->getCandidates().asArrayRef());
@@ -770,14 +771,7 @@ FailureOr<ParameterAttr> fullCoverageParameter(func::FuncOp kernel,
   if (!parameter || !parameter.isDeferred() || !coverage || coverage.getInt() <= 0)
     return failure();
   uint64_t dimension = static_cast<uint64_t>(coverage.getInt());
-  bool launchVisible = false;
-  for (BlockArgument argument : kernel.getArguments()) {
-    DictionaryAttr attributes = kernel.getArgAttrDict(argument.getArgNumber());
-    auto kind = attributes.getAs<StringAttr>(abiKindAttr);
-    auto identity = attributes.getAs<IntegerAttr>(dimensionAttr);
-    launchVisible |= kind && kind.getValue() == "dimension" && identity &&
-                     identity.getInt() == static_cast<int64_t>(dimension);
-  }
+  bool launchVisible = bool(resolveDimension(kernel, dimension));
   if (!launchVisible)
     return failure();
   static constexpr int64_t candidates[] = {
@@ -951,14 +945,7 @@ bool hasSelectedSegmentExtent(ReduceOp reduce, func::FuncOp kernel) {
 }
 
 FailureOr<Value> dimensionArgument(func::FuncOp kernel, int64_t dimension) {
-  for (BlockArgument argument : kernel.getArguments()) {
-    DictionaryAttr attributes = kernel.getArgAttrDict(argument.getArgNumber());
-    auto kind = attributes.getAs<StringAttr>(abiKindAttr);
-    auto identity = attributes.getAs<IntegerAttr>(dimensionAttr);
-    if (kind && kind.getValue() == "dimension" && identity &&
-        identity.getInt() == dimension)
-      return Value(argument);
-  }
+  if (auto argument = resolveDimension(kernel, dimension)) return Value(argument);
   return failure();
 }
 

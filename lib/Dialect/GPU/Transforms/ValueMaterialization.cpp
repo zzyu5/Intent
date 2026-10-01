@@ -1,3 +1,4 @@
+#include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
@@ -156,17 +157,12 @@ FailureOr<Value> materializeNonOverlappingView(func::FuncOp kernel,
   auto view = cast<ViewType>(resource.getType());
   SmallVector<OpFoldResult> strides;
   for (Attribute attribute : view.getLayout().getStrides()) {
-    if (auto constant = dyn_cast<IntegerAttr>(attribute)) {
-      strides.push_back(constant);
+    auto expression = cast<PhysicalExprAttr>(attribute);
+    if (expression.getKind() == PhysicalExprKind::Constant) {
+      strides.push_back(IntegerAttr::get(IndexType::get(kernel.getContext()), expression.getValue()));
       continue;
     }
-    auto name = dyn_cast<StringAttr>(attribute);
-    Value stride;
-    if (name)
-      for (BlockArgument argument : kernel.getArguments())
-        if (kernel.getArgAttrOfType<StringAttr>(argument.getArgNumber(),
-                                               abiNameAttr) == name)
-          stride = argument;
+    Value stride = resolveArgument(kernel, expression.getArgumentReference());
     if (!stride || !stride.getType().isIndex())
       return failure();
     strides.push_back(stride);

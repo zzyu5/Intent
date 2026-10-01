@@ -7,21 +7,15 @@ import statistics
 
 import torch
 
-from .compilation import SCALAR_CTYPES, compile_library
+from .compilation import compile_library
 from ..cpu import check_alias
-from ..native import NativeInterface, NativePreparedRuntime, ViewFacts, ViewParameter
+from ..interface import ViewParameter
+from ..native import NativeABI, NativePreparedRuntime, ViewFacts
+from ..torch import torch_dtype
 
 
 _winners: dict[tuple[object, ...], dict[tuple[object, ...], int]] = {}
 _candidate_timings: dict[tuple[object, ...], dict[tuple[object, ...], tuple[float, ...]]] = {}
-
-_DTYPES = {
-    "f16": torch.float16, "bf16": torch.bfloat16, "f32": torch.float32, "f64": torch.float64,
-    "i1": torch.bool, "i8": torch.int8, "i16": torch.int16, "i32": torch.int32, "i64": torch.int64,
-    "ui8": torch.uint8, "ui16": torch.uint16, "ui32": torch.uint32, "ui64": torch.uint64,
-    "f8e4m3fn": torch.float8_e4m3fn, "f8e5m2": torch.float8_e5m2,
-}
-
 
 def _timing_samples(measure, arguments: tuple[object, ...], *, samples: int) -> float:
     first = measure(*arguments, 1)
@@ -79,25 +73,25 @@ class NativeCall:
 
 class NativeProgram(NativePreparedRuntime):
     def __init__(self, source: str, metadata: dict[str, object], target) -> None:
-        self.parameters = metadata["parameters"]
-        self.interface = NativeInterface.read(self.parameters)
+        abi = NativeABI.read(metadata)
+        self.interface = abi.interface
         self._view_dtypes = tuple(
-            _DTYPES[parameter.dtype]
+            torch_dtype(parameter.dtype)
             if isinstance(parameter, ViewParameter) else None
             for parameter in self.interface.parameters
         )
         self.candidates = metadata["candidates"]
-        self.contiguous_views = metadata["contiguous_views"]
-        if not metadata["disjoint_outputs"]:
+        self.contiguous_views = metadata["native"]["contiguous_views"]
+        if not metadata["native"]["disjoint_outputs"]:
             raise NotImplementedError("Mojo runtime requires declared disjoint-output entry legality")
-        self._binders = self.interface.binders(
+        self._binders = abi.binders(
             observe_view=type(self)._view, allocate_output=type(self)._allocate_output,
             check_alias=check_alias,
             view_key=lambda facts, group: (facts.shape, facts.strides, facts.offset, facts.dtype, group),
-            scalar_key=lambda parameter, value: parameter.dtype,
+            scalar_key=lambda parameter, value: parameter.dtype.name,
         )
-        self.compilation = compile_library(source, metadata, target)
-        argument_types = self.interface.argument_types(SCALAR_CTYPES.__getitem__)
+        self.compilation = compile_library(source, metadata, target, abi=abi)
+        argument_types = abi.argument_types()
         self.functions = []
         self.measurements = []
         for candidate, compilation in zip(self.candidates, self.compilation.libraries):
@@ -134,7 +128,8 @@ class NativeProgram(NativePreparedRuntime):
             offset = (extent - 1) * stride
             lower += min(0, offset)
             upper += max(0, offset)
-        return ViewFacts(shape, strides, pointer, tensor.untyped_storage().data_ptr(),
+        storage = tensor.untyped_storage()
+        return ViewFacts(shape, strides, pointer, storage.data_ptr(), storage.data_ptr() + storage.nbytes(),
                          tensor.storage_offset(), dtype, pointer + lower * element_size,
                          pointer + upper * element_size)
 
@@ -145,12 +140,10 @@ class NativeProgram(NativePreparedRuntime):
         if elements == 0:
             raise NotImplementedError("Mojo CPU empty-storage pointer ABI is not implemented")
         strides = tensor.stride()
-        if parameter.stride_mismatch(strides):
-            raise ValueError(f"{parameter.name} violates an author stride constraint")
         pointer = tensor.data_ptr()
         # This invocation owns the new contiguous allocation. Shape, dtype,
         # zero offset and storage identity follow from the factory contract.
-        facts = ViewFacts(shape, strides, pointer, pointer, 0, dtype,
+        facts = ViewFacts(shape, strides, pointer, pointer, pointer + tensor.untyped_storage().nbytes(), 0, dtype,
                           pointer, pointer + elements * tensor.element_size())
         return tensor, facts
 

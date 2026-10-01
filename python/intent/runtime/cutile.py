@@ -99,7 +99,7 @@ class CuTileProgram:
 
     def _arguments(self, values: dict, config) -> tuple:
         bindings = {**values, **vars(config)}
-        return tuple(bindings[name] for name in self.facts["kernel_arguments"])
+        return tuple(self.interface.native_value(name, bindings) for name in self.facts["kernel_arguments"])
 
     def _grid(self, values: dict, config) -> tuple:
         return (*evaluate_shape(self.interface.grid, {**values, **vars(config)}), 1, 1)
@@ -107,7 +107,7 @@ class CuTileProgram:
     def _key(self, invocation, values: dict) -> tuple:
         return (tuple((tuple(view.shape), tuple(view.stride()), view.dtype, view.device)
                       for view in invocation.views),
-                tuple(values[name] for name in self.facts["tuning_key_scalars"]),
+                tuple(self.interface.native_value(name, values) for name in self.facts["tuning_key_scalars"]),
                 tuple(values[name] for name in self.configurations.coverage_names),
                 tuple(values[entry["eligible"]] for entry in self.facts["array_views"]),
                 tuple(values[entry["name"]] for entry in self.interface.overlaps))
@@ -130,7 +130,7 @@ class CuTileProgram:
             state = self.trial_state(invocation.public_views,
                                      tuple(view.writable for view in self.interface.public_views))
             trial_values = dict(values)
-            trial_values.update((view.kernel_name, trial) for view, trial in
+            trial_values.update((view.id, trial) for view, trial in
                                 zip(self.interface.public_views, state.views, strict=True))
             self._array_values(trial_values)
             hints = (self._hints,) if self.facts["compiler_hints"] else ()

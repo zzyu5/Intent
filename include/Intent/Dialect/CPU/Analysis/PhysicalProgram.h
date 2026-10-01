@@ -29,7 +29,7 @@ class PhysicalProgramAnalysis {
 public:
   explicit PhysicalProgramAnalysis(mlir::func::FuncOp function) : function(function) {}
   mlir::Value storageRoot(mlir::Value memory);
-  ViewArgumentAttr externalView(mlir::Value memory);
+  intent::ViewType externalView(mlir::Value memory);
   bool isReadOnly(mlir::Value memory);
   bool mayReadAt(mlir::Value memory, mlir::Operation *from,
                  mlir::Operation *to);

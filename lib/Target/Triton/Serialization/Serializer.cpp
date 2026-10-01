@@ -2,6 +2,8 @@
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Analysis/ProgramInterface.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -33,30 +35,6 @@ std::string pythonType(Type type) {
   return gpu::pythonScalarType(type, syntax);
 }
 
-std::string expressionString(gpu::PhysicalExprAttr expression) {
-  static const gpu::PythonExpressionSyntax syntax{
-      "", "min", "max", "", "triton.next_power_of_2", true};
-  return gpu::pythonExpression(expression, syntax, [](gpu::PhysicalExprAttr leaf) {
-    return leaf.getSymbolName().getValue().str();
-  });
-}
-
-std::string fragmentShape(gpu::FragmentType fragment) {
-  SmallVector<std::string> extents;
-  for (Attribute extent : fragment.getShape())
-    extents.push_back(
-        expressionString(cast<gpu::PhysicalExprAttr>(extent)));
-  std::string result = "(";
-  for (auto [index, extent] : llvm::enumerate(extents)) {
-    if (index)
-      result += ", ";
-    result += extent;
-  }
-  if (extents.size() == 1)
-    result += ",";
-  return result + ")";
-}
-
 std::string literal(Attribute value) {
   return gpu::pythonLiteral(value);
 }
@@ -76,9 +54,26 @@ public:
   }
 
 private:
-  using ViewABI = gpu::ViewArgument;
-  using ScalarABI = gpu::ScalarArgument;
-  using MetadataABI = gpu::MetadataArgument;
+  std::string expressionString(gpu::PhysicalExprAttr expression) {
+    static const gpu::PythonExpressionSyntax syntax{
+        "", "min", "max", "", "triton.next_power_of_2", true};
+    return gpu::pythonExpression(expression, syntax, [&](gpu::PhysicalExprAttr leaf) {
+      if (leaf.getKind() == gpu::PhysicalExprKind::Parameter)
+        return leaf.getParameterReference().getName().getValue().str();
+      return valueString(gpu::resolveArgument(kernel, leaf.getArgumentReference()));
+    });
+  }
+
+  std::string fragmentShape(gpu::FragmentType fragment) {
+    SmallVector<std::string> extents;
+    for (Attribute extent : fragment.getShape())
+      extents.push_back(expressionString(cast<gpu::PhysicalExprAttr>(extent)));
+    return stringTuple(extents);
+  }
+
+  using ViewABI = gpu::PythonArgument;
+  using ScalarABI = gpu::PythonArgument;
+  using MetadataABI = gpu::PythonArgument;
   struct DescriptorABI {
     TensorDescriptorOp operation;
     std::string name;
@@ -91,7 +86,7 @@ private:
       return;
     }
     configuration = std::move(*configurationSchema);
-    auto interface = gpu::readInterface(kernel);
+    auto interface = gpu::PythonSignature::read(kernel);
     if (mlir::failed(interface)) {
       failed = true;
       return;
@@ -100,22 +95,15 @@ private:
     scalars = std::move(interface->scalars);
     metadataArguments = std::move(interface->metadata);
     for (const ScalarABI &scalar : scalars)
-      values[kernel.getArgument(scalar.abi)] = scalar.name;
+      values[scalar.value] = scalar.name;
     for (const MetadataABI &metadata : metadataArguments)
-      values[kernel.getArgument(metadata.abi)] = metadata.name;
+      values[metadata.value] = metadata.name;
+    for (const ViewABI &view : views)
+      values[view.value] = view.name;
     llvm::StringSet<> argumentNames;
-    for (unsigned index = 0; index < kernel.getNumArguments(); ++index)
-      argumentNames.insert(kernel.getArgAttrDict(index)
-                               .getAs<StringAttr>(gpu::abiNameAttr).getValue());
-    // Launch keywords share Triton's argument map with kernel arguments.
-    for (ViewABI &view : views) {
-      view.name = "_intent_view_" + std::to_string(view.abi);
-      while (!argumentNames.insert(view.name).second)
-        view.name += "_";
-      values[kernel.getArgument(view.abi)] = view.name;
-    }
+    for (const auto &entry : values) argumentNames.insert(entry.second);
     for (const MetadataABI &metadata : metadataArguments)
-      constexprValues.insert(kernel.getArgument(metadata.abi));
+      constexprValues.insert(metadata.value);
     for (Attribute attribute : gpu::getParameterDeclarations(kernel)) {
       auto schema = cast<gpu::ParameterAttr>(attribute);
       std::string name = schema.getName().getValue().str();
@@ -228,7 +216,7 @@ private:
         output << ", ";
       first = false;
       output << scalar.name;
-      output << ": " << pythonType(scalar.type);
+      output << ": " << pythonType(scalar.value.getType());
     }
     if (!metadataArguments.empty()) {
       if (!first)
@@ -619,7 +607,7 @@ private:
         }
         llvm_unreachable("unhandled Intent scaled format");
       };
-      auto extent = [](gpu::FragmentType type, unsigned axis) {
+      auto extent = [&](gpu::FragmentType type, unsigned axis) {
         return expressionString(
             cast<gpu::PhysicalExprAttr>(type.getShape()[axis]));
       };
@@ -1096,13 +1084,7 @@ private:
     auto view = cast<gpu::ViewType>(viewValue.getType());
     auto strides = view.getLayout().getStrides();
     auto strideString = [&](int64_t axis) -> std::string {
-      Attribute stride = strides[axis];
-      if (auto symbol = dyn_cast<StringAttr>(stride))
-        return symbol.getValue().str();
-      if (auto integer = dyn_cast<IntegerAttr>(stride))
-        return std::to_string(integer.getInt());
-      failed = true;
-      return {};
+      return expressionString(cast<gpu::PhysicalExprAttr>(strides[axis]));
     };
 
     SmallVector<std::string> baseOffsets;
@@ -1177,16 +1159,8 @@ private:
     unsigned coordinateSlot = 0;
     std::string result = values.lookup(resource);
     for (auto [axis, coordinate] : llvm::enumerate(coordinates)) {
-      Attribute strideAttribute = strides[sourceAxes[axis]];
-      std::string stride;
-      if (auto symbol = dyn_cast<StringAttr>(strideAttribute))
-        stride = symbol.getValue().str();
-      else if (auto constant = dyn_cast<IntegerAttr>(strideAttribute))
-        stride = std::to_string(constant.getInt());
-      else {
-        failed = true;
-        return {};
-      }
+      std::string stride = expressionString(
+          cast<gpu::PhysicalExprAttr>(strides[sourceAxes[axis]]));
       std::optional<unsigned> coordinateAxis;
       if (cartesian && isa<gpu::FragmentType>(coordinate.getType())) {
         auto source = cast<gpu::FragmentType>(coordinate.getType());
@@ -1311,9 +1285,8 @@ private:
             {"kind", kind}, {"operands", std::move(operands)}});
       }
     }
-    if (isa<BlockArgument>(value))
-      return llvm::json::Value(llvm::json::Object{
-          {"kind", "scalar"}, {"symbol", valueString(value)}});
+    if (auto expression = gpu::queryLaunchExpression(value))
+      return gpu::serializeExpression(expression);
     return kernel.emitError("Triton descriptor has no host-evaluable value binding");
   }
 
@@ -1358,7 +1331,8 @@ private:
     for (const DescriptorABI &descriptor : descriptors) {
       TensorDescriptorOp operation = descriptor.operation;
       llvm::json::Object encoded{
-          {"name", descriptor.name}, {"base", valueString(operation.getBase())},
+          {"name", descriptor.name},
+          {"base", gpu::getArgumentReference(operation.getBase()).getId()},
           {"rank", cast<gpu::ViewType>(operation.getBase().getType()).getRank()},
           {"require_positive_shape", operation.getRequirePositiveShape()},
           {"require_positive_strides", operation.getRequirePositiveStrides()},

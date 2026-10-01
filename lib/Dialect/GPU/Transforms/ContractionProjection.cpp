@@ -857,7 +857,7 @@ LogicalResult normalizeMatrixContractShapes(func::FuncOp kernel) {
   AttrTypeReplacer replacer;
   replacer.addReplacement([&](PhysicalExprAttr extent) -> std::optional<Attribute> {
     if (extent.getKind() != PhysicalExprKind::Parameter ||
-        !units.contains(extent.getSymbolName()))
+        !units.contains(extent.getParameterReference().getName()))
       return std::nullopt;
     return expression(kernel.getContext(), PhysicalExprKind::Constant, 1);
   });

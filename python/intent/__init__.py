@@ -14,7 +14,7 @@ from .diagnostics import IntentError
 from .diagnostics import LanguageUseError
 from .frontend import FrontendError
 from .frontend import lower_to_mlir
-from .runtime import CompiledArtifact, PreparedCall
+from .runtime import CompiledArtifact, PreparedCall, PublicInterface, ScalarParameter, ViewParameter
 from .targets import CuTileTarget
 from .targets import TileLangTarget
 from .targets import TritonTarget
@@ -46,6 +46,9 @@ __all__ = [
     "OptimizedIR",
     "CompiledArtifact",
     "PreparedCall",
+    "PublicInterface",
+    "ScalarParameter",
+    "ViewParameter",
     "CuTileTarget",
     "TileLangTarget",
     "TritonTarget",

@@ -1,6 +1,7 @@
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/ProgramInterface.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 
@@ -199,14 +200,10 @@ Attribute getCompileTimeScalar(Value value) {
     if (kind == gpu::PhysicalExprKind::ScalarABI) {
       if (!kernel)
         return false;
-      for (BlockArgument argument : kernel.getArguments()) {
-        auto attributes = kernel.getArgAttrDict(argument.getArgNumber());
-        auto name = attributes.getAs<StringAttr>(gpu::abiNameAttr);
-        auto abi = attributes.getAs<StringAttr>(gpu::abiKindAttr);
-        if (name && abi && name == current.getSymbolName())
-          return abi.getValue() == "constexpr" || abi.getValue() == "stride";
-      }
-      return false;
+      auto argument = gpu::resolveArgument(kernel, current.getArgumentReference());
+      auto binding = argument ? gpu::getArgumentBinding(argument)
+                              : gpu::ArgumentBindingAttr();
+      return binding && binding.getKind() == gpu::ArgumentKind::Stride;
     }
     return llvm::all_of(current.getOperands(), [&](Attribute operand) {
       return isCompileTime(cast<gpu::PhysicalExprAttr>(operand));

@@ -94,7 +94,7 @@ linalg::GenericOp pointwiseProducer(Value buffer, Operation *consumer,
   auto generic = dyn_cast<linalg::GenericOp>(consumer);
   auto function = consumer->getParentOfType<func::FuncOp>();
   AliasAnalysis aliases(function);
-  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
   for (Value read : reads) {
     if (!analysis.mayReadAt(read, producer, consumer)) return {};
     if (!generic) continue;

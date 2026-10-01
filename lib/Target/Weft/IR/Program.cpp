@@ -85,8 +85,6 @@ LogicalResult verifyProgram(ModuleOp program) {
   if (!modules->host->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities"))
     return modules->host.emitError("Weft host requires CPU capabilities");
 
-  cpu::InterfaceAttr interface;
-  FunctionType signature;
   SmallVector<ArgumentAlignmentAttr> publicAlignments;
   llvm::DenseSet<Operation *> entries, declarations;
   for (func::FuncOp function : modules->host.getOps<func::FuncOp>()) {
@@ -96,15 +94,9 @@ LogicalResult verifyProgram(ModuleOp program) {
       declarations.insert(function);
       continue;
     }
-    auto current = function->getAttrOfType<cpu::InterfaceAttr>("intent_cpu.interface");
-    bool firstEntry = !interface;
-    if (firstEntry) {
-      interface = current;
-      signature = function.getFunctionType();
-      publicAlignments.resize(function.getNumArguments());
-    }
-    if (!current || current != interface || signature != function.getFunctionType())
-      return function.emitError("Weft candidates must share one complete public interface");
+    auto current = getPublicInterface(function);
+    bool firstEntry = entries.empty();
+    if (firstEntry) publicAlignments.resize(function.getNumArguments());
     auto implementations = function->getAttrOfType<ArrayAttr>("intent_cpu.implementations");
     if (!function->getAttrOfType<cpu::ConfigurationAttr>("intent_cpu.configuration") ||
         !function->getAttrOfType<BoolAttr>("intent_cpu.requires_matrix_i8_i32") ||
@@ -112,7 +104,7 @@ LogicalResult verifyProgram(ModuleOp program) {
         !llvm::all_of(implementations, [](Attribute binding) { return isa<cpu::ImplementationAttr>(binding); }))
       return function.emitError("Weft candidate requires its complete typed configuration and implementations");
     for (auto [index, field] : llvm::enumerate(current.getArguments())) {
-      if (!isa<cpu::ViewArgumentAttr>(field)) continue;
+      if (!getPublicView(current, index)) continue;
       auto alignment = function.getArgAttrOfType<ArgumentAlignmentAttr>(index, argumentAlignmentAttr);
       if (!alignment)
         return function.emitError("Weft public view requires a typed alignment");

@@ -20,7 +20,7 @@ bool expressionReferencesParameter(PhysicalExprAttr expression,
                                    StringAttr parameter) {
   if (expression.getKind() ==
           PhysicalExprKind::Parameter &&
-      expression.getSymbolName() == parameter)
+      expression.getParameterReference().getName() == parameter)
     return true;
   return llvm::any_of(expression.getOperands(), [&](Attribute operand) {
     return expressionReferencesParameter(cast<PhysicalExprAttr>(operand),
@@ -524,7 +524,7 @@ contractionFreeExtents(func::FuncOp kernel, ArrayRef<ParameterAttr> parameters) 
           return extent.getValue() > 0;
         }
         if (kind == PhysicalExprKind::Parameter) {
-          auto found = freeAxisParameters.find(extent.getSymbolName().getValue());
+          auto found = freeAxisParameters.find(extent.getParameterReference().getName().getValue());
           if (found == freeAxisParameters.end()) return false;
           ++factors;
           if (!llvm::is_contained(group.parameters, found->second))
@@ -628,10 +628,10 @@ SmallVector<FullResultContraction> fullResultContractions(func::FuncOp kernel) {
     auto sliced = cast<PhysicalExprAttr>(source.getShape()[axis]);
     auto full = cast<PhysicalExprAttr>(result.getShape()[axis]);
     if (sliced.getKind() != PhysicalExprKind::Parameter ||
-        sliced.getSymbolName() != schema.getName() ||
+        sliced.getParameterReference().getName() != schema.getName() ||
         full.getKind() != PhysicalExprKind::Parameter)
       return;
-    auto coverage = queryParameterBySymbol(kernel, full.getSymbolName());
+    auto coverage = queryParameterBySymbol(kernel, full.getParameterReference().getName());
     if (failed(coverage) || !coverage->isDeferred())
       return;
     auto other = cast<PhysicalExprAttr>(source.getShape()[1 - axis]);
@@ -702,7 +702,7 @@ ConfigurationFacts analyzeConfigurationPolicy(
         continue;
       auto localExtent = [&](PhysicalExprAttr extent) -> std::optional<int64_t> {
         if (extent.getKind() != PhysicalExprKind::Parameter ||
-            extent.getSymbolName() != schema.getName())
+            extent.getParameterReference().getName() != schema.getName())
           return std::nullopt;
         return 1;
       };

@@ -26,6 +26,7 @@ class Buffer:
         self.pointer = ctypes.addressof(ctypes.c_char.from_buffer(self.storage)) if self.nbytes else 0
         owner = memoryview(view.obj).cast("B")
         self.allocation = ctypes.addressof(ctypes.c_char.from_buffer(owner)) if owner.nbytes else id(view.obj)
+        self.allocation_end = self.allocation + owner.nbytes
         self.strides = tuple(prod(self.shape[axis + 1:]) for axis in range(len(self.shape)))
 
     @classmethod

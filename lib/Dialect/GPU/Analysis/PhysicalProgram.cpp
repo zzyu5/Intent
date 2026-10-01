@@ -1,3 +1,4 @@
+#include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/IndexPredicates.h"
@@ -340,16 +341,7 @@ bool matchesResourceExtent(Value value, Value resource, unsigned axis) {
                PhysicalExprKind::Constant &&
            *constant == extent.getValue();
   if (auto argument = dyn_cast<BlockArgument>(value)) {
-    auto function = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
-    if (!function)
-      return false;
-    DictionaryAttr attrs = function.getArgAttrDict(argument.getArgNumber());
-    auto kind = attrs.getAs<StringAttr>(abiKindAttr);
-    auto dimension = attrs.getAs<IntegerAttr>(dimensionAttr);
-    return kind && kind.getValue() == "dimension" && dimension &&
-           extent.getKind() ==
-               PhysicalExprKind::Dimension &&
-           dimension.getInt() == extent.getValue();
+    return queryArgumentExpression(argument) == extent;
   }
   if (auto dim = value.getDefiningOp<DimOp>()) {
     auto view = dyn_cast<ViewType>(resource.getType());
@@ -360,7 +352,7 @@ bool matchesResourceExtent(Value value, Value resource, unsigned axis) {
   if (auto parameter = queryParameter(value))
     return extent.getKind() ==
                PhysicalExprKind::Parameter &&
-           parameter.getName() == extent.getSymbolName();
+           parameter.getName() == extent.getParameterReference().getName();
   if (auto bound = value.getDefiningOp<RangeBoundOp>()) {
     auto range = bound.getRange().getDefiningOp<RangeOp>();
     if (!range)
@@ -382,7 +374,7 @@ bool capacityCoversResourceExtent(Value value, Value resource, unsigned axis) {
                         PhysicalExprKind::Parameter) {
     auto resolved = queryParameterBySymbol(
         expression->getParentOfType<func::FuncOp>(),
-        expression.getExpression().getSymbolName());
+        expression.getExpression().getParameterReference().getName());
     if (succeeded(resolved))
       parameter = *resolved;
   }
@@ -449,7 +441,7 @@ bool upperBoundWithinResource(Value value, Value resource, unsigned axis) {
                             ? resource.getParentRegion()->getParentOfType<func::FuncOp>()
                             : func::FuncOp();
   FailureOr<ParameterAttr> parameter =
-      kernel ? queryParameterBySymbol(kernel, extent.getSymbolName())
+      kernel ? queryParameterBySymbol(kernel, extent.getParameterReference().getName())
              : FailureOr<ParameterAttr>(failure());
   if (failed(parameter))
     return false;
@@ -731,7 +723,7 @@ IndexSign physicalIndexSign(PhysicalExprAttr expression, func::FuncOp kernel) {
   if (kind == PhysicalExprKind::Dimension)
     return IndexSign::NonNegative;
   if (kind == PhysicalExprKind::Parameter) {
-    FailureOr<ParameterAttr> parameter = queryParameterBySymbol(kernel, expression.getSymbolName());
+    FailureOr<ParameterAttr> parameter = queryParameterBySymbol(kernel, expression.getParameterReference().getName());
     if (failed(parameter))
       return IndexSign::Unknown;
     auto candidates = (*parameter).getCandidates().asArrayRef();
@@ -860,13 +852,9 @@ bool valueKnownNonNegative(Value value, unsigned depth = 0) {
   if (value.getDefiningOp<DimOp>())
     return true;
   if (auto argument = dyn_cast<BlockArgument>(value)) {
-    if (auto function =
-            dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp())) {
-      DictionaryAttr attrs = function.getArgAttrDict(argument.getArgNumber());
-      auto kind = attrs.getAs<StringAttr>(abiKindAttr);
-      if (kind && kind.getValue() == "dimension")
-        return true;
-    }
+    if (auto binding = getArgumentBinding(argument);
+        binding && binding.getKind() == ArgumentKind::Dimension)
+      return true;
     auto loop = dyn_cast_or_null<scf::ForOp>(argument.getOwner()->getParentOp());
     if (loop && argument == loop.getInductionVar()) {
       return valueKnownPositive(loop.getStep(), depth + 1) &&
@@ -979,7 +967,7 @@ nonNegativeExtentBounds(func::FuncOp kernel, PhysicalExprAttr extent) {
   }
   if (kind == PhysicalExprKind::Parameter) {
     FailureOr<ParameterAttr> parameter =
-        queryParameterBySymbol(kernel, extent.getSymbolName());
+        queryParameterBySymbol(kernel, extent.getParameterReference().getName());
     if (failed(parameter))
       return std::nullopt;
     // Provider configuration formation may rebind resident capacity. Its
@@ -1000,7 +988,7 @@ nonNegativeExtentBounds(func::FuncOp kernel, PhysicalExprAttr extent) {
       bool bound = true;
       for (Attribute attribute : configurations.getRows()) {
         auto tuple = dyn_cast<DictionaryAttr>(attribute);
-        auto selected = tuple ? tuple.getAs<IntegerAttr>(extent.getSymbolName())
+        auto selected = tuple ? tuple.getAs<IntegerAttr>(extent.getParameterReference().getName())
                               : IntegerAttr();
         if (!selected || selected.getInt() <= 0 ||
             !llvm::is_contained(candidates, selected.getInt())) {
@@ -1396,7 +1384,7 @@ bool valueMatchesExtent(Value value, PhysicalExprAttr extent) {
   if (kind == PhysicalExprKind::Parameter) {
     auto parameter = queryParameter(value);
     return parameter &&
-           parameter.getName() == extent.getSymbolName();
+           parameter.getName() == extent.getParameterReference().getName();
   }
   return false;
 }
@@ -1409,7 +1397,7 @@ bool isExclusiveProgramRange(MakeRangeOp range, func::FuncOp kernel) {
   if (auto expression = extent.getDefiningOp<PhysicalExprOp>();
       expression && expression.getExpression().getKind() ==
           PhysicalExprKind::Parameter) {
-    auto parameter = queryParameterBySymbol(kernel, expression.getExpression().getSymbolName());
+    auto parameter = queryParameterBySymbol(kernel, expression.getExpression().getParameterReference().getName());
     if (failed(parameter))
       return false;
   }
@@ -1748,7 +1736,7 @@ FailureOr<ParameterAttr> queryBlockingParameter(func::FuncOp kernel,
                     : PhysicalExprAttr();
   if (extent && extent.getKind() ==
                     PhysicalExprKind::Parameter)
-    return queryParameterBySymbol(kernel, extent.getSymbolName());
+    return queryParameterBySymbol(kernel, extent.getParameterReference().getName());
 
   PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
                             range.getDerived()};
@@ -1918,26 +1906,8 @@ PhysicalExprAttr queryLaunchExpression(Value value) {
       }
       return expression(PhysicalExprKind::Constant, integer.getInt());
     }
-    if (auto argument = dyn_cast<BlockArgument>(current)) {
-      auto kernel = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
-      if (!kernel)
-        return {};
-      DictionaryAttr attributes = kernel.getArgAttrDict(argument.getArgNumber());
-      auto kind = attributes.getAs<StringAttr>(abiKindAttr);
-      auto name = attributes.getAs<StringAttr>(abiNameAttr);
-      if (!kind || !name)
-        return {};
-      if (kind.getValue() == "dimension") {
-        auto dimension = attributes.getAs<IntegerAttr>(dimensionAttr);
-        return dimension ? expression(PhysicalExprKind::Dimension,
-                                      dimension.getInt(), name.getValue())
-                         : PhysicalExprAttr();
-      }
-      if (kind.getValue() == "scalar" || kind.getValue() == "constexpr" ||
-          kind.getValue() == "value" || kind.getValue() == "stride")
-        return expression(PhysicalExprKind::ScalarABI, 0, name.getValue());
-      return {};
-    }
+    if (auto argument = dyn_cast<BlockArgument>(current))
+      return queryArgumentExpression(argument);
     if (auto dim = current.getDefiningOp<DimOp>())
       return resourceExtentExpression(dim.getView(), dim.getAxis());
     if (auto physical = current.getDefiningOp<PhysicalExprOp>())
@@ -2095,23 +2065,9 @@ IndexBounds queryIndexBounds(Value value) {
     if (current.getDefiningOp<ProgramIdOp>())
       return {true, {}};
     auto dimensionExpression = [&](BlockArgument argument) -> PhysicalExprAttr {
-      auto kernel = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
-      DictionaryAttr attributes =
-          kernel ? kernel.getArgAttrDict(argument.getArgNumber())
-                 : DictionaryAttr();
-      auto kind = attributes ? attributes.getAs<StringAttr>(abiKindAttr)
-                             : StringAttr();
-      auto dimension = attributes
-                           ? attributes.getAs<IntegerAttr>(dimensionAttr)
-                           : IntegerAttr();
-      if (!kind || kind.getValue() != "dimension" || !dimension)
-        return {};
-      return PhysicalExprAttr::get(
-          current.getContext(), PhysicalExprKind::Dimension,
-          dimension.getInt(),
-          StringAttr::get(current.getContext(),
-                          "D" + std::to_string(dimension.getInt())),
-          ArrayAttr::get(current.getContext(), {}));
+      auto binding = getArgumentBinding(argument);
+      return binding && binding.getKind() == ArgumentKind::Dimension
+          ? queryArgumentExpression(argument) : PhysicalExprAttr{};
     };
     if (auto dim = current.getDefiningOp<DimOp>())
       return {true, resourceExtentExpression(dim.getView(), dim.getAxis())};
@@ -2501,9 +2457,12 @@ bool canReplayReadAt(LoadOp load, Operation *insertionAnchor) {
             (writtenBuffer && isa<ViewType>(load.getResource().getType())) ||
             (readBuffer && writtenBuffer &&
              readBuffer.getInstance() != writtenBuffer.getInstance());
+        auto publicRead = getPublicView(load.getResource());
+        auto publicWrite = getPublicView(written);
         bool disjointViews = readView && writtenView &&
-            (readView.getLayout().getNoalias() ||
-             writtenView.getLayout().getNoalias());
+            (isInvocationWorkspace(load.getResource()) || isInvocationWorkspace(written) ||
+             (publicRead && publicRead.getConstraints().getNoalias()) ||
+             (publicWrite && publicWrite.getConstraints().getNoalias()));
         if ((privateAllocation || disjointViews) && isa<StoreOp>(nested))
           return WalkResult::advance();
       }

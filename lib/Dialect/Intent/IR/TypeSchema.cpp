@@ -3,6 +3,53 @@
 
 using namespace mlir;
 
+namespace intent {
+
+bool isCanonicalScalarType(Type type) {
+  if (isa<IndexType>(type)) return true;
+  if (auto integer = dyn_cast<IntegerType>(type))
+    return llvm::is_contained({1u, 8u, 16u, 32u, 64u}, integer.getWidth());
+  if (auto floating = dyn_cast<FloatType>(type))
+    return floating.isF16() || floating.isBF16() || floating.isF32() ||
+        floating.isF64() || isa<Float8E4M3FNType, Float8E5M2Type>(floating);
+  return false;
+}
+
+LogicalResult verifyCanonicalType(function_ref<InFlightDiagnostic()> error, Type type) {
+  if (isCanonicalScalarType(type) ||
+      isa<LogicalIndexType, DomainType, RegionType, ConstexprType, EnumType>(type))
+    return success();
+  if (auto tensor = dyn_cast<RankedTensorType>(type)) {
+    if (failed(verifyCanonicalType(error, tensor.getElementType()))) return failure();
+    auto encoding = dyn_cast_or_null<TensorShapeAttr>(tensor.getEncoding());
+    auto dimensions = encoding ? encoding.getDimensions() : DenseI64ArrayAttr();
+    if (!dimensions || dimensions.size() != tensor.getRank())
+      return error() << "tensor type requires one canonical dimension identity per axis";
+    if (llvm::any_of(dimensions.asArrayRef(), [](int64_t identity) { return identity <= 0; }))
+      return error() << "tensor dimension identities must be positive for every logical axis";
+    return success();
+  }
+  if (auto view = dyn_cast<ViewType>(type)) return verifyCanonicalType(error, view.getTensor());
+  if (auto buffer = dyn_cast<BufferType>(type)) return verifyCanonicalType(error, buffer.getTensor());
+  if (auto tuple = dyn_cast<intent::TupleType>(type)) {
+    for (Attribute attribute : tuple.getComponentTypes())
+      if (failed(verifyCanonicalType(error, cast<TypeAttr>(attribute).getValue()))) return failure();
+    return success();
+  }
+  if (auto record = dyn_cast<RecordType>(type)) {
+    for (Attribute attribute : record.getFieldTypes())
+      if (failed(verifyCanonicalType(error, cast<TypeAttr>(attribute).getValue()))) return failure();
+    return success();
+  }
+  return error() << "contains non-canonical KIR type " << type;
+}
+
+LogicalResult verifyCanonicalType(Operation *owner, Type type) {
+  return verifyCanonicalType([&] { return owner->emitOpError(); }, type);
+}
+
+} // namespace intent
+
 namespace intent::detail {
 
 bool isIntegerLike(Type type) {

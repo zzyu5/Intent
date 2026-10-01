@@ -6,6 +6,7 @@ from dataclasses import field
 from enum import IntEnum
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
+from .interface import PublicInterface
 
 
 BackendIRCollector = Callable[[object], dict[str, str]]
@@ -104,8 +105,12 @@ class CompiledArtifact:
         return self._invoke(self.runtime.run, arguments)
 
     @property
-    def interface(self):
-        """Read this runtime's typed invocation interface; unsupported runtimes raise NotImplementedError."""
+    def interface(self) -> PublicInterface:
+        """Read the common typed public parameters, excluding compiler-private resources.
+
+        This describes dtype, shape, stride and allocation constraints in author
+        order. Device binding and native launch arguments remain runtime-owned.
+        """
         if not hasattr(self.runtime, "interface"):
             raise NotImplementedError("this runtime does not expose a typed invocation interface")
         return self.runtime.interface

@@ -54,7 +54,7 @@ gpu::PhysicalExprAttr arrayIndexTileBound(gpu::PhysicalExprAttr expression,
   if (kind == gpu::PhysicalExprKind::Constant)
     return expression.getValue() > 0 ? expression : gpu::PhysicalExprAttr();
   if (kind == gpu::PhysicalExprKind::Parameter) {
-    auto parameter = gpu::queryParameterBySymbol(kernel, expression.getSymbolName());
+    auto parameter = gpu::queryParameterBySymbol(kernel, expression.getParameterReference().getName());
     if (failed(parameter))
       return {};
     if (parameter->isDeferred())
@@ -65,7 +65,7 @@ gpu::PhysicalExprAttr arrayIndexTileBound(gpu::PhysicalExprAttr expression,
     int64_t maximum = 0;
     for (Attribute configuration : configurations.getRows()) {
       auto tuple = dyn_cast<DictionaryAttr>(configuration);
-      auto value = tuple ? tuple.getAs<IntegerAttr>(expression.getSymbolName()) : IntegerAttr();
+      auto value = tuple ? tuple.getAs<IntegerAttr>(expression.getParameterReference().getName()) : IntegerAttr();
       if (!value || value.getInt() <= 0)
         return {};
       maximum = std::max(maximum, value.getInt());
@@ -99,15 +99,17 @@ gpu::PhysicalExprAttr arrayIndexTileBound(gpu::PhysicalExprAttr expression,
       expression.getSymbol(), ArrayAttr::get(kernel.getContext(), operands));
 }
 
-ArrayAttr arrayIndexTileBounds(func::FuncOp kernel) {
+using ArrayIndexBounds = SmallVector<std::pair<BlockArgument, ArrayAttr>>;
+
+std::optional<ArrayIndexBounds> arrayIndexTileBounds(func::FuncOp kernel) {
   MLIRContext *context = kernel.getContext();
   auto one = gpu::PhysicalExprAttr::get(
       context, gpu::PhysicalExprKind::Constant, 1,
       StringAttr::get(context), ArrayAttr::get(context, {}));
-  SmallVector<SmallVector<Attribute>> bounds(kernel.getNumArguments());
+  llvm::DenseMap<Value, SmallVector<Attribute>> bounds;
   for (BlockArgument argument : kernel.getArguments())
     if (auto view = dyn_cast<gpu::ViewType>(argument.getType()))
-      bounds[argument.getArgNumber()].assign(view.getRank(), one);
+      bounds[argument].assign(view.getRank(), one);
   bool hasArrayAccess = false;
   auto result = kernel.walk([&](Operation *operation) {
     Value resource;
@@ -144,7 +146,7 @@ ArrayAttr arrayIndexTileBounds(func::FuncOp kernel) {
       return WalkResult::interrupt();
     if (!tile)
       return WalkResult::advance();
-    auto &viewBounds = bounds[argument.getArgNumber()];
+    auto &viewBounds = bounds[argument];
     if (tile.getShape().size() != viewBounds.size())
       return WalkResult::interrupt();
     for (auto [axis, extent] : llvm::enumerate(tile.getShape())) {
@@ -162,10 +164,11 @@ ArrayAttr arrayIndexTileBounds(func::FuncOp kernel) {
   });
   if (result.wasInterrupted() || !hasArrayAccess)
     return {};
-  SmallVector<Attribute> encoded;
-  for (const auto &shape : bounds)
-    encoded.push_back(ArrayAttr::get(context, shape));
-  return ArrayAttr::get(context, encoded);
+  ArrayIndexBounds resultBounds;
+  for (BlockArgument argument : kernel.getArguments())
+    if (auto entry = bounds.find(argument); entry != bounds.end())
+      resultBounds.emplace_back(argument, ArrayAttr::get(context, entry->second));
+  return resultBounds;
 }
 
 void preserveNativeIndexValues(func::FuncOp kernel) {
@@ -182,9 +185,18 @@ void preserveNativeIndexValues(func::FuncOp kernel) {
 }
 
 LogicalResult verifyKernel(func::FuncOp kernel) {
-  if (Attribute bounds = kernel->getAttr(arrayIndexTileBoundsAttr))
-    if (bounds != arrayIndexTileBounds(kernel))
+  if (kernel->hasAttr(arrayIndexTileBoundsAttr)) {
+    auto expected = arrayIndexTileBounds(kernel);
+    if (!kernel->getAttrOfType<UnitAttr>(arrayIndexTileBoundsAttr) || !expected)
       return kernel.emitError("cuTile array-index bounds do not cover the current native accesses");
+    for (auto [argument, bounds] : *expected)
+      if (kernel.getArgAttr(argument.getArgNumber(), arrayIndexTileBoundsAttr) != bounds)
+        return kernel.emitError("cuTile array-index bounds do not match their view argument");
+  }
+  for (BlockArgument argument : kernel.getArguments())
+    if (kernel.getArgAttr(argument.getArgNumber(), arrayIndexTileBoundsAttr) &&
+        (!kernel->hasAttr(arrayIndexTileBoundsAttr) || !isa<gpu::ViewType>(argument.getType())))
+      return kernel.emitError("cuTile array-index bounds require a selected view binding");
   auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
   if (!space || space.size() != 1)
     return kernel.emitError(
@@ -682,8 +694,11 @@ LogicalResult finalizeProgram(ModuleOp module) {
     return failure();
   if (failed(gpu::eliminateCommonValues(module)))
     return failure();
-  if (ArrayAttr bounds = arrayIndexTileBounds(*kernel))
-    (*kernel)->setAttr(arrayIndexTileBoundsAttr, bounds);
+  if (auto bounds = arrayIndexTileBounds(*kernel)) {
+    (*kernel)->setAttr(arrayIndexTileBoundsAttr, UnitAttr::get(module.getContext()));
+    for (auto [argument, shape] : *bounds)
+      kernel->setArgAttr(argument.getArgNumber(), arrayIndexTileBoundsAttr, shape);
+  }
   SmallVector<ValueRange> reductionSources;
   kernel->walk([&](ReduceOp reduce) {
     reductionSources.push_back(reduce.getSources());

@@ -39,7 +39,7 @@ class SymbolRef:
 @dataclass(frozen=True, slots=True)
 class ParameterAttribute:
     name: str
-    kind: int
+    origin: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,7 +114,7 @@ def emit_attribute(value: object) -> str:
             emit_attribute(axis) for axis in value.axes
         ) + "]>"
     if isinstance(value, ParameterAttribute):
-        return f"#intent.parameter<{quote(value.name)}, {value.kind}>"
+        return f"#intent.parameter<{quote(value.name)}, {value.origin}>"
     if isinstance(value, FunctionKindAttribute):
         return f"#intent.function_kind<{value.kind}>"
     if isinstance(value, SparseFormatAttribute):

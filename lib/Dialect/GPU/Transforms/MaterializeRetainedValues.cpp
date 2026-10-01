@@ -7,6 +7,7 @@
 #include "Intent/Dialect/GPU/Transforms/Storage.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
+#include "Intent/Dialect/GPU/Transforms/ProgramInterface.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -32,19 +33,13 @@ Value createInvocationWorkspace(func::FuncOp kernel, Location location,
                                 Type elementType, ArrayAttr shape,
                                 uint64_t owner) {
   uint64_t instance = 1;
-  llvm::StringSet<> names;
   for (BlockArgument argument : kernel.getArguments()) {
-    names.insert(kernel.getArgAttrDict(argument.getArgNumber())
-                     .getAs<StringAttr>(abiNameAttr).getValue());
     if (auto buffer = dyn_cast<BufferType>(argument.getType()))
       instance = std::max(instance, buffer.getInstance() + 1);
   }
   kernel.walk([&](BufferOp buffer) {
     instance = std::max(instance, buffer.getResult().getType().getInstance() + 1);
   });
-  std::string name = ("_workspace_" + Twine(instance)).str();
-  while (!names.insert(name).second)
-    name += "_";
   OpBuilder builder(kernel.getContext());
   auto type = BufferType::get(
       kernel.getContext(), elementType, shape,
@@ -53,14 +48,11 @@ Value createInvocationWorkspace(func::FuncOp kernel, Location location,
       BufferInitializationAttr::get(kernel.getContext(), BufferInitialization::FirstWrite),
       BufferLifetimeAttr::get(kernel.getContext(), BufferLifetime::Invocation),
       /*visibility=*/1, /*workspace=*/true);
-  unsigned argument = kernel.getNumArguments();
-  kernel.insertArgument(
-      argument, type,
-      builder.getDictionaryAttr({
-          builder.getNamedAttr(abiKindAttr, builder.getStringAttr("workspace")),
-          builder.getNamedAttr(abiNameAttr, builder.getStringAttr(name)),
-      }), location);
-  return kernel.getArgument(argument);
+  auto binding = ArgumentBindingAttr::get(kernel.getContext(),
+      nextArgumentReference(kernel), ArgumentKind::Workspace,
+      IntegerAttr{}, ArgumentRefAttr{}, IntegerAttr{}, IntegerAttr{});
+  auto argument = appendArgument(kernel, type, binding);
+  return succeeded(argument) ? Value(*argument) : Value{};
 }
 
 FailureOr<Value> materializeRetainedSlice(
@@ -440,7 +432,7 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
     if (!end || (!indirect && end != outputShape[axis]))
       return false;
     if (extent.getKind() == PhysicalExprKind::Parameter) {
-      FailureOr<ParameterAttr> parameter = queryParameterBySymbol(kernel, extent.getSymbolName());
+      FailureOr<ParameterAttr> parameter = queryParameterBySymbol(kernel, extent.getParameterReference().getName());
       if (failed(parameter) || !parameter->isDeferred())
         return false;
     } else if (extent.getKind() != PhysicalExprKind::Constant ||
@@ -651,10 +643,15 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
             return false;
           if (load.getResource() != store.getResource()) {
             if (output) {
-              auto input = dyn_cast<ViewType>(load.getResource().getType());
-              if (input && !input.getLayout().getNoalias() &&
-                  !output.getLayout().getNoalias())
-                return false;
+              if (isa<ViewType>(load.getResource().getType())) {
+                auto input = getPublicView(load.getResource());
+                auto destination = getPublicView(store.getResource());
+                bool independent = isInvocationWorkspace(load.getResource()) ||
+                    isInvocationWorkspace(store.getResource()) ||
+                    (input && input.getConstraints().getNoalias()) ||
+                    (destination && destination.getConstraints().getNoalias());
+                if (!independent) return false;
+              }
             }
             continue;
           }
@@ -847,7 +844,7 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
     auto extent = cast<PhysicalExprAttr>(payload.getShape()[axis]);
     if (extent.getKind() != PhysicalExprKind::Parameter)
       return {};
-    auto parameter = queryParameterBySymbol(kernel, extent.getSymbolName());
+    auto parameter = queryParameterBySymbol(kernel, extent.getParameterReference().getName());
     if (failed(parameter))
       return {};
     auto dimension = parameter->isDeferred() ? parameter->getBinding().getDimension() : IntegerAttr();
@@ -886,7 +883,7 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
     if (extent.getKind() == PhysicalExprKind::Constant) {
       minimum = extent.getValue();
     } else if (extent.getKind() == PhysicalExprKind::Parameter) {
-      auto parameter = queryParameterBySymbol(kernel, extent.getSymbolName());
+      auto parameter = queryParameterBySymbol(kernel, extent.getParameterReference().getName());
       if (failed(parameter))
         return false;
       minimum = *llvm::min_element(parameter->getCandidates().asArrayRef());
@@ -1037,7 +1034,7 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
         builder.getArrayAttr({}));
   }
   if (chunkExtent.getKind() == PhysicalExprKind::Parameter) {
-    FailureOr<ParameterAttr> parameter = queryParameterBySymbol(kernel, chunkExtent.getSymbolName());
+    FailureOr<ParameterAttr> parameter = queryParameterBySymbol(kernel, chunkExtent.getParameterReference().getName());
     if (failed(parameter))
       return failure();
     chunk = materializeParameter(builder, gather.getLoc(), parameter->getReference());

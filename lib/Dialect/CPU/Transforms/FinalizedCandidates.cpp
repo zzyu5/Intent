@@ -1,5 +1,6 @@
 #include "Intent/Dialect/CPU/Transforms/FinalizedCandidates.h"
 #include "Intent/Dialect/CPU/IR/CPUAttrs.h"
+#include "Intent/Dialect/Intent/IR/Interface.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/SymbolTable.h"
@@ -35,7 +36,7 @@ void deduplicateFinalizedCandidates(ModuleOp module) {
     if (function.isExternal() ||
         !function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration") ||
         !function->getAttrOfType<ArrayAttr>("intent_cpu.implementations") ||
-        !function->getAttrOfType<InterfaceAttr>("intent_cpu.interface"))
+        !getPublicInterface(function))
       continue;
     // Do not infer a correspondence between separate task/callee graphs, or
     // change an entry whose symbol identity is observed elsewhere in the IR.

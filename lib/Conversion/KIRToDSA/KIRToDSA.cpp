@@ -47,13 +47,12 @@ public:
         shapeBindings(shapes), strideBindings(strides) {}
 
   LogicalResult lower(func::FuncOp source) {
-    auto parameters = source->getAttrOfType<ArrayAttr>("intent.parameters");
-    if (!parameters || parameters.size() != source.getNumArguments())
-      return source.emitError("DSA construction requires canonical parameter metadata");
+    auto publicInterface = buildPublicInterface(source);
+    if (failed(publicInterface)) return failure();
     DenseMap<int64_t, int64_t> fixedDimensions;
     llvm::SmallSet<StringRef, 8> boundNames;
-    for (auto [argument, parameter] : llvm::zip(source.getArguments(), parameters)) {
-      auto name = cast<ParameterAttr>(parameter).getName();
+    for (BlockArgument argument : source.getArguments()) {
+      auto name = getSourceParameter(argument).getName();
       auto binding = shapeBindings ? shapeBindings.getAs<DenseI64ArrayAttr>(name.getValue()) : DenseI64ArrayAttr();
       if (!binding) continue;
       auto view = dyn_cast<ViewType>(argument.getType());
@@ -77,11 +76,11 @@ public:
     if (shapeBindings && boundNames.size() != shapeBindings.size())
       return source.emitError("DSA shape binding names an unknown parameter");
     SmallVector<Type> arguments;
-    SmallVector<Attribute> interface;
+    SmallVector<Attribute> interface(publicInterface->getArguments().getValue());
     SmallVector<Value> sourceArguments;
     llvm::SmallSet<StringRef, 8> boundStrideNames;
-    for (auto [argument, parameter] : llvm::zip(source.getArguments(), parameters)) {
-      auto name = cast<ParameterAttr>(parameter).getName();
+    for (BlockArgument argument : source.getArguments()) {
+      auto name = getSourceParameter(argument).getName();
       if (isa<ConstexprType>(argument.getType()) && argument.use_empty()) continue;
       if (auto view = dyn_cast<ViewType>(argument.getType())) {
         auto tensor = cast<RankedTensorType>(view.getTensor());
@@ -109,11 +108,11 @@ public:
               constraints.getAlias(), constraints.getNoalias());
           boundStrideNames.insert(name.getValue());
         }
-        interface.push_back(dsa::ViewArgumentAttr::get(b.getContext(), name, tensor.getElementType(),
-            b.getDenseI64ArrayAttr(specialized), shape.getDimensions(), view.getAccess(), constraints));
+        auto compiledTensor = RankedTensorType::get(specialized, tensor.getElementType(), shape);
+        auto compiledView = intent::ViewType::get(b.getContext(), compiledTensor, view.getAccess(), constraints);
+        interface[sourceArguments.size()] = PublicParameterAttr::get(b.getContext(), name, compiledView);
       } else if (argument.getType().isF32() || argument.getType().isIndex() || argument.getType().isInteger(64) || argument.getType().isInteger(32) || argument.getType().isInteger(1)) {
         arguments.push_back(argument.getType());
-        interface.push_back(dsa::ScalarArgumentAttr::get(b.getContext(), name, argument.getType()));
       } else return source.emitError("unsupported DSA scalar ABI type");
       sourceArguments.push_back(argument);
     }
@@ -121,7 +120,11 @@ public:
       return source.emitError("DSA stride binding must name a view parameter");
     b.setInsertionPointToEnd(target.getBody());
     function = b.create<func::FuncOp>(source.getLoc(), source.getName(), b.getFunctionType(arguments, {}));
-    function->setAttr("intent_dsa.interface", dsa::InterfaceAttr::get(b.getContext(), b.getArrayAttr(interface)));
+    auto compiledInterface = InterfaceAttr::getChecked([&] { return source.emitError(); },
+        b.getContext(), b.getArrayAttr(interface));
+    if (!compiledInterface) return failure();
+    function->setAttr(interfaceAttr, compiledInterface);
+    function->setAttr(dsa::entryRequirementsAttr, dsa::EntryRequirementsAttr::get(b.getContext(), true));
     function->setAttr("intent_dsa.configuration", config);
     function.addEntryBlock();
     b.setInsertionPointToStart(&function.front());
@@ -2683,8 +2686,8 @@ private:
   }
   Value stride(Location loc, Value view, int64_t axis) {
     if (auto argument = dyn_cast<BlockArgument>(view); argument && argument.getOwner() == &function.front()) {
-      auto interface = function->getAttrOfType<dsa::InterfaceAttr>("intent_dsa.interface");
-      auto parameter = cast<dsa::ViewArgumentAttr>(interface.getArguments()[argument.getArgNumber()]);
+      auto interface = intent::getPublicInterface(function);
+      auto parameter = intent::getPublicView(interface, argument.getArgNumber());
       if (parameter.getConstraints().getHasStrides())
         if (auto fixed = dyn_cast<IntegerAttr>(parameter.getConstraints().getStrides()[axis]))
           return index(loc, fixed.getInt());

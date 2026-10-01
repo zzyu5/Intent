@@ -38,6 +38,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   ValueRelations.cpp
   Traversal.cpp
   PhysicalParameters.cpp
+  ProgramInterface.cpp
   Resources.cpp
   VerifyGPUProgram.cpp
 

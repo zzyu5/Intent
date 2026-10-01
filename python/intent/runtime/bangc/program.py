@@ -6,11 +6,8 @@ import statistics
 
 from .buffer import DeviceBuffer, DeviceView, runtime
 from .compilation import compile_library
-from ..native import AliasCheck, NativeInterface, NativePreparedRuntime, ScalarParameter, ViewFacts, ViewParameter
-
-
-_SCALAR_CTYPES = {"f32": ctypes.c_float, "i64": ctypes.c_int64,
-                  "i32": ctypes.c_int32, "bool": ctypes.c_bool}
+from ..interface import AliasCheck, ScalarParameter, ViewParameter, byte_spans_overlap
+from ..native import NativeABI, NativePreparedRuntime, ViewFacts
 
 
 @dataclass
@@ -105,19 +102,19 @@ class NativeProgram(NativePreparedRuntime):
         require_matching_target(compilation, target.compilation)
         self.target = target
         self.metadata = metadata
-        self.parameters = metadata["parameters"]
-        self.interface = NativeInterface.read(self.parameters)
-        self._binders = self.interface.binders(
+        abi = NativeABI.read(metadata)
+        self.interface = abi.interface
+        self._binders = abi.binders(
             observe_view=type(self)._view, allocate_output=type(self)._allocate_output,
             check_alias=type(self)._check_alias, scalar_argument=type(self)._scalar,
             check_dimensions=type(self)._check_dimensions,
         )
-        parameters_by_name = {parameter["name"]: parameter for parameter in self.parameters}
+        parameters_by_name = {parameter.name: parameter for parameter in self.interface.parameters}
         for name, shape in target.compilation.shapes:
             parameter = parameters_by_name.get(name)
-            if parameter is None or parameter["kind"] != "view" or len(shape) != len(parameter["shape"]):
+            if not isinstance(parameter, ViewParameter) or len(shape) != len(parameter.shape):
                 raise ValueError("BANG C artifact and target disagree on bound parameter shapes")
-            if any(extent >= 0 and extent != declared for extent, declared in zip(shape, parameter["shape"])):
+            if any(extent >= 0 and extent != declared for extent, declared in zip(shape, parameter.shape)):
                 raise ValueError("BANG C artifact and target disagree on bound extents")
         self.compilation = compile_library(source, target)
         self.runtime = runtime(target.neuware)
@@ -125,7 +122,7 @@ class NativeProgram(NativePreparedRuntime):
         self.queue = ctypes.c_void_p()
         self.runtime.invoke("cnrtQueueCreate", ctypes.byref(self.queue))
         self.function = getattr(self.compilation.library, metadata["entry"])
-        self.function.argtypes = (ctypes.c_void_p, *self.interface.argument_types(_SCALAR_CTYPES.__getitem__))
+        self.function.argtypes = (ctypes.c_void_p, *abi.argument_types())
         self.function.restype = ctypes.c_int
 
     def run(self, *arguments):
@@ -140,7 +137,7 @@ class NativeProgram(NativePreparedRuntime):
         bound = self._binders[bool(explicit_outputs)](self, arguments)
         # BANG C run returns only declared Out buffers. CPU runtimes also return
         # their InOut state; that difference is not part of the flattened ABI.
-        outputs = tuple(bound.arguments[parameter.position] for parameter in self.interface.allocated_outputs)
+        outputs = tuple(bound.arguments[parameter.position] for parameter in self.interface.outputs)
         return NativeCall(self, bound.arguments, bound.native_arguments, outputs)
 
     def _view(self, parameter: ViewParameter, value) -> ViewFacts:
@@ -148,19 +145,19 @@ class NativeProgram(NativePreparedRuntime):
             raise TypeError(f"{parameter.name} requires a live MLU buffer or view")
         if value.device != self.target.device or value.runtime is not self.runtime:
             raise ValueError("BANG C arguments must belong to the artifact's MLU device and runtime")
-        if value.dtype != parameter.dtype or len(value.shape) != len(parameter.shape):
+        if value.dtype != parameter.dtype.name or len(value.shape) != len(parameter.shape):
             raise ValueError(f"{parameter.name} has incompatible shape or dtype")
         lower, upper = value.byte_bounds
+        owner = value.owner if isinstance(value, DeviceView) else value
         return ViewFacts(value.shape, value.strides, value.pointer, value.allocation_pointer,
+                         owner.pointer + owner.nbytes,
                          value.pointer - value.allocation_pointer, value.dtype, lower, upper)
 
     def _allocate_output(self, parameter: ViewParameter, shape: tuple[int, ...]) -> tuple[DeviceBuffer, ViewFacts]:
-        value = DeviceBuffer(shape, parameter.dtype, device=self.target.device, neuware=self.target.neuware)
-        if parameter.stride_mismatch(value.strides):
-            value.close()
-            raise NotImplementedError("automatic BANG C outputs require contiguous declared strides; launch accepts explicit strided output views")
+        value = DeviceBuffer(shape, parameter.dtype.name, device=self.target.device, neuware=self.target.neuware)
         lower, upper = value.byte_bounds
         return value, ViewFacts(value.shape, value.strides, value.pointer, value.allocation_pointer,
+                                value.pointer + value.nbytes,
                                 0, value.dtype, lower, upper)
 
     def _check_dimensions(self, dimensions: dict[int, int]) -> None:
@@ -170,15 +167,15 @@ class NativeProgram(NativePreparedRuntime):
 
     @staticmethod
     def _scalar(parameter: ScalarParameter, value):
-        return float(value) if parameter.dtype == "f32" else int(value)
+        return float(value) if parameter.dtype.name == "f32" else int(value)
 
     @staticmethod
     def _check_alias(check: AliasCheck, left: ViewFacts, right: ViewFacts) -> None:
-        if check.noalias_violation(left, right):
+        if check.noalias_violation((left.allocation, left.allocation_end), (right.allocation, right.allocation_end)):
             raise ValueError("MLU views violate a declared noalias contract")
-        if check.writable_overlap(left, right):
+        if check.writable and byte_spans_overlap((left.begin, left.end), (right.begin, right.end)):
             raise NotImplementedError("BANG C currently requires nonoverlapping writable views")
-        if check.allocation_violation(left, right):
+        if check.allocation_violation(left.allocation, right.allocation):
             raise ValueError("MLU views violate a declared allocation alias relation")
 
     def close(self) -> None:

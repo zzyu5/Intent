@@ -50,27 +50,28 @@ class RemoteSequence:
         program = intent.generate(definition, target=target, compiler=self.context.compiler,
             constexprs=constexprs, tuning_config=self.context.tuning_config)
         bound = dict(arguments)
+        interface = program.interface
         dimensions = {}
-        for parameter in program.metadata["parameters"]:
-            value = bound.get(parameter["name"])
-            if parameter["kind"] == "view" and value is not None:
-                for identity, extent in zip(parameter["dimensions"], value.shape):
+        for parameter in interface.views:
+            value = bound.get(parameter.name)
+            if value is not None:
+                for identity, extent in zip(parameter.dimensions, value.shape):
                     if identity > 0:
                         dimensions[identity] = extent
         outputs = {}
-        for parameter in program.metadata["parameters"]:
-            name = parameter["name"]
-            if parameter["kind"] == "view" and parameter["access"] == 1 and name not in bound:
+        for parameter in interface.parameters:
+            name = parameter.name
+            if isinstance(parameter, intent.ViewParameter) and parameter.output and name not in bound:
                 shape = tuple(fixed if fixed >= 0 else dimensions[identity]
-                    for fixed, identity in zip(parameter["shape"], parameter["dimensions"]))
-                bound[name] = torch.empty(shape, dtype=TORCH_DTYPES[parameter["dtype"]], device="cpu")
+                    for fixed, identity in zip(parameter.shape, parameter.dimensions))
+                bound[name] = torch.empty(shape, dtype=TORCH_DTYPES[parameter.dtype.name], device="cpu")
                 storage = bound[name].untyped_storage()
                 self.allocated_outputs.add((str(bound[name].device), storage.data_ptr(), storage.nbytes()))
             if name not in bound:
                 raise ValueError(f"missing BANG C invocation argument {name}")
-            if parameter["kind"] == "view" and parameter["access"] != 0:
+            if isinstance(parameter, intent.ViewParameter) and parameter.writable:
                 outputs[name] = bound[name]
-        self.steps.append((program, bound))
+        self.steps.append((program, bound, interface))
         report_stage("adapter_preparation")
         return outputs
 
@@ -104,11 +105,11 @@ class RemoteSequence:
             return {"buffer": name, "shape": list(value.shape), "strides": list(value.stride()),
                     "offset": value.storage_offset()}
 
-        for index, (program, arguments) in enumerate(self.steps):
+        for index, (program, arguments, interface) in enumerate(self.steps):
             artifact = f"kernel{index}"
             export_artifact(program, path / artifact)
             manifest["steps"].append({"artifact": artifact,
-                "arguments": [describe(arguments[parameter["name"]]) for parameter in program.metadata["parameters"]]})
+                "arguments": [describe(arguments[parameter.name]) for parameter in interface.parameters]})
 
         def output_spec(value):
             specification = describe(value)

@@ -2,6 +2,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/ProgramInterface.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
@@ -19,9 +20,14 @@ namespace intent::triton::detail {
 bool viewsMayAlias(Value lhs, Value rhs) {
   if (lhs == rhs)
     return true;
-  auto left = cast<gpu::ViewType>(lhs.getType());
-  auto right = cast<gpu::ViewType>(rhs.getType());
-  return !left.getLayout().getNoalias() && !right.getLayout().getNoalias();
+  if (gpu::isInvocationWorkspace(lhs) || gpu::isInvocationWorkspace(rhs))
+    return false;
+  auto left = gpu::getPublicView(lhs);
+  auto right = gpu::getPublicView(rhs);
+  // Compiler-private workspaces own distinct allocations. External views use
+  // the author contract; their current pointer relation is checked at launch.
+  return !(left && left.getConstraints().getNoalias()) &&
+         !(right && right.getConstraints().getNoalias());
 }
 
 using ViewAccessModes = llvm::DenseMap<Value, unsigned>;
@@ -84,9 +90,7 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
     for (auto [resource, mode] : bodyAccesses) {
       auto argument = dyn_cast<BlockArgument>(resource);
       auto view = dyn_cast<gpu::ViewType>(resource.getType());
-      if (!(mode & 2) || !argument || argument.getOwner() != &kernel.front() ||
-          !view || !view.getLayout().getHasStrides() ||
-          view.getLayout().getStrides().size() != view.getRank())
+      if (!(mode & 2) || !argument || argument.getOwner() != &kernel.front() || !view)
         continue;
       gpu::StoreOp selected;
       unsigned stores = 0;
@@ -171,9 +175,10 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
       auto argument = dyn_cast<BlockArgument>(value);
       if (!argument || argument.getOwner() != &kernel.front())
         return {};
-      auto kind = kernel.getArgAttrOfType<StringAttr>(argument.getArgNumber(),
-                                                    gpu::abiKindAttr);
-      return kind && kind.getValue() == "view" ? argument : BlockArgument();
+      auto binding = gpu::getArgumentBinding(argument);
+      return binding && binding.getKind() == gpu::ArgumentKind::Public &&
+                     isa<gpu::ViewType>(argument.getType())
+                 ? argument : BlockArgument();
     };
     for (auto [resource, mode] : pending)
       for (auto [other, otherMode] : current) {

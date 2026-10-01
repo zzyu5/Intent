@@ -104,11 +104,11 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
   };
   if (!external(lhs.getSource()) || !external(rhs.getSource())) return std::nullopt;
   auto function = work->getParentOfType<func::FuncOp>();
-  auto interface = function->getAttrOfType<InterfaceAttr>("intent_dsa.interface");
+  auto interface = intent::getPublicInterface(function);
   auto viewStride = [&](Value stride, Value source, unsigned axis) {
     auto argument = dyn_cast<BlockArgument>(source);
     if (!argument || argument.getOwner() != &function.front()) return false;
-    auto view = dyn_cast<ViewArgumentAttr>(interface.getArguments()[argument.getArgNumber()]);
+    auto view = intent::getPublicView(interface, argument.getArgNumber());
     if (!view || view.getAccess() != 0) return false;
     if (auto query = stride.getDefiningOp<StrideOp>())
       return query.getSource() == source && query.getAxis() == axis;
@@ -138,10 +138,10 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
   if (!lhsSourceType.isDynamicDim(1) && !rhsSourceType.isDynamicDim(0)) {
     if (lhsSourceType.getDimSize(1) != rhsSourceType.getDimSize(0)) return std::nullopt;
   } else {
-    auto leftView = cast<ViewArgumentAttr>(interface.getArguments()[cast<BlockArgument>(lhs.getSource()).getArgNumber()]);
-    auto rightView = cast<ViewArgumentAttr>(interface.getArguments()[cast<BlockArgument>(rhs.getSource()).getArgNumber()]);
-    int64_t reduction = leftView.getDimensions()[1];
-    if (reduction <= 0 || reduction != rightView.getDimensions()[0]) return std::nullopt;
+    auto leftView = intent::getPublicView(interface, cast<BlockArgument>(lhs.getSource()).getArgNumber());
+    auto rightView = intent::getPublicView(interface, cast<BlockArgument>(rhs.getSource()).getArgNumber());
+    int64_t reduction = intent::publicViewDimensions(leftView)[1];
+    if (reduction <= 0 || reduction != intent::publicViewDimensions(rightView)[0]) return std::nullopt;
   }
   if (matrix.getLhs() == matrix.getRhs() || matrix.getAccumulator() == matrix.getLhs() ||
       matrix.getAccumulator() == matrix.getRhs()) return std::nullopt;
@@ -460,9 +460,9 @@ private:
   Value mul(Location loc, Value a, Value c) { return b.create<arith::MulIOp>(loc, a, c); }
   Value stride(Location loc, Value source, unsigned axis) {
     auto function = match.work->getParentOfType<func::FuncOp>();
-    auto interface = function->getAttrOfType<InterfaceAttr>("intent_dsa.interface");
+    auto interface = intent::getPublicInterface(function);
     auto argument = cast<BlockArgument>(source);
-    auto view = cast<ViewArgumentAttr>(interface.getArguments()[argument.getArgNumber()]);
+    auto view = intent::getPublicView(interface, argument.getArgNumber());
     if (view.getConstraints().getHasStrides())
       if (auto fixed = dyn_cast<IntegerAttr>(view.getConstraints().getStrides()[axis])) return index(loc, fixed.getInt());
     return b.create<StrideOp>(loc, b.getIndexType(), source, axis);

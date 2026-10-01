@@ -99,7 +99,7 @@ std::optional<IndexedContraction> indexedContraction(linalg::GenericOp operation
   auto function = operation->getParentOfType<func::FuncOp>();
   PhysicalProgramAnalysis analysis(function);
   AliasAnalysis aliases(function);
-  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
+  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
   auto independent = [&](Value input) {
     if (aliases.alias(input, output).isNo()) return true;
     auto source = analysis.externalView(input), destination = analysis.externalView(output);

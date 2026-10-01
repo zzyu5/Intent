@@ -74,12 +74,11 @@ Value PhysicalProgramAnalysis::storageRoot(Value memory) {
   }
 }
 
-ViewArgumentAttr PhysicalProgramAnalysis::externalView(Value memory) {
+intent::ViewType PhysicalProgramAnalysis::externalView(Value memory) {
   auto argument = dyn_cast<BlockArgument>(storageRoot(memory));
   if (!argument || argument.getOwner() != &function.front()) return {};
-  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
-  return interface ? dyn_cast<ViewArgumentAttr>(interface.getArguments()[argument.getArgNumber()])
-                   : ViewArgumentAttr();
+  auto interface = getPublicInterface(function);
+  return interface ? getPublicView(interface, argument.getArgNumber()) : intent::ViewType();
 }
 
 bool PhysicalProgramAnalysis::isReadOnly(Value memory) {
@@ -198,33 +197,46 @@ SmallVector<AllocationFacts> PhysicalProgramAnalysis::allocations() {
 }
 
 LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
-  auto interface = function->getAttrOfType<InterfaceAttr>("intent_cpu.interface");
-  if (!interface || interface.getArguments().size() != function.getNumArguments() ||
-      !interface.getDisjointOutputs())
+  auto interface = getPublicInterface(function);
+  auto requirements = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
+  if (failed(verifyPublicInterface(function, interface))) return failure();
+  if (interface.getArguments().empty() || interface.getArguments().size() != function.getNumArguments() ||
+      !requirements || !requirements.getDisjointOutputs())
     return function.emitError("CPU function requires its complete typed native interface");
   for (auto [argument, field] : llvm::zip(function.getArguments(), interface.getArguments())) {
     auto storageType = [&](Type logical) -> Type {
       if (auto integer = dyn_cast<IntegerType>(logical)) return IntegerType::get(function.getContext(), integer.getWidth());
       return logical;
     };
-    if (auto view = dyn_cast<ViewArgumentAttr>(field)) {
+    Type logical = cast<PublicParameterAttr>(field).getType();
+    if (auto view = dyn_cast<intent::ViewType>(logical)) {
+      auto tensor = publicViewTensor(view);
+      Type element = tensor.getElementType();
+      if (!element.isF16() && !element.isBF16() && !element.isF32() && !element.isF64() &&
+          !isa<Float8E4M3FNType, Float8E5M2Type>(element) && !isa<IntegerType>(element))
+        return function.emitError("CPU view has unsupported storage element type");
       auto type = dyn_cast<MemRefType>(argument.getType());
-      if (!type || type.getElementType() != storageType(view.getElementType()) ||
-          type.getShape() != view.getShape().asArrayRef())
+      if (!type || type.getElementType() != storageType(element) || type.getShape() != tensor.getShape())
         return function.emitError("CPU view type disagrees with its physical ABI");
       SmallVector<int64_t> strides;
       int64_t offset;
       if (failed(type.getStridesAndOffset(strides, offset)) || offset != 0 ||
-          ((interface.getContiguousViews() || view.getAccess() != 0) && !type.getLayout().isIdentity()))
+          ((requirements.getContiguousViews() || view.getAccess() != 0) && !type.getLayout().isIdentity()))
         return function.emitError("CPU view layout disagrees with its physical ABI");
-      for (auto [constraint, stride] : llvm::zip(view.getStrides(), strides))
-        if (auto fixed = dyn_cast<IntegerAttr>(constraint);
-            fixed && !ShapedType::isDynamic(stride) && fixed.getInt() != stride)
-          return function.emitError("CPU view layout contradicts its declared stride constraint");
-    } else if (auto scalar = dyn_cast<ScalarArgumentAttr>(field)) {
-      if (storageType(scalar.getType()) != argument.getType())
+      if (view.getConstraints().getHasStrides())
+        for (auto [constraint, stride] : llvm::zip(view.getConstraints().getStrides(), strides)) {
+          if (!isa<UnitAttr, IntegerAttr>(constraint))
+            return function.emitError("CPU stride constraint must be an integer or unconstrained");
+          if (auto fixed = dyn_cast<IntegerAttr>(constraint);
+              fixed && !ShapedType::isDynamic(stride) && fixed.getInt() != stride)
+            return function.emitError("CPU view layout contradicts its declared stride constraint");
+        }
+    } else {
+      if (!logical.isF32() && !logical.isF64() && !logical.isIndex() && !isa<IntegerType>(logical))
+        return function.emitError("CPU scalar requires a supported C ABI numeric type");
+      if (storageType(logical) != argument.getType())
         return function.emitError("CPU scalar type disagrees with its physical ABI");
-    } else return function.emitError("CPU interface contains an unknown argument schema");
+    }
   }
   auto capabilities = function->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>(
       "intent_cpu.capabilities");
@@ -284,9 +296,17 @@ LogicalResult verifyCPUProgram(ModuleOp module, bool realized) {
       invalid = true;
     }
   });
+  func::FuncOp first;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
     if (function.isExternal() && function->hasAttr("cpu.external_runtime")) continue;
     if (failed(PhysicalProgramAnalysis(function).verify(realized))) invalid = true;
+    if (!first) first = function;
+    else if (getPublicInterface(function) != getPublicInterface(first) ||
+             function.getFunctionType() != first.getFunctionType() ||
+             function->getAttr(entryRequirementsAttr) != first->getAttr(entryRequirementsAttr)) {
+      function.emitError("CPU candidates must share one public interface and physical entry ABI");
+      invalid = true;
+    }
   }
   return failure(invalid);
 }

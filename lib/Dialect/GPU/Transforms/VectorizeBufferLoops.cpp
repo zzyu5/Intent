@@ -129,8 +129,7 @@ bool hasIndependentUpdates(scf::ForOp loop, func::FuncOp kernel,
         type && !type.getWorkspace() &&
         type.getScope().getValue() == BufferScope::ProgramPrivate &&
         type.getLifetime().getValue() == BufferLifetime::Program;
-    if (!privateBuffer && (!view || !view.getLayout().getHasStrides() ||
-                          view.getLayout().getStrides().size() != view.getRank())) {
+    if (!privateBuffer && !view) {
       independent = false;
       return;
     }
@@ -386,7 +385,7 @@ LogicalResult assignIterationRoles(func::FuncOp kernel) {
       auto extent = cast<PhysicalExprAttr>(type.getShape()[0]);
       if (extent.getKind() != PhysicalExprKind::Parameter)
         return;
-      auto parameter = queryParameterBySymbol(kernel, extent.getSymbolName());
+      auto parameter = queryParameterBySymbol(kernel, extent.getParameterReference().getName());
       if (failed(parameter) || !parameter->getBinding().getPointwiseChunk() ||
           parameter->getCategory() !=
               ParameterCategory::Pointwise ||

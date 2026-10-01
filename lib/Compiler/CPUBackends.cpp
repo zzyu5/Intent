@@ -71,28 +71,24 @@ LogicalResult CPUBackend::verifySharedInput(ModuleOp module, const Request &requ
   auto registry = cpu::lookupImplementationProvider(module, provider);
   if (failed(registry)) return failure();
   if (failed((**registry).verifyBindings(module))) return failure();
-  cpu::InterfaceAttr interface;
-  FunctionType functionType;
+  bool hasCandidate = false;
   for (auto function : module.getOps<func::FuncOp>()) {
-    auto current = function->getAttrOfType<cpu::InterfaceAttr>("intent_cpu.interface");
+    auto requirements = function->getAttrOfType<cpu::EntryRequirementsAttr>(cpu::entryRequirementsAttr);
     auto summary = function->getAttrOfType<ArrayAttr>("intent_cpu.implementations");
-    if (function.isExternal() || !current || !summary || summary.empty() ||
+    if (function.isExternal() || !summary || summary.empty() ||
         !function->getAttrOfType<cpu::ConfigurationAttr>("intent_cpu.configuration") ||
         !function->getAttrOfType<BoolAttr>("intent_cpu.requires_matrix_i8_i32"))
       return function.emitError("shared CPU input requires executable candidates with complete bound configuration and implementation summaries");
-    if (current.getContiguousViews() != !stridedInputs)
+    if (requirements.getContiguousViews() != !stridedInputs)
       return function.emitError("shared CPU entry layout disagrees with the selected provider");
-    if (interface && (interface != current || functionType != function.getFunctionType()))
-      return function.emitError("shared CPU candidates disagree on their typed public interface");
-    interface = current;
-    functionType = function.getFunctionType();
+    hasCandidate = true;
     auto status = function.walk([&](Operation *operation) -> WalkResult {
       if (!operation->hasAttr("intent_cpu.implementation")) return WalkResult::advance();
       return succeeded((**registry).lookup(operation)) ? WalkResult::advance() : WalkResult::interrupt();
     });
     if (status.wasInterrupted()) return failure();
   }
-  if (!interface) return module.emitError("shared CPU input requires at least one executable candidate");
+  if (!hasCandidate) return module.emitError("shared CPU input requires at least one executable candidate");
   return success();
 }
 

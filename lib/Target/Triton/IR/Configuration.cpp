@@ -1,6 +1,7 @@
 #include "Intent/Target/Triton/IR/Configuration.h"
 #include "Intent/Target/Triton/IR/TritonOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/Analysis/ProgramInterface.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/Support/MathExtras.h"
 #include <limits>
@@ -35,9 +36,9 @@ FailureOr<ConfigurationSchema> ConfigurationSchema::read(func::FuncOp kernel) {
     return kernel.emitError("Triton configuration requires GPU capabilities"), failure();
   bool requiresSingleCTA = false;
   for (BlockArgument argument : kernel.getArguments()) {
-    auto kind = kernel.getArgAttrOfType<StringAttr>(argument.getArgNumber(), gpu::abiKindAttr);
+    auto binding = gpu::getArgumentBinding(argument);
     requiresSingleCTA |= isa<gpu::BufferType>(argument.getType()) ||
-                         (kind && kind.getValue() == "workspace");
+                         (binding && binding.getKind() == gpu::ArgumentKind::Workspace);
   }
   kernel.walk([&](CtaBarrierOp) { requiresSingleCTA = true; });
   gpu::ParameterAttr stageDeclaration;

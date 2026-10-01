@@ -23,7 +23,7 @@ class GroupRelations {
 public:
   explicit GroupRelations(scf::ForOp work)
       : work(work), function(work->getParentOfType<func::FuncOp>()),
-        interface(function->getAttrOfType<InterfaceAttr>("intent_dsa.interface")) {}
+        interface(intent::getPublicInterface(function)) {}
 
   bool taskIdentity(Value value) const {
     auto loop = work;
@@ -34,12 +34,12 @@ public:
     return value == loop.getInductionVar();
   }
 
-  ViewArgumentAttr readonlyView(Value value) const {
+  intent::ViewType readonlyView(Value value) const {
     auto owner = function;
     auto argument = dyn_cast<BlockArgument>(value);
     if (!argument || argument.getOwner() != &owner.front()) return {};
-    auto view = dyn_cast<ViewArgumentAttr>(interface.getArguments()[argument.getArgNumber()]);
-    return view && view.getAccess() == 0 ? view : ViewArgumentAttr();
+    auto view = intent::getPublicView(interface, argument.getArgNumber());
+    return view && view.getAccess() == 0 ? view : intent::ViewType();
   }
 
   // These are the control expressions whose group-uniform form is retained by
