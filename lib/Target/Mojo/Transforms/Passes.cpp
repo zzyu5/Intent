@@ -2,6 +2,7 @@
 #include "Legalize.h"
 #include "Intent/Dialect/CPU/IR/CPUDialect.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/Transforms/FinalizedCandidates.h"
 #include "Intent/Transforms/PassManager.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -97,12 +98,13 @@ public:
   }
   StringRef getArgument() const final { return "intent-mojo-finalize-program"; }
   StringRef getDescription() const final {
-    return "Legalize arithmetic, scratch and floating-point environment and verify the Mojo surface";
+    return "Legalize the Mojo surface and remove equivalent finalized candidates";
   }
   void runOnOperation() final {
     auto module = getOperation();
-    if (failed(finishGroup(module, getArgument(), finalizeNativeProgram(module), true)))
-      signalPassFailure();
+    auto result = finalizeNativeProgram(module);
+    if (succeeded(result)) cpu::deduplicateFinalizedCandidates(module);
+    if (failed(finishGroup(module, getArgument(), result, true))) signalPassFailure();
   }
 };
 

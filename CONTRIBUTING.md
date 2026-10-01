@@ -141,11 +141,14 @@ Region 展开后，模板参数变成具体 views，可以用同一存储证明�
 | 完整候选形成 | [Configurations.cpp](lib/Dialect/CPU/Transforms/Configurations.cpp) | 从当前 computations 枚举有限 implementation portfolio；保留合法性筛选、顺序与去重，候选成为独立的完整函数 |
 | 实现绑定与展开接口 | [Implementation.h](include/Intent/Dialect/CPU/Transforms/Implementation.h)、[Implementation.cpp](lib/Dialect/CPU/Transforms/Implementation.cpp) | `bind` 一次提交 operation binding、函数配置与实现摘要；供数与展开消费同一个选择 |
 | 存储别名、生命周期与读快照 | [Analysis/Storage.h](include/Intent/Dialect/CPU/Analysis/Storage.h) | `queryStorageAliases`、`queryStorageLifetime` 查询 views、captures、uses 与 lexical end；`areDisjointStorage`、`preservesStorage`、`isStorageReadStable` 结合当前 effects、alias analysis 与显式 ABI 证明能否重放读取，不移动 allocation 或决定 packing |
+| 当前描述符的维度上界 | [Analysis/Storage.h](include/Intent/Dialect/CPU/Analysis/Storage.h) | `constantDimensionUpperBound` 通过 MLIR ValueBounds 查询闭合常数上界；未知界不作为收缩依据，不使用观察到的运行时尺寸，也不将未经溢出证明的 index 算术当作数学整数等式 |
 | 供数与私有计算复用 | [ReusePreparedInputs.cpp](lib/Dialect/CPU/Transforms/ReusePreparedInputs.cpp)、[FuseIntermediateBuffers.cpp](lib/Dialect/CPU/Transforms/FuseIntermediateBuffers.cpp) | 在共同存储证明之外，分别检查坐标、effect、读取稳定性与计算可重放性，实际改写 current IR |
 
 扩展 CPU implementation 时，`applicable` 描述它承接的计算语义，`check` 查询当前 capability 与 configuration，合法时返回 `std::nullopt`，否则返回具体拒绝原因。`candidates` 与 `bind` 共用布局、provider 条件、参数和供数检查；无合法候选时，诊断定位阻断的 computation，并列出 profile 行的实际参数与原因。`lookup` 服务于已绑定且经过变换的程序，只核对实现身份及当前计算和输入布局，不重新选择实现或用原始配置要求检查已经缩小的微块。
 
 `inputRequirements` 是只读查询，候选期与后续供数变换都可以调用。`checkInputRequirement` / `checkInputRequirements` 共享 operand、panel、alignment 与显式 widening 的证明，实际物化时依据当前 IR 重查。跨阶段只传递正式 binding，不缓存另一份供数计划。输入已经满足实现要求、无需额外准备时可以返回空需求；空需求只表示不需要外围 preparation，不说明它一定更快。
+
+[ImplementationInputs.cpp](lib/Dialect/CPU/Transforms/ImplementationInputs.cpp) 的 group supply 将配置容量与当前 source 维度的已证明上界取小，只收缩未拆成 panel 的维度；panel 宽度、对齐、有效写入窗口及生命周期保持原合同。Mojo 的 group panel 预算检查使用同一上界查询。配置容量是分块上限，不能代替当前 IR 已有的更紧界；有效窗口宽度也不能代替实现要求的固定 panel pitch。Weft 当前不请求这类 group preparation，不因此宣称它使用了同一 packing 路径。
 
 候选组合先为每个 contraction 找到合法且无需外围 preparation 的基准，再将每种注册实现应用于它能服务的计算，其余计算保持各自基准，按完整 bindings 去重。这样同一函数中的低精度 contraction 可以选择 widened 供数，另一个连续 f32 contraction 同时选择直接读取；不会因二者实现名不同而把后者改回默认 packing。需要准备供数的实现仍参与有限 portfolio，最终 winner 由实际调优决定，不展开每个 computation 的笛卡尔积，也不把这个基准当成布局或复用代价模型。
 
@@ -156,6 +159,8 @@ Region 展开后，模板参数变成具体 views，可以用同一存储证明�
 输出转发也使用这份存储查询，并保留目标的 disjoint、dominance 和 effect 检查。identity layout 与显式静态 strides 若具有相同 shape、元素类型、memory space、offset 和 strides，可通过标准 `memref.cast` 保持派生 view 的输入类型；两个未知动态 strides 不构成等价证明。这样，unit-axis 视图等正常 lowering 结构不会仅因类型拼写不同而强制保留中间结果拷贝。
 
 Mojo 的 [Passes.cpp](lib/Target/Mojo/Transforms/Passes.cpp) 调度实现展开、私有计算融合、向量化和最终原生合法化，具体阶段在相邻 [Legalize.cpp](lib/Target/Mojo/Transforms/Legalize.cpp)。向量宽度来自已绑定 implementation；scratch 提升复用 CPU 的存储证明；算术、原子更新和浮点环境在最终 surface 验证前闭合。Weft 保留 Canonical Weft IR 的 structured 输入边界，不经过 Mojo 的 SIMD 展开。
+
+Mojo 最终合法化完成后通过 [FinalizedCandidates.h](include/Intent/Dialect/CPU/Transforms/FinalizedCandidates.h) 删除结构完全相同的候选。比较保留完整 ABI、类型、SSA、嵌套任务、effects 和数值属性，仅忽略位置、顶层 entry 名字及已经消费完的配置/实现摘要；保留 profile 顺序中的第一个代表，serializer 和 runtime 从剩余函数形成源码与候选集合。这个入口不能用于尚未消费向量化或分块参数的程序，也不按生成源码文本或算子名字合并。Weft 已将 task 分离到另一个模块，不能只比较 host、忽略 callee 名字后套用此入口。
 
 CPU 归约的相邻重结合与元素重排许可统一保存于 `ReductionOrderAttr`。Construction 从源操作合同建立许可，fusion 取参与计算的许可交集，partition 与 materialization 保留它；不能由末尾恰好有一个 add 推断整个计算可重排。[VectorizeLoops.cpp](lib/Dialect/CPU/Transforms/VectorizeLoops.cpp) 在访问独立且允许重排时跨块保留向量累加器，最后才做横向归约；初始 accumulator 只合入一次。私有 [VectorReductions.h](lib/Dialect/CPU/Transforms/VectorReductions.h) 为该路径和多输出归约提供同一套 tuple 横向树，调用者负责初始化、captures 与顺序合法性。Weft 直接消费自己的原生归约能力，不经过这一 SIMD 展开。
 

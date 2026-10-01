@@ -1,5 +1,6 @@
 #include "Intent/Target/Mojo/Transforms/Passes.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "../../../Dialect/CPU/Transforms/Utilities.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -249,10 +250,14 @@ cpu::ImplementationRegistry implementations() {
   contraction.check = [directCheck](Operation *op, CapabilitiesAttr capabilities, const Configuration &config)
       -> std::optional<std::string> {
     if (auto reason = directCheck(op, capabilities, config)) return reason;
-    int64_t bytes = cast<MemRefType>(cast<linalg::GenericOp>(op).getInputs()[1].getType()).getElementTypeBitWidth() / 8;
+    Value source = cast<linalg::GenericOp>(op).getInputs()[1];
+    int64_t bytes = cast<MemRefType>(source.getType()).getElementTypeBitWidth() / 8;
     int64_t limit = capabilities.getPrivateBytes() / bytes / config.parameter("vector_width") / config.parameter("micro_n");
-    if (config.tileK > limit)
-      return "tile_k " + std::to_string(config.tileK) + " exceeds the group input panel's private storage limit of " +
+    int64_t capacity = config.tileK;
+    if (auto bound = constantDimensionUpperBound(source, 0); bound && *bound > 0)
+      capacity = std::min(capacity, *bound);
+    if (capacity > limit)
+      return "group input panel requires " + std::to_string(capacity) + " reduction elements, exceeding the private storage limit of " +
           std::to_string(limit) + " reduction elements";
     return std::nullopt;
   };

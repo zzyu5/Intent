@@ -10,6 +10,7 @@ add_mlir_library(MLIRIntentCPUAnalysis
   MLIRIntentCPUDialect
   MLIRIntentAnalysis
   MLIRAnalysis
+  MLIRArithDialect
   MLIRFuncDialect
   MLIRLinalgDialect
   MLIRMathDialect
@@ -18,4 +19,5 @@ add_mlir_library(MLIRIntentCPUAnalysis
   MLIRIR
   MLIRSideEffectInterfaces
   MLIRViewLikeInterface
+  MLIRValueBoundsOpInterface
 )

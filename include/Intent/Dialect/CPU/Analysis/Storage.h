@@ -7,6 +7,10 @@
 
 namespace intent::cpu {
 
+// A closed upper bound for a current descriptor dimension. This query does not
+// use observed runtime shapes or interpret wrapping index arithmetic as affine.
+std::optional<int64_t> constantDimensionUpperBound(mlir::Value memory, unsigned axis);
+
 // Current-IR aliases of the supplied origin, not an execution or allocation plan.
 // Unknown memref-producing users remain visible and make the closure incomplete.
 struct StorageAliasFacts {

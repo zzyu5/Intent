@@ -467,8 +467,15 @@ FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepareGroup(OpBuilder
       begins.push_back(starts[axis]);
     }
     auto other = cast<AffineDimExpr>(map.getResult(otherAxis)).getPosition();
+    int64_t capacity = capacities[other];
+    // A valid tile window cannot exceed its current source dimension. Keep the
+    // panel pitch/alignment unchanged; only remove unused rows of its storage.
+    // Empty dimensions retain the existing allocation form, which remains under
+    // the zero-work loop guard; this optimization does not introduce zero slots.
+    if (auto bound = constantDimensionUpperBound(source, otherAxis); bound && *bound > 0)
+      capacity = std::min(capacity, *bound);
     auto storage = b.create<memref::AllocaOp>(loc,
-        MemRefType::get({1, capacities[other], requirement.panelSize}, requirement.elementType));
+        MemRefType::get({1, capacity, requirement.panelSize}, requirement.elementType));
     storage.setAlignment(requirement.alignment);
     SmallVector<OpFoldResult> strides(2, b.getIndexAttr(1));
     Value window = b.create<memref::SubViewOp>(loc, source, offsets, sizes, strides);

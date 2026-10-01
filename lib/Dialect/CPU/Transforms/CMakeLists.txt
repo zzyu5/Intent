@@ -22,6 +22,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   ImplementationInputs.cpp
   TuningProfiles.cpp
   Configurations.cpp
+  FinalizedCandidates.cpp
   Passes.cpp
 
   LINK_LIBS PUBLIC
