@@ -1,15 +1,10 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Dialect/CPU/Transforms/Implementation.h"
 #include "Intent/Dialect/CPU/Analysis/Contractions.h"
-#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Contractions.h"
 #include "Utilities.h"
-#include "mlir/Dialect/Math/IR/Math.h"
-#include "mlir/Dialect/Utils/StaticValueUtils.h"
-#include "mlir/IR/Dominance.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/IRMapping.h"
-#include "mlir/IR/Matchers.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
@@ -28,99 +23,6 @@ SmallVector<OpFoldResult> shape(OpBuilder &builder, Location loc, Value source) 
     result.push_back(type.isDynamicDim(axis) ? OpFoldResult(shapeValue(builder, loc, source, axis))
                                            : OpFoldResult(builder.getIndexAttr(type.getDimSize(axis))));
   return result;
-}
-
-// Logical shape projections are snapshots. A descriptor view is legal
-// only if the source observed by this consumer still has the producer's value.
-Value foldInput(Value input, linalg::GenericOp consumer,
-                const ContractionRequirements *requirements = nullptr, unsigned operand = 0) {
-  auto allocation = input.getDefiningOp<memref::AllocOp>();
-  if (!allocation) return input;
-  auto lifetime = queryStorageLifetime(allocation);
-  if (!lifetime || !lifetime->aliases.complete) return input;
-  linalg::GenericOp producer;
-  for (Operation *user : lifetime->aliases.users) {
-    auto generic = dyn_cast<linalg::GenericOp>(user);
-    if (!generic || !llvm::is_contained(generic.getOutputs(), input)) continue;
-    if (producer) return input;
-    producer = generic;
-  }
-  if (!producer || producer.getNumResults() || producer.getInputs().size() != 1 ||
-      producer.getOutputs().size() != 1 || producer.getNumReductionLoops() ||
-      !producer.getIndexingMapsArray().back().isIdentity()) return input;
-  Block &body = producer.getRegion().front();
-  if (!body.without_terminator().empty() || body.getTerminator()->getOperand(0) != body.getArgument(0))
-    return input;
-  auto map = producer.getIndexingMapsArray().front();
-  if (!map.isProjectedPermutation(/*allowZeroInResults=*/true)) return input;
-  // Keep real broadcasts as explicit computations. A descriptor permutation
-  // or unit projection preserves the element set; expanding a non-unit domain
-  // needs a provider representation beyond the shared axis-view contract.
-  for (unsigned axis = 0; axis < map.getNumDims(); ++axis)
-    if (!llvm::is_contained(map.getResults(), getAffineDimExpr(axis, map.getContext())) &&
-        allocation.getType().getDimSize(axis) != 1) return input;
-  Value source = producer.getInputs()[0];
-  auto original = dyn_cast<MemRefType>(source.getType());
-  if (!original || original.getElementType() != allocation.getType().getElementType() ||
-      original.getMemorySpace() != allocation.getType().getMemorySpace()) return input;
-  for (auto [axis, expression] : llvm::enumerate(map.getResults()))
-    if (isa<AffineConstantExpr>(expression) && original.getDimSize(axis) != 1) return input;
-  for (Operation *user : lifetime->aliases.users)
-    if (user != producer && user != lifetime->end && !preservesStorage(user, input)) return input;
-  if (!isStorageReadStable(source, producer, consumer)) return input;
-  source = foldInput(source, consumer);
-  auto type = cast<MemRefType>(source.getType());
-  SmallVector<int64_t> sourceStrides;
-  int64_t sourceOffset;
-  if (failed(type.getStridesAndOffset(sourceStrides, sourceOffset))) return input;
-  OpBuilder builder(consumer);
-  Location loc = producer.getLoc();
-  SmallVector<int64_t> staticStrides(allocation.getType().getRank(), 0);
-  for (auto [axis, expression] : llvm::enumerate(map.getResults()))
-    if (auto dim = dyn_cast<AffineDimExpr>(expression)) staticStrides[dim.getPosition()] = sourceStrides[axis];
-  auto viewType = MemRefType::get(allocation.getType().getShape(), type.getElementType(),
-      StridedLayoutAttr::get(builder.getContext(), sourceOffset, staticStrides), type.getMemorySpace());
-  if (requirements && !requirements->acceptsInputLayout(operand, viewType)) return input;
-  auto metadata = builder.create<memref::ExtractStridedMetadataOp>(loc, source);
-  SmallVector<OpFoldResult> sizes, strides(allocation.getType().getRank(), builder.getIndexAttr(0));
-  unsigned dynamic = 0;
-  for (int64_t extent : allocation.getType().getShape())
-    sizes.push_back(ShapedType::isDynamic(extent) ? OpFoldResult(allocation.getDynamicSizes()[dynamic++])
-                                               : OpFoldResult(builder.getIndexAttr(extent)));
-  for (auto [axis, expression] : llvm::enumerate(map.getResults())) {
-    auto dim = dyn_cast<AffineDimExpr>(expression);
-    if (!dim) continue;
-    strides[dim.getPosition()] = ShapedType::isDynamic(sourceStrides[axis])
-        ? OpFoldResult(metadata.getStrides()[axis]) : OpFoldResult(builder.getIndexAttr(sourceStrides[axis]));
-  }
-  OpFoldResult offset = ShapedType::isDynamic(sourceOffset)
-      ? OpFoldResult(metadata.getOffset()) : OpFoldResult(builder.getIndexAttr(sourceOffset));
-  return builder.create<memref::ReinterpretCastOp>(loc, viewType, metadata.getBaseBuffer(),
-      offset, sizes, strides);
-}
-
-linalg::FillOp initialization(linalg::GenericOp operation) {
-  Value output = operation.getOutputs()[0];
-  linalg::FillOp fill;
-  for (Operation *user : output.getUsers()) {
-    auto candidate = dyn_cast<linalg::FillOp>(user);
-    if (candidate && candidate->getBlock() == operation->getBlock() &&
-        candidate->isBeforeInBlock(operation) && (!fill || fill->isBeforeInBlock(candidate))) fill = candidate;
-  }
-  if (!fill || fill.getOutputs().size() != 1) return {};
-  Value value = fill.getInputs()[0];
-  if (!(isa<FloatType>(value.getType()) ? matchPattern(value, m_PosZeroFloat()) : matchPattern(value, m_Zero())))
-    return {};
-  for (Operation *between = fill->getNextNode(); between != operation; between = between->getNextNode()) {
-    auto effects = getEffectsRecursively(between);
-    if (!effects) return {};
-    for (auto &effect : *effects) {
-      if (isa<MemoryEffects::Allocate>(effect.getEffect())) continue;
-      if (!effect.getValue() || !isa<BaseMemRefType>(effect.getValue().getType()) ||
-          !areDisjointStorage(output, effect.getValue(), operation)) return {};
-    }
-  }
-  return fill;
 }
 
 LogicalResult verifyStaticExtents(linalg::GenericOp operation, const ContractionAxes &axes) {
@@ -455,7 +357,7 @@ LogicalResult foldContractionInputs(func::FuncOp function,
     const auto &requirements = (*implementation)->contraction;
     for (unsigned operand = 0; operand != 2; ++operand)
       operation.getDpsInputOperand(operand)->set(
-          foldInput(operation.getInputs()[operand], operation, &requirements, operand));
+          foldContractionInput(operation.getInputs()[operand], operation, &requirements, operand));
   }
   eraseDeadPrivateBuffers(function);
   return success();
@@ -475,12 +377,12 @@ LogicalResult normalizeContractions(func::FuncOp function) {
   for (auto operation : operations) {
     auto axes = queryContractionAxes(operation);
     for (unsigned operand = 0; operand != 2; ++operand)
-      operation.getDpsInputOperand(operand)->set(foldInput(operation.getInputs()[operand], operation));
+      operation.getDpsInputOperand(operand)->set(foldContractionInput(operation.getInputs()[operand], operation));
     bool column = isa<FloatType>(cast<MemRefType>(operation.getOutputs()[0].getType()).getElementType()) &&
         axes->rhsFree.size() == 1 &&
         cast<MemRefType>(operation.getInputs()[1].getType()).getDimSize(axes->rhsFree.front()) == 1;
     if (isMatrixContraction(operation) && !column) continue;
-    auto fill = initialization(operation);
+    auto fill = findContractionInitialization(operation);
     if (!fill) return operation.emitError("CPU contraction normalization requires a closed zero initialization");
     if (failed(Normalizer(operation, *axes).run())) return failure();
     operation.erase();

@@ -42,35 +42,31 @@ std::optional<ContractionAxes> queryContractionAxes(linalg::GenericOp operation)
   if (operation.getInputs().size() != 2 || operation.getOutputs().size() != 1 ||
       operation.getNumResults() || !supportedBody(operation)) return std::nullopt;
   auto maps = operation.getIndexingMapsArray();
-  SmallVector<SmallVector<std::optional<unsigned>>> positions;
-  for (AffineMap map : maps) {
+  SmallVector<SmallVector<std::optional<unsigned>>> projections;
+  for (AffineMap map : ArrayRef(maps).take_front(2)) {
     if (map.getNumSymbols()) return std::nullopt;
-    auto &axes = positions.emplace_back(operation.getNumLoops());
+    auto &axes = projections.emplace_back(operation.getNumLoops());
     for (auto [axis, expression] : llvm::enumerate(map.getResults())) {
       auto dim = dyn_cast<AffineDimExpr>(expression);
       if (!dim || axes[dim.getPosition()]) return std::nullopt;
       axes[dim.getPosition()] = axis;
     }
   }
-  SmallVector<int64_t> lhsReduction, rhsReduction, lhsBatch, rhsBatch;
+  SmallVector<int64_t> reduction;
   for (auto [loop, iterator] : llvm::enumerate(operation.getIteratorTypesArray())) {
-    auto left = positions[0][loop], right = positions[1][loop], result = positions[2][loop];
-    if (iterator == utils::IteratorType::reduction) {
-      if (!left || !right || result) return std::nullopt;
-      lhsReduction.push_back(*left); rhsReduction.push_back(*right);
-    } else if (iterator == utils::IteratorType::parallel) {
-      if (!result || (!left && !right)) return std::nullopt;
-      if (left && right) { lhsBatch.push_back(*left); rhsBatch.push_back(*right); }
-    } else return std::nullopt;
+    if (iterator == utils::IteratorType::reduction) reduction.push_back(loop);
+    else if (iterator != utils::IteratorType::parallel) return std::nullopt;
   }
-  auto axes = ContractionAxes::get(maps[0].getNumResults(), maps[1].getNumResults(),
-      lhsReduction, rhsReduction, lhsBatch, rhsBatch);
-  if (!axes || axes->results.size() != maps[2].getNumResults()) return std::nullopt;
-  for (auto [position, result] : llvm::enumerate(axes->results)) {
-    auto source = result.operand == ContractionOperand::Lhs ? maps[0] : maps[1];
-    if (source.getResult(result.axis) != maps[2].getResult(position)) return std::nullopt;
-  }
-  return axes;
+  // Explicit contraction maps already bind every operand axis. Do not squeeze
+  // their singleton axes: K=1 and unit M/N remain valid paired dimensions.
+  auto relation = ProductContractionAxes::get(projections[0],
+      SmallVector<bool>(maps[0].getNumResults(), false), projections[1],
+      SmallVector<bool>(maps[1].getNumResults(), false), reduction);
+  if (!relation || maps[2].getNumSymbols() || relation->axes.results.size() != maps[2].getNumResults())
+    return std::nullopt;
+  for (auto [position, productAxis] : llvm::enumerate(relation->resultProductAxes))
+    if (maps[2].getResult(position) != getAffineDimExpr(productAxis, operation.getContext())) return std::nullopt;
+  return std::move(relation->axes);
 }
 
 } // namespace intent::cpu

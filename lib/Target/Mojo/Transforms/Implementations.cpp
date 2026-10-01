@@ -94,6 +94,7 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
           nested.create<linalg::YieldOp>(loc, mapping.lookup(body.getTerminator()->getOperand(0)));
         });
     contract->setAttr("intent_cpu.implementation", binding);
+    contract->setAttr("intent_cpu.reduction_order", operation->getAttr("intent_cpu.reduction_order"));
     contract->setAttr("intent_cpu.microtile", MicrotileAttr::get(b.getContext(), rows, columns, width));
     if (!tile.first) return;
     b.create<linalg::GenericOp>(loc, ValueRange{partial}, ValueRange{out},

@@ -76,6 +76,8 @@ DSA 的 [MatrixSupply.cpp](lib/Dialect/DSA/Transforms/MatrixSupply.cpp) 消费�
 
 [ContractionAxes.h](include/Intent/Analysis/ContractionAxes.h) 统一 contraction 的 reduction/batch 配对、free axes 与操作数轴到结果轴的位置关系。CPU construction 和 GPU 当前 IR 查询共用这份纯轴关系；GPU 的 projection、vector realization 与 provider 原生矩阵检查消费相同结果。结果位置按正式 operand axis 推导，同一 source 或 dimension 在两边出现不代表同一个结果轴。该分析不读取 SSA、不选择 packing/tile，也不替各 provider 扩大原生 rank 或 dtype 支持。
 
+同一接口中的 `ProductContractionAxes::get` 从两个操作数到乘积公共域的投影、已证明的逻辑 unit 轴及归约轴，推导 contraction 配对、保留的原操作数轴和结果排列。CPU 的 [ContractionSources](lib/Dialect/CPU/Transforms/ContractionSources.cpp) 与 GPU 的 [ContractionSources](lib/Dialect/GPU/Transforms/ContractionSources.cpp) 共用它识别乘法后求和的轴关系。CPU 的显式 contraction 查询也使用这个核心，但不将合法的 `K=1` 配对当成广播消除。调用方分别证明数值合同、唯一数值消费者和存储或 SSA 关系；物理 tile 大小为 1 不构成逻辑 singleton 的证明。新增共同轴规则改此分析；存储快照、方向选择、blocking 与目标支持改各自消费者。
+
 [IntegerRelations.h](include/Intent/Analysis/IntegerRelations.h) 的 `foldIntegerDifference` 复用 `UniformExpression` 描述，只读折叠加减、常数乘法及等宽整数/index cast 的变化系数。[CPU VectorizeLoops](lib/Dialect/CPU/Transforms/VectorizeLoops.cpp) 用它判断循环坐标差值，再检查连续 stride、别名与依赖；[DSA CollectiveGather](lib/Dialect/DSA/Transforms/CollectiveGather.cpp) 用它判断四个参与者之间的地址差值，保留自己的 task 商余关系、只读视图、局部 buffer 写入和控制一致性证明。CPU 的这个 vectorizer 当前由 Mojo legalization 调用，共享 CPU family 不意味着所有 provider 都调用它。
 
 该核心只接受 i64 或调用方明确绑定为 64 位的 index；两个适配层依据 Intent 的逻辑 index 合同传入位宽，不假定任意 MLIR index 都是 64 位。值运算仍遵守模整数语义，系数的加减乘另外检查是否能用 `int64_t` 表示；失败返回 `Unknown`，不能当作系数零。窄整数回绕后的扩宽需要独立范围证明，地址有效性、memory effects 与拓扑也不由系数证明。GPU 的按位宽模运算规范化和 source-axis 关系分析有不同合同，不应仅因都有 Add/Mul 就接到这一接口。
@@ -128,6 +130,8 @@ CPU 的候选绑定、存储证明与执行变换有各自的入口。[共享 pi
 
 普通 contraction 的 construction 只形成完整 `linalg.generic` 索引映射、显式零初始化及原数值运算，不选择 dot、batch 循环或 packing。[Contractions analysis](include/Intent/Dialect/CPU/Analysis/Contractions.h) 从当前索引图和乘加 body 查询共享轴语义；[NormalizeContractions.cpp](lib/Dialect/CPU/Transforms/NormalizeContractions.cpp) 在候选选择前形成 dot、矩阵和 batch 程序，并按实际 strides 决定能否使用视图。转置或 unit 轴投影的输入快照稳定时，矩阵可直接消费派生视图；非 unit 广播保留显式计算，无法通过视图表达的轴合并仍形成显式 pack 与 lifetime。实现所需的 panel 准备继续由 implementation requirements 与 input supply 负责，不能把整块转置重新藏进 construction。
 
+同一 source 规范化阶段先调用私有 `normalizeContractionSources`，将满足条件的 f32 乘法与零初始化普通求和组合为显式乘加 contraction，再由上述 normalizer 和 implementation registry 处理。它仅穿过纯轴投影与 unit views，用 [Storage analysis](include/Intent/Dialect/CPU/Analysis/Storage.h) 证明读取快照稳定，不跨越数值 cast 或其它计算；没有独立 free 轴的逐行点积仍交给普通归约路径。只有一侧 free 轴时，还要求能够形成连续矩阵列，否则保留原 producer-fused reduction，避免为了单个向量结果物化和打包矩阵。源识别、投影视图折叠和零初始化证明集中在相邻 `ContractionSources.cpp`，矩阵展平、batch 循环与 pack 保留在 `NormalizeContractions.cpp`。修改其中一个阶段不需要在 provider serializer 新增算子分支。
+
 Region 展开后，模板参数变成具体 views，可以用同一存储证明再次折叠矩阵输入；私有 `foldContractionInputs` 保持已绑定 implementation、计算和配置。`ContractionRequirements::unitInnerStride` 显式保存所选实现的输入布局条件，候选选择、绑定、lookup 与该改写共用检查；例如 Mojo direct 的 RHS 必须保持单位内层 stride。条件不成立时保留原物化，不重新选实现，也不把 Region 参数假定为 noalias。
 
 | 需要的能力 | 模块 | 使用方式 |
@@ -148,6 +152,8 @@ Region 展开后，模板参数变成具体 views，可以用同一存储证明�
 Mojo 的 [Passes.cpp](lib/Target/Mojo/Transforms/Passes.cpp) 调度实现展开、私有计算融合、向量化和最终原生合法化，具体阶段在相邻 [Legalize.cpp](lib/Target/Mojo/Transforms/Legalize.cpp)。向量宽度来自已绑定 implementation；scratch 提升复用 CPU 的存储证明；算术、原子更新和浮点环境在最终 surface 验证前闭合。Weft 保留 Canonical Weft IR 的 structured 输入边界，不经过 Mojo 的 SIMD 展开。
 
 CPU 归约的相邻重结合与元素重排许可统一保存于 `ReductionOrderAttr`。Construction 从源操作合同建立许可，fusion 取参与计算的许可交集，partition 与 materialization 保留它；不能由末尾恰好有一个 add 推断整个计算可重排。[VectorizeLoops.cpp](lib/Dialect/CPU/Transforms/VectorizeLoops.cpp) 在访问独立且允许重排时跨块保留向量累加器，最后才做横向归约；初始 accumulator 只合入一次。私有 [VectorReductions.h](lib/Dialect/CPU/Transforms/VectorReductions.h) 为该路径和多输出归约提供同一套 tuple 横向树，调用者负责初始化、captures 与顺序合法性。Weft 直接消费自己的原生归约能力，不经过这一 SIMD 展开。
+
+Mojo 的矩阵 `formTile` 同样把该许可传给微块，后续实现不能仅因识别到 FMA 就扩大重排许可。矩阵寄存器组织属于 Mojo 原生实现，CPU source 识别和 GPU provider 不承担该 SIMD 决策。
 
 Weft 的私有 [Views.h](lib/Target/Weft/Transforms/Views.h) 证明标准 memref 描述符是否仅做轴置换或 unit 轴插删，并将纯 view capture 的定义链显式放回 task 内。原存储及所需标量进入 task ABI；[Legalize.cpp](lib/Target/Weft/Transforms/Legalize.cpp) 将逻辑访问反投影到原 Slice/Subview，缓存原存储顺序的 Admit 快照。矩阵消费者保留该顺序，将轴重命名为当前循环轴，直接交给按命名轴归约的 OuterContract；位置相关的普通读写则显式投影到对应逻辑顺序。不能把非连续 capture 直接标成连续，也不能只改 shape 冒充转置。当前 Weft RISC-V 不能实现一般置换 Reshape；动态轴合并、非矩形 flatten 和任意 strided reinterpretation 也不在该桥接能力内，失败明确报告，不插入隐藏 copy。
 

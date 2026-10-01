@@ -65,7 +65,8 @@ public:
       if (!llvm::hasSingleElement(functions) || (*functions.begin()).isExternal())
         return module.emitError("CPU source normalization requires one executable source function");
       auto function = *functions.begin();
-      if (failed(normalizeContractions(function)) || failed(realizeSliceScans(function)) || failed(foldUniformComputations(function)) ||
+      if (failed(normalizeContractionSources(function)) || failed(normalizeContractions(function)) ||
+          failed(realizeSliceScans(function)) || failed(foldUniformComputations(function)) ||
           failed(fuseStructuredComputations(function))) return failure();
       return runPipeline(cleanup, module);
     };
