@@ -92,8 +92,10 @@ FailureOr<PhysicalSourceAxis> axisSource(Attribute axis) {
 
 PhysicalExprAttr expression(MLIRContext *context, PhysicalExprKind kind,
                             int64_t value, StringRef symbol) {
-  return PhysicalExprAttr::get(context, static_cast<uint32_t>(kind), value,
-                               StringAttr::get(context, symbol),
+  return PhysicalExprAttr::get(context, kind, value,
+                               kind == PhysicalExprKind::Parameter
+                                   ? Attribute(ParameterRefAttr::get(context, StringAttr::get(context, symbol)))
+                                   : Attribute(StringAttr::get(context, symbol)),
                                ArrayAttr::get(context, {}));
 }
 
@@ -101,7 +103,7 @@ PhysicalExprAttr binaryExpression(MLIRContext *context, PhysicalExprKind kind,
                                   PhysicalExprAttr lhs,
                                   PhysicalExprAttr rhs) {
   return PhysicalExprAttr::get(
-      context, static_cast<uint32_t>(kind), 0, StringAttr::get(context),
+      context, kind, 0, StringAttr::get(context),
       ArrayAttr::get(context, {lhs, rhs}));
 }
 
@@ -153,33 +155,34 @@ FailureOr<uint64_t> ownershipDimension(func::FuncOp kernel,
   return rangeDimension(range);
 }
 
-FailureOr<ParameterOp> queryOwnershipBlockingParameter(func::FuncOp kernel,
+FailureOr<ParameterAttr> queryOwnershipBlockingParameter(func::FuncOp kernel,
                                                        MakeRangeOp range) {
-  FailureOr<ParameterOp> direct = queryBlockingParameter(kernel, range);
+  FailureOr<ParameterAttr> direct = queryBlockingParameter(kernel, range);
   if (succeeded(direct))
     return *direct;
   FailureOr<int64_t> parent = querySubregionParentDimension(range);
   if (failed(parent))
     return failure();
-  ParameterOp result;
+  ParameterAttr result;
   bool ambiguous = false;
-  kernel.walk([&](ParameterOp parameter) {
+  for (Attribute declaration : getParameterDeclarations(kernel)) {
+    auto parameter = cast<ParameterAttr>(declaration);
     PhysicalParameterBinding binding = queryParameterBinding(parameter);
     if (!binding.isExact() || !binding.dimension ||
         *binding.dimension != *parent ||
-        parameter.getParameter().getRole() !=
-            static_cast<uint32_t>(ParameterRole::OwnershipN))
-      return;
+        parameter.getRole() !=
+            ParameterRole::OwnershipN)
+      continue;
     if (result && result != parameter)
       ambiguous = true;
     else
       result = parameter;
-  });
-  return result && !ambiguous ? FailureOr<ParameterOp>(result)
-                              : FailureOr<ParameterOp>(failure());
+  }
+  return result && !ambiguous ? FailureOr<ParameterAttr>(result)
+                              : FailureOr<ParameterAttr>(failure());
 }
 
-FailureOr<Attribute> parameterAxis(ParameterOp parameter) {
+FailureOr<Attribute> parameterAxis(ParameterAttr parameter) {
   PhysicalParameterBinding binding = queryParameterBinding(parameter);
   if (!binding.isExact())
     return failure();
@@ -190,8 +193,8 @@ FailureOr<Attribute> parameterAxis(ParameterOp parameter) {
   return failure();
 }
 
-PhysicalExprAttr fragmentExtent(ParameterOp parameter) {
-  ParameterAttr schema = parameter.getParameter();
+PhysicalExprAttr fragmentExtent(ParameterAttr parameter) {
+  ParameterAttr schema = parameter;
   PhysicalParameterBinding binding = queryParameterBinding(parameter);
   if (binding.source && schema.getCandidates().size() == 1)
     return expression(parameter.getContext(), PhysicalExprKind::Constant,
@@ -207,7 +210,7 @@ bool hasExactStaticFullCoverage(func::FuncOp kernel, Value source,
     return false;
   auto extent = dyn_cast<PhysicalExprAttr>(fragment.getShape()[axis]);
   if (!extent || extent.getKind() !=
-                     static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+                     PhysicalExprKind::Constant ||
       extent.getValue() <= 0)
     return false;
   PhysicalAxisRealizationFact fact =
@@ -236,7 +239,7 @@ bool hasExactStaticFullCoverage(func::FuncOp kernel, Value source,
         queryNonNegativeIndexUpperBound(range.getLogicalStop());
     return startBound && stopBound &&
            stopBound.getKind() ==
-               static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+               PhysicalExprKind::Constant &&
            static_cast<__int128>(extent.getValue()) * step.value() >=
                stopBound.getValue();
   });
@@ -429,13 +432,13 @@ std::optional<int64_t> estimatedFragmentRegisters(func::FuncOp kernel, Value val
       // complete fragments must cover the logical capacity, not that seed.
       minimum = *count > limit ? limit + 1
                               : llvm::PowerOf2Ceil(static_cast<uint64_t>(*count));
-    } else if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant)) {
+    } else if (extent.getKind() == PhysicalExprKind::Constant) {
       minimum = extent.getValue();
-    } else if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
-      auto parameter = queryParameterBySymbol(kernel, extent.getSymbol());
+    } else if (extent.getKind() == PhysicalExprKind::Parameter) {
+      auto parameter = queryParameterBySymbol(kernel, extent.getSymbolName());
       if (failed(parameter))
         return std::nullopt;
-      minimum = *llvm::min_element(parameter->getParameter().getCandidates().asArrayRef());
+      minimum = *llvm::min_element(parameter->getCandidates().asArrayRef());
     } else {
       return std::nullopt;
     }
@@ -858,8 +861,8 @@ ContractFreeAxisFacts contractFreeAxisFacts(func::FuncOp kernel,
           }) == 1)
         facts.batchedContraction = true;
       if (fold &&
-          fold.getSegment().getCategory() ==
-              static_cast<uint32_t>(ParameterCategory::RegionContraction))
+          lookupParameter(kernel, fold.getSegment()).getCategory() ==
+              ParameterCategory::RegionContraction)
         facts.regionContraction = true;
     }
   });
@@ -1142,12 +1145,12 @@ SmallVector<WriteEffectFacts> readWriteEffects(func::FuncOp kernel) {
 FailureOr<Attribute> mappingAxis(func::FuncOp kernel, Attribute attribute) {
   auto expression = dyn_cast<PhysicalExprAttr>(attribute);
   if (expression && expression.getKind() ==
-                        static_cast<uint32_t>(PhysicalExprKind::CeilDiv) &&
+                        PhysicalExprKind::CeilDiv &&
       expression.getOperands().size() == 2) {
     auto divisor = dyn_cast<PhysicalExprAttr>(expression.getOperands()[1]);
     if (divisor && divisor.getKind() ==
-                       static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
-      FailureOr<ParameterOp> parameter = queryParameterBySymbol(kernel, divisor.getSymbol());
+                       PhysicalExprKind::Parameter) {
+      FailureOr<ParameterAttr> parameter = queryParameterBySymbol(kernel, divisor.getSymbolName());
       if (succeeded(parameter))
         return parameterAxis(*parameter);
     }
@@ -1158,7 +1161,7 @@ FailureOr<Attribute> mappingAxis(func::FuncOp kernel, Attribute attribute) {
   auto physical = dyn_cast<PhysicalExprAttr>(attribute);
   if (!physical ||
       physical.getKind() !=
-          static_cast<uint32_t>(PhysicalExprKind::Dimension))
+          PhysicalExprKind::Dimension)
     return failure();
   return physical.getValue() > 0
              ? FailureOr<Attribute>(dimensionAxisKey(kernel.getContext(),
@@ -1185,7 +1188,7 @@ FailureOr<MappingCoordinates> readMappingCoordinates(func::FuncOp kernel, Deline
     if (!result.reusableUnit && axis < mapping.getCoordinates().size() &&
         mapping.getCoordinates()[axis].use_empty() && physical &&
         physical.getKind() ==
-            static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+            PhysicalExprKind::Constant &&
         physical.getValue() == 1)
       result.reusableUnit = axis;
   }

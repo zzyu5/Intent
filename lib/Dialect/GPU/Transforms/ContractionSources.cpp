@@ -219,13 +219,13 @@ FailureOr<bool> collapseMultiReductionContract(ContractOp contract) {
   // The outer coordinates then stay constant across aligned K lanes, allowing
   // the provider's axis analysis to share their delinearization arithmetic.
   auto tail = reductionExtents.back();
-  if (tail.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+  if (tail.getKind() == PhysicalExprKind::Constant &&
       tail.getValue() > 0 && !llvm::isPowerOf2_64(tail.getValue())) {
     unsigned inner = lhsAxes.size() - 1;
     int64_t largest = 0;
     for (auto [position, extent] : llvm::enumerate(reductionExtents)) {
       if (extent.getKind() !=
-              static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+              PhysicalExprKind::Constant ||
           extent.getValue() < contractionReductionCandidates[0] ||
           !llvm::isPowerOf2_64(extent.getValue()) ||
           extent.getValue() <= largest)
@@ -383,7 +383,7 @@ static ReshapeOp exposeTransposedContractSplit(ContractOp contract) {
     if (group.getSourceAxes().empty()) {
       for (int64_t axis : group.getResultAxes().asArrayRef()) {
         auto extent = cast<PhysicalExprAttr>(target.getShape()[axis]);
-        if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+        if (extent.getKind() != PhysicalExprKind::Constant ||
             extent.getValue() != 1)
           return {};
         units.insert(axis);
@@ -401,13 +401,13 @@ static ReshapeOp exposeTransposedContractSplit(ContractOp contract) {
       freeAxes.size() + units.size() + 1 != target.getShape().size())
     return {};
   auto rowExtent = cast<PhysicalExprAttr>(contract.getResult().getType().getShape()[0]);
-  if (rowExtent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+  if (rowExtent.getKind() != PhysicalExprKind::Constant ||
       rowExtent.getValue() <= 0)
     return {};
   int64_t product = 1;
   for (int64_t axis : freeAxes) {
     auto extent = cast<PhysicalExprAttr>(target.getShape()[axis]);
-    if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+    if (extent.getKind() != PhysicalExprKind::Constant ||
         extent.getValue() <= 0 || product > rowExtent.getValue() / extent.getValue())
       return {};
     product *= extent.getValue();

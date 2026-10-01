@@ -7,6 +7,7 @@ import shutil
 import subprocess
 
 from intent.runtime import CompiledArtifact
+from .specification import CPUCompilationTarget, require_matching_target
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,17 +16,16 @@ class ResolvedMojoTarget:
     triple: str
     cpu: str
     features: str
-    vector_bits: int
-    workers: int
+    compilation: CPUCompilationTarget
     build_threads: int
 
     @property
-    def compiler_options(self) -> tuple[str, ...]:
-        return ("--target=mojo", f"--cpu-vector-bits={self.vector_bits}", f"--cpu-workers={self.workers}")
+    def vector_bits(self) -> int:
+        return self.compilation.vector_bits
 
     @property
-    def compiler_role(self) -> str:
-        return "Intent CPU compiler"
+    def workers(self) -> int:
+        return self.compilation.workers
 
     @property
     def native_options(self) -> tuple[str, ...]:
@@ -35,10 +35,10 @@ class ResolvedMojoTarget:
             f"--num-threads={self.build_threads}", "-O3",
         )
 
-    def materialize(self, source: str, module_text: str, entry_name: str,
-                    metadata: dict[str, object]) -> CompiledArtifact:
+    def materialize(self, program) -> CompiledArtifact:
         from intent.runtime.mojo import materialize_mojo_artifact
-        return materialize_mojo_artifact(source, module_text, metadata, self)
+        require_matching_target(program.target, self.compilation)
+        return materialize_mojo_artifact(program.source, program.ir, program.metadata, self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +46,7 @@ class MojoTarget:
     workers: int = 8
     compiler: str | Path | None = None
     build_threads: int = 4
+    private_bytes: int = 262144
 
     def resolve(self) -> ResolvedMojoTarget:
         if self.workers <= 0 or self.build_threads <= 0:
@@ -72,5 +73,7 @@ class MojoTarget:
             vector_bits = 256
         else:
             raise NotImplementedError("Mojo CPU currently requires AVX2 or AVX512")
+        compilation = CPUCompilationTarget("mojo", vector_bits, self.workers,
+                                            private_bytes=self.private_bytes)
         return ResolvedMojoTarget(executable, triple, configuration["--target-cpu"], features,
-                                  vector_bits, self.workers, self.build_threads)
+                                  compilation, self.build_threads)

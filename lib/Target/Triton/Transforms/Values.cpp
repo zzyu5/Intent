@@ -77,7 +77,7 @@ void canonicalizeBroadcastProjections(func::FuncOp kernel) {
                    source.getShape()[*mapped] == target.getShape()[axis];
           auto extent = cast<gpu::PhysicalExprAttr>(target.getShape()[axis]);
           return extent.getKind() ==
-                     static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+                     gpu::PhysicalExprKind::Constant &&
                  extent.getValue() == 1;
         });
     if (insertsUnits && nextSource == source.getShape().size())
@@ -119,7 +119,7 @@ void selectContractForms(func::FuncOp kernel) {
       for (Attribute dimension : contract.getAccumulator().getType().getShape())
         elements = gpu::PhysicalExprAttr::get(
             kernel.getContext(),
-            static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
+            gpu::PhysicalExprKind::Multiply, 0,
             builder.getStringAttr(""), builder.getArrayAttr({elements, dimension}));
       Value count = builder.create<gpu::PhysicalExprOp>(
           contract.getLoc(), builder.getIndexType(), elements);
@@ -129,7 +129,7 @@ void selectContractForms(func::FuncOp kernel) {
                                            count, maximum, ComparePredicate::Le);
     };
     if (reductionExtent.getKind() ==
-        static_cast<uint32_t>(gpu::PhysicalExprKind::Constant)) {
+        gpu::PhysicalExprKind::Constant) {
       if (reductionExtent.getValue() < 16) {
         builder.create<cf::AssertOp>(contract.getLoc(), expandedFits(),
             "Triton expanded contraction exceeds the maximum element count");
@@ -225,7 +225,7 @@ void selectContractForms(func::FuncOp kernel) {
     for (Attribute extent : shape.drop_front())
       elements = gpu::PhysicalExprAttr::get(
           kernel.getContext(),
-          static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
+          gpu::PhysicalExprKind::Multiply, 0,
           builder.getStringAttr(""), builder.getArrayAttr({elements, extent}));
     auto fmaForm = builder.getStringAttr("fma");
     // Serial K accumulation needs enough independent output elements.

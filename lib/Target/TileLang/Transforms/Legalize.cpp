@@ -1,6 +1,5 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
-#include "Intent/Dialect/GPU/Analysis/Configurations.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
@@ -55,26 +54,28 @@ bool isLegalThreadCount(int64_t threads, gpu::CapabilitiesAttr capabilities) {
          threads <= capabilities.getMaxThreadsPerBlock();
 }
 
-FailureOr<gpu::PhysicalParameterSpace> readConfigurationDomains(func::FuncOp kernel) {
+FailureOr<gpu::ParameterSpace> readConfigurationDomains(func::FuncOp kernel) {
   auto capabilities = kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
   if (!capabilities)
     return kernel.emitError("TileLang configuration requires GPU capabilities"), failure();
-  auto space = gpu::PhysicalParameterSpace::read(kernel);
+  auto space = gpu::ParameterSpace::read(kernel);
   if (failed(space)) return failure();
   bool sawThreads = false;
-  for (const auto &domain : space->domains()) {
-    if (!domain.provider) continue;
-    auto role = domain.role();
+  for (gpu::ParameterAttr domain : space->declarations()) {
+    if (!domain.isExtent())
+      return kernel.emitError("TileLang parameters must have index type"), failure();
+    if (domain.getPhase() != gpu::ConfigurationBindingPhase::Provider) continue;
+    auto role = domain.getRole();
     if (role != gpu::ParameterRole::ProviderThreads &&
         role != gpu::ParameterRole::ProviderStages)
-      return domain.operation->emitOpError("TileLang program contains a foreign provider parameter"), failure();
+      return kernel.emitError("TileLang program contains a foreign provider parameter"), failure();
     sawThreads |= role == gpu::ParameterRole::ProviderThreads;
-    for (int64_t value : domain.candidates())
+    for (int64_t value : domain.getCandidates().asArrayRef())
       if (role == gpu::ParameterRole::ProviderThreads
               ? !isLegalThreadCount(value, capabilities)
               : !isLegalPipelineStageCount(value))
-        return domain.operation->emitOpError("TileLang parameter is outside the native option domain")
-                   << "; parameter=" << domain.name() << "; value=" << value,
+        return kernel.emitError("TileLang parameter is outside the native option domain")
+                   << "; parameter=" << domain.getName() << "; value=" << value,
                failure();
   }
   if (!sawThreads)
@@ -86,12 +87,12 @@ std::optional<int64_t>
 evaluate(gpu::PhysicalExprAttr expression, DictionaryAttr config) {
   return gpu::evaluatePhysicalExpression(expression,
       [&](gpu::PhysicalExprAttr leaf) -> std::optional<int64_t> {
-        if (leaf.getKind() != static_cast<uint32_t>(gpu::PhysicalExprKind::Parameter))
+        if (leaf.getKind() != gpu::PhysicalExprKind::Parameter)
           return std::nullopt;
-        auto value = config.getAs<IntegerAttr>(leaf.getSymbol());
+        auto value = config.getAs<IntegerAttr>(leaf.getSymbolName());
         return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
       }, [](gpu::PhysicalExprAttr operation, ArrayRef<int64_t> operands) {
-        switch (static_cast<gpu::PhysicalExprKind>(operation.getKind())) {
+        switch (operation.getKind()) {
         case gpu::PhysicalExprKind::Add:
         case gpu::PhysicalExprKind::Subtract:
         case gpu::PhysicalExprKind::Multiply:
@@ -218,14 +219,14 @@ bool exactSharedMemoryIsLegal(func::FuncOp kernel,
 }
 
 unsigned configurationFailures(func::FuncOp kernel,
-                               ArrayRef<gpu::PhysicalParameterDomain> domains,
+                               ArrayRef<gpu::ParameterAttr> domains,
                                DictionaryAttr config,
                                gpu::CapabilitiesAttr capabilities) {
   std::optional<int64_t> threads;
   for (const auto &domain : domains) {
-    if (domain.role() != gpu::ParameterRole::ProviderThreads)
+    if (domain.getRole() != gpu::ParameterRole::ProviderThreads)
       continue;
-    if (auto value = config.getAs<IntegerAttr>(domain.name()))
+    if (auto value = config.getAs<IntegerAttr>(domain.getName()))
       threads = value.getInt();
   }
   if (!threads)
@@ -309,20 +310,14 @@ SmallVector<int64_t> extentCandidates(func::FuncOp kernel, Attribute attribute) 
   auto extent = dyn_cast<gpu::PhysicalExprAttr>(attribute);
   if (!extent)
     return {};
-  auto kind = static_cast<gpu::PhysicalExprKind>(extent.getKind());
+  auto kind = extent.getKind();
   if (kind == gpu::PhysicalExprKind::Constant)
     return {extent.getValue()};
   if (kind != gpu::PhysicalExprKind::Parameter)
     return {};
-  SmallVector<int64_t> result;
-  kernel.walk([&](gpu::ParameterOp parameter) {
-    if (parameter.getParameter().getName() == extent.getSymbol()) {
-      ArrayRef<int64_t> candidates =
-          parameter.getParameter().getCandidates().asArrayRef();
-      result.assign(candidates.begin(), candidates.end());
-    }
-  });
-  return result;
+  auto parameter = gpu::lookupParameter(kernel, extent.getParameterReference());
+  return parameter ? SmallVector<int64_t>(parameter.getCandidates().asArrayRef())
+                   : SmallVector<int64_t>();
 }
 
 LogicalResult materializeLegalConfigurations(func::FuncOp kernel) {
@@ -334,18 +329,18 @@ LogicalResult materializeLegalConfigurations(func::FuncOp kernel) {
   auto space = readConfigurationDomains(kernel);
   if (failed(space)) return failure();
 
-  auto shared = space->sharedConfigurations();
+  auto shared = space->configurations(gpu::ConfigurationStage::Shared);
   if (failed(shared)) return failure();
   SmallVector<DictionaryAttr> configs = std::move(*shared);
   Builder builder(kernel.getContext());
-  for (const auto &domain : space->domains()) {
-    if (!domain.provider)
+  for (gpu::ParameterAttr domain : space->declarations()) {
+    if (domain.getPhase() != gpu::ConfigurationBindingPhase::Provider)
       continue;
     SmallVector<DictionaryAttr> expanded;
     for (DictionaryAttr base : configs)
-      for (int64_t candidate : domain.candidates()) {
+      for (int64_t candidate : domain.getCandidates().asArrayRef()) {
         NamedAttrList bindings(base);
-        bindings.set(domain.name(), builder.getI64IntegerAttr(candidate));
+        bindings.set(domain.getName(), builder.getI64IntegerAttr(candidate));
         DictionaryAttr config = bindings.getDictionary(kernel.getContext());
         if (!llvm::is_contained(expanded, config))
           expanded.push_back(config);
@@ -357,7 +352,7 @@ LogicalResult materializeLegalConfigurations(func::FuncOp kernel) {
   unsigned rejected = 0;
   for (DictionaryAttr config : configs) {
     unsigned failures =
-        configurationFailures(kernel, space->domains(), config, capabilities);
+        configurationFailures(kernel, space->declarations(), config, capabilities);
     if (failures) {
       rejected |= failures;
       continue;
@@ -441,10 +436,10 @@ LogicalResult materializeLaunchConfiguration(
   if (candidates.empty())
     return kernel.emitError(
         "TileLang provider found no legal thread count for every native GEMM shape");
-  gpu::ParameterOp threads = gpu::getOrCreatePhysicalParameter(
+  auto threads = gpu::getOrCreatePhysicalParameter(
       kernel, "THREADS", gpu::ParameterRole::ProviderThreads,
       gpu::ParameterCategory::Provider, 0, candidates);
-  if (!threads)
+  if (failed(threads))
     return failure();
   SmallVector<LaunchConfigOp> configs;
   kernel.getBody().front().walk(
@@ -452,14 +447,16 @@ LogicalResult materializeLaunchConfiguration(
   if (configs.size() > 1)
     return kernel.emitError(
         "TileLang provider program has duplicate launch configurations");
-  if (!configs.empty())
-    return configs.front().getThreads() == threads.getResult()
+  if (!configs.empty()) {
+    auto declaration = gpu::queryParameter(configs.front().getThreads());
+    return declaration && declaration.getReference() == *threads
                ? success()
                : configs.front().emitOpError(
                      "uses a conflicting TileLang thread parameter");
-  OpBuilder builder(threads);
-  builder.setInsertionPointAfter(threads);
-  builder.create<LaunchConfigOp>(kernel.getLoc(), threads.getResult());
+  }
+  OpBuilder builder(&kernel.front(), kernel.front().begin());
+  auto value = gpu::materializeParameter(builder, kernel.getLoc(), *threads);
+  builder.create<LaunchConfigOp>(kernel.getLoc(), value.getResult());
   return success();
 }
 
@@ -467,13 +464,13 @@ LogicalResult verifyTileLangProgram(ModuleOp module) {
   FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
   if (failed(kernel) || failed(mlir::verify(module))) return failure();
   auto domains = readConfigurationDomains(*kernel);
-  auto configurations = gpu::ConfigurationSpace::read(*kernel);
+  auto configurations = gpu::ParameterSpace::read(*kernel);
   if (failed(domains) || failed(configurations)) return failure();
   auto rows = configurations->configurations(gpu::ConfigurationStage::Complete);
   if (failed(rows) || failed(verifyTileLangKernel(*kernel))) return failure();
   auto capabilities = (*kernel)->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
   for (DictionaryAttr row : *rows)
-    if (unsigned failures = configurationFailures(*kernel, domains->domains(), row, capabilities))
+    if (unsigned failures = configurationFailures(*kernel, domains->declarations(), row, capabilities))
       return diagnoseConfigurationFailures(*kernel, failures,
           "final TileLang candidate violates the current native program", row);
   return success();

@@ -3,6 +3,7 @@
 #include "Legalize.h"
 #include "mlir/IR/Verifier.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include <cassert>
@@ -47,12 +48,11 @@ bool hasLoopCarriedFragment(func::FuncOp kernel) {
 }
 
 bool hasResidentWorkerTraversal(func::FuncOp kernel) {
-  bool found = false;
-  kernel.walk([&](gpu::ParameterOp parameter) {
-    found |= parameter.getParameter().getRole() ==
-             static_cast<uint32_t>(gpu::ParameterRole::ResidentWorkers);
-  });
-  return found;
+  for (Attribute attribute : gpu::getParameterDeclarations(kernel))
+    if (cast<gpu::ParameterAttr>(attribute).getRole() ==
+        gpu::ParameterRole::ResidentWorkers)
+      return true;
+  return false;
 }
 
 StringRef occupancyProfileFamily(func::FuncOp kernel,

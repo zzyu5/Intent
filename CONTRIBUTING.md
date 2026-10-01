@@ -25,8 +25,9 @@ Python definition
     ├─ KIRToGPU → GPU transformations → GPU provider
     ├─ KIRToCPU → CPU transformations → Mojo / Weft
     └─ KIRToDSA → DSA transformations → BANG C legalization
-  → provider serialization：source + 当前 IR 的 invocation interface
-  → GeneratedProgram.materialize()：使用同一 resolved target
+  → provider serialization：source + 当前 IR 的 interface 与 compilation target
+  → GeneratedProgram：可保存、恢复的 source / IR / metadata
+  → materialize(target=...)：检查目标事实，再绑定本机 runtime
   → CompiledArtifact.runtime → provider 编译、绑定与 launch
 ```
 
@@ -36,7 +37,7 @@ Python definition
 |---|---|---|
 | Kernel/helper 定义 | [python/intent/api/](python/intent/api/) | `@intent.kernel`、`@intent.fn` 及 source definition |
 | Python frontend | [frontend/compilation/compiler.py](python/intent/frontend/compilation/compiler.py)、[frontend/lowering/](python/intent/frontend/lowering/) | 类型化捕获、helper、控制与 intrinsic lowering |
-| 编译调用 | [compiler/pipeline.py](python/intent/compiler/pipeline.py)、[compiler/artifact.py](python/intent/compiler/artifact.py)、[compiler/toolchain.py](python/intent/compiler/toolchain.py) | `generate` 返回 source/IR/metadata；无参 `materialize` 沿用同一目标；`compile` 组合这两步 |
+| 编译调用 | [compiler/pipeline.py](python/intent/compiler/pipeline.py)、[compiler/artifact.py](python/intent/compiler/artifact.py)、[compiler/toolchain.py](python/intent/compiler/toolchain.py) | `generate` 返回独立 source/IR/metadata；`save/load` 不加载 SDK；`materialize` 绑定运行环境；`compile` 组合生成与绑定 |
 | C++ 编译入口 | [Compiler.cpp](lib/Compiler/Compiler.cpp)、[Backend.h](include/Intent/Compiler/Backend.h)、[intent-compile.cpp](tools/intent-compile/intent-compile.cpp) | 库拥有请求、阶段调度与当前模块；CLI 只解析参数和读写文件；backend 声明 family 与 provider 的连接 |
 | 公共产物与调用 | [runtime/artifact.py](python/intent/runtime/artifact.py)、[GPU program](python/intent/runtime/gpu/program.py)、[native ABI](python/intent/runtime/native.py) | `ArtifactRuntime.run/launch` 是显式调用接口；`prepare` 通过能力协议绑定一次调用，provider 完成自身的 JIT/tuning/launch |
 | 用户与 agent 工具 | [tools/compilation.py](python/intent/tools/compilation.py)、[tools/cli.py](python/intent/tools/cli.py)、[tools/compiler_mcp.py](python/intent/tools/compiler_mcp.py) | CLI 与显式启用的 compiler MCP 共用公开编译 API 和错误阶段，不建立第二条 compiler 路径 |
@@ -120,6 +121,36 @@ family passes 或 profile 导入，也不接受新的 tuning override。GPU/CPU 
 `python/triton/compiler/compiler.py:289–350` 顺序传递各阶段的实际产物。
 Intent 由同一个编译库连接 GPU、CPU 和 DSA 的不同 IR，保留各 family 的物理决策边界。
 标准工具可重放这些阶段；只有相应输入合同成立，单个 pass 才可独立使用。
+
+### 编译目标与本机运行绑定
+
+[targets/specification.py](python/intent/targets/specification.py) 的
+`GPUCompilationTarget`、`CPUCompilationTarget`、`DSACompilationTarget` 只提供
+编译所需的能力与预算。显式传入这些对象时，生成 source/shared IR 不查询设备，
+也不查找 provider SDK。`TritonTarget`、`MojoTarget` 等本机入口仍可探测环境，
+但解析结果中的 `compilation` 与 device、SDK、native compiler options 分别保存。
+
+编译器从最终 typed IR 导出 `metadata.target` 和 `metadata.provider`；
+`GeneratedProgram.target` 读取这份事实。GPU target 不包含设备序号；CPU 的
+vector、workers 和 private-memory 预算不包含 Mojo executable 路径。
+公共编译入口核对请求与结果，不从 MLIR 文本或本机设备补出缺失 metadata。
+
+`program.save(directory)` 保存 `kernel.source`、`kernel.mlir`、`artifact.json`；
+`intent.GeneratedProgram.load(directory)` 恢复同一产物，包括诊断入口名字。
+新目录完整写出后才发布，已有目录不会被覆盖。加载过程不执行生成源码。
+恢复的程序调用 `materialize(target=...)` 时必须显式选择本机运行环境；
+生成时使用了本机 target 的程序可无参沿用其进程内绑定。
+运行绑定检查编译事实一致，GPU 还重新查询所选设备，不能把另一架构的产物
+默默当作当前设备生成的程序。需要改变编译目标时重新运行相应编译阶段。
+
+Weft 的 AOT lowering、系统编译和 native artifact 仍有自己的产物合同；
+公共生成产物的保存不能替代这些步骤。BANG C 的导出和加载使用同一公共生成载体，
+NeuWare 编译、CNRT queue 与实际设备绑定继续属于其 runtime。
+
+职责对照：Triton `python/triton/compiler/compiler.py:226–233` 接受显式 target，
+`:413–438` 从 metadata 恢复目标并延迟 native handles，`:452–488` 才加载设备代码。
+Intent 的显式目标描述对应其 `python/triton/backends/compiler.py:8–14` 的 `GPUTarget`，
+同时保留 GPU、CPU、DSA 各自实际需要的构造能力。
 
 ## 按贡献类型选择模块
 
@@ -259,7 +290,7 @@ KIR 的验证入口直接属于 operation，按合同分布在
 | 物理整数表达式求值 | [Analysis/UniformValues.h](include/Intent/Dialect/GPU/Analysis/UniformValues.h) | `evaluatePhysicalExpression` 接受 symbolic-leaf binding；算术和溢出检查共用一份实现 |
 | range/loop 中的整数比较与完整 tile 界限 | [Analysis/IndexPredicates.h](include/Intent/Dialect/GPU/Analysis/IndexPredicates.h) | `proveRangeComparison`、`queryCompleteTileLimit` 与 `queryIndexComparisonBound` 只读当前范围；区分已证明的真值、条件蕴含和未知 |
 | 常量、大小关系与访问对齐 | [Analysis/IndexRelations.h](include/Intent/Dialect/GPU/Analysis/IndexRelations.h) | `IndexRelations` 共用于范围谓词、Triton descriptor 与 cuTile tile access；按 typed index 与回绕合同证明，不创建 guard 或选择原生 form |
-| 参数声明与完整候选绑定检查 | [Analysis/PhysicalParameters.h](include/Intent/Dialect/GPU/Analysis/PhysicalParameters.h) | `PhysicalParameterSpace::read` 建只读快照；改变声明后重读；候选仍保存在 IR |
+| 参数声明与完整候选绑定检查 | [Analysis/PhysicalParameters.h](include/Intent/Dialect/GPU/Analysis/PhysicalParameters.h) | `ParameterSpace::read` 读取 kernel 声明；不依赖 SSA 读取是否存在；改变声明后重读 |
 | fragment 结构资源估计 | [Analysis/Resources.h](include/Intent/Dialect/GPU/Analysis/Resources.h) | `FragmentResourceAnalysis` 缓存稳定 IR 的类型与参数使用关系；类型或 IR 改写后重建。估计不代替下层布局、寄存器分配和 occupancy |
 | specialization 后才能判定的资源约束 | [Transforms/Resources.h](include/Intent/Dialect/GPU/Transforms/Resources.h) | 将 deferred reduction bounds 写成当前 IR 的断言，供 Triton/cuTile 兑现；不是 analysis 中的隐藏改写 |
 | value projection、replay、validity 与显式常量 | [Transforms/ValueMaterialization.h](include/Intent/Dialect/GPU/Transforms/ValueMaterialization.h) | 传入当前 schema、source-axis 与 replay scope；由调用者决定合法的变换范围 |
@@ -293,15 +324,22 @@ Pointwise 的两个完整入口也在同一 driver 文件 [RealizePointwiseBlock
 每行给出该阶段全部必要符号的具体值，顺序是候选枚举顺序。Coverage 的运行期 extent
 通过独立的 deferred 声明绑定，不写成静态候选值；没有候选时直接失败。
 
-[ConfigurationParameterOpInterface](include/Intent/Dialect/GPU/IR/ConfigurationParameterOpInterface.h)
-由 operation 提供符号、有限 domain、语义角色与绑定阶段。
-普通 `ParameterOp` 保留正整数 extent 合同；Triton `DescriptorChoiceOp` 仍是独立的
-`i1` 选择，domain 为 `{0, 1}`。新增 provider 选择时声明真实 domain，不能为了共享表格
-把 bool 当成正整数 tile，也不能让 serializer 额外接受一个未声明的名字。
+Kernel 的 `intent_gpu.parameters` 保存唯一有序 `ParameterAttr` 声明表，包含名字、
+类型、有限 domain、角色、绑定阶段与 typed source/coverage binding。
+`ParameterRefAttr` 引用它；`ParameterOp` 是无副作用的 index 读取，
+其 `getDeclaration()` 查询当前 owner，不保存另一份 domain。
+Fragment 类型、physical expressions、region segment 和 provider loop-stage
+属性也使用引用，声明不依赖某个 SSA operation 存活。
+
+Index 声明严格为正整数；Triton descriptor choice 引用独立的 `i1` 声明，domain 为
+`{0, 1}`。Native warps/CTAs 等仅编译器消费的选项直接声明，不制造无用途的 SSA 值。
+普通 MLIR verifier 检查声明唯一性及 operation attributes、result types、block-argument
+types 中的引用。标准 DCE/CSE 可以删除或合并读取，无需保活声明的特殊名单。
 
 | 需要修改的职责 | 入口 |
 |---|---|
-| 当前声明、完整绑定与阶段验证 | [Analysis/Configurations.h](include/Intent/Dialect/GPU/Analysis/Configurations.h) 的只读 `ConfigurationSpace` |
+| 当前声明、完整绑定与阶段验证 | [Analysis/PhysicalParameters.h](include/Intent/Dialect/GPU/Analysis/PhysicalParameters.h) 的只读 `ParameterSpace` |
+| 创建声明、按需读取、改域、替换与改名 | [Transforms/PhysicalParameters.h](include/Intent/Dialect/GPU/Transforms/PhysicalParameters.h) 的 `declareParameter`、`materializeParameter`、`updateParameter`、`replaceParameter`、`renameParameters` |
 | 校验并发布候选表 | [Transforms/PhysicalParameters.h](include/Intent/Dialect/GPU/Transforms/PhysicalParameters.h) 的 `writeConfigurations` |
 | 当前图的分类、关联参数及完整结果机会 | [ConfigurationAnalysis.cpp](lib/Dialect/GPU/Transforms/ConfigurationAnalysis.cpp) |
 | 有限 profile 解码、family 选择与 role 投影 | [ConfigurationProfiles.cpp](lib/Dialect/GPU/Transforms/ConfigurationProfiles.cpp) |
@@ -309,8 +347,12 @@ Pointwise 的两个完整入口也在同一 driver 文件 [RealizePointwiseBlock
 | 共同候选形成的完整入口 | [MaterializeConfigTuples.cpp](lib/Dialect/GPU/Transforms/MaterializeConfigTuples.cpp) |
 
 这些私有 policy facts 只在一次不变的 current program 上使用，不跨改写缓存，不拥有
-第二张执行表。改变声明或参数关系后，完整变换重新形成并验证候选；不能让旧表继续
-解释新程序。Provider 可以进一步过滤、绑定或形成 local form，最终表仍通过同一入口发布。
+第二张执行表。修改 shared/deferred 声明使候选表失效；仅修改 provider 声明时，
+已有 shared 表仍有效，complete 表失效。完整变换在结束前重新形成最终表。
+改名与替换通过统一 owner 同时修改 attributes、result types 和 region argument types；
+不能只做 SSA RAUW，也不能把名称改写分散到 serializer。
+跨类型参数引用不是 MLIR 标准 SymbolTable 的完整遍历合同，因此这里使用 kernel-owned
+typed references 和显式 owner API，不把自有参数冒充通用 module symbols。
 
 Triton 的 [ConfigurationSchema](include/Intent/Target/Triton/IR/Configuration.h)
 统一查询 kernel constexpr 顺序以及 `num_warps/stages/ctas` 对应的参数符号，
@@ -420,9 +462,9 @@ CPU 的 implementation registry 是明确的局部扩展点。GPU provider 通�
 | PyTorch operator 注册 | [runtime/torch.py](python/intent/runtime/torch.py) | `as_torch_op` 注册 opaque 调用；fake 只消费相同接口。当前限 GPU 只读 In/scalar 和 fresh Out，拒绝 InOut，backward 由作者注册 |
 | 安装与依赖说明 | [tools/backends.py](python/intent/tools/backends.py)、[environment/install.py](environment/install.py) | 新安装路线声明实际依赖和外部工具链要求；不把实验私有环境或 baseline 包当作公共 runtime 依赖 |
 
-新增 GPU provider 时，先让 legalization 交付可独立验证的当前程序，再导出共同 interface 与必要 provider facts，实现上述 provider 调用接口，并由 `Target.materialize` 接入。不要复制 serializer 中的 Python host 模板，也不要让 framework adapter 自己猜输出或解析生成源码。CPU、DSA 可以保留自己的 ABI/buffer 类型；共同 `ArtifactRuntime` 协议不要求它们采用 GPU 的 grid、workspace 或 tensor binder。
+新增 GPU provider 时，先让 legalization 交付可独立验证的当前程序，再导出共同 interface 与必要 provider facts，实现上述 provider 调用接口，并由 `ResolvedTarget.materialize` 接入。不要复制 serializer 中的 Python host 模板，也不要让 framework adapter 自己猜输出或解析生成源码。CPU、DSA 可以保留自己的 ABI/buffer 类型；共同 `ArtifactRuntime` 协议不要求它们采用 GPU 的 grid、workspace 或 tensor binder。
 
-GPU target 的设备校验、解析、编译参数和 materialization 共用 [targets/gpu/target.py](python/intent/targets/gpu/target.py)；三个公开 Target 只声明 provider，静态 provider 表保存依赖与入口，`ResolvedGPUTarget` 只保存可序列化的 capabilities 和 provider 名称。
+GPU 的纯编译事实位于 [targets/specification.py](python/intent/targets/specification.py)，设备观察位于 [gpu/device.py](python/intent/targets/gpu/device.py)，本机绑定与 materialization 共用 [gpu/target.py](python/intent/targets/gpu/target.py)。三个公开本机 Target 只声明 provider；`ResolvedGPUTarget` 分别保存 compilation 与 device，provider 表只连接实际 materializer。显式 compilation target 不经过设备观察或 SDK import。
 
 实验适配若需要准备候选、观察调优或绑定调用，使用 `artifact.runtime` 的明确对象与 provider 扩展点。Compiler 生成的 source 不再承担 host `launch/run` 协议；只有显式作者提供的 Python source 由 [runtime/source.py](python/intent/runtime/source.py) 的独立 source loader 承接其已有 host callable。不要通过生成模块的私有字典改写编译器产物的执行语义。
 

@@ -6,6 +6,7 @@
 #include "Intent/Dialect/GPU/Transforms/Storage.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
@@ -40,12 +41,20 @@ PhysicalExprAttr expression(MLIRContext *context, PhysicalExprKind kind,
                             int64_t value = 0, StringRef symbol = {},
                             ArrayRef<Attribute> operands = {}) {
   return PhysicalExprAttr::get(
-      context, static_cast<uint32_t>(kind), value,
-      StringAttr::get(context, symbol), ArrayAttr::get(context, operands));
+      context, kind, value,
+      kind == PhysicalExprKind::Parameter
+          ? Attribute(ParameterRefAttr::get(context, StringAttr::get(context, symbol)))
+          : Attribute(StringAttr::get(context, symbol)),
+      ArrayAttr::get(context, operands));
+}
+
+Value parameterValue(func::FuncOp kernel, ParameterAttr declaration) {
+  OpBuilder entry(&kernel.front(), kernel.front().begin());
+  return materializeParameter(entry, kernel.getLoc(), declaration.getReference());
 }
 
 PhysicalExprAttr nextPowerOfTwo(PhysicalExprAttr source) {
-  if (source.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant)) {
+  if (source.getKind() == PhysicalExprKind::Constant) {
     uint64_t value = std::max<int64_t>(source.getValue(), 1);
     uint64_t result = 1;
     while (result < value)
@@ -57,7 +66,7 @@ PhysicalExprAttr nextPowerOfTwo(PhysicalExprAttr source) {
 }
 
 bool isCompileTimeExtent(PhysicalExprAttr expression) {
-  auto kind = static_cast<PhysicalExprKind>(expression.getKind());
+  auto kind = expression.getKind();
   if (kind == PhysicalExprKind::Constant || kind == PhysicalExprKind::Parameter)
     return true;
   if (kind == PhysicalExprKind::Dimension ||
@@ -86,13 +95,13 @@ bool exceedsRegisterFile(Value source, func::FuncOp kernel) {
   for (Attribute attribute : fragment.getShape()) {
     auto extent = cast<PhysicalExprAttr>(attribute);
     int64_t minimum;
-    if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant)) {
+    if (extent.getKind() == PhysicalExprKind::Constant) {
       minimum = extent.getValue();
-    } else if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
-      auto parameter = queryParameterBySymbol(kernel, extent.getSymbol());
+    } else if (extent.getKind() == PhysicalExprKind::Parameter) {
+      auto parameter = queryParameterBySymbol(kernel, extent.getSymbolName());
       if (failed(parameter))
         return false;
-      minimum = *llvm::min_element(parameter->getParameter().getCandidates().asArrayRef());
+      minimum = *llvm::min_element(parameter->getCandidates().asArrayRef());
     } else {
       return false;
     }
@@ -361,7 +370,7 @@ FailureOr<Value> clonePaddedProducer(
           cast<PhysicalExprAttr>(input.getShape()[*inputAxis]);
       bool expandsSingleton =
           inputExtent.getKind() ==
-              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+              PhysicalExprKind::Constant &&
           inputExtent.getValue() == 1 &&
           input.getShape()[*inputAxis] != fragment.getShape()[reductionAxis];
       if (!expandsSingleton) {
@@ -507,7 +516,7 @@ FailureOr<Value> clonePaddedProducer(
         auto operandExtent =
             cast<PhysicalExprAttr>(operandType.getShape()[*operandAxis]);
         if (operandExtent.getKind() ==
-                static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                PhysicalExprKind::Constant &&
             operandExtent.getValue() == 1 &&
             operandType.getShape()[*operandAxis] !=
                 fragment.getShape()[reductionAxis])
@@ -751,22 +760,14 @@ FragmentType eraseFragmentAxis(FragmentType source, unsigned erasedAxis) {
                            source.getValidity(), source.getOwner());
 }
 
-FailureOr<ParameterOp> fullCoverageParameter(func::FuncOp kernel,
+FailureOr<ParameterAttr> fullCoverageParameter(func::FuncOp kernel,
                                              PhysicalExprAttr extent) {
   if (extent.getKind() !=
-      static_cast<uint32_t>(PhysicalExprKind::Parameter))
+      PhysicalExprKind::Parameter)
     return failure();
-  StringRef name = extent.getSymbol().getValue();
-  ParameterOp parameter;
-  kernel.walk([&](ParameterOp candidate) {
-    if (candidate.getParameter().getName().getValue() == name)
-      parameter = candidate;
-  });
-  auto coverage = parameter
-                      ? parameter->getAttrOfType<IntegerAttr>(
-                            coverageDimensionAttr)
-                      : IntegerAttr();
-  if (!parameter || !coverage || coverage.getInt() <= 0)
+  ParameterAttr parameter = lookupParameter(kernel, extent.getParameterReference());
+  auto coverage = parameter ? parameter.getBinding().getDimension() : IntegerAttr();
+  if (!parameter || !parameter.isDeferred() || !coverage || coverage.getInt() <= 0)
     return failure();
   uint64_t dimension = static_cast<uint64_t>(coverage.getInt());
   bool launchVisible = false;
@@ -782,64 +783,48 @@ FailureOr<ParameterOp> fullCoverageParameter(func::FuncOp kernel,
   static constexpr int64_t candidates[] = {
       1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048,
       4096, 8192, 16384, 32768, 65536};
-  ParameterAttr schema = parameter.getParameter();
-  parameter->setAttr(
-      "parameter",
-      ParameterAttr::get(kernel.getContext(), schema.getName(), schema.getRole(),
-                         schema.getCategory(), schema.getElementBitWidth(),
-                         DenseI64ArrayAttr::get(kernel.getContext(), candidates)));
-  parameter->setAttr(coverageDimensionAttr,
-                     IntegerAttr::get(IntegerType::get(kernel.getContext(), 64),
-                                      dimension));
+  parameter = parameter.withCandidates(DenseI64ArrayAttr::get(kernel.getContext(), candidates));
+  if (failed(updateParameter(kernel, parameter))) return failure();
   return parameter;
 }
 
-FailureOr<ParameterOp> parameterForExtent(func::FuncOp kernel,
+FailureOr<ParameterAttr> parameterForExtent(func::FuncOp kernel,
                                           PhysicalExprAttr extent) {
   if (extent.getKind() !=
-      static_cast<uint32_t>(PhysicalExprKind::Parameter))
+      PhysicalExprKind::Parameter)
     return failure();
-  ParameterOp result;
-  kernel.walk([&](ParameterOp parameter) {
-    if (!result && parameter.getParameter().getName() == extent.getSymbol())
-      result = parameter;
-  });
-  return result ? FailureOr<ParameterOp>(result)
-                : FailureOr<ParameterOp>(failure());
+  ParameterAttr result = lookupParameter(kernel, extent.getParameterReference());
+  return result ? FailureOr<ParameterAttr>(result)
+                : FailureOr<ParameterAttr>(failure());
 }
 
 FailureOr<Value> dimensionArgument(func::FuncOp kernel, int64_t dimension);
 
-FailureOr<ParameterOp> parameterForDimension(func::FuncOp kernel,
+FailureOr<ParameterAttr> parameterForDimension(func::FuncOp kernel,
                                              int64_t dimension) {
-  ParameterOp result;
+  ParameterAttr result;
   bool ambiguous = false;
-  kernel.walk([&](ParameterOp parameter) {
-    auto bound = parameter->getAttrOfType<IntegerAttr>(dimensionAttr);
-    auto coverage =
-        parameter->getAttrOfType<IntegerAttr>(coverageDimensionAttr);
-    bool matches = (bound && bound.getInt() == dimension) ||
-                   (coverage && coverage.getInt() == dimension);
-    if (!matches)
-      return;
-    uint32_t role = parameter.getParameter().getRole();
+  for (Attribute attribute : getParameterDeclarations(kernel)) {
+    auto parameter = cast<ParameterAttr>(attribute);
+    auto bound = parameter.getBinding().getDimension();
+    if (!parameter.isExtent() || !bound || bound.getInt() != dimension) continue;
+    ParameterRole role = parameter.getRole();
     bool ownership =
-        role == static_cast<uint32_t>(ParameterRole::OwnershipM) ||
-        role == static_cast<uint32_t>(ParameterRole::OwnershipN);
-    if (!ownership && !coverage)
-      return;
+        role == ParameterRole::OwnershipM ||
+        role == ParameterRole::OwnershipN;
+    if (!ownership && !parameter.isDeferred()) continue;
     if (result && result != parameter) {
       ambiguous = true;
-      return;
+      continue;
     }
     result = parameter;
-  });
-  return result && !ambiguous ? FailureOr<ParameterOp>(result)
-                              : FailureOr<ParameterOp>(failure());
+  }
+  return result && !ambiguous ? FailureOr<ParameterAttr>(result)
+                              : FailureOr<ParameterAttr>(failure());
 }
 
-PhysicalExprAttr selectedParameterExtent(ParameterOp parameter) {
-  ParameterAttr schema = parameter.getParameter();
+PhysicalExprAttr selectedParameterExtent(ParameterAttr parameter) {
+  ParameterAttr schema = parameter;
   PhysicalParameterBinding binding = queryParameterBinding(parameter);
   if (binding.source && schema.getCandidates().size() == 1)
     return expression(parameter.getContext(), PhysicalExprKind::Constant,
@@ -848,21 +833,21 @@ PhysicalExprAttr selectedParameterExtent(ParameterOp parameter) {
                     schema.getName().getValue());
 }
 
-FailureOr<ParameterOp> parameterForOwnedRange(func::FuncOp kernel,
+FailureOr<ParameterAttr> parameterForOwnedRange(func::FuncOp kernel,
                                              MakeRangeOp range) {
-  FailureOr<ParameterOp> parameter = queryBlockingParameter(kernel, range);
+  FailureOr<ParameterAttr> parameter = queryBlockingParameter(kernel, range);
   if (failed(parameter) || !isUnitStepRange(range) ||
-      (*parameter)->hasAttr(coverageDimensionAttr))
+      parameter->isDeferred())
     return failure();
   PhysicalParameterBinding binding = queryParameterBinding(*parameter);
   FailureOr<int64_t> dimension = queryRangeDimension(range);
-  auto schema = parameter->getParameter();
+  auto schema = *parameter;
   if (!binding.isExact() ||
       (binding.source && !(*binding.source == sourceAxisIdentity(range))) ||
       (binding.dimension &&
        (failed(dimension) || *binding.dimension != *dimension)) ||
-      (schema.getRole() != static_cast<uint32_t>(ParameterRole::OwnershipM) &&
-       schema.getRole() != static_cast<uint32_t>(ParameterRole::OwnershipN)))
+      (schema.getRole() != ParameterRole::OwnershipM &&
+       schema.getRole() != ParameterRole::OwnershipN))
     return failure();
   auto fragment = cast<FragmentType>(range.getResult().getType());
   if (fragment.getShape()[0] != selectedParameterExtent(*parameter))
@@ -886,10 +871,12 @@ FailureOr<ParameterOp> parameterForOwnedRange(func::FuncOp kernel,
   Value tileOffset = offset ? otherOperand(offset, range.getStep(),
                                           BinaryOperator::Multiply)
                             : Value();
-  Value coordinate = tileOffset
-                         ? otherOperand(tileOffset, parameter->getResult(),
-                                        BinaryOperator::Multiply)
-                         : Value();
+  Value coordinate;
+  if (auto multiply = tileOffset ? tileOffset.getDefiningOp<BinaryOp>() : BinaryOp();
+      multiply && multiply.getOperatorKind() == BinaryOperator::Multiply) {
+    if (queryParameter(multiply.getLhs()) == *parameter) coordinate = multiply.getRhs();
+    else if (queryParameter(multiply.getRhs()) == *parameter) coordinate = multiply.getLhs();
+  }
   auto result = dyn_cast_or_null<OpResult>(coordinate);
   auto mapping = result ? dyn_cast<DelinearizeOp>(result.getOwner())
                         : DelinearizeOp();
@@ -903,22 +890,23 @@ FailureOr<ParameterOp> parameterForOwnedRange(func::FuncOp kernel,
   return *parameter;
 }
 
-FailureOr<ParameterOp> fullCoverageParameterForDimension(func::FuncOp kernel,
+FailureOr<ParameterAttr> fullCoverageParameterForDimension(func::FuncOp kernel,
                                                          int64_t dimension) {
   if (dimension <= 0 || failed(dimensionArgument(kernel, dimension)))
     return failure();
   static constexpr int64_t candidates[] = {
       1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048,
       4096, 8192, 16384, 32768, 65536};
-  ParameterOp parameter = getOrCreatePhysicalParameter(
+  auto reference = getOrCreatePhysicalParameter(
       kernel, ("REDUCE_FULL_D" + Twine(dimension)).str(),
       ParameterRole::OwnershipN, ParameterCategory::Coverage,
       /*elementBitWidth=*/0, candidates);
-  if (!parameter)
+  if (failed(reference))
     return failure();
-  parameter->setAttr(
-      coverageDimensionAttr,
-      IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), dimension));
+  auto parameter = lookupParameter(kernel, *reference);
+  parameter = parameter.withBinding(parameter.getBinding().withDimension(
+      IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), dimension)));
+  if (failed(updateParameter(kernel, parameter))) return failure();
   return parameter;
 }
 
@@ -932,7 +920,7 @@ bool hasNonUnitFreeAxis(ReduceOp reduce) {
         continue;
       auto extent = cast<PhysicalExprAttr>(attribute);
       if (extent.getKind() ==
-              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+              PhysicalExprKind::Constant &&
           extent.getValue() == 1)
         continue;
       return true;
@@ -942,7 +930,7 @@ bool hasNonUnitFreeAxis(ReduceOp reduce) {
 }
 
 bool hasSelectedSegmentExtent(ReduceOp reduce, func::FuncOp kernel) {
-  ParameterOp segment;
+  ParameterAttr segment;
   for (Value source : reduce.getSources()) {
     auto fragment = dyn_cast<FragmentType>(source.getType());
     int64_t axis = reduce.getAxes().empty() ? -1 : reduce.getAxes().front();
@@ -950,10 +938,10 @@ bool hasSelectedSegmentExtent(ReduceOp reduce, func::FuncOp kernel) {
         axis >= static_cast<int64_t>(fragment.getShape().size()))
       return false;
     auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
-    FailureOr<ParameterOp> parameter = parameterForExtent(kernel, extent);
+    FailureOr<ParameterAttr> parameter = parameterForExtent(kernel, extent);
     if (failed(parameter) ||
-        (*parameter).getParameter().getRole() !=
-            static_cast<uint32_t>(ParameterRole::ScanChunk))
+        parameter->getRole() !=
+            ParameterRole::ScanChunk)
       return false;
     if (segment && segment != *parameter)
       return false;
@@ -991,7 +979,7 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
     auto extent =
         dyn_cast<PhysicalExprAttr>(fragment.getShape()[reductionAxis]);
     if (!extent || extent.getKind() !=
-                       static_cast<uint32_t>(PhysicalExprKind::Constant))
+                       PhysicalExprKind::Constant)
       return false;
     if (logicalExtent && logicalExtent != extent)
       return false;
@@ -1272,7 +1260,7 @@ FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
     sourceAxes.push_back(sourceAxisIdentity(*mapping));
   }
   if (!extent || extent.getKind() !=
-                     static_cast<uint32_t>(PhysicalExprKind::Parameter))
+                     PhysicalExprKind::Parameter)
     return false;
   llvm::DenseMap<PhysicalSourceAxis, MakeRangeOp> ranges;
   PhysicalProgramAnalysis analysis(kernel);
@@ -1292,7 +1280,7 @@ FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
   MakeRangeOp range = ranges.begin()->second;
   if (range->hasAttr(sourceSubregionAttr))
     return false;
-  FailureOr<ParameterOp> parameter = fullCoverageParameter(kernel, extent);
+  FailureOr<ParameterAttr> parameter = fullCoverageParameter(kernel, extent);
   if (failed(parameter))
     return false;
   if (llvm::any_of(ranges, [](const auto &entry) {
@@ -1304,8 +1292,7 @@ FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
   Value logicalExtent = range.getExtent();
   if (isCompileTimeValue(logicalExtent)) {
     FailureOr<int64_t> sourceDimension = queryRangeDimension(range);
-    auto coverageDimension =
-        (*parameter)->getAttrOfType<IntegerAttr>(coverageDimensionAttr);
+    auto coverageDimension = parameter->getBinding().getDimension();
     if (range->hasAttr(sourceSubregionAttr) || failed(sourceDimension) ||
         !coverageDimension ||
         *sourceDimension != coverageDimension.getInt())
@@ -1317,11 +1304,10 @@ FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
     logicalExtent = *launchExtent;
   }
 
-  auto coverageDimension =
-      (*parameter)->getAttrOfType<IntegerAttr>(coverageDimensionAttr);
+  auto coverageDimension = parameter->getBinding().getDimension();
   if (!coverageDimension ||
       failed(bindFullCoverageDimension(
-          kernel, coverageDimension.getInt(), parameter->getResult())))
+          kernel, coverageDimension.getInt(), parameterValue(kernel, *parameter))))
     return failure();
 
   OpBuilder builder(reduce);
@@ -1381,7 +1367,7 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
       auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
       if (realization.constructionScalarSeed ||
           extent.getKind() ==
-              static_cast<uint32_t>(PhysicalExprKind::Dimension)) {
+              PhysicalExprKind::Dimension) {
         if (mapping.getDimensionId() <= 0)
           return reduce.emitOpError(
               "reduction free axis has no logical dimension authority");
@@ -1393,18 +1379,18 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
         continue;
       }
       if (extent.getKind() !=
-          static_cast<uint32_t>(PhysicalExprKind::Parameter))
+          PhysicalExprKind::Parameter)
         return reduce.emitOpError(
             "reduction free axis has no physical parameter authority");
-      FailureOr<ParameterOp> parameter = parameterForExtent(kernel, extent);
+      FailureOr<ParameterAttr> parameter = parameterForExtent(kernel, extent);
       if (failed(parameter))
         return reduce.emitOpError(
             "reduction free axis has no physical parameter authority");
-      uint32_t role = (*parameter).getParameter().getRole();
+      ParameterRole role = parameter->getRole();
       bool ownership =
-          role == static_cast<uint32_t>(ParameterRole::OwnershipM) ||
-          role == static_cast<uint32_t>(ParameterRole::OwnershipN);
-      if (!ownership && !(*parameter)->hasAttr(coverageDimensionAttr))
+          role == ParameterRole::OwnershipM ||
+          role == ParameterRole::OwnershipN;
+      if (!ownership && !parameter->isDeferred())
         return reduce.emitOpError(
             "reduction free axis is neither ownership-blocked nor exact full coverage");
     }
@@ -1413,7 +1399,7 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
   for (auto [source, sourceAxis, dimension] : pending) {
     PhysicalProgramAnalysis analysis(kernel);
     PhysicalRangeFact ranges = analysis.sourceRanges(source, sourceAxis);
-    FailureOr<ParameterOp> parameter = parameterForDimension(kernel, dimension);
+    FailureOr<ParameterAttr> parameter = parameterForDimension(kernel, dimension);
     bool projectedOwnership = false;
     PhysicalAxisProjection projection =
         queryFragmentAxis(source.getType(), sourceAxis);
@@ -1422,11 +1408,11 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
           analysis.axisRanges(source, projection.fragmentAxis);
       if (projected.isExact() && projected.unitStep &&
           analysis.lockstepRanges(projected.roots).isExact()) {
-        FailureOr<ParameterOp> owner =
+        FailureOr<ParameterAttr> owner =
             parameterForOwnedRange(kernel, projected.roots.front());
         if (succeeded(owner) &&
             llvm::all_of(projected.roots, [&](MakeRangeOp range) {
-              FailureOr<ParameterOp> current =
+              FailureOr<ParameterAttr> current =
                   parameterForOwnedRange(kernel, range);
               return succeeded(current) && *current == *owner;
             })) {
@@ -1489,7 +1475,7 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
                            selectedParameterExtent(*parameter));
     if (fullCoverage &&
         failed(bindFullCoverageDimension(kernel, dimension,
-                                         parameter->getResult())))
+                                         parameterValue(kernel, *parameter))))
       return reduce.emitOpError(
                  "reduction free axis full-coverage binding failed")
              << "; dimension=" << dimension;
@@ -1507,8 +1493,8 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
         auto parameter = parameterForExtent(kernel, cast<PhysicalExprAttr>(attribute));
         if (failed(parameter))
           continue;
-        auto schema = parameter->getParameter();
-        auto role = static_cast<ParameterRole>(schema.getRole());
+        auto schema = *parameter;
+        auto role = schema.getRole();
         if (role != ParameterRole::OwnershipM && role != ParameterRole::OwnershipN)
           continue;
         Type element = fragment.getElementType();
@@ -1519,7 +1505,7 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
           if (axis == otherAxis)
             continue;
           auto extent = cast<PhysicalExprAttr>(otherAttribute);
-          if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+          if (extent.getKind() != PhysicalExprKind::Constant ||
               extent.getValue() <= 0) {
             known = false;
             break;
@@ -1534,9 +1520,9 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
             candidates.push_back(candidate);
         if (!candidates.empty() &&
             candidates.size() != static_cast<size_t>(schema.getCandidates().size()))
-          parameter->setParameterAttr(ParameterAttr::get(
-              kernel.getContext(), schema.getName(), schema.getRole(), schema.getCategory(),
-              schema.getElementBitWidth(), DenseI64ArrayAttr::get(kernel.getContext(), candidates)));
+          if (failed(updateParameter(kernel, schema.withCandidates(
+                  DenseI64ArrayAttr::get(kernel.getContext(), candidates)))))
+            return failure();
       }
     }
   }
@@ -1887,13 +1873,13 @@ FailureOr<bool> decomposeFullCoverageMultiAxisReduce(
     return false;
   auto outerExtent =
       dyn_cast<PhysicalExprAttr>(firstSource.getShape()[outerAxis]);
-  FailureOr<ParameterOp> coverage =
+  FailureOr<ParameterAttr> coverage =
       outerExtent ? fullCoverageParameter(kernel, outerExtent)
-                  : FailureOr<ParameterOp>(failure());
+                  : FailureOr<ParameterAttr>(failure());
   if (succeeded(coverage)) {
-    auto dimension = (*coverage)->getAttrOfType<IntegerAttr>(coverageDimensionAttr);
+    auto dimension = coverage->getBinding().getDimension();
     if (!dimension || failed(bindFullCoverageDimension(
-            kernel, dimension.getInt(), coverage->getResult())))
+            kernel, dimension.getInt(), parameterValue(kernel, *coverage))))
       return reduce.emitOpError(
                  "multi-axis full-coverage fragment could not bind its logical dimension"),
              failure();
@@ -2133,7 +2119,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                             [](Operation &operation) {
                               return canLiftCombineOperation(operation);
                             });
-  ParameterOp outerChunk;
+  ParameterAttr outerChunk;
   PhysicalExprAttr outerSliceExtent = unitExtent;
   if (blockOuterAxis) {
     std::string name =
@@ -2155,26 +2141,29 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
         cast<FragmentType>(reduce.getSources().front().getType());
     if (queryFragmentAxes(firstSource, plans.front().sourceIdentity).size() > 1)
       name += ("_F" + Twine(outerAxis)).str();
-    outerChunk = getOrCreatePhysicalParameter(
+    auto reference = getOrCreatePhysicalParameter(
         kernel, name, ParameterRole::ReductionOuter,
         ParameterCategory::Reduction,
         firstSource.getElementType().getIntOrFloatBitWidth(), candidates);
-    if (!outerChunk)
+    if (failed(reference))
       return reduce.emitOpError(
           "multi-axis outer reduction has no physical chunk parameter");
+    outerChunk = lookupParameter(kernel, *reference);
     if (FailureOr<int64_t> dimension =
             queryRangeDimension(master->range);
-        succeeded(dimension))
-      outerChunk->setAttr(dimensionAttr,
-                          IntegerAttr::get(
-                              IntegerType::get(reduce.getContext(), 64),
-                              *dimension));
+        succeeded(dimension)) {
+      outerChunk = outerChunk.withBinding(outerChunk.getBinding().withDimension(
+          IntegerAttr::get(IntegerType::get(reduce.getContext(), 64), *dimension)));
+      if (failed(updateParameter(kernel, outerChunk))) return failure();
+    }
     outerSliceExtent = expression(
         reduce.getContext(), PhysicalExprKind::Parameter, 0,
-        outerChunk.getParameter().getName().getValue());
+        outerChunk.getName().getValue());
   }
   OpBuilder builder(reduce);
   Location location = reduce.getLoc();
+  Value outerChunkValue = blockOuterAxis
+      ? materializeParameter(builder, location, outerChunk.getReference()).getResult() : Value();
   SmallVector<FragmentType> accumulatorTypes;
   if (blockOuterAxis)
     for (const SourcePlan &plan : plans)
@@ -2212,7 +2201,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
   bool bodyFailed = false;
   std::string failureReason;
   Value outerLoopStep =
-      blockOuterAxis ? outerChunk.getResult() : master->range.getStep();
+      blockOuterAxis ? outerChunkValue : master->range.getStep();
   auto loop = builder.create<scf::ForOp>(
       location, master->range.getLogicalStart(),
       master->range.getLogicalStop(), outerLoopStep, loopInitials,
@@ -2240,7 +2229,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
             }
             auto blocked = nested.create<MakeRangeOp>(
                 nestedLocation, blockedType, coordinate,
-                outerChunk.getResult(), range.getStep(),
+                outerChunkValue, range.getStep(),
                 range.getLogicalStart(), range.getLogicalStop(),
                 range.getSourceId(), range.getSourceAxis(), range.getDerived());
             inheritRangeAuthority(blocked, range);
@@ -2427,7 +2416,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                     outerMap.getSourceAxis(), outerMap.getDimensionId(),
                     /*fragmentAxis=*/0, outerMap.getDerived())}),
                 sliced.getValidity(), sliced.getOwner());
-            Value physicalExtent = outerChunk.getResult();
+            Value physicalExtent = outerChunkValue;
             auto outerRange = nested.create<MakeRangeOp>(
                 nestedLocation, rangeType, coordinate, physicalExtent,
                 master->range.getStep(), master->range.getLogicalStart(),
@@ -2654,27 +2643,27 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
   auto firstSource = cast<FragmentType>(sourcePlans.front().source.getType());
   PhysicalExprAttr sourceExtent = cast<PhysicalExprAttr>(
       firstSource.getShape()[sourcePlans.front().reductionAxis]);
-  FailureOr<ParameterOp> fullCoverage = failure();
+  FailureOr<ParameterAttr> fullCoverage = failure();
   if (!tileProducerFreeAxis && !hasNonUnitFreeAxis(reduce))
     fullCoverage = fullCoverageParameter(kernel, sourceExtent);
-  FailureOr<ParameterOp> selectedChunk =
+  FailureOr<ParameterAttr> selectedChunk =
       parameterForExtent(kernel, sourceExtent);
   ParameterRole reductionRole = tileProducerFreeAxis
                                     ? ParameterRole::ReductionOuter
                                     : ParameterRole::Reduction;
   if (auto parent = reduce->getParentOfType<scf::ForOp>())
     if (auto outer = parent.getStep().getDefiningOp<ParameterOp>();
-        outer && outer.getParameter().getRole() ==
-                     static_cast<uint32_t>(ParameterRole::ReductionOuter))
+        outer && outer.getDeclaration().getRole() ==
+                     ParameterRole::ReductionOuter)
       reductionRole = ParameterRole::ReductionInner;
-  ParameterOp chunk;
+  ParameterAttr chunk;
   if (reduce.getSources().size() == 1 &&
       !firstRange->hasAttr(sourceSubregionAttr) && succeeded(fullCoverage)) {
     chunk = *fullCoverage;
   } else if (succeeded(selectedChunk) &&
-             !(*selectedChunk)->hasAttr(coverageDimensionAttr) &&
-             (*selectedChunk).getParameter().getRole() ==
-                 static_cast<uint32_t>(reductionRole)) {
+             !selectedChunk->isDeferred() &&
+             selectedChunk->getRole() ==
+                 reductionRole) {
     chunk = *selectedChunk;
   } else {
     std::string name =
@@ -2700,15 +2689,18 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
         });
         name += ("_E" + Twine(padded)).str();
       }
-    chunk = getOrCreatePhysicalParameter(
+    auto reference = getOrCreatePhysicalParameter(
         kernel, name, reductionRole, ParameterCategory::Reduction,
         firstSource.getElementType().getIntOrFloatBitWidth(), candidates);
-    if (chunk)
+    if (succeeded(reference)) {
+      chunk = lookupParameter(kernel, *reference);
       if (FailureOr<int64_t> dimension = queryRangeDimension(firstRange);
-          succeeded(dimension))
-        chunk->setAttr(dimensionAttr,
-                       IntegerAttr::get(IntegerType::get(chunk.getContext(), 64),
-                                        *dimension));
+          succeeded(dimension)) {
+        chunk = chunk.withBinding(chunk.getBinding().withDimension(
+            IntegerAttr::get(IntegerType::get(chunk.getContext(), 64), *dimension)));
+        if (failed(updateParameter(kernel, chunk))) return failure();
+      }
+    }
   }
   if (!chunk)
     return reduce.emitOpError(
@@ -2726,11 +2718,9 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
 
   OpBuilder builder(reduce);
   Location location = reduce.getLoc();
-  Value chunkSize = chunk.getResult();
-  if (chunkExtent.getKind() !=
-      static_cast<uint32_t>(PhysicalExprKind::Parameter))
-    chunkSize = builder.create<PhysicalExprOp>(
-        location, builder.getIndexType(), chunkExtent);
+  Value chunkSize = chunkExtent.getKind() == PhysicalExprKind::Parameter
+      ? materializeParameter(builder, location, chunk.getReference()).getResult()
+      : builder.create<PhysicalExprOp>(location, builder.getIndexType(), chunkExtent).getResult();
   Value stop = firstEnd;
   SmallVector<Value> identities(
       reduce.getIdentities()
@@ -3337,7 +3327,7 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
   OpBuilder builder(reduce);
   Value physicalExtent;
   if (blockExtent.getKind() ==
-      static_cast<uint32_t>(PhysicalExprKind::Constant))
+      PhysicalExprKind::Constant)
     physicalExtent = builder.create<arith::ConstantIndexOp>(
         reduce.getLoc(), blockExtent.getValue());
   else
@@ -3436,11 +3426,11 @@ FailureOr<SourcePlan> nestedScalarReductionSource(ReduceOp reduce,
   auto type = dyn_cast<FragmentType>(source.getType());
   if (!type || type.getShape().size() != 1)
     return failure();
-  FailureOr<ParameterOp> parameter = parameterForExtent(
+  FailureOr<ParameterAttr> parameter = parameterForExtent(
       kernel, cast<PhysicalExprAttr>(type.getShape()[0]));
   PhysicalProgramAnalysis analysis(kernel);
   if (succeeded(parameter)) {
-    if (!(*parameter)->hasAttr(coverageDimensionAttr))
+    if (!parameter->isDeferred())
       return failure();
   }
   FailureOr<SourcePlan> plan = analyzeSource(source, 0);
@@ -3510,7 +3500,7 @@ FailureOr<SourcePlan> nestedScalarReductionSource(ReduceOp reduce,
       for (auto [axis, attribute] : llvm::enumerate(fragment.getShape())) {
         auto extent = cast<PhysicalExprAttr>(attribute);
         if (extent.getKind() !=
-                static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+                PhysicalExprKind::Constant ||
             extent.getValue() != 1 ||
             analysis.axisRealization(result, axis).constructionScalarSeed)
           ++varyingAxes;

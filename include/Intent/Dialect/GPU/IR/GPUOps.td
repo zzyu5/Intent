@@ -5,7 +5,6 @@ include "Intent/Dialect/GPU/IR/GPUDialect.td"
 include "Intent/Dialect/GPU/IR/GPUAttrs.td"
 include "Intent/Dialect/GPU/IR/GPUTypes.td"
 include "Intent/Dialect/GPU/IR/AccessOpInterface.td"
-include "Intent/Dialect/GPU/IR/ConfigurationParameterOpInterface.td"
 include "Intent/Dialect/Intent/IR/IntentAttrs.td"
 include "Intent/Interfaces/StructuredOpInterface.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
@@ -40,11 +39,14 @@ class IntentGPU_ReadOp<string mnemonic, string kind, string resource,
     "::mlir::Value getAccessFill() { return getFill(); }\n" #
     "std::optional<::mlir::MutableOperandRange> getAccessFillMutable() { return getFillMutable(); }\n">;
 
-def IntentGPU_ParameterOp : IntentGPU_Op<"parameter", [Pure,
-    DeclareOpInterfaceMethods<IntentGPU_ConfigurationParameterOpInterface>]> {
-  let arguments = (ins IntentGPU_Parameter:$parameter);
+def IntentGPU_ParameterOp : IntentGPU_Op<"parameter", [Pure]> {
+  let summary = "Read a kernel-owned positive index parameter";
+  let arguments = (ins IntentGPU_ParameterRefAttr:$reference);
   let results = (outs Index:$result);
   let hasVerifier = 1;
+  let extraClassDeclaration = [{
+    ::intent::gpu::ParameterAttr getDeclaration();
+  }];
 }
 
 def IntentGPU_PhysicalExprOp : IntentGPU_Op<"physical_expr", [Pure]> {
@@ -321,7 +323,7 @@ def IntentGPU_RegionFoldOp : IntentGPU_Op<"region_fold", [Pure, IsolatedFromAbov
                        Variadic<IntentGPU_DataValue>:$identities,
                        Variadic<IntentGPU_DataValue>:$captures,
                        I64Attr:$axis,
-                       IntentGPU_Parameter:$segment);
+                       IntentGPU_ParameterRefAttr:$segment);
   let results = (outs Variadic<IntentGPU_DataValue>:$results);
   let regions = (region SizedRegion<1>:$summarize,
                          SizedRegion<1>:$combine);
@@ -354,7 +356,7 @@ def IntentGPU_RegionScanOp : IntentGPU_Op<"region_scan", [Pure, IsolatedFromAbov
                        Variadic<IntentGPU_DataValue>:$initial_states,
                        Variadic<IntentGPU_DataValue>:$captures,
                        I64Attr:$axis,
-                       IntentGPU_Parameter:$segment);
+                       IntentGPU_ParameterRefAttr:$segment);
   let results = (outs Variadic<IntentGPU_DataValue>:$emitted_results,
                       Variadic<IntentGPU_DataValue>:$final_states);
   let regions = (region SizedRegion<1>:$summarize,

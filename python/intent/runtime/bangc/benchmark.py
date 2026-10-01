@@ -5,8 +5,9 @@ import json
 from pathlib import Path
 
 from intent.targets.bangc import BangCTarget
+from intent.compiler.artifact import GeneratedProgram
 from .buffer import DeviceBuffer
-from .program import NativeProgram, benchmark_calls, launch_calls
+from .program import benchmark_calls, launch_calls
 
 
 def run(manifest: Path, output: Path, *, device: int, neuware: str) -> None:
@@ -32,11 +33,9 @@ def run(manifest: Path, output: Path, *, device: int, neuware: str) -> None:
 
         for step in request["steps"]:
             artifact = root / step["artifact"]
-            metadata = json.loads((artifact / "artifact.json").read_text())
-            target = BangCTarget(**{name: metadata[name] for name in
-                ("architecture", "tile", "tile_m", "tile_n", "tile_k", "region_tile", "tasks", "local_bytes")},
-                device=device, neuware=neuware).resolve()
-            program = NativeProgram((artifact / "kernel.mlu").read_text(), metadata, target)
+            generated = GeneratedProgram.load(artifact)
+            target = BangCTarget.from_program(generated, device=device, neuware=neuware)
+            program = generated.materialize(target=target).runtime
             programs.append(program)
             calls.append(program.prepare(tuple(argument(value) for value in step["arguments"]), explicit_outputs=True))
             for parameter, specification in zip(program.parameters, step["arguments"]):

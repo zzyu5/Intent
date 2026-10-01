@@ -124,11 +124,11 @@ int64_t selectCandidate(ArrayRef<int64_t> candidates, int64_t requested) {
 LogicalResult projectConfigurationProfiles(
     func::FuncOp kernel, const ConfigurationFacts &facts,
     const TuningProfiles &tables, ProfileBindingConsumer consume) {
-  ArrayRef<ParameterOp> parameters = facts.parameters;
+  ArrayRef<ParameterAttr> parameters = facts.parameters;
   Builder builder(kernel.getContext());
   unsigned profileCount = 0;
-  llvm::DenseMap<Operation *, SmallVector<TuningProfile, 5>> parameterProfiles;
-  for (ParameterOp parameter : parameters) {
+  llvm::DenseMap<ParameterAttr, SmallVector<TuningProfile, 5>> parameterProfiles;
+  for (ParameterAttr parameter : parameters) {
     const auto &classification = facts.classifications.find(parameter)->second;
     auto profiles = profilesFor(
         kernel, classification.kind, classification.width,
@@ -144,9 +144,9 @@ LogicalResult projectConfigurationProfiles(
     profileCount = 1;
   int64_t largestReduction = 0;
   bool hasReductionRows = false;
-  for (ParameterOp parameter : parameters) {
+  for (ParameterAttr parameter : parameters) {
     hasReductionRows |= facts.classifications.find(parameter)->second.reductionRow;
-    auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());
+    auto role = parameter.getRole();
     if (role == ParameterRole::Reduction || role == ParameterRole::ReductionInner ||
         role == ParameterRole::ReductionOuter)
       for (const TuningProfile &profile : parameterProfiles.find(parameter)->second)
@@ -160,13 +160,13 @@ LogicalResult projectConfigurationProfiles(
   }) ? 2 : 1;
   auto appendTuple = [&](ProfileLookup profileFor, bool compactRows = false) {
     for (unsigned choice = 0; choice < rowChoiceCount * freeAxisChoices; ++choice) {
-      llvm::SmallDenseSet<Operation *> selectedRows;
+      llvm::SmallDenseSet<ParameterAttr> selectedRows;
       for (const auto &group : facts.rowGroups)
         selectedRows.insert(group.second[(choice / freeAxisChoices) % group.second.size()]);
       NamedAttrList bindings;
-      for (ParameterOp parameter : parameters) {
-        auto schema = parameter.getParameter();
-        auto role = static_cast<ParameterRole>(schema.getRole());
+      for (ParameterAttr parameter : parameters) {
+        auto schema = parameter;
+        auto role = schema.getRole();
         int64_t requested = requestedValue(profileFor(parameter), role);
         // A one-axis pointwise profile budgets the entire fragment. Static
         // local axes consume that budget even without their own parameters.
@@ -194,7 +194,7 @@ LogicalResult projectConfigurationProfiles(
   };
   for (unsigned profileIndex = 0; profileIndex < profileCount;
        ++profileIndex) {
-    appendTuple([&](ParameterOp parameter) -> const TuningProfile & {
+    appendTuple([&](ParameterAttr parameter) -> const TuningProfile & {
       const auto &profiles = parameterProfiles.find(parameter)->second;
       unsigned selectedProfile = std::min<unsigned>(profileIndex,
                                                      profiles.size() - 1);
@@ -205,13 +205,13 @@ LogicalResult projectConfigurationProfiles(
   // resource budget. Keep one correlated small-row/large-chunk tuple instead
   // of pairing both granularities solely by their profile row number.
   if (!facts.hasContraction && hasReductionRows && largestReduction > 0)
-    appendTuple([&](ParameterOp parameter) -> const TuningProfile & {
+    appendTuple([&](ParameterAttr parameter) -> const TuningProfile & {
       return parameterProfiles.find(parameter)->second.front();
     }, true);
   for (const ReductionProfileParameters &correlated : facts.reductionProfiles) {
     for (auto [index, profile] :
          llvm::enumerate(parameterProfiles.find(correlated.chunk)->second))
-      appendTuple([&](ParameterOp parameter) -> const TuningProfile & {
+      appendTuple([&](ParameterAttr parameter) -> const TuningProfile & {
         if (parameter == correlated.chunk || llvm::is_contained(correlated.rows, parameter))
           return profile;
         const auto &profiles = parameterProfiles.find(parameter)->second;
@@ -229,7 +229,7 @@ LogicalResult projectConfigurationProfiles(
       rows.ownershipN = matrix.ownershipM;
       TuningProfile columns = matrix;
       columns.reduction = matrix.ownershipN;
-      appendTuple([&](ParameterOp parameter) -> const TuningProfile & {
+      appendTuple([&](ParameterAttr parameter) -> const TuningProfile & {
         if (parameter == correlated.pointwise)
           return rows;
         if (parameter == correlated.reduction)
@@ -244,14 +244,14 @@ LogicalResult projectConfigurationProfiles(
     if (failed(indirectProfiles))
       return failure();
     for (const TuningProfile &indirectRowProfile : *indirectProfiles) {
-      appendTuple([&](ParameterOp parameter) -> const TuningProfile & {
-        ParameterAttr schema = parameter.getParameter();
+      appendTuple([&](ParameterAttr parameter) -> const TuningProfile & {
+        ParameterAttr schema = parameter;
         const auto &profiles = parameterProfiles.find(parameter)->second;
         bool indirectContraction =
             schema.getCategory() ==
-                static_cast<uint32_t>(ParameterCategory::Contraction) &&
+                ParameterCategory::Contraction &&
             llvm::is_contained(facts.indirectRowGroups,
-                               parameter->getAttr(parameterGroupAttr));
+                               parameter.getBinding().getGroup());
         return indirectContraction ? indirectRowProfile : profiles.front();
       });
     }

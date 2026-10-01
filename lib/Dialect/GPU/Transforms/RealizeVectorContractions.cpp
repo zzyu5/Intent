@@ -53,7 +53,7 @@ FailureOr<Value> projectOperand(OpBuilder &builder, ContractOp contract,
   }
   SmallVector<Attribute> shape(productType.getShape().size(),
       PhysicalExprAttr::get(contract.getContext(),
-          static_cast<uint32_t>(PhysicalExprKind::Constant), 1,
+          PhysicalExprKind::Constant, 1,
           builder.getStringAttr(""), builder.getArrayAttr({})));
   SmallVector<std::optional<unsigned>> sourceAxes(shape.size());
   for (auto [axis, originalAxis] : llvm::enumerate(permutation)) {

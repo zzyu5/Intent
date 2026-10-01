@@ -6,6 +6,7 @@
 #include "Intent/Analysis/CanonicalKernel.h"
 #include "Intent/Interfaces/StructuredOpInterface.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
@@ -68,8 +69,11 @@ PhysicalExprAttr expression(MLIRContext *context, PhysicalExprKind kind,
                             int64_t value = 0, StringRef symbol = {},
                             ArrayRef<Attribute> operands = {}) {
   return PhysicalExprAttr::get(
-      context, static_cast<uint32_t>(kind), value,
-      StringAttr::get(context, symbol), ArrayAttr::get(context, operands));
+      context, kind, value,
+      kind == PhysicalExprKind::Parameter
+          ? Attribute(gpu::ParameterRefAttr::get(context, StringAttr::get(context, symbol)))
+          : Attribute(StringAttr::get(context, symbol)),
+      ArrayAttr::get(context, operands));
 }
 
 PhysicalExprAttr parameterExpression(MLIRContext *context, StringRef name) {
@@ -84,8 +88,8 @@ PhysicalExprAttr dimensionExpression(MLIRContext *context, int64_t dimension) {
 PhysicalExprAttr binaryExpression(MLIRContext *context, PhysicalExprKind kind,
                                   PhysicalExprAttr lhs,
                                   PhysicalExprAttr rhs) {
-  auto leftKind = static_cast<PhysicalExprKind>(lhs.getKind());
-  auto rightKind = static_cast<PhysicalExprKind>(rhs.getKind());
+  auto leftKind = lhs.getKind();
+  auto rightKind = rhs.getKind();
   bool leftConstant = leftKind == PhysicalExprKind::Constant;
   bool rightConstant = rightKind == PhysicalExprKind::Constant;
   if (kind == PhysicalExprKind::Multiply && leftConstant && rightConstant)
@@ -213,11 +217,11 @@ mergeBroadcastExtents(gpu::FragmentType source,
     auto targetExtent = cast<gpu::PhysicalExprAttr>(shape[targetAxis]);
     bool sourceUnit =
         sourceExtent.getKind() ==
-            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+            gpu::PhysicalExprKind::Constant &&
         sourceExtent.getValue() == 1;
     bool targetUnit =
         targetExtent.getKind() ==
-            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+            gpu::PhysicalExprKind::Constant &&
         targetExtent.getValue() == 1;
     if (sourceUnit)
       continue;
@@ -409,7 +413,7 @@ LogicalResult alignElementwiseOperands(OpBuilder &builder, Location location,
           auto extent = dyn_cast<gpu::PhysicalExprAttr>(shape[axis]);
           if (!extent ||
               extent.getKind() !=
-                  static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+                  gpu::PhysicalExprKind::Constant ||
               extent.getValue() != 1)
             return failure();
         }
@@ -765,10 +769,10 @@ FailureOr<PhysicalExprAttr> launchExpression(Value value,
       if (failed(start) || failed(stop) || failed(step))
         return failure();
       if (start->getKind() ==
-              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+              PhysicalExprKind::Constant &&
           start->getValue() == 0 &&
           step->getKind() ==
-              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+              PhysicalExprKind::Constant &&
           step->getValue() == 1)
         return *stop;
       PhysicalExprAttr distance =
@@ -1507,50 +1511,32 @@ private:
                              : gpu::ParameterCategory::RegionReduction;
     }
     auto schema = gpu::ParameterAttr::get(
-        operation->getContext(), builder.getStringAttr(name),
-        static_cast<uint32_t>(gpu::ParameterRole::ScanChunk),
-        static_cast<uint32_t>(category),
+        operation->getContext(), builder.getStringAttr(name), builder.getIndexType(),
+        gpu::ParameterRole::ScanChunk,
+        category,
         sourceType.getIntOrFloatBitWidth(),
         builder.getDenseI64ArrayAttr(
             {16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384,
-             32768, 65536}));
+             32768, 65536}),
+        gpu::ConfigurationBindingPhase::Shared,
+        gpu::ParameterBindingAttr::get(
+            operation->getContext(), builder.getI64IntegerAttr(fact.dimensionIdentity),
+            {}, {}, {}, false, false));
     func::FuncOp physical = physicalKernel;
 
-    gpu::ParameterOp declaration;
-    bool ambiguous = false;
-    physical.walk([&](gpu::ParameterOp parameter) {
-      auto origin = parameter->getAttrOfType<IntegerAttr>(gpu::originAttr);
-      auto dimension =
-          parameter->getAttrOfType<IntegerAttr>(gpu::dimensionAttr);
-      if (!origin || !dimension || origin.getInt() != fact.operationIdentity ||
-          dimension.getInt() != fact.dimensionIdentity ||
-          parameter.getParameter().getRole() !=
-              static_cast<uint32_t>(gpu::ParameterRole::ScanChunk))
-        return;
-      if (declaration)
-        ambiguous = true;
-      else
-        declaration = parameter;
-    });
-    if (ambiguous)
-      return operation->emitOpError(
-          "region segment decision has multiple physical declarations");
-    if (declaration && declaration.getParameter() != schema)
-      return operation->emitOpError(
-          "region segment decision is bound to conflicting candidates");
-    if (!declaration) {
+    auto reference = gpu::declareParameter(physical, schema);
+    if (failed(reference))
+      return failure();
+    if (!parameters.count(schema.getName())) {
       OpBuilder declarationBuilder(&physical.getBody().front(),
                                    physical.getBody().front().begin());
-      declaration = declarationBuilder.create<gpu::ParameterOp>(
-          operation->getLoc(), declarationBuilder.getIndexType(), schema);
-      declaration->setAttr(
+      auto read = gpu::materializeParameter(
+          declarationBuilder, operation->getLoc(), *reference);
+      read->setAttr(
           gpu::originAttr,
           declarationBuilder.getI64IntegerAttr(fact.operationIdentity));
-      declaration->setAttr(
-          gpu::dimensionAttr,
-          declarationBuilder.getI64IntegerAttr(fact.dimensionIdentity));
+      parameters[schema.getName()] = read.getResult();
     }
-    parameters[schema.getName()] = declaration.getResult();
     return schema;
   }
 
@@ -1625,7 +1611,7 @@ private:
 
   FailureOr<Value> physicalExtentValue(Location location,
                                        PhysicalExprAttr expression) {
-    auto kind = static_cast<PhysicalExprKind>(expression.getKind());
+    auto kind = expression.getKind();
     if (kind == PhysicalExprKind::Constant)
       return Value(builder.create<arith::ConstantIndexOp>(location,
                                                            expression.getValue()));
@@ -1638,7 +1624,7 @@ private:
                                        : FailureOr<Value>(found->second);
     }
     if (kind == PhysicalExprKind::Parameter) {
-      auto found = parameters.find(expression.getSymbol());
+      auto found = parameters.find(expression.getSymbolName());
       return found == parameters.end() ? FailureOr<Value>(failure())
                                        : FailureOr<Value>(found->second);
     }
@@ -1647,7 +1633,7 @@ private:
       for (BlockArgument argument : function.getArguments()) {
         auto name = function.getArgAttrOfType<StringAttr>(
             argument.getArgNumber(), gpu::abiNameAttr);
-        if (name == expression.getSymbol())
+        if (name == expression.getSymbolName())
           return Value(argument);
       }
       return failure();
@@ -1783,7 +1769,7 @@ private:
         return failure();
       extent = cast<PhysicalExprAttr>(view.getLayout().getExtents()[axis]);
       if (extent.getKind() ==
-          static_cast<uint32_t>(PhysicalExprKind::Constant))
+          PhysicalExprKind::Constant)
         return physicalExtentValue(location, extent);
       return Value(builder.create<gpu::DimOp>(location, builder.getIndexType(),
                                               resource, axis));
@@ -3016,7 +3002,7 @@ private:
       auto extent = cast<PhysicalExprAttr>(
           view.getLayout().getExtents()[dim.getAxis()]);
       if (extent.getKind() ==
-          static_cast<uint32_t>(PhysicalExprKind::Constant)) {
+          PhysicalExprKind::Constant) {
         values[dim.getResult()] = builder.create<arith::ConstantIndexOp>(
             location, extent.getValue());
         return success();
@@ -3556,7 +3542,7 @@ private:
           PhysicalExprAttr logicalExtent =
               logicalResultExtents[logicalResultAxis];
           if (logicalExtent.getKind() ==
-                  static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                  PhysicalExprKind::Constant &&
               logicalExtent.getValue() == 1) {
             physicalResultExtents[logicalResultAxis] = logicalExtent;
             continue;
@@ -3592,21 +3578,21 @@ private:
         }
         if (unresolved.size() > 1) {
           auto knownKind =
-              static_cast<PhysicalExprKind>(knownProduct.getKind());
+              knownProduct.getKind();
           bool allConstant = knownKind == PhysicalExprKind::Constant;
           int64_t logicalConstantProduct =
               allConstant ? knownProduct.getValue() : 0;
           for (unsigned axis : unresolved) {
             PhysicalExprAttr logicalExtent = logicalResultExtents[axis];
             if (logicalExtent.getKind() !=
-                static_cast<uint32_t>(PhysicalExprKind::Constant)) {
+                PhysicalExprKind::Constant) {
               allConstant = false;
               continue;
             }
             if (allConstant)
               logicalConstantProduct *= logicalExtent.getValue();
           }
-          auto sourceKind = static_cast<PhysicalExprKind>(sourceProduct.getKind());
+          auto sourceKind = sourceProduct.getKind();
           if (allConstant && sourceKind == PhysicalExprKind::Constant &&
               logicalConstantProduct == sourceProduct.getValue()) {
             for (unsigned axis : unresolved)
@@ -3984,12 +3970,12 @@ private:
         }
         case StructuredOpKind::RegionFold:
           return builder.create<gpu::RegionFoldOp>(location, results, *sources, *identities,
-              *captures, axes.front(), segment).getOperation();
+              *captures, axes.front(), segment.getReference()).getOperation();
         case StructuredOpKind::RegionScan:
           return builder.create<gpu::RegionScanOp>(location,
               TypeRange(results).take_front(schema.getEmittedResults().size()),
               TypeRange(results).drop_front(schema.getEmittedResults().size()),
-              *sources, *identities, *initialStates, *captures, axes.front(), segment).getOperation();
+              *sources, *identities, *initialStates, *captures, axes.front(), segment.getReference()).getOperation();
         }
         return operation->emitOpError("unknown structured operation kind"), failure();
       }();
@@ -5415,6 +5401,7 @@ LogicalResult constructGPUProgram(ModuleOp module,
       capabilities.nativeFragmentGather);
   SmallVector<NamedAttribute> functionAttrs{
       builder.getNamedAttr(gpu::kernelAttr, builder.getUnitAttr()),
+      builder.getNamedAttr(gpu::parametersAttr, builder.getArrayAttr({})),
       builder.getNamedAttr(gpu::capabilitiesAttr, capabilityAttr),
       builder.getNamedAttr(gpu::programSpaceAttr,
                            builder.getArrayAttr({totalLength})),

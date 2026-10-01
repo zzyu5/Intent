@@ -60,6 +60,7 @@ int main(int argc, char **argv) {
   llvm::cl::opt<int64_t> cpuVectorBits("cpu-vector-bits", llvm::cl::init(0));
   llvm::cl::opt<int64_t> cpuWorkers("cpu-workers", llvm::cl::init(0));
   llvm::cl::opt<bool> cpuMatrixI8I32("cpu-matrix-i8-i32", llvm::cl::init(false));
+  llvm::cl::opt<int64_t> cpuPrivateBytes("cpu-private-bytes", llvm::cl::init(256 * 1024));
   llvm::cl::opt<std::string> dsaArchitecture("dsa-architecture", llvm::cl::init("mtp_372"));
   llvm::cl::opt<int64_t> dsaTile("dsa-tile", llvm::cl::init(1024));
   llvm::cl::opt<int64_t> dsaTileM("dsa-tile-m", llvm::cl::init(16));
@@ -115,7 +116,7 @@ int main(int argc, char **argv) {
   request.gpu = {computeUnits, sharedMemoryPerUnit, maxDynamicSharedMemoryPerBlock,
       registersPerUnit, maxThreadsPerBlock, computeCapabilityMajor, computeCapabilityMinor,
       singleToDoublePrecisionPerfRatio, matrixUnits, dynamicVectorWidth, false, false};
-  request.cpu = {cpuVectorBits, cpuWorkers, cpuMatrixI8I32};
+  request.cpu = {cpuVectorBits, cpuWorkers, cpuMatrixI8I32, cpuPrivateBytes};
   request.dsa = {dsaArchitecture, dsaTile, dsaTileM, dsaTileN, dsaTileK,
       dsaRegionTile, dsaTasks, dsaLocalBytes, dsaShapes, dsaStrides};
   request.tuningConfig = tuningConfigFilename;

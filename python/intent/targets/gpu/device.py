@@ -1,39 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from ..specification import GPUCapabilities
 
 
-@dataclass(frozen=True, slots=True)
-class GpuDeviceCapabilities:
-    device: int
-    compute_units: int
-    shared_memory_per_unit: int
-    max_dynamic_shared_memory_per_block: int
-    registers_per_unit: int
-    max_threads_per_block: int
-    compute_capability_major: int
-    compute_capability_minor: int
-    single_to_double_precision_perf_ratio: int
-    matrix_units: bool
-    dynamic_vector_width: bool
-
-    @property
-    def compiler_options(self) -> tuple[str, ...]:
-        return (
-            f"--compute-units={self.compute_units}",
-            f"--shared-memory-per-unit={self.shared_memory_per_unit}",
-            f"--max-dynamic-shared-memory-per-block={self.max_dynamic_shared_memory_per_block}",
-            f"--registers-per-unit={self.registers_per_unit}",
-            f"--max-threads-per-block={self.max_threads_per_block}",
-            f"--compute-capability-major={self.compute_capability_major}",
-            f"--compute-capability-minor={self.compute_capability_minor}",
-            f"--single-to-double-precision-perf-ratio={self.single_to_double_precision_perf_ratio}",
-            f"--matrix-units={'true' if self.matrix_units else 'false'}",
-            f"--dynamic-vector-width={'true' if self.dynamic_vector_width else 'false'}",
-        )
-
-
-def resolve_gpu_device(device: int) -> GpuDeviceCapabilities:
+def resolve_gpu_device(device: int) -> GPUCapabilities:
     from cuda.bindings import driver
     import torch
 
@@ -63,8 +33,7 @@ def resolve_gpu_device(device: int) -> GpuDeviceCapabilities:
     minor = attribute(
         driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR
     )
-    return GpuDeviceCapabilities(
-        device=device,
+    return GPUCapabilities(
         compute_units=attribute(
             driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT
         ),

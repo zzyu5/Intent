@@ -106,10 +106,9 @@ LogicalResult verifyLoadLatency(Operation *operation, Value latency) {
   if (!latency)
     return success();
   auto parameter = latency.getDefiningOp<gpu::ParameterOp>();
-  if (!parameter || parameter.getParameter().getRole() !=
-                        static_cast<uint32_t>(
-                            gpu::ParameterRole::ProviderLoadPolicy) ||
-      !llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
+  if (!parameter || parameter.getDeclaration().getRole() !=
+                        gpu::ParameterRole::ProviderLoadPolicy ||
+      !llvm::all_of(parameter.getDeclaration().getCandidates().asArrayRef(),
                     isLegalLoadPolicy))
     return operation->emitOpError(
         "load policy requires an inferred or explicit latency domain");
@@ -125,7 +124,7 @@ LogicalResult verifyFullTileCondition(TileLoadOp load) {
   for (auto [axis, attribute] : llvm::enumerate(shape)) {
     auto width = cast<gpu::PhysicalExprAttr>(attribute);
     auto size = cast<gpu::PhysicalExprAttr>(view.getLayout().getExtents()[axis]);
-    auto constant = static_cast<uint32_t>(gpu::PhysicalExprKind::Constant);
+    auto constant = gpu::PhysicalExprKind::Constant;
     covered[axis] = width.getKind() == constant && width.getValue() > 0 &&
                     (width.getValue() == 1 ||
                      (size.getKind() == constant &&
@@ -196,7 +195,7 @@ Attribute getCompileTimeScalar(Value value) {
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   std::function<bool(gpu::PhysicalExprAttr)> isCompileTime =
       [&](gpu::PhysicalExprAttr current) {
-    auto kind = static_cast<gpu::PhysicalExprKind>(current.getKind());
+    auto kind = current.getKind();
     if (kind == gpu::PhysicalExprKind::ScalarABI) {
       if (!kernel)
         return false;
@@ -204,7 +203,7 @@ Attribute getCompileTimeScalar(Value value) {
         auto attributes = kernel.getArgAttrDict(argument.getArgNumber());
         auto name = attributes.getAs<StringAttr>(gpu::abiNameAttr);
         auto abi = attributes.getAs<StringAttr>(gpu::abiKindAttr);
-        if (name && abi && name == current.getSymbol())
+        if (name && abi && name == current.getSymbolName())
           return abi.getValue() == "constexpr" || abi.getValue() == "stride";
       }
       return false;
@@ -238,7 +237,7 @@ LogicalResult ArrayViewOp::verify() {
           dyn_cast<gpu::PhysicalExprAttr>(view.getLayout().getExtents()[axis]);
       if (!extent ||
           extent.getKind() !=
-              static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+              gpu::PhysicalExprKind::Constant ||
           extent.getValue() <= 1)
         return emitOpError(
             "collapsed inner axes require positive non-unit static extents");
@@ -319,7 +318,7 @@ LogicalResult TileLoadOp::verify() {
         return emitOpError(
             "collapsed inner tile axes must cover the full source axis from zero");
       extent = gpu::PhysicalExprAttr::get(
-          getContext(), static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
+          getContext(), gpu::PhysicalExprKind::Multiply, 0,
           StringAttr::get(getContext()),
           ArrayAttr::get(getContext(), {extent, source.getShape()[axis]}));
     }
@@ -506,7 +505,7 @@ LogicalResult ExtractOp::verify() {
     if (!extent)
       return emitOpError("extraction shape must contain physical expressions");
     if (!retained.test(axis) && (extent.getKind() !=
-                   static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+                   gpu::PhysicalExprKind::Constant ||
                extent.getValue() != 1)) {
       return emitOpError("selected axes require unit extraction extents");
     }
@@ -540,7 +539,7 @@ LogicalResult MMAOp::verify() {
     if (!lhs.getShape().empty()) {
       auto reduction = cast<gpu::PhysicalExprAttr>(lhs.getShape().getValue().back());
       if (reduction.getKind() ==
-              static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+              gpu::PhysicalExprKind::Constant &&
           (reduction.getValue() < chunk || reduction.getValue() % chunk != 0))
         return emitOpError("MMA reduction extent must contain complete chunks");
     }
@@ -608,7 +607,7 @@ LogicalResult ScaledMMAOp::verify() {
   auto inner = dyn_cast<gpu::PhysicalExprAttr>(lhs.getShape()[2]);
   if (!inner ||
       inner.getKind() !=
-          static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+          gpu::PhysicalExprKind::Constant ||
       inner.getValue() != static_cast<int64_t>(getLhsGroupSize()) ||
       getLhsGroupSize() != getRhsGroupSize() ||
       getLhsFormat() != ScaledFormat::E4M3 ||

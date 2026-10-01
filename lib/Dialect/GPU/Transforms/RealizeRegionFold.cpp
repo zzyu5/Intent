@@ -2,6 +2,8 @@
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Analysis/RegionSemantics.h"
@@ -28,11 +30,11 @@ using namespace mlir;
 namespace intent::gpu {
 namespace {
 
-PhysicalExprAttr parameterExtent(ParameterAttr parameter) {
+PhysicalExprAttr parameterExtent(ParameterRefAttr parameter) {
   return PhysicalExprAttr::get(
       parameter.getContext(),
-      static_cast<uint32_t>(PhysicalExprKind::Parameter), 0,
-      parameter.getName(), ArrayAttr::get(parameter.getContext(), {}));
+      PhysicalExprKind::Parameter, 0,
+      parameter, ArrayAttr::get(parameter.getContext(), {}));
 }
 
 FragmentType replaceSliceAxis(FragmentType source, unsigned axis,
@@ -64,7 +66,7 @@ bool isUnitExtent(Attribute attribute) {
   auto expression = dyn_cast<PhysicalExprAttr>(attribute);
   return expression &&
          expression.getKind() ==
-             static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+             PhysicalExprKind::Constant &&
          expression.getValue() == 1;
 }
 
@@ -448,7 +450,7 @@ void bindClonedOperationTypes(Operation *root,
       OpBuilder builder(range);
       Value physicalExtent;
       if (extent.getKind() ==
-          static_cast<uint32_t>(PhysicalExprKind::Constant))
+          PhysicalExprKind::Constant)
         physicalExtent = builder.create<arith::ConstantIndexOp>(
             range.getLoc(), extent.getValue());
       else
@@ -624,15 +626,6 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
   return results;
 }
 
-ParameterOp findParameter(func::FuncOp kernel, ParameterAttr schema) {
-  ParameterOp result;
-  kernel.walk([&](ParameterOp parameter) {
-    if (!result && parameter.getParameter().getName() == schema.getName())
-      result = parameter;
-  });
-  return result;
-}
-
 std::optional<bool> booleanConstant(
     Value value, Value falsePredicate,
     llvm::SmallPtrSetImpl<Operation *> &visiting);
@@ -748,7 +741,7 @@ bool equalWhenPredicateIsFalse(Value summary, Value identity,
 // Only synthetic padding receives source fill facts. Logical traversal pruning
 // separately calls equalWhenPredicateIsFalse without these assumptions.
 Value physicalTailMembershipPredicate(RegionFoldOp fold, ValueRange identities,
-                                 ParameterAttr segment, ArrayRef<SourcePlan> plans) {
+                                 ParameterRefAttr segment, ArrayRef<SourcePlan> plans) {
   auto yield = dyn_cast<YieldOp>(fold.getSummarize().front().getTerminator());
   if (!yield || yield.getValues().size() != identities.size())
     return {};
@@ -764,9 +757,8 @@ Value physicalTailMembershipPredicate(RegionFoldOp fold, ValueRange identities,
           fragment.getShape(), [&](Attribute extent) {
             auto expression = dyn_cast<PhysicalExprAttr>(extent);
             return expression &&
-                   expression.getKind() == static_cast<uint32_t>(
-                                               PhysicalExprKind::Parameter) &&
-                   expression.getSymbol() == segment.getName();
+                   expression.getKind() == PhysicalExprKind::Parameter &&
+                   expression.getParameterReference() == segment;
           });
       if (!fragment || !fragment.getElementType().isInteger(1) ||
           !carriesSegment)
@@ -1977,8 +1969,7 @@ void forwardUnusedRecordFields(RegionFoldOp fold) {
 LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   foldKnownRecordProjections(fold);
   forwardUnusedRecordFields(fold);
-  ParameterOp segment = findParameter(kernel, fold.getSegment());
-  if (!segment)
+  if (!lookupParameter(kernel, fold.getSegment()))
     return fold.emitOpError("region-fold segment parameter is not declared");
   PhysicalProgramAnalysis physicalAnalysis(kernel);
   SmallVector<SourcePlan> plans;
@@ -2040,6 +2031,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
 
   MakeRangeOp master = traversal.authority;
   OpBuilder builder(fold);
+  auto segment = materializeParameter(builder, fold.getLoc(), fold.getSegment());
   Location location = fold.getLoc();
   Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
   Value logicalEnd = master.getLogicalStop();
@@ -2064,7 +2056,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   if (!memberPredicate) {
     scalarTailStep = builder.create<arith::ConstantIndexOp>(location, 1);
     scalarTailExtent = PhysicalExprAttr::get(
-        fold.getContext(), static_cast<uint32_t>(PhysicalExprKind::Constant), 1,
+        fold.getContext(), PhysicalExprKind::Constant, 1,
         builder.getStringAttr(""), builder.getArrayAttr({}));
   }
   std::optional<SummaryEmptinessPlan> emptiness;
@@ -2270,7 +2262,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     return finish();
   };
 
-  if (segment->hasAttr(coverageDimensionAttr) && memberPredicate) {
+  if (segment.getDeclaration().isDeferred() && memberPredicate) {
     FailureOr<SmallVector<Value>> summary =
         emitSummary(builder, location, zero, /*fullSegment=*/false,
                     /*predicateIsTrue=*/false,
@@ -2554,8 +2546,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
 
 LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
   foldKnownRecordProjections(scan);
-  ParameterOp segment = findParameter(kernel, scan.getSegment());
-  if (!segment)
+  if (!lookupParameter(kernel, scan.getSegment()))
     return scan.emitOpError("region-scan segment parameter is not declared");
   PhysicalProgramAnalysis physicalAnalysis(kernel);
   SmallVector<SourcePlan> plans;
@@ -2623,6 +2614,7 @@ LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
   ValueRange initialStates = scan.getInitialStates();
   ValueRange captures = scan.getCaptures();
   OpBuilder builder(scan);
+  auto segment = materializeParameter(builder, scan.getLoc(), scan.getSegment());
   Location location = scan.getLoc();
   Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
   Value logicalEnd = master.getLogicalStop();

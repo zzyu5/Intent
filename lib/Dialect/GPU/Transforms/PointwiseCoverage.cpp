@@ -32,7 +32,7 @@ struct ProductConstraint {
 
 bool collectProductConstraint(PhysicalExprAttr extent,
                               ProductConstraint &constraint) {
-  auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+  auto kind = extent.getKind();
   if (kind == PhysicalExprKind::Constant) {
     if (extent.getValue() <= 0)
       return false;
@@ -44,9 +44,9 @@ bool collectProductConstraint(PhysicalExprAttr extent,
   }
   if (kind == PhysicalExprKind::Parameter) {
     ++constraint.parameterCount;
-    if (constraint.parameter && constraint.parameter != extent.getSymbol())
+    if (constraint.parameter && constraint.parameter != extent.getSymbolName())
       return false;
-    constraint.parameter = extent.getSymbol();
+    constraint.parameter = extent.getSymbolName();
     return true;
   }
   if (kind != PhysicalExprKind::Multiply || extent.getOperands().size() != 2)
@@ -67,23 +67,23 @@ bool collectProductConstraint(FragmentType fragment, ArrayRef<int64_t> axes,
 }
 
 LogicalResult bindStructurallyRequiredStaticFragments(func::FuncOp kernel) {
-  llvm::MapVector<ParameterOp, int64_t> required;
+  llvm::MapVector<ParameterAttr, int64_t> required;
   auto requireExtent = [&](Operation *operation, StringAttr symbol,
                            int64_t candidate) -> LogicalResult {
-    FailureOr<ParameterOp> declaration = queryParameterBySymbol(kernel, symbol);
+    FailureOr<ParameterAttr> declaration = queryParameterBySymbol(kernel, symbol);
     if (failed(declaration))
       return success();
-    ParameterOp parameter = *declaration;
+    ParameterAttr parameter = *declaration;
     PhysicalParameterBinding binding = queryParameterBinding(parameter);
     if (!binding.isExact() || !binding.source)
       return success();
     if (!llvm::is_contained(
-            parameter.getParameter().getCandidates().asArrayRef(), candidate))
+            parameter.getCandidates().asArrayRef(), candidate))
       return operation->emitOpError(
           "reshape requires a static fragment extent outside its legal domain");
     auto found = required.find(parameter);
     if (found != required.end() && found->second != candidate)
-      return parameter.emitOpError(
+      return operation->emitOpError(
           "one static fragment has incompatible structural extent requirements");
     required[parameter] = candidate;
     return success();
@@ -171,10 +171,10 @@ LogicalResult bindStructurallyRequiredStaticFragments(func::FuncOp kernel) {
         auto constrain = [&](PhysicalExprAttr expression,
                              bool mayBroadcast = false) -> LogicalResult {
           if (expression.getKind() ==
-              static_cast<uint32_t>(PhysicalExprKind::Parameter))
-            return requireExtent(user, expression.getSymbol(), extent);
+              PhysicalExprKind::Parameter)
+            return requireExtent(user, expression.getSymbolName(), extent);
           if (expression.getKind() ==
-                  static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                  PhysicalExprKind::Constant &&
               expression.getValue() != extent &&
               !(mayBroadcast && expression.getValue() == 1))
             return user->emitOpError(
@@ -201,7 +201,7 @@ LogicalResult bindStructurallyRequiredStaticFragments(func::FuncOp kernel) {
   }
 
   for (auto [parameter, candidate] : required) {
-    StringAttr parameterName = parameter.getParameter().getName();
+    StringAttr parameterName = parameter.getName();
     PhysicalExprAttr fixedExtent =
         expression(kernel.getContext(), PhysicalExprKind::Constant, candidate);
     // A parameter binding applies to every typed occurrence of its symbol,
@@ -210,8 +210,8 @@ LogicalResult bindStructurallyRequiredStaticFragments(func::FuncOp kernel) {
     replacer.addReplacement(
         [&](PhysicalExprAttr current) -> std::optional<Attribute> {
           if (current.getKind() ==
-                  static_cast<uint32_t>(PhysicalExprKind::Parameter) &&
-              current.getSymbol() == parameterName)
+                  PhysicalExprKind::Parameter &&
+              current.getSymbolName() == parameterName)
             return fixedExtent;
           return std::nullopt;
         });
@@ -219,12 +219,18 @@ LogicalResult bindStructurallyRequiredStaticFragments(func::FuncOp kernel) {
                                           /*replaceAttrs=*/true,
                                           /*replaceLocs=*/false,
                                           /*replaceTypes=*/true);
-    OpBuilder builder(parameter);
-    Value fixed =
-        builder.create<arith::ConstantIndexOp>(parameter.getLoc(), candidate);
-    parameter.getResult().replaceAllUsesWith(fixed);
-    parameter.erase();
+    SmallVector<ParameterOp> reads;
+    kernel.walk([&](ParameterOp read) {
+      if (read.getReference() == parameter.getReference()) reads.push_back(read);
+    });
+    for (ParameterOp read : reads) {
+      OpBuilder builder(read);
+      Value fixed = builder.create<arith::ConstantIndexOp>(read.getLoc(), candidate);
+      read.getResult().replaceAllUsesWith(fixed);
+      read.erase();
+    }
   }
+  eraseUnusedParameters(kernel);
   return success();
 }
 
@@ -278,7 +284,7 @@ LogicalResult requireScanFullCoverage(func::FuncOp kernel, ScanOp scan,
         exactSubregionStaticBound(sourceRanges,
                                   sourceAxisIdentity(sourceMapping));
     if (chunkExtent.getKind() !=
-            static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+            PhysicalExprKind::Constant ||
         failed(bound) || chunkExtent.getValue() < *bound)
       return scan.emitOpError(
           "dynamic subregion scan has no static source bound");
@@ -316,32 +322,26 @@ LogicalResult requireScanFullCoverage(func::FuncOp kernel, ScanOp scan,
     return success();
   }
   std::string parameterName = ("FULL_D" + Twine(dimension)).str();
-  ParameterOp parameter;
-  kernel.walk([&](ParameterOp candidate) {
-    if (!parameter &&
-        candidate.getParameter().getName().getValue() == parameterName)
-      parameter = candidate;
-  });
+  ParameterAttr parameter = lookupParameter(kernel, StringAttr::get(kernel.getContext(), parameterName));
+  OpBuilder builder(&kernel.getBody().front(), kernel.getBody().front().begin());
   if (!parameter) {
     static constexpr int64_t candidates[] = {
         64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
-    OpBuilder builder(&kernel.getBody().front(),
-                      kernel.getBody().front().begin());
     auto schema = ParameterAttr::get(
-        kernel.getContext(), builder.getStringAttr(parameterName),
-        static_cast<uint32_t>(ParameterRole::ScanChunk),
-        static_cast<uint32_t>(ParameterCategory::Coverage),
+        kernel.getContext(), builder.getStringAttr(parameterName), builder.getIndexType(),
+        ParameterRole::ScanChunk,
+        ParameterCategory::Coverage,
         /*elementBitWidth=*/0,
-        DenseI64ArrayAttr::get(kernel.getContext(), candidates));
-    parameter = builder.create<ParameterOp>(source.getLoc(),
-                                            builder.getIndexType(), schema);
+        DenseI64ArrayAttr::get(kernel.getContext(), candidates),
+        ConfigurationBindingPhase::Deferred,
+        ParameterBindingAttr::get(kernel.getContext(), builder.getI64IntegerAttr(dimension),
+                                 {}, {}, {}, false, false));
+    if (failed(declareParameter(kernel, schema))) return failure();
+    parameter = schema;
   }
-  parameter->setAttr(
-      dimensionAttr,
-      IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), dimension));
-  parameter->setAttr(
-      coverageDimensionAttr,
-      IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), dimension));
+  parameter = parameter.withPhase(ConfigurationBindingPhase::Deferred).withBinding(
+      parameter.getBinding().withDimension(builder.getI64IntegerAttr(dimension)));
+  if (failed(updateParameter(kernel, parameter))) return failure();
   PhysicalExprAttr covered = fragmentExtent(parameter);
   for (MakeRangeOp range : sourceRanges.roots) {
     FailureOr<uint64_t> rangeIdentity = rangeDimension(range);
@@ -354,7 +354,8 @@ LogicalResult requireScanFullCoverage(func::FuncOp kernel, ScanOp scan,
   }
   retargetDimensionExtent(source, dimension, covered);
   if (failed(
-          bindFullCoverageDimension(kernel, dimension, parameter.getResult())))
+          bindFullCoverageDimension(kernel, dimension,
+              materializeParameter(builder, source.getLoc(), parameter.getReference()))))
     return kernel.emitError(
         "scan source could not bind its exact full-coverage parameter");
   return success();
@@ -379,7 +380,7 @@ LogicalResult requireStructuredReductionFullCoverage(func::FuncOp kernel,
     FailureOr<int64_t> bound = exactSubregionStaticBound(ranges, sourceAxis);
     auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
     if (failed(bound) || extent.getKind() !=
-            static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+            PhysicalExprKind::Constant ||
         extent.getValue() < *bound)
       return realizeFullCoverageDimension(kernel, source, axis);
     for (MakeRangeOp range : ranges.roots)
@@ -798,7 +799,7 @@ LogicalResult PointwiseRewrite::finalizeValues() {
       auto begin = range ? queryLaunchExpression(range.getLogicalStart())
                          : PhysicalExprAttr();
       if (!range || !isUnitStepRange(range) ||
-          !begin || begin.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+          !begin || begin.getKind() != PhysicalExprKind::Constant ||
           begin.getValue() != 0 ||
           samePhysicalScalarExpression(range.getStart(), range.getLogicalStart()) ||
           range.getResult().getType().getShape()[0] != source.getShape()[axis])
@@ -838,10 +839,10 @@ LogicalResult PointwiseRewrite::materializeFixedRanges() {
       unresolved.push_back(range);
       continue;
     }
-    FailureOr<ParameterOp> parameter = queryBlockingParameter(kernel, range);
+    FailureOr<ParameterAttr> parameter = queryBlockingParameter(kernel, range);
     if (failed(parameter) ||
-        parameter->getParameter().getRole() !=
-            static_cast<uint32_t>(ParameterRole::ScanChunk)) {
+        parameter->getRole() !=
+            ParameterRole::ScanChunk) {
       unresolved.push_back(range);
       continue;
     }
@@ -858,7 +859,7 @@ LogicalResult PointwiseRewrite::materializeFixedRanges() {
     const bool fixedSubregion =
         range->hasAttr(sourceSubregionAttr) &&
         physicalExtent.getKind() ==
-            static_cast<uint32_t>(PhysicalExprKind::Constant);
+            PhysicalExprKind::Constant;
     if (!fixedSubregion && boundedWritebackRanges.contains(range.getOperation()) &&
         reuseTraversalRanges.contains(range.getOperation())) {
       unresolved.push_back(range);
@@ -871,7 +872,7 @@ LogicalResult PointwiseRewrite::materializeFixedRanges() {
           PhysicalProgramAnalysis(kernel).axisRanges(range.getResult(), 0));
       if (failed(staticExtent) ||
           physicalExtent.getKind() !=
-              static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+              PhysicalExprKind::Constant ||
           !samePhysicalScalarExpression(range.getStart(),
                                         range.getLogicalStart())) {
         unresolved.push_back(range);
@@ -909,7 +910,7 @@ LogicalResult PointwiseRewrite::materializeFixedRanges() {
       continue;
     }
     if (physicalExtent.getKind() !=
-        static_cast<uint32_t>(PhysicalExprKind::Constant)) {
+        PhysicalExprKind::Constant) {
       unresolved.push_back(range);
       continue;
     }

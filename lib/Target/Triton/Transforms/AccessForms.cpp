@@ -2,6 +2,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
@@ -275,7 +276,7 @@ void orientPointerLoads(func::FuncOp kernel) {
         if (!source)
           continue;
         auto extent = cast<gpu::PhysicalExprAttr>(type.getShape()[*source]);
-        if (extent.getKind() == static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+        if (extent.getKind() == gpu::PhysicalExprKind::Constant &&
             extent.getValue() == 1)
           continue;
         auto ranges = analysis.axisRanges(coordinate, *source);
@@ -451,12 +452,12 @@ bool descriptorAccessEligible(func::FuncOp kernel, Value viewValue,
       cast<gpu::PhysicalExprAttr>(fragment.getShape()[contiguousAxis]);
   StringAttr alignedBlockParameter;
   if (extent.getKind() ==
-      static_cast<uint32_t>(gpu::PhysicalExprKind::Parameter))
-    alignedBlockParameter = extent.getSymbol();
+      gpu::PhysicalExprKind::Parameter)
+    alignedBlockParameter = extent.getParameterReference().getName();
   gpu::IndexRelations relations;
   return relations.multipleOf(offsets.back(), 16 / *elementBytes,
-      [&](gpu::ParameterOp parameter) {
-        return parameter.getParameter().getName() == alignedBlockParameter;
+      [&](gpu::ParameterAttr parameter) {
+        return parameter.getName() == alignedBlockParameter;
       });
 }
 
@@ -624,7 +625,7 @@ materializeTensorDescriptorForms(
       } else {
         shape.push_back(gpu::PhysicalExprAttr::get(
             kernel.getContext(),
-            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), 1,
+            gpu::PhysicalExprKind::Constant, 1,
             entry.getStringAttr(""), entry.getArrayAttr({})));
         mappings.push_back(gpu::AxisMapAttr::get(
             kernel.getContext(), nextSource++, 0, nextDimension++, axis, true));
@@ -695,10 +696,18 @@ materializeTensorDescriptorForms(
   SmallVector<Value> descriptorValues;
   for (DescriptorPlan &plan : descriptors)
     descriptorValues.push_back(plan.descriptor.getResult());
+  auto declaration = gpu::ParameterAttr::get(
+      kernel.getContext(), entry.getStringAttr(tensorDescriptorChoice),
+      entry.getI1Type(), gpu::ParameterRole::ProviderAccessForm,
+      gpu::ParameterCategory::Provider, 0,
+      entry.getDenseI64ArrayAttr({0, 1}), gpu::ConfigurationBindingPhase::Provider,
+      gpu::ParameterBindingAttr::get(kernel.getContext(), {}, {}, {}, {}, false, false));
+  auto reference = gpu::declareParameter(kernel, declaration);
+  if (failed(reference)) return failure();
   auto choice = entry.create<TensorDescriptorChoiceOp>(
       kernel.getLoc(), entry.getI1Type(), descriptorValues,
       entry.getStringAttr("host"), entry.getStringAttr("all_eligible"),
-      entry.getStringAttr(tensorDescriptorChoice),
+      *reference,
       entry.getStringAttr(tensorDescriptorEligibility));
   auto prepareBranch = [](Region &region) {
     Block &block = region.front();

@@ -20,7 +20,7 @@ bool isLegalOccupancy(int64_t value);
 bool isLegalWorkerWarps(int64_t value);
 bool isLegalCTAs(int64_t value);
 bool isCuTileProviderRole(gpu::ParameterRole role);
-mlir::FailureOr<gpu::ParameterOp> declareProviderParameter(
+mlir::FailureOr<gpu::ParameterRefAttr> declareProviderParameter(
     mlir::func::FuncOp kernel, const gpu::TuningProfiles &profiles,
     llvm::StringRef family, llvm::StringRef name, gpu::ParameterRole role,
     bool (*isLegal)(int64_t));

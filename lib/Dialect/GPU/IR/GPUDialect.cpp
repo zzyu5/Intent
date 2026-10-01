@@ -4,10 +4,13 @@
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -27,8 +30,147 @@ using namespace intent::gpu;
 
 namespace intent::gpu {
 
+StringAttr PhysicalExprAttr::getSymbolName() const {
+  if (auto reference = mlir::dyn_cast<ParameterRefAttr>(getSymbol()))
+    return reference.getName();
+  return mlir::dyn_cast<StringAttr>(getSymbol());
+}
+
+ParameterRefAttr PhysicalExprAttr::getParameterReference() const {
+  return mlir::dyn_cast<ParameterRefAttr>(getSymbol());
+}
+
+ParameterRefAttr ParameterAttr::getReference() const {
+  return ParameterRefAttr::get(getContext(), getName());
+}
+bool ParameterAttr::isExtent() const { return getValueType().isIndex(); }
+bool ParameterAttr::isDeferred() const {
+  return getPhase() == ConfigurationBindingPhase::Deferred;
+}
+ParameterAttr ParameterAttr::withName(StringAttr value) const {
+  return get(getContext(), value, getValueType(), getRole(), getCategory(),
+             getElementBitWidth(), getCandidates(), getPhase(), getBinding());
+}
+ParameterAttr ParameterAttr::withCandidates(DenseI64ArrayAttr value) const {
+  return get(getContext(), getName(), getValueType(), getRole(), getCategory(),
+             getElementBitWidth(), value, getPhase(), getBinding());
+}
+ParameterAttr ParameterAttr::withPhase(ConfigurationBindingPhase value) const {
+  return get(getContext(), getName(), getValueType(), getRole(), getCategory(),
+             getElementBitWidth(), getCandidates(), value, getBinding());
+}
+ParameterAttr ParameterAttr::withBinding(ParameterBindingAttr value) const {
+  return get(getContext(), getName(), getValueType(), getRole(), getCategory(),
+             getElementBitWidth(), getCandidates(), getPhase(), value);
+}
+
+ParameterBindingAttr ParameterBindingAttr::withDimension(IntegerAttr value) const {
+  return get(getContext(), value, getSource(), getCoverageBound(), getGroup(),
+             getPointwiseChunk(), getPointwiseLocal());
+}
+ParameterBindingAttr ParameterBindingAttr::withSource(PhysicalSourceAttr value) const {
+  return get(getContext(), getDimension(), value, getCoverageBound(), getGroup(),
+             getPointwiseChunk(), getPointwiseLocal());
+}
+ParameterBindingAttr ParameterBindingAttr::withCoverageBound(PhysicalExprAttr value) const {
+  return get(getContext(), getDimension(), getSource(), value, getGroup(),
+             getPointwiseChunk(), getPointwiseLocal());
+}
+ParameterBindingAttr ParameterBindingAttr::withGroup(ArrayAttr value) const {
+  return get(getContext(), getDimension(), getSource(), getCoverageBound(), value,
+             getPointwiseChunk(), getPointwiseLocal());
+}
+ParameterBindingAttr ParameterBindingAttr::withPointwiseChunk(bool value) const {
+  return get(getContext(), getDimension(), getSource(), getCoverageBound(), getGroup(),
+             value, getPointwiseLocal());
+}
+ParameterBindingAttr ParameterBindingAttr::withPointwiseLocal(bool value) const {
+  return get(getContext(), getDimension(), getSource(), getCoverageBound(), getGroup(),
+             getPointwiseChunk(), value);
+}
+
+ParameterAttr lookupParameterDeclaration(Operation *anchor,
+                                         ParameterRefAttr reference) {
+  if (!anchor || !reference) return {};
+  auto kernel = mlir::dyn_cast<func::FuncOp>(anchor);
+  if (!kernel) kernel = anchor->getParentOfType<func::FuncOp>();
+  if (!kernel || !kernel->getAttrOfType<UnitAttr>(kernelAttr)) return {};
+  auto declarations = kernel->getAttrOfType<ArrayAttr>(parametersAttr);
+  if (!declarations) return {};
+  ParameterAttr found;
+  for (Attribute attribute : declarations) {
+    auto declaration = mlir::dyn_cast<ParameterAttr>(attribute);
+    if (!declaration || declaration.getName() != reference.getName()) continue;
+    if (found) return {};
+    found = declaration;
+  }
+  return found;
+}
+
+LogicalResult verifyParameterDeclarations(Operation *kernel) {
+  if (!mlir::isa<func::FuncOp>(kernel) || !kernel->getAttrOfType<UnitAttr>(kernelAttr))
+    return kernel->emitOpError("physical GPU kernel ownership requires func.func with a unit kernel marker");
+  auto declarations = kernel->getAttrOfType<ArrayAttr>(parametersAttr);
+  if (!declarations)
+    return kernel->emitOpError("requires a kernel-owned parameter declaration table");
+  llvm::DenseMap<StringAttr, ParameterAttr> names;
+  for (Attribute attribute : declarations) {
+    auto declaration = mlir::dyn_cast<ParameterAttr>(attribute);
+    if (!declaration || !names.try_emplace(declaration.getName(), declaration).second)
+      return kernel->emitOpError("parameter declarations must be typed and have unique names");
+    auto diagnostic = [&] {
+      auto result = kernel->emitOpError("invalid parameter declaration ");
+      result << declaration.getName() << ": ";
+      return result;
+    };
+    auto binding = declaration.getBinding();
+    if (!binding || failed(ParameterBindingAttr::verify(
+            diagnostic, binding.getDimension(), binding.getSource(), binding.getCoverageBound(),
+            binding.getGroup(), binding.getPointwiseChunk(), binding.getPointwiseLocal())) ||
+        failed(ParameterAttr::verify(diagnostic, declaration.getName(), declaration.getValueType(),
+            declaration.getRole(), declaration.getCategory(), declaration.getElementBitWidth(),
+            declaration.getCandidates(), declaration.getPhase(), binding)))
+      return failure();
+  }
+  bool valid = true;
+  AttrTypeWalker walker;
+  walker.addWalk([&](ParameterRefAttr reference) {
+    if (valid && !names.contains(reference.getName())) {
+      kernel->emitOpError("references an undeclared compile-time parameter ") << reference;
+      valid = false;
+    }
+  });
+  walker.addWalk([&](PhysicalExprAttr expression) {
+    if (!valid || expression.getKind() != PhysicalExprKind::Parameter) return;
+    auto reference = expression.getParameterReference();
+    auto found = reference ? names.find(reference.getName()) : names.end();
+    if (found == names.end() || !found->second.isExtent()) {
+      kernel->emitOpError("physical extent expression requires a declared positive index parameter");
+      valid = false;
+    }
+  });
+  kernel->walk([&](Operation *operation) {
+    walker.walk(operation->getAttrDictionary());
+    for (Type type : operation->getResultTypes()) walker.walk(type);
+    for (Region &region : operation->getRegions())
+      for (Block &block : region)
+        for (BlockArgument argument : block.getArguments()) walker.walk(argument.getType());
+  });
+  return success(valid);
+}
+
+LogicalResult IntentGPUDialect::verifyOperationAttribute(Operation *operation,
+                                                        NamedAttribute attribute) {
+  if (attribute.getName() == kernelAttr)
+    return verifyParameterDeclarations(operation);
+  if (attribute.getName() == parametersAttr &&
+      (!mlir::isa<func::FuncOp>(operation) || !operation->getAttrOfType<UnitAttr>(kernelAttr)))
+    return operation->emitOpError("parameter declarations require a physical GPU kernel owner");
+  return success();
+}
+
 bool isCompileTimePhysicalExpr(PhysicalExprAttr expression) {
-  auto kind = static_cast<PhysicalExprKind>(expression.getKind());
+  auto kind = expression.getKind();
   if (kind == PhysicalExprKind::Constant || kind == PhysicalExprKind::Parameter)
     return true;
   if (kind == PhysicalExprKind::Dimension ||
@@ -176,7 +318,7 @@ BroadcastProjection queryAxisProjection(FragmentType source,
     auto sourceExtent = cast<PhysicalExprAttr>(source.getShape()[sourceIndex]);
     bool singleton =
         sourceExtent.getKind() ==
-            static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+            PhysicalExprKind::Constant &&
         sourceExtent.getValue() == 1;
     if (singleton)
       continue;
@@ -247,7 +389,7 @@ BroadcastProjection queryBroadcastProjection(FragmentType source,
     auto sourceExtent = cast<PhysicalExprAttr>(source.getShape()[*sourceAxis]);
     bool singleton =
         sourceExtent.getKind() ==
-            static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+            PhysicalExprKind::Constant &&
         sourceExtent.getValue() == 1;
     if (!singleton && source.getShape()[*sourceAxis] != target.getShape()[targetAxis]) {
       result.state = BroadcastProjectionState::Unknown;
@@ -272,32 +414,54 @@ void IntentGPUDialect::initialize() {
       >();
 }
 
+LogicalResult ParameterRefAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, StringAttr name) {
+  return name && !name.empty() ? success()
+                             : emitError() << "parameter reference requires a nonempty name";
+}
+
+LogicalResult ParameterBindingAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, IntegerAttr dimension,
+    PhysicalSourceAttr source, PhysicalExprAttr, ArrayAttr, bool, bool) {
+  if (dimension && (!dimension.getType().isSignlessInteger(64) || dimension.getInt() <= 0))
+    return emitError() << "parameter dimension must be a positive i64 identity";
+  if (source && source.getSourceId() == 0)
+    return emitError() << "parameter source requires a nonzero source identity";
+  return success();
+}
+
 LogicalResult PhysicalExprAttr::verify(
-    function_ref<InFlightDiagnostic()> emitError, uint32_t kind,
-    int64_t value, StringAttr symbol, ArrayAttr operands) {
-  if (kind > 12 || !symbol || !operands)
+    function_ref<InFlightDiagnostic()> emitError, PhysicalExprKind kind,
+    int64_t value, Attribute symbol, ArrayAttr operands) {
+  if (kind > PhysicalExprKind::NextPowerOfTwo || !symbol || !operands)
     return emitError() << "physical expression has an invalid closed schema";
   for (Attribute operand : operands)
     if (!mlir::isa<PhysicalExprAttr>(operand))
       return emitError() << "physical expression operands must be #intent_gpu.expr";
-  if (kind == 0)
-    return symbol.empty() && operands.empty()
+  auto name = mlir::dyn_cast<StringAttr>(symbol);
+  if (kind == PhysicalExprKind::Constant)
+    return name && name.empty() && operands.empty()
                ? success()
                : emitError() << "constant physical expression cannot carry a symbol or operands";
-  if (kind == 1 || kind == 2 || kind == 3)
-    return !symbol.empty() && operands.empty()
+  if (kind == PhysicalExprKind::Parameter)
+    return mlir::isa<ParameterRefAttr>(symbol) && value == 0 && operands.empty()
+               ? success()
+               : emitError() << "parameter expression requires a typed declaration reference";
+  if (kind == PhysicalExprKind::Dimension || kind == PhysicalExprKind::ScalarABI)
+    return name && !name.empty() && operands.empty()
                ? success()
                : emitError() << "symbolic physical expression requires one name and no operands";
-  if (!symbol.empty() || value != 0)
+  if (!name || !name.empty() || value != 0)
     return emitError() << "composed physical expression cannot carry a symbol or literal payload";
-  unsigned expected = kind == 8 ? 3 : kind == 12 ? 1 : 2;
+  unsigned expected = kind == PhysicalExprKind::Select ? 3
+                    : kind == PhysicalExprKind::NextPowerOfTwo ? 1 : 2;
   if (operands.size() != expected)
     return emitError() << "composed physical expression has the wrong arity";
-  if (kind == static_cast<uint32_t>(PhysicalExprKind::CeilDiv) ||
-      kind == static_cast<uint32_t>(PhysicalExprKind::FloorDiv)) {
+  if (kind == PhysicalExprKind::CeilDiv ||
+      kind == PhysicalExprKind::FloorDiv) {
     auto divisor = mlir::cast<PhysicalExprAttr>(operands[1]);
     if (divisor.getKind() ==
-            static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+            PhysicalExprKind::Constant &&
         divisor.getValue() == 0)
       return emitError() << "physical division requires a nonzero divisor";
   }
@@ -367,18 +531,20 @@ LogicalResult ConfigurationSetAttr::verify(
 }
 
 LogicalResult ParameterAttr::verify(
-    function_ref<InFlightDiagnostic()> emitError, StringAttr name,
-    uint32_t role, uint32_t category, uint32_t elementBitWidth,
-    DenseI64ArrayAttr candidates) {
+    function_ref<InFlightDiagnostic()> emitError, StringAttr name, Type valueType,
+    ParameterRole role, ParameterCategory category, uint32_t elementBitWidth,
+    DenseI64ArrayAttr candidates, ConfigurationBindingPhase phase,
+    ParameterBindingAttr binding) {
   if (!name || name.empty() ||
-      role > static_cast<uint32_t>(ParameterRole::ProviderLoadPolicy) ||
+      role > ParameterRole::ProviderLoadPolicy ||
       category >
-          static_cast<uint32_t>(ParameterCategory::Histogram) ||
-      !candidates || candidates.empty())
+          ParameterCategory::Histogram ||
+      !candidates || candidates.empty() || !valueType ||
+      (!valueType.isIndex() && !valueType.isSignlessInteger(1)) || !binding)
     return emitError()
            << "physical parameter requires a name, role, category and candidates";
-  auto typedCategory = static_cast<ParameterCategory>(category);
-  auto typedRole = static_cast<ParameterRole>(role);
+  auto typedCategory = category;
+  auto typedRole = role;
   const bool providerRole =
       typedRole == ParameterRole::ProviderWarps ||
       typedRole == ParameterRole::ProviderStages ||
@@ -390,6 +556,16 @@ LogicalResult ParameterAttr::verify(
   if (providerRole != (typedCategory == ParameterCategory::Provider))
     return emitError()
            << "provider parameter roles require exactly the provider category";
+  if ((phase != ConfigurationBindingPhase::Shared &&
+       phase != ConfigurationBindingPhase::Provider &&
+       phase != ConfigurationBindingPhase::Deferred) ||
+      providerRole != (phase == ConfigurationBindingPhase::Provider) ||
+      (typedCategory == ParameterCategory::Coverage && phase != ConfigurationBindingPhase::Deferred))
+    return emitError() << "parameter binding phase disagrees with its category";
+  if (binding.getCoverageBound() && phase != ConfigurationBindingPhase::Deferred)
+    return emitError() << "coverage bounds require a deferred parameter declaration";
+  if (valueType.isSignlessInteger(1) && phase != ConfigurationBindingPhase::Provider)
+    return emitError() << "boolean configuration choices must be provider declarations";
   if ((typedRole == ParameterRole::ReductionOuter ||
        typedRole == ParameterRole::ReductionInner) &&
       typedCategory != ParameterCategory::Reduction)
@@ -409,8 +585,9 @@ LogicalResult ParameterAttr::verify(
            << "data-granularity parameter categories require an element bit width and non-data categories forbid one";
   llvm::DenseSet<int64_t> unique;
   for (int64_t candidate : candidates.asArrayRef())
-    if (candidate <= 0 || !unique.insert(candidate).second)
-      return emitError() << "physical parameter candidates must be unique positive integers";
+    if ((valueType.isIndex() ? candidate <= 0 : candidate < 0 || candidate > 1) ||
+        !unique.insert(candidate).second)
+      return emitError() << "parameter candidates must be unique and in the declared value-type domain";
   return success();
 }
 

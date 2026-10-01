@@ -1,6 +1,6 @@
 #include "Legalization.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
-#include "Intent/Dialect/GPU/Analysis/Configurations.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Target/Triton/IR/Configuration.h"
 #include "llvm/ADT/DenseSet.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -74,7 +74,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
   }
 
   auto schema = ConfigurationSchema::read(kernel);
-  auto configurations = gpu::ConfigurationSpace::read(kernel);
+  auto configurations = gpu::ParameterSpace::read(kernel);
   if (failed(schema) || failed(configurations) ||
       failed(configurations->configurations(gpu::ConfigurationStage::Complete)))
     return failure();

@@ -103,10 +103,15 @@ LogicalResult serializeProgram(ModuleOp program, std::string &source, std::strin
   auto capabilities = modules->host->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities");
   llvm::raw_string_ostream metadataStream(metadata);
   metadataStream << llvm::json::Value(llvm::json::Object{{"kind", "weft-generation"},
+      {"provider", "weft"}, {"entry_name", candidates.front().getName()},
+      {"target", llvm::json::Object{
+          {"family", "cpu"}, {"vector_bits", capabilities.getVectorBits()},
+          {"workers", capabilities.getWorkers()},
+          {"private_bytes", capabilities.getPrivateBytes()},
+          {"matrix_i8_i32", capabilities.getMatrixI8I32()}}},
       {"native", false}, {"host_source", hostSource}, {"tasks", std::move(*tasks)},
       {"parameters", std::move(*parameters)}, {"candidates", std::move(configurations)},
-      {"contiguous_views", interface.getContiguousViews()}, {"disjoint_outputs", interface.getDisjointOutputs()},
-      {"matrix_i8_i32", capabilities.getMatrixI8I32()}, {"workers", capabilities.getWorkers()}});
+      {"contiguous_views", interface.getContiguousViews()}, {"disjoint_outputs", interface.getDisjointOutputs()}});
   return success();
 }
 

@@ -5,6 +5,7 @@
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "llvm/ADT/APInt.h"
@@ -28,20 +29,22 @@ using namespace mlir;
 
 namespace intent::gpu {
 
-PhysicalExprAttr boundedTraversalChunk(ParameterOp chunk, MakeRangeOp range) {
+PhysicalExprAttr boundedTraversalChunk(ParameterAttr chunk, MakeRangeOp range) {
   auto expression = [&](PhysicalExprKind kind, int64_t value = 0,
                         StringRef symbol = {}, ArrayRef<Attribute> operands = {}) {
-    return PhysicalExprAttr::get(chunk.getContext(), static_cast<uint32_t>(kind),
-                                 value, StringAttr::get(chunk.getContext(), symbol),
+    return PhysicalExprAttr::get(chunk.getContext(), kind,
+                                 value, kind == PhysicalExprKind::Parameter
+                                     ? Attribute(ParameterRefAttr::get(chunk.getContext(), StringAttr::get(chunk.getContext(), symbol)))
+                                     : Attribute(StringAttr::get(chunk.getContext(), symbol)),
                                  ArrayAttr::get(chunk.getContext(), operands));
   };
   auto extent = expression(PhysicalExprKind::Parameter, 0,
-                           chunk.getParameter().getName().getValue());
+                           chunk.getName().getValue());
   auto capacity = queryLogicalRangeCapacity(range);
-  if (!capacity || !isShapeBound(capacity) || chunk->hasAttr(coverageDimensionAttr))
+  if (!capacity || !isShapeBound(capacity) || chunk.isDeferred())
     return extent;
   int64_t maximum =
-      *llvm::max_element(chunk.getParameter().getCandidates().asArrayRef());
+      *llvm::max_element(chunk.getCandidates().asArrayRef());
   if (maximum > (int64_t{1} << 62))
     return extent;
   if (auto bound = constantPhysicalExpression(capacity);
@@ -138,7 +141,7 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
       auto extent = cast<PhysicalExprAttr>(
           view.getLayout().getExtents()[axis]);
       if (extent.getKind() !=
-          static_cast<uint32_t>(PhysicalExprKind::Constant))
+          PhysicalExprKind::Constant)
         continue;
       if (staticDimension && *staticDimension != extent.getValue())
         return kernel.emitError(
@@ -148,7 +151,7 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
   }
   if (!runtimeDimension && staticDimension &&
       currentExtent.getKind() ==
-          static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          PhysicalExprKind::Constant &&
       currentExtent.getValue() == *staticDimension &&
       llvm::isPowerOf2_64(*staticDimension))
     return success();
@@ -193,7 +196,7 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
             UniformValueAnalysis(describeUniformValue).evaluate(runtimeDimension)))
       staticDimension = value.getInt();
   if (!staticDimension && coverageBound.getKind() ==
-                              static_cast<uint32_t>(PhysicalExprKind::Constant))
+                              PhysicalExprKind::Constant)
     staticDimension = coverageBound.getValue();
   if (staticDimension && *staticDimension >= 0) {
     uint64_t size = llvm::PowerOf2Ceil(
@@ -201,7 +204,7 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
     if (size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
       return kernel.emitError("full-coverage extent exceeds the index range");
     auto covered = PhysicalExprAttr::get(kernel.getContext(),
-        static_cast<uint32_t>(PhysicalExprKind::Constant), size,
+        PhysicalExprKind::Constant, size,
         StringAttr::get(kernel.getContext(), ""), ArrayAttr::get(kernel.getContext(), {}));
     if (currentExtent == covered &&
         analysis.axisRealization(source, fragmentAxis).physicalized)
@@ -227,49 +230,50 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
     return success();
   }
 
-  ParameterOp parameter;
+  ParameterAttr parameter;
   if (currentExtent.getKind() ==
-      static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
-    FailureOr<ParameterOp> declaration =
-        queryParameterBySymbol(kernel, currentExtent.getSymbol());
+      PhysicalExprKind::Parameter) {
+    FailureOr<ParameterAttr> declaration =
+        queryParameterBySymbol(kernel, currentExtent.getSymbolName());
     if (succeeded(declaration)) {
-      auto covered = (*declaration)->getAttrOfType<IntegerAttr>(
-          coverageDimensionAttr);
-      if (covered && covered.getInt() == coverageDimension &&
-          (*declaration).getParameter().getRole() ==
-              static_cast<uint32_t>(ParameterRole::FullCoverage))
+      auto covered = declaration->getBinding().getDimension();
+      if (declaration->isDeferred() && covered && covered.getInt() == coverageDimension &&
+          declaration->getRole() ==
+              ParameterRole::FullCoverage)
         parameter = *declaration;
     }
   }
   if (!parameter) {
-    kernel.walk([&](ParameterOp candidate) {
-      auto covered = candidate->getAttrOfType<IntegerAttr>(
-          coverageDimensionAttr);
-      if (!covered || covered.getInt() != coverageDimension ||
-          candidate.getParameter().getRole() !=
-              static_cast<uint32_t>(ParameterRole::FullCoverage))
-        return;
+    for (Attribute attribute : getParameterDeclarations(kernel)) {
+      auto candidate = cast<ParameterAttr>(attribute);
+      auto covered = candidate.getBinding().getDimension();
+      if (!candidate.isDeferred() || !covered || covered.getInt() != coverageDimension ||
+          candidate.getRole() !=
+              ParameterRole::FullCoverage)
+        continue;
       if (parameter && parameter != candidate) {
-        parameter = ParameterOp();
-        return;
+        parameter = ParameterAttr();
+        continue;
       }
       parameter = candidate;
-    });
+    }
   }
   if (parameter &&
       currentExtent.getKind() ==
-          static_cast<uint32_t>(PhysicalExprKind::Parameter) &&
-      currentExtent.getSymbol() == parameter.getParameter().getName() &&
-      parameter.getParameter().getRole() ==
-          static_cast<uint32_t>(ParameterRole::FullCoverage)) {
-    parameter->setAttr(coverageBoundAttr, coverageBound);
+          PhysicalExprKind::Parameter &&
+      currentExtent.getSymbolName() == parameter.getName() &&
+      parameter.getRole() ==
+          ParameterRole::FullCoverage) {
+    parameter = parameter.withBinding(parameter.getBinding().withCoverageBound(coverageBound));
+    if (failed(updateParameter(kernel, parameter))) return failure();
     PhysicalParameterBinding binding = queryParameterBinding(parameter);
     if (!binding.isExact() || !binding.dimension ||
         *binding.dimension != coverageDimension)
-      return parameter.emitOpError(
+      return kernel.emitOpError(
           "full-coverage parameter lost its typed dimension authority");
+    OpBuilder entry(&kernel.front(), kernel.front().begin());
     if (failed(bindFullCoverageDimension(kernel, dimension,
-                                         parameter.getResult())))
+          materializeParameter(entry, source.getLoc(), parameter.getReference()))))
       return kernel.emitError(
           "existing full-coverage decision could not preserve access validity");
     return success();
@@ -279,57 +283,40 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
       512,  1024, 2048,  4096,  8192,  16384, 32768, 65536};
   if (!parameter) {
     std::string name = ("FULL_D" + Twine(coverageDimension)).str();
-    bool nameCollision = false;
-    kernel.walk([&](ParameterOp candidate) {
-      nameCollision |=
-          candidate.getParameter().getName().getValue() == name;
-    });
-    if (nameCollision) {
+    if (auto existing = lookupParameter(kernel, StringAttr::get(kernel.getContext(), name))) {
       InFlightDiagnostic diagnostic = kernel.emitError(
           "full-coverage parameter name is already owned by another decision");
-      kernel.walk([&](ParameterOp candidate) {
-        if (candidate.getParameter().getName().getValue() != name)
-          return;
-        diagnostic << "; role=" << candidate.getParameter().getRole();
-        if (auto covered = candidate->getAttrOfType<IntegerAttr>(
-                coverageDimensionAttr))
-          diagnostic << ", coverage_dimension=" << covered.getInt();
-        if (auto bound = candidate->getAttrOfType<IntegerAttr>(dimensionAttr))
-          diagnostic << ", dimension=" << bound.getInt();
-      });
+      diagnostic << "; role=" << stringifyParameterRole(existing.getRole());
+      if (auto bound = existing.getBinding().getDimension())
+        diagnostic << ", dimension=" << bound.getInt();
       return failure();
     }
     OpBuilder builder(&kernel.getBody().front(),
                       kernel.getBody().front().begin());
     auto schema = ParameterAttr::get(
-        kernel.getContext(), builder.getStringAttr(name),
-        static_cast<uint32_t>(ParameterRole::FullCoverage),
-        static_cast<uint32_t>(ParameterCategory::Coverage),
+        kernel.getContext(), builder.getStringAttr(name), builder.getIndexType(),
+        ParameterRole::FullCoverage,
+        ParameterCategory::Coverage,
         /*elementBitWidth=*/0,
-        DenseI64ArrayAttr::get(kernel.getContext(), candidates));
-    parameter = builder.create<ParameterOp>(source.getLoc(),
-                                            builder.getIndexType(), schema);
+        DenseI64ArrayAttr::get(kernel.getContext(), candidates),
+        ConfigurationBindingPhase::Deferred,
+        ParameterBindingAttr::get(kernel.getContext(), builder.getI64IntegerAttr(coverageDimension),
+                                 {}, coverageBound, {}, false, false));
+    if (failed(declareParameter(kernel, schema))) return failure();
+    parameter = schema;
   } else {
-    ParameterAttr schema = parameter.getParameter();
-    parameter->setAttr(
-        "parameter",
-        ParameterAttr::get(
-            kernel.getContext(), schema.getName(), schema.getRole(),
-            schema.getCategory(), schema.getElementBitWidth(),
-            DenseI64ArrayAttr::get(kernel.getContext(), candidates)));
+    parameter = parameter.withCandidates(DenseI64ArrayAttr::get(kernel.getContext(), candidates));
   }
-  parameter->setAttr(
-      dimensionAttr,
-      IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), coverageDimension));
-  parameter->setAttr(
-      coverageDimensionAttr,
-      IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), coverageDimension));
-  parameter->setAttr(coverageBoundAttr, coverageBound);
+  parameter = parameter.withPhase(ConfigurationBindingPhase::Deferred).withBinding(
+      parameter.getBinding().withDimension(IntegerAttr::get(
+          IntegerType::get(kernel.getContext(), 64), coverageDimension))
+          .withCoverageBound(coverageBound));
+  if (failed(updateParameter(kernel, parameter))) return failure();
 
   auto covered = PhysicalExprAttr::get(
       kernel.getContext(),
-      static_cast<uint32_t>(PhysicalExprKind::Parameter), 0,
-      parameter.getParameter().getName(),
+      PhysicalExprKind::Parameter, 0,
+      parameter.getReference(),
       ArrayAttr::get(kernel.getContext(), {}));
   if (!ranges.roots.empty() && failed(queryExactLogicalRange(ranges)))
     return kernel.emitError(
@@ -358,8 +345,9 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
   }
   if (ranges.roots.empty())
     retargetDimensionExtent(source, dimension, covered);
+  OpBuilder entry(&kernel.front(), kernel.front().begin());
   if (failed(bindFullCoverageDimension(kernel, dimension,
-                                       parameter.getResult())))
+        materializeParameter(entry, source.getLoc(), parameter.getReference()))))
     return kernel.emitError(
         "full-coverage decision could not preserve access validity");
   return success();
@@ -367,19 +355,19 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
 
 LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
                                         Value physicalExtent) {
-  auto parameter = physicalExtent.getDefiningOp<ParameterOp>();
+  auto parameter = queryParameter(physicalExtent);
   PhysicalExprAttr parameterExtent = queryLaunchExpression(physicalExtent);
   if (!parameterExtent ||
       (!parameter && parameterExtent.getKind() !=
-                         static_cast<uint32_t>(PhysicalExprKind::Constant)))
+                         PhysicalExprKind::Constant))
     return failure();
   std::function<bool(PhysicalExprAttr)> hasBlockedExtent =
       [&](PhysicalExprAttr extent) {
-    if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
-      auto declaration = queryParameterBySymbol(kernel, extent.getSymbol());
+    if (extent.getKind() == PhysicalExprKind::Parameter) {
+      auto declaration = queryParameterBySymbol(kernel, extent.getSymbolName());
       return succeeded(declaration) && *declaration != parameter &&
-             declaration->getParameter().getRole() !=
-                 static_cast<uint32_t>(ParameterRole::FullCoverage);
+             declaration->getRole() !=
+                 ParameterRole::FullCoverage;
     }
     return llvm::any_of(extent.getOperands(), [&](Attribute operand) {
       return hasBlockedExtent(cast<PhysicalExprAttr>(operand));

@@ -1,6 +1,7 @@
 #ifndef INTENT_DIALECT_GPU_IR_PROGRAM_H
 #define INTENT_DIALECT_GPU_IR_PROGRAM_H
 
+#include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/IR/Operation.h"
@@ -57,20 +58,8 @@ inline constexpr llvm::StringLiteral segmentOffsetAttr =
     "intent_gpu.segment_offset";
 inline constexpr llvm::StringLiteral segmentLengthAttr =
     "intent_gpu.segment_length";
-inline constexpr llvm::StringLiteral coverageDimensionAttr =
-    "intent_gpu.coverage_dimension";
-inline constexpr llvm::StringLiteral coverageBoundAttr =
-    "intent_gpu.coverage_bound";
 inline constexpr llvm::StringLiteral reductionSourcesAttr =
     "intent_gpu.reduction_sources";
-inline constexpr llvm::StringLiteral parameterSourceAttr =
-    "intent_gpu.parameter_source";
-inline constexpr llvm::StringLiteral parameterGroupAttr =
-    "intent_gpu.parameter_group";
-inline constexpr llvm::StringLiteral pointwiseChunkAttr =
-    "intent_gpu.pointwise_chunk";
-inline constexpr llvm::StringLiteral pointwiseLocalAttr =
-    "intent_gpu.pointwise_local";
 inline constexpr llvm::StringLiteral independentIterationAttr =
     "intent_gpu.independent_iteration";
 inline constexpr llvm::StringLiteral physicalTailAttr =
@@ -79,58 +68,9 @@ inline constexpr llvm::StringLiteral programBoundedOriginAttr =
     "intent_gpu.program_bounded_origin";
 inline constexpr llvm::StringLiteral configurationsAttr =
     "intent_gpu.configurations";
+inline constexpr llvm::StringLiteral parametersAttr = "intent_gpu.parameters";
 inline constexpr llvm::StringLiteral tuningProfilesAttr =
     "intent_gpu.tuning_profiles";
-
-enum class PhysicalExprKind : uint32_t {
-  Constant = 0,
-  Parameter = 1,
-  Dimension = 2,
-  ScalarABI = 3,
-  Add = 4,
-  Multiply = 5,
-  CeilDiv = 6,
-  Minimum = 7,
-  Select = 8,
-  Subtract = 9,
-  FloorDiv = 10,
-  Maximum = 11,
-  NextPowerOfTwo = 12,
-};
-
-enum class ParameterRole : uint32_t {
-  OwnershipM = 0,
-  OwnershipN = 1,
-  Reduction = 2,
-  ScanChunk = 3,
-  ProviderWarps = 4,
-  ProviderStages = 5,
-  ProviderCTAs = 6,
-  ProviderThreads = 7,
-  TraversalWorkers = 8,
-  TraversalGroup = 9,
-  ResidentWorkers = 10,
-  FullCoverage = 11,
-  ReductionOuter = 12,
-  ReductionInner = 13,
-  ProviderAccessForm = 14,
-  ProviderOccupancy = 15,
-  ProviderLoadPolicy = 16,
-};
-
-enum class ParameterCategory : uint32_t {
-  Pointwise = 0,
-  Reduction = 1,
-  Scan = 2,
-  Contraction = 3,
-  Execution = 4,
-  Coverage = 5,
-  Provider = 6,
-  RegionReduction = 7,
-  RegionContraction = 8,
-  PersistentContraction = 9,
-  Histogram = 10,
-};
 
 enum class CoordinateRole : int64_t {
   Unspecified = -1,

@@ -40,7 +40,7 @@ bool isSingletonInsertion(ReshapeOp reshape) {
         return false;
     } else {
       auto extent = cast<PhysicalExprAttr>(target.getShape()[axis]);
-      if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+      if (extent.getKind() != PhysicalExprKind::Constant ||
           extent.getValue() != 1)
         return false;
     }
@@ -184,9 +184,7 @@ void eliminateInBlock(Block &block) {
       reshape.erase();
       continue;
     }
-    // Parameter declarations also have symbolic type/attribute users. They are
-    // retained and cleaned up by eraseUnusedPhysicalParameters, not SSA DCE.
-    if (isa<ParameterOp, DelinearizeOp>(operation) ||
+    if (isa<DelinearizeOp>(operation) ||
         operation.getNumRegions() != 0 ||
         operation.getNumResults() == 0 || !isMemoryEffectFree(&operation) ||
         !isPhysicalReplayNode(&operation, PhysicalReplayScope::ValueGraph,

@@ -1,6 +1,7 @@
 """Call the existing softmax algorithm from PyTorch using an installed Intent."""
 
 import argparse
+from pathlib import Path
 import intent
 import torch
 
@@ -10,11 +11,16 @@ from kernels.normalization.softmax import stable_softmax_f16
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", choices=("triton", "cutile"), default="triton")
+    parser.add_argument("--program", type=Path,
+                        help="Load a saved generated program and bind it to the selected runtime")
     parser.add_argument("--torch-compile", action="store_true",
                         help="Call through the opaque PyTorch operator adapter")
     args = parser.parse_args()
     target = intent.TritonTarget() if args.target == "triton" else intent.CuTileTarget()
-    softmax = intent.compile(stable_softmax_f16, target=target)
+    if args.program is None:
+        softmax = intent.compile(stable_softmax_f16, target=target)
+    else:
+        softmax = intent.GeneratedProgram.load(args.program).materialize(target=target)
     x = torch.randn((8192, 8192), device="cuda", dtype=torch.float16)
     if args.torch_compile:
         operation = softmax.as_torch_op("intent_examples::softmax")

@@ -25,7 +25,7 @@ LogicalResult materializeProgramBuffers(ModuleOp module) {
   bool singleton = llvm::all_of(space, [](Attribute attribute) {
     auto extent = cast<PhysicalExprAttr>(attribute);
     return extent.getKind() ==
-               static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+               PhysicalExprKind::Constant &&
            extent.getValue() == 1;
   });
   SmallVector<Value> programCoordinates;
@@ -33,7 +33,7 @@ LogicalResult materializeProgramBuffers(ModuleOp module) {
     OpBuilder entry(&kernel.front(), kernel.front().begin());
     for (auto [axis, attribute] : llvm::enumerate(space)) {
       auto extent = cast<PhysicalExprAttr>(attribute);
-      auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+      auto kind = extent.getKind();
       if (kind != PhysicalExprKind::Constant &&
           kind != PhysicalExprKind::Dimension)
         return kernel.emitError(
@@ -67,7 +67,7 @@ LogicalResult materializeProgramBuffers(ModuleOp module) {
         return user->emitOpError("mutable buffer supports explicit loads and stores");
     for (Attribute attribute : type.getShape()) {
       auto extent = cast<PhysicalExprAttr>(attribute);
-      auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+      auto kind = extent.getKind();
       if ((kind != PhysicalExprKind::Constant &&
            kind != PhysicalExprKind::Dimension) || extent.getValue() <= 0)
         return buffer.emitOpError(
@@ -154,7 +154,7 @@ LogicalResult lowerInvocationWorkspaces(ModuleOp module) {
     uint32_t abi = argumentIndex;
     for (auto [axis, attribute] : llvm::enumerate(buffer.getShape())) {
       auto extent = cast<PhysicalExprAttr>(attribute);
-      auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+      auto kind = extent.getKind();
       if (kind != PhysicalExprKind::Constant &&
           kind != PhysicalExprKind::Dimension)
         return kernel.emitError(

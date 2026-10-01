@@ -224,7 +224,7 @@ LogicalResult alignContractAccumulator(Operation *operation, RelationWorklist &c
     auto isUnit = [](Attribute attribute) {
       auto expression = cast<PhysicalExprAttr>(attribute);
       return expression.getKind() ==
-                 static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                 PhysicalExprKind::Constant &&
              expression.getValue() == 1;
     };
     SmallVector<Attribute> shape(target.getShape().begin(),
@@ -288,7 +288,7 @@ WalkResult alignContractOperands(Operation *operation, RelationWorklist &changes
   auto isUnit = [](Attribute attribute) {
     auto extent = cast<PhysicalExprAttr>(attribute);
     return extent.getKind() ==
-               static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+               PhysicalExprKind::Constant &&
            extent.getValue() == 1;
   };
   auto isUniformBatch = [&](Value value, unsigned axis) {
@@ -502,7 +502,7 @@ bool preservesIntroducedUnitAxis(Value value, AxisSelector selects) {
     return false;
   auto extent = cast<PhysicalExprAttr>(result.getShape()[*axis]);
   bool unit = extent.getKind() ==
-                  static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                  PhysicalExprKind::Constant &&
               extent.getValue() == 1;
   if (!unit)
     return false;
@@ -805,7 +805,7 @@ WalkResult alignPointwiseValue(Operation *operation, RelationWorklist &changes) 
     auto extent = dyn_cast<PhysicalExprAttr>(attribute);
     return extent &&
            extent.getKind() ==
-               static_cast<uint32_t>(PhysicalExprKind::Parameter);
+               PhysicalExprKind::Parameter;
   };
   auto sameSchema = [](FragmentType lhs, FragmentType rhs) {
     return lhs.getShape() == rhs.getShape() &&
@@ -886,7 +886,7 @@ WalkResult alignPointwiseValue(Operation *operation, RelationWorklist &changes) 
             cast<PhysicalExprAttr>(source.getShape()[*sourceAxis]);
         bool singleton =
             sourceExtent.getKind() ==
-                static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                PhysicalExprKind::Constant &&
             sourceExtent.getValue() == 1;
         if (singleton)
           continue;
@@ -894,7 +894,7 @@ WalkResult alignPointwiseValue(Operation *operation, RelationWorklist &changes) 
             cast<PhysicalExprAttr>(target.getShape()[targetAxis]);
         bool targetSingleton =
             targetExtent.getKind() ==
-                static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                PhysicalExprKind::Constant &&
             targetExtent.getValue() == 1;
         if (targetSingleton) {
           PhysicalProgramAnalysis analysis(kernel);
@@ -1342,7 +1342,7 @@ static LogicalResult refreshReshapeRelation(ReshapeOp reshape, RelationWorklist 
         auto extent = cast<PhysicalExprAttr>(
             resultShape[resultPrefix + axis]);
         if (extent.getKind() !=
-                static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+                PhysicalExprKind::Constant ||
             extent.getValue() != 1)
           nonUnitAxes.push_back(axis);
       }
@@ -1398,11 +1398,11 @@ WalkResult alignAggregateValue(Operation *operation, RelationWorklist &changes) 
         auto rightExtent = cast<PhysicalExprAttr>(right);
         bool leftUnit =
             leftExtent.getKind() ==
-                static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                PhysicalExprKind::Constant &&
             leftExtent.getValue() == 1;
         bool rightUnit =
             rightExtent.getKind() ==
-                static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                PhysicalExprKind::Constant &&
             rightExtent.getValue() == 1;
         if (leftUnit == rightUnit)
           return failure();
@@ -1465,7 +1465,7 @@ WalkResult alignAggregateValue(Operation *operation, RelationWorklist &changes) 
           // A uniform branch adopts the other branch's selected physical
           // extents, while retaining its axis, dtype and ownership obligations.
           auto unit = PhysicalExprAttr::get(
-              kernel.getContext(), static_cast<uint32_t>(PhysicalExprKind::Constant),
+              kernel.getContext(), PhysicalExprKind::Constant,
               1, StringAttr::get(kernel.getContext(), ""),
               ArrayAttr::get(kernel.getContext(), {}));
           SmallVector<Attribute> units(fragment.getShape().size(), unit);
@@ -1706,7 +1706,7 @@ static void retargetExtent(Value root, AxisSelector selects,
           OpBuilder builder(range);
           Value physicalExtent;
           if (extent.getKind() ==
-              static_cast<uint32_t>(PhysicalExprKind::Constant))
+              PhysicalExprKind::Constant)
             physicalExtent = builder.create<arith::ConstantIndexOp>(
                 range.getLoc(), extent.getValue());
           else
@@ -1790,9 +1790,9 @@ static void retargetExtent(Value root, AxisSelector selects,
                 auto oldExtent = cast<PhysicalExprAttr>(before);
                 auto newExtent = cast<PhysicalExprAttr>(after);
                 return oldExtent.getKind() ==
-                           static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                           PhysicalExprKind::Constant &&
                        newExtent.getKind() ==
-                           static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                           PhysicalExprKind::Constant &&
                        oldExtent.getValue() > 0 &&
                        static_cast<uint64_t>(newExtent.getValue()) ==
                            llvm::PowerOf2Ceil(static_cast<uint64_t>(oldExtent.getValue()));
@@ -1825,7 +1825,7 @@ static void retargetExtent(Value root, AxisSelector selects,
               auto oldExtent =
                   cast<PhysicalExprAttr>(previousFragment.getShape()[*sourceAxis]);
               bool unit = oldExtent.getKind() ==
-                              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                              PhysicalExprKind::Constant &&
                           oldExtent.getValue() <= 1;
               bool sameLogicalExtent = inputMap.getDimensionId() > 0 &&
                   inputMap.getDimensionId() == targetMap.getDimensionId();
@@ -2053,7 +2053,7 @@ void eraseDeadPhysicalValues(func::FuncOp kernel) {
   do {
     changed = false;
     kernel.walk<WalkOrder::PostOrder>([&](Operation *operation) {
-      if (!operation->getBlock() || isa<DelinearizeOp, ParameterOp>(operation) ||
+      if (!operation->getBlock() || isa<DelinearizeOp>(operation) ||
           operation == kernel.getOperation() || !operation->getNumResults() ||
           !llvm::all_of(operation->getResults(),
                         [](Value value) { return value.use_empty(); }))

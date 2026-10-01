@@ -10,31 +10,18 @@ using namespace mlir;
 namespace intent::gpu {
 namespace {
 
-bool isCoverageParameter(ParameterOp parameter) {
-  return parameter->hasAttr(coverageDimensionAttr) ||
-         parameter.getParameter().getCategory() ==
-             static_cast<uint32_t>(ParameterCategory::Coverage);
+bool isCoverageParameter(ParameterAttr parameter) {
+  return parameter.isDeferred() ||
+         parameter.getCategory() ==
+             ParameterCategory::Coverage;
 }
 
-bool hasLateBoundDomain(ParameterOp parameter) {
+bool hasLateBoundDomain(ParameterAttr parameter) {
   // Provider configuration formation binds resident capacity after native
   // access formation. Its placeholder candidates prove neither a constant nor
   // common divisibility of the eventual SM/CTA/occupancy-dependent domain.
-  return parameter.getParameter().getRole() ==
-         static_cast<uint32_t>(ParameterRole::ResidentWorkers);
-}
-
-ParameterOp parameterFor(Value value) {
-  if (auto parameter = value.getDefiningOp<ParameterOp>())
-    return parameter;
-  auto expression = value.getDefiningOp<PhysicalExprOp>();
-  if (!expression || expression.getExpression().getKind() !=
-                         static_cast<uint32_t>(PhysicalExprKind::Parameter))
-    return {};
-  auto parameter = queryParameterBySymbol(
-      expression->getParentOfType<func::FuncOp>(),
-      expression.getExpression().getSymbol());
-  return succeeded(parameter) ? *parameter : ParameterOp();
+  return parameter.getRole() ==
+         ParameterRole::ResidentWorkers;
 }
 
 std::optional<int64_t> evaluateSingletonExpression(PhysicalExprAttr expression,
@@ -42,13 +29,13 @@ std::optional<int64_t> evaluateSingletonExpression(PhysicalExprAttr expression,
   return evaluatePhysicalExpression(expression, [&](PhysicalExprAttr leaf)
       -> std::optional<int64_t> {
     if (!kernel || leaf.getKind() !=
-                       static_cast<uint32_t>(PhysicalExprKind::Parameter))
+                       PhysicalExprKind::Parameter)
       return std::nullopt;
-    auto parameter = queryParameterBySymbol(kernel, leaf.getSymbol());
+    auto parameter = queryParameterBySymbol(kernel, leaf.getSymbolName());
     if (failed(parameter) || isCoverageParameter(*parameter) ||
         hasLateBoundDomain(*parameter))
       return std::nullopt;
-    auto candidates = parameter->getParameter().getCandidates().asArrayRef();
+    auto candidates = parameter->getCandidates().asArrayRef();
     return candidates.size() == 1 ? std::optional<int64_t>(candidates.front())
                                   : std::nullopt;
   });
@@ -128,11 +115,11 @@ bool IndexRelations::nonnegative(Value value, unsigned depth) const {
 bool IndexRelations::positive(Value value) const {
   if (auto literal = constant(value))
     return *literal > 0;
-  if (auto parameter = parameterFor(value)) {
+  if (auto parameter = queryParameter(value)) {
     // Coverage capacity is selected from these candidates at launch. Their
     // common sign/alignment properties apply, but they are not the logical
     // extent and do not make a coverage parameter a compile-time singleton.
-    auto candidates = parameter.getParameter().getCandidates().asArrayRef();
+    auto candidates = parameter.getCandidates().asArrayRef();
     return !candidates.empty() && llvm::all_of(candidates, [](int64_t candidate) {
       return candidate > 0;
     });
@@ -188,10 +175,10 @@ bool IndexRelations::atMost(Value lhs, Value rhs, unsigned depth) const {
 }
 
 bool IndexRelations::powerOfTwo(Value value) const {
-  if (auto parameter = parameterFor(value)) {
+  if (auto parameter = queryParameter(value)) {
     if (hasLateBoundDomain(parameter))
       return false;
-    auto candidates = parameter.getParameter().getCandidates().asArrayRef();
+    auto candidates = parameter.getCandidates().asArrayRef();
     return !candidates.empty() && llvm::all_of(candidates, [](int64_t candidate) {
       return candidate > 0 && llvm::isPowerOf2_64(candidate);
     });
@@ -202,26 +189,28 @@ bool IndexRelations::powerOfTwo(Value value) const {
 
 bool IndexRelations::multipleOf(
     Value value, int64_t divisor,
-    llvm::function_ref<bool(ParameterOp)> alignedParameter) const {
+    llvm::function_ref<bool(ParameterAttr)> alignedParameter) const {
   if (!value || !value.getType().isIndex() || divisor <= 0)
     return false;
   // Powers of two divide the index modulus. Their divisibility survives
   // fixed-width add/sub/mul; other divisors require a concrete constant.
+  auto declarationAligned = [&](ParameterAttr parameter) {
+    if (alignedParameter && alignedParameter(parameter))
+      return true;
+    if (hasLateBoundDomain(parameter))
+      return false;
+    auto candidates = parameter.getCandidates().asArrayRef();
+    return !candidates.empty() && llvm::all_of(candidates, [&](int64_t candidate) {
+      return candidate % divisor == 0;
+    });
+  };
   std::function<bool(Value, unsigned)> prove = [&](Value current, unsigned depth) {
     if (!current || !current.getType().isIndex() || depth >= 32)
       return false;
     if (divisor == 1)
       return true;
-    if (auto parameter = parameterFor(current)) {
-      if (alignedParameter && alignedParameter(parameter))
-        return true;
-      if (hasLateBoundDomain(parameter))
-        return false;
-      auto candidates = parameter.getParameter().getCandidates().asArrayRef();
-      return !candidates.empty() && llvm::all_of(candidates, [&](int64_t candidate) {
-        return candidate % divisor == 0;
-      });
-    }
+    if (auto parameter = queryParameter(current))
+      return declarationAligned(parameter);
     if (auto literal = constant(current))
       return *literal % divisor == 0;
     if (!llvm::isPowerOf2_64(divisor))
@@ -239,13 +228,13 @@ bool IndexRelations::multipleOf(
     if (auto physical = current.getDefiningOp<PhysicalExprOp>()) {
       std::function<bool(PhysicalExprAttr)> expressionAligned =
           [&](PhysicalExprAttr expression) {
-        auto kind = static_cast<PhysicalExprKind>(expression.getKind());
+        auto kind = expression.getKind();
         if (kind == PhysicalExprKind::Constant)
           return expression.getValue() % divisor == 0;
         if (kind == PhysicalExprKind::Parameter) {
           auto parameter = queryParameterBySymbol(
-              physical->getParentOfType<func::FuncOp>(), expression.getSymbol());
-          return succeeded(parameter) && aligned(parameter->getResult());
+              physical->getParentOfType<func::FuncOp>(), expression.getSymbolName());
+          return succeeded(parameter) && declarationAligned(*parameter);
         }
         if (expression.getOperands().size() != 2)
           return false;
@@ -280,10 +269,10 @@ bool IndexRelations::multipleOf(Value value, Value divisor) const {
     return true;
   if (auto literal = constant(divisor))
     return multipleOf(value, *literal);
-  auto parameter = parameterFor(divisor);
+  auto parameter = queryParameter(divisor);
   if (!parameter || hasLateBoundDomain(parameter))
     return false;
-  auto candidates = parameter.getParameter().getCandidates().asArrayRef();
+  auto candidates = parameter.getCandidates().asArrayRef();
   if (candidates.empty())
     return false;
   std::function<bool(Value, unsigned)> prove = [&](Value current, unsigned depth) {

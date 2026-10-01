@@ -3,6 +3,7 @@
 
 #include "Intent/Dialect/GPU/Transforms/Contraction.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
@@ -31,7 +32,7 @@ struct ProgramSegment {
 
   bool isComplete() const {
     return mapping && space && space.size() == 1 && offset && length &&
-           offset.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+           offset.getKind() == PhysicalExprKind::Constant &&
            offset.getValue() == 0 && space[0] == length;
   }
 };
@@ -93,7 +94,7 @@ FailureOr<unsigned> mappingAxisForScalar(Value value, DelinearizeOp mapping);
 
 LogicalResult refineOwnershipParameter(func::FuncOp kernel, MakeRangeOp range,
                                        FailureOr<unsigned> mappingAxis,
-                                       ParameterOp replacement);
+                                       ParameterAttr replacement);
 
 LogicalResult collectPairedReductionRanges(
     ContractOp contract, SmallVectorImpl<MakeRangeOp> &lhsRanges,
@@ -133,7 +134,7 @@ bool isIntegerConstant(Value value, int64_t expected);
 bool isTailPredicate(Value value,
                      ArrayRef<std::pair<MakeRangeOp, Value>> ranges);
 
-FailureOr<ParameterOp> parameterForExtent(func::FuncOp kernel,
+FailureOr<ParameterAttr> parameterForExtent(func::FuncOp kernel,
                                           PhysicalExprAttr extent);
 
 LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
@@ -219,7 +220,7 @@ LogicalResult decomposeMultiReductionContract(ContractOp contract);
 
 scf::ForOp enclosingRegionContractionSegment(Operation *operation);
 
-FailureOr<ParameterOp>
+FailureOr<ParameterAttr>
 regionContractionParameter(func::FuncOp kernel, PhysicalExprAttr extent);
 
 FailureOr<bool> realizeSegmentNativeReduction(ContractOp contract,

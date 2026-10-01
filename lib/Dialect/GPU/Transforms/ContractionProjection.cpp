@@ -1,4 +1,5 @@
 #include "ContractionDetail.h"
+#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
@@ -61,7 +62,7 @@ void pruneContractionProgramCoordinates(func::FuncOp kernel) {
         !program || program.getAxis() != 0 ||
         !program.getResult().hasOneUse() || !space ||
         space.size() != 1 || !offset || !length || space[0] != length ||
-        offset.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+        offset.getKind() != PhysicalExprKind::Constant ||
         offset.getValue() != 0)
       continue;
     SmallVector<Type> types;
@@ -167,7 +168,7 @@ LogicalResult normalizeMatrixContractForms(func::FuncOp kernel) {
         auto type = cast<FragmentType>(value.getType());
         auto extent = dyn_cast<PhysicalExprAttr>(type.getShape()[axis]);
         if (!extent || extent.getKind() !=
-                           static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+                           PhysicalExprKind::Constant ||
             extent.getValue() != 1)
           return false;
         auto realization = analysis.axisRealization(value, axis);
@@ -466,7 +467,7 @@ static bool supportsMatrixLoopTranspose(scf::ForOp loop) {
         return llvm::count_if(type.getShape(), [](Attribute extent) {
           auto expression = cast<PhysicalExprAttr>(extent);
           return expression.getKind() !=
-                     static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+                     PhysicalExprKind::Constant ||
                  expression.getValue() != 1;
         });
       };
@@ -599,7 +600,7 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
     return false;
   auto isUnit = [](Attribute attribute) {
     auto extent = cast<PhysicalExprAttr>(attribute);
-    return extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+    return extent.getKind() == PhysicalExprKind::Constant &&
            extent.getValue() == 1;
   };
   SmallVector<SmallVector<unsigned>, 2> resultAxes(2);
@@ -834,26 +835,29 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
 
 LogicalResult normalizeMatrixContractShapes(func::FuncOp kernel) {
   llvm::DenseSet<StringAttr> units;
-  kernel.walk([&](ParameterOp parameter) {
-    auto schema = parameter.getParameter();
-    auto role = static_cast<ParameterRole>(schema.getRole());
+  for (Attribute declaration : getParameterDeclarations(kernel)) {
+    auto schema = cast<ParameterAttr>(declaration);
+    auto role = schema.getRole();
     if ((role != ParameterRole::OwnershipM &&
          role != ParameterRole::OwnershipN) ||
         schema.getCandidates().size() != 1 || schema.getCandidates()[0] != 1)
-      return;
+      continue;
     units.insert(schema.getName());
-    OpBuilder builder(parameter);
+  }
+  kernel.walk([&](ParameterOp read) {
+    if (!units.contains(read.getReference().getName())) return;
+    OpBuilder builder(read);
     Value constant = builder.create<arith::ConstantOp>(
-        parameter.getLoc(), parameter.getResult().getType(),
-        builder.getIntegerAttr(parameter.getResult().getType(), 1));
-    parameter.getResult().replaceAllUsesWith(constant);
+        read.getLoc(), read.getResult().getType(),
+        builder.getIntegerAttr(read.getResult().getType(), 1));
+    read.getResult().replaceAllUsesWith(constant);
   });
   // Ownership and coverage are already closed at this boundary. A singleton
   // physical candidate is an exact extent, independent of the target API.
   AttrTypeReplacer replacer;
   replacer.addReplacement([&](PhysicalExprAttr extent) -> std::optional<Attribute> {
-    if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter) ||
-        !units.contains(extent.getSymbol()))
+    if (extent.getKind() != PhysicalExprKind::Parameter ||
+        !units.contains(extent.getSymbolName()))
       return std::nullopt;
     return expression(kernel.getContext(), PhysicalExprKind::Constant, 1);
   });
@@ -902,7 +906,7 @@ LogicalResult normalizeMatrixContractShapes(func::FuncOp kernel) {
       auto extent = cast<PhysicalExprAttr>(type.getShape()[axes.front()]);
       for (int64_t axis : axes.drop_front())
         extent = PhysicalExprAttr::get(kernel.getContext(),
-            static_cast<uint32_t>(PhysicalExprKind::Multiply), 0,
+            PhysicalExprKind::Multiply, 0,
             builder.getStringAttr(""),
             builder.getArrayAttr({extent, type.getShape()[axis]}));
       return extent;
@@ -1142,10 +1146,10 @@ static LogicalResult orientLoopContractionsImpl(ModuleOp module) {
     auto column = parameterForExtent(
         *kernel, cast<PhysicalExprAttr>(matrix.getShape()[1]));
     if (failed(row) || failed(column) ||
-        row->getParameter().getCategory() !=
-            static_cast<uint32_t>(ParameterCategory::RegionContraction) ||
-        column->getParameter().getRole() !=
-            static_cast<uint32_t>(ParameterRole::FullCoverage))
+        row->getCategory() !=
+            ParameterCategory::RegionContraction ||
+        column->getRole() !=
+            ParameterRole::FullCoverage)
       continue;
     llvm::DenseSet<Value> visited;
     ContractOp carriedContract;
@@ -1210,10 +1214,10 @@ static LogicalResult orientLoopContractionsImpl(ModuleOp module) {
     Location location = loop.getLoc();
     Value four = builder.create<arith::ConstantIndexOp>(location, 4);
     Value quarter = binary(builder, location, builder.getIndexType(),
-                           column->getResult(), four,
+                           materializeParameter(builder, location, column->getReference()), four,
                            BinaryOperator::FloorDivide);
     Value rectangular = builder.create<CompareOp>(
-        location, builder.getI1Type(), row->getResult(), quarter,
+        location, builder.getI1Type(), materializeParameter(builder, location, row->getReference()), quarter,
         ComparePredicate::Le);
     auto choice = builder.create<scf::IfOp>(
         location, loop.getResultTypes(), rectangular, true);

@@ -1,6 +1,7 @@
 #include "Intent/Target/Triton/Serialization/Serializer.h"
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -36,7 +37,7 @@ std::string expressionString(gpu::PhysicalExprAttr expression) {
   static const gpu::PythonExpressionSyntax syntax{
       "", "min", "max", "", "triton.next_power_of_2", true};
   return gpu::pythonExpression(expression, syntax, [](gpu::PhysicalExprAttr leaf) {
-    return leaf.getSymbol().getValue().str();
+    return leaf.getSymbolName().getValue().str();
   });
 }
 
@@ -115,17 +116,17 @@ private:
     }
     for (const MetadataABI &metadata : metadataArguments)
       constexprValues.insert(kernel.getArgument(metadata.abi));
-    kernel.walk([&](gpu::ParameterOp parameter) {
-      auto schema = parameter.getParameter();
+    for (Attribute attribute : gpu::getParameterDeclarations(kernel)) {
+      auto schema = cast<gpu::ParameterAttr>(attribute);
       std::string name = schema.getName().getValue().str();
       argumentNames.insert(name);
-      if (parameter->hasAttr(gpu::coverageDimensionAttr))
+      if (schema.isDeferred())
         coverageNames.insert(name);
-    });
+    }
     kernel.walk([&](TensorDescriptorChoiceOp choice) {
       descriptorChoice = choice;
-      values[choice.getResult()] = choice.getConfigParameter().str();
-      argumentNames.insert(choice.getConfigParameter());
+      values[choice.getResult()] = choice.getConfigParameter().getName().getValue().str();
+      argumentNames.insert(choice.getConfigParameter().getName().getValue());
       argumentNames.insert(choice.getEligibilityArgument());
     });
     kernel.walk([&](TensorDescriptorAllocatorOp allocator) {
@@ -322,7 +323,7 @@ private:
     }
     if (auto parameter = dyn_cast<gpu::ParameterOp>(operation)) {
       values[parameter.getResult()] =
-          parameter.getParameter().getName().getValue().str();
+          parameter.getReference().getName().getValue().str();
       constexprValues.insert(parameter.getResult());
       return;
     }
@@ -773,7 +774,7 @@ private:
         values[argument] = name;
       auto unroll = loop->getAttrOfType<IntegerAttr>(
           "intent_gpu.triton.loop_unroll_factor");
-      auto stages = loop->getAttrOfType<gpu::ParameterAttr>(loopStagesAttr);
+      auto stages = loop->getAttrOfType<gpu::ParameterRefAttr>(loopStagesAttr);
       std::string range = unroll || stages ? "tl.range(" : "range(";
       range += valueString(loop.getLowerBound()) + ", " +
                valueString(loop.getUpperBound()) + ", " +
@@ -1230,7 +1231,7 @@ private:
 
   bool isConstexprExpression(gpu::PhysicalExprAttr expression) {
     if (expression.getKind() ==
-        static_cast<uint32_t>(gpu::PhysicalExprKind::ScalarABI))
+        gpu::PhysicalExprKind::ScalarABI)
       return false;
     return llvm::all_of(expression.getOperands(), [&](Attribute operand) {
       return isConstexprExpression(cast<gpu::PhysicalExprAttr>(operand));
@@ -1347,7 +1348,7 @@ private:
     details["descriptor_choice"] = nullptr;
     if (descriptorChoice) {
       details["descriptor_choice"] = llvm::json::Object{
-          {"config", descriptorChoice.getConfigParameter()},
+          {"config", descriptorChoice.getConfigParameter().getName().getValue()},
           {"eligibility", descriptorChoice.getEligibilityArgument()}};
       arguments.push_back(descriptorChoice.getEligibilityArgument());
       key.push_back(descriptorChoice.getEligibilityArgument());

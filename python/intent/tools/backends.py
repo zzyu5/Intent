@@ -13,6 +13,12 @@ BACKENDS = {
         "torch_index": "https://download.pytorch.org/whl/cu130",
         "python_max": (3, 12), "toolchain": "NVIDIA driver and the CUDA tile compiler",
     },
+    "tilelang": {
+        "target": "TileLangTarget", "modules": ("torch", "tilelang"),
+        "requirements": None, "torch": "2.10.0",
+        "torch_index": "https://download.pytorch.org/whl/cu130",
+        "python_max": (3, 12), "toolchain": "An explicitly installed TileLang compiler and CUDA runtime",
+    },
     "mojo": {
         "target": "MojoTarget", "modules": ("torch",),
         "requirements": None, "torch": "2.10.0",
@@ -38,7 +44,12 @@ def backend(name: str) -> dict:
     return BACKENDS[name]
 
 
-def make_target(name: str, options: dict):
+def make_target(name: str, options: dict, *, facts: dict | None = None):
     import intent
+    from intent.targets.specification import read_compilation_target
 
+    if facts is not None:
+        if options:
+            raise ValueError("explicit compiler facts do not accept local runtime target options")
+        return read_compilation_target(name, facts)
     return getattr(intent, backend(name)["target"])(**options)

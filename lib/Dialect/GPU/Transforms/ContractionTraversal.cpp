@@ -185,7 +185,7 @@ FailureOr<bool> realizeSegmentNativeReduction(ContractOp contract,
       contract.getRhsReductionAxes().size() != 1)
     return false;
   auto segmentParameter = [&](Value operand,
-                              int64_t axis) -> FailureOr<ParameterOp> {
+                              int64_t axis) -> FailureOr<ParameterAttr> {
     auto fragment = dyn_cast<FragmentType>(operand.getType());
     if (!fragment || axis < 0 ||
         axis >= static_cast<int64_t>(fragment.getShape().size()))
@@ -193,9 +193,9 @@ FailureOr<bool> realizeSegmentNativeReduction(ContractOp contract,
     auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
     return regionContractionParameter(kernel, extent);
   };
-  FailureOr<ParameterOp> lhsSegment = segmentParameter(
+  FailureOr<ParameterAttr> lhsSegment = segmentParameter(
       contract.getLhs(), contract.getLhsReductionAxes().front());
-  FailureOr<ParameterOp> rhsSegment = segmentParameter(
+  FailureOr<ParameterAttr> rhsSegment = segmentParameter(
       contract.getRhs(), contract.getRhsReductionAxes().front());
   if (failed(lhsSegment) || failed(rhsSegment) ||
       *lhsSegment != *rhsSegment)
@@ -203,7 +203,7 @@ FailureOr<bool> realizeSegmentNativeReduction(ContractOp contract,
   scf::ForOp segmentLoop =
       enclosingRegionContractionSegment(contract.getOperation());
   if (segmentLoop &&
-      segmentLoop.getStep().getDefiningOp<ParameterOp>() != *lhsSegment)
+      queryParameter(segmentLoop.getStep()) != *lhsSegment)
     return contract.emitOpError(
                "reduction extent disagrees with its enclosing region-contraction segment"),
            failure();
@@ -230,10 +230,10 @@ FailureOr<bool> realizeStructuredNativeReduction(
     auto parameter = parameterForExtent(
         kernel, cast<PhysicalExprAttr>(type.getShape()[axis]));
     fullReduction &= succeeded(parameter) &&
-        parameter->getParameter().getRole() ==
-            static_cast<uint32_t>(ParameterRole::FullCoverage) &&
-        parameter->getParameter().getCategory() ==
-            static_cast<uint32_t>(ParameterCategory::Coverage);
+        parameter->getRole() ==
+            ParameterRole::FullCoverage &&
+        parameter->getCategory() ==
+            ParameterCategory::Coverage;
     auto mapping = cast<AxisMapAttr>(type.getAxisMaps()[axis]);
     retainedSource |= !analysis.replayability(
         operand, sourceAxisIdentity(mapping), PhysicalReplayScope::ValueGraph,
@@ -251,7 +251,7 @@ FailureOr<bool> realizeStructuredNativeReduction(
     return false;
   struct SegmentFact {
     bool present = false;
-    ParameterOp parameter;
+    ParameterAttr parameter;
     std::optional<PhysicalSourceAxis> source;
   };
   auto operandSegment = [&](Value operand,
@@ -265,7 +265,7 @@ FailureOr<bool> realizeStructuredNativeReduction(
       if (llvm::is_contained(reductionAxes, static_cast<int64_t>(axis)))
         continue;
       auto extent = cast<PhysicalExprAttr>(attribute);
-      FailureOr<ParameterOp> parameter =
+      FailureOr<ParameterAttr> parameter =
           regionContractionParameter(kernel, extent);
       PhysicalRangeFact ranges = analysis.axisRanges(operand, axis);
       bool subregion = llvm::any_of(ranges.roots, [](MakeRangeOp range) {
@@ -313,7 +313,7 @@ FailureOr<bool> realizeStructuredNativeReduction(
     return false;
   scf::ForOp segmentLoop =
       enclosingRegionContractionSegment(contract.getOperation());
-  if (segmentLoop && segmentLoop.getStep().getDefiningOp<ParameterOp>() !=
+  if (segmentLoop && queryParameter(segmentLoop.getStep()) !=
                          segment.parameter)
     return contract.emitOpError(
                "operand extent disagrees with its enclosing region-contraction segment"),
@@ -485,24 +485,26 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
       ("_" + Twine(lhsMap->getSourceId()) + "_" +
        Twine(rhsMap->getSourceId()))
           .str();
-  ParameterOp blockK = getOrCreatePhysicalParameter(
+  auto blockKRef = getOrCreatePhysicalParameter(
       kernel, "BLOCK_K" + suffix, ParameterRole::Reduction,
       ParameterCategory::Contraction,
       lhsType.getElementType().getIntOrFloatBitWidth(),
       contractionReductionCandidates);
-  if (!blockK)
+  if (failed(blockKRef))
     return failure();
+  ParameterAttr blockK = lookupParameter(kernel, *blockKRef);
   FailureOr<int64_t> lhsDimension = queryRangeDimension(lhsRange);
   FailureOr<int64_t> rhsDimension = queryRangeDimension(rhsRange);
   if (succeeded(lhsDimension) && succeeded(rhsDimension) &&
       *lhsDimension == *rhsDimension)
-    blockK->setAttr(
-        dimensionAttr,
-        IntegerAttr::get(IntegerType::get(kernel.getContext(), 64),
-                         *lhsDimension));
+    if (failed(updateParameter(kernel, blockK.withBinding(blockK.getBinding().withDimension(
+            IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), *lhsDimension))))))
+      return failure();
+  OpBuilder parameterBuilder(&kernel.front(), kernel.front().begin());
+  Value blockKValue = materializeParameter(parameterBuilder, contract.getLoc(), *blockKRef);
   MLIRContext *context = kernel.getContext();
   PhysicalExprAttr unitK = parameterExpression(
-      context, blockK.getParameter().getName().getValue());
+      context, blockK.getName().getValue());
   auto lhsIndexType = fragmentType(
       context, IndexType::get(context), {unitK},
       {cast<AxisMapAttr>(lhsRange.getResult().getType().getAxisMaps()[0])},
@@ -518,12 +520,12 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
   bool bodyFailed = false;
   SmallVector<ContractOp> nativeProducts;
   auto loop = builder.create<scf::ForOp>(
-      location, lhsRange.getLogicalStart(), logicalEnd, blockK.getResult(),
+      location, lhsRange.getLogicalStart(), logicalEnd, blockKValue,
       ValueRange{contract.getAccumulator()},
       [&](OpBuilder &nested, Location nestedLocation, Value kStart,
           ValueRange carries) {
         Value lhsK = nested.create<MakeRangeOp>(
-            nestedLocation, lhsIndexType, kStart, blockK.getResult(), one,
+            nestedLocation, lhsIndexType, kStart, blockKValue, one,
             lhsRange.getLogicalStart(), lhsRange.getLogicalStop(),
             lhsRange.getSourceId(), lhsRange.getSourceAxis(),
             lhsRange.getDerived());
@@ -535,7 +537,7 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
             nested, nestedLocation, nested.getIndexType(),
             rhsRange.getLogicalStart(), rhsOffset, BinaryOperator::Add);
         Value rhsK = nested.create<MakeRangeOp>(
-            nestedLocation, rhsIndexType, rhsStart, blockK.getResult(), one,
+            nestedLocation, rhsIndexType, rhsStart, blockKValue, one,
             rhsRange.getLogicalStart(), rhsRange.getLogicalStop(),
             rhsRange.getSourceId(), rhsRange.getSourceAxis(),
             rhsRange.getDerived());
@@ -614,10 +616,10 @@ FailureOr<bool> realizeFullResultTraversal(
     auto extent = cast<PhysicalExprAttr>(attribute);
     auto width = constantPhysicalExpression(extent);
     if (!width && extent.getKind() ==
-                      static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
+                      PhysicalExprKind::Parameter) {
       auto parameter = parameterForExtent(kernel, extent);
       if (succeeded(parameter)) {
-        auto candidates = (*parameter).getParameter().getCandidates().asArrayRef();
+        auto candidates = (*parameter).getCandidates().asArrayRef();
         if (!candidates.empty())
           width = *std::min_element(candidates.begin(), candidates.end());
       }
@@ -639,7 +641,7 @@ FailureOr<bool> realizeFullResultTraversal(
   auto needsTraversal = [&](PhysicalExprAttr extent) {
     return isFullCoverageExtent(contract, extent) ||
            (largeRetainedResult && extent.getKind() ==
-                                      static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                                      PhysicalExprKind::Constant &&
             extent.getValue() > 1);
   };
   if (llvm::none_of(resultType.getShape(), [&](Attribute extent) {
@@ -673,12 +675,12 @@ FailureOr<bool> realizeFullResultTraversal(
                 traversal.isExact()
             ? FailureOr<MakeRangeOp>(traversal.authority)
             : FailureOr<MakeRangeOp>(failure());
-    FailureOr<ParameterOp> fullParameter = parameterForExtent(kernel, fullExtent);
+    FailureOr<ParameterAttr> fullParameter = parameterForExtent(kernel, fullExtent);
     FailureOr<AxisMapAttr> axisMap =
         queryAxisMap(selected.first->get().getType(), selected.second);
     if (failed(authority) || failed(axisMap) ||
         (failed(fullParameter) && fullExtent.getKind() !=
-                                     static_cast<uint32_t>(PhysicalExprKind::Constant)) ||
+                                     PhysicalExprKind::Constant) ||
         !fact.unitStep ||
         !samePhysicalScalarExpression((*authority).getStart(),
                                       (*authority).getLogicalStart()))
@@ -702,19 +704,22 @@ FailureOr<bool> realizeFullResultTraversal(
             .str();
     Type inputElement = cast<FragmentType>(selected.first->get().getType())
                             .getElementType();
-    ParameterOp block = getOrCreatePhysicalParameter(
+    auto blockRef = getOrCreatePhysicalParameter(
         kernel, name,
         lhsAxis ? ParameterRole::OwnershipM : ParameterRole::OwnershipN,
         ParameterCategory::Contraction,
         inputElement.isIndex() ? 64 : inputElement.getIntOrFloatBitWidth(),
         {32, 64, 128, 256, 512});
-    if (!block)
+    if (failed(blockRef))
       return failure();
+    ParameterAttr block = lookupParameter(kernel, *blockRef);
     if (FailureOr<int64_t> dimension = queryRangeDimension(*authority);
         succeeded(dimension))
-      block->setAttr(dimensionAttr,
-                     IntegerAttr::get(IntegerType::get(kernel.getContext(), 64),
-                                      *dimension));
+      if (failed(updateParameter(kernel, block.withBinding(block.getBinding().withDimension(
+              IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), *dimension))))))
+        return failure();
+    OpBuilder parameterBuilder(&kernel.front(), kernel.front().begin());
+    Value blockValue = materializeParameter(parameterBuilder, contract.getLoc(), *blockRef);
     auto tileExtent = parameterExpression(kernel.getContext(), name);
     SmallVector<Attribute> tileShape(resultType.getShape().begin(),
                                      resultType.getShape().end());
@@ -745,7 +750,7 @@ FailureOr<bool> realizeFullResultTraversal(
     OpBuilder builder(contract);
     Location location = contract.getLoc();
     Value fullSize = succeeded(fullParameter)
-                         ? (*fullParameter).getResult()
+                         ? materializeParameter(builder, location, fullParameter->getReference()).getResult()
                          : Value(builder.create<arith::ConstantIndexOp>(
                                location, fullExtent.getValue()));
     Value fullRange = builder.create<MakeRangeOp>(
@@ -774,11 +779,11 @@ FailureOr<bool> realizeFullResultTraversal(
     // the traversal so its reduction can be blocked before using native MMA.
     if (!hasReductionSeed && !fullReductionNeedsTraversal(contract)) {
       Value covers = builder.create<CompareOp>(location, builder.getI1Type(),
-          fullSize, block.getResult(), ComparePredicate::Le);
+          fullSize, blockValue, ComparePredicate::Le);
       // Keep the full shapes reachable by the old equality branch. Domain
       // membership also preserves padding for undersized or non-native full
       // extents, without assuming a contiguous power-of-two candidate domain.
-      auto candidates = block.getParameter().getCandidates().asArrayRef();
+      auto candidates = block.getCandidates().asArrayRef();
       Value nativeExtent;
       if (auto fixed = constantPhysicalExpression(fullExtent)) {
         nativeExtent = builder.create<arith::ConstantIntOp>(
@@ -807,14 +812,14 @@ FailureOr<bool> realizeFullResultTraversal(
     // The operand and dot fragments retain their independent, bounded tiles.
     auto loop = builder.create<scf::ForOp>(
         location, (*authority).getLogicalStart(), (*authority).getLogicalStop(),
-        block.getResult(), ValueRange{contract.getAccumulator()},
+        blockValue, ValueRange{contract.getAccumulator()},
         [](OpBuilder &body, Location location, Value, ValueRange carries) {
           body.create<scf::YieldOp>(location, carries);
         });
     Operation *yield = loop.getBody()->getTerminator();
     OpBuilder nested(yield);
     Value tileRange = nested.create<MakeRangeOp>(
-        location, tileRangeType, loop.getInductionVar(), block.getResult(),
+        location, tileRangeType, loop.getInductionVar(), blockValue,
         (*authority).getStep(), (*authority).getLogicalStart(),
         (*authority).getLogicalStop(), axisMap->getSourceId(),
         axisMap->getSourceAxis(), axisMap->getDerived());
@@ -901,7 +906,7 @@ FailureOr<bool> realizeFullResultTraversal(
                          BinaryOperator::Subtract);
     Value zero = nested.create<arith::ConstantIndexOp>(location, 0);
     Value zeroes = nested.create<BroadcastOp>(location, indexType, zero);
-    Value width = nested.create<BroadcastOp>(location, indexType, block.getResult());
+    Value width = nested.create<BroadcastOp>(location, indexType, blockValue);
     Value stop = nested.create<BroadcastOp>(location, indexType,
                                            (*authority).getLogicalStop());
     Value lower = compare(nested, location, predicateType, local, zeroes,
@@ -1059,22 +1064,25 @@ LogicalResult realizeSparseReductionTraversal(SparseContractOp contract,
       ("_sparse_" + Twine(compressedMap->getSourceId()) + "_" +
        Twine(denseMap->getSourceId()))
           .str();
-  ParameterOp blockK = getOrCreatePhysicalParameter(
+  auto blockKRef = getOrCreatePhysicalParameter(
       kernel, "BLOCK_K" + suffix, ParameterRole::Reduction,
       ParameterCategory::Contraction,
       std::max(compressedType.getElementType().getIntOrFloatBitWidth(),
                rhsType.getElementType().getIntOrFloatBitWidth()),
       {32, 64, 128});
-  if (!blockK)
+  if (failed(blockKRef))
     return failure();
+  ParameterAttr blockK = lookupParameter(kernel, *blockKRef);
   if (FailureOr<int64_t> dimension = queryRangeDimension(denseRange);
       succeeded(dimension))
-    blockK->setAttr(
-        dimensionAttr,
-        IntegerAttr::get(IntegerType::get(context, 64), *dimension));
+    if (failed(updateParameter(kernel, blockK.withBinding(blockK.getBinding().withDimension(
+            IntegerAttr::get(IntegerType::get(context, 64), *dimension))))))
+      return failure();
+  OpBuilder parameterBuilder(&kernel.front(), kernel.front().begin());
+  Value blockKValue = materializeParameter(parameterBuilder, contract.getLoc(), *blockKRef);
 
   PhysicalExprAttr unitDenseK = parameterExpression(
-      context, blockK.getParameter().getName().getValue());
+      context, blockK.getName().getValue());
   PhysicalExprAttr two = expression(context, PhysicalExprKind::Constant, 2);
   PhysicalExprAttr group =
       expression(context, PhysicalExprKind::Constant, groupSize);
@@ -1105,7 +1113,7 @@ LogicalResult realizeSparseReductionTraversal(SparseContractOp contract,
   bool bodyFailed = false;
   auto loop = builder.create<scf::ForOp>(
       location, denseRange.getLogicalStart(), denseLogicalEnd,
-      blockK.getResult(), ValueRange{contract.getAccumulator()},
+      blockKValue, ValueRange{contract.getAccumulator()},
       [&](OpBuilder &nested, Location nestedLocation, Value denseStart,
           ValueRange carries) {
         Value denseOffset = binary(
@@ -1130,7 +1138,7 @@ LogicalResult realizeSparseReductionTraversal(SparseContractOp contract,
             compressedMap->getSourceAxis(), compressedMap->getDerived());
         inheritRangeAuthority(compressedK, compressedRange);
         Value denseK = nested.create<MakeRangeOp>(
-            nestedLocation, denseIndexType, denseStart, blockK.getResult(), one,
+            nestedLocation, denseIndexType, denseStart, blockKValue, one,
             denseRange.getLogicalStart(), denseRange.getLogicalStop(),
             denseMap->getSourceId(), denseMap->getSourceAxis(),
             denseMap->getDerived());

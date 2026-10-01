@@ -195,7 +195,7 @@ FailureOr<Value> gatherBounds(OpBuilder &builder, Location location,
   for (auto [coordinate, axis] : llvm::zip(coordinates, axes)) {
     auto projected = projectPhysicalValueToSchema(builder, location, coordinate, indexType);
     auto extent = cast<PhysicalExprAttr>(source.getShape()[axis]);
-    Value bound = extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant)
+    Value bound = extent.getKind() == PhysicalExprKind::Constant
         ? Value(builder.create<arith::ConstantIndexOp>(location, extent.getValue()))
         : Value(builder.create<PhysicalExprOp>(location, builder.getIndexType(), extent));
     auto upper = projectPhysicalValueToSchema(builder, location, bound, indexType);
@@ -450,7 +450,7 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
         return llvm::all_of(axes, [&](int64_t axis) {
           auto extent = cast<PhysicalExprAttr>(type.getShape()[prefix + axis]);
           return extent.getKind() ==
-                     static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                     PhysicalExprKind::Constant &&
                  extent.getValue() == 1;
         });
       };
@@ -663,7 +663,7 @@ FailureOr<bool> composeReshapedGather(GatherOp gather) {
           std::pair{shaped, group.getResultAxes().asArrayRef()}})
       for (int64_t axis : axes) {
         auto extent = cast<PhysicalExprAttr>(type.getShape()[sourcePrefix + axis]);
-        if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+        if (extent.getKind() != PhysicalExprKind::Constant ||
             extent.getValue() <= 0)
           return false;
       }
@@ -699,7 +699,7 @@ FailureOr<bool> composeReshapedGather(GatherOp gather) {
   };
   auto extentValue = [&](Attribute attribute) -> Value {
     auto extent = cast<PhysicalExprAttr>(attribute);
-    if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant))
+    if (extent.getKind() == PhysicalExprKind::Constant)
       return builder.create<arith::ConstantIndexOp>(location, extent.getValue());
     return builder.create<PhysicalExprOp>(location, builder.getIndexType(), extent);
   };
@@ -896,7 +896,7 @@ FailureOr<bool> composePointwiseGather(GatherOp gather) {
   auto broadcastUnit = [&](Value operand, unsigned axis) {
     auto input = cast<FragmentType>(operand.getType());
     auto extent = cast<PhysicalExprAttr>(input.getShape()[axis]);
-    if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+    if (extent.getKind() != PhysicalExprKind::Constant ||
         extent.getValue() != 1)
       return false;
     PhysicalRangeFact ranges = analysis.axisRanges(operand, axis);
@@ -1037,7 +1037,7 @@ FailureOr<bool> composeReducedGather(GatherOp gather) {
     auto range = queryExactLogicalRange(analysis.axisRanges(reduce.getSources().front(), axis));
     auto extent = cast<PhysicalExprAttr>(input.getShape()[axis]);
     if (failed(range) ||
-        extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+        extent.getKind() != PhysicalExprKind::Constant ||
         extent.getValue() <= 0 ||
         constantLogicalRangeCardinality(*range) != extent.getValue())
       return false;
@@ -1649,7 +1649,7 @@ FailureOr<bool> composeIdentityFragmentGather(GatherOp gather) {
     auto expression = dyn_cast<PhysicalExprAttr>(extent);
     if (!expression ||
         expression.getKind() !=
-            static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+            PhysicalExprKind::Constant ||
         expression.getValue() != 1)
       return false;
   }
@@ -1680,7 +1680,7 @@ FailureOr<bool> composeReductionGathers(ReduceOp reduce) {
     return false;
   auto extent = cast<PhysicalExprAttr>(schema.getShape()[0]);
   int64_t size = extent.getValue();
-  if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+  if (extent.getKind() != PhysicalExprKind::Constant ||
       size <= 0 || (size & (size - 1)) != 0 ||
       size > std::numeric_limits<int64_t>::max() / 2)
     return false;
@@ -1736,7 +1736,7 @@ FailureOr<bool> composeReductionGathers(ReduceOp reduce) {
       return false;
   PhysicalExprAttr bound = queryNonNegativeIndexUpperBound(range.getStart());
   if (!bound ||
-      bound.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+      bound.getKind() != PhysicalExprKind::Constant ||
       bound.getValue() > size)
     return false;
 
@@ -1994,7 +1994,7 @@ bool hasNonUnitAxisSplit(ReshapeOp reshape) {
       for (int64_t axis : group.getResultAxes().asArrayRef()) {
         auto extent = cast<PhysicalExprAttr>(result.getShape()[axis]);
         if (extent.getKind() !=
-                static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+                PhysicalExprKind::Constant ||
             extent.getValue() != 1)
           return false;
       }
@@ -2002,7 +2002,7 @@ bool hasNonUnitAxisSplit(ReshapeOp reshape) {
       for (int64_t axis : group.getResultAxes().asArrayRef()) {
         auto extent = cast<PhysicalExprAttr>(result.getShape()[axis]);
         if (extent.getKind() !=
-                static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+                PhysicalExprKind::Constant ||
             extent.getValue() <= 1)
           return false;
       }
@@ -2119,7 +2119,7 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
         auto extent = cast<PhysicalExprAttr>(source.getShape()[axis]);
         PhysicalRangeFact ranges = analysis.axisRanges(sourceValue, axis);
         if (extent.getKind() !=
-                static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+                PhysicalExprKind::Constant ||
             extent.getValue() != 1 || !ranges.isExact() ||
             !llvm::all_of(ranges.roots, isProvablySingletonLogicalRange))
           return false;
@@ -2128,7 +2128,7 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
       for (int64_t axis : group.getResultAxes().asArrayRef()) {
         auto extent = cast<PhysicalExprAttr>(result.getShape()[axis]);
         if (extent.getKind() !=
-                static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+                PhysicalExprKind::Constant ||
             extent.getValue() != 1)
           return false;
       }
@@ -2184,7 +2184,7 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
       bool introducedUnit = fact.roots.empty() && realization.isExact() &&
                             !realization.constructionScalarSeed &&
                             cast<PhysicalExprAttr>(source.getShape()[axis]).getKind() ==
-                                static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                                PhysicalExprKind::Constant &&
                             cast<PhysicalExprAttr>(source.getShape()[axis]).getValue() == 1;
       if (fact.state != PhysicalFactState::Exact && !introducedUnit)
         return false;
@@ -2203,7 +2203,7 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
           cast<PhysicalExprAttr>(root.getResult().getType().getShape()[0]);
       bool covered = count &&
                      physical.getKind() ==
-                         static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                         PhysicalExprKind::Constant &&
                      physical.getValue() >= *count;
       auto realization = analysis.axisRealization(root.getResult(), 0);
       if (!covered &&
@@ -2218,7 +2218,7 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
     PhysicalExprAttr extent =
         count ? PhysicalExprAttr::get(
                     reshape.getContext(),
-                    static_cast<uint32_t>(PhysicalExprKind::Constant), *count,
+                    PhysicalExprKind::Constant, *count,
                     StringAttr::get(reshape.getContext(), ""),
                     ArrayAttr::get(reshape.getContext(), {}))
               : queryLaunchExpression(range.getLogicalStop());
@@ -2226,10 +2226,10 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
       return false;
     if (!count && !queryNonNegativeIndexUpperBound(range.getLogicalStop())) {
       auto zero = PhysicalExprAttr::get(
-          reshape.getContext(), static_cast<uint32_t>(PhysicalExprKind::Constant),
+          reshape.getContext(), PhysicalExprKind::Constant,
           0, StringAttr::get(reshape.getContext(), ""), ArrayAttr::get(reshape.getContext(), {}));
       extent = PhysicalExprAttr::get(
-          reshape.getContext(), static_cast<uint32_t>(PhysicalExprKind::Maximum),
+          reshape.getContext(), PhysicalExprKind::Maximum,
           0, StringAttr::get(reshape.getContext(), ""),
           ArrayAttr::get(reshape.getContext(), {extent, zero}));
     }
@@ -2254,7 +2254,7 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
       for (int64_t axis : group.getResultAxes().asArrayRef()) {
         auto part = cast<PhysicalExprAttr>(result.getShape()[axis]);
         if (part.getKind() !=
-                static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+                PhysicalExprKind::Constant ||
             part.getValue() <= 0 ||
             product > std::numeric_limits<int64_t>::max() / part.getValue())
           return false;
@@ -2264,7 +2264,7 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
       int64_t sourceProduct = 1;
       for (int64_t axis : axes) {
         auto part = cast<PhysicalExprAttr>(sourceExtents[axis]);
-        if (part.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+        if (part.getKind() != PhysicalExprKind::Constant ||
             part.getValue() <= 0 ||
             sourceProduct > std::numeric_limits<int64_t>::max() / part.getValue())
           return false;
@@ -2276,7 +2276,7 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
     }
     for (int64_t axis : axes.drop_front())
       extent = PhysicalExprAttr::get(reshape.getContext(),
-          static_cast<uint32_t>(PhysicalExprKind::Multiply), 0,
+          PhysicalExprKind::Multiply, 0,
           StringAttr::get(reshape.getContext(), ""),
           ArrayAttr::get(reshape.getContext(), {extent, sourceExtents[axis]}));
     resultExtents[resultAxis] = extent;
@@ -2340,7 +2340,7 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
   OpBuilder builder(reshape);
   auto materializeExtent = [&](PhysicalExprAttr extent) -> Value {
     if (extent.getKind() ==
-        static_cast<uint32_t>(PhysicalExprKind::Constant))
+        PhysicalExprKind::Constant)
       return builder.create<arith::ConstantIndexOp>(reshape.getLoc(),
                                                     extent.getValue());
     return builder.create<PhysicalExprOp>(reshape.getLoc(), builder.getIndexType(),
@@ -2402,7 +2402,7 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
         unsigned axis = group.getResultAxes()[0];
         SmallVector<Attribute> shape(resultRank,
             PhysicalExprAttr::get(result.getContext(),
-                static_cast<uint32_t>(PhysicalExprKind::Constant), 1,
+                PhysicalExprKind::Constant, 1,
                 builder.getStringAttr(""), builder.getArrayAttr({})));
         shape[axis] = root.getResult().getType().getShape()[0];
         SmallVector<Attribute> groups;
@@ -2539,7 +2539,7 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
       for (auto [axis, inputAxis] : llvm::enumerate(relation.targetToSource)) {
         auto extent = cast<PhysicalExprAttr>(source.getShape()[axis]);
         bool unit = extent.getKind() ==
-                        static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                        PhysicalExprKind::Constant &&
                     extent.getValue() == 1;
         if (inputAxis ? *inputAxis != axis : !unit)
           return false;
@@ -2714,7 +2714,7 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
         return llvm::all_of(axes, [&](int64_t axis) {
           auto extent = cast<PhysicalExprAttr>(type.getShape()[prefix + axis]);
           return extent.getKind() ==
-                     static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                     PhysicalExprKind::Constant &&
                  extent.getValue() == 1;
         });
       };
@@ -2861,7 +2861,7 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
       auto rangeType = inputRanges[sourceAxis].getResult().getType();
       SmallVector<Attribute> axisShape(input.getShape().size(),
           PhysicalExprAttr::get(store.getContext(),
-              static_cast<uint32_t>(PhysicalExprKind::Constant), 1,
+              PhysicalExprKind::Constant, 1,
               builder.getStringAttr(""), builder.getArrayAttr({})));
       axisShape[sourceAxis] = rangeType.getShape()[0];
       auto axisType = FragmentType::get(
@@ -3156,8 +3156,8 @@ LogicalResult materializeIndexedFragments(func::FuncOp kernel) {
       auto extent = cast<PhysicalExprAttr>(source.getShape()[sourceAxis]);
       PhysicalExprAttr bound = queryNonNegativeIndexUpperBound(coordinate);
       if (bound &&
-          bound.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-          extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          bound.getKind() == PhysicalExprKind::Constant &&
+          extent.getKind() == PhysicalExprKind::Constant &&
           bound.getValue() < extent.getValue())
         continue;
       if (failed(realizeFullCoverageDimension(kernel, gather.getSource(),

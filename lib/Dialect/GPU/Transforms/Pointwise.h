@@ -2,6 +2,8 @@
 #define INTENT_GPU_TRANSFORMS_POINTWISE_H
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
@@ -83,10 +85,10 @@ FailureOr<uint64_t> rangeDimension(MakeRangeOp range);
 bool hasAccessDependentSubregionBounds(func::FuncOp kernel, MakeRangeOp range);
 FailureOr<uint64_t> ownershipDimension(func::FuncOp kernel,
                                        MakeRangeOp range);
-FailureOr<ParameterOp> queryOwnershipBlockingParameter(func::FuncOp kernel,
+FailureOr<ParameterAttr> queryOwnershipBlockingParameter(func::FuncOp kernel,
                                                        MakeRangeOp range);
-FailureOr<Attribute> parameterAxis(ParameterOp parameter);
-PhysicalExprAttr fragmentExtent(ParameterOp parameter);
+FailureOr<Attribute> parameterAxis(ParameterAttr parameter);
+PhysicalExprAttr fragmentExtent(ParameterAttr parameter);
 LogicalResult bindStructurallyRequiredStaticFragments(func::FuncOp kernel);
 bool hasExactStaticFullCoverage(func::FuncOp kernel, Value source,
                                 uint64_t axis);
@@ -282,7 +284,7 @@ private:
   };
   SmallVector<RangeBinding> bindings;
   llvm::MapVector<Attribute, SmallVector<MakeRangeOp>> axes;
-  llvm::DenseMap<Attribute, ParameterOp> parameters;
+  llvm::DenseMap<Attribute, ParameterRefAttr> parameters;
   llvm::SmallDenseSet<Attribute> ownershipAxes;
   llvm::SmallDenseSet<Attribute> internalAxes;
   llvm::SmallDenseSet<uint64_t> partiallyCarriedStructuredDimensions;
@@ -291,7 +293,7 @@ private:
   llvm::SmallPtrSet<Operation *, 8> retainedCartesianRanges;
   llvm::SmallPtrSet<Operation *, 8> independentContractionRanges;
   llvm::DenseMap<Operation *, MakeRangeOp> occurrenceRoots;
-  llvm::DenseMap<Operation *, ParameterOp> occurrenceParameters;
+  llvm::DenseMap<Operation *, ParameterRefAttr> occurrenceParameters;
   llvm::SmallPtrSet<Operation *, 8> positionalOccurrences;
   llvm::SmallDenseSet<uint64_t> independentCartesianDimensions;
   llvm::SmallPtrSet<Operation *, 8> dependentResourceRanges;

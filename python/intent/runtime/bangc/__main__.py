@@ -5,7 +5,8 @@ import json
 from pathlib import Path
 
 from intent.targets.bangc import BangCTarget
-from . import DeviceBuffer, NativeProgram
+from intent.compiler.artifact import GeneratedProgram
+from . import DeviceBuffer
 
 
 def main() -> None:
@@ -16,11 +17,9 @@ def main() -> None:
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--neuware", default="/usr/local/neuware")
     args = parser.parse_args()
-    metadata = json.loads((args.artifact / "artifact.json").read_text())
-    target = BangCTarget(**{name: metadata[name] for name in
-        ("architecture", "tile", "tile_m", "tile_n", "tile_k", "region_tile", "tasks", "local_bytes")},
-        device=args.device, neuware=args.neuware).resolve()
-    program = NativeProgram((args.artifact / "kernel.mlu").read_text(), metadata, target)
+    generated = GeneratedProgram.load(args.artifact)
+    target = BangCTarget.from_program(generated, device=args.device, neuware=args.neuware)
+    program = generated.materialize(target=target).runtime
     buffers = []
     try:
         arguments = []

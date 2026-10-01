@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
@@ -86,7 +87,7 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
     PhysicalExprAttr expression = queryLaunchExpression(value);
     return expression &&
            expression.getKind() ==
-               static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+               PhysicalExprKind::Constant &&
            expression.getValue() == expected;
   };
   if (!isConstant(match.loop.getLowerBound(), 0) ||
@@ -175,9 +176,8 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
   auto mapping = cast<AxisMapAttr>(original.getAxisMaps()[0]);
   PhysicalSourceAxis source = sourceAxisIdentity(mapping);
   llvm::StringSet<> names;
-  kernel.walk([&](ParameterOp parameter) {
-    names.insert(parameter.getParameter().getName().getValue());
-  });
+  for (Attribute declaration : getParameterDeclarations(kernel))
+    names.insert(cast<ParameterAttr>(declaration).getName().getValue());
   std::string name = ("SCAN_CHUNK_S" + Twine(source.sourceId) + "_A" +
                       Twine(source.sourceAxis))
                          .str();
@@ -190,13 +190,16 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
       isa<IntegerType, IndexType>(element) && !element.isInteger(1) && zero &&
       zero.getValue().isZero() &&
       queryBinaryCombineKind(scan.getCombine()) == BinaryOperator::Add;
-  auto chunk = getOrCreatePhysicalParameter(
+  auto reference = getOrCreatePhysicalParameter(
       kernel, name, ParameterRole::ScanChunk, ParameterCategory::Scan,
       element.isIndex() ? 64 : element.getIntOrFloatBitWidth(),
-      {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192});
-  chunk->setAttr(parameterSourceAttr,
-                 PhysicalSourceAttr::get(kernel.getContext(), source.sourceId,
-                                         source.sourceAxis, source.derived));
+      {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192},
+      ParameterBindingAttr::get(kernel.getContext(), {},
+          PhysicalSourceAttr::get(kernel.getContext(), source.sourceId, source.sourceAxis, source.derived),
+          {}, {}, false, false));
+  if (failed(reference)) return failure();
+  OpBuilder entry(&kernel.front(), kernel.front().begin());
+  auto chunk = materializeParameter(entry, scan.getLoc(), *reference);
   PhysicalExprAttr extent = queryLaunchExpression(chunk);
   auto fragment = [&](Type element) {
     return FragmentType::get(kernel.getContext(), element,
@@ -365,7 +368,7 @@ FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
   auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
   if (!llvm::all_of(space, [](Attribute attribute) {
         auto extent = cast<PhysicalExprAttr>(attribute);
-        return extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+        return extent.getKind() == PhysicalExprKind::Constant &&
                extent.getValue() == 1;
       }))
     return false;
@@ -403,7 +406,7 @@ FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
     auto begin = queryLaunchExpression(range.getStart());
     auto logicalBegin = queryLaunchExpression(range.getLogicalStart());
     auto zero = [](PhysicalExprAttr value) {
-      return value && value.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+      return value && value.getKind() == PhysicalExprKind::Constant &&
              value.getValue() == 0;
     };
     if (!zero(begin) || !zero(logicalBegin) || !isUnitStepRange(range))
@@ -415,7 +418,7 @@ FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
   auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   Type element = type.getElementType();
   unsigned bits = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
-  if (stop.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+  if (stop.getKind() == PhysicalExprKind::Constant &&
       static_cast<__int128>(stop.getValue()) * ((bits + 31) / 32) <=
       capabilities.getRegistersPerUnit())
     return false;

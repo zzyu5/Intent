@@ -119,9 +119,9 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
       auto size = constantLogicalRangeCardinality(blocked);
       auto begin = queryLaunchExpression(blocked.getLogicalStart());
       if (retain && size && isUnitStepRange(blocked) &&
-          extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          extent.getKind() == PhysicalExprKind::Constant &&
           extent.getValue() == *size && begin &&
-          begin.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          begin.getKind() == PhysicalExprKind::Constant &&
           begin.getValue() == 0 && DominanceInfo(kernel).dominates(value, insertionAnchor)) {
         // Preserve split shapes and complete loop-carried reduction inputs.
         // Only the already-computed result is projected to the writeback tile.
@@ -643,20 +643,20 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
   std::string name = ("POINTWISE_CHUNK_S" + Twine(logicalSource.sourceId) +
                       "_A" + Twine(logicalSource.sourceAxis))
                          .str();
-  ParameterOp chunk;
+  ParameterAttr chunk;
   bool ambiguousChunk = false;
-  kernel.walk([&](ParameterOp parameter) {
-    auto source =
-        parameter->getAttrOfType<PhysicalSourceAttr>(parameterSourceAttr);
-    if (!parameter->hasAttr(pointwiseChunkAttr) || !source ||
+  for (Attribute declaration : getParameterDeclarations(kernel)) {
+    auto parameter = cast<ParameterAttr>(declaration);
+    auto source = parameter.getBinding().getSource();
+    if (!parameter.getBinding().getPointwiseChunk() || !source ||
         !(PhysicalSourceAxis{source.getSourceId(), source.getSourceAxis(),
                              source.getDerived()} == logicalSource))
-      return;
+      continue;
     if (chunk && chunk != parameter)
       ambiguousChunk = true;
     else
       chunk = parameter;
-  });
+  }
   if (ambiguousChunk)
     return range.emitOpError(
         "pointwise traversal has multiple parameters for one source axis");
@@ -682,17 +682,17 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
           "pointwise traversal has no typed data width for its physical parameter");
     OpBuilder entry(&kernel.getBody().front(), kernel.getBody().front().begin());
     auto schema = ParameterAttr::get(
-        kernel.getContext(), entry.getStringAttr(name),
-        static_cast<uint32_t>(ParameterRole::OwnershipN),
-        static_cast<uint32_t>(ParameterCategory::Pointwise), elementBitWidth,
-        DenseI64ArrayAttr::get(kernel.getContext(), candidates));
-    chunk = entry.create<ParameterOp>(range.getLoc(), entry.getIndexType(), schema);
-    chunk->setAttr(parameterSourceAttr,
-                   PhysicalSourceAttr::get(kernel.getContext(),
-                                           logicalSource.sourceId,
-                                           logicalSource.sourceAxis,
-                                           logicalSource.derived));
-    chunk->setAttr(pointwiseChunkAttr, entry.getUnitAttr());
+        kernel.getContext(), entry.getStringAttr(name), entry.getIndexType(),
+        ParameterRole::OwnershipN,
+        ParameterCategory::Pointwise, elementBitWidth,
+        DenseI64ArrayAttr::get(kernel.getContext(), candidates),
+        ConfigurationBindingPhase::Shared,
+        ParameterBindingAttr::get(kernel.getContext(), {},
+            PhysicalSourceAttr::get(kernel.getContext(), logicalSource.sourceId,
+                                   logicalSource.sourceAxis, logicalSource.derived),
+            {}, {}, true, false));
+    if (failed(declareParameter(kernel, schema))) return failure();
+    chunk = schema;
   }
 
   auto originalType = dyn_cast<FragmentType>(range.getResult().getType());
@@ -971,12 +971,12 @@ LogicalResult realizeOwnedHistograms(func::FuncOp kernel) {
         return histogram.emitOpError(
             "histogram output effects do not share one physical bin traversal");
     }
-    FailureOr<ParameterOp> outputParameter =
+    FailureOr<ParameterAttr> outputParameter =
         queryBlockingParameter(kernel, outputRange);
     if (failed(outputParameter))
       return histogram.emitOpError(
           "histogram output ownership has no typed blocking parameter");
-    ParameterAttr outputSchema = outputParameter->getParameter();
+    ParameterAttr outputSchema = *outputParameter;
     SmallVector<int64_t> outputCandidates(
         outputSchema.getCandidates().asArrayRef());
     if (auto bins = histogram.getBins().getDefiningOp<arith::ConstantIndexOp>())
@@ -985,13 +985,9 @@ LogicalResult realizeOwnedHistograms(func::FuncOp kernel) {
     if (outputCandidates.empty())
       return histogram.emitOpError(
           "histogram output ownership has no legal bin-tile candidate");
-    (*outputParameter)->setAttr(
-        "parameter",
-        ParameterAttr::get(
-            kernel.getContext(), outputSchema.getName(), outputSchema.getRole(),
-            outputSchema.getCategory(),
-            outputSchema.getElementBitWidth(),
-            DenseI64ArrayAttr::get(kernel.getContext(), outputCandidates)));
+    if (failed(updateParameter(kernel, outputSchema.withCandidates(
+            DenseI64ArrayAttr::get(kernel.getContext(), outputCandidates)))))
+      return failure();
 
     auto valuesType = dyn_cast<FragmentType>(histogram.getValues().getType());
     if (!valuesType || valuesType.getShape().size() != 1)
@@ -1014,16 +1010,16 @@ LogicalResult realizeOwnedHistograms(func::FuncOp kernel) {
          Twine(inputSource.sourceAxis) +
          (inputSource.derived ? "_DERIVED" : ""))
             .str();
-    ParameterOp chunk = getOrCreatePhysicalParameter(
+    auto chunk = getOrCreatePhysicalParameter(
         kernel, chunkName, ParameterRole::Reduction,
         ParameterCategory::Histogram,
         valuesType.getElementType().getIntOrFloatBitWidth(),
-        {256, 512, 1024, 2048, 4096, 8192, 16384, 32768});
-    if (!chunk)
+        {256, 512, 1024, 2048, 4096, 8192, 16384, 32768},
+        ParameterBindingAttr::get(kernel.getContext(),
+            IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), *inputDimension),
+            {}, {}, {}, false, false));
+    if (failed(chunk))
       return failure();
-    chunk->setAttr(dimensionAttr,
-                   IntegerAttr::get(IntegerType::get(kernel.getContext(), 64),
-                                    *inputDimension));
 
     PhysicalExprAttr chunkExtent = expression(
         kernel.getContext(), PhysicalExprKind::Parameter, 0, chunkName);
@@ -1050,7 +1046,8 @@ LogicalResult realizeOwnedHistograms(func::FuncOp kernel) {
     Value zero = builder.create<SplatOp>(histogram.getLoc(), *outputType,
                                          zeroScalar);
     Value loopStep = builder.create<BinaryOp>(
-        histogram.getLoc(), builder.getIndexType(), chunk.getResult(),
+        histogram.getLoc(), builder.getIndexType(),
+        materializeParameter(builder, histogram.getLoc(), *chunk),
         inputRange.getStep(), BinaryOperator::Multiply);
     bool bodyFailed = false;
     std::string failureReason;
@@ -1060,7 +1057,8 @@ LogicalResult realizeOwnedHistograms(func::FuncOp kernel) {
         [&](OpBuilder &nested, Location location, Value tileStart,
             ValueRange carries) {
           Value blocked = nested.create<MakeRangeOp>(
-              location, blockedInputType, tileStart, chunk.getResult(),
+              location, blockedInputType, tileStart,
+              materializeParameter(nested, location, *chunk),
               inputRange.getStep(), inputRange.getLogicalStart(),
               inputRange.getLogicalStop(), inputRange.getSourceId(),
               inputRange.getSourceAxis(), inputRange.getDerived());
@@ -1188,11 +1186,10 @@ LogicalResult PointwiseRewrite::selectWritebackCandidates(bool accountResourcePr
           PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true,
           store.getOperation(), *dimension);
       bool regionReduction = !replay.structuredPrograms.empty() &&
-          llvm::all_of(replay.structuredPrograms, [](Operation *operation) {
+          llvm::all_of(replay.structuredPrograms, [&](Operation *operation) {
             auto fold = dyn_cast<RegionFoldOp>(operation);
             return fold &&
-                   static_cast<ParameterCategory>(
-                       fold.getSegment().getCategory()) ==
+                   lookupParameter(kernel, fold.getSegment()).getCategory() ==
                        ParameterCategory::RegionReduction;
           });
       if (!replay.isReplayable() || !regionReduction)

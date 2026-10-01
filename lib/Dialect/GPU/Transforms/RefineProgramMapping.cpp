@@ -1,6 +1,7 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 
 #include "Intent/Dialect/GPU/IR/Program.h"
 
@@ -15,10 +16,10 @@ using namespace mlir;
 namespace intent::gpu {
 namespace {
 
-PhysicalExprAttr parameterExpression(MLIRContext *context, StringRef name) {
+PhysicalExprAttr parameterExpression(ParameterRefAttr reference) {
   return PhysicalExprAttr::get(
-      context, static_cast<uint32_t>(PhysicalExprKind::Parameter), 0,
-      StringAttr::get(context, name), ArrayAttr::get(context, {}));
+      reference.getContext(), PhysicalExprKind::Parameter, 0,
+      reference, ArrayAttr::get(reference.getContext(), {}));
 }
 
 void preserveBoundedTileOrigins(func::FuncOp kernel, DelinearizeOp mapping) {
@@ -31,7 +32,7 @@ void preserveBoundedTileOrigins(func::FuncOp kernel, DelinearizeOp mapping) {
     auto block = range.getExtent().getDefiningOp<ParameterOp>();
     FailureOr<int64_t> dimension = queryRangeDimension(range);
     if (!startValue || startValue.getInt() != 0 || !block || failed(dimension) ||
-        llvm::any_of(block.getParameter().getCandidates().asArrayRef(),
+        llvm::any_of(block.getDeclaration().getCandidates().asArrayRef(),
                      [](int64_t value) { return value <= 0; }))
       return;
     for (auto [axis, coordinate] : llvm::enumerate(mapping.getCoordinates())) {
@@ -44,8 +45,8 @@ void preserveBoundedTileOrigins(func::FuncOp kernel, DelinearizeOp mapping) {
         continue;
       auto divisor = dyn_cast<PhysicalExprAttr>(extent.getOperands()[1]);
       if (!divisor || divisor.getKind() !=
-                          static_cast<uint32_t>(PhysicalExprKind::Parameter) ||
-          divisor.getSymbol() != block.getParameter().getName())
+                          PhysicalExprKind::Parameter ||
+          divisor.getSymbolName() != block.getDeclaration().getName())
         continue;
       for (Operation *user : coordinate.getUsers()) {
         auto product = dyn_cast<BinaryOp>(user);
@@ -99,14 +100,10 @@ LogicalResult realizeGroupedContractionMapping(
 
   OpBuilder parameterBuilder(&kernel.getBody().front(),
                              kernel.getBody().front().begin());
-  auto schema = ParameterAttr::get(
-      module.getContext(), parameterBuilder.getStringAttr("GROUP_SIZE_M"),
-      static_cast<uint32_t>(ParameterRole::TraversalGroup),
-      static_cast<uint32_t>(ParameterCategory::Execution),
-      /*elementBitWidth=*/0,
-      DenseI64ArrayAttr::get(module.getContext(), {1, 2, 4, 8}));
-  Value groupSize = parameterBuilder.create<ParameterOp>(
-      mapping.getLoc(), parameterBuilder.getIndexType(), schema);
+  auto group = getOrCreatePhysicalParameter(kernel, "GROUP_SIZE_M",
+      ParameterRole::TraversalGroup, ParameterCategory::Execution, 0, {1, 2, 4, 8});
+  if (failed(group)) return failure();
+  Value groupSize = materializeParameter(parameterBuilder, mapping.getLoc(), *group);
 
   OpBuilder builder(mapping);
   builder.setInsertionPointAfter(mapping);
@@ -122,8 +119,8 @@ LogicalResult realizeGroupedContractionMapping(
   Value columnCount = mapping.getExtents()[*columnAxis];
   Value row = mapping.getCoordinates()[*rowAxis];
   Value column = mapping.getCoordinates()[*columnAxis];
-  Value group = binary(row, groupSize, BinaryOperator::FloorDivide);
-  Value firstRow = binary(group, groupSize, BinaryOperator::Multiply);
+  Value groupIndex = binary(row, groupSize, BinaryOperator::FloorDivide);
+  Value firstRow = binary(groupIndex, groupSize, BinaryOperator::Multiply);
   Value liveRows = binary(rowCount, firstRow, BinaryOperator::Subtract);
   Value activeGroupSize =
       binary(liveRows, groupSize, BinaryOperator::MinimumNum);
@@ -202,7 +199,7 @@ LogicalResult refineProgramMapping(ModuleOp module) {
   if (!programSpace || programSpace.size() != 1 || !segmentOffset ||
       !segmentLength ||
       segmentOffset.getKind() !=
-          static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+          PhysicalExprKind::Constant ||
       segmentOffset.getValue() != 0 || programSpace[0] != segmentLength)
     return mapping.emitOpError(
         "persistent traversal requires one full-program execution segment");
@@ -211,8 +208,8 @@ LogicalResult refineProgramMapping(ModuleOp module) {
     auto parameter =
         mapping.getExtents()[axis].getDefiningOp<ParameterOp>();
     if (!parameter ||
-        parameter.getParameter().getRole() !=
-            static_cast<uint32_t>(ParameterRole::TraversalWorkers))
+        parameter.getDeclaration().getRole() !=
+            ParameterRole::TraversalWorkers)
       return mapping.emitOpError(
           "traversal-worker coordinate lacks its physical parameter");
   }
@@ -225,15 +222,10 @@ LogicalResult refineProgramMapping(ModuleOp module) {
   int64_t residentCount = capabilities.getComputeUnits();
   OpBuilder parameterBuilder(&kernel.getBody().front(),
                              kernel.getBody().front().begin());
-  auto residentSchema = ParameterAttr::get(
-      module.getContext(),
-      parameterBuilder.getStringAttr("RESIDENT_WORKERS"),
-      static_cast<uint32_t>(ParameterRole::ResidentWorkers),
-      static_cast<uint32_t>(ParameterCategory::Execution),
-      /*elementBitWidth=*/0,
-      DenseI64ArrayAttr::get(module.getContext(), {residentCount}));
-  auto residentWorkers = parameterBuilder.create<ParameterOp>(
-      mapping.getLoc(), parameterBuilder.getIndexType(), residentSchema);
+  auto resident = getOrCreatePhysicalParameter(kernel, "RESIDENT_WORKERS",
+      ParameterRole::ResidentWorkers, ParameterCategory::Execution, 0, {residentCount});
+  if (failed(resident)) return failure();
+  auto residentWorkers = materializeParameter(parameterBuilder, mapping.getLoc(), *resident);
 
   SmallVector<Operation *> taskBody;
   for (Operation *operation = mapping.getOperation();
@@ -259,10 +251,9 @@ LogicalResult refineProgramMapping(ModuleOp module) {
   for (Operation *operation : taskBody)
     operation->moveBefore(yield);
 
-  PhysicalExprAttr residentExtent = parameterExpression(
-      module.getContext(), residentSchema.getName().getValue());
+  PhysicalExprAttr residentExtent = parameterExpression(*resident);
   auto boundedResidentExtent = PhysicalExprAttr::get(
-      module.getContext(), static_cast<uint32_t>(PhysicalExprKind::Minimum), 0,
+      module.getContext(), PhysicalExprKind::Minimum, 0,
       StringAttr::get(module.getContext()),
       ArrayAttr::get(module.getContext(), {segmentLength, residentExtent}));
   kernel->setAttr(programSpaceAttr,

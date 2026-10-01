@@ -69,7 +69,7 @@ void PointwiseRewrite::filterOwnershipRanges() {
     bool launchParent = succeeded(parent) && !hasAccessDependentSubregionBounds(kernel, range) &&
                         succeeded(dimensionArgument(kernel, static_cast<uint64_t>(*parent)));
     return range->hasAttr(sourceSubregionAttr) &&
-           extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) && !launchParent;
+           extent.getKind() == PhysicalExprKind::Constant && !launchParent;
   });
 }
 
@@ -132,7 +132,7 @@ LogicalResult PointwiseRewrite::ownership() {
   selectRanges([](MakeRangeOp range, PhysicalExprAttr extent) {
     return range.getExtent().getDefiningOp<arith::ConstantIndexOp>() &&
            (range->hasAttr(worksetCoordinateRangeAttr) ||
-            (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) && extent.getValue() > 1));
+            (extent.getKind() == PhysicalExprKind::Constant && extent.getValue() > 1));
   });
   if (failed(selectWritebackCandidates(false))) return failure();
   filterOwnershipRanges();
@@ -189,13 +189,13 @@ LogicalResult PointwiseRewrite::bindAxes() {
         internalAxes.insert(dimensionAxisKey(module.getContext(), *dimension));
       continue;
     }
-    FailureOr<ParameterOp> parameter =
+    FailureOr<ParameterAttr> parameter =
         queryOwnershipBlockingParameter(kernel, range);
     MakeRangeOp occurrenceRoot = occurrenceRoots.lookup(range.getOperation());
     if (occurrenceRoot) {
-      ParameterOp selected = occurrenceParameters.lookup(occurrenceRoot.getOperation());
+      ParameterAttr selected = lookupParameter(kernel, occurrenceParameters.lookup(occurrenceRoot.getOperation()));
       if (!selected) {
-        FailureOr<ParameterOp> existing =
+        FailureOr<ParameterAttr> existing =
             queryOwnershipBlockingParameter(kernel, occurrenceRoot);
         if (succeeded(existing)) {
           PhysicalParameterBinding binding = queryParameterBinding(*existing);
@@ -214,14 +214,14 @@ LogicalResult PointwiseRewrite::bindAxes() {
             selected = *existing;
         }
       }
-      parameter = selected ? FailureOr<ParameterOp>(selected)
-                           : FailureOr<ParameterOp>(failure());
+      parameter = selected ? FailureOr<ParameterAttr>(selected)
+                           : FailureOr<ParameterAttr>(failure());
     }
     bool requiresBlockingParameter = request.requiresTile;
     if (requiresBlockingParameter && succeeded(parameter) &&
-        (parameter->getParameter().getCategory() ==
-             static_cast<uint32_t>(ParameterCategory::Coverage) ||
-         (*parameter)->hasAttr(coverageDimensionAttr)))
+        (parameter->getCategory() ==
+             ParameterCategory::Coverage ||
+         parameter->isDeferred()))
       parameter = failure();
     if (failed(parameter) && requiresBlockingParameter) {
       const bool worksetRange = range->hasAttr(worksetCoordinateRangeAttr);
@@ -264,7 +264,7 @@ LogicalResult PointwiseRewrite::bindAxes() {
       if (dynamicSubregion ||
           launchVisibleExtent ||
           (logicalExtent && physicalExtent.getKind() ==
-                                static_cast<uint32_t>(PhysicalExprKind::Constant))) {
+                                PhysicalExprKind::Constant)) {
         SmallVector<int64_t> candidates;
         if (worksetRange ? logicalExtent && logicalExtent.getInt() == 1
                          : isProvablySingletonLogicalRange(range)) {
@@ -304,21 +304,22 @@ LogicalResult PointwiseRewrite::bindAxes() {
                                             .str()
                                       : ("FRAGMENT_S" + Twine(source.sourceId) +
                                          "_A" + Twine(source.sourceAxis))
-                                            .str()),
-            static_cast<uint32_t>(ParameterRole::OwnershipN),
-            static_cast<uint32_t>(category),
+                                            .str()), builder.getIndexType(),
+            ParameterRole::OwnershipN,
+            category,
             pointwiseElementBitWidth,
-            DenseI64ArrayAttr::get(module.getContext(), candidates));
-        parameter = builder.create<ParameterOp>(
-            range.getLoc(), builder.getIndexType(), schema);
-        if (succeeded(sourceDimension))
-          (*parameter)->setAttr(dimensionAttr,
-                                builder.getI64IntegerAttr(*sourceDimension));
-        if (!launchVisibleDimension || occurrenceRoot)
-          (*parameter)->setAttr(
-              parameterSourceAttr,
-              PhysicalSourceAttr::get(module.getContext(), source.sourceId,
-                                      source.sourceAxis, source.derived));
+            DenseI64ArrayAttr::get(module.getContext(), candidates),
+            ConfigurationBindingPhase::Shared,
+            ParameterBindingAttr::get(
+                module.getContext(), succeeded(sourceDimension)
+                    ? builder.getI64IntegerAttr(*sourceDimension) : IntegerAttr(),
+                !launchVisibleDimension || occurrenceRoot
+                    ? PhysicalSourceAttr::get(module.getContext(), source.sourceId,
+                                              source.sourceAxis, source.derived)
+                    : PhysicalSourceAttr(),
+                {}, {}, false, false));
+        if (failed(declareParameter(kernel, schema))) return failure();
+        parameter = schema;
       }
     }
     FailureOr<Attribute> axis =
@@ -331,11 +332,11 @@ LogicalResult PointwiseRewrite::bindAxes() {
                  << range.getResult().getType();
       if (succeeded(parameter))
         diagnostic << ", parameter="
-                   << parameter->getParameter().getName().getValue();
+                   << parameter->getName().getValue();
       return failure();
     }
     if (occurrenceRoot)
-      occurrenceParameters[occurrenceRoot.getOperation()] = *parameter;
+      occurrenceParameters[occurrenceRoot.getOperation()] = parameter->getReference();
     // Repeated Cartesian axes use their proven occurrence classes. A unique
     // logical dimension can still bind connected pointwise values, while a
     // range-local source retains its own traversal relation.
@@ -353,13 +354,13 @@ LogicalResult PointwiseRewrite::bindAxes() {
     else
       return range.emitOpError("blocking parameter has no typed axis binding");
     auto found = parameters.find(*axis);
-    if (found != parameters.end() && found->second != *parameter)
+    if (found != parameters.end() && found->second != parameter->getReference())
       return range.emitOpError("one physical axis has multiple blocking parameters")
              << "; axis=" << *axis << ", previous="
-             << found->second.getParameter().getName().getValue()
-             << ", current=" << parameter->getParameter().getName().getValue()
+             << found->second.getName().getValue()
+             << ", current=" << parameter->getName().getValue()
              << ", source_id=" << range.getSourceId();
-    parameters[*axis] = *parameter;
+    parameters[*axis] = parameter->getReference();
     axes[*axis].push_back(range);
     if (internalTraversalRanges.contains(range.getOperation()))
       internalAxes.insert(*axis);
@@ -372,9 +373,9 @@ LogicalResult PointwiseRewrite::materializeRanges() {
   llvm::DenseMap<Value, Value> rangePredicates;
   for (MakeRangeOp range : dynamicRanges) {
     OpBuilder builder(range);
-    FailureOr<ParameterOp> parameter = queryBlockingParameter(kernel, range);
+    FailureOr<ParameterAttr> parameter = queryBlockingParameter(kernel, range);
     if (MakeRangeOp root = occurrenceRoots.lookup(range.getOperation()))
-      if (ParameterOp selected = occurrenceParameters.lookup(root.getOperation()))
+      if (ParameterAttr selected = lookupParameter(kernel, occurrenceParameters.lookup(root.getOperation())))
         parameter = selected;
     FailureOr<Attribute> axisKey =
         failed(parameter) ? FailureOr<Attribute>(failure())
@@ -395,7 +396,7 @@ LogicalResult PointwiseRewrite::materializeRanges() {
     // places on the program grid.
     if (!tileCoordinate &&
         (internalAxes.contains(*axisKey) ||
-         (*parameter)->hasAttr(coverageDimensionAttr)))
+         parameter->isDeferred()))
       tileCoordinate = builder.create<arith::ConstantIndexOp>(range.getLoc(), 0);
     if (!tileCoordinate)
       return range.emitOpError(
@@ -405,14 +406,15 @@ LogicalResult PointwiseRewrite::materializeRanges() {
              << ", ownership=" << ownershipAxes.contains(*axisKey)
              << ", internal=" << internalAxes.contains(*axisKey)
              << ", parameter_name="
-             << (*parameter).getParameter().getName().getValue()
-             << ", parameter_role=" << (*parameter).getParameter().getRole()
+             << (*parameter).getName().getValue()
+             << ", parameter_role=" << stringifyParameterRole(parameter->getRole())
              << ", has_coverage="
-             << (*parameter)->hasAttr(coverageDimensionAttr)
+             << parameter->isDeferred()
              << ", launch_extents=" << mapping->getAttr("launch_extents");
     Value tileOffset = builder.create<BinaryOp>(
         range.getLoc(), builder.getIndexType(), tileCoordinate,
-        parameter->getResult(), BinaryOperator::Multiply);
+        materializeParameter(builder, range.getLoc(), parameter->getReference()),
+        BinaryOperator::Multiply);
     Value start;
     Value end;
     if (range->hasAttr(worksetCoordinateRangeAttr)) {
@@ -434,7 +436,7 @@ LogicalResult PointwiseRewrite::materializeRanges() {
                    "workset coordinate range lost its logical dimension extent")
                << "; axis=" << *axisKey << ", source_id="
                << range.getSourceId() << ", parameter="
-               << parameter->getParameter().getName().getValue();
+               << parameter->getName().getValue();
       Value remaining = builder.create<BinaryOp>(
           range.getLoc(), builder.getIndexType(), dimension, tileOffset,
           BinaryOperator::Subtract);
@@ -472,9 +474,9 @@ LogicalResult PointwiseRewrite::materializeRanges() {
                              tileExtent);
       sourceType = cast<FragmentType>(range.getResult().getType());
     }
-    Value physicalExtent = parameter->getResult();
+    Value physicalExtent = materializeParameter(builder, range.getLoc(), parameter->getReference());
     if (tileExtent.getKind() ==
-        static_cast<uint32_t>(PhysicalExprKind::Constant))
+        PhysicalExprKind::Constant)
       physicalExtent = builder.create<arith::ConstantIndexOp>(
           range.getLoc(), tileExtent.getValue());
     auto blockedType = FragmentType::get(

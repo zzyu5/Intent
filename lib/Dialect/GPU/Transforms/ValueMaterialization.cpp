@@ -38,7 +38,7 @@ FailureOr<Value> projectPredicate(OpBuilder &builder, Location location,
       target.getShape().size(),
       PhysicalExprAttr::get(
           target.getContext(),
-          static_cast<uint32_t>(PhysicalExprKind::Constant), 1,
+          PhysicalExprKind::Constant, 1,
           StringAttr::get(target.getContext()),
           ArrayAttr::get(target.getContext(), {})));
   shape[axis] = base.getShape()[0];
@@ -310,7 +310,7 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
           unsigned inputAxis = *inputRelation.targetToSource[*sourceAxis];
           auto extent = cast<PhysicalExprAttr>(shape[inputAxis]);
           if (extent.getKind() !=
-                  static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+                  PhysicalExprKind::Constant ||
               extent.getValue() != 1)
             shape[inputAxis] = target.getShape()[targetAxis];
         }
@@ -698,7 +698,7 @@ FailureOr<Value> materializeReplayedValue(
               auto extent = cast<PhysicalExprAttr>(input.getShape()[*inputAxis]);
               neutralSchemaCarrier |=
                   extent.getKind() ==
-                      static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                      PhysicalExprKind::Constant &&
                   extent.getValue() == 1;
             }
           }
@@ -960,7 +960,7 @@ FailureOr<Value> materializeReplayedValue(
                                      resultMap.getDimensionId();
           bool nonUnitStaticExtent =
               inputExtent.getKind() ==
-                  static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                  PhysicalExprKind::Constant &&
               inputExtent.getValue() > 1 &&
               queryBroadcastProjection(input, fragment).isExact();
           if (!(sourceAxisIdentity(inputMap) == sourceAxisIdentity(resultMap)) &&

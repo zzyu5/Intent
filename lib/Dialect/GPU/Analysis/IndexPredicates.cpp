@@ -69,19 +69,19 @@ private:
     return result;
   }
   std::optional<Interval> infer(PhysicalExprAttr expression) {
-    auto kind = static_cast<PhysicalExprKind>(expression.getKind());
+    auto kind = expression.getKind();
     if (kind == PhysicalExprKind::Constant)
       return Interval{expression.getValue(), expression.getValue()};
     if (kind == PhysicalExprKind::Dimension)
       return Interval{0, std::numeric_limits<int64_t>::max()};
     if (kind == PhysicalExprKind::Parameter) {
-      auto parameter = queryParameterBySymbol(kernel, expression.getSymbol());
+      auto parameter = queryParameterBySymbol(kernel, expression.getSymbolName());
       if (failed(parameter)) return std::nullopt;
-      if ((*parameter)->hasAttr(coverageDimensionAttr) ||
-          parameter->getParameter().getCategory() ==
-              static_cast<uint32_t>(ParameterCategory::Coverage))
+      if (parameter->isDeferred() ||
+          parameter->getCategory() ==
+              ParameterCategory::Coverage)
         return Interval{0, std::numeric_limits<int64_t>::max()};
-      auto domain = parameter->getParameter().getCandidates().asArrayRef();
+      auto domain = parameter->getCandidates().asArrayRef();
       if (domain.empty()) return std::nullopt;
       return Interval{*llvm::min_element(domain), *llvm::max_element(domain)};
     }
@@ -110,7 +110,7 @@ private:
     auto context = expression.getContext();
     auto constant = [&](int64_t value) {
       return PhysicalExprAttr::get(context,
-          static_cast<uint32_t>(PhysicalExprKind::Constant), value,
+          PhysicalExprKind::Constant, value,
           StringAttr::get(context, ""), ArrayAttr::get(context, {}));
     };
     Interval result{std::numeric_limits<int64_t>::max(),

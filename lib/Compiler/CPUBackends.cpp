@@ -56,15 +56,15 @@ void CPUBackend::buildShared(OpPassManager &manager, const Request &request, Str
   options.vectorBits = request.cpu.vectorBits;
   options.workers = request.cpu.workers;
   options.matrixI8I32 = request.cpu.matrixI8I32;
+  options.privateBytes = request.cpu.privateBytes;
   cpu::buildCPUPipeline(manager, options);
 }
 
 LogicalResult CPUBackend::verifySharedInput(ModuleOp module, const Request &request, StringRef provider) const {
   if (failed(cpu::verifyCPUProgram(module, false))) return failure();
-  cpu::CPUCompilationOptions defaults;
   auto expected = cpu::CapabilitiesAttr::getChecked([&] { return module.emitError(); },
       module.getContext(), request.cpu.vectorBits, request.cpu.workers,
-      defaults.privateBytes.getValue(), request.cpu.matrixI8I32);
+      request.cpu.privateBytes, request.cpu.matrixI8I32);
   if (!expected) return failure();
   if (module->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities") != expected)
     return module.emitError("shared CPU capabilities disagree with the requested CPU resources");

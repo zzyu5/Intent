@@ -5,7 +5,8 @@ from pathlib import Path
 from intent.api import KernelDefinition
 from intent.frontend import lower_to_mlir
 from intent.runtime import CompiledArtifact
-from intent.targets.base import Target, SourceTarget, ResolvedSourceTarget, ResolvedTarget
+from intent.targets.base import Target, SourceTarget, ResolvedTarget
+from intent.targets.specification import CompilationTarget, require_matching_target
 
 from .artifact import CompiledIR, GeneratedProgram, OptimizedIR
 from .toolchain import CompilationStageError
@@ -23,10 +24,10 @@ def compile(
     tuning_config: str | Path | None = None,
 ) -> CompiledArtifact:
     kernel_mlir = _capture(definition, constexprs)
-    resolved = _resolve(target)
-    if not isinstance(resolved, ResolvedTarget):
+    resolved, binding = _resolve(target)
+    if binding is None:
         raise NotImplementedError("This target only generates source; use intent.generate, not intent.compile")
-    program = _generate_source(kernel_mlir, resolved, compiler, tuning_config, definition.__name__)
+    program = _generate_source(kernel_mlir, resolved, compiler, tuning_config, definition.__name__, binding=binding)
     return program.materialize()
 
 
@@ -39,8 +40,8 @@ def generate(
     tuning_config: str | Path | None = None,
 ) -> GeneratedProgram:
     kernel_mlir = _capture(definition, constexprs)
-    resolved = _resolve(target)
-    return _generate_source(kernel_mlir, resolved, compiler, tuning_config, definition.__name__)
+    resolved, binding = _resolve(target)
+    return _generate_source(kernel_mlir, resolved, compiler, tuning_config, definition.__name__, binding=binding)
 
 
 def generate_from_ir(
@@ -67,8 +68,8 @@ def generate_from_ir(
         raise ValueError("input_stage must be 'kir' or 'shared'")
     if not isinstance(name, str) or not name.strip():
         raise ValueError("name must provide a nonempty diagnostic identifier for the generated program")
-    resolved = _resolve(target)
-    return _generate_source(ir, resolved, compiler, None, name, input_stage=input_stage)
+    resolved, binding = _resolve(target)
+    return _generate_source(ir, resolved, compiler, None, name, input_stage=input_stage, binding=binding)
 
 
 def compile_ir(
@@ -101,7 +102,7 @@ def compile_ir(
     if selected is CompilerStage.KIR:
         options, role = (), "Intent compiler"
     else:
-        resolved = _resolve(target)
+        resolved, _ = _resolve(target)
         options, role = _options(resolved, tuning_config), resolved.compiler_role
     output = run_compiler(compiler, kernel_mlir, options, role, stage=selected)
     return CompiledIR(selected.value, output.ir, output.directory)
@@ -114,14 +115,19 @@ def _capture(definition, constexprs) -> str:
         raise CompilationStageError("frontend_kir", str(error)) from error
 
 
-def _resolve(target: SourceTarget) -> ResolvedSourceTarget:
+def _resolve(target: SourceTarget) -> tuple[CompilationTarget, ResolvedTarget | None]:
     try:
-        return target.resolve()
+        resolved = target.resolve()
+        if isinstance(resolved, ResolvedTarget):
+            return resolved.compilation, resolved
+        if isinstance(resolved, CompilationTarget):
+            return resolved, None
+        raise TypeError("target resolution must provide compiler facts or a runtime binding")
     except Exception as error:
         raise CompilationStageError("target_resolution", str(error)) from error
 
 
-def _options(resolved: ResolvedSourceTarget, tuning_config: str | Path | None) -> tuple[str, ...]:
+def _options(resolved: CompilationTarget, tuning_config: str | Path | None) -> tuple[str, ...]:
     return resolved.compiler_options + (
         (f"--tuning-config={Path(tuning_config).resolve()}",)
         if tuning_config is not None else ()
@@ -129,7 +135,7 @@ def _options(resolved: ResolvedSourceTarget, tuning_config: str | Path | None) -
 
 
 def _generate_source(kernel_mlir, resolved, compiler, tuning_config, entry_name,
-                     *, input_stage: str | None = None) -> GeneratedProgram:
+                     *, input_stage: str | None = None, binding: ResolvedTarget | None = None) -> GeneratedProgram:
     options = _options(resolved, tuning_config)
     if input_stage is not None:
         options += (f"--input-stage={input_stage}",)
@@ -139,7 +145,12 @@ def _generate_source(kernel_mlir, resolved, compiler, tuning_config, entry_name,
         options,
         resolved.compiler_role,
     )
-    return GeneratedProgram(output.source, output.ir, output.metadata, output.directory, entry_name, resolved)
+    try:
+        program = GeneratedProgram(output.source, output.ir, output.metadata, output.directory, entry_name, binding)
+        require_matching_target(program.target, resolved)
+    except (KeyError, TypeError, ValueError, NotImplementedError) as error:
+        raise CompilationStageError("compiler_output", str(error), cache_directory=output.directory) from error
+    return program
 
 
 def compile_shared_gpu(

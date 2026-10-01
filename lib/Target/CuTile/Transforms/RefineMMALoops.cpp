@@ -35,8 +35,8 @@ bool positiveExtent(Value value) {
     return integer && integer.getInt() > 0;
   }
   auto parameter = value.getDefiningOp<gpu::ParameterOp>();
-  return parameter && !parameter.getParameter().getCandidates().empty() &&
-         llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
+  return parameter && !parameter.getDeclaration().getCandidates().empty() &&
+         llvm::all_of(parameter.getDeclaration().getCandidates().asArrayRef(),
                       [](int64_t candidate) { return candidate > 0; });
 }
 
@@ -178,7 +178,7 @@ void boundNativeReductionWidth(MMAOp mma) {
     return;
   auto reduction = cast<gpu::PhysicalExprAttr>(lhs.getShape().getValue().back());
   if (reduction.getKind() ==
-          static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+          gpu::PhysicalExprKind::Constant &&
       (reduction.getValue() <= nativeReductionLimit ||
        reduction.getValue() % reductionChunk != 0))
     return;
@@ -251,7 +251,7 @@ LogicalResult refineMMALoops(ModuleOp module) {
       auto unit = dyn_cast<gpu::PhysicalExprAttr>(original.getShape()[0]);
       if (!unit ||
           unit.getKind() !=
-              static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+              gpu::PhysicalExprKind::Constant ||
           unit.getValue() != 1)
         continue;
       auto incoming = dyn_cast<gpu::ReshapeOp>(*argument.getUsers().begin());

@@ -1,48 +1,24 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from collections.abc import Mapping
-import json
 from pathlib import Path
 
 from intent.runtime import CompiledArtifact
+from .specification import DSACompilationTarget, require_matching_target
 
 
 @dataclass(frozen=True, slots=True)
 class ResolvedBangCTarget:
-    architecture: str
-    tile: int
-    tile_m: int
-    tile_n: int
-    tile_k: int
-    region_tile: int
-    tasks: int
-    local_bytes: int
+    compilation: DSACompilationTarget
     device: int
     neuware: str
     compiler: str | None
-    shapes: tuple[tuple[str, tuple[int, ...]], ...]
-    strides: tuple[tuple[str, tuple[int, ...]], ...]
 
-    @property
-    def compiler_options(self) -> tuple[str, ...]:
-        return (
-            "--target=bangc", f"--dsa-architecture={self.architecture}",
-            f"--dsa-tile={self.tile}", f"--dsa-tile-m={self.tile_m}",
-            f"--dsa-tile-n={self.tile_n}", f"--dsa-tile-k={self.tile_k}",
-            f"--dsa-region-tile={self.region_tile}", f"--dsa-shapes={json.dumps(dict(self.shapes))}",
-            f"--dsa-strides={json.dumps(dict(self.strides))}",
-            f"--dsa-tasks={self.tasks}", f"--dsa-local-bytes={self.local_bytes}",
-        )
-
-    @property
-    def compiler_role(self) -> str:
-        return "Intent DSA compiler"
-
-    def materialize(self, source: str, module_text: str, entry_name: str,
-                    metadata: dict[str, object]) -> CompiledArtifact:
+    def materialize(self, program) -> CompiledArtifact:
         from intent.runtime.bangc import materialize_bangc_artifact
-        return materialize_bangc_artifact(source, module_text, metadata, self)
+        require_matching_target(program.target, self.compilation)
+        return materialize_bangc_artifact(program.source, program.ir, program.metadata, self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,23 +39,26 @@ class BangCTarget:
     shapes: Mapping[str, tuple[int, ...]] | None = None
     strides: Mapping[str, tuple[int, ...]] | None = None
 
+    @classmethod
+    def from_program(cls, program, *, device: int, neuware: str | Path,
+                     compiler: str | Path | None = None) -> BangCTarget:
+        """Select a local runtime while retaining this program's DSA construction bindings."""
+        if not isinstance(program.target, DSACompilationTarget):
+            raise ValueError("a BANG C runtime requires a DSA generated program")
+        fields = asdict(program.target)
+        fields["shapes"] = dict(program.target.shapes)
+        fields["strides"] = dict(program.target.strides)
+        return cls(**fields, device=device, neuware=neuware, compiler=compiler)
+
     def resolve(self) -> ResolvedBangCTarget:
-        if self.architecture != "mtp_372":
-            raise NotImplementedError("BANG C currently provides an MLU370 implementation profile")
-        if any(value <= 0 for value in (self.tile, self.tile_m, self.tile_n, self.tile_k, self.region_tile, self.tasks, self.local_bytes)):
-            raise ValueError("DSA block and resource bindings must be positive")
-        if self.tile % 64 or self.device < 0:
-            raise ValueError("DSA vector tile must be divisible by 64 and device must be nonnegative")
+        if type(self.device) is not int or self.device < 0:
+            raise ValueError("BANG C device must be a nonnegative integer")
         shapes = tuple(sorted((name, tuple(shape)) for name, shape in (self.shapes or {}).items()))
-        if any(not isinstance(name, str) or any(not isinstance(extent, int) or extent < -1 for extent in shape)
-               for name, shape in shapes):
-            raise ValueError("DSA shape bindings map parameter names to integer extents, with -1 for dynamic axes")
         strides = tuple(sorted((name, tuple(values)) for name, values in (self.strides or {}).items()))
-        if any(not isinstance(name, str) or any(type(value) is not int or not -(1 << 63) <= value < (1 << 63)
-               for value in values) for name, values in strides):
-            raise ValueError("DSA stride bindings map parameter names to signed 64-bit element strides")
-        return ResolvedBangCTarget(
+        compilation = DSACompilationTarget(
             self.architecture, self.tile, self.tile_m, self.tile_n, self.tile_k,
-            self.region_tile, self.tasks, self.local_bytes, self.device, str(self.neuware),
-            str(self.compiler) if self.compiler is not None else None, shapes, strides,
+            self.region_tile, self.tasks, self.local_bytes, shapes, strides)
+        return ResolvedBangCTarget(
+            compilation, self.device, str(self.neuware),
+            str(self.compiler) if self.compiler is not None else None,
         )

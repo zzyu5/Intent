@@ -2,7 +2,7 @@
 #define INTENT_TARGET_TRITON_IR_TRITONOPS_TD
 
 include "Intent/Dialect/GPU/IR/GPUTypes.td"
-include "Intent/Dialect/GPU/IR/ConfigurationParameterOpInterface.td"
+include "Intent/Dialect/GPU/IR/GPUAttrs.td"
 include "Intent/Target/Triton/IR/TritonDialect.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
@@ -16,30 +16,14 @@ def IntentTriton_CtaBarrierOp : IntentTriton_Op<"cta_barrier", [
   ]>;
 
 def IntentTriton_TensorDescriptorChoiceOp :
-    IntentTriton_Op<"tensor_descriptor_choice", [Pure, IntentGPU_ConfigurationParameterOpInterface]> {
+    IntentTriton_Op<"tensor_descriptor_choice", [Pure]> {
   let arguments = (ins Variadic<IntentGPU_ViewValue>:$descriptors,
                        StrAttr:$construction,
                        StrAttr:$selection,
-                       StrAttr:$config_parameter,
+                       IntentGPU_ParameterRefAttr:$config_parameter,
                        StrAttr:$eligibility_argument);
   let results = (outs I1:$result);
   let hasVerifier = 1;
-  let extraClassDeclaration = [{
-    ::mlir::StringAttr getConfigurationName() { return getConfigParameterAttr(); }
-    ::llvm::ArrayRef<int64_t> getConfigurationCandidates() {
-      static const int64_t candidates[] = {0, 1};
-      return candidates;
-    }
-    ::intent::gpu::ConfigurationBindingPhase getConfigurationBindingPhase() {
-      return ::intent::gpu::ConfigurationBindingPhase::Provider;
-    }
-    ::intent::gpu::ParameterRole getConfigurationRole() {
-      return ::intent::gpu::ParameterRole::ProviderAccessForm;
-    }
-    ::intent::gpu::ParameterCategory getConfigurationCategory() {
-      return ::intent::gpu::ParameterCategory::Provider;
-    }
-  }];
 }
 
 def IntentTriton_TensorDescriptorAllocatorOp :

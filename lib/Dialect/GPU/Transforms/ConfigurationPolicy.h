@@ -29,40 +29,40 @@ struct ParameterClassification {
 };
 
 struct CorrelatedProfileParameters {
-  ParameterOp pointwise, reduction, contraction;
+  ParameterAttr pointwise, reduction, contraction;
 };
 
 struct ReductionProfileParameters {
-  ParameterOp chunk;
-  llvm::SmallVector<ParameterOp> rows;
+  ParameterAttr chunk;
+  llvm::SmallVector<ParameterAttr> rows;
 };
 
 struct ContractionFreeExtent {
   llvm::SmallVector<PhysicalExprAttr> extents;
-  llvm::SmallVector<ParameterOp> parameters;
-  llvm::SmallVector<ParameterOp> profileParameters;
+  llvm::SmallVector<ParameterAttr> parameters;
+  llvm::SmallVector<ParameterAttr> profileParameters;
   ParameterRole role;
 };
 
 struct FullResultContraction {
-  ParameterOp parameter;
+  ParameterAttr parameter;
   PhysicalExprAttr otherExtent;
 };
 
 // Recomputed for one unchanged current program. These facts select profile
 // projections; the resulting configuration set is published only in the IR.
 struct ConfigurationFacts {
-  llvm::SmallVector<ParameterOp> parameters;
-  llvm::DenseMap<mlir::Operation *, ParameterClassification> classifications;
+  llvm::SmallVector<ParameterAttr> parameters;
+  llvm::DenseMap<ParameterAttr, ParameterClassification> classifications;
   bool hasTwoAxisPointwiseOwnership = false;
   bool hasFixedPointwiseLocal = false;
   bool pointwiseOnlyProgram = true;
   bool hasContraction = false;
   bool smallRegionRows = false;
   bool multipleRegionMatrixAccumulators = false;
-  llvm::DenseMap<mlir::Operation *, int64_t> pointwiseLocalMultiplicity;
-  llvm::SmallVector<ParameterOp> pointwiseRowAxes;
-  llvm::MapVector<unsigned, llvm::SmallVector<ParameterOp>> rowGroups;
+  llvm::DenseMap<ParameterAttr, int64_t> pointwiseLocalMultiplicity;
+  llvm::SmallVector<ParameterAttr> pointwiseRowAxes;
+  llvm::MapVector<unsigned, llvm::SmallVector<ParameterAttr>> rowGroups;
   llvm::SmallVector<CorrelatedProfileParameters> correlatedProfiles;
   llvm::SmallVector<ReductionProfileParameters> reductionProfiles;
   llvm::SmallVector<mlir::Attribute> indirectRowGroups;
@@ -71,11 +71,11 @@ struct ConfigurationFacts {
 };
 
 ConfigurationFacts analyzeConfigurationPolicy(
-    mlir::func::FuncOp kernel, llvm::ArrayRef<ParameterOp> parameters,
+    mlir::func::FuncOp kernel, llvm::ArrayRef<ParameterAttr> parameters,
     const FragmentResourceAnalysis &resources);
 
 using ProfileLookup =
-    llvm::function_ref<const TuningProfile &(ParameterOp)>;
+    llvm::function_ref<const TuningProfile &(ParameterAttr)>;
 using ProfileBindingConsumer =
     llvm::function_ref<void(mlir::NamedAttrList &, ProfileLookup, bool)>;
 mlir::LogicalResult projectConfigurationProfiles(
@@ -88,13 +88,13 @@ void bindContractionFreeExtents(
     llvm::ArrayRef<ContractionFreeExtent> groups, mlir::NamedAttrList &bindings,
     ProfileLookup profileFor, mlir::Builder &builder, bool splitInnerAxis);
 mlir::LogicalResult bindTraversalFragmentFootprints(
-    mlir::func::FuncOp kernel, llvm::ArrayRef<ParameterOp> parameters,
+    mlir::func::FuncOp kernel, llvm::ArrayRef<ParameterAttr> parameters,
     const FragmentResourceAnalysis &resources,
     mlir::NamedAttrList &bindings, mlir::Builder &builder);
 void appendFullResultContractionTuples(
     mlir::func::FuncOp kernel,
     llvm::ArrayRef<FullResultContraction> contractions,
-    const mlir::NamedAttrList &bindings, llvm::ArrayRef<ParameterOp> parameters,
+    const mlir::NamedAttrList &bindings, llvm::ArrayRef<ParameterAttr> parameters,
     const FragmentResourceAnalysis &resources, ProfileLookup profileFor,
     mlir::Builder &builder,
     llvm::function_ref<void(mlir::DictionaryAttr)> append);

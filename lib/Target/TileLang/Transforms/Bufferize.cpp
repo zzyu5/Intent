@@ -22,19 +22,19 @@ namespace {
 
 gpu::PhysicalExprAttr constantExtent(MLIRContext *context, int64_t value) {
   return gpu::PhysicalExprAttr::get(
-      context, static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), value,
+      context, gpu::PhysicalExprKind::Constant, value,
       StringAttr::get(context), ArrayAttr::get(context, {}));
 }
 
 gpu::PhysicalExprAttr floorDivideExtent(gpu::PhysicalExprAttr dividend,
                                         int64_t divisor) {
   if (dividend.getKind() ==
-      static_cast<uint32_t>(gpu::PhysicalExprKind::Constant))
+      gpu::PhysicalExprKind::Constant)
     return constantExtent(dividend.getContext(), dividend.getValue() / divisor);
   auto divisorAttr = constantExtent(dividend.getContext(), divisor);
   return gpu::PhysicalExprAttr::get(
       dividend.getContext(),
-      static_cast<uint32_t>(gpu::PhysicalExprKind::FloorDiv), 0,
+      gpu::PhysicalExprKind::FloorDiv, 0,
       StringAttr::get(dividend.getContext()),
       ArrayAttr::get(dividend.getContext(), {dividend, divisorAttr}));
 }
@@ -747,7 +747,7 @@ private:
       auto extent = cast<gpu::PhysicalExprAttr>(
           source.getShape()[sourceMap.getFragmentAxis()]);
       if (extent.getKind() !=
-              static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+              gpu::PhysicalExprKind::Constant ||
           extent.getValue() != 1)
         return owner->emitOpError(
                    "TileLang scalarization cannot recover a missing non-unit physical axis: source=")
@@ -831,7 +831,7 @@ private:
       auto extent = cast<gpu::PhysicalExprAttr>(
           fragment.getShape()[layout.bufferToFragment[*bufferAxis]]);
       if (extent.getKind() ==
-              static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+              gpu::PhysicalExprKind::Constant &&
           extent.getValue() == 1)
         return false;
     }
@@ -1037,7 +1037,7 @@ private:
         for (auto [axis, attribute] : llvm::enumerate(sourceType.getShape())) {
           auto extent = cast<gpu::PhysicalExprAttr>(attribute);
           if (extent.getKind() ==
-                  static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+                  gpu::PhysicalExprKind::Constant &&
               extent.getValue() == 1)
             sourceIndices[axis] = builder.create<arith::ConstantIndexOp>(
                 owner->getLoc(), 0);
@@ -1439,7 +1439,7 @@ private:
          llvm::zip(fragment.getShape(), alignments)) {
       auto extent = cast<gpu::PhysicalExprAttr>(extentAttribute);
       if (extent.getKind() ==
-          static_cast<uint32_t>(gpu::PhysicalExprKind::Constant)) {
+          gpu::PhysicalExprKind::Constant) {
         int64_t value = extent.getValue();
         int64_t padded = ((value + alignment - 1) / alignment) * alignment;
         shape.push_back(constantExtent(kernel.getContext(), padded));
@@ -1880,7 +1880,7 @@ private:
       auto extent = dyn_cast<gpu::PhysicalExprAttr>(attribute);
       if (!extent ||
           extent.getKind() !=
-              static_cast<uint32_t>(gpu::PhysicalExprKind::Constant))
+              gpu::PhysicalExprKind::Constant)
         return std::nullopt;
       return extent.getValue();
     };
@@ -2620,7 +2620,7 @@ private:
             !llvm::all_of(operation->getResults(),
                           [](Value result) { return result.use_empty(); }) ||
             !isMemoryEffectFree(operation) ||
-            isa<gpu::ParameterOp, gpu::ProgramIdOp>(operation))
+            isa<gpu::ProgramIdOp>(operation))
           return;
         dead.push_back(operation);
       });

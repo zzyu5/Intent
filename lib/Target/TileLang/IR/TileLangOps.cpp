@@ -32,7 +32,7 @@ bool isConstantExtent(Attribute attribute, int64_t expected) {
   auto expression = dyn_cast<gpu::PhysicalExprAttr>(attribute);
   return expression &&
          expression.getKind() ==
-             static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+             gpu::PhysicalExprKind::Constant &&
          expression.getValue() == expected;
 }
 
@@ -71,13 +71,13 @@ bool hasNoStaticQuotientConflict(Attribute quotientAttribute,
   if (!quotient || !dividend || divisor <= 0)
     return false;
   if (quotient.getKind() ==
-          static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+          gpu::PhysicalExprKind::Constant &&
       dividend.getKind() ==
-          static_cast<uint32_t>(gpu::PhysicalExprKind::Constant))
+          gpu::PhysicalExprKind::Constant)
     return dividend.getValue() > 0 && dividend.getValue() % divisor == 0 &&
            quotient.getValue() == dividend.getValue() / divisor;
   if (quotient.getKind() ==
-          static_cast<uint32_t>(gpu::PhysicalExprKind::FloorDiv) &&
+          gpu::PhysicalExprKind::FloorDiv &&
       quotient.getOperands().size() == 2 &&
       quotient.getOperands()[0] == dividendAttribute &&
       isConstantExtent(quotient.getOperands()[1], divisor))
@@ -93,8 +93,8 @@ bool hasNoStaticQuotientConflict(Attribute quotientAttribute,
 LogicalResult LaunchConfigOp::verify() {
   auto parameter = getThreads().getDefiningOp<gpu::ParameterOp>();
   if (!parameter ||
-      parameter.getParameter().getRole() !=
-          static_cast<uint32_t>(gpu::ParameterRole::ProviderThreads))
+      parameter.getDeclaration().getRole() !=
+          gpu::ParameterRole::ProviderThreads)
     return emitOpError("threads must be an explicit TileLang provider parameter");
   return success();
 }
@@ -102,8 +102,8 @@ LogicalResult LaunchConfigOp::verify() {
 LogicalResult PipelineOp::verify() {
   auto parameter = getStages().getDefiningOp<gpu::ParameterOp>();
   if (!parameter ||
-      parameter.getParameter().getRole() !=
-          static_cast<uint32_t>(gpu::ParameterRole::ProviderStages))
+      parameter.getDeclaration().getRole() !=
+          gpu::ParameterRole::ProviderStages)
     return emitOpError("stages must be an explicit provider-stage parameter");
   if (!llvm::hasSingleElement(getBody()))
     return emitOpError("requires one explicit body block");
@@ -322,7 +322,7 @@ LogicalResult ReduceOp::verify() {
       expected.push_back(extent);
   if (expected.empty())
     expected.push_back(gpu::PhysicalExprAttr::get(
-        getContext(), 0, 1, StringAttr::get(getContext()),
+        getContext(), gpu::PhysicalExprKind::Constant, 1, StringAttr::get(getContext()),
         ArrayAttr::get(getContext(), {})));
   return destination.getShape() == ArrayAttr::get(getContext(), expected)
              ? success()

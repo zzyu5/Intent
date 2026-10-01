@@ -11,27 +11,10 @@
 
 using namespace mlir;
 
-#include "Intent/Dialect/GPU/IR/ConfigurationParameterOpInterface.cpp.inc"
-
 namespace intent::gpu {
 
-StringAttr ParameterOp::getConfigurationName() { return getParameter().getName(); }
-ArrayRef<int64_t> ParameterOp::getConfigurationCandidates() {
-  return getParameter().getCandidates().asArrayRef();
-}
-ConfigurationBindingPhase ParameterOp::getConfigurationBindingPhase() {
-  if (getOperation()->hasAttr(coverageDimensionAttr) ||
-      getConfigurationCategory() == ParameterCategory::Coverage)
-    return ConfigurationBindingPhase::Deferred;
-  return getConfigurationCategory() == ParameterCategory::Provider
-             ? ConfigurationBindingPhase::Provider
-             : ConfigurationBindingPhase::Shared;
-}
-ParameterRole ParameterOp::getConfigurationRole() {
-  return static_cast<ParameterRole>(getParameter().getRole());
-}
-ParameterCategory ParameterOp::getConfigurationCategory() {
-  return static_cast<ParameterCategory>(getParameter().getCategory());
+ParameterAttr ParameterOp::getDeclaration() {
+  return lookupParameterDeclaration(getOperation(), getReference());
 }
 
 namespace {
@@ -66,14 +49,14 @@ bool sameExecutionShape(Type lhs, Type rhs) {
 bool valueMatchesPhysicalExtent(Value value, PhysicalExprAttr extent) {
   if (auto physical = value.getDefiningOp<PhysicalExprOp>())
     return physical.getExpression() == extent;
-  auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+  auto kind = extent.getKind();
   if (kind == PhysicalExprKind::Constant) {
     auto constant = value.getDefiningOp<arith::ConstantIndexOp>();
     return constant && constant.value() == extent.getValue();
   }
   if (kind == PhysicalExprKind::Parameter) {
     auto parameter = value.getDefiningOp<ParameterOp>();
-    return parameter && parameter.getParameter().getName() == extent.getSymbol();
+    return parameter && parameter.getReference() == extent.getParameterReference();
   }
   return false;
 }
@@ -87,7 +70,7 @@ struct PhysicalProduct {
 void collectPhysicalProduct(PhysicalExprAttr value, PhysicalProduct &product) {
   if (!product.valid)
     return;
-  auto kind = static_cast<PhysicalExprKind>(value.getKind());
+  auto kind = value.getKind();
   if (kind == PhysicalExprKind::Multiply) {
     if (value.getOperands().size() != 2) {
       product.valid = false;
@@ -495,9 +478,12 @@ inferReshapeReassociation(FragmentType source, FragmentType result,
 }
 
 LogicalResult ParameterOp::verify() {
-  return getParameter().getCandidates().empty()
-             ? emitOpError("parameter has no legal candidate")
-             : success();
+  ParameterAttr declaration = getDeclaration();
+  if (!declaration)
+    return emitOpError("references an undeclared kernel parameter") << "; reference=" << getReference();
+  if (!declaration.isExtent())
+    return emitOpError("index parameter read requires a positive index declaration");
+  return success();
 }
 
 LogicalResult PhysicalExprOp::verify() { return success(); }
@@ -818,7 +804,7 @@ LogicalResult JoinOp::verify() {
   auto trailing = dyn_cast<PhysicalExprAttr>(
       result.getShape()[result.getShape().size() - 1]);
   if (!trailing ||
-      trailing.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+      trailing.getKind() != PhysicalExprKind::Constant ||
       trailing.getValue() != 2)
     return emitOpError("join trailing physical extent must be exactly two");
   return success();
@@ -967,7 +953,10 @@ LogicalResult verifyHelperRegion(Operation *owner, Region &region,
 
 LogicalResult verifySegmentSlice(Operation *owner, Type sourceType,
                                  Type sliceType, uint64_t axis,
-                                 ParameterAttr segment) {
+                                 ParameterRefAttr segment) {
+  auto declaration = lookupParameterDeclaration(owner, segment);
+  if (!declaration || !declaration.isExtent())
+    return owner->emitOpError("region segment requires a declared positive index parameter");
   auto source = dyn_cast<FragmentType>(sourceType);
   auto slice = dyn_cast<FragmentType>(sliceType);
   if (!source || !slice || source.getElementType() != slice.getElementType() ||
@@ -981,8 +970,8 @@ LogicalResult verifySegmentSlice(Operation *owner, Type sourceType,
       auto extent = dyn_cast<PhysicalExprAttr>(slice.getShape()[dimension]);
       if (!extent ||
           extent.getKind() !=
-              static_cast<uint32_t>(PhysicalExprKind::Parameter) ||
-          extent.getSymbol() != segment.getName())
+              PhysicalExprKind::Parameter ||
+          extent.getParameterReference() != segment)
         return owner->emitOpError(
                    "physical region slice axis is not bound to its segment parameter: slice_extent=")
                << slice.getShape()[dimension]
@@ -1281,7 +1270,7 @@ LogicalResult ScaledContractOp::verify() {
                            unsigned axis) -> std::optional<int64_t> {
     auto extent = cast<PhysicalExprAttr>(value.getShape()[axis]);
     return extent.getKind() ==
-                   static_cast<uint32_t>(PhysicalExprKind::Constant)
+                   PhysicalExprKind::Constant
                ? std::optional<int64_t>(extent.getValue())
                : std::nullopt;
   };

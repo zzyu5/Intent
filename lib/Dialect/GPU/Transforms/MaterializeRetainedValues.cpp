@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/Traversal.h"
@@ -21,7 +22,7 @@ bool isZero(Value value) {
   PhysicalExprAttr expression = queryNonNegativeIndexUpperBound(value);
   return expression &&
          expression.getKind() ==
-             static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+             PhysicalExprKind::Constant &&
          expression.getValue() == 0;
 }
 
@@ -247,7 +248,7 @@ bool materializeLoopState(scf::ForOp loop, func::FuncOp kernel) {
     bool fixed = true;
     for (Attribute attribute : type.getShape()) {
       auto extent = cast<PhysicalExprAttr>(attribute);
-      if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+      if (extent.getKind() != PhysicalExprKind::Constant ||
           extent.getValue() <= 0) {
         fixed = false;
         break;
@@ -438,11 +439,11 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
     PhysicalExprAttr end = queryLaunchExpression(range.getLogicalStop());
     if (!end || (!indirect && end != outputShape[axis]))
       return false;
-    if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
-      FailureOr<ParameterOp> parameter = queryParameterBySymbol(kernel, extent.getSymbol());
-      if (failed(parameter) || !(*parameter)->hasAttr(coverageDimensionAttr))
+    if (extent.getKind() == PhysicalExprKind::Parameter) {
+      FailureOr<ParameterAttr> parameter = queryParameterBySymbol(kernel, extent.getSymbolName());
+      if (failed(parameter) || !parameter->isDeferred())
         return false;
-    } else if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+    } else if (extent.getKind() != PhysicalExprKind::Constant ||
                extent != end) {
       return false;
     }
@@ -575,7 +576,7 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
     bool fixed = true;
     for (Attribute attribute : shape) {
       auto extent = cast<PhysicalExprAttr>(attribute);
-      fixed &= extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant);
+      fixed &= extent.getKind() == PhysicalExprKind::Constant;
       if (fixed)
         footprint *= extent.getValue();
     }
@@ -691,7 +692,7 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
       ? std::to_string(workspaceBuffer.getInstance())
       : ("VIEW_" + Twine(cast<ViewType>(workspace.getType()).getSourceId())).str();
   bool linearTraversal = payload.getShape().size() == 1;
-  ParameterOp chunk = getOrCreatePhysicalParameter(
+  auto reference = getOrCreatePhysicalParameter(
       kernel, ((linearTraversal ? "MATERIALIZE_ELEMENTS_" : "MATERIALIZE_AXIS_") +
                resourceId),
       linearTraversal ? ParameterRole::OwnershipN : ParameterRole::ReductionOuter,
@@ -700,6 +701,9 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
       linearTraversal
           ? ArrayRef<int64_t>{32, 64, 128, 256, 512, 1024, 2048, 4096, 8192}
           : ArrayRef<int64_t>{1, 2, 4, 8, 16, 32, 64});
+  if (failed(reference)) return failure();
+  OpBuilder entry(&kernel.front(), kernel.front().begin());
+  auto chunk = materializeParameter(entry, store.getLoc(), *reference);
   SmallVector<Attribute> blockedShape(payload.getShape().begin(),
                                       payload.getShape().end());
   blockedShape[chunkAxis] = queryLaunchExpression(chunk);
@@ -841,29 +845,29 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
   unsigned rank = payload.getShape().size();
   auto coverageBound = [&](unsigned axis) -> PhysicalExprAttr {
     auto extent = cast<PhysicalExprAttr>(payload.getShape()[axis]);
-    if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter))
+    if (extent.getKind() != PhysicalExprKind::Parameter)
       return {};
-    auto parameter = queryParameterBySymbol(kernel, extent.getSymbol());
+    auto parameter = queryParameterBySymbol(kernel, extent.getSymbolName());
     if (failed(parameter))
       return {};
-    auto dimension = (*parameter)->getAttrOfType<IntegerAttr>(coverageDimensionAttr);
+    auto dimension = parameter->isDeferred() ? parameter->getBinding().getDimension() : IntegerAttr();
     auto mapping = cast<AxisMapAttr>(payload.getAxisMaps()[axis]);
     if (!dimension || dimension.getInt() != mapping.getDimensionId())
       return {};
-    return (*parameter)->getAttrOfType<PhysicalExprAttr>(coverageBoundAttr);
+    return parameter->getBinding().getCoverageBound();
   };
   unsigned chunkAxis = 0;
   int64_t largest = 0;
   bool dynamicCoverage = false;
   for (auto [axis, attribute] : llvm::enumerate(payload.getShape())) {
     auto bound = coverageBound(axis);
-    if (bound && bound.getKind() == static_cast<uint32_t>(PhysicalExprKind::Dimension)) {
+    if (bound && bound.getKind() == PhysicalExprKind::Dimension) {
       chunkAxis = axis;
       dynamicCoverage = true;
       break;
     }
     auto extent = cast<PhysicalExprAttr>(attribute);
-    if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+    if (extent.getKind() == PhysicalExprKind::Constant &&
         extent.getValue() > largest) {
       largest = extent.getValue();
       chunkAxis = axis;
@@ -872,20 +876,20 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
   auto full = cast<PhysicalExprAttr>(payload.getShape()[chunkAxis]);
   auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   if (!dynamicCoverage &&
-      full.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant))
+      full.getKind() != PhysicalExprKind::Constant)
     return false;
   int64_t footprint = std::max(1u,
       (payload.getElementType().getIntOrFloatBitWidth() + 31) / 32);
   for (Attribute attribute : payload.getShape()) {
     auto extent = cast<PhysicalExprAttr>(attribute);
     int64_t minimum;
-    if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant)) {
+    if (extent.getKind() == PhysicalExprKind::Constant) {
       minimum = extent.getValue();
-    } else if (extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
-      auto parameter = queryParameterBySymbol(kernel, extent.getSymbol());
+    } else if (extent.getKind() == PhysicalExprKind::Parameter) {
+      auto parameter = queryParameterBySymbol(kernel, extent.getSymbolName());
       if (failed(parameter))
         return false;
-      minimum = *llvm::min_element(parameter->getParameter().getCandidates().asArrayRef());
+      minimum = *llvm::min_element(parameter->getCandidates().asArrayRef());
     } else {
       return false;
     }
@@ -926,11 +930,11 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
     if (auto constant = dyn_cast_or_null<IntegerAttr>(
             UniformValueAnalysis(describeUniformValue).evaluate(range.getLogicalStop())))
       extent = PhysicalExprAttr::get(kernel.getContext(),
-          static_cast<uint32_t>(PhysicalExprKind::Constant), constant.getInt(),
+          PhysicalExprKind::Constant, constant.getInt(),
           StringAttr::get(kernel.getContext(), ""), ArrayAttr::get(kernel.getContext(), {}));
     if (!extent ||
-        (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-         extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Dimension)))
+        (extent.getKind() != PhysicalExprKind::Constant &&
+         extent.getKind() != PhysicalExprKind::Dimension))
       return false;
     if (analysis.isProgramOwnedRange(range))
       ownedAxes.push_back(axis);
@@ -952,7 +956,7 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
   auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
   if (ownedAxes.empty() && !llvm::all_of(space, [](Attribute attribute) {
         auto extent = cast<PhysicalExprAttr>(attribute);
-        return extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+        return extent.getKind() == PhysicalExprKind::Constant &&
                extent.getValue() == 1;
       }))
     return false;
@@ -1027,13 +1031,16 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
         ParameterRole::ReductionOuter, ParameterCategory::Reduction,
         payload.getElementType().getIntOrFloatBitWidth(),
         {64, 128, 256, 512, 1024, 2048});
-    chunkExtent = queryLaunchExpression(parameter);
+    if (failed(parameter)) return failure();
+    chunkExtent = PhysicalExprAttr::get(kernel.getContext(),
+        PhysicalExprKind::Parameter, 0, *parameter,
+        builder.getArrayAttr({}));
   }
-  if (chunkExtent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
-    FailureOr<ParameterOp> parameter = queryParameterBySymbol(kernel, chunkExtent.getSymbol());
+  if (chunkExtent.getKind() == PhysicalExprKind::Parameter) {
+    FailureOr<ParameterAttr> parameter = queryParameterBySymbol(kernel, chunkExtent.getSymbolName());
     if (failed(parameter))
       return failure();
-    chunk = parameter->getResult();
+    chunk = materializeParameter(builder, gather.getLoc(), parameter->getReference());
   } else {
     chunk = builder.create<arith::ConstantIndexOp>(gather.getLoc(), chunkExtent.getValue());
   }
@@ -1150,7 +1157,7 @@ static LogicalResult materializeRetainedValuesImpl(ModuleOp module) {
     auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
     if (!llvm::all_of(space, [](Attribute attribute) {
           auto extent = cast<PhysicalExprAttr>(attribute);
-          return extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          return extent.getKind() == PhysicalExprKind::Constant &&
                  extent.getValue() == 1;
         }))
       return success();

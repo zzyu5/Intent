@@ -312,8 +312,11 @@ PhysicalExprAttr expression(MLIRContext *context, PhysicalExprKind kind,
                             int64_t value, StringRef symbol,
                             ArrayRef<Attribute> operands) {
   return PhysicalExprAttr::get(
-      context, static_cast<uint32_t>(kind), value,
-      StringAttr::get(context, symbol), ArrayAttr::get(context, operands));
+      context, kind, value,
+      kind == PhysicalExprKind::Parameter
+          ? Attribute(ParameterRefAttr::get(context, StringAttr::get(context, symbol)))
+          : Attribute(StringAttr::get(context, symbol)),
+      ArrayAttr::get(context, operands));
 }
 
 PhysicalExprAttr parameterExpression(MLIRContext *context, StringRef name) {
@@ -348,34 +351,38 @@ void inheritRangeAuthority(Value derived, MakeRangeOp source) {
 
 LogicalResult refineOwnershipParameter(func::FuncOp kernel, MakeRangeOp range,
                                        FailureOr<unsigned> mappingAxis,
-                                       ParameterOp replacement) {
+                                       ParameterAttr replacement) {
   if (failed(mappingAxis))
     return success();
-  FailureOr<ParameterOp> previous = queryBlockingParameter(kernel, range);
+  FailureOr<ParameterAttr> previous = queryBlockingParameter(kernel, range);
   if (failed(previous))
     return range.emitOpError(
         "pointwise ownership axis has no typed blocking parameter to refine");
-  if (*previous == replacement)
+  if (previous->getReference() == replacement.getReference())
     return success();
-  ParameterAttr previousSchema = previous->getParameter();
-  auto previousRole = static_cast<ParameterRole>(previousSchema.getRole());
+  ParameterAttr previousSchema = *previous;
+  auto previousRole = previousSchema.getRole();
   if (previousSchema.getCategory() !=
-          static_cast<uint32_t>(ParameterCategory::Pointwise) ||
+          ParameterCategory::Pointwise ||
       (previousRole != ParameterRole::OwnershipM &&
        previousRole != ParameterRole::OwnershipN))
-    return previous->emitOpError(
+    return range.emitOpError(
         "contraction can only refine a provisional pointwise ownership parameter");
-  for (StringRef attribute : {dimensionAttr, parameterSourceAttr,
-                              coverageDimensionAttr, coverageBoundAttr}) {
-    Attribute inherited = (*previous)->getAttr(attribute);
-    Attribute current = replacement->getAttr(attribute);
-    if (inherited && current && inherited != current)
-      return replacement.emitOpError(
-          "contraction ownership refinement has conflicting parameter bindings");
-    if (inherited && !current)
-      replacement->setAttr(attribute, inherited);
-  }
-  return replacePhysicalParameter(kernel, *previous, replacement);
+  replacement = lookupParameter(kernel, replacement.getReference());
+  auto inherited = previous->getBinding(), current = replacement.getBinding();
+  auto conflicts = [](Attribute lhs, Attribute rhs) { return lhs && rhs && lhs != rhs; };
+  if (conflicts(inherited.getDimension(), current.getDimension()) ||
+      conflicts(inherited.getSource(), current.getSource()) ||
+      conflicts(inherited.getCoverageBound(), current.getCoverageBound()))
+    return range.emitOpError("contraction ownership refinement has conflicting parameter bindings");
+  auto merged = current
+      .withDimension(current.getDimension() ? current.getDimension() : inherited.getDimension())
+      .withSource(current.getSource() ? current.getSource() : inherited.getSource())
+      .withCoverageBound(current.getCoverageBound() ? current.getCoverageBound() : inherited.getCoverageBound());
+  if (previous->isDeferred()) replacement = replacement.withPhase(ConfigurationBindingPhase::Deferred);
+  replacement = replacement.withBinding(merged);
+  if (failed(updateParameter(kernel, replacement))) return failure();
+  return replaceParameter(kernel, previous->getReference(), replacement.getReference());
 }
 
 FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
@@ -556,7 +563,7 @@ LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
     return failure();
   for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
     auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
-    if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+    if (extent.getKind() != PhysicalExprKind::Constant ||
         extent.getValue() <= 0 || llvm::isPowerOf2_64(extent.getValue()))
       continue;
     if (failed(realizeFullCoverageDimension(kernel, source, axis)))
@@ -567,12 +574,12 @@ LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
     if (axis < 0 || axis >= static_cast<int64_t>(fragment.getShape().size()))
       return failure();
     auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
-    FailureOr<ParameterOp> parameter = parameterForExtent(kernel, extent);
+    FailureOr<ParameterAttr> parameter = parameterForExtent(kernel, extent);
     if (failed(parameter)) {
       PhysicalAxisRealizationFact coverage =
           PhysicalProgramAnalysis(kernel).axisRealization(source, axis);
       if (extent.getKind() ==
-              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+              PhysicalExprKind::Constant &&
           extent.getValue() == 1 && coverage.isExact() &&
           !coverage.constructionScalarSeed && coverage.roots.empty())
         continue;
@@ -593,14 +600,14 @@ LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
       }
       continue;
     }
-    uint32_t role = parameter->getParameter().getRole();
-    if (role == static_cast<uint32_t>(ParameterRole::ScanChunk) ||
-        role == static_cast<uint32_t>(ParameterRole::Reduction) ||
-        role == static_cast<uint32_t>(ParameterRole::FullCoverage))
+    ParameterRole role = parameter->getRole();
+    if (role == ParameterRole::ScanChunk ||
+        role == ParameterRole::Reduction ||
+        role == ParameterRole::FullCoverage)
       continue;
     PhysicalParameterBinding binding = queryParameterBinding(*parameter);
     if (!binding.isExact() || !binding.dimension)
-      return parameter->emitOpError(
+      return kernel.emitOpError(
           "native contraction coverage parameter has no logical dimension");
     uint64_t dimension = *binding.dimension;
     bool launchVisible = false;
@@ -612,31 +619,26 @@ LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
                        identity.getInt() == static_cast<int64_t>(dimension);
     }
     if (!launchVisible)
-      return parameter->emitOpError(
+      return kernel.emitOpError(
           "native contraction cannot fully cover a data-dependent dimension");
     static constexpr int64_t fullCoverageCandidates[] = {
         16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
         16384, 32768, 65536};
-    ParameterAttr schema = parameter->getParameter();
-    (*parameter)->setAttr(
-        "parameter",
-        ParameterAttr::get(
-            kernel.getContext(), schema.getName(), schema.getRole(),
-            schema.getCategory(), schema.getElementBitWidth(),
-            DenseI64ArrayAttr::get(kernel.getContext(), fullCoverageCandidates)));
-    if (auto current =
-            (*parameter)->getAttrOfType<IntegerAttr>(coverageDimensionAttr)) {
+    ParameterAttr schema = *parameter;
+    if (auto current = schema.isDeferred() ? schema.getBinding().getDimension() : IntegerAttr()) {
       if (current.getInt() != static_cast<int64_t>(dimension))
-        return parameter->emitOpError(
+        return kernel.emitOpError(
             "one physical parameter covers multiple logical dimensions");
-    } else {
-      (*parameter)->setAttr(
-          coverageDimensionAttr,
-          IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), dimension));
     }
+    schema = schema.withCandidates(DenseI64ArrayAttr::get(kernel.getContext(), fullCoverageCandidates))
+        .withPhase(ConfigurationBindingPhase::Deferred)
+        .withBinding(schema.getBinding().withDimension(
+            IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), dimension)));
+    if (failed(updateParameter(kernel, schema))) return failure();
+    OpBuilder entry(&kernel.front(), kernel.front().begin());
     if (failed(bindFullCoverageDimension(kernel, dimension,
-                                         parameter->getResult())))
-      return parameter->emitOpError(
+          materializeParameter(entry, kernel.getLoc(), schema.getReference()))))
+      return kernel.emitOpError(
           "native contraction coverage could not bind its exact logical dimension");
 
     // A logical subregion keeps its dynamic end, but a provider-native
@@ -645,7 +647,7 @@ LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
     // predicate remains the authority for active members in the final tile.
     // Retarget only the exact provenance carried by this operand axis.
     PhysicalExprAttr parameterExtent = parameterExpression(
-        kernel.getContext(), parameter->getParameter().getName().getValue());
+        kernel.getContext(), parameter->getName().getValue());
     auto sourceMapping = cast<AxisMapAttr>(
         fragment.getAxisMaps()[static_cast<unsigned>(axis)]);
     PhysicalSourceAxis source{sourceMapping.getSourceId(),
@@ -660,7 +662,7 @@ LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
     });
     for (MakeRangeOp range : subregions) {
       retargetSourceExtent(range.getResult(), source, parameterExtent);
-      range->setOperand(1, parameter->getResult());
+      range->setOperand(1, materializeParameter(entry, range.getLoc(), parameter->getReference()));
     }
   }
   return success();
@@ -766,7 +768,7 @@ LogicalResult neutralizeFullCoverageOperand(ContractOp contract,
     bool fullCoverage = isFullCoverageExtent(contract, type.getShape()[axis]);
     auto extent = cast<PhysicalExprAttr>(type.getShape()[axis]);
     if (!fullCoverage && extent.getKind() !=
-                             static_cast<uint32_t>(PhysicalExprKind::Constant))
+                             PhysicalExprKind::Constant)
       continue;
     PhysicalProgramAnalysis analysis(kernel);
     PhysicalRangeFact fact = analysis.axisRanges(source, static_cast<unsigned>(axis));

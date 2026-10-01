@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from intent.runtime.artifact import CompiledArtifact
@@ -18,23 +17,13 @@ def materialize_bangc_artifact(source, module_text, metadata, target) -> Compile
 
 
 def export_artifact(program, directory: str | Path) -> Path:
-    path = Path(directory)
-    path.mkdir(parents=True, exist_ok=True)
-    (path / "kernel.mlu").write_text(program.source)
-    (path / "program.mlir").write_text(program.ir)
-    (path / "artifact.json").write_text(json.dumps(program.metadata, indent=2))
-    return path
+    return program.save(directory)
 
 
-def load_artifact(directory: str | Path, target=None) -> CompiledArtifact:
-    from intent.targets.bangc import BangCTarget
-    path = Path(directory)
-    metadata = json.loads((path / "artifact.json").read_text())
-    if target is None:
-        target = BangCTarget(**{name: metadata[name] for name in
-            ("architecture", "tile", "tile_m", "tile_n", "tile_k", "region_tile", "tasks", "local_bytes")})
-    return materialize_bangc_artifact((path / "kernel.mlu").read_text(),
-        (path / "program.mlir").read_text(), metadata, target.resolve())
+def load_artifact(directory: str | Path, *, target) -> CompiledArtifact:
+    from intent.compiler.artifact import GeneratedProgram
+
+    return GeneratedProgram.load(directory).materialize(target=target)
 
 
 __all__ = ["DeviceBuffer", "DeviceView", "NativeProgram", "compile_library", "export_artifact", "load_artifact"]

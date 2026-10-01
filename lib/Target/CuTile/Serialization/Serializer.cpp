@@ -1,6 +1,7 @@
 #include "Intent/Target/CuTile/Serialization/Serializer.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -35,7 +36,7 @@ std::string expressionString(gpu::PhysicalExprAttr expression) {
   static const gpu::PythonExpressionSyntax syntax{
       "ct.cdiv", "min", "max", "", "_intent_next_power_of_2", false};
   return gpu::pythonExpression(expression, syntax, [](gpu::PhysicalExprAttr leaf) {
-    return leaf.getSymbol().getValue().str();
+    return leaf.getSymbolName().getValue().str();
   });
 }
 
@@ -57,8 +58,8 @@ std::string literal(Attribute value) {
   return gpu::pythonLiteral(value);
 }
 
-StringRef providerHint(gpu::ParameterOp parameter) {
-  auto role = static_cast<gpu::ParameterRole>(parameter.getParameter().getRole());
+StringRef providerHint(gpu::ParameterAttr parameter) {
+  auto role = parameter.getRole();
   if (role == gpu::ParameterRole::ProviderOccupancy)
     return "occupancy";
   if (role == gpu::ParameterRole::ProviderCTAs)
@@ -108,23 +109,22 @@ private:
       values[kernel.getArgument(metadata.abi)] = metadata.name;
     for (const ViewABI &view : views)
       values[kernel.getArgument(view.abi)] = view.name;
-    kernel.walk([&](gpu::ParameterOp parameter) {
+    for (Attribute attribute : gpu::getParameterDeclarations(kernel)) {
+      auto parameter = cast<gpu::ParameterAttr>(attribute);
       if (StringRef hint = providerHint(parameter); !hint.empty()) {
         if (!providerHintParameters.emplace(
-                hint.str(), parameter.getParameter().getName().getValue().str()).second) {
-          parameter.emitOpError("duplicates a cuTile compiler hint");
+                hint.str(), parameter.getName().getValue().str()).second) {
+          kernel.emitError("duplicates a cuTile compiler hint");
           failed = true;
           return;
         }
-        return;
       }
-    });
+    }
     llvm::StringSet<> occupied;
     for (const auto &entry : values)
       occupied.insert(entry.second);
-    kernel.walk([&](gpu::ParameterOp parameter) {
-      occupied.insert(parameter.getParameter().getName().getValue());
-    });
+    for (Attribute attribute : gpu::getParameterDeclarations(kernel))
+      occupied.insert(cast<gpu::ParameterAttr>(attribute).getName().getValue());
     auto fresh = [&](StringRef stem) {
       unsigned suffix = 0;
       std::string name;
@@ -258,13 +258,13 @@ private:
       argument(metadata.name + ": ConstInt");
     for (gpu::ViewOverlapOp overlap : overlapFacts)
       argument(valueString(overlap.getResult()) + ": ct.Constant[bool]");
-    kernel.walk([&](gpu::ParameterOp parameter) {
+    for (Attribute attribute : gpu::getParameterDeclarations(kernel)) {
+      auto parameter = cast<gpu::ParameterAttr>(attribute);
       if (!providerHint(parameter).empty())
-        return;
-      std::string name = parameter.getParameter().getName().getValue().str();
-      values[parameter.getResult()] = name;
+        continue;
+      std::string name = parameter.getName().getValue().str();
       argument(name + ": ConstInt");
-    });
+    }
     output << "):\n";
     indent = 1;
     emitBlock(kernel.getBody().front(), false, {});
@@ -359,7 +359,7 @@ private:
       values[constant.getResult()] = value;
     } else if (auto parameter = dyn_cast<gpu::ParameterOp>(operation)) {
       values[parameter.getResult()] =
-          parameter.getParameter().getName().getValue().str();
+          parameter.getReference().getName().getValue().str();
     } else if (auto physical = dyn_cast<gpu::PhysicalExprOp>(operation)) {
       assign(physical.getResult(), expressionString(physical.getExpression()));
     } else if (auto program = dyn_cast<gpu::ProgramIdOp>(operation)) {
@@ -991,10 +991,11 @@ private:
     for (const MetadataABI &argument : metadataArguments) arguments.push_back(argument.name);
     for (gpu::ViewOverlapOp overlap : overlapFacts)
       arguments.push_back(valueString(overlap.getResult()));
-    kernel.walk([&](gpu::ParameterOp parameter) {
+    for (Attribute attribute : gpu::getParameterDeclarations(kernel)) {
+      auto parameter = cast<gpu::ParameterAttr>(attribute);
       if (providerHint(parameter).empty())
-        arguments.push_back(parameter.getParameter().getName().getValue());
-    });
+        arguments.push_back(parameter.getName().getValue());
+    }
     details["kernel_arguments"] = std::move(arguments);
     details["array_views"] = std::move(arrays);
     details["index_tile_bounds"] = nullptr;

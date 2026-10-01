@@ -7,6 +7,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AttrTypeSubElements.h"
@@ -74,7 +75,7 @@ LogicalResult simplifyValues(ModuleOp module) {
 }
 
 LogicalResult closeSharedConfigurations(func::FuncOp kernel) {
-  eraseUnusedPhysicalParameters(kernel);
+  eraseUnusedParameters(kernel);
   if (failed(materializeSharedConfigTuples(kernel)))
     return failure();
   return verifySharedConfigTuples(kernel);
@@ -291,7 +292,7 @@ scf::IfOp independentUniformBranches(func::FuncOp kernel) {
   AttrTypeWalker expressions;
   expressions.addWalk([&](PhysicalExprAttr expression) {
     referencesParameter |= expression.getKind() ==
-                           static_cast<uint32_t>(PhysicalExprKind::Parameter);
+                           PhysicalExprKind::Parameter;
   });
   while (!conditions.empty()) {
     Operation *producer = conditions.pop_back_val().getDefiningOp();
@@ -395,7 +396,7 @@ FailureOr<bool> realizeUniformBranches(ModuleOp module, func::FuncOp kernel,
     eraseDeadPhysicalValues(function);
     if (failed(runTransforms(*branch)))
       return failure();
-    eraseUnusedPhysicalParameters(function);
+    eraseUnusedParameters(function);
     auto space = function->getAttrOfType<ArrayAttr>(programSpaceAttr);
     bool separateResources =
         function.getFunctionType() != kernel.getFunctionType();
@@ -415,27 +416,23 @@ FailureOr<bool> realizeUniformBranches(ModuleOp module, func::FuncOp kernel,
           module.getContext(),
           "G" + std::to_string(index) + "_" + name.getValue().str());
     };
-    AttrTypeReplacer replacer;
-    replacer.addReplacement([&](ParameterAttr parameter)
-                                -> std::optional<Attribute> {
-      return ParameterAttr::get(
-          module.getContext(), qualify(parameter.getName()), parameter.getRole(),
-          parameter.getCategory(), parameter.getElementBitWidth(),
-          parameter.getCandidates());
-    });
-    replacer.addReplacement([&](PhysicalExprAttr expression)
-                                -> std::optional<Attribute> {
-      if (expression.getKind() !=
-          static_cast<uint32_t>(PhysicalExprKind::Parameter))
-        return std::nullopt;
-      return PhysicalExprAttr::get(
-          module.getContext(), expression.getKind(), expression.getValue(),
-          qualify(expression.getSymbol()), expression.getOperands());
-    });
-    replacer.recursivelyReplaceElementsIn(function, true, true, true);
+    if (failed(renameParameters(function, qualify))) return failure();
   }
 
-  auto combined = cast<func::FuncOp>(kernel->cloneWithoutRegions());
+  OwningOpRef<func::FuncOp> combinedOwner(cast<func::FuncOp>(kernel->cloneWithoutRegions()));
+  func::FuncOp combined = *combinedOwner;
+  combined->setAttr(parametersAttr, ArrayAttr::get(module.getContext(), {}));
+  combined->removeAttr(configurationsAttr);
+  SmallVector<ParameterAttr> declarations;
+  for (auto &branch : branches) {
+    auto function = *getPhysicalKernel(*branch);
+    for (Attribute attribute : getParameterDeclarations(function))
+      declarations.push_back(cast<ParameterAttr>(attribute));
+  }
+  // Declaration insertion is prepend, matching the former entry-block builder.
+  // Import in reverse so the merged domain order remains branch0 then branch1.
+  for (ParameterAttr declaration : llvm::reverse(declarations))
+    if (failed(declareParameter(combined, declaration))) return failure();
   module.getBody()->push_back(combined);
   Block *entry = combined.addEntryBlock();
   OpBuilder builder(entry, entry->begin());
@@ -455,7 +452,7 @@ FailureOr<bool> realizeUniformBranches(ModuleOp module, func::FuncOp kernel,
   Value program = builder.create<ProgramIdOp>(location, builder.getIndexType(), 0);
   auto expression = [&](PhysicalExprKind kind, int64_t value,
                         ArrayRef<Attribute> operands = {}) {
-    return PhysicalExprAttr::get(module.getContext(), static_cast<uint32_t>(kind),
+    return PhysicalExprAttr::get(module.getContext(), kind,
         value, builder.getStringAttr(""), builder.getArrayAttr(operands));
   };
   PhysicalExprAttr zero = expression(PhysicalExprKind::Constant, 0);
@@ -471,9 +468,6 @@ FailureOr<bool> realizeUniformBranches(ModuleOp module, func::FuncOp kernel,
            index == 0 ? zero : length});
     IRMapping mapping;
     mapping.map(function.getArguments(), combined.getArguments());
-    function.walk([&](ParameterOp parameter) {
-      builder.clone(*parameter, mapping);
-    });
     Value begin = builder.create<PhysicalExprOp>(
         location, builder.getIndexType(), offset);
     Value count = builder.create<PhysicalExprOp>(
@@ -500,8 +494,6 @@ FailureOr<bool> realizeUniformBranches(ModuleOp module, func::FuncOp kernel,
     Value local = nested.create<BinaryOp>(
         location, builder.getIndexType(), program, begin, BinaryOperator::Subtract);
     for (Operation &operation : function.front().without_terminator()) {
-      if (isa<ParameterOp>(operation))
-        continue;
       if (auto id = dyn_cast<ProgramIdOp>(operation)) {
         mapping.map(id.getResult(), local);
         continue;
@@ -522,6 +514,7 @@ FailureOr<bool> realizeUniformBranches(ModuleOp module, func::FuncOp kernel,
   combined->setAttr(programSpaceAttr, builder.getArrayAttr({offset}));
   combined->setAttr(gridRankAttr, builder.getI64IntegerAttr(1));
   kernel.erase();
+  combinedOwner.release();
   branches.clear();
   if (failed(verifyGPUProgram(module)))
     return failure();

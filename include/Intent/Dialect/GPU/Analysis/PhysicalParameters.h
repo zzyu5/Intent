@@ -1,41 +1,37 @@
 #ifndef INTENT_DIALECT_GPU_ANALYSIS_PHYSICALPARAMETERS_H
 #define INTENT_DIALECT_GPU_ANALYSIS_PHYSICALPARAMETERS_H
 
-#include "Intent/Dialect/GPU/IR/GPUOps.h"
+#include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 
 namespace intent::gpu {
 
-struct PhysicalParameterDomain {
-  ParameterOp operation;
-  ParameterAttr definition;
-  bool coverage;
-  bool provider;
+// A missing table/reference is returned as null, never as an implicit empty
+// parameter space. These queries do not cache declaration state.
+mlir::ArrayAttr getParameterDeclarations(mlir::func::FuncOp kernel);
+ParameterAttr lookupParameter(mlir::func::FuncOp kernel, mlir::StringAttr name);
+ParameterAttr lookupParameter(mlir::func::FuncOp kernel, ParameterRefAttr reference);
 
-  mlir::StringAttr name() const { return definition.getName(); }
-  ParameterRole role() const {
-    return static_cast<ParameterRole>(definition.getRole());
-  }
-  llvm::ArrayRef<int64_t> candidates() const {
-    return definition.getCandidates().asArrayRef();
-  }
-};
-
-// A read-only snapshot of declarations in the current physical kernel. Rebuild
-// after changing a declaration or its candidate domain. Configs remain IR
-// attributes; this analysis neither chooses candidates nor owns execution data.
-class PhysicalParameterSpace {
+// Snapshot of kernel-owned declarations, independent of SSA reads. Rebuild
+// after any declaration mutation; candidate bindings remain in current IR.
+class ParameterSpace {
 public:
-  static mlir::FailureOr<PhysicalParameterSpace> read(mlir::func::FuncOp kernel);
-  llvm::ArrayRef<PhysicalParameterDomain> domains() const { return parameters; }
-  const PhysicalParameterDomain *find(ParameterRole role) const;
+  static mlir::FailureOr<ParameterSpace> read(mlir::func::FuncOp kernel);
+  llvm::ArrayRef<ParameterAttr> declarations() const { return parameters; }
+  llvm::ArrayRef<ParameterAttr> extentDeclarations() const { return extents; }
+  ParameterAttr lookup(mlir::StringAttr name) const;
+  ParameterAttr lookup(ParameterRefAttr reference) const;
+  ParameterAttr find(ParameterRole role) const;
+  mlir::LogicalResult verifyBindings(mlir::DictionaryAttr bindings,
+                                    ConfigurationStage stage) const;
   mlir::FailureOr<llvm::SmallVector<mlir::DictionaryAttr>>
-  sharedConfigurations() const;
+  configurations(ConfigurationStage stage) const;
 
 private:
   mlir::func::FuncOp kernel;
-  llvm::SmallVector<PhysicalParameterDomain> parameters;
+  llvm::SmallVector<ParameterAttr> parameters;
+  llvm::SmallVector<ParameterAttr> extents;
 };
 
 } // namespace intent::gpu

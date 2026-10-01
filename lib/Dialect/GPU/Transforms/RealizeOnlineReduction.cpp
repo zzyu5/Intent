@@ -3,6 +3,7 @@
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 
 #include "OnlineSummary.h"
 
@@ -31,8 +32,9 @@ struct OnlineSummaryPattern : OnlineSummaryStructure {
 
 PhysicalExprAttr parameterExpression(MLIRContext *context, StringRef name) {
   return PhysicalExprAttr::get(
-      context, static_cast<uint32_t>(PhysicalExprKind::Parameter), 0,
-      StringAttr::get(context, name), ArrayAttr::get(context, {}));
+      context, PhysicalExprKind::Parameter, 0,
+      ParameterRefAttr::get(context, StringAttr::get(context, name)),
+      ArrayAttr::get(context, {}));
 }
 
 FragmentType withElementType(FragmentType type, Type elementType) {
@@ -128,20 +130,24 @@ LogicalResult realizeOnlineSummary(OnlineSummaryPattern pattern,
           .str();
   SmallVector<int64_t> candidates{8, 16, 32, 64, 128,
                                   256, 512, 1024, 2048, 4096};
-  ParameterOp chunk = getOrCreatePhysicalParameter(
+  auto chunkReference = getOrCreatePhysicalParameter(
       kernel, parameterName, ParameterRole::Reduction,
       ParameterCategory::Reduction,
       scoreType.getElementType().getIntOrFloatBitWidth(), candidates);
-  if (!chunk)
+  if (failed(chunkReference))
     return pattern.record.emitOpError(
         "online reduction has no physical traversal parameter");
   if (FailureOr<int64_t> dimension = queryRangeDimension(pattern.authority);
       succeeded(dimension))
-    chunk->setAttr(dimensionAttr,
-                   IntegerAttr::get(IntegerType::get(chunk.getContext(), 64),
-                                    *dimension));
+    if (failed(updateParameter(kernel,
+            lookupParameter(kernel, *chunkReference).withBinding(
+                lookupParameter(kernel, *chunkReference).getBinding().withDimension(
+                    IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), *dimension))))))
+      return failure();
+  OpBuilder parameterBuilder(&kernel.front(), kernel.front().begin());
+  auto chunk = materializeParameter(parameterBuilder, pattern.record.getLoc(), *chunkReference);
   PhysicalExprAttr chunkExtent = parameterExpression(
-      pattern.record.getContext(), chunk.getParameter().getName().getValue());
+      pattern.record.getContext(), chunkReference->getName().getValue());
 
   OpBuilder builder(pattern.record);
   Location location = pattern.record.getLoc();

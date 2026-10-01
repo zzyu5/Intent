@@ -6,7 +6,7 @@
 
 namespace intent::gpu {
 
-PhysicalExprAttr boundedTraversalChunk(ParameterOp chunk, MakeRangeOp range);
+PhysicalExprAttr boundedTraversalChunk(ParameterAttr chunk, MakeRangeOp range);
 mlir::LogicalResult bindFullCoverageDimension(mlir::func::FuncOp kernel,
                                               uint64_t dimension,
                                               mlir::Value physicalExtent);

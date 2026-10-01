@@ -1,181 +1,236 @@
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
-#include "Intent/Dialect/GPU/Analysis/Configurations.h"
-#include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
-
-#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
-#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
-#include "Intent/Dialect/GPU/IR/Program.h"
-#include "llvm/ADT/APInt.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/SetVector.h"
-#include "llvm/ADT/SmallPtrSet.h"
-#include "llvm/ADT/StringSet.h"
-#include "llvm/Support/MathExtras.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/IR/AttrTypeSubElements.h"
-#include "mlir/IR/Matchers.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
-#include "mlir/Transforms/RegionUtils.h"
+#include "llvm/ADT/STLExtras.h"
 #include <algorithm>
-#include <functional>
-#include <optional>
 
 using namespace mlir;
 
 namespace intent::gpu {
-
-LogicalResult writeConfigurations(func::FuncOp kernel,
-                                  ArrayRef<DictionaryAttr> rows,
-                                  ConfigurationStage stage) {
-  auto space = ConfigurationSpace::read(kernel);
-  if (failed(space))
-    return failure();
-  for (DictionaryAttr row : rows)
-    if (failed(space->verifyBindings(row, stage)))
-      return failure();
-  SmallVector<Attribute> encoded(rows.begin(), rows.end());
-  auto set = ConfigurationSetAttr::getChecked(
-      [&] { return kernel.emitError(); }, kernel.getContext(), stage,
-      ArrayAttr::get(kernel.getContext(), encoded));
-  if (!set)
-    return failure();
-  kernel->setAttr(configurationsAttr, set);
-  return success();
-}
-
-ParameterOp getOrCreatePhysicalParameter(
-    func::FuncOp kernel, StringRef name, ParameterRole role,
-    ParameterCategory category, uint32_t elementBitWidth,
-    ArrayRef<int64_t> candidates) {
-  ParameterOp existing;
-  bool ambiguous = false;
-  kernel.walk([&](ParameterOp parameter) {
-    if (parameter.getParameter().getName().getValue() != name)
-      return;
-    if (existing && existing != parameter)
-      ambiguous = true;
-    else
-      existing = parameter;
-  });
-  if (ambiguous) {
-    kernel.emitError("physical parameter symbol has multiple declarations")
-        << "; name=" << name;
-    return ParameterOp();
-  }
-  auto expectedCandidates =
-      DenseI64ArrayAttr::get(kernel.getContext(), candidates);
-  if (existing) {
-    ParameterAttr schema = existing.getParameter();
-    if (schema.getRole() != static_cast<uint32_t>(role) ||
-        schema.getCategory() != static_cast<uint32_t>(category) ||
-        schema.getCandidates() != expectedCandidates) {
-      existing.emitOpError(
-          "physical parameter symbol is reused with an incompatible decision domain")
-          << "; name=" << name << "; existing_role=" << schema.getRole()
-          << "; requested_role=" << static_cast<uint32_t>(role)
-          << "; existing_category=" << schema.getCategory()
-          << "; requested_category=" << static_cast<uint32_t>(category)
-          << "; existing_candidates=" << schema.getCandidates()
-          << "; requested_candidates=" << expectedCandidates;
-      return ParameterOp();
-    }
-    uint32_t aggregateWidth =
-        std::max(schema.getElementBitWidth(), elementBitWidth);
-    if (aggregateWidth != schema.getElementBitWidth())
-      existing->setAttr(
-          "parameter",
-          ParameterAttr::get(kernel.getContext(), schema.getName(),
-                             schema.getRole(), schema.getCategory(),
-                             aggregateWidth, schema.getCandidates()));
-    return existing;
-  }
-  OpBuilder builder(&kernel.getBody().front(), kernel.getBody().front().begin());
-  auto schema = ParameterAttr::get(
-      kernel.getContext(), builder.getStringAttr(name),
-      static_cast<uint32_t>(role), static_cast<uint32_t>(category),
-      elementBitWidth, expectedCandidates);
-  return builder.create<ParameterOp>(kernel.getLoc(), builder.getIndexType(),
-                                     schema);
-}
-
-
 namespace {
 
-llvm::StringSet<> referencedParameterSymbols(func::FuncOp kernel) {
-  llvm::StringSet<> symbols;
+void invalidateConfigurations(func::FuncOp kernel, ParameterAttr before,
+                              ParameterAttr after) {
+  auto set = kernel->getAttrOfType<ConfigurationSetAttr>(configurationsAttr);
+  if (!set) return;
+  bool providerOnly = (!before || before.getPhase() == ConfigurationBindingPhase::Provider) &&
+                      (!after || after.getPhase() == ConfigurationBindingPhase::Provider);
+  if (!providerOnly || set.getStage() == ConfigurationStage::Complete)
+    kernel->removeAttr(configurationsAttr);
+}
+
+LogicalResult verifyDeclaration(func::FuncOp kernel, ParameterAttr declaration) {
+  if (!declaration) return kernel.emitError("cannot publish a null parameter declaration");
+  auto emit = [&] { return kernel.emitError("invalid compile-time parameter declaration"); };
+  auto binding = declaration.getBinding();
+  if (!binding) return emit() << "; missing typed binding";
+  if (failed(ParameterBindingAttr::verify(emit, binding.getDimension(), binding.getSource(),
+          binding.getCoverageBound(), binding.getGroup(), binding.getPointwiseChunk(),
+          binding.getPointwiseLocal())))
+    return failure();
+  return ParameterAttr::verify(emit, declaration.getName(), declaration.getValueType(),
+      declaration.getRole(), declaration.getCategory(), declaration.getElementBitWidth(),
+      declaration.getCandidates(), declaration.getPhase(), binding);
+}
+
+llvm::DenseSet<ParameterRefAttr> referencedParameters(func::FuncOp kernel) {
+  llvm::DenseSet<ParameterRefAttr> references;
   AttrTypeWalker walker;
-  walker.addWalk([&](PhysicalExprAttr expression) {
-    if (expression.getKind() == static_cast<uint32_t>(PhysicalExprKind::Parameter))
-      symbols.insert(expression.getSymbol().getValue());
-  });
+  walker.addWalk([&](ParameterRefAttr reference) { references.insert(reference); });
   kernel.walk([&](Operation *operation) {
-    walker.walk(operation->getAttrDictionary());
-    for (Type type : operation->getResultTypes())
-      walker.walk(type);
+    if (operation == kernel.getOperation()) {
+      // Declarations are not their own users, and rows are a derived binding
+      // set. A retained declaration's dependencies are reached below.
+      for (NamedAttribute attribute : operation->getAttrs())
+        if (attribute.getName() != parametersAttr && attribute.getName() != configurationsAttr)
+          walker.walk(attribute.getValue());
+    } else {
+      walker.walk(operation->getAttrDictionary());
+    }
+    for (Type type : operation->getResultTypes()) walker.walk(type);
     for (Region &region : operation->getRegions())
       for (Block &block : region)
-        for (BlockArgument argument : block.getArguments())
-          walker.walk(argument.getType());
+        for (BlockArgument argument : block.getArguments()) walker.walk(argument.getType());
   });
-  return symbols;
+  auto declarations = getParameterDeclarations(kernel);
+  if (!declarations) return references;
+  // Provider options are part of the native compile interface even when they
+  // are not read by the kernel body (for example Triton's warp/CTA counts).
+  for (Attribute attribute : declarations) {
+    auto declaration = cast<ParameterAttr>(attribute);
+    if (declaration.getPhase() == ConfigurationBindingPhase::Provider)
+      references.insert(declaration.getReference());
+  }
+  llvm::DenseSet<ParameterRefAttr> visited;
+  bool changed;
+  do {
+    changed = false;
+    for (Attribute attribute : declarations) {
+      auto declaration = cast<ParameterAttr>(attribute);
+      auto reference = declaration.getReference();
+      if (!references.contains(reference) || !visited.insert(reference).second) continue;
+      walker.walk(declaration.getBinding());
+      changed = true;
+    }
+  } while (changed);
+  return references;
 }
 
 } // namespace
 
-void eraseUnusedPhysicalParameters(func::FuncOp kernel) {
-  auto referenced = referencedParameterSymbols(kernel);
-  SmallVector<ParameterOp> unused;
-  kernel.walk([&](ParameterOp parameter) {
-    if (parameter.getResult().use_empty() &&
-        !referenced.contains(parameter.getParameter().getName().getValue()))
-      unused.push_back(parameter);
-  });
-  for (ParameterOp parameter : llvm::reverse(unused))
-    parameter.erase();
-  if (!unused.empty())
-    kernel->removeAttr(configurationsAttr);
+LogicalResult writeConfigurations(func::FuncOp kernel,
+                                  ArrayRef<DictionaryAttr> rows,
+                                  ConfigurationStage stage) {
+  auto space = ParameterSpace::read(kernel);
+  if (failed(space)) return failure();
+  for (DictionaryAttr row : rows)
+    if (failed(space->verifyBindings(row, stage))) return failure();
+  SmallVector<Attribute> encoded(rows.begin(), rows.end());
+  auto set = ConfigurationSetAttr::getChecked(
+      [&] { return kernel.emitError(); }, kernel.getContext(), stage,
+      ArrayAttr::get(kernel.getContext(), encoded));
+  if (!set) return failure();
+  kernel->setAttr(configurationsAttr, set);
+  return success();
 }
 
-LogicalResult replacePhysicalParameter(func::FuncOp kernel,
-                                       ParameterOp previous,
-                                       ParameterOp replacement) {
-  if (!previous || !replacement || previous == replacement)
-    return success();
-  // This changes the executable parameter domain. A completed candidate set is
-  // not a declaration and cannot survive as bindings to the old program. The
-  // enclosing transformation must materialize configurations for its result.
-  kernel->removeAttr(configurationsAttr);
-  StringAttr previousName = previous.getParameter().getName();
-  StringAttr replacementName = replacement.getParameter().getName();
-  previous.getResult().replaceAllUsesWith(replacement.getResult());
-  AttrTypeReplacer replacer;
-  replacer.addReplacement([&](PhysicalExprAttr expression)
-      -> std::optional<Attribute> {
-    if (expression.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter) ||
-        expression.getSymbol() != previousName)
-      return std::nullopt;
-    return PhysicalExprAttr::get(
-        expression.getContext(), expression.getKind(), expression.getValue(),
-        replacementName, expression.getOperands());
-  });
-  kernel.walk([&](Operation *operation) {
-    for (Value result : operation->getResults())
-      result.setType(replacer.replace(result.getType()));
-    operation->setAttrs(cast<DictionaryAttr>(
-        replacer.replace(operation->getAttrDictionary())));
-    for (Region &region : operation->getRegions())
-      for (Block &block : region)
-        for (BlockArgument argument : block.getArguments())
-          argument.setType(replacer.replace(argument.getType()));
-  });
-  if (!previous.getResult().use_empty() ||
-      referencedParameterSymbols(kernel).contains(previousName.getValue()))
-    return previous.emitOpError(
-        "physical parameter refinement left a second executable authority");
-  previous.erase();
+FailureOr<ParameterRefAttr> declareParameter(func::FuncOp kernel,
+                                             ParameterAttr declaration) {
+  if (failed(verifyDeclaration(kernel, declaration))) return failure();
+  auto declarations = getParameterDeclarations(kernel);
+  if (!declarations)
+    return kernel.emitError("cannot declare a parameter without its kernel-owned table"), failure();
+  if (auto existing = lookupParameter(kernel, declaration.getName())) {
+    if (existing == declaration) return existing.getReference();
+    return kernel.emitError("compile-time parameter already has a different declaration: ")
+           << declaration.getName(), failure();
+  }
+  SmallVector<Attribute> updated{declaration};
+  llvm::append_range(updated, declarations);
+  kernel->setAttr(parametersAttr, ArrayAttr::get(kernel.getContext(), updated));
+  invalidateConfigurations(kernel, {}, declaration);
+  return declaration.getReference();
+}
+
+FailureOr<ParameterRefAttr> getOrCreatePhysicalParameter(
+    func::FuncOp kernel, StringRef name, ParameterRole role,
+    ParameterCategory category, uint32_t elementBitWidth,
+    ArrayRef<int64_t> candidates, ParameterBindingAttr binding) {
+  Builder builder(kernel.getContext());
+  const bool explicitBinding = bool(binding);
+  if (!binding) binding = ParameterBindingAttr::get(kernel.getContext(), {}, {}, {}, {}, false, false);
+  auto phase = category == ParameterCategory::Provider ? ConfigurationBindingPhase::Provider
+             : category == ParameterCategory::Coverage ? ConfigurationBindingPhase::Deferred
+                                                       : ConfigurationBindingPhase::Shared;
+  auto declaration = ParameterAttr::get(kernel.getContext(), builder.getStringAttr(name),
+      builder.getIndexType(), role, category,
+      elementBitWidth, builder.getDenseI64ArrayAttr(candidates), phase, binding);
+  if (auto existing = lookupParameter(kernel, declaration.getName())) {
+    if (!existing.isExtent() || existing.getRole() != declaration.getRole() ||
+        existing.getCategory() != declaration.getCategory() ||
+        existing.getCandidates() != declaration.getCandidates() ||
+        (explicitBinding && existing.getBinding() != binding))
+      return kernel.emitError("physical parameter is reused with an incompatible domain: ")
+             << name, failure();
+    uint32_t width = std::max(existing.getElementBitWidth(), elementBitWidth);
+    if (width != existing.getElementBitWidth()) {
+      auto widened = ParameterAttr::get(kernel.getContext(), existing.getName(), existing.getValueType(),
+          existing.getRole(), existing.getCategory(), width, existing.getCandidates(),
+          existing.getPhase(), existing.getBinding());
+      if (failed(updateParameter(kernel, widened))) return failure();
+    }
+    return existing.getReference();
+  }
+  return declareParameter(kernel, declaration);
+}
+
+ParameterOp materializeParameter(OpBuilder &builder, Location location,
+                                 ParameterRefAttr reference) {
+  return builder.create<ParameterOp>(location, builder.getIndexType(), reference);
+}
+
+LogicalResult updateParameter(func::FuncOp kernel, ParameterAttr declaration) {
+  if (failed(verifyDeclaration(kernel, declaration))) return failure();
+  auto previous = lookupParameter(kernel, declaration.getName());
+  if (!previous) return kernel.emitError("cannot update an undeclared parameter: ") << declaration.getName();
+  if (previous == declaration) return success();
+  if (previous.getValueType() != declaration.getValueType())
+    return kernel.emitError("parameter update cannot change the type of existing references");
+  SmallVector<Attribute> updated;
+  for (Attribute attribute : getParameterDeclarations(kernel))
+    updated.push_back(attribute == previous ? declaration : attribute);
+  kernel->setAttr(parametersAttr, ArrayAttr::get(kernel.getContext(), updated));
+  invalidateConfigurations(kernel, previous, declaration);
   return success();
+}
+
+LogicalResult replaceParameter(func::FuncOp kernel, ParameterRefAttr previous,
+                                ParameterRefAttr replacement) {
+  if (previous == replacement) return success();
+  auto before = lookupParameter(kernel, previous);
+  auto after = lookupParameter(kernel, replacement);
+  if (!before || !after || before.getValueType() != after.getValueType())
+    return kernel.emitError("parameter replacement requires two same-type declarations");
+  invalidateConfigurations(kernel, before, after);
+  SmallVector<Attribute> updated;
+  for (Attribute attribute : getParameterDeclarations(kernel))
+    if (attribute != before) updated.push_back(attribute);
+  kernel->setAttr(parametersAttr, ArrayAttr::get(kernel.getContext(), updated));
+  AttrTypeReplacer replacer;
+  replacer.addReplacement([&](ParameterRefAttr reference) -> std::optional<Attribute> {
+    return reference == previous ? std::optional<Attribute>(replacement) : std::nullopt;
+  });
+  replacer.recursivelyReplaceElementsIn(kernel, true, false, true);
+  return success();
+}
+
+LogicalResult renameParameters(func::FuncOp kernel,
+                               function_ref<StringAttr(StringAttr)> rename) {
+  auto space = ParameterSpace::read(kernel);
+  if (failed(space)) return failure();
+  llvm::DenseMap<StringAttr, StringAttr> names;
+  llvm::DenseSet<StringAttr> unique;
+  for (ParameterAttr declaration : space->declarations()) {
+    auto name = rename(declaration.getName());
+    if (!name || name.empty() || !unique.insert(name).second)
+      return kernel.emitError("parameter rename must produce unique nonempty names");
+    names.try_emplace(declaration.getName(), name);
+  }
+  kernel->removeAttr(configurationsAttr);
+  AttrTypeReplacer replacer;
+  replacer.addReplacement([&](ParameterAttr declaration) -> std::optional<Attribute> {
+    auto found = names.find(declaration.getName());
+    return found == names.end() ? std::nullopt
+                               : std::optional<Attribute>(declaration.withName(found->second));
+  });
+  replacer.addReplacement([&](ParameterRefAttr reference) -> std::optional<Attribute> {
+    auto found = names.find(reference.getName());
+    return found == names.end() ? std::nullopt
+        : std::optional<Attribute>(ParameterRefAttr::get(kernel.getContext(), found->second));
+  });
+  replacer.recursivelyReplaceElementsIn(kernel, true, false, true);
+  return success();
+}
+
+void eraseUnusedParameters(func::FuncOp kernel) {
+  SmallVector<ParameterOp> deadReads;
+  kernel.walk([&](ParameterOp read) {
+    if (read.getResult().use_empty()) deadReads.push_back(read);
+  });
+  for (ParameterOp read : deadReads) read.erase();
+  auto declarations = getParameterDeclarations(kernel);
+  if (!declarations) return;
+  auto referenced = referencedParameters(kernel);
+  SmallVector<Attribute> retained;
+  for (Attribute attribute : declarations) {
+    auto declaration = cast<ParameterAttr>(attribute);
+    if (referenced.contains(declaration.getReference())) retained.push_back(declaration);
+    else invalidateConfigurations(kernel, declaration, {});
+  }
+  if (retained.size() != declarations.size())
+    kernel->setAttr(parametersAttr, ArrayAttr::get(kernel.getContext(), retained));
 }
 
 } // namespace intent::gpu

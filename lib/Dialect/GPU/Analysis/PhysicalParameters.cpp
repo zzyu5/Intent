@@ -1,44 +1,98 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
-#include "Intent/Dialect/GPU/Analysis/Configurations.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSet.h"
 
 using namespace mlir;
 
 namespace intent::gpu {
 
-FailureOr<PhysicalParameterSpace>
-PhysicalParameterSpace::read(func::FuncOp kernel) {
-  PhysicalParameterSpace result;
+ArrayAttr getParameterDeclarations(func::FuncOp kernel) {
+  return kernel->getAttrOfType<ArrayAttr>(parametersAttr);
+}
+
+ParameterAttr lookupParameter(func::FuncOp kernel, StringAttr name) {
+  return name ? lookupParameterDeclaration(kernel, ParameterRefAttr::get(kernel.getContext(), name))
+              : ParameterAttr();
+}
+
+ParameterAttr lookupParameter(func::FuncOp kernel, ParameterRefAttr reference) {
+  return lookupParameterDeclaration(kernel, reference);
+}
+
+FailureOr<ParameterSpace> ParameterSpace::read(func::FuncOp kernel) {
+  ParameterSpace result;
   result.kernel = kernel;
-  auto declarations = ConfigurationSpace::read(kernel);
-  if (failed(declarations))
-    return failure();
-  for (auto declaration : declarations->parameters()) {
-    auto parameter = dyn_cast<ParameterOp>(declaration.getOperation());
-    if (!parameter)
-      continue;
-    auto phase = parameter.getConfigurationBindingPhase();
-    result.parameters.push_back({
-        parameter, parameter.getParameter(),
-        phase == ConfigurationBindingPhase::Deferred,
-        phase == ConfigurationBindingPhase::Provider});
+  auto declarations = getParameterDeclarations(kernel);
+  if (!declarations)
+    return kernel.emitError("requires a kernel-owned parameter declaration table"), failure();
+  llvm::StringSet<> names;
+  for (Attribute attribute : declarations) {
+    auto parameter = dyn_cast<ParameterAttr>(attribute);
+    if (!parameter || !names.insert(parameter.getName().getValue()).second)
+      return kernel.emitError("parameter declarations must be typed and have unique names"), failure();
+    result.parameters.push_back(parameter);
+    if (parameter.isExtent()) result.extents.push_back(parameter);
   }
   return result;
 }
 
-const PhysicalParameterDomain *
-PhysicalParameterSpace::find(ParameterRole role) const {
-  for (const auto &domain : parameters)
-    if (domain.role() == role)
-      return &domain;
-  return nullptr;
+ParameterAttr ParameterSpace::lookup(StringAttr name) const {
+  for (ParameterAttr parameter : parameters)
+    if (parameter.getName() == name) return parameter;
+  return {};
+}
+
+ParameterAttr ParameterSpace::lookup(ParameterRefAttr reference) const {
+  return reference ? lookup(reference.getName()) : ParameterAttr();
+}
+
+ParameterAttr ParameterSpace::find(ParameterRole role) const {
+  for (ParameterAttr parameter : parameters)
+    if (parameter.getRole() == role) return parameter;
+  return {};
+}
+
+LogicalResult ParameterSpace::verifyBindings(DictionaryAttr bindings,
+                                             ConfigurationStage stage) const {
+  if (!bindings)
+    return kernel->emitError("configuration requires a binding dictionary");
+  unsigned expected = 0;
+  for (ParameterAttr parameter : parameters) {
+    auto phase = parameter.getPhase();
+    if (phase == ConfigurationBindingPhase::Deferred ||
+        (stage == ConfigurationStage::Shared && phase == ConfigurationBindingPhase::Provider))
+      continue;
+    ++expected;
+    auto value = bindings.getAs<IntegerAttr>(parameter.getName());
+    if (!value || !value.getType().isSignlessInteger(64) ||
+        !llvm::is_contained(parameter.getCandidates().asArrayRef(), value.getInt()))
+      return kernel->emitError("configuration has no in-domain binding for ")
+             << parameter.getName().getValue();
+  }
+  if (bindings.size() != expected)
+    return kernel->emitError("configuration contains an undeclared or deferred binding");
+  return success();
 }
 
 FailureOr<SmallVector<DictionaryAttr>>
-PhysicalParameterSpace::sharedConfigurations() const {
-  auto space = ConfigurationSpace::read(kernel);
-  if (failed(space))
-    return failure();
-  return space->configurations(ConfigurationStage::Shared);
+ParameterSpace::configurations(ConfigurationStage stage) const {
+  auto set = kernel->getAttrOfType<ConfigurationSetAttr>(configurationsAttr);
+  if (!set || set.getStage() != stage)
+    return kernel->emitError("requires a ") << stringifyConfigurationStage(stage)
+           << " configuration set for the current program";
+  SmallVector<DictionaryAttr> result;
+  llvm::DenseSet<Attribute> unique;
+  if (set.getRows().empty())
+    return kernel->emitError("configuration set cannot be empty");
+  for (Attribute attribute : set.getRows()) {
+    auto row = dyn_cast<DictionaryAttr>(attribute);
+    if (failed(verifyBindings(row, stage))) return failure();
+    if (!unique.insert(row).second)
+      return kernel->emitError("configuration set contains duplicate bindings");
+    result.push_back(row);
+  }
+  return result;
 }
 
 } // namespace intent::gpu

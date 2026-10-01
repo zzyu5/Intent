@@ -2,7 +2,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
-#include "Intent/Dialect/GPU/Analysis/Configurations.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
@@ -87,7 +87,7 @@ expandedGatherAxis(gpu::FragmentType source, gpu::FragmentType result,
     auto extent = dyn_cast<gpu::PhysicalExprAttr>(result.getShape()[resultIndex]);
     if (!extent ||
         extent.getKind() !=
-            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+            gpu::PhysicalExprKind::Constant ||
         extent.getValue() != 1)
       return std::nullopt;
   }
@@ -136,7 +136,7 @@ std::optional<int64_t> staticGatherCoordinate(gpu::GatherOp gather) {
       source.getShape()[source.getShape().size() - 1]);
   if (!trailing ||
       trailing.getKind() !=
-          static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+          gpu::PhysicalExprKind::Constant ||
       trailing.getValue() != 2 ||
       !std::equal(result.getShape().begin(), result.getShape().end(),
                   source.getShape().begin()) ||
@@ -289,7 +289,7 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
           if (axis)
             elements = gpu::PhysicalExprAttr::get(
                 kernel.getContext(),
-                static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
+                gpu::PhysicalExprKind::Multiply, 0,
                 builder.getStringAttr(""), builder.getArrayAttr({elements, extent}));
           Value size = builder.create<gpu::PhysicalExprOp>(
               location, builder.getIndexType(), extent);
@@ -304,7 +304,7 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
         if (auto count = evaluateCompileTimeExpression(elements))
           elements = gpu::PhysicalExprAttr::get(
               kernel.getContext(),
-              static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), *count,
+              gpu::PhysicalExprKind::Constant, *count,
               builder.getStringAttr(""), builder.getArrayAttr({}));
         auto mapping = gpu::AxisMapAttr::get(
             kernel.getContext(), nextSource++, 0, nextDimension++, 0, true);
@@ -342,7 +342,7 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
         for (Attribute extent : result.getShape().getValue().drop_front())
           elements = gpu::PhysicalExprAttr::get(
               kernel.getContext(),
-              static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
+              gpu::PhysicalExprKind::Multiply, 0,
               builder.getStringAttr(""), builder.getArrayAttr({elements, extent}));
         auto mapping = gpu::AxisMapAttr::get(
             kernel.getContext(), nextSource++, 0, nextDimension++, 0, true);
@@ -432,11 +432,9 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
               ? dyn_cast<gpu::PhysicalExprAttr>(source.getShape()[selectedAxis])
               : gpu::PhysicalExprAttr();
       bool compatible = selectedExtent &&
-          ((selectedExtent.getKind() == static_cast<uint32_t>(
-                                           gpu::PhysicalExprKind::Constant) &&
+          ((selectedExtent.getKind() == gpu::PhysicalExprKind::Constant &&
             selectedExtent.getValue() > 0) ||
-           selectedExtent.getKind() == static_cast<uint32_t>(
-                                          gpu::PhysicalExprKind::Parameter));
+           selectedExtent.getKind() == gpu::PhysicalExprKind::Parameter);
       unsigned resultAxis = 0;
       for (unsigned sourceAxis = 0;
            compatible && sourceAxis < source.getShape().size(); ++sourceAxis) {
@@ -452,7 +450,7 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
                                              source.getShape().end());
         selectedShape[selectedAxis] = gpu::PhysicalExprAttr::get(
             gather.getContext(),
-            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), 1,
+            gpu::PhysicalExprKind::Constant, 1,
             builder.getStringAttr(""), builder.getArrayAttr({}));
         auto coordinateType = gpu::FragmentType::get(
             gather.getContext(), gpu::uniformElementType(gather.getCoordinates().front().getType()),
@@ -511,8 +509,7 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
       auto predicateValue = predicate ? dyn_cast<IntegerAttr>(predicate.getValue())
                                       : IntegerAttr();
       if (extent &&
-          extent.getKind() == static_cast<uint32_t>(
-                                  gpu::PhysicalExprKind::Constant) &&
+          extent.getKind() == gpu::PhysicalExprKind::Constant &&
           coordinateValue && coordinateValue.getInt() >= 0 &&
           coordinateValue.getInt() < extent.getValue() && predicateValue &&
           predicateValue.getValue().isOne()) {
@@ -606,7 +603,7 @@ LogicalResult legalizeExpandingGathers(func::FuncOp kernel) {
       continue;
     auto constantExtent = [](gpu::PhysicalExprAttr extent) {
       return extent.getKind() ==
-             static_cast<uint32_t>(gpu::PhysicalExprKind::Constant);
+             gpu::PhysicalExprKind::Constant;
     };
     bool constantShape = constantExtent(sourceExtent) &&
                          constantExtent(resultExtent);
@@ -618,7 +615,7 @@ LogicalResult legalizeExpandingGathers(func::FuncOp kernel) {
     auto product = [&](ArrayRef<Attribute> shape) {
       auto extent = gpu::PhysicalExprAttr::get(
           kernel.getContext(),
-          static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), 1,
+          gpu::PhysicalExprKind::Constant, 1,
           builder.getStringAttr(""), builder.getArrayAttr({}));
       if (shape.empty())
         return extent;
@@ -626,7 +623,7 @@ LogicalResult legalizeExpandingGathers(func::FuncOp kernel) {
       for (Attribute dimension : shape.drop_front())
         extent = gpu::PhysicalExprAttr::get(
             kernel.getContext(),
-            static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
+            gpu::PhysicalExprKind::Multiply, 0,
             builder.getStringAttr(""), builder.getArrayAttr({extent, dimension}));
       return extent;
     };
@@ -884,13 +881,13 @@ void foldIntegerScanTails(func::FuncOp kernel) {
       continue;
     auto extent = cast<gpu::PhysicalExprAttr>(type.getShape()[0]);
     bool positive = extent.getKind() ==
-                        static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+                        gpu::PhysicalExprKind::Constant &&
                     extent.getValue() > 0;
     if (extent.getKind() ==
-        static_cast<uint32_t>(gpu::PhysicalExprKind::Parameter)) {
-      auto parameter = gpu::queryParameterBySymbol(kernel, extent.getSymbol());
+        gpu::PhysicalExprKind::Parameter) {
+      auto parameter = gpu::queryParameterBySymbol(kernel, extent.getSymbolName());
       positive = succeeded(parameter) && llvm::all_of(
-          (*parameter).getParameter().getCandidates().asArrayRef(),
+          parameter->getCandidates().asArrayRef(),
           [](int64_t candidate) { return candidate > 0; });
     }
     if (!positive)
@@ -899,7 +896,7 @@ void foldIntegerScanTails(func::FuncOp kernel) {
     auto coordinate = gpu::queryLaunchExpression(index);
     bool last = coordinate &&
                 coordinate.getKind() ==
-                    static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+                    gpu::PhysicalExprKind::Constant &&
                 extent.getKind() == coordinate.getKind() &&
                 coordinate.getValue() == extent.getValue() - 1;
     if (auto subtract = index.getDefiningOp<gpu::BinaryOp>();
@@ -907,7 +904,7 @@ void foldIntegerScanTails(func::FuncOp kernel) {
       auto one = gpu::queryLaunchExpression(subtract.getRhs());
       last |= gpu::queryLaunchExpression(subtract.getLhs()) == extent && one &&
               one.getKind() ==
-                  static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+                  gpu::PhysicalExprKind::Constant &&
               one.getValue() == 1;
     }
     if (!last)
@@ -1003,7 +1000,7 @@ LogicalResult legalizeLargeScalarGathers(func::FuncOp kernel) {
     bool fixed = true;
     for (Attribute attribute : source.getShape()) {
       auto extent = cast<gpu::PhysicalExprAttr>(attribute);
-      if (extent.getKind() != static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+      if (extent.getKind() != gpu::PhysicalExprKind::Constant ||
           extent.getValue() <= 0) {
         fixed = false;
         break;
@@ -1171,7 +1168,7 @@ LogicalResult materializeOversizedGathers(func::FuncOp kernel) {
   auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
   if (!space || space.size() != 1)
     return success();
-  auto configurations = gpu::ConfigurationSpace::read(kernel);
+  auto configurations = gpu::ParameterSpace::read(kernel);
   if (failed(configurations)) return failure();
   auto tuples = configurations->configurations(gpu::ConfigurationStage::Shared);
   if (failed(tuples)) return failure();
@@ -1179,11 +1176,10 @@ LogicalResult materializeOversizedGathers(func::FuncOp kernel) {
   for (DictionaryAttr tuple : *tuples) {
     NamedAttrList bindings;
     Builder attributes(kernel.getContext());
-    kernel.walk([&](gpu::ParameterOp parameter) {
-      auto schema = parameter.getParameter();
+    for (gpu::ParameterAttr schema : configurations->extentDeclarations()) {
       if (schema.getCandidates().size() == 1)
         bindings.set(schema.getName(), attributes.getI64IntegerAttr(schema.getCandidates()[0]));
-    });
+    }
     for (NamedAttribute entry : tuple)
       bindings.set(entry.getName(), entry.getValue());
     auto count = evaluateCompileTimeExpression(
@@ -1204,7 +1200,7 @@ LogicalResult materializeOversizedGathers(func::FuncOp kernel) {
     int64_t bytes = (source.getElementType().getIntOrFloatBitWidth() + 7) / 8;
     for (Attribute attribute : source.getShape()) {
       auto extent = cast<gpu::PhysicalExprAttr>(attribute);
-      if (extent.getKind() != static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+      if (extent.getKind() != gpu::PhysicalExprKind::Constant ||
           extent.getValue() <= 0 ||
           bytes > std::numeric_limits<int64_t>::max() / extent.getValue())
         return;
@@ -1267,7 +1263,7 @@ LogicalResult materializeOversizedGathers(func::FuncOp kernel) {
   Value program = programId.getResult();
   entry.setInsertionPointAfter(programId);
   auto prefix = gpu::PhysicalExprAttr::get(kernel.getContext(),
-      static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), maximumPrograms,
+      gpu::PhysicalExprKind::Constant, maximumPrograms,
       entry.getStringAttr(""), entry.getArrayAttr({}));
   for (auto &readerGroup : readers) {
     auto &gathers = readerGroup.second;

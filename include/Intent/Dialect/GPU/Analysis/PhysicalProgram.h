@@ -279,10 +279,11 @@ struct PhysicalParameterBinding {
   bool isExact() const { return state == PhysicalFactState::Exact; }
 };
 
-PhysicalParameterBinding queryParameterBinding(ParameterOp parameter);
-mlir::FailureOr<ParameterOp>
+PhysicalParameterBinding queryParameterBinding(ParameterAttr parameter);
+ParameterAttr queryParameter(mlir::Value value);
+mlir::FailureOr<ParameterAttr>
 queryParameterBySymbol(mlir::func::FuncOp kernel, mlir::StringAttr symbol);
-mlir::FailureOr<ParameterOp>
+mlir::FailureOr<ParameterAttr>
 queryBlockingParameter(mlir::func::FuncOp kernel, MakeRangeOp range);
 
 /// Exact current-IR access relation, or an explicit conservative result.

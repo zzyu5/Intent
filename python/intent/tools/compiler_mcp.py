@@ -1,7 +1,7 @@
 """Explicitly enabled compilation tools, separate from the read-only manual."""
 from pathlib import Path
 
-from .compilation import compile_request, doctor, generate_ir_request, optimize_request
+from .compilation import compile_request, doctor, generate_ir_request, materialize_request, optimize_request
 
 
 def main() -> None:
@@ -14,7 +14,7 @@ def main() -> None:
         raise SystemExit("Install IntentDSL with its 'manual' extra to use the MCP servers.") from error
 
     server = FastMCP("intent_compiler", instructions=(
-        "Compile only an existing Python program path, or transform/resume an existing IR path explicitly supplied by the user. "
+        "Use only existing Python program, IR or saved program paths explicitly supplied by the user. "
         "Loading that module executes its top-level Python host code. "
         "These tools use the public Intent pipeline and do not themselves launch the selected kernel. "
         "Generated/materialized does not mean numerical or performance validation. "
@@ -25,11 +25,15 @@ def main() -> None:
     async def compile(program_path: str, kernel: str, target: str | None = None,
                       target_options: dict | None = None, constexprs: dict | None = None,
                       compiler: str | None = None, tuning_config: str | None = None,
-                      materialize: bool = False, stage: str = "provider") -> dict:
+                      materialize: bool = False, stage: str = "provider",
+                      target_facts: dict | None = None, export_directory: str | None = None) -> dict:
         """Compile an existing .py file and report stages/artifacts.
 
         stage='kir' needs no target, provider SDK or device. 'shared' and
         'provider' need a target; only 'provider' permits materialize=True.
+        target_facts accepts the compiler's explicit target object for offline
+        generation. export_directory saves source, final IR and metadata for a
+        later host; target_options select the local runtime if materializing.
         The file's ordinary top-level Python host code executes normally.
         """
         path = Path(program_path).expanduser().resolve(strict=True)
@@ -39,12 +43,14 @@ def main() -> None:
         # owns sys.path/stdout, so concurrent compilation requests must not overlap.
         return compile_request(str(path), kernel, target, target_options=target_options,
                                constexprs=constexprs, compiler=compiler,
-                               tuning_config=tuning_config, materialize=materialize, stage=stage)
+                               tuning_config=tuning_config, materialize=materialize, stage=stage,
+                               target_facts=target_facts, export_directory=export_directory)
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True))
     async def generate_from_ir(ir_file: str, name: str, target: str,
                                input_stage: str = "shared", target_options: dict | None = None,
-                               compiler: str | None = None, materialize: bool = False) -> dict:
+                               compiler: str | None = None, materialize: bool = False,
+                               target_facts: dict | None = None, export_directory: str | None = None) -> dict:
         """Generate provider source from explicit existing KIR or shared IR.
 
         Supply the input stage, target and diagnostic program name explicitly.
@@ -55,7 +61,17 @@ def main() -> None:
         """
         return generate_ir_request(ir_file, name, target, input_stage=input_stage,
                                    target_options=target_options, compiler=compiler,
-                                   materialize=materialize)
+                                   materialize=materialize, target_facts=target_facts,
+                                   export_directory=export_directory)
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True))
+    async def materialize(program_directory: str, target: str, target_options: dict | None = None) -> dict:
+        """Load a generated program from an explicit directory and bind a matching local runtime.
+
+        Target capabilities must agree with the saved compiler facts. This may
+        compile/load native code, but neither recompiles KIR nor launches a kernel.
+        """
+        return materialize_request(program_directory, target, target_options=target_options)
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True))
     async def optimize(ir_file: str, pipeline: str, optimizer: str | None = None) -> dict:
@@ -69,9 +85,13 @@ def main() -> None:
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
     async def environment(target: str, target_options: dict | None = None,
-                          compiler: str | None = None) -> dict:
-        """Inspect only the selected backend's dependencies and target facts; this is not a numerical check."""
-        return doctor(target, target_options=target_options, compiler=compiler)
+                          compiler: str | None = None, target_facts: dict | None = None) -> dict:
+        """Inspect the selected compiler/target; explicit facts skip local SDK/device probing.
+
+        Without explicit facts, also inspect selected runtime dependencies. This
+        does not establish numerical correctness or device execution.
+        """
+        return doctor(target, target_options=target_options, compiler=compiler, target_facts=target_facts)
 
     server.run(transport="stdio")
 

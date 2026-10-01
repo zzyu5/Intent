@@ -31,8 +31,8 @@ bool sameBound(Value lhs, Value rhs, ArrayAttr tuples) {
     return false;
   return llvm::all_of(tuples, [&](Attribute attribute) {
     auto tuple = cast<DictionaryAttr>(attribute);
-    auto a = tuple.getAs<IntegerAttr>(first.getParameter().getName().getValue());
-    auto b = tuple.getAs<IntegerAttr>(second.getParameter().getName().getValue());
+    auto a = tuple.getAs<IntegerAttr>(first.getDeclaration().getName().getValue());
+    auto b = tuple.getAs<IntegerAttr>(second.getDeclaration().getName().getValue());
     return a && b && a == b;
   });
 }

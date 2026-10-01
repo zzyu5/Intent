@@ -1,6 +1,6 @@
 #include "Intent/Dialect/GPU/Serialization/Interface.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
-#include "Intent/Dialect/GPU/Analysis/Configurations.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -50,7 +50,7 @@ llvm::json::Array strides(ArrayAttr attributes) {
 
 bool isLaunchSpecialization(PhysicalExprAttr expression) {
   if (expression.getKind() ==
-      static_cast<uint32_t>(PhysicalExprKind::ScalarABI))
+      PhysicalExprKind::ScalarABI)
     return false;
   return llvm::all_of(expression.getOperands(), [](Attribute operand) {
     return isLaunchSpecialization(cast<PhysicalExprAttr>(operand));
@@ -66,7 +66,7 @@ std::optional<llvm::json::Value> resourceExpression(Value value) {
   return std::nullopt;
 }
 
-FailureOr<llvm::json::Array> configurations(const ConfigurationSpace &space) {
+FailureOr<llvm::json::Array> configurations(const ParameterSpace &space) {
   auto rows = space.configurations(ConfigurationStage::Complete);
   if (failed(rows))
     return failure();
@@ -149,7 +149,7 @@ FailureOr<KernelInterface> readInterface(func::FuncOp kernel) {
 
 llvm::json::Value serializeExpression(PhysicalExprAttr expression) {
   StringRef kind;
-  switch (static_cast<PhysicalExprKind>(expression.getKind())) {
+  switch (expression.getKind()) {
   case PhysicalExprKind::Constant:
     return llvm::json::Object{{"kind", "constant"},
                               {"value", expression.getValue()}};
@@ -169,7 +169,7 @@ llvm::json::Value serializeExpression(PhysicalExprAttr expression) {
   }
   if (kind == "parameter" || kind == "dimension" || kind == "scalar")
     return llvm::json::Object{{"kind", kind},
-                              {"symbol", expression.getSymbol().getValue()}};
+                              {"symbol", expression.getSymbolName().getValue()}};
   return llvm::json::Object{{"kind", kind},
                             {"operands", expressions(expression.getOperands())}};
 }
@@ -180,7 +180,7 @@ FailureOr<llvm::json::Object> serializeInterface(
   auto facts = readInterface(kernel);
   if (failed(facts))
     return failure();
-  auto configurationSpace = ConfigurationSpace::read(kernel);
+  auto configurationSpace = ParameterSpace::read(kernel);
   if (failed(configurationSpace))
     return failure();
   llvm::json::Array views, scalars, metadata, publicArguments, parameters;
@@ -215,30 +215,21 @@ FailureOr<llvm::json::Object> serializeInterface(
   for (unsigned abi : facts->publicArguments)
     publicArguments.push_back(abi);
 
-  for (ConfigurationParameterOpInterface declaration :
-       configurationSpace->parameters()) {
-    auto parameter = dyn_cast<ParameterOp>(declaration.getOperation());
-    PhysicalParameterBinding binding;
-    if (parameter) {
-      binding = queryParameterBinding(parameter);
-      if (binding.state == PhysicalFactState::Ambiguous) {
-        parameter.emitError("has contradictory physical parameter bindings");
-        return failure();
-      }
-    }
+  for (ParameterAttr declaration : configurationSpace->declarations()) {
+    PhysicalParameterBinding binding = queryParameterBinding(declaration);
     llvm::json::Object entry{
-        {"name", declaration.getConfigurationName().getValue()},
-        {"role", static_cast<uint32_t>(declaration.getConfigurationRole())},
-        {"category", static_cast<uint32_t>(declaration.getConfigurationCategory())},
-        {"element_bits", parameter ? parameter.getParameter().getElementBitWidth() : 0},
-        {"candidates", integers(declaration.getConfigurationCandidates())}};
-    if (parameter) {
-      if (auto bound = parameter->getAttrOfType<PhysicalExprAttr>(coverageBoundAttr))
-        entry["coverage"] = serializeExpression(bound);
-      else if (parameter->hasAttr(coverageDimensionAttr)) {
-        parameter.emitError("full-coverage parameter has no typed bound expression");
+        {"name", declaration.getName().getValue()},
+        {"role", static_cast<uint32_t>(declaration.getRole())},
+        {"category", static_cast<uint32_t>(declaration.getCategory())},
+        {"element_bits", declaration.getElementBitWidth()},
+        {"candidates", integers(declaration.getCandidates().asArrayRef())}};
+    if (declaration.isDeferred()) {
+      auto bound = declaration.getBinding().getCoverageBound();
+      if (!bound) {
+        kernel.emitError("full-coverage declaration has no typed bound expression");
         return failure();
       }
+      entry["coverage"] = serializeExpression(bound);
     }
     if (binding.dimension) {
       entry["dimension"] = *binding.dimension;
@@ -299,6 +290,24 @@ FailureOr<llvm::json::Object> serializeInterface(
   auto configs = configurations(*configurationSpace);
   if (failed(configs))
     return failure();
+  auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+  if (!capabilities) {
+    kernel.emitError("generated GPU program has no compilation target");
+    return failure();
+  }
+  llvm::json::Object target{
+      {"family", "gpu"},
+      {"capabilities", llvm::json::Object{
+          {"compute_units", capabilities.getComputeUnits()},
+          {"shared_memory_per_unit", capabilities.getSharedMemoryPerUnit()},
+          {"max_dynamic_shared_memory_per_block", capabilities.getMaxDynamicSharedMemoryPerBlock()},
+          {"registers_per_unit", capabilities.getRegistersPerUnit()},
+          {"max_threads_per_block", capabilities.getMaxThreadsPerBlock()},
+          {"compute_capability_major", capabilities.getComputeCapabilityMajor()},
+          {"compute_capability_minor", capabilities.getComputeCapabilityMinor()},
+          {"single_to_double_precision_perf_ratio", capabilities.getSingleToDoublePrecisionPerfRatio()},
+          {"matrix_units", capabilities.getMatrixUnits()},
+          {"dynamic_vector_width", capabilities.getDynamicVectorWidth()}}}};
   llvm::json::Object interface{
       {"views", std::move(views)}, {"scalars", std::move(scalars)},
       {"metadata", std::move(metadata)},
@@ -308,6 +317,8 @@ FailureOr<llvm::json::Object> serializeInterface(
       {"configurations", std::move(*configs)},
       {"resource_bounds", std::move(bounds)}};
   return llvm::json::Object{{"provider", provider},
+                            {"entry_name", kernel.getName()},
+                            {"target", std::move(target)},
                             {"interface", std::move(interface)}};
 }
 

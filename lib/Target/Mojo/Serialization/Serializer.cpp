@@ -633,6 +633,13 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string
             "from max.algorithm import parallelize\n\n";
   Serializer serializer(output);
   llvm::json::Object interface;
+  auto capabilities = module->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities");
+  interface["provider"] = "mojo";
+  interface["target"] = llvm::json::Object{
+      {"family", "cpu"}, {"vector_bits", capabilities.getVectorBits()},
+      {"workers", capabilities.getWorkers()},
+      {"private_bytes", capabilities.getPrivateBytes()},
+      {"matrix_i8_i32", capabilities.getMatrixI8I32()}};
   interface["native_dependencies"] = llvm::json::Array{"std", "max"};
   interface["source_prelude_end"] = static_cast<int64_t>(output.tell());
   llvm::json::Array candidates;
@@ -644,8 +651,8 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string
     int64_t sourceEnd = output.tell();
     if (first) {
       auto abi = function->getAttrOfType<cpu::InterfaceAttr>("intent_cpu.interface");
+      interface["entry_name"] = function.getName();
       interface["parameters"] = parameters(abi);
-      interface["workers"] = module->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities").getWorkers();
       interface["contiguous_views"] = abi.getContiguousViews();
       interface["disjoint_outputs"] = abi.getDisjointOutputs();
       first = false;

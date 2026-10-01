@@ -37,7 +37,7 @@ FailureOr<func::FuncOp> getPhysicalKernel(ModuleOp module) {
 }
 
 bool isShapeBound(PhysicalExprAttr bound) {
-  return bound.getKind() != static_cast<uint32_t>(PhysicalExprKind::ScalarABI) &&
+  return bound.getKind() != PhysicalExprKind::ScalarABI &&
          llvm::all_of(bound.getOperands(), [](Attribute operand) {
            return isShapeBound(cast<PhysicalExprAttr>(operand));
          });
@@ -71,7 +71,7 @@ bool canPredicateValueOperation(Operation *operation) {
       bool positive = matchPattern(binary.getRhs(), m_ConstantInt(&divisor)) &&
                       divisor.isStrictlyPositive();
       if (auto parameter = binary.getRhs().getDefiningOp<ParameterOp>()) {
-        auto candidates = parameter.getParameter().getCandidates().asArrayRef();
+        auto candidates = parameter.getDeclaration().getCandidates().asArrayRef();
         positive = !candidates.empty() && llvm::all_of(
             candidates, [](int64_t value) { return value > 0; });
       }
@@ -135,6 +135,10 @@ std::pair<uint64_t, int64_t> nextPhysicalAxisIdentities(func::FuncOp kernel) {
   identities.addWalk([&](PhysicalSourceAttr source) {
     nextSource = std::max(nextSource, source.getSourceId() + 1);
   });
+  identities.addWalk([&](ParameterBindingAttr binding) {
+    if (auto dimension = binding.getDimension())
+      nextDimension = std::max(nextDimension, dimension.getInt() + 1);
+  });
   identities.addWalk([&](ViewType view) {
     nextSource = std::max(nextSource, view.getSourceId() + 1);
   });
@@ -143,7 +147,7 @@ std::pair<uint64_t, int64_t> nextPhysicalAxisIdentities(func::FuncOp kernel) {
       nextDimension = std::max(nextDimension, dimension + 1);
   });
   identities.addWalk([&](PhysicalExprAttr expression) {
-    if (expression.getKind() == static_cast<uint32_t>(PhysicalExprKind::Dimension))
+    if (expression.getKind() == PhysicalExprKind::Dimension)
       nextDimension = std::max(nextDimension, expression.getValue() + 1);
   });
   kernel.walk([&](Operation *operation) {
@@ -154,16 +158,15 @@ std::pair<uint64_t, int64_t> nextPhysicalAxisIdentities(func::FuncOp kernel) {
       for (Block &block : region)
         for (BlockArgument argument : block.getArguments())
           identities.walk(argument.getType());
-    for (StringRef name : {dimensionAttr, coverageDimensionAttr})
-      if (auto dimension = operation->getAttrOfType<IntegerAttr>(name))
-        nextDimension = std::max(nextDimension, dimension.getInt() + 1);
+    if (auto dimension = operation->getAttrOfType<IntegerAttr>(dimensionAttr))
+      nextDimension = std::max(nextDimension, dimension.getInt() + 1);
   });
   return {nextSource, nextDimension};
 }
 
 PhysicalExprAttr multiplyExtent(PhysicalExprAttr lhs, PhysicalExprAttr rhs) {
-  auto leftKind = static_cast<PhysicalExprKind>(lhs.getKind());
-  auto rightKind = static_cast<PhysicalExprKind>(rhs.getKind());
+  auto leftKind = lhs.getKind();
+  auto rightKind = rhs.getKind();
   if (leftKind == PhysicalExprKind::Constant && lhs.getValue() == 1)
     return rhs;
   if (rightKind == PhysicalExprKind::Constant && rhs.getValue() == 1)
@@ -171,11 +174,11 @@ PhysicalExprAttr multiplyExtent(PhysicalExprAttr lhs, PhysicalExprAttr rhs) {
   if (leftKind == PhysicalExprKind::Constant &&
       rightKind == PhysicalExprKind::Constant)
     return PhysicalExprAttr::get(
-        lhs.getContext(), static_cast<uint32_t>(PhysicalExprKind::Constant),
+        lhs.getContext(), PhysicalExprKind::Constant,
         lhs.getValue() * rhs.getValue(), StringAttr::get(lhs.getContext()),
         ArrayAttr::get(lhs.getContext(), {}));
   return PhysicalExprAttr::get(
-      lhs.getContext(), static_cast<uint32_t>(PhysicalExprKind::Multiply), 0,
+      lhs.getContext(), PhysicalExprKind::Multiply, 0,
       StringAttr::get(lhs.getContext()),
       ArrayAttr::get(lhs.getContext(), {lhs, rhs}));
 }
@@ -184,7 +187,7 @@ PhysicalExprAttr productExtent(MLIRContext *context,
                                ArrayRef<Attribute> shape,
                                ArrayRef<int64_t> axes, unsigned prefix) {
   PhysicalExprAttr product = PhysicalExprAttr::get(
-      context, static_cast<uint32_t>(PhysicalExprKind::Constant), 1,
+      context, PhysicalExprKind::Constant, 1,
       StringAttr::get(context), ArrayAttr::get(context, {}));
   for (int64_t axis : axes)
     product = multiplyExtent(
@@ -199,7 +202,7 @@ bool isIntroducedReshapeUnitAxis(Value value, unsigned fragmentAxis) {
     return false;
   auto extent = cast<PhysicalExprAttr>(result.getShape()[fragmentAxis]);
   if (extent.getKind() !=
-          static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+          PhysicalExprKind::Constant ||
       extent.getValue() != 1)
     return false;
   unsigned logicalResultRank = 0;
@@ -335,7 +338,7 @@ FailureOr<FragmentType> queryValueSchema(func::FuncOp kernel,
           cast<PhysicalExprAttr>(source.getShape()[sourceAxis]);
       bool singleton =
           sourceExtent.getKind() ==
-              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+              PhysicalExprKind::Constant &&
           sourceExtent.getValue() == 1;
       // A logical singleton may broadcast. A selected one-lane slice of a
       // larger logical range instead owns that consumer's physical extent.
@@ -459,7 +462,7 @@ FailureOr<FragmentType> queryAccessResultSchema(
       auto extent = cast<PhysicalExprAttr>(source.getShape()[sourceAxis]);
       bool singleton =
           extent.getKind() ==
-              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+              PhysicalExprKind::Constant &&
           extent.getValue() == 1;
       PhysicalRangeFact ranges = analysis.axisRanges(coordinate, sourceAxis);
       FailureOr<MakeRangeOp> range = queryExactLogicalRange(ranges);
@@ -536,16 +539,16 @@ FailureOr<uint64_t> blockedDimension(Attribute attribute) {
   auto extent = dyn_cast<PhysicalExprAttr>(attribute);
   if (!extent ||
       extent.getKind() !=
-          static_cast<uint32_t>(PhysicalExprKind::CeilDiv) ||
+          PhysicalExprKind::CeilDiv ||
       extent.getOperands().size() != 2)
     return failure();
   auto logical = dyn_cast<PhysicalExprAttr>(extent.getOperands()[0]);
   auto block = dyn_cast<PhysicalExprAttr>(extent.getOperands()[1]);
   if (!logical || !block ||
       logical.getKind() !=
-          static_cast<uint32_t>(PhysicalExprKind::Dimension) ||
+          PhysicalExprKind::Dimension ||
       block.getKind() !=
-          static_cast<uint32_t>(PhysicalExprKind::Parameter))
+          PhysicalExprKind::Parameter)
     return failure();
   return logical.getValue() > 0
              ? FailureOr<uint64_t>(logical.getValue())

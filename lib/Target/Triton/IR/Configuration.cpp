@@ -41,11 +41,12 @@ FailureOr<ConfigurationSchema> ConfigurationSchema::read(func::FuncOp kernel) {
   }
   kernel.walk([&](CtaBarrierOp) { requiresSingleCTA = true; });
   gpu::ParameterAttr stageDeclaration;
-  SmallVector<gpu::ParameterOp> parameters;
-  bool valid = true;
-  kernel.walk([&](gpu::ParameterOp parameter) {
-    auto definition = parameter.getParameter();
-    auto role = static_cast<gpu::ParameterRole>(definition.getRole());
+  if (failed(gpu::verifyParameterDeclarations(kernel))) return failure();
+  auto parameters = kernel->getAttrOfType<ArrayAttr>(gpu::parametersAttr);
+  for (Attribute attribute : parameters) {
+    auto definition = cast<gpu::ParameterAttr>(attribute);
+    if (!definition.isExtent()) continue;
+    auto role = definition.getRole();
     StringAttr *option = nullptr;
     switch (role) {
     case gpu::ParameterRole::ProviderWarps: option = &result.warps; break;
@@ -57,39 +58,33 @@ FailureOr<ConfigurationSchema> ConfigurationSchema::read(func::FuncOp kernel) {
     default: break;
     }
     bool provider = definition.getCategory() ==
-                    static_cast<uint32_t>(gpu::ParameterCategory::Provider);
+                    gpu::ParameterCategory::Provider;
     if (provider != bool(option)) {
-      parameter.emitOpError("Triton program contains a foreign provider parameter");
-      valid = false;
-      return;
+      return kernel.emitError("Triton program contains a foreign provider parameter"), failure();
     }
     if (option) {
       if (*option) {
-        parameter.emitOpError("duplicates a Triton provider-parameter role");
-        valid = false;
-        return;
+        return kernel.emitError("duplicates a Triton provider-parameter role"), failure();
       }
       *option = definition.getName();
     }
     if (option)
       for (int64_t candidate : definition.getCandidates().asArrayRef())
         if (!isLegalDeviceOption(role, candidate, capabilities, requiresSingleCTA)) {
-          parameter.emitOpError("declares a Triton option outside the current device/launch contract")
+          kernel.emitError("declares a Triton option outside the current device/launch contract")
               << "; parameter=" << definition.getName() << "; value=" << candidate;
-          valid = false;
-          return;
+          return failure();
         }
-    parameters.push_back(parameter);
-  });
-  if (!valid) return failure();
+  }
   if (!result.warps || !result.stages || !result.ctas)
     return kernel.emitError("Triton provider parameter domains are incomplete"), failure();
 
   bool stagesInKernel = false;
   auto walked = kernel.walk([&](Operation *operation) {
     if (!operation->hasAttr(loopStagesAttr)) return WalkResult::advance();
-    auto binding = operation->getAttrOfType<gpu::ParameterAttr>(loopStagesAttr);
-    if (!isa<scf::ForOp>(operation) || !binding || binding != stageDeclaration) {
+    auto binding = operation->getAttrOfType<gpu::ParameterRefAttr>(loopStagesAttr);
+    if (!isa<scf::ForOp>(operation) || !binding ||
+        binding != stageDeclaration.getReference()) {
       operation->emitOpError("loop stages must bind the declared Triton stage parameter");
       return WalkResult::interrupt();
     }
@@ -98,11 +93,21 @@ FailureOr<ConfigurationSchema> ConfigurationSchema::read(func::FuncOp kernel) {
   });
   if (walked.wasInterrupted()) return failure();
 
+  llvm::SmallVector<gpu::ParameterRefAttr> formParameters;
   kernel.walk([&](TensorDescriptorChoiceOp choice) {
-    result.kernelParameters.push_back(choice.getConfigParameterAttr());
+    formParameters.push_back(choice.getConfigParameter());
+    result.kernelParameters.push_back(choice.getConfigParameter().getName());
   });
-  for (gpu::ParameterOp parameter : parameters) {
-    StringAttr name = parameter.getParameter().getName();
+  for (Attribute attribute : parameters) {
+    auto declaration = cast<gpu::ParameterAttr>(attribute);
+    if (!declaration.isExtent() &&
+        !llvm::is_contained(formParameters, declaration.getReference()))
+      return kernel.emitError("boolean provider declaration has no tensor-descriptor choice"), failure();
+  }
+  for (Attribute attribute : parameters) {
+    auto parameter = cast<gpu::ParameterAttr>(attribute);
+    if (!parameter.isExtent()) continue;
+    StringAttr name = parameter.getName();
     if (name == result.warps || name == result.ctas ||
         (name == result.stages && !stagesInKernel))
       continue;

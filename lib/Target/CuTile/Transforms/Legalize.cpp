@@ -5,6 +5,7 @@
 #include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -49,14 +50,14 @@ bool isCuTileScalarType(Type type) {
 
 gpu::PhysicalExprAttr arrayIndexTileBound(gpu::PhysicalExprAttr expression,
                                          func::FuncOp kernel) {
-  auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
+  auto kind = expression.getKind();
   if (kind == gpu::PhysicalExprKind::Constant)
     return expression.getValue() > 0 ? expression : gpu::PhysicalExprAttr();
   if (kind == gpu::PhysicalExprKind::Parameter) {
-    auto parameter = gpu::queryParameterBySymbol(kernel, expression.getSymbol());
+    auto parameter = gpu::queryParameterBySymbol(kernel, expression.getSymbolName());
     if (failed(parameter))
       return {};
-    if ((*parameter)->hasAttr(gpu::coverageDimensionAttr))
+    if (parameter->isDeferred())
       return expression;
     auto configurations = kernel->getAttrOfType<gpu::ConfigurationSetAttr>(gpu::configurationsAttr);
     if (!configurations || configurations.getStage() != gpu::ConfigurationStage::Complete)
@@ -64,13 +65,13 @@ gpu::PhysicalExprAttr arrayIndexTileBound(gpu::PhysicalExprAttr expression,
     int64_t maximum = 0;
     for (Attribute configuration : configurations.getRows()) {
       auto tuple = dyn_cast<DictionaryAttr>(configuration);
-      auto value = tuple ? tuple.getAs<IntegerAttr>(expression.getSymbol()) : IntegerAttr();
+      auto value = tuple ? tuple.getAs<IntegerAttr>(expression.getSymbolName()) : IntegerAttr();
       if (!value || value.getInt() <= 0)
         return {};
       maximum = std::max(maximum, value.getInt());
     }
     return gpu::PhysicalExprAttr::get(
-        kernel.getContext(), static_cast<uint32_t>(gpu::PhysicalExprKind::Constant),
+        kernel.getContext(), gpu::PhysicalExprKind::Constant,
         maximum, StringAttr::get(kernel.getContext()),
         ArrayAttr::get(kernel.getContext(), {}));
   }
@@ -101,7 +102,7 @@ gpu::PhysicalExprAttr arrayIndexTileBound(gpu::PhysicalExprAttr expression,
 ArrayAttr arrayIndexTileBounds(func::FuncOp kernel) {
   MLIRContext *context = kernel.getContext();
   auto one = gpu::PhysicalExprAttr::get(
-      context, static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), 1,
+      context, gpu::PhysicalExprKind::Constant, 1,
       StringAttr::get(context), ArrayAttr::get(context, {}));
   SmallVector<SmallVector<Attribute>> bounds(kernel.getNumArguments());
   for (BlockArgument argument : kernel.getArguments())
@@ -154,7 +155,7 @@ ArrayAttr arrayIndexTileBounds(func::FuncOp kernel) {
         viewBounds[axis] = bound;
       else
         viewBounds[axis] = gpu::PhysicalExprAttr::get(
-            context, static_cast<uint32_t>(gpu::PhysicalExprKind::Maximum), 0,
+            context, gpu::PhysicalExprKind::Maximum, 0,
             StringAttr::get(context), ArrayAttr::get(context, {viewBounds[axis], bound}));
     }
     return WalkResult::advance();
@@ -192,74 +193,47 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
       kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
   if (!capabilities)
     return kernel.emitError("cuTile provider requires selected GPU capabilities");
-  gpu::ParameterOp accessForm;
-  gpu::ParameterOp occupancy;
-  gpu::ParameterOp ctas;
-  gpu::ParameterOp workerWarps;
-  gpu::ParameterOp loadPolicy;
-  LogicalResult parameterSchema = success();
-  kernel.walk([&](gpu::ParameterOp parameter) {
-    auto schema = parameter.getParameter();
-    auto role = static_cast<gpu::ParameterRole>(schema.getRole());
-    auto category =
-        static_cast<gpu::ParameterCategory>(schema.getCategory());
-    bool provider = category == gpu::ParameterCategory::Provider;
-    bool cuTileProvider = isCuTileProviderRole(role);
-    if (provider != cuTileProvider) {
-      parameter.emitOpError(
-          "cuTile program contains a foreign provider parameter");
-      parameterSchema = failure();
-      return;
-    }
+  auto parameters = gpu::ParameterSpace::read(kernel);
+  if (failed(parameters)) return failure();
+  gpu::ParameterAttr accessForm, occupancy, ctas, workerWarps, loadPolicy;
+  for (gpu::ParameterAttr schema : parameters->declarations()) {
+    auto role = schema.getRole();
+    bool provider = schema.getPhase() == gpu::ConfigurationBindingPhase::Provider;
+    if (!schema.isExtent() || provider != isCuTileProviderRole(role))
+      return kernel.emitError("cuTile program contains a foreign provider parameter");
     if (!provider)
-      return;
+      continue;
     ArrayRef<int64_t> candidates = schema.getCandidates().asArrayRef();
+    gpu::ParameterAttr *binding = nullptr;
+    StringRef name;
+    bool (*legal)(int64_t) = nullptr;
     if (role == gpu::ParameterRole::ProviderAccessForm) {
-      if (accessForm) {
-        parameter.emitOpError("duplicates the cuTile access-form parameter");
-        parameterSchema = failure();
-        return;
-      }
-      if (schema.getName().getValue() != accessFormParameter ||
-          candidates.empty() || !llvm::all_of(candidates, isLegalAccessForm)) {
-        parameter.emitOpError("has an invalid cuTile access-form domain");
-        parameterSchema = failure();
-        return;
-      }
-      accessForm = parameter;
-      return;
+      binding = &accessForm; name = accessFormParameter; legal = isLegalAccessForm;
+    } else if (role == gpu::ParameterRole::ProviderCTAs) {
+      binding = &ctas; name = ctasParameter; legal = isLegalCTAs;
+    } else if (role == gpu::ParameterRole::ProviderWarps) {
+      binding = &workerWarps; name = workerWarpsParameter; legal = isLegalWorkerWarps;
+    } else if (role == gpu::ParameterRole::ProviderLoadPolicy) {
+      binding = &loadPolicy; name = loadPolicyParameter; legal = isLegalLoadPolicy;
+    } else {
+      binding = &occupancy; name = occupancyParameter; legal = isLegalOccupancy;
     }
-    if (role == gpu::ParameterRole::ProviderCTAs) {
-      if (ctas || schema.getName().getValue() != ctasParameter ||
-          candidates.empty() || !llvm::all_of(candidates, isLegalCTAs) ||
-          !parameter.getResult().use_empty()) {
-        parameter.emitOpError("has an invalid or duplicate cuTile CTA hint schema");
-        parameterSchema = failure();
-        return;
-      }
-      ctas = parameter;
-      return;
+    if (*binding || schema.getName().getValue() != name ||
+        candidates.empty() || !llvm::all_of(candidates, legal))
+      return kernel.emitError("invalid or duplicate cuTile provider declaration: ") << schema.getName();
+    *binding = schema;
+  }
+  auto parameterUses = kernel.walk([&](gpu::ParameterOp parameter) -> WalkResult {
+    auto schema = parameter.getDeclaration();
+    auto role = schema.getRole();
+    if ((role == gpu::ParameterRole::ProviderCTAs ||
+         role == gpu::ParameterRole::ProviderWarps ||
+         role == gpu::ParameterRole::ProviderOccupancy) &&
+        !parameter.getResult().use_empty()) {
+      parameter.emitOpError("cuTile compiler hints cannot be read by the kernel body");
+      return WalkResult::interrupt();
     }
-    if (role == gpu::ParameterRole::ProviderWarps) {
-      if (workerWarps || schema.getName().getValue() != workerWarpsParameter ||
-          candidates.empty() || !llvm::all_of(candidates, isLegalWorkerWarps) ||
-          !parameter.getResult().use_empty()) {
-        parameter.emitOpError(
-            "has an invalid or duplicate cuTile worker-warp hint schema");
-        parameterSchema = failure();
-        return;
-      }
-      workerWarps = parameter;
-      return;
-    }
-    if (role == gpu::ParameterRole::ProviderLoadPolicy) {
-      if (loadPolicy || schema.getName().getValue() != loadPolicyParameter ||
-          candidates.empty() || !llvm::all_of(candidates, isLegalLoadPolicy) ||
-          parameter.getResult().use_empty()) {
-        parameter.emitOpError("has an invalid cuTile load-latency domain");
-        parameterSchema = failure();
-        return;
-      }
+    if (role == gpu::ParameterRole::ProviderLoadPolicy)
       for (OpOperand &use : parameter.getResult().getUses()) {
         auto load = dyn_cast<TileLoadOp>(use.getOwner());
         auto gather = dyn_cast<GatherLoadOp>(use.getOwner());
@@ -267,29 +241,12 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
             (!gather || gather.getLatencyPolicy() != parameter.getResult())) {
           parameter.emitOpError(
               "cuTile load latency must bind a tile or gather load");
-          parameterSchema = failure();
-          return;
+          return WalkResult::interrupt();
         }
       }
-      loadPolicy = parameter;
-      return;
-    }
-    if (occupancy) {
-      parameter.emitOpError("duplicates the cuTile occupancy parameter");
-      parameterSchema = failure();
-      return;
-    }
-    if (schema.getName().getValue() != occupancyParameter ||
-        candidates.empty() || !llvm::all_of(candidates, isLegalOccupancy) ||
-        !parameter.getResult().use_empty()) {
-      parameter.emitOpError(
-          "has an invalid cuTile occupancy hint schema");
-      parameterSchema = failure();
-      return;
-    }
-    occupancy = parameter;
+    return WalkResult::advance();
   });
-  if (failed(parameterSchema))
+  if (parameterUses.wasInterrupted())
     return failure();
   if (failed(verifyClosedConfigs(kernel)))
     return failure();
@@ -303,7 +260,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     auto compare = value.getDefiningOp<gpu::CompareOp>();
     return accessForm && compare &&
            compare.getPredicate() == ComparePredicate::Ne &&
-           compare.getLhs() == accessForm.getResult() &&
+           gpu::queryParameter(compare.getLhs()) == accessForm &&
            gpu::IndexRelations().constant(compare.getRhs()) == nativeNoTMAForm;
   };
   WalkResult result = kernel.walk([&](Operation *operation) {
@@ -435,7 +392,7 @@ bool fitsNativeLoopBound(Value value, unsigned depth = 0) {
       return true;
   }
   if (auto parameter = value.getDefiningOp<gpu::ParameterOp>())
-    return llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
+    return llvm::all_of(parameter.getDeclaration().getCandidates().asArrayRef(),
                         [](int64_t candidate) { return llvm::isInt<32>(candidate); });
   if (auto bound = value.getDefiningOp<gpu::RangeBoundOp>())
     if (auto range = bound.getRange().getDefiningOp<gpu::RangeOp>())
@@ -484,7 +441,7 @@ std::optional<int64_t> maximumNativeLoopStep(Value value) {
   }
   if (auto parameter = value.getDefiningOp<gpu::ParameterOp>()) {
     ArrayRef<int64_t> candidates =
-        parameter.getParameter().getCandidates().asArrayRef();
+        parameter.getDeclaration().getCandidates().asArrayRef();
     if (!candidates.empty() && llvm::all_of(candidates, [](int64_t candidate) {
           return candidate > 0 && llvm::isInt<32>(candidate);
         }))

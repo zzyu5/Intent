@@ -263,24 +263,27 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
       ("_" + Twine(static_cast<unsigned>(contractionCategory)) + "_" +
        Twine(static_cast<unsigned>(indirectRow)))
           .str();
-  ParameterOp blockM = getOrCreatePhysicalParameter(
+  auto blockMRef = getOrCreatePhysicalParameter(
       kernel, "BLOCK_M" + suffix, ParameterRole::OwnershipM,
       contractionCategory,
       lhsType.getElementType().getIntOrFloatBitWidth(),
       {32, 64, 128, 256});
-  ParameterOp blockN = getOrCreatePhysicalParameter(
+  auto blockNRef = getOrCreatePhysicalParameter(
       kernel, "BLOCK_N" + suffix, ParameterRole::OwnershipN,
       contractionCategory,
       rhsType.getElementType().getIntOrFloatBitWidth(),
       {16, 32, 64, 128, 256});
-  ParameterOp blockK = getOrCreatePhysicalParameter(
+  auto blockKRef = getOrCreatePhysicalParameter(
       kernel, "BLOCK_K" + suffix, ParameterRole::Reduction,
       contractionCategory,
       std::max(lhsType.getElementType().getIntOrFloatBitWidth(),
                rhsType.getElementType().getIntOrFloatBitWidth()),
       contractionReductionCandidates);
-  if (!blockM || !blockN || !blockK)
+  if (failed(blockMRef) || failed(blockNRef) || failed(blockKRef))
     return failure();
+  ParameterAttr blockM = lookupParameter(kernel, *blockMRef);
+  ParameterAttr blockN = lookupParameter(kernel, *blockNRef);
+  ParameterAttr blockK = lookupParameter(kernel, *blockKRef);
   FailureOr<unsigned> existingRowAxis =
       mappingAxisForScalar(rowRange.getStart(), mapping);
   FailureOr<unsigned> existingColumnAxis =
@@ -298,25 +301,27 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
                                       blockN)))
     return failure();
   for (auto [parameter, range] :
-       {std::pair<ParameterOp, MakeRangeOp>{blockM, rowRange},
-        std::pair<ParameterOp, MakeRangeOp>{blockN, columnRange},
-        std::pair<ParameterOp, MakeRangeOp>{blockK, lhsReductionRange}})
+       {std::pair<ParameterAttr, MakeRangeOp>{blockM, rowRange},
+        std::pair<ParameterAttr, MakeRangeOp>{blockN, columnRange},
+        std::pair<ParameterAttr, MakeRangeOp>{blockK, lhsReductionRange}})
     if (FailureOr<int64_t> dimension = queryRangeDimension(range);
         succeeded(dimension))
-      parameter->setAttr(
-          dimensionAttr,
-          IntegerAttr::get(IntegerType::get(kernel.getContext(), 64),
-                           *dimension));
-  ParameterOp rowWorkers;
+      if (failed(updateParameter(kernel, lookupParameter(kernel, parameter.getReference()).withBinding(
+              lookupParameter(kernel, parameter.getReference()).getBinding().withDimension(
+                  IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), *dimension))))))
+        return failure();
+  ParameterAttr rowWorkers;
   if (runtimeRowTraversal) {
     SmallVector<int64_t, 5> rowWorkerCandidates = {1, 2, 4, 8};
     if (persistentRowTraversal)
       rowWorkerCandidates.push_back(16);
-    rowWorkers = getOrCreatePhysicalParameter(
+    auto reference = getOrCreatePhysicalParameter(
         kernel, "ROW_WORKERS" + suffix, ParameterRole::TraversalWorkers,
         contractionCategory,
         lhsType.getElementType().getIntOrFloatBitWidth(),
         rowWorkerCandidates);
+    if (failed(reference)) return failure();
+    rowWorkers = lookupParameter(kernel, *reference);
   }
   if (runtimeRowTraversal && !rowWorkers)
     return failure();
@@ -336,20 +341,28 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
        IntegerAttr::get(IntegerType::get(context, 32),
                         static_cast<uint32_t>(contractionCategory)),
        BoolAttr::get(context, indirectRow)});
-  for (ParameterOp parameter : {blockM, blockN, blockK})
-    parameter->setAttr(parameterGroupAttr, parameterGroup);
-  if (rowWorkers)
-    rowWorkers->setAttr(parameterGroupAttr, parameterGroup);
+  for (ParameterAttr parameter : {blockM, blockN, blockK, rowWorkers}) {
+    if (!parameter) continue;
+    auto current = lookupParameter(kernel, parameter.getReference());
+    if (failed(updateParameter(kernel, current.withBinding(
+            current.getBinding().withGroup(parameterGroup))))) return failure();
+  }
+  OpBuilder parameterBuilder(&kernel.front(), kernel.front().begin());
+  Value blockMValue = materializeParameter(parameterBuilder, location, *blockMRef);
+  Value blockNValue = materializeParameter(parameterBuilder, location, *blockNRef);
+  Value blockKValue = materializeParameter(parameterBuilder, location, *blockKRef);
+  Value rowWorkersValue = rowWorkers
+      ? materializeParameter(parameterBuilder, location, rowWorkers.getReference()).getResult() : Value();
   PhysicalExprAttr unitM =
-      parameterExpression(context, blockM.getParameter().getName().getValue());
+      parameterExpression(context, blockM.getName().getValue());
   PhysicalExprAttr unitN =
-      parameterExpression(context, blockN.getParameter().getName().getValue());
+      parameterExpression(context, blockN.getName().getValue());
   PhysicalExprAttr unitK =
-      parameterExpression(context, blockK.getParameter().getName().getValue());
+      parameterExpression(context, blockK.getName().getValue());
   PhysicalExprAttr unitRowWorkers;
   if (rowWorkers)
     unitRowWorkers = parameterExpression(
-        context, rowWorkers.getParameter().getName().getValue());
+        context, rowWorkers.getName().getValue());
 
   OpBuilder mapBuilder(mapping, &created);
   Value rowExtent = mapBuilder.create<DimOp>(
@@ -373,8 +386,8 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
     return binary(mapBuilder, location, mapBuilder.getIndexType(), adjusted,
                   divisor, BinaryOperator::FloorDivide);
   };
-  Value rowTiles = ceilDiv(rowExtent, blockM.getResult());
-  Value columnTiles = ceilDiv(columnExtent, blockN.getResult());
+  Value rowTiles = ceilDiv(rowExtent, blockMValue);
+  Value columnTiles = ceilDiv(columnExtent, blockNValue);
   SmallVector<Value> mappingExtents(mapping.getExtents());
   SmallVector<Attribute> launchExtents(mapping.getLaunchExtents().begin(),
                                        mapping.getLaunchExtents().end());
@@ -415,7 +428,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
     return axis;
   };
   unsigned rowMappingAxis = bindMappingAxis(
-      existingRowAxis, runtimeRowTraversal ? rowWorkers.getResult() : rowTiles,
+      existingRowAxis, runtimeRowTraversal ? rowWorkersValue : rowTiles,
       runtimeRowTraversal
           ? unitRowWorkers
           : binaryExpression(context, PhysicalExprKind::CeilDiv, rowExpression,
@@ -468,7 +481,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
     columnStart = binary(
         builder, location, builder.getIndexType(), columnStart,
         binary(builder, location, builder.getIndexType(), columnTile,
-               blockN.getResult(), BinaryOperator::Multiply),
+               blockNValue, BinaryOperator::Multiply),
         BinaryOperator::Add);
   Value columnStop = columnLogicalEnd;
   Value reductionStop = reductionLogicalEnd;
@@ -513,7 +526,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
       {*rowMap, *columnMap}, contract.getResult().getType().getOwner());
 
   Value columns = builder.create<MakeRangeOp>(
-      location, columnIndexType, columnStart, blockN.getResult(), one,
+      location, columnIndexType, columnStart, blockNValue, one,
       columnRange.getLogicalStart(), columnRange.getLogicalStop(),
       columnMap->getSourceId(), columnMap->getSourceAxis(),
       columnMap->getDerived());
@@ -527,7 +540,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
   auto emitRowBlock = [&](OpBuilder &rowBuilder,
                           Value rowStart) -> LogicalResult {
     Value rows = rowBuilder.create<MakeRangeOp>(
-        location, rowIndexType, rowStart, blockM.getResult(), one,
+        location, rowIndexType, rowStart, blockMValue, one,
         rowRange.getLogicalStart(), rowRange.getLogicalStop(),
         rowMap->getSourceId(), rowMap->getSourceAxis(), rowMap->getDerived());
     inheritRangeAuthority(rows, rowRange);
@@ -592,7 +605,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
     std::string loopBodyFailure;
     auto loop = rowBuilder.create<scf::ForOp>(
         location, reductionStart, reductionStop,
-        blockK.getResult(), ValueRange{*accumulator},
+        blockKValue, ValueRange{*accumulator},
         [](OpBuilder &body, Location location, Value, ValueRange carries) {
           body.create<scf::YieldOp>(location, carries);
         });
@@ -601,14 +614,14 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
         [&](OpBuilder &nested, Location nestedLocation, Value kStart,
             ValueRange carries) {
           Value reductions = nested.create<MakeRangeOp>(
-              nestedLocation, reductionIndexType, kStart, blockK.getResult(), one,
+              nestedLocation, reductionIndexType, kStart, blockKValue, one,
               lhsReductionRange.getLogicalStart(),
               lhsReductionRange.getLogicalStop(),
               lhsReductionMap->getSourceId(), lhsReductionMap->getSourceAxis(),
               lhsReductionMap->getDerived());
           inheritRangeAuthority(reductions, lhsReductionRange);
           Value rhsReductionCoordinates = nested.create<MakeRangeOp>(
-              nestedLocation, rhsReductionIndexType, kStart, blockK.getResult(), one,
+              nestedLocation, rhsReductionIndexType, kStart, blockKValue, one,
               rhsReductionRange.getLogicalStart(), rhsReductionRange.getLogicalStop(),
               rhsReductionMap->getSourceId(), rhsReductionMap->getSourceAxis(),
               rhsReductionMap->getDerived());
@@ -832,10 +845,10 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
       rowStart = binary(
           builder, location, builder.getIndexType(), rowStart,
           binary(builder, location, builder.getIndexType(), rowWorker,
-                 blockM.getResult(), BinaryOperator::Multiply),
+                 blockMValue, BinaryOperator::Multiply),
           BinaryOperator::Add);
     Value rowStep = binary(builder, location, builder.getIndexType(),
-                           blockM.getResult(), rowWorkers.getResult(),
+                           blockMValue, rowWorkersValue,
                            BinaryOperator::Multiply);
     auto rowLoop = builder.create<scf::ForOp>(
         location, rowStart, rowStop, rowStep);
@@ -850,7 +863,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
       rowStart = binary(
           builder, location, builder.getIndexType(), rowStart,
           binary(builder, location, builder.getIndexType(), rowTile,
-                 blockM.getResult(), BinaryOperator::Multiply),
+                 blockMValue, BinaryOperator::Multiply),
           BinaryOperator::Add);
     if (failed(emitRowBlock(builder, rowStart)))
       return failure();
@@ -1121,22 +1134,25 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       ("_" + Twine(rowMap->getSourceId()) + "_" +
        Twine(columnMap->getSourceId()))
           .str();
-  ParameterOp blockM = getOrCreatePhysicalParameter(
+  auto blockMRef = getOrCreatePhysicalParameter(
       kernel, "BLOCK_M" + suffix, ParameterRole::OwnershipM,
       ParameterCategory::Contraction,
       lhsType.getElementType().getIntOrFloatBitWidth(), {64, 128});
-  ParameterOp blockN = getOrCreatePhysicalParameter(
+  auto blockNRef = getOrCreatePhysicalParameter(
       kernel, "BLOCK_N" + suffix, ParameterRole::OwnershipN,
       ParameterCategory::Contraction,
       rhsType.getElementType().getIntOrFloatBitWidth(), {64, 128});
-  ParameterOp blockK = getOrCreatePhysicalParameter(
+  auto blockKRef = getOrCreatePhysicalParameter(
       kernel, "BLOCK_K_GROUPS" + suffix, ParameterRole::Reduction,
       ParameterCategory::Contraction,
       std::max(lhsType.getElementType().getIntOrFloatBitWidth(),
                rhsType.getElementType().getIntOrFloatBitWidth()),
       {2, 4, 8});
-  if (!blockM || !blockN || !blockK)
+  if (failed(blockMRef) || failed(blockNRef) || failed(blockKRef))
     return failure();
+  ParameterAttr blockM = lookupParameter(kernel, *blockMRef);
+  ParameterAttr blockN = lookupParameter(kernel, *blockNRef);
+  ParameterAttr blockK = lookupParameter(kernel, *blockKRef);
   FailureOr<unsigned> existingRowAxis =
       mappingAxisForScalar(rowRange->getStart(), mapping);
   FailureOr<unsigned> existingColumnAxis =
@@ -1151,21 +1167,25 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
                                       blockN)))
     return failure();
   for (auto [parameter, range] :
-       {std::pair<ParameterOp, MakeRangeOp>{blockM, *rowRange},
-        std::pair<ParameterOp, MakeRangeOp>{blockN, *columnRange},
-        std::pair<ParameterOp, MakeRangeOp>{blockK, *blockRange}})
+       {std::pair<ParameterAttr, MakeRangeOp>{blockM, *rowRange},
+        std::pair<ParameterAttr, MakeRangeOp>{blockN, *columnRange},
+        std::pair<ParameterAttr, MakeRangeOp>{blockK, *blockRange}})
     if (FailureOr<int64_t> dimension = queryRangeDimension(range);
         succeeded(dimension))
-      parameter->setAttr(
-          dimensionAttr,
-          IntegerAttr::get(IntegerType::get(kernel.getContext(), 64),
-                           *dimension));
+      if (failed(updateParameter(kernel, lookupParameter(kernel, parameter.getReference()).withBinding(
+              lookupParameter(kernel, parameter.getReference()).getBinding().withDimension(
+                  IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), *dimension))))))
+        return failure();
+  OpBuilder parameterBuilder(&kernel.front(), kernel.front().begin());
+  Value blockMValue = materializeParameter(parameterBuilder, location, *blockMRef);
+  Value blockNValue = materializeParameter(parameterBuilder, location, *blockNRef);
+  Value blockKValue = materializeParameter(parameterBuilder, location, *blockKRef);
   PhysicalExprAttr unitM = parameterExpression(
-      context, blockM.getParameter().getName().getValue());
+      context, blockM.getName().getValue());
   PhysicalExprAttr unitN = parameterExpression(
-      context, blockN.getParameter().getName().getValue());
+      context, blockN.getName().getValue());
   PhysicalExprAttr unitK = parameterExpression(
-      context, blockK.getParameter().getName().getValue());
+      context, blockK.getName().getValue());
 
   OpBuilder mapBuilder(mapping);
   Value rowExtent = mapBuilder.create<DimOp>(
@@ -1183,8 +1203,8 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
     return binary(mapBuilder, location, mapBuilder.getIndexType(), adjusted,
                   divisor, BinaryOperator::FloorDivide);
   };
-  Value rowTiles = ceilDiv(rowExtent, blockM.getResult());
-  Value columnTiles = ceilDiv(columnExtent, blockN.getResult());
+  Value rowTiles = ceilDiv(rowExtent, blockMValue);
+  Value columnTiles = ceilDiv(columnExtent, blockNValue);
   SmallVector<Value> mappingExtents(mapping.getExtents());
   SmallVector<Attribute> launchExtents(mapping.getLaunchExtents().begin(),
                                        mapping.getLaunchExtents().end());
@@ -1262,7 +1282,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
     rowStart = binary(
         builder, location, builder.getIndexType(), rowStart,
         binary(builder, location, builder.getIndexType(), rowTile,
-               blockM.getResult(), BinaryOperator::Multiply),
+               blockMValue, BinaryOperator::Multiply),
         BinaryOperator::Add);
   Value rowStop = rowLogicalEnd;
   Value columnStart = columnRange->getStart();
@@ -1270,7 +1290,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
     columnStart = binary(
         builder, location, builder.getIndexType(), columnStart,
         binary(builder, location, builder.getIndexType(), columnTile,
-               blockN.getResult(), BinaryOperator::Multiply),
+               blockNValue, BinaryOperator::Multiply),
         BinaryOperator::Add);
   Value columnStop = columnLogicalEnd;
   Value blockStop = blockLogicalEnd;
@@ -1319,7 +1339,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       {*rowMap, *columnMap}, resultType.getOwner());
 
   Value rows = builder.create<MakeRangeOp>(
-      location, rowIndexType, rowStart, blockM.getResult(), one,
+      location, rowIndexType, rowStart, blockMValue, one,
       rowRange->getLogicalStart(), rowRange->getLogicalStop(),
       rowMap->getSourceId(), rowMap->getSourceAxis(), rowMap->getDerived());
   inheritRangeAuthority(rows, *rowRange);
@@ -1327,7 +1347,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
     rows.getDefiningOp()->setAttr(programBoundedOriginAttr,
                                  builder.getUnitAttr());
   Value columns = builder.create<MakeRangeOp>(
-      location, columnIndexType, columnStart, blockN.getResult(), one,
+      location, columnIndexType, columnStart, blockNValue, one,
       columnRange->getLogicalStart(), columnRange->getLogicalStop(),
       columnMap->getSourceId(), columnMap->getSourceAxis(),
       columnMap->getDerived());
@@ -1344,12 +1364,12 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       location, blockedResultType, *initialAccumulator);
   bool loopBodyFailed = false;
   auto loop = builder.create<scf::ForOp>(
-      location, blockRange->getStart(), blockStop, blockK.getResult(),
+      location, blockRange->getStart(), blockStop, blockKValue,
       ValueRange{accumulator},
       [&](OpBuilder &nested, Location nestedLocation, Value blockStart,
           ValueRange carries) {
         Value blocks = nested.create<MakeRangeOp>(
-            nestedLocation, blockIndexType, blockStart, blockK.getResult(), one,
+            nestedLocation, blockIndexType, blockStart, blockKValue, one,
             blockRange->getLogicalStart(), blockRange->getLogicalStop(),
             lhsBlockMap->getSourceId(), lhsBlockMap->getSourceAxis(),
             lhsBlockMap->getDerived());

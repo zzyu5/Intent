@@ -5,7 +5,8 @@ from .gpu import ResolvedGPUTarget
 from .mojo import MojoTarget
 from .bangc import BangCTarget
 from .mojo import ResolvedMojoTarget
-from .weft import WeftTarget, ResolvedWeftTarget
+from .weft import WeftTarget
+from .specification import GPUCapabilities, GPUCompilationTarget, CPUCompilationTarget, DSACompilationTarget
 
 
 __all__ = [
@@ -17,5 +18,5 @@ __all__ = [
     "BangCTarget",
     "ResolvedMojoTarget",
     "WeftTarget",
-    "ResolvedWeftTarget",
+    "GPUCapabilities", "GPUCompilationTarget", "CPUCompilationTarget", "DSACompilationTarget",
 ]

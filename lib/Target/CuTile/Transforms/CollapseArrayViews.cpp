@@ -27,7 +27,7 @@ DenseI64ArrayAttr collapseGroups(TileLoadOp load) {
         dyn_cast<gpu::PhysicalExprAttr>(view.getLayout().getExtents()[axis]);
     bool fullInner = extent &&
         extent.getKind() ==
-            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+            gpu::PhysicalExprKind::Constant &&
         extent.getValue() > 1 &&
         load.getResult().getType().getShape()[axis] == extent &&
         matchPattern(load.getTileIndices()[axis], m_Zero());
@@ -51,7 +51,7 @@ gpu::FragmentType collapsedTile(gpu::FragmentType source,
     Attribute extent = source.getShape()[begin];
     for (unsigned axis = begin + 1; axis < static_cast<unsigned>(end); ++axis)
       extent = gpu::PhysicalExprAttr::get(
-          context, static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
+          context, gpu::PhysicalExprKind::Multiply, 0,
           StringAttr::get(context),
           ArrayAttr::get(context, {extent, source.getShape()[axis]}));
     auto mapping = cast<gpu::AxisMapAttr>(source.getAxisMaps()[begin]);

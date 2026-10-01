@@ -1,5 +1,6 @@
 #include "ConfigurationPolicy.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -18,8 +19,8 @@ namespace {
 bool expressionReferencesParameter(PhysicalExprAttr expression,
                                    StringAttr parameter) {
   if (expression.getKind() ==
-          static_cast<uint32_t>(PhysicalExprKind::Parameter) &&
-      expression.getSymbol() == parameter)
+          PhysicalExprKind::Parameter &&
+      expression.getSymbolName() == parameter)
     return true;
   return llvm::any_of(expression.getOperands(), [&](Attribute operand) {
     return expressionReferencesParameter(cast<PhysicalExprAttr>(operand),
@@ -29,18 +30,18 @@ bool expressionReferencesParameter(PhysicalExprAttr expression,
 
 bool expressionHasParameter(PhysicalExprAttr expression) {
   if (expression.getKind() ==
-      static_cast<uint32_t>(PhysicalExprKind::Parameter))
+      PhysicalExprKind::Parameter)
     return true;
   return llvm::any_of(expression.getOperands(), [](Attribute operand) {
     return expressionHasParameter(cast<PhysicalExprAttr>(operand));
   });
 }
 
-bool isBlockedReductionFreeAxis(func::FuncOp kernel, ParameterOp parameter) {
-  auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());
+bool isBlockedReductionFreeAxis(func::FuncOp kernel, ParameterAttr parameter) {
+  auto role = parameter.getRole();
   if (role != ParameterRole::OwnershipM && role != ParameterRole::OwnershipN)
     return false;
-  StringAttr name = parameter.getParameter().getName();
+  StringAttr name = parameter.getName();
   bool found = false;
   kernel.walk([&](ReduceOp reduce) {
     if (found || reduce.getAxes().empty())
@@ -56,7 +57,7 @@ bool isBlockedReductionFreeAxis(func::FuncOp kernel, ParameterOp parameter) {
         if (axis < 0 || axis >= static_cast<int64_t>(fragment.getShape().size()))
           return false;
         auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
-        auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+        auto kind = extent.getKind();
         return (kind == PhysicalExprKind::Constant && extent.getValue() > 0) ||
                expressionHasParameter(extent);
       });
@@ -141,11 +142,11 @@ bool valueDependsOn(Value value, Value producer,
   });
 }
 
-bool isOnlineMomentOwnership(func::FuncOp kernel, ParameterOp parameter) {
-  auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());
+bool isOnlineMomentOwnership(func::FuncOp kernel, ParameterAttr parameter) {
+  auto role = parameter.getRole();
   if (role != ParameterRole::OwnershipM && role != ParameterRole::OwnershipN)
     return false;
-  StringAttr name = parameter.getParameter().getName();
+  StringAttr name = parameter.getName();
   bool found = false;
   kernel.walk([&](scf::ForOp loop) {
     if (found || !loop->hasAttr(reductionSourcesAttr) ||
@@ -176,11 +177,11 @@ bool isOnlineMomentOwnership(func::FuncOp kernel, ParameterOp parameter) {
 }
 
 unsigned contractionOwnershipBitWidth(func::FuncOp kernel,
-                                      ParameterOp parameter) {
-  auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());
+                                      ParameterAttr parameter) {
+  auto role = parameter.getRole();
   if (role != ParameterRole::OwnershipM && role != ParameterRole::OwnershipN)
     return 0;
-  StringAttr name = parameter.getParameter().getName();
+  StringAttr name = parameter.getName();
   unsigned width = 0;
   auto include = [&](FragmentType result, FragmentType lhs, FragmentType rhs) {
     if (fragmentReferencesParameter(result, name))
@@ -204,8 +205,8 @@ unsigned contractionOwnershipBitWidth(func::FuncOp kernel,
   return width;
 }
 
-bool isMultiAxisReduction(func::FuncOp kernel, ParameterOp parameter) {
-  StringAttr name = parameter.getParameter().getName();
+bool isMultiAxisReduction(func::FuncOp kernel, ParameterAttr parameter) {
+  StringAttr name = parameter.getName();
   SmallVector<ReduceOp> reductions;
   kernel.walk([&](ReduceOp reduce) { reductions.push_back(reduce); });
   for (ReduceOp inner : reductions) {
@@ -245,8 +246,8 @@ bool isMultiAxisReduction(func::FuncOp kernel, ParameterOp parameter) {
   return false;
 }
 
-bool isStatefulReduction(func::FuncOp kernel, ParameterOp parameter) {
-  auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());
+bool isStatefulReduction(func::FuncOp kernel, ParameterAttr parameter) {
+  auto role = parameter.getRole();
   if (role != ParameterRole::Reduction)
     return false;
   bool found = false;
@@ -256,7 +257,7 @@ bool isStatefulReduction(func::FuncOp kernel, ParameterOp parameter) {
   kernel.walk([&](scf::ForOp loop) {
     auto step = queryLaunchExpression(loop.getStep());
     if (found || !step ||
-        !expressionReferencesParameter(step, parameter.getParameter().getName()) ||
+        !expressionReferencesParameter(step, parameter.getName()) ||
         !loop->hasAttr(reductionSourcesAttr) || loop.getNumResults() < 2)
       return;
     loop.getBody()->walk([&](ReduceOp reduce) {
@@ -267,15 +268,15 @@ bool isStatefulReduction(func::FuncOp kernel, ParameterOp parameter) {
   return found;
 }
 
-bool isRegionContractionParameter(func::FuncOp kernel, ParameterOp parameter) {
+bool isRegionContractionParameter(func::FuncOp kernel, ParameterAttr parameter) {
   SmallVector<StringAttr> segments;
-  kernel.walk([&](ParameterOp candidate) {
-    auto schema = candidate.getParameter();
+  for (Attribute declaration : getParameterDeclarations(kernel)) {
+    auto schema = cast<ParameterAttr>(declaration);
     if (schema.getCategory() ==
-            static_cast<uint32_t>(ParameterCategory::RegionContraction) &&
-        schema.getRole() == static_cast<uint32_t>(ParameterRole::ScanChunk))
+            ParameterCategory::RegionContraction &&
+        schema.getRole() == ParameterRole::ScanChunk)
       segments.push_back(schema.getName());
-  });
+  }
   if (segments.empty())
     return false;
   bool found = false;
@@ -286,7 +287,7 @@ bool isRegionContractionParameter(func::FuncOp kernel, ParameterOp parameter) {
     auto references = [&](Type type) {
       auto fragment = dyn_cast<FragmentType>(type);
       return fragment && fragmentReferencesParameter(
-                             fragment, parameter.getParameter().getName());
+                             fragment, parameter.getName());
     };
     if (!llvm::any_of(operation->getOperandTypes(), references) &&
         !llvm::any_of(operation->getResultTypes(), references))
@@ -307,19 +308,18 @@ bool isRegionContractionParameter(func::FuncOp kernel, ParameterOp parameter) {
   return found && allRegion;
 }
 
-TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter,
+TuningClass tuningClass(func::FuncOp kernel, ParameterAttr parameter,
                        bool reductionRow, unsigned contractionWidth) {
-  ParameterAttr schema = parameter.getParameter();
-  switch (static_cast<ParameterCategory>(schema.getCategory())) {
+  ParameterAttr schema = parameter;
+  switch (schema.getCategory()) {
   case ParameterCategory::Reduction:
     if (isMultiAxisReduction(kernel, parameter))
       return TuningClass::MultiAxisReduction;
     if (isStatefulReduction(kernel, parameter))
       return TuningClass::StatefulReduction;
     return schema.getRole() ==
-                       static_cast<uint32_t>(ParameterRole::ReductionOuter) ||
-                   schema.getRole() == static_cast<uint32_t>(
-                                           ParameterRole::ReductionInner)
+                       ParameterRole::ReductionOuter ||
+                   schema.getRole() == ParameterRole::ReductionInner
                ? TuningClass::MultiAxisReduction
                : TuningClass::Reduction;
   case ParameterCategory::Scan:
@@ -357,7 +357,7 @@ TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter,
 
 SmallVector<CorrelatedProfileParameters>
 correlatedReductionContractionParameters(
-    func::FuncOp kernel, ArrayRef<ParameterOp> parameters,
+    func::FuncOp kernel, ArrayRef<ParameterAttr> parameters,
     const ConfigurationFacts &facts) {
   SmallVector<CorrelatedProfileParameters> correlated;
   auto capabilities =
@@ -366,13 +366,13 @@ correlatedReductionContractionParameters(
       facts.hasFixedPointwiseLocal)
     return correlated;
 
-  SmallVector<ParameterOp> pointwise;
-  SmallVector<ParameterOp> reductions;
-  SmallVector<ParameterOp> contractions;
+  SmallVector<ParameterAttr> pointwise;
+  SmallVector<ParameterAttr> reductions;
+  SmallVector<ParameterAttr> contractions;
   SmallVector<ContractOp> contracts;
-  for (ParameterOp parameter : parameters) {
-    ParameterAttr schema = parameter.getParameter();
-    auto role = static_cast<ParameterRole>(schema.getRole());
+  for (ParameterAttr parameter : parameters) {
+    ParameterAttr schema = parameter;
+    auto role = schema.getRole();
     auto kind = facts.classifications.find(parameter)->second.kind;
     if ((kind == TuningClass::Pointwise ||
          kind == TuningClass::PointwiseReduction) &&
@@ -398,14 +398,14 @@ correlatedReductionContractionParameters(
     if (!sourceType || !resultType)
       return;
 
-    for (ParameterOp pointwiseParameter : pointwise) {
-      StringAttr pointwiseName = pointwiseParameter.getParameter().getName();
+    for (ParameterAttr pointwiseParameter : pointwise) {
+      StringAttr pointwiseName = pointwiseParameter.getName();
       if (!freeAxesReferenceParameter(sourceType, reduce.getAxes(),
                                       pointwiseName) ||
           !fragmentReferencesParameter(resultType, pointwiseName))
         continue;
-      for (ParameterOp reductionParameter : reductions) {
-        StringAttr reductionName = reductionParameter.getParameter().getName();
+      for (ParameterAttr reductionParameter : reductions) {
+        StringAttr reductionName = reductionParameter.getName();
         if (!reducedAxesReferenceParameter(sourceType, reduce.getAxes(),
                                            reductionName))
           continue;
@@ -434,9 +434,9 @@ correlatedReductionContractionParameters(
           llvm::DenseSet<Value> visited;
           if (!valueDependsOn(source, contract.getResult(), visited))
             continue;
-          for (ParameterOp contractionParameter : contractions) {
+          for (ParameterAttr contractionParameter : contractions) {
             StringAttr contractionName =
-                contractionParameter.getParameter().getName();
+                contractionParameter.getName();
             if (!reducedAxesReferenceParameter(
                     lhsType, contract.getLhsReductionAxes(), contractionName) ||
                 !reducedAxesReferenceParameter(
@@ -473,9 +473,9 @@ unsigned carriedMatrixCount(Type type) {
 bool hasMultipleRegionMatrixAccumulators(func::FuncOp kernel) {
   bool found = false;
   kernel.walk([&](scf::ForOp loop) {
-    auto segment = loop.getStep().getDefiningOp<ParameterOp>();
-    if (!segment || segment.getParameter().getCategory() !=
-                        static_cast<uint32_t>(ParameterCategory::RegionContraction))
+    auto segment = queryParameter(loop.getStep());
+    if (!segment || segment.getCategory() !=
+                        ParameterCategory::RegionContraction)
       return;
     unsigned matrices = 0;
     for (Value carry : loop.getInitArgs())
@@ -486,24 +486,24 @@ bool hasMultipleRegionMatrixAccumulators(func::FuncOp kernel) {
 }
 
 SmallVector<ContractionFreeExtent>
-contractionFreeExtents(func::FuncOp kernel, ArrayRef<ParameterOp> parameters) {
+contractionFreeExtents(func::FuncOp kernel, ArrayRef<ParameterAttr> parameters) {
   // An enclosing reduction's chunk can be a free axis of its inner contract.
-  llvm::StringMap<ParameterOp> freeAxisParameters;
-  for (ParameterOp parameter : parameters)
-    freeAxisParameters[parameter.getParameter().getName().getValue()] = parameter;
+  llvm::StringMap<ParameterAttr> freeAxisParameters;
+  for (ParameterAttr parameter : parameters)
+    freeAxisParameters[parameter.getName().getValue()] = parameter;
   SmallVector<ContractionFreeExtent> groups;
   kernel.walk([&](ContractOp contract) {
     SmallVector<ContractionFreeExtent> contractGroups;
     bool factorizedFreeAxes = false;
-    SmallVector<ParameterOp> contractProfiles;
-    for (ParameterOp parameter : parameters) {
-      auto category = static_cast<ParameterCategory>(
-          parameter.getParameter().getCategory());
+    SmallVector<ParameterAttr> contractProfiles;
+    for (ParameterAttr parameter : parameters) {
+      auto category =
+          parameter.getCategory();
       if (category != ParameterCategory::Contraction &&
           category != ParameterCategory::PersistentContraction &&
           category != ParameterCategory::RegionContraction)
         continue;
-      StringAttr name = parameter.getParameter().getName();
+      StringAttr name = parameter.getName();
       if (reducedAxesReferenceParameter(
               cast<FragmentType>(contract.getLhs().getType()),
               contract.getLhsReductionAxes(), name) &&
@@ -518,13 +518,13 @@ contractionFreeExtents(func::FuncOp kernel, ArrayRef<ParameterOp> parameters) {
       group.role = role;
       unsigned factors = 0;
       std::function<bool(PhysicalExprAttr)> collect = [&](PhysicalExprAttr extent) {
-        auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+        auto kind = extent.getKind();
         if (kind == PhysicalExprKind::Constant) {
           factors += extent.getValue() > 1;
           return extent.getValue() > 0;
         }
         if (kind == PhysicalExprKind::Parameter) {
-          auto found = freeAxisParameters.find(extent.getSymbol().getValue());
+          auto found = freeAxisParameters.find(extent.getSymbolName().getValue());
           if (found == freeAxisParameters.end()) return false;
           ++factors;
           if (!llvm::is_contained(group.parameters, found->second))
@@ -572,13 +572,13 @@ contractionFreeExtents(func::FuncOp kernel, ArrayRef<ParameterOp> parameters) {
   return groups;
 }
 
-bool hasSmallRegionRows(func::FuncOp kernel, ArrayRef<ParameterOp> parameters) {
+bool hasSmallRegionRows(func::FuncOp kernel, ArrayRef<ParameterAttr> parameters) {
   bool found = false;
-  for (ParameterOp parameter : parameters) {
-    ParameterAttr schema = parameter.getParameter();
+  for (ParameterAttr parameter : parameters) {
+    ParameterAttr schema = parameter;
     if (schema.getCategory() !=
-            static_cast<uint32_t>(ParameterCategory::RegionContraction) ||
-        schema.getRole() != static_cast<uint32_t>(ParameterRole::OwnershipM))
+            ParameterCategory::RegionContraction ||
+        schema.getRole() != ParameterRole::OwnershipM)
       continue;
     bool small = false;
     kernel.walk([&](MakeRangeOp range) {
@@ -602,13 +602,13 @@ bool hasSmallRegionRows(func::FuncOp kernel, ArrayRef<ParameterOp> parameters) {
 SmallVector<FullResultContraction> fullResultContractions(func::FuncOp kernel) {
   SmallVector<FullResultContraction> contractions;
   kernel.walk([&](scf::ForOp loop) {
-    auto parameter = loop.getStep().getDefiningOp<ParameterOp>();
+    auto parameter = queryParameter(loop.getStep());
     if (!parameter || loop.getNumResults() != 1)
       return;
-    auto schema = parameter.getParameter();
-    auto role = static_cast<ParameterRole>(schema.getRole());
+    auto schema = parameter;
+    auto role = schema.getRole();
     if (schema.getCategory() !=
-            static_cast<uint32_t>(ParameterCategory::Contraction) ||
+            ParameterCategory::Contraction ||
         (role != ParameterRole::OwnershipM && role != ParameterRole::OwnershipN))
       return;
     auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
@@ -627,12 +627,12 @@ SmallVector<FullResultContraction> fullResultContractions(func::FuncOp kernel) {
       return;
     auto sliced = cast<PhysicalExprAttr>(source.getShape()[axis]);
     auto full = cast<PhysicalExprAttr>(result.getShape()[axis]);
-    if (sliced.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter) ||
-        sliced.getSymbol() != schema.getName() ||
-        full.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter))
+    if (sliced.getKind() != PhysicalExprKind::Parameter ||
+        sliced.getSymbolName() != schema.getName() ||
+        full.getKind() != PhysicalExprKind::Parameter)
       return;
-    auto coverage = queryParameterBySymbol(kernel, full.getSymbol());
-    if (failed(coverage) || !(*coverage)->hasAttr(coverageDimensionAttr))
+    auto coverage = queryParameterBySymbol(kernel, full.getSymbolName());
+    if (failed(coverage) || !coverage->isDeferred())
       return;
     auto other = cast<PhysicalExprAttr>(source.getShape()[1 - axis]);
     contractions.push_back({parameter, other});
@@ -643,12 +643,12 @@ SmallVector<FullResultContraction> fullResultContractions(func::FuncOp kernel) {
 } // namespace
 
 ConfigurationFacts analyzeConfigurationPolicy(
-    func::FuncOp kernel, ArrayRef<ParameterOp> parameters,
+    func::FuncOp kernel, ArrayRef<ParameterAttr> parameters,
     const FragmentResourceAnalysis &resources) {
   ConfigurationFacts facts;
   facts.parameters.assign(parameters.begin(), parameters.end());
-  for (ParameterOp parameter : parameters) {
-    auto schema = parameter.getParameter();
+  for (ParameterAttr parameter : parameters) {
+    auto schema = parameter;
     bool reductionRow = isBlockedReductionFreeAxis(kernel, parameter);
     unsigned contractionWidth = contractionOwnershipBitWidth(kernel, parameter);
     TuningClass kind =
@@ -658,7 +658,7 @@ ConfigurationFacts analyzeConfigurationPolicy(
          kind == TuningClass::PersistentContraction) && contractionWidth)
       width = contractionWidth;
     bool pointwiseTraversal = false;
-    if (parameter->hasAttr(pointwiseChunkAttr))
+    if (parameter.getBinding().getPointwiseChunk())
       kernel.walk([&](scf::ForOp loop) {
         auto step = queryLaunchExpression(loop.getStep());
         if (step && expressionReferencesParameter(step, schema.getName()))
@@ -669,20 +669,20 @@ ConfigurationFacts analyzeConfigurationPolicy(
                                            pointwiseTraversal});
   }
   facts.hasTwoAxisPointwiseOwnership = llvm::any_of(
-      parameters, [](ParameterOp parameter) {
-        ParameterAttr schema = parameter.getParameter();
+      parameters, [](ParameterAttr parameter) {
+        ParameterAttr schema = parameter;
         return schema.getCategory() ==
-                   static_cast<uint32_t>(ParameterCategory::Pointwise) &&
+                   ParameterCategory::Pointwise &&
                schema.getRole() ==
-               static_cast<uint32_t>(ParameterRole::OwnershipM);
+               ParameterRole::OwnershipM;
       });
   facts.hasFixedPointwiseLocal = llvm::any_of(
-      parameters, [](ParameterOp parameter) {
-        ParameterAttr schema = parameter.getParameter();
+      parameters, [](ParameterAttr parameter) {
+        ParameterAttr schema = parameter;
         return schema.getCategory() ==
-                   static_cast<uint32_t>(ParameterCategory::Pointwise) &&
+                   ParameterCategory::Pointwise &&
                schema.getCandidates().size() == 1 &&
-               parameter->hasAttr(pointwiseLocalAttr);
+               parameter.getBinding().getPointwiseLocal();
       });
   facts.pointwiseOnlyProgram = true;
   kernel.walk([&](Operation *operation) {
@@ -695,14 +695,14 @@ ConfigurationFacts analyzeConfigurationPolicy(
   });
 
   if (facts.pointwiseOnlyProgram && !facts.hasTwoAxisPointwiseOwnership)
-    for (ParameterOp parameter : parameters) {
-      auto schema = parameter.getParameter();
-      if (schema.getCategory() != static_cast<uint32_t>(ParameterCategory::Pointwise) ||
-          schema.getRole() != static_cast<uint32_t>(ParameterRole::OwnershipN))
+    for (ParameterAttr parameter : parameters) {
+      auto schema = parameter;
+      if (schema.getCategory() != ParameterCategory::Pointwise ||
+          schema.getRole() != ParameterRole::OwnershipN)
         continue;
       auto localExtent = [&](PhysicalExprAttr extent) -> std::optional<int64_t> {
-        if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter) ||
-            extent.getSymbol() != schema.getName())
+        if (extent.getKind() != PhysicalExprKind::Parameter ||
+            extent.getSymbolName() != schema.getName())
           return std::nullopt;
         return 1;
       };
@@ -729,11 +729,11 @@ ConfigurationFacts analyzeConfigurationPolicy(
     }
 
   if (facts.pointwiseOnlyProgram)
-    for (ParameterOp parameter : parameters) {
-      ParameterAttr schema = parameter.getParameter();
+    for (ParameterAttr parameter : parameters) {
+      ParameterAttr schema = parameter;
       if (schema.getCategory() ==
-              static_cast<uint32_t>(ParameterCategory::Pointwise) &&
-          schema.getRole() == static_cast<uint32_t>(ParameterRole::OwnershipM) &&
+              ParameterCategory::Pointwise &&
+          schema.getRole() == ParameterRole::OwnershipM &&
           llvm::is_contained(schema.getCandidates().asArrayRef(), 1) &&
           llvm::any_of(schema.getCandidates().asArrayRef(),
                        [](int64_t extent) { return extent > 1; }))
@@ -755,7 +755,7 @@ ConfigurationFacts analyzeConfigurationPolicy(
       std::optional<unsigned> first;
       for (auto [index, parameter] : llvm::enumerate(facts.pointwiseRowAxes)) {
         if (!fragmentReferencesParameter(fragment,
-                                          parameter.getParameter().getName()))
+                                          parameter.getName()))
           continue;
         if (first)
           rowLeaders[leader(index)] = leader(*first);
@@ -776,13 +776,13 @@ ConfigurationFacts analyzeConfigurationPolicy(
   auto capabilities =
       kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   if (capabilities && capabilities.getMatrixUnits())
-    for (ParameterOp parameter : parameters) {
-      ParameterAttr schema = parameter.getParameter();
-      Attribute group = parameter->getAttr(parameterGroupAttr);
+    for (ParameterAttr parameter : parameters) {
+      ParameterAttr schema = parameter;
+      Attribute group = parameter.getBinding().getGroup();
       if (schema.getCategory() !=
-              static_cast<uint32_t>(ParameterCategory::Contraction) ||
+              ParameterCategory::Contraction ||
           schema.getRole() !=
-              static_cast<uint32_t>(ParameterRole::TraversalWorkers) ||
+              ParameterRole::TraversalWorkers ||
           !isa_and_nonnull<ArrayAttr>(group) ||
           llvm::is_contained(facts.indirectRowGroups, group))
         continue;
@@ -801,11 +801,11 @@ ConfigurationFacts analyzeConfigurationPolicy(
       auto source = dyn_cast<FragmentType>(reduce.getSources().front().getType());
       if (!source)
         return;
-      ParameterOp chunk;
-      SmallVector<ParameterOp> rows;
-      for (ParameterOp parameter : parameters) {
-        auto schema = parameter.getParameter();
-        auto role = static_cast<ParameterRole>(schema.getRole());
+      ParameterAttr chunk;
+      SmallVector<ParameterAttr> rows;
+      for (ParameterAttr parameter : parameters) {
+        auto schema = parameter;
+        auto role = schema.getRole();
         if (role == ParameterRole::Reduction &&
             reducedAxesReferenceParameter(source, reduce.getAxes(), schema.getName())) {
           if (chunk || facts.classifications.find(parameter)->second.kind != TuningClass::Reduction)

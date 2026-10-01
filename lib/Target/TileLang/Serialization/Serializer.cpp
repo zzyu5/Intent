@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Target/TileLang/Serialization/Serializer.h"
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
@@ -36,7 +37,7 @@ std::string expressionString(gpu::PhysicalExprAttr expression) {
   static const gpu::PythonExpressionSyntax syntax{
       "T.ceildiv", "T.min", "T.max", "T.if_then_else", "T.next_power_of_2", false};
   return gpu::pythonExpression(expression, syntax, [](gpu::PhysicalExprAttr leaf) {
-    return leaf.getSymbol().getValue().str();
+    return leaf.getSymbolName().getValue().str();
   });
 }
 
@@ -92,12 +93,16 @@ private:
       values[kernel.getArgument(metadata.abi)] = metadata.name;
     for (const ViewABI &view : views)
       values[kernel.getArgument(view.abi)] = view.name;
+    // Launch configuration is printed before the body. Parameter reads name
+    // builder arguments, so their bindings are available at both positions.
+    kernel.walk([&](gpu::ParameterOp read) {
+      values[read.getResult()] = read.getReference().getName().getValue().str();
+    });
     llvm::StringSet<> occupied;
     for (const auto &entry : values)
       occupied.insert(entry.second);
-    kernel.walk([&](gpu::ParameterOp parameter) {
-      occupied.insert(parameter.getParameter().getName().getValue());
-    });
+    for (Attribute attribute : gpu::getParameterDeclarations(kernel))
+      occupied.insert(cast<gpu::ParameterAttr>(attribute).getName().getValue());
     auto fresh = [&](StringRef stem) {
       std::string name = stem.str();
       while (!occupied.insert(name).second)
@@ -111,14 +116,14 @@ private:
   }
 
   void collectConfiguration() {
-    kernel.walk([&](gpu::ParameterOp parameter) {
-      std::string name = parameter.getParameter().getName().getValue().str();
-      values[parameter.getResult()] = name;
-      if (parameter->hasAttr(gpu::coverageDimensionAttr))
+    for (Attribute attribute : gpu::getParameterDeclarations(kernel)) {
+      auto parameter = cast<gpu::ParameterAttr>(attribute);
+      std::string name = parameter.getName().getValue().str();
+      if (parameter.isDeferred())
         coverageNames.insert(name);
       else
         parameterNames.push_back(name);
-    });
+    }
   }
 
   void emitPreamble() {
@@ -231,13 +236,10 @@ private:
   }
 
   void emitOperation(Operation &operation) {
-    if (isa<gpu::ViewOverlapOp>(operation)) {
+    if (isa<gpu::ViewOverlapOp, gpu::ParameterOp>(operation)) {
       return;
     } else if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
       values[constant.getResult()] = literal(constant.getValue());
-    } else if (auto parameter = dyn_cast<gpu::ParameterOp>(operation)) {
-      values[parameter.getResult()] =
-          parameter.getParameter().getName().getValue().str();
     } else if (auto physical = dyn_cast<gpu::PhysicalExprOp>(operation)) {
       assign(physical.getResult(), expressionString(physical.getExpression()));
     } else if (auto program = dyn_cast<gpu::ProgramIdOp>(operation)) {
@@ -621,6 +623,9 @@ private:
   std::string valueString(Value value) {
     auto found = values.find(value);
     if (found == values.end()) {
+      if (!failed)
+        kernel.emitError("TileLang serialization has no source binding for SSA value: ")
+            << value;
       failed = true;
       return "<missing>";
     }

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import sys
 
 from .backends import BACKENDS
-from .compilation import compile_request, doctor, generate_ir_request, optimize_request
+from .compilation import compile_request, doctor, generate_ir_request, materialize_request, optimize_request
 
 
 def _assignments(parser, values: list[str]) -> dict:
@@ -31,6 +32,8 @@ def main() -> None:
         command.add_argument("--target", choices=BACKENDS, required=name in {"doctor", "generate-ir"})
         command.add_argument("--target-option", action="append", default=[], metavar="NAME=JSON")
         command.add_argument("--compiler", help="Intent compiler override")
+        command.add_argument("--target-facts", type=Path,
+                             help="JSON object containing the compiler's target facts; generate without probing a local device or SDK")
         command.add_argument("--json", action="store_true", help="Write a structured result")
     compile_parser = commands.choices["compile"]
     compile_parser.add_argument("program", metavar="PROGRAM:KERNEL")
@@ -39,11 +42,18 @@ def main() -> None:
     compile_parser.add_argument("--stage", choices=("kir", "shared", "provider"), default="provider",
                                 help="Stop at verified KIR, shared physical IR, or generated provider source")
     compile_parser.add_argument("--materialize", action="store_true", help="Also create the callable; never launch the kernel")
+    compile_parser.add_argument("--export", dest="export_directory", help="Save the generated program in a new portable directory")
     generate_parser = commands.choices["generate-ir"]
     generate_parser.add_argument("ir_file", metavar="INPUT.mlir")
     generate_parser.add_argument("--input-stage", choices=("kir", "shared"), default="shared")
     generate_parser.add_argument("--name", required=True, help="Diagnostic program identifier; does not select a kernel")
     generate_parser.add_argument("--materialize", action="store_true", help="Also create the callable without launching")
+    generate_parser.add_argument("--export", dest="export_directory", help="Save the generated program in a new portable directory")
+    materialize_parser = commands.add_parser("materialize", help="Load a saved generated program and bind an explicitly selected runtime")
+    materialize_parser.add_argument("directory")
+    materialize_parser.add_argument("--target", choices=BACKENDS, required=True)
+    materialize_parser.add_argument("--target-option", action="append", default=[], metavar="NAME=JSON")
+    materialize_parser.add_argument("--json", action="store_true")
     optimize_parser = commands.add_parser("optimize", help="Run a standard MLIR pass pipeline on existing IR")
     optimize_parser.add_argument("ir_file", metavar="INPUT.mlir")
     optimize_parser.add_argument("--pipeline", required=True, help="Standard MLIR pass pipeline")
@@ -54,12 +64,23 @@ def main() -> None:
         result = optimize_request(arguments.ir_file, arguments.pipeline, optimizer=arguments.optimizer)
     else:
         options = _assignments(parser, arguments.target_option)
-        if arguments.command == "doctor":
-            result = doctor(arguments.target, target_options=options, compiler=arguments.compiler)
+        facts = None
+        if arguments.command != "materialize" and arguments.target_facts is not None:
+            try:
+                facts = json.loads(arguments.target_facts.read_text(encoding="utf-8"))
+                if not isinstance(facts, dict):
+                    raise ValueError("target facts must be a JSON object")
+            except (OSError, UnicodeError, ValueError) as error:
+                parser.error(str(error))
+        if arguments.command == "materialize":
+            result = materialize_request(arguments.directory, arguments.target, target_options=options)
+        elif arguments.command == "doctor":
+            result = doctor(arguments.target, target_options=options, compiler=arguments.compiler, target_facts=facts)
         elif arguments.command == "generate-ir":
             result = generate_ir_request(arguments.ir_file, arguments.name, arguments.target,
                                          input_stage=arguments.input_stage, target_options=options,
-                                         compiler=arguments.compiler, materialize=arguments.materialize)
+                                         compiler=arguments.compiler, materialize=arguments.materialize,
+                                         target_facts=facts, export_directory=arguments.export_directory)
         else:
             program, separator, kernel = arguments.program.rpartition(":")
             if not separator or not program:
@@ -67,7 +88,8 @@ def main() -> None:
             result = compile_request(program, kernel, arguments.target, target_options=options,
                                      constexprs=_assignments(parser, arguments.constexpr),
                                      compiler=arguments.compiler, tuning_config=arguments.tuning_config,
-                                     materialize=arguments.materialize, stage=arguments.stage)
+                                     materialize=arguments.materialize, stage=arguments.stage,
+                                     target_facts=facts, export_directory=arguments.export_directory)
     if arguments.json:
         print(json.dumps(result, indent=2))
     elif arguments.command == "doctor":
@@ -80,6 +102,8 @@ def main() -> None:
             print(f"{arguments.ir_file}: {result['status']} with {arguments.pipeline}")
         elif arguments.command == "generate-ir":
             print(f"{arguments.ir_file}: {result['status']} for {arguments.target}")
+        elif arguments.command == "materialize":
+            print(f"{arguments.directory}: {result['status']} for {arguments.target}")
         else:
             scope = arguments.target or arguments.stage
             print(f"{arguments.program}: {result['status']} for {scope}")
@@ -87,6 +111,8 @@ def main() -> None:
             print(f"Stage: {result['stage']}\n{result['diagnostic']['message']}", file=sys.stderr)
         for name, path in result.get("files", {}).items():
             print(f"  {name}: {path}")
+        if "export_directory" in result:
+            print(f"  exported program: {result['export_directory']}")
         if result.get("program_stdout"):
             print(result["program_stdout"], file=sys.stderr, end="")
         if arguments.command == "compile":

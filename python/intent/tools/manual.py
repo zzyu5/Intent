@@ -92,8 +92,9 @@ def _corpus(documents_root: Path, package: Path, revision: str) -> dict:
         if inspect.isclass(value):
             members = {member: method for base in reversed(value.__mro__)
                        for member, method in vars(base).items()}
-            declared = {member: method for member, method in members.items()
-                        if (inspect.isfunction(method) or isinstance(method, property))
+            declared = {member: getattr(value, member) if isinstance(method, (classmethod, staticmethod)) else method
+                        for member, method in members.items()
+                        if (inspect.isfunction(method) or isinstance(method, (property, classmethod, staticmethod)))
                         and (not member.startswith("_") or member == "__call__")}
             exports.update({f"{name}.{member}": method for member, method in declared.items()})
             class_members[name] = list(declared)
@@ -144,8 +145,8 @@ def _corpus(documents_root: Path, package: Path, revision: str) -> dict:
             signature = name if annotation is inspect.Signature.empty else f"{name}: {annotation}"
             source = "python/intent/" + Path(inspect.getfile(declaration)).resolve().relative_to(package).as_posix()
             docstring = inspect.getdoc(value)
-        elif inspect.isfunction(value) or inspect.isclass(value):
-            signature = inspect.signature(value) if inspect.isfunction(value) or inspect.isfunction(vars(value).get("__init__")) else None
+        elif inspect.isfunction(value) or inspect.ismethod(value) or inspect.isclass(value):
+            signature = inspect.signature(value) if inspect.isfunction(value) or inspect.ismethod(value) or inspect.isfunction(vars(value).get("__init__")) else None
             source = "python/intent/" + Path(inspect.getfile(value)).resolve().relative_to(package).as_posix()
             if name.startswith("intent."):
                 docstring = inspect.getdoc(value)
@@ -172,7 +173,7 @@ def _corpus(documents_root: Path, package: Path, revision: str) -> dict:
                 signature = "[dtype, shape]"
         elif get_origin(value) is not None:
             kind = "type alias"
-        elif inspect.isfunction(value):
+        elif inspect.isfunction(value) or inspect.ismethod(value):
             kind = "host function"
         elif isinstance(value, QuantFormats):
             kind = "namespace"

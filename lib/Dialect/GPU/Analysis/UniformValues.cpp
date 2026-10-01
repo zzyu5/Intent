@@ -14,7 +14,7 @@ std::optional<int64_t> evaluatePhysicalExpression(
     llvm::function_ref<bool(PhysicalExprAttr, llvm::ArrayRef<int64_t>)> supportsOperation) {
   if (!expression)
     return std::nullopt;
-  auto kind = static_cast<PhysicalExprKind>(expression.getKind());
+  auto kind = expression.getKind();
   if (kind == PhysicalExprKind::Constant)
     return expression.getValue();
   if (kind == PhysicalExprKind::Parameter || kind == PhysicalExprKind::Dimension ||

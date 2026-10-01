@@ -60,7 +60,7 @@ bool isUnitExtent(Attribute attribute) {
   auto extent = dyn_cast<gpu::PhysicalExprAttr>(attribute);
   return extent &&
          extent.getKind() ==
-             static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+             gpu::PhysicalExprKind::Constant &&
          extent.getValue() == 1;
 }
 
@@ -350,8 +350,7 @@ bool isBlockedWorksetOrigin(Value value, Value block, int64_t dimension) {
       dyn_cast<gpu::PhysicalExprAttr>(expression.getOperands()[1]);
   auto parameter = block.getDefiningOp<gpu::ParameterOp>();
   return parameterExpression && parameter &&
-         parameterExpression.getSymbol() ==
-             parameter.getParameter().getName();
+         parameterExpression.getParameterReference() == parameter.getReference();
 }
 
 std::optional<int64_t> constantTileOrigin(gpu::MakeRangeOp range,
@@ -419,10 +418,10 @@ bool rangeOriginInView(gpu::MakeRangeOp range, ArrayRef<Value> offsets,
     auto parameter = range.getExtent().getDefiningOp<gpu::ParameterOp>();
     if (isProvably(start, 0) && isProvably(range.getLogicalStart(), 0) &&
         parameter &&
-        parameter.getParameter().getRole() ==
-            static_cast<uint32_t>(gpu::ParameterRole::FullCoverage)) {
+        parameter.getDeclaration().getRole() ==
+            gpu::ParameterRole::FullCoverage) {
       gpu::PhysicalParameterBinding binding =
-          gpu::queryParameterBinding(parameter);
+          gpu::queryParameterBinding(parameter.getDeclaration());
       if (binding.isExact() && binding.dimension &&
           *binding.dimension == dimension)
         return true;
@@ -549,16 +548,16 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
           auto upper = loop ? gpu::queryLaunchExpression(loop.getUpperBound())
                             : gpu::PhysicalExprAttr();
           if (upper && upper.getKind() ==
-                           static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply) &&
+                           gpu::PhysicalExprKind::Multiply &&
               upper.getOperands().size() == 2) {
             auto covers = [&](Attribute dimension, Attribute factor) {
               auto dim = cast<gpu::PhysicalExprAttr>(dimension);
               auto scale = cast<gpu::PhysicalExprAttr>(factor);
               return dim.getKind() ==
-                         static_cast<uint32_t>(gpu::PhysicalExprKind::Dimension) &&
+                         gpu::PhysicalExprKind::Dimension &&
                      dim.getValue() == dimensions[resourceAxis] &&
                      scale.getKind() ==
-                         static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+                         gpu::PhysicalExprKind::Constant &&
                      scale.getValue() == divisor;
             };
             axis.originInBounds |= covers(upper.getOperands()[0], upper.getOperands()[1]) ||
@@ -676,7 +675,7 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
 
   MLIRContext *context = owner->getContext();
   auto unit = gpu::PhysicalExprAttr::get(
-      context, static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), 1,
+      context, gpu::PhysicalExprKind::Constant, 1,
       StringAttr::get(context), ArrayAttr::get(context, {}));
   SmallVector<Attribute> resourceShape(resourceRank);
   SmallVector<Attribute> resourceMappings(resourceRank);
@@ -703,7 +702,7 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
         extent = component;
       else if (!isUnitExtent(component))
         extent = gpu::PhysicalExprAttr::get(
-            context, static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
+            context, gpu::PhysicalExprKind::Multiply, 0,
             StringAttr::get(context), ArrayAttr::get(context, {extent, component}));
       auto componentMap = cast<gpu::AxisMapAttr>(
           computationType.getAxisMaps()[computationAxis]);

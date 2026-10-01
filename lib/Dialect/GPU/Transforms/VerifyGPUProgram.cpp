@@ -2,7 +2,7 @@
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
-#include "Intent/Dialect/GPU/Analysis/Configurations.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -22,9 +22,9 @@ LogicalResult verifyExpressionSymbols(Operation *owner,
                                       const llvm::StringSet<> &parameters,
                                       const llvm::StringSet<> &launchABI,
                                       const llvm::DenseSet<int64_t> &dimensions) {
-  auto kind = static_cast<PhysicalExprKind>(expression.getKind());
+  auto kind = expression.getKind();
   if (kind == PhysicalExprKind::Parameter &&
-      !parameters.contains(expression.getSymbol().getValue()))
+      !parameters.contains(expression.getSymbolName().getValue()))
     return owner->emitOpError("launch expression references an undeclared physical parameter");
   if (kind == PhysicalExprKind::Dimension &&
       (expression.getValue() <= 0 ||
@@ -34,10 +34,10 @@ LogicalResult verifyExpressionSymbols(Operation *owner,
            << expression.getValue();
   if ((kind == PhysicalExprKind::Dimension ||
        kind == PhysicalExprKind::ScalarABI) &&
-      !launchABI.contains(expression.getSymbol().getValue()))
+      !launchABI.contains(expression.getSymbolName().getValue()))
     return owner->emitOpError(
                "launch expression references unavailable host metadata: ")
-           << expression.getSymbol();
+           << expression.getSymbolName();
   for (Attribute operand : expression.getOperands())
     if (failed(verifyExpressionSymbols(owner, cast<PhysicalExprAttr>(operand),
                                        parameters, launchABI, dimensions)))
@@ -92,21 +92,21 @@ bool requiresRangeProvenance(Value coordinate) {
   return llvm::any_of(fragment.getShape(), [](Attribute extent) {
     auto expression = cast<PhysicalExprAttr>(extent);
     return expression.getKind() !=
-               static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+               PhysicalExprKind::Constant ||
            expression.getValue() != 1;
   });
 }
 
 LogicalResult verifyStructuredSegment(Operation *operation,
                                       func::FuncOp kernel,
-                                      ParameterAttr segment) {
-  FailureOr<ParameterOp> declaration =
+                                      ParameterRefAttr segment) {
+  FailureOr<ParameterAttr> declaration =
       queryParameterBySymbol(kernel, segment.getName());
-  if (failed(declaration) || declaration->getParameter() != segment)
+  if (failed(declaration))
     return operation->emitOpError(
         "structured segment does not reference one exact physical parameter declaration");
-  return segment.getRole() ==
-                 static_cast<uint32_t>(ParameterRole::ScanChunk)
+  return declaration->getRole() ==
+                 ParameterRole::ScanChunk
              ? success()
              : operation->emitOpError(
                    "structured segment parameter has the wrong physical role");
@@ -171,7 +171,7 @@ LogicalResult verifyBufferResources(func::FuncOp kernel,
     if (!llvm::all_of(space, [](Attribute extent) {
           auto expression = cast<PhysicalExprAttr>(extent);
           return expression.getKind() ==
-                     static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                     PhysicalExprKind::Constant &&
                  expression.getValue() == 1;
         }) && !analysis.hasDisjointWorkspaceSlices(argument))
       return kernel.emitError(
@@ -200,7 +200,7 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
     auto configurations = dyn_cast<ConfigurationSetAttr>(attribute);
     if (!configurations)
       return kernel.emitError("candidate bindings require a typed configuration set");
-    auto space = ConfigurationSpace::read(kernel);
+    auto space = ParameterSpace::read(kernel);
     if (failed(space) ||
         failed(space->configurations(configurations.getStage())))
       return failure();
@@ -272,9 +272,18 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
   SmallVector<PhysicalExprAttr> abiExpressions;
   for (Type type : kernel.getArgumentTypes())
     collectTypeExpressions(type, abiExpressions);
-  kernel.walk([&](ParameterOp parameter) {
-    parameterNames.insert(parameter.getParameter().getName().getValue());
-  });
+  auto declarations = ParameterSpace::read(kernel);
+  if (failed(declarations))
+    return failure();
+  for (ParameterAttr parameter : declarations->declarations()) {
+    parameterNames.insert(parameter.getName().getValue());
+    if (auto bound = parameter.getBinding().getCoverageBound()) {
+      const llvm::StringSet<> noParameters;
+      if (failed(verifyExpressionSymbols(kernel, bound, noParameters,
+                                         launchABI, launchDimensions)))
+        return failure();
+    }
+  }
   for (Attribute extent : programSpace)
     if (failed(verifyExpressionSymbols(kernel, cast<PhysicalExprAttr>(extent),
                                        parameterNames, launchABI,
@@ -310,31 +319,6 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
         dialect != "func" && dialect != "builtin") {
       operation->emitOpError("operation dialect is not legal in shared GPU IR");
       return WalkResult::interrupt();
-    }
-    if (auto parameter = dyn_cast<ParameterOp>(operation)) {
-      StringRef name = parameter.getParameter().getName().getValue();
-      unsigned count = 0;
-      kernel.walk([&](ParameterOp candidate) {
-        count += candidate.getParameter().getName().getValue() == name;
-      });
-      if (count != 1) {
-        operation->emitOpError("physical parameter name is duplicated: ")
-            << name;
-        return WalkResult::interrupt();
-      }
-      if (parameter->hasAttr(coverageBoundAttr)) {
-        auto bound =
-            parameter->getAttrOfType<PhysicalExprAttr>(coverageBoundAttr);
-        if (!parameter->hasAttr(coverageDimensionAttr) || !bound) {
-          parameter.emitOpError(
-              "coverage bound requires a typed coverage decision");
-          return WalkResult::interrupt();
-        }
-        const llvm::StringSet<> noParameters;
-        if (failed(verifyExpressionSymbols(operation, bound, noParameters,
-                                           launchABI, launchDimensions)))
-          return WalkResult::interrupt();
-      }
     }
     if (auto physical = dyn_cast<PhysicalExprOp>(operation))
       if (failed(verifyExpressionSymbols(operation, physical.getExpression(),

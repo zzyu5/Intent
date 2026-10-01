@@ -34,7 +34,7 @@ std::string pythonScalarType(Type type, const PythonScalarSyntax &syntax) {
 std::string pythonExpression(
     PhysicalExprAttr expression, const PythonExpressionSyntax &syntax,
     llvm::function_ref<std::string(PhysicalExprAttr)> symbol) {
-  auto kind = static_cast<PhysicalExprKind>(expression.getKind());
+  auto kind = expression.getKind();
   if (kind == PhysicalExprKind::Constant)
     return std::to_string(expression.getValue());
   if (kind == PhysicalExprKind::Parameter ||

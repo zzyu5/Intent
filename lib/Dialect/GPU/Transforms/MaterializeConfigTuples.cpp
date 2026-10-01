@@ -1,5 +1,4 @@
 #include "ConfigurationPolicy.h"
-#include "Intent/Dialect/GPU/Analysis/Configurations.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
@@ -10,19 +9,19 @@ using namespace mlir;
 namespace intent::gpu {
 namespace {
 
-LogicalResult materializeCoverageBound(func::FuncOp kernel, ParameterOp parameter) {
-  auto schema = parameter.getParameter();
-  auto role = static_cast<ParameterRole>(schema.getRole());
-  auto category = static_cast<ParameterCategory>(schema.getCategory());
-  const bool coverage = parameter->hasAttr(coverageDimensionAttr);
+LogicalResult materializeCoverageBound(func::FuncOp kernel, ParameterAttr parameter) {
+  auto schema = parameter;
+  auto role = schema.getRole();
+  auto category = schema.getCategory();
+  const bool coverage = parameter.isDeferred();
   if ((role == ParameterRole::FullCoverage ||
        category == ParameterCategory::Coverage) &&
       (!coverage || category != ParameterCategory::Coverage)) {
-    parameter.emitOpError(
+    kernel.emitOpError(
         "full-coverage parameter lacks its typed coverage category or dimension");
     return failure();
   }
-  if (coverage && !parameter->hasAttr(coverageBoundAttr)) {
+  if (coverage && !parameter.getBinding().getCoverageBound()) {
     PhysicalParameterBinding binding = queryParameterBinding(parameter);
     PhysicalExprAttr bound;
     if (binding.isExact() && binding.dimension)
@@ -36,11 +35,19 @@ LogicalResult materializeCoverageBound(func::FuncOp kernel, ParameterOp paramete
           bound = queryLaunchExpression(argument);
       }
     if (!bound) {
-      parameter.emitOpError(
+      kernel.emitOpError(
           "full-coverage parameter has no launch-visible bound expression");
       return failure();
     }
-    parameter->setAttr(coverageBoundAttr, bound);
+    auto previous = parameter.getBinding();
+    auto updatedBinding = ParameterBindingAttr::get(
+        kernel.getContext(), previous.getDimension(), previous.getSource(),
+        bound, previous.getGroup(), previous.getPointwiseChunk(),
+        previous.getPointwiseLocal());
+    return updateParameter(kernel, ParameterAttr::get(
+        kernel.getContext(), parameter.getName(), parameter.getValueType(),
+        parameter.getRole(), parameter.getCategory(), parameter.getElementBitWidth(),
+        parameter.getCandidates(), parameter.getPhase(), updatedBinding));
   }
   return success();
 }
@@ -51,15 +58,15 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
   auto tables = TuningProfiles::from(kernel->getParentOfType<ModuleOp>());
   if (failed(tables))
     return failure();
-  auto declarations = PhysicalParameterSpace::read(kernel);
+  auto declarations = ParameterSpace::read(kernel);
   if (failed(declarations))
     return failure();
-  SmallVector<ParameterOp> parameters;
-  for (const PhysicalParameterDomain &domain : declarations->domains()) {
-    if (failed(materializeCoverageBound(kernel, domain.operation)))
+  SmallVector<ParameterAttr> parameters;
+  for (ParameterAttr parameter : declarations->extentDeclarations()) {
+    if (failed(materializeCoverageBound(kernel, parameter)))
       return failure();
-    if (!domain.coverage && !domain.provider)
-      parameters.push_back(domain.operation);
+    if (parameter.getPhase() == ConfigurationBindingPhase::Shared)
+      parameters.push_back(parameter);
   }
 
   Builder builder(kernel.getContext());
@@ -97,20 +104,16 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
 }
 
 LogicalResult verifySharedConfigTuples(func::FuncOp kernel) {
-  auto coverage = kernel.walk([&](ParameterOp parameter) -> WalkResult {
-    if (parameter->hasAttr(coverageDimensionAttr) &&
-        !parameter->getAttrOfType<PhysicalExprAttr>(coverageBoundAttr)) {
-      parameter.emitOpError(
-          "full-coverage parameter requires a typed bound expression");
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
-  });
-  if (coverage.wasInterrupted())
-    return failure();
-  auto space = ConfigurationSpace::read(kernel);
+  auto space = ParameterSpace::read(kernel);
   if (failed(space))
     return failure();
+  for (ParameterAttr parameter : space->extentDeclarations()) {
+    if (parameter.isDeferred() && !parameter.getBinding().getCoverageBound()) {
+      kernel.emitOpError(
+          "full-coverage parameter requires a typed bound expression");
+      return failure();
+    }
+  }
   auto tuples = space->configurations(ConfigurationStage::Shared);
   return failed(tuples) ? failure() : success();
 }

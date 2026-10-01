@@ -51,17 +51,112 @@ def IntentGPU_BufferLifetime : IntentGPU_I32Enum<
 def IntentGPU_BufferLifetimeAttr : IntentGPU_I32EnumAttr<
     "buffer_lifetime", IntentGPU_BufferLifetime>;
 
+def IntentGPU_ParameterRefAttr : AttrDef<IntentGPU_Dialect, "ParameterRef"> {
+  let mnemonic = "parameter_ref";
+  let summary = "A reference to one kernel-owned compile-time declaration";
+  let parameters = (ins "::mlir::StringAttr":$name);
+  let assemblyFormat = "`<` $name `>`";
+  let genVerifyDecl = 1;
+}
+
+def IntentGPU_PhysicalExprKind : IntentGPU_I32Enum<
+    "PhysicalExprKind", "Typed physical integer expression kind", [
+      I32EnumAttrCase<"Constant", 0, "constant">,
+      I32EnumAttrCase<"Parameter", 1, "parameter">,
+      I32EnumAttrCase<"Dimension", 2, "dimension">,
+      I32EnumAttrCase<"ScalarABI", 3, "scalar_abi">,
+      I32EnumAttrCase<"Add", 4, "add">,
+      I32EnumAttrCase<"Multiply", 5, "multiply">,
+      I32EnumAttrCase<"CeilDiv", 6, "ceil_div">,
+      I32EnumAttrCase<"Minimum", 7, "minimum">,
+      I32EnumAttrCase<"Select", 8, "select">,
+      I32EnumAttrCase<"Subtract", 9, "subtract">,
+      I32EnumAttrCase<"FloorDiv", 10, "floor_div">,
+      I32EnumAttrCase<"Maximum", 11, "maximum">,
+      I32EnumAttrCase<"NextPowerOfTwo", 12, "next_power_of_two">
+    ]>;
+
+def IntentGPU_ParameterRole : IntentGPU_I32Enum<
+    "ParameterRole", "Semantic role of a physical compile-time parameter", [
+      I32EnumAttrCase<"OwnershipM", 0, "ownership_m">,
+      I32EnumAttrCase<"OwnershipN", 1, "ownership_n">,
+      I32EnumAttrCase<"Reduction", 2, "reduction">,
+      I32EnumAttrCase<"ScanChunk", 3, "scan_chunk">,
+      I32EnumAttrCase<"ProviderWarps", 4, "provider_warps">,
+      I32EnumAttrCase<"ProviderStages", 5, "provider_stages">,
+      I32EnumAttrCase<"ProviderCTAs", 6, "provider_ctas">,
+      I32EnumAttrCase<"ProviderThreads", 7, "provider_threads">,
+      I32EnumAttrCase<"TraversalWorkers", 8, "traversal_workers">,
+      I32EnumAttrCase<"TraversalGroup", 9, "traversal_group">,
+      I32EnumAttrCase<"ResidentWorkers", 10, "resident_workers">,
+      I32EnumAttrCase<"FullCoverage", 11, "full_coverage">,
+      I32EnumAttrCase<"ReductionOuter", 12, "reduction_outer">,
+      I32EnumAttrCase<"ReductionInner", 13, "reduction_inner">,
+      I32EnumAttrCase<"ProviderAccessForm", 14, "provider_access_form">,
+      I32EnumAttrCase<"ProviderOccupancy", 15, "provider_occupancy">,
+      I32EnumAttrCase<"ProviderLoadPolicy", 16, "provider_load_policy">
+    ]>;
+
+def IntentGPU_ParameterCategory : IntentGPU_I32Enum<
+    "ParameterCategory", "Physical parameter decision family", [
+      I32EnumAttrCase<"Pointwise", 0, "pointwise">,
+      I32EnumAttrCase<"Reduction", 1, "reduction">,
+      I32EnumAttrCase<"Scan", 2, "scan">,
+      I32EnumAttrCase<"Contraction", 3, "contraction">,
+      I32EnumAttrCase<"Execution", 4, "execution">,
+      I32EnumAttrCase<"Coverage", 5, "coverage">,
+      I32EnumAttrCase<"Provider", 6, "provider">,
+      I32EnumAttrCase<"RegionReduction", 7, "region_reduction">,
+      I32EnumAttrCase<"RegionContraction", 8, "region_contraction">,
+      I32EnumAttrCase<"PersistentContraction", 9, "persistent_contraction">,
+      I32EnumAttrCase<"Histogram", 10, "histogram">
+    ]>;
+
 def IntentGPU_PhysicalExprAttr : AttrDef<IntentGPU_Dialect, "PhysicalExpr"> {
   let mnemonic = "expr";
   let summary = "Typed launch or compile-time physical integer expression";
   let parameters = (ins
-    "uint32_t":$kind,
+    EnumParameter<IntentGPU_PhysicalExprKind>:$kind,
     "int64_t":$value,
-    "::mlir::StringAttr":$symbol,
+    "::mlir::Attribute":$symbol,
     "::mlir::ArrayAttr":$operands
   );
   let assemblyFormat = "`<` $kind `,` $value `,` $symbol `,` $operands `>`";
   let genVerifyDecl = 1;
+  let extraClassDeclaration = [{
+    ::mlir::StringAttr getSymbolName() const;
+    ::intent::gpu::ParameterRefAttr getParameterReference() const;
+  }];
+}
+
+def IntentGPU_ConfigurationBindingPhase : IntentGPU_I32Enum<
+    "ConfigurationBindingPhase", "When a compile-time declaration is bound", [
+      I32EnumAttrCase<"Shared", 0, "shared">,
+      I32EnumAttrCase<"Provider", 1, "provider">,
+      I32EnumAttrCase<"Deferred", 2, "deferred">
+    ]>;
+
+def IntentGPU_ParameterBindingAttr : AttrDef<IntentGPU_Dialect, "ParameterBinding"> {
+  let mnemonic = "parameter_binding";
+  let summary = "Declared physical source and coverage binding for a parameter";
+  let parameters = (ins
+    OptionalParameter<"::mlir::IntegerAttr">:$dimension,
+    OptionalParameter<"::intent::gpu::PhysicalSourceAttr">:$source,
+    OptionalParameter<"::intent::gpu::PhysicalExprAttr">:$coverageBound,
+    OptionalParameter<"::mlir::ArrayAttr">:$group,
+    "bool":$pointwiseChunk,
+    "bool":$pointwiseLocal
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+  let genVerifyDecl = 1;
+  let extraClassDeclaration = [{
+    ParameterBindingAttr withDimension(::mlir::IntegerAttr value) const;
+    ParameterBindingAttr withSource(::intent::gpu::PhysicalSourceAttr value) const;
+    ParameterBindingAttr withCoverageBound(::intent::gpu::PhysicalExprAttr value) const;
+    ParameterBindingAttr withGroup(::mlir::ArrayAttr value) const;
+    ParameterBindingAttr withPointwiseChunk(bool value) const;
+    ParameterBindingAttr withPointwiseLocal(bool value) const;
+  }];
 }
 
 def IntentGPU_ParameterAttr : AttrDef<IntentGPU_Dialect, "Parameter"> {
@@ -69,14 +164,26 @@ def IntentGPU_ParameterAttr : AttrDef<IntentGPU_Dialect, "Parameter"> {
   let summary = "One typed compile-time physical parameter and its legal candidates";
   let parameters = (ins
     "::mlir::StringAttr":$name,
-    "uint32_t":$role,
-    "uint32_t":$category,
+    "::mlir::Type":$valueType,
+    EnumParameter<IntentGPU_ParameterRole>:$role,
+    EnumParameter<IntentGPU_ParameterCategory>:$category,
     "uint32_t":$elementBitWidth,
-    "::mlir::DenseI64ArrayAttr":$candidates
+    "::mlir::DenseI64ArrayAttr":$candidates,
+    EnumParameter<IntentGPU_ConfigurationBindingPhase>:$phase,
+    "::intent::gpu::ParameterBindingAttr":$binding
   );
   let assemblyFormat =
-      "`<` $name `,` $role `,` $category `,` $elementBitWidth `,` $candidates `>`";
+      "`<` $name `,` $valueType `,` $role `,` $category `,` $elementBitWidth `,` $candidates `,` $phase `,` $binding `>`";
   let genVerifyDecl = 1;
+  let extraClassDeclaration = [{
+    ::intent::gpu::ParameterRefAttr getReference() const;
+    bool isExtent() const;
+    bool isDeferred() const;
+    ParameterAttr withName(::mlir::StringAttr value) const;
+    ParameterAttr withCandidates(::mlir::DenseI64ArrayAttr value) const;
+    ParameterAttr withPhase(ConfigurationBindingPhase value) const;
+    ParameterAttr withBinding(ParameterBindingAttr value) const;
+  }];
 }
 
 def IntentGPU_ConfigurationStage : IntentGPU_I32Enum<
@@ -192,15 +299,6 @@ def IntentGPU_PhysicalExpr : DialectAttr<
     "typed physical expression"> {
   let storageType = "::intent::gpu::PhysicalExprAttr";
   let returnType = "::intent::gpu::PhysicalExprAttr";
-  let convertFromStorage = "$_self";
-}
-
-def IntentGPU_Parameter : DialectAttr<
-    IntentGPU_Dialect,
-    CPred<"::llvm::isa<::intent::gpu::ParameterAttr>($_self)">,
-    "typed physical parameter"> {
-  let storageType = "::intent::gpu::ParameterAttr";
-  let returnType = "::intent::gpu::ParameterAttr";
   let convertFromStorage = "$_self";
 }
 

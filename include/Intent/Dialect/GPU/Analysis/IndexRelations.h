@@ -29,7 +29,7 @@ public:
   // specialization. It is consulted for typed parameter declarations, never
   // persisted as a fact about the unrestricted parameter domain.
   bool multipleOf(mlir::Value value, int64_t divisor,
-                  llvm::function_ref<bool(ParameterOp)> alignedParameter = {}) const;
+                  llvm::function_ref<bool(ParameterAttr)> alignedParameter = {}) const;
 
   // Return an equal aligned endpoint, including a selected min arm whose
   // ordering is proven. This does not prove that an entire loop is nonempty.

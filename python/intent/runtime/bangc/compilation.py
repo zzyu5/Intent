@@ -25,7 +25,7 @@ def compile_library(source: str, target) -> NativeCompilation:
     if executable is None:
         raise FileNotFoundError("CNCC was not found; set BangCTarget(compiler=...) or INTENT_BANGC_CNCC")
     library_dir = str(Path(target.neuware) / "lib64")
-    options = (f"--neuware-path={target.neuware}", f"--bang-mlu-arch={target.architecture}", "-O2", "-fPIC", "-shared",
+    options = (f"--neuware-path={target.neuware}", f"--bang-mlu-arch={target.compilation.architecture}", "-O2", "-fPIC", "-shared",
                "-std=c++14", "-ffp-contract=off", "-I" + str(Path(target.neuware) / "include"),
                "-L" + library_dir, "-Wl,-rpath," + library_dir, "-lcnrt")
     identity = (source, executable, Path(executable).stat().st_mtime_ns, options)

@@ -163,7 +163,7 @@ bool isStaticUnitExtent(Attribute attribute) {
   auto extent = dyn_cast<PhysicalExprAttr>(attribute);
   return extent &&
          extent.getKind() ==
-             static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+             PhysicalExprKind::Constant &&
          extent.getValue() == 1;
 }
 
@@ -1501,8 +1501,7 @@ LogicalResult PointwiseRewrite::prepareAxisRelations(bool preserveReductionPosit
   }
 
   kernel.walk([&](RegionFoldOp fold) {
-    auto category = static_cast<ParameterCategory>(
-        fold.getSegment().getCategory());
+    auto category = lookupParameter(kernel, fold.getSegment()).getCategory();
     if (category != ParameterCategory::RegionContraction &&
         category != ParameterCategory::RegionReduction)
       return;
@@ -2021,7 +2020,7 @@ LogicalResult PointwiseRewrite::prepareAxisRelations(bool preserveReductionPosit
   auto constantBound = [](Value value) -> std::optional<int64_t> {
     auto bound = queryLaunchExpression(value);
     if (!bound || bound.getKind() !=
-                      static_cast<uint32_t>(PhysicalExprKind::Constant))
+                      PhysicalExprKind::Constant)
       return std::nullopt;
     return bound.getValue();
   };
@@ -2337,10 +2336,10 @@ LogicalResult PointwiseRewrite::chooseOwnership() {
               }) ||
               !extent)
             return false;
-          ParameterOp parameter = parameters.lookup(axis);
+          ParameterAttr parameter = lookupParameter(kernel, parameters.lookup(axis));
           if (!parameter ||
               !llvm::is_contained(
-                  parameter.getParameter().getCandidates().asArrayRef(),
+                  parameter.getCandidates().asArrayRef(),
                   *extent))
             return false;
           exactLocalExtents[axis] = *extent;
@@ -2356,17 +2355,11 @@ LogicalResult PointwiseRewrite::chooseOwnership() {
       // contraction-free workset axis.  This changes both the fragment schema
       // and the launch mapping; no provider serializer inference is involved.
       for (Attribute axis : internalOwnershipAxes) {
-        ParameterOp parameter = parameters.lookup(axis);
-        ParameterAttr schema = parameter.getParameter();
-        parameter->setAttr(
-            "parameter",
-            ParameterAttr::get(
-                module.getContext(), schema.getName(), schema.getRole(),
-                schema.getCategory(), schema.getElementBitWidth(),
-                DenseI64ArrayAttr::get(module.getContext(),
-                                       {exactLocalExtents.lookup(axis)})));
-        parameter->setAttr(pointwiseLocalAttr,
-                           UnitAttr::get(module.getContext()));
+        ParameterAttr parameter = lookupParameter(kernel, parameters.lookup(axis));
+        auto updated = parameter.withCandidates(DenseI64ArrayAttr::get(
+            module.getContext(), {exactLocalExtents.lookup(axis)})).withBinding(
+                parameter.getBinding().withPointwiseLocal(true));
+        if (failed(updateParameter(kernel, updated))) return failure();
         ownershipAxes.erase(axis);
         internalAxes.insert(axis);
       }
@@ -2405,10 +2398,10 @@ LogicalResult PointwiseRewrite::chooseOwnership() {
   for (auto [axis, ranges] : axes) {
     if (!ownershipAxes.contains(axis))
       continue;
-    ParameterOp parameter = parameters.lookup(axis);
+    ParameterAttr parameter = lookupParameter(kernel, parameters.lookup(axis));
     if (!parameter ||
-        parameter.getParameter().getRole() ==
-            static_cast<uint32_t>(ParameterRole::ScanChunk))
+        parameter.getRole() ==
+            ParameterRole::ScanChunk)
       continue;
     pointwiseOwnershipAxes.push_back(axis);
   }
@@ -2479,9 +2472,9 @@ LogicalResult PointwiseRewrite::chooseOwnership() {
     }
     if (!inputAxis || inputAxis == pointwiseOwnershipAxes.back())
       return;
-    ParameterOp inputParameter = parameters.lookup(inputAxis);
+    ParameterAttr inputParameter = lookupParameter(kernel, parameters.lookup(inputAxis));
     if (!inputParameter || llvm::all_of(
-            inputParameter.getParameter().getCandidates().asArrayRef(),
+            inputParameter.getCandidates().asArrayRef(),
             [](int64_t extent) { return extent == 1; }))
       return;
     bool commonOutputDirection = true;
@@ -2582,9 +2575,9 @@ LogicalResult PointwiseRewrite::chooseOwnership() {
     });
     Attribute selected = pointwiseOwnershipAxes[pointwiseOwnershipAxes.size() - 2];
     for (Attribute axis : llvm::drop_end(pointwiseOwnershipAxes)) {
-      ParameterOp parameter = parameters.lookup(axis);
+      ParameterAttr parameter = lookupParameter(kernel, parameters.lookup(axis));
       if (knownReads &&
-          llvm::any_of(parameter.getParameter().getCandidates().asArrayRef(),
+          llvm::any_of(parameter.getCandidates().asArrayRef(),
                        [](int64_t extent) { return extent > 1; }) &&
           invariantReadVolume.lookup(axis) > invariantReadVolume.lookup(selected))
         selected = axis;
@@ -2598,7 +2591,7 @@ LogicalResult PointwiseRewrite::chooseOwnership() {
 
   for (auto [ownershipIndex, axis] :
        llvm::enumerate(pointwiseOwnershipAxes)) {
-    ParameterOp parameter = parameters.lookup(axis);
+    ParameterAttr parameter = lookupParameter(kernel, parameters.lookup(axis));
     unsigned contractSides = ContractFreeAxisNone;
     unsigned matrixSides = ContractFreeAxisNone;
     bool batchedContraction = false;
@@ -2616,7 +2609,7 @@ LogicalResult PointwiseRewrite::chooseOwnership() {
         ownershipIndex + 2 < pointwiseOwnershipAxes.size();
     ParameterRole ownershipRole = ParameterRole::OwnershipN;
     auto declaredRole =
-        static_cast<ParameterRole>(parameter.getParameter().getRole());
+        parameter.getRole();
     // Matrix operands constrain M/N orientation. A vector contraction with
     // other output axes uses their existing store order, so independent axes
     // do not accidentally consume the same profile column.
@@ -2627,42 +2620,41 @@ LogicalResult PointwiseRewrite::chooseOwnership() {
       ownershipRole = ParameterRole::OwnershipM;
     else if (orientedSides == ContractFreeAxisRhs)
       ownershipRole = ParameterRole::OwnershipN;
-    else if (parameter.getParameter().getCategory() ==
-            static_cast<uint32_t>(ParameterCategory::Contraction) &&
+    else if (parameter.getCategory() ==
+            ParameterCategory::Contraction &&
         (declaredRole == ParameterRole::OwnershipM ||
          declaredRole == ParameterRole::OwnershipN))
       ownershipRole = declaredRole;
     else if (!scalarGridAxis &&
              ownershipIndex + 1 < pointwiseOwnershipAxes.size())
       ownershipRole = ParameterRole::OwnershipM;
-    parameter->removeAttr(coverageDimensionAttr);
-    parameter->removeAttr(coverageBoundAttr);
     DenseI64ArrayAttr candidates;
     if (scalarGridAxis)
       candidates = DenseI64ArrayAttr::get(module.getContext(), {1});
     else if (isSourceAxisKey(axis))
-      candidates = parameter.getParameter().getCandidates();
+      candidates = parameter.getCandidates();
     else
       candidates = DenseI64ArrayAttr::get(
           module.getContext(),
           {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
            8192, 16384, 32768, 65536});
-    uint32_t category = parameter.getParameter().getCategory();
+    ParameterCategory category = parameter.getCategory();
     if (!scalarGridAxis && batchedContraction &&
         (contractSides == ContractFreeAxisLhs ||
          contractSides == ContractFreeAxisRhs) &&
-        category == static_cast<uint32_t>(ParameterCategory::Pointwise))
-      category = static_cast<uint32_t>(ParameterCategory::Contraction);
+        category == ParameterCategory::Pointwise)
+      category = ParameterCategory::Contraction;
     auto schema = ParameterAttr::get(
-        module.getContext(), parameter.getParameter().getName(),
-        static_cast<uint32_t>(ownershipRole), category,
-        category == static_cast<uint32_t>(ParameterCategory::Contraction) &&
+        module.getContext(), parameter.getName(), parameter.getValueType(),
+        ownershipRole, category,
+        category == ParameterCategory::Contraction &&
                 contractElementBitWidth != 0
             ? contractElementBitWidth
             : pointwiseElementBitWidth,
-        candidates);
-    parameter->setAttr("parameter", schema);
-    if (category == static_cast<uint32_t>(ParameterCategory::Contraction))
+        candidates, ConfigurationBindingPhase::Shared,
+        parameter.getBinding().withCoverageBound({}));
+    if (failed(updateParameter(kernel, schema))) return failure();
+    if (category == ParameterCategory::Contraction)
       contractionCoordinateRoles[axis] =
           ownershipRole == ParameterRole::OwnershipM
               ? CoordinateRole::ContractionM
@@ -2716,7 +2708,7 @@ LogicalResult PointwiseRewrite::mapOwnership() {
     if (failed(position)) return failure();
     std::optional<unsigned> worksetPosition = *position;
     tileCoordinates = existing->tiles;
-    ParameterOp parameter = parameters.lookup(axisKey);
+    ParameterAttr parameter = lookupParameter(kernel, parameters.lookup(axisKey));
     if (!parameter) return range.emitOpError("pointwise mapping lost its blocking parameter");
     if (!ownershipAxes.contains(axisKey)) continue;
     Value dimension;
@@ -2780,7 +2772,7 @@ LogicalResult PointwiseRewrite::mapOwnership() {
           "dynamic ownership range has no launch-visible logical dimension");
       diagnostic << "; axis=" << axisKey << ", fragment="
                  << range.getResult().getType() << ", parameter="
-                 << parameter.getParameter().getName().getValue();
+                 << parameter.getName().getValue();
       return failure();
     }
     logicalDimensions[axisKey] = dimension;
@@ -2789,12 +2781,12 @@ LogicalResult PointwiseRewrite::mapOwnership() {
         mapping.getLoc(), mappingBuilder.getIndexType(), dimension,
         mappingBuilder.create<BinaryOp>(mapping.getLoc(),
                                         mappingBuilder.getIndexType(),
-                                        parameter.getResult(), one,
+                                        materializeParameter(mappingBuilder, mapping.getLoc(), parameter.getReference()), one,
                                         BinaryOperator::Subtract),
         BinaryOperator::Add);
     Value tiles = mappingBuilder.create<BinaryOp>(
         mapping.getLoc(), mappingBuilder.getIndexType(), adjusted,
-        parameter.getResult(), BinaryOperator::FloorDivide);
+        materializeParameter(mappingBuilder, mapping.getLoc(), parameter.getReference()), BinaryOperator::FloorDivide);
     PhysicalExprAttr logical;
     if (worksetPosition) {
       logical = cast<PhysicalExprAttr>(
@@ -2819,7 +2811,7 @@ LogicalResult PointwiseRewrite::mapOwnership() {
     }
     PhysicalExprAttr tile = expression(
         module.getContext(), PhysicalExprKind::Parameter, 0,
-        parameter.getParameter().getName().getValue());
+        parameter.getName().getValue());
     PhysicalExprAttr launch = binaryExpression(
         module.getContext(), PhysicalExprKind::CeilDiv, logical, tile);
     auto mapped = mappedAxes.find(axisKey);
@@ -2892,13 +2884,13 @@ LogicalResult PointwiseRewrite::mapOwnership() {
                     ? pointwise::mappingAxis(kernel, mapping.getLaunchExtents()[axis])
                     : FailureOr<Attribute>(failure());
       if (succeeded(axisKey) && ownershipAxes.contains(*axisKey)) {
-        ParameterOp parameter = parameters.lookup(*axisKey);
+        ParameterAttr parameter = lookupParameter(kernel, parameters.lookup(*axisKey));
         if (!parameter)
           return kernel.emitError(
               "pointwise ownership mapping lost its blocking parameter");
         newCoordinate = mappingBuilder.create<BinaryOp>(
             mapping.getLoc(), mappingBuilder.getIndexType(), newCoordinate,
-            parameter.getResult(), BinaryOperator::Multiply);
+            materializeParameter(mappingBuilder, mapping.getLoc(), parameter.getReference()), BinaryOperator::Multiply);
         oldCoordinate.replaceAllUsesWith(newCoordinate);
         continue;
       }

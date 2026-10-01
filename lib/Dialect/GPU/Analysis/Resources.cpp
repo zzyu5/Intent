@@ -15,12 +15,12 @@ PhysicalExprAttr fragmentRegisterFootprint(FragmentType fragment) {
   unsigned bits = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
   MLIRContext *context = fragment.getContext();
   auto footprint = PhysicalExprAttr::get(
-      context, static_cast<uint32_t>(PhysicalExprKind::Constant),
+      context, PhysicalExprKind::Constant,
       std::max(1u, (bits + 31) / 32), StringAttr::get(context, ""),
       ArrayAttr::get(context, {}));
   for (Attribute extent : fragment.getShape())
     footprint = PhysicalExprAttr::get(
-        context, static_cast<uint32_t>(PhysicalExprKind::Multiply), 0,
+        context, PhysicalExprKind::Multiply, 0,
         StringAttr::get(context, ""), ArrayAttr::get(context, {footprint, extent}));
   return footprint;
 }
@@ -29,12 +29,12 @@ PhysicalExprAttr reductionRegisterFootprint(ValueRange sources,
                                           func::FuncOp kernel) {
   std::function<bool(PhysicalExprAttr)> isTunableExtent =
       [&](PhysicalExprAttr extent) {
-    if (static_cast<PhysicalExprKind>(extent.getKind()) ==
+    if (extent.getKind() ==
         PhysicalExprKind::Parameter) {
-      auto parameter = queryParameterBySymbol(kernel, extent.getSymbol());
+      auto parameter = queryParameterBySymbol(kernel, extent.getSymbolName());
       if (failed(parameter))
         return false;
-      auto role = static_cast<ParameterRole>(parameter->getParameter().getRole());
+      auto role = parameter->getRole();
       return role == ParameterRole::OwnershipM ||
              role == ParameterRole::OwnershipN ||
              role == ParameterRole::Reduction ||
@@ -54,7 +54,7 @@ PhysicalExprAttr reductionRegisterFootprint(ValueRange sources,
       continue;
     auto footprint = fragmentRegisterFootprint(fragment);
     registers = !registers ? footprint : PhysicalExprAttr::get(
-        kernel.getContext(), static_cast<uint32_t>(PhysicalExprKind::Add), 0,
+        kernel.getContext(), PhysicalExprKind::Add, 0,
         StringAttr::get(kernel.getContext(), ""),
         ArrayAttr::get(kernel.getContext(), {registers, footprint}));
   }
@@ -113,8 +113,8 @@ FragmentResourceAnalysis::FragmentResourceAnalysis(func::FuncOp kernel) {
       AttrTypeWalker parameters;
       parameters.addWalk([&](PhysicalExprAttr expression) {
         if (expression.getKind() ==
-            static_cast<uint32_t>(PhysicalExprKind::Parameter))
-          symbols.insert(expression.getSymbol());
+            PhysicalExprKind::Parameter)
+          symbols.insert(expression.getSymbolName());
       });
       parameters.walk(fragment.getShape());
       for (StringAttr name : symbols)

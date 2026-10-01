@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
@@ -289,23 +290,24 @@ LogicalResult vectorizeIterations(func::FuncOp kernel,
           return (static_cast<__int128>(upper.value()) - lower.value()) % width == 0;
         });
     auto name = ("ITERATION_" + Twine(source)).str();
-    ParameterOp width = getOrCreatePhysicalParameter(
+    auto reference = getOrCreatePhysicalParameter(
         kernel, name, ParameterRole::OwnershipN, ParameterCategory::Pointwise,
         elementBitWidth, candidates);
-    if (!width)
+    if (failed(reference))
       return failure();
     OpBuilder builder(loop);
     // This is a fresh one-dimensional iteration domain. Load/store sourceAxes
     // continue to map its coordinates to the original resource axes.
     auto ordinal = AxisMapAttr::get(kernel.getContext(), source++, 0,
                                    dimension++, 0, false);
-    width->setAttr(parameterSourceAttr,
-                   PhysicalSourceAttr::get(kernel.getContext(),
-                                           ordinal.getSourceId(), 0, false));
-    width->setAttr(pointwiseChunkAttr, builder.getUnitAttr());
+    auto widthSchema = lookupParameter(kernel, *reference);
+    if (failed(updateParameter(kernel, widthSchema.withBinding(widthSchema.getBinding()
+            .withSource(PhysicalSourceAttr::get(kernel.getContext(), ordinal.getSourceId(), 0, false))
+            .withPointwiseChunk(true))))) return failure();
+    auto width = materializeParameter(builder, loop.getLoc(), *reference);
     auto extent = PhysicalExprAttr::get(
-        kernel.getContext(), static_cast<uint32_t>(PhysicalExprKind::Parameter),
-        0, builder.getStringAttr(name), builder.getArrayAttr({}));
+        kernel.getContext(), PhysicalExprKind::Parameter,
+        0, *reference, builder.getArrayAttr({}));
     auto shape = FragmentType::get(
         kernel.getContext(), builder.getIndexType(), builder.getArrayAttr({extent}),
         builder.getArrayAttr({ordinal}), 1, /*owner=*/1);
@@ -367,13 +369,13 @@ LogicalResult vectorizeIterations(func::FuncOp kernel,
   return success();
 }
 
-void assignIterationRoles(func::FuncOp kernel) {
-  llvm::DenseMap<Operation *, unsigned> roles;
+LogicalResult assignIterationRoles(func::FuncOp kernel) {
+  llvm::DenseMap<ParameterAttr, unsigned> roles;
   kernel.walk([&](StoreOp store) {
     auto value = dyn_cast<FragmentType>(store.getValue().getType());
     if (!value || value.getShape().size() != 2)
       return;
-    SmallVector<std::pair<int64_t, ParameterOp>, 2> axes;
+    SmallVector<std::pair<int64_t, ParameterAttr>, 2> axes;
     for (auto [coordinate, resourceAxis] :
          llvm::zip(store.getCoordinates(), store.getSourceAxes())) {
       auto type = dyn_cast<FragmentType>(coordinate.getType());
@@ -382,13 +384,13 @@ void assignIterationRoles(func::FuncOp kernel) {
       if (type.getShape().size() != 1)
         return;
       auto extent = cast<PhysicalExprAttr>(type.getShape()[0]);
-      if (extent.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter))
+      if (extent.getKind() != PhysicalExprKind::Parameter)
         return;
-      auto parameter = queryParameterBySymbol(kernel, extent.getSymbol());
-      if (failed(parameter) || !(*parameter)->hasAttr(pointwiseChunkAttr) ||
-          parameter->getParameter().getCategory() !=
-              static_cast<uint32_t>(ParameterCategory::Pointwise) ||
-          parameter->getParameter().getCandidates().size() < 2)
+      auto parameter = queryParameterBySymbol(kernel, extent.getSymbolName());
+      if (failed(parameter) || !parameter->getBinding().getPointwiseChunk() ||
+          parameter->getCategory() !=
+              ParameterCategory::Pointwise ||
+          parameter->getCandidates().size() < 2)
         return;
       auto source = sourceAxisIdentity(cast<AxisMapAttr>(type.getAxisMaps()[0]));
       auto binding = queryParameterBinding(*parameter);
@@ -409,16 +411,16 @@ void assignIterationRoles(func::FuncOp kernel) {
   });
   // Use the resource axis order, not the fragment prefix order introduced by
   // nested-loop lifting. Independent one-dimensional stages keep their roles.
-  for (auto [operation, mask] : roles) {
+  for (auto [schema, mask] : roles) {
     if (mask == 3)
       continue;
-    auto parameter = cast<ParameterOp>(operation);
-    auto schema = parameter.getParameter();
     auto role = mask == 1 ? ParameterRole::OwnershipM : ParameterRole::OwnershipN;
-    parameter->setAttr("parameter", ParameterAttr::get(
-        kernel.getContext(), schema.getName(), static_cast<uint32_t>(role),
-        schema.getCategory(), schema.getElementBitWidth(), schema.getCandidates()));
+    if (failed(updateParameter(kernel, ParameterAttr::get(
+            kernel.getContext(), schema.getName(), schema.getValueType(), role,
+            schema.getCategory(), schema.getElementBitWidth(), schema.getCandidates(),
+            schema.getPhase(), schema.getBinding())))) return failure();
   }
+  return success();
 }
 
 } // namespace
@@ -431,13 +433,13 @@ static LogicalResult vectorizeBufferLoopsImpl(ModuleOp module) {
   auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
   bool singleInstance = llvm::all_of(space, [](Attribute attribute) {
         auto extent = cast<PhysicalExprAttr>(attribute);
-        return extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+        return extent.getKind() == PhysicalExprKind::Constant &&
                extent.getValue() == 1;
       });
   auto [source, dimension] = nextPhysicalAxisIdentities(kernel);
   if (failed(vectorizeIterations(kernel, source, dimension, singleInstance)))
     return failure();
-  assignIterationRoles(kernel);
+  if (failed(assignIterationRoles(kernel))) return failure();
   eraseDeadPhysicalValues(kernel);
   return success();
 }

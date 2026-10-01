@@ -208,7 +208,7 @@ LogicalResult legalizeProgramGrid(ModuleOp module) {
         mapping.getExtents()[coordinateAxis]);
     if (!bound ||
         bound.getKind() !=
-            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+            gpu::PhysicalExprKind::Constant ||
         bound.getValue() > 65535)
       return success();
   }

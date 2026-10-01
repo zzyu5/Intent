@@ -151,9 +151,9 @@ llvm::SmallBitVector getTuningKeyScalarArguments(func::FuncOp kernel) {
   expressions.addWalk([&](gpu::PhysicalExprAttr expression) {
     if (gpu::isShapeBound(expression) ||
         expression.getKind() !=
-            static_cast<uint32_t>(gpu::PhysicalExprKind::ScalarABI))
+            gpu::PhysicalExprKind::ScalarABI)
       return;
-    auto argument = arguments.find(expression.getSymbol().getValue());
+    auto argument = arguments.find(expression.getSymbolName().getValue());
     if (argument != arguments.end())
       retained.set(argument->second);
   });

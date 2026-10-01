@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/IndexPredicates.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 
@@ -244,6 +245,12 @@ bool sameScalarExpression(Value lhs, Value rhs, unsigned depth = 0) {
   if (leftConstant || rightConstant)
     return leftConstant && rightConstant &&
            leftConstant.getValue() == rightConstant.getValue();
+  auto leftParameter = queryParameter(lhs), rightParameter = queryParameter(rhs);
+  if (leftParameter || rightParameter)
+    return leftParameter && rightParameter &&
+           leftParameter.getReference() == rightParameter.getReference() &&
+           lhs.getDefiningOp()->getParentOfType<func::FuncOp>() ==
+               rhs.getDefiningOp()->getParentOfType<func::FuncOp>();
   auto leftExpression = lhs.getDefiningOp<PhysicalExprOp>();
   auto rightExpression = rhs.getDefiningOp<PhysicalExprOp>();
   if (leftExpression || rightExpression)
@@ -330,7 +337,7 @@ bool matchesResourceExtent(Value value, Value resource, unsigned axis) {
     return matchesResourceExtent(stripped, resource, axis);
   if (std::optional<int64_t> constant = integerConstant(value))
     return extent.getKind() ==
-               static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+               PhysicalExprKind::Constant &&
            *constant == extent.getValue();
   if (auto argument = dyn_cast<BlockArgument>(value)) {
     auto function = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
@@ -341,7 +348,7 @@ bool matchesResourceExtent(Value value, Value resource, unsigned axis) {
     auto dimension = attrs.getAs<IntegerAttr>(dimensionAttr);
     return kind && kind.getValue() == "dimension" && dimension &&
            extent.getKind() ==
-               static_cast<uint32_t>(PhysicalExprKind::Dimension) &&
+               PhysicalExprKind::Dimension &&
            dimension.getInt() == extent.getValue();
   }
   if (auto dim = value.getDefiningOp<DimOp>()) {
@@ -350,10 +357,10 @@ bool matchesResourceExtent(Value value, Value resource, unsigned axis) {
   }
   if (auto expression = value.getDefiningOp<PhysicalExprOp>())
     return expression.getExpression() == extent;
-  if (auto parameter = value.getDefiningOp<ParameterOp>())
+  if (auto parameter = queryParameter(value))
     return extent.getKind() ==
-               static_cast<uint32_t>(PhysicalExprKind::Parameter) &&
-           parameter.getParameter().getName() == extent.getSymbol();
+               PhysicalExprKind::Parameter &&
+           parameter.getName() == extent.getSymbolName();
   if (auto bound = value.getDefiningOp<RangeBoundOp>()) {
     auto range = bound.getRange().getDefiningOp<RangeOp>();
     if (!range)
@@ -369,20 +376,20 @@ bool matchesResourceExtent(Value value, Value resource, unsigned axis) {
 
 bool capacityCoversResourceExtent(Value value, Value resource, unsigned axis) {
   value = stripScalarIdentity(value);
-  ParameterOp parameter = value.getDefiningOp<ParameterOp>();
+  ParameterAttr parameter = queryParameter(value);
   if (auto expression = value.getDefiningOp<PhysicalExprOp>();
       expression && expression.getExpression().getKind() ==
-                        static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
+                        PhysicalExprKind::Parameter) {
     auto resolved = queryParameterBySymbol(
         expression->getParentOfType<func::FuncOp>(),
-        expression.getExpression().getSymbol());
+        expression.getExpression().getSymbolName());
     if (succeeded(resolved))
       parameter = *resolved;
   }
-  if (!parameter || parameter.getParameter().getCategory() !=
-                        static_cast<uint32_t>(ParameterCategory::Coverage))
+  if (!parameter || parameter.getCategory() !=
+                        ParameterCategory::Coverage)
     return false;
-  auto covered = parameter->getAttrOfType<PhysicalExprAttr>(coverageBoundAttr);
+  auto covered = parameter.getBinding().getCoverageBound();
   return covered && covered == resourceExtentExpression(resource, axis);
 }
 
@@ -399,20 +406,20 @@ bool expressionAtMost(PhysicalExprAttr lhs, PhysicalExprAttr rhs,
   if (lhs.getOperands().size() == 2) {
     auto first = cast<PhysicalExprAttr>(lhs.getOperands()[0]);
     auto second = cast<PhysicalExprAttr>(lhs.getOperands()[1]);
-    if (lhs.getKind() == static_cast<uint32_t>(PhysicalExprKind::Minimum))
+    if (lhs.getKind() == PhysicalExprKind::Minimum)
       return expressionAtMost(first, rhs, depth + 1) ||
              expressionAtMost(second, rhs, depth + 1);
-    if (lhs.getKind() == static_cast<uint32_t>(PhysicalExprKind::Maximum))
+    if (lhs.getKind() == PhysicalExprKind::Maximum)
       return expressionAtMost(first, rhs, depth + 1) &&
              expressionAtMost(second, rhs, depth + 1);
   }
   if (rhs.getOperands().size() == 2) {
     auto first = cast<PhysicalExprAttr>(rhs.getOperands()[0]);
     auto second = cast<PhysicalExprAttr>(rhs.getOperands()[1]);
-    if (rhs.getKind() == static_cast<uint32_t>(PhysicalExprKind::Maximum))
+    if (rhs.getKind() == PhysicalExprKind::Maximum)
       return expressionAtMost(lhs, first, depth + 1) ||
              expressionAtMost(lhs, second, depth + 1);
-    if (rhs.getKind() == static_cast<uint32_t>(PhysicalExprKind::Minimum))
+    if (rhs.getKind() == PhysicalExprKind::Minimum)
       return expressionAtMost(lhs, first, depth + 1) &&
              expressionAtMost(lhs, second, depth + 1);
   }
@@ -426,14 +433,14 @@ bool upperBoundWithinResource(Value value, Value resource, unsigned axis) {
   PhysicalExprAttr provenBound =
       queryNonNegativeIndexUpperBound(stripScalarIdentity(value));
   if (!bound && provenBound && provenBound.getKind() ==
-                                  static_cast<uint32_t>(PhysicalExprKind::Constant))
+                                  PhysicalExprKind::Constant)
     bound = provenBound.getValue();
   PhysicalExprAttr extent = resourceExtentExpression(resource, axis);
   if (!extent)
     return false;
   if (provenBound && expressionAtMost(provenBound, extent))
     return true;
-  auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+  auto kind = extent.getKind();
   if (kind == PhysicalExprKind::Constant)
     return bound && *bound >= 0 && *bound <= extent.getValue();
   if (kind != PhysicalExprKind::Parameter)
@@ -441,20 +448,19 @@ bool upperBoundWithinResource(Value value, Value resource, unsigned axis) {
   func::FuncOp kernel = resource.getParentRegion()
                             ? resource.getParentRegion()->getParentOfType<func::FuncOp>()
                             : func::FuncOp();
-  FailureOr<ParameterOp> parameter =
-      kernel ? queryParameterBySymbol(kernel, extent.getSymbol())
-             : FailureOr<ParameterOp>(failure());
+  FailureOr<ParameterAttr> parameter =
+      kernel ? queryParameterBySymbol(kernel, extent.getSymbolName())
+             : FailureOr<ParameterAttr>(failure());
   if (failed(parameter))
     return false;
-  if (parameter->getParameter().getCategory() ==
-      static_cast<uint32_t>(ParameterCategory::Coverage))
-    if (auto covered = (*parameter)->getAttrOfType<PhysicalExprAttr>(
-            coverageBoundAttr);
+  if (parameter->getCategory() ==
+      ParameterCategory::Coverage)
+    if (auto covered = parameter->getBinding().getCoverageBound();
         covered && (queryLaunchExpression(value) == covered ||
                     provenBound == covered))
       return true;
   return bound && *bound >= 0 &&
-         llvm::all_of(parameter->getParameter().getCandidates().asArrayRef(),
+         llvm::all_of(parameter->getCandidates().asArrayRef(),
                       [&](int64_t candidate) { return *bound <= candidate; });
 }
 
@@ -560,7 +566,7 @@ bool sameBroadcastCoordinateExpression(Value lhs, Value rhs) {
       if (axis) {
         auto extent = cast<PhysicalExprAttr>(fragment.getShape()[*axis]);
         if (extent.getKind() ==
-                static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                PhysicalExprKind::Constant &&
             extent.getValue() == 1)
           return std::optional<unsigned>();
       }
@@ -718,17 +724,17 @@ std::optional<std::pair<int64_t, int64_t>>
 positiveExtentBounds(func::FuncOp kernel, PhysicalExprAttr extent);
 
 IndexSign physicalIndexSign(PhysicalExprAttr expression, func::FuncOp kernel) {
-  auto kind = static_cast<PhysicalExprKind>(expression.getKind());
+  auto kind = expression.getKind();
   if (kind == PhysicalExprKind::Constant)
     return expression.getValue() > 0 ? IndexSign::Positive
          : expression.getValue() == 0 ? IndexSign::NonNegative : IndexSign::Unknown;
   if (kind == PhysicalExprKind::Dimension)
     return IndexSign::NonNegative;
   if (kind == PhysicalExprKind::Parameter) {
-    FailureOr<ParameterOp> parameter = queryParameterBySymbol(kernel, expression.getSymbol());
+    FailureOr<ParameterAttr> parameter = queryParameterBySymbol(kernel, expression.getSymbolName());
     if (failed(parameter))
       return IndexSign::Unknown;
-    auto candidates = (*parameter).getParameter().getCandidates().asArrayRef();
+    auto candidates = (*parameter).getCandidates().asArrayRef();
     if (candidates.empty())
       return IndexSign::Unknown;
     if (llvm::all_of(candidates, [](int64_t value) { return value > 0; }))
@@ -799,9 +805,9 @@ bool valueKnownPositive(Value value, unsigned depth = 0) {
            IndexSign::Positive;
   if (std::optional<int64_t> constant = integerConstant(value))
     return *constant > 0;
-  if (auto parameter = value.getDefiningOp<ParameterOp>())
+  if (auto parameter = queryParameter(value))
     return llvm::all_of(
-        parameter.getParameter().getCandidates().asArrayRef(),
+        parameter.getCandidates().asArrayRef(),
         [](int64_t candidate) { return candidate > 0; });
   if (auto bound = value.getDefiningOp<RangeBoundOp>()) {
     auto range = bound.getRange().getDefiningOp<RangeOp>();
@@ -842,9 +848,9 @@ bool valueKnownNonNegative(Value value, unsigned depth = 0) {
     return *constant >= 0;
   if (value.getDefiningOp<ProgramIdOp>())
     return true;
-  if (auto parameter = value.getDefiningOp<ParameterOp>())
+  if (auto parameter = queryParameter(value))
     return llvm::all_of(
-        parameter.getParameter().getCandidates().asArrayRef(),
+        parameter.getCandidates().asArrayRef(),
         [](int64_t candidate) { return candidate >= 0; });
   if (auto delinearize = value.getDefiningOp<DelinearizeOp>())
     return valueKnownNonNegative(delinearize.getLinear(), depth + 1) &&
@@ -934,9 +940,9 @@ bool valueKnownNonNegative(Value value, unsigned depth = 0) {
     if (*subtrahend <= 0)
       return lhs;
     Value minuend = stripIntegerIndexCasts(binary.getLhs());
-    auto parameter = minuend.getDefiningOp<ParameterOp>();
+    auto parameter = queryParameter(minuend);
     return parameter &&
-           llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
+           llvm::all_of(parameter.getCandidates().asArrayRef(),
                         [&](int64_t candidate) {
                           return candidate >= *subtrahend;
                         });
@@ -965,24 +971,24 @@ std::optional<std::pair<int64_t, int64_t>>
 nonNegativeExtentBounds(func::FuncOp kernel, PhysicalExprAttr extent) {
   if (!extent)
     return std::nullopt;
-  auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+  auto kind = extent.getKind();
   if (auto constant = constantPhysicalExpression(extent)) {
     if (*constant < 0)
       return std::nullopt;
     return std::pair{*constant, *constant};
   }
   if (kind == PhysicalExprKind::Parameter) {
-    FailureOr<ParameterOp> parameter =
-        queryParameterBySymbol(kernel, extent.getSymbol());
+    FailureOr<ParameterAttr> parameter =
+        queryParameterBySymbol(kernel, extent.getSymbolName());
     if (failed(parameter))
       return std::nullopt;
     // Provider configuration formation may rebind resident capacity. Its
     // positive sign is stable, but placeholder candidates and shared tuples
     // cannot prove a numeric upper bound or absence of index overflow.
-    if (parameter->getParameter().getRole() ==
-        static_cast<uint32_t>(ParameterRole::ResidentWorkers))
+    if (parameter->getRole() ==
+        ParameterRole::ResidentWorkers)
       return std::nullopt;
-    auto candidates = parameter->getParameter().getCandidates().asArrayRef();
+    auto candidates = parameter->getCandidates().asArrayRef();
     if (candidates.empty() ||
         llvm::any_of(candidates, [](int64_t value) { return value <= 0; }))
       return std::nullopt;
@@ -994,7 +1000,7 @@ nonNegativeExtentBounds(func::FuncOp kernel, PhysicalExprAttr extent) {
       bool bound = true;
       for (Attribute attribute : configurations.getRows()) {
         auto tuple = dyn_cast<DictionaryAttr>(attribute);
-        auto selected = tuple ? tuple.getAs<IntegerAttr>(extent.getSymbol())
+        auto selected = tuple ? tuple.getAs<IntegerAttr>(extent.getSymbolName())
                               : IntegerAttr();
         if (!selected || selected.getInt() <= 0 ||
             !llvm::is_contained(candidates, selected.getInt())) {
@@ -1183,14 +1189,14 @@ bool linearizedGatherWithinResource(Value coordinate, Value resource) {
       continue;
     MLIRContext *context = resource.getContext();
     auto inner = PhysicalExprAttr::get(
-        context, static_cast<uint32_t>(PhysicalExprKind::Constant), 1,
+        context, PhysicalExprKind::Constant, 1,
         StringAttr::get(context, ""), ArrayAttr::get(context, {}));
     for (unsigned dimension = axis + 1; dimension < source.getShape().size(); ++dimension) {
       auto extent = cast<PhysicalExprAttr>(source.getShape()[dimension]);
       inner = dimension == axis + 1
                   ? extent
                   : PhysicalExprAttr::get(
-                        context, static_cast<uint32_t>(PhysicalExprKind::Multiply),
+                        context, PhysicalExprKind::Multiply,
                         0, StringAttr::get(context, ""),
                         ArrayAttr::get(context, {inner, extent}));
     }
@@ -1255,7 +1261,7 @@ bool coordinateRangeWithinResource(Value coordinate, Value resource,
         auto unit = [](Attribute attribute) {
           auto extent = cast<PhysicalExprAttr>(attribute);
           return extent.getKind() ==
-                     static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                     PhysicalExprKind::Constant &&
                  extent.getValue() == 1;
         };
         bool projection = llvm::all_of(
@@ -1323,7 +1329,7 @@ bool coordinateRangeWithinResource(Value coordinate, Value resource,
   PhysicalExprAttr resourceExtent = resourceExtentExpression(resource, axis);
   if (!resourceExtent ||
       resourceExtent.getKind() !=
-          static_cast<uint32_t>(PhysicalExprKind::Constant))
+          PhysicalExprKind::Constant)
     return false;
   std::optional<int64_t> start = integerConstant(range.getStart());
   std::optional<int64_t> extent = integerConstant(range.getExtent());
@@ -1382,15 +1388,15 @@ bool valueMatchesExtent(Value value, PhysicalExprAttr extent) {
     return true;
   if (auto physical = value.getDefiningOp<PhysicalExprOp>())
     return physical.getExpression() == extent;
-  auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+  auto kind = extent.getKind();
   if (kind == PhysicalExprKind::Constant) {
     std::optional<int64_t> constant = integerConstant(value);
     return constant && *constant == extent.getValue();
   }
   if (kind == PhysicalExprKind::Parameter) {
-    auto parameter = value.getDefiningOp<ParameterOp>();
+    auto parameter = queryParameter(value);
     return parameter &&
-           parameter.getParameter().getName() == extent.getSymbol();
+           parameter.getName() == extent.getSymbolName();
   }
   return false;
 }
@@ -1402,15 +1408,14 @@ bool isExclusiveProgramRange(MakeRangeOp range, func::FuncOp kernel) {
   Value extent = stripScalarIdentity(range.getExtent());
   if (auto expression = extent.getDefiningOp<PhysicalExprOp>();
       expression && expression.getExpression().getKind() ==
-          static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
-    auto parameter = queryParameterBySymbol(kernel, expression.getExpression().getSymbol());
+          PhysicalExprKind::Parameter) {
+    auto parameter = queryParameterBySymbol(kernel, expression.getExpression().getSymbolName());
     if (failed(parameter))
       return false;
-    extent = parameter->getResult();
   }
   bool positive = integerConstant(extent).value_or(0) > 0;
-  if (auto parameter = extent.getDefiningOp<ParameterOp>())
-    positive = llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
+  if (auto parameter = queryParameter(extent))
+    positive = llvm::all_of(parameter.getCandidates().asArrayRef(),
                            [](int64_t value) { return value > 0; });
   auto multiply = stripScalarIdentity(range.getStart()).getDefiningOp<BinaryOp>();
   if (!positive || !multiply ||
@@ -1432,12 +1437,12 @@ bool isExclusiveProgramRange(MakeRangeOp range, func::FuncOp kernel) {
     return false;
   for (Attribute attribute : space.getValue().drop_front()) {
     auto expression = cast<PhysicalExprAttr>(attribute);
-    if (expression.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+    if (expression.getKind() != PhysicalExprKind::Constant ||
         expression.getValue() != 1)
       return false;
   }
   auto launch = cast<PhysicalExprAttr>(space[0]);
-  return launch.getKind() == static_cast<uint32_t>(PhysicalExprKind::CeilDiv) &&
+  return launch.getKind() == PhysicalExprKind::CeilDiv &&
          launch.getOperands().size() == 2 &&
          launch.getOperands()[0] == queryLaunchExpression(range.getLogicalStop()) &&
          launch.getOperands()[1] == queryLaunchExpression(extent);
@@ -1608,7 +1613,7 @@ std::optional<int64_t> constantLogicalRangeCardinality(MakeRangeOp range) {
       // Cancel a common affine base only when all intermediate index arithmetic
       // stays in range; signed wrap must not turn a short slice into a full one.
       if (upper && upper.getKind() ==
-                       static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                       PhysicalExprKind::Constant &&
           std::min(begin.minimum, end.minimum) >=
               std::numeric_limits<int64_t>::min() &&
           std::max(begin.maximum, end.maximum) <=
@@ -1698,26 +1703,16 @@ bool typeCarriesTraversal(Type type, PhysicalSourceAxis source,
   return false;
 }
 
-PhysicalParameterBinding queryParameterBinding(ParameterOp parameter) {
+PhysicalParameterBinding queryParameterBinding(ParameterAttr parameter) {
   PhysicalParameterBinding result;
   if (!parameter)
     return result;
-  auto dimension = parameter->getAttrOfType<IntegerAttr>(dimensionAttr);
-  auto coverage = parameter->getAttrOfType<IntegerAttr>(coverageDimensionAttr);
+  auto dimension = parameter.getBinding().getDimension();
   if (dimension && dimension.getInt() <= 0)
     return result;
-  if (coverage && coverage.getInt() <= 0)
-    return result;
-  if (dimension && coverage && dimension.getInt() != coverage.getInt()) {
-    result.state = PhysicalFactState::Ambiguous;
-    return result;
-  }
-  if (coverage)
-    result.dimension = coverage.getInt();
-  else if (dimension)
+  if (dimension)
     result.dimension = dimension.getInt();
-  if (auto source =
-          parameter->getAttrOfType<PhysicalSourceAttr>(parameterSourceAttr))
+  if (auto source = parameter.getBinding().getSource())
     result.source =
         PhysicalSourceAxis{source.getSourceId(), source.getSourceAxis(),
                            source.getDerived()};
@@ -1726,43 +1721,47 @@ PhysicalParameterBinding queryParameterBinding(ParameterOp parameter) {
   return result;
 }
 
-FailureOr<ParameterOp> queryParameterBySymbol(func::FuncOp kernel,
-                                              StringAttr symbol) {
-  ParameterOp result;
-  bool ambiguous = false;
-  kernel.walk([&](ParameterOp parameter) {
-    if (parameter.getParameter().getName() != symbol)
-      return;
-    if (result && result != parameter)
-      ambiguous = true;
-    else
-      result = parameter;
-  });
-  return result && !ambiguous ? FailureOr<ParameterOp>(result)
-                              : FailureOr<ParameterOp>(failure());
+ParameterAttr queryParameter(Value value) {
+  if (value.getType().isIndex())
+    value = stripScalarIdentity(value);
+  if (auto read = value.getDefiningOp<ParameterOp>())
+    return read.getDeclaration();
+  auto expression = value.getDefiningOp<PhysicalExprOp>();
+  if (!expression || !expression.getExpression().getParameterReference())
+    return {};
+  return lookupParameter(expression->getParentOfType<func::FuncOp>(),
+                         expression.getExpression().getParameterReference());
 }
 
-FailureOr<ParameterOp> queryBlockingParameter(func::FuncOp kernel,
+FailureOr<ParameterAttr> queryParameterBySymbol(func::FuncOp kernel,
+                                                StringAttr symbol) {
+  auto parameter = lookupParameter(kernel, symbol);
+  return parameter ? FailureOr<ParameterAttr>(parameter)
+                   : FailureOr<ParameterAttr>(failure());
+}
+
+FailureOr<ParameterAttr> queryBlockingParameter(func::FuncOp kernel,
                                               MakeRangeOp range) {
   auto fragment = dyn_cast<FragmentType>(range.getResult().getType());
   auto extent = fragment && fragment.getShape().size() == 1
                     ? dyn_cast<PhysicalExprAttr>(fragment.getShape()[0])
                     : PhysicalExprAttr();
   if (extent && extent.getKind() ==
-                    static_cast<uint32_t>(PhysicalExprKind::Parameter))
-    return queryParameterBySymbol(kernel, extent.getSymbol());
+                    PhysicalExprKind::Parameter)
+    return queryParameterBySymbol(kernel, extent.getSymbolName());
 
   PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
                             range.getDerived()};
   FailureOr<int64_t> dimension = queryRangeDimension(range);
-  ParameterOp sourceMatch;
-  ParameterOp dimensionMatch;
+  ParameterAttr sourceMatch;
+  ParameterAttr dimensionMatch;
   bool sourceAmbiguous = false;
   bool dimensionAmbiguous = false;
-  kernel.walk([&](ParameterOp parameter) {
+  for (Attribute declaration : getParameterDeclarations(kernel)) {
+    auto parameter = cast<ParameterAttr>(declaration);
     PhysicalParameterBinding binding = queryParameterBinding(parameter);
     if (!binding.isExact())
-      return;
+      continue;
     if (binding.source && *binding.source == source) {
       if (sourceMatch && sourceMatch != parameter)
         sourceAmbiguous = true;
@@ -1776,12 +1775,12 @@ FailureOr<ParameterOp> queryBlockingParameter(func::FuncOp kernel,
       else
         dimensionMatch = parameter;
     }
-  });
+  }
   if (sourceMatch && !sourceAmbiguous)
     return sourceMatch;
   return dimensionMatch && !dimensionAmbiguous
-             ? FailureOr<ParameterOp>(dimensionMatch)
-             : FailureOr<ParameterOp>(failure());
+             ? FailureOr<ParameterAttr>(dimensionMatch)
+             : FailureOr<ParameterAttr>(failure());
 }
 
 PhysicalSourceAxis sourceAxisIdentity(AxisMapAttr mapping) {
@@ -1900,8 +1899,11 @@ PhysicalExprAttr queryLaunchExpression(Value value) {
                           StringRef symbol = {},
                           ArrayRef<Attribute> operands = {}) {
       return PhysicalExprAttr::get(
-          context, static_cast<uint32_t>(kind), constant,
-          StringAttr::get(context, symbol), ArrayAttr::get(context, operands));
+          context, kind, constant,
+          kind == PhysicalExprKind::Parameter
+              ? Attribute(ParameterRefAttr::get(context, StringAttr::get(context, symbol)))
+              : Attribute(StringAttr::get(context, symbol)),
+          ArrayAttr::get(context, operands));
     };
     if (auto constant = current.getDefiningOp<arith::ConstantOp>()) {
       auto integer = dyn_cast<IntegerAttr>(constant.getValue());
@@ -1940,9 +1942,9 @@ PhysicalExprAttr queryLaunchExpression(Value value) {
       return resourceExtentExpression(dim.getView(), dim.getAxis());
     if (auto physical = current.getDefiningOp<PhysicalExprOp>())
       return physical.getExpression();
-    if (auto parameter = current.getDefiningOp<ParameterOp>())
+    if (auto parameter = queryParameter(current))
       return expression(PhysicalExprKind::Parameter, 0,
-                        parameter.getParameter().getName().getValue());
+                        parameter.getName().getValue());
     if (auto cast = current.getDefiningOp<arith::IndexCastOp>()) {
       auto integer = dyn_cast<IntegerType>(cast.getIn().getType());
       return integer && !integer.isUnsigned() && integer.getWidth() > 1 &&
@@ -2015,7 +2017,7 @@ PhysicalExprAttr queryLaunchRangeExtent(MakeRangeOp range) {
   auto expression = [&](PhysicalExprKind kind, int64_t value = 0,
                         ArrayRef<Attribute> operands = {}) {
     return PhysicalExprAttr::get(
-        context, static_cast<uint32_t>(kind), value, StringAttr::get(context),
+        context, kind, value, StringAttr::get(context),
         ArrayAttr::get(context, operands));
   };
   if (auto count = constantLogicalRangeCardinality(range))
@@ -2025,7 +2027,7 @@ PhysicalExprAttr queryLaunchRangeExtent(MakeRangeOp range) {
   PhysicalExprAttr step = queryLaunchExpression(range.getStep());
   if (!start || !stop || !step)
     return {};
-  if (step.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+  if (step.getKind() == PhysicalExprKind::Constant &&
       step.getValue() <= 0)
     return {};
   PhysicalExprAttr distance =
@@ -2072,7 +2074,7 @@ IndexBounds queryIndexBounds(Value value) {
   using Bounds = IndexBounds;
   auto constantUpper = [](Bounds bounds) -> std::optional<int64_t> {
     if (bounds.nonNegative && bounds.upper &&
-        bounds.upper.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant))
+        bounds.upper.getKind() == PhysicalExprKind::Constant)
       return bounds.upper.getValue();
     return std::nullopt;
   };
@@ -2085,7 +2087,7 @@ IndexBounds queryIndexBounds(Value value) {
                           ArrayRef<Attribute> operands = {}) {
       MLIRContext *context = current.getContext();
       return PhysicalExprAttr::get(
-          context, static_cast<uint32_t>(kind), constant,
+          context, kind, constant,
           StringAttr::get(context, ""), ArrayAttr::get(context, operands));
     };
     if (auto coordinate = current.getDefiningOp<WorksetCoordinateOp>())
@@ -2105,7 +2107,7 @@ IndexBounds queryIndexBounds(Value value) {
       if (!kind || kind.getValue() != "dimension" || !dimension)
         return {};
       return PhysicalExprAttr::get(
-          current.getContext(), static_cast<uint32_t>(PhysicalExprKind::Dimension),
+          current.getContext(), PhysicalExprKind::Dimension,
           dimension.getInt(),
           StringAttr::get(current.getContext(),
                           "D" + std::to_string(dimension.getInt())),
@@ -2123,10 +2125,10 @@ IndexBounds queryIndexBounds(Value value) {
         std::optional<int64_t> upper =
             constantUpper(upperBound);
         std::optional<int64_t> step = integerConstant(loop.getStep());
-        if (auto parameter = loop.getStep().getDefiningOp<ParameterOp>()) {
-          auto candidates = parameter.getParameter().getCandidates().asArrayRef();
-          if (parameter.getParameter().getRole() !=
-                  static_cast<uint32_t>(ParameterRole::ResidentWorkers) &&
+        if (auto parameter = queryParameter(loop.getStep())) {
+          auto candidates = parameter.getCandidates().asArrayRef();
+          if (parameter.getRole() !=
+                  ParameterRole::ResidentWorkers &&
               !candidates.empty() && llvm::all_of(candidates, [](int64_t value) {
                 return value > 0;
               }))
@@ -2175,13 +2177,13 @@ IndexBounds queryIndexBounds(Value value) {
         }
       }
     }
-    if (auto parameter = current.getDefiningOp<ParameterOp>()) {
-      auto schema = parameter.getParameter();
+    if (auto parameter = queryParameter(current)) {
+      auto schema = parameter;
       if (llvm::all_of(schema.getCandidates().asArrayRef(),
                        [](int64_t candidate) { return candidate >= 0; }))
         return {true, PhysicalExprAttr::get(
-            current.getContext(), static_cast<uint32_t>(PhysicalExprKind::Parameter),
-            0, schema.getName(), ArrayAttr::get(current.getContext(), {}))};
+            current.getContext(), PhysicalExprKind::Parameter,
+            0, schema.getReference(), ArrayAttr::get(current.getContext(), {}))};
       return {};
     }
     if (auto result = dyn_cast<OpResult>(current))
@@ -2298,11 +2300,11 @@ IndexBounds queryIndexBounds(Value value) {
         Bounds preceding = bound(difference, depth + 1);
         if (amount && *amount >= 0 && preceding.nonNegative && preceding.upper &&
             preceding.upper.getKind() ==
-                static_cast<uint32_t>(PhysicalExprKind::Subtract) &&
+                PhysicalExprKind::Subtract &&
             preceding.upper.getOperands().size() == 2) {
           auto headroom = cast<PhysicalExprAttr>(preceding.upper.getOperands()[1]);
           if (headroom.getKind() ==
-                  static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                  PhysicalExprKind::Constant &&
               headroom.getValue() >= *amount &&
               preceding.lower <= std::numeric_limits<int64_t>::max() - *amount) {
             auto base = cast<PhysicalExprAttr>(preceding.upper.getOperands()[0]);
@@ -2358,8 +2360,8 @@ IndexBounds queryIndexBounds(Value value) {
         return *constant > 0
                    ? expression(PhysicalExprKind::Constant, *constant)
                    : PhysicalExprAttr();
-      if (auto parameter = divisor.getDefiningOp<ParameterOp>())
-        if (llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
+      if (auto parameter = queryParameter(divisor))
+        if (llvm::all_of(parameter.getCandidates().asArrayRef(),
                          [](int64_t candidate) { return candidate > 0; }))
           return bound(divisor, depth + 1).upper;
       return {};
@@ -2418,7 +2420,7 @@ PhysicalExprAttr queryLogicalRangeCapacity(MakeRangeOp range) {
       auto make = [&](PhysicalExprKind kind, int64_t value,
                       ArrayRef<Attribute> operands = {}) {
         auto context = range.getContext();
-        return PhysicalExprAttr::get(context, static_cast<uint32_t>(kind), value,
+        return PhysicalExprAttr::get(context, kind, value,
                                     StringAttr::get(context, ""),
                                     ArrayAttr::get(context, operands));
       };
@@ -2459,7 +2461,7 @@ PhysicalExprAttr queryLogicalRangeCapacity(MakeRangeOp range) {
     return {};
   auto expression = [&](PhysicalExprKind kind, ArrayRef<Attribute> operands) {
     auto context = range.getContext();
-    return PhysicalExprAttr::get(context, static_cast<uint32_t>(kind), 0,
+    return PhysicalExprAttr::get(context, kind, 0,
                                  StringAttr::get(context, ""),
                                  ArrayAttr::get(context, operands));
   };
@@ -3168,7 +3170,7 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     auto extent =
         cast<PhysicalExprAttr>(fragment.getShape()[fragmentAxis]);
     if (extent.getKind() ==
-            static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+            PhysicalExprKind::Constant &&
         extent.getValue() == 1)
       return;
     result.state = PhysicalFactState::Unknown;
@@ -3274,7 +3276,7 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     auto inputExtent = cast<PhysicalExprAttr>(input.getShape()[*inputAxis]);
     auto outputExtent = cast<PhysicalExprAttr>(fragment.getShape()[fragmentAxis]);
     if (inputExtent.getKind() ==
-            static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+            PhysicalExprKind::Constant &&
         inputExtent.getValue() == 1 && inputExtent != outputExtent) {
       PhysicalRangeFact inputRanges;
       inputRanges.state = PhysicalFactState::Exact;
@@ -3416,7 +3418,7 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     if (occurrences.empty()) {
       auto extent = cast<PhysicalExprAttr>(fragment.getShape()[fragmentAxis]);
       bool broadcastAxis =
-          extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          extent.getKind() == PhysicalExprKind::Constant &&
           extent.getValue() == 1 &&
           llvm::all_of(load.getCoordinates(), [&](Value coordinate) {
             auto type = dyn_cast<FragmentType>(coordinate.getType());
@@ -3813,7 +3815,7 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
         continue;
       PhysicalAxisRealizationFact input = axisRealization(operand, sourceAxis);
       bool introducedUnit =
-          extent.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          extent.getKind() == PhysicalExprKind::Constant &&
           extent.getValue() == 1 && input.roots.empty();
       if (input.hasExtentAuthority() && input.physicalized &&
           !input.constructionScalarSeed && !introducedUnit) {
@@ -3846,7 +3848,7 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
         yield.getOperand(opResult.getResultNumber()).getType() == fragment) {
       PhysicalRangeFact provenance =
           sourceRanges(yield.getOperand(opResult.getResultNumber()), result.source);
-      auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+      auto kind = extent.getKind();
       bool physicalExtent =
           kind != PhysicalExprKind::Dimension &&
           kind != PhysicalExprKind::ScalarABI &&
@@ -3979,7 +3981,7 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
       result.roots.append(ranges.roots.begin(), ranges.roots.end());
       result.constructionScalarSeed =
           extent.getKind() ==
-              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+              PhysicalExprKind::Constant &&
           extent.getValue() == 1 && !ranges.roots.empty() &&
           llvm::any_of(ranges.roots, [](MakeRangeOp range) {
             return !isProvablySingletonLogicalRange(range) &&
@@ -4004,7 +4006,7 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
   result.blockers.append(ranges.blockers.begin(), ranges.blockers.end());
   result.constructionScalarSeed =
       extent.getKind() ==
-          static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          PhysicalExprKind::Constant &&
       extent.getValue() == 1 && !ranges.roots.empty() &&
       llvm::any_of(ranges.roots, [](MakeRangeOp range) {
         return !isProvablySingletonLogicalRange(range) &&
@@ -4020,7 +4022,7 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
   if (value.getDefiningOp<ReshapeOp>()) {
     if (ranges.isExact() && ranges.roots.empty()) {
       if (extent.getKind() ==
-              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+              PhysicalExprKind::Constant &&
           extent.getValue() == 1) {
         result.state = PhysicalFactState::Exact;
         result.physicalized = true;
@@ -4219,7 +4221,7 @@ PhysicalProgramAnalysis::lockstepRanges(ArrayRef<MakeRangeOp> ranges) {
     auto isZero = [](Value value) {
       PhysicalExprAttr bound = queryNonNegativeIndexUpperBound(value);
       return bound &&
-             bound.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+             bound.getKind() == PhysicalExprKind::Constant &&
              bound.getValue() == 0;
     };
     bool sameStart = sameValue(lhs.getStart(), rhs.getStart()) ||

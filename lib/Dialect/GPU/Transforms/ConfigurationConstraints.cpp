@@ -13,12 +13,12 @@ bool fitsFragmentFootprints(
     ArrayRef<FragmentType> fragments, CapabilitiesAttr capabilities,
     const NamedAttrList &bindings, StringAttr selected = {}, int64_t candidate = 0) {
   auto resolve = [&](PhysicalExprAttr expression) -> std::optional<int64_t> {
-    if (expression.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter))
+    if (expression.getKind() != PhysicalExprKind::Parameter)
       return std::nullopt;
     auto binding = dyn_cast_or_null<IntegerAttr>(
-        bindings.get(expression.getSymbol().getValue()));
+        bindings.get(expression.getSymbolName().getValue()));
     if (!binding) return std::nullopt;
-    return expression.getSymbol() == selected ? candidate : binding.getInt();
+    return expression.getSymbolName() == selected ? candidate : binding.getInt();
   };
   // This bounds individual payloads, not provider register allocation or
   // machine occupancy. ABI-dependent Unknown bounds remain for specialization.
@@ -41,19 +41,19 @@ void bindContractionFreeExtents(
     ProfileLookup profileFor, Builder &builder, bool splitInnerAxis) {
   for (const ContractionFreeExtent &group : groups) {
     int64_t budget = std::numeric_limits<int64_t>::max();
-    for (ParameterOp parameter : group.profileParameters)
+    for (ParameterAttr parameter : group.profileParameters)
       budget = std::min(budget, requestedValue(profileFor(parameter), group.role));
-    auto fits = [&](ParameterOp selected, int64_t candidate) {
+    auto fits = [&](ParameterAttr selected, int64_t candidate) {
       std::function<std::optional<int64_t>(PhysicalExprAttr)> evaluate =
           [&](PhysicalExprAttr extent) -> std::optional<int64_t> {
-        auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+        auto kind = extent.getKind();
         if (kind == PhysicalExprKind::Constant)
           return extent.getValue() <= budget
                      ? std::optional<int64_t>(extent.getValue()) : std::nullopt;
         if (kind == PhysicalExprKind::Parameter) {
-          int64_t value = selected && extent.getSymbol() == selected.getParameter().getName()
+          int64_t value = selected && extent.getSymbolName() == selected.getName()
                               ? candidate
-                              : cast<IntegerAttr>(bindings.get(extent.getSymbol().getValue())).getInt();
+                              : cast<IntegerAttr>(bindings.get(extent.getSymbolName().getValue())).getInt();
           return value <= budget ? std::optional<int64_t>(value) : std::nullopt;
         }
         int64_t product = 1;
@@ -74,9 +74,9 @@ void bindContractionFreeExtents(
     };
     // Keep the innermost coordinates wide; the profile targets their combined
     // M/N extent, not each independently tiled factor of that extent.
-    for (ParameterOp parameter : group.parameters) {
+    for (ParameterAttr parameter : group.parameters) {
       if (fits({}, 0)) break;
-      auto schema = parameter.getParameter();
+      auto schema = parameter;
       int64_t current = cast<IntegerAttr>(bindings.get(schema.getName().getValue())).getInt();
       auto candidates = schema.getCandidates().asArrayRef();
       int64_t selected = *std::min_element(candidates.begin(), candidates.end());
@@ -88,10 +88,10 @@ void bindContractionFreeExtents(
     // A flattened free side can span adjacent logical axes. Offer the same
     // tile budget across those axes as well as along its innermost coordinate.
     if (splitInnerAxis && group.parameters.size() > 1) {
-      ParameterOp outerParameter = group.parameters[group.parameters.size() - 2];
-      ParameterOp innerParameter = group.parameters.back();
-      ParameterAttr outer = outerParameter.getParameter();
-      ParameterAttr inner = innerParameter.getParameter();
+      ParameterAttr outerParameter = group.parameters[group.parameters.size() - 2];
+      ParameterAttr innerParameter = group.parameters.back();
+      ParameterAttr outer = outerParameter;
+      ParameterAttr inner = innerParameter;
       int64_t outerValue = cast<IntegerAttr>(bindings.get(outer.getName().getValue())).getInt();
       int64_t innerValue = cast<IntegerAttr>(bindings.get(inner.getName().getValue())).getInt();
       if (innerValue > 1 && innerValue % 2 == 0 && outerValue <= budget / 2 &&
@@ -109,17 +109,17 @@ void bindContractionFreeExtents(
 }
 
 LogicalResult bindTraversalFragmentFootprints(
-    func::FuncOp kernel, ArrayRef<ParameterOp> parameters,
+    func::FuncOp kernel, ArrayRef<ParameterAttr> parameters,
     const FragmentResourceAnalysis &resources, NamedAttrList &bindings,
     Builder &builder) {
   auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   if (!capabilities || capabilities.getRegistersPerUnit() <= 0)
     return success();
   SmallVector<ArrayRef<FragmentType>> budgeted;
-  for (ParameterOp parameter : parameters) {
-    auto schema = parameter.getParameter();
-    auto category = static_cast<ParameterCategory>(schema.getCategory());
-    auto role = static_cast<ParameterRole>(schema.getRole());
+  for (ParameterAttr parameter : parameters) {
+    auto schema = parameter;
+    auto category = schema.getCategory();
+    auto role = schema.getRole();
     bool reduction = category == ParameterCategory::Reduction &&
                      (role == ParameterRole::Reduction ||
                       role == ParameterRole::ReductionInner ||
@@ -127,7 +127,7 @@ LogicalResult bindTraversalFragmentFootprints(
     bool pointwise =
         category == ParameterCategory::Pointwise &&
         (role == ParameterRole::OwnershipM || role == ParameterRole::OwnershipN);
-    if (!parameter->hasAttr(pointwiseChunkAttr) && !reduction && !pointwise)
+    if (!parameter.getBinding().getPointwiseChunk() && !reduction && !pointwise)
       continue;
     auto fragments = resources.materializedTypesUsing(schema.getName());
     auto fits = [&](int64_t candidate) {
@@ -157,20 +157,20 @@ LogicalResult bindTraversalFragmentFootprints(
 
 void appendFullResultContractionTuples(
     func::FuncOp kernel, ArrayRef<FullResultContraction> contractions,
-    const NamedAttrList &bindings, ArrayRef<ParameterOp> parameters,
+    const NamedAttrList &bindings, ArrayRef<ParameterAttr> parameters,
     const FragmentResourceAnalysis &resources, ProfileLookup profileFor,
     Builder &builder, llvm::function_ref<void(DictionaryAttr)> append) {
   for (const FullResultContraction &contraction : contractions) {
-    ParameterOp parameter = contraction.parameter;
-    auto schema = parameter.getParameter();
+    ParameterAttr parameter = contraction.parameter;
+    auto schema = parameter;
     auto other = contraction.otherExtent;
     int64_t otherExtent;
-    if (other.getKind() == static_cast<uint32_t>(PhysicalExprKind::Constant))
+    if (other.getKind() == PhysicalExprKind::Constant)
       otherExtent = other.getValue();
     else if (other.getKind() ==
-             static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
+             PhysicalExprKind::Parameter) {
       auto binding = dyn_cast_or_null<IntegerAttr>(
-          bindings.get(other.getSymbol().getValue()));
+          bindings.get(other.getSymbolName().getValue()));
       if (!binding)
         continue;
       otherExtent = binding.getInt();

@@ -1,5 +1,6 @@
 #include "Intent/Dialect/GPU/Transforms/Resources.h"
 #include "Intent/Dialect/GPU/Analysis/Resources.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -15,16 +16,16 @@ void materializeDeferredReductionBounds(
   if (!capabilities || capabilities.getRegistersPerUnit() <= 0)
     return;
   llvm::DenseMap<StringAttr, int64_t> knownParameters;
-  kernel.walk([&](ParameterOp parameter) {
-    auto schema = parameter.getParameter();
-    if (!parameter->hasAttr(coverageDimensionAttr) &&
-        schema.getCategory() != static_cast<uint32_t>(ParameterCategory::Coverage))
+  for (Attribute declaration : getParameterDeclarations(kernel)) {
+    auto schema = cast<ParameterAttr>(declaration);
+    if (!schema.isDeferred() &&
+        schema.getCategory() != ParameterCategory::Coverage)
       knownParameters[schema.getName()] = schema.getCandidates().asArrayRef().front();
-  });
+  }
   auto resolve = [&](PhysicalExprAttr expression) -> std::optional<int64_t> {
-    if (expression.getKind() != static_cast<uint32_t>(PhysicalExprKind::Parameter))
+    if (expression.getKind() != PhysicalExprKind::Parameter)
       return std::nullopt;
-    auto found = knownParameters.find(expression.getSymbol());
+    auto found = knownParameters.find(expression.getSymbolName());
     return found == knownParameters.end() ? std::nullopt
                                           : std::optional<int64_t>(found->second);
   };

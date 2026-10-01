@@ -21,6 +21,7 @@ from .targets import TritonTarget
 from .targets import MojoTarget
 from .targets import BangCTarget
 from .targets import WeftTarget
+from .targets import GPUCapabilities, GPUCompilationTarget, CPUCompilationTarget, DSACompilationTarget
 
 
 __all__ = [
@@ -51,6 +52,10 @@ __all__ = [
     "MojoTarget",
     "BangCTarget",
     "WeftTarget",
+    "GPUCapabilities",
+    "GPUCompilationTarget",
+    "CPUCompilationTarget",
+    "DSACompilationTarget",
     "FrontendError",
     "lower_to_mlir",
 ]

@@ -4,6 +4,7 @@
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/Support/MathExtras.h"
@@ -127,7 +128,7 @@ coordinateTargetAxes(gpu::FragmentType source, gpu::FragmentType target) {
        llvm::enumerate(source.getAxisMaps())) {
     auto extent = cast<gpu::PhysicalExprAttr>(source.getShape()[sourceIndex]);
     if (extent.getKind() ==
-            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+            gpu::PhysicalExprKind::Constant &&
         extent.getValue() == 1) {
       unitAxes.push_back(sourceIndex);
       continue;
@@ -272,7 +273,7 @@ FailureOr<SmallVector<Value>> materializeCoordinateDomains(
 
     auto unit = gpu::PhysicalExprAttr::get(
         owner->getContext(),
-        static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), 1,
+        gpu::PhysicalExprKind::Constant, 1,
         StringAttr::get(owner->getContext()),
         ArrayAttr::get(owner->getContext(), {}));
     SmallVector<Attribute> expandedShape(target.getShape().size(), unit);
@@ -415,12 +416,12 @@ Value repeatTileForExtraction(OpBuilder &builder, Location location, Value value
   auto context = builder.getContext();
   auto expression = [&](gpu::PhysicalExprKind kind,
                          ArrayRef<Attribute> operands) {
-    return gpu::PhysicalExprAttr::get(context, static_cast<uint32_t>(kind), 0,
+    return gpu::PhysicalExprAttr::get(context, kind, 0,
                                      builder.getStringAttr(""),
                                      builder.getArrayAttr(operands));
   };
   auto unit = gpu::PhysicalExprAttr::get(
-      context, static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), 1,
+      context, gpu::PhysicalExprKind::Constant, 1,
       builder.getStringAttr(""), builder.getArrayAttr({}));
   auto repeat = expression(gpu::PhysicalExprKind::FloorDiv,
       {expression(gpu::PhysicalExprKind::Maximum, {extent, requested}), extent});
@@ -817,7 +818,8 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
         gpu::ParameterRole::ProviderAccessForm, isLegalAccessForm);
     if (failed(parameter))
       return failure();
-    accessForm = parameter->getResult();
+    OpBuilder entry(&kernel.front(), kernel.front().begin());
+    accessForm = gpu::materializeParameter(entry, kernel.getLoc(), *parameter);
     return accessForm;
   };
   auto loadFormCondition = [&]() -> FailureOr<Value> {
@@ -932,7 +934,8 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
             gpu::ParameterRole::ProviderLoadPolicy, isLegalLoadPolicy);
         if (failed(parameter))
           return failure();
-        loadPolicy = parameter->getResult();
+        OpBuilder entry(&kernel.front(), kernel.front().begin());
+        loadPolicy = gpu::materializeParameter(entry, kernel.getLoc(), *parameter);
       }
       loopLatency = loadPolicy;
     }
@@ -942,7 +945,7 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
       for (auto [axis, attribute] : llvm::enumerate(plan->resourceType.getShape())) {
         auto extent = cast<gpu::PhysicalExprAttr>(attribute);
         if (extent.getKind() ==
-                static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+                gpu::PhysicalExprKind::Constant &&
             extent.getValue() == 1)
           continue;
         Value size = nested.create<gpu::DimOp>(
@@ -1095,7 +1098,7 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
     SmallVector<Value> coordinates(source.getShape().size());
     OpBuilder builder(gather);
     auto unit = gpu::PhysicalExprAttr::get(
-        kernel.getContext(), static_cast<uint32_t>(gpu::PhysicalExprKind::Constant),
+        kernel.getContext(), gpu::PhysicalExprKind::Constant,
         1, builder.getStringAttr(""), builder.getArrayAttr({}));
     SmallVector<Attribute> extractionShape(source.getShape().size(), unit);
     SmallVector<bool> slicedAxes(source.getShape().size(), false);
@@ -1143,11 +1146,11 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
               cast<gpu::PhysicalExprAttr>(source.getShape()[sourceAxis]);
           Value full;
           if (fullExtent.getKind() ==
-              static_cast<uint32_t>(gpu::PhysicalExprKind::Parameter)) {
-            auto parameter = gpu::queryParameterBySymbol(kernel, fullExtent.getSymbol());
+              gpu::PhysicalExprKind::Parameter) {
+            auto parameter = gpu::queryParameterBySymbol(kernel, fullExtent.getSymbolName());
             if (failed(parameter))
               return gather.emitOpError("tile extraction source extent has no parameter");
-            full = parameter->getResult();
+            full = gpu::materializeParameter(builder, gather.getLoc(), parameter->getReference());
           } else {
             full = builder.create<gpu::PhysicalExprOp>(
                 gather.getLoc(), builder.getIndexType(), fullExtent);

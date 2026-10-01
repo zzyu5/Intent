@@ -1,4 +1,5 @@
 #include "ConfigurationFacts.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Target/Triton/IR/TritonOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -86,17 +87,17 @@ bool hasRecurrentContraction(scf::ForOp loop) {
 ProgramConfigurationFacts::ProgramConfigurationFacts(func::FuncOp kernel) {
   bool mayFormDot = false, hasReductionOrScan = false;
   bool hasScaledOrSparse = false, loopMemory = false, straightLine = true;
-  kernel.walk([&](Operation *operation) {
-    if (auto parameter = dyn_cast<gpu::ParameterOp>(operation)) {
-      auto schema = parameter.getParameter();
-      auto category = static_cast<gpu::ParameterCategory>(schema.getCategory());
+  for (Attribute attribute : gpu::getParameterDeclarations(kernel)) {
+      auto schema = cast<gpu::ParameterAttr>(attribute);
+      auto category = schema.getCategory();
       twoAxisPointwise |= category == gpu::ParameterCategory::Pointwise &&
-          schema.getRole() == static_cast<uint32_t>(gpu::ParameterRole::OwnershipM);
+          schema.getRole() == gpu::ParameterRole::OwnershipM;
       if (category != gpu::ParameterCategory::Coverage &&
           category != gpu::ParameterCategory::Provider &&
           !llvm::is_contained(categories, category))
         categories.push_back(category);
-    }
+  }
+  kernel.walk([&](Operation *operation) {
     mayFormDot |= isa<gpu::ReduceOp, ReduceOp>(operation);
     hasReductionOrScan |= isa<gpu::ReduceOp, gpu::ScanOp>(operation);
     if (auto contract = dyn_cast<gpu::ContractOp>(operation)) {

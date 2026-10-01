@@ -2,7 +2,6 @@
 #include "Configurations.h"
 #include "ConfigurationFacts.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
-#include "Intent/Dialect/GPU/Analysis/Configurations.h"
 #include "Intent/Target/Triton/IR/Configuration.h"
 #include "Intent/Dialect/GPU/Analysis/Resources.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
@@ -74,9 +73,9 @@ std::optional<int64_t> evaluateCompileTimeExpression(
     gpu::PhysicalExprAttr expression, DictionaryAttr bindings) {
   return gpu::evaluatePhysicalExpression(expression, [&](gpu::PhysicalExprAttr leaf)
       -> std::optional<int64_t> {
-    if (leaf.getKind() != static_cast<uint32_t>(gpu::PhysicalExprKind::Parameter))
+    if (leaf.getKind() != gpu::PhysicalExprKind::Parameter)
       return std::nullopt;
-    auto value = bindings ? bindings.getAs<IntegerAttr>(leaf.getSymbol()) : IntegerAttr();
+    auto value = bindings ? bindings.getAs<IntegerAttr>(leaf.getSymbolName()) : IntegerAttr();
     return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
   });
 }
@@ -85,14 +84,14 @@ bool isTritonFragmentExtent(Attribute attribute) {
   auto expression = dyn_cast<gpu::PhysicalExprAttr>(attribute);
   if (!expression)
     return false;
-  auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
+  auto kind = expression.getKind();
   return kind != gpu::PhysicalExprKind::ScalarABI &&
          isTritonExpression(expression) &&
          llvm::all_of(expression.getOperands(), isTritonFragmentExtent);
 }
 
 bool isTritonExpression(gpu::PhysicalExprAttr expression) {
-  auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
+  auto kind = expression.getKind();
   switch (kind) {
   case gpu::PhysicalExprKind::Constant:
   case gpu::PhysicalExprKind::Parameter:
@@ -181,17 +180,16 @@ LogicalResult materializeDeferredResourceBounds(func::FuncOp kernel) {
   NamedAttrList knownBindings;
   Builder attributes(kernel.getContext());
   gpu::ParameterAttr warpParameter;
-  kernel.walk([&](gpu::ParameterOp parameter) {
-    auto schema = parameter.getParameter();
+  auto parameters = gpu::ParameterSpace::read(kernel);
+  if (failed(parameters)) return failure();
+  for (gpu::ParameterAttr schema : parameters->extentDeclarations()) {
     if (schema.getRole() ==
-        static_cast<uint32_t>(gpu::ParameterRole::ProviderWarps))
+        gpu::ParameterRole::ProviderWarps)
       warpParameter = schema;
-    if (schema.getCategory() !=
-            static_cast<uint32_t>(gpu::ParameterCategory::Coverage) &&
-        !parameter->hasAttr(gpu::coverageDimensionAttr))
+    if (!schema.isDeferred())
       knownBindings.set(schema.getName(),
           attributes.getI64IntegerAttr(schema.getCandidates().asArrayRef().front()));
-  });
+  }
   DictionaryAttr known = knownBindings.getDictionary(kernel.getContext());
   const gpu::FragmentResourceAnalysis resources(kernel);
   SmallVector<gpu::PhysicalExprAttr> bounds;
@@ -200,12 +198,12 @@ LogicalResult materializeDeferredResourceBounds(func::FuncOp kernel) {
     for (Attribute attribute : fragment.getShape()) {
       auto extent = cast<gpu::PhysicalExprAttr>(attribute);
       if (extent.getKind() ==
-              static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+              gpu::PhysicalExprKind::Constant &&
           extent.getValue() == 1)
         continue;
       elements = !elements ? extent : gpu::PhysicalExprAttr::get(
           kernel.getContext(),
-          static_cast<uint32_t>(gpu::PhysicalExprKind::Multiply), 0,
+          gpu::PhysicalExprKind::Multiply, 0,
           StringAttr::get(kernel.getContext(), ""),
           ArrayAttr::get(kernel.getContext(), {elements, extent}));
     }
@@ -242,7 +240,7 @@ LogicalResult materializeDeferredResourceBounds(func::FuncOp kernel) {
       auto expression = [&](gpu::PhysicalExprKind kind, int64_t value,
                             ArrayRef<Attribute> operands) {
         return gpu::PhysicalExprAttr::get(
-            kernel.getContext(), static_cast<uint32_t>(kind), value,
+            kernel.getContext(), kind, value,
             builder.getStringAttr(""), builder.getArrayAttr(operands));
       };
       auto constant = [&](int64_t value) {
@@ -250,8 +248,8 @@ LogicalResult materializeDeferredResourceBounds(func::FuncOp kernel) {
       };
       auto warps = gpu::PhysicalExprAttr::get(
           kernel.getContext(),
-          static_cast<uint32_t>(gpu::PhysicalExprKind::Parameter), 0,
-          warpParameter.getName(), builder.getArrayAttr({}));
+          gpu::PhysicalExprKind::Parameter, 0,
+          warpParameter.getReference(), builder.getArrayAttr({}));
       int64_t maximumWarps =
           *llvm::max_element(warpParameter.getCandidates().asArrayRef());
       auto belowMaximum = expression(gpu::PhysicalExprKind::Subtract, 0,
@@ -306,18 +304,18 @@ bool descriptorFragmentFits(gpu::FragmentType fragment,
             evaluateCompileTimeExpression(expression, config)) {
       values.push_back(*value);
       concreteElements *= *value;
-    } else if (static_cast<gpu::PhysicalExprKind>(expression.getKind()) ==
+    } else if (expression.getKind() ==
                gpu::PhysicalExprKind::Parameter) {
-      auto domain = parameterDomains.find(expression.getSymbol().getValue());
+      auto domain = parameterDomains.find(expression.getSymbolName().getValue());
       if (domain == parameterDomains.end())
         return false;
       concrete = false;
       values.append(domain->second.begin(), domain->second.end());
       if (axis + 1 == fragment.getShape().size())
         runtimeGuardsLastExtent =
-            coverageParameters.contains(expression.getSymbol().getValue());
+            coverageParameters.contains(expression.getSymbolName().getValue());
       runtimeGuardsElementCount |=
-          coverageParameters.contains(expression.getSymbol().getValue());
+          coverageParameters.contains(expression.getSymbolName().getValue());
     } else {
       return false;
     }
@@ -349,30 +347,30 @@ bool descriptorFragmentFits(gpu::FragmentType fragment,
 LogicalResult materializeLegalConfigs(func::FuncOp kernel,
                                       TensorDescriptorChoiceOp descriptorChoice,
                                       ArrayRef<TritonLocalOptions> localOptions) {
-  auto space = gpu::PhysicalParameterSpace::read(kernel);
+  auto space = gpu::ParameterSpace::read(kernel);
   if (failed(space))
     return failure();
   auto schema = ConfigurationSchema::read(kernel);
   if (failed(schema)) return failure();
-  auto shared = space->sharedConfigurations();
+  auto shared = space->configurations(gpu::ConfigurationStage::Shared);
   if (failed(shared))
     return failure();
   llvm::StringMap<SmallVector<int64_t>> parameterDomains;
   llvm::StringSet<> coverageParameters;
-  for (const auto &domain : space->domains()) {
-    parameterDomains[domain.name().getValue()] =
-        SmallVector<int64_t>(domain.candidates());
-    if (domain.coverage)
-      coverageParameters.insert(domain.name().getValue());
+  for (gpu::ParameterAttr domain : space->extentDeclarations()) {
+    parameterDomains[domain.getName().getValue()] =
+        SmallVector<int64_t>(domain.getCandidates().asArrayRef());
+    if (domain.isDeferred())
+      coverageParameters.insert(domain.getName().getValue());
   }
-  const auto *warps = space->find(gpu::ParameterRole::ProviderWarps);
-  const auto *stages = space->find(gpu::ParameterRole::ProviderStages);
-  const auto *ctas = space->find(gpu::ParameterRole::ProviderCTAs);
+  auto warps = space->find(gpu::ParameterRole::ProviderWarps);
+  auto stages = space->find(gpu::ParameterRole::ProviderStages);
+  auto ctas = space->find(gpu::ParameterRole::ProviderCTAs);
   if (!warps || !stages || !ctas)
     return kernel.emitError("Triton provider parameter domains are incomplete");
   SmallVector<DictionaryAttr> configs;
   Builder builder(kernel.getContext());
-  int64_t maximumWarps = *llvm::max_element(warps->candidates());
+  int64_t maximumWarps = *llvm::max_element(warps.getCandidates().asArrayRef());
   SmallVector<gpu::PhysicalExprAttr> collectiveFootprints;
   for (gpu::FragmentType fragment : collectiveFragments(kernel)) {
     auto footprint = gpu::fragmentRegisterFootprint(fragment);
@@ -385,7 +383,7 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
       for (int64_t form = 0; form < formCount; ++form) {
         NamedAttrList bindings(tuple);
         if (descriptorChoice)
-          bindings.set(descriptorChoice.getConfigParameter(), builder.getI64IntegerAttr(form));
+          bindings.set(descriptorChoice.getConfigParameter().getName(), builder.getI64IntegerAttr(form));
         bindings.set(schema->warps, builder.getI64IntegerAttr(options.warps));
         bindings.set(schema->stages, builder.getI64IntegerAttr(options.stages));
         bindings.set(schema->ctas, builder.getI64IntegerAttr(options.ctas));
@@ -474,7 +472,7 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
         }))
       continue;
     bool descriptorConfig = descriptorChoice &&
-        config.getAs<IntegerAttr>(descriptorChoice.getConfigParameter()).getInt() != 0;
+        config.getAs<IntegerAttr>(descriptorChoice.getConfigParameter().getName()).getInt() != 0;
     if (descriptorConfig && llvm::any_of(descriptors, [&](const auto &constraint) {
           return !descriptorFragmentFits(constraint.fragment, config, configStages,
               constraint.alignment, parameterDomains, coverageParameters);
@@ -540,25 +538,11 @@ FailureOr<SmallVector<TritonLocalOptions>> declareProviderOptions(
   }
   if (localOptions.empty())
     return kernel.emitError("Triton tuning profile has no legal provider options");
-  OpBuilder builder(&kernel.getBody().front(), kernel.getBody().front().begin());
-  llvm::StringSet<> names;
-  kernel.walk([&](gpu::ParameterOp parameter) {
-    names.insert(parameter.getParameter().getName().getValue());
-  });
+  Builder builder(kernel.getContext());
   auto declareProviderParameter = [&](StringRef name, gpu::ParameterRole role,
                                       ArrayRef<int64_t> candidates) -> LogicalResult {
-    if (names.contains(name))
-      return failure();
-    auto schema = gpu::ParameterAttr::get(
-        kernel.getContext(), builder.getStringAttr(name),
-        static_cast<uint32_t>(role),
-        static_cast<uint32_t>(gpu::ParameterCategory::Provider),
-        /*elementBitWidth=*/0,
-        DenseI64ArrayAttr::get(kernel.getContext(), candidates));
-    builder.create<gpu::ParameterOp>(kernel.getLoc(), builder.getIndexType(),
-                                     schema);
-    names.insert(name);
-    return success();
+    return success(succeeded(gpu::getOrCreatePhysicalParameter(
+        kernel, name, role, gpu::ParameterCategory::Provider, 0, candidates)));
   };
   if (failed(declareProviderParameter("NUM_WARPS", gpu::ParameterRole::ProviderWarps,
                                       warpDomain)) ||
@@ -573,7 +557,7 @@ FailureOr<SmallVector<TritonLocalOptions>> declareProviderOptions(
     if (failed(stages))
       return failure();
     for (scf::ForOp loop : loadPipelineLoops)
-      loop->setAttr(loopStagesAttr, stages->getParameter());
+      loop->setAttr(loopStagesAttr, stages->getReference());
   }
   return localOptions;
 }

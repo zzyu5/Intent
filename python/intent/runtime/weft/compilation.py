@@ -75,7 +75,12 @@ def validate_artifact(manifest: dict) -> None:
 
 def export_artifact(program, directory: Path, *, compiler: str, profile: TargetProfile) -> None:
     """AOT lowering; system compilation and native loading remain separate."""
-    if program.metadata["matrix_i8_i32"] and not profile.matrix_extension:
+    from intent.targets.specification import CPUCompilationTarget
+
+    target = program.target
+    if not isinstance(target, CPUCompilationTarget) or target.provider != "weft":
+        raise ValueError("Weft AOT requires a generated Weft CPU program")
+    if target.matrix_i8_i32 and not profile.matrix_extension:
         raise ValueError("CPU program matrix capability disagrees with native materialization")
     artifact = lower_artifact(program.source, compiler=compiler, profile=profile)
     manifest = {"profile": asdict(profile), "program": program.metadata, "weft": artifact}
@@ -143,7 +148,7 @@ def compile_artifact(directory: Path, *, cc: tuple[str, ...], cflags: tuple[str,
         *cc, "-O3", "-shared", "-fPIC", "-std=c11", "-D_POSIX_C_SOURCE=200809L",
         f"-march={profile.march}", f"-mabi={profile.abi}", *cflags,
         "-fno-fast-math", "-ffp-contract=off",
-        *(["-fopenmp"] if metadata["workers"] > 1 else []),
+        *(["-fopenmp"] if metadata["target"]["workers"] > 1 else []),
         str(directory / "host.c"), str(directory / "kernels.c"), str(exports),
         "-lm", "-o", str(library),
     ])

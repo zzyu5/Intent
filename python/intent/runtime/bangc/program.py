@@ -99,11 +99,10 @@ def benchmark_calls(calls: tuple[NativeCall, ...], *, prepare=None, repetitions:
 
 class NativeProgram(NativePreparedRuntime):
     def __init__(self, source: str, metadata: dict[str, object], target) -> None:
-        if metadata.get("provider") != "bangc" or metadata.get("architecture") != target.architecture:
-            raise ValueError("BANG C artifact and target disagree")
-        for binding in ("tile", "tile_m", "tile_n", "tile_k", "region_tile", "tasks", "local_bytes"):
-            if metadata[binding] != getattr(target, binding):
-                raise ValueError(f"BANG C artifact and target disagree on {binding}")
+        from intent.targets.specification import read_compilation_target, require_matching_target
+
+        compilation = read_compilation_target(metadata["provider"], metadata["target"])
+        require_matching_target(compilation, target.compilation)
         self.target = target
         self.metadata = metadata
         self.parameters = metadata["parameters"]
@@ -114,7 +113,7 @@ class NativeProgram(NativePreparedRuntime):
             check_dimensions=type(self)._check_dimensions,
         )
         parameters_by_name = {parameter["name"]: parameter for parameter in self.parameters}
-        for name, shape in target.shapes:
+        for name, shape in target.compilation.shapes:
             parameter = parameters_by_name.get(name)
             if parameter is None or parameter["kind"] != "view" or len(shape) != len(parameter["shape"]):
                 raise ValueError("BANG C artifact and target disagree on bound parameter shapes")
@@ -166,7 +165,7 @@ class NativeProgram(NativePreparedRuntime):
 
     def _check_dimensions(self, dimensions: dict[int, int]) -> None:
         for identity in self.metadata["full_extent_dimensions"]:
-            if dimensions[identity] > self.metadata["tile"]:
+            if dimensions[identity] > self.target.compilation.tile:
                 raise NotImplementedError("this row reduction requires a larger DSA tile binding")
 
     @staticmethod

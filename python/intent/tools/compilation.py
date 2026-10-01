@@ -91,18 +91,23 @@ def _ir_text(ir_file: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _generated_result(result: dict, generated, materialize: bool) -> None:
+def _generated_result(result: dict, generated, materialize: bool, *,
+                      runtime_target=None, export_directory: str | None = None) -> None:
     result.update(cache_directory=str(generated.cache_directory),
                   files=_files(generated.cache_directory), metadata=generated.metadata)
+    if export_directory is not None:
+        directory = generated.save(export_directory)
+        result.update(export_directory=str(directory), exported_files=_files(directory))
     if materialize:
-        generated.materialize()
+        generated.materialize(target=runtime_target)
     result.update(status="materialized" if materialize else "generated")
 
 
 def compile_request(program: str, kernel: str, target: str | None = None, *,
                     target_options: dict | None = None, constexprs: dict | None = None,
                     compiler: str | None = None, tuning_config: str | None = None,
-                    materialize: bool = False, stage: str = "provider") -> dict:
+                    materialize: bool = False, stage: str = "provider",
+                    target_facts: dict | None = None, export_directory: str | None = None) -> dict:
     """Compile an existing definition without invoking its kernel.
 
     Loading the Python module executes its ordinary top-level host code. Native
@@ -117,12 +122,16 @@ def compile_request(program: str, kernel: str, target: str | None = None, *,
     try:
         selected_stage = CompilerStage(stage)
         if selected_stage is CompilerStage.KIR:
-            if target is not None or target_options or tuning_config is not None or materialize:
+            if target is not None or target_options or target_facts is not None or tuning_config is not None or materialize:
                 raise ValueError("KIR compilation does not accept target, target options, tuning or materialization")
         elif target is None:
             raise ValueError("shared/provider compilation requires a target")
         if materialize and selected_stage is not CompilerStage.PROVIDER:
             raise ValueError("materialization requires provider compilation")
+        if export_directory is not None and selected_stage is not CompilerStage.PROVIDER:
+            raise ValueError("export requires provider source and metadata")
+        if target_facts is not None and target_options and not materialize:
+            raise ValueError("runtime target options require materialization when explicit compiler facts are supplied")
         current_stage = "program_loading"
         # User module prints must not corrupt JSON output or the MCP transport.
         with redirect_stdout(transcript), _definition(program, kernel) as definition:
@@ -130,14 +139,16 @@ def compile_request(program: str, kernel: str, target: str | None = None, *,
             selected = None
             if target is not None:
                 current_stage = "target_options"
-                selected = make_target(target, dict(target_options or {}))
+                selected = make_target(target, {} if target_facts is not None else dict(target_options or {}), facts=target_facts)
             current_stage = "compilation"
             if selected_stage is CompilerStage.PROVIDER:
                 generated = intent.generate(definition, target=selected, compiler=compiler,
                                             constexprs=constexprs, tuning_config=tuning_config)
                 if materialize:
                     current_stage = "generated_source_materialization"
-                _generated_result(result, generated, materialize)
+                runtime_target = make_target(target, dict(target_options or {})) if materialize and target_facts is not None else None
+                _generated_result(result, generated, materialize,
+                                  runtime_target=runtime_target, export_directory=export_directory)
             else:
                 lowered = intent.compile_ir(definition, stage=selected_stage.value,
                                             target=selected, compiler=compiler,
@@ -154,7 +165,8 @@ def compile_request(program: str, kernel: str, target: str | None = None, *,
 
 def generate_ir_request(ir_file: str, name: str, target: str, *,
                         input_stage: str = "shared", target_options: dict | None = None,
-                        compiler: str | None = None, materialize: bool = False) -> dict:
+                        compiler: str | None = None, materialize: bool = False,
+                        target_facts: dict | None = None, export_directory: str | None = None) -> dict:
     """Resume compilation from explicit existing IR through the public API."""
     import intent
 
@@ -166,13 +178,38 @@ def generate_ir_request(ir_file: str, name: str, target: str, *,
         text = _ir_text(ir_file)
         with redirect_stdout(transcript):
             current_stage = "target_options"
-            selected = make_target(target, dict(target_options or {}))
+            if target_facts is not None and target_options and not materialize:
+                raise ValueError("runtime target options require materialization when explicit compiler facts are supplied")
+            selected = make_target(target, {} if target_facts is not None else dict(target_options or {}), facts=target_facts)
             current_stage = "compilation"
             generated = intent.generate_from_ir(text, input_stage=input_stage,
                 name=name, target=selected, compiler=compiler)
             if materialize:
                 current_stage = "generated_source_materialization"
-            _generated_result(result, generated, materialize)
+            runtime_target = make_target(target, dict(target_options or {})) if materialize and target_facts is not None else None
+            _generated_result(result, generated, materialize,
+                              runtime_target=runtime_target, export_directory=export_directory)
+    except (Exception, SystemExit) as error:
+        _failure(result, error, current_stage)
+    if transcript.getvalue():
+        result["program_stdout"] = transcript.getvalue()
+    return result
+
+
+def materialize_request(directory: str, target: str, *, target_options: dict | None = None) -> dict:
+    """Load a generated program and bind an explicitly selected local runtime; never launch."""
+    from intent.compiler.artifact import GeneratedProgram
+
+    result = {"program_directory": directory, "target": target, "tool_invoked_kernel": False}
+    transcript = io.StringIO()
+    current_stage = "generated_program_loading"
+    try:
+        program = GeneratedProgram.load(directory)
+        current_stage = "target_options"
+        selected = make_target(target, dict(target_options or {}))
+        with redirect_stdout(transcript):
+            current_stage = "generated_source_materialization"
+            _generated_result(result, program, True, runtime_target=selected)
     except (Exception, SystemExit) as error:
         _failure(result, error, current_stage)
     if transcript.getvalue():
@@ -197,7 +234,8 @@ def optimize_request(ir_file: str, pipeline: str, *, optimizer: str | None = Non
     return result
 
 
-def doctor(target: str, *, target_options: dict | None = None, compiler: str | None = None) -> dict:
+def doctor(target: str, *, target_options: dict | None = None, compiler: str | None = None,
+           target_facts: dict | None = None) -> dict:
     from intent.compiler.toolchain import compiler_info
     from intent.targets.base import ResolvedTarget
 
@@ -236,29 +274,33 @@ def doctor(target: str, *, target_options: dict | None = None, compiler: str | N
     executable = information["executable"] if information is not None else None
     if executable is not None and target != "bangc":
         def profiles():
-            names = ("shared", target) if target in {"triton", "cutile"} else (target,)
+            names = ("shared", target) if target in {"triton", "cutile", "tilelang"} else (target,)
             paths = [Path(executable).parent / "profiles" / f"{name}.json" for name in names]
             for path in paths:
                 if not path.is_file():
                     raise FileNotFoundError(f"Compiler profile is missing: {path}")
             return [str(path) for path in paths]
         check("compiler profiles", profiles)
-    for name in description["modules"]:
-        check(name, lambda name=name: python_module(name))
-    if target == "cutile":
+    if target_facts is None:
+        for name in description["modules"]:
+            check(name, lambda name=name: python_module(name))
+    else:
+        result["scope"] = "Compiler and explicit compiler facts only; provider SDK, runtime device and execution were not checked"
+    if target == "cutile" and target_facts is None:
         def tile_compiler():
             from cuda.tile._compile import _find_compiler_bin
             return {"path": _find_compiler_bin().path, "resolver": "cuda.tile"}
         check("cuTile native compiler", tile_compiler)
 
     def resolve():
-        value = make_target(target, dict(target_options or {})).resolve()
+        value = make_target(target, dict(target_options or {}), facts=target_facts).resolve()
         result["callable_materialization"] = isinstance(value, ResolvedTarget)
-        return {"compiler_options": list(value.compiler_options),
+        compilation = value.compilation if isinstance(value, ResolvedTarget) else value
+        return {"compiler_options": list(compilation.compiler_options),
                 "facts": asdict(value) if is_dataclass(value) else {}}
 
     check("target", resolve)
-    if target == "bangc":
+    if target == "bangc" and target_facts is None:
         def neuware():
             value = make_target(target, dict(target_options or {})).resolve()
             path = shutil.which(value.compiler or os.environ.get("INTENT_BANGC_CNCC") or

@@ -85,7 +85,7 @@ ProgramSegment queryContractionProgramSegment(func::FuncOp kernel,
 }
 
 bool isCompileTimeExtent(PhysicalExprAttr expression) {
-  auto kind = static_cast<PhysicalExprKind>(expression.getKind());
+  auto kind = expression.getKind();
   if (kind == PhysicalExprKind::Constant || kind == PhysicalExprKind::Parameter)
     return true;
   if (kind == PhysicalExprKind::Dimension ||
@@ -104,7 +104,7 @@ bool isFullCoverageExtent(Operation *origin, Attribute attribute) {
   if (!kernel || !extent)
     return false;
   auto parameter = parameterForExtent(kernel, extent);
-  return succeeded(parameter) && (*parameter)->hasAttr(coverageDimensionAttr);
+  return succeeded(parameter) && parameter->isDeferred();
 }
 
 static bool isOwnershipExtent(Operation *origin, Attribute attribute) {
@@ -117,7 +117,7 @@ static bool isOwnershipExtent(Operation *origin, Attribute attribute) {
   auto parameter = parameterForExtent(kernel, extent);
   if (failed(parameter))
     return false;
-  auto role = static_cast<ParameterRole>(parameter->getParameter().getRole());
+  auto role = parameter->getRole();
   return role == ParameterRole::OwnershipM || role == ParameterRole::OwnershipN;
 }
 
@@ -325,12 +325,12 @@ bool isTailPredicate(Value value,
   return kernel && PhysicalProgramAnalysis(kernel).isTailPredicate(value, ranges);
 }
 
-FailureOr<ParameterOp> parameterForExtent(func::FuncOp kernel,
+FailureOr<ParameterAttr> parameterForExtent(func::FuncOp kernel,
                                           PhysicalExprAttr extent) {
   if (!extent || extent.getKind() !=
-                     static_cast<uint32_t>(PhysicalExprKind::Parameter))
+                     PhysicalExprKind::Parameter)
     return failure();
-  return queryParameterBySymbol(kernel, extent.getSymbol());
+  return queryParameterBySymbol(kernel, extent.getSymbolName());
 }
 
 static bool isTransparentMatrixReshape(ReshapeOp reshape) {
@@ -347,7 +347,7 @@ static bool isTransparentMatrixReshape(ReshapeOp reshape) {
       bool introducedUnit =
           axis.getDerived() &&
           expression.getKind() ==
-              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+              PhysicalExprKind::Constant &&
           expression.getValue() == 1;
       if (!introducedUnit)
         axes.emplace_back(sourceAxisIdentity(axis), extent);
@@ -428,19 +428,19 @@ bool freeAxesReadyForReductionTraversal(ContractOp contract,
     auto extent = cast<PhysicalExprAttr>(
         fragment.getShape()[axis.operandAxis]);
     if (extent.getKind() ==
-        static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
-      FailureOr<ParameterOp> parameter =
-          queryParameterBySymbol(kernel, extent.getSymbol());
+        PhysicalExprKind::Parameter) {
+      FailureOr<ParameterAttr> parameter =
+          queryParameterBySymbol(kernel, extent.getSymbolName());
       if (failed(parameter))
         return false;
-      auto role = static_cast<ParameterRole>(
-          parameter->getParameter().getRole());
+      auto role =
+          parameter->getRole();
       return role == ParameterRole::OwnershipM ||
              role == ParameterRole::OwnershipN ||
              role == ParameterRole::FullCoverage;
     }
     return extent.getKind() ==
-               static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+               PhysicalExprKind::Constant &&
            extent.getValue() == 1 &&
            axis.realization.isExact() &&
            !axis.realization.constructionScalarSeed &&
@@ -524,31 +524,31 @@ scf::ForOp enclosingRegionContractionSegment(Operation *operation) {
     auto loop = dyn_cast<scf::ForOp>(parent);
     if (!loop)
       continue;
-    auto segment = loop.getStep().getDefiningOp<ParameterOp>();
+    auto segment = queryParameter(loop.getStep());
     if (!segment ||
-        segment.getParameter().getRole() !=
-            static_cast<uint32_t>(ParameterRole::ScanChunk) ||
-        segment.getParameter().getCategory() !=
-            static_cast<uint32_t>(ParameterCategory::RegionContraction))
+        segment.getRole() !=
+            ParameterRole::ScanChunk ||
+        segment.getCategory() !=
+            ParameterCategory::RegionContraction)
       continue;
     return loop;
   }
   return {};
 }
 
-FailureOr<ParameterOp>
+FailureOr<ParameterAttr>
 regionContractionParameter(func::FuncOp kernel, PhysicalExprAttr extent) {
   if (!extent ||
       extent.getKind() !=
-          static_cast<uint32_t>(PhysicalExprKind::Parameter))
+          PhysicalExprKind::Parameter)
     return failure();
-  FailureOr<ParameterOp> parameter =
-      queryParameterBySymbol(kernel, extent.getSymbol());
+  FailureOr<ParameterAttr> parameter =
+      queryParameterBySymbol(kernel, extent.getSymbolName());
   if (failed(parameter) ||
-      (*parameter).getParameter().getRole() !=
-          static_cast<uint32_t>(ParameterRole::ScanChunk) ||
-      (*parameter).getParameter().getCategory() !=
-          static_cast<uint32_t>(ParameterCategory::RegionContraction))
+      (*parameter).getRole() !=
+          ParameterRole::ScanChunk ||
+      (*parameter).getCategory() !=
+          ParameterCategory::RegionContraction)
     return failure();
   return *parameter;
 }

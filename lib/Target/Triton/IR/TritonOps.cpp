@@ -227,8 +227,9 @@ LogicalResult TensorDescriptorChoiceOp::verify() {
   if (getSelection() != "all_eligible")
     return emitOpError(
         "supports only an all-descriptor runtime eligibility contract");
-  if (getConfigParameter().empty() || getEligibilityArgument().empty() ||
-      getConfigParameter() == getEligibilityArgument())
+  StringRef configName = getConfigParameter().getName().getValue();
+  if (configName.empty() || getEligibilityArgument().empty() ||
+      configName == getEligibilityArgument())
     return emitOpError(
         "requires distinct non-empty config and runtime eligibility names");
   if (getDescriptors().empty())
@@ -253,20 +254,22 @@ LogicalResult TensorDescriptorChoiceOp::verify() {
         "descriptor operands must enumerate every descriptor declaration exactly once");
   for (unsigned index = 0; index < kernel.getNumArguments(); ++index) {
     auto name = kernel.getArgAttrOfType<StringAttr>(index, gpu::abiNameAttr);
-    if (name && (name.getValue() == getConfigParameter() ||
+    if (name && (name.getValue() == configName ||
                  name.getValue() == getEligibilityArgument()))
       return emitOpError(
           "descriptor config and eligibility names must not collide with the physical ABI");
   }
-  bool parameterCollision = false;
-  kernel.walk([&](gpu::ParameterOp parameter) {
-    StringRef name = parameter.getParameter().getName().getValue();
-    parameterCollision |= name == getConfigParameter() ||
-                          name == getEligibilityArgument();
-  });
-  if (parameterCollision)
+  auto declaration = gpu::lookupParameterDeclaration(getOperation(), getConfigParameter());
+  const int64_t domain[] = {0, 1};
+  if (!declaration || !declaration.getValueType().isSignlessInteger(1) ||
+      declaration.getRole() != gpu::ParameterRole::ProviderAccessForm ||
+      declaration.getPhase() != gpu::ConfigurationBindingPhase::Provider ||
+      declaration.getCandidates().asArrayRef() != ArrayRef<int64_t>(domain))
+    return emitOpError("requires a declared boolean provider access-form parameter");
+  if (gpu::lookupParameterDeclaration(getOperation(),
+          gpu::ParameterRefAttr::get(getContext(), getEligibilityArgumentAttr())))
     return emitOpError(
-        "descriptor config and eligibility names must not collide with physical parameters");
+        "descriptor eligibility name must not collide with a compile-time declaration");
   return success();
 }
 
@@ -370,7 +373,7 @@ LogicalResult TensorDescriptorOp::verify() {
       return emitOpError("descriptor block shape must use physical expressions");
     if (!blocked.test(axis) &&
         (extent.getExpression().getKind() !=
-             static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+             gpu::PhysicalExprKind::Constant ||
          extent.getExpression().getValue() != 1))
       return emitOpError("scalar source axes must have descriptor block extent one");
   }
@@ -449,7 +452,7 @@ LogicalResult SplitOp::verify() {
       source.getShape()[source.getShape().size() - 1]);
   if (!trailing ||
       trailing.getKind() !=
-          static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+          gpu::PhysicalExprKind::Constant ||
       trailing.getValue() != 2)
     return emitOpError("requires a constant trailing extent of two");
   if (!std::equal(low.getShape().begin(), low.getShape().end(),

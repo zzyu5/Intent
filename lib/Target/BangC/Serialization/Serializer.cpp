@@ -72,12 +72,12 @@ public:
     llvm::json::Array fullExtents;
     for (int64_t value : function->getAttrOfType<DenseI64ArrayAttr>("intent_dsa.full_extent_dimensions").asArrayRef())
       fullExtents.push_back(value);
-    metadata = llvm::json::Object{{"provider", "bangc"}, {"architecture", "mtp_372"},
+    metadata = llvm::json::Object{{"provider", "bangc"}, {"entry_name", function.getName()},
         {"parameters", std::move(parameters)}, {"entry", "intent_launch"},
-        {"tile", config.getTile()}, {"tasks", config.getTasks()},
-        {"tile_m", config.getTileM()}, {"tile_n", config.getTileN()}, {"tile_k", config.getTileK()},
-        {"region_tile", config.getRegionTile()},
-        {"local_bytes", config.getLocalBytes()},
+        {"target", llvm::json::Object{{"family", "dsa"}, {"architecture", "mtp_372"},
+            {"tile", config.getTile()}, {"tasks", config.getTasks()},
+            {"tile_m", config.getTileM()}, {"tile_n", config.getTileN()}, {"tile_k", config.getTileK()},
+            {"region_tile", config.getRegionTile()}, {"local_bytes", config.getLocalBytes()}}},
         {"full_extent_dimensions", std::move(fullExtents)}, {"disjoint_outputs", true}};
     out << "#pragma bang walign(" << function->getAttrOfType<IntegerAttr>("bangc.wram_align").getInt() << ")\n"
         << tileImplementations << "\n__mlu_global__ void intent_device(" << llvm::join(signature, ", ") << ") {\n";

@@ -3,6 +3,7 @@
 #include "PassDetail.h"
 
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Target/TileLang/IR/TileLangOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/DenseSet.h"
@@ -14,53 +15,22 @@ using namespace mlir;
 namespace intent::tilelang {
 namespace {
 
-gpu::ParameterOp getOrCreateStages(func::FuncOp kernel,
-                                  const gpu::TuningProfiles &profiles) {
-  gpu::ParameterOp existing;
-  bool duplicate = false;
-  kernel.walk([&](gpu::ParameterOp parameter) {
-    if (parameter.getParameter().getName().getValue() != "NUM_STAGES")
-      return;
-    if (existing)
-      duplicate = true;
-    else
-      existing = parameter;
-  });
+FailureOr<gpu::ParameterRefAttr> declareStages(
+    func::FuncOp kernel, const gpu::TuningProfiles &profiles) {
   auto rows = profiles.get(tuningProfileSchema(), "stages", kernel.getLoc());
   if (failed(rows))
-    return {};
+    return failure();
   SmallVector<int64_t> values;
   for (const auto &row : *rows)
     if (isLegalPipelineStageCount(row[0]))
       values.push_back(row[0]);
   if (values.empty()) {
     kernel.emitError("TileLang tuning profile has no legal pipeline stage counts");
-    return {};
+    return failure();
   }
-  auto candidates = DenseI64ArrayAttr::get(kernel.getContext(), values);
-  if (duplicate) {
-    kernel.emitError("duplicates the TileLang NUM_STAGES parameter");
-    return {};
-  }
-  if (existing) {
-    gpu::ParameterAttr schema = existing.getParameter();
-    if (schema.getRole() !=
-            static_cast<uint32_t>(gpu::ParameterRole::ProviderStages) ||
-        schema.getCandidates() != candidates) {
-      existing.emitOpError(
-          "NUM_STAGES is reused with a different role or candidate domain");
-      return {};
-    }
-    return existing;
-  }
-  OpBuilder builder(&kernel.getBody().front(), kernel.getBody().front().begin());
-  auto schema = gpu::ParameterAttr::get(
-      kernel.getContext(), builder.getStringAttr("NUM_STAGES"),
-      static_cast<uint32_t>(gpu::ParameterRole::ProviderStages),
-      static_cast<uint32_t>(gpu::ParameterCategory::Provider),
-      /*elementBitWidth=*/0, candidates);
-  return builder.create<gpu::ParameterOp>(kernel.getLoc(), builder.getIndexType(),
-                                          schema);
+  return gpu::getOrCreatePhysicalParameter(
+      kernel, "NUM_STAGES", gpu::ParameterRole::ProviderStages,
+      gpu::ParameterCategory::Provider, 0, values);
 }
 
 bool dependsOnSharedBuffer(Value value, llvm::DenseSet<Value> &active) {
@@ -154,9 +124,11 @@ LogicalResult formPipelines(func::FuncOp kernel,
   }
   if (loops.empty())
     return success();
-  gpu::ParameterOp stages = getOrCreateStages(kernel, profiles);
-  if (!stages)
+  auto reference = declareStages(kernel, profiles);
+  if (failed(reference))
     return failure();
+  OpBuilder entry(&kernel.front(), kernel.front().begin());
+  auto stages = gpu::materializeParameter(entry, kernel.getLoc(), *reference);
   for (scf::ForOp loop : loops) {
     OpBuilder builder(loop);
     OperationState state(loop.getLoc(), PipelineOp::getOperationName());

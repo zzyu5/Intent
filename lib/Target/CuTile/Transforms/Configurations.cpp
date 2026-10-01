@@ -2,7 +2,6 @@
 
 #include "Configurations.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
-#include "Intent/Dialect/GPU/Analysis/Configurations.h"
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "Intent/Target/CuTile/Transforms/Passes.h"
@@ -38,7 +37,7 @@ bool isCuTileProviderRole(gpu::ParameterRole role) {
          role == gpu::ParameterRole::ProviderCTAs;
 }
 
-FailureOr<gpu::ParameterOp> declareProviderParameter(
+FailureOr<gpu::ParameterRefAttr> declareProviderParameter(
     func::FuncOp kernel, const gpu::TuningProfiles &profiles, StringRef family,
     StringRef name, gpu::ParameterRole role, bool (*isLegal)(int64_t)) {
   auto rows = profiles.get(tuningProfileSchema(), family, kernel.getLoc());
@@ -50,28 +49,20 @@ FailureOr<gpu::ParameterOp> declareProviderParameter(
       candidates.push_back(row.front());
   if (candidates.empty())
     return kernel.emitError("cuTile tuning profile has no legal hints for ") << name;
-  bool nameCollision = false;
-  kernel.walk([&](gpu::ParameterOp parameter) {
-    nameCollision |= parameter.getParameter().getName().getValue() == name;
-  });
-  if (nameCollision)
-    return kernel.emitError("cuTile hint parameter name is already owned: ") << name;
-  OpBuilder entry(&kernel.getBody().front(), kernel.getBody().front().begin());
-  auto schema = gpu::ParameterAttr::get(
-      kernel.getContext(), entry.getStringAttr(name), static_cast<uint32_t>(role),
-      static_cast<uint32_t>(gpu::ParameterCategory::Provider),
-      /*elementBitWidth=*/0, DenseI64ArrayAttr::get(kernel.getContext(), candidates));
-  return entry.create<gpu::ParameterOp>(kernel.getLoc(), entry.getIndexType(), schema);
+  return gpu::getOrCreatePhysicalParameter(
+      kernel, name, role, gpu::ParameterCategory::Provider, 0, candidates);
 }
 
 LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
-  auto space = gpu::PhysicalParameterSpace::read(kernel);
+  auto space = gpu::ParameterSpace::read(kernel);
   if (failed(space))
     return failure();
-  for (const auto &domain : space->domains())
-    if (domain.provider != isCuTileProviderRole(domain.role()))
-      return domain.operation->emitOpError("cuTile program contains a foreign provider parameter");
-  auto shared = space->sharedConfigurations();
+  for (gpu::ParameterAttr domain : space->declarations())
+    if (!domain.isExtent() ||
+        (domain.getPhase() == gpu::ConfigurationBindingPhase::Provider) !=
+            isCuTileProviderRole(domain.getRole()))
+      return kernel.emitError("cuTile program contains a foreign provider parameter");
+  auto shared = space->configurations(gpu::ConfigurationStage::Shared);
   if (failed(shared))
     return failure();
   Builder builder(kernel.getContext());
@@ -80,25 +71,24 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
     configurations.emplace_back(tuple.getValue());
   SmallVector<NamedAttribute> launchBaseline;
   SmallVector<NamedAttribute> launchEndpoint;
-  SmallVector<gpu::ParameterOp> launchOptions;
-  gpu::ParameterOp accessForm;
-  gpu::ParameterOp loadPolicy;
-  for (const auto &domain : space->domains()) {
-    if (!domain.provider)
+  SmallVector<gpu::ParameterAttr> launchOptions;
+  gpu::ParameterAttr accessForm;
+  gpu::ParameterAttr loadPolicy;
+  for (gpu::ParameterAttr definition : space->declarations()) {
+    if (definition.getPhase() != gpu::ConfigurationBindingPhase::Provider)
       continue;
-    gpu::ParameterAttr definition = domain.definition;
     if (definition.getRole() ==
-        static_cast<uint32_t>(gpu::ParameterRole::ProviderAccessForm)) {
-      accessForm = domain.operation;
+        gpu::ParameterRole::ProviderAccessForm) {
+      accessForm = definition;
       continue;
     }
     if (definition.getRole() ==
-        static_cast<uint32_t>(gpu::ParameterRole::ProviderLoadPolicy)) {
-      loadPolicy = domain.operation;
+        gpu::ParameterRole::ProviderLoadPolicy) {
+      loadPolicy = definition;
       continue;
     }
     auto candidates = definition.getCandidates().asArrayRef();
-    launchOptions.push_back(domain.operation);
+    launchOptions.push_back(definition);
     launchBaseline.push_back(builder.getNamedAttr(
         definition.getName(), builder.getI64IntegerAttr(candidates.front())));
     launchEndpoint.push_back(builder.getNamedAttr(
@@ -109,8 +99,7 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
   // every shared tile. Retain each declared value and the joint endpoint,
   // including the lower compiler's inferred worker count.
   SmallVector<SmallVector<NamedAttribute>> launchConfigurations{launchBaseline};
-  for (gpu::ParameterOp option : launchOptions) {
-    auto definition = option.getParameter();
+  for (gpu::ParameterAttr definition : launchOptions) {
     for (int64_t candidate : definition.getCandidates().asArrayRef().drop_front()) {
       auto bindings = launchBaseline;
       for (NamedAttribute &binding : bindings)
@@ -124,10 +113,9 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
     launchConfigurations.push_back(std::move(launchEndpoint));
 
   SmallVector<SmallVector<NamedAttribute>> memoryConfigurations(1);
-  for (gpu::ParameterOp option : {loadPolicy, accessForm}) {
-    if (!option)
+  for (gpu::ParameterAttr definition : {loadPolicy, accessForm}) {
+    if (!definition)
       continue;
-    auto definition = option.getParameter();
     auto forms = definition.getCandidates().asArrayRef();
     SmallVector<SmallVector<NamedAttribute>> expanded;
     for (const auto &base : memoryConfigurations)
@@ -160,44 +148,33 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
     }
   configurations = std::move(expanded);
 
-  gpu::ParameterOp resident;
-  gpu::ParameterOp ctas;
-  gpu::ParameterOp occupancy;
-  for (const auto &domain : space->domains()) {
-    auto role = domain.role();
-    if (role == gpu::ParameterRole::ResidentWorkers)
-      resident = domain.operation;
-    if (role == gpu::ParameterRole::ProviderCTAs)
-      ctas = domain.operation;
-    if (role == gpu::ParameterRole::ProviderOccupancy)
-      occupancy = domain.operation;
-  }
+  auto resident = space->find(gpu::ParameterRole::ResidentWorkers);
+  auto ctas = space->find(gpu::ParameterRole::ProviderCTAs);
+  auto occupancy = space->find(gpu::ParameterRole::ProviderOccupancy);
   bool bindResidentCapacity = resident && ctas && occupancy;
   if (bindResidentCapacity) {
     auto capabilities = kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
     if (!capabilities || capabilities.getComputeUnits() <= 0)
       return kernel.emitError("cuTile resident binding requires a positive compute-unit count");
     SmallVector<int64_t> counts;
-    auto definition = resident.getParameter();
     for (auto &configuration : configurations) {
       NamedAttrList bindings(configuration);
-      int64_t cluster = cast<IntegerAttr>(bindings.get(ctas.getParameter().getName())).getInt();
-      int64_t capacity = cast<IntegerAttr>(bindings.get(occupancy.getParameter().getName())).getInt();
+      int64_t cluster = cast<IntegerAttr>(bindings.get(ctas.getName())).getInt();
+      int64_t capacity = cast<IntegerAttr>(bindings.get(occupancy.getName())).getInt();
       if (!isLegalCTAs(cluster) || !isLegalOccupancy(capacity))
         return kernel.emitError("cuTile resident binding requires legal CTA and occupancy options");
       int64_t count;
       if (llvm::MulOverflow(capabilities.getComputeUnits() / cluster, capacity, count) || count <= 0)
         return kernel.emitError("cuTile resident capacity is not a positive representable count");
-      bindings.set(definition.getName(), builder.getI64IntegerAttr(count));
+      bindings.set(resident.getName(), builder.getI64IntegerAttr(count));
       configuration.assign(bindings.begin(), bindings.end());
       if (!llvm::is_contained(counts, count))
         counts.push_back(count);
     }
     llvm::sort(counts);
-    resident.setParameterAttr(gpu::ParameterAttr::get(
-        kernel.getContext(), definition.getName(), definition.getRole(),
-        definition.getCategory(), definition.getElementBitWidth(),
-        DenseI64ArrayAttr::get(kernel.getContext(), counts)));
+    if (failed(gpu::updateParameter(kernel, resident.withCandidates(
+            DenseI64ArrayAttr::get(kernel.getContext(), counts)))))
+      return failure();
   }
 
   SmallVector<DictionaryAttr> encoded;
@@ -212,7 +189,7 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
 }
 
 LogicalResult verifyClosedConfigs(func::FuncOp kernel) {
-  auto space = gpu::ConfigurationSpace::read(kernel);
+  auto space = gpu::ParameterSpace::read(kernel);
   if (failed(space))
     return failure();
   return success(succeeded(space->configurations(gpu::ConfigurationStage::Complete)));
