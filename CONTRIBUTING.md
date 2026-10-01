@@ -19,8 +19,9 @@ GPU 与 CPU 有独立的 physical IR 和 passes，这是执行模型的边界。
 
 ```text
 Python definition
-  → frontend：语义检查、specialization、canonical KIR
-  → compiler driver：目标解析与 intent-compile 调用
+  → Python frontend：类型化构造、specialization、单次 MLIR 序列化
+  → intent-compile：typed KIR 验证 → KIR 规范化 → canonical KIR 验证
+  → compiler driver：目标解析与 family/provider 编译
     ├─ KIRToGPU → GPU transformations → GPU provider
     ├─ KIRToCPU → CPU transformations → Mojo / Weft
     └─ KIRToDSA → DSA transformations → BANG C legalization
@@ -36,11 +37,33 @@ Python definition
 | Kernel/helper 定义 | [python/intent/api/](python/intent/api/) | `@intent.kernel`、`@intent.fn` 及 source definition |
 | Python frontend | [frontend/compilation/compiler.py](python/intent/frontend/compilation/compiler.py)、[frontend/lowering/](python/intent/frontend/lowering/) | 类型化捕获、helper、控制与 intrinsic lowering |
 | 编译调用 | [compiler/pipeline.py](python/intent/compiler/pipeline.py)、[compiler/artifact.py](python/intent/compiler/artifact.py)、[compiler/toolchain.py](python/intent/compiler/toolchain.py) | `generate` 返回 source/IR/metadata；无参 `materialize` 沿用同一目标；`compile` 组合这两步 |
-| C++ 编译入口 | [intent-compile.cpp](tools/intent-compile/intent-compile.cpp) | 选择 execution family 与 provider pipeline |
-| 公共产物与调用 | [runtime/artifact.py](python/intent/runtime/artifact.py)、[GPU program](python/intent/runtime/gpu/program.py) | `ArtifactRuntime.run/launch` 是显式调用接口；GPU 的 `prepare` 绑定一次调用，provider 完成自身的 JIT/tuning/launch |
+| C++ 编译入口 | [intent-compile.cpp](tools/intent-compile/intent-compile.cpp)、[NormalizeKernelIR.cpp](lib/Transforms/NormalizeKernelIR.cpp) | 先完成无设备的 KIR 规范化与验证，再选择 execution family 与 provider pipeline |
+| 公共产物与调用 | [runtime/artifact.py](python/intent/runtime/artifact.py)、[GPU program](python/intent/runtime/gpu/program.py)、[native ABI](python/intent/runtime/native.py) | `ArtifactRuntime.run/launch` 是显式调用接口；`prepare` 通过能力协议绑定一次调用，provider 完成自身的 JIT/tuning/launch |
 | 用户与 agent 工具 | [tools/compilation.py](python/intent/tools/compilation.py)、[tools/cli.py](python/intent/tools/cli.py)、[tools/compiler_mcp.py](python/intent/tools/compiler_mcp.py) | CLI 与显式启用的 compiler MCP 共用公开编译 API 和错误阶段，不建立第二条 compiler 路径 |
 
 已有 `.codegraph/` 时，可用 Codegraph 查询上面的具体文件或符号，再补读未覆盖部分；没有索引不必先创建索引才能工作。
+
+### 前端构造与 KIR 边界
+
+`lower_to_mlir` 捕获作者程序，不加载 MLIR Python bindings。前端的 [state.py](python/intent/frontend/mlir/state.py) 保存 value 的定义、operation 的 operands/results/regions，以及 block/region 的词法关系；[builder.py](python/intent/frontend/mlir/builder.py) 负责构造并分配 provenance 和逻辑维度身份。读取 owner、effects 或可见性时查询当前结构，不新增另一份 value→block 或 operation→block 表。
+
+[serialization.py](python/intent/frontend/mlir/serialization.py) 在构造结束后一次遍历图，输出类型、属性、最终 source names 与 source locations。不要在这里匹配算法、选择目标或做 region 改写；也不要在 AST lowering 中先输出嵌套文本再重新解析来获得语义关系。
+
+Lowering 的共同构造能力有明确入口：
+
+| 需要的能力 | 模块 | 责任边界 |
+|---|---|---|
+| tuple/record schema、类型递归、取字段和重建 | [products.py](python/intent/frontend/lowering/products.py) | 控制合流、structured identity 和普通表达式共用；leaf 的 dtype/shape 合同仍由调用方决定 |
+| helper、分支、循环的临时环境 | [scope.py](python/intent/frontend/lowering/scope.py) | 异常时也恢复词法环境和插入位置，不跨作用域保留另一份 owner 表 |
+| pure structured region | [regions.py](python/intent/frontend/lowering/regions.py) | 一次完成 region 构造、作用域、effect 检查和 yield；reduce/scan 的顺序与数值资格继续由各操作检查 |
+| dimension 来源、整数 shape 关系与 domain bounds | [shapes.py](python/intent/frontend/lowering/shapes.py) | 查询当前 typed graph；只 intern 确切整数表达式与维度身份，不决定物理 blocking |
+| shape 类型、extent operands 与属性构造 | [shape_construction.py](python/intent/frontend/lowering/shape_construction.py) | 广播、显式 shape 与 outer 共用同一维度对象和操作数位置；调用方决定 SSA 来源，不让 serializer 补齐关系 |
+
+职责参考是 Triton 的 `python/triton/compiler/code_generator.py:129–148`（子 region 的作用域恢复）和 `:300–322`（typed builder 与 semantic 层）。Intent 对应上表中的 scope 和 [MlirBuilder](python/intent/frontend/mlir/builder.py)，但把 MLIR 原生操作放在独立 compiler 进程中，因此 Python 安装不需要匹配 ABI 的 MLIR bindings。
+
+Native `intent-normalize-kernel` 是 KIR 规范化的完整入口：输入结构验证、合法 region 归一、输出 canonical 验证在同一 pass 中闭合，之后才建立 canonical analyses。它同时服务 `intent-compile` 和 `intent-opt`。新的跨目标 KIR 规范化放在 [lib/Transforms/](lib/Transforms/)，需要满足相应语言合同；GPU/CPU 的物理变换继续留在各自 family。
+
+只检查既有作者程序时，可用 `intent.compile_ir(definition)` 或 `intent compile path/to/program.py:kernel --stage kir --json`；这个阶段无需 target、后端 SDK 或设备。`--stage shared --target …` 输出共享物理 IR，默认 `provider` 阶段输出 provider IR、source 和 metadata。`intent-compile --compiler-info` 查询当前二进制实际编入的 providers；它不证明外部 provider 编译器或设备可用。
 
 ## 按贡献类型选择模块
 
@@ -203,7 +226,9 @@ GPU target 的设备校验、解析、编译参数和 materialization 共用 [ta
 
 实验适配若需要准备候选、观察调优或绑定调用，使用 `artifact.runtime` 的明确对象与 provider 扩展点。Compiler 生成的 source 不再承担 host `launch/run` 协议；只有显式作者提供的 Python source 由 [runtime/source.py](python/intent/runtime/source.py) 的独立 source loader 承接其已有 host callable。不要通过生成模块的私有字典改写编译器产物的执行语义。
 
-CPU host ABI 的共同绑定在 [runtime/cpu.py](python/intent/runtime/cpu.py)。`CPUInterface` 在 artifact 初始化时解析参数角色、静态形状、维度身份和需要检查的别名关系，并为隐式分配输出与显式传入输出生成各自的绑定函数。参数位置、维度 owner/相等关系、输出形状与 ABI 排列固定在函数中；每次调用仍重新观察实参并校验 shape、stride、pointer、allocation 与 offset。受控 allocator 可以同时返回本次新分配的输出及其 `ViewFacts`，显式输出仍走完整观察。Mojo 的 Torch 对象规则和 Weft 的 Buffer/alignment 规则留在各自 `program.py`，各自的 tuning key 与计时范围也由适配层保持。Weft 的 `_ExecutionContract` 持有稳定硬件描述与 native 函数绑定，每次执行继续检查当前线程的 affinity、stack、RVV 状态和 VLEN。不要把一次实参观察或线程状态存入不可变 ABI schema，也不要在绑定函数中重建算法或 task 调度。
+Mojo、Weft、BANG C 的共同 native ABI 绑定在 [runtime/native.py](python/intent/runtime/native.py)。`NativeInterface` 解析参数角色、静态形状、维度身份、已声明的 strides 和别名关系，为隐式分配与显式传入输出生成绑定函数，并统一 pointer/shape/stride/scalar 的原生参数排列。每次调用重新观察实参；allocator 返回新输出和本次 `ViewFacts`。CPU 的别名拒绝规则位于 [cpu.py](python/intent/runtime/cpu.py)，BANG C 的设备、队列、tile 资格与分配规则留在自己的 `program.py`；Mojo 的 Torch 规则、Weft 的 Buffer/alignment 规则和各自 tuning key 也留在 provider。Weft 的 `_ExecutionContract` 每次执行继续检查当前线程的 affinity、stack、RVV 状态和 VLEN。不要把一次实参观察或线程状态存入不可变 ABI schema，也不要在绑定函数中重建算法或 task 调度。
+
+公共 `artifact.prepare(*inputs, outputs=...)` 通过 `PreparedRuntime.prepare_call` 接入这些能力，返回 `intent.PreparedCall`，仅共同保证 `launch()` 和 `result()`。GPU launch 使用当前 stream，CPU launch 等待本次任务，BANG C launch 同步自己的 CNRT queue；`result()` 只返回输出容器，不隐含同步。CPU 既有返回值包含 InOut，GPU/BANG C 仅返回 Out，这个差异没有被 ABI 复用改写。Provider 特有的 enqueue、benchmark 或调优观察仍属于其具体调用对象。
 
 原生编译与产物寿命由 provider runtime 负责。Mojo 的 [compilation.py](python/intent/runtime/mojo/compilation.py) 组织候选和加载，[toolchain.py](python/intent/runtime/mojo/toolchain.py) 查询已支持工具链的依赖身份，公共 [compiler/cache.py](python/intent/compiler/cache.py) 提供输入比较、锁与发布机制。新增 SDK import 时同步 serializer 的 `native_dependencies`；无法证明依赖闭合时继续原编译并说明缓存不可复用原因。失败不发布成功产物，已加载的库不原位覆写；这些机制不改变算法、候选或算子计时范围。
 
@@ -253,7 +278,7 @@ INTENT_COMPILER=/path/to/intent-build/tools/intent-compile/intent-compile \
 
 定位失败时看 `CompilationStageError.stage`、`cache_directory`、`artifact.source` 和 `artifact.mlir`。区分 frontend、physical program、provider source、下层编译及实际 launch，不把所有失败归成“后端不支持”。CLI/MCP 的 [compilation.py](python/intent/tools/compilation.py) 只转换现有诊断与路径，不维护另一份错误知识库或 compiler policy。
 
-作者位置沿 [SourceUnit.location](python/intent/frontend/source/unit.py)、[canonical KIR 打印](python/intent/frontend/mlir/builder.py) 和 [compiler IR 输出](tools/intent-compile/intent-compile.cpp) 保存在标准 MLIR location 中。缓存的 `input.mlir`、`kernel.mlir` 与 operation 诊断使用这条位置链；新增 rewrite 创建或克隆 operation 时保留相应 source location，不用旁表替代。编译日志位于同一 `cache_directory` 的 `compiler.log`。
+作者位置沿 [SourceUnit.location](python/intent/frontend/source/unit.py)、[KIR 序列化](python/intent/frontend/mlir/serialization.py) 和 [compiler IR 输出](tools/intent-compile/intent-compile.cpp) 保存在标准 MLIR location 中。缓存的 `input.mlir`、`kernel.mlir` 与 operation 诊断使用这条位置链；新增 rewrite 创建或克隆 operation 时保留相应 source location，不用旁表替代。编译日志位于同一 `cache_directory` 的 `compiler.log`。
 
 Mojo 的 [native compilation](python/intent/runtime/mojo/compilation.py) 失败会指出具体 candidate、native 阶段和保留目录，目录中包含 bindings、命令、编译器 stdout/stderr 和阶段耗时，`request.json` 指向实际 source 与 FP object。`NativeLibrary.directory/cache_hit/cache_reason` 提供本次加载的产物及复用状态；既有 CPU runner 在准备阶段记录物化耗时和命中数量，二者不计为算子执行时间。Weft 的 [Canonical IR serializer](lib/Target/Weft/Serialization/Serializer.cpp) 同样保留标准 location，使下层编译诊断可以追到作者源码。
 

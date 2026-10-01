@@ -1,5 +1,5 @@
 [build-system]
-requires = ["scikit-build-core>=0.11,<1", "setuptools-scm>=9,<10"]
+requires = ["scikit-build-core>=0.11,<1", "setuptools-scm>=9,<10", "patchelf>=0.17; sys_platform == 'linux'"]
 build-backend = "scikit_build_core.build"
 
 [project]
@@ -23,6 +23,7 @@ cmake.build-type = "Release"
 build.targets = ["intent-compile"]
 install.components = ["IntentRuntime"]
 wheel.packages = ["python/intent"]
+wheel.py-api = "py3"
 sdist.exclude = [".codegraph", "experiments", "report", "tasks"]
 metadata.version.provider = "scikit_build_core.metadata.setuptools_scm"
 

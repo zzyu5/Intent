@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install Intent and one selected backend into an explicit virtual environment."""
+"""Install an Intent wheel or build from source, with one selected backend."""
 from __future__ import annotations
 
 import argparse
@@ -29,11 +29,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=BACKENDS, required=True)
     parser.add_argument("--venv", type=Path, help="Default: .venv-BACKEND")
-    parser.add_argument("--mlir-build", type=Path, help="Matching LLVM build with completed MLIRPythonModules")
-    parser.add_argument("--mlir-dir", type=Path,
-                        default=Path(os.environ.get("INTENT_MLIR_DIR", "/usr/lib/llvm-20/lib/cmake/mlir")))
-    parser.add_argument("--llvm-dir", type=Path,
-                        default=Path(os.environ.get("INTENT_LLVM_DIR", "/usr/lib/llvm-20/lib/cmake/llvm")))
+    parser.add_argument("--wheel", type=Path, help="Install an existing wheel without an LLVM/MLIR build SDK")
+    parser.add_argument("--mlir-dir", type=Path, help="Source build: MLIR CMake package directory")
+    parser.add_argument("--llvm-dir", type=Path, help="Source build: LLVM CMake package directory")
+    parser.add_argument("--runtime-notices", type=Path, help="Source build: JSON library-to-notice mapping for custom SDKs")
     parser.add_argument("--build-dir", type=Path)
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--torch-index-url", help="Override the selected backend's PyTorch wheel index")
@@ -53,9 +52,19 @@ def main() -> None:
         parser.error("--neuware requires --backend bangc")
     if args.torch_index_url and selected["torch"] is None:
         parser.error("this backend does not install PyTorch")
-    for directory, filename in ((args.mlir_dir, "MLIRConfig.cmake"), (args.llvm_dir, "LLVMConfig.cmake")):
-        if not (directory.expanduser() / filename).is_file():
-            parser.error(f"{filename} not found in {directory}; select an LLVM/MLIR 20 SDK")
+    if args.wheel is not None:
+        if any((args.mlir_dir, args.llvm_dir, args.runtime_notices, args.build_dir,
+                args.weft_source_dir, args.weft_binary_dir)):
+            parser.error("--wheel cannot be combined with source-build SDK, build, notice, or Weft source flags")
+        args.wheel = args.wheel.expanduser().resolve()
+        if not args.wheel.is_file() or args.wheel.suffix != ".whl":
+            parser.error(f"Wheel file not found: {args.wheel}")
+    else:
+        args.mlir_dir = (args.mlir_dir or Path(os.environ.get("INTENT_MLIR_DIR", "/usr/lib/llvm-20/lib/cmake/mlir"))).expanduser().resolve()
+        args.llvm_dir = (args.llvm_dir or Path(os.environ.get("INTENT_LLVM_DIR", "/usr/lib/llvm-20/lib/cmake/llvm"))).expanduser().resolve()
+        for directory, filename in ((args.mlir_dir, "MLIRConfig.cmake"), (args.llvm_dir, "LLVMConfig.cmake")):
+            if not (directory / filename).is_file():
+                parser.error(f"{filename} not found in {directory}; select an LLVM/MLIR 20 build SDK or --wheel")
     options = {}
     extra_cmake = []
     if args.backend == "mojo":
@@ -67,18 +76,18 @@ def main() -> None:
             parser.error(f"Mojo compiler is not executable: {compiler}")
         options["compiler"] = str(Path(resolved).resolve())
     elif args.backend == "weft":
-        if args.weft_source_dir is None or args.weft_binary_dir is None:
-            parser.error("Weft requires explicit --weft-source-dir and --weft-binary-dir matching the MLIR SDK")
-        source, build = args.weft_source_dir.expanduser().resolve(), args.weft_binary_dir.expanduser().resolve()
-        for path in (source / "include/Weft/Dialect/Kernel/IR/KernelDialect.h",
-                     build / "include/Weft/Dialect/Kernel/IR/KernelOps.h.inc"):
-            if not path.is_file():
-                parser.error(f"Weft source/build is incomplete: {path}")
-        compiler = args.provider_compiler or build / "tools/weft-compile/weft-compile"
-        if shutil.which(os.path.expanduser(str(compiler))) is None:
-            parser.error(f"Weft compiler is not executable: {compiler}")
-        extra_cmake = [f"--config-settings=cmake.define.INTENT_WEFT_SOURCE_DIR={source}",
-                       f"--config-settings=cmake.define.INTENT_WEFT_BINARY_DIR={build}"]
+        if args.wheel is None:
+            if args.weft_source_dir is None or args.weft_binary_dir is None:
+                parser.error("Weft source builds require --weft-source-dir and --weft-binary-dir matching the MLIR SDK")
+            source, build = args.weft_source_dir.expanduser().resolve(), args.weft_binary_dir.expanduser().resolve()
+            for path in (source / "include/Weft/Dialect/Kernel/IR/KernelDialect.h",
+                         build / "include/Weft/Dialect/Kernel/IR/KernelOps.h.inc"):
+                if not path.is_file():
+                    parser.error(f"Weft source/build is incomplete: {path}")
+            extra_cmake = [f"--config-settings=cmake.define.INTENT_WEFT_SOURCE_DIR={source}",
+                           f"--config-settings=cmake.define.INTENT_WEFT_BINARY_DIR={build}"]
+        if args.provider_compiler and shutil.which(os.path.expanduser(str(args.provider_compiler))) is None:
+            parser.error(f"Weft compiler is not executable: {args.provider_compiler}")
     elif args.backend == "bangc":
         if args.neuware is None:
             parser.error("BANG C requires an existing SDK selected by --neuware")
@@ -96,39 +105,40 @@ def main() -> None:
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)
+    env.pop("INTENT_COMPILER", None)
     env["PYTHONNOUSERSITE"] = "1"
     env["CMAKE_BUILD_PARALLEL_LEVEL"] = str(args.jobs)
     if not destination.exists():
         run(sys.executable, "-m", "venv", destination, env=env)
     python = destination / "bin/python"
     interpreter = json.loads(subprocess.check_output(
-        [str(python), "-c", "import json,sys,sysconfig; print(json.dumps({'version':list(sys.version_info[:2]),"
-         "'site':sysconfig.get_path('purelib')}))"], text=True, env=env))
-    if not (3, 10) <= tuple(interpreter["version"]) <= selected["python_max"]:
-        parser.error("the public dependency routes require Python 3.10–3.12 with matching MLIR bindings")
+        [str(python), "-c", "import json,sys; print(json.dumps(list(sys.version_info[:2])))"], text=True, env=env))
+    if not (3, 10) <= tuple(interpreter) <= selected["python_max"]:
+        parser.error("the public backend dependency routes currently require Python 3.10–3.12")
     run(python, "-m", "pip", "install", "--upgrade", "pip", env=env)
-    run(python, "-m", "pip", "install", *DECLARATIONS["FRONTEND_REQUIREMENTS"], env=env)
-    if args.mlir_build is not None:
-        run("cmake", "--install", args.mlir_build.expanduser().resolve(), "--component", "MLIRPythonModules",
-            "--prefix", destination, env=env)
-        bindings = destination / "python_packages/mlir_core"
-        if not (bindings / "mlir/ir.py").is_file():
-            parser.error("build MLIRPythonModules with this Python ABI before installation")
-        (Path(interpreter["site"]) / "intentdsl-mlir.pth").write_text(str(bindings) + "\n", encoding="utf-8")
-    run(python, "-c", "from mlir.dialects import func; import mlir.ir; print(mlir.ir.__file__)", env=env)
     if selected["torch"] is not None:
         run(python, "-m", "pip", "install", f"torch=={selected['torch']}", "--index-url",
             args.torch_index_url or selected["torch_index"], env=env)
     if selected["requirements"] is not None:
         run(python, "-m", "pip", "install", "-r", REPOSITORY / "environment" / selected["requirements"], env=env)
-    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-    build = (args.build_dir or cache / "intentdsl/install-build" / args.backend / sys.implementation.cache_tag).resolve()
-    run(python, "-m", "pip", "install", str(REPOSITORY) + "[manual]",
-        "--config-settings=cmake.define.MLIR_DIR=" + str(args.mlir_dir.expanduser().resolve()),
-        "--config-settings=cmake.define.LLVM_DIR=" + str(args.llvm_dir.expanduser().resolve()),
-        "--config-settings=build-dir=" + str(build), *extra_cmake, env=env)
+    if args.wheel is not None:
+        run(python, "-m", "pip", "install", str(args.wheel) + "[manual]", env=env)
+    else:
+        cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+        build = (args.build_dir or cache / "intentdsl/install-build" / args.backend / sys.implementation.cache_tag).resolve()
+        if args.runtime_notices is not None:
+            extra_cmake.append("--config-settings=cmake.define.INTENT_RUNTIME_NOTICES=" + str(args.runtime_notices.expanduser().resolve()))
+        run(python, "-m", "pip", "install", str(REPOSITORY) + "[manual]",
+            "--config-settings=cmake.define.MLIR_DIR=" + str(args.mlir_dir),
+            "--config-settings=cmake.define.LLVM_DIR=" + str(args.llvm_dir),
+            "--config-settings=build-dir=" + str(build), *extra_cmake, env=env)
     print(f"Installed {args.backend}. Activate: source {shlex.quote(str(destination / 'bin/activate'))}")
     if args.backend == "weft":
+        run(python, "-c", "import sys; from intent.compiler.toolchain import compiler_info; "
+            "facts = compiler_info(); "
+            "print(facts); "
+            "'weft' in facts['providers'] or "
+            "sys.exit('The installed Intent compiler was built without Weft support')", env=env)
         print("Weft is available for source generation. Supply your actual vector_bits/workers to intent doctor/compile;")
         print("native RISC-V execution additionally requires an explicit deployment and matching external toolchain.")
     else:

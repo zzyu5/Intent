@@ -12,30 +12,28 @@ IntentDSL is a Python kernel language and compiler for GPU, CPU, and accelerator
 
 ## Install
 
-The first public setup path is **Linux + NVIDIA + Triton**, using Python 3.10–3.12 and the LLVM/MLIR 20 SDK. MLIR's Python bindings must be built for the same Python interpreter ABI. The [installation guide](environment/README.md) covers these prerequisites and the source build.
+The first public setup path is **Linux + NVIDIA + Triton**, using Python 3.10–3.12. Source builds require the LLVM/MLIR 20 C++ SDK. Python MLIR bindings are not required: the packaged C++ compiler parses, normalizes, and verifies KIR.
 
-From this checkout, with an LLVM build containing the completed `MLIRPythonModules` target:
+From this checkout, with the SDK installed:
 
 ```bash
 python3 environment/install.py --backend triton \
-  --venv .venv-triton \
-  --mlir-build /path/to/llvm-build
+  --venv .venv-triton
 source .venv-triton/bin/activate
 intent doctor --target triton
 python examples/softmax.py
 ```
 
-The installer installs the MLIR bindings, CUDA PyTorch, Triton, Intent's compiler and profiles, and MCP dependencies. It does not require a project `PYTHONPATH`. The same installer provides a separate `--backend cutile` environment and explicit external-toolchain setup for Mojo, Weft, and BANG C. See the [backend setup table](environment/README.md#choose-a-backend). Override `--mlir-dir` and `--llvm-dir` when the SDK is outside `/usr/lib/llvm-20`.
+The installer installs CUDA PyTorch, Triton, Intent's compiler and profiles, and MCP dependencies. It does not require a project `PYTHONPATH`. The same installer provides a separate `--backend cutile` environment and explicit external-toolchain setup for Mojo, Weft, and BANG C. See the [installation guide](environment/README.md). Override `--mlir-dir` and `--llvm-dir` when the build SDK is outside `/usr/lib/llvm-20`.
 
-If the SDK, MLIR Python bindings, and backend dependencies are already installed in your environment:
+If you already have a locally built Intent wheel, set `INTENT_WHEEL` to its actual filename and install it with the same backend setup:
 
 ```bash
-python -m pip install '.[manual]' \
-  --config-settings=cmake.define.MLIR_DIR=/usr/lib/llvm-20/lib/cmake/mlir \
-  --config-settings=cmake.define.LLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
+python3 environment/install.py --backend triton \
+  --venv .venv-triton --wheel "$INTENT_WHEEL"
 ```
 
-This is a source installation. The resulting wheel includes the Intent compiler and resources, and uses the LLVM/MLIR runtime libraries from the SDK installation.
+The wheel carries the compiler's non-system shared libraries and their third-party notices. Its runtime needs neither an LLVM/MLIR SDK nor Python MLIR bindings. It still requires a compatible Linux system, glibc/C++ runtime, and the selected backend's dependencies and driver. These are local platform wheels, not a published PyPI release or a claim of manylinux compatibility. The guide describes building a wheel and supplying notices for custom SDKs.
 
 ## Write and call a kernel
 
@@ -107,9 +105,12 @@ For an agent that should compile a user-supplied program, explicitly add a secon
 
 ## Inspect and learn
 
-Generate compiler artifacts for an existing definition:
+Capture and verify canonical KIR without selecting a device, or continue to a provider:
 
 ```bash
+intent compile examples/kernels/normalization/softmax.py:stable_softmax_f16 \
+  --stage kir --json
+
 intent compile examples/kernels/normalization/softmax.py:stable_softmax_f16 \
   --target triton --json
 ```

@@ -13,7 +13,13 @@ foreach(provider Triton CuTile TileLang Mojo Weft)
   configure_file("${PROJECT_SOURCE_DIR}/lib/Target/${provider}/Transforms/TuningProfiles.json"
                  "${CMAKE_CURRENT_BINARY_DIR}/profiles/${provider_name}.json" COPYONLY)
 endforeach()
-set_target_properties(intent-compile PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
+if(SKBUILD)
+  set_target_properties(intent-compile PROPERTIES
+    INSTALL_RPATH "$ORIGIN/lib"
+    INSTALL_RPATH_USE_LINK_PATH FALSE)
+else()
+  set_target_properties(intent-compile PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
+endif()
 install(TARGETS intent-compile
   RUNTIME DESTINATION "${INTENT_RUNTIME_INSTALL_DIR}"
   COMPONENT IntentRuntime)
@@ -21,6 +27,14 @@ install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/profiles/"
   DESTINATION "${INTENT_RUNTIME_INSTALL_DIR}/profiles"
   COMPONENT IntentRuntime
   FILES_MATCHING PATTERN "*.json")
+if(SKBUILD)
+  configure_file("${PROJECT_SOURCE_DIR}/cmake/BundleRuntime.cmake.in"
+                 "${CMAKE_CURRENT_BINARY_DIR}/BundleRuntime.cmake.in" @ONLY)
+  file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/BundleRuntime-$<CONFIG>.cmake"
+       INPUT "${CMAKE_CURRENT_BINARY_DIR}/BundleRuntime.cmake.in")
+  install(SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/BundleRuntime-$<CONFIG>.cmake"
+          COMPONENT IntentRuntime)
+endif()
 target_link_libraries(intent-compile PRIVATE
   ${dialect_libs}
   MLIRIntentDialect

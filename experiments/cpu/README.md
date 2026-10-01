@@ -13,7 +13,7 @@
 
 ## Mojo 单点
 
-在已安装 MLIR Python bindings 的环境运行，明确指定 Mojo 可执行文件：
+在已安装 Intent 和 CPU 运行依赖的环境运行，明确指定 Mojo 可执行文件：
 
 ```bash
 export PYTHONPATH="$PWD:$PWD/python:$PWD/examples"
